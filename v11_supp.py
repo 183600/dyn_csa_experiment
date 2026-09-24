@@ -126,11 +126,12 @@ def v11_analysis(out='analysis_v11/stats.json'):
         probe = {'cells': probe_cells, 'contrasts': contrasts}
         _n_cell_max = max((c['n'] for c in probe_cells), default=0)
         _n_pair_max = max((v['n'] for v in contrasts.values()), default=0)
+        _n_pair_min = min((v['n'] for v in contrasts.values()), default=0)
         _n_pair_cells = max([v['n'] * 2 for v in contrasts.values()], default=0)
-        probe['n_seeds'] = {'cell_max': _n_cell_max, 'contrast_paired_max': _n_pair_max}
-        if _n_pair_cells and _n_pair_cells < _n_cell_max:
+        probe['n_seeds'] = {'cell_max': _n_cell_max, 'contrast_paired_max': _n_pair_max, 'contrast_paired_min': _n_pair_min}
+        if _n_pair_cells and _n_pair_min * 2 < _n_cell_max:
             lowered = sorted((k for k, v in contrasts.items() if v['n'] * 2 < _n_cell_max))
-            print(f'[v11 stats] NOTE: the fullest probe cell reaches n={_n_cell_max} but the LARGEST contrast pairs only {_n_pair_max} seeds — the arms are not seed-complete with each other, so every p value below is computed at the PAIRED count, i.e. the floor for this panel is {2.0 / 2 ** _n_pair_max:.3f}, not {2.0 / 2 ** _n_cell_max:.3f}. {len(lowered)}/{len(contrasts)} contrast(s) are limited by this: {lowered[:3]}')
+            print(f'[v11 stats] NOTE: the fullest probe cell reaches n={_n_cell_max} but the WEAKEST contrast pairs only {_n_pair_min} seeds — the arms are not seed-complete with each other, so every p value below is computed at its own PAIRED count, i.e. the worst floor for this panel is {2.0 / 2 ** _n_pair_min:.3f}, not {2.0 / 2 ** _n_cell_max:.3f}. {len(lowered)}/{len(contrasts)} contrast(s) are limited by this: {lowered[:3]}')
     xo = V10._scale_crossovers()
     pts, _no_tok, _recon = ([], [], [])
     for _lab, v in xo.items():
@@ -474,7 +475,7 @@ def build_report(out='REPORT_v11.md'):
         A(f'| `{_name}/` | — | — | — | — | **无法解析**（{_err}） |')
     A('')
     if _prov_unreadable:
-        A(f'> **⚠ 上表有 {len(_prov_unreadable)} 个面板无法解析**，其记录数未计入下方汇总。这些面板的溯源状态**未知**（不是「无戳」），在修复前不能假定它们与任何代码语义一致。')
+        A(f'> **⚠ 上表有 {len(_prov_unreadable)} 个面板无法解析**，其记录数未计入下方汇总。这些面板的溯源状态**未知**（不是「无戳」），在重新解析成功前不能假定它们与任何代码语义一致。')
         A('')
     A('重建记录（`synthesized`）的 PPL 是从更早的表里抄来的，没有权重支撑，本报告的配对与聚合都已在读取时把它们剔出——它们不会进入任何Δ、n 或 p 值。上面把它们单独计一列，是为了让「这条记录存在」与「这条记录是一次测量」不再被混为一谈。')
     A('')

@@ -222,7 +222,7 @@ def sec_p0w():
             m = sum((p for p, _s, _m, _sd in vals)) / len(vals)
             lines.append(f'- `{v}` warm={w}：{m:.2f} PPL（{m - b:+.2f} vs 基线，n={len(vals)}）')
         curves = collections.defaultdict(lambda: collections.defaultdict(list))
-        for v, w, sd, ppl, sw, mins, _k in rows:
+        for v, w, sd, ppl, sw, mins, _syn, _k in rows:
             r = s.get(_k) or {}
             if not _measurable(r):
                 continue
@@ -372,7 +372,7 @@ def sec_p1t():
         lines += ['', '**未完成的扫描点（如实记录）**：', '']
         for v in sorted(failed):
             seeds = ','.join((str(x) for x in sorted(failed[v])))
-            lines.append(f'- `{v}`（seed {seeds}）：训练初期即 **CUDA OOM**（`gathered_attention` 的 topk 块收集张量随 topk 线性增长）——该实现下 topk≥128 在 seq 2048 的显存代价是硬约束，扫描点被截断。')
+            lines.append(f'- `{v}`（seed {seeds}）：topk≥128 的扫描点在本配置与预算约束下未完成，扫描被截断。')
         lines.append('')
     ks = [8, 32, 128, 512]
     rows_k = []
@@ -425,7 +425,7 @@ def sec_p1t():
         _n_gap = min(_n8, _n32) if min(_n8, _n32) else _n8
         _floor = 2.0 / (1 << _n_gap) if _n_gap else 1.0
         lines.append(f'2. 在已完成的两个选择率点上：{_dir}；但 topk8 与 topk32 之差（{_gap:.2f} PPL）在 n={_n_gap} 的噪声量级内，且该 n 下精确符号翻转p 值下限为 {_floor:.3f}，**不构成显著性主张**，只作方向性参考。')
-        lines.append('3. topk≥128 的点因显存约束未完成（见上），「甜点位置」的完整刻画需要更大显存或梯度检查点，留作后续。')
+        lines.append('3. topk≥128 的点未完成（见上），「甜点位置」的完整刻画需要后续在完整扫描面板补齐。')
     return '\n'.join(lines) + '\n'
 
 def sec_p1l():

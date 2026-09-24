@@ -131,7 +131,11 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 print(f"[p3mp] REFUSE {v} s{seed}: {ck} exists but {_msp} has no '{v}::seed{seed}' training record — the weights have no traceable provenance, so they cannot be attributed to the current recipe")
                 del d
                 continue
-            _fp = _probe_fingerprint(cfg)
+            _vocab_ck = int(d.get('vocab', 8192))
+            if cfg.get('vocab') is not None and int(cfg['vocab']) != _vocab_ck:
+                print(f"[p3mp] {v} s{seed}: probe cfg vocab={int(cfg['vocab'])} differs from the checkpoint's vocab={_vocab_ck} — using the checkpoint's (the model is what is being scored)")
+            _pcfg = dict(cfg, vocab=_vocab_ck)
+            _fp = _probe_fingerprint(_pcfg)
             _defs = [(Ln, rho) for Ln in cfg['eval_lens'] for rho in cfg['rhos']]
             for arm in cfg['arms']:
                 if not _arm_of(v, arm):
@@ -153,12 +157,8 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                     elif arm == 'allblocks':
                         c2.index_topk = 10 ** 6
                     cfgs.append(c2)
-                _vocab_ck = int(d.get('vocab', 8192))
                 model = L.SmallGPT(_vocab_ck, 256, 6, 8, 32, d.get('train_len', 512), cfgs, mlp_ratio=d['mlp_ratio']).to(DEVICE)
                 model.load_state_dict(d['sd'])
-                if cfg.get('vocab') is not None and int(cfg['vocab']) != _vocab_ck:
-                    print(f"[p3mp] {v} s{seed}: probe cfg vocab={int(cfg['vocab'])} differs from the checkpoint's vocab={_vocab_ck} — using the checkpoint's (the model is what is being scored)")
-                _pcfg = dict(cfg, vocab=_vocab_ck)
                 t0 = time.time()
                 for Ln, rho in cells:
                     key = _cell_key(Ln, rho)
@@ -299,7 +299,7 @@ def _scale_crossovers():
         _paired = []
         _no_overlap = []
         for s in common:
-            if set(ha[s]) & set(hb[s]):
+            if set(dict(ha[s])) & set(dict(hb[s])):
                 _paired.append(s)
             else:
                 _no_overlap.append(s)

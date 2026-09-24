@@ -33,7 +33,7 @@ def main():
     import datasets
     datasets.load_dataset = fake_load_dataset
     import exp_lib as L
-    combos = [(512, 1000000), (1024, 40000000), (512, 110000000)]
+    combos = [(512, 1000000), (512, 8000000), (1024, 40000000), (512, 110000000), (2048, 8000000), (2048, 1000000), (4097, 4000000)]
     for seq_len, cap in combos:
         print(f'\n===== prep cache: seq_len={seq_len} cap={cap} =====')
         L.load_wikitext(seq_len, cap)

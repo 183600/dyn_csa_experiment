@@ -5,7 +5,7 @@ import os
 import subprocess
 import time
 BASE = os.path.dirname(os.path.abspath(__file__))
-PHASES = [('results_lm_v7_rope', 12, 'P0R  RoPE+QK-norm 4 variants x 3 seeds @1500'), ('results_lm_v7_warmup', 15, 'P0W  dense->sparse warmup csa_fixed x w{0,5k,10k} x 3 seeds'), ('results_niah', None, 'P1N  NIAH retrieval probe'), ('results_lm_v7_long40', 6, 'P0E  long horizon 40k: csa_fixed+full x 2 seeds'), ('results_lm_v7_seq2k', 8, 'P1T  seq2048 topk sweep + m=1'), ('results_lm_v5_scale', None, 'P2S  param-matched scale seeds 2,3')]
+PHASES = [('results_lm_v7_rope', 12, 'P0R  RoPE+QK-norm 4 variants x 3 seeds @1500'), ('results_lm_v7_warmup', 6, 'P0W  dense->sparse warmup csa_fixed x w{0,5k,10k} x 2 seeds'), ('results_niah', None, 'P1N  NIAH retrieval probe'), ('results_lm_v7_long40', 4, 'P0E  long horizon 40k: csa_fixed+full x 2 seeds'), ('results_lm_v7_seq2k', 10, 'P1T  seq2048 topk sweep 5 variants x 2 seeds + m=1'), ('results_lm_v5_scale', None, 'P2S  param-matched scale seeds 2,3')]
 BUDGET_STATE = os.path.join(BASE, 'autodl_budget_state_v7.json')
 
 def load(p):
@@ -24,7 +24,7 @@ def proc_alive():
                 cmd = f.read().decode('utf-8', 'replace')
         except Exception:
             continue
-        if 'v7_supp.py' in cmd and 'phase' in cmd:
+        if 'v7_supp.py' in cmd and 'python' in cmd:
             return int(pid)
     return None
 
@@ -71,7 +71,7 @@ def main():
         for k, r in s.items():
             if not isinstance(r, dict):
                 continue
-            rows.append((k, r.get('ppl'), r.get('warm_steps', r.get('warm')), r.get('ppl_at_switch'), r.get('elapsed_min') or (r.get('elapsed_s', 0) / 60.0 if r.get('elapsed_s') else None)))
+            rows.append((k, r.get('ppl'), r.get('warm_steps', r.get('warm')), r.get('ppl_at_switch'), (r.get('train_time_s') / 60.0) if isinstance(r.get('train_time_s'), (int, float)) else None))
         rows.sort(key=lambda x: x[0])
         for k, ppl, warm, sw, mins in rows:
             ppl_s = f'{ppl:8.2f}' if isinstance(ppl, (int, float)) and (not isinstance(ppl, bool)) and math.isfinite(ppl) else '     n/a'

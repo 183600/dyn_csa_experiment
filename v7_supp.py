@@ -577,13 +577,18 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
     for v in variants:
         if v not in ratios:
             ratios[v] = L.variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'})
+    _fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{cfg.get('warmup', 50)}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_cs{CKPT_CODE}'
     for seed in seeds:
         for warm in warm_grid:
             for v in variants:
                 key = f'{v}::w{warm}::seed{seed}'
-                if L.result_is_current(summary.get(key), CKPT_CODE, 'ppl'):
-                    print(f'[skip] {key} already completed (resume)')
-                    continue
+                _cur = summary.get(key)
+                if L.result_is_current(_cur, CKPT_CODE, 'ppl'):
+                    if _cur.get('run_cfg') == _fp:
+                        print(f'[skip] {key} already completed (resume)')
+                        continue
+                    print(f'[resume] {key} carries no matching config fingerprint (stored {_cur.get('run_cfg')!r}) — re-running and overwriting so a config change can never be mistaken for a fresh result')
+                    summary.pop(key, None)
                 if guard is not None:
                     est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
                     if not guard.can_start(est):
@@ -593,6 +598,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                 _deadline = None
                 if guard is not None:
                     _deadline = guard.deadline_ts()
+                rec = None
                 try:
                     rec = train_warmup(v, train_ids, val_batch, vocab, seed=seed, warm_steps=warm, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=_deadline)
                     if rec.get('budget_truncated'):
@@ -600,6 +606,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                     else:
                         summary[key] = rec
                         summary[key]['_code'] = CKPT_CODE
+                        summary[key]['run_cfg'] = _fp
                 except Exception as e:
                     if key in summary and 'ppl' in (summary.get(key) or {}):
                         print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (the error record holds no `ppl` and must not replace it)')
@@ -607,9 +614,11 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                         summary[key] = {'variant': v, 'seed': seed, 'warm_steps': warm, 'error': traceback.format_exc()}
                         print(f'[{key}] FAILED: {e}')
                 if guard is not None:
-                    steps_done = cfg['steps']
+                    steps_done = 0
                     if isinstance(rec, dict) and rec.get('steps_done'):
-                        steps_done = rec['steps_done']
+                        steps_done = int(rec['steps_done'])
+                    elif isinstance(rec, dict) and 'ppl' in rec:
+                        steps_done = int(cfg['steps'])
                     guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'])
                 L.atomic_write_json(spath, summary, indent=2)
                 gc.collect()
@@ -965,7 +974,10 @@ def run_niah_phase(payload, guard=None, label=''):
                 del model, opt
                 gc.collect()
                 torch.cuda.empty_cache()
-            del _batch, cache
+            try:
+                del _batch, cache
+            except UnboundLocalError:
+                pass
             _ckp = torch.load(ck, map_location='cpu', weights_only=False)
             model = L.SmallGPT(_ckp.get('vocab', vocab), 256, 6, 8, 32, 512, _ckp['cfg'], mlp_ratio=_ckp['mlp_ratio']).to(DEVICE)
             model.load_state_dict(_ckp['sd'])

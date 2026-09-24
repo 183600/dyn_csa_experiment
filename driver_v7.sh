@@ -21,8 +21,12 @@ if [ $all_ok -ne 1 ]; then
   exit 1
 fi
 echo "=== [driver] $(date '+%F %T') final analysis + report rebuild ==="
-$PY v7_supp.py analysis
-$PY build_report.py
+$PY v7_supp.py analysis || all_ok=0
+$PY build_report.py || all_ok=0
+if [ $all_ok -ne 1 ]; then
+  echo "=== [driver] $(date '+%F %T') aborted: analysis or report failed; skipping commit/push and NOT printing ALL DONE ==="
+  exit 1
+fi
 git add -A
 git commit -m "v7: remaining phases complete (P0E/P2S/P1L/P1T) + rebuilt report + stats" || true
 git push origin HEAD 2>&1 | tail -3

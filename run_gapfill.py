@@ -116,7 +116,8 @@ def schedule_shutdown(delay_s=90):
 def run_full():
     guard = L.CostGuard(L.BUDGET)
     guard.report()
-    push_ok = git_push('v6: rebuild results_lm_v3_long/summary.json from committed aggregate (stale 500-step entries fixed)')
+    synthesize_long_summary()
+    push_ok = git_push('v6: rebuild results_lm_v3_long/summary.json from committed aggregate')
     L.run({**L.RUN_LONG, 'variants': LONG_GAP_VARIANTS}, seeds=[2], guard=guard, label='P-LONG hybrid seed2 (complete 3-seed table)')
     push_ok &= git_push('v6: results_lm_v3_long hybrid variants at seed 2 — 3-seed long-run table complete')
     L.run(L.RUN, seeds=[0, 1, 2], guard=guard, label='P-CORE 1500-step core table (results_lm_v3_1500)')

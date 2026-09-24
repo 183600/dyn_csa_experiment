@@ -38,8 +38,13 @@ def make_guard():
             if os.path.exists(src):
                 try:
                     st = json.load(open(src, encoding='utf-8'))
-                    g.state['sps_by_class'] = st.get('sps_by_class', {})
-                    g.state['norm_sps'] = st.get('norm_sps')
+                    sbc = st.get('sps_by_class') or {}
+                    norm = st.get('norm_sps')
+                    if not sbc and norm is None:
+                        print(f'[v9] NOTE: {src} holds no calibration data — leaving the guard uncalibrated rather than recording an empty calibration')
+                        continue
+                    g.state['sps_by_class'] = sbc
+                    g.state['norm_sps'] = norm
                     g._save()
                     print(f'[v9] CostGuard calibrated from {src}')
                     break
@@ -193,17 +198,17 @@ def build_report(out='REPORT_v9.md'):
     A('')
     _r_n = sorted({p['n'] for p in rope.values()}) if rope else []
     _r_n_txt = (str(_r_n[0]) if len(_r_n) == 1 else f'{_r_n[0]}–{_r_n[-1]}') if _r_n else '0'
-    A(f'v9 补齐 v7/v8 留下的两个缺口：(1) P1T 的 seq-2048 topk 扫描因显存截断于 topk≥128，v9 以 batch_size=1 重跑**完整 5 点扫描**（新目录、面板内自洽）；(2) v8 的 RoPE 20k 长跑只有 2 seeds（精确符号翻转检验在 n=2 时 p 值下限 0.500，正是当初评审否决 n=2 面板的原因），v9 补种子以提升该面板分辨率——**实际落盘 n={_r_n_txt}**。')
+    A(f'v9 补齐 v7/v8 留下的两个缺口：(1) P1T 的 seq-2048 topk 扫描在 v7 截断于 topk≥128，v9 以 batch_size=1 重跑**完整 5 点扫描**（新目录、面板内自洽）；(2) v8 的 RoPE 20k 长跑只有 2 seeds（精确符号翻转检验在 n=2 时 p 值下限 0.500，正是当初评审否决 n=2 面板的原因），v9 补种子以提升该面板分辨率——**实际落盘 n={_r_n_txt}**。')
     A('')
     A('---')
     A('')
-    A('## P2T seq-2048 topk 完整扫描（batch_size=1，解决 OOM 截断）')
+    A('## P2T seq-2048 topk 完整扫描（batch_size=1）')
     A('')
-    A('**背景**：v7 P1T 在 bs=3 下扫描 `topk ∈ {8,32,128,512}` + `csa_fix_m1`；topk128/512 训练初期即 CUDA OOM（autograd 图按层数×batch 样本保留收集张量），扫描被截断，结论只剩 3 点。v9：bs=1 仍不足，遂按 v7 台账预案启用**逐 block 梯度检查点**——前向无 dropout/RNG，重算严格等价，纯显存层改动，数学结果与无检查点路径一致。')
+    A('**背景**：v7 P1T 在 bs=3 下扫描 `topk ∈ {8,32,128,512}` + `csa_fix_m1`；topk128/512 在该配置下未能完成，扫描被截断，结论只剩 3 点。v9 改用 bs=1 并按 v7 台账预案启用**逐 block 梯度检查点**——前向无 dropout/RNG，重算严格等价，数学结果与无检查点路径一致。')
     A('')
     _n_seen = sorted({p['n'] for p in seq2k.values()}) if seq2k else []
     _n_txt = (f'{_n_seen[0]} seeds' if len(_n_seen) == 1 else f'{_n_seen[0]}–{_n_seen[-1]} seeds') if _n_seen else '0 seeds'
-    A(f'**做法**：seq 2048、bs 1、逐 block 梯度检查点、1500 步；5 个变体全部重跑于新目录 `results_lm_v9_seq2k`（面板内 batch/步数/token 数/显存设置完全一致；v7 的 bs=3 残板保留在 `results_lm_v7_seq2k` 作历史记录，不并入统计）。**实际落盘 {_n_txt}**（下表每点自报 n）。')
+    A(f'**做法**：seq 2048、bs 1、逐 block 梯度检查点、1500 步；5 个变体全部重跑于新目录 `results_lm_v9_seq2k`（面板内 batch/步数/token 数/训练配置完全一致；v7 的 bs=3 残板保留在 `results_lm_v7_seq2k` 作历史记录，不并入统计）。**实际落盘 {_n_txt}**（下表每点自报 n）。')
     A('')
     A('| variant | PPL (mean±std) | n | 等效选择率@2048 |')
     A('|---|---|---|---|')
@@ -246,7 +251,7 @@ def build_report(out='REPORT_v9.md'):
                 continue
             A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
     A('')
-    A('**结论读法**：若完整扫描证实 m=1（纯 DSA）不差于压缩 CSA，则 v7「压缩不是瓶颈」的方向性结论在完整扫描下成立/被修正（按表）；选择率甜点位置由 5 点全貌直接给出，v7 因 OOM 留下的「甜点完整刻画」待办关闭。')
+    A('**结论读法**：若完整扫描证实 m=1（纯 DSA）不差于压缩 CSA，则 v7「压缩不是瓶颈」的方向性结论在完整扫描下成立/被修正（按表）；选择率甜点位置由 5 点全貌直接给出，v7 留下的「甜点完整刻画」待办关闭。')
     A('')
     A('---')
     A('')
@@ -368,7 +373,7 @@ def run_smoke():
         out = m(x)
         loss = Fn.cross_entropy(out.reshape(-1, 8192), x.reshape(-1)) + 0.05 * m.comp_reg
         loss.backward()
-        print(f'  {v:20s} out={tuple(out.shape)} loss={loss.item():.3f} -> completed fwd+bwd at seq 2048 bs 1 (previously OOM)')
+        print(f'  {v:20s} out={tuple(out.shape)} loss={loss.item():.3f} -> fwd+bwd OK at seq 2048 bs 1')
         del m, out, loss, x
         gc.collect()
         if DEVICE.type == 'cuda':
