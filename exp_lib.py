@@ -32,7 +32,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 BUDGET = dict(total_yuan=140.0, price_per_hour=2.4, margin=0.93, already_spent_yuan=0.0, state_path='autodl_budget_state.json')
-CODE_SEMANTICS = 'v11.113'
+CODE_SEMANTICS = 'v11.114'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
@@ -401,12 +401,14 @@ def _rank_blocks(masked, B, ties):
     order = torch.sort(masked.flip(1), dim=1, stable=True, descending=True).indices
     return torch.sub(B - 1, order, out=order).to(torch.int32)
 
-def _indexer_selection(scores, causal, k, ties='earliest'):
+def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     n, B = scores.shape
     if ties not in ('earliest', 'latest'):
         raise ValueError(f'unknown tie rule {ties!r}')
     k_req = max(int(k), 0)
     if k_req <= 0:
+        if out_valid is not None:
+            out_valid[:] = [torch.zeros(n, 0, dtype=torch.bool, device=scores.device)]
         return torch.empty(n, 0, device=scores.device, dtype=torch.int32)
     k = min(k_req, B)
     finite = torch.isfinite(scores)
@@ -434,12 +436,17 @@ def _indexer_selection(scores, causal, k, ties='earliest'):
     del grid, _keep_w
     pad_blk = causal.to(torch.int32).argmax(dim=1).to(torch.int32)
     idx_out = torch.where(kept >= 0, kept, pad_blk[:, None])
+    if out_valid is not None:
+        valid_cols = kept >= 0
+        if k_req > _w_keep:
+            valid_cols = torch.cat([valid_cols, torch.zeros(n, k_req - _w_keep, dtype=torch.bool, device=scores.device)], dim=1)
+        out_valid[:] = [valid_cols]
     if k_req > _w_keep:
         pad = pad_blk[:, None].expand(n, k_req - _w_keep)
         idx_out = torch.cat([idx_out, pad], dim=1)
     return idx_out
 
-def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_mask=True, query_chunk=2048, random_select=False, pre_qI=None, pre_w=None):
+def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_mask=True, query_chunk=2048, random_select=False, pre_qI=None, pre_w=None, out_valid=None):
     n = H.shape[0]
     B = comp_kv.shape[0]
     dev = H.device
@@ -483,7 +490,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     scores = torch.cat(score_chunks, dim=0)
     out_dtype = scores.dtype
     with torch.no_grad():
-        idx = _indexer_selection(scores, causal, k)
+        idx = _indexer_selection(scores, causal, k, out_valid=out_valid)
     scores.masked_fill_(~causal, float('-inf'))
     soft = F.softmax(scores, dim=-1)
     soft = torch.nan_to_num(soft)
@@ -596,7 +603,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
         out[s:e] = torch.einsum('nhm,nmhd->nhd', attn, Vset)
     return out
 
-def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None):
+def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None):
     n = q.shape[0]
     dev = q.device
     if mem_budget_bytes is None:
@@ -629,6 +636,16 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         pos = pos_all[s:e]
         ib = topk_idx[s:e].long()
         sel_blk = torch.gather(block_readable(pos, last_tok), 1, ib)
+        keep = None
+        if sel_valid is not None:
+            sv = sel_valid[s:e]
+            k_nb = int(ib.shape[1])
+            nval = sv.sum(1)
+            rep = _arange_cache(k_nb, dev)[None, :] == nval[:, None]
+            pad_val = ib.gather(1, nval.clamp(max=k_nb - 1)[:, None])
+            pad_dup = ((ib == pad_val) & sv).any(1, keepdim=True)
+            keep = sv | (rep & ~pad_dup)
+            sel_blk = sel_blk & keep
         win_global = pos[:, None] - (w - 1) + rel[None, :]
         win_valid = win_global >= 0
         both_idx = _both_idx_all[s:e]
@@ -643,6 +660,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
             continue
         soft_g = soft[s:e].gather(1, ib)
+        if keep is not None:
+            soft_g = soft_g * keep.to(soft_g.dtype)
         _nb = int(ib.shape[1])
         kb = Kset[:, :_nb]
         kw = Kset[:, _nb:]
@@ -895,9 +914,10 @@ class HybridAttention(nn.Module):
                 out = _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None)
         else:
             topk = cfg.index_topk
-            topk_mask, topk_idx, soft = lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, return_mask=T <= 1024, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None)
+            _sel_valid_box = [] if T > 1024 else None
+            topk_mask, topk_idx, soft = lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, return_mask=T <= 1024, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box)
             if T > 1024:
-                out = gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None)
+                out = gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0])
             else:
                 out = _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None)
         return (self.W_o(out.reshape(T, self.nh * self.hd)), gate_mean)
@@ -2583,7 +2603,7 @@ def aggregate(summary):
         if v in ('full', 'full_sw128_matched'):
             continue
         key = _agg_key(v, tag, fp_idx)
-        base_recs, base_tag = _baseline_for(tag, fp_idx, _sw_groups)
+        base_recs, base_tag = _baseline_for(tag, fp_idx, _sw_groups, recs)
         if base_recs is None:
             continue
         if base_tag != tag:

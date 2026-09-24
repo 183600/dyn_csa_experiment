@@ -260,6 +260,12 @@ class HybridAttentionRoPE(L.HybridAttention):
             pos = pos_all[s:e]
             ib = topk_idx[s:e].long()
             sel = torch.gather(L.block_readable(pos, last_tok), 1, ib)
+            if ib.shape[1] > 1:
+                _dup_mm = ib[:, :, None] == ib[:, None, :]
+                _keep = ~_dup_mm.tril(-1).any(-1)
+                sel = sel & _keep
+            else:
+                _keep = None
             pos_b = last_tok[ib].float()
             wg = pos[:, None] - (w - 1) + rel[None, :]
             wvalid = wg >= 0
@@ -275,6 +281,8 @@ class HybridAttentionRoPE(L.HybridAttention):
             if soft is not None:
                 nb = ib.shape[1]
                 sv = torch.gather(soft[s:e], 1, ib)
+                if _keep is not None:
+                    sv = sv.masked_fill(~_keep, 1.0)
                 sp = (1.0 - sv).clamp(min=1e-12, max=1.0)
                 soft_log = torch.log(sp)
                 soft_log.masked_fill_(sv >= 1.0, torch.finfo(sv.dtype).min)
@@ -1133,8 +1141,13 @@ def run_lenphase(payload, guard=None, label=''):
                 gc.collect()
                 torch.cuda.empty_cache()
             key = f'{v}::seed{seed}'
-            if L.result_is_current(summary.get(key), CKPT_CODE, 'by_len'):
-                continue
+            _cur = summary.get(key)
+            if L.result_is_current(_cur, CKPT_CODE, 'by_len'):
+                if all(L.by_len_cells([_cur], Ln) for Ln in eval_lens):
+                    continue
+                print(f'[resume] {key}: by_len record is stamped current but at least one eval length holds no usable measurement (error cell) — re-evaluating the missing lengths')
+                del summary[key]
+                L.atomic_write_json(spath, summary, indent=2)
             _ckp = torch.load(ck, map_location='cpu', weights_only=False)
             model = L.SmallGPT(_ckp.get('vocab', vocab), 256, 6, 8, 32, _ckp.get('train_len', train_len), _ckp['cfg'], mlp_ratio=_ckp['mlp_ratio']).to(DEVICE)
             model.load_state_dict(_ckp['sd'])
