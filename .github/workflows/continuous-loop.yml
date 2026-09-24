@@ -1,0 +1,140 @@
+name: Continuous Loop
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 兜底：万一链路断了，6 小时一次 cron 也能接上
+    - cron: '0 */6 * * *'
+
+# 同一时刻只跑一个，避免 cron 与 dispatch 重叠
+concurrency:
+  group: continuous-loop
+  cancel-in-progress: false
+
+jobs:
+  run-opencode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330        # 5h 任务 + 30min 收尾缓冲
+    permissions:
+      contents: write           # push 提交
+      actions: write            # 关键：允许 workflow_dispatch 下一个 run
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install opencode
+        run: npm i -g opencode-ai
+
+      - name: Configure opencode (NVIDIA endpoint)
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: |
+          mkdir -p ~/.config/opencode
+          cat > ~/.config/opencode/opencode.json <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "nvidia": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "NVIDIA",
+                "options": {
+                  "baseURL": "https://integrate.api.nvidia.com/v1",
+                  "apiKey": "{env:NVIDIA_API_KEY}"
+                },
+                "models": {
+                  "moonshotai/kimi-k3": { "name": "moonshotai/kimi-k3" }
+                }
+              }
+            },
+            "model": "nvidia/moonshotai/kimi-k3"
+          }
+          EOF
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run opencode for ~5 hours
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: |
+          set +e
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          # 预留 15 分钟做清理 / push / 触发下一次
+          DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
+          PROMPT='确保代码没有影响实验结果的bug(修复所有的bug)，优化性能和显存占用(优化只要不会明显降低性能就可以做)，不要管之前修的bug，不要写修复了哪些bug，确保远程仓库里面没有实验结果和REPORTxx.md以及autodl_budgetxx.json，同时远程仓库docs目录只留design_notes.md，确保远程仓库里面没有性能、修复了哪些bug和显存占用的记录（注释里也没有）'
+
+          i=0
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            i=$((i+1))
+            echo "=========== opencode iteration #$i ==========="
+            
+            opencode run "$PROMPT"
+            EXIT_CODE=$?
+            
+            if [ $EXIT_CODE -ne 0 ]; then
+              echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE"
+              # 关键修复：如果出现 API 错误，不要立刻疯狂重试，等待 1 分钟
+              sleep 60
+              
+              # 如果 API 彻底崩溃，主动打破循环，等 6 小时后的 cron 再来
+              if [ $EXIT_CODE -eq 1 ] && [ "$i" -gt 10 ]; then
+                # 这里可以加入关键词检查，比如如果日志中有 "Unexpected server error" 就 break
+                # 避免在 API 长时间宕机时无限空转
+                echo "多次请求失败，跳过本轮，等待定时任务唤醒"
+                break
+              fi
+            fi
+
+            # 每轮结束就推一次，避免 runner 被回收丢改动
+            git add -A || true
+            git commit -m "auto: iteration $i" || true
+            
+            # 先拉取防止远程冲突
+            git pull --rebase origin "$BRANCH" || true
+            git push origin "HEAD:${BRANCH}" || echo "[warn] push #$i failed"
+            
+            sleep 5
+          done
+
+      - name: Cleanup repo artifacts
+        run: |
+          set +e
+          # 1) 删实验报告 / 预算文件
+          find . -type f -name 'REPORT*.md'         -not -path './.git/*' -delete
+          find . -type f -name 'autodl_budget*.json' -not -path './.git/*' -delete
+          # 2) docs 目录只留 design_notes.md
+          if [ -d docs ]; then
+            find docs -mindepth 1 -maxdepth 1 ! -name 'design_notes.md' -exec rm -rf {} +
+            [ -f docs/design_notes.md ] || : > docs/design_notes.md
+          fi
+
+      - name: Final commit and push
+        run: |
+          set +e
+          git add -A
+          git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          git pull --rebase origin "$BRANCH" || true
+          git push origin "HEAD:${BRANCH}" || echo "[warn] final push failed"
+
+      - name: Trigger next workflow run (self-loop)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          # gh 已预装在 GitHub-hosted runner 上
+          gh workflow run continuous-loop.yml --ref "$BRANCH" \
+            && echo "next run dispatched on ${BRANCH}" \
+            || echo "[warn] dispatch failed, cron fallback will pick up"

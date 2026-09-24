@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+*.ipynb_checkpoints
+*.ipynb
+
+# 数据集 / 大文件缓存（可本地再生，禁止入库）
+wt103_cache/
+*.npy
+*.npz
+*.arrow
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+datasets/
+data/
+*.lmdb
+*.h5
+*.hdf5
+
+# 实验产物不入库：结果目录、分析目录、逐版报告、预算台账
+results_*/
+analysis_*/
+REPORT*.md
+autodl_budget*.json
+
+# docs/ 白名单：只留 design_notes.md
+docs/*
+!docs/design_notes.md
+/build_report_debug.json
+
+# 实验运行时状态
+autodl_budget_state.json
+.ipynb_checkpoints/autodl_budget_state-checkpoint.json
+
+# 临时 / 日志
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+
+# HuggingFace 缓存
+.cache/
+.cache/huggingface/
+~/.cache/huggingface/
+
+# matplotlib / font cache
+.matplotlib/
+fontlist*.json
+
+# smoke 临时产物
+results_smoke/
+results_smoke_bench/
