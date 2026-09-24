@@ -31,8 +31,13 @@ def make_guard():
             if os.path.exists(src):
                 try:
                     st = json.load(open(src, encoding='utf-8'))
-                    g.state['sps_by_class'] = st.get('sps_by_class', {})
-                    g.state['norm_sps'] = st.get('norm_sps')
+                    sbc = st.get('sps_by_class') or {}
+                    norm = st.get('norm_sps')
+                    if not sbc and norm is None:
+                        print(f'[v11] NOTE: {src} holds no calibration data — leaving the guard uncalibrated rather than recording an empty calibration')
+                        continue
+                    g.state['sps_by_class'] = sbc
+                    g.state['norm_sps'] = norm
                     g._save()
                     print(f'[v11] CostGuard calibrated from {src}')
                     break
@@ -185,7 +190,11 @@ def v11_analysis(out='analysis_v11/stats.json'):
         if v.get('status') == 'ok':
             n = len(v['seeds'])
             if not v['mean_crossed']:
-                print(f'  crossover {label:10s} n={n} mean-traj: CENSORED (> {v['mean_traj']['steps'][-1]:g} steps)')
+                _stps = v['mean_traj']['steps']
+                if _stps:
+                    print(f'  crossover {label:10s} n={n} mean-traj: CENSORED (> {_stps[-1]:g} steps)')
+                else:
+                    print(f'  crossover {label:10s} n={n} mean-traj: no eval step shared by every seed — no censored bound')
             elif 'mean_crossover_tokens' in v:
                 print(f'  crossover {label:10s} n={n} mean-traj: step {v['mean_crossover_step']:g} ({v['mean_crossover_tokens']:g} tokens)')
             else:
@@ -424,7 +433,11 @@ def build_report(out='REPORT_v11.md'):
             _tok = f'{v['mean_crossover_tokens'] / 1000000.0:.1f}M' if 'mean_crossover_tokens' in v else 'n/a'
             A(f'| d={v['d']}/{v['n_layers']}L | `{v['outdir']}` | {_ntag} | {v['mean_crossover_step']:g} | {_tok} | 已交叉 |')
         else:
-            last = v['mean_traj']['steps'][-1]
+            _stps = v['mean_traj']['steps']
+            if not _stps:
+                A(f'| d={v['d']}/{v['n_layers']}L | `{v['outdir']}` | {_ntag} | — | — | 无公共 eval 步 |')
+                continue
+            last = _stps[-1]
             _cbeg = f'> {last * v['tokens_per_step'] / 1000000.0:.1f}M' if v.get('tokens_per_step') else '(tokens/step unknown)'
             A(f'| d={v['d']}/{v['n_layers']}L | `{v['outdir']}` | {_ntag} | > {last:g} | {_cbeg} | 删失 |')
     A('')

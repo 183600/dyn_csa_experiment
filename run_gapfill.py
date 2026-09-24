@@ -73,16 +73,16 @@ def synthesize_long_summary():
         _ppls = e.get('ppls') or []
         _seeds = e.get('seeds')
         _real = sorted((r.get('seed') for r in summary.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None)))
-        if not _real:
-            continue
         if _ppls and _seeds is None:
             _unaligned.append((v, len(_ppls), _real))
+            continue
+        if not _real:
             continue
         if _ppls and (len(_seeds) != len(_ppls) or sorted((int(s) for s in _seeds)) != _real):
             _unaligned.append((v, len(_ppls), _real))
     if _unaligned:
         for _v, _n, _real in _unaligned:
-            print(f"[synth] REFUSING to synthesize `{_v}`: the aggregate holds {_n} PPL value(s) but the summary has real per-seed records at seeds {_real}.  Without a verified seed->ppl mapping `enumerate` would attach the wrong seed's number to each key, replacing a genuine measurement with a copy.  Restore the per-seed records (or re-run the panel) — only this variant is skipped; the aligned variants are still rebuilt.")
+            print(f"[synth] REFUSING to synthesize `{_v}`: the aggregate holds {_n} PPL value(s) but carries no verified seed->ppl mapping (real per-seed records at seeds {_real}).  `enumerate` would attach the wrong seed's number to each key, replacing a genuine measurement with a copy.  Restore the per-seed records (or re-run the panel) — only this variant is skipped; the aligned variants are still rebuilt.")
     _unaligned = {v for v, _n, _r in _unaligned}
     for v, e in agg.items():
         if v in _unaligned:

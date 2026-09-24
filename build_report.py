@@ -168,7 +168,7 @@ def paired_row(a_records, b_records):
 
 def sec_header(budget_hrs, spent, price, cap):
     return f'# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）\n> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n> 说明：本报告全部数字由 `build_report.py` 从 `results_*/`、`analysis_v7/`\n> 的落盘产物计算得到，无手填数值。\n\n**预算**：累计 booked {budget_hrs:.2f} GPU·h，估算花费 ¥{spent:.2f} / ¥{cap:.2f}\n（AutoDL RTX 4090，单价按 ¥{price:.2f}/h 保守记账）。\n\n本报告针对外部评审提出的 3 项 P0 阻断项与 P1/P2 缺口逐一补做实验。所有新变体\n（RoPE+QK-norm、dense-warmup、topk 扫描、m=1、长度外推）都经由 **完全相同的\n训练/优化器/LR/评测/CostGuard 代码路径**（对 `exp_lib` 的 `make_layer_cfgs`/\n`SmallGPT` 做 monkey-patch 注入），以保证可比性。长上下文证据采用\n**wikitext 长度外推探针**（train@512 → eval 512..4096）：合成 NIAH 探针在\n本模型规模（d=256/6 层）下两臂均停留在随机水平（已实现并调试过，探针本身\n无信息量），故以自然语料的长度外推替代，同样回应「无长上下文评测」的质疑。\n\n'
-_MODULE_NOTE = '本模块只读：从 `results_*/` 与 `analysis_v7/` 的落盘产物计算\n报告全文，不 import torch（也不 import exp_lib），零 GPU 开销。上面那段\n模块说明文字以 `_MODULE_NOTE` 命名保留，不参与报告正文的渲染。'
+_MODULE_NOTE = '本模块只读：从 `results_*/` 与 `analysis_v7/` 的落盘产物计算\n报告全文，不 import torch（也不 import exp_lib）。上面那段\n模块说明文字以 `_MODULE_NOTE` 命名保留，不参与报告正文的渲染。'
 
 def sec_p0r():
     rope = agg('results_lm_v7_rope')
@@ -356,7 +356,9 @@ def sec_p0e():
             elif slope < -1e-06:
                 x0 = steps[-1] - g_last * 1000.0 / slope
                 if 40000 < x0 <= 400000:
-                    verdict = f'- 按尾段斜率线性外推，差距将在 ~{x0 / 1000:.0f}k 步附近归零（外推仅供参考：学习率已 cosine 衰减到底，后期斜率通常进一步放缓）。\n\n**结论**：40k 步内未发生反演，但差距仍在缓慢收窄。**保守表述**：「等 token budget 下 CSA 收敛更慢，终点差距 由 20k 的 {_g20} 收窄到 40k 的 {g_last:+.1f}，未见交叉」。是否最终追平属外推，不属证据。'
+                    _g20v = gaps.get(20000)
+                    _g20c = f'由 20k 的 **{_g20v:+.1f}** ' if isinstance(_g20v, (int, float)) and math.isfinite(_g20v) else ''
+                    verdict = f'- 按尾段斜率线性外推，差距将在 ~{x0 / 1000:.0f}k 步附近归零（外推仅供参考：学习率已 cosine 衰减到底，后期斜率通常进一步放缓）。\n\n**结论**：40k 步内未发生反演，但差距仍在缓慢收窄。**保守表述**：「等 token budget 下 CSA 收敛更慢，终点差距 {_g20c}收窄到 40k 的 {g_last:+.1f}，未见交叉」。是否最终追平属外推，不属证据。'
                 else:
                     verdict = f'- 线性外推的交叉点在 ~{x0 / 1000:.0f}k 步，超出可信外推范围。\n\n**结论**：40k 步（~246M tokens，约 2 epoch）仍未追平——终点差距 **{g_last:+.1f} PPL**。差距收窄速度在尾段为 {abs(slope):.2f} PPL/1k，即每多花 10k 步约收窄 {abs(slope) * 10:.0f} PPL。**「渐近线更差」在实验可达范围内成立**，更精确的措辞是「等预算收敛更慢且差距长期存在」。'
             else:
@@ -445,7 +447,12 @@ def sec_p1t():
     _n8, _n32 = (_n_of(t8), _n_of(t32))
     lines += ['', '**结论（基于已完成的扫描点）**：', '']
     if all((isinstance(x, (int, float)) for x in (m1m, t8m, t32m))):
-        lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最差的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}，n={min(_n8, _n32)} 同向）：去掉压缩并没有拯救 sparse 臂——在 seq 2048 / 1500 步的受控 budget 下，**压缩不是瓶颈**，评审「缺 m=1 对照」的质疑得到直接回答（方向与整体负结果一致）。')
+        if m1m > t8m and m1m > t32m:
+            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最差的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}，n={min(_n8, _n32)} 同向）：去掉压缩并没有拯救 sparse 臂——在 seq 2048 / 1500 步的受控 budget 下，**压缩不是瓶颈**，评审「缺 m=1 对照」的质疑得到直接回答（方向与整体负结果一致）。')
+        elif m1m < t8m and m1m < t32m:
+            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最好的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}，n={min(_n8, _n32)}）：去掉压缩反而占优——在 seq 2048 / 1500 步的受控 budget 下，**压缩是当前的瓶颈之一**，评审「缺 m=1 对照」的质疑得到直接回答。')
+        else:
+            lines.append(f'1. m=1（{fm(m1m)}）介于 topk8（{fm(t8m)}）与 topk32（{fm(t32m)}）之间，三点排序非单调（n={min(_n8, _n32)}）；评审「缺 m=1 对照」的质疑得到直接回答，但压缩是否瓶颈需结合显著性判断，此处只作方向性表述。')
         if t8m <= t32m:
             _dir = f'topk8 {fm(t8m)} ≤ topk32 {fm(t32m)}：选得更少反而略好，与论文「长序列下低选择率足够」的设计方向一致'
         else:
@@ -594,7 +601,7 @@ def sec_p2s():
 def sec_flops():
     d = load(os.path.join(REPO, 'analysis_v7', 'flops_analytic.json'))
     if not d:
-        return '## 解析 FLOPs / KV-cache（节省评审 P1 效率结论）— （无结果）\n\n'
+        return '## 解析 FLOPs / KV-cache（对应评审 P1 效率问题）— （无结果）\n\n'
     cfg = d.get('config', {})
     rows = d.get('rows', [])
     pick = {512, 2048, 8192, 65536, 1048576}

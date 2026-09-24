@@ -166,11 +166,13 @@ def run_full():
             run_phase(pname, guard)
         except Exception:
             traceback.print_exc()
+            all_ok = False
         all_ok &= git_push(f'v8: phase {pname} results')
     try:
         v8_analysis()
     except Exception:
         traceback.print_exc()
+        all_ok = False
     all_ok &= git_push('v8: paired sign-flip stats (analysis_v8)')
     guard.report()
     print('\n[v8] ALL PHASES DONE.')

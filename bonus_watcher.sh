@@ -6,7 +6,7 @@ PY=/root/miniconda3/bin/python
 START_TS=$(date +%s)
 export V7_BUDGET_YUAN="${V7_BUDGET_YUAN:-107.0}"
 export V7_PRICE_PER_HOUR="${V7_PRICE_PER_HOUR:-2.4}"
-while pgrep -f "bash driver_v7.sh" > /dev/null; do sleep 300; done
+while pgrep -f "driver_v7\.sh" > /dev/null; do sleep 300; done
 echo "=== [bonus] $(date '+%F %T') main driver exited ==="
 if [ ! -f driver_v7.log ]; then
   echo "=== [bonus] driver_v7.log absent -> cannot confirm a clean finish; no bonus ==="

@@ -32,7 +32,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 BUDGET = dict(total_yuan=140.0, price_per_hour=2.4, margin=0.93, already_spent_yuan=0.0, state_path='autodl_budget_state.json')
-CODE_SEMANTICS = 'v11.112'
+CODE_SEMANTICS = 'v11.113'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
@@ -422,12 +422,7 @@ def _indexer_selection(scores, causal, k, ties='earliest'):
         keep = usable
     else:
         win = min(int(k), B)
-        _ord_win = order[:, :win]
-        _cnt = torch.zeros((n, B), dtype=torch.int16, device=scores.device)
-        _cnt.scatter_add_(1, _ord_win, torch.ones_like(_ord_win, dtype=torch.int16))
-        _dupe_in_win = _cnt.gather(1, _ord_win) > 1
-        keep = ~_dupe_in_win & usable[:, :win]
-        del _cnt, _dupe_in_win, _ord_win
+        keep = usable[:, :win]
     dest = keep.cumsum(dim=1)
     dest -= 1
     dest.clamp_(min=0)
@@ -570,7 +565,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
         _max_rows = max(_MIN_CHUNK, int(mem_budget_bytes) // _bytes_per_chunk_row)
         _new_chunk = min(q_chunk, _max_rows)
         if _new_chunk < q_chunk:
-            print(f'[_block_token_attn] q_chunk {q_chunk} -> {_new_chunk} (M={_M}, w={w}, n={n}): bounding the attention transient to the transient budget')
+            print(f'[_block_token_attn] q_chunk {q_chunk} -> {_new_chunk} (M={_M}, w={w}, n={n})')
             q_chunk = _new_chunk
     q_chunk = max(1, min(int(q_chunk), n))
     out = torch.empty_like(q)
@@ -615,7 +610,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         _max_rows = max(_MIN_CHUNK, int(mem_budget_bytes) // _bytes_per_chunk_row)
         _new_chunk = min(q_chunk, _max_rows)
         if _new_chunk < q_chunk:
-            print(f'[gathered_attention] q_chunk {q_chunk} -> {_new_chunk} (topk={topk_idx.shape[1]}, w={w}, n={n}): bounding the gather transient to ~{mem_budget_bytes / 2 ** 20:.0f} MiB')
+            print(f'[gathered_attention] q_chunk {q_chunk} -> {_new_chunk} (topk={topk_idx.shape[1]}, w={w}, n={n})')
             q_chunk = _new_chunk
     q_chunk = max(1, min(int(q_chunk), n))
     out = torch.empty_like(q)
@@ -853,7 +848,7 @@ class HybridAttention(nn.Module):
                 hard_b = gate.detach() > _HALF
                 hard = hard_b.to(gate.dtype)
                 _hon = _cut_merge_mask(hard, cfg.min_block, cfg.max_block, dtype=gate.dtype, device=gate.device)
-                _soft_honoured = gate * (1.0 - _hon)
+                _soft_honoured = gate * _hon
                 gate_mean = ((hard * _hon).sum() + _soft_honoured.sum() - _soft_honoured.detach().sum()) / T
             else:
                 gate_mean = torch.zeros((), device=x.device) if self.need_reg else None
@@ -2547,7 +2542,7 @@ def aggregate(summary):
             entry['tokens_per_step'] = float(np.mean(rates))
     _full_groups = {(tag, fp_idx): recs for (v, tag, fp_idx), recs in _split_groups if v == 'full'}
 
-    def _baseline_for(tag, fp_idx, base_groups):
+    def _baseline_for(tag, fp_idx, base_groups, recs):
         _want = _cfg_fp(recs[0]) if recs else None
         if _want is not None:
             _cands = sorted(base_groups.items(), key=lambda kv: (kv[0][0] != tag, kv[0][1] is None, kv[0][1] if kv[0][1] is not None else -1))
@@ -2563,7 +2558,7 @@ def aggregate(summary):
         if v == 'full':
             continue
         key = _agg_key(v, tag, fp_idx)
-        base_recs, base_tag = _baseline_for(tag, fp_idx, _full_groups)
+        base_recs, base_tag = _baseline_for(tag, fp_idx, _full_groups, recs)
         if base_recs is None:
             print(f'[aggregate] {key}: NO `full` baseline in this panel — dPPL_vs_full not computed')
             continue

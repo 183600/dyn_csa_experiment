@@ -173,7 +173,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 hard = hard_b.to(gate.dtype)
                 if self.need_reg:
                     _hon = L._cut_merge_mask(hard, cfg.min_block, cfg.max_block, dtype=gate.dtype, device=gate.device)
-                    _soft_hon = gate * (1.0 - _hon)
+                    _soft_hon = gate * _hon
                     gate_mean = ((hard * _hon).sum() + _soft_hon.sum() - _soft_hon.detach().sum()) / T
                 with torch.no_grad():
                     gate_bool = locals().get('hard_b')
@@ -233,7 +233,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             _max_rows = max(_MIN_CHUNK, int(mem_budget_bytes) // _bytes_per_chunk_row)
             _new_chunk = min(q_chunk, _max_rows)
             if _new_chunk < q_chunk:
-                print(f'[_rope_attn] q_chunk {q_chunk} -> {_new_chunk} (topk={topk_idx.shape[1]}, w={w}, T={T}): bounding the gather transient to ~{mem_budget_bytes / 2 ** 20:.0f} MiB')
+                print(f'[_rope_attn] q_chunk {q_chunk} -> {_new_chunk} (topk={topk_idx.shape[1]}, w={w}, T={T})')
                 q_chunk = _new_chunk
         _adtype = q.dtype if q.dtype in (torch.float32, torch.float64) else torch.float32
         inv = rope_inv_freq(half, dev, rope_base)
@@ -258,7 +258,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         for s in range(0, T, q_chunk):
             e = min(s + q_chunk, T)
             pos = pos_all[s:e]
-            ib = topk_idx[s:e]
+            ib = topk_idx[s:e].long()
             sel = torch.gather(L.block_readable(pos, last_tok), 1, ib)
             pos_b = last_tok[ib].float()
             wg = pos[:, None] - (w - 1) + rel[None, :]
@@ -342,7 +342,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         return outs
 
     def forward(self, x):
-        if getattr(self, '_dense_warmup', False):
+        if getattr(self, '_dense_warmup', False) and self.cfg.kind in ('csa', 'hca'):
             self.last_gate_mean = None
             return self._dense_warmup_forward(x)
         if getattr(self.cfg, 'rope', False) and self.cfg.kind in ('csa', 'hca'):
@@ -488,6 +488,9 @@ PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
 def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None):
     L.set_seed(seed)
+    L._attb_bump_epoch()
+    if variant in set(L.PARAM_MATCHED) | set(PARAM_MATCHED_V7) and float(mlp_ratio) == 4.0:
+        raise ValueError(f'{variant} is a PARAM-MATCHED baseline but was given the default mlp_ratio=4; its MLP must be widened to match its sparse reference arm, or the comparison is not parameter-controlled. Pass mlp_ratio=L.variant_mlp_ratio(...).')
     cfgs = L.make_layer_cfgs(n_layers, variant)
     model = L.SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
     n_param = L.count_params(model)
@@ -750,7 +753,7 @@ def flops_analysis(outdir='analysis_v7', seq_lens=None):
         rows.append({'seq_len': n, 'sel_ratio': min(k, B) / B if B else 1.0, 'dense_flops': dense, 'csa_flops': csa, 'hca_flops': hca, 'hybrid_flops': hybrid, 'csa_over_dense': csa / dense, 'hybrid_over_dense': hybrid / dense, 'kv_dense': kv_dense, 'kv_csa': kv_csa, 'kv_hca': kv_hca, 'kv_hybrid': kv_hybrid, 'csa_kv_over_dense': kv_csa / kv_dense, 'hybrid_kv_over_dense': kv_hybrid / kv_dense})
     cross = next((r['seq_len'] for r in rows if r['csa_over_dense'] < 1.0), None)
     if cross is None:
-        print('[flops] NOTE: under the corrected accounting CSA is NOT cheaper than dense at any tested length — no crossover exists in this config; reporting None instead of the old (artifactual) value.')
+        print('[flops] NOTE: under this accounting CSA is NOT cheaper than dense at any tested length — no crossover exists in this config; reporting None.')
     L.atomic_write_json(os.path.join(outdir, 'flops_analytic.json'), {'config': {'d': d, 'heads': H, 'd_head': Dh, 'layers': L_layers, 'm': m, 'topk': k, 'window': w, 'm_hca': mph}, 'crossover_seq_len_csa_beats_dense': cross, 'rows': rows})
     L.atomic_write_csv(os.path.join(outdir, 'flops_analytic.csv'), None, rows)
     _flops_plot(rows, outdir)
@@ -929,7 +932,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 _meta = torch.load(ck, map_location='cpu', weights_only=False)
                 stale = _meta.get('code') != CKPT_CODE
                 if stale:
-                    print(f'[niah] {v} s{seed}: checkpoint predates the v11 changes (code={_meta.get('code')!r}) — RETRAINING')
+                    print(f'[niah] {v} s{seed}: checkpoint predates CKPT_CODE={CKPT_CODE} (code={_meta.get('code')!r}) — RETRAINING')
                 del _meta
             if stale or not os.path.exists(ck):
                 if guard is not None:
@@ -1089,18 +1092,19 @@ def run_lenphase(payload, guard=None, label=''):
                 _meta = torch.load(ck, map_location='cpu', weights_only=False)
                 stale = _meta.get('code') != CKPT_CODE
                 if stale:
-                    print(f'[p1l] {v} s{seed}: checkpoint predates the v11 changes (code={_meta.get('code')!r}) — RETRAINING')
+                    print(f'[p1l] {v} s{seed}: checkpoint predates CKPT_CODE={CKPT_CODE} (code={_meta.get('code')!r}) — RETRAINING')
                 del _meta
             if stale or not os.path.exists(ck):
+                key0 = f'{v}::seed{seed}'
+                if not L.result_is_current(summary.get(key0), CKPT_CODE, 'by_len'):
+                    if key0 in summary:
+                        print(f'[p1l] {v} s{seed}: cached eval predates CKPT_CODE={CKPT_CODE} — dropped, will re-evaluate the retrained weights')
+                        del summary[key0]
                 if guard is not None:
                     est = guard.estimate_seconds(steps, d=256, n_layers=6, seq_len=train_len, batch_size=12)
                     if not guard.can_start(est):
                         print(f'[budget] SKIP lenphase train {v} s{seed}')
                         continue
-                if not L.result_is_current(summary.get(f'{v}::seed{seed}'), CKPT_CODE, 'by_len'):
-                    if f'{v}::seed{seed}' in summary:
-                        print(f'[p1l] {v} s{seed}: cached eval predates CKPT_CODE={CKPT_CODE} — dropped, will re-evaluate the retrained weights')
-                        del summary[f'{v}::seed{seed}']
                 t0 = time.time()
                 L.set_seed(seed)
                 cfgs = L.make_layer_cfgs(6, v)
@@ -1128,13 +1132,13 @@ def run_lenphase(payload, guard=None, label=''):
                 del model
                 gc.collect()
                 torch.cuda.empty_cache()
+            key = f'{v}::seed{seed}'
+            if L.result_is_current(summary.get(key), CKPT_CODE, 'by_len'):
+                continue
             _ckp = torch.load(ck, map_location='cpu', weights_only=False)
             model = L.SmallGPT(_ckp.get('vocab', vocab), 256, 6, 8, 32, _ckp.get('train_len', train_len), _ckp['cfg'], mlp_ratio=_ckp['mlp_ratio']).to(DEVICE)
             model.load_state_dict(_ckp['sd'])
             mp = None if not getattr(model, 'use_abs_pe', True) else _ckp.get('max_seq', train_len)
-            key = f'{v}::seed{seed}'
-            if L.result_is_current(summary.get(key), CKPT_CODE, 'by_len'):
-                continue
             r = eval_length_gen(model, val_ids, eval_lens, DEVICE, max_pos=mp)
             summary[key] = {'variant': v, 'seed': seed, 'params': _ckp['params'], 'max_pos': mp, 'by_len': r, '_code': CKPT_CODE}
             print(f'  [p1l] {v:18s} s{seed} ' + '  '.join((f'L{k}={vv.get('ppl', float('nan')):.2f}' for k, vv in sorted(r.items()))))

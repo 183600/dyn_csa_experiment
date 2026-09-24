@@ -33,8 +33,13 @@ def make_guard():
             if os.path.exists(src):
                 try:
                     st = json.load(open(src, encoding='utf-8'))
-                    g.state['sps_by_class'] = st.get('sps_by_class', {})
-                    g.state['norm_sps'] = st.get('norm_sps')
+                    sbc = st.get('sps_by_class') or {}
+                    norm = st.get('norm_sps')
+                    if not sbc and norm is None:
+                        print(f'[v10] NOTE: {src} holds no calibration data — leaving the guard uncalibrated rather than recording an empty calibration')
+                        continue
+                    g.state['sps_by_class'] = sbc
+                    g.state['norm_sps'] = norm
                     g._save()
                     print(f'[v10] CostGuard calibrated from {src}')
                     break
@@ -54,7 +59,8 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg):
     target = cfg['target']
     vocab = int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
     far = eval_len - target
-    k = int(round(rho * far))
+    n_far = far + 1
+    k = int(round(rho * n_far))
     nll_sum = []
     n_tok = []
     n_ch = max(1, int(cfg['chunk']))
@@ -63,8 +69,8 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg):
         for j in range(i, min(i + n_ch, n_seq)):
             ids = np.asarray(val_ids[j, :eval_len + 1], dtype=np.int64).copy()
             if k > 0:
-                rng = np.random.default_rng(eval_len * 1000003 + j * 10007 + k)
-                pos = rng.choice(far, size=k, replace=False)
+                rng = np.random.default_rng((eval_len * 1000003 + j * 10007) * 1048576 + int(round(rho * 1048576)))
+                pos = rng.choice(n_far, size=k, replace=False)
                 ids[pos] = rng.integers(0, vocab, size=k)
             rows.append(ids)
         ids = torch.from_numpy(np.stack(rows)).to(DEVICE)
@@ -86,7 +92,7 @@ def _cell_ppl(nll_sum, n_tok):
     return math.exp(total / nt)
 
 def _probe_fingerprint(cfg):
-    return {'n_seq': int(cfg['n_seq']), 'chunk': int(cfg['chunk']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'stat': 'ppl_pooled_nll_v1'}
+    return {'n_seq': int(cfg['n_seq']), 'chunk': int(cfg['chunk']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'stat': 'ppl_pooled_nll_v2'}
 
 def _probe_params_current(rec, fp):
     return isinstance(rec, dict) and rec.get('probe_params') == fp
@@ -123,7 +129,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 continue
             d = torch.load(ck, map_location='cpu', weights_only=False)
             if d.get('code') != V.CKPT_CODE:
-                print(f'[p3mp] REFUSE {v} s{seed}: checkpoint predates the v11 changes (code={d.get('code')!r}) — re-run the training phase (P3MT/P4MT) first')
+                print(f'[p3mp] REFUSE {v} s{seed}: checkpoint predates the current code stamp (code={d.get('code')!r}) — re-run the training phase (P3MT/P4MT) first')
                 del d
                 continue
             _tr = (mech_summ or {}).get(f'{v}::seed{seed}') or {}
@@ -198,8 +204,8 @@ def run_phase(name, guard):
         return s
     raise SystemExit(f'unknown phase {name}')
 
-def _ppl_by_seed(outdir):
-    return V9._ppl_by_seed(outdir)
+def _ppl_by_seed(outdir, full=False):
+    return V9._ppl_by_seed(outdir, full=full)
 
 def _hist_by_seed(outdir, variant):
     sp = os.path.join(outdir, 'summary.json')
@@ -451,7 +457,11 @@ def v10_analysis(out='analysis_v10/stats.json'):
     for label, v in xo.items():
         if v.get('status') == 'ok':
             if not v['mean_crossed']:
-                print(f'  crossover {label:10s} mean-traj: CENSORED (> {v['mean_traj']['steps'][-1]:g} steps)')
+                _stps = v['mean_traj']['steps']
+                if _stps:
+                    print(f'  crossover {label:10s} mean-traj: CENSORED (> {_stps[-1]:g} steps)')
+                else:
+                    print(f'  crossover {label:10s} mean-traj: no eval step shared by every seed — no censored bound')
             elif 'mean_crossover_tokens' in v:
                 print(f'  crossover {label:10s} mean-traj: step {v['mean_crossover_step']:g} ({v['mean_crossover_tokens']:g} tokens)')
             else:
@@ -601,7 +611,11 @@ def build_report(out='REPORT_v10.md'):
             _tok = f'{v['mean_crossover_tokens'] / 1000000.0:.1f}M' if 'mean_crossover_tokens' in v else 'n/a'
             A(f'| d={v['d']}/{v['n_layers']}L | `{v['outdir']}` | {_ntag} | {v['mean_crossover_step']:g} | {_tok} | 已交叉 |')
         else:
-            last = v['mean_traj']['steps'][-1]
+            _stps = v['mean_traj']['steps']
+            if not _stps:
+                A(f'| d={v['d']}/{v['n_layers']}L | `{v['outdir']}` | {_ntag} | — | — | 无公共 eval 步 |')
+                continue
+            last = _stps[-1]
             _tok = f'{last * v['tokens_per_step'] / 1000000.0:.1f}M' if v.get('tokens_per_step') else 'n/a'
             A(f'| d={v['d']}/{v['n_layers']}L | `{v['outdir']}` | {_ntag} | > {last:g} | > {_tok} | 删失（窗内未交叉） |')
     A('')

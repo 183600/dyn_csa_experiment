@@ -116,10 +116,26 @@ def main(argv=None):
     lines.append('# fuse vs no-fuse — 零 GPU 边界统计对比（全部数字由落盘产物计算）\n')
     lines.append('> 数据来源：`results_lm_v4_abl/summary.json`（1500 步 × 3 seeds，seq 512）与\n> `results_lm_v3_1500/summary.json`（同配置核心面板）。无权重、无 GPU，\n> 仅使用每条 run 记录的 `stats`（逐层边界对齐 + 块长统计）与 `ppl_history`。\n')
     lines.append('**容差说明（诚实记录）**：落盘的边界对齐只在 `tol=1` 下计算（`boundary_alignment(..., tol=1)`），逐 token 的切点位置未保存、模型权重未保存，因此**无法离线重算其它容差**。下文改用 precision / recall / 相对随机基线的超额（excess）分解来回答「F1 提升从哪来、是否真实」——这一分解对容差选择不敏感。\n')
+    def _pair_cells_ok(a, b):
+        try:
+            for v in (a, b):
+                for s in SEEDS:
+                    rec(v, s)
+            layers_of(a)
+            layers_of(b)
+            return None
+        except (KeyError, ValueError) as e:
+            return str(e)
     for pair, tag in [(('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn'), 'A. 同面板配对（hybrid，n=3，干净对照）'), (('csa_dyn_fuse', 'csa_dynamic'), 'B. 跨面板同配置（纯 CSA 栈；仅作参考，非严格配对）')]:
         a, b = pair
         lines.append(f'\n## {tag}\n')
         lines.append(f'`{a}` (fuse) vs `{b}` (no-fuse)\n')
+        _unavail = _pair_cells_ok(a, b)
+        if _unavail:
+            lines.append(f'\n**该对照不可用**（{_unavail}）；其余部分照常输出。\n')
+            stats_out[f'{a}__vs__{b}'] = dict(unavailable=_unavail)
+            report[tag] = False
+            continue
         layers = layers_of(a)
         header = '| 层 | 指标 | no-fuse (mean±std) | fuse (mean±std) | Δ(fuse−no-fuse) |'
         lines.append(header)
@@ -210,19 +226,27 @@ def main(argv=None):
     if _pgate_drop:
         lines.append(f'> 注：分块偏移量的配对已按 `pair_reason` 过滤，{_pgate_drop} 因两臂配置/预算不一致被排除；下方偏移量是在 {_pair_ok_seeds} 上计算的。\n')
     for v, (panel_name, label, fused) in VARIANTS.items():
-        _, Mm = per_seed_layer(v, 'len_mean')
-        _, Ms = per_seed_layer(v, 'len_std')
-        _, Mx = per_seed_layer(v, 'len_max')
-        _, Mf = per_seed_layer(v, 'frac_at_min')
-        _, Mb = per_seed_layer(v, 'blocks')
-        _, Md = per_seed_layer(v, 'delta')
+        try:
+            _, Mm = per_seed_layer(v, 'len_mean')
+            _, Ms = per_seed_layer(v, 'len_std')
+            _, Mx = per_seed_layer(v, 'len_max')
+            _, Mf = per_seed_layer(v, 'frac_at_min')
+            _, Mb = per_seed_layer(v, 'blocks')
+            _, Md = per_seed_layer(v, 'delta')
+        except (KeyError, ValueError) as e:
+            lines.append(f'| `{v}` | — | — | — | — | — | — |  （该变体数据缺失：{e}）|')
+            continue
         lines.append(f'| `{v}` | {np.nanmean(Mm):.3f} | {np.nanmean(Ms):.3f} | {np.nanmean(Mx):.1f} | {np.nanmean(Mf):.3f} | {np.nanmean(Mb):.1f} | {np.nanmean(Md):+.3f} |')
     lines.append('')
     plt.rcParams.update({'font.size': 10})
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.6))
     for ax, (a, b, ttl) in zip(axes, [('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn', 'hybrid stack (in-panel paired)'), ('csa_dyn_fuse', 'csa_dynamic', 'pure CSA stack (cross-panel)')]):
         for v, color, lab in [(b, 'steelblue', f'{b} (no-fuse)'), (a, 'darkorange', f'{a} (fuse)')]:
-            hs = [dict(rec(v, s)['ppl_history']) for s in SEEDS]
+            try:
+                hs = [dict(rec(v, s)['ppl_history']) for s in SEEDS]
+            except (KeyError, ValueError) as e:
+                print(f'[fuse_analysis] NOTE: skipping trajectory of `{v}` — {e}')
+                continue
             steps = _axis_steps(hs)
             if not steps:
                 continue

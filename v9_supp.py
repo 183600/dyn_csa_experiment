@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import v8_supp as V8
 V = V8.V
+V7 = V8.V
 L = V8.L
 REPO = V8.REPO
 DEVICE = L.DEVICE
@@ -27,10 +28,20 @@ def _v9_block_forward(self, x):
     if _V9_CKPT['on'] and self.training and torch.is_grad_enabled() and x.requires_grad:
         _acfg = self.attn.cfg
         if getattr(_acfg, 'dynamic', False) or getattr(_acfg, 'chunking', 'fixed') != 'fixed':
-            raise RuntimeError(f'gradient checkpointing under _V9_CKPT is only valid for fixed-chunking, non-dynamic arms (got chunking={getattr(_acfg, 'chunking', None)!r}, dynamic={getattr(_acfg, 'dynamic', None)!r}): the recompute in backward would overwrite `last_gate_mean` after the gate regularizer was read, silently zeroing its gradient')
-        return _ckpt.checkpoint(_orig_block_forward, self, x, use_reentrant=False)
+            raise RuntimeError(f'gradient checkpointing under _V9_CKPT is only enabled for fixed-chunking, non-dynamic arms (got chunking={getattr(_acfg, 'chunking', None)!r}, dynamic={getattr(_acfg, 'dynamic', None)!r}); dynamic arms would recompute a different gate state in backward')
+        return _ckpt.checkpoint(_orig_block_forward, self, x, use_reentrant=False, preserve_rng_state=False)
     return _orig_block_forward(self, x)
 L.Block.forward = _v9_block_forward
+_orig_blockrope_forward = V7.BlockRoPE.forward
+
+def _v9_blockrope_forward(self, x):
+    if _V9_CKPT['on'] and self.training and torch.is_grad_enabled() and x.requires_grad:
+        _acfg = self.attn.cfg
+        if getattr(_acfg, 'dynamic', False) or getattr(_acfg, 'chunking', 'fixed') != 'fixed':
+            raise RuntimeError(f'gradient checkpointing under _V9_CKPT is only enabled for fixed-chunking, non-dynamic arms (got chunking={getattr(_acfg, 'chunking', None)!r}, dynamic={getattr(_acfg, 'dynamic', None)!r}); dynamic arms would recompute a different gate state in backward')
+        return _ckpt.checkpoint(_orig_blockrope_forward, self, x, use_reentrant=False, preserve_rng_state=False)
+    return _orig_blockrope_forward(self, x)
+V7.BlockRoPE.forward = _v9_blockrope_forward
 BUDGET_V9 = dict(L.BUDGET)
 BUDGET_V9.update(total_yuan=float(os.environ.get('V9_BUDGET_YUAN', 25.0)), price_per_hour=float(os.environ.get('V9_PRICE_PER_HOUR', 2.4)), state_path='autodl_budget_state_v9.json', already_spent_yuan=0.0)
 
@@ -354,12 +365,14 @@ def run_full():
             run_phase(pname, guard)
         except Exception:
             traceback.print_exc()
+            all_ok = False
         all_ok &= git_push(f'v9: phase {pname} results')
     try:
         v9_analysis()
         build_report()
     except Exception:
         traceback.print_exc()
+        all_ok = False
     all_ok &= git_push('v9: paired sign-flip stats + REPORT_v9.md (analysis_v9)')
     guard.report()
     print('\n[v9] ALL PHASES DONE.')
