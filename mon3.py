@@ -24,7 +24,7 @@ def proc_alive():
                 cmd = f.read().decode('utf-8', 'replace')
         except Exception:
             continue
-        if 'v7_supp.py' in cmd and 'python' in cmd:
+        if 'python' in cmd and any((f'v{x}_supp.py' in cmd for x in (7, 8, 9, 10, 11))):
             return int(pid)
     return None
 

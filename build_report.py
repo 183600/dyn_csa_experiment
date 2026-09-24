@@ -113,7 +113,11 @@ def per_seed_ppls(outdir):
     out = collections.defaultdict(dict)
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
-            out[r['variant']][int(r['seed'])] = float(r['ppl'])
+            _slot, _sd = (out[r['variant']], int(r['seed']))
+            if _sd in _slot:
+                print(f'[report] ambiguous (variant, seed) = ({r['variant']!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
+                continue
+            _slot[_sd] = float(r['ppl'])
     return dict(out)
 
 def per_seed_records(outdir):
@@ -121,7 +125,10 @@ def per_seed_records(outdir):
     out = collections.defaultdict(dict)
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
-            out[r['variant']][int(r['seed'])] = r
+            _slot, _sd = (out[r['variant']], int(r['seed']))
+            if _sd in _slot:
+                continue
+            _slot[_sd] = r
     return dict(out)
 
 def _pair_reason(ra, rb):
@@ -323,6 +330,7 @@ def sec_p0e():
                 gaps[st] = c - f_
                 lines.append(f'| {st} | {c:.1f} | {f_:.1f} | **{gaps[st]:+.1f}** |')
             tail = steps[-5:] if len(steps) >= 5 else steps
+            _tail_span_k = (steps[-1] - tail[0]) / 1000.0
             g_last = gaps[steps[-1]]
             xs = [st / 1000.0 for st in tail]
             ys = [gaps[st] for st in tail]
@@ -340,7 +348,7 @@ def sec_p0e():
                 v = gaps.get(step)
                 return f'**{v:+.1f}**' if isinstance(v, (int, float)) and math.isfinite(v) else '**未测量**（该面板无此步）'
             _g20 = _gap_at(20000)
-            lines += ['', '**差距轨迹分析（最近 10k 步窗口，seed 平均）**：', '', f'- 20k 步差距：{_g20} PPL；40k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa 下降 {abs(r_csa):.2f}、dense 下降 {abs(r_full):.2f} PPL/1k）。']
+            lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，seed 平均）**：', '', f'- 20k 步差距：{_g20} PPL；40k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa 下降 {abs(r_csa):.2f}、dense 下降 {abs(r_full):.2f} PPL/1k）。']
             if n_ < 2 or not (math.isfinite(g_last) and math.isfinite(slope)):
                 verdict = f'**结论：尾段差距统计量不可用**（`g_last` 或 `slope` 非有限值：g_last={g_last!r}、slope={slope!r}），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。上表已剔除非有限的曲线点；若此处仍出现，说明该面板的尾段整体缺失，需补跑。'
             elif g_last <= 0:
@@ -488,7 +496,7 @@ def sec_p1l():
         per_v[v] = ratio
         trunc_v[v] = trunc_flags
         if _finite_or_none(ratio) and trunc_flags and trunc_flags[-1]:
-            rt_txt = '×1.00（长端为截断格，单前缀，无信息）'
+            rt_txt = f'×{ratio:.2f}（长端为截断格，与基线不同 token 窗口，不可比）'
         else:
             rt_txt = f'×{ratio:.2f}' if _finite_or_none(ratio) else '—'
         lines.append(f'| `{v}` | ' + ' | '.join(cells) + f' | {rt_txt} |')
@@ -501,7 +509,7 @@ def sec_p1l():
             if not _finite_or_none(rt):
                 continue
             if trunc_v.get(v) and trunc_v[v][-1]:
-                lines.append(f'- `{v}`：**不适用** —— 两端都是截断格（同一段`max_pos` 前缀），比值恒为 ×1.00，对长度外推没有信息量。')
+                lines.append(f'- `{v}`：**不适用** —— 长端截断格覆盖的是另一段文本的最后 `max_pos` 个 token，与基线格不是同一段文本，读数 ×{rt:.2f} 是跨文本窗口的比值，对长度外推没有信息量。')
             else:
                 lines.append(f'- `{v}`：{lens[-1]}/{lens[0]} = ×{rt:.2f}')
         _rope_ok = 'csa_fixed_rope' in per_v and 'full_rope' in per_v and _finite_or_none(per_v['csa_fixed_rope']) and _finite_or_none(per_v['full_rope']) and (not (trunc_v.get('csa_fixed_rope', [0])[-1] and trunc_v.get('full_rope', [0])[-1]))

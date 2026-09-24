@@ -91,17 +91,27 @@ def _add_paired(comparisons, name, panel, a, b, who='', outdir=None):
 def _panel_block(panel):
     out = {}
     for v, d in sorted(panel.items()):
-        vals = list(d.values())
+        recs = dict(d)
+        if recs and all((isinstance(r, dict) for r in recs.values())):
+            by_cfg = {}
+            for s, r in recs.items():
+                by_cfg.setdefault(json.dumps(r.get('run_cfg'), sort_keys=True, default=str), {})[s] = r
+            if len(by_cfg) > 1:
+                keep = max(by_cfg.values(), key=len)
+                print(f'[stats] _panel_block: variant `{v}` spans {len(by_cfg)} distinct run_cfg groups — pooling across configurations is not allowed, so the table keeps only the largest group ({len(keep)}/{len(recs)} seeds) and drops the rest')
+                recs = keep
+        vals = [(r.get('ppl') if isinstance(r, dict) else r) for r in recs.values()]
+        ppl_map = {s: (r.get('ppl') if isinstance(r, dict) else r) for s, r in recs.items()}
         if not vals:
-            out[v] = {'ppls': d, 'n': 0}
+            out[v] = {'ppls': ppl_map, 'n': 0}
             continue
-        out[v] = {'ppls': d, 'mean': float(np.mean(vals)), 'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0, 'n': len(vals)}
+        out[v] = {'ppls': ppl_map, 'mean': float(np.mean(vals)), 'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0, 'n': len(vals)}
     return out
 
 def v8_analysis(out='analysis_v8/stats.json'):
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
-    scale = _ppl_by_seed('results_lm_v5_scale')
-    rope20k = _ppl_by_seed('results_lm_v8_rope20k')
+    scale = _ppl_by_seed('results_lm_v5_scale', full=True)
+    rope20k = _ppl_by_seed('results_lm_v8_rope20k', full=True)
     scale_f = _paired_records('results_lm_v5_scale')
     rope20k_f = _paired_records('results_lm_v8_rope20k')
     abs_long_f = _paired_records('results_lm_v3_long')

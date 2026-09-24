@@ -497,7 +497,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     if return_mask:
         with torch.no_grad():
             m = torch.zeros(n, B, device=dev, dtype=out_dtype)
-            m.scatter_(1, idx, 1.0)
+            m.scatter_(1, idx.long(), 1.0)
             m.masked_fill_(~causal, 0.0)
     return (m, idx, soft)
 
@@ -554,7 +554,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
     win_key = pos[:, None] - (w - 1) + rel[None, :]
     win_valid = win_key >= 0
     win_idx = win_key.clamp(min=0)
-    wv_all = win_valid & (win_key <= pos[:, None])
+    wv_all = win_valid
     _both_idx_all = torch.cat([_arange_cache(n_blk, dev).unsqueeze(0).expand(n, n_blk).to(torch.int32), (win_idx + n_blk).to(torch.int32)], 1)
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
@@ -632,7 +632,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         e = min(s + q_chunk, n)
         qseg = q[s:e]
         pos = pos_all[s:e]
-        ib = topk_idx[s:e]
+        ib = topk_idx[s:e].long()
         sel_blk = torch.gather(block_readable(pos, last_tok), 1, ib)
         win_global = pos[:, None] - (w - 1) + rel[None, :]
         win_valid = win_global >= 0
@@ -1213,8 +1213,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     np.save(tr_path, train_ids)
     np.save(va_path, val_batch)
     np.save(vp_path, val_bnd)
-    with open(me_path, 'w', encoding='utf-8') as f:
-        json.dump({'vocab': vocab}, f)
+    atomic_write_json(me_path, {'vocab': vocab}, indent=0)
     print('[data] cached token ids to disk (resume-safe)')
     del ds
     gc.collect()
@@ -2102,7 +2101,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         print(f'    delta_logit params: {len(delta_params)} (lr x{delta_lr_mult:g})')
 
     def lr_at(step):
-        if step < warmup:
+        if warmup > 0 and step < warmup:
             return lr * (step + 1) / warmup
         t = (step - warmup) / max(steps - warmup, 1)
         return lr * (0.1 + 0.45 * (1.0 + math.cos(math.pi * t)))
@@ -2129,12 +2128,12 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        losses.append(loss.detach())
-        _lv = float(losses[-1]) if (step % log_every == 0 or step == steps - 1) else None
-        if eval_every and (step % eval_every == 0 or step == steps - 1):
+        losses.append(float(loss))
+        _lv = losses[-1]
+        if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
             sub_ppl = eval_ppl(model, val_batch[:eval_subset], device)
-            ppl_hist.append([step, float(sub_ppl)])
-        if step % log_every == 0 or step == steps - 1:
+            ppl_hist.append([step + 1, float(sub_ppl)])
+        if log_every and (step % log_every == 0 or step == steps - 1):
             for li, blk in enumerate(model.blocks):
                 dl = getattr(blk.attn, 'delta_logit', None)
                 if dl is not None:
@@ -2147,6 +2146,13 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         return {'variant': variant, 'seed': seed, 'budget_truncated': True, 'steps_done': step, 'train_time_s': wall}
+    if deadline_ts is not None and time.time() > deadline_ts:
+        print('  [budget] HARD cap reached before the final evaluation - truncating; this run is NOT recorded (raise BUDGET and re-run to retry it)')
+        del model, opt, bpe
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        return {'variant': variant, 'seed': seed, 'budget_truncated': True, 'steps_done': steps, 'train_time_s': wall}
     if val_batch is None:
         ppl, stats = (float('nan'), {})
     else:
@@ -2154,7 +2160,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         stats = compression_report(model, val_batch, device, val_bnd=val_bnd)
         print(f'[{variant} seed={seed}] val PPL = {ppl:.3f}')
         print(f'    block-length diagnostics: {json.dumps(stats, default=float)}')
-    losses = torch.stack(losses).cpu().tolist() if losses else []
+    losses = [float(v) for v in losses]
     result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(np.mean(losses[-50:])), 'ppl_history': ppl_hist, 'delta_trace': delta_trace}
     if return_model:
         result['_model'] = model
@@ -2200,7 +2206,7 @@ class CostGuard:
         self.state['booked_seconds'] += float(seconds)
         self.state['runs'] += 1
         if steps_done and steps_done > 0:
-            f = self._compute_factor(d, n_layers, seq_len, batch_size)
+            f = self._wallclock_factor(d, n_layers, seq_len, batch_size)
             sps = seconds / steps_done
             norm = sps / f
             prev = self.state.get('norm_sps')
@@ -2858,7 +2864,7 @@ def run(cfg=None, seeds=None, guard=None, label=''):
         _mkey = 'default'
     else:
         _mkey = ','.join(sorted((str(_x) for _x in _mg)))
-    fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_wu{cfg.get('warmup', 50)}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_det{determinism_label()}_ac{_attn_chunk_key()}_cs{CODE_SEMANTICS}'
+    fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_wu{cfg.get('warmup', 50)}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_det{determinism_label()}_cs{CODE_SEMANTICS}'
     ratios = {}
     dropped_truncations = []
     stale_dropped = []

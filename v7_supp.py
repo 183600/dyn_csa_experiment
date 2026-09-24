@@ -48,13 +48,12 @@ def rope_cos_sin(head_dim, rope_dim, positions, device, base=10000.0):
     cacheable = isinstance(positions, torch.Tensor) and positions.dtype in (torch.int64, torch.int32) and (positions.numel() > 0)
     if cacheable:
         _np = int(positions.numel())
-        cacheable = int(positions[0]) == 0 and int(positions[-1]) == _np - 1
+        cacheable = int(positions[0]) == 0 and int(positions[-1]) == _np - 1 and (_np == 1 or bool((positions[1:] - positions[:-1] == 1).all()))
     if cacheable:
         key = (float(base), int(rope_dim), int(head_dim), str(device), int(positions.numel()), str(positions.dtype))
         hit = _ROPE_CS_CACHE.get(key)
         if hit is not None:
             return hit
-        cacheable = bool((positions[1:] - positions[:-1] == 1).all())
     half = rope_dim // 2
     inv = rope_inv_freq(half, device, base)
     ang = positions.to(device).double()[:, None] * inv[None, :]
@@ -63,14 +62,16 @@ def rope_cos_sin(head_dim, rope_dim, positions, device, base=10000.0):
         _ROPE_CS_CACHE[key] = out
     return out
 
-def rope_rev_tables(T, half, device, base=10000.0, *, lo=0):
-    key = (int(T), int(lo), int(half), str(device), float(base))
+def rope_rev_tables(T, half, device, base=10000.0, *, lo=0, out_dtype=None):
+    key = (int(T), int(lo), int(half), str(device), float(base), str(out_dtype) if out_dtype is not None else None)
     hit = _ROPE_REV_CACHE.get(key)
     if hit is not None:
         return hit
     inv = rope_inv_freq(half, device, base)
     ang = (-torch.arange(int(lo), int(T), device=device, dtype=torch.float64))[:, None] * inv
     out = (torch.cos(ang), torch.sin(ang))
+    if out_dtype is not None:
+        out = (out[0].to(out_dtype), out[1].to(out_dtype))
     if len(_ROPE_REV_CACHE) < 64:
         _ROPE_REV_CACHE[key] = out
     return out
@@ -252,9 +253,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         _plo, _phi = (int(last_tok[_idx].min()), int(last_tok[_idx].max())) if T > 0 else (0, 0)
         _lo = min(0, _plo, -(w - 1))
         _hi = max(_phi, T - 1)
-        _rc_all, _rs_all = rope_rev_tables(T, half, dev, rope_base, lo=_lo)
-        _rc_tab = _rc_all.to(_adtype)
-        _rs_tab = _rs_all.to(_adtype)
+        _rc_tab, _rs_tab = rope_rev_tables(T, half, dev, rope_base, lo=_lo, out_dtype=_adtype)
         _tab_ok = T > 0 and _hi < T
         for s in range(0, T, q_chunk):
             e = min(s + q_chunk, T)
@@ -537,16 +536,23 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        losses.append(loss.detach())
-        if eval_every and (step % eval_every == 0 or step == steps - 1):
-            ppl_hist.append([step, float(L.eval_ppl(model, val_batch[:eval_subset], device))])
-        if step % log_every == 0 or step == steps - 1:
-            print(f'  step {step:5d}  loss {float(losses[-1]):.4f}  lr {opt.param_groups[0]['lr']:.2e}  dense={getattr(model.blocks[0].attn, '_dense_warmup', False)}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
+        losses.append(float(loss))
+        if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
+            ppl_hist.append([step + 1, float(L.eval_ppl(model, val_batch[:eval_subset], device))])
+        if log_every and (step % log_every == 0 or step == steps - 1):
+            print(f'  step {step:5d}  loss {losses[-1]:.4f}  lr {opt.param_groups[0]['lr']:.2e}  dense={getattr(model.blocks[0].attn, '_dense_warmup', False)}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
     wall = time.time() - t0
+    if deadline_ts is not None and time.time() > deadline_ts:
+        print(f'[{variant} seed={seed} warm={warm_steps}] BUDGET deadline reached before the final evaluation ({wall / 60:.1f} min) — truncating; this cell produced NO measurement and will be retried.')
+        del model, opt, bpe, decay, ndecay, dpar
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        return {'budget_truncated': True, 'steps_done': steps, 'train_time_s': wall}
     ppl = L.eval_ppl(model, val_batch, device)
     stats = L.compression_report(model, val_batch, device, val_bnd=val_bnd)
     print(f'[{variant} seed={seed} warm={warm_steps}] val PPL = {ppl:.3f}  ({wall / 60:.1f} min)')
-    losses = torch.stack(losses).cpu().tolist() if losses else []
+    losses = [float(v) for v in losses]
     res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(np.mean(losses[-50:])), 'ppl_history': ppl_hist, 'delta_trace': {}}
     del model, opt, bpe, decay, ndecay, dpar
     gc.collect()
@@ -1027,11 +1033,27 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
             trunc = True
         x = torch.from_numpy(ids).to(device)
         try:
-            logits = model(x)
-            _lsm = F.log_softmax(logits[:, :-1], dim=-1)
-            nll = float(-_lsm.gather(-1, x[:, 1:].unsqueeze(-1)).double().sum())
-            ppl = math.exp(nll / max(x[:, 1:].numel(), 1))
-            out[int(Ln)] = {'ppl': float(ppl), 'n_tok': int(x[:, 1:].numel()), 'truncated': trunc, 'eval_span': int(x.shape[1])}
+            nll, ntok = (0.0, 0)
+            _r, _chunk = (0, int(ids.shape[0]))
+            while _r < int(ids.shape[0]):
+                _sub = x[_r:_r + _chunk]
+                try:
+                    logits = model(_sub)
+                except RuntimeError as _oe:
+                    if 'out of memory' in str(_oe).lower() and _chunk > 1:
+                        _chunk = max(1, _chunk // 2)
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        print(f'[p1l] L{Ln}: OOM at {_chunk * 2} rows - retrying with {_chunk} row(s)')
+                        continue
+                    raise
+                _lsm = F.log_softmax(logits[:, :-1], dim=-1)
+                nll += float(-_lsm.gather(-1, _sub[:, 1:].unsqueeze(-1)).double().sum())
+                ntok += int(_sub[:, 1:].numel())
+                del logits, _lsm
+                _r += _chunk
+            ppl = math.exp(nll / max(ntok, 1))
+            out[int(Ln)] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': int(x.shape[1])}
         except Exception as e:
             out[int(Ln)] = {'error': f'{type(e).__name__}: {e}'}
     model.train(was)

@@ -25,6 +25,9 @@ _orig_block_forward = L.Block.forward
 
 def _v9_block_forward(self, x):
     if _V9_CKPT['on'] and self.training and torch.is_grad_enabled() and x.requires_grad:
+        _acfg = self.attn.cfg
+        if getattr(_acfg, 'dynamic', False) or getattr(_acfg, 'chunking', 'fixed') != 'fixed':
+            raise RuntimeError(f'gradient checkpointing under _V9_CKPT is only valid for fixed-chunking, non-dynamic arms (got chunking={getattr(_acfg, 'chunking', None)!r}, dynamic={getattr(_acfg, 'dynamic', None)!r}): the recompute in backward would overwrite `last_gate_mean` after the gate regularizer was read, silently zeroing its gradient')
         return _ckpt.checkpoint(_orig_block_forward, self, x, use_reentrant=False)
     return _orig_block_forward(self, x)
 L.Block.forward = _v9_block_forward

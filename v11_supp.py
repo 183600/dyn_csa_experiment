@@ -167,7 +167,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
         ss_res = float(((ys - pred) ** 2).sum())
         ss_tot = float(((ys - ys.mean()) ** 2).sum())
         fit = {'n_points': len(pts), 'slope': float(slope), 'intercept': float(intercept), 'r2': 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan'), 'note': 'log10(crossover_tokens) ~ log10(d_model), untruncated crossovers only', 'excluded_no_rate': sorted(_no_tok), 'excluded_reconstructed': sorted(_recon)}
-    scale384 = V10._ppl_by_seed('results_lm_v5_scale')
+    scale384 = V10._ppl_by_seed('results_lm_v5_scale', full=True)
     scale384_f = V9._paired_records('results_lm_v5_scale')
     panel = V8._panel_block
     comparisons = {}
@@ -301,7 +301,7 @@ def build_report(out='REPORT_v11.md'):
     else:
         A('v11 计划做三处统计收尾：主正面结果（远距干扰注入探针）补到 n=6、两个交叉定位面板补到 n=4、d=384 面板 `full` 臂补到 n=4。')
         A('')
-        A(f'> **⚠ 实际落盘状态（本报告从 disk 实时计算）**：探针对比的最大种子数为 **n={n_contr_max}**（精确符号翻转 p 值下限 {_floor_txt}，**未**跨过 0.05），最小 n={n_probe_min}；交叉面板 {_xo_txt}；d=384 面板 {_n384_txt}。**P4MT/P4MP 的 seeds 3–5 尚未产出**，因此本节的 n 仍停留在 v10 的水平，**「n=6」的统计升级未发生**；相关结论须待补跑后方可作显著性主张。')
+        A(f'> **⚠ 实际落盘状态（本报告从 disk 实时计算）**：探针对比的最大种子数为 **n={n_contr_max}**（精确符号翻转 p 值下限 {_floor_txt}，**未**跨过 0.05），最小配对 n={n_pair_min}；交叉面板 {_xo_txt}；d=384 面板 {_n384_txt}。**P4MT/P4MP 的 seeds 3–5 尚未产出**，因此本节的 n 仍停留在 v10 的水平，**「n=6」的统计升级未发生**；相关结论须待补跑后方可作显著性主张。')
     if _pair_ragged:
         A('')
         A(f'> **⚠ 探针各臂的种子数不一致**：最全的 cell 达 n={n_cells_max}，但最强的对比也只配上 n={n_contr_max} 对，最弱的只有 n={n_tree_min} 对——`full_rope` 与 `csa_fixed_rope` 是分别续训的，任一臂未补满，跨臂对比就只能用两臂的交集。因此表中每个 p 值的实际下限是 {_floor_txt}，**不是**按 cell 数算出的 {2.0 / 2 ** n_cells_max:.3f}；未配满的对比在下面按「未配满」标注，其 Δ 仅作方向性表述。')
@@ -560,12 +560,14 @@ def run_full():
             run_phase(pname, guard)
         except Exception:
             traceback.print_exc()
+            all_ok = False
         all_ok &= git_push(f'v11: phase {pname} results')
     try:
         v11_analysis()
         build_report()
     except Exception:
         traceback.print_exc()
+        all_ok = False
     all_ok &= git_push('v11: stats + REPORT_v11.md (analysis_v11)')
     guard.report()
     print('\n[v11] ALL PHASES DONE.')

@@ -146,7 +146,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 _stale_param = [f'L{Ln}::r{rho}' for Ln, rho in _defs if (summary.get(_cell_key(Ln, rho)) or {}).get('probe_params') is not None and (not _probe_params_current(summary.get(_cell_key(Ln, rho)), _fp))]
                 if _stale_param:
                     print(f'[p3mp] {v} s{seed} {arm}: re-probing {len(_stale_param)} cell(s) whose stored probe parameters differ from the current config ({', '.join(_stale_param[:3])}{('…' if len(_stale_param) > 3 else '')})')
-                cells = [(Ln, rho) for Ln, rho in _defs if not (L.result_is_current(summary.get(_cell_key(Ln, rho)), V.CKPT_CODE, 'ppl_mean') and _probe_params_current(summary.get(_cell_key(Ln, rho)), _fp))]
+                cells = [(Ln, rho) for Ln, rho in _defs if not (L.result_is_current(summary.get(_cell_key(Ln, rho)), V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((summary.get(_cell_key(Ln, rho)) or {}).get('ppl_mean')) and _probe_params_current(summary.get(_cell_key(Ln, rho)), _fp))]
                 if not cells:
                     continue
                 cfgs = []
@@ -243,9 +243,7 @@ def _crossover_step(gap_steps, gap_vals, smooth=1):
     if len(g) != len(s):
         raise ValueError(f'_crossover_step: gap_steps and gap_vals must be the same length ({len(s)} vs {len(g)}) — the returned step indexes the two together, so a silent misalignment would report the crossover at the wrong STEP while looking perfectly well-formed.')
     if smooth > 0 and len(g) > 2 * smooth:
-        ker = np.ones(2 * smooth + 1) / (2 * smooth + 1)
-        gp = np.pad(g, smooth, mode='edge')
-        g = np.convolve(gp, ker, mode='valid')
+        g = np.array([g[max(0, i - smooth):i + smooth + 1].mean() for i in range(len(g))])
     for i in range(len(g)):
         if g[i] > 0 and np.all(g[i:] > 0):
             return (float(s[i]), True)
@@ -361,6 +359,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             _usable[_k] = r
         if _bad_cells:
             print(f'[v10 stats] {len(_bad_cells)} record(s) in {sp} carry no variant/seed/ppl_mean and are skipped (they are error or truncation stubs, not measurements): ' + ', '.join((f'{k}({why})' for k, why in _bad_cells[:4])))
+        _n_bad_pre = len(_bad_cells)
         for k, r in _usable.items():
             p = r.get('probe_params')
             if p is None:
@@ -384,6 +383,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
             grp[r['seed']] = r
         if _dup_cells:
             print(f'[v10 stats] {len(_dup_cells)} probe record(s) share a (cell, seed) identity — their PPL is ambiguous and they are dropped from the pooling: ' + ', '.join((f'{k}' for k, _c, _s in _dup_cells[:4])))
+        _new_bad = _bad_cells[_n_bad_pre:]
+        if _new_bad:
+            print(f'[v10 stats] {len(_new_bad)} record(s) in {sp} lack `probe_params` and are dropped from every mean/paired statistic: ' + ', '.join((f'{k}({why})' for k, why in _new_bad[:4])))
         probe_cells = []
         for (v, arm, Ln, rho), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
@@ -428,7 +430,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
         ss_res = float(((ys - pred) ** 2).sum())
         ss_tot = float(((ys - ys.mean()) ** 2).sum())
         fit = {'n_points': len(pts), 'slope': float(slope), 'intercept': float(intercept), 'r2': 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan'), 'note': 'log10(crossover_tokens) ~ log10(d_model), untruncated crossovers only', 'excluded_no_rate': sorted(dropped), 'excluded_reconstructed': recon}
-    seq2k = _ppl_by_seed('results_lm_v9_seq2k')
+    seq2k = _ppl_by_seed('results_lm_v9_seq2k', full=True)
     seq2k_f = V9._paired_records('results_lm_v9_seq2k')
     comparisons = {}
 
@@ -615,7 +617,10 @@ def build_report(out='REPORT_v10.md'):
                 parts.append(f's{s}: {ps['crossover_step']:g}{('' if ps['crossed'] else '（删失）')}')
             A(f'- d={v['d']}: ' + '；'.join(parts))
         A('')
-    A('**注意**：d=256 的轨迹取自 `results_lm_v3_long/summary.json`（v6 重构件，见 README 记账说明 #1）——逐种子轨迹不可独立恢复，该规模的逐种子交叉步互为副本，只有 seed 均值轨迹的交叉步（~3000 步，1000 步网格）是有效读数。')
+    _xo256 = xo.get('d256_L6') or next((v for v in xo.values() if v.get('d') == 256), {})
+    _xo256_step = _xo256.get('mean_crossover_step')
+    _xo256_txt = f'~{_xo256_step:g} 步' if isinstance(_xo256_step, (int, float)) and math.isfinite(_xo256_step) else '步数未知（该规模无有效交叉读数）'
+    A(f'**注意**：d=256 的轨迹取自 `results_lm_v3_long/summary.json`（v6 重构件，见 README 记账说明 #1）——逐种子轨迹不可独立恢复，该规模的逐种子交叉步互为副本，只有 seed 均值轨迹的交叉步（{_xo256_txt}，eval 网格 1000 步）是有效读数。')
     A('')
     if fit:
         _excl = []
@@ -706,12 +711,14 @@ def run_full():
             run_phase(pname, guard)
         except Exception:
             traceback.print_exc()
+            all_ok = False
         all_ok &= git_push(f'v10: phase {pname} results')
     try:
         v10_analysis()
         build_report()
     except Exception:
         traceback.print_exc()
+        all_ok = False
     all_ok &= git_push('v10: stats + REPORT_v10.md (analysis_v10)')
     guard.report()
     print('\n[v10] ALL PHASES DONE.')
