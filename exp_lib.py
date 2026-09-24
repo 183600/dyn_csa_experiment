@@ -489,11 +489,9 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     out_dtype = scores.dtype
     with torch.no_grad():
         idx = _indexer_selection(scores, causal, k)
-    soft_in = scores.clone()
-    soft_in.masked_fill_(~causal, float('-inf'))
-    soft = F.softmax(soft_in, dim=-1)
+    scores.masked_fill_(~causal, float('-inf'))
+    soft = F.softmax(scores, dim=-1)
     soft = torch.nan_to_num(soft)
-    del soft_in
     del scores, score_chunks
     m = None
     if return_mask:

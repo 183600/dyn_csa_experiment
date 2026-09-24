@@ -118,8 +118,7 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
             why.add(reason)
             skipped.append(s)
             continue
-        if ra.get('run_cfg') is None:
-            unstamped += 1
+        unstamped += (ra.get('run_cfg') is None) + (rb.get('run_cfg') is None)
         dl.append(ra['ppl'] - rb['ppl'])
     if skipped:
         print(f'[stats] {who}{name}: {len(skipped)}/{len(common)} seed(s) NOT paired — {sorted(why)}; excluded from the test')
