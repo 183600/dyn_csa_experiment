@@ -83,7 +83,7 @@ jobs:
             
             if [ $EXIT_CODE -ne 0 ]; then
               echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE"
-              # 遇到 API 错误时等待 1 分钟再重试
+              # 关键修复：如果出现 API 错误，不要立刻疯狂重试，等待 1 分钟
               sleep 60
               
               # 如果 API 彻底崩溃，主动打破循环，等 6 小时后的 cron 再来
