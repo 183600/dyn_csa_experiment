@@ -73,6 +73,8 @@ def synthesize_long_summary():
         _ppls = e.get('ppls') or []
         _seeds = e.get('seeds')
         _real = sorted((r.get('seed') for r in summary.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None)))
+        if not _real:
+            continue
         if _ppls and _seeds is None:
             _unaligned.append((v, len(_ppls), _real))
             continue
@@ -93,6 +95,10 @@ def synthesize_long_summary():
                 if old.get('tokens_seen') is None and e.get('tokens_seen') is not None:
                     old['tokens_seen'] = e['tokens_seen']
                     n_backfill += 1
+                continue
+            if isinstance(old, dict) and 'ppl' in old and (not old.get('synthesized')):
+                n_kept += 1
+                print(f"[synth] keeping real record `{key}` (steps={old.get('steps')}); the aggregate's reconstructed value is NOT written over it")
                 continue
             if isinstance(old, dict) and 'ppl' in old:
                 n_replaced += 1

@@ -129,8 +129,8 @@ def v11_analysis(out='analysis_v11/stats.json'):
         _n_pair_min = min((v['n'] for v in contrasts.values()), default=0)
         _n_pair_cells = max([v['n'] * 2 for v in contrasts.values()], default=0)
         probe['n_seeds'] = {'cell_max': _n_cell_max, 'contrast_paired_max': _n_pair_max, 'contrast_paired_min': _n_pair_min}
-        if _n_pair_cells and _n_pair_min * 2 < _n_cell_max:
-            lowered = sorted((k for k, v in contrasts.items() if v['n'] * 2 < _n_cell_max))
+        if _n_pair_cells and _n_pair_min < _n_cell_max:
+            lowered = sorted((k for k, v in contrasts.items() if v['n'] < _n_cell_max))
             print(f'[v11 stats] NOTE: the fullest probe cell reaches n={_n_cell_max} but the WEAKEST contrast pairs only {_n_pair_min} seeds — the arms are not seed-complete with each other, so every p value below is computed at its own PAIRED count, i.e. the worst floor for this panel is {2.0 / 2 ** _n_pair_min:.3f}, not {2.0 / 2 ** _n_cell_max:.3f}. {len(lowered)}/{len(contrasts)} contrast(s) are limited by this: {lowered[:3]}')
     xo = V10._scale_crossovers()
     pts, _no_tok, _recon = ([], [], [])

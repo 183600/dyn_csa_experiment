@@ -204,8 +204,9 @@ class HybridAttentionRoPE(L.HybridAttention):
                 self._cuts.append(cuts.cpu())
         comp_n = self.kv_norm(attn_kv) if cfg.qk_norm else attn_kv
         qn = self.q_norm(q) if cfg.qk_norm else q
+        sw_n = self.kv_norm(Ca_raw) if cfg.qk_norm else Ca_raw
         k_blk, v_blk = self._split(self.W_kvhead(F.normalize(comp_n, dim=-1)))
-        k_sw, v_sw = self._split(self.W_kvhead(F.normalize(Ca_raw, dim=-1)))
+        k_sw, v_sw = self._split(self.W_kvhead(F.normalize(sw_n, dim=-1)))
         k_blk = F.normalize(k_blk, dim=-1)
         k_sw = F.normalize(k_sw, dim=-1)
         soft = None
@@ -223,7 +224,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         half = rope_dim // 2
         if mem_budget_bytes is None:
             mem_budget_bytes = L._attn_transient_budget(dev)
-        _per_row = 8 * max(1, int(topk_idx.shape[1]) + int(w)) * nh * hd
+        _per_row = 4 * max(1, int(topk_idx.shape[1]) + int(w)) * nh * hd
         _bytes_per_chunk_row = _per_row * q.element_size()
         _MIN_CHUNK = 64
         _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
@@ -310,7 +311,8 @@ class HybridAttentionRoPE(L.HybridAttention):
             Ca = xb @ self.W_aKV
             q = F.normalize(self.W_q(xb).view(T, nh, hd), dim=-1)
             norm_kv = getattr(self.cfg, 'qk_norm', False)
-            _Ca_int = self.kv_norm(Ca) if norm_kv else F.normalize(Ca, dim=-1)
+            _Ca_int = self.kv_norm(Ca) if norm_kv else Ca
+            _Ca_int = F.normalize(_Ca_int, dim=-1)
             if self.cfg.content_mode == 'zero':
                 _Ca_int = torch.zeros_like(_Ca_int)
             k, v = self._split(self.W_kvhead(_Ca_int))
@@ -385,7 +387,6 @@ class BlockRoPE(nn.Module):
         super().__init__()
         self.n1 = L.RMSNorm(d)
         self.attn = HybridAttentionRoPE(d, n_heads, d_head, cfg)
-        torch.manual_seed(torch.initial_seed() + 907)
         self.n2 = L.RMSNorm(d)
         self.mlp = L.MLP(d, int(d * mlp_ratio))
 
@@ -536,15 +537,16 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        losses.append(loss.item())
+        losses.append(loss.detach())
         if eval_every and (step % eval_every == 0 or step == steps - 1):
             ppl_hist.append([step, float(L.eval_ppl(model, val_batch[:eval_subset], device))])
         if step % log_every == 0 or step == steps - 1:
-            print(f'  step {step:5d}  loss {loss.item():.4f}  lr {opt.param_groups[0]['lr']:.2e}  dense={getattr(model.blocks[0].attn, '_dense_warmup', False)}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
+            print(f'  step {step:5d}  loss {float(losses[-1]):.4f}  lr {opt.param_groups[0]['lr']:.2e}  dense={getattr(model.blocks[0].attn, '_dense_warmup', False)}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
     wall = time.time() - t0
     ppl = L.eval_ppl(model, val_batch, device)
     stats = L.compression_report(model, val_batch, device, val_bnd=val_bnd)
     print(f'[{variant} seed={seed} warm={warm_steps}] val PPL = {ppl:.3f}  ({wall / 60:.1f} min)')
+    losses = torch.stack(losses).cpu().tolist() if losses else []
     res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(np.mean(losses[-50:])), 'ppl_history': ppl_hist, 'delta_trace': {}}
     del model, opt, bpe, decay, ndecay, dpar
     gc.collect()
@@ -1019,7 +1021,8 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
         x = torch.from_numpy(ids).to(device)
         try:
             logits = model(x)
-            nll = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)).double(), x[:, 1:].reshape(-1), reduction='sum').item()
+            _lsm = F.log_softmax(logits[:, :-1], dim=-1)
+            nll = float(-_lsm.gather(-1, x[:, 1:].unsqueeze(-1)).double().sum())
             ppl = math.exp(nll / max(x[:, 1:].numel(), 1))
             out[int(Ln)] = {'ppl': float(ppl), 'n_tok': int(x[:, 1:].numel()), 'truncated': trunc, 'eval_span': int(x.shape[1])}
         except Exception as e:

@@ -4,7 +4,7 @@ export V7_NO_SHUTDOWN=1
 export PYTHONUNBUFFERED=1
 PY=/root/miniconda3/bin/python
 START_TS=$(date +%s)
-export V7_BUDGET_YUAN="${V7_BUDGET_YUAN:-66.0}"
+export V7_BUDGET_YUAN="${V7_BUDGET_YUAN:-107.0}"
 export V7_PRICE_PER_HOUR="${V7_PRICE_PER_HOUR:-2.4}"
 while pgrep -f "bash driver_v7.sh" > /dev/null; do sleep 300; done
 echo "=== [bonus] $(date '+%F %T') main driver exited ==="
@@ -16,7 +16,7 @@ if [ "$(stat -c %Y driver_v7.log)" -lt "$START_TS" ]; then
   echo "=== [bonus] driver_v7.log predates this watcher -> stale log, no bonus ==="
   exit 0
 fi
-if ! grep -q "ALL DONE" driver_v7.log; then
+if ! grep -q "\[driver\] ALL DONE" driver_v7.log; then
   echo "=== [bonus] main driver did not finish cleanly -> no bonus, box stays up ==="
   exit 0
 fi

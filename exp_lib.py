@@ -110,13 +110,13 @@ def adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return 1.0
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
-    return float(torch.quantile(sim.float().cpu(), q).item())
+    return float(torch.quantile(sim.detach().float().cpu(), q).item())
 
 def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
-    vals = [torch.quantile(sim[:k + 1].float(), q) for k in range(sim.numel())]
+    vals = [torch.quantile(sim[:k + 1].detach().float(), q) for k in range(sim.numel())]
     return torch.stack(vals).to(sim.device)
 
 def blocks_fixed(n, block_size, device):
@@ -437,7 +437,7 @@ def _indexer_selection(scores, causal, k, ties='earliest'):
     _keep_w = keep[:, :_w_keep]
     kept[grid[_keep_w], dest[:, :_w_keep][_keep_w]] = order[:, :_w_keep][_keep_w]
     del grid, _keep_w
-    pad_blk = causal.to(torch.int32).argmin(dim=1).to(torch.int32)
+    pad_blk = causal.to(torch.int32).argmax(dim=1).to(torch.int32)
     idx_out = torch.where(kept >= 0, kept, pad_blk[:, None])
     if k_req > _w_keep:
         pad = pad_blk[:, None].expand(n, k_req - _w_keep)
@@ -739,7 +739,7 @@ class HybridAttention(nn.Module):
             self.W_bKV = None
             self.W_bZ = None
             self.W_aZ = nn.Parameter(torch.empty(d_model, self.kv_dim))
-            self.B_pos_a = nn.Parameter(torch.zeros(128, self.kv_dim))
+            self.B_pos_a = nn.Parameter(torch.zeros(int(cfg.max_block) + 1, self.kv_dim))
             self.sink = nn.Parameter(torch.zeros(n_heads))
             nn.init.xavier_uniform_(self.W_aZ)
             if cfg.chunking == 'cosine_learnable':
@@ -752,8 +752,8 @@ class HybridAttention(nn.Module):
         self.W_bKV = nn.Parameter(torch.empty(d_model, self.kv_dim))
         self.W_aZ = nn.Parameter(torch.empty(d_model, self.kv_dim))
         self.W_bZ = nn.Parameter(torch.empty(d_model, self.kv_dim))
-        self.B_pos_a = nn.Parameter(torch.zeros(128, self.kv_dim))
-        self.B_pos_b = nn.Parameter(torch.zeros(128, self.kv_dim))
+        self.B_pos_a = nn.Parameter(torch.zeros(int(cfg.max_block) + 1, self.kv_dim))
+        self.B_pos_b = nn.Parameter(torch.zeros(int(cfg.max_block) + 1, self.kv_dim))
         self.sink = nn.Parameter(torch.zeros(n_heads))
         self.W_DQ = nn.Parameter(torch.empty(d_model, cfg.c_index))
         self.W_DK = nn.Parameter(torch.empty(self.kv_dim, cfg.c_index))
@@ -971,7 +971,6 @@ class Block(nn.Module):
         super().__init__()
         self.n1 = RMSNorm(d)
         self.attn = HybridAttention(d, n_heads, d_head, cfg)
-        torch.manual_seed(torch.initial_seed() + 907)
         self.n2 = RMSNorm(d)
         self.mlp = MLP(d, int(d * mlp_ratio))
 
@@ -1569,30 +1568,27 @@ def eval_ppl(model, val_batch, device, chunk=64, eval_rows=None, eval_seed=0):
             if V is None:
                 V = logits.size(-1)
             _span = max(0, ids.shape[1] - 1)
-            _bi = _arange_cache(int(ids.shape[0]), logits.device).repeat_interleave(_span)
-            _ti = _arange_cache(_span, logits.device).repeat(int(ids.shape[0]))
-            rows_flat = logits[_bi, _ti, :]
-            tgt_flat = ids[_bi, _ti + 1]
-            del _bi, _ti
+            if _span == 0:
+                del ids, logits
+                continue
             if _sel is not None:
                 _base = i * _span
                 _wide = int(ids.shape[0]) * _span
                 _m = (_sel_sorted >= _base) & (_sel_sorted < _base + _wide)
                 _local = _sel_sorted[_m] - _base
                 if _local.numel() == 0:
+                    del ids, logits
                     continue
-                _sel_rows = _local
+                _local = _local.to(logits.device)
+                _ri = torch.div(_local, _span, rounding_mode='floor')
+                _ci = _local - _ri * _span
+                _rows = logits[_ri, _ci, :]
+                _tgts = ids[_ri, _ci + 1]
+                del _ri, _ci
             else:
-                _sel_rows = None
-            if tgt_flat.numel() == 0 or (_sel_rows is not None and _sel_rows.numel() == 0):
-                continue
-            if _sel_rows is None:
-                _rows, _tgts = (rows_flat, tgt_flat)
-            else:
-                _sel_rows = _sel_rows.to(rows_flat.device)
-                _rows = rows_flat.index_select(0, _sel_rows)
-                _tgts = tgt_flat.index_select(0, _sel_rows)
-            del rows_flat, tgt_flat
+                _rows = logits[:, :_span, :].reshape(-1, logits.size(-1))
+                _tgts = ids[:, 1:].reshape(-1)
+            del ids, logits
             g = F.log_softmax(_rows, dim=-1).gather(1, _tgts[:, None]).squeeze(1)
             del _rows, _tgts
             _g_pieces.append(g)
@@ -1604,9 +1600,7 @@ def eval_ppl(model, val_batch, device, chunk=64, eval_rows=None, eval_seed=0):
     if _g_pieces:
         _g_all = _g_pieces[0] if len(_g_pieces) == 1 else torch.cat(_g_pieces, 0)
         del _g_pieces
-        _G = 2048
-        for _s in range(0, _g_all.numel(), _G):
-            nll -= _g_all[_s:_s + _G].double().sum()
+        nll -= _g_all.double().sum()
         del _g_all
     return math.exp(nll.item() / max(ntok, 1))
 
@@ -2142,8 +2136,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        _lv = loss.item()
-        losses.append(_lv)
+        losses.append(loss.detach())
+        _lv = float(losses[-1]) if (step % log_every == 0 or step == steps - 1) else None
         if eval_every and (step % eval_every == 0 or step == steps - 1):
             sub_ppl = eval_ppl(model, val_batch[:eval_subset], device)
             ppl_hist.append([step, float(sub_ppl)])
@@ -2167,6 +2161,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         stats = compression_report(model, val_batch, device, val_bnd=val_bnd)
         print(f'[{variant} seed={seed}] val PPL = {ppl:.3f}')
         print(f'    block-length diagnostics: {json.dumps(stats, default=float)}')
+    losses = torch.stack(losses).cpu().tolist() if losses else []
     result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(np.mean(losses[-50:])), 'ppl_history': ppl_hist, 'delta_trace': delta_trace}
     if return_model:
         result['_model'] = model

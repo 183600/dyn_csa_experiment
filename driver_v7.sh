@@ -24,7 +24,7 @@ echo "=== [driver] $(date '+%F %T') final analysis + report rebuild ==="
 $PY v7_supp.py analysis || all_ok=0
 $PY build_report.py || all_ok=0
 if [ $all_ok -ne 1 ]; then
-  echo "=== [driver] $(date '+%F %T') aborted: analysis or report failed; skipping commit/push and NOT printing ALL DONE ==="
+  echo "=== [driver] $(date '+%F %T') aborted: analysis or report failed; skipping commit/push and NOT writing the success marker ==="
   exit 1
 fi
 git add -A

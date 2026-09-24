@@ -373,6 +373,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
             raise ValueError('v10_analysis: the P3MP probe panel mixes probe parameters under one cell key, so its mean and its paired contrasts would difference two different measurements. Re-probe the cell(s): ' + '; '.join((f'{k}' for k in sorted(_bad)[:3])))
         cells, _dup_cells = ({}, [])
         for k, r in _usable.items():
+            if r.get('probe_params') is None:
+                _bad_cells.append((k, 'no probe_params'))
+                continue
             key = (r['variant'], r['arm'], r['eval_len'], r['rho'])
             grp = cells.setdefault(key, {})
             if r['seed'] in grp:
