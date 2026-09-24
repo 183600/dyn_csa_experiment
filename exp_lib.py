@@ -557,7 +557,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
     win_valid = win_key >= 0
     win_idx = win_key.clamp(min=0)
     wv_all = win_valid
-    _both_idx_all = torch.cat([_arange_cache(n_blk, dev).unsqueeze(0).expand(n, n_blk).to(torch.int32), (win_idx + n_blk).to(torch.int32)], 1)
+    _blk_rows = _arange_cache(n_blk, dev).to(torch.int32).unsqueeze(0)
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
     _heads = q.shape[1] if q.dim() == 3 else 1
@@ -579,7 +579,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
     _MINL = torch.finfo(q.dtype).min
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
-        both_idx = _both_idx_all[s:e]
+        both_idx = torch.cat([_blk_rows.expand(e - s, n_blk), (win_idx[s:e] + n_blk).to(torch.int32)], 1)
         Kset = _take_2d(K, both_idx)
         Vset = _take_2d(V, both_idx)
         _wv = wv_all[s:e]
@@ -2143,12 +2143,12 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        losses.append(float(loss))
-        _lv = losses[-1]
+        losses.append(loss.detach())
         if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
             sub_ppl = eval_ppl(model, val_batch[:eval_subset], device)
             ppl_hist.append([step + 1, float(sub_ppl)])
         if log_every and (step % log_every == 0 or step == steps - 1):
+            _lv = float(losses[-1])
             for li, blk in enumerate(model.blocks):
                 dl = getattr(blk.attn, 'delta_logit', None)
                 if dl is not None:

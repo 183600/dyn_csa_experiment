@@ -547,11 +547,11 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        losses.append(float(loss))
+        losses.append(loss.detach())
         if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
             ppl_hist.append([step + 1, float(L.eval_ppl(model, val_batch[:eval_subset], device))])
         if log_every and (step % log_every == 0 or step == steps - 1):
-            print(f'  step {step:5d}  loss {losses[-1]:.4f}  lr {opt.param_groups[0]['lr']:.2e}  dense={getattr(model.blocks[0].attn, '_dense_warmup', False)}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
+            print(f'  step {step:5d}  loss {float(losses[-1]):.4f}  lr {opt.param_groups[0]['lr']:.2e}  dense={getattr(model.blocks[0].attn, '_dense_warmup', False)}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
     wall = time.time() - t0
     if deadline_ts is not None and time.time() > deadline_ts:
         print(f'[{variant} seed={seed} warm={warm_steps}] BUDGET deadline reached before the final evaluation ({wall / 60:.1f} min) — truncating; this cell produced NO measurement and will be retried.')
