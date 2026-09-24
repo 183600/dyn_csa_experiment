@@ -484,7 +484,7 @@ def install_patches():
     _PATCHES_INSTALLED = True
 install_patches()
 CKPT_CODE = L.CKPT_CODE
-ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope']
+ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
 def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None):
@@ -585,6 +585,10 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
             for v in variants:
                 key = f'{v}::w{warm}::seed{seed}'
                 _cur = summary.get(key)
+                if isinstance(_cur, dict) and not L.result_is_current(_cur, CKPT_CODE, 'ppl'):
+                    print(f'[resume] {key} holds a record that is not current under this code semantics (stale code stamp, missing ppl, or synthesized) — DROPPING it before retraining, so a failed or truncated attempt cannot leave the old reading in place looking like a fresh result')
+                    summary.pop(key, None)
+                    _cur = None
                 if L.result_is_current(_cur, CKPT_CODE, 'ppl'):
                     if _cur.get('run_cfg') == _fp:
                         print(f'[skip] {key} already completed (resume)')
@@ -610,8 +614,8 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                         summary[key]['_code'] = CKPT_CODE
                         summary[key]['run_cfg'] = _fp
                 except Exception as e:
-                    if key in summary and 'ppl' in (summary.get(key) or {}):
-                        print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (the error record holds no `ppl` and must not replace it)')
+                    if L.result_is_current(summary.get(key), CKPT_CODE, 'ppl'):
+                        print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (current under this code semantics; the error record holds no `ppl` and must not replace it)')
                     else:
                         summary[key] = {'variant': v, 'seed': seed, 'warm_steps': warm, 'error': traceback.format_exc()}
                         print(f'[{key}] FAILED: {e}')
@@ -806,8 +810,11 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                 tag = f'{od.split('/')[-1]}::{r.get('variant')}'
                 if r.get('warm_steps') is not None:
                     tag += f'::w{r['warm_steps']}'
+                if r['seed'] in recs.get(tag, {}):
+                    print(f'[stats] WARNING: {tag} seed {r['seed']} holds TWO measurable records — the PPL is ambiguous; the first one is kept and the duplicate is dropped')
+                    continue
                 recs.setdefault(tag, {})[r['seed']] = r
-    pairs = [('warmup w=5000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w5000', 'results_lm_v7_warmup::csa_fixed::w0'), ('warmup w=10000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w10000', 'results_lm_v7_warmup::csa_fixed::w0'), ('CSA+RoPE vs CSA absPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v3_1500::csa_fixed'), ('CSA+RoPE vs dense+RoPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::full_rope'), ('hybrid+RoPE vs dense+RoPE', 'results_lm_v7_rope::hybrid_fixed_rope', 'results_lm_v7_rope::full_rope')]
+    pairs = [('warmup w=5000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w5000', 'results_lm_v7_warmup::csa_fixed::w0'), ('warmup w=10000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w10000', 'results_lm_v7_warmup::csa_fixed::w0'), ('CSA+RoPE vs CSA absPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::csa_fixed'), ('CSA+RoPE vs dense+RoPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::full_rope'), ('hybrid+RoPE vs dense+RoPE', 'results_lm_v7_rope::hybrid_fixed_rope', 'results_lm_v7_rope::full_rope')]
     out_d = {'per_variant': {k: {'ppls': {s: r['ppl'] for s, r in v.items()}, 'mean': float(np.mean([r['ppl'] for r in v.values()]))} for k, v in recs.items()}, 'comparisons': {}}
     for name, a, b in pairs:
         if a not in recs or b not in recs:

@@ -82,9 +82,11 @@ def synthesize_long_summary():
             _unaligned.append((v, len(_ppls), _real))
     if _unaligned:
         for _v, _n, _real in _unaligned:
-            print(f"[synth] REFUSING to synthesize `{_v}`: the aggregate holds {_n} PPL value(s) but the summary has real per-seed records at seeds {_real}.  Without a verified seed->ppl mapping `enumerate` would attach the wrong seed's number to each key, replacing a genuine measurement with a copy.  Restore the per-seed records (or re-run the panel) — the summary is left untouched.")
-        return {'skipped_unaligned': [v for v, _n, _r in _unaligned]}
+            print(f"[synth] REFUSING to synthesize `{_v}`: the aggregate holds {_n} PPL value(s) but the summary has real per-seed records at seeds {_real}.  Without a verified seed->ppl mapping `enumerate` would attach the wrong seed's number to each key, replacing a genuine measurement with a copy.  Restore the per-seed records (or re-run the panel) — only this variant is skipped; the aligned variants are still rebuilt.")
+    _unaligned = {v for v, _n, _r in _unaligned}
     for v, e in agg.items():
+        if v in _unaligned:
+            continue
         _seeds = e.get('seeds')
         for i, p in enumerate(e.get('ppls', [])):
             _seed = int(_seeds[i]) if _seeds is not None else i

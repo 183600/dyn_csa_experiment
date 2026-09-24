@@ -184,10 +184,24 @@ def sec_p0r():
         _has_mt = 'full_matched' in ab and _finite_or_none(ab['full_matched'].get('ppl_mean')) is not None
         rope_unmatched = unmatched_tag(rope['csa_fixed_rope'], rope['full_rope'])
         rope_is_defect = gap_is_architecture(rope['csa_fixed_rope'], rope['full_rope']) is False
-        lines += [f'- absPE 面板：`csa_fixed` 领先 dense **{g_abs:+.2f}** PPL（参数对齐 `full_matched` 时 **{g_abs_m:+.2f}**；两者相差 **{abs(g_abs) - abs(g_abs_m):+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(ab['csa_fixed'], ab.get('full_matched'))}。' if _has_mt else f'- absPE 面板：`csa_fixed` 领先 dense **{g_abs:+.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该领先量因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` 领先 `full_rope` **{g_rope:+.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense 改善 **{d_abs:.2f}**、sparse 改善 **{d_sp:.2f}**（注：`full_rope` 与 `csa_fixed_rope` 参数不同，此对比同时含容量效应）。', '']
+        _w_abs = '领先' if g_abs < 0 else '落后'
+        _w_absm = '领先' if g_abs_m < 0 else '落后'
+        _w_rope = '领先' if g_rope < 0 else '落后'
+        _d_abs_t = ('改善' if d_abs > 0 else '变差') + f' **{abs(d_abs):.2f}**'
+        _d_sp_t = ('改善' if d_sp > 0 else '变差') + f' **{abs(d_sp):.2f}**'
+        lines += [f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL（参数对齐 `full_matched` 时{_w_absm} **{abs(g_abs_m):.2f}**；两者相差 **{abs(g_abs) - abs(g_abs_m):+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(ab['csa_fixed'], ab.get('full_matched'))}。' if _has_mt else f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该差距因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` {_w_rope} `full_rope` **{abs(g_rope):.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense {_d_abs_t}、sparse {_d_sp_t}（注：`full_rope` 与 `csa_fixed_rope` 参数不同，此对比同时含容量效应）。', '']
         if rope_unmatched and rope_is_defect and _has_mt:
-            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线。`full_rope` 由 v7 P0R 的 plain 路径训练，当时 `matched` 集合没有传进去，因此它的 MLP 停在标准 ratio 4（{_params_m(rope['full_rope'])}），而 `csa_fixed_rope` 保持全宽（{_params_m(rope['csa_fixed_rope'])}），相差 {100 * (param_gap(rope['csa_fixed_rope'], rope['full_rope']) or 0):.1f}%。对照 absPE 面板，同样的容量差异会贡献约 {abs(g_abs) - abs(g_abs_m):.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。`exp_lib.run` 已修正 `matched` 的传递，需**重跑 P0R 面板**（得到参数对齐的 `full_rope_matched`）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
-        lines += ['**结论**：PE 错配 **不是** sparse 劣势的来源。（1）RoPE+QK-norm 对两臂都有真实增益，值得保留为新默认；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍显著为负，**P0-3 的混淆假设被证伪**，反而**强化**了论文的负结果——sparse 在该 budget 下的落后是机制性的。' if _has_mt else '**结论（受限）**：PE 错配 **不是** sparse 劣势的来源——`csa_fixed` 在 absPE 面板领先而未匹配的 `full`，RoPE+QK-norm 对两臂都有真实增益。但**参数对齐的 absPE 臂（`full_matched`）在本面板缺失**，所以「容量差贡献了多少」无法剥离，**P0-3 的证伪在本轮没有证据支持**——本条只作方向性表述，须待 `full_matched` 产出后方可作结论。', '']
+            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线。`full_rope` 由 v7 P0R 的 plain 路径训练，当时 `matched` 集合没有传进去，因此它的 MLP 停在标准 ratio 4（{_params_m(rope['full_rope'])}），而 `csa_fixed_rope` 保持全宽（{_params_m(rope['csa_fixed_rope'])}），相差 {100 * (param_gap(rope['csa_fixed_rope'], rope['full_rope']) or 0):.1f}%。对照 absPE 面板，同样的容量差异会贡献约 {abs(g_abs) - abs(g_abs_m):.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
+        _arms_gain = d_abs > 0 and d_sp > 0
+        _gain_txt = 'RoPE+QK-norm 对两臂都有真实增益，值得保留为新默认' if _arms_gain else f'RoPE+QK-norm 并未对两臂都带来增益（dense {_d_abs_t}、sparse {_d_sp_t}）'
+        if _has_mt:
+            if g_abs_m < 0:
+                _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍显著为负，**P0-3 的混淆假设被证伪**，反而**强化**了论文的负结果——sparse 在该 budget 下的落后是机制性的。'
+            else:
+                _p0r_concl = f'**结论**：{_gain_txt}；但参数对齐的 absPE 数字中 `csa_fixed` 落后 `full_matched` **{abs(g_abs_m):.2f}** PPL——方向与原论断相反，**P0-3 的混淆假设在本轮未被证伪**，PE 错配不能排除在 sparse 的差距之外。'
+        else:
+            _p0r_concl = f'**结论（受限）**：`csa_fixed` 在 absPE 面板{_w_abs}未匹配的 `full`，{_gain_txt}。但**参数对齐的 absPE 臂（`full_matched`）在本面板缺失**，所以「容量差贡献了多少」无法剥离，**P0-3 的证伪在本轮没有证据支持**——本条只作方向性表述，须待 `full_matched` 产出后方可作结论。'
+        lines += [_p0r_concl, '']
     return '\n'.join(lines) + '\n'
 
 def sec_p0w():
@@ -241,6 +255,7 @@ def sec_p0w():
                 lines.append(f'| {st} | ' + ' | '.join(cells) + ' |')
         _conc = ['', '**结论**：']
         _parts = []
+        _ds = []
         for v, w in sorted(grp):
             if v != 'csa_fixed' or w == 0:
                 continue
@@ -259,11 +274,17 @@ def sec_p0w():
             else:
                 _verdict = f'n={_st['n']} 时 p={_st['p_exact_signflip']:.4f}，**显著**'
             _parts.append(f'`{v}` warm={w}：{_d:+.2f} PPL vs from-scratch 基线（{_verdict}）')
+            _ds.append(_d)
         if _parts:
             _conc.append('；'.join(_parts) + '。')
         else:
             _conc.append('（该面板无可配对的可测量记录，无法给出结论。）')
-        _conc.append('即 dense 预热**不能**拯救 sparse 臂，过度预热反而有害——论文的 from-scratch 对比是保守的，**P0-1 的质疑被证伪**，负结果更稳固。')
+        if _ds and all((x > 0 for x in _ds)):
+            _conc.append('即 dense 预热**不能**拯救 sparse 臂，过度预热反而有害——论文的 from-scratch 对比是保守的，**P0-1 的质疑被证伪**，负结果更稳固。')
+        elif _ds and all((x < 0 for x in _ds)):
+            _conc.append('即 dense 预热对 sparse 臂**有**真实帮助——**P0-1 的质疑成立**，from-scratch 对比不利于 sparse，相关负结果须按带 warmup 的设定重审。')
+        elif _ds:
+            _conc.append('各 warm 档的方向不一致，P0-1 质疑既不能证伪也不能确认，须补更多 seeds/档位后再判。')
         _conc.append('')
         lines += _conc
     return '\n'.join(lines) + '\n'

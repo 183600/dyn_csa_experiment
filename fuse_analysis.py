@@ -93,10 +93,11 @@ def signflip(deltas):
 def sample_std(deltas, axis=None):
     d = np.asarray(deltas, dtype=float)
     if axis is None:
-        return float(d.std(ddof=1)) if d.size > 1 else 0.0
+        return float(np.nanstd(d, ddof=1)) if d.size > 1 else 0.0
     if d.shape[axis] < 2:
         return np.zeros(d.shape[:axis] + d.shape[axis + 1:])
-    return d.std(axis=axis, ddof=1)
+    with np.errstate(invalid='ignore'):
+        return np.nanstd(d, axis=axis, ddof=1)
 
 def main(argv=None):
     if argv is None:
@@ -129,17 +130,17 @@ def main(argv=None):
             Ma_layers, Ma = per_seed_layer(a, key)
             if Ma_layers != Mb_layers:
                 raise ValueError(f'fuse_analysis: `{a}` and `{b}` are not on the same layer list ({Ma_layers} vs {Mb_layers}); the per-layer deltas would be a misaligned subtraction.')
-            db = Ma.mean(0) - Mb.mean(0)
-            sd_b = Mb.mean(1).std(ddof=1) if Mb.shape[0] > 1 else 0.0
-            sd_a = Ma.mean(1).std(ddof=1) if Ma.shape[0] > 1 else 0.0
-            lines.append(f'| — | **{name}** | {Mb.mean():.4f}±{sd_b:.4f} | {Ma.mean():.4f}±{sd_a:.4f} | **{db.mean():+.4f}** |')
-            pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=Mb.mean(0).round(4).tolist(), fuse_perlayer_mean=Ma.mean(0).round(4).tolist(), delta_perlayer=db.round(4).tolist(), nofuse_seed_std=float(sd_b), fuse_seed_std=float(sd_a))
+            db = np.nanmean(Ma, axis=0) - np.nanmean(Mb, axis=0)
+            sd_b = sample_std(np.nanmean(Mb, axis=1)) if Mb.shape[0] > 1 else 0.0
+            sd_a = sample_std(np.nanmean(Ma, axis=1)) if Ma.shape[0] > 1 else 0.0
+            lines.append(f'| — | **{name}** | {np.nanmean(Mb):.4f}±{sd_b:.4f} | {np.nanmean(Ma):.4f}±{sd_a:.4f} | **{np.nanmean(db):+.4f}** |')
+            pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=np.nanmean(Mb, axis=0).round(4).tolist(), fuse_perlayer_mean=np.nanmean(Ma, axis=0).round(4).tolist(), delta_perlayer=db.round(4).tolist(), nofuse_seed_std=float(sd_b), fuse_seed_std=float(sd_a))
         _why = [L.pair_reason(rec(a, s), rec(b, s)) for s in SEEDS]
         _why = [w for w in _why if w]
         _gate_ok = not _why
         _, fb = per_seed_layer(b, 'bnd_f1')
         _, fa = per_seed_layer(a, 'bnd_f1')
-        d_f1 = fa.mean(1) - fb.mean(1)
+        d_f1 = np.nanmean(fa, axis=1) - np.nanmean(fb, axis=1)
         d_f1 = d_f1[np.isfinite(d_f1)]
         pa = np.array([rec(a, s)['ppl'] for s in SEEDS])
         pb = np.array([rec(b, s)['ppl'] for s in SEEDS])
@@ -215,7 +216,7 @@ def main(argv=None):
         _, Mf = per_seed_layer(v, 'frac_at_min')
         _, Mb = per_seed_layer(v, 'blocks')
         _, Md = per_seed_layer(v, 'delta')
-        lines.append(f'| `{v}` | {Mm.mean():.3f} | {Ms.mean():.3f} | {Mx.mean():.1f} | {Mf.mean():.3f} | {Mb.mean():.1f} | {Md.mean():+.3f} |')
+        lines.append(f'| `{v}` | {np.nanmean(Mm):.3f} | {np.nanmean(Ms):.3f} | {np.nanmean(Mx):.1f} | {np.nanmean(Mf):.3f} | {np.nanmean(Mb):.1f} | {np.nanmean(Md):+.3f} |')
     lines.append('')
     plt.rcParams.update({'font.size': 10})
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.6))
@@ -245,8 +246,8 @@ def main(argv=None):
         _, Ma = per_seed_layer('hybrid_csa_dyn_fuse', key)
         x = np.arange(len(layers))
         w = 0.38
-        ax.bar(x - w / 2, Mb.mean(0), w, yerr=sample_std(Mb, axis=0), capsize=3, color='steelblue', label='no-fuse')
-        ax.bar(x + w / 2, Ma.mean(0), w, yerr=sample_std(Ma, axis=0), capsize=3, color='darkorange', label='fuse')
+        ax.bar(x - w / 2, np.nanmean(Mb, axis=0), w, yerr=sample_std(Mb, axis=0), capsize=3, color='steelblue', label='no-fuse')
+        ax.bar(x + w / 2, np.nanmean(Ma, axis=0), w, yerr=sample_std(Ma, axis=0), capsize=3, color='darkorange', label='fuse')
         ax.set_xticks(x)
         ax.set_xticklabels([lk.split('_')[0] for lk in layers])
         ax.set_title(f'{ttl} — hybrid panel')
@@ -263,7 +264,7 @@ def main(argv=None):
         layers, Mm = per_seed_layer(v, 'len_mean')
         _, Ms = per_seed_layer(v, 'len_std')
         x = np.array(layer_idx(layers))
-        ax.errorbar(x, Mm.mean(0), yerr=Ms.mean(0), marker='o', ms=4, lw=1.6, color=color, label=v, alpha=0.9)
+        ax.errorbar(x, np.nanmean(Mm, axis=0), yerr=np.nanmean(Ms, axis=0), marker='o', ms=4, lw=1.6, color=color, label=v, alpha=0.9)
     ax.set_xticks(all_idx)
     ax.set_xticklabels([f'L{i}' for i in all_idx])
     ax.set_title('block length: mean ± std (dynamic layers only)')
@@ -272,7 +273,7 @@ def main(argv=None):
     ax = axes[1]
     for v, color in PLOTTED:
         layers, Mf = per_seed_layer(v, 'frac_at_min')
-        ax.plot(np.array(layer_idx(layers)), Mf.mean(0), marker='s', ms=4, lw=1.6, color=color, label=v)
+        ax.plot(np.array(layer_idx(layers)), np.nanmean(Mf, axis=0), marker='s', ms=4, lw=1.6, color=color, label=v)
     ax.set_xticks(all_idx)
     ax.set_xticklabels([f'L{i}' for i in all_idx])
     ax.set_title('frac_at_min (degenerate min-length blocks)')
@@ -301,7 +302,29 @@ def main(argv=None):
     else:
         _blk_line = '2. **分块行为的偏移量未测量**：本节无法从产物算出两臂的逐层块长差（层表不一致或统计量缺失），因此**不对「分块行为是否不变」作断言**。\n'
     lines.append('\n## 机制结论（与上方计算结果一致）\n')
-    lines.append(f'1. **连「F1 提升」本身都不稳固**：在最干净的同面板配对（hybrid 栈，仅 csa_dyn 层，按 seed 配对，n={probe.get('n', '?')}）中，fuse 与 no-fuse 的边界 F1 差为 **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}**，即 p 值打在 n={probe.get('n', '?')} 的分辨率下限上，不能排除是噪声；只有在跨面板的纯 CSA 对比里才看到 {_pv('x_d_f1')} 的 F1 差' + (f'（p={_pv('x_p_f1', '{:.3f}')}）' if probe.get('x_d_f1_guarded') else '（该对比未通过本仓库的可配对门禁，故未执行检验、不给 p 值）') + '，而该对比非严格配对（面板/实现差异未受控），不足以支撑机制性主张。\n' + _blk_line + f'3. **PPL 同样不变**：两条验证 PPL 轨迹全程重叠（见 `fuse_ppl_traj.png`），同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')}），跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL，均远小于种子噪声，配对符号翻转 p 值打在 n={probe.get('n', '?')} 的分辨率下限上。\n4. **结论写法（可直接引用）**：在 1500 步 budget 区间，用于边界检测的邻域表示融合是一个**惰性旋钮（inert knob）**——它既没有稳定改善动态分块的边界对齐质量，在上文第 2 条核验通过的范围内也没有改变块长分布，更没有转化为语言建模收益。这与全套实验的主结论一致：该 budget 下 LM 损失对分块质量不敏感（v4 全部消融臂停在同一 PPL 水平），且动态分块母轴本身在 4 个面板（核心表/20k 长跑/RoPE/scale）都与固定分块贴平。（若第 2 条报出越界，本条不成立，以第 2 条为准。）\n5. **遗留（如需更强断言）**：本分析限于 tol=1（落盘唯一容差）与 1500 步 budget 区间；其它容差或收敛区间（20k 步）的断言需要新 run，在母轴已贴平、子旋钮已证惰性的前提下预期信息量极低，不建议。\n')
+    _n_p = probe.get('n')
+    _f1_d, _f1_p = (probe.get('d_f1'), probe.get('p_f1'))
+    _ppl_d, _ppl_p = (probe.get('d_ppl'), probe.get('p_ppl'))
+    _f1_sig = _f1_p is not None and _f1_p < 0.05
+    _ppl_sig = _ppl_p is not None and _ppl_p < 0.05
+    _blk_stable = bool(_blk) and _blk_max <= 0.01
+    if _f1_d is None:
+        _c1 = f'1. **边界 F1 的同面板配对差未测量**（n={_n_p or 0} 的可用配对不足），本节不对 F1 方向作断言。\n'
+    elif _f1_sig:
+        _c1 = f'1. **同面板配对下 fuse 显著改变了边界 F1**：hybrid 栈按 seed 配对（n={_n_p}），ΔF1 = **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}** < 0.05——「F1 差不稳固」的读法在本轮产物上不成立。\n'
+    else:
+        _c1 = f'1. **连「F1 提升」本身都不稳固**：在最干净的同面板配对（hybrid 栈，仅 csa_dyn 层，按 seed 配对，n={_n_p or '?'}）中，fuse 与 no-fuse 的边界 F1 差为 **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}**，即 p 值打在 n={_n_p or '?'} 的分辨率下限上，不能排除是噪声；只有在跨面板的纯 CSA 对比里才看到 {_pv('x_d_f1')} 的 F1 差' + (f'（p={_pv('x_p_f1', '{:.3f}')}）' if probe.get('x_d_f1_guarded') else '（该对比未通过本仓库的可配对门禁，故未执行检验、不给 p 值）') + '，而该对比非严格配对（面板/实现差异未受控），不足以支撑机制性主张。\n'
+    if _ppl_d is None:
+        _c3 = '3. **验证 PPL 的配对差未测量**，本节不对 PPL 方向作断言。\n'
+    elif _ppl_sig:
+        _c3 = f'3. **PPL 存在可分辨的差异**：同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')} < 0.05），「PPL 不变」的读法在本轮产物上不成立。\n'
+    else:
+        _c3 = f'3. **PPL 同样不变**：两条验证 PPL 轨迹全程重叠（见 `fuse_ppl_traj.png`），同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')}），跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL——配对符号翻转 p 值打在 n={_n_p or '?'} 的分辨率下限上，任何差异不能排除是种子噪声。\n'
+    if _blk_stable and not _f1_sig and not _ppl_sig and (_f1_d is not None) and (_ppl_d is not None):
+        _c4 = '4. **结论写法（可直接引用）**：在 1500 步 budget 区间，用于边界检测的邻域表示融合是一个**惰性旋钮（inert knob）**——它既没有稳定改善动态分块的边界对齐质量，在上文第 2 条核验通过的范围内也没有改变块长分布，更没有转化为语言建模收益。这与全套实验的主结论一致：该 budget 下 LM 损失对分块质量不敏感（v4 全部消融臂停在同一 PPL 水平），且动态分块母轴本身在 4 个面板（核心表/20k 长跑/RoPE/scale）都与固定分块贴平。\n'
+    else:
+        _c4 = '4. **结论写法**：本轮产物**不满足**「惰性旋钮」的全部前置条件（第 1–3 条中至少一条报错、显著或越界）——不作「fuse 是惰性旋钮」的断言，以第 1–3 条各自的实测结果为准。\n'
+    lines.append(_c1 + _blk_line + _c3 + _c4 + '5. **遗留（如需更强断言）**：本分析限于 tol=1（落盘唯一容差）与 1500 步 budget 区间；其它容差或收敛区间（20k 步）的断言需要新 run。\n')
     md = '\n'.join(lines)
     L.atomic_write_text(os.path.join(OUT, 'fuse_report.md'), md)
     L.atomic_write_json(os.path.join(OUT, 'stats.json'), stats_out, indent=1)

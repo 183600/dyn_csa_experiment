@@ -1546,7 +1546,6 @@ def eval_ppl(model, val_batch, device, chunk=64, eval_rows=None, eval_seed=0):
     for _a in need_reg_layers:
         _a.need_reg = False
     try:
-        _g_pieces = []
         ntok = 0
         V = None
         _sel = None
@@ -1591,17 +1590,13 @@ def eval_ppl(model, val_batch, device, chunk=64, eval_rows=None, eval_seed=0):
             del ids, logits
             g = F.log_softmax(_rows, dim=-1).gather(1, _tgts[:, None]).squeeze(1)
             del _rows, _tgts
-            _g_pieces.append(g)
+            nll -= g.double().sum()
             ntok += int(g.numel())
+            del g
     finally:
         for _a, _prev in zip(need_reg_layers, need_reg_prior):
             _a.need_reg = _prev
         model.train(was_training)
-    if _g_pieces:
-        _g_all = _g_pieces[0] if len(_g_pieces) == 1 else torch.cat(_g_pieces, 0)
-        del _g_pieces
-        nll -= _g_all.double().sum()
-        del _g_all
     return math.exp(nll.item() / max(ntok, 1))
 
 def enable_block_stats(model, on):

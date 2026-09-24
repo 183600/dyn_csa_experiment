@@ -82,11 +82,14 @@ def v11_analysis(out='analysis_v11/stats.json'):
             if r.get('variant') is None or r.get('seed') is None:
                 _bad_cells.append((_k, 'no variant/seed'))
                 continue
-            if r.get('ppl_mean') is None:
-                _bad_cells.append((_k, 'no ppl_mean'))
+            if not L.ppl_is_usable(r.get('ppl_mean')):
+                _bad_cells.append((_k, 'ppl_mean is not a usable measurement'))
                 continue
             if r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:
                 _bad_cells.append((_k, 'no arm/eval_len/rho'))
+                continue
+            if r.get('probe_params') is None:
+                _bad_cells.append((_k, 'no probe_params'))
                 continue
             pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), json.dumps(r.get('probe_params'), sort_keys=True))
             grp = cells.setdefault(pk, {})
@@ -112,15 +115,20 @@ def v11_analysis(out='analysis_v11/stats.json'):
             if len(hits) > 1:
                 print(f'[v11 stats] ({v}/{arm}/L{Ln}/r{rho}) holds {len(hits)} probe parameterisations — no unambiguous cell, so the contrast is omitted rather than pooled across them')
                 return {}
-            return hits[0]['ppl_by_seed']
+            return hits[0]
         for Ln in V10.PROBE['eval_lens']:
             for rho in V10.PROBE['rhos']:
                 learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho)
                 for arm, tag in (('dense', 'full_rope(dense)'), ('randidx', 'csa+randidx'), ('allblocks', 'csa+allblocks')):
                     other = cell_mean('full_rope', 'dense', Ln, rho) if arm == 'dense' else cell_mean('csa_fixed_rope', arm, Ln, rho)
-                    common = sorted(set(learned) & set(other))
+                    if not learned or not other:
+                        continue
+                    if learned.get('probe_params') != other.get('probe_params'):
+                        print(f'[v11 stats] L{Ln} r{rho} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
+                        continue
+                    common = sorted(set(learned['ppl_by_seed']) & set(other['ppl_by_seed']))
                     if len(common) >= 2:
-                        dl = [other[s] - learned[s] for s in common]
+                        dl = [other['ppl_by_seed'][s] - learned['ppl_by_seed'][s] for s in common]
                         contrasts[f'L{Ln} r{rho}: {tag} - csa+learned'] = V.exact_sign_permutation(dl)
                         contrasts[f'L{Ln} r{rho}: {tag} - csa+learned']['seeds'] = common
         probe = {'cells': probe_cells, 'contrasts': contrasts}
@@ -265,7 +273,7 @@ def build_report(out='REPORT_v11.md'):
                 continue
             _me += 1
             _rc = _v.get('run_cfg')
-            if isinstance(_rc, str) and '_cs' in _rc:
+            if isinstance(_rc, str) and _rc.endswith(f'_cs{L.CODE_SEMANTICS}'):
                 _st += 1
         if _tot:
             _prov_panels.append((_p.split('/')[0], _tot, _me, _st, _sy))
@@ -493,7 +501,7 @@ def build_report(out='REPORT_v11.md'):
             return None
         _sd = {}
         for _r in _s.values():
-            if isinstance(_r, dict) and 'seed' in _r and _r.get('variant'):
+            if isinstance(_r, dict) and 'seed' in _r and _r.get('variant') and L.ppl_is_usable(_r.get('ppl')) and (not _r.get('synthesized')):
                 _sd.setdefault(_r['variant'], set()).add(_r['seed'])
         _ns = [len(x) for x in _sd.values()]
         return (min(_ns), max(_ns)) if _ns else None

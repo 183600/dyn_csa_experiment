@@ -44,17 +44,30 @@ if booked > wallet_h - 2.0:
 print(f"[bonus] booked {booked:.1f}h, wallet {wallet_h:.1f}h -> go")
 PYEOF
 _rc=$?
+commit_and_push() {
+  git add -A
+  if ! git commit -m "$1"; then
+    if [ -n "$(git status --porcelain)" ]; then
+      echo "=== [bonus] commit FAILED with staged changes; box stays up ==="
+      return 1
+    fi
+  fi
+  set -o pipefail
+  if ! git push origin HEAD 2>&1 | tail -2; then
+    echo "=== [bonus] push FAILED — nothing reached the remote; box stays up ==="
+    return 1
+  fi
+  return 0
+}
 if [ $_rc -eq 2 ]; then
   echo "=== [bonus] skipped (ledger unreadable) ==="
-  git add -A; git commit -m "v7: bonus skipped (budget ledger unreadable)" || true
-  git push origin HEAD 2>&1 | tail -2
+  commit_and_push "v7: bonus skipped (budget ledger unreadable)" || exit 1
   shutdown
   exit 0
 fi
 if [ $_rc -ne 0 ]; then
   echo "=== [bonus] skipped (budget) ==="
-  git add -A; git commit -m "v7: bonus skipped (wallet headroom too small)" || true
-  git push origin HEAD 2>&1 | tail -2
+  commit_and_push "v7: bonus skipped (wallet headroom too small)" || exit 1
   shutdown
   exit 0
 fi
@@ -71,10 +84,14 @@ V.run_warmup(dict(L.RUN_LONG, outdir="results_lm_v7_warmup",
 PYEOF
 _bonus_rc=$?
 echo "=== [bonus] $(date '+%F %T') P0W seed2 END rc=$_bonus_rc ==="
-$PY v7_supp.py analysis
-$PY build_report.py
-git add -A
-git commit -m "v7 bonus: P0W seed2 complete (warm grid n=3) + final report" || true
-git push origin HEAD 2>&1 | tail -2
+if [ $_bonus_rc -ne 0 ]; then
+  echo "=== [bonus] P0W seed2 run FAILED (rc=$_bonus_rc) -> skipping analysis/report/commit; box stays up for inspection ==="
+  exit 1
+fi
+if ! $PY v7_supp.py analysis || ! $PY build_report.py; then
+  echo "=== [bonus] analysis or report FAILED -> no commit, box stays up ==="
+  exit 1
+fi
+commit_and_push "v7 bonus: P0W seed2 complete (warm grid n=3) + final report" || exit 1
 echo "=== [bonus] ALL DONE $(date '+%F %T'); shutting down to stop billing ==="
 shutdown

@@ -278,7 +278,9 @@ def build_report(out='REPORT_v9.md'):
     _r20 = comp.get('rope20k: csa_fixed_rope - full_rope') or {}
     if _r20 and 'omitted' not in _r20:
         c = _r20
-        A(f'**结论**：RoPE 面板上 `csa_fixed_rope` 落后 `full_rope` **{c['mean']:+.2f} PPL**（n={c['n']}，p={c['p_exact_signflip']:.3f}）——与 abs-PE 长跑的「渐近线反转」同向，中心负结果在论文自己的位置编码方案下复现，且达到与其镜像面板相同的种子数。')
+        _dir20 = '落后' if c['mean'] > 0 else '领先'
+        _tail20 = '——与 abs-PE 长跑的「渐近线反转」同向，中心负结果在论文自己的位置编码方案下复现，且达到与其镜像面板相同的种子数。' if c['mean'] > 0 else '——方向与 abs-PE 长跑的「渐近线反转」**相反**，「同向复现」的读法在本轮产物上不成立，以该配对数字为准。'
+        A(f'**结论**：RoPE 面板上 `csa_fixed_rope` {_dir20} `full_rope` **{abs(c['mean']):.2f} PPL**（n={c['n']}，p={c['p_exact_signflip']:.3f}）' + _tail20)
     _a20 = comp.get('long20k(abs): csa_fixed - full') or {}
     if _a20 and 'omitted' in _a20:
         A('> **abs-PE 镜像对比不可用**：`results_lm_v3_long` 的 summary 全部是 `synthesized` 重构记录（由旧 `aggregate.json` 回填，无权重、无 `run_cfg`，同一变体的多个 seed 共享同一个拷贝值），不构成独立观测，故不参与配对检验。该面板的 20k abs-PE 数值请以重新训练后的产物为准；本表的 abs-PE 侧结论只由 `REPORT_v7/v10` 中持有真实记录的 run 支撑。')
@@ -295,7 +297,7 @@ def build_report(out='REPORT_v9.md'):
             return None
         _sd = {}
         for _r in _s.values():
-            if isinstance(_r, dict) and 'seed' in _r:
+            if isinstance(_r, dict) and 'seed' in _r and L.ppl_is_usable(_r.get('ppl')) and (not _r.get('synthesized')):
                 _sd.setdefault(_r.get('variant'), set()).add(_r['seed'])
         _ns = [len(x) for x in _sd.values()]
         return (min(_ns), max(_ns)) if _ns else None

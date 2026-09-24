@@ -28,6 +28,15 @@ if [ $all_ok -ne 1 ]; then
   exit 1
 fi
 git add -A
-git commit -m "v7: remaining phases complete (P0E/P2S/P1L/P1T) + rebuilt report + stats" || true
-git push origin HEAD 2>&1 | tail -3
+if ! git commit -m "v7: remaining phases complete (P0E/P2S/P1L/P1T) + rebuilt report + stats"; then
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "=== [driver] commit FAILED with staged changes; NOT writing the success marker ==="
+    exit 1
+  fi
+fi
+set -o pipefail
+if ! git push origin HEAD 2>&1 | tail -3; then
+  echo "=== [driver] push FAILED — results are local only; NOT writing the success marker ==="
+  exit 1
+fi
 echo "=== [driver] ALL DONE $(date '+%F %T') ==="

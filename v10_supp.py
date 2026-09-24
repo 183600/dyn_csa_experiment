@@ -352,8 +352,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if r.get('variant') is None or r.get('seed') is None:
                 _bad_cells.append((_k, 'no variant/seed'))
                 continue
-            if r.get('ppl_mean') is None:
-                _bad_cells.append((_k, 'no ppl_mean'))
+            if not L.ppl_is_usable(r.get('ppl_mean')):
+                _bad_cells.append((_k, 'ppl_mean is not a usable measurement'))
                 continue
             if r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:
                 _bad_cells.append((_k, 'no arm/eval_len/rho'))
