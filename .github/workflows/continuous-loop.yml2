@@ -46,15 +46,15 @@ jobs:
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "NVIDIA",
                 "options": {
-                  "baseURL": "https://integrate.api.nvidia.com/v1",
-                  "apiKey": "{env:NVIDIA_API_KEY}"
+                  "baseURL": "https://api.moonshot.cn/v1",
+                  "apiKey": "{env:KIMI_API_KEY}"
                 },
                 "models": {
-                  "moonshotai/kimi-k3": { "name": "moonshotai/kimi-k3" }
+                  kimi-k3": { "name": kimi-k3" }
                 }
               }
             },
-            "model": "nvidia/moonshotai/kimi-k3"
+            "model":kimi-k3"
           }
           EOF
 
@@ -65,7 +65,7 @@ jobs:
 
       - name: Run opencode for ~5 hours
         env:
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
         run: |
           set +e
           BRANCH="${GITHUB_REF_NAME:-main}"
