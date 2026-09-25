@@ -162,6 +162,9 @@ def main(argv=None):
         _gate_ok = not _why
         _, fb = per_seed_layer(b, 'bnd_f1')
         _, fa = per_seed_layer(a, 'bnd_f1')
+        _jf = np.isfinite(fa) & np.isfinite(fb)
+        fa = np.where(_jf, fa, np.nan)
+        fb = np.where(_jf, fb, np.nan)
         d_f1 = np.nanmean(fa, axis=1) - np.nanmean(fb, axis=1)
         d_f1 = d_f1[np.isfinite(d_f1)]
         pa = np.array([rec(a, s)['ppl'] for s in SEEDS])

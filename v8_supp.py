@@ -34,7 +34,7 @@ def make_guard():
             print(f'[v8] WARNING: could not calibrate CostGuard from the v7 speed ledger ({type(_e).__name__}: {_e}); falling back to the built-in per-class defaults — budget estimates are NOMINAL, not calibrated')
     return g
 P1S_CFG = dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full', 'full_matched', 'hybrid_dynamic'])
-P2R_CFG = dict(L.RUN_LONG, outdir='results_lm_v8_rope20k', variants=['csa_fixed_rope', 'full_rope'], matched=set(V.PARAM_MATCHED_V7))
+P2R_CFG = dict(L.RUN_LONG, outdir='results_lm_v8_rope20k', variants=['csa_fixed_rope', 'full_rope'], matched=set(V.PARAM_MATCHED_V7), mlp_match_ref='csa_dynamic_rope')
 PHASES = [('P1S', P1S_CFG, [0, 1, 2, 3], 3.0), ('P2R', P2R_CFG, [0, 1], 11.0)]
 
 def run_phase(name, guard):

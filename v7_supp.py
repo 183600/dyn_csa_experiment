@@ -168,22 +168,23 @@ class HybridAttentionRoPE(L.HybridAttention):
                     if gate_bool is None:
                         gate_bool = gate.detach() > L._HALF
                     gl = gate_bool.cpu().tolist()
-                    bid = L.blocks_from_cuts(T, gl, cfg.min_block, cfg.max_block, x.device)
+                    bid, nblk = L.blocks_from_cuts(T, gl, cfg.min_block, cfg.max_block, x.device, return_count=True)
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
             sim = L.cosine_similarity_consecutive(x)
             tau = L.causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
-            bid = L.blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim)
+            bid, nblk = L.blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim, return_count=True)
         else:
             bid = L.blocks_fixed(T, cfg.block_size, x.device)
+            nblk = -(-T // cfg.block_size)
         if pre is not None:
             Za, Zb = (pre['Za'], pre['Zb'])
         else:
             Za = x @ self.W_aZ
             Zb = x @ self.W_bZ if self.W_bZ is not None else None
         if cfg.kind == 'hca':
-            comp_kv, last_tok, Bn = L.pool_blocks_single(Ca_raw, Za, self.B_pos_a, bid)
+            comp_kv, last_tok, Bn = L.pool_blocks_single(Ca_raw, Za, self.B_pos_a, bid, n_blocks=nblk, monotonic=True)
         else:
-            comp_kv, last_tok, Bn = L.pool_variable_blocks(Ca_raw, Cb_raw, Za, Zb, bid, self.B_pos_a, self.B_pos_b, cfg.overlap)
+            comp_kv, last_tok, Bn = L.pool_variable_blocks(Ca_raw, Cb_raw, Za, Zb, bid, self.B_pos_a, self.B_pos_b, cfg.overlap, n_blocks=nblk, monotonic=True)
         index_kv = comp_kv
         attn_kv = torch.zeros_like(comp_kv) if cfg.content_mode == 'zero' else comp_kv
         if self._stats is not None:
@@ -564,21 +565,23 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
             for v in variants:
                 key = f'{v}::w{warm}::seed{seed}'
                 _cur = summary.get(key)
+                _drop_msg = None
                 if isinstance(_cur, dict) and not L.result_is_current(_cur, CKPT_CODE, 'ppl'):
-                    print(f'[resume] {key} holds a record that is not current under this code semantics (stale code stamp, missing ppl, or synthesized) — DROPPING it before retraining, so a failed or truncated attempt cannot leave the old reading in place looking like a fresh result')
-                    summary.pop(key, None)
+                    _drop_msg = f'[resume] {key} holds a record that is not current under this code semantics (stale code stamp, missing ppl, or synthesized) — DROPPING it before retraining, so a failed or truncated attempt cannot leave the old reading in place looking like a fresh result'
                     _cur = None
                 if L.result_is_current(_cur, CKPT_CODE, 'ppl'):
                     if _cur.get('run_cfg') == _fp:
                         print(f'[skip] {key} already completed (resume)')
                         continue
-                    print(f'[resume] {key} carries no matching config fingerprint (stored {_cur.get('run_cfg')!r}) — re-running and overwriting so a config change can never be mistaken for a fresh result')
-                    summary.pop(key, None)
+                    _drop_msg = f'[resume] {key} carries no matching config fingerprint (stored {_cur.get('run_cfg')!r}) — re-running and overwriting so a config change can never be mistaken for a fresh result'
                 if guard is not None:
                     est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
                     if not guard.can_start(est):
                         print(f'[budget] SKIP {key}: projected ¥{est / 3600 * guard.price:.2f} would pass cap ¥{guard.cap_yuan():.2f} (spent ¥{guard.spent_yuan():.2f})')
                         continue
+                if _drop_msg is not None:
+                    print(_drop_msg)
+                    summary.pop(key, None)
                 t_run = time.time()
                 _deadline = None
                 if guard is not None:
@@ -859,7 +862,7 @@ def schedule_shutdown(delay_s=120):
     subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f'[v7] AutoDL instance shuts down in {delay_s}s (only the data disk bills afterwards).')
 LONG_EXT = dict(L.RUN_LONG, steps=40000, n_train_tokens=110000000, eval_every=2000, outdir='results_lm_v7_long40')
-PHASES = [('P0R', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_rope', variants=ROPE_VARIANTS, steps=1500, matched=set(PARAM_MATCHED_V7)), seeds=[0, 1, 2]), 2.6), ('P0W', 'warm', dict(cfg=dict(L.RUN_LONG, outdir='results_lm_v7_warmup', variants=['csa_fixed']), seeds=[0, 1], warm_grid=(0, 5000, 10000)), 3.4), ('P1L', 'len', dict(outdir='results_len', vocab=8192, steps=3000, train_len=512, eval_lens=[512, 1024, 2048, 4096], variants=['full', 'csa_fixed', 'full_rope', 'csa_fixed_rope']), 2.5), ('P2S', 'plain', dict(cfg=dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic']), seeds=[2, 3]), 4.5), ('P1T', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_seq2k', seq_len=2048, batch_size=3, steps=1500, variants=['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']), seeds=[0, 1]), 6.0), ('P0E', 'plain', dict(cfg=dict(LONG_EXT, variants=['csa_fixed', 'full']), seeds=[0, 1]), 17.0)]
+PHASES = [('P0R', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_rope', variants=ROPE_VARIANTS, steps=1500, matched=set(PARAM_MATCHED_V7), mlp_match_ref='csa_dynamic_rope'), seeds=[0, 1, 2]), 2.6), ('P0W', 'warm', dict(cfg=dict(L.RUN_LONG, outdir='results_lm_v7_warmup', variants=['csa_fixed']), seeds=[0, 1], warm_grid=(0, 5000, 10000)), 3.4), ('P1L', 'len', dict(outdir='results_len', vocab=8192, steps=3000, train_len=512, eval_lens=[512, 1024, 2048, 4096], variants=['full', 'csa_fixed', 'full_rope', 'csa_fixed_rope']), 2.5), ('P2S', 'plain', dict(cfg=dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic']), seeds=[2, 3]), 4.5), ('P1T', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_seq2k', seq_len=2048, batch_size=3, steps=1500, variants=['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']), seeds=[0, 1]), 6.0), ('P0E', 'plain', dict(cfg=dict(LONG_EXT, variants=['csa_fixed', 'full']), seeds=[0, 1]), 17.0)]
 
 def run_phase(name, guard, only=None):
     for pname, kind, payload, _h in PHASES:
@@ -915,7 +918,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 cfgs = L.make_layer_cfgs(6, v)
                 mr = 4.0
                 if v in PARAM_MATCHED_V7:
-                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=set(PARAM_MATCHED_V7))
+                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=set(PARAM_MATCHED_V7), ref_variant='csa_dynamic_rope')
                 model = L.SmallGPT(vocab, 256, 6, 8, 32, 512, cfgs, mlp_ratio=mr).to(DEVICE)
                 opt = torch.optim.AdamW(model.parameters(), lr=0.0003)
                 model.train()
@@ -1080,7 +1083,7 @@ def run_lenphase(payload, guard=None, label=''):
                 cfgs = L.make_layer_cfgs(6, v)
                 mr = 4.0
                 if v in PARAM_MATCHED_V7:
-                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7))
+                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant='csa_dynamic_rope')
                 if _train_cache[0] is None:
                     _train_cache[0] = L.load_wikitext(train_len, 8000000)[0]
                 train_ids = _train_cache[0]

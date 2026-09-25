@@ -5,7 +5,7 @@ import os
 import subprocess
 import time
 BASE = os.path.dirname(os.path.abspath(__file__))
-PHASES = [('results_lm_v7_rope', 12, 'P0R  RoPE+QK-norm 4 variants x 3 seeds @1500'), ('results_lm_v7_warmup', 6, 'P0W  dense->sparse warmup csa_fixed x w{0,5k,10k} x 2 seeds'),('results_lm_v7_long40', 4, 'P0E  long horizon 40k: csa_fixed+full x 2 seeds'), ('results_lm_v7_seq2k', 10, 'P1T  seq2048 topk sweep 5 variants x 2 seeds + m=1'), ('results_lm_v5_scale', None, 'P2S  param-matched scale seeds 2,3')]
+PHASES = [('results_lm_v7_rope', 15, 'P0R  RoPE+QK-norm 5 variants x 3 seeds @1500'), ('results_lm_v7_warmup', 6, 'P0W  dense->sparse warmup csa_fixed x w{0,5k,10k} x 2 seeds'),('results_lm_v7_long40', 4, 'P0E  long horizon 40k: csa_fixed+full x 2 seeds'), ('results_lm_v7_seq2k', 10, 'P1T  seq2048 topk sweep 5 variants x 2 seeds + m=1'), ('results_lm_v5_scale', None, 'P2S  param-matched scale seeds 2,3')]
 BUDGET_STATE = os.path.join(BASE, 'autodl_budget_state_v7.json')
 
 def load(p):

@@ -87,24 +87,30 @@ def _cut_merge_mask(want_cut_list, min_block, max_block, dtype=None, device=None
             keep[slot] = 1.0
     return _t.tensor(keep, dtype=dtype, device=device)
 
-def blocks_from_cuts(n, want_cut_list, min_block, max_block, device):
+def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_count=False):
     if n == 0:
-        return torch.empty(0, dtype=torch.long, device=device)
+        z = torch.empty(0, dtype=torch.long, device=device)
+        return (z, 0) if return_count else z
     if n == 1:
-        return torch.zeros(1, dtype=torch.long, device=device)
+        z = torch.zeros(1, dtype=torch.long, device=device)
+        return (z, 1) if return_count else z
     bids, _honoured = _segment(n, want_cut_list, min_block, max_block)
     bids_t = torch.tensor(bids, dtype=torch.long, device=device)
-    return bids_t - bids_t.min()
+    bids_t = bids_t - bids_t.min()
+    if return_count:
+        return (bids_t, int(bids[-1] - bids[0]) + 1)
+    return bids_t
 
-def blocks_from_cosine(H, tau, min_block, max_block, sim=None):
+def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=False):
     n = H.shape[0]
     dev = H.device
     if n <= 1:
-        return torch.zeros(n, dtype=torch.long, device=dev)
+        z = torch.zeros(n, dtype=torch.long, device=dev)
+        return (z, 1) if return_count and n == 1 else ((z, 0) if return_count else z)
     if sim is None:
         sim = cosine_similarity_consecutive(H)
     cut_list = (sim < tau).cpu().tolist()
-    return blocks_from_cuts(n, cut_list, min_block, max_block, dev)
+    return blocks_from_cuts(n, cut_list, min_block, max_block, dev, return_count=return_count)
 
 def adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
@@ -296,11 +302,11 @@ def _block_order(block_ids, n):
         return (_arange_cache(block_ids.numel(), block_ids.device), True)
     return (torch.argsort(block_ids, stable=True), False)
 
-def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap):
+def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n_blocks=None, monotonic=False):
     n, Fd = Xa.shape
     dev = Xa.device
-    B = int(block_ids.max().item()) + 1
-    order, _ident = _block_order(block_ids, n)
+    B = int(n_blocks) if n_blocks is not None else int(block_ids.max().item()) + 1
+    order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
     if _ident:
         Xas, Xbs, Zas, Zbs = (Xa, Xb, Za, Zb)
     else:
@@ -363,11 +369,11 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     last_idx = (ends - 1).clamp(max=n - 1)
     return (comp, order[last_idx], B)
 
-def pool_blocks_single(X, Z, B_pos, block_ids):
+def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     n = X.shape[0]
     dev = X.device
-    B = int(block_ids.max().item()) + 1
-    order, _ident = _block_order(block_ids, n)
+    B = int(n_blocks) if n_blocks is not None else int(block_ids.max().item()) + 1
+    order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
     if _ident:
         Xs, Zs = (X, Z)
     else:
@@ -556,6 +562,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
     win_valid = win_key >= 0
     win_idx = win_key.clamp(min=0)
     wv_all = win_valid
+    _win_off = (win_idx + n_blk).to(torch.int32)
     _blk_rows = _arange_cache(n_blk, dev).to(torch.int32).unsqueeze(0)
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
@@ -578,7 +585,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
     _MINL = torch.finfo(q.dtype).min
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
-        both_idx = torch.cat([_blk_rows.expand(e - s, n_blk), (win_idx[s:e] + n_blk).to(torch.int32)], 1)
+        both_idx = torch.cat([_blk_rows.expand(e - s, n_blk), _win_off[s:e]], 1)
         Kset = _take_2d(K, both_idx)
         Vset = _take_2d(V, both_idx)
         _wv = wv_all[s:e]
@@ -622,9 +629,10 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     n_blk = k_blk.shape[0]
     k_stack = torch.cat([k_blk, k_sw], 0)
     v_stack = torch.cat([v_blk, v_sw], 0)
-    win_idx = pos_all[:, None] - (w - 1) + rel[None, :]
-    win_idx = win_idx.clamp(min=0)
+    win_idx_raw = pos_all[:, None] - (w - 1) + rel[None, :]
+    win_idx = win_idx_raw.clamp(min=0)
     _both_idx_all = torch.cat([topk_idx.to(torch.int32), (win_idx + n_blk).to(torch.int32)], dim=1)
+    win_valid_all = win_idx_raw >= 0
     _MINL = torch.finfo(k_blk.dtype).min
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
@@ -642,8 +650,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             pad_dup = ((ib == pad_val) & sv).any(1, keepdim=True)
             keep = sv | (rep & ~pad_dup)
             sel_blk = sel_blk & keep
-        win_global = pos[:, None] - (w - 1) + rel[None, :]
-        win_valid = win_global >= 0
+        win_valid = win_valid_all[s:e]
         both_idx = _both_idx_all[s:e]
         Kset = _take_2d(k_stack, both_idx)
         Vset = _take_2d(v_stack, both_idx)
@@ -872,22 +879,23 @@ class HybridAttention(nn.Module):
                 if gate_bool is None:
                     gate_bool = gate.detach() > _HALF
                 gate_list = gate_bool.cpu().tolist()
-                bid = blocks_from_cuts(T, gate_list, cfg.min_block, cfg.max_block, x.device)
+                bid, nblk = blocks_from_cuts(T, gate_list, cfg.min_block, cfg.max_block, x.device, return_count=True)
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
             sim = cosine_similarity_consecutive(x)
             tau = causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
-            bid = blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim)
+            bid, nblk = blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim, return_count=True)
         else:
             bid = blocks_fixed(T, cfg.block_size, x.device)
+            nblk = -(-T // cfg.block_size)
         if pre is not None:
             Za, Zb = (pre['Za'], pre['Zb'])
         else:
             Za = x @ self.W_aZ
             Zb = x @ self.W_bZ if self.W_bZ is not None else None
         if cfg.kind == 'hca':
-            comp_kv, last_tok, Bn = pool_blocks_single(Ca_raw, Za, self.B_pos_a, bid)
+            comp_kv, last_tok, Bn = pool_blocks_single(Ca_raw, Za, self.B_pos_a, bid, n_blocks=nblk, monotonic=True)
         else:
-            comp_kv, last_tok, Bn = pool_variable_blocks(Ca_raw, Cb_raw, Za, Zb, bid, self.B_pos_a, self.B_pos_b, cfg.overlap)
+            comp_kv, last_tok, Bn = pool_variable_blocks(Ca_raw, Cb_raw, Za, Zb, bid, self.B_pos_a, self.B_pos_b, cfg.overlap, n_blocks=nblk, monotonic=True)
         index_kv = comp_kv
         attn_kv = torch.zeros_like(comp_kv) if cfg.content_mode == 'zero' else comp_kv
         if self._stats is not None:
@@ -962,7 +970,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.g
+        return F.rms_norm(x, self.g.shape, weight=self.g, eps=self.eps)
 
 class MLP(nn.Module):
 
@@ -1013,7 +1021,7 @@ class SmallGPT(nn.Module):
 
     def forward(self, ids):
         T = ids.shape[1]
-        x = self.tok(ids) + self.pos(_arange_cache(T, ids.device))
+        x = self.tok(ids) + self.pos.weight[:T]
         for blk in self.blocks:
             x = blk(x)
         reg = None
@@ -1291,9 +1299,11 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     n = len(train_ids) - seq_len - 1
     if n <= 0:
         raise ValueError(f'batch_iter needs len(train_ids) > seq_len+1 to sample causal windows, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
+    train_ids = np.asarray(train_ids)
+    cols = np.arange(seq_len + 1)
     while True:
         starts = rng.integers(0, n, size=batch_size)
-        ids = np.stack([train_ids[s:s + seq_len + 1] for s in starts])
+        ids = train_ids[starts[:, None] + cols[None, :]]
         ids = torch.from_numpy(ids).to(device)
         yield (ids[:, :-1], ids[:, 1:])
 
@@ -2884,27 +2894,25 @@ def run(cfg=None, seeds=None, guard=None, label=''):
     for seed in cfg['seeds']:
         for v in cfg['variants']:
             key = f'{v}::seed{seed}'
+            _drop_msg = None
+            _drop_is_stale = False
             if key in summary and 'ppl' in summary.get(key, {}):
                 old = summary[key]
                 if not ppl_is_usable(old.get('ppl')):
-                    print(f"[resume] {key} holds a NON-MEASURABLE ppl ({old.get('ppl')!r}) — every statistic in this repo refuses it (`ppl_is_usable`), so counting it as 'already completed' would drop the seed from the tables silently. DROPPING it and retraining")
-                    del summary[key]
+                    _drop_msg = f"[resume] {key} holds a NON-MEASURABLE ppl ({old.get('ppl')!r}) — every statistic in this repo refuses it (`ppl_is_usable`), so counting it as 'already completed' would drop the seed from the tables silently. DROPPING it and retraining"
                 elif old.get('synthesized'):
-                    print(f'[resume] {key} is a SYNTHESIZED record (reconstructed from an old aggregate.json, no weights) — DROPPING it and retraining')
-                    del summary[key]
+                    _drop_msg = f'[resume] {key} is a SYNTHESIZED record (reconstructed from an old aggregate.json, no weights) — DROPPING it and retraining'
                 elif old.get('run_cfg') is None:
-                    print(f"[resume] {key} has no config fingerprint (predates fingerprinting) — re-running and overwriting; the STALE record is dropped now, so a failed or truncated retrain cannot leave it in place looking like this attempt's result")
-                    stale_dropped.append(key)
-                    del summary[key]
+                    _drop_msg = f"[resume] {key} has no config fingerprint (predates fingerprinting) — re-running and overwriting; the STALE record is dropped before retraining, so a failed or truncated attempt cannot leave it in place looking like this attempt's result"
+                    _drop_is_stale = True
                 elif old.get('run_cfg') == fp:
                     print(f'[skip] {key} already completed (resume)')
                     continue
                 else:
-                    print(f"[resume] {key} was run under a DIFFERENT config ({old['run_cfg']} != {fp}) — re-running and overwriting; the STALE record is dropped now, so a failed or truncated retrain cannot leave it in place looking like this attempt's result")
-                    stale_dropped.append(key)
-                    del summary[key]
+                    _drop_msg = f"[resume] {key} was run under a DIFFERENT config ({old['run_cfg']} != {fp}) — re-running and overwriting; the STALE record is dropped before retraining, so a failed or truncated attempt cannot leave it in place looking like this attempt's result"
+                    _drop_is_stale = True
             if v not in ratios:
-                ratios[v] = variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=_matched)
+                ratios[v] = variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=_matched, ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
             deadline_ts = None
             if guard is not None:
                 est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
@@ -2913,6 +2921,11 @@ def run(cfg=None, seeds=None, guard=None, label=''):
                     continue
                 deadline_ts = guard.deadline_ts()
                 print(f'[budget] {key}: projected {est / 60:.0f} min (¥{est / 3600 * guard.price:.2f}), spent so far ¥{guard.spent_yuan():.2f}')
+            if _drop_msg is not None:
+                print(_drop_msg)
+                if _drop_is_stale:
+                    stale_dropped.append(key)
+                del summary[key]
             t_run = time.time()
             rec = None
             try:

@@ -96,7 +96,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
             if r.get('probe_params') is None:
                 _bad_cells.append((_k, 'no probe_params'))
                 continue
-            pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), json.dumps(r.get('probe_params'), sort_keys=True))
+            pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), json.dumps(r.get('probe_params'), sort_keys=True), str(r.get('_code')))
             grp = cells.setdefault(pk, {})
             if r['seed'] in grp:
                 _dup_cells.append((_k, pk[:4], r['seed']))
@@ -107,7 +107,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
         if _dup_cells:
             print(f'[v11 stats] {len(_dup_cells)} probe record(s) share a (cell, probe_params, seed) identity — their PPL is ambiguous and they are dropped from the pooling: ' + ', '.join((f'{k}' for k, _c, _s in _dup_cells[:4])))
         probe_cells = []
-        for (v, arm, Ln, rho, _pp), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
+        for (v, arm, Ln, rho, _pp, _cd), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
             assert means, (v, arm, Ln, rho)
             probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': json.loads(_pp), 'mean': float(np.mean(list(means.values()))), 'std': float(np.std(list(means.values()), ddof=1)) if len(means) > 1 else 0.0, 'n': len(means)})

@@ -20,7 +20,10 @@ def load(path, default=None):
     try:
         with open(path, encoding='utf-8') as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return default
+    except Exception as _e:
+        print(f'[build_report] WARNING: {path} exists but cannot be read ({type(_e).__name__}: {_e}) — treating it as absent rather than silently using partial data')
         return default
 
 def agg(outdir):
@@ -183,7 +186,7 @@ def sec_p0r():
             pa, pb = (ab[a]['ppl_mean'], rope[b]['ppl_mean'])
             lines.append(f'| `{a}` | {fm(pa)} {sp(ab[a].get('ppl_std'))} | {fm(pb)} {sp(rope[b].get('ppl_std'))} | **{pb - pa:+.2f}** | {_params_m(ab[a])} / {_params_m(rope[b])} |')
     lines += ['', '**组间差距（决定评审论点是否成立）**：', '']
-    if 'csa_fixed' in ab and 'csa_fixed_rope' in rope and ('full_rope' in rope):
+    if 'csa_fixed' in ab and 'csa_fixed_rope' in rope and ('full_rope' in rope) and ('full' in ab):
         g_abs = ab['csa_fixed']['ppl_mean'] - ab['full']['ppl_mean']
         g_abs_m = ab['csa_fixed']['ppl_mean'] - ab.get('full_matched', {}).get('ppl_mean', float('nan'))
         g_rope = rope['csa_fixed_rope']['ppl_mean'] - rope['full_rope']['ppl_mean']
