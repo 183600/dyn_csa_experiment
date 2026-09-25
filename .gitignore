@@ -61,6 +61,10 @@ autodl_budget_state.json
 *.swp
 *.swo
 *~
+nohup.out
+core
+core.*
+.opencode/
 
 # 系统文件
 .DS_Store

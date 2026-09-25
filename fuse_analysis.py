@@ -146,10 +146,16 @@ def main(argv=None):
             Ma_layers, Ma = per_seed_layer(a, key)
             if Ma_layers != Mb_layers:
                 raise ValueError(f'fuse_analysis: `{a}` and `{b}` are not on the same layer list ({Ma_layers} vs {Mb_layers}); the per-layer deltas would be a misaligned subtraction.')
+            _both = np.isfinite(Ma) & np.isfinite(Mb)
+            Ma, Mb = (np.where(_both, Ma, np.nan), np.where(_both, Mb, np.nan))
             db = np.nanmean(Ma, axis=0) - np.nanmean(Mb, axis=0)
-            sd_b = sample_std(np.nanmean(Mb, axis=1)) if Mb.shape[0] > 1 else 0.0
-            sd_a = sample_std(np.nanmean(Ma, axis=1)) if Ma.shape[0] > 1 else 0.0
-            lines.append(f'| — | **{name}** | {np.nanmean(Mb):.4f}±{sd_b:.4f} | {np.nanmean(Ma):.4f}±{sd_a:.4f} | **{np.nanmean(db):+.4f}** |')
+            _sb = np.nanmean(Mb, axis=1)
+            _sa = np.nanmean(Ma, axis=1)
+            sd_b = sample_std(_sb) if Mb.shape[0] > 1 else 0.0
+            sd_a = sample_std(_sa) if Ma.shape[0] > 1 else 0.0
+            mean_b = float(np.nanmean(_sb))
+            mean_a = float(np.nanmean(_sa))
+            lines.append(f'| — | **{name}** | {mean_b:.4f}±{sd_b:.4f} | {mean_a:.4f}±{sd_a:.4f} | **{np.nanmean(db):+.4f}** |')
             pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=np.nanmean(Mb, axis=0).round(4).tolist(), fuse_perlayer_mean=np.nanmean(Ma, axis=0).round(4).tolist(), delta_perlayer=db.round(4).tolist(), nofuse_seed_std=float(sd_b), fuse_seed_std=float(sd_a))
         _why = [L.pair_reason(rec(a, s), rec(b, s)) for s in SEEDS]
         _why = [w for w in _why if w]

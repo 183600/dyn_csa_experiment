@@ -250,10 +250,9 @@ def _mask_buffer(n, device, kind):
     buf = _MASK_CACHE.get(key)
     if buf is not None:
         return buf
-    if kind == 'band':
-        buf = _tri_full(n, device, -1)
-    else:
-        buf = torch.zeros((n, n), device=device)
+    if kind != 'zero':
+        raise ValueError(f'unknown mask kind {kind!r}')
+    buf = torch.zeros((n, n), device=device)
     _cache_put(_MASK_CACHE, key, buf, _MASK_CACHE_BUDGET_BYTES, _mask_cache_total)
     return buf
 
@@ -615,10 +614,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
     if _bindable and _bytes_per_chunk_row > 0:
         _max_rows = max(_MIN_CHUNK, int(mem_budget_bytes) // _bytes_per_chunk_row)
-        _new_chunk = min(q_chunk, _max_rows)
-        if _new_chunk < q_chunk:
-            print(f'[gathered_attention] q_chunk {q_chunk} -> {_new_chunk} (topk={topk_idx.shape[1]}, w={w}, n={n})')
-            q_chunk = _new_chunk
+        q_chunk = min(q_chunk, _max_rows)
     q_chunk = max(1, min(int(q_chunk), n))
     out = torch.empty_like(q)
     rel = _range_cache(0, w, dev)
@@ -635,7 +631,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         qseg = q[s:e]
         pos = pos_all[s:e]
         ib = topk_idx[s:e].long()
-        sel_blk = torch.gather(block_readable(pos, last_tok), 1, ib)
+        sel_blk = pos[:, None] > last_tok[ib]
         keep = None
         if sel_valid is not None:
             sv = sel_valid[s:e]
@@ -1225,9 +1221,9 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     bnd_ids = sorted(boundary_token_ids(tok, eos_id))
     val_bnd = np.isin(val_batch, bnd_ids)
     print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
-    np.save(tr_path, train_ids)
-    np.save(va_path, val_batch)
-    np.save(vp_path, val_bnd)
+    for _p, _a in ((tr_path, train_ids), (va_path, val_batch), (vp_path, val_bnd)):
+        np.save(_p + '.tmp', _a)
+        os.replace(_p + '.tmp.npy', _p)
     atomic_write_json(me_path, {'vocab': vocab}, indent=0)
     print('[data] cached token ids to disk (resume-safe)')
     del ds
@@ -2299,6 +2295,8 @@ def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32
     p_full = n_params(variant, 4)
     p_ref = n_params(ref_variant, 4)
     ratio = 4 + (p_ref - p_full) / (2.0 * d * d * n_layers)
+    if ratio == 4.0:
+        ratio = math.nextafter(4.0, 0.0)
     print(f'[{variant}] matched mlp_ratio = {ratio:.2f} ({p_full / 1000000.0:.2f}M -> target {p_ref / 1000000.0:.2f}M params vs {ref_variant})')
     return ratio
 
@@ -2971,7 +2969,7 @@ def _dump_aggregate(outdir, summary):
         print(f'[aggregate] aggregate({outdir}) failed: {type(e).__name__}: {e}')
         print('[aggregate] retrying with the unusable records (no measured `ppl`, `synthesized`, an ambiguous same-seed duplicate, or a record missing a key `aggregate` indexes unconditionally) removed — the untouched records keep their exact values')
         _REQUIRED = ()
-        clean = {k: r for k, r in summary.items() if isinstance(r, dict) and ppl_is_usable(r.get('ppl')) and (not r.get('synthesized')) and all((r.get(f) is not None for f in _REQUIRED))}
+        clean = {k: r for k, r in summary.items() if isinstance(r, dict) and r.get('seed') is not None and ppl_is_usable(r.get('ppl')) and (not r.get('synthesized')) and all((r.get(f) is not None for f in _REQUIRED))}
         _legacy_ok = legacy_warm_tags(clean)
         _seen, _dups = ({}, [])
         for k, r in clean.items():

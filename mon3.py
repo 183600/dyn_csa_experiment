@@ -41,8 +41,8 @@ def main():
     if pid:
         try:
             with open(f'/proc/{pid}/stat', encoding='utf-8') as f:
-                fields = f.read().split()
-            starttime = int(fields[21])
+                rest = f.read().rsplit(')', 1)[1].split()
+            starttime = int(rest[19])
             hz = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
             with open('/proc/uptime', encoding='utf-8') as f:
                 uptime = float(f.read().split()[0])

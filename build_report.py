@@ -127,6 +127,7 @@ def per_seed_records(outdir):
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
             _slot, _sd = (out[r['variant']], int(r['seed']))
             if _sd in _slot:
+                print(f'[report] ambiguous (variant, seed) = ({r['variant']!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
                 continue
             _slot[_sd] = r
     return dict(out)
@@ -167,7 +168,7 @@ def paired_row(a_records, b_records):
     return (kept, dl, st)
 
 def sec_header(budget_hrs, spent, price, cap):
-    return f'# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）\n> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n> 说明：本报告全部数字由 `build_report.py` 从 `results_*/`、`analysis_v7/`\n> 的落盘产物计算得到，无手填数值。\n\n**预算**：累计 booked {budget_hrs:.2f} GPU·h，估算花费 ¥{spent:.2f} / ¥{cap:.2f}\n（AutoDL RTX 4090，单价按 ¥{price:.2f}/h 保守记账）。\n\n本报告针对外部评审提出的 3 项 P0 阻断项与 P1/P2 缺口逐一补做实验。所有新变体\n（RoPE+QK-norm、dense-warmup、topk 扫描、m=1、长度外推）都经由 **完全相同的\n训练/优化器/LR/评测/CostGuard 代码路径**（对 `exp_lib` 的 `make_layer_cfgs`/\n`SmallGPT` 做 monkey-patch 注入），以保证可比性。长上下文证据采用\n**wikitext 长度外推探针**（train@512 → eval 512..4096）：合成 NIAH 探针在\n本模型规模（d=256/6 层）下两臂均停留在随机水平（已实现并调试过，探针本身\n无信息量），故以自然语料的长度外推替代，同样回应「无长上下文评测」的质疑。\n\n'
+    return f'# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）\n> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n> 说明：本报告全部数字由 `build_report.py` 从 `results_*/`、`analysis_v7/`\n> 的落盘产物计算得到，无手填数值。\n\n**预算**：累计 booked {budget_hrs:.2f} GPU·h，估算花费 ¥{spent:.2f} / ¥{cap:.2f}\n（AutoDL RTX 4090，单价按 ¥{price:.2f}/h 保守记账）。\n\n本报告针对外部评审提出的 3 项 P0 阻断项与 P1/P2 缺口逐一补做实验。所有新变体\n（RoPE+QK-norm、dense-warmup、topk 扫描、m=1、长度外推）都经由 **完全相同的\n训练/优化器/LR/评测/CostGuard 代码路径**（对 `exp_lib` 的 `make_layer_cfgs`/\n`SmallGPT` 做 monkey-patch 注入），以保证可比性。长上下文证据采用\n**wikitext 长度外推探针**（train@512 → eval 512..4096）：合成 NIAH 探针在\n本模型规模（d=256/6 层）下两臂均停留在随机水平（无区分度），故以自然语料的\n长度外推替代，同样回应「无长上下文评测」的质疑。\n\n'
 _MODULE_NOTE = '本模块只读：从 `results_*/` 与 `analysis_v7/` 的落盘产物计算\n报告全文，不 import torch（也不 import exp_lib）。上面那段\n模块说明文字以 `_MODULE_NOTE` 命名保留，不参与报告正文的渲染。'
 
 def sec_p0r():
@@ -243,12 +244,18 @@ def sec_p0w():
             m = sum((p for p, _s, _m, _sd in vals)) / len(vals)
             lines.append(f'- `{v}` warm={w}：{m:.2f} PPL（{m - b:+.2f} vs 基线，n={len(vals)}）')
         curves = collections.defaultdict(lambda: collections.defaultdict(list))
+        _dropped_pts = 0
         for v, w, sd, ppl, sw, mins, _syn, _k in rows:
             r = s.get(_k) or {}
             if not _measurable(r):
                 continue
             for step, pv in r.get('ppl_history') or []:
+                if not _ppl_ok(pv):
+                    _dropped_pts += 1
+                    continue
                 curves[v, w][int(step)].append(float(pv))
+        if _dropped_pts:
+            lines += ['', f'> **⚠ 轨迹表剔除了 {_dropped_pts} 个非有限/非正的 PPL 曲线点**（单次失败的 eval），它们不再参与 seed 平均。', '']
         if curves and any((len(c) > 1 for c in curves.values())):
             steps_all = sorted({st for c in curves.values() for st in c})
             lines += ['', '**验证 PPL 轨迹（seed 平均）**：', '', '| step | ' + ' | '.join((f'w={w}' for _v, w in sorted(curves) if _v == 'csa_fixed')) + ' |', '|' + '---|' * (1 + len([1 for _v, w in curves if _v == 'csa_fixed']))]
@@ -268,7 +275,7 @@ def sec_p0w():
                 continue
             _wm = {sd: p for p, _s, _m, sd in grp[v, w]}
             _bm = {sd: p for p, _s, _m, sd in base}
-            _shared = sorted(set(_wm) & set(_bm), key=lambda x: (x is None, x))
+            _shared = sorted(set(_wm) & set(_bm), key=lambda x: (x is None, 0 if x is None else x))
             _dd = [_wm[sd] - _bm[sd] for sd in _shared]
             _st = exact_signflip(_dd) if _dd else None
             if _st is None:
@@ -512,14 +519,14 @@ def sec_p1l():
         lines += ['', '**位置受限（截断）臂**：' + '、'.join((f'`{v}`' for v, f in sorted(trunc_v.items()) if any(f))) + ' —— 其 span > max_pos 的格全部只覆盖最后 `max_pos` 个 token，与真正的长上下文分数不可比；比较外推能力时须以 RoPE 臂（无位置上限）为准。', '']
     if per_v:
         lines += ['', '**读法（相对退化，越低越好）**：', '']
-        for v, rt in sorted(per_v.items(), key=lambda kv: kv[1] or 1000000000.0):
+        for v, rt in sorted(per_v.items(), key=lambda kv: kv[1] if _finite_or_none(kv[1]) is not None else 1000000000.0):
             if not _finite_or_none(rt):
                 continue
             if trunc_v.get(v) and trunc_v[v][-1]:
                 lines.append(f'- `{v}`：**不适用** —— 长端截断格覆盖的是另一段文本的最后 `max_pos` 个 token，与基线格不是同一段文本，读数 ×{rt:.2f} 是跨文本窗口的比值，对长度外推没有信息量。')
             else:
                 lines.append(f'- `{v}`：{lens[-1]}/{lens[0]} = ×{rt:.2f}')
-        _rope_ok = 'csa_fixed_rope' in per_v and 'full_rope' in per_v and _finite_or_none(per_v['csa_fixed_rope']) and _finite_or_none(per_v['full_rope']) and (not (trunc_v.get('csa_fixed_rope', [0])[-1] and trunc_v.get('full_rope', [0])[-1]))
+        _rope_ok = 'csa_fixed_rope' in per_v and 'full_rope' in per_v and _finite_or_none(per_v['csa_fixed_rope']) and _finite_or_none(per_v['full_rope']) and (not (trunc_v.get('csa_fixed_rope', [0])[-1] or trunc_v.get('full_rope', [0])[-1]))
         if _rope_ok:
             _ra = per_v['csa_fixed_rope']
             _rb = per_v['full_rope']
@@ -562,7 +569,7 @@ def sec_p2s():
     lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**评审论断**：v5 scale 只有 2 seeds 且不显著，需 4 seeds + `full_matched`。', '', '| variant | PPL (mean±std) | n | params |', '|---|---|---|---|']
     for v in sorted(d):
         r = d[v]
-        lines.append(f'| `{v}` | {fm(r.get('ppl_mean'))} {sp(r.get('ppl_std'))} | {r.get('n', r.get('n_seeds', '?'))} | {_params_m(r)} |')
+        lines.append(f'| `{v}` | {fm(r.get('ppl_mean'))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
     ps = per_seed_records('results_lm_v5_scale')
     pairs = [('csa_fixed', 'full'), ('csa_fixed', 'full_sw128_matched'), ('csa_fixed', 'full_matched'), ('csa_dynamic', 'full'), ('hybrid_dynamic', 'full')]
     _agg = d
@@ -605,7 +612,7 @@ def sec_flops():
     cfg = d.get('config', {})
     rows = d.get('rows', [])
     pick = {512, 2048, 8192, 65536, 1048576}
-    lines = ['## 解析 FLOPs / KV-cache 与交叉点（评审 P1：效率结论误导）', '', f'**配置**：{cfg}。**之所以用解析式**：论文只给相对百分比、无闭式；且本机小模型的计时受 batch size 变化干扰（512 时 bs=12、8192 时 bs=1），故效率结论改用与硬件无关的解析 FLOPs / KV-cache。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 **seq = {d.get('crossover_seq_len_csa_beats_dense')}** 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
+    lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 **seq = {d.get('crossover_seq_len_csa_beats_dense')}** 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
     for r in rows:
         if r['seq_len'] in pick:
             lines.append(f'| {r['seq_len']} | {r['sel_ratio']:.2%} | {r['csa_over_dense']:.3f} | {r['hybrid_over_dense']:.3f} | {r['csa_kv_over_dense']:.3f} |')
@@ -617,7 +624,7 @@ def sec_flops():
         _sel = _r512['sel_ratio']
         _verdict = '省' if _ratio < 1.0 else '不省'
         _cross = f'交叉点本身就在 seq={_x}' if _x <= 512 else f'交叉点在 seq={_x}，训练序列（512）尚未到达'
-        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。优势随序列变长继续放大（比值单调降到 {min((r['csa_over_dense'] for r in rows)):.3f}）。这条修正了「sparse 天然更高效」的笼统表述——稀疏的收益是随长度增长的，并非在任意长度上都成立。', '']
+        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。优势随序列变长继续放大（比值单调降到 {min((r['csa_over_dense'] for r in rows)):.3f}）。稀疏的收益是随长度增长的，并非在任意长度上都成立。', '']
     return '\n'.join(lines) + '\n'
 
 def sec_stats():

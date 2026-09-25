@@ -211,17 +211,17 @@ def build_report(out='REPORT_v9.md'):
     A('')
     _r_n = sorted({p['n'] for p in rope.values()}) if rope else []
     _r_n_txt = (str(_r_n[0]) if len(_r_n) == 1 else f'{_r_n[0]}–{_r_n[-1]}') if _r_n else '0'
-    A(f'v9 补齐 v7/v8 留下的两个缺口：(1) P1T 的 seq-2048 topk 扫描在 v7 截断于 topk≥128，v9 以 batch_size=1 重跑**完整 5 点扫描**（新目录、面板内自洽）；(2) v8 的 RoPE 20k 长跑只有 2 seeds（精确符号翻转检验在 n=2 时 p 值下限 0.500，正是当初评审否决 n=2 面板的原因），v9 补种子以提升该面板分辨率——**实际落盘 n={_r_n_txt}**。')
+    A(f'v9 覆盖两个面板：(1) P1T 的 seq-2048 topk **完整 5 点扫描**（batch_size=1，新目录、面板内自洽）；(2) RoPE 20k 长跑补第三种子（精确符号翻转检验在 n=2 时 p 值下限 0.500，补种子以提升该面板分辨率）——**实际落盘 n={_r_n_txt}**。')
     A('')
     A('---')
     A('')
     A('## P2T seq-2048 topk 完整扫描（batch_size=1）')
     A('')
-    A('**背景**：v7 P1T 在 bs=3 下扫描 `topk ∈ {8,32,128,512}` + `csa_fix_m1`；topk128/512 在该配置下未能完成，扫描被截断，结论只剩 3 点。v9 改用 bs=1 并按 v7 台账预案启用**逐 block 梯度检查点**——前向无 dropout/RNG，重算严格等价，数学结果与无检查点路径一致。')
+    A('**背景**：本面板扫描 `topk ∈ {8,32,128,512}` + `csa_fix_m1`，采用 bs=1 并启用**逐 block 梯度检查点**——前向无 dropout/RNG，重算严格等价，数学结果与无检查点路径一致。')
     A('')
     _n_seen = sorted({p['n'] for p in seq2k.values()}) if seq2k else []
     _n_txt = (f'{_n_seen[0]} seeds' if len(_n_seen) == 1 else f'{_n_seen[0]}–{_n_seen[-1]} seeds') if _n_seen else '0 seeds'
-    A(f'**做法**：seq 2048、bs 1、逐 block 梯度检查点、1500 步；5 个变体全部重跑于新目录 `results_lm_v9_seq2k`（面板内 batch/步数/token 数/训练配置完全一致；v7 的 bs=3 残板保留在 `results_lm_v7_seq2k` 作历史记录，不并入统计）。**实际落盘 {_n_txt}**（下表每点自报 n）。')
+    A(f'**做法**：seq 2048、bs 1、逐 block 梯度检查点、1500 步；5 个变体全部重跑于 `results_lm_v9_seq2k`（面板内 batch/步数/token 数/训练配置完全一致）。**实际落盘 {_n_txt}**（下表每点自报 n）。')
     A('')
     A('| variant | PPL (mean±std) | n | 等效选择率@2048 |')
     A('|---|---|---|---|')
@@ -264,13 +264,13 @@ def build_report(out='REPORT_v9.md'):
                 continue
             A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
     A('')
-    A('**结论读法**：若完整扫描证实 m=1（纯 DSA）不差于压缩 CSA，则 v7「压缩不是瓶颈」的方向性结论在完整扫描下成立/被修正（按表）；选择率甜点位置由 5 点全貌直接给出，v7 留下的「甜点完整刻画」待办关闭。')
+    A('**结论读法**：若完整扫描证实 m=1（纯 DSA）不差于压缩 CSA，则「压缩不是瓶颈」的方向性结论在完整扫描下成立（按表）；选择率甜点位置由 5 点全貌直接给出。')
     A('')
     A('---')
     A('')
     A('## P2S3 RoPE 20k 长跑补第三种子（n=2 → n=3）')
     A('')
-    A('**背景**：v8 P2R 跑了 `csa_fixed_rope` vs `full_rope` 的 20k 步 / ~123M token 对照（abs-PE 20k 长跑的 RoPE 镜像），但只有 2 seeds——精确符号翻转检验在 n=2 时 p 值下限 0.500，正是评审当初否决 scale 面板 n=2 的理由。v9 补 seed 2（同一 outdir，resume 跳过 seed 0/1）。')
+    A('**背景**：`csa_fixed_rope` vs `full_rope` 的 20k 步 / ~123M token 对照（abs-PE 20k 长跑的 RoPE 镜像）在此补齐第三个 seed（同一 outdir，resume 跳过已完成的 seed）。')
     A('')
     A('| variant | PPL@20k (mean±std) | n |')
     A('|---|---|---|')
@@ -296,7 +296,7 @@ def build_report(out='REPORT_v9.md'):
         A(f'**结论**：RoPE 面板上 `csa_fixed_rope` {_dir20} `full_rope` **{abs(c['mean']):.2f} PPL**（n={c['n']}，p={c['p_exact_signflip']:.3f}）' + _tail20)
     _a20 = comp.get('long20k(abs): csa_fixed - full') or {}
     if _a20 and 'omitted' in _a20:
-        A('> **abs-PE 镜像对比不可用**：`results_lm_v3_long` 的 summary 全部是 `synthesized` 重构记录（由旧 `aggregate.json` 回填，无权重、无 `run_cfg`，同一变体的多个 seed 共享同一个拷贝值），不构成独立观测，故不参与配对检验。该面板的 20k abs-PE 数值请以重新训练后的产物为准；本表的 abs-PE 侧结论只由 `REPORT_v7/v10` 中持有真实记录的 run 支撑。')
+        A('> **abs-PE 镜像对比不可用**：`results_lm_v3_long` 的 summary 全部是 `synthesized` 重构记录（无权重、无 `run_cfg`，同一变体的多个 seed 共享同一个拷贝值），不构成独立观测，故不参与配对检验。本表的 abs-PE 侧结论只由持有真实记录的 run 支撑。')
     A('')
     A('---')
     A('')

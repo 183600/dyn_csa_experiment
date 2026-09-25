@@ -39,7 +39,6 @@ BUDGET_V7 = dict(L.BUDGET)
 BUDGET_V7.update(total_yuan=float(os.environ.get('V7_BUDGET_YUAN', 107.0)), price_per_hour=float(os.environ.get('V7_PRICE_PER_HOUR', 2.4)), state_path='autodl_budget_state_v7.json')
 BUDGET_V7['already_spent_yuan'] = 0.0
 _ROPE_CS_CACHE = {}
-_ROPE_REV_CACHE = {}
 
 def rope_inv_freq(half, device, base=10000.0):
     return base ** (-torch.arange(0, half, device=device, dtype=torch.float64) / half)
@@ -47,8 +46,11 @@ def rope_inv_freq(half, device, base=10000.0):
 def rope_cos_sin(head_dim, rope_dim, positions, device, base=10000.0):
     cacheable = isinstance(positions, torch.Tensor) and positions.dtype in (torch.int64, torch.int32) and (positions.numel() > 0)
     if cacheable:
-        _np = int(positions.numel())
-        cacheable = int(positions[0]) == 0 and int(positions[-1]) == _np - 1 and (_np == 1 or bool((positions[1:] - positions[:-1] == 1).all()))
+        if positions is L._arange_cache(positions.numel(), positions.device):
+            pass
+        else:
+            _np = int(positions.numel())
+            cacheable = int(positions[0]) == 0 and int(positions[-1]) == _np - 1 and (_np == 1 or bool((positions[1:] - positions[:-1] == 1).all()))
     if cacheable:
         key = (float(base), int(rope_dim), int(head_dim), str(device), int(positions.numel()), str(positions.dtype))
         hit = _ROPE_CS_CACHE.get(key)
@@ -60,20 +62,6 @@ def rope_cos_sin(head_dim, rope_dim, positions, device, base=10000.0):
     out = (torch.cos(ang).to(torch.float32), torch.sin(ang).to(torch.float32))
     if cacheable and len(_ROPE_CS_CACHE) < 64:
         _ROPE_CS_CACHE[key] = out
-    return out
-
-def rope_rev_tables(T, half, device, base=10000.0, *, lo=0, out_dtype=None):
-    key = (int(T), int(lo), int(half), str(device), float(base), str(out_dtype) if out_dtype is not None else None)
-    hit = _ROPE_REV_CACHE.get(key)
-    if hit is not None:
-        return hit
-    inv = rope_inv_freq(half, device, base)
-    ang = (-torch.arange(int(lo), int(T), device=device, dtype=torch.float64))[:, None] * inv
-    out = (torch.cos(ang), torch.sin(ang))
-    if out_dtype is not None:
-        out = (out[0].to(out_dtype), out[1].to(out_dtype))
-    if len(_ROPE_REV_CACHE) < 64:
-        _ROPE_REV_CACHE[key] = out
     return out
 
 def apply_rope(x, cos, sin, rope_dim):
@@ -222,7 +210,6 @@ class HybridAttentionRoPE(L.HybridAttention):
     def _rope_attn(self, q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, sink, rope_dim, q_chunk=128, soft=None, rope_base=10000.0, mem_budget_bytes=None):
         T, nh, hd = q.shape
         dev = q.device
-        half = rope_dim // 2
         if mem_budget_bytes is None:
             mem_budget_bytes = L._attn_transient_budget(dev)
         _per_row = 4 * max(1, int(topk_idx.shape[1]) + int(w)) * nh * hd
@@ -231,12 +218,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
         if _bindable and _bytes_per_chunk_row > 0:
             _max_rows = max(_MIN_CHUNK, int(mem_budget_bytes) // _bytes_per_chunk_row)
-            _new_chunk = min(q_chunk, _max_rows)
-            if _new_chunk < q_chunk:
-                print(f'[_rope_attn] q_chunk {q_chunk} -> {_new_chunk} (topk={topk_idx.shape[1]}, w={w}, T={T})')
-                q_chunk = _new_chunk
-        _adtype = q.dtype if q.dtype in (torch.float32, torch.float64) else torch.float32
-        inv = rope_inv_freq(half, dev, rope_base)
+            q_chunk = min(q_chunk, _max_rows)
         cos, sin = rope_cos_sin(hd, rope_dim, L._arange_cache(T, dev), dev, rope_base)
         qr = apply_rope(q, cos[:, None, :], sin[:, None, :], rope_dim)
         bc, bs = rope_cos_sin(hd, rope_dim, last_tok, dev, rope_base)
@@ -249,24 +231,17 @@ class HybridAttentionRoPE(L.HybridAttention):
         _n_blk = k_blk_r.shape[0]
         _k_stack = torch.cat([k_blk_r, k_sw_r], 0)
         _v_stack = torch.cat([v_blk, v_sw], 0)
-        _idx = topk_idx.long()
-        _plo, _phi = (int(last_tok[_idx].min()), int(last_tok[_idx].max())) if T > 0 else (0, 0)
-        _lo = min(0, _plo, -(w - 1))
-        _hi = max(_phi, T - 1)
-        _rc_tab, _rs_tab = rope_rev_tables(T, half, dev, rope_base, lo=_lo, out_dtype=_adtype)
-        _tab_ok = T > 0 and _hi < T
         for s in range(0, T, q_chunk):
             e = min(s + q_chunk, T)
             pos = pos_all[s:e]
             ib = topk_idx[s:e].long()
-            sel = torch.gather(L.block_readable(pos, last_tok), 1, ib)
+            sel = pos[:, None] > last_tok[ib]
             if ib.shape[1] > 1:
                 _dup_mm = ib[:, :, None] == ib[:, None, :]
                 _keep = ~_dup_mm.tril(-1).any(-1)
                 sel = sel & _keep
             else:
                 _keep = None
-            pos_b = last_tok[ib].float()
             wg = pos[:, None] - (w - 1) + rel[None, :]
             wvalid = wg >= 0
             wi = wg.clamp(min=0)
@@ -274,9 +249,8 @@ class HybridAttentionRoPE(L.HybridAttention):
             Kset = L._take_2d(_k_stack, both)
             Vset = L._take_2d(_v_stack, both)
             valid = torch.cat([sel, wvalid], 1)
-            ent_pos = torch.cat([pos_b, wg.float()], 1)
-            logits = torch.einsum('qhd,qmhd->qhm', qr[s:e], Kset) * scale
-            logits = logits.masked_fill(~valid[:, None, :], torch.finfo(logits.dtype).min)
+            raw_logits = torch.einsum('qhd,qmhd->qhm', qr[s:e], Kset) * scale
+            logits = raw_logits.masked_fill(~valid[:, None, :], torch.finfo(raw_logits.dtype).min)
             attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
             if soft is not None:
                 nb = ib.shape[1]
@@ -286,24 +260,11 @@ class HybridAttentionRoPE(L.HybridAttention):
                 sp = (1.0 - sv).clamp(min=1e-12, max=1.0)
                 soft_log = torch.log(sp)
                 soft_log.masked_fill_(sv >= 1.0, torch.finfo(sv.dtype).min)
-                soft_logits = torch.cat([logits[:, :, :nb] + soft_log[:, None, :], logits[:, :, nb:]], -1)
+                soft_logits = torch.cat([raw_logits[:, :, :nb] + soft_log[:, None, :], raw_logits[:, :, nb:]], -1)
+                soft_logits = soft_logits.masked_fill(~valid[:, None, :], torch.finfo(soft_logits.dtype).min)
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = soft_attn + (attn - soft_attn.detach())
-            _epl = ent_pos.long()
-            if _tab_ok:
-                rc = _rc_tab[_epl - _lo][:, None, :, :]
-                rs = _rs_tab[_epl - _lo][:, None, :, :]
-            else:
-                ang = (-ent_pos.to(torch.float64))[..., None] * inv
-                rc = torch.cos(ang).to(_adtype)[:, None, :, :]
-                rs = torch.sin(ang).to(_adtype)[:, None, :, :]
-            Vp = Vset.permute(0, 2, 1, 3)
-            vr = Vp[..., :rope_dim]
-            vp_ = Vp[..., rope_dim:]
-            v1, v2 = (vr[..., :half], vr[..., half:])
-            rot = torch.cat([v1 * rc - v2 * rs, v1 * rs + v2 * rc], -1)
-            Vr = torch.cat([rot, vp_], -1)
-            chunks.append((attn[:, :, :, None] * Vr).sum(2))
+            chunks.append((attn[:, :, :, None] * Vset.permute(0, 2, 1, 3)).sum(2))
         return torch.cat(chunks, 0)
 
     def _dense_warmup_forward(self, x):
@@ -547,7 +508,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        losses.append(loss.detach())
+        losses.append(float(loss))
         if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
             ppl_hist.append([step + 1, float(L.eval_ppl(model, val_batch[:eval_subset], device))])
         if log_every and (step % log_every == 0 or step == steps - 1):
@@ -596,7 +557,8 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
     for v in variants:
         if v not in ratios:
             ratios[v] = L.variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'})
-    _fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{cfg.get('warmup', 50)}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_cs{CKPT_CODE}'
+    _wu = cfg['warmup']
+    _fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_cs{CKPT_CODE}'
     for seed in seeds:
         for warm in warm_grid:
             for v in variants:
@@ -623,7 +585,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                     _deadline = guard.deadline_ts()
                 rec = None
                 try:
-                    rec = train_warmup(v, train_ids, val_batch, vocab, seed=seed, warm_steps=warm, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=_deadline)
+                    rec = train_warmup(v, train_ids, val_batch, vocab, seed=seed, warm_steps=warm, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=_wu, comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=_deadline)
                     if rec.get('budget_truncated'):
                         print(f'[budget] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`) and the key is left ABSENT. Raise the budget and re-run to retry this cell.')
                     else:
@@ -1018,7 +980,7 @@ def run_niah_phase(payload, guard=None, label=''):
                     break
                 t0 = time.time()
                 try:
-                    r = eval_niah(model, Ln, DEVICE)
+                    r = eval_niah(model, Ln, DEVICE, vocab=vocab)
                 except Exception as e:
                     r = {'error': f'{type(e).__name__}: {e}'}
                 r.update({'variant': v, 'seed': seed, 'seq_len': Ln, 'params': _ckp['params'], 'probe_s': time.time() - t0, '_code': CKPT_CODE})
@@ -1055,7 +1017,6 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                         _chunk = max(1, _chunk // 2)
                         if device.type == 'cuda':
                             torch.cuda.empty_cache()
-                        print(f'[p1l] L{Ln}: OOM at {_chunk * 2} rows - retrying with {_chunk} row(s)')
                         continue
                     raise
                 _lsm = F.log_softmax(logits[:, :-1], dim=-1)
@@ -1092,6 +1053,7 @@ def run_lenphase(payload, guard=None, label=''):
     need = max(eval_lens) + 1
     _, val_ids, _, _, _ = L.load_wikitext(max(train_len, need), 4000000)
     print(f'[p1l] val slice {val_ids.shape}, eval_lens={eval_lens}, seeds={seeds}')
+    _train_cache = [None]
     for v in variants:
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
@@ -1119,7 +1081,9 @@ def run_lenphase(payload, guard=None, label=''):
                 mr = 4.0
                 if v in PARAM_MATCHED_V7:
                     mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7))
-                train_ids, _, _, _, _ = L.load_wikitext(train_len, 8000000)
+                if _train_cache[0] is None:
+                    _train_cache[0] = L.load_wikitext(train_len, 8000000)[0]
+                train_ids = _train_cache[0]
                 _tr = L.train_variant(v, train_ids, None, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=12, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=guard.deadline_ts() if guard is not None else None, return_model=True)
                 if _tr.get('budget_truncated'):
                     print(f'  [p1l-train] {v:18s} s{seed} TRUNCATED by budget — not saved, will retry')

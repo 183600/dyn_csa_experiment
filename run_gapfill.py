@@ -41,9 +41,12 @@ def git_push(msg):
     committed = r.returncode == 0
     if not committed and 'nothing to commit' not in r.stdout + r.stderr:
         print(f'[git] commit problem: {(r.stdout + r.stderr)[-300:]}')
-    rb = run('git', 'pull', '--rebase', '--autostash', 'origin', run('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip())
-    if committed and rb.returncode != 0:
-        print(f'[git] rebase onto origin failed: {(rb.stdout + rb.stderr)[-300:]}')
+    _branch = run('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
+    if _branch != 'HEAD':
+        rb = run('git', 'pull', '--rebase', '--autostash', 'origin', _branch)
+        if rb.returncode != 0:
+            print(f'[git] rebase onto origin failed: {(rb.stdout + rb.stderr)[-300:]}')
+            run('git', 'rebase', '--abort')
     r = run('git', 'push', 'origin', 'HEAD')
     ok = r.returncode == 0
     tail = (r.stdout + r.stderr).strip()[-300:]
@@ -72,13 +75,25 @@ def synthesize_long_summary():
     for v, e in agg.items():
         _ppls = e.get('ppls') or []
         _seeds = e.get('seeds')
+        if not _ppls:
+            continue
         _real = sorted((r.get('seed') for r in summary.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None)))
-        if _ppls and _seeds is None:
+        if _seeds is None or len(_seeds) != len(_ppls):
             _unaligned.append((v, len(_ppls), _real))
             continue
-        if not _real:
-            continue
-        if _ppls and (len(_seeds) != len(_ppls) or sorted((int(s) for s in _seeds)) != _real):
+        _agg_map = {}
+        _bad_map = False
+        for _si, _pi in zip(_seeds, _ppls):
+            _si = _num_or_none(_si)
+            if _si is None:
+                _bad_map = True
+                break
+            _pi = float(_pi)
+            if _si in _agg_map and abs(_agg_map[_si] - _pi) > 1e-06 * max(1.0, abs(_pi)):
+                _bad_map = True
+            _agg_map[_si] = _pi
+        _conflict = [int(r['seed']) for r in summary.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None) and (not r.get('synthesized')) and (r.get('steps') == 20000) and L.ppl_is_usable(r.get('ppl')) and (int(r['seed']) not in _agg_map or abs(float(r['ppl']) - _agg_map[int(r['seed'])]) > 1e-06 * max(1.0, abs(_agg_map[int(r['seed'])])))]
+        if _bad_map or _conflict:
             _unaligned.append((v, len(_ppls), _real))
     if _unaligned:
         for _v, _n, _real in _unaligned:
