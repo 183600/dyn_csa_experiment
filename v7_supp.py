@@ -46,11 +46,7 @@ def rope_inv_freq(half, device, base=10000.0):
 def rope_cos_sin(head_dim, rope_dim, positions, device, base=10000.0):
     cacheable = isinstance(positions, torch.Tensor) and positions.dtype in (torch.int64, torch.int32) and (positions.numel() > 0)
     if cacheable:
-        if positions is L._arange_cache(positions.numel(), positions.device):
-            pass
-        else:
-            _np = int(positions.numel())
-            cacheable = int(positions[0]) == 0 and int(positions[-1]) == _np - 1 and (_np == 1 or bool((positions[1:] - positions[:-1] == 1).all()))
+        cacheable = positions is L._arange_cache(positions.numel(), positions.device)
     if cacheable:
         key = (float(base), int(rope_dim), int(head_dim), str(device), int(positions.numel()), str(positions.dtype))
         hit = _ROPE_CS_CACHE.get(key)
@@ -483,6 +479,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         _blk.attn._dense_warmup = warm_on
     t0 = time.time()
     losses, ppl_hist, switch_ppl = ([], [], None)
+    _lbuf = []
     model.train()
     for step in range(steps):
         if deadline_ts is not None and time.time() > deadline_ts:
@@ -509,10 +506,13 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        losses.append(float(loss))
+        _lbuf.append(loss.detach())
         if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
             ppl_hist.append([step + 1, float(L.eval_ppl(model, val_batch[:eval_subset], device))])
         if log_every and (step % log_every == 0 or step == steps - 1):
+            if _lbuf:
+                losses.extend(torch.stack(_lbuf).tolist())
+                _lbuf.clear()
             print(f'  step {step:5d}  loss {float(losses[-1]):.4f}  lr {opt.param_groups[0]['lr']:.2e}  dense={getattr(model.blocks[0].attn, '_dense_warmup', False)}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
     wall = time.time() - t0
     if deadline_ts is not None and time.time() > deadline_ts:
@@ -525,6 +525,9 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     ppl = L.eval_ppl(model, val_batch, device)
     stats = L.compression_report(model, val_batch, device, val_bnd=val_bnd)
     print(f'[{variant} seed={seed} warm={warm_steps}] val PPL = {ppl:.3f}  ({wall / 60:.1f} min)')
+    if _lbuf:
+        losses.extend(torch.stack(_lbuf).tolist())
+        _lbuf.clear()
     losses = [float(v) for v in losses]
     res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(np.mean(losses[-50:])), 'ppl_history': ppl_hist, 'delta_trace': {}}
     del model, opt, bpe, decay, ndecay, dpar

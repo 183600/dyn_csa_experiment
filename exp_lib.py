@@ -21,7 +21,7 @@ if _NEEDED:
         print(f'[setup] could not install {', '.join(_NEEDED)} ({type(_pip_err).__name__}: {_pip_err}) — continuing; a code path that actually needs them will raise ImportError')
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, math, os, re, time, json, random, csv, tempfile, itertools
+import gc, math, os, re, time, json, random, csv, tempfile, itertools, bisect
 from math import comb
 from dataclasses import dataclass
 import numpy as np
@@ -137,8 +137,16 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
-    vals = [torch.quantile(sim[:k + 1].detach().float(), q) for k in range(sim.numel())]
-    return torch.stack(vals).to(sim.device)
+    x = sim.detach().float().cpu()
+    out = torch.empty_like(x)
+    srt = []
+    for k, v in enumerate(x.tolist()):
+        srt.insert(bisect.bisect_left(srt, v), v)
+        pos = q * k
+        lo = int(pos)
+        frac = pos - lo
+        out[k] = srt[lo] if frac == 0.0 or lo + 1 > k else srt[lo] * (1.0 - frac) + srt[lo + 1] * frac
+    return out.to(sim.device)
 
 def blocks_fixed(n, block_size, device):
     return torch.arange(n, device=device) // block_size
@@ -591,10 +599,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
     _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
     if _bindable and _bytes_per_chunk_row > 0:
         _max_rows = max(_MIN_CHUNK, int(mem_budget_bytes) // _bytes_per_chunk_row)
-        _new_chunk = min(q_chunk, _max_rows)
-        if _new_chunk < q_chunk:
-            print(f'[_block_token_attn] q_chunk {q_chunk} -> {_new_chunk} (M={_M}, w={w}, n={n})')
-            q_chunk = _new_chunk
+        q_chunk = min(q_chunk, _max_rows)
     q_chunk = max(1, min(int(q_chunk), n))
     out = torch.empty_like(q)
     _MINL = torch.finfo(q.dtype).min
@@ -2144,6 +2149,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     bpe = batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
     t0 = time.time()
     losses = []
+    _lbuf = []
     ppl_hist = []
     delta_trace = {}
     model.train()
@@ -2164,11 +2170,14 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        losses.append(loss.detach())
+        _lbuf.append(loss.detach())
         if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
             sub_ppl = eval_ppl(model, val_batch[:eval_subset], device)
             ppl_hist.append([step + 1, float(sub_ppl)])
         if log_every and (step % log_every == 0 or step == steps - 1):
+            if _lbuf:
+                losses.extend(torch.stack(_lbuf).tolist())
+                _lbuf.clear()
             _lv = float(losses[-1])
             for li, blk in enumerate(model.blocks):
                 dl = getattr(blk.attn, 'delta_logit', None)
@@ -2196,6 +2205,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         stats = compression_report(model, val_batch, device, val_bnd=val_bnd)
         print(f'[{variant} seed={seed}] val PPL = {ppl:.3f}')
         print(f'    block-length diagnostics: {json.dumps(stats, default=float)}')
+    if _lbuf:
+        losses.extend(torch.stack(_lbuf).tolist())
+        _lbuf.clear()
     losses = [float(v) for v in losses]
     result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(np.mean(losses[-50:])), 'ppl_history': ppl_hist, 'delta_trace': delta_trace}
     if return_model:

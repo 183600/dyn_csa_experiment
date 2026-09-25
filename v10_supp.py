@@ -59,7 +59,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg):
     target = cfg['target']
     vocab = int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
     far = eval_len - target
-    n_far = far + 1
+    n_far = far
     k = int(round(rho * n_far))
     nll_sum = []
     n_tok = []
@@ -92,7 +92,7 @@ def _cell_ppl(nll_sum, n_tok):
     return math.exp(total / nt)
 
 def _probe_fingerprint(cfg):
-    return {'n_seq': int(cfg['n_seq']), 'chunk': int(cfg['chunk']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'stat': 'ppl_pooled_nll_v2'}
+    return {'n_seq': int(cfg['n_seq']), 'chunk': int(cfg['chunk']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'stat': 'ppl_pooled_nll_v3'}
 
 def _probe_params_current(rec, fp):
     return isinstance(rec, dict) and rec.get('probe_params') == fp
@@ -165,6 +165,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                     cfgs.append(c2)
                 model = L.SmallGPT(_vocab_ck, 256, 6, 8, 32, d.get('train_len', 512), cfgs, mlp_ratio=d['mlp_ratio']).to(DEVICE)
                 model.load_state_dict(d['sd'])
+                model.eval()
                 t0 = time.time()
                 for Ln, rho in cells:
                     key = _cell_key(Ln, rho)
@@ -590,7 +591,7 @@ def build_report(out='REPORT_v10.md'):
         n_min_ri = min((n for k, n in _n_by_c if 'randidx' in k), default=0)
         p_floor = 2.0 / 2 ** n_min if n_min else float('nan')
         learned_helps = ri_sig
-        A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——正值表示「看得见远距噪声就会受害」，支持限制远距注意力暴露带来抗噪性；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，即该面板在设计上就无法达到 0.05 显著性），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '（注意：v11 之前 committed 的探针单元所用的验证文本与 indexer 已不适用于当前代码，需重跑 P3MT/P3MP 再解读本段。）')
+        A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——正值表示「看得见远距噪声就会受害」，支持限制远距注意力暴露带来抗噪性；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，即该面板在设计上就无法达到 0.05 显著性），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
         A('')
     A('---')
     A('')
@@ -648,7 +649,7 @@ def build_report(out='REPORT_v10.md'):
     A('')
     A('## P3T seq-2048 topk 扫描补种子（n=2 → n=4）')
     A('')
-    A('**背景**：v9 P2T 的完整 5 点扫描只有 2 seeds，精确符号翻转 p 值下限 0.500——v9 收官后唯一仍处该下限的面板。v10 按同一配方（seq 2048、bs 1、逐 block 梯度检查点、1500 步）补 seeds 2/3（同一 outdir，resume 跳过 seed 0/1）。')
+    A('**背景**：v9 P2T 的完整 5 点扫描只有 2 seeds，精确符号翻转 p 值下限 0.500——v9 收官后唯一仍处该下限的面板。v10 按同一配方（seq 2048、bs 1、1500 步）补 seeds 2/3（同一 outdir，resume 跳过 seed 0/1）。')
     A('')
     A('| variant | PPL (mean±std) | n |')
     A('|---|---|---|')

@@ -611,7 +611,7 @@ def sec_p2s():
 def sec_flops():
     d = load(os.path.join(REPO, 'analysis_v7', 'flops_analytic.json'))
     if not d:
-        return '## 解析 FLOPs / KV-cache（对应评审 P1 效率问题）— （无结果）\n\n'
+        return '## 解析 FLOPs / KV-cache — （无结果）\n\n'
     cfg = d.get('config', {})
     rows = d.get('rows', [])
     pick = {512, 2048, 8192, 65536, 1048576}
