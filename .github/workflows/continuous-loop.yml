@@ -50,7 +50,7 @@ jobs:
                   "apiKey": "{env:KIMI_API_KEY}"
                 },
                 "models": {
-                  kimi-k3": { "name": kimi-k3" }
+                  "moonshotai/kimi-k3": { "name": "moonshotai/kimi-k3" }
                 }
               }
             },
