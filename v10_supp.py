@@ -561,7 +561,9 @@ def build_report(out='REPORT_v10.md'):
                 row = []
                 for rho in rhos:
                     m = [c['mean'] for c in cells if (c['variant'], c['arm'], c['eval_len'], c['rho']) == (v, arm, Ln, rho)]
-                    row.append(f'{m[0]:.2f}' if m else '—')
+                    row.append(f'{m[0]:.2f}' if len(m) == 1 else '—')
+                    if len(m) > 1:
+                        print(f'[report] {v}+{arm} L={Ln} rho={rho}: {len(m)} parameterisations of the cell exist — the table omits the cell (the paired test refuses it too)')
                 A(f'| `{v}`+{arm} | ' + ' | '.join(row) + ' |')
             A('')
     contr = probe.get('contrasts', {})

@@ -148,6 +148,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             sim = L.cosine_similarity_consecutive(fused)
             if sim.numel() == 0:
                 bid = torch.zeros(T, dtype=torch.long, device=x.device)
+                nblk = 1
                 gate_mean = torch.zeros((), device=x.device) if self.need_reg else None
             else:
                 prefix_mean = torch.cumsum(sim, 0) / L._range_cache(1, sim.numel() + 1, x.device)
@@ -827,6 +828,8 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                 skipped.append(s)
                 continue
             if ra.get('run_cfg') is None:
+                unstamped += 1
+            if rb.get('run_cfg') is None:
                 unstamped += 1
             dl.append(ra['ppl'] - rb['ppl'])
         if skipped:

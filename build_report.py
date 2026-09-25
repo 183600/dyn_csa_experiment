@@ -152,6 +152,15 @@ def per_seed_records(outdir):
             _slot[_sd] = r
     return dict(out)
 
+def _first_wins_by_seed(rows, label):
+    out = {}
+    for p, _s, _m, sd in rows:
+        if sd in out:
+            print(f'[report] ambiguous seed {sd} in {label}: two measurable records found; keeping the FIRST for pairing')
+            continue
+        out[sd] = p
+    return out
+
 def _pair_reason(ra, rb):
     fa, fb = (ra.get('run_cfg'), rb.get('run_cfg'))
     if fa is None or fb is None:
@@ -295,8 +304,8 @@ def sec_p0w():
         for v, w in sorted(grp):
             if v != 'csa_fixed' or w == 0:
                 continue
-            _wm = {sd: p for p, _s, _m, sd in grp[v, w]}
-            _bm = {sd: p for p, _s, _m, sd in base}
+            _wm = _first_wins_by_seed(grp[v, w], f'{v} w={w}')
+            _bm = _first_wins_by_seed(base, f'{v} w=0 (base)')
             _shared = sorted(set(_wm) & set(_bm), key=lambda x: (x is None, 0 if x is None else x))
             _dd = [_wm[sd] - _bm[sd] for sd in _shared]
             _st = exact_signflip(_dd) if _dd else None
@@ -431,7 +440,7 @@ def sec_p1t():
     if failed:
         lines += ['', '**未完成的扫描点（如实记录）**：', '']
         for v in sorted(failed):
-            seeds = ','.join((str(x) for x in sorted(failed[v])))
+            seeds = ','.join((str(x) for x in sorted(failed[v], key=lambda x: (x is None, -1 if x is None else x))))
             lines.append(f'- `{v}`（seed {seeds}）：topk≥128 的扫描点在本配置与预算约束下未完成，扫描被截断。')
         lines.append('')
     ks = [8, 32, 128, 512]

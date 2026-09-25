@@ -276,8 +276,12 @@ def main(argv=None):
     plt.close(fig)
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.4))
     for ax, key, ttl in zip(axes, ['bnd_f1', 'bnd_prec', 'bnd_rec'], ['boundary F1 (tol=1)', 'precision', 'recall']):
-        layers, Mb = per_seed_layer('hybrid_csa_dyn', key)
-        _, Ma = per_seed_layer('hybrid_csa_dyn_fuse', key)
+        try:
+            layers, Mb = per_seed_layer('hybrid_csa_dyn', key)
+            _, Ma = per_seed_layer('hybrid_csa_dyn_fuse', key)
+        except (KeyError, ValueError) as e:
+            print(f'[fuse_analysis] NOTE: skipping `{ttl}` boundary plot — {e}')
+            continue
         x = np.arange(len(layers))
         w = 0.38
         ax.bar(x - w / 2, np.nanmean(Mb, axis=0), w, yerr=sample_std(Mb, axis=0), capsize=3, color='steelblue', label='no-fuse')
@@ -292,11 +296,21 @@ def main(argv=None):
     plt.close(fig)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
     PLOTTED = [('hybrid_csa_dyn', 'steelblue'), ('hybrid_csa_dyn_fuse', 'darkorange'), ('csa_dynamic', 'seagreen'), ('csa_dyn_fuse', 'firebrick')]
-    all_idx = sorted({i for v, _ in PLOTTED for i in layer_idx(layers_of(v))})
+    _plotted_layers = {}
+    for v, _c in PLOTTED:
+        try:
+            _plotted_layers[v] = layers_of(v)
+        except (KeyError, ValueError) as e:
+            print(f'[fuse_analysis] NOTE: skipping layer index contribution of `{v}` — {e}')
+    all_idx = sorted({i for v, _ in PLOTTED for i in layer_idx(_plotted_layers.get(v, []))})
     ax = axes[0]
     for v, color in PLOTTED:
-        layers, Mm = per_seed_layer(v, 'len_mean')
-        _, Ms = per_seed_layer(v, 'len_std')
+        try:
+            layers, Mm = per_seed_layer(v, 'len_mean')
+            _, Ms = per_seed_layer(v, 'len_std')
+        except (KeyError, ValueError) as e:
+            print(f'[fuse_analysis] NOTE: skipping len_mean curve of `{v}` — {e}')
+            continue
         x = np.array(layer_idx(layers))
         ax.errorbar(x, np.nanmean(Mm, axis=0), yerr=np.nanmean(Ms, axis=0), marker='o', ms=4, lw=1.6, color=color, label=v, alpha=0.9)
     ax.set_xticks(all_idx)
@@ -306,7 +320,11 @@ def main(argv=None):
     ax.legend(fontsize=8)
     ax = axes[1]
     for v, color in PLOTTED:
-        layers, Mf = per_seed_layer(v, 'frac_at_min')
+        try:
+            layers, Mf = per_seed_layer(v, 'frac_at_min')
+        except (KeyError, ValueError) as e:
+            print(f'[fuse_analysis] NOTE: skipping frac_at_min curve of `{v}` — {e}')
+            continue
         ax.plot(np.array(layer_idx(layers)), np.nanmean(Mf, axis=0), marker='s', ms=4, lw=1.6, color=color, label=v)
     ax.set_xticks(all_idx)
     ax.set_xticklabels([f'L{i}' for i in all_idx])

@@ -389,12 +389,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         _pad_b = max(_ov_lo if _ov_lo is not None else 0, 0)
         if _pad_b < _W_b:
             Xbm[:, _pad_b:].masked_fill_(~mask_b[:, _pad_b:, None], 0.0)
-    if 0 < _W_b < ov:
-        _prod_b = Xbm.new_zeros(Xbm.shape[0], ov, Xbm.shape[2])
-        _prod_b[:, :_W_b] = sc_b * Xbm
-        comp = (sc_a * Xam).sum(1) + _prod_b.sum(1)
-    else:
-        comp = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
+    comp = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
     last_idx = (ends - 1).clamp(max=n - 1)
     return (comp, order[last_idx], B)
 
@@ -552,6 +547,20 @@ class _SinkWiden(torch.autograd.Function):
     def backward(ctx, gz):
         return (gz[..., 1:], gz[..., 0].sum(dim=0))
 
+_SINK_FINITE = {}
+
+def _sink_all_finite(sink_logits):
+    if sink_logits is None:
+        return True
+    key = (id(sink_logits), int(sink_logits._version))
+    v = _SINK_FINITE.get(key)
+    if v is None:
+        v = bool(torch.isfinite(sink_logits).all())
+        if len(_SINK_FINITE) > 256:
+            _SINK_FINITE.clear()
+        _SINK_FINITE[key] = v
+    return v
+
 def sink_softmax(logits, sink_logits, dim=-1):
     _diff = torch.is_grad_enabled() and (getattr(logits, 'requires_grad', False) or (sink_logits is not None and getattr(sink_logits, 'requires_grad', False)))
     if _diff:
@@ -563,7 +572,7 @@ def _sink_softmax_impl(logits, sink_logits, dim=-1):
     if sink_logits is None:
         return torch.nan_to_num(torch.softmax(logits, dim))
     z = _SinkWiden.apply(logits, sink_logits)
-    if not torch.isfinite(sink_logits).all():
+    if not _sink_all_finite(sink_logits):
         return torch.nan_to_num(torch.softmax(z, -1)[..., 1:])
     return torch.softmax(z, -1)[..., 1:]
 
@@ -571,7 +580,7 @@ def _sink_split_softmax(logits, sink_logits, want_sink=True):
     if sink_logits is None:
         return (sink_softmax(logits, None, -1), None)
     z = _SinkWiden.apply(logits, sink_logits)
-    if not torch.isfinite(sink_logits).all():
+    if not _sink_all_finite(sink_logits):
         return (torch.nan_to_num(torch.softmax(z, -1)[..., 1:]), logits.new_zeros(logits.shape[:-1]) if want_sink else None)
     soft = torch.softmax(z, -1)[..., 1:]
     return (soft, 1.0 - soft.sum(-1) if want_sink else None)
@@ -664,13 +673,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         sel_blk = pos[:, None] > last_tok[ib]
         keep = None
         if sel_valid is not None:
-            sv = sel_valid[s:e]
-            k_nb = int(ib.shape[1])
-            nval = sv.sum(1)
-            rep = _arange_cache(k_nb, dev)[None, :] == nval[:, None]
-            pad_val = ib.gather(1, nval.clamp(max=k_nb - 1)[:, None])
-            pad_dup = ((ib == pad_val) & sv).any(1, keepdim=True)
-            keep = sv | (rep & ~pad_dup)
+            keep = sel_valid[s:e]
             sel_blk = sel_blk & keep
         win_valid = win_valid_all[s:e]
         both_idx = _both_idx_all[s:e]
@@ -855,8 +858,11 @@ class HybridAttention(nn.Module):
         pre['Za'] = x @ self.W_aZ if self.W_aZ is not None else None
         pre['Zb'] = x @ self.W_bZ if self.W_bZ is not None else None
         if cfg.kind != 'hca':
-            pre['qI'] = x @ self.W_DQ
-            pre['w_idx'] = F.linear(x, self.W_w.weight)
+            if cfg.indexer_mode == 'random':
+                pre['qI'] = pre['w_idx'] = None
+            else:
+                pre['qI'] = x @ self.W_DQ
+                pre['w_idx'] = F.linear(x, self.W_w.weight)
         if self.fuse_conv is not None:
             k = cfg.fuse_kernel
             fx = fuse_x
@@ -2386,7 +2392,7 @@ def record_tag(rec, key, legacy_ok):
         if ok is None:
             return ''
     if m.group(1) in ok:
-        return m.group(1)
+        return f'w{m.group(1)}'
     return ''
 
 def _group_params(recs):
