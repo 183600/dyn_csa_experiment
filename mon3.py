@@ -16,9 +16,7 @@ def load(p):
         return None
 
 def proc_alive():
-    for pid in os.listdir('/proc'):
-        if not pid.isdigit():
-            continue
+    for pid in sorted((p for p in os.listdir('/proc') if p.isdigit()), key=int):
         try:
             with open(f'/proc/{pid}/cmdline', 'rb') as f:
                 cmd = f.read().decode('utf-8', 'replace')

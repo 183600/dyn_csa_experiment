@@ -137,15 +137,19 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
-    x = sim.detach().float().cpu()
-    out = torch.empty_like(x)
-    srt = []
-    for k, v in enumerate(x.tolist()):
-        srt.insert(bisect.bisect_left(srt, v), v)
-        pos = q * k
-        lo = int(pos)
-        frac = pos - lo
-        out[k] = srt[lo] if frac == 0.0 or lo + 1 > k else srt[lo] * (1.0 - frac) + srt[lo + 1] * frac
+    x = sim.detach().float()
+    n = x.numel()
+    idx = _arange_cache(n, sim.device)
+    masked = torch.where(idx[None, :] <= idx[:, None], x[None, :], float('inf'))
+    srt = masked.sort(dim=1).values
+    pos = q * idx
+    lo = pos.floor().long()
+    frac = pos - lo
+    lo_v = srt.gather(1, lo.clamp(max=n - 1)[:, None]).squeeze(1)
+    hi_v = srt.gather(1, (lo + 1).clamp(max=n - 1)[:, None]).squeeze(1)
+    interp = lo_v * (1.0 - frac) + hi_v * frac
+    use_hi = (frac > 0.0) & (lo + 1 <= idx)
+    out = torch.where(use_hi, interp, lo_v)
     return out.to(sim.device)
 
 def blocks_fixed(n, block_size, device):
@@ -343,7 +347,8 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     counts = torch.bincount(block_ids, minlength=B)
     ends = torch.cumsum(counts, 0)
     starts = ends - counts
-    _cmin, max_len = torch.stack(list(torch.aminmax(counts))).tolist()
+    _cmin_t, max_len_t = torch.aminmax(counts)
+    _cmin, max_len = (int(_cmin_t), int(max_len_t))
     pos = _range_cache(0, max_len, dev)
     _gp = starts[:, None] + pos[None, :]
     g_a = _gp.clamp(max=n - 1)
@@ -357,7 +362,8 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     ov_len = end_prev - ov_start
     _ov_lo = _ov_hi = None
     if ov_len.numel():
-        _ov_lo, _ov_hi = torch.stack(list(torch.aminmax(ov_len))).tolist()
+        _ov_lo_t, _ov_hi_t = torch.aminmax(ov_len)
+        _ov_lo, _ov_hi = (int(_ov_lo_t), int(_ov_hi_t))
     _W_b = max(_ov_hi if _ov_hi is not None else 0, 0)
     op = _range_cache(0, _W_b, dev)
     g_b = (ov_start[:, None] + op[None, :]).clamp(max=n - 1)
@@ -405,7 +411,8 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     counts = torch.bincount(block_ids, minlength=B)
     ends = torch.cumsum(counts, 0)
     starts = ends - counts
-    _cmin, max_len = torch.stack(list(torch.aminmax(counts))).tolist()
+    _cmin_t, max_len_t = torch.aminmax(counts)
+    _cmin, max_len = (int(_cmin_t), int(max_len_t))
     pos = _range_cache(0, max_len, dev)
     _gp = starts[:, None] + pos[None, :]
     g = _gp.clamp(max=n - 1)
@@ -595,10 +602,9 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
     _hd = int(q.shape[-1])
     _per_row = 4 * _heads * max(1, _M) + 2 * max(1, _M) * _heads * max(1, _hd) + (max(1, _M) * 4 + max(1, _M)) / _es
     _bytes_per_chunk_row = _per_row * _es
-    _MIN_CHUNK = 64
     _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
     if _bindable and _bytes_per_chunk_row > 0:
-        _max_rows = max(_MIN_CHUNK, int(mem_budget_bytes) // _bytes_per_chunk_row)
+        _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
         q_chunk = min(q_chunk, _max_rows)
     q_chunk = max(1, min(int(q_chunk), n))
     out = torch.empty_like(q)
@@ -637,10 +643,9 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _heads = q.shape[1] if q.dim() == 3 else 1
     _per_row = max(1, int(topk_idx.shape[1]) + int(w)) * _heads * int(q.shape[-1])
     _bytes_per_chunk_row = 2 * _per_row * q.element_size()
-    _MIN_CHUNK = 64
     _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
     if _bindable and _bytes_per_chunk_row > 0:
-        _max_rows = max(_MIN_CHUNK, int(mem_budget_bytes) // _bytes_per_chunk_row)
+        _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
         q_chunk = min(q_chunk, _max_rows)
     q_chunk = max(1, min(int(q_chunk), n))
     out = torch.empty_like(q)
@@ -827,12 +832,11 @@ class HybridAttention(nn.Module):
             mask = causal_window_mask(T, self.cfg.window, x.device)
         else:
             mask = causal_mask(T, x.device)
+        logits.add_(mask)
         if self.sink is not None:
             sculpt = self.sink.view(1, self.nh, 1, 1).expand(B, self.nh, T, 1)
-            logits.add_(mask)
             attn = torch.softmax(torch.cat([sculpt, logits], -1), -1)[..., 1:]
         else:
-            logits.add_(mask)
             attn = torch.softmax(logits, -1)
         out = torch.einsum('bhnm,bmhd->bnhd', attn, v)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
@@ -886,19 +890,21 @@ class HybridAttention(nn.Module):
                 prefix_mean = torch.cumsum(sim, 0) / _range_cache(1, sim.numel() + 1, x.device)
                 tau = prefix_mean + self.delta_logit
                 gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
+            gate_bool = None
+            gate_list = None
+            if gate.numel():
+                gate_bool = gate.detach() > _HALF
+                gate_list = gate_bool.cpu().tolist()
             if gate.numel() and self.need_reg:
-                hard_b = gate.detach() > _HALF
-                hard = hard_b.to(gate.dtype)
-                _hon = _cut_merge_mask(hard, cfg.min_block, cfg.max_block, dtype=gate.dtype, device=gate.device)
+                hard = gate_bool.to(gate.dtype)
+                _hon = _cut_merge_mask(gate_list, cfg.min_block, cfg.max_block, dtype=gate.dtype, device=gate.device)
                 _soft_honoured = gate * _hon
                 gate_mean = ((hard * _hon).sum() + _soft_honoured.sum() - _soft_honoured.detach().sum()) / T
             else:
                 gate_mean = torch.zeros((), device=x.device) if self.need_reg else None
             with torch.no_grad():
-                gate_bool = locals().get('hard_b')
-                if gate_bool is None:
-                    gate_bool = gate.detach() > _HALF
-                gate_list = gate_bool.cpu().tolist()
+                if gate_list is None:
+                    gate_list = (gate.detach() > _HALF).cpu().tolist()
                 bid, nblk = blocks_from_cuts(T, gate_list, cfg.min_block, cfg.max_block, x.device, return_count=True)
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
             sim = cosine_similarity_consecutive(x)
@@ -1322,7 +1328,7 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     train_ids = np.asarray(train_ids)
     cols = np.arange(seq_len + 1)
     while True:
-        starts = rng.integers(0, n, size=batch_size)
+        starts = rng.integers(0, n + 1, size=batch_size)
         ids = train_ids[starts[:, None] + cols[None, :]]
         ids = torch.from_numpy(ids).to(device)
         yield (ids[:, :-1], ids[:, 1:])
@@ -1626,11 +1632,9 @@ def eval_ppl(model, val_batch, device, chunk=64, eval_rows=None, eval_seed=0):
                 _rows = logits[:, :_span, :].reshape(-1, logits.size(-1))
                 _tgts = ids[:, 1:].reshape(-1)
             del ids, logits
-            g = F.log_softmax(_rows, dim=-1).gather(1, _tgts[:, None]).squeeze(1)
+            nll += F.cross_entropy(_rows, _tgts, reduction='sum').double()
+            ntok += int(_tgts.numel())
             del _rows, _tgts
-            nll -= g.double().sum()
-            ntok += int(g.numel())
-            del g
     finally:
         for _a, _prev in zip(need_reg_layers, need_reg_prior):
             _a.need_reg = _prev
@@ -2059,9 +2063,15 @@ def compression_report(model, val_batch, device, n_sample=64, val_bnd=None, bnd_
     was_training = model.training
     model.eval()
     enable_block_stats(model, True)
+    need_reg_layers = [blk.attn for blk in model.blocks if hasattr(blk.attn, 'need_reg')]
+    need_reg_prior = [_a.need_reg for _a in need_reg_layers]
+    for _a in need_reg_layers:
+        _a.need_reg = False
     try:
         return _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_tol)
     finally:
+        for _a, _prev in zip(need_reg_layers, need_reg_prior):
+            _a.need_reg = _prev
         enable_block_stats(model, False)
         model.train(was_training)
 

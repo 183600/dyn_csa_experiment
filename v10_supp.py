@@ -71,7 +71,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg):
             if k > 0:
                 rng = np.random.default_rng((eval_len * 1000003 + j * 10007) * 1048576 + int(round(rho * 1048576)))
                 pos = rng.choice(n_far, size=k, replace=False)
-                ids[pos] = rng.integers(0, vocab, size=k)
+                ids[pos] = (ids[pos] + rng.integers(1, vocab, size=k)) % vocab
             rows.append(ids)
         ids = torch.from_numpy(np.stack(rows)).to(DEVICE)
         logits = model(ids[:, :-1])
@@ -212,7 +212,10 @@ def _hist_by_seed(outdir, variant):
     sp = os.path.join(outdir, 'summary.json')
 
     class _Curves(dict):
-        per_seed_synth = {}
+
+        def __init__(self):
+            super().__init__()
+            self.per_seed_synth = {}
     out = _Curves()
     synth_of = {}
     if not os.path.exists(sp):
@@ -548,7 +551,8 @@ def build_report(out='REPORT_v10.md'):
         rhos = PROBE['rhos']
         arm_order = [('full_rope', 'dense'), ('csa_fixed_rope', 'learned'), ('csa_fixed_rope', 'randidx'), ('csa_fixed_rope', 'allblocks')]
         for Ln in lens:
-            A(f'**目标区 PPL（eval_len={Ln}，3 seeds 平均）**：')
+            _n_ln = max([c.get('n', 0) for c in cells if c['eval_len'] == Ln] or [0])
+            A(f'**目标区 PPL（eval_len={Ln}，{_n_ln or "?"} seeds 平均）**：')
             A('')
             A('| 臂 | ' + ' | '.join((f'ρ={r:g}' for r in rhos)) + ' |')
             A('|---|' + '---|' * len(rhos))

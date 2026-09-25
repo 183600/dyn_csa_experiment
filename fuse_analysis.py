@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, itertools, os, sys
+import json, itertools, os, sys, functools
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -56,6 +56,7 @@ def layers_of(variant, dyn_only=True):
         ks = [k for k in ks if 'dyn' in k]
     return ks
 
+@functools.lru_cache(maxsize=None)
 def per_seed_layer(variant, key):
     layers = layers_of(variant)
     M = np.full((len(SEEDS), len(layers)), np.nan)

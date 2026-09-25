@@ -36,7 +36,11 @@ if not isinstance(st, dict) or "booked_seconds" not in st:
     print("[bonus] ledger has no booked_seconds -> no bonus")
     sys.exit(2)
 booked = st.get("booked_seconds", 0) / 3600.0
-wallet_h = float(os.environ["V7_BUDGET_YUAN"]) / float(os.environ["V7_PRICE_PER_HOUR"])
+try:
+    wallet_h = float(os.environ["V7_BUDGET_YUAN"]) / float(os.environ["V7_PRICE_PER_HOUR"])
+except Exception as e:
+    print(f"[bonus] wallet env unreadable ({e}) -> unexpected state, box stays up")
+    sys.exit(3)
 if booked > wallet_h - 2.0:
     print(f"[bonus] booked {booked:.1f}h leaves <2h headroom under wallet "
           f"{wallet_h:.1f}h -> skip")
@@ -44,6 +48,10 @@ if booked > wallet_h - 2.0:
 print(f"[bonus] booked {booked:.1f}h, wallet {wallet_h:.1f}h -> go")
 PYEOF
 _rc=$?
+if [ $_rc -ne 0 ] && [ $_rc -ne 1 ] && [ $_rc -ne 2 ]; then
+  echo "=== [bonus] ledger check crashed unexpectedly (rc=$_rc); box stays up for inspection ==="
+  exit 1
+fi
 commit_and_push() {
   git add -A
   if ! git commit -m "$1"; then

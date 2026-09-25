@@ -211,10 +211,9 @@ class HybridAttentionRoPE(L.HybridAttention):
             mem_budget_bytes = L._attn_transient_budget(dev)
         _per_row = 4 * max(1, int(topk_idx.shape[1]) + int(w)) * nh * hd
         _bytes_per_chunk_row = _per_row * q.element_size()
-        _MIN_CHUNK = 64
         _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
         if _bindable and _bytes_per_chunk_row > 0:
-            _max_rows = max(_MIN_CHUNK, int(mem_budget_bytes) // _bytes_per_chunk_row)
+            _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
             q_chunk = min(q_chunk, _max_rows)
         cos, sin = rope_cos_sin(hd, rope_dim, L._arange_cache(T, dev), dev, rope_base)
         qr = apply_rope(q, cos[:, None, :], sin[:, None, :], rope_dim)
@@ -270,6 +269,12 @@ class HybridAttentionRoPE(L.HybridAttention):
         scale = 1.0
         use_rope = isinstance(self.cfg, AttnCfgRope) and self.cfg.rope
         rd = min(getattr(self.cfg, 'rope_dim', 0), hd)
+        mask = L.causal_mask(T, x.device)
+        win = getattr(self, '_dense_max_T', None)
+        if win is not None and win < T:
+            row = L._arange_cache(T, x.device)[:, None]
+            col = L._arange_cache(T, x.device)[None, :]
+            mask = torch.where(col < row - win + 1, float('-inf'), mask)
         outs = None
         for b in range(B):
             xb = x[b]
@@ -289,12 +294,6 @@ class HybridAttentionRoPE(L.HybridAttention):
                 q = apply_rope(q, cos[:, None, :], sin[:, None, :], rd)
                 k = apply_rope(k, cos[:, None, :], sin[:, None, :], rd)
             logits = torch.einsum('thd,shd->hts', q, k) * scale
-            mask = L.causal_mask(T, xb.device)
-            win = getattr(self, '_dense_max_T', None)
-            if win is not None and win < T:
-                row = L._arange_cache(T, xb.device)[:, None]
-                col = L._arange_cache(T, xb.device)[None, :]
-                mask = torch.where(col < row - win + 1, float('-inf'), mask)
             sink = self.sink if self.cfg.use_sink and self.sink is not None else None
             if sink is None:
                 attn = L.sink_softmax((logits + mask).transpose(0, 1), sink)
@@ -469,7 +468,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     opt = torch.optim.AdamW([{'params': decay, 'weight_decay': weight_decay, 'lr_scale': 1.0}, {'params': ndecay, 'weight_decay': 0.0, 'lr_scale': 1.0}, {'params': dpar, 'weight_decay': 0.0, 'lr_scale': delta_lr_mult}], lr=lr)
 
     def lr_at(step):
-        if step < warmup:
+        if warmup > 0 and step < warmup:
             return lr * (step + 1) / warmup
         t = (step - warmup) / max(steps - warmup, 1)
         return lr * (0.1 + 0.45 * (1.0 + math.cos(math.pi * t)))
@@ -658,19 +657,31 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
     correct = np.zeros_like(tgt, dtype=bool)
     span = min(seq_len, max_pos) if getattr(model, 'use_abs_pe', True) else seq_len
     n_scored = span - 1
-    for i in range(0, n_seq, chunk):
-        x = torch.from_numpy(ids[i:i + chunk]).to(device)
-        if getattr(model, 'use_abs_pe', True) and seq_len > max_pos:
-            clip_ids = x[:, -span:].clamp(0, vocab - 1)
-            logits = model(clip_ids)
-            pred = logits[:, :-1].argmax(-1).cpu().numpy()
-            t = tgt[i:i + chunk, -n_scored:]
-            correct[i:i + chunk, -n_scored:] = (pred == t) & (t >= 0)
+    i = 0
+    while i < n_seq:
+        j = min(i + chunk, n_seq)
+        x = torch.from_numpy(ids[i:j]).to(device)
+        trunc = getattr(model, 'use_abs_pe', True) and seq_len > max_pos
+        try:
+            logits = model(x[:, -span:].clamp(0, vocab - 1) if trunc else x)
+        except torch.cuda.OutOfMemoryError:
+            del x
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            if chunk <= 1:
+                raise
+            chunk = max(1, chunk // 2)
+            print(f'[niah] eval OOM; retrying with chunk={chunk}')
+            continue
+        pred = logits[:, :-1].argmax(-1).cpu().numpy()
+        if trunc:
+            t = tgt[i:j, -n_scored:]
+            correct[i:j, -n_scored:] = (pred == t) & (t >= 0)
         else:
-            logits = model(x)
-            pred = logits[:, :-1].argmax(-1).cpu().numpy()
-            t = tgt[i:i + chunk][:, :n_scored]
-            correct[i:i + chunk, :n_scored] = (pred == t) & (t >= 0)
+            t = tgt[i:j][:, :n_scored]
+            correct[i:j, :n_scored] = (pred == t) & (t >= 0)
+        del x, logits
+        i = j
     m = tgt >= 0
     scored_cols = n_scored
     m = np.zeros_like(tgt, dtype=bool)
@@ -865,7 +876,7 @@ def schedule_shutdown(delay_s=120):
     subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f'[v7] AutoDL instance shuts down in {delay_s}s (only the data disk bills afterwards).')
 LONG_EXT = dict(L.RUN_LONG, steps=40000, n_train_tokens=110000000, eval_every=2000, outdir='results_lm_v7_long40')
-PHASES = [('P0R', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_rope', variants=ROPE_VARIANTS, steps=1500, matched=set(PARAM_MATCHED_V7), mlp_match_ref='csa_dynamic_rope'), seeds=[0, 1, 2]), 2.6), ('P0W', 'warm', dict(cfg=dict(L.RUN_LONG, outdir='results_lm_v7_warmup', variants=['csa_fixed']), seeds=[0, 1], warm_grid=(0, 5000, 10000)), 3.4), ('P1L', 'len', dict(outdir='results_len', vocab=8192, steps=3000, train_len=512, eval_lens=[512, 1024, 2048, 4096], variants=['full', 'csa_fixed', 'full_rope', 'csa_fixed_rope']), 2.5), ('P2S', 'plain', dict(cfg=dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic']), seeds=[2, 3]), 4.5), ('P1T', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_seq2k', seq_len=2048, batch_size=3, steps=1500, variants=['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']), seeds=[0, 1]), 6.0), ('P0E', 'plain', dict(cfg=dict(LONG_EXT, variants=['csa_fixed', 'full']), seeds=[0, 1]), 17.0)]
+PHASES = [('P0R', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_rope', variants=ROPE_VARIANTS, steps=1500, matched=set(PARAM_MATCHED_V7), mlp_match_ref='csa_fixed_rope'), seeds=[0, 1, 2]), 2.6), ('P0W', 'warm', dict(cfg=dict(L.RUN_LONG, outdir='results_lm_v7_warmup', variants=['csa_fixed']), seeds=[0, 1], warm_grid=(0, 5000, 10000)), 3.4), ('P1L', 'len', dict(outdir='results_len', vocab=8192, steps=3000, train_len=512, eval_lens=[512, 1024, 2048, 4096], variants=['full', 'csa_fixed', 'full_rope', 'csa_fixed_rope']), 2.5), ('P2S', 'plain', dict(cfg=dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic']), seeds=[2, 3]), 4.5), ('P1T', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_seq2k', seq_len=2048, batch_size=3, steps=1500, variants=['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']), seeds=[0, 1]), 6.0), ('P0E', 'plain', dict(cfg=dict(LONG_EXT, variants=['csa_fixed', 'full']), seeds=[0, 1]), 17.0)]
 
 def run_phase(name, guard, only=None):
     for pname, kind, payload, _h in PHASES:

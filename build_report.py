@@ -15,6 +15,7 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 REPO = os.path.dirname(os.path.abspath(__file__))
 PAIR_BUDGET_KEYS = ('steps', 'tokens_seen')
+_LOADED = {}
 
 def load(path, default=None):
     try:
@@ -27,10 +28,16 @@ def load(path, default=None):
         return default
 
 def agg(outdir):
-    return load(os.path.join(REPO, outdir, 'aggregate.json'), {}) or {}
+    key = ('agg', outdir)
+    if key not in _LOADED:
+        _LOADED[key] = load(os.path.join(REPO, outdir, 'aggregate.json'), {}) or {}
+    return _LOADED[key]
 
 def summary(outdir):
-    return load(os.path.join(REPO, outdir, 'summary.json'), {}) or {}
+    key = ('summary', outdir)
+    if key not in _LOADED:
+        _LOADED[key] = load(os.path.join(REPO, outdir, 'summary.json'), {}) or {}
+    return _LOADED[key]
 
 def fm(x, nd=2):
     return f'{x:.{nd}f}' if isinstance(x, (int, float)) else 'n/a'
@@ -116,7 +123,12 @@ def per_seed_ppls(outdir):
     out = collections.defaultdict(dict)
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
-            _slot, _sd = (out[r['variant']], int(r['seed']))
+            try:
+                _sd = int(r['seed'])
+            except (TypeError, ValueError, OverflowError):
+                print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
+                continue
+            _slot = out[r['variant']]
             if _sd in _slot:
                 print(f'[report] ambiguous (variant, seed) = ({r['variant']!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
                 continue
@@ -128,7 +140,12 @@ def per_seed_records(outdir):
     out = collections.defaultdict(dict)
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
-            _slot, _sd = (out[r['variant']], int(r['seed']))
+            try:
+                _sd = int(r['seed'])
+            except (TypeError, ValueError, OverflowError):
+                print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
+                continue
+            _slot = out[r['variant']]
             if _sd in _slot:
                 print(f'[report] ambiguous (variant, seed) = ({r['variant']!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
                 continue

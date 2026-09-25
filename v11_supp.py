@@ -410,7 +410,7 @@ def build_report(out='REPORT_v11.md'):
     dn, ab, ri = (_rng('dense'), _rng('allblocks'), _rng('randidx'))
     learned_helps = bool(ri) and ri[0] > 0.0
     if contr:
-        A(f'**机制结论（区间实时算自上方配对检验，n={n_contr_max}，Δ = 对照臂 − 学习选择臂）：**dense−learned Δ {_fmt(dn)} PPL，allblocks−learned Δ {_fmt(ab)} PPL，randidx−learned Δ {_fmt(ri)} PPL——' + ('randidx 全线更差：学习到的检索对抗噪性有**独立贡献**。' if learned_helps else 'randidx 至少在一格与 learned 相当或更优：抗噪性主要来自稀疏归纳偏置本身，「学习检索滤噪」的强版本不成立。') + (f'（统计分辨率：本段引用的对比中，最全的为 n={n_contr_max}、最弱的仅 n={n_tree_min}，精确符号翻转 p 值下限因此是 {_floor_txt}，**未**跨过 0.05——上述读法只作方向性表述。）' if not probe_ok else '') + (f'（统计分辨率：本段引用的是 n={n_tree_min}–{n_contr_max} 的对比，最弱者下限 {floor_p_tree:.3f}；`dense − learned` 这一格是n={n_tree_min}，其分辨率仍不足以支撑显著性主张。）' if probe_ok and _pair_ragged else ''))
+        A(f'**机制结论（区间实时算自上方配对检验，n={n_contr_max}，Δ = 对照臂 − 学习选择臂）：**dense−learned Δ {_fmt(dn)} PPL，allblocks−learned Δ {_fmt(ab)} PPL，randidx−learned Δ {_fmt(ri)} PPL——' + ('randidx 全线更差：学习到的检索对抗噪性有**独立贡献**。' if learned_helps else 'randidx 至少在一格与 learned 相当或更优：抗噪性主要来自稀疏归纳偏置本身，「学习检索滤噪」的强版本不成立。') + (f'（统计分辨率：本段引用的对比中，最全的为 n={n_contr_max}、最弱的仅 n={n_tree_min}，精确符号翻转 p 值下限因此是 {_floor_txt}，**未**跨过 0.05——上述读法只作方向性表述。）' if not probe_ok else '') + (f'（统计分辨率：本段引用的是 n={n_tree_min}–{n_contr_max} 的对比，最弱者下限 {floor_p_tree:.3f}；最弱一格仅 n={n_tree_min}，其分辨率仍不足以支撑显著性主张。）' if probe_ok and _pair_ragged else ''))
         A('')
     else:
         A('**机制结论**：`analysis_v11/stats.json` 的 `probe.contrasts` 为空，因此 dense/allblocks/randidx 相对 learned 的 Δ 区间**无数据**，本轮不给出机制读法。这不是「无差异」——是**未测量**。')
