@@ -48,11 +48,11 @@ jobs:
                   "apiKey": "{env:KIMI_API_KEY}"
                 },
                 "models": {
-                  "kimi-k2": { "name": "kimi-k2" } # 关键修复：改为真实存在的模型，如 kimi-k2 或 moonshot-v1-32k
+                  "kimi-k3": { "name": "kimi-k3" }
                 }
               }
             },
-            "model": "moonshot/kimi-k2"
+            "model": "moonshot/kimi-k3"
           }
           EOF
           # 打印出配置以方便调试（注意隐藏 Key）
