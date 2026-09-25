@@ -1,176 +1,53 @@
-name: Continuous Loop
+- name: Maximize swap memory
+  run: |
+    set -e
+    echo "=== Before ==="
+    free -h
+    df -h /
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
+    # ---------- 1) 启用 zram（压缩内存，优先级最高） ----------
+    sudo modprobe zram 2>/dev/null || true
+    if [ -e /dev/zram0 ]; then
+      sudo swapoff /dev/zram0 2>/dev/null || true
+      # disksize = 未压缩容量，实际内存占用约为 1/2 ~ 1/3
+      echo 4G | sudo tee /sys/block/zram0/disksize >/dev/null || true
+      sudo mkswap /dev/zram0 >/dev/null 2>&1 || true
+      sudo swapon -p 100 /dev/zram0 2>/dev/null && echo "[ok] zram enabled (4G, prio=100)" \
+        || echo "[warn] zram enable failed"
+    else
+      echo "[info] zram not available, skip"
+    fi
 
-concurrency:
-  group: continuous-loop
-  cancel-in-progress: false
+    # ---------- 2) 创建尽可能大的磁盘 swapfile ----------
+    AVAIL_KB=$(df --output=avail / | tail -1)
+    AVAIL_MB=$((AVAIL_KB / 1024))
+    # 预留 2GB 给文件系统，避免写满根分区
+    WANT_MB=$((AVAIL_MB - 2048))
+    # 上限 16GB（再多也没意义，反而拖慢 I/O）
+    if [ "$WANT_MB" -gt 16384 ]; then WANT_MB=16384; fi
+    # 下限保护
+    if [ "$WANT_MB" -lt 1024 ]; then WANT_MB=1024; fi
+    echo "[info] available disk: ${AVAIL_MB}MB, will create swapfile: ${WANT_MB}MB"
 
-jobs:
-  run-opencode:
-    runs-on: ubuntu-latest
-    timeout-minutes: 330
-    permissions:
-      contents: write
-      actions: write
+    sudo swapoff /swapfile 2>/dev/null || true
+    sudo rm -f /swapfile
+    # fallocate 很快；某些文件系统不支持则退回 dd
+    if ! sudo fallocate -l "${WANT_MB}M" /swapfile 2>/dev/null; then
+      echo "[info] fallocate failed, falling back to dd"
+      sudo dd if=/dev/zero of=/swapfile bs=1M count=$WANT_MB status=progress
+    fi
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile >/dev/null
+    sudo swapon -p 10 /swapfile && echo "[ok] swapfile enabled"
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    # ---------- 3) 内核调优 ----------
+    sudo sysctl -w vm.swappiness=100            # 最激进地使用 swap
+    sudo sysctl -w vm.vfs_cache_pressure=50     # 少回收 inode/dentry 缓存
+    sudo sysctl -w vm.overcommit_memory=1       # 允许超量分配
+    sudo sysctl -w vm.dirty_ratio=80            # 大 I/O 时减少抖动
+    sudo sysctl -w vm.dirty_background_ratio=50
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install opencode
-        run: npm i -g opencode-ai
-
-      - name: Configure opencode (primary Moonshot + fallback NVIDIA)
-        env:
-          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-        run: |
-          mkdir -p ~/.config/opencode
-
-          # ---------- 主配置：Moonshot ----------
-          cat > ~/.config/opencode/opencode.json <<'EOF'
-          {
-            "$schema": "https://opencode.ai/config.json",
-            "provider": {
-              "moonshot": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "Moonshot",
-                "options": {
-                  "baseURL": "https://api.moonshot.cn/v1",
-                  "apiKey": "{env:KIMI_API_KEY}"
-                },
-                "models": {
-                  "kimi-k3": { "name": "kimi-k3" }
-                }
-              }
-            },
-            "model": "moonshot/kimi-k3"
-          }
-          EOF
-
-          # ---------- 备用配置：NVIDIA（Moonshot 不可用时会替换主配置） ----------
-          cat > ~/.config/opencode/opencode.nvidia.json <<'EOF'
-          {
-            "$schema": "https://opencode.ai/config.json",
-            "provider": {
-              "nvidia": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "NVIDIA",
-                "options": {
-                  "baseURL": "https://integrate.api.nvidia.com/v1",
-                  "apiKey": "{env:NVIDIA_API_KEY}"
-                },
-                "models": {
-                  "moonshotai/kimi-k3": { "name": "moonshotai/kimi-k3" }
-                }
-              }
-            },
-            "model": "nvidia/moonshotai/kimi-k3"
-          }
-          EOF
-
-          echo "=== primary (Moonshot) ==="
-          cat ~/.config/opencode/opencode.json
-          echo "=== fallback (NVIDIA) ==="
-          cat ~/.config/opencode/opencode.nvidia.json
-
-      - name: Configure git
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Run opencode for ~5 hours
-        env:
-          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-        run: |
-          set +e
-          BRANCH="${GITHUB_REF_NAME:-main}"
-          DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
-          PROMPT='确保代码没有影响实验结果的bug(修复所有的bug)，优化性能和显存占用(优化只要不会明显降低性能就可以做)，不要管之前修的bug，不要写修复了哪些bug，确保远程仓库里面没有实验结果和REPORTxx.md以及autodl_budgetxx.json，同时远程仓库docs目录只留design_notes.md，确保远程仓库里面没有性能、修复了哪些bug和显存占用的记录（注释里也没有）'
-
-          i=0
-          FAIL_COUNT=0
-          USE_NVIDIA=0
-
-          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            i=$((i+1))
-            echo "=========== opencode iteration #$i (provider=$([ $USE_NVIDIA -eq 1 ] && echo NVIDIA || echo Moonshot)) ==========="
-
-            opencode run "$PROMPT"
-            EXIT_CODE=$?
-
-            if [ $EXIT_CODE -ne 0 ]; then
-              FAIL_COUNT=$((FAIL_COUNT+1))
-              echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE (连续失败: $FAIL_COUNT)"
-
-              # ---------- 首次失败：认为 Moonshot API 不可用，切换到 NVIDIA 备用配置 ----------
-              if [ $USE_NVIDIA -eq 0 ]; then
-                echo "[info] Moonshot API 调用失败，切换到 NVIDIA 备用配置..."
-                cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
-                USE_NVIDIA=1
-                FAIL_COUNT=0
-                sleep 10
-                continue
-              fi
-
-              # ---------- 已切到 NVIDIA 仍然连续失败：跳过本轮，等定时任务唤醒 ----------
-              if [ $FAIL_COUNT -ge 3 ]; then
-                echo "连续 3 次请求失败（可能是 API Key 错误或模型名不存在），跳过本轮，等待定时任务唤醒"
-                break
-              fi
-
-              sleep 30
-              continue
-            else
-              FAIL_COUNT=0
-            fi
-
-            git add -A || true
-            git commit -m "auto: iteration $i" || true
-            git pull --rebase origin "$BRANCH" || true
-            git push origin "HEAD:${BRANCH}" || echo "[warn] push #$i failed"
-
-            sleep 5
-          done
-
-      - name: Cleanup repo artifacts
-        run: |
-          set +e
-          find . -type f -name 'REPORT*.md'         -not -path './.git/*' -delete
-          find . -type f -name 'autodl_budget*.json' -not -path './.git/*' -delete
-          if [ -d docs ]; then
-            find docs -mindepth 1 -maxdepth 1 ! -name 'design_notes.md' -exec rm -rf {} +
-            [ -f docs/design_notes.md ] || : > docs/design_notes.md
-          fi
-
-      - name: Final commit and push
-        run: |
-          set +e
-          git add -A
-          git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
-          BRANCH="${GITHUB_REF_NAME:-main}"
-          git pull --rebase origin "$BRANCH" || true
-          git push origin "HEAD:${BRANCH}" || echo "[warn] final push failed"
-
-      - name: Trigger next workflow run (self-loop)
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set +e
-          BRANCH="${GITHUB_REF_NAME:-main}"
-          gh workflow run continuous-loop.yml --ref "$BRANCH" \
-            && echo "next run dispatched on ${BRANCH}" \
-            || echo "[warn] dispatch failed, cron fallback will pick up"
+    echo "=== After ==="
+    free -h
+    swapon --show
+    df -h /
