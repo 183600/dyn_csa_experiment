@@ -3,10 +3,8 @@ name: Continuous Loop
 on:
   workflow_dispatch:
   schedule:
-    # 兜底：万一链路断了，6 小时一次 cron 也能接上
     - cron: '0 */6 * * *'
 
-# 同一时刻只跑一个，避免 cron 与 dispatch 重叠
 concurrency:
   group: continuous-loop
   cancel-in-progress: false
@@ -14,10 +12,10 @@ concurrency:
 jobs:
   run-opencode:
     runs-on: ubuntu-latest
-    timeout-minutes: 330        # 5h 任务 + 30min 收尾缓冲
+    timeout-minutes: 330
     permissions:
-      contents: write           # push 提交
-      actions: write            # 关键：允许 workflow_dispatch 下一个 run
+      contents: write
+      actions: write
 
     steps:
       - name: Checkout
@@ -33,30 +31,32 @@ jobs:
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      - name: Configure opencode (NVIDIA endpoint)
+      - name: Configure opencode (Moonshot endpoint)
         env:
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }} # 关键修复：在此步骤注入环境变量
         run: |
           mkdir -p ~/.config/opencode
           cat > ~/.config/opencode/opencode.json <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
             "provider": {
-              "nvidia": {
+              "moonshot": {                      # 关键修复：改为 moonshot
                 "npm": "@ai-sdk/openai-compatible",
-                "name": "NVIDIA",
+                "name": "Moonshot",
                 "options": {
                   "baseURL": "https://api.moonshot.cn/v1",
                   "apiKey": "{env:KIMI_API_KEY}"
                 },
                 "models": {
-                  "kimi-k3": { "name": "kimi-k3" }
+                  "kimi-k2": { "name": "kimi-k2" } # 关键修复：改为真实存在的模型，如 kimi-k2 或 moonshot-v1-32k
                 }
               }
             },
-            "model":"kimi-k3"
+            "model": "moonshot/kimi-k2"
           }
           EOF
+          # 打印出配置以方便调试（注意隐藏 Key）
+          cat ~/.config/opencode/opencode.json
 
       - name: Configure git
         run: |
@@ -69,11 +69,12 @@ jobs:
         run: |
           set +e
           BRANCH="${GITHUB_REF_NAME:-main}"
-          # 预留 15 分钟做清理 / push / 触发下一次
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
           PROMPT='确保代码没有影响实验结果的bug(修复所有的bug)，优化性能和显存占用(优化只要不会明显降低性能就可以做)，不要管之前修的bug，不要写修复了哪些bug，确保远程仓库里面没有实验结果和REPORTxx.md以及autodl_budgetxx.json，同时远程仓库docs目录只留design_notes.md，确保远程仓库里面没有性能、修复了哪些bug和显存占用的记录（注释里也没有）'
 
           i=0
+          FAIL_COUNT=0 # 新增：连续失败计数器
+          
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             i=$((i+1))
             echo "=========== opencode iteration #$i ==========="
@@ -82,24 +83,25 @@ jobs:
             EXIT_CODE=$?
             
             if [ $EXIT_CODE -ne 0 ]; then
-              echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE"
-              # 关键修复：如果出现 API 错误，不要立刻疯狂重试，等待 1 分钟
-              sleep 60
+              FAIL_COUNT=$((FAIL_COUNT+1))
+              echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE (连续失败: $FAIL_COUNT)"
               
-              # 如果 API 彻底崩溃，主动打破循环，等 6 小时后的 cron 再来
-              if [ $EXIT_CODE -eq 1 ] && [ "$i" -gt 10 ]; then
-                # 这里可以加入关键词检查，比如如果日志中有 "Unexpected server error" 就 break
-                # 避免在 API 长时间宕机时无限空转
-                echo "多次请求失败，跳过本轮，等待定时任务唤醒"
+              # 失败后等待 30 秒再重试
+              sleep 30
+              
+              # 关键修复：连续失败 3 次就直接退出循环，避免无限空转
+              if [ $FAIL_COUNT -ge 3 ]; then
+                echo "连续 3 次请求失败（可能是 API Key 错误或模型名不存在），跳过本轮，等待定时任务唤醒"
                 break
               fi
+              continue # 失败时跳过下方的 git push
+            else
+              FAIL_COUNT=0 # 成功执行后重置失败计数
             fi
 
-            # 每轮结束就推一次，避免 runner 被回收丢改动
+            # 每轮结束就推一次
             git add -A || true
             git commit -m "auto: iteration $i" || true
-            
-            # 先拉取防止远程冲突
             git pull --rebase origin "$BRANCH" || true
             git push origin "HEAD:${BRANCH}" || echo "[warn] push #$i failed"
             
@@ -109,10 +111,8 @@ jobs:
       - name: Cleanup repo artifacts
         run: |
           set +e
-          # 1) 删实验报告 / 预算文件
           find . -type f -name 'REPORT*.md'         -not -path './.git/*' -delete
           find . -type f -name 'autodl_budget*.json' -not -path './.git/*' -delete
-          # 2) docs 目录只留 design_notes.md
           if [ -d docs ]; then
             find docs -mindepth 1 -maxdepth 1 ! -name 'design_notes.md' -exec rm -rf {} +
             [ -f docs/design_notes.md ] || : > docs/design_notes.md
@@ -134,7 +134,6 @@ jobs:
         run: |
           set +e
           BRANCH="${GITHUB_REF_NAME:-main}"
-          # gh 已预装在 GitHub-hosted runner 上
           gh workflow run continuous-loop.yml --ref "$BRANCH" \
             && echo "next run dispatched on ${BRANCH}" \
             || echo "[warn] dispatch failed, cron fallback will pick up"
