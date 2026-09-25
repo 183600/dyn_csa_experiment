@@ -31,11 +31,14 @@ jobs:
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      - name: Configure opencode (Moonshot endpoint)
+      - name: Configure opencode (primary Moonshot + fallback NVIDIA)
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           mkdir -p ~/.config/opencode
+
+          # ---------- 主配置：Moonshot ----------
           cat > ~/.config/opencode/opencode.json <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
@@ -55,8 +58,32 @@ jobs:
             "model": "moonshot/kimi-k3"
           }
           EOF
-          # 打印出配置以方便调试（注意隐藏 Key）
+
+          # ---------- 备用配置：NVIDIA（Moonshot 不可用时会替换主配置） ----------
+          cat > ~/.config/opencode/opencode.nvidia.json <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "nvidia": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "NVIDIA",
+                "options": {
+                  "baseURL": "https://integrate.api.nvidia.com/v1",
+                  "apiKey": "{env:NVIDIA_API_KEY}"
+                },
+                "models": {
+                  "moonshotai/kimi-k3": { "name": "moonshotai/kimi-k3" }
+                }
+              }
+            },
+            "model": "nvidia/moonshotai/kimi-k3"
+          }
+          EOF
+
+          echo "=== primary (Moonshot) ==="
           cat ~/.config/opencode/opencode.json
+          echo "=== fallback (NVIDIA) ==="
+          cat ~/.config/opencode/opencode.nvidia.json
 
       - name: Configure git
         run: |
@@ -66,6 +93,7 @@ jobs:
       - name: Run opencode for ~5 hours
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           set +e
           BRANCH="${GITHUB_REF_NAME:-main}"
@@ -74,24 +102,36 @@ jobs:
 
           i=0
           FAIL_COUNT=0
-          
+          USE_NVIDIA=0
+
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             i=$((i+1))
-            echo "=========== opencode iteration #$i ==========="
-            
+            echo "=========== opencode iteration #$i (provider=$([ $USE_NVIDIA -eq 1 ] && echo NVIDIA || echo Moonshot)) ==========="
+
             opencode run "$PROMPT"
             EXIT_CODE=$?
-            
+
             if [ $EXIT_CODE -ne 0 ]; then
               FAIL_COUNT=$((FAIL_COUNT+1))
               echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE (连续失败: $FAIL_COUNT)"
-              
-              sleep 30
-              
+
+              # ---------- 首次失败：认为 Moonshot API 不可用，切换到 NVIDIA 备用配置 ----------
+              if [ $USE_NVIDIA -eq 0 ]; then
+                echo "[info] Moonshot API 调用失败，切换到 NVIDIA 备用配置..."
+                cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
+                USE_NVIDIA=1
+                FAIL_COUNT=0
+                sleep 10
+                continue
+              fi
+
+              # ---------- 已切到 NVIDIA 仍然连续失败：跳过本轮，等定时任务唤醒 ----------
               if [ $FAIL_COUNT -ge 3 ]; then
                 echo "连续 3 次请求失败（可能是 API Key 错误或模型名不存在），跳过本轮，等待定时任务唤醒"
                 break
               fi
+
+              sleep 30
               continue
             else
               FAIL_COUNT=0
@@ -101,7 +141,7 @@ jobs:
             git commit -m "auto: iteration $i" || true
             git pull --rebase origin "$BRANCH" || true
             git push origin "HEAD:${BRANCH}" || echo "[warn] push #$i failed"
-            
+
             sleep 5
           done
 
