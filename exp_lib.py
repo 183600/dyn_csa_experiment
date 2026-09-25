@@ -32,7 +32,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 BUDGET = dict(total_yuan=140.0, price_per_hour=2.4, margin=0.93, already_spent_yuan=0.0, state_path='autodl_budget_state.json')
-CODE_SEMANTICS = 'v11.114'
+CODE_SEMANTICS = 'v11.115'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
@@ -50,7 +50,6 @@ def cosine_similarity_consecutive(H, eps=1e-08):
 def _segment(n, want_cut_list, min_block, max_block):
     n_cuts = len(want_cut_list)
     bids = [0] * n
-    honoured = {}
     cur, cur_len = (0, 1)
     pending_cut = False
     pending_slot = -1
@@ -63,13 +62,29 @@ def _segment(n, want_cut_list, min_block, max_block):
         may = cur_len > min_block
         must = cur_len > max_block
         if must or (pending_cut and may):
-            if pending_cut and 0 <= pending_slot < n_cuts:
-                honoured[pending_slot] = 1.0
             cur += 1
             cur_len = 1
             pending_cut = False
             pending_slot = -1
         bids[t] = cur
+    if cur > 0 and cur_len < min_block:
+        prev_len = 0
+        for t in range(n - cur_len - 1, -1, -1):
+            if bids[t] == cur - 1:
+                prev_len += 1
+            else:
+                break
+        need = min_block - cur_len
+        if prev_len - need >= min_block and cur_len + need <= max_block:
+            for t in range(n - cur_len - need, n - cur_len):
+                bids[t] = cur
+        elif prev_len + cur_len <= max_block:
+            for t in range(n - cur_len, n):
+                bids[t] = cur - 1
+    honoured = {}
+    for ci in range(n_cuts):
+        if want_cut_list[ci] and bids[ci + 1] != bids[ci]:
+            honoured[ci] = 1.0
     return (bids, honoured)
 
 def _cut_merge_mask(want_cut_list, min_block, max_block, dtype=None, device=None):
