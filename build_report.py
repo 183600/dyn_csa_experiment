@@ -154,6 +154,8 @@ def per_seed_records(outdir):
 
 def _pair_reason(ra, rb):
     fa, fb = (ra.get('run_cfg'), rb.get('run_cfg'))
+    if fa is None or fb is None:
+        return 'unverifiable run_cfg'
     if fa != fb:
         return 'different run_cfg'
     bad = [k for k in PAIR_BUDGET_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
@@ -485,9 +487,13 @@ def sec_p1t():
         else:
             _dir = f'topk8 {fm(t8m)} > topk32 {fm(t32m)}：选得更少反而更差，整体为单调上升（选择越多越好）'
         _gap = abs(t32m - t8m)
-        _n_gap = min(_n8, _n32) if min(_n8, _n32) else _n8
-        _floor = 2.0 / (1 << _n_gap) if _n_gap else 1.0
-        lines.append(f'2. 在已完成的两个选择率点上：{_dir}；但 topk8 与 topk32 之差（{_gap:.2f} PPL）在 n={_n_gap} 的噪声量级内，且该 n 下精确符号翻转p 值下限为 {_floor:.3f}，**不构成显著性主张**，只作方向性参考。')
+        _recs = per_seed_records('results_lm_v7_seq2k')
+        _pair = paired_row(_recs.get('csa_fixed_topk8', {}), _recs.get('csa_fixed_topk32', {}))
+        if _pair is not None:
+            _kept, _dl, _st = _pair
+            lines.append(f'2. 在已完成的两个选择率点上：{_dir}；配对的精确符号翻转检验（n={_st['n']}，p={_st['p_exact_signflip']:.3f}，Δ(topk8−topk32) mean={_st['mean']:+.2f} PPL）显示该差距仍在噪声量级内，**不构成显著性主张**，只作方向性参考。')
+        else:
+            lines.append(f'2. 在已完成的两个选择率点上：{_dir}；面板上没有可通过 pairing 门禁的同配置种子对，topk8 与 topk32 之差（{_gap:.2f} PPL）无法配对检验，只作方向性参考。')
         lines.append('3. topk≥128 的点未完成（见上），「甜点位置」的完整刻画需要后续在完整扫描面板补齐。')
     return '\n'.join(lines) + '\n'
 

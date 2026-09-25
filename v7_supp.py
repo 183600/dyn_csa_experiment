@@ -260,7 +260,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 soft_logits = soft_logits.masked_fill(~valid[:, None, :], torch.finfo(soft_logits.dtype).min)
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = soft_attn + (attn - soft_attn.detach())
-            chunks.append((attn[:, :, :, None] * Vset.permute(0, 2, 1, 3)).sum(2))
+            chunks.append(torch.einsum('qhm,qmhd->qhd', attn, Vset))
         return torch.cat(chunks, 0)
 
     def _dense_warmup_forward(self, x):

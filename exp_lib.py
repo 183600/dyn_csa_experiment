@@ -561,10 +561,7 @@ def sink_softmax(logits, sink_logits, dim=-1):
 
 def _sink_softmax_impl(logits, sink_logits, dim=-1):
     if sink_logits is None:
-        out = torch.softmax(logits, dim)
-        if torch.isnan(out).any():
-            return torch.nan_to_num(out)
-        return out
+        return torch.nan_to_num(torch.softmax(logits, dim))
     z = _SinkWiden.apply(logits, sink_logits)
     if not torch.isfinite(sink_logits).all():
         return torch.nan_to_num(torch.softmax(z, -1)[..., 1:])
@@ -1349,6 +1346,8 @@ PAIR_BUDGET_KEYS = ('steps', 'tokens_seen')
 def pair_reason(ra, rb):
     if not isinstance(ra, dict) or not isinstance(rb, dict):
         return 'a record is not a dict'
+    if ra.get('run_cfg') is None or rb.get('run_cfg') is None:
+        return 'unverifiable run_cfg'
     if ra.get('run_cfg') != rb.get('run_cfg'):
         return 'different run_cfg'
     bad = [k for k in PAIR_BUDGET_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
@@ -1450,7 +1449,9 @@ def ppl_by_seed(outdir, full=False):
         for _v, _tags in sorted(_collide.items()):
             print(f'[stats] WARNING: {sp}: variant `{_v}` holds SEVERAL protocol conditions for one seed (tags {sorted(_tags)}). This reader keeps ONE record per (variant, seed) — the flat map CANNOT represent the others.  A paired contrast built from it would silently quote a single condition; use `ppl_by_seed_grouped` to read the panel per condition.')
     for (_v, _t, _s), (_k, r) in _by_id.items():
-        out.setdefault(_v, {})[_s] = r if full else r['ppl']
+        _slot = out.setdefault(_v, {})
+        if _s not in _slot:
+            _slot[_s] = r if full else r['ppl']
         if full:
             r.setdefault('protocol_tag', _t)
     return out

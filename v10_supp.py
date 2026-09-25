@@ -385,7 +385,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if r.get('probe_params') is None:
                 _bad_cells.append((k, 'no probe_params'))
                 continue
-            key = (r['variant'], r['arm'], r['eval_len'], r['rho'])
+            key = (r['variant'], r['arm'], r['eval_len'], r['rho'], str(r.get('_code')))
             grp = cells.setdefault(key, {})
             if r['seed'] in grp:
                 _dup_cells.append((k, key, r['seed']))
@@ -397,17 +397,18 @@ def v10_analysis(out='analysis_v10/stats.json'):
         if _new_bad:
             print(f'[v10 stats] {len(_new_bad)} record(s) in {sp} lack `probe_params` and are dropped from every mean/paired statistic: ' + ', '.join((f'{k}({why})' for k, why in _new_bad[:4])))
         probe_cells = []
-        for (v, arm, Ln, rho), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
+        for (v, arm, Ln, rho, _cd), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
             assert means, (v, arm, Ln, rho)
             probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'seeds': sorted(means), 'ppl_by_seed': means, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
         contrasts = {}
 
         def cell_mean(v, arm, Ln, rho):
-            for c in probe_cells:
-                if (c['variant'], c['arm'], c['eval_len'], c['rho']) == (v, arm, Ln, rho):
-                    return c['ppl_by_seed']
-            return {}
+            hits = [c for c in probe_cells if (c['variant'], c['arm'], c['eval_len'], c['rho']) == (v, arm, Ln, rho)]
+            if len(hits) > 1:
+                print(f'[v10 stats] ({v}/{arm}/L{Ln}/r{rho}) holds {len(hits)} probe parameterisations — no unambiguous cell, so the contrast is omitted rather than pooled across them')
+                return {}
+            return hits[0]['ppl_by_seed'] if hits else {}
         for Ln in PROBE['eval_lens']:
             for rho in PROBE['rhos']:
                 learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho)
