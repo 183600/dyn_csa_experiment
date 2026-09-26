@@ -3,8 +3,10 @@ name: Continuous Loop
 on:
   workflow_dispatch:
   schedule:
+    # 兜底：万一链路断了，6 小时一次 cron 也能接上
     - cron: '0 */6 * * *'
 
+# 同一时刻只跑一个，避免 cron 与 dispatch 重叠
 concurrency:
   group: continuous-loop
   cancel-in-progress: false
@@ -12,10 +14,10 @@ concurrency:
 jobs:
   run-opencode:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 330        # 5h 任务 + 30min 收尾缓冲
     permissions:
-      contents: write
-      actions: write
+      contents: write           # push 提交
+      actions: write            # 关键：允许 workflow_dispatch 下一个 run
 
     steps:
       - name: Checkout
@@ -28,93 +30,15 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Configure swap (safe version)
-        run: |
-          set -e
-          echo "=== Before ==="
-          free -h
-          df -h /
-
-          # ---------- 0) 关闭 systemd-oomd ----------
-          # 它在内存紧张时向进程发 SIGTERM，是 exit code 143 的常见来源
-          sudo systemctl disable --now systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
-
-          # ---------- 1) zram：2G 压缩内存即可，不占磁盘 ----------
-          sudo modprobe zram 2>/dev/null || true
-          if [ -e /dev/zram0 ]; then
-            sudo swapoff /dev/zram0 2>/dev/null || true
-            echo 2G | sudo tee /sys/block/zram0/disksize >/dev/null || true
-            sudo mkswap /dev/zram0 >/dev/null 2>&1 || true
-            sudo swapon -p 100 /dev/zram0 2>/dev/null && echo "[ok] zram enabled (2G, prio=100)" \
-              || echo "[warn] zram enable failed"
-          else
-            echo "[info] zram not available, skip"
-          fi
-
-          # ---------- 2) 磁盘 swapfile：上限 4G，至少预留 6GB 磁盘 ----------
-          # 之前 16G swapfile 几乎吃满磁盘 -> 写满后 runner 杀步骤(143)
-          AVAIL_KB=$(df --output=avail / | tail -1)
-          AVAIL_MB=$((AVAIL_KB / 1024))
-          WANT_MB=$((AVAIL_MB - 6144))
-          if [ "$WANT_MB" -gt 4096 ]; then WANT_MB=4096; fi
-          if [ "$WANT_MB" -lt 1024 ]; then WANT_MB=1024; fi
-          echo "[info] available disk: ${AVAIL_MB}MB, will create swapfile: ${WANT_MB}MB"
-
-          sudo swapoff /swapfile 2>/dev/null || true
-          sudo rm -f /swapfile
-          if ! sudo fallocate -l "${WANT_MB}M" /swapfile 2>/dev/null; then
-            echo "[info] fallocate failed, falling back to dd"
-            sudo dd if=/dev/zero of=/swapfile bs=1M count=$WANT_MB status=none
-          fi
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile >/dev/null
-          sudo swapon -p 10 /swapfile && echo "[ok] swapfile enabled"
-
-          # ---------- 3) 内核调优（温和版，避免整机抖动拖死 runner agent） ----------
-          sudo sysctl -w vm.swappiness=60
-          sudo sysctl -w vm.vfs_cache_pressure=100
-          sudo sysctl -w vm.overcommit_memory=1
-          sudo sysctl -w vm.dirty_ratio=40
-          sudo sysctl -w vm.dirty_background_ratio=10
-
-          echo "=== After ==="
-          free -h
-          swapon --show
-          df -h /
-
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      - name: Configure opencode (primary Moonshot + fallback NVIDIA)
+      - name: Configure opencode (NVIDIA endpoint)
         env:
-          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           mkdir -p ~/.config/opencode
-
-          # ---------- 主配置：Moonshot ----------
           cat > ~/.config/opencode/opencode.json <<'EOF'
-          {
-            "$schema": "https://opencode.ai/config.json",
-            "provider": {
-              "moonshot": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "Moonshot",
-                "options": {
-                  "baseURL": "https://api.moonshot.cn/v1",
-                  "apiKey": "{env:KIMI_API_KEY}"
-                },
-                "models": {
-                  "kimi-k3": { "name": "kimi-k3" }
-                }
-              }
-            },
-            "model": "moonshot/kimi-k3"
-          }
-          EOF
-
-          # ---------- 备用配置：NVIDIA（Moonshot 不可用时会替换主配置） ----------
-          cat > ~/.config/opencode/opencode.nvidia.json <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
             "provider": {
@@ -134,118 +58,73 @@ jobs:
           }
           EOF
 
-          echo "=== primary (Moonshot) ==="
-          cat ~/.config/opencode/opencode.json
-          echo "=== fallback (NVIDIA) ==="
-          cat ~/.config/opencode/opencode.nvidia.json
-
       - name: Configure git
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Run opencode for ~5 hours
-        timeout-minutes: 300   # 小于 job 的 330，给收尾步骤留时间
         env:
-          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           set +e
           BRANCH="${GITHUB_REF_NAME:-main}"
+          # 预留 15 分钟做清理 / push / 触发下一次
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
           PROMPT='确保代码没有影响实验结果的bug(修复所有的bug)，优化性能和显存占用(优化只要不会明显降低性能就可以做)，不要管之前修的bug，不要写修复了哪些bug，确保远程仓库里面没有实验结果和REPORTxx.md以及autodl_budgetxx.json，同时远程仓库docs目录只留design_notes.md，确保远程仓库里面没有性能、修复了哪些bug和显存占用的记录（注释里也没有）'
-          ITER_TIMEOUT=10800   # 单次 opencode 最长 3 小时，防止 API 挂起卡死整个步骤
 
           i=0
-          FAIL_COUNT=0
-          USE_NVIDIA=0
-
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             i=$((i+1))
-
-            # ---------- 每轮检查资源：磁盘低于 2GB 就收工，避免被 runner 杀掉(143) ----------
-            AVAIL_MB=$(( $(df --output=avail / | tail -1) / 1024 ))
-            echo "--- iteration #$i | free disk: ${AVAIL_MB}MB ---"
-            free -h | head -2
-            if [ "$AVAIL_MB" -lt 2048 ]; then
-              echo "[error] 磁盘剩余不足 2GB，提前结束循环，交给收尾步骤清理"
-              break
-            fi
-
-            echo "=========== opencode iteration #$i (provider=$([ $USE_NVIDIA -eq 1 ] && echo NVIDIA || echo Moonshot)) ==========="
-
-            timeout --kill-after=180 $ITER_TIMEOUT opencode run "$PROMPT"
+            echo "=========== opencode iteration #$i ==========="
+            
+            opencode run "$PROMPT"
             EXIT_CODE=$?
-
-            # ---------- 超时/被杀（124=timeout, 137=SIGKILL, 143=SIGTERM）：改动照样提交，保住进度 ----------
-            if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ] || [ $EXIT_CODE -eq 143 ]; then
-              FAIL_COUNT=$((FAIL_COUNT+1))
-              echo "[warn] iteration $i 超时或被杀 (exit=$EXIT_CODE)，已完成的改动照常提交 (连续: $FAIL_COUNT)"
-              git add -A || true
-              git commit -m "auto: iteration $i (partial, killed)" || true
-              git pull --rebase origin "$BRANCH" || git rebase --abort || true
-              git push origin "HEAD:${BRANCH}" || echo "[warn] push #$i failed"
-              if [ $FAIL_COUNT -ge 3 ]; then
-                echo "连续 3 次超时/被杀，结束本轮，等待定时任务唤醒"
-                break
-              fi
-              sleep 10
-              continue
-            fi
-
+            
             if [ $EXIT_CODE -ne 0 ]; then
-              FAIL_COUNT=$((FAIL_COUNT+1))
-              echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE (连续失败: $FAIL_COUNT)"
-
-              # ---------- 首次失败：认为 Moonshot API 不可用，切换到 NVIDIA 备用配置 ----------
-              if [ $USE_NVIDIA -eq 0 ]; then
-                echo "[info] Moonshot API 调用失败，切换到 NVIDIA 备用配置..."
-                cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
-                USE_NVIDIA=1
-                FAIL_COUNT=0
-                sleep 10
-                continue
-              fi
-
-              # ---------- 已切到 NVIDIA 仍然连续失败：跳过本轮，等定时任务唤醒 ----------
-              if [ $FAIL_COUNT -ge 3 ]; then
-                echo "连续 3 次请求失败（可能是 API Key 错误或模型名不存在），跳过本轮，等待定时任务唤醒"
+              echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE"
+              # 关键修复：如果出现 API 错误，不要立刻疯狂重试，等待 1 分钟
+              sleep 60
+              
+              # 如果 API 彻底崩溃，主动打破循环，等 6 小时后的 cron 再来
+              if [ $EXIT_CODE -eq 1 ] && [ "$i" -gt 10 ]; then
+                # 这里可以加入关键词检查，比如如果日志中有 "Unexpected server error" 就 break
+                # 避免在 API 长时间宕机时无限空转
+                echo "多次请求失败，跳过本轮，等待定时任务唤醒"
                 break
               fi
-
-              sleep 30
-              continue
-            else
-              FAIL_COUNT=0
             fi
 
+            # 每轮结束就推一次，避免 runner 被回收丢改动
             git add -A || true
             git commit -m "auto: iteration $i" || true
-            git pull --rebase origin "$BRANCH" || git rebase --abort || true
+            
+            # 先拉取防止远程冲突
+            git pull --rebase origin "$BRANCH" || true
             git push origin "HEAD:${BRANCH}" || echo "[warn] push #$i failed"
-
+            
             sleep 5
           done
 
       - name: Cleanup repo artifacts
-        if: always()
         run: |
           set +e
+          # 1) 删实验报告 / 预算文件
           find . -type f -name 'REPORT*.md'         -not -path './.git/*' -delete
           find . -type f -name 'autodl_budget*.json' -not -path './.git/*' -delete
+          # 2) docs 目录只留 design_notes.md
           if [ -d docs ]; then
             find docs -mindepth 1 -maxdepth 1 ! -name 'design_notes.md' -exec rm -rf {} +
             [ -f docs/design_notes.md ] || : > docs/design_notes.md
           fi
 
       - name: Final commit and push
-        if: always()
         run: |
           set +e
           git add -A
           git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
           BRANCH="${GITHUB_REF_NAME:-main}"
-          git pull --rebase origin "$BRANCH" || git rebase --abort || true
+          git pull --rebase origin "$BRANCH" || true
           git push origin "HEAD:${BRANCH}" || echo "[warn] final push failed"
 
       - name: Trigger next workflow run (self-loop)
@@ -255,6 +134,7 @@ jobs:
         run: |
           set +e
           BRANCH="${GITHUB_REF_NAME:-main}"
+          # gh 已预装在 GitHub-hosted runner 上
           gh workflow run continuous-loop.yml --ref "$BRANCH" \
             && echo "next run dispatched on ${BRANCH}" \
             || echo "[warn] dispatch failed, cron fallback will pick up"
