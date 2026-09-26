@@ -174,7 +174,7 @@ jobs:
 
             echo "=========== opencode iteration #$i (provider=$([ $USE_NVIDIA -eq 1 ] && echo NVIDIA || echo Moonshot)) ==========="
 
-            timeout --kill-after=30 $ITER_TIMEOUT opencode run "$PROMPT"
+            timeout --kill-after=180 $ITER_TIMEOUT opencode run "$PROMPT"
             EXIT_CODE=$?
 
             # ---------- 超时/被杀（124=timeout, 137=SIGKILL, 143=SIGTERM）：改动照样提交，保住进度 ----------
