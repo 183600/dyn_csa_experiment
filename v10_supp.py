@@ -75,11 +75,12 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg):
             rows.append(ids)
         ids = torch.from_numpy(np.stack(rows)).to(DEVICE)
         logits = model(ids[:, :-1])
-        ce = F.cross_entropy(logits[:, -target:].reshape(-1, vocab), ids[:, 1:][:, -target:].reshape(-1), reduction='none')
-        ce = ce.double().view(len(rows), -1)
-        nll_sum += ce.sum(1).tolist()
-        n_tok += [int(ce.shape[1])] * len(rows)
-        del ids, logits, ce
+        tgt = ids[:, 1:]
+        for _r in range(len(rows)):
+            ce_r = F.cross_entropy(logits[_r, -target:], tgt[_r, -target:], reduction='none')
+            nll_sum.append(float(ce_r.double().sum()))
+            n_tok.append(int(ce_r.numel()))
+        del ids, logits, tgt
     return (nll_sum, n_tok)
 
 def _cell_ppl(nll_sum, n_tok):
@@ -127,6 +128,21 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
             if not os.path.exists(ck):
                 print(f'[p3mp] SKIP {v} s{seed}: no checkpoint {ck} (run phase P3MT first)')
                 continue
+            _defs = [(Ln, rho) for Ln in cfg['eval_lens'] for rho in cfg['rhos']]
+            _fp_pre = _probe_fingerprint(dict(cfg, vocab=int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])))
+            _todo = False
+            for arm in cfg['arms']:
+                if not _arm_of(v, arm):
+                    continue
+                for Ln, rho in _defs:
+                    _rec = summary.get(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}')
+                    if not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_pre)):
+                        _todo = True
+                        break
+                if _todo:
+                    break
+            if not _todo:
+                continue
             d = torch.load(ck, map_location='cpu', weights_only=False)
             if d.get('code') != V.CKPT_CODE:
                 print(f'[p3mp] REFUSE {v} s{seed}: checkpoint predates the current code stamp (code={d.get('code')!r}) — re-run the training phase (P3MT/P4MT) first')
@@ -142,7 +158,6 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 print(f"[p3mp] {v} s{seed}: probe cfg vocab={int(cfg['vocab'])} differs from the checkpoint's vocab={_vocab_ck} — using the checkpoint's (the model is what is being scored)")
             _pcfg = dict(cfg, vocab=_vocab_ck)
             _fp = _probe_fingerprint(_pcfg)
-            _defs = [(Ln, rho) for Ln in cfg['eval_lens'] for rho in cfg['rhos']]
             for arm in cfg['arms']:
                 if not _arm_of(v, arm):
                     continue
@@ -189,6 +204,7 @@ P3SL_CFG = dict(L.RUN, outdir='results_lm_v10_scale_l', d=512, n_layers=10, n_he
 PHASES = [('P3MT', 'lenphase', P3MT_PAYLOAD, [0, 1, 2], 1.6), ('P3MP', 'probe', PROBE, None, 0.3), ('P3T', 'run', V9.P2T_CFG, [2, 3], 1.8), ('P3SS', 'run', P3SS_CFG, [0, 1], 0.6), ('P3SL', 'run', P3SL_CFG, [0, 1], 9.0)]
 
 def run_phase(name, guard):
+    V9._install_ckpt_patch()
     for pname, kind, payload, seeds, _h in PHASES:
         if pname != name:
             continue
@@ -226,6 +242,7 @@ def _hist_by_seed(outdir, variant):
         print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — no curve for {variant}')
         return out
     seen = {}
+    cfg_of = {}
     for _k, r in raw.items():
         if not (isinstance(r, dict) and r.get('variant') == variant and r.get('ppl_history')):
             continue
@@ -243,7 +260,19 @@ def _hist_by_seed(outdir, variant):
             continue
         seen[fp] = s
         synth_of[s] = bool(r.get('synthesized'))
+        cfg_of[s] = r.get('run_cfg')
         out[s] = r['ppl_history']
+    if len(out) > 1:
+        _groups = {}
+        for s in out:
+            _groups.setdefault(json.dumps(cfg_of.get(s), sort_keys=True, default=str), []).append(s)
+        if len(_groups) > 1:
+            _keep = max(_groups.values(), key=len)
+            _dropped = sorted((s for s in out if s not in set(_keep)))
+            print(f'[stats] {sp}: `{variant}` curves span {len(_groups)} distinct run_cfg groups — pooling across configurations is not allowed, so the trajectory keeps only the largest group ({len(_keep)}/{len(out)} seeds) and drops seeds {_dropped}')
+            for s in _dropped:
+                del out[s]
+                synth_of.pop(s, None)
     out.per_seed_synth = synth_of
     return out
 
@@ -400,7 +429,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
         for (v, arm, Ln, rho, _cd), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
             assert means, (v, arm, Ln, rho)
-            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'seeds': sorted(means), 'ppl_by_seed': means, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
+            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
         contrasts = {}
 
         def cell_mean(v, arm, Ln, rho):
@@ -408,15 +437,20 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if len(hits) > 1:
                 print(f'[v10 stats] ({v}/{arm}/L{Ln}/r{rho}) holds {len(hits)} probe parameterisations — no unambiguous cell, so the contrast is omitted rather than pooled across them')
                 return {}
-            return hits[0]['ppl_by_seed'] if hits else {}
+            return hits[0] if hits else {}
         for Ln in PROBE['eval_lens']:
             for rho in PROBE['rhos']:
                 learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho)
                 for arm, tag in (('dense', 'full_rope(dense)'), ('randidx', 'csa+randidx'), ('allblocks', 'csa+allblocks')):
                     other = cell_mean('full_rope', 'dense', Ln, rho) if arm == 'dense' else cell_mean('csa_fixed_rope', arm, Ln, rho)
-                    common = sorted(set(learned) & set(other))
+                    if not learned or not other:
+                        continue
+                    if learned.get('probe_params') != other.get('probe_params'):
+                        print(f'[v10 stats] L{Ln} r{rho} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
+                        continue
+                    common = sorted(set(learned['ppl_by_seed']) & set(other['ppl_by_seed']))
                     if len(common) >= 2:
-                        dl = [other[s] - learned[s] for s in common]
+                        dl = [other['ppl_by_seed'][s] - learned['ppl_by_seed'][s] for s in common]
                         contrasts[f'L{Ln} r{rho}: {tag} - csa+learned'] = V.exact_sign_permutation(dl)
         probe = {'cells': probe_cells, 'contrasts': contrasts}
     xo = _scale_crossovers()
@@ -442,14 +476,13 @@ def v10_analysis(out='analysis_v10/stats.json'):
         ss_tot = float(((ys - ys.mean()) ** 2).sum())
         fit = {'n_points': len(pts), 'slope': float(slope), 'intercept': float(intercept), 'r2': 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan'), 'note': 'log10(crossover_tokens) ~ log10(d_model), untruncated crossovers only', 'excluded_no_rate': sorted(dropped), 'excluded_reconstructed': recon}
     seq2k = _ppl_by_seed('results_lm_v9_seq2k', full=True)
-    seq2k_f = V9._paired_records('results_lm_v9_seq2k')
     comparisons = {}
 
     def add(name, panel, a, b, outdir):
         V9.add_paired(comparisons, name, panel, a, b, who='v10 ', outdir=outdir)
-    add('seq2k(bs1): topk8 - m1', seq2k_f, 'csa_fixed_topk8', 'csa_fix_m1', 'results_lm_v9_seq2k')
-    add('seq2k(bs1): topk512 - m1', seq2k_f, 'csa_fixed_topk512', 'csa_fix_m1', 'results_lm_v9_seq2k')
-    add('seq2k(bs1): topk8 - topk512', seq2k_f, 'csa_fixed_topk8', 'csa_fixed_topk512', 'results_lm_v9_seq2k')
+    add('seq2k(bs1): topk8 - m1', seq2k, 'csa_fixed_topk8', 'csa_fix_m1', 'results_lm_v9_seq2k')
+    add('seq2k(bs1): topk512 - m1', seq2k, 'csa_fixed_topk512', 'csa_fix_m1', 'results_lm_v9_seq2k')
+    add('seq2k(bs1): topk8 - topk512', seq2k, 'csa_fixed_topk8', 'csa_fixed_topk512', 'results_lm_v9_seq2k')
     panel = V8._panel_block
     out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'seq2k_bs1_panel': panel(seq2k), 'comparisons': comparisons}
     L.atomic_write_json(out, out_d, indent=2)
@@ -531,11 +564,26 @@ def build_report(out='REPORT_v10.md'):
                 continue
 
             def _at(Ln, rows=rows):
-                vals = [c['ppl'] for c in L.by_len_cells(rows, Ln)]
-                return float(np.mean(vals)) if vals else float('nan')
-            p512, p2048, p4096 = (_at(512), _at(2048), _at(4096))
-            _ratio = '—' if not (np.isfinite(p512) and np.isfinite(p4096) and (p512 > 0)) else f'×{p4096 / p512:.2f}'
-            A(f'| `{v}` | {p512:.1f} | {p2048:.1f} | {p4096:.1f} | {_ratio} |')
+                cells = L.by_len_cells(rows, Ln)
+                ok = [c for c in cells if not c.get('truncated')]
+                if ok:
+                    return (float(np.mean([c['ppl'] for c in ok])), False)
+                return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
+
+            def _fmt_cell(Ln):
+                val, tr = _at(Ln)
+                return f'{val:.1f}~' if tr else f'{val:.1f}'
+            p512, _512tr = _at(512)
+            p4096, _4096tr = _at(4096)
+            if _512tr or _4096tr:
+                _ratio = '—（含截断 cell，不可比）'
+            elif not (np.isfinite(p512) and np.isfinite(p4096) and (p512 > 0)):
+                _ratio = '—'
+            else:
+                _ratio = f'×{p4096 / p512:.2f}'
+            A(f'| `{v}` | {_fmt_cell(512)} | {_fmt_cell(2048)} | {_fmt_cell(4096)} | {_ratio} |')
+        A('')
+        A('> 后缀 `~` 表示该列**只有位置受限（abs-PE）的截断 cell**：它是在比列名更短的 span 上评出来的分数，**不是**长上下文测量值。任何 `~` 行不可用于「外推是否稳健」的结论。')
         A('')
     A('**P3MP 干扰注入设计**：eval 长度 2048/4096；把**远距上下文**（除最后 512 个干净目标 token 外的全部位置）中比例为 ρ ∈ {0, 1/8, 1/4, 1/2} 的 token 替换为均匀随机 token——同一 (序列, ρ) 的腐坏对所有臂逐字节相同（按 (eval_len, 序列号, ρ) 播种，与臂/模型种子无关），臂间严格配对。只在干净目标区计 PPL。四个臂：')
     A('')

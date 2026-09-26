@@ -118,12 +118,11 @@ class HybridAttentionRoPE(L.HybridAttention):
         mask = L.causal_mask(T, x.device)
         if cfg.window > 0:
             mask = L.causal_window_mask(T, cfg.window, x.device)
+        logits.add_(mask)
         if self.sink is not None:
-            sculpt = self.sink.view(1, self.nh, 1, 1).expand(B, self.nh, T, 1)
-            logits.add_(mask)
-            attn = torch.softmax(torch.cat([sculpt, logits], -1), -1)[..., 1:]
+            lse = torch.logaddexp(self.sink.view(1, self.nh, 1, 1), torch.logsumexp(logits, dim=-1, keepdim=True))
+            attn = torch.exp(logits - lse)
         else:
-            logits.add_(mask)
             attn = torch.softmax(logits, -1)
         out = torch.einsum('bhnm,bmhd->bnhd', attn, v)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
@@ -155,17 +154,18 @@ class HybridAttentionRoPE(L.HybridAttention):
                 tau = prefix_mean + self.delta_logit
                 gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
                 hard_b = gate.detach() > L._HALF
-                hard = hard_b.to(gate.dtype)
+                gl = hard_b.cpu().tolist()
+                with torch.no_grad():
+                    bid, nblk, _hon_d = L.blocks_from_cuts(T, gl, cfg.min_block, cfg.max_block, x.device, return_count=True, return_honoured=True)
                 if self.need_reg:
-                    _hon = L._cut_merge_mask(hard, cfg.min_block, cfg.max_block, dtype=gate.dtype, device=gate.device)
+                    hard = hard_b.to(gate.dtype)
+                    _keep = [0.0] * len(gl)
+                    for _slot in _hon_d:
+                        if 0 <= _slot < len(_keep):
+                            _keep[_slot] = 1.0
+                    _hon = torch.tensor(_keep, dtype=gate.dtype, device=gate.device)
                     _soft_hon = gate * _hon
                     gate_mean = ((hard * _hon).sum() + _soft_hon.sum() - _soft_hon.detach().sum()) / T
-                with torch.no_grad():
-                    gate_bool = locals().get('hard_b')
-                    if gate_bool is None:
-                        gate_bool = gate.detach() > L._HALF
-                    gl = gate_bool.cpu().tolist()
-                    bid, nblk = L.blocks_from_cuts(T, gl, cfg.min_block, cfg.max_block, x.device, return_count=True)
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
             sim = L.cosine_similarity_consecutive(x)
             tau = L.causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
@@ -653,54 +653,54 @@ def build_niah_batch(n_seq, seq_len, n_pairs=4, vocab=8192, seed=0):
 def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, seed=1234, chunk=16):
     was = model.training
     model.eval()
-    max_pos = getattr(model, 'max_seq', seq_len)
-    ids, tgt, dist = build_niah_batch(n_seq, seq_len, n_pairs, vocab, seed)
-    correct = np.zeros_like(tgt, dtype=bool)
-    span = min(seq_len, max_pos) if getattr(model, 'use_abs_pe', True) else seq_len
-    n_scored = span - 1
-    i = 0
-    while i < n_seq:
-        j = min(i + chunk, n_seq)
-        x = torch.from_numpy(ids[i:j]).to(device)
-        trunc = getattr(model, 'use_abs_pe', True) and seq_len > max_pos
-        try:
-            logits = model(x[:, -span:].clamp(0, vocab - 1) if trunc else x)
-        except torch.cuda.OutOfMemoryError:
-            del x
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-            if chunk <= 1:
-                raise
-            chunk = max(1, chunk // 2)
-            print(f'[niah] eval OOM; retrying with chunk={chunk}')
-            continue
-        pred = logits[:, :-1].argmax(-1).cpu().numpy()
-        if trunc:
-            t = tgt[i:j, -n_scored:]
-            correct[i:j, -n_scored:] = (pred == t) & (t >= 0)
-        else:
-            t = tgt[i:j][:, :n_scored]
-            correct[i:j, :n_scored] = (pred == t) & (t >= 0)
-        del x, logits
-        i = j
-    m = tgt >= 0
-    scored_cols = n_scored
-    m = np.zeros_like(tgt, dtype=bool)
-    m[:, -scored_cols:] = tgt[:, -scored_cols:] >= 0
-    if m.sum() == 0:
+    try:
+        max_pos = getattr(model, 'max_seq', seq_len)
+        ids, tgt, dist = build_niah_batch(n_seq, seq_len, n_pairs, vocab, seed)
+        correct = np.zeros_like(tgt, dtype=bool)
+        span = min(seq_len, max_pos) if getattr(model, 'use_abs_pe', True) else seq_len
+        n_scored = span - 1
+        i = 0
+        while i < n_seq:
+            j = min(i + chunk, n_seq)
+            x = torch.from_numpy(ids[i:j]).to(device)
+            trunc = getattr(model, 'use_abs_pe', True) and seq_len > max_pos
+            try:
+                logits = model(x[:, -span:].clamp(0, vocab - 1) if trunc else x)
+            except torch.cuda.OutOfMemoryError:
+                del x
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                if chunk <= 1:
+                    raise
+                chunk = max(1, chunk // 2)
+                print(f'[niah] eval OOM; retrying with chunk={chunk}')
+                continue
+            pred = logits[:, :-1].argmax(-1).cpu().numpy()
+            if trunc:
+                t = tgt[i:j, -n_scored:]
+                correct[i:j, -n_scored:] = (pred == t) & (t >= 0)
+            else:
+                t = tgt[i:j][:, :n_scored]
+                correct[i:j, :n_scored] = (pred == t) & (t >= 0)
+            del x, logits
+            i = j
+        scored_cols = n_scored
+        m = np.zeros_like(tgt, dtype=bool)
+        m[:, -scored_cols:] = tgt[:, -scored_cols:] >= 0
+        if m.sum() == 0:
+            return {'acc': 0.0, 'n': 0, 'by_dist': {}}
+        d = dist[m]
+        c = correct[m]
+        buckets = [(0, 128), (128, 512), (512, 2048), (2048, 8192), (8192, 10 ** 9)]
+        by = {}
+        for lo, hi in buckets:
+            sel = (d >= lo) & (d < hi)
+            if sel.sum():
+                by[f'{lo}-{(hi if hi < 10 ** 9 else 'inf')}'] = {'acc': float(c[sel].mean()), 'n': int(sel.sum())}
+        _trunc = bool(getattr(model, 'use_abs_pe', True) and seq_len > max_pos)
+        return {'acc': float(c.mean()), 'n': int(m.sum()), 'by_dist': by, 'eval_span': int(span), 'train_pos': int(max_pos), 'truncated': _trunc, 'mid_pos': int(seq_len - span) if _trunc else 0}
+    finally:
         model.train(was)
-        return {'acc': 0.0, 'n': 0, 'by_dist': {}}
-    d = dist[m]
-    c = correct[m]
-    buckets = [(0, 128), (128, 512), (512, 2048), (2048, 8192), (8192, 10 ** 9)]
-    by = {}
-    for lo, hi in buckets:
-        sel = (d >= lo) & (d < hi)
-        if sel.sum():
-            by[f'{lo}-{(hi if hi < 10 ** 9 else 'inf')}'] = {'acc': float(c[sel].mean()), 'n': int(sel.sum())}
-    model.train(was)
-    _trunc = bool(getattr(model, 'use_abs_pe', True) and seq_len > max_pos)
-    return {'acc': float(c.mean()), 'n': int(m.sum()), 'by_dist': by, 'eval_span': int(span), 'train_pos': int(max_pos), 'truncated': _trunc, 'mid_pos': int(seq_len - span) if _trunc else 0}
 
 def exact_sign_permutation(deltas):
     d = np.asarray(deltas, dtype=float)
@@ -889,7 +889,7 @@ def run_phase(name, guard, only=None):
             s, a = L.run(payload['cfg'], seeds=payload['seeds'], guard=guard, label=f'v7 {pname}')
             return s
         if kind == 'warm':
-            return run_warmup(payload['cfg'], seeds=payload['seeds'], guard=guard, label=f'v7 {pname}', warm_grid=payload['warm_grid'])
+            return run_warmup(payload['cfg'], seeds=payload['seeds'], guard=guard, label=f'v7 {pname}', warm_grid=payload['warm_grid'], variants=tuple(payload['cfg'].get('variants', ('csa_fixed',))))
         if kind == 'niah':
             return run_niah_phase(payload, guard, label=f'v7 {pname}')
         if kind == 'len':
@@ -1018,37 +1018,39 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
     was = model.training
     model.eval()
     out = {}
-    for Ln in eval_lens:
-        trunc = False
-        ids = np.asarray(val_ids[:n_seq, :Ln], dtype=np.int64)
-        if max_pos is not None and Ln > max_pos:
-            ids = ids[:, -max_pos:]
-            trunc = True
-        x = torch.from_numpy(ids).to(device)
-        try:
-            nll, ntok = (0.0, 0)
-            _r, _chunk = (0, int(ids.shape[0]))
-            while _r < int(ids.shape[0]):
-                _sub = x[_r:_r + _chunk]
-                try:
-                    logits = model(_sub)
-                except RuntimeError as _oe:
-                    if 'out of memory' in str(_oe).lower() and _chunk > 1:
-                        _chunk = max(1, _chunk // 2)
-                        if device.type == 'cuda':
-                            torch.cuda.empty_cache()
-                        continue
-                    raise
-                _lsm = F.log_softmax(logits[:, :-1], dim=-1)
-                nll += float(-_lsm.gather(-1, _sub[:, 1:].unsqueeze(-1)).double().sum())
-                ntok += int(_sub[:, 1:].numel())
-                del logits, _lsm
-                _r += _chunk
-            ppl = math.exp(nll / max(ntok, 1))
-            out[int(Ln)] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': int(x.shape[1])}
-        except Exception as e:
-            out[int(Ln)] = {'error': f'{type(e).__name__}: {e}'}
-    model.train(was)
+    try:
+        for Ln in eval_lens:
+            trunc = False
+            ids = np.asarray(val_ids[:n_seq, :Ln], dtype=np.int64)
+            if max_pos is not None and Ln > max_pos:
+                ids = ids[:, -max_pos:]
+                trunc = True
+            try:
+                x = torch.from_numpy(ids).to(device)
+                nll, ntok = (0.0, 0)
+                _r, _chunk = (0, int(ids.shape[0]))
+                while _r < int(ids.shape[0]):
+                    _sub = x[_r:_r + _chunk]
+                    try:
+                        logits = model(_sub)
+                    except RuntimeError as _oe:
+                        if 'out of memory' in str(_oe).lower() and _chunk > 1:
+                            _chunk = max(1, _chunk // 2)
+                            if device.type == 'cuda':
+                                torch.cuda.empty_cache()
+                            continue
+                        raise
+                    _lsm = F.log_softmax(logits[:, :-1], dim=-1)
+                    nll += float(-_lsm.gather(-1, _sub[:, 1:].unsqueeze(-1)).double().sum())
+                    ntok += int(_sub[:, 1:].numel())
+                    del logits, _lsm
+                    _r += _chunk
+                ppl = math.exp(nll / max(ntok, 1))
+                out[int(Ln)] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': int(x.shape[1])}
+            except Exception as e:
+                out[int(Ln)] = {'error': f'{type(e).__name__}: {e}'}
+    finally:
+        model.train(was)
     return out
 
 def run_lenphase(payload, guard=None, label=''):
@@ -1277,12 +1279,14 @@ def run_full():
             run_phase(pname, guard)
         except Exception:
             traceback.print_exc()
+            all_ok = False
         all_ok &= git_push(f'v7: phase {pname} results')
     try:
         flops_analysis()
         bootstrap_report(['results_lm_v7_warmup', 'results_lm_v7_rope', 'results_lm_v7_long40', 'results_lm_v7_seq2k', 'results_lm_v3_1500'])
     except Exception:
         traceback.print_exc()
+        all_ok = False
     all_ok &= git_push('v7: analytic FLOPs/KV-cache + paired sign-flip stats')
     guard.report()
     print('\n[v7] ALL PHASES DONE.')

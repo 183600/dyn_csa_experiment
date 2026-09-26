@@ -230,7 +230,7 @@ def sec_p0r():
         _d_sp_t = ('改善' if d_sp > 0 else '变差') + f' **{abs(d_sp):.2f}**'
         lines += [f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL（参数对齐 `full_matched` 时{_w_absm} **{abs(g_abs_m):.2f}**；两者相差 **{g_abs - g_abs_m:+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(ab['csa_fixed'], ab.get('full_matched'))}。' if _has_mt else f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该差距因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` {_w_rope} `full_rope` **{abs(g_rope):.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense {_d_abs_t}、sparse {_d_sp_t}（注：`full_rope` 与 `csa_fixed_rope` 参数不同，此对比同时含容量效应）。', '']
         if rope_unmatched and rope_is_defect and _has_mt:
-            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线。`full_rope` 由 v7 P0R 的 plain 路径训练，当时 `matched` 集合没有传进去，因此它的 MLP 停在标准 ratio 4（{_params_m(rope['full_rope'])}），而 `csa_fixed_rope` 保持全宽（{_params_m(rope['csa_fixed_rope'])}），相差 {100 * (param_gap(rope['csa_fixed_rope'], rope['full_rope']) or 0):.1f}%。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
+            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线——落盘记录显示 `full_rope` 的 MLP 停在标准宽度（{_params_m(rope['full_rope'])}），而 `csa_fixed_rope` 保持全宽（{_params_m(rope['csa_fixed_rope'])}），相差 {100 * (param_gap(rope['csa_fixed_rope'], rope['full_rope']) or 0):.1f}%。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
         _arms_gain = d_abs > 0 and d_sp > 0
         _gain_txt = 'RoPE+QK-norm 对两臂都有真实增益，值得保留为新默认' if _arms_gain else f'RoPE+QK-norm 并未对两臂都带来增益（dense {_d_abs_t}、sparse {_d_sp_t}）'
         if _has_mt:
@@ -386,14 +386,14 @@ def sec_p0e():
                 v = gaps.get(step)
                 return f'**{v:+.1f}**' if isinstance(v, (int, float)) and math.isfinite(v) else '**未测量**（该面板无此步）'
             _g20 = _gap_at(20000)
-            lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，seed 平均）**：', '', f'- 20k 步差距：{_g20} PPL；40k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa 下降 {abs(r_csa):.2f}、dense 下降 {abs(r_full):.2f} PPL/1k）。']
+            lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，seed 平均）**：', '', f'- 20k 步差距：{_g20} PPL；40k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {'下降' if r_csa < 0 else '上升'} {abs(r_csa):.2f}、dense {'下降' if r_full < 0 else '上升'} {abs(r_full):.2f} PPL/1k）。']
             if n_ < 2 or not (math.isfinite(g_last) and math.isfinite(slope)):
                 verdict = f'**结论：尾段差距统计量不可用**（`g_last` 或 `slope` 非有限值：g_last={g_last!r}、slope={slope!r}），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。上表已剔除非有限的曲线点；若此处仍出现，说明该面板的尾段整体缺失，需补跑。'
             elif g_last <= 0:
                 verdict = '**结论：渐近线在 40k 内反演**——`csa_fixed` 追平并超过 dense，评审的 P0-2 质疑成立，此前「worse asymptote」的表述需撤回。'
             elif slope < -1e-06:
                 x0 = steps[-1] - g_last * 1000.0 / slope
-                if 40000 < x0 <= 400000:
+                if steps[-1] < x0 <= steps[-1] * 10:
                     _g20v = gaps.get(20000)
                     _g20c = f'由 20k 的 **{_g20v:+.1f}** ' if isinstance(_g20v, (int, float)) and math.isfinite(_g20v) else ''
                     verdict = f'- 按尾段斜率线性外推，差距将在 ~{x0 / 1000:.0f}k 步附近归零（外推仅供参考：学习率已 cosine 衰减到底，后期斜率通常进一步放缓）。\n\n**结论**：40k 步内未发生反演，但差距仍在缓慢收窄。**保守表述**：「等 token budget 下 CSA 收敛更慢，终点差距 {_g20c}收窄到 40k 的 {g_last:+.1f}，未见交叉」。是否最终追平属外推，不属证据。'
@@ -422,7 +422,7 @@ def sec_p1t():
             std = sample_std(ppls)
             n = len(ppls)
         else:
-            mean, std, n = (r.get('ppl_mean'), r.get('ppl_std') or 0.0, r.get('n', 0))
+            mean, std, n = (r.get('ppl_mean'), r.get('ppl_std') or 0.0, r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n', 0))
         if v == 'csa_fix_m1':
             sr = '1.6% (m=1, topk=32)'
         elif v.startswith('csa_fixed_topk'):
@@ -599,7 +599,7 @@ def sec_p1l():
 def _agg_entry(d, v):
     if v in d:
         return d[v]
-    cands = [(k, e) for k, e in d.items() if isinstance(e, dict) and k.startswith(f'{v}@cfg')]
+    cands = [(k, e) for k, e in d.items() if isinstance(e, dict) and (k.startswith(f'{v}@cfg') or k.startswith(f'{v}#'))]
     if not cands:
         return None
     cands.sort(key=lambda kv: -(_int_or(kv[1].get('n_seeds'), 0)))
@@ -729,4 +729,4 @@ def main(argv=None):
     print(f'[report] wrote {out} ({len(txt)} bytes)')
     return out
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(0 if main() else 1)

@@ -57,8 +57,8 @@ def P4MP_CFG(seeds=(3, 4, 5)):
     return dict(V10.PROBE, seeds=list(seeds))
 P4SS_CFG = dict(V10.P3SS_CFG)
 P4SL_CFG = dict(V10.P3SL_CFG)
-P4F_CFG = dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full'])
-PHASES = [('P4MT', 'p4mt', P4MT_CFG, None, 1.0), ('P4MP', 'probe', P4MP_CFG, None, 0.3), ('P4SS', 'run', P4SS_CFG, [2, 3], 1.0), ('P4SL', 'run', P4SL_CFG, [2, 3], 1.3), ('P4F', 'run', P4F_CFG, [2, 3], 1.0)]
+P4F_CFG = dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['csa_fixed', 'full'])
+PHASES = [('P4MT', 'p4mt', P4MT_CFG, None, 1.0), ('P4MP', 'probe', P4MP_CFG, None, 0.3), ('P4SS', 'run', P4SS_CFG, [2, 3], 1.0), ('P4SL', 'run', P4SL_CFG, [2, 3], 1.3), ('P4F', 'run', P4F_CFG, [0, 1, 2, 3], 4.5)]
 
 def run_phase(name, guard):
     for pname, kind, payload, seeds, _h in PHASES:
@@ -173,14 +173,13 @@ def v11_analysis(out='analysis_v11/stats.json'):
         ss_tot = float(((ys - ys.mean()) ** 2).sum())
         fit = {'n_points': len(pts), 'slope': float(slope), 'intercept': float(intercept), 'r2': 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan'), 'note': 'log10(crossover_tokens) ~ log10(d_model), untruncated crossovers only', 'excluded_no_rate': sorted(_no_tok), 'excluded_reconstructed': sorted(_recon)}
     scale384 = V10._ppl_by_seed('results_lm_v5_scale', full=True)
-    scale384_f = V9._paired_records('results_lm_v5_scale')
     panel = V8._panel_block
     comparisons = {}
 
     def add(name, panel_d, a, b, outdir):
         V9.add_paired(comparisons, name, panel_d, a, b, who='v11 ', outdir=outdir)
-    add('scale384: csa_fixed - full', scale384_f, 'csa_fixed', 'full', 'results_lm_v5_scale')
-    add('scale384: csa_fixed - full_sw128_matched', scale384_f, 'csa_fixed', 'full_sw128_matched', 'results_lm_v5_scale')
+    add('scale384: csa_fixed - full', scale384, 'csa_fixed', 'full', 'results_lm_v5_scale')
+    add('scale384: csa_fixed - full_sw128_matched', scale384, 'csa_fixed', 'full_sw128_matched', 'results_lm_v5_scale')
     out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale384_panel': panel(scale384), 'comparisons': comparisons}
     L.atomic_write_json(out, out_d, indent=2)
     print(f'[v11 stats] wrote {out}')
@@ -306,9 +305,9 @@ def build_report(out='REPORT_v11.md'):
     A(f'**预算**：v11 记账 {v11_state.get('runs', 0)} runs，估算花费 ¥{v11_h * price:.2f} / ¥{BUDGET_V11['total_yuan']:.2f}（AutoDL RTX 4090，按 ¥{price:.2f}/h 记账；v7–v10 台账各自独立冻结）。')
     A('')
     if probe_ok:
-        A(f'v11 不提出新科学问题，只做 v10 留下的三处统计收尾：(1) 主正面结果（远距干扰注入探针）从 n=3 补到 **n={n_contr_max}**——全仓库唯一一个低成本即可让精确符号翻转 p 值下限跨过 0.05 的地方（0.250 → {_floor_txt}）；(**注意**：补满的是该面板的**最强**对比。各臂独立续训，配对取两臂交集，因此最弱对比仍停在 n={n_tree_min}、下限 {floor_p_tree:.3f}，凡引用它的结论不作显著性主张。)；(2) v10 新建的两个交叉定位面板（d=128/4L、d=512/10L）从 n=2 补到 {_xo_txt}——各面板的完成度不同，标题给的是分布而不是上限；(3) d=384 面板的 `full` 臂补到 n={n384}，消除 4 点标度读数中唯一离群点的配对不平衡。')
+        A(f'v11 不提出新科学问题，只做 v10 留下的三处统计收尾：(1) 主正面结果（远距干扰注入探针）从 n=3 补到 **n={n_contr_max}**——全仓库唯一一个低成本即可让精确符号翻转 p 值下限跨过 0.05 的地方（0.250 → {_floor_txt}）；(**注意**：补满的是该面板的**最强**对比。各臂独立续训，配对取两臂交集，因此最弱对比仍停在 n={n_tree_min}、下限 {floor_p_tree:.3f}，凡引用它的结论不作显著性主张。)；(2) v10 新建的两个交叉定位面板（d=128/4L、d=512/10L）从 n=2 补到 {_xo_txt}——各面板的完成度不同，标题给的是分布而不是上限；(3) d=384 面板的 `csa_fixed`/`full` 两臂在同一配置下补到 n={n384}，消除 4 点标度读数中唯一离群点的配对不平衡。')
     else:
-        A('v11 计划做三处统计收尾：主正面结果（远距干扰注入探针）补到 n=6、两个交叉定位面板补到 n=4、d=384 面板 `full` 臂补到 n=4。')
+        A('v11 计划做三处统计收尾：主正面结果（远距干扰注入探针）补到 n=6、两个交叉定位面板补到 n=4、d=384 面板 `csa_fixed`/`full` 两臂补到 n=4。')
         A('')
         A(f'> **⚠ 实际落盘状态（本报告从 disk 实时计算）**：探针对比的最大种子数为 **n={n_contr_max}**（精确符号翻转 p 值下限 {_floor_txt}，**未**跨过 0.05），最小配对 n={n_pair_min}；交叉面板 {_xo_txt}；d=384 面板 {_n384_txt}。**P4MT/P4MP 的 seeds 3–5 尚未产出**，因此本节的 n 仍停留在 v10 的水平，**「n=6」的统计升级未发生**；相关结论须待补跑后方可作显著性主张。')
     if _pair_ragged:
@@ -531,7 +530,7 @@ def build_report(out='REPORT_v11.md'):
     A(f'| `results_v10_mech/` | P4MT 追加 seeds 3–5 权重与 by-length 行 + P4MP 探针 cell（`distractor.json`，实际 n={n_contr_max}） |')
     A(f'| `results_lm_v10_scale_s/` | P4S：d=128/4L 面板 {_n_txt('results_lm_v10_scale_s', 4)} |')
     A(f'| `results_lm_v10_scale_l/` | P4S：d=512/10L 面板 {_n_txt('results_lm_v10_scale_l', 4)} |')
-    A(f'| `results_lm_v5_scale/` | P4F：d=384 `full` 臂 {_n_txt('results_lm_v5_scale', 4)} |')
+    A(f'| `results_lm_v5_scale/` | P4F：d=384 `csa_fixed`/`full` 臂 {_n_txt('results_lm_v5_scale', 4)} |')
     A(f'| `analysis_v11/stats.json` | n={n_contr_max} 探针对比、交叉定位（{_xo_txt}）、配对检验 |')
     A('| `autodl_budget_state_v11.json` | v11 CostGuard 台账 |')
     A('| `v11_supp.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')

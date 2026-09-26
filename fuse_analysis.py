@@ -60,12 +60,19 @@ def layers_of(variant, dyn_only=True):
 def per_seed_layer(variant, key):
     layers = layers_of(variant)
     M = np.full((len(SEEDS), len(layers)), np.nan)
+    n_sampled = 0
     for i, s in enumerate(SEEDS):
         st = rec(variant, s)['stats']
         for j, lk in enumerate(layers):
             _cell = st.get(lk)
             if isinstance(_cell, dict):
-                M[i, j] = _cell.get(key, np.nan)
+                v = _cell.get(key, np.nan)
+                if key in ('bnd_rand', 'bnd_excess') and _cell.get('bnd_rand_exact') is False:
+                    v = np.nan
+                    n_sampled += 1
+                M[i, j] = v
+    if n_sampled:
+        print(f'[fuse_analysis] NOTE: `{variant}` {key}: {n_sampled} cell(s) carry `bnd_rand_exact: False` (Monte-Carlo estimate, not the exact baseline) and are masked out rather than pooled with the exact readings')
     return (layers, M)
 
 def _axis_steps(histories):
@@ -122,8 +129,9 @@ def main(argv=None):
             for v in (a, b):
                 for s in SEEDS:
                     rec(v, s)
-            layers_of(a)
-            layers_of(b)
+            _la, _lb = (layers_of(a), layers_of(b))
+            if _la != _lb:
+                return f'`{a}` and `{b}` are not on the same layer list ({_la} vs {_lb}); the per-layer deltas would be a misaligned subtraction'
             return None
         except (KeyError, ValueError) as e:
             return str(e)

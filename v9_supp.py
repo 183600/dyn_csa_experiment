@@ -22,7 +22,9 @@ REPO = V8.REPO
 DEVICE = L.DEVICE
 import torch.utils.checkpoint as _ckpt
 _V9_CKPT = {'on': False}
-_orig_block_forward = L.Block.forward
+_CKPT_PATCHED = False
+_orig_block_forward = None
+_orig_blockrope_forward = None
 
 def _v9_block_forward(self, x):
     if _V9_CKPT['on'] and self.training and torch.is_grad_enabled() and x.requires_grad:
@@ -31,8 +33,6 @@ def _v9_block_forward(self, x):
             raise RuntimeError(f'gradient checkpointing under _V9_CKPT is only enabled for fixed-chunking, non-dynamic arms (got chunking={getattr(_acfg, 'chunking', None)!r}, dynamic={getattr(_acfg, 'dynamic', None)!r}); dynamic arms would recompute a different gate state in backward')
         return _ckpt.checkpoint(_orig_block_forward, self, x, use_reentrant=False, preserve_rng_state=False)
     return _orig_block_forward(self, x)
-L.Block.forward = _v9_block_forward
-_orig_blockrope_forward = V7.BlockRoPE.forward
 
 def _v9_blockrope_forward(self, x):
     if _V9_CKPT['on'] and self.training and torch.is_grad_enabled() and x.requires_grad:
@@ -41,7 +41,16 @@ def _v9_blockrope_forward(self, x):
             raise RuntimeError(f'gradient checkpointing under _V9_CKPT is only enabled for fixed-chunking, non-dynamic arms (got chunking={getattr(_acfg, 'chunking', None)!r}, dynamic={getattr(_acfg, 'dynamic', None)!r}); dynamic arms would recompute a different gate state in backward')
         return _ckpt.checkpoint(_orig_blockrope_forward, self, x, use_reentrant=False, preserve_rng_state=False)
     return _orig_blockrope_forward(self, x)
-V7.BlockRoPE.forward = _v9_blockrope_forward
+
+def _install_ckpt_patch():
+    global _CKPT_PATCHED, _orig_block_forward, _orig_blockrope_forward
+    if _CKPT_PATCHED:
+        return
+    _orig_block_forward = L.Block.forward
+    _orig_blockrope_forward = V7.BlockRoPE.forward
+    L.Block.forward = _v9_block_forward
+    V7.BlockRoPE.forward = _v9_blockrope_forward
+    _CKPT_PATCHED = True
 BUDGET_V9 = dict(L.BUDGET)
 BUDGET_V9.update(total_yuan=float(os.environ.get('V9_BUDGET_YUAN', 25.0)), price_per_hour=float(os.environ.get('V9_PRICE_PER_HOUR', 2.4)), state_path='autodl_budget_state_v9.json', already_spent_yuan=0.0)
 
@@ -70,6 +79,7 @@ P2S3_CFG = dict(V8.P2R_CFG)
 PHASES = [('P2T', P2T_CFG, [0, 1], 1.5), ('P2S3', P2S3_CFG, [2], 5.5)]
 
 def run_phase(name, guard):
+    _install_ckpt_patch()
     for pname, cfg, seeds, _h in PHASES:
         if pname != name:
             continue
@@ -147,20 +157,18 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
 
 def v9_analysis(out='analysis_v9/stats.json'):
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
-    seq2k = _ppl_by_seed('results_lm_v9_seq2k')
-    seq2k_v7 = _ppl_by_seed('results_lm_v7_seq2k')
-    rope20k = _ppl_by_seed('results_lm_v8_rope20k')
-    seq2k_f = _paired_records('results_lm_v9_seq2k')
-    rope20k_f = _paired_records('results_lm_v8_rope20k')
+    seq2k = _ppl_by_seed('results_lm_v9_seq2k', full=True)
+    seq2k_v7 = _ppl_by_seed('results_lm_v7_seq2k', full=True)
+    rope20k = _ppl_by_seed('results_lm_v8_rope20k', full=True)
     abs_long_f = _paired_records('results_lm_v3_long')
     comparisons = {}
 
     def add(name, panel, a, b, outdir):
         add_paired(comparisons, name, panel, a, b, who='v9 ', outdir=outdir)
-    add('seq2k(bs1): topk8 - m1', seq2k_f, 'csa_fixed_topk8', 'csa_fix_m1', 'results_lm_v9_seq2k')
-    add('seq2k(bs1): topk512 - m1', seq2k_f, 'csa_fixed_topk512', 'csa_fix_m1', 'results_lm_v9_seq2k')
-    add('seq2k(bs1): topk8 - topk512', seq2k_f, 'csa_fixed_topk8', 'csa_fixed_topk512', 'results_lm_v9_seq2k')
-    add('rope20k: csa_fixed_rope - full_rope', rope20k_f, 'csa_fixed_rope', 'full_rope', 'results_lm_v8_rope20k')
+    add('seq2k(bs1): topk8 - m1', seq2k, 'csa_fixed_topk8', 'csa_fix_m1', 'results_lm_v9_seq2k')
+    add('seq2k(bs1): topk512 - m1', seq2k, 'csa_fixed_topk512', 'csa_fix_m1', 'results_lm_v9_seq2k')
+    add('seq2k(bs1): topk8 - topk512', seq2k, 'csa_fixed_topk8', 'csa_fixed_topk512', 'results_lm_v9_seq2k')
+    add('rope20k: csa_fixed_rope - full_rope', rope20k, 'csa_fixed_rope', 'full_rope', 'results_lm_v8_rope20k')
     add('long20k(abs): csa_fixed - full', abs_long_f, 'csa_fixed', 'full', 'results_lm_v3_long')
     panel = V8._panel_block
     out_d = {'seq2k_bs1_panel': panel(seq2k), 'seq2k_bs3_panel_historical': panel(seq2k_v7), 'rope20k_panel': panel(rope20k), 'comparisons': comparisons}
@@ -381,6 +389,7 @@ def run_full():
 def run_smoke():
     print('[smoke] 1) topk128/512 forward/backward (seq 2048, bs 1)')
     L.set_seed(0)
+    _install_ckpt_patch()
     _V9_CKPT['on'] = True
     for v in ['csa_fixed_topk128', 'csa_fixed_topk512']:
         cfgs = L.make_layer_cfgs(6, v)
@@ -398,7 +407,10 @@ def run_smoke():
     _V9_CKPT['on'] = False
     print('[smoke] 2) 60-step csa_fixed_topk128 probe (seq 2048, bs 1 — matches the P2T phase setting)')
     guard = make_guard()
+    t_data = time.time()
     train_ids, val_batch, vocab, _, vb = L.load_wikitext(2048, 1000000)
+    guard.record_run(time.time() - t_data, 0, 0, 0, 0, 0)
+    _install_ckpt_patch()
     _V9_CKPT['on'] = True
     t0 = time.time()
     try:

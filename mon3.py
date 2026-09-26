@@ -22,7 +22,7 @@ def proc_alive():
                 cmd = f.read().decode('utf-8', 'replace')
         except Exception:
             continue
-        if 'python' in cmd and any((f'v{x}_supp.py' in cmd for x in (7, 8, 9, 10, 11))):
+        if 'python' in cmd and (any((f'v{x}_supp.py' in cmd for x in (7, 8, 9, 10, 11))) or 'run_gapfill.py' in cmd):
             return int(pid)
     return None
 
@@ -60,8 +60,19 @@ def main():
             print(f'\n--- {desc}: (dir absent)')
             continue
         s = load(os.path.join(p, 'summary.json'))
-        n = len(s) if isinstance(s, dict) else 0
+        n = n_err = 0
+        if isinstance(s, dict):
+            for _r in s.values():
+                if not isinstance(_r, dict):
+                    continue
+                _ppl = _r.get('ppl')
+                if isinstance(_ppl, (int, float)) and (not isinstance(_ppl, bool)) and math.isfinite(_ppl) and (_ppl > 0) and (not _r.get('synthesized')):
+                    n += 1
+                elif _r.get('error'):
+                    n_err += 1
         tag = f'{n}/{exp}' if exp else f'{n}'
+        if n_err:
+            tag += f' (+{n_err} error)'
         print(f'\n--- {desc}  [{tag}]')
         if not isinstance(s, dict):
             continue

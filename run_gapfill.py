@@ -12,6 +12,7 @@ sys.path.insert(0, REPO)
 import exp_lib as L
 import torch
 LONG_GAP_VARIANTS = ['hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn']
+_LONG_STEPS = L.RUN_LONG['steps']
 
 def _num_or_none(v):
     if v is None or isinstance(v, bool):
@@ -92,7 +93,7 @@ def synthesize_long_summary():
             if _si in _agg_map and abs(_agg_map[_si] - _pi) > 1e-06 * max(1.0, abs(_pi)):
                 _bad_map = True
             _agg_map[_si] = _pi
-        _conflict = [int(r['seed']) for r in summary.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None) and (not r.get('synthesized')) and (r.get('steps') == 20000) and L.ppl_is_usable(r.get('ppl')) and (int(r['seed']) not in _agg_map or abs(float(r['ppl']) - _agg_map[int(r['seed'])]) > 1e-06 * max(1.0, abs(_agg_map[int(r['seed'])])))]
+        _conflict = [int(r['seed']) for r in summary.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None) and (not r.get('synthesized')) and (r.get('steps') == _LONG_STEPS) and L.ppl_is_usable(r.get('ppl')) and (int(r['seed']) not in _agg_map or abs(float(r['ppl']) - _agg_map[int(r['seed'])]) > 1e-06 * max(1.0, abs(_agg_map[int(r['seed'])])))]
         if _bad_map or _conflict:
             _unaligned.append((v, len(_ppls), _real))
     if _unaligned:
@@ -107,7 +108,7 @@ def synthesize_long_summary():
             _seed = int(_seeds[i]) if _seeds is not None else i
             key = f'{v}::seed{_seed}'
             old = summary.get(key)
-            if isinstance(old, dict) and 'ppl' in old and (old.get('steps') == 20000) and (not old.get('synthesized')):
+            if isinstance(old, dict) and 'ppl' in old and (old.get('steps') == _LONG_STEPS) and (not old.get('synthesized')):
                 n_kept += 1
                 if old.get('tokens_seen') is None and e.get('tokens_seen') is not None:
                     old['tokens_seen'] = e['tokens_seen']
@@ -119,7 +120,7 @@ def synthesize_long_summary():
                 continue
             if isinstance(old, dict) and 'ppl' in old:
                 n_replaced += 1
-            rec = {'variant': v, 'seed': _seed, 'steps': 20000, 'tokens_seen': e.get('tokens_seen'), 'ppl': float(p), 'params': _num_or_none(e.get('params')), 'synthesized': True, 'note': 'reconstructed from committed aggregate.json (v6); means exact, secondary-metric stds approximate'}
+            rec = {'variant': v, 'seed': _seed, 'steps': _LONG_STEPS, 'tokens_seen': e.get('tokens_seen'), 'ppl': float(p), 'params': _num_or_none(e.get('params')), 'synthesized': True, 'note': 'reconstructed from committed aggregate.json (v6); means exact, secondary-metric stds approximate'}
             if 'ppl_curve' in e:
                 rec['ppl_history'] = e['ppl_curve']
             summary[key] = rec
@@ -157,6 +158,17 @@ def run_smoke():
     synthesize_long_summary()
     smoke_cfg = dict(L.RUN, outdir='results_smoke', variants=['full', 'csa_fixed', 'hybrid_dynamic'], steps=60, eval_every=30, n_train_tokens=1000000, seeds=[0])
     L.run(smoke_cfg, seeds=[0], guard=None, label='SMOKE (60 steps)')
+    _sp = os.path.join('results_smoke', 'summary.json')
+    _got = {}
+    if os.path.exists(_sp):
+        try:
+            _got = json.load(open(_sp, encoding='utf-8'))
+        except Exception:
+            _got = {}
+    _bad = [f'{v}::seed0' for v in smoke_cfg['variants'] if not L.ppl_is_usable((_got.get(f'{v}::seed0') or {}).get('ppl'))]
+    if _bad:
+        print(f'\n[smoke] FAILED: no usable PPL was measured for {_bad} — the pipeline is degraded; results_smoke/ is KEPT for inspection instead of being deleted.')
+        sys.exit(1)
     shutil.rmtree('results_smoke', ignore_errors=True)
     print('\n[smoke] PASSED — the full pipeline works end to end. The synthesized results_lm_v3_long/summary.json is kept (it is the desired repo state); smoke outputs were deleted.')
 if __name__ == '__main__':

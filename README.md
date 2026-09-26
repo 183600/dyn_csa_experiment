@@ -22,7 +22,7 @@ needed to reproduce the results on a machine of your own.
 | `v8_supp.py` | **the v8 driver**: P1S (scale panel seed completion to 4 seeds) and P2R (RoPE+QK-norm 20k-step long run) |
 | `v9_supp.py` | **the v9 driver**: P2T (the seq-2048 topk sweep at `batch_size=1` with per-block gradient checkpointing) and P2S3 (third seed for the RoPE 20k run) |
 | `v10_supp.py` | **the v10 driver**: P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
-| `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 `full` arm to n=4 (P4F) |
+| `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
 | `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk, never hard-coded) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
 | `mon3.py` | tiny AutoDL progress watcher used by the drivers |
@@ -89,7 +89,8 @@ python v11_supp.py report         # rebuild REPORT_v11.md from disk (zero GPU)
 
 Phases: P4MT (RoPE-arm seeds 3-5, exact P1L/P3MT recipe), P4MP (probe
 resume for the new seeds, eval-only), P4SS/P4SL (crossover panels seeds
-2/3), P4F (d=384 `full` seeds 2/3). Books against
+2/3), P4F (d=384 `csa_fixed`/`full` seeds 0-3 under one config, so the
+panel pairs at n=4). Books against
 `autodl_budget_state_v11.json` (default cap ¥30); `V11_*` env vars mirror
 the earlier ones.
 

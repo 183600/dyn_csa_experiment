@@ -112,16 +112,14 @@ def v8_analysis(out='analysis_v8/stats.json'):
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     scale = _ppl_by_seed('results_lm_v5_scale', full=True)
     rope20k = _ppl_by_seed('results_lm_v8_rope20k', full=True)
-    scale_f = _paired_records('results_lm_v5_scale')
-    rope20k_f = _paired_records('results_lm_v8_rope20k')
     abs_long_f = _paired_records('results_lm_v3_long')
     comparisons = {}
 
     def add(name, panel, a, b, outdir):
         _add_paired(comparisons, name, panel, a, b, who='v8 ', outdir=outdir)
     for a, b in [('csa_fixed', 'full'), ('csa_fixed', 'full_matched'), ('csa_fixed', 'full_sw128_matched'), ('csa_dynamic', 'full'), ('hybrid_dynamic', 'full')]:
-        add(f'scale: {a} - {b}', scale_f, a, b, 'results_lm_v5_scale')
-    add('rope20k: csa_fixed_rope - full_rope', rope20k_f, 'csa_fixed_rope', 'full_rope', 'results_lm_v8_rope20k')
+        add(f'scale: {a} - {b}', scale, a, b, 'results_lm_v5_scale')
+    add('rope20k: csa_fixed_rope - full_rope', rope20k, 'csa_fixed_rope', 'full_rope', 'results_lm_v8_rope20k')
     add('long20k(abs): csa_fixed - full', abs_long_f, 'csa_fixed', 'full', 'results_lm_v3_long')
     out_d = {'scale_panel': _panel_block(scale), 'rope20k_panel': _panel_block(rope20k), 'comparisons': comparisons}
     L.atomic_write_json(out, out_d, indent=2)
@@ -196,7 +194,9 @@ def run_smoke():
             torch.cuda.empty_cache()
     print('[smoke] 2) 60-step csa_fixed_rope probe (LONG recipe), for CostGuard calibration')
     guard = make_guard()
+    t_data = time.time()
     train_ids, val_batch, vocab, _, vb = L.load_wikitext(512, 1000000)
+    guard.record_run(time.time() - t_data, 0, 0, 0, 0, 0)
     t0 = time.time()
     rec = L.train_variant('csa_fixed_rope', train_ids, val_batch, vocab, seed=0, steps=60, eval_every=30, eval_subset=16, log_every=30, val_bnd=vb)
     dt = time.time() - t0

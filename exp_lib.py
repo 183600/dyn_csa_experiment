@@ -1,5 +1,5 @@
 import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 import sys, subprocess
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
@@ -88,19 +88,24 @@ def _cut_merge_mask(want_cut_list, min_block, max_block, dtype=None, device=None
             keep[slot] = 1.0
     return _t.tensor(keep, dtype=dtype, device=device)
 
-def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_count=False):
+def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_count=False, return_honoured=False):
     if n == 0:
-        z = torch.empty(0, dtype=torch.long, device=device)
-        return (z, 0) if return_count else z
-    if n == 1:
-        z = torch.zeros(1, dtype=torch.long, device=device)
-        return (z, 1) if return_count else z
-    bids, _honoured = _segment(n, want_cut_list, min_block, max_block)
-    bids_t = torch.tensor(bids, dtype=torch.long, device=device)
-    bids_t = bids_t - bids_t.min()
+        base, cnt, hon = (torch.empty(0, dtype=torch.long, device=device), 0, {})
+    elif n == 1:
+        base, cnt, hon = (torch.zeros(1, dtype=torch.long, device=device), 1, {})
+    else:
+        bids, hon = _segment(n, want_cut_list, min_block, max_block)
+        bids_t = torch.tensor(bids, dtype=torch.long, device=device)
+        base = bids_t - bids_t.min()
+        cnt = int(bids[-1] - bids[0]) + 1
+    if not (return_count or return_honoured):
+        return base
+    out = [base]
     if return_count:
-        return (bids_t, int(bids[-1] - bids[0]) + 1)
-    return bids_t
+        out.append(cnt)
+    if return_honoured:
+        out.append(hon)
+    return tuple(out)
 
 def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=False):
     n = H.shape[0]
@@ -811,8 +816,8 @@ class HybridAttention(nn.Module):
             mask = causal_mask(T, x.device)
         logits.add_(mask)
         if self.sink is not None:
-            sculpt = self.sink.view(1, self.nh, 1, 1).expand(B, self.nh, T, 1)
-            attn = torch.softmax(torch.cat([sculpt, logits], -1), -1)[..., 1:]
+            lse = torch.logaddexp(self.sink.view(1, self.nh, 1, 1), torch.logsumexp(logits, dim=-1, keepdim=True))
+            attn = torch.exp(logits - lse)
         else:
             attn = torch.softmax(logits, -1)
         out = torch.einsum('bhnm,bmhd->bnhd', attn, v)
@@ -875,17 +880,21 @@ class HybridAttention(nn.Module):
             if gate.numel():
                 gate_bool = gate.detach() > _HALF
                 gate_list = gate_bool.cpu().tolist()
+            with torch.no_grad():
+                if gate_list is None:
+                    gate_list = (gate.detach() > _HALF).cpu().tolist()
+                bid, nblk, _honoured = blocks_from_cuts(T, gate_list, cfg.min_block, cfg.max_block, x.device, return_count=True, return_honoured=True)
             if gate.numel() and self.need_reg:
                 hard = gate_bool.to(gate.dtype)
-                _hon = _cut_merge_mask(gate_list, cfg.min_block, cfg.max_block, dtype=gate.dtype, device=gate.device)
+                _keep = [0.0] * len(gate_list)
+                for _slot in _honoured:
+                    if 0 <= _slot < len(_keep):
+                        _keep[_slot] = 1.0
+                _hon = torch.tensor(_keep, dtype=gate.dtype, device=gate.device)
                 _soft_honoured = gate * _hon
                 gate_mean = ((hard * _hon).sum() + _soft_honoured.sum() - _soft_honoured.detach().sum()) / T
             else:
                 gate_mean = torch.zeros((), device=x.device) if self.need_reg else None
-            with torch.no_grad():
-                if gate_list is None:
-                    gate_list = (gate.detach() > _HALF).cpu().tolist()
-                bid, nblk = blocks_from_cuts(T, gate_list, cfg.min_block, cfg.max_block, x.device, return_count=True)
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
             sim = cosine_similarity_consecutive(x)
             tau = causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
@@ -1612,18 +1621,24 @@ def eval_ppl(model, val_batch, device, chunk=64, eval_rows=None, eval_seed=0):
                 _rows = logits[_ri, _ci, :]
                 _tgts = ids[_ri, _ci + 1]
                 del _ri, _ci
+                nll += F.cross_entropy(_rows, _tgts, reduction='sum').double()
+                ntok += int(_tgts.numel())
+                del _rows, _tgts
             else:
-                _rows = logits[:, :_span, :].reshape(-1, logits.size(-1))
-                _tgts = ids[:, 1:].reshape(-1)
+                for _r0 in range(0, ids.shape[0], 8):
+                    _rows = logits[_r0:_r0 + 8, :_span, :].reshape(-1, logits.size(-1))
+                    _tgts = ids[_r0:_r0 + 8, 1:].reshape(-1)
+                    nll += F.cross_entropy(_rows, _tgts, reduction='sum').double()
+                    ntok += int(_tgts.numel())
+                    del _rows, _tgts
             del ids, logits
-            nll += F.cross_entropy(_rows, _tgts, reduction='sum').double()
-            ntok += int(_tgts.numel())
-            del _rows, _tgts
     finally:
         for _a, _prev in zip(need_reg_layers, need_reg_prior):
             _a.need_reg = _prev
         model.train(was_training)
-    return math.exp(nll.item() / max(ntok, 1))
+    if not ntok:
+        return float('nan')
+    return math.exp(nll.item() / ntok)
 
 def enable_block_stats(model, on):
     for blk in model.blocks:
@@ -1636,7 +1651,7 @@ def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None):
     P, G = (len(pred), len(gt))
     if P == 0 or G == 0:
         if provenance is not None:
-            provenance['bnd_rand_exact'] = True
+            provenance.setdefault('bnd_rand_exact', True)
         return (0.0, 0.0, 0.0, 0.0)
     hits, ghits = _greedy_match_counts(pred, gt, tol)
     prec, rec = (hits / P, ghits / G)
@@ -1648,7 +1663,7 @@ def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None):
     _approx = []
     rand_prec = _random_cut_precision(P, near, n_pos, tol, G, gt, approx_flag=_approx)
     if provenance is not None:
-        provenance['bnd_rand_exact'] = not _approx
+        provenance['bnd_rand_exact'] = provenance.get('bnd_rand_exact', True) and (not _approx)
     return (prec, rec, f1, rand_prec)
 
 def _mask_runs(near, n_pos, tol):
@@ -2067,9 +2082,10 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
         raise ValueError(f'compression_report: n_sample must be >= 1, got {n_sample!r}; the report is an average over the sequences it scores, so there is nothing to measure with no sequence scored')
     n_used = min(n_sample, val_batch.shape[0])
     with torch.no_grad():
-        ids = torch.from_numpy(val_batch[:n_used]).to(device)
-        _ = model(ids)
-        del ids
+        for _r0 in range(0, n_used, 16):
+            ids = torch.from_numpy(val_batch[_r0:_r0 + 16]).to(device)
+            _ = model(ids)
+            del ids
     for li, blk in enumerate(model.blocks):
         attn = blk.attn
         st = attn._stats
@@ -2708,15 +2724,18 @@ def _print_table(agg):
 def _print_pairs(summary):
     recs = {}
     _pair_amb = []
+    _amb = set()
     _legacy_ok = legacy_warm_tags(summary)
     for _k, r in summary.items():
         if not (isinstance(r, dict) and ppl_is_usable(r.get('ppl')) and ('seed' in r) and (not r.get('synthesized'))):
             continue
         rk = _record_identity(r, _k, _legacy_ok)
-        if rk is None:
+        if rk is None or rk in _amb:
             continue
         if rk in recs:
+            _amb.add(rk)
             _pair_amb.append(rk)
+            recs.pop(rk)
             continue
         recs[rk] = r
     _pair_skip = []
@@ -2908,7 +2927,9 @@ def run(cfg=None, seeds=None, guard=None, label=''):
         _mkey = 'default'
     else:
         _mkey = ','.join(sorted((str(_x) for _x in _mg)))
-    fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_wu{cfg.get('warmup', 50)}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_det{determinism_label()}_cs{CODE_SEMANTICS}'
+    if torch.cuda.is_available():
+        _pin_cuda_determinism()
+    fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_wu{cfg.get('warmup', 50)}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_det{determinism_label()}_cs{CODE_SEMANTICS}'
     ratios = {}
     dropped_truncations = []
     stale_dropped = []
