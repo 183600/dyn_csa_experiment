@@ -151,14 +151,53 @@ jobs:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           set +e
+          set -o pipefail
           BRANCH="${GITHUB_REF_NAME:-main}"
+          OUT=/tmp/oc_out.log
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
           PROMPT='确保代码没有影响实验结果的bug(修复所有的bug)，优化性能和显存占用(优化只要不会明显降低性能就可以做)，不要管之前修的bug，不要写修复了哪些bug，确保远程仓库里面没有实验结果和REPORTxx.md以及autodl_budgetxx.json，同时远程仓库docs目录只留design_notes.md，确保远程仓库里面没有性能、修复了哪些bug和显存占用的记录（注释里也没有）'
           ITER_TIMEOUT=10800   # 单次 opencode 最长 3 小时，防止 API 挂起卡死整个步骤
 
           i=0
           FAIL_COUNT=0
+          RATE_COUNT=0
           USE_NVIDIA=0
+
+          commit_and_push() {
+            git add -A || true
+            git commit -m "auto: iteration $1" || true
+            git pull --rebase origin "$BRANCH" || git rebase --abort || true
+            git push origin "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
+          }
+
+          # ---------- runner 收到外部终止信号(143)时，尽力保存未提交的改动 ----------
+          on_shutdown() {
+            echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
+            git add -A || true
+            if ! git diff --cached --quiet; then
+              git commit -m "auto: partial work saved on shutdown" || true
+              git pull --rebase origin "$BRANCH" || git rebase --abort || true
+              git push origin "HEAD:${BRANCH}" || true
+              echo "[trap] partial work committed & pushed"
+            else
+              echo "[trap] nothing to commit"
+            fi
+            exit 0
+          }
+          trap on_shutdown TERM INT
+
+          # ---------- 切换到备用端点（仍为 kimi-k3，只是走 NVIDIA 网关） ----------
+          switch_provider() {
+            if [ $USE_NVIDIA -eq 0 ]; then
+              echo "[info] 切换到 NVIDIA 备用端点 (moonshotai/kimi-k3)..."
+              cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
+              USE_NVIDIA=1
+              FAIL_COUNT=0
+              RATE_COUNT=0
+              return 0
+            fi
+            return 1
+          }
 
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             i=$((i+1))
@@ -172,19 +211,16 @@ jobs:
               break
             fi
 
-            echo "=========== opencode iteration #$i (provider=$([ $USE_NVIDIA -eq 1 ] && echo NVIDIA || echo Moonshot)) ==========="
+            echo "=========== opencode iteration #$i (provider=$([ $USE_NVIDIA -eq 1 ] && echo NVIDIA || echo Moonshot), model=kimi-k3) ==========="
 
-            timeout --kill-after=180 $ITER_TIMEOUT opencode run "$PROMPT"
+            timeout --kill-after=180 $ITER_TIMEOUT opencode run "$PROMPT" 2>&1 | tee "$OUT"
             EXIT_CODE=$?
 
             # ---------- 超时/被杀（124=timeout, 137=SIGKILL, 143=SIGTERM）：改动照样提交，保住进度 ----------
             if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ] || [ $EXIT_CODE -eq 143 ]; then
               FAIL_COUNT=$((FAIL_COUNT+1))
               echo "[warn] iteration $i 超时或被杀 (exit=$EXIT_CODE)，已完成的改动照常提交 (连续: $FAIL_COUNT)"
-              git add -A || true
-              git commit -m "auto: iteration $i (partial, killed)" || true
-              git pull --rebase origin "$BRANCH" || git rebase --abort || true
-              git push origin "HEAD:${BRANCH}" || echo "[warn] push #$i failed"
+              commit_and_push "$i (partial, killed)"
               if [ $FAIL_COUNT -ge 3 ]; then
                 echo "连续 3 次超时/被杀，结束本轮，等待定时任务唤醒"
                 break
@@ -194,15 +230,29 @@ jobs:
             fi
 
             if [ $EXIT_CODE -ne 0 ]; then
+              # ---------- 429 限流：opencode 的报错固定打印在输出末尾，退避后用同一端点重试 ----------
+              if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
+                RATE_COUNT=$((RATE_COUNT+1))
+                echo "[warn] iteration $i 命中 API 限流(429) (连续: $RATE_COUNT)，退避 180 秒后用同一端点重试"
+                if [ $RATE_COUNT -ge 8 ]; then
+                  echo "[info] 连续 8 次限流，当前端点配额可能耗尽"
+                  if switch_provider; then
+                    sleep 30
+                    continue
+                  fi
+                  echo "备用端点也持续限流，结束本轮，等待定时任务唤醒"
+                  break
+                fi
+                sleep 180
+                continue
+              fi
+
+              RATE_COUNT=0
               FAIL_COUNT=$((FAIL_COUNT+1))
               echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE (连续失败: $FAIL_COUNT)"
 
-              # ---------- 首次失败：认为 Moonshot API 不可用，切换到 NVIDIA 备用配置 ----------
-              if [ $USE_NVIDIA -eq 0 ]; then
-                echo "[info] Moonshot API 调用失败，切换到 NVIDIA 备用配置..."
-                cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
-                USE_NVIDIA=1
-                FAIL_COUNT=0
+              # ---------- 首次失败：认为当前 API 不可用，切换到 NVIDIA 备用配置 ----------
+              if switch_provider; then
                 sleep 10
                 continue
               fi
@@ -217,12 +267,10 @@ jobs:
               continue
             else
               FAIL_COUNT=0
+              RATE_COUNT=0
             fi
 
-            git add -A || true
-            git commit -m "auto: iteration $i" || true
-            git pull --rebase origin "$BRANCH" || git rebase --abort || true
-            git push origin "HEAD:${BRANCH}" || echo "[warn] push #$i failed"
+            commit_and_push "$i"
 
             sleep 5
           done
