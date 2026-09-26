@@ -20,7 +20,7 @@ needed to reproduce the results on a machine of your own.
 | `run_gapfill.py` | **the v6 driver**: the minimum-publishable supplementary runs, resumable, budget-guarded, pushes after every phase, auto-shuts the AutoDL instance down |
 | `v7_supp.py` | **the v7 driver**: reviewer-response supplementary suite — P0R RoPE+QK-norm, P0W dense-warmup, P0E 40k-step long run, P2S scale re-seeding, P1L length extrapolation, P1T topk sweep |
 | `v8_supp.py` | **the v8 driver**: P1S (scale panel seed completion to 4 seeds) and P2R (RoPE+QK-norm 20k-step long run) |
-| `v9_supp.py` | **the v9 driver**: P2T (the seq-2048 topk sweep at `batch_size=1` with per-block gradient checkpointing) and P2S3 (third seed for the RoPE 20k run) |
+| `v9_supp.py` | **the v9 driver**: P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
 | `v10_supp.py` | **the v10 driver**: P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
 | `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
 | `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk, never hard-coded) |
@@ -28,7 +28,7 @@ needed to reproduce the results on a machine of your own.
 | `mon3.py` | tiny AutoDL progress watcher used by the drivers |
 | `prep_cache.py` | one-off helper that builds `wt103_cache/*.npy` from the raw WikiText-103 dump |
 | `bonus_watcher.sh`, `driver_v7.sh` | shell wrappers used on the AutoDL box (budget watch / v7 launch) |
-| `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the transient-bound contracts that keep attention row-chunking equivalent to its unbatched form |
+| `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
 
 > **`exp_lib.py` 是唯一的代码来源（source of truth），直接改它。**
 
@@ -148,9 +148,6 @@ python v7_supp.py phase P1L   # length extrapolation
 python v7_supp.py phase P1T   # seq-2048 topk sweep
 python build_report.py        # regenerate REPORT_v7.md from artifacts (zero GPU)
 ```
-
-`gathered_attention` and `_block_token_attn` shrink their row chunk to fit a
-per-layer transient budget (`_attn_transient_budget`).
 
 The CostGuard (`exp_lib.py`, SECTION 8.5) books GPU time to
 `autodl_budget_state.json`, refuses to start runs that would pass
