@@ -154,7 +154,7 @@ jobs:
           BRANCH="${GITHUB_REF_NAME:-main}"
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
           PROMPT='确保代码没有影响实验结果的bug(修复所有的bug)，优化性能和显存占用(优化只要不会明显降低性能就可以做)，不要管之前修的bug，不要写修复了哪些bug，确保远程仓库里面没有实验结果和REPORTxx.md以及autodl_budgetxx.json，同时远程仓库docs目录只留design_notes.md，确保远程仓库里面没有性能、修复了哪些bug和显存占用的记录（注释里也没有）'
-          ITER_TIMEOUT=1800    # 单次 opencode 最长 30 分钟，防止 API 挂起卡死整个步骤
+          ITER_TIMEOUT=10800   # 单次 opencode 最长 3 小时，防止 API 挂起卡死整个步骤
 
           i=0
           FAIL_COUNT=0
