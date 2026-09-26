@@ -67,20 +67,6 @@ def _segment(n, want_cut_list, min_block, max_block):
             pending_cut = False
             pending_slot = -1
         bids[t] = cur
-    if cur > 0 and cur_len < min_block:
-        prev_len = 0
-        for t in range(n - cur_len - 1, -1, -1):
-            if bids[t] == cur - 1:
-                prev_len += 1
-            else:
-                break
-        need = min_block - cur_len
-        if prev_len - need >= min_block and cur_len + need <= max_block:
-            for t in range(n - cur_len - need, n - cur_len):
-                bids[t] = cur
-        elif prev_len + cur_len <= max_block:
-            for t in range(n - cur_len, n):
-                bids[t] = cur - 1
     honoured = {}
     for ci in range(n_cuts):
         if want_cut_list[ci] and bids[ci + 1] != bids[ci]:
