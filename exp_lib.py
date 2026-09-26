@@ -533,19 +533,10 @@ class _SinkWiden(torch.autograd.Function):
     def backward(ctx, gz):
         return (gz[..., 1:], gz[..., 0].sum(dim=0))
 
-_SINK_FINITE = {}
-
 def _sink_all_finite(sink_logits):
     if sink_logits is None:
         return True
-    key = (id(sink_logits), int(sink_logits._version))
-    v = _SINK_FINITE.get(key)
-    if v is None:
-        v = bool(torch.isfinite(sink_logits).all())
-        if len(_SINK_FINITE) > 256:
-            _SINK_FINITE.clear()
-        _SINK_FINITE[key] = v
-    return v
+    return bool(torch.isfinite(sink_logits).all())
 
 def sink_softmax(logits, sink_logits, dim=-1):
     _diff = torch.is_grad_enabled() and (getattr(logits, 'requires_grad', False) or (sink_logits is not None and getattr(sink_logits, 'requires_grad', False)))

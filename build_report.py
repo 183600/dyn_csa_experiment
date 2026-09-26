@@ -228,9 +228,9 @@ def sec_p0r():
         _w_rope = '领先' if g_rope < 0 else '落后'
         _d_abs_t = ('改善' if d_abs > 0 else '变差') + f' **{abs(d_abs):.2f}**'
         _d_sp_t = ('改善' if d_sp > 0 else '变差') + f' **{abs(d_sp):.2f}**'
-        lines += [f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL（参数对齐 `full_matched` 时{_w_absm} **{abs(g_abs_m):.2f}**；两者相差 **{abs(g_abs) - abs(g_abs_m):+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(ab['csa_fixed'], ab.get('full_matched'))}。' if _has_mt else f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该差距因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` {_w_rope} `full_rope` **{abs(g_rope):.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense {_d_abs_t}、sparse {_d_sp_t}（注：`full_rope` 与 `csa_fixed_rope` 参数不同，此对比同时含容量效应）。', '']
+        lines += [f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL（参数对齐 `full_matched` 时{_w_absm} **{abs(g_abs_m):.2f}**；两者相差 **{g_abs - g_abs_m:+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(ab['csa_fixed'], ab.get('full_matched'))}。' if _has_mt else f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该差距因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` {_w_rope} `full_rope` **{abs(g_rope):.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense {_d_abs_t}、sparse {_d_sp_t}（注：`full_rope` 与 `csa_fixed_rope` 参数不同，此对比同时含容量效应）。', '']
         if rope_unmatched and rope_is_defect and _has_mt:
-            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线。`full_rope` 由 v7 P0R 的 plain 路径训练，当时 `matched` 集合没有传进去，因此它的 MLP 停在标准 ratio 4（{_params_m(rope['full_rope'])}），而 `csa_fixed_rope` 保持全宽（{_params_m(rope['csa_fixed_rope'])}），相差 {100 * (param_gap(rope['csa_fixed_rope'], rope['full_rope']) or 0):.1f}%。对照 absPE 面板，同样的容量差异会贡献约 {abs(g_abs) - abs(g_abs_m):.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
+            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线。`full_rope` 由 v7 P0R 的 plain 路径训练，当时 `matched` 集合没有传进去，因此它的 MLP 停在标准 ratio 4（{_params_m(rope['full_rope'])}），而 `csa_fixed_rope` 保持全宽（{_params_m(rope['csa_fixed_rope'])}），相差 {100 * (param_gap(rope['csa_fixed_rope'], rope['full_rope']) or 0):.1f}%。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
         _arms_gain = d_abs > 0 and d_sp > 0
         _gain_txt = 'RoPE+QK-norm 对两臂都有真实增益，值得保留为新默认' if _arms_gain else f'RoPE+QK-norm 并未对两臂都带来增益（dense {_d_abs_t}、sparse {_d_sp_t}）'
         if _has_mt:
@@ -441,7 +441,7 @@ def sec_p1t():
         lines += ['', '**未完成的扫描点（如实记录）**：', '']
         for v in sorted(failed):
             seeds = ','.join((str(x) for x in sorted(failed[v], key=lambda x: (x is None, -1 if x is None else x))))
-            lines.append(f'- `{v}`（seed {seeds}）：topk≥128 的扫描点在本配置与预算约束下未完成，扫描被截断。')
+            lines.append(f'- `{v}`（seed {seeds}）：该扫描点在本配置与预算约束下未完成（记录为 error），扫描被截断。')
         lines.append('')
     ks = [8, 32, 128, 512]
     rows_k = []
@@ -500,10 +500,15 @@ def sec_p1t():
         _pair = paired_row(_recs.get('csa_fixed_topk8', {}), _recs.get('csa_fixed_topk32', {}))
         if _pair is not None:
             _kept, _dl, _st = _pair
-            lines.append(f'2. 在已完成的两个选择率点上：{_dir}；配对的精确符号翻转检验（n={_st['n']}，p={_st['p_exact_signflip']:.3f}，Δ(topk8−topk32) mean={_st['mean']:+.2f} PPL）显示该差距仍在噪声量级内，**不构成显著性主张**，只作方向性参考。')
+            _sig_txt = '显示该差距**达到 p<0.05**，按显著性读法处理。' if _st['p_exact_signflip'] < 0.05 else '显示该差距仍在噪声量级内，**不构成显著性主张**，只作方向性参考。'
+            lines.append(f'2. 在已完成的两个选择率点上：{_dir}；配对的精确符号翻转检验（n={_st['n']}，p={_st['p_exact_signflip']:.3f}，Δ(topk8−topk32) mean={_st['mean']:+.2f} PPL）{_sig_txt}')
         else:
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；面板上没有可通过 pairing 门禁的同配置种子对，topk8 与 topk32 之差（{_gap:.2f} PPL）无法配对检验，只作方向性参考。')
-        lines.append('3. topk≥128 的点未完成（见上），「甜点位置」的完整刻画需要后续在完整扫描面板补齐。')
+        if failed:
+            _miss = '、'.join((f'`{v}`' for v in sorted(failed)))
+            lines.append(f'3. 未完成的点（{_miss}，见上）需后续在完整扫描面板补齐，「甜点位置」的完整刻画以补齐后的面板为准。')
+        else:
+            lines.append('3. 全部扫描点均已完成，「甜点位置」以本面板数据为准。')
     return '\n'.join(lines) + '\n'
 
 def sec_p1l():
@@ -591,6 +596,15 @@ def sec_p1l():
     lines.append('')
     return '\n'.join(lines) + '\n'
 
+def _agg_entry(d, v):
+    if v in d:
+        return d[v]
+    cands = [(k, e) for k, e in d.items() if isinstance(e, dict) and k.startswith(f'{v}@cfg')]
+    if not cands:
+        return None
+    cands.sort(key=lambda kv: -(_int_or(kv[1].get('n_seeds'), 0)))
+    return cands[0][1]
+
 def _params_m(r):
     p = r.get('params') if isinstance(r, dict) else None
     if not isinstance(p, (int, float)) or isinstance(p, bool) or (not p):
@@ -622,9 +636,9 @@ def sec_p2s():
     if rows:
         lines += ['', '**配对检验（同 seed 配对，精确符号翻转）**：', '', '| 比较 | n (共同 seeds) | Δ (a−b) mean±std | p (exact) | params |', '|---|---|---|---|---|']
         for a, b, common, st in rows:
-            lines.append(f'| `{a}` − `{b}` | {len(common)} | {st['mean']:+.2f} ± {st['std']:.2f} | {st['p_exact_signflip']:.3f} | {unmatched_tag(_agg.get(a), _agg.get(b)) or '✓'} |')
+            lines.append(f'| `{a}` − `{b}` | {len(common)} | {st['mean']:+.2f} ± {st['std']:.2f} | {st['p_exact_signflip']:.3f} | {unmatched_tag(_agg_entry(_agg, a), _agg_entry(_agg, b)) or '✓'} |')
         main = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full'), None)
-        _mt = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full_matched'), None) if _agg.get('full_matched') else None
+        _mt = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full_matched'), None) if _agg_entry(_agg, 'full_matched') is not None else None
         _mt_txt = ''
         if _mt:
             _mt_txt = f' 参数对齐的 `csa_fixed − full_matched` 为 **{_mt[3]['mean']:+.2f} PPL**（p={_mt[3]['p_exact_signflip']:.3f}），该配对的容量已受控，机制的读数以它为准。'
@@ -632,7 +646,7 @@ def sec_p2s():
         if _base:
             _ba, _bb, common, st = _base
             _which = '`csa_fixed − full_matched`（参数对齐）' if _mt else '`csa_fixed − full`（未做容量匹配）'
-            _tag = unmatched_tag(_agg.get(_ba), _agg.get(_bb)) if _mt else unmatched_tag(_agg.get('csa_fixed'), _agg.get('full'))
+            _tag = unmatched_tag(_agg_entry(_agg, _ba), _agg_entry(_agg, _bb)) if _mt else unmatched_tag(_agg_entry(_agg, 'csa_fixed'), _agg_entry(_agg, 'full'))
             if st['mean'] > 0:
                 concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：短训练下的 sparse 早期优势在 d=384 / 8 层 / seq 1024 的规模上**已经消失并反转为劣势**——规模越大，dense 的容量红利显现越早，与 20k/40k 长跑的「渐近线反转」同一方向。{_tag or '✓'}' + _mt_txt
             else:

@@ -149,8 +149,7 @@ python build_report.py        # regenerate REPORT_v7.md from artifacts (zero GPU
 ```
 
 `gathered_attention` and `_block_token_attn` shrink their row chunk to fit a
-per-layer transient budget (`_attn_transient_budget`), which is what lets the
-seq-2048 topk sweep complete on a single accelerator card.
+per-layer transient budget (`_attn_transient_budget`).
 
 The CostGuard (`exp_lib.py`, SECTION 8.5) books GPU time to
 `autodl_budget_state.json`, refuses to start runs that would pass
