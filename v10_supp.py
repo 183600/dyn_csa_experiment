@@ -76,7 +76,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=
                 if k > 0:
                     rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
                     pos = rng.choice(n_far, size=k, replace=False)
-                    ids[pos] = (ids[pos] + rng.integers(1, vocab, size=k)) % vocab
+                    ids[pos] = rng.integers(0, vocab, size=k)
                 _row = ids
                 if row_cache is not None:
                     row_cache[_rk] = _row
@@ -113,7 +113,7 @@ def _cell_ppl(nll_sum, n_tok):
     return math.exp(total / nt)
 
 def _probe_fingerprint(cfg):
-    return {'n_seq': int(cfg['n_seq']), 'chunk': int(cfg['chunk']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'stat': 'ppl_pooled_nll_v3'}
+    return {'n_seq': int(cfg['n_seq']), 'chunk': int(cfg['chunk']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'stat': 'ppl_pooled_nll_v4'}
 
 def _probe_params_current(rec, fp):
     return isinstance(rec, dict) and rec.get('probe_params') == fp
@@ -179,6 +179,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
             if not _todo:
                 del d
                 continue
+            model = None
             for arm in cfg['arms']:
                 if not _arm_of(v, arm):
                     continue
@@ -191,17 +192,18 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 cells = [(Ln, rho) for Ln, rho in _defs if not (L.result_is_current(summary.get(_cell_key(Ln, rho)), V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((summary.get(_cell_key(Ln, rho)) or {}).get('ppl_mean')) and _probe_params_current(summary.get(_cell_key(Ln, rho)), _fp))]
                 if not cells:
                     continue
-                cfgs = []
-                for c in d['cfg']:
-                    c2 = copy.copy(c)
-                    if arm == 'randidx':
-                        c2.indexer_mode = 'random'
-                    elif arm == 'allblocks':
-                        c2.index_topk = 10 ** 6
-                    cfgs.append(c2)
-                model = L.SmallGPT(_vocab_ck, 256, 6, 8, 32, d.get('train_len', 512), cfgs, mlp_ratio=d['mlp_ratio']).to(DEVICE)
-                model.load_state_dict(d['sd'])
-                model.eval()
+                if model is None:
+                    _arch = (int(d.get('d', 256)), int(d.get('n_layers', 6)), int(d.get('n_heads', 8)), int(d.get('d_head', 32)))
+                    if _arch != (256, 6, 8, 32):
+                        print(f"[p3mp] REFUSE {v} s{seed}: checkpoint architecture {_arch} differs from the recipe this probe was validated against (256, 6, 8, 32) — not running the probe on unverified weights")
+                        break
+                    model = L.SmallGPT(_vocab_ck, *_arch, d.get('train_len', 512), [copy.copy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
+                    model.load_state_dict(d['sd'])
+                    model.eval()
+                for blk, c0 in zip(model.blocks, d['cfg']):
+                    ac = blk.attn.cfg
+                    ac.indexer_mode = 'random' if arm == 'randidx' else getattr(c0, 'indexer_mode', 'learned')
+                    ac.index_topk = 10 ** 6 if arm == 'allblocks' else getattr(c0, 'index_topk', 32)
                 t0 = time.time()
                 for Ln, rho in cells:
                     key = _cell_key(Ln, rho)
@@ -213,6 +215,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                     L.atomic_write_json(spath, summary, indent=1)
                 if guard is not None:
                     guard.record_run(time.time() - t0, 0, 0, 0, 0, 0)
+            if model is not None:
                 del model
                 gc.collect()
                 if DEVICE.type == 'cuda':

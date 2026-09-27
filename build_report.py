@@ -152,15 +152,6 @@ def per_seed_records(outdir):
             _slot[_sd] = r
     return dict(out)
 
-def _first_wins_by_seed(rows, label):
-    out = {}
-    for p, _s, _m, sd in rows:
-        if sd in out:
-            print(f'[report] ambiguous seed {sd} in {label}: two measurable records found; keeping the FIRST for pairing')
-            continue
-        out[sd] = p
-    return out
-
 def _pair_reason(ra, rb):
     fa, fb = (ra.get('run_cfg'), rb.get('run_cfg'))
     if fa is None or fb is None:
@@ -211,7 +202,10 @@ def sec_p0r():
     lines = ['## P0-3 位置编码错配是否为混淆项？（RoPE + QK-RMSNorm 对照）', '', '**评审论断**：论文用 partial RoPE（末 64 维）+ 输出侧反向 RoPE(pos=−i) + core attention 前 Q/KV RMSNorm；仓库用 `nn.Embedding(max_seq,d)` 学习式绝对位置编码、无 QK-norm。怀疑 PE 错配造成了 sparse 落后。', '', '**做法**：新增 `*_rope` 变体族，seed 0/1/2 × 1500 步 × seq 512，其余训练配置与 absPE 面板完全一致。', '', '| 变体 | absPE (v3_1500) | RoPE+QKnorm (v7) | Δ(RoPE−abs) | params(abs/rope) |', '|---|---|---|---|---|']
     for a, b in pairs:
         if a in ab and b in rope:
-            pa, pb = (ab[a]['ppl_mean'], rope[b]['ppl_mean'])
+            pa, pb = (_finite_or_none(ab[a].get('ppl_mean')), _finite_or_none(rope[b].get('ppl_mean')))
+            if pa is None or pb is None:
+                print(f'[report] sec_p0r: `{a}`/`{b}` lacks a finite ppl_mean — row omitted rather than printed as n/a arithmetic')
+                continue
             lines.append(f'| `{a}` | {fm(pa)} {sp(ab[a].get('ppl_std'))} | {fm(pb)} {sp(rope[b].get('ppl_std'))} | **{pb - pa:+.2f}** | {_params_m(ab[a])} / {_params_m(rope[b])} |')
     lines += ['', '**组间差距（决定评审论点是否成立）**：', '']
     if 'csa_fixed' in ab and 'csa_fixed_rope' in rope and ('full_rope' in rope) and ('full' in ab):
@@ -298,16 +292,33 @@ def sec_p0w():
                     vals = curves[_v, w].get(st)
                     cells.append(f'{sum(vals) / len(vals):.1f}' if vals else '—')
                 lines.append(f'| {st} | ' + ' | '.join(cells) + ' |')
+        rec_by_s = collections.defaultdict(dict)
+        for _k, _r in s.items():
+            if not (isinstance(_r, dict) and _measurable(_r)):
+                continue
+            _sd = _int_or(_r.get('seed'), -1)
+            if _sd < 0:
+                continue
+            rec_by_s[_r.get('variant', '?'), _int_or(_r.get('warm_steps'), -1)].setdefault(_sd, _r)
         _conc = ['', '**结论**：']
         _parts = []
         _ds = []
         for v, w in sorted(grp):
             if v != 'csa_fixed' or w == 0:
                 continue
-            _wm = _first_wins_by_seed(grp[v, w], f'{v} w={w}')
-            _bm = _first_wins_by_seed(base, f'{v} w=0 (base)')
-            _shared = sorted(set(_wm) & set(_bm), key=lambda x: (x is None, 0 if x is None else x))
-            _dd = [_wm[sd] - _bm[sd] for sd in _shared]
+            _wm = rec_by_s.get((v, w), {})
+            _bm = rec_by_s.get(('csa_fixed', 0), {})
+            _shared = sorted(set(_wm) & set(_bm))
+            _dd = []
+            _gated = 0
+            for sd in _shared:
+                reason = _pair_reason(_wm[sd], _bm[sd])
+                if reason:
+                    _gated += 1
+                    continue
+                _dd.append(_wm[sd]['ppl'] - _bm[sd]['ppl'])
+            if _gated:
+                print(f'[report] sec_p0w `{v}` warm={w}: {_gated}/{len(_shared)} seed(s) NOT paired (run_cfg/budget gate); excluded from the sign-flip test')
             _st = exact_signflip(_dd) if _dd else None
             if _st is None:
                 continue
@@ -518,7 +529,7 @@ def sec_p1l():
     recs = [r for r in s.values() if isinstance(r, dict) and 'by_len' in r and (not r.get('synthesized')) and any((isinstance(c, dict) and _ppl_ok(c.get('ppl')) for c in r['by_len'].values()))]
     if not recs:
         return '## P1 长上下文长度外推 — （无结果）\n\n'
-    lens = sorted({int(Ln) for r in recs for Ln in r['by_len']})
+    lens = sorted({int(Ln) for r in recs for Ln in r['by_len'] if isinstance(Ln, int) or (isinstance(Ln, str) and Ln.lstrip('-').isdigit())})
     variants = sorted({r['variant'] for r in recs})
     lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径、3 seeds），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、位置越界被 clamp——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
     per_v = {}
@@ -549,10 +560,10 @@ def sec_p1l():
         ratio = sum(last_vals) / len(last_vals) / (sum(base_vals) / len(base_vals)) if base_vals and last_vals else None
         per_v[v] = ratio
         trunc_v[v] = trunc_flags
-        if _finite_or_none(ratio) and trunc_flags and trunc_flags[-1]:
+        if _finite_or_none(ratio) is not None and trunc_flags and trunc_flags[-1]:
             rt_txt = f'×{ratio:.2f}（长端为截断格，与基线不同 token 窗口，不可比）'
         else:
-            rt_txt = f'×{ratio:.2f}' if _finite_or_none(ratio) else '—'
+            rt_txt = f'×{ratio:.2f}' if _finite_or_none(ratio) is not None else '—'
         lines.append(f'| `{v}` | ' + ' | '.join(cells) + f' | {rt_txt} |')
     _any_trunc = any((any(f) for f in trunc_v.values()))
     if _any_trunc:
@@ -560,7 +571,7 @@ def sec_p1l():
     if per_v:
         lines += ['', '**读法（相对退化，越低越好）**：', '']
         for v, rt in sorted(per_v.items(), key=lambda kv: kv[1] if _finite_or_none(kv[1]) is not None else 1000000000.0):
-            if not _finite_or_none(rt):
+            if _finite_or_none(rt) is None:
                 continue
             if trunc_v.get(v) and trunc_v[v][-1]:
                 lines.append(f'- `{v}`：**不适用** —— 长端截断格覆盖的是另一段文本的最后 `max_pos` 个 token，与基线格不是同一段文本，读数 ×{rt:.2f} 是跨文本窗口的比值，对长度外推没有信息量。')

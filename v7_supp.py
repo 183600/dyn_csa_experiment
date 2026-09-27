@@ -985,7 +985,7 @@ def run_niah_phase(payload, guard=None, label=''):
                     if guard is not None:
                         guard.record_run(time.time() - t0, step, 256, 6, 512, 12)
                     continue
-                torch.save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'params': L.count_params(model)}, ck)
+                torch.save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'params': L.count_params(model)}, ck)
                 if guard is not None:
                     guard.record_run(time.time() - t0, n_steps, 256, 6, 512, 12)
                 del model, opt
@@ -1049,7 +1049,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                                 torch.cuda.empty_cache()
                             continue
                         raise
-                    nll += float(F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), _sub[:, 1:].reshape(-1), reduction='none').double().sum())
+                    nll += float(F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), _sub[:, 1:].reshape(-1), reduction='sum').double())
                     ntok += int(_sub[:, 1:].numel())
                     del logits
                     _r += _chunk
@@ -1130,7 +1130,7 @@ def run_lenphase(payload, guard=None, label=''):
                     continue
                 model = _tr.pop('_model')
                 try:
-                    torch.save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model)}, ck)
+                    torch.save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model)}, ck)
                 finally:
                     pass
                 if guard is not None:

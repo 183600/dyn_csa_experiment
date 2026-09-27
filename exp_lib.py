@@ -657,6 +657,11 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         keep = None
         if sel_valid is not None:
             keep = sel_valid[s:e]
+        if ib.shape[1] > 1:
+            _dup_mm = ib[:, :, None] == ib[:, None, :]
+            _ddk = ~_dup_mm.tril(-1).any(-1)
+            keep = _ddk if keep is None else keep & _ddk
+        if keep is not None:
             sel_blk = sel_blk & keep
         win_valid = win_valid_all[s:e]
         both_idx = _both_idx_all[s:e]

@@ -66,10 +66,10 @@ def main():
                 if not isinstance(_r, dict):
                     continue
                 _ppl = _r.get('ppl')
-                if isinstance(_ppl, (int, float)) and (not isinstance(_ppl, bool)) and math.isfinite(_ppl) and (_ppl > 0) and (not _r.get('synthesized')):
-                    n += 1
-                elif _r.get('error'):
+                if _r.get('error'):
                     n_err += 1
+                elif isinstance(_ppl, (int, float)) and (not isinstance(_ppl, bool)) and math.isfinite(_ppl) and (_ppl > 0) and (not _r.get('synthesized')):
+                    n += 1
         tag = f'{n}/{exp}' if exp else f'{n}'
         if n_err:
             tag += f' (+{n_err} error)'

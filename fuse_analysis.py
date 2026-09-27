@@ -326,7 +326,7 @@ def main(argv=None):
             print(f'[fuse_analysis] NOTE: skipping len_mean curve of `{v}` — {e}')
             continue
         x = np.array(layer_idx(layers))
-        ax.errorbar(x, np.nanmean(Mm, axis=0), yerr=np.nanmean(Ms, axis=0), marker='o', ms=4, lw=1.6, color=color, label=v, alpha=0.9)
+        ax.errorbar(x, np.nanmean(Mm, axis=0), yerr=sample_std(Mm, axis=0), marker='o', ms=4, lw=1.6, color=color, label=v, alpha=0.9)
     ax.set_xticks(all_idx)
     ax.set_xticklabels([f'L{i}' for i in all_idx])
     ax.set_title('block length: mean ± std (dynamic layers only)')
