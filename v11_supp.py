@@ -247,10 +247,11 @@ def build_report(out='REPORT_v11.md'):
     n_xo = max(_xo_real.values(), default=0)
     n_xo_min = min(_xo_real.values(), default=0)
     _xo_all_max = all((n == n_xo for n in _xo_real.values())) if _xo_real else False
-    n384 = max((p['n'] for p in scale384.values()), default=0)
-    _n384_set = sorted({p['n'] for p in scale384.values()})
-    _n384_full = (scale384.get('full') or {}).get('n')
-    n384_ok = _n384_full is not None and _n384_full == n384 and (len(_n384_set) == 1)
+    _n384_arms = {v: (scale384.get(v) or {}).get('n') for v in ('csa_fixed', 'full')}
+    n384 = min((n for n in _n384_arms.values() if n is not None), default=0)
+    _n384_set = sorted({n for n in _n384_arms.values() if n is not None})
+    _n384_full = _n384_arms.get('full')
+    n384_ok = _n384_full is not None and _n384_arms.get('csa_fixed') == _n384_full and (len(_n384_set) == 1)
     _xo_hit = sum((1 for n in _xo_real.values() if n == n_xo))
     n_tree_min = n_pair_min
     floor_p = 2.0 / 2 ** n_contr_max if n_contr_max else float('nan')
@@ -510,7 +511,7 @@ def build_report(out='REPORT_v11.md'):
     A('| 路径 | 内容 |')
     A('|---|---|')
 
-    def _n_seeds_of(_outdir):
+    def _n_seeds_of(_outdir, _variants=None):
         try:
             _s = json.load(open(os.path.join(REPO, _outdir, 'summary.json'), encoding='utf-8'))
         except Exception:
@@ -518,12 +519,14 @@ def build_report(out='REPORT_v11.md'):
         _sd = {}
         for _r in _s.values():
             if isinstance(_r, dict) and 'seed' in _r and _r.get('variant') and L.ppl_is_usable(_r.get('ppl')) and (not _r.get('synthesized')):
+                if _variants is not None and _r['variant'] not in _variants:
+                    continue
                 _sd.setdefault(_r['variant'], set()).add(_r['seed'])
         _ns = [len(x) for x in _sd.values()]
         return (min(_ns), max(_ns)) if _ns else None
 
-    def _n_txt(_outdir, _target):
-        _n = _n_seeds_of(_outdir)
+    def _n_txt(_outdir, _target, _variants=None):
+        _n = _n_seeds_of(_outdir, _variants)
         if _n is None:
             return f'n=?→{_target}'
         if _n[0] == _n[1]:
@@ -532,7 +535,7 @@ def build_report(out='REPORT_v11.md'):
     A(f'| `results_v10_mech/` | P4MT 追加 seeds 3–5 权重与 by-length 行 + P4MP 探针 cell（`distractor.json`，实际 n={n_contr_max}） |')
     A(f'| `results_lm_v10_scale_s/` | P4S：d=128/4L 面板 {_n_txt('results_lm_v10_scale_s', 4)} |')
     A(f'| `results_lm_v10_scale_l/` | P4S：d=512/10L 面板 {_n_txt('results_lm_v10_scale_l', 4)} |')
-    A(f'| `results_lm_v5_scale/` | P4F：d=384 `csa_fixed`/`full` 臂 {_n_txt('results_lm_v5_scale', 4)} |')
+    A(f'| `results_lm_v5_scale/` | P4F：d=384 `csa_fixed`/`full` 臂 {_n_txt('results_lm_v5_scale', 4, ('csa_fixed', 'full'))} |')
     A(f'| `analysis_v11/stats.json` | n={n_contr_max} 探针对比、交叉定位（{_xo_txt}）、配对检验 |')
     A('| `autodl_budget_state_v11.json` | v11 CostGuard 台账 |')
     A('| `v11_supp.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
