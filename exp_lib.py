@@ -583,6 +583,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
     wv_all = win_valid
     _win_off = (win_idx + n_blk).to(torch.int32)
     _blk_rows = _arange_cache(n_blk, dev).to(torch.int32).unsqueeze(0)
+    _both_all = torch.cat([_blk_rows.expand(n, n_blk), _win_off], 1)
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
     _heads = q.shape[1] if q.dim() == 3 else 1
@@ -600,7 +601,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
     _MINL = torch.finfo(q.dtype).min
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
-        both_idx = torch.cat([_blk_rows.expand(e - s, n_blk), _win_off[s:e]], 1)
+        both_idx = _both_all[s:e]
         Kset = _take_2d(K, both_idx)
         Vset = _take_2d(V, both_idx)
         _wv = wv_all[s:e]
@@ -821,11 +822,12 @@ class HybridAttention(nn.Module):
         else:
             scale = 1.0 / math.sqrt(self.hd)
         if self.sink is None:
+            sdpa_kw = dict(scale=scale)
             if self.cfg.window > 0:
-                mask = causal_window_mask(T, self.cfg.window, x.device)
+                sdpa_kw['attn_mask'] = causal_window_mask(T, self.cfg.window, x.device)
             else:
-                mask = causal_mask(T, x.device)
-            out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask, scale=scale).transpose(1, 2)
+                sdpa_kw['is_causal'] = True
+            out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
             return self.W_o(out.reshape(B, T, self.nh * self.hd))
         logits = torch.einsum('bnhd,bmhd->bhnm', q, k)
         logits.mul_(scale)

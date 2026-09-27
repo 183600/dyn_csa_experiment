@@ -25,6 +25,7 @@ build/
 
 # 数据集 / 大文件缓存（可本地再生，禁止入库）
 wt103_cache/
+wt103_raw/
 *.npy
 *.npz
 *.arrow

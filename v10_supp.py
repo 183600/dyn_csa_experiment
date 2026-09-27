@@ -814,7 +814,7 @@ def run_full():
     guard = make_guard()
     guard.report()
     print(f'[v10] remaining ¥{guard.remaining_yuan():.2f} (cap ¥{guard.cap_yuan():.2f} @ ¥{guard.price:.2f}/h)')
-    git_push('v10: supplementary driver (P3M distractor-injection mechanism + P3S crossover scaling + P3T topk seeds 3/4)')
+    git_push('v10: supplementary driver (P3M distractor-injection mechanism + P3S crossover scaling + P3T topk seeds 2/3)')
     all_ok = True
     for pname, _kind, _payload, _seeds, est_h in PHASES:
         rem = guard.remaining_yuan()

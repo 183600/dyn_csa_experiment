@@ -29,7 +29,32 @@ def panel(name):
         _PANEL_CACHE[name] = load(name)
     return _PANEL_CACHE[name]
 VARIANTS = {'hybrid_csa_dyn': ('results_lm_v4_abl', 'hybrid dyn (no-fuse)', False), 'hybrid_csa_dyn_fuse': ('results_lm_v4_abl', 'hybrid dyn + fuse', True), 'csa_dyn_fuse': ('results_lm_v4_abl', 'csa dyn + fuse', True), 'csa_dynamic': ('results_lm_v3_1500', 'csa dyn (no-fuse)', False)}
-SEEDS = [0, 1, 2]
+SEEDS = []
+
+def _panel_seeds():
+    sets = []
+    for _v, (_pn, _lab, _fu) in VARIANTS.items():
+        _pnl = panel(_pn)
+        _sv = set()
+        for _k, _r in _pnl.items():
+            if not isinstance(_r, dict):
+                continue
+            if str(_r.get('variant', str(_k).split('::')[0])) != _v:
+                continue
+            if _r.get('synthesized') or not L.ppl_is_usable(_r.get('ppl')):
+                continue
+            _s = _r.get('seed')
+            if isinstance(_s, bool):
+                continue
+            try:
+                _sv.add(int(_s))
+            except (TypeError, ValueError):
+                continue
+        sets.append(_sv)
+    common = set.intersection(*sets) if sets else set()
+    if not common:
+        raise ValueError('fuse_analysis: no seed is measured in EVERY panel arm, so no honest paired analysis can be produced; fill the panels first')
+    return sorted(common)
 BND_KEYS = ['bnd_prec', 'bnd_rec', 'bnd_f1', 'bnd_rand', 'bnd_excess']
 LEN_KEYS = ['blocks', 'len_mean', 'len_std', 'len_max', 'frac_at_min', 'delta']
 
@@ -50,7 +75,7 @@ def rec(variant, seed):
     return r
 
 def layers_of(variant, dyn_only=True):
-    r = rec(variant, 0)
+    r = rec(variant, SEEDS[0])
     ks = [k for k in r['stats'] if k.startswith('L')]
     if dyn_only:
         ks = [k for k in ks if 'dyn' in k]
@@ -122,12 +147,14 @@ def main(argv=None):
             return 0
         raise SystemExit(f'fuse_analysis: unknown argument {a!r} (this driver takes none; try -h)')
     os.makedirs(OUT, exist_ok=True)
+    global SEEDS
+    SEEDS = _panel_seeds()
     report = {}
     stats_out = {}
     probe = {}
     lines = []
     lines.append('# fuse vs no-fuse — 零 GPU 边界统计对比（全部数字由落盘产物计算）\n')
-    lines.append('> 数据来源：`results_lm_v4_abl/summary.json`（1500 步 × 3 seeds，seq 512）与\n> `results_lm_v3_1500/summary.json`（同配置核心面板）。无权重、无 GPU，\n> 仅使用每条 run 记录的 `stats`（逐层边界对齐 + 块长统计）与 `ppl_history`。\n')
+    lines.append(f'> 数据来源：`results_lm_v4_abl/summary.json`（1500 步 × {len(SEEDS)} seeds，seq 512）与\n> `results_lm_v3_1500/summary.json`（同配置核心面板）。无权重、无 GPU，\n> 仅使用每条 run 记录的 `stats`（逐层边界对齐 + 块长统计）与 `ppl_history`。\n')
     lines.append('**容差说明（诚实记录）**：落盘的边界对齐只在 `tol=1` 下计算（`boundary_alignment(..., tol=1)`），逐 token 的切点位置未保存、模型权重未保存，因此**无法离线重算其它容差**。下文改用 precision / recall / 相对随机基线的超额（excess）分解来回答「F1 提升从哪来、是否真实」——这一分解对容差选择不敏感。\n')
     def _pair_cells_ok(a, b):
         try:
@@ -219,7 +246,7 @@ def main(argv=None):
             probe['x_p_ppl_csa'] = float(p_ppl) if p_ppl is not None else None
             probe['x_d_f1_guarded'] = _gate_ok
         report[tag] = True
-    lines.append('\n## 块长分布形状对比（逐层存储矩，n=3 seeds 平均）\n')
+    lines.append(f'\n## 块长分布形状对比（逐层存储矩，n={len(SEEDS)} seeds 平均）\n')
     lines.append('| 变体 | len_mean | len_std | len_max | frac_at_min(贴下限块占比) | blocks/seq | δ(gate) |')
     lines.append('|---|---|---|---|---|---|---|')
     _blk, _pgate_drop = ({}, [])
@@ -284,7 +311,7 @@ def main(argv=None):
         ax.set_yscale('log')
         ax.legend(fontsize=8)
         ax.grid(alpha=0.3, which='both')
-    fig.suptitle('fuse vs no-fuse: validation PPL trajectories (3 seeds, min–max band)', y=1.0)
+    fig.suptitle(f'fuse vs no-fuse: validation PPL trajectories ({len(SEEDS)} seeds, min–max band)', y=1.0)
     fig.tight_layout()
     fig.savefig(os.path.join(OUT, 'fuse_ppl_traj.png'), dpi=140, bbox_inches='tight')
     plt.close(fig)
