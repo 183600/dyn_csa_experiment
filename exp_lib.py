@@ -491,17 +491,19 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     if query_chunk is None:
         raise ValueError("lightning_indexer: query_chunk=None is not 'use the default'; pass the default (2048) explicitly or omit the argument")
     query_chunk = max(1, min(int(query_chunk), n))
-    scores = torch.empty(n, B, device=dev, dtype=H.dtype if random_select else qI.dtype)
+    chunks = []
     for s in range(0, n, query_chunk):
         e = min(s + query_chunk, n)
         if random_select:
             z = torch.sin(_ri[s:e] * 12.9898 + _jc) * 43758.5453
             z = (z - torch.floor(z)) * 2.0 - 1.0
-            scores[s:e] = z.to(sc_dtype)
+            chunks.append(z.to(H.dtype))
         else:
             raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI) * hd ** (-0.5)
             F.relu(raw, inplace=True)
-            scores[s:e] = torch.einsum('inb,ni->nb', raw, w_idx[s:e])
+            chunks.append(torch.einsum('inb,ni->nb', raw, w_idx[s:e]))
+    scores = chunks[0] if len(chunks) == 1 else torch.cat(chunks, 0)
+    del chunks
     out_dtype = scores.dtype
     with torch.no_grad():
         idx = _indexer_selection(scores, causal, k, out_valid=out_valid)
