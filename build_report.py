@@ -201,30 +201,36 @@ def sec_p0r():
     pairs = [('full', 'full_rope'), ('csa_fixed', 'csa_fixed_rope'), ('csa_dynamic', 'csa_dynamic_rope'), ('hybrid_fixed', 'hybrid_fixed_rope')]
     lines = ['## P0-3 位置编码错配是否为混淆项？（RoPE + QK-RMSNorm 对照）', '', '**评审论断**：论文用 partial RoPE（末 64 维）+ 输出侧反向 RoPE(pos=−i) + core attention 前 Q/KV RMSNorm；仓库用 `nn.Embedding(max_seq,d)` 学习式绝对位置编码、无 QK-norm。怀疑 PE 错配造成了 sparse 落后。', '', '**做法**：新增 `*_rope` 变体族，seed 0/1/2 × 1500 步 × seq 512，其余训练配置与 absPE 面板完全一致。', '', '| 变体 | absPE (v3_1500) | RoPE+QKnorm (v7) | Δ(RoPE−abs) | params(abs/rope) |', '|---|---|---|---|---|']
     for a, b in pairs:
-        if a in ab and b in rope:
-            pa, pb = (_finite_or_none(ab[a].get('ppl_mean')), _finite_or_none(rope[b].get('ppl_mean')))
+        ea, eb = (_agg_entry(ab, a), _agg_entry(rope, b))
+        if ea is not None and eb is not None:
+            pa, pb = (_finite_or_none(ea.get('ppl_mean')), _finite_or_none(eb.get('ppl_mean')))
             if pa is None or pb is None:
                 print(f'[report] sec_p0r: `{a}`/`{b}` lacks a finite ppl_mean — row omitted rather than printed as n/a arithmetic')
                 continue
-            lines.append(f'| `{a}` | {fm(pa)} {sp(ab[a].get('ppl_std'))} | {fm(pb)} {sp(rope[b].get('ppl_std'))} | **{pb - pa:+.2f}** | {_params_m(ab[a])} / {_params_m(rope[b])} |')
+            lines.append(f'| `{a}` | {fm(pa)} {sp(ea.get('ppl_std'))} | {fm(pb)} {sp(eb.get('ppl_std'))} | **{pb - pa:+.2f}** | {_params_m(ea)} / {_params_m(eb)} |')
+        else:
+            print(f'[report] sec_p0r: `{a}`/`{b}` not both present (config-split or absent) — row omitted')
     lines += ['', '**组间差距（决定评审论点是否成立）**：', '']
-    if 'csa_fixed' in ab and 'csa_fixed_rope' in rope and ('full_rope' in rope) and ('full' in ab):
-        g_abs = ab['csa_fixed']['ppl_mean'] - ab['full']['ppl_mean']
-        g_abs_m = ab['csa_fixed']['ppl_mean'] - ab.get('full_matched', {}).get('ppl_mean', float('nan'))
-        g_rope = rope['csa_fixed_rope']['ppl_mean'] - rope['full_rope']['ppl_mean']
-        d_abs = ab['full']['ppl_mean'] - rope['full_rope']['ppl_mean']
-        d_sp = ab['csa_fixed']['ppl_mean'] - rope['csa_fixed_rope']['ppl_mean']
-        _has_mt = 'full_matched' in ab and _finite_or_none(ab['full_matched'].get('ppl_mean')) is not None
-        rope_unmatched = unmatched_tag(rope['csa_fixed_rope'], rope['full_rope'])
-        rope_is_defect = gap_is_architecture(rope['csa_fixed_rope'], rope['full_rope']) is False
+    _cf, _fu = (_agg_entry(ab, 'csa_fixed'), _agg_entry(ab, 'full'))
+    _cf_r, _fu_r = (_agg_entry(rope, 'csa_fixed_rope'), _agg_entry(rope, 'full_rope'))
+    _mt = _agg_entry(ab, 'full_matched')
+    if _cf is not None and _cf_r is not None and (_fu_r is not None) and (_fu is not None):
+        g_abs = _cf['ppl_mean'] - _fu['ppl_mean']
+        g_abs_m = _cf['ppl_mean'] - (_mt or {}).get('ppl_mean', float('nan'))
+        g_rope = _cf_r['ppl_mean'] - _fu_r['ppl_mean']
+        d_abs = _fu['ppl_mean'] - _fu_r['ppl_mean']
+        d_sp = _cf['ppl_mean'] - _cf_r['ppl_mean']
+        _has_mt = _mt is not None and _finite_or_none(_mt.get('ppl_mean')) is not None
+        rope_unmatched = unmatched_tag(_cf_r, _fu_r)
+        rope_is_defect = gap_is_architecture(_cf_r, _fu_r) is False
         _w_abs = '领先' if g_abs < 0 else '落后'
         _w_absm = '领先' if g_abs_m < 0 else '落后'
         _w_rope = '领先' if g_rope < 0 else '落后'
         _d_abs_t = ('改善' if d_abs > 0 else '变差') + f' **{abs(d_abs):.2f}**'
         _d_sp_t = ('改善' if d_sp > 0 else '变差') + f' **{abs(d_sp):.2f}**'
-        lines += [f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL（参数对齐 `full_matched` 时{_w_absm} **{abs(g_abs_m):.2f}**；两者相差 **{g_abs - g_abs_m:+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(ab['csa_fixed'], ab.get('full_matched'))}。' if _has_mt else f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该差距因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` {_w_rope} `full_rope` **{abs(g_rope):.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense {_d_abs_t}、sparse {_d_sp_t}（注：`full_rope` 与 `csa_fixed_rope` 参数不同，此对比同时含容量效应）。', '']
+        lines += [f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL（参数对齐 `full_matched` 时{_w_absm} **{abs(g_abs_m):.2f}**；两者相差 **{g_abs - g_abs_m:+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(_cf, _mt)}。' if _has_mt else f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该差距因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` {_w_rope} `full_rope` **{abs(g_rope):.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense {_d_abs_t}、sparse {_d_sp_t}（注：`full_rope` 与 `csa_fixed_rope` 参数不同，此对比同时含容量效应）。', '']
         if rope_unmatched and rope_is_defect and _has_mt:
-            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线——落盘记录显示 `full_rope` 的 MLP 停在标准宽度（{_params_m(rope['full_rope'])}），而 `csa_fixed_rope` 保持全宽（{_params_m(rope['csa_fixed_rope'])}），相差 {100 * (param_gap(rope['csa_fixed_rope'], rope['full_rope']) or 0):.1f}%。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
+            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线——落盘记录显示 `full_rope` 的 MLP 停在标准宽度（{_params_m(_fu_r)}），而 `csa_fixed_rope` 保持全宽（{_params_m(_cf_r)}），相差 {100 * (param_gap(_cf_r, _fu_r) or 0):.1f}%。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
         _arms_gain = d_abs > 0 and d_sp > 0
         _gain_txt = 'RoPE+QK-norm 对两臂都有真实增益，值得保留为新默认' if _arms_gain else f'RoPE+QK-norm 并未对两臂都带来增益（dense {_d_abs_t}、sparse {_d_sp_t}）'
         if _has_mt:

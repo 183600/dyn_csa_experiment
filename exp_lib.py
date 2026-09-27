@@ -21,7 +21,7 @@ if _NEEDED:
         print(f'[setup] could not install {', '.join(_NEEDED)} ({type(_pip_err).__name__}: {_pip_err}) — continuing; a code path that actually needs them will raise ImportError')
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, math, os, re, time, json, random, csv, tempfile, itertools, bisect
+import gc, math, os, re, time, json, random, csv, tempfile, itertools, bisect, hashlib
 from math import comb
 from dataclasses import dataclass
 import numpy as np
@@ -621,6 +621,8 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
             soft_logits = torch.cat([soft_blk, soft_win], -1)
             soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
             attn = soft_attn + (attn - soft_attn.detach())
+        if sink_logits is None:
+            attn = attn * sel.any(-1)[:, None, None].to(attn.dtype)
         out[s:e] = torch.einsum('nhm,nmhd->nhd', attn, Vset)
     return out
 
@@ -673,6 +675,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             logits.mul_(scale)
             logits.masked_fill_(~valid[:, None, :], _MINL)
             attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
+            if sink_logits is None:
+                attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
             out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
             continue
         soft_g = soft[s:e].gather(1, ib)
@@ -696,6 +700,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         logits.masked_fill_(~valid[:, None, :], _MINL)
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
         attn = soft_attn + (attn - soft_attn.detach())
+        if sink_logits is None:
+            attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
         out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
     return out
 
@@ -814,6 +820,13 @@ class HybridAttention(nn.Module):
             scale = 1.0
         else:
             scale = 1.0 / math.sqrt(self.hd)
+        if self.sink is None:
+            if self.cfg.window > 0:
+                mask = causal_window_mask(T, self.cfg.window, x.device)
+            else:
+                mask = causal_mask(T, x.device)
+            out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask, scale=scale).transpose(1, 2)
+            return self.W_o(out.reshape(B, T, self.nh * self.hd))
         logits = torch.einsum('bnhd,bmhd->bhnm', q, k)
         logits.mul_(scale)
         if self.cfg.window > 0:
@@ -995,22 +1008,29 @@ class RMSNorm(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, d, hidden):
+    def __init__(self, d, hidden, init_gen=None):
         super().__init__()
         self.fc1 = nn.Linear(d, hidden, bias=False)
         self.fc2 = nn.Linear(hidden, d, bias=False)
+        # The shared-panel design expects identical MLP weights across variants;
+        # drawing them from `init_gen` keeps that true no matter how many RNG
+        # draws the attention branch consumed beforehand.
+        if init_gen is not None:
+            with torch.no_grad():
+                nn.init.kaiming_uniform_(self.fc1.weight, a=math.sqrt(5), generator=init_gen)
+                nn.init.kaiming_uniform_(self.fc2.weight, a=math.sqrt(5), generator=init_gen)
 
     def forward(self, x):
         return self.fc2(F.gelu(self.fc1(x)))
 
 class Block(nn.Module):
 
-    def __init__(self, d, n_heads, d_head, cfg: AttnCfg, mlp_ratio=4):
+    def __init__(self, d, n_heads, d_head, cfg: AttnCfg, mlp_ratio=4, mlp_gen=None):
         super().__init__()
         self.n1 = RMSNorm(d)
         self.attn = HybridAttention(d, n_heads, d_head, cfg)
         self.n2 = RMSNorm(d)
-        self.mlp = MLP(d, int(d * mlp_ratio))
+        self.mlp = MLP(d, int(d * mlp_ratio), init_gen=mlp_gen)
 
     def forward(self, x):
         x = x + self.attn(self.n1(x))
@@ -1033,12 +1053,13 @@ class SmallGPT(nn.Module):
         self.blocks = nn.ModuleList()
         for i, c in enumerate(layer_cfgs):
             torch.manual_seed(shared + 104729 * (i + 1))
-            self.blocks.append(self._make_block(d, n_heads, d_head, c, mlp_ratio))
+            mlp_g = torch.Generator().manual_seed(shared + 1299709 * (i + 1))
+            self.blocks.append(self._make_block(d, n_heads, d_head, c, mlp_ratio, mlp_g))
         self.norm = RMSNorm(d)
         self.max_seq = max_seq
 
-    def _make_block(self, d, n_heads, d_head, cfg, mlp_ratio):
-        return Block(d, n_heads, d_head, cfg, mlp_ratio)
+    def _make_block(self, d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=None):
+        return Block(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
 
     def forward(self, ids):
         T = ids.shape[1]
@@ -2136,7 +2157,9 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
     return report
 
 def is_no_decay(name):
-    return any((k in name for k in ('delta_logit', 'B_pos', 'W_aZ', 'W_bZ', 'sink', 'tok.weight', 'pos.weight', '.g', 'fuse_conv', 'q_norm', 'kv_norm')))
+    if any((k in name for k in ('delta_logit', 'B_pos', 'W_aZ', 'W_bZ', 'sink', 'tok.weight', 'pos.weight', 'fuse_conv', 'q_norm', 'kv_norm'))):
+        return True
+    return name == 'g' or name.endswith('.g')
 
 def is_delta_param(name):
     return 'delta_logit' in name
@@ -2186,7 +2209,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        _lbuf.append(loss.detach())
+        _lbuf.append(ce.detach())
         if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
             sub_ppl = eval_ppl(model, val_batch[:eval_subset], device)
             ppl_hist.append([step + 1, float(sub_ppl)])
@@ -2266,12 +2289,14 @@ class CostGuard:
     def cap_yuan(self):
         return self.total_yuan * self.margin
 
-    def record_run(self, seconds, steps_done, d, n_layers, seq_len, batch_size):
+    def record_run(self, seconds, steps_done, d, n_layers, seq_len, batch_size, calib_seconds=None):
         self.state['booked_seconds'] += float(seconds)
         self.state['runs'] += 1
         if steps_done and steps_done > 0:
+            if calib_seconds is None or not calib_seconds > 0:
+                calib_seconds = seconds
             f = self._wallclock_factor(d, n_layers, seq_len, batch_size)
-            sps = seconds / steps_done
+            sps = calib_seconds / steps_done
             norm = sps / f
             prev = self.state.get('norm_sps')
             self.state['norm_sps'] = norm if prev is None else 0.7 * prev + 0.3 * norm
@@ -2510,9 +2535,12 @@ def aggregate(summary):
         _subs = {}
         for r in recs:
             _subs.setdefault(_cfg_fp(r), []).append(r)
-        _ordered = sorted(_subs.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        # the `@cfg` suffix is a digest of the config fingerprint itself, so a
+        # resume pass cannot reshuffle which group a published key refers to
+        _ordered = sorted(_subs.items(), key=lambda kv: kv[0])
         print(f'[aggregate] WARNING: `{_agg_key(v, tag)}` holds records from {len(_ordered)} different run_cfg/budget/parameter-count configurations — pooling them would average incompatible runs (or two different MODEL WIDTHS, which are not two seeds of one model) and fake extra seeds.  Reported per configuration instead.')
-        for _i, (_fp, _rs) in enumerate(_ordered):
+        for _fp, _rs in _ordered:
+            _i = hashlib.sha1(_fp.encode('utf-8')).hexdigest()[:8]
             _split_groups.append(((v, tag, _i), _rs))
             _group_records[v, tag, _i] = _rs
     for (_v, _tag, _fp_idx), recs in _split_groups:
@@ -2616,9 +2644,9 @@ def aggregate(summary):
     def _baseline_for(tag, fp_idx, base_groups, recs):
         _want = _cfg_fp(recs[0]) if recs else None
         if _want is not None:
-            _cands = sorted(base_groups.items(), key=lambda kv: (kv[0][0] != tag, kv[0][1] is None, kv[0][1] if kv[0][1] is not None else -1))
+            _cands = sorted(base_groups.items(), key=lambda kv: (kv[0][0] != tag, kv[0][1] is None))
             for (_t_c, _i_c), _grp in _cands:
-                if _grp and _cfg_fp(_grp[0]) == _want:
+                if any((_cfg_fp(_r) == _want for _r in _grp)):
                     return (_grp, _t_c)
         for _cand in ((tag, fp_idx), (tag, None), ('', None)):
             if _cand in base_groups:
@@ -2635,7 +2663,7 @@ def aggregate(summary):
             continue
         if base_tag != tag:
             print(f'[aggregate] {key}: pairing against the UNTAGGED `full` baseline (no `full` run exists for protocol {tag or '(untagged)'})')
-        elif tag and ('', None) in _full_groups:
+        elif tag and any((_t == '' for _t, _i in _full_groups)):
             _base_amb.append(f'{key}: `full#{tag}` and `full` both present')
             continue
         ds, skipped = _paired(recs, base_recs)
@@ -2659,7 +2687,7 @@ def aggregate(summary):
             continue
         if base_tag != tag:
             print(f'[aggregate] {key}: pairing against the UNTAGGED `full_sw128_matched` baseline')
-        elif tag and ('', None) in _sw_groups:
+        elif tag and any((_t == '' for _t, _i in _sw_groups)):
             _base_amb.append(f'{key}: `full_sw128_matched#{tag}` and the untagged one both present')
             continue
         ds, skipped = _paired(recs, base_recs)
@@ -2937,7 +2965,9 @@ def run(cfg=None, seeds=None, guard=None, label=''):
         _mkey = ','.join(sorted((str(_x) for _x in _mg)))
     if torch.cuda.is_available():
         _pin_cuda_determinism()
-    fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg.get('warmup', 50)}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_det{determinism_label()}_cs{CODE_SEMANTICS}'
+    cfg.setdefault('warmup', 50)
+    cfg.setdefault('comp_lambda', 0.05)
+    fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_cs{CODE_SEMANTICS}'
     ratios = {}
     dropped_truncations = []
     stale_dropped = []
@@ -3000,11 +3030,13 @@ def run(cfg=None, seeds=None, guard=None, label=''):
                     print(f'[{key}] FAILED: {e}')
             if guard is not None:
                 steps_done = 0
+                calib_s = None
                 if isinstance(rec, dict) and rec.get('steps_done'):
                     steps_done = int(rec['steps_done'])
                 elif isinstance(rec, dict) and 'ppl' in rec:
                     steps_done = int(cfg['steps'])
-                guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'])
+                    calib_s = rec.get('train_time_s')
+                guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'], calib_seconds=calib_s)
             atomic_write_json(summary_path, summary)
             gc.collect()
             if DEVICE.type == 'cuda':

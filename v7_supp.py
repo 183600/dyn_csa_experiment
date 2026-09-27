@@ -344,12 +344,12 @@ class HybridAttentionRoPE(L.HybridAttention):
 
 class BlockRoPE(nn.Module):
 
-    def __init__(self, d, n_heads, d_head, cfg, mlp_ratio=4):
+    def __init__(self, d, n_heads, d_head, cfg, mlp_ratio=4, mlp_gen=None):
         super().__init__()
         self.n1 = L.RMSNorm(d)
         self.attn = HybridAttentionRoPE(d, n_heads, d_head, cfg)
         self.n2 = L.RMSNorm(d)
-        self.mlp = L.MLP(d, int(d * mlp_ratio))
+        self.mlp = L.MLP(d, int(d * mlp_ratio), init_gen=mlp_gen)
 
     def forward(self, x):
         x = x + self.attn(self.n1(x))
@@ -364,10 +364,10 @@ class SmallGPTRoPE(L.SmallGPT):
         if not self.use_abs_pe:
             del self.pos
 
-    def _make_block(self, d, n_heads, d_head, cfg, mlp_ratio):
+    def _make_block(self, d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=None):
         if getattr(cfg, 'rope', False):
-            return BlockRoPE(d, n_heads, d_head, cfg, mlp_ratio)
-        return L.Block(d, n_heads, d_head, cfg, mlp_ratio)
+            return BlockRoPE(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
+        return L.Block(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
 
     def forward(self, ids):
         T = ids.shape[1]
@@ -502,7 +502,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        _lbuf.append(loss.detach())
+        _lbuf.append(ce.detach())
         if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
             ppl_hist.append([step + 1, float(L.eval_ppl(model, val_batch[:eval_subset], device))])
         if log_every and (step % log_every == 0 or step == steps - 1):
@@ -556,7 +556,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
     ratios = {}
     for v in variants:
         if v not in ratios:
-            ratios[v] = L.variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'})
+            ratios[v] = L.variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}, ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
     _wu = cfg['warmup']
     _mkey = ','.join(sorted((str(_x) for _x in (set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}))))
     _fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_det{L.determinism_label()}_cs{CKPT_CODE}'
@@ -574,14 +574,14 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                         print(f'[skip] {key} already completed (resume)')
                         continue
                     _drop_msg = f'[resume] {key} carries no matching config fingerprint (stored {_cur.get('run_cfg')!r}) — re-running and overwriting so a config change can never be mistaken for a fresh result'
+                if _drop_msg is not None:
+                    print(_drop_msg)
+                    summary.pop(key, None)
                 if guard is not None:
                     est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
                     if not guard.can_start(est):
                         print(f'[budget] SKIP {key}: projected ¥{est / 3600 * guard.price:.2f} would pass cap ¥{guard.cap_yuan():.2f} (spent ¥{guard.spent_yuan():.2f})')
                         continue
-                if _drop_msg is not None:
-                    print(_drop_msg)
-                    summary.pop(key, None)
                 t_run = time.time()
                 _deadline = None
                 if guard is not None:
@@ -934,6 +934,9 @@ def run_niah_phase(payload, guard=None, label=''):
                         print(f'[niah] {v} s{seed}: checkpoint recipe mismatch (stored {_meta.get('recipe')!r}) — RETRAINING')
                     del _meta
             if stale or not os.path.exists(ck):
+                _ev_pref = f'{v}::seed{seed}::'
+                for _k in [_k for _k in summary if _k.startswith(_ev_pref)]:
+                    del summary[_k]
                 if guard is not None:
                     est = guard.estimate_seconds(n_steps, d=256, n_layers=6, seq_len=512, batch_size=12)
                     if not guard.can_start(est):
@@ -1100,10 +1103,9 @@ def run_lenphase(payload, guard=None, label=''):
                 del _meta
             if stale or not os.path.exists(ck):
                 key0 = f'{v}::seed{seed}'
-                if not L.result_is_current(summary.get(key0), CKPT_CODE, 'by_len'):
-                    if key0 in summary:
-                        print(f'[p1l] {v} s{seed}: cached eval predates CKPT_CODE={CKPT_CODE} — dropped, will re-evaluate the retrained weights')
-                        del summary[key0]
+                if summary.get(key0) is not None:
+                    print(f'[p1l] {v} s{seed}: weights are being retrained — dropping the cached eval, which belongs to the previous weights')
+                    del summary[key0]
                 if guard is not None:
                     est = guard.estimate_seconds(steps, d=256, n_layers=6, seq_len=train_len, batch_size=12)
                     if not guard.can_start(est):

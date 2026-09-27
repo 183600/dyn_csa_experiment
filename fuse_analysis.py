@@ -45,7 +45,7 @@ def rec(variant, seed):
     r = panel.get(key)
     if not isinstance(r, dict):
         raise KeyError(f'fuse_analysis: {key} is absent from {VARIANTS[variant][0]}/summary.json — the panel is incomplete; run that cell first (or restrict SEEDS to the ones present)')
-    if not L.ppl_is_usable(r.get('ppl')):
+    if r.get('synthesized') or not L.ppl_is_usable(r.get('ppl')):
         raise ValueError(f'fuse_analysis: {variant}::seed{seed} has no usable `ppl` ({r.get('ppl')!r}) — it is not a measurement, so it cannot be paired. Re-run that cell or exclude the variant.')
     return r
 
