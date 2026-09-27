@@ -1646,7 +1646,7 @@ def enable_block_stats(model, on):
         blk.attn._cuts = [] if on else None
 
 def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None):
-    gt = np.nonzero(gt_mask_row[:n - 1])[0] + 1
+    gt = np.nonzero(np.asarray(gt_mask_row)[:n - 1])[0] + 1
     pred = np.asarray(pred_cuts)
     P, G = (len(pred), len(gt))
     if P == 0 or G == 0:
