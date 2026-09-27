@@ -64,23 +64,36 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg):
     nll_sum = []
     n_tok = []
     n_ch = max(1, int(cfg['chunk']))
-    for i in range(0, n_seq, n_ch):
+    i = 0
+    while i < n_seq:
+        j = min(i + n_ch, n_seq)
         rows = []
-        for j in range(i, min(i + n_ch, n_seq)):
-            ids = np.asarray(val_ids[j, :eval_len + 1], dtype=np.int64).copy()
+        for jj in range(i, j):
+            ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
             if k > 0:
-                rng = np.random.default_rng((eval_len * 1000003 + j * 10007) * 1048576 + int(round(rho * 1048576)))
+                rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
                 pos = rng.choice(n_far, size=k, replace=False)
                 ids[pos] = (ids[pos] + rng.integers(1, vocab, size=k)) % vocab
             rows.append(ids)
         ids = torch.from_numpy(np.stack(rows)).to(DEVICE)
-        logits = model(ids[:, :-1])
+        try:
+            logits = model(ids[:, :-1])
+        except RuntimeError as _oe:
+            del ids
+            if 'out of memory' in str(_oe).lower() and n_ch > 1:
+                if DEVICE.type == 'cuda':
+                    torch.cuda.empty_cache()
+                n_ch = max(1, n_ch // 2)
+                print(f'[p3mp] eval device-memory exhaustion; retrying with chunk={n_ch}')
+                continue
+            raise
         tgt = ids[:, 1:]
         for _r in range(len(rows)):
             ce_r = F.cross_entropy(logits[_r, -target:], tgt[_r, -target:], reduction='none')
             nll_sum.append(float(ce_r.double().sum()))
             n_tok.append(int(ce_r.numel()))
         del ids, logits, tgt
+        i = j
     return (nll_sum, n_tok)
 
 def _cell_ppl(nll_sum, n_tok):
