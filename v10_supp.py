@@ -58,8 +58,10 @@ def _arm_of(variant, arm):
 def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=None):
     target = cfg['target']
     vocab = int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
-    far = eval_len - target
-    n_far = far
+    # corruptible context positions: every input position except the scored
+    # target zone (ids[-target:]); ids has eval_len+1 tokens, so the context
+    # spans ids[0 : eval_len + 1 - target]
+    n_far = eval_len + 1 - target
     k = int(round(rho * n_far))
     nll_sum = []
     n_tok = []
@@ -113,7 +115,7 @@ def _cell_ppl(nll_sum, n_tok):
     return math.exp(total / nt)
 
 def _probe_fingerprint(cfg):
-    return {'n_seq': int(cfg['n_seq']), 'chunk': int(cfg['chunk']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'stat': 'ppl_pooled_nll_v4'}
+    return {'n_seq': int(cfg['n_seq']), 'chunk': int(cfg['chunk']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'stat': 'ppl_pooled_nll_v5'}
 
 def _probe_params_current(rec, fp):
     return isinstance(rec, dict) and rec.get('probe_params') == fp
@@ -198,7 +200,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                         print(f"[p3mp] REFUSE {v} s{seed}: checkpoint architecture {_arch} differs from the recipe this probe was validated against (256, 6, 8, 32) — not running the probe on unverified weights")
                         break
                     model = L.SmallGPT(_vocab_ck, *_arch, d.get('train_len', 512), [copy.copy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
-                    model.load_state_dict(d['sd'])
+                    model.load_state_dict(d.pop('sd'))
                     model.eval()
                 for blk, c0 in zip(model.blocks, d['cfg']):
                     ac = blk.attn.cfg
@@ -270,7 +272,14 @@ def _hist_by_seed(outdir, variant):
     for _k, r in raw.items():
         if not (isinstance(r, dict) and r.get('variant') == variant and r.get('ppl_history')):
             continue
-        s = int(r['seed'])
+        _s_raw = r.get('seed')
+        if isinstance(_s_raw, bool):
+            _s_raw = None
+        try:
+            s = int(_s_raw)
+        except (TypeError, ValueError):
+            print(f'[v10 stats] {_k} has no usable `seed`; its curve cannot be attributed and is skipped')
+            continue
         try:
             fp = tuple(((int(t), type(v).__name__, round(float(v), 9)) for t, v in r['ppl_history'] if isinstance(v, (int, float)) and (not isinstance(v, bool)) and (v == v)))
         except (TypeError, ValueError):
@@ -281,6 +290,9 @@ def _hist_by_seed(outdir, variant):
         if fp in seen:
             if not r.get('synthesized'):
                 print(f'[stats] {sp}: seed {s} of `{variant}` is a REAL record but its curve is IDENTICAL to the one already admitted for seed {seen[fp]}; keeping seed {seen[fp]} (the first admission) and dropping seed {s} so the curve is not counted twice.')
+            continue
+        if s in out:
+            print(f'[stats] {sp}: two records with DIFFERENT curves both claim ({variant}, seed {s}) — the gap trajectory is ambiguous; the first record is kept and this one is dropped')
             continue
         seen[fp] = s
         synth_of[s] = bool(r.get('synthesized'))

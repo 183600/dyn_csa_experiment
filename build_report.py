@@ -215,12 +215,17 @@ def sec_p0r():
     _cf_r, _fu_r = (_agg_entry(rope, 'csa_fixed_rope'), _agg_entry(rope, 'full_rope'))
     _mt = _agg_entry(ab, 'full_matched')
     if _cf is not None and _cf_r is not None and (_fu_r is not None) and (_fu is not None):
-        g_abs = _cf['ppl_mean'] - _fu['ppl_mean']
-        g_abs_m = _cf['ppl_mean'] - (_mt or {}).get('ppl_mean', float('nan'))
+        _means = [_finite_or_none(_e.get('ppl_mean')) for _e in (_cf, _fu, _cf_r, _fu_r)]
+        if any((m is None for m in _means)):
+            print('[report] sec_p0r: one of the four arm entries lacks a finite ppl_mean — group-gap block omitted')
+            return '\n'.join(lines) + '\n'
+        g_abs = _means[0] - _means[1]
+        _mtm = _finite_or_none((_mt or {}).get('ppl_mean'))
+        g_abs_m = _cf['ppl_mean'] - _mtm if _mtm is not None else float('nan')
         g_rope = _cf_r['ppl_mean'] - _fu_r['ppl_mean']
         d_abs = _fu['ppl_mean'] - _fu_r['ppl_mean']
         d_sp = _cf['ppl_mean'] - _cf_r['ppl_mean']
-        _has_mt = _mt is not None and _finite_or_none(_mt.get('ppl_mean')) is not None
+        _has_mt = _mtm is not None
         rope_unmatched = unmatched_tag(_cf_r, _fu_r)
         rope_is_defect = gap_is_architecture(_cf_r, _fu_r) is False
         _w_abs = '领先' if g_abs < 0 else '落后'
