@@ -139,7 +139,7 @@ def main(argv=None):
             return None
         except (KeyError, ValueError) as e:
             return str(e)
-    for pair, tag in [(('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn'), 'A. 同面板配对（hybrid，n=3，干净对照）'), (('csa_dyn_fuse', 'csa_dynamic'), 'B. 跨面板同配置（纯 CSA 栈；仅作参考，非严格配对）')]:
+    for pair, tag in [(('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn'), 'A. 同面板配对（hybrid，干净对照）'), (('csa_dyn_fuse', 'csa_dynamic'), 'B. 跨面板同配置（纯 CSA 栈；仅作参考，非严格配对）')]:
         a, b = pair
         lines.append(f'\n## {tag}\n')
         lines.append(f'`{a}` (fuse) vs `{b}` (no-fuse)\n')
@@ -187,9 +187,10 @@ def main(argv=None):
         if _gate_ok and len(d_f1) and len(d_ppl):
             p_f1 = signflip(d_f1)
             p_ppl = signflip(d_ppl)
-            lines.append('\n**配对精确符号翻转检验（n=3，按 seed 配对）**：')
-            lines.append(f'- 层均边界 F1：Δ = {d_f1.mean():+.4f} ± {sample_std(d_f1):.4f}，{int(max((d_f1 > 0).sum(), (d_f1 < 0).sum()))}/{len(d_f1)} 同向，p(exact) = {p_f1:.3f}')
-            lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p(exact) = {p_ppl:.3f}（n=3 时 p 分辨率下限 0.25）\n')
+            _n_f1 = len(d_f1)
+            lines.append(f'\n**配对精确符号翻转检验（n={_n_f1}，按 seed 配对）**：')
+            lines.append(f'- 层均边界 F1：Δ = {d_f1.mean():+.4f} ± {sample_std(d_f1):.4f}，{int(max((d_f1 > 0).sum(), (d_f1 < 0).sum()))}/{_n_f1} 同向，p(exact) = {p_f1:.3f}')
+            lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p(exact) = {p_ppl:.3f}（n={len(d_ppl)} 时 p 分辨率下限 {2.0 / 2 ** max(len(d_ppl), 1):.3f}）\n')
         elif _gate_ok:
             p_f1 = p_ppl = None
             lines.append('\n**配对检验：未执行。** 可用于配对的有限样本不足，**不给出 p 值**、不进入任何显著性主张。\n')

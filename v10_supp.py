@@ -149,20 +149,6 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 print(f'[p3mp] SKIP {v} s{seed}: no checkpoint {ck} (run phase P3MT first)')
                 continue
             _defs = [(Ln, rho) for Ln in cfg['eval_lens'] for rho in cfg['rhos']]
-            _fp_pre = _probe_fingerprint(dict(cfg, vocab=int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])))
-            _todo = False
-            for arm in cfg['arms']:
-                if not _arm_of(v, arm):
-                    continue
-                for Ln, rho in _defs:
-                    _rec = summary.get(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}')
-                    if not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_pre)):
-                        _todo = True
-                        break
-                if _todo:
-                    break
-            if not _todo:
-                continue
             d = torch.load(ck, map_location='cpu', weights_only=False)
             if d.get('code') != V.CKPT_CODE:
                 print(f'[p3mp] REFUSE {v} s{seed}: checkpoint predates the current code stamp (code={d.get('code')!r}) — re-run the training phase (P3MT/P4MT) first')
@@ -178,6 +164,20 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 print(f"[p3mp] {v} s{seed}: probe cfg vocab={int(cfg['vocab'])} differs from the checkpoint's vocab={_vocab_ck} — using the checkpoint's (the model is what is being scored)")
             _pcfg = dict(cfg, vocab=_vocab_ck)
             _fp = _probe_fingerprint(_pcfg)
+            _todo = False
+            for arm in cfg['arms']:
+                if not _arm_of(v, arm):
+                    continue
+                for Ln, rho in _defs:
+                    _rec = summary.get(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}')
+                    if not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp)):
+                        _todo = True
+                        break
+                if _todo:
+                    break
+            if not _todo:
+                del d
+                continue
             _row_cache = {}
             for arm in cfg['arms']:
                 if not _arm_of(v, arm):

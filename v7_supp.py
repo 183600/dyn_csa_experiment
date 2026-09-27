@@ -277,36 +277,31 @@ class HybridAttentionRoPE(L.HybridAttention):
             row = L._arange_cache(T, x.device)[:, None]
             col = L._arange_cache(T, x.device)[None, :]
             mask = torch.where(col < row - win + 1, float('-inf'), mask)
-        outs = None
-        for b in range(B):
-            xb = x[b]
-            Ca = xb @ self.W_aKV
-            q = F.normalize(self.W_q(xb).view(T, nh, hd), dim=-1)
-            norm_kv = getattr(self.cfg, 'qk_norm', False)
-            _Ca_int = self.kv_norm(Ca) if norm_kv else Ca
-            _Ca_int = F.normalize(_Ca_int, dim=-1)
-            if self.cfg.content_mode == 'zero':
-                _Ca_int = torch.zeros_like(_Ca_int)
-            k, v = self._split(self.W_kvhead(_Ca_int))
-            k = F.normalize(k, dim=-1)
-            if use_rope:
-                if norm_kv:
-                    q = self.q_norm(q)
-                cos, sin = rope_cos_sin(hd, rd, L._arange_cache(T, xb.device), xb.device)
-                q = apply_rope(q, cos[:, None, :], sin[:, None, :], rd)
-                k = apply_rope(k, cos[:, None, :], sin[:, None, :], rd)
-            logits = torch.einsum('thd,shd->hts', q, k) * scale
-            sink = self.sink if self.cfg.use_sink and self.sink is not None else None
-            if sink is None:
-                attn = L.sink_softmax((logits + mask).transpose(0, 1), sink)
-            else:
-                attn, _sink_unused = L._sink_split_softmax((logits + mask).transpose(0, 1), sink, want_sink=False)
-            o = torch.einsum('ths,shd->thd', attn, v)
-            _o = self.W_o(o.reshape(T, nh * hd))
-            if outs is None:
-                outs = torch.empty(B, *_o.shape, device=_o.device, dtype=_o.dtype)
-            outs[b].copy_(_o)
-        return outs
+        Ca = x @ self.W_aKV
+        q = F.normalize(self.W_q(x).view(B, T, nh, hd), dim=-1)
+        norm_kv = getattr(self.cfg, 'qk_norm', False)
+        _Ca_int = self.kv_norm(Ca) if norm_kv else Ca
+        _Ca_int = F.normalize(_Ca_int, dim=-1)
+        if self.cfg.content_mode == 'zero':
+            _Ca_int = torch.zeros_like(_Ca_int)
+        k, v = self._split(self.W_kvhead(_Ca_int))
+        k = F.normalize(k, dim=-1)
+        if use_rope:
+            if norm_kv:
+                q = self.q_norm(q)
+            cos, sin = rope_cos_sin(hd, rd, L._arange_cache(T, x.device), x.device)
+            q = apply_rope(q, cos[:, None, :], sin[:, None, :], rd)
+            k = apply_rope(k, cos[:, None, :], sin[:, None, :], rd)
+        logits = torch.einsum('bthd,bshd->bhts', q, k) * scale
+        sink = self.sink if self.cfg.use_sink and self.sink is not None else None
+        zflat = (logits + mask).transpose(1, 2).reshape(B * T, nh, T)
+        if sink is None:
+            attn = L.sink_softmax(zflat, sink)
+        else:
+            attn, _sink_unused = L._sink_split_softmax(zflat, sink, want_sink=False)
+        attn = attn.view(B, T, nh, T)
+        o = torch.einsum('bths,bshd->bthd', attn, v)
+        return self.W_o(o.reshape(B, T, nh * hd))
 
     def forward(self, x):
         if getattr(self, '_dense_warmup', False) and self.cfg.kind in ('csa', 'hca'):
@@ -563,7 +558,8 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
         if v not in ratios:
             ratios[v] = L.variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'})
     _wu = cfg['warmup']
-    _fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_cs{CKPT_CODE}'
+    _mkey = ','.join(sorted((str(_x) for _x in (set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}))))
+    _fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_det{L.determinism_label()}_cs{CKPT_CODE}'
     for seed in seeds:
         for warm in warm_grid:
             for v in variants:
@@ -915,6 +911,7 @@ def run_niah_phase(payload, guard=None, label=''):
         except Exception as _e:
             print(f'[resume] FATAL: {spath} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
+    _recipe = f'niah_steps{n_steps}_v{vocab}_bs12_sl512_lr0.0003_mr-csa_dynamic_rope'
     for v in variants:
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
@@ -929,6 +926,9 @@ def run_niah_phase(payload, guard=None, label=''):
                     stale = _meta.get('code') != CKPT_CODE
                     if stale:
                         print(f'[niah] {v} s{seed}: checkpoint predates CKPT_CODE={CKPT_CODE} (code={_meta.get('code')!r}) — RETRAINING')
+                    elif _meta.get('recipe') != _recipe:
+                        stale = True
+                        print(f'[niah] {v} s{seed}: checkpoint recipe mismatch (stored {_meta.get('recipe')!r}) — RETRAINING')
                     del _meta
             if stale or not os.path.exists(ck):
                 if guard is not None:
@@ -982,7 +982,7 @@ def run_niah_phase(payload, guard=None, label=''):
                     if guard is not None:
                         guard.record_run(time.time() - t0, step, 256, 6, 512, 12)
                     continue
-                torch.save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'code': CKPT_CODE, 'sd': model.state_dict(), 'params': L.count_params(model)}, ck)
+                torch.save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'params': L.count_params(model)}, ck)
                 if guard is not None:
                     guard.record_run(time.time() - t0, n_steps, 256, 6, 512, 12)
                 del model, opt
@@ -1081,6 +1081,7 @@ def run_lenphase(payload, guard=None, label=''):
     _, val_ids, _, _, _ = L.load_wikitext(max(train_len, need), 4000000)
     print(f'[p1l] val slice {val_ids.shape}, eval_lens={eval_lens}, seeds={seeds}')
     _train_cache = [None]
+    _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs12_lr0.0003_nt8000000_mr-csa_dynamic_rope'
     for v in variants:
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
@@ -1090,6 +1091,9 @@ def run_lenphase(payload, guard=None, label=''):
                 stale = _meta.get('code') != CKPT_CODE
                 if stale:
                     print(f'[p1l] {v} s{seed}: checkpoint predates CKPT_CODE={CKPT_CODE} (code={_meta.get('code')!r}) — RETRAINING')
+                elif _meta.get('recipe') != _recipe:
+                    stale = True
+                    print(f'[p1l] {v} s{seed}: checkpoint recipe mismatch (stored {_meta.get('recipe')!r}) — RETRAINING')
                 del _meta
             if stale or not os.path.exists(ck):
                 key0 = f'{v}::seed{seed}'
@@ -1123,7 +1127,7 @@ def run_lenphase(payload, guard=None, label=''):
                     continue
                 model = _tr.pop('_model')
                 try:
-                    torch.save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model)}, ck)
+                    torch.save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model)}, ck)
                 finally:
                     pass
                 if guard is not None:
