@@ -856,9 +856,12 @@ def git_push(msg):
     committed = r.returncode == 0
     if not committed and 'nothing to commit' not in r.stdout + r.stderr:
         print(f'[git] commit FAILED (will still try to push): {(r.stdout + r.stderr)[-300:]}')
-    rb = run('git', 'pull', '--rebase', '--autostash', 'origin', run('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip())
-    if committed and rb.returncode != 0:
-        print(f'[git] rebase onto origin FAILED: {(rb.stdout + rb.stderr)[-300:]}')
+    _branch = run('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
+    if _branch != 'HEAD':
+        rb = run('git', 'pull', '--rebase', '--autostash', 'origin', _branch)
+        if committed and rb.returncode != 0:
+            print(f'[git] rebase onto origin FAILED: {(rb.stdout + rb.stderr)[-300:]}')
+            run('git', 'rebase', '--abort')
     r = run('git', 'push', 'origin', 'HEAD')
     ok = r.returncode == 0
     if not ok:
