@@ -54,8 +54,8 @@ def _arm_of(variant, arm):
         return arm == 'dense'
     return arm in ('learned', 'randidx', 'allblocks')
 
-@torch.no_grad()
-def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg):
+@torch.inference_mode()
+def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=None):
     target = cfg['target']
     vocab = int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
     far = eval_len - target
@@ -69,12 +69,18 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg):
         j = min(i + n_ch, n_seq)
         rows = []
         for jj in range(i, j):
-            ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
-            if k > 0:
-                rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
-                pos = rng.choice(n_far, size=k, replace=False)
-                ids[pos] = (ids[pos] + rng.integers(1, vocab, size=k)) % vocab
-            rows.append(ids)
+            _rk = (eval_len, jj, k)
+            _row = row_cache.get(_rk) if row_cache is not None else None
+            if _row is None:
+                ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
+                if k > 0:
+                    rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
+                    pos = rng.choice(n_far, size=k, replace=False)
+                    ids[pos] = (ids[pos] + rng.integers(1, vocab, size=k)) % vocab
+                _row = ids
+                if row_cache is not None:
+                    row_cache[_rk] = _row
+            rows.append(_row)
         ids = torch.from_numpy(np.stack(rows)).to(DEVICE)
         try:
             logits = model(ids[:, :-1])
@@ -88,11 +94,12 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg):
                 continue
             raise
         tgt = ids[:, 1:]
+        _ce = F.cross_entropy(logits[:, -target:, :].reshape(-1, vocab), tgt[:, -target:].reshape(-1), reduction='none').view(len(rows), target)
         for _r in range(len(rows)):
-            ce_r = F.cross_entropy(logits[_r, -target:], tgt[_r, -target:], reduction='none')
+            ce_r = _ce[_r]
             nll_sum.append(float(ce_r.double().sum()))
             n_tok.append(int(ce_r.numel()))
-        del ids, logits, tgt
+        del ids, logits, tgt, _ce
         i = j
     return (nll_sum, n_tok)
 
@@ -171,6 +178,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 print(f"[p3mp] {v} s{seed}: probe cfg vocab={int(cfg['vocab'])} differs from the checkpoint's vocab={_vocab_ck} — using the checkpoint's (the model is what is being scored)")
             _pcfg = dict(cfg, vocab=_vocab_ck)
             _fp = _probe_fingerprint(_pcfg)
+            _row_cache = {}
             for arm in cfg['arms']:
                 if not _arm_of(v, arm):
                     continue
@@ -197,10 +205,10 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 t0 = time.time()
                 for Ln, rho in cells:
                     key = _cell_key(Ln, rho)
-                    nll_sum, n_tok = _distractor_ppls(model, val_ids, Ln, rho, _pcfg['n_seq'], seed, _pcfg)
+                    nll_sum, n_tok = _distractor_ppls(model, val_ids, Ln, rho, _pcfg['n_seq'], seed, _pcfg, row_cache=_row_cache)
                     cell_ppl = _cell_ppl(nll_sum, n_tok)
                     per_seq = [math.exp(s / t) for s, t in zip(nll_sum, n_tok)]
-                    summary[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'ppl_mean': float(cell_ppl), 'ppl_std': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp}
+                    summary[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp}
                     print(f'  [p3mp] {key:44s} PPL={cell_ppl:8.2f}', flush=True)
                     L.atomic_write_json(spath, summary, indent=1)
                 if guard is not None:

@@ -104,8 +104,12 @@ def sample_std(deltas, axis=None):
         return float(np.nanstd(d, ddof=1)) if d.size > 1 else 0.0
     if d.shape[axis] < 2:
         return np.zeros(d.shape[:axis] + d.shape[axis + 1:])
-    with np.errstate(invalid='ignore'):
-        return np.nanstd(d, axis=axis, ddof=1)
+    srt = np.moveaxis(d, axis, 0).reshape(d.shape[axis], -1)
+    out = np.zeros(srt.shape[1])
+    for j in range(srt.shape[1]):
+        col = srt[:, j][np.isfinite(srt[:, j])]
+        out[j] = float(np.std(col, ddof=1)) if col.size > 1 else 0.0
+    return out.reshape(d.shape[:axis] + d.shape[axis + 1:])
 
 def main(argv=None):
     if argv is None:

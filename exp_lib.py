@@ -32,7 +32,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 BUDGET = dict(total_yuan=140.0, price_per_hour=2.4, margin=0.93, already_spent_yuan=0.0, state_path='autodl_budget_state.json')
-CODE_SEMANTICS = 'v11.115'
+CODE_SEMANTICS = 'v11.116'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
@@ -381,7 +381,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         if _pad_b < _W_b:
             Xbm[:, _pad_b:].masked_fill_(~mask_b[:, _pad_b:, None], 0.0)
     comp = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
-    last_idx = (ends - 1).clamp(max=n - 1)
+    last_idx = (ends - 1).clamp(0, n - 1)
     return (comp, order[last_idx], B)
 
 def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
@@ -413,7 +413,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         _pad = slice(_cmin, max_len)
         Xb[:, _pad].masked_fill_(~mask[:, _pad, None], 0.0)
     comp = (sc * Xb).sum(1)
-    last_idx = (ends - 1).clamp(max=n - 1)
+    last_idx = (ends - 1).clamp(0, n - 1)
     return (comp, order[last_idx], B)
 
 def _rank_blocks(masked, B, ties):
@@ -505,6 +505,8 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     scores = chunks[0] if len(chunks) == 1 else torch.cat(chunks, 0)
     del chunks
     out_dtype = scores.dtype
+    if out_valid is None and return_mask:
+        out_valid = []
     with torch.no_grad():
         idx = _indexer_selection(scores, causal, k, out_valid=out_valid)
     scores.masked_fill_(~causal, float('-inf'))
@@ -513,9 +515,13 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     del scores
     m = None
     if return_mask:
+        valid_cols = out_valid[0]
         with torch.no_grad():
-            m = torch.zeros(n, B, device=dev, dtype=out_dtype)
-            m.scatter_(1, idx.long(), 1.0)
+            _il = idx.long()
+            _tgt = torch.where(valid_cols, _il, torch.full_like(_il, B))
+            m = torch.zeros(n, B + 1, device=dev, dtype=out_dtype)
+            m.scatter_(1, _tgt, 1.0)
+            m = m[:, :B].contiguous()
             m.masked_fill_(~causal, 0.0)
     return (m, idx, soft)
 
@@ -1567,7 +1573,7 @@ def determinism_label():
         return 'strict' if not torch.is_deterministic_algorithms_warn_only_enabled() else 'warn'
     return 'cudnn' if torch.backends.cudnn.deterministic else 'off'
 
-@torch.no_grad()
+@torch.inference_mode()
 def eval_ppl(model, val_batch, device, chunk=32, eval_rows=None, eval_seed=0):
     chunk = max(1, int(chunk))
     was_training = model.training
@@ -2069,7 +2075,7 @@ def compression_report(model, val_batch, device, n_sample=64, val_bnd=None, bnd_
         enable_block_stats(model, False)
         model.train(was_training)
 
-@torch.no_grad()
+@torch.inference_mode()
 def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_tol):
     report = {}
     seq_len = val_batch.shape[1]
@@ -2924,7 +2930,7 @@ def run(cfg=None, seeds=None, guard=None, label=''):
         _mkey = ','.join(sorted((str(_x) for _x in _mg)))
     if torch.cuda.is_available():
         _pin_cuda_determinism()
-    fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_wu{cfg.get('warmup', 50)}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_det{determinism_label()}_cs{CODE_SEMANTICS}'
+    fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg.get('warmup', 50)}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_det{determinism_label()}_cs{CODE_SEMANTICS}'
     ratios = {}
     dropped_truncations = []
     stale_dropped = []

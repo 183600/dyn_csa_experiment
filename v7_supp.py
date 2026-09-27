@@ -210,8 +210,9 @@ class HybridAttentionRoPE(L.HybridAttention):
         dev = q.device
         if mem_budget_bytes is None:
             mem_budget_bytes = L._attn_transient_budget(dev)
-        _per_row = 4 * max(1, int(topk_idx.shape[1]) + int(w)) * nh * hd
-        _bytes_per_chunk_row = _per_row * q.element_size()
+        _es = q.element_size()
+        _m = max(1, int(topk_idx.shape[1]) + int(w))
+        _bytes_per_chunk_row = 2 * _m * nh * hd * _es + 4 * _m * nh * _es
         _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
         if _bindable and _bytes_per_chunk_row > 0:
             _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
@@ -397,9 +398,9 @@ class SmallGPTRoPE(L.SmallGPT):
 
 def make_layer_cfgs_v7(n_layers, variant):
     if variant == 'csa_fixed_rope':
-        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, rope=True, rope_dim=16, qk_norm=True)] * n_layers
+        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_dynamic_rope':
-        return [AttnCfgRope(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, rope=True, rope_dim=16, qk_norm=True)] * n_layers
+        return [AttnCfgRope(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'hybrid_fixed_rope':
         out = []
         for i in range(n_layers):
@@ -409,14 +410,14 @@ def make_layer_cfgs_v7(n_layers, variant):
                 out.append(AttnCfgRope(kind='hca', dynamic=False, block_size=64, rope=True, rope_dim=16, qk_norm=True))
         return out
     if variant == 'full_rope':
-        return [AttnCfgRope(kind='full', rope=True, rope_dim=16, qk_norm=True)] * n_layers
+        return [AttnCfgRope(kind='full', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'full_sw128_matched_rope':
-        return [AttnCfgRope(kind='full', window=128, rope=True, rope_dim=16, qk_norm=True)] * n_layers
+        return [AttnCfgRope(kind='full', window=128, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_fix_m1':
-        return [L.AttnCfg(kind='csa', dynamic=False, block_size=1, overlap=0, index_topk=32)] * n_layers
+        return [L.AttnCfg(kind='csa', dynamic=False, block_size=1, overlap=0, index_topk=32) for _ in range(n_layers)]
     if variant.startswith('csa_fixed_topk'):
         k = int(variant.replace('csa_fixed_topk', ''))
-        return [L.AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=k)] * n_layers
+        return [L.AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=k) for _ in range(n_layers)]
     return L.__dict__['_orig_make_layer_cfgs'](n_layers, variant)
 _PATCHES_INSTALLED = False
 
@@ -649,7 +650,7 @@ def build_niah_batch(n_seq, seq_len, n_pairs=4, vocab=8192, seed=0):
             dist[i, kp] = kp - val_pos[int(keys[pj])]
     return (ids, tgt, dist)
 
-@torch.no_grad()
+@torch.inference_mode()
 def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, seed=1234, chunk=16):
     was = model.training
     model.eval()
@@ -919,11 +920,16 @@ def run_niah_phase(payload, guard=None, label=''):
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
             stale = False
             if os.path.exists(ck):
-                _meta = torch.load(ck, map_location='cpu', weights_only=False)
-                stale = _meta.get('code') != CKPT_CODE
-                if stale:
-                    print(f'[niah] {v} s{seed}: checkpoint predates CKPT_CODE={CKPT_CODE} (code={_meta.get('code')!r}) — RETRAINING')
-                del _meta
+                try:
+                    _meta = torch.load(ck, map_location='cpu', weights_only=False)
+                except Exception as _cke:
+                    print(f'[niah] {v} s{seed}: checkpoint unreadable ({type(_cke).__name__}: {_cke}) — RETRAINING')
+                    stale = True
+                else:
+                    stale = _meta.get('code') != CKPT_CODE
+                    if stale:
+                        print(f'[niah] {v} s{seed}: checkpoint predates CKPT_CODE={CKPT_CODE} (code={_meta.get('code')!r}) — RETRAINING')
+                    del _meta
             if stale or not os.path.exists(ck):
                 if guard is not None:
                     est = guard.estimate_seconds(n_steps, d=256, n_layers=6, seq_len=512, batch_size=12)
@@ -1013,7 +1019,7 @@ def run_niah_phase(payload, guard=None, label=''):
     _niah_plot(summary, outdir, seq_lens)
     return summary
 
-@torch.no_grad()
+@torch.inference_mode()
 def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=None):
     was = model.training
     model.eval()
@@ -1040,10 +1046,9 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                                 torch.cuda.empty_cache()
                             continue
                         raise
-                    _lsm = F.log_softmax(logits[:, :-1], dim=-1)
-                    nll += float(-_lsm.gather(-1, _sub[:, 1:].unsqueeze(-1)).double().sum())
+                    nll += float(F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), _sub[:, 1:].reshape(-1), reduction='none').double().sum())
                     ntok += int(_sub[:, 1:].numel())
-                    del logits, _lsm
+                    del logits
                     _r += _chunk
                 ppl = math.exp(nll / max(ntok, 1))
                 out[int(Ln)] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': int(x.shape[1])}
