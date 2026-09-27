@@ -433,13 +433,8 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
         return torch.empty(n, 0, device=scores.device, dtype=torch.int32)
     k = min(k_req, B)
     finite = torch.isfinite(scores)
-    if k >= B:
-        masked = scores.masked_fill(~causal | ~finite, float('-inf'))
-        order = _rank_blocks(masked, B, ties)
-    else:
-        masked = scores.masked_fill(~causal, float('-inf'))
-        masked = masked.masked_fill(~finite, float('-inf'))
-        order = _rank_blocks(masked, B, ties)
+    masked = scores.masked_fill(~causal | ~finite, float('-inf'))
+    order = _rank_blocks(masked, B, ties)
     usable = causal.gather(1, order) & finite.gather(1, order)
     if k >= B:
         keep = usable

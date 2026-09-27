@@ -256,8 +256,10 @@ def build_report(out='REPORT_v9.md'):
         _skipped = [v for v in done if v not in _SEL_PCT]
         if len(_ord) >= 3:
             ms = [seq2k[v]['mean'] for _r, v in _ord]
-            mono = all((ms[i] <= ms[i + 1] + 1e-09 for i in range(len(ms) - 1)))
-            A('按选择率升序（' + ' < '.join((f'{_r:g}%`{v.replace('csa_fixed_', '')}`' for _r, v in _ord)) + f'）PPL：{('单调不降' if mono else '非单调（见表）')}。' + (f'（`{'`、`'.join(_skipped)}` 无唯一选择率位置，不参与该排序判断。）' if _skipped else ''))
+            _nondec = all((ms[i] <= ms[i + 1] + 1e-09 for i in range(len(ms) - 1)))
+            _noninc = all((ms[i] >= ms[i + 1] - 1e-09 for i in range(len(ms) - 1)))
+            _mono_txt = '单调不降' if _nondec else ('单调不增' if _noninc else '非单调（见表）')
+            A('按选择率升序（' + ' < '.join((f'{_r:g}%`{v.replace('csa_fixed_', '')}`' for _r, v in _ord)) + f'）PPL：{_mono_txt}。' + (f'（`{'`、`'.join(_skipped)}` 无唯一选择率位置，不参与该排序判断。）' if _skipped else ''))
         else:
             A('按选择率升序的单调性判断：有效排序点不足 3 个，不作判断。')
         A('')

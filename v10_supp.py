@@ -270,10 +270,14 @@ def _hist_by_seed(outdir, variant):
             _keep = max(_groups.values(), key=len)
             _dropped = sorted((s for s in out if s not in set(_keep)))
             print(f'[stats] {sp}: `{variant}` curves span {len(_groups)} distinct run_cfg groups — pooling across configurations is not allowed, so the trajectory keeps only the largest group ({len(_keep)}/{len(out)} seeds) and drops seeds {_dropped}')
+            if sum((1 for g in _groups.values() if len(g) == len(_keep))) > 1:
+                print(f'[stats] {sp}: `{variant}` run_cfg groups TIE at {len(_keep)} seed(s) each — the first-admitted group {sorted(_keep)} is kept; the tied alternatives are dropped, so this panel contributes fewer seeds than were measured')
             for s in _dropped:
                 del out[s]
                 synth_of.pop(s, None)
+                cfg_of.pop(s, None)
     out.per_seed_synth = synth_of
+    out.per_seed_cfg = cfg_of
     return out
 
 def _crossover_step(gap_steps, gap_vals, smooth=1):
@@ -333,6 +337,15 @@ def _scale_crossovers():
         if not common:
             out[label] = {'status': 'missing', **p}
             continue
+        _cfg_a = getattr(ha, 'per_seed_cfg', {})
+        _cfg_b = getattr(hb, 'per_seed_cfg', {})
+        _cfg_bad = [s for s in common if _cfg_a.get(s) != _cfg_b.get(s)]
+        if _cfg_bad:
+            print(f'[stats] {label}: seed(s) {_cfg_bad} pair a `csa_fixed` curve against a `full` curve measured under a DIFFERENT run_cfg — cross-configuration pairing is not allowed, so these seeds enter no crossover statistic and are excluded from the reported n')
+            common = [s for s in common if s not in set(_cfg_bad)]
+            if not common:
+                out[label] = {'status': 'missing', **p}
+                continue
         _paired = []
         _no_overlap = []
         for s in common:
