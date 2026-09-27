@@ -476,7 +476,6 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     pos = _arange_cache(n, dev)
     causal = block_readable(pos, last_tok)
     k = min(topk, B)
-    score_chunks = []
     if random_select:
         _ri_key = (str(dev), 'rs_ri', int(n))
         _jc_key = (str(dev), 'rs_jc', int(B))
@@ -492,25 +491,24 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     if query_chunk is None:
         raise ValueError("lightning_indexer: query_chunk=None is not 'use the default'; pass the default (2048) explicitly or omit the argument")
     query_chunk = max(1, min(int(query_chunk), n))
+    scores = torch.empty(n, B, device=dev, dtype=H.dtype if random_select else qI.dtype)
     for s in range(0, n, query_chunk):
         e = min(s + query_chunk, n)
         if random_select:
             z = torch.sin(_ri[s:e] * 12.9898 + _jc) * 43758.5453
             z = (z - torch.floor(z)) * 2.0 - 1.0
-            sc = z.to(sc_dtype)
+            scores[s:e] = z.to(sc_dtype)
         else:
             raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI) * hd ** (-0.5)
             F.relu(raw, inplace=True)
-            sc = torch.einsum('inb,ni->nb', raw, w_idx[s:e])
-        score_chunks.append(sc)
-    scores = torch.cat(score_chunks, dim=0)
+            scores[s:e] = torch.einsum('inb,ni->nb', raw, w_idx[s:e])
     out_dtype = scores.dtype
     with torch.no_grad():
         idx = _indexer_selection(scores, causal, k, out_valid=out_valid)
     scores.masked_fill_(~causal, float('-inf'))
     soft = F.softmax(scores, dim=-1)
     soft = torch.nan_to_num(soft)
-    del scores, score_chunks
+    del scores
     m = None
     if return_mask:
         with torch.no_grad():
