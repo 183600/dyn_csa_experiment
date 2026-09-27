@@ -69,7 +69,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=
         j = min(i + n_ch, n_seq)
         rows = []
         for jj in range(i, j):
-            _rk = (eval_len, jj, k)
+            _rk = (eval_len, jj, rho)
             _row = row_cache.get(_rk) if row_cache is not None else None
             if _row is None:
                 ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
@@ -142,6 +142,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
             print(f'[p3mp] FATAL: {_msp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — without it no checkpoint can be attributed to a training recipe, so the probe would score unknown weights.  Move it aside to re-train.')
             raise
     print(f'[p3mp] val slice {val_ids.shape}, arms={cfg['arms']}, rhos={cfg['rhos']}')
+    _row_cache = {}
     for v in cfg['variants']:
         for seed in cfg['seeds']:
             ck = os.path.join(cfg['ckpt_dir'], f'{v}_seed{seed}.pt')
@@ -178,7 +179,6 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
             if not _todo:
                 del d
                 continue
-            _row_cache = {}
             for arm in cfg['arms']:
                 if not _arm_of(v, arm):
                     continue

@@ -101,7 +101,8 @@ def signflip(deltas):
 def sample_std(deltas, axis=None):
     d = np.asarray(deltas, dtype=float)
     if axis is None:
-        return float(np.nanstd(d, ddof=1)) if d.size > 1 else 0.0
+        d = d[np.isfinite(d)]
+        return float(np.std(d, ddof=1)) if d.size > 1 else 0.0
     if d.shape[axis] < 2:
         return np.zeros(d.shape[:axis] + d.shape[axis + 1:])
     srt = np.moveaxis(d, axis, 0).reshape(d.shape[axis], -1)
