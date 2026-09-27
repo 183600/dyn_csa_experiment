@@ -1566,7 +1566,7 @@ def determinism_label():
     return 'cudnn' if torch.backends.cudnn.deterministic else 'off'
 
 @torch.no_grad()
-def eval_ppl(model, val_batch, device, chunk=64, eval_rows=None, eval_seed=0):
+def eval_ppl(model, val_batch, device, chunk=32, eval_rows=None, eval_seed=0):
     chunk = max(1, int(chunk))
     was_training = model.training
     model.eval()
