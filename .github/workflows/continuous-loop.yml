@@ -23,6 +23,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Free up disk space (keep miniconda)
+        run: |
+          set +e
+          echo "=== disk before cleanup ==="
+          df -h /
+          # 只删和本项目无关的预装 SDK，保留 miniconda
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/share/swift \
+                      /usr/local/lib/android \
+                      /usr/local/share/boost \
+                      /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo apt-get clean
+          echo "=== disk after cleanup ==="
+          df -h /
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -39,25 +55,25 @@ jobs:
           # 它在内存紧张时向进程发 SIGTERM，是 exit code 143 的常见来源
           sudo systemctl disable --now systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
 
-          # ---------- 1) zram：2G 压缩内存即可，不占磁盘 ----------
+          # ---------- 1) zram：8G 压缩内存，不占磁盘 ----------
+          # disksize 是解压后容量上限，实际物理占用约为 1/3
           sudo modprobe zram 2>/dev/null || true
           if [ -e /dev/zram0 ]; then
             sudo swapoff /dev/zram0 2>/dev/null || true
-            echo 2G | sudo tee /sys/block/zram0/disksize >/dev/null || true
+            echo 8G | sudo tee /sys/block/zram0/disksize >/dev/null || true
             sudo mkswap /dev/zram0 >/dev/null 2>&1 || true
-            sudo swapon -p 100 /dev/zram0 2>/dev/null && echo "[ok] zram enabled (2G, prio=100)" \
+            sudo swapon -p 100 /dev/zram0 2>/dev/null && echo "[ok] zram enabled (8G, prio=100)" \
               || echo "[warn] zram enable failed"
           else
             echo "[info] zram not available, skip"
           fi
 
-          # ---------- 2) 磁盘 swapfile：上限 4G，至少预留 6GB 磁盘 ----------
-          # 之前 16G swapfile 几乎吃满磁盘 -> 写满后 runner 杀步骤(143)
+          # ---------- 2) 磁盘 swapfile：上限 8G，至少预留 3GB 磁盘 ----------
           AVAIL_KB=$(df --output=avail / | tail -1)
           AVAIL_MB=$((AVAIL_KB / 1024))
-          WANT_MB=$((AVAIL_MB - 6144))
-          if [ "$WANT_MB" -gt 4096 ]; then WANT_MB=4096; fi
-          if [ "$WANT_MB" -lt 1024 ]; then WANT_MB=1024; fi
+          WANT_MB=$((AVAIL_MB - 3072))
+          if [ "$WANT_MB" -gt 8192 ]; then WANT_MB=8192; fi
+          if [ "$WANT_MB" -lt 2048 ]; then WANT_MB=2048; fi
           echo "[info] available disk: ${AVAIL_MB}MB, will create swapfile: ${WANT_MB}MB"
 
           sudo swapoff /swapfile 2>/dev/null || true
@@ -70,12 +86,13 @@ jobs:
           sudo mkswap /swapfile >/dev/null
           sudo swapon -p 10 /swapfile && echo "[ok] swapfile enabled"
 
-          # ---------- 3) 内核调优（温和版，避免整机抖动拖死 runner agent） ----------
-          sudo sysctl -w vm.swappiness=60
-          sudo sysctl -w vm.vfs_cache_pressure=100
+          # ---------- 3) 内核调优 ----------
+          sudo sysctl -w vm.swappiness=100
+          sudo sysctl -w vm.vfs_cache_pressure=200
           sudo sysctl -w vm.overcommit_memory=1
           sudo sysctl -w vm.dirty_ratio=40
           sudo sysctl -w vm.dirty_background_ratio=10
+          sudo sysctl -w vm.watermark_scale_factor=200 2>/dev/null || true
 
           echo "=== After ==="
           free -h
