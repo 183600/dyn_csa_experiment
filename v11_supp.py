@@ -45,7 +45,7 @@ def make_guard():
                     print(f'[v11] WARNING: cannot read {src} ({type(e).__name__}: {e}) — this run starts UNCALIBRATED (the first admission uses the conservative default)')
     return g
 
-def P4MT_CFG(seeds=(3, 4, 5)):
+def P4MT_CFG(seeds=(0, 1, 2, 3, 4, 5)):
     return dict(V10.P3MT_PAYLOAD, seeds=list(seeds))
 
 def run_p4mt(payload=None, guard=None, label='v11 P4MT'):
@@ -53,12 +53,12 @@ def run_p4mt(payload=None, guard=None, label='v11 P4MT'):
         payload = P4MT_CFG()
     return V.run_lenphase(payload, guard=guard, label=label)
 
-def P4MP_CFG(seeds=(3, 4, 5)):
+def P4MP_CFG(seeds=(0, 1, 2, 3, 4, 5)):
     return dict(V10.PROBE, seeds=list(seeds))
 P4SS_CFG = dict(V10.P3SS_CFG)
 P4SL_CFG = dict(V10.P3SL_CFG)
 P4F_CFG = dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['csa_fixed', 'full'])
-PHASES = [('P4MT', 'p4mt', P4MT_CFG, None, 1.0), ('P4MP', 'probe', P4MP_CFG, None, 0.3), ('P4SS', 'run', P4SS_CFG, [2, 3], 1.0), ('P4SL', 'run', P4SL_CFG, [2, 3], 1.3), ('P4F', 'run', P4F_CFG, [0, 1, 2, 3], 4.5)]
+PHASES = [('P4MT', 'p4mt', P4MT_CFG, None, 1.6), ('P4MP', 'probe', P4MP_CFG, None, 0.3), ('P4SS', 'run', P4SS_CFG, [0, 1, 2, 3], 0.6), ('P4SL', 'run', P4SL_CFG, [0, 1, 2, 3], 9.0), ('P4F', 'run', P4F_CFG, [0, 1, 2, 3], 4.5)]
 
 def run_phase(name, guard):
     for pname, kind, payload, seeds, _h in PHASES:
@@ -96,7 +96,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
             if r.get('probe_params') is None:
                 _bad_cells.append((_k, 'no probe_params'))
                 continue
-            pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), json.dumps(r.get('probe_params'), sort_keys=True), str(r.get('_code')))
+            pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')))
             grp = cells.setdefault(pk, {})
             if r['seed'] in grp:
                 _dup_cells.append((_k, pk[:4], r['seed']))
@@ -128,7 +128,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
                     other = cell_mean('full_rope', 'dense', Ln, rho) if arm == 'dense' else cell_mean('csa_fixed_rope', arm, Ln, rho)
                     if not learned or not other:
                         continue
-                    if learned.get('probe_params') != other.get('probe_params'):
+                    if V10._fp_norm(learned.get('probe_params')) != V10._fp_norm(other.get('probe_params')):
                         print(f'[v11 stats] L{Ln} r{rho} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
                         continue
                     common = sorted(set(learned['ppl_by_seed']) & set(other['ppl_by_seed']))
@@ -214,8 +214,7 @@ def _fmt_pm(cell, std=None):
 
 def build_report(out='REPORT_v11.md'):
     stats_p = 'analysis_v11/stats.json'
-    if not os.path.exists(stats_p):
-        v11_analysis()
+    v11_analysis()
     st = json.load(open(stats_p, encoding='utf-8'))
     probe = st['probe']
     xo = st['crossover_panels']
@@ -279,11 +278,14 @@ def build_report(out='REPORT_v11.md'):
             if _v.get('synthesized'):
                 _sy += 1
                 continue
-            if not L.ppl_is_usable(_v.get('ppl')):
+            _bl = _v.get('by_len')
+            _acc = _v.get('acc')
+            _meas = L.ppl_is_usable(_v.get('ppl')) or (isinstance(_bl, dict) and any((isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) for c in _bl.values()))) or (isinstance(_acc, (int, float)) and (not isinstance(_acc, bool)) and (0.0 <= float(_acc) <= 1.0))
+            if not _meas:
                 continue
             _me += 1
             _rc = _v.get('run_cfg')
-            if isinstance(_rc, str) and _rc.endswith(f'_cs{L.CODE_SEMANTICS}'):
+            if isinstance(_rc, str) and _rc.endswith(f'_cs{L.CODE_SEMANTICS}') or _v.get('_code') == L.CODE_SEMANTICS:
                 _st += 1
         if _tot:
             _prov_panels.append((_p.split('/')[0], _tot, _me, _st, _sy))
@@ -311,7 +313,12 @@ def build_report(out='REPORT_v11.md'):
     else:
         A('v11 计划做三处统计收尾：主正面结果（远距干扰注入探针）补到 n=6、两个交叉定位面板补到 n=4、d=384 面板 `csa_fixed`/`full` 两臂补到 n=4。')
         A('')
-        A(f'> **⚠ 实际落盘状态（本报告从 disk 实时计算）**：探针对比的最大种子数为 **n={n_contr_max}**（精确符号翻转 p 值下限 {_floor_txt}，**未**跨过 0.05），最小配对 n={n_pair_min}；交叉面板 {_xo_txt}；d=384 面板 {_n384_txt}。**P4MT/P4MP 的 seeds 3–5 尚未产出**，因此本节的 n 仍停留在 v10 的水平，**「n=6」的统计升级未发生**；相关结论须待补跑后方可作显著性主张。')
+        _cell_seeds = sorted({s for c in probe_cells_ for s in c['seeds']})
+        _cell_seeds_txt = '/'.join((str(s) for s in _cell_seeds)) or '无'
+        if probe_cells_ and not contr_:
+            A(f'> **⚠ 实际落盘状态（本报告从 disk 实时计算）**：探针 cell 已覆盖 seeds {_cell_seeds_txt}，但**全部配对对比都被门禁略去**（同一 cell 存在多种探针参数化或代码戳、或两臂没有可配对的公共 seed），可算对比数为 0。这不是「无差异」，而是**对比暂不可配对**；在 cell 重新收敛到单一参数化之前不作任何显著性主张。')
+        else:
+            A(f'> **⚠ 实际落盘状态（本报告从 disk 实时计算）**：探针对比的最大种子数为 **n={n_contr_max}**（精确符号翻转 p 值下限 {_floor_txt}，**未**跨过 0.05），最小配对 n={n_pair_min}；交叉面板 {_xo_txt}；d=384 面板 {_n384_txt}。**P4MT/P4MP 的新种子尚未全部产出**（已产出的 cell 覆盖 seeds {_cell_seeds_txt}），**「n=6」的统计升级未发生**；相关结论须待补跑后方可作显著性主张。')
     if _pair_ragged:
         A('')
         A(f'> **⚠ 探针各臂的种子数不一致**：最全的 cell 达 n={n_cells_max}，但最强的对比也只配上 n={n_contr_max} 对，最弱的只有 n={n_tree_min} 对——`full_rope` 与 `csa_fixed_rope` 是分别续训的，任一臂未补满，跨臂对比就只能用两臂的交集。因此表中每个 p 值的实际下限是 {_floor_txt}，**不是**按 cell 数算出的 {2.0 / 2 ** n_cells_max:.3f}；未配满的对比在下面按「未配满」标注，其 Δ 仅作方向性表述。')
@@ -323,21 +330,27 @@ def build_report(out='REPORT_v11.md'):
     if not probe_ok:
         A(f'> 计划 n=6；**实际 n={n_contr_max}**（`distractor.json` 仅含 seeds ' + '/'.join((str(s) for s in sorted({s for c in probe_cells_ for s in c['seeds']}))) + '）。下表的 Δ 与 p 值均基于该实际种子数。')
         A('')
-    A('**做法**：P4MT 按 v7 P1L / v10 P3MT 原配方（seq 512、3000 步、AdamW lr 3e-4、bs 12）续训 seeds 3/4/5（v10 权重不入库但 seeds 0–2 的探针 cell 已提交在 `distractor.json`，故只需补 3 个种子的权重）；P4MP 对新种子续跑探针（纯 eval，逐 cell 断点续跑）。种子间训练/评测代码路径与 v10 完全一致。')
+    A('**做法**：P4MT 按 v7 P1L / v10 P3MT 原配方（seq 512、3000 步、AdamW lr 3e-4、bs 12）把 seeds 0–5 全部置于当前代码语义下（续跑逻辑自动跳过语义仍新的 checkpoint，只有语义陈旧的种子才真正重训）；P4MP 对同一组种子续跑探针（纯 eval，逐 cell 断点续跑，陈旧 cell 自动重测）。种子间训练/评测代码路径与 v10 完全一致。')
     A('')
     if mech_sum:
-        n_by_v = {}
-        for _k, r in mech_sum.items():
-            if not isinstance(r, dict) or r.get('variant') is None or r.get('seed') is None:
-                continue
-            if 'by_len' in r:
-                n_by_v.setdefault(r['variant'], set()).add(r['seed'])
+        _rows_by_v = {}
+        for v in V10.P3MT_PAYLOAD['variants']:
+            _rv = [r for r in mech_sum.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None) and ('by_len' in r)]
+            _cur = [r for r in _rv if r.get('_code') == L.CODE_SEMANTICS]
+            if _cur:
+                if len(_cur) < len(_rv):
+                    print(f'[v11 report] {v}: {len(_rv) - len(_cur)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur)} current one(s)')
+                _rv = _cur
+            elif _rv:
+                print(f'[v11 report] {v}: no by-length record carries the current code semantics ({L.CODE_SEMANTICS}) — quoting all {len(_rv)} (they predate it; re-run P4MT to refresh)')
+            _rows_by_v[v] = _rv
+        n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
         A(f'**双臂 by-length 面板**（n={(min((len(s) for s in n_by_v.values())) if n_by_v else 0)}，ratio = PPL@L / PPL@512，seed 平均）：')
         A('')
         A('| variant | PPL@512 | PPL@2048 | PPL@4096 | ratio@4096 |')
         A('|---|---|---|---|---|')
         for v in V10.P3MT_PAYLOAD['variants']:
-            rows = [r for r in mech_sum.values() if r.get('variant') == v and 'by_len' in r]
+            rows = _rows_by_v.get(v, [])
             if not rows:
                 continue
 
@@ -410,10 +423,23 @@ def build_report(out='REPORT_v11.md'):
 
     def _fmt(r, nd=1):
         return 'n/a' if not r else f'{r[0]:+.{nd}f}~{r[1]:+.{nd}f}'
+
+    def _all_sig(tag, alpha=0.05):
+        _vs = [(k, v) for k, v in contr.items() if tag in k]
+        if not _vs:
+            return False
+        return all((v['mean'] > 0 and v.get('p_exact_signflip', 1.0) < alpha for _k, v in _vs))
     dn, ab, ri = (_rng('dense'), _rng('allblocks'), _rng('randidx'))
-    learned_helps = bool(ri) and ri[0] > 0.0
+    ri_sig = _all_sig('randidx')
+    ri_all_pos = bool(ri) and ri[0] > 0.0
+    if ri_sig:
+        _ri_txt = 'randidx 全线更差且各对照格均达 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。'
+    elif ri_all_pos:
+        _ri_txt = 'randidx 全线更差但并非各对照格都达 p<0.05：方向一致地支持「学习检索有独立贡献」，按当前分辨率只作方向性表述；「抗噪性主要来自稀疏归纳偏置本身」的较弱读法仍然成立。'
+    else:
+        _ri_txt = 'randidx 至少在一格与 learned 相当或更优：抗噪性主要来自稀疏归纳偏置本身，「学习检索滤噪」的强版本不成立。'
     if contr:
-        A(f'**机制结论（区间实时算自上方配对检验，n={n_contr_max}，Δ = 对照臂 − 学习选择臂）：**dense−learned Δ {_fmt(dn)} PPL，allblocks−learned Δ {_fmt(ab)} PPL，randidx−learned Δ {_fmt(ri)} PPL——' + ('randidx 全线更差：学习到的检索对抗噪性有**独立贡献**。' if learned_helps else 'randidx 至少在一格与 learned 相当或更优：抗噪性主要来自稀疏归纳偏置本身，「学习检索滤噪」的强版本不成立。') + (f'（统计分辨率：本段引用的对比中，最全的为 n={n_contr_max}、最弱的仅 n={n_tree_min}，精确符号翻转 p 值下限因此是 {_floor_txt}，**未**跨过 0.05——上述读法只作方向性表述。）' if not probe_ok else '') + (f'（统计分辨率：本段引用的是 n={n_tree_min}–{n_contr_max} 的对比，最弱者下限 {floor_p_tree:.3f}；最弱一格仅 n={n_tree_min}，其分辨率仍不足以支撑显著性主张。）' if probe_ok and _pair_ragged else ''))
+        A(f'**机制结论（区间实时算自上方配对检验，n={n_contr_max}，Δ = 对照臂 − 学习选择臂）：**dense−learned Δ {_fmt(dn)} PPL，allblocks−learned Δ {_fmt(ab)} PPL，randidx−learned Δ {_fmt(ri)} PPL——' + _ri_txt + (f'（统计分辨率：本段引用的对比中，最全的为 n={n_contr_max}、最弱的仅 n={n_tree_min}，精确符号翻转 p 值下限因此是 {_floor_txt}，**未**跨过 0.05——上述读法只作方向性表述。）' if not probe_ok else '') + (f'（统计分辨率：本段引用的是 n={n_tree_min}–{n_contr_max} 的对比，最弱者下限 {floor_p_tree:.3f}；最弱一格仅 n={n_tree_min}，其分辨率仍不足以支撑显著性主张。）' if probe_ok and _pair_ragged else ''))
         A('')
     else:
         A('**机制结论**：`analysis_v11/stats.json` 的 `probe.contrasts` 为空，因此 dense/allblocks/randidx 相对 learned 的 Δ 区间**无数据**，本轮不给出机制读法。这不是「无差异」——是**未测量**。')

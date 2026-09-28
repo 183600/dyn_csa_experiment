@@ -2582,15 +2582,18 @@ def aggregate(summary):
                 if '_dyn' in lk:
                     dyn_lens.append(lm)
                     if 'bnd_f1' in lv:
-                        _f1, _ex = (_cell(lv, 'bnd_f1'), _cell(lv, 'bnd_excess'))
-                        if _f1 is not None and _ex is not None:
+                        _f1 = _cell(lv, 'bnd_f1')
+                        _ex = _cell(lv, 'bnd_excess') if lv.get('bnd_rand_exact') is not False else None
+                        if _f1 is not None:
                             r_f1.append(_f1)
+                        if _ex is not None:
                             r_ex.append(_ex)
                 dl = _cell(lv, 'delta')
                 if dl is not None:
                     deltas.append(dl)
             if r_f1:
                 bf1.append(float(np.mean(r_f1)))
+            if r_ex:
                 bex.append(float(np.mean(r_ex)))
         if dyn_lens:
             entry['avg_dyn_block_len'] = float(np.mean(dyn_lens))
@@ -2601,6 +2604,7 @@ def aggregate(summary):
         if bf1:
             entry['boundary_f1_dyn'] = float(np.mean(bf1))
             entry['boundary_f1_dyn_std'] = float(np.std(bf1, ddof=1)) if len(bf1) > 1 else 0.0
+        if bex:
             entry['boundary_excess_dyn'] = float(np.mean(bex))
         hists = [r['ppl_history'] for r in recs if r.get('ppl_history')]
         if hists:
@@ -2969,7 +2973,7 @@ def run(cfg=None, seeds=None, guard=None, label=''):
             print(f'[resume] FATAL: {summary_path} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
     if label:
-        print(f'\n########## v5 phase: {label} — {len(cfg['variants'])} variants x seeds {cfg['seeds']} x {cfg['steps']} steps ##########')
+        print(f'\n########## phase: {label} — {len(cfg['variants'])} variants x seeds {cfg['seeds']} x {cfg['steps']} steps ##########')
     _mg = cfg.get('matched')
     if _mg is None:
         _mkey = 'default'

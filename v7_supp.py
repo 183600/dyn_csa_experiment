@@ -80,6 +80,11 @@ def gather_rows(x, idx):
     picked = flat.index_select(0, idx.reshape(-1))
     return picked.reshape(idx.shape[0], idx.shape[1], *lead)
 
+def _atomic_torch_save(obj, path):
+    _tmp = path + '.tmp'
+    torch.save(obj, _tmp)
+    os.replace(_tmp, path)
+
 class HybridAttentionRoPE(L.HybridAttention):
 
     def __init__(self, d_model, n_heads, d_head, cfg):
@@ -1007,7 +1012,7 @@ def run_niah_phase(payload, guard=None, label=''):
                     if guard is not None:
                         guard.record_run(time.time() - t0, step, 256, 6, 512, 12)
                     continue
-                torch.save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'params': L.count_params(model)}, ck)
+                _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'params': L.count_params(model)}, ck)
                 if guard is not None:
                     guard.record_run(time.time() - t0, n_steps, 256, 6, 512, 12)
                 del model, opt
@@ -1112,14 +1117,19 @@ def run_lenphase(payload, guard=None, label=''):
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
             stale = False
             if os.path.exists(ck):
-                _meta = torch.load(ck, map_location='cpu', weights_only=False)
-                stale = _meta.get('code') != CKPT_CODE
-                if stale:
-                    print(f'[p1l] {v} s{seed}: checkpoint predates CKPT_CODE={CKPT_CODE} (code={_meta.get('code')!r}) — RETRAINING')
-                elif _meta.get('recipe') != _recipe:
+                try:
+                    _meta = torch.load(ck, map_location='cpu', weights_only=False)
+                except Exception as _cke:
+                    print(f'[p1l] {v} s{seed}: checkpoint unreadable ({type(_cke).__name__}: {_cke}) — RETRAINING')
                     stale = True
-                    print(f'[p1l] {v} s{seed}: checkpoint recipe mismatch (stored {_meta.get('recipe')!r}) — RETRAINING')
-                del _meta
+                else:
+                    stale = _meta.get('code') != CKPT_CODE
+                    if stale:
+                        print(f'[p1l] {v} s{seed}: checkpoint predates CKPT_CODE={CKPT_CODE} (code={_meta.get('code')!r}) — RETRAINING')
+                    elif _meta.get('recipe') != _recipe:
+                        stale = True
+                        print(f'[p1l] {v} s{seed}: checkpoint recipe mismatch (stored {_meta.get('recipe')!r}) — RETRAINING')
+                    del _meta
             if stale or not os.path.exists(ck):
                 key0 = f'{v}::seed{seed}'
                 if summary.get(key0) is not None:
@@ -1150,10 +1160,7 @@ def run_lenphase(payload, guard=None, label=''):
                     torch.cuda.empty_cache()
                     continue
                 model = _tr.pop('_model')
-                try:
-                    torch.save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model)}, ck)
-                finally:
-                    pass
+                _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model)}, ck)
                 if guard is not None:
                     guard.record_run(time.time() - t0, steps, 256, 6, train_len, 12)
                 del model

@@ -39,7 +39,7 @@ def _panel_seeds():
         for _k, _r in _pnl.items():
             if not isinstance(_r, dict):
                 continue
-            if str(_r.get('variant', str(_k).split('::')[0])) != _v:
+            if str(_r.get('variant') or str(_k).split('::')[0]) != _v:
                 continue
             if _r.get('synthesized') or not L.ppl_is_usable(_r.get('ppl')):
                 continue
@@ -48,7 +48,7 @@ def _panel_seeds():
                 continue
             try:
                 _sv.add(int(_s))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
         sets.append(_sv)
     common = set.intersection(*sets) if sets else set()
@@ -236,6 +236,7 @@ def main(argv=None):
             probe['sd_ppl'] = float(sample_std(d_ppl)) if len(d_ppl) > 1 else None
             probe['p_ppl'] = float(p_ppl) if p_ppl is not None else None
             probe['n'] = int(len(d_f1))
+            probe['n_ppl'] = int(len(d_ppl))
         else:
             probe['x_d_f1'] = float(d_f1.mean()) if len(d_f1) else None
             probe['x_sd_f1'] = float(sample_std(d_f1)) if len(d_f1) > 1 else None
@@ -396,6 +397,7 @@ def main(argv=None):
         _blk_line = '2. **分块行为的偏移量未测量**：本节无法从产物算出两臂的逐层块长差（层表不一致或统计量缺失），因此**不对「分块行为是否不变」作断言**。\n'
     lines.append('\n## 机制结论（与上方计算结果一致）\n')
     _n_p = probe.get('n')
+    _n_pp = probe.get('n_ppl')
     _f1_d, _f1_p = (probe.get('d_f1'), probe.get('p_f1'))
     _ppl_d, _ppl_p = (probe.get('d_ppl'), probe.get('p_ppl'))
     _f1_sig = _f1_p is not None and _f1_p < 0.05
@@ -412,7 +414,7 @@ def main(argv=None):
     elif _ppl_sig:
         _c3 = f'3. **PPL 存在可分辨的差异**：同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')} < 0.05），「PPL 不变」的读法在本轮产物上不成立。\n'
     else:
-        _c3 = f'3. **PPL 同样不变**：两条验证 PPL 轨迹全程重叠（见 `fuse_ppl_traj.png`），同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')}），跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL——配对符号翻转 p 值打在 n={_n_p or '?'} 的分辨率下限上，任何差异不能排除是种子噪声。\n'
+        _c3 = f'3. **PPL 同样不变**：两条验证 PPL 轨迹全程重叠（见 `fuse_ppl_traj.png`），同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')}），跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL——配对符号翻转 p 值打在 n={_n_pp or '?'} 的分辨率下限上，任何差异不能排除是种子噪声。\n'
     if _blk_stable and not _f1_sig and not _ppl_sig and (_f1_d is not None) and (_ppl_d is not None):
         _c4 = '4. **结论写法（可直接引用）**：在 1500 步 budget 区间，用于边界检测的邻域表示融合是一个**惰性旋钮（inert knob）**——它既没有稳定改善动态分块的边界对齐质量，在上文第 2 条核验通过的范围内也没有改变块长分布，更没有转化为语言建模收益。这与全套实验的主结论一致：该 budget 下 LM 损失对分块质量不敏感（v4 全部消融臂停在同一 PPL 水平），且动态分块母轴本身在 4 个面板（核心表/20k 长跑/RoPE/scale）都与固定分块贴平。\n'
     else:

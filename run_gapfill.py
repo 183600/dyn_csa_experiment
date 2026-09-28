@@ -73,12 +73,27 @@ def synthesize_long_summary():
             raise
     n_synth = n_kept = n_replaced = n_backfill = 0
     _unaligned = []
+    _split = []
+
+    def _canon(v, e):
+        if '@' in str(v):
+            return None
+        real_v = e.get('variant') if isinstance(e, dict) else None
+        if not isinstance(real_v, str) or not real_v:
+            real_v = str(v).split('#')[0]
+        _proto = e.get('protocol') if isinstance(e, dict) else None
+        return (real_v, str(_proto) if _proto else None)
     for v, e in agg.items():
         _ppls = e.get('ppls') or []
         _seeds = e.get('seeds')
         if not _ppls:
             continue
-        _real = sorted((r.get('seed') for r in summary.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None)))
+        _c = _canon(v, e)
+        if _c is None:
+            _split.append(v)
+            continue
+        real_v, _proto = _c
+        _real = sorted((r.get('seed') for r in summary.values() if isinstance(r, dict) and r.get('variant') == real_v and (r.get('seed') is not None)))
         if _seeds is None or len(_seeds) != len(_ppls):
             _unaligned.append((v, len(_ppls), _real))
             continue
@@ -93,20 +108,26 @@ def synthesize_long_summary():
             if _si in _agg_map and abs(_agg_map[_si] - _pi) > 1e-06 * max(1.0, abs(_pi)):
                 _bad_map = True
             _agg_map[_si] = _pi
-        _conflict = [_rs for _r in summary.values() if isinstance(_r, dict) and _r.get('variant') == v and (_r.get('seed') is not None) and (not _r.get('synthesized')) and (_r.get('steps') == _LONG_STEPS) and L.ppl_is_usable(_r.get('ppl')) for _rs in [_num_or_none(_r.get('seed'))] if _rs is None or _rs not in _agg_map or abs(float(_r['ppl']) - _agg_map[_rs]) > 1e-06 * max(1.0, abs(_agg_map[_rs]))]
+        _conflict = [_rs for _r in summary.values() if isinstance(_r, dict) and _r.get('variant') == real_v and (_r.get('seed') is not None) and (not _r.get('synthesized')) and (_r.get('steps') == _LONG_STEPS) and L.ppl_is_usable(_r.get('ppl')) for _rs in [_num_or_none(_r.get('seed'))] if _rs is None or _rs not in _agg_map or abs(float(_r['ppl']) - _agg_map[_rs]) > 1e-06 * max(1.0, abs(_agg_map[_rs]))]
         if _bad_map or _conflict:
             _unaligned.append((v, len(_ppls), _real))
     if _unaligned:
         for _v, _n, _real in _unaligned:
             print(f"[synth] REFUSING to synthesize `{_v}`: the aggregate holds {_n} PPL value(s) but carries no verified seed->ppl mapping (real per-seed records at seeds {_real}).  `enumerate` would attach the wrong seed's number to each key, replacing a genuine measurement with a copy.  Restore the per-seed records (or re-run the panel) — only this variant is skipped; the aligned variants are still rebuilt.")
-    _unaligned = {v for v, _n, _r in _unaligned}
+    for _v in _split:
+        print(f'[synth] REFUSING to synthesize `{_v}`: this aggregate key is a run_cfg-split group, so it cannot be mapped back to one canonical per-seed record — re-run the panel to get per-seed records; only this key is skipped')
+    _unaligned = {v for v, _n, _r in _unaligned} | set(_split)
     for v, e in agg.items():
         if v in _unaligned:
             continue
+        _c = _canon(v, e)
+        if _c is None:
+            continue
+        real_v, _proto = _c
         _seeds = e.get('seeds')
         for i, p in enumerate(e.get('ppls', [])):
             _seed = int(_seeds[i]) if _seeds is not None else i
-            key = f'{v}::seed{_seed}'
+            key = f'{real_v}::seed{_seed}'
             old = summary.get(key)
             if isinstance(old, dict) and 'ppl' in old and (old.get('steps') == _LONG_STEPS) and (not old.get('synthesized')):
                 n_kept += 1
@@ -120,7 +141,9 @@ def synthesize_long_summary():
                 continue
             if isinstance(old, dict) and 'ppl' in old:
                 n_replaced += 1
-            rec = {'variant': v, 'seed': _seed, 'steps': _LONG_STEPS, 'tokens_seen': e.get('tokens_seen'), 'ppl': float(p), 'params': _num_or_none(e.get('params')), 'synthesized': True, 'note': 'reconstructed from committed aggregate.json (v6); means exact, secondary-metric stds approximate'}
+            rec = {'variant': real_v, 'seed': _seed, 'steps': _LONG_STEPS, 'tokens_seen': e.get('tokens_seen'), 'ppl': float(p), 'params': _num_or_none(e.get('params')), 'synthesized': True, 'note': 'reconstructed from committed aggregate.json (v6); means exact, secondary-metric stds approximate'}
+            if _proto:
+                rec['protocol'] = _proto
             if 'ppl_curve' in e:
                 rec['ppl_history'] = e['ppl_curve']
             summary[key] = rec

@@ -71,7 +71,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=
         j = min(i + n_ch, n_seq)
         rows = []
         for jj in range(i, j):
-            _rk = (eval_len, jj, rho)
+            _rk = (eval_len, jj, rho, vocab)
             _row = row_cache.get(_rk) if row_cache is not None else None
             if _row is None:
                 ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
@@ -115,10 +115,15 @@ def _cell_ppl(nll_sum, n_tok):
     return math.exp(total / nt)
 
 def _probe_fingerprint(cfg):
-    return {'n_seq': int(cfg['n_seq']), 'chunk': int(cfg['chunk']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'stat': 'ppl_pooled_nll_v5'}
+    return {'n_seq': int(cfg['n_seq']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'stat': 'ppl_pooled_nll_v5'}
+
+def _fp_norm(p):
+    if not isinstance(p, dict):
+        return p
+    return {k: v for k, v in p.items() if k != 'chunk'}
 
 def _probe_params_current(rec, fp):
-    return isinstance(rec, dict) and rec.get('probe_params') == fp
+    return isinstance(rec, dict) and _fp_norm(rec.get('probe_params')) == _fp_norm(fp)
 
 def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
     outdir = cfg['outdir']
@@ -152,7 +157,28 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 print(f'[p3mp] SKIP {v} s{seed}: no checkpoint {ck} (run phase P3MT first)')
                 continue
             _defs = [(Ln, rho) for Ln in cfg['eval_lens'] for rho in cfg['rhos']]
-            d = torch.load(ck, map_location='cpu', weights_only=False)
+
+            def _cell_stale(_key, _fp_x):
+                _rec = summary.get(_key)
+                return not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_x))
+            _fp0 = _probe_fingerprint(cfg)
+            _todo = False
+            for arm in cfg['arms']:
+                if not _arm_of(v, arm):
+                    continue
+                for Ln, rho in _defs:
+                    if _cell_stale(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}', _fp0):
+                        _todo = True
+                        break
+                if _todo:
+                    break
+            if not _todo:
+                continue
+            try:
+                d = torch.load(ck, map_location='cpu', weights_only=False)
+            except Exception as _cle:
+                print(f'[p3mp] SKIP {v} s{seed}: checkpoint unreadable ({type(_cle).__name__}: {_cle}) — re-run the training phase (P3MT/P4MT) to regenerate it')
+                continue
             if d.get('code') != V.CKPT_CODE:
                 print(f'[p3mp] REFUSE {v} s{seed}: checkpoint predates the current code stamp (code={d.get('code')!r}) — re-run the training phase (P3MT/P4MT) first')
                 del d
@@ -167,20 +193,6 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 print(f"[p3mp] {v} s{seed}: probe cfg vocab={int(cfg['vocab'])} differs from the checkpoint's vocab={_vocab_ck} — using the checkpoint's (the model is what is being scored)")
             _pcfg = dict(cfg, vocab=_vocab_ck)
             _fp = _probe_fingerprint(_pcfg)
-            _todo = False
-            for arm in cfg['arms']:
-                if not _arm_of(v, arm):
-                    continue
-                for Ln, rho in _defs:
-                    _rec = summary.get(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}')
-                    if not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp)):
-                        _todo = True
-                        break
-                if _todo:
-                    break
-            if not _todo:
-                del d
-                continue
             model = None
             for arm in cfg['arms']:
                 if not _arm_of(v, arm):
@@ -234,6 +246,8 @@ def run_phase(name, guard):
     for pname, kind, payload, seeds, _h in PHASES:
         if pname != name:
             continue
+        if seeds:
+            payload = dict(payload, seeds=list(seeds))
         if kind == 'lenphase':
             return V.run_lenphase(payload, guard=guard, label=f'v10 {pname}')
         if kind == 'probe':
@@ -297,17 +311,34 @@ def _hist_by_seed(outdir, variant):
         seen[fp] = s
         synth_of[s] = bool(r.get('synthesized'))
         cfg_of[s] = r.get('run_cfg')
-        out[s] = r['ppl_history']
+        _clean_hist = []
+        _n_badpt = 0
+        for _pt in r['ppl_history']:
+            try:
+                _t = int(_pt[0])
+                _v2 = float(_pt[1])
+            except (TypeError, ValueError, IndexError):
+                _n_badpt += 1
+                continue
+            if not (math.isfinite(_v2) and _v2 > 0):
+                _n_badpt += 1
+                continue
+            _clean_hist.append([_t, _v2])
+        if _n_badpt:
+            print(f'[v10 stats] {_k}: {_n_badpt} non-finite/non-positive curve point(s) dropped before the crossover math')
+        out[s] = _clean_hist
     if len(out) > 1:
         _groups = {}
         for s in out:
             _groups.setdefault(json.dumps(cfg_of.get(s), sort_keys=True, default=str), []).append(s)
         if len(_groups) > 1:
-            _keep = max(_groups.values(), key=len)
+            _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
+            _ranked = sorted(_groups.values(), key=lambda g: (not any((isinstance(cfg_of.get(_s), str) and cfg_of[_s].endswith(_cur_sfx) for _s in g)), -len(g)))
+            _keep = _ranked[0]
             _dropped = sorted((s for s in out if s not in set(_keep)))
-            print(f'[stats] {sp}: `{variant}` curves span {len(_groups)} distinct run_cfg groups — pooling across configurations is not allowed, so the trajectory keeps only the largest group ({len(_keep)}/{len(out)} seeds) and drops seeds {_dropped}')
+            print(f'[stats] {sp}: `{variant}` curves span {len(_groups)} distinct run_cfg groups — pooling across configurations is not allowed, so the trajectory keeps only one group ({len(_keep)}/{len(out)} seeds, preferring the one stamped with the current code semantics) and drops seeds {_dropped}')
             if sum((1 for g in _groups.values() if len(g) == len(_keep))) > 1:
-                print(f'[stats] {sp}: `{variant}` run_cfg groups TIE at {len(_keep)} seed(s) each — the first-admitted group {sorted(_keep)} is kept; the tied alternatives are dropped, so this panel contributes fewer seeds than were measured')
+                print(f'[stats] {sp}: `{variant}` run_cfg groups TIE at {len(_keep)} seed(s) each — the kept group is {sorted(_keep)}; the tied alternatives are dropped, so this panel contributes fewer seeds than were measured')
             for s in _dropped:
                 del out[s]
                 synth_of.pop(s, None)
@@ -454,7 +485,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 continue
             key = (r['variant'], r['arm'], r['eval_len'], r['rho'])
             seen = _param_conflict.setdefault(key, set())
-            seen.add(tuple(sorted(p.items())))
+            seen.add(tuple(sorted(_fp_norm(p).items())))
         _bad = {k: sorted(v) for k, v in _param_conflict.items() if len(v) > 1}
         if _bad:
             raise ValueError('v10_analysis: the P3MP probe panel mixes probe parameters under one cell key, so its mean and its paired contrasts would difference two different measurements. Re-probe the cell(s): ' + '; '.join((f'{k}' for k in sorted(_bad)[:3])))
@@ -494,7 +525,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     other = cell_mean('full_rope', 'dense', Ln, rho) if arm == 'dense' else cell_mean('csa_fixed_rope', arm, Ln, rho)
                     if not learned or not other:
                         continue
-                    if learned.get('probe_params') != other.get('probe_params'):
+                    if _fp_norm(learned.get('probe_params')) != _fp_norm(other.get('probe_params')):
                         print(f'[v10 stats] L{Ln} r{rho} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
                         continue
                     common = sorted(set(learned['ppl_by_seed']) & set(other['ppl_by_seed']))
@@ -566,8 +597,7 @@ def _fmt_pm(cell, std=None):
 
 def build_report(out='REPORT_v10.md'):
     stats_p = 'analysis_v10/stats.json'
-    if not os.path.exists(stats_p):
-        v10_analysis()
+    v10_analysis()
     st = json.load(open(stats_p, encoding='utf-8'))
     probe = st['probe']
     xo = st['crossover_panels']
@@ -611,6 +641,13 @@ def build_report(out='REPORT_v10.md'):
             rows = [r for r in mech_sum.values() if r.get('variant') == v and 'by_len' in r]
             if not rows:
                 continue
+            _cur_rows = [r for r in rows if r.get('_code') == L.CODE_SEMANTICS]
+            if _cur_rows:
+                if len(_cur_rows) < len(rows):
+                    print(f'[v10 report] {v}: {len(rows) - len(_cur_rows)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur_rows)} current one(s)')
+                    rows = _cur_rows
+            else:
+                print(f'[v10 report] {v}: no by-length record carries the current code semantics ({L.CODE_SEMANTICS}) — quoting all {len(rows)} (they predate it; re-run the training phase to refresh)')
 
             def _at(Ln, rows=rows):
                 cells = L.by_len_cells(rows, Ln)
@@ -739,7 +776,11 @@ def build_report(out='REPORT_v10.md'):
     _xo256 = xo.get('d256_L6') or next((v for v in xo.values() if v.get('d') == 256), {})
     _xo256_step = _xo256.get('mean_crossover_step')
     _xo256_txt = f'~{_xo256_step:g} 步' if isinstance(_xo256_step, (int, float)) and math.isfinite(_xo256_step) else '步数未知（该规模无有效交叉读数）'
-    A(f'**注意**：d=256 的轨迹取自 `results_lm_v3_long/summary.json`（v6 重构件，见 README 记账说明 #1）——逐种子轨迹不可独立恢复，该规模的逐种子交叉步互为副本，只有 seed 均值轨迹的交叉步（{_xo256_txt}，eval 网格 1000 步）是有效读数。')
+    _xo256_recon = any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', [])))
+    if _xo256_recon:
+        A(f'**注意**：d=256 的轨迹取自 `results_lm_v3_long/summary.json`（v6 重构件，见 README 记账说明 #1）——逐种子轨迹不可独立恢复，该规模的逐种子交叉步互为副本，只有 seed 均值轨迹的交叉步（{_xo256_txt}，eval 网格 1000 步）是有效读数。')
+    else:
+        A(f'**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步（{_xo256_txt} 附近）与 seed 均值轨迹同为有效读数。')
     A('')
     if fit:
         _excl = []

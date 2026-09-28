@@ -94,11 +94,19 @@ def _panel_block(panel):
         recs = dict(d)
         if recs and all((isinstance(r, dict) for r in recs.values())):
             by_cfg = {}
+            raw_cfg = {}
             for s, r in recs.items():
-                by_cfg.setdefault(json.dumps(r.get('run_cfg'), sort_keys=True, default=str), {})[s] = r
+                _gk = json.dumps(r.get('run_cfg'), sort_keys=True, default=str)
+                by_cfg.setdefault(_gk, {})[s] = r
+                raw_cfg[_gk] = r.get('run_cfg')
             if len(by_cfg) > 1:
-                keep = max(by_cfg.values(), key=len)
-                print(f'[stats] _panel_block: variant `{v}` spans {len(by_cfg)} distinct run_cfg groups — pooling across configurations is not allowed, so the table keeps only the largest group ({len(keep)}/{len(recs)} seeds) and drops the rest')
+                _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
+                _ranked = sorted(by_cfg.items(), key=lambda kv: (not (isinstance(raw_cfg.get(kv[0]), str) and raw_cfg[kv[0]].endswith(_cur_sfx)), -len(kv[1])))
+                keep = _ranked[0][1]
+                _ties = [g for _k, g in _ranked[1:] if len(g) == len(keep)]
+                print(f'[stats] _panel_block: variant `{v}` spans {len(by_cfg)} distinct run_cfg groups — pooling across configurations is not allowed, so the table keeps only one group ({len(keep)}/{len(recs)} seeds, preferring the one stamped with the current code semantics) and drops the rest')
+                if _ties:
+                    print(f'[stats] _panel_block: variant `{v}` run_cfg groups TIE at {len(keep)} seed(s) each — the kept group is {sorted(keep)}; the tied alternatives are dropped, so this panel contributes fewer seeds than were measured')
                 recs = keep
         vals = [(r.get('ppl') if isinstance(r, dict) else r) for r in recs.values()]
         ppl_map = {s: (r.get('ppl') if isinstance(r, dict) else r) for s, r in recs.items()}
@@ -200,7 +208,7 @@ def run_smoke():
     t0 = time.time()
     rec = L.train_variant('csa_fixed_rope', train_ids, val_batch, vocab, seed=0, steps=60, eval_every=30, eval_subset=16, log_every=30, val_bnd=vb)
     dt = time.time() - t0
-    guard.record_run(dt, 60, 256, 6, 512, 12)
+    guard.record_run(dt, 60, 256, 6, 512, 12, calib_seconds=rec.get('train_time_s'))
     print(f'  60 steps in {dt:.0f}s -> {dt / 60:.3f} s/step (ppl {rec['ppl']:.1f}); booked to the v8 guard for calibration')
     est = guard.estimate_seconds(20000, d=256, n_layers=6, seq_len=512, batch_size=12)
     print(f'  -> 20k-step RoPE run estimate: {est / 3600:.2f} h (¥{est / 3600 * guard.price:.2f})')

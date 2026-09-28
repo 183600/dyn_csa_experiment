@@ -192,8 +192,7 @@ def _fmt_pm(cell, std=None):
 
 def build_report(out='REPORT_v9.md'):
     stats_p = 'analysis_v9/stats.json'
-    if not os.path.exists(stats_p):
-        v9_analysis()
+    v9_analysis()
     st = json.load(open(stats_p, encoding='utf-8'))
     seq2k = st['seq2k_bs1_panel']
     seq2k_old = st.get('seq2k_bs3_panel_historical', {})
@@ -420,7 +419,7 @@ def run_smoke():
     finally:
         _V9_CKPT['on'] = False
     dt = time.time() - t0
-    guard.record_run(dt, 60, 256, 6, 2048, 1)
+    guard.record_run(dt, 60, 256, 6, 2048, 1, calib_seconds=rec.get('train_time_s'))
     print(f'  60 steps in {dt:.0f}s -> {dt / 60:.3f} s/step (ppl {rec['ppl']:.1f}); booked to the v9 guard for calibration')
     est = guard.estimate_seconds(1500, d=256, n_layers=6, seq_len=2048, batch_size=1)
     print(f'  -> 1500-step bs1 seq2k run estimate: {est / 60:.1f} min (¥{est / 3600 * guard.price:.2f}); full P2T (10 runs) ~{10 * est / 3600:.2f} h')

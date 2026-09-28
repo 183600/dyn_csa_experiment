@@ -87,10 +87,12 @@ nohup python v11_supp.py full > run_v11.log 2>&1 &
 python v11_supp.py report         # rebuild REPORT_v11.md from disk (zero GPU)
 ```
 
-Phases: P4MT (RoPE-arm seeds 3-5, exact P1L/P3MT recipe), P4MP (probe
-resume for the new seeds, eval-only), P4SS/P4SL (crossover panels seeds
-2/3), P4F (d=384 `csa_fixed`/`full` seeds 0-3 under one config, so the
-panel pairs at n=4). Books against
+Phases: P4MT (RoPE-arm seeds 0-5, exact P1L/P3MT recipe; resume skips
+checkpoints whose code stamp is still current), P4MP (probe resume for
+the same seed set, eval-only, stale cells re-measured), P4SS/P4SL
+(crossover panels seeds 0-3, same resume rule), P4F (d=384
+`csa_fixed`/`full` seeds 0-3 under one config, so the panel pairs at
+n=4). Books against
 `autodl_budget_state_v11.json` (default cap ¥30); `V11_*` env vars mirror
 the earlier ones.
 

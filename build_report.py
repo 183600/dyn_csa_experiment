@@ -3,6 +3,7 @@ import collections
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -83,6 +84,42 @@ def _int_or(v, default):
     if isinstance(v, float):
         return int(v) if math.isfinite(v) else default
     return default
+
+def _code_semantics():
+    try:
+        with open(os.path.join(REPO, 'exp_lib.py'), encoding='utf-8') as f:
+            m = re.search("^CODE_SEMANTICS = '([^']+)'", f.read(), re.M)
+            return m.group(1) if m else None
+    except Exception:
+        return None
+_CUR_CS = _code_semantics()
+
+def _tag_of(r):
+    if r.get('protocol') is not None:
+        return str(r['protocol'])
+    if r.get('warm_steps') is not None:
+        return f"w{r['warm_steps']}"
+    return ''
+
+def _prefer_one_cfg(items, cfg_of, who=''):
+    by = collections.defaultdict(list)
+    for it in items:
+        by[cfg_of(it)].append(it)
+    per = collections.defaultdict(list)
+    for (label, cfg), lst in by.items():
+        per[label].append((cfg, lst))
+    kept, dropped = ([], [])
+    for label, gl in per.items():
+        if len(gl) == 1:
+            kept.extend(gl[0][1])
+            continue
+        gl.sort(key=lambda kv: (not (isinstance(kv[0], str) and _CUR_CS and kv[0].endswith(f'_cs{_CUR_CS}')), -len(kv[1])))
+        kept.extend(gl[0][1])
+        for _cfg, lst in gl[1:]:
+            dropped.extend(lst)
+    if dropped:
+        print(f'[report] {who}: {len(dropped)} record(s) sit in a minority run_cfg group of their variant — pooling across configurations is not allowed, so one group per variant is kept (the current code stamp preferred) and the rest are dropped from this table')
+    return kept
 PARAM_MATCH_TOL = 0.015
 PARAM_MATCH_SMALL = 0.3
 PARAM_MATCH_ARCH = 0.06
@@ -123,16 +160,20 @@ def per_seed_ppls(outdir):
     out = collections.defaultdict(dict)
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
+            if isinstance(r['seed'], bool):
+                print(f"[report] record {_k!r} in {outdir} carries a boolean seed — skipped for pairing")
+                continue
             try:
                 _sd = int(r['seed'])
             except (TypeError, ValueError, OverflowError):
                 print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
                 continue
             _slot = out[r['variant']]
-            if _sd in _slot:
-                print(f'[report] ambiguous (variant, seed) = ({r['variant']!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
+            _tk = (_tag_of(r), _sd)
+            if _tk in _slot:
+                print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
                 continue
-            _slot[_sd] = float(r['ppl'])
+            _slot[_tk] = float(r['ppl'])
     return dict(out)
 
 def per_seed_records(outdir):
@@ -140,16 +181,20 @@ def per_seed_records(outdir):
     out = collections.defaultdict(dict)
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
+            if isinstance(r['seed'], bool):
+                print(f"[report] record {_k!r} in {outdir} carries a boolean seed — skipped for pairing")
+                continue
             try:
                 _sd = int(r['seed'])
             except (TypeError, ValueError, OverflowError):
                 print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
                 continue
             _slot = out[r['variant']]
-            if _sd in _slot:
-                print(f'[report] ambiguous (variant, seed) = ({r['variant']!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
+            _tk = (_tag_of(r), _sd)
+            if _tk in _slot:
+                print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
                 continue
-            _slot[_sd] = r
+            _slot[_tk] = r
     return dict(out)
 
 def _pair_reason(ra, rb):
@@ -238,11 +283,25 @@ def sec_p0r():
             lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线——落盘记录显示 `full_rope` 的 MLP 停在标准宽度（{_params_m(_fu_r)}），而 `csa_fixed_rope` 保持全宽（{_params_m(_cf_r)}），相差 {100 * (param_gap(_cf_r, _fu_r) or 0):.1f}%。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
         _arms_gain = d_abs > 0 and d_sp > 0
         _gain_txt = 'RoPE+QK-norm 对两臂都有真实增益，值得保留为新默认' if _arms_gain else f'RoPE+QK-norm 并未对两臂都带来增益（dense {_d_abs_t}、sparse {_d_sp_t}）'
+        _pair_mt = None
         if _has_mt:
-            if g_abs_m < 0:
-                _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍显著为负，**P0-3 的混淆假设被证伪**，反而**强化**了论文的负结果——sparse 在该 budget 下的落后是机制性的。'
+            _ps_ab = per_seed_records('results_lm_v3_1500')
+            _pair_mt = paired_row(_ps_ab.get('csa_fixed', {}), _ps_ab.get('full_matched', {}))
+        if _has_mt:
+            if _pair_mt is not None:
+                _st_mt = _pair_mt[2]
+                _mt_stat = f'配对符号翻转 n={_st_mt['n']}、p={_st_mt['p_exact_signflip']:.3f}（Δ mean={_st_mt['mean']:+.2f}）'
+                _mt_sig = _st_mt['p_exact_signflip'] < 0.05
             else:
-                _p0r_concl = f'**结论**：{_gain_txt}；但参数对齐的 absPE 数字中 `csa_fixed` 落后 `full_matched` **{abs(g_abs_m):.2f}** PPL——方向与原论断相反，**P0-3 的混淆假设在本轮未被证伪**，PE 错配不能排除在 sparse 的差距之外。'
+                _mt_stat = '本面板没有可通过配对门禁的同配置种子对，显著性无法检验'
+                _mt_sig = False
+            if g_abs_m < 0:
+                if _mt_sig:
+                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍显著为负（{_mt_stat}），**P0-3 的混淆假设被证伪**，反而**强化**了论文的负结果——sparse 在该 budget 下的落后是机制性的。'
+                else:
+                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）方向为负（{_mt_stat}），**P0-3 的混淆假设被证伪**——sparse 在该 budget 下的落后是机制性的；其显著性按配对检验的实际分辨率表述，不作超出分辨率的显著性主张。'
+            else:
+                _p0r_concl = f'**结论**：{_gain_txt}；但参数对齐的 absPE 数字中 `csa_fixed` 落后 `full_matched` **{abs(g_abs_m):.2f}** PPL（{_mt_stat}）——方向与原论断相反，**P0-3 的混淆假设在本轮未被证伪**，PE 错配不能排除在 sparse 的差距之外。'
         else:
             _p0r_concl = f'**结论（受限）**：`csa_fixed` 在 absPE 面板{_w_abs}未匹配的 `full`，{_gain_txt}。但**参数对齐的 absPE 臂（`full_matched`）在本面板缺失**，所以「容量差贡献了多少」无法剥离，**P0-3 的证伪在本轮没有证据支持**——本条只作方向性表述，须待 `full_matched` 产出后方可作结论。'
         lines += [_p0r_concl, '']
@@ -258,11 +317,14 @@ def sec_p0w():
             continue
         rows.append((r.get('variant', '?'), _int_or(r.get('warm_steps'), -1), _int_or(r.get('seed'), -1), r.get('ppl'), r.get('ppl_at_switch'), r.get('train_time_s', 0) / 60.0 if r.get('train_time_s') else None, r.get('synthesized', False), k))
     rows.sort(key=lambda x: (x[0], x[1], x[2]))
+    rows = [row for row in rows if _measurable({'ppl': row[3], 'synthesized': row[6]})]
+    rows = _prefer_one_cfg(rows, lambda row: ((row[0], row[1]), (s.get(row[-1]) or {}).get('run_cfg')), who='sec_p0w')
+    _kept_keys = {row[-1] for row in rows}
     grp = collections.defaultdict(list)
     for v, w, sd, ppl, sw, mins, syn, _k in rows:
         if _measurable({'ppl': ppl, 'synthesized': syn}):
             grp[v, w].append((ppl, sw, mins, sd))
-    lines = ['## P0-1 dense→sparse warmup 是否能让 sparse 追平 dense？（评审「必做」项）', '', '**评审论断**：论文 §4.2.2 先训 1T token 的 dense 再在 seq 64K 切 sparse；仓库所有 sparse run 都是 from-scratch，故「渐近线更差」可能是没 warmup 的产物。不给这个实验，「渐近线反转」立不住。', '', '**做法**：`train_warmup` 用**相同全长度 cosine LR**，前 `warm_steps` 步走 dense 前向（复用各 csa/hca 层自己的 `W_kvhead` per-token KV 路径 + 同一 sink，不引入新参数），到点切换为 sparse 并记录切换瞬间 PPL。网格 `warm ∈ {0,5000,10000}` × **2 seeds**（15-run 设计受预算上限约束），20k 步、seq 512。**两臂参数/步数/token 数/初始 PPL/LR 曲线完全相同**，唯一差异是切点。', '', '| variant | warm_steps | PPL (mean±std) | n | 切换时 PPL |', '|---|---|---|---|---|']
+    lines = ['## P0-1 dense→sparse warmup 是否能让 sparse 追平 dense？（评审「必做」项）', '', '**评审论断**：论文 §4.2.2 先训 1T token 的 dense 再在 seq 64K 切 sparse；仓库所有 sparse run 都是 from-scratch，故「渐近线更差」可能是没 warmup 的产物。不给这个实验，「渐近线反转」立不住。', '', '**做法**：`train_warmup` 用**相同全长度 cosine LR**，前 `warm_steps` 步走 dense 前向（复用各 csa/hca 层自己的 `W_kvhead` per-token KV 路径 + 同一 sink，不引入新参数），到点切换为 sparse 并记录切换瞬间 PPL。网格 `warm ∈ {0,5000,10000}`（每格 seed 数以下表 n 列为准），20k 步、seq 512。**两臂参数/步数/token 数/初始 PPL/LR 曲线完全相同**，唯一差异是切点。', '', '| variant | warm_steps | PPL (mean±std) | n | 切换时 PPL |', '|---|---|---|---|---|']
     for (v, w), vals in sorted(grp.items()):
         ppls = [p for p, _s, _m, _sd in vals]
         mean = sum(ppls) / len(ppls)
@@ -305,6 +367,8 @@ def sec_p0w():
                 lines.append(f'| {st} | ' + ' | '.join(cells) + ' |')
         rec_by_s = collections.defaultdict(dict)
         for _k, _r in s.items():
+            if _k not in _kept_keys:
+                continue
             if not (isinstance(_r, dict) and _measurable(_r)):
                 continue
             _sd = _int_or(_r.get('seed'), -1)
@@ -361,13 +425,14 @@ def sec_p0e():
     if not d:
         return '## P0-2 渐近线是否反演（40k 长跑）— （无结果）\n\n'
     s = summary('results_lm_v7_long40')
-    lines = ['## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / ~246M tokens）', '', '**评审论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等 budget 下收敛更慢」。', '', '**做法**：`csa_fixed` + `full` × 2 seeds，同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (mean±std) | n | params |', '|---|---|---|---|']
+    lines = ['## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / ~246M tokens）', '', '**评审论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等 budget 下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (mean±std) | n | params |', '|---|---|---|---|']
     for v in sorted(d):
         r = d[v]
         lines.append(f'| `{v}` | {fm(r.get('ppl_mean'))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
+    _s_items = _prefer_one_cfg([_kv for _kv in s.items() if isinstance(_kv[1], dict) and 'variant' in _kv[1] and _measurable(_kv[1])], lambda kv: (kv[1].get('variant'), kv[1].get('run_cfg')), who='sec_p0e')
     trajs = collections.defaultdict(lambda: collections.defaultdict(list))
     _dropped_pts = 0
-    for _k, r in s.items():
+    for _k, r in _s_items:
         if not isinstance(r, dict) or 'variant' not in r:
             continue
         if not _measurable(r):
@@ -431,7 +496,7 @@ def sec_p1t():
     if not d:
         return '## P1 选择率错配 / m=1 对照（seq 2048 topk 扫描）— （无结果）\n\n'
     order = ['csa_fix_m1', 'csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fixed']
-    lines = ['## P1 选择率错配 与 m=1(纯 DSA) 对照（seq 2048, topk 扫描）', '', '**评审论断**：仓库 seq 512 时选择率 25%，论文在长序列约 0.2%。`topk` 是主控旋钮，需要扫描；且缺 m=1（纯 DSA，不压缩）对照。', '', '**做法**：seq 2048、1500 步、2 seeds，扫描 `topk ∈ {8,32,128,512}` 并加入 `csa_fix_m1`（block_size=1, overlap=0 → 逐 token 选择 = 纯 DSA）。', '', '| variant | PPL (mean±std) | n | 等效选择率@2048 (topk/512 blocks) |', '|---|---|---|---|']
+    lines = ['## P1 选择率错配 与 m=1(纯 DSA) 对照（seq 2048, topk 扫描）', '', '**评审论断**：仓库 seq 512 时选择率 25%，论文在长序列约 0.2%。`topk` 是主控旋钮，需要扫描；且缺 m=1（纯 DSA，不压缩）对照。', '', '**做法**：seq 2048、1500 步（seed 数见下表），扫描 `topk ∈ {8,32,128,512}` 并加入 `csa_fix_m1`（block_size=1, overlap=0 → 逐 token 选择 = 纯 DSA）。', '', '| variant | PPL (mean±std) | n | 等效选择率@2048 (topk/512 blocks) |', '|---|---|---|---|']
     seen = set()
     for v in order + sorted(d):
         if v in seen or v not in d:
@@ -448,7 +513,12 @@ def sec_p1t():
         if v == 'csa_fix_m1':
             sr = '1.6% (m=1, topk=32)'
         elif v.startswith('csa_fixed_topk'):
-            k = int(v.replace('csa_fixed_topk', ''))
+            _kv = v.replace('csa_fixed_topk', '').split('@')[0].split('#')[0]
+            try:
+                k = int(_kv)
+            except ValueError:
+                print(f'[report] sec_p1t: cannot parse topk from aggregate key {v!r} — row omitted')
+                continue
             sr = f'{min(k, 512) / 512:.1%}'
         else:
             sr = '6.25% (default topk=32)'
@@ -468,9 +538,8 @@ def sec_p1t():
     ks = [8, 32, 128, 512]
     rows_k = []
     for k in ks:
-        v = f'csa_fixed_topk{k}'
-        if v in d:
-            r = d[v]
+        r = _agg_entry(d, f'csa_fixed_topk{k}')
+        if r is not None:
             ppls = r.get('ppls') or r.get('ppl_list')
             m = sum(ppls) / len(ppls) if ppls else r.get('ppl_mean')
             if isinstance(m, (int, float)):
@@ -486,9 +555,9 @@ def sec_p1t():
         else:
             lines.append('存在非单调点：存在一个「少选反而更好/更差」的转折（见上表），提示 topk 存在 budget 相关的最优值。')
         lines.append('')
-    m1 = d.get('csa_fix_m1')
-    t8 = d.get('csa_fixed_topk8')
-    t32 = d.get('csa_fixed_topk32')
+    m1 = _agg_entry(d, 'csa_fix_m1')
+    t8 = _agg_entry(d, 'csa_fixed_topk8')
+    t32 = _agg_entry(d, 'csa_fixed_topk32')
 
     def _mean(r):
         if not r:
@@ -506,13 +575,29 @@ def sec_p1t():
         return _int_or(r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n'), 0)
     _n8, _n32 = (_n_of(t8), _n_of(t32))
     lines += ['', '**结论（基于已完成的扫描点）**：', '']
-    if all((isinstance(x, (int, float)) for x in (m1m, t8m, t32m))):
-        if m1m > t8m and m1m > t32m:
-            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最差的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}，n={min(_n8, _n32)} 同向）：去掉压缩并没有拯救 sparse 臂——在 seq 2048 / 1500 步的受控 budget 下，**压缩不是瓶颈**，评审「缺 m=1 对照」的质疑得到直接回答（方向与整体负结果一致）。')
-        elif m1m < t8m and m1m < t32m:
-            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最好的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}，n={min(_n8, _n32)}）：去掉压缩反而占优——在 seq 2048 / 1500 步的受控 budget 下，**压缩是当前的瓶颈之一**，评审「缺 m=1 对照」的质疑得到直接回答。')
+    _m1_ok = isinstance(m1m, (int, float))
+    _t_ok = isinstance(t8m, (int, float)) and isinstance(t32m, (int, float))
+    if _m1_ok and _t_ok:
+        _ps2k = per_seed_ppls('results_lm_v7_seq2k')
+        _m1_s, _t8_s, _t32_s = (_ps2k.get('csa_fix_m1', {}), _ps2k.get('csa_fixed_topk8', {}), _ps2k.get('csa_fixed_topk32', {}))
+        _c3 = sorted(set(_m1_s) & set(_t8_s) & set(_t32_s))
+        if _c3:
+            _nw = sum((1 for sk in _c3 if _m1_s[sk] > _t8_s[sk] and (_m1_s[sk] > _t32_s[sk])))
+            _nb = sum((1 for sk in _c3 if _m1_s[sk] < _t8_s[sk] and (_m1_s[sk] < _t32_s[sk])))
+            _dir3 = f'（逐 seed：{len(_c3)} 个三方公共 seed 中，{_nw} 个 m1 最差、{_nb} 个 m1 最好）'
         else:
-            lines.append(f'1. m=1（{fm(m1m)}）介于 topk8（{fm(t8m)}）与 topk32（{fm(t32m)}）之间，三点排序非单调（n={min(_n8, _n32)}）；评审「缺 m=1 对照」的质疑得到直接回答，但压缩是否瓶颈需结合显著性判断，此处只作方向性表述。')
+            _dir3 = '（无三方公共 seed，逐 seed 方向不可核验）'
+        if m1m > t8m and m1m > t32m:
+            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最差的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩并没有拯救 sparse 臂——在 seq 2048 / 1500 步的受控 budget 下，**压缩不是瓶颈**，评审「缺 m=1 对照」的质疑得到直接回答（方向与整体负结果一致）。')
+        elif m1m < t8m and m1m < t32m:
+            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最好的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩反而占优——在 seq 2048 / 1500 步的受控 budget 下，**压缩是当前的瓶颈之一**，评审「缺 m=1 对照」的质疑得到直接回答。')
+        else:
+            lines.append(f'1. m=1（{fm(m1m)}）介于 topk8（{fm(t8m)}）与 topk32（{fm(t32m)}）之间，三点排序非单调{_dir3}；评审「缺 m=1 对照」的质疑得到直接回答，但压缩是否瓶颈需结合显著性判断，此处只作方向性表述。')
+    elif _m1_ok:
+        lines.append(f'1. m=1 测得 {fm(m1m)}，但 topk8/topk32 至少其一缺失，三点排序不可比——本条只陈述事实，不作「压缩是否瓶颈」的读法。')
+    else:
+        lines.append('1. m=1 未测量（该扫描点缺失或失败），三点排序不可比——本条只陈述事实，不作「压缩是否瓶颈」的读法。')
+    if _t_ok:
         if t8m <= t32m:
             _dir = f'topk8 {fm(t8m)} ≤ topk32 {fm(t32m)}：选得更少反而略好，与论文「长序列下低选择率足够」的设计方向一致'
         else:
@@ -526,11 +611,13 @@ def sec_p1t():
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；配对的精确符号翻转检验（n={_st['n']}，p={_st['p_exact_signflip']:.3f}，Δ(topk8−topk32) mean={_st['mean']:+.2f} PPL）{_sig_txt}')
         else:
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；面板上没有可通过 pairing 门禁的同配置种子对，topk8 与 topk32 之差（{_gap:.2f} PPL）无法配对检验，只作方向性参考。')
-        if failed:
-            _miss = '、'.join((f'`{v}`' for v in sorted(failed)))
-            lines.append(f'3. 未完成的点（{_miss}，见上）需后续在完整扫描面板补齐，「甜点位置」的完整刻画以补齐后的面板为准。')
-        else:
-            lines.append('3. 全部扫描点均已完成，「甜点位置」以本面板数据为准。')
+    else:
+        lines.append('2. topk8/topk32 至少其一缺失，两个选择率点之间的对比不可算。')
+    if failed:
+        _miss = '、'.join((f'`{v}`' for v in sorted(failed)))
+        lines.append(f'3. 未完成的点（{_miss}，见上）需后续在完整扫描面板补齐，「甜点位置」的完整刻画以补齐后的面板为准。')
+    else:
+        lines.append('3. 全部扫描点均已完成，「甜点位置」以本面板数据为准。')
     return '\n'.join(lines) + '\n'
 
 def sec_p1l():
@@ -542,7 +629,8 @@ def sec_p1l():
         return '## P1 长上下文长度外推 — （无结果）\n\n'
     lens = sorted({int(Ln) for r in recs for Ln in r['by_len'] if isinstance(Ln, int) or (isinstance(Ln, str) and Ln.lstrip('-').isdigit())})
     variants = sorted({r['variant'] for r in recs})
-    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径、3 seeds），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、位置越界被 clamp——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
+    _n_seeds = len({r.get('seed') for r in recs if r.get('seed') is not None})
+    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', f'**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径、{_n_seeds} seeds），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、位置越界被 clamp——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
     per_v = {}
     trunc_v = {}
     for v in variants:
@@ -612,7 +700,9 @@ def sec_p1l():
                 note = f'`csa_fixed_rope` 的长度外推退化低于 `full_rope` {abs(dv):.2f} 个比值单位——稀疏掩码滤掉了远距噪声，外推更稳。' + _tail
             lines += ['', f'**结论**：{note}', '']
         elif 'csa_fixed_rope' in per_v and 'full_rope' in per_v:
-            lines += ['', f'**结论**：外推对比只看两个 RoPE 臂（`csa_fixed_rope` ×{per_v['csa_fixed_rope'] or float('nan'):.2f} vs `full_rope` ×{per_v['full_rope'] or float('nan'):.2f}）——absPE 臂在 `max_pos` 之外没有可比的读数，**不参与**该对比。', '']
+            _ra_t = f"×{per_v['csa_fixed_rope']:.2f}" if _finite_or_none(per_v.get('csa_fixed_rope')) is not None else '—'
+            _rb_t = f"×{per_v['full_rope']:.2f}" if _finite_or_none(per_v.get('full_rope')) is not None else '—'
+            lines += ['', f'**结论**：外推对比只看两个 RoPE 臂（`csa_fixed_rope` {_ra_t} vs `full_rope` {_rb_t}）——absPE 臂在 `max_pos` 之外没有可比的读数，**不参与**该对比。', '']
         lines.append('')
     lines.append('图：`results_len/length_gen.png`（PPL 与相对比值 vs 评测长度）。')
     lines.append('')
@@ -625,6 +715,8 @@ def _agg_entry(d, v):
     if not cands:
         return None
     cands.sort(key=lambda kv: -(_int_or(kv[1].get('n_seeds'), 0)))
+    if len(cands) > 1:
+        print(f'[report] _agg_entry: `{v}` spans {len(cands)} cfg/protocol groups ({sorted((k for k, _e in cands))}) — quoting the largest-n one ({cands[0][0]}, n_seeds={cands[0][1].get('n_seeds')})')
     return cands[0][1]
 
 def _params_m(r):
@@ -695,7 +787,10 @@ def sec_flops():
         _sel = _r512['sel_ratio']
         _verdict = '省' if _ratio < 1.0 else '不省'
         _cross = f'交叉点本身就在 seq={_x}' if _x <= 512 else f'交叉点在 seq={_x}，训练序列（512）尚未到达'
-        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。优势随序列变长继续放大（比值单调降到 {min((r['csa_over_dense'] for r in rows)):.3f}）。稀疏的收益是随长度增长的，并非在任意长度上都成立。', '']
+        _ratios = [r['csa_over_dense'] for r in rows]
+        _mono = all((_ratios[i] >= _ratios[i + 1] - 1e-12 for i in range(len(_ratios) - 1)))
+        _trend = f'比值单调降到 {min(_ratios):.3f}' if _mono else f'比值总体下行到 {min(_ratios):.3f}（非严格单调，逐点见 flops_analytic.csv）'
+        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。优势随序列变长继续放大（{_trend}）。稀疏的收益是随长度增长的，并非在任意长度上都成立。', '']
     return '\n'.join(lines) + '\n'
 
 def sec_stats():
