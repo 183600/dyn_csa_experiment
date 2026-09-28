@@ -28,7 +28,6 @@ jobs:
           set +e
           echo "=== disk before cleanup ==="
           df -h /
-          # 只删和本项目无关的预装 SDK，保留 miniconda
           sudo rm -rf /usr/share/dotnet \
                       /usr/share/swift \
                       /usr/local/lib/android \
@@ -51,12 +50,8 @@ jobs:
           free -h
           df -h /
 
-          # ---------- 0) 关闭 systemd-oomd ----------
-          # 它在内存紧张时向进程发 SIGTERM，是 exit code 143 的常见来源
           sudo systemctl disable --now systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
 
-          # ---------- 1) zram：8G 压缩内存，不占磁盘 ----------
-          # disksize 是解压后容量上限，实际物理占用约为 1/3
           sudo modprobe zram 2>/dev/null || true
           if [ -e /dev/zram0 ]; then
             sudo swapoff /dev/zram0 2>/dev/null || true
@@ -68,7 +63,6 @@ jobs:
             echo "[info] zram not available, skip"
           fi
 
-          # ---------- 2) 磁盘 swapfile：上限 8G，至少预留 3GB 磁盘 ----------
           AVAIL_KB=$(df --output=avail / | tail -1)
           AVAIL_MB=$((AVAIL_KB / 1024))
           WANT_MB=$((AVAIL_MB - 3072))
@@ -86,7 +80,6 @@ jobs:
           sudo mkswap /swapfile >/dev/null
           sudo swapon -p 10 /swapfile && echo "[ok] swapfile enabled"
 
-          # ---------- 3) 内核调优 ----------
           sudo sysctl -w vm.swappiness=100
           sudo sysctl -w vm.vfs_cache_pressure=200
           sudo sysctl -w vm.overcommit_memory=1
@@ -102,15 +95,15 @@ jobs:
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      - name: Configure opencode (primary Moonshot + fallback NVIDIA)
+      - name: Configure opencode (Moonshot + NVIDIA templates)
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           mkdir -p ~/.config/opencode
 
-          # ---------- 主配置：Moonshot ----------
-          cat > ~/.config/opencode/opencode.json <<'EOF'
+          # ---------- Moonshot 配置模板 ----------
+          cat > ~/.config/opencode/opencode.moonshot.json <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
             "provider": {
@@ -130,7 +123,7 @@ jobs:
           }
           EOF
 
-          # ---------- 备用配置：NVIDIA（Moonshot 不可用时会替换主配置） ----------
+          # ---------- NVIDIA 配置模板 ----------
           cat > ~/.config/opencode/opencode.nvidia.json <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
@@ -151,9 +144,12 @@ jobs:
           }
           EOF
 
-          echo "=== primary (Moonshot) ==="
-          cat ~/.config/opencode/opencode.json
-          echo "=== fallback (NVIDIA) ==="
+          # 默认放 NVIDIA，实际运行时会按概率覆盖
+          cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
+
+          echo "=== Moonshot template ==="
+          cat ~/.config/opencode/opencode.moonshot.json
+          echo "=== NVIDIA template ==="
           cat ~/.config/opencode/opencode.nvidia.json
 
       - name: Configure git
@@ -162,7 +158,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Run opencode for ~5 hours
-        timeout-minutes: 300   # 小于 job 的 330，给收尾步骤留时间
+        timeout-minutes: 300
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -173,12 +169,13 @@ jobs:
           OUT=/tmp/oc_out.log
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
           PROMPT='确保代码没有影响实验结果的bug(修复所有的bug)，优化性能和显存占用(优化只要不会明显降低性能就可以做)，不要管之前修的bug，不要写修复了哪些bug，确保远程仓库里面没有实验结果和REPORTxx.md以及autodl_budgetxx.json，同时远程仓库docs目录只留design_notes.md，确保远程仓库里面没有性能、修复了哪些bug和显存占用的记录（注释里也没有）'
-          ITER_TIMEOUT=10800   # 单次 opencode 最长 3 小时，防止 API 挂起卡死整个步骤
+          ITER_TIMEOUT=10800
 
           i=0
           FAIL_COUNT=0
           RATE_COUNT=0
-          USE_NVIDIA=0
+          CURRENT_PROVIDER=""
+          MOONSHOT_DISABLED=0
 
           commit_and_push() {
             git add -A || true
@@ -187,7 +184,6 @@ jobs:
             git push origin "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
           }
 
-          # ---------- runner 收到外部终止信号(143)时，尽力保存未提交的改动 ----------
           on_shutdown() {
             echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
             git add -A || true
@@ -203,23 +199,36 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 切换到备用端点（仍为 kimi-k3，只是走 NVIDIA 网关） ----------
-          switch_provider() {
-            if [ $USE_NVIDIA -eq 0 ]; then
-              echo "[info] 切换到 NVIDIA 备用端点 (moonshotai/kimi-k3)..."
-              cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
-              USE_NVIDIA=1
-              FAIL_COUNT=0
-              RATE_COUNT=0
-              return 0
+          # ---------- 探测 Moonshot 端点是否可用 ----------
+          check_moonshot() {
+            curl -sf --max-time 8 \
+              -H "Authorization: Bearer $KIMI_API_KEY" \
+              "https://api.moonshot.cn/v1/models" >/dev/null 2>&1
+          }
+
+          # ---------- 每轮挑选 provider ----------
+          # 规则：
+          #   Moonshot 可用  -> 10% 概率用 Moonshot，否则用 NVIDIA
+          #   Moonshot 不可用 -> 用 NVIDIA
+          pick_provider() {
+            if [ "$MOONSHOT_DISABLED" -eq 0 ] && check_moonshot; then
+              if [ $((RANDOM % 10)) -eq 0 ]; then
+                cp ~/.config/opencode/opencode.moonshot.json ~/.config/opencode/opencode.json
+                CURRENT_PROVIDER="Moonshot"
+                echo "[info] Moonshot 可用，本轮命中 10% → 使用 Moonshot"
+                return 0
+              fi
+              echo "[info] Moonshot 可用，本轮未命中 10% → 使用 NVIDIA"
+            else
+              echo "[info] Moonshot 不可用 / 本轮已禁用 → 使用 NVIDIA"
             fi
-            return 1
+            cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
+            CURRENT_PROVIDER="NVIDIA"
           }
 
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             i=$((i+1))
 
-            # ---------- 每轮检查资源：磁盘低于 2GB 就收工，避免被 runner 杀掉(143) ----------
             AVAIL_MB=$(( $(df --output=avail / | tail -1) / 1024 ))
             echo "--- iteration #$i | free disk: ${AVAIL_MB}MB ---"
             free -h | head -2
@@ -228,12 +237,20 @@ jobs:
               break
             fi
 
-            echo "=========== opencode iteration #$i (provider=$([ $USE_NVIDIA -eq 1 ] && echo NVIDIA || echo Moonshot), model=kimi-k3) ==========="
+            pick_provider
+
+            echo "=========== opencode iteration #$i (provider=$CURRENT_PROVIDER, model=kimi-k3) ==========="
 
             timeout --kill-after=180 $ITER_TIMEOUT opencode run "$PROMPT" 2>&1 | tee "$OUT"
             EXIT_CODE=$?
 
-            # ---------- 超时/被杀（124=timeout, 137=SIGKILL, 143=SIGTERM）：改动照样提交，保住进度 ----------
+            # ---------- 本轮抽中 Moonshot 但失败：把 Moonshot 拉黑，避免反复踩坑 ----------
+            if [ $EXIT_CODE -ne 0 ] && [ "$CURRENT_PROVIDER" = "Moonshot" ]; then
+              echo "[warn] Moonshot 本轮运行失败 (exit=$EXIT_CODE)，本轮后续不再使用 Moonshot"
+              MOONSHOT_DISABLED=1
+            fi
+
+            # ---------- 超时/被杀：改动照样提交，保住进度 ----------
             if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ] || [ $EXIT_CODE -eq 143 ]; then
               FAIL_COUNT=$((FAIL_COUNT+1))
               echo "[warn] iteration $i 超时或被杀 (exit=$EXIT_CODE)，已完成的改动照常提交 (连续: $FAIL_COUNT)"
@@ -247,17 +264,12 @@ jobs:
             fi
 
             if [ $EXIT_CODE -ne 0 ]; then
-              # ---------- 429 限流：opencode 的报错固定打印在输出末尾，退避后用同一端点重试 ----------
+              # ---------- 429 限流：退避后重试 ----------
               if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
                 RATE_COUNT=$((RATE_COUNT+1))
-                echo "[warn] iteration $i 命中 API 限流(429) (连续: $RATE_COUNT)，退避 180 秒后用同一端点重试"
+                echo "[warn] iteration $i 命中 API 限流(429) (连续: $RATE_COUNT)，退避 180 秒后重试"
                 if [ $RATE_COUNT -ge 8 ]; then
-                  echo "[info] 连续 8 次限流，当前端点配额可能耗尽"
-                  if switch_provider; then
-                    sleep 30
-                    continue
-                  fi
-                  echo "备用端点也持续限流，结束本轮，等待定时任务唤醒"
+                  echo "[info] 连续 8 次限流，当前端点配额可能耗尽，结束本轮，等待定时任务唤醒"
                   break
                 fi
                 sleep 180
@@ -268,15 +280,8 @@ jobs:
               FAIL_COUNT=$((FAIL_COUNT+1))
               echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE (连续失败: $FAIL_COUNT)"
 
-              # ---------- 首次失败：认为当前 API 不可用，切换到 NVIDIA 备用配置 ----------
-              if switch_provider; then
-                sleep 10
-                continue
-              fi
-
-              # ---------- 已切到 NVIDIA 仍然连续失败：跳过本轮，等定时任务唤醒 ----------
               if [ $FAIL_COUNT -ge 3 ]; then
-                echo "连续 3 次请求失败（可能是 API Key 错误或模型名不存在），跳过本轮，等待定时任务唤醒"
+                echo "连续 3 次请求失败，跳过本轮，等待定时任务唤醒"
                 break
               fi
 
