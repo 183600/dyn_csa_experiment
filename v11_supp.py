@@ -234,7 +234,6 @@ def build_report(out='REPORT_v11.md'):
         mech_sum = json.load(open(mp, encoding='utf-8'))
     probe_cells_ = probe.get('cells', [])
     contr_ = probe.get('contrasts', {})
-    n_probe_min = min((c['n'] for c in probe_cells_), default=0)
     n_contr_max = max((v['n'] for v in contr_.values()), default=0)
     _n_seeds = probe.get('n_seeds') or {}
     n_cells_max = max(_n_seeds.get('cell_max', 0), max((c['n'] for c in probe_cells_), default=0))

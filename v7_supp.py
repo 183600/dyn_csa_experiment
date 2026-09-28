@@ -205,15 +205,18 @@ class HybridAttentionRoPE(L.HybridAttention):
         k_blk = F.normalize(k_blk, dim=-1)
         k_sw = F.normalize(k_sw, dim=-1)
         soft = None
+        sel_valid = None
         if cfg.kind == 'hca':
             topk_idx = L._arange_cache(Bn, x.device).unsqueeze(0).expand(T, Bn)
         else:
-            _, topk_idx, soft = L.lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, cfg.index_topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None)
+            _sel_valid_box = []
+            _, topk_idx, soft = L.lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, cfg.index_topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box)
+            sel_valid = _sel_valid_box[0]
         sink = self.sink if cfg.use_sink else None
-        out = self._rope_attn(qn, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink, rd, soft=soft)
+        out = self._rope_attn(qn, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink, rd, soft=soft, sel_valid=sel_valid)
         return (self.W_o(out.reshape(T, nh * hd)), gate_mean)
 
-    def _rope_attn(self, q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, sink, rope_dim, q_chunk=128, soft=None, rope_base=10000.0, mem_budget_bytes=None):
+    def _rope_attn(self, q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, sink, rope_dim, q_chunk=128, soft=None, rope_base=10000.0, mem_budget_bytes=None, sel_valid=None):
         T, nh, hd = q.shape
         dev = q.device
         if mem_budget_bytes is None:
@@ -242,12 +245,13 @@ class HybridAttentionRoPE(L.HybridAttention):
             pos = pos_all[s:e]
             ib = topk_idx[s:e].long()
             sel = pos[:, None] > last_tok[ib]
+            _keep = sel_valid[s:e] if sel_valid is not None else None
             if ib.shape[1] > 1:
                 _dup_mm = ib[:, :, None] == ib[:, None, :]
-                _keep = ~_dup_mm.tril(-1).any(-1)
+                _ddk = ~_dup_mm.tril(-1).any(-1)
+                _keep = _ddk if _keep is None else _keep & _ddk
+            if _keep is not None:
                 sel = sel & _keep
-            else:
-                _keep = None
             wg = pos[:, None] - (w - 1) + rel[None, :]
             wvalid = wg >= 0
             wi = wg.clamp(min=0)
@@ -256,9 +260,14 @@ class HybridAttentionRoPE(L.HybridAttention):
             Vset = L._take_2d(_v_stack, both)
             valid = torch.cat([sel, wvalid], 1)
             raw_logits = torch.einsum('qhd,qmhd->qhm', qr[s:e], Kset) * scale
-            logits = raw_logits.masked_fill(~valid[:, None, :], torch.finfo(raw_logits.dtype).min)
-            attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
+            if soft is None:
+                logits = raw_logits.masked_fill_(~valid[:, None, :], torch.finfo(raw_logits.dtype).min)
+                attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
+                if sink is None:
+                    attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
             if soft is not None:
+                logits = raw_logits.masked_fill(~valid[:, None, :], torch.finfo(raw_logits.dtype).min)
+                attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
                 nb = ib.shape[1]
                 sv = torch.gather(soft[s:e], 1, ib)
                 if _keep is not None:
@@ -270,6 +279,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 soft_logits = soft_logits.masked_fill(~valid[:, None, :], torch.finfo(soft_logits.dtype).min)
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = soft_attn + (attn - soft_attn.detach())
+                if sink is None:
+                    attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
             out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
         return out
 
@@ -1047,7 +1058,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                 trunc = True
             try:
                 x = torch.from_numpy(ids).to(device)
-                nll, ntok = (0.0, 0)
+                nll, ntok = (torch.zeros((), dtype=torch.float64, device=device), 0)
                 _r, _chunk = (0, int(ids.shape[0]))
                 while _r < int(ids.shape[0]):
                     _sub = x[_r:_r + _chunk]
@@ -1060,11 +1071,11 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                                 torch.cuda.empty_cache()
                             continue
                         raise
-                    nll += float(F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), _sub[:, 1:].reshape(-1), reduction='sum').double())
+                    nll += F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), _sub[:, 1:].reshape(-1), reduction='sum').double()
                     ntok += int(_sub[:, 1:].numel())
                     del logits
                     _r += _chunk
-                ppl = math.exp(nll / max(ntok, 1))
+                ppl = math.exp(float(nll) / max(ntok, 1))
                 out[int(Ln)] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': int(x.shape[1])}
             except Exception as e:
                 out[int(Ln)] = {'error': f'{type(e).__name__}: {e}'}
