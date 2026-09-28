@@ -967,11 +967,12 @@ def run_niah_phase(payload, guard=None, label=''):
                         print(f'[budget] SKIP niah train {v} s{seed}')
                         continue
                 t0 = time.time()
-                L.set_seed(seed)
                 cfgs = L.make_layer_cfgs(6, v)
                 mr = 4.0
                 if v in PARAM_MATCHED_V7:
                     mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=set(PARAM_MATCHED_V7), ref_variant='csa_dynamic_rope')
+                # 随机源在建模前一刻定界：同 seed 下各臂的共享组件（tok/head/MLP）必须同构
+                L.set_seed(seed)
                 model = L.SmallGPT(vocab, 256, 6, 8, 32, 512, cfgs, mlp_ratio=mr).to(DEVICE)
                 opt = torch.optim.AdamW(model.parameters(), lr=0.0003)
                 model.train()

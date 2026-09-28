@@ -1346,7 +1346,10 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     train_ids = np.asarray(train_ids)
     host = torch.from_numpy(train_ids)
     if device.type == 'cuda' and not host.is_pinned():
-        host = host.pin_memory()
+        try:
+            host = host.pin_memory()
+        except RuntimeError:
+            pass
     cols = np.arange(seq_len + 1)
     while True:
         starts = rng.integers(0, n + 1, size=batch_size)
