@@ -113,6 +113,14 @@ class HybridAttentionRoPE(L.HybridAttention):
             scale = 1.0
         else:
             scale = 1.0 / math.sqrt(self.hd)
+        if self.sink is None:
+            sdpa_kw = dict(scale=scale)
+            if cfg.window > 0:
+                sdpa_kw['attn_mask'] = L.causal_window_mask(T, cfg.window, x.device)
+            else:
+                sdpa_kw['is_causal'] = True
+            out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
+            return self.W_o(out.reshape(B, T, self.nh * self.hd))
         logits = torch.einsum('bnhd,bmhd->bhnm', q, k)
         logits.mul_(scale)
         mask = L.causal_mask(T, x.device)

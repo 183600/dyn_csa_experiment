@@ -396,8 +396,8 @@ def build_report(out='REPORT_v11.md'):
         n6 = [v for v in contr.values() if v['n'] >= 6]
         if n6:
             sig = [v for v in n6 if v['p_exact_signflip'] < 0.05]
-            _strongest = max((v['n'] for v in n6))
-            A(f'**统计读法**：n>={_strongest} 的格子共 {len(n6)} 个，其中 p<0.05 的 {len(sig)} 个（精确符号翻转在 n={_strongest} 的下限为 {2.0 / 2 ** _strongest:.3f}）——注意这是**这些格子自己**的分辨率，不是整个面板的：本面板最弱的对比仍有 n={n_tree_min}，其下限为 {floor_p_tree:.3f}，**跨不过 0.05**。因此本报告的一切显著性主张只对上面的 n>={_strongest} 行成立，凡引用最弱对比（n={n_tree_min}）的段落一律按效应量 + 方向同向性表述。p≥0.05 的格子同样不作显著性主张。')
+            _weakest = min((v['n'] for v in n6))
+            A(f'**统计读法**：n>={_weakest} 的格子共 {len(n6)} 个，其中 p<0.05 的 {len(sig)} 个（精确符号翻转在 n={_weakest} 的下限为 {2.0 / 2 ** _weakest:.3f}）——注意这是**这些格子自己**的分辨率，不是整个面板的：本面板最弱的对比仍有 n={n_tree_min}，其下限为 {floor_p_tree:.3f}，**跨不过 0.05**。因此本报告的一切显著性主张只对上面的 n>={_weakest} 行成立，凡引用最弱对比（n={n_tree_min}）的段落一律按效应量 + 方向同向性表述。p≥0.05 的格子同样不作显著性主张。')
             A('')
         else:
             A(f'**统计读法**：本面板实际最大 n={n_contr_max}，精确符号翻转的 p 值下限为 {_floor_txt}，**无法**在该种子数下跨过 0.05。因此下文所有 Δ 一律按效应量 + 方向同向性表述，不作显著性主张；p 值仅作分辨率下限的记录。')
