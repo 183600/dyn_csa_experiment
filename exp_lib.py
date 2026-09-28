@@ -1344,11 +1344,14 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     if n <= 0:
         raise ValueError(f'batch_iter needs len(train_ids) > seq_len+1 to sample causal windows, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
     train_ids = np.asarray(train_ids)
+    host = torch.from_numpy(train_ids)
+    if device.type == 'cuda' and not host.is_pinned():
+        host = host.pin_memory()
     cols = np.arange(seq_len + 1)
     while True:
         starts = rng.integers(0, n + 1, size=batch_size)
-        ids = train_ids[starts[:, None] + cols[None, :]]
-        ids = torch.from_numpy(ids).to(device)
+        ids = host[torch.from_numpy(starts[:, None] + cols[None, :])]
+        ids = ids.to(device, non_blocking=host.is_pinned())
         yield (ids[:, :-1], ids[:, 1:])
 
 def count_params(m):
@@ -1627,8 +1630,15 @@ def eval_ppl(model, val_batch, device, chunk=32, eval_rows=None, eval_seed=0):
                 print(f'[eval_ppl] scoring a uniform sample of {_k}/{_flat} target rows (eval_rows={int(eval_rows)}, eval_seed={int(eval_seed)}) — this is a SAMPLED estimate, not the full-set PPL')
             else:
                 print(f'[eval_ppl] eval_rows={int(eval_rows)} covers the whole {_flat}-row target space; scoring the FULL set (this is the population statistic, not a sample)')
+        _vhost = torch.as_tensor(val_batch)
+        if device.type == 'cuda' and not _vhost.is_pinned():
+            try:
+                _vhost = _vhost.pin_memory()
+            except RuntimeError:
+                pass
+        _async = _vhost.is_pinned()
         for i in range(0, val_batch.shape[0], chunk):
-            ids = torch.from_numpy(val_batch[i:i + chunk]).to(device)
+            ids = _vhost[i:i + chunk].to(device, non_blocking=_async)
             logits = model(ids)
             if V is None:
                 V = logits.size(-1)
