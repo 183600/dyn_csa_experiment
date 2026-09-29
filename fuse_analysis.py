@@ -31,33 +31,32 @@ def panel(name):
 VARIANTS = {'hybrid_csa_dyn': ('results_lm_v4_abl', 'hybrid dyn (no-fuse)', False), 'hybrid_csa_dyn_fuse': ('results_lm_v4_abl', 'hybrid dyn + fuse', True), 'csa_dyn_fuse': ('results_lm_v4_abl', 'csa dyn + fuse', True), 'csa_dynamic': ('results_lm_v3_1500', 'csa dyn (no-fuse)', False)}
 SEEDS = []
 
+_RESOLVED = {}
+
+def _variant_records(variant):
+    panel_name = VARIANTS[variant][0]
+    rkey = (panel_name, variant)
+    if rkey not in _RESOLVED:
+        groups = {}
+        for (_v, _tag, _s), (_k, _r) in L.read_panel(panel_name).items():
+            if _v != variant:
+                continue
+            groups.setdefault(_tag, {})[_s] = _r
+        if not groups:
+            _RESOLVED[rkey] = {}
+        else:
+            if len(groups) > 1:
+                _ranked = sorted(groups.items(), key=lambda kv: (kv[0] != '', -len(kv[1])))
+                _keep_tag, _keep = _ranked[0]
+                _dropped = {t: sorted(g) for t, g in _ranked[1:]}
+                print(f'[fuse_analysis] WARNING: {panel_name}: `{variant}` spans {len(_ranked)} protocol groups — pooling across protocols is not allowed (design §3.3), so the analysis keeps only the `{_keep_tag or '(untagged)'}` group ({len(_keep)} seeds) and drops {_dropped}')
+                _RESOLVED[rkey] = _keep
+            else:
+                _RESOLVED[rkey] = next(iter(groups.values()))
+    return _RESOLVED[rkey]
+
 def _panel_seeds():
-    sets = []
-    for _v, (_pn, _lab, _fu) in VARIANTS.items():
-        _pnl = panel(_pn)
-        _sv = set()
-        for _k, _r in _pnl.items():
-            if not isinstance(_r, dict):
-                continue
-            if str(_r.get('variant') or str(_k).split('::')[0]) != _v:
-                continue
-            if _r.get('synthesized') or not L.ppl_is_usable(_r.get('ppl')):
-                continue
-            _s = _r.get('seed')
-            if isinstance(_s, bool):
-                continue
-            if isinstance(_s, float) and not (math.isfinite(_s) and _s.is_integer()):
-                print(f'[fuse_analysis] WARNING: {_pn} record {_k!r} carries a non-integral seed ({_s!r}) — refused for pairing (it would silently alias onto seed {int(_s) if math.isfinite(_s) else _s!r})')
-                continue
-            try:
-                _si = int(_s)
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if _si in _sv:
-                print(f'[fuse_analysis] WARNING: {_pn}: a second measurable record for `{_v}` seed={_si} (key {_k!r}) — its PPL is ambiguous with the first; pairing keeps the canonical key and IGNORES this one')
-                continue
-            _sv.add(_si)
-        sets.append(_sv)
+    sets = [set(_variant_records(_v)) for _v in VARIANTS]
     common = set.intersection(*sets) if sets else set()
     if not common:
         raise ValueError('fuse_analysis: no seed is measured in EVERY panel arm, so no honest paired analysis can be produced; fill the panels first')
@@ -72,18 +71,19 @@ def layer_idx(layers):
     return [int(lk.split('_')[0][1:]) for lk in layers]
 
 def rec(variant, seed):
-    panel = panel_of(variant)
-    key = f'{variant}::seed{seed}'
-    r = panel.get(key)
+    r = _variant_records(variant).get(seed)
     if not isinstance(r, dict):
-        raise KeyError(f'fuse_analysis: {key} is absent from {VARIANTS[variant][0]}/summary.json — the panel is incomplete; run that cell first (or restrict SEEDS to the ones present)')
+        raise KeyError(f'fuse_analysis: {variant}::seed{seed} is absent from {VARIANTS[variant][0]}/summary.json — the panel is incomplete; run that cell first (or restrict SEEDS to the ones present)')
     if r.get('synthesized') or not L.ppl_is_usable(r.get('ppl')):
         raise ValueError(f'fuse_analysis: {variant}::seed{seed} has no usable `ppl` ({r.get('ppl')!r}) — it is not a measurement, so it cannot be paired. Re-run that cell or exclude the variant.')
     return r
 
 def layers_of(variant, dyn_only=True):
     r = rec(variant, SEEDS[0])
-    ks = [k for k in r['stats'] if k.startswith('L')]
+    st = r.get('stats')
+    if not isinstance(st, dict):
+        raise ValueError(f'fuse_analysis: {variant}::seed{SEEDS[0]} carries no usable `stats` table (got {type(st).__name__}) — the per-layer boundary statistics cannot be read')
+    ks = [k for k in st if k.startswith('L')]
     if dyn_only:
         ks = [k for k in ks if 'dyn' in k]
     return ks
@@ -94,11 +94,15 @@ def per_seed_layer(variant, key):
     M = np.full((len(SEEDS), len(layers)), np.nan)
     n_sampled = 0
     for i, s in enumerate(SEEDS):
-        st = rec(variant, s)['stats']
+        st = rec(variant, s).get('stats')
+        if not isinstance(st, dict):
+            raise ValueError(f'fuse_analysis: {variant}::seed{s} carries no usable `stats` table (got {type(st).__name__}) — the per-layer boundary statistics cannot be read')
         for j, lk in enumerate(layers):
             _cell = st.get(lk)
             if isinstance(_cell, dict):
                 v = _cell.get(key, np.nan)
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    v = np.nan
                 if key in ('bnd_rand', 'bnd_excess') and _cell.get('bnd_rand_exact') is False:
                     if isinstance(v, (int, float)) and np.isfinite(v):
                         n_sampled += 1
@@ -194,7 +198,7 @@ def main(argv=None):
             if _la != _lb:
                 return f'`{a}` and `{b}` are not on the same layer list ({_la} vs {_lb}); the per-layer deltas would be a misaligned subtraction'
             return None
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             return str(e)
     for pair, tag in [(('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn'), 'A. 同面板配对（hybrid，干净对照）'), (('csa_dyn_fuse', 'csa_dynamic'), 'B. 跨面板同配置（纯 CSA 栈；仅作参考，非严格配对）')]:
         a, b = pair
@@ -234,7 +238,7 @@ def main(argv=None):
             sd_a = sample_std(_sa) if Ma.shape[0] > 1 else 0.0
             mean_b = _finite_mean(_sb)
             mean_a = _finite_mean(_sa)
-            lines.append(f'| — | **{name}** | {mean_b:.4f}±{sd_b:.4f} | {mean_a:.4f}±{sd_a:.4f} | **{_finite_mean(db):+.4f}** |')
+            lines.append(f'| — | **{name}** | {mean_b:.4f}±{sd_b:.4f} | {mean_a:.4f}±{sd_a:.4f} | **{mean_a - mean_b:+.4f}** |')
             pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=np.round(_lay_nanmean(Mb), 4).tolist(), fuse_perlayer_mean=np.round(_lay_nanmean(Ma), 4).tolist(), delta_perlayer=np.round(db, 4).tolist(), nofuse_seed_std=float(sd_b), fuse_seed_std=float(sd_a))
         if _ok_seeds and not _gate_ok:
             lines.append(f'\n> 注：上表的均值与 Δ 与下方检验同口径——只在通过配置/预算配对门禁的 {_ok_seeds} 上计算，{len(SEEDS) - len(_ok_seeds)} 个未过门禁的 seed（{_why}）不进入任何数字。')
@@ -264,7 +268,7 @@ def main(argv=None):
         else:
             p_f1 = p_ppl = None
             lines.append('\n**配对检验：未执行。** 可用于配对的有限样本不足，**不给出 p 值**、不进入任何显著性主张。\n')
-        unstamped = sum((1 for v in pair for s in SEEDS if panel_of(v)[f'{v}::seed{s}'].get('run_cfg') is None))
+        unstamped = sum((1 for v in pair for s in SEEDS if (_variant_records(v).get(s) or {}).get('run_cfg') is None))
         stats_out[f'{a}__vs__{b}'] = dict(boundary=pair_stats, f1_delta_per_seed=d_f1.round(4).tolist(), f1_p_exact=p_f1, ppl_fuse=pa.round(2).tolist(), ppl_nofuse=pb.round(2).tolist(), ppl_delta_per_seed=d_ppl.round(3).tolist(), ppl_p_exact=p_ppl, n_unstamped=unstamped, paired_test='run' if p_f1 is not None else 'skipped', pair_refusals=_why)
         _is_clean = a == 'hybrid_csa_dyn_fuse'
         if _is_clean:
@@ -284,7 +288,7 @@ def main(argv=None):
             probe['x_d_ppl_csa'] = float(d_ppl.mean()) if len(d_ppl) else None
             probe['x_sd_ppl_csa'] = float(sample_std(d_ppl)) if len(d_ppl) > 1 else None
             probe['x_p_ppl_csa'] = float(p_ppl) if p_ppl is not None else None
-            probe['x_d_f1_guarded'] = _gate_ok
+            probe['x_d_f1_guarded'] = p_f1 is not None
         report[tag] = True
     lines.append(f'\n## 块长分布形状对比（逐层存储矩，n={len(SEEDS)} seeds 平均）\n')
     lines.append('| 变体 | len_mean | len_std | len_max | frac_at_min(贴下限块占比) | blocks/seq | δ(gate) |')
@@ -293,7 +297,7 @@ def main(argv=None):
     _pair_missing = False
     try:
         _pair_ok_seeds = [s for s in SEEDS if L.pair_reason(rec('hybrid_csa_dyn', s), rec('hybrid_csa_dyn_fuse', s)) is None]
-    except (KeyError, ValueError):
+    except (KeyError, ValueError, TypeError):
         _pair_ok_seeds = []
         _pair_missing = True
     _pgate_drop = [s for s in SEEDS if s not in _pair_ok_seeds]
@@ -301,7 +305,7 @@ def main(argv=None):
         try:
             _l, _mb = per_seed_layer('hybrid_csa_dyn', _key)
             _l2, _ma = per_seed_layer('hybrid_csa_dyn_fuse', _key)
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, TypeError):
             continue
         if _l != _l2:
             continue
@@ -318,6 +322,8 @@ def main(argv=None):
         _blk[_name + '_fmt'] = _fmt
     if _pair_missing:
         lines.append('> 注：分块偏移量未计算——至少一臂的记录缺失或不可计量，配对门禁无从谈起；本节的块长分布表只列各臂自身的描述值，不给出两臂偏移量。\n')
+    elif not _pair_ok_seeds:
+        lines.append(f'> 注：分块偏移量未计算——{_pgate_drop} 全部因两臂配置/预算不一致被 `pair_reason` 排除，没有可配对的 seed；本节的块长分布表只列各臂自身的描述值。\n')
     elif _pgate_drop:
         lines.append(f'> 注：分块偏移量的配对已按 `pair_reason` 过滤，{_pgate_drop} 因两臂配置/预算不一致被排除；下方偏移量是在 {_pair_ok_seeds} 上计算的。\n')
     for v, (panel_name, label, fused) in VARIANTS.items():
@@ -328,7 +334,7 @@ def main(argv=None):
             _, Mf = per_seed_layer(v, 'frac_at_min')
             _, Mb = per_seed_layer(v, 'blocks')
             _, Md = per_seed_layer(v, 'delta')
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             lines.append(f'| `{v}` | — | — | — | — | — | — |  （该变体数据缺失：{e}）|')
             continue
         lines.append(f'| `{v}` | {np.nanmean(Mm):.3f} | {np.nanmean(Ms):.3f} | {np.nanmean(Mx):.1f} | {np.nanmean(Mf):.3f} | {np.nanmean(Mb):.1f} | {np.nanmean(Md):+.3f} |')
@@ -336,7 +342,7 @@ def main(argv=None):
     _hyb_keep = None
     try:
         _hyb_keep = np.array([L.pair_reason(rec('hybrid_csa_dyn', s), rec('hybrid_csa_dyn_fuse', s)) is None for s in SEEDS], dtype=bool)
-    except (KeyError, ValueError):
+    except (KeyError, ValueError, TypeError):
         _hyb_keep = np.zeros(len(SEEDS), dtype=bool)
     _hyb_seeds = [s for s, k in zip(SEEDS, _hyb_keep) if k]
     plt.rcParams.update({'font.size': 10})
@@ -350,8 +356,13 @@ def main(argv=None):
             continue
         for v, color, lab in [(b, 'steelblue', f'{b} (no-fuse)'), (a, 'darkorange', f'{a} (fuse)')]:
             try:
-                hs = [dict(rec(v, s)['ppl_history']) for s in _seeds_ax]
-            except (KeyError, ValueError) as e:
+                hs = []
+                for s in _seeds_ax:
+                    _h = rec(v, s).get('ppl_history')
+                    if not isinstance(_h, list):
+                        raise ValueError(f'`ppl_history` of {v}::seed{s} is {type(_h).__name__}, not a list of [step, ppl] pairs')
+                    hs.append(dict(_h))
+            except (KeyError, ValueError, TypeError) as e:
                 print(f'[fuse_analysis] NOTE: skipping trajectory of `{v}` — {e}')
                 continue
             steps = _axis_steps(hs)
@@ -367,7 +378,8 @@ def main(argv=None):
         ax.set_yscale('log')
         ax.legend(fontsize=8)
         ax.grid(alpha=0.3, which='both')
-    fig.suptitle(f'fuse vs no-fuse: validation PPL trajectories ({len(SEEDS)} seeds, min–max band)', y=1.0)
+    _traj_n = f'{len(SEEDS)} seeds' if len(_hyb_seeds) == len(SEEDS) else f'{len(SEEDS)} seeds (hybrid panel gated to {len(_hyb_seeds)})'
+    fig.suptitle(f'fuse vs no-fuse: validation PPL trajectories ({_traj_n}, min–max band)', y=1.0)
     fig.tight_layout()
     fig.savefig(os.path.join(OUT, 'fuse_ppl_traj.png'), dpi=140, bbox_inches='tight')
     plt.close(fig)
@@ -381,7 +393,7 @@ def main(argv=None):
         try:
             layers, Mb = per_seed_layer('hybrid_csa_dyn', key)
             _, Ma = per_seed_layer('hybrid_csa_dyn_fuse', key)
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             print(f'[fuse_analysis] NOTE: skipping `{ttl}` boundary plot — {e}')
             continue
         Mb = np.where(_hyb_keep[:, None], Mb, np.nan)
@@ -404,7 +416,7 @@ def main(argv=None):
     for v, _c in PLOTTED:
         try:
             _plotted_layers[v] = layers_of(v)
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             print(f'[fuse_analysis] NOTE: skipping layer index contribution of `{v}` — {e}')
     all_idx = sorted({i for v, _ in PLOTTED for i in layer_idx(_plotted_layers.get(v, []))})
     ax = axes[0]
@@ -412,11 +424,11 @@ def main(argv=None):
         try:
             layers, Mm = per_seed_layer(v, 'len_mean')
             _, Ms = per_seed_layer(v, 'len_std')
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             print(f'[fuse_analysis] NOTE: skipping len_mean curve of `{v}` — {e}')
             continue
         x = np.array(layer_idx(layers))
-        ax.errorbar(x, np.nanmean(Mm, axis=0), yerr=sample_std(Mm, axis=0), marker='o', ms=4, lw=1.6, color=color, label=v, alpha=0.9)
+        ax.errorbar(x, np.nanmean(Mm, axis=0), yerr=np.nanmean(Ms, axis=0), marker='o', ms=4, lw=1.6, color=color, label=v, alpha=0.9)
     ax.set_xticks(all_idx)
     ax.set_xticklabels([f'L{i}' for i in all_idx])
     ax.set_title('block length: mean ± std (dynamic layers only)')
@@ -426,7 +438,7 @@ def main(argv=None):
     for v, color in PLOTTED:
         try:
             layers, Mf = per_seed_layer(v, 'frac_at_min')
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             print(f'[fuse_analysis] NOTE: skipping frac_at_min curve of `{v}` — {e}')
             continue
         ax.plot(np.array(layer_idx(layers)), np.nanmean(Mf, axis=0), marker='s', ms=4, lw=1.6, color=color, label=v)

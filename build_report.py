@@ -83,7 +83,10 @@ def _int_or(v, default):
         return int(v)
     if isinstance(v, float):
         return int(v) if math.isfinite(v) and float(v).is_integer() else default
-    return default
+    try:
+        return int(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 def _code_semantics():
     try:
@@ -98,11 +101,42 @@ def _finite_ppls(r):
     ppls = (r.get('ppls') if r.get('ppls') is not None else r.get('ppl_list')) or []
     return [x for x in ppls if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(x) and (x > 0)]
 
-def _tag_of(r):
+_WARM_KEY_RE = re.compile('.*::w(\\d+)::seed\\d+$')
+
+def _legacy_warm_tags(s):
+    _legacy = {}
+    for key, rec in s.items():
+        if not isinstance(rec, dict) or 'seed' not in rec or 'ppl' not in rec:
+            continue
+        if not _ppl_ok(rec.get('ppl')) or rec.get('synthesized'):
+            continue
+        if ('protocol' in rec and rec['protocol'] is not None) or rec.get('warm_steps') is not None:
+            continue
+        m = _WARM_KEY_RE.match(str(key))
+        _var = rec.get('variant')
+        if _var is None:
+            _var = str(key).split('::', 1)[0]
+        _legacy.setdefault(str(_var), set()).add(m.group(1) if m else None)
+    return {v: frozenset(tags) for v, tags in _legacy.items() if None not in tags}
+
+def _tag_of(r, key=None, legacy_ok=None):
     if r.get('protocol') is not None:
         return str(r['protocol'])
     if r.get('warm_steps') is not None:
         return f"w{r['warm_steps']}"
+    if key is not None:
+        m = _WARM_KEY_RE.match(str(key))
+        if m:
+            ok = legacy_ok
+            if isinstance(ok, dict):
+                _var = r.get('variant')
+                if _var is None:
+                    _var = str(key).split('::', 1)[0]
+                ok = ok.get(str(_var))
+                if ok is None:
+                    return ''
+            if ok is not None and m.group(1) in ok:
+                return f'w{m.group(1)}'
     return ''
 
 def _prefer_one_cfg(items, cfg_of, who=''):
@@ -161,6 +195,7 @@ def unmatched_tag(a, b, tol=PARAM_MATCH_TOL, small=PARAM_MATCH_SMALL):
 
 def per_seed_ppls(outdir):
     s = summary(outdir)
+    _legacy_ok = _legacy_warm_tags(s)
     out = collections.defaultdict(dict)
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
@@ -173,7 +208,7 @@ def per_seed_ppls(outdir):
                 print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
                 continue
             _slot = out[r['variant']]
-            _tk = (_tag_of(r), _sd)
+            _tk = (_tag_of(r, _k, _legacy_ok), _sd)
             if _tk in _slot:
                 print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
                 continue
@@ -182,6 +217,7 @@ def per_seed_ppls(outdir):
 
 def per_seed_records(outdir):
     s = summary(outdir)
+    _legacy_ok = _legacy_warm_tags(s)
     out = collections.defaultdict(dict)
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
@@ -194,7 +230,7 @@ def per_seed_records(outdir):
                 print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
                 continue
             _slot = out[r['variant']]
-            _tk = (_tag_of(r), _sd)
+            _tk = (_tag_of(r, _k, _legacy_ok), _sd)
             if _tk in _slot:
                 print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
                 continue
@@ -316,11 +352,16 @@ def sec_p0w():
     s = summary('results_lm_v7_warmup')
     if not s:
         return '## P0-1 dense→sparse warmup — （无结果）\n\n'
+    _legacy_ok = _legacy_warm_tags(s)
     rows = []
     for k, r in s.items():
         if not isinstance(r, dict):
             continue
-        rows.append((r.get('variant', '?'), _int_or(r.get('warm_steps'), -1), _int_or(r.get('seed'), -1), r.get('ppl'), r.get('ppl_at_switch'), r.get('train_time_s', 0) / 60.0 if r.get('train_time_s') else None, r.get('synthesized', False), k))
+        _w = _int_or(r.get('warm_steps'), None)
+        if _w is None:
+            _t = _tag_of(r, k, _legacy_ok)
+            _w = int(_t[1:]) if _t.startswith('w') and _t[1:].isdigit() else -1
+        rows.append((r.get('variant', '?'), _w, _int_or(r.get('seed'), -1), r.get('ppl'), r.get('ppl_at_switch'), r.get('train_time_s', 0) / 60.0 if r.get('train_time_s') else None, r.get('synthesized', False), k))
     rows.sort(key=lambda x: (x[0], x[1], x[2]))
     rows = [row for row in rows if _measurable({'ppl': row[3], 'synthesized': row[6]})]
     rows = _prefer_one_cfg(rows, lambda row: ((row[0], row[1]), (s.get(row[-1]) or {}).get('run_cfg')), who='sec_p0w')
@@ -379,7 +420,11 @@ def sec_p0w():
             _sd = _int_or(_r.get('seed'), -1)
             if _sd < 0:
                 continue
-            rec_by_s[_r.get('variant', '?'), _int_or(_r.get('warm_steps'), -1)].setdefault(_sd, _r)
+            _w = _int_or(_r.get('warm_steps'), None)
+            if _w is None:
+                _t = _tag_of(_r, _k, _legacy_ok)
+                _w = int(_t[1:]) if _t.startswith('w') and _t[1:].isdigit() else -1
+            rec_by_s[_r.get('variant', '?'), _w].setdefault(_sd, _r)
         _conc = ['', '**结论**：']
         _parts = []
         _ds = []
@@ -481,7 +526,9 @@ def sec_p0e():
             def _dir_word(r):
                 return '下降' if r < 0 else ('上升' if r > 0 else '持平')
             lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，seed 平均）**：', '', f'- 20k 步差距：{_g20} PPL；40k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {_dir_word(r_csa)} {abs(r_csa):.2f}、dense {_dir_word(r_full)} {abs(r_full):.2f} PPL/1k）。']
-            if n_ < 2 or not (math.isfinite(g_last) and math.isfinite(slope)):
+            if n_ < 2:
+                verdict = f'**结论：尾段差距统计量不可用**（两臂只在 {n_} 个公共评测步上有测量，尾段回归需要至少 2 个点），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。需补跑或加密尾段评测网格。'
+            elif not (math.isfinite(g_last) and math.isfinite(slope)):
                 verdict = f'**结论：尾段差距统计量不可用**（`g_last` 或 `slope` 非有限值：g_last={g_last!r}、slope={slope!r}），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。上表已剔除非有限的曲线点；若此处仍出现，说明该面板的尾段整体缺失，需补跑。'
             elif g_last <= 0:
                 verdict = '**结论：渐近线在 40k 内反演**——`csa_fixed` 追平并超过 dense，评审的 P0-2 质疑成立，此前「worse asymptote」的表述需撤回。'
@@ -552,7 +599,7 @@ def sec_p1t():
     if failed:
         lines += ['', '**未完成的扫描点（如实记录）**：', '']
         for v in sorted(failed):
-            seeds = ','.join((str(x) for x in sorted(failed[v], key=lambda x: (x is None, -1 if x is None else x))))
+            seeds = ','.join((str(x) for x in sorted(failed[v], key=lambda x: (x is None, 0 if isinstance(x, (int, float)) and (not isinstance(x, bool)) else 1, x if isinstance(x, (int, float)) and (not isinstance(x, bool)) else str(x)))))
             lines.append(f'- `{v}`（seed {seeds}）：该扫描点在本配置与预算约束下未完成（记录为 error），扫描被截断。')
         lines.append('')
     if missing:
@@ -591,14 +638,6 @@ def sec_p1t():
         return sum(ppls) / len(ppls) if ppls else r.get('ppl_mean')
     m1m, t8m, t32m = (_mean(m1), _mean(t8), _mean(t32))
 
-    def _n_of(r):
-        if not r:
-            return 0
-        ppls = _finite_ppls(r)
-        if ppls:
-            return len(ppls)
-        return _int_or(r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n'), 0)
-    _n8, _n32 = (_n_of(t8), _n_of(t32))
     lines += ['', '**结论（基于已完成的扫描点）**：', '']
     _m1_ok = isinstance(m1m, (int, float))
     _t_ok = isinstance(t8m, (int, float)) and isinstance(t32m, (int, float))
@@ -653,8 +692,9 @@ def sec_p1l():
     if not recs:
         return '## P1 长上下文长度外推 — （无结果）\n\n'
     lens = sorted({int(Ln) for r in recs for Ln in r['by_len'] if isinstance(Ln, int) or (isinstance(Ln, str) and Ln.lstrip('-').isdigit())})
-    variants = sorted({r['variant'] for r in recs})
-    _seeds_by_v = {v: sorted({r.get('seed') for r in recs if r.get('variant') == v and r.get('seed') is not None}) for v in variants}
+    variants = sorted({r.get('variant') for r in recs if r.get('variant') is not None})
+    _seed_key = lambda x: (0, float(x), '') if isinstance(x, (int, float)) and (not isinstance(x, bool)) else (1, 0.0, str(x))
+    _seeds_by_v = {v: sorted({r.get('seed') for r in recs if r.get('variant') == v and r.get('seed') is not None}, key=_seed_key) for v in variants}
     lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、位置越界被 clamp——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
     per_v = {}
     trunc_v = {}
@@ -709,8 +749,8 @@ def sec_p1l():
             _ptag = ''
             _rl = {}
             for _r in recs:
-                if _r['variant'] in ('csa_fixed_rope', 'full_rope') and isinstance(_r.get('params'), (int, float)):
-                    _rl.setdefault(_r['variant'], set()).add(_r['params'])
+                if _r.get('variant') in ('csa_fixed_rope', 'full_rope') and isinstance(_r.get('params'), (int, float)):
+                    _rl.setdefault(_r.get('variant'), set()).add(_r['params'])
             _ok = set(_rl) == {'csa_fixed_rope', 'full_rope'} and all((len(v) == 1 for v in _rl.values()))
             if _ok:
                 _ptag = unmatched_tag({'params': next(iter(_rl['csa_fixed_rope']))}, {'params': next(iter(_rl['full_rope']))})
@@ -800,10 +840,16 @@ def sec_flops():
     cfg = d.get('config', {})
     rows = d.get('rows', [])
     pick = {512, 2048, 8192, 65536, 1048576}
-    lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 **seq = {d.get('crossover_seq_len_csa_beats_dense')}** 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
+    _xo = d.get('crossover_seq_len_csa_beats_dense')
+    _xo_txt = f'**seq = {_xo}**' if _xo is not None else '**不存在**（所测长度内 CSA 均不低于 dense）'
+    lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 {_xo_txt} 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
     for r in rows:
-        if r['seq_len'] in pick:
+        if not isinstance(r, dict) or r.get('seq_len') not in pick:
+            continue
+        try:
             lines.append(f'| {r['seq_len']} | {r['sel_ratio']:.2%} | {r['csa_over_dense']:.3f} | {r['hybrid_over_dense']:.3f} | {r['csa_kv_over_dense']:.3f} |')
+        except (KeyError, TypeError, ValueError) as _e:
+            print(f'[report] sec_flops: a malformed row was skipped ({type(_e).__name__}: {_e})')
     _rows = {r['seq_len']: r for r in rows}
     _x = d.get('crossover_seq_len_csa_beats_dense')
     _r512 = _rows.get(512)
@@ -823,7 +869,9 @@ def sec_stats():
     if not d:
         return ''
     lines = ['## 配对符号翻转检验（exact sign-flip permutation）', '', 'n≤4 时 bootstrap 无意义，改用精确符号翻转：枚举全部 2^n 种符号组合，双侧 p 值（n 很小时 p 的分辨率有限是统计事实，报告 Δ 与方向同向性）。', '', '| 比较 | Δ(mean) | p (exact) |', '|---|---|---|']
-    items = d.get('comparisons', d) if isinstance(d, dict) else {}
+    items = d.get('comparisons', {}) if isinstance(d, dict) else {}
+    if not items and isinstance(d, dict):
+        items = {k: v for k, v in d.items() if isinstance(v, dict) and (v.get('mean') is not None or v.get('delta') is not None)}
     for k, v in items.items():
         if isinstance(v, dict):
             lines.append(f'| {k} | {fm(v.get('mean', v.get('delta')))} | {fm(v.get('p_exact_signflip', v.get('p')), 4)} |')
