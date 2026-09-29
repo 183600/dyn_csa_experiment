@@ -50,7 +50,12 @@ def git_push(msg):
         if rb.returncode != 0:
             print(f'[git] rebase onto origin failed: {(rb.stdout + rb.stderr)[-300:]}')
             run('git', 'rebase', '--abort')
-    r = run('git', 'push', 'origin', 'HEAD')
+        r = run('git', 'push', 'origin', 'HEAD')
+    else:
+        _up = run('git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name', 'origin/HEAD').stdout.strip()
+        _dst = _up.split('/', 1)[1] if _up.startswith('origin/') else 'main'
+        print(f'[git] detached HEAD — pushing explicitly to origin/{_dst}')
+        r = run('git', 'push', 'origin', f'HEAD:{_dst}')
     ok = r.returncode == 0
     tail = (r.stdout + r.stderr).strip()[-300:]
     print(f'[git] push {('OK' if ok else 'FAILED')}: {msg}' + ('' if ok else f'  ({tail})'))

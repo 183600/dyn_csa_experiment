@@ -31,8 +31,10 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 os.chdir(REPO)
 sys.path.insert(0, REPO)
 subprocess.check_call = _soft_check_call
-import exp_lib as L
-subprocess.check_call = _REAL_CHECK_CALL
+try:
+    import exp_lib as L
+finally:
+    subprocess.check_call = _REAL_CHECK_CALL
 DEVICE = L.DEVICE
 OVERLAP = L.OVERLAP
 BUDGET_V7 = dict(L.BUDGET)
@@ -641,14 +643,15 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
 
 def build_niah_batch(n_seq, seq_len, n_pairs=4, vocab=8192, seed=0):
     rng = np.random.default_rng(seed)
-    ids = rng.integers(2, vocab // 2, size=(n_seq, seq_len)).astype(np.int64)
+    key_hi = max(2 + (vocab // 2 - 2) // 4, 2 + 2 * n_pairs)
+    ids = rng.integers(key_hi, vocab // 2, size=(n_seq, seq_len)).astype(np.int64)
     tgt = np.full((n_seq, seq_len - 1), -100, dtype=np.int64)
     dist = np.full((n_seq, seq_len - 1), -1, dtype=np.int64)
     tail = 2 * n_pairs
     hay = seq_len - tail
     band = max(hay // n_pairs, 2)
     for i in range(n_seq):
-        keys = rng.choice(np.arange(2, vocab // 2), size=n_pairs, replace=False)
+        keys = rng.choice(np.arange(2, key_hi), size=n_pairs, replace=False)
         vals = rng.choice(np.arange(vocab // 2, vocab), size=n_pairs, replace=False)
         key_to_val, val_pos = ({}, {})
         for j in range(n_pairs):

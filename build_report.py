@@ -272,7 +272,8 @@ def sec_p0r():
         d_sp = _cf['ppl_mean'] - _cf_r['ppl_mean']
         _has_mt = _mtm is not None
         rope_unmatched = unmatched_tag(_cf_r, _fu_r)
-        rope_is_defect = gap_is_architecture(_cf_r, _fu_r) is False
+        _pgap_r = param_gap(_cf_r, _fu_r)
+        rope_is_defect = gap_is_architecture(_cf_r, _fu_r) is False or _pgap_r is None
         _w_abs = '领先' if g_abs < 0 else '落后'
         _w_absm = '领先' if g_abs_m < 0 else '落后'
         _w_rope = '领先' if g_rope < 0 else '落后'
@@ -280,7 +281,7 @@ def sec_p0r():
         _d_sp_t = ('改善' if d_sp > 0 else '变差') + f' **{abs(d_sp):.2f}**'
         lines += [f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL（参数对齐 `full_matched` 时{_w_absm} **{abs(g_abs_m):.2f}**；两者相差 **{g_abs - g_abs_m:+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(_cf, _mt)}。' if _has_mt else f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该差距因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` {_w_rope} `full_rope` **{abs(g_rope):.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense {_d_abs_t}、sparse {_d_sp_t}（注：`full_rope` 与 `csa_fixed_rope` 参数不同，此对比同时含容量效应）。', '']
         if rope_unmatched and rope_is_defect and _has_mt:
-            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线——落盘记录显示 `full_rope` 的 MLP 停在标准宽度（{_params_m(_fu_r)}），而 `csa_fixed_rope` 保持全宽（{_params_m(_cf_r)}），相差 {100 * (param_gap(_cf_r, _fu_r) or 0):.1f}%。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
+            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线——落盘记录显示 `full_rope` 的 MLP 停在标准宽度（{_params_m(_fu_r)}），而 `csa_fixed_rope` 保持全宽（{_params_m(_cf_r)}），{f'相差 {100 * _pgap_r:.1f}%' if _pgap_r is not None else '参数差未知'}。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
         _arms_gain = d_abs > 0 and d_sp > 0
         _gain_txt = 'RoPE+QK-norm 对两臂都有真实增益，值得保留为新默认' if _arms_gain else f'RoPE+QK-norm 并未对两臂都带来增益（dense {_d_abs_t}、sparse {_d_sp_t}）'
         _pair_mt = None

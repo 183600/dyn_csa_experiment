@@ -1031,7 +1031,7 @@ class Block(nn.Module):
         self.n1 = RMSNorm(d)
         self.attn = HybridAttention(d, n_heads, d_head, cfg)
         self.n2 = RMSNorm(d)
-        self.mlp = MLP(d, int(d * mlp_ratio), init_gen=mlp_gen)
+        self.mlp = MLP(d, int(round(d * mlp_ratio)), init_gen=mlp_gen)
 
     def forward(self, x):
         x = x + self.attn(self.n1(x))
@@ -1641,12 +1641,19 @@ def eval_ppl(model, val_batch, device, chunk=16, eval_rows=None, eval_seed=0):
                 print(f'[eval_ppl] scoring a uniform sample of {_k}/{_flat} target rows (eval_rows={int(eval_rows)}, eval_seed={int(eval_seed)}) — this is a SAMPLED estimate, not the full-set PPL')
             else:
                 print(f'[eval_ppl] eval_rows={int(eval_rows)} covers the whole {_flat}-row target space; scoring the FULL set (this is the population statistic, not a sample)')
-        _vhost = torch.as_tensor(val_batch)
-        if device.type == 'cuda' and not _vhost.is_pinned():
-            try:
-                _vhost = _vhost.pin_memory()
-            except RuntimeError:
-                pass
+        _vhost = None
+        if device.type == 'cuda':
+            _vc = _PINNED_HOST_CACHE.get('val')
+            if _vc is not None and _vc[0] is val_batch and _vc[1].shape == tuple(val_batch.shape):
+                _vhost = _vc[1]
+            else:
+                try:
+                    _vhost = torch.as_tensor(val_batch).pin_memory()
+                    _PINNED_HOST_CACHE['val'] = (val_batch, _vhost)
+                except RuntimeError:
+                    _vhost = torch.as_tensor(val_batch)
+        else:
+            _vhost = torch.as_tensor(val_batch)
         _async = _vhost.is_pinned()
         for i in range(0, val_batch.shape[0], chunk):
             ids = _vhost[i:i + chunk].to(device, non_blocking=_async)

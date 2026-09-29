@@ -319,8 +319,17 @@ def _hist_by_seed(outdir, variant):
                     print(f'[stats] {sp}: seed {s} of `{variant}` is a REAL record but its curve is IDENTICAL to the one already admitted for seed {seen[fp]}; keeping seed {seen[fp]} (the first admission) and dropping seed {s} so the curve is not counted twice.')
                 continue
         if s in out:
-            print(f'[stats] {sp}: two records with DIFFERENT curves both claim ({variant}, seed {s}) — the gap trajectory is ambiguous; the first record is kept and this one is dropped')
-            continue
+            if not r.get('synthesized') and synth_of.get(s):
+                out.pop(s, None)
+                synth_of.pop(s, None)
+                cfg_of.pop(s, None)
+                for _fp_old, _s_old in list(seen.items()):
+                    if _s_old == s:
+                        seen.pop(_fp_old)
+                print(f'[stats] {sp}: a REAL record for ({variant}, seed {s}) arrives after a SYNTHESIZED reconstruction of the same seed whose curve differs; keeping the real measurement and dropping the reconstruction.')
+            else:
+                print(f'[stats] {sp}: two records with DIFFERENT curves both claim ({variant}, seed {s}) — the gap trajectory is ambiguous; the first record is kept and this one is dropped')
+                continue
         seen[fp] = s
         synth_of[s] = bool(r.get('synthesized'))
         cfg_of[s] = r.get('run_cfg')
