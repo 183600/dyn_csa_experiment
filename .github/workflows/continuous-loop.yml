@@ -28,7 +28,6 @@ jobs:
           set +e
           echo "=== disk before cleanup ==="
           df -h /
-          # 只删和本项目无关的预装 SDK，保留 miniconda
           sudo rm -rf /usr/share/dotnet \
                       /usr/share/swift \
                       /usr/local/lib/android \
@@ -50,13 +49,7 @@ jobs:
           echo "=== Before ==="
           free -h
           df -h /
-
-          # ---------- 0) 关闭 systemd-oomd ----------
-          # 它在内存紧张时向进程发 SIGTERM，是 exit code 143 的常见来源
           sudo systemctl disable --now systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
-
-          # ---------- 1) zram：8G 压缩内存，不占磁盘 ----------
-          # disksize 是解压后容量上限，实际物理占用约为 1/3
           sudo modprobe zram 2>/dev/null || true
           if [ -e /dev/zram0 ]; then
             sudo swapoff /dev/zram0 2>/dev/null || true
@@ -67,15 +60,12 @@ jobs:
           else
             echo "[info] zram not available, skip"
           fi
-
-          # ---------- 2) 磁盘 swapfile：上限 8G，至少预留 3GB 磁盘 ----------
           AVAIL_KB=$(df --output=avail / | tail -1)
           AVAIL_MB=$((AVAIL_KB / 1024))
           WANT_MB=$((AVAIL_MB - 3072))
           if [ "$WANT_MB" -gt 8192 ]; then WANT_MB=8192; fi
           if [ "$WANT_MB" -lt 2048 ]; then WANT_MB=2048; fi
           echo "[info] available disk: ${AVAIL_MB}MB, will create swapfile: ${WANT_MB}MB"
-
           sudo swapoff /swapfile 2>/dev/null || true
           sudo rm -f /swapfile
           if ! sudo fallocate -l "${WANT_MB}M" /swapfile 2>/dev/null; then
@@ -85,15 +75,12 @@ jobs:
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile >/dev/null
           sudo swapon -p 10 /swapfile && echo "[ok] swapfile enabled"
-
-          # ---------- 3) 内核调优 ----------
           sudo sysctl -w vm.swappiness=100
           sudo sysctl -w vm.vfs_cache_pressure=200
           sudo sysctl -w vm.overcommit_memory=1
           sudo sysctl -w vm.dirty_ratio=40
           sudo sysctl -w vm.dirty_background_ratio=10
           sudo sysctl -w vm.watermark_scale_factor=200 2>/dev/null || true
-
           echo "=== After ==="
           free -h
           swapon --show
@@ -102,36 +89,13 @@ jobs:
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      - name: Configure opencode (NVIDIA default, 10% Moonshot when available)
-        env:
-          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      # 模板里的 __MODEL__ 会在运行时被实际探测到的模型 id 替换
+      # 注意：文件名不要以 opencode 开头，避免被 opencode 当成配置误读
+      - name: Prepare opencode config templates
         run: |
           mkdir -p ~/.config/opencode
 
-          # ---------- 模板 A：Moonshot（端点可用且抽中 10% 概率时才启用） ----------
-          cat > ~/.config/opencode/opencode.moonshot.json <<'EOF'
-          {
-            "$schema": "https://opencode.ai/config.json",
-            "provider": {
-              "moonshot": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "Moonshot",
-                "options": {
-                  "baseURL": "https://api.moonshot.cn/v1",
-                  "apiKey": "{env:KIMI_API_KEY}"
-                },
-                "models": {
-                  "kimi-k3": { "name": "kimi-k3" }
-                }
-              }
-            },
-            "model": "moonshot/kimi-k3"
-          }
-          EOF
-
-          # ---------- 模板 B：NVIDIA（默认端点） ----------
-          cat > ~/.config/opencode/opencode.nvidia.json <<'EOF'
+          cat > ~/.config/opencode/template.nvidia.json <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
             "provider": {
@@ -143,21 +107,37 @@ jobs:
                   "apiKey": "{env:NVIDIA_API_KEY}"
                 },
                 "models": {
-                  "moonshotai/kimi-k3": { "name": "moonshotai/kimi-k3" }
+                  "__MODEL__": { "name": "__MODEL__" }
                 }
               }
             },
-            "model": "nvidia/moonshotai/kimi-k3"
+            "model": "nvidia/__MODEL__"
           }
           EOF
 
-          # 默认先启用 NVIDIA；运行循环里每轮会重新抽签选择
-          cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
+          cat > ~/.config/opencode/template.moonshot.json <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "moonshot": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Moonshot",
+                "options": {
+                  "baseURL": "https://api.moonshot.cn/v1",
+                  "apiKey": "{env:KIMI_API_KEY}"
+                },
+                "models": {
+                  "__MODEL__": { "name": "__MODEL__" }
+                }
+              }
+            },
+            "model": "moonshot/__MODEL__"
+          }
+          EOF
 
-          echo "=== template (Moonshot) ==="
-          cat ~/.config/opencode/opencode.moonshot.json
-          echo "=== template (NVIDIA) ==="
-          cat ~/.config/opencode/opencode.nvidia.json
+          # 初始配置（运行循环里每轮都会按探测结果重新生成）
+          sed 's|__MODEL__|moonshotai/kimi-k3|g' ~/.config/opencode/template.nvidia.json \
+            > ~/.config/opencode/opencode.json
 
       - name: Configure git
         run: |
@@ -165,7 +145,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Run opencode for ~5 hours
-        timeout-minutes: 300   # 小于 job 的 330，给收尾步骤留时间
+        timeout-minutes: 300
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -176,20 +156,28 @@ jobs:
           OUT=/tmp/oc_out.log
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
           PROMPT='确保代码没有影响实验结果的bug(修复所有的bug)，优化性能和显存占用(优化只要不会明显降低性能就可以做)，不要管之前修的bug，不要写修复了哪些bug，确保远程仓库里面没有实验结果和REPORTxx.md以及autodl_budgetxx.json，同时远程仓库docs目录只留design_notes.md，确保远程仓库里面没有性能、修复了哪些bug和显存占用的记录（注释里也没有）'
-          ITER_TIMEOUT=10800   # 单次 opencode 最长 3 小时，防止 API 挂起卡死整个步骤
+          ITER_TIMEOUT=10800     # 单次 opencode 最长 3 小时
 
-          # ================= provider 选择策略 =================
-          # 每轮迭代开始时：
-          #   - Moonshot (api.moonshot.cn/v1) 可用  -> 10% 概率用 Moonshot，其余 90% 用 NVIDIA
-          #   - Moonshot 不可用（健康检查失败/运行中出错/429/冷却中）-> 一律 NVIDIA
-          # =====================================================
-          MOONSHOT_PROB=10     # Moonshot 可用时每轮被选中的概率（%），可调
-          MOONSHOT_COOLDOWN=0  # Moonshot 失败后的冷却轮数（期间不再抽 Moonshot）
+          # ================= 失败容忍度 =================
+          MAX_FAIL=8     # 连续 API 失败上限（旧版是 3，偶发 404 就把整个循环杀掉了）
+          MAX_RATE=10    # 连续限流上限
+          MAX_KILL=3     # 连续超时/被杀上限
+
+          # ================= provider / 模型状态 =================
+          MOONSHOT_PROB=10      # Moonshot 可用时每轮被选中的概率（%）
+          MOONSHOT_COOLDOWN=0   # Moonshot 失败后的冷却轮数
+          NVIDIA_COOLDOWN=0     # NVIDIA 探测不到 kimi 模型后的冷却轮数
+          CUR_PROVIDER="nvidia"
+          NVIDIA_MODEL="moonshotai/kimi-k3"   # 静态兜底，会被 /models 探测结果覆盖
+          MOONSHOT_MODEL="kimi-k3"            # 静态兜底，会被 /models 探测结果覆盖
 
           i=0
           FAIL_COUNT=0
           RATE_COUNT=0
-          USE_NVIDIA=1         # 默认走 NVIDIA；每轮循环开始时会重新抽
+          KILL_COUNT=0
+
+          mkdir -p ~/.config/opencode
+          echo normal > /tmp/loop_end_reason
 
           commit_and_push() {
             git add -A || true
@@ -198,7 +186,6 @@ jobs:
             git push origin "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
           }
 
-          # ---------- runner 收到外部终止信号(143)时，尽力保存未提交的改动 ----------
           on_shutdown() {
             echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
             git add -A || true
@@ -214,64 +201,165 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 健康检查：Moonshot 端点当前是否可用（2xx = 可用，不消耗 token） ----------
-          moonshot_alive() {
-            local code
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
-                   -H "Authorization: Bearer ${KIMI_API_KEY}" \
-                   'https://api.moonshot.cn/v1/models' 2>/dev/null)
-            echo "[info] Moonshot 健康检查 /v1/models -> HTTP ${code:-timeout}"
-            case "$code" in
-              2*) return 0 ;;
-              *)  return 1 ;;
+          # ---------- 探测端点：返回该端点当前真实可用的 kimi 模型 id ----------
+          # rc=0: 找到模型（stdout 输出模型 id）；rc=2: 端点正常但没有 kimi 模型；rc=1: 端点不可用
+          probe_endpoint() {
+            local base key tmp code ids m
+            case "$1" in
+              nvidia)   base='https://integrate.api.nvidia.com/v1'; key="${NVIDIA_API_KEY}" ;;
+              moonshot) base='https://api.moonshot.cn/v1';          key="${KIMI_API_KEY}" ;;
+              *) echo "[error] unknown provider: $1" >&2; return 1 ;;
             esac
+            if [ -z "$key" ]; then
+              echo "[warn] $1 的 API key 未配置" >&2
+              return 1
+            fi
+            tmp="/tmp/models_$1.json"
+            code=$(curl -s -o "$tmp" -w '%{http_code}' --max-time 20 \
+                   -H "Authorization: Bearer ${key}" "$base/models" 2>/dev/null)
+            echo "[info] $1 /models 探测 -> HTTP ${code:-timeout}" >&2
+            case "$code" in
+              2*) ;;
+              *) return 1 ;;
+            esac
+            if command -v jq >/dev/null 2>&1; then
+              ids=$(jq -r '.data[].id' "$tmp" 2>/dev/null | sort -u)
+            else
+              ids=$(grep -oE '"id" *: *"[^"]*"' "$tmp" 2>/dev/null \
+                    | sed -e 's/^"id" *: *"//' -e 's/"$//' | sort -u)
+            fi
+            if [ -z "$ids" ]; then
+              echo "[warn] $1 /models 响应解析失败" >&2
+              return 1
+            fi
+            # 按偏好挑选：k3 优先，其次 k2，最后任意 kimi（模型改名/换版本时自动适应）
+            for p in 'moonshotai/kimi-k3' 'moonshotai/kimi-k2' 'kimi-k3' 'kimi-k2' 'moonshotai/kimi' 'kimi'; do
+              m=$(printf '%s\n' "$ids" | grep -iF -- "$p" | head -1)
+              if [ -n "$m" ]; then
+                echo "$m"
+                return 0
+              fi
+            done
+            echo "[warn] $1 模型列表中没有 kimi 系列模型" >&2
+            return 2
           }
 
-          # ---------- 切换配置文件（切到另一端点时重置失败计数） ----------
-          use_moonshot() {
-            if [ $USE_NVIDIA -eq 1 ]; then
-              cp ~/.config/opencode/opencode.moonshot.json ~/.config/opencode/opencode.json
-              USE_NVIDIA=0
-              FAIL_COUNT=0
-              RATE_COUNT=0
-            fi
+          # ---------- 用模板 + 实际模型 id 生成 opencode.json ----------
+          write_config() {
+            sed "s|__MODEL__|$2|g" ~/.config/opencode/template.$1.json \
+              > ~/.config/opencode/opencode.json
           }
-          use_nvidia() {
-            if [ $USE_NVIDIA -eq 0 ]; then
-              cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
-              USE_NVIDIA=1
-              FAIL_COUNT=0
-              RATE_COUNT=0
+
+          # ---------- 重新探测当前 provider 的模型（必要时更新模型变量） ----------
+          refresh_current_model() {
+            local m rc
+            m=$(probe_endpoint "$CUR_PROVIDER"); rc=$?
+            if [ $rc -eq 0 ]; then
+              if [ "$CUR_PROVIDER" = "nvidia" ]; then
+                if [ "$m" != "$NVIDIA_MODEL" ]; then
+                  echo "[info] NVIDIA 模型更新: $NVIDIA_MODEL -> $m"
+                  NVIDIA_MODEL="$m"
+                fi
+              else
+                if [ "$m" != "$MOONSHOT_MODEL" ]; then
+                  echo "[info] Moonshot 模型更新: $MOONSHOT_MODEL -> $m"
+                  MOONSHOT_MODEL="$m"
+                fi
+              fi
+            fi
+            return $rc
+          }
+
+          cooldown_current() {
+            if [ "$CUR_PROVIDER" = "nvidia" ]; then NVIDIA_COOLDOWN=20; else MOONSHOT_COOLDOWN=20; fi
+          }
+
+          # ---------- 尝试切到另一个 provider ----------
+          try_switch_provider() {
+            local o
+            if [ "$CUR_PROVIDER" = "nvidia" ]; then
+              o=$(probe_endpoint moonshot)
+              if [ -n "$o" ]; then
+                MOONSHOT_MODEL="$o"
+                CUR_PROVIDER="moonshot"
+                echo "[info] 切换到 Moonshot ($o) 重试"
+                return 0
+              fi
+              echo "[info] Moonshot 当前不可用，继续使用 NVIDIA"
+              return 1
+            else
+              if [ $NVIDIA_COOLDOWN -gt 0 ]; then
+                echo "[info] NVIDIA 处于冷却期，继续使用 Moonshot"
+                return 1
+              fi
+              CUR_PROVIDER="nvidia"
+              echo "[info] 切换到 NVIDIA 重试"
+              return 0
             fi
           }
 
           # ---------- 每轮开始时选 provider ----------
           pick_provider() {
-            # 冷却期内：Moonshot 刚失败过，视为"不能用"，直接 NVIDIA
+            local m
+            # 失败恢复期间保持当前 provider 不变（切换由失败处理逻辑负责）
+            if [ $FAIL_COUNT -gt 0 ]; then
+              return 0
+            fi
+            # Moonshot 冷却中 -> 一律 NVIDIA
             if [ $MOONSHOT_COOLDOWN -gt 0 ]; then
               MOONSHOT_COOLDOWN=$((MOONSHOT_COOLDOWN-1))
-              echo "[info] Moonshot 冷却中（剩余 $MOONSHOT_COOLDOWN 轮），本轮使用 NVIDIA"
-              use_nvidia
-              return
+              CUR_PROVIDER="nvidia"
+              return 0
             fi
-            # 抽签：10% 概率抽中 Moonshot，且只有健康检查通过才真正启用
-            if [ $(( RANDOM % 100 )) -lt $MOONSHOT_PROB ]; then
-              if moonshot_alive; then
-                use_moonshot
-                echo "[info] 第 $i 轮抽中 Moonshot（${MOONSHOT_PROB}% 概率且健康检查通过）"
+            # NVIDIA 冷却中（模型疑似下架）-> 尽量用 Moonshot
+            if [ $NVIDIA_COOLDOWN -gt 0 ]; then
+              NVIDIA_COOLDOWN=$((NVIDIA_COOLDOWN-1))
+              if m=$(probe_endpoint moonshot); then
+                MOONSHOT_MODEL="$m"
+                CUR_PROVIDER="moonshot"
               else
-                echo "[info] 第 $i 轮抽中 Moonshot，但端点当前不可用，本轮使用 NVIDIA"
-                use_nvidia
+                CUR_PROVIDER="nvidia"
+              fi
+              return 0
+            fi
+            # 正常抽签：10% Moonshot（健康检查通过才用），90% NVIDIA
+            if [ $(( RANDOM % 100 )) -lt $MOONSHOT_PROB ]; then
+              if m=$(probe_endpoint moonshot); then
+                MOONSHOT_MODEL="$m"
+                CUR_PROVIDER="moonshot"
+                echo "[info] 第 $i 轮抽中 Moonshot（模型: $m）"
+              else
+                CUR_PROVIDER="nvidia"
+                echo "[info] 第 $i 轮抽中 Moonshot，但端点不可用，改用 NVIDIA"
               fi
             else
-              use_nvidia
+              CUR_PROVIDER="nvidia"
             fi
           }
+
+          # ================= 启动时探测两端点真实可用的模型 =================
+          m=$(probe_endpoint nvidia); rc=$?
+          if [ $rc -eq 0 ]; then
+            NVIDIA_MODEL="$m"
+            echo "[init] NVIDIA 可用模型: $m"
+          else
+            echo "[warn] NVIDIA 模型探测失败 (rc=$rc)，使用静态默认: $NVIDIA_MODEL"
+            [ $rc -eq 2 ] && NVIDIA_COOLDOWN=20
+          fi
+
+          m=$(probe_endpoint moonshot); rc=$?
+          if [ $rc -eq 0 ]; then
+            MOONSHOT_MODEL="$m"
+            echo "[init] Moonshot 可用模型: $m"
+          else
+            echo "[warn] Moonshot 模型探测失败 (rc=$rc)，使用静态默认: $MOONSHOT_MODEL"
+            [ $rc -eq 2 ] && MOONSHOT_COOLDOWN=20
+          fi
 
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             i=$((i+1))
 
-            # ---------- 每轮检查资源：磁盘低于 2GB 就收工，避免被 runner 杀掉(143) ----------
+            # ---------- 每轮检查磁盘 ----------
             AVAIL_MB=$(( $(df --output=avail / | tail -1) / 1024 ))
             echo "--- iteration #$i | free disk: ${AVAIL_MB}MB ---"
             free -h | head -2
@@ -280,79 +368,110 @@ jobs:
               break
             fi
 
-            # ---------- 选择本轮 provider：Moonshot 可用则按概率抽，否则 NVIDIA ----------
+            # ---------- 选择 provider 并生成配置 ----------
             pick_provider
+            if [ "$CUR_PROVIDER" = "nvidia" ]; then CUR_MODEL="$NVIDIA_MODEL"; else CUR_MODEL="$MOONSHOT_MODEL"; fi
+            write_config "$CUR_PROVIDER" "$CUR_MODEL"
 
-            echo "=========== opencode iteration #$i (provider=$([ $USE_NVIDIA -eq 1 ] && echo NVIDIA || echo Moonshot), model=kimi-k3) ==========="
+            echo "=========== opencode iteration #$i (provider=$CUR_PROVIDER, model=$CUR_MODEL) ==========="
 
             timeout --kill-after=180 $ITER_TIMEOUT opencode run "$PROMPT" 2>&1 | tee "$OUT"
             EXIT_CODE=$?
 
-            # ---------- 超时/被杀（124=timeout, 137=SIGKILL, 143=SIGTERM）：改动照样提交，保住进度 ----------
+            # ---------- 超时/被杀：改动照样提交 ----------
             if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ] || [ $EXIT_CODE -eq 143 ]; then
-              FAIL_COUNT=$((FAIL_COUNT+1))
-              echo "[warn] iteration $i 超时或被杀 (exit=$EXIT_CODE)，已完成的改动照常提交 (连续: $FAIL_COUNT)"
+              KILL_COUNT=$((KILL_COUNT+1))
+              echo "[warn] iteration $i 超时或被杀 (exit=$EXIT_CODE)，已完成的改动照常提交 (连续被杀: $KILL_COUNT)"
               commit_and_push "$i (partial, killed)"
-              if [ $FAIL_COUNT -ge 3 ]; then
-                echo "连续 3 次超时/被杀，结束本轮，等待定时任务唤醒"
+              if [ $KILL_COUNT -ge $MAX_KILL ]; then
+                echo "连续 ${MAX_KILL} 次超时/被杀，结束本轮，等待定时任务唤醒"
+                echo fail > /tmp/loop_end_reason
                 break
               fi
-              sleep 10
-              continue
-            fi
-
-            if [ $EXIT_CODE -ne 0 ]; then
-              # ---------- 429 限流 ----------
-              if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
-                # 正在用 Moonshot 时被限流 -> 视为"不能用 Moonshot"，冷却并立即切 NVIDIA
-                if [ $USE_NVIDIA -eq 0 ]; then
-                  echo "[warn] iteration $i 命中 Moonshot 限流(429)，视为不可用，切到 NVIDIA 重试"
-                  MOONSHOT_COOLDOWN=10
-                  use_nvidia
-                  sleep 10
-                  continue
-                fi
-                # NVIDIA 限流 -> 退避后用同一端点重试
-                RATE_COUNT=$((RATE_COUNT+1))
-                echo "[warn] iteration $i 命中 NVIDIA 限流(429) (连续: $RATE_COUNT)，退避 180 秒后重试"
-                if [ $RATE_COUNT -ge 8 ]; then
-                  echo "连续 8 次限流，结束本轮，等待定时任务唤醒"
-                  break
-                fi
-                sleep 180
-                continue
-              fi
-
-              RATE_COUNT=0
-              FAIL_COUNT=$((FAIL_COUNT+1))
-              echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE (连续失败: $FAIL_COUNT)"
-
-              # ---------- 正在用 Moonshot 时出错 -> 认为端点不可用，冷却并切 NVIDIA 重试 ----------
-              if [ $USE_NVIDIA -eq 0 ]; then
-                echo "[info] Moonshot 端点异常，视为不可用，切到 NVIDIA 重试"
-                MOONSHOT_COOLDOWN=10
-                use_nvidia
-                sleep 10
-                continue
-              fi
-
-              # ---------- NVIDIA 连续失败：跳过本轮，等定时任务唤醒 ----------
-              if [ $FAIL_COUNT -ge 3 ]; then
-                echo "连续 3 次请求失败（可能是 API Key 错误或模型名不存在），跳过本轮，等待定时任务唤醒"
-                break
-              fi
-
               sleep 30
               continue
-            else
-              FAIL_COUNT=0
-              RATE_COUNT=0
             fi
 
-            commit_and_push "$i"
+            # ---------- 成功 ----------
+            if [ $EXIT_CODE -eq 0 ]; then
+              FAIL_COUNT=0
+              RATE_COUNT=0
+              KILL_COUNT=0
+              commit_and_push "$i"
+              sleep 5
+              continue
+            fi
 
-            sleep 5
+            # ---------- 429 限流 ----------
+            if tail -60 "$OUT" | grep -qiE 'too many requests|rate.?limit|"status":429|status code 429|status:429'; then
+              if [ "$CUR_PROVIDER" = "moonshot" ]; then
+                echo "[warn] iteration $i 命中 Moonshot 限流(429)，切到 NVIDIA 重试"
+                MOONSHOT_COOLDOWN=10
+                CUR_PROVIDER="nvidia"
+                commit_and_push "$i (partial, 429)"
+                sleep 20
+                continue
+              fi
+              RATE_COUNT=$((RATE_COUNT+1))
+              echo "[warn] iteration $i 命中 NVIDIA 限流(429) (连续限流: $RATE_COUNT)，退避 180 秒后重试"
+              if [ $RATE_COUNT -ge $MAX_RATE ]; then
+                echo "连续 ${MAX_RATE} 次限流，结束本轮，等待定时任务唤醒"
+                echo fail > /tmp/loop_end_reason
+                break
+              fi
+              sleep 180
+              continue
+            fi
+
+            # ---------- 404 / 模型不存在（本次报错的核心场景） ----------
+            if tail -60 "$OUT" | grep -qiE '"status":404|status code 404|status:404|function id|is not found|does not exist|no such model|model_not_found'; then
+              FAIL_COUNT=$((FAIL_COUNT+1))
+              echo "[warn] iteration $i 命中 404/模型不存在 (连续失败: $FAIL_COUNT)，重新探测可用模型"
+              refresh_current_model; prc=$?
+              if [ $prc -ne 0 ]; then
+                # 当前 provider 已探测不到可用 kimi 模型：冷却并切到另一边
+                [ $prc -eq 2 ] && cooldown_current
+                try_switch_provider || true
+              elif [ $((FAIL_COUNT % 2)) -eq 0 ]; then
+                # 模型仍在列表中（端点间歇性故障）：连续偶数次失败时换一边试试
+                try_switch_provider || true
+              fi
+              commit_and_push "$i (partial, 404)"
+              if [ $FAIL_COUNT -ge $MAX_FAIL ]; then
+                echo "连续 ${MAX_FAIL} 次失败，结束本轮，等待定时任务唤醒"
+                echo fail > /tmp/loop_end_reason
+                break
+              fi
+              sleep 60
+              continue
+            fi
+
+            # ---------- 其他错误：计数 + 指数退避 + 偶数次切换 provider ----------
+            RATE_COUNT=0
+            FAIL_COUNT=$((FAIL_COUNT+1))
+            echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE (连续失败: $FAIL_COUNT)"
+            commit_and_push "$i (partial, failed)"
+
+            if [ $((FAIL_COUNT % 2)) -eq 0 ]; then
+              echo "[info] 连续失败 ${FAIL_COUNT} 次，刷新模型并尝试切换 provider"
+              refresh_current_model; prc=$?
+              [ $prc -eq 2 ] && cooldown_current
+              try_switch_provider || true
+            fi
+
+            if [ $FAIL_COUNT -ge $MAX_FAIL ]; then
+              echo "连续 ${MAX_FAIL} 次失败，结束本轮，等待定时任务唤醒"
+              echo fail > /tmp/loop_end_reason
+              break
+            fi
+
+            BO=$(( 30 * (2 ** (FAIL_COUNT - 1)) ))
+            [ $BO -gt 300 ] && BO=300
+            echo "[info] 退避 ${BO}s 后重试"
+            sleep $BO
           done
+
+          echo "[info] 主循环结束"
 
       - name: Cleanup repo artifacts
         if: always()
@@ -382,6 +501,11 @@ jobs:
         run: |
           set +e
           BRANCH="${GITHUB_REF_NAME:-main}"
+          # 本轮若因连续失败提前退出，先等 10 分钟再触发，避免 API 故障期间空转
+          if [ -f /tmp/loop_end_reason ] && grep -q '^fail$' /tmp/loop_end_reason; then
+            echo "[info] 本轮因连续失败提前结束，延迟 10 分钟再触发下一次"
+            sleep 600
+          fi
           gh workflow run continuous-loop.yml --ref "$BRANCH" \
             && echo "next run dispatched on ${BRANCH}" \
             || echo "[warn] dispatch failed, cron fallback will pick up"
