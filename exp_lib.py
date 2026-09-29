@@ -597,7 +597,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
         _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
         q_chunk = min(q_chunk, _max_rows)
     q_chunk = max(1, min(int(q_chunk), n))
-    out = torch.empty_like(q)
+    pieces = []
     _MINL = torch.finfo(q.dtype).min
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
@@ -624,8 +624,8 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
             attn = soft_attn + (attn - soft_attn.detach())
         if sink_logits is None:
             attn = attn * sel.any(-1)[:, None, None].to(attn.dtype)
-        out[s:e] = torch.einsum('nhm,nmhd->nhd', attn, Vset)
-    return out
+        pieces.append(torch.einsum('nhm,nmhd->nhd', attn, Vset))
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, 0)
 
 def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None):
     n = q.shape[0]
@@ -640,7 +640,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
         q_chunk = min(q_chunk, _max_rows)
     q_chunk = max(1, min(int(q_chunk), n))
-    out = torch.empty_like(q)
+    pieces = []
     rel = _range_cache(0, w, dev)
     pos_all = _arange_cache(n, dev)
     n_blk = k_blk.shape[0]
@@ -678,7 +678,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
             if sink_logits is None:
                 attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
-            out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
+            pieces.append(torch.einsum('qhm,qmhd->qhd', attn, Vset))
             continue
         soft_g = soft[s:e].gather(1, ib)
         if keep is not None:
@@ -703,8 +703,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         attn = soft_attn + (attn - soft_attn.detach())
         if sink_logits is None:
             attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
-        out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
-    return out
+        pieces.append(torch.einsum('qhm,qmhd->qhd', attn, Vset))
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, 0)
 
 @dataclass
 class AttnCfg:
@@ -979,16 +979,15 @@ class HybridAttention(nn.Module):
                     pre_all[kk] = v
                 else:
                     pre_all[kk] = v.reshape(B, T, *v.shape[1:])
-        outs = None
+        outs = []
         gates = []
         for b in range(B):
             pre = None if pre_all is None else {kk: v[b] if v is not None else None for kk, v in pre_all.items()}
             o, g = self._single(x[b], pre=pre)
-            if outs is None:
-                outs = torch.empty(B, *o.shape, device=o.device, dtype=o.dtype)
-            outs[b].copy_(o)
+            outs.append(o)
             if g is not None:
                 gates.append(g)
+        outs = torch.stack(outs, 0)
         if not gates:
             self.last_gate_mean = None
         else:

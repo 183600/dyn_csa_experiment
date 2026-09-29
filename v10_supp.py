@@ -97,11 +97,10 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=
             raise
         tgt = ids[:, 1:]
         _ce = F.cross_entropy(logits[:, -target:, :].reshape(-1, vocab), tgt[:, -target:].reshape(-1), reduction='none').view(len(rows), target)
-        for _r in range(len(rows)):
-            ce_r = _ce[_r]
-            nll_sum.append(float(ce_r.double().sum()))
-            n_tok.append(int(ce_r.numel()))
-        del ids, logits, tgt, _ce
+        _sums = _ce.double().sum(1).tolist()
+        nll_sum.extend(map(float, _sums))
+        n_tok.extend([target] * len(rows))
+        del ids, logits, tgt, _ce, _sums
         i = j
     return (nll_sum, n_tok)
 
@@ -179,13 +178,17 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
             def _cell_stale(_key, _fp_x):
                 _rec = summary.get(_key)
                 return not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_x) and (_rec or {}).get('recipe') == _ck_recipe)
-            _fp0 = _probe_fingerprint(cfg)
+            _vocab_ck = int(d.get('vocab', 8192))
+            if cfg.get('vocab') is not None and int(cfg['vocab']) != _vocab_ck:
+                print(f"[p3mp] {v} s{seed}: probe cfg vocab={int(cfg['vocab'])} differs from the checkpoint's vocab={_vocab_ck} — using the checkpoint's (the model is what is being scored)")
+            _pcfg = dict(cfg, vocab=_vocab_ck)
+            _fp = _probe_fingerprint(_pcfg)
             _todo = False
             for arm in cfg['arms']:
                 if not _arm_of(v, arm):
                     continue
                 for Ln, rho in _defs:
-                    if _cell_stale(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}', _fp0):
+                    if _cell_stale(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}', _fp):
                         _todo = True
                         break
                 if _todo:
@@ -193,11 +196,6 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
             if not _todo:
                 del d
                 continue
-            _vocab_ck = int(d.get('vocab', 8192))
-            if cfg.get('vocab') is not None and int(cfg['vocab']) != _vocab_ck:
-                print(f"[p3mp] {v} s{seed}: probe cfg vocab={int(cfg['vocab'])} differs from the checkpoint's vocab={_vocab_ck} — using the checkpoint's (the model is what is being scored)")
-            _pcfg = dict(cfg, vocab=_vocab_ck)
-            _fp = _probe_fingerprint(_pcfg)
             model = None
             for arm in cfg['arms']:
                 if not _arm_of(v, arm):

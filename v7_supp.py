@@ -238,7 +238,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         bc, bs = rope_cos_sin(hd, rope_dim, last_tok, dev, rope_base)
         k_blk_r = apply_rope(k_blk, bc[:, None, :], bs[:, None, :], rope_dim)
         k_sw_r = apply_rope(k_sw, cos[:, None, :], sin[:, None, :], rope_dim)
-        out = torch.empty_like(q)
+        pieces = []
         rel = L._range_cache(0, w, dev)
         pos_all = L._arange_cache(T, dev)
         q_chunk = max(1, min(int(q_chunk), T))
@@ -286,8 +286,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 attn = soft_attn + (attn - soft_attn.detach())
                 if sink is None:
                     attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
-            out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
-        return out
+            pieces.append(torch.einsum('qhm,qmhd->qhd', attn, Vset))
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, 0)
 
     def _dense_warmup_forward(self, x):
         B, T, _ = x.shape
@@ -346,16 +346,15 @@ class HybridAttentionRoPE(L.HybridAttention):
                         pre_all[kk] = v
                     else:
                         pre_all[kk] = v.reshape(B, T, *v.shape[1:])
-            outs = None
+            outs = []
             gates = []
             for b in range(B):
                 pre = None if pre_all is None else {kk: v[b] if v is not None else None for kk, v in pre_all.items()}
                 o, g = self._single_rope(x[b], pre=pre)
-                if outs is None:
-                    outs = torch.empty(B, *o.shape, device=o.device, dtype=o.dtype)
-                outs[b].copy_(o)
+                outs.append(o)
                 if g is not None:
                     gates.append(g)
+            outs = torch.stack(outs, 0)
             if not gates:
                 self.last_gate_mean = None
             else:

@@ -866,4 +866,5 @@ def main(argv=None):
     print(f'[report] wrote {out} ({len(txt)} bytes)')
     return out
 if __name__ == '__main__':
-    sys.exit(0 if main() else 1)
+    _rc = main()
+    sys.exit(0 if _rc is not None else 1)
