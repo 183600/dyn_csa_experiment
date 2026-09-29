@@ -329,7 +329,7 @@ def sec_p0w():
         ppls = [p for p, _s, _m, _sd in vals]
         mean = sum(ppls) / len(ppls)
         std = sample_std(ppls)
-        sws = [s for _p, s, _m, _sd in vals if isinstance(s, (int, float))]
+        sws = [s for _p, s, _m, _sd in vals if _ppl_ok(s)]
         sw_s = f'{sum(sws) / len(sws):.2f}' if sws else '—'
         lines.append(f'| `{v}` | {w} | {mean:.2f} ± {std:.2f} | {len(ppls)} | {sw_s} |')
     base = grp.get(('csa_fixed', 0))
@@ -510,18 +510,22 @@ def sec_p1t():
             n = len(ppls)
         else:
             mean, std, n = (r.get('ppl_mean'), r.get('ppl_std') or 0.0, r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n', 0))
-        if v == 'csa_fix_m1':
+        _bv = v.split('@')[0].split('#')[0]
+        if _bv == 'csa_fix_m1':
             sr = '1.6% (m=1, topk=32)'
-        elif v.startswith('csa_fixed_topk'):
-            _kv = v.replace('csa_fixed_topk', '').split('@')[0].split('#')[0]
+        elif _bv.startswith('csa_fixed_topk'):
+            _kv = _bv.replace('csa_fixed_topk', '')
             try:
                 k = int(_kv)
             except ValueError:
                 print(f'[report] sec_p1t: cannot parse topk from aggregate key {v!r} — row omitted')
                 continue
             sr = f'{min(k, 512) / 512:.1%}'
-        else:
+        elif _bv == 'csa_fixed':
             sr = '6.25% (default topk=32)'
+        else:
+            sr = '—'
+            print(f'[report] sec_p1t: aggregate key {v!r} is not one of the known sweep variants — its selection-rate cell is left blank rather than guessed')
         lines.append(f'| `{v}` | {fm(mean)} ± {fm(std)} | {n} | {sr} |')
     s = summary('results_lm_v7_seq2k')
     failed = {}
@@ -748,7 +752,7 @@ def sec_p2s():
                 common, dl, st = pr
                 rows.append((a, b, common, st))
     if rows:
-        lines += ['', '**配对检验（同 seed 配对，精确符号翻转）**：', '', '| 比较 | n (共同 seeds) | Δ (a−b) mean±std | p (exact) | params |', '|---|---|---|---|---|']
+        lines += ['', '**配对检验（同 seed 配对，精确符号翻转）**：', '', '| 比较 | n (配对 seeds) | Δ (a−b) mean±std | p (exact) | params |', '|---|---|---|---|---|']
         for a, b, common, st in rows:
             lines.append(f'| `{a}` − `{b}` | {len(common)} | {st['mean']:+.2f} ± {st['std']:.2f} | {st['p_exact_signflip']:.3f} | {unmatched_tag(_agg_entry(_agg, a), _agg_entry(_agg, b)) or '✓'} |')
         main = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full'), None)

@@ -96,7 +96,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
             if r.get('probe_params') is None:
                 _bad_cells.append((_k, 'no probe_params'))
                 continue
-            pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')))
+            pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
             grp = cells.setdefault(pk, {})
             if r['seed'] in grp:
                 _dup_cells.append((_k, pk[:4], r['seed']))
@@ -345,6 +345,16 @@ def build_report(out='REPORT_v11.md'):
                 print(f'[v11 report] {v}: no by-length record carries the current code semantics ({L.CODE_SEMANTICS}) — quoting all {len(_rv)} (they predate it; re-run P4MT to refresh)')
             _rows_by_v[v] = _rv
         n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
+        if len(n_by_v) > 1:
+            _common_seeds = set.intersection(*n_by_v.values())
+            if len({frozenset(s) for s in n_by_v.values()}) > 1:
+                if _common_seeds:
+                    print(f'[v11 report] by-length panel is ragged ({ {v: sorted(s) for v, s in n_by_v.items()} }) — restricting the table to the {len(_common_seeds)}-seed intersection {sorted(_common_seeds)} so every column shares one seed set')
+                    for _v in list(_rows_by_v):
+                        _rows_by_v[_v] = [r for r in _rows_by_v[_v] if r['seed'] in _common_seeds]
+                    n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
+                else:
+                    print(f'[v11 report] WARNING: by-length arms share NO seed ({ {v: sorted(s) for v, s in n_by_v.items()} }) — the table below quotes per-arm means over DIFFERENT seed sets and is not a paired comparison')
         A(f'**双臂 by-length 面板**（n={(min((len(s) for s in n_by_v.values())) if n_by_v else 0)}，ratio = PPL@L / PPL@512，seed 平均）：')
         A('')
         A('| variant | PPL@512 | PPL@2048 | PPL@4096 | ratio@4096 |')

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, itertools, os, sys, functools
+import json, itertools, math, os, sys, functools
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -46,10 +46,17 @@ def _panel_seeds():
             _s = _r.get('seed')
             if isinstance(_s, bool):
                 continue
+            if isinstance(_s, float) and not (math.isfinite(_s) and _s.is_integer()):
+                print(f'[fuse_analysis] WARNING: {_pn} record {_k!r} carries a non-integral seed ({_s!r}) — refused for pairing (it would silently alias onto seed {int(_s) if math.isfinite(_s) else _s!r})')
+                continue
             try:
-                _sv.add(int(_s))
+                _si = int(_s)
             except (TypeError, ValueError, OverflowError):
                 continue
+            if _si in _sv:
+                print(f'[fuse_analysis] WARNING: {_pn}: a second measurable record for `{_v}` seed={_si} (key {_k!r}) — its PPL is ambiguous with the first; pairing keeps the canonical key and IGNORES this one')
+                continue
+            _sv.add(_si)
         sets.append(_sv)
     common = set.intersection(*sets) if sets else set()
     if not common:
@@ -198,35 +205,39 @@ def main(argv=None):
             mean_a = float(np.nanmean(_sa))
             lines.append(f'| — | **{name}** | {mean_b:.4f}±{sd_b:.4f} | {mean_a:.4f}±{sd_a:.4f} | **{np.nanmean(db):+.4f}** |')
             pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=np.nanmean(Mb, axis=0).round(4).tolist(), fuse_perlayer_mean=np.nanmean(Ma, axis=0).round(4).tolist(), delta_perlayer=db.round(4).tolist(), nofuse_seed_std=float(sd_b), fuse_seed_std=float(sd_a))
-        _why = [L.pair_reason(rec(a, s), rec(b, s)) for s in SEEDS]
-        _why = [w for w in _why if w]
+        _reasons = {s: L.pair_reason(rec(a, s), rec(b, s)) for s in SEEDS}
+        _why = sorted({r for r in _reasons.values() if r})
+        _ok_seeds = [s for s in SEEDS if _reasons[s] is None]
         _gate_ok = not _why
+        _keep = np.array([_reasons[s] is None for s in SEEDS], dtype=bool)
         _, fb = per_seed_layer(b, 'bnd_f1')
         _, fa = per_seed_layer(a, 'bnd_f1')
-        _jf = np.isfinite(fa) & np.isfinite(fb)
+        _jf = np.isfinite(fa) & np.isfinite(fb) & _keep[:, None]
         fa = np.where(_jf, fa, np.nan)
         fb = np.where(_jf, fb, np.nan)
         d_f1 = np.nanmean(fa, axis=1) - np.nanmean(fb, axis=1)
         d_f1 = d_f1[np.isfinite(d_f1)]
         pa = np.array([rec(a, s)['ppl'] for s in SEEDS])
         pb = np.array([rec(b, s)['ppl'] for s in SEEDS])
-        d_ppl = pa - pb
+        d_ppl = (pa - pb)[_keep]
         d_ppl = d_ppl[np.isfinite(d_ppl)]
-        if _gate_ok and len(d_f1) and len(d_ppl):
+        if len(d_f1) and len(d_ppl):
             p_f1 = signflip(d_f1)
             p_ppl = signflip(d_ppl)
             _n_f1 = len(d_f1)
             lines.append(f'\n**配对精确符号翻转检验（n={_n_f1}，按 seed 配对）**：')
+            if not _gate_ok:
+                lines.append(f'> 注：{len(SEEDS) - len(_ok_seeds)} 个 seed 未通过配置/预算配对门禁（{_why}），已按本仓库惯例排除——Δ 与 p 值只在可配对的 {_ok_seeds} 上计算，跨配置的种子差不进入检验。')
             lines.append(f'- 层均边界 F1：Δ = {d_f1.mean():+.4f} ± {sample_std(d_f1):.4f}，{int(max((d_f1 > 0).sum(), (d_f1 < 0).sum()))}/{_n_f1} 同向，p(exact) = {p_f1:.3f}')
             lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p(exact) = {p_ppl:.3f}（n={len(d_ppl)} 时 p 分辨率下限 {2.0 / 2 ** max(len(d_ppl), 1):.3f}）\n')
-        elif _gate_ok:
+        elif not _ok_seeds:
             p_f1 = p_ppl = None
-            lines.append('\n**配对检验：未执行。** 可用于配对的有限样本不足，**不给出 p 值**、不进入任何显著性主张。\n')
+            lines.append(f'\n**配对检验：未执行。** 上述两臂不满足本仓库的可配对条件（{_why}）——它们的训练配置无法证明相同，**不给出 p 值**、不进入任何显著性主张。\n')
         else:
             p_f1 = p_ppl = None
-            lines.append(f'\n**配对检验：未执行。** 上述两臂不满足本仓库的可配对条件（{sorted(set(_why))}）——它们的训练配置无法证明相同，因此下面的 Δ 只作描述性差异，**不给出 p 值**、不进入任何显著性主张。\n')
+            lines.append('\n**配对检验：未执行。** 可用于配对的有限样本不足，**不给出 p 值**、不进入任何显著性主张。\n')
         unstamped = sum((1 for v in pair for s in SEEDS if panel_of(v)[f'{v}::seed{s}'].get('run_cfg') is None))
-        stats_out[f'{a}__vs__{b}'] = dict(boundary=pair_stats, f1_delta_per_seed=d_f1.round(4).tolist(), f1_p_exact=p_f1, ppl_fuse=pa.round(2).tolist(), ppl_nofuse=pb.round(2).tolist(), ppl_delta_per_seed=d_ppl.round(3).tolist(), ppl_p_exact=p_ppl, n_unstamped=unstamped, paired_test='run' if _gate_ok else 'skipped', pair_refusals=sorted(set(_why)))
+        stats_out[f'{a}__vs__{b}'] = dict(boundary=pair_stats, f1_delta_per_seed=d_f1.round(4).tolist(), f1_p_exact=p_f1, ppl_fuse=pa.round(2).tolist(), ppl_nofuse=pb.round(2).tolist(), ppl_delta_per_seed=d_ppl.round(3).tolist(), ppl_p_exact=p_ppl, n_unstamped=unstamped, paired_test='run' if p_f1 is not None else 'skipped', pair_refusals=_why)
         _is_clean = a == 'hybrid_csa_dyn_fuse'
         if _is_clean:
             probe['d_f1'] = float(d_f1.mean()) if len(d_f1) else None

@@ -157,23 +157,6 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 print(f'[p3mp] SKIP {v} s{seed}: no checkpoint {ck} (run phase P3MT first)')
                 continue
             _defs = [(Ln, rho) for Ln in cfg['eval_lens'] for rho in cfg['rhos']]
-
-            def _cell_stale(_key, _fp_x):
-                _rec = summary.get(_key)
-                return not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_x))
-            _fp0 = _probe_fingerprint(cfg)
-            _todo = False
-            for arm in cfg['arms']:
-                if not _arm_of(v, arm):
-                    continue
-                for Ln, rho in _defs:
-                    if _cell_stale(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}', _fp0):
-                        _todo = True
-                        break
-                if _todo:
-                    break
-            if not _todo:
-                continue
             try:
                 d = torch.load(ck, map_location='cpu', weights_only=False)
             except Exception as _cle:
@@ -186,6 +169,25 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
             _tr = (mech_summ or {}).get(f'{v}::seed{seed}') or {}
             if not _tr:
                 print(f"[p3mp] REFUSE {v} s{seed}: {ck} exists but {_msp} has no '{v}::seed{seed}' training record — the weights have no traceable provenance, so they cannot be attributed to the current recipe")
+                del d
+                continue
+            _ck_recipe = d.get('recipe')
+
+            def _cell_stale(_key, _fp_x):
+                _rec = summary.get(_key)
+                return not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_x) and (_rec or {}).get('recipe') == _ck_recipe)
+            _fp0 = _probe_fingerprint(cfg)
+            _todo = False
+            for arm in cfg['arms']:
+                if not _arm_of(v, arm):
+                    continue
+                for Ln, rho in _defs:
+                    if _cell_stale(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}', _fp0):
+                        _todo = True
+                        break
+                if _todo:
+                    break
+            if not _todo:
                 del d
                 continue
             _vocab_ck = int(d.get('vocab', 8192))
@@ -203,7 +205,10 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 _stale_param = [f'L{Ln}::r{rho}' for Ln, rho in _defs if (summary.get(_cell_key(Ln, rho)) or {}).get('probe_params') is not None and (not _probe_params_current(summary.get(_cell_key(Ln, rho)), _fp))]
                 if _stale_param:
                     print(f'[p3mp] {v} s{seed} {arm}: re-probing {len(_stale_param)} cell(s) whose stored probe parameters differ from the current config ({', '.join(_stale_param[:3])}{('…' if len(_stale_param) > 3 else '')})')
-                cells = [(Ln, rho) for Ln, rho in _defs if not (L.result_is_current(summary.get(_cell_key(Ln, rho)), V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((summary.get(_cell_key(Ln, rho)) or {}).get('ppl_mean')) and _probe_params_current(summary.get(_cell_key(Ln, rho)), _fp))]
+                _stale_w = [f'L{Ln}::r{rho}' for Ln, rho in _defs if (summary.get(_cell_key(Ln, rho)) or {}).get('ppl_mean') is not None and (summary.get(_cell_key(Ln, rho)) or {}).get('recipe') != _ck_recipe]
+                if _stale_w:
+                    print(f'[p3mp] {v} s{seed} {arm}: re-probing {len(_stale_w)} cell(s) that were measured under different weights (stored recipe does not match the current checkpoint) — reusing them would quote the old weights')
+                cells = [(Ln, rho) for Ln, rho in _defs if _cell_stale(_cell_key(Ln, rho), _fp)]
                 if not cells:
                     continue
                 if model is None:
@@ -224,7 +229,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                     nll_sum, n_tok = _distractor_ppls(model, val_ids, Ln, rho, _pcfg['n_seq'], seed, _pcfg, row_cache=_row_cache)
                     cell_ppl = _cell_ppl(nll_sum, n_tok)
                     per_seq = [math.exp(s / t) for s, t in zip(nll_sum, n_tok)]
-                    summary[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp}
+                    summary[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp, 'recipe': _ck_recipe}
                     print(f'  [p3mp] {key:44s} PPL={cell_ppl:8.2f}', flush=True)
                     L.atomic_write_json(spath, summary, indent=1)
                 if guard is not None:
