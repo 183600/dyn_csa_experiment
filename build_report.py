@@ -82,7 +82,7 @@ def _int_or(v, default):
     if isinstance(v, int):
         return int(v)
     if isinstance(v, float):
-        return int(v) if math.isfinite(v) else default
+        return int(v) if math.isfinite(v) and float(v).is_integer() else default
     return default
 
 def _code_semantics():
@@ -93,6 +93,10 @@ def _code_semantics():
     except Exception:
         return None
 _CUR_CS = _code_semantics()
+
+def _finite_ppls(r):
+    ppls = (r.get('ppls') if r.get('ppls') is not None else r.get('ppl_list')) or []
+    return [x for x in ppls if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(x) and (x > 0)]
 
 def _tag_of(r):
     if r.get('protocol') is not None:
@@ -506,7 +510,7 @@ def sec_p1t():
             continue
         seen.add(v)
         r = d[v]
-        ppls = r.get('ppls') or r.get('ppl_list')
+        ppls = _finite_ppls(r)
         if ppls:
             mean = sum(ppls) / len(ppls)
             std = sample_std(ppls)
@@ -561,7 +565,7 @@ def sec_p1t():
     for k in ks:
         r = _agg_entry(d, f'csa_fixed_topk{k}')
         if r is not None:
-            ppls = r.get('ppls') or r.get('ppl_list')
+            ppls = _finite_ppls(r)
             m = sum(ppls) / len(ppls) if ppls else r.get('ppl_mean')
             if isinstance(m, (int, float)):
                 rows_k.append((k, m))
@@ -583,14 +587,14 @@ def sec_p1t():
     def _mean(r):
         if not r:
             return None
-        ppls = r.get('ppls') or r.get('ppl_list')
+        ppls = _finite_ppls(r)
         return sum(ppls) / len(ppls) if ppls else r.get('ppl_mean')
     m1m, t8m, t32m = (_mean(m1), _mean(t8), _mean(t32))
 
     def _n_of(r):
         if not r:
             return 0
-        ppls = r.get('ppls') or r.get('ppl_list')
+        ppls = _finite_ppls(r)
         if ppls:
             return len(ppls)
         return _int_or(r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n'), 0)

@@ -245,7 +245,7 @@ def build_report(out='REPORT_v9.md'):
         if _old_ok:
             A('历史对照（v7，bs=3，仅 3 个完成点）：' + '；'.join((f'`{v}` {p['mean']:.2f}' for v, p in _old_ok.items())) + '。bs 不同不直接比较，仅作 sanity check。')
         A('')
-    done = [v for v in ['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1'] if v in seq2k]
+    done = [v for v in ['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1'] if v in seq2k and seq2k[v].get('mean') is not None]
     if len(done) >= 3:
         means = [seq2k[v]['mean'] for v in done]
         best = done[int(np.argmin(means))]
@@ -418,6 +418,8 @@ def run_smoke():
         rec = L.train_variant('csa_fixed_topk128', train_ids, val_batch, vocab, seed=0, steps=60, seq_len=2048, batch_size=1, eval_every=30, eval_subset=16, log_every=30, val_bnd=vb)
     finally:
         _V9_CKPT['on'] = False
+    if DEVICE.type == 'cuda':
+        torch.cuda.synchronize()
     dt = time.time() - t0
     guard.record_run(dt, 60, 256, 6, 2048, 1, calib_seconds=rec.get('train_time_s'))
     print(f'  60 steps in {dt:.0f}s -> {dt / 60:.3f} s/step (ppl {rec['ppl']:.1f}); booked to the v9 guard for calibration')

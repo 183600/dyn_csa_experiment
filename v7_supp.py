@@ -41,9 +41,15 @@ BUDGET_V7 = dict(L.BUDGET)
 BUDGET_V7.update(total_yuan=float(os.environ.get('V7_BUDGET_YUAN', 107.0)), price_per_hour=float(os.environ.get('V7_PRICE_PER_HOUR', 2.4)), state_path='autodl_budget_state_v7.json')
 BUDGET_V7['already_spent_yuan'] = 0.0
 _ROPE_CS_CACHE = {}
+_ROPE_INV_CACHE = {}
 
 def rope_inv_freq(half, device, base=10000.0):
-    return base ** (-torch.arange(0, half, device=device, dtype=torch.float64) / half)
+    key = (float(base), int(half), str(device))
+    inv = _ROPE_INV_CACHE.get(key)
+    if inv is None:
+        inv = base ** (-torch.arange(0, half, device=device, dtype=torch.float64) / half)
+        _ROPE_INV_CACHE[key] = inv
+    return inv
 
 def rope_cos_sin(head_dim, rope_dim, positions, device, base=10000.0):
     cacheable = isinstance(positions, torch.Tensor) and positions.dtype in (torch.int64, torch.int32) and (positions.numel() > 0)
@@ -393,7 +399,7 @@ class SmallGPTRoPE(L.SmallGPT):
             return BlockRoPE(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
         return L.Block(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
 
-    def forward(self, ids):
+    def forward(self, ids, logits_tail=None):
         T = ids.shape[1]
         x = self.tok(ids)
         if getattr(self, 'use_abs_pe', True):
@@ -413,6 +419,8 @@ class SmallGPTRoPE(L.SmallGPT):
                     gm = tot / len(gm)
                 reg = reg + mult * (gm * Lb - 1.0) ** 2
         self.comp_reg = reg
+        if logits_tail:
+            x = x[:, -logits_tail:]
         return self.head(self.norm(x))
 
 def make_layer_cfgs_v7(n_layers, variant):
@@ -953,6 +961,7 @@ def run_niah_phase(payload, guard=None, label=''):
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
             stale = False
+            _ckp_pre = None
             if os.path.exists(ck):
                 try:
                     _meta = torch.load(ck, map_location='cpu', weights_only=False)
@@ -966,6 +975,8 @@ def run_niah_phase(payload, guard=None, label=''):
                     elif _meta.get('recipe') != _recipe:
                         stale = True
                         print(f'[niah] {v} s{seed}: checkpoint recipe mismatch (stored {_meta.get('recipe')!r}) — RETRAINING')
+                    else:
+                        _ckp_pre = _meta
                     del _meta
             if stale or not os.path.exists(ck):
                 _ev_pref = f'{v}::seed{seed}::'
@@ -1034,7 +1045,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 del _batch, cache
             except UnboundLocalError:
                 pass
-            _ckp = torch.load(ck, map_location='cpu', weights_only=False)
+            _ckp = _ckp_pre if _ckp_pre is not None else torch.load(ck, map_location='cpu', weights_only=False)
             model = L.SmallGPT(_ckp.get('vocab', vocab), 256, 6, 8, 32, 512, _ckp['cfg'], mlp_ratio=_ckp['mlp_ratio']).to(DEVICE)
             model.load_state_dict(_ckp['sd'])
             for Ln in seq_lens:
@@ -1131,6 +1142,7 @@ def run_lenphase(payload, guard=None, label=''):
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
             stale = False
+            _ckp_pre = None
             if os.path.exists(ck):
                 try:
                     _meta = torch.load(ck, map_location='cpu', weights_only=False)
@@ -1144,6 +1156,8 @@ def run_lenphase(payload, guard=None, label=''):
                     elif _meta.get('recipe') != _recipe:
                         stale = True
                         print(f'[p1l] {v} s{seed}: checkpoint recipe mismatch (stored {_meta.get('recipe')!r}) — RETRAINING')
+                    else:
+                        _ckp_pre = _meta
                     del _meta
             if stale or not os.path.exists(ck):
                 key0 = f'{v}::seed{seed}'
@@ -1190,7 +1204,7 @@ def run_lenphase(payload, guard=None, label=''):
                 print(f'[resume] {key}: by_len record is stamped current but at least one eval length holds no usable measurement (error cell) — re-evaluating the missing lengths')
                 del summary[key]
                 L.atomic_write_json(spath, summary, indent=2)
-            _ckp = torch.load(ck, map_location='cpu', weights_only=False)
+            _ckp = _ckp_pre if _ckp_pre is not None else torch.load(ck, map_location='cpu', weights_only=False)
             model = L.SmallGPT(_ckp.get('vocab', vocab), 256, 6, 8, 32, _ckp.get('train_len', train_len), _ckp['cfg'], mlp_ratio=_ckp['mlp_ratio']).to(DEVICE)
             model.load_state_dict(_ckp['sd'])
             mp = None if not getattr(model, 'use_abs_pe', True) else _ckp.get('max_seq', train_len)

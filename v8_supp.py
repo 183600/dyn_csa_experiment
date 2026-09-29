@@ -108,7 +108,7 @@ def _panel_block(panel):
                 if _ties:
                     print(f'[stats] _panel_block: variant `{v}` run_cfg groups TIE at {len(keep)} seed(s) each — the kept group is {sorted(keep)}; the tied alternatives are dropped, so this panel contributes fewer seeds than were measured')
                 recs = keep
-        vals = [(r.get('ppl') if isinstance(r, dict) else r) for r in recs.values()]
+        vals = [v0 for v0 in ((r.get('ppl') if isinstance(r, dict) else r) for r in recs.values()) if isinstance(v0, (int, float)) and np.isfinite(v0)]
         ppl_map = {s: (r.get('ppl') if isinstance(r, dict) else r) for s, r in recs.items()}
         if not vals:
             out[v] = {'ppls': ppl_map, 'n': 0}
@@ -196,7 +196,7 @@ def run_smoke():
         loss = Fn.cross_entropy(out.reshape(-1, 8192), x.reshape(-1)) + 0.05 * m.comp_reg
         loss.backward()
         print(f'  {v:18s} out={tuple(out.shape)} loss={loss.item():.3f} use_abs_pe={getattr(m, 'use_abs_pe', True)}')
-        del m
+        del m, out, loss, x
         gc.collect()
         if DEVICE.type == 'cuda':
             torch.cuda.empty_cache()
@@ -207,6 +207,8 @@ def run_smoke():
     guard.record_run(time.time() - t_data, 0, 0, 0, 0, 0)
     t0 = time.time()
     rec = L.train_variant('csa_fixed_rope', train_ids, val_batch, vocab, seed=0, steps=60, eval_every=30, eval_subset=16, log_every=30, val_bnd=vb)
+    if DEVICE.type == 'cuda':
+        torch.cuda.synchronize()
     dt = time.time() - t0
     guard.record_run(dt, 60, 256, 6, 512, 12, calib_seconds=rec.get('train_time_s'))
     print(f'  60 steps in {dt:.0f}s -> {dt / 60:.3f} s/step (ppl {rec['ppl']:.1f}); booked to the v8 guard for calibration')

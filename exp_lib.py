@@ -49,6 +49,7 @@ def cosine_similarity_consecutive(H, eps=1e-08):
 
 def _segment(n, want_cut_list, min_block, max_block):
     n_cuts = len(want_cut_list)
+    honoured = {}
     bids = [0] * n
     cur, cur_len = (0, 1)
     pending_cut = False
@@ -64,13 +65,11 @@ def _segment(n, want_cut_list, min_block, max_block):
         if must or (pending_cut and may):
             cur += 1
             cur_len = 1
+            if pending_cut and 0 <= pending_slot < n_cuts:
+                honoured[pending_slot] = 1.0
             pending_cut = False
             pending_slot = -1
         bids[t] = cur
-    honoured = {}
-    for ci in range(n_cuts):
-        if want_cut_list[ci] and bids[ci + 1] != bids[ci]:
-            honoured[ci] = 1.0
     return (bids, honoured)
 
 def _cut_merge_mask(want_cut_list, min_block, max_block, dtype=None, device=None):
@@ -1062,7 +1061,7 @@ class SmallGPT(nn.Module):
     def _make_block(self, d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=None):
         return Block(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
 
-    def forward(self, ids):
+    def forward(self, ids, logits_tail=None):
         T = ids.shape[1]
         x = self.tok(ids) + self.pos.weight[:T]
         for blk in self.blocks:
@@ -1083,6 +1082,8 @@ class SmallGPT(nn.Module):
         if reg is None:
             reg = torch.zeros((), device=ids.device)
         self.comp_reg = reg
+        if logits_tail:
+            x = x[:, -logits_tail:]
         return self.head(self.norm(x))
 OVERLAP = 8
 _WARM_KEY_RE = re.compile('.*::w(\\d+)::seed\\d+$')

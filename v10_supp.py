@@ -85,7 +85,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=
             rows.append(_row)
         ids = torch.from_numpy(np.stack(rows)).to(DEVICE)
         try:
-            logits = model(ids[:, :-1])
+            logits = model(ids[:, :-1], logits_tail=target)
         except RuntimeError as _oe:
             del ids
             if 'out of memory' in str(_oe).lower() and n_ch > 1:
@@ -96,7 +96,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=
                 continue
             raise
         tgt = ids[:, 1:]
-        _ce = F.cross_entropy(logits[:, -target:, :].reshape(-1, vocab), tgt[:, -target:].reshape(-1), reduction='none').view(len(rows), target)
+        _ce = F.cross_entropy(logits.reshape(-1, vocab), tgt[:, -target:].reshape(-1), reduction='none').view(len(rows), target)
         _sums = _ce.double().sum(1).tolist()
         nll_sum.extend(map(float, _sums))
         n_tok.extend([target] * len(rows))
