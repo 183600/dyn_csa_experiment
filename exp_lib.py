@@ -1337,18 +1337,27 @@ def atomic_write_csv(path, header, rows):
             w.writerow(list(r))
     atomic_write_text(path, buf.getvalue())
 
+_PINNED_HOST_CACHE = {}
+
 def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     rng = np.random.default_rng(seed)
     n = len(train_ids) - seq_len - 1
     if n <= 0:
         raise ValueError(f'batch_iter needs len(train_ids) > seq_len+1 to sample causal windows, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
     train_ids = np.asarray(train_ids)
-    host = torch.from_numpy(train_ids)
-    if device.type == 'cuda' and not host.is_pinned():
-        try:
-            host = host.pin_memory()
-        except RuntimeError:
-            pass
+    host = None
+    if device.type == 'cuda':
+        cached = _PINNED_HOST_CACHE.get('entry')
+        if cached is not None and cached[0] is train_ids and cached[1].shape[0] == train_ids.shape[0]:
+            host = cached[1]
+        else:
+            try:
+                host = torch.from_numpy(train_ids).pin_memory()
+                _PINNED_HOST_CACHE['entry'] = (train_ids, host)
+            except RuntimeError:
+                host = torch.from_numpy(train_ids)
+    else:
+        host = torch.from_numpy(train_ids)
     cols = np.arange(seq_len + 1)
     while True:
         starts = rng.integers(0, n + 1, size=batch_size)
@@ -2179,6 +2188,8 @@ def is_delta_param(name):
     return 'delta_logit' in name
 
 def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False):
+    if steps < 1:
+        raise ValueError(f'train_variant needs steps >= 1, got steps={steps}')
     set_seed(seed)
     _attb_bump_epoch()
     if variant in PARAM_MATCHED | PARAM_MATCHED_V7 and float(mlp_ratio) == 4.0:
@@ -3016,6 +3027,12 @@ def run(cfg=None, seeds=None, guard=None, label=''):
                     _drop_is_stale = True
             if v not in ratios:
                 ratios[v] = variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=_matched, ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
+            if _drop_msg is not None:
+                print(_drop_msg)
+                if _drop_is_stale:
+                    stale_dropped.append(key)
+                del summary[key]
+                atomic_write_json(summary_path, summary)
             deadline_ts = None
             if guard is not None:
                 est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
@@ -3024,11 +3041,6 @@ def run(cfg=None, seeds=None, guard=None, label=''):
                     continue
                 deadline_ts = guard.deadline_ts()
                 print(f'[budget] {key}: projected {est / 60:.0f} min (¥{est / 3600 * guard.price:.2f}), spent so far ¥{guard.spent_yuan():.2f}')
-            if _drop_msg is not None:
-                print(_drop_msg)
-                if _drop_is_stale:
-                    stale_dropped.append(key)
-                del summary[key]
             t_run = time.time()
             rec = None
             try:

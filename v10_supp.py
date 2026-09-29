@@ -308,9 +308,16 @@ def _hist_by_seed(outdir, variant):
             print(f'[v10 stats] {_k} has an unreadable ppl_history entry; its curve fingerprint cannot be de-duplicated reliably')
             fp = ('__unreadable__', id(r))
         if fp in seen:
-            if not r.get('synthesized'):
-                print(f'[stats] {sp}: seed {s} of `{variant}` is a REAL record but its curve is IDENTICAL to the one already admitted for seed {seen[fp]}; keeping seed {seen[fp]} (the first admission) and dropping seed {s} so the curve is not counted twice.')
-            continue
+            if not r.get('synthesized') and synth_of.get(seen[fp]):
+                _s0 = seen.pop(fp)
+                out.pop(_s0, None)
+                synth_of.pop(_s0, None)
+                cfg_of.pop(_s0, None)
+                print(f'[stats] {sp}: seed {s} of `{variant}` is a REAL record whose curve matches the SYNTHESIZED reconstruction admitted as seed {_s0}; keeping the real measurement (seed {s}) and dropping the reconstruction.')
+            else:
+                if not r.get('synthesized'):
+                    print(f'[stats] {sp}: seed {s} of `{variant}` is a REAL record but its curve is IDENTICAL to the one already admitted for seed {seen[fp]}; keeping seed {seen[fp]} (the first admission) and dropping seed {s} so the curve is not counted twice.')
+                continue
         if s in out:
             print(f'[stats] {sp}: two records with DIFFERENT curves both claim ({variant}, seed {s}) — the gap trajectory is ambiguous; the first record is kept and this one is dropped')
             continue

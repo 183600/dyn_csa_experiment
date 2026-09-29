@@ -849,16 +849,16 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         mismatch_fields = set()
         for s in common:
             ra, rb = (recs[a][s], recs[b][s])
+            if ra.get('run_cfg') is None:
+                unstamped += 1
+            if rb.get('run_cfg') is None:
+                unstamped += 1
             reason = L.pair_reason(ra, rb)
             if reason is not None:
                 if reason.startswith('disagreeing') or reason.startswith('unverifiable'):
                     mismatch_fields.add(reason)
                 skipped.append(s)
                 continue
-            if ra.get('run_cfg') is None:
-                unstamped += 1
-            if rb.get('run_cfg') is None:
-                unstamped += 1
             dl.append(ra['ppl'] - rb['ppl'])
         if skipped:
             why = '; '.join(sorted(mismatch_fields)) if mismatch_fields else 'different run_cfg'
