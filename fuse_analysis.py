@@ -144,6 +144,27 @@ def sample_std(deltas, axis=None):
         out[j] = float(np.std(col, ddof=1)) if col.size > 1 else 0.0
     return out.reshape(d.shape[:axis] + d.shape[axis + 1:])
 
+def _row_nanmean(M):
+    out = np.full(M.shape[0], np.nan)
+    for i in range(M.shape[0]):
+        r = M[i][np.isfinite(M[i])]
+        if r.size:
+            out[i] = r.mean()
+    return out
+
+def _lay_nanmean(M):
+    out = np.full(M.shape[1], np.nan)
+    for j in range(M.shape[1]):
+        c = M[:, j][np.isfinite(M[:, j])]
+        if c.size:
+            out[j] = c.mean()
+    return out
+
+def _finite_mean(v):
+    v = np.asarray(v, dtype=float)
+    v = v[np.isfinite(v)]
+    return float(v.mean()) if v.size else float('nan')
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -185,37 +206,43 @@ def main(argv=None):
             report[tag] = False
             continue
         layers = layers_of(a)
-        header = '| 层 | 指标 | no-fuse (mean±std) | fuse (mean±std) | Δ(fuse−no-fuse) |'
-        lines.append(header)
-        lines.append('|---|---|---|---|---|')
-        pair_stats = {}
-        for key, name in [('bnd_f1', 'F1'), ('bnd_prec', 'precision'), ('bnd_rec', 'recall'), ('bnd_excess', 'excess(超过随机)')]:
-            Mb_layers, Mb = per_seed_layer(b, key)
-            Ma_layers, Ma = per_seed_layer(a, key)
-            if Ma_layers != Mb_layers:
-                raise ValueError(f'fuse_analysis: `{a}` and `{b}` are not on the same layer list ({Ma_layers} vs {Mb_layers}); the per-layer deltas would be a misaligned subtraction.')
-            _both = np.isfinite(Ma) & np.isfinite(Mb)
-            Ma, Mb = (np.where(_both, Ma, np.nan), np.where(_both, Mb, np.nan))
-            db = np.nanmean(Ma, axis=0) - np.nanmean(Mb, axis=0)
-            _sb = np.nanmean(Mb, axis=1)
-            _sa = np.nanmean(Ma, axis=1)
-            sd_b = sample_std(_sb) if Mb.shape[0] > 1 else 0.0
-            sd_a = sample_std(_sa) if Ma.shape[0] > 1 else 0.0
-            mean_b = float(np.nanmean(_sb))
-            mean_a = float(np.nanmean(_sa))
-            lines.append(f'| — | **{name}** | {mean_b:.4f}±{sd_b:.4f} | {mean_a:.4f}±{sd_a:.4f} | **{np.nanmean(db):+.4f}** |')
-            pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=np.nanmean(Mb, axis=0).round(4).tolist(), fuse_perlayer_mean=np.nanmean(Ma, axis=0).round(4).tolist(), delta_perlayer=db.round(4).tolist(), nofuse_seed_std=float(sd_b), fuse_seed_std=float(sd_a))
         _reasons = {s: L.pair_reason(rec(a, s), rec(b, s)) for s in SEEDS}
         _why = sorted({r for r in _reasons.values() if r})
         _ok_seeds = [s for s in SEEDS if _reasons[s] is None]
         _gate_ok = not _why
         _keep = np.array([_reasons[s] is None for s in SEEDS], dtype=bool)
+        header = '| 层 | 指标 | no-fuse (mean±std) | fuse (mean±std) | Δ(fuse−no-fuse) |'
+        lines.append(header)
+        lines.append('|---|---|---|---|---|')
+        pair_stats = {}
+        if not _ok_seeds:
+            lines.append(f'| — | — | — | — | —（没有通过配置/预算配对门禁的 seed（{_why}），描述性均值与 Δ 不计算——跨配置的种子差不进入任何数字） |')
+        for key, name in [('bnd_f1', 'F1'), ('bnd_prec', 'precision'), ('bnd_rec', 'recall'), ('bnd_excess', 'excess(超过随机)')]:
+            if not _ok_seeds:
+                break
+            Mb_layers, Mb = per_seed_layer(b, key)
+            Ma_layers, Ma = per_seed_layer(a, key)
+            if Ma_layers != Mb_layers:
+                raise ValueError(f'fuse_analysis: `{a}` and `{b}` are not on the same layer list ({Ma_layers} vs {Mb_layers}); the per-layer deltas would be a misaligned subtraction.')
+            _both = np.isfinite(Ma) & np.isfinite(Mb) & _keep[:, None]
+            Ma, Mb = (np.where(_both, Ma, np.nan), np.where(_both, Mb, np.nan))
+            db = _lay_nanmean(Ma) - _lay_nanmean(Mb)
+            _sb = _row_nanmean(Mb)
+            _sa = _row_nanmean(Ma)
+            sd_b = sample_std(_sb) if Mb.shape[0] > 1 else 0.0
+            sd_a = sample_std(_sa) if Ma.shape[0] > 1 else 0.0
+            mean_b = _finite_mean(_sb)
+            mean_a = _finite_mean(_sa)
+            lines.append(f'| — | **{name}** | {mean_b:.4f}±{sd_b:.4f} | {mean_a:.4f}±{sd_a:.4f} | **{_finite_mean(db):+.4f}** |')
+            pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=np.round(_lay_nanmean(Mb), 4).tolist(), fuse_perlayer_mean=np.round(_lay_nanmean(Ma), 4).tolist(), delta_perlayer=np.round(db, 4).tolist(), nofuse_seed_std=float(sd_b), fuse_seed_std=float(sd_a))
+        if _ok_seeds and not _gate_ok:
+            lines.append(f'\n> 注：上表的均值与 Δ 与下方检验同口径——只在通过配置/预算配对门禁的 {_ok_seeds} 上计算，{len(SEEDS) - len(_ok_seeds)} 个未过门禁的 seed（{_why}）不进入任何数字。')
         _, fb = per_seed_layer(b, 'bnd_f1')
         _, fa = per_seed_layer(a, 'bnd_f1')
         _jf = np.isfinite(fa) & np.isfinite(fb) & _keep[:, None]
         fa = np.where(_jf, fa, np.nan)
         fb = np.where(_jf, fb, np.nan)
-        d_f1 = np.nanmean(fa, axis=1) - np.nanmean(fb, axis=1)
+        d_f1 = _row_nanmean(fa) - _row_nanmean(fb)
         d_f1 = d_f1[np.isfinite(d_f1)]
         pa = np.array([rec(a, s)['ppl'] for s in SEEDS])
         pb = np.array([rec(b, s)['ppl'] for s in SEEDS])
@@ -262,10 +289,12 @@ def main(argv=None):
     lines.append('| 变体 | len_mean | len_std | len_max | frac_at_min(贴下限块占比) | blocks/seq | δ(gate) |')
     lines.append('|---|---|---|---|---|---|---|')
     _blk, _pgate_drop = ({}, [])
+    _pair_missing = False
     try:
         _pair_ok_seeds = [s for s in SEEDS if L.pair_reason(rec('hybrid_csa_dyn', s), rec('hybrid_csa_dyn_fuse', s)) is None]
     except (KeyError, ValueError):
         _pair_ok_seeds = []
+        _pair_missing = True
     _pgate_drop = [s for s in SEEDS if s not in _pair_ok_seeds]
     for _key, _name, _fmt in [('len_mean', 'len_mean', '{:+.3f}'), ('len_std', 'len_std', '{:+.3f}'), ('frac_at_min', 'frac_at_min', '{:+.4f}'), ('blocks', 'blocks', '{:+.3f}')]:
         try:
@@ -286,7 +315,9 @@ def main(argv=None):
             continue
         _blk[_name] = float(np.nanmax(np.abs(_d)))
         _blk[_name + '_fmt'] = _fmt
-    if _pgate_drop:
+    if _pair_missing:
+        lines.append('> 注：分块偏移量未计算——至少一臂的记录缺失或不可计量，配对门禁无从谈起；本节的块长分布表只列各臂自身的描述值，不给出两臂偏移量。\n')
+    elif _pgate_drop:
         lines.append(f'> 注：分块偏移量的配对已按 `pair_reason` 过滤，{_pgate_drop} 因两臂配置/预算不一致被排除；下方偏移量是在 {_pair_ok_seeds} 上计算的。\n')
     for v, (panel_name, label, fused) in VARIANTS.items():
         try:
@@ -301,12 +332,24 @@ def main(argv=None):
             continue
         lines.append(f'| `{v}` | {np.nanmean(Mm):.3f} | {np.nanmean(Ms):.3f} | {np.nanmean(Mx):.1f} | {np.nanmean(Mf):.3f} | {np.nanmean(Mb):.1f} | {np.nanmean(Md):+.3f} |')
     lines.append('')
+    _hyb_keep = None
+    try:
+        _hyb_keep = np.array([L.pair_reason(rec('hybrid_csa_dyn', s), rec('hybrid_csa_dyn_fuse', s)) is None for s in SEEDS], dtype=bool)
+    except (KeyError, ValueError):
+        _hyb_keep = np.zeros(len(SEEDS), dtype=bool)
+    _hyb_seeds = [s for s, k in zip(SEEDS, _hyb_keep) if k]
     plt.rcParams.update({'font.size': 10})
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.6))
     for ax, (a, b, ttl) in zip(axes, [('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn', 'hybrid stack (in-panel paired)'), ('csa_dyn_fuse', 'csa_dynamic', 'pure CSA stack (cross-panel)')]):
+        _in_panel = (a, b) == ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn')
+        _seeds_ax = _hyb_seeds if _in_panel else SEEDS
+        if _in_panel and not _seeds_ax:
+            print('[fuse_analysis] NOTE: skipping the hybrid trajectory panel — no seed passes the run_cfg/budget pairing gate, so pooling the arms would mix configurations')
+            ax.set_visible(False)
+            continue
         for v, color, lab in [(b, 'steelblue', f'{b} (no-fuse)'), (a, 'darkorange', f'{a} (fuse)')]:
             try:
-                hs = [dict(rec(v, s)['ppl_history']) for s in SEEDS]
+                hs = [dict(rec(v, s)['ppl_history']) for s in _seeds_ax]
             except (KeyError, ValueError) as e:
                 print(f'[fuse_analysis] NOTE: skipping trajectory of `{v}` — {e}')
                 continue
@@ -327,18 +370,25 @@ def main(argv=None):
     fig.tight_layout()
     fig.savefig(os.path.join(OUT, 'fuse_ppl_traj.png'), dpi=140, bbox_inches='tight')
     plt.close(fig)
+    if not _hyb_seeds:
+        print('[fuse_analysis] NOTE: skipping the boundary bar plot — no seed passes the run_cfg/budget pairing gate for the hybrid pair')
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.4))
     for ax, key, ttl in zip(axes, ['bnd_f1', 'bnd_prec', 'bnd_rec'], ['boundary F1 (tol=1)', 'precision', 'recall']):
+        if not _hyb_seeds:
+            ax.set_visible(False)
+            continue
         try:
             layers, Mb = per_seed_layer('hybrid_csa_dyn', key)
             _, Ma = per_seed_layer('hybrid_csa_dyn_fuse', key)
         except (KeyError, ValueError) as e:
             print(f'[fuse_analysis] NOTE: skipping `{ttl}` boundary plot — {e}')
             continue
+        Mb = np.where(_hyb_keep[:, None], Mb, np.nan)
+        Ma = np.where(_hyb_keep[:, None], Ma, np.nan)
         x = np.arange(len(layers))
         w = 0.38
-        ax.bar(x - w / 2, np.nanmean(Mb, axis=0), w, yerr=sample_std(Mb, axis=0), capsize=3, color='steelblue', label='no-fuse')
-        ax.bar(x + w / 2, np.nanmean(Ma, axis=0), w, yerr=sample_std(Ma, axis=0), capsize=3, color='darkorange', label='fuse')
+        ax.bar(x - w / 2, _lay_nanmean(Mb), w, yerr=sample_std(Mb, axis=0), capsize=3, color='steelblue', label='no-fuse')
+        ax.bar(x + w / 2, _lay_nanmean(Ma), w, yerr=sample_std(Ma, axis=0), capsize=3, color='darkorange', label='fuse')
         ax.set_xticks(x)
         ax.set_xticklabels([lk.split('_')[0] for lk in layers])
         ax.set_title(f'{ttl} — hybrid panel')
@@ -419,13 +469,17 @@ def main(argv=None):
     elif _f1_sig:
         _c1 = f'1. **同面板配对下 fuse 显著改变了边界 F1**：hybrid 栈按 seed 配对（n={_n_p}），ΔF1 = **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}** < 0.05——「F1 差不稳固」的读法在本轮产物上不成立。\n'
     else:
-        _c1 = f'1. **连「F1 提升」本身都不稳固**：在最干净的同面板配对（hybrid 栈，仅 csa_dyn 层，按 seed 配对，n={_n_p or '?'}）中，fuse 与 no-fuse 的边界 F1 差为 **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}**，即 p 值打在 n={_n_p or '?'} 的分辨率下限上，不能排除是噪声；只有在跨面板的纯 CSA 对比里才看到 {_pv('x_d_f1')} 的 F1 差' + (f'（p={_pv('x_p_f1', '{:.3f}')}）' if probe.get('x_d_f1_guarded') else '（该对比未通过本仓库的可配对门禁，故未执行检验、不给 p 值）') + '，而该对比非严格配对（面板/实现差异未受控），不足以支撑机制性主张。\n'
+        _f1_floor = 2.0 / 2 ** _n_p if isinstance(_n_p, int) and _n_p > 0 else float('nan')
+        _f1_floor_txt = f'p 值打在 n={_n_p} 的分辨率下限上，不能排除是噪声' if _f1_p is not None and math.isfinite(_f1_floor) and (abs(_f1_p - _f1_floor) < 1e-12) else f'p={_pv('p_f1', '{:.3f}')}，高于 n={_n_p or '?'} 的分辨率下限 {_f1_floor:.3f}，不能排除是噪声'
+        _c1 = f'1. **连「F1 提升」本身都不稳固**：在最干净的同面板配对（hybrid 栈，仅 csa_dyn 层，按 seed 配对，n={_n_p or '?'}）中，fuse 与 no-fuse 的边界 F1 差为 **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}**，即 {_f1_floor_txt}；只有在跨面板的纯 CSA 对比里才看到 {_pv('x_d_f1')} 的 F1 差' + (f'（p={_pv('x_p_f1', '{:.3f}')}）' if probe.get('x_d_f1_guarded') else '（该对比未通过本仓库的可配对门禁，故未执行检验、不给 p 值）') + '，而该对比非严格配对（面板/实现差异未受控），不足以支撑机制性主张。\n'
     if _ppl_d is None:
         _c3 = '3. **验证 PPL 的配对差未测量**，本节不对 PPL 方向作断言。\n'
     elif _ppl_sig:
         _c3 = f'3. **PPL 存在可分辨的差异**：同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')} < 0.05），「PPL 不变」的读法在本轮产物上不成立。\n'
     else:
-        _c3 = f'3. **PPL 同样不变**：两条验证 PPL 轨迹全程重叠（见 `fuse_ppl_traj.png`），同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')}），跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL——配对符号翻转 p 值打在 n={_n_pp or '?'} 的分辨率下限上，任何差异不能排除是种子噪声。\n'
+        _ppl_floor = 2.0 / 2 ** _n_pp if isinstance(_n_pp, int) and _n_pp > 0 else float('nan')
+        _ppl_floor_txt = f'配对符号翻转 p 值打在 n={_n_pp} 的分辨率下限上，任何差异不能排除是种子噪声' if _ppl_p is not None and math.isfinite(_ppl_floor) and (abs(_ppl_p - _ppl_floor) < 1e-12) else f'配对符号翻转 p={_pv('p_ppl', '{:.3f}')}，高于 n={_n_pp or '?'} 的分辨率下限 {_ppl_floor:.3f}，任何差异不能排除是种子噪声'
+        _c3 = f'3. **PPL 同样不变**：两条验证 PPL 轨迹全程重叠（见 `fuse_ppl_traj.png`），同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')}），跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL——{_ppl_floor_txt}。\n'
     if _blk_stable and not _f1_sig and not _ppl_sig and (_f1_d is not None) and (_ppl_d is not None):
         _c4 = '4. **结论写法（可直接引用）**：在 1500 步 budget 区间，用于边界检测的邻域表示融合是一个**惰性旋钮（inert knob）**——它既没有稳定改善动态分块的边界对齐质量，在上文第 2 条核验通过的范围内也没有改变块长分布，更没有转化为语言建模收益。这与全套实验的主结论一致：该 budget 下 LM 损失对分块质量不敏感（v4 全部消融臂停在同一 PPL 水平），且动态分块母轴本身在 4 个面板（核心表/20k 长跑/RoPE/scale）都与固定分块贴平。\n'
     else:

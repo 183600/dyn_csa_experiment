@@ -138,7 +138,10 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
             raise
     need = max(cfg['eval_lens']) + 1
     train_len = int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
+    _t_data = time.time()
     _, val_ids, _, _, _ = L.load_wikitext(max(train_len, need), 4000000)
+    if guard is not None:
+        guard.record_run(time.time() - _t_data, 0, 0, 0, 0, 0)
     mech_summ = {}
     _trdir = cfg.get('outdir') or P3MT_PAYLOAD['outdir']
     _msp = os.path.join(_trdir, 'summary.json')
@@ -638,21 +641,36 @@ def build_report(out='REPORT_v10.md'):
     A('**背景**：v7 P1L 的 ×1.07 vs ×1.57 是全仓库唯一的 sparse 正面发现，但只是附带观察（n=3 时精确符号翻转 p 值下限 0.250）。P1L 权重未持久化，P3MT 先按 v7 P1L 原配方（seq 512、3000 步、3 seeds、AdamW lr 3e-4）重训两臂并保存权重——同时作为 ×1.07/×1.57 对比的独立复现。')
     A('')
     if mech_sum:
-        A('**P3MT 复现对照**（train@512 → 同权重 eval；ratio = PPL@L / PPL@512，seed 平均）：')
+        _rows_by_v = {}
+        for v in P3MT_PAYLOAD['variants']:
+            _rv = [r for r in mech_sum.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None) and ('by_len' in r)]
+            _cur = [r for r in _rv if r.get('_code') == L.CODE_SEMANTICS]
+            if _cur:
+                if len(_cur) < len(_rv):
+                    print(f'[v10 report] {v}: {len(_rv) - len(_cur)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur)} current one(s)')
+                _rv = _cur
+            elif _rv:
+                print(f'[v10 report] {v}: no by-length record carries the current code semantics ({L.CODE_SEMANTICS}) — quoting all {len(_rv)} (they predate it; re-run the training phase to refresh)')
+            _rows_by_v[v] = _rv
+        n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
+        if len(n_by_v) > 1:
+            _common_seeds = set.intersection(*n_by_v.values())
+            if len({frozenset(s) for s in n_by_v.values()}) > 1:
+                if _common_seeds:
+                    print(f'[v10 report] by-length panel is ragged ({ {v: sorted(s) for v, s in n_by_v.items()} }) — restricting the table to the {len(_common_seeds)}-seed intersection {sorted(_common_seeds)} so every column shares one seed set')
+                    for _v in list(_rows_by_v):
+                        _rows_by_v[_v] = [r for r in _rows_by_v[_v] if r['seed'] in _common_seeds]
+                    n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
+                else:
+                    print(f'[v10 report] WARNING: by-length arms share NO seed ({ {v: sorted(s) for v, s in n_by_v.items()} }) — the table below quotes per-arm means over DIFFERENT seed sets and is not a paired comparison')
+        A(f'**P3MT 复现对照**（train@512 → 同权重 eval；ratio = PPL@L / PPL@512，seed 平均，n={(min((len(s) for s in n_by_v.values())) if n_by_v else 0)}）：')
         A('')
         A('| variant | PPL@512 | PPL@2048 | PPL@4096 | ratio@4096 |')
         A('|---|---|---|---|---|')
         for v in P3MT_PAYLOAD['variants']:
-            rows = [r for r in mech_sum.values() if r.get('variant') == v and 'by_len' in r]
+            rows = _rows_by_v.get(v, [])
             if not rows:
                 continue
-            _cur_rows = [r for r in rows if r.get('_code') == L.CODE_SEMANTICS]
-            if _cur_rows:
-                if len(_cur_rows) < len(rows):
-                    print(f'[v10 report] {v}: {len(rows) - len(_cur_rows)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur_rows)} current one(s)')
-                    rows = _cur_rows
-            else:
-                print(f'[v10 report] {v}: no by-length record carries the current code semantics ({L.CODE_SEMANTICS}) — quoting all {len(rows)} (they predate it; re-run the training phase to refresh)')
 
             def _at(Ln, rows=rows):
                 cells = L.by_len_cells(rows, Ln)

@@ -218,7 +218,7 @@ def build_report(out='REPORT_v9.md'):
     A('')
     _r_n = sorted({p['n'] for p in rope.values()}) if rope else []
     _r_n_txt = (str(_r_n[0]) if len(_r_n) == 1 else f'{_r_n[0]}–{_r_n[-1]}') if _r_n else '0'
-    A(f'v9 覆盖两个面板：(1) P1T 的 seq-2048 topk **完整 5 点扫描**（batch_size=1，新目录、面板内自洽）；(2) RoPE 20k 长跑补第三种子（精确符号翻转检验在 n=2 时 p 值下限 0.500，补种子以提升该面板分辨率）——**实际落盘 n={_r_n_txt}**。')
+    A(f'v9 覆盖两个面板：(1) P2T 的 seq-2048 topk **完整 5 点扫描**（batch_size=1，新目录、面板内自洽）；(2) RoPE 20k 长跑补第三种子（精确符号翻转检验在 n=2 时 p 值下限 0.500，补种子以提升该面板分辨率）——**实际落盘 n={_r_n_txt}**。')
     A('')
     A('---')
     A('')

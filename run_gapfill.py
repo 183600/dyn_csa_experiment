@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, shutil, subprocess, sys, traceback
+import json, math, os, shutil, subprocess, sys, traceback
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -17,6 +17,8 @@ _LONG_STEPS = L.RUN_LONG['steps']
 def _num_or_none(v):
     if v is None or isinstance(v, bool):
         return None
+    if isinstance(v, float):
+        return int(v) if math.isfinite(v) and v.is_integer() else None
     try:
         return int(v)
     except (TypeError, ValueError, OverflowError):
@@ -126,8 +128,11 @@ def synthesize_long_summary():
         real_v, _proto = _c
         _seeds = e.get('seeds')
         for i, p in enumerate(e.get('ppls', [])):
-            _seed = int(_seeds[i]) if _seeds is not None else i
-            key = f'{real_v}::seed{_seed}'
+            _seed = _num_or_none(_seeds[i]) if _seeds is not None else i
+            if _seed is None:
+                print(f"[synth] REFUSING one reconstructed value of `{v}`: its seed ({_seeds[i]!r}) is not an integer, so it cannot be attached to any per-seed key without aliasing — skipping this value only")
+                continue
+            key = f'{real_v}::{_proto}::seed{_seed}' if _proto else f'{real_v}::seed{_seed}'
             old = summary.get(key)
             if isinstance(old, dict) and 'ppl' in old and (old.get('steps') == _LONG_STEPS) and (not old.get('synthesized')):
                 n_kept += 1

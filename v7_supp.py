@@ -316,9 +316,9 @@ class HybridAttentionRoPE(L.HybridAttention):
             cos, sin = rope_cos_sin(hd, rd, L._arange_cache(T, x.device), x.device)
             q = apply_rope(q, cos[:, None, :], sin[:, None, :], rd)
             k = apply_rope(k, cos[:, None, :], sin[:, None, :], rd)
-        logits = torch.einsum('bthd,bshd->bhts', q, k) * scale
+        logits = torch.einsum('bthd,bshd->bths', q, k) * scale
         sink = self.sink if self.cfg.use_sink and self.sink is not None else None
-        zflat = (logits + mask).transpose(1, 2).reshape(B * T, nh, T)
+        zflat = (logits + mask[:, None, :]).reshape(B * T, nh, T)
         if sink is None:
             attn = L.sink_softmax(zflat, sink)
         else:
@@ -601,6 +601,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                 if _drop_msg is not None:
                     print(_drop_msg)
                     summary.pop(key, None)
+                    L.atomic_write_json(spath, summary, indent=2)
                 if guard is not None:
                     est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
                     if not guard.can_start(est):
@@ -627,11 +628,13 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                         print(f'[{key}] FAILED: {e}')
                 if guard is not None:
                     steps_done = 0
+                    calib_s = None
                     if isinstance(rec, dict) and rec.get('steps_done'):
                         steps_done = int(rec['steps_done'])
                     elif isinstance(rec, dict) and 'ppl' in rec:
                         steps_done = int(cfg['steps'])
-                    guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'])
+                        calib_s = rec.get('train_time_s')
+                    guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'], calib_seconds=calib_s)
                 L.atomic_write_json(spath, summary, indent=2)
                 gc.collect()
                 if DEVICE.type == 'cuda':
@@ -828,10 +831,16 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                 tag = f'{od.split('/')[-1]}::{r.get('variant')}'
                 if r.get('warm_steps') is not None:
                     tag += f'::w{r['warm_steps']}'
-                if r['seed'] in recs.get(tag, {}):
-                    print(f'[stats] WARNING: {tag} seed {r['seed']} holds TWO measurable records — the PPL is ambiguous; the first one is kept and the duplicate is dropped')
+                _slot = recs.setdefault(tag, {})
+                _old = _slot.get(r['seed'])
+                if _old is not None:
+                    if r.get('_code') == CKPT_CODE and _old.get('_code') != CKPT_CODE:
+                        print(f'[stats] WARNING: {tag} seed {r['seed']} holds TWO measurable records — the PPL is ambiguous; the one stamped with the current code semantics is kept and the duplicate is dropped')
+                        _slot[r['seed']] = r
+                    else:
+                        print(f'[stats] WARNING: {tag} seed {r['seed']} holds TWO measurable records — the PPL is ambiguous; the first one is kept and the duplicate is dropped')
                     continue
-                recs.setdefault(tag, {})[r['seed']] = r
+                _slot[r['seed']] = r
     pairs = [('warmup w=5000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w5000', 'results_lm_v7_warmup::csa_fixed::w0'), ('warmup w=10000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w10000', 'results_lm_v7_warmup::csa_fixed::w0'), ('CSA+RoPE vs CSA absPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::csa_fixed'), ('CSA+RoPE vs dense+RoPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::full_rope'), ('hybrid+RoPE vs dense+RoPE', 'results_lm_v7_rope::hybrid_fixed_rope', 'results_lm_v7_rope::full_rope')]
     out_d = {'per_variant': {k: {'ppls': {s: r['ppl'] for s, r in v.items()}, 'mean': float(np.mean([r['ppl'] for r in v.values()]))} for k, v in recs.items()}, 'comparisons': {}}
     for name, a, b in pairs:
@@ -961,6 +970,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 _ev_pref = f'{v}::seed{seed}::'
                 for _k in [_k for _k in summary if _k.startswith(_ev_pref)]:
                     del summary[_k]
+                L.atomic_write_json(spath, summary, indent=2)
                 if guard is not None:
                     est = guard.estimate_seconds(n_steps, d=256, n_layers=6, seq_len=512, batch_size=12)
                     if not guard.can_start(est):
@@ -1109,7 +1119,10 @@ def run_lenphase(payload, guard=None, label=''):
             print(f'[resume] FATAL: {spath} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
     need = max(eval_lens) + 1
+    _t_data = time.time()
     _, val_ids, _, _, _ = L.load_wikitext(max(train_len, need), 4000000)
+    if guard is not None:
+        guard.record_run(time.time() - _t_data, 0, 0, 0, 0, 0)
     print(f'[p1l] val slice {val_ids.shape}, eval_lens={eval_lens}, seeds={seeds}')
     _train_cache = [None]
     _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs12_lr0.0003_nt8000000_mr-csa_dynamic_rope'
@@ -1136,6 +1149,7 @@ def run_lenphase(payload, guard=None, label=''):
                 if summary.get(key0) is not None:
                     print(f'[p1l] {v} s{seed}: weights are being retrained — dropping the cached eval, which belongs to the previous weights')
                     del summary[key0]
+                    L.atomic_write_json(spath, summary, indent=2)
                 if guard is not None:
                     est = guard.estimate_seconds(steps, d=256, n_layers=6, seq_len=train_len, batch_size=12)
                     if not guard.can_start(est):
@@ -1163,7 +1177,7 @@ def run_lenphase(payload, guard=None, label=''):
                 model = _tr.pop('_model')
                 _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model)}, ck)
                 if guard is not None:
-                    guard.record_run(time.time() - t0, steps, 256, 6, train_len, 12)
+                    guard.record_run(time.time() - t0, steps, 256, 6, train_len, 12, calib_seconds=_tr.get('train_time_s'))
                 del model
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -1179,7 +1193,10 @@ def run_lenphase(payload, guard=None, label=''):
             model = L.SmallGPT(_ckp.get('vocab', vocab), 256, 6, 8, 32, _ckp.get('train_len', train_len), _ckp['cfg'], mlp_ratio=_ckp['mlp_ratio']).to(DEVICE)
             model.load_state_dict(_ckp['sd'])
             mp = None if not getattr(model, 'use_abs_pe', True) else _ckp.get('max_seq', train_len)
+            _t_ev = time.time()
             r = eval_length_gen(model, val_ids, eval_lens, DEVICE, max_pos=mp)
+            if guard is not None:
+                guard.record_run(time.time() - _t_ev, 0, 0, 0, 0, 0)
             summary[key] = {'variant': v, 'seed': seed, 'params': _ckp['params'], 'max_pos': mp, 'by_len': r, '_code': CKPT_CODE}
             print(f'  [p1l] {v:18s} s{seed} ' + '  '.join((f'L{k}={vv.get('ppl', float('nan')):.2f}' for k, vv in sorted(r.items()))))
             L.atomic_write_json(spath, summary, indent=2)

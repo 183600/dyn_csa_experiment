@@ -473,7 +473,9 @@ def sec_p0e():
                 v = gaps.get(step)
                 return f'**{v:+.1f}**' if isinstance(v, (int, float)) and math.isfinite(v) else '**未测量**（该面板无此步）'
             _g20 = _gap_at(20000)
-            lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，seed 平均）**：', '', f'- 20k 步差距：{_g20} PPL；40k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {'下降' if r_csa < 0 else '上升'} {abs(r_csa):.2f}、dense {'下降' if r_full < 0 else '上升'} {abs(r_full):.2f} PPL/1k）。']
+            def _dir_word(r):
+                return '下降' if r < 0 else ('上升' if r > 0 else '持平')
+            lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，seed 平均）**：', '', f'- 20k 步差距：{_g20} PPL；40k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {_dir_word(r_csa)} {abs(r_csa):.2f}、dense {_dir_word(r_full)} {abs(r_full):.2f} PPL/1k）。']
             if n_ < 2 or not (math.isfinite(g_last) and math.isfinite(slope)):
                 verdict = f'**结论：尾段差距统计量不可用**（`g_last` 或 `slope` 非有限值：g_last={g_last!r}、slope={slope!r}），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。上表已剔除非有限的曲线点；若此处仍出现，说明该面板的尾段整体缺失，需补跑。'
             elif g_last <= 0:
@@ -529,15 +531,29 @@ def sec_p1t():
         lines.append(f'| `{v}` | {fm(mean)} ± {fm(std)} | {n} | {sr} |')
     s = summary('results_lm_v7_seq2k')
     failed = {}
+    _measured = set()
     for rid, r in s.items():
-        if isinstance(r, dict) and r.get('error'):
+        if not isinstance(r, dict):
+            continue
+        if r.get('error'):
             v = r.get('variant', rid.split('::')[0])
             failed.setdefault(v, []).append(r.get('seed'))
+        elif _measurable(r):
+            _measured.add(r.get('variant', rid.split('::')[0]))
+    _grid = ['csa_fix_m1', 'csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512']
+    missing = [v for v in _grid if v not in _measured and v not in failed]
+    for v in missing:
+        print(f'[report] sec_p1t: sweep point `{v}` has NO record in results_lm_v7_seq2k (never ran, budget-skipped, or truncated) — it is absent from the table and is listed below')
     if failed:
         lines += ['', '**未完成的扫描点（如实记录）**：', '']
         for v in sorted(failed):
             seeds = ','.join((str(x) for x in sorted(failed[v], key=lambda x: (x is None, -1 if x is None else x))))
             lines.append(f'- `{v}`（seed {seeds}）：该扫描点在本配置与预算约束下未完成（记录为 error），扫描被截断。')
+        lines.append('')
+    if missing:
+        lines += ['', '**无记录的扫描点（如实记录）**：', '']
+        for v in missing:
+            lines.append(f'- `{v}`：面板上没有任何记录（未运行、被预算跳过或截断后未留下测量），扫描不完整。')
         lines.append('')
     ks = [8, 32, 128, 512]
     rows_k = []
@@ -617,8 +633,8 @@ def sec_p1t():
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；面板上没有可通过 pairing 门禁的同配置种子对，topk8 与 topk32 之差（{_gap:.2f} PPL）无法配对检验，只作方向性参考。')
     else:
         lines.append('2. topk8/topk32 至少其一缺失，两个选择率点之间的对比不可算。')
-    if failed:
-        _miss = '、'.join((f'`{v}`' for v in sorted(failed)))
+    if failed or missing:
+        _miss = '、'.join((f'`{v}`' for v in sorted(set(failed) | set(missing))))
         lines.append(f'3. 未完成的点（{_miss}，见上）需后续在完整扫描面板补齐，「甜点位置」的完整刻画以补齐后的面板为准。')
     else:
         lines.append('3. 全部扫描点均已完成，「甜点位置」以本面板数据为准。')
@@ -633,8 +649,8 @@ def sec_p1l():
         return '## P1 长上下文长度外推 — （无结果）\n\n'
     lens = sorted({int(Ln) for r in recs for Ln in r['by_len'] if isinstance(Ln, int) or (isinstance(Ln, str) and Ln.lstrip('-').isdigit())})
     variants = sorted({r['variant'] for r in recs})
-    _n_seeds = len({r.get('seed') for r in recs if r.get('seed') is not None})
-    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', f'**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径、{_n_seeds} seeds），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、位置越界被 clamp——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
+    _seeds_by_v = {v: sorted({r.get('seed') for r in recs if r.get('variant') == v and r.get('seed') is not None}) for v in variants}
+    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、位置越界被 clamp——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
     per_v = {}
     trunc_v = {}
     for v in variants:
@@ -667,7 +683,7 @@ def sec_p1l():
             rt_txt = f'×{ratio:.2f}（长端为截断格，与基线不同 token 窗口，不可比）'
         else:
             rt_txt = f'×{ratio:.2f}' if _finite_or_none(ratio) is not None else '—'
-        lines.append(f'| `{v}` | ' + ' | '.join(cells) + f' | {rt_txt} |')
+        lines.append(f'| `{v}`（n={len(_seeds_by_v.get(v, []))}） | ' + ' | '.join(cells) + f' | {rt_txt} |')
     _any_trunc = any((any(f) for f in trunc_v.values()))
     if _any_trunc:
         lines += ['', '**位置受限（截断）臂**：' + '、'.join((f'`{v}`' for v, f in sorted(trunc_v.items()) if any(f))) + ' —— 其 span > max_pos 的格全部只覆盖最后 `max_pos` 个 token，与真正的长上下文分数不可比；比较外推能力时须以 RoPE 臂（无位置上限）为准。', '']
