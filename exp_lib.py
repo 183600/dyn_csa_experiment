@@ -32,7 +32,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 BUDGET = dict(total_yuan=140.0, price_per_hour=2.4, margin=0.93, already_spent_yuan=0.0, state_path='autodl_budget_state.json')
-CODE_SEMANTICS = 'v11.117'
+CODE_SEMANTICS = 'v11.118'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
@@ -597,7 +597,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
         _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
         q_chunk = min(q_chunk, _max_rows)
     q_chunk = max(1, min(int(q_chunk), n))
-    pieces = []
+    out = torch.empty_like(q)
     _MINL = torch.finfo(q.dtype).min
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
@@ -624,8 +624,8 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
             attn = soft_attn + (attn - soft_attn.detach())
         if sink_logits is None:
             attn = attn * sel.any(-1)[:, None, None].to(attn.dtype)
-        pieces.append(torch.einsum('nhm,nmhd->nhd', attn, Vset))
-    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, 0)
+        out[s:e] = torch.einsum('nhm,nmhd->nhd', attn, Vset)
+    return out
 
 def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None):
     n = q.shape[0]
@@ -640,7 +640,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
         q_chunk = min(q_chunk, _max_rows)
     q_chunk = max(1, min(int(q_chunk), n))
-    pieces = []
+    out = torch.empty_like(q)
     rel = _range_cache(0, w, dev)
     pos_all = _arange_cache(n, dev)
     n_blk = k_blk.shape[0]
@@ -678,7 +678,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
             if sink_logits is None:
                 attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
-            pieces.append(torch.einsum('qhm,qmhd->qhd', attn, Vset))
+            out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
             continue
         soft_g = soft[s:e].gather(1, ib)
         if keep is not None:
@@ -703,8 +703,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         attn = soft_attn + (attn - soft_attn.detach())
         if sink_logits is None:
             attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
-        pieces.append(torch.einsum('qhm,qmhd->qhd', attn, Vset))
-    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, 0)
+        out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
+    return out
 
 @dataclass
 class AttnCfg:
@@ -789,7 +789,7 @@ class HybridAttention(nn.Module):
         self.W_bZ = nn.Parameter(torch.empty(d_model, self.kv_dim))
         self.B_pos_a = nn.Parameter(torch.zeros(int(cfg.max_block) + 1, self.kv_dim))
         self.B_pos_b = nn.Parameter(torch.zeros(int(cfg.max_block) + 1, self.kv_dim))
-        self.sink = nn.Parameter(torch.zeros(n_heads))
+        self.sink = nn.Parameter(torch.zeros(n_heads)) if getattr(cfg, 'use_sink', True) else None
         self.W_DQ = nn.Parameter(torch.empty(d_model, cfg.c_index))
         self.W_DK = nn.Parameter(torch.empty(self.kv_dim, cfg.c_index))
         self.W_w = nn.Linear(d_model, cfg.n_index_heads, bias=False)
@@ -2560,7 +2560,12 @@ def aggregate(summary):
     for (_v, _tag, _fp_idx), recs in _split_groups:
         v, tag = (_v, _tag)
         key = _agg_key(v, tag, _fp_idx)
-        _recs_sorted = sorted(recs, key=lambda r: r.get('seed'))
+        def _seed_sort_key(r):
+            s = r.get('seed')
+            if isinstance(s, (int, float)) and (not isinstance(s, bool)) and math.isfinite(float(s)):
+                return (0, float(s), '')
+            return (1, 0.0, str(s))
+        _recs_sorted = sorted(recs, key=_seed_sort_key)
         recs = _recs_sorted
         ppls = np.array([r['ppl'] for r in recs], dtype=float)
         entry = {'variant': v, 'protocol': tag, 'n_seeds': len(recs), 'ppl_mean': float(ppls.mean()), 'ppl_std': float(ppls.std(ddof=1)) if len(ppls) > 1 else 0.0, 'ppls': [float(p) for p in ppls], 'seeds': [r.get('seed') for r in recs], 'params': _group_params(recs), 'tokens_seen': recs[0].get('tokens_seen')}

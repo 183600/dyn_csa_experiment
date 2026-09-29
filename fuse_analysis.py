@@ -100,8 +100,9 @@ def per_seed_layer(variant, key):
             if isinstance(_cell, dict):
                 v = _cell.get(key, np.nan)
                 if key in ('bnd_rand', 'bnd_excess') and _cell.get('bnd_rand_exact') is False:
+                    if isinstance(v, (int, float)) and np.isfinite(v):
+                        n_sampled += 1
                     v = np.nan
-                    n_sampled += 1
                 M[i, j] = v
     if n_sampled:
         print(f'[fuse_analysis] NOTE: `{variant}` {key}: {n_sampled} cell(s) carry `bnd_rand_exact: False` (Monte-Carlo estimate, not the exact baseline) and are masked out rather than pooled with the exact readings')

@@ -109,7 +109,8 @@ def synthesize_long_summary():
             _pi = float(_pi)
             if _si in _agg_map and abs(_agg_map[_si] - _pi) > 1e-06 * max(1.0, abs(_pi)):
                 _bad_map = True
-            _agg_map[_si] = _pi
+            else:
+                _agg_map[_si] = _pi
         _conflict = [_rs for _r in summary.values() if isinstance(_r, dict) and _r.get('variant') == real_v and (_r.get('seed') is not None) and (not _r.get('synthesized')) and (_r.get('steps') == _LONG_STEPS) and L.ppl_is_usable(_r.get('ppl')) for _rs in [_num_or_none(_r.get('seed'))] if _rs is None or _rs not in _agg_map or abs(float(_r['ppl']) - _agg_map[_rs]) > 1e-06 * max(1.0, abs(_agg_map[_rs]))]
         if _bad_map or _conflict:
             _unaligned.append((v, len(_ppls), _real))

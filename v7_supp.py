@@ -238,7 +238,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         bc, bs = rope_cos_sin(hd, rope_dim, last_tok, dev, rope_base)
         k_blk_r = apply_rope(k_blk, bc[:, None, :], bs[:, None, :], rope_dim)
         k_sw_r = apply_rope(k_sw, cos[:, None, :], sin[:, None, :], rope_dim)
-        pieces = []
+        out = torch.empty_like(q)
         rel = L._range_cache(0, w, dev)
         pos_all = L._arange_cache(T, dev)
         q_chunk = max(1, min(int(q_chunk), T))
@@ -276,7 +276,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 nb = ib.shape[1]
                 sv = torch.gather(soft[s:e], 1, ib)
                 if _keep is not None:
-                    sv = sv.masked_fill(~_keep, 1.0)
+                    sv = sv * _keep.to(sv.dtype)
                 sp = (1.0 - sv).clamp(min=1e-12, max=1.0)
                 soft_log = torch.log(sp)
                 soft_log.masked_fill_(sv >= 1.0, torch.finfo(sv.dtype).min)
@@ -286,9 +286,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 attn = soft_attn + (attn - soft_attn.detach())
                 if sink is None:
                     attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
-            pieces.append(torch.einsum('qhm,qmhd->qhd', attn, Vset))
-        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, 0)
-
+            out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
+        return out
     def _dense_warmup_forward(self, x):
         B, T, _ = x.shape
         nh, hd = (self.nh, self.hd)
