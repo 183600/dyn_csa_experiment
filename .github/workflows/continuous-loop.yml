@@ -12,8 +12,6 @@ concurrency:
 jobs:
   run-opencode:
     runs-on: ubuntu-latest
-    # 保留 job 级超时作为兜底（GitHub Actions 单 job 硬上限 6 小时）
-    # 如果想完全不设限，可以删除这一行，但 6 小时后 job 会被平台强制终止
     timeout-minutes: 330
     permissions:
       contents: write
@@ -91,8 +89,6 @@ jobs:
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      # 模板里的 __MODEL__ 会在运行时被实际探测到的模型 id 替换
-      # 注意：文件名不要以 opencode 开头，避免被 opencode 当成配置误读
       - name: Prepare opencode config templates
         run: |
           mkdir -p ~/.config/opencode
@@ -137,8 +133,28 @@ jobs:
           }
           EOF
 
+          cat > ~/.config/opencode/template.deepseek.json <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "deepseek": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "DeepSeek",
+                "options": {
+                  "baseURL": "https://api.deepseek.com/v1",
+                  "apiKey": "{env:DEEPSEEK_API_KEY}"
+                },
+                "models": {
+                  "__MODEL__": { "name": "__MODEL__" }
+                }
+              }
+            },
+            "model": "deepseek/__MODEL__"
+          }
+          EOF
+
           # 初始配置（运行循环里每轮都会按探测结果重新生成）
-          sed 's|__MODEL__|moonshotai/kimi-k3|g' ~/.config/opencode/template.nvidia.json \
+          sed 's|__MODEL__|deepseek-flash|g' ~/.config/opencode/template.deepseek.json \
             > ~/.config/opencode/opencode.json
 
       - name: Configure git
@@ -146,15 +162,54 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # 修改点：删除了本步骤的 timeout-minutes: 300，
-      # 单次 opencode 运行不再有 5 小时的限制，
-      # 循环会一直跑到 job 级超时（330 分钟）为止
       - name: Run opencode continuously
         env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           set -uo pipefail
+
+          # 探测指定 provider 的可用模型；成功则设置 PROVIDER 和 MODEL_ID
+          pick_model() {
+            local p="$1"
+            MODEL_ID=""
+            case "$p" in
+              deepseek)
+                [ -n "${DEEPSEEK_API_KEY:-}" ] || return 1
+                local list
+                list=$(curl -sf --max-time 30 \
+                  -H "Authorization: Bearer ${DEEPSEEK_API_KEY}" \
+                  https://api.deepseek.com/models \
+                  | jq -r '.data[].id' 2>/dev/null) || return 1
+                # 优先 deepseek-flash，列表里没有就取第一个可用模型
+                MODEL_ID=$(printf '%s\n' "$list" | grep -x 'deepseek-flash' | head -n 1 || true)
+                if [ -z "$MODEL_ID" ]; then
+                  MODEL_ID=$(printf '%s\n' "$list" | head -n 1 || true)
+                fi
+                ;;
+              moonshot)
+                [ -n "${KIMI_API_KEY:-}" ] || return 1
+                MODEL_ID=$(curl -sf --max-time 30 \
+                  -H "Authorization: Bearer ${KIMI_API_KEY}" \
+                  https://api.moonshot.cn/v1/models \
+                  | jq -r '.data[].id' 2>/dev/null | head -n 1 || true)
+                ;;
+              nvidia)
+                [ -n "${NVIDIA_API_KEY:-}" ] || return 1
+                MODEL_ID=$(curl -sf --max-time 30 \
+                  -H "Authorization: Bearer ${NVIDIA_API_KEY}" \
+                  https://integrate.api.nvidia.com/v1/models \
+                  | jq -r '.data[].id' 2>/dev/null \
+                  | grep -Ei 'qwen|kimi|deepseek' | head -n 1 || true)
+                ;;
+            esac
+            if [ -n "$MODEL_ID" ]; then
+              PROVIDER="$p"
+              return 0
+            fi
+            return 1
+          }
 
           LOOP=0
           while true; do
@@ -163,30 +218,25 @@ jobs:
             echo "[loop] iteration #${LOOP} start at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "=========================================="
 
-            # ---------- 1. 探测可用 provider 与模型 ----------
+            # ---------- 1. 掷骰子：1/5 概率 kimi，4/5 概率 deepseek；都不可用则 nvidia 兜底 ----------
             PROVIDER=""
             MODEL_ID=""
-
-            if [ -n "${NVIDIA_API_KEY:-}" ]; then
-              MODEL_ID=$(curl -sf --max-time 30 \
-                -H "Authorization: Bearer ${NVIDIA_API_KEY}" \
-                https://integrate.api.nvidia.com/v1/models \
-                | jq -r '.data[].id' 2>/dev/null \
-                | grep -Ei 'qwen|kimi|deepseek' | head -n 1 || true)
-              if [ -n "${MODEL_ID}" ]; then
-                PROVIDER="nvidia"
-              fi
+            ROLL=$((RANDOM % 5))
+            if [ "$ROLL" -eq 0 ]; then
+              ORDER="moonshot deepseek nvidia"
+            else
+              ORDER="deepseek moonshot nvidia"
             fi
+            echo "[loop] dice roll=${ROLL} (0=>kimi, 1-4=>deepseek), try order: ${ORDER}"
 
-            if [ -z "${PROVIDER}" ] && [ -n "${KIMI_API_KEY:-}" ]; then
-              MODEL_ID=$(curl -sf --max-time 30 \
-                -H "Authorization: Bearer ${KIMI_API_KEY}" \
-                https://api.moonshot.cn/v1/models \
-                | jq -r '.data[].id' 2>/dev/null | head -n 1 || true)
-              if [ -n "${MODEL_ID}" ]; then
-                PROVIDER="moonshot"
+            for p in ${ORDER}; do
+              if pick_model "$p"; then
+                echo "[loop] provider '${p}' available"
+                break
+              else
+                echo "[loop] provider '${p}' unavailable, trying next..."
               fi
-            fi
+            done
 
             if [ -z "${PROVIDER}" ]; then
               echo "[loop] no provider/model available, retry in 10 minutes..."
