@@ -12,6 +12,8 @@ concurrency:
 jobs:
   run-opencode:
     runs-on: ubuntu-latest
+    # 保留 job 级超时作为兜底（GitHub Actions 单 job 硬上限 6 小时）
+    # 如果想完全不设限，可以删除这一行，但 6 小时后 job 会被平台强制终止
     timeout-minutes: 330
     permissions:
       contents: write
@@ -144,368 +146,96 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Run opencode for ~5 hours
-        timeout-minutes: 300
+      # 修改点：删除了本步骤的 timeout-minutes: 300，
+      # 单次 opencode 运行不再有 5 小时的限制，
+      # 循环会一直跑到 job 级超时（330 分钟）为止
+      - name: Run opencode continuously
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
-          set +e
-          set -o pipefail
-          BRANCH="${GITHUB_REF_NAME:-main}"
-          OUT=/tmp/oc_out.log
-          DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
-          PROMPT='确保代码没有影响实验结果的bug(修复所有的bug)，优化性能和显存占用(优化只要不会明显降低性能就可以做)，不要管之前修的bug，不要写修复了哪些bug，确保远程仓库里面没有实验结果和REPORTxx.md以及autodl_budgetxx.json，同时远程仓库docs目录只留design_notes.md，确保远程仓库里面没有性能、修复了哪些bug和显存占用的记录（注释里也没有）'
-          ITER_TIMEOUT=10800     # 单次 opencode 最长 3 小时
+          set -uo pipefail
 
-          # ================= 失败容忍度 =================
-          MAX_FAIL=8     # 连续 API 失败上限（旧版是 3，偶发 404 就把整个循环杀掉了）
-          MAX_RATE=10    # 连续限流上限
-          MAX_KILL=3     # 连续超时/被杀上限
+          LOOP=0
+          while true; do
+            LOOP=$((LOOP + 1))
+            echo "=========================================="
+            echo "[loop] iteration #${LOOP} start at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "=========================================="
 
-          # ================= provider / 模型状态 =================
-          MOONSHOT_PROB=10      # Moonshot 可用时每轮被选中的概率（%）
-          MOONSHOT_COOLDOWN=0   # Moonshot 失败后的冷却轮数
-          NVIDIA_COOLDOWN=0     # NVIDIA 探测不到 kimi 模型后的冷却轮数
-          CUR_PROVIDER="nvidia"
-          NVIDIA_MODEL="moonshotai/kimi-k3"   # 静态兜底，会被 /models 探测结果覆盖
-          MOONSHOT_MODEL="kimi-k3"            # 静态兜底，会被 /models 探测结果覆盖
+            # ---------- 1. 探测可用 provider 与模型 ----------
+            PROVIDER=""
+            MODEL_ID=""
 
-          i=0
-          FAIL_COUNT=0
-          RATE_COUNT=0
-          KILL_COUNT=0
-
-          mkdir -p ~/.config/opencode
-          echo normal > /tmp/loop_end_reason
-
-          commit_and_push() {
-            git add -A || true
-            git commit -m "auto: iteration $1" || true
-            git pull --rebase origin "$BRANCH" || git rebase --abort || true
-            git push origin "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
-          }
-
-          on_shutdown() {
-            echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
-            git add -A || true
-            if ! git diff --cached --quiet; then
-              git commit -m "auto: partial work saved on shutdown" || true
-              git pull --rebase origin "$BRANCH" || git rebase --abort || true
-              git push origin "HEAD:${BRANCH}" || true
-              echo "[trap] partial work committed & pushed"
-            else
-              echo "[trap] nothing to commit"
-            fi
-            exit 0
-          }
-          trap on_shutdown TERM INT
-
-          # ---------- 探测端点：返回该端点当前真实可用的 kimi 模型 id ----------
-          # rc=0: 找到模型（stdout 输出模型 id）；rc=2: 端点正常但没有 kimi 模型；rc=1: 端点不可用
-          probe_endpoint() {
-            local base key tmp code ids m
-            case "$1" in
-              nvidia)   base='https://integrate.api.nvidia.com/v1'; key="${NVIDIA_API_KEY}" ;;
-              moonshot) base='https://api.moonshot.cn/v1';          key="${KIMI_API_KEY}" ;;
-              *) echo "[error] unknown provider: $1" >&2; return 1 ;;
-            esac
-            if [ -z "$key" ]; then
-              echo "[warn] $1 的 API key 未配置" >&2
-              return 1
-            fi
-            tmp="/tmp/models_$1.json"
-            code=$(curl -s -o "$tmp" -w '%{http_code}' --max-time 20 \
-                   -H "Authorization: Bearer ${key}" "$base/models" 2>/dev/null)
-            echo "[info] $1 /models 探测 -> HTTP ${code:-timeout}" >&2
-            case "$code" in
-              2*) ;;
-              *) return 1 ;;
-            esac
-            if command -v jq >/dev/null 2>&1; then
-              ids=$(jq -r '.data[].id' "$tmp" 2>/dev/null | sort -u)
-            else
-              ids=$(grep -oE '"id" *: *"[^"]*"' "$tmp" 2>/dev/null \
-                    | sed -e 's/^"id" *: *"//' -e 's/"$//' | sort -u)
-            fi
-            if [ -z "$ids" ]; then
-              echo "[warn] $1 /models 响应解析失败" >&2
-              return 1
-            fi
-            # 按偏好挑选：k3 优先，其次 k2，最后任意 kimi（模型改名/换版本时自动适应）
-            for p in 'moonshotai/kimi-k3' 'moonshotai/kimi-k2' 'kimi-k3' 'kimi-k2' 'moonshotai/kimi' 'kimi'; do
-              m=$(printf '%s\n' "$ids" | grep -iF -- "$p" | head -1)
-              if [ -n "$m" ]; then
-                echo "$m"
-                return 0
+            if [ -n "${NVIDIA_API_KEY:-}" ]; then
+              MODEL_ID=$(curl -sf --max-time 30 \
+                -H "Authorization: Bearer ${NVIDIA_API_KEY}" \
+                https://integrate.api.nvidia.com/v1/models \
+                | jq -r '.data[].id' 2>/dev/null \
+                | grep -Ei 'qwen|kimi|deepseek' | head -n 1 || true)
+              if [ -n "${MODEL_ID}" ]; then
+                PROVIDER="nvidia"
               fi
-            done
-            echo "[warn] $1 模型列表中没有 kimi 系列模型" >&2
-            return 2
-          }
+            fi
 
-          # ---------- 用模板 + 实际模型 id 生成 opencode.json ----------
-          write_config() {
-            sed "s|__MODEL__|$2|g" ~/.config/opencode/template.$1.json \
+            if [ -z "${PROVIDER}" ] && [ -n "${KIMI_API_KEY:-}" ]; then
+              MODEL_ID=$(curl -sf --max-time 30 \
+                -H "Authorization: Bearer ${KIMI_API_KEY}" \
+                https://api.moonshot.cn/v1/models \
+                | jq -r '.data[].id' 2>/dev/null | head -n 1 || true)
+              if [ -n "${MODEL_ID}" ]; then
+                PROVIDER="moonshot"
+              fi
+            fi
+
+            if [ -z "${PROVIDER}" ]; then
+              echo "[loop] no provider/model available, retry in 10 minutes..."
+              sleep 600
+              continue
+            fi
+
+            echo "[loop] using provider=${PROVIDER}, model=${MODEL_ID}"
+
+            # ---------- 2. 生成配置 ----------
+            sed "s|__MODEL__|${MODEL_ID}|g" \
+              ~/.config/opencode/template.${PROVIDER}.json \
               > ~/.config/opencode/opencode.json
-          }
 
-          # ---------- 重新探测当前 provider 的模型（必要时更新模型变量） ----------
-          refresh_current_model() {
-            local m rc
-            m=$(probe_endpoint "$CUR_PROVIDER"); rc=$?
-            if [ $rc -eq 0 ]; then
-              if [ "$CUR_PROVIDER" = "nvidia" ]; then
-                if [ "$m" != "$NVIDIA_MODEL" ]; then
-                  echo "[info] NVIDIA 模型更新: $NVIDIA_MODEL -> $m"
-                  NVIDIA_MODEL="$m"
-                fi
-              else
-                if [ "$m" != "$MOONSHOT_MODEL" ]; then
-                  echo "[info] Moonshot 模型更新: $MOONSHOT_MODEL -> $m"
-                  MOONSHOT_MODEL="$m"
-                fi
-              fi
-            fi
-            return $rc
-          }
+            # ---------- 3. 运行 opencode（无单次时间限制） ----------
+            set +e
+            opencode run \
+              --model "${PROVIDER}/${MODEL_ID}" \
+              "继续按照仓库中的说明/任务文件推进工作，自主迭代改进。"
+            RUN_RC=$?
+            set -e
+            echo "[loop] opencode exited with rc=${RUN_RC}"
 
-          cooldown_current() {
-            if [ "$CUR_PROVIDER" = "nvidia" ]; then NVIDIA_COOLDOWN=20; else MOONSHOT_COOLDOWN=20; fi
-          }
-
-          # ---------- 尝试切到另一个 provider ----------
-          try_switch_provider() {
-            local o
-            if [ "$CUR_PROVIDER" = "nvidia" ]; then
-              o=$(probe_endpoint moonshot)
-              if [ -n "$o" ]; then
-                MOONSHOT_MODEL="$o"
-                CUR_PROVIDER="moonshot"
-                echo "[info] 切换到 Moonshot ($o) 重试"
-                return 0
-              fi
-              echo "[info] Moonshot 当前不可用，继续使用 NVIDIA"
-              return 1
+            # ---------- 4. 提交本轮改动 ----------
+            git add -A
+            if git diff --cached --quiet; then
+              echo "[loop] no changes to commit"
             else
-              if [ $NVIDIA_COOLDOWN -gt 0 ]; then
-                echo "[info] NVIDIA 处于冷却期，继续使用 Moonshot"
-                return 1
-              fi
-              CUR_PROVIDER="nvidia"
-              echo "[info] 切换到 NVIDIA 重试"
-              return 0
+              git commit -m "chore(opencode): loop #${LOOP} update $(date -u '+%Y-%m-%d %H:%M UTC')"
+              git push origin HEAD
+              echo "[loop] changes pushed"
             fi
-          }
 
-          # ---------- 每轮开始时选 provider ----------
-          pick_provider() {
-            local m
-            # 失败恢复期间保持当前 provider 不变（切换由失败处理逻辑负责）
-            if [ $FAIL_COUNT -gt 0 ]; then
-              return 0
-            fi
-            # Moonshot 冷却中 -> 一律 NVIDIA
-            if [ $MOONSHOT_COOLDOWN -gt 0 ]; then
-              MOONSHOT_COOLDOWN=$((MOONSHOT_COOLDOWN-1))
-              CUR_PROVIDER="nvidia"
-              return 0
-            fi
-            # NVIDIA 冷却中（模型疑似下架）-> 尽量用 Moonshot
-            if [ $NVIDIA_COOLDOWN -gt 0 ]; then
-              NVIDIA_COOLDOWN=$((NVIDIA_COOLDOWN-1))
-              if m=$(probe_endpoint moonshot); then
-                MOONSHOT_MODEL="$m"
-                CUR_PROVIDER="moonshot"
-              else
-                CUR_PROVIDER="nvidia"
-              fi
-              return 0
-            fi
-            # 正常抽签：10% Moonshot（健康检查通过才用），90% NVIDIA
-            if [ $(( RANDOM % 100 )) -lt $MOONSHOT_PROB ]; then
-              if m=$(probe_endpoint moonshot); then
-                MOONSHOT_MODEL="$m"
-                CUR_PROVIDER="moonshot"
-                echo "[info] 第 $i 轮抽中 Moonshot（模型: $m）"
-              else
-                CUR_PROVIDER="nvidia"
-                echo "[info] 第 $i 轮抽中 Moonshot，但端点不可用，改用 NVIDIA"
-              fi
+            # ---------- 5. 失败退避 ----------
+            if [ "${RUN_RC}" -ne 0 ]; then
+              echo "[loop] opencode failed, backoff 5 minutes"
+              sleep 300
             else
-              CUR_PROVIDER="nvidia"
-            fi
-          }
-
-          # ================= 启动时探测两端点真实可用的模型 =================
-          m=$(probe_endpoint nvidia); rc=$?
-          if [ $rc -eq 0 ]; then
-            NVIDIA_MODEL="$m"
-            echo "[init] NVIDIA 可用模型: $m"
-          else
-            echo "[warn] NVIDIA 模型探测失败 (rc=$rc)，使用静态默认: $NVIDIA_MODEL"
-            [ $rc -eq 2 ] && NVIDIA_COOLDOWN=20
-          fi
-
-          m=$(probe_endpoint moonshot); rc=$?
-          if [ $rc -eq 0 ]; then
-            MOONSHOT_MODEL="$m"
-            echo "[init] Moonshot 可用模型: $m"
-          else
-            echo "[warn] Moonshot 模型探测失败 (rc=$rc)，使用静态默认: $MOONSHOT_MODEL"
-            [ $rc -eq 2 ] && MOONSHOT_COOLDOWN=20
-          fi
-
-          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            i=$((i+1))
-
-            # ---------- 每轮检查磁盘 ----------
-            AVAIL_MB=$(( $(df --output=avail / | tail -1) / 1024 ))
-            echo "--- iteration #$i | free disk: ${AVAIL_MB}MB ---"
-            free -h | head -2
-            if [ "$AVAIL_MB" -lt 2048 ]; then
-              echo "[error] 磁盘剩余不足 2GB，提前结束循环，交给收尾步骤清理"
-              break
-            fi
-
-            # ---------- 选择 provider 并生成配置 ----------
-            pick_provider
-            if [ "$CUR_PROVIDER" = "nvidia" ]; then CUR_MODEL="$NVIDIA_MODEL"; else CUR_MODEL="$MOONSHOT_MODEL"; fi
-            write_config "$CUR_PROVIDER" "$CUR_MODEL"
-
-            echo "=========== opencode iteration #$i (provider=$CUR_PROVIDER, model=$CUR_MODEL) ==========="
-
-            timeout --kill-after=180 $ITER_TIMEOUT opencode run "$PROMPT" 2>&1 | tee "$OUT"
-            EXIT_CODE=$?
-
-            # ---------- 超时/被杀：改动照样提交 ----------
-            if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ] || [ $EXIT_CODE -eq 143 ]; then
-              KILL_COUNT=$((KILL_COUNT+1))
-              echo "[warn] iteration $i 超时或被杀 (exit=$EXIT_CODE)，已完成的改动照常提交 (连续被杀: $KILL_COUNT)"
-              commit_and_push "$i (partial, killed)"
-              if [ $KILL_COUNT -ge $MAX_KILL ]; then
-                echo "连续 ${MAX_KILL} 次超时/被杀，结束本轮，等待定时任务唤醒"
-                echo fail > /tmp/loop_end_reason
-                break
-              fi
               sleep 30
-              continue
             fi
-
-            # ---------- 成功 ----------
-            if [ $EXIT_CODE -eq 0 ]; then
-              FAIL_COUNT=0
-              RATE_COUNT=0
-              KILL_COUNT=0
-              commit_and_push "$i"
-              sleep 5
-              continue
-            fi
-
-            # ---------- 429 限流 ----------
-            if tail -60 "$OUT" | grep -qiE 'too many requests|rate.?limit|"status":429|status code 429|status:429'; then
-              if [ "$CUR_PROVIDER" = "moonshot" ]; then
-                echo "[warn] iteration $i 命中 Moonshot 限流(429)，切到 NVIDIA 重试"
-                MOONSHOT_COOLDOWN=10
-                CUR_PROVIDER="nvidia"
-                commit_and_push "$i (partial, 429)"
-                sleep 20
-                continue
-              fi
-              RATE_COUNT=$((RATE_COUNT+1))
-              echo "[warn] iteration $i 命中 NVIDIA 限流(429) (连续限流: $RATE_COUNT)，退避 180 秒后重试"
-              if [ $RATE_COUNT -ge $MAX_RATE ]; then
-                echo "连续 ${MAX_RATE} 次限流，结束本轮，等待定时任务唤醒"
-                echo fail > /tmp/loop_end_reason
-                break
-              fi
-              sleep 180
-              continue
-            fi
-
-            # ---------- 404 / 模型不存在（本次报错的核心场景） ----------
-            if tail -60 "$OUT" | grep -qiE '"status":404|status code 404|status:404|function id|is not found|does not exist|no such model|model_not_found'; then
-              FAIL_COUNT=$((FAIL_COUNT+1))
-              echo "[warn] iteration $i 命中 404/模型不存在 (连续失败: $FAIL_COUNT)，重新探测可用模型"
-              refresh_current_model; prc=$?
-              if [ $prc -ne 0 ]; then
-                # 当前 provider 已探测不到可用 kimi 模型：冷却并切到另一边
-                [ $prc -eq 2 ] && cooldown_current
-                try_switch_provider || true
-              elif [ $((FAIL_COUNT % 2)) -eq 0 ]; then
-                # 模型仍在列表中（端点间歇性故障）：连续偶数次失败时换一边试试
-                try_switch_provider || true
-              fi
-              commit_and_push "$i (partial, 404)"
-              if [ $FAIL_COUNT -ge $MAX_FAIL ]; then
-                echo "连续 ${MAX_FAIL} 次失败，结束本轮，等待定时任务唤醒"
-                echo fail > /tmp/loop_end_reason
-                break
-              fi
-              sleep 60
-              continue
-            fi
-
-            # ---------- 其他错误：计数 + 指数退避 + 偶数次切换 provider ----------
-            RATE_COUNT=0
-            FAIL_COUNT=$((FAIL_COUNT+1))
-            echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE (连续失败: $FAIL_COUNT)"
-            commit_and_push "$i (partial, failed)"
-
-            if [ $((FAIL_COUNT % 2)) -eq 0 ]; then
-              echo "[info] 连续失败 ${FAIL_COUNT} 次，刷新模型并尝试切换 provider"
-              refresh_current_model; prc=$?
-              [ $prc -eq 2 ] && cooldown_current
-              try_switch_provider || true
-            fi
-
-            if [ $FAIL_COUNT -ge $MAX_FAIL ]; then
-              echo "连续 ${MAX_FAIL} 次失败，结束本轮，等待定时任务唤醒"
-              echo fail > /tmp/loop_end_reason
-              break
-            fi
-
-            BO=$(( 30 * (2 ** (FAIL_COUNT - 1)) ))
-            [ $BO -gt 300 ] && BO=300
-            echo "[info] 退避 ${BO}s 后重试"
-            sleep $BO
           done
-
-          echo "[info] 主循环结束"
-
-      - name: Cleanup repo artifacts
-        if: always()
-        run: |
-          set +e
-          find . -type f -name 'REPORT*.md'         -not -path './.git/*' -delete
-          find . -type f -name 'autodl_budget*.json' -not -path './.git/*' -delete
-          if [ -d docs ]; then
-            find docs -mindepth 1 -maxdepth 1 ! -name 'design_notes.md' -exec rm -rf {} +
-            [ -f docs/design_notes.md ] || : > docs/design_notes.md
-          fi
 
       - name: Final commit and push
         if: always()
         run: |
-          set +e
           git add -A
-          git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
-          BRANCH="${GITHUB_REF_NAME:-main}"
-          git pull --rebase origin "$BRANCH" || git rebase --abort || true
-          git push origin "HEAD:${BRANCH}" || echo "[warn] final push failed"
-
-      - name: Trigger next workflow run (self-loop)
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set +e
-          BRANCH="${GITHUB_REF_NAME:-main}"
-          # 本轮若因连续失败提前退出，先等 10 分钟再触发，避免 API 故障期间空转
-          if [ -f /tmp/loop_end_reason ] && grep -q '^fail$' /tmp/loop_end_reason; then
-            echo "[info] 本轮因连续失败提前结束，延迟 10 分钟再触发下一次"
-            sleep 600
+          if git diff --cached --quiet; then
+            echo "no leftover changes"
+          else
+            git commit -m "chore(opencode): final sync $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push origin HEAD || true
           fi
-          gh workflow run continuous-loop.yml --ref "$BRANCH" \
-            && echo "next run dispatched on ${BRANCH}" \
-            || echo "[warn] dispatch failed, cron fallback will pick up"
