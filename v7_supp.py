@@ -677,7 +677,7 @@ def build_niah_batch(n_seq, seq_len, n_pairs=4, vocab=8192, seed=0):
             kp = hay + 2 * j
             ap = kp + 1
             ids[i, kp] = keys[pj]
-            ids[i, ap] = rng.integers(2, vocab // 2)
+            ids[i, ap] = rng.integers(key_hi, vocab // 2)
             tgt[i, kp] = key_to_val[int(keys[pj])]
             dist[i, kp] = kp - val_pos[int(keys[pj])]
     return (ids, tgt, dist)

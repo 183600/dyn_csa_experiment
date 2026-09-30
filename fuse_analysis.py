@@ -46,7 +46,8 @@ def _variant_records(variant):
             _RESOLVED[rkey] = {}
         else:
             if len(groups) > 1:
-                _ranked = sorted(groups.items(), key=lambda kv: (kv[0] != '', -len(kv[1])))
+                _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
+                _ranked = sorted(groups.items(), key=lambda kv: (not str(kv[0]).endswith(_cur_sfx), -len(kv[1])))
                 _keep_tag, _keep = _ranked[0]
                 _dropped = {t: sorted(g) for t, g in _ranked[1:]}
                 print(f'[fuse_analysis] WARNING: {panel_name}: `{variant}` spans {len(_ranked)} protocol groups — pooling across protocols is not allowed (design §3.3), so the analysis keeps only the `{_keep_tag or '(untagged)'}` group ({len(_keep)} seeds) and drops {_dropped}')

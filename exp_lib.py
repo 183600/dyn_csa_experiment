@@ -1644,13 +1644,14 @@ def eval_ppl(model, val_batch, device, chunk=16, eval_rows=None, eval_seed=0):
                 print(f'[eval_ppl] eval_rows={int(eval_rows)} covers the whole {_flat}-row target space; scoring the FULL set (this is the population statistic, not a sample)')
         _vhost = None
         if device.type == 'cuda':
+            _vkey = (val_batch.__array_interface__['data'][0], tuple(val_batch.shape)) if hasattr(val_batch, '__array_interface__') else (id(val_batch), tuple(val_batch.shape))
             _vc = _PINNED_HOST_CACHE.get('val')
-            if _vc is not None and _vc[0] is val_batch and _vc[1].shape == tuple(val_batch.shape):
+            if _vc is not None and _vc[0] == _vkey:
                 _vhost = _vc[1]
             else:
                 try:
                     _vhost = torch.as_tensor(val_batch).pin_memory()
-                    _PINNED_HOST_CACHE['val'] = (val_batch, _vhost)
+                    _PINNED_HOST_CACHE['val'] = (_vkey, _vhost)
                 except RuntimeError:
                     _vhost = torch.as_tensor(val_batch)
         else:
@@ -2398,10 +2399,11 @@ def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32
         return 4.0
 
     def n_params(v, ratio):
-        cfgs = make_layer_cfgs(n_layers, v)
-        m = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=ratio)
-        n = count_params(m)
-        del m
+        with torch.random.fork_rng():
+            cfgs = make_layer_cfgs(n_layers, v)
+            m = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=ratio)
+            n = count_params(m)
+            del m
         return n
     p_full = n_params(variant, 4)
     p_ref = n_params(ref_variant, 4)

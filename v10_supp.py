@@ -97,7 +97,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=
             raise
         tgt = ids[:, 1:]
         _ce = F.cross_entropy(logits.reshape(-1, vocab), tgt[:, -target:].reshape(-1), reduction='none').view(len(rows), target)
-        _sums = _ce.double().sum(1).tolist()
+        _sums = _ce.sum(dim=1, dtype=torch.float64).tolist()
         nll_sum.extend(map(float, _sums))
         n_tok.extend([target] * len(rows))
         del ids, logits, tgt, _ce, _sums
@@ -160,7 +160,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 continue
             _defs = [(Ln, rho) for Ln in cfg['eval_lens'] for rho in cfg['rhos']]
             try:
-                d = torch.load(ck, map_location='cpu', weights_only=False)
+                d = torch.load(ck, map_location='cpu', weights_only=False, mmap=True)
             except Exception as _cle:
                 print(f'[p3mp] SKIP {v} s{seed}: checkpoint unreadable ({type(_cle).__name__}: {_cle}) — re-run the training phase (P3MT/P4MT) to regenerate it')
                 continue
@@ -708,7 +708,7 @@ def build_report(out='REPORT_v10.md'):
         A('')
         A('> 后缀 `~` 表示该列**只有位置受限（abs-PE）的截断 cell**：它是在比列名更短的 span 上评出来的分数，**不是**长上下文测量值。任何 `~` 行不可用于「外推是否稳健」的结论。')
         A('')
-    A('**P3MP 干扰注入设计**：eval 长度 2048/4096；把**远距上下文**（除最后 512 个干净目标 token 外的全部位置）中比例为 ρ ∈ {0, 1/8, 1/4, 1/2} 的 token 替换为均匀随机 token——同一 (序列, ρ) 的腐坏对所有臂逐字节相同（按 (eval_len, 序列号, ρ) 播种，与臂/模型种子无关），臂间严格配对。只在干净目标区计 PPL。四个臂：')
+    A(f'**P3MP 干扰注入设计**：eval 长度 2048/4096；把**远距上下文**（除最后 {PROBE['target']} 个干净目标 token 外的全部位置）中比例为 ρ ∈ {{0, 1/8, 1/4, 1/2}} 的 token 替换为均匀随机 token——同一 (序列, ρ) 的腐坏对所有臂逐字节相同（按 (eval_len, 序列号, ρ) 播种，与臂/模型种子无关），臂间严格配对。只在干净目标区计 PPL。四个臂：')
     A('')
     A('- `full_rope`（dense，必须直面远距噪声）')
     A('- `csa_fixed_rope` 学习选择（原机制）')
