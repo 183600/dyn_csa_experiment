@@ -2142,7 +2142,7 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
     with torch.no_grad():
         for _r0 in range(0, n_used, 16):
             ids = torch.from_numpy(val_batch[_r0:_r0 + 16]).to(device)
-            _ = model(ids)
+            _ = model(ids, logits_tail=1)
             del ids
     for li, blk in enumerate(model.blocks):
         attn = blk.attn
