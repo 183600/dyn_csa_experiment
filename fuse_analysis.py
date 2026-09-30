@@ -47,7 +47,10 @@ def _variant_records(variant):
         else:
             if len(groups) > 1:
                 _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
-                _ranked = sorted(groups.items(), key=lambda kv: (not str(kv[0]).endswith(_cur_sfx), -len(kv[1])))
+
+                def _stamped(recs):
+                    return any((isinstance(r, dict) and isinstance(r.get('run_cfg'), str) and r['run_cfg'].endswith(_cur_sfx) for r in recs.values()))
+                _ranked = sorted(groups.items(), key=lambda kv: (not _stamped(kv[1]), -len(kv[1])))
                 _keep_tag, _keep = _ranked[0]
                 _dropped = {t: sorted(g) for t, g in _ranked[1:]}
                 print(f'[fuse_analysis] WARNING: {panel_name}: `{variant}` spans {len(_ranked)} protocol groups — pooling across protocols is not allowed (design §3.3), so the analysis keeps only the `{_keep_tag or '(untagged)'}` group ({len(_keep)} seeds) and drops {_dropped}')
@@ -57,10 +60,14 @@ def _variant_records(variant):
     return _RESOLVED[rkey]
 
 def _panel_seeds():
+    for _v in VARIANTS:
+        _p = VARIANTS[_v][0]
+        if not os.path.exists(os.path.join(ROOT, _p, 'summary.json')):
+            load(_p)
     sets = [set(_variant_records(_v)) for _v in VARIANTS]
     common = set.intersection(*sets) if sets else set()
     if not common:
-        raise ValueError('fuse_analysis: no seed is measured in EVERY panel arm, so no honest paired analysis can be produced; fill the panels first')
+        raise ValueError('fuse_analysis: every required panel file exists but no seed is measured in EVERY arm, so no honest paired analysis can be produced; fill the panels first')
     return sorted(common)
 BND_KEYS = ['bnd_prec', 'bnd_rec', 'bnd_f1', 'bnd_rand', 'bnd_excess']
 LEN_KEYS = ['blocks', 'len_mean', 'len_std', 'len_max', 'frac_at_min', 'delta']
