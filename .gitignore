@@ -42,6 +42,7 @@ data/
 
 # 实验产物不入库：结果目录、分析目录、逐版报告、预算台账
 results_*/
+t/
 analysis_*/
 REPORT*.md
 autodl_budget*.json

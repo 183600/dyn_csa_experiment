@@ -215,7 +215,8 @@ def _arange_cache(n, device):
     key = (str(device), 'arange', int(n))
     a = _IDX_CACHE.get(key)
     if a is None:
-        a = torch.arange(n, device=device)
+        with torch.inference_mode(False):
+            a = torch.arange(n, device=device)
         _cache_put(_IDX_CACHE, key, a, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return a
 
@@ -225,7 +226,8 @@ def _range_cache(lo, hi, device):
     key = (str(device), 'arange2', int(lo), int(hi))
     a = _IDX_CACHE.get(key)
     if a is None:
-        a = torch.arange(lo, hi, device=device)
+        with torch.inference_mode(False):
+            a = torch.arange(lo, hi, device=device)
         _cache_put(_IDX_CACHE, key, a, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return a
 
@@ -260,7 +262,8 @@ def tok_sel_mask(n, w, device):
     return (pos[None, :] <= pos[:, None]) & (pos[None, :] > pos[:, None] - w)
 
 def _tri_full(n, device, k):
-    m = torch.empty((n, n), device=device)
+    with torch.inference_mode(False):
+        m = torch.empty((n, n), device=device)
     m.fill_(float('-inf'))
     torch.triu(m, k, out=m) if k > 0 else torch.tril(m, k, out=m)
     return m
@@ -274,7 +277,8 @@ def _mask_buffer(n, device, kind):
         return buf
     if kind != 'zero':
         raise ValueError(f'unknown mask kind {kind!r}')
-    buf = torch.zeros((n, n), device=device)
+    with torch.inference_mode(False):
+        buf = torch.zeros((n, n), device=device)
     _cache_put(_MASK_CACHE, key, buf, _MASK_CACHE_BUDGET_BYTES, _mask_cache_total)
     return buf
 
@@ -300,7 +304,8 @@ def causal_window_mask(T, window, device):
     key = (str(device), 'cw', int(T), int(window))
     m = _MASK_CACHE.get(key)
     if m is None:
-        m = causal_mask(T, device).clone()
+        with torch.inference_mode(False):
+            m = causal_mask(T, device).clone()
         m.add_(window_band(T, window, device))
         _cache_put(_MASK_CACHE, key, m, _MASK_CACHE_BUDGET_BYTES, _mask_cache_total)
     return m
@@ -487,11 +492,13 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         _jc_key = (str(dev), 'rs_jc', int(B))
         _ri = _IDX_CACHE.get(_ri_key)
         if _ri is None:
-            _ri = torch.arange(n, device=dev, dtype=torch.float64)[:, None]
+            with torch.inference_mode(False):
+                _ri = torch.arange(n, device=dev, dtype=torch.float64)[:, None]
             _cache_put(_IDX_CACHE, _ri_key, _ri, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
         _jc = _IDX_CACHE.get(_jc_key)
         if _jc is None:
-            _jc = (torch.arange(B, device=dev, dtype=torch.float64)[None, :] * 78.233).contiguous()
+            with torch.inference_mode(False):
+                _jc = (torch.arange(B, device=dev, dtype=torch.float64)[None, :] * 78.233).contiguous()
             _cache_put(_IDX_CACHE, _jc_key, _jc, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     if query_chunk is None:
         raise ValueError("lightning_indexer: query_chunk=None is not 'use the default'; pass the default (2048) explicitly or omit the argument")
@@ -860,7 +867,7 @@ class HybridAttention(nn.Module):
             logits.add_(mask[s:e])
             if sink_view is not None:
                 lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
-                attn = torch.exp_(logits.sub_(lse))
+                attn = torch.exp(logits - lse)
             else:
                 attn = torch.softmax(logits, -1)
             out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)
