@@ -71,7 +71,11 @@ def synthesize_long_summary():
     if not os.path.exists(agg_path):
         print(f'[synth] SKIP: {agg_path} is absent — the panel is a LOCAL experiment artifact and is not tracked in the repository, so there is nothing to synthesize from.  Run the v3 panel (or restore the artifact) if you need this reconstruction.')
         return {'skipped_missing_aggregate': agg_path}
-    agg = json.load(open(agg_path, encoding='utf-8'))
+    try:
+        agg = json.load(open(agg_path, encoding='utf-8'))
+    except Exception as _e:
+        print(f'[synth] SKIP: {agg_path} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to rebuild summary.json from a corrupt aggregate; re-derive the aggregate first.')
+        return {'skipped_unreadable_aggregate': agg_path}
     spath = os.path.join(adir, 'summary.json')
     summary = {}
     if os.path.exists(spath):

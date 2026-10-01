@@ -57,8 +57,9 @@ def main():
                 print(f'[prep] seq_len={seq_len} cap={cap}: cache already present, skipped')
                 continue
             for path, arr in ((tr_path, train_ids[:cap + seq_len]), (va_path, val_batch), (vp_path, val_bnd)):
-                np.save(path + '.tmp', arr)
-                os.replace(path + '.tmp.npy', path)
+                _tmp = f'{path}.tmp{os.getpid()}'
+                np.save(_tmp, arr)
+                os.replace(_tmp + '.npy', path)
             L.atomic_write_json(me_path, {'vocab': vocab}, indent=0)
             print(f'[prep] seq_len={seq_len} cap={cap}: derived from the cap={biggest} tokenisation (same corpus prefix, same vocab)')
     print('\n[prep] ALL CACHES DONE')

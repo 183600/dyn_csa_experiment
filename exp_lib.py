@@ -32,7 +32,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 BUDGET = dict(total_yuan=140.0, price_per_hour=2.4, margin=0.93, already_spent_yuan=0.0, state_path='autodl_budget_state.json')
-CODE_SEMANTICS = 'v11.119'
+CODE_SEMANTICS = 'v11.120'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
@@ -631,9 +631,9 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
         if soft is not None:
             blk = logits[:, :, :n_blk]
             win = logits[:, :, n_blk:]
-            soft_sel = soft[s:e] * topk_mask[s:e]
-            soft_log = torch.log((1 - soft_sel).clamp_min(1e-12))
-            soft_log.masked_fill_(soft_sel >= 1, _MINL)
+            soft_sel = soft[s:e]
+            soft_log = torch.log(soft_sel.clamp_min(1e-12))
+            soft_log.masked_fill_(soft_sel <= 0, _MINL)
             soft_blk = blk + soft_log[:, None, :]
             soft_win = win
             blk = None
@@ -703,8 +703,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         _nb = int(ib.shape[1])
         kb = Kset[:, :_nb]
         kw = Kset[:, _nb:]
-        soft_log_g = torch.log((1 - soft_g).clamp_min(1e-12))
-        soft_log_g.masked_fill_(soft_g >= 1, _MINL)
+        soft_log_g = torch.log(soft_g.clamp_min(1e-12))
+        soft_log_g.masked_fill_(soft_g <= 0, _MINL)
         blk_logits = torch.einsum('qhd,qmhd->qhm', qseg, kb)
         blk_logits.mul_(scale)
         win_logits = torch.einsum('qhd,qmhd->qhm', qseg, kw)
@@ -846,19 +846,24 @@ class HybridAttention(nn.Module):
                 sdpa_kw['is_causal'] = True
             out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
             return self.W_o(out.reshape(B, T, self.nh * self.hd))
-        logits = torch.einsum('bnhd,bmhd->bhnm', q, k)
-        logits.mul_(scale)
         if self.cfg.window > 0:
             mask = causal_window_mask(T, self.cfg.window, x.device)
         else:
             mask = causal_mask(T, x.device)
-        logits.add_(mask)
-        if self.sink is not None:
-            lse = torch.logaddexp(self.sink.view(1, self.nh, 1, 1), torch.logsumexp(logits, dim=-1, keepdim=True))
-            attn = torch.exp(logits - lse)
-        else:
-            attn = torch.softmax(logits, -1)
-        out = torch.einsum('bhnm,bmhd->bnhd', attn, v)
+        sink_view = self.sink.view(1, self.nh, 1, 1) if self.sink is not None else None
+        out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
+        row_chunk = max(1, min(T, 1024))
+        for s in range(0, T, row_chunk):
+            e = min(s + row_chunk, T)
+            logits = torch.einsum('bnhd,bmhd->bhnm', q[:, s:e], k)
+            logits.mul_(scale)
+            logits.add_(mask[s:e])
+            if sink_view is not None:
+                lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
+                attn = torch.exp_(logits.sub_(lse))
+            else:
+                attn = torch.softmax(logits, -1)
+            out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
 
     def _split(self, kvh):
