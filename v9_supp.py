@@ -190,9 +190,8 @@ def _fmt_pm(cell, std=None):
         mean = cell
     return f'{mean:.2f} ±{std or 0.0:.2f}'
 
-def build_report(out='REPORT_v9.md'):
-    stats_p = 'analysis_v9/stats.json'
-    v9_analysis()
+def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
+    v9_analysis(out=stats_p)
     st = json.load(open(stats_p, encoding='utf-8'))
     seq2k = st['seq2k_bs1_panel']
     seq2k_old = st.get('seq2k_bs3_panel_historical', {})
@@ -426,8 +425,8 @@ def run_smoke():
     print(f'  60 steps in {dt:.0f}s -> {dt / 60:.3f} s/step (ppl {rec['ppl']:.1f}); booked to the v9 guard for calibration')
     est = guard.estimate_seconds(1500, d=256, n_layers=6, seq_len=2048, batch_size=1)
     print(f'  -> 1500-step bs1 seq2k run estimate: {est / 60:.1f} min (¥{est / 3600 * guard.price:.2f}); full P2T (10 runs) ~{10 * est / 3600:.2f} h')
-    print('[smoke] 3) zero-GPU report rebuild on current artifacts')
-    build_report()
+    print('[smoke] 3) zero-GPU report rebuild (scratch outputs, real artifacts untouched)')
+    build_report(out='results_smoke_v9/REPORT_v9.md', stats_p='results_smoke_v9/stats.json')
     print('\n[smoke] PASSED')
 if __name__ == '__main__':
     mode = sys.argv[1] if len(sys.argv) > 1 else 'full'

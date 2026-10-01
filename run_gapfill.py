@@ -24,16 +24,6 @@ def _num_or_none(v):
     except (TypeError, ValueError, OverflowError):
         return None
 
-def _vocab_or_none(v):
-    if v is None or isinstance(v, bool):
-        return None
-    if isinstance(v, float):
-        return int(v) if v.is_integer() else v
-    try:
-        return int(v)
-    except (TypeError, ValueError, OverflowError):
-        return None
-
 def git_push(msg):
     if os.environ.get('V6_NO_PUSH'):
         print(f'[git] push skipped (V6_NO_PUSH): {msg}')
@@ -195,7 +185,6 @@ def run_full():
         print('[v6] WARNING: final push failed — instance stays up 40 min for a retry, then shuts down. Results are safe on the data disk either way.')
 
 def run_smoke():
-    synthesize_long_summary()
     smoke_cfg = dict(L.RUN, outdir='results_smoke', variants=['full', 'csa_fixed', 'hybrid_dynamic'], steps=60, eval_every=30, n_train_tokens=1000000, seeds=[0])
     L.run(smoke_cfg, seeds=[0], guard=None, label='SMOKE (60 steps)')
     _sp = os.path.join('results_smoke', 'summary.json')
@@ -210,7 +199,7 @@ def run_smoke():
         print(f'\n[smoke] FAILED: no usable PPL was measured for {_bad} — the pipeline is degraded; results_smoke/ is KEPT for inspection instead of being deleted.')
         sys.exit(1)
     shutil.rmtree('results_smoke', ignore_errors=True)
-    print('\n[smoke] PASSED — the full pipeline works end to end. The synthesized results_lm_v3_long/summary.json is kept (it is the desired repo state); smoke outputs were deleted.')
+    print('\n[smoke] PASSED — the full pipeline works end to end; smoke outputs were deleted and no experiment directory was touched.')
 if __name__ == '__main__':
     mode = sys.argv[1] if len(sys.argv) > 1 else 'full'
     if mode in ('-h', '--help'):

@@ -16,14 +16,27 @@ def load(p):
         return None
 
 def proc_alive():
+    entries = []
     for pid in sorted((p for p in os.listdir('/proc') if p.isdigit()), key=int):
         try:
             with open(f'/proc/{pid}/cmdline', 'rb') as f:
                 cmd = f.read().decode('utf-8', 'replace')
         except Exception:
             continue
-        if 'python' in cmd and (any((f'v{x}_supp.py' in cmd for x in (7, 8, 9, 10, 11))) or 'run_gapfill.py' in cmd):
-            return int(pid)
+        try:
+            with open(f'/proc/{pid}/stat', encoding='utf-8') as f:
+                ppid = int(f.read().rsplit(')', 1)[1].split()[1])
+        except Exception:
+            ppid = -1
+        entries.append((int(pid), ppid, cmd))
+    watchers = {pid for pid, _ppid, cmd in entries if 'bonus_watcher.sh' in cmd or 'driver_v7.sh' in cmd}
+    for pid, ppid, cmd in entries:
+        if 'python' not in cmd:
+            continue
+        if any((f'v{x}_supp.py' in cmd for x in (7, 8, 9, 10, 11))) or 'run_gapfill.py' in cmd:
+            return pid
+        if ppid in watchers:
+            return pid
     return None
 
 def gpu():

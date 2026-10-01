@@ -114,7 +114,9 @@ def _cell_ppl(nll_sum, n_tok):
     return math.exp(total / nt)
 
 def _probe_fingerprint(cfg):
-    return {'n_seq': int(cfg['n_seq']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'stat': 'ppl_pooled_nll_v5'}
+    _need = max((int(_x) for _x in cfg['eval_lens'])) + 1
+    _tl = int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
+    return {'n_seq': int(cfg['n_seq']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'val_seq_len': max(_tl, _need), 'stat': 'ppl_pooled_nll_v5'}
 
 def _fp_norm(p):
     if not isinstance(p, dict):
@@ -731,7 +733,7 @@ def build_report(out='REPORT_v10.md'):
         arm_order = [('full_rope', 'dense'), ('csa_fixed_rope', 'learned'), ('csa_fixed_rope', 'randidx'), ('csa_fixed_rope', 'allblocks')]
         for Ln in lens:
             _n_ln = max([c.get('n', 0) for c in cells if c['eval_len'] == Ln] or [0])
-            A(f'**目标区 PPL（eval_len={Ln}，{_n_ln or "?"} seeds 平均）**：')
+            A(f'**目标区 PPL（eval_len={Ln}，至多 {_n_ln or "?"} seeds 平均）**：')
             A('')
             A('| 臂 | ' + ' | '.join((f'ρ={r:g}' for r in rhos)) + ' |')
             A('|---|' + '---|' * len(rhos))
@@ -778,7 +780,7 @@ def build_report(out='REPORT_v10.md'):
         learned_helps = ri_sig
         _dpos = bool(dn) and dn[0] > 0 and bool(ab) and ab[0] > 0
         _dtxt = '正值表示「看得见远距噪声就会受害」，支持限制远距注意力暴露带来抗噪性' if _dpos else '区间并非全正，「远距暴露致害」的方向在本轮产物上不成立，以配对数字为准'
-        A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——{_dtxt}；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，即该面板在设计上就无法达到 0.05 显著性），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
+        A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——{_dtxt}；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，' + ('该种子数下无法达到 0.05 显著性' if not (p_floor <= 0.05) else '分辨率已足以达到 0.05，未显著是数据结论而非分辨率上限') + '），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
         A('')
     A('---')
     A('')

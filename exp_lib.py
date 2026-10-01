@@ -352,21 +352,22 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     counts = torch.bincount(block_ids, minlength=B)
     ends = torch.cumsum(counts, 0)
     starts = ends - counts
-    _cmin, max_len = (int(v) for v in torch.stack(torch.aminmax(counts)).tolist())
+    ov = overlap
+    end_prev = torch.cat([torch.full((1,), -1, dtype=ends.dtype, device=dev), ends[:-1]])
+    starts_prev = torch.cat([torch.zeros(1, dtype=starts.dtype, device=dev), starts[:-1]])
+    ov_start = torch.clamp(end_prev - ov, min=starts_prev)
+    ov_len = end_prev - ov_start
+    if ov_len.numel():
+        _cmin, max_len, _ov_lo, _ov_hi = (int(v) for v in torch.stack([counts.min(), counts.max(), ov_len.min(), ov_len.max()]).tolist())
+    else:
+        _cmin, max_len = (int(v) for v in torch.stack(torch.aminmax(counts)).tolist())
+        _ov_lo = _ov_hi = None
     pos = _range_cache(0, max_len, dev)
     _gp = starts[:, None] + pos[None, :]
     g_a = _gp.clamp(max=n - 1)
     mask_a = _gp < ends[:, None]
     Xam = _take_2d(Xas, g_a)
     Zam = _take_2d(Zas, g_a)
-    ov = overlap
-    end_prev = torch.cat([torch.full((1,), -1, dtype=ends.dtype, device=dev), ends[:-1]])
-    starts_prev = torch.cat([torch.zeros(1, dtype=starts.dtype, device=dev), starts[:-1]])
-    ov_start = torch.clamp(end_prev - ov, min=starts_prev)
-    ov_len = end_prev - ov_start
-    _ov_lo = _ov_hi = None
-    if ov_len.numel():
-        _ov_lo, _ov_hi = (int(v) for v in torch.stack(torch.aminmax(ov_len)).tolist())
     _W_b = max(_ov_hi if _ov_hi is not None else 0, 0)
     op = _range_cache(0, _W_b, dev)
     g_b = (ov_start[:, None] + op[None, :]).clamp(max=n - 1)

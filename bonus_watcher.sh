@@ -15,7 +15,7 @@ while true; do
     continue
   fi
   [ "$SAW_DRIVER" -eq 1 ] && break
-  if [ -f driver_v7.log ] && [ "$(stat -c %Y driver_v7.log 2>/dev/null || echo 0)" -gt "$START_TS" ] && grep -q "\[driver\] ALL DONE" driver_v7.log; then
+  if [ -f driver_v7.log ] && grep -q "\[driver\] ALL DONE" driver_v7.log; then
     break
   fi
   if [ $(( $(date +%s) - START_TS )) -gt $GIVE_UP_AFTER ]; then
