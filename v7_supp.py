@@ -260,8 +260,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             sel = pos[:, None] > last_tok[ib]
             _keep = sel_valid[s:e] if sel_valid is not None else None
             if ib.shape[1] > 1:
-                _dup_mm = ib[:, :, None] == ib[:, None, :]
-                _ddk = ~_dup_mm.tril(-1).any(-1)
+                _ddk = L.first_occurrence_mask(ib)
                 _keep = _ddk if _keep is None else _keep & _ddk
             if _keep is not None:
                 sel = sel & _keep
@@ -325,7 +324,8 @@ class HybridAttentionRoPE(L.HybridAttention):
             k = apply_rope(k, cos[:, None, :], sin[:, None, :], rd)
         logits = torch.einsum('bthd,bshd->bths', q, k) * scale
         sink = self.sink if self.cfg.use_sink and self.sink is not None else None
-        zflat = (logits + mask[:, None, :]).reshape(B * T, nh, T)
+        logits.add_(mask[:, None, :])
+        zflat = logits.reshape(B * T, nh, T)
         if sink is None:
             attn = L.sink_softmax(zflat, sink)
         else:

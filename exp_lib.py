@@ -312,6 +312,17 @@ def _take_rows(x, idx):
 def _take_2d(x, idx):
     return torch.index_select(x, 0, idx.flatten()).view(idx.shape[0], idx.shape[1], *x.shape[1:])
 
+def first_occurrence_mask(idx):
+    if idx.shape[1] <= 1:
+        return torch.ones_like(idx, dtype=torch.bool)
+    order = torch.argsort(idx, dim=1, stable=True)
+    sorted_idx = idx.gather(1, order)
+    first = torch.ones_like(sorted_idx, dtype=torch.bool)
+    first[:, 1:] = sorted_idx[:, 1:] != sorted_idx[:, :-1]
+    keep = torch.empty_like(first)
+    keep.scatter_(1, order, first)
+    return keep
+
 def _block_order(block_ids, n):
     if block_ids.numel() <= 1:
         return (_arange_cache(block_ids.numel(), block_ids.device), True)
@@ -660,8 +671,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         if sel_valid is not None:
             keep = sel_valid[s:e]
         if ib.shape[1] > 1:
-            _dup_mm = ib[:, :, None] == ib[:, None, :]
-            _ddk = ~_dup_mm.tril(-1).any(-1)
+            _ddk = first_occurrence_mask(ib)
             keep = _ddk if keep is None else keep & _ddk
         if keep is not None:
             sel_blk = sel_blk & keep
