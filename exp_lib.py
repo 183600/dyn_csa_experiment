@@ -1674,7 +1674,10 @@ def eval_ppl(model, val_batch, device, chunk=16, eval_rows=None, eval_seed=0):
                 print(f'[eval_ppl] eval_rows={int(eval_rows)} covers the whole {_flat}-row target space; scoring the FULL set (this is the population statistic, not a sample)')
         _vhost = None
         if device.type == 'cuda':
-            _vkey = (val_batch.__array_interface__['data'][0], tuple(val_batch.shape)) if hasattr(val_batch, '__array_interface__') else (id(val_batch), tuple(val_batch.shape))
+            _vptr = val_batch.__array_interface__['data'][0] if hasattr(val_batch, '__array_interface__') else id(val_batch)
+            _vflat = np.asarray(val_batch).reshape(-1)
+            _vfp = (int(_vflat[0]), int(_vflat[-1]), int(np.mod(_vflat, 2 ** 31).sum() % 2 ** 31)) if _vflat.size else None
+            _vkey = (_vptr, tuple(val_batch.shape), _vfp)
             _vc = _PINNED_HOST_CACHE.get('val')
             if _vc is not None and _vc[0] == _vkey:
                 _vhost = _vc[1]
@@ -2507,7 +2510,9 @@ def aggregate(summary):
             continue
         if not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
             continue
-        v = rec.get('variant', key)
+        v = rec.get('variant')
+        if v is None:
+            v = str(key).split('::', 1)[0]
         per_variant.setdefault((v, _protocol_tag(rec, key)), []).append(rec)
     _dups = {}
     for k, recs in per_variant.items():
