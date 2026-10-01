@@ -402,7 +402,7 @@ def sec_p0w():
                 curves[v, w][int(step)].append(float(pv))
         if _dropped_pts:
             lines += ['', f'> **⚠ 轨迹表剔除了 {_dropped_pts} 个非有限/非正的 PPL 曲线点**（单次失败的 eval），它们不再参与 seed 平均。', '']
-        if curves and any((len(c) > 1 for c in curves.values())):
+        if curves and any((len(c) > 1 for c in curves.values())) and any((_v == 'csa_fixed' for _v, _w in curves)):
             steps_all = sorted({st for c in curves.values() for st in c})
             lines += ['', '**验证 PPL 轨迹（seed 平均）**：', '', '| step | ' + ' | '.join((f'w={w}' for _v, w in sorted(curves) if _v == 'csa_fixed')) + ' |', '|' + '---|' * (1 + len([1 for _v, w in curves if _v == 'csa_fixed']))]
             for st in steps_all:
@@ -652,15 +652,26 @@ def sec_p1t():
     _m1_ok = isinstance(m1m, (int, float))
     _t_ok = isinstance(t8m, (int, float)) and isinstance(t32m, (int, float))
     if _m1_ok and _t_ok:
-        _ps2k = per_seed_ppls('results_lm_v7_seq2k')
-        _m1_s, _t8_s, _t32_s = (_ps2k.get('csa_fix_m1', {}), _ps2k.get('csa_fixed_topk8', {}), _ps2k.get('csa_fixed_topk32', {}))
-        _c3 = sorted(set(_m1_s) & set(_t8_s) & set(_t32_s))
+        _recs3 = per_seed_records('results_lm_v7_seq2k')
+        _m1_r, _t8_r, _t32_r = (_recs3.get('csa_fix_m1', {}), _recs3.get('csa_fixed_topk8', {}), _recs3.get('csa_fixed_topk32', {}))
+        _c3 = []
+        _rej3 = 0
+        for sk in sorted(set(_m1_r) & set(_t8_r) & set(_t32_r)):
+            if _pair_reason(_m1_r[sk], _t8_r[sk]) is not None or _pair_reason(_m1_r[sk], _t32_r[sk]) is not None:
+                _rej3 += 1
+                continue
+            _c3.append(sk)
+        if _rej3:
+            print(f'[report] sec_p1t: {_rej3} three-way shared seed(s) rejected by the run_cfg/budget gate — excluded from the per-seed direction count')
+        _m1_s = {sk: float(_m1_r[sk]['ppl']) for sk in _c3}
+        _t8_s = {sk: float(_t8_r[sk]['ppl']) for sk in _c3}
+        _t32_s = {sk: float(_t32_r[sk]['ppl']) for sk in _c3}
         if _c3:
             _nw = sum((1 for sk in _c3 if _m1_s[sk] > _t8_s[sk] and (_m1_s[sk] > _t32_s[sk])))
             _nb = sum((1 for sk in _c3 if _m1_s[sk] < _t8_s[sk] and (_m1_s[sk] < _t32_s[sk])))
-            _dir3 = f'（逐 seed：{len(_c3)} 个三方公共 seed 中，{_nw} 个 m1 最差、{_nb} 个 m1 最好）'
+            _dir3 = f'（逐 seed：{len(_c3)} 个通过门禁的三方公共 seed 中，{_nw} 个 m1 最差、{_nb} 个 m1 最好）'
         else:
-            _dir3 = '（无三方公共 seed，逐 seed 方向不可核验）'
+            _dir3 = '（无通过门禁的三方公共 seed，逐 seed 方向不可核验）'
         if m1m > t8m and m1m > t32m:
             lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最差的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩并没有拯救 sparse 臂——在 seq 2048 / 1500 步的受控 budget 下，**压缩不是瓶颈**，评审「缺 m=1 对照」的质疑得到直接回答（方向与整体负结果一致）。')
         elif m1m < t8m and m1m < t32m:
@@ -860,7 +871,10 @@ def sec_flops():
             lines.append(f'| {r['seq_len']} | {r['sel_ratio']:.2%} | {r['csa_over_dense']:.3f} | {r['hybrid_over_dense']:.3f} | {r['csa_kv_over_dense']:.3f} |')
         except (KeyError, TypeError, ValueError) as _e:
             print(f'[report] sec_flops: a malformed row was skipped ({type(_e).__name__}: {_e})')
-    _rows = {r['seq_len']: r for r in rows}
+    _clean = [r for r in rows if isinstance(r, dict) and r.get('seq_len') is not None]
+    _rows = {}
+    for r in _clean:
+        _rows.setdefault(r['seq_len'], r)
     _x = d.get('crossover_seq_len_csa_beats_dense')
     _r512 = _rows.get(512)
     if _r512 is not None and _x is not None:
@@ -868,7 +882,7 @@ def sec_flops():
         _sel = _r512['sel_ratio']
         _verdict = '省' if _ratio < 1.0 else '不省'
         _cross = f'交叉点本身就在 seq={_x}' if _x <= 512 else f'交叉点在 seq={_x}，训练序列（512）尚未到达'
-        _ratios = [r['csa_over_dense'] for r in rows]
+        _ratios = [r['csa_over_dense'] for r in _clean]
         _mono = all((_ratios[i] >= _ratios[i + 1] - 1e-12 for i in range(len(_ratios) - 1)))
         _trend = f'比值单调降到 {min(_ratios):.3f}' if _mono else f'比值总体下行到 {min(_ratios):.3f}（非严格单调，逐点见 flops_analytic.csv）'
         lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。优势随序列变长继续放大（{_trend}）。稀疏的收益是随长度增长的，并非在任意长度上都成立。', '']

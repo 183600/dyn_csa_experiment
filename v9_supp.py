@@ -377,7 +377,6 @@ def run_full():
             all_ok = False
         all_ok &= git_push(f'v9: phase {pname} results')
     try:
-        v9_analysis()
         build_report()
     except Exception:
         traceback.print_exc()
@@ -426,7 +425,6 @@ def run_smoke():
     est = guard.estimate_seconds(1500, d=256, n_layers=6, seq_len=2048, batch_size=1)
     print(f'  -> 1500-step bs1 seq2k run estimate: {est / 60:.1f} min (¥{est / 3600 * guard.price:.2f}); full P2T (10 runs) ~{10 * est / 3600:.2f} h')
     print('[smoke] 3) zero-GPU report rebuild on current artifacts')
-    v9_analysis()
     build_report()
     print('\n[smoke] PASSED')
 if __name__ == '__main__':

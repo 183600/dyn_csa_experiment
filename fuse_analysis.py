@@ -28,12 +28,6 @@ def load(panel):
         raise FileNotFoundError(f'fuse_analysis: results panel `{panel}` is not present ({path}).\n  The repository tracks SOURCE only — `results_*/` directories, `REPORT*.md` and the budget ledgers are all build products and are not committed.\n  Regenerate the panel before running this zero-GPU analysis, e.g.:  python run_gapfill.py full   (or the driver that owns `{panel}`), then re-run `python fuse_analysis.py`.')
     with open(path, encoding='utf-8') as f:
         return json.load(f)
-_PANEL_CACHE = {}
-
-def panel(name):
-    if name not in _PANEL_CACHE:
-        _PANEL_CACHE[name] = load(name)
-    return _PANEL_CACHE[name]
 VARIANTS = {'hybrid_csa_dyn': ('results_lm_v4_abl', 'hybrid dyn (no-fuse)', False), 'hybrid_csa_dyn_fuse': ('results_lm_v4_abl', 'hybrid dyn + fuse', True), 'csa_dyn_fuse': ('results_lm_v4_abl', 'csa dyn + fuse', True), 'csa_dynamic': ('results_lm_v3_1500', 'csa dyn (no-fuse)', False)}
 SEEDS = []
 
@@ -77,9 +71,6 @@ def _panel_seeds():
     return sorted(common)
 BND_KEYS = ['bnd_prec', 'bnd_rec', 'bnd_f1', 'bnd_rand', 'bnd_excess']
 LEN_KEYS = ['blocks', 'len_mean', 'len_std', 'len_max', 'frac_at_min', 'delta']
-
-def panel_of(variant):
-    return panel(VARIANTS[variant][0])
 
 def layer_idx(layers):
     return [int(lk.split('_')[0][1:]) for lk in layers]
@@ -349,7 +340,7 @@ def main(argv=None):
             _, Mb = per_seed_layer(v, 'blocks')
             _, Md = per_seed_layer(v, 'delta')
         except (KeyError, ValueError, TypeError) as e:
-            lines.append(f'| `{v}` | — | — | — | — | — | — |  （该变体数据缺失：{e}）|')
+            lines.append(f'| `{v}` | — | — | — | — | — | （该变体数据缺失：{e}）|')
             continue
         lines.append(f'| `{v}` | {np.nanmean(Mm):.3f} | {np.nanmean(Ms):.3f} | {np.nanmean(Mx):.1f} | {np.nanmean(Mf):.3f} | {np.nanmean(Mb):.1f} | {np.nanmean(Md):+.3f} |')
     lines.append('')
@@ -399,31 +390,29 @@ def main(argv=None):
     plt.close(fig)
     if not _hyb_seeds:
         print('[fuse_analysis] NOTE: skipping the boundary bar plot — no seed passes the run_cfg/budget pairing gate for the hybrid pair')
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.4))
-    for ax, key, ttl in zip(axes, ['bnd_f1', 'bnd_prec', 'bnd_rec'], ['boundary F1 (tol=1)', 'precision', 'recall']):
-        if not _hyb_seeds:
-            ax.set_visible(False)
-            continue
-        try:
-            layers, Mb = per_seed_layer('hybrid_csa_dyn', key)
-            _, Ma = per_seed_layer('hybrid_csa_dyn_fuse', key)
-        except (KeyError, ValueError, TypeError) as e:
-            print(f'[fuse_analysis] NOTE: skipping `{ttl}` boundary plot — {e}')
-            continue
-        Mb = np.where(_hyb_keep[:, None], Mb, np.nan)
-        Ma = np.where(_hyb_keep[:, None], Ma, np.nan)
-        x = np.arange(len(layers))
-        w = 0.38
-        ax.bar(x - w / 2, _lay_nanmean(Mb), w, yerr=sample_std(Mb, axis=0), capsize=3, color='steelblue', label='no-fuse')
-        ax.bar(x + w / 2, _lay_nanmean(Ma), w, yerr=sample_std(Ma, axis=0), capsize=3, color='darkorange', label='fuse')
-        ax.set_xticks(x)
-        ax.set_xticklabels([lk.split('_')[0] for lk in layers])
-        ax.set_title(f'{ttl} — hybrid panel')
-        ax.grid(alpha=0.3, axis='y')
-        ax.legend(fontsize=8)
-    fig.tight_layout()
-    _save_fig(fig, 'fuse_boundary.png', dpi=140, bbox_inches='tight')
-    plt.close(fig)
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.4))
+        for ax, key, ttl in zip(axes, ['bnd_f1', 'bnd_prec', 'bnd_rec'], ['boundary F1 (tol=1)', 'precision', 'recall']):
+            try:
+                layers, Mb = per_seed_layer('hybrid_csa_dyn', key)
+                _, Ma = per_seed_layer('hybrid_csa_dyn_fuse', key)
+            except (KeyError, ValueError, TypeError) as e:
+                print(f'[fuse_analysis] NOTE: skipping `{ttl}` boundary plot — {e}')
+                continue
+            Mb = np.where(_hyb_keep[:, None], Mb, np.nan)
+            Ma = np.where(_hyb_keep[:, None], Ma, np.nan)
+            x = np.arange(len(layers))
+            w = 0.38
+            ax.bar(x - w / 2, _lay_nanmean(Mb), w, yerr=sample_std(Mb, axis=0), capsize=3, color='steelblue', label='no-fuse')
+            ax.bar(x + w / 2, _lay_nanmean(Ma), w, yerr=sample_std(Ma, axis=0), capsize=3, color='darkorange', label='fuse')
+            ax.set_xticks(x)
+            ax.set_xticklabels([lk.split('_')[0] for lk in layers])
+            ax.set_title(f'{ttl} — hybrid panel')
+            ax.grid(alpha=0.3, axis='y')
+            ax.legend(fontsize=8)
+        fig.tight_layout()
+        _save_fig(fig, 'fuse_boundary.png', dpi=140, bbox_inches='tight')
+        plt.close(fig)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
     PLOTTED = [('hybrid_csa_dyn', 'steelblue'), ('hybrid_csa_dyn_fuse', 'darkorange'), ('csa_dynamic', 'seagreen'), ('csa_dyn_fuse', 'firebrick')]
     _plotted_layers = {}

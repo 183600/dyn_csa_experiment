@@ -160,7 +160,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 continue
             _defs = [(Ln, rho) for Ln in cfg['eval_lens'] for rho in cfg['rhos']]
             try:
-                d = torch.load(ck, map_location='cpu', weights_only=False, mmap=True)
+                d = V._load_ckpt(ck)
             except Exception as _cle:
                 print(f'[p3mp] SKIP {v} s{seed}: checkpoint unreadable ({type(_cle).__name__}: {_cle}) — re-run the training phase (P3MT/P4MT) to regenerate it')
                 continue
@@ -495,8 +495,11 @@ def v10_analysis(out='analysis_v10/stats.json'):
     probe = {}
     sp = PROBE['summary']
     if os.path.exists(sp):
-        raw = json.load(open(sp, encoding='utf-8'))
-        cells = {}
+        try:
+            raw = json.load(open(sp, encoding='utf-8'))
+        except Exception as _e:
+            print(f'[stats] FATAL: {sp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to compute probe statistics from a truncated file; move it aside to re-probe.')
+            raise
         _usable, _bad_cells = ({}, [])
         for _k, r in raw.items():
             if not isinstance(r, dict):
@@ -773,7 +776,9 @@ def build_report(out='REPORT_v10.md'):
         n_min_ri = min((n for k, n in _n_by_c if 'randidx' in k), default=0)
         p_floor = 2.0 / 2 ** n_min if n_min else float('nan')
         learned_helps = ri_sig
-        A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——正值表示「看得见远距噪声就会受害」，支持限制远距注意力暴露带来抗噪性；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，即该面板在设计上就无法达到 0.05 显著性），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
+        _dpos = bool(dn) and dn[0] > 0 and bool(ab) and ab[0] > 0
+        _dtxt = '正值表示「看得见远距噪声就会受害」，支持限制远距注意力暴露带来抗噪性' if _dpos else '区间并非全正，「远距暴露致害」的方向在本轮产物上不成立，以配对数字为准'
+        A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——{_dtxt}；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，即该面板在设计上就无法达到 0.05 显著性），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
         A('')
     A('---')
     A('')
@@ -915,7 +920,6 @@ def run_full():
             all_ok = False
         all_ok &= git_push(f'v10: phase {pname} results')
     try:
-        v10_analysis()
         build_report()
     except Exception:
         traceback.print_exc()
@@ -954,7 +958,6 @@ def run_smoke():
             if DEVICE.type == 'cuda':
                 torch.cuda.empty_cache()
     print('[smoke] 3) zero-GPU analysis/report on current artifacts')
-    v10_analysis()
     build_report()
     print('\n[smoke] PASSED')
 if __name__ == '__main__':

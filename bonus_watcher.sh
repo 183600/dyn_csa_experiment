@@ -6,14 +6,28 @@ PY=/root/miniconda3/bin/python
 START_TS=$(date +%s)
 export V7_BUDGET_YUAN="${V7_BUDGET_YUAN:-107.0}"
 export V7_PRICE_PER_HOUR="${V7_PRICE_PER_HOUR:-2.4}"
-while pgrep -f "driver_v7\.sh" > /dev/null; do sleep 300; done
+GIVE_UP_AFTER=$((36*3600))
+SAW_DRIVER=0
+while true; do
+  if pgrep -f "driver_v7\.sh" > /dev/null; then
+    SAW_DRIVER=1
+    sleep 300
+    continue
+  fi
+  [ $SAW_DRIVER -eq 1 ] && break
+  if [ -f driver_v7.log ] && grep -q "\[driver\] ALL DONE" driver_v7.log; then
+    break
+  fi
+  if [ $(( $(date +%s) - START_TS )) -gt $GIVE_UP_AFTER ]; then
+    echo "=== [bonus] no driver process and no ALL-DONE log within ${GIVE_UP_AFTER}s -> giving up; shutting down to stop billing ==="
+    shutdown
+    exit 0
+  fi
+  sleep 300
+done
 echo "=== [bonus] $(date '+%F %T') main driver exited ==="
 if [ ! -f driver_v7.log ]; then
-  echo "=== [bonus] driver_v7.log absent -> cannot confirm a clean finish; no bonus ==="
-  exit 0
-fi
-if [ "$(stat -c %Y driver_v7.log)" -lt "$START_TS" ]; then
-  echo "=== [bonus] driver_v7.log predates this watcher -> stale log, no bonus ==="
+  echo "=== [bonus] driver_v7.log absent -> cannot confirm a clean finish; no bonus, box stays up ==="
   exit 0
 fi
 if ! grep -q "\[driver\] ALL DONE" driver_v7.log; then

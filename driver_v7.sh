@@ -51,3 +51,10 @@ if ! git push origin "$_push_ref" 2>&1 | tail -3; then
   exit 1
 fi
 echo "=== [driver] ALL DONE $(date '+%F %T') ==="
+# the bonus watcher owns the shutdown when it is alive; if it is not running
+# (crashed / never launched), stop billing here instead of idling forever
+if ! pgrep -f "bonus_watcher\.sh" > /dev/null; then
+  echo "=== [driver] no bonus watcher alive -> safety shutdown in 60s to stop billing (cancel: kill $$ now) ==="
+  sleep 60
+  pgrep -f "bonus_watcher\.sh" > /dev/null || shutdown
+fi

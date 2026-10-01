@@ -93,6 +93,12 @@ def _atomic_torch_save(obj, path):
     torch.save(obj, _tmp)
     os.replace(_tmp, path)
 
+def _load_ckpt(path):
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False, mmap=True)
+    except (RuntimeError, TypeError, ValueError):
+        return torch.load(path, map_location='cpu', weights_only=False)
+
 class HybridAttentionRoPE(L.HybridAttention):
 
     def __init__(self, d_model, n_heads, d_head, cfg):
@@ -964,7 +970,7 @@ def run_niah_phase(payload, guard=None, label=''):
             _ckp_pre = None
             if os.path.exists(ck):
                 try:
-                    _meta = torch.load(ck, map_location='cpu', weights_only=False)
+                    _meta = _load_ckpt(ck)
                 except Exception as _cke:
                     print(f'[niah] {v} s{seed}: checkpoint unreadable ({type(_cke).__name__}: {_cke}) — RETRAINING')
                     stale = True
@@ -1045,7 +1051,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 del _batch, cache
             except UnboundLocalError:
                 pass
-            _ckp = _ckp_pre if _ckp_pre is not None else torch.load(ck, map_location='cpu', weights_only=False)
+            _ckp = _ckp_pre if _ckp_pre is not None else _load_ckpt(ck)
             model = L.SmallGPT(_ckp.get('vocab', vocab), 256, 6, 8, 32, 512, _ckp['cfg'], mlp_ratio=_ckp['mlp_ratio']).to(DEVICE)
             model.load_state_dict(_ckp['sd'])
             for Ln in seq_lens:
@@ -1145,7 +1151,7 @@ def run_lenphase(payload, guard=None, label=''):
             _ckp_pre = None
             if os.path.exists(ck):
                 try:
-                    _meta = torch.load(ck, map_location='cpu', weights_only=False)
+                    _meta = _load_ckpt(ck)
                 except Exception as _cke:
                     print(f'[p1l] {v} s{seed}: checkpoint unreadable ({type(_cke).__name__}: {_cke}) — RETRAINING')
                     stale = True
@@ -1204,7 +1210,7 @@ def run_lenphase(payload, guard=None, label=''):
                 print(f'[resume] {key}: by_len record is stamped current but at least one eval length holds no usable measurement (error cell) — re-evaluating the missing lengths')
                 del summary[key]
                 L.atomic_write_json(spath, summary, indent=2)
-            _ckp = _ckp_pre if _ckp_pre is not None else torch.load(ck, map_location='cpu', weights_only=False)
+            _ckp = _ckp_pre if _ckp_pre is not None else _load_ckpt(ck)
             model = L.SmallGPT(_ckp.get('vocab', vocab), 256, 6, 8, 32, _ckp.get('train_len', train_len), _ckp['cfg'], mlp_ratio=_ckp['mlp_ratio']).to(DEVICE)
             model.load_state_dict(_ckp['sd'])
             mp = None if not getattr(model, 'use_abs_pe', True) else _ckp.get('max_seq', train_len)

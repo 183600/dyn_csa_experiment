@@ -21,7 +21,7 @@ if _NEEDED:
         print(f'[setup] could not install {', '.join(_NEEDED)} ({type(_pip_err).__name__}: {_pip_err}) — continuing; a code path that actually needs them will raise ImportError')
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, math, os, re, time, json, random, csv, tempfile, itertools, bisect, hashlib
+import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib
 from math import comb
 from dataclasses import dataclass
 import numpy as np
@@ -493,7 +493,6 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         if _jc is None:
             _jc = (torch.arange(B, device=dev, dtype=torch.float64)[None, :] * 78.233).contiguous()
             _cache_put(_IDX_CACHE, _jc_key, _jc, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
-        sc_dtype = H.dtype
     if query_chunk is None:
         raise ValueError("lightning_indexer: query_chunk=None is not 'use the default'; pass the default (2048) explicitly or omit the argument")
     query_chunk = max(1, min(int(query_chunk), n))
@@ -555,7 +554,8 @@ def _sink_all_finite(sink_logits):
     hit = _SINK_FIN_CACHE.get(key)
     if hit is not None:
         return hit
-    val = bool(torch.isfinite(sink_logits).all())
+    with torch.no_grad():
+        val = bool(torch.isfinite(sink_logits).all())
     if len(_SINK_FIN_CACHE) > 256:
         _SINK_FIN_CACHE.clear()
     _SINK_FIN_CACHE[key] = val

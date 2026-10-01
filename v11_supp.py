@@ -246,7 +246,7 @@ def build_report(out='REPORT_v11.md'):
     n_xo_min = min(_xo_real.values(), default=0)
     _xo_all_max = all((n == n_xo for n in _xo_real.values())) if _xo_real else False
     _n384_arms = {v: (scale384.get(v) or {}).get('n') for v in ('csa_fixed', 'full')}
-    n384 = min((n for n in _n384_arms.values() if n is not None), default=0)
+    n384 = min((_n384_arms.get(v) or 0) for v in ('csa_fixed', 'full'))
     _n384_set = sorted({n for n in _n384_arms.values() if n is not None})
     _n384_full = _n384_arms.get('full')
     n384_ok = _n384_full is not None and _n384_arms.get('csa_fixed') == _n384_full and (len(_n384_set) == 1)
@@ -309,7 +309,7 @@ def build_report(out='REPORT_v11.md'):
     A(f'**预算**：v11 记账 {v11_state.get('runs', 0)} runs，估算花费 ¥{v11_h * price:.2f} / ¥{BUDGET_V11['total_yuan']:.2f}（AutoDL RTX 4090，按 ¥{price:.2f}/h 记账；v7–v10 台账各自独立冻结）。')
     A('')
     if probe_ok:
-        A(f'v11 不提出新科学问题，只做 v10 留下的三处统计收尾：(1) 主正面结果（远距干扰注入探针）从 n=3 补到 **n={n_contr_max}**——全仓库唯一一个低成本即可让精确符号翻转 p 值下限跨过 0.05 的地方（0.250 → {_floor_txt}）；(**注意**：补满的是该面板的**最强**对比。各臂独立续训，配对取两臂交集，因此最弱对比仍停在 n={n_tree_min}、下限 {floor_p_tree:.3f}，凡引用它的结论不作显著性主张。)；(2) v10 新建的两个交叉定位面板（d=128/4L、d=512/10L）从 n=2 补到 {_xo_txt}——各面板的完成度不同，标题给的是分布而不是上限；(3) d=384 面板的 `csa_fixed`/`full` 两臂在同一配置下补到 n={n384}，消除 4 点标度读数中唯一离群点的配对不平衡。')
+        A(f'v11 不提出新科学问题，只做 v10 留下的三处统计收尾：(1) 主正面结果（远距干扰注入探针）从 n=3 补到 **n={n_contr_max}**——全仓库唯一一个低成本即可让精确符号翻转 p 值下限跨过 0.05 的地方（0.250 → {_floor_txt}）；(**注意**：补满的是该面板的**最强**对比。各臂独立续训，配对取两臂交集，因此最弱对比仍停在 n={n_tree_min}、下限 {floor_p_tree:.3f}，凡引用它的结论不作显著性主张。)；(2) v10 新建的两个交叉定位面板（d=128/4L、d=512/10L）从 n=2 补到 {_xo_txt}——各面板的完成度不同，标题给的是分布而不是上限；(3) d=384 面板的 `csa_fixed`/`full` 两臂在同一配置下补到 {_n384_txt if not n384_ok else f'n={n384}'}{'' if n384_ok else '——两臂未配满，配对不平衡仍在，该面板只作方向性表述'}，消除 4 点标度读数中唯一离群点的配对不平衡。')
     else:
         A('v11 计划做三处统计收尾：主正面结果（远距干扰注入探针）补到 n=6、两个交叉定位面板补到 n=4、d=384 面板 `csa_fixed`/`full` 两臂补到 n=4。')
         A('')
@@ -492,7 +492,11 @@ def build_report(out='REPORT_v11.md'):
                 parts.append(f's{s}: {ps['crossover_step']:g}{('' if ps['crossed'] else '（删失）')}')
             A(f'- d={v['d']}: ' + '；'.join(parts))
         A('')
-    A('**注意**：d=256 的轨迹取自 v6 重构 summary（README 记账说明 #1），逐种子交叉步互为副本，只有均值轨迹有效。')
+    _xo256 = xo.get('d256_L6') or next((v for v in xo.values() if v.get('d') == 256), {})
+    if any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', []))):
+        A('**注意**：d=256 的轨迹取自 v6 重构 summary（README 记账说明 #1），逐种子交叉步互为副本，只有均值轨迹有效。')
+    elif _xo256.get('status') == 'ok':
+        A('**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步与 seed 均值轨迹同为有效读数。')
     A('')
     if fit:
         A(f'**趋势拟合（仅供参考）**：{fit['n_points']} 个已观测交叉点，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}（R²={fit['r2']:.2f}）。方向性证据，不作精确幂律主张。')
@@ -617,7 +621,6 @@ def run_full():
             all_ok = False
         all_ok &= git_push(f'v11: phase {pname} results')
     try:
-        v11_analysis()
         build_report()
     except Exception:
         traceback.print_exc()
@@ -641,7 +644,6 @@ def run_smoke():
     print(f'  probe roundtrip OK ({len(s)} cells)')
     shutil.rmtree('results_smoke_v11', ignore_errors=True)
     print('[smoke] 2) zero-GPU analysis/report on current artifacts')
-    v11_analysis()
     build_report()
     print('\n[smoke] PASSED')
 if __name__ == '__main__':
