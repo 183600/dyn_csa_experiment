@@ -99,10 +99,9 @@ jobs:
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      - name: Configure opencode (Kimi 20% / DeepSeek 80%, fallback NVIDIA)
+      - name: Configure opencode (Kimi 20% / NVIDIA fallback)
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           mkdir -p ~/.config/opencode
@@ -128,27 +127,6 @@ jobs:
           }
           EOF
 
-          # ---------- 模板 D：DeepSeek 官方 ----------
-          cat > ~/.config/opencode/opencode.deepseek.json <<'EOF'
-          {
-            "$schema": "https://opencode.ai/config.json",
-            "provider": {
-              "deepseek": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "DeepSeek",
-                "options": {
-                  "baseURL": "https://api.deepseek.com",
-                  "apiKey": "{env:DEEPSEEK_API_KEY}"
-                },
-                "models": {
-                  "deepseek-flash": { "name": "deepseek-flash" }
-                }
-              }
-            },
-            "model": "deepseek/deepseek-flash"
-          }
-          EOF
-
           # ---------- 模板 N：NVIDIA（最终 fallback） ----------
           cat > ~/.config/opencode/opencode.nvidia.json <<'EOF'
           {
@@ -170,13 +148,11 @@ jobs:
           }
           EOF
 
-          # 默认先启用 DeepSeek；运行循环里每轮会重新抽签
-          cp ~/.config/opencode/opencode.deepseek.json ~/.config/opencode/opencode.json
+          # 默认先启用 NVIDIA；运行循环里每轮会重新抽签
+          cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
 
           echo "=== template (Kimi) ==="
           cat ~/.config/opencode/opencode.kimi.json
-          echo "=== template (DeepSeek) ==="
-          cat ~/.config/opencode/opencode.deepseek.json
           echo "=== template (NVIDIA) ==="
           cat ~/.config/opencode/opencode.nvidia.json
 
@@ -189,7 +165,6 @@ jobs:
         timeout-minutes: 300
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           set +e
@@ -203,18 +178,16 @@ jobs:
           # ================= provider 选择策略 =================
           #   每轮开始：
           #     - 20% 概率尝试 Kimi（Moonshot 官方），健康检查通过就用
-          #     - 否则（80%，或 Kimi 不可用）走 DeepSeek 官方，健康检查通过就用
-          #     - DeepSeek 也不可用 -> 回退 NVIDIA
-          #   运行中出错 / 429 会触发分级降级 + 冷却。
+          #     - 否则（80%，或 Kimi 不可用）走 NVIDIA
+          #   运行中出错 / 429 会触发降级 + 冷却。
           # =====================================================
-          KIMI_PROB=20          # Kimi 被选中的概率（%），其余走 DeepSeek
+          KIMI_PROB=20          # Kimi 被选中的概率（%），其余走 NVIDIA
           KIMI_COOLDOWN=0       # Kimi 失败后的冷却轮数
-          DEEPSEEK_COOLDOWN=0   # DeepSeek 失败后的冷却轮数
 
           i=0
           FAIL_COUNT=0
           RATE_COUNT=0
-          CURRENT_PROVIDER=deepseek
+          CURRENT_PROVIDER=nvidia
 
           commit_and_push() {
             git add -A || true
@@ -250,17 +223,6 @@ jobs:
               *)  return 1 ;;
             esac
           }
-          deepseek_alive() {
-            local code
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
-                   -H "Authorization: Bearer ${DEEPSEEK_API_KEY}" \
-                   'https://api.deepseek.com/models' 2>/dev/null)
-            echo "[info] DeepSeek 健康检查 /models -> HTTP ${code:-timeout}"
-            case "$code" in
-              2*) return 0 ;;
-              *)  return 1 ;;
-            esac
-          }
 
           # ---------- 切换 provider（真正换了才重置计数） ----------
           switch_provider() {
@@ -269,14 +231,6 @@ jobs:
                 if [ "$CURRENT_PROVIDER" != "kimi" ]; then
                   cp ~/.config/opencode/opencode.kimi.json ~/.config/opencode/opencode.json
                   CURRENT_PROVIDER=kimi
-                  FAIL_COUNT=0
-                  RATE_COUNT=0
-                fi
-                ;;
-              deepseek)
-                if [ "$CURRENT_PROVIDER" != "deepseek" ]; then
-                  cp ~/.config/opencode/opencode.deepseek.json ~/.config/opencode/opencode.json
-                  CURRENT_PROVIDER=deepseek
                   FAIL_COUNT=0
                   RATE_COUNT=0
                 fi
@@ -297,9 +251,6 @@ jobs:
             if [ $KIMI_COOLDOWN -gt 0 ]; then
               KIMI_COOLDOWN=$((KIMI_COOLDOWN-1))
             fi
-            if [ $DEEPSEEK_COOLDOWN -gt 0 ]; then
-              DEEPSEEK_COOLDOWN=$((DEEPSEEK_COOLDOWN-1))
-            fi
 
             # 1) 20% 概率尝试 Kimi
             if [ $((RANDOM % 100)) -lt $KIMI_PROB ] && [ $KIMI_COOLDOWN -eq 0 ]; then
@@ -308,24 +259,12 @@ jobs:
                 echo "[info] 第 $i 轮抽中 Kimi（${KIMI_PROB}%），使用 Moonshot 官方 API"
                 return
               fi
-              echo "[info] 抽中 Kimi 但端点不可用，回退 DeepSeek"
+              echo "[info] 抽中 Kimi 但端点不可用，回退 NVIDIA"
             elif [ $KIMI_COOLDOWN -gt 0 ]; then
-              echo "[info] Kimi 冷却中（剩余 $KIMI_COOLDOWN 轮），本轮使用 DeepSeek"
+              echo "[info] Kimi 冷却中（剩余 $KIMI_COOLDOWN 轮），本轮使用 NVIDIA"
             fi
 
-            # 2) 默认路径（80% 抽签 + Kimi 回退）：DeepSeek
-            if [ $DEEPSEEK_COOLDOWN -eq 0 ]; then
-              if deepseek_alive; then
-                switch_provider deepseek
-                echo "[info] 第 $i 轮使用 DeepSeek 官方 API (deepseek-flash)"
-                return
-              fi
-              echo "[info] DeepSeek 端点不可用，回退 NVIDIA"
-            else
-              echo "[info] DeepSeek 冷却中（剩余 $DEEPSEEK_COOLDOWN 轮），本轮使用 NVIDIA"
-            fi
-
-            # 3) 最后兜底：NVIDIA
+            # 2) 兜底：NVIDIA
             switch_provider nvidia
             echo "[info] 第 $i 轮使用 NVIDIA fallback"
           }
@@ -365,15 +304,8 @@ jobs:
               # ---------- 429 限流 ----------
               if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
                 if [ "$CURRENT_PROVIDER" = "kimi" ]; then
-                  echo "[warn] iteration $i 命中 Kimi 限流(429)，切到 DeepSeek 重试"
+                  echo "[warn] iteration $i 命中 Kimi 限流(429)，切到 NVIDIA 重试"
                   KIMI_COOLDOWN=10
-                  switch_provider deepseek
-                  sleep 10
-                  continue
-                fi
-                if [ "$CURRENT_PROVIDER" = "deepseek" ]; then
-                  echo "[warn] iteration $i 命中 DeepSeek 限流(429)，切到 NVIDIA 重试"
-                  DEEPSEEK_COOLDOWN=10
                   switch_provider nvidia
                   sleep 10
                   continue
@@ -392,18 +324,10 @@ jobs:
               FAIL_COUNT=$((FAIL_COUNT+1))
               echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE (连续失败: $FAIL_COUNT)"
 
-              # Kimi 异常 -> 冷却 + 立即切 DeepSeek
+              # Kimi 异常 -> 冷却 + 立即切 NVIDIA
               if [ "$CURRENT_PROVIDER" = "kimi" ]; then
-                echo "[info] Kimi 端点异常，切到 DeepSeek 重试"
+                echo "[info] Kimi 端点异常，切到 NVIDIA 重试"
                 KIMI_COOLDOWN=10
-                switch_provider deepseek
-                sleep 10
-                continue
-              fi
-              # DeepSeek 异常 -> 冷却 + 立即切 NVIDIA
-              if [ "$CURRENT_PROVIDER" = "deepseek" ]; then
-                echo "[info] DeepSeek 端点异常，切到 NVIDIA 重试"
-                DEEPSEEK_COOLDOWN=10
                 switch_provider nvidia
                 sleep 10
                 continue
