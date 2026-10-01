@@ -106,7 +106,7 @@ def synthesize_long_summary():
             _split.append(v)
             continue
         real_v, _proto = _c
-        _real = sorted((r.get('seed') for r in summary.values() if isinstance(r, dict) and r.get('variant') == real_v and (r.get('seed') is not None)))
+        _real = sorted({_num_or_none(r.get('seed')) for r in summary.values() if isinstance(r, dict) and r.get('variant') == real_v and (r.get('seed') is not None)} - {None})
         if _seeds is None or len(_seeds) != len(_ppls):
             _unaligned.append((v, len(_ppls), _real))
             continue
@@ -114,7 +114,7 @@ def synthesize_long_summary():
         _bad_map = False
         for _si, _pi in zip(_seeds, _ppls):
             _si = _num_or_none(_si)
-            if _si is None:
+            if _si is None or not L.ppl_is_usable(_pi):
                 _bad_map = True
                 break
             _pi = float(_pi)

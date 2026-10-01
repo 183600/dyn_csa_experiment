@@ -14,7 +14,7 @@ while true; do
     sleep 300
     continue
   fi
-  [ $SAW_DRIVER -eq 1 ] && break
+  [ "$SAW_DRIVER" -eq 1 ] && break
   if [ -f driver_v7.log ] && [ "$(stat -c %Y driver_v7.log 2>/dev/null || echo 0)" -gt "$START_TS" ] && grep -q "\[driver\] ALL DONE" driver_v7.log; then
     break
   fi
@@ -62,7 +62,7 @@ if booked > wallet_h - 2.0:
 print(f"[bonus] booked {booked:.1f}h, wallet {wallet_h:.1f}h -> go")
 PYEOF
 _rc=$?
-if [ $_rc -ne 0 ] && [ $_rc -ne 1 ] && [ $_rc -ne 2 ]; then
+if [ "$_rc" -ne 0 ] && [ "$_rc" -ne 1 ] && [ "$_rc" -ne 2 ]; then
   echo "=== [bonus] ledger check crashed unexpectedly (rc=$_rc); box stays up for inspection ==="
   exit 1
 fi
@@ -92,13 +92,13 @@ commit_and_push() {
   fi
   return 0
 }
-if [ $_rc -eq 2 ]; then
+if [ "$_rc" -eq 2 ]; then
   echo "=== [bonus] skipped (ledger unreadable) ==="
   commit_and_push "v7: bonus skipped (budget ledger unreadable)" || exit 1
   shutdown
   exit 0
 fi
-if [ $_rc -ne 0 ]; then
+if [ "$_rc" -ne 0 ]; then
   echo "=== [bonus] skipped (budget) ==="
   commit_and_push "v7: bonus skipped (wallet headroom too small)" || exit 1
   shutdown
@@ -117,7 +117,7 @@ V.run_warmup(dict(L.RUN_LONG, outdir="results_lm_v7_warmup",
 PYEOF
 _bonus_rc=$?
 echo "=== [bonus] $(date '+%F %T') P0W seed2 END rc=$_bonus_rc ==="
-if [ $_bonus_rc -ne 0 ]; then
+if [ "$_bonus_rc" -ne 0 ]; then
   echo "=== [bonus] P0W seed2 run FAILED (rc=$_bonus_rc) -> skipping analysis/report/commit; box stays up for inspection ==="
   exit 1
 fi

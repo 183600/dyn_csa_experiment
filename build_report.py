@@ -871,7 +871,7 @@ def sec_flops():
             lines.append(f'| {r['seq_len']} | {r['sel_ratio']:.2%} | {r['csa_over_dense']:.3f} | {r['hybrid_over_dense']:.3f} | {r['csa_kv_over_dense']:.3f} |')
         except (KeyError, TypeError, ValueError) as _e:
             print(f'[report] sec_flops: a malformed row was skipped ({type(_e).__name__}: {_e})')
-    _clean = [r for r in rows if isinstance(r, dict) and r.get('seq_len') is not None]
+    _clean = sorted((r for r in rows if isinstance(r, dict) and isinstance(r.get('seq_len'), (int, float)) and (not isinstance(r.get('seq_len'), bool)) and math.isfinite(r['seq_len'])), key=lambda r: r['seq_len'])
     _rows = {}
     for r in _clean:
         _rows.setdefault(r['seq_len'], r)

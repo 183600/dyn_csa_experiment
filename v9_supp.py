@@ -391,20 +391,22 @@ def run_smoke():
     L.set_seed(0)
     _install_ckpt_patch()
     _V9_CKPT['on'] = True
-    for v in ['csa_fixed_topk128', 'csa_fixed_topk512']:
-        cfgs = L.make_layer_cfgs(6, v)
-        m = L.SmallGPT(8192, 256, 6, 8, 32, 2048, cfgs).to(DEVICE)
-        x = torch.randint(0, 8192, (1, 2048), device=DEVICE)
-        import torch.nn.functional as Fn
-        out = m(x)
-        loss = Fn.cross_entropy(out.reshape(-1, 8192), x.reshape(-1)) + 0.05 * m.comp_reg
-        loss.backward()
-        print(f'  {v:20s} out={tuple(out.shape)} loss={loss.item():.3f} -> fwd+bwd OK at seq 2048 bs 1')
-        del m, out, loss, x
-        gc.collect()
-        if DEVICE.type == 'cuda':
-            torch.cuda.empty_cache()
-    _V9_CKPT['on'] = False
+    try:
+        for v in ['csa_fixed_topk128', 'csa_fixed_topk512']:
+            cfgs = L.make_layer_cfgs(6, v)
+            m = L.SmallGPT(8192, 256, 6, 8, 32, 2048, cfgs).to(DEVICE)
+            x = torch.randint(0, 8192, (1, 2048), device=DEVICE)
+            import torch.nn.functional as Fn
+            out = m(x)
+            loss = Fn.cross_entropy(out.reshape(-1, 8192), x.reshape(-1)) + 0.05 * m.comp_reg
+            loss.backward()
+            print(f'  {v:20s} out={tuple(out.shape)} loss={loss.item():.3f} -> fwd+bwd OK at seq 2048 bs 1')
+            del m, out, loss, x
+            gc.collect()
+            if DEVICE.type == 'cuda':
+                torch.cuda.empty_cache()
+    finally:
+        _V9_CKPT['on'] = False
     print('[smoke] 2) 60-step csa_fixed_topk128 probe (seq 2048, bs 1 — matches the P2T phase setting)')
     guard = make_guard()
     t_data = time.time()
