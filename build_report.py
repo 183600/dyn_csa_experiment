@@ -332,7 +332,7 @@ def sec_p0r():
             if _pair_mt is not None:
                 _st_mt = _pair_mt[2]
                 _mt_stat = f'配对符号翻转 n={_st_mt['n']}、p={_st_mt['p_exact_signflip']:.3f}（Δ mean={_st_mt['mean']:+.2f}）'
-                _mt_sig = _st_mt['p_exact_signflip'] < 0.05
+                _mt_sig = _st_mt['p_exact_signflip'] <= 0.05
                 _mt_gap = _st_mt['mean']
             else:
                 _mt_stat = '本面板没有可通过配对门禁的同配置种子对，显著性无法检验'

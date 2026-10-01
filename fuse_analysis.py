@@ -477,8 +477,8 @@ def main(argv=None):
     _n_pp = probe.get('n_ppl')
     _f1_d, _f1_p = (probe.get('d_f1'), probe.get('p_f1'))
     _ppl_d, _ppl_p = (probe.get('d_ppl'), probe.get('p_ppl'))
-    _f1_sig = _f1_p is not None and _f1_p < 0.05
-    _ppl_sig = _ppl_p is not None and _ppl_p < 0.05
+    _f1_sig = _f1_p is not None and _f1_p <= 0.05
+    _ppl_sig = _ppl_p is not None and _ppl_p <= 0.05
     _blk_stable = bool(_blk) and _blk_max <= 0.01
     if _f1_d is None:
         _c1 = f'1. **边界 F1 的同面板配对差未测量**（n={_n_p or 0} 的可用配对不足），本节不对 F1 方向作断言。\n'

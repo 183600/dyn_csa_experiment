@@ -78,7 +78,11 @@ def v11_analysis(out='analysis_v11/stats.json'):
     probe = {'cells': [], 'contrasts': {}}
     sp = V10.PROBE['summary']
     if os.path.exists(sp):
-        raw = json.load(open(sp, encoding='utf-8'))
+        try:
+            raw = json.load(open(sp, encoding='utf-8'))
+        except Exception as _e:
+            print(f'[stats] FATAL: {sp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to compute probe statistics from a truncated file; move it aside to re-probe.')
+            raise
         cells, _dup_cells, _bad_cells = ({}, [], [])
         for _k, r in raw.items():
             if not isinstance(r, dict):

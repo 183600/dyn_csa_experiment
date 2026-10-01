@@ -446,7 +446,9 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     finite = torch.isfinite(scores)
     masked = scores.masked_fill(~causal | ~finite, float('-inf'))
     order = _rank_blocks(masked, B, ties)
-    usable = causal.gather(1, order) & finite.gather(1, order)
+    _gidx = order.to(torch.int64)
+    usable = causal.gather(1, _gidx) & finite.gather(1, _gidx)
+    del _gidx
     if k >= B:
         keep = usable
     else:
@@ -1674,17 +1676,13 @@ def eval_ppl(model, val_batch, device, chunk=16, eval_rows=None, eval_seed=0):
                 print(f'[eval_ppl] eval_rows={int(eval_rows)} covers the whole {_flat}-row target space; scoring the FULL set (this is the population statistic, not a sample)')
         _vhost = None
         if device.type == 'cuda':
-            _vptr = val_batch.__array_interface__['data'][0] if hasattr(val_batch, '__array_interface__') else id(val_batch)
-            _vflat = np.asarray(val_batch).reshape(-1)
-            _vfp = (int(_vflat[0]), int(_vflat[-1]), int(np.mod(_vflat, 2 ** 31).sum() % 2 ** 31)) if _vflat.size else None
-            _vkey = (_vptr, tuple(val_batch.shape), _vfp)
             _vc = _PINNED_HOST_CACHE.get('val')
-            if _vc is not None and _vc[0] == _vkey:
-                _vhost = _vc[1]
+            if _vc is not None and _vc[0] is val_batch and _vc[1] == tuple(val_batch.shape):
+                _vhost = _vc[2]
             else:
                 try:
                     _vhost = torch.as_tensor(val_batch).pin_memory()
-                    _PINNED_HOST_CACHE['val'] = (_vkey, _vhost)
+                    _PINNED_HOST_CACHE['val'] = (val_batch, tuple(val_batch.shape), _vhost)
                 except RuntimeError:
                     _vhost = torch.as_tensor(val_batch)
         else:
