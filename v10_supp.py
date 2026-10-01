@@ -173,6 +173,10 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 print(f"[p3mp] REFUSE {v} s{seed}: {ck} exists but {_msp} has no '{v}::seed{seed}' training record — the weights have no traceable provenance, so they cannot be attributed to the current recipe")
                 del d
                 continue
+            if not L.result_is_current(_tr, V.CKPT_CODE, 'by_len') or _tr.get('synthesized'):
+                print(f"[p3mp] REFUSE {v} s{seed}: the training record '{v}::seed{seed}' in {_msp} is not a current measurement under this code semantics (stale stamp, unusable ppl, or synthesized) — re-run the training phase (P3MT/P4MT) so the weights are backed by a fresh measured record")
+                del d
+                continue
             _ck_recipe = d.get('recipe')
 
             def _cell_stale(_key, _fp_x):
@@ -308,12 +312,20 @@ def _hist_by_seed(outdir, variant):
             print(f'[v10 stats] {_k} has an unreadable ppl_history entry; its curve fingerprint cannot be de-duplicated reliably')
             fp = ('__unreadable__', id(r))
         if fp in seen:
-            if not r.get('synthesized') and synth_of.get(seen[fp]):
-                _s0 = seen.pop(fp)
+            _s0 = seen[fp]
+            _new_real = not r.get('synthesized')
+            _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
+            _new_cur = isinstance(r.get('run_cfg'), str) and r['run_cfg'].endswith(_cur_sfx)
+            _old_cur = isinstance(cfg_of.get(_s0), str) and cfg_of[_s0].endswith(_cur_sfx)
+            if _new_real and (synth_of.get(_s0) or (_new_cur and not _old_cur)):
+                seen.pop(fp)
                 out.pop(_s0, None)
                 synth_of.pop(_s0, None)
                 cfg_of.pop(_s0, None)
-                print(f'[stats] {sp}: seed {s} of `{variant}` is a REAL record whose curve matches the SYNTHESIZED reconstruction admitted as seed {_s0}; keeping the real measurement (seed {s}) and dropping the reconstruction.')
+                if _new_cur and not _old_cur:
+                    print(f'[stats] {sp}: seed {s} of `{variant}` is a REAL record stamped with the CURRENT code semantics whose curve matches the older one admitted as seed {_s0}; keeping the current measurement (seed {s}) and dropping the older record.')
+                else:
+                    print(f'[stats] {sp}: seed {s} of `{variant}` is a REAL record whose curve matches the SYNTHESIZED reconstruction admitted as seed {_s0}; keeping the real measurement (seed {s}) and dropping the reconstruction.')
             else:
                 if not r.get('synthesized'):
                     print(f'[stats] {sp}: seed {s} of `{variant}` is a REAL record but its curve is IDENTICAL to the one already admitted for seed {seen[fp]}; keeping seed {seen[fp]} (the first admission) and dropping seed {s} so the curve is not counted twice.')
@@ -410,6 +422,9 @@ def _tokens_per_step(outdir, fallback=None):
     if n_bad:
         print(f'[stats] WARNING: {outdir}: {n_bad} record(s) state a non-numeric or non-positive tokens_seen/steps and are ignored when establishing the token axis')
     if not rates:
+        if fallback is not None:
+            print(f'[stats] {outdir}: no measured tokens/step rate on disk (every record is synthesized or unmeasured) — falling back to the panel-declared rate {float(fallback):g} (= batch x seq, exact for this panel)')
+            return float(fallback)
         return None
     if len(set(rates)) > 1:
         print(f'[stats] WARNING: {outdir} reports {len(set(rates))} distinct tokens/step rates {sorted(set(rates))} — the token axis is ambiguous, so no crossover_tokens will be published')
@@ -449,7 +464,7 @@ def _scale_crossovers():
             out[label] = {'status': 'missing', **p}
             continue
         common = _paired
-        tps = _tokens_per_step(p['outdir'])
+        tps = _tokens_per_step(p['outdir'], fallback=p['batch'] * p['seq'])
         if tps is not None and tps != p['batch'] * p['seq']:
             print(f'[stats] {label}: panel tokens/step is {tps:g} but its declared batch*seq is {p['batch'] * p['seq']} — using the calibrated rate')
         per_seed = {}
@@ -482,7 +497,6 @@ def v10_analysis(out='analysis_v10/stats.json'):
     if os.path.exists(sp):
         raw = json.load(open(sp, encoding='utf-8'))
         cells = {}
-        _param_conflict = {}
         _usable, _bad_cells = ({}, [])
         for _k, r in raw.items():
             if not isinstance(r, dict):
@@ -501,25 +515,15 @@ def v10_analysis(out='analysis_v10/stats.json'):
         if _bad_cells:
             print(f'[v10 stats] {len(_bad_cells)} record(s) in {sp} carry no variant/seed/ppl_mean and are skipped (they are error or truncation stubs, not measurements): ' + ', '.join((f'{k}({why})' for k, why in _bad_cells[:4])))
         _n_bad_pre = len(_bad_cells)
-        for k, r in _usable.items():
-            p = r.get('probe_params')
-            if p is None:
-                continue
-            key = (r['variant'], r['arm'], r['eval_len'], r['rho'])
-            seen = _param_conflict.setdefault(key, set())
-            seen.add(tuple(sorted(_fp_norm(p).items())))
-        _bad = {k: sorted(v) for k, v in _param_conflict.items() if len(v) > 1}
-        if _bad:
-            raise ValueError('v10_analysis: the P3MP probe panel mixes probe parameters under one cell key, so its mean and its paired contrasts would difference two different measurements. Re-probe the cell(s): ' + '; '.join((f'{k}' for k in sorted(_bad)[:3])))
         cells, _dup_cells = ({}, [])
         for k, r in _usable.items():
             if r.get('probe_params') is None:
                 _bad_cells.append((k, 'no probe_params'))
                 continue
-            key = (r['variant'], r['arm'], r['eval_len'], r['rho'], str(r.get('_code')))
+            key = (r['variant'], r['arm'], r['eval_len'], r['rho'], json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
             grp = cells.setdefault(key, {})
             if r['seed'] in grp:
-                _dup_cells.append((k, key, r['seed']))
+                _dup_cells.append((k, key[:4], r['seed']))
                 continue
             grp[r['seed']] = r
         if _dup_cells:
@@ -528,7 +532,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
         if _new_bad:
             print(f'[v10 stats] {len(_new_bad)} record(s) in {sp} lack `probe_params` and are dropped from every mean/paired statistic: ' + ', '.join((f'{k}({why})' for k, why in _new_bad[:4])))
         probe_cells = []
-        for (v, arm, Ln, rho, _cd), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
+        for (v, arm, Ln, rho, _pp, _cd, _recipe), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
             assert means, (v, arm, Ln, rho)
             probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
@@ -537,7 +541,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
         def cell_mean(v, arm, Ln, rho):
             hits = [c for c in probe_cells if (c['variant'], c['arm'], c['eval_len'], c['rho']) == (v, arm, Ln, rho)]
             if len(hits) > 1:
-                print(f'[v10 stats] ({v}/{arm}/L{Ln}/r{rho}) holds {len(hits)} probe parameterisations — no unambiguous cell, so the contrast is omitted rather than pooled across them')
+                print(f'[v10 stats] ({v}/{arm}/L{Ln}/r{rho}) holds {len(hits)} distinct probe parameterisations/recipes/code stamps — no unambiguous cell, so the contrast is omitted rather than pooled across them')
                 return {}
             return hits[0] if hits else {}
         for Ln in PROBE['eval_lens']:

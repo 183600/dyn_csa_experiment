@@ -92,6 +92,7 @@ def _panel_block(panel):
     out = {}
     for v, d in sorted(panel.items()):
         recs = dict(d)
+        _stale_cfg = False
         if recs and all((isinstance(r, dict) for r in recs.values())):
             by_cfg = {}
             raw_cfg = {}
@@ -99,21 +100,25 @@ def _panel_block(panel):
                 _gk = json.dumps(r.get('run_cfg'), sort_keys=True, default=str)
                 by_cfg.setdefault(_gk, {})[s] = r
                 raw_cfg[_gk] = r.get('run_cfg')
+            _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
+            _ranked = sorted(by_cfg.items(), key=lambda kv: (not (isinstance(raw_cfg.get(kv[0]), str) and raw_cfg[kv[0]].endswith(_cur_sfx)), -len(kv[1])))
+            _kept_cfg = raw_cfg.get(_ranked[0][0])
             if len(by_cfg) > 1:
-                _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
-                _ranked = sorted(by_cfg.items(), key=lambda kv: (not (isinstance(raw_cfg.get(kv[0]), str) and raw_cfg[kv[0]].endswith(_cur_sfx)), -len(kv[1])))
                 keep = _ranked[0][1]
                 _ties = [g for _k, g in _ranked[1:] if len(g) == len(keep)]
                 print(f'[stats] _panel_block: variant `{v}` spans {len(by_cfg)} distinct run_cfg groups — pooling across configurations is not allowed, so the table keeps only one group ({len(keep)}/{len(recs)} seeds, preferring the one stamped with the current code semantics) and drops the rest')
                 if _ties:
                     print(f'[stats] _panel_block: variant `{v}` run_cfg groups TIE at {len(keep)} seed(s) each — the kept group is {sorted(keep)}; the tied alternatives are dropped, so this panel contributes fewer seeds than were measured')
                 recs = keep
+            _stale_cfg = not (isinstance(_kept_cfg, str) and _kept_cfg.endswith(_cur_sfx))
+            if _stale_cfg:
+                print(f'[stats] _panel_block: variant `{v}` has NO run_cfg group stamped with the current code semantics ({_cur_sfx}) — the table entry quotes numbers measured by older code and is marked `_stale_cfg` so downstream readers can tell')
         vals = [v0 for v0 in ((r.get('ppl') if isinstance(r, dict) else r) for r in recs.values()) if isinstance(v0, (int, float)) and np.isfinite(v0)]
         ppl_map = {s: (r.get('ppl') if isinstance(r, dict) else r) for s, r in recs.items()}
         if not vals:
-            out[v] = {'ppls': ppl_map, 'n': 0}
+            out[v] = {'ppls': ppl_map, 'n': 0, **({'_stale_cfg': True} if _stale_cfg else {})}
             continue
-        out[v] = {'ppls': ppl_map, 'mean': float(np.mean(vals)), 'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0, 'n': len(vals)}
+        out[v] = {'ppls': ppl_map, 'mean': float(np.mean(vals)), 'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0, 'n': len(vals), **({'_stale_cfg': True} if _stale_cfg else {})}
     return out
 
 def v8_analysis(out='analysis_v8/stats.json'):

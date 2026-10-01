@@ -16,6 +16,12 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import exp_lib as L
 
+def _save_fig(fig, name, **kw):
+    path = os.path.join(OUT, name)
+    tmp = path + '.tmp.png'
+    fig.savefig(tmp, format='png', **kw)
+    os.replace(tmp, path)
+
 def load(panel):
     path = os.path.join(ROOT, panel, 'summary.json')
     if not os.path.exists(path):
@@ -370,13 +376,13 @@ def main(argv=None):
                     if not isinstance(_h, list):
                         raise ValueError(f'`ppl_history` of {v}::seed{s} is {type(_h).__name__}, not a list of [step, ppl] pairs')
                     hs.append(dict(_h))
+                steps = _axis_steps(hs)
+                Y = np.array([[h[st] for st in steps] for h in hs], dtype=float) if steps else None
             except (KeyError, ValueError, TypeError) as e:
                 print(f'[fuse_analysis] NOTE: skipping trajectory of `{v}` — {e}')
                 continue
-            steps = _axis_steps(hs)
             if not steps:
                 continue
-            Y = np.array([[h[st] for st in steps] for h in hs], dtype=float)
             Y[~np.isfinite(Y) | (Y <= 0)] = np.nan
             ax.plot(steps, np.nanmean(Y, axis=0), color=color, lw=2, label=lab)
             ax.fill_between(steps, np.nanmin(Y, axis=0), np.nanmax(Y, axis=0), color=color, alpha=0.18)
@@ -389,7 +395,7 @@ def main(argv=None):
     _traj_n = f'{len(SEEDS)} seeds' if len(_hyb_seeds) == len(SEEDS) else f'{len(SEEDS)} seeds (hybrid panel gated to {len(_hyb_seeds)})'
     fig.suptitle(f'fuse vs no-fuse: validation PPL trajectories ({_traj_n}, min–max band)', y=1.0)
     fig.tight_layout()
-    fig.savefig(os.path.join(OUT, 'fuse_ppl_traj.png'), dpi=140, bbox_inches='tight')
+    _save_fig(fig, 'fuse_ppl_traj.png', dpi=140, bbox_inches='tight')
     plt.close(fig)
     if not _hyb_seeds:
         print('[fuse_analysis] NOTE: skipping the boundary bar plot — no seed passes the run_cfg/budget pairing gate for the hybrid pair')
@@ -416,7 +422,7 @@ def main(argv=None):
         ax.grid(alpha=0.3, axis='y')
         ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(os.path.join(OUT, 'fuse_boundary.png'), dpi=140, bbox_inches='tight')
+    _save_fig(fig, 'fuse_boundary.png', dpi=140, bbox_inches='tight')
     plt.close(fig)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
     PLOTTED = [('hybrid_csa_dyn', 'steelblue'), ('hybrid_csa_dyn_fuse', 'darkorange'), ('csa_dynamic', 'seagreen'), ('csa_dyn_fuse', 'firebrick')]
@@ -456,7 +462,7 @@ def main(argv=None):
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(os.path.join(OUT, 'fuse_blocklen.png'), dpi=140, bbox_inches='tight')
+    _save_fig(fig, 'fuse_blocklen.png', dpi=140, bbox_inches='tight')
     plt.close(fig)
 
     def _pv(k, fmt='{:+.4f}'):
@@ -492,7 +498,12 @@ def main(argv=None):
     else:
         _f1_floor = 2.0 / 2 ** _n_p if isinstance(_n_p, int) and _n_p > 0 else float('nan')
         _f1_floor_txt = f'p 值打在 n={_n_p} 的分辨率下限上，不能排除是噪声' if _f1_p is not None and math.isfinite(_f1_floor) and (abs(_f1_p - _f1_floor) < 1e-12) else f'p={_pv('p_f1', '{:.3f}')}，高于 n={_n_p or '?'} 的分辨率下限 {_f1_floor:.3f}，不能排除是噪声'
-        _c1 = f'1. **连「F1 提升」本身都不稳固**：在最干净的同面板配对（hybrid 栈，仅 csa_dyn 层，按 seed 配对，n={_n_p or '?'}）中，fuse 与 no-fuse 的边界 F1 差为 **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}**，即 {_f1_floor_txt}；只有在跨面板的纯 CSA 对比里才看到 {_pv('x_d_f1')} 的 F1 差' + (f'（p={_pv('x_p_f1', '{:.3f}')}）' if probe.get('x_d_f1_guarded') else '（该对比未通过本仓库的可配对门禁，故未执行检验、不给 p 值）') + '，而该对比非严格配对（面板/实现差异未受控），不足以支撑机制性主张。\n'
+        _x_f1 = probe.get('x_d_f1')
+        if _x_f1 is None or not np.isfinite(_x_f1):
+            _x_f1_txt = '跨面板的纯 CSA 对比未测量'
+        else:
+            _x_f1_txt = f'只有在跨面板的纯 CSA 对比里才看到 {_pv('x_d_f1')} 的 F1 差' + (f'（p={_pv('x_p_f1', '{:.3f}')}）' if probe.get('x_d_f1_guarded') else '（该对比未通过本仓库的可配对门禁，故未执行检验、不给 p 值）') + '，而该对比非严格配对（面板/实现差异未受控）'
+        _c1 = f'1. **连「F1 提升」本身都不稳固**：在最干净的同面板配对（hybrid 栈，仅 csa_dyn 层，按 seed 配对，n={_n_p or '?'}）中，fuse 与 no-fuse 的边界 F1 差为 **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}**，即 {_f1_floor_txt}；{_x_f1_txt}，不足以支撑机制性主张。\n'
     if _ppl_d is None:
         _c3 = '3. **验证 PPL 的配对差未测量**，本节不对 PPL 方向作断言。\n'
     elif _ppl_sig:
@@ -500,7 +511,9 @@ def main(argv=None):
     else:
         _ppl_floor = 2.0 / 2 ** _n_pp if isinstance(_n_pp, int) and _n_pp > 0 else float('nan')
         _ppl_floor_txt = f'配对符号翻转 p 值打在 n={_n_pp} 的分辨率下限上，任何差异不能排除是种子噪声' if _ppl_p is not None and math.isfinite(_ppl_floor) and (abs(_ppl_p - _ppl_floor) < 1e-12) else f'配对符号翻转 p={_pv('p_ppl', '{:.3f}')}，高于 n={_n_pp or '?'} 的分辨率下限 {_ppl_floor:.3f}，任何差异不能排除是种子噪声'
-        _c3 = f'3. **PPL 同样不变**：两条验证 PPL 轨迹全程重叠（见 `fuse_ppl_traj.png`），同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')}），跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL——{_ppl_floor_txt}。\n'
+        _x_ppl = probe.get('x_d_ppl_csa')
+        _x_ppl_txt = f'，跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL' if _x_ppl is not None and np.isfinite(_x_ppl) else '，跨面板纯 CSA 对比未测量'
+        _c3 = f'3. **PPL 同样不变**：两条验证 PPL 轨迹全程重叠（见 `fuse_ppl_traj.png`），同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')}）{_x_ppl_txt}——{_ppl_floor_txt}。\n'
     if _blk_stable and not _f1_sig and not _ppl_sig and (_f1_d is not None) and (_ppl_d is not None):
         _c4 = '4. **结论写法（可直接引用）**：在 1500 步 budget 区间，用于边界检测的邻域表示融合是一个**惰性旋钮（inert knob）**——它既没有稳定改善动态分块的边界对齐质量，在上文第 2 条核验通过的范围内也没有改变块长分布，更没有转化为语言建模收益。这与全套实验的主结论一致：该 budget 下 LM 损失对分块质量不敏感（v4 全部消融臂停在同一 PPL 水平），且动态分块母轴本身在 4 个面板（核心表/20k 长跑/RoPE/scale）都与固定分块贴平。\n'
     else:

@@ -35,7 +35,18 @@ if ! git commit -m "v7: remaining phases complete (P0E/P2S/P1L/P1T) + rebuilt re
   fi
 fi
 set -o pipefail
-if ! git push origin HEAD 2>&1 | tail -3; then
+_branch=$(git rev-parse --abbrev-ref HEAD)
+if [ "$_branch" = "HEAD" ]; then
+  _up=$(git symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)
+  _dst="${_up#refs/remotes/origin/}"
+  if [ -z "$_dst" ] || ! git rev-parse --verify -q "refs/remotes/origin/${_dst}" >/dev/null; then
+    _dst=main
+  fi
+  _push_ref="HEAD:${_dst}"
+else
+  _push_ref="HEAD"
+fi
+if ! git push origin "$_push_ref" 2>&1 | tail -3; then
   echo "=== [driver] push FAILED — results are local only ==="
   exit 1
 fi

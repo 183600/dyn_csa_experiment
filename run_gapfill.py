@@ -52,8 +52,10 @@ def git_push(msg):
             run('git', 'rebase', '--abort')
         r = run('git', 'push', 'origin', 'HEAD')
     else:
-        _up = run('git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name', 'origin/HEAD').stdout.strip()
-        _dst = _up.split('/', 1)[1] if _up.startswith('origin/') else 'main'
+        _up = run('git', 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD').stdout.strip()
+        _dst = _up[len('refs/remotes/origin/'):] if _up.startswith('refs/remotes/origin/') else ''
+        if not _dst or run('git', 'rev-parse', '--verify', '-q', f'refs/remotes/origin/{_dst}').returncode != 0:
+            _dst = 'main'
         print(f'[git] detached HEAD — pushing explicitly to origin/{_dst}')
         r = run('git', 'push', 'origin', f'HEAD:{_dst}')
     ok = r.returncode == 0

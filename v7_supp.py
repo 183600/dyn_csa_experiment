@@ -379,7 +379,7 @@ class BlockRoPE(nn.Module):
         self.n1 = L.RMSNorm(d)
         self.attn = HybridAttentionRoPE(d, n_heads, d_head, cfg)
         self.n2 = L.RMSNorm(d)
-        self.mlp = L.MLP(d, int(d * mlp_ratio), init_gen=mlp_gen)
+        self.mlp = L.MLP(d, int(round(d * mlp_ratio)), init_gen=mlp_gen)
 
     def forward(self, x):
         x = x + self.attn(self.n1(x))
@@ -598,7 +598,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                 key = f'{v}::w{warm}::seed{seed}'
                 _cur = summary.get(key)
                 _drop_msg = None
-                if isinstance(_cur, dict) and not L.result_is_current(_cur, CKPT_CODE, 'ppl'):
+                if isinstance(_cur, dict) and ((_cur.get('synthesized')) or not L.result_is_current(_cur, CKPT_CODE, 'ppl')):
                     _drop_msg = f'[resume] {key} holds a record that is not current under this code semantics (stale code stamp, missing ppl, or synthesized) — DROPPING it before retraining, so a failed or truncated attempt cannot leave the old reading in place looking like a fresh result'
                     _cur = None
                 if L.result_is_current(_cur, CKPT_CODE, 'ppl'):

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-import os
+import os, sys
+REPO = os.path.dirname(os.path.abspath(__file__))
+os.chdir(REPO)
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
 import pandas as pd
 PARQUET_DIR = '/root/autodl-tmp/wt103_parquet'
 

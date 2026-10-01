@@ -32,7 +32,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 BUDGET = dict(total_yuan=140.0, price_per_hour=2.4, margin=0.93, already_spent_yuan=0.0, state_path='autodl_budget_state.json')
-CODE_SEMANTICS = 'v11.118'
+CODE_SEMANTICS = 'v11.119'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
@@ -94,8 +94,7 @@ def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_coun
         base, cnt, hon = (torch.zeros(1, dtype=torch.long, device=device), 1, {})
     else:
         bids, hon = _segment(n, want_cut_list, min_block, max_block)
-        bids_t = torch.tensor(bids, dtype=torch.long, device=device)
-        base = bids_t - bids_t.min()
+        base = torch.tensor(bids, dtype=torch.long, device=device)
         cnt = int(bids[-1] - bids[0]) + 1
     if not (return_count or return_honoured):
         return base
@@ -348,8 +347,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     counts = torch.bincount(block_ids, minlength=B)
     ends = torch.cumsum(counts, 0)
     starts = ends - counts
-    _cmin_t, max_len_t = torch.aminmax(counts)
-    _cmin, max_len = (int(_cmin_t), int(max_len_t))
+    _cmin, max_len = (int(v) for v in torch.stack(torch.aminmax(counts)).tolist())
     pos = _range_cache(0, max_len, dev)
     _gp = starts[:, None] + pos[None, :]
     g_a = _gp.clamp(max=n - 1)
@@ -363,8 +361,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     ov_len = end_prev - ov_start
     _ov_lo = _ov_hi = None
     if ov_len.numel():
-        _ov_lo_t, _ov_hi_t = torch.aminmax(ov_len)
-        _ov_lo, _ov_hi = (int(_ov_lo_t), int(_ov_hi_t))
+        _ov_lo, _ov_hi = (int(v) for v in torch.stack(torch.aminmax(ov_len)).tolist())
     _W_b = max(_ov_hi if _ov_hi is not None else 0, 0)
     op = _range_cache(0, _W_b, dev)
     g_b = (ov_start[:, None] + op[None, :]).clamp(max=n - 1)
@@ -407,8 +404,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     counts = torch.bincount(block_ids, minlength=B)
     ends = torch.cumsum(counts, 0)
     starts = ends - counts
-    _cmin_t, max_len_t = torch.aminmax(counts)
-    _cmin, max_len = (int(_cmin_t), int(max_len_t))
+    _cmin, max_len = (int(v) for v in torch.stack(torch.aminmax(counts)).tolist())
     pos = _range_cache(0, max_len, dev)
     _gp = starts[:, None] + pos[None, :]
     g = _gp.clamp(max=n - 1)
@@ -552,7 +548,19 @@ class _SinkWiden(torch.autograd.Function):
 def _sink_all_finite(sink_logits):
     if sink_logits is None:
         return True
-    return bool(torch.isfinite(sink_logits).all())
+    try:
+        key = (sink_logits.data_ptr(), sink_logits._version, tuple(sink_logits.shape))
+    except Exception:
+        return bool(torch.isfinite(sink_logits).all())
+    hit = _SINK_FIN_CACHE.get(key)
+    if hit is not None:
+        return hit
+    val = bool(torch.isfinite(sink_logits).all())
+    if len(_SINK_FIN_CACHE) > 256:
+        _SINK_FIN_CACHE.clear()
+    _SINK_FIN_CACHE[key] = val
+    return val
+_SINK_FIN_CACHE = {}
 
 def sink_softmax(logits, sink_logits, dim=-1):
     _diff = torch.is_grad_enabled() and (getattr(logits, 'requires_grad', False) or (sink_logits is not None and getattr(sink_logits, 'requires_grad', False)))

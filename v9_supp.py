@@ -204,8 +204,8 @@ def build_report(out='REPORT_v9.md'):
         v9_state = {'booked_seconds': 0.0, 'runs': 0}
     price = BUDGET_V9['price_per_hour']
     v9_h = v9_state.get('booked_seconds', 0.0) / 3600.0
-    sel_ratio = {'csa_fixed_topk8': '1.6%', 'csa_fixed_topk32': '6.2%', 'csa_fixed_topk128': '25%', 'csa_fixed_topk512': '100%', 'csa_fix_m1': '1.6% (m=1, topk=32)'}
-    _SEL_PCT = {'csa_fixed_topk8': 1.6, 'csa_fixed_topk32': 6.2, 'csa_fixed_topk128': 25.0, 'csa_fixed_topk512': 100.0}
+    sel_ratio = {'csa_fixed_topk8': '1.5625%', 'csa_fixed_topk32': '6.25%', 'csa_fixed_topk128': '25%', 'csa_fixed_topk512': '100%', 'csa_fix_m1': '1.5625% (m=1, topk=32)'}
+    _SEL_PCT = {'csa_fixed_topk8': 1.5625, 'csa_fixed_topk32': 6.25, 'csa_fixed_topk128': 25.0, 'csa_fixed_topk512': 100.0}
     lines = []
     A = lines.append
     A('# CSA / HCA 受控机制研究 — v9 补实验报告（topk 扫描补齐 + RoPE 长跑第三种子）')

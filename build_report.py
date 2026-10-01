@@ -333,16 +333,18 @@ def sec_p0r():
                 _st_mt = _pair_mt[2]
                 _mt_stat = f'配对符号翻转 n={_st_mt['n']}、p={_st_mt['p_exact_signflip']:.3f}（Δ mean={_st_mt['mean']:+.2f}）'
                 _mt_sig = _st_mt['p_exact_signflip'] < 0.05
+                _mt_gap = _st_mt['mean']
             else:
                 _mt_stat = '本面板没有可通过配对门禁的同配置种子对，显著性无法检验'
                 _mt_sig = False
-            if g_abs_m < 0:
+                _mt_gap = g_abs_m
+            if _mt_gap < 0:
                 if _mt_sig:
                     _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍显著为负（{_mt_stat}），**P0-3 的混淆假设被证伪**，反而**强化**了论文的负结果——sparse 在该 budget 下的落后是机制性的。'
                 else:
                     _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）方向为负（{_mt_stat}），**P0-3 的混淆假设被证伪**——sparse 在该 budget 下的落后是机制性的；其显著性按配对检验的实际分辨率表述，不作超出分辨率的显著性主张。'
             else:
-                _p0r_concl = f'**结论**：{_gain_txt}；但参数对齐的 absPE 数字中 `csa_fixed` 落后 `full_matched` **{abs(g_abs_m):.2f}** PPL（{_mt_stat}）——方向与原论断相反，**P0-3 的混淆假设在本轮未被证伪**，PE 错配不能排除在 sparse 的差距之外。'
+                _p0r_concl = f'**结论**：{_gain_txt}；但参数对齐的 absPE 数字中 `csa_fixed` 落后 `full_matched` **{abs(_mt_gap):.2f}** PPL（{_mt_stat}）——方向与原论断相反，**P0-3 的混淆假设在本轮未被证伪**，PE 错配不能排除在 sparse 的差距之外。'
         else:
             _p0r_concl = f'**结论（受限）**：`csa_fixed` 在 absPE 面板{_w_abs}未匹配的 `full`，{_gain_txt}。但**参数对齐的 absPE 臂（`full_matched`）在本面板缺失**，所以「容量差贡献了多少」无法剥离，**P0-3 的证伪在本轮没有证据支持**——本条只作方向性表述，须待 `full_matched` 产出后方可作结论。'
         lines += [_p0r_concl, '']
@@ -428,6 +430,7 @@ def sec_p0w():
         _conc = ['', '**结论**：']
         _parts = []
         _ds = []
+        _ds_sig = []
         for v, w in sorted(grp):
             if v != 'csa_fixed' or w == 0:
                 continue
@@ -456,14 +459,21 @@ def sec_p0w():
                 _verdict = f'n={_st['n']} 时 p={_st['p_exact_signflip']:.4f}，**显著**'
             _parts.append(f'`{v}` warm={w}：{_d:+.2f} PPL vs from-scratch 基线（{_verdict}）')
             _ds.append(_d)
+            _ds_sig.append(bool(_st['p_exact_signflip'] <= 0.05))
         if _parts:
             _conc.append('；'.join(_parts) + '。')
         else:
             _conc.append('（该面板无可配对的可测量记录，无法给出结论。）')
         if _ds and all((x > 0 for x in _ds)):
-            _conc.append('即 dense 预热**不能**拯救 sparse 臂，过度预热反而有害——论文的 from-scratch 对比是保守的，**P0-1 的质疑被证伪**，负结果更稳固。')
+            if any(_ds_sig):
+                _conc.append('即 dense 预热**不能**拯救 sparse 臂，过度预热反而有害——论文的 from-scratch 对比是保守的，**P0-1 的质疑被证伪**，负结果更稳固。')
+            else:
+                _conc.append('各 warm 档方向一致（预热更差），dense 预热在方向上**未能**拯救 sparse 臂，但没有一档达到配对检验的显著性（分辨率见上）——**P0-1 的质疑按方向不成立，按显著性则既不能证伪也不能确认**，须补更多 seeds 后再判。')
         elif _ds and all((x < 0 for x in _ds)):
-            _conc.append('即 dense 预热对 sparse 臂**有**真实帮助——**P0-1 的质疑成立**，from-scratch 对比不利于 sparse，相关负结果须按带 warmup 的设定重审。')
+            if any(_ds_sig):
+                _conc.append('即 dense 预热对 sparse 臂**有**真实帮助——**P0-1 的质疑成立**，from-scratch 对比不利于 sparse，相关负结果须按带 warmup 的设定重审。')
+            else:
+                _conc.append('各 warm 档方向一致（预热更好），dense 预热在方向上对 sparse 臂有帮助，但没有一档达到配对检验的显著性（分辨率见上）——**P0-1 质疑既不能证伪也不能确认**，须补更多 seeds 后再判。')
         elif _ds:
             _conc.append('各 warm 档的方向不一致，P0-1 质疑既不能证伪也不能确认，须补更多 seeds/档位后再判。')
         _conc.append('')
@@ -566,7 +576,7 @@ def sec_p1t():
             mean, std, n = (r.get('ppl_mean'), r.get('ppl_std') or 0.0, r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n', 0))
         _bv = v.split('@')[0].split('#')[0]
         if _bv == 'csa_fix_m1':
-            sr = '1.6% (m=1, topk=32)'
+            sr = '1.5625% (m=1, topk=32)'
         elif _bv.startswith('csa_fixed_topk'):
             _kv = _bv.replace('csa_fixed_topk', '')
             try:
@@ -574,7 +584,7 @@ def sec_p1t():
             except ValueError:
                 print(f'[report] sec_p1t: cannot parse topk from aggregate key {v!r} — row omitted')
                 continue
-            sr = f'{min(k, 512) / 512:.1%}'
+            sr = f'{min(k, 512) / 512 * 100:.5g}%'
         elif _bv == 'csa_fixed':
             sr = '6.25% (default topk=32)'
         else:
@@ -620,7 +630,7 @@ def sec_p1t():
         lines += ['', '**剂量-反应（topk → PPL）**：', '']
         mono = all((rows_k[i][1] >= rows_k[i + 1][1] - 1e-09 for i in range(len(rows_k) - 1)))
         for k, m in rows_k:
-            lines.append(f'- topk={k}（选择率 {k / 512:.1%}）：{m:.2f} PPL')
+            lines.append(f'- topk={k}（选择率 {k / 512 * 100:.5g}%）：{m:.2f} PPL')
         lines.append('')
         if mono:
             lines.append('PPL 随选择率单调下降（选择越多越好），说明在 seq 2048 / 1500 步的受控 budget 下未出现「少选反而优」的甜点——检索质量不足时，选择率是硬上限。')
