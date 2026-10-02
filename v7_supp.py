@@ -838,11 +838,16 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         except Exception as e:
             print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — its panel is EXCLUDED from these statistics')
             continue
+        _legacy_ok = L.legacy_warm_tags(s)
         for k, r in s.items():
             if isinstance(r, dict) and 'seed' in r and (not r.get('synthesized')) and L.ppl_is_usable(r.get('ppl')):
                 tag = f'{od.split('/')[-1]}::{r.get('variant')}'
                 if r.get('warm_steps') is not None:
                     tag += f'::w{r['warm_steps']}'
+                else:
+                    _wt = L.record_tag(r, k, _legacy_ok)
+                    if _wt:
+                        tag += f'::{_wt}'
                 _slot = recs.setdefault(tag, {})
                 _old = _slot.get(r['seed'])
                 if _old is not None:

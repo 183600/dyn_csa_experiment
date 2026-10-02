@@ -363,7 +363,11 @@ def sec_p0w():
         if _w is None:
             _t = _tag_of(r, k, _legacy_ok)
             _w = int(_t[1:]) if _t.startswith('w') and _t[1:].isdigit() else -1
-        rows.append((r.get('variant', '?'), _w, _int_or(r.get('seed'), -1), r.get('ppl'), r.get('ppl_at_switch'), r.get('train_time_s', 0) / 60.0 if r.get('train_time_s') else None, r.get('synthesized', False), k))
+        _sd = _int_or(r.get('seed'), -1)
+        if _sd < 0 and _measurable({'ppl': r.get('ppl'), 'synthesized': r.get('synthesized', False)}):
+            print(f"[report] sec_p0w: record {k!r} carries a non-integer seed — it is skipped, not counted")
+            continue
+        rows.append((r.get('variant', '?'), _w, _sd, r.get('ppl'), r.get('ppl_at_switch'), r.get('train_time_s', 0) / 60.0 if r.get('train_time_s') else None, r.get('synthesized', False), k))
     rows.sort(key=lambda x: (x[0], x[1], x[2]))
     rows = [row for row in rows if _measurable({'ppl': row[3], 'synthesized': row[6]})]
     rows = _prefer_one_cfg(rows, lambda row: ((row[0], row[1]), (s.get(row[-1]) or {}).get('run_cfg')), who='sec_p0w')
@@ -740,7 +744,7 @@ def sec_p1l():
                 cells.append('—')
             else:
                 cells.append(f'~{mean:.1f}' if is_tr else f'{mean:.1f}')
-            if vals:
+            if vals and not is_tr:
                 (base_vals if Ln == lens[0] else last_vals if Ln == lens[-1] else []).append(mean)
         ratio = sum(last_vals) / len(last_vals) / (sum(base_vals) / len(base_vals)) if base_vals and last_vals else None
         per_v[v] = ratio

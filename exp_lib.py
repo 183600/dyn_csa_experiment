@@ -2255,6 +2255,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         t = (step - warmup) / max(steps - warmup, 1)
         return lr * (0.1 + 0.45 * (1.0 + math.cos(math.pi * t)))
     bpe = batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
+    _eval_batch = val_batch[:eval_subset] if val_batch is not None else None
     t0 = time.time()
     losses = []
     _lbuf = []
@@ -2280,7 +2281,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         opt.step()
         _lbuf.append(ce.detach())
         if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
-            sub_ppl = eval_ppl(model, val_batch[:eval_subset], device)
+            sub_ppl = eval_ppl(model, _eval_batch, device)
             ppl_hist.append([step + 1, float(sub_ppl)])
         if log_every and (step % log_every == 0 or step == steps - 1):
             if _lbuf:
@@ -2743,7 +2744,7 @@ def aggregate(summary):
             print(f'[aggregate] {key}: NO `full` baseline in this panel — dPPL_vs_full not computed')
             continue
         if base_tag != tag:
-            print(f'[aggregate] {key}: pairing against the UNTAGGED `full` baseline (no `full` run exists for protocol {tag or '(untagged)'})')
+            print(f'[aggregate] {key}: pairing against the `full#{base_tag or '(untagged)'}` baseline (no `full` run exists for protocol {tag or '(untagged)'})')
         elif tag and any((_t == '' for _t, _i in _full_groups)):
             _base_amb.append(f'{key}: `full#{tag}` and `full` both present')
             continue
@@ -3104,7 +3105,7 @@ def run(cfg=None, seeds=None, guard=None, label=''):
             except Exception as e:
                 import traceback
                 import sys as _sys
-                if key in summary and 'ppl' in (summary.get(key) or {}):
+                if key in summary and ppl_is_usable((summary.get(key) or {}).get('ppl')):
                     print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (the error record holds no `ppl` and must not replace it); the failed attempt is still billed to the guard below.')
                     print(traceback.format_exc(), file=_sys.stderr)
                 else:
