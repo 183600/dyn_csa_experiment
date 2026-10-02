@@ -31,7 +31,7 @@ def _v9_block_forward(self, x):
         _acfg = self.attn.cfg
         if getattr(_acfg, 'dynamic', False) or getattr(_acfg, 'chunking', 'fixed') != 'fixed':
             raise RuntimeError(f'gradient checkpointing under _V9_CKPT is only enabled for fixed-chunking, non-dynamic arms (got chunking={getattr(_acfg, 'chunking', None)!r}, dynamic={getattr(_acfg, 'dynamic', None)!r}); dynamic arms would recompute a different gate state in backward')
-        return _ckpt.checkpoint(_orig_block_forward, self, x, use_reentrant=False, preserve_rng_state=False)
+        return _ckpt.checkpoint(_orig_block_forward, self, x, use_reentrant=False, preserve_rng_state=True)
     return _orig_block_forward(self, x)
 
 def _v9_blockrope_forward(self, x):
@@ -39,7 +39,7 @@ def _v9_blockrope_forward(self, x):
         _acfg = self.attn.cfg
         if getattr(_acfg, 'dynamic', False) or getattr(_acfg, 'chunking', 'fixed') != 'fixed':
             raise RuntimeError(f'gradient checkpointing under _V9_CKPT is only enabled for fixed-chunking, non-dynamic arms (got chunking={getattr(_acfg, 'chunking', None)!r}, dynamic={getattr(_acfg, 'dynamic', None)!r}); dynamic arms would recompute a different gate state in backward')
-        return _ckpt.checkpoint(_orig_blockrope_forward, self, x, use_reentrant=False, preserve_rng_state=False)
+        return _ckpt.checkpoint(_orig_blockrope_forward, self, x, use_reentrant=False, preserve_rng_state=True)
     return _orig_blockrope_forward(self, x)
 
 def _install_ckpt_patch():
@@ -213,7 +213,7 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
     A('> 说明：本报告全部数字由 `v9_supp.py report` 从 `results_*/`、`analysis_v9/` 的落盘产物计算得到，无手填数值。')
     A('')
-    A(f'**预算**：v9 记账 {v9_state.get('runs', 0)} runs，估算花费 ¥{v9_h * price:.2f} / ¥{BUDGET_V9['total_yuan']:.2f}（AutoDL RTX 4090，按 ¥{price:.2f}/h 记账；v7/v8 台账各自独立冻结）。')
+    A(f'**预算**：v9 记账 {v9_state.get('runs', 0)} runs，估算花费 ¥{v9_h * price:.2f} / ¥{BUDGET_V9['total_yuan']:.2f}（云端 GPU 实例，按 ¥{price:.2f}/h 记账；v7/v8 台账各自独立冻结）。')
     A('')
     _r_n = sorted({p['n'] for p in rope.values()}) if rope else []
     _r_n_txt = (str(_r_n[0]) if len(_r_n) == 1 else f'{_r_n[0]}–{_r_n[-1]}') if _r_n else '0'

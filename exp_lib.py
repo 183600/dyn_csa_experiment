@@ -481,6 +481,8 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
         idx_out = torch.cat([idx_out, pad], dim=1)
     return idx_out
 
+_TOPK_CLAMP_WARNED = set()
+
 def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_mask=True, query_chunk=2048, random_select=False, pre_qI=None, pre_w=None, out_valid=None):
     n = H.shape[0]
     B = comp_kv.shape[0]
@@ -495,6 +497,11 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     pos = _arange_cache(n, dev)
     causal = block_readable(pos, last_tok)
     k = min(topk, B)
+    if k < int(topk):
+        _wk = (int(topk), int(B))
+        if _wk not in _TOPK_CLAMP_WARNED:
+            _TOPK_CLAMP_WARNED.add(_wk)
+            print(f'[lightning_indexer] requested topk={int(topk)} but only B={int(B)} blocks are available; effective selection is clamped to all {int(k)} blocks for this call')
     if random_select:
         _ri_key = (str(dev), 'rs_ri', int(n))
         _jc_key = (str(dev), 'rs_jc', int(B))
@@ -856,7 +863,7 @@ class HybridAttention(nn.Module):
         if self.sink is None:
             sdpa_kw = dict(scale=scale)
             if self.cfg.window > 0:
-                sdpa_kw['attn_mask'] = causal_window_mask(T, self.cfg.window, x.device)
+                sdpa_kw['attn_mask'] = causal_window_mask(T, self.cfg.window, x.device).to(q.dtype)
             else:
                 sdpa_kw['is_causal'] = True
             out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
@@ -1659,7 +1666,7 @@ def determinism_label():
     return 'cudnn' if torch.backends.cudnn.deterministic else 'off'
 
 @torch.inference_mode()
-def eval_ppl(model, val_batch, device, chunk=16, eval_rows=None, eval_seed=0):
+def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
     chunk = max(1, int(chunk))
     was_training = model.training
     model.eval()

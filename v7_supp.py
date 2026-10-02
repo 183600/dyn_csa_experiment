@@ -975,7 +975,7 @@ def run_niah_phase(payload, guard=None, label=''):
         except Exception as _e:
             print(f'[resume] FATAL: {spath} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
-    _recipe = f'niah_steps{n_steps}_v{vocab}_bs12_sl512_lr0.0003_mr-csa_dynamic_rope'
+    _recipe = f'niah_steps{n_steps}_v{vocab}_bs12_sl512_lr0.0003_mr-csa_dynamic_rope_reuse4'
     for v in variants:
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')

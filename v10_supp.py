@@ -656,7 +656,7 @@ def build_report(out='REPORT_v10.md'):
     A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
     A('> 说明：本报告全部数字由 `v10_supp.py report` 从 `results_*/`、`analysis_v10/` 的落盘产物计算得到，无手填数值。')
     A('')
-    A(f'**预算**：v10 记账 {v10_state.get('runs', 0)} runs，估算花费 ¥{v10_h * price:.2f} / ¥{BUDGET_V10['total_yuan']:.2f}（AutoDL RTX 4090，按 ¥{price:.2f}/h 记账；v7/v8/v9 台账各自独立冻结）。')
+    A(f'**预算**：v10 记账 {v10_state.get('runs', 0)} runs，估算花费 ¥{v10_h * price:.2f} / ¥{BUDGET_V10['total_yuan']:.2f}（云端 GPU 实例，按 ¥{price:.2f}/h 记账；v7/v8/v9 台账各自独立冻结）。')
     A('')
     A('v10 落实 v9 收官后评审的三项升级：(1) 把唯一正面发现（CSA+RoPE 长度外推 ×1.07 vs dense-RoPE ×1.57）从附带观察升级为机制性主结果——远距干扰注入实验直接检验「稀疏掩码滤除远距噪声」假设；(2) 新增 d=128/4L 与 d=512/10L 两个规模，与既有 d=256/d=384 面板组成 4 点反转交叉点标度读数（预注册交叉判据）；(3) 把 v9 唯一仍处 p=0.500 下限的面板（seq-2048 topk 扫描）从 n=2 补到 n=4。')
     A('')

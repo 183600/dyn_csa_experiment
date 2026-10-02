@@ -313,7 +313,7 @@ def build_report(out='REPORT_v11.md'):
     A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
     A('> 说明：本报告全部数字由 `v11_supp.py report` 从 `results_*/`、`analysis_v11/` 的落盘产物计算得到，无手填数值。')
     A('')
-    A(f'**预算**：v11 记账 {v11_state.get('runs', 0)} runs，估算花费 ¥{v11_h * price:.2f} / ¥{BUDGET_V11['total_yuan']:.2f}（AutoDL RTX 4090，按 ¥{price:.2f}/h 记账；v7–v10 台账各自独立冻结）。')
+    A(f'**预算**：v11 记账 {v11_state.get('runs', 0)} runs，估算花费 ¥{v11_h * price:.2f} / ¥{BUDGET_V11['total_yuan']:.2f}（云端 GPU 实例，按 ¥{price:.2f}/h 记账；v7–v10 台账各自独立冻结）。')
     A('')
     if probe_ok:
         _probe_note = f'最弱对比停在 n={n_tree_min}、下限 {floor_p_tree:.3f}，跨不过 0.05，因此凡引用它的结论不作显著性主张' if floor_p_tree >= 0.05 else f'最弱对比也达 n={n_tree_min}、下限 {floor_p_tree:.3f}，已跨过 0.05'
