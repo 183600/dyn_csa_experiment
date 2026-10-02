@@ -153,6 +153,7 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     interp = lo_v * (1.0 - frac) + hi_v * frac
     use_hi = (frac > 0.0) & (lo + 1 <= idx)
     out = torch.where(use_hi, interp, lo_v)
+    out = torch.where(idx == 0, torch.full_like(out, float('-inf')), out)
     return out.to(sim.device)
 
 def blocks_fixed(n, block_size, device):
@@ -685,7 +686,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
             soft_sel = soft[s:e]
             soft_log = torch.log(soft_sel.clamp_min(1e-12))
             soft_log.masked_fill_(soft_sel <= 0, _MINL)
-            soft_blk = blk + soft_log[:, None, :]
+            soft_blk = (blk + soft_log[:, None, :]).clamp_min(_MINL)
             soft_win = win
             blk = None
             soft_logits = torch.cat([soft_blk, soft_win], -1)
@@ -758,7 +759,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         win_logits = torch.einsum('qhd,qmhd->qhm', qseg, kw)
         win_logits.mul_(scale)
         logits = torch.cat([blk_logits, win_logits], -1)
-        soft_logits = torch.cat([logits[:, :, :_nb] + soft_log_g[:, None, :], win_logits], -1)
+        soft_logits = torch.cat([(logits[:, :, :_nb] + soft_log_g[:, None, :]).clamp_min(_MINL), win_logits], -1)
         soft_valid = torch.cat([sel_blk, win_valid], dim=1)
         valid = soft_valid
         soft_logits.masked_fill_(~soft_valid[:, None, :], _MINL)

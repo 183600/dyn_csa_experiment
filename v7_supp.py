@@ -147,8 +147,13 @@ class HybridAttentionRoPE(L.HybridAttention):
             mask = L.causal_window_mask(T, cfg.window, x.device)
         logits.add_(mask)
         if self.sink is not None:
-            lse = torch.logaddexp(self.sink.view(1, self.nh, 1, 1), torch.logsumexp(logits, dim=-1, keepdim=True))
-            attn = torch.exp(logits - lse)
+            sink_view = self.sink.view(1, self.nh, 1, 1)
+            if not L._sink_all_finite(self.sink):
+                logits = torch.cat([sink_view.expand_as(logits[..., :1]), logits], dim=-1)
+                attn = torch.nan_to_num(torch.softmax(logits, -1))[..., 1:]
+            else:
+                lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
+                attn = torch.exp(logits - lse)
         else:
             attn = torch.softmax(logits, -1)
         out = torch.einsum('bhnm,bmhd->bnhd', attn, v)
