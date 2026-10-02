@@ -325,9 +325,9 @@ class HybridAttentionRoPE(L.HybridAttention):
         _Ca_int = F.normalize(_Ca_int, dim=-1)
         k, v = self._split(self.W_kvhead(_Ca_int))
         k = F.normalize(k, dim=-1)
+        if norm_kv:
+            q = self.q_norm(q)
         if use_rope:
-            if norm_kv:
-                q = self.q_norm(q)
             cos, sin = rope_cos_sin(hd, rd, L._arange_cache(T, x.device), x.device)
             q = apply_rope(q, cos[:, None, :], sin[:, None, :], rd)
             k = apply_rope(k, cos[:, None, :], sin[:, None, :], rd)
