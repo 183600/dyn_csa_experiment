@@ -185,14 +185,13 @@ class HybridAttentionRoPE(L.HybridAttention):
                 with torch.no_grad():
                     bid, nblk, _hon_d = L.blocks_from_cuts(T, gl, cfg.min_block, cfg.max_block, x.device, return_count=True, return_honoured=True)
                 if self.need_reg:
-                    hard = hard_b.to(gate.dtype)
                     _keep = [0.0] * len(gl)
                     for _slot in _hon_d:
                         if 0 <= _slot < len(_keep):
                             _keep[_slot] = 1.0
                     _hon = torch.tensor(_keep, dtype=gate.dtype, device=gate.device)
                     _soft_hon = gate * _hon
-                    gate_mean = ((hard * _hon).sum() + _soft_hon.sum() - _soft_hon.detach().sum()) / T
+                    gate_mean = (float(nblk - 1) + _soft_hon.sum() - _soft_hon.detach().sum()) / T
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
             sim = L.cosine_similarity_consecutive(x)
             tau = L.causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
@@ -325,17 +324,25 @@ class HybridAttentionRoPE(L.HybridAttention):
             cos, sin = rope_cos_sin(hd, rd, L._arange_cache(T, x.device), x.device)
             q = apply_rope(q, cos[:, None, :], sin[:, None, :], rd)
             k = apply_rope(k, cos[:, None, :], sin[:, None, :], rd)
-        logits = torch.einsum('bthd,bshd->bths', q, k) * scale
         sink = self.sink if self.cfg.use_sink and self.sink is not None else None
-        logits.add_(mask[:, None, :])
-        zflat = logits.reshape(B * T, nh, T)
-        if sink is None:
-            attn = L.sink_softmax(zflat, sink)
-        else:
-            attn, _sink_unused = L._sink_split_softmax(zflat, sink, want_sink=False)
-        attn = attn.view(B, T, nh, T)
-        o = torch.einsum('bths,bshd->bthd', attn, v)
-        return self.W_o(o.reshape(B, T, nh * hd))
+        out = torch.empty(B, T, nh, hd, device=x.device, dtype=q.dtype)
+        row_chunk = max(1, min(T, 1024))
+        _budget = L._attn_transient_budget(x.device)
+        if _budget is not None:
+            _per_row = max(1, 3 * B * nh * T) * q.element_size()
+            row_chunk = max(1, min(row_chunk, int(_budget) // _per_row))
+        for s in range(0, T, row_chunk):
+            e = min(s + row_chunk, T)
+            logits = torch.einsum('bthd,bshd->bths', q[:, s:e], k)
+            logits.mul_(scale)
+            logits.add_(mask[s:e][:, None, :])
+            zflat = logits.reshape(B * (e - s), nh, T)
+            if sink is None:
+                attn = L.sink_softmax(zflat, sink)
+            else:
+                attn, _sink_unused = L._sink_split_softmax(zflat, sink, want_sink=False)
+            out[:, s:e] = torch.einsum('bths,bshd->bthd', attn.view(B, e - s, nh, T), v)
+        return self.W_o(out.reshape(B, T, nh * hd))
 
     def forward(self, x):
         if getattr(self, '_dense_warmup', False) and self.cfg.kind in ('csa', 'hca'):
@@ -769,7 +776,7 @@ def flops_analysis(outdir='analysis_v7', seq_lens=None):
         B = max(n // m, 1)
         Bh = max(n // mph, 1)
         dense = 2 * (2 * H * Dh * n)
-        idx = 2 * nIH * cI * B + 2 * nIH * B
+        idx = 2 * cI * B + 2 * nIH * B
         core = 2 * (2 * H * Dh * min(k, B) + 2 * H * Dh * min(w, n))
         csa = idx + core
         hca = 2 * (2 * H * Dh * min(Bh, n) + 2 * H * Dh * min(w, n))
