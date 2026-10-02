@@ -863,6 +863,10 @@ class HybridAttention(nn.Module):
         sink_view = self.sink.view(1, self.nh, 1, 1) if self.sink is not None else None
         out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
         row_chunk = max(1, min(T, 1024))
+        _budget = _attn_transient_budget(x.device)
+        if _budget is not None:
+            _per_row = max(1, 3 * B * self.nh * T) * q.element_size()
+            row_chunk = max(1, min(row_chunk, int(_budget) // _per_row))
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
             logits = torch.einsum('bnhd,bmhd->bhnm', q[:, s:e], k)
@@ -1671,7 +1675,7 @@ def eval_ppl(model, val_batch, device, chunk=16, eval_rows=None, eval_seed=0):
             if _k < _flat:
                 _g = torch.Generator().manual_seed(int(eval_seed))
                 _sel = torch.randperm(_flat, generator=_g)[:_k]
-                _sel_sorted = torch.sort(_sel).values
+                _sel_sorted = torch.sort(_sel).values.to(device)
                 print(f'[eval_ppl] scoring a uniform sample of {_k}/{_flat} target rows (eval_rows={int(eval_rows)}, eval_seed={int(eval_seed)}) — this is a SAMPLED estimate, not the full-set PPL')
             else:
                 print(f'[eval_ppl] eval_rows={int(eval_rows)} covers the whole {_flat}-row target space; scoring the FULL set (this is the population statistic, not a sample)')
@@ -1706,7 +1710,6 @@ def eval_ppl(model, val_batch, device, chunk=16, eval_rows=None, eval_seed=0):
                 if _local.numel() == 0:
                     del ids, logits
                     continue
-                _local = _local.to(logits.device)
                 _ri = torch.div(_local, _span, rounding_mode='floor')
                 _ci = _local - _ri * _span
                 _rows = logits[_ri, _ci, :]

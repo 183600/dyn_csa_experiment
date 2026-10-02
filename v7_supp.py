@@ -317,8 +317,6 @@ class HybridAttentionRoPE(L.HybridAttention):
         norm_kv = getattr(self.cfg, 'qk_norm', False)
         _Ca_int = self.kv_norm(Ca) if norm_kv else Ca
         _Ca_int = F.normalize(_Ca_int, dim=-1)
-        if self.cfg.content_mode == 'zero':
-            _Ca_int = torch.zeros_like(_Ca_int)
         k, v = self._split(self.W_kvhead(_Ca_int))
         k = F.normalize(k, dim=-1)
         if use_rope:

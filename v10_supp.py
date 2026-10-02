@@ -540,7 +540,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
         for (v, arm, Ln, rho, _pp, _cd, _recipe), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
             assert means, (v, arm, Ln, rho)
-            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
+            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
         contrasts = {}
 
         def cell_mean(v, arm, Ln, rho):
@@ -558,6 +558,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         continue
                     if _fp_norm(learned.get('probe_params')) != _fp_norm(other.get('probe_params')):
                         print(f'[v10 stats] L{Ln} r{rho} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
+                        continue
+                    if learned.get('_code') != other.get('_code') or learned.get('recipe') != other.get('recipe'):
+                        print(f"[v10 stats] L{Ln} r{rho} {tag}: the two arms carry DIFFERENT code/recipe stamps (learned {learned.get('_code')}/{learned.get('recipe')} vs {other.get('_code')}/{other.get('recipe')}) — pairing them would mix two measurement semantics, so the contrast is omitted; re-run the stale arm's phase to refresh it")
                         continue
                     common = sorted(set(learned['ppl_by_seed']) & set(other['ppl_by_seed']))
                     if len(common) >= 2:

@@ -338,13 +338,13 @@ def sec_p0r():
                 _mt_stat = '本面板没有可通过配对门禁的同配置种子对，显著性无法检验'
                 _mt_sig = False
                 _mt_gap = g_abs_m
-            if _mt_gap < 0:
+            if _mt_gap > 0:
                 if _mt_sig:
-                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍显著为负（{_mt_stat}），**P0-3 的混淆假设被证伪**，反而**强化**了论文的负结果——sparse 在该 budget 下的落后是机制性的。'
+                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍显著落后（{_mt_stat}），**P0-3 的混淆假设被证伪**，反而**强化**了论文的负结果——sparse 在该 budget 下的落后是机制性的。'
                 else:
-                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）方向为负（{_mt_stat}），**P0-3 的混淆假设被证伪**——sparse 在该 budget 下的落后是机制性的；其显著性按配对检验的实际分辨率表述，不作超出分辨率的显著性主张。'
+                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）方向仍为落后（{_mt_stat}），**P0-3 的混淆假设被证伪**——sparse 在该 budget 下的落后是机制性的；其显著性按配对检验的实际分辨率表述，不作超出分辨率的显著性主张。'
             else:
-                _p0r_concl = f'**结论**：{_gain_txt}；但参数对齐的 absPE 数字中 `csa_fixed` 落后 `full_matched` **{abs(_mt_gap):.2f}** PPL（{_mt_stat}）——方向与原论断相反，**P0-3 的混淆假设在本轮未被证伪**，PE 错配不能排除在 sparse 的差距之外。'
+                _p0r_concl = f'**结论**：{_gain_txt}；但参数对齐的 absPE 数字中 `csa_fixed` 不再落后 `full_matched`（Δ={_mt_gap:+.2f} PPL，{_mt_stat}）——与原论断方向相反，**P0-3 的混淆假设在本轮未被证伪**，PE 错配不能排除在 sparse 的差距之外。'
         else:
             _p0r_concl = f'**结论（受限）**：`csa_fixed` 在 absPE 面板{_w_abs}未匹配的 `full`，{_gain_txt}。但**参数对齐的 absPE 臂（`full_matched`）在本面板缺失**，所以「容量差贡献了多少」无法剥离，**P0-3 的证伪在本轮没有证据支持**——本条只作方向性表述，须待 `full_matched` 产出后方可作结论。'
         lines += [_p0r_concl, '']

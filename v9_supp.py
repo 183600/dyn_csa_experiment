@@ -242,7 +242,7 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     if seq2k_old:
         _old_ok = {v: p for v, p in seq2k_old.items() if p.get('mean') is not None}
         if _old_ok:
-            A('历史对照（v7，bs=3，仅 3 个完成点）：' + '；'.join((f'`{v}` {p['mean']:.2f}' for v, p in _old_ok.items())) + '。bs 不同不直接比较，仅作 sanity check。')
+            A(f'历史对照（v7，bs=3，{len(_old_ok)} 个完成点）：' + '；'.join((f'`{v}` {p['mean']:.2f}' for v, p in _old_ok.items())) + '。bs 不同不直接比较，仅作 sanity check。')
         A('')
     done = [v for v in ['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1'] if v in seq2k and seq2k[v].get('mean') is not None]
     if len(done) >= 3:
@@ -323,15 +323,17 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
         _ns = [len(x) for x in _sd.values()]
         return (min(_ns), max(_ns)) if _ns else None
 
-    def _seed_txt(_outdir, _fallback):
+    def _seed_txt(_outdir):
         _n = _n_seeds_of(_outdir)
         if _n is None:
-            return _fallback
+            return None
         return f'{_n[0]} seeds' if _n[0] == _n[1] else f'{_n[0]}–{_n[1]} seeds'
+    _s2k_seeds = _seed_txt('results_lm_v9_seq2k')
+    _r20_seeds = _seed_txt('results_lm_v8_rope20k')
     A('| 路径 | 内容 |')
     A('|---|---|')
-    A(f'| `results_lm_v9_seq2k/` | P2T 完整 topk 扫描（bs=1，5 变体 × {_seed_txt('results_lm_v9_seq2k', '2 seeds')}） |')
-    A(f'| `results_lm_v8_rope20k/` | P2S3 追加 seed 2 后的 {_seed_txt('results_lm_v8_rope20k', '3-seed')} RoPE 20k 面板 |')
+    A(f"| `results_lm_v9_seq2k/` | P2T 完整 topk 扫描（bs=1，5 变体{f' × {_s2k_seeds}' if _s2k_seeds else ''}） |")
+    A(f'| `results_lm_v8_rope20k/` | P2S3 追加 seed 2 后的 {_r20_seeds + ' ' if _r20_seeds else ''}RoPE 20k 面板 |')
     A('| `analysis_v9/stats.json` | 上述面板的配对符号翻转检验 |')
     A('| `autodl_budget_state_v9.json` | v9 CostGuard 台账 |')
     A('| `v9_supp.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
