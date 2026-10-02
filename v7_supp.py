@@ -396,7 +396,7 @@ class BlockRoPE(nn.Module):
         x = x + self.mlp(self.n2(x))
         return x
 
-class SmallGPTRoPE(L.SmallGPT):
+class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
 
     def __init__(self, vocab, d, n_layers, n_heads, d_head, max_seq, layer_cfgs, mlp_ratio=4):
         super().__init__(vocab, d, n_layers, n_heads, d_head, max_seq, layer_cfgs, mlp_ratio)
@@ -465,8 +465,10 @@ def install_patches():
         L.SmallGPT = L.__dict__['_v7_smallgpt_factory']
         L.HybridAttention.forward = L.__dict__['_v7_forward_warmup_aware']
         return
-    L.__dict__['_orig_make_layer_cfgs'] = L.make_layer_cfgs
-    _orig_smallgpt = L.SmallGPT
+    if '_orig_make_layer_cfgs' not in L.__dict__:
+        L.__dict__['_orig_make_layer_cfgs'] = L.make_layer_cfgs
+    _orig_smallgpt = L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)
+    L.__dict__['_v7_orig_smallgpt'] = _orig_smallgpt
 
     def smallgpt_factory(vocab, d, n_layers, n_heads, d_head, max_seq, layer_cfgs, mlp_ratio=4):
         if any((getattr(c, 'rope', False) for c in layer_cfgs)):
@@ -522,11 +524,12 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     _lbuf = []
     _tail = []
     model.train()
+    x = y = logits = ce = loss = None
     for step in range(steps):
         if deadline_ts is not None and time.time() > deadline_ts:
             wall = time.time() - t0
             print(f'[{variant} seed={seed} warm={warm_steps}] BUDGET deadline reached after {step} steps ({wall / 60:.1f} min) — stopping; this cell produced NO measurement and will be retried.')
-            del model, opt, bpe, decay, ndecay, dpar
+            del model, opt, bpe, decay, ndecay, dpar, x, y, logits, ce, loss
             gc.collect()
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -562,11 +565,12 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     wall = time.time() - t0
     if deadline_ts is not None and time.time() > deadline_ts:
         print(f'[{variant} seed={seed} warm={warm_steps}] BUDGET deadline reached before the final evaluation ({wall / 60:.1f} min) — truncating; this cell produced NO measurement and will be retried.')
-        del model, opt, bpe, decay, ndecay, dpar
+        del model, opt, bpe, decay, ndecay, dpar, x, y, logits, ce, loss
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         return {'budget_truncated': True, 'steps_done': steps, 'train_time_s': wall}
+    del x, y, logits, ce, loss
     ppl = L.eval_ppl(model, val_batch, device)
     stats = L.compression_report(model, val_batch, device, val_bnd=val_bnd)
     print(f'[{variant} seed={seed} warm={warm_steps}] val PPL = {ppl:.3f}  ({wall / 60:.1f} min)')
