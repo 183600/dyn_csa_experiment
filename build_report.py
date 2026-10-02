@@ -194,6 +194,9 @@ def unmatched_tag(a, b, tol=PARAM_MATCH_TOL, small=PARAM_MATCH_SMALL):
     return f' (⚠ 参数不匹配 {100 * g:.1f}%)'
 
 def per_seed_ppls(outdir):
+    _ck = ('psp', outdir)
+    if _ck in _LOADED:
+        return _LOADED[_ck]
     s = summary(outdir)
     _legacy_ok = _legacy_warm_tags(s)
     out = collections.defaultdict(dict)
@@ -213,9 +216,14 @@ def per_seed_ppls(outdir):
                 print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
                 continue
             _slot[_tk] = float(r['ppl'])
-    return dict(out)
+    out = dict(out)
+    _LOADED[_ck] = out
+    return out
 
 def per_seed_records(outdir):
+    _ck = ('psr', outdir)
+    if _ck in _LOADED:
+        return _LOADED[_ck]
     s = summary(outdir)
     _legacy_ok = _legacy_warm_tags(s)
     out = collections.defaultdict(dict)
@@ -235,7 +243,9 @@ def per_seed_records(outdir):
                 print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
                 continue
             _slot[_tk] = r
-    return dict(out)
+    out = dict(out)
+    _LOADED[_ck] = out
+    return out
 
 def _pair_reason(ra, rb):
     fa, fb = (ra.get('run_cfg'), rb.get('run_cfg'))

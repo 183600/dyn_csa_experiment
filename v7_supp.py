@@ -511,6 +511,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     t0 = time.time()
     losses, ppl_hist, switch_ppl = ([], [], None)
     _lbuf = []
+    _tail = []
     model.train()
     for step in range(steps):
         if deadline_ts is not None and time.time() > deadline_ts:
@@ -538,6 +539,9 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         _lbuf.append(ce.detach())
+        _tail.append(ce.detach())
+        if len(_tail) > 50:
+            del _tail[:-50]
         if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
             ppl_hist.append([step + 1, float(L.eval_ppl(model, val_batch[:eval_subset], device))])
         if log_every and (step % log_every == 0 or step == steps - 1):
@@ -560,7 +564,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(np.mean(losses[-50:])), 'ppl_history': ppl_hist, 'delta_trace': {}}
+    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(_tail[-50:]).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': {}}
     del model, opt, bpe, decay, ndecay, dpar
     gc.collect()
     if device.type == 'cuda':

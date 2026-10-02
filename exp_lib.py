@@ -1,5 +1,10 @@
 import os
 os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+_cpu_thr = os.environ.get('CSA_CPU_THREADS', '').strip() or '1'
+os.environ.setdefault('OMP_NUM_THREADS', _cpu_thr)
+os.environ.setdefault('MKL_NUM_THREADS', _cpu_thr)
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+del _cpu_thr
 import sys, subprocess
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
@@ -942,14 +947,13 @@ class HybridAttention(nn.Module):
                     gate_list = (gate.detach() > _HALF).cpu().tolist()
                 bid, nblk, _honoured = blocks_from_cuts(T, gate_list, cfg.min_block, cfg.max_block, x.device, return_count=True, return_honoured=True)
             if gate.numel() and self.need_reg:
-                hard = gate_bool.to(gate.dtype)
                 _keep = [0.0] * len(gate_list)
                 for _slot in _honoured:
                     if 0 <= _slot < len(_keep):
                         _keep[_slot] = 1.0
                 _hon = torch.tensor(_keep, dtype=gate.dtype, device=gate.device)
                 _soft_honoured = gate * _hon
-                gate_mean = ((hard * _hon).sum() + _soft_honoured.sum() - _soft_honoured.detach().sum()) / T
+                gate_mean = (float(nblk - 1) + _soft_honoured.sum() - _soft_honoured.detach().sum()) / T
             else:
                 gate_mean = torch.zeros((), device=x.device) if self.need_reg else None
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
@@ -1524,9 +1528,10 @@ def ppl_by_seed(outdir, full=False):
     for (_v, _t, _s), (_k, r) in _by_id.items():
         _slot = out.setdefault(_v, {})
         if _s not in _slot:
-            _slot[_s] = r if full else r['ppl']
-        if full:
-            r.setdefault('protocol_tag', _t)
+            if full:
+                _slot[_s] = r if 'protocol_tag' in r else {**r, 'protocol_tag': _t}
+            else:
+                _slot[_s] = r['ppl']
     return out
 
 def _record_identity(rec, key, legacy_ok):
@@ -1617,7 +1622,7 @@ def _pin_cpu_threads():
         except ValueError:
             print(f'[determinism] CSA_CPU_THREADS={want!r} is not an integer — using 1')
             n = 1
-        os.environ['OMP_NUM_THREADS'] = str(n)
+        os.environ.setdefault('OMP_NUM_THREADS', str(n))
         os.environ.setdefault('MKL_NUM_THREADS', str(n))
         _CPU_THREADS_PINNED = n
     else:
@@ -2259,6 +2264,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     t0 = time.time()
     losses = []
     _lbuf = []
+    _tail = []
     ppl_hist = []
     delta_trace = {}
     model.train()
@@ -2280,6 +2286,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         _lbuf.append(ce.detach())
+        _tail.append(ce.detach())
+        if len(_tail) > 50:
+            del _tail[:-50]
         if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
             sub_ppl = eval_ppl(model, _eval_batch, device)
             ppl_hist.append([step + 1, float(sub_ppl)])
@@ -2318,7 +2327,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(np.mean(losses[-50:])), 'ppl_history': ppl_hist, 'delta_trace': delta_trace}
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(_tail[-50:]).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace}
     if return_model:
         result['_model'] = model
     else:
@@ -3145,7 +3154,7 @@ def _dump_aggregate(outdir, summary):
         agg = aggregate(summary)
     except Exception as e:
         print(f'[aggregate] aggregate({outdir}) failed: {type(e).__name__}: {e}')
-        print('[aggregate] retrying with the unusable records (no measured `ppl`, `synthesized`, an ambiguous same-seed duplicate, or a record missing a key `aggregate` indexes unconditionally) removed — the untouched records keep their exact values')
+        print('[aggregate] retrying with the unusable records (no measured `ppl`, `synthesized`, or an ambiguous same-seed duplicate) removed — the untouched records keep their exact values')
         _REQUIRED = ()
         clean = {k: r for k, r in summary.items() if isinstance(r, dict) and r.get('seed') is not None and ppl_is_usable(r.get('ppl')) and (not r.get('synthesized')) and all((r.get(f) is not None for f in _REQUIRED))}
         _legacy_ok = legacy_warm_tags(clean)
