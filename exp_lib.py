@@ -60,7 +60,6 @@ def _segment(n, want_cut_list, min_block, max_block):
     hit = _SEGMENT_CACHE.get(key)
     if hit is not None:
         return hit
-    n_cuts = len(want_cut_list)
     honoured = {}
     bids = [0] * n
     cur, cur_len = (0, 1)
