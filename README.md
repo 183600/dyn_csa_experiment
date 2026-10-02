@@ -151,7 +151,7 @@ python v7_supp.py phase P1T   # seq-2048 topk sweep
 python build_report.py        # regenerate REPORT_v7.md from artifacts (zero GPU)
 ```
 
-The CostGuard (`exp_lib.py`, SECTION 8.5) books GPU time to
+The CostGuard (`exp_lib.py`, class `CostGuard`) books GPU time to
 `autodl_budget_state.json`, refuses to start runs that would pass
 `BUDGET["total_yuan"] × margin`, and hard-truncates a run at the absolute cap.
 Edit `BUDGET["price_per_hour"]` to match the rented GPU. When all phases

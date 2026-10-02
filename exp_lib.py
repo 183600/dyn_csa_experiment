@@ -172,7 +172,14 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     return out.to(sim.device)
 
 def blocks_fixed(n, block_size, device):
-    return torch.arange(n, device=device) // block_size
+    key = (str(device), 'blkfix', int(n), int(block_size))
+    hit = _IDX_CACHE.get(key)
+    if hit is not None:
+        return hit
+    with torch.inference_mode(False):
+        out = torch.arange(n, device=device) // int(block_size)
+    _cache_put(_IDX_CACHE, key, out, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
+    return out
 _MASK_CACHE = {}
 _CAUSAL_DONOR = -1
 _CAUSAL_TRI = None
