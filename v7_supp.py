@@ -752,6 +752,14 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
             return {'acc': 0.0, 'n': 0, 'by_dist': {}}
         d = dist[m]
         c = correct[m]
+        if getattr(model, 'use_abs_pe', True) and seq_len > max_pos:
+            _cut = seq_len - span
+            _cols = np.nonzero(m)[1]
+            _in_ctx = (_cols - d) >= _cut
+            d = d[_in_ctx]
+            c = c[_in_ctx]
+            if d.size == 0:
+                return {'acc': 0.0, 'n': 0, 'by_dist': {}}
         buckets = [(0, 128), (128, 512), (512, 2048), (2048, 8192), (8192, 10 ** 9)]
         by = {}
         for lo, hi in buckets:
@@ -759,7 +767,7 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
             if sel.sum():
                 by[f'{lo}-{(hi if hi < 10 ** 9 else 'inf')}'] = {'acc': float(c[sel].mean()), 'n': int(sel.sum())}
         _trunc = bool(getattr(model, 'use_abs_pe', True) and seq_len > max_pos)
-        return {'acc': float(c.mean()), 'n': int(m.sum()), 'by_dist': by, 'eval_span': int(span), 'train_pos': int(max_pos), 'truncated': _trunc, 'mid_pos': int(seq_len - span) if _trunc else 0}
+        return {'acc': float(c.mean()), 'n': int(c.size), 'by_dist': by, 'eval_span': int(span), 'train_pos': int(max_pos), 'truncated': _trunc, 'mid_pos': int(seq_len - span) if _trunc else 0}
     finally:
         model.train(was)
 
@@ -876,11 +884,18 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                 _slot = recs.setdefault(tag, {})
                 _old = _slot.get(r['seed'])
                 if _old is not None:
-                    if r.get('_code') == CKPT_CODE and _old.get('_code') != CKPT_CODE:
+                    if _old.get('_dup'):
+                        continue
+                    _new_cur = r.get('_code') == CKPT_CODE
+                    _old_cur = _old.get('_code') == CKPT_CODE
+                    if _new_cur and not _old_cur:
                         print(f'[stats] WARNING: {tag} seed {r['seed']} holds TWO measurable records — the PPL is ambiguous; the one stamped with the current code semantics is kept and the duplicate is dropped')
                         _slot[r['seed']] = r
-                    else:
-                        print(f'[stats] WARNING: {tag} seed {r['seed']} holds TWO measurable records — the PPL is ambiguous; the first one is kept and the duplicate is dropped')
+                    elif _new_cur == _old_cur:
+                        print(f'[stats] WARNING: {tag} seed {r['seed']} holds TWO measurable records with identical stamp status — the seed is EXCLUDED from every comparison rather than quoting an arbitrarily picked PPL')
+                        _dup = dict(_old)
+                        _dup['_dup'] = True
+                        _slot[r['seed']] = _dup
                     continue
                 _slot[r['seed']] = r
     pairs = [('warmup w=5000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w5000', 'results_lm_v7_warmup::csa_fixed::w0'), ('warmup w=10000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w10000', 'results_lm_v7_warmup::csa_fixed::w0'), ('CSA+RoPE vs CSA absPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::csa_fixed'), ('CSA+RoPE vs dense+RoPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::full_rope'), ('hybrid+RoPE vs dense+RoPE', 'results_lm_v7_rope::hybrid_fixed_rope', 'results_lm_v7_rope::full_rope')]
