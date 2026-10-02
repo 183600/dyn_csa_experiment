@@ -47,7 +47,8 @@ def rope_inv_freq(half, device, base=10000.0):
     key = (float(base), int(half), str(device))
     inv = _ROPE_INV_CACHE.get(key)
     if inv is None:
-        inv = base ** (-torch.arange(0, half, device=device, dtype=torch.float64) / half)
+        with torch.inference_mode(False):
+            inv = base ** (-torch.arange(0, half, device=device, dtype=torch.float64) / half)
         _ROPE_INV_CACHE[key] = inv
     return inv
 
@@ -62,8 +63,9 @@ def rope_cos_sin(head_dim, rope_dim, positions, device, base=10000.0):
             return hit
     half = rope_dim // 2
     inv = rope_inv_freq(half, device, base)
-    ang = positions.to(device).double()[:, None] * inv[None, :]
-    out = (torch.cos(ang).to(torch.float32), torch.sin(ang).to(torch.float32))
+    with torch.inference_mode(False):
+        ang = positions.to(device).double()[:, None] * inv[None, :]
+        out = (torch.cos(ang).to(torch.float32), torch.sin(ang).to(torch.float32))
     if cacheable and len(_ROPE_CS_CACHE) < 64:
         _ROPE_CS_CACHE[key] = out
     return out

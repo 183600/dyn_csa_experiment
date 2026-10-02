@@ -55,7 +55,7 @@ pip install datasets tokenizers matplotlib
 # point `WT103_RAW_TXT` at a directory holding `wiki.train.raw` /
 # `wiki.valid.raw` (the search also tries `./wt103_raw` next to the repo and
 # `/root/wt103_raw`).  Only those two files are read, and tokenising them
-# reproduces the committed `wt103_cache/*.npy` token-for-token, so the
+# reproduces the `wt103_cache/*.npy` cache token-for-token, so the
 # fallback is a pure availability path and never changes a measurement.
 # When `wt103_cache/` is already populated the corpus is served from the cache
 # and no dump or network access is needed at all.
