@@ -52,7 +52,14 @@ def cosine_similarity_consecutive(H, eps=1e-08):
     h = F.normalize(H, dim=-1, eps=eps)
     return (h[1:] * h[:-1]).sum(dim=-1)
 
+_SEGMENT_CACHE = {}
+_SEGMENT_CACHE_CAP = 4096
+
 def _segment(n, want_cut_list, min_block, max_block):
+    key = (n, min_block, max_block, bytes(bytearray((1 if _c else 0 for _c in want_cut_list))))
+    hit = _SEGMENT_CACHE.get(key)
+    if hit is not None:
+        return hit
     n_cuts = len(want_cut_list)
     honoured = {}
     bids = [0] * n
@@ -62,7 +69,7 @@ def _segment(n, want_cut_list, min_block, max_block):
     for t in range(1, n):
         cur_len += 1
         ci = t - 1
-        if 0 <= ci < n_cuts and want_cut_list[ci]:
+        if want_cut_list[ci]:
             pending_cut = True
             pending_slot = ci
         may = cur_len > min_block
@@ -70,11 +77,14 @@ def _segment(n, want_cut_list, min_block, max_block):
         if must or (pending_cut and may):
             cur += 1
             cur_len = 1
-            if pending_cut and 0 <= pending_slot < n_cuts:
+            if pending_cut:
                 honoured[pending_slot] = 1.0
             pending_cut = False
             pending_slot = -1
         bids[t] = cur
+    if len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
+        _SEGMENT_CACHE.clear()
+    _SEGMENT_CACHE[key] = (bids, honoured)
     return (bids, honoured)
 
 def _cut_merge_mask(want_cut_list, min_block, max_block, dtype=None, device=None):
@@ -224,6 +234,32 @@ def _arange_cache(n, device):
             a = torch.arange(n, device=device)
         _cache_put(_IDX_CACHE, key, a, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return a
+
+def _window_geometry(n, w, device):
+    key = (str(device), 'wingeo', int(n), int(w))
+    hit = _IDX_CACHE.get(key)
+    if hit is not None:
+        return hit
+    pos = _arange_cache(n, device)
+    rel = _range_cache(0, w, device)
+    with torch.inference_mode(False):
+        win_idx_raw = pos[:, None] - (w - 1) + rel[None, :]
+        pair = (win_idx_raw.clamp(min=0), win_idx_raw >= 0)
+    _cache_put(_IDX_CACHE, key, pair, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
+    return pair
+
+def _both_all_index(n, n_blk, w, device):
+    key = (str(device), 'bta_idx', int(n), int(n_blk), int(w))
+    hit = _IDX_CACHE.get(key)
+    if hit is not None:
+        return hit
+    win_idx, _ = _window_geometry(n, w, device)
+    with torch.inference_mode(False):
+        _win_off = (win_idx + n_blk).to(torch.int32)
+        _blk_rows = _arange_cache(n_blk, device).to(torch.int32).unsqueeze(0)
+        both = torch.cat([_blk_rows.expand(n, n_blk), _win_off], 1)
+    _cache_put(_IDX_CACHE, key, both, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
+    return both
 
 def _range_cache(lo, hi, device):
     if lo == 0:
@@ -612,18 +648,12 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
     n = q.shape[0]
     dev = q.device
     n_blk = k_blk.shape[0]
-    rel = _range_cache(0, w, dev)
     K = torch.cat([k_blk, k_sw], 0)
     V = torch.cat([v_blk, v_sw], 0)
     pos = _arange_cache(n, dev)
     causal_blk = block_readable(pos, last_tok)
-    win_key = pos[:, None] - (w - 1) + rel[None, :]
-    win_valid = win_key >= 0
-    win_idx = win_key.clamp(min=0)
-    wv_all = win_valid
-    _win_off = (win_idx + n_blk).to(torch.int32)
-    _blk_rows = _arange_cache(n_blk, dev).to(torch.int32).unsqueeze(0)
-    _both_all = torch.cat([_blk_rows.expand(n, n_blk), _win_off], 1)
+    win_idx, wv_all = _window_geometry(n, w, dev)
+    _both_all = _both_all_index(n, n_blk, w, dev)
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
     _heads = q.shape[1] if q.dim() == 3 else 1
@@ -681,15 +711,12 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         q_chunk = min(q_chunk, _max_rows)
     q_chunk = max(1, min(int(q_chunk), n))
     out = torch.empty_like(q)
-    rel = _range_cache(0, w, dev)
     pos_all = _arange_cache(n, dev)
     n_blk = k_blk.shape[0]
     k_stack = torch.cat([k_blk, k_sw], 0)
     v_stack = torch.cat([v_blk, v_sw], 0)
-    win_idx_raw = pos_all[:, None] - (w - 1) + rel[None, :]
-    win_idx = win_idx_raw.clamp(min=0)
+    win_idx, win_valid_all = _window_geometry(n, w, dev)
     _both_idx_all = torch.cat([topk_idx.to(torch.int32), (win_idx + n_blk).to(torch.int32)], dim=1)
-    win_valid_all = win_idx_raw >= 0
     _MINL = torch.finfo(k_blk.dtype).min
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
@@ -873,6 +900,7 @@ class HybridAttention(nn.Module):
         else:
             mask = causal_mask(T, x.device)
         sink_view = self.sink.view(1, self.nh, 1, 1) if self.sink is not None else None
+        _sink_ok = _sink_all_finite(self.sink) if self.sink is not None else True
         out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
         row_chunk = max(1, min(T, 1024))
         _budget = _attn_transient_budget(x.device)
@@ -885,8 +913,12 @@ class HybridAttention(nn.Module):
             logits.mul_(scale)
             logits.add_(mask[s:e])
             if sink_view is not None:
-                lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
-                attn = torch.exp(logits - lse)
+                if not _sink_ok:
+                    logits = torch.cat([sink_view.expand_as(logits[..., :1]), logits], dim=-1)
+                    attn = torch.nan_to_num(torch.softmax(logits, -1))[..., 1:]
+                else:
+                    lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
+                    attn = torch.exp(logits - lse)
             else:
                 attn = torch.softmax(logits, -1)
             out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)
@@ -1731,12 +1763,11 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
                 ntok += int(_tgts.numel())
                 del _rows, _tgts
             else:
-                for _r0 in range(0, ids.shape[0], 8):
-                    _rows = logits[_r0:_r0 + 8, :_span, :].reshape(-1, logits.size(-1))
-                    _tgts = ids[_r0:_r0 + 8, 1:].reshape(-1)
-                    nll += F.cross_entropy(_rows, _tgts, reduction='sum').double()
-                    ntok += int(_tgts.numel())
-                    del _rows, _tgts
+                _rows = logits[:, :_span, :].reshape(-1, logits.size(-1))
+                _tgts = ids[:, 1:].reshape(-1)
+                nll += F.cross_entropy(_rows, _tgts, reduction='sum').double()
+                ntok += int(_tgts.numel())
+                del _rows, _tgts
             del ids, logits
     finally:
         for _a, _prev in zip(need_reg_layers, need_reg_prior):

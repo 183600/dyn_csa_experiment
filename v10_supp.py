@@ -390,9 +390,10 @@ def _crossover_step(gap_steps, gap_vals, smooth=1):
         raise ValueError(f'_crossover_step: gap_steps and gap_vals must be the same length ({len(s)} vs {len(g)}) — the returned step indexes the two together, so a silent misalignment would report the crossover at the wrong STEP while looking perfectly well-formed.')
     if smooth > 0 and len(g) > 2 * smooth:
         g = np.array([g[max(0, i - smooth):i + smooth + 1].mean() for i in range(len(g))])
-    for i in range(len(g)):
-        if g[i] > 0 and np.all(g[i:] > 0):
-            return (float(s[i]), True)
+    if len(g):
+        _suf_ok = (np.minimum.accumulate(g[::-1])[::-1] > 0) & (g > 0)
+        if _suf_ok.any():
+            return (float(s[int(np.argmax(_suf_ok))]), True)
     return (float(s[len(g) - 1]) if len(g) else float('nan'), False)
 
 def _tokens_per_step(outdir, fallback=None):
@@ -702,7 +703,7 @@ def build_report(out='REPORT_v10.md'):
                 cells = L.by_len_cells(rows, Ln)
                 ok = [c for c in cells if not c.get('truncated')]
                 if ok:
-                    return (float(np.mean([c['ppl'] for c in ok])), False)
+                    return (float(np.mean([c['ppl'] for c in ok])), len(ok) < len(cells))
                 return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
 
             def _fmt_cell(Ln):

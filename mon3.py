@@ -98,7 +98,7 @@ def main():
         for k, ppl, warm, sw, mins in rows:
             ppl_s = f'{ppl:8.2f}' if isinstance(ppl, (int, float)) and (not isinstance(ppl, bool)) and math.isfinite(ppl) else '     n/a'
             try:
-                warm_s = f'{int(warm):5d}' if warm is not None else '    -'
+                warm_s = f'{int(warm):5d}' if warm is not None and (not isinstance(warm, bool)) and isinstance(warm, (int, float)) else '    -'
             except (TypeError, ValueError):
                 warm_s = '    -'
             sw_s = '      -' if not isinstance(sw, (int, float)) else f'{sw:7.2f}'

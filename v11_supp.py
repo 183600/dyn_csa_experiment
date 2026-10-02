@@ -147,7 +147,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
         _n_cell_max = max((c['n'] for c in probe_cells), default=0)
         _n_pair_max = max((v['n'] for v in contrasts.values()), default=0)
         _n_pair_min = min((v['n'] for v in contrasts.values()), default=0)
-        _n_pair_cells = max([v['n'] * 2 for v in contrasts.values()], default=0)
+        _n_pair_cells = bool(contrasts)
         probe['n_seeds'] = {'cell_max': _n_cell_max, 'contrast_paired_max': _n_pair_max, 'contrast_paired_min': _n_pair_min}
         if _n_pair_cells and _n_pair_min < _n_cell_max:
             lowered = sorted((k for k, v in contrasts.items() if v['n'] < _n_cell_max))
@@ -376,7 +376,7 @@ def build_report(out='REPORT_v11.md'):
                 cells = L.by_len_cells(rows, Ln)
                 ok = [c for c in cells if not c.get('truncated')]
                 if ok:
-                    return (float(np.mean([c['ppl'] for c in ok])), False)
+                    return (float(np.mean([c['ppl'] for c in ok])), len(ok) < len(cells))
                 return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
 
             def _fmt_cell(Ln):

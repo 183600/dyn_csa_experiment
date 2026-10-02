@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys
+import os, sys, json
 REPO = os.path.dirname(os.path.abspath(__file__))
 os.chdir(REPO)
 if REPO not in sys.path:
@@ -47,6 +47,8 @@ def main():
         biggest = caps[-1]
         print(f'\n===== prep cache: seq_len={seq_len} cap={biggest} =====')
         train_ids, val_batch, vocab, _, val_bnd = L.load_wikitext(seq_len, biggest)
+        import hashlib
+        src_fp = hashlib.sha256(np.ascontiguousarray(train_ids[:biggest + seq_len]).tobytes()).hexdigest()[:16] if isinstance(train_ids, np.ndarray) else None
         for cap in caps[:-1]:
             tag = f'v3_sl{seq_len}_cap{cap}_v8192_vs512'
             tr_path = os.path.join('./wt103_cache', f'train_ids_{tag}.npy')
@@ -54,13 +56,22 @@ def main():
             vp_path = os.path.join('./wt103_cache', f'val_bnd_{tag}.npy')
             me_path = os.path.join('./wt103_cache', f'meta_{tag}.json')
             if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
-                print(f'[prep] seq_len={seq_len} cap={cap}: cache already present, skipped')
-                continue
+                stale = False
+                try:
+                    with open(me_path, encoding='utf-8') as _f:
+                        _me = json.load(_f)
+                    stale = src_fp is not None and _me.get('src_fp') != src_fp
+                except Exception:
+                    stale = True
+                if not stale:
+                    print(f'[prep] seq_len={seq_len} cap={cap}: cache already present, skipped')
+                    continue
+                print(f'[prep] seq_len={seq_len} cap={cap}: derived cache predates the current cap={biggest} tokenisation — regenerating')
             for path, arr in ((tr_path, train_ids[:cap + seq_len]), (va_path, val_batch), (vp_path, val_bnd)):
                 _tmp = f'{path}.tmp{os.getpid()}'
                 np.save(_tmp, arr)
                 os.replace(_tmp + '.npy', path)
-            L.atomic_write_json(me_path, {'vocab': vocab}, indent=0)
+            L.atomic_write_json(me_path, {'vocab': vocab, 'src_fp': src_fp}, indent=0)
             print(f'[prep] seq_len={seq_len} cap={cap}: derived from the cap={biggest} tokenisation (same corpus prefix, same vocab)')
     print('\n[prep] ALL CACHES DONE')
 if __name__ == '__main__':

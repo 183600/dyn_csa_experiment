@@ -54,6 +54,7 @@ def sample_std(vals):
     return (sum(((v - mu) ** 2 for v in vals)) / (n - 1)) ** 0.5
 
 def exact_signflip(deltas):
+    deltas = [float(d) for d in deltas if isinstance(d, (int, float)) and (not isinstance(d, bool)) and math.isfinite(d)]
     n = len(deltas)
     if n == 0:
         return None
@@ -659,12 +660,12 @@ def sec_p1t():
         if not r:
             return None
         ppls = _finite_ppls(r)
-        return sum(ppls) / len(ppls) if ppls else r.get('ppl_mean')
+        return sum(ppls) / len(ppls) if ppls else _finite_or_none(r.get('ppl_mean'))
     m1m, t8m, t32m = (_mean(m1), _mean(t8), _mean(t32))
 
     lines += ['', '**结论（基于已完成的扫描点）**：', '']
-    _m1_ok = isinstance(m1m, (int, float))
-    _t_ok = isinstance(t8m, (int, float)) and isinstance(t32m, (int, float))
+    _m1_ok = m1m is not None
+    _t_ok = t8m is not None and t32m is not None
     if _m1_ok and _t_ok:
         _recs3 = per_seed_records('results_lm_v7_seq2k')
         _m1_r, _t8_r, _t32_r = (_recs3.get('csa_fix_m1', {}), _recs3.get('csa_fixed_topk8', {}), _recs3.get('csa_fixed_topk32', {}))
@@ -726,7 +727,12 @@ def sec_p1l():
     recs = [r for r in s.values() if isinstance(r, dict) and 'by_len' in r and (not r.get('synthesized')) and any((isinstance(c, dict) and _ppl_ok(c.get('ppl')) for c in r['by_len'].values()))]
     if not recs:
         return '## P1 长上下文长度外推 — （无结果）\n\n'
-    lens = sorted({int(Ln) for r in recs for Ln in r['by_len'] if isinstance(Ln, int) or (isinstance(Ln, str) and Ln.lstrip('-').isdigit())})
+    def _len_key(Ln):
+        try:
+            return int(Ln)
+        except (TypeError, ValueError):
+            return None
+    lens = sorted({_k for _k in (_len_key(Ln) for r in recs for Ln in r['by_len']) if _k is not None})
     variants = sorted({r.get('variant') for r in recs if r.get('variant') is not None})
     _seed_key = lambda x: (0, float(x), '') if isinstance(x, (int, float)) and (not isinstance(x, bool)) else (1, 0.0, str(x))
     _seeds_by_v = {v: sorted({r.get('seed') for r in recs if r.get('variant') == v and r.get('seed') is not None}, key=_seed_key) for v in variants}
@@ -746,8 +752,8 @@ def sec_p1l():
                 if isinstance(_c, dict) and _ppl_ok(_c.get('ppl')):
                     recs_l.append(_c)
             ok = [x for x in recs_l if not x.get('truncated')]
-            is_tr = not ok and bool(recs_l)
-            vals = [float(x['ppl']) for x in (recs_l if is_tr else ok)]
+            is_tr = bool(recs_l) and len(ok) < len(recs_l)
+            vals = [float(x['ppl']) for x in (ok if ok else recs_l)]
             trunc_flags.append(is_tr)
             mean = sum(vals) / len(vals) if vals else None
             if mean is None:

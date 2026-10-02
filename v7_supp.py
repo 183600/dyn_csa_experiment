@@ -495,6 +495,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     L._attb_bump_epoch()
     if variant in set(L.PARAM_MATCHED) | set(PARAM_MATCHED_V7) and float(mlp_ratio) == 4.0:
         raise ValueError(f'{variant} is a PARAM-MATCHED baseline but was given the default mlp_ratio=4; its MLP must be widened to match its sparse reference arm, or the comparison is not parameter-controlled. Pass mlp_ratio=L.variant_mlp_ratio(...).')
+    if warm_steps >= steps:
+        raise ValueError(f'warm_steps={warm_steps} >= steps={steps}: the dense->sparse switch never fires, so the recorded numbers would come from a dense-protocol model')
     cfgs = L.make_layer_cfgs(n_layers, variant)
     model = L.SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
     n_param = L.count_params(model)
@@ -516,7 +518,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     for _blk in model.blocks:
         _blk.attn._dense_warmup = warm_on
     t0 = time.time()
-    losses, ppl_hist, switch_ppl = ([], [], None)
+    losses, ppl_hist, warm_hist, switch_ppl = ([], [], [], None)
     _lbuf = []
     _tail = []
     model.train()
@@ -550,7 +552,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         if len(_tail) > 50:
             del _tail[:-50]
         if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
-            ppl_hist.append([step + 1, float(L.eval_ppl(model, val_batch[:eval_subset], device))])
+            _pv = float(L.eval_ppl(model, val_batch[:eval_subset], device))
+            (warm_hist if getattr(model.blocks[0].attn, '_dense_warmup', False) else ppl_hist).append([step + 1, _pv])
         if log_every and (step % log_every == 0 or step == steps - 1):
             if _lbuf:
                 losses.extend(torch.stack(_lbuf).tolist())
@@ -571,7 +574,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(_tail[-50:]).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': {}}
+    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(_tail[-50:]).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}}
     del model, opt, bpe, decay, ndecay, dpar
     gc.collect()
     if device.type == 'cuda':

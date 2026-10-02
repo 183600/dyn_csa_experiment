@@ -63,7 +63,7 @@ def _panel_seeds():
     for _v in VARIANTS:
         _p = VARIANTS[_v][0]
         if not os.path.exists(os.path.join(ROOT, _p, 'summary.json')):
-            load(_p)
+            load(_p)  # raises FileNotFoundError with the panel-specific message
     sets = [set(_variant_records(_v)) for _v in VARIANTS]
     common = set.intersection(*sets) if sets else set()
     if not common:

@@ -93,10 +93,8 @@ commit_and_push() {
   return 0
 }
 if [ "$_rc" -eq 2 ]; then
-  echo "=== [bonus] skipped (ledger unreadable) ==="
-  commit_and_push "v7: bonus skipped (budget ledger unreadable)" || exit 1
-  shutdown
-  exit 0
+  echo "=== [bonus] ledger unreadable -> no bonus, box stays up for inspection ==="
+  exit 1
 fi
 if [ "$_rc" -ne 0 ]; then
   echo "=== [bonus] skipped (budget) ==="
