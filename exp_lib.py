@@ -37,7 +37,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 BUDGET = dict(total_yuan=140.0, price_per_hour=2.4, margin=0.93, already_spent_yuan=0.0, state_path='autodl_budget_state.json')
-CODE_SEMANTICS = 'v11.120'
+CODE_SEMANTICS = 'v11.121'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
@@ -81,21 +81,6 @@ def _segment(n, want_cut_list, min_block, max_block):
             pending_cut = False
             pending_slot = -1
         bids[t] = cur
-    if cur > 0 and cur_len < min_block:
-        prev_len = n - cur_len
-        for t in range(n - 1, -1, -1):
-            if bids[t] < cur - 1:
-                break
-            if bids[t] == cur - 1:
-                prev_len = n - cur_len - t
-        if prev_len + cur_len <= max_block:
-            for t in range(n - 1, -1, -1):
-                if bids[t] == cur:
-                    bids[t] = cur - 1
-                else:
-                    break
-            if honoured:
-                honoured.pop(max(honoured), None)
     if len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
         _SEGMENT_CACHE.clear()
     _SEGMENT_CACHE[key] = (bids, honoured)
