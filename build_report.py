@@ -744,7 +744,7 @@ def sec_p1l():
     variants = sorted({r.get('variant') for r in recs if r.get('variant') is not None})
     _seed_key = lambda x: (0, float(x), '') if isinstance(x, (int, float)) and (not isinstance(x, bool)) else (1, 0.0, str(x))
     _seeds_by_v = {v: sorted({r.get('seed') for r in recs if r.get('variant') == v and r.get('seed') is not None}, key=_seed_key) for v in variants}
-    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、位置越界被 clamp——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
+    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
     per_v = {}
     trunc_v = {}
     for v in variants:
@@ -950,13 +950,18 @@ def main(argv=None):
     cap = float(os.environ.get('V7_BUDGET_YUAN', 107.0))
     spent = hrs * price
     parts = [sec_header(hrs, spent, price, cap), '---\n']
+    failed = []
     for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_stats):
         try:
             parts.append(sec())
         except Exception as e:
             print(f'[report] section {sec.__name__} FAILED: {type(e).__name__}: {e}')
             traceback.print_exc()
+            failed.append(sec.__name__)
             parts.append(f'## （{sec.__name__} 生成失败）\n\n> `{type(e).__name__}: {e}` —— 本节未能从产物计算，其余各节不受影响。\n\n')
+    if failed:
+        print(f'[report] refusing to publish a partial report — failed section(s): {', '.join(failed)}')
+        return None
     txt = '\n'.join((p for p in parts if p))
     out = os.path.join(REPO, 'REPORT_v7.md')
     _d = os.path.dirname(os.path.abspath(out))

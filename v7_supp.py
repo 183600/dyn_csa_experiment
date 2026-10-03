@@ -1040,7 +1040,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 cfgs = L.make_layer_cfgs(6, v)
                 mr = 4.0
                 if v in PARAM_MATCHED_V7:
-                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=set(PARAM_MATCHED_V7), ref_variant='csa_dynamic_rope')
+                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=set(PARAM_MATCHED_V7), ref_variant='csa_fixed_rope')
                 # 随机源在建模前一刻定界：同 seed 下各臂的共享组件（tok/head/MLP）必须同构
                 L.set_seed(seed)
                 model = L.SmallGPT(vocab, 256, 6, 8, 32, 512, cfgs, mlp_ratio=mr).to(DEVICE)
@@ -1223,7 +1223,7 @@ def run_lenphase(payload, guard=None, label=''):
                 cfgs = L.make_layer_cfgs(6, v)
                 mr = 4.0
                 if v in PARAM_MATCHED_V7:
-                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant='csa_dynamic_rope')
+                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant='csa_fixed_rope')
                 if _train_cache[0] is None:
                     _train_cache[0] = L.load_wikitext(train_len, 8000000)[0]
                 train_ids = _train_cache[0]

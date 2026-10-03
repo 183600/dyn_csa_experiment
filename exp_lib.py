@@ -4,6 +4,7 @@ _cpu_thr = os.environ.get('CSA_CPU_THREADS', '').strip() or '1'
 os.environ.setdefault('OMP_NUM_THREADS', _cpu_thr)
 os.environ.setdefault('MKL_NUM_THREADS', _cpu_thr)
 os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 del _cpu_thr
 import sys, subprocess
 for _stream in (sys.stdout, sys.stderr):
@@ -1681,6 +1682,7 @@ def _pin_cpu_threads():
 
 def _pin_cuda_determinism():
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     mode = os.environ.get('CSA_DETERMINISTIC', '').strip().lower()
