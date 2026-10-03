@@ -65,6 +65,7 @@ def _segment(n, want_cut_list, min_block, max_block):
             return hit
     honoured = {}
     bids = [0] * n
+    counts = [1]
     cur, cur_len = (0, 1)
     pending_cut = False
     for t in range(1, n):
@@ -77,17 +78,19 @@ def _segment(n, want_cut_list, min_block, max_block):
         if must or (pending_cut and may):
             cur += 1
             cur_len = 1
+            counts.append(0)
             if pending_cut:
                 honoured[ci] = 1.0
             pending_cut = False
+        counts[cur] += 1
         bids[t] = cur
     if cacheable:
         if len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
             _keep = list(_SEGMENT_CACHE.items())[len(_SEGMENT_CACHE) // 2:]
             _SEGMENT_CACHE.clear()
             _SEGMENT_CACHE.update(_keep)
-        _SEGMENT_CACHE[key] = (bids, honoured)
-    return (bids, honoured)
+        _SEGMENT_CACHE[key] = (bids, honoured, counts)
+    return (bids, honoured, counts)
 
 def _cut_merge_mask(want_cut_list, min_block, max_block, dtype=None, device=None):
     import torch as _t
@@ -97,7 +100,7 @@ def _cut_merge_mask(want_cut_list, min_block, max_block, dtype=None, device=None
         lst = want_cut_list.detach().cpu().tolist()
     else:
         lst = list(want_cut_list)
-    _bids, honoured = _segment(len(lst) + 1, lst, min_block, max_block)
+    _bids, honoured, _counts = _segment(len(lst) + 1, lst, min_block, max_block)
     keep = [0.0] * len(lst)
     for slot in honoured:
         if 0 <= slot < len(keep):
@@ -110,9 +113,11 @@ def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_coun
     elif n == 1:
         base, cnt, hon = (torch.zeros(1, dtype=torch.long, device=device), 1, {})
     else:
-        bids, hon = _segment(n, want_cut_list, min_block, max_block)
+        bids, hon, counts = _segment(n, want_cut_list, min_block, max_block)
         base = torch.tensor(bids, dtype=torch.long, device=device)
-        cnt = int(bids[-1] - bids[0]) + 1
+        cnt = len(counts)
+        _mx = max(counts)
+        base._pool_cpu = (counts, _mx, max(counts[:-1]) if cnt > 1 else 0)
     if not (return_count or return_honoured):
         return base
     out = [base]
@@ -166,6 +171,13 @@ def blocks_fixed(n, block_size, device):
         return hit
     with torch.inference_mode(False):
         out = torch.arange(n, device=device) // int(block_size)
+        if n > 0:
+            bs = int(block_size)
+            counts = [bs] * (n // bs)
+            _rem = n % bs
+            if _rem:
+                counts.append(_rem)
+            out._pool_cpu = (counts, min(bs, n), bs if len(counts) > 1 else 0)
     _cache_put(_IDX_CACHE, key, out, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return out
 _MASK_CACHE = {}
@@ -410,7 +422,11 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     starts_prev = torch.cat([torch.zeros(1, dtype=starts.dtype, device=dev), starts[:-1]])
     ov_start = torch.clamp(end_prev - ov, min=starts_prev)
     ov_len = end_prev - ov_start
-    if ov_len.numel():
+    _cpu = getattr(block_ids, '_pool_cpu', None)
+    if _cpu is not None and len(_cpu[0]) == B:
+        max_len = _cpu[1]
+        _ov_hi = min(ov, _cpu[2]) if B > 1 else -1
+    elif ov_len.numel():
         _cmin, max_len, _ov_lo, _ov_hi = (int(v) for v in torch.stack([counts.min(), counts.max(), ov_len.min(), ov_len.max()]).tolist())
     else:
         _cmin, max_len = (int(v) for v in torch.stack(torch.aminmax(counts)).tolist())
@@ -456,7 +472,11 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     counts = torch.bincount(block_ids, minlength=B)
     ends = torch.cumsum(counts, 0)
     starts = ends - counts
-    _cmin, max_len = (int(v) for v in torch.stack(torch.aminmax(counts)).tolist())
+    _cpu = getattr(block_ids, '_pool_cpu', None)
+    if _cpu is not None and len(_cpu[0]) == B:
+        max_len = _cpu[1]
+    else:
+        _cmin, max_len = (int(v) for v in torch.stack(torch.aminmax(counts)).tolist())
     pos = _range_cache(0, max_len, dev)
     _gp = starts[:, None] + pos[None, :]
     g = _gp.clamp(max=n - 1)
@@ -896,7 +916,7 @@ class HybridAttention(nn.Module):
             logits.add_(mask[s:e])
             if sink_view is not None:
                 lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
-                attn = torch.exp(logits - lse)
+                attn = logits.sub(lse).exp_()
                 del logits
             else:
                 attn = torch.softmax(logits, -1)

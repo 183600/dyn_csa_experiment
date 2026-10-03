@@ -72,23 +72,25 @@ def main():
             va_path = os.path.join('./wt103_cache', f'val_batch_{tag}.npy')
             vp_path = os.path.join('./wt103_cache', f'val_bnd_{tag}.npy')
             me_path = os.path.join('./wt103_cache', f'meta_{tag}.json')
+            _ids = train_ids[:cap + seq_len]
+            _slice_fp = L._ids_fp(_ids) if src_fp is not None else None
             if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
                 stale = False
                 try:
                     with open(me_path, encoding='utf-8') as _f:
                         _me = json.load(_f)
-                    stale = src_fp is not None and _me.get('src_fp') != src_fp
+                    stale = _slice_fp is not None and _me.get('src_fp') != _slice_fp
                 except Exception:
                     stale = True
                 if not stale:
                     print(f'[prep] seq_len={seq_len} cap={cap}: cache already present, skipped')
                     continue
                 print(f'[prep] seq_len={seq_len} cap={cap}: derived cache predates the current cap={biggest} tokenisation — regenerating')
-            for path, arr in ((tr_path, train_ids[:cap + seq_len]), (va_path, val_batch), (vp_path, val_bnd)):
+            for path, arr in ((tr_path, _ids), (va_path, val_batch), (vp_path, val_bnd)):
                 _tmp = f'{path}.tmp{os.getpid()}'
                 np.save(_tmp, arr)
                 os.replace(_tmp + '.npy', path)
-            L.atomic_write_json(me_path, {'vocab': vocab, 'src_fp': src_fp}, indent=0)
+            L.atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _slice_fp}, indent=0)
             print(f'[prep] seq_len={seq_len} cap={cap}: derived from the cap={biggest} tokenisation (same corpus prefix, same vocab)')
     print('\n[prep] ALL CACHES DONE')
 if __name__ == '__main__':
