@@ -359,10 +359,24 @@ def sec_p0w():
     rows = [row for row in rows if _measurable({'ppl': row[3], 'synthesized': row[6]})]
     rows = _prefer_one_cfg(rows, lambda row: ((row[0], row[1]), (s.get(row[-1]) or {}).get('run_cfg')), who='sec_p0w')
     _kept_keys = {row[-1] for row in rows}
+    rec_by_s = collections.defaultdict(dict)
+    for _k, _r in s.items():
+        if _k not in _kept_keys:
+            continue
+        if not (isinstance(_r, dict) and _measurable(_r)):
+            continue
+        _sd = _int_or(_r.get('seed'), -1)
+        if _sd < 0:
+            continue
+        _w = _int_or(_r.get('warm_steps'), None)
+        if _w is None:
+            _t = _tag_of(_r, _k, _legacy_ok)
+            _w = int(_t[1:]) if _t.startswith('w') and _t[1:].isdigit() else -1
+        rec_by_s[_r.get('variant', '?'), _w].setdefault(_sd, _r)
     grp = collections.defaultdict(list)
-    for v, w, sd, ppl, sw, mins, syn, _k in rows:
-        if _measurable({'ppl': ppl, 'synthesized': syn}):
-            grp[v, w].append((ppl, sw, mins, sd))
+    for (v, w), _m in rec_by_s.items():
+        for _sd, _r in sorted(_m.items()):
+            grp[v, w].append((_r.get('ppl'), _r.get('ppl_at_switch'), _r.get('train_time_s', 0) / 60.0 if _r.get('train_time_s') else None, _sd))
     lines = ['## P0-1 dense→sparse warmup 是否能让 sparse 追平 dense？（评审「必做」项）', '', '**评审论断**：论文 §4.2.2 先训 1T token 的 dense 再在 seq 64K 切 sparse；仓库所有 sparse run 都是 from-scratch，故「渐近线更差」可能是没 warmup 的产物。不给这个实验，「渐近线反转」立不住。', '', '**做法**：`train_warmup` 用**相同全长度 cosine LR**，前 `warm_steps` 步走 dense 前向（复用各 csa/hca 层自己的 `W_kvhead` per-token KV 路径 + 同一 sink，不引入新参数），到点切换为 sparse 并记录切换瞬间 PPL。网格 `warm ∈ {0,5000,10000}`（每格 seed 数以下表 n 列为准），20k 步、seq 512。**两臂参数/步数/token 数/初始 PPL/LR 曲线完全相同**，唯一差异是切点。', '', '| variant | warm_steps | PPL (mean±std) | n | 切换时 PPL |', '|---|---|---|---|---|']
     for (v, w), vals in sorted(grp.items()):
         ppls = [p for p, _s, _m, _sd in vals]
@@ -382,15 +396,13 @@ def sec_p0w():
             lines.append(f'- `{v}` warm={w}：{m:.2f} PPL（{m - b:+.2f} vs 基线，n={len(vals)}）')
         curves = collections.defaultdict(lambda: collections.defaultdict(list))
         _dropped_pts = 0
-        for v, w, sd, ppl, sw, mins, _syn, _k in rows:
-            r = s.get(_k) or {}
-            if not _measurable(r):
-                continue
-            for step, pv in r.get('ppl_history') or []:
-                if not _ppl_ok(pv):
-                    _dropped_pts += 1
-                    continue
-                curves[v, w][int(step)].append(float(pv))
+        for (v, w), _m in rec_by_s.items():
+            for _sd, r in sorted(_m.items()):
+                for step, pv in r.get('ppl_history') or []:
+                    if not _ppl_ok(pv):
+                        _dropped_pts += 1
+                        continue
+                    curves[v, w][int(step)].append(float(pv))
         if _dropped_pts:
             lines += ['', f'> **⚠ 轨迹表剔除了 {_dropped_pts} 个非有限/非正的 PPL 曲线点**（单次失败的 eval），它们不再参与 seed 平均。', '']
         if curves and any((len(c) > 1 for c in curves.values())) and any((_v == 'csa_fixed' for _v, _w in curves)):
@@ -404,20 +416,6 @@ def sec_p0w():
                     vals = curves[_v, w].get(st)
                     cells.append(f'{sum(vals) / len(vals):.1f}' if vals else '—')
                 lines.append(f'| {st} | ' + ' | '.join(cells) + ' |')
-        rec_by_s = collections.defaultdict(dict)
-        for _k, _r in s.items():
-            if _k not in _kept_keys:
-                continue
-            if not (isinstance(_r, dict) and _measurable(_r)):
-                continue
-            _sd = _int_or(_r.get('seed'), -1)
-            if _sd < 0:
-                continue
-            _w = _int_or(_r.get('warm_steps'), None)
-            if _w is None:
-                _t = _tag_of(_r, _k, _legacy_ok)
-                _w = int(_t[1:]) if _t.startswith('w') and _t[1:].isdigit() else -1
-            rec_by_s[_r.get('variant', '?'), _w].setdefault(_sd, _r)
         _conc = ['', '**结论**：']
         _parts = []
         _ds = []

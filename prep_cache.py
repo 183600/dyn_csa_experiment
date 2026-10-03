@@ -47,16 +47,20 @@ def main():
         biggest = caps[-1]
         print(f'\n===== prep cache: seq_len={seq_len} cap={biggest} =====')
         train_ids, val_batch, vocab, _, val_bnd = L.load_wikitext(seq_len, biggest)
-        import hashlib
         if isinstance(train_ids, np.ndarray):
-            _h = hashlib.sha256()
-            _mv = np.ascontiguousarray(train_ids[:biggest + seq_len])
-            _cs = 1 << 24
-            for _off in range(0, len(_mv), _cs):
-                _h.update(_mv[_off:_off + _cs].data)
-            src_fp = _h.hexdigest()[:16]
+            src_fp = L._ids_fp(train_ids)
         else:
             src_fp = None
+        _me_big_path = os.path.join('./wt103_cache', f'meta_v3_sl{seq_len}_cap{biggest}_v8192_vs512.json')
+        _big_fp = None
+        try:
+            with open(_me_big_path, encoding='utf-8') as _f:
+                _big_fp = json.load(_f).get('src_fp')
+        except Exception:
+            _big_fp = None
+        if src_fp is not None and _big_fp != src_fp:
+            print(f'[prep] seq_len={seq_len}: the cap={biggest} cache carries src_fp={_big_fp!r} while the ids it served hash to {src_fp!r} — the source tokenisation is not verifiable; REFUSING to derive smaller-cap caches from it. Remove the cap={biggest} cache files and re-run to re-tokenise from the corpus.')
+            continue
         for cap in caps[:-1]:
             tag = f'v3_sl{seq_len}_cap{cap}_v8192_vs512'
             tr_path = os.path.join('./wt103_cache', f'train_ids_{tag}.npy')

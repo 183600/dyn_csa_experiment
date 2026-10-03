@@ -900,8 +900,10 @@ class HybridAttention(nn.Module):
             if sink_view is not None:
                 lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
                 attn = torch.exp(logits - lse)
+                del logits
             else:
                 attn = torch.softmax(logits, -1)
+                del logits
             out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
 
@@ -1273,6 +1275,14 @@ def _read_raw_rows(path):
     with open(path, encoding='utf-8') as fh:
         return [ln.rstrip('\n') for ln in fh]
 
+def _ids_fp(train_ids):
+    _h = hashlib.sha256()
+    _mv = np.ascontiguousarray(train_ids)
+    _cs = 1 << 24
+    for _off in range(0, len(_mv), _cs):
+        _h.update(_mv[_off:_off + _cs].data)
+    return _h.hexdigest()[:16]
+
 def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_dir='./wt103_cache'):
     from datasets import load_dataset
     os.makedirs(cache_dir, exist_ok=True)
@@ -1337,7 +1347,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     for _p, _a in ((tr_path, train_ids), (va_path, val_batch), (vp_path, val_bnd)):
         np.save(_p + '.tmp', _a)
         os.replace(_p + '.tmp.npy', _p)
-    atomic_write_json(me_path, {'vocab': vocab}, indent=0)
+    atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids)}, indent=0)
     print('[data] cached token ids to disk (resume-safe)')
     del ds
     gc.collect()

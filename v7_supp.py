@@ -620,6 +620,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
     _wu = cfg['warmup']
     _mkey = ','.join(sorted((str(_x) for _x in (set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}))))
     _fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{L.determinism_label()}_cs{CKPT_CODE}'
+    stale_dropped = []
     for seed in seeds:
         for warm in warm_grid:
             for v in variants:
@@ -637,6 +638,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                 if _drop_msg is not None:
                     print(_drop_msg)
                     summary.pop(key, None)
+                    stale_dropped.append(key)
                     L.atomic_write_json(spath, summary, indent=2)
                 if guard is not None:
                     est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
@@ -675,6 +677,13 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                 gc.collect()
                 if DEVICE.type == 'cuda':
                     torch.cuda.empty_cache()
+    if stale_dropped:
+        _still = [k for k in stale_dropped if k not in summary]
+        print(f'\n[resume] {len(stale_dropped)} warmup cell(s) held a non-current record and were dropped before retraining; {len(_still)} of them produced NO measurement this pass (budget gate / truncation / failure) and are ABSENT from {spath}:')
+        for _k in _still:
+            print(f'    {_k}')
+        if len(_still) != len(stale_dropped):
+            print(f'    ({len(stale_dropped) - len(_still)} of them succeeded and carry a fresh record.)')
     return summary
 
 def build_niah_batch(n_seq, seq_len, n_pairs=4, vocab=8192, seed=0):
