@@ -78,7 +78,12 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=
                 if k > 0:
                     rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
                     pos = rng.choice(n_far, size=k, replace=False)
-                    ids[pos] = rng.integers(0, vocab, size=k)
+                    _draw = rng.integers(0, vocab, size=k)
+                    _same = _draw == ids[pos]
+                    while _same.any():
+                        _draw[_same] = rng.integers(0, vocab, size=int(_same.sum()))
+                        _same = _draw == ids[pos]
+                    ids[pos] = _draw
                 _row = ids
                 if row_cache is not None:
                     row_cache[_rk] = _row
@@ -379,6 +384,11 @@ def _hist_by_seed(outdir, variant):
                 del out[s]
                 synth_of.pop(s, None)
                 cfg_of.pop(s, None)
+    _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
+    _stale = sorted((s for s in out if isinstance(cfg_of.get(s), str) and (not cfg_of[s].endswith(_cur_sfx))))
+    if _stale:
+        print(f'[stats] {sp}: `{variant}` curve(s) at seed(s) {_stale} are stamped with an OLDER code semantics than the current run_cfg suffix — they are kept on disk but excluded from every crossover/pairing statistic; re-run this cell to measure them with the current code')
+    out.stale_cfg_seeds = set(_stale)
     out.per_seed_synth = synth_of
     out.per_seed_cfg = cfg_of
     return out
@@ -440,7 +450,10 @@ def _scale_crossovers():
     for label, p in panels.items():
         ha = _hist_by_seed(p['outdir'], 'csa_fixed')
         hb = _hist_by_seed(p['outdir'], 'full')
-        common = sorted(set(ha) & set(hb))
+        _stale_seeds = sorted(getattr(ha, 'stale_cfg_seeds', set()) | getattr(hb, 'stale_cfg_seeds', set()))
+        if _stale_seeds:
+            print(f'[stats] {label}: seed(s) {_stale_seeds} were measured under an older code-stamp — a code change must invalidate and recompute, not be reused, so they are excluded from this {label} crossover fit')
+        common = sorted((set(ha) & set(hb)) - set(_stale_seeds))
         if not common:
             out[label] = {'status': 'missing', **p}
             continue
@@ -900,7 +913,7 @@ def schedule_shutdown(delay_s=120):
     if os.environ.get('V10_NO_SHUTDOWN'):
         print('[v10] shutdown suppressed (V10_NO_SHUTDOWN)')
         return
-    subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown -h now'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f'[v10] instance shuts down in {delay_s}s.')
 
 def run_full():

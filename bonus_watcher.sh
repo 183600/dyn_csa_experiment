@@ -20,7 +20,7 @@ while true; do
   fi
   if [ $(( $(date +%s) - START_TS )) -gt $GIVE_UP_AFTER ]; then
     echo "=== [bonus] no driver process and no ALL-DONE log within ${GIVE_UP_AFTER}s -> giving up; shutting down to stop billing ==="
-    shutdown
+    shutdown -h +1
     exit 0
   fi
   sleep 300
@@ -99,7 +99,7 @@ fi
 if [ "$_rc" -ne 0 ]; then
   echo "=== [bonus] skipped (budget) ==="
   commit_and_push "v7: bonus skipped (wallet headroom too small)" || exit 1
-  shutdown
+  shutdown -h +1
   exit 0
 fi
 echo "=== [bonus] $(date '+%F %T') P0W seed2 (warm grid n=3) START ==="
@@ -125,4 +125,4 @@ if ! $PY v7_supp.py analysis || ! $PY build_report.py; then
 fi
 commit_and_push "v7 bonus: P0W seed2 complete (warm grid n=3) + final report" || exit 1
 echo "=== [bonus] ALL DONE $(date '+%F %T'); shutting down to stop billing ==="
-shutdown
+shutdown -h +1

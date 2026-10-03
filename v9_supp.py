@@ -352,7 +352,7 @@ def schedule_shutdown(delay_s=120):
     if os.environ.get('V9_NO_SHUTDOWN'):
         print('[v9] shutdown suppressed (V9_NO_SHUTDOWN)')
         return
-    subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown -h now'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f'[v9] instance shuts down in {delay_s}s.')
 
 def run_full():

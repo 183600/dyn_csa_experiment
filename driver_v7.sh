@@ -56,5 +56,5 @@ echo "=== [driver] ALL DONE $(date '+%F %T') ==="
 if ! pgrep -f "bonus_watcher\.sh" > /dev/null; then
   echo "=== [driver] no bonus watcher alive -> safety shutdown in 60s to stop billing (cancel: kill $$ now) ==="
   sleep 60
-  pgrep -f "bonus_watcher\.sh" > /dev/null || shutdown
+  pgrep -f "bonus_watcher\.sh" > /dev/null || shutdown -h +1
 fi

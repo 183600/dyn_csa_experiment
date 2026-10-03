@@ -48,7 +48,15 @@ def main():
         print(f'\n===== prep cache: seq_len={seq_len} cap={biggest} =====')
         train_ids, val_batch, vocab, _, val_bnd = L.load_wikitext(seq_len, biggest)
         import hashlib
-        src_fp = hashlib.sha256(np.ascontiguousarray(train_ids[:biggest + seq_len]).tobytes()).hexdigest()[:16] if isinstance(train_ids, np.ndarray) else None
+        if isinstance(train_ids, np.ndarray):
+            _h = hashlib.sha256()
+            _mv = np.ascontiguousarray(train_ids[:biggest + seq_len])
+            _cs = 1 << 24
+            for _off in range(0, len(_mv), _cs):
+                _h.update(_mv[_off:_off + _cs].data)
+            src_fp = _h.hexdigest()[:16]
+        else:
+            src_fp = None
         for cap in caps[:-1]:
             tag = f'v3_sl{seq_len}_cap{cap}_v8192_vs512'
             tr_path = os.path.join('./wt103_cache', f'train_ids_{tag}.npy')

@@ -58,7 +58,7 @@ def P4MP_CFG(seeds=(0, 1, 2, 3, 4, 5)):
 P4SS_CFG = dict(V10.P3SS_CFG)
 P4SL_CFG = dict(V10.P3SL_CFG)
 P4F_CFG = dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['csa_fixed', 'full'])
-PHASES = [('P4MT', 'p4mt', P4MT_CFG, None, 1.6), ('P4MP', 'probe', P4MP_CFG, None, 0.3), ('P4SS', 'run', P4SS_CFG, [0, 1, 2, 3], 0.6), ('P4SL', 'run', P4SL_CFG, [0, 1, 2, 3], 9.0), ('P4F', 'run', P4F_CFG, [0, 1, 2, 3], 4.5)]
+PHASES = [('P4MT', 'p4mt', P4MT_CFG, None, 1.6), ('P4MP', 'probe', P4MP_CFG, None, 0.3), ('P4SS', 'run', P4SS_CFG, [0, 1, 2, 3], 0.6), ('P4F', 'run', P4F_CFG, [0, 1, 2, 3], 4.5), ('P4SL', 'run', P4SL_CFG, [0, 1, 2, 3], 9.0)]
 
 def run_phase(name, guard):
     for pname, kind, payload, seeds, _h in PHASES:
@@ -568,11 +568,17 @@ def build_report(out='REPORT_v11.md'):
         except Exception:
             return None
         _sd = {}
+        _sd_cur = {}
+        _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
         for _r in _s.values():
             if isinstance(_r, dict) and 'seed' in _r and _r.get('variant') and L.ppl_is_usable(_r.get('ppl')) and (not _r.get('synthesized')):
                 if _variants is not None and _r['variant'] not in _variants:
                     continue
                 _sd.setdefault(_r['variant'], set()).add(_r['seed'])
+                if isinstance(_r.get('run_cfg'), str) and _r['run_cfg'].endswith(_cur_sfx):
+                    _sd_cur.setdefault(_r['variant'], set()).add(_r['seed'])
+        if _sd_cur:
+            _sd = {v: (_sd_cur.get(v) or s) for v, s in _sd.items()}
         _ns = [len(x) for x in _sd.values()]
         return (min(_ns), max(_ns)) if _ns else None
 
@@ -605,7 +611,7 @@ def schedule_shutdown(delay_s=120):
     if os.environ.get('V11_NO_SHUTDOWN'):
         print('[v11] shutdown suppressed (V11_NO_SHUTDOWN)')
         return
-    subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown -h now'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f'[v11] instance shuts down in {delay_s}s.')
 
 def run_full():

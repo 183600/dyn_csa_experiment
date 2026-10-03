@@ -55,6 +55,7 @@ docs/*
 # 实验运行时状态
 autodl_budget_state.json
 .ipynb_checkpoints/autodl_budget_state-checkpoint.json
+autodl_budget*.json.lock
 
 # 临时 / 日志
 *.log

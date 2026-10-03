@@ -64,25 +64,24 @@ def _segment(n, want_cut_list, min_block, max_block):
     bids = [0] * n
     cur, cur_len = (0, 1)
     pending_cut = False
-    pending_slot = -1
     for t in range(1, n):
         cur_len += 1
         ci = t - 1
         if want_cut_list[ci]:
             pending_cut = True
-            pending_slot = ci
         may = cur_len > min_block
         must = cur_len > max_block
         if must or (pending_cut and may):
             cur += 1
             cur_len = 1
             if pending_cut:
-                honoured[pending_slot] = 1.0
+                honoured[ci] = 1.0
             pending_cut = False
-            pending_slot = -1
         bids[t] = cur
     if len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
+        _keep = list(_SEGMENT_CACHE.items())[len(_SEGMENT_CACHE) // 2:]
         _SEGMENT_CACHE.clear()
+        _SEGMENT_CACHE.update(_keep)
     _SEGMENT_CACHE[key] = (bids, honoured)
     return (bids, honoured)
 
@@ -848,7 +847,7 @@ class HybridAttention(nn.Module):
             self.W_bZ = None
             self.W_aZ = nn.Parameter(torch.empty(d_model, self.kv_dim))
             self.B_pos_a = nn.Parameter(torch.zeros(int(cfg.max_block) + 1, self.kv_dim))
-            self.sink = nn.Parameter(torch.zeros(n_heads))
+            self.sink = nn.Parameter(torch.zeros(n_heads)) if getattr(cfg, 'use_sink', True) else None
             nn.init.xavier_uniform_(self.W_aZ)
             if cfg.chunking == 'cosine_learnable':
                 Tc = max(cfg.temperature, 0.001)
@@ -2392,14 +2391,18 @@ class CostGuard:
         self.margin = float(budget.get('margin', 0.93))
         self.already = float(budget.get('already_spent_yuan', 0.0))
         self.state_path = budget.get('state_path', 'autodl_budget_state.json')
-        self.state = {'booked_seconds': 0.0, 'norm_sps': None, 'sps_by_class': {}, 'runs': 0}
+        self.state = self._load_state()
+
+    def _load_state(self):
+        st = {'booked_seconds': 0.0, 'norm_sps': None, 'sps_by_class': {}, 'runs': 0}
         if os.path.exists(self.state_path):
             try:
                 with open(self.state_path, encoding='utf-8') as f:
-                    self.state.update(json.load(f))
+                    st.update(json.load(f))
             except Exception as e:
                 print(f'[budget] FATAL: {self.state_path} exists but cannot be parsed ({type(e).__name__}: {e}).  Refusing to start with a silently RESET ledger (spent would read as 0) — move it aside to start fresh.')
                 raise
+        return st
 
     def _save(self):
         atomic_write_json(self.state_path, self.state)
@@ -2414,21 +2417,37 @@ class CostGuard:
         return self.total_yuan * self.margin
 
     def record_run(self, seconds, steps_done, d, n_layers, seq_len, batch_size, calib_seconds=None):
-        self.state['booked_seconds'] += float(seconds)
-        self.state['runs'] += 1
-        if steps_done and steps_done > 0:
-            if calib_seconds is None or not calib_seconds > 0:
-                calib_seconds = seconds
-            f = self._wallclock_factor(d, n_layers, seq_len, batch_size)
-            sps = calib_seconds / steps_done
-            norm = sps / f
-            prev = self.state.get('norm_sps')
-            self.state['norm_sps'] = norm if prev is None else 0.7 * prev + 0.3 * norm
-            by_class = self.state.setdefault('sps_by_class', {})
-            key = str((int(d), int(n_layers), int(seq_len), int(batch_size)))
-            cprev = by_class.get(key)
-            by_class[key] = sps if cprev is None else 0.7 * cprev + 0.3 * sps
-        self._save()
+        try:
+            import fcntl
+        except ImportError:
+            fcntl = None
+        _lock_f = None
+        if fcntl is not None:
+            _lock_f = open(self.state_path + '.lock', 'a')
+            fcntl.flock(_lock_f, fcntl.LOCK_EX)
+        try:
+            self.state = self._load_state()
+            self.state['booked_seconds'] += float(seconds)
+            self.state['runs'] += 1
+            if steps_done and steps_done > 0:
+                if calib_seconds is None or not calib_seconds > 0:
+                    calib_seconds = seconds
+                f = self._wallclock_factor(d, n_layers, seq_len, batch_size)
+                sps = calib_seconds / steps_done
+                norm = sps / f
+                prev = self.state.get('norm_sps')
+                self.state['norm_sps'] = norm if prev is None else 0.7 * prev + 0.3 * norm
+                by_class = self.state.setdefault('sps_by_class', {})
+                key = str((int(d), int(n_layers), int(seq_len), int(batch_size)))
+                cprev = by_class.get(key)
+                by_class[key] = sps if cprev is None else 0.7 * cprev + 0.3 * sps
+            self._save()
+        finally:
+            if _lock_f is not None:
+                try:
+                    fcntl.flock(_lock_f, fcntl.LOCK_UN)
+                finally:
+                    _lock_f.close()
 
     @classmethod
     def _depth_factor(cls, n_layers):
@@ -2600,28 +2619,7 @@ def aggregate(summary):
     def _budget_ok(recs):
         if len(recs) < 2:
             return True
-        ref = recs[0]
-
-        def _pnum(r):
-            v = r.get('params')
-            if v is None or isinstance(v, bool):
-                return None
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return None
-        _ref_p = _pnum(ref)
-        for r in recs[1:]:
-            if ref.get('run_cfg') != r.get('run_cfg'):
-                return False
-            _r_p = _pnum(r)
-            if _ref_p is not None and _r_p is not None and (_ref_p != _r_p):
-                return False
-            for k in PAIR_BUDGET_KEYS:
-                a, b = (ref.get(k), r.get(k))
-                if (a is None) != (b is None) or (a is not None and a != b):
-                    return False
-        return True
+        return len({_cfg_fp(r) for r in recs}) == 1
 
     def _by_seed(recs):
         out, dup = ({}, [])

@@ -505,18 +505,19 @@ def sec_p0e():
         r = d[v]
         lines.append(f'| `{v}` | {fm(r.get('ppl_mean'))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
     _s_items = _prefer_one_cfg([_kv for _kv in s.items() if isinstance(_kv[1], dict) and 'variant' in _kv[1] and _measurable(_kv[1])], lambda kv: (kv[1].get('variant'), kv[1].get('run_cfg')), who='sec_p0e')
-    trajs = collections.defaultdict(lambda: collections.defaultdict(list))
+    trajs = collections.defaultdict(lambda: collections.defaultdict(dict))
     _dropped_pts = 0
     for _k, r in _s_items:
         if not isinstance(r, dict) or 'variant' not in r:
             continue
         if not _measurable(r):
             continue
+        _sdv = str(r.get('seed'))
         for step, pv in r.get('ppl_history') or []:
             if not _ppl_ok(pv):
                 _dropped_pts += 1
                 continue
-            trajs[r['variant']][int(step)].append(float(pv))
+            trajs[r['variant']][int(step)][_sdv] = float(pv)
     if _dropped_pts:
         lines += ['', f'> **⚠ 轨迹表剔除了 {_dropped_pts} 个非有限/非正的 PPL 曲线点**（单次失败的 eval），它们不再参与 seed 平均、尾段斜率与下方结论的判定。', '']
     if 'csa_fixed' in trajs and 'full' in trajs:
@@ -525,21 +526,28 @@ def sec_p0e():
             lines += ['', '**验证 PPL 轨迹（seed 平均，每 2000 步）**：', '', '| step | csa_fixed | full | gap (csa−full) |', '|---|---|---|---|']
             gaps = {}
             for st in steps:
-                c = sum(trajs['csa_fixed'][st]) / len(trajs['csa_fixed'][st])
-                f_ = sum(trajs['full'][st]) / len(trajs['full'][st])
+                c = sum(trajs['csa_fixed'][st].values()) / len(trajs['csa_fixed'][st])
+                f_ = sum(trajs['full'][st].values()) / len(trajs['full'][st])
                 gaps[st] = c - f_
                 lines.append(f'| {st} | {c:.1f} | {f_:.1f} | **{gaps[st]:+.1f}** |')
             tail = steps[-5:] if len(steps) >= 5 else steps
             _tail_span_k = (steps[-1] - tail[0]) / 1000.0
             g_last = gaps[steps[-1]]
+            _paired = sorted(set.intersection(*(set(trajs[v][st]) for v in ('csa_fixed', 'full') for st in tail))) if tail else []
             xs = [st / 1000.0 for st in tail]
-            ys = [gaps[st] for st in tail]
+            if _paired:
+                ys = [sum((trajs['csa_fixed'][st][sd] - trajs['full'][st][sd] for sd in _paired)) / len(_paired) for st in tail]
+            else:
+                ys = [gaps[st] for st in tail]
             n_ = len(xs)
             mx, my = (sum(xs) / n_, sum(ys) / n_)
             slope = sum(((x - mx) * (y - my) for x, y in zip(xs, ys))) / sum(((x - mx) ** 2 for x in xs)) if n_ > 1 else 0.0
 
             def rate(var):
-                yv = [sum(trajs[var][st]) / len(trajs[var][st]) for st in tail]
+                if _paired:
+                    yv = [sum((trajs[var][st][sd] for sd in _paired)) / len(_paired) for st in tail]
+                else:
+                    yv = [sum(trajs[var][st].values()) / len(trajs[var][st]) for st in tail]
                 my2 = sum(yv) / n_
                 return sum(((x - mx) * (y - my2) for x, y in zip(xs, yv))) / sum(((x - mx) ** 2 for x in xs)) if n_ > 1 else 0.0
             r_csa, r_full = (rate('csa_fixed'), rate('full'))
@@ -740,7 +748,8 @@ def sec_p1l():
     per_v = {}
     trunc_v = {}
     for v in variants:
-        cells, base_vals, last_vals = ([], [], [])
+        cells = []
+        base_map, last_map = ({}, {})
         trunc_flags = []
         for Ln in lens:
             recs_l = []
@@ -750,19 +759,23 @@ def sec_p1l():
                 _bl = _r.get('by_len') or {}
                 _c = _bl.get(Ln, _bl.get(str(Ln)))
                 if isinstance(_c, dict) and _ppl_ok(_c.get('ppl')):
-                    recs_l.append(_c)
-            ok = [x for x in recs_l if not x.get('truncated')]
+                    recs_l.append((_r.get('seed'), _c))
+            ok = [x for _sd, x in recs_l if not x.get('truncated')]
             is_tr = bool(recs_l) and len(ok) < len(recs_l)
-            vals = [float(x['ppl']) for x in (ok if ok else recs_l)]
+            vals = [float(x['ppl']) for x in (ok if ok else [x for _sd, x in recs_l])]
             trunc_flags.append(is_tr)
             mean = sum(vals) / len(vals) if vals else None
             if mean is None:
                 cells.append('—')
             else:
                 cells.append(f'~{mean:.1f}' if is_tr else f'{mean:.1f}')
-            if vals and not is_tr:
-                (base_vals if Ln == lens[0] else last_vals if Ln == lens[-1] else []).append(mean)
-        ratio = sum(last_vals) / len(last_vals) / (sum(base_vals) / len(base_vals)) if base_vals and last_vals else None
+            if recs_l and not is_tr:
+                _tgt = base_map if Ln == lens[0] else last_map if Ln == lens[-1] else None
+                if _tgt is not None:
+                    for _sd, x in recs_l:
+                        _tgt[str(_sd)] = float(x['ppl'])
+        _matched = sorted(set(base_map) & set(last_map))
+        ratio = sum((last_map[sd] for sd in _matched)) / len(_matched) / (sum((base_map[sd] for sd in _matched)) / len(_matched)) if _matched else None
         per_v[v] = ratio
         trunc_v[v] = trunc_flags
         if _finite_or_none(ratio) is not None and trunc_flags and trunc_flags[-1]:

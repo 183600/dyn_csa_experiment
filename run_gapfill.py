@@ -146,6 +146,11 @@ def synthesize_long_summary():
                 n_kept += 1
                 print(f"[synth] keeping real record `{key}` (steps={old.get('steps')}); the aggregate's reconstructed value is NOT written over it")
                 continue
+            _twin = next((_k for _k, _r in summary.items() if _k != key and isinstance(_r, dict) and _r.get('variant') == real_v and str(_r.get('protocol') or '') == str(_proto or '') and (_num_or_none(_r.get('seed')) == _seed) and (not _r.get('synthesized')) and (_r.get('steps') == _LONG_STEPS) and L.ppl_is_usable(_r.get('ppl')) and (abs(float(_r['ppl']) - float(p)) <= 1e-06 * max(1.0, abs(float(p))))), None)
+            if _twin is not None:
+                n_kept += 1
+                print(f'[synth] real record `{_twin}` already covers `({real_v}, seed {_seed})` under a different key — the reconstructed value is not duplicated next to it')
+                continue
             if isinstance(old, dict) and 'ppl' in old:
                 n_replaced += 1
             rec = {'variant': real_v, 'seed': _seed, 'steps': _LONG_STEPS, 'tokens_seen': e.get('tokens_seen'), 'ppl': float(p), 'params': _num_or_none(e.get('params')), 'synthesized': True, 'note': 'reconstructed from committed aggregate.json (v6); means exact, secondary-metric stds approximate'}
@@ -164,7 +169,7 @@ def schedule_shutdown(delay_s=90):
         print('[v6] shutdown suppressed (V6_NO_SHUTDOWN)')
         return
     marker = 'v6autoshutdown'
-    subprocess.Popen(['bash', '-c', f'sleep {delay_s}; echo {marker}; shutdown'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(['bash', '-c', f'sleep {delay_s}; echo {marker}; shutdown -h now'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f'[v6] AutoDL instance will SHUT DOWN in {delay_s}s — only the data disk keeps billing afterwards. (cancel: pkill -f {marker})')
 
 def run_full():

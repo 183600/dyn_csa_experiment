@@ -966,7 +966,7 @@ def schedule_shutdown(delay_s=120):
     if os.environ.get('V7_NO_SHUTDOWN'):
         print('[v7] shutdown suppressed (V7_NO_SHUTDOWN)')
         return
-    subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown -h now'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f'[v7] AutoDL instance shuts down in {delay_s}s (only the data disk bills afterwards).')
 LONG_EXT = dict(L.RUN_LONG, steps=40000, n_train_tokens=110000000, eval_every=2000, outdir='results_lm_v7_long40')
 PHASES = [('P0R', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_rope', variants=ROPE_VARIANTS, steps=1500, matched=set(PARAM_MATCHED_V7), mlp_match_ref='csa_fixed_rope'), seeds=[0, 1, 2]), 2.6), ('P0W', 'warm', dict(cfg=dict(L.RUN_LONG, outdir='results_lm_v7_warmup', variants=['csa_fixed']), seeds=[0, 1], warm_grid=(0, 5000, 10000)), 3.4), ('P1L', 'len', dict(outdir='results_len', vocab=8192, steps=3000, train_len=512, eval_lens=[512, 1024, 2048, 4096], variants=['full', 'csa_fixed', 'full_rope', 'csa_fixed_rope']), 2.5), ('P2S', 'plain', dict(cfg=dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic']), seeds=[2, 3]), 4.5), ('P1T', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_seq2k', seq_len=2048, batch_size=3, steps=1500, variants=['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']), seeds=[0, 1]), 6.0), ('P0E', 'plain', dict(cfg=dict(LONG_EXT, variants=['csa_fixed', 'full']), seeds=[0, 1]), 17.0)]
@@ -1185,7 +1185,7 @@ def run_lenphase(payload, guard=None, label=''):
         guard.record_run(time.time() - _t_data, 0, 0, 0, 0, 0)
     print(f'[p1l] val slice {val_ids.shape}, eval_lens={eval_lens}, seeds={seeds}')
     _train_cache = [None]
-    _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs12_lr0.0003_nt8000000_mr-csa_dynamic_rope'
+    _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs12_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr-csa_dynamic_rope'
     for v in variants:
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
