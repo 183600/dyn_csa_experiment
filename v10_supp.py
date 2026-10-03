@@ -215,6 +215,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 del d
                 continue
             model = None
+            _chunk_mem = {}
             for arm in cfg['arms']:
                 if not _arm_of(v, arm):
                     continue
@@ -230,7 +231,6 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 cells = [(Ln, rho) for Ln, rho in _defs if _cell_stale(_cell_key(Ln, rho), _fp)]
                 if not cells:
                     continue
-                _chunk_mem = {}
                 if model is None:
                     _arch = (int(d.get('d', 256)), int(d.get('n_layers', 6)), int(d.get('n_heads', 8)), int(d.get('d_head', 32)))
                     if _arch != (256, 6, 8, 32):

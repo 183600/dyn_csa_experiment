@@ -30,7 +30,10 @@ def proc_alive():
             ppid = -1
         entries.append((int(pid), ppid, cmd))
     watchers = {pid for pid, _ppid, cmd in entries if 'bonus_watcher.sh' in cmd or 'driver_v7.sh' in cmd}
+    _self = os.getpid()
     for pid, ppid, cmd in entries:
+        if pid == _self:
+            continue
         if 'python' not in cmd:
             continue
         if any((f'v{x}_supp.py' in cmd for x in (7, 8, 9, 10, 11))) or 'run_gapfill.py' in cmd:

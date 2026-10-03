@@ -63,15 +63,25 @@ def exact_signflip(deltas):
     mu = sum(deltas) / n
     std = (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0
     if n > 20:
-        rng = random.Random(0)
         B = 200000
-        cnt = 1
-        for _ in range(B):
-            s = 0.0
-            for d in deltas:
-                s += d if rng.random() < 0.5 else -d
-            if abs(s) >= obs - 1e-12:
-                cnt += 1
+        try:
+            import numpy as _np
+        except ImportError:
+            _np = None
+        if _np is not None:
+            _rng = _np.random.default_rng(0)
+            _signs = _np.where(_rng.random((B, n)) < 0.5, 1.0, -1.0)
+            _sums = _np.abs((_signs * _np.asarray(deltas)[None, :]).sum(1))
+            cnt = 1 + int((_sums >= obs - 1e-12).sum())
+        else:
+            rng = random.Random(0)
+            cnt = 1
+            for _ in range(B):
+                s = 0.0
+                for d in deltas:
+                    s += d if rng.random() < 0.5 else -d
+                if abs(s) >= obs - 1e-12:
+                    cnt += 1
         return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': cnt / (B + 1)}
     cnt = 0
     for mask in range(1 << n):
@@ -317,7 +327,9 @@ def sec_p0r():
         _w_rope = '领先' if g_rope < 0 else '落后'
         _d_abs_t = ('改善' if d_abs > 0 else '变差') + f' **{abs(d_abs):.2f}**'
         _d_sp_t = ('改善' if d_sp > 0 else '变差') + f' **{abs(d_sp):.2f}**'
-        lines += [f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL（参数对齐 `full_matched` 时{_w_absm} **{abs(g_abs_m):.2f}**；两者相差 **{g_abs - g_abs_m:+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(_cf, _mt)}。' if _has_mt else f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该差距因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` {_w_rope} `full_rope` **{abs(g_rope):.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense {_d_abs_t}、sparse {_d_sp_t}（注：`full_rope` 与 `csa_fixed_rope` 参数不同，此对比同时含容量效应）。', '']
+        _gain_conf = [f'dense 臂{unmatched_tag(_fu, _fu_r)}' for _ in [1] if unmatched_tag(_fu, _fu_r)] + [f'sparse 臂{unmatched_tag(_cf, _cf_r)}' for _ in [1] if unmatched_tag(_cf, _cf_r)]
+        _gain_note = f'（注：{'；'.join(_gain_conf)}，对应对比同时含容量效应）' if _gain_conf else ''
+        lines += [f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL（参数对齐 `full_matched` 时{_w_absm} **{abs(g_abs_m):.2f}**；两者相差 **{g_abs - g_abs_m:+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(_cf, _mt)}。' if _has_mt else f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该差距因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` {_w_rope} `full_rope` **{abs(g_rope):.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense {_d_abs_t}、sparse {_d_sp_t}{_gain_note}。', '']
         if rope_unmatched and rope_is_defect and _has_mt:
             lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线——落盘记录显示 `full_rope` 的 MLP 停在标准宽度（{_params_m(_fu_r)}），而 `csa_fixed_rope` 保持全宽（{_params_m(_cf_r)}），{f'相差 {100 * _pgap_r:.1f}%' if _pgap_r is not None else '参数差未知'}。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
         _arms_gain = d_abs > 0 and d_sp > 0
@@ -404,7 +416,7 @@ def sec_p0w():
         b = sum((p for p, _s, _m, _sd in base)) / len(base)
         lines += ['', f'**from-scratch 基线**（warm=0）：{b:.2f} PPL。相对基线的变化：', '']
         for (v, w), vals in sorted(grp.items()):
-            if w == 0:
+            if v != 'csa_fixed' or w == 0:
                 continue
             m = sum((p for p, _s, _m, _sd in vals)) / len(vals)
             lines.append(f'- `{v}` warm={w}：{m:.2f} PPL（{m - b:+.2f} vs 基线，n={len(vals)}）')
@@ -732,6 +744,7 @@ def sec_p1l():
                 print(f'[report] sec_p1l: {_v}: {len(_rv) - len(_cur)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur)} current one(s)')
             recs.extend(_cur)
         else:
+            print(f'[report] sec_p1l: {_v}: NONE of the {len(_rv)} by-length record(s) carries the current code-semantics stamp {_CUR_CS!r} — quoting STALE values for lack of a current one; re-run the length panel to refresh')
             recs.extend(_rv)
     if not recs:
         return '## P1 长上下文长度外推 — （无结果）\n\n'

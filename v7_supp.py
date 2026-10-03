@@ -731,14 +731,14 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
         ids, tgt, dist = build_niah_batch(n_seq, seq_len, n_pairs, vocab, seed)
         correct = np.zeros_like(tgt, dtype=bool)
         span = min(seq_len, max_pos) if getattr(model, 'use_abs_pe', True) else seq_len
-        n_scored = span - 1
+        tail = 2 * n_pairs
         i = 0
         while i < n_seq:
             j = min(i + chunk, n_seq)
             x = torch.from_numpy(ids[i:j]).to(device)
             trunc = getattr(model, 'use_abs_pe', True) and seq_len > max_pos
             try:
-                logits = model(x[:, -span:].clamp(0, vocab - 1) if trunc else x)
+                logits = model(x[:, -span:].clamp(0, vocab - 1) if trunc else x, logits_tail=tail)
             except torch.cuda.OutOfMemoryError:
                 del x
                 if device.type == 'cuda':
@@ -749,15 +749,11 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
                 print(f'[niah] eval OOM; retrying with chunk={chunk}')
                 continue
             pred = logits[:, :-1].argmax(-1).cpu().numpy()
-            if trunc:
-                t = tgt[i:j, -n_scored:]
-                correct[i:j, -n_scored:] = (pred == t) & (t >= 0)
-            else:
-                t = tgt[i:j][:, :n_scored]
-                correct[i:j, :n_scored] = (pred == t) & (t >= 0)
+            t = tgt[i:j, -(tail - 1):]
+            correct[i:j, -(tail - 1):] = (pred == t) & (t >= 0)
             del x, logits
             i = j
-        scored_cols = n_scored
+        scored_cols = tail - 1
         m = np.zeros_like(tgt, dtype=bool)
         m[:, -scored_cols:] = tgt[:, -scored_cols:] >= 0
         if m.sum() == 0:

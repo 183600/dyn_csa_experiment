@@ -191,6 +191,8 @@ _MASK_CACHE_BUDGET_BYTES = 192 << 20
 def _cache_bytes(t):
     if t is None:
         return 0
+    if isinstance(t, (tuple, list)):
+        return sum((_cache_bytes(_v) for _v in t))
     try:
         return int(t.numel()) * int(t.element_size())
     except Exception:
@@ -974,7 +976,7 @@ class HybridAttention(nn.Module):
             else:
                 gate_mean = torch.zeros((), device=x.device) if self.need_reg else None
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
-            sim = cosine_similarity_consecutive(x)
+            sim = cosine_similarity_consecutive(x.detach())
             tau = causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
             bid, nblk = blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim, return_count=True)
         else:
@@ -1281,7 +1283,7 @@ def _ids_fp(train_ids):
 def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_dir='./wt103_cache'):
     from datasets import load_dataset
     os.makedirs(cache_dir, exist_ok=True)
-    tag = f'v3_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}'
+    tag = f'v4_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}'
     tr_path = os.path.join(cache_dir, f'train_ids_{tag}.npy')
     va_path = os.path.join(cache_dir, f'val_batch_{tag}.npy')
     vp_path = os.path.join(cache_dir, f'val_bnd_{tag}.npy')
@@ -1289,10 +1291,13 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
         print('[data] loading cached token ids ...')
         train_ids = np.load(tr_path)
-        val_batch = np.load(va_path)
-        val_bnd = np.load(vp_path)
-        vocab = json.load(open(me_path, encoding='utf-8'))['vocab']
-        return (train_ids, val_batch, vocab, None, val_bnd)
+        meta = json.load(open(me_path, encoding='utf-8'))
+        if meta.get('src_fp') != _ids_fp(train_ids):
+            print('[data] WARNING: the cached train_ids do not match the fingerprint in the meta file — the cache is corrupt or was mixed across builds; REBUILDING it')
+        else:
+            val_batch = np.load(va_path)
+            val_bnd = np.load(vp_path)
+            return (train_ids, val_batch, meta['vocab'], None, val_bnd)
     ds = local_wikitext_if_available(cache_dir)
     if ds is None:
         last_err = None
@@ -1333,15 +1338,24 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     print(f'[data] train tokens = {len(train_ids)}  vocab = {vocab}')
     print('[data] tokenising validation ...')
     val_ids = stream_tokenise('validation', val_seqs * seq_len + seq_len, 'val')
-    n_val = len(val_ids) // seq_len
+    n_val = min(len(val_ids) // seq_len, val_seqs)
     val_batch = val_ids[:n_val * seq_len].reshape(n_val, seq_len)
     print(f'[data] val sequences = {n_val} (seq_len={seq_len})')
     bnd_ids = sorted(boundary_token_ids(tok, eos_id))
     val_bnd = np.isin(val_batch, bnd_ids)
     print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
     for _p, _a in ((tr_path, train_ids), (va_path, val_batch), (vp_path, val_bnd)):
-        np.save(_p + '.tmp', _a)
-        os.replace(_p + '.tmp.npy', _p)
+        _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(_p)), prefix=os.path.basename(_p) + '.', suffix='.tmp')
+        try:
+            with os.fdopen(_fd, 'wb') as _fh:
+                np.save(_fh, _a)
+            os.replace(_tmp, _p)
+        except BaseException:
+            try:
+                os.unlink(_tmp)
+            except OSError:
+                pass
+            raise
     atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids)}, indent=0)
     print('[data] cached token ids to disk (resume-safe)')
     del ds
@@ -1517,7 +1531,7 @@ def variant_presence(outdir):
         v = r.get('variant')
         if v is None:
             v = _k.split('::')[0]
-        if ppl_is_usable(r.get('ppl')) and (not r.get('synthesized')):
+        if ppl_is_usable(r.get('ppl')) and (not r.get('synthesized')) and (_as_seed_int(r.get('seed')) is not None):
             kept[v] = kept.get(v, 0) + 1
         else:
             refused[v] = refused.get(v, 0) + 1
@@ -1750,11 +1764,10 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
                 ntok += int(_tgts.numel())
                 del _rows, _tgts
             else:
-                _rows = logits[:, :_span, :].reshape(-1, logits.size(-1))
-                _tgts = ids[:, 1:].reshape(-1)
-                nll += F.cross_entropy(_rows, _tgts, reduction='sum').double()
+                _tgts = ids[:, 1:]
+                nll += F.cross_entropy(logits[:, :_span, :].transpose(1, 2), _tgts, reduction='sum').double()
                 ntok += int(_tgts.numel())
-                del _rows, _tgts
+                del _tgts
             del ids, logits
     finally:
         for _a, _prev in zip(need_reg_layers, need_reg_prior):
@@ -1807,15 +1820,8 @@ def _mask_runs(near, n_pos, tol):
         elif e == m.size and L == tol + 1:
             out.append(m.size - 1)
         elif L > 2 * tol + 1:
-            step = 2 * tol + 1
-            k = -(-L // step)
-            span = (k - 1) * step
-            off = (L - 1 - span) // 2
-            if s == 0:
-                off = 0
-            elif e == m.size:
-                off = L - 1 - span
-            out.extend((s + off + i * step for i in range(k)))
+            ok = False
+            break
         else:
             ok = False
             break
@@ -1826,7 +1832,7 @@ def _mask_runs(near, n_pos, tol):
         room = m.size - ends[-1]
         if len(starts) == 1 or room >= tol:
             return np.asarray(sorted(set(out)), dtype=int) + 1
-    return np.nonzero(m)[0].astype(int) + 1
+    return None
 
 def _random_cut_precision(P, near, n_pos, tol, G, gt_bounds=None, approx_flag=None):
     if P <= 0 or G <= 0 or n_pos <= 0:
@@ -2113,6 +2119,7 @@ def _match_count(cuts, bounds, tol, _pre=None):
     return _greedy_match_counts(cuts, bounds, tol, _pre=_pre)[0]
 
 def _greedy_match_counts(pred, gt, tol, _pre=None):
+    pred = np.sort(np.asarray(pred))
     P, G = (len(pred), len(gt))
     if P == 0 or G == 0:
         return (0, 0)
@@ -2767,6 +2774,11 @@ def aggregate(summary):
         for _cand in ((tag, fp_idx), (tag, None), ('', None)):
             if _cand in base_groups:
                 return (base_groups[_cand], _cand[0])
+        _want_cfg = recs[0].get('run_cfg') if recs else None
+        if _want_cfg is not None:
+            _rc = [(_t_c, _grp) for (_t_c, _i_c), _grp in base_groups.items() if _t_c == tag and _grp and (_grp[0].get('run_cfg') == _want_cfg)]
+            if len(_rc) == 1:
+                return (_rc[0][1], _rc[0][0])
         return (None, None)
     _base_amb = []
     for (v, tag, fp_idx), recs in _split_groups:
@@ -2916,19 +2928,21 @@ def _print_pairs(summary):
             if tag == '' and '' in _a_t and ('' in _b_t):
                 seeds = sorted({s for t, s in ra if t == ''} & {s for t, s in rb if t == ''})
                 common += [('', '', s) for s in seeds]
-        dl, _sk = ([], [])
+        _by_cond = {}
+        _sk = []
         for ts, bs, s in common:
             _reason = pair_reason(ra[ts, s], rb[bs, s])
             if _reason is not None:
                 _sk.append((s, _reason))
                 continue
-            dl.append(ra[ts, s]['ppl'] - rb[bs, s]['ppl'])
+            _by_cond.setdefault((ts, bs), []).append(ra[ts, s]['ppl'] - rb[bs, s]['ppl'])
         if _sk:
             _pair_skip.append((a, b, len(_sk), len(common), sorted({r for _s, r in _sk})))
-        if dl:
+        for (ts, bs), dl in sorted(_by_cond.items()):
             d = np.array(dl, dtype=float)
             std = float(d.std(ddof=1)) if len(d) > 1 else 0.0
-            print(f'  {a:22s} − {b:22s} = {d.mean():+7.2f} ± {std:5.2f}   (n={len(d)})')
+            _lab = '' if ts == bs == '' else f'   [{ts or '(untagged)'} vs {bs or '(untagged)'}]'
+            print(f'  {a:22s} − {b:22s} = {d.mean():+7.2f} ± {std:5.2f}   (n={len(d)}){_lab}')
     if _pair_skip:
         print('  [skip] seed(s) rejected by the run_cfg/budget gate (see `pair_reason`); the printed n counts only the pairs that cleared it —')
         for _a, _b, _nsk, _ncom, _why in _pair_skip:
@@ -3005,7 +3019,7 @@ def _plot(summary, agg, outdir):
     if drew:
         ax[3].legend(fontsize=7)
     ax[3].grid(alpha=0.3)
-    _dense_keys = [k for k in agg if k == 'full' or k.startswith('full@cfg')]
+    _dense_keys = [k for k in agg if k.split('#')[0].split('@')[0] == 'full']
     _dense_key = next((k for k in _dense_keys if agg[k].get('ppl_curve') and agg[k].get('tokens_per_step')), None)
     if _dense_key is None:
         print(f'[_plot] no dense `full` group with both a `ppl_curve` and a `tokens_per_step` in this aggregate (candidates: {_dense_keys or 'none'}) — the sparse-vs-dense gap panel (finding #10) is NOT drawn.')

@@ -404,8 +404,10 @@ def main(argv=None):
             if not steps:
                 continue
             Y[~np.isfinite(Y) | (Y <= 0)] = np.nan
-            ax.plot(steps, np.nanmean(Y, axis=0), color=color, lw=2, label=lab)
-            ax.fill_between(steps, np.nanmin(Y, axis=0), np.nanmax(Y, axis=0), color=color, alpha=0.18)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                ax.plot(steps, np.nanmean(Y, axis=0), color=color, lw=2, label=lab)
+                ax.fill_between(steps, np.nanmin(Y, axis=0), np.nanmax(Y, axis=0), color=color, alpha=0.18)
         ax.set_title(ttl)
         ax.set_xlabel('step')
         ax.set_ylabel('val PPL (log)')
@@ -462,7 +464,9 @@ def main(argv=None):
             print(f'[fuse_analysis] NOTE: skipping len_mean curve of `{v}` — {e}')
             continue
         x = np.array(layer_idx(layers))
-        ax.errorbar(x, np.nanmean(Mm, axis=0), yerr=np.nanmean(Ms, axis=0), marker='o', ms=4, lw=1.6, color=color, label=v, alpha=0.9)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            ax.errorbar(x, np.nanmean(Mm, axis=0), yerr=np.nanmean(Ms, axis=0), marker='o', ms=4, lw=1.6, color=color, label=v, alpha=0.9)
     ax.set_xticks(all_idx)
     ax.set_xticklabels([f'L{i}' for i in all_idx])
     ax.set_title('block length: mean ± std (dynamic layers only)')
@@ -475,7 +479,9 @@ def main(argv=None):
         except (KeyError, ValueError, TypeError) as e:
             print(f'[fuse_analysis] NOTE: skipping frac_at_min curve of `{v}` — {e}')
             continue
-        ax.plot(np.array(layer_idx(layers)), np.nanmean(Mf, axis=0), marker='s', ms=4, lw=1.6, color=color, label=v)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            ax.plot(np.array(layer_idx(layers)), np.nanmean(Mf, axis=0), marker='s', ms=4, lw=1.6, color=color, label=v)
     ax.set_xticks(all_idx)
     ax.set_xticklabels([f'L{i}' for i in all_idx])
     ax.set_title('frac_at_min (degenerate min-length blocks)')
