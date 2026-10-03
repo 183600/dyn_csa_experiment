@@ -379,6 +379,21 @@ def build_report(out='REPORT_v11.md'):
                     return (float(np.mean([c['ppl'] for c in ok])), len(ok) < len(cells))
                 return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
 
+            def _paired_ratio(rows=rows):
+                m512, m4096 = ({}, {})
+                for r in rows:
+                    bl = r.get('by_len')
+                    if not isinstance(bl, dict):
+                        continue
+                    for Ln, mp in ((512, m512), (4096, m4096)):
+                        c = bl.get(Ln, bl.get(str(Ln)))
+                        if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')):
+                            mp[r.get('seed')] = float(c['ppl'])
+                both = sorted(set(m512) & set(m4096))
+                if not both:
+                    return None
+                return float(np.mean([m4096[s] for s in both])) / float(np.mean([m512[s] for s in both]))
+
             def _fmt_cell(Ln):
                 val, tr = _at(Ln)
                 return f'{val:.1f}~' if tr else f'{val:.1f}'
@@ -386,10 +401,9 @@ def build_report(out='REPORT_v11.md'):
             _p4096, _4096tr = _at(4096)
             if _512tr or _4096tr:
                 ratio = '—（含截断 cell，不可比）'
-            elif np.isnan(_p512) or np.isnan(_p4096) or (not _p512):
-                ratio = '—'
             else:
-                ratio = f'×{_p4096 / _p512:.2f}'
+                _pr = _paired_ratio()
+                ratio = f'×{_pr:.2f}' if _pr is not None and np.isfinite(_pr) else '—'
             A(f'| `{v}` | {_fmt_cell(512)} | {_fmt_cell(2048)} | {_fmt_cell(4096)} | {ratio} |')
         A('')
         A('> 后缀 `~` 表示该列**只有位置受限（abs-PE）的截断 cell**：它是在比列名更短的 span 上评出来的分数，**不是**长上下文测量值。任何 `~` 行不可用于「外推是否稳健」的结论；RoPE 臂（无位置上限）在同一表里是未被截断的真实长上下文分数，两类不可直接相比。')

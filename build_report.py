@@ -707,6 +707,18 @@ def sec_p1l():
     if not s:
         return '## P1 长上下文长度外推（train@512 → eval 512..4096）— （无结果）\n\n> 注：合成 NIAH 检索探针已实现并调试（碰撞无关布局、可达标签），但在本受控规模（d=256 / 6 层 / seq 512）下 absPE 与 RoPE 两臂均无法学到高于随机的检索率，探针面板无信息量，故以 wikitext长度外推替代（见报告头部说明）。\n\n'
     recs = [r for r in s.values() if isinstance(r, dict) and 'by_len' in r and (not r.get('synthesized')) and any((isinstance(c, dict) and _ppl_ok(c.get('ppl')) for c in r['by_len'].values()))]
+    _by_var = {}
+    for r in recs:
+        _by_var.setdefault(r.get('variant'), []).append(r)
+    recs = []
+    for _v, _rv in _by_var.items():
+        _cur = [r for r in _rv if r.get('_code') == _CUR_CS]
+        if _cur:
+            if len(_cur) < len(_rv):
+                print(f'[report] sec_p1l: {_v}: {len(_rv) - len(_cur)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur)} current one(s)')
+            recs.extend(_cur)
+        else:
+            recs.extend(_rv)
     if not recs:
         return '## P1 长上下文长度外推 — （无结果）\n\n'
     def _len_key(Ln):
@@ -801,9 +813,18 @@ def _agg_entry(d, v):
     cands = [(k, e) for k, e in d.items() if isinstance(e, dict) and (k.startswith(f'{v}@cfg') or k.startswith(f'{v}#'))]
     if not cands:
         return None
-    cands.sort(key=lambda kv: (not (isinstance(kv[0], str) and _CUR_CS and kv[0].endswith(f'_cs{_CUR_CS}')), -(_int_or(kv[1].get('n_seeds'), 0))))
+
+    def _is_cur(e):
+        rc = e.get('run_cfg')
+        return isinstance(rc, str) and bool(_CUR_CS) and rc.endswith(f'_cs{_CUR_CS}')
+    if any((_is_cur(e) for _k, e in cands)):
+        cands.sort(key=lambda kv: (not _is_cur(kv[1]), -(_int_or(kv[1].get('n_seeds'), 0))))
+        _why = 'the one stamped with the current code semantics'
+    else:
+        cands.sort(key=lambda kv: -(_int_or(kv[1].get('n_seeds'), 0)))
+        _why = 'the largest-n one (no group carries a current-code run_cfg stamp — re-run `aggregate` to stamp them)'
     if len(cands) > 1:
-        print(f'[report] _agg_entry: `{v}` spans {len(cands)} cfg/protocol groups ({sorted((k for k, _e in cands))}) — quoting the largest-n one ({cands[0][0]}, n_seeds={cands[0][1].get('n_seeds')})')
+        print(f'[report] _agg_entry: `{v}` spans {len(cands)} cfg/protocol groups ({sorted((k for k, _e in cands))}) — quoting {_why} ({cands[0][0]}, n_seeds={cands[0][1].get('n_seeds')})')
     return cands[0][1]
 
 def _params_m(r):

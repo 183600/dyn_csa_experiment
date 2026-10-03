@@ -288,7 +288,7 @@ def run_phase(name, guard):
 def _ppl_by_seed(outdir, full=False):
     return V9._ppl_by_seed(outdir, full=full)
 
-def _hist_by_seed(outdir, variant):
+def _hist_by_seed(outdir, variant, raw=None):
     sp = os.path.join(outdir, 'summary.json')
 
     class _Curves(dict):
@@ -298,13 +298,14 @@ def _hist_by_seed(outdir, variant):
             self.per_seed_synth = {}
     out = _Curves()
     synth_of = {}
-    if not os.path.exists(sp):
-        return out
-    try:
-        raw = json.load(open(sp, encoding='utf-8'))
-    except Exception as e:
-        print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — no curve for {variant}')
-        return out
+    if raw is None:
+        if not os.path.exists(sp):
+            return out
+        try:
+            raw = json.load(open(sp, encoding='utf-8'))
+        except Exception as e:
+            print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — no curve for {variant}')
+            return out
     seen = {}
     cfg_of = {}
     for _k, r in raw.items():
@@ -392,7 +393,7 @@ def _hist_by_seed(outdir, variant):
                 synth_of.pop(s, None)
                 cfg_of.pop(s, None)
     _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
-    _stale = sorted((s for s in out if isinstance(cfg_of.get(s), str) and (not cfg_of[s].endswith(_cur_sfx))))
+    _stale = sorted((s for s in out if not (isinstance(cfg_of.get(s), str) and cfg_of[s].endswith(_cur_sfx))))
     if _stale:
         print(f'[stats] {sp}: `{variant}` curve(s) at seed(s) {_stale} are stamped with an OLDER code semantics than the current run_cfg suffix — they are kept on disk but excluded from every crossover/pairing statistic; re-run this cell to measure them with the current code')
     out.stale_cfg_seeds = set(_stale)
@@ -413,15 +414,16 @@ def _crossover_step(gap_steps, gap_vals, smooth=1):
             return (float(s[int(np.argmax(_suf_ok))]), True)
     return (float(s[len(g) - 1]) if len(g) else float('nan'), False)
 
-def _tokens_per_step(outdir, fallback=None):
+def _tokens_per_step(outdir, fallback=None, raw=None):
     sp = os.path.join(outdir, 'summary.json')
-    if not os.path.exists(sp):
-        return None
-    try:
-        raw = json.load(open(sp, encoding='utf-8'))
-    except Exception as e:
-        print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — no tokens/step for this panel')
-        return None
+    if raw is None:
+        if not os.path.exists(sp):
+            return None
+        try:
+            raw = json.load(open(sp, encoding='utf-8'))
+        except Exception as e:
+            print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — no tokens/step for this panel')
+            return None
     rates = []
     n_bad = 0
     for _k, r in raw.items():
@@ -455,8 +457,16 @@ def _scale_crossovers():
     panels = {'d128_L4': dict(outdir='results_lm_v10_scale_s', d=128, n_layers=4, batch=12, seq=512), 'd256_L6': dict(outdir='results_lm_v3_long', d=256, n_layers=6, batch=12, seq=512), 'd384_L8': dict(outdir='results_lm_v5_scale', d=384, n_layers=8, batch=8, seq=1024), 'd512_L10': dict(outdir='results_lm_v10_scale_l', d=512, n_layers=10, batch=12, seq=512)}
     out = {}
     for label, p in panels.items():
-        ha = _hist_by_seed(p['outdir'], 'csa_fixed')
-        hb = _hist_by_seed(p['outdir'], 'full')
+        _raw = None
+        _sp = os.path.join(p['outdir'], 'summary.json')
+        if os.path.exists(_sp):
+            try:
+                with open(_sp, encoding='utf-8') as _f:
+                    _raw = json.load(_f)
+            except Exception:
+                _raw = None
+        ha = _hist_by_seed(p['outdir'], 'csa_fixed', raw=_raw)
+        hb = _hist_by_seed(p['outdir'], 'full', raw=_raw)
         _stale_seeds = sorted(getattr(ha, 'stale_cfg_seeds', set()) | getattr(hb, 'stale_cfg_seeds', set()))
         if _stale_seeds:
             print(f'[stats] {label}: seed(s) {_stale_seeds} were measured under an older code-stamp — a code change must invalidate and recompute, not be reused, so they are excluded from this {label} crossover fit')
@@ -487,7 +497,7 @@ def _scale_crossovers():
             out[label] = {'status': 'missing', **p}
             continue
         common = _paired
-        tps = _tokens_per_step(p['outdir'], fallback=p['batch'] * p['seq'])
+        tps = _tokens_per_step(p['outdir'], fallback=p['batch'] * p['seq'], raw=_raw)
         if tps is not None and tps != p['batch'] * p['seq']:
             print(f'[stats] {label}: panel tokens/step is {tps:g} but its declared batch*seq is {p['batch'] * p['seq']} — using the calibrated rate')
         per_seed = {}
@@ -726,6 +736,21 @@ def build_report(out='REPORT_v10.md'):
                     return (float(np.mean([c['ppl'] for c in ok])), len(ok) < len(cells))
                 return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
 
+            def _paired_ratio(rows=rows):
+                m512, m4096 = ({}, {})
+                for r in rows:
+                    bl = r.get('by_len')
+                    if not isinstance(bl, dict):
+                        continue
+                    for Ln, mp in ((512, m512), (4096, m4096)):
+                        c = bl.get(Ln, bl.get(str(Ln)))
+                        if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')):
+                            mp[r.get('seed')] = float(c['ppl'])
+                both = sorted(set(m512) & set(m4096))
+                if not both:
+                    return None
+                return float(np.mean([m4096[s] for s in both])) / float(np.mean([m512[s] for s in both]))
+
             def _fmt_cell(Ln):
                 val, tr = _at(Ln)
                 return f'{val:.1f}~' if tr else f'{val:.1f}'
@@ -733,10 +758,9 @@ def build_report(out='REPORT_v10.md'):
             p4096, _4096tr = _at(4096)
             if _512tr or _4096tr:
                 _ratio = '—（含截断 cell，不可比）'
-            elif not (np.isfinite(p512) and np.isfinite(p4096) and (p512 > 0)):
-                _ratio = '—'
             else:
-                _ratio = f'×{p4096 / p512:.2f}'
+                _pr = _paired_ratio()
+                _ratio = f'×{_pr:.2f}' if _pr is not None and np.isfinite(_pr) else '—'
             A(f'| `{v}` | {_fmt_cell(512)} | {_fmt_cell(2048)} | {_fmt_cell(4096)} | {_ratio} |')
         A('')
         A('> 后缀 `~` 表示该列**只有位置受限（abs-PE）的截断 cell**：它是在比列名更短的 span 上评出来的分数，**不是**长上下文测量值。任何 `~` 行不可用于「外推是否稳健」的结论。')

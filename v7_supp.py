@@ -1267,22 +1267,29 @@ def run_lenphase(payload, guard=None, label=''):
                 torch.cuda.empty_cache()
             key = f'{v}::seed{seed}'
             _cur = summary.get(key)
+            _need_lens = list(eval_lens)
             if L.result_is_current(_cur, CKPT_CODE, 'by_len'):
-                if all(L.by_len_cells([_cur], Ln) for Ln in eval_lens):
+                _need_lens = [Ln for Ln in eval_lens if not L.by_len_cells([_cur], Ln)]
+                if not _need_lens:
                     continue
                 print(f'[resume] {key}: by_len record is stamped current but at least one eval length holds no usable measurement (error cell) — re-evaluating the missing lengths')
-                del summary[key]
-                L.atomic_write_json(spath, summary, indent=2)
             _ckp = _ckp_pre if _ckp_pre is not None else _load_ckpt(ck)
             model = L.SmallGPT(_ckp.get('vocab', vocab), 256, 6, 8, 32, _ckp.get('train_len', train_len), _ckp['cfg'], mlp_ratio=_ckp['mlp_ratio']).to(DEVICE)
             model.load_state_dict(_ckp['sd'])
             mp = None if not getattr(model, 'use_abs_pe', True) else _ckp.get('max_seq', train_len)
             _t_ev = time.time()
-            r = eval_length_gen(model, val_ids, eval_lens, DEVICE, max_pos=mp)
+            r = eval_length_gen(model, val_ids, _need_lens, DEVICE, max_pos=mp)
             if guard is not None:
                 guard.record_run(time.time() - _t_ev, 0, 0, 0, 0, 0)
-            summary[key] = {'variant': v, 'seed': seed, 'params': _ckp['params'], 'max_pos': mp, 'by_len': r, '_code': CKPT_CODE}
-            print(f'  [p1l] {v:18s} s{seed} ' + '  '.join((f'L{k}={vv.get('ppl', float('nan')):.2f}' for k, vv in sorted(r.items()))))
+            _merged = {}
+            for _bk, _bc in (((_cur or {}).get('by_len') or {}).items() if _need_lens != list(eval_lens) else []):
+                try:
+                    _merged[int(_bk)] = _bc
+                except (TypeError, ValueError):
+                    continue
+            _merged.update(r)
+            summary[key] = {'variant': v, 'seed': seed, 'params': _ckp['params'], 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE}
+            print(f'  [p1l] {v:18s} s{seed} ' + '  '.join((f'L{k}={vv.get('ppl', float('nan')):.2f}' for k, vv in sorted(_merged.items()))))
             L.atomic_write_json(spath, summary, indent=2)
             del model, _ckp
             gc.collect()

@@ -2668,6 +2668,7 @@ def aggregate(summary):
         entry = {'variant': v, 'protocol': tag, 'n_seeds': len(recs), 'ppl_mean': float(ppls.mean()), 'ppl_std': float(ppls.std(ddof=1)) if len(ppls) > 1 else 0.0, 'ppls': [float(p) for p in ppls], 'seeds': [r.get('seed') for r in recs], 'params': _group_params(recs), 'tokens_seen': recs[0].get('tokens_seen')}
         if _fp_idx is not None:
             entry['run_cfg_class'] = _fp_idx
+            entry['run_cfg'] = recs[0].get('run_cfg')
         dyn_lens, all_lens, deltas = ([], [], [])
         bf1, bex = ([], [])
 

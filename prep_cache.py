@@ -25,13 +25,18 @@ class FakeSplit:
             return self.texts
         raise TypeError(key)
 
+_CORPUS = None
+
 def fake_load_dataset(repo, config, cache_dir=None):
+    global _CORPUS
     assert config == 'wikitext-103-raw-v1', config
-    print(f'[prep] fake load_dataset({repo}, {config}) from {PARQUET_DIR}')
-    train = pd.concat([pd.read_parquet(os.path.join(PARQUET_DIR, f'train-0000{i}-of-00002.parquet')) for i in (0, 1)])['text'].tolist()
-    val = pd.read_parquet(os.path.join(PARQUET_DIR, 'validation-00000-of-00001.parquet'))['text'].tolist()
-    print(f'[prep] train rows={len(train)}  val rows={len(val)}')
-    return {'train': FakeSplit(train), 'validation': FakeSplit(val)}
+    if _CORPUS is None:
+        print(f'[prep] fake load_dataset({repo}, {config}) from {PARQUET_DIR}')
+        train = pd.concat([pd.read_parquet(os.path.join(PARQUET_DIR, f'train-0000{i}-of-00002.parquet')) for i in (0, 1)])['text'].tolist()
+        val = pd.read_parquet(os.path.join(PARQUET_DIR, 'validation-00000-of-00001.parquet'))['text'].tolist()
+        print(f'[prep] train rows={len(train)}  val rows={len(val)}')
+        _CORPUS = (train, val)
+    return {'train': FakeSplit(_CORPUS[0]), 'validation': FakeSplit(_CORPUS[1])}
 
 def main():
     import numpy as np
