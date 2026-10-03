@@ -56,7 +56,7 @@ def main():
             src_fp = L._ids_fp(train_ids)
         else:
             src_fp = None
-        _me_big_path = os.path.join('./wt103_cache', f'meta_v3_sl{seq_len}_cap{biggest}_v8192_vs512.json')
+        _me_big_path = os.path.join('./wt103_cache', f'meta_v4_sl{seq_len}_cap{biggest}_v8192_vs512.json')
         _big_fp = None
         try:
             with open(_me_big_path, encoding='utf-8') as _f:
@@ -67,7 +67,7 @@ def main():
             print(f'[prep] seq_len={seq_len}: the cap={biggest} cache carries src_fp={_big_fp!r} while the ids it served hash to {src_fp!r} — the source tokenisation is not verifiable; REFUSING to derive smaller-cap caches from it. Remove the cap={biggest} cache files and re-run to re-tokenise from the corpus.')
             continue
         for cap in caps[:-1]:
-            tag = f'v3_sl{seq_len}_cap{cap}_v8192_vs512'
+            tag = f'v4_sl{seq_len}_cap{cap}_v8192_vs512'
             tr_path = os.path.join('./wt103_cache', f'train_ids_{tag}.npy')
             va_path = os.path.join('./wt103_cache', f'val_batch_{tag}.npy')
             vp_path = os.path.join('./wt103_cache', f'val_bnd_{tag}.npy')

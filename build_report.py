@@ -70,9 +70,13 @@ def exact_signflip(deltas):
             _np = None
         if _np is not None:
             _rng = _np.random.default_rng(0)
-            _signs = _np.where(_rng.random((B, n)) < 0.5, 1.0, -1.0)
-            _sums = _np.abs((_signs * _np.asarray(deltas)[None, :]).sum(1))
-            cnt = 1 + int((_sums >= obs - 1e-12).sum())
+            cnt = 1
+            _step = max(1, min(B, (1 << 24) // max(n, 1)))
+            for _off in range(0, B, _step):
+                _bs = min(_step, B - _off)
+                _signs = _np.where(_rng.random((_bs, n)) < 0.5, 1.0, -1.0)
+                _sums = _np.abs((_signs * _np.asarray(deltas)[None, :]).sum(1))
+                cnt += int((_sums >= obs - 1e-12).sum())
         else:
             rng = random.Random(0)
             cnt = 1
@@ -466,7 +470,7 @@ def sec_p0w():
             if _st is None:
                 continue
             _d = _st['mean']
-            _floor = 2.0 / (1 << _st['n']) if _st['n'] else 1.0
+            _floor = 2.0 / (1 << _st['n']) if _st['n'] and _st['n'] <= 20 else 1.0 / 200001.0
             _same_dir = all((x != 0 and (x > 0) == (_d > 0) for x in _dd))
             if _st['p_exact_signflip'] > 0.05:
                 _verdict = f'n={_st['n']} 时 p={_st['p_exact_signflip']:.4f}（检验下限 {_floor:.3f}），**不构成显著**，' + ('各 seed 方向一致' if _same_dir else '方向不一致')

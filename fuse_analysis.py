@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, itertools, math, os, sys, functools, warnings
+import json, math, os, sys, functools, warnings
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -145,13 +145,16 @@ def signflip(deltas):
     if n > 20:
         rng = np.random.default_rng(0)
         B = 200000
-        signs = np.where(rng.random((B, n)) < 0.5, 1.0, -1.0)
-        cnt = 1 + int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
+        cnt = 1
+        step = max(1, min(B, (1 << 24) // max(n, 1)))
+        for off in range(0, B, step):
+            bs = min(step, B - off)
+            signs = np.where(rng.random((bs, n)) < 0.5, 1.0, -1.0)
+            cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
         return cnt / (B + 1)
-    cnt = 0
-    for signs in itertools.product([1, -1], repeat=n):
-        if abs((d * np.asarray(signs)).mean()) >= obs - 1e-12:
-            cnt += 1
+    masks = np.arange(1 << n, dtype=np.int64)
+    signs = (((masks[:, None] >> np.arange(n, dtype=np.int64)) & 1) * 2 - 1).astype(float)
+    cnt = int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
     return cnt / 2 ** n
 
 def sample_std(deltas, axis=None):
