@@ -149,13 +149,9 @@ class HybridAttentionRoPE(L.HybridAttention):
             mask = L.causal_window_mask(T, cfg.window, x.device)
         logits.add_(mask)
         if self.sink is not None:
-            sink_view = self.sink.view(1, self.nh, 1, 1)
-            if not L._sink_all_finite(self.sink):
-                logits = torch.cat([sink_view.expand_as(logits[..., :1]), logits], dim=-1)
-                attn = torch.nan_to_num(torch.softmax(logits, -1))[..., 1:]
-            else:
-                lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
-                attn = torch.exp(logits - lse)
+            sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1)
+            lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
+            attn = torch.exp(logits - lse)
         else:
             attn = torch.softmax(logits, -1)
         out = torch.einsum('bhnm,bmhd->bnhd', attn, v)
@@ -255,7 +251,8 @@ class HybridAttentionRoPE(L.HybridAttention):
             q_chunk = min(q_chunk, _max_rows)
         cos, sin = rope_cos_sin(hd, rope_dim, L._arange_cache(T, dev), dev, rope_base)
         qr = apply_rope(q, cos[:, None, :], sin[:, None, :], rope_dim)
-        bc, bs = rope_cos_sin(hd, rope_dim, last_tok, dev, rope_base)
+        _lt = last_tok.long()
+        bc, bs = (cos[_lt], sin[_lt])
         k_blk_r = apply_rope(k_blk, bc[:, None, :], bs[:, None, :], rope_dim)
         k_sw_r = apply_rope(k_sw, cos[:, None, :], sin[:, None, :], rope_dim)
         out = torch.empty_like(q)
@@ -504,6 +501,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     L._attb_bump_epoch()
     if variant in set(L.PARAM_MATCHED) | set(PARAM_MATCHED_V7) and float(mlp_ratio) == 4.0:
         raise ValueError(f'{variant} is a PARAM-MATCHED baseline but was given the default mlp_ratio=4; its MLP must be widened to match its sparse reference arm, or the comparison is not parameter-controlled. Pass mlp_ratio=L.variant_mlp_ratio(...).')
+    if steps < 1:
+        raise ValueError(f'steps={steps}: nothing to train')
     if warm_steps >= steps:
         raise ValueError(f'warm_steps={warm_steps} >= steps={steps}: the dense->sparse switch never fires, so the recorded numbers would come from a dense-protocol model')
     cfgs = L.make_layer_cfgs(n_layers, variant)
@@ -523,6 +522,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         t = (step - warmup) / max(steps - warmup, 1)
         return lr * (0.1 + 0.45 * (1.0 + math.cos(math.pi * t)))
     bpe = L.batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
+    _eval_batch = val_batch[:eval_subset]
     warm_on = warm_steps > 0
     for _blk in model.blocks:
         _blk.attn._dense_warmup = warm_on
@@ -544,7 +544,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         if warm_steps > 0 and step == warm_steps:
             for _blk in model.blocks:
                 _blk.attn._dense_warmup = False
-            switch_ppl = float(L.eval_ppl(model, val_batch[:eval_subset], device))
+            switch_ppl = float(L.eval_ppl(model, _eval_batch, device))
             print(f'  [warmup] step {step}: dense -> SPARSE (h=val PPL {switch_ppl:.2f})')
         base = lr_at(step)
         for g in opt.param_groups:
@@ -562,7 +562,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         if len(_tail) > 50:
             del _tail[:-50]
         if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
-            _pv = float(L.eval_ppl(model, val_batch[:eval_subset], device))
+            _pv = float(L.eval_ppl(model, _eval_batch, device))
             (warm_hist if getattr(model.blocks[0].attn, '_dense_warmup', False) else ppl_hist).append([step + 1, _pv])
         if log_every and (step % log_every == 0 or step == steps - 1):
             if _lbuf:
@@ -899,7 +899,13 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                     continue
                 _slot[r['seed']] = r
     pairs = [('warmup w=5000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w5000', 'results_lm_v7_warmup::csa_fixed::w0'), ('warmup w=10000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w10000', 'results_lm_v7_warmup::csa_fixed::w0'), ('CSA+RoPE vs CSA absPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::csa_fixed'), ('CSA+RoPE vs dense+RoPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::full_rope'), ('hybrid+RoPE vs dense+RoPE', 'results_lm_v7_rope::hybrid_fixed_rope', 'results_lm_v7_rope::full_rope')]
-    out_d = {'per_variant': {k: {'ppls': {s: r['ppl'] for s, r in v.items()}, 'mean': float(np.mean([r['ppl'] for r in v.values()]))} for k, v in recs.items()}, 'comparisons': {}}
+    per_variant = {}
+    for k, v in recs.items():
+        _m = {s: r for s, r in v.items() if not r.get('_dup')}
+        if not _m:
+            continue
+        per_variant[k] = {'ppls': {s: r['ppl'] for s, r in _m.items()}, 'mean': float(np.mean([r['ppl'] for r in _m.values()]))}
+    out_d = {'per_variant': per_variant, 'comparisons': {}}
     for name, a, b in pairs:
         if a not in recs or b not in recs:
             continue
@@ -908,6 +914,10 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         mismatch_fields = set()
         for s in common:
             ra, rb = (recs[a][s], recs[b][s])
+            if ra.get('_dup') or rb.get('_dup'):
+                mismatch_fields.add('an ambiguous duplicate measurement on one side')
+                skipped.append(s)
+                continue
             if ra.get('run_cfg') is None:
                 unstamped += 1
             if rb.get('run_cfg') is None:
@@ -1004,7 +1014,8 @@ def run_niah_phase(payload, guard=None, label=''):
         except Exception as _e:
             print(f'[resume] FATAL: {spath} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
-    _recipe = f'niah_steps{n_steps}_v{vocab}_bs12_sl512_lr0.0003_mr-csa_dynamic_rope_reuse4'
+    _mr_ref = 'csa_fixed_rope'
+    _recipe = f'niah_steps{n_steps}_v{vocab}_bs12_sl512_lr0.0003_mr-{_mr_ref}_reuse4'
     for v in variants:
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
@@ -1040,7 +1051,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 cfgs = L.make_layer_cfgs(6, v)
                 mr = 4.0
                 if v in PARAM_MATCHED_V7:
-                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=set(PARAM_MATCHED_V7), ref_variant='csa_fixed_rope')
+                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=set(PARAM_MATCHED_V7), ref_variant=_mr_ref)
                 # 随机源在建模前一刻定界：同 seed 下各臂的共享组件（tok/head/MLP）必须同构
                 L.set_seed(seed)
                 model = L.SmallGPT(vocab, 256, 6, 8, 32, 512, cfgs, mlp_ratio=mr).to(DEVICE)
@@ -1185,7 +1196,8 @@ def run_lenphase(payload, guard=None, label=''):
         guard.record_run(time.time() - _t_data, 0, 0, 0, 0, 0)
     print(f'[p1l] val slice {val_ids.shape}, eval_lens={eval_lens}, seeds={seeds}')
     _train_cache = [None]
-    _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs12_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr-csa_dynamic_rope'
+    _mr_ref = 'csa_fixed_rope'
+    _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs12_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr-{_mr_ref}'
     for v in variants:
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
@@ -1223,7 +1235,7 @@ def run_lenphase(payload, guard=None, label=''):
                 cfgs = L.make_layer_cfgs(6, v)
                 mr = 4.0
                 if v in PARAM_MATCHED_V7:
-                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant='csa_fixed_rope')
+                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant=_mr_ref)
                 if _train_cache[0] is None:
                     _train_cache[0] = L.load_wikitext(train_len, 8000000)[0]
                 train_ids = _train_cache[0]

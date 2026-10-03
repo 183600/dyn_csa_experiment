@@ -194,33 +194,6 @@ def unmatched_tag(a, b, tol=PARAM_MATCH_TOL, small=PARAM_MATCH_SMALL):
         return f' (⚠ 参数差 {100 * g:.1f}%，属架构差异)'
     return f' (⚠ 参数不匹配 {100 * g:.1f}%)'
 
-def per_seed_ppls(outdir):
-    _ck = ('psp', outdir)
-    if _ck in _LOADED:
-        return _LOADED[_ck]
-    s = summary(outdir)
-    _legacy_ok = _legacy_warm_tags(s)
-    out = collections.defaultdict(dict)
-    for _k, r in s.items():
-        if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
-            if isinstance(r['seed'], bool):
-                print(f"[report] record {_k!r} in {outdir} carries a boolean seed — skipped for pairing")
-                continue
-            try:
-                _sd = int(r['seed'])
-            except (TypeError, ValueError, OverflowError):
-                print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
-                continue
-            _slot = out[r['variant']]
-            _tk = (_tag_of(r, _k, _legacy_ok), _sd)
-            if _tk in _slot:
-                print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
-                continue
-            _slot[_tk] = float(r['ppl'])
-    out = dict(out)
-    _LOADED[_ck] = out
-    return out
-
 def per_seed_records(outdir):
     _ck = ('psr', outdir)
     if _ck in _LOADED:
@@ -377,6 +350,9 @@ def sec_p0w():
         _sd = _int_or(r.get('seed'), -1)
         if _sd < 0 and _measurable({'ppl': r.get('ppl'), 'synthesized': r.get('synthesized', False)}):
             print(f"[report] sec_p0w: record {k!r} carries a non-integer seed — it is skipped, not counted")
+            continue
+        if _w < 0 and _measurable({'ppl': r.get('ppl'), 'synthesized': r.get('synthesized', False)}):
+            print(f"[report] sec_p0w: record {k!r} carries no parseable warmup tag — it is skipped, not counted")
             continue
         rows.append((r.get('variant', '?'), _w, _sd, r.get('ppl'), r.get('ppl_at_switch'), r.get('train_time_s', 0) / 60.0 if r.get('train_time_s') else None, r.get('synthesized', False), k))
     rows.sort(key=lambda x: (x[0], x[1], x[2]))
@@ -778,10 +754,7 @@ def sec_p1l():
         ratio = sum((last_map[sd] for sd in _matched)) / len(_matched) / (sum((base_map[sd] for sd in _matched)) / len(_matched)) if _matched else None
         per_v[v] = ratio
         trunc_v[v] = trunc_flags
-        if _finite_or_none(ratio) is not None and trunc_flags and trunc_flags[-1]:
-            rt_txt = f'×{ratio:.2f}（长端为截断格，与基线不同 token 窗口，不可比）'
-        else:
-            rt_txt = f'×{ratio:.2f}' if _finite_or_none(ratio) is not None else '—'
+        rt_txt = f'×{ratio:.2f}' if _finite_or_none(ratio) is not None else '—'
         lines.append(f'| `{v}`（n={len(_seeds_by_v.get(v, []))}） | ' + ' | '.join(cells) + f' | {rt_txt} |')
     _any_trunc = any((any(f) for f in trunc_v.values()))
     if _any_trunc:
@@ -791,10 +764,7 @@ def sec_p1l():
         for v, rt in sorted(per_v.items(), key=lambda kv: kv[1] if _finite_or_none(kv[1]) is not None else 1000000000.0):
             if _finite_or_none(rt) is None:
                 continue
-            if trunc_v.get(v) and trunc_v[v][-1]:
-                lines.append(f'- `{v}`：**不适用** —— 长端截断格覆盖的是另一段文本的最后 `max_pos` 个 token，与基线格不是同一段文本，读数 ×{rt:.2f} 是跨文本窗口的比值，对长度外推没有信息量。')
-            else:
-                lines.append(f'- `{v}`：{lens[-1]}/{lens[0]} = ×{rt:.2f}')
+            lines.append(f'- `{v}`：{lens[-1]}/{lens[0]} = ×{rt:.2f}')
         _rope_ok = 'csa_fixed_rope' in per_v and 'full_rope' in per_v and _finite_or_none(per_v['csa_fixed_rope']) and _finite_or_none(per_v['full_rope']) and (not (trunc_v.get('csa_fixed_rope', [0])[-1] or trunc_v.get('full_rope', [0])[-1]))
         if _rope_ok:
             _ra = per_v['csa_fixed_rope']
@@ -833,7 +803,7 @@ def _agg_entry(d, v):
     cands = [(k, e) for k, e in d.items() if isinstance(e, dict) and (k.startswith(f'{v}@cfg') or k.startswith(f'{v}#'))]
     if not cands:
         return None
-    cands.sort(key=lambda kv: -(_int_or(kv[1].get('n_seeds'), 0)))
+    cands.sort(key=lambda kv: (not (isinstance(kv[0], str) and _CUR_CS and kv[0].endswith(f'_cs{_CUR_CS}')), -(_int_or(kv[1].get('n_seeds'), 0))))
     if len(cands) > 1:
         print(f'[report] _agg_entry: `{v}` spans {len(cands)} cfg/protocol groups ({sorted((k for k, _e in cands))}) — quoting the largest-n one ({cands[0][0]}, n_seeds={cands[0][1].get('n_seeds')})')
     return cands[0][1]
@@ -931,7 +901,9 @@ def sec_stats():
         items = {k: v for k, v in d.items() if isinstance(v, dict) and (v.get('mean') is not None or v.get('delta') is not None)}
     for k, v in items.items():
         if isinstance(v, dict):
-            lines.append(f'| {k} | {fm(v.get('mean', v.get('delta')))} | {fm(v.get('p_exact_signflip', v.get('p')), 4)} |')
+            _dv = v.get('mean') if v.get('mean') is not None else v.get('delta')
+            _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
+            lines.append(f'| {k} | {fm(_dv)} | {fm(_pv, 4)} |')
     lines.append('')
     return '\n'.join(lines) + '\n'
 

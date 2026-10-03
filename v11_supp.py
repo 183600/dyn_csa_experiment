@@ -578,7 +578,7 @@ def build_report(out='REPORT_v11.md'):
                 if isinstance(_r.get('run_cfg'), str) and _r['run_cfg'].endswith(_cur_sfx):
                     _sd_cur.setdefault(_r['variant'], set()).add(_r['seed'])
         if _sd_cur:
-            _sd = {v: (_sd_cur.get(v) or s) for v, s in _sd.items()}
+            _sd = {v: _sd_cur.get(v, set()) for v in _sd}
         _ns = [len(x) for x in _sd.values()]
         return (min(_ns), max(_ns)) if _ns else None
 

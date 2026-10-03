@@ -32,13 +32,21 @@ VARIANTS = {'hybrid_csa_dyn': ('results_lm_v4_abl', 'hybrid dyn (no-fuse)', Fals
 SEEDS = []
 
 _RESOLVED = {}
+_PANEL_CACHE = {}
+
+def _read_panel(panel_name):
+    hit = _PANEL_CACHE.get(panel_name)
+    if hit is None:
+        hit = L.read_panel(os.path.join(ROOT, panel_name))
+        _PANEL_CACHE[panel_name] = hit
+    return hit
 
 def _variant_records(variant):
     panel_name = VARIANTS[variant][0]
     rkey = (panel_name, variant)
     if rkey not in _RESOLVED:
         groups = {}
-        for (_v, _tag, _s), (_k, _r) in L.read_panel(panel_name).items():
+        for (_v, _tag, _s), (_k, _r) in _read_panel(panel_name).items():
             if _v != variant:
                 continue
             groups.setdefault(_tag, {})[_s] = _r
@@ -395,7 +403,9 @@ def main(argv=None):
         for ax, key, ttl in zip(axes, ['bnd_f1', 'bnd_prec', 'bnd_rec'], ['boundary F1 (tol=1)', 'precision', 'recall']):
             try:
                 layers, Mb = per_seed_layer('hybrid_csa_dyn', key)
-                _, Ma = per_seed_layer('hybrid_csa_dyn_fuse', key)
+                _lb, Ma = per_seed_layer('hybrid_csa_dyn_fuse', key)
+                if _lb != layers:
+                    raise ValueError(f'layer lists differ between the two arms ({layers} vs {_lb}) — not plotting side by side')
             except (KeyError, ValueError, TypeError) as e:
                 print(f'[fuse_analysis] NOTE: skipping `{ttl}` boundary plot — {e}')
                 continue

@@ -312,8 +312,8 @@ def tok_sel_mask(n, w, device):
 def _tri_full(n, device, k):
     with torch.inference_mode(False):
         m = torch.empty((n, n), device=device)
-    m.fill_(float('-inf'))
-    torch.triu(m, k, out=m) if k > 0 else torch.tril(m, k, out=m)
+        m.fill_(float('-inf'))
+        torch.triu(m, k, out=m) if k > 0 else torch.tril(m, k, out=m)
     return m
 
 def _mask_buffer(n, device, kind):
@@ -354,7 +354,7 @@ def causal_window_mask(T, window, device):
     if m is None:
         with torch.inference_mode(False):
             m = causal_mask(T, device).clone()
-        m.add_(window_band(T, window, device))
+            m.add_(window_band(T, window, device))
         _cache_put(_MASK_CACHE, key, m, _MASK_CACHE_BUDGET_BYTES, _mask_cache_total)
     return m
 
@@ -609,24 +609,6 @@ class _SinkWiden(torch.autograd.Function):
     def backward(ctx, gz):
         return (gz[..., 1:], gz[..., 0].sum(dim=0))
 
-def _sink_all_finite(sink_logits):
-    if sink_logits is None:
-        return True
-    try:
-        key = (sink_logits.data_ptr(), sink_logits._version, tuple(sink_logits.shape))
-    except Exception:
-        return bool(torch.isfinite(sink_logits).all())
-    hit = _SINK_FIN_CACHE.get(key)
-    if hit is not None:
-        return hit
-    with torch.no_grad():
-        val = bool(torch.isfinite(sink_logits).all())
-    if len(_SINK_FIN_CACHE) > 256:
-        _SINK_FIN_CACHE.clear()
-    _SINK_FIN_CACHE[key] = val
-    return val
-_SINK_FIN_CACHE = {}
-
 def sink_softmax(logits, sink_logits, dim=-1):
     _diff = torch.is_grad_enabled() and (getattr(logits, 'requires_grad', False) or (sink_logits is not None and getattr(sink_logits, 'requires_grad', False)))
     if _diff:
@@ -637,17 +619,13 @@ def sink_softmax(logits, sink_logits, dim=-1):
 def _sink_softmax_impl(logits, sink_logits, dim=-1):
     if sink_logits is None:
         return torch.nan_to_num(torch.softmax(logits, dim))
-    z = _SinkWiden.apply(logits, sink_logits)
-    if not _sink_all_finite(sink_logits):
-        return torch.nan_to_num(torch.softmax(z, -1)[..., 1:])
-    return torch.softmax(z, -1)[..., 1:]
+    z = _SinkWiden.apply(logits, torch.nan_to_num(sink_logits))
+    return torch.nan_to_num(torch.softmax(z, -1)[..., 1:])
 
 def _sink_split_softmax(logits, sink_logits, want_sink=True):
     if sink_logits is None:
         return (sink_softmax(logits, None, -1), None)
-    z = _SinkWiden.apply(logits, sink_logits)
-    if not _sink_all_finite(sink_logits):
-        return (torch.nan_to_num(torch.softmax(z, -1)[..., 1:]), logits.new_zeros(logits.shape[:-1]) if want_sink else None)
+    z = _SinkWiden.apply(logits, torch.nan_to_num(sink_logits))
     soft = torch.softmax(z, -1)[..., 1:]
     return (soft, 1.0 - soft.sum(-1) if want_sink else None)
 
@@ -710,8 +688,9 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
     _heads = q.shape[1] if q.dim() == 3 else 1
-    _per_row = max(1, int(topk_idx.shape[1]) + int(w)) * _heads * int(q.shape[-1])
-    _bytes_per_chunk_row = 2 * _per_row * q.element_size()
+    _M = max(1, int(topk_idx.shape[1]) + int(w))
+    _per_row = 2 * _M * _heads * int(q.shape[-1]) + 2 * _M * _heads
+    _bytes_per_chunk_row = _per_row * q.element_size()
     _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
     if _bindable and _bytes_per_chunk_row > 0:
         _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
@@ -906,8 +885,7 @@ class HybridAttention(nn.Module):
             mask = causal_window_mask(T, self.cfg.window, x.device)
         else:
             mask = causal_mask(T, x.device)
-        sink_view = self.sink.view(1, self.nh, 1, 1) if self.sink is not None else None
-        _sink_ok = _sink_all_finite(self.sink) if self.sink is not None else True
+        sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1) if self.sink is not None else None
         out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
         row_chunk = max(1, min(T, 1024))
         _budget = _attn_transient_budget(x.device)
@@ -920,12 +898,8 @@ class HybridAttention(nn.Module):
             logits.mul_(scale)
             logits.add_(mask[s:e])
             if sink_view is not None:
-                if not _sink_ok:
-                    logits = torch.cat([sink_view.expand_as(logits[..., :1]), logits], dim=-1)
-                    attn = torch.nan_to_num(torch.softmax(logits, -1))[..., 1:]
-                else:
-                    lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
-                    attn = torch.exp(logits - lse)
+                lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
+                attn = torch.exp(logits - lse)
             else:
                 attn = torch.softmax(logits, -1)
             out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)

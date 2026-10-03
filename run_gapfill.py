@@ -130,7 +130,7 @@ def synthesize_long_summary():
         real_v, _proto = _c
         _seeds = e.get('seeds')
         for i, p in enumerate(e.get('ppls', [])):
-            _seed = _num_or_none(_seeds[i]) if _seeds is not None else i
+            _seed = _num_or_none(_seeds[i])
             if _seed is None:
                 print(f"[synth] REFUSING one reconstructed value of `{v}`: its seed ({_seeds[i]!r}) is not an integer, so it cannot be attached to any per-seed key without aliasing — skipping this value only")
                 continue

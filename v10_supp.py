@@ -55,7 +55,7 @@ def _arm_of(variant, arm):
     return arm in ('learned', 'randidx', 'allblocks')
 
 @torch.inference_mode()
-def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=None):
+def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, chunk_mem=None):
     target = cfg['target']
     vocab = int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
     # corruptible context positions: every input position except the scored
@@ -66,6 +66,8 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=
     nll_sum = []
     n_tok = []
     n_ch = max(1, int(cfg['chunk']))
+    if chunk_mem is not None:
+        n_ch = max(1, min(n_ch, int(chunk_mem.get(eval_len, n_ch))))
     i = 0
     while i < n_seq:
         j = min(i + n_ch, n_seq)
@@ -97,6 +99,8 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=
                 if DEVICE.type == 'cuda':
                     torch.cuda.empty_cache()
                 n_ch = max(1, n_ch // 2)
+                if chunk_mem is not None:
+                    chunk_mem[eval_len] = n_ch
                 print(f'[p3mp] eval device-memory exhaustion; retrying with chunk={n_ch}')
                 continue
             raise
@@ -106,6 +110,8 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, seed, cfg, row_cache=
         nll_sum.extend(map(float, _sums))
         n_tok.extend([target] * len(rows))
         del ids, logits, tgt, _ce, _sums
+        if chunk_mem is not None:
+            chunk_mem[eval_len] = n_ch
         i = j
     return (nll_sum, n_tok)
 
@@ -223,6 +229,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 cells = [(Ln, rho) for Ln, rho in _defs if _cell_stale(_cell_key(Ln, rho), _fp)]
                 if not cells:
                     continue
+                _chunk_mem = {}
                 if model is None:
                     _arch = (int(d.get('d', 256)), int(d.get('n_layers', 6)), int(d.get('n_heads', 8)), int(d.get('d_head', 32)))
                     if _arch != (256, 6, 8, 32):
@@ -238,7 +245,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                 t0 = time.time()
                 for Ln, rho in cells:
                     key = _cell_key(Ln, rho)
-                    nll_sum, n_tok = _distractor_ppls(model, val_ids, Ln, rho, _pcfg['n_seq'], seed, _pcfg, row_cache=_row_cache)
+                    nll_sum, n_tok = _distractor_ppls(model, val_ids, Ln, rho, _pcfg['n_seq'], _pcfg, row_cache=_row_cache, chunk_mem=_chunk_mem)
                     cell_ppl = _cell_ppl(nll_sum, n_tok)
                     per_seq = [math.exp(s / t) for s, t in zip(nll_sum, n_tok)]
                     summary[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp, 'recipe': _ck_recipe}
