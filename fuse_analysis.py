@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, itertools, math, os, sys, functools
+import json, itertools, math, os, sys, functools, warnings
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -142,6 +142,12 @@ def signflip(deltas):
         return None
     n = len(d)
     obs = abs(d.mean())
+    if n > 20:
+        rng = np.random.default_rng(0)
+        B = 200000
+        signs = np.where(rng.random((B, n)) < 0.5, 1.0, -1.0)
+        cnt = 1 + int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
+        return cnt / (B + 1)
     cnt = 0
     for signs in itertools.product([1, -1], repeat=n):
         if abs((d * np.asarray(signs)).mean()) >= obs - 1e-12:
@@ -282,7 +288,7 @@ def main(argv=None):
             p_f1 = p_ppl = None
             lines.append('\n**配对检验：未执行。** 可用于配对的有限样本不足，**不给出 p 值**、不进入任何显著性主张。\n')
         unstamped = sum((1 for v in pair for s in SEEDS if (_variant_records(v).get(s) or {}).get('run_cfg') is None))
-        stats_out[f'{a}__vs__{b}'] = dict(boundary=pair_stats, f1_delta_per_seed=d_f1.round(4).tolist(), f1_p_exact=p_f1, ppl_fuse=pa.round(2).tolist(), ppl_nofuse=pb.round(2).tolist(), ppl_delta_per_seed=d_ppl.round(3).tolist(), ppl_p_exact=p_ppl, n_unstamped=unstamped, paired_test='run' if p_f1 is not None else 'skipped', pair_refusals=_why)
+        stats_out[f'{a}__vs__{b}'] = dict(boundary=pair_stats, f1_delta_per_seed=d_f1.round(4).tolist(), f1_p_exact=p_f1, ppl_fuse=pa[_keep].round(2).tolist(), ppl_nofuse=pb[_keep].round(2).tolist(), ppl_delta_per_seed=d_ppl.round(3).tolist(), ppl_p_exact=p_ppl, n_unstamped=unstamped, paired_test='run' if p_f1 is not None else 'skipped', pair_refusals=_why)
         _is_clean = a == 'hybrid_csa_dyn_fuse'
         if _is_clean:
             probe['d_f1'] = float(d_f1.mean()) if len(d_f1) else None
@@ -303,7 +309,7 @@ def main(argv=None):
             probe['x_p_ppl_csa'] = float(p_ppl) if p_ppl is not None else None
             probe['x_d_f1_guarded'] = p_f1 is not None
         report[tag] = True
-    lines.append(f'\n## 块长分布形状对比（逐层存储矩，n={len(SEEDS)} seeds 平均）\n')
+    lines.append(f'\n## 块长分布形状对比（对全部动态层与 {len(SEEDS)} seeds 合并平均）\n')
     lines.append('| 变体 | len_mean | len_std | len_max | frac_at_min(贴下限块占比) | blocks/seq | δ(gate) |')
     lines.append('|---|---|---|---|---|---|---|')
     _blk, _pgate_drop = ({}, [])
@@ -350,7 +356,22 @@ def main(argv=None):
         except (KeyError, ValueError, TypeError) as e:
             lines.append(f'| `{v}` | — | — | — | — | — | （该变体数据缺失：{e}）|')
             continue
-        lines.append(f'| `{v}` | {np.nanmean(Mm):.3f} | {np.nanmean(Ms):.3f} | {np.nanmean(Mx):.1f} | {np.nanmean(Mf):.3f} | {np.nanmean(Mb):.1f} | {np.nanmean(Md):+.3f} |')
+        def _nm(M):
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                v = np.nanmean(M)
+            return f'{v:.1f}' if np.isfinite(v) else '—'
+        def _nm3(M):
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                v = np.nanmean(M)
+            return f'{v:.3f}' if np.isfinite(v) else '—'
+        def _nmp(M):
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                v = np.nanmean(M)
+            return f'{v:+.3f}' if np.isfinite(v) else '—'
+        lines.append(f'| `{v}` | {_nm3(Mm)} | {_nm3(Ms)} | {_nm(Mx)} | {_nm3(Mf)} | {_nm(Mb)} | {_nmp(Md)} |')
     lines.append('')
     _hyb_keep = None
     try:

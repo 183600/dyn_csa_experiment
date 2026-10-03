@@ -298,7 +298,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 soft_logits = torch.cat([raw_logits[:, :, :nb] + soft_log[:, None, :], raw_logits[:, :, nb:]], -1)
                 soft_logits = soft_logits.masked_fill(~valid[:, None, :], torch.finfo(soft_logits.dtype).min)
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
-                attn = soft_attn + (attn - soft_attn.detach())
+                attn = attn + (soft_attn - soft_attn.detach())
                 if sink is None:
                     attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
             out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
@@ -312,9 +312,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         mask = L.causal_mask(T, x.device)
         win = getattr(self, '_dense_max_T', None)
         if win is not None and win < T:
-            row = L._arange_cache(T, x.device)[:, None]
-            col = L._arange_cache(T, x.device)[None, :]
-            mask = torch.where(col < row - win + 1, float('-inf'), mask)
+            mask = L.causal_window_mask(T, win, x.device)
         Ca = x @ self.W_aKV
         q = F.normalize(self.W_q(x).view(B, T, nh, hd), dim=-1)
         norm_kv = getattr(self.cfg, 'qk_norm', False)
@@ -329,6 +327,11 @@ class HybridAttentionRoPE(L.HybridAttention):
             q = apply_rope(q, cos[:, None, :], sin[:, None, :], rd)
             k = apply_rope(k, cos[:, None, :], sin[:, None, :], rd)
         sink = self.sink if self.cfg.use_sink and self.sink is not None else None
+        if sink is None and win is None:
+            out = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                is_causal=True, scale=scale).transpose(1, 2)
+            return self.W_o(out.reshape(B, T, nh * hd))
         out = torch.empty(B, T, nh, hd, device=x.device, dtype=q.dtype)
         row_chunk = max(1, min(T, 1024))
         _budget = L._attn_transient_budget(x.device)
@@ -789,6 +792,13 @@ def exact_sign_permutation(deltas):
     if n == 0:
         return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'p_exact_signflip': float('nan'), 'n_flips': 0, 'n_dropped': n_dropped}
     obs = abs(d.mean())
+    if n > 20:
+        rng = np.random.default_rng(0)
+        B = 200000
+        signs = np.where(rng.random((B, n)) < 0.5, 1.0, -1.0)
+        means = np.abs((signs * d[None, :]).mean(1))
+        p = float((1 + (means >= obs - 1e-12).sum()) / (B + 1))
+        return {'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': B, 'n_dropped': n_dropped}
     masks = np.arange(2 ** n, dtype=np.int64)[:, None]
     bitpos = np.arange(n, dtype=np.int64)[None, :]
     flips = np.where(masks & 1 << bitpos != 0, 1.0, -1.0)

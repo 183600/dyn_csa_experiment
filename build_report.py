@@ -3,6 +3,7 @@ import collections
 import json
 import math
 import os
+import random
 import re
 import sys
 import tempfile
@@ -59,6 +60,19 @@ def exact_signflip(deltas):
     if n == 0:
         return None
     obs = abs(sum(deltas))
+    mu = sum(deltas) / n
+    std = (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0
+    if n > 20:
+        rng = random.Random(0)
+        B = 200000
+        cnt = 1
+        for _ in range(B):
+            s = 0.0
+            for d in deltas:
+                s += d if rng.random() < 0.5 else -d
+            if abs(s) >= obs - 1e-12:
+                cnt += 1
+        return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': cnt / (B + 1)}
     cnt = 0
     for mask in range(1 << n):
         s = sum((d if mask >> i & 1 else -d for i, d in enumerate(deltas)))
@@ -506,13 +520,13 @@ def sec_p0e():
                 lines.append(f'| {st} | {c:.1f} | {f_:.1f} | **{gaps[st]:+.1f}** |')
             tail = steps[-5:] if len(steps) >= 5 else steps
             _tail_span_k = (steps[-1] - tail[0]) / 1000.0
-            g_last = gaps[steps[-1]]
             _paired = sorted(set.intersection(*(set(trajs[v][st]) for v in ('csa_fixed', 'full') for st in tail))) if tail else []
             xs = [st / 1000.0 for st in tail]
             if _paired:
                 ys = [sum((trajs['csa_fixed'][st][sd] - trajs['full'][st][sd] for sd in _paired)) / len(_paired) for st in tail]
             else:
                 ys = [gaps[st] for st in tail]
+            g_last = ys[-1]
             n_ = len(xs)
             mx, my = (sum(xs) / n_, sum(ys) / n_)
             slope = sum(((x - mx) * (y - my) for x, y in zip(xs, ys))) / sum(((x - mx) ** 2 for x in xs)) if n_ > 1 else 0.0
@@ -570,7 +584,7 @@ def sec_p1t():
             std = sample_std(ppls)
             n = len(ppls)
         else:
-            mean, std, n = (r.get('ppl_mean'), r.get('ppl_std') or 0.0, r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n', 0))
+            mean, std, n = (r.get('ppl_mean'), r.get('ppl_std'), r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n', 0))
         _bv = v.split('@')[0].split('#')[0]
         if _bv == 'csa_fix_m1':
             sr = '1.5625% (m=1, topk=32)'
@@ -620,7 +634,7 @@ def sec_p1t():
         r = _agg_entry(d, f'csa_fixed_topk{k}')
         if r is not None:
             ppls = _finite_ppls(r)
-            m = sum(ppls) / len(ppls) if ppls else r.get('ppl_mean')
+            m = sum(ppls) / len(ppls) if ppls else _finite_or_none(r.get('ppl_mean'))
             if isinstance(m, (int, float)):
                 rows_k.append((k, m))
     if len(rows_k) >= 3:

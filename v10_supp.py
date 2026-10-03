@@ -58,10 +58,11 @@ def _arm_of(variant, arm):
 def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, chunk_mem=None):
     target = cfg['target']
     vocab = int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
-    # corruptible context positions: every input position except the scored
-    # target zone (ids[-target:]); ids has eval_len+1 tokens, so the context
-    # spans ids[0 : eval_len + 1 - target]
-    n_far = eval_len + 1 - target
+    # corruptible context positions: input positions outside the scored
+    # target zone; the first scored prediction reads input position
+    # eval_len - target (it predicts ids[eval_len - target + 1]), so the
+    # clean context spans ids[0 : eval_len - target]
+    n_far = eval_len - target
     k = int(round(rho * n_far))
     nll_sum = []
     n_tok = []
@@ -243,13 +244,16 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                     ac.indexer_mode = 'random' if arm == 'randidx' else getattr(c0, 'indexer_mode', 'learned')
                     ac.index_topk = 10 ** 6 if arm == 'allblocks' else getattr(c0, 'index_topk', 32)
                 t0 = time.time()
-                for Ln, rho in cells:
+                for _ci, (Ln, rho) in enumerate(cells, 1):
                     key = _cell_key(Ln, rho)
                     nll_sum, n_tok = _distractor_ppls(model, val_ids, Ln, rho, _pcfg['n_seq'], _pcfg, row_cache=_row_cache, chunk_mem=_chunk_mem)
                     cell_ppl = _cell_ppl(nll_sum, n_tok)
                     per_seq = [math.exp(s / t) for s, t in zip(nll_sum, n_tok)]
                     summary[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp, 'recipe': _ck_recipe}
                     print(f'  [p3mp] {key:44s} PPL={cell_ppl:8.2f}', flush=True)
+                    if _ci % 8 == 0:
+                        L.atomic_write_json(spath, summary, indent=1)
+                if cells:
                     L.atomic_write_json(spath, summary, indent=1)
                 if guard is not None:
                     guard.record_run(time.time() - t0, 0, 0, 0, 0, 0)
@@ -733,7 +737,7 @@ def build_report(out='REPORT_v10.md'):
                 cells = L.by_len_cells(rows, Ln)
                 ok = [c for c in cells if not c.get('truncated')]
                 if ok:
-                    return (float(np.mean([c['ppl'] for c in ok])), len(ok) < len(cells))
+                    return (float(np.mean([c['ppl'] for c in ok])), False)
                 return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
 
             def _paired_ratio(rows=rows):

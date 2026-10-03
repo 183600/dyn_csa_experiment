@@ -57,10 +57,12 @@ _SEGMENT_CACHE = {}
 _SEGMENT_CACHE_CAP = 4096
 
 def _segment(n, want_cut_list, min_block, max_block):
-    key = (n, min_block, max_block, bytes(bytearray((1 if _c else 0 for _c in want_cut_list))))
-    hit = _SEGMENT_CACHE.get(key)
-    if hit is not None:
-        return hit
+    cacheable = n <= 64
+    key = (n, min_block, max_block, bytes(bytearray((1 if _c else 0 for _c in want_cut_list)))) if cacheable else None
+    if cacheable:
+        hit = _SEGMENT_CACHE.get(key)
+        if hit is not None:
+            return hit
     honoured = {}
     bids = [0] * n
     cur, cur_len = (0, 1)
@@ -79,11 +81,12 @@ def _segment(n, want_cut_list, min_block, max_block):
                 honoured[ci] = 1.0
             pending_cut = False
         bids[t] = cur
-    if len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
-        _keep = list(_SEGMENT_CACHE.items())[len(_SEGMENT_CACHE) // 2:]
-        _SEGMENT_CACHE.clear()
-        _SEGMENT_CACHE.update(_keep)
-    _SEGMENT_CACHE[key] = (bids, honoured)
+    if cacheable:
+        if len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
+            _keep = list(_SEGMENT_CACHE.items())[len(_SEGMENT_CACHE) // 2:]
+            _SEGMENT_CACHE.clear()
+            _SEGMENT_CACHE.update(_keep)
+        _SEGMENT_CACHE[key] = (bids, honoured)
     return (bids, honoured)
 
 def _cut_merge_mask(want_cut_list, min_block, max_block, dtype=None, device=None):
@@ -434,13 +437,6 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     sc = torch.nan_to_num(sc)
     sc_a = sc[:, :max_len]
     sc_b = sc[:, max_len:]
-    if _cmin < max_len:
-        _pad_a = slice(_cmin, max_len)
-        Xam[:, _pad_a].masked_fill_(~mask_a[:, _pad_a, None], 0.0)
-    if ov:
-        _pad_b = max(_ov_lo if _ov_lo is not None else 0, 0)
-        if _pad_b < _W_b:
-            Xbm[:, _pad_b:].masked_fill_(~mask_b[:, _pad_b:, None], 0.0)
     comp = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
     last_idx = (ends - 1).clamp(0, n - 1)
     return (comp, order[last_idx], B)
@@ -469,9 +465,6 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     WinZ[:, :max_len] += B_pos[pos.clamp(max=B_pos.shape[0] - 1)]
     WinZ.masked_fill_(~mask[:, :, None], float('-inf'))
     sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
-    if _cmin < max_len:
-        _pad = slice(_cmin, max_len)
-        Xb[:, _pad].masked_fill_(~mask[:, _pad, None], 0.0)
     comp = (sc * Xb).sum(1)
     last_idx = (ends - 1).clamp(0, n - 1)
     return (comp, order[last_idx], B)
@@ -610,6 +603,8 @@ class _SinkWiden(torch.autograd.Function):
         return (gz[..., 1:], gz[..., 0].sum(dim=0))
 
 def sink_softmax(logits, sink_logits, dim=-1):
+    if dim not in (-1, logits.dim() - 1):
+        raise ValueError('sink_softmax only supports the last dim')
     _diff = torch.is_grad_enabled() and (getattr(logits, 'requires_grad', False) or (sink_logits is not None and getattr(sink_logits, 'requires_grad', False)))
     if _diff:
         return _sink_softmax_impl(logits, sink_logits, dim)
@@ -676,7 +671,7 @@ def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale
             blk = None
             soft_logits = torch.cat([soft_blk, soft_win], -1)
             soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
-            attn = soft_attn + (attn - soft_attn.detach())
+            attn = attn + (soft_attn - soft_attn.detach())
         if sink_logits is None:
             attn = attn * sel.any(-1)[:, None, None].to(attn.dtype)
         out[s:e] = torch.einsum('nhm,nmhd->nhd', attn, Vset)
@@ -752,7 +747,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
         logits.masked_fill_(~valid[:, None, :], _MINL)
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
-        attn = soft_attn + (attn - soft_attn.detach())
+        attn = attn + (soft_attn - soft_attn.detach())
         if sink_logits is None:
             attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
         out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)

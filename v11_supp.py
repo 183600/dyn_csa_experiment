@@ -292,7 +292,7 @@ def build_report(out='REPORT_v11.md'):
                 continue
             _me += 1
             _rc = _v.get('run_cfg')
-            if isinstance(_rc, str) and _rc.endswith(f'_cs{L.CODE_SEMANTICS}') or _v.get('_code') == L.CODE_SEMANTICS:
+            if (isinstance(_rc, str) and _rc.endswith(f'_cs{L.CODE_SEMANTICS}')) or (_v.get('_code') == L.CODE_SEMANTICS):
                 _st += 1
         if _tot:
             _prov_panels.append((_p.split('/')[0], _tot, _me, _st, _sy))
@@ -376,7 +376,7 @@ def build_report(out='REPORT_v11.md'):
                 cells = L.by_len_cells(rows, Ln)
                 ok = [c for c in cells if not c.get('truncated')]
                 if ok:
-                    return (float(np.mean([c['ppl'] for c in ok])), len(ok) < len(cells))
+                    return (float(np.mean([c['ppl'] for c in ok])), False)
                 return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
 
             def _paired_ratio(rows=rows):
