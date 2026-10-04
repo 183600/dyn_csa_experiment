@@ -196,7 +196,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                     _soft_hon = gate * _hon
                     gate_mean = (float(nblk - 1) + _soft_hon.sum() - _soft_hon.detach().sum()) / T
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
-            sim = L.cosine_similarity_consecutive(x)
+            sim = L.cosine_similarity_consecutive(x.detach())
             tau = L.causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
             bid, nblk = L.blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim, return_count=True)
         else:
@@ -793,16 +793,25 @@ def exact_sign_permutation(deltas):
     if n > 20:
         rng = np.random.default_rng(0)
         B = 200000
-        signs = np.where(rng.random((B, n)) < 0.5, 1.0, -1.0)
-        means = np.abs((signs * d[None, :]).mean(1))
-        p = float((1 + (means >= obs - 1e-12).sum()) / (B + 1))
+        cnt = 1
+        step = max(1, min(B, (1 << 24) // max(n, 1)))
+        for off in range(0, B, step):
+            bs = min(step, B - off)
+            signs = np.where(rng.random((bs, n)) < 0.5, 1.0, -1.0)
+            cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
+        p = float(cnt / (B + 1))
         return {'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': B, 'n_dropped': n_dropped}
-    masks = np.arange(2 ** n, dtype=np.int64)[:, None]
+    cnt = 0
+    total = 1 << n
     bitpos = np.arange(n, dtype=np.int64)[None, :]
-    flips = np.where(masks & 1 << bitpos != 0, 1.0, -1.0)
-    means = np.abs((flips * d[None, :]).mean(1))
-    p = float((means >= obs - 1e-12).mean())
-    return {'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': int(2 ** n), 'n_dropped': n_dropped}
+    step = max(1, min(total, (1 << 24) // max(n, 1)))
+    for off in range(0, total, step):
+        bs = min(step, total - off)
+        masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
+        flips = np.where(masks & 1 << bitpos != 0, 1.0, -1.0)
+        cnt += int((np.abs((flips * d[None, :]).mean(1)) >= obs - 1e-12).sum())
+    p = float(cnt / total)
+    return {'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': int(total), 'n_dropped': n_dropped}
 
 def flops_analysis(outdir='analysis_v7', seq_lens=None):
     os.makedirs(outdir, exist_ok=True)
@@ -921,6 +930,16 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         _m = {s: r for s, r in v.items() if not r.get('_dup')}
         if not _m:
             continue
+        _groups = {}
+        for s, r in _m.items():
+            _groups.setdefault(r.get('run_cfg'), []).append(s)
+        if len(_groups) > 1:
+            _cur_sfx = f'_cs{CKPT_CODE}'
+            _ranked = sorted(_groups.items(), key=lambda kv: (not (isinstance(kv[0], str) and kv[0].endswith(_cur_sfx)), -len(kv[1]), str(kv[0])))
+            _keep_seeds = _ranked[0][1]
+            _dropped = [s for _g, _ss in _ranked[1:] for s in _ss]
+            print(f'[stats] WARNING: {k}: seed(s) {_dropped} were measured under a DIFFERENT run_cfg group than seed(s) {_keep_seeds} — the per-variant mean pools only one configuration group ({len(_keep_seeds)} seed(s), current code stamp preferred); pooling across configurations is not allowed')
+            _m = {s: _m[s] for s in _keep_seeds}
         per_variant[k] = {'ppls': {s: r['ppl'] for s, r in _m.items()}, 'mean': float(np.mean([r['ppl'] for r in _m.values()]))}
     out_d = {'per_variant': per_variant, 'comparisons': {}}
     for name, a, b in pairs:

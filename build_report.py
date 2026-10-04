@@ -402,7 +402,11 @@ def sec_p0w():
         if _w is None:
             _t = _tag_of(_r, _k, _legacy_ok)
             _w = int(_t[1:]) if _t.startswith('w') and _t[1:].isdigit() else -1
-        rec_by_s[_r.get('variant', '?'), _w].setdefault(_sd, _r)
+        _slot = rec_by_s[_r.get('variant', '?'), _w]
+        if _sd in _slot:
+            print(f"[report] sec_p0w: ambiguous (variant, warm_steps, seed) = ({_r.get('variant', '?')!r}, {_w}, {_sd}): two measurable records found; keeping the FIRST (key {_k!r} ignored)")
+            continue
+        _slot[_sd] = _r
     grp = collections.defaultdict(list)
     for (v, w), _m in rec_by_s.items():
         for _sd, _r in sorted(_m.items()):
@@ -521,7 +525,11 @@ def sec_p0e():
             if not _ppl_ok(pv):
                 _dropped_pts += 1
                 continue
-            trajs[r['variant']][int(step)][_sdv] = float(pv)
+            _cell = trajs[r['variant']][int(step)]
+            if _sdv in _cell:
+                print(f"[report] sec_p0e: ambiguous (variant, step, seed) = ({r['variant']!r}, {int(step)}, {_sdv}): two measurable points found; keeping the FIRST")
+                continue
+            _cell[_sdv] = float(pv)
     if _dropped_pts:
         lines += ['', f'> **⚠ 轨迹表剔除了 {_dropped_pts} 个非有限/非正的 PPL 曲线点**（单次失败的 eval），它们不再参与 seed 平均、尾段斜率与下方结论的判定。', '']
     if 'csa_fixed' in trajs and 'full' in trajs:
@@ -745,6 +753,7 @@ def sec_p1l():
     for r in recs:
         _by_var.setdefault(r.get('variant'), []).append(r)
     recs = []
+    _stale_vars = set()
     for _v, _rv in _by_var.items():
         _cur = [r for r in _rv if r.get('_code') == _CUR_CS]
         if _cur:
@@ -753,6 +762,7 @@ def sec_p1l():
             recs.extend(_cur)
         else:
             print(f'[report] sec_p1l: {_v}: NONE of the {len(_rv)} by-length record(s) carries the current code-semantics stamp {_CUR_CS!r} — quoting STALE values for lack of a current one; re-run the length panel to refresh')
+            _stale_vars.add(_v)
             recs.extend(_rv)
     if not recs:
         return '## P1 长上下文长度外推 — （无结果）\n\n'
@@ -800,7 +810,10 @@ def sec_p1l():
         per_v[v] = ratio
         trunc_v[v] = trunc_flags
         rt_txt = f'×{ratio:.2f}' if _finite_or_none(ratio) is not None else '—'
-        lines.append(f'| `{v}`（n={len(_seeds_by_v.get(v, []))}） | ' + ' | '.join(cells) + f' | {rt_txt} |')
+        _vmark = '，⚠ 陈旧' if v in _stale_vars else ''
+        lines.append(f'| `{v}`（n={len(_seeds_by_v.get(v, []))}{_vmark}） | ' + ' | '.join(cells) + f' | {rt_txt} |')
+    if _stale_vars:
+        lines += ['', '> **⚠ 陈旧数据**：' + '、'.join((f'`{v}`' for v in sorted(_stale_vars))) + f' 的按长度记录全部早于当前代码语义戳 `{_CUR_CS}`——这些数值由旧版代码测得，仅因缺少当前测量而列出，重跑长度面板后才会刷新；涉及它们的结论须按陈旧数据处理。', '']
     _any_trunc = any((any(f) for f in trunc_v.values()))
     if _any_trunc:
         lines += ['', '**位置受限（截断）臂**：' + '、'.join((f'`{v}`' for v, f in sorted(trunc_v.items()) if any(f))) + ' —— 其 span > max_pos 的格全部只覆盖最后 `max_pos` 个 token，与真正的长上下文分数不可比；比较外推能力时须以 RoPE 臂（无位置上限）为准。', '']
@@ -896,10 +909,10 @@ def sec_p2s():
             lines.append(f'| `{a}` − `{b}` | {len(common)} | {st['mean']:+.2f} ± {st['std']:.2f} | {st['p_exact_signflip']:.3f} | {unmatched_tag(_agg_entry(_agg, a), _agg_entry(_agg, b)) or '✓'} |')
         main = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full'), None)
         _mt = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full_matched'), None) if _agg_entry(_agg, 'full_matched') is not None else None
-        _mt_txt = ''
-        if _mt:
-            _mt_txt = f' 参数对齐的 `csa_fixed − full_matched` 为 **{_mt[3]['mean']:+.2f} PPL**（p={_mt[3]['p_exact_signflip']:.3f}），该配对的容量已受控，机制的读数以它为准。'
         _base = _mt if _mt else main
+        _mt_txt = ''
+        if _mt and _base is not _mt:
+            _mt_txt = f' 参数对齐的 `csa_fixed − full_matched` 为 **{_mt[3]['mean']:+.2f} PPL**（p={_mt[3]['p_exact_signflip']:.3f}），该配对的容量已受控，机制的读数以它为准。'
         if _base:
             _ba, _bb, common, st = _base
             _which = '`csa_fixed − full_matched`（参数对齐）' if _mt else '`csa_fixed − full`（未做容量匹配）'

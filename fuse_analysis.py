@@ -152,10 +152,15 @@ def signflip(deltas):
             signs = np.where(rng.random((bs, n)) < 0.5, 1.0, -1.0)
             cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
         return cnt / (B + 1)
-    masks = np.arange(1 << n, dtype=np.int64)
-    signs = (((masks[:, None] >> np.arange(n, dtype=np.int64)) & 1) * 2 - 1).astype(float)
-    cnt = int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
-    return cnt / 2 ** n
+    total = 1 << n
+    bitpos = np.arange(n, dtype=np.int64)
+    step = max(1, min(total, (1 << 24) // max(n, 1)))
+    cnt = 0
+    for off in range(0, total, step):
+        masks = np.arange(off, min(off + step, total), dtype=np.int64)
+        signs = (((masks[:, None] >> bitpos) & 1) * 2 - 1).astype(float)
+        cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
+    return cnt / total
 
 def sample_std(deltas, axis=None):
     d = np.asarray(deltas, dtype=float)
@@ -219,6 +224,10 @@ def main(argv=None):
             _la, _lb = (layers_of(a), layers_of(b))
             if _la != _lb:
                 return f'`{a}` and `{b}` are not on the same layer list ({_la} vs {_lb}); the per-layer deltas would be a misaligned subtraction'
+            for v in (a, b):
+                for s in SEEDS:
+                    if not isinstance(rec(v, s).get('stats'), dict):
+                        return f'`{v}`::seed{s} carries no usable `stats` table (got {type(rec(v, s).get('stats')).__name__}) — the per-layer boundary statistics cannot be read'
             return None
         except (KeyError, ValueError, TypeError) as e:
             return str(e)
@@ -283,7 +292,8 @@ def main(argv=None):
             if not _gate_ok:
                 lines.append(f'> 注：{len(SEEDS) - len(_ok_seeds)} 个 seed 未通过配置/预算配对门禁（{_why}），已按本仓库惯例排除——Δ 与 p 值只在可配对的 {_ok_seeds} 上计算，跨配置的种子差不进入检验。')
             lines.append(f'- 层均边界 F1：Δ = {d_f1.mean():+.4f} ± {sample_std(d_f1):.4f}，{int(max((d_f1 > 0).sum(), (d_f1 < 0).sum()))}/{_n_f1} 同向，p(exact) = {p_f1:.3f}')
-            lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p(exact) = {p_ppl:.3f}（n={len(d_ppl)} 时 p 分辨率下限 {2.0 / 2 ** max(len(d_ppl), 1):.3f}）\n')
+            _ppl_floor0 = 2.0 / (1 << len(d_ppl)) if len(d_ppl) <= 20 else 1.0 / 200001.0
+            lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p(exact) = {p_ppl:.3f}（n={len(d_ppl)} 时 p 分辨率下限 {_ppl_floor0:.3f}）\n')
         elif not _ok_seeds:
             p_f1 = p_ppl = None
             lines.append(f'\n**配对检验：未执行。** 上述两臂不满足本仓库的可配对条件（{_why}）——它们的训练配置无法证明相同，**不给出 p 值**、不进入任何显著性主张。\n')
@@ -382,13 +392,18 @@ def main(argv=None):
     except (KeyError, ValueError, TypeError):
         _hyb_keep = np.zeros(len(SEEDS), dtype=bool)
     _hyb_seeds = [s for s, k in zip(SEEDS, _hyb_keep) if k]
+    try:
+        _csa_keep = np.array([L.pair_reason(rec('csa_dynamic', s), rec('csa_dyn_fuse', s)) is None for s in SEEDS], dtype=bool)
+    except (KeyError, ValueError, TypeError):
+        _csa_keep = np.zeros(len(SEEDS), dtype=bool)
+    _csa_seeds = [s for s, k in zip(SEEDS, _csa_keep) if k]
     plt.rcParams.update({'font.size': 10})
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.6))
     for ax, (a, b, ttl) in zip(axes, [('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn', 'hybrid stack (in-panel paired)'), ('csa_dyn_fuse', 'csa_dynamic', 'pure CSA stack (cross-panel)')]):
         _in_panel = (a, b) == ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn')
-        _seeds_ax = _hyb_seeds if _in_panel else SEEDS
-        if _in_panel and not _seeds_ax:
-            print('[fuse_analysis] NOTE: skipping the hybrid trajectory panel — no seed passes the run_cfg/budget pairing gate, so pooling the arms would mix configurations')
+        _seeds_ax = _hyb_seeds if _in_panel else _csa_seeds
+        if not _seeds_ax:
+            print(f'[fuse_analysis] NOTE: skipping the {a} vs {b} trajectory panel — no seed passes the run_cfg/budget pairing gate, so pooling the arms would mix configurations')
             ax.set_visible(False)
             continue
         for v, color, lab in [(b, 'steelblue', f'{b} (no-fuse)'), (a, 'darkorange', f'{a} (fuse)')]:
@@ -525,7 +540,7 @@ def main(argv=None):
     elif _f1_sig:
         _c1 = f'1. **同面板配对下 fuse 显著改变了边界 F1**：hybrid 栈按 seed 配对（n={_n_p}），ΔF1 = **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}** < 0.05——「F1 差不稳固」的读法在本轮产物上不成立。\n'
     else:
-        _f1_floor = 2.0 / 2 ** _n_p if isinstance(_n_p, int) and _n_p > 0 else float('nan')
+        _f1_floor = (2.0 / (1 << _n_p) if _n_p <= 20 else 1.0 / 200001.0) if isinstance(_n_p, int) and _n_p > 0 else float('nan')
         _f1_floor_txt = f'p 值打在 n={_n_p} 的分辨率下限上，不能排除是噪声' if _f1_p is not None and math.isfinite(_f1_floor) and (abs(_f1_p - _f1_floor) < 1e-12) else f'p={_pv('p_f1', '{:.3f}')}，高于 n={_n_p or '?'} 的分辨率下限 {_f1_floor:.3f}，不能排除是噪声'
         _x_f1 = probe.get('x_d_f1')
         if _x_f1 is None or not np.isfinite(_x_f1):
@@ -538,7 +553,7 @@ def main(argv=None):
     elif _ppl_sig:
         _c3 = f'3. **PPL 存在可分辨的差异**：同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')} < 0.05），「PPL 不变」的读法在本轮产物上不成立。\n'
     else:
-        _ppl_floor = 2.0 / 2 ** _n_pp if isinstance(_n_pp, int) and _n_pp > 0 else float('nan')
+        _ppl_floor = (2.0 / (1 << _n_pp) if _n_pp <= 20 else 1.0 / 200001.0) if isinstance(_n_pp, int) and _n_pp > 0 else float('nan')
         _ppl_floor_txt = f'配对符号翻转 p 值打在 n={_n_pp} 的分辨率下限上，任何差异不能排除是种子噪声' if _ppl_p is not None and math.isfinite(_ppl_floor) and (abs(_ppl_p - _ppl_floor) < 1e-12) else f'配对符号翻转 p={_pv('p_ppl', '{:.3f}')}，高于 n={_n_pp or '?'} 的分辨率下限 {_ppl_floor:.3f}，任何差异不能排除是种子噪声'
         _x_ppl = probe.get('x_d_ppl_csa')
         _x_ppl_txt = f'，跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL' if _x_ppl is not None and np.isfinite(_x_ppl) else '，跨面板纯 CSA 对比未测量'

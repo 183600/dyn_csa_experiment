@@ -337,6 +337,9 @@ def _hist_by_seed(outdir, variant, raw=None):
             _new_cur = isinstance(r.get('run_cfg'), str) and r['run_cfg'].endswith(_cur_sfx)
             _old_cur = isinstance(cfg_of.get(_s0), str) and cfg_of[_s0].endswith(_cur_sfx)
             if _new_real and (synth_of.get(_s0) or (_new_cur and not _old_cur)):
+                if s in out:
+                    print(f'[stats] {sp}: seed {s} of `{variant}` matches the curve of seed {_s0} but a DIFFERENT record already holds seed {s} — the panel is ambiguous; keeping the existing admissions and dropping this record')
+                    continue
                 seen.pop(fp)
                 out.pop(_s0, None)
                 synth_of.pop(_s0, None)
@@ -505,8 +508,10 @@ def _scale_crossovers():
         if tps is not None and tps != p['batch'] * p['seq']:
             print(f'[stats] {label}: panel tokens/step is {tps:g} but its declared batch*seq is {p['batch'] * p['seq']} — using the calibrated rate')
         per_seed = {}
+        das = {s: dict(ha[s]) for s in common}
+        dbs = {s: dict(hb[s]) for s in common}
         for s in common:
-            da, db = (dict(ha[s]), dict(hb[s]))
+            da, db = (das[s], dbs[s])
             steps = sorted(set(da) & set(db))
             gap = [da[t] - db[t] for t in steps]
             xo, crossed = _crossover_step(steps, gap)
@@ -514,8 +519,8 @@ def _scale_crossovers():
             if tps is not None and crossed and math.isfinite(xo):
                 rec['crossover_tokens'] = xo * tps
             per_seed[s] = rec
-        steps = sorted(set.intersection(*[set(dict(ha[s]).keys()) for s in common], *[set(dict(hb[s]).keys()) for s in common]))
-        gap_mean = [float(np.mean([dict(ha[s])[t] for s in common]) - np.mean([dict(hb[s])[t] for s in common])) for t in steps]
+        steps = sorted(set.intersection(*[set(das[s]) for s in common], *[set(dbs[s]) for s in common]))
+        gap_mean = [float(np.mean([das[s][t] for s in common]) - np.mean([dbs[s][t] for s in common])) for t in steps]
         xo_m, crossed_m = _crossover_step(steps, gap_mean)
         entry = {'status': 'ok', **p, 'seeds': common, 'tokens_per_step': tps, 'per_seed': per_seed, 'per_seed_synth': {str(s): bool(getattr(ha, 'per_seed_synth', {}).get(s) or getattr(hb, 'per_seed_synth', {}).get(s)) for s in common}, 'mean_crossover_step': xo_m, 'mean_crossed': crossed_m, 'mean_traj': {'steps': steps, 'gap': gap_mean}}
         if tps is not None and crossed_m and math.isfinite(xo_m):
@@ -857,8 +862,8 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                 A(f'| d={v['d']}/{v['n_layers']}L | `{v['outdir']}` | {_ntag} | — | — | 无公共 eval 步 |')
                 continue
             last = _stps[-1]
-            _tok = f'{last * v['tokens_per_step'] / 1000000.0:.1f}M' if v.get('tokens_per_step') else 'n/a'
-            A(f'| d={v['d']}/{v['n_layers']}L | `{v['outdir']}` | {_ntag} | > {last:g} | > {_tok} | 删失（窗内未交叉） |')
+            _tok = f'> {last * v['tokens_per_step'] / 1000000.0:.1f}M' if v.get('tokens_per_step') else '(tokens/step unknown)'
+            A(f'| d={v['d']}/{v['n_layers']}L | `{v['outdir']}` | {_ntag} | > {last:g} | {_tok} | 删失（窗内未交叉） |')
     A('')
     ok = [v for v in xo.values() if v.get('status') == 'ok']
     if ok:

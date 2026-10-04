@@ -1799,7 +1799,10 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
         model.train(was_training)
     if not ntok:
         return float('nan')
-    return math.exp(nll.item() / ntok)
+    try:
+        return math.exp(nll.item() / ntok)
+    except OverflowError:
+        return float('inf')
 
 def enable_block_stats(model, on):
     for blk in model.blocks:
@@ -1817,12 +1820,9 @@ def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None):
     hits, ghits = _greedy_match_counts(pred, gt, tol)
     prec, rec = (hits / P, ghits / G)
     f1 = 2 * prec * rec / max(prec + rec, 1e-09)
-    near = np.zeros(n + 1, dtype=bool)
-    for g in gt:
-        near[max(g - tol, 1):g + tol + 1] = True
     n_pos = max(n - 1, 1)
     _approx = []
-    rand_prec = _random_cut_precision(P, near, n_pos, tol, G, gt, approx_flag=_approx)
+    rand_prec = _random_cut_precision(P, None, n_pos, tol, G, gt, approx_flag=_approx)
     if provenance is not None:
         provenance['bnd_rand_exact'] = provenance.get('bnd_rand_exact', True) and (not _approx)
     return (prec, rec, f1, rand_prec)
@@ -1862,6 +1862,9 @@ def _random_cut_precision(P, near, n_pos, tol, G, gt_bounds=None, approx_flag=No
     if P <= 0 or G <= 0 or n_pos <= 0:
         return 0.0
     if gt_bounds is None:
+        if near is None:
+            print('[stats] WARNING: `_random_cut_precision` got neither a `near` mask nor `gt_bounds`; the baseline is UNCOMPUTABLE for this call (returning 0.0) rather than being scored against an inflated reference set.  Pass `gt_bounds`.')
+            return 0.0
         _runs = _mask_runs(near, n_pos, tol)
         if _runs is None:
             print('[stats] WARNING: `_random_cut_precision` got a `near` mask it cannot decompose into boundary neighbourhoods and no `gt_bounds`; the baseline is UNCOMPUTABLE for this call (returning 0.0) rather than being scored against an inflated reference set.  Pass `gt_bounds`.')
@@ -1872,9 +1875,9 @@ def _random_cut_precision(P, near, n_pos, tol, G, gt_bounds=None, approx_flag=No
         gt = gt[(gt >= 1) & (gt <= n_pos)]
     if gt.size == 0:
         return 0.0
+    gt = np.unique(gt)
     if P >= n_pos:
         return float(min(gt.size, P) / P)
-    gt = np.unique(gt)
     clusters, cur = ([], [int(gt[0])])
     for g in gt[1:]:
         g = int(g)
@@ -3169,8 +3172,11 @@ def run(cfg=None, seeds=None, guard=None, label=''):
             try:
                 rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts)
                 if rec.get('budget_truncated'):
-                    print(f'[budget] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`); ' + ('keeping the previous record instead.' if key in summary else 'the key is left ABSENT, not written as a stub.') + ' Raise BUDGET and re-run to retry this cell.')
-                    if key not in summary:
+                    _prev_ok = ppl_is_usable((summary.get(key) or {}).get('ppl'))
+                    print(f'[budget] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`); ' + ('keeping the previous record instead.' if _prev_ok else 'the key is left ABSENT, not written as a stub.') + ' Raise BUDGET and re-run to retry this cell.')
+                    if not _prev_ok:
+                        if key in summary:
+                            del summary[key]
                         dropped_truncations.append(key)
                 else:
                     rec['run_cfg'] = fp
