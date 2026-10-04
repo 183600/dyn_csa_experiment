@@ -231,12 +231,18 @@ def per_seed_records(outdir):
     out = collections.defaultdict(dict)
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
-            if isinstance(r['seed'], bool):
+            _sv = r['seed']
+            if isinstance(_sv, bool):
                 print(f"[report] record {_k!r} in {outdir} carries a boolean seed — skipped for pairing")
                 continue
-            try:
-                _sd = int(r['seed'])
-            except (TypeError, ValueError, OverflowError):
+            if isinstance(_sv, float):
+                _sd = int(_sv) if math.isfinite(_sv) and _sv.is_integer() else None
+            else:
+                try:
+                    _sd = int(_sv)
+                except (TypeError, ValueError, OverflowError):
+                    _sd = None
+            if _sd is None:
                 print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
                 continue
             _slot = out[r['variant']]
@@ -573,24 +579,27 @@ def sec_p0e():
             _g20 = _gap_at(20000)
             def _dir_word(r):
                 return '下降' if r < 0 else ('上升' if r > 0 else '持平')
+            _lastk = steps[-1] / 1000.0
+            _tps = next((r['tokens_seen'] / r['steps'] for _k, r in _s_items if isinstance(r, dict) and isinstance(r.get('tokens_seen'), (int, float)) and isinstance(r.get('steps'), (int, float)) and r['steps']), None)
+            _tok_m = f'{steps[-1] * _tps / 1e6:.0f}M' if _tps else 'token 数未知'
             _gap_calib = 'seed 平均' if not _unpaired_gap else '非配对逐步均值差（两臂尾段无公共 seed，仅作方向性参考）'
-            lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，{_gap_calib}）**：', '', f'- 20k 步差距：{_g20} PPL；40k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {_dir_word(r_csa)} {abs(r_csa):.2f}、dense {_dir_word(r_full)} {abs(r_full):.2f} PPL/1k）。']
+            lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，{_gap_calib}）**：', '', f'- 20k 步差距：{_g20} PPL；{_lastk:g}k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {_dir_word(r_csa)} {abs(r_csa):.2f}、dense {_dir_word(r_full)} {abs(r_full):.2f} PPL/1k）。']
             if n_ < 2:
                 verdict = f'**结论：尾段差距统计量不可用**（两臂只在 {n_} 个公共评测步上有测量，尾段回归需要至少 2 个点），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。需补跑或加密尾段评测网格。'
             elif not (math.isfinite(g_last) and math.isfinite(slope)):
                 verdict = f'**结论：尾段差距统计量不可用**（`g_last` 或 `slope` 非有限值：g_last={g_last!r}、slope={slope!r}），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。上表已剔除非有限的曲线点；若此处仍出现，说明该面板的尾段整体缺失，需补跑。'
             elif g_last <= 0:
-                verdict = '**结论：渐近线在 40k 内反演**——`csa_fixed` 追平并超过 dense，评审的 P0-2 质疑成立，此前「worse asymptote」的表述需撤回。'
+                verdict = f'**结论：渐近线在 {_lastk:g}k 内反演**——`csa_fixed` 追平并超过 dense，评审的 P0-2 质疑成立，此前「worse asymptote」的表述需撤回。'
             elif slope < -1e-06:
                 x0 = steps[-1] - g_last * 1000.0 / slope
                 if steps[-1] < x0 <= steps[-1] * 10:
                     _g20v = gaps.get(20000)
                     _g20c = f'由 20k 的 **{_g20v:+.1f}** ' if isinstance(_g20v, (int, float)) and math.isfinite(_g20v) else ''
-                    verdict = f'- 按尾段斜率线性外推，差距将在 ~{x0 / 1000:.0f}k 步附近归零（外推仅供参考：学习率已 cosine 衰减到底，后期斜率通常进一步放缓）。\n\n**结论**：40k 步内未发生反演，但差距仍在缓慢收窄。**保守表述**：「等 token budget 下 CSA 收敛更慢，终点差距 {_g20c}收窄到 40k 的 {g_last:+.1f}，未见交叉」。是否最终追平属外推，不属证据。'
+                    verdict = f'- 按尾段斜率线性外推，差距将在 ~{x0 / 1000:.0f}k 步附近归零（外推仅供参考：学习率已 cosine 衰减到底，后期斜率通常进一步放缓）。\n\n**结论**：{_lastk:g}k 步内未发生反演，但差距仍在缓慢收窄。**保守表述**：「等 token budget 下 CSA 收敛更慢，终点差距 {_g20c}收窄到 {_lastk:g}k 的 {g_last:+.1f}，未见交叉」。是否最终追平属外推，不属证据。'
                 else:
-                    verdict = f'- 线性外推的交叉点在 ~{x0 / 1000:.0f}k 步，超出可信外推范围。\n\n**结论**：40k 步（~246M tokens，约 2 epoch）仍未追平——终点差距 **{g_last:+.1f} PPL**。差距收窄速度在尾段为 {abs(slope):.2f} PPL/1k，即每多花 10k 步约收窄 {abs(slope) * 10:.0f} PPL。**「渐近线更差」在实验可达范围内成立**，更精确的措辞是「等预算收敛更慢且差距长期存在」。'
+                    verdict = f'- 线性外推的交叉点在 ~{x0 / 1000:.0f}k 步，超出可信外推范围。\n\n**结论**：{_lastk:g}k 步（~{_tok_m} tokens）仍未追平——终点差距 **{g_last:+.1f} PPL**。差距收窄速度在尾段为 {abs(slope):.2f} PPL/1k，即每多花 10k 步约收窄 {abs(slope) * 10:.0f} PPL。**「渐近线更差」在实验可达范围内成立**，更精确的措辞是「等预算收敛更慢且差距长期存在」。'
             else:
-                verdict = f'**结论**：尾段差距已不再收窄（斜率 {slope:+.2f} PPL/1k），**「渐近线更差」在 40k 步坐实**。'
+                verdict = f'**结论**：尾段差距已不再收窄（斜率 {slope:+.2f} PPL/1k），**「渐近线更差」在 {_lastk:g}k 步坐实**。'
             lines += ['', verdict, '']
     return '\n'.join(lines) + '\n'
 
