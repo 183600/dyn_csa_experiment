@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import glob
 import json
+import math
 import os
 import subprocess
 import sys
@@ -262,7 +263,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     floor_p_tree = 2.0 / 2 ** n_tree_min if n_tree_min else float('nan')
     probe_ok = n_contr_max >= 6
     probe_tag = f'@ n={n_contr_max}' if n_contr_max else '@ n/a'
-    _floor_txt = f'{floor_p:.3f}' if n_tree_min == n_contr_max else f'{floor_p_tree:.3f}（最弱对比 n={n_tree_min}；最全对比 n={n_contr_max} 为 {floor_p:.3f}）'
+    _floor_fmt = lambda _p: f'{_p:.3f}' if isinstance(_p, float) and math.isfinite(_p) else 'n/a'
+    _floor_txt = _floor_fmt(floor_p) if n_tree_min == n_contr_max else f'{_floor_fmt(floor_p_tree)}（最弱对比 n={n_tree_min}；最全对比 n={n_contr_max} 为 {_floor_fmt(floor_p)}）'
     _prov_total = 0
     _prov_stamped = 0
     _prov_synth = 0
@@ -374,6 +376,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
             def _at(Ln, rows=rows):
                 cells = L.by_len_cells(rows, Ln)
                 ok = [c for c in cells if not c.get('truncated')]
+                if (ok if ok else cells) and len(ok if ok else cells) < len(rows):
+                    print(f'[v11 report] {v} L{Ln}: the column mean covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed mean')
                 if ok:
                     return (float(np.mean([c['ppl'] for c in ok])), False)
                 return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
@@ -389,6 +393,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                         if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')):
                             mp[r.get('seed')] = float(c['ppl'])
                 both = sorted(set(m512) & set(m4096))
+                if both and len(both) < len(rows):
+                    print(f'[v11 report] {v} ratio@4096: computed over {len(both)}/{len(rows)} seeds — the rest lack a usable cell at 512 or 4096')
                 if not both:
                     return None
                 return float(np.mean([m4096[s] / m512[s] for s in both]))

@@ -750,6 +750,8 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             def _at(Ln, rows=rows):
                 cells = L.by_len_cells(rows, Ln)
                 ok = [c for c in cells if not c.get('truncated')]
+                if (ok if ok else cells) and len(ok if ok else cells) < len(rows):
+                    print(f'[v10 report] {v} L{Ln}: the column mean covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed mean')
                 if ok:
                     return (float(np.mean([c['ppl'] for c in ok])), False)
                 return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
@@ -765,6 +767,8 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                         if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')):
                             mp[r.get('seed')] = float(c['ppl'])
                 both = sorted(set(m512) & set(m4096))
+                if both and len(both) < len(rows):
+                    print(f'[v10 report] {v} ratio@4096: computed over {len(both)}/{len(rows)} seeds — the rest lack a usable cell at 512 or 4096')
                 if not both:
                     return None
                 return float(np.mean([m4096[s] / m512[s] for s in both]))
@@ -783,7 +787,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         A('')
         A('> 后缀 `~` 表示该列**只有位置受限（abs-PE）的截断 cell**：它是在比列名更短的 span 上评出来的分数，**不是**长上下文测量值。任何 `~` 行不可用于「外推是否稳健」的结论。')
         A('')
-    A(f'**P3MP 干扰注入设计**：eval 长度 2048/4096；把**远距上下文**（除最后 {PROBE['target']} 个干净目标 token 外的全部位置）中比例为 ρ ∈ {{0, 1/8, 1/4, 1/2}} 的 token 替换为均匀随机 token——同一 (序列, ρ) 的腐坏对所有臂逐字节相同（按 (eval_len, 序列号, ρ) 播种，与臂/模型种子无关），臂间严格配对。只在干净目标区计 PPL。四个臂：')
+    A(f'**P3MP 干扰注入设计**：eval 长度 2048/4096；把**远距上下文**（目标区之前的全部输入位置，即除最后 {PROBE['target']} 个干净目标 token 及其紧邻前置位置以外的位置）中比例为 ρ ∈ {{0, 1/8, 1/4, 1/2}} 的 token 替换为均匀随机 token——同一 (序列, ρ) 的腐坏对所有臂逐字节相同（按 (eval_len, 序列号, ρ) 播种，与臂/模型种子无关），臂间严格配对。只在干净目标区计 PPL。四个臂：')
     A('')
     A('- `full_rope`（dense，必须直面远距噪声）')
     A('- `csa_fixed_rope` 学习选择（原机制）')

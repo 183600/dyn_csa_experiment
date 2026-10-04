@@ -598,7 +598,12 @@ def sec_p0e():
             _lastk = steps[-1] / 1000.0
             _tps = next((r['tokens_seen'] / r['steps'] for _k, r in _s_items if isinstance(r, dict) and isinstance(r.get('tokens_seen'), (int, float)) and isinstance(r.get('steps'), (int, float)) and r['steps']), None)
             _tok_m = f'{steps[-1] * _tps / 1e6:.0f}M' if _tps else 'token 数未知'
-            _gap_calib = 'seed 平均' if not _unpaired_gap else '非配对逐步均值差（两臂尾段无公共 seed，仅作方向性参考）'
+            if _unpaired_gap:
+                _gap_calib = '非配对逐步均值差（两臂尾段无公共 seed，仅作方向性参考）'
+            elif _pair_gated:
+                _gap_calib = f'尾段斜率与终点差距为过门禁配对子集（{len(_paired)}/{len(_paired) + len(_pair_gated)} 个公共 seed；上表逐行仍是逐步全 seed 均值）'
+            else:
+                _gap_calib = 'seed 平均'
             lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，{_gap_calib}）**：', '', f'- 20k 步差距：{_g20} PPL；{_lastk:g}k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {_dir_word(r_csa)} {abs(r_csa):.2f}、dense {_dir_word(r_full)} {abs(r_full):.2f} PPL/1k）。']
             if n_ < 2:
                 verdict = f'**结论：尾段差距统计量不可用**（两臂只在 {n_} 个公共评测步上有测量，尾段回归需要至少 2 个点），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。需补跑或加密尾段评测网格。'
@@ -809,13 +814,19 @@ def sec_p1l():
         trunc_flags = []
         for Ln in lens:
             recs_l = []
+            _seen_sd = set()
             for _r in recs:
                 if _r.get('variant') != v:
                     continue
                 _bl = _r.get('by_len') or {}
                 _c = _bl.get(Ln, _bl.get(str(Ln)))
                 if isinstance(_c, dict) and _ppl_ok(_c.get('ppl')):
-                    recs_l.append((_r.get('seed'), _c))
+                    _sd = _r.get('seed')
+                    if _sd in _seen_sd:
+                        print(f'[report] sec_p1l: ambiguous (variant, seed) = ({v!r}, {_sd}) at L{Ln}: two measurable records found; keeping the FIRST')
+                        continue
+                    _seen_sd.add(_sd)
+                    recs_l.append((_sd, _c))
             ok = [x for _sd, x in recs_l if not x.get('truncated')]
             is_tr = bool(recs_l) and len(ok) < len(recs_l)
             vals = [float(x['ppl']) for x in (ok if ok else [x for _sd, x in recs_l])]
@@ -935,17 +946,14 @@ def sec_p2s():
         main = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full'), None)
         _mt = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full_matched'), None) if _agg_entry(_agg, 'full_matched') is not None else None
         _base = _mt if _mt else main
-        _mt_txt = ''
-        if _mt and _base is not _mt:
-            _mt_txt = f' 参数对齐的 `csa_fixed − full_matched` 为 **{_mt[3]['mean']:+.2f} PPL**（p={_mt[3]['p_exact_signflip']:.3f}），该配对的容量已受控，机制的读数以它为准。'
         if _base:
             _ba, _bb, common, st = _base
             _which = '`csa_fixed − full_matched`（参数对齐）' if _mt else '`csa_fixed − full`（未做容量匹配）'
             _tag = unmatched_tag(_agg_entry(_agg, _ba), _agg_entry(_agg, _bb)) if _mt else unmatched_tag(_agg_entry(_agg, 'csa_fixed'), _agg_entry(_agg, 'full'))
             if st['mean'] > 0:
-                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：短训练下的 sparse 早期优势在 d=384 / 8 层 / seq 1024 的规模上**已经消失并反转为劣势**——规模越大，dense 的容量红利显现越早，与 20k/40k 长跑的「渐近线反转」同一方向。{_tag or '✓'}' + _mt_txt
+                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：短训练下的 sparse 早期优势在 d=384 / 8 层 / seq 1024 的规模上**已经消失并反转为劣势**——规模越大，dense 的容量红利显现越早，与 20k/40k 长跑的「渐近线反转」同一方向。{_tag or '✓'}'
             else:
-                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：该规模下 sparse 仍领先，早期优势未随规模消失。{_tag or '✓'}' + _mt_txt
+                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：该规模下 sparse 仍领先，早期优势未随规模消失。{_tag or '✓'}'
             lines += ['', f'**结论**：{concl}', '']
     return '\n'.join(lines) + '\n'
 
