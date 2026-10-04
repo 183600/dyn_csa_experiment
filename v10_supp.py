@@ -353,6 +353,8 @@ def _hist_by_seed(outdir, variant, raw=None):
                     print(f'[stats] {sp}: seed {s} of `{variant}` is a REAL record but its curve is IDENTICAL to the one already admitted for seed {seen[fp]}; keeping seed {seen[fp]} (the first admission) and dropping seed {s} so the curve is not counted twice.')
                 continue
         if s in out:
+            _new_cur2 = isinstance(r.get('run_cfg'), str) and r['run_cfg'].endswith(f'_cs{L.CODE_SEMANTICS}')
+            _old_cur2 = isinstance(cfg_of.get(s), str) and cfg_of[s].endswith(f'_cs{L.CODE_SEMANTICS}')
             if not r.get('synthesized') and synth_of.get(s):
                 out.pop(s, None)
                 synth_of.pop(s, None)
@@ -361,6 +363,14 @@ def _hist_by_seed(outdir, variant, raw=None):
                     if _s_old == s:
                         seen.pop(_fp_old)
                 print(f'[stats] {sp}: a REAL record for ({variant}, seed {s}) arrives after a SYNTHESIZED reconstruction of the same seed whose curve differs; keeping the real measurement and dropping the reconstruction.')
+            elif _new_cur2 and not _old_cur2:
+                out.pop(s, None)
+                synth_of.pop(s, None)
+                cfg_of.pop(s, None)
+                for _fp_old, _s_old in list(seen.items()):
+                    if _s_old == s:
+                        seen.pop(_fp_old)
+                print(f'[stats] {sp}: two records with DIFFERENT curves both claim ({variant}, seed {s}); keeping the one stamped with the CURRENT code semantics and dropping the older-stamped one (the older reading would be excluded as stale anyway).')
             else:
                 print(f'[stats] {sp}: two records with DIFFERENT curves both claim ({variant}, seed {s}) — the gap trajectory is ambiguous; the first record is kept and this one is dropped')
                 continue
@@ -883,7 +893,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     _xo256_recon = any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', [])))
     if _xo256_recon:
         A(f'**注意**：d=256 的轨迹取自 `results_lm_v3_long/summary.json`（v6 重构件，见 README 记账说明 #1）——逐种子轨迹不可独立恢复，该规模的逐种子交叉步互为副本，只有 seed 均值轨迹的交叉步（{_xo256_txt}，eval 网格 1000 步）是有效读数。')
-    else:
+    elif _xo256.get('status') == 'ok':
         A(f'**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步（{_xo256_txt} 附近）与 seed 均值轨迹同为有效读数。')
     A('')
     if fit:

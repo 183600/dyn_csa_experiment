@@ -624,6 +624,8 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
             ratios[v] = L.variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}, ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
     _wu = cfg['warmup']
     _mkey = ','.join(sorted((str(_x) for _x in (set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}))))
+    if torch.cuda.is_available():
+        L._pin_cuda_determinism()
     _fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{L.determinism_label()}_cs{CKPT_CODE}'
     stale_dropped = []
     for seed in seeds:
@@ -697,6 +699,7 @@ def build_niah_batch(n_seq, seq_len, n_pairs=4, vocab=8192, seed=0):
     ids = rng.integers(key_hi, vocab // 2, size=(n_seq, seq_len)).astype(np.int64)
     tgt = np.full((n_seq, seq_len - 1), -100, dtype=np.int64)
     dist = np.full((n_seq, seq_len - 1), -1, dtype=np.int64)
+    kdist = np.full((n_seq, seq_len - 1), -1, dtype=np.int64)
     tail = 2 * n_pairs
     hay = seq_len - tail
     band = max(hay // n_pairs, 2)
@@ -722,7 +725,8 @@ def build_niah_batch(n_seq, seq_len, n_pairs=4, vocab=8192, seed=0):
             ids[i, ap] = rng.integers(key_hi, vocab // 2)
             tgt[i, kp] = key_to_val[int(keys[pj])]
             dist[i, kp] = kp - val_pos[int(keys[pj])]
-    return (ids, tgt, dist)
+            kdist[i, kp] = kp - pj * band
+    return (ids, tgt, dist, kdist)
 
 @torch.inference_mode()
 def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, seed=1234, chunk=16):
@@ -730,7 +734,7 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
     model.eval()
     try:
         max_pos = getattr(model, 'max_seq', seq_len)
-        ids, tgt, dist = build_niah_batch(n_seq, seq_len, n_pairs, vocab, seed)
+        ids, tgt, dist, kdist = build_niah_batch(n_seq, seq_len, n_pairs, vocab, seed)
         correct = np.zeros_like(tgt, dtype=bool)
         span = min(seq_len, max_pos) if getattr(model, 'use_abs_pe', True) else seq_len
         tail = 2 * n_pairs
@@ -759,17 +763,17 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
         m = np.zeros_like(tgt, dtype=bool)
         m[:, -scored_cols:] = tgt[:, -scored_cols:] >= 0
         if m.sum() == 0:
-            return {'acc': 0.0, 'n': 0, 'by_dist': {}}
+            return {'n': 0, 'by_dist': {}}
         d = dist[m]
         c = correct[m]
         if getattr(model, 'use_abs_pe', True) and seq_len > max_pos:
             _cut = seq_len - span
             _cols = np.nonzero(m)[1]
-            _in_ctx = (_cols - d) >= _cut
+            _in_ctx = ((_cols - d) >= _cut) & ((_cols - kdist[m]) >= _cut)
             d = d[_in_ctx]
             c = c[_in_ctx]
             if d.size == 0:
-                return {'acc': 0.0, 'n': 0, 'by_dist': {}}
+                return {'n': 0, 'by_dist': {}}
         buckets = [(0, 128), (128, 512), (512, 2048), (2048, 8192), (8192, 10 ** 9)]
         by = {}
         for lo, hi in buckets:
@@ -1104,7 +1108,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 def _batch(cache=cache, _seed=seed, _vocab=vocab):
                     if cache['age'] >= 4 or cache['ids'] is None:
                         eps = _seed * 100003 + cache['epoch'] * 7919
-                        ids, tgt, _ = build_niah_batch(12, 512, 4, _vocab, seed=eps)
+                        ids, tgt, _, _kd = build_niah_batch(12, 512, 4, _vocab, seed=eps)
                         cache['ids'] = torch.from_numpy(ids).to(DEVICE)
                         cache['tgt'] = torch.from_numpy(tgt).to(DEVICE)
                         cache['age'] = 0
@@ -1163,6 +1167,8 @@ def run_niah_phase(payload, guard=None, label=''):
                     r = eval_niah(model, Ln, DEVICE, vocab=int(_ckp.get('vocab', vocab)))
                 except Exception as e:
                     r = {'error': f'{type(e).__name__}: {e}'}
+                if guard is not None:
+                    guard.record_run(time.time() - t0, 0, 0, 0, 0, 0)
                 r.update({'variant': v, 'seed': seed, 'seq_len': Ln, 'params': _ckp['params'], 'probe_s': time.time() - t0, '_code': CKPT_CODE})
                 summary[key] = r
                 print(f'  [niah] {v:18s} s{seed} len={Ln:5d}  acc={r.get('acc')}  by_dist={r.get('by_dist')}')

@@ -40,6 +40,8 @@ def proc_alive():
             return pid
         if ppid in watchers:
             return pid
+    if watchers:
+        return min(watchers)
     return None
 
 def gpu():

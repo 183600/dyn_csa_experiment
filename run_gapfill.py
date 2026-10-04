@@ -34,6 +34,9 @@ def git_push(msg):
     committed = r.returncode == 0
     if not committed and 'nothing to commit' not in r.stdout + r.stderr:
         print(f'[git] commit problem: {(r.stdout + r.stderr)[-300:]}')
+        if run('git', 'status', '--porcelain').stdout.strip():
+            print('[git] the commit failed while changes are still uncommitted — NOT pushing (a push would publish stale history and report success); leaving the tree for inspection')
+            return False
     _branch = run('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
     if _branch != 'HEAD':
         rb = run('git', 'pull', '--rebase', '--autostash', 'origin', _branch)
