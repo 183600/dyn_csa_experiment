@@ -256,7 +256,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         k_blk_r = apply_rope(k_blk, bc[:, None, :], bs[:, None, :], rope_dim)
         k_sw_r = apply_rope(k_sw, cos[:, None, :], sin[:, None, :], rope_dim)
         out = torch.empty_like(q)
-        rel = L._range_cache(0, w, dev)
+        _wi_all, _wvalid_all = L._window_geometry(T, w, dev)
         pos_all = L._arange_cache(T, dev)
         q_chunk = max(1, min(int(q_chunk), T))
         _n_blk = k_blk_r.shape[0]
@@ -273,9 +273,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 _keep = _ddk if _keep is None else _keep & _ddk
             if _keep is not None:
                 sel = sel & _keep
-            wg = pos[:, None] - (w - 1) + rel[None, :]
-            wvalid = wg >= 0
-            wi = wg.clamp(min=0)
+            wvalid = _wvalid_all[s:e]
+            wi = _wi_all[s:e]
             both = torch.cat([ib, wi + _n_blk], 1).to(torch.int32)
             Kset = L._take_2d(_k_stack, both)
             Vset = L._take_2d(_v_stack, both)
@@ -564,6 +563,9 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         _tail.append(ce.detach())
         if len(_tail) > 50:
             del _tail[:-50]
+        if len(_lbuf) >= 512:
+            losses.extend(torch.stack(_lbuf).tolist())
+            _lbuf.clear()
         if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
             _pv = float(L.eval_ppl(model, _eval_batch, device))
             (warm_hist if getattr(model.blocks[0].attn, '_dense_warmup', False) else ppl_hist).append([step + 1, _pv])
@@ -923,6 +925,9 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
     out_d = {'per_variant': per_variant, 'comparisons': {}}
     for name, a, b in pairs:
         if a not in recs or b not in recs:
+            _missing = [t for t in (a, b) if t not in recs]
+            print(f'[stats] {name}: comparison OMITTED — panel tag(s) {_missing} absent from the loaded summaries (not measured under this naming, or the directory was renamed); not quoting a cross-panel delta')
+            out_d['comparisons'][name] = {'omitted': f'panel tag(s) {_missing} absent', 'n': 0}
             continue
         common = sorted(set(recs[a]) & set(recs[b]))
         dl, skipped, unstamped = ([], [], 0)
@@ -957,6 +962,9 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
     L.atomic_write_json(out, out_d)
     print(f'[stats] wrote {out}')
     for k, v in out_d['comparisons'].items():
+        if 'omitted' in v:
+            print(f'  {k:34s} omitted — {v['omitted']}')
+            continue
         warn = f'  [{v['n_skipped_config_mismatch']} seed(s) dropped: config mismatch]' if v.get('n_skipped_config_mismatch') else ''
         print(f'  {k:34s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}{warn}')
     return out_d
@@ -1133,7 +1141,7 @@ def run_niah_phase(payload, guard=None, label=''):
                     break
                 t0 = time.time()
                 try:
-                    r = eval_niah(model, Ln, DEVICE, vocab=vocab)
+                    r = eval_niah(model, Ln, DEVICE, vocab=int(_ckp.get('vocab', vocab)))
                 except Exception as e:
                     r = {'error': f'{type(e).__name__}: {e}'}
                 r.update({'variant': v, 'seed': seed, 'seq_len': Ln, 'params': _ckp['params'], 'probe_s': time.time() - t0, '_code': CKPT_CODE})

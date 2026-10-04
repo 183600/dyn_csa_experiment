@@ -429,6 +429,8 @@ def run_smoke():
     print(f'  -> 1500-step bs1 seq2k run estimate: {est / 60:.1f} min (¥{est / 3600 * guard.price:.2f}); full P2T (10 runs) ~{10 * est / 3600:.2f} h')
     print('[smoke] 3) zero-GPU report rebuild (scratch outputs, real artifacts untouched)')
     build_report(out='results_smoke_v9/REPORT_v9.md', stats_p='results_smoke_v9/stats.json')
+    import shutil
+    shutil.rmtree('results_smoke_v9', ignore_errors=True)
     print('\n[smoke] PASSED')
 if __name__ == '__main__':
     mode = sys.argv[1] if len(sys.argv) > 1 else 'full'

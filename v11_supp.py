@@ -219,9 +219,8 @@ def _fmt_pm(cell, std=None):
         mean = cell
     return f'{mean:.2f} ±{std or 0.0:.2f}'
 
-def build_report(out='REPORT_v11.md'):
-    stats_p = 'analysis_v11/stats.json'
-    v11_analysis()
+def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
+    v11_analysis(out=stats_p)
     st = json.load(open(stats_p, encoding='utf-8'))
     probe = st['probe']
     xo = st['crossover_panels']
@@ -675,8 +674,9 @@ def run_smoke():
     assert want <= got, f'probe cells missing: {want - got}'
     print(f'  probe roundtrip OK ({len(s)} cells)')
     shutil.rmtree('results_smoke_v11', ignore_errors=True)
-    print('[smoke] 2) zero-GPU analysis/report on current artifacts')
-    build_report()
+    print('[smoke] 2) zero-GPU analysis/report on current artifacts (scratch outputs, real artifacts untouched)')
+    build_report(out='results_smoke_v11/REPORT_v11.md', stats_p='results_smoke_v11/stats.json')
+    shutil.rmtree('results_smoke_v11', ignore_errors=True)
     print('\n[smoke] PASSED')
 if __name__ == '__main__':
     mode = sys.argv[1] if len(sys.argv) > 1 else 'full'

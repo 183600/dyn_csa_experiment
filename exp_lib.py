@@ -38,7 +38,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 BUDGET = dict(total_yuan=140.0, price_per_hour=2.4, margin=0.93, already_spent_yuan=0.0, state_path='autodl_budget_state.json')
-CODE_SEMANTICS = 'v11.121'
+CODE_SEMANTICS = 'v11.122'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
@@ -68,10 +68,13 @@ def _segment(n, want_cut_list, min_block, max_block):
     counts = [1]
     cur, cur_len = (0, 1)
     pending_cut = False
+    pending_slot = -1
     for t in range(1, n):
         cur_len += 1
         ci = t - 1
         if want_cut_list[ci]:
+            if not pending_cut:
+                pending_slot = ci
             pending_cut = True
         may = cur_len > min_block
         must = cur_len > max_block
@@ -80,8 +83,9 @@ def _segment(n, want_cut_list, min_block, max_block):
             cur_len = 1
             counts.append(0)
             if pending_cut:
-                honoured[ci] = 1.0
+                honoured[pending_slot] = 1.0
             pending_cut = False
+            pending_slot = -1
         counts[cur] += 1
         bids[t] = cur
     if cacheable:
@@ -2341,6 +2345,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         _tail.append(ce.detach())
         if len(_tail) > 50:
             del _tail[:-50]
+        if len(_lbuf) >= 512:
+            losses.extend(torch.stack(_lbuf).tolist())
+            _lbuf.clear()
         if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
             sub_ppl = eval_ppl(model, _eval_batch, device)
             ppl_hist.append([step + 1, float(sub_ppl)])

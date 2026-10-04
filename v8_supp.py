@@ -113,7 +113,7 @@ def _panel_block(panel):
             _stale_cfg = not (isinstance(_kept_cfg, str) and _kept_cfg.endswith(_cur_sfx))
             if _stale_cfg:
                 print(f'[stats] _panel_block: variant `{v}` has NO run_cfg group stamped with the current code semantics ({_cur_sfx}) — the table entry quotes numbers measured by older code and is marked `_stale_cfg` so downstream readers can tell')
-        vals = [v0 for v0 in ((r.get('ppl') if isinstance(r, dict) else r) for r in recs.values()) if isinstance(v0, (int, float)) and np.isfinite(v0)]
+        vals = [v0 for v0 in ((r.get('ppl') if isinstance(r, dict) else r) for r in recs.values()) if isinstance(v0, (int, float)) and (not isinstance(v0, bool)) and np.isfinite(v0)]
         ppl_map = {s: (r.get('ppl') if isinstance(r, dict) else r) for s, r in recs.items()}
         if not vals:
             out[v] = {'ppls': ppl_map, 'n': 0, **({'_stale_cfg': True} if _stale_cfg else {})}

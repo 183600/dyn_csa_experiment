@@ -537,6 +537,9 @@ def sec_p0e():
             tail = steps[-5:] if len(steps) >= 5 else steps
             _tail_span_k = (steps[-1] - tail[0]) / 1000.0
             _paired = sorted(set.intersection(*(set(trajs[v][st]) for v in ('csa_fixed', 'full') for st in tail))) if tail else []
+            _unpaired_gap = not _paired
+            if _unpaired_gap:
+                print('[report] sec_p0e: the two arms share NO seed on the tail evaluation steps — the tail-gap slope and extrapolation below use the UNPAIRED per-step mean gap (each step averaged over whichever seeds measured it), not a paired per-seed difference; read it as indicative only')
             xs = [st / 1000.0 for st in tail]
             if _paired:
                 ys = [sum((trajs['csa_fixed'][st][sd] - trajs['full'][st][sd] for sd in _paired)) / len(_paired) for st in tail]
@@ -562,7 +565,8 @@ def sec_p0e():
             _g20 = _gap_at(20000)
             def _dir_word(r):
                 return '下降' if r < 0 else ('上升' if r > 0 else '持平')
-            lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，seed 平均）**：', '', f'- 20k 步差距：{_g20} PPL；40k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {_dir_word(r_csa)} {abs(r_csa):.2f}、dense {_dir_word(r_full)} {abs(r_full):.2f} PPL/1k）。']
+            _gap_calib = 'seed 平均' if not _unpaired_gap else '非配对逐步均值差（两臂尾段无公共 seed，仅作方向性参考）'
+            lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，{_gap_calib}）**：', '', f'- 20k 步差距：{_g20} PPL；40k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {_dir_word(r_csa)} {abs(r_csa):.2f}、dense {_dir_word(r_full)} {abs(r_full):.2f} PPL/1k）。']
             if n_ < 2:
                 verdict = f'**结论：尾段差距统计量不可用**（两臂只在 {n_} 个公共评测步上有测量，尾段回归需要至少 2 个点），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。需补跑或加密尾段评测网格。'
             elif not (math.isfinite(g_last) and math.isfinite(slope)):
