@@ -550,7 +550,23 @@ def sec_p0e():
                 lines.append(f'| {st} | {c:.1f} | {f_:.1f} | **{gaps[st]:+.1f}** |')
             tail = steps[-5:] if len(steps) >= 5 else steps
             _tail_span_k = (steps[-1] - tail[0]) / 1000.0
-            _paired = sorted(set.intersection(*(set(trajs[v][st]) for v in ('csa_fixed', 'full') for st in tail))) if tail else []
+            _paired_raw = sorted(set.intersection(*(set(trajs[v][st]) for v in ('csa_fixed', 'full') for st in tail))) if tail else []
+            _rec_of = {}
+            for _k, r in _s_items:
+                if isinstance(r, dict):
+                    _rec_of.setdefault((r.get('variant'), str(r.get('seed'))), r)
+            _paired = []
+            _pair_gated = []
+            for _sd in _paired_raw:
+                _ra = _rec_of.get(('csa_fixed', _sd))
+                _rb = _rec_of.get(('full', _sd))
+                _why = _pair_reason(_ra, _rb) if _ra is not None and _rb is not None else 'record missing'
+                if _why is None:
+                    _paired.append(_sd)
+                else:
+                    _pair_gated.append((_sd, _why))
+            if _pair_gated:
+                print(f'[report] sec_p0e: {len(_pair_gated)} shared seed(s) FAILED the run_cfg/budget gate ({sorted({w for _s, w in _pair_gated})}) and are excluded from the paired tail-gap — the pairing rules are the same as every other section')
             _unpaired_gap = not _paired
             if _unpaired_gap:
                 print('[report] sec_p0e: the two arms share NO seed on the tail evaluation steps — the tail-gap slope and extrapolation below use the UNPAIRED per-step mean gap (each step averaged over whichever seeds measured it), not a paired per-seed difference; read it as indicative only')

@@ -173,7 +173,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             Cb_raw = x @ self.W_bKV if self.W_bKV is not None else None
         gate_mean = None
         if cfg.chunking == 'cosine_learnable':
-            fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x)
+            fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
             sim = L.cosine_similarity_consecutive(fused)
             if sim.numel() == 0:
                 bid = torch.zeros(T, dtype=torch.long, device=x.device)

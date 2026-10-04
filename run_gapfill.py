@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, math, os, shutil, subprocess, sys, traceback
+import json, math, os, shutil, statistics, subprocess, sys, traceback
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -63,12 +63,12 @@ def synthesize_long_summary():
     agg_path = os.path.join(adir, 'aggregate.json')
     if not os.path.exists(agg_path):
         print(f'[synth] SKIP: {agg_path} is absent — the panel is a LOCAL experiment artifact and is not tracked in the repository, so there is nothing to synthesize from.  Run the v3 panel (or restore the artifact) if you need this reconstruction.')
-        return {'skipped_missing_aggregate': agg_path}
+        return ({'skipped_missing_aggregate': agg_path}, None)
     try:
         agg = json.load(open(agg_path, encoding='utf-8'))
     except Exception as _e:
         print(f'[synth] SKIP: {agg_path} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to rebuild summary.json from a corrupt aggregate; re-derive the aggregate first.')
-        return {'skipped_unreadable_aggregate': agg_path}
+        return ({'skipped_unreadable_aggregate': agg_path}, None)
     spath = os.path.join(adir, 'summary.json')
     summary = {}
     if os.path.exists(spath):
@@ -80,6 +80,7 @@ def synthesize_long_summary():
     n_synth = n_kept = n_replaced = n_backfill = 0
     _unaligned = []
     _split = []
+    _cfg_refused = []
 
     def _canon(v, e):
         if '@' in str(v):
@@ -100,6 +101,12 @@ def synthesize_long_summary():
             continue
         real_v, _proto = _c
         _real = sorted({_num_or_none(r.get('seed')) for r in summary.values() if isinstance(r, dict) and r.get('variant') == real_v and (r.get('seed') is not None)} - {None})
+        _exp_tok = _LONG_STEPS * int(L.RUN_LONG['batch_size']) * int(L.RUN_LONG['seq_len'])
+        _ts = _num_or_none(e.get('tokens_seen'))
+        if _ts is not None and _ts != _exp_tok:
+            print(f"[synth] REFUSING to synthesize `{v}`: the aggregate's tokens_seen={_ts} does not match the current long recipe ({_LONG_STEPS} steps x {int(L.RUN_LONG['batch_size'])} x {int(L.RUN_LONG['seq_len'])} = {_exp_tok} tokens) — the snapshot was produced under a different configuration and reconstructing under the current step count would mislabel it.  Re-run the panel; only this variant is skipped.")
+            _cfg_refused.append(v)
+            continue
         if _seeds is None or len(_seeds) != len(_ppls):
             _unaligned.append((v, len(_ppls), _real))
             continue
@@ -123,7 +130,7 @@ def synthesize_long_summary():
             print(f"[synth] REFUSING to synthesize `{_v}`: the aggregate holds {_n} PPL value(s) but carries no verified seed->ppl mapping (real per-seed records at seeds {_real}).  `enumerate` would attach the wrong seed's number to each key, replacing a genuine measurement with a copy.  Restore the per-seed records (or re-run the panel) — only this variant is skipped; the aligned variants are still rebuilt.")
     for _v in _split:
         print(f'[synth] REFUSING to synthesize `{_v}`: this aggregate key is a run_cfg-split group, so it cannot be mapped back to one canonical per-seed record — re-run the panel to get per-seed records; only this key is skipped')
-    _unaligned = {v for v, _n, _r in _unaligned} | set(_split)
+    _unaligned = {v for v, _n, _r in _unaligned} | set(_split) | set(_cfg_refused)
     for v, e in agg.items():
         if v in _unaligned:
             continue
@@ -165,7 +172,51 @@ def synthesize_long_summary():
             n_synth += 1
     L.atomic_write_json(spath, summary, indent=2)
     print(f'[v6-synth] results_lm_v3_long/summary.json rebuilt: {n_synth} synthesized, {n_kept} real kept ({n_backfill} of them had `tokens_seen` backfilled from the aggregate so they stay pairable), {n_replaced} stale replaced')
-    return summary
+    return (summary, agg)
+
+def merge_long_aggregate(adir, snapshot_agg):
+    if not snapshot_agg:
+        return
+    agg_path = os.path.join(adir, 'aggregate.json')
+    try:
+        fresh = json.load(open(agg_path, encoding='utf-8'))
+    except Exception as _e:
+        print(f'[v6-merge] WARNING: cannot read the freshly written {agg_path} ({type(_e).__name__}: {_e}) — the snapshot is left unmerged; re-run `_finish_panel` on the panel to rebuild it')
+        return
+    merged = json.loads(json.dumps(snapshot_agg))
+    n_folded = 0
+    for key, fentry in fresh.items():
+        if not isinstance(fentry, dict):
+            continue
+        sentry = merged.get(key)
+        if not isinstance(sentry, dict):
+            merged[key] = fentry
+            continue
+        sm = {}
+        for _s, _p in zip(sentry.get('seeds') or [], sentry.get('ppls') or []):
+            _s = _num_or_none(_s)
+            if _s is not None and L.ppl_is_usable(_p):
+                sm[_s] = float(_p)
+        for _s, _p in zip(fentry.get('seeds') or [], fentry.get('ppls') or []):
+            _s = _num_or_none(_s)
+            if _s is not None and L.ppl_is_usable(_p):
+                sm[_s] = float(_p)
+        if not sm:
+            continue
+        seeds_sorted = sorted(sm)
+        vals = [sm[_s] for _s in seeds_sorted]
+        sentry['seeds'] = seeds_sorted
+        sentry['ppls'] = vals
+        sentry['n_seeds'] = len(vals)
+        sentry['ppl_mean'] = sum(vals) / len(vals)
+        sentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        n_folded += 1
+    L.atomic_write_json(agg_path, merged, indent=2)
+    try:
+        L._save_csv(merged, adir)
+    except Exception as _e:
+        print(f'[v6-merge] WARNING: aggregate.json was merged but the CSV could not be refreshed ({type(_e).__name__}: {_e}) — regenerate it from aggregate.json before quoting the table')
+    print(f'[v6-merge] aggregate.json: {n_folded} measured entr(ies) folded into the snapshot — per-seed PPL means/stds now cover every seed (measured values win per seed; reconstructed secondary metrics keep their snapshot values, see the `note` on the synthesized records in summary.json)')
 
 def schedule_shutdown(delay_s=90):
     if os.environ.get('V6_NO_SHUTDOWN'):
@@ -178,9 +229,10 @@ def schedule_shutdown(delay_s=90):
 def run_full():
     guard = L.CostGuard(L.BUDGET)
     guard.report()
-    synthesize_long_summary()
+    _synth_summary, _long_snapshot = synthesize_long_summary()
     push_ok = git_push('v6: rebuild results_lm_v3_long/summary.json from committed aggregate')
     L.run({**L.RUN_LONG, 'variants': LONG_GAP_VARIANTS}, seeds=[2], guard=guard, label='P-LONG hybrid seed2 (complete 3-seed table)')
+    merge_long_aggregate(os.path.join(REPO, 'results_lm_v3_long'), _long_snapshot)
     push_ok &= git_push('v6: results_lm_v3_long hybrid variants at seed 2 — 3-seed long-run table complete')
     L.run(L.RUN, seeds=[0, 1, 2], guard=guard, label='P-CORE 1500-step core table (results_lm_v3_1500)')
     push_ok &= git_push('v6: results_lm_v3_1500 — 9-variant core table, 1500 steps x 3 seeds')
