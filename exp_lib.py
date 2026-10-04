@@ -38,7 +38,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 BUDGET = dict(total_yuan=140.0, price_per_hour=2.4, margin=0.93, already_spent_yuan=0.0, state_path='autodl_budget_state.json')
-CODE_SEMANTICS = 'v11.123'
+CODE_SEMANTICS = 'v11.124'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
@@ -1030,19 +1030,12 @@ class HybridAttention(nn.Module):
         k_sw = F.normalize(k_sw, dim=-1)
         if cfg.kind == 'hca':
             topk_idx = _arange_cache(Bn, x.device).unsqueeze(0).expand(T, Bn)
-            if T > 1024:
-                out = gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None)
-            else:
-                topk_mask = block_readable(_arange_cache(T, x.device), last_tok)
-                out = _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None)
+            out = gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None)
         else:
             topk = cfg.index_topk
-            _sel_valid_box = [] if T > 1024 else None
-            topk_mask, topk_idx, soft = lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, return_mask=T <= 1024, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box)
-            if T > 1024:
-                out = gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0])
-            else:
-                out = _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None)
+            _sel_valid_box = []
+            _, topk_idx, soft = lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box)
+            out = gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0])
         return (self.W_o(out.reshape(T, self.nh * self.hd)), gate_mean)
 
     def forward(self, x):
