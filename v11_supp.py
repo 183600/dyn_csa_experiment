@@ -391,7 +391,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                 both = sorted(set(m512) & set(m4096))
                 if not both:
                     return None
-                return float(np.mean([m4096[s] for s in both])) / float(np.mean([m512[s] for s in both]))
+                return float(np.mean([m4096[s] / m512[s] for s in both]))
 
             def _fmt_cell(Ln):
                 val, tr = _at(Ln)

@@ -31,7 +31,7 @@ def _v9_block_forward(self, x):
         _acfg = self.attn.cfg
         if getattr(_acfg, 'dynamic', False) or getattr(_acfg, 'chunking', 'fixed') != 'fixed':
             raise RuntimeError(f'gradient checkpointing under _V9_CKPT is only enabled for fixed-chunking, non-dynamic arms (got chunking={getattr(_acfg, 'chunking', None)!r}, dynamic={getattr(_acfg, 'dynamic', None)!r}); dynamic arms would recompute a different gate state in backward')
-        return _ckpt.checkpoint(_orig_block_forward, self, x, use_reentrant=False, preserve_rng_state=False)
+        return _ckpt.checkpoint(_orig_block_forward, self, x, use_reentrant=False, preserve_rng_state=True)
     return _orig_block_forward(self, x)
 
 def _v9_blockrope_forward(self, x):
@@ -39,7 +39,7 @@ def _v9_blockrope_forward(self, x):
         _acfg = self.attn.cfg
         if getattr(_acfg, 'dynamic', False) or getattr(_acfg, 'chunking', 'fixed') != 'fixed':
             raise RuntimeError(f'gradient checkpointing under _V9_CKPT is only enabled for fixed-chunking, non-dynamic arms (got chunking={getattr(_acfg, 'chunking', None)!r}, dynamic={getattr(_acfg, 'dynamic', None)!r}); dynamic arms would recompute a different gate state in backward')
-        return _ckpt.checkpoint(_orig_blockrope_forward, self, x, use_reentrant=False, preserve_rng_state=False)
+        return _ckpt.checkpoint(_orig_blockrope_forward, self, x, use_reentrant=False, preserve_rng_state=True)
     return _orig_blockrope_forward(self, x)
 
 def _install_ckpt_patch():

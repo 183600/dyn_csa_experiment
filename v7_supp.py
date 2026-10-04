@@ -137,24 +137,30 @@ class HybridAttentionRoPE(L.HybridAttention):
         if self.sink is None:
             sdpa_kw = dict(scale=scale)
             if cfg.window > 0:
-                sdpa_kw['attn_mask'] = L.causal_window_mask(T, cfg.window, x.device)
+                sdpa_kw['attn_mask'] = L.causal_window_mask(T, cfg.window, x.device).to(q.dtype)
             else:
                 sdpa_kw['is_causal'] = True
             out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
             return self.W_o(out.reshape(B, T, self.nh * self.hd))
-        logits = torch.einsum('bnhd,bmhd->bhnm', q, k)
-        logits.mul_(scale)
         mask = L.causal_mask(T, x.device)
         if cfg.window > 0:
             mask = L.causal_window_mask(T, cfg.window, x.device)
-        logits.add_(mask)
-        if self.sink is not None:
-            sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1)
+        sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1)
+        out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
+        row_chunk = max(1, min(T, 1024))
+        _budget = L._attn_transient_budget(x.device)
+        if _budget is not None:
+            _per_row = max(1, 3 * B * self.nh * T) * q.element_size()
+            row_chunk = max(1, min(row_chunk, int(_budget) // _per_row))
+        for s in range(0, T, row_chunk):
+            e = min(s + row_chunk, T)
+            logits = torch.einsum('bnhd,bmhd->bhnm', q[:, s:e], k)
+            logits.mul_(scale)
+            logits.add_(mask[s:e])
             lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
-            attn = torch.exp(logits - lse)
-        else:
-            attn = torch.softmax(logits, -1)
-        out = torch.einsum('bhnm,bmhd->bnhd', attn, v)
+            attn = logits.sub(lse).exp_()
+            del logits
+            out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
 
     def _single_rope(self, x, pre=None):
@@ -508,6 +514,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     if warm_steps >= steps:
         raise ValueError(f'warm_steps={warm_steps} >= steps={steps}: the dense->sparse switch never fires, so the recorded numbers would come from a dense-protocol model')
     cfgs = L.make_layer_cfgs(n_layers, variant)
+    if warm_steps > 0 and any((getattr(c, 'kind', None) != 'full' and (not getattr(c, 'use_sink', True)) for c in cfgs)):
+        raise ValueError(f'{variant} disables the attention sink on its sparse layers; the dense-warmup forward is only validated against sink-enabled layers, so running it under warmup would mix two protocols')
     model = L.SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
     n_param = L.count_params(model)
     print(f'\n[{variant} seed={seed}] WARMUP warm_steps={warm_steps} total={steps}  params={n_param / 1000000.0:.2f}M  mlp_ratio={mlp_ratio:.2f}')

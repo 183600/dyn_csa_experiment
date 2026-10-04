@@ -831,7 +831,7 @@ def sec_p1l():
                     for _sd, x in recs_l:
                         _tgt[str(_sd)] = float(x['ppl'])
         _matched = sorted(set(base_map) & set(last_map))
-        ratio = sum((last_map[sd] for sd in _matched)) / len(_matched) / (sum((base_map[sd] for sd in _matched)) / len(_matched)) if _matched else None
+        ratio = sum((last_map[sd] / base_map[sd] for sd in _matched)) / len(_matched) if _matched else None
         per_v[v] = ratio
         trunc_v[v] = trunc_flags
         rt_txt = f'×{ratio:.2f}' if _finite_or_none(ratio) is not None else '—'

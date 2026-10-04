@@ -1451,23 +1451,31 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         raise ValueError(f'batch_iter needs len(train_ids) > seq_len+1 to sample causal windows, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
     train_ids = np.asarray(train_ids)
     host = None
-    if device.type == 'cuda':
-        cached = _PINNED_HOST_CACHE.get('entry')
-        if cached is not None and cached[0] is train_ids and cached[1].shape[0] == train_ids.shape[0]:
-            host = cached[1]
-        else:
+    cached = _PINNED_HOST_CACHE.get('entry')
+    if cached is not None and cached[0] is train_ids and cached[1].shape[0] == train_ids.shape[0]:
+        host = cached[1]
+    elif device.type == 'cuda' and train_ids.nbytes <= (512 << 20):
+        try:
+            host = torch.from_numpy(train_ids).to(device)
+            _PINNED_HOST_CACHE['entry'] = (train_ids, host)
+        except RuntimeError:
+            host = None
+    if host is None:
+        if device.type == 'cuda':
             try:
                 host = torch.from_numpy(train_ids).pin_memory()
                 _PINNED_HOST_CACHE['entry'] = (train_ids, host)
             except RuntimeError:
                 host = torch.from_numpy(train_ids)
-    else:
-        host = torch.from_numpy(train_ids)
+        else:
+            host = torch.from_numpy(train_ids)
     cols = np.arange(seq_len + 1)
     while True:
         starts = rng.integers(0, n + 1, size=batch_size)
-        ids = host[torch.from_numpy(starts[:, None] + cols[None, :])]
-        ids = ids.to(device, non_blocking=host.is_pinned())
+        idx = torch.from_numpy(starts[:, None] + cols[None, :])
+        ids = host[idx.to(host.device)]
+        if ids.device != device:
+            ids = ids.to(device, non_blocking=host.is_pinned())
         yield (ids[:, :-1], ids[:, 1:])
 
 def count_params(m):
@@ -3127,7 +3135,7 @@ def run(cfg=None, seeds=None, guard=None, label=''):
         _pin_cuda_determinism()
     cfg.setdefault('warmup', 50)
     cfg.setdefault('comp_lambda', 0.05)
-    fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_cs{CODE_SEMANTICS}'
+    fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_cs{CODE_SEMANTICS}'
     ratios = {}
     dropped_truncations = []
     stale_dropped = []

@@ -236,7 +236,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                     if _arch != (256, 6, 8, 32):
                         print(f"[p3mp] REFUSE {v} s{seed}: checkpoint architecture {_arch} differs from the recipe this probe was validated against (256, 6, 8, 32) — not running the probe on unverified weights")
                         break
-                    model = L.SmallGPT(_vocab_ck, *_arch, d.get('train_len', 512), [copy.copy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
+                    model = L.SmallGPT(_vocab_ck, *_arch, d.get('train_len', 512), [copy.deepcopy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
                     model.load_state_dict(d.pop('sd'))
                     model.eval()
                 for blk, c0 in zip(model.blocks, d['cfg']):
@@ -767,7 +767,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                 both = sorted(set(m512) & set(m4096))
                 if not both:
                     return None
-                return float(np.mean([m4096[s] for s in both])) / float(np.mean([m512[s] for s in both]))
+                return float(np.mean([m4096[s] / m512[s] for s in both]))
 
             def _fmt_cell(Ln):
                 val, tr = _at(Ln)
