@@ -2,8 +2,6 @@ name: Continuous Loop
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, master]     # fallback 通道
   schedule:
     - cron: '0 */6 * * *'
 
@@ -168,7 +166,6 @@ jobs:
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
           set -o pipefail
@@ -192,34 +189,9 @@ jobs:
           RATE_COUNT=0
           CURRENT_PROVIDER=nvidia
 
-          # ---------- 统一的下一个 run 触发器（带重试 + push 兜底） ----------
-          trigger_next() {
-            local branch="${GITHUB_REF_NAME:-main}"
-
-            # 主通道：gh workflow run（失败重试 5 次）
-            for attempt in 1 2 3 4 5; do
-              if gh workflow run continuous-loop.yml --ref "$branch" 2>/dev/null; then
-                echo "[ok] next run dispatched via gh (attempt=$attempt)"
-                return 0
-              fi
-              local wait=$((attempt * 20))
-              echo "[warn] dispatch attempt $attempt failed, retry in ${wait}s"
-              sleep "$wait"
-            done
-
-            # 备通道：push 一个空提交，靠 on:push 拉起
-            echo "[warn] gh workflow run 全部失败，切换到 push 兜底触发"
-            git add -A || true
-            git commit --allow-empty -m "trigger: next run (fallback, no skip-ci)" || true
-            git pull --rebase origin "$branch" || git rebase --abort || true
-            git push origin "HEAD:${branch}" \
-              && echo "[ok] fallback push done, push event will start next run" \
-              || echo "[error] fallback push also failed, rely on cron"
-          }
-
           commit_and_push() {
             git add -A || true
-            git commit -m "auto: iteration $1 [skip ci]" || true
+            git commit -m "auto: iteration $1" || true
             git pull --rebase origin "$BRANCH" || git rebase --abort || true
             git push origin "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
           }
@@ -228,15 +200,13 @@ jobs:
             echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
             git add -A || true
             if ! git diff --cached --quiet; then
-              git commit -m "auto: partial work saved on shutdown [skip ci]" || true
+              git commit -m "auto: partial work saved on shutdown" || true
               git pull --rebase origin "$BRANCH" || git rebase --abort || true
               git push origin "HEAD:${BRANCH}" || true
               echo "[trap] partial work committed & pushed"
             else
               echo "[trap] nothing to commit"
             fi
-            # 退出前也保证下一轮被触发
-            trigger_next
             exit 0
           }
           trap on_shutdown TERM INT
@@ -397,35 +367,18 @@ jobs:
         run: |
           set +e
           git add -A
-          git commit -m "auto: end of 5h run, cleanup [skip ci]" || echo "nothing to commit"
+          git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
           BRANCH="${GITHUB_REF_NAME:-main}"
           git pull --rebase origin "$BRANCH" || git rebase --abort || true
           git push origin "HEAD:${BRANCH}" || echo "[warn] final push failed"
 
-      - name: Trigger next workflow run (self-loop, retry + push fallback)
+      - name: Trigger next workflow run (self-loop)
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
           BRANCH="${GITHUB_REF_NAME:-main}"
-
-          # ---------- 主通道：gh workflow run（失败重试 6 次） ----------
-          for attempt in 1 2 3 4 5 6; do
-            if gh workflow run continuous-loop.yml --ref "$BRANCH"; then
-              echo "[ok] next run dispatched via gh (attempt=$attempt)"
-              exit 0
-            fi
-            WAIT=$((attempt * 30))
-            echo "[warn] dispatch attempt $attempt failed, retry in ${WAIT}s"
-            sleep "$WAIT"
-          done
-
-          # ---------- 备通道：push 一个空提交，靠 on:push 拉起 ----------
-          echo "[warn] gh workflow run 全部失败，使用 push 兜底触发"
-          git add -A || true
-          git commit --allow-empty -m "trigger: next run (fallback, no skip-ci)" || true
-          git pull --rebase origin "$BRANCH" || git rebase --abort || true
-          git push origin "HEAD:${BRANCH}" \
-            && echo "[ok] fallback push done, push event will start next run" \
-            || echo "[error] fallback push failed, rely on cron fallback"
+          gh workflow run continuous-loop.yml --ref "$BRANCH" \
+            && echo "next run dispatched on ${BRANCH}" \
+            || echo "[warn] dispatch failed, cron fallback will pick up"
