@@ -295,7 +295,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 logits = raw_logits.masked_fill(~valid[:, None, :], torch.finfo(raw_logits.dtype).min)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
                 nb = ib.shape[1]
-                sv = torch.gather(soft[s:e], 1, ib)
+                sv = soft[s:e]
                 if _keep is not None:
                     sv = sv * _keep.to(sv.dtype)
                 soft_log = torch.log(sv.clamp_min(1e-12))
@@ -1069,8 +1069,11 @@ def run_niah_phase(payload, guard=None, label=''):
             print(f'[resume] FATAL: {spath} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
     _mr_ref = 'csa_fixed_rope'
-    _recipe = f'niah_steps{n_steps}_v{vocab}_bs12_sl512_lr0.0003_mr-{_mr_ref}_reuse4'
     for v in variants:
+        mr = 4.0
+        if v in PARAM_MATCHED_V7:
+            mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=set(PARAM_MATCHED_V7), ref_variant=_mr_ref)
+        _recipe = f'niah_steps{n_steps}_v{vocab}_bs12_sl512_lr0.0003_mr{mr:.8g}-{_mr_ref}_reuse4'
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
             stale = False
@@ -1103,9 +1106,6 @@ def run_niah_phase(payload, guard=None, label=''):
                         continue
                 t0 = time.time()
                 cfgs = L.make_layer_cfgs(6, v)
-                mr = 4.0
-                if v in PARAM_MATCHED_V7:
-                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=set(PARAM_MATCHED_V7), ref_variant=_mr_ref)
                 # 随机源在建模前一刻定界：同 seed 下各臂的共享组件（tok/head/MLP）必须同构
                 L.set_seed(seed)
                 model = L.SmallGPT(vocab, 256, 6, 8, 32, 512, cfgs, mlp_ratio=mr).to(DEVICE)
@@ -1192,8 +1192,39 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
     was = model.training
     model.eval()
     out = {}
+    _within = [int(Ln) for Ln in eval_lens if max_pos is None or int(Ln) <= max_pos]
+    _trunc_lens = [int(Ln) for Ln in eval_lens if max_pos is not None and int(Ln) > max_pos]
     try:
-        for Ln in eval_lens:
+        if _within:
+            _Lmax = max(_within)
+            ids = np.asarray(val_ids[:n_seq, :_Lmax], dtype=np.int64)
+            x = torch.from_numpy(ids).to(device)
+            nll_cols = torch.zeros((int(ids.shape[0]), _Lmax - 1), dtype=torch.float64, device=device)
+            _r, _chunk = (0, int(ids.shape[0]))
+            while _r < int(ids.shape[0]):
+                _sub = x[_r:_r + _chunk]
+                try:
+                    logits = model(_sub)
+                except RuntimeError as _oe:
+                    if 'out of memory' in str(_oe).lower() and _chunk > 1:
+                        _chunk = max(1, _chunk // 2)
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        continue
+                    raise
+                nll_cols[_r:_r + _chunk] = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), _sub[:, 1:].reshape(-1), reduction='none').double().view(int(_sub.shape[0]), _Lmax - 1)
+                del logits
+                _r += _chunk
+            _cum = nll_cols.cumsum(dim=1)
+            for Ln in _within:
+                _t = float(_cum[:, Ln - 2].sum()) if Ln >= 2 else 0.0
+                _ntok = int(ids.shape[0]) * (Ln - 1)
+                ppl = math.exp(_t / max(_ntok, 1))
+                out[Ln] = {'ppl': float(ppl), 'n_tok': _ntok, 'truncated': False, 'eval_span': Ln}
+            del x, nll_cols, _cum
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+        for Ln in _trunc_lens:
             trunc = False
             ids = np.asarray(val_ids[:n_seq, :Ln], dtype=np.int64)
             if max_pos is not None and Ln > max_pos:
@@ -1253,8 +1284,11 @@ def run_lenphase(payload, guard=None, label=''):
     print(f'[p1l] val slice {val_ids.shape}, eval_lens={eval_lens}, seeds={seeds}')
     _train_cache = [None]
     _mr_ref = 'csa_fixed_rope'
-    _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs12_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr-{_mr_ref}'
     for v in variants:
+        mr = 4.0
+        if v in PARAM_MATCHED_V7:
+            mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant=_mr_ref)
+        _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs12_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr{mr:.8g}-{_mr_ref}'
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
             stale = False
@@ -1289,9 +1323,6 @@ def run_lenphase(payload, guard=None, label=''):
                 t0 = time.time()
                 L.set_seed(seed)
                 cfgs = L.make_layer_cfgs(6, v)
-                mr = 4.0
-                if v in PARAM_MATCHED_V7:
-                    mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant=_mr_ref)
                 if _train_cache[0] is None:
                     _train_cache[0] = L.load_wikitext(train_len, 8000000)[0]
                 train_ids = _train_cache[0]

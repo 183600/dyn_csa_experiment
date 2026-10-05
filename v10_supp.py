@@ -123,6 +123,8 @@ def _cell_ppl(nll_sum, n_tok):
     nt = int(sum(n_tok))
     if nt <= 0:
         return float('nan')
+    if total / nt > 709.0:
+        return float('inf')
     return math.exp(total / nt)
 
 def _probe_fingerprint(cfg):
@@ -248,7 +250,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP'):
                     key = _cell_key(Ln, rho)
                     nll_sum, n_tok = _distractor_ppls(model, val_ids, Ln, rho, _pcfg['n_seq'], _pcfg, row_cache=_row_cache, chunk_mem=_chunk_mem)
                     cell_ppl = _cell_ppl(nll_sum, n_tok)
-                    per_seq = [math.exp(s / t) for s, t in zip(nll_sum, n_tok)]
+                    per_seq = [float('inf') if s / t > 709.0 else math.exp(s / t) for s, t in zip(nll_sum, n_tok)]
                     summary[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp, 'recipe': _ck_recipe}
                     print(f'  [p3mp] {key:44s} PPL={cell_ppl:8.2f}', flush=True)
                     if _ci % 8 == 0:

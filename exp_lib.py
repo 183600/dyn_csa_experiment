@@ -599,9 +599,10 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     with torch.no_grad():
         idx = _indexer_selection(scores, causal, k, out_valid=out_valid)
     scores.masked_fill_(~causal, float('-inf'))
-    soft = F.softmax(scores, dim=-1)
+    _lse = torch.logsumexp(scores, dim=-1, keepdim=True)
+    soft = torch.exp(scores.gather(1, idx.long()) - _lse)
     soft = torch.nan_to_num(soft)
-    del scores
+    del scores, _lse
     m = None
     if return_mask:
         valid_cols = out_valid[0]
@@ -753,7 +754,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
                 attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
             out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
             continue
-        soft_g = soft[s:e].gather(1, ib)
+        soft_g = soft[s:e]
         if keep is not None:
             soft_g = soft_g * keep.to(soft_g.dtype)
         _nb = int(ib.shape[1])

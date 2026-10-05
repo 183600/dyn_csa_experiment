@@ -761,7 +761,7 @@ def sec_p1t():
         _pair = paired_row(_recs.get('csa_fixed_topk8', {}), _recs.get('csa_fixed_topk32', {}))
         if _pair is not None:
             _kept, _dl, _st = _pair
-            _sig_txt = '显示该差距**达到 p<0.05**，按显著性读法处理。' if _st['p_exact_signflip'] < 0.05 else '显示该差距仍在噪声量级内，**不构成显著性主张**，只作方向性参考。'
+            _sig_txt = '显示该差距**达到 p≤0.05**，按显著性读法处理。' if _st['p_exact_signflip'] <= 0.05 else '显示该差距仍在噪声量级内，**不构成显著性主张**，只作方向性参考。'
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；配对的精确符号翻转检验（n={_st['n']}，p={_st['p_exact_signflip']:.3f}，Δ(topk8−topk32) mean={_st['mean']:+.2f} PPL）{_sig_txt}')
         else:
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；面板上没有可通过 pairing 门禁的同配置种子对，topk8 与 topk32 之差（{_gap:.2f} PPL）无法配对检验，只作方向性参考。')

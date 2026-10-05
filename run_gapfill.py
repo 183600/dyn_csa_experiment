@@ -120,8 +120,8 @@ def synthesize_long_summary():
             _pi = float(_pi)
             if _si in _agg_map and abs(_agg_map[_si] - _pi) > 1e-06 * max(1.0, abs(_pi)):
                 _bad_map = True
-            else:
-                _agg_map[_si] = _pi
+                break
+            _agg_map[_si] = _pi
         _conflict = [_rs for _r in summary.values() if isinstance(_r, dict) and _r.get('variant') == real_v and (_r.get('seed') is not None) and (not _r.get('synthesized')) and (_r.get('steps') == _LONG_STEPS) and L.ppl_is_usable(_r.get('ppl')) for _rs in [_num_or_none(_r.get('seed'))] if _rs is None or _rs not in _agg_map or abs(float(_r['ppl']) - _agg_map[_rs]) > 1e-06 * max(1.0, abs(_agg_map[_rs]))]
         if _bad_map or _conflict:
             _unaligned.append((v, len(_ppls), _real))
@@ -146,13 +146,13 @@ def synthesize_long_summary():
                 continue
             key = f'{real_v}::{_proto}::seed{_seed}' if _proto else f'{real_v}::seed{_seed}'
             old = summary.get(key)
-            if isinstance(old, dict) and 'ppl' in old and (old.get('steps') == _LONG_STEPS) and (not old.get('synthesized')):
+            if isinstance(old, dict) and L.ppl_is_usable(old.get('ppl')) and (old.get('steps') == _LONG_STEPS) and (not old.get('synthesized')):
                 n_kept += 1
                 if old.get('tokens_seen') is None and e.get('tokens_seen') is not None:
                     old['tokens_seen'] = e['tokens_seen']
                     n_backfill += 1
                 continue
-            if isinstance(old, dict) and 'ppl' in old and (not old.get('synthesized')):
+            if isinstance(old, dict) and L.ppl_is_usable(old.get('ppl')) and (not old.get('synthesized')):
                 n_kept += 1
                 print(f"[synth] keeping real record `{key}` (steps={old.get('steps')}); the aggregate's reconstructed value is NOT written over it")
                 continue
