@@ -96,21 +96,6 @@ def _segment(n, want_cut_list, min_block, max_block):
         _SEGMENT_CACHE[key] = (bids, honoured, counts)
     return (bids, honoured, counts)
 
-def _cut_merge_mask(want_cut_list, min_block, max_block, dtype=None, device=None):
-    import torch as _t
-    if dtype is None:
-        dtype = _t.float32
-    if isinstance(want_cut_list, _t.Tensor):
-        lst = want_cut_list.detach().cpu().tolist()
-    else:
-        lst = list(want_cut_list)
-    _bids, honoured, _counts = _segment(len(lst) + 1, lst, min_block, max_block)
-    keep = [0.0] * len(lst)
-    for slot in honoured:
-        if 0 <= slot < len(keep):
-            keep[slot] = 1.0
-    return _t.tensor(keep, dtype=dtype, device=device)
-
 def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_count=False, return_honoured=False):
     if n == 0:
         base, cnt, hon = (torch.empty(0, dtype=torch.long, device=device), 0, {})
@@ -141,12 +126,6 @@ def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=Fals
         sim = cosine_similarity_consecutive(H)
     cut_list = (sim < tau).cpu().tolist()
     return blocks_from_cuts(n, cut_list, min_block, max_block, dev, return_count=return_count)
-
-def adaptive_threshold(sim, target_block_tokens):
-    if sim.numel() == 0:
-        return 1.0
-    q = max(1.0 / max(target_block_tokens, 1), 0.001)
-    return float(torch.quantile(sim.detach().float().cpu(), q).item())
 
 def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
@@ -220,9 +199,6 @@ def _mask_cache_total(cache):
 def _idx_cache_total(cache):
     return sum((_cache_bytes(v) + 128 * len(k) for k, v in cache.items()))
 
-def _entry_bytes(cache, key, total_of):
-    return total_of({key: cache[key]})
-
 def _is_pinned_key(key):
     return key in _PINNED_KEYS
 
@@ -276,19 +252,6 @@ def _window_geometry(n, w, device):
     _cache_put(_IDX_CACHE, key, pair, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return pair
 
-def _both_all_index(n, n_blk, w, device):
-    key = (str(device), 'bta_idx', int(n), int(n_blk), int(w))
-    hit = _IDX_CACHE.get(key)
-    if hit is not None:
-        return hit
-    win_idx, _ = _window_geometry(n, w, device)
-    with torch.inference_mode(False):
-        _win_off = (win_idx + n_blk).to(torch.int32)
-        _blk_rows = _arange_cache(n_blk, device).to(torch.int32).unsqueeze(0)
-        both = torch.cat([_blk_rows.expand(n, n_blk), _win_off], 1)
-    _cache_put(_IDX_CACHE, key, both, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
-    return both
-
 def _range_cache(lo, hi, device):
     if lo == 0:
         return _arange_cache(hi, device)
@@ -299,18 +262,6 @@ def _range_cache(lo, hi, device):
             a = torch.arange(lo, hi, device=device)
         _cache_put(_IDX_CACHE, key, a, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return a
-
-def _attn_chunk_key(device=None):
-    try:
-        budget = _attn_transient_budget(device if device is not None else DEVICE)
-    except Exception:
-        return 'b?'
-    if budget is None:
-        return 'b0'
-    n = int(budget)
-    if n <= 0:
-        return 'b0'
-    return f'b{1 << n.bit_length() - 1}'
 
 def _attn_transient_budget(device):
     key = (str(device), _ATB_EPOCH)
@@ -325,10 +276,6 @@ def _attn_transient_budget(device):
         val = None
     _ATB_CACHE[key] = val
     return val
-
-def tok_sel_mask(n, w, device):
-    pos = torch.arange(n, device=device)
-    return (pos[None, :] <= pos[:, None]) & (pos[None, :] > pos[:, None] - w)
 
 def _tri_full(n, device, k):
     with torch.inference_mode(False):
@@ -650,59 +597,6 @@ def _sink_split_softmax(logits, sink_logits, want_sink=True):
     z = _SinkWiden.apply(logits, torch.nan_to_num(sink_logits))
     soft = torch.softmax(z, -1)[..., 1:]
     return (soft, 1.0 - soft.sum(-1) if want_sink else None)
-
-def _block_token_attn(q, k_blk, v_blk, topk_mask, last_tok, k_sw, v_sw, w, scale, soft=None, sink_logits=None, q_chunk=128, mem_budget_bytes=None):
-    n = q.shape[0]
-    dev = q.device
-    n_blk = k_blk.shape[0]
-    K = torch.cat([k_blk, k_sw], 0)
-    V = torch.cat([v_blk, v_sw], 0)
-    pos = _arange_cache(n, dev)
-    causal_blk = block_readable(pos, last_tok)
-    win_idx, wv_all = _window_geometry(n, w, dev)
-    _both_all = _both_all_index(n, n_blk, w, dev)
-    if mem_budget_bytes is None:
-        mem_budget_bytes = _attn_transient_budget(dev)
-    _heads = q.shape[1] if q.dim() == 3 else 1
-    _M = n_blk + int(w)
-    _es = q.element_size()
-    _hd = int(q.shape[-1])
-    _per_row = 4 * _heads * max(1, _M) + 2 * max(1, _M) * _heads * max(1, _hd) + (max(1, _M) * 4 + max(1, _M)) / _es
-    _bytes_per_chunk_row = _per_row * _es
-    _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
-    if _bindable and _bytes_per_chunk_row > 0:
-        _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
-        q_chunk = min(q_chunk, _max_rows)
-    q_chunk = max(1, min(int(q_chunk), n))
-    out = torch.empty_like(q)
-    _MINL = torch.finfo(q.dtype).min
-    for s in range(0, n, q_chunk):
-        e = min(s + q_chunk, n)
-        both_idx = _both_all[s:e]
-        Kset = _take_2d(K, both_idx)
-        Vset = _take_2d(V, both_idx)
-        _wv = wv_all[s:e]
-        sel = torch.cat([(topk_mask[s:e] > 0) & causal_blk[s:e], _wv], 1)
-        logits = torch.einsum('nhd,nmhd->nhm', q[s:e], Kset)
-        logits.mul_(scale)
-        logits.masked_fill_(~sel[:, None, :], _MINL)
-        attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
-        if soft is not None:
-            blk = logits[:, :, :n_blk]
-            win = logits[:, :, n_blk:]
-            soft_sel = soft[s:e]
-            soft_log = torch.log(soft_sel.clamp_min(1e-12))
-            soft_log.masked_fill_(soft_sel <= 0, _MINL)
-            soft_blk = (blk + soft_log[:, None, :]).clamp_min(_MINL)
-            soft_win = win
-            blk = None
-            soft_logits = torch.cat([soft_blk, soft_win], -1)
-            soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
-            attn = attn + (soft_attn - soft_attn.detach())
-        if sink_logits is None:
-            attn = attn * sel.any(-1)[:, None, None].to(attn.dtype)
-        out[s:e] = torch.einsum('nhm,nmhd->nhd', attn, Vset)
-    return out
 
 def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None):
     n = q.shape[0]
@@ -1651,21 +1545,6 @@ def ppl_by_seed_grouped(outdir):
 
 def add_paired(*_a, **_kw):
     raise NotImplementedError('use v9_supp.add_paired (exp_lib cannot import v7_supp)')
-
-def status_helper_selftest():
-    cur = CODE_SEMANTICS
-    assert not result_is_current({}, cur, 'ppl')
-    assert not result_is_current({'ppl': 1.0}, cur, 'ppl')
-    assert not result_is_current({'_code': 'v11.3', 'ppl': 1.0}, cur, 'ppl')
-    assert not result_is_current({'_code': cur}, cur, 'ppl')
-    assert result_is_current({'_code': cur, 'ppl': 1.0}, cur, 'ppl')
-    assert not result_is_current({'_code': cur, 'ppl': float('nan')}, cur, 'ppl')
-    assert not result_is_current({'_code': cur, 'ppl': float('inf')}, cur, 'ppl')
-    assert not result_is_current({'_code': cur, 'ppl': 0.0}, cur, 'ppl')
-    assert not result_is_current({'_code': cur, 'ppl': -1.0}, cur, 'ppl')
-    assert result_is_current({'_code': cur, 'by_len': {}}, cur, 'by_len')
-    assert not result_is_current({'_code': 'v11.4', 'ppl': 1.0}, cur, 'ppl') or cur == 'v11.4'
-    return True
 
 def set_seed(seed):
     random.seed(seed)

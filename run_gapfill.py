@@ -29,7 +29,10 @@ def git_push(msg):
         print(f'[git] push skipped (V6_NO_PUSH): {msg}')
         return True
     run = lambda *a: subprocess.run(a, cwd=REPO, capture_output=True, text=True, encoding='utf-8', errors='replace')
-    run('git', 'add', '-A')
+    ra = run('git', 'add', '-A')
+    if ra.returncode != 0:
+        print(f'[git] add FAILED: {(ra.stdout + ra.stderr)[-300:]} — NOT pushing (a commit could miss unstaged work); leaving the tree for inspection')
+        return False
     r = run('git', 'commit', '-m', msg)
     committed = r.returncode == 0
     if not committed and 'nothing to commit' not in r.stdout + r.stderr:
@@ -184,7 +187,18 @@ def merge_long_aggregate(adir, snapshot_agg):
         print(f'[v6-merge] WARNING: cannot read the freshly written {agg_path} ({type(_e).__name__}: {_e}) — the snapshot is left unmerged; re-run `_finish_panel` on the panel to rebuild it')
         return
     merged = json.loads(json.dumps(snapshot_agg))
+
+    def _seed_map(entry):
+        out = {}
+        if not isinstance(entry, dict):
+            return out
+        for _s, _p in zip(entry.get('seeds') or [], entry.get('ppls') or []):
+            _s = _num_or_none(_s)
+            if _s is not None and L.ppl_is_usable(_p):
+                out[_s] = float(_p)
+        return out
     n_folded = 0
+    _folded_keys = set()
     for key, fentry in fresh.items():
         if not isinstance(fentry, dict):
             continue
@@ -192,15 +206,10 @@ def merge_long_aggregate(adir, snapshot_agg):
         if not isinstance(sentry, dict):
             merged[key] = fentry
             continue
-        sm = {}
-        for _s, _p in zip(sentry.get('seeds') or [], sentry.get('ppls') or []):
-            _s = _num_or_none(_s)
-            if _s is not None and L.ppl_is_usable(_p):
-                sm[_s] = float(_p)
-        for _s, _p in zip(fentry.get('seeds') or [], fentry.get('ppls') or []):
-            _s = _num_or_none(_s)
-            if _s is not None and L.ppl_is_usable(_p):
-                sm[_s] = float(_p)
+        sm = _seed_map(sentry)
+        fm = _seed_map(fentry)
+        n_old, n_new = (len(sm), len(fm))
+        sm.update(fm)
         if not sm:
             continue
         seeds_sorted = sorted(sm)
@@ -211,12 +220,60 @@ def merge_long_aggregate(adir, snapshot_agg):
         sentry['ppl_mean'] = sum(vals) / len(vals)
         sentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
         n_folded += 1
+        _folded_keys.add(key)
+        if n_old and n_new:
+            w_old = n_old / (n_old + n_new)
+            for _f in ('avg_dyn_block_len', 'avg_block_len', 'boundary_f1_dyn', 'boundary_excess_dyn', 'delta_logit_mean', 'tokens_per_step'):
+                _vo, _vn = (sentry.get(_f), fentry.get(_f))
+                if isinstance(_vo, (int, float)) and isinstance(_vn, (int, float)) and (not isinstance(_vo, bool)) and (not isinstance(_vn, bool)) and math.isfinite(_vo) and math.isfinite(_vn):
+                    sentry[_f] = _vo * w_old + _vn * (1.0 - w_old)
+            _co, _cn = (sentry.get('ppl_curve'), fentry.get('ppl_curve'))
+            if _co and _cn:
+                _cm = {}
+                for _pt in _co:
+                    try:
+                        _cm[int(_pt[0])] = [float(_pt[1]) * n_old, n_old]
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                for _pt in _cn:
+                    try:
+                        _s, _v = (int(_pt[0]), float(_pt[1]))
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    _acc = _cm.setdefault(_s, [0.0, 0])
+                    _acc[0] += _v * n_new
+                    _acc[1] += n_new
+                sentry['ppl_curve'] = [[_s, _a / _w] for _s, (_a, _w) in sorted(_cm.items()) if _w]
+    if _folded_keys:
+        _base_full = _seed_map(merged.get('full'))
+        _base_sw = _seed_map(merged.get('full_sw128_matched'))
+
+        def _repair_delta(entry, base_map, mean_f, std_f, n_f):
+            if not base_map:
+                return
+            vm = _seed_map(entry)
+            common = sorted(set(vm) & set(base_map))
+            if not common:
+                return
+            ds = [vm[_s] - base_map[_s] for _s in common]
+            entry[mean_f] = sum(ds) / len(ds)
+            entry[std_f] = statistics.stdev(ds) if len(ds) > 1 else 0.0
+            entry[n_f] = len(ds)
+        for key in _folded_keys:
+            entry = merged.get(key)
+            if not isinstance(entry, dict):
+                continue
+            _v = entry.get('variant') or str(key).split('#')[0].split('@')[0]
+            if _v != 'full':
+                _repair_delta(entry, _base_full, 'dPPL_vs_full_mean', 'dPPL_vs_full_std', 'n_paired')
+            if _v not in ('full', 'full_sw128_matched'):
+                _repair_delta(entry, _base_sw, 'dPPL_vs_sw128m_mean', 'dPPL_vs_sw128m_std', 'n_paired_sw128m')
     L.atomic_write_json(agg_path, merged, indent=2)
     try:
         L._save_csv(merged, adir)
     except Exception as _e:
         print(f'[v6-merge] WARNING: aggregate.json was merged but the CSV could not be refreshed ({type(_e).__name__}: {_e}) — regenerate it from aggregate.json before quoting the table')
-    print(f'[v6-merge] aggregate.json: {n_folded} measured entr(ies) folded into the snapshot — per-seed PPL means/stds now cover every seed (measured values win per seed; reconstructed secondary metrics keep their snapshot values, see the `note` on the synthesized records in summary.json)')
+    print(f'[v6-merge] aggregate.json: {n_folded} measured entr(ies) folded into the snapshot — per-seed PPL means/stds, the paired deltas, the seed-averaged curves and the pooled secondary means now cover every measured seed (measured values win per seed; secondary-metric stds keep their snapshot values, see the `note` on the synthesized records in summary.json)')
 
 def schedule_shutdown(delay_s=90):
     if os.environ.get('V6_NO_SHUTDOWN'):

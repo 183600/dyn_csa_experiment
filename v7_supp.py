@@ -1005,7 +1005,10 @@ def git_push(msg):
         print(f'[git] push skipped (V7_NO_PUSH): {msg}')
         return True
     run = lambda *a: subprocess.run(a, cwd=REPO, capture_output=True, text=True, encoding='utf-8', errors='replace')
-    run('git', 'add', '-A')
+    ra = run('git', 'add', '-A')
+    if ra.returncode != 0:
+        print(f'[git] add FAILED: {(ra.stdout + ra.stderr)[-300:]} — NOT pushing (a commit could miss unstaged work); leaving the tree for inspection')
+        return False
     r = run('git', 'commit', '-m', msg)
     committed = r.returncode == 0
     if not committed and 'nothing to commit' not in r.stdout + r.stderr:
