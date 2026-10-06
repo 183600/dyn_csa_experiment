@@ -349,7 +349,7 @@ def schedule_shutdown(delay_s=90):
         return
     marker = 'v6autoshutdown'
     subprocess.Popen(['bash', '-c', f'sleep {delay_s}; echo {marker}; shutdown -h now'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f'[v6] AutoDL instance will SHUT DOWN in {delay_s}s — only the data disk keeps billing afterwards. (cancel: pkill -f {marker})')
+    print(f'[v6] AutoDL instance will SHUT DOWN in {delay_s}s. (cancel: pkill -f {marker})')
 
 def run_full():
     guard = L.CostGuard(L.BUDGET)

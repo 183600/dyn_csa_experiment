@@ -5,7 +5,7 @@ export PYTHONUNBUFFERED=1
 PY=/root/miniconda3/bin/python
 safety_net() {
   if ! pgrep -f "bonus_watcher\.sh" > /dev/null; then
-    echo "=== [driver] no bonus watcher alive -> safety shutdown in 60s to stop billing (cancel: kill $$ now) ==="
+    echo "=== [driver] no bonus watcher alive -> safety shutdown in 60s (cancel: kill $$ now) ==="
     sleep 60
     pgrep -f "bonus_watcher\.sh" > /dev/null || shutdown -h +1
   fi
@@ -60,5 +60,5 @@ if ! git push origin "$_push_ref" 2>&1 | tail -3; then
 fi
 echo "=== [driver] ALL DONE $(date '+%F %T') ==="
 # the bonus watcher owns the shutdown when it is alive; if it is not running
-# (crashed / never launched), the EXIT trap stops billing here instead of
+# (crashed / never launched), the EXIT trap shuts the instance down here instead of
 # idling forever

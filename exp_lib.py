@@ -2299,7 +2299,7 @@ class CostGuard:
                 with open(self.state_path, encoding='utf-8') as f:
                     st.update(json.load(f))
             except Exception as e:
-                print(f'[budget] FATAL: {self.state_path} exists but cannot be parsed ({type(e).__name__}: {e}).  Refusing to start with a silently RESET ledger (spent would read as 0) — move it aside to start fresh.')
+                print(f'[budget] FATAL: {self.state_path} exists but cannot be parsed ({type(e).__name__}: {e}).  Refusing to start with a silently RESET ledger (booked time would read as 0) — move it aside to start fresh.')
                 raise
         return st
 
@@ -2386,17 +2386,13 @@ class CostGuard:
         return time.time() + headroom / self.price * 3600.0
 
     def report(self):
-        print('\n==================== AutoDL budget report ====================')
+        print('\n==================== usage report ====================')
         print(f'  booked GPU time : {self.state['booked_seconds'] / 3600:.2f} h ({self.state.get('runs', 0)} runs)')
-        print(f'  cost so far     : ¥{self.spent_yuan():.2f} of ¥{self.total_yuan:.2f} (planning cap ¥{self.cap_yuan():.2f})')
         for key, sps in sorted((self.state.get('sps_by_class') or {}).items()):
-            print(f'  calibrated speed: {sps:.3f} s/step  (d, L, seq, batch = {key})')
+            print(f'  calibrated rate : {sps:.3f} s/step  (d, L, seq, batch = {key})')
         if self.state.get('norm_sps'):
-            print(f'  normalised speed: {self.state['norm_sps']:.3f} s/step (base class d=256 / 6L / seq512 / batch12)')
-        print('  REMINDER: AutoDL bills the instance while it is ON — shut it')
-        print('  down (关机) now that the run is done; only the data disk')
-        print('  keeps billing after shutdown.')
-        print('================================================================')
+            print(f'  normalised rate : {self.state['norm_sps']:.3f} s/step (base class d=256 / 6L / seq512 / batch12)')
+        print('======================================================')
 PARAM_MATCHED = {'full_matched', 'full_sw128_matched'}
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
@@ -2562,7 +2558,7 @@ def aggregate(summary):
         # the `@cfg` suffix is a digest of the config fingerprint itself, so a
         # resume pass cannot reshuffle which group a published key refers to
         _ordered = sorted(_subs.items(), key=lambda kv: kv[0])
-        print(f'[aggregate] WARNING: `{_agg_key(v, tag)}` holds records from {len(_ordered)} different run_cfg/budget/parameter-count configurations — pooling them would average incompatible runs (or two different MODEL WIDTHS, which are not two seeds of one model) and fake extra seeds.  Reported per configuration instead.')
+        print(f'[aggregate] WARNING: `{_agg_key(v, tag)}` holds records from {len(_ordered)} different run_cfg/load/parameter-count configurations — pooling them would average incompatible runs (or two different MODEL WIDTHS, which are not two seeds of one model) and fake extra seeds.  Reported per configuration instead.')
         for _fp, _rs in _ordered:
             _i = hashlib.sha1(_fp.encode('utf-8')).hexdigest()[:8]
             _split_groups.append(((v, tag, _i), _rs))
@@ -2855,7 +2851,7 @@ def _print_pairs(summary):
             _lab = '' if ts == bs == '' else f'   [{ts or '(untagged)'} vs {bs or '(untagged)'}]'
             print(f'  {a:22s} − {b:22s} = {d.mean():+7.2f} ± {std:5.2f}   (n={len(d)}){_lab}')
     if _pair_skip:
-        print('  [skip] seed(s) rejected by the run_cfg/budget gate (see `pair_reason`); the printed n counts only the pairs that cleared it —')
+        print('  [skip] seed(s) rejected by the run_cfg/load gate (see `pair_reason`); the printed n counts only the pairs that cleared it —')
         for _a, _b, _nsk, _ncom, _why in _pair_skip:
             print(f'    {_a} − {_b}: {_nsk}/{_ncom} rejected — {_why}')
     print('=' * 78)
@@ -3044,10 +3040,10 @@ def run(cfg=None, seeds=None, guard=None, label=''):
             if guard is not None:
                 est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
                 if not guard.can_start(est):
-                    print(f'[budget] SKIP {key}: projected ¥{est / 3600 * guard.price:.2f} would pass cap ¥{guard.cap_yuan():.2f} (spent ¥{guard.spent_yuan():.2f})')
+                    print(f'[budget] SKIP {key}: projected {est / 3600:.2f} h would pass the configured cap (headroom {max(guard.total_yuan - guard.spent_yuan(), 0.0) / guard.price:.2f} h)')
                     continue
                 deadline_ts = guard.deadline_ts()
-                print(f'[budget] {key}: projected {est / 60:.0f} min (¥{est / 3600 * guard.price:.2f}), spent so far ¥{guard.spent_yuan():.2f}')
+                print(f'[budget] {key}: projected {est / 60:.0f} min, booked so far {guard.state['booked_seconds'] / 3600:.2f} h')
             t_run = time.time()
             rec = None
             try:

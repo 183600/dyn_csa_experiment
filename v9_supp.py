@@ -197,12 +197,6 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     seq2k_old = st.get('seq2k_bs3_panel_historical', {})
     rope = st['rope20k_panel']
     comp = st['comparisons']
-    if os.path.exists('autodl_budget_state_v9.json'):
-        v9_state = json.load(open('autodl_budget_state_v9.json', encoding='utf-8'))
-    else:
-        v9_state = {'booked_seconds': 0.0, 'runs': 0}
-    price = BUDGET_V9['price_per_hour']
-    v9_h = v9_state.get('booked_seconds', 0.0) / 3600.0
     sel_ratio = {'csa_fixed_topk8': '1.5625%', 'csa_fixed_topk32': '6.25%', 'csa_fixed_topk128': '25%', 'csa_fixed_topk512': '100%', 'csa_fix_m1': '1.5625% (m=1, topk=32)'}
     _SEL_PCT = {'csa_fixed_topk8': 1.5625, 'csa_fixed_topk32': 6.25, 'csa_fixed_topk128': 25.0, 'csa_fixed_topk512': 100.0}
     lines = []
@@ -212,8 +206,6 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
     A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
     A('> 说明：本报告全部数字由 `v9_supp.py report` 从 `results_*/`、`analysis_v9/` 的落盘产物计算得到，无手填数值。')
-    A('')
-    A(f'**预算**：v9 记账 {v9_state.get('runs', 0)} runs，估算花费 ¥{v9_h * price:.2f} / ¥{BUDGET_V9['total_yuan']:.2f}（云端 GPU 实例，按 ¥{price:.2f}/h 记账；v7/v8 台账各自独立冻结）。')
     A('')
     _r_n = sorted({p['n'] for p in rope.values()}) if rope else []
     _r_n_txt = (str(_r_n[0]) if len(_r_n) == 1 else f'{_r_n[0]}–{_r_n[-1]}') if _r_n else '0'
@@ -343,7 +335,6 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     A(f"| `results_lm_v9_seq2k/` | P2T 完整 topk 扫描（bs=1，5 变体{f' × {_s2k_seeds}' if _s2k_seeds else ''}） |")
     A(f'| `results_lm_v8_rope20k/` | P2S3 追加 seed 2 后的 {_r20_seeds + ' ' if _r20_seeds else ''}RoPE 20k 面板 |')
     A('| `analysis_v9/stats.json` | 上述面板的配对符号翻转检验 |')
-    A('| `autodl_budget_state_v9.json` | v9 CostGuard 台账 |')
     A('| `v9_supp.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
     A('')
     L.atomic_write_text(out, '\n'.join(lines) + '\n')
@@ -366,19 +357,19 @@ def schedule_shutdown(delay_s=120):
 def run_full():
     guard = make_guard()
     guard.report()
-    print(f'[v9] remaining ¥{guard.remaining_yuan():.2f} (cap ¥{guard.cap_yuan():.2f} @ ¥{guard.price:.2f}/h)')
+    print(f'[v9] headroom {max(guard.remaining_yuan(), 0.0) / guard.price:.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v9: supplementary driver (P2T topk sweep completion @bs1 + P2S3 RoPE-20k third seed)')
     all_ok = True
     for pname, _cfg, _seeds, est_h in PHASES:
         rem = guard.remaining_yuan()
         if rem < 1.0:
-            print(f'[v9] stopping before {pname}: ¥{rem:.2f} left')
+            print(f'[v9] stopping before {pname}: headroom exhausted ({rem / guard.price:.2f} h)')
             break
         if not V.cuda_healthy():
             print(f'[v9] CUDA context poisoned before {pname} — aborting (re-run resumes).')
             all_ok = False
             break
-        print(f'\n===== v9 phase {pname} (~{est_h} h est, ¥{rem:.2f} left) =====')
+        print(f'\n===== v9 phase {pname} (~{est_h} h est) =====')
         try:
             run_phase(pname, guard)
         except Exception:
@@ -434,7 +425,7 @@ def run_smoke():
     guard.record_run(dt, 60, 256, 6, 2048, 1, calib_seconds=rec.get('train_time_s'))
     print(f'  60 steps in {dt:.0f}s -> {dt / 60:.3f} s/step (ppl {rec['ppl']:.1f}); booked to the v9 guard for calibration')
     est = guard.estimate_seconds(1500, d=256, n_layers=6, seq_len=2048, batch_size=1)
-    print(f'  -> 1500-step bs1 seq2k run estimate: {est / 60:.1f} min (¥{est / 3600 * guard.price:.2f}); full P2T (10 runs) ~{10 * est / 3600:.2f} h')
+    print(f'  -> 1500-step bs1 seq2k run estimate: {est / 60:.1f} min; full P2T (10 runs) ~{10 * est / 3600:.2f} h')
     print('[smoke] 3) zero-GPU report rebuild (scratch outputs, real artifacts untouched)')
     build_report(out='results_smoke_v9/REPORT_v9.md', stats_p='results_smoke_v9/stats.json')
     import shutil

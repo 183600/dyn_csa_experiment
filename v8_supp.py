@@ -160,19 +160,19 @@ def schedule_shutdown(delay_s=120):
 def run_full():
     guard = make_guard()
     guard.report()
-    print(f'[v8] remaining ¥{guard.remaining_yuan():.2f} (cap ¥{guard.cap_yuan():.2f} @ ¥{guard.price:.2f}/h)')
+    print(f'[v8] headroom {max(guard.remaining_yuan(), 0.0) / guard.price:.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v8: supplementary driver (P1S scale seed completion + P2R RoPE long run)')
     all_ok = True
     for pname, _cfg, _seeds, est_h in PHASES:
         rem = guard.remaining_yuan()
         if rem < 1.0:
-            print(f'[v8] stopping before {pname}: ¥{rem:.2f} left')
+            print(f'[v8] stopping before {pname}: headroom exhausted ({rem / guard.price:.2f} h)')
             break
         if not V.cuda_healthy():
             print(f'[v8] CUDA context poisoned before {pname} — aborting (re-run resumes).')
             all_ok = False
             break
-        print(f'\n===== v8 phase {pname} (~{est_h} h est, ¥{rem:.2f} left) =====')
+        print(f'\n===== v8 phase {pname} (~{est_h} h est) =====')
         try:
             run_phase(pname, guard)
         except Exception:
@@ -218,7 +218,7 @@ def run_smoke():
     guard.record_run(dt, 60, 256, 6, 512, 12, calib_seconds=rec.get('train_time_s'))
     print(f'  60 steps in {dt:.0f}s -> {dt / 60:.3f} s/step (ppl {rec['ppl']:.1f}); booked to the v8 guard for calibration')
     est = guard.estimate_seconds(20000, d=256, n_layers=6, seq_len=512, batch_size=12)
-    print(f'  -> 20k-step RoPE run estimate: {est / 3600:.2f} h (¥{est / 3600 * guard.price:.2f})')
+    print(f'  -> 20k-step RoPE run estimate: {est / 3600:.2f} h')
     print('\n[smoke] PASSED')
 if __name__ == '__main__':
     mode = sys.argv[1] if len(sys.argv) > 1 else 'full'

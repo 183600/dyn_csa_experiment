@@ -19,7 +19,7 @@ while true; do
     break
   fi
   if [ $(( $(date +%s) - START_TS )) -gt $GIVE_UP_AFTER ]; then
-    echo "=== [bonus] no driver process and no ALL-DONE log within ${GIVE_UP_AFTER}s -> giving up; shutting down to stop billing ==="
+    echo "=== [bonus] no driver process and no ALL-DONE log within ${GIVE_UP_AFTER}s -> giving up; shutting down ==="
     shutdown -h +1
     exit 0
   fi
@@ -27,12 +27,12 @@ while true; do
 done
 echo "=== [bonus] $(date '+%F %T') main driver exited ==="
 if [ ! -f driver_v7.log ]; then
-  echo "=== [bonus] driver_v7.log absent -> cannot confirm a clean finish; no bonus; shutting down in 60 min to stop billing (inspect now; cancel: shutdown -c) ==="
+  echo "=== [bonus] driver_v7.log absent -> cannot confirm a clean finish; no bonus; shutting down in 60 min (inspect now; cancel: shutdown -c) ==="
   shutdown -h +60
   exit 0
 fi
 if ! grep -q "\[driver\] ALL DONE" driver_v7.log; then
-  echo "=== [bonus] main driver did not finish cleanly -> no bonus; shutting down in 60 min to stop billing (inspect now; cancel: shutdown -c) ==="
+  echo "=== [bonus] main driver did not finish cleanly -> no bonus; shutting down in 60 min (inspect now; cancel: shutdown -c) ==="
   shutdown -h +60
   exit 0
 fi
@@ -118,15 +118,15 @@ PYEOF
 _bonus_rc=$?
 echo "=== [bonus] $(date '+%F %T') P0W seed2 END rc=$_bonus_rc ==="
 if [ "$_bonus_rc" -ne 0 ]; then
-  echo "=== [bonus] P0W seed2 run FAILED (rc=$_bonus_rc) -> skipping analysis/report/commit; shutting down in 60 min to stop billing (inspect now; cancel: shutdown -c) ==="
+  echo "=== [bonus] P0W seed2 run FAILED (rc=$_bonus_rc) -> skipping analysis/report/commit; shutting down in 60 min (inspect now; cancel: shutdown -c) ==="
   shutdown -h +60
   exit 1
 fi
 if ! $PY v7_supp.py analysis || ! $PY build_report.py; then
-  echo "=== [bonus] analysis or report FAILED -> no commit; shutting down in 60 min to stop billing (inspect now; cancel: shutdown -c) ==="
+  echo "=== [bonus] analysis or report FAILED -> no commit; shutting down in 60 min (inspect now; cancel: shutdown -c) ==="
   shutdown -h +60
   exit 1
 fi
 commit_and_push "v7 bonus: P0W seed2 complete (warm grid n=3) + final report" || exit 1
-echo "=== [bonus] ALL DONE $(date '+%F %T'); shutting down to stop billing ==="
+echo "=== [bonus] ALL DONE $(date '+%F %T'); shutting down ==="
 shutdown -h +1

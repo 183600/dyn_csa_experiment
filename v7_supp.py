@@ -658,7 +658,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                 if guard is not None:
                     est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
                     if not guard.can_start(est):
-                        print(f'[budget] SKIP {key}: projected ¥{est / 3600 * guard.price:.2f} would pass cap ¥{guard.cap_yuan():.2f} (spent ¥{guard.spent_yuan():.2f})')
+                        print(f'[budget] SKIP {key}: projected {est / 3600:.2f} h would pass the configured cap')
                         continue
                 t_run = time.time()
                 _deadline = None
@@ -1492,19 +1492,19 @@ def cuda_healthy():
 def run_full():
     guard = L.CostGuard(BUDGET_V7)
     guard.report()
-    print(f'[v7] remaining ¥{guard.remaining_yuan():.2f} (cap ¥{guard.cap_yuan():.2f} @ ¥{guard.price:.2f}/h)')
+    print(f'[v7] headroom {max(guard.remaining_yuan(), 0.0) / guard.price:.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v7: supplementary experiment library (RoPE+QK-norm, dense->sparse warmup, NIAH probe, topk sweep, analytic FLOPs)')
     all_ok = True
     for pname, kind, payload, est_h in PHASES:
         rem = guard.remaining_yuan()
         if rem < 1.0:
-            print(f'[v7] stopping before {pname}: ¥{rem:.2f} left')
+            print(f'[v7] stopping before {pname}: headroom exhausted ({rem / guard.price:.2f} h)')
             break
         if not cuda_healthy():
             print(f'[v7] CUDA context poisoned before {pname} -- restart the process to continue (resume will skip completed runs).  Aborting phase loop.')
             all_ok = False
             break
-        print(f'\n===== v7 phase {pname} (~{est_h} h est, ¥{rem:.2f} left) =====')
+        print(f'\n===== v7 phase {pname} (~{est_h} h est) =====')
         try:
             run_phase(pname, guard)
         except Exception:

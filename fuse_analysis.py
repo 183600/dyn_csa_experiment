@@ -263,7 +263,7 @@ def main(argv=None):
         lines.append('|---|---|---|---|---|')
         pair_stats = {}
         if not _ok_seeds:
-            lines.append(f'| — | — | — | — | —（没有通过配置/预算配对门禁的 seed（{_why}），描述性均值与 Δ 不计算——跨配置的种子差不进入任何数字） |')
+            lines.append(f'| — | — | — | — | —（没有通过配置/训练量配对门禁的 seed（{_why}），描述性均值与 Δ 不计算——跨配置的种子差不进入任何数字） |')
         for key, name in [('bnd_f1', 'F1'), ('bnd_prec', 'precision'), ('bnd_rec', 'recall'), ('bnd_excess', 'excess(超过随机)')]:
             if not _ok_seeds:
                 break
@@ -286,7 +286,7 @@ def main(argv=None):
             lines.append(f'| — | **{name}** | {mean_b:.4f}±{sd_b:.4f} | {mean_a:.4f}±{sd_a:.4f} | **{mean_a - mean_b:+.4f}** |')
             pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=np.round(_lay_nanmean(Mb), 4).tolist(), fuse_perlayer_mean=np.round(_lay_nanmean(Ma), 4).tolist(), delta_perlayer=np.round(db, 4).tolist(), nofuse_seed_std=float(sd_b), fuse_seed_std=float(sd_a))
         if _ok_seeds and not _gate_ok:
-            lines.append(f'\n> 注：上表的均值与 Δ 与下方检验同口径——只在通过配置/预算配对门禁的 {_ok_seeds} 上计算，{len(SEEDS) - len(_ok_seeds)} 个未过门禁的 seed（{_why}）不进入任何数字。')
+            lines.append(f'\n> 注：上表的均值与 Δ 与下方检验同口径——只在通过配置/训练量配对门禁的 {_ok_seeds} 上计算，{len(SEEDS) - len(_ok_seeds)} 个未过门禁的 seed（{_why}）不进入任何数字。')
         _, fb = per_seed_layer(b, 'bnd_f1', tuple(SEEDS))
         _, fa = per_seed_layer(a, 'bnd_f1', tuple(SEEDS))
         _jf = np.isfinite(fa) & np.isfinite(fb) & _keep[:, None]
@@ -304,7 +304,7 @@ def main(argv=None):
             _n_f1 = len(d_f1)
             lines.append(f'\n**配对精确符号翻转检验（n={_n_f1}，按 seed 配对）**：')
             if not _gate_ok:
-                lines.append(f'> 注：{len(SEEDS) - len(_ok_seeds)} 个 seed 未通过配置/预算配对门禁（{_why}），已按本仓库惯例排除——Δ 与 p 值只在可配对的 {_ok_seeds} 上计算，跨配置的种子差不进入检验。')
+                lines.append(f'> 注：{len(SEEDS) - len(_ok_seeds)} 个 seed 未通过配置/训练量配对门禁（{_why}），已按本仓库惯例排除——Δ 与 p 值只在可配对的 {_ok_seeds} 上计算，跨配置的种子差不进入检验。')
             _d_f1m = d_f1.mean()
             _n_same = int(((d_f1 == 0) | ((d_f1 > 0) == (_d_f1m > 0))).sum())
             lines.append(f'- 层均边界 F1：Δ = {_d_f1m:+.4f} ± {sample_std(d_f1):.4f}，{_n_same}/{_n_f1} 同向，p(exact) = {p_f1:.3f}')
@@ -373,9 +373,9 @@ def main(argv=None):
     if _pair_missing:
         lines.append('> 注：分块偏移量未计算——至少一臂的记录缺失或不可计量，配对门禁无从谈起；本节的块长分布表只列各臂自身的描述值，不给出两臂偏移量。\n')
     elif not _pair_ok_seeds:
-        lines.append(f'> 注：分块偏移量未计算——{_pgate_drop} 全部因两臂配置/预算不一致被 `pair_reason` 排除，没有可配对的 seed；本节的块长分布表只列各臂自身的描述值。\n')
+        lines.append(f'> 注：分块偏移量未计算——{_pgate_drop} 全部因两臂配置/训练量不一致被 `pair_reason` 排除，没有可配对的 seed；本节的块长分布表只列各臂自身的描述值。\n')
     elif _pgate_drop:
-        lines.append(f'> 注：分块偏移量的配对已按 `pair_reason` 过滤，{_pgate_drop} 因两臂配置/预算不一致被排除；下方偏移量是在 {_pair_ok_seeds} 上计算的。\n')
+        lines.append(f'> 注：分块偏移量的配对已按 `pair_reason` 过滤，{_pgate_drop} 因两臂配置/训练量不一致被排除；下方偏移量是在 {_pair_ok_seeds} 上计算的。\n')
     for v, (panel_name, label, fused) in VARIANTS.items():
         _v_seeds = _seeds_of(v)
         if not _v_seeds:

@@ -228,12 +228,6 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     fit = st['crossover_fit']
     scale384 = st['scale384_panel']
     comp = st['comparisons']
-    if os.path.exists('autodl_budget_state_v11.json'):
-        v11_state = json.load(open('autodl_budget_state_v11.json', encoding='utf-8'))
-    else:
-        v11_state = {'booked_seconds': 0.0, 'runs': 0}
-    price = BUDGET_V11['price_per_hour']
-    v11_h = v11_state.get('booked_seconds', 0.0) / 3600.0
     mech_sum = {}
     mp = os.path.join(V10.P3MT_PAYLOAD['outdir'], 'summary.json')
     if os.path.exists(mp):
@@ -313,8 +307,6 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
     A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
     A('> 说明：本报告全部数字由 `v11_supp.py report` 从 `results_*/`、`analysis_v11/` 的落盘产物计算得到，无手填数值。')
-    A('')
-    A(f'**预算**：v11 记账 {v11_state.get('runs', 0)} runs，估算花费 ¥{v11_h * price:.2f} / ¥{BUDGET_V11['total_yuan']:.2f}（云端 GPU 实例，按 ¥{price:.2f}/h 记账；v7–v10 台账各自独立冻结）。')
     A('')
     if probe_ok:
         _probe_note = f'最弱对比停在 n={n_tree_min}、下限 {floor_p_tree:.3f}，跨不过 0.05，因此凡引用它的结论不作显著性主张' if floor_p_tree >= 0.05 else f'最弱对比也达 n={n_tree_min}、下限 {floor_p_tree:.3f}，已跨过 0.05'
@@ -607,7 +599,6 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     A(f'| `results_lm_v10_scale_l/` | P4S：d=512/10L 面板 {_n_txt('results_lm_v10_scale_l', 4)} |')
     A(f'| `results_lm_v5_scale/` | P4F：d=384 `csa_fixed`/`full` 臂 {_n_txt('results_lm_v5_scale', 4, ('csa_fixed', 'full'))} |')
     A(f'| `analysis_v11/stats.json` | n={n_contr_max} 探针对比、交叉定位（{_xo_txt}）、配对检验 |')
-    A('| `autodl_budget_state_v11.json` | v11 CostGuard 台账 |')
     A('| `v11_supp.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
     A('')
     L.atomic_write_text(out, '\n'.join(lines) + '\n')
@@ -632,19 +623,19 @@ def run_full():
     atexit.register(lambda: sys.stdout.flush())
     guard = make_guard()
     guard.report()
-    print(f'[v11] remaining ¥{guard.remaining_yuan():.2f} (cap ¥{guard.cap_yuan():.2f} @ ¥{guard.price:.2f}/h)')
+    print(f'[v11] headroom {max(guard.remaining_yuan(), 0.0) / guard.price:.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v11: supplementary driver (probe n=6 + crossover panels n=4 + d384 full-arm seed completion)')
     all_ok = True
     for pname, _kind, _payload, _seeds, est_h in PHASES:
         rem = guard.remaining_yuan()
         if rem < 1.0:
-            print(f'[v11] stopping before {pname}: ¥{rem:.2f} left')
+            print(f'[v11] stopping before {pname}: headroom exhausted ({rem / guard.price:.2f} h)')
             break
         if not V.cuda_healthy():
             print(f'[v11] CUDA context poisoned before {pname} — aborting (re-run resumes).')
             all_ok = False
             break
-        print(f'\n===== v11 phase {pname} (~{est_h} h est, ¥{rem:.2f} left) =====')
+        print(f'\n===== v11 phase {pname} (~{est_h} h est) =====')
         try:
             run_phase(pname, guard)
         except Exception:

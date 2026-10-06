@@ -695,12 +695,6 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     fit = st['crossover_fit']
     seq2k = st['seq2k_bs1_panel']
     comp = st['comparisons']
-    if os.path.exists('autodl_budget_state_v10.json'):
-        v10_state = json.load(open('autodl_budget_state_v10.json', encoding='utf-8'))
-    else:
-        v10_state = {'booked_seconds': 0.0, 'runs': 0}
-    price = BUDGET_V10['price_per_hour']
-    v10_h = v10_state.get('booked_seconds', 0.0) / 3600.0
     mech_sum = {}
     mp = os.path.join(P3MT_PAYLOAD['outdir'], 'summary.json')
     if os.path.exists(mp):
@@ -713,15 +707,13 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
     A('> 说明：本报告全部数字由 `v10_supp.py report` 从 `results_*/`、`analysis_v10/` 的落盘产物计算得到，无手填数值。')
     A('')
-    A(f'**预算**：v10 记账 {v10_state.get('runs', 0)} runs，估算花费 ¥{v10_h * price:.2f} / ¥{BUDGET_V10['total_yuan']:.2f}（云端 GPU 实例，按 ¥{price:.2f}/h 记账；v7/v8/v9 台账各自独立冻结）。')
-    A('')
-    A('v10 落实 v9 收官后评审的三项升级：(1) 把唯一正面发现（CSA+RoPE 长度外推 ×1.07 vs dense-RoPE ×1.57）从附带观察升级为机制性主结果——远距干扰注入实验直接检验「稀疏掩码滤除远距噪声」假设；(2) 新增 d=128/4L 与 d=512/10L 两个规模，与既有 d=256/d=384 面板组成 4 点反转交叉点标度读数（预注册交叉判据）；(3) 把 v9 唯一仍处 p=0.500 下限的面板（seq-2048 topk 扫描）从 n=2 补到 n=4。')
+    A('v10 落实 v9 收官后评审的三项升级：(1) 把 v7 P1L 的 sparse 正面发现（CSA+RoPE 长度外推显著优于 dense-RoPE）从附带观察升级为机制性主结果——远距干扰注入实验直接检验「稀疏掩码滤除远距噪声」假设；(2) 新增 d=128/4L 与 d=512/10L 两个规模，与既有 d=256/d=384 面板组成 4 点反转交叉点标度读数（预注册交叉判据）；(3) 把 v9 唯一仍处 p 值分辨率下限的面板（seq-2048 topk 扫描）从 n=2 补到 n=4。')
     A('')
     A('---')
     A('')
     A('## P3M 长度外推优势的机制验证（远距干扰注入）')
     A('')
-    A('**背景**：v7 P1L 的 ×1.07 vs ×1.57 是全仓库唯一的 sparse 正面发现，但只是附带观察（n=3 时精确符号翻转 p 值下限 0.250）。P1L 权重未持久化，P3MT 先按 v7 P1L 原配方（seq 512、3000 步、3 seeds、AdamW lr 3e-4）重训两臂并保存权重——同时作为 ×1.07/×1.57 对比的独立复现。')
+    A('**背景**：v7 P1L 的外推对比是全仓库唯一的 sparse 正面发现，但只是附带观察（n=3 时精确符号翻转 p 值下限 0.250）。P1L 权重未持久化，P3MT 先按 v7 P1L 原配方（seq 512、3000 步、3 seeds、AdamW lr 3e-4）重训两臂并保存权重——同时作为该外推对比的独立复现。')
     A('')
     if mech_sum:
         _rows_by_v = {}
@@ -957,7 +949,6 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('| `results_lm_v10_scale_l/` | P3S：d=512/10L 交叉定位面板（4000 步） |')
     A('| `results_lm_v9_seq2k/` | P3T：topk 扫描追加 seeds 2/3 后的 4-seed 面板 |')
     A('| `analysis_v10/stats.json` | 探针对比、交叉定位与配对符号翻转检验 |')
-    A('| `autodl_budget_state_v10.json` | v10 CostGuard 台账 |')
     A('| `v10_supp.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
     A('')
     L.atomic_write_text(out, '\n'.join(lines) + '\n')
@@ -980,19 +971,19 @@ def schedule_shutdown(delay_s=120):
 def run_full():
     guard = make_guard()
     guard.report()
-    print(f'[v10] remaining ¥{guard.remaining_yuan():.2f} (cap ¥{guard.cap_yuan():.2f} @ ¥{guard.price:.2f}/h)')
+    print(f'[v10] headroom {max(guard.remaining_yuan(), 0.0) / guard.price:.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v10: supplementary driver (P3M distractor-injection mechanism + P3S crossover scaling + P3T topk seeds 2/3)')
     all_ok = True
     for pname, _kind, _payload, _seeds, est_h in PHASES:
         rem = guard.remaining_yuan()
         if rem < 1.0:
-            print(f'[v10] stopping before {pname}: ¥{rem:.2f} left')
+            print(f'[v10] stopping before {pname}: headroom exhausted ({rem / guard.price:.2f} h)')
             break
         if not V.cuda_healthy():
             print(f'[v10] CUDA context poisoned before {pname} — aborting (re-run resumes).')
             all_ok = False
             break
-        print(f'\n===== v10 phase {pname} (~{est_h} h est, ¥{rem:.2f} left) =====')
+        print(f'\n===== v10 phase {pname} (~{est_h} h est) =====')
         try:
             run_phase(pname, guard)
         except Exception:

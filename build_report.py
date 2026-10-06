@@ -300,8 +300,8 @@ def paired_row(a_records, b_records):
     st = exact_signflip(dl)
     return (kept, dl, st)
 
-def sec_header(budget_hrs, spent, price, cap):
-    return f'# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）\n> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n> 说明：本报告全部数字由 `build_report.py` 从 `results_*/`、`analysis_v7/`\n> 的落盘产物计算得到，无手填数值。\n\n**预算**：累计 booked {budget_hrs:.2f} GPU·h，估算花费 ¥{spent:.2f} / ¥{cap:.2f}\n（云端 GPU 实例，单价按 ¥{price:.2f}/h 保守记账）。\n\n本报告针对外部评审提出的 3 项 P0 阻断项与 P1/P2 缺口逐一补做实验。所有新变体\n（RoPE+QK-norm、dense-warmup、topk 扫描、m=1、长度外推）都经由 **完全相同的\n训练/优化器/LR/评测/CostGuard 代码路径**（对 `exp_lib` 的 `make_layer_cfgs`/\n`SmallGPT` 做 monkey-patch 注入），以保证可比性。长上下文证据采用\n**wikitext 长度外推探针**（train@512 → eval 512..4096）：合成 NIAH 探针在\n本模型规模（d=256/6 层）下两臂均停留在随机水平（无区分度），故以自然语料的\n长度外推替代，同样回应「无长上下文评测」的质疑。\n\n'
+def sec_header():
+    return f'# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）\n> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n> 说明：本报告全部数字由 `build_report.py` 从 `results_*/`、`analysis_v7/`\n> 的落盘产物计算得到，无手填数值。\n\n本报告针对外部评审提出的 3 项 P0 阻断项与 P1/P2 缺口逐一补做实验。所有新变体\n（RoPE+QK-norm、dense-warmup、topk 扫描、m=1、长度外推）都经由 **完全相同的\n训练/优化器/LR/评测/CostGuard 代码路径**（对 `exp_lib` 的 `make_layer_cfgs`/\n`SmallGPT` 做 monkey-patch 注入），以保证可比性。长上下文证据采用\n**wikitext 长度外推探针**（train@512 → eval 512..4096）：合成 NIAH 探针在\n本模型规模（d=256/6 层）下两臂均停留在随机水平（无区分度），故以自然语料的\n长度外推替代，同样回应「无长上下文评测」的质疑。\n\n'
 _MODULE_NOTE = '本模块只读：从 `results_*/` 与 `analysis_v7/` 的落盘产物计算\n报告全文，不 import torch（也不 import exp_lib）。上面那段\n模块说明文字以 `_MODULE_NOTE` 命名保留，不参与报告正文的渲染。'
 
 def sec_p0r():
@@ -614,7 +614,7 @@ def sec_p0e():
                 _gap_calib = 'seed 平均'
             lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，{_gap_calib}）**：', '', f'- 20k 步差距：{_g20} PPL；{_lastk:g}k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {_dir_word(r_csa)} {abs(r_csa):.2f}、dense {_dir_word(r_full)} {abs(r_full):.2f} PPL/1k）。']
             if _unpaired_gap:
-                verdict = f'**结论（受限）：本轮不对「渐近线是否反演」作判定。** 两臂在尾段评测步上没有任何通过配置/预算配对门禁的公共 seed，上方尾段斜率（{slope:+.2f} PPL/1k）与终点差距（{g_last:+.1f} PPL）是**非配对逐步均值差**——每个评测步由各自测得的 seed 平均，seed 组成随步变化，组成变化本身即可伪造或掩盖交叉。需补齐两臂共享 seed 的长跑记录后再按同一判据重算。'
+                verdict = f'**结论（受限）：本轮不对「渐近线是否反演」作判定。** 两臂在尾段评测步上没有任何通过配置/训练量配对门禁的公共 seed，上方尾段斜率（{slope:+.2f} PPL/1k）与终点差距（{g_last:+.1f} PPL）是**非配对逐步均值差**——每个评测步由各自测得的 seed 平均，seed 组成随步变化，组成变化本身即可伪造或掩盖交叉。需补齐两臂共享 seed 的长跑记录后再按同一判据重算。'
             elif n_ < 2:
                 verdict = f'**结论：尾段差距统计量不可用**（两臂只在 {n_} 个公共评测步上有测量，尾段回归需要至少 2 个点），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。需补跑或加密尾段评测网格。'
             elif not (math.isfinite(g_last) and math.isfinite(slope)):
@@ -628,7 +628,7 @@ def sec_p0e():
                     _g20c = f'由 20k 的 **{_g20v:+.1f}** ' if isinstance(_g20v, (int, float)) and math.isfinite(_g20v) else ''
                     verdict = f'- 按尾段斜率线性外推，差距将在 ~{x0 / 1000:.0f}k 步附近归零（外推仅供参考：学习率已 cosine 衰减到底，后期斜率通常进一步放缓）。\n\n**结论**：{_lastk:g}k 步内未发生反演，但差距仍在缓慢收窄。**保守表述**：「等 token budget 下 CSA 收敛更慢，终点差距 {_g20c}收窄到 {_lastk:g}k 的 {g_last:+.1f}，未见交叉」。是否最终追平属外推，不属证据。'
                 else:
-                    verdict = f'- 线性外推的交叉点在 ~{x0 / 1000:.0f}k 步，超出可信外推范围。\n\n**结论**：{_lastk:g}k 步（~{_tok_m} tokens）仍未追平——终点差距 **{g_last:+.1f} PPL**。差距收窄速度在尾段为 {abs(slope):.2f} PPL/1k，即每多花 10k 步约收窄 {abs(slope) * 10:.0f} PPL。**「渐近线更差」在实验可达范围内成立**，更精确的措辞是「等预算收敛更慢且差距长期存在」。'
+                    verdict = f'- 线性外推的交叉点在 ~{x0 / 1000:.0f}k 步，超出可信外推范围。\n\n**结论**：{_lastk:g}k 步（~{_tok_m} tokens）仍未追平——终点差距 **{g_last:+.1f} PPL**。差距收窄速度在尾段为 {abs(slope):.2f} PPL/1k，即每多训 10k 步约收窄 {abs(slope) * 10:.0f} PPL。**「渐近线更差」在实验可达范围内成立**，更精确的措辞是「等训练量下收敛更慢且差距长期存在」。'
             else:
                 verdict = f'**结论**：尾段差距已不再收窄（斜率 {slope:+.2f} PPL/1k），**「渐近线更差」在 {_lastk:g}k 步坐实**。'
             lines += ['', verdict, '']
@@ -689,12 +689,12 @@ def sec_p1t():
         lines += ['', '**未完成的扫描点（如实记录）**：', '']
         for v in sorted(failed):
             seeds = ','.join((str(x) for x in sorted(failed[v], key=lambda x: (x is None, 0 if isinstance(x, (int, float)) and (not isinstance(x, bool)) else 1, x if isinstance(x, (int, float)) and (not isinstance(x, bool)) else str(x)))))
-            lines.append(f'- `{v}`（seed {seeds}）：该扫描点在本配置与预算约束下未完成（记录为 error），扫描被截断。')
+            lines.append(f'- `{v}`（seed {seeds}）：该扫描点在本配置与运行时长约束下未完成（记录为 error），扫描被截断。')
         lines.append('')
     if missing:
         lines += ['', '**无记录的扫描点（如实记录）**：', '']
         for v in missing:
-            lines.append(f'- `{v}`：面板上没有任何记录（未运行、被预算跳过或截断后未留下测量），扫描不完整。')
+            lines.append(f'- `{v}`：面板上没有任何记录（未运行、被时长门禁跳过或截断后未留下测量），扫描不完整。')
         lines.append('')
     ks = [8, 32, 128, 512]
     rows_k = []
@@ -1026,12 +1026,7 @@ def main(argv=None):
             print('Usage: python build_report.py\n  Zero GPU.  Reads results_*/*.json + analysis_v7/*.json and rewrites\n  REPORT_v7.md next to the repo root.  Takes no arguments.')
             return 0
         raise SystemExit(f'build_report: unknown argument {a!r} (this builder takes none; try -h)')
-    st = load(os.path.join(REPO, 'autodl_budget_state_v7.json'), {}) or {}
-    hrs = st.get('booked_seconds', 0) / 3600.0
-    price = float(os.environ.get('V7_PRICE_PER_HOUR', 2.4))
-    cap = float(os.environ.get('V7_BUDGET_YUAN', 107.0))
-    spent = hrs * price
-    parts = [sec_header(hrs, spent, price, cap), '---\n']
+    parts = [sec_header(), '---\n']
     failed = []
     for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_stats):
         try:
