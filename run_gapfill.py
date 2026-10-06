@@ -209,7 +209,7 @@ def merge_long_aggregate(adir, snapshot_agg):
         sm = _seed_map(sentry)
         fm = _seed_map(fentry)
         _overlap = set(sm) & set(fm)
-        n_old, n_new = (len(sm) - len(_overlap), len(fm))
+        n_old_all, n_new_only = (len(sm), len(fm) - len(_overlap))
         sm.update(fm)
         if not sm:
             continue
@@ -222,18 +222,28 @@ def merge_long_aggregate(adir, snapshot_agg):
         sentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
         n_folded += 1
         _folded_keys.add(key)
-        if n_old and n_new:
-            w_old = n_old / (n_old + n_new)
+        if n_new_only:
+            _fresh_covers = n_old_all == 0 or len(fm) == n_old_all + n_new_only
             for _f in ('avg_dyn_block_len', 'avg_block_len', 'boundary_f1_dyn', 'boundary_excess_dyn', 'delta_logit_mean', 'tokens_per_step'):
                 _vo, _vn = (sentry.get(_f), fentry.get(_f))
-                if isinstance(_vo, (int, float)) and isinstance(_vn, (int, float)) and (not isinstance(_vo, bool)) and (not isinstance(_vn, bool)) and math.isfinite(_vo) and math.isfinite(_vn):
+                _vn_ok = isinstance(_vn, (int, float)) and (not isinstance(_vn, bool)) and math.isfinite(_vn)
+                _vo_ok = isinstance(_vo, (int, float)) and (not isinstance(_vo, bool)) and math.isfinite(_vo)
+                if not _vn_ok:
+                    continue
+                if _fresh_covers:
+                    sentry[_f] = _vn
+                elif _vo_ok:
+                    w_old = n_old_all / (n_old_all + n_new_only)
                     sentry[_f] = _vo * w_old + _vn * (1.0 - w_old)
             _co, _cn = (sentry.get('ppl_curve'), fentry.get('ppl_curve'))
-            if _co and _cn:
+            if _fresh_covers:
+                if _cn:
+                    sentry['ppl_curve'] = _cn
+            elif _co and _cn:
                 _cm = {}
                 for _pt in _co:
                     try:
-                        _cm[int(_pt[0])] = [float(_pt[1]) * n_old, n_old]
+                        _cm[int(_pt[0])] = [float(_pt[1]) * n_old_all, n_old_all]
                     except (TypeError, ValueError, IndexError):
                         continue
                 for _pt in _cn:
@@ -242,8 +252,8 @@ def merge_long_aggregate(adir, snapshot_agg):
                     except (TypeError, ValueError, IndexError):
                         continue
                     _acc = _cm.setdefault(_s, [0.0, 0])
-                    _acc[0] += _v * n_new
-                    _acc[1] += n_new
+                    _acc[0] += _v * n_new_only
+                    _acc[1] += n_new_only
                 sentry['ppl_curve'] = [[_s, _a / _w] for _s, (_a, _w) in sorted(_cm.items()) if _w]
     if _folded_keys:
         _base_full = _seed_map(merged.get('full'))

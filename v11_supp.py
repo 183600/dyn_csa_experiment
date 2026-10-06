@@ -587,17 +587,11 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
         except Exception:
             return None
         _sd = {}
-        _sd_cur = {}
-        _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
         for _r in _s.values():
             if isinstance(_r, dict) and 'seed' in _r and _r.get('variant') and L.ppl_is_usable(_r.get('ppl')) and (not _r.get('synthesized')):
                 if _variants is not None and _r['variant'] not in _variants:
                     continue
                 _sd.setdefault(_r['variant'], set()).add(_r['seed'])
-                if isinstance(_r.get('run_cfg'), str) and _r['run_cfg'].endswith(_cur_sfx):
-                    _sd_cur.setdefault(_r['variant'], set()).add(_r['seed'])
-        if _sd_cur:
-            _sd = {v: _sd_cur.get(v, set()) for v in _sd}
         _ns = [len(x) for x in _sd.values()]
         return (min(_ns), max(_ns)) if _ns else None
 

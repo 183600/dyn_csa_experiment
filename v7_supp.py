@@ -634,7 +634,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
     _mkey = ','.join(sorted((str(_x) for _x in (set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}))))
     if torch.cuda.is_available():
         L._pin_cuda_determinism()
-    _fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{L.determinism_label()}_cs{CKPT_CODE}'
+    _fp = f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{L.determinism_label()}_df{L._ids_fp(train_ids)}-{L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_cs{CKPT_CODE}'
     stale_dropped = []
     for seed in seeds:
         for warm in warm_grid:
@@ -1291,7 +1291,7 @@ def run_lenphase(payload, guard=None, label=''):
         mr = 4.0
         if v in PARAM_MATCHED_V7:
             mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant=_mr_ref)
-        _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs12_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr{mr:.8g}-{_mr_ref}'
+        _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs12_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr{mr:.8g}-{_mr_ref}_df{L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))}'
         for seed in seeds:
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
             stale = False
