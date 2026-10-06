@@ -208,7 +208,8 @@ def merge_long_aggregate(adir, snapshot_agg):
             continue
         sm = _seed_map(sentry)
         fm = _seed_map(fentry)
-        n_old, n_new = (len(sm), len(fm))
+        _overlap = set(sm) & set(fm)
+        n_old, n_new = (len(sm) - len(_overlap), len(fm))
         sm.update(fm)
         if not sm:
             continue
