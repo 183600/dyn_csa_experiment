@@ -268,6 +268,8 @@ class HybridAttentionRoPE(L.HybridAttention):
         _n_blk = k_blk_r.shape[0]
         _k_stack = torch.cat([k_blk_r, k_sw_r], 0)
         _v_stack = torch.cat([v_blk, v_sw], 0)
+        _MINL = torch.finfo(k_blk.dtype).min
+        _both_all = torch.cat([topk_idx, (_wi_all + _n_blk).to(torch.int32)], 1).to(torch.int32)
         for s in range(0, T, q_chunk):
             e = min(s + q_chunk, T)
             pos = pos_all[s:e]
@@ -280,27 +282,26 @@ class HybridAttentionRoPE(L.HybridAttention):
             if _keep is not None:
                 sel = sel & _keep
             wvalid = _wvalid_all[s:e]
-            wi = _wi_all[s:e]
-            both = torch.cat([ib, wi + _n_blk], 1).to(torch.int32)
+            both = _both_all[s:e]
             Kset = L._take_2d(_k_stack, both)
             Vset = L._take_2d(_v_stack, both)
             valid = torch.cat([sel, wvalid], 1)
             raw_logits = torch.einsum('qhd,qmhd->qhm', qr[s:e], Kset) * scale
             if soft is None:
-                logits = raw_logits.masked_fill_(~valid[:, None, :], torch.finfo(raw_logits.dtype).min)
+                logits = raw_logits.masked_fill_(~valid[:, None, :], _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
                 if sink is None:
                     attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
             if soft is not None:
-                logits = raw_logits.masked_fill(~valid[:, None, :], torch.finfo(raw_logits.dtype).min)
+                logits = raw_logits.masked_fill(~valid[:, None, :], _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
                 nb = ib.shape[1]
                 sv = soft[s:e]
                 if _keep is not None:
                     sv = sv * _keep.to(sv.dtype)
                 soft_log = torch.log(sv.clamp_min(1e-12))
-                soft_log.masked_fill_(sv <= 0, torch.finfo(sv.dtype).min)
-                soft_logits = torch.cat([raw_logits[:, :, :nb] + soft_log[:, None, :], raw_logits[:, :, nb:]], -1)
+                soft_log.masked_fill_(sv <= 0, _MINL)
+                soft_logits = torch.cat([(raw_logits[:, :, :nb] + soft_log[:, None, :]).clamp_min(_MINL), raw_logits[:, :, nb:]], -1)
                 soft_logits = soft_logits.masked_fill(~valid[:, None, :], torch.finfo(soft_logits.dtype).min)
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = attn + (soft_attn - soft_attn.detach())
@@ -985,6 +986,7 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
             print(f'[stats] {name}: {len(skipped)} seed(s) NOT paired — the two sides have {why}; excluded from the test')
         if not dl:
             print(f'[stats] {name}: NO usable pair after the run_cfg/budget checks — comparison omitted rather than quoting a cross-configuration delta')
+            out_d['comparisons'][name] = {'omitted': 'no usable pair after the run_cfg/budget checks', 'n': 0, 'n_skipped_config_mismatch': len(skipped), 'n_unstamped': unstamped}
             continue
         res = exact_sign_permutation(dl)
         res['n_skipped_config_mismatch'] = len(skipped)
@@ -1012,7 +1014,10 @@ def git_push(msg):
     r = run('git', 'commit', '-m', msg)
     committed = r.returncode == 0
     if not committed and 'nothing to commit' not in r.stdout + r.stderr:
-        print(f'[git] commit FAILED (will still try to push): {(r.stdout + r.stderr)[-300:]}')
+        print(f'[git] commit problem: {(r.stdout + r.stderr)[-300:]}')
+        if run('git', 'status', '--porcelain').stdout.strip():
+            print('[git] the commit failed while changes are still uncommitted — NOT pushing (a push would publish stale history and report success); leaving the tree for inspection')
+            return False
     _branch = run('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
     if _branch != 'HEAD':
         rb = run('git', 'pull', '--rebase', '--autostash', 'origin', _branch)

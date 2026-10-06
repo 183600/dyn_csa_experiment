@@ -42,10 +42,22 @@ def summary(outdir):
     return _LOADED[key]
 
 def fm(x, nd=2):
-    return f'{x:.{nd}f}' if isinstance(x, (int, float)) else 'n/a'
+    return f'{x:.{nd}f}' if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(x) else 'n/a'
 
 def sp(x, nd=2):
-    return f'±{x:.{nd}f}' if isinstance(x, (int, float)) else ''
+    return f'±{x:.{nd}f}' if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(x) else ''
+
+def _mins(v):
+    return v / 60.0 if isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v) else None
+
+def _hist_points(r):
+    for _pt in (r.get('ppl_history') or []) if isinstance(r, dict) else []:
+        try:
+            _st, _pv = _pt
+            _st = int(_st)
+        except (TypeError, ValueError):
+            continue
+        yield (_st, _pv)
 
 def sample_std(vals):
     n = len(vals)
@@ -127,7 +139,7 @@ def _code_semantics():
 _CUR_CS = _code_semantics()
 
 def _finite_ppls(r):
-    ppls = (r.get('ppls') if r.get('ppls') is not None else r.get('ppl_list')) or []
+    ppls = r.get('ppls') or r.get('ppl_list') or []
     return [x for x in ppls if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(x) and (x > 0)]
 
 _WARM_KEY_RE = re.compile('.*::w(\\d+)::seed\\d+$')
@@ -398,7 +410,7 @@ def sec_p0w():
         if _w < 0 and _measurable({'ppl': r.get('ppl'), 'synthesized': r.get('synthesized', False)}):
             print(f"[report] sec_p0w: record {k!r} carries no parseable warmup tag — it is skipped, not counted")
             continue
-        rows.append((r.get('variant', '?'), _w, _sd, r.get('ppl'), r.get('ppl_at_switch'), r.get('train_time_s', 0) / 60.0 if r.get('train_time_s') else None, r.get('synthesized', False), k))
+        rows.append((r.get('variant', '?'), _w, _sd, r.get('ppl'), r.get('ppl_at_switch'), _mins(r.get('train_time_s')), r.get('synthesized', False), k))
     rows.sort(key=lambda x: (x[0], x[1], x[2]))
     rows = [row for row in rows if _measurable({'ppl': row[3], 'synthesized': row[6]})]
     rows = _prefer_one_cfg(rows, lambda row: ((row[0], row[1]), (s.get(row[-1]) or {}).get('run_cfg')), who='sec_p0w')
@@ -424,7 +436,7 @@ def sec_p0w():
     grp = collections.defaultdict(list)
     for (v, w), _m in rec_by_s.items():
         for _sd, _r in sorted(_m.items()):
-            grp[v, w].append((_r.get('ppl'), _r.get('ppl_at_switch'), _r.get('train_time_s', 0) / 60.0 if _r.get('train_time_s') else None, _sd))
+            grp[v, w].append((_r.get('ppl'), _r.get('ppl_at_switch'), _mins(_r.get('train_time_s')), _sd))
     lines = ['## P0-1 dense→sparse warmup 是否能让 sparse 追平 dense？（评审「必做」项）', '', '**评审论断**：论文 §4.2.2 先训 1T token 的 dense 再在 seq 64K 切 sparse；仓库所有 sparse run 都是 from-scratch，故「渐近线更差」可能是没 warmup 的产物。不给这个实验，「渐近线反转」立不住。', '', '**做法**：`train_warmup` 用**相同全长度 cosine LR**，前 `warm_steps` 步走 dense 前向（复用各 csa/hca 层自己的 `W_kvhead` per-token KV 路径 + 同一 sink，不引入新参数），到点切换为 sparse 并记录切换瞬间 PPL。网格 `warm ∈ {0,5000,10000}`（每格 seed 数以下表 n 列为准），20k 步、seq 512。**两臂参数/步数/token 数/初始 PPL/LR 曲线完全相同**，唯一差异是切点。', '', '| variant | warm_steps | PPL (mean±std) | n | 切换时 PPL |', '|---|---|---|---|---|']
     for (v, w), vals in sorted(grp.items()):
         ppls = [p for p, _s, _m, _sd in vals]
@@ -446,7 +458,7 @@ def sec_p0w():
         _dropped_pts = 0
         for (v, w), _m in rec_by_s.items():
             for _sd, r in sorted(_m.items()):
-                for step, pv in r.get('ppl_history') or []:
+                for step, pv in _hist_points(r):
                     if not _ppl_ok(pv):
                         _dropped_pts += 1
                         continue
@@ -535,7 +547,7 @@ def sec_p0e():
         if not _measurable(r):
             continue
         _sdv = str(r.get('seed'))
-        for step, pv in r.get('ppl_history') or []:
+        for step, pv in _hist_points(r):
             if not _ppl_ok(pv):
                 _dropped_pts += 1
                 continue
@@ -1011,6 +1023,9 @@ def sec_stats():
         items = {k: v for k, v in d.items() if isinstance(v, dict) and (v.get('mean') is not None or v.get('delta') is not None)}
     for k, v in items.items():
         if isinstance(v, dict):
+            if 'omitted' in v:
+                lines.append(f'| {k} | —（{v['omitted']}） | — |')
+                continue
             _dv = v.get('mean') if v.get('mean') is not None else v.get('delta')
             _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
             lines.append(f'| {k} | {fm(_dv)} | {fm(_pv, 4)} |')

@@ -98,7 +98,7 @@ def main():
         for k, r in s.items():
             if not isinstance(r, dict):
                 continue
-            rows.append((k, r.get('ppl'), r.get('warm_steps', r.get('warm')), r.get('ppl_at_switch'), (r.get('train_time_s') / 60.0) if isinstance(r.get('train_time_s'), (int, float)) else None))
+            rows.append((k, r.get('ppl'), r.get('warm_steps', r.get('warm')), r.get('ppl_at_switch'), (r.get('train_time_s') / 60.0) if isinstance(r.get('train_time_s'), (int, float)) and (not isinstance(r.get('train_time_s'), bool)) and math.isfinite(r.get('train_time_s')) else None))
         rows.sort(key=lambda x: x[0])
         for k, ppl, warm, sw, mins in rows:
             ppl_s = f'{ppl:8.2f}' if isinstance(ppl, (int, float)) and (not isinstance(ppl, bool)) and math.isfinite(ppl) else '     n/a'
@@ -106,7 +106,7 @@ def main():
                 warm_s = f'{int(warm):5d}' if warm is not None and (not isinstance(warm, bool)) and isinstance(warm, (int, float)) else '    -'
             except (TypeError, ValueError, OverflowError):
                 warm_s = '    -'
-            sw_s = '      -' if not isinstance(sw, (int, float)) else f'{sw:7.2f}'
+            sw_s = f'{sw:7.2f}' if isinstance(sw, (int, float)) and (not isinstance(sw, bool)) and math.isfinite(sw) else '      -'
             m_s = '' if mins is None else f'{mins:8.1f}min'
             print(f'  {k:34s} ppl={ppl_s} warm={warm_s} switch={sw_s} {m_s}')
 if __name__ == '__main__':
