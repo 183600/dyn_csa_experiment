@@ -276,6 +276,14 @@ def paired_row(a_records, b_records):
     common = sorted(set(a_records) & set(b_records))
     if not common:
         return None
+    _by_tag = {}
+    for _tk in common:
+        _by_tag.setdefault(_tk[0] if isinstance(_tk, tuple) else '', []).append(_tk)
+    if len(_by_tag) > 1:
+        _ranked = sorted(_by_tag.items(), key=lambda kv: (-len(kv[1]), str(kv[0])))
+        _keep_tag, _kept_keys = _ranked[0]
+        print(f"[report] paired_row: the two arms share {len(_by_tag)} protocol conditions ({sorted(_by_tag)}) — one sign-flip test cannot pool deltas across protocols (that would fake extra seeds), so only the largest shared condition `{_keep_tag or '(untagged)'}` ({len(_kept_keys)} seed(s)) is tested; the rest ({sorted((t for t in _by_tag if t != _keep_tag))}) is left to its own per-condition section")
+        common = _kept_keys
     dl, kept, skipped = ([], [], [])
     for s in common:
         reason = _pair_reason(a_records[s], b_records[s])
@@ -605,7 +613,9 @@ def sec_p0e():
             else:
                 _gap_calib = 'seed 平均'
             lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，{_gap_calib}）**：', '', f'- 20k 步差距：{_g20} PPL；{_lastk:g}k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {_dir_word(r_csa)} {abs(r_csa):.2f}、dense {_dir_word(r_full)} {abs(r_full):.2f} PPL/1k）。']
-            if n_ < 2:
+            if _unpaired_gap:
+                verdict = f'**结论（受限）：本轮不对「渐近线是否反演」作判定。** 两臂在尾段评测步上没有任何通过配置/预算配对门禁的公共 seed，上方尾段斜率（{slope:+.2f} PPL/1k）与终点差距（{g_last:+.1f} PPL）是**非配对逐步均值差**——每个评测步由各自测得的 seed 平均，seed 组成随步变化，组成变化本身即可伪造或掩盖交叉。需补齐两臂共享 seed 的长跑记录后再按同一判据重算。'
+            elif n_ < 2:
                 verdict = f'**结论：尾段差距统计量不可用**（两臂只在 {n_} 个公共评测步上有测量，尾段回归需要至少 2 个点），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。需补跑或加密尾段评测网格。'
             elif not (math.isfinite(g_last) and math.isfinite(slope)):
                 verdict = f'**结论：尾段差距统计量不可用**（`g_last` 或 `slope` 非有限值：g_last={g_last!r}、slope={slope!r}），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。上表已剔除非有限的曲线点；若此处仍出现，说明该面板的尾段整体缺失，需补跑。'

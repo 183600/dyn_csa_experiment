@@ -304,7 +304,15 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
         A(f'**结论**：RoPE 面板上 `csa_fixed_rope` {_dir20} `full_rope` **{abs(c['mean']):.2f} PPL**（n={c['n']}，p={c['p_exact_signflip']:.3f}）' + _tail20)
     _a20 = comp.get('long20k(abs): csa_fixed - full') or {}
     if _a20 and 'omitted' in _a20:
-        A('> **abs-PE 镜像对比不可用**：`results_lm_v3_long` 的 summary 全部是 `synthesized` 重构记录（无权重、无 `run_cfg`，同一变体的多个 seed 共享同一个拷贝值），不构成独立观测，故不参与配对检验。本表的 abs-PE 侧结论只由持有真实记录的 run 支撑。')
+        _a20_note = None
+        try:
+            _a20_panel = L.read_panel(os.path.join(REPO, 'results_lm_v3_long'))
+            _a20_real = {(_v, _s) for (_v, _t, _s) in _a20_panel}
+            if not any((_v in ('csa_fixed', 'full')) for _v, _s in _a20_real):
+                _a20_note = 'panel 内没有通过可计量检查的真实记录（现存记录为重构或不可计量），不构成独立观测'
+        except Exception:
+            _a20_note = None
+        A(f"> **abs-PE 镜像对比不可用**：该对比被省略——{_a20['omitted']}" + (f'（{_a20_note}）' if _a20_note else '') + '。本表的 abs-PE 侧结论只由持有真实记录的 run 支撑。')
     A('')
     A('---')
     A('')

@@ -4,6 +4,7 @@ import gc
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -136,6 +137,11 @@ def _fp_norm(p):
     if not isinstance(p, dict):
         return p
     return {k: v for k, v in p.items() if k != 'chunk'}
+
+def _recipe_norm(recipe):
+    if not isinstance(recipe, str):
+        return recipe
+    return re.sub(r'(_mr)[^-]*-', r'\1*-', recipe)
 
 def _probe_params_current(rec, fp):
     return isinstance(rec, dict) and _fp_norm(rec.get('probe_params')) == _fp_norm(fp)
@@ -611,7 +617,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     if _fp_norm(learned.get('probe_params')) != _fp_norm(other.get('probe_params')):
                         print(f'[v10 stats] L{Ln} r{rho} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
                         continue
-                    if learned.get('_code') != other.get('_code') or learned.get('recipe') != other.get('recipe'):
+                    if learned.get('_code') != other.get('_code') or _recipe_norm(learned.get('recipe')) != _recipe_norm(other.get('recipe')):
                         print(f"[v10 stats] L{Ln} r{rho} {tag}: the two arms carry DIFFERENT code/recipe stamps (learned {learned.get('_code')}/{learned.get('recipe')} vs {other.get('_code')}/{other.get('recipe')}) — pairing them would mix two measurement semantics, so the contrast is omitted; re-run the stale arm's phase to refresh it")
                         continue
                     common = sorted(set(learned['ppl_by_seed']) & set(other['ppl_by_seed']))

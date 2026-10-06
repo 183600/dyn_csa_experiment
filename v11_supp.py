@@ -136,7 +136,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
                     if V10._fp_norm(learned.get('probe_params')) != V10._fp_norm(other.get('probe_params')):
                         print(f'[v11 stats] L{Ln} r{rho} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
                         continue
-                    if learned.get('_code') != other.get('_code') or learned.get('recipe') != other.get('recipe'):
+                    if learned.get('_code') != other.get('_code') or V10._recipe_norm(learned.get('recipe')) != V10._recipe_norm(other.get('recipe')):
                         print(f"[v11 stats] L{Ln} r{rho} {tag}: the two arms carry DIFFERENT code/recipe stamps (learned {learned.get('_code')}/{learned.get('recipe')} vs {other.get('_code')}/{other.get('recipe')}) — pairing them would mix two measurement semantics, so the contrast is omitted; re-run the stale arm's phase to refresh it")
                         continue
                     common = sorted(set(learned['ppl_by_seed']) & set(other['ppl_by_seed']))

@@ -61,9 +61,66 @@ def git_push(msg):
         print('[git] WARNING: the commit is only on this instance — the work is NOT on the remote.  Re-push before shutting down.')
     return ok
 
+def _agg_seed_map(entry):
+    out = {}
+    if not isinstance(entry, dict):
+        return out
+    for _s, _p in zip(entry.get('seeds') or [], entry.get('ppls') or []):
+        _si = _num_or_none(_s)
+        if _si is not None and L.ppl_is_usable(_p):
+            out[_si] = float(_p)
+    return out
+
+def _fold_backup_into_aggregate(adir):
+    agg_path = os.path.join(adir, 'aggregate.json')
+    bak_path = agg_path + '.v6bak'
+    if not os.path.exists(bak_path):
+        return
+    try:
+        bak = json.load(open(bak_path, encoding='utf-8'))
+    except Exception as _e:
+        print(f'[synth] NOTE: the pre-retrain snapshot {bak_path} cannot be parsed ({type(_e).__name__}: {_e}) — ignoring it')
+        return
+    live = {}
+    if os.path.exists(agg_path):
+        try:
+            live = json.load(open(agg_path, encoding='utf-8'))
+        except Exception:
+            live = {}
+    if not isinstance(live, dict):
+        live = {}
+    merged = dict(live)
+    recovered = {}
+    for key, bentry in bak.items():
+        if not isinstance(bentry, dict):
+            continue
+        lentry = merged.get(key)
+        sm_b, sm_l = (_agg_seed_map(bentry), _agg_seed_map(lentry))
+        missing = set(sm_b) - set(sm_l)
+        if not missing:
+            continue
+        if not isinstance(lentry, dict):
+            merged[key] = bentry
+            recovered[key] = sorted(missing)
+            continue
+        sm = dict(sm_b)
+        sm.update(sm_l)
+        seeds_sorted = sorted(sm)
+        vals = [sm[_s] for _s in seeds_sorted]
+        lentry['seeds'] = seeds_sorted
+        lentry['ppls'] = vals
+        lentry['n_seeds'] = len(vals)
+        lentry['ppl_mean'] = sum(vals) / len(vals)
+        lentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        recovered[key] = sorted(missing)
+    if recovered:
+        L.atomic_write_json(agg_path, merged, indent=2)
+        print(f'[synth] {agg_path} had lost per-seed coverage (a previous pass was interrupted between re-aggregation and the snapshot merge) — recovered from the pre-retrain snapshot: ' + ', '.join((f'{k}: seeds {v}' for k, v in sorted(recovered.items()))))
+
 def synthesize_long_summary():
     adir = os.path.join(REPO, 'results_lm_v3_long')
     agg_path = os.path.join(adir, 'aggregate.json')
+    _fold_backup_into_aggregate(adir)
     if not os.path.exists(agg_path):
         print(f'[synth] SKIP: {agg_path} is absent — the panel is a LOCAL experiment artifact and is not tracked in the repository, so there is nothing to synthesize from.  Run the v3 panel (or restore the artifact) if you need this reconstruction.')
         return ({'skipped_missing_aggregate': agg_path}, None)
@@ -166,7 +223,7 @@ def synthesize_long_summary():
                 continue
             if isinstance(old, dict) and 'ppl' in old:
                 n_replaced += 1
-            rec = {'variant': real_v, 'seed': _seed, 'steps': _LONG_STEPS, 'tokens_seen': e.get('tokens_seen'), 'ppl': float(p), 'params': _num_or_none(e.get('params')), 'synthesized': True, 'note': 'reconstructed from committed aggregate.json (v6); means exact, secondary-metric stds approximate'}
+            rec = {'variant': real_v, 'seed': _seed, 'steps': _LONG_STEPS, 'tokens_seen': e.get('tokens_seen'), 'ppl': float(p), 'params': _num_or_none(e.get('params')), 'synthesized': True, 'note': 'reconstructed from the v6 aggregate.json snapshot; means exact, secondary-metric stds approximate'}
             if _proto:
                 rec['protocol'] = _proto
             if 'ppl_curve' in e:
@@ -298,6 +355,8 @@ def run_full():
     guard = L.CostGuard(L.BUDGET)
     guard.report()
     _synth_summary, _long_snapshot = synthesize_long_summary()
+    if _long_snapshot:
+        L.atomic_write_json(os.path.join(REPO, 'results_lm_v3_long', 'aggregate.json.v6bak'), _long_snapshot, indent=2)
     push_ok = git_push('v6: rebuild results_lm_v3_long/summary.json from committed aggregate')
     L.run({**L.RUN_LONG, 'variants': LONG_GAP_VARIANTS}, seeds=[2], guard=guard, label='P-LONG hybrid seed2 (complete 3-seed table)')
     merge_long_aggregate(os.path.join(REPO, 'results_lm_v3_long'), _long_snapshot)
