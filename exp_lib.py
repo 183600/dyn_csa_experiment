@@ -2221,7 +2221,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         logits = model(x)
         ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
         loss = ce + comp_lambda * model.comp_reg
-        opt.zero_grad()
+        opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()

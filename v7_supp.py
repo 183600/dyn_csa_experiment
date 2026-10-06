@@ -563,7 +563,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         logits = model(x)
         ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
         loss = ce + comp_lambda * model.comp_reg
-        opt.zero_grad()
+        opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -1138,7 +1138,7 @@ def run_niah_phase(payload, guard=None, label=''):
                     lg = model(x)
                     ce = F.cross_entropy(lg[:, :-1].reshape(-1, vocab), y.reshape(-1), ignore_index=-100)
                     loss = ce + 0.05 * model.comp_reg
-                    opt.zero_grad()
+                    opt.zero_grad(set_to_none=True)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     opt.step()
