@@ -50,10 +50,8 @@ jobs:
           free -h
           df -h /
 
-          # ---------- 0) 关闭 systemd-oomd ----------
           sudo systemctl disable --now systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
 
-          # ---------- 1) zram ----------
           sudo modprobe zram 2>/dev/null || true
           if [ -e /dev/zram0 ]; then
             sudo swapoff /dev/zram0 2>/dev/null || true
@@ -65,7 +63,6 @@ jobs:
             echo "[info] zram not available, skip"
           fi
 
-          # ---------- 2) 磁盘 swapfile ----------
           AVAIL_KB=$(df --output=avail / | tail -1)
           AVAIL_MB=$((AVAIL_KB / 1024))
           WANT_MB=$((AVAIL_MB - 3072))
@@ -83,7 +80,6 @@ jobs:
           sudo mkswap /swapfile >/dev/null
           sudo swapon -p 10 /swapfile && echo "[ok] swapfile enabled"
 
-          # ---------- 3) 内核调优 ----------
           sudo sysctl -w vm.swappiness=100
           sudo sysctl -w vm.vfs_cache_pressure=200
           sudo sysctl -w vm.overcommit_memory=1
@@ -106,7 +102,6 @@ jobs:
         run: |
           mkdir -p ~/.config/opencode
 
-          # ---------- 模板 K：Kimi (Moonshot 官方) ----------
           cat > ~/.config/opencode/opencode.kimi.json <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
@@ -127,7 +122,6 @@ jobs:
           }
           EOF
 
-          # ---------- 模板 N：NVIDIA（最终 fallback） ----------
           cat > ~/.config/opencode/opencode.nvidia.json <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
@@ -148,7 +142,6 @@ jobs:
           }
           EOF
 
-          # 默认先启用 NVIDIA；运行循环里每轮会重新抽签
           cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
 
           echo "=== template (Kimi) ==="
@@ -161,7 +154,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Run opencode for ~5 hours
+      - name: Run opencode for ~5 hours (3 phases per iteration)
         timeout-minutes: 300
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
@@ -172,17 +165,20 @@ jobs:
           BRANCH="${GITHUB_REF_NAME:-main}"
           OUT=/tmp/oc_out.log
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
-          PROMPT='确保代码没有影响实验结果的bug(修复所有的bug)，优化性能和显存占用(优化只要不会明显降低性能就可以做)，不要管之前修的bug，不要写修复了哪些bug，确保远程仓库里面没有实验结果和REPORTxx.md以及autodl_budgetxx.json，同时远程仓库docs目录只留design_notes.md，确保远程仓库里面没有性能、预算、花费、修复了哪些bug和显存占用的记录（注释里也没有）'
-          ITER_TIMEOUT=10800   # 单次 opencode 最长 3 小时
 
-          # ================= provider 选择策略 =================
-          #   每轮开始：
-          #     - 20% 概率尝试 Kimi（Moonshot 官方），健康检查通过就用
-          #     - 否则（80%，或 Kimi 不可用）走 NVIDIA
-          #   运行中出错 / 429 会触发降级 + 冷却。
-          # =====================================================
-          KIMI_PROB=20          # Kimi 被选中的概率（%），其余走 NVIDIA
-          KIMI_COOLDOWN=0       # Kimi 失败后的冷却轮数
+          # ================= 三阶段提示词 =================
+          PROMPT_PERF='优化代码的性能和显存占用。优化只要不会明显降低性能就可以做。不要修改代码逻辑、不要影响实验结果。不要输出或写入"优化了哪些内容"的报告。'
+          PROMPT_BUG='仔细检查代码中是否存在影响实验结果的bug，如果有就修复所有的bug。不要重复修复之前已经修过的bug。不要输出或写入"修复了哪些bug"的报告。'
+          PROMPT_CLEAN='确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释）。删除所有多余的内容。'
+
+          # 每阶段单次调用的最大时长（秒）
+          PERF_TIMEOUT=$((60*60))     # 1h
+          BUG_TIMEOUT=$((60*60))      # 1h
+          CLEAN_TIMEOUT=$((30*60))    # 30m
+
+          # provider 选择策略：20% 概率走 Kimi，其余走 NVIDIA
+          KIMI_PROB=20
+          KIMI_COOLDOWN=0
 
           i=0
           FAIL_COUNT=0
@@ -211,7 +207,7 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 健康检查（2xx = 可用，不消耗 token） ----------
+          # ---------- 健康检查 ----------
           kimi_alive() {
             local code
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
@@ -224,7 +220,7 @@ jobs:
             esac
           }
 
-          # ---------- 切换 provider（真正换了才重置计数） ----------
+          # ---------- 切换 provider ----------
           switch_provider() {
             case "$1" in
               kimi)
@@ -246,29 +242,102 @@ jobs:
             esac
           }
 
-          # ---------- 每轮开始时选 provider ----------
+          # ---------- 每阶段开始时选 provider ----------
           pick_provider() {
             if [ $KIMI_COOLDOWN -gt 0 ]; then
               KIMI_COOLDOWN=$((KIMI_COOLDOWN-1))
             fi
 
-            # 1) 20% 概率尝试 Kimi
             if [ $((RANDOM % 100)) -lt $KIMI_PROB ] && [ $KIMI_COOLDOWN -eq 0 ]; then
               if kimi_alive; then
                 switch_provider kimi
-                echo "[info] 第 $i 轮抽中 Kimi（${KIMI_PROB}%），使用 Moonshot 官方 API"
+                echo "[info] 抽中 Kimi（${KIMI_PROB}%），使用 Moonshot 官方 API"
                 return
               fi
               echo "[info] 抽中 Kimi 但端点不可用，回退 NVIDIA"
             elif [ $KIMI_COOLDOWN -gt 0 ]; then
-              echo "[info] Kimi 冷却中（剩余 $KIMI_COOLDOWN 轮），本轮使用 NVIDIA"
+              echo "[info] Kimi 冷却中（剩余 $KIMI_COOLDOWN 轮），使用 NVIDIA"
             fi
 
-            # 2) 兜底：NVIDIA
             switch_provider nvidia
-            echo "[info] 第 $i 轮使用 NVIDIA fallback"
+            echo "[info] 使用 NVIDIA fallback"
           }
 
+          # ---------- 单阶段执行（带重试 + provider 降级） ----------
+          # 参数: phase_name  prompt  timeout_seconds
+          # 返回: 0 成功 / 124|137|143 超时被杀 / 1 放弃
+          run_phase() {
+            local phase="$1" prompt="$2" budget="$3"
+            local attempt=0
+            FAIL_COUNT=0
+            RATE_COUNT=0
+
+            while [ $attempt -lt 3 ]; do
+              attempt=$((attempt+1))
+
+              if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+                echo "[info] phase=$phase 全局时间已用尽，跳过"
+                return 1
+              fi
+
+              pick_provider
+              echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER ==========="
+
+              timeout --kill-after=180 "$budget" opencode run "$prompt" 2>&1 | tee "$OUT"
+              local EC=$?
+
+              # 成功
+              if [ $EC -eq 0 ]; then
+                return 0
+              fi
+
+              # 超时 / 被杀
+              if [ $EC -eq 124 ] || [ $EC -eq 137 ] || [ $EC -eq 143 ]; then
+                echo "[warn] phase=$phase 超时/被杀 (exit=$EC)"
+                return $EC
+              fi
+
+              # 429 限流
+              if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
+                if [ "$CURRENT_PROVIDER" = "kimi" ]; then
+                  echo "[warn] phase=$phase 命中 Kimi 限流(429)，切到 NVIDIA 重试"
+                  KIMI_COOLDOWN=10
+                  switch_provider nvidia
+                  sleep 10
+                  continue
+                fi
+                RATE_COUNT=$((RATE_COUNT+1))
+                echo "[warn] phase=$phase 命中 NVIDIA 限流(429) (连续: $RATE_COUNT)"
+                if [ $RATE_COUNT -ge 8 ]; then
+                  echo "[warn] 连续 8 次限流，放弃该阶段"
+                  return 1
+                fi
+                sleep 180
+                continue
+              fi
+
+              # 其它非零退出
+              RATE_COUNT=0
+              if [ "$CURRENT_PROVIDER" = "kimi" ]; then
+                echo "[info] phase=$phase Kimi 端点异常，切到 NVIDIA 重试"
+                KIMI_COOLDOWN=10
+                switch_provider nvidia
+                sleep 10
+                continue
+              fi
+              FAIL_COUNT=$((FAIL_COUNT+1))
+              echo "[warn] phase=$phase NVIDIA 失败 (连续: $FAIL_COUNT)"
+              if [ $FAIL_COUNT -ge 3 ]; then
+                echo "[warn] 连续 3 次失败，放弃该阶段"
+                return 1
+              fi
+              sleep 30
+            done
+
+            return 1
+          }
+
+          # ================= 主循环 =================
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             i=$((i+1))
 
@@ -280,82 +349,37 @@ jobs:
               break
             fi
 
-            pick_provider
+            # ----- 三个阶段：perf -> bug -> clean -----
+            for phase in perf bug clean; do
+              case "$phase" in
+                perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
+                bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
+                clean) P="$PROMPT_CLEAN"; T="$CLEAN_TIMEOUT" ;;
+              esac
 
-            echo "=========== opencode iteration #$i (provider=${CURRENT_PROVIDER}) ==========="
-
-            timeout --kill-after=180 $ITER_TIMEOUT opencode run "$PROMPT" 2>&1 | tee "$OUT"
-            EXIT_CODE=$?
-
-            # ---------- 超时/被杀：改动照样提交，保住进度 ----------
-            if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ] || [ $EXIT_CODE -eq 143 ]; then
-              FAIL_COUNT=$((FAIL_COUNT+1))
-              echo "[warn] iteration $i 超时或被杀 (exit=$EXIT_CODE)，已完成的改动照常提交 (连续: $FAIL_COUNT)"
-              commit_and_push "$i (partial, killed)"
-              if [ $FAIL_COUNT -ge 3 ]; then
-                echo "连续 3 次超时/被杀，结束本轮，等待定时任务唤醒"
-                break
+              # 收窄到剩余时间
+              REMAIN=$(( DEADLINE - $(date +%s) ))
+              if [ "$REMAIN" -le 0 ]; then
+                echo "[info] 全局时间已到，退出循环"
+                break 2
               fi
-              sleep 10
-              continue
-            fi
+              if [ "$T" -gt "$REMAIN" ]; then T="$REMAIN"; fi
 
-            if [ $EXIT_CODE -ne 0 ]; then
-              # ---------- 429 限流 ----------
-              if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
-                if [ "$CURRENT_PROVIDER" = "kimi" ]; then
-                  echo "[warn] iteration $i 命中 Kimi 限流(429)，切到 NVIDIA 重试"
-                  KIMI_COOLDOWN=10
-                  switch_provider nvidia
-                  sleep 10
-                  continue
-                fi
-                RATE_COUNT=$((RATE_COUNT+1))
-                echo "[warn] iteration $i 命中 NVIDIA 限流(429) (连续: $RATE_COUNT)，退避 180 秒后重试"
-                if [ $RATE_COUNT -ge 8 ]; then
-                  echo "连续 8 次限流，结束本轮，等待定时任务唤醒"
-                  break
-                fi
-                sleep 180
-                continue
-              fi
+              echo ">>> iteration #$i | phase=$phase | budget=${T}s"
+              run_phase "$phase" "$P" "$T"
 
-              RATE_COUNT=0
-              FAIL_COUNT=$((FAIL_COUNT+1))
-              echo "[warn] opencode iteration $i exited non-zero with code $EXIT_CODE (连续失败: $FAIL_COUNT)"
+              # 无论成功失败，先把已完成的改动提交上去
+              commit_and_push "$i-$phase"
 
-              # Kimi 异常 -> 冷却 + 立即切 NVIDIA
-              if [ "$CURRENT_PROVIDER" = "kimi" ]; then
-                echo "[info] Kimi 端点异常，切到 NVIDIA 重试"
-                KIMI_COOLDOWN=10
-                switch_provider nvidia
-                sleep 10
-                continue
-              fi
-
-              # NVIDIA 连续失败 -> 跳过本轮
-              if [ $FAIL_COUNT -ge 3 ]; then
-                echo "连续 3 次请求失败（可能是 API Key 错误或模型名不存在），跳过本轮，等待定时任务唤醒"
-                break
-              fi
-
-              sleep 30
-              continue
-            else
-              FAIL_COUNT=0
-              RATE_COUNT=0
-            fi
-
-            commit_and_push "$i"
-
-            sleep 5
+              sleep 5
+            done
           done
 
       - name: Cleanup repo artifacts
         if: always()
         run: |
           set +e
-          find . -type f -name 'REPORT*.md'         -not -path './.git/*' -delete
+          find . -type f -name 'REPORT*.md'          -not -path './.git/*' -delete
           find . -type f -name 'autodl_budget*.json' -not -path './.git/*' -delete
           if [ -d docs ]; then
             find docs -mindepth 1 -maxdepth 1 ! -name 'design_notes.md' -exec rm -rf {} +
