@@ -26,7 +26,7 @@ needed to reproduce the results on a machine of your own.
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
 | `mon3.py` | tiny AutoDL progress watcher used by the drivers |
 | `prep_cache.py` | one-off helper that builds `wt103_cache/*.npy` from the raw WikiText-103 dump |
-| `bonus_watcher.sh`, `driver_v7.sh` | shell wrappers used on the AutoDL box (watchdog / v7 launch) |
+| `driver_v7.sh` | shell wrapper used on the AutoDL box (v7 launch) |
 | `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
 
 > **`exp_lib.py` 是唯一的代码来源（source of truth），直接改它。**

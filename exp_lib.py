@@ -37,7 +37,7 @@ import torch.nn.functional as F
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
-BUDGET = dict(total_yuan=140.0, price_per_hour=2.4, margin=0.93, already_spent_yuan=0.0, state_path='autodl_budget_state.json')
+RUN_CAP = dict(total_hours=140.0 / 2.4, margin=0.93, already_hours=0.0, state_path='run_time_state.json')
 CODE_SEMANTICS = 'v11.124'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
@@ -1377,7 +1377,7 @@ def result_is_current(rec, code, *required_keys):
     if 'ppl' in required_keys and (not ppl_is_usable(rec.get('ppl'))):
         return False
     return rec.get('_code') == code
-PAIR_BUDGET_KEYS = ('steps', 'tokens_seen')
+PAIR_STEP_KEYS = ('steps', 'tokens_seen')
 
 def pair_reason(ra, rb):
     if not isinstance(ra, dict) or not isinstance(rb, dict):
@@ -1386,7 +1386,7 @@ def pair_reason(ra, rb):
         return 'unverifiable run_cfg'
     if ra.get('run_cfg') != rb.get('run_cfg'):
         return 'different run_cfg'
-    bad = [k for k in PAIR_BUDGET_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
+    bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
     if bad:
         absent = [k for k in bad if ra.get(k) is None and rb.get(k) is None]
         unknown = [k for k in bad if k not in absent and (ra.get(k) is None) != (rb.get(k) is None)]
@@ -2211,7 +2211,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     truncated = False
     for step in range(steps):
         if deadline_ts is not None and time.time() > deadline_ts:
-            print(f'  [budget] HARD cap reached before step {step} - truncating; this run is NOT recorded (raise BUDGET and re-run to retry it)')
+            print(f'  [cap] HARD cap reached before step {step} - truncating; this run is NOT recorded (raise RUN_CAP and re-run to retry it)')
             truncated = True
             break
         base = lr_at(step)
@@ -2252,14 +2252,14 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
-        return {'variant': variant, 'seed': seed, 'budget_truncated': True, 'steps_done': step, 'train_time_s': wall}
+        return {'variant': variant, 'seed': seed, 'cap_truncated': True, 'steps_done': step, 'train_time_s': wall}
     if deadline_ts is not None and time.time() > deadline_ts:
-        print('  [budget] HARD cap reached before the final evaluation - truncating; this run is NOT recorded (raise BUDGET and re-run to retry it)')
+        print('  [cap] HARD cap reached before the final evaluation - truncating; this run is NOT recorded (raise RUN_CAP and re-run to retry it)')
         del model, opt, bpe
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
-        return {'variant': variant, 'seed': seed, 'budget_truncated': True, 'steps_done': steps, 'train_time_s': wall}
+        return {'variant': variant, 'seed': seed, 'cap_truncated': True, 'steps_done': steps, 'train_time_s': wall}
     if val_batch is None:
         ppl, stats = (float('nan'), {})
     else:
@@ -2282,15 +2282,14 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         torch.cuda.empty_cache()
     return result
 
-class CostGuard:
+class TimeGuard:
     BASE = (256, 6, 512, 12)
 
-    def __init__(self, budget):
-        self.total_yuan = float(budget['total_yuan'])
-        self.price = float(budget['price_per_hour'])
-        self.margin = float(budget.get('margin', 0.93))
-        self.already = float(budget.get('already_spent_yuan', 0.0))
-        self.state_path = budget.get('state_path', 'autodl_budget_state.json')
+    def __init__(self, cap):
+        self.total_hours = float(cap['total_hours'])
+        self.margin = float(cap.get('margin', 0.93))
+        self.already = float(cap.get('already_hours', 0.0))
+        self.state_path = cap.get('state_path', 'run_time_state.json')
         self.state = self._load_state()
 
     def _load_state(self):
@@ -2300,21 +2299,21 @@ class CostGuard:
                 with open(self.state_path, encoding='utf-8') as f:
                     st.update(json.load(f))
             except Exception as e:
-                print(f'[budget] FATAL: {self.state_path} exists but cannot be parsed ({type(e).__name__}: {e}).  Refusing to start with a silently RESET ledger (booked time would read as 0) — move it aside to start fresh.')
+                print(f'[cap] FATAL: {self.state_path} exists but cannot be parsed ({type(e).__name__}: {e}).  Refusing to start with a silently RESET state (booked time would read as 0) — move it aside to start fresh.')
                 raise
         return st
 
     def _save(self):
         atomic_write_json(self.state_path, self.state)
 
-    def spent_yuan(self):
-        return self.already + self.state['booked_seconds'] / 3600.0 * self.price
+    def spent_hours(self):
+        return self.already + self.state['booked_seconds'] / 3600.0
 
-    def remaining_yuan(self):
-        return self.total_yuan - self.spent_yuan()
+    def remaining_hours(self):
+        return self.total_hours - self.spent_hours()
 
-    def cap_yuan(self):
-        return self.total_yuan * self.margin
+    def cap_hours(self):
+        return self.total_hours * self.margin
 
     def record_run(self, seconds, steps_done, d, n_layers, seq_len, batch_size, calib_seconds=None):
         try:
@@ -2379,12 +2378,12 @@ class CostGuard:
         return steps * norm * f * 1.15
 
     def can_start(self, est_seconds):
-        projected = self.spent_yuan() + est_seconds / 3600.0 * self.price
-        return projected <= self.cap_yuan()
+        projected = self.spent_hours() + est_seconds / 3600.0
+        return projected <= self.cap_hours()
 
     def deadline_ts(self):
-        headroom = max(self.cap_yuan() - self.spent_yuan(), 0.0)
-        return time.time() + headroom / self.price * 3600.0
+        headroom = max(self.cap_hours() - self.spent_hours(), 0.0)
+        return time.time() + headroom * 3600.0
 
     def report(self):
         print('\n==================== usage report ====================')
@@ -2510,9 +2509,9 @@ def aggregate(summary):
             _p = int(_p) if _p is not None and (not isinstance(_p, bool)) else None
         except (TypeError, ValueError):
             _p = None
-        return json.dumps([rec.get('run_cfg'), _p, [rec.get(k) for k in PAIR_BUDGET_KEYS]], sort_keys=True, default=str)
+        return json.dumps([rec.get('run_cfg'), _p, [rec.get(k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
 
-    def _budget_ok(recs):
+    def _steps_ok(recs):
         if len(recs) < 2:
             return True
         return len({_cfg_fp(r) for r in recs}) == 1
@@ -2549,7 +2548,7 @@ def aggregate(summary):
         key = v if not tag else f'{v}#{tag}'
         return key if fp_idx is None else f'{key}@cfg{fp_idx}'
     for (v, tag), recs in per_variant.items():
-        if _budget_ok(recs):
+        if _steps_ok(recs):
             _split_groups.append(((v, tag, None), recs))
             _group_records[v, tag, None] = recs
             continue
@@ -3041,17 +3040,17 @@ def run(cfg=None, seeds=None, guard=None, label=''):
             if guard is not None:
                 est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
                 if not guard.can_start(est):
-                    print(f'[budget] SKIP {key}: projected {est / 3600:.2f} h would pass the configured cap (headroom {max(guard.total_yuan - guard.spent_yuan(), 0.0) / guard.price:.2f} h)')
+                    print(f'[cap] SKIP {key}: projected {est / 3600:.2f} h would pass the configured cap (headroom {max(guard.total_hours - guard.spent_hours(), 0.0):.2f} h)')
                     continue
                 deadline_ts = guard.deadline_ts()
-                print(f'[budget] {key}: projected {est / 60:.0f} min, booked so far {guard.state['booked_seconds'] / 3600:.2f} h')
+                print(f'[cap] {key}: projected {est / 60:.0f} min, booked so far {guard.state['booked_seconds'] / 3600:.2f} h')
             t_run = time.time()
             rec = None
             try:
                 rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts)
-                if rec.get('budget_truncated'):
+                if rec.get('cap_truncated'):
                     _prev_ok = ppl_is_usable((summary.get(key) or {}).get('ppl'))
-                    print(f'[budget] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`); ' + ('keeping the previous record instead.' if _prev_ok else 'the key is left ABSENT, not written as a stub.') + ' Raise BUDGET and re-run to retry this cell.')
+                    print(f'[cap] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`); ' + ('keeping the previous record instead.' if _prev_ok else 'the key is left ABSENT, not written as a stub.') + ' Raise RUN_CAP and re-run to retry this cell.')
                     if not _prev_ok:
                         if key in summary:
                             del summary[key]
@@ -3084,10 +3083,10 @@ def run(cfg=None, seeds=None, guard=None, label=''):
             if DEVICE.type == 'cuda':
                 torch.cuda.empty_cache()
     if dropped_truncations:
-        print(f'\n[budget] {len(dropped_truncations)} cell(s) were retrained, hit the budget deadline, and produced NO measurement — they are ABSENT from {summary_path} and from every table above:')
+        print(f'\n[cap] {len(dropped_truncations)} cell(s) were retrained, hit the cap deadline, and produced NO measurement — they are ABSENT from {summary_path} and from every table above:')
         for _k in dropped_truncations:
             print(f'    {_k}')
-        print('[budget] raise BUDGET and re-run to fill these cells in.')
+        print('[cap] raise RUN_CAP and re-run to fill these cells in.')
     if stale_dropped:
         _still = [k for k in stale_dropped if k not in summary]
         print(f'\n[resume] {len(stale_dropped)} cell(s) held a record from a DIFFERENT config and were re-run; {len(_still)} of them produced NO measurement this pass and are now ABSENT from {summary_path} (the stale record was removed rather than kept, so no number measured by older code can be reported under the current config):')

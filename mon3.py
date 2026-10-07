@@ -5,8 +5,8 @@ import os
 import subprocess
 import time
 BASE = os.path.dirname(os.path.abspath(__file__))
-PHASES = [('results_lm_v7_rope', 15, 'P0R  RoPE+QK-norm 5 variants x 3 seeds @1500'), ('results_lm_v7_warmup', 9, 'P0W  dense->sparse warmup csa_fixed x w{0,5k,10k} x 3 seeds (bonus_watcher 补 seed 2)'),('results_lm_v7_long40', 4, 'P0E  long horizon 40k: csa_fixed+full x 2 seeds'), ('results_lm_v7_seq2k', 10, 'P1T  seq2048 topk sweep 5 variants x 2 seeds + m=1'), ('results_lm_v5_scale', None, 'P2S  param-matched scale seeds 2,3')]
-BUDGET_STATE = os.path.join(BASE, 'autodl_budget_state_v7.json')
+PHASES = [('results_lm_v7_rope', 15, 'P0R  RoPE+QK-norm 5 variants x 3 seeds @1500'), ('results_lm_v7_warmup', 9, 'P0W  dense->sparse warmup csa_fixed x w{0,5k,10k} x 3 seeds (补 seed 2)'),('results_lm_v7_long40', 4, 'P0E  long horizon 40k: csa_fixed+full x 2 seeds'), ('results_lm_v7_seq2k', 10, 'P1T  seq2048 topk sweep 5 variants x 2 seeds + m=1'), ('results_lm_v5_scale', None, 'P2S  param-matched scale seeds 2,3')]
+STATE_PATH = os.path.join(BASE, 'run_time_state_v7.json')
 
 def load(p):
     try:
@@ -29,7 +29,7 @@ def proc_alive():
         except Exception:
             ppid = -1
         entries.append((int(pid), ppid, cmd))
-    watchers = {pid for pid, _ppid, cmd in entries if 'bonus_watcher.sh' in cmd or 'driver_v7.sh' in cmd}
+    watchers = {pid for pid, _ppid, cmd in entries if 'driver_v7.sh' in cmd}
     _self = os.getpid()
     for pid, ppid, cmd in entries:
         if pid == _self:
@@ -68,10 +68,10 @@ def main():
             print(f'driver: PID {pid} alive')
     else:
         print('driver: NOT RUNNING')
-    st = load(BUDGET_STATE)
+    st = load(STATE_PATH)
     if st:
         hrs = st.get('booked_seconds', 0) / 3600.0
-        print(f'budget: {hrs:.2f} h booked, {st.get('runs', '?')} runs logged')
+        print(f'booked: {hrs:.2f} h, {st.get('runs', '?')} runs logged')
     for d, exp, desc in PHASES:
         p = os.path.join(BASE, d)
         if not os.path.isdir(p):

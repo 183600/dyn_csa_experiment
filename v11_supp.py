@@ -22,13 +22,13 @@ V = V10.V
 L = V10.L
 REPO = V10.REPO
 DEVICE = L.DEVICE
-BUDGET_V11 = dict(L.BUDGET)
-BUDGET_V11.update(total_yuan=float(os.environ.get('V11_BUDGET_YUAN', 30.0)), price_per_hour=float(os.environ.get('V11_PRICE_PER_HOUR', 2.4)), state_path='autodl_budget_state_v11.json', already_spent_yuan=0.0)
+RUN_CAP_V11 = dict(L.RUN_CAP)
+RUN_CAP_V11.update(total_hours=float(os.environ.get('V11_CAP_HOURS', 30.0 / 2.4)), state_path='run_time_state_v11.json', already_hours=0.0)
 
 def make_guard():
-    g = L.CostGuard(BUDGET_V11)
+    g = L.TimeGuard(RUN_CAP_V11)
     if not g.state.get('sps_by_class'):
-        for src in ('autodl_budget_state_v10.json', 'autodl_budget_state_v9.json', 'autodl_budget_state_v8.json'):
+        for src in ('run_time_state_v10.json', 'run_time_state_v9.json', 'run_time_state_v8.json'):
             if os.path.exists(src):
                 try:
                     st = json.load(open(src, encoding='utf-8'))
@@ -40,7 +40,7 @@ def make_guard():
                     g.state['sps_by_class'] = sbc
                     g.state['norm_sps'] = norm
                     g._save()
-                    print(f'[v11] CostGuard calibrated from {src}')
+                    print(f'[v11] TimeGuard calibrated from {src}')
                     break
                 except Exception as e:
                     print(f'[v11] WARNING: cannot read {src} ({type(e).__name__}: {e}) — this run starts UNCALIBRATED (the first admission uses the conservative default)')
@@ -623,13 +623,13 @@ def run_full():
     atexit.register(lambda: sys.stdout.flush())
     guard = make_guard()
     guard.report()
-    print(f'[v11] headroom {max(guard.remaining_yuan(), 0.0) / guard.price:.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
+    print(f'[v11] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v11: supplementary driver (probe n=6 + crossover panels n=4 + d384 full-arm seed completion)')
     all_ok = True
     for pname, _kind, _payload, _seeds, est_h in PHASES:
-        rem = guard.remaining_yuan()
-        if rem < 1.0:
-            print(f'[v11] stopping before {pname}: headroom exhausted ({rem / guard.price:.2f} h)')
+        rem = guard.remaining_hours()
+        if rem < 1.0 / 2.4:
+            print(f'[v11] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
             break
         if not V.cuda_healthy():
             print(f'[v11] CUDA context poisoned before {pname} — aborting (re-run resumes).')

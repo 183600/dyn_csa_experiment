@@ -25,7 +25,7 @@ def _save_fig(fig, name, **kw):
 def load(panel):
     path = os.path.join(ROOT, panel, 'summary.json')
     if not os.path.exists(path):
-        raise FileNotFoundError(f'fuse_analysis: results panel `{panel}` is not present ({path}).\n  The repository tracks SOURCE only — `results_*/` directories, `REPORT*.md` and the budget ledgers are all build products and are not committed.\n  Regenerate the panel before running this zero-GPU analysis, e.g.:  python run_gapfill.py full   (or the driver that owns `{panel}`), then re-run `python fuse_analysis.py`.')
+        raise FileNotFoundError(f'fuse_analysis: results panel `{panel}` is not present ({path}).\n  The repository tracks SOURCE only — `results_*/` directories, `REPORT*.md` and the run-state files are all build products and are not committed.\n  Regenerate the panel before running this zero-GPU analysis, e.g.:  python run_gapfill.py full   (or the driver that owns `{panel}`), then re-run `python fuse_analysis.py`.')
     with open(path, encoding='utf-8') as f:
         return json.load(f)
 VARIANTS = {'hybrid_csa_dyn': ('results_lm_v4_abl', 'hybrid dyn (no-fuse)', False), 'hybrid_csa_dyn_fuse': ('results_lm_v4_abl', 'hybrid dyn + fuse', True), 'csa_dyn_fuse': ('results_lm_v4_abl', 'csa dyn + fuse', True), 'csa_dynamic': ('results_lm_v3_1500', 'csa dyn (no-fuse)', False)}
@@ -425,7 +425,7 @@ def main(argv=None):
         _in_panel = (a, b) == ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn')
         _seeds_ax = _hyb_seeds if _in_panel else _csa_seeds
         if not _seeds_ax:
-            print(f'[fuse_analysis] NOTE: skipping the {a} vs {b} trajectory panel — no seed passes the run_cfg/budget pairing gate, so pooling the arms would mix configurations')
+            print(f'[fuse_analysis] NOTE: skipping the {a} vs {b} trajectory panel — no seed passes the run_cfg/steps pairing gate, so pooling the arms would mix configurations')
             ax.set_visible(False)
             continue
         for v, color, lab in [(b, 'steelblue', f'{b} (no-fuse)'), (a, 'darkorange', f'{a} (fuse)')]:
@@ -466,7 +466,7 @@ def main(argv=None):
     _save_fig(fig, 'fuse_ppl_traj.png', dpi=140, bbox_inches='tight')
     plt.close(fig)
     if not _hyb_seeds:
-        print('[fuse_analysis] NOTE: skipping the boundary bar plot — no seed passes the run_cfg/budget pairing gate for the hybrid pair')
+        print('[fuse_analysis] NOTE: skipping the boundary bar plot — no seed passes the run_cfg/steps pairing gate for the hybrid pair')
     else:
         fig, axes = plt.subplots(1, 3, figsize=(15, 4.4))
         for ax, key, ttl in zip(axes, ['bnd_f1', 'bnd_prec', 'bnd_rec'], ['boundary F1 (tol=1)', 'precision', 'recall']):
@@ -596,10 +596,10 @@ def main(argv=None):
         _x_ppl_txt = f'，跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL' if _x_ppl is not None and np.isfinite(_x_ppl) else '，跨面板纯 CSA 对比未测量'
         _c3 = f'3. **PPL 同样不变**：两条验证 PPL 轨迹全程重叠（见 `fuse_ppl_traj.png`），同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')}）{_x_ppl_txt}——{_ppl_floor_txt}。\n'
     if _blk_stable and not _f1_sig and not _ppl_sig and (_f1_d is not None) and (_ppl_d is not None):
-        _c4 = '4. **结论写法（可直接引用）**：在 1500 步 budget 区间，用于边界检测的邻域表示融合是一个**惰性旋钮（inert knob）**——它既没有稳定改善动态分块的边界对齐质量，在上文第 2 条核验通过的范围内也没有改变块长分布，更没有转化为语言建模收益。这与全套实验的主结论一致：该 budget 下 LM 损失对分块质量不敏感（v4 全部消融臂停在同一 PPL 水平），且动态分块母轴本身在 4 个面板（核心表/20k 长跑/RoPE/scale）都与固定分块贴平。\n'
+        _c4 = '4. **结论写法（可直接引用）**：在 1500 步训练量区间，用于边界检测的邻域表示融合是一个**惰性旋钮（inert knob）**——它既没有稳定改善动态分块的边界对齐质量，在上文第 2 条核验通过的范围内也没有改变块长分布，更没有转化为语言建模收益。这与全套实验的主结论一致：该训练量下 LM 损失对分块质量不敏感（v4 全部消融臂停在同一 PPL 水平），且动态分块母轴本身在 4 个面板（核心表/20k 长跑/RoPE/scale）都与固定分块贴平。\n'
     else:
         _c4 = '4. **结论写法**：本轮产物**不满足**「惰性旋钮」的全部前置条件（第 1–3 条中至少一条报错、显著或越界）——不作「fuse 是惰性旋钮」的断言，以第 1–3 条各自的实测结果为准。\n'
-    lines.append(_c1 + _blk_line + _c3 + _c4 + '5. **遗留（如需更强断言）**：本分析限于 tol=1（落盘唯一容差）与 1500 步 budget 区间；其它容差或收敛区间（20k 步）的断言需要新 run。\n')
+    lines.append(_c1 + _blk_line + _c3 + _c4 + '5. **遗留（如需更强断言）**：本分析限于 tol=1（落盘唯一容差）与 1500 步训练量区间；其它容差或收敛区间（20k 步）的断言需要新 run。\n')
     md = '\n'.join(lines)
     L.atomic_write_text(os.path.join(OUT, 'fuse_report.md'), md)
     L.atomic_write_json(os.path.join(OUT, 'stats.json'), stats_out, indent=1)

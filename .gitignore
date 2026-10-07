@@ -45,7 +45,7 @@ results_*/
 t/
 analysis_*/
 REPORT*.md
-autodl_budget*.json
+run_time_state*.json
 
 # docs/ 白名单：只留 design_notes.md
 docs/*
@@ -53,9 +53,9 @@ docs/*
 /build_report_debug.json
 
 # 实验运行时状态
-autodl_budget_state.json
-.ipynb_checkpoints/autodl_budget_state-checkpoint.json
-autodl_budget*.json.lock
+run_time_state.json
+.ipynb_checkpoints/run_time_state-checkpoint.json
+run_time_state*.json.lock
 
 # 临时 / 日志
 *.log

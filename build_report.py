@@ -16,7 +16,7 @@ for _stream in (sys.stdout, sys.stderr):
         except (ValueError, OSError):
             pass
 REPO = os.path.dirname(os.path.abspath(__file__))
-PAIR_BUDGET_KEYS = ('steps', 'tokens_seen')
+PAIR_STEP_KEYS = ('steps', 'tokens_seen')
 _LOADED = {}
 
 def load(path, default=None):
@@ -273,7 +273,7 @@ def _pair_reason(ra, rb):
         return 'unverifiable run_cfg'
     if fa != fb:
         return 'different run_cfg'
-    bad = [k for k in PAIR_BUDGET_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
+    bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
     if not bad:
         return None
     absent = [k for k in bad if ra.get(k) is None and rb.get(k) is None]
@@ -307,13 +307,13 @@ def paired_row(a_records, b_records):
     if skipped:
         print(f'[report] {len(skipped)}/{len(common)} seed(s) NOT paired ({skipped}); excluded from the sign-flip test')
     if not dl:
-        print('[report] no usable pair left after the run_cfg/budget checks — comparison omitted rather than quoting a cross-config delta')
+        print('[report] no usable pair left after the run_cfg/steps checks — comparison omitted rather than quoting a cross-config delta')
         return None
     st = exact_signflip(dl)
     return (kept, dl, st)
 
 def sec_header():
-    return f'# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）\n> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n> 说明：本报告全部数字由 `build_report.py` 从 `results_*/`、`analysis_v7/`\n> 的落盘产物计算得到，无手填数值。\n\n本报告针对外部评审提出的 3 项 P0 阻断项与 P1/P2 缺口逐一补做实验。所有新变体\n（RoPE+QK-norm、dense-warmup、topk 扫描、m=1、长度外推）都经由 **完全相同的\n训练/优化器/LR/评测/CostGuard 代码路径**（对 `exp_lib` 的 `make_layer_cfgs`/\n`SmallGPT` 做 monkey-patch 注入），以保证可比性。长上下文证据采用\n**wikitext 长度外推探针**（train@512 → eval 512..4096）：合成 NIAH 探针在\n本模型规模（d=256/6 层）下两臂均停留在随机水平（无区分度），故以自然语料的\n长度外推替代，同样回应「无长上下文评测」的质疑。\n\n'
+    return f'# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）\n> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n> 说明：本报告全部数字由 `build_report.py` 从 `results_*/`、`analysis_v7/`\n> 的落盘产物计算得到，无手填数值。\n\n本报告针对外部评审提出的 3 项 P0 阻断项与 P1/P2 缺口逐一补做实验。所有新变体\n（RoPE+QK-norm、dense-warmup、topk 扫描、m=1、长度外推）都经由 **完全相同的\n训练/优化器/LR/评测/TimeGuard 代码路径**（对 `exp_lib` 的 `make_layer_cfgs`/\n`SmallGPT` 做 monkey-patch 注入），以保证可比性。长上下文证据采用\n**wikitext 长度外推探针**（train@512 → eval 512..4096）：合成 NIAH 探针在\n本模型规模（d=256/6 层）下两臂均停留在随机水平（无区分度），故以自然语料的\n长度外推替代，同样回应「无长上下文评测」的质疑。\n\n'
 _MODULE_NOTE = '本模块只读：从 `results_*/` 与 `analysis_v7/` 的落盘产物计算\n报告全文，不 import torch（也不 import exp_lib）。上面那段\n模块说明文字以 `_MODULE_NOTE` 命名保留，不参与报告正文的渲染。'
 
 def sec_p0r():
@@ -380,9 +380,9 @@ def sec_p0r():
                 _mt_gap = g_abs_m
             if _mt_gap > 0:
                 if _mt_sig:
-                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍显著落后（{_mt_stat}），**P0-3 的混淆假设被证伪**，反而**强化**了论文的负结果——sparse 在该 budget 下的落后是机制性的。'
+                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍显著落后（{_mt_stat}），**P0-3 的混淆假设被证伪**，反而**强化**了论文的负结果——sparse 在该训练量下的落后是机制性的。'
                 else:
-                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）方向仍为落后（{_mt_stat}），**P0-3 的混淆假设被证伪**——sparse 在该 budget 下的落后是机制性的；其显著性按配对检验的实际分辨率表述，不作超出分辨率的显著性主张。'
+                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）方向仍为落后（{_mt_stat}），**P0-3 的混淆假设被证伪**——sparse 在该训练量下的落后是机制性的；其显著性按配对检验的实际分辨率表述，不作超出分辨率的显著性主张。'
             else:
                 _p0r_concl = f'**结论**：{_gain_txt}；但参数对齐的 absPE 数字中 `csa_fixed` 不再落后 `full_matched`（Δ={_mt_gap:+.2f} PPL，{_mt_stat}）——与原论断方向相反，**P0-3 的混淆假设在本轮未被证伪**，PE 错配不能排除在 sparse 的差距之外。'
         else:
@@ -495,7 +495,7 @@ def sec_p0w():
                     continue
                 _dd.append(_wm[sd]['ppl'] - _bm[sd]['ppl'])
             if _gated:
-                print(f'[report] sec_p0w `{v}` warm={w}: {_gated}/{len(_shared)} seed(s) NOT paired (run_cfg/budget gate); excluded from the sign-flip test')
+                print(f'[report] sec_p0w `{v}` warm={w}: {_gated}/{len(_shared)} seed(s) NOT paired (run_cfg/steps gate); excluded from the sign-flip test')
             _st = exact_signflip(_dd) if _dd else None
             if _st is None:
                 continue
@@ -534,7 +534,7 @@ def sec_p0e():
     if not d:
         return '## P0-2 渐近线是否反演（40k 长跑）— （无结果）\n\n'
     s = summary('results_lm_v7_long40')
-    lines = ['## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / ~246M tokens）', '', '**评审论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等 budget 下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (mean±std) | n | params |', '|---|---|---|---|']
+    lines = ['## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / ~246M tokens）', '', '**评审论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (mean±std) | n | params |', '|---|---|---|---|']
     for v in sorted(d):
         r = d[v]
         lines.append(f'| `{v}` | {fm(r.get('ppl_mean'))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
@@ -590,7 +590,7 @@ def sec_p0e():
                 else:
                     _pair_gated.append((_sd, _why))
             if _pair_gated:
-                print(f'[report] sec_p0e: {len(_pair_gated)} shared seed(s) FAILED the run_cfg/budget gate ({sorted({w for _s, w in _pair_gated})}) and are excluded from the paired tail-gap — the pairing rules are the same as every other section')
+                print(f'[report] sec_p0e: {len(_pair_gated)} shared seed(s) FAILED the run_cfg/steps gate ({sorted({w for _s, w in _pair_gated})}) and are excluded from the paired tail-gap — the pairing rules are the same as every other section')
             _unpaired_gap = not _paired
             if _unpaired_gap:
                 print('[report] sec_p0e: the two arms share NO seed on the tail evaluation steps — the tail-gap slope and extrapolation below use the UNPAIRED per-step mean gap (each step averaged over whichever seeds measured it), not a paired per-seed difference; read it as indicative only')
@@ -642,7 +642,7 @@ def sec_p0e():
                 if steps[-1] < x0 <= steps[-1] * 10:
                     _g20v = gaps.get(20000)
                     _g20c = f'由 20k 的 **{_g20v:+.1f}** ' if isinstance(_g20v, (int, float)) and math.isfinite(_g20v) else ''
-                    verdict = f'- 按尾段斜率线性外推，差距将在 ~{x0 / 1000:.0f}k 步附近归零（外推仅供参考：学习率已 cosine 衰减到底，后期斜率通常进一步放缓）。\n\n**结论**：{_lastk:g}k 步内未发生反演，但差距仍在缓慢收窄。**保守表述**：「等 token budget 下 CSA 收敛更慢，终点差距 {_g20c}收窄到 {_lastk:g}k 的 {g_last:+.1f}，未见交叉」。是否最终追平属外推，不属证据。'
+                    verdict = f'- 按尾段斜率线性外推，差距将在 ~{x0 / 1000:.0f}k 步附近归零（外推仅供参考：学习率已 cosine 衰减到底，后期斜率通常进一步放缓）。\n\n**结论**：{_lastk:g}k 步内未发生反演，但差距仍在缓慢收窄。**保守表述**：「等 token 量下 CSA 收敛更慢，终点差距 {_g20c}收窄到 {_lastk:g}k 的 {g_last:+.1f}，未见交叉」。是否最终追平属外推，不属证据。'
                 else:
                     verdict = f'- 线性外推的交叉点在 ~{x0 / 1000:.0f}k 步，超出可信外推范围。\n\n**结论**：{_lastk:g}k 步（~{_tok_m} tokens）仍未追平——终点差距 **{g_last:+.1f} PPL**。差距收窄速度在尾段为 {abs(slope):.2f} PPL/1k，即每多训 10k 步约收窄 {abs(slope) * 10:.0f} PPL。**「渐近线更差」在实验可达范围内成立**，更精确的措辞是「等训练量下收敛更慢且差距长期存在」。'
             else:
@@ -702,7 +702,7 @@ def sec_p1t():
     _grid = ['csa_fix_m1', 'csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512']
     missing = [v for v in _grid if v not in _measured and v not in failed]
     for v in missing:
-        print(f'[report] sec_p1t: sweep point `{v}` has NO record in results_lm_v7_seq2k (never ran, budget-skipped, or truncated) — it is absent from the table and is listed below')
+        print(f'[report] sec_p1t: sweep point `{v}` has NO record in results_lm_v7_seq2k (never ran, cap-skipped, or truncated) — it is absent from the table and is listed below')
     if failed:
         lines += ['', '**未完成的扫描点（如实记录）**：', '']
         for v in sorted(failed):
@@ -730,9 +730,9 @@ def sec_p1t():
             lines.append(f'- topk={k}（选择率 {k / 512 * 100:.5g}%）：{m:.2f} PPL')
         lines.append('')
         if mono:
-            lines.append('PPL 随选择率单调下降（选择越多越好），说明在 seq 2048 / 1500 步的受控 budget 下未出现「少选反而优」的甜点——检索质量不足时，选择率是硬上限。')
+            lines.append('PPL 随选择率单调下降（选择越多越好），说明在 seq 2048 / 1500 步的受控训练量下未出现「少选反而优」的甜点——检索质量不足时，选择率是硬上限。')
         else:
-            lines.append('存在非单调点：存在一个「少选反而更好/更差」的转折（见上表），提示 topk 存在 budget 相关的最优值。')
+            lines.append('存在非单调点：存在一个「少选反而更好/更差」的转折（见上表），提示 topk 存在训练量相关的最优值。')
         lines.append('')
     m1 = _agg_entry(d, 'csa_fix_m1')
     t8 = _agg_entry(d, 'csa_fixed_topk8')
@@ -759,7 +759,7 @@ def sec_p1t():
                 continue
             _c3.append(sk)
         if _rej3:
-            print(f'[report] sec_p1t: {_rej3} three-way shared seed(s) rejected by the run_cfg/budget gate — excluded from the per-seed direction count')
+            print(f'[report] sec_p1t: {_rej3} three-way shared seed(s) rejected by the run_cfg/steps gate — excluded from the per-seed direction count')
         _m1_s = {sk: float(_m1_r[sk]['ppl']) for sk in _c3}
         _t8_s = {sk: float(_t8_r[sk]['ppl']) for sk in _c3}
         _t32_s = {sk: float(_t32_r[sk]['ppl']) for sk in _c3}
@@ -770,9 +770,9 @@ def sec_p1t():
         else:
             _dir3 = '（无通过门禁的三方公共 seed，逐 seed 方向不可核验）'
         if m1m > t8m and m1m > t32m:
-            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最差的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩并没有拯救 sparse 臂——在 seq 2048 / 1500 步的受控 budget 下，**压缩不是瓶颈**，评审「缺 m=1 对照」的质疑得到直接回答（方向与整体负结果一致）。')
+            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最差的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩并没有拯救 sparse 臂——在 seq 2048 / 1500 步的受控训练量下，**压缩不是瓶颈**，评审「缺 m=1 对照」的质疑得到直接回答（方向与整体负结果一致）。')
         elif m1m < t8m and m1m < t32m:
-            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最好的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩反而占优——在 seq 2048 / 1500 步的受控 budget 下，**压缩是当前的瓶颈之一**，评审「缺 m=1 对照」的质疑得到直接回答。')
+            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最好的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩反而占优——在 seq 2048 / 1500 步的受控训练量下，**压缩是当前的瓶颈之一**，评审「缺 m=1 对照」的质疑得到直接回答。')
         else:
             lines.append(f'1. m=1（{fm(m1m)}）介于 topk8（{fm(t8m)}）与 topk32（{fm(t32m)}）之间，三点排序非单调{_dir3}；评审「缺 m=1 对照」的质疑得到直接回答，但压缩是否瓶颈需结合显著性判断，此处只作方向性表述。')
     elif _m1_ok:

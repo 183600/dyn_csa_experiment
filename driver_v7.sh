@@ -4,11 +4,9 @@ export V7_NO_SHUTDOWN=1
 export PYTHONUNBUFFERED=1
 PY=/root/miniconda3/bin/python
 safety_net() {
-  if ! pgrep -f "bonus_watcher\.sh" > /dev/null; then
-    echo "=== [driver] no bonus watcher alive -> safety shutdown in 60s (cancel: kill $$ now) ==="
-    sleep 60
-    pgrep -f "bonus_watcher\.sh" > /dev/null || shutdown -h +1
-  fi
+  echo "=== [driver] safety shutdown in 60s (cancel: kill $$ now) ==="
+  sleep 60
+  shutdown -h +1
 }
 trap safety_net EXIT
 all_ok=1
@@ -19,7 +17,7 @@ for phase in P0E P2S P1L P1T; do
   echo "=== [driver] $(date '+%F %T') phase $phase END rc=$rc ==="
   $PY mon3.py 2>/dev/null | tail -20 || true
   if [ "$rc" -ne 0 ]; then
-    echo "=== [driver] phase $phase failed (rc=$rc) -> stopping before spending on later phases ==="
+    echo "=== [driver] phase $phase failed (rc=$rc) -> stopping before running later phases ==="
     all_ok=0
     break
   fi
@@ -75,6 +73,5 @@ if [ "$_pushed" -ne 1 ]; then
   exit 1
 fi
 echo "=== [driver] ALL DONE $(date '+%F %T') ==="
-# the bonus watcher owns the shutdown when it is alive; if it is not running
-# (crashed / never launched), the EXIT trap shuts the instance down here instead of
-# idling forever
+# the EXIT trap shuts the instance down after the driver exits, so the box
+# never idles

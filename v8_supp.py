@@ -18,20 +18,20 @@ import v7_supp as V
 L = V.L
 REPO = V.REPO
 DEVICE = L.DEVICE
-BUDGET_V8 = dict(L.BUDGET)
-BUDGET_V8.update(total_yuan=float(os.environ.get('V8_BUDGET_YUAN', 45.0)), price_per_hour=float(os.environ.get('V8_PRICE_PER_HOUR', 2.4)), state_path='autodl_budget_state_v8.json', already_spent_yuan=0.0)
+RUN_CAP_V8 = dict(L.RUN_CAP)
+RUN_CAP_V8.update(total_hours=float(os.environ.get('V8_CAP_HOURS', 45.0 / 2.4)), state_path='run_time_state_v8.json', already_hours=0.0)
 
 def make_guard():
-    g = L.CostGuard(BUDGET_V8)
-    if not g.state.get('sps_by_class') and os.path.exists('autodl_budget_state_v7.json'):
+    g = L.TimeGuard(RUN_CAP_V8)
+    if not g.state.get('sps_by_class') and os.path.exists('run_time_state_v7.json'):
         try:
-            st = json.load(open('autodl_budget_state_v7.json', encoding='utf-8'))
+            st = json.load(open('run_time_state_v7.json', encoding='utf-8'))
             g.state['sps_by_class'] = st.get('sps_by_class', {})
             g.state['norm_sps'] = st.get('norm_sps')
             g._save()
-            print('[v8] CostGuard calibrated from the v7 speed ledger')
+            print('[v8] TimeGuard calibrated from the v7 speed log')
         except Exception as _e:
-            print(f'[v8] WARNING: could not calibrate CostGuard from the v7 speed ledger ({type(_e).__name__}: {_e}); falling back to the built-in per-class defaults — budget estimates are NOMINAL, not calibrated')
+            print(f'[v8] WARNING: could not calibrate TimeGuard from the v7 speed log ({type(_e).__name__}: {_e}); falling back to the built-in per-class defaults — time estimates are NOMINAL, not calibrated')
     return g
 P1S_CFG = dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full', 'full_matched', 'hybrid_dynamic'])
 P2R_CFG = dict(L.RUN_LONG, outdir='results_lm_v8_rope20k', variants=['csa_fixed_rope', 'full_rope'], matched=set(V.PARAM_MATCHED_V7), mlp_match_ref='csa_fixed_rope')
@@ -80,7 +80,7 @@ def _add_paired(comparisons, name, panel, a, b, who='', outdir=None):
     if skipped:
         print(f'[stats] {who}{name}: {len(skipped)}/{len(common)} seed(s) NOT paired — {sorted(why)}; excluded from the test')
     if not dl:
-        return _omit(f'no seed survived the run_cfg/budget checks ({len(common)} shared, {len(skipped)} rejected: {sorted(why)})')
+        return _omit(f'no seed survived the run_cfg/steps checks ({len(common)} shared, {len(skipped)} rejected: {sorted(why)})')
     res = V.exact_sign_permutation(dl)
     res['seeds'] = [s for s in common if s not in set(skipped)]
     res['n_skipped_config_mismatch'] = len(skipped)
@@ -160,13 +160,13 @@ def schedule_shutdown(delay_s=120):
 def run_full():
     guard = make_guard()
     guard.report()
-    print(f'[v8] headroom {max(guard.remaining_yuan(), 0.0) / guard.price:.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
+    print(f'[v8] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v8: supplementary driver (P1S scale seed completion + P2R RoPE long run)')
     all_ok = True
     for pname, _cfg, _seeds, est_h in PHASES:
-        rem = guard.remaining_yuan()
-        if rem < 1.0:
-            print(f'[v8] stopping before {pname}: headroom exhausted ({rem / guard.price:.2f} h)')
+        rem = guard.remaining_hours()
+        if rem < 1.0 / 2.4:
+            print(f'[v8] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
             break
         if not V.cuda_healthy():
             print(f'[v8] CUDA context poisoned before {pname} — aborting (re-run resumes).')
@@ -205,7 +205,7 @@ def run_smoke():
         gc.collect()
         if DEVICE.type == 'cuda':
             torch.cuda.empty_cache()
-    print('[smoke] 2) 60-step csa_fixed_rope probe (LONG recipe), for CostGuard calibration')
+    print('[smoke] 2) 60-step csa_fixed_rope probe (LONG recipe), for TimeGuard calibration')
     guard = make_guard()
     t_data = time.time()
     train_ids, val_batch, vocab, _, vb = L.load_wikitext(512, 1000000)

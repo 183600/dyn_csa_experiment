@@ -51,13 +51,13 @@ def _install_ckpt_patch():
     L.Block.forward = _v9_block_forward
     V7.BlockRoPE.forward = _v9_blockrope_forward
     _CKPT_PATCHED = True
-BUDGET_V9 = dict(L.BUDGET)
-BUDGET_V9.update(total_yuan=float(os.environ.get('V9_BUDGET_YUAN', 25.0)), price_per_hour=float(os.environ.get('V9_PRICE_PER_HOUR', 2.4)), state_path='autodl_budget_state_v9.json', already_spent_yuan=0.0)
+RUN_CAP_V9 = dict(L.RUN_CAP)
+RUN_CAP_V9.update(total_hours=float(os.environ.get('V9_CAP_HOURS', 25.0 / 2.4)), state_path='run_time_state_v9.json', already_hours=0.0)
 
 def make_guard():
-    g = L.CostGuard(BUDGET_V9)
+    g = L.TimeGuard(RUN_CAP_V9)
     if not g.state.get('sps_by_class'):
-        for src in ('autodl_budget_state_v8.json', 'autodl_budget_state_v7.json'):
+        for src in ('run_time_state_v8.json', 'run_time_state_v7.json'):
             if os.path.exists(src):
                 try:
                     st = json.load(open(src, encoding='utf-8'))
@@ -69,7 +69,7 @@ def make_guard():
                     g.state['sps_by_class'] = sbc
                     g.state['norm_sps'] = norm
                     g._save()
-                    print(f'[v9] CostGuard calibrated from {src}')
+                    print(f'[v9] TimeGuard calibrated from {src}')
                     break
                 except Exception as e:
                     print(f'[v9] WARNING: cannot read {src} ({type(e).__name__}: {e}) — this run starts UNCALIBRATED (the first admission uses the conservative default)')
@@ -147,7 +147,7 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
     if skipped:
         print(f'[stats] {who}{name}: {len(skipped)}/{len(common)} seed(s) NOT paired — {sorted(why)}; excluded from the test')
     if not dl:
-        return _omit(f'no seed survived the run_cfg/budget checks ({len(common)} shared, {len(skipped)} rejected: {sorted(why)})')
+        return _omit(f'no seed survived the run_cfg/steps checks ({len(common)} shared, {len(skipped)} rejected: {sorted(why)})')
     res = V.exact_sign_permutation(dl)
     res['seeds'] = [s for s in common if s not in set(skipped)]
     res['n_skipped_config_mismatch'] = len(skipped)
@@ -357,13 +357,13 @@ def schedule_shutdown(delay_s=120):
 def run_full():
     guard = make_guard()
     guard.report()
-    print(f'[v9] headroom {max(guard.remaining_yuan(), 0.0) / guard.price:.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
+    print(f'[v9] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v9: supplementary driver (P2T topk sweep completion @bs1 + P2S3 RoPE-20k third seed)')
     all_ok = True
     for pname, _cfg, _seeds, est_h in PHASES:
-        rem = guard.remaining_yuan()
-        if rem < 1.0:
-            print(f'[v9] stopping before {pname}: headroom exhausted ({rem / guard.price:.2f} h)')
+        rem = guard.remaining_hours()
+        if rem < 1.0 / 2.4:
+            print(f'[v9] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
             break
         if not V.cuda_healthy():
             print(f'[v9] CUDA context poisoned before {pname} — aborting (re-run resumes).')

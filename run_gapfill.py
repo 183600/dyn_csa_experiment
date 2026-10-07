@@ -352,7 +352,7 @@ def schedule_shutdown(delay_s=90):
     print(f'[v6] AutoDL instance will SHUT DOWN in {delay_s}s. (cancel: pkill -f {marker})')
 
 def run_full():
-    guard = L.CostGuard(L.BUDGET)
+    guard = L.TimeGuard(L.RUN_CAP)
     guard.report()
     _synth_summary, _long_snapshot = synthesize_long_summary()
     if _long_snapshot:

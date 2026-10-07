@@ -37,9 +37,9 @@ finally:
     subprocess.check_call = _REAL_CHECK_CALL
 DEVICE = L.DEVICE
 OVERLAP = L.OVERLAP
-BUDGET_V7 = dict(L.BUDGET)
-BUDGET_V7.update(total_yuan=float(os.environ.get('V7_BUDGET_YUAN', 107.0)), price_per_hour=float(os.environ.get('V7_PRICE_PER_HOUR', 2.4)), state_path='autodl_budget_state_v7.json')
-BUDGET_V7['already_spent_yuan'] = 0.0
+RUN_CAP_V7 = dict(L.RUN_CAP)
+RUN_CAP_V7.update(total_hours=float(os.environ.get('V7_CAP_HOURS', 107.0 / 2.4)), state_path='run_time_state_v7.json')
+RUN_CAP_V7['already_hours'] = 0.0
 _ROPE_CS_CACHE = {}
 _ROPE_INV_CACHE = {}
 
@@ -546,12 +546,12 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     for step in range(steps):
         if deadline_ts is not None and time.time() > deadline_ts:
             wall = time.time() - t0
-            print(f'[{variant} seed={seed} warm={warm_steps}] BUDGET deadline reached after {step} steps ({wall / 60:.1f} min) — stopping; this cell produced NO measurement and will be retried.')
+            print(f'[{variant} seed={seed} warm={warm_steps}] time-cap deadline reached after {step} steps ({wall / 60:.1f} min) — stopping; this cell produced NO measurement and will be retried.')
             del model, opt, bpe, decay, ndecay, dpar, x, y, logits, ce, loss
             gc.collect()
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
-            return {'budget_truncated': True, 'steps_done': step, 'train_time_s': wall}
+            return {'cap_truncated': True, 'steps_done': step, 'train_time_s': wall}
         if warm_steps > 0 and step == warm_steps:
             for _blk in model.blocks:
                 _blk.attn._dense_warmup = False
@@ -585,12 +585,12 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             print(f'  step {step:5d}  loss {float(losses[-1]):.4f}  lr {opt.param_groups[0]['lr']:.2e}  dense={getattr(model.blocks[0].attn, '_dense_warmup', False)}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
     wall = time.time() - t0
     if deadline_ts is not None and time.time() > deadline_ts:
-        print(f'[{variant} seed={seed} warm={warm_steps}] BUDGET deadline reached before the final evaluation ({wall / 60:.1f} min) — truncating; this cell produced NO measurement and will be retried.')
+        print(f'[{variant} seed={seed} warm={warm_steps}] time-cap deadline reached before the final evaluation ({wall / 60:.1f} min) — truncating; this cell produced NO measurement and will be retried.')
         del model, opt, bpe, decay, ndecay, dpar, x, y, logits, ce, loss
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
-        return {'budget_truncated': True, 'steps_done': steps, 'train_time_s': wall}
+        return {'cap_truncated': True, 'steps_done': steps, 'train_time_s': wall}
     del x, y, logits, ce, loss
     ppl = L.eval_ppl(model, val_batch, device)
     stats = L.compression_report(model, val_batch, device, val_bnd=val_bnd)
@@ -659,7 +659,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                 if guard is not None:
                     est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
                     if not guard.can_start(est):
-                        print(f'[budget] SKIP {key}: projected {est / 3600:.2f} h would pass the configured cap')
+                        print(f'[cap] SKIP {key}: projected {est / 3600:.2f} h would pass the configured cap')
                         continue
                 t_run = time.time()
                 _deadline = None
@@ -668,8 +668,8 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                 rec = None
                 try:
                     rec = train_warmup(v, train_ids, val_batch, vocab, seed=seed, warm_steps=warm, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=_wu, comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=_deadline)
-                    if rec.get('budget_truncated'):
-                        print(f'[budget] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`) and the key is left ABSENT. Raise the budget and re-run to retry this cell.')
+                    if rec.get('cap_truncated'):
+                        print(f'[cap] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`) and the key is left ABSENT. Raise the cap and re-run to retry this cell.')
                     else:
                         summary[key] = rec
                         summary[key]['_code'] = CKPT_CODE
@@ -695,7 +695,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
                     torch.cuda.empty_cache()
     if stale_dropped:
         _still = [k for k in stale_dropped if k not in summary]
-        print(f'\n[resume] {len(stale_dropped)} warmup cell(s) held a non-current record and were dropped before retraining; {len(_still)} of them produced NO measurement this pass (budget gate / truncation / failure) and are ABSENT from {spath}:')
+        print(f'\n[resume] {len(stale_dropped)} warmup cell(s) held a non-current record and were dropped before retraining; {len(_still)} of them produced NO measurement this pass (cap gate / truncation / failure) and are ABSENT from {spath}:')
         for _k in _still:
             print(f'    {_k}')
         if len(_still) != len(stale_dropped):
@@ -985,8 +985,8 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
             why = '; '.join(sorted(mismatch_fields)) if mismatch_fields else 'different run_cfg'
             print(f'[stats] {name}: {len(skipped)} seed(s) NOT paired — the two sides have {why}; excluded from the test')
         if not dl:
-            print(f'[stats] {name}: NO usable pair after the run_cfg/budget checks — comparison omitted rather than quoting a cross-configuration delta')
-            out_d['comparisons'][name] = {'omitted': 'no usable pair after the run_cfg/budget checks', 'n': 0, 'n_skipped_config_mismatch': len(skipped), 'n_unstamped': unstamped}
+            print(f'[stats] {name}: NO usable pair after the run_cfg/steps checks — comparison omitted rather than quoting a cross-configuration delta')
+            out_d['comparisons'][name] = {'omitted': 'no usable pair after the run_cfg/steps checks', 'n': 0, 'n_skipped_config_mismatch': len(skipped), 'n_unstamped': unstamped}
             continue
         res = exact_sign_permutation(dl)
         res['n_skipped_config_mismatch'] = len(skipped)
@@ -1110,7 +1110,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 if guard is not None:
                     est = guard.estimate_seconds(n_steps, d=256, n_layers=6, seq_len=512, batch_size=12)
                     if not guard.can_start(est):
-                        print(f'[budget] SKIP niah train {v} s{seed}')
+                        print(f'[cap] SKIP niah train {v} s{seed}')
                         continue
                 t0 = time.time()
                 cfgs = L.make_layer_cfgs(6, v)
@@ -1136,7 +1136,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 for step in range(n_steps):
                     if _deadline is not None and time.time() > _deadline:
                         wall = time.time() - t0
-                        print(f'[budget] niah train {v} s{seed} hit the deadline after {step}/{n_steps} steps ({wall / 60:.1f} min) — the cell is abandoned WITHOUT a checkpoint, so it retrains from scratch on the next pass rather than being probed from a half-trained model.')
+                        print(f'[cap] niah train {v} s{seed} hit the deadline after {step}/{n_steps} steps ({wall / 60:.1f} min) — the cell is abandoned WITHOUT a checkpoint, so it retrains from scratch on the next pass rather than being probed from a half-trained model.')
                         niah_truncated = True
                         break
                     x, y = _batch()
@@ -1326,7 +1326,7 @@ def run_lenphase(payload, guard=None, label=''):
                 if guard is not None:
                     est = guard.estimate_seconds(steps, d=256, n_layers=6, seq_len=train_len, batch_size=12)
                     if not guard.can_start(est):
-                        print(f'[budget] SKIP lenphase train {v} s{seed}')
+                        print(f'[cap] SKIP lenphase train {v} s{seed}')
                         continue
                 t0 = time.time()
                 L.set_seed(seed)
@@ -1335,8 +1335,8 @@ def run_lenphase(payload, guard=None, label=''):
                     _train_cache[0] = L.load_wikitext(train_len, 8000000)[0]
                 train_ids = _train_cache[0]
                 _tr = L.train_variant(v, train_ids, None, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=12, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=guard.deadline_ts() if guard is not None else None, return_model=True)
-                if _tr.get('budget_truncated'):
-                    print(f'  [p1l-train] {v:18s} s{seed} TRUNCATED by budget — not saved, will retry')
+                if _tr.get('cap_truncated'):
+                    print(f'  [p1l-train] {v:18s} s{seed} TRUNCATED by the cap — not saved, will retry')
                     _sd_tr = _tr.get('steps_done')
                     if guard is not None:
                         guard.record_run(time.time() - t0, _sd_tr if _sd_tr else 0, 256, 6, train_len, 12)
@@ -1495,15 +1495,15 @@ def cuda_healthy():
         return False
 
 def run_full():
-    guard = L.CostGuard(BUDGET_V7)
+    guard = L.TimeGuard(RUN_CAP_V7)
     guard.report()
-    print(f'[v7] headroom {max(guard.remaining_yuan(), 0.0) / guard.price:.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
+    print(f'[v7] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v7: supplementary experiment library (RoPE+QK-norm, dense->sparse warmup, NIAH probe, topk sweep, analytic FLOPs)')
     all_ok = True
     for pname, kind, payload, est_h in PHASES:
-        rem = guard.remaining_yuan()
-        if rem < 1.0:
-            print(f'[v7] stopping before {pname}: headroom exhausted ({rem / guard.price:.2f} h)')
+        rem = guard.remaining_hours()
+        if rem < 1.0 / 2.4:
+            print(f'[v7] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
             break
         if not cuda_healthy():
             print(f'[v7] CUDA context poisoned before {pname} -- restart the process to continue (resume will skip completed runs).  Aborting phase loop.')
@@ -1593,7 +1593,7 @@ if __name__ == '__main__':
             flops_analysis()
             bootstrap_report(['results_lm_v7_warmup', 'results_lm_v7_rope', 'results_lm_v7_long40', 'results_lm_v7_seq2k', 'results_lm_v3_1500'])
         elif mode == 'phase':
-            run_phase(sys.argv[2], L.CostGuard(BUDGET_V7))
+            run_phase(sys.argv[2], L.TimeGuard(RUN_CAP_V7))
             git_push(f'v7: phase {sys.argv[2]} results')
         else:
             run_full()
