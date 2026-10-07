@@ -8,11 +8,10 @@ needed to reproduce the results on a machine of your own.
 ## Repository layout
 
 仓库只保留**源码、驱动脚本与设计文档**。所有实验结果目录（`results_*/`）、
-零 GPU 分析目录（`analysis_*/`）、逐版报告（`REPORT*.md`）与记账账本
-（`autodl_budget*.json`）都**不入库**——它们由下面的驱动脚本在跑实验的
-机器上重新生成，需要时本地复现即可（见下一节的命令）。`.gitignore` 已把这几类
-路径挡在仓库外（记账账本按前缀匹配，因为 `CostGuard.state_path` 由调用方
-命名；`docs/` 只保留 `design_notes.md`）。
+零 GPU 分析目录（`analysis_*/`）、逐版报告（`REPORT*.md`）与运行状态文件
+都**不入库**——它们由下面的驱动脚本在跑实验的机器上重新生成，需要时本地
+复现即可（见下一节的命令）。`.gitignore` 已把这几类路径挡在仓库外（`docs/`
+只保留 `design_notes.md`）。
 
 | path | what |
 |---|---|
@@ -34,11 +33,11 @@ needed to reproduce the results on a machine of your own.
 
 ### 重新生成实验产物
 
-结果目录、报告与记账账本都不在仓库里。要重新得到它们：
+结果目录与报告都不在仓库里。要重新得到它们：
 
 ```bash
 python run_gapfill.py smoke      # 端到端自检，零 GPU 消耗
-python run_gapfill.py full       # v6 主实验（受运行时上限约束，账本见上）
+python run_gapfill.py full       # v6 主实验（受运行时上限约束）
 python v7_supp.py ...            # 各版本补充实验，子命令见对应脚本的 docstring
 python build_report.py           # 从落盘的 results_*/ + analysis_*/ 重建报告
 ```
@@ -77,7 +76,7 @@ same command skips completed `variant::seed` pairs):
 | P-CORE | `results_lm_v3_1500` | 9-variant core table, 1500 steps x 3 seeds |
 | P-SCALE | `results_lm_v5_scale` | d=384 / 8 layers / seq-1024 probe, 5 variants x 2 seeds x 4000 steps |
 
-`full` books against its own usage ledger described at the end of this section.
+`full` is bounded by the run-time cap described at the end of this section.
 
 ### v11 statistical close-out suite
 
@@ -92,8 +91,7 @@ checkpoints whose code stamp is still current), P4MP (probe resume for
 the same seed set, eval-only, stale cells re-measured), P4SS/P4SL
 (crossover panels seeds 0-3, same resume rule), P4F (d=384
 `csa_fixed`/`full` seeds 0-3 under one config, so the panel pairs at
-n=4). It books against its own ledger; `V11_*` env vars mirror the
-earlier ones.
+n=4).
 
 ### v10 mechanism / scaling / stats suite
 
@@ -111,8 +109,7 @@ contexts, clean 512-token target, learned-selection vs dense vs
 random-indexer vs see-everything arms), P3T (topk sweep seeds 2/3 → n=4),
 P3SS/P3SL (d=128/4L 8000-step and d=512/10L 4000-step crossover panels).
 See `docs/design_notes.md` for the design rationale behind the
-paired-corruption protocol and the pre-registered crossover criterion. v10
-books against its own ledger; `V10_*` env vars mirror the earlier ones.
+paired-corruption protocol and the pre-registered crossover criterion.
 
 ### v8 / v9 close-out suites
 
@@ -129,8 +126,7 @@ python v9_supp.py report          # rebuild REPORT_v9.md from disk (zero GPU)
 ```
 
 See `docs/design_notes.md` for the design rationale
-and the pairing/measurability rules these phases rely on. v8/v9 book against their own ledgers;
-`V8_*` / `V9_*` env vars mirror the v6/v7 ones.
+and the pairing/measurability rules these phases rely on.
 
 ### v7 reviewer-response suite
 
@@ -148,10 +144,10 @@ python v7_supp.py phase P1T   # seq-2048 topk sweep
 python build_report.py        # regenerate REPORT_v7.md from artifacts (zero GPU)
 ```
 
-The CostGuard (`exp_lib.py`, class `CostGuard`) meters accelerator time to a
-local ledger, refuses to start runs that would pass the configured cap times
-a safety margin, and hard-truncates a run at the absolute cap. Edit `BUDGET`
-in `exp_lib.py` to match the rented instance. When all phases finish the
+Every driver meters its own accelerator time against a configured run-time
+cap: it refuses to start a run that would pass the cap, and hard-truncates a
+run that reaches it mid-flight — a truncated cell leaves no partial
+measurement and is retried on the next pass. When all phases finish the
 script pushes and shuts the instance down (cancel with
 `pkill -f v6autoshutdown`; suppress with `V6_NO_SHUTDOWN=1`, pushes with
 `V6_NO_PUSH=1`).
