@@ -269,12 +269,13 @@ class HybridAttentionRoPE(L.HybridAttention):
         _k_stack = torch.cat([k_blk_r, k_sw_r], 0)
         _v_stack = torch.cat([v_blk, v_sw], 0)
         _MINL = torch.finfo(k_blk.dtype).min
-        _both_all = torch.cat([topk_idx, (_wi_all + _n_blk).to(torch.int32)], 1).to(torch.int32)
+        _both_all = torch.cat([topk_idx, L._window_block_offset(T, w, _n_blk, dev)], 1).to(torch.int32)
+        topk_l = topk_idx if topk_idx.dtype == torch.int64 else topk_idx.long()
+        _sel_all = pos_all[:, None] > last_tok[topk_l]
         for s in range(0, T, q_chunk):
             e = min(s + q_chunk, T)
-            pos = pos_all[s:e]
-            ib = topk_idx[s:e].long()
-            sel = pos[:, None] > last_tok[ib]
+            ib = topk_l[s:e]
+            sel = _sel_all[s:e]
             _keep = sel_valid[s:e] if sel_valid is not None else None
             if ib.shape[1] > 1:
                 _ddk = L.first_occurrence_mask(ib)
@@ -286,14 +287,16 @@ class HybridAttentionRoPE(L.HybridAttention):
             Kset = L._take_2d(_k_stack, both)
             Vset = L._take_2d(_v_stack, both)
             valid = torch.cat([sel, wvalid], 1)
-            raw_logits = torch.einsum('qhd,qmhd->qhm', qr[s:e], Kset) * scale
+            raw_logits = torch.einsum('qhd,qmhd->qhm', qr[s:e], Kset)
+            raw_logits.mul_(scale)
             if soft is None:
                 logits = raw_logits.masked_fill_(~valid[:, None, :], _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
                 if sink is None:
                     attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
             if soft is not None:
-                logits = raw_logits.masked_fill(~valid[:, None, :], _MINL)
+                _nvalid = ~valid[:, None, :]
+                logits = raw_logits.masked_fill(_nvalid, _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
                 nb = ib.shape[1]
                 sv = soft[s:e]
@@ -302,7 +305,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 soft_log = torch.log(sv.clamp_min(1e-12))
                 soft_log.masked_fill_(sv <= 0, _MINL)
                 soft_logits = torch.cat([(raw_logits[:, :, :nb] + soft_log[:, None, :]).clamp_min(_MINL), raw_logits[:, :, nb:]], -1)
-                soft_logits = soft_logits.masked_fill(~valid[:, None, :], torch.finfo(soft_logits.dtype).min)
+                soft_logits = soft_logits.masked_fill(_nvalid, torch.finfo(soft_logits.dtype).min)
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = attn + (soft_attn - soft_attn.detach())
                 if sink is None:

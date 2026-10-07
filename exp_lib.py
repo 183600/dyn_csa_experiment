@@ -326,6 +326,17 @@ def causal_window_mask(T, window, device):
         _cache_put(_MASK_CACHE, key, m, _MASK_CACHE_BUDGET_BYTES, _mask_cache_total)
     return m
 
+def _window_block_offset(n, w, n_blk, device):
+    key = (str(device), 'winoff', int(n), int(w), int(n_blk))
+    hit = _IDX_CACHE.get(key)
+    if hit is not None:
+        return hit
+    win_idx, _win_valid = _window_geometry(n, w, device)
+    with torch.inference_mode(False):
+        out = (win_idx + int(n_blk)).to(torch.int32)
+    _cache_put(_IDX_CACHE, key, out, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
+    return out
+
 def _take_rows(x, idx):
     return torch.index_select(x, 0, idx)
 
@@ -335,6 +346,9 @@ def _take_2d(x, idx):
 def first_occurrence_mask(idx):
     if idx.shape[1] <= 1:
         return torch.ones_like(idx, dtype=torch.bool)
+    if idx.shape[1] <= 256:
+        dup = (idx[:, :, None] == idx[:, None, :]).triu(1).any(dim=1)
+        return ~dup
     order = torch.argsort(idx, dim=1, stable=True)
     sorted_idx = idx.gather(1, order)
     first = torch.ones_like(sorted_idx, dtype=torch.bool)
@@ -369,8 +383,8 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     ends = torch.cumsum(counts, 0)
     starts = ends - counts
     ov = overlap
-    end_prev = torch.cat([torch.full((1,), -1, dtype=ends.dtype, device=dev), ends[:-1]])
-    starts_prev = torch.cat([torch.zeros(1, dtype=starts.dtype, device=dev), starts[:-1]])
+    end_prev = F.pad(ends[:-1], (1, 0), value=-1)
+    starts_prev = F.pad(starts[:-1], (1, 0), value=0)
     ov_start = torch.clamp(end_prev - ov, min=starts_prev)
     ov_len = end_prev - ov_start
     _cpu = getattr(block_ids, '_pool_cpu', None)
@@ -459,7 +473,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
         return torch.empty(n, 0, device=scores.device, dtype=torch.int32)
     k = min(k_req, B)
     finite = torch.isfinite(scores)
-    masked = scores.masked_fill(~causal | ~finite, float('-inf'))
+    masked = scores.masked_fill(~(causal & finite), float('-inf'))
     order = _rank_blocks(masked, B, ties)
     _gidx = order.to(torch.int64)
     usable = causal.gather(1, _gidx) & finite.gather(1, _gidx)
@@ -535,7 +549,8 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             z = (z - torch.floor(z)) * 2.0 - 1.0
             chunks.append(z.to(H.dtype))
         else:
-            raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI) * hd ** (-0.5)
+            raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI)
+            raw.mul_(hd ** (-0.5))
             F.relu(raw, inplace=True)
             chunks.append(torch.einsum('inb,ni->nb', raw, w_idx[s:e]))
     scores = chunks[0] if len(chunks) == 1 else torch.cat(chunks, 0)
@@ -618,14 +633,15 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     k_stack = torch.cat([k_blk, k_sw], 0)
     v_stack = torch.cat([v_blk, v_sw], 0)
     win_idx, win_valid_all = _window_geometry(n, w, dev)
-    _both_idx_all = torch.cat([topk_idx.to(torch.int32), (win_idx + n_blk).to(torch.int32)], dim=1)
+    _both_idx_all = torch.cat([topk_idx.to(torch.int32), _window_block_offset(n, w, n_blk, dev)], dim=1)
     _MINL = torch.finfo(k_blk.dtype).min
+    topk_l = topk_idx if topk_idx.dtype == torch.int64 else topk_idx.long()
+    sel_blk_all = pos_all[:, None] > last_tok[topk_l]
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
         qseg = q[s:e]
-        pos = pos_all[s:e]
-        ib = topk_idx[s:e].long()
-        sel_blk = pos[:, None] > last_tok[ib]
+        ib = topk_l[s:e]
+        sel_blk = sel_blk_all[s:e]
         keep = None
         if sel_valid is not None:
             keep = sel_valid[s:e]
@@ -664,9 +680,10 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         soft_logits = torch.cat([(logits[:, :, :_nb] + soft_log_g[:, None, :]).clamp_min(_MINL), win_logits], -1)
         soft_valid = torch.cat([sel_blk, win_valid], dim=1)
         valid = soft_valid
-        soft_logits.masked_fill_(~soft_valid[:, None, :], _MINL)
+        _nvalid = ~valid[:, None, :]
+        soft_logits.masked_fill_(_nvalid, _MINL)
         soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
-        logits.masked_fill_(~valid[:, None, :], _MINL)
+        logits.masked_fill_(_nvalid, _MINL)
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
         attn = attn + (soft_attn - soft_attn.detach())
         if sink_logits is None:
