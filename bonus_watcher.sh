@@ -88,11 +88,23 @@ commit_and_push() {
   else
     _push_ref="HEAD"
   fi
-  if ! git push origin "$_push_ref" 2>&1 | tail -2; then
-    echo "=== [bonus] push FAILED — nothing reached the remote; box stays up ==="
-    return 1
+  local _try _rb_dst
+  if [ "$_push_ref" = "HEAD" ]; then
+    _rb_dst="origin/${_branch}"
+  else
+    _rb_dst="origin/${_push_ref#HEAD:}"
   fi
-  return 0
+  for _try in 1 2 3; do
+    if git push origin "$_push_ref" 2>&1 | tail -2; then
+      return 0
+    fi
+    echo "=== [bonus] push attempt $_try failed — rebasing onto origin and retrying ==="
+    git fetch origin 2>&1 | tail -2 || true
+    git rebase "$_rb_dst" 2>&1 | tail -2 || git rebase --abort || true
+    sleep 10
+  done
+  echo "=== [bonus] push FAILED after retries — nothing reached the remote; box stays up ==="
+  return 1
 }
 if [ "$_rc" -eq 2 ]; then
   echo "=== [bonus] ledger unreadable -> no bonus, box stays up for inspection ==="

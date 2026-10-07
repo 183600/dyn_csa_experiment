@@ -571,6 +571,10 @@ def sec_p0e():
             tail = steps[-5:] if len(steps) >= 5 else steps
             _tail_span_k = (steps[-1] - tail[0]) / 1000.0
             _paired_raw = sorted(set.intersection(*(set(trajs[v][st]) for v in ('csa_fixed', 'full') for st in tail))) if tail else []
+            _all_seeds = sorted(set.union(*(set(trajs[v][st]) for v in ('csa_fixed', 'full') for st in tail))) if tail else []
+            _incomplete = [sd for sd in _all_seeds if sd not in set(_paired_raw)]
+            if _incomplete:
+                print(f'[report] sec_p0e: seed(s) {_incomplete} miss at least one arm x tail-step cell and are excluded from the paired tail gap — pairing requires a measurement on EVERY tail step for BOTH arms')
             _rec_of = {}
             for _k, r in _s_items:
                 if isinstance(r, dict):
@@ -663,6 +667,8 @@ def sec_p1t():
             mean = sum(ppls) / len(ppls)
             std = sample_std(ppls)
             n = len(ppls)
+        elif r.get('ppls') or r.get('ppl_list'):
+            mean, std, n = (None, None, 0)
         else:
             mean, std, n = (r.get('ppl_mean'), r.get('ppl_std'), r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n', 0))
         _bv = v.split('@')[0].split('#')[0]
@@ -864,7 +870,7 @@ def sec_p1l():
                     for _sd, x in recs_l:
                         _tgt[str(_sd)] = float(x['ppl'])
         _matched = sorted(set(base_map) & set(last_map))
-        ratio = sum((last_map[sd] / base_map[sd] for sd in _matched)) / len(_matched) if _matched else None
+        ratio = sum((last_map[sd] / base_map[sd] for sd in _matched)) / len(_matched) if _matched and len(lens) >= 2 else None
         per_v[v] = ratio
         trunc_v[v] = trunc_flags
         rt_txt = f'×{ratio:.2f}' if _finite_or_none(ratio) is not None else '—'
@@ -881,7 +887,7 @@ def sec_p1l():
             if _finite_or_none(rt) is None:
                 continue
             lines.append(f'- `{v}`：{lens[-1]}/{lens[0]} = ×{rt:.2f}')
-        _rope_ok = 'csa_fixed_rope' in per_v and 'full_rope' in per_v and _finite_or_none(per_v['csa_fixed_rope']) and _finite_or_none(per_v['full_rope']) and (not (trunc_v.get('csa_fixed_rope', [0])[-1] or trunc_v.get('full_rope', [0])[-1]))
+        _rope_ok = 'csa_fixed_rope' in per_v and 'full_rope' in per_v and _finite_or_none(per_v['csa_fixed_rope']) is not None and _finite_or_none(per_v['full_rope']) is not None and (not (trunc_v.get('csa_fixed_rope', [0])[-1] or trunc_v.get('full_rope', [0])[-1]))
         if _rope_ok:
             _ra = per_v['csa_fixed_rope']
             _rb = per_v['full_rope']

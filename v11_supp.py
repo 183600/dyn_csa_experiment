@@ -517,7 +517,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
         A('')
     _xo256 = xo.get('d256_L6') or next((v for v in xo.values() if v.get('d') == 256), {})
     if any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', []))):
-        A('**注意**：d=256 的轨迹取自 v6 重构 summary（README 记账说明 #1），逐种子交叉步互为副本，只有均值轨迹有效。')
+        A('**注意**：d=256 的逐种子轨迹取自含 `synthesized` 重构记录的 summary，逐种子交叉步互为副本，只有均值轨迹有效。')
     elif _xo256.get('status') == 'ok':
         A('**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步与 seed 均值轨迹同为有效读数。')
     A('')

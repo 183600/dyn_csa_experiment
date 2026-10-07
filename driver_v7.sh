@@ -54,8 +54,24 @@ if [ "$_branch" = "HEAD" ]; then
 else
   _push_ref="HEAD"
 fi
-if ! git push origin "$_push_ref" 2>&1 | tail -3; then
-  echo "=== [driver] push FAILED — results are local only ==="
+if [ "$_push_ref" = "HEAD" ]; then
+  _rb_dst="origin/${_branch}"
+else
+  _rb_dst="origin/${_push_ref#HEAD:}"
+fi
+_pushed=0
+for _try in 1 2 3; do
+  if git push origin "$_push_ref" 2>&1 | tail -3; then
+    _pushed=1
+    break
+  fi
+  echo "=== [driver] push attempt $_try failed — rebasing onto origin and retrying ==="
+  git fetch origin 2>&1 | tail -2 || true
+  git rebase "$_rb_dst" 2>&1 | tail -2 || git rebase --abort || true
+  sleep 10
+done
+if [ "$_pushed" -ne 1 ]; then
+  echo "=== [driver] push FAILED after retries — results are local only ==="
   exit 1
 fi
 echo "=== [driver] ALL DONE $(date '+%F %T') ==="

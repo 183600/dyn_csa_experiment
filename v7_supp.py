@@ -159,7 +159,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             logits.add_(mask[s:e])
             lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
             attn = logits.sub(lse).exp_()
-            del logits
+            del logits, lse
             out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
 
@@ -821,7 +821,7 @@ def exact_sign_permutation(deltas):
     for off in range(0, total, step):
         bs = min(step, total - off)
         masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
-        flips = np.where(masks & 1 << bitpos != 0, 1.0, -1.0)
+        flips = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
         cnt += int((np.abs((flips * d[None, :]).mean(1)) >= obs - 1e-12).sum())
     p = float(cnt / total)
     return {'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': int(total), 'n_dropped': n_dropped}

@@ -816,7 +816,7 @@ class HybridAttention(nn.Module):
             if sink_view is not None:
                 lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
                 attn = logits.sub(lse).exp_()
-                del logits
+                del logits, lse
             else:
                 attn = torch.softmax(logits, -1)
                 del logits
@@ -2225,8 +2225,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        _lbuf.append(ce.detach())
-        _tail.append(ce.detach())
+        _ce_d = ce.detach()
+        _lbuf.append(_ce_d)
+        _tail.append(_ce_d)
         if len(_tail) > 50:
             del _tail[:-50]
         if len(_lbuf) >= 512:

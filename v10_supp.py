@@ -75,7 +75,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
         j = min(i + n_ch, n_seq)
         rows = []
         for jj in range(i, j):
-            _rk = (eval_len, jj, rho, vocab)
+            _rk = (eval_len, jj, rho, vocab, int(cfg['target']))
             _row = row_cache.get(_rk) if row_cache is not None else None
             if _row is None:
                 ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
@@ -896,7 +896,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     _xo256_txt = f'~{_xo256_step:g} 步' if isinstance(_xo256_step, (int, float)) and math.isfinite(_xo256_step) else '步数未知（该规模无有效交叉读数）'
     _xo256_recon = any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', [])))
     if _xo256_recon:
-        A(f'**注意**：d=256 的轨迹取自 `results_lm_v3_long/summary.json`（v6 重构件，见 README 记账说明 #1）——逐种子轨迹不可独立恢复，该规模的逐种子交叉步互为副本，只有 seed 均值轨迹的交叉步（{_xo256_txt}，eval 网格 1000 步）是有效读数。')
+        A(f'**注意**：d=256 的轨迹取自 `results_lm_v3_long/summary.json`，其中部分记录是从旧聚合表重构的副本（`synthesized`），逐种子轨迹不可独立恢复——该规模的逐种子交叉步互为副本，只有 seed 均值轨迹的交叉步（{_xo256_txt}，eval 网格 1000 步）是有效读数。')
     elif _xo256.get('status') == 'ok':
         A(f'**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步（{_xo256_txt} 附近）与 seed 均值轨迹同为有效读数。')
     A('')
