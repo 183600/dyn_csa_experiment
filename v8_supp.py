@@ -29,9 +29,9 @@ def make_guard():
             g.state['sps_by_class'] = st.get('sps_by_class', {})
             g.state['norm_sps'] = st.get('norm_sps')
             g._save()
-            print('[v8] TimeGuard calibrated from the v7 speed log')
+            print('[v8] TimeGuard calibrated from run_time_state_v7.json')
         except Exception as _e:
-            print(f'[v8] WARNING: could not calibrate TimeGuard from the v7 speed log ({type(_e).__name__}: {_e}); falling back to the built-in per-class defaults — time estimates are NOMINAL, not calibrated')
+            print(f'[v8] WARNING: could not calibrate TimeGuard from run_time_state_v7.json ({type(_e).__name__}: {_e}); falling back to the built-in per-class defaults — time estimates are NOMINAL, not calibrated')
     return g
 P1S_CFG = dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full', 'full_matched', 'hybrid_dynamic'])
 P2R_CFG = dict(L.RUN_LONG, outdir='results_lm_v8_rope20k', variants=['csa_fixed_rope', 'full_rope'], matched=set(V.PARAM_MATCHED_V7), mlp_match_ref='csa_fixed_rope')

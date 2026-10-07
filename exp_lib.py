@@ -3081,7 +3081,7 @@ def run(cfg=None, seeds=None, guard=None, label=''):
                 import traceback
                 import sys as _sys
                 if key in summary and ppl_is_usable((summary.get(key) or {}).get('ppl')):
-                    print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (the error record holds no `ppl` and must not replace it); the failed attempt is still billed to the guard below.')
+                    print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (the error record holds no `ppl` and must not replace it); the failed attempt is still booked to the guard below.')
                     print(traceback.format_exc(), file=_sys.stderr)
                 else:
                     summary[key] = {'variant': v, 'seed': seed, 'error': traceback.format_exc()}

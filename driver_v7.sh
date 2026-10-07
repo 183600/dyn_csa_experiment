@@ -73,5 +73,4 @@ if [ "$_pushed" -ne 1 ]; then
   exit 1
 fi
 echo "=== [driver] ALL DONE $(date '+%F %T') ==="
-# the EXIT trap shuts the instance down after the driver exits, so the box
-# never idles
+# the EXIT trap shuts the instance down after the driver exits
