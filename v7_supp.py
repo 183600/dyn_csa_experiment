@@ -200,7 +200,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                             _keep[_slot] = 1.0
                     _hon = torch.tensor(_keep, dtype=gate.dtype, device=gate.device)
                     _soft_hon = gate * _hon
-                    gate_mean = (float(nblk - 1) + _soft_hon.sum() - _soft_hon.detach().sum()) / T
+                    _shs = _soft_hon.sum()
+                    gate_mean = (float(nblk - 1) + _shs - _shs.detach()) / T
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
             sim = L.cosine_similarity_consecutive(x.detach())
             tau = L.causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
@@ -272,28 +273,45 @@ class HybridAttentionRoPE(L.HybridAttention):
         _both_all = torch.cat([topk_idx, L._window_block_offset(T, w, _n_blk, dev)], 1).to(torch.int32)
         topk_l = topk_idx if topk_idx.dtype == torch.int64 else topk_idx.long()
         _sel_all = pos_all[:, None] > last_tok[topk_l]
+        # see exp_lib.gathered_attention: these per-row masks are hoisted when the
+        # full-width first-occurrence mask fits in a modest transient; the hoisted
+        # values are bitwise identical to the per-chunk forms.
+        if T * topk_l.shape[1] * topk_l.shape[1] <= L._FO_FULL_CAP_BYTES:
+            _keep_all = sel_valid
+            if topk_l.shape[1] > 1:
+                _ddk_all = L.first_occurrence_mask(topk_l)
+                _keep_all = _ddk_all if _keep_all is None else _keep_all & _ddk_all
+            if _keep_all is not None:
+                _sel_all &= _keep_all
+            _valid_all = torch.cat([_sel_all, _wvalid_all], 1)
+        else:
+            _keep_all = _valid_all = None
         for s in range(0, T, q_chunk):
             e = min(s + q_chunk, T)
             ib = topk_l[s:e]
-            sel = _sel_all[s:e]
-            _keep = sel_valid[s:e] if sel_valid is not None else None
-            if ib.shape[1] > 1:
-                _ddk = L.first_occurrence_mask(ib)
-                _keep = _ddk if _keep is None else _keep & _ddk
-            if _keep is not None:
-                sel = sel & _keep
-            wvalid = _wvalid_all[s:e]
+            if _valid_all is not None:
+                sel = _sel_all[s:e]
+                _keep = None if _keep_all is None else _keep_all[s:e]
+                valid = _valid_all[s:e]
+            else:
+                sel = _sel_all[s:e]
+                _keep = sel_valid[s:e] if sel_valid is not None else None
+                if ib.shape[1] > 1:
+                    _ddk = L.first_occurrence_mask(ib)
+                    _keep = _ddk if _keep is None else _keep & _ddk
+                if _keep is not None:
+                    sel = sel & _keep
+                valid = torch.cat([sel, _wvalid_all[s:e]], 1)
             both = _both_all[s:e]
             Kset = L._take_2d(_k_stack, both)
             Vset = L._take_2d(_v_stack, both)
-            valid = torch.cat([sel, wvalid], 1)
             raw_logits = torch.einsum('qhd,qmhd->qhm', qr[s:e], Kset)
             raw_logits.mul_(scale)
             if soft is None:
                 logits = raw_logits.masked_fill_(~valid[:, None, :], _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
                 if sink is None:
-                    attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
+                    attn = attn * valid.any(-1)[:, None, None]
             if soft is not None:
                 _nvalid = ~valid[:, None, :]
                 logits = raw_logits.masked_fill(_nvalid, _MINL)
@@ -301,7 +319,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 nb = ib.shape[1]
                 sv = soft[s:e]
                 if _keep is not None:
-                    sv = sv * _keep.to(sv.dtype)
+                    sv = sv * _keep
                 soft_log = torch.log(sv.clamp_min(1e-12))
                 soft_log.masked_fill_(sv <= 0, _MINL)
                 soft_logits = torch.cat([(raw_logits[:, :, :nb] + soft_log[:, None, :]).clamp_min(_MINL), raw_logits[:, :, nb:]], -1)
@@ -309,7 +327,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = attn + (soft_attn - soft_attn.detach())
                 if sink is None:
-                    attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
+                    attn = attn * valid.any(-1)[:, None, None]
             out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
         return out
     def _dense_warmup_forward(self, x):

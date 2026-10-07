@@ -347,7 +347,7 @@ def first_occurrence_mask(idx):
     if idx.shape[1] <= 1:
         return torch.ones_like(idx, dtype=torch.bool)
     if idx.shape[1] <= 256:
-        dup = (idx[:, :, None] == idx[:, None, :]).triu(1).any(dim=1)
+        dup = (idx[:, :, None] == idx[:, None, :]).triu_(1).any(dim=1)
         return ~dup
     order = torch.argsort(idx, dim=1, stable=True)
     sorted_idx = idx.gather(1, order)
@@ -411,7 +411,8 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     b_off = ov_start[:, None] - starts_prev[:, None] + op[None, :]
     b_off = b_off.clamp(max=B_pos_b.shape[0] - 1)
     _lim = B_pos_a.shape[0] - 1
-    Zam += B_pos_a[pos.clamp(max=_lim)]
+    _pos_a = pos if max_len <= B_pos_a.shape[0] else pos.clamp(max=_lim)
+    Zam += B_pos_a[_pos_a]
     Zbm += B_pos_b[b_off]
     Zam.masked_fill_(~mask_a[:, :, None], float('-inf'))
     Zbm.masked_fill_(~mask_b[:, :, None], float('-inf'))
@@ -449,7 +450,8 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     Xb = _take_2d(Xs, g)
     Zb = _take_2d(Zs, g)
     WinZ = Zb
-    WinZ[:, :max_len] += B_pos[pos.clamp(max=B_pos.shape[0] - 1)]
+    _pos_a = pos if max_len <= B_pos.shape[0] else pos.clamp(max=B_pos.shape[0] - 1)
+    WinZ[:, :max_len] += B_pos[_pos_a]
     WinZ.masked_fill_(~mask[:, :, None], float('-inf'))
     sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
     comp = (sc * Xb).sum(1)
@@ -613,6 +615,8 @@ def _sink_split_softmax(logits, sink_logits, want_sink=True):
     soft = torch.softmax(z, -1)[..., 1:]
     return (soft, 1.0 - soft.sum(-1) if want_sink else None)
 
+_FO_FULL_CAP_BYTES = 64 << 20
+
 def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None):
     n = q.shape[0]
     dev = q.device
@@ -637,36 +641,55 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _MINL = torch.finfo(k_blk.dtype).min
     topk_l = topk_idx if topk_idx.dtype == torch.int64 else topk_idx.long()
     sel_blk_all = pos_all[:, None] > last_tok[topk_l]
+    # the keep mask and the [selected|window] valid mask are per-row functions of
+    # the same inputs, so their full-width forms are bitwise identical to the
+    # per-chunk forms; they are hoisted out of the chunk loop whenever the
+    # full-width first-occurrence mask fits in a modest transient (the chunked
+    # fallback below keeps the peak memory of very wide top-k sweeps unchanged).
+    if n * topk_l.shape[1] * topk_l.shape[1] <= _FO_FULL_CAP_BYTES:
+        keep_all = sel_valid
+        if topk_l.shape[1] > 1:
+            _ddk_all = first_occurrence_mask(topk_l)
+            keep_all = _ddk_all if keep_all is None else keep_all & _ddk_all
+        if keep_all is not None:
+            sel_blk_all &= keep_all
+        valid_all = torch.cat([sel_blk_all, win_valid_all], dim=1)
+    else:
+        keep_all = valid_all = None
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
         qseg = q[s:e]
         ib = topk_l[s:e]
-        sel_blk = sel_blk_all[s:e]
-        keep = None
-        if sel_valid is not None:
-            keep = sel_valid[s:e]
-        if ib.shape[1] > 1:
-            _ddk = first_occurrence_mask(ib)
-            keep = _ddk if keep is None else keep & _ddk
-        if keep is not None:
-            sel_blk = sel_blk & keep
-        win_valid = win_valid_all[s:e]
+        if valid_all is not None:
+            sel_blk = sel_blk_all[s:e]
+            keep = None if keep_all is None else keep_all[s:e]
+            valid = valid_all[s:e]
+        else:
+            sel_blk = sel_blk_all[s:e]
+            keep = None
+            if sel_valid is not None:
+                keep = sel_valid[s:e]
+            if ib.shape[1] > 1:
+                _ddk = first_occurrence_mask(ib)
+                keep = _ddk if keep is None else keep & _ddk
+            if keep is not None:
+                sel_blk = sel_blk & keep
+            valid = torch.cat([sel_blk, win_valid_all[s:e]], dim=1)
         both_idx = _both_idx_all[s:e]
         Kset = _take_2d(k_stack, both_idx)
         Vset = _take_2d(v_stack, both_idx)
         if soft is None:
-            valid = torch.cat([sel_blk, win_valid], dim=1)
             logits = torch.einsum('qhd,qmhd->qhm', qseg, Kset)
             logits.mul_(scale)
             logits.masked_fill_(~valid[:, None, :], _MINL)
             attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
             if sink_logits is None:
-                attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
+                attn = attn * valid.any(-1)[:, None, None]
             out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
             continue
         soft_g = soft[s:e]
         if keep is not None:
-            soft_g = soft_g * keep.to(soft_g.dtype)
+            soft_g = soft_g * keep
         _nb = int(ib.shape[1])
         kb = Kset[:, :_nb]
         kw = Kset[:, _nb:]
@@ -678,8 +701,6 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         win_logits.mul_(scale)
         logits = torch.cat([blk_logits, win_logits], -1)
         soft_logits = torch.cat([(logits[:, :, :_nb] + soft_log_g[:, None, :]).clamp_min(_MINL), win_logits], -1)
-        soft_valid = torch.cat([sel_blk, win_valid], dim=1)
-        valid = soft_valid
         _nvalid = ~valid[:, None, :]
         soft_logits.masked_fill_(_nvalid, _MINL)
         soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
@@ -687,7 +708,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
         attn = attn + (soft_attn - soft_attn.detach())
         if sink_logits is None:
-            attn = attn * valid.any(-1)[:, None, None].to(attn.dtype)
+            attn = attn * valid.any(-1)[:, None, None]
         out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
     return out
 
@@ -908,7 +929,8 @@ class HybridAttention(nn.Module):
                         _keep[_slot] = 1.0
                 _hon = torch.tensor(_keep, dtype=gate.dtype, device=gate.device)
                 _soft_honoured = gate * _hon
-                gate_mean = (float(nblk - 1) + _soft_honoured.sum() - _soft_honoured.detach().sum()) / T
+                _shs = _soft_honoured.sum()
+                gate_mean = (float(nblk - 1) + _shs - _shs.detach()) / T
             else:
                 gate_mean = torch.zeros((), device=x.device) if self.need_reg else None
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
