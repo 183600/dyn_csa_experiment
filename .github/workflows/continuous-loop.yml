@@ -130,7 +130,7 @@ jobs:
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "NVIDIA",
                 "options": {
-                  "baseURL": "https://integrate.api.nvidia.com/v1",
+                  "baseURL": "https://integrate.api.nvidiiiiiiiiiiiiia.com/v1",
                   "apiKey": "{env:NVIDIA_API_KEY}"
                 },
                 "models": {
