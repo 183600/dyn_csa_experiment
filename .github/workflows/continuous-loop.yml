@@ -396,6 +396,22 @@ jobs:
           git pull --rebase origin "$BRANCH" || git rebase --abort || true
           git push origin "HEAD:${BRANCH}" || echo "[warn] final push failed"
 
+      - name: Push to Gitee
+        if: always()
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+        run: |
+          set +e
+          if [ -z "$GITEE_TOKEN" ] || [ -z "$GITEE_REPO" ]; then
+            echo "GITEE_TOKEN or GITEE_REPO not set, skipping Gitee push."
+            exit 0
+          fi
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          git remote remove gitee 2>/dev/null || true
+          git remote add gitee "https://oauth2:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
+          git push gitee "HEAD:${BRANCH}" --force || echo "[warn] push to Gitee failed"
+
       - name: Trigger next workflow run (self-loop)
         if: always()
         env:
