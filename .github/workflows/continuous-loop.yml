@@ -3,7 +3,7 @@ name: Continuous Loop
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '0 */1 * * *'
 
 concurrency:
   group: continuous-loop
