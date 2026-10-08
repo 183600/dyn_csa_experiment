@@ -326,9 +326,14 @@ def _hist_by_seed(outdir, variant, raw=None):
         _s_raw = r.get('seed')
         if isinstance(_s_raw, bool):
             _s_raw = None
-        try:
-            s = int(_s_raw)
-        except (TypeError, ValueError):
+        if isinstance(_s_raw, float):
+            s = int(_s_raw) if math.isfinite(_s_raw) and _s_raw.is_integer() else None
+        else:
+            try:
+                s = int(_s_raw)
+            except (TypeError, ValueError, OverflowError):
+                s = None
+        if s is None:
             print(f'[v10 stats] {_k} has no usable `seed`; its curve cannot be attributed and is skipped')
             continue
         try:

@@ -351,7 +351,7 @@ def sec_p0r():
         _has_mt = _mtm is not None
         rope_unmatched = unmatched_tag(_cf_r, _fu_r)
         _pgap_r = param_gap(_cf_r, _fu_r)
-        rope_is_defect = gap_is_architecture(_cf_r, _fu_r) is False or _pgap_r is None
+        rope_is_defect = is_param_matched(_cf_r, _fu_r) is not True
         _w_abs = '领先' if g_abs < 0 else '落后'
         _w_absm = '领先' if g_abs_m < 0 else '落后'
         _w_rope = '领先' if g_rope < 0 else '落后'
