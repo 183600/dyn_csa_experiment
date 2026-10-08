@@ -105,6 +105,26 @@ def _segment(n, want_cut_list, min_block, max_block):
         _SEGMENT_CACHE[key] = (bids, honoured, counts)
     return (bids, honoured, counts)
 
+def _h2d_async(host_src, dtype, device):
+    # Same values as torch.tensor(host_src, dtype=dtype, device=device), but the
+    # H2D copy is staged through pinned memory and enqueued non-blocking, so the
+    # host is not stalled waiting for the stream to drain on every per-row
+    # transfer.  Pure transport of exact (integer or gate-mask) values; the
+    # inference_mode(False) guard keeps the result a normal tensor even when the
+    # caller runs under inference_mode (eval), so it can later serve as an
+    # autograd index tensor.
+    with torch.inference_mode(False):
+        t = torch.as_tensor(host_src, dtype=dtype)
+        if t.device == device:
+            return t
+        if t.device.type == 'cuda' or device.type != 'cuda' or not torch.cuda.is_available():
+            return t.to(device)
+        try:
+            t = t.pin_memory()
+        except RuntimeError:
+            pass
+        return t.to(device, non_blocking=t.is_pinned())
+
 def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_count=False, return_honoured=False):
     if n == 0:
         base, cnt, hon = (torch.empty(0, dtype=torch.long, device=device), 0, {})
@@ -112,7 +132,7 @@ def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_coun
         base, cnt, hon = (torch.zeros(1, dtype=torch.long, device=device), 1, {})
     else:
         bids, hon, counts = _segment(n, want_cut_list, min_block, max_block)
-        base = torch.tensor(bids, dtype=torch.long, device=device)
+        base = _h2d_async(bids, torch.long, device)
         cnt = len(counts)
         _mx = max(counts)
         base._pool_cpu = (counts, _mx, max(counts[:-1]) if cnt > 1 else 0)
@@ -387,15 +407,46 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
         Zbs = _take_rows(Zb, order)
     return _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, Fd, dev, B, order)
 
+def _pool_parts(block_ids, B, ov, n):
+    # Integer block geometry shared by the pooling paths.  Every value is an
+    # exact integer function of (block_ids, B, ov, n), so caching the tensors on
+    # the block-ids object is bitwise safe; the fixed segmenter hands out ONE
+    # shared block-ids object for every row/layer/step, which is where the
+    # eliminated bincount/cumsum/pad kernels go.  Tensors are built outside
+    # inference mode so a cache first filled during eval can still serve
+    # training (an inference tensor saved for backward would raise).
+    key = (int(B), -1 if ov is None else int(ov), int(n))
+    cache = getattr(block_ids, '_pool_gpu', None)
+    if cache is None:
+        cache = {}
+        try:
+            block_ids._pool_gpu = cache
+        except (AttributeError, RuntimeError):
+            pass
+    else:
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+    with torch.inference_mode(False):
+        counts = torch.bincount(block_ids, minlength=B)
+        ends = torch.cumsum(counts, 0)
+        starts = ends - counts
+        last_idx = (ends - 1).clamp(0, n - 1)
+        if ov is None:
+            parts = (counts, ends, starts, last_idx)
+        else:
+            end_prev = F.pad(ends[:-1], (1, 0), value=-1)
+            starts_prev = F.pad(starts[:-1], (1, 0), value=0)
+            ov_start = torch.clamp(end_prev - ov, min=starts_prev)
+            ov_len = end_prev - ov_start
+            parts = (counts, ends, starts, last_idx, end_prev, starts_prev, ov_start, ov_len)
+    if len(cache) < 8:
+        cache[key] = parts
+    return parts
+
 def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, Fd, dev, B, order):
-    counts = torch.bincount(block_ids, minlength=B)
-    ends = torch.cumsum(counts, 0)
-    starts = ends - counts
+    counts, ends, starts, last_idx, end_prev, starts_prev, ov_start, ov_len = _pool_parts(block_ids, B, overlap, n)
     ov = overlap
-    end_prev = F.pad(ends[:-1], (1, 0), value=-1)
-    starts_prev = F.pad(starts[:-1], (1, 0), value=0)
-    ov_start = torch.clamp(end_prev - ov, min=starts_prev)
-    ov_len = end_prev - ov_start
     _cpu = getattr(block_ids, '_pool_cpu', None)
     if _cpu is not None and len(_cpu[0]) == B:
         max_len = _cpu[1]
@@ -431,7 +482,6 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     sc_a = sc[:, :max_len]
     sc_b = sc[:, max_len:]
     comp = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
-    last_idx = (ends - 1).clamp(0, n - 1)
     return (comp, order[last_idx], B)
 
 def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
@@ -444,9 +494,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     else:
         Xs = _take_rows(X, order)
         Zs = _take_rows(Z, order)
-    counts = torch.bincount(block_ids, minlength=B)
-    ends = torch.cumsum(counts, 0)
-    starts = ends - counts
+    counts, ends, starts, last_idx = _pool_parts(block_ids, B, None, n)
     _cpu = getattr(block_ids, '_pool_cpu', None)
     if _cpu is not None and len(_cpu[0]) == B:
         max_len = _cpu[1]
@@ -464,7 +512,6 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     WinZ.masked_fill_(~mask[:, :, None], float('-inf'))
     sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
     comp = (sc * Xb).sum(1)
-    last_idx = (ends - 1).clamp(0, n - 1)
     return (comp, order[last_idx], B)
 
 def _rank_blocks(masked, B, ties):
@@ -709,7 +756,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         win_logits = torch.einsum('qhd,qmhd->qhm', qseg, kw)
         win_logits.mul_(scale)
         logits = torch.cat([blk_logits, win_logits], -1)
-        soft_logits = torch.cat([(logits[:, :, :_nb] + soft_log_g[:, None, :]).clamp_min(_MINL), win_logits], -1)
+        soft_logits = torch.cat([(logits[:, :, :_nb] + soft_log_g[:, None, :]).clamp_min_(_MINL), win_logits], -1)
         _nvalid = ~valid[:, None, :]
         soft_logits.masked_fill_(_nvalid, _MINL)
         soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
@@ -956,7 +1003,7 @@ class HybridAttention(nn.Module):
                 for _slot in _honoured:
                     if 0 <= _slot < len(_keep):
                         _keep[_slot] = 1.0
-                _hon = torch.tensor(_keep, dtype=gate.dtype, device=gate.device)
+                _hon = _h2d_async(_keep, gate.dtype, gate.device)
                 _soft_honoured = gate * _hon
                 _shs = _soft_honoured.sum()
                 gate_mean = (float(nblk - 1) + _shs - _shs.detach()) / T
@@ -1436,9 +1483,15 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     while True:
         starts = rng.integers(0, n + 1, size=batch_size)
         idx = torch.from_numpy(starts[:, None] + cols[None, :])
-        ids = host[idx.to(host.device)]
+        if host.device.type == 'cuda':
+            ids = host[_h2d_async(idx, idx.dtype, host.device)]
+        else:
+            ids = host[idx]
         if ids.device != device:
-            ids = ids.to(device, non_blocking=host.is_pinned())
+            # stage the batch through pinned memory so the per-step H2D copy is
+            # stream-ordered instead of host-blocking (pure transport of exact
+            # integer ids; the values are unchanged).
+            ids = _h2d_async(ids, ids.dtype, device)
         yield (ids[:, :-1], ids[:, 1:])
 
 def count_params(m):

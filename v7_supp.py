@@ -204,7 +204,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                     for _slot in _hon_d:
                         if 0 <= _slot < len(_keep):
                             _keep[_slot] = 1.0
-                    _hon = torch.tensor(_keep, dtype=gate.dtype, device=gate.device)
+                    _hon = L._h2d_async(_keep, gate.dtype, gate.device)
                     _soft_hon = gate * _hon
                     _shs = _soft_hon.sum()
                     gate_mean = (float(nblk - 1) + _shs - _shs.detach()) / T
@@ -328,7 +328,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                     sv = sv * _keep
                 soft_log = torch.log(sv.clamp_min(1e-12))
                 soft_log.masked_fill_(sv <= 0, _MINL)
-                soft_logits = torch.cat([(raw_logits[:, :, :nb] + soft_log[:, None, :]).clamp_min(_MINL), raw_logits[:, :, nb:]], -1)
+                soft_logits = torch.cat([(raw_logits[:, :, :nb] + soft_log[:, None, :]).clamp_min_(_MINL), raw_logits[:, :, nb:]], -1)
                 soft_logits = soft_logits.masked_fill(_nvalid, torch.finfo(soft_logits.dtype).min)
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = attn + (soft_attn - soft_attn.detach())
