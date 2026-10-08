@@ -68,9 +68,8 @@ def _segment(n, want_cut_list, min_block, max_block):
     # next_cut[p] + 1)), where next_cut[p] is the earliest wanted-cut slot >= p
     # (slot ci is the boundary between tokens ci and ci+1, scanned when the scan
     # reaches token ci + 1).  A cut at q honours next_cut[p] iff it was already
-    # pending by then (next_cut[p] <= q - 1).  The walk therefore only needs one
-    # iteration per produced block instead of one per token; the results are
-    # exactly those of the token-by-token scan.
+    # pending by then (next_cut[p] <= q - 1).  The results are exactly those of
+    # the token-by-token scan.
     _BIG = n + 1
     slots = np.nonzero(np.asarray(want_cut_list, dtype=bool))[0].tolist()
     honoured = {}
@@ -106,10 +105,8 @@ def _segment(n, want_cut_list, min_block, max_block):
     return (bids, honoured, counts)
 
 def _h2d_async(host_src, dtype, device):
-    # Same values as torch.tensor(host_src, dtype=dtype, device=device), but the
-    # H2D copy is staged through pinned memory and enqueued non-blocking, so the
-    # host is not stalled waiting for the stream to drain on every per-row
-    # transfer.  Pure transport of exact (integer or gate-mask) values; the
+    # Same values as torch.tensor(host_src, dtype=dtype, device=device):
+    # pure transport of exact (integer or gate-mask) values.  The
     # inference_mode(False) guard keeps the result a normal tensor even when the
     # caller runs under inference_mode (eval), so it can later serve as an
     # autograd index tensor.
@@ -411,9 +408,8 @@ def _pool_parts(block_ids, B, ov, n):
     # Integer block geometry shared by the pooling paths.  Every value is an
     # exact integer function of (block_ids, B, ov, n), so caching the tensors on
     # the block-ids object is bitwise safe; the fixed segmenter hands out ONE
-    # shared block-ids object for every row/layer/step, which is where the
-    # eliminated bincount/cumsum/pad kernels go.  Tensors are built outside
-    # inference mode so a cache first filled during eval can still serve
+    # shared block-ids object for every row/layer/step.  Tensors are built
+    # outside inference mode so a cache first filled during eval can still serve
     # training (an inference tensor saved for backward would raise).
     key = (int(B), -1 if ov is None else int(ov), int(n))
     cache = getattr(block_ids, '_pool_gpu', None)
@@ -699,9 +695,9 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     sel_blk_all = pos_all[:, None] > last_tok[topk_l]
     # the keep mask and the [selected|window] valid mask are per-row functions of
     # the same inputs, so their full-width forms are bitwise identical to the
-    # per-chunk forms; they are hoisted out of the chunk loop whenever the
-    # full-width first-occurrence mask fits in a modest transient (the chunked
-    # fallback below covers very wide top-k sweeps).
+    # per-chunk forms; they are hoisted out of the chunk loop under
+    # _FO_FULL_CAP_BYTES (the chunked fallback below covers very wide top-k
+    # sweeps).
     if n * topk_l.shape[1] * topk_l.shape[1] <= _FO_FULL_CAP_BYTES:
         keep_all = sel_valid
         if topk_l.shape[1] > 1:
@@ -949,10 +945,9 @@ class HybridAttention(nn.Module):
     def _gate_signal(self, x, pre=None):
         # GPU-side half of the cosine_learnable gate, computed by the same ops as
         # the inline path in _single.  forward() calls this for every row of the
-        # batch first, then moves the stacked hard decisions to the CPU with ONE
-        # synchronising transfer instead of one per row; every value downstream
-        # (the gate tensor itself and the per-row cut lists) is identical to the
-        # per-row inline form.
+        # batch first, then moves the stacked hard decisions to the CPU; every
+        # value downstream (the gate tensor itself and the per-row cut lists) is
+        # identical to the per-row inline form.
         fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
         sim = cosine_similarity_consecutive(fused)
         if sim.numel() == 0:
@@ -1028,9 +1023,6 @@ class HybridAttention(nn.Module):
         index_kv = comp_kv
         attn_kv = torch.zeros_like(comp_kv) if cfg.content_mode == 'zero' else comp_kv
         if self._stats is not None:
-            # keep the per-row block stats on the device; _compression_report_impl
-            # concatenates and reads them with one synchronisation per layer
-            # instead of one host round-trip per row.  Same integer values.
             self._stats.append(torch.bincount(bid))
             if self._cuts is not None:
                 cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
@@ -1491,9 +1483,6 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         else:
             ids = host[idx]
         if ids.device != device:
-            # stage the batch through pinned memory so the per-step H2D copy is
-            # stream-ordered instead of host-blocking (pure transport of exact
-            # integer ids; the values are unchanged).
             ids = _h2d_async(ids, ids.dtype, device)
         yield (ids[:, :-1], ids[:, 1:])
 
@@ -2351,11 +2340,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         x, y = next(bpe)
         logits = model(x)
         ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
-        # Drop the caller's references BEFORE backward: cross-entropy's backward
-        # needs only its saved log-softmax output and the targets (the ids are
-        # small), so the full (B*T, vocab) logits storage — the single largest
-        # fp32 transient of the step — can be released instead of being held at
-        # the backward peak.  No graph value changes.
         del x, y, logits
         loss = ce + comp_lambda * model.comp_reg
         opt.zero_grad(set_to_none=True)

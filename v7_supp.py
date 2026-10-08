@@ -227,8 +227,6 @@ class HybridAttentionRoPE(L.HybridAttention):
         index_kv = comp_kv
         attn_kv = torch.zeros_like(comp_kv) if cfg.content_mode == 'zero' else comp_kv
         if self._stats is not None:
-            # device-resident per-row stats; the report concatenates them with
-            # one host sync per layer (see exp_lib.HybridAttention._single).
             self._stats.append(torch.bincount(bid))
             if self._cuts is not None:
                 cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
@@ -281,9 +279,9 @@ class HybridAttentionRoPE(L.HybridAttention):
         _both_all = torch.cat([topk_idx, L._window_block_offset(T, w, _n_blk, dev)], 1).to(torch.int32)
         topk_l = topk_idx if topk_idx.dtype == torch.int64 else topk_idx.long()
         _sel_all = pos_all[:, None] > last_tok[topk_l]
-        # see exp_lib.gathered_attention: these per-row masks are hoisted when the
-        # full-width first-occurrence mask fits in a modest transient; the hoisted
-        # values are bitwise identical to the per-chunk forms.
+        # see exp_lib.gathered_attention: these per-row masks are hoisted under
+        # L._FO_FULL_CAP_BYTES; the hoisted values are bitwise identical to the
+        # per-chunk forms.
         if T * topk_l.shape[1] * topk_l.shape[1] <= L._FO_FULL_CAP_BYTES:
             _keep_all = sel_valid
             if topk_l.shape[1] > 1:
@@ -599,9 +597,6 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         x, y = next(bpe)
         logits = model(x)
         ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
-        # release the (B*T, vocab) logits storage before the backward peak
-        # (cross-entropy's backward needs only its saved log-softmax output and
-        # the targets; see exp_lib.train_variant).  No graph value changes.
         logits = None
         loss = ce + comp_lambda * model.comp_reg
         opt.zero_grad(set_to_none=True)
