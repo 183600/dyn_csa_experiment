@@ -227,10 +227,12 @@ class HybridAttentionRoPE(L.HybridAttention):
         index_kv = comp_kv
         attn_kv = torch.zeros_like(comp_kv) if cfg.content_mode == 'zero' else comp_kv
         if self._stats is not None:
-            self._stats.append(torch.bincount(bid).float().cpu())
+            # device-resident per-row stats; the report concatenates them with
+            # one host sync per layer (see exp_lib.HybridAttention._single).
+            self._stats.append(torch.bincount(bid))
             if self._cuts is not None:
                 cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
-                self._cuts.append(cuts.cpu())
+                self._cuts.append(cuts)
         comp_n = self.kv_norm(attn_kv) if cfg.qk_norm else attn_kv
         qn = self.q_norm(q) if cfg.qk_norm else q
         sw_n = self.kv_norm(Ca_raw) if cfg.qk_norm else Ca_raw
@@ -597,6 +599,10 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         x, y = next(bpe)
         logits = model(x)
         ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
+        # release the (B*T, vocab) logits storage before the backward peak
+        # (cross-entropy's backward needs only its saved log-softmax output and
+        # the targets; see exp_lib.train_variant).  No graph value changes.
+        logits = None
         loss = ce + comp_lambda * model.comp_reg
         opt.zero_grad(set_to_none=True)
         loss.backward()

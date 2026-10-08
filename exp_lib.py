@@ -1028,10 +1028,13 @@ class HybridAttention(nn.Module):
         index_kv = comp_kv
         attn_kv = torch.zeros_like(comp_kv) if cfg.content_mode == 'zero' else comp_kv
         if self._stats is not None:
-            self._stats.append(torch.bincount(bid).float().cpu())
+            # keep the per-row block stats on the device; _compression_report_impl
+            # concatenates and reads them with one synchronisation per layer
+            # instead of one host round-trip per row.  Same integer values.
+            self._stats.append(torch.bincount(bid))
             if self._cuts is not None:
                 cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
-                self._cuts.append(cuts.cpu())
+                self._cuts.append(cuts)
         core_kv = F.normalize(attn_kv, dim=-1)
         kv_local = F.normalize(Ca_raw, dim=-1)
         k_blk, v_blk = self._split(self.W_kvhead(core_kv))
@@ -2259,7 +2262,7 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
         kind = attn.cfg.kind
         if st is None or kind == 'full' or len(st) == 0:
             continue
-        lens = torch.cat(list(st)).float()
+        lens = torch.cat([t if torch.is_tensor(t) else torch.as_tensor(t) for t in st]).float()
         n_blocks = sum((t.numel() for t in st)) / len(st)
         entry = {'blocks': n_blocks, 'avg_len': seq_len / max(n_blocks, 1.0), 'len_mean': float(lens.mean()), 'len_std': float(lens.std()) if lens.numel() > 1 else 0.0, 'len_min': int(lens.min()), 'len_max': int(lens.max()), 'frac_at_min': float((lens <= attn.cfg.min_block).float().mean()), 'frac_at_max': float((lens >= attn.cfg.max_block).float().mean())}
         if attn.cfg.dynamic and getattr(attn, 'delta_logit', None) is not None:
@@ -2273,8 +2276,8 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
             _prov = {}
             for si in range(n_seq_ref):
                 c = _cuts[si]
-                if hasattr(c, 'numpy'):
-                    c = c.numpy()
+                if torch.is_tensor(c):
+                    c = c.cpu().numpy()
                 p, r_, f_, rp = boundary_alignment(c, val_bnd[si], seq_len, tol=bnd_tol, provenance=_prov)
                 ps.append(p)
                 rs.append(r_)
@@ -2348,6 +2351,12 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         x, y = next(bpe)
         logits = model(x)
         ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
+        # Drop the caller's references BEFORE backward: cross-entropy's backward
+        # needs only its saved log-softmax output and the targets (the ids are
+        # small), so the full (B*T, vocab) logits storage — the single largest
+        # fp32 transient of the step — can be released instead of being held at
+        # the backward peak.  No graph value changes.
+        del x, y, logits
         loss = ce + comp_lambda * model.comp_reg
         opt.zero_grad(set_to_none=True)
         loss.backward()
