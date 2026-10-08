@@ -52,7 +52,7 @@ def _install_ckpt_patch():
     V7.BlockRoPE.forward = _v9_blockrope_forward
     _CKPT_PATCHED = True
 RUN_CAP_V9 = dict(L.RUN_CAP)
-RUN_CAP_V9.update(total_hours=float(os.environ.get('V9_CAP_HOURS', 25.0 / 2.4)), state_path='run_time_state_v9.json', already_hours=0.0)
+RUN_CAP_V9.update(total_hours=float(os.environ.get('V9_CAP_HOURS', 10.416666666666668)), state_path='run_time_state_v9.json', already_hours=0.0)
 
 def make_guard():
     g = L.TimeGuard(RUN_CAP_V9)
@@ -362,7 +362,7 @@ def run_full():
     all_ok = True
     for pname, _cfg, _seeds, est_h in PHASES:
         rem = guard.remaining_hours()
-        if rem < 1.0 / 2.4:
+        if rem < 0.4166666666666667:
             print(f'[v9] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
             break
         if not V.cuda_healthy():

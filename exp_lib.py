@@ -37,7 +37,7 @@ import torch.nn.functional as F
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
-RUN_CAP = dict(total_hours=140.0 / 2.4, margin=0.93, already_hours=0.0, state_path='run_time_state.json')
+RUN_CAP = dict(total_hours=58.333333333333336, margin=0.93, already_hours=0.0, state_path='run_time_state.json')
 CODE_SEMANTICS = 'v11.124'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
@@ -645,7 +645,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # the same inputs, so their full-width forms are bitwise identical to the
     # per-chunk forms; they are hoisted out of the chunk loop whenever the
     # full-width first-occurrence mask fits in a modest transient (the chunked
-    # fallback below keeps the peak memory of very wide top-k sweeps unchanged).
+    # fallback below covers very wide top-k sweeps).
     if n * topk_l.shape[1] * topk_l.shape[1] <= _FO_FULL_CAP_BYTES:
         keep_all = sel_valid
         if topk_l.shape[1] > 1:

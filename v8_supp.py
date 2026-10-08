@@ -19,7 +19,7 @@ L = V.L
 REPO = V.REPO
 DEVICE = L.DEVICE
 RUN_CAP_V8 = dict(L.RUN_CAP)
-RUN_CAP_V8.update(total_hours=float(os.environ.get('V8_CAP_HOURS', 45.0 / 2.4)), state_path='run_time_state_v8.json', already_hours=0.0)
+RUN_CAP_V8.update(total_hours=float(os.environ.get('V8_CAP_HOURS', 18.75)), state_path='run_time_state_v8.json', already_hours=0.0)
 
 def make_guard():
     g = L.TimeGuard(RUN_CAP_V8)
@@ -165,7 +165,7 @@ def run_full():
     all_ok = True
     for pname, _cfg, _seeds, est_h in PHASES:
         rem = guard.remaining_hours()
-        if rem < 1.0 / 2.4:
+        if rem < 0.4166666666666667:
             print(f'[v8] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
             break
         if not V.cuda_healthy():

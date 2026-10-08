@@ -38,7 +38,7 @@ finally:
 DEVICE = L.DEVICE
 OVERLAP = L.OVERLAP
 RUN_CAP_V7 = dict(L.RUN_CAP)
-RUN_CAP_V7.update(total_hours=float(os.environ.get('V7_CAP_HOURS', 107.0 / 2.4)), state_path='run_time_state_v7.json')
+RUN_CAP_V7.update(total_hours=float(os.environ.get('V7_CAP_HOURS', 44.583333333333336)), state_path='run_time_state_v7.json')
 RUN_CAP_V7['already_hours'] = 0.0
 _ROPE_CS_CACHE = {}
 _ROPE_INV_CACHE = {}
@@ -1523,7 +1523,7 @@ def run_full():
     all_ok = True
     for pname, kind, payload, est_h in PHASES:
         rem = guard.remaining_hours()
-        if rem < 1.0 / 2.4:
+        if rem < 0.4166666666666667:
             print(f'[v7] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
             break
         if not cuda_healthy():
