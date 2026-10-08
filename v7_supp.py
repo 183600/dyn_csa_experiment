@@ -163,7 +163,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
 
-    def _single_rope(self, x, pre=None, gate_sig=None):
+    def _single_rope(self, x, pre=None, gate_sig=None, pre_blocks=None):
         cfg = self.cfg
         T = x.shape[0]
         nh, hd = (self.nh, self.hd)
@@ -196,6 +196,14 @@ class HybridAttentionRoPE(L.HybridAttention):
                 bid = torch.zeros(T, dtype=torch.long, device=x.device)
                 nblk = 1
                 gate_mean = torch.zeros((), device=x.device) if self.need_reg else None
+            elif pre_blocks is not None:
+                bid, nblk, _hon = pre_blocks
+                if self.need_reg:
+                    if _hon.dtype != gate.dtype:
+                        _hon = _hon.to(gate.dtype)
+                    _soft_hon = gate * _hon
+                    _shs = _soft_hon.sum()
+                    gate_mean = (float(nblk - 1) + _shs - _shs.detach()) / T
             else:
                 with torch.no_grad():
                     bid, nblk, _hon_d = L.blocks_from_cuts(T, gl, cfg.min_block, cfg.max_block, x.device, return_count=True, return_honoured=True)
@@ -405,16 +413,20 @@ class HybridAttentionRoPE(L.HybridAttention):
                         pre_all[kk] = v.reshape(B, T, *v.shape[1:])
             pres = [None if pre_all is None else {kk: v[b] if v is not None else None for kk, v in pre_all.items()} for b in range(B)]
             gate_sigs = None
+            pre_blocks = None
             if self.cfg.chunking == 'cosine_learnable' and B > 1:
                 _raw = [self._gate_signal(x[b], pres[b]) for b in range(B)]
                 if all((_r is not None for _r in _raw)):
-                    _gl = torch.stack([_r[1] for _r in _raw]).cpu().tolist()
+                    _gl = torch.stack([_r[1] for _r in _raw]).cpu().numpy()
                     gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gl)]
+                    # same hoisted block geometry as exp_lib.HybridAttention.forward:
+                    # one stacked H2D for bids and honoured instead of 2B copies
+                    pre_blocks = L._hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
             outs = []
             gates = []
             for b in range(B):
                 pre = pres[b]
-                o, g = self._single_rope(x[b], pre=pre, gate_sig=None if gate_sigs is None else gate_sigs[b])
+                o, g = self._single_rope(x[b], pre=pre, gate_sig=None if gate_sigs is None else gate_sigs[b], pre_blocks=None if pre_blocks is None else pre_blocks[b])
                 outs.append(o)
                 if g is not None:
                     gates.append(g)

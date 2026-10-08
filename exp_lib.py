@@ -71,12 +71,17 @@ def _segment(n, want_cut_list, min_block, max_block):
     # pending by then (next_cut[p] <= q - 1).  The results are exactly those of
     # the token-by-token scan.
     _BIG = n + 1
+    # `want_cut_list` arrives as a python list (per-row `.tolist()`) or as a
+    # numpy bool row (the batched `_hoist_blocks_from_cuts` path); normalising
+    # through np.asarray is a no-op for the latter.  Same booleans either way.
     slots = np.nonzero(np.asarray(want_cut_list, dtype=bool))[0].tolist()
     honoured = {}
     counts = []
     p = 0
     si = 0
     ns = len(slots)
+    append = counts.append
+    hon_set = honoured.__setitem__
     while p < n:
         while si < ns and slots[si] < p:
             si += 1
@@ -91,9 +96,9 @@ def _segment(n, want_cut_list, min_block, max_block):
             q = n
         if q <= p:
             q = p + 1
-        counts.append(q - p)
+        append(q - p)
         if q < n and nc <= q - 1:
-            honoured[nc] = 1.0
+            hon_set(nc, 1.0)
         p = q
     bids = np.repeat(np.arange(len(counts), dtype=np.int64), np.asarray(counts, dtype=np.int64))
     if cacheable:
@@ -141,6 +146,40 @@ def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_coun
     if return_honoured:
         out.append(hon)
     return tuple(out)
+
+def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_honoured, hon_dtype):
+    # Batched form of the per-row `blocks_from_cuts` + honoured-mask uploads in
+    # the cosine_learnable path.  `blocks_from_cuts` stays the single exit for
+    # the cut table (called with a CPU device it returns the host tensor and
+    # performs no H2D); the B per-row pinned H2D copies of the block ids and
+    # the B honoured-mask copies are replaced by ONE stacked H2D each.  Every
+    # value reaching the device — the integer block ids (with the `_pool_cpu`
+    # tag re-attached to each device row) and the 0.0/1.0 honoured mask — is
+    # identical to the per-row form; only the transport is batched.
+    bids_cpu = []
+    nblks = []
+    hons = []
+    for _g in gate_lists:
+        _b, _nb, _hon = blocks_from_cuts(T, _g, min_block, max_block, torch.device('cpu'), return_count=True, return_honoured=True)
+        bids_cpu.append(_b)
+        nblks.append(_nb)
+        hons.append(_hon)
+    bid_stack = _h2d_async(torch.stack(bids_cpu), torch.long, device)
+    hon_stack = None
+    if want_honoured and T > 1:
+        arr = np.zeros((len(gate_lists), T - 1), dtype=np.float32)
+        for _i, _hon in enumerate(hons):
+            if _hon:
+                _sl = np.fromiter((int(_s) for _s in _hon), dtype=np.int64, count=len(_hon))
+                _sl = _sl[(0 <= _sl) & (_sl < T - 1)]
+                arr[_i, _sl] = 1.0
+        hon_stack = _h2d_async(arr, hon_dtype, device)
+    out = []
+    for b in range(len(bids_cpu)):
+        row = bid_stack[b]
+        row._pool_cpu = getattr(bids_cpu[b], '_pool_cpu', None)
+        out.append((row, nblks[b], None if hon_stack is None else hon_stack[b]))
+    return out
 
 def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=False):
     n = H.shape[0]
@@ -958,7 +997,7 @@ class HybridAttention(nn.Module):
         gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
         return (gate, gate.detach() > _HALF)
 
-    def _single(self, x, pre=None, gate_sig=None):
+    def _single(self, x, pre=None, gate_sig=None, pre_blocks=None):
         cfg = self.cfg
         T = x.shape[0]
         assert cfg.kind in ('csa', 'hca'), 'dense layers go through _full_batched'
@@ -989,17 +1028,24 @@ class HybridAttention(nn.Module):
                 if gate.numel():
                     gate_bool = gate.detach() > _HALF
                     gate_list = gate_bool.cpu().tolist()
-            with torch.no_grad():
-                if gate_list is None:
-                    gate_list = (gate.detach() > _HALF).cpu().tolist()
-                bid, nblk, _honoured = blocks_from_cuts(T, gate_list, cfg.min_block, cfg.max_block, x.device, return_count=True, return_honoured=True)
+            if pre_blocks is not None:
+                bid, nblk, _hon_dev = pre_blocks
+            else:
+                with torch.no_grad():
+                    if gate_list is None:
+                        gate_list = (gate.detach() > _HALF).cpu().tolist()
+                    bid, nblk, _honoured = blocks_from_cuts(T, gate_list, cfg.min_block, cfg.max_block, x.device, return_count=True, return_honoured=True)
+                _hon_dev = None
+                if gate.numel() and self.need_reg:
+                    _keep = [0.0] * len(gate_list)
+                    for _slot in _honoured:
+                        if 0 <= _slot < len(_keep):
+                            _keep[_slot] = 1.0
+                    _hon_dev = _h2d_async(_keep, gate.dtype, gate.device)
             if gate.numel() and self.need_reg:
-                _keep = [0.0] * len(gate_list)
-                for _slot in _honoured:
-                    if 0 <= _slot < len(_keep):
-                        _keep[_slot] = 1.0
-                _hon = _h2d_async(_keep, gate.dtype, gate.device)
-                _soft_honoured = gate * _hon
+                if _hon_dev.dtype != gate.dtype:
+                    _hon_dev = _hon_dev.to(gate.dtype)
+                _soft_honoured = gate * _hon_dev
                 _shs = _soft_honoured.sum()
                 gate_mean = (float(nblk - 1) + _shs - _shs.detach()) / T
             else:
@@ -1062,16 +1108,25 @@ class HybridAttention(nn.Module):
                     pre_all[kk] = v.reshape(B, T, *v.shape[1:])
         pres = [None if pre_all is None else {kk: v[b] if v is not None else None for kk, v in pre_all.items()} for b in range(B)]
         gate_sigs = None
+        pre_blocks = None
         if self.cfg.chunking == 'cosine_learnable' and B > 1:
             _raw = [self._gate_signal(x[b], pres[b]) for b in range(B)]
             if all((_r is not None for _r in _raw)):
-                _gl = torch.stack([_r[1] for _r in _raw]).cpu().tolist()
+                # .numpy() is a zero-copy view of the stacked CPU tensor (the
+                # base tensor stays alive through the views); the segmenter
+                # consumes the same booleans without a per-row list rebuild.
+                _gl = torch.stack([_r[1] for _r in _raw]).cpu().numpy()
                 gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gl)]
+                # Hoist the per-row block geometry: ONE stacked H2D for the
+                # (B, T) block ids and ONE for the (B, T-1) honoured mask
+                # instead of 2B pinned copies; every value is identical to
+                # the per-row form (see _hoist_blocks_from_cuts).
+                pre_blocks = _hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
         outs = []
         gates = []
         for b in range(B):
             pre = pres[b]
-            o, g = self._single(x[b], pre=pre, gate_sig=None if gate_sigs is None else gate_sigs[b])
+            o, g = self._single(x[b], pre=pre, gate_sig=None if gate_sigs is None else gate_sigs[b], pre_blocks=None if pre_blocks is None else pre_blocks[b])
             outs.append(o)
             if g is not None:
                 gates.append(g)
@@ -1449,6 +1504,18 @@ def atomic_write_csv(path, header, rows):
 
 _PINNED_HOST_CACHE = {}
 
+def _ids_narrow(train_ids):
+    # Token ids are bounded by the vocab (<= 2**31 for every corpus this repo
+    # produces), so the resident copy (GPU, or pinned host staging) is stored
+    # int32 — half the footprint of int64 — and widened back to int64 right
+    # after each batch gather, leaving the yielded batch bit-identical.  The
+    # guard keeps any hypothetical out-of-range corpus on the old int64 path.
+    if train_ids.dtype == np.int32:
+        return train_ids
+    if train_ids.size and int(train_ids.max()) < 2 ** 31:
+        return train_ids.astype(np.int32)
+    return train_ids
+
 def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     rng = np.random.default_rng(seed)
     n = len(train_ids) - seq_len - 1
@@ -1461,14 +1528,14 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         host = cached[1]
     elif device.type == 'cuda' and train_ids.nbytes <= (512 << 20):
         try:
-            host = torch.from_numpy(train_ids).to(device)
+            host = torch.from_numpy(_ids_narrow(train_ids)).to(device)
             _PINNED_HOST_CACHE['entry'] = (train_ids, host)
         except RuntimeError:
             host = None
     if host is None:
         if device.type == 'cuda':
             try:
-                host = torch.from_numpy(train_ids).pin_memory()
+                host = torch.from_numpy(_ids_narrow(train_ids)).pin_memory()
                 _PINNED_HOST_CACHE['entry'] = (train_ids, host)
             except RuntimeError:
                 host = torch.from_numpy(train_ids)
@@ -1482,6 +1549,10 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
             ids = host[_h2d_async(idx, idx.dtype, host.device)]
         else:
             ids = host[idx]
+        if ids.dtype != torch.int64:
+            # widen back right after the gather (one tiny cast on a (B, T+1)
+            # batch): the yielded ids are bit-identical to the int64 form.
+            ids = ids.long()
         if ids.device != device:
             ids = _h2d_async(ids, ids.dtype, device)
         yield (ids[:, :-1], ids[:, 1:])
