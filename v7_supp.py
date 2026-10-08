@@ -419,8 +419,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 if all((_r is not None for _r in _raw)):
                     _gl = torch.stack([_r[1] for _r in _raw]).cpu().numpy()
                     gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gl)]
-                    # same hoisted block geometry as exp_lib.HybridAttention.forward:
-                    # one stacked H2D for bids and honoured instead of 2B copies
+                    # same batched block geometry as exp_lib.HybridAttention.forward;
+                    # every value identical to the per-row form
                     pre_blocks = L._hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
             outs = []
             gates = []

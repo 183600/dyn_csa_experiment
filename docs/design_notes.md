@@ -104,20 +104,20 @@ q_chunk ∈ {128, 1024, 7}）输出与 `q.grad` 逐位相同。但 `_take_2d` �
 
 ## 6.1 传输层批量化不改值
 
-有两处性能优化只改**传输/存储形式**，不改任何到达算子的数值，因此不
+有两处实现只改**传输/存储形式**，不改任何到达算子的数值，因此不
 触碰 §3.1 的可比性（`CODE_SEMANTICS` 不需要 bump）：
 
 - `HybridAttention.forward`（及 v7 的 RoPE 镜像）把逐行的
-  `blocks_from_cuts` H2D 与 honoured 掩码 H2D 合并为每层**一次堆叠
-  H2D**（`_hoist_blocks_from_cuts`）。块表仍由 `blocks_from_cuts` 唯一
+  `blocks_from_cuts` 上传与 honoured 掩码上传合并为每层一次堆叠
+  （`_hoist_blocks_from_cuts`）。块表仍由 `blocks_from_cuts` 唯一
   出口产生（以 CPU device 调用即跳过上传）；块 id 是整数、honoured
   掩码是精确的 0.0/1.0，堆叠后逐行切片与逐行上传逐位相同。门控硬决策
   以 `.cpu().numpy()` 零拷贝视图传给宿主侧分段器，布尔值与 `.tolist()`
   形式相同。
 - `batch_iter` 的常驻语料（GPU 或 pinned host）以 int32 存储（token id
   < 2³¹，有 max 守卫），每次取批后**立即** `.long()` 还原，yield 出的
-  batch 与 int64 形式逐位相同；语料显存/内存占用减半。是否驻留 GPU 的
-  阈值判断仍以原 int64 字节数为准（行为集合不变）。
+  batch 与 int64 形式逐位相同。是否驻留 GPU 的阈值判断仍以原 int64
+  字节数为准（行为集合不变）。
 
 ## 6.2 宿主侧算法的整数等价
 

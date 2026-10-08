@@ -151,11 +151,9 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
     # Batched form of the per-row `blocks_from_cuts` + honoured-mask uploads in
     # the cosine_learnable path.  `blocks_from_cuts` stays the single exit for
     # the cut table (called with a CPU device it returns the host tensor and
-    # performs no H2D); the B per-row pinned H2D copies of the block ids and
-    # the B honoured-mask copies are replaced by ONE stacked H2D each.  Every
-    # value reaching the device — the integer block ids (with the `_pool_cpu`
-    # tag re-attached to each device row) and the 0.0/1.0 honoured mask — is
-    # identical to the per-row form; only the transport is batched.
+    # performs no H2D).  Every value reaching the device — the integer block
+    # ids (with the `_pool_cpu` tag re-attached to each device row) and the
+    # 0.0/1.0 honoured mask — is identical to the per-row form.
     bids_cpu = []
     nblks = []
     hons = []
@@ -1114,13 +1112,11 @@ class HybridAttention(nn.Module):
             if all((_r is not None for _r in _raw)):
                 # .numpy() is a zero-copy view of the stacked CPU tensor (the
                 # base tensor stays alive through the views); the segmenter
-                # consumes the same booleans without a per-row list rebuild.
+                # consumes the same booleans.
                 _gl = torch.stack([_r[1] for _r in _raw]).cpu().numpy()
                 gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gl)]
-                # Hoist the per-row block geometry: ONE stacked H2D for the
-                # (B, T) block ids and ONE for the (B, T-1) honoured mask
-                # instead of 2B pinned copies; every value is identical to
-                # the per-row form (see _hoist_blocks_from_cuts).
+                # Batched block geometry for the whole batch; every value is
+                # identical to the per-row form (see _hoist_blocks_from_cuts).
                 pre_blocks = _hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
         outs = []
         gates = []
@@ -1507,9 +1503,9 @@ _PINNED_HOST_CACHE = {}
 def _ids_narrow(train_ids):
     # Token ids are bounded by the vocab (<= 2**31 for every corpus this repo
     # produces), so the resident copy (GPU, or pinned host staging) is stored
-    # int32 — half the footprint of int64 — and widened back to int64 right
-    # after each batch gather, leaving the yielded batch bit-identical.  The
-    # guard keeps any hypothetical out-of-range corpus on the old int64 path.
+    # int32 and widened back to int64 right after each batch gather, leaving
+    # the yielded batch bit-identical.  The guard keeps any hypothetical
+    # out-of-range corpus on the old int64 path.
     if train_ids.dtype == np.int32:
         return train_ids
     if train_ids.size and int(train_ids.max()) < 2 ** 31:
@@ -1550,8 +1546,8 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         else:
             ids = host[idx]
         if ids.dtype != torch.int64:
-            # widen back right after the gather (one tiny cast on a (B, T+1)
-            # batch): the yielded ids are bit-identical to the int64 form.
+            # widen back right after the gather: the yielded ids are
+            # bit-identical to the int64 form.
             ids = ids.long()
         if ids.device != device:
             ids = _h2d_async(ids, ids.dtype, device)
