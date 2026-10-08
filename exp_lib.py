@@ -63,31 +63,40 @@ def _segment(n, want_cut_list, min_block, max_block):
         hit = _SEGMENT_CACHE.get(key)
         if hit is not None:
             return hit
+    # Closed form of the original greedy scan: with p the start of the current
+    # block, the next cut lands at min(p + max_block, max(p + min_block,
+    # next_cut[p] + 1)), where next_cut[p] is the earliest wanted-cut slot >= p
+    # (slot ci is the boundary between tokens ci and ci+1, scanned when the scan
+    # reaches token ci + 1).  A cut at q honours next_cut[p] iff it was already
+    # pending by then (next_cut[p] <= q - 1).  The walk therefore only needs one
+    # iteration per produced block instead of one per token; the results are
+    # exactly those of the token-by-token scan.
+    _BIG = n + 1
+    slots = np.nonzero(np.asarray(want_cut_list, dtype=bool))[0].tolist()
     honoured = {}
-    bids = [0] * n
-    counts = [1]
-    cur, cur_len = (0, 1)
-    pending_cut = False
-    pending_slot = -1
-    for t in range(1, n):
-        cur_len += 1
-        ci = t - 1
-        if want_cut_list[ci]:
-            if not pending_cut:
-                pending_slot = ci
-            pending_cut = True
-        may = cur_len > min_block
-        must = cur_len > max_block
-        if must or (pending_cut and may):
-            cur += 1
-            cur_len = 1
-            counts.append(0)
-            if pending_cut:
-                honoured[pending_slot] = 1.0
-            pending_cut = False
-            pending_slot = -1
-        counts[cur] += 1
-        bids[t] = cur
+    counts = []
+    p = 0
+    si = 0
+    ns = len(slots)
+    while p < n:
+        while si < ns and slots[si] < p:
+            si += 1
+        nc = slots[si] if si < ns else _BIG
+        t = p + min_block
+        if nc + 1 > t:
+            t = nc + 1
+        q = p + max_block
+        if t < q:
+            q = t
+        if q > n:
+            q = n
+        if q <= p:
+            q = p + 1
+        counts.append(q - p)
+        if q < n and nc <= q - 1:
+            honoured[nc] = 1.0
+        p = q
+    bids = np.repeat(np.arange(len(counts), dtype=np.int64), np.asarray(counts, dtype=np.int64))
     if cacheable:
         if len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
             _keep = list(_SEGMENT_CACHE.items())[len(_SEGMENT_CACHE) // 2:]
@@ -494,7 +503,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     _keep_w = keep[:, :_w_keep]
     kept[grid[_keep_w], dest[:, :_w_keep][_keep_w]] = order[:, :_w_keep][_keep_w]
     del grid, _keep_w
-    pad_blk = causal.to(torch.int32).argmax(dim=1).to(torch.int32)
+    pad_blk = causal.to(torch.uint8).argmax(dim=1).to(torch.int32)
     idx_out = torch.where(kept >= 0, kept, pad_blk[:, None])
     if out_valid is not None:
         valid_cols = kept >= 0
@@ -890,7 +899,24 @@ class HybridAttention(nn.Module):
             pre['fused'] = F.conv1d(z, self.fuse_conv.weight, groups=fx.shape[-1]).transpose(1, 2)
         return pre
 
-    def _single(self, x, pre=None):
+    def _gate_signal(self, x, pre=None):
+        # GPU-side half of the cosine_learnable gate, computed by the same ops as
+        # the inline path in _single.  forward() calls this for every row of the
+        # batch first, then moves the stacked hard decisions to the CPU with ONE
+        # synchronising transfer instead of one per row; every value downstream
+        # (the gate tensor itself and the per-row cut lists) is identical to the
+        # per-row inline form.
+        fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
+        sim = cosine_similarity_consecutive(fused)
+        if sim.numel() == 0:
+            return None
+        cfg = self.cfg
+        prefix_mean = torch.cumsum(sim, 0) / _range_cache(1, sim.numel() + 1, x.device)
+        tau = prefix_mean + self.delta_logit
+        gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
+        return (gate, gate.detach() > _HALF)
+
+    def _single(self, x, pre=None, gate_sig=None):
         cfg = self.cfg
         T = x.shape[0]
         assert cfg.kind in ('csa', 'hca'), 'dense layers go through _full_batched'
@@ -904,20 +930,23 @@ class HybridAttention(nn.Module):
             Cb_raw = x @ self.W_bKV if self.W_bKV is not None else None
         gate_mean = None
         if cfg.chunking == 'cosine_learnable':
-            fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
-            sim = cosine_similarity_consecutive(fused)
-            if sim.numel() == 0:
-                tau = torch.tensor(0.0, device=x.device)
-                gate = torch.tensor([], device=x.device)
+            if gate_sig is not None:
+                gate, gate_list = gate_sig
             else:
-                prefix_mean = torch.cumsum(sim, 0) / _range_cache(1, sim.numel() + 1, x.device)
-                tau = prefix_mean + self.delta_logit
-                gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
-            gate_bool = None
-            gate_list = None
-            if gate.numel():
-                gate_bool = gate.detach() > _HALF
-                gate_list = gate_bool.cpu().tolist()
+                fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
+                sim = cosine_similarity_consecutive(fused)
+                if sim.numel() == 0:
+                    tau = torch.tensor(0.0, device=x.device)
+                    gate = torch.tensor([], device=x.device)
+                else:
+                    prefix_mean = torch.cumsum(sim, 0) / _range_cache(1, sim.numel() + 1, x.device)
+                    tau = prefix_mean + self.delta_logit
+                    gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
+                gate_bool = None
+                gate_list = None
+                if gate.numel():
+                    gate_bool = gate.detach() > _HALF
+                    gate_list = gate_bool.cpu().tolist()
             with torch.no_grad():
                 if gate_list is None:
                     gate_list = (gate.detach() > _HALF).cpu().tolist()
@@ -989,11 +1018,18 @@ class HybridAttention(nn.Module):
                     pre_all[kk] = v
                 else:
                     pre_all[kk] = v.reshape(B, T, *v.shape[1:])
+        pres = [None if pre_all is None else {kk: v[b] if v is not None else None for kk, v in pre_all.items()} for b in range(B)]
+        gate_sigs = None
+        if self.cfg.chunking == 'cosine_learnable' and B > 1:
+            _raw = [self._gate_signal(x[b], pres[b]) for b in range(B)]
+            if all((_r is not None for _r in _raw)):
+                _gl = torch.stack([_r[1] for _r in _raw]).cpu().tolist()
+                gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gl)]
         outs = []
         gates = []
         for b in range(B):
-            pre = None if pre_all is None else {kk: v[b] if v is not None else None for kk, v in pre_all.items()}
-            o, g = self._single(x[b], pre=pre)
+            pre = pres[b]
+            o, g = self._single(x[b], pre=pre, gate_sig=None if gate_sigs is None else gate_sigs[b])
             outs.append(o)
             if g is not None:
                 gates.append(g)

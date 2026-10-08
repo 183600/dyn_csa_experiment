@@ -163,7 +163,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
 
-    def _single_rope(self, x, pre=None):
+    def _single_rope(self, x, pre=None, gate_sig=None):
         cfg = self.cfg
         T = x.shape[0]
         nh, hd = (self.nh, self.hd)
@@ -179,18 +179,24 @@ class HybridAttentionRoPE(L.HybridAttention):
             Cb_raw = x @ self.W_bKV if self.W_bKV is not None else None
         gate_mean = None
         if cfg.chunking == 'cosine_learnable':
-            fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
-            sim = L.cosine_similarity_consecutive(fused)
-            if sim.numel() == 0:
+            if gate_sig is not None:
+                gate, gl = gate_sig
+            else:
+                fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
+                sim = L.cosine_similarity_consecutive(fused)
+                if sim.numel() == 0:
+                    gate = None
+                else:
+                    prefix_mean = torch.cumsum(sim, 0) / L._range_cache(1, sim.numel() + 1, x.device)
+                    tau = prefix_mean + self.delta_logit
+                    gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
+                    hard_b = gate.detach() > L._HALF
+                    gl = hard_b.cpu().tolist()
+            if gate is None:
                 bid = torch.zeros(T, dtype=torch.long, device=x.device)
                 nblk = 1
                 gate_mean = torch.zeros((), device=x.device) if self.need_reg else None
             else:
-                prefix_mean = torch.cumsum(sim, 0) / L._range_cache(1, sim.numel() + 1, x.device)
-                tau = prefix_mean + self.delta_logit
-                gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
-                hard_b = gate.detach() > L._HALF
-                gl = hard_b.cpu().tolist()
                 with torch.no_grad():
                     bid, nblk, _hon_d = L.blocks_from_cuts(T, gl, cfg.min_block, cfg.max_block, x.device, return_count=True, return_honoured=True)
                 if self.need_reg:
@@ -397,11 +403,18 @@ class HybridAttentionRoPE(L.HybridAttention):
                         pre_all[kk] = v
                     else:
                         pre_all[kk] = v.reshape(B, T, *v.shape[1:])
+            pres = [None if pre_all is None else {kk: v[b] if v is not None else None for kk, v in pre_all.items()} for b in range(B)]
+            gate_sigs = None
+            if self.cfg.chunking == 'cosine_learnable' and B > 1:
+                _raw = [self._gate_signal(x[b], pres[b]) for b in range(B)]
+                if all((_r is not None for _r in _raw)):
+                    _gl = torch.stack([_r[1] for _r in _raw]).cpu().tolist()
+                    gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gl)]
             outs = []
             gates = []
             for b in range(B):
-                pre = None if pre_all is None else {kk: v[b] if v is not None else None for kk, v in pre_all.items()}
-                o, g = self._single_rope(x[b], pre=pre)
+                pre = pres[b]
+                o, g = self._single_rope(x[b], pre=pre, gate_sig=None if gate_sigs is None else gate_sigs[b])
                 outs.append(o)
                 if g is not None:
                     gates.append(g)
