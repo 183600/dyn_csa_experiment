@@ -2,21 +2,16 @@ name: Continuous Loop
 
 on:
   workflow_dispatch:
-  # 低频兜底：每天一次，防止自循环 dispatch 断链后彻底停摆。
-  # 机制说明：同一 concurrency group 中，新触发的 run 只会取代「排队中」的 run，
-  # 绝不会取消「运行中」的 run（cancel-in-progress: false），因此不会堆积队列。
-  # 不需要兜底就删掉下面两行。
   schedule:
-    - cron: '23 3 * * *'
+    - cron: '0 */6 * * *'
 
 concurrency:
   group: continuous-loop
-  cancel-in-progress: false   # 运行中的 5 小时任务绝不会被新 run 取消
+  cancel-in-progress: false
 
 jobs:
   run-opencode:
     runs-on: ubuntu-latest
-    # 保险丝：实际 ~5h 结束；step 超时(315m) + 收尾(~5m) < 330m < GitHub 6h 硬上限
     timeout-minutes: 330
     permissions:
       contents: write
@@ -54,7 +49,9 @@ jobs:
           echo "=== Before ==="
           free -h
           df -h /
+
           sudo systemctl disable --now systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
+
           sudo modprobe zram 2>/dev/null || true
           if [ -e /dev/zram0 ]; then
             sudo swapoff /dev/zram0 2>/dev/null || true
@@ -65,12 +62,14 @@ jobs:
           else
             echo "[info] zram not available, skip"
           fi
+
           AVAIL_KB=$(df --output=avail / | tail -1)
           AVAIL_MB=$((AVAIL_KB / 1024))
           WANT_MB=$((AVAIL_MB - 3072))
           if [ "$WANT_MB" -gt 8192 ]; then WANT_MB=8192; fi
           if [ "$WANT_MB" -lt 2048 ]; then WANT_MB=2048; fi
           echo "[info] available disk: ${AVAIL_MB}MB, will create swapfile: ${WANT_MB}MB"
+
           sudo swapoff /swapfile 2>/dev/null || true
           sudo rm -f /swapfile
           if ! sudo fallocate -l "${WANT_MB}M" /swapfile 2>/dev/null; then
@@ -80,12 +79,14 @@ jobs:
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile >/dev/null
           sudo swapon -p 10 /swapfile && echo "[ok] swapfile enabled"
+
           sudo sysctl -w vm.swappiness=100
           sudo sysctl -w vm.vfs_cache_pressure=200
           sudo sysctl -w vm.overcommit_memory=1
           sudo sysctl -w vm.dirty_ratio=40
           sudo sysctl -w vm.dirty_background_ratio=10
           sudo sysctl -w vm.watermark_scale_factor=200 2>/dev/null || true
+
           echo "=== After ==="
           free -h
           swapon --show
@@ -120,13 +121,16 @@ jobs:
           }
           EOF
 
+          echo "=== opencode config ==="
+          cat ~/.config/opencode/opencode.json
+
       - name: Configure git
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Run opencode for ~5 hours (3 phases per iteration)
-        timeout-minutes: 315   # 5h15m：> 主循环(4h45m)+收尾，< job 的 330m
+        timeout-minutes: 300
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
         run: |
@@ -134,87 +138,35 @@ jobs:
           set -o pipefail
           BRANCH="${GITHUB_REF_NAME:-main}"
           OUT=/tmp/oc_out.log
-          MAIN_PID=$$ 
-          # 4小时45分实际工作 + ~15分钟收尾 ≈ 整个 job 运行约 5 小时后从容结束
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
-          echo "[info] start: $(date '+%F %T') | planned end: $(date -d "@${DEADLINE}" '+%F %T' 2>/dev/null || echo "${DEADLINE}")"
 
           # ================= 三阶段提示词 =================
-          PROMPT_PERF='尽可能优化代码的性能和显存占用，确保不会使实验结果不成立'
-          PROMPT_BUG='检查代码中是否存在bug，如果有就修复所有的bug。'
+          PROMPT_PERF='优化代码的性能和显存占用。优化只要不会明显降低性能就可以做。不要修改代码逻辑、不要影响实验结果。不要输出或写入"优化了哪些内容"的报告。'
+          PROMPT_BUG='仔细检查代码中是否存在影响实验结果的bug，如果有就修复所有的bug。不要重复修复之前已经修过的bug。不要输出或写入"修复了哪些bug"的报告。'
           PROMPT_CLEAN='确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释）。删除所有多余的内容。'
 
+          # 每阶段单次调用的最大时长（秒）
           PERF_TIMEOUT=$((60*60))     # 1h
           BUG_TIMEOUT=$((60*60))      # 1h
           CLEAN_TIMEOUT=$((30*60))    # 30m
 
           i=0
-
-          # ---------- 心跳 ----------
-          # 1) 每 5 分钟输出一条日志，防止长时间无日志；
-          # 2) 关键：持续探测主进程($$)是否存活，主进程一退出，心跳最迟 30s 内
-          #    自行消亡。孤儿后台进程会占住 stdout 把 step 挂死到 job 超时，
-          #    最终被 runner 以 "The operation was canceled" 强杀。
-          heartbeat() {
-            local n=0
-            while kill -0 "$MAIN_PID" 2>/dev/null; do
-              sleep 30
-              n=$((n+1))
-              if [ $((n % 10)) -eq 0 ]; then
-                echo "[heartbeat] $(date '+%F %T') - still running, $(( (DEADLINE - $(date +%s)) / 60 )) min left"
-              fi
-            done
-          }
-          heartbeat &
-          HEARTBEAT_PID=$!
-
-          # 清理 timeout 杀漏的 opencode 残留子进程（脱离进程组的 node 进程
-          # 同样会占住管道把 step 挂死）
-          kill_stray() {
-            pkill -TERM -f 'opencode' 2>/dev/null
-            sleep 3
-            pkill -KILL -f 'opencode' 2>/dev/null
-            return 0
-          }
-
-          # 磁盘低水位时先回收，尽量避免 <2GB 直接 break 提前结束
-          reclaim_space() {
-            echo "[space] 磁盘低水位，尝试回收..."
-            npm cache clean --force >/dev/null 2>&1 || true
-            rm -rf ~/.npm/_cacache 2>/dev/null || true
-            rm -rf ~/.local/share/opencode/storage 2>/dev/null || true
-            sudo journalctl --rotate >/dev/null 2>&1 || true
-            sudo journalctl --vacuum-time=1s >/dev/null 2>&1 || true
-            df -h / | tail -1
-          }
+          FAIL_COUNT=0
+          RATE_COUNT=0
 
           commit_and_push() {
             git add -A || true
-            if git commit -q -m "auto: iteration $1"; then
-              local try
-              for try in 1 2 3; do
-                git pull --rebase origin "$BRANCH" >/dev/null 2>&1 || git rebase --abort >/dev/null 2>&1 || true
-                if git push origin "HEAD:${BRANCH}"; then
-                  echo "[ok] pushed iteration $1"
-                  return 0
-                fi
-                echo "[warn] push 失败 (第 ${try}/3 次)，30s 后重试"
-                sleep 30
-              done
-              echo "[warn] iteration $1 最终 push 失败，改动保留在本地"
-            else
-              echo "[info] iteration $1 nothing to commit"
-            fi
+            git commit -m "auto: iteration $1" || true
+            git pull --rebase origin "$BRANCH" || git rebase --abort || true
+            git push origin "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
           }
 
           on_shutdown() {
             echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
-            kill "$HEARTBEAT_PID" 2>/dev/null || true
-            kill_stray
             git add -A || true
             if ! git diff --cached --quiet; then
-              git commit -q -m "auto: partial work saved on shutdown" || true
-              git pull --rebase origin "$BRANCH" >/dev/null 2>&1 || git rebase --abort >/dev/null 2>&1 || true
+              git commit -m "auto: partial work saved on shutdown" || true
+              git pull --rebase origin "$BRANCH" || git rebase --abort || true
               git push origin "HEAD:${BRANCH}" || true
               echo "[trap] partial work committed & pushed"
             else
@@ -224,89 +176,103 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          kimi_alive() {
-            local code
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
-                   -H "Authorization: Bearer ${KIMI_API_KEY}" \
-                   'https://api.moonshot.cn/v1/models' 2>/dev/null)
-            echo "[info] Kimi 健康检查 /v1/models -> HTTP ${code:-timeout}"
-            case "$code" in 2*) return 0 ;; *) return 1 ;; esac
-          }
-
+          # ---------- 单阶段执行（带重试） ----------
+          # 参数: phase_name  prompt  timeout_seconds
+          # 返回: 0 成功 / 124|137|143 超时被杀 / 1 放弃
           run_phase() {
             local phase="$1" prompt="$2" budget="$3"
-            local attempt=0 fail=0 rate=0 EC=0
+            local attempt=0
+            FAIL_COUNT=0
+            RATE_COUNT=0
+
             while [ $attempt -lt 3 ]; do
               attempt=$((attempt+1))
+
               if [ "$(date +%s)" -ge "$DEADLINE" ]; then
                 echo "[info] phase=$phase 全局时间已用尽，跳过"
                 return 1
               fi
-              if ! kimi_alive; then
-                echo "[warn] phase=$phase Kimi 端点不可用，等待 60s 后重试"
-                sleep 60
-              fi
+
               echo "=========== iter #$i | phase=$phase | attempt=$attempt ==========="
+
               timeout --kill-after=180 "$budget" opencode run "$prompt" 2>&1 | tee "$OUT"
-              EC=$?
-              kill_stray
-              if [ "$EC" -eq 0 ]; then return 0; fi
-              if [ "$EC" -eq 124 ] || [ "$EC" -eq 137 ] || [ "$EC" -eq 143 ]; then
-                echo "[warn] phase=$phase 阶段预算用尽/被杀 (exit=$EC)，按计划进入下一阶段"
-                return "$EC"
+              local EC=$?
+
+              # 成功
+              if [ $EC -eq 0 ]; then
+                return 0
               fi
+
+              # 超时 / 被杀
+              if [ $EC -eq 124 ] || [ $EC -eq 137 ] || [ $EC -eq 143 ]; then
+                echo "[warn] phase=$phase 超时/被杀 (exit=$EC)"
+                return $EC
+              fi
+
+              # 429 限流：等待后重试（不消耗重试次数）
               if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
-                rate=$((rate+1))
-                echo "[warn] phase=$phase 命中 Kimi 限流(429) (连续: $rate)"
-                if [ "$rate" -ge 8 ]; then echo "[warn] 连续 8 次限流，放弃该阶段"; return 1; fi
+                RATE_COUNT=$((RATE_COUNT+1))
+                echo "[warn] phase=$phase 命中限流(429) (连续: $RATE_COUNT)"
+                if [ $RATE_COUNT -ge 8 ]; then
+                  echo "[warn] 连续 8 次限流，放弃该阶段"
+                  return 1
+                fi
                 sleep 180
+                attempt=$((attempt-1))
                 continue
               fi
-              rate=0
-              fail=$((fail+1))
-              echo "[warn] phase=$phase Kimi 失败 (连续: $fail)"
-              if [ "$fail" -ge 3 ]; then echo "[warn] 连续 3 次失败，放弃该阶段"; return 1; fi
+
+              # 其它非零退出
+              RATE_COUNT=0
+              FAIL_COUNT=$((FAIL_COUNT+1))
+              echo "[warn] phase=$phase 失败 (连续: $FAIL_COUNT)"
+              if [ $FAIL_COUNT -ge 3 ]; then
+                echo "[warn] 连续 3 次失败，放弃该阶段"
+                return 1
+              fi
               sleep 30
             done
+
             return 1
           }
 
           # ================= 主循环 =================
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             i=$((i+1))
+
             AVAIL_MB=$(( $(df --output=avail / | tail -1) / 1024 ))
-            echo "--- iteration #$i | $(date '+%F %T') | free disk: ${AVAIL_MB}MB | left: $(( (DEADLINE-$(date +%s))/60 ))min ---"
+            echo "--- iteration #$i | free disk: ${AVAIL_MB}MB ---"
             free -h | head -2
-            if [ "$AVAIL_MB" -lt 4096 ]; then
-              reclaim_space
-              AVAIL_MB=$(( $(df --output=avail / | tail -1) / 1024 ))
-            fi
             if [ "$AVAIL_MB" -lt 2048 ]; then
-              echo "[error] 回收后磁盘仍不足 2GB，提前结束主循环，交给收尾步骤清理"
+              echo "[error] 磁盘剩余不足 2GB，提前结束循环，交给收尾步骤清理"
               break
             fi
+
+            # ----- 三个阶段：perf -> bug -> clean -----
             for phase in perf bug clean; do
               case "$phase" in
                 perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
                 bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
                 clean) P="$PROMPT_CLEAN"; T="$CLEAN_TIMEOUT" ;;
               esac
+
+              # 收窄到剩余时间
               REMAIN=$(( DEADLINE - $(date +%s) ))
               if [ "$REMAIN" -le 0 ]; then
                 echo "[info] 全局时间已到，退出循环"
                 break 2
               fi
               if [ "$T" -gt "$REMAIN" ]; then T="$REMAIN"; fi
+
               echo ">>> iteration #$i | phase=$phase | budget=${T}s"
               run_phase "$phase" "$P" "$T"
+
+              # 无论成功失败，先把已完成的改动提交上去
               commit_and_push "$i-$phase"
+
               sleep 5
             done
           done
-
-          echo "[info] 主循环于 $(date '+%F %T') 结束（按计划运行约 5 小时）"
-          kill "$HEARTBEAT_PID" 2>/dev/null || true
-          kill_stray
 
       - name: Cleanup repo artifacts
         if: always()
@@ -337,7 +303,8 @@ jobs:
         run: |
           set +e
           if [ -z "$GITEE_TOKEN" ] || [ -z "$GITEE_REPO" ]; then
-            echo "GITEE_TOKEN or GITEE_REPO not set, skipping Gitee push."; exit 0
+            echo "GITEE_TOKEN or GITEE_REPO not set, skipping Gitee push."
+            exit 0
           fi
           BRANCH="${GITHUB_REF_NAME:-main}"
           git remote remove gitee 2>/dev/null || true
@@ -351,13 +318,6 @@ jobs:
         run: |
           set +e
           BRANCH="${GITHUB_REF_NAME:-main}"
-          sleep 30
-          for try in 1 2 3; do
-            if gh workflow run continuous-loop.yml --ref "$BRANCH"; then
-              echo "[ok] next run dispatched on ${BRANCH} (attempt ${try})"
-              exit 0
-            fi
-            echo "[warn] dispatch 失败 (第 ${try} 次)，60s 后重试"
-            sleep 60
-          done
-          echo "[warn] dispatch 全部失败：每日 cron 兜底会在 03:23 UTC 自动恢复链条"
+          gh workflow run continuous-loop.yml --ref "$BRANCH" \
+            && echo "next run dispatched on ${BRANCH}" \
+            || echo "[warn] dispatch failed, cron fallback will pick up"
