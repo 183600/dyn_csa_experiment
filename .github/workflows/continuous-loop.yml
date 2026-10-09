@@ -2,8 +2,9 @@ name: Continuous Loop
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */1 * * *'
+  # 移除每小时触发，仅依靠 workflow_dispatch 和底部的自我循环，防止队列堆积导致被 GitHub 强杀
+  # schedule:
+  #   - cron: '0 */1 * * *'
 
 concurrency:
   group: continuous-loop
@@ -12,7 +13,7 @@ concurrency:
 jobs:
   run-opencode:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 360  # 给予足够空间，放在 GitHub 6小时硬上限之前
     permissions:
       contents: write
       actions: write
@@ -49,9 +50,7 @@ jobs:
           echo "=== Before ==="
           free -h
           df -h /
-
           sudo systemctl disable --now systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
-
           sudo modprobe zram 2>/dev/null || true
           if [ -e /dev/zram0 ]; then
             sudo swapoff /dev/zram0 2>/dev/null || true
@@ -62,14 +61,12 @@ jobs:
           else
             echo "[info] zram not available, skip"
           fi
-
           AVAIL_KB=$(df --output=avail / | tail -1)
           AVAIL_MB=$((AVAIL_KB / 1024))
           WANT_MB=$((AVAIL_MB - 3072))
           if [ "$WANT_MB" -gt 8192 ]; then WANT_MB=8192; fi
           if [ "$WANT_MB" -lt 2048 ]; then WANT_MB=2048; fi
           echo "[info] available disk: ${AVAIL_MB}MB, will create swapfile: ${WANT_MB}MB"
-
           sudo swapoff /swapfile 2>/dev/null || true
           sudo rm -f /swapfile
           if ! sudo fallocate -l "${WANT_MB}M" /swapfile 2>/dev/null; then
@@ -79,14 +76,12 @@ jobs:
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile >/dev/null
           sudo swapon -p 10 /swapfile && echo "[ok] swapfile enabled"
-
           sudo sysctl -w vm.swappiness=100
           sudo sysctl -w vm.vfs_cache_pressure=200
           sudo sysctl -w vm.overcommit_memory=1
           sudo sysctl -w vm.dirty_ratio=40
           sudo sysctl -w vm.dirty_background_ratio=10
           sudo sysctl -w vm.watermark_scale_factor=200 2>/dev/null || true
-
           echo "=== After ==="
           free -h
           swapon --show
@@ -95,14 +90,13 @@ jobs:
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      - name: Configure opencode (Kimi 20% / NVIDIA fallback)
+      - name: Configure opencode (Kimi)
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           mkdir -p ~/.config/opencode
 
-          cat > ~/.config/opencode/opencode.kimi.json <<'EOF'
+          cat > ~/.config/opencode/opencode.json <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
             "provider": {
@@ -122,48 +116,21 @@ jobs:
           }
           EOF
 
-          cat > ~/.config/opencode/opencode.nvidia.json <<'EOF'
-          {
-            "$schema": "https://opencode.ai/config.json",
-            "provider": {
-              "nvidia": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "NVIDIA",
-                "options": {
-                  "baseURL": "https://integrate.api.nvidiiiiiiiiiiiiia.com/v1",
-                  "apiKey": "{env:NVIDIA_API_KEY}"
-                },
-                "models": {
-                  "moonshotai/kimi-k3": { "name": "moonshotai/kimi-k3" }
-                }
-              }
-            },
-            "model": "nvidia/moonshotai/kimi-k3"
-          }
-          EOF
-
-          cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
-
-          echo "=== template (Kimi) ==="
-          cat ~/.config/opencode/opencode.kimi.json
-          echo "=== template (NVIDIA) ==="
-          cat ~/.config/opencode/opencode.nvidia.json
-
       - name: Configure git
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Run opencode for ~5 hours (3 phases per iteration)
-        timeout-minutes: 300
+        timeout-minutes: 315 # 设置为 5小时15分钟，确保留有余量
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           set +e
           set -o pipefail
           BRANCH="${GITHUB_REF_NAME:-main}"
           OUT=/tmp/oc_out.log
+          # 4小时45分 = 5小时 - 15分钟缓冲，确保在第5小时左右从容结束并清理
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
 
           # ================= 三阶段提示词 =================
@@ -171,19 +138,21 @@ jobs:
           PROMPT_BUG='检查代码中是否存在bug，如果有就修复所有的bug。'
           PROMPT_CLEAN='确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释）。删除所有多余的内容。'
 
-          # 每阶段单次调用的最大时长（秒）
           PERF_TIMEOUT=$((60*60))     # 1h
           BUG_TIMEOUT=$((60*60))      # 1h
           CLEAN_TIMEOUT=$((30*60))    # 30m
 
-          # provider 选择策略：20% 概率走 Kimi，其余走 NVIDIA
-          KIMI_PROB=20
-          KIMI_COOLDOWN=0
-
           i=0
-          FAIL_COUNT=0
-          RATE_COUNT=0
-          CURRENT_PROVIDER=nvidia
+
+          # 【新增】心跳进程，防止 GitHub Actions 因长期无日志输出而判定空闲超时强行终止
+          heartbeat() {
+            while true; do
+              sleep 300
+              echo "[heartbeat] $(date '+%Y-%m-%d %H:%M:%S') - 流程仍在后台稳定运行..."
+            done
+          }
+          heartbeat &
+          HEARTBEAT_PID=$!
 
           commit_and_push() {
             git add -A || true
@@ -194,6 +163,7 @@ jobs:
 
           on_shutdown() {
             echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
+            kill $HEARTBEAT_PID 2>/dev/null || true
             git add -A || true
             if ! git diff --cached --quiet; then
               git commit -m "auto: partial work saved on shutdown" || true
@@ -207,173 +177,75 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 健康检查 ----------
           kimi_alive() {
             local code
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
                    -H "Authorization: Bearer ${KIMI_API_KEY}" \
                    'https://api.moonshot.cn/v1/models' 2>/dev/null)
             echo "[info] Kimi 健康检查 /v1/models -> HTTP ${code:-timeout}"
-            case "$code" in
-              2*) return 0 ;;
-              *)  return 1 ;;
-            esac
+            case "$code" in 2*) return 0 ;; *) return 1 ;; esac
           }
 
-          # ---------- 切换 provider ----------
-          switch_provider() {
-            case "$1" in
-              kimi)
-                if [ "$CURRENT_PROVIDER" != "kimi" ]; then
-                  cp ~/.config/opencode/opencode.kimi.json ~/.config/opencode/opencode.json
-                  CURRENT_PROVIDER=kimi
-                  FAIL_COUNT=0
-                  RATE_COUNT=0
-                fi
-                ;;
-              nvidia)
-                if [ "$CURRENT_PROVIDER" != "nvidia" ]; then
-                  cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
-                  CURRENT_PROVIDER=nvidia
-                  FAIL_COUNT=0
-                  RATE_COUNT=0
-                fi
-                ;;
-            esac
-          }
-
-          # ---------- 每阶段开始时选 provider ----------
-          pick_provider() {
-            if [ $KIMI_COOLDOWN -gt 0 ]; then
-              KIMI_COOLDOWN=$((KIMI_COOLDOWN-1))
-            fi
-
-            if [ $((RANDOM % 100)) -lt $KIMI_PROB ] && [ $KIMI_COOLDOWN -eq 0 ]; then
-              if kimi_alive; then
-                switch_provider kimi
-                echo "[info] 抽中 Kimi（${KIMI_PROB}%），使用 Moonshot 官方 API"
-                return
-              fi
-              echo "[info] 抽中 Kimi 但端点不可用，回退 NVIDIA"
-            elif [ $KIMI_COOLDOWN -gt 0 ]; then
-              echo "[info] Kimi 冷却中（剩余 $KIMI_COOLDOWN 轮），使用 NVIDIA"
-            fi
-
-            switch_provider nvidia
-            echo "[info] 使用 NVIDIA fallback"
-          }
-
-          # ---------- 单阶段执行（带重试 + provider 降级） ----------
-          # 参数: phase_name  prompt  timeout_seconds
-          # 返回: 0 成功 / 124|137|143 超时被杀 / 1 放弃
           run_phase() {
             local phase="$1" prompt="$2" budget="$3"
-            local attempt=0
-            FAIL_COUNT=0
-            RATE_COUNT=0
+            local attempt=0 fail=0 rate=0
 
             while [ $attempt -lt 3 ]; do
               attempt=$((attempt+1))
-
-              if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-                echo "[info] phase=$phase 全局时间已用尽，跳过"
-                return 1
+              if [ "$(date +%s)" -ge "$DEADLINE" ]; then echo "[info] phase=$phase 全局时间已用尽，跳过"; return 1; fi
+              if ! kimi_alive; then
+                echo "[warn] phase=$phase Kimi 端点不可用，等待 60s 后重试"
+                sleep 60
               fi
-
-              pick_provider
-              echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER ==========="
-
+              echo "=========== iter #$i | phase=$phase | attempt=$attempt ==========="
               timeout --kill-after=180 "$budget" opencode run "$prompt" 2>&1 | tee "$OUT"
               local EC=$?
-
-              # 成功
-              if [ $EC -eq 0 ]; then
-                return 0
-              fi
-
-              # 超时 / 被杀
+              if [ $EC -eq 0 ]; then return 0; fi
               if [ $EC -eq 124 ] || [ $EC -eq 137 ] || [ $EC -eq 143 ]; then
-                echo "[warn] phase=$phase 超时/被杀 (exit=$EC)"
-                return $EC
+                echo "[warn] phase=$phase 超时/被杀 (exit=$EC)"; return $EC
               fi
-
-              # 429 限流
               if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
-                if [ "$CURRENT_PROVIDER" = "kimi" ]; then
-                  echo "[warn] phase=$phase 命中 Kimi 限流(429)，切到 NVIDIA 重试"
-                  KIMI_COOLDOWN=10
-                  switch_provider nvidia
-                  sleep 10
-                  continue
-                fi
-                RATE_COUNT=$((RATE_COUNT+1))
-                echo "[warn] phase=$phase 命中 NVIDIA 限流(429) (连续: $RATE_COUNT)"
-                if [ $RATE_COUNT -ge 8 ]; then
-                  echo "[warn] 连续 8 次限流，放弃该阶段"
-                  return 1
-                fi
-                sleep 180
-                continue
+                rate=$((rate+1))
+                echo "[warn] phase=$phase 命中 Kimi 限流(429) (连续: $rate)"
+                if [ $rate -ge 8 ]; then echo "[warn] 连续 8 次限流，放弃该阶段"; return 1; fi
+                sleep 180; continue
               fi
-
-              # 其它非零退出
-              RATE_COUNT=0
-              if [ "$CURRENT_PROVIDER" = "kimi" ]; then
-                echo "[info] phase=$phase Kimi 端点异常，切到 NVIDIA 重试"
-                KIMI_COOLDOWN=10
-                switch_provider nvidia
-                sleep 10
-                continue
-              fi
-              FAIL_COUNT=$((FAIL_COUNT+1))
-              echo "[warn] phase=$phase NVIDIA 失败 (连续: $FAIL_COUNT)"
-              if [ $FAIL_COUNT -ge 3 ]; then
-                echo "[warn] 连续 3 次失败，放弃该阶段"
-                return 1
-              fi
+              rate=0
+              fail=$((fail+1))
+              echo "[warn] phase=$phase Kimi 失败 (连续: $fail)"
+              if [ $fail -ge 3 ]; then echo "[warn] 连续 3 次失败，放弃该阶段"; return 1; fi
               sleep 30
             done
-
             return 1
           }
 
           # ================= 主循环 =================
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             i=$((i+1))
-
             AVAIL_MB=$(( $(df --output=avail / | tail -1) / 1024 ))
             echo "--- iteration #$i | free disk: ${AVAIL_MB}MB ---"
             free -h | head -2
             if [ "$AVAIL_MB" -lt 2048 ]; then
-              echo "[error] 磁盘剩余不足 2GB，提前结束循环，交给收尾步骤清理"
-              break
+              echo "[error] 磁盘剩余不足 2GB，提前结束循环，交给收尾步骤清理"; break
             fi
-
-            # ----- 三个阶段：perf -> bug -> clean -----
             for phase in perf bug clean; do
               case "$phase" in
                 perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
                 bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
                 clean) P="$PROMPT_CLEAN"; T="$CLEAN_TIMEOUT" ;;
               esac
-
-              # 收窄到剩余时间
               REMAIN=$(( DEADLINE - $(date +%s) ))
-              if [ "$REMAIN" -le 0 ]; then
-                echo "[info] 全局时间已到，退出循环"
-                break 2
-              fi
+              if [ "$REMAIN" -le 0 ]; then echo "[info] 全局时间已到，退出循环"; break 2; fi
               if [ "$T" -gt "$REMAIN" ]; then T="$REMAIN"; fi
-
               echo ">>> iteration #$i | phase=$phase | budget=${T}s"
               run_phase "$phase" "$P" "$T"
-
-              # 无论成功失败，先把已完成的改动提交上去
               commit_and_push "$i-$phase"
-
               sleep 5
             done
           done
+
+          # 结束前清理心跳进程
+          kill $HEARTBEAT_PID 2>/dev/null || true
 
       - name: Cleanup repo artifacts
         if: always()
@@ -404,8 +276,7 @@ jobs:
         run: |
           set +e
           if [ -z "$GITEE_TOKEN" ] || [ -z "$GITEE_REPO" ]; then
-            echo "GITEE_TOKEN or GITEE_REPO not set, skipping Gitee push."
-            exit 0
+            echo "GITEE_TOKEN or GITEE_REPO not set, skipping Gitee push."; exit 0
           fi
           BRANCH="${GITHUB_REF_NAME:-main}"
           git remote remove gitee 2>/dev/null || true
@@ -419,6 +290,8 @@ jobs:
         run: |
           set +e
           BRANCH="${GITHUB_REF_NAME:-main}"
+          # 延迟 30 秒触发，避免 GitHub API 并发限制导致触发失败
+          sleep 30
           gh workflow run continuous-loop.yml --ref "$BRANCH" \
             && echo "next run dispatched on ${BRANCH}" \
             || echo "[warn] dispatch failed, cron fallback will pick up"
