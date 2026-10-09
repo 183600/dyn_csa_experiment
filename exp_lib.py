@@ -843,8 +843,8 @@ _FO_MINL = {}
 
 def _finfo_min(dtype):
     # torch.finfo(dtype).min is a pure function of the dtype — the same
-    # constant on every call.  Memoising it (host-side, no tensor values
-    # involved) skips rebuilding the finfo object once per attention call.
+    # constant on every call, so it is memoised per dtype (host-side, no
+    # tensor values involved).
     v = _FO_MINL.get(dtype)
     if v is None:
         v = torch.finfo(dtype).min
@@ -1268,9 +1268,7 @@ class HybridAttention(nn.Module):
         pre_blocks = None
         # The batched gate-signal / block-geometry hoist below is value-identical
         # to the per-row inline form for ANY batch size (design notes §6.1), so
-        # it also serves B == 1 (e.g. the seq-2048 topk sweep): one stacked
-        # hard-decision download and one staged block-table upload per layer
-        # instead of per-row round-trips.
+        # it also serves B == 1 (e.g. the seq-2048 topk sweep).
         if self.cfg.chunking == 'cosine_learnable':
             _raw = [self._gate_signal(x[b], pres[b]) for b in range(B)]
             if all((_r is not None for _r in _raw)):
@@ -1749,9 +1747,9 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     cols = np.arange(seq_len + 1)
     # Transport-only narrowing (design notes §6.1): every gather index is an
     # exact integer bounded by n + seq_len, so when that bound fits in int32
-    # the index tensor is uploaded / consumed as int32 (half the per-step H2D
-    # on the GPU-resident path) and the gathered ids are widened back to int64
-    # right after the gather exactly as before — bit-identical batches.
+    # the index tensor is uploaded / consumed as int32 and the gathered ids
+    # are widened back to int64 right after the gather exactly as before —
+    # bit-identical batches.
     _idx_i32 = n + seq_len + 1 < 2 ** 31
     while True:
         starts = rng.integers(0, n + 1, size=batch_size)
