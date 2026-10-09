@@ -191,7 +191,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                     tau = prefix_mean + self.delta_logit
                     gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
                     hard_b = gate.detach() > L._HALF
-                    gl = hard_b.cpu().tolist()
+                    # zero-copy numpy view — same booleans as the .tolist() form
+                    gl = hard_b.cpu().numpy()
             if gate is None:
                 bid = torch.zeros(T, dtype=torch.long, device=x.device)
                 nblk = 1
@@ -255,10 +256,11 @@ class HybridAttentionRoPE(L.HybridAttention):
             _, topk_idx, soft = L.lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, cfg.index_topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box)
             sel_valid = _sel_valid_box[0]
         sink = self.sink if cfg.use_sink else None
-        out = self._rope_attn(qn, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink, rd, soft=soft, sel_valid=sel_valid)
+        # cfg.kind == 'hca' passes the distinct-per-row arange expansion
+        out = self._rope_attn(qn, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink, rd, soft=soft, sel_valid=sel_valid, topk_distinct=cfg.kind == 'hca')
         return (self.W_o(out.reshape(T, nh * hd)), gate_mean)
 
-    def _rope_attn(self, q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, sink, rope_dim, q_chunk=128, soft=None, rope_base=10000.0, mem_budget_bytes=None, sel_valid=None):
+    def _rope_attn(self, q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, sink, rope_dim, q_chunk=128, soft=None, rope_base=10000.0, mem_budget_bytes=None, sel_valid=None, topk_distinct=False):
         T, nh, hd = q.shape
         dev = q.device
         if mem_budget_bytes is None:
@@ -283,16 +285,20 @@ class HybridAttentionRoPE(L.HybridAttention):
         _n_blk = k_blk_r.shape[0]
         _k_stack = torch.cat([k_blk_r, k_sw_r], 0)
         _v_stack = torch.cat([v_blk, v_sw], 0)
-        _MINL = torch.finfo(k_blk.dtype).min
+        _MINL = L._finfo_min(k_blk.dtype)
         _both_all = torch.cat([topk_idx, L._window_block_offset(T, w, _n_blk, dev)], 1).to(torch.int32)
-        topk_l = topk_idx if topk_idx.dtype == torch.int64 else topk_idx.long()
+        # same int32 index transport as exp_lib.gathered_attention (§6.1):
+        # identical integers, identical gathered values.
+        topk_l = topk_idx if topk_idx.dtype in (torch.int32, torch.int64) else topk_idx.long()
         _sel_all = pos_all[:, None] > last_tok[topk_l]
         # see exp_lib.gathered_attention: these per-row masks are hoisted under
         # L._FO_FULL_CAP_BYTES; the hoisted values are bitwise identical to the
-        # per-chunk forms.
+        # per-chunk forms.  `topk_distinct=True` (the read-everything HCA arm's
+        # arange expansion) makes first_occurrence_mask provably all-True, so
+        # it is skipped — the keep mask is then identical to the computed form.
         if T * topk_l.shape[1] * topk_l.shape[1] <= L._FO_FULL_CAP_BYTES:
             _keep_all = sel_valid
-            if topk_l.shape[1] > 1:
+            if topk_l.shape[1] > 1 and not topk_distinct:
                 _ddk_all = L.first_occurrence_mask(topk_l)
                 _keep_all = _ddk_all if _keep_all is None else _keep_all & _ddk_all
             if _keep_all is not None:
@@ -310,7 +316,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             else:
                 sel = _sel_all[s:e]
                 _keep = sel_valid[s:e] if sel_valid is not None else None
-                if ib.shape[1] > 1:
+                if ib.shape[1] > 1 and not topk_distinct:
                     _ddk = L.first_occurrence_mask(ib)
                     _keep = _ddk if _keep is None else _keep & _ddk
                 if _keep is not None:
@@ -337,7 +343,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 soft_log = torch.log(sv.clamp_min(1e-12))
                 soft_log.masked_fill_(sv <= 0, _MINL)
                 soft_logits = torch.cat([(raw_logits[:, :, :nb] + soft_log[:, None, :]).clamp_min_(_MINL), raw_logits[:, :, nb:]], -1)
-                soft_logits = soft_logits.masked_fill(_nvalid, torch.finfo(soft_logits.dtype).min)
+                soft_logits = soft_logits.masked_fill(_nvalid, L._finfo_min(soft_logits.dtype))
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = attn + (soft_attn - soft_attn.detach())
                 if sink is None:
@@ -414,7 +420,9 @@ class HybridAttentionRoPE(L.HybridAttention):
             pres = [None if pre_all is None else {kk: v[b] if v is not None else None for kk, v in pre_all.items()} for b in range(B)]
             gate_sigs = None
             pre_blocks = None
-            if self.cfg.chunking == 'cosine_learnable' and B > 1:
+            # same value-identical hoist as exp_lib.HybridAttention.forward,
+            # for any batch size (design notes §6.1)
+            if self.cfg.chunking == 'cosine_learnable':
                 _raw = [self._gate_signal(x[b], pres[b]) for b in range(B)]
                 if all((_r is not None for _r in _raw)):
                     _gl = torch.stack([_r[1] for _r in _raw]).cpu().numpy()

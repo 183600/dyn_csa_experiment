@@ -268,7 +268,8 @@ def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=Fals
         return (z, 1) if return_count and n == 1 else ((z, 0) if return_count else z)
     if sim is None:
         sim = cosine_similarity_consecutive(H)
-    cut_list = (sim < tau).cpu().tolist()
+    # zero-copy numpy view; the segmenter sees the same booleans as a list
+    cut_list = (sim < tau).cpu().numpy()
     return blocks_from_cuts(n, cut_list, min_block, max_block, dev, return_count=return_count)
 
 def causal_adaptive_threshold(sim, target_block_tokens):
@@ -786,8 +787,19 @@ def _sink_split_softmax(logits, sink_logits, want_sink=True):
     return (soft, 1.0 - soft.sum(-1) if want_sink else None)
 
 _FO_FULL_CAP_BYTES = 64 << 20
+_FO_MINL = {}
 
-def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None):
+def _finfo_min(dtype):
+    # torch.finfo(dtype).min is a pure function of the dtype — the same
+    # constant on every call.  Memoising it (host-side, no tensor values
+    # involved) skips rebuilding the finfo object once per attention call.
+    v = _FO_MINL.get(dtype)
+    if v is None:
+        v = torch.finfo(dtype).min
+        _FO_MINL[dtype] = v
+    return v
+
+def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False):
     n = q.shape[0]
     dev = q.device
     if mem_budget_bytes is None:
@@ -808,17 +820,25 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     v_stack = torch.cat([v_blk, v_sw], 0)
     win_idx, win_valid_all = _window_geometry(n, w, dev)
     _both_idx_all = torch.cat([topk_idx.to(torch.int32), _window_block_offset(n, w, n_blk, dev)], dim=1)
-    _MINL = torch.finfo(k_blk.dtype).min
-    topk_l = topk_idx if topk_idx.dtype == torch.int64 else topk_idx.long()
+    _MINL = _finfo_min(k_blk.dtype)
+    # Index transport (design notes §6.1): int32 and int64 index tensors hold
+    # the same exact integers, and advanced indexing / equality comparisons on
+    # them return bitwise identical values, so the upcast to int64 is skipped
+    # when the selection already arrives as int32.
+    topk_l = topk_idx if topk_idx.dtype in (torch.int32, torch.int64) else topk_idx.long()
     sel_blk_all = pos_all[:, None] > last_tok[topk_l]
     # the keep mask and the [selected|window] valid mask are per-row functions of
     # the same inputs, so their full-width forms are bitwise identical to the
     # per-chunk forms; they are hoisted out of the chunk loop under
     # _FO_FULL_CAP_BYTES (the chunked fallback below covers very wide top-k
     # sweeps).
+    # `topk_distinct=True` asserts every row of topk_idx holds distinct block
+    # ids (the read-everything HCA arm passes an arange expansion), in which
+    # case first_occurrence_mask is provably all-True and is skipped — the keep
+    # mask is then identical to the computed form.
     if n * topk_l.shape[1] * topk_l.shape[1] <= _FO_FULL_CAP_BYTES:
         keep_all = sel_valid
-        if topk_l.shape[1] > 1:
+        if topk_l.shape[1] > 1 and not topk_distinct:
             _ddk_all = first_occurrence_mask(topk_l)
             keep_all = _ddk_all if keep_all is None else keep_all & _ddk_all
         if keep_all is not None:
@@ -839,7 +859,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             keep = None
             if sel_valid is not None:
                 keep = sel_valid[s:e]
-            if ib.shape[1] > 1:
+            if ib.shape[1] > 1 and not topk_distinct:
                 _ddk = first_occurrence_mask(ib)
                 keep = _ddk if keep is None else keep & _ddk
             if keep is not None:
@@ -1106,13 +1126,16 @@ class HybridAttention(nn.Module):
                 gate_list = None
                 if gate.numel():
                     gate_bool = gate.detach() > _HALF
-                    gate_list = gate_bool.cpu().tolist()
+                    # .numpy() is a zero-copy view of the CPU tensor; the
+                    # segmenter consumes the same booleans as the .tolist()
+                    # form (design notes §6.2).
+                    gate_list = gate_bool.cpu().numpy()
             if pre_blocks is not None:
                 bid, nblk, _hon_dev = pre_blocks
             else:
                 with torch.no_grad():
                     if gate_list is None:
-                        gate_list = (gate.detach() > _HALF).cpu().tolist()
+                        gate_list = (gate.detach() > _HALF).cpu().numpy()
                     bid, nblk, _honoured = blocks_from_cuts(T, gate_list, cfg.min_block, cfg.max_block, x.device, return_count=True, return_honoured=True)
                 _hon_dev = None
                 if gate.numel() and self.need_reg:
@@ -1160,7 +1183,10 @@ class HybridAttention(nn.Module):
         k_sw = F.normalize(k_sw, dim=-1)
         if cfg.kind == 'hca':
             topk_idx = _arange_cache(Bn, x.device).unsqueeze(0).expand(T, Bn)
-            out = gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None)
+            # every row of the arange expansion holds distinct block ids, so the
+            # first-occurrence dedup inside gathered_attention is provably the
+            # all-True mask and is skipped (identical keep mask).
+            out = gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None, topk_distinct=True)
         else:
             topk = cfg.index_topk
             _sel_valid_box = []
@@ -1188,7 +1214,12 @@ class HybridAttention(nn.Module):
         pres = [None if pre_all is None else {kk: v[b] if v is not None else None for kk, v in pre_all.items()} for b in range(B)]
         gate_sigs = None
         pre_blocks = None
-        if self.cfg.chunking == 'cosine_learnable' and B > 1:
+        # The batched gate-signal / block-geometry hoist below is value-identical
+        # to the per-row inline form for ANY batch size (design notes §6.1), so
+        # it also serves B == 1 (e.g. the seq-2048 topk sweep): one stacked
+        # hard-decision download and one staged block-table upload per layer
+        # instead of per-row round-trips.
+        if self.cfg.chunking == 'cosine_learnable':
             _raw = [self._gate_signal(x[b], pres[b]) for b in range(B)]
             if all((_r is not None for _r in _raw)):
                 # .numpy() is a zero-copy view of the stacked CPU tensor (the
@@ -1664,9 +1695,18 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         else:
             host = torch.from_numpy(train_ids)
     cols = np.arange(seq_len + 1)
+    # Transport-only narrowing (design notes §6.1): every gather index is an
+    # exact integer bounded by n + seq_len, so when that bound fits in int32
+    # the index tensor is uploaded / consumed as int32 (half the per-step H2D
+    # on the GPU-resident path) and the gathered ids are widened back to int64
+    # right after the gather exactly as before — bit-identical batches.
+    _idx_i32 = n + seq_len + 1 < 2 ** 31
     while True:
         starts = rng.integers(0, n + 1, size=batch_size)
-        idx = torch.from_numpy(starts[:, None] + cols[None, :])
+        idx_np = starts[:, None] + cols[None, :]
+        if _idx_i32:
+            idx_np = idx_np.astype(np.int32)
+        idx = torch.from_numpy(idx_np)
         if host.device.type == 'cuda':
             ids = host[_h2d_async(idx, idx.dtype, host.device)]
         else:

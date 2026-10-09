@@ -124,6 +124,19 @@ q_chunk ∈ {128, 1024, 7}）输出与 `q.grad` 逐位相同。但 `_take_2d` �
   值完全一致。每个槽位由 CUDA event 守卫（上次入队未完成则不复用，
   全部忙时回落原 pin-per-call 形式），槽位内容在复用前必被整体覆写，
   因此不存在传输中的数据竞争；池不命中时的回落路径就是原实现。
+- `batch_iter` 的窗口 gather 索引在 `n + seq_len + 1 < 2³¹`（有守卫，
+  越界即回落 int64）时以 int32 上传/消费：每个下标都是精确整数，
+  gather 返回值与 int64 索引形式逐位相同，gather 后照例 `.long()` 还原，
+  yield 出的 batch 不变。
+- `gathered_attention`（及 v7 的 `_rope_attn`）的 `topk_l` 在 topk 选择
+  已是 int32 时跳过 int64 上行：高级索引与相等比较作用于同一组精确
+  整数，返回值逐位相同。
+- `HybridAttention.forward`（及 v7 的 RoPE 镜像）的门控信号 /
+  `blocks_from_cuts` 提升路径对**一切** batch 大小启用（含 B=1，如
+  seq-2048 topk 扫描）：B=1 时逐行内联形式与提升形式的差异仍仅在
+  上传/下载的传输形状——门控布尔值、块 id、honoured 掩码逐一相同，
+  §6.1 的原有论证对 B=1 逐字成立；`_gate_signal` 与 `_single` 内联
+  门控的算子序列本就逐行相同。
 
 ## 6.2 宿主侧算法的整数等价
 
@@ -131,6 +144,17 @@ q_chunk ∈ {128, 1024, 7}）输出与 `q.grad` 逐位相同。但 `_take_2d` �
 「输出整数完全一致」的前提下自由重写（局部变量绑定、numpy 视图直读
 等）。任何重写都以随机化对拍（含 n≤64 缓存键路径）验证 bids /
 honoured / counts 三者与旧实现逐一相同。
+
+同类的布尔/整数等价：
+
+- 门控与余弦切割的布尔表以 `.cpu().numpy()` 零拷贝视图（而非
+  `.tolist()`）传给 `_segment` / `blocks_from_cuts`：同一组布尔值，
+  分段输出的 bids / honoured / counts 逐一相同。
+- `gathered_attention`（及 v7 的 `_rope_attn`）接受 `topk_distinct`
+  关键字：调用方保证 topk 每行块 id 互不相同（HCA「读所有块」臂的
+  arange 展开）时，`first_occurrence_mask` 恒为全 True，跳过它得到的
+  keep 掩码与计算形式逐位相同。学习式 indexer 路径允许重复（无效槽
+  以 pad 块填充），不得使用此关键字。
 
 ## 6.3 宿主侧纯函数的记忆化
 
@@ -152,6 +176,8 @@ RNG 流、不改返回内容，因此不触碰 §3.1 的可比性（`CODE_SEMANT
 - `variant_mlp_ratio`：matched variant 的 MLP 加宽比是其全部形状
   参数的纯函数（参数量只依赖形状；构造过程在 `fork_rng` 内进行，
   命中时跳过的一次性 RNG 抽取本来就会被丢弃，调用方 RNG 流不变）。
+- `_finfo_min`：`torch.finfo(dtype).min` 是 dtype 的纯函数（每次调用
+  返回同一常量），按 dtype 记忆化，不涉及任何张量值。
 
 ## 7. 落盘与续跑
 
