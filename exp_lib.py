@@ -109,18 +109,78 @@ def _segment(n, want_cut_list, min_block, max_block):
         _SEGMENT_CACHE[key] = (bids, honoured, counts)
     return (bids, honoured, counts)
 
+_H2D_POOL = {}
+_H2D_POOL_BYTES = [0]
+_H2D_POOL_CAP = 96 << 20
+_H2D_POOL_SLOTS = 4
+
+def _h2d_stage(shape, dtype, device):
+    # Pinned-staging pool for CUDA uploads — transport only (design notes
+    # §6.1).  The caller fills the returned host buffer with the exact values
+    # it would otherwise hand to `torch.tensor(..., device=device)` and
+    # `commit()` enqueues the H2D copy; the copy is bit-exact regardless of
+    # which staging buffer (if any) it leaves from, so every value reaching
+    # the device is identical to the pin-per-call form.  Each slot is guarded
+    # by a CUDA event recorded after its last enqueue, so a slot is never
+    # rewritten while an earlier async copy from it is still in flight; when
+    # every slot is busy (or the pool cannot serve at all) the caller falls
+    # back to the pin-per-call form, again with identical values.
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        return (None, None)
+    shape = tuple(int(_s) for _s in shape)
+    if not shape or 0 in shape:
+        return (None, None)
+    key = (str(device), dtype, shape)
+    ent = _H2D_POOL.get(key)
+    if ent is None:
+        est = int(np.prod(shape, dtype=np.int64)) * torch.empty((), dtype=dtype).element_size() * _H2D_POOL_SLOTS
+        if _H2D_POOL_BYTES[0] + est > _H2D_POOL_CAP:
+            return (None, None)
+        try:
+            with torch.inference_mode(False):
+                slots = [[torch.empty(shape, dtype=dtype).pin_memory(), None] for _ in range(_H2D_POOL_SLOTS)]
+        except (RuntimeError, TypeError):
+            return (None, None)
+        _H2D_POOL_BYTES[0] += est
+        ent = {'slots': slots, 'rr': 0}
+        _H2D_POOL[key] = ent
+    slots = ent['slots']
+    n = len(slots)
+    for _ in range(n):
+        i = ent['rr'] % n
+        ent['rr'] += 1
+        buf, ev = slots[i]
+        if ev is None or ev.query():
+            def commit(_buf=buf, _slot=slots[i]):
+                with torch.inference_mode(False):
+                    dev_t = _buf.to(device, non_blocking=True)
+                    ev2 = _slot[1]
+                    if ev2 is None:
+                        ev2 = torch.cuda.Event()
+                    ev2.record()
+                    _slot[1] = ev2
+                return dev_t
+            return (buf, commit)
+    return (None, None)
+
 def _h2d_async(host_src, dtype, device):
     # Same values as torch.tensor(host_src, dtype=dtype, device=device):
     # pure transport of exact (integer or gate-mask) values.  The
     # inference_mode(False) guard keeps the result a normal tensor even when the
     # caller runs under inference_mode (eval), so it can later serve as an
-    # autograd index tensor.
+    # autograd index tensor.  CUDA uploads stage through the pooled pinned
+    # buffers of `_h2d_stage` (same bit-exact copy, no per-call host pinning);
+    # the pin-per-call form below remains as the fallback.
     with torch.inference_mode(False):
         t = torch.as_tensor(host_src, dtype=dtype)
         if t.device == device:
             return t
         if t.device.type == 'cuda' or device.type != 'cuda' or not torch.cuda.is_available():
             return t.to(device)
+        staged, commit = _h2d_stage(t.shape, t.dtype, device)
+        if staged is not None:
+            staged.copy_(t)
+            return commit()
         try:
             t = t.pin_memory()
         except RuntimeError:
@@ -162,16 +222,37 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
         bids_cpu.append(_b)
         nblks.append(_nb)
         hons.append(_hon)
-    bid_stack = _h2d_async(torch.stack(bids_cpu), torch.long, device)
+    # When the staging pool serves, the rows are written straight into the
+    # pinned buffer (skipping the intermediate `torch.stack` copy); the values
+    # uploaded are exactly the stacked rows either way.
+    staged, commit = _h2d_stage((len(bids_cpu), T), torch.long, device)
+    if staged is not None:
+        for _b in range(len(bids_cpu)):
+            staged[_b].copy_(bids_cpu[_b])
+        bid_stack = commit()
+    else:
+        bid_stack = _h2d_async(torch.stack(bids_cpu), torch.long, device)
     hon_stack = None
     if want_honoured and T > 1:
-        arr = np.zeros((len(gate_lists), T - 1), dtype=np.float32)
+        arr = None
+        staged_h, commit_h = _h2d_stage((len(gate_lists), T - 1), hon_dtype, device)
+        if staged_h is not None:
+            try:
+                arr = staged_h.numpy()
+                arr[:] = 0.0
+            except TypeError:
+                # a numpy-less dtype (e.g. bfloat16) — keep the old form
+                arr = None
+                staged_h = commit_h = None
+        if arr is None:
+            arr = np.zeros((len(gate_lists), T - 1), dtype=np.float32)
         for _i, _hon in enumerate(hons):
             if _hon:
                 _sl = np.fromiter((int(_s) for _s in _hon), dtype=np.int64, count=len(_hon))
                 _sl = _sl[(0 <= _sl) & (_sl < T - 1)]
                 arr[_i, _sl] = 1.0
-        hon_stack = _h2d_async(arr, hon_dtype, device)
+        # the honoured mask is exact 0.0/1.0, identical in any float dtype
+        hon_stack = commit_h() if commit_h is not None else _h2d_async(arr, hon_dtype, device)
     out = []
     for b in range(len(bids_cpu)):
         row = bid_stack[b]
