@@ -126,6 +126,28 @@ q_chunk ∈ {128, 1024, 7}）输出与 `q.grad` 逐位相同。但 `_take_2d` �
 等）。任何重写都以随机化对拍（含 n≤64 缓存键路径）验证 bids /
 honoured / counts 三者与旧实现逐一相同。
 
+## 6.3 宿主侧纯函数的记忆化
+
+以下三处是**纯宿主侧**的进程内记忆化，不改任何到达算子的数值、不改
+RNG 流、不改返回内容，因此不触碰 §3.1 的可比性（`CODE_SEMANTICS`
+不需要 bump）：
+
+- `_ids_fp`：语料字节的 sha256 摘要。驱动每个 phase 都会对同一批
+  数组重算一次（`run()` 的 run_cfg 指纹、`load_wikitext` 的缓存
+  校验），全量读取可达数 GB。以（数据指针、shape、strides、dtype）
+  为键并持有数组强引用（指针在条目存活期内不可能被复用）做记忆化；
+  输入字节相同则摘要必然相同。约定：调用方不就地修改这些数组
+  （全仓库无此用法）。
+- `load_wikitext`：以（cache_dir、tag、四个缓存文件的 size+mtime）
+  为键记忆返回元组。命中时跳过 `np.load` 与校验哈希，且返回对象
+  保持身份——`batch_iter` 的 `_PINNED_HOST_CACHE` 以对象身份为键，
+  因此常驻语料（GPU / pinned）在 phase 之间不必重新上传。缓存文件
+  被外部重建时 size/mtime 变化，记忆自动失效并重新校验。
+- `variant_mlp_ratio`：matched variant 的 MLP 加宽比是其全部形状
+  参数的纯函数（参数量只依赖形状；构造过程在 `fork_rng` 内进行，
+  命中时跳过的一次性 RNG 抽取本来就会被丢弃，调用方 RNG 流不变）。
+  省去每个 phase 每个 matched variant 两次完整模型构造。
+
 ## 7. 落盘与续跑
 
 - 所有 JSON 产物原子写（临时文件 + `os.replace`），读者永远不会看到

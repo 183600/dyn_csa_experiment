@@ -1352,13 +1352,38 @@ def _read_raw_rows(path):
     with open(path, encoding='utf-8') as fh:
         return [ln.rstrip('\n') for ln in fh]
 
+_IDS_FP_MEMO = {}
+_IDS_FP_MEMO_CAP = 4
+
 def _ids_fp(train_ids):
+    # Pure function of the buffer bytes.  Callers re-fingerprint the SAME
+    # corpus arrays once per phase (the run_cfg fingerprint, and the cache
+    # verification in load_wikitext), which re-reads up to ~3GB per call;
+    # memoising on (data pointer, layout) with a strong ref to the array
+    # (so the keyed pointer can never be recycled while the entry lives)
+    # skips the re-hash.  Same bytes in -> same digest out, always.
+    try:
+        _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
+    except (AttributeError, TypeError):
+        _key = None
+    if _key is not None:
+        _hit = _IDS_FP_MEMO.get(_key)
+        if _hit is not None:
+            return _hit[1]
     _h = hashlib.sha256()
     _mv = np.ascontiguousarray(train_ids)
     _cs = 1 << 24
     for _off in range(0, len(_mv), _cs):
         _h.update(_mv[_off:_off + _cs].data)
-    return _h.hexdigest()[:16]
+    _fp = _h.hexdigest()[:16]
+    if _key is not None:
+        if len(_IDS_FP_MEMO) >= _IDS_FP_MEMO_CAP:
+            _IDS_FP_MEMO.pop(next(iter(_IDS_FP_MEMO)))
+        _IDS_FP_MEMO[_key] = (train_ids, _fp)
+    return _fp
+
+_WT103_MEMO = {}
+_WT103_MEMO_CAP = 4
 
 def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_dir='./wt103_cache'):
     from datasets import load_dataset
@@ -1369,6 +1394,22 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     vp_path = os.path.join(cache_dir, f'val_bnd_{tag}.npy')
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
+        # In-process memo: a driver process loads the same tag once per
+        # phase; re-serving the already-verified arrays skips the np.load
+        # and the multi-GB verification hash, and — because the returned
+        # objects keep their identity — the identity-keyed resident-corpus
+        # cache in batch_iter (_PINNED_HOST_CACHE) also keeps hitting, so
+        # the GPU/pinned corpus is not re-uploaded between phases.  The
+        # memo key carries every file's size+mtime, so an externally
+        # rebuilt cache is re-read (and re-verified) instead of being
+        # served stale.  The served bytes are exactly what a fresh load
+        # would return; callers never mutate them.
+        _sig = tuple((os.path.getsize(_p), os.path.getmtime(_p)) for _p in (tr_path, va_path, vp_path, me_path))
+        _mkey = (os.path.abspath(cache_dir), tag, _sig)
+        _hit = _WT103_MEMO.get(_mkey)
+        if _hit is not None:
+            print('[data] serving token ids from the in-process memo (same cache files, already verified) ...')
+            return _hit
         print('[data] loading cached token ids ...')
         train_ids = np.load(tr_path)
         meta = json.load(open(me_path, encoding='utf-8'))
@@ -1377,7 +1418,11 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         else:
             val_batch = np.load(va_path)
             val_bnd = np.load(vp_path)
-            return (train_ids, val_batch, meta['vocab'], None, val_bnd)
+            _out = (train_ids, val_batch, meta['vocab'], None, val_bnd)
+            if len(_WT103_MEMO) >= _WT103_MEMO_CAP:
+                _WT103_MEMO.pop(next(iter(_WT103_MEMO)))
+            _WT103_MEMO[_mkey] = _out
+            return _out
     ds = local_wikitext_if_available(cache_dir)
     if ds is None:
         last_err = None
@@ -2584,11 +2629,23 @@ class TimeGuard:
 PARAM_MATCHED = {'full_matched', 'full_sw128_matched'}
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
+_MLP_RATIO_MEMO = {}
+
 def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=None, ref_variant='csa_dynamic'):
     if matched is None:
         matched = PARAM_MATCHED
     if variant not in matched:
         return 4.0
+    # The ratio is a pure function of these arguments (the parameter count
+    # of a freshly-initialised SmallGPT depends only on shapes; the build
+    # runs under torch.random.fork_rng, so skipping a repeat build leaves
+    # the caller's RNG stream untouched either way).  Drivers call this
+    # once per variant per phase, and each call builds the model twice at
+    # full init cost just to count parameters — memoise it.
+    _mkey = (variant, int(vocab), int(d), int(n_layers), int(n_heads), int(d_head), int(seq_len), tuple(sorted((str(_x) for _x in matched))), str(ref_variant))
+    _hit = _MLP_RATIO_MEMO.get(_mkey)
+    if _hit is not None:
+        return _hit
 
     def n_params(v, ratio):
         with torch.random.fork_rng():
@@ -2603,6 +2660,7 @@ def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32
     if ratio == 4.0:
         ratio = math.nextafter(4.0, 0.0)
     print(f'[{variant}] matched mlp_ratio = {ratio:.2f} ({p_full / 1000000.0:.2f}M -> target {p_ref / 1000000.0:.2f}M params vs {ref_variant})')
+    _MLP_RATIO_MEMO[_mkey] = ratio
     return ratio
 
 def _tag_of(rec):
