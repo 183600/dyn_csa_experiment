@@ -523,6 +523,51 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
         Zbs = _take_rows(Zb, order)
     return _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, Fd, dev, B, order)
 
+_POOL_PARTS_HOST = True
+_POOL_PARTS_BUCKET = 256
+
+def _pool_parts_host(block_ids, B, ov, n, counts_l):
+    # Host-side integer build of the pooling geometry (design notes §6.2):
+    # every part is an exact integer function of the cut table's own counts
+    # list (block_ids._pool_cpu[0] — the same list that generated block_ids),
+    # so each value is the same integer the bincount/cumsum form below
+    # produces (cumsum / shifts / clamps on int64 are exact on either side).
+    # The whole geometry rides one flat staged upload (transport only, §6.1),
+    # replacing the per-row on-device scan kernels; the parts are views into
+    # that single buffer (they are only ever read downstream, never mutated),
+    # and the bucket-padding tail is never read.  `_h2d_async` builds the
+    # buffer outside inference mode, so a part first filled during eval can
+    # still serve training, exactly like the on-device form.  Returns None
+    # when the host form cannot serve; the caller then falls back to the
+    # on-device form, whose values are identical.
+    try:
+        counts_np = np.asarray(counts_l, dtype=np.int64)
+        if counts_np.shape != (int(B),) or int(n) <= 0:
+            return None
+        ends_np = np.cumsum(counts_np, dtype=np.int64)
+        starts_np = ends_np - counts_np
+        last_idx_np = np.clip(ends_np - 1, 0, int(n) - 1)
+        segs = [counts_np, ends_np, starts_np, last_idx_np]
+        if ov is not None:
+            end_prev_np = np.concatenate((np.array([-1], dtype=np.int64), ends_np[:-1]))
+            starts_prev_np = np.concatenate((np.array([0], dtype=np.int64), starts_np[:-1]))
+            ov_start_np = np.maximum(end_prev_np - int(ov), starts_prev_np)
+            ov_len_np = end_prev_np - ov_start_np
+            segs += [end_prev_np, starts_prev_np, ov_start_np, ov_len_np]
+        flat = np.concatenate(segs)
+        pad = (-int(flat.shape[0])) % _POOL_PARTS_BUCKET
+        if pad:
+            flat = np.concatenate((flat, np.zeros(pad, dtype=np.int64)))
+        buf = _h2d_async(flat, torch.long, block_ids.device)
+        off = 0
+        out = []
+        for s in segs:
+            out.append(buf[off:off + int(s.shape[0])])
+            off += int(s.shape[0])
+        return tuple(out)
+    except (RuntimeError, TypeError, ValueError, AttributeError):
+        return None
+
 def _pool_parts(block_ids, B, ov, n):
     # Integer block geometry shared by the pooling paths.  Every value is an
     # exact integer function of (block_ids, B, ov, n), so caching the tensors on
@@ -542,6 +587,13 @@ def _pool_parts(block_ids, B, ov, n):
         hit = cache.get(key)
         if hit is not None:
             return hit
+    _cpu = getattr(block_ids, '_pool_cpu', None)
+    if _POOL_PARTS_HOST and _cpu is not None and len(_cpu[0]) == int(B):
+        _parts = _pool_parts_host(block_ids, B, ov, n, _cpu[0])
+        if _parts is not None:
+            if len(cache) < 8:
+                cache[key] = _parts
+            return _parts
     with torch.inference_mode(False):
         counts = torch.bincount(block_ids, minlength=B)
         ends = torch.cumsum(counts, 0)
