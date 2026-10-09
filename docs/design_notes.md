@@ -104,7 +104,7 @@ q_chunk ∈ {128, 1024, 7}）输出与 `q.grad` 逐位相同。但 `_take_2d` �
 
 ## 6.1 传输层批量化不改值
 
-有两处实现只改**传输/存储形式**，不改任何到达算子的数值，因此不
+以下实现只改**传输/存储形式**，不改任何到达算子的数值，因此不
 触碰 §3.1 的可比性（`CODE_SEMANTICS` 不需要 bump）：
 
 - `HybridAttention.forward`（及 v7 的 RoPE 镜像）把逐行的
@@ -140,7 +140,7 @@ RNG 流、不改返回内容，因此不触碰 §3.1 的可比性（`CODE_SEMANT
 
 - `_ids_fp`：语料字节的 sha256 摘要。驱动每个 phase 都会对同一批
   数组重算一次（`run()` 的 run_cfg 指纹、`load_wikitext` 的缓存
-  校验），全量读取可达数 GB。以（数据指针、shape、strides、dtype）
+  校验）。以（数据指针、shape、strides、dtype）
   为键并持有数组强引用（指针在条目存活期内不可能被复用）做记忆化；
   输入字节相同则摘要必然相同。约定：调用方不就地修改这些数组
   （全仓库无此用法）。
@@ -152,7 +152,6 @@ RNG 流、不改返回内容，因此不触碰 §3.1 的可比性（`CODE_SEMANT
 - `variant_mlp_ratio`：matched variant 的 MLP 加宽比是其全部形状
   参数的纯函数（参数量只依赖形状；构造过程在 `fork_rng` 内进行，
   命中时跳过的一次性 RNG 抽取本来就会被丢弃，调用方 RNG 流不变）。
-  省去每个 phase 每个 matched variant 两次完整模型构造。
 
 ## 7. 落盘与续跑
 

@@ -46,6 +46,7 @@ t/
 analysis_*/
 REPORT*.md
 run_time_state*.json
+autodl_budget*.json
 
 # docs/ 白名单：只留 design_notes.md
 docs/*

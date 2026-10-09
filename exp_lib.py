@@ -1439,10 +1439,10 @@ _IDS_FP_MEMO_CAP = 4
 def _ids_fp(train_ids):
     # Pure function of the buffer bytes.  Callers re-fingerprint the SAME
     # corpus arrays once per phase (the run_cfg fingerprint, and the cache
-    # verification in load_wikitext), which re-reads up to ~3GB per call;
-    # memoising on (data pointer, layout) with a strong ref to the array
-    # (so the keyed pointer can never be recycled while the entry lives)
-    # skips the re-hash.  Same bytes in -> same digest out, always.
+    # verification in load_wikitext); memoising on (data pointer, layout)
+    # with a strong ref to the array (so the keyed pointer can never be
+    # recycled while the entry lives) skips the re-hash.  Same bytes in ->
+    # same digest out, always.
     try:
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
     except (AttributeError, TypeError):
@@ -1477,7 +1477,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
         # In-process memo: a driver process loads the same tag once per
         # phase; re-serving the already-verified arrays skips the np.load
-        # and the multi-GB verification hash, and — because the returned
+        # and the verification hash, and — because the returned
         # objects keep their identity — the identity-keyed resident-corpus
         # cache in batch_iter (_PINNED_HOST_CACHE) also keeps hitting, so
         # the GPU/pinned corpus is not re-uploaded between phases.  The
@@ -2721,8 +2721,8 @@ def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32
     # of a freshly-initialised SmallGPT depends only on shapes; the build
     # runs under torch.random.fork_rng, so skipping a repeat build leaves
     # the caller's RNG stream untouched either way).  Drivers call this
-    # once per variant per phase, and each call builds the model twice at
-    # full init cost just to count parameters — memoise it.
+    # once per variant per phase; each call builds the model twice just to
+    # count parameters — memoise it.
     _mkey = (variant, int(vocab), int(d), int(n_layers), int(n_heads), int(d_head), int(seq_len), tuple(sorted((str(_x) for _x in matched))), str(ref_variant))
     _hit = _MLP_RATIO_MEMO.get(_mkey)
     if _hit is not None:
