@@ -607,47 +607,59 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     _tail = []
     model.train()
     x = y = logits = ce = loss = None
-    for step in range(steps):
-        if deadline_ts is not None and time.time() > deadline_ts:
-            wall = time.time() - t0
-            print(f'[{variant} seed={seed} warm={warm_steps}] time-cap deadline reached after {step} steps ({wall / 60:.1f} min) — stopping; this cell produced NO measurement and will be retried.')
-            del model, opt, bpe, decay, ndecay, dpar, x, y, logits, ce, loss
-            gc.collect()
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-            return {'cap_truncated': True, 'steps_done': step, 'train_time_s': wall}
-        if warm_steps > 0 and step == warm_steps:
-            for _blk in model.blocks:
-                _blk.attn._dense_warmup = False
-            switch_ppl = float(L.eval_ppl(model, _eval_batch, device))
-            print(f'  [warmup] step {step}: dense -> SPARSE (h=val PPL {switch_ppl:.2f})')
-        base = lr_at(step)
-        for g in opt.param_groups:
-            g['lr'] = base * g.get('lr_scale', 1.0)
-        x, y = next(bpe)
-        logits = model(x)
-        ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
-        logits = None
-        loss = ce + comp_lambda * model.comp_reg
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        _lbuf.append(ce.detach())
-        _tail.append(ce.detach())
-        if len(_tail) > 50:
-            del _tail[:-50]
-        if len(_lbuf) >= 512:
-            losses.extend(torch.stack(_lbuf).tolist())
-            _lbuf.clear()
-        if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
-            _pv = float(L.eval_ppl(model, _eval_batch, device))
-            (warm_hist if getattr(model.blocks[0].attn, '_dense_warmup', False) else ppl_hist).append([step + 1, _pv])
-        if log_every and (step % log_every == 0 or step == steps - 1):
-            if _lbuf:
+    # same cyclic-GC relief as exp_lib.train_variant: the loop's garbage is
+    # refcount-freed; collections still run at a fixed cadence and the
+    # original GC state is restored on every exit path.
+    _gc_relief = gc.isenabled()
+    if _gc_relief:
+        gc.disable()
+    try:
+        for step in range(steps):
+            if deadline_ts is not None and time.time() > deadline_ts:
+                wall = time.time() - t0
+                print(f'[{variant} seed={seed} warm={warm_steps}] time-cap deadline reached after {step} steps ({wall / 60:.1f} min) — stopping; this cell produced NO measurement and will be retried.')
+                del model, opt, bpe, decay, ndecay, dpar, x, y, logits, ce, loss
+                gc.collect()
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                return {'cap_truncated': True, 'steps_done': step, 'train_time_s': wall}
+            if warm_steps > 0 and step == warm_steps:
+                for _blk in model.blocks:
+                    _blk.attn._dense_warmup = False
+                switch_ppl = float(L.eval_ppl(model, _eval_batch, device))
+                print(f'  [warmup] step {step}: dense -> SPARSE (h=val PPL {switch_ppl:.2f})')
+            base = lr_at(step)
+            for g in opt.param_groups:
+                g['lr'] = base * g.get('lr_scale', 1.0)
+            x, y = next(bpe)
+            logits = model(x)
+            ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
+            logits = None
+            loss = ce + comp_lambda * model.comp_reg
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            _lbuf.append(ce.detach())
+            _tail.append(ce.detach())
+            if len(_tail) > 50:
+                del _tail[:-50]
+            if len(_lbuf) >= 512:
                 losses.extend(torch.stack(_lbuf).tolist())
                 _lbuf.clear()
-            print(f'  step {step:5d}  loss {float(losses[-1]):.4f}  lr {opt.param_groups[0]['lr']:.2e}  dense={getattr(model.blocks[0].attn, '_dense_warmup', False)}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
+            if (step + 1) % 1024 == 0:
+                gc.collect()
+            if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
+                _pv = float(L.eval_ppl(model, _eval_batch, device))
+                (warm_hist if getattr(model.blocks[0].attn, '_dense_warmup', False) else ppl_hist).append([step + 1, _pv])
+            if log_every and (step % log_every == 0 or step == steps - 1):
+                if _lbuf:
+                    losses.extend(torch.stack(_lbuf).tolist())
+                    _lbuf.clear()
+                print(f'  step {step:5d}  loss {float(losses[-1]):.4f}  lr {opt.param_groups[0]['lr']:.2e}  dense={getattr(model.blocks[0].attn, '_dense_warmup', False)}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
+    finally:
+        if _gc_relief:
+            gc.enable()
     wall = time.time() - t0
     if deadline_ts is not None and time.time() > deadline_ts:
         print(f'[{variant} seed={seed} warm={warm_steps}] time-cap deadline reached before the final evaluation ({wall / 60:.1f} min) — truncating; this cell produced NO measurement and will be retried.')
@@ -1198,22 +1210,33 @@ def run_niah_phase(payload, guard=None, label=''):
                     return (cache['ids'], cache['tgt'])
                 _deadline = guard.deadline_ts() if guard is not None else None
                 niah_truncated = False
-                for step in range(n_steps):
-                    if _deadline is not None and time.time() > _deadline:
-                        wall = time.time() - t0
-                        print(f'[cap] niah train {v} s{seed} hit the deadline after {step}/{n_steps} steps ({wall / 60:.1f} min) — the cell is abandoned WITHOUT a checkpoint, so it retrains from scratch on the next pass rather than being probed from a half-trained model.')
-                        niah_truncated = True
-                        break
-                    x, y = _batch()
-                    lg = model(x)
-                    ce = F.cross_entropy(lg[:, :-1].reshape(-1, vocab), y.reshape(-1), ignore_index=-100)
-                    loss = ce + 0.05 * model.comp_reg
-                    opt.zero_grad(set_to_none=True)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    opt.step()
-                    if step % 500 == 0 or step == n_steps - 1:
-                        print(f'  [niah-train] {v:18s} s{seed} step {step:5d} loss {loss.item():.4f}', flush=True)
+                # same cyclic-GC relief as train_warmup: refcount frees the
+                # loop's garbage; the original GC state is restored on exit.
+                _gc_relief = gc.isenabled()
+                if _gc_relief:
+                    gc.disable()
+                try:
+                    for step in range(n_steps):
+                        if _deadline is not None and time.time() > _deadline:
+                            wall = time.time() - t0
+                            print(f'[cap] niah train {v} s{seed} hit the deadline after {step}/{n_steps} steps ({wall / 60:.1f} min) — the cell is abandoned WITHOUT a checkpoint, so it retrains from scratch on the next pass rather than being probed from a half-trained model.')
+                            niah_truncated = True
+                            break
+                        x, y = _batch()
+                        lg = model(x)
+                        ce = F.cross_entropy(lg[:, :-1].reshape(-1, vocab), y.reshape(-1), ignore_index=-100)
+                        loss = ce + 0.05 * model.comp_reg
+                        opt.zero_grad(set_to_none=True)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        opt.step()
+                        if (step + 1) % 1024 == 0:
+                            gc.collect()
+                        if step % 500 == 0 or step == n_steps - 1:
+                            print(f'  [niah-train] {v:18s} s{seed} step {step:5d} loss {loss.item():.4f}', flush=True)
+                finally:
+                    if _gc_relief:
+                        gc.enable()
                 if niah_truncated:
                     del model, opt
                     gc.collect()

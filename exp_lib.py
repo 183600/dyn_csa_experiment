@@ -788,6 +788,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         raise ValueError("lightning_indexer: query_chunk=None is not 'use the default'; pass the default (2048) explicitly or omit the argument")
     query_chunk = max(1, min(int(query_chunk), n))
     chunks = []
+    _iscale = hd ** (-0.5)
     for s in range(0, n, query_chunk):
         e = min(s + query_chunk, n)
         if random_select:
@@ -796,7 +797,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             chunks.append(z.to(H.dtype))
         else:
             raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI)
-            raw.mul_(hd ** (-0.5))
+            raw.mul_(_iscale)
             F.relu(raw, inplace=True)
             chunks.append(torch.einsum('inb,ni->nb', raw, w_idx[s:e]))
     scores = chunks[0] if len(chunks) == 1 else torch.cat(chunks, 0)
@@ -1776,18 +1777,21 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
                 host = torch.from_numpy(train_ids)
         else:
             host = torch.from_numpy(train_ids)
-    cols = np.arange(seq_len + 1)
     # Transport-only narrowing (design notes §6.1): every gather index is an
     # exact integer bounded by n + seq_len, so when that bound fits in int32
     # the index tensor is uploaded / consumed as int32 and the gathered ids
     # are widened back to int64 right after the gather exactly as before —
-    # bit-identical batches.
+    # bit-identical batches.  The broadcast addition itself is then also done
+    # in int32: every operand and the sum are < 2**31, so the int32 result
+    # holds exactly the same integers as the int64 form.
     _idx_i32 = n + seq_len + 1 < 2 ** 31
+    cols = np.arange(seq_len + 1, dtype=np.int32 if _idx_i32 else np.int64)
     while True:
         starts = rng.integers(0, n + 1, size=batch_size)
-        idx_np = starts[:, None] + cols[None, :]
         if _idx_i32:
-            idx_np = idx_np.astype(np.int32)
+            idx_np = starts[:, None].astype(np.int32) + cols[None, :]
+        else:
+            idx_np = starts[:, None] + cols[None, :]
         idx = torch.from_numpy(idx_np)
         if host.device.type == 'cuda':
             ids = host[_h2d_async(idx, idx.dtype, host.device)]
@@ -2644,44 +2648,57 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     delta_trace = {}
     model.train()
     truncated = False
-    for step in range(steps):
-        if deadline_ts is not None and time.time() > deadline_ts:
-            print(f'  [cap] HARD cap reached before step {step} - truncating; this run is NOT recorded (raise RUN_CAP and re-run to retry it)')
-            truncated = True
-            break
-        base = lr_at(step)
-        for g in opt.param_groups:
-            g['lr'] = base * g.get('lr_scale', 1.0)
-        x, y = next(bpe)
-        logits = model(x)
-        ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
-        del x, y, logits
-        loss = ce + comp_lambda * model.comp_reg
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        _ce_d = ce.detach()
-        _lbuf.append(_ce_d)
-        _tail.append(_ce_d)
-        if len(_tail) > 50:
-            del _tail[:-50]
-        if len(_lbuf) >= 512:
-            losses.extend(torch.stack(_lbuf).tolist())
-            _lbuf.clear()
-        if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
-            sub_ppl = eval_ppl(model, _eval_batch, device)
-            ppl_hist.append([step + 1, float(sub_ppl)])
-        if log_every and (step % log_every == 0 or step == steps - 1):
-            if _lbuf:
+    # Cyclic-GC relief for the step loop: the loop's garbage is refcount-freed
+    # already, so the periodic gen0 scans only cost time.  Collections still
+    # run at a fixed cadence (cyclic garbage stays bounded) and the original
+    # GC state is restored on every exit path.
+    _gc_relief = gc.isenabled()
+    if _gc_relief:
+        gc.disable()
+    try:
+        for step in range(steps):
+            if deadline_ts is not None and time.time() > deadline_ts:
+                print(f'  [cap] HARD cap reached before step {step} - truncating; this run is NOT recorded (raise RUN_CAP and re-run to retry it)')
+                truncated = True
+                break
+            base = lr_at(step)
+            for g in opt.param_groups:
+                g['lr'] = base * g.get('lr_scale', 1.0)
+            x, y = next(bpe)
+            logits = model(x)
+            ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
+            del x, y, logits
+            loss = ce + comp_lambda * model.comp_reg
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            _ce_d = ce.detach()
+            _lbuf.append(_ce_d)
+            _tail.append(_ce_d)
+            if len(_tail) > 50:
+                del _tail[:-50]
+            if len(_lbuf) >= 512:
                 losses.extend(torch.stack(_lbuf).tolist())
                 _lbuf.clear()
-            _lv = float(losses[-1])
-            for li, blk in enumerate(model.blocks):
-                dl = getattr(blk.attn, 'delta_logit', None)
-                if dl is not None:
-                    delta_trace.setdefault(f'L{li}', []).append([step, float(dl.item())])
-            print(f'  step {step:4d}  loss {_lv:.4f}  lr {opt.param_groups[0]['lr']:.2e}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
+            if (step + 1) % 1024 == 0:
+                gc.collect()
+            if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
+                sub_ppl = eval_ppl(model, _eval_batch, device)
+                ppl_hist.append([step + 1, float(sub_ppl)])
+            if log_every and (step % log_every == 0 or step == steps - 1):
+                if _lbuf:
+                    losses.extend(torch.stack(_lbuf).tolist())
+                    _lbuf.clear()
+                _lv = float(losses[-1])
+                for li, blk in enumerate(model.blocks):
+                    dl = getattr(blk.attn, 'delta_logit', None)
+                    if dl is not None:
+                        delta_trace.setdefault(f'L{li}', []).append([step, float(dl.item())])
+                print(f'  step {step:4d}  loss {_lv:.4f}  lr {opt.param_groups[0]['lr']:.2e}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
+    finally:
+        if _gc_relief:
+            gc.enable()
     wall = time.time() - t0
     if truncated:
         del model, opt, bpe
