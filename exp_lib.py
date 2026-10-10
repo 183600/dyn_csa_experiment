@@ -1155,7 +1155,15 @@ class HybridAttention(nn.Module):
         if cfg.kind == 'full':
             return None
         pre['q'] = self.W_q(x)
+        # q / Ca are always consumed F.normalize'd by _single (per-vector ops
+        # over the last dim), so the normalized forms are computed here on the
+        # flattened batch — per-vector values identical to the per-row form
+        # (same row-independence as the gate hoist, design notes §6.1).  The
+        # raw tensors are kept under their original keys: pooling needs the raw
+        # Ca, and the v7 RoPE mirror consumes the raw q.
+        pre['q_n'] = F.normalize(pre['q'].view(-1, self.nh, self.hd), dim=-1)
         pre['Ca'] = x @ self.W_aKV
+        pre['Ca_n'] = F.normalize(pre['Ca'], dim=-1)
         pre['Cb'] = x @ self.W_bKV if self.W_bKV is not None else None
         pre['Za'] = x @ self.W_aZ if self.W_aZ is not None else None
         pre['Zb'] = x @ self.W_bZ if self.W_bZ is not None else None
@@ -1187,6 +1195,37 @@ class HybridAttention(nn.Module):
         tau = prefix_mean + self.delta_logit
         gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
         return (gate, gate.detach() > _HALF)
+
+    def _gate_signals(self, x, pre_all=None):
+        # Batched form of the per-row `_gate_signal` calls.  Every op except the
+        # prefix cumsum is pointwise or a reduction over the last dim of each
+        # vector/pair, so its per-row values are independent of how many rows
+        # share the launch — bit-identical to the per-row form (the same
+        # row-independence the gate-decision hoist already relies on, design
+        # notes §6.1).  The prefix cumsum still runs per row on the same
+        # contiguous [T-1] values with the same 1-D kernel call, so its output
+        # is bit-identical to the per-row form as well.  Returns (rows,
+        # gate_bool_stacked): rows[b] is None or (gate_row, bool_row) exactly
+        # as `_gate_signal` would have returned for row b.
+        B, T, _d = x.shape
+        fused = pre_all.get('fused') if pre_all is not None else None
+        if fused is None:
+            if self.fuse_conv is not None:
+                # safe fallback identical to the per-row loop (each row fuses
+                # itself, exactly like _gate_signal's inline form)
+                return ([self._gate_signal(x[b], None) for b in range(B)], None)
+            fused = x.detach()
+        h = F.normalize(fused, dim=-1, eps=1e-08)
+        sim = (h[:, 1:] * h[:, :-1]).sum(dim=-1)
+        if sim.shape[-1] == 0:
+            return ([None] * B, None)
+        cfg = self.cfg
+        prefix_mean = torch.stack([torch.cumsum(_r, 0) for _r in sim.unbind(0)], 0)
+        prefix_mean = prefix_mean / _range_cache(1, sim.shape[-1] + 1, x.device)
+        tau = prefix_mean + self.delta_logit
+        gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
+        gate_b = gate.detach() > _HALF
+        return ([(gate[b], gate_b[b]) for b in range(B)], gate_b)
 
     def _single(self, x, pre=None, gate_sig=None, pre_blocks=None):
         cfg = self.cfg
@@ -1303,19 +1342,26 @@ class HybridAttention(nn.Module):
                     pre_all[kk] = v
                 else:
                     pre_all[kk] = v.reshape(B, T, *v.shape[1:])
-        pres = [None if pre_all is None else {kk: v[b] if v is not None else None for kk, v in pre_all.items()} for b in range(B)]
+        # unbind hands out the same per-row views as v[b] (one C++ call per key
+        # instead of one Python-dispatched getitem per row per key); the views
+        # feeding _single are identical.
+        if pre_all is None:
+            pres = [None] * B
+        else:
+            _cols = {kk: (None if v is None else v.unbind(0)) for kk, v in pre_all.items()}
+            pres = [{kk: (None if vv is None else vv[b]) for kk, vv in _cols.items()} for b in range(B)]
         gate_sigs = None
         pre_blocks = None
         # The batched gate-signal / block-geometry hoist below is value-identical
         # to the per-row inline form for ANY batch size (design notes §6.1), so
         # it also serves B == 1 (e.g. the seq-2048 topk sweep).
         if self.cfg.chunking == 'cosine_learnable':
-            _raw = [self._gate_signal(x[b], pres[b]) for b in range(B)]
+            _raw, _gbool = self._gate_signals(x, pre_all)
             if all((_r is not None for _r in _raw)):
                 # .numpy() is a zero-copy view of the stacked CPU tensor (the
                 # base tensor stays alive through the views); the segmenter
                 # consumes the same booleans.
-                _gl = torch.stack([_r[1] for _r in _raw]).cpu().numpy()
+                _gl = _gbool.cpu().numpy()
                 gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gl)]
                 # Batched block geometry for the whole batch; every value is
                 # identical to the per-row form (see _hoist_blocks_from_cuts).
