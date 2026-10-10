@@ -223,9 +223,8 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
         nblks.append(_nb)
         hons.append(_hon)
     # When the staging pool serves, the rows are written straight into the
-    # pinned buffer via a single `torch.stack(out=...)` call (skipping the
-    # intermediate stacked copy and the per-row copies); the values uploaded
-    # are exactly the stacked rows either way.
+    # pinned buffer via a single `torch.stack(out=...)` call; the values
+    # uploaded are exactly the stacked rows either way.
     staged, commit = _h2d_stage((len(bids_cpu), T), torch.long, device)
     if staged is not None:
         torch.stack(bids_cpu, out=staged)
@@ -241,15 +240,14 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
                 arr = staged_h.numpy()
                 arr[:] = 0.0
             except TypeError:
-                # a numpy-less dtype (e.g. bfloat16) — keep the old form
+                # a numpy-less dtype (e.g. bfloat16) — fall back to a host array
                 arr = None
                 staged_h = commit_h = None
         if arr is None:
             arr = np.zeros((len(gate_lists), T - 1), dtype=np.float32)
         for _i, _hon in enumerate(hons):
             if _hon:
-                # iterating the honoured dict yields its (integer) slot keys;
-                # same slot set as the generator-with-int() form
+                # iterating the honoured dict yields its (integer) slot keys
                 _sl = np.fromiter(_hon, dtype=np.int64, count=len(_hon))
                 _sl = _sl[(0 <= _sl) & (_sl < T - 1)]
                 arr[_i, _sl] = 1.0
@@ -552,10 +550,9 @@ def _pool_parts_host(block_ids, B, ov, n, counts_l):
         nseg = 8 if ov is not None else 4
         total = nseg * B
         pad = (-total) % _POOL_PARTS_BUCKET
-        # One allocation carries the same flat layout as the concat form —
-        # [counts | ends | starts | last_idx (| end_prev | starts_prev |
-        # ov_start | ov_len)] followed by the zero pad — with every segment
-        # computed in place; the integers uploaded are identical.
+        # Flat layout: [counts | ends | starts | last_idx (| end_prev |
+        # starts_prev | ov_start | ov_len)] followed by the zero pad; the
+        # integers uploaded are identical to the per-segment form.
         flat = np.empty(total + pad, dtype=np.int64)
         flat[0:B] = counts_np
         flat[B:2 * B] = ends_np
@@ -576,9 +573,8 @@ def _pool_parts_host(block_ids, B, ov, n, counts_l):
         if pad:
             flat[total:] = 0
         buf = _h2d_async(flat, torch.long, block_ids.device)
-        # one view + unbind is the cheapest way to hand out the nseg segment
-        # views (the bucket pad is sliced off first); they are read-only views
-        # into buf exactly like the per-segment slices of the concat form.
+        # the bucket pad is sliced off first; the unbound segment views are
+        # read-only views into buf.
         return buf[:total].view(nseg, B).unbind(0)
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
@@ -643,7 +639,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     mask_a = _gp < ends[:, None]
     # These three index tensors feed gathers only; once the masks (which need
     # the unclamped values) are built, the clamps run in place — the same
-    # clamp kernel on the same values, just without the extra allocation.
+    # clamp on the same values.
     g_a = _gp.clamp_(max=n - 1)
     Xam = _take_2d(Xas, g_a)
     Zam = _take_2d(Zas, g_a)
@@ -701,11 +697,9 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     return (comp, order[last_idx], B)
 
 def _rank_blocks(masked, B, ties):
-    # The int64 sort indices are consumed directly by the int64 gathers below
-    # and narrowed to int32 once, on the kept slice only — the old form
-    # narrowed the full matrix to int32 and then widened it straight back to
-    # int64 for the gathers.  Same integers on every path (index transport,
-    # design notes §6.1).
+    # The sort indices are consumed by the int64 gathers below and narrowed
+    # to int32 on the kept slice only.  Same integers on every path (index
+    # transport, design notes §6.1).
     if ties == 'earliest':
         return torch.sort(masked, dim=1, stable=True, descending=True).indices
     order = torch.sort(masked.flip(1), dim=1, stable=True, descending=True).indices
@@ -723,7 +717,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     k = min(k_req, B)
     finite = torch.isfinite(scores)
     # torch.where picks bit-identical values (scores or the -inf constant) —
-    # the same selection masked_fill produced, minus the negated-mask pass.
+    # the same selection masked_fill produced.
     masked = torch.where(causal & finite, scores, float('-inf'))
     order = _rank_blocks(masked, B, ties)
     usable = causal.gather(1, order) & finite.gather(1, order)
@@ -739,8 +733,8 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     grid = _arange_cache(n, scores.device)[:, None].expand(n, _w_keep)
     kept = torch.full((n, _w_keep), -1, dtype=torch.int32, device=scores.device)
     _keep_w = keep[:, :_w_keep]
-    # single int64 -> int32 narrowing, on the kept slice only (same integers
-    # as the old full-matrix narrowing, just less of it).
+    # int64 -> int32 narrowing, on the kept slice only — same integers
+    # (index transport, design notes §6.1).
     order_k = order[:, :_w_keep].to(torch.int32)
     kept[grid[_keep_w], dest[:, :_w_keep][_keep_w]] = order_k[_keep_w]
     del grid, _keep_w
@@ -927,8 +921,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             sel_blk_all &= keep_all
         valid_all = torch.cat([sel_blk_all, win_valid_all], dim=1)
         # full-width forms of the per-chunk negation / any-reduction: the
-        # elementwise and reduction values per row are identical, hoisted out
-        # of the chunk loop so they are computed once instead of per chunk.
+        # elementwise and reduction values per row are identical to the
+        # per-chunk forms.
         nvalid_all = ~valid_all[:, None, :]
         anyrow_all = valid_all.any(-1) if sink_logits is None else None
     else:

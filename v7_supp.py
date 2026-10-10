@@ -289,8 +289,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         # same int32 index transport as exp_lib.gathered_attention (§6.1):
         # identical integers, identical gathered values.  The int32 narrowing
         # rides the (T, topk) part only; the window offsets are cached int32,
-        # so the cat never leaves int32 (the old form catted in int64 and then
-        # narrowed the whole (T, M) matrix).
+        # so the cat never leaves int32.
         topk_l = topk_idx if topk_idx.dtype in (torch.int32, torch.int64) else topk_idx.long()
         _both_all = torch.cat([topk_idx.to(torch.int32), L._window_block_offset(T, w, _n_blk, dev)], 1)
         _sel_all = pos_all[:, None] > last_tok[topk_l]
@@ -307,9 +306,9 @@ class HybridAttentionRoPE(L.HybridAttention):
             if _keep_all is not None:
                 _sel_all &= _keep_all
             _valid_all = torch.cat([_sel_all, _wvalid_all], 1)
-            # same once-per-call hoist as exp_lib.gathered_attention: the
-            # negation / any-reduction values per row are identical to the
-            # per-chunk forms.
+            # same hoisted forms as exp_lib.gathered_attention: the negation /
+            # any-reduction values per row are identical to the per-chunk
+            # forms.
             _nvalid_all = ~_valid_all[:, None, :]
             _anyrow_all = _valid_all.any(-1) if sink is None else None
         else:
