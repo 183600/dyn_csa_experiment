@@ -95,13 +95,14 @@ jobs:
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      - name: Configure opencode (Kimi)
+      - name: Configure opencode (Kimi 20% / NVIDIA fallback)
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           mkdir -p ~/.config/opencode
 
-          cat > ~/.config/opencode/opencode.json <<'EOF'
+          cat > ~/.config/opencode/opencode.kimi.json <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
             "provider": {
@@ -121,8 +122,32 @@ jobs:
           }
           EOF
 
-          echo "=== opencode config ==="
-          cat ~/.config/opencode/opencode.json
+          cat > ~/.config/opencode/opencode.nvidia.json <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "nvidia": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "NVIDIA",
+                "options": {
+                  "baseURL": "https://integrate.api.nvidiiiiiiiiiiiiia.com/v1",
+                  "apiKey": "{env:NVIDIA_API_KEY}"
+                },
+                "models": {
+                  "moonshotai/kimi-k3": { "name": "moonshotai/kimi-k3" }
+                }
+              }
+            },
+            "model": "nvidia/moonshotai/kimi-k3"
+          }
+          EOF
+
+          cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
+
+          echo "=== template (Kimi) ==="
+          cat ~/.config/opencode/opencode.kimi.json
+          echo "=== template (NVIDIA) ==="
+          cat ~/.config/opencode/opencode.nvidia.json
 
       - name: Configure git
         run: |
@@ -133,6 +158,7 @@ jobs:
         timeout-minutes: 300
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           set +e
           set -o pipefail
@@ -150,9 +176,14 @@ jobs:
           BUG_TIMEOUT=$((60*60))      # 1h
           CLEAN_TIMEOUT=$((30*60))    # 30m
 
+          # provider 选择策略：20% 概率走 Kimi，其余走 NVIDIA
+          KIMI_PROB=20
+          KIMI_COOLDOWN=0
+
           i=0
           FAIL_COUNT=0
           RATE_COUNT=0
+          CURRENT_PROVIDER=nvidia
 
           commit_and_push() {
             git add -A || true
@@ -176,7 +207,63 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 单阶段执行（带重试） ----------
+          # ---------- 健康检查 ----------
+          kimi_alive() {
+            local code
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+                   -H "Authorization: Bearer ${KIMI_API_KEY}" \
+                   'https://api.moonshot.cn/v1/models' 2>/dev/null)
+            echo "[info] Kimi 健康检查 /v1/models -> HTTP ${code:-timeout}"
+            case "$code" in
+              2*) return 0 ;;
+              *)  return 1 ;;
+            esac
+          }
+
+          # ---------- 切换 provider ----------
+          switch_provider() {
+            case "$1" in
+              kimi)
+                if [ "$CURRENT_PROVIDER" != "kimi" ]; then
+                  cp ~/.config/opencode/opencode.kimi.json ~/.config/opencode/opencode.json
+                  CURRENT_PROVIDER=kimi
+                  FAIL_COUNT=0
+                  RATE_COUNT=0
+                fi
+                ;;
+              nvidia)
+                if [ "$CURRENT_PROVIDER" != "nvidia" ]; then
+                  cp ~/.config/opencode/opencode.nvidia.json ~/.config/opencode/opencode.json
+                  CURRENT_PROVIDER=nvidia
+                  FAIL_COUNT=0
+                  RATE_COUNT=0
+                fi
+                ;;
+            esac
+          }
+
+          # ---------- 每阶段开始时选 provider ----------
+          pick_provider() {
+            if [ $KIMI_COOLDOWN -gt 0 ]; then
+              KIMI_COOLDOWN=$((KIMI_COOLDOWN-1))
+            fi
+
+            if [ $((RANDOM % 100)) -lt $KIMI_PROB ] && [ $KIMI_COOLDOWN -eq 0 ]; then
+              if kimi_alive; then
+                switch_provider kimi
+                echo "[info] 抽中 Kimi（${KIMI_PROB}%），使用 Moonshot 官方 API"
+                return
+              fi
+              echo "[info] 抽中 Kimi 但端点不可用，回退 NVIDIA"
+            elif [ $KIMI_COOLDOWN -gt 0 ]; then
+              echo "[info] Kimi 冷却中（剩余 $KIMI_COOLDOWN 轮），使用 NVIDIA"
+            fi
+
+            switch_provider nvidia
+            echo "[info] 使用 NVIDIA fallback"
+          }
+
+          # ---------- 单阶段执行（带重试 + provider 降级） ----------
           # 参数: phase_name  prompt  timeout_seconds
           # 返回: 0 成功 / 124|137|143 超时被杀 / 1 放弃
           run_phase() {
@@ -193,7 +280,8 @@ jobs:
                 return 1
               fi
 
-              echo "=========== iter #$i | phase=$phase | attempt=$attempt ==========="
+              pick_provider
+              echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER ==========="
 
               timeout --kill-after=180 "$budget" opencode run "$prompt" 2>&1 | tee "$OUT"
               local EC=$?
@@ -209,23 +297,36 @@ jobs:
                 return $EC
               fi
 
-              # 429 限流：等待后重试（不消耗重试次数）
+              # 429 限流
               if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
+                if [ "$CURRENT_PROVIDER" = "kimi" ]; then
+                  echo "[warn] phase=$phase 命中 Kimi 限流(429)，切到 NVIDIA 重试"
+                  KIMI_COOLDOWN=10
+                  switch_provider nvidia
+                  sleep 10
+                  continue
+                fi
                 RATE_COUNT=$((RATE_COUNT+1))
-                echo "[warn] phase=$phase 命中限流(429) (连续: $RATE_COUNT)"
+                echo "[warn] phase=$phase 命中 NVIDIA 限流(429) (连续: $RATE_COUNT)"
                 if [ $RATE_COUNT -ge 8 ]; then
                   echo "[warn] 连续 8 次限流，放弃该阶段"
                   return 1
                 fi
                 sleep 180
-                attempt=$((attempt-1))
                 continue
               fi
 
               # 其它非零退出
               RATE_COUNT=0
+              if [ "$CURRENT_PROVIDER" = "kimi" ]; then
+                echo "[info] phase=$phase Kimi 端点异常，切到 NVIDIA 重试"
+                KIMI_COOLDOWN=10
+                switch_provider nvidia
+                sleep 10
+                continue
+              fi
               FAIL_COUNT=$((FAIL_COUNT+1))
-              echo "[warn] phase=$phase 失败 (连续: $FAIL_COUNT)"
+              echo "[warn] phase=$phase NVIDIA 失败 (连续: $FAIL_COUNT)"
               if [ $FAIL_COUNT -ge 3 ]; then
                 echo "[warn] 连续 3 次失败，放弃该阶段"
                 return 1
