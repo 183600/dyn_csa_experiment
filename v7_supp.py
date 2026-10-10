@@ -607,9 +607,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     _tail = []
     model.train()
     x = y = logits = ce = loss = None
-    # same cyclic-GC relief as exp_lib.train_variant: the loop's garbage is
-    # refcount-freed; collections still run at a fixed cadence and the
-    # original GC state is restored on every exit path.
+    # same cyclic-GC handling as exp_lib.train_variant: collections run at a
+    # fixed cadence and the original GC state is restored on every exit path.
     _gc_relief = gc.isenabled()
     if _gc_relief:
         gc.disable()
@@ -1210,8 +1209,8 @@ def run_niah_phase(payload, guard=None, label=''):
                     return (cache['ids'], cache['tgt'])
                 _deadline = guard.deadline_ts() if guard is not None else None
                 niah_truncated = False
-                # same cyclic-GC relief as train_warmup: refcount frees the
-                # loop's garbage; the original GC state is restored on exit.
+                # same cyclic-GC handling as train_warmup; the original GC
+                # state is restored on exit.
                 _gc_relief = gc.isenabled()
                 if _gc_relief:
                     gc.disable()

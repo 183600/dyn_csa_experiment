@@ -2652,10 +2652,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     delta_trace = {}
     model.train()
     truncated = False
-    # Cyclic-GC relief for the step loop: the loop's garbage is refcount-freed
-    # already, so the periodic gen0 scans only cost time.  Collections still
-    # run at a fixed cadence (cyclic garbage stays bounded) and the original
-    # GC state is restored on every exit path.
+    # Cyclic GC is disabled for the step loop; collections still run at a
+    # fixed cadence and the original GC state is restored on every exit path.
     _gc_relief = gc.isenabled()
     if _gc_relief:
         gc.disable()
