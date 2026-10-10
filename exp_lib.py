@@ -1342,9 +1342,8 @@ class HybridAttention(nn.Module):
                     pre_all[kk] = v
                 else:
                     pre_all[kk] = v.reshape(B, T, *v.shape[1:])
-        # unbind hands out the same per-row views as v[b] (one C++ call per key
-        # instead of one Python-dispatched getitem per row per key); the views
-        # feeding _single are identical.
+        # unbind hands out the same per-row views as v[b]; the views feeding
+        # _single are identical.
         if pre_all is None:
             pres = [None] * B
         else:
