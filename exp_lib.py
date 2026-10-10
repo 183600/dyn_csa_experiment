@@ -28,6 +28,7 @@ if _NEEDED:
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
 import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib
+from bisect import bisect_right as _bisect_right
 from math import comb
 from dataclasses import dataclass
 import numpy as np
@@ -38,7 +39,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 RUN_CAP = dict(total_hours=58.333333333333336, margin=0.93, already_hours=0.0, state_path='run_time_state.json')
-CODE_SEMANTICS = 'v11.124'
+CODE_SEMANTICS = 'v11.125'
 CKPT_CODE = CODE_SEMANTICS
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
@@ -67,9 +68,10 @@ def _segment(n, want_cut_list, min_block, max_block):
     # block, the next cut lands at min(p + max_block, max(p + min_block,
     # next_cut[p] + 1)), where next_cut[p] is the earliest wanted-cut slot >= p
     # (slot ci is the boundary between tokens ci and ci+1, scanned when the scan
-    # reaches token ci + 1).  A cut at q honours next_cut[p] iff it was already
-    # pending by then (next_cut[p] <= q - 1).  The results are exactly those of
-    # the token-by-token scan.
+    # reaches token ci + 1).  A cut at q honours the LAST wanted slot that was
+    # already pending by then (the largest slot in [p, q - 1]) — the greedy
+    # scan keeps overwriting `pending_slot` as later wanted slots arrive before
+    # the cut fires.  The results are exactly those of the token-by-token scan.
     _BIG = n + 1
     # `want_cut_list` arrives as a python list (per-row `.tolist()`) or as a
     # numpy bool row (the batched `_hoist_blocks_from_cuts` path); normalising
@@ -98,7 +100,9 @@ def _segment(n, want_cut_list, min_block, max_block):
             q = p + 1
         append(q - p)
         if q < n and nc <= q - 1:
-            hon_set(nc, 1.0)
+            # honour the LATEST pending slot (largest wanted slot <= q - 1),
+            # exactly as the token-by-token scan's `pending_slot` overwrite does
+            hon_set(slots[_bisect_right(slots, q - 1, si) - 1], 1.0)
         p = q
     bids = np.repeat(np.arange(len(counts), dtype=np.int64), np.asarray(counts, dtype=np.int64))
     if cacheable:
