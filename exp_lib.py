@@ -640,18 +640,20 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         _ov_lo = _ov_hi = None
     pos = _range_cache(0, max_len, dev)
     _gp = starts[:, None] + pos[None, :]
-    g_a = _gp.clamp(max=n - 1)
     mask_a = _gp < ends[:, None]
+    # These three index tensors feed gathers only; once the masks (which need
+    # the unclamped values) are built, the clamps run in place — the same
+    # clamp kernel on the same values, just without the extra allocation.
+    g_a = _gp.clamp_(max=n - 1)
     Xam = _take_2d(Xas, g_a)
     Zam = _take_2d(Zas, g_a)
     _W_b = max(_ov_hi if _ov_hi is not None else 0, 0)
     op = _range_cache(0, _W_b, dev)
-    g_b = (ov_start[:, None] + op[None, :]).clamp(max=n - 1)
     mask_b = op[None, :] < ov_len[:, None]
+    g_b = (ov_start[:, None] + op[None, :]).clamp_(max=n - 1)
     Xbm = _take_2d(Xbs, g_b)
     Zbm = _take_2d(Zbs, g_b)
-    b_off = ov_start[:, None] - starts_prev[:, None] + op[None, :]
-    b_off = b_off.clamp(max=B_pos_b.shape[0] - 1)
+    b_off = (ov_start[:, None] - starts_prev[:, None] + op[None, :]).clamp_(max=B_pos_b.shape[0] - 1)
     _lim = B_pos_a.shape[0] - 1
     _pos_a = pos if max_len <= B_pos_a.shape[0] else pos.clamp(max=_lim)
     Zam += B_pos_a[_pos_a]
@@ -684,8 +686,10 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         _cmin, max_len = (int(v) for v in torch.stack(torch.aminmax(counts)).tolist())
     pos = _range_cache(0, max_len, dev)
     _gp = starts[:, None] + pos[None, :]
-    g = _gp.clamp(max=n - 1)
     mask = _gp < ends[:, None]
+    # g feeds the gathers only; the mask needs the unclamped values, so it is
+    # built first and the clamp runs in place (same kernel, same integers).
+    g = _gp.clamp_(max=n - 1)
     Xb = _take_2d(Xs, g)
     Zb = _take_2d(Zs, g)
     WinZ = Zb
@@ -697,10 +701,15 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     return (comp, order[last_idx], B)
 
 def _rank_blocks(masked, B, ties):
+    # The int64 sort indices are consumed directly by the int64 gathers below
+    # and narrowed to int32 once, on the kept slice only — the old form
+    # narrowed the full matrix to int32 and then widened it straight back to
+    # int64 for the gathers.  Same integers on every path (index transport,
+    # design notes §6.1).
     if ties == 'earliest':
-        return torch.sort(masked, dim=1, stable=True, descending=True).indices.to(torch.int32)
+        return torch.sort(masked, dim=1, stable=True, descending=True).indices
     order = torch.sort(masked.flip(1), dim=1, stable=True, descending=True).indices
-    return torch.sub(B - 1, order, out=order).to(torch.int32)
+    return torch.sub(B - 1, order, out=order)
 
 def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     n, B = scores.shape
@@ -713,11 +722,11 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
         return torch.empty(n, 0, device=scores.device, dtype=torch.int32)
     k = min(k_req, B)
     finite = torch.isfinite(scores)
-    masked = scores.masked_fill(~(causal & finite), float('-inf'))
+    # torch.where picks bit-identical values (scores or the -inf constant) —
+    # the same selection masked_fill produced, minus the negated-mask pass.
+    masked = torch.where(causal & finite, scores, float('-inf'))
     order = _rank_blocks(masked, B, ties)
-    _gidx = order.to(torch.int64)
-    usable = causal.gather(1, _gidx) & finite.gather(1, _gidx)
-    del _gidx
+    usable = causal.gather(1, order) & finite.gather(1, order)
     if k >= B:
         keep = usable
     else:
@@ -730,7 +739,10 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     grid = _arange_cache(n, scores.device)[:, None].expand(n, _w_keep)
     kept = torch.full((n, _w_keep), -1, dtype=torch.int32, device=scores.device)
     _keep_w = keep[:, :_w_keep]
-    kept[grid[_keep_w], dest[:, :_w_keep][_keep_w]] = order[:, :_w_keep][_keep_w]
+    # single int64 -> int32 narrowing, on the kept slice only (same integers
+    # as the old full-matrix narrowing, just less of it).
+    order_k = order[:, :_w_keep].to(torch.int32)
+    kept[grid[_keep_w], dest[:, :_w_keep][_keep_w]] = order_k[_keep_w]
     del grid, _keep_w
     pad_blk = causal.to(torch.uint8).argmax(dim=1).to(torch.int32)
     idx_out = torch.where(kept >= 0, kept, pad_blk[:, None])
@@ -802,7 +814,10 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         idx = _indexer_selection(scores, causal, k, out_valid=out_valid)
     scores.masked_fill_(~causal, float('-inf'))
     _lse = torch.logsumexp(scores, dim=-1, keepdim=True)
-    soft = torch.exp(scores.gather(1, idx.long()) - _lse)
+    # the gather output is fresh and nothing downstream needs the pre-subtract
+    # values, so the subtraction runs in place (same kernel, same values, and
+    # the sub_ node records the identical broadcast gradient).
+    soft = torch.exp(scores.gather(1, idx.long()).sub_(_lse))
     soft = torch.nan_to_num(soft)
     del scores, _lse
     m = None
@@ -911,8 +926,13 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         if keep_all is not None:
             sel_blk_all &= keep_all
         valid_all = torch.cat([sel_blk_all, win_valid_all], dim=1)
+        # full-width forms of the per-chunk negation / any-reduction: the
+        # elementwise and reduction values per row are identical, hoisted out
+        # of the chunk loop so they are computed once instead of per chunk.
+        nvalid_all = ~valid_all[:, None, :]
+        anyrow_all = valid_all.any(-1) if sink_logits is None else None
     else:
-        keep_all = valid_all = None
+        keep_all = valid_all = nvalid_all = anyrow_all = None
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
         qseg = q[s:e]
@@ -921,6 +941,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             sel_blk = sel_blk_all[s:e]
             keep = None if keep_all is None else keep_all[s:e]
             valid = valid_all[s:e]
+            nvalid = nvalid_all[s:e]
+            anyrow = None if anyrow_all is None else anyrow_all[s:e]
         else:
             sel_blk = sel_blk_all[s:e]
             keep = None
@@ -932,16 +954,18 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             if keep is not None:
                 sel_blk = sel_blk & keep
             valid = torch.cat([sel_blk, win_valid_all[s:e]], dim=1)
+            nvalid = ~valid[:, None, :]
+            anyrow = valid.any(-1) if sink_logits is None else None
         both_idx = _both_idx_all[s:e]
         Kset = _take_2d(k_stack, both_idx)
         Vset = _take_2d(v_stack, both_idx)
         if soft is None:
             logits = torch.einsum('qhd,qmhd->qhm', qseg, Kset)
             logits.mul_(scale)
-            logits.masked_fill_(~valid[:, None, :], _MINL)
+            logits.masked_fill_(nvalid, _MINL)
             attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
             if sink_logits is None:
-                attn = attn * valid.any(-1)[:, None, None]
+                attn = attn * anyrow[:, None, None]
             out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
             continue
         soft_g = soft[s:e]
@@ -958,14 +982,13 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         win_logits.mul_(scale)
         logits = torch.cat([blk_logits, win_logits], -1)
         soft_logits = torch.cat([(logits[:, :, :_nb] + soft_log_g[:, None, :]).clamp_min_(_MINL), win_logits], -1)
-        _nvalid = ~valid[:, None, :]
-        soft_logits.masked_fill_(_nvalid, _MINL)
+        soft_logits.masked_fill_(nvalid, _MINL)
         soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
-        logits.masked_fill_(_nvalid, _MINL)
+        logits.masked_fill_(nvalid, _MINL)
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
         attn = attn + (soft_attn - soft_attn.detach())
         if sink_logits is None:
-            attn = attn * valid.any(-1)[:, None, None]
+            attn = attn * anyrow[:, None, None]
         out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
     return out
 

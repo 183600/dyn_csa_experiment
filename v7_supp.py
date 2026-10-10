@@ -286,10 +286,13 @@ class HybridAttentionRoPE(L.HybridAttention):
         _k_stack = torch.cat([k_blk_r, k_sw_r], 0)
         _v_stack = torch.cat([v_blk, v_sw], 0)
         _MINL = L._finfo_min(k_blk.dtype)
-        _both_all = torch.cat([topk_idx, L._window_block_offset(T, w, _n_blk, dev)], 1).to(torch.int32)
         # same int32 index transport as exp_lib.gathered_attention (§6.1):
-        # identical integers, identical gathered values.
+        # identical integers, identical gathered values.  The int32 narrowing
+        # rides the (T, topk) part only; the window offsets are cached int32,
+        # so the cat never leaves int32 (the old form catted in int64 and then
+        # narrowed the whole (T, M) matrix).
         topk_l = topk_idx if topk_idx.dtype in (torch.int32, torch.int64) else topk_idx.long()
+        _both_all = torch.cat([topk_idx.to(torch.int32), L._window_block_offset(T, w, _n_blk, dev)], 1)
         _sel_all = pos_all[:, None] > last_tok[topk_l]
         # see exp_lib.gathered_attention: these per-row masks are hoisted under
         # L._FO_FULL_CAP_BYTES; the hoisted values are bitwise identical to the
@@ -304,8 +307,13 @@ class HybridAttentionRoPE(L.HybridAttention):
             if _keep_all is not None:
                 _sel_all &= _keep_all
             _valid_all = torch.cat([_sel_all, _wvalid_all], 1)
+            # same once-per-call hoist as exp_lib.gathered_attention: the
+            # negation / any-reduction values per row are identical to the
+            # per-chunk forms.
+            _nvalid_all = ~_valid_all[:, None, :]
+            _anyrow_all = _valid_all.any(-1) if sink is None else None
         else:
-            _keep_all = _valid_all = None
+            _keep_all = _valid_all = _nvalid_all = _anyrow_all = None
         for s in range(0, T, q_chunk):
             e = min(s + q_chunk, T)
             ib = topk_l[s:e]
@@ -313,6 +321,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 sel = _sel_all[s:e]
                 _keep = None if _keep_all is None else _keep_all[s:e]
                 valid = _valid_all[s:e]
+                _nvalid = _nvalid_all[s:e]
+                _anyrow = None if _anyrow_all is None else _anyrow_all[s:e]
             else:
                 sel = _sel_all[s:e]
                 _keep = sel_valid[s:e] if sel_valid is not None else None
@@ -322,18 +332,19 @@ class HybridAttentionRoPE(L.HybridAttention):
                 if _keep is not None:
                     sel = sel & _keep
                 valid = torch.cat([sel, _wvalid_all[s:e]], 1)
+                _nvalid = ~valid[:, None, :]
+                _anyrow = valid.any(-1) if sink is None else None
             both = _both_all[s:e]
             Kset = L._take_2d(_k_stack, both)
             Vset = L._take_2d(_v_stack, both)
             raw_logits = torch.einsum('qhd,qmhd->qhm', qr[s:e], Kset)
             raw_logits.mul_(scale)
             if soft is None:
-                logits = raw_logits.masked_fill_(~valid[:, None, :], _MINL)
+                logits = raw_logits.masked_fill_(_nvalid, _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
                 if sink is None:
-                    attn = attn * valid.any(-1)[:, None, None]
+                    attn = attn * _anyrow[:, None, None]
             if soft is not None:
-                _nvalid = ~valid[:, None, :]
                 logits = raw_logits.masked_fill(_nvalid, _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
                 nb = ib.shape[1]
@@ -347,7 +358,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = attn + (soft_attn - soft_attn.detach())
                 if sink is None:
-                    attn = attn * valid.any(-1)[:, None, None]
+                    attn = attn * _anyrow[:, None, None]
             out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
         return out
     def _dense_warmup_forward(self, x):
