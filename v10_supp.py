@@ -92,7 +92,8 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
                 if row_cache is not None:
                     row_cache[_rk] = _row
             rows.append(_row)
-        ids = torch.from_numpy(np.stack(rows)).to(DEVICE)
+        # same bit-exact staged upload as batch_iter (design notes §6.1)
+        ids = L._h2d_async(np.stack(rows), torch.int64, DEVICE)
         try:
             logits = model(ids[:, :-1], logits_tail=target)
         except RuntimeError as _oe:

@@ -826,7 +826,8 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
         i = 0
         while i < n_seq:
             j = min(i + chunk, n_seq)
-            x = torch.from_numpy(ids[i:j]).to(device)
+            # same bit-exact staged upload as batch_iter (design notes §6.1)
+            x = L._h2d_async(ids[i:j], torch.int64, device)
             trunc = getattr(model, 'use_abs_pe', True) and seq_len > max_pos
             try:
                 logits = model(x[:, -span:].clamp(0, vocab - 1) if trunc else x, logits_tail=tail)
@@ -1293,7 +1294,8 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
         if _within:
             _Lmax = max(_within)
             ids = np.asarray(val_ids[:n_seq, :_Lmax], dtype=np.int64)
-            x = torch.from_numpy(ids).to(device)
+            # same bit-exact staged upload as batch_iter (design notes §6.1)
+            x = L._h2d_async(ids, torch.int64, device)
             nll_cols = torch.zeros((int(ids.shape[0]), _Lmax - 1), dtype=torch.float64, device=device)
             _r, _chunk = (0, int(ids.shape[0]))
             while _r < int(ids.shape[0]):
@@ -1326,7 +1328,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                 ids = ids[:, -max_pos:]
                 trunc = True
             try:
-                x = torch.from_numpy(ids).to(device)
+                x = L._h2d_async(ids, torch.int64, device)
                 nll, ntok = (torch.zeros((), dtype=torch.float64, device=device), 0)
                 _r, _chunk = (0, int(ids.shape[0]))
                 while _r < int(ids.shape[0]):

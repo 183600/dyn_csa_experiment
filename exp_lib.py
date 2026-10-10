@@ -724,22 +724,23 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     # the same selection masked_fill produced.
     masked = torch.where(causal & finite, scores, float('-inf'))
     order = _rank_blocks(masked, B, ties)
-    usable = causal.gather(1, order) & finite.gather(1, order)
-    if k >= B:
-        keep = usable
-    else:
-        win = min(int(k), B)
-        keep = usable[:, :win]
+    _w_keep = min(int(k), B)
+    # Only the first _w_keep order columns are ever consumed (the k >= B and
+    # k < B forms both reduce to usable[:, :_w_keep]), so the causal/finite
+    # gathers run on that column slice directly: gathering a column subset
+    # yields exactly the corresponding columns of the full gather — the same
+    # booleans, with less index traffic (index transport, design notes §6.1).
+    order_w = order[:, :_w_keep]
+    keep = causal.gather(1, order_w) & finite.gather(1, order_w)
     dest = keep.cumsum(dim=1)
     dest -= 1
     dest.clamp_(min=0)
-    _w_keep = min(int(k), B)
     grid = _arange_cache(n, scores.device)[:, None].expand(n, _w_keep)
     kept = torch.full((n, _w_keep), -1, dtype=torch.int32, device=scores.device)
     _keep_w = keep[:, :_w_keep]
     # int64 -> int32 narrowing, on the kept slice only — same integers
     # (index transport, design notes §6.1).
-    order_k = order[:, :_w_keep].to(torch.int32)
+    order_k = order_w.to(torch.int32)
     kept[grid[_keep_w], dest[:, :_w_keep][_keep_w]] = order_k[_keep_w]
     del grid, _keep_w
     pad_blk = causal.to(torch.uint8).argmax(dim=1).to(torch.int32)
@@ -811,12 +812,14 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         out_valid = []
     with torch.no_grad():
         idx = _indexer_selection(scores, causal, k, out_valid=out_valid)
-    scores.masked_fill_(~causal, float('-inf'))
+    _ncausal = ~causal
+    scores.masked_fill_(_ncausal, float('-inf'))
     _lse = torch.logsumexp(scores, dim=-1, keepdim=True)
     # the gather output is fresh and nothing downstream needs the pre-subtract
     # values, so the subtraction runs in place (same kernel, same values, and
-    # the sub_ node records the identical broadcast gradient).
-    soft = torch.exp(scores.gather(1, idx.long()).sub_(_lse))
+    # the sub_ node records the identical broadcast gradient); exp_ is the
+    # same story (its backward saves the output, as the out-of-place form).
+    soft = scores.gather(1, idx.long()).sub_(_lse).exp_()
     soft = torch.nan_to_num(soft)
     del scores, _lse
     m = None
@@ -828,7 +831,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             m = torch.zeros(n, B + 1, device=dev, dtype=out_dtype)
             m.scatter_(1, _tgt, 1.0)
             m = m[:, :B].contiguous()
-            m.masked_fill_(~causal, 0.0)
+            m.masked_fill_(_ncausal, 0.0)
     return (m, idx, soft)
 
 class _SinkWiden(torch.autograd.Function):
