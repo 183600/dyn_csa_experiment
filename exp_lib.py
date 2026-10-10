@@ -223,12 +223,12 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
         nblks.append(_nb)
         hons.append(_hon)
     # When the staging pool serves, the rows are written straight into the
-    # pinned buffer (skipping the intermediate `torch.stack` copy); the values
-    # uploaded are exactly the stacked rows either way.
+    # pinned buffer via a single `torch.stack(out=...)` call (skipping the
+    # intermediate stacked copy and the per-row copies); the values uploaded
+    # are exactly the stacked rows either way.
     staged, commit = _h2d_stage((len(bids_cpu), T), torch.long, device)
     if staged is not None:
-        for _b in range(len(bids_cpu)):
-            staged[_b].copy_(bids_cpu[_b])
+        torch.stack(bids_cpu, out=staged)
         bid_stack = commit()
     else:
         bid_stack = _h2d_async(torch.stack(bids_cpu), torch.long, device)
@@ -248,7 +248,9 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
             arr = np.zeros((len(gate_lists), T - 1), dtype=np.float32)
         for _i, _hon in enumerate(hons):
             if _hon:
-                _sl = np.fromiter((int(_s) for _s in _hon), dtype=np.int64, count=len(_hon))
+                # iterating the honoured dict yields its (integer) slot keys;
+                # same slot set as the generator-with-int() form
+                _sl = np.fromiter(_hon, dtype=np.int64, count=len(_hon))
                 _sl = _sl[(0 <= _sl) & (_sl < T - 1)]
                 arr[_i, _sl] = 1.0
         # the honoured mask is exact 0.0/1.0, identical in any float dtype
@@ -541,30 +543,43 @@ def _pool_parts_host(block_ids, B, ov, n, counts_l):
     # when the host form cannot serve; the caller then falls back to the
     # on-device form, whose values are identical.
     try:
+        B = int(B)
+        n = int(n)
         counts_np = np.asarray(counts_l, dtype=np.int64)
-        if counts_np.shape != (int(B),) or int(n) <= 0:
+        if counts_np.shape != (B,) or n <= 0:
             return None
         ends_np = np.cumsum(counts_np, dtype=np.int64)
-        starts_np = ends_np - counts_np
-        last_idx_np = np.clip(ends_np - 1, 0, int(n) - 1)
-        segs = [counts_np, ends_np, starts_np, last_idx_np]
+        nseg = 8 if ov is not None else 4
+        total = nseg * B
+        pad = (-total) % _POOL_PARTS_BUCKET
+        # One allocation carries the same flat layout as the concat form —
+        # [counts | ends | starts | last_idx (| end_prev | starts_prev |
+        # ov_start | ov_len)] followed by the zero pad — with every segment
+        # computed in place; the integers uploaded are identical.
+        flat = np.empty(total + pad, dtype=np.int64)
+        flat[0:B] = counts_np
+        flat[B:2 * B] = ends_np
+        starts_np = flat[2 * B:3 * B]
+        np.subtract(ends_np, counts_np, out=starts_np)
+        np.clip(ends_np - 1, 0, n - 1, out=flat[3 * B:4 * B])
         if ov is not None:
-            end_prev_np = np.concatenate((np.array([-1], dtype=np.int64), ends_np[:-1]))
-            starts_prev_np = np.concatenate((np.array([0], dtype=np.int64), starts_np[:-1]))
-            ov_start_np = np.maximum(end_prev_np - int(ov), starts_prev_np)
-            ov_len_np = end_prev_np - ov_start_np
-            segs += [end_prev_np, starts_prev_np, ov_start_np, ov_len_np]
-        flat = np.concatenate(segs)
-        pad = (-int(flat.shape[0])) % _POOL_PARTS_BUCKET
+            end_prev = flat[4 * B:5 * B]
+            end_prev[0] = -1
+            end_prev[1:] = ends_np[:-1]
+            starts_prev = flat[5 * B:6 * B]
+            starts_prev[0] = 0
+            starts_prev[1:] = starts_np[:-1]
+            ov_start = flat[6 * B:7 * B]
+            np.subtract(end_prev, int(ov), out=ov_start)
+            np.maximum(ov_start, starts_prev, out=ov_start)
+            np.subtract(end_prev, ov_start, out=flat[7 * B:8 * B])
         if pad:
-            flat = np.concatenate((flat, np.zeros(pad, dtype=np.int64)))
+            flat[total:] = 0
         buf = _h2d_async(flat, torch.long, block_ids.device)
-        off = 0
-        out = []
-        for s in segs:
-            out.append(buf[off:off + int(s.shape[0])])
-            off += int(s.shape[0])
-        return tuple(out)
+        # one view + unbind is the cheapest way to hand out the nseg segment
+        # views (the bucket pad is sliced off first); they are read-only views
+        # into buf exactly like the per-segment slices of the concat form.
+        return buf[:total].view(nseg, B).unbind(0)
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
 
