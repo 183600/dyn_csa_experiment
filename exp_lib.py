@@ -729,7 +729,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     # k < B forms both reduce to usable[:, :_w_keep]), so the causal/finite
     # gathers run on that column slice directly: gathering a column subset
     # yields exactly the corresponding columns of the full gather — the same
-    # booleans, with less index traffic (index transport, design notes §6.1).
+    # booleans (index transport, design notes §6.1).
     order_w = order[:, :_w_keep]
     keep = causal.gather(1, order_w) & finite.gather(1, order_w)
     dest = keep.cumsum(dim=1)
@@ -1752,7 +1752,7 @@ def _ids_narrow(train_ids):
     # produces), so the resident copy (GPU, or pinned host staging) is stored
     # int32 and widened back to int64 right after each batch gather, leaving
     # the yielded batch bit-identical.  The guard keeps any hypothetical
-    # out-of-range corpus on the old int64 path.
+    # out-of-range corpus on the int64 path.
     if train_ids.dtype == np.int32:
         return train_ids
     if train_ids.size and int(train_ids.max()) < 2 ** 31:
@@ -2864,9 +2864,8 @@ def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32
     # The ratio is a pure function of these arguments (the parameter count
     # of a freshly-initialised SmallGPT depends only on shapes; the build
     # runs under torch.random.fork_rng, so skipping a repeat build leaves
-    # the caller's RNG stream untouched either way).  Drivers call this
-    # once per variant per phase; each call builds the model twice just to
-    # count parameters — memoise it.
+    # the caller's RNG stream untouched either way) — memoise it on the
+    # full argument tuple.
     _mkey = (variant, int(vocab), int(d), int(n_layers), int(n_heads), int(d_head), int(seq_len), tuple(sorted((str(_x) for _x in matched))), str(ref_variant))
     _hit = _MLP_RATIO_MEMO.get(_mkey)
     if _hit is not None:
