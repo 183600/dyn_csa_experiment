@@ -142,7 +142,9 @@ def _fp_norm(p):
 def _recipe_norm(recipe):
     if not isinstance(recipe, str):
         return recipe
-    return re.sub(r'(_mr)[^-]*-', r'\1*-', recipe)
+    # recipe fields are '_' separated (see exp_lib run_cfg); wildcard only the
+    # mlp_match_ref field, not everything up to the '-' inside the df hashes.
+    return re.sub(r'_mr[^_]*', '_mr*', recipe)
 
 def _probe_params_current(rec, fp):
     return isinstance(rec, dict) and _fp_norm(rec.get('probe_params')) == _fp_norm(fp)

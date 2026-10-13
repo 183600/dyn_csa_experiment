@@ -210,7 +210,9 @@ class HybridAttentionRoPE(L.HybridAttention):
                 with torch.no_grad():
                     bid, nblk, _hon_d = L.blocks_from_cuts(T, gl, cfg.min_block, cfg.max_block, x.device, return_count=True, return_honoured=True)
                 if self.need_reg:
-                    _hon = torch.zeros(T, dtype=gate.dtype, device=gate.device)
+                    # gate has length T-1 (consecutive-pair cosine similarities),
+                    # so the honoured mask must too (cf. exp_lib._single_rope).
+                    _hon = torch.zeros(T - 1, dtype=gate.dtype, device=gate.device)
                     _hon[list(_hon_d)] = 1.0
                     _soft_hon = gate * _hon
                     _shs = _soft_hon.sum()
