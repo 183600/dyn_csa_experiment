@@ -1,151 +1,197 @@
 #!/usr/bin/env python3
-"""par.py — task-level parallel executor (one GPU card per independent run).
+"""Task-level parallel executor: one GPU per independent experiment run.
 
-The experiment drivers (v6-v11) schedule their work as independent cells of
-the form (variant, seed) — one full training/eval run each.  This module adds
-an opt-in task-level parallel mode on top of them:
+Environment:
+    CSA_PAR=auto       One worker per visible GPU.
+    CSA_PAR=N          At most N GPU workers, or N CPU workers.
+    CSA_PAR=off        Serial execution.
+    CSA_PAR_GPUS=0,2   Parent-logical GPU indices to use.
 
-    CSA_PAR=auto python v11_supp.py full      # one worker per visible GPU
-    CSA_PAR=2     python v11_supp.py phase P4F
-    CSA_PAR_GPUS=0,2                           # restrict the GPU pool
-    (unset CSA_PAR) python v11_supp.py full    # 100% serial, old behaviour
+GPU indices in CSA_PAR_GPUS are relative to the parent's visible devices.
+Children receive the corresponding original CUDA_VISIBLE_DEVICES tokens.
 
-Design contracts (see docs/design_notes.md "Task-level parallelism"):
-  * A cell runs in a CHILD PROCESS with CUDA_VISIBLE_DEVICES pinned to exactly
-    one card, so `DEVICE` in exp_lib resolves to that card and model code is
-    untouched.  On CPU-only boxes the slots are CPU workers (useful for tests).
-  * Shared on-disk state is updated under an flock (summary.json via
-    L.locked_json_update, TimeGuard via its own lock): parallel children can
-    never lose each other's records.
-  * The child pre-books its projected run time into the shared TimeGuard state
-    before training and refunds the difference afterwards, so concurrently
-    launching children still respect the run-time cap (the cap meters
-    GPU-seconds, i.e. N parallel runs consume it N times faster in wall
-    clock).
-  * Aggregation, plotting, git push and shutdown live ONLY in the parent.
-  * If a child dies (rc != 0) the parent raises, exactly like an exception in
-    the serial loop; completed cells stay on disk and re-runs resume.
+Completed experiment cells remain the responsibility of the existing
+experiment-library resume logic. This module manages dispatch, process
+lifecycle, logs, and child result files.
 """
+
+import importlib
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, 'reconfigure'):
-        try:
-            _stream.reconfigure(encoding='utf-8', errors='replace')
-        except (ValueError, OSError):
-            pass
+
+
 REPO = os.path.dirname(os.path.abspath(__file__))
-JOBS_DIR = os.path.join(REPO, 'par_jobs')
-_KILL = {'on': False}
+JOBS_DIR = os.path.join(REPO, "par_jobs")
+_KILL = {"on": False}
+_OFF = ("", "0", "no", "off", "false", "none", "serial")
 
-_OFF = ('', '0', 'no', 'off', 'false', 'none', 'serial')
 
-
-def _num_or_none(v):
+def _num_or_none(value):
     try:
-        n = int(str(v).strip())
-        return n if n > 0 else None
-    except (TypeError, ValueError):
+        number = int(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
         return None
+    return number if number > 0 else None
 
 
 def _torch():
     try:
-        import torch
-        return torch
-    except Exception:
+        return importlib.import_module("torch")
+    except ImportError:
         return None
 
 
 def gpu_slots(want_gpus=None):
-    """Parent-relative GPU indices that may be handed to children, one per slot.
+    """Return child CUDA visibility tokens and whether CUDA is available.
 
-    Returns (slots, on_cuda): slots is a list of CUDA_VISIBLE_DEVICES override
-    values ('0', '1', ...); on_cuda is False when there is no CUDA at all, in
-    which case each slot is a CPU worker (CUDA_VISIBLE_DEVICES='')."""
+    CSA_PAR_GPUS uses parent-logical indices. When the parent has
+    CUDA_VISIBLE_DEVICES=2,3, logical indices 0,1 map to tokens 2,3.
+    UUID and MIG visibility tokens are preserved.
+    """
     torch = _torch()
-    n = 0
+    count = 0
     if torch is not None:
         try:
-            n = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        except Exception:
-            n = 0
-    if n > 0:
-        slots = [str(i) for i in range(n)]
-    else:
+            if torch.cuda.is_available():
+                count = int(torch.cuda.device_count())
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not query parent CUDA devices."
+            ) from exc
+
+    if count <= 0:
+        if want_gpus is not None and str(want_gpus).strip():
+            raise ValueError(
+                "CSA_PAR_GPUS was specified, but no CUDA device is visible."
+            )
         return [], False
-    if want_gpus:
-        keep = []
-        for g in str(want_gpus).split(','):
-            g = g.strip()
-            if g and g in slots:
-                keep.append(g)
-            elif g:
-                print(f'[par] WARNING: CSA_PAR_GPUS entry {g!r} is not a visible GPU here (visible: 0-{n - 1}) — ignored')
-        slots = keep or slots
-    return slots, True
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        tokens = [str(index) for index in range(count)]
+    else:
+        tokens = [item.strip() for item in visible.split(",")]
+        if (
+            len(tokens) != count
+            or any(not item or item == "-1" for item in tokens)
+            or len(set(tokens)) != len(tokens)
+        ):
+            raise RuntimeError(
+                "CUDA_VISIBLE_DEVICES cannot be mapped safely: "
+                f"value={visible!r}, torch device_count={count}. "
+                "Use a valid explicit device list."
+            )
+
+    if want_gpus is None or not str(want_gpus).strip():
+        return tokens, True
+
+    selected = []
+    for item in str(want_gpus).split(","):
+        item = item.strip()
+        if not re.fullmatch(r"[0-9]+", item):
+            raise ValueError(
+                f"Invalid CSA_PAR_GPUS entry {item!r}; "
+                "use parent-logical integer GPU indices."
+            )
+        index = int(item)
+        if index >= count:
+            raise ValueError(
+                f"CSA_PAR_GPUS index {index} is out of range "
+                f"for {count} visible device(s)."
+            )
+        token = tokens[index]
+        if token not in selected:
+            selected.append(token)
+
+    if not selected:
+        raise ValueError("CSA_PAR_GPUS selected no devices.")
+    return selected, True
 
 
-def resolve_ctx(par=None, label=''):
-    """Turn the `par` argument / CSA_PAR env into an execution context dict.
-
-    None/False/'0'/'off' -> None (serial, the default and the old behaviour).
-    'auto'/True -> one worker per GPU slot.  Integer N -> N workers.
-    A dict is a driver-decorated context and passes through unchanged.
-    The context is a plain dict so it can cross the job-file boundary."""
+def resolve_ctx(par=None, label=""):
+    """Resolve a driver context or CSA_PAR environment configuration."""
     if isinstance(par, dict):
         return par or None
     if par is None:
-        par = os.environ.get('CSA_PAR')
-    if par is None or par is False or str(par).strip().lower() in _OFF:
+        par = os.environ.get("CSA_PAR")
+    if par is None or par is False:
         return None
-    par = str(par).strip().lower() if not isinstance(par, (int, bool)) else par
-    if par is True:
-        par = 'auto'
-    want = None
-    if isinstance(par, int):
-        want = par
-    elif par.isdigit():
-        want = int(par)
-    elif par != 'auto':
-        print(f'[par] WARNING: CSA_PAR={par!r} not understood (use auto / N / off) — running serial')
+
+    value = "auto" if par is True else str(par).strip().lower()
+    if value in _OFF:
         return None
-    slots, on_cuda = gpu_slots(os.environ.get('CSA_PAR_GPUS'))
-    if on_cuda:
-        if not slots:
+
+    if value == "auto":
+        wanted = None
+    elif re.fullmatch(r"[0-9]+", value):
+        wanted = int(value)
+        if wanted <= 0:
             return None
-        workers = len(slots) if want is None else min(want, len(slots))
-        if want is not None and want > len(slots):
-            print(f'[par] NOTE: requested {want} workers but only {len(slots)} GPU slot(s) are usable — capping at {len(slots)}')
     else:
-        if want is None:
-            print('[par] NOTE: no CUDA device is visible — CSA_PAR on a CPU box runs CPU-worker children (mainly useful for testing)')
-            want = 1
-        workers = want
-        slots = [''] * workers
-    ctx = {'workers': workers, 'slots': slots, 'on_cuda': on_cuda, 'label': label}
-    print(f"[par] task-level parallelism ON: {workers} worker(s), one independent run per slot ({'GPUs ' + ','.join(str(s) for s in slots[:workers]) if on_cuda else 'CPU workers'}) — serial behaviour is restored by unsetting CSA_PAR")
-    return ctx
+        raise ValueError(
+            f"Invalid CSA_PAR value {par!r}; use auto, N, or off."
+        )
+
+    slots, on_cuda = gpu_slots(os.environ.get("CSA_PAR_GPUS"))
+    if on_cuda:
+        workers = len(slots) if wanted is None else min(wanted, len(slots))
+        if wanted is not None and wanted > len(slots):
+            print(
+                f"[par] Requested {wanted} workers; "
+                f"capping at {len(slots)} GPU slot(s).",
+                flush=True,
+            )
+        slots = slots[:workers]
+    else:
+        workers = 1 if wanted is None else wanted
+        slots = [""] * workers
+        print(
+            f"[par] No visible CUDA device: using {workers} CPU worker(s).",
+            flush=True,
+        )
+
+    context = {
+        "workers": workers,
+        "slots": slots,
+        "on_cuda": on_cuda,
+        "label": label,
+    }
+    location = "GPUs " + ",".join(slots) if on_cuda else "CPU"
+    print(
+        f"[par] Parallel execution enabled: {workers} worker(s), {location}.",
+        flush=True,
+    )
+    return context
 
 
 def ctx_active(ctx, n_cells=1):
-    return bool(ctx) and ctx.get('workers', 0) > 1 and n_cells > 1
+    return (
+        bool(ctx)
+        and int(ctx.get("workers", 0)) > 1
+        and n_cells > 1
+    )
 
 
 def _norm(obj):
-    """JSON-safe normalisation for job payloads (set -> sorted list)."""
+    """Convert driver payloads to JSON-compatible values."""
     if isinstance(obj, dict):
-        return {str(k): _norm(v) for k, v in obj.items()}
+        return {str(key): _norm(value) for key, value in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_norm(v) for v in obj]
+        return [_norm(value) for value in obj]
     if isinstance(obj, (set, frozenset)):
-        return sorted((_norm(v) for v in obj), key=lambda x: json.dumps(x, sort_keys=True, default=str))
+        return sorted(
+            (_norm(value) for value in obj),
+            key=lambda value: json.dumps(
+                value, sort_keys=True, default=str
+            ),
+        )
     if isinstance(obj, (str, int, float, bool)) or obj is None:
         return obj
     return str(obj)
@@ -153,189 +199,386 @@ def _norm(obj):
 
 def _denorm(obj):
     if isinstance(obj, dict):
-        return {str(k): _denorm(v) for k, v in obj.items()}
+        return {str(key): _denorm(value) for key, value in obj.items()}
     if isinstance(obj, list):
-        return [_denorm(v) for v in obj]
+        return [_denorm(value) for value in obj]
     return obj
 
 
-def _slug(s):
-    return re.sub(r'[^A-Za-z0-9._-]+', '_', str(s))[:80]
+def _slug(value):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))[:80]
 
 
 def _child_env(slot):
     env = os.environ.copy()
-    env['CUDA_VISIBLE_DEVICES'] = str(slot) if str(slot) != '' else ''
-    env['PYTHONUNBUFFERED'] = '1'
+    env["CUDA_VISIBLE_DEVICES"] = str(slot)
+    env["PYTHONUNBUFFERED"] = "1"
     return env
 
 
-def run_jobs(jobs, ctx, phase_label='phase'):
-    """Run `jobs` (list of dicts from _norm) on the ctx's worker slots.
-
-    Each job becomes a child process: `python par.py __child__ <job> <result>`,
-    stdout/stderr teed to its own log file under par_jobs/.  Returns the list
-    of result dicts (one per job, in job order).  Raises RuntimeError when a
-    child infrastructure-fails (rc != 0) — matching the serial semantics where
-    an exception in the phase loop aborts the phase (completed cells stay)."""
-    workers = max(1, min(int(ctx.get('workers', 1)), len(ctx['slots'])))
-    slots = ctx['slots'][:workers]
-    os.makedirs(JOBS_DIR, exist_ok=True)
-    run_dir = os.path.join(JOBS_DIR, _slug(phase_label) + '_' + time.strftime('%Y%m%d_%H%M%S'))
-    os.makedirs(run_dir, exist_ok=True)
-    print(f'[par] dispatching {len(jobs)} cell(s) to {workers} worker(s) — job dir: {os.path.relpath(run_dir, REPO)}')
-    entries = []
-    for i, job in enumerate(jobs):
-        name = f"{i:03d}_{_slug(job.get('kind'))}_{_slug(job.get('v'))}_s{job.get('seed')}" + (f"_w{job['extra']['warm']}" if job.get('extra') and job.get('extra', {}).get('warm') is not None else '')
-        d = os.path.join(run_dir, name)
-        os.makedirs(d, exist_ok=True)
-        jpath = os.path.join(d, 'job.json')
-        with open(jpath, 'w', encoding='utf-8') as f:
-            json.dump(_norm(job), f, indent=1)
-        entries.append({'idx': i, 'job': job, 'dir': d, 'job_path': jpath, 'result_path': os.path.join(d, 'result.json'), 'log_path': os.path.join(d, 'log.txt'), 'name': name, 'proc': None, 'slot': None, 'done': False, 'result': None})
-    pending = list(entries)
-    running = []
-    results = [None] * len(entries)
-    t0 = time.time()
+def _atomic_json(path, obj):
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix="." + os.path.basename(path) + ".",
+        suffix=".tmp",
+        dir=directory,
+    )
     try:
-        while pending or running:
-            while pending and len(running) < workers:
-                _busy = {r['slot'] for r in running}
-                _free = [s for s in slots if s not in _busy]
-                if not _free:
-                    break
-                slot = _free[0]
-                e = pending.pop(0)
-                e['slot'] = slot
-                log_f = open(e['log_path'], 'w', encoding='utf-8')
-                e['log_f'] = log_f
-                e['proc'] = subprocess.Popen([sys.executable, os.path.abspath(__file__), '__child__', e['job_path'], e['result_path']], cwd=REPO, env=_child_env(slot), stdout=log_f, stderr=subprocess.STDOUT, start_new_session=True)
-                where = f"GPU {slot}" if ctx.get('on_cuda') and str(slot) != '' else 'CPU'
-                print(f"[par] start {e['name']} on {where}  (log: {os.path.relpath(e['log_path'], REPO)})", flush=True)
-                running.append(e)
-            time.sleep(2.0)
-            still = []
-            for e in running:
-                rc = e['proc'].poll()
-                if rc is None:
-                    still.append(e)
-                    continue
-                e['done'] = True
-                e['log_f'].close()
-                e['result'] = _read_result(e['result_path'])
-                took = time.time() - t0
-                results[e['idx']] = e['result']
-                status = (e['result'] or {}).get('status', f'rc={rc}')
-                print(f"[par] done  {e['name']} rc={rc} status={status} ({took / 60:.1f} min since dispatch)", flush=True)
-                if rc != 0:
-                    _dump_log_tail(e, 40)
-                    raise RuntimeError(f"[par] child {e['name']} exited rc={rc} (see {os.path.relpath(e['log_path'], REPO)}) — aborting the phase like a serial exception; completed cells are kept, re-run resumes")
-            running = still
-            if running and int(time.time() - t0) % 60 < 2:
-                ndone = sum(1 for x in entries if x['done'])
-                names = ', '.join(x['name'] for x in running)
-                print(f'[par] {len(running)} running / {ndone} done / {len(pending)} pending — {names}', flush=True)
-    except BaseException:
-        _KILL['on'] = True
-        for e in running:
-            try:
-                os.killpg(os.getpgid(e['proc'].pid), signal.SIGTERM)
-            except Exception:
-                try:
-                    e['proc'].terminate()
-                except Exception:
-                    pass
-        for e in running:
-            try:
-                e['proc'].wait(timeout=30)
-            except Exception:
-                try:
-                    os.killpg(os.getpgid(e['proc'].pid), signal.SIGKILL)
-                except Exception:
-                    pass
-            try:
-                e['log_f'].close()
-            except Exception:
-                pass
-        print('[par] children terminated — a cell killed mid-training leaves NO record (same semantics as a serial crash); re-run resumes')
-        raise
-    for e in entries:
-        if e['result'] is None:
-            e['result'] = _read_result(e['result_path'])
-            results[e['idx']] = e['result']
-    return results
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(_norm(obj), stream, indent=1, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _read_result(path):
     if not os.path.exists(path):
         return None
     try:
-        with open(path, encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as _e:
-        return {'status': 'unreadable_result', 'error': f'{type(_e).__name__}: {_e}'}
+        with open(path, encoding="utf-8") as stream:
+            result = json.load(stream)
+        if not isinstance(result, dict):
+            raise ValueError("Child result must be a JSON object.")
+        return result
+    except Exception as exc:
+        return {
+            "status": "unreadable_result",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
-def _dump_log_tail(e, n=40):
+def _dump_log_tail(entry, n=40):
     try:
-        with open(e['log_path'], encoding='utf-8', errors='replace') as f:
-            tail = f.readlines()[-n:]
-        print(f"[par] ---- tail of {os.path.relpath(e['log_path'], REPO)} ----")
-        sys.stdout.writelines('    ' + ln for ln in tail)
-        print('[par] ------------------------------------------')
-    except Exception:
+        with open(
+            entry["log_path"], encoding="utf-8", errors="replace"
+        ) as stream:
+            tail = stream.readlines()[-n:]
+        print(f"[par] ---- {entry['log_path']} ----", flush=True)
+        sys.stdout.writelines("  " + line for line in tail)
+        print("[par] ------------------------------", flush=True)
+    except OSError:
         pass
 
 
-# ---------------------------------------------------------------- child side
+def _terminate_entries(entries):
+    """Terminate children and their process groups, then reap them."""
+    active = [
+        entry for entry in entries
+        if entry.get("proc") is not None
+        and entry["proc"].poll() is None
+    ]
+    for entry in active:
+        proc = entry["proc"]
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGTERM)
+            else:
+                proc.terminate()
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+    deadline = time.monotonic() + 30.0
+    for entry in active:
+        proc = entry["proc"]
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name == "posix":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                print(
+                    f"[par] WARNING: child PID {proc.pid} "
+                    "could not be reaped promptly.",
+                    flush=True,
+                )
+
+
+def run_jobs(jobs, ctx, phase_label="phase"):
+    """Dispatch jobs and return result objects in input order.
+
+    A normal experiment failure can return an error status with rc=0.
+    Nonzero exit codes or invalid/missing result files are infrastructure
+    failures and abort dispatch.
+    """
+    jobs = list(jobs)
+    if not jobs:
+        return []
+    if not isinstance(ctx, dict):
+        raise ValueError("run_jobs requires a resolved context dict.")
+
+    slots = [str(slot) for slot in ctx.get("slots", [])]
+    requested = int(ctx.get("workers", 1))
+    if requested <= 0 or not slots:
+        raise ValueError("Parallel context has no usable worker slots.")
+    workers = min(requested, len(slots))
+    slots = slots[:workers]
+
+    if ctx.get("on_cuda"):
+        if any(not slot for slot in slots):
+            raise ValueError("GPU context contains an empty device token.")
+        if len(set(slots)) != len(slots):
+            raise ValueError("GPU worker slots must use distinct devices.")
+    elif any(slots):
+        raise ValueError("CPU context must use empty CUDA visibility.")
+
+    os.makedirs(JOBS_DIR, exist_ok=True)
+    prefix = (
+        _slug(phase_label)
+        + "_"
+        + time.strftime("%Y%m%d_%H%M%S")
+        + "_"
+    )
+    run_dir = tempfile.mkdtemp(prefix=prefix, dir=JOBS_DIR)
+    print(
+        f"[par] Dispatching {len(jobs)} cell(s) to {workers} worker(s): "
+        f"{os.path.relpath(run_dir, REPO)}",
+        flush=True,
+    )
+
+    entries = []
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            raise TypeError(f"Job {index} must be a dict.")
+        name = (
+            f"{index:03d}_{_slug(job.get('kind'))}_"
+            f"{_slug(job.get('v'))}_s{_slug(job.get('seed'))}"
+        )
+        extra = job.get("extra")
+        if isinstance(extra, dict) and extra.get("warm") is not None:
+            name += f"_w{_slug(extra['warm'])}"
+        directory = os.path.join(run_dir, name)
+        os.mkdir(directory)
+        entry = {
+            "idx": index,
+            "name": name,
+            "job": job,
+            "job_path": os.path.join(directory, "job.json"),
+            "result_path": os.path.join(directory, "result.json"),
+            "log_path": os.path.join(directory, "log.txt"),
+            "proc": None,
+            "log_f": None,
+            "worker": None,
+            "done": False,
+            "result": None,
+        }
+        _atomic_json(entry["job_path"], job)
+        entries.append(entry)
+
+    pending = list(entries)
+    running = []
+    results = [None] * len(entries)
+    started = time.monotonic()
+    next_heartbeat = started + 60.0
+    _KILL["on"] = False
+
+    try:
+        while pending or running:
+            busy = {entry["worker"] for entry in running}
+            free_workers = [
+                index for index in range(workers) if index not in busy
+            ]
+
+            for worker in free_workers:
+                if not pending:
+                    break
+                entry = pending.pop(0)
+                entry["worker"] = worker
+                entry["log_f"] = open(
+                    entry["log_path"], "w", encoding="utf-8"
+                )
+                entry["proc"] = subprocess.Popen(
+                    [
+                        sys.executable,
+                        os.path.abspath(__file__),
+                        "__child__",
+                        entry["job_path"],
+                        entry["result_path"],
+                    ],
+                    cwd=REPO,
+                    env=_child_env(slots[worker]),
+                    stdout=entry["log_f"],
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                running.append(entry)
+                location = (
+                    f"GPU {slots[worker]}"
+                    if ctx.get("on_cuda")
+                    else f"CPU worker {worker}"
+                )
+                print(
+                    f"[par] Start {entry['name']} on {location}.",
+                    flush=True,
+                )
+
+            still_running = []
+            for entry in running:
+                rc = entry["proc"].poll()
+                if rc is None:
+                    still_running.append(entry)
+                    continue
+
+                entry["log_f"].close()
+                entry["done"] = True
+                result = _read_result(entry["result_path"])
+                entry["result"] = result
+                results[entry["idx"]] = result
+                status = (result or {}).get("status", "missing_result")
+                print(
+                    f"[par] Done {entry['name']}: rc={rc}, "
+                    f"status={status}, "
+                    f"{(time.monotonic() - started) / 60:.1f} min "
+                    "since dispatch.",
+                    flush=True,
+                )
+
+                valid_result = (
+                    isinstance(result, dict)
+                    and isinstance(status, str)
+                    and bool(status.strip())
+                    and status != "unreadable_result"
+                )
+                if rc != 0 or not valid_result:
+                    _dump_log_tail(entry)
+                    raise RuntimeError(
+                        f"Child {entry['name']} failed: "
+                        f"rc={rc}, status={status}. "
+                        f"See {entry['log_path']}. "
+                        "Completed experiment records are preserved."
+                    )
+
+            running = still_running
+            now = time.monotonic()
+            if running and now >= next_heartbeat:
+                completed = sum(entry["done"] for entry in entries)
+                names = ", ".join(entry["name"] for entry in running)
+                print(
+                    f"[par] {len(running)} running / {completed} done / "
+                    f"{len(pending)} pending: {names}",
+                    flush=True,
+                )
+                next_heartbeat = now + 60.0
+
+            if running:
+                time.sleep(0.2)
+
+    except BaseException:
+        _KILL["on"] = True
+        _terminate_entries(entries)
+        print(
+            "[par] Dispatch aborted; remaining children were terminated. "
+            "Completed records are preserved. Inspect time reservations "
+            "before resuming if a child was killed.",
+            flush=True,
+        )
+        raise
+    finally:
+        for entry in entries:
+            stream = entry.get("log_f")
+            if stream is not None and not stream.closed:
+                stream.close()
+
+    return results
+
 
 def run_child(job_path, result_path):
-    job = _denorm(json.load(open(job_path, encoding='utf-8')))
-    result = {'status': 'error', 'kind': job.get('kind'), 'v': job.get('v'), 'seed': job.get('seed')}
+    result = {"status": "fatal"}
     try:
-        module = job.get('module') or 'exp_lib'
-        mod = __import__(module)
-        if job.get('ckpt_install') and hasattr(mod, 'V9'):
+        with open(job_path, encoding="utf-8") as stream:
+            job = _denorm(json.load(stream))
+        if not isinstance(job, dict):
+            raise ValueError("Job payload must be a JSON object.")
+
+        result.update({
+            "kind": job.get("kind"),
+            "v": job.get("v"),
+            "seed": job.get("seed"),
+        })
+
+        module_name = job.get("module") or "exp_lib"
+        mod = importlib.import_module(module_name)
+
+        # Preserve the existing driver-specific checkpoint patch chain.
+        if job.get("ckpt_install") and hasattr(mod, "V9"):
             mod.V9._install_ckpt_patch()
-        if job.get('ckpt_flag') and hasattr(mod, 'V9'):
-            mod.V9._V9_CKPT['on'] = True
-        kind = job['kind']
-        if kind == 'run':
-            res = getattr(mod, 'L', mod).run_cell_job(job)
-        elif kind == 'lenphase':
-            res = __import__('v7_supp').run_lenphase_cell_job(job)
-        elif kind == 'probe':
-            res = __import__('v10_supp').run_probe_cell_job(job)
-        elif kind == 'warm':
-            res = __import__('v7_supp').run_warmup_cell_job(job)
+        if job.get("ckpt_flag") and hasattr(mod, "V9"):
+            mod.V9._V9_CKPT["on"] = True
+
+        kind = job["kind"]
+        if kind == "run":
+            response = getattr(mod, "L", mod).run_cell_job(job)
+        elif kind == "lenphase":
+            response = importlib.import_module(
+                "v7_supp"
+            ).run_lenphase_cell_job(job)
+        elif kind == "probe":
+            response = importlib.import_module(
+                "v10_supp"
+            ).run_probe_cell_job(job)
+        elif kind == "warm":
+            response = importlib.import_module(
+                "v7_supp"
+            ).run_warmup_cell_job(job)
         else:
-            raise ValueError(f'unknown job kind {kind!r}')
-        result.update(res or {})
-        result.setdefault('status', 'ok')
-    except SystemExit as e:
-        result['status'] = f'exit_{e.code}'
+            raise ValueError(f"Unknown job kind {kind!r}.")
+
+        if response is not None and not isinstance(response, dict):
+            raise TypeError("Cell handler must return a dict or None.")
+
+        result["status"] = "ok"
+        if response is not None:
+            result.update(response)
+
+        status = result.get("status")
+        if not isinstance(status, str) or not status.strip():
+            raise ValueError("Cell result must contain a nonempty status.")
+
+    except SystemExit as exc:
+        result["status"] = f"exit_{exc.code}"
+        result["error"] = traceback.format_exc()
         raise
     except BaseException:
-        result['status'] = 'fatal'
-        result['error'] = traceback.format_exc()
+        result["status"] = "fatal"
+        result["error"] = traceback.format_exc()
         traceback.print_exc()
         raise
     finally:
-        try:
-            with open(result_path, 'w', encoding='utf-8') as f:
-                json.dump(_norm(result), f, indent=1)
-        except Exception:
-            pass
+        # A write failure must propagate, not masquerade as child success.
+        _atomic_json(result_path, result)
 
 
 def main(argv):
-    if len(argv) > 3 and argv[1] == '__child__':
+    if len(argv) == 4 and argv[1] == "__child__":
         run_child(argv[2], argv[3])
         return 0
+    if len(argv) > 1 and argv[1] == "__child__":
+        raise SystemExit(
+            "Usage: par.py __child__ JOB_JSON RESULT_JSON"
+        )
     print(__doc__)
-    print('[par] this module is imported by the drivers; set CSA_PAR=auto|N to enable task-level parallel runs (one GPU per run).')
+    print(
+        "[par] Imported by experiment drivers; "
+        "set CSA_PAR=auto|N to enable parallel execution."
+    )
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main(sys.argv))
