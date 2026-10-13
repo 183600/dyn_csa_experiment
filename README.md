@@ -1,5 +1,8 @@
 # Dynamic-Block CSA + HCA — WikiText-103 controlled study
 
+**English** | [中文说明](README_zh.md)
+
+
 Controlled study of compressed-block sparse attention (CSA / HCA, fixed and
 dynamic blocking) vs dense attention in a small from-scratch LM (BPE-8k,
 WikiText-103). This repository contains the experiment code and everything
