@@ -12,7 +12,7 @@
 零 GPU 分析目录（`analysis_*/`）、逐版报告（`REPORT*.md`）与运行状态文件
 都**不入库**——它们由驱动脚本在跑实验的机器上重新生成，需要时本地复现即可
 （见下文命令）。`.gitignore` 已把这几类路径挡在仓库外（`docs/` 只保留
-`design_notes.md`）。
+`design_notes.md` 与 `compute_plan.md`）。
 
 | 路径 | 说明 |
 |---|---|
@@ -27,6 +27,7 @@
 | `build_report.py` | 零 GPU 报告构建器：从 `results_*/` + `analysis_*/` 产物重建 v7 报告（所有数字现算，绝不硬编码） |
 | `fuse_analysis.py` | 零 GPU fuse 对比驱动：从 `results_*/summary.json` 重算逐层边界对齐（tol=1）、块长统计与 PPL 曲线 |
 | `docs/design_notes.md` | **设计与实现笔记**：块读门为何必须严格、且五处位置必须同步；动态分段器的前缀不变性要求；配对/可测量规则；报告约定；保证注意力按行分块与不分批形式等价的契约 |
+| `docs/compute_plan.md` | **算力规划**：扩规模路线图（0.14B–1.3B 阶梯、FineWeb-Edu、Triton 内核前提）、按 H800 卡时折算的预算口径与 M0–M4 里程碑判据；原申请表草稿不再入库 |
 
 > **`exp_lib.py` 是唯一的代码来源，直接改它。**
 

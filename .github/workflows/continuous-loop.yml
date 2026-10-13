@@ -169,8 +169,8 @@ jobs:
           # ================= 四阶段提示词 =================
           PROMPT_PERF='优化代码的性能和显存占用，不要输出或写入"优化了哪些内容"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_BUG='仔细检查代码中是否存在bug或者科研方法层面的问题，如果有就修改代码。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_CLEAN='不要修改算力申请.md，确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释）。删除所有多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样必须原样保留，绝对不能删除或移动，也不属于“多余的内容”。'
-          PROMPT_APPLY='确保算力申请.md没有错误。不要删除或移动 README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README）；.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
+          PROMPT_CLEAN='不要修改 docs/compute_plan.md 与 docs/design_notes.md（前者是算力规划文档，允许包含预算与算力估算数字，二者都不属于“多余的内容”）；确保远程仓库里没有实验结果文件、REPORTxx.md、autodl_budgetxx.json 以及算力申请.md（该文件已废弃并被 docs/compute_plan.md 取代，若再次出现请删除）；确保 docs 目录只保留 design_notes.md 与 compute_plan.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释），但 docs/compute_plan.md 与 docs/design_notes.md 中的规划与设计记录除外。删除所有多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样必须原样保留，绝对不能删除或移动，也不属于“多余的内容”。'
+          PROMPT_APPLY='确保 docs/compute_plan.md 存在且没有被误删或清空；若发现算力申请.md 再次出现则删除它（已被 docs/compute_plan.md 取代）。不要修改 docs/compute_plan.md 与 docs/design_notes.md 的内容。不要删除或移动 README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README）；.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
 
           # 每阶段单次调用的最大时长（秒）
           PERF_TIMEOUT=$((60*60))     # 1h（性能与显存优化）
@@ -213,11 +213,34 @@ jobs:
           }
           ensure_readme
 
+          # ================= docs 防删自愈 =================
+          # docs/compute_plan.md（算力规划）与 docs/design_notes.md（设计笔记）
+          # 与 README 守卫同一逻辑：只防删除，允许正常的内容修改。
+          ensure_docs() {
+            for f in docs/compute_plan.md docs/design_notes.md; do
+              [ -f "$f" ] && continue
+              if git show "HEAD:$f" > /tmp/docs_restore.md 2>/dev/null && [ -s /tmp/docs_restore.md ]; then
+                mv /tmp/docs_restore.md "$f"
+                echo "[guard] 检测到 $f 被删除，已从 HEAD 恢复"
+                continue
+              fi
+              F_SHA=$(git log --format=%H --diff-filter=AM -- "$f" 2>/dev/null | head -1)
+              if [ -n "$F_SHA" ] && git show "${F_SHA}:$f" > /tmp/docs_restore2.md 2>/dev/null && [ -s /tmp/docs_restore2.md ]; then
+                mv /tmp/docs_restore2.md "$f"
+                echo "[guard] 检测到 $f 被删除，已从历史版本 ${F_SHA:0:7} 恢复"
+              else
+                echo "[warn] $f 缺失且找不到可恢复的历史版本"
+              fi
+            done
+          }
+          ensure_docs
+
           commit_and_push() {
             # ⭐ 保护循环自身：回滚 AI 对 .github 的改动，防止 workflow 被改坏导致循环中断
             git checkout HEAD -- .github 2>/dev/null || true
             git clean -fdq .github 2>/dev/null || true
             ensure_readme
+            ensure_docs
             git add -A || true
             git commit -m "auto: iteration $1" || true
             git pull --rebase origin "$BRANCH" || git rebase --abort || true
@@ -230,6 +253,7 @@ jobs:
             git checkout HEAD -- .github 2>/dev/null || true
             git clean -fdq .github 2>/dev/null || true
             ensure_readme
+            ensure_docs
             git add -A || true
             if ! git diff --cached --quiet; then
               git commit -m "auto: partial work saved on shutdown" || true
@@ -419,7 +443,7 @@ jobs:
           find . -type f -name 'REPORT*.md'          -not -path './.git/*' -delete
           find . -type f -name 'autodl_budget*.json' -not -path './.git/*' -delete
           if [ -d docs ]; then
-            find docs -mindepth 1 -maxdepth 1 ! -name 'design_notes.md' -exec rm -rf {} +
+            find docs -mindepth 1 -maxdepth 1 ! -name 'design_notes.md' ! -name 'compute_plan.md' -exec rm -rf {} +
             [ -f docs/design_notes.md ] || : > docs/design_notes.md
           fi
 
@@ -442,6 +466,20 @@ jobs:
             fi
             [ -f README.md ] && echo "[guard] 收尾阶段发现 README.md 被删，已恢复"
           fi
+          # 防删自愈：收尾提交前恢复被删的 docs 文档（算力规划与设计笔记）
+          for f in docs/compute_plan.md docs/design_notes.md; do
+            if [ ! -f "$f" ]; then
+              if git show "HEAD:$f" > /tmp/docs_restore.md 2>/dev/null && [ -s /tmp/docs_restore.md ]; then
+                mv /tmp/docs_restore.md "$f"
+              else
+                F_SHA=$(git log --format=%H --diff-filter=AM -- "$f" 2>/dev/null | head -1)
+                if [ -n "$F_SHA" ] && git show "${F_SHA}:$f" > /tmp/docs_restore2.md 2>/dev/null && [ -s /tmp/docs_restore2.md ]; then
+                  mv /tmp/docs_restore2.md "$f"
+                fi
+              fi
+              [ -f "$f" ] && echo "[guard] 收尾阶段发现 $f 被删，已恢复"
+            fi
+          done
           git add -A
           git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
           BRANCH="${GITHUB_REF_NAME:-main}"

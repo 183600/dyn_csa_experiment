@@ -14,7 +14,7 @@ needed to reproduce the results on a machine of your own.
 零 GPU 分析目录（`analysis_*/`）、逐版报告（`REPORT*.md`）与运行状态文件
 都**不入库**——它们由下面的驱动脚本在跑实验的机器上重新生成，需要时本地
 复现即可（见下一节的命令）。`.gitignore` 已把这几类路径挡在仓库外（`docs/`
-只保留 `design_notes.md`）。
+只保留 `design_notes.md` 与 `compute_plan.md`）。
 
 | path | what |
 |---|---|
@@ -29,6 +29,7 @@ needed to reproduce the results on a machine of your own.
 | `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk, never hard-coded) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
 | `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
+| `docs/compute_plan.md` | **compute plan**: the scale-up roadmap (0.14B–1.3B ladder, FineWeb-Edu, Triton-kernel prerequisite), H800-hour budget tiers and gated milestones M0–M4; the former application draft is no longer kept in the repo |
 
 > **`exp_lib.py` 是唯一的代码来源（source of truth），直接改它。**
 
