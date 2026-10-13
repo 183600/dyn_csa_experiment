@@ -54,7 +54,10 @@ def cosine_similarity_consecutive(H, eps=1e-08):
     h = F.normalize(H, dim=-1, eps=eps)
     return (h[1:] * h[:-1]).sum(dim=-1)
 
-_SEGMENT_CACHE = {}
+# LRU memo of exact segmenter outputs (OrderedDict, O(1) eviction by recency)
+# — a pure cache: hits return the identical (bids, honoured, counts) triple
+# either policy would return, so no value downstream can change.
+_SEGMENT_CACHE = collections.OrderedDict()
 _SEGMENT_CACHE_CAP = 4096
 
 def _segment(n, want_cut_list, min_block, max_block):
@@ -63,6 +66,7 @@ def _segment(n, want_cut_list, min_block, max_block):
     if cacheable:
         hit = _SEGMENT_CACHE.get(key)
         if hit is not None:
+            _SEGMENT_CACHE.move_to_end(key)
             return hit
     # Closed form of the original greedy scan: with p the start of the current
     # block, the next cut lands at min(p + max_block, max(p + min_block,
@@ -106,10 +110,8 @@ def _segment(n, want_cut_list, min_block, max_block):
         p = q
     bids = np.repeat(np.arange(len(counts), dtype=np.int64), np.asarray(counts, dtype=np.int64))
     if cacheable:
-        if len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
-            _keep = list(_SEGMENT_CACHE.items())[len(_SEGMENT_CACHE) // 2:]
-            _SEGMENT_CACHE.clear()
-            _SEGMENT_CACHE.update(_keep)
+        while len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
+            _SEGMENT_CACHE.popitem(last=False)
         _SEGMENT_CACHE[key] = (bids, honoured, counts)
     return (bids, honoured, counts)
 
@@ -2927,11 +2929,12 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
     if int(n_sample) < 1:
         raise ValueError(f'compression_report: n_sample must be >= 1, got {n_sample!r}; the report is an average over the sequences it scores, so there is nothing to measure with no sequence scored')
     n_used = min(n_sample, val_batch.shape[0])
-    with torch.no_grad():
-        for _r0 in range(0, n_used, 16):
-            ids = torch.from_numpy(val_batch[_r0:min(_r0 + 16, n_used)]).to(device)
-            _ = model(ids, logits_tail=1)
-            del ids
+    # inference_mode (the decorator) already covers the forward pass — a nested
+    # no_grad would be a redundant context manager per call, identical values.
+    for _r0 in range(0, n_used, 16):
+        ids = torch.from_numpy(val_batch[_r0:min(_r0 + 16, n_used)]).to(device)
+        _ = model(ids, logits_tail=1)
+        del ids
     for li, blk in enumerate(model.blocks):
         attn = blk.attn
         st = attn._stats

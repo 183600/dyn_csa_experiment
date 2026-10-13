@@ -1477,6 +1477,9 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                     _r += _chunk
                 ppl = math.exp(float(nll) / max(ntok, 1))
                 out[int(Ln)] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': int(x.shape[1])}
+                del x
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
             except Exception as e:
                 out[int(Ln)] = {'error': f'{type(e).__name__}: {e}'}
     finally:
