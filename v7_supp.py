@@ -582,7 +582,12 @@ def install_patches():
         return
     if '_orig_make_layer_cfgs' not in L.__dict__:
         L.__dict__['_orig_make_layer_cfgs'] = L.make_layer_cfgs
-    _orig_smallgpt = L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)
+    # Fall back to SmallGPTRoPE's actual base (the class it was defined
+    # against at import time) rather than the current L.SmallGPT: if another
+    # patcher replaced L.SmallGPT before this install, capturing it here while
+    # SmallGPTRoPE keeps the older base would make the two factory branches
+    # inherit from different class chains.
+    _orig_smallgpt = L.__dict__.get('_v7_orig_smallgpt', SmallGPTRoPE.__mro__[1])
     L.__dict__['_v7_orig_smallgpt'] = _orig_smallgpt
 
     def smallgpt_factory(vocab, d, n_layers, n_heads, d_head, max_seq, layer_cfgs, mlp_ratio=4):

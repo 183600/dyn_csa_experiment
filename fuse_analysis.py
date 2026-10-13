@@ -99,7 +99,10 @@ def layers_of(variant, seeds, dyn_only=True):
     ks = [k for k in st if k.startswith('L')]
     if dyn_only:
         ks = [k for k in ks if 'dyn' in k]
-    return ks
+    # Sort numerically by layer index: stats-dict insertion order is not
+    # guaranteed to be layer order, and an unsorted list would silently
+    # connect per-layer plot points in the wrong x order.
+    return sorted(ks, key=lambda k: int(k.split('_')[0][1:]))
 
 @functools.lru_cache(maxsize=None)
 def per_seed_layer(variant, key, seeds):
@@ -335,6 +338,11 @@ def main(argv=None):
             probe['x_sd_ppl_csa'] = float(sample_std(d_ppl)) if len(d_ppl) > 1 else None
             probe['x_p_ppl_csa'] = float(p_ppl) if p_ppl is not None else None
             probe['x_d_f1_guarded'] = p_f1 is not None
+            # Distinguish WHY the test was skipped: gate refusal (seeds fail
+            # the pairability gate, `_ok_seeds` empty) vs. the gate passed
+            # but finite paired samples are insufficient — the report text
+            # must not claim the former when the latter happened.
+            probe['x_skip_reason'] = 'gate' if not _ok_seeds else 'samples'
         report[tag] = True
     _hyb_common = _pair_seeds[('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn')]
     _csa_common = _pair_seeds[('csa_dyn_fuse', 'csa_dynamic')]
@@ -581,7 +589,7 @@ def main(argv=None):
         if _x_f1 is None or not np.isfinite(_x_f1):
             _x_f1_txt = '跨面板的纯 CSA 对比未测量'
         else:
-            _x_f1_txt = f'只有在跨面板的纯 CSA 对比里才看到 {_pv('x_d_f1')} 的 F1 差' + (f'（p={_pv('x_p_f1', '{:.3f}')}）' if probe.get('x_d_f1_guarded') else '（该对比未通过本仓库的可配对门禁，故未执行检验、不给 p 值）') + '，而该对比非严格配对（面板/实现差异未受控）'
+            _x_f1_txt = f'只有在跨面板的纯 CSA 对比里才看到 {_pv('x_d_f1')} 的 F1 差' + (f'（p={_pv('x_p_f1', '{:.3f}')}）' if probe.get('x_d_f1_guarded') else ('（该对比未通过本仓库的可配对门禁，故未执行检验、不给 p 值）' if probe.get('x_skip_reason') == 'gate' else '（可用于配对的有限样本不足，故未执行检验、不给 p 值）')) + '，而该对比非严格配对（面板/实现差异未受控）'
         _c1 = f'1. **连「F1 提升」本身都不稳固**：在最干净的同面板配对（hybrid 栈，仅 csa_dyn 层，按 seed 配对，n={_n_p or '?'}）中，fuse 与 no-fuse 的边界 F1 差为 **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}**，即 {_f1_floor_txt}；{_x_f1_txt}，不足以支撑机制性主张。\n'
     if _ppl_d is None:
         _c3 = '3. **验证 PPL 的配对差未测量**，本节不对 PPL 方向作断言。\n'

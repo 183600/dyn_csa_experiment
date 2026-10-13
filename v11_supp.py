@@ -28,7 +28,7 @@ RUN_CAP_V11.update(total_hours=float(os.environ.get('V11_CAP_HOURS', 12.5)), sta
 def make_guard():
     g = L.TimeGuard(RUN_CAP_V11)
     if not g.state.get('sps_by_class'):
-        for src in ('run_time_state_v10.json', 'run_time_state_v9.json', 'run_time_state_v8.json'):
+        for src in ('run_time_state_v10.json', 'run_time_state_v9.json', 'run_time_state_v8.json', 'run_time_state_v7.json'):
             if os.path.exists(src):
                 try:
                     st = json.load(open(src, encoding='utf-8'))
