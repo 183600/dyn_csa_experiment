@@ -122,8 +122,15 @@ def v11_analysis(out='analysis_v11/stats.json'):
             probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': json.loads(_pp), '_code': _cd, 'recipe': _recipe, 'mean': float(np.mean(list(means.values()))), 'std': float(np.std(list(means.values()), ddof=1)) if len(means) > 1 else 0.0, 'n': len(means)})
         contrasts = {}
 
+        # O(1) lookup instead of a full probe_cells scan per contrast arm; the
+        # grouped lists are exactly what the scan would have collected, so the
+        # ambiguity/unambiguous outcomes (and the picked cell) are unchanged.
+        _cell_idx = {}
+        for c in probe_cells:
+            _cell_idx.setdefault((c['variant'], c['arm'], c['eval_len'], c['rho']), []).append(c)
+
         def cell_mean(v, arm, Ln, rho):
-            hits = [c for c in probe_cells if (c['variant'], c['arm'], c['eval_len'], c['rho']) == (v, arm, Ln, rho)]
+            hits = _cell_idx.get((v, arm, Ln, rho), [])
             if not hits:
                 return {}
             if len(hits) > 1:

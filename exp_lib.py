@@ -27,7 +27,7 @@ if _NEEDED:
         print(f'[setup] could not install {', '.join(_NEEDED)} ({type(_pip_err).__name__}: {_pip_err}) — continuing; a code path that actually needs them will raise ImportError')
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib
+import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections
 from bisect import bisect_right as _bisect_right
 from math import comb
 from dataclasses import dataclass
@@ -979,27 +979,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     q_chunk = max(1, min(int(q_chunk), n))
     out = torch.empty_like(q)
     pos_all = _arange_cache(n, dev)
-    n_blk = k_blk.shape[0]
-    k_stack = torch.cat([k_blk, k_sw], 0)
-    v_stack = torch.cat([v_blk, v_sw], 0)
     win_idx, win_valid_all = _window_geometry(n, w, dev)
-    # When topk_idx IS the cached HCA arange expansion (identity check against
-    # the _IDX_CACHE entry, as in rope_cos_sin), the whole [selected|window]
-    # index table is an exact integer function of (n, w, n_blk, topk-width) and
-    # rides the same cache; any other caller takes the per-call cat below,
-    # whose integers are identical.  The cached table is only ever read (row
-    # slices feeding gathers), never mutated, and is built outside inference
-    # mode like every other cached index tensor.
-    _exp = _IDX_CACHE.get((str(dev), 'arangeexp', int(n), int(topk_idx.shape[1]))) if topk_distinct and topk_idx.dtype == torch.int32 else None
-    if _exp is not None and topk_idx is _exp:
-        _bk = (str(dev), 'bothidx', int(n), int(w), int(n_blk), int(topk_idx.shape[1]))
-        _both_idx_all = _IDX_CACHE.get(_bk)
-        if _both_idx_all is None:
-            with torch.inference_mode(False):
-                _both_idx_all = torch.cat([topk_idx, _window_block_offset(n, w, n_blk, dev)], dim=1)
-            _cache_put(_IDX_CACHE, _bk, _both_idx_all, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
-    else:
-        _both_idx_all = torch.cat([topk_idx.to(torch.int32), _window_block_offset(n, w, n_blk, dev)], dim=1)
     _MINL = _finfo_min(k_blk.dtype)
     # Index transport (design notes §6.1): int32 and int64 index tensors hold
     # the same exact integers, and advanced indexing / equality comparisons on
@@ -1070,9 +1050,19 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             valid = torch.cat([sel_blk, win_valid_all[s:e]], dim=1)
             nvalid = ~valid[:, None, :]
             anyrow = None if _has_sink else valid.any(-1)
-        both_idx = _both_idx_all[s:e]
-        Kset = _tk2(k_stack, both_idx)
-        Vset = _tk2(v_stack, both_idx)
+        # Two half-gathers instead of a per-call cat of [k_blk|k_sw] (and the
+        # same for V): the block half of the old stacked index table was
+        # topk_l[:, j] (rows 0..n_blk-1 of the stacked tensor == k_blk rows)
+        # and the window half was win_idx + n_blk, so rows n_blk+j of the
+        # stacked tensor == row j of k_sw.  index_select returns exactly the
+        # same source rows, so the gathered values — and hence every
+        # downstream value — are bit-identical to the cat-then-gather form
+        # (index re-plumbing only, design notes §6.1), minus two full
+        # [n_blk+T, nh, hd] copies per call.
+        _sel_rows = topk_l[s:e]
+        _win_rows = win_idx[s:e]
+        Kset = torch.cat([_tk2(k_blk, _sel_rows), _tk2(k_sw, _win_rows)], 1)
+        Vset = torch.cat([_tk2(v_blk, _sel_rows), _tk2(v_sw, _win_rows)], 1)
         if soft is None:
             logits = _einsum('qhd,qmhd->qhm', qseg, Kset)
             logits.mul_(scale)
@@ -3009,7 +2999,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     t0 = time.time()
     losses = []
     _lbuf = []
-    _tail = []
+    # deque with a fixed capacity drops the oldest scalar for free instead of
+    # an O(50) list rebuild every step; the window contents are identical.
+    _tail = collections.deque(maxlen=50)
     ppl_hist = []
     delta_trace = {}
     model.train()
@@ -3040,8 +3032,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             _ce_d = ce.detach()
             _lbuf.append(_ce_d)
             _tail.append(_ce_d)
-            if len(_tail) > 50:
-                del _tail[:-50]
             if len(_lbuf) >= 512:
                 losses.extend(torch.stack(_lbuf).tolist())
                 _lbuf.clear()
@@ -3090,7 +3080,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(_tail[-50:]).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace}
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace}
     if return_model:
         result['_model'] = model
     else:

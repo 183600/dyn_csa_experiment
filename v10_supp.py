@@ -659,8 +659,15 @@ def v10_analysis(out='analysis_v10/stats.json'):
             probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
         contrasts = {}
 
+        # O(1) lookup instead of a full probe_cells scan per contrast arm; the
+        # grouped lists are exactly what the scan would have collected, so the
+        # ambiguity/unambiguous outcomes (and the picked cell) are unchanged.
+        _cell_idx = {}
+        for c in probe_cells:
+            _cell_idx.setdefault((c['variant'], c['arm'], c['eval_len'], c['rho']), []).append(c)
+
         def cell_mean(v, arm, Ln, rho):
-            hits = [c for c in probe_cells if (c['variant'], c['arm'], c['eval_len'], c['rho']) == (v, arm, Ln, rho)]
+            hits = _cell_idx.get((v, arm, Ln, rho), [])
             if len(hits) > 1:
                 print(f'[v10 stats] ({v}/{arm}/L{Ln}/r{rho}) holds {len(hits)} distinct probe parameterisations/recipes/code stamps — no unambiguous cell, so the contrast is omitted rather than pooled across them')
                 return {}

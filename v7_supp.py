@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import collections
 import dataclasses
 import gc
 import json
@@ -288,30 +289,10 @@ class HybridAttentionRoPE(L.HybridAttention):
         _wi_all, _wvalid_all = L._window_geometry(T, w, dev)
         pos_all = L._arange_cache(T, dev)
         q_chunk = max(1, min(int(q_chunk), T))
-        _n_blk = k_blk_r.shape[0]
-        _k_stack = torch.cat([k_blk_r, k_sw_r], 0)
-        _v_stack = torch.cat([v_blk, v_sw], 0)
         _MINL = L._finfo_min(k_blk.dtype)
         # same int32 index transport as exp_lib.gathered_attention (§6.1):
-        # identical integers, identical gathered values.  The int32 narrowing
-        # rides the (T, topk) part only; the window offsets are cached int32,
-        # so the cat never leaves int32.
+        # identical integers, identical gathered values.
         topk_l = topk_idx if topk_idx.dtype in (torch.int32, torch.int64) else topk_idx.long()
-        # same cached-table form as exp_lib.gathered_attention: when topk_idx IS
-        # the cached HCA arange expansion (identity check), the [selected|window]
-        # index table is an exact integer function of (T, w, n_blk, topk-width)
-        # and rides L._IDX_CACHE; any other caller takes the per-call cat, whose
-        # integers are identical.  The cached table is only ever read.
-        _exp = L._IDX_CACHE.get((str(dev), 'arangeexp', int(T), int(topk_idx.shape[1]))) if topk_distinct and topk_idx.dtype == torch.int32 else None
-        if _exp is not None and topk_idx is _exp:
-            _bk = (str(dev), 'bothidx', int(T), int(w), int(_n_blk), int(topk_idx.shape[1]))
-            _both_all = L._IDX_CACHE.get(_bk)
-            if _both_all is None:
-                with torch.inference_mode(False):
-                    _both_all = torch.cat([topk_idx, L._window_block_offset(T, w, _n_blk, dev)], 1)
-                L._cache_put(L._IDX_CACHE, _bk, _both_all, L._MASK_CACHE_BUDGET_BYTES, L._idx_cache_total)
-        else:
-            _both_all = torch.cat([topk_idx.to(torch.int32), L._window_block_offset(T, w, _n_blk, dev)], 1)
         _sel_all = pos_all[:, None] > last_tok[topk_l]
         # see exp_lib.gathered_attention: these per-row masks are hoisted under
         # L._FO_FULL_CAP_BYTES; the hoisted values are bitwise identical to the
@@ -354,9 +335,14 @@ class HybridAttentionRoPE(L.HybridAttention):
                 valid = torch.cat([sel, _wvalid_all[s:e]], 1)
                 _nvalid = ~valid[:, None, :]
                 _anyrow = valid.any(-1) if sink is None else None
-            both = _both_all[s:e]
-            Kset = L._take_2d(_k_stack, both)
-            Vset = L._take_2d(_v_stack, both)
+            # Two half-gathers instead of a per-call cat of [k_blk|k_sw]:
+            # ib selects rows of k_blk_r / v_blk and _wi_all selects rows of
+            # k_sw_r / v_sw — exactly the rows the old cat-then-gather form
+            # addressed through the +n_blk offsets, so every gathered value is
+            # bit-identical (index re-plumbing only, §6.1), minus two full
+            # [n_blk+T, nh, hd] copies per call.
+            Kset = torch.cat([L._take_2d(k_blk_r, ib), L._take_2d(k_sw_r, _wi_all[s:e])], 1)
+            Vset = torch.cat([L._take_2d(v_blk, ib), L._take_2d(v_sw, _wi_all[s:e])], 1)
             raw_logits = torch.einsum('qhd,qmhd->qhm', qr[s:e], Kset)
             raw_logits.mul_(scale)
             if soft is None:
@@ -647,7 +633,10 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     t0 = time.time()
     losses, ppl_hist, warm_hist, switch_ppl = ([], [], [], None)
     _lbuf = []
-    _tail = []
+    # fixed-capacity window: deque auto-drops the oldest scalar instead of an
+    # O(50) list rebuild every step; the surviving window contents (and hence
+    # final_loss_smoothed) are identical to the list form.
+    _tail = collections.deque(maxlen=50)
     model.train()
     x = y = logits = ce = loss = None
     # same cyclic-GC handling as exp_lib.train_variant: collections run at a
@@ -684,8 +673,6 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             opt.step()
             _lbuf.append(ce.detach())
             _tail.append(ce.detach())
-            if len(_tail) > 50:
-                del _tail[:-50]
             if len(_lbuf) >= 512:
                 losses.extend(torch.stack(_lbuf).tolist())
                 _lbuf.clear()
@@ -718,7 +705,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(_tail[-50:]).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}}
+    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}}
     del model, opt, bpe, decay, ndecay, dpar
     gc.collect()
     if device.type == 'cuda':
@@ -1335,8 +1322,11 @@ def run_niah_phase(payload, guard=None, label=''):
                     if cache['age'] >= 4 or cache['ids'] is None:
                         eps = _seed * 100003 + cache['epoch'] * 7919
                         ids, tgt, _, _kd = build_niah_batch(12, 512, 4, _vocab, seed=eps)
-                        cache['ids'] = torch.from_numpy(ids).to(DEVICE)
-                        cache['tgt'] = torch.from_numpy(tgt).to(DEVICE)
+                        # staged non-blocking upload — the same bit-exact
+                        # transport as batch_iter's staging path (§6.1),
+                        # instead of two blocking H2D copies per rebuild.
+                        cache['ids'] = L._h2d_async(ids, torch.int64, DEVICE)
+                        cache['tgt'] = L._h2d_async(tgt, torch.int64, DEVICE)
                         cache['age'] = 0
                         cache['epoch'] += 1
                     cache['age'] += 1
