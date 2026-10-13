@@ -46,6 +46,15 @@ ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_
 RUN_ABL = dict(RUN, outdir='results_lm_v4_abl', variants=ABL_VARIANTS, seeds=[0] if QUICK else [0, 1, 2, 3, 4])
 RUN_LONG = dict(RUN, n_train_tokens=2000000 if QUICK else 110000000, steps=500 if QUICK else 20000, warmup=200, eval_every=1000, seeds=[0] if QUICK else [0, 1, 2, 3], outdir='results_lm_v3_long', variants=['full', 'full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn'])
 RUN_SCALE = dict(RUN, d=384, n_layers=8, n_heads=12, d_head=32, seq_len=1024, batch_size=8, n_train_tokens=2000000 if QUICK else 40000000, steps=500 if QUICK else 4000, warmup=100, eval_every=500, seeds=[0] if QUICK else [0, 1, 2], outdir='results_lm_v5_scale', variants=['full', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic'])
+# ---- B 档规模阶梯（docs/compute_plan.md §4–§5；档位已选定 B 进取）----
+# 以下全部为规划值：步数 / 批大小 / 学习率等训练量与超参以 G0 出口的吞吐
+# 校准与 M1 配方冻结为准滚动修正；参数量以 SmallGPT 实例化统计（见
+# m0_supp.py params，S4 按规划的解析外推口径）。
+B_VOCAB = 32768
+SCALE_LADDER = {'S1': dict(d=768, n_layers=12, n_heads=12, d_head=64), 'S2': dict(d=1024, n_layers=16, n_heads=16, d_head=64), 'S3': dict(d=1536, n_layers=20, n_heads=24, d_head=64), 'S4': dict(d=2048, n_layers=24, n_heads=32, d_head=64)}
+B_ARMS = ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic']
+RUN_S1 = dict(RUN, dataset='fineweb', vocab_size=B_VOCAB, d=768, n_layers=12, n_heads=12, d_head=64, seq_len=8192, batch_size=8, n_train_tokens=5000000000, steps=76294, warmup=2000, eval_every=4000, eval_subset=32, val_seqs=512, seeds=[0, 1, 2, 3], outdir='results_b_s1', variants=B_ARMS)
+M0_CAP = dict(total_hours=700.0, margin=0.93, already_hours=0.0, state_path='run_time_state_m0.json')
 
 def block_readable(pos, last_tok):
     return pos[:, None] > last_tok[None, :]
@@ -1996,6 +2005,269 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     gc.collect()
     return (train_ids, val_batch, vocab, tok, val_bnd)
 
+_FWEB_MEMO = {}
+_FWEB_MEMO_CAP = 2
+
+def _fineweb_disk_dtype(vocab):
+    if vocab <= 65536:
+        return np.uint16
+    if vocab < 2 ** 31:
+        return np.int32
+    raise ValueError(f'vocab {vocab} exceeds the id range representable by the on-disk corpus cache')
+
+def _fineweb_local_rows(env_value):
+    """Offline FineWeb-Edu stand-in: FWEDU_LOCAL_JSONL lists files or
+    directories (os.pathsep-separated; directories expand to their sorted
+    *.jsonl / *.json / *.txt).  Every non-empty line is a document — either a
+    JSON object with a "text" field (the FineWeb-Edu row shape) or plain text.
+    Pure availability path for air-gapped kernel-dev machines; the corpus a
+    panel trains on is still bound by the content fingerprint, so a local
+    stand-in can never be confused with a genuine FineWeb-Edu cache."""
+    import glob
+    files = []
+    for cand in str(env_value).split(os.pathsep):
+        cand = cand.strip()
+        if not cand:
+            continue
+        if os.path.isdir(cand):
+            for pat in ('*.jsonl', '*.json', '*.txt'):
+                files.extend(sorted(glob.glob(os.path.join(cand, pat))))
+        elif any(ch in cand for ch in '*?['):
+            files.extend(sorted(glob.glob(cand)))
+        else:
+            files.append(cand)
+    files = [f for f in files if os.path.isfile(f)]
+    if not files:
+        raise RuntimeError(f'FWEDU_LOCAL_JSONL is set ({env_value!r}) but resolves to no readable file — point it at FineWeb-Edu style jsonl/txt files, or unset it to stream from the hub')
+    print(f'[data] local FineWeb-Edu stand-in corpus: {len(files)} file(s) ({files[0]}{" ..." if len(files) > 1 else ""})')
+    for path in files:
+        with open(path, encoding='utf-8') as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    obj = json.loads(ln)
+                except ValueError:
+                    yield ln
+                    continue
+                text = obj.get('text') if isinstance(obj, dict) else (obj if isinstance(obj, str) else None)
+                if isinstance(text, str) and text.strip():
+                    yield text
+                elif not isinstance(obj, dict):
+                    yield ln
+
+def _fineweb_rows(source):
+    """Ordered, non-empty FineWeb-Edu documents (streaming; deterministic row
+    order per dataset revision).  The token cache plus its content fingerprint
+    is what actually binds a panel to its corpus, so a hub-side revision change
+    rebuilds a different, non-confusable corpus (different src_fp -> different
+    run_cfg -> stale records are dropped, never silently reused)."""
+    env_value = os.environ.get('FWEDU_LOCAL_JSONL', '')
+    if env_value.strip():
+        yield from _fineweb_local_rows(env_value)
+        return
+    from datasets import load_dataset
+    ds = load_dataset('HuggingFaceFW/fineweb-edu', name=source, split='train', streaming=True)
+    n_docs = 0
+    for rec in ds:
+        text = rec.get('text') if isinstance(rec, dict) else None
+        if text is None or not str(text).strip():
+            continue
+        n_docs += 1
+        if n_docs % 50000 == 0:
+            print(f'    [fineweb] {n_docs} docs streamed')
+        yield str(text)
+
+def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, cache_dir='./fineweb_cache', source='sample-10BT', fit_docs=20000):
+    """B-tier corpus (docs/compute_plan.md §5): FineWeb-Edu, self-trained BPE.
+
+    Discipline mirrors load_wikitext exactly: npy cache keyed by the full
+    protocol tag, atomic writes, sha256 content fingerprint in the meta file,
+    in-process memo keyed on (file size, mtime).  Differences forced by the
+    scale band:
+      - token ids are cached on disk at 2 bytes/token (uint16, guarded by the
+        actual vocab) and served as int32; every consumer widens ids back to
+        int64 per batch exactly as the int64 corpora always did, so yielded
+        batches are bit-identical to the int64-storage form;
+      - the corpus is built in one streaming pass (fit tokenizer on the first
+        `fit_docs` documents, then train tokens up to n_train_tokens + seq_len,
+        then the validation holdout: the next val_seqs*seq_len + seq_len tokens
+        after the train region — contiguous, deterministic per protocol tag);
+      - val_batch is int64 (eval paths feed targets straight to cross entropy).
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    tag = f'v1_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}_fw{source}_fd{fit_docs}'
+    tr_path = os.path.join(cache_dir, f'train_ids_{tag}.npy')
+    va_path = os.path.join(cache_dir, f'val_batch_{tag}.npy')
+    vp_path = os.path.join(cache_dir, f'val_bnd_{tag}.npy')
+    me_path = os.path.join(cache_dir, f'meta_{tag}.json')
+    if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
+        _sig = tuple((os.path.getsize(p), os.path.getmtime(p)) for p in (tr_path, va_path, vp_path, me_path))
+        _mkey = (os.path.abspath(cache_dir), tag, _sig)
+        _hit = _FWEB_MEMO.get(_mkey)
+        if _hit is not None:
+            print('[data] serving fineweb token ids from the in-process memo (same cache files, already verified) ...')
+            return _hit
+        print('[data] loading cached fineweb token ids ...')
+        meta = json.load(open(me_path, encoding='utf-8'))
+        train_ids = np.load(tr_path).astype(np.int32)
+        if meta.get('src_fp') != _ids_fp(train_ids):
+            print('[data] WARNING: the cached fineweb train_ids do not match the fingerprint in the meta file — the cache is corrupt or was mixed across builds; REBUILDING it')
+        else:
+            val_batch = np.load(va_path).astype(np.int64)
+            val_bnd = np.load(vp_path)
+            _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
+            if len(_FWEB_MEMO) >= _FWEB_MEMO_CAP:
+                _FWEB_MEMO.pop(next(iter(_FWEB_MEMO)))
+            _FWEB_MEMO[_mkey] = _out
+            return _out
+    rows = _fineweb_rows(source)
+    fit_text = []
+    for _i, doc in enumerate(rows):
+        if _i >= fit_docs:
+            break
+        fit_text.append(doc)
+    print(f'[data] training BPE tokenizer on {len(fit_text)} fineweb docs (vocab_size={vocab_size}) ...')
+    tok = build_tokenizer(fit_text, vocab_size)
+    vocab = tok.get_vocab_size()
+    del fit_text
+    gc.collect()
+    eos_id = tok.token_to_id('<eos>')
+    disk_dt = _fineweb_disk_dtype(vocab)
+    cap_train = int(n_train_tokens) + int(seq_len)
+    cap_val = int(val_seqs) * int(seq_len) + int(seq_len)
+    raw_dir = os.path.dirname(os.path.abspath(tr_path))
+
+    def _raw_tmp(label):
+        fd, tmp = tempfile.mkstemp(dir=raw_dir, prefix=f'.fineweb_{label}_{tag}.', suffix='.raw')
+        os.close(fd)
+        return tmp
+
+    raw_train = _raw_tmp('train')
+    raw_val = _raw_tmp('val')
+    n_train_total = 0
+    n_val_total = 0
+    _marks = 0
+
+    def _encode_into(doc, buf):
+        buf.extend(tok.encode(doc).ids)
+        buf.append(eos_id)
+
+    try:
+        buf = []
+        print(f'[data] tokenising fineweb train (cap {n_train_tokens} tokens, source {source}) ...')
+        with open(raw_train, 'wb') as fh:
+            for doc in rows:
+                _encode_into(doc, buf)
+                if len(buf) >= (1 << 22):
+                    chunk = np.array(buf, dtype=disk_dt)
+                    if disk_dt is np.uint16 and int(chunk.max()) > 65535:
+                        raise ValueError(f'token id {int(chunk.max())} exceeds the uint16 cache range (vocab={vocab}) — widen _fineweb_disk_dtype before rebuilding')
+                    chunk.tofile(fh)
+                    n_train_total += len(buf)
+                    buf = []
+                    if (n_train_total >> 26) > _marks:
+                        _marks = n_train_total >> 26
+                        print(f'    [train] {n_train_total} tokens')
+                if n_train_total + len(buf) >= cap_train:
+                    break
+            if buf:
+                chunk = np.array(buf, dtype=disk_dt)
+                if disk_dt is np.uint16 and int(chunk.max()) > 65535:
+                    raise ValueError(f'token id {int(chunk.max())} exceeds the uint16 cache range (vocab={vocab}) — widen _fineweb_disk_dtype before rebuilding')
+                chunk.tofile(fh)
+                n_train_total += len(buf)
+                buf = []
+        n_train = min(n_train_total, cap_train)
+        print(f'[data] train tokens = {n_train}  vocab = {vocab}')
+        print('[data] tokenising fineweb validation holdout ...')
+        with open(raw_val, 'wb') as fh:
+            for doc in rows:
+                _encode_into(doc, buf)
+                if len(buf) >= (1 << 22):
+                    np.array(buf, dtype=disk_dt).tofile(fh)
+                    n_val_total += len(buf)
+                    buf = []
+                if n_val_total + len(buf) >= cap_val:
+                    break
+            if buf:
+                np.array(buf, dtype=disk_dt).tofile(fh)
+                n_val_total += len(buf)
+                buf = []
+        n_val_tokens = min(n_val_total, cap_val)
+        n_val = n_val_tokens // seq_len
+        print(f'[data] val sequences = {n_val} (seq_len={seq_len}, contiguous holdout after the train region)')
+        if n_val == 0:
+            raise RuntimeError('load_fineweb_edu: the corpus ran dry before a single validation sequence was filled — raise n_train_tokens or provide a larger source')
+        if n_train <= seq_len + 1:
+            raise RuntimeError(f'load_fineweb_edu: only {n_train} train tokens available (need > seq_len+1 = {seq_len + 1}) — the source is too small for the requested cap')
+
+        def _finalise_npy(raw_path, dst_path, count):
+            npy_tmp = dst_path + '.tmp'
+            mm = np.lib.format.open_memmap(npy_tmp, mode='w+', dtype=disk_dt, shape=(int(count),))
+            done = 0
+            with open(raw_path, 'rb') as rf:
+                while done < count:
+                    take = min(1 << 22, count - done)
+                    chunk = np.fromfile(rf, dtype=disk_dt, count=take)
+                    if chunk.size < take:
+                        raise RuntimeError(f'load_fineweb_edu: raw staging file {raw_path} is shorter than the encoded count — aborting the cache write')
+                    mm[done:done + take] = chunk
+                    done += take
+            mm.flush()
+            del mm
+            os.replace(npy_tmp, dst_path)
+
+        _finalise_npy(raw_train, tr_path, n_train)
+        val_disk = np.fromfile(raw_val, dtype=disk_dt, count=n_val * seq_len)
+        val_batch = val_disk.astype(np.int64).reshape(n_val, seq_len)
+        bnd_ids = sorted(boundary_token_ids(tok, eos_id))
+        val_bnd = np.isin(val_batch, bnd_ids)
+        print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
+        for _p, _a in ((va_path, val_batch), (vp_path, val_bnd)):
+            _fd, _tmp = tempfile.mkstemp(dir=raw_dir, prefix=os.path.basename(_p) + '.', suffix='.tmp')
+            try:
+                with os.fdopen(_fd, 'wb') as _fh:
+                    np.save(_fh, _a)
+                os.replace(_tmp, _p)
+            except BaseException:
+                try:
+                    os.unlink(_tmp)
+                except OSError:
+                    pass
+                raise
+        train_ids = np.load(tr_path).astype(np.int32)
+        atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids), 'source': source, 'fit_docs': fit_docs, 'disk_dtype': np.dtype(disk_dt).str, 'seq_len': int(seq_len), 'n_train_tokens': int(n_train_tokens), 'val_seqs': int(val_seqs)}, indent=0)
+        print('[data] cached fineweb token ids to disk (resume-safe)')
+        _out = (train_ids, val_batch, vocab, tok, val_bnd)
+        if len(_FWEB_MEMO) >= _FWEB_MEMO_CAP:
+            _FWEB_MEMO.pop(next(iter(_FWEB_MEMO)))
+        _FWEB_MEMO[(os.path.abspath(cache_dir), tag, tuple((os.path.getsize(p), os.path.getmtime(p)) for p in (tr_path, va_path, vp_path, me_path)))] = _out
+        return _out
+    finally:
+        for _raw in (raw_train, raw_val):
+            try:
+                os.unlink(_raw)
+            except OSError:
+                pass
+
+def load_run_corpus(cfg):
+    """Serve the corpus tuple for a run cfg (data-source switch).
+
+    A cfg without a 'dataset' key keeps WikiText-103 with exactly the arguments
+    the drivers have always passed — behaviour is bit-identical to the former
+    hard-wired load_wikitext call, so no existing panel, fingerprint or record
+    is touched.  'dataset': 'fineweb' selects the B-tier corpus
+    (docs/compute_plan.md §5) with its own cache directory, tokenizer width,
+    source name and fit protocol."""
+    name = cfg.get('dataset') or 'wikitext'
+    if name == 'wikitext':
+        return load_wikitext(cfg['seq_len'], cfg['n_train_tokens'], vocab_size=cfg.get('vocab_size', 8192), val_seqs=cfg.get('val_seqs', 512), cache_dir=cfg.get('cache_dir', './wt103_cache'))
+    if name == 'fineweb':
+        return load_fineweb_edu(cfg['seq_len'], cfg['n_train_tokens'], vocab_size=cfg.get('vocab_size', B_VOCAB), val_seqs=cfg.get('val_seqs', 512), cache_dir=cfg.get('cache_dir', './fineweb_cache'), source=cfg.get('fw_source', 'sample-10BT'), fit_docs=cfg.get('fw_fit_docs', 20000))
+    raise ValueError(f"load_run_corpus: unknown dataset {name!r} (expected 'wikitext' or 'fineweb')")
+
 def atomic_write_json(path, obj, indent=2):
     text = json.dumps(obj, indent=indent, default=float)
     d = os.path.dirname(os.path.abspath(path))
@@ -3653,7 +3925,7 @@ def _fmt_pair(main, spread, width, main_fmt, spread_fmt, absent='—', main_cap=
     return s if len(s) >= width else f'{s:>{width}s}'
 
 def _print_table(agg):
-    print('\n============== WikiText-103 validation perplexity ==============')
+    print('\n============== validation perplexity (corpus per run cfg) ==============')
     print(f'{'variant':{_TW['variant']}s} {'PPL mean±std':>{_TW['ppl']}s} {'Δvs full':>{_TW['d']}s} {'Δvs sw128m':>{_TW['d2']}s} {'params(M)':>{_TW['params']}s} {'seeds':>{_TW['seeds']}s} {'blklen':>{_TW['blklen']}s} {'bndF1':>{_TW['bnd']}s}')
     order = ['full', 'full_matched', 'full_cos', 'full_sink', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn', 'hybrid_hca_dyn', 'hybrid_csa_dyn_fuse']
     rows = [v for v in order if v in agg] + [v for v in agg if v not in order]
@@ -3771,7 +4043,7 @@ def _plot(summary, agg, outdir):
     ax[0].set_xticks(range(len(vs)))
     ax[0].set_xticklabels(vs, rotation=30, ha='right')
     ax[0].set_ylabel('validation perplexity (mean ± std)')
-    ax[0].set_title('WikiText-103 PPL')
+    ax[0].set_title('val PPL (corpus per run cfg)')
     ax[0].grid(alpha=0.3, axis='y')
     _unknown = [v for v in vs if agg[v].get('params') is None]
     if _unknown:
@@ -4035,7 +4307,7 @@ def run_cell_job(job):
     if isinstance(_matched, (list, tuple)):
         cfg['matched'] = set(_matched)
     guard = TimeGuard(job['guard_cap']) if job.get('guard_cap') else None
-    train_ids, val_batch, vocab, _, val_bnd = load_wikitext(cfg['seq_len'], cfg['n_train_tokens'])
+    train_ids, val_batch, vocab, _, val_bnd = load_run_corpus(cfg)
     d = cfg.get('d', 256)
     n_layers = cfg.get('n_layers', 6)
     n_heads = cfg.get('n_heads', 8)
@@ -4061,7 +4333,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     os.makedirs(outdir, exist_ok=True)
     _attb_bump_epoch()
     t_data = time.time()
-    train_ids, val_batch, vocab, _, val_bnd = load_wikitext(cfg['seq_len'], cfg['n_train_tokens'])
+    train_ids, val_batch, vocab, _, val_bnd = load_run_corpus(cfg)
     if guard is not None:
         guard.record_run(time.time() - t_data, 0, 0, 0, 0, 0)
     summary_path = os.path.join(outdir, 'summary.json')

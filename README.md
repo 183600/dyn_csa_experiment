@@ -26,6 +26,7 @@ needed to reproduce the results on a machine of your own.
 | `v9_supp.py` | **the v9 driver**: P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
 | `v10_supp.py` | **the v10 driver**: P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
 | `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
+| `m0_supp.py` | **the M0/S1 driver (adopted B tier)**: entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `full` (the S1 panel); see "B-tier M0/S1" below and `docs/compute_plan.md` |
 | `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk, never hard-coded) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
 | `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
@@ -118,6 +119,31 @@ What it guarantees (see `docs/design_notes.md` §13 for the full contracts):
 Per-cell logs land under `par_jobs/<phase>_<timestamp>/` (gitignored); the
 main log reports start/done/heartbeat lines and tails a failed child's log.
 Smoke modes always run serially regardless of `CSA_PAR`.
+
+### B-tier M0 / S1 (scale-up entry point, adopted tier B)
+
+The adopted compute-plan tier (docs/compute_plan.md §4–§6) adds a second
+corpus path and the S1–S4 scale ladder on top of the WikiText-103 mechanism
+layer; `m0_supp.py` is the entry point:
+
+```bash
+python m0_supp.py params   # zero GPU: S1–S4 parameter audit vs the plan
+python m0_supp.py data     # build / verify the FineWeb-Edu cache (M0_TOKENS=…)
+python m0_supp.py smoke    # end-to-end self-check on the B-tier data path
+python m0_supp.py full     # the S1 panel (5 arms × 4 seeds; CSA_PAR=auto works)
+```
+
+- Corpus: FineWeb-Edu (default `sample-10BT` config), self-trained 32k BPE;
+  npy cache + sha256 content fingerprint, same discipline as `wt103_cache/`.
+  Token ids are cached at 2 bytes/token and served int32 — every batch widens
+  back to int64, so nothing downstream changes.
+- Offline / air-gapped machines: point `FWEDU_LOCAL_JSONL` at local jsonl/txt
+  documents (pure availability fallback — different corpus content yields a
+  different fingerprint, never a confusable cache).
+- `full` is gated by `M0_CAP` (state file `run_time_state_m0.json`,
+  `M0_CAP_HOURS` overrides): before the Triton kernels pass the G0 gate the
+  eager throughput projections are refused — that is the plan's own
+  precondition (compute_plan §3), not a defect.
 
 ### v11 statistical close-out suite
 

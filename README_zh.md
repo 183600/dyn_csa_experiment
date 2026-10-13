@@ -24,6 +24,7 @@
 | `v9_supp.py` | **v9 驱动**：P2T（seq-2048 的 topk 扫描，`batch_size=1`）与 P2S3（RoPE 20k 长跑的第三个 seed） |
 | `v10_supp.py` | **v10 驱动**：P3M 长度外推机制 + 干扰项注入探针、P3S 交叉面板扩规模、P3T topk 扫描补至 4 seeds |
 | `v11_supp.py` | **v11 驱动**：统计收尾——干扰探针扩到 n=6（P4MT/P4MP）、交叉面板扩到 n=4（P4S）、d=384 配对臂扩到 n=4（P4F） |
+| `m0_supp.py` | **M0/S1 驱动（已选定 B 档）**：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`full`（S1 主面板）；见下文“B 档 M0/S1”与 `docs/compute_plan.md` |
 | `build_report.py` | 零 GPU 报告构建器：从 `results_*/` + `analysis_*/` 产物重建 v7 报告（所有数字现算，绝不硬编码） |
 | `fuse_analysis.py` | 零 GPU fuse 对比驱动：从 `results_*/summary.json` 重算逐层边界对齐（tol=1）、块长统计与 PPL 曲线 |
 | `docs/design_notes.md` | **设计与实现笔记**：块读门为何必须严格、且五处位置必须同步；动态分段器的前缀不变性要求；配对/可测量规则；报告约定；保证注意力按行分块与不分批形式等价的契约 |
@@ -108,6 +109,27 @@ CSA_PAR=2 CSA_PAR_GPUS=0,3 python v10_supp.py phase P3SL
 每个单元的日志在 `par_jobs/<phase>_<timestamp>/`（已 gitignore）；主日志
 输出 start/done/heartbeat 行，并尾部回显失败子进程的日志。smoke 模式
 无论 `CSA_PAR` 如何都强制串行。
+
+### B 档 M0 / S1（扩规模入口，已选定 B 档）
+
+B 档（docs/compute_plan.md §4–§6）在 WikiText-103 机制层之上新增第二条语料路径与
+S1–S4 规模阶梯，代码入口为 `m0_supp.py`：
+
+```bash
+python m0_supp.py params   # 零 GPU：S1–S4 参数量核算（对照规划值）
+python m0_supp.py data     # 构建 / 校验 FineWeb-Edu 缓存（M0_TOKENS=… 可调 cap）
+python m0_supp.py smoke    # 端到端自检：B 档数据路径 + 三条注意力路径
+python m0_supp.py full     # S1 主面板（5 臂 × 4 seeds；CSA_PAR=auto 可用）
+```
+
+- 语料：FineWeb-Edu（默认 `sample-10BT` 配置），自训 32k BPE；npy 缓存 + sha256
+  内容指纹，纪律与 `wt103_cache/` 完全一致；token id 以 2 字节落盘、int32 供给，
+  取批后照旧回宽 int64，下游路径不变；
+- 离线 / 内网机器：`FWEDU_LOCAL_JSONL` 指向本地 jsonl/txt 文档（纯可用性回退——
+  不同语料内容必然产生不同指纹，不会与真缓存混淆）；
+- `full` 受 `M0_CAP` 上限约束（状态文件 `run_time_state_m0.json`，`M0_CAP_HOURS`
+  可覆盖）：Triton 内核通过 G0 判据之前，eager 路径的预计耗时会被拒绝启动——
+  这是规划文档自身的前提判断（§3），不是缺陷。
 
 ### v11 统计收尾套件
 
