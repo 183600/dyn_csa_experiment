@@ -1416,6 +1416,28 @@ class HybridAttention(nn.Module):
         gate_b = gate.detach() > _HALF
         return ([(gate[b], gate_b[b]) for b in range(B)], gate_b)
 
+    def _cut_blocks_batched(self, x):
+        # Batched hoist of the per-row cosine cut computation in the
+        # cosine_abs / cosine_adaptive / dynamic branches of `_single` (design
+        # notes §6.1): the batched normalize + last-dim reduce is the same
+        # row-independent form _gate_signals already relies on.  The whole
+        # batch makes ONE host transfer (a .cpu() sync per layer) instead of B
+        # — the per-row form pays a device sync per row per layer per step.
+        # Every integer reaching _single is identical to the per-row
+        # blocks_from_cosine form (same cuts, same segmenter).
+        cfg = self.cfg
+        B, T, _d = x.shape
+        if T <= 1:
+            return None
+        _h = F.normalize(x.detach(), dim=-1, eps=1e-08)
+        sim = (_h[:, 1:] * _h[:, :-1]).sum(dim=-1)
+        if cfg.chunking == 'cosine_adaptive' or cfg.adaptive:
+            tau = torch.stack([causal_adaptive_threshold(sim[b], cfg.target_block_tokens) for b in range(B)], 0)
+        else:
+            tau = cfg.cos_threshold
+        cuts = (sim < tau).cpu().numpy()
+        return _hoist_blocks_from_cuts(T, cuts, cfg.min_block, cfg.max_block, x.device, want_honoured=False, hon_dtype=torch.float32)
+
     def _single(self, x, pre=None, gate_sig=None, pre_blocks=None):
         cfg = self.cfg
         T = x.shape[0]
@@ -1473,9 +1495,15 @@ class HybridAttention(nn.Module):
             else:
                 gate_mean = torch.zeros((), device=x.device) if self.need_reg else None
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
-            sim = cosine_similarity_consecutive(x.detach())
-            tau = causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
-            bid, nblk = blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim, return_count=True)
+            if pre_blocks is not None:
+                # geometry pre-computed once for the whole batch by
+                # _cut_blocks_batched (forward hoist); values identical to the
+                # per-row form below (design notes §6.1).
+                bid, nblk, _hon_dev = pre_blocks
+            else:
+                sim = cosine_similarity_consecutive(x.detach())
+                tau = causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
+                bid, nblk = blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim, return_count=True)
         else:
             bid = blocks_fixed(T, cfg.block_size, x.device)
             nblk = -(-T // cfg.block_size)
@@ -1568,6 +1596,11 @@ class HybridAttention(nn.Module):
                 # Batched block geometry for the whole batch; every value is
                 # identical to the per-row form (see _hoist_blocks_from_cuts).
                 pre_blocks = _hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
+        elif self.cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (self.cfg.dynamic and self.cfg.kind != 'hca'):
+            # same batch-level geometry hoist for the fixed/adaptive cosine
+            # paths: one host transfer per layer instead of B (the cut booleans
+            # and the resulting block ids are identical to the per-row form).
+            pre_blocks = self._cut_blocks_batched(x)
         # Preallocate the batch output and write each row's attention output in
         # place: the stacked buffer holds exactly the tensor torch.stack would
         # have built (a per-row copy into the same layout), and the CopySlices

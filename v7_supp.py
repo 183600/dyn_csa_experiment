@@ -215,9 +215,15 @@ class HybridAttentionRoPE(L.HybridAttention):
                     _shs = _soft_hon.sum()
                     gate_mean = (float(nblk - 1) + _shs - _shs.detach()) / T
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
-            sim = L.cosine_similarity_consecutive(x.detach())
-            tau = L.causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
-            bid, nblk = L.blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim, return_count=True)
+            if pre_blocks is not None:
+                # geometry pre-computed once for the whole batch by the
+                # inherited _cut_blocks_batched (forward hoist); values
+                # identical to the per-row form below (design notes §6.1).
+                bid, nblk, _hon = pre_blocks
+            else:
+                sim = L.cosine_similarity_consecutive(x.detach())
+                tau = L.causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
+                bid, nblk = L.blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim, return_count=True)
         else:
             bid = L.blocks_fixed(T, cfg.block_size, x.device)
             nblk = -(-T // cfg.block_size)
@@ -465,15 +471,22 @@ class HybridAttentionRoPE(L.HybridAttention):
                     # same batched block geometry as exp_lib.HybridAttention.forward;
                     # every value identical to the per-row form
                     pre_blocks = L._hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
-            outs = []
+            elif self.cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (self.cfg.dynamic and self.cfg.kind != 'hca'):
+                # same batch-level geometry hoist as exp_lib.HybridAttention.forward:
+                # one host transfer per layer instead of B, values identical.
+                pre_blocks = self._cut_blocks_batched(x)
+            # Preallocate the batch output and write each row's attention output
+            # in place — the same transport-only, value-identical form as
+            # exp_lib.HybridAttention.forward (design notes §6.1), minus one full
+            # [B, T, d] intermediate and one cat kernel per layer per step.
+            outs = torch.empty(B, T, x.shape[-1], device=x.device, dtype=x.dtype)
             gates = []
             for b in range(B):
                 pre = pres[b]
                 o, g = self._single_rope(x[b], pre=pre, gate_sig=None if gate_sigs is None else gate_sigs[b], pre_blocks=None if pre_blocks is None else pre_blocks[b])
-                outs.append(o)
+                outs[b] = o
                 if g is not None:
                     gates.append(g)
-            outs = torch.stack(outs, 0)
             if not gates:
                 self.last_gate_mean = None
             else:
