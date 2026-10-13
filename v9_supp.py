@@ -200,8 +200,26 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     seq2k_old = st.get('seq2k_bs3_panel_historical', {})
     rope = st['rope20k_panel']
     comp = st['comparisons']
-    sel_ratio = {'csa_fixed_topk8': '1.5625%', 'csa_fixed_topk32': '6.25%', 'csa_fixed_topk128': '25%', 'csa_fixed_topk512': '100%', 'csa_fix_m1': '1.5625% (m=1, topk=32)'}
-    _SEL_PCT = {'csa_fixed_topk8': 1.5625, 'csa_fixed_topk32': 6.25, 'csa_fixed_topk128': 25.0, 'csa_fixed_topk512': 100.0}
+    # Selection ratios are derived from the actual P2T configuration
+    # (seq_len, per-variant block_size and index_topk) instead of being
+    # hard-coded, so a change of P2T_CFG cannot silently desync the report.
+    _SEL_VARIANTS = ['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']
+    _seq2k_len = int(P2T_CFG.get('seq_len', 2048))
+    def _sel_pct_of(v):
+        _c = V.make_layer_cfgs_v7(1, v)[0]
+        _bs = max(1, int(getattr(_c, 'block_size', 1) or 1))
+        _nb = max(1, _seq2k_len // _bs)
+        return 100.0 * min(int(_c.index_topk), _nb) / _nb, _bs, int(_c.index_topk)
+    sel_ratio, _SEL_PCT = ({}, {})
+    for _v in _SEL_VARIANTS:
+        try:
+            _pct, _bs, _tk = _sel_pct_of(_v)
+        except Exception:
+            sel_ratio[_v] = '—'
+            continue
+        sel_ratio[_v] = (f'{_pct:g}%' if _bs > 1 else f'{_pct:g}% (m=1, topk={_tk})')
+        if _bs > 1:
+            _SEL_PCT[_v] = _pct
     lines = []
     A = lines.append
     A('# CSA / HCA 受控机制研究 — v9 补实验报告（topk 扫描补齐 + RoPE 长跑第三种子）')

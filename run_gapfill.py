@@ -61,9 +61,12 @@ def git_push(msg):
         print('[git] WARNING: the commit is only on this instance — the work is NOT on the remote.  Re-push before shutting down.')
     return ok
 
-def _agg_seed_map(entry):
+def _agg_seed_map(entry, tag=''):
     out = {}
     if not isinstance(entry, dict):
+        return out
+    if len(entry.get('seeds') or []) != len(entry.get('ppls') or []):
+        print(f'[synth] NOTE: seeds/ppls length mismatch in aggregate entry{(" for " + tag) if tag else ""} — skipping it instead of silently truncating')
         return out
     for _s, _p in zip(entry.get('seeds') or [], entry.get('ppls') or []):
         _si = _num_or_none(_s)
@@ -95,7 +98,7 @@ def _fold_backup_into_aggregate(adir):
         if not isinstance(bentry, dict):
             continue
         lentry = merged.get(key)
-        sm_b, sm_l = (_agg_seed_map(bentry), _agg_seed_map(lentry))
+        sm_b, sm_l = (_agg_seed_map(bentry, tag=str(key)), _agg_seed_map(lentry, tag=str(key)))
         missing = set(sm_b) - set(sm_l)
         if not missing:
             continue
@@ -245,9 +248,12 @@ def merge_long_aggregate(adir, snapshot_agg):
         return
     merged = json.loads(json.dumps(snapshot_agg))
 
-    def _seed_map(entry):
+    def _seed_map(entry, tag=''):
         out = {}
         if not isinstance(entry, dict):
+            return out
+        if len(entry.get('seeds') or []) != len(entry.get('ppls') or []):
+            print(f'[v6-merge] NOTE: seeds/ppls length mismatch in aggregate entry{(" for " + tag) if tag else ""} — skipping it instead of silently truncating')
             return out
         for _s, _p in zip(entry.get('seeds') or [], entry.get('ppls') or []):
             _s = _num_or_none(_s)
@@ -263,8 +269,8 @@ def merge_long_aggregate(adir, snapshot_agg):
         if not isinstance(sentry, dict):
             merged[key] = fentry
             continue
-        sm = _seed_map(sentry)
-        fm = _seed_map(fentry)
+        sm = _seed_map(sentry, tag=str(key))
+        fm = _seed_map(fentry, tag=str(key))
         _overlap = set(sm) & set(fm)
         n_old_all, n_new_only = (len(sm), len(fm) - len(_overlap))
         sm.update(fm)
@@ -313,13 +319,13 @@ def merge_long_aggregate(adir, snapshot_agg):
                     _acc[1] += n_new_only
                 sentry['ppl_curve'] = [[_s, _a / _w] for _s, (_a, _w) in sorted(_cm.items()) if _w]
     if _folded_keys:
-        _base_full = _seed_map(merged.get('full'))
-        _base_sw = _seed_map(merged.get('full_sw128_matched'))
+        _base_full = _seed_map(merged.get('full'), tag='full')
+        _base_sw = _seed_map(merged.get('full_sw128_matched'), tag='full_sw128_matched')
 
         def _repair_delta(entry, base_map, mean_f, std_f, n_f):
             if not base_map:
                 return
-            vm = _seed_map(entry)
+            vm = _seed_map(entry, tag=str(entry.get('variant') if isinstance(entry, dict) else ''))
             common = sorted(set(vm) & set(base_map))
             if not common:
                 return

@@ -353,15 +353,18 @@ def main(argv=None):
     _pair_missing = False
     try:
         _pair_ok_seeds = [s for s in _hyb_common if L.pair_reason(rec('hybrid_csa_dyn', s), rec('hybrid_csa_dyn_fuse', s)) is None]
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, IndexError, ValueError, TypeError):
         _pair_ok_seeds = []
         _pair_missing = True
     _pgate_drop = [s for s in _hyb_common if s not in _pair_ok_seeds]
     for _key, _name, _fmt in [('len_mean', 'len_mean', '{:+.3f}'), ('len_std', 'len_std', '{:+.3f}'), ('frac_at_min', 'frac_at_min', '{:+.4f}'), ('blocks', 'blocks', '{:+.3f}')]:
         try:
+        if not _hyb_common:
+            continue
+        try:
             _l, _mb = per_seed_layer('hybrid_csa_dyn', _key, tuple(_hyb_common))
             _l2, _ma = per_seed_layer('hybrid_csa_dyn_fuse', _key, tuple(_hyb_common))
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, IndexError, ValueError, TypeError):
             continue
         if _l != _l2:
             continue
