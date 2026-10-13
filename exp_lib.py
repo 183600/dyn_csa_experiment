@@ -280,21 +280,26 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
-    x = sim.detach().float()
-    n = x.numel()
+    # 1-D (single row) or 2-D (batched rows) — every op is rowwise
+    # independent, so the batched form is value-identical per row while
+    # issuing one kernel chain instead of one per row.
+    squeeze = sim.dim() == 1
+    x = (sim.unsqueeze(0) if squeeze else sim).detach().float()
+    n = x.shape[-1]
     idx = _arange_cache(n, sim.device)
-    masked = torch.where(idx[None, :] <= idx[:, None], x[None, :], float('inf'))
-    srt = masked.sort(dim=1).values
+    masked = torch.where(idx[None, None, :] <= idx[None, :, None], x[:, None, :], float('inf'))
+    srt = masked.sort(dim=-1).values
     pos = q * idx
     lo = pos.floor().long()
     frac = pos - lo
-    lo_v = srt.gather(1, lo.clamp(max=n - 1)[:, None]).squeeze(1)
-    hi_v = srt.gather(1, (lo + 1).clamp(max=n - 1)[:, None]).squeeze(1)
+    lo_v = srt.gather(-1, lo.clamp(max=n - 1).expand(x.shape[0], n)[..., None]).squeeze(-1)
+    hi_v = srt.gather(-1, (lo + 1).clamp(max=n - 1).expand(x.shape[0], n)[..., None]).squeeze(-1)
     interp = lo_v * (1.0 - frac) + hi_v * frac
     use_hi = (frac > 0.0) & (lo + 1 <= idx)
     out = torch.where(use_hi, interp, lo_v)
     out = torch.where(idx == 0, torch.full_like(out, float('-inf')), out)
-    return out.to(sim.device)
+    out = out.to(sim.device)
+    return out.squeeze(0) if squeeze else out
 
 def blocks_fixed(n, block_size, device):
     key = (str(device), 'blkfix', int(n), int(block_size))
@@ -1409,7 +1414,9 @@ class HybridAttention(nn.Module):
         if sim.shape[-1] == 0:
             return ([None] * B, None)
         cfg = self.cfg
-        prefix_mean = torch.stack([torch.cumsum(_r, 0) for _r in sim.unbind(0)], 0)
+        # rowwise batched cumsum — same per-row values as the unbind/stack loop
+        # but one scan kernel instead of B launches plus a stack copy
+        prefix_mean = torch.cumsum(sim, dim=-1)
         prefix_mean = prefix_mean / _range_cache(1, sim.shape[-1] + 1, x.device)
         tau = prefix_mean + self.delta_logit
         gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
@@ -1432,7 +1439,7 @@ class HybridAttention(nn.Module):
         _h = F.normalize(x.detach(), dim=-1, eps=1e-08)
         sim = (_h[:, 1:] * _h[:, :-1]).sum(dim=-1)
         if cfg.chunking == 'cosine_adaptive' or cfg.adaptive:
-            tau = torch.stack([causal_adaptive_threshold(sim[b], cfg.target_block_tokens) for b in range(B)], 0)
+            tau = causal_adaptive_threshold(sim, cfg.target_block_tokens)
         else:
             tau = cfg.cos_threshold
         cuts = (sim < tau).cpu().numpy()
@@ -2470,7 +2477,11 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
                 del _rows, _tgts
             else:
                 _tgts = ids[:, 1:]
-                nll += F.cross_entropy(logits[:, :_span, :].transpose(1, 2), _tgts, reduction='sum').double()
+                # slice the CE over the time axis so the log_softmax transient
+                # stays ~1/8 of the full [chunk, T, vocab] block at a time
+                for _s0 in range(0, _span, 64):
+                    _sl = slice(_s0, min(_s0 + 64, _span))
+                    nll += F.cross_entropy(logits[:, _sl, :].transpose(1, 2), _tgts[:, _sl], reduction='sum').double()
                 ntok += int(_tgts.numel())
                 del _tgts
             del ids, logits
@@ -2918,7 +2929,11 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
             continue
         lens = torch.cat([t if torch.is_tensor(t) else torch.as_tensor(t) for t in st]).float()
         n_blocks = sum((t.numel() for t in st)) / len(st)
-        entry = {'blocks': n_blocks, 'avg_len': seq_len / max(n_blocks, 1.0), 'len_mean': float(lens.mean()), 'len_std': float(lens.std()) if lens.numel() > 1 else 0.0, 'len_min': int(lens.min()), 'len_max': int(lens.max()), 'frac_at_min': float((lens <= attn.cfg.min_block).float().mean()), 'frac_at_max': float((lens >= attn.cfg.max_block).float().mean())}
+        # one stacked transfer for all scalar stats instead of a GPU→CPU sync each
+        _sc = torch.stack([lens.mean(), lens.std() if lens.numel() > 1 else torch.zeros((), device=lens.device, dtype=lens.dtype), lens.min().float(), lens.max().float(), (lens <= attn.cfg.min_block).float().mean(), (lens >= attn.cfg.max_block).float().mean()])
+        _vals = _sc.tolist()
+        entry = {'blocks': n_blocks, 'avg_len': seq_len / max(n_blocks, 1.0), 'len_mean': _vals[0], 'len_std': _vals[1], 'len_min': int(_vals[2]), 'len_max': int(_vals[3]), 'frac_at_min': _vals[4], 'frac_at_max': _vals[5]}
+        del _sc, _vals
         if attn.cfg.dynamic and getattr(attn, 'delta_logit', None) is not None:
             entry['delta'] = float(attn.delta_logit.item())
         if val_bnd is not None and attn._cuts:
