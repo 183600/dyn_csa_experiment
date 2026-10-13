@@ -717,8 +717,12 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     # gather+add now only touches valid lanes on ragged dynamic layouts.
     _ma3 = mask_a[:, :, None].expand_as(Zam)
     _mb3 = mask_b[:, :, None].expand_as(Zbm)
-    Zam.masked_fill_(~_ma3, float('-inf'))
-    Zbm.masked_fill_(~_mb3, float('-inf'))
+    # the fill mask broadcasts: masked_fill_ accepts a broadcastable mask, so
+    # the negation materializes [B, L, 1] instead of the full [B, L, c] form —
+    # the same booleans reach every lane (broadcast reads are exact), and the
+    # smaller mask is what autograd saves for the masked_fill backward.
+    Zam.masked_fill_(~mask_a[:, :, None], float('-inf'))
+    Zbm.masked_fill_(~mask_b[:, :, None], float('-inf'))
     Zam[_ma3] += B_pos_a[_pos_a].expand(Zam.shape[0], -1, -1)[_ma3]
     Zbm[_mb3] += B_pos_b[b_off][_mb3]
     WinZ = torch.cat([Zam, Zbm], 1)
@@ -772,7 +776,9 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     # unchanged, so the values and gradients are identical to masking after a
     # full-width add.
     _m3 = mask[:, :, None].expand_as(WinZ)
-    WinZ.masked_fill_(~_m3, float('-inf'))
+    # broadcast fill mask (same argument as _pool_ordered): identical booleans
+    # per lane, without materializing the full-size negated mask.
+    WinZ.masked_fill_(~mask[:, :, None], float('-inf'))
     WinZ[_m3] += B_pos[_pos_a].expand(WinZ.shape[0], -1, -1)[_m3]
     sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
     comp = (sc * Xb).sum(1)
@@ -1061,22 +1067,35 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # [n_blk+T, nh, hd] copies per call.
         _sel_rows = topk_l[s:e]
         _win_rows = win_idx[s:e]
-        Kset = torch.cat([_tk2(k_blk, _sel_rows), _tk2(k_sw, _win_rows)], 1)
-        Vset = torch.cat([_tk2(v_blk, _sel_rows), _tk2(v_sw, _win_rows)], 1)
         if soft is None:
+            Kset = torch.cat([_tk2(k_blk, _sel_rows), _tk2(k_sw, _win_rows)], 1)
+            Vset = torch.cat([_tk2(v_blk, _sel_rows), _tk2(v_sw, _win_rows)], 1)
             logits = _einsum('qhd,qmhd->qhm', qseg, Kset)
             logits.mul_(scale)
             logits.masked_fill_(nvalid, _MINL)
             attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
             if not _has_sink:
-                attn = attn * anyrow[:, None, None]
+                # in-place is safe here and saves one [q,h,M] transient per
+                # chunk: `attn` is the fresh sink-softmax output (the softmax
+                # / nan_to_num backward saves sit on other tensors), so mul_
+                # touches no autograd-saved value — identical pointwise
+                # values to the out-of-place multiply.
+                attn.mul_(anyrow[:, None, None])
             out[s:e] = _einsum('qhm,qmhd->qhd', attn, Vset)
             continue
+        Vset = torch.cat([_tk2(v_blk, _sel_rows), _tk2(v_sw, _win_rows)], 1)
+        # The soft branch only ever read Kset through its [selected|window]
+        # halves, so the halves are gathered directly and the full-width K
+        # cat is skipped: a cat's slices hold exactly the copied values of
+        # the two gather outputs, so kb/kw — the operands the two logits
+        # einsums save for backward — are bit-identical to the
+        # cat-then-slice form (index re-plumbing only, design notes §6.1),
+        # minus one [q, M, nh, hd] cat (+ its transient) per chunk.
+        kb = _tk2(k_blk, _sel_rows)
+        kw = _tk2(k_sw, _win_rows)
         soft_g = soft[s:e]
         if keep is not None:
             soft_g = soft_g * keep
-        kb = Kset[:, :_nb]
-        kw = Kset[:, _nb:]
         soft_log_g = torch.log(soft_g.clamp_min(1e-12))
         soft_log_g.masked_fill_(soft_g <= 0, _MINL)
         blk_logits = _einsum('qhd,qmhd->qhm', qseg, kb)
@@ -1084,7 +1103,9 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         win_logits = _einsum('qhd,qmhd->qhm', qseg, kw)
         win_logits.mul_(scale)
         logits = torch.cat([blk_logits, win_logits], -1)
-        soft_logits = torch.cat([(logits[:, :, :_nb] + soft_log_g[:, None, :]).clamp_min_(_MINL), win_logits], -1)
+        # logits[:, :, :_nb] is the cat buffer's copy of blk_logits — the same
+        # values, so the add reads blk_logits directly.
+        soft_logits = torch.cat([(blk_logits + soft_log_g[:, None, :]).clamp_min_(_MINL), win_logits], -1)
         soft_logits.masked_fill_(nvalid, _MINL)
         soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
         logits.masked_fill_(nvalid, _MINL)

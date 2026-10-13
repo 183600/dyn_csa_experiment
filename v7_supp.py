@@ -349,7 +349,10 @@ class HybridAttentionRoPE(L.HybridAttention):
                 logits = raw_logits.masked_fill_(_nvalid, _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
                 if sink is None:
-                    attn = attn * _anyrow[:, None, None]
+                    # in-place on the fresh sink-softmax output — same safety
+                    # argument as exp_lib.gathered_attention's non-soft branch
+                    # (identical pointwise values, one fewer [q,h,M] transient).
+                    attn.mul_(_anyrow[:, None, None])
             if soft is not None:
                 logits = raw_logits.masked_fill(_nvalid, _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
@@ -359,7 +362,10 @@ class HybridAttentionRoPE(L.HybridAttention):
                 soft_log = torch.log(sv.clamp_min(1e-12))
                 soft_log.masked_fill_(sv <= 0, _MINL)
                 soft_logits = torch.cat([(raw_logits[:, :, :_nb] + soft_log[:, None, :]).clamp_min_(_MINL), raw_logits[:, :, _nb:]], -1)
-                soft_logits = soft_logits.masked_fill(_nvalid, L._finfo_min(soft_logits.dtype))
+                # in-place on the fresh cat output (nothing downstream needs the
+                # pre-fill values): identical masked values, one fewer [q,h,M]
+                # transient per chunk.
+                soft_logits.masked_fill_(_nvalid, L._finfo_min(soft_logits.dtype))
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = attn + (soft_attn - soft_attn.detach())
                 if sink is None:

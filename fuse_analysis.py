@@ -358,7 +358,6 @@ def main(argv=None):
         _pair_missing = True
     _pgate_drop = [s for s in _hyb_common if s not in _pair_ok_seeds]
     for _key, _name, _fmt in [('len_mean', 'len_mean', '{:+.3f}'), ('len_std', 'len_std', '{:+.3f}'), ('frac_at_min', 'frac_at_min', '{:+.4f}'), ('blocks', 'blocks', '{:+.3f}')]:
-        try:
         if not _hyb_common:
             continue
         try:
