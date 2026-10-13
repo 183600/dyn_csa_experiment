@@ -704,10 +704,18 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     Zam = _take_2d(Zas, g_a)
     Xbm = _take_2d(Xbs, g_b)
     Zbm = _take_2d(Zbs, g_b)
-    Zam += B_pos_a[_pos_a]
-    Zbm += B_pos_b[b_off]
-    Zam.masked_fill_(~mask_a[:, :, None], float('-inf'))
-    Zbm.masked_fill_(~mask_b[:, :, None], float('-inf'))
+    # Mask before the position-embedding add and restrict the add to valid
+    # lanes: invalid (pad) lanes are set to -inf either way, and an -inf lane
+    # contributes exactly 0 through the softmax/nan_to_num below, so the
+    # forward values and the B_pos gradients (zero on invalid lanes in both
+    # forms) are identical to the add-everything-then-mask form — while the
+    # gather+add now only touches valid lanes on ragged dynamic layouts.
+    _ma3 = mask_a[:, :, None].expand_as(Zam)
+    _mb3 = mask_b[:, :, None].expand_as(Zbm)
+    Zam.masked_fill_(~_ma3, float('-inf'))
+    Zbm.masked_fill_(~_mb3, float('-inf'))
+    Zam[_ma3] += B_pos_a[_pos_a].expand(Zam.shape[0], -1, -1)[_ma3]
+    Zbm[_mb3] += B_pos_b[b_off][_mb3]
     WinZ = torch.cat([Zam, Zbm], 1)
     sc = F.softmax(WinZ, dim=1)
     sc = torch.nan_to_num(sc)
@@ -754,8 +762,13 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     Xb = _take_2d(Xs, g)
     Zb = _take_2d(Zs, g)
     WinZ = Zb
-    WinZ[:, :max_len] += B_pos[_pos_a]
-    WinZ.masked_fill_(~mask[:, :, None], float('-inf'))
+    # Same valid-lane-only position add as _pool_ordered: pad lanes are -inf
+    # before/after either form, and their (exactly zero) softmax gradient is
+    # unchanged, so the values and gradients are identical to masking after a
+    # full-width add.
+    _m3 = mask[:, :, None].expand_as(WinZ)
+    WinZ.masked_fill_(~_m3, float('-inf'))
+    WinZ[_m3] += B_pos[_pos_a].expand(WinZ.shape[0], -1, -1)[_m3]
     sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
     comp = (sc * Xb).sum(1)
     return (comp, order[last_idx], B)
@@ -1131,6 +1144,14 @@ class HybridAttention(nn.Module):
         self._stats = None
         self._cuts = None
         self.fuse_conv = None
+        # Fused-weight cache (eval-only): the gateway is `not
+        # torch.is_grad_enabled()`, so training forward passes always rebuild
+        # the cat inside the autograd graph exactly as before.  Under eval the
+        # concat values are pure functions of the source weights, so keying on
+        # their autograd `_version` counters (bumped by every in-place
+        # optimizer update) makes a stale hit impossible; a hit skips one cat
+        # kernel + one weight-sized transient allocation per layer per forward.
+        self._wcat_cache = {}
         if cfg.kind in ('csa', 'hca') and cfg.chunking == 'cosine_learnable' and (cfg.fuse_mode == 'learned'):
             self.fuse_conv = nn.Conv1d(d_model, d_model, cfg.fuse_kernel, groups=d_model, bias=False)
             with torch.no_grad():
@@ -1201,7 +1222,16 @@ class HybridAttention(nn.Module):
             # self.W_*(x) calls (the same row/column independence the
             # pre-projection hoist relies on, design notes §6.1).
             _nhq = self.nh * self.hd
-            _wqkv = torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0)
+            if torch.is_grad_enabled():
+                _wqkv = torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0)
+            else:
+                _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version)
+                _hit = self._wcat_cache.get('qkv')
+                if _hit is None or _hit[0] != _key:
+                    with torch.inference_mode(False):
+                        _hit = (_key, torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0))
+                    self._wcat_cache['qkv'] = _hit
+                _wqkv = _hit[1]
             _qkv = F.linear(x, _wqkv)
             q = _qkv[..., :_nhq].reshape(B, T, self.nh, self.hd)
             k = _qkv[..., _nhq:2 * _nhq].reshape(B, T, self.nh, self.hd)
@@ -1301,7 +1331,17 @@ class HybridAttention(nn.Module):
         if _want_idx:
             _mats.append(self.W_DQ)
             _keys.append('qI')
-        _fused = F.linear(x, torch.cat([_m.t() for _m in _mats], dim=0))
+        if torch.is_grad_enabled():
+            _wcat = torch.cat([_m.t() for _m in _mats], dim=0)
+        else:
+            _key = tuple(_m._version for _m in _mats)
+            _hit = self._wcat_cache.get('pre')
+            if _hit is None or _hit[0] != _key:
+                with torch.inference_mode(False):
+                    _hit = (_key, torch.cat([_m.t() for _m in _mats], dim=0))
+                self._wcat_cache['pre'] = _hit
+            _wcat = _hit[1]
+        _fused = F.linear(x, _wcat)
         _off = 0
         for _k, _m in zip(_keys, _mats):
             _w = _m.shape[1]
