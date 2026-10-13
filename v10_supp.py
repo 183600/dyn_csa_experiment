@@ -245,7 +245,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             if _arch != (256, 6, 8, 32):
                 print(f"[p3mp] REFUSE {v} s{seed}: checkpoint architecture {_arch} differs from the recipe this probe was validated against (256, 6, 8, 32) — not running the probe on unverified weights")
                 out['status'] = 'skipped_arch'
-                break
+                return out
             model = L.SmallGPT(_vocab_ck, *_arch, d.get('train_len', 512), [copy.deepcopy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
             model.load_state_dict(d.pop('sd'))
             model.eval()

@@ -2595,11 +2595,18 @@ def _cluster_expected_matches(win, cl, tol, P, n_pos, approx_flag=None):
         if not wts:
             return 0.0
         nb_r = len(wts)
-        per = max(1, _AMP_FALLBACK_DRAWS // nb_r)
         order = sorted(range(nb_r), key=lambda i: -wts[i][1])
-        budget = [per] * nb_r
-        for i in range(_AMP_FALLBACK_DRAWS - per * nb_r):
-            budget[order[i % nb_r]] += 1
+        if nb_r > _AMP_FALLBACK_DRAWS:
+            # More candidate sizes than the draw budget: keep the top-weight
+            # sizes, one draw each, so the actual number of draws never
+            # exceeds the declared _AMP_FALLBACK_DRAWS budget.
+            _keep = set(order[:_AMP_FALLBACK_DRAWS])
+            budget = [1 if i in _keep else 0 for i in range(nb_r)]
+        else:
+            per = max(1, _AMP_FALLBACK_DRAWS // nb_r)
+            budget = [per] * nb_r
+            for i in range(_AMP_FALLBACK_DRAWS - per * nb_r):
+                budget[order[i % nb_r]] += 1
         total = 0.0
         for i, (r, lw) in enumerate(wts):
             n_draw = budget[i]
@@ -3490,12 +3497,19 @@ def aggregate(summary):
             entry['tokens_per_step'] = float(np.mean(rates))
     _full_groups = {(tag, fp_idx): recs for (v, tag, fp_idx), recs in _split_groups if v == 'full'}
 
+    def _cfg_fp_noparam(rec):
+        # Baseline-matching fingerprint WITHOUT params: a `full` baseline
+        # legitimately differs from the sparse arm in parameter count, so a
+        # params-including fingerprint could never match it (dead branch).
+        # run_cfg + steps/tokens is exactly the gate `pair_reason` applies.
+        return json.dumps([rec.get('run_cfg'), [rec.get(k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
+
     def _baseline_for(tag, fp_idx, base_groups, recs):
-        _want = _cfg_fp(recs[0]) if recs else None
+        _want = _cfg_fp_noparam(recs[0]) if recs else None
         if _want is not None:
             _cands = sorted(base_groups.items(), key=lambda kv: (kv[0][0] != tag, kv[0][1] is None))
             for (_t_c, _i_c), _grp in _cands:
-                if any((_cfg_fp(_r) == _want for _r in _grp)):
+                if any((_cfg_fp_noparam(_r) == _want for _r in _grp)):
                     return (_grp, _t_c)
         for _cand in ((tag, fp_idx), (tag, None), ('', None)):
             if _cand in base_groups:

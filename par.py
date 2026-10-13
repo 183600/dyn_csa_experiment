@@ -516,10 +516,15 @@ def run_child(job_path, result_path):
         mod = importlib.import_module(module_name)
 
         # Preserve the existing driver-specific checkpoint patch chain.
-        if job.get("ckpt_install") and hasattr(mod, "V9"):
-            mod.V9._install_ckpt_patch()
-        if job.get("ckpt_flag") and hasattr(mod, "V9"):
-            mod.V9._V9_CKPT["on"] = True
+        # The patch state lives in v9_supp; v10/v11 expose it via their `V9`
+        # alias, while v9_supp itself is the owner. Fall back to the module
+        # itself so v9 jobs (module='v9_supp', no `V9` attribute) are not
+        # silently skipped.
+        _ckpt_owner = getattr(mod, "V9", mod)
+        if job.get("ckpt_install") and hasattr(_ckpt_owner, "_install_ckpt_patch"):
+            _ckpt_owner._install_ckpt_patch()
+        if job.get("ckpt_flag") and hasattr(_ckpt_owner, "_V9_CKPT"):
+            _ckpt_owner._V9_CKPT["on"] = True
 
         kind = job["kind"]
         if kind == "run":
@@ -551,9 +556,18 @@ def run_child(job_path, result_path):
             raise ValueError("Cell result must contain a nonempty status.")
 
     except SystemExit as exc:
-        result["status"] = f"exit_{exc.code}"
-        result["error"] = traceback.format_exc()
-        raise
+        # A cell-level sys.exit() is a normal experiment failure, not an
+        # infrastructure crash: record it and exit 0 so the dispatcher
+        # continues the phase (re-raising here would abort every sibling
+        # cell, and exit code None/0 would previously masquerade as "ok").
+        code = exc.code if isinstance(exc.code, int) else 1
+        if code != 0:
+            result["status"] = "fatal"
+            result["error"] = (
+                f"SystemExit({exc.code!r})\n" + traceback.format_exc()
+            )
+            return
+        result["status"] = "ok"
     except BaseException:
         result["status"] = "fatal"
         result["error"] = traceback.format_exc()

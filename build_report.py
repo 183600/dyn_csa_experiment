@@ -348,7 +348,10 @@ def sec_p0r():
         _has_mt = _mtm is not None
         rope_unmatched = unmatched_tag(_cf_r, _fu_r)
         _pgap_r = param_gap(_cf_r, _fu_r)
-        rope_is_defect = is_param_matched(_cf_r, _fu_r) is not True
+        # Only a *known* mismatch counts as a defect: when params are missing
+        # (`is_param_matched` returns None) keep the "params 未知" tag but do
+        # not assert the structural-defect block.
+        rope_is_defect = is_param_matched(_cf_r, _fu_r) is False
         _w_abs = '领先' if g_abs < 0 else '落后'
         _w_absm = '领先' if g_abs_m < 0 else '落后'
         _w_rope = '领先' if g_rope < 0 else '落后'
@@ -531,7 +534,14 @@ def sec_p0e():
     if not d:
         return '## P0-2 渐近线是否反演（40k 长跑）— （无结果）\n\n'
     s = summary('results_lm_v7_long40')
-    lines = ['## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / ~246M tokens）', '', '**评审论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (mean±std) | n | params |', '|---|---|---|---|']
+    # The headline token count is recomputed from the persisted records
+    # (tokens_seen / steps), never hard-coded.
+    _tok_hdr = 'token 数未知'
+    for _k, _r in (s or {}).items():
+        if isinstance(_r, dict) and _measurable(_r) and isinstance(_r.get('tokens_seen'), (int, float)) and _r['tokens_seen'] > 0:
+            _tok_hdr = f'~{_r['tokens_seen'] / 1e6:.0f}M tokens'
+            break
+    lines = [f'## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / {_tok_hdr}）', '', '**评审论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (mean±std) | n | params |', '|---|---|---|---|']
     for v in sorted(d):
         r = d[v]
         lines.append(f'| `{v}` | {fm(r.get('ppl_mean'))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
@@ -652,7 +662,34 @@ def sec_p1t():
     if not d:
         return '## P1 选择率错配 / m=1 对照（seq 2048 topk 扫描）— （无结果）\n\n'
     order = ['csa_fix_m1', 'csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fixed']
-    lines = ['## P1 选择率错配 与 m=1(纯 DSA) 对照（seq 2048, topk 扫描）', '', '**评审论断**：仓库 seq 512 时选择率 25%，论文在长序列约 0.2%。`topk` 是主控旋钮，需要扫描；且缺 m=1（纯 DSA，不压缩）对照。', '', '**做法**：seq 2048、1500 步（seed 数见下表），扫描 `topk ∈ {8,32,128,512}` 并加入 `csa_fix_m1`（block_size=1, overlap=0 → 逐 token 选择 = 纯 DSA）。', '', '| variant | PPL (mean±std) | n | 等效选择率@2048 (topk/512 blocks) |', '|---|---|---|---|']
+    lines = ['## P1 选择率错配 与 m=1(纯 DSA) 对照（seq 2048, topk 扫描）', '', '**评审论断**：仓库 seq 512 时选择率 25%，论文在长序列约 0.2%。`topk` 是主控旋钮，需要扫描；且缺 m=1（纯 DSA，不压缩）对照。', '', '**做法**：seq 2048、1500 步（seed 数见下表），扫描 `topk ∈ {8,32,128,512}` 并加入 `csa_fix_m1`（block_size=1, overlap=0 → 逐 token 选择 = 纯 DSA）。', '', '| variant | PPL (mean±std) | n | 等效选择率 (topk / 实测块数) |', '|---|---|---|---|']
+    # Selection rates are computed from the *measured* per-sequence block
+    # counts persisted in each run's `stats` (never assumed): for a fixed
+    # block size m the panel has n_blocks = seq_len / m blocks, and the
+    # indexer's effective selection is min(topk, n_blocks) / n_blocks.
+    # `topk` itself is parsed from the sweep variant names; the two
+    # non-sweep rows use the drivers' configured constants
+    # (csa_fix_m1 / csa_fixed both run with index_topk=32).
+    _s1t = summary('results_lm_v7_seq2k') or {}
+
+    def _nblocks_measured(base_variant):
+        _vals = []
+        for _rid, _r in _s1t.items():
+            if not isinstance(_r, dict) or _r.get('variant') != base_variant:
+                continue
+            if not _measurable(_r):
+                continue
+            for _e in (_r.get('stats') or {}).values():
+                if isinstance(_e, dict) and isinstance(_e.get('blocks'), (int, float)) and _e['blocks'] > 0:
+                    _vals.append(float(_e['blocks']))
+        return (sum(_vals) / len(_vals)) if _vals else None
+
+    def _sr(topk, base_variant, note=''):
+        _nb = _nblocks_measured(base_variant)
+        if _nb is None:
+            print(f'[report] sec_p1t: no measured block count for {base_variant!r} — selection-rate cell left blank rather than hard-coded')
+            return '—'
+        return f'{min(topk, _nb) / _nb * 100:.5g}%{note}'
     seen = set()
     for v in order + sorted(d):
         if v in seen or v not in d:
@@ -670,7 +707,7 @@ def sec_p1t():
             mean, std, n = (r.get('ppl_mean'), r.get('ppl_std'), r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n', 0))
         _bv = v.split('@')[0].split('#')[0]
         if _bv == 'csa_fix_m1':
-            sr = '1.5625% (m=1, topk=32)'
+            sr = _sr(32, _bv, ' (m=1, topk=32)')
         elif _bv.startswith('csa_fixed_topk'):
             _kv = _bv.replace('csa_fixed_topk', '')
             try:
@@ -678,9 +715,9 @@ def sec_p1t():
             except ValueError:
                 print(f'[report] sec_p1t: cannot parse topk from aggregate key {v!r} — row omitted')
                 continue
-            sr = f'{min(k, 512) / 512 * 100:.5g}%'
+            sr = _sr(k, _bv)
         elif _bv == 'csa_fixed':
-            sr = '6.25% (default topk=32)'
+            sr = _sr(32, _bv, ' (default topk=32)')
         else:
             sr = '—'
             print(f'[report] sec_p1t: aggregate key {v!r} is not one of the known sweep variants — its selection-rate cell is left blank rather than guessed')
@@ -724,7 +761,9 @@ def sec_p1t():
         lines += ['', '**剂量-反应（topk → PPL）**：', '']
         mono = all((rows_k[i][1] >= rows_k[i + 1][1] - 1e-09 for i in range(len(rows_k) - 1)))
         for k, m in rows_k:
-            lines.append(f'- topk={k}（选择率 {k / 512 * 100:.5g}%）：{m:.2f} PPL')
+            _nb = _nblocks_measured(f'csa_fixed_topk{k}')
+            _sr_txt = f'{min(k, _nb) / _nb * 100:.5g}%' if _nb is not None else 'n/a (未测得块数)'
+            lines.append(f'- topk={k}（选择率 {_sr_txt}）：{m:.2f} PPL')
         lines.append('')
         if mono:
             lines.append('PPL 随选择率单调下降（选择越多越好），说明在 seq 2048 / 1500 步的受控训练量下未出现「少选反而优」的甜点——检索质量不足时，选择率是硬上限。')

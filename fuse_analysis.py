@@ -304,7 +304,7 @@ def main(argv=None):
             if not _gate_ok:
                 lines.append(f'> 注：{len(SEEDS) - len(_ok_seeds)} 个 seed 未通过配置/训练量配对门禁（{_why}），已按本仓库惯例排除——Δ 与 p 值只在可配对的 {_ok_seeds} 上计算，跨配置的种子差不进入检验。')
             _d_f1m = d_f1.mean()
-            _n_same = int(((d_f1 == 0) | ((d_f1 > 0) == (_d_f1m > 0))).sum())
+            _n_same = int(((d_f1 != 0) & ((d_f1 > 0) == (_d_f1m > 0))).sum())
             lines.append(f'- 层均边界 F1：Δ = {_d_f1m:+.4f} ± {sample_std(d_f1):.4f}，{_n_same}/{_n_f1} 同向，p(exact) = {p_f1:.3f}')
             _ppl_floor0 = 2.0 / (1 << len(d_ppl)) if len(d_ppl) <= 20 else 1.0 / 200001.0
             lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p(exact) = {p_ppl:.3f}（n={len(d_ppl)} 时 p 分辨率下限 {_ppl_floor0:.3f}）\n')
