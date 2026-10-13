@@ -169,7 +169,11 @@ def signflip(deltas):
 def sample_std(deltas, axis=None):
     d = np.asarray(deltas, dtype=float)
     if axis is None:
-        d = d[np.isfinite(d)]
+        # Fast path: when nothing is non-finite, d[np.isfinite(d)] is a copy
+        # of the same values in the same order, so np.std on `d` directly is
+        # bitwise-identical and skips the mask + compaction allocation.
+        if not np.isfinite(d).all():
+            d = d[np.isfinite(d)]
         return float(np.std(d, ddof=1)) if d.size > 1 else 0.0
     if d.shape[axis] < 2:
         return np.zeros(d.shape[:axis] + d.shape[axis + 1:])
@@ -181,6 +185,10 @@ def sample_std(deltas, axis=None):
     return out.reshape(d.shape[:axis] + d.shape[axis + 1:])
 
 def _row_nanmean(M):
+    # Fast path: with no NaNs, a 2-D mean along the (contiguous) last axis is
+    # bitwise-identical to per-row np.mean (verified by differential test).
+    if M.shape[1] and np.isfinite(M).all():
+        return M.mean(axis=1)
     out = np.full(M.shape[0], np.nan)
     for i in range(M.shape[0]):
         r = M[i][np.isfinite(M[i])]

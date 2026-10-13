@@ -71,7 +71,11 @@ _SEGMENT_CACHE_CAP = 4096
 
 def _segment(n, want_cut_list, min_block, max_block):
     cacheable = n <= 64
-    key = (n, min_block, max_block, bytes(bytearray((1 if _c else 0 for _c in want_cut_list)))) if cacheable else None
+    # uint8 cast of the booleans is exactly 0/1 per slot — the same byte string
+    # `bytes(bytearray(1 if _c else 0 ...))` built, without a Python-level
+    # generator per cut slot (host-side integer/bool equivalent rewrite; the
+    # cached bids/honoured/counts the key guards are unchanged).
+    key = (n, min_block, max_block, np.asarray(want_cut_list, dtype=np.uint8).tobytes()) if cacheable else None
     if cacheable:
         hit = _SEGMENT_CACHE.get(key)
         if hit is not None:

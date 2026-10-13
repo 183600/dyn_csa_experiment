@@ -80,11 +80,12 @@ def exact_signflip(deltas):
         if _np is not None:
             _rng = _np.random.default_rng(0)
             cnt = 1
+            _darr = _np.asarray(deltas)[None, :]
             _step = max(1, min(B, (1 << 24) // max(n, 1)))
             for _off in range(0, B, _step):
                 _bs = min(_step, B - _off)
                 _signs = _np.where(_rng.random((_bs, n)) < 0.5, 1.0, -1.0)
-                _sums = _np.abs((_signs * _np.asarray(deltas)[None, :]).sum(1))
+                _sums = _np.abs((_signs * _darr).sum(1))
                 cnt += int((_sums >= obs - 1e-12).sum())
         else:
             rng = random.Random(0)
@@ -96,11 +97,40 @@ def exact_signflip(deltas):
                 if abs(s) >= obs - 1e-12:
                     cnt += 1
         return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': cnt / (B + 1)}
-    cnt = 0
-    for mask in range(1 << n):
-        s = sum((d if mask >> i & 1 else -d for i, d in enumerate(deltas)))
-        if abs(s) >= obs - 1e-12:
-            cnt += 1
+    try:
+        import numpy as _np
+    except ImportError:
+        _np = None
+    if _np is not None:
+        # Vectorized counting with an exactness guard: numpy's pairwise sum
+        # rounds differently than the reference left-to-right sum, so any mask
+        # whose vectorized |sum| lies within the classic rounding bound
+        # n*eps*sum|d| of the decision threshold is re-decided with the
+        # original per-mask Python summation; all other masks are decided
+        # identically by both summations (the bound covers the difference).
+        _total = 1 << n
+        _thr = obs - 1e-12
+        _darr = _np.asarray(deltas, dtype=float)
+        _ebnd = n * 2.220446049250313e-16 * float(_np.abs(_darr).sum())
+        _bitpos = _np.arange(n, dtype=_np.int64)
+        _step = max(1, min(_total, (1 << 24) // max(n, 1)))
+        cnt = 0
+        for _off in range(0, _total, _step):
+            _masks = _np.arange(_off, min(_off + _step, _total), dtype=_np.int64)
+            _signs = (((_masks[:, None] >> _bitpos) & 1) * 2 - 1).astype(float)
+            _s = _np.abs((_signs * _darr[None, :]).sum(1))
+            _near = _np.abs(_s - _thr) <= _ebnd
+            cnt += int((_s[~_near] >= _thr).sum())
+            for _m in _masks[_near].tolist():
+                s = sum((d if _m >> i & 1 else -d for i, d in enumerate(deltas)))
+                if abs(s) >= _thr:
+                    cnt += 1
+    else:
+        cnt = 0
+        for mask in range(1 << n):
+            s = sum((d if mask >> i & 1 else -d for i, d in enumerate(deltas)))
+            if abs(s) >= obs - 1e-12:
+                cnt += 1
     mu = sum(deltas) / n
     return {'n': n, 'mean': mu, 'std': (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0, 'p_exact_signflip': cnt / (1 << n)}
 
@@ -156,6 +186,12 @@ def _legacy_warm_tags(s):
             _var = str(key).split('::', 1)[0]
         _legacy.setdefault(str(_var), set()).add(m.group(1) if m else None)
     return {v: frozenset(tags) for v, tags in _legacy.items() if None not in tags}
+
+def _legacy_warm_tags_cached(outdir):
+    key = ('legacy', outdir)
+    if key not in _LOADED:
+        _LOADED[key] = _legacy_warm_tags(summary(outdir))
+    return _LOADED[key]
 
 def _tag_of(r, key=None, legacy_ok=None):
     if r.get('protocol') is not None:
@@ -236,7 +272,7 @@ def per_seed_records(outdir):
     if _ck in _LOADED:
         return _LOADED[_ck]
     s = summary(outdir)
-    _legacy_ok = _legacy_warm_tags(s)
+    _legacy_ok = _legacy_warm_tags_cached(outdir)
     out = collections.defaultdict(dict)
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
@@ -394,7 +430,7 @@ def sec_p0w():
     s = summary('results_lm_v7_warmup')
     if not s:
         return '## P0-1 dense→sparse warmup — （无结果）\n\n'
-    _legacy_ok = _legacy_warm_tags(s)
+    _legacy_ok = _legacy_warm_tags_cached('results_lm_v7_warmup')
     rows = []
     for k, r in s.items():
         if not isinstance(r, dict):
@@ -872,6 +908,11 @@ def sec_p1l():
     lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
     per_v = {}
     trunc_v = {}
+    # Group by variant once (preserving order) instead of re-filtering the
+    # full record list for every (variant, length) cell.
+    _recs_by_v = {}
+    for _r in recs:
+        _recs_by_v.setdefault(_r.get('variant'), []).append(_r)
     for v in variants:
         cells = []
         base_map, last_map = ({}, {})
@@ -879,9 +920,7 @@ def sec_p1l():
         for Ln in lens:
             recs_l = []
             _seen_sd = set()
-            for _r in recs:
-                if _r.get('variant') != v:
-                    continue
+            for _r in _recs_by_v.get(v, []):
                 _bl = _r.get('by_len') or {}
                 _c = _bl.get(Ln, _bl.get(str(Ln)))
                 if isinstance(_c, dict) and _ppl_ok(_c.get('ppl')):
@@ -955,7 +994,23 @@ def sec_p1l():
     lines.append('')
     return '\n'.join(lines) + '\n'
 
+_AGG_ENTRY_CACHE = {}
+
 def _agg_entry(d, v):
+    # The resolution below scans the whole dict; agg dicts are already
+    # memoized in _LOADED, so cache the per-variant resolution on the dict's
+    # identity (keeping a strong ref to `d` so the id cannot be recycled
+    # while the entry is alive).  Results are identical to the uncached scan.
+    _ck = id(d)
+    _ent = _AGG_ENTRY_CACHE.get(_ck)
+    if _ent is None or _ent[0] is not d:
+        _ent = (d, {})
+        _AGG_ENTRY_CACHE[_ck] = _ent
+    if v not in _ent[1]:
+        _ent[1][v] = _agg_entry_scan(d, v)
+    return _ent[1][v]
+
+def _agg_entry_scan(d, v):
     if v in d:
         return d[v]
     cands = [(k, e) for k, e in d.items() if isinstance(e, dict) and (k.startswith(f'{v}@cfg') or k.startswith(f'{v}#'))]
