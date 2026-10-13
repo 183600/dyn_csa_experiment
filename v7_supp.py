@@ -371,7 +371,10 @@ class HybridAttentionRoPE(L.HybridAttention):
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = attn + (soft_attn - soft_attn.detach())
                 if sink is None:
-                    attn = attn * _anyrow[:, None, None]
+                    # in-place on the fresh straight-through sum (same safety
+                    # argument as exp_lib.gathered_attention); saves one
+                    # [q,h,M] transient per chunk.
+                    attn.mul_(_anyrow[:, None, None])
             out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
         return out
     def _dense_warmup_forward(self, x):

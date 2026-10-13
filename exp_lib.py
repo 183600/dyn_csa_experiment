@@ -1096,7 +1096,10 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
         attn = attn + (soft_attn - soft_attn.detach())
         if not _has_sink:
-            attn = attn * anyrow[:, None, None]
+            # in-place is safe here and saves one [q,h,M] transient per chunk:
+            # `attn` is the fresh straight-through sum (the `+` node saves no
+            # tensors for backward), so mul_ touches no autograd-saved value.
+            attn.mul_(anyrow[:, None, None])
         out[s:e] = _einsum('qhm,qmhd->qhd', attn, Vset)
     return out
 
@@ -2997,10 +3000,12 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     losses.extend(torch.stack(_lbuf).tolist())
                     _lbuf.clear()
                 _lv = float(losses[-1])
-                for li, blk in enumerate(model.blocks):
-                    dl = getattr(blk.attn, 'delta_logit', None)
-                    if dl is not None:
-                        delta_trace.setdefault(f'L{li}', []).append([step, float(dl.item())])
+                _dls = [(li, getattr(blk.attn, 'delta_logit', None)) for li, blk in enumerate(model.blocks)]
+                _dls = [(li, dl) for li, dl in _dls if dl is not None]
+                if _dls:
+                    # one device sync for all layers instead of one per layer
+                    for li, _v in zip([li for li, _ in _dls], torch.stack([dl for _, dl in _dls]).tolist()):
+                        delta_trace.setdefault(f'L{li}', []).append([step, float(_v)])
                 print(f'  step {step:4d}  loss {_lv:.4f}  lr {opt.param_groups[0]['lr']:.2e}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
     finally:
         if _gc_relief:
