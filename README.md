@@ -1,0 +1,196 @@
+# Dynamic-Block CSA + HCA — WikiText-103 controlled study
+
+Controlled study of compressed-block sparse attention (CSA / HCA, fixed and
+dynamic blocking) vs dense attention in a small from-scratch LM (BPE-8k,
+WikiText-103). This repository contains the experiment code and everything
+needed to reproduce the results on a machine of your own.
+
+## Repository layout
+
+仓库只保留**源码、驱动脚本与设计文档**。所有实验结果目录（`results_*/`）、
+零 GPU 分析目录（`analysis_*/`）、逐版报告（`REPORT*.md`）与运行状态文件
+都**不入库**——它们由下面的驱动脚本在跑实验的机器上重新生成，需要时本地
+复现即可（见下一节的命令）。`.gitignore` 已把这几类路径挡在仓库外（`docs/`
+只保留 `design_notes.md`）。
+
+| path | what |
+|---|---|
+| `exp_lib.py` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer, segmenters, training loop, aggregation and statistics |
+| `run_gapfill.py` | **the v6 driver**: the minimum-publishable supplementary runs, resumable, guarded by a run-time cap, pushes after every phase, auto-shuts the instance down |
+| `par.py` | **task-level parallel executor (opt-in)**: one GPU card per independent run — see "Task-level parallelism" below |
+| `v7_supp.py` | **the v7 driver**: reviewer-response supplementary suite — P0R RoPE+QK-norm, P0W dense-warmup, P0E 40k-step long run, P2S scale re-seeding, P1L length extrapolation, P1T topk sweep |
+| `v8_supp.py` | **the v8 driver**: P1S (scale panel seed completion to 4 seeds) and P2R (RoPE+QK-norm 20k-step long run) |
+| `v9_supp.py` | **the v9 driver**: P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
+| `v10_supp.py` | **the v10 driver**: P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
+| `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
+| `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk, never hard-coded) |
+| `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
+| `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
+
+> **`exp_lib.py` 是唯一的代码来源（source of truth），直接改它。**
+
+### 重新生成实验产物
+
+结果目录与报告都不在仓库里。要重新得到它们：
+
+```bash
+python run_gapfill.py smoke      # 端到端自检，零 GPU 消耗
+python run_gapfill.py full       # v6 主实验（受运行时上限约束）
+python v7_supp.py ...            # 各版本补充实验，子命令见对应脚本的 docstring
+python build_report.py           # 从落盘的 results_*/ + analysis_*/ 重建报告
+```
+
+## Reproducing (any CUDA box)
+
+```bash
+# 0) environment — Python 3.12, torch 2.8.0+cu128, plus:
+pip install datasets tokenizers matplotlib
+# (the code also pip-installs these itself on import; HF_ENDPOINT is set to
+#  hf-mirror.com inside exp_lib.py — change it if you are outside CN)
+#
+# If the Hub is unreachable, `load_wikitext` falls back to a local raw dump:
+# point `WT103_RAW_TXT` at a directory holding `wiki.train.raw` /
+# `wiki.valid.raw` (the search also tries `./wt103_raw` next to the repo and
+# `/root/wt103_raw`).  Only those two files are read, and tokenising them
+# reproduces the `wt103_cache/*.npy` cache token-for-token, so the
+# fallback is a pure availability path and never changes a measurement.
+# When `wt103_cache/` is already populated the corpus is served from the cache
+# and no dump or network access is needed at all.
+
+# 1) validate the whole pipeline end to end (smoke run, no push):
+python run_gapfill.py smoke
+
+# 2) the real supplementary study (bounded by the run-time cap):
+nohup python run_gapfill.py full > run_v6.log 2>&1 &
+tail -f run_v6.log
+```
+
+`run_gapfill.py full` runs, in order (each phase is resumable; re-running the
+same command skips completed `variant::seed` pairs):
+
+| phase | output dir | what |
+|---|---|---|
+| P-LONG | `results_lm_v3_long` | hybrid_fixed / hybrid_dynamic / hybrid_csa_dyn at seed 2 → 3-seed long-run table |
+| P-CORE | `results_lm_v3_1500` | 9-variant core table, 1500 steps x 3 seeds |
+| P-SCALE | `results_lm_v5_scale` | d=384 / 8 layers / seq-1024 probe, 5 variants x 2 seeds x 4000 steps |
+
+`full` is bounded by the run-time cap described at the end of this section.
+
+### Task-level parallelism (one GPU per run)
+
+Every driver can run its independent cells — one `(variant, seed)` training
+run each — in parallel, **one card per run**, on multi-GPU boxes.  It is
+strictly opt-in and off by default, so the serial behaviour above is exactly
+what you get when the variable is unset:
+
+```bash
+# one worker per visible GPU (recommended):
+CSA_PAR=auto nohup python v11_supp.py full > run_v11.log 2>&1 &
+
+# only 2 cards, only these cards:
+CSA_PAR=2 CSA_PAR_GPUS=0,3 python v10_supp.py phase P3SL
+
+# back to 100% serial (the default): unset CSA_PAR
+```
+
+What it guarantees (see `docs/design_notes.md` §13 for the full contracts):
+
+- **identical numbers** — each cell seeds its own RNG in its own process, so
+  the parallel pass reproduces the serial pass bit-for-bit; fingerprints,
+  resume rules and `CODE_SEMANTICS` are unchanged;
+- **merge-safe artifacts** — all `summary.json` updates go through an
+  flock-guarded load-modify-write, so concurrently finishing runs never lose
+  each other's records; aggregation / plots / git push / shutdown happen once,
+  in the parent;
+- **honest accounting under the run-time cap** — a child pre-books its
+  projected time into the shared `TimeGuard` state and refunds the difference
+  after the run, so concurrently launched cells still respect the cap, and the
+  cap keeps metering **GPU-seconds** (4 cards x 1 h = 4 h against the cap);
+- **same failure semantics as serial** — a failed cell writes its error
+  record and the phase continues; a crashed child aborts the phase like a
+  serial exception would, completed cells stay on disk and re-running
+  resumes.
+
+Per-cell logs land under `par_jobs/<phase>_<timestamp>/` (gitignored); the
+main log reports start/done/heartbeat lines and tails a failed child's log.
+Smoke modes always run serially regardless of `CSA_PAR`.
+
+### v11 statistical close-out suite
+
+```bash
+python v11_supp.py smoke
+nohup python v11_supp.py full > run_v11.log 2>&1 &
+python v11_supp.py report         # rebuild REPORT_v11.md from disk (zero GPU)
+```
+
+Phases: P4MT (RoPE-arm seeds 0-5, exact P1L/P3MT recipe; resume skips
+checkpoints whose code stamp is still current), P4MP (probe resume for
+the same seed set, eval-only, stale cells re-measured), P4SS/P4SL
+(crossover panels seeds 0-3, same resume rule), P4F (d=384
+`csa_fixed`/`full` seeds 0-3 under one config, so the panel pairs at
+n=4).
+
+### v10 mechanism / scaling / stats suite
+
+```bash
+# v10: distractor-injection mechanism probe + crossover scaling + topk seeds
+python v10_supp.py smoke
+nohup python v10_supp.py full > run_v10.log 2>&1 &
+python v10_supp.py analysis       # zero-GPU stats -> analysis_v10/
+python v10_supp.py report         # rebuild REPORT_v10.md from disk (zero GPU)
+```
+
+Phases (each resumable): P3MT (retrain the two RoPE arms, the P1L recipe),
+P3MP (eval-only far-distance distractor injection: paired corrupted
+contexts, clean 512-token target, learned-selection vs dense vs
+random-indexer vs see-everything arms), P3T (topk sweep seeds 2/3 → n=4),
+P3SS/P3SL (d=128/4L 8000-step and d=512/10L 4000-step crossover panels).
+See `docs/design_notes.md` for the design rationale behind the
+paired-corruption protocol and the pre-registered crossover criterion.
+
+### v8 / v9 close-out suites
+
+```bash
+# v8: scale-panel seed completion (4 seeds) + RoPE 20k long run
+python v8_supp.py smoke
+python v8_supp.py full            # or: python v8_supp.py phase P1S / P2R
+python v8_supp.py analysis        # zero-GPU stats -> analysis_v8/
+
+# v9: complete topk sweep (bs=1) + RoPE-20k third seed + report
+python v9_supp.py smoke
+nohup python v9_supp.py full > run_v9.log 2>&1 &
+python v9_supp.py report          # rebuild REPORT_v9.md from disk (zero GPU)
+```
+
+See `docs/design_notes.md` for the design rationale
+and the pairing/measurability rules these phases rely on.
+
+### v7 reviewer-response suite
+
+The v7 suite (see `docs/design_notes.md` for the design rationale and the
+phase-command layout) runs the reviewer-concern experiments and rebuilds the report:
+
+```bash
+# zero-GPU: analytic FLOPs/KV-cache + paired sign-flip stats + report rebuild
+python v7_supp.py analysis
+# one phase at a time (resumable), or the whole chain:
+python v7_supp.py phase P0E   # 40k-step long run
+python v7_supp.py phase P2S   # scale re-seeding to 4 seeds
+python v7_supp.py phase P1L   # length extrapolation
+python v7_supp.py phase P1T   # seq-2048 topk sweep
+python build_report.py        # regenerate REPORT_v7.md from artifacts (zero GPU)
+```
+
+Every driver meters its own accelerator time against a configured run-time
+cap: it refuses to start a run that would pass the cap, and hard-truncates a
+run that reaches it mid-flight.  On a multi-GPU box, `CSA_PAR=auto` runs the
+same phases with one independent run per card (the cap then meters aggregate
+GPU-seconds, i.e. N parallel runs consume it N times faster in wall clock) — a truncated cell leaves no partial
+measurement and is retried on the next pass. When all phases finish the
+script pushes and shuts the instance down (cancel with
+`pkill -f v6autoshutdown`; suppress with `V6_NO_SHUTDOWN=1`, pushes with
+`V6_NO_PUSH=1`).
+
+> 量值一律以 `build_report.py` / `fuse_analysis.py` 与各 `v*_supp.py report`
+> 构建器从 `results_*/`、`analysis_*/` 落盘产物现算出的表格为准，仓库正文
+> 不写死任何量值。
