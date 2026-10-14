@@ -663,6 +663,102 @@ def _pool_parts_host(block_ids, B, ov, n, counts_l):
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
 
+def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, dev):
+    # Host-side integer/bool build of the variable-block gather geometry
+    # (design notes §6.2): g_a/mask_a/g_b/mask_b/b_off/_pos_a are exact
+    # integer/bool functions of the cut table's own counts (the same counts
+    # _pool_parts_host already mirrors) plus the shape scalars, so the numpy
+    # form below produces values identical to the on-device build in
+    # _pool_ordered — only the location of the integer math and the
+    # transport change (§6.1).  The int64 parts ride one flat staged upload
+    # and the two bool masks a second one (the same staged pinned pool
+    # _pool_parts_host uses); the returned tensors are read-only views into
+    # those buffers (the same aliasing argument the parts make — downstream
+    # they feed gathers / mask multiplies / negated-mask fills only).  For
+    # the dynamic segmenter's per-row block-ids objects this replaces the
+    # ~9 small device kernels the on-device build issues per row per layer
+    # per step; the fixed segmenter keeps its build-once/cache path.  Returns
+    # None when the host form cannot serve; the caller then falls back to
+    # the on-device form, whose values are identical.
+    try:
+        B = int(B)
+        n = int(n)
+        ov = int(ov)
+        max_len = int(max_len)
+        W_b = max(int(ov_hi), 0)
+        pa_rows = int(pa_rows)
+        pb_rows = int(pb_rows)
+        counts_np = np.asarray(counts_l, dtype=np.int64)
+        if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or pa_rows <= 0 or pb_rows <= 0:
+            return None
+        ends_np = np.cumsum(counts_np, dtype=np.int64)
+        starts_np = ends_np - counts_np
+        pos = np.arange(max_len, dtype=np.int64)
+        gp = starts_np[:, None] + pos[None, :]
+        mask_a_np = gp < ends_np[:, None]
+        np.minimum(gp, n - 1, out=gp)
+        op = np.arange(W_b, dtype=np.int64)
+        end_prev = np.empty(B, dtype=np.int64)
+        end_prev[0] = -1
+        end_prev[1:] = ends_np[:-1]
+        starts_prev = np.empty(B, dtype=np.int64)
+        starts_prev[0] = 0
+        starts_prev[1:] = starts_np[:-1]
+        ov_start = np.maximum(end_prev - ov, starts_prev)
+        ov_len = np.maximum(end_prev - ov_start, 0)
+        mask_b_np = op[None, :] < ov_len[:, None]
+        g_b_np = np.minimum(ov_start[:, None] + op[None, :], n - 1)
+        b_off_np = np.minimum(ov_start[:, None] - starts_prev[:, None] + op[None, :], pb_rows - 1)
+        pos_a_np = pos if max_len <= pa_rows else np.minimum(pos, pa_rows - 1)
+        n_a = B * max_len
+        n_b = B * W_b
+        flat_i = np.empty(n_a + 2 * n_b + max_len, dtype=np.int64)
+        flat_i[0:n_a] = gp.ravel()
+        flat_i[n_a:n_a + n_b] = g_b_np.ravel()
+        flat_i[n_a + n_b:n_a + 2 * n_b] = b_off_np.ravel()
+        flat_i[n_a + 2 * n_b:] = pos_a_np
+        buf = _h2d_async(flat_i, torch.long, dev)
+        g_a = buf[0:n_a].view(B, max_len)
+        g_b = buf[n_a:n_a + n_b].view(B, W_b)
+        b_off = buf[n_a + n_b:n_a + 2 * n_b].view(B, W_b)
+        pos_a = buf[n_a + 2 * n_b:]
+        flat_b = np.empty(n_a + n_b, dtype=np.bool_)
+        flat_b[0:n_a] = mask_a_np.ravel()
+        flat_b[n_a:] = mask_b_np.ravel()
+        mbuf = _h2d_async(flat_b, torch.bool, dev)
+        return (g_a, mbuf[0:n_a].view(B, max_len), g_b, mbuf[n_a:].view(B, W_b), b_off, pos_a)
+    except (RuntimeError, TypeError, ValueError, AttributeError):
+        return None
+
+def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
+    # Single-block-form twin of _pool_geom_host_var (pool_blocks_single's
+    # g/mask/_pos_a): same exact-integer host build (§6.2), same staged
+    # transport (§6.1), same None-means-device-fallback contract.
+    try:
+        B = int(B)
+        n = int(n)
+        max_len = int(max_len)
+        p_rows = int(p_rows)
+        counts_np = np.asarray(counts_l, dtype=np.int64)
+        if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or p_rows <= 0:
+            return None
+        ends_np = np.cumsum(counts_np, dtype=np.int64)
+        starts_np = ends_np - counts_np
+        pos = np.arange(max_len, dtype=np.int64)
+        gp = starts_np[:, None] + pos[None, :]
+        mask_np = gp < ends_np[:, None]
+        np.minimum(gp, n - 1, out=gp)
+        pos_a_np = pos if max_len <= p_rows else np.minimum(pos, p_rows - 1)
+        n_g = B * max_len
+        flat_i = np.empty(n_g + max_len, dtype=np.int64)
+        flat_i[0:n_g] = gp.ravel()
+        flat_i[n_g:] = pos_a_np
+        buf = _h2d_async(flat_i, torch.long, dev)
+        mask = _h2d_async(mask_np, torch.bool, dev).view(B, max_len)
+        return (buf[0:n_g].view(B, max_len), mask, buf[n_g:])
+    except (RuntimeError, TypeError, ValueError, AttributeError):
+        return None
+
 def _pool_parts(block_ids, B, ov, n):
     # Integer block geometry shared by the pooling paths.  Every value is an
     # exact integer function of (block_ids, B, ov, n), so caching the tensors on
@@ -887,16 +983,26 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     dest.clamp_(min=0)
     grid = _arange_cache(n, scores.device)[:, None].expand(n, _w_keep)
     kept = torch.full((n, _w_keep), -1, dtype=torch.int32, device=scores.device)
-    _keep_w = keep[:, :_w_keep]
     # int64 -> int32 narrowing, on the kept slice only — same integers
-    # (index transport, design notes §6.1).
+    # (index transport, design notes §6.1).  keep/dest are already exactly
+    # _w_keep wide (keep = cf.gather(1, order_w), dest = keep.cumsum), so the
+    # old [:, :_w_keep] re-slices were identity views and are dropped.
     order_k = order_w.to(torch.int32)
-    kept[grid[_keep_w], dest[:, :_w_keep][_keep_w]] = order_k[_keep_w]
-    del grid, _keep_w
-    pad_blk = causal.to(torch.uint8).argmax(dim=1).to(torch.int32)
-    idx_out = torch.where(kept >= 0, kept, pad_blk[:, None])
+    kept[grid[keep], dest[keep]] = order_k[keep]
+    del grid
+    # last_tok from either pooling path is non-decreasing (a cumsum of
+    # non-negative counts followed by the monotone (ends-1).clamp(0, n-1)),
+    # so every row of `causal` is a prefix of Trues: the first-max argmax of
+    # the old cast form returns 0 for any row with a readable block, and 0
+    # for an all-False row (ties resolve to index 0) — identically zero.
+    # The padded lanes are masked downstream via the selection-valid mask
+    # either way, so the zeros are the same integers the argmax produced
+    # (host-side integer equivalence, design notes §6.2), minus the cast /
+    # argmax / cast round trip per call.
+    pad_blk = torch.zeros(n, dtype=torch.int32, device=scores.device)
+    valid_cols = kept >= 0
+    idx_out = torch.where(valid_cols, kept, pad_blk[:, None])
     if out_valid is not None:
-        valid_cols = kept >= 0
         if k_req > _w_keep:
             valid_cols = torch.cat([valid_cols, torch.zeros(n, k_req - _w_keep, dtype=torch.bool, device=scores.device)], dim=1)
         out_valid[:] = [valid_cols]
@@ -919,7 +1025,27 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         kI = (comp_kv @ W_DK).view(B, nIH, hd).transpose(0, 1)
         w_idx = pre_w if pre_w is not None else F.linear(H, W_w)
     pos = _arange_cache(n, dev)
-    causal = block_readable(pos, last_tok)
+    # causal (and its negation) are exact bool functions of (pos, last_tok).
+    # The fixed segmenter's pooled last_tok is ONE shared cached tensor read
+    # by every row/layer/step, so the pair is cached on that tensor object —
+    # the same bitwise-safe cache-on-immutable-object argument as
+    # _pool_parts/_pool_geom (design notes §6.2).  Both masks are only ever
+    # read downstream (masked_fill sources, no_grad selection); the dynamic
+    # per-row last_tok objects simply miss and rebuild (identical values).
+    # Built outside inference mode so a pair first filled during eval can
+    # still serve training (masked_fill_ saves the mask for backward).
+    _rkey = (int(n), int(last_tok.shape[0]))
+    _rc = getattr(last_tok, '_readable_cache', None)
+    if _rc is not None and _rc[0] == _rkey:
+        causal, _ncausal = _rc[1:3]
+    else:
+        with torch.inference_mode(False):
+            causal = block_readable(pos, last_tok)
+            _ncausal = ~causal
+        try:
+            last_tok._readable_cache = (_rkey, causal, _ncausal)
+        except (AttributeError, RuntimeError):
+            pass
     k = min(topk, B)
     if k < int(topk):
         _wk = (int(topk), int(B))
@@ -962,7 +1088,6 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         out_valid = []
     with torch.no_grad():
         idx = _indexer_selection(scores, causal, k, out_valid=out_valid)
-    _ncausal = ~causal
     scores.masked_fill_(_ncausal, float('-inf'))
     _lse = torch.logsumexp(scores, dim=-1, keepdim=True)
     # the gather output is fresh and nothing downstream needs the pre-subtract
