@@ -663,7 +663,7 @@ def run_child(job_path, result_path):
         # A cell-level sys.exit() is a normal experiment failure, not an
         # infrastructure crash: record it and exit 0 so the dispatcher
         # continues the phase (re-raising here would abort every sibling
-        # cell, and exit code None/0 would previously masquerade as "ok").
+        # cell).
         code = exc.code if isinstance(exc.code, int) else 1
         if code != 0:
             result["status"] = "fatal"

@@ -312,9 +312,8 @@ def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=Fals
 def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
-    # 闭式因果分位数是 O(B·T²) 内存与逐行排序：T=8192、B=8 单次即 ~2 GB
-    # 提交内存 + 每层每步的 67M 元素排序。长上下文臂请改用 cosine_learnable
-    # 分块器；此处 fail-fast 而不是让内核 OOM。
+    # 闭式因果分位数是 O(B·T²) 内存与逐行排序：长上下文臂请改用
+    # cosine_learnable 分块器；此处 fail-fast 而不是让内核 OOM。
     n = sim.shape[-1]
     _sq_bytes = sim.shape[0] * n * n if sim.dim() == 2 else n * n
     if _sq_bytes * 4 > 1 << 30:

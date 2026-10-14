@@ -1913,7 +1913,7 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
 
     # ---- 算子 3 退化配置对照：soft=None（HCA 臂）与 sink=None（use_sink=False）----
     # 这两条路径的反向分解与默认配置不同（A 路单项 / 无 sink 列的 S 路），
-    # 必须与 eager 逐步对齐，之前未覆盖。
+    # 必须与 eager 逐步对齐。
     for cfg_tag, use_soft, use_sink in (('nosoft', False, True), ('nosink', True, False)):
         for tag, mode in (('eager', None), (impl, impl)):
             L_ = [t.detach().clone().requires_grad_(True) for t in leaves_a]
