@@ -1199,9 +1199,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         flat = topk_idx.reshape(R, T * nb).to(torch.int64)
         order = flat.argsort(dim=1, stable=True).to(torch.int32).contiguous()
         # 整数直方图（等价于逐行 bincount(minlength=Bm)）：整数键的
-        # scatter_add_ 精确且与写入顺序无关（整数加法可交换、无舍入），
-        # 避免 [R, T·nb, Bm] 等大布尔广播——显存从 O(R·T·nb·Bm) 降为
-        # O(R·T·nb + R·Bm)，Bm 随 T 增长时差异是数量级的。
+        # scatter_add_ 精确且与写入顺序无关（整数加法可交换、无舍入）。
         cnt = torch.zeros((R, Bm), device=dev, dtype=torch.int64)
         cnt.scatter_add_(1, flat, torch.ones_like(flat))
         offs = torch.zeros((R, Bm + 1), device=dev, dtype=torch.int64)
