@@ -41,6 +41,24 @@ QUICK = False
 RUN_CAP = dict(total_hours=58.333333333333336, margin=0.93, already_hours=0.0, state_path='run_time_state.json')
 CODE_SEMANTICS = 'v11.125'
 CKPT_CODE = CODE_SEMANTICS
+# ---- 三算子内核路径（docs/compute_plan.md §3 的 M0 工作包；实现与数值契约
+# 见 csa_kernels.py）。CSA_KERNEL 未设置时本模块的执行路径与指纹逐字节不变。
+try:
+    import csa_kernels as _CK
+except Exception as _ck_err:
+    _CK = None
+    _CK_ERR = _ck_err
+
+
+def _kernel_stamp():
+    """内核变体标识（进入 run_cfg 指纹与 `_code` 戳）。eager 模式返回空串，
+    既有记录的指纹逐字节不变；内核模式下记录只与同模式记录配对（§3.1）。"""
+    if _CK is None:
+        return ''
+    try:
+        return _CK.kernel_stamp()
+    except Exception:
+        return ''
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
 RUN_ABL = dict(RUN, outdir='results_lm_v4_abl', variants=ABL_VARIANTS, seeds=[0] if QUICK else [0, 1, 2, 3, 4])
@@ -1654,6 +1672,14 @@ class HybridAttention(nn.Module):
             # paths: one host transfer per layer instead of B (the cut booleans
             # and the resulting block ids are identical to the per-row form).
             pre_blocks = self._cut_blocks_batched(x)
+        if _CK is not None and self.cfg.kind in ('csa', 'hca') and _CK.kernel_enabled():
+            # 内核路径（CSA_KERNEL；独立变体，与 eager 统计对照，不逐位承诺）。
+            # 不支持的臂在这里硬失败，绝不静默回退——否则同一面板会混入两种
+            # 实现的记录。
+            if self.cfg.fuse_mode != 'none' or self.cfg.indexer_mode != 'learned':
+                raise RuntimeError('CSA_KERNEL 只覆盖 learned-indexer / 非 fuse 的 csa·hca 臂；'
+                                   'fuse_mode 或 indexer_mode 不同的臂请 unset CSA_KERNEL 后走 eager')
+            return _CK.sparse_layer_forward(self, x, pre_all, gate_sigs, pre_blocks)
         # Preallocate the batch output and write each row's attention output in
         # place: the stacked buffer holds exactly the tensor torch.stack would
         # have built (a per-row copy into the same layout), and the CopySlices
@@ -3478,6 +3504,10 @@ class TimeGuard:
         self.margin = float(cap.get('margin', 0.93))
         self.already = float(cap.get('already_hours', 0.0))
         self.state_path = cap.get('state_path', 'run_time_state.json')
+        # 内核模式使用独立的状态文件：两档吞吐的标定不可互相污染（同一
+        # state 文件会把 eager 的 sps 标定用于内核单元的预计耗时）。
+        if _kernel_stamp():
+            self.state_path = self.state_path + '.k'
         self.state = self._load_state()
 
     def _load_state(self):
@@ -4242,7 +4272,7 @@ def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch):
         _mkey = ','.join(sorted((str(_x) for _x in _mg)))
     cfg.setdefault('warmup', 50)
     cfg.setdefault('comp_lambda', 0.05)
-    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_cs{CODE_SEMANTICS}'
+    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_cs{CODE_SEMANTICS}{_kernel_stamp()}'
 
 
 def _plan_run(cfg, summary_path, fp):
@@ -4339,7 +4369,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                     out['truncated'] = True
             else:
                 rec['run_cfg'] = fp
-                rec['_code'] = CODE_SEMANTICS
+                rec['_code'] = f'{CODE_SEMANTICS}{_kernel_stamp()}'
                 assert fp.endswith(f'_cs{rec['_code']}'), (fp, rec['_code'])
                 summary[key] = rec
             return summary

@@ -17,6 +17,12 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
   smoke    端到端自检：微型模型 @ seq 8192 走完 fineweb 数据路径、
            稠密 / 固定稀疏 / 动态稀疏三条注意力路径与 8k 长度的
            掩码 / 分段 / 索引几何（M0_SMOKE_* 可调规模）。
+  kernel   G0 验证套件（docs/compute_plan.md §3/§6）：三算子（块压缩 /
+           索引 top-k / 稀疏注意力）的 kernel/eager 同种子数值对照（值 +
+           全部梯度）、模型级前反向对照（csa_fixed / csa_dynamic /
+           hybrid_dynamic），以及 CUDA 机器上的稀疏注意力吞吐基准
+           （G0 主判据：有效吞吐 ≥ 150 TFLOPS）。任意设备可跑——
+           CPU / 无 triton 时验证 torch 参考后端（数值语义层）。
   full     S1 主面板（5 臂 × 4 seeds × 5B token，results_b_s1/）。
            CSA_PAR=auto 一卡一实验（par.py 零改动，§7 排班口径）。
 
@@ -151,6 +157,66 @@ def run_smoke():
     shutil.rmtree('results_smoke_m0', ignore_errors=True)
     print(f'\n[smoke] PASSED — fineweb 数据路径与 seq-{seq} 的稠密/固定/动态三条注意力路径端到端可用；smoke 输出已删除，未触碰任何实验目录。')
 
+def run_kernel():
+    """G0 验证套件（docs/compute_plan.md §3/§6）。
+
+    判据：
+    - 数值一致性：三算子 + 模型级的 kernel/eager 同种子对照（值与全部
+      梯度；fp32 容差 5e-3，bf16 容差 5e-2——归约分组不同带来的浮点噪声
+      口径，见 design_notes §5 的同类漂移讨论）；
+    - 吞吐（仅 CUDA + triton）：稀疏注意力算子有效 TFLOPS，G0 主判据
+      ≥ 150 TFLOPS。
+    """
+    import csa_kernels as ck
+    dev = L.DEVICE
+    print('[kernel] G0 验证套件 — 判据: 数值一致性（算子级+模型级）与 ≥150 TFLOPS（仅 CUDA）')
+    print(f'[kernel] device = {dev}   triton 可导入 = {ck.triton_importable()}   CSA_KERNEL = {os.environ.get("CSA_KERNEL") or "(unset)"}')
+    backends = ['ref']
+    if dev.type == 'cuda' and ck.triton_importable():
+        backends.append('triton')
+    elif dev.type == 'cuda':
+        print('[kernel] triton 不可导入——只验证 torch 参考后端（数值语义层）；安装与 CUDA 匹配的 triton 后重跑可得完整对照')
+    dtypes = [torch.float32] + ([torch.bfloat16] if dev.type == 'cuda' else [])
+    fail = False
+    for impl in backends:
+        for dt in dtypes:
+            tol = 5e-3 if dt == torch.float32 else 5e-2
+            for seed in (0, 1):
+                res = ck.selfcheck_operators(device=dev, dtype=dt, impl=impl, seed=seed, verbose=False)
+                worst_k = max(res, key=res.get)
+                worst = res[worst_k]
+                ok = worst < tol
+                fail |= not ok
+                print(f'[kernel] 算子对照 impl={impl:<6} dtype={str(dt).split(".")[-1]:<8} seed={seed}: worst={worst_k}={worst:.2e}  {"OK" if ok else "FAIL (tol %.0e)" % tol}')
+    T_m = int(os.environ.get('M0_KERNEL_T') or 128)
+    B_m = int(os.environ.get('M0_KERNEL_B') or 2)
+    for impl in backends:
+        for variant in ('csa_fixed', 'csa_dynamic', 'hybrid_dynamic'):
+            res = ck.selfcheck_model(variant=variant, impl=impl, seed=0, T=T_m, B=B_m)
+            # 梯度判据：范数相对误差 < 1e-4（主）；逐条目相对误差 < 5e-2
+            # （上限——归约分组不同带来的逐条目漂移属 design_notes §5 记录
+            # 在案的同类 ULP 漂移，前向 ce 逐位一致是更强的主判据）。
+            ok = res['ce_abs_diff'] < 1e-5 and res['grad_norm_rel'] < 1e-4 and res['grad_max_rel'] < 5e-2
+            fail |= not ok
+            print(f'[kernel] 模型对照 impl={impl:<6} {variant:<14}: {"OK" if ok else "FAIL"}')
+    tflops = {}
+    if dev.type == 'cuda' and 'triton' in backends:
+        for dt in (torch.float32, torch.bfloat16):
+            tflops[str(dt)] = ck.bench_attention(dev, impl='triton', dtype=dt,
+                                                 iters=int(os.environ.get('M0_KERNEL_ITERS') or 20))
+    print()
+    if tflops:
+        best = max(tflops.values())
+        print(f'[kernel] 吞吐：' + '  '.join(f'{k.split(".")[-1]}={v:.1f} TFLOPS' for k, v in tflops.items()))
+        print(f'[kernel] G0 吞吐判据（≥150 TFLOPS）：{"PASS" if best >= 150.0 else "NOT YET (差 %.0f TFLOPS)" % (150.0 - best)}')
+    else:
+        print('[kernel] 吞吐基准需要 CUDA + triton（本机跳过；G0 吞吐判据未测量，不算通过）')
+    print(f'[kernel] 数值判据：{"PASS" if not fail else "FAIL"}')
+    print('[kernel] 说明：内核路径是独立变体（CSA_KERNEL 开启后 run_cfg 指纹追加 -tk1:<backend>）；S1 主面板在 G0 双判据通过前仍被 TimeGuard 拒绝启动')
+    if fail:
+        sys.exit(1)
+
+
 def run_full():
     cap = dict(L.M0_CAP)
     _env = os.environ.get('M0_CAP_HOURS')
@@ -174,8 +240,8 @@ if __name__ == '__main__':
     if mode in ('-h', '--help'):
         print(__doc__ or '')
         raise SystemExit(0)
-    if mode not in ('params', 'data', 'smoke', 'full'):
-        print(f"[m0] unknown or missing mode {mode!r}; expected one of 'params' / 'data' / 'smoke' / 'full' (all phases are explicit — nothing starts by default).  Nothing was started.")
+    if mode not in ('params', 'data', 'smoke', 'kernel', 'full'):
+        print(f"[m0] unknown or missing mode {mode!r}; expected one of 'params' / 'data' / 'smoke' / 'kernel' / 'full' (all phases are explicit — nothing starts by default).  Nothing was started.")
         raise SystemExit(2)
     try:
         _gpu = torch.cuda.get_device_name(0)
@@ -189,6 +255,8 @@ if __name__ == '__main__':
             run_data()
         elif mode == 'smoke':
             run_smoke()
+        elif mode == 'kernel':
+            run_kernel()
         elif mode == 'full':
             run_full()
     except Exception:

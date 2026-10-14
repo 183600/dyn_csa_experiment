@@ -19,6 +19,7 @@ needed to reproduce the results on a machine of your own.
 | path | what |
 |---|---|
 | `exp_lib.py` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer, segmenters, training loop, aggregation and statistics |
+| `csa_kernels.py` | **the fused-kernel path for the three core operators** (docs/compute_plan.md §3, the M0 work package): block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see "Triton kernel path (M0/G0)" below |
 | `run_gapfill.py` | **the v6 driver**: the minimum-publishable supplementary runs, resumable, guarded by a run-time cap, pushes after every phase, auto-shuts the instance down |
 | `par.py` | **task-level parallel executor (opt-in)**: one GPU card per independent run — see "Task-level parallelism" below |
 | `v7_supp.py` | **the v7 driver**: reviewer-response supplementary suite — P0R RoPE+QK-norm, P0W dense-warmup, P0E 40k-step long run, P2S scale re-seeding, P1L length extrapolation, P1T topk sweep |
@@ -26,7 +27,7 @@ needed to reproduce the results on a machine of your own.
 | `v9_supp.py` | **the v9 driver**: P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
 | `v10_supp.py` | **the v10 driver**: P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
 | `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
-| `m0_supp.py` | **the M0/S1 driver (adopted B tier)**: entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `full` (the S1 panel); see "B-tier M0/S1" below and `docs/compute_plan.md` |
+| `m0_supp.py` | **the M0/S1 driver (adopted B tier)**: entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below and `docs/compute_plan.md` |
 | `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk, never hard-coded) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
 | `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
@@ -130,6 +131,7 @@ layer; `m0_supp.py` is the entry point:
 python m0_supp.py params   # zero GPU: S1–S4 parameter audit vs the plan
 python m0_supp.py data     # build / verify the FineWeb-Edu cache (M0_TOKENS=…)
 python m0_supp.py smoke    # end-to-end self-check on the B-tier data path
+python m0_supp.py kernel   # G0 suite: kernel/eager numerical comparison + throughput
 python m0_supp.py full     # the S1 panel (5 arms × 4 seeds; CSA_PAR=auto works)
 ```
 
@@ -144,6 +146,49 @@ python m0_supp.py full     # the S1 panel (5 arms × 4 seeds; CSA_PAR=auto works
   `M0_CAP_HOURS` overrides): before the Triton kernels pass the G0 gate the
   eager throughput projections are refused — that is the plan's own
   precondition (compute_plan §3), not a defect.
+
+### Triton kernel path (M0/G0)
+
+`csa_kernels.py` implements the three core operators of compute_plan §3 as
+fused kernels — block-compression pooling (per-channel masked softmax over
+[A-lanes | overlap lanes] with position embeddings), indexer scoring + top-k
+selection (first-max extraction per round, which is exactly the order of
+torch's stable descending sort, tie = earliest index), and sparse attention
+(flash-style online softmax over [top-k block | sliding-window] lanes with a
+sink as the initial normalizer mass). Every operator also has a torch
+reference twin of the same algorithmic decomposition that runs on any device
+and is what the CPU-side semantic validation exercises.
+
+The kernel path is an **independent variant**, not a bitwise rewrite: the G0
+gate is statistical equivalence against eager (same seed, same data), while
+the eager path itself is untouched — with `CSA_KERNEL` unset the run-config
+fingerprint is byte-identical to the historical one, and with it on the
+fingerprint and `_code` stamp gain a `-tk1:<backend>` suffix so kernel records
+only ever pair with kernel records (design_notes §3.1). Backward passes are
+fixed-order reductions throughout — no atomics; cross-destination accumulations
+go through stable-sort segment sums. The straight-through soft prior of the
+eager path cancels in the forward value and is reconstructed as a dual A/S
+Jacobian in the backward, matching the eager autograd graph.
+
+```bash
+python m0_supp.py kernel                 # anywhere: ref-backend semantics check
+CSA_KERNEL=1 python m0_supp.py kernel    # CUDA + triton: full G0 suite
+CSA_KERNEL=1 python m0_supp.py full      # kernel-mode S1 panel (after G0)
+```
+
+- `CSA_KERNEL` unset / `0`: eager everywhere (default; nothing changes);
+  `1`: require CUDA + triton (hard error if missing); `auto`: triton when
+  available, else the torch reference; `ref`: force the reference backend
+  (CPU-debuggable, same dispatch and autograd wrappers).
+- Per-operator overrides for GPU debugging: `CSA_KERNEL_POOL` / `_IDX` /
+  `_ATTN` ∈ {`triton`, `ref`}; `CSA_KERNEL_TF32=0` switches `tl.dot` to
+  ieee fp32 for bit-level triage (default tf32 for tensor-core throughput).
+- Kernel mode uses its own TimeGuard state file (`*.k`): eager and kernel
+  throughput calibrations never contaminate each other.
+- Supported layer kinds: `csa` / `hca` with the learned indexer and no fuse
+  conv — exactly the B-tier arms (`csa_fixed`, `csa_dynamic`,
+  `hybrid_dynamic`). Anything else fails loudly rather than silently mixing
+  implementations within a panel.
 
 ### v11 statistical close-out suite
 

@@ -17,6 +17,7 @@
 | 路径 | 说明 |
 |---|---|
 | `exp_lib.py` | **核心库，也是唯一的代码来源（source of truth）**：模型、CSA/HCA 注意力、池化、indexer、分段器、训练循环、聚合与统计 |
+| `csa_kernels.py` | **三算子融合内核路径**（docs/compute_plan.md §3 的 M0 工作包）：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文「Triton 内核路径（M0/G0）」 |
 | `run_gapfill.py` | **v6 驱动**：最小可发表补充实验，支持断点续跑，受运行时上限约束，每阶段完成后自动 push，结束后自动关机 |
 | `par.py` | **任务级并行执行器（可选）**：每个独立实验占一张 GPU 卡——见下文"任务级并行" |
 | `v7_supp.py` | **v7 驱动**：回应 reviewer 的补充实验套件——P0R RoPE+QK-norm、P0W 稠密预热、P0E 40k 步长跑、P2S 规模重播种、P1L 长度外推、P1T topk 扫描 |
@@ -24,7 +25,7 @@
 | `v9_supp.py` | **v9 驱动**：P2T（seq-2048 的 topk 扫描，`batch_size=1`）与 P2S3（RoPE 20k 长跑的第三个 seed） |
 | `v10_supp.py` | **v10 驱动**：P3M 长度外推机制 + 干扰项注入探针、P3S 交叉面板扩规模、P3T topk 扫描补至 4 seeds |
 | `v11_supp.py` | **v11 驱动**：统计收尾——干扰探针扩到 n=6（P4MT/P4MP）、交叉面板扩到 n=4（P4S）、d=384 配对臂扩到 n=4（P4F） |
-| `m0_supp.py` | **M0/S1 驱动（已选定 B 档）**：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`full`（S1 主面板）；见下文“B 档 M0/S1”与 `docs/compute_plan.md` |
+| `m0_supp.py` | **M0/S1 驱动（已选定 B 档）**：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力吞吐基准）、`full`（S1 主面板）；见下文“B 档 M0/S1”与 `docs/compute_plan.md` |
 | `build_report.py` | 零 GPU 报告构建器：从 `results_*/` + `analysis_*/` 产物重建 v7 报告（所有数字现算，绝不硬编码） |
 | `fuse_analysis.py` | 零 GPU fuse 对比驱动：从 `results_*/summary.json` 重算逐层边界对齐（tol=1）、块长统计与 PPL 曲线 |
 | `docs/design_notes.md` | **设计与实现笔记**：块读门为何必须严格、且五处位置必须同步；动态分段器的前缀不变性要求；配对/可测量规则；报告约定；保证注意力按行分块与不分批形式等价的契约 |
@@ -119,6 +120,7 @@ S1–S4 规模阶梯，代码入口为 `m0_supp.py`：
 python m0_supp.py params   # 零 GPU：S1–S4 参数量核算（对照规划值）
 python m0_supp.py data     # 构建 / 校验 FineWeb-Edu 缓存（M0_TOKENS=… 可调 cap）
 python m0_supp.py smoke    # 端到端自检：B 档数据路径 + 三条注意力路径
+python m0_supp.py kernel   # G0 套件：kernel/eager 数值对照 + 吞吐基准
 python m0_supp.py full     # S1 主面板（5 臂 × 4 seeds；CSA_PAR=auto 可用）
 ```
 
@@ -130,6 +132,40 @@ python m0_supp.py full     # S1 主面板（5 臂 × 4 seeds；CSA_PAR=auto 可�
 - `full` 受 `M0_CAP` 上限约束（状态文件 `run_time_state_m0.json`，`M0_CAP_HOURS`
   可覆盖）：Triton 内核通过 G0 判据之前，eager 路径的预计耗时会被拒绝启动——
   这是规划文档自身的前提判断（§3），不是缺陷。
+
+### Triton 内核路径（M0/G0）
+
+`csa_kernels.py` 把 compute_plan §3 的三个核心算子实现为融合内核——块压缩
+池化（[A 泳道 | overlap 泳道] 拼接后的逐通道掩码 softmax + 位置嵌入）、
+索引打分 + top-k 选择（逐轮首达最大值提取，与 torch 稳定降序排序严格同
+序，tie 取最早下标）、稀疏注意力（[top-k 块 | 滑窗] 泳道上的 flash 式在线
+softmax，sink 作为归一化初值质量）。每个算子另有同一套算法分解的 torch
+参考孪生实现，任意设备可跑，CPU 侧的语义验证走的正是它。
+
+内核路径是**独立变体**而非逐位置写：G0 判据是与 eager 的统计等价（同
+种子、同数据）；eager 路径本身零改动——`CSA_KERNEL` 未设置时 run_cfg
+指纹与历史版本逐字节一致，开启后指纹与 `_code` 戳追加 `-tk1:<backend>`
+后缀，内核记录只与同模式记录配对（design_notes §3.1）。反向全部为固定
+顺序归约（无原子加），跨目的地累加走稳定排序段和；eager 直通 soft
+先验在前向值上严格抵消，反向按 A/S 双路 jacobian 重建，与 eager 的
+autograd 图一一对应。
+
+```bash
+python m0_supp.py kernel                 # 任意设备：ref 后端语义验证
+CSA_KERNEL=1 python m0_supp.py kernel    # CUDA + triton：完整 G0 套件
+CSA_KERNEL=1 python m0_supp.py full      # 内核模式 S1 主面板（G0 通过后）
+```
+
+- `CSA_KERNEL` 未设置 / `0`：全部 eager（默认，什么都不变）；`1`：强制
+  CUDA + triton（缺席即硬报错）；`auto`：可用则 triton，否则 torch 参考；
+  `ref`：强制参考后端（CPU 可调试，分发与 autograd 封装同一套）。
+- 逐算子覆盖（GPU 排查用）：`CSA_KERNEL_POOL` / `_IDX` / `_ATTN` ∈
+  {`triton`, `ref`}；`CSA_KERNEL_TF32=0` 把 `tl.dot` 切到 ieee fp32
+  （逐位口径排查；默认 tf32 走张量核吞吐）。
+- 内核模式使用独立的 TimeGuard 状态文件（`*.k`）：两档吞吐标定互不污染。
+- 支持的层类型：learned indexer、无 fuse 卷积的 `csa` / `hca`——恰好
+  覆盖 B 档的 `csa_fixed` / `csa_dynamic` / `hybrid_dynamic`；其余臂
+  硬报错，绝不在同一面板里静默混入两种实现。
 
 ### v11 统计收尾套件
 
