@@ -1319,7 +1319,10 @@ class HybridAttention(nn.Module):
             if torch.is_grad_enabled():
                 _wqkv = torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0)
             else:
-                _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version)
+                # device in the key: a cached concatenation from before a
+                # model .to(device) move would otherwise be fed to F.linear
+                # alongside activations on the new device and crash.
+                _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version, self.W_q.weight.device)
                 _hit = self._wcat_cache.get('qkv')
                 if _hit is None or _hit[0] != _key:
                     with torch.inference_mode(False):
@@ -1428,7 +1431,7 @@ class HybridAttention(nn.Module):
         if torch.is_grad_enabled():
             _wcat = torch.cat([_m.t() for _m in _mats], dim=0)
         else:
-            _key = tuple(_m._version for _m in _mats)
+            _key = tuple(_m._version for _m in _mats) + (_mats[0].device,)
             _hit = self._wcat_cache.get('pre')
             if _hit is None or _hit[0] != _key:
                 with torch.inference_mode(False):
@@ -3358,7 +3361,10 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
     # inference_mode (the decorator) already covers the forward pass — a nested
     # no_grad would be a redundant context manager per call, identical values.
     for _r0 in range(0, n_used, 16):
-        ids = torch.from_numpy(val_batch[_r0:min(_r0 + 16, n_used)]).to(device)
+        # as_tensor accepts numpy arrays AND torch tensors (eval_ppl already
+        # uses it); wrapping with asarray first avoids sharing memory with a
+        # caller-owned numpy buffer.
+        ids = torch.as_tensor(np.asarray(val_batch[_r0:min(_r0 + 16, n_used)])).to(device)
         _ = model(ids, logits_tail=1)
         del ids
     for li, blk in enumerate(model.blocks):

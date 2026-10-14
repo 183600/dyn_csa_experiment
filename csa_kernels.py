@@ -374,11 +374,14 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
             jA_t = (t_idx - starts_l.gather(1, sel)).clamp(0, L - 1)
             dc_sel = dcomp.gather(1, sel[:, :, None].expand(R, T, c)).to(torch.float32)
             if need_xa:
-                sc_a_sel = _take_lane(sc_a, r_idx, sel, jA_t)
+                # sc_a/glogit_a are chunk-local ([R, b1-b0, L, c]); rebase the
+                # global clamped block id into chunk coordinates before the
+                # lane gather (starts_l/dcomp stay global-indexed above).
+                sc_a_sel = _take_lane(sc_a, r_idx, sel - b0, jA_t)
                 gXa += torch.where(in_ch[:, :, None], sc_a_sel * dc_sel,
                                    torch.zeros((), device=dev, dtype=torch.float32)).to(dtype)
             if need_za:
-                gl_a_sel = _take_lane(glogit_a, r_idx, sel, jA_t)
+                gl_a_sel = _take_lane(glogit_a, r_idx, sel - b0, jA_t)
                 gZa += torch.where(in_ch[:, :, None], gl_a_sel,
                                    torch.zeros((), device=dev, dtype=torch.float32)).to(dtype)
         if has_b and (need_xb or need_zb):
@@ -391,10 +394,10 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
             dc2 = dcomp.gather(1, b2c[:, :, None].expand(R, T, c)).to(torch.float32)
             zero = torch.zeros((), device=dev, dtype=torch.float32)
             if need_xb:
-                sc_b_sel = _take_lane(sc_b, r_idx, b2c, j2c)
+                sc_b_sel = _take_lane(sc_b, r_idx, b2c - b0, j2c)
                 gXb += torch.where(ok2[:, :, None], sc_b_sel * dc2, zero).to(dtype)
             if need_zb:
-                gZb += torch.where(ok2[:, :, None], _take_lane(glogit_b, r_idx, b2c, j2c), zero).to(dtype)
+                gZb += torch.where(ok2[:, :, None], _take_lane(glogit_b, r_idx, b2c - b0, j2c), zero).to(dtype)
         if need_bpa:
             gsum = glogit_a.sum(dim=(0, 1))
             gBpa[:gsum.shape[0]] += gsum.to(B_pos_a.dtype)
@@ -1412,7 +1415,11 @@ def _attach_attn_kernels(ns):
             tt = lane // NB
             jj = lane % NB
             if HAS_VALID:
-                ok = tl.load(valid_ptr + (r * T + tt) * NB + jj) != 0
+                # Match attn_fwd / attn_bwd_stats: validity AND causality. The
+                # indexer's valid already implies t > last_tok today, but a
+                # future caller passing a causal-free sel_valid would silently
+                # desync forward mask from backward gradient without this.
+                ok = (tl.load(valid_ptr + (r * T + tt) * NB + jj) != 0) & (tt > tl.load(lt_ptr + r * Bm + b).to(tl.int64))
             else:
                 ok = tt > tl.load(lt_ptr + r * Bm + b).to(tl.int64)
             if ok:
@@ -1730,8 +1737,12 @@ def _rel(a, b, pad_mask=None):
         bf = bf[pad_mask]
     if af.numel() == 0:
         return 0.0
-    floor = 1e-4 * float(bf.abs().max())
-    return float(((af - bf).abs() / (bf.abs() + floor)).max())
+    denom = bf.abs() + 1e-4 * float(bf.abs().max())
+    if not bool(denom.max()):
+        # reference is all-zero: identical-zero => rel err 0; any nonzero
+        # absolute difference => rel err 1 (4-decimal floor, saturating).
+        return 0.0 if not bool(af.abs().max()) else 1.0
+    return float(((af - bf).abs() / denom).max())
 
 
 def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, verbose=True):
@@ -1789,6 +1800,27 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
         results[f'pool.{nm}'] = _rel(ker[i], ref[i])
     if verbose:
         print(f'[selfcheck:{impl}:{str(dtype)}] pool  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith('pool.')))
+    # Multi-chunk regression: shrinking _POOL_CHUNK_BYTES exercises the b0>0
+    # rebasing in the chunked backward; the default 64MiB budget keeps this
+    # tiny case single-chunk, which used to hide a global-vs-chunk-local lane
+    # index mismatch.
+    _saved_chunk = _POOL_CHUNK_BYTES
+    try:
+        # two blocks per chunk: one block per chunk would give every lane a
+        # chunk-local index of 0 and could not expose a missing b0 rebase.
+        globals()['_POOL_CHUNK_BYTES'] = 3 * (int(geom.max_len) + int(geom.W_b)) * 32 * 4 * 2
+        L2_ = [t.detach().clone().requires_grad_(True) for t in leaves]
+        bid2 = torch.stack([_host_bid(c) for c in counts_rows], 0).to(device).to(torch.int32).contiguous()
+        bid2._pool_cpu = None
+        comp2, _lt2, _B2 = pool_variable_blocks_kernel(L2_[0], L2_[1], L2_[2], L2_[3], bid2, geom, L2_[4], L2_[5], impl=impl)
+        (comp2 * gcrit).sum().backward()
+        ker2 = [comp2] + [t.grad for t in L2_]
+    finally:
+        globals()['_POOL_CHUNK_BYTES'] = _saved_chunk
+    for i, nm in enumerate(names):
+        results[f'pool_mc.{nm}'] = _rel(ker2[i], ref[i])
+    if verbose:
+        print(f'[selfcheck:{impl}:{str(dtype)}] pool(mc)  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith('pool_mc.')))
 
     # ---- 算子 2：indexer ----
     counts_i = [_rand_counts(T, 4, 8, gen) for _ in range(R)]
