@@ -20,11 +20,11 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
   full     S1 主面板（5 臂 × 4 seeds × 5B token，results_b_s1/）。
            CSA_PAR=auto 一卡一实验（par.py 零改动，§7 排班口径）。
 
-运行时上限：M0_CAP（默认 700 卡时口径，M0_CAP_HOURS 覆盖），状态文件
+运行时上限：M0_CAP（可用 M0_CAP_HOURS 覆盖），状态文件
 run_time_state_m0.json；超限单元拒绝启动、中途到达上限则硬截断且不留
 半条测量。注意（compute_plan §3 的前提判断，不是缺陷）：Triton 内核
 （G0 判据）就绪之前，eager 路径的预计耗时会让 TimeGuard 直接拒绝启动
-S1 单元——此时应先在自费 4090 上完成内核与 kernel/eager 数值对照。
+S1 单元——此时应先完成内核与 kernel/eager 数值对照。
 """
 import gc, json, os, shutil, subprocess, sys, time, traceback
 for _stream in (sys.stdout, sys.stderr):
@@ -159,7 +159,7 @@ def run_full():
         print(f'[m0] M0_CAP_HOURS={_env} 覆盖默认上限 {L.M0_CAP["total_hours"]} 卡时')
     guard = L.TimeGuard(cap)
     guard.report()
-    print('[m0] 提示（compute_plan §3）：内核（G0）就绪前 eager 预计耗时会被 TimeGuard 拒绝启动——先在自费 4090 完成三算子 Triton 化与 kernel/eager 数值对照，再回到这里跑 S1 主面板。')
+    print('[m0] 提示（compute_plan §3）：内核（G0）就绪前 eager 预计耗时会被 TimeGuard 拒绝启动——先完成三算子 Triton 化与 kernel/eager 数值对照，再回到这里跑 S1 主面板。')
     push_ok = git_push('m0: S1 主面板启动（B 档，5 臂 × 4 seeds × 5B token）')
     L.run(L.RUN_S1, guard=guard, label='M0/S1 B 档主面板（5 臂 × 4 seeds × 5B token）')
     push_ok &= git_push('m0: S1 主面板完成一轮（results_b_s1 为本地实验产物，不入库；量值以 summary.json 现算为准）')
