@@ -682,7 +682,7 @@ def _pool_parts_host(block_ids, B, ov, n, counts_l):
             np.subtract(end_prev, int(ov), out=ov_start)
             np.maximum(ov_start, starts_prev, out=ov_start)
             np.subtract(end_prev, ov_start, out=flat[7 * B:8 * B])
-            np.maximum(flat[7 * B:8 * B], 0, out=flat[7 * B:8 * B])  # block 0 无 overlap：几何表自身保持非负（此前为 -1，靠下游 mask 兜底）
+            np.maximum(flat[7 * B:8 * B], 0, out=flat[7 * B:8 * B])  # block 0 无 overlap：几何表自身保持非负
         if pad:
             flat[total:] = 0
         buf = _h2d_async(flat, torch.long, block_ids.device)
@@ -825,7 +825,7 @@ def _pool_parts(block_ids, B, ov, n):
             end_prev = F.pad(ends[:-1], (1, 0), value=-1)
             starts_prev = F.pad(starts[:-1], (1, 0), value=0)
             ov_start = torch.clamp(end_prev - ov, min=starts_prev)
-            ov_len = (end_prev - ov_start).clamp_min(0)  # block 0 无 overlap：几何表自身保持非负（此前为 -1，靠下游 mask 兜底）
+            ov_len = (end_prev - ov_start).clamp_min(0)  # block 0 无 overlap：几何表自身保持非负
             parts = (counts, ends, starts, last_idx, end_prev, starts_prev, ov_start, ov_len)
     if len(cache) < 8:
         cache[key] = parts

@@ -547,7 +547,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     valid = torch.empty((R, T, k_out), device=dev, dtype=torch.bool)
     soft = torch.empty((R, T, k_out), device=dev, dtype=torch.float32)
     # 逐行独立的 (r,t) 归约（mask/lse/sort/topk）：按 t 分块与整幅计算的
-    # 每行值逐位一致（同 kernel、同归约顺序），峰值显存按块封顶。
+    # 每行值逐位一致（同 kernel、同归约顺序），中间张量按 t 块封顶。
     t_chunk = max(1, min(T, (256 << 20) // max(R * Bm * 32, 1)))
     for t0 in range(0, T, t_chunk):
         t1 = min(t0 + t_chunk, T)
@@ -2001,8 +2001,7 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
     go = rp(R, T, nh, d_head)
     leaves_a = [q0, kb0, vb0, ksw0, vsw0, soft0]
     # 用非 1 的 scale（d_head**-0.5 惯例）对照——dq 反向必须与 dk 一样乘
-    # scale，历史上 _attn_bwd_ref / attn_bwd_dq 里 dq 曾漏乘而被全 1.0 调用
-    # 掩盖；此处固化非 1 scale 的对照以防回归。
+    # scale；此处使用非 1 scale 的对照。
     asc = float(d_head) ** -0.5
     for tag, mode in (('eager', None), (impl, impl)):
         L_ = [t.detach().clone().requires_grad_(True) for t in leaves_a]
