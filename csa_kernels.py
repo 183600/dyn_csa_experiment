@@ -1415,10 +1415,7 @@ def _attach_attn_kernels(ns):
             tt = lane // NB
             jj = lane % NB
             if HAS_VALID:
-                # Match attn_fwd / attn_bwd_stats: validity AND causality. The
-                # indexer's valid already implies t > last_tok today, but a
-                # future caller passing a causal-free sel_valid would silently
-                # desync forward mask from backward gradient without this.
+                # Match attn_fwd / attn_bwd_stats: validity AND causality.
                 ok = (tl.load(valid_ptr + (r * T + tt) * NB + jj) != 0) & (tt > tl.load(lt_ptr + r * Bm + b).to(tl.int64))
             else:
                 ok = tt > tl.load(lt_ptr + r * Bm + b).to(tl.int64)
@@ -1801,13 +1798,12 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
     if verbose:
         print(f'[selfcheck:{impl}:{str(dtype)}] pool  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith('pool.')))
     # Multi-chunk regression: shrinking _POOL_CHUNK_BYTES exercises the b0>0
-    # rebasing in the chunked backward; the default 64MiB budget keeps this
-    # tiny case single-chunk, which used to hide a global-vs-chunk-local lane
-    # index mismatch.
+    # rebasing in the chunked backward (the default chunk size would keep this
+    # tiny case single-chunk).
     _saved_chunk = _POOL_CHUNK_BYTES
     try:
-        # two blocks per chunk: one block per chunk would give every lane a
-        # chunk-local index of 0 and could not expose a missing b0 rebase.
+        # two blocks per chunk: lane indices must be rebased into chunk
+        # coordinates at b0 > 0, so a second block keeps the test discerning.
         globals()['_POOL_CHUNK_BYTES'] = 3 * (int(geom.max_len) + int(geom.W_b)) * 32 * 4 * 2
         L2_ = [t.detach().clone().requires_grad_(True) for t in leaves]
         bid2 = torch.stack([_host_bid(c) for c in counts_rows], 0).to(device).to(torch.int32).contiguous()

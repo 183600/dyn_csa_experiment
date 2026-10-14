@@ -551,10 +551,7 @@ def first_occurrence_mask(idx):
     # duplicate iff an equal element sits at an earlier column; the stable
     # argsort form keeps, inside each run of equal sorted values, the element
     # that stability places first — which is the earliest original column.
-    # The triu form materializes an [n, k, k] bool matrix (k=256, n=512 ->
-    # 32MB transient on every sparse row/layer/step), so it is only worth it
-    # for small k; at larger k the O(n k log k) argsort form wins on both
-    # memory and time.  Identical output on either branch.
+    # Identical output on either branch.
     if idx.shape[1] <= 64:
         dup = (idx[:, :, None] == idx[:, None, :]).triu_(1).any(dim=1)
         return ~dup
@@ -1138,11 +1135,6 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             logits.masked_fill_(nvalid, _MINL)
             attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
             if not _has_sink:
-                # in-place is safe here and saves one [q,h,M] transient per
-                # chunk: `attn` is the fresh sink-softmax output (the softmax
-                # / nan_to_num backward saves sit on other tensors), so mul_
-                # touches no autograd-saved value — identical pointwise
-                # values to the out-of-place multiply.
                 attn.mul_(anyrow[:, None, None])
             out[s:e] = _einsum('qhm,qmhd->qhd', attn, Vset)
             continue
@@ -1152,8 +1144,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # cat is skipped: a cat's slices hold exactly the copied values of
         # the two gather outputs, so kb/kw — the operands the two logits
         # einsums save for backward — are bit-identical to the
-        # cat-then-slice form (index re-plumbing only, design notes §6.1),
-        # minus one [q, M, nh, hd] cat (+ its transient) per chunk.
+        # cat-then-slice form (index re-plumbing only, design notes §6.1).
         kb = _tk2(k_blk, _sel_rows)
         kw = _tk2(k_sw, _win_rows)
         soft_g = soft[s:e]
@@ -1166,30 +1157,14 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         win_logits = _einsum('qhd,qmhd->qhm', qseg, kw)
         win_logits.mul_(scale)
         logits = torch.cat([blk_logits, win_logits], -1)
-        # soft_logits holds the same values as the old second cat: the clone
-        # carries the cat buffer's copies verbatim, and the selected half is
-        # adjusted in place (elementwise add + clamp on the same values —
-        # identical results to the out-of-place add-then-cat form, with the
-        # same identity gradient routing through clone/cat instead of cat).
-        # The window half is copied once instead of twice and the [q, h, nb]
-        # add temp is gone: one [q, h, M] copy + one [q, h, nb] temp less per
-        # chunk.  The clone is taken before logits.masked_fill_ below runs, so
-        # it sees the same pre-fill values the old form read from blk_logits /
-        # win_logits.
         soft_logits = logits.clone()
         soft_logits[:, :, :_nb].add_(soft_log_g[:, None, :]).clamp_min_(_MINL)
         soft_logits.masked_fill_(nvalid, _MINL)
         soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
         logits.masked_fill_(nvalid, _MINL)
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
-        # in-place add into the fresh sub output (the sub node saves nothing
-        # for backward): the elementwise sum of the same operands is identical
-        # to the old `attn + diff` form, one [q,h,M] temp less per chunk.
         attn = (soft_attn - soft_attn.detach()).add_(attn)
         if not _has_sink:
-            # in-place is safe here and saves one [q,h,M] transient per chunk:
-            # `attn` is the fresh straight-through sum (the sub/add_ nodes save
-            # no tensors for backward), so mul_ touches no autograd-saved value.
             attn.mul_(anyrow[:, None, None])
         out[s:e] = _einsum('qhm,qmhd->qhd', attn, Vset)
     return out
@@ -1243,8 +1218,7 @@ class HybridAttention(nn.Module):
         # the cat inside the autograd graph exactly as before.  Under eval the
         # concat values are pure functions of the source weights, so keying on
         # their autograd `_version` counters (bumped by every in-place
-        # optimizer update) makes a stale hit impossible; a hit skips one cat
-        # kernel + one weight-sized transient allocation per layer per forward.
+        # optimizer update) makes a stale hit impossible.
         self._wcat_cache = {}
         if cfg.kind in ('csa', 'hca') and cfg.chunking == 'cosine_learnable' and (cfg.fuse_mode == 'learned'):
             self.fuse_conv = nn.Conv1d(d_model, d_model, cfg.fuse_kernel, groups=d_model, bias=False)
@@ -1319,9 +1293,6 @@ class HybridAttention(nn.Module):
             if torch.is_grad_enabled():
                 _wqkv = torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0)
             else:
-                # device in the key: a cached concatenation from before a
-                # model .to(device) move would otherwise be fed to F.linear
-                # alongside activations on the new device and crash.
                 _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version, self.W_q.weight.device)
                 _hit = self._wcat_cache.get('qkv')
                 if _hit is None or _hit[0] != _key:
@@ -1506,10 +1477,6 @@ class HybridAttention(nn.Module):
         # rowwise batched cumsum — same per-row values as the unbind/stack loop
         # but one scan kernel instead of B launches plus a stack copy
         prefix_mean = torch.cumsum(sim, dim=-1)
-        # in-place pointwise chain on fresh intermediates (same kernels, same
-        # values as the out-of-place form; each in-place op touches only the
-        # tensor its own op just produced, so no autograd-saved value is
-        # mutated — div_/sub+div_/sigmoid_ record the identical backward).
         prefix_mean.div_(_range_cache(1, sim.shape[-1] + 1, x.device))
         tau = prefix_mean + self.delta_logit
         gate = torch.sigmoid_((tau - sim).div_(max(cfg.temperature, 0.001)))
@@ -1837,9 +1804,7 @@ class SmallGPT(nn.Module):
     def ce_loss(self, ids, targets, vocab, chunk=64):
         # LM-head cross-entropy computed in time chunks: the chunk sums add to
         # the same total as the full-batch form (up to fp reduction order), so
-        # the scalar and its gradients are unchanged, while the peak logits
-        # transient is ~1/chunk of the full [B, T, vocab] tensor — the dominant
-        # memory term of a training step.
+        # the scalar and its gradients are unchanged.
         h = self.trunk(ids)
         n_tok = targets.numel()
         ce = None
@@ -2064,10 +2029,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
 
     def stream_tokenise(split, cap_tokens, label, _ds=ds, _tok=tok, _eos=eos_id):
         # Ids accumulate in bounded numpy chunks instead of one Python list of
-        # ints (~36 B/token incl. object overhead): peak host memory of a
-        # 100M+ token build drops ~4x, and the int64 values produced are
-        # unchanged.  Rows go through the tokenizer's batch encoder — the
-        # same Rust pipeline per row as `encode`, so the ids (and the chunk
+        # ints; the int64 values produced are unchanged.  Rows go through the
         # boundary / cap-truncation behaviour) are identical to the
         # per-`encode` form.
         chunks = []
@@ -2876,14 +2838,9 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
         _async = _vhost.is_pinned()
         for i in range(0, val_batch.shape[0], chunk):
             ids = _vhost[i:i + chunk].to(device, non_blocking=_async)
-            # Trunk + per-slice LM head instead of a single full-width head:
-            # the [chunk, T, vocab] logits block is never materialized, so the
-            # eval transient stays ~1/64 of it and scales with the 64-token
-            # slice width, not with T * V (same chunked-head pattern as
-            # SmallGPT.ce_loss, whose design note already records that the
-            # chunk sums match the full-batch form up to fp reduction order).
-            # comp_reg / need_reg handling is identical to model(ids) because
-            # forward() itself is exactly trunk() followed by head().
+            # Trunk + per-slice LM head; comp_reg / need_reg handling is
+            # identical to model(ids) because forward() itself is exactly
+            # trunk() followed by head().
             h = model.trunk(ids)
             _span = max(0, ids.shape[1] - 1)
             if _span == 0:
@@ -2912,11 +2869,6 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
                 del _rows, _tgts
             else:
                 _tgts = ids[:, 1:]
-                # slice the head GEMM and the CE over the same time-axis
-                # windows the previous form used for the CE alone, so the
-                # accumulation sequence (and hence the fp64 running total) is
-                # unchanged while the logits transient stays ~1/64 of the full
-                # [chunk, T, vocab] block at a time
                 for _s0 in range(0, _span, 64):
                     _sl = slice(_s0, min(_s0 + 64, _span))
                     _lg = model.head(h[:, _sl, :])
@@ -3389,11 +3341,8 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
             ps, rs, fs, rps = ([], [], [], [])
             _cuts = attn._cuts
             _prov = {}
-            # Stage all tensor cuts through ONE concatenated D2H copy instead
-            # of up to 64 separate blocking .cpu() round-trips: the integers
-            # transferred are exactly the per-sequence values (index
-            # transport, design notes §6.1), only segmented on the host
-            # afterwards.
+            # The integers transferred are exactly the per-sequence values
+            # (index transport, design notes §6.1), segmented on the host.
             _tcut_ix = [si for si in range(n_seq_ref) if torch.is_tensor(_cuts[si])]
             _tcut_host = {}
             if _tcut_ix:

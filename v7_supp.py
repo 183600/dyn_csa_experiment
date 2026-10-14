@@ -353,9 +353,6 @@ class HybridAttentionRoPE(L.HybridAttention):
                 logits = raw_logits.masked_fill_(_nvalid, _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
                 if sink is None:
-                    # in-place on the fresh sink-softmax output — same safety
-                    # argument as exp_lib.gathered_attention's non-soft branch
-                    # (identical pointwise values, one fewer [q,h,M] transient).
                     attn.mul_(_anyrow[:, None, None])
             if soft is not None:
                 sv = soft[s:e]
@@ -363,34 +360,16 @@ class HybridAttentionRoPE(L.HybridAttention):
                     sv = sv * _keep
                 soft_log = torch.log(sv.clamp_min(1e-12))
                 soft_log.masked_fill_(sv <= 0, _MINL)
-                # Clone BEFORE the mask fill below: the clone carries the
-                # unmasked logits the old form read out of raw_logits, and the
-                # selected half is adjusted in place (elementwise add + clamp
-                # on the same values — identical results to the old
-                # add-then-cat form, with the same identity gradient routing
-                # through clone instead of cat).  The old form spent a full
-                # [q,h,M] masked_fill copy plus a [q,h,nb] add temp plus
-                # another full [q,h,M] cat; this spends one [q,h,M] clone.
+                # The clone is taken before the masked_fill_ below, so it
+                # carries the unmasked logits.
                 soft_logits = raw_logits.clone()
                 soft_logits[:, :, :_nb].add_(soft_log[:, None, :]).clamp_min_(_MINL)
-                # in-place on the fresh einsum output (nothing downstream needs
-                # the pre-fill values — the clone above holds them): identical
-                # masked values to the out-of-place masked_fill form.
                 logits = raw_logits.masked_fill_(_nvalid, _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
-                # in-place on the fresh clone output (nothing downstream needs
-                # the pre-fill values): identical masked values, one fewer
-                # [q,h,M] transient per chunk.
                 soft_logits.masked_fill_(_nvalid, L._finfo_min(soft_logits.dtype))
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
-                # in-place add into the fresh sub output (the sub node saves
-                # nothing for backward): identical elementwise sum to the old
-                # `attn + diff` form, one [q,h,M] temp less per chunk.
                 attn = (soft_attn - soft_attn.detach()).add_(attn)
                 if sink is None:
-                    # in-place on the fresh straight-through sum (same safety
-                    # argument as exp_lib.gathered_attention); saves one
-                    # [q,h,M] transient per chunk.
                     attn.mul_(_anyrow[:, None, None])
             out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
         return out
