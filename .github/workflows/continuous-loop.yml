@@ -167,8 +167,8 @@ jobs:
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
 
           # ================= 四阶段提示词 =================
-          PROMPT_PERF='优化代码的性能和显存占用，不要输出或写入"优化了哪些内容"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_BUG='仔细检查代码中是否存在bug或者科研方法层面的问题，如果有就修改代码。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          PROMPT_PERF='优化代码的性能和显存占用，不要输出或写入"优化了哪些内容"的报告。注意以后可能会scale。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          PROMPT_BUG='仔细检查代码中是否存在bug或者科研方法层面的问题，如果有就修改代码。注意以后可能会scale。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_CLEAN='不要修改 docs/compute_plan.md 与 docs/design_notes.md（前者是算力规划文档，允许包含预算与算力估算数字，二者都不属于“多余的内容”）；确保远程仓库里没有实验结果文件、REPORTxx.md、autodl_budgetxx.json 以及算力申请.md（该文件已废弃并被 docs/compute_plan.md 取代，若再次出现请删除）；确保 docs 目录只保留 design_notes.md 与 compute_plan.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释），但 docs/compute_plan.md 与 docs/design_notes.md 中的规划与设计记录除外。删除所有多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样必须原样保留，绝对不能删除或移动，也不属于“多余的内容”。'
           PROMPT_APPLY='确保 docs/compute_plan.md 存在且没有被误删或清空；若发现算力申请.md 再次出现则删除它（已被 docs/compute_plan.md 取代）。不要修改 docs/compute_plan.md 与 docs/design_notes.md 的内容。不要删除或移动 README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README）；.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
 
