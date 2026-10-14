@@ -558,7 +558,7 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
         Xbs = _take_rows(Xb, order)
         Zas = _take_rows(Za, order)
         Zbs = _take_rows(Zb, order)
-    return _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, Fd, dev, B, order)
+    return _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, Fd, dev, B, order, order_is_identity=_ident)
 
 _POOL_PARTS_HOST = True
 _POOL_PARTS_BUCKET = 256
@@ -679,7 +679,7 @@ def _pool_geom_put(block_ids, key, geom):
         cache[key] = geom
     return geom
 
-def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, Fd, dev, B, order):
+def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, Fd, dev, B, order, order_is_identity=False):
     counts, ends, starts, last_idx, end_prev, starts_prev, ov_start, ov_len = _pool_parts(block_ids, B, overlap, n)
     ov = overlap
     _cpu = getattr(block_ids, '_pool_cpu', None)
@@ -744,7 +744,10 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     sc_a = sc[:, :max_len]
     sc_b = sc[:, max_len:]
     comp = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
-    return (comp, order[last_idx], B)
+    # Identity-order fast path: when `order` is the cached arange, the gather
+    # order[last_idx] returns exactly last_idx (arange[i] == i, exact integers
+    # — index transport, design notes §6.1), so the gather kernel is skipped.
+    return (comp, last_idx if order_is_identity else order[last_idx], B)
 
 def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     n = X.shape[0]
@@ -794,7 +797,9 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     WinZ.masked_fill_(~mask[:, :, None], float('-inf'))
     sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
     comp = (sc * Xb).sum(1)
-    return (comp, order[last_idx], B)
+    # same identity-order fast path as _pool_ordered: order[last_idx] over the
+    # cached arange returns exactly last_idx (index transport, §6.1).
+    return (comp, last_idx if _ident else order[last_idx], B)
 
 def _rank_blocks(masked, B, ties):
     # The sort indices are consumed by the int64 gathers below and narrowed
@@ -1440,9 +1445,13 @@ class HybridAttention(nn.Module):
         # rowwise batched cumsum — same per-row values as the unbind/stack loop
         # but one scan kernel instead of B launches plus a stack copy
         prefix_mean = torch.cumsum(sim, dim=-1)
-        prefix_mean = prefix_mean / _range_cache(1, sim.shape[-1] + 1, x.device)
+        # in-place pointwise chain on fresh intermediates (same kernels, same
+        # values as the out-of-place form; each in-place op touches only the
+        # tensor its own op just produced, so no autograd-saved value is
+        # mutated — div_/sub+div_/sigmoid_ record the identical backward).
+        prefix_mean.div_(_range_cache(1, sim.shape[-1] + 1, x.device))
         tau = prefix_mean + self.delta_logit
-        gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
+        gate = torch.sigmoid_((tau - sim).div_(max(cfg.temperature, 0.001)))
         gate_b = gate.detach() > _HALF
         return ([(gate[b], gate_b[b]) for b in range(B)], gate_b)
 
@@ -1985,19 +1994,44 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     eos_id = tok.token_to_id('<eos>')
 
     def stream_tokenise(split, cap_tokens, label, _ds=ds, _tok=tok, _eos=eos_id):
-        out = []
-        chunk = 10000
-        for start in range(0, len(_ds[split]), chunk):
-            rows = _ds[split][start:start + chunk]['text']
-            for r in rows:
-                if r.strip():
-                    out.extend(_tok.encode(r).ids)
-                    out.append(_eos)
-            if len(out) >= cap_tokens:
+        # Ids accumulate in bounded numpy chunks instead of one Python list of
+        # ints (~36 B/token incl. object overhead): peak host memory of a
+        # 100M+ token build drops ~4x, and the int64 values produced are
+        # unchanged.  Rows go through the tokenizer's batch encoder — the
+        # same Rust pipeline per row as `encode`, so the ids (and the chunk
+        # boundary / cap-truncation behaviour) are identical to the
+        # per-`encode` form.
+        chunks = []
+        cur = []
+        n_have = 0
+
+        def _flush():
+            if cur:
+                chunks.append(np.array(cur, dtype=np.int64))
+                cur.clear()
+
+        row_chunk = 10000
+        for start in range(0, len(_ds[split]), row_chunk):
+            rows = _ds[split][start:start + row_chunk]['text']
+            rows = [r for r in rows if r.strip()]
+            for enc in _tok.encode_batch(rows):
+                cur.extend(enc.ids)
+                cur.append(_eos)
+            if len(cur) >= (1 << 22):
+                _flush()
+            n_have = sum(c.size for c in chunks) + len(cur)
+            if n_have >= cap_tokens:
                 break
             if start and start % 50000 == 0:
-                print(f'    [{label}] {start} rows, {len(out)} tokens')
-        return np.array(out[:cap_tokens], dtype=np.int64)
+                print(f'    [{label}] {start} rows, {n_have} tokens')
+        _flush()
+        if not chunks:
+            return np.empty(0, dtype=np.int64)
+        # a single chunk is handed out directly (a copy of the same values);
+        # the concatenation and the [:cap_tokens] truncation are the same
+        # integers the single-list form produced.
+        ids = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+        return ids[:cap_tokens]
     print(f'[data] tokenising train (cap {n_train_tokens} tokens) ...')
     train_ids = stream_tokenise('train', n_train_tokens + seq_len, 'train')
     print(f'[data] train tokens = {len(train_ids)}  vocab = {vocab}')
@@ -2172,28 +2206,35 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     n_val_total = 0
     _marks = 0
 
-    def _encode_into(doc, buf):
-        buf.extend(tok.encode(doc).ids)
-        buf.append(eos_id)
-
     try:
         buf = []
         print(f'[data] tokenising fineweb train (cap {n_train_tokens} tokens, source {source}) ...')
         with open(raw_train, 'wb') as fh:
-            for doc in rows:
-                _encode_into(doc, buf)
-                if len(buf) >= (1 << 22):
-                    chunk = np.array(buf, dtype=disk_dt)
-                    if disk_dt is np.uint16 and int(chunk.max()) > 65535:
-                        raise ValueError(f'token id {int(chunk.max())} exceeds the uint16 cache range (vocab={vocab}) — widen _fineweb_disk_dtype before rebuilding')
-                    chunk.tofile(fh)
-                    n_train_total += len(buf)
-                    buf = []
-                    if (n_train_total >> 26) > _marks:
-                        _marks = n_train_total >> 26
-                        print(f'    [train] {n_train_total} tokens')
-                if n_train_total + len(buf) >= cap_train:
+            stop = False
+            while not stop:
+                docs = list(itertools.islice(rows, 4096))
+                if not docs:
                     break
+                # batched encode — the same Rust pipeline per doc as `encode`,
+                # so the ids (and hence the raw staging bytes / content
+                # fingerprint) are identical to the per-`encode` form; the
+                # per-doc flush / cap checks below run in the original order.
+                for enc in tok.encode_batch(docs):
+                    buf.extend(enc.ids)
+                    buf.append(eos_id)
+                    if len(buf) >= (1 << 22):
+                        chunk = np.array(buf, dtype=disk_dt)
+                        if disk_dt is np.uint16 and int(chunk.max()) > 65535:
+                            raise ValueError(f'token id {int(chunk.max())} exceeds the uint16 cache range (vocab={vocab}) — widen _fineweb_disk_dtype before rebuilding')
+                        chunk.tofile(fh)
+                        n_train_total += len(buf)
+                        buf = []
+                        if (n_train_total >> 26) > _marks:
+                            _marks = n_train_total >> 26
+                            print(f'    [train] {n_train_total} tokens')
+                    if n_train_total + len(buf) >= cap_train:
+                        stop = True
+                        break
             if buf:
                 chunk = np.array(buf, dtype=disk_dt)
                 if disk_dt is np.uint16 and int(chunk.max()) > 65535:
@@ -2205,14 +2246,21 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         print(f'[data] train tokens = {n_train}  vocab = {vocab}')
         print('[data] tokenising fineweb validation holdout ...')
         with open(raw_val, 'wb') as fh:
-            for doc in rows:
-                _encode_into(doc, buf)
-                if len(buf) >= (1 << 22):
-                    np.array(buf, dtype=disk_dt).tofile(fh)
-                    n_val_total += len(buf)
-                    buf = []
-                if n_val_total + len(buf) >= cap_val:
+            stop = False
+            while not stop:
+                docs = list(itertools.islice(rows, 4096))
+                if not docs:
                     break
+                for enc in tok.encode_batch(docs):
+                    buf.extend(enc.ids)
+                    buf.append(eos_id)
+                    if len(buf) >= (1 << 22):
+                        np.array(buf, dtype=disk_dt).tofile(fh)
+                        n_val_total += len(buf)
+                        buf = []
+                    if n_val_total + len(buf) >= cap_val:
+                        stop = True
+                        break
             if buf:
                 np.array(buf, dtype=disk_dt).tofile(fh)
                 n_val_total += len(buf)

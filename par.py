@@ -15,6 +15,7 @@ experiment-library resume logic. This module manages dispatch, process
 lifecycle, logs, and child result files.
 """
 
+import collections
 import importlib
 import json
 import os
@@ -257,7 +258,10 @@ def _dump_log_tail(entry, n=40):
         with open(
             entry["log_path"], encoding="utf-8", errors="replace"
         ) as stream:
-            tail = stream.readlines()[-n:]
+            # deque(maxlen) keeps only the last n lines resident: the same
+            # tail lines as readlines()[-n:] without holding the whole
+            # (possibly multi-GB) child log in memory on a failure path.
+            tail = collections.deque(stream, maxlen=n)
         print(f"[par] ---- {entry['log_path']} ----", flush=True)
         sys.stdout.writelines("  " + line for line in tail)
         print("[par] ------------------------------", flush=True)
