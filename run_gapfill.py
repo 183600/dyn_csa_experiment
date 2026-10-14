@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json, math, os, shutil, statistics, subprocess, sys, traceback
+import copy
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -194,6 +195,22 @@ def synthesize_long_summary():
     for _v in _split:
         print(f'[synth] REFUSING to synthesize `{_v}`: this aggregate key is a run_cfg-split group, so it cannot be mapped back to one canonical per-seed record — re-run the panel to get per-seed records; only this key is skipped')
     _unaligned = {v for v, _n, _r in _unaligned} | set(_split) | set(_cfg_refused)
+    # One indexed pass over summary replaces the per-value O(len(summary))
+    # scan for a covering real record: group the real (non-synthesized,
+    # usable, full-steps) records by (variant, protocol, seed) once, then each
+    # reconstructed value only walks its own tiny bucket with the identical
+    # match conditions as before.
+    _twin_idx = {}
+    for _k, _r in summary.items():
+        if not isinstance(_r, dict) or _r.get('synthesized'):
+            continue
+        if _r.get('steps') != _LONG_STEPS or not L.ppl_is_usable(_r.get('ppl')):
+            continue
+        _tw_seed = _num_or_none(_r.get('seed'))
+        if _tw_seed is None:
+            continue
+        _twkey = (_r.get('variant'), str(_r.get('protocol') or ''), _tw_seed)
+        _twin_idx.setdefault(_twkey, []).append((_k, float(_r['ppl'])))
     for v, e in agg.items():
         if v in _unaligned:
             continue
@@ -219,7 +236,12 @@ def synthesize_long_summary():
                 n_kept += 1
                 print(f"[synth] keeping real record `{key}` (steps={old.get('steps')}); the aggregate's reconstructed value is NOT written over it")
                 continue
-            _twin = next((_k for _k, _r in summary.items() if _k != key and isinstance(_r, dict) and _r.get('variant') == real_v and str(_r.get('protocol') or '') == str(_proto or '') and (_num_or_none(_r.get('seed')) == _seed) and (not _r.get('synthesized')) and (_r.get('steps') == _LONG_STEPS) and L.ppl_is_usable(_r.get('ppl')) and (abs(float(_r['ppl']) - float(p)) <= 1e-06 * max(1.0, abs(float(p))))), None)
+            _twin = None
+            _pf = float(p)
+            for _k, _tp in _twin_idx.get((real_v, str(_proto or ''), _seed), ()):
+                if _k != key and abs(_tp - _pf) <= 1e-06 * max(1.0, abs(_pf)):
+                    _twin = _k
+                    break
             if _twin is not None:
                 n_kept += 1
                 print(f'[synth] real record `{_twin}` already covers `({real_v}, seed {_seed})` under a different key — the reconstructed value is not duplicated next to it')
@@ -246,7 +268,7 @@ def merge_long_aggregate(adir, snapshot_agg):
     except Exception as _e:
         print(f'[v6-merge] WARNING: cannot read the freshly written {agg_path} ({type(_e).__name__}: {_e}) — the snapshot is left unmerged; re-run `_finish_panel` on the panel to rebuild it')
         return
-    merged = json.loads(json.dumps(snapshot_agg))
+    merged = copy.deepcopy(snapshot_agg)
 
     def _seed_map(entry, tag=''):
         out = {}

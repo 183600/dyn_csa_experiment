@@ -286,7 +286,9 @@ def main(argv=None):
                 raise ValueError(f'fuse_analysis: `{a}` and `{b}` are not on the same layer list ({Ma_layers} vs {Mb_layers}); the per-layer deltas would be a misaligned subtraction.')
             _both = np.isfinite(Ma) & np.isfinite(Mb) & _keep[:, None]
             Ma, Mb = (np.where(_both, Ma, np.nan), np.where(_both, Mb, np.nan))
-            db = _lay_nanmean(Ma) - _lay_nanmean(Mb)
+            _lma = _lay_nanmean(Ma)
+            _lmb = _lay_nanmean(Mb)
+            db = _lma - _lmb
             _sb = _row_nanmean(Mb)
             _sa = _row_nanmean(Ma)
             sd_b = sample_std(_sb) if Mb.shape[0] > 1 else 0.0
@@ -297,7 +299,7 @@ def main(argv=None):
                 print(f'[fuse_analysis] NOTE: metric {key!r} has no finite per-seed value in at least one arm — the {name} row is omitted from the table rather than printed as nan')
                 continue
             lines.append(f'| — | **{name}** | {mean_b:.4f}±{sd_b:.4f} | {mean_a:.4f}±{sd_a:.4f} | **{mean_a - mean_b:+.4f}** |')
-            pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=np.round(_lay_nanmean(Mb), 4).tolist(), fuse_perlayer_mean=np.round(_lay_nanmean(Ma), 4).tolist(), delta_perlayer=np.round(db, 4).tolist(), nofuse_seed_std=float(sd_b), fuse_seed_std=float(sd_a))
+            pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=np.round(_lmb, 4).tolist(), fuse_perlayer_mean=np.round(_lma, 4).tolist(), delta_perlayer=np.round(db, 4).tolist(), nofuse_seed_std=float(sd_b), fuse_seed_std=float(sd_a))
         if _ok_seeds and not _gate_ok:
             lines.append(f'\n> 注：上表的均值与 Δ 与下方检验同口径——只在通过配置/训练量配对门禁的 {_ok_seeds} 上计算，{len(SEEDS) - len(_ok_seeds)} 个未过门禁的 seed（{_why}）不进入任何数字。')
         _, fb = per_seed_layer(b, 'bnd_f1', tuple(SEEDS))

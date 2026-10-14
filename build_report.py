@@ -708,7 +708,13 @@ def sec_p1t():
     # (csa_fix_m1 / csa_fixed both run with index_topk=32).
     _s1t = summary('results_lm_v7_seq2k') or {}
 
+    _nblocks_cache = {}
+
     def _nblocks_measured(base_variant):
+        # memoized: the summary table is not mutated inside sec_p1t, and this
+        # function is a pure, expensive full-table scan per variant.
+        if base_variant in _nblocks_cache:
+            return _nblocks_cache[base_variant]
         _vals = []
         for _rid, _r in _s1t.items():
             if not isinstance(_r, dict) or _r.get('variant') != base_variant:
@@ -718,7 +724,9 @@ def sec_p1t():
             for _e in (_r.get('stats') or {}).values():
                 if isinstance(_e, dict) and isinstance(_e.get('blocks'), (int, float)) and _e['blocks'] > 0:
                     _vals.append(float(_e['blocks']))
-        return (sum(_vals) / len(_vals)) if _vals else None
+        _out = (sum(_vals) / len(_vals)) if _vals else None
+        _nblocks_cache[base_variant] = _out
+        return _out
 
     def _sr(topk, base_variant, note=''):
         _nb = _nblocks_measured(base_variant)

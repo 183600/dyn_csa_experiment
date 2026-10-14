@@ -546,10 +546,24 @@ def _block_order(block_ids, n):
         return (_arange_cache(block_ids.numel(), block_ids.device), True)
     return (torch.argsort(block_ids, stable=True), False)
 
+def _n_blocks_cached(block_ids):
+    # block_ids is treated as immutable by the pooling caches (_pool_gpu /
+    # _pool_geom), so its max+1 is a constant of the object; caching it avoids
+    # a max().item() GPU->CPU sync on every pooled layer/step.  First call per
+    # object still syncs and computes the identical value.
+    B = getattr(block_ids, '_pool_nblocks', None)
+    if B is None:
+        B = int(block_ids.max().item()) + 1
+        try:
+            block_ids._pool_nblocks = B
+        except (AttributeError, RuntimeError):
+            pass
+    return B
+
 def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n_blocks=None, monotonic=False):
     n, Fd = Xa.shape
     dev = Xa.device
-    B = int(n_blocks) if n_blocks is not None else int(block_ids.max().item()) + 1
+    B = int(n_blocks) if n_blocks is not None else _n_blocks_cached(block_ids)
     order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
     if _ident:
         Xas, Xbs, Zas, Zbs = (Xa, Xb, Za, Zb)
@@ -752,7 +766,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
 def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     n = X.shape[0]
     dev = X.device
-    B = int(n_blocks) if n_blocks is not None else int(block_ids.max().item()) + 1
+    B = int(n_blocks) if n_blocks is not None else _n_blocks_cached(block_ids)
     order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
     if _ident:
         Xs, Zs = (X, Z)
