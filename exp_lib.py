@@ -1157,18 +1157,30 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         win_logits = _einsum('qhd,qmhd->qhm', qseg, kw)
         win_logits.mul_(scale)
         logits = torch.cat([blk_logits, win_logits], -1)
-        # logits[:, :, :_nb] is the cat buffer's copy of blk_logits — the same
-        # values, so the add reads blk_logits directly.
-        soft_logits = torch.cat([(blk_logits + soft_log_g[:, None, :]).clamp_min_(_MINL), win_logits], -1)
+        # soft_logits holds the same values as the old second cat: the clone
+        # carries the cat buffer's copies verbatim, and the selected half is
+        # adjusted in place (elementwise add + clamp on the same values —
+        # identical results to the out-of-place add-then-cat form, with the
+        # same identity gradient routing through clone/cat instead of cat).
+        # The window half is copied once instead of twice and the [q, h, nb]
+        # add temp is gone: one [q, h, M] copy + one [q, h, nb] temp less per
+        # chunk.  The clone is taken before logits.masked_fill_ below runs, so
+        # it sees the same pre-fill values the old form read from blk_logits /
+        # win_logits.
+        soft_logits = logits.clone()
+        soft_logits[:, :, :_nb].add_(soft_log_g[:, None, :]).clamp_min_(_MINL)
         soft_logits.masked_fill_(nvalid, _MINL)
         soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
         logits.masked_fill_(nvalid, _MINL)
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
-        attn = attn + (soft_attn - soft_attn.detach())
+        # in-place add into the fresh sub output (the sub node saves nothing
+        # for backward): the elementwise sum of the same operands is identical
+        # to the old `attn + diff` form, one [q,h,M] temp less per chunk.
+        attn = (soft_attn - soft_attn.detach()).add_(attn)
         if not _has_sink:
             # in-place is safe here and saves one [q,h,M] transient per chunk:
-            # `attn` is the fresh straight-through sum (the `+` node saves no
-            # tensors for backward), so mul_ touches no autograd-saved value.
+            # `attn` is the fresh straight-through sum (the sub/add_ nodes save
+            # no tensors for backward), so mul_ touches no autograd-saved value.
             attn.mul_(anyrow[:, None, None])
         out[s:e] = _einsum('qhm,qmhd->qhd', attn, Vset)
     return out
