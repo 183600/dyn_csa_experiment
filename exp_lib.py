@@ -20,11 +20,11 @@ for _pkg in ('datasets', 'tokenizers', 'matplotlib'):
     except ImportError:
         _NEEDED.append(_pkg)
 if _NEEDED:
-    print(f'[setup] installing missing package(s): {', '.join(_NEEDED)}')
+    print(f"[setup] installing missing package(s): {', '.join(_NEEDED)}")
     try:
         subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', *_NEEDED])
     except Exception as _pip_err:
-        print(f'[setup] could not install {', '.join(_NEEDED)} ({type(_pip_err).__name__}: {_pip_err}) — continuing; a code path that actually needs them will raise ImportError')
+        print(f"[setup] could not install {', '.join(_NEEDED)} ({type(_pip_err).__name__}: {_pip_err}) — continuing; a code path that actually needs them will raise ImportError")
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
 import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections
@@ -2463,7 +2463,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 n_val_total += len(buf)
                 buf = []
         n_val_tokens = min(n_val_total, cap_val)
-        n_val = n_val_tokens // seq_len
+        # 与 load_wikitext 同口径：块缓冲区含 +1 条序列的余量，钳到 val_seqs。
+        n_val = min(n_val_tokens // seq_len, int(val_seqs))
         print(f'[data] val sequences = {n_val} (seq_len={seq_len}, contiguous holdout after the train region)')
         if n_val == 0:
             raise RuntimeError('load_fineweb_edu: the corpus ran dry before a single validation sequence was filled — raise n_train_tokens or provide a larger source')
@@ -3995,6 +3996,8 @@ def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32
     ratio = 4 + (p_ref - p_full) / (2.0 * d * d * n_layers)
     if ratio == 4.0:
         ratio = math.nextafter(4.0, 0.0)
+    if ratio <= 1.0:
+        raise RuntimeError(f'[{variant}] param-matched mlp_ratio would be {ratio:.2f} (<= 1): the reference arm {ref_variant} already has fewer/equal params — param matching is impossible for this variant/config')
     print(f'[{variant}] matched mlp_ratio = {ratio:.2f} ({p_full / 1000000.0:.2f}M -> target {p_ref / 1000000.0:.2f}M params vs {ref_variant})')
     _MLP_RATIO_MEMO[_mkey] = ratio
     return ratio

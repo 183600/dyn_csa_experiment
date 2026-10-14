@@ -876,7 +876,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                     dsink[h] += acc.to(dtype)
             dz = dzA if dzS is None else dzA + dzS
             if dq is not None:
-                dq[:, t0:t1, h, :] += torch.einsum('rtm,rtmd->rtd', dz, Kl).to(dtype)
+                dq[:, t0:t1, h, :] += torch.einsum('rtm,rtmd->rtd', dz, Kl).mul(scale).to(dtype)
             if dsoft is not None and dzS is not None:
                 dl = dzS[:, :, :nb]
                 sf = soft[:, t0:t1, :].to(torch.float32)
@@ -1473,7 +1473,7 @@ def _attach_attn_kernels(ns):
             if HAS_SOFT:
                 eS = tl.exp(z - mS[:, None])
                 dz += eS / ZSs[:, None] * (g - GS[:, None])
-            dqacc += tl.dot(dz, kt, input_precision=DOT)
+            dqacc += tl.dot(dz, kt, input_precision=DOT) * SCALE
         for j in tl.static_range(NB):
             src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
             lt_j = tl.load(lt_ptr + r * Bm + src, mask=tm, other=0).to(tl.int64)
@@ -1495,7 +1495,7 @@ def _attach_attn_kernels(ns):
                 zS = tl.where(ok, zS, float('-inf'))
                 eS = tl.exp(zS - mS)
                 dz += eS / ZSs * (g - GS)
-            dqacc += dz[:, None] * kj
+            dqacc += dz[:, None] * kj * SCALE
         tl.store(dq_ptr + ((r * T + ti[:, None]) * NH + h) * HD + d[None, :], dqacc.to(dq_ptr.dtype.element_ty), mask=tm[:, None])
 
     ns.attn_bwd_dq = attn_bwd_dq
@@ -2000,16 +2000,20 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
     topk_idx = ker_i[0].detach().to(torch.int64)
     go = rp(R, T, nh, d_head)
     leaves_a = [q0, kb0, vb0, ksw0, vsw0, soft0]
+    # 用非 1 的 scale（d_head**-0.5 惯例）对照——dq 反向必须与 dk 一样乘
+    # scale，历史上 _attn_bwd_ref / attn_bwd_dq 里 dq 曾漏乘而被全 1.0 调用
+    # 掩盖；此处固化非 1 scale 的对照以防回归。
+    asc = float(d_head) ** -0.5
     for tag, mode in (('eager', None), (impl, impl)):
         L_ = [t.detach().clone().requires_grad_(True) for t in leaves_a]
         sk = sink0.detach().clone().requires_grad_(True) if mode is not None else sink0.detach().clone().requires_grad_(True)
         if mode is None:
             outs = []
             for r in range(R):
-                outs.append(L.gathered_attention(L_[0][r], L_[1][r], L_[2][r], topk_idx[r], last_tok[r].to(torch.int64), L_[3][r], L_[4][r], win, 1.0, soft=L_[5][r], sink_logits=sk, sel_valid=valid[r]))
+                outs.append(L.gathered_attention(L_[0][r], L_[1][r], L_[2][r], topk_idx[r], last_tok[r].to(torch.int64), L_[3][r], L_[4][r], win, asc, soft=L_[5][r], sink_logits=sk, sel_valid=valid[r]))
             out = torch.stack(outs, 0)
         else:
-            out = gathered_attention_kernel(L_[0], L_[1], L_[2], topk_idx.to(torch.int32), last_tok, L_[3], L_[4], win, 1.0, soft=L_[5], sink_logits=sk, sel_valid=valid, impl=mode)
+            out = gathered_attention_kernel(L_[0], L_[1], L_[2], topk_idx.to(torch.int32), last_tok, L_[3], L_[4], win, asc, soft=L_[5], sink_logits=sk, sel_valid=valid, impl=mode)
         (out * go).sum().backward()
         if mode is None:
             ref_a = [out] + [t.grad for t in L_] + [sk.grad]
