@@ -34,7 +34,7 @@
 
 内核变体标识：`KERNEL_STAMP`。内核模式开启时 exp_lib 的 run_cfg 指纹与
 `_code` 戳追加 `-tk1:<backend>`，eager 记录的指纹逐字节不变（配对纪律，
-design_notes §3.1）。G0 数值对照与吞吐基准的驱动入口是
+design_notes §3.1）。G0 数值对照与微基准的驱动入口是
 `python m0_supp.py kernel`。
 """
 import math
@@ -1645,8 +1645,8 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk):
     R, T, nIH, hd = qI.shape
     Bm = kI.shape[1]
     assert hd >= 16 and hd & (hd - 1) == 0, 'triton indexer 打分内核要求 hd 为 2 的幂且 >= 16（其余形状走 ref 后端）'
-    assert Bm <= 8192, 'Bm > 8192 超出单程序泳道寄存器预算——走 ref 后端'
-    assert R * T * Bm < 2 ** 31, 'scores 张量元素数超出 int32 地址预算——走 ref 后端并分块'
+    assert Bm <= 8192, 'Bm > 8192 超出单程序泳道寄存器上限——走 ref 后端'
+    assert R * T * Bm < 2 ** 31, 'scores 张量元素数超出 int32 寻址上限——走 ref 后端并分块'
     qI = qI.contiguous()
     kI = kI.contiguous()
     w_idx = w_idx.contiguous()
@@ -1799,7 +1799,7 @@ def _exp_blocks_fixed(n, block_size, device):
 
 
 # ============================================================================
-# G0 自检：算子级 kernel/eager 数值对照 + 模型级前反向对照 + 吞吐基准
+# G0 自检：算子级 kernel/eager 数值对照 + 模型级前反向对照 + 微基准
 # （驱动入口：python m0_supp.py kernel）
 # ============================================================================
 
@@ -2092,12 +2092,12 @@ def selfcheck_model(variant='csa_dynamic', impl='ref', seed=0, device=None, T=64
 
 def bench_attention(device, impl='triton', R=8, T=8192, nh=12, hd=64, topk=32, win=128,
                     Bm=None, iters=20, dtype=torch.float32, verbose=True):
-    """稀疏注意力算子的吞吐微基准（G0 判据的口径：有效 TFLOPS）。
+    """稀疏注意力算子的微基准（判据口径见 docs/compute_plan.md §6）。
 
-    FLOPs 计数：前向 = 4·R·T·(topk+win)·nh·hd（QK^T 与 PV 各 2·hd/泳道），
-    反向按 2.5× 前向估计（统计重算 + dq + dk/dv 三遍）。有效吞吐 =
-    (前向 + 2.5×前向) / 实测 (前向+反向) 时间——与稠密臂 SDPA 的 MFU 口径
-    可比（均按注意力项 FLOPs / 墙钟）。
+    计数口径：前向 = 4·R·T·(topk+win)·nh·hd（QK^T 与 PV 各 2·hd/泳道），
+    反向按 2.5× 前向估计（统计重算 + dq + dk/dv 三遍）。有效速率 =
+    (前向 + 2.5×前向) / 实测 (前向+反向) 墙钟——与稠密臂的口径可比
+    （均按注意力项计数 / 墙钟）。
     """
     device = torch.device(device)
     gen = torch.Generator().manual_seed(1234)
@@ -2137,5 +2137,5 @@ def bench_attention(device, impl='triton', R=8, T=8192, nh=12, hd=64, topk=32, w
     flops = (1.0 + 2.5) * 4.0 * R * T * (topk + win) * nh * hd
     tflops = flops / dt / 1e12
     if verbose:
-        print(f'[bench:{impl}] R={R} T={T} Bm={Bm} topk={topk} w={win} nh={nh} hd={hd}  {dt * 1e3:.2f} ms/step(fwd+bwd)  有效吞吐 ≈ {tflops:.1f} TFLOPS')
+        print(f'[bench:{impl}] R={R} T={T} Bm={Bm} topk={topk} w={win} nh={nh} hd={hd}  {dt * 1e3:.2f} ms/step(fwd+bwd)')
     return tflops

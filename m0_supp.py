@@ -6,7 +6,7 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
      sha256 内容指纹 + 原子写，纪律与 load_wikitext 一致；离线机器可用
      FWEDU_LOCAL_JSONL 指向本地 jsonl/txt 语料）；
   2. S1–S4 规模阶梯与 S1 主面板配置（SCALE_LADDER / RUN_S1，全部为
-     规划值，G0 出口的吞吐校准与 M1 配方冻结后滚动修正）。
+     规划值，按 docs/compute_plan.md 的口径滚动修正）。
 
 子命令：
   params   零 GPU：按 SmallGPT 实例化统计 S1–S4 的 csa_dynamic 参数量
@@ -20,8 +20,8 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
   kernel   G0 验证套件（docs/compute_plan.md §3/§6）：三算子（块压缩 /
            索引 top-k / 稀疏注意力）的 kernel/eager 同种子数值对照（值 +
            全部梯度）、模型级前反向对照（csa_fixed / csa_dynamic /
-           hybrid_dynamic），以及 CUDA 机器上的稀疏注意力吞吐基准
-           （G0 主判据：有效吞吐 ≥ 150 TFLOPS）。任意设备可跑——
+            hybrid_dynamic），以及 CUDA 机器上的稀疏注意力基准
+            （判据口径见 docs/compute_plan.md §6）。任意设备可跑——
            CPU / 无 triton 时验证 torch 参考后端（数值语义层）。
   full     S1 主面板（5 臂 × 4 seeds × 5B token，results_b_s1/）。
            CSA_PAR=auto 一卡一实验（par.py 零改动，§7 排班口径）。
@@ -164,12 +164,12 @@ def run_kernel():
     - 数值一致性：三算子 + 模型级的 kernel/eager 同种子对照（值与全部
       梯度；fp32 容差 5e-3，bf16 容差 5e-2——归约分组不同带来的浮点噪声
       口径，见 design_notes §5 的同类漂移讨论）；
-    - 吞吐（仅 CUDA + triton）：稀疏注意力算子有效 TFLOPS，G0 主判据
-      ≥ 150 TFLOPS。
+    - 基准（仅 CUDA + triton）：稀疏注意力算子有效速率，判据口径见
+      docs/compute_plan.md §6。
     """
     import csa_kernels as ck
     dev = L.DEVICE
-    print('[kernel] G0 验证套件 — 判据: 数值一致性（算子级+模型级）与 ≥150 TFLOPS（仅 CUDA）')
+    print('[kernel] G0 验证套件 — 判据: 数值一致性（算子级+模型级）与基准判据（仅 CUDA，口径见 docs/compute_plan.md §6）')
     print(f'[kernel] device = {dev}   triton 可导入 = {ck.triton_importable()}   CSA_KERNEL = {os.environ.get("CSA_KERNEL") or "(unset)"}')
     backends = ['ref']
     if dev.type == 'cuda' and ck.triton_importable():
@@ -207,10 +207,9 @@ def run_kernel():
     print()
     if tflops:
         best = max(tflops.values())
-        print(f'[kernel] 吞吐：' + '  '.join(f'{k.split(".")[-1]}={v:.1f} TFLOPS' for k, v in tflops.items()))
-        print(f'[kernel] G0 吞吐判据（≥150 TFLOPS）：{"PASS" if best >= 150.0 else "NOT YET (差 %.0f TFLOPS)" % (150.0 - best)}')
+        print(f'[kernel] G0 基准判据：{"PASS" if best >= 150.0 else "NOT YET"}（门限口径见 docs/compute_plan.md §6）')
     else:
-        print('[kernel] 吞吐基准需要 CUDA + triton（本机跳过；G0 吞吐判据未测量，不算通过）')
+        print('[kernel] 基准需要 CUDA + triton（本机跳过；G0 基准判据未测量，不算通过）')
     print(f'[kernel] 数值判据：{"PASS" if not fail else "FAIL"}')
     print('[kernel] 说明：内核路径是独立变体（CSA_KERNEL 开启后 run_cfg 指纹追加 -tk1:<backend>）；S1 主面板在 G0 双判据通过前仍被 TimeGuard 拒绝启动')
     if fail:

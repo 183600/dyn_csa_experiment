@@ -73,8 +73,8 @@ RUN_ABL = dict(RUN, outdir='results_lm_v4_abl', variants=ABL_VARIANTS, seeds=[0]
 RUN_LONG = dict(RUN, n_train_tokens=2000000 if QUICK else 110000000, steps=500 if QUICK else 20000, warmup=200, eval_every=1000, seeds=[0] if QUICK else [0, 1, 2, 3], outdir='results_lm_v3_long', variants=['full', 'full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn'])
 RUN_SCALE = dict(RUN, d=384, n_layers=8, n_heads=12, d_head=32, seq_len=1024, batch_size=8, n_train_tokens=2000000 if QUICK else 40000000, steps=500 if QUICK else 4000, warmup=100, eval_every=500, seeds=[0] if QUICK else [0, 1, 2], outdir='results_lm_v5_scale', variants=['full', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic'])
 # ---- B 档规模阶梯（docs/compute_plan.md §4–§5；档位已选定 B 进取）----
-# 以下全部为规划值：步数 / 批大小 / 学习率等训练量与超参以 G0 出口的吞吐
-# 校准与 M1 配方冻结为准滚动修正；参数量以 SmallGPT 实例化统计（见
+# 以下全部为规划值：步数 / 批大小 / 学习率等训练量与超参按
+# docs/compute_plan.md 的口径滚动修正；参数量以 SmallGPT 实例化统计（见
 # m0_supp.py params，S4 按规划的解析外推口径）。
 B_VOCAB = 32768
 SCALE_LADDER = {'S1': dict(d=768, n_layers=12, n_heads=12, d_head=64), 'S2': dict(d=1024, n_layers=16, n_heads=16, d_head=64), 'S3': dict(d=1536, n_layers=20, n_heads=24, d_head=64), 'S4': dict(d=2048, n_layers=24, n_heads=32, d_head=64)}
@@ -3661,7 +3661,7 @@ class TimeGuard:
         self.margin = float(cap.get('margin', 0.93))
         self.already = float(cap.get('already_hours', 0.0))
         self.state_path = cap.get('state_path', 'run_time_state.json')
-        # 内核模式使用独立的状态文件：两档吞吐的标定不可互相污染（同一
+        # 内核模式使用独立的状态文件：两档速率标定不可互相污染（同一
         # state 文件会把 eager 的 sps 标定用于内核单元的预计耗时）。
         if _kernel_stamp():
             self.state_path = self.state_path + '.k'
