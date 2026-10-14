@@ -961,11 +961,16 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     if return_mask:
         valid_cols = out_valid[0]
         with torch.no_grad():
+            # Build the (n, B) mask directly instead of scattering into an
+            # (n, B+1) sentinel scratch and slicing off the last column with a
+            # contiguous() copy: only the valid selections are written (1.0
+            # each; duplicate writes of the same cell are idempotent), so the
+            # values are bit-identical to the sentinel form's [.., :B] slice —
+            # one less full-width allocation and one less copy per call.
             _il = idx.long()
-            _tgt = torch.where(valid_cols, _il, torch.full_like(_il, B))
-            m = torch.zeros(n, B + 1, device=dev, dtype=out_dtype)
-            m.scatter_(1, _tgt, 1.0)
-            m = m[:, :B].contiguous()
+            _rows = _arange_cache(n, dev)[:, None].expand(n, _il.shape[1])
+            m = torch.zeros(n, B, device=dev, dtype=out_dtype)
+            m[_rows[valid_cols], _il[valid_cols]] = 1.0
             m.masked_fill_(_ncausal, 0.0)
     return (m, idx, soft)
 
