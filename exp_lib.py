@@ -546,7 +546,16 @@ def _take_2d(x, idx):
 def first_occurrence_mask(idx):
     if idx.shape[1] <= 1:
         return torch.ones_like(idx, dtype=torch.bool)
-    if idx.shape[1] <= 256:
+    # Both branches compute exactly the same booleans ("keep only the first
+    # occurrence of each value per row"): the triu form marks an element a
+    # duplicate iff an equal element sits at an earlier column; the stable
+    # argsort form keeps, inside each run of equal sorted values, the element
+    # that stability places first — which is the earliest original column.
+    # The triu form materializes an [n, k, k] bool matrix (k=256, n=512 ->
+    # 32MB transient on every sparse row/layer/step), so it is only worth it
+    # for small k; at larger k the O(n k log k) argsort form wins on both
+    # memory and time.  Identical output on either branch.
+    if idx.shape[1] <= 64:
         dup = (idx[:, :, None] == idx[:, None, :]).triu_(1).any(dim=1)
         return ~dup
     order = torch.argsort(idx, dim=1, stable=True)
@@ -2864,12 +2873,18 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
         _async = _vhost.is_pinned()
         for i in range(0, val_batch.shape[0], chunk):
             ids = _vhost[i:i + chunk].to(device, non_blocking=_async)
-            logits = model(ids)
-            if V is None:
-                V = logits.size(-1)
+            # Trunk + per-slice LM head instead of a single full-width head:
+            # the [chunk, T, vocab] logits block is never materialized, so the
+            # eval transient stays ~1/64 of it and scales with the 64-token
+            # slice width, not with T * V (same chunked-head pattern as
+            # SmallGPT.ce_loss, whose design note already records that the
+            # chunk sums match the full-batch form up to fp reduction order).
+            # comp_reg / need_reg handling is identical to model(ids) because
+            # forward() itself is exactly trunk() followed by head().
+            h = model.trunk(ids)
             _span = max(0, ids.shape[1] - 1)
             if _span == 0:
-                del ids, logits
+                del ids, h
                 continue
             if _sel is not None:
                 _base = i * _span
@@ -2877,11 +2892,16 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
                 _m = (_sel_sorted >= _base) & (_sel_sorted < _base + _wide)
                 _local = _sel_sorted[_m] - _base
                 if _local.numel() == 0:
-                    del ids, logits
+                    del ids, h
                     continue
                 _ri = torch.div(_local, _span, rounding_mode='floor')
                 _ci = _local - _ri * _span
-                _rows = logits[_ri, _ci, :]
+                # gather the selected hidden rows BEFORE the head: each output
+                # row of the Linear is an independent function of one hidden
+                # row, so head(h[sel]) == head(h)[sel]
+                _rows = model.head(h[_ri, _ci, :])
+                if V is None:
+                    V = _rows.size(-1)
                 _tgts = ids[_ri, _ci + 1]
                 del _ri, _ci
                 nll += F.cross_entropy(_rows, _tgts, reduction='sum').double()
@@ -2889,14 +2909,21 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
                 del _rows, _tgts
             else:
                 _tgts = ids[:, 1:]
-                # slice the CE over the time axis so the log_softmax transient
-                # stays ~1/8 of the full [chunk, T, vocab] block at a time
+                # slice the head GEMM and the CE over the same time-axis
+                # windows the previous form used for the CE alone, so the
+                # accumulation sequence (and hence the fp64 running total) is
+                # unchanged while the logits transient stays ~1/64 of the full
+                # [chunk, T, vocab] block at a time
                 for _s0 in range(0, _span, 64):
                     _sl = slice(_s0, min(_s0 + 64, _span))
-                    nll += F.cross_entropy(logits[:, _sl, :].transpose(1, 2), _tgts[:, _sl], reduction='sum').double()
+                    _lg = model.head(h[:, _sl, :])
+                    if V is None:
+                        V = _lg.size(-1)
+                    nll += F.cross_entropy(_lg.transpose(1, 2), _tgts[:, _sl], reduction='sum').double()
+                    del _lg
                 ntok += int(_tgts.numel())
                 del _tgts
-            del ids, logits
+            del ids, h
     finally:
         for _a, _prev in zip(need_reg_layers, need_reg_prior):
             _a.need_reg = _prev
@@ -3356,10 +3383,23 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
             ps, rs, fs, rps = ([], [], [], [])
             _cuts = attn._cuts
             _prov = {}
+            # Stage all tensor cuts through ONE concatenated D2H copy instead
+            # of up to 64 separate blocking .cpu() round-trips: the integers
+            # transferred are exactly the per-sequence values (index
+            # transport, design notes §6.1), only segmented on the host
+            # afterwards.
+            _tcut_ix = [si for si in range(n_seq_ref) if torch.is_tensor(_cuts[si])]
+            _tcut_host = {}
+            if _tcut_ix:
+                _tlens = [int(_cuts[si].numel()) for si in _tcut_ix]
+                _tflat = torch.cat([_cuts[si].reshape(-1) for si in _tcut_ix]).cpu().numpy()
+                _toff = 0
+                for si, _tln in zip(_tcut_ix, _tlens):
+                    _tcut_host[si] = _tflat[_toff:_toff + _tln]
+                    _toff += _tln
+                del _tflat
             for si in range(n_seq_ref):
-                c = _cuts[si]
-                if torch.is_tensor(c):
-                    c = c.cpu().numpy()
+                c = _tcut_host.get(si) if si in _tcut_host else _cuts[si]
                 p, r_, f_, rp = boundary_alignment(c, val_bnd[si], seq_len, tol=bnd_tol, provenance=_prov)
                 ps.append(p)
                 rs.append(r_)
