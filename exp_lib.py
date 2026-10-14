@@ -59,6 +59,14 @@ def _kernel_stamp():
         return _CK.kernel_stamp()
     except Exception:
         return ''
+
+def code_stamp():
+    """当前代码+内核模式写进每条记录的 `_code` 戳（eager = CODE_SEMANTICS
+    本身，与历史逐字节一致；内核模式追加变体后缀）。一切「记录是否当前」
+    的判定（result_is_current 的 code 实参、`_cs...` 后缀匹配）都必须以
+    本值为准——裸比 CODE_SEMANTICS 会把内核模式的全部记录误判为陈旧，
+    使 resume 静默失效、面板被标 `_stale_cfg`。"""
+    return f'{CODE_SEMANTICS}{_kernel_stamp()}'
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
 RUN_ABL = dict(RUN, outdir='results_lm_v4_abl', variants=ABL_VARIANTS, seeds=[0] if QUICK else [0, 1, 2, 3, 4])
@@ -3707,12 +3715,22 @@ class TimeGuard:
                     self.state['booked_untracked'] = float(self.state.get('booked_untracked', 0.0)) + float(seconds)
             else:
                 bookings = self.state.setdefault('bookings', {})
+                if 'booked_untracked' not in self.state:
+                    # First tokenised booking coexisting with a pre-bookings
+                    # state (e.g. the parent's data-load record_run, or any
+                    # serial phase that ran before this parallel one): every
+                    # second booked so far has no per-token representation,
+                    # so it ALL becomes the untracked remainder.  Defaulting
+                    # it to 0 would silently erase those seconds from the
+                    # booked total on the next refund's recompute — the cap
+                    # would then never fill in parallel mode.
+                    self.state['booked_untracked'] = max(0.0, float(self.state.get('booked_seconds', 0.0)) - sum(float(b.get('seconds', 0.0)) for b in bookings.values()))
                 if seconds > 0:
                     bookings[str(token)] = {'seconds': float(seconds), 'pid': int(os.getpid()), 'ts': time.time()}
                 else:
                     bookings.pop(str(token), None)
-                legacy = float(self.state.get('booked_untracked', 0.0))
-                self.state['booked_seconds'] = legacy + sum(float(b['seconds']) for b in bookings.values())
+                legacy = float(self.state['booked_untracked'])
+                self.state['booked_seconds'] = legacy + sum(float(b.get('seconds', 0.0)) for b in bookings.values())
             self._save()
         finally:
             if _lock_f is not None:
@@ -3755,12 +3773,26 @@ class TimeGuard:
             tracked = sum(float(b.get('seconds', 0.0)) for b in bookings.values())
             self.state['booked_untracked'] = max(0.0, total - tracked)
             refunded = 0.0
+            now = time.time()
             for tok in sorted(bookings):
                 b = bookings[tok]
-                if not self._pid_alive(b.get('pid', -1)):
-                    refunded += float(b.get('seconds', 0.0))
+                est_s = float(b.get('seconds', 0.0))
+                dead = not self._pid_alive(b.get('pid', -1))
+                # A live child can hold a booking for at most its dispatcher
+                # watchdog horizon (par.py SIGKILLs run/warm/lenphase cells at
+                # max(3*est, est+1h); every other kind is capped at 12 h).  A
+                # booking older than that CANNOT have a live owner: the pid
+                # reading is a reuse artifact (an instance reboot recycles
+                # pids — this driver's own auto-shutdown makes that the common
+                # case), and without an age fallback the phantom reservation
+                # would starve every later cell behind the cap forever.
+                horizon = max(4.0 * est_s, 13.0 * 3600.0)
+                too_old = b.get('ts') is not None and (now - float(b['ts'])) > horizon
+                if dead or too_old:
+                    refunded += est_s
                     bookings.pop(tok, None)
-                    print(f'[cap] reconcile: refunded {float(b.get("seconds", 0.0)) / 3600:.2f} h from dead booking {tok} (pid {b.get("pid")})')
+                    _why = 'dead pid' if dead else f'phantom: age {(now - float(b["ts"])) / 3600:.1f} h exceeds the watchdog horizon {horizon / 3600:.1f} h'
+                    print(f'[cap] reconcile: refunded {est_s / 3600:.2f} h from booking {tok} ({_why}, pid {b.get("pid")})')
             self.state['booked_seconds'] = self.state['booked_untracked'] + sum(float(b['seconds']) for b in bookings.values())
             self._save()
             return refunded
@@ -3792,6 +3824,14 @@ class TimeGuard:
         try:
             self.state = self._load_state()
             self.state['booked_seconds'] += float(seconds)
+            if 'bookings' in self.state:
+                # Keep the invariant booked_seconds == booked_untracked + Σ
+                # bookings: recorded actual seconds have no per-token
+                # representation, so they accrue to the untracked remainder.
+                # Without this the next token refund's recompute silently
+                # drops every recorded second from the booked total (the run
+                # -time cap then meters nothing in parallel mode).
+                self.state['booked_untracked'] = float(self.state.get('booked_untracked', 0.0)) + float(seconds)
             if steps_done and steps_done > 0:
                 self.state['runs'] += 1
                 if calib_seconds is None or not calib_seconds > 0:
@@ -3841,6 +3881,50 @@ class TimeGuard:
             norm = 0.35
         f = self._wallclock_factor(d, n_layers, seq_len, batch_size)
         return steps * norm * f * 1.15
+
+    def note_watchdog_kill(self, elapsed_seconds, steps, d=256, n_layers=6, seq_len=512, batch_size=12):
+        """Lift the calibrated per-step floor after a dispatcher-watchdog kill
+        (par.py).  A cell killed at `elapsed_seconds` demonstrably needs MORE
+        than that for `steps` steps, so its true sps exceeds
+        elapsed/steps — yet a killed cell never records a run, so without
+        this hook the calibration (and hence the watchdog bound
+        max(3*est, est+1h) derived from it) would stay wrong and the same
+        healthy cell would be killed at the same wall-clock point on every
+        resume (uncalibrated slow hardware, CPU workers).  Lifting the floor
+        to the kill time itself makes the next bound ~3.45x larger, so the
+        retry window grows geometrically until a healthy cell fits; a truly
+        hung cell is still killed on every attempt, just later."""
+        if not steps or int(steps) <= 0 or not float(elapsed_seconds) > 0:
+            return
+        floor = float(elapsed_seconds) / int(steps)
+        try:
+            import fcntl
+        except ImportError:
+            fcntl = None
+        _lock_f = None
+        if fcntl is not None:
+            _lock_f = open(self.state_path + '.lock', 'a')
+            fcntl.flock(_lock_f, fcntl.LOCK_EX)
+        try:
+            self.state = self._load_state()
+            by_class = self.state.setdefault('sps_by_class', {})
+            key = str((int(d), int(n_layers), int(seq_len), int(batch_size)))
+            prev = by_class.get(key)
+            if prev is None or floor > float(prev):
+                by_class[key] = floor
+            f = self._wallclock_factor(d, n_layers, seq_len, batch_size)
+            norm_floor = floor / f
+            norm = self.state.get('norm_sps')
+            if norm is None or norm_floor > float(norm):
+                self.state['norm_sps'] = norm_floor
+            self._save()
+        finally:
+            if _lock_f is not None:
+                try:
+                    fcntl.flock(_lock_f, fcntl.LOCK_UN)
+                finally:
+                    _lock_f.close()
+        print(f'[cap] watchdog kill noted: the pace floor for (d={d}, L={n_layers}, seq={seq_len}, bs={batch_size}) is now >= {floor:.3f} s/step so the next attempt gets a wider watchdog bound')
 
     def can_start(self, est_seconds):
         projected = self.spent_hours() + est_seconds / 3600.0
