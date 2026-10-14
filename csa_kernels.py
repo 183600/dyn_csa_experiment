@@ -231,7 +231,7 @@ class PoolGeometry:
 
 # 几何/常数表缓存：键 = 内容的纯整型函数，缓存值只读消费（与 exp_lib 的
 # _pool_parts/_arange_exp_cache 同一论证）。fix 分块臂每步传入完全相同的
-# counts，缓存可避免每步的 numpy 逐行重建与 7 次 H2D 上传。
+# counts。
 _GEOM_CACHE = {}
 _GEOM_CACHE_CAP = 16
 _ARANGE_CACHE = {}
@@ -688,9 +688,8 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     win_raw = (t_idx - (w - 1) + torch.arange(w, device=dev)[None, None, :]).expand(R, T, w)
     sink_v = torch.nan_to_num(sink).to(dtype) if sink is not None else None
     tc = _attn_t_chunk(R, M, nh, hd)
-    # 头在外、t-chunk 在内：各头的 fp32 cast 只做一次（原写法每个 chunk
-    # 重复整条 [R,T/Bm,hd] 的精度拷贝）。各 (t,h) 的前向计算相互独立，
-    # 循环顺序交换不改变任何元素值。
+    # 头在外、t-chunk 在内：各 (t,h) 的前向计算相互独立，循环顺序交换
+    # 不改变任何元素值。
     for h in range(nh):
         q_all = q[:, :, h, :].to(torch.float32)
         kb_all = k_blk[:, :, h, :].to(torch.float32)
@@ -758,10 +757,9 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     dsink = torch.zeros_like(sink) if (need_dsink and sink is not None) else None
     r_idx = torch.arange(R, device=dev)[:, None, None]
     tc = _attn_t_chunk(R, M, nh, hd)
-    # 头在外、t-chunk 在内：各头的 fp32 cast 只做一次；键值梯度碎片按头
-    # 收集、逐头 flush 入 fp32 缓冲（跨 chunk 的同键累加顺序 = chunk 升序，
-    # 与原来全局进出 _det_scatter_add 的稳定排序段和分组逐元素一致），
-    # 避免所有 chunk×head 的梯度碎片在整个反向期间同时驻留。
+    # 头在外、t-chunk 在内：键值梯度碎片按头收集、逐头 flush 入 fp32
+    # 缓冲（跨 chunk 的同键累加顺序 = chunk 升序，与全局一次
+    # _det_scatter_add 的稳定排序段和分组逐元素一致）。
     dk_blk32 = torch.zeros((R * Bm * nh, hd), device=dev, dtype=torch.float32) if need_dkb else None
     dv_blk32 = torch.zeros((R * Bm * nh, hd), device=dev, dtype=torch.float32) if need_dvb else None
     dk_sw32 = torch.zeros((R * T * nh, hd), device=dev, dtype=torch.float32) if need_dksw else None
@@ -863,7 +861,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                     dvsw_keys.append(((r_idx.expand(R, t1 - t0, w) * T + src_win) * nh + h).reshape(-1))
                     dvsw_vals.append(dvl[:, :, nb:].reshape(-1, hd))
         # 逐头 flush：同键条目在头内按 chunk 升序进入段和，不同头键不相交——
-        # 与原全局一次 _det_scatter_add 的 (key, 原下标) 稳定排序分组一致。
+        # 与全局一次 _det_scatter_add 的 (key, 原下标) 稳定排序分组一致。
         def _flush(keys_list, vals_list, buf, n_rows):
             if not keys_list:
                 return
