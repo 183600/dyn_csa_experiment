@@ -187,10 +187,15 @@ def v11_analysis(out='analysis_v11/stats.json'):
         ys = np.log10([max(p[1], 1.0) for p in pts])
         A = np.vstack([xs, np.ones_like(xs)]).T
         slope, intercept = np.linalg.lstsq(A, ys, rcond=None)[0]
-        pred = A @ np.array([slope, intercept])
-        ss_res = float(((ys - pred) ** 2).sum())
-        ss_tot = float(((ys - ys.mean()) ** 2).sum())
-        fit = {'n_points': len(pts), 'slope': float(slope), 'intercept': float(intercept), 'r2': 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan'), 'note': 'log10(crossover_tokens) ~ log10(d_model), untruncated crossovers only', 'excluded_no_rate': sorted(_no_tok), 'excluded_reconstructed': sorted(_recon)}
+        # n=2 时两点必共线：R² 恒为 1，不具统计意义——只在 n>=3 时报告拟合优度。
+        fit = {'n_points': len(pts), 'slope': float(slope), 'intercept': float(intercept), 'note': 'log10(crossover_tokens) ~ log10(d_model), untruncated crossovers only', 'excluded_no_rate': sorted(_no_tok), 'excluded_reconstructed': sorted(_recon)}
+        if len(pts) >= 3:
+            pred = A @ np.array([slope, intercept])
+            ss_res = float(((ys - pred) ** 2).sum())
+            ss_tot = float(((ys - ys.mean()) ** 2).sum())
+            fit['r2'] = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
+        else:
+            fit['note'] += '; WARNING: n=2 — R² 恒为 1（恒等式），斜率不具显著性，仅供参考'
     scale384 = V10._ppl_by_seed('results_lm_v5_scale', full=True)
     panel = V8._panel_block
     comparisons = {}
@@ -533,7 +538,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
         A('**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步与 seed 均值轨迹同为有效读数。')
     A('')
     if fit:
-        A(f'**趋势拟合（仅供参考）**：{fit['n_points']} 个已观测交叉点，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}（R²={fit['r2']:.2f}）。方向性证据，不作精确幂律主张。')
+        _r2s = f'（R²={fit["r2"]:.2f}）' if 'r2' in fit else '（n=2，R² 恒为 1，不报告拟合优度）'
+        A(f'**趋势拟合（仅供参考）**：{fit['n_points']} 个已观测交叉点，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}{_r2s}。方向性证据，不作精确幂律主张。')
         A('')
     if scale384:
         A(f'**d=384 面板（P4F 后，实际 {_n384_txt}）：**')

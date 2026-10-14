@@ -26,8 +26,9 @@ def load(path, default=None):
     except FileNotFoundError:
         return default
     except Exception as _e:
-        print(f'[build_report] WARNING: {path} exists but cannot be read ({type(_e).__name__}: {_e}) — treating it as absent rather than silently using partial data')
-        return default
+        # 「文件存在但损坏」与「实验未跑」是两种不同的事实：前者必须阻断
+        # 发布（进入 main 的 failed 列表），而不是伪装成「（无结果）」。
+        raise RuntimeError(f'{path} exists but cannot be parsed ({type(_e).__name__}: {_e}); refusing to build a report over corrupt data — fix or remove the file') from _e
 
 def agg(outdir):
     key = ('agg', outdir)
@@ -96,7 +97,7 @@ def exact_signflip(deltas):
                     s += d if rng.random() < 0.5 else -d
                 if abs(s) >= obs - 1e-12:
                     cnt += 1
-        return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': cnt / (B + 1)}
+        return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': cnt / (B + 1), 'method': 'mc'}
     try:
         import numpy as _np
     except ImportError:
@@ -132,7 +133,7 @@ def exact_signflip(deltas):
             if abs(s) >= obs - 1e-12:
                 cnt += 1
     mu = sum(deltas) / n
-    return {'n': n, 'mean': mu, 'std': (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0, 'p_exact_signflip': cnt / (1 << n)}
+    return {'n': n, 'mean': mu, 'std': (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0, 'p_exact_signflip': cnt / (1 << n), 'method': 'exact'}
 
 def _measurable(r):
     v = r.get('ppl')
@@ -366,7 +367,7 @@ def sec_p0r():
             lines.append(f'| `{a}` | {fm(pa)} {sp(ea.get('ppl_std'))} | {fm(pb)} {sp(eb.get('ppl_std'))} | **{pb - pa:+.2f}** | {_params_m(ea)} / {_params_m(eb)} |')
         else:
             print(f'[report] sec_p0r: `{a}`/`{b}` not both present (config-split or absent) — row omitted')
-    lines += ['', '**组间差距（决定评审论点是否成立）**：', '']
+    lines += ['', '> 注：表中 Δ(RoPE−abs) 为两臂**各自 seed 集合的均值之差（非配对）**——且跨面板（absPE vs RoPE）本身没有同 seed 配对的意义；显著性主张一律以下文配对检验的口径为准。', '', '**组间差距（决定评审论点是否成立）**：', '']
     _cf, _fu = (_agg_entry(ab, 'csa_fixed'), _agg_entry(ab, 'full'))
     _cf_r, _fu_r = (_agg_entry(rope, 'csa_fixed_rope'), _agg_entry(rope, 'full_rope'))
     _mt = _agg_entry(ab, 'full_matched')
@@ -729,6 +730,10 @@ def sec_p1t():
         return _out
 
     def _sr(topk, base_variant, note=''):
+        # 注意：选择率的分子 topk 是设计常量（不落盘于 run 记录），分母块数
+        # 才是实测。若 exp_lib 中相应的 index_topk 默认值更改，这里必须同步。
+        if note:
+            print(f'[report] sec_p1t WARNING: selection rate for {base_variant!r} uses the DESIGN topk (not a measured value) — verify it matches exp_lib.make_layer_cfgs')
         _nb = _nblocks_measured(base_variant)
         if _nb is None:
             print(f'[report] sec_p1t: no measured block count for {base_variant!r} — selection-rate cell left blank rather than hard-coded')
@@ -1067,9 +1072,10 @@ def sec_p2s():
                 common, dl, st = pr
                 rows.append((a, b, common, st))
     if rows:
-        lines += ['', '**配对检验（同 seed 配对，精确符号翻转）**：', '', '| 比较 | n (配对 seeds) | Δ (a−b) mean±std | p (exact) | params |', '|---|---|---|---|---|']
+        lines += ['', '**配对检验（同 seed 配对，符号翻转）**：', '', '| 比较 | n (配对 seeds) | Δ (a−b) mean±std | p | params |', '|---|---|---|---|---|']
         for a, b, common, st in rows:
-            lines.append(f'| `{a}` − `{b}` | {len(common)} | {st['mean']:+.2f} ± {st['std']:.2f} | {st['p_exact_signflip']:.3f} | {unmatched_tag(_agg_entry(_agg, a), _agg_entry(_agg, b)) or '✓'} |')
+            _pl = f'{st["p_exact_signflip"]:.3f}' + (' (MC)' if st.get('method') == 'mc' else ' (exact)')
+            lines.append(f'| `{a}` − `{b}` | {len(common)} | {st['mean']:+.2f} ± {st['std']:.2f} | {_pl} | {unmatched_tag(_agg_entry(_agg, a), _agg_entry(_agg, b)) or '✓'} |')
         main = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full'), None)
         _mt = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full_matched'), None) if _agg_entry(_agg, 'full_matched') is not None else None
         _base = _mt if _mt else main
@@ -1122,7 +1128,7 @@ def sec_stats():
     d = load(os.path.join(REPO, 'analysis_v7', 'stats.json'))
     if not d:
         return ''
-    lines = ['## 配对符号翻转检验（exact sign-flip permutation）', '', 'n≤4 时 bootstrap 无意义，改用精确符号翻转：枚举全部 2^n 种符号组合，双侧 p 值（n 很小时 p 的分辨率有限是统计事实，报告 Δ 与方向同向性）。', '', '| 比较 | Δ(mean) | p (exact) |', '|---|---|---|']
+    lines = ['## 配对符号翻转检验（sign-flip permutation）', '', 'n≤4 时 bootstrap 无意义，改用符号翻转：n≤20 枚举全部 2^n 种符号组合得精确双侧 p 值；n>20 为固定种子的 Monte-Carlo 符号翻转（B=200000，p 分辨率下限 1/200001）。n 很小时 p 的分辨率有限是统计事实，报告 Δ 与方向同向性。', '', '| 比较 | Δ(mean) | p |', '|---|---|---|']
     items = d.get('comparisons', {}) if isinstance(d, dict) else {}
     if not items and isinstance(d, dict):
         items = {k: v for k, v in d.items() if isinstance(v, dict) and (v.get('mean') is not None or v.get('delta') is not None)}
@@ -1133,7 +1139,8 @@ def sec_stats():
                 continue
             _dv = v.get('mean') if v.get('mean') is not None else v.get('delta')
             _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
-            lines.append(f'| {k} | {fm(_dv)} | {fm(_pv, 4)} |')
+            _mc = v.get('method') == 'mc' or (v.get('method') is None and isinstance(v.get('n'), (int, float)) and v['n'] > 20)
+            lines.append(f'| {k} | {fm(_dv)} | {fm(_pv, 4)}{' (MC)' if _mc else ''} |')
     lines.append('')
     return '\n'.join(lines) + '\n'
 

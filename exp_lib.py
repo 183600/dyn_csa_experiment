@@ -312,6 +312,15 @@ def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=Fals
 def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
+    # 闭式因果分位数是 O(B·T²) 内存与逐行排序：T=8192、B=8 单次即 ~2 GB
+    # 提交内存 + 每层每步的 67M 元素排序。长上下文臂请改用 cosine_learnable
+    # 分块器；此处 fail-fast 而不是让内核 OOM。
+    n = sim.shape[-1]
+    _sq_bytes = sim.shape[0] * n * n if sim.dim() == 2 else n * n
+    if _sq_bytes * 4 > 1 << 30:
+        raise RuntimeError(
+            f'causal_adaptive_threshold 的因果分位数闭式为 O(B·T²)（本次需 ~{_sq_bytes * 4 / 2**30:.1f} GB）: '
+            'adaptive 分段器不支持该序列长度——请改用 chunking="cosine_learnable"')
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
     # 1-D (single row) or 2-D (batched rows) — every op is rowwise
     # independent, so the batched form is value-identical per row while
@@ -645,6 +654,7 @@ def _pool_parts_host(block_ids, B, ov, n, counts_l):
             np.subtract(end_prev, int(ov), out=ov_start)
             np.maximum(ov_start, starts_prev, out=ov_start)
             np.subtract(end_prev, ov_start, out=flat[7 * B:8 * B])
+            np.maximum(flat[7 * B:8 * B], 0, out=flat[7 * B:8 * B])  # block 0 无 overlap：几何表自身保持非负（此前为 -1，靠下游 mask 兜底）
         if pad:
             flat[total:] = 0
         buf = _h2d_async(flat, torch.long, block_ids.device)
@@ -691,7 +701,7 @@ def _pool_parts(block_ids, B, ov, n):
             end_prev = F.pad(ends[:-1], (1, 0), value=-1)
             starts_prev = F.pad(starts[:-1], (1, 0), value=0)
             ov_start = torch.clamp(end_prev - ov, min=starts_prev)
-            ov_len = end_prev - ov_start
+            ov_len = (end_prev - ov_start).clamp_min(0)  # block 0 无 overlap：几何表自身保持非负（此前为 -1，靠下游 mask 兜底）
             parts = (counts, ends, starts, last_idx, end_prev, starts_prev, ov_start, ov_len)
     if len(cache) < 8:
         cache[key] = parts
@@ -2179,8 +2189,11 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         batches are bit-identical to the int64-storage form;
       - the corpus is built in one streaming pass (fit tokenizer on the first
         `fit_docs` documents, then train tokens up to n_train_tokens + seq_len,
-        then the validation holdout: the next val_seqs*seq_len + seq_len tokens
-        after the train region — contiguous, deterministic per protocol tag);
+        then the validation holdout: val_seqs*seq_len + seq_len tokens drawn
+        from documents strictly after the train region — non-overlapping and
+        deterministic per protocol tag, but not necessarily token-contiguous:
+        the partial final train batch (up to one 4096-doc fetch block) is
+        discarded between the two regions);
       - val_batch is int64 (eval paths feed targets straight to cross entropy).
     """
     os.makedirs(cache_dir, exist_ok=True)
@@ -3541,13 +3554,19 @@ class TimeGuard:
         to rebuild an equivalent TimeGuard against the same shared state file."""
         return dict(total_hours=self.total_hours, margin=self.margin, already_hours=self.already, state_path=self.state_path)
 
-    def book(self, seconds):
+    def book(self, seconds, token=None):
         """Reserve (seconds > 0) or refund (seconds < 0) projected run time
         against the shared state WITHOUT touching the run counter or the
         calibration.  Parallel cell workers pre-book their estimate before
         training and refund it after recording the actual seconds, so the
         booked total always converges to the true sum while concurrently
-        launching children still see the shared headroom shrink."""
+        launching children still see the shared headroom shrink.
+
+        With `token`, the reservation is recorded per-booking (with the
+        booking process pid) so `reconcile()` can refund reservations whose
+        process died before refunding (killed child / instance shutdown) —
+        without this, a killed parallel cell starves every later phase with
+        a phantom reservation."""
         try:
             import fcntl
         except ImportError:
@@ -3558,8 +3577,69 @@ class TimeGuard:
             fcntl.flock(_lock_f, fcntl.LOCK_EX)
         try:
             self.state = self._load_state()
-            self.state['booked_seconds'] += float(seconds)
+            if token is None:
+                self.state['booked_seconds'] += float(seconds)
+                if 'bookings' in self.state:
+                    self.state['booked_untracked'] = float(self.state.get('booked_untracked', 0.0)) + float(seconds)
+            else:
+                bookings = self.state.setdefault('bookings', {})
+                if seconds > 0:
+                    bookings[str(token)] = {'seconds': float(seconds), 'pid': int(os.getpid()), 'ts': time.time()}
+                else:
+                    bookings.pop(str(token), None)
+                legacy = float(self.state.get('booked_untracked', 0.0))
+                self.state['booked_seconds'] = legacy + sum(float(b['seconds']) for b in bookings.values())
             self._save()
+        finally:
+            if _lock_f is not None:
+                try:
+                    fcntl.flock(_lock_f, fcntl.LOCK_UN)
+                finally:
+                    _lock_f.close()
+
+    @staticmethod
+    def _pid_alive(pid):
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except (OSError, AttributeError):
+            return True  # 无法判定（非 posix 等）时按存活处理，绝不误退
+
+    def reconcile(self):
+        """Refund per-token bookings whose recording process is no longer
+        alive (crash/kill recovery).  Old state files without a `bookings`
+        map are untouched: their `booked_seconds` is preserved as
+        `booked_untracked` once any tokenised booking coexists."""
+        try:
+            import fcntl
+        except ImportError:
+            fcntl = None
+        _lock_f = None
+        if fcntl is not None:
+            _lock_f = open(self.state_path + '.lock', 'a')
+            fcntl.flock(_lock_f, fcntl.LOCK_EX)
+        try:
+            self.state = self._load_state()
+            bookings = self.state.get('bookings') or {}
+            if not bookings:
+                return 0.0
+            total = float(self.state.get('booked_seconds', 0.0))
+            tracked = sum(float(b.get('seconds', 0.0)) for b in bookings.values())
+            self.state['booked_untracked'] = max(0.0, total - tracked)
+            refunded = 0.0
+            for tok in sorted(bookings):
+                b = bookings[tok]
+                if not self._pid_alive(b.get('pid', -1)):
+                    refunded += float(b.get('seconds', 0.0))
+                    bookings.pop(tok, None)
+                    print(f'[cap] reconcile: refunded {float(b.get("seconds", 0.0)) / 3600:.2f} h from dead booking {tok} (pid {b.get("pid")})')
+            self.state['booked_seconds'] = self.state['booked_untracked'] + sum(float(b['seconds']) for b in bookings.values())
+            self._save()
+            return refunded
         finally:
             if _lock_f is not None:
                 try:
@@ -4353,14 +4433,15 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
     out = {'status': 'ok', 'key': key, 'variant': v, 'seed': seed}
     deadline_ts = None
     booked = 0.0
+    _book_tok = f'run|{key}|pid{os.getpid()}'
     if guard is not None:
         est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
         if prebook and est:
-            guard.book(est)
+            guard.book(est, token=_book_tok)
             booked = est
         if not guard.can_start(est):
             if booked:
-                guard.book(-booked)
+                guard.book(-booked, token=_book_tok)
                 booked = 0.0
             print(f'[cap] SKIP {key}: projected {est / 3600:.2f} h would pass the configured cap (headroom {max(guard.total_hours - guard.spent_hours(), 0.0):.2f} h)')
             out['status'] = 'skipped_cap'
@@ -4413,7 +4494,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             calib_s = rec.get('train_time_s')
         guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'], calib_seconds=calib_s)
         if booked:
-            guard.book(-booked)
+            guard.book(-booked, token=_book_tok)
     gc.collect()
     if DEVICE.type == 'cuda':
         torch.cuda.empty_cache()

@@ -714,10 +714,15 @@ def v10_analysis(out='analysis_v10/stats.json'):
         ys = np.log10([max(p[1], 1.0) for p in pts])
         A = np.vstack([xs, np.ones_like(xs)]).T
         slope, intercept = np.linalg.lstsq(A, ys, rcond=None)[0]
-        pred = A @ np.array([slope, intercept])
-        ss_res = float(((ys - pred) ** 2).sum())
-        ss_tot = float(((ys - ys.mean()) ** 2).sum())
-        fit = {'n_points': len(pts), 'slope': float(slope), 'intercept': float(intercept), 'r2': 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan'), 'note': 'log10(crossover_tokens) ~ log10(d_model), untruncated crossovers only', 'excluded_no_rate': sorted(dropped), 'excluded_reconstructed': recon}
+        # n=2 时两点必共线：R² 恒为 1，不具统计意义——只在 n>=3 时报告拟合优度。
+        fit = {'n_points': len(pts), 'slope': float(slope), 'intercept': float(intercept), 'note': 'log10(crossover_tokens) ~ log10(d_model), untruncated crossovers only', 'excluded_no_rate': sorted(dropped), 'excluded_reconstructed': recon}
+        if len(pts) >= 3:
+            pred = A @ np.array([slope, intercept])
+            ss_res = float(((ys - pred) ** 2).sum())
+            ss_tot = float(((ys - ys.mean()) ** 2).sum())
+            fit['r2'] = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
+        else:
+            fit['note'] += '; WARNING: n=2 — R² 恒为 1（恒等式），斜率不具显著性，仅供参考'
     seq2k = _ppl_by_seed('results_lm_v9_seq2k', full=True)
     comparisons = {}
 
@@ -977,7 +982,8 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             _excl.append(f'{len(fit['excluded_reconstructed'])} 个规模（{', '.join(fit['excluded_reconstructed'])}）的轨迹是重构件而非测量')
         if fit.get('excluded_no_rate'):
             _excl.append(f'{len(fit['excluded_no_rate'])} 个规模无 token 速率')
-        A(f'**趋势拟合（仅供参考）**：在 {fit['n_points']} 个已观测交叉点上，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}（R²={fit['r2']:.2f}）——负斜率 = 规模越大交叉越早。' + (f'点数已扣除{'、'.join(_excl)}；' if _excl else '') + '点数少且部分格子删失，只作方向性证据，不作精确幂律主张。')
+        _r2s = f'（R²={fit["r2"]:.2f}）' if 'r2' in fit else '（n=2，R² 恒为 1，不报告拟合优度）'
+        A(f'**趋势拟合（仅供参考）**：在 {fit['n_points']} 个已观测交叉点上，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}{_r2s}——负斜率 = 规模越大交叉越早。' + (f'点数已扣除{'、'.join(_excl)}；' if _excl else '') + '点数少且部分格子删失，只作方向性证据，不作精确幂律主张。')
         A('')
     A('---')
     A('')

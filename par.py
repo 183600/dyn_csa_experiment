@@ -314,6 +314,72 @@ def _terminate_entries(entries):
                 )
 
 
+def _job_watchdog_seconds(job, ctx):
+    """Per-cell wall-clock watchdog limit.
+
+    Explicit override: job['watchdog_seconds'] or ctx['watchdog_seconds'].
+    Otherwise derived from the same TimeGuard estimate the cell pre-books
+    (3x estimate, at least estimate + 1 h); unestimable kinds get a 12 h
+    net.  A child outliving this limit is treated as hung (CUDA deadlock /
+    IO stall): without it one stuck child blocks the phase forever, until
+    the driver's scheduled shutdown kills the whole instance mid-cell.
+    """
+    v = job.get("watchdog_seconds") or ctx.get("watchdog_seconds")
+    if v:
+        return float(v)
+    try:
+        import exp_lib as _L
+        cap = job.get("guard_cap")
+        if not cap:
+            return 12.0 * 3600.0
+        guard = _L.TimeGuard(cap)
+        kind = job.get("kind")
+        if kind in ("run", "warm"):
+            cfg = job.get("cfg") or {}
+            est = guard.estimate_seconds(
+                cfg["steps"], d=cfg.get("d", 256),
+                n_layers=cfg.get("n_layers", 6), seq_len=cfg["seq_len"],
+                batch_size=cfg["batch_size"],
+            )
+        elif kind == "lenphase":
+            p = job.get("payload") or {}
+            est = guard.estimate_seconds(
+                p.get("steps", 3000), d=256, n_layers=6,
+                seq_len=p.get("train_len", 512),
+                batch_size=p.get("batch_size", 12),
+            )
+        else:
+            return 12.0 * 3600.0
+        return max(3.0 * float(est), float(est) + 3600.0)
+    except Exception:
+        return 12.0 * 3600.0
+
+
+def _reconcile_guards(jobs):
+    """Refund TimeGuard bookings whose booking process is dead (killed
+    child, aborted dispatch, instance shutdown): without this, phantom
+    reservations stay in the shared state file and starve every later
+    phase behind the run-time cap."""
+    seen = set()
+    for job in jobs:
+        cap = (job or {}).get("guard_cap")
+        if not cap:
+            continue
+        path = cap.get("state_path")
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            import exp_lib as _L
+            _L.TimeGuard(cap).reconcile()
+        except Exception as e:
+            print(
+                f"[par] WARNING: booking reconcile failed for "
+                f"{path}: {type(e).__name__}: {e}",
+                flush=True,
+            )
+
+
 def run_jobs(jobs, ctx, phase_label="phase"):
     """Dispatch jobs and return result objects in input order.
 
@@ -381,9 +447,13 @@ def run_jobs(jobs, ctx, phase_label="phase"):
             "worker": None,
             "done": False,
             "result": None,
+            "t_start": None,
+            "watchdog_s": _job_watchdog_seconds(job, ctx),
         }
         _atomic_json(entry["job_path"], job)
         entries.append(entry)
+
+    _reconcile_guards(jobs)
 
     pending = list(entries)
     running = []
@@ -404,6 +474,7 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                     break
                 entry = pending.pop(0)
                 entry["worker"] = worker
+                entry["t_start"] = time.monotonic()
                 entry["log_f"] = open(
                     entry["log_path"], "w", encoding="utf-8"
                 )
@@ -436,6 +507,34 @@ def run_jobs(jobs, ctx, phase_label="phase"):
             for entry in running:
                 rc = entry["proc"].poll()
                 if rc is None:
+                    elapsed = time.monotonic() - (entry["t_start"] or time.monotonic())
+                    if elapsed > entry["watchdog_s"]:
+                        print(
+                            f"[par] WATCHDOG: {entry['name']} exceeded its "
+                            f"{entry['watchdog_s'] / 3600:.1f} h limit "
+                            f"({elapsed / 3600:.1f} h) — killing it and "
+                            "continuing the phase.",
+                            flush=True,
+                        )
+                        _terminate_entries([entry])
+                        _reconcile_guards([entry["job"]])
+                        entry["log_f"].close()
+                        entry["done"] = True
+                        result = {
+                            "status": "watchdog_timeout",
+                            "kind": entry["job"].get("kind"),
+                            "v": entry["job"].get("v"),
+                            "seed": entry["job"].get("seed"),
+                            "error": (
+                                f"killed by the dispatcher watchdog after "
+                                f"{elapsed:.0f} s (limit {entry['watchdog_s']:.0f} s)"
+                            ),
+                        }
+                        _atomic_json(entry["result_path"], result)
+                        entry["result"] = result
+                        results[entry["idx"]] = result
+                        _dump_log_tail(entry)
+                        continue
                     still_running.append(entry)
                     continue
 
@@ -486,10 +585,11 @@ def run_jobs(jobs, ctx, phase_label="phase"):
     except BaseException:
         _KILL["on"] = True
         _terminate_entries(entries)
+        _reconcile_guards([entry["job"] for entry in entries if not entry["done"]])
         print(
             "[par] Dispatch aborted; remaining children were terminated. "
-            "Completed records are preserved. Inspect time reservations "
-            "before resuming if a child was killed.",
+            "Completed records are preserved; time reservations of dead "
+            "children were refunded via reconcile.",
             flush=True,
         )
         raise
@@ -571,7 +671,13 @@ def run_child(job_path, result_path):
                 f"SystemExit({exc.code!r})\n" + traceback.format_exc()
             )
             return
-        result["status"] = "ok"
+        if result.get("status") == "fatal":
+            # sys.exit(0) before the handler produced anything: this is NOT a
+            # successful measurement — mark it distinctly so the dispatch log
+            # shows an empty cell instead of a silent "ok" that produces no
+            # record (and would otherwise be re-run on every resume).
+            result["status"] = "empty_exit"
+            result["error"] = "SystemExit(0) before the cell produced a result"
     except BaseException:
         result["status"] = "fatal"
         result["error"] = traceback.format_exc()

@@ -754,12 +754,23 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             zA = zA.masked_fill(~lane_ok, MINL)
             g = torch.einsum('rtd,rtmd->rtm', dOh, Vl)
             gh = g * (anyrow[:, :, None] if anyrow is not None else 1.0)
-            P_S = GS = dzS = P_sinkS = None
+            P_S = GS = dzS = P_sinkS = P_sinkA = None
+            if soft_l is not None:
+                # S 路径（soft 先验）与 sink 无关——eager 的直通估计器在
+                # use_sink=False 时同样有 S 路梯度。
+                lam = torch.log(soft_l.clamp_min(1e-12))
+                lam = lam.masked_fill(soft_l <= 0, MINL)
+                zS = zA.clone()
+                zS[:, :, :nb] = (zA[:, :, :nb] + lam[:, :, :nb]).clamp_min(MINL)
             if sink_v is None:
                 P_A = torch.softmax(zA, dim=-1)
                 P_A_f = P_A * (anyrow[:, :, None] if anyrow is not None else 1.0)
                 GA = (P_A * gh).sum(dim=-1)
                 dzA = P_A * (gh - GA[:, :, None])
+                if soft_l is not None:
+                    P_S = torch.softmax(zS, dim=-1)
+                    GS = (P_S * gh).sum(dim=-1)
+                    dzS = P_S * (gh - GS[:, :, None])
             else:
                 zext = torch.cat([sink_v[h].expand(R, t1 - t0, 1), zA], dim=-1)
                 P_full = torch.softmax(zext, dim=-1)
@@ -769,10 +780,6 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 GA = (P_A * gh).sum(dim=-1)
                 dzA = P_A * (gh - GA[:, :, None])
                 if soft_l is not None:
-                    lam = torch.log(soft_l.clamp_min(1e-12))
-                    lam = lam.masked_fill(soft_l <= 0, MINL)
-                    zS = zA.clone()
-                    zS[:, :, :nb] = (zA[:, :, :nb] + lam[:, :, :nb]).clamp_min(MINL)
                     zextS = torch.cat([sink_v[h].expand(R, t1 - t0, 1), zS], dim=-1)
                     P_fullS = torch.softmax(zextS, dim=-1)
                     P_S = P_fullS[..., 1:]
@@ -964,18 +971,20 @@ def _kernels():
         r = pid // n_t
         t = pid_t * BT + tl.arange(0, BT)
         tm = t < T
+        ti = t.to(tl.int64)
         d = tl.arange(0, HD)
         for b0 in range(0, Bm, BB):
             bcol = b0 + tl.arange(0, BB)
             bm = bcol < Bm
+            bi = bcol.to(tl.int64)
             acc = tl.zeros((BT, BB), dtype=tl.float32)
             for i in tl.static_range(N_IH):
-                q_i = tl.load(qI_ptr + ((r * T + t[:, None]) * N_IH + i) * HD + d[None, :], mask=tm[:, None], other=0.0).to(tl.float32)
-                w_i = tl.load(w_ptr + (r * T + t) * N_IH + i, mask=tm, other=0.0).to(tl.float32)
-                k_t = tl.load(kI_ptr + ((r * Bm + bcol[:, None]) * N_IH + i) * HD + d[None, :], mask=bm[:, None], other=0.0).to(tl.float32)
+                q_i = tl.load(qI_ptr + ((r * T + ti[:, None]) * N_IH + i) * HD + d[None, :], mask=tm[:, None], other=0.0).to(tl.float32)
+                w_i = tl.load(w_ptr + (r * T + ti) * N_IH + i, mask=tm, other=0.0).to(tl.float32)
+                k_t = tl.load(kI_ptr + ((r * Bm + bi[:, None]) * N_IH + i) * HD + d[None, :], mask=bm[:, None], other=0.0).to(tl.float32)
                 s = tl.dot(q_i, tl.trans(k_t), input_precision=DOT) * ISCALE
                 acc += tl.where(s > 0.0, s, 0.0) * w_i[:, None]
-            tl.store(scores_ptr + (r * T + t[:, None]) * Bm + bcol[None, :], acc, mask=tm[:, None] & bm[None, :])
+            tl.store(scores_ptr + (r * T + ti[:, None]) * Bm + bi[None, :], acc, mask=tm[:, None] & bm[None, :])
 
     ns.idx_score = idx_score
 
@@ -988,7 +997,8 @@ def _kernels():
         t = pid % T
         b = tl.arange(0, BB).to(tl.int64)
         bm = b < Bm
-        s = tl.load(scores_ptr + (r * T + t) * Bm + b, mask=bm, other=float('-inf')).to(tl.float32)
+        rt = (r * T + t).to(tl.int64)
+        s = tl.load(scores_ptr + rt * Bm + b, mask=bm, other=float('-inf')).to(tl.float32)
         lt = tl.load(last_tok_ptr + r * Bm + b, mask=bm, other=T - 1).to(tl.int64)
         causal = (t.to(tl.int64) > lt) & bm
         finite = (s - s) == 0.0
@@ -1016,9 +1026,9 @@ def _kernels():
             sv = tl.exp(s0 - lse)
             sv = tl.where(has, sv, 0.0)
             sv = tl.where(sv == sv, sv, 0.0)
-            tl.store(idx_ptr + (r * T + t) * K + j, use.to(tl.int32))
-            tl.store(valid_ptr + (r * T + t) * K + j, has.to(tl.int8))
-            tl.store(soft_ptr + (r * T + t) * K + j, sv.to(soft_ptr.dtype.element_ty))
+            tl.store(idx_ptr + rt * K + j, use.to(tl.int32))
+            tl.store(valid_ptr + rt * K + j, has.to(tl.int8))
+            tl.store(soft_ptr + rt * K + j, sv.to(soft_ptr.dtype.element_ty))
 
     ns.idx_topk = idx_topk
 
@@ -1049,7 +1059,7 @@ def _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     R, T, nh, hd = q.shape
     nb = topk_idx.shape[-1]
     Bm = k_blk.shape[1]
-    assert int(w) >= 1 and hd >= 16, 'triton attention 前向要求 w >= 1 且 hd >= 16（其余形状走 ref 后端）'
+    assert int(w) >= 1 and hd >= 16 and hd & (hd - 1) == 0, 'triton attention 前向要求 w >= 1 且 hd 为 2 的幂且 >= 16（其余形状走 ref 后端）'
     q = q.contiguous()
     k_blk, v_blk = k_blk.contiguous(), v_blk.contiguous()
     k_sw, v_sw = k_sw.contiguous(), v_sw.contiguous()
@@ -1079,7 +1089,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     Bm = k_blk.shape[1]
     dev = q.device
     dtype = q.dtype
-    assert int(w) >= 1 and hd >= 16
+    assert int(w) >= 1 and hd >= 16 and hd & (hd - 1) == 0
     q = q.contiguous()
     k_blk, v_blk = k_blk.contiguous(), v_blk.contiguous()
     k_sw, v_sw = k_sw.contiguous(), v_sw.contiguous()
@@ -1137,16 +1147,19 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         K.attn_bwd_dkdv_window[(R * T * nh,)](
             q, k_sw, v_sw, sink_arg, dO, mA, ZA, mS, ZS, GA, GS,
             dk_sw, dv_sw, T, int(w), float(scale),
-            NH=nh, HD=hd, HAS_SINK=sink is not None,
+            NH=nh, HD=hd, HAS_SINK=sink is not None, HAS_SOFT=soft is not None,
             NEED_DK=need_dksw, NEED_DV=need_dvsw, num_warps=1)
     dsink = None
     if need_dsink:
         sk = sink_c.to(torch.float32).view(1, 1, nh)
         ZAs = torch.where(ZA == 0, torch.ones_like(ZA), ZA)
-        ZSs = torch.where(ZS == 0, torch.ones_like(ZS), ZS)
         p_sink_a = torch.exp(sk - mA) / ZAs
-        p_sink_s = torch.exp(sk - mS) / ZSs
-        dsink = (-(p_sink_a * GA).sum(dim=(0, 1)) - (p_sink_s * GS).sum(dim=(0, 1))).to(dtype)
+        acc = -(p_sink_a * GA).sum(dim=(0, 1))
+        if soft is not None:
+            ZSs = torch.where(ZS == 0, torch.ones_like(ZS), ZS)
+            p_sink_s = torch.exp(sk - mS) / ZSs
+            acc = acc - (p_sink_s * GS).sum(dim=(0, 1))
+        dsink = acc.to(dtype)
     return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)
 
 
@@ -1271,11 +1284,12 @@ def _attach_attn_kernels(ns):
             ZA = ZA * aA + tl.sum(tl.exp(z - mnA[:, None]), 1)
             GAr = GAr * aA + tl.sum(tl.exp(z - mnA[:, None]) * g, 1)
             mA = mnA
-            mnS = tl.maximum(mS, tl.max(z, 1))
-            aS = tl.exp(mS - mnS)
-            ZS = ZS * aS + tl.sum(tl.exp(z - mnS[:, None]), 1)
-            GSr = GSr * aS + tl.sum(tl.exp(z - mnS[:, None]) * g, 1)
-            mS = mnS
+            if HAS_SOFT:
+                mnS = tl.maximum(mS, tl.max(z, 1))
+                aS = tl.exp(mS - mnS)
+                ZS = ZS * aS + tl.sum(tl.exp(z - mnS[:, None]), 1)
+                GSr = GSr * aS + tl.sum(tl.exp(z - mnS[:, None]) * g, 1)
+                mS = mnS
         for j in tl.static_range(NB):
             src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
             lt_j = tl.load(lt_ptr + r * Bm + src, mask=tm, other=0).to(tl.int64)
@@ -1287,13 +1301,6 @@ def _attach_attn_kernels(ns):
             vjv = tl.load(vb_ptr + ((r * Bm + src[:, None]) * NH + h) * HD + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
             zj = tl.sum(qt * kj, 1) * SCALE
             zj = tl.where(ok, zj, float('-inf'))
-            if HAS_SOFT:
-                sf = tl.load(soft_ptr + ((r * T + ti) * NB + j), mask=tm, other=0.0).to(tl.float32)
-                lam = tl.where(sf > 0.0, tl.log(tl.maximum(sf, 1e-12)), -3.402823466e38)
-                zS = tl.maximum(zj + lam, -3.402823466e38)
-                zS = tl.where(ok, zS, float('-inf'))
-            else:
-                zS = zj
             g = tl.sum(dOt * vjv, 1)
             mnA = tl.maximum(mA, zj)
             aA = tl.exp(mA - mnA)
@@ -1301,12 +1308,17 @@ def _attach_attn_kernels(ns):
             ZA = ZA * aA + eA
             GAr = GAr * aA + eA * g
             mA = mnA
-            mnS = tl.maximum(mS, zS)
-            aS = tl.exp(mS - mnS)
-            eS = tl.exp(zS - mnS)
-            ZS = ZS * aS + eS
-            GSr = GSr * aS + eS * g
-            mS = mnS
+            if HAS_SOFT:
+                sf = tl.load(soft_ptr + ((r * T + ti) * NB + j), mask=tm, other=0.0).to(tl.float32)
+                lam = tl.where(sf > 0.0, tl.log(tl.maximum(sf, 1e-12)), -3.402823466e38)
+                zS = tl.maximum(zj + lam, -3.402823466e38)
+                zS = tl.where(ok, zS, float('-inf'))
+                mnS = tl.maximum(mS, zS)
+                aS = tl.exp(mS - mnS)
+                eS = tl.exp(zS - mnS)
+                ZS = ZS * aS + eS
+                GSr = GSr * aS + eS * g
+                mS = mnS
         ZAs = tl.where(ZA == 0.0, 1.0, ZA)
         ZSs = tl.where(ZS == 0.0, 1.0, ZS)
         base = (r * T + ti) * NH + h
@@ -1359,9 +1371,11 @@ def _attach_attn_kernels(ns):
             ok = pm[None, :] & (p[None, :] <= ti[:, None]) & (p[None, :] > ti[:, None] - W)
             z = tl.where(ok, z, float('-inf'))
             eA = tl.exp(z - mA[:, None])
-            eS = tl.exp(z - mS[:, None])
             g = tl.dot(dOt, tl.trans(vt), input_precision=DOT)
-            dz = eA / ZAs[:, None] * (g - GA[:, None]) + eS / ZSs[:, None] * (g - GS[:, None])
+            dz = eA / ZAs[:, None] * (g - GA[:, None])
+            if HAS_SOFT:
+                eS = tl.exp(z - mS[:, None])
+                dz += eS / ZSs[:, None] * (g - GS[:, None])
             dqacc += tl.dot(dz, kt, input_precision=DOT)
         for j in tl.static_range(NB):
             src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
@@ -1374,17 +1388,16 @@ def _attach_attn_kernels(ns):
             vjv = tl.load(vb_ptr + ((r * Bm + src[:, None]) * NH + h) * HD + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
             zj = tl.sum(qt * kj, 1) * SCALE
             zj = tl.where(ok, zj, float('-inf'))
+            eA = tl.exp(zj - mA)
+            g = tl.sum(dOt * vjv, 1)
+            dz = eA / ZAs * (g - GA)
             if HAS_SOFT:
                 sf = tl.load(soft_ptr + ((r * T + ti) * NB + j), mask=tm, other=0.0).to(tl.float32)
                 lam = tl.where(sf > 0.0, tl.log(tl.maximum(sf, 1e-12)), -3.402823466e38)
                 zS = tl.maximum(zj + lam, -3.402823466e38)
                 zS = tl.where(ok, zS, float('-inf'))
-            else:
-                zS = zj
-            eA = tl.exp(zj - mA)
-            eS = tl.exp(zS - mS)
-            g = tl.sum(dOt * vjv, 1)
-            dz = eA / ZAs * (g - GA) + eS / ZSs * (g - GS)
+                eS = tl.exp(zS - mS)
+                dz += eS / ZSs * (g - GS)
             dqacc += dz[:, None] * kj
         tl.store(dq_ptr + ((r * T + ti[:, None]) * NH + h) * HD + d[None, :], dqacc.to(dq_ptr.dtype.element_ty), mask=tm[:, None])
 
@@ -1461,12 +1474,13 @@ def _attach_attn_kernels(ns):
                              mA_ptr, ZA_ptr, mS_ptr, ZS_ptr, GA_ptr, GS_ptr,
                              dksw_ptr, dvsw_ptr, T, W, SCALE,
                              NH: tl.constexpr, HD: tl.constexpr, HAS_SINK: tl.constexpr,
+                             HAS_SOFT: tl.constexpr,
                              NEED_DK: tl.constexpr, NEED_DV: tl.constexpr):
         pid = tl.program_id(0)
         h = pid % NH
         rp = pid // NH
-        p = rp % T
         r = rp // T
+        p = (rp % T).to(tl.int64)
         d = tl.arange(0, HD)
         k_v = tl.load(ksw_ptr + ((r * T + p) * NH + h) * HD + d).to(tl.float32)
         v_v = tl.load(vsw_ptr + ((r * T + p) * NH + h) * HD + d).to(tl.float32)
@@ -1483,15 +1497,17 @@ def _attach_attn_kernels(ns):
             mA = tl.load(mA_ptr + st)
             ZA = tl.load(ZA_ptr + st)
             GA = tl.load(GA_ptr + st)
-            GS = tl.load(GS_ptr + st)
-            mS = tl.load(mS_ptr + st)
-            ZS = tl.load(ZS_ptr + st)
             ZAs = tl.where(ZA == 0.0, 1.0, ZA)
-            ZSs = tl.where(ZS == 0.0, 1.0, ZS)
             PA = tl.exp(z - mA) / ZAs
-            PS = tl.exp(z - mS) / ZSs
             g = tl.sum(dO_v * v_v)
-            dz = PA * (g - GA) + PS * (g - GS)
+            dz = PA * (g - GA)
+            if HAS_SOFT:
+                GS = tl.load(GS_ptr + st)
+                mS = tl.load(mS_ptr + st)
+                ZS = tl.load(ZS_ptr + st)
+                ZSs = tl.where(ZS == 0.0, 1.0, ZS)
+                PS = tl.exp(z - mS) / ZSs
+                dz += PS * (g - GS)
             if NEED_DK:
                 dk_acc += dz * q_v * SCALE
             if NEED_DV:
@@ -1540,8 +1556,9 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk):
     triton = K.triton
     R, T, nIH, hd = qI.shape
     Bm = kI.shape[1]
-    assert hd >= 16, 'triton indexer 打分内核要求 hd >= 16（其余形状走 ref 后端）'
+    assert hd >= 16 and hd & (hd - 1) == 0, 'triton indexer 打分内核要求 hd 为 2 的幂且 >= 16（其余形状走 ref 后端）'
     assert Bm <= 8192, 'Bm > 8192 超出单程序泳道寄存器预算——走 ref 后端'
+    assert R * T * Bm < 2 ** 31, 'scores 张量元素数超出 int32 地址预算——走 ref 后端并分块'
     qI = qI.contiguous()
     kI = kI.contiguous()
     w_idx = w_idx.contiguous()
@@ -1893,6 +1910,39 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
         results[f'attn.{nm}'] = _rel(ker_a[i], ref_a[i])
     if verbose:
         print(f'[selfcheck:{impl}:{str(dtype)}] attn  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith('attn.')))
+
+    # ---- 算子 3 退化配置对照：soft=None（HCA 臂）与 sink=None（use_sink=False）----
+    # 这两条路径的反向分解与默认配置不同（A 路单项 / 无 sink 列的 S 路），
+    # 必须与 eager 逐步对齐，之前未覆盖。
+    for cfg_tag, use_soft, use_sink in (('nosoft', False, True), ('nosink', True, False)):
+        for tag, mode in (('eager', None), (impl, impl)):
+            L_ = [t.detach().clone().requires_grad_(True) for t in leaves_a]
+            sk = sink0.detach().clone().requires_grad_(True)
+            sf = L_[5] if use_soft else None
+            sk_arg = sk if use_sink else None
+            if mode is None:
+                outs = []
+                for r in range(R):
+                    outs.append(L.gathered_attention(L_[0][r], L_[1][r], L_[2][r], topk_idx[r], last_tok[r].to(torch.int64), L_[3][r], L_[4][r], win, 1.0,
+                                                     soft=None if sf is None else sf[r], sink_logits=sk_arg, sel_valid=valid[r]))
+                out = torch.stack(outs, 0)
+            else:
+                out = gathered_attention_kernel(L_[0], L_[1], L_[2], topk_idx.to(torch.int32), last_tok, L_[3], L_[4], win, 1.0,
+                                                soft=sf, sink_logits=sk_arg, sel_valid=valid, impl=mode)
+            (out * go).sum().backward()
+            row = [out] + [t.grad for t in L_]
+            if use_sink:
+                row = row + [sk.grad]
+            if mode is None:
+                ref_d = row
+            else:
+                ker_d = row
+        names_d = ['out', 'gq', 'gkb', 'gvb', 'gksw', 'gvsw'] + (['gsoft'] if use_soft else []) + (['gsink'] if use_sink else [])
+        idxs_d = [0, 1, 2, 3, 4, 5] + ([6] if use_soft else []) + ([7] if use_sink else [])
+        for i, nm in zip(idxs_d, names_d):
+            results[f'attn_{cfg_tag}.{nm}'] = _rel(ker_d[i], ref_d[i])
+        if verbose:
+            print(f'[selfcheck:{impl}:{str(dtype)}] attn_{cfg_tag}  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith(f'attn_{cfg_tag}.')))
     return results
 
 

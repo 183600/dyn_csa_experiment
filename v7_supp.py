@@ -768,14 +768,15 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
         L.locked_json_update(spath, _drop_cell)
         out['stale_dropped'] = True
     booked = 0.0
+    _book_tok = f'warm|{key}|pid{os.getpid()}'
     if guard is not None:
         est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
         if prebook and est:
-            guard.book(est)
+            guard.book(est, token=_book_tok)
             booked = est
         if not guard.can_start(est):
             if booked:
-                guard.book(-booked)
+                guard.book(-booked, token=_book_tok)
             print(f'[cap] SKIP {key}: projected {est / 3600:.2f} h would pass the configured cap')
             out['status'] = 'skipped_cap'
             return out
@@ -823,7 +824,7 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
             calib_s = rec.get('train_time_s')
         guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'], calib_seconds=calib_s)
         if booked:
-            guard.book(-booked)
+            guard.book(-booked, token=_book_tok)
     gc.collect()
     if DEVICE.type == 'cuda':
         torch.cuda.empty_cache()
@@ -1318,7 +1319,12 @@ def run_niah_phase(payload, guard=None, label=''):
                 _ev_pref = f'{v}::seed{seed}::'
                 for _k in [_k for _k in summary if _k.startswith(_ev_pref)]:
                     del summary[_k]
-                L.atomic_write_json(spath, summary, indent=2)
+
+                def _drop_niah_evals(s, _pref=_ev_pref):
+                    for _k in [_k for _k in s if _k.startswith(_pref)]:
+                        del s[_k]
+                    return s
+                L.locked_json_update(spath, _drop_niah_evals)
                 if guard is not None:
                     est = guard.estimate_seconds(n_steps, d=256, n_layers=6, seq_len=512, batch_size=12)
                     if not guard.can_start(est):
@@ -1402,7 +1408,11 @@ def run_niah_phase(payload, guard=None, label=''):
                 if not cuda_healthy():
                     print(f'  [niah] CUDA context poisoned; skipping len={Ln}')
                     summary[key] = {'variant': v, 'seed': seed, 'seq_len': Ln, 'error': 'cuda_context_poisoned_before_eval'}
-                    L.atomic_write_json(spath, summary, indent=2)
+
+                    def _put_niah_err(s, _k=key, _r=summary[key]):
+                        s[_k] = _r
+                        return s
+                    L.locked_json_update(spath, _put_niah_err)
                     break
                 t0 = time.time()
                 try:
@@ -1414,7 +1424,11 @@ def run_niah_phase(payload, guard=None, label=''):
                 r.update({'variant': v, 'seed': seed, 'seq_len': Ln, 'params': _ckp['params'], 'probe_s': time.time() - t0, '_code': CKPT_CODE})
                 summary[key] = r
                 print(f'  [niah] {v:18s} s{seed} len={Ln:5d}  acc={r.get('acc')}  by_dist={r.get('by_dist')}')
-                L.atomic_write_json(spath, summary, indent=2)
+
+                def _put_niah(s, _k=key, _r=r):
+                    s[_k] = _r
+                    return s
+                L.locked_json_update(spath, _put_niah)
             del model, _ckp
             gc.collect()
             torch.cuda.empty_cache()
@@ -1518,7 +1532,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     mr = 4.0
     if v in PARAM_MATCHED_V7:
         mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant='csa_fixed_rope')
-    _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs12_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr{mr:.8g}-csa_fixed_rope_df{L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))}'
+    _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs{batch_size}_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr{mr:.8g}-csa_fixed_rope_df{L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))}'
     ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
     stale = False
     _ckp_pre = None
@@ -1548,14 +1562,15 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             return summary
         L.locked_json_update(spath, _drop_eval)
         booked = 0.0
+        _book_tok = f'lenphase|{v}::seed{seed}|pid{os.getpid()}'
         if guard is not None:
             est = guard.estimate_seconds(steps, d=256, n_layers=6, seq_len=train_len, batch_size=batch_size)
             if prebook and est:
-                guard.book(est)
+                guard.book(est, token=_book_tok)
                 booked = est
             if not guard.can_start(est):
                 if booked:
-                    guard.book(-booked)
+                    guard.book(-booked, token=_book_tok)
                 print(f'[cap] SKIP lenphase train {v} s{seed}')
                 out['status'] = 'skipped_cap'
                 return out
@@ -1571,7 +1586,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             if guard is not None:
                 guard.record_run(time.time() - t0, _sd_tr if _sd_tr else 0, 256, 6, train_len, batch_size)
                 if booked:
-                    guard.book(-booked)
+                    guard.book(-booked, token=_book_tok)
             out['status'] = 'truncated'
             out['truncated'] = True
             del _tr
@@ -1583,7 +1598,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         if guard is not None:
             guard.record_run(time.time() - t0, steps, 256, 6, train_len, batch_size, calib_seconds=_tr.get('train_time_s'))
             if booked:
-                guard.book(-booked)
+                guard.book(-booked, token=_book_tok)
         del model
         gc.collect()
         torch.cuda.empty_cache()
