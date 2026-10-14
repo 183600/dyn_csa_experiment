@@ -311,12 +311,14 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     for b0 in range(0, Bm, ch):
         b1 = min(b0 + ch, Bm)
         av = av_all[:, b0:b1]
+        # 这些 logit 张量都是本轮新算出的临时量（无别名），fill 原地进行——
+        # 值与出位版逐位相同，省一份同形分配。
         logit_a = _gather_rows(Za, g_a[:, b0:b1]) + Bp_a[None, None] * av
-        logit_a = logit_a.masked_fill(~av, _NEG_INF)
+        logit_a.masked_fill_(~av, _NEG_INF)
         if has_b:
             vm = jB[None, None, :, None] < geom.ov_len.to(torch.int64)[:, b0:b1, None, None]
             logit_b = _gather_rows(Zb, g_b[:, b0:b1]) + Bp_b[:, b0:b1] * vm
-            logit_b = logit_b.masked_fill(~vm, _NEG_INF)
+            logit_b.masked_fill_(~vm, _NEG_INF)
             WinZ = torch.cat([logit_a, logit_b], dim=2)
         else:
             WinZ = logit_a
@@ -377,12 +379,14 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     for b0 in range(0, Bm, ch):
         b1 = min(b0 + ch, Bm)
         av = av_all[:, b0:b1]
+        # 这些 logit 张量都是本轮新算出的临时量（无别名），fill 原地进行——
+        # 值与出位版逐位相同，省一份同形分配。
         logit_a = _gather_rows(Za, g_a[:, b0:b1]) + Bp_a[None, None] * av
-        logit_a = logit_a.masked_fill(~av, _NEG_INF)
+        logit_a.masked_fill_(~av, _NEG_INF)
         if has_b:
             vm = jB[None, None, :, None] < geom.ov_len.to(torch.int64)[:, b0:b1, None, None]
             logit_b = _gather_rows(Zb, g_b[:, b0:b1]) + Bp_b[:, b0:b1] * vm
-            logit_b = logit_b.masked_fill(~vm, _NEG_INF)
+            logit_b.masked_fill_(~vm, _NEG_INF)
             WinZ = torch.cat([logit_a, logit_b], dim=2)
         else:
             WinZ = logit_a
@@ -524,9 +528,12 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     causal = t_idx > last_tok[:, None, :].to(torch.int64)
     scores = torch.zeros((R, T, Bm), device=dev, dtype=torch.float32)
     for i in range(nIH):
+        # mul/relu 原地（s_i 是本轮新出的临时量，relu(x)>0 ⟺ x>0 逐位一致）；
+        # add_ 与 += 同一个核——每轮少两份 [R, T, Bm] 临时分配。
         s_i = torch.einsum('rth,rbh->rtb', qI[:, :, i, :].to(torch.float32), kI[:, :, i, :].to(torch.float32))
-        s_i = F.relu(s_i * iscale)
-        scores += s_i * w_idx[:, :, i:i + 1].to(torch.float32)
+        s_i *= iscale
+        F.relu_(s_i)
+        scores.add_(s_i * w_idx[:, :, i:i + 1].to(torch.float32))
     scores = scores.to(dtype)
     masked_lse = torch.where(causal, scores, torch.full_like(scores, _NEG_INF))
     lse = torch.logsumexp(masked_lse, dim=-1)
@@ -593,10 +600,12 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
         q_c = qI[:, t0:t1].to(torch.float32)
         s_list = []
         for i in range(nIH):
-            s_list.append(torch.einsum('rth,rbh->rtb', q_c[:, :, i, :], kI[:, :, i, :].to(torch.float32)) * iscale)
+            # 原地 relu：后面用到的 (s_i > 0) 与 relu(s_i)>0 逐位同真，
+            # dw 用的 relu(s_i) 即本张量自身——不再保留 relu 前的副本。
+            s_list.append(F.relu_(torch.einsum('rth,rbh->rtb', q_c[:, :, i, :], kI[:, :, i, :].to(torch.float32)) * iscale))
         s_all = torch.zeros_like(s_list[0])
         for i in range(nIH):
-            s_all = s_all + F.relu(s_list[i]) * w_idx[:, t0:t1, i:i + 1].to(torch.float32)
+            s_all.add_(s_list[i] * w_idx[:, t0:t1, i:i + 1].to(torch.float32))
         causal_c = causal[:, t0:t1]
         masked = torch.where(causal_c, s_all, torch.full_like(s_all, _NEG_INF))
         lse = torch.logsumexp(masked, dim=-1)
@@ -612,7 +621,8 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
             if need_dk:
                 dkI[:, :, i, :] += torch.einsum('rtb,rth->rbh', g, q_c[:, :, i, :]).to(dtype)
             if need_dw:
-                dw[:, t0:t1, i] += (ds * F.relu(s_i)).sum(dim=-1).to(dtype)
+                # s_i 已在上方原地 relu（relu(relu(x)) 与 relu(x) 逐位一致）。
+                dw[:, t0:t1, i] += (ds * s_i).sum(dim=-1).to(dtype)
     return dqI, dkI, dw
 
 
@@ -711,7 +721,7 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             Vw = _gather_rows(vw_all, src_win)
             zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1) * scale
             lane_ok = torch.cat([sel_ok, win_ok], dim=-1)
-            zA = zA.masked_fill(~lane_ok, MINL)
+            zA.masked_fill_(~lane_ok, MINL)
             if sink_v is None:
                 P_A = torch.softmax(zA, dim=-1) * (anyrow[:, :, None] if anyrow is not None else 1.0)
             else:
@@ -797,7 +807,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             Kl = torch.cat([Kb, Kw], dim=-2)
             Vl = torch.cat([Vb, Vw], dim=-2)
             zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1) * scale
-            zA = zA.masked_fill(~lane_ok, MINL)
+            zA.masked_fill_(~lane_ok, MINL)
             g = torch.einsum('rtd,rtmd->rtm', dOh, Vl)
             gh = g * (anyrow[:, :, None] if anyrow is not None else 1.0)
             P_S = GS = dzS = P_sinkS = P_sinkA = None
@@ -1188,9 +1198,12 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         dsoft = torch.zeros((R, T, nb), device=dev, dtype=dtype) if need_dsoft else q
         flat = topk_idx.reshape(R, T * nb).to(torch.int64)
         order = flat.argsort(dim=1, stable=True).to(torch.int32).contiguous()
-        # 整数直方图的向量化：等价于逐行 bincount(minlength=Bm)，
-        # 省去 R 次小 kernel 发射。
-        cnt = (flat[:, :, None] == torch.arange(Bm, device=dev)[None, None, :]).sum(dim=1)
+        # 整数直方图（等价于逐行 bincount(minlength=Bm)）：整数键的
+        # scatter_add_ 精确且与写入顺序无关（整数加法可交换、无舍入），
+        # 避免 [R, T·nb, Bm] 等大布尔广播——显存从 O(R·T·nb·Bm) 降为
+        # O(R·T·nb + R·Bm)，Bm 随 T 增长时差异是数量级的。
+        cnt = torch.zeros((R, Bm), device=dev, dtype=torch.int64)
+        cnt.scatter_add_(1, flat, torch.ones_like(flat))
         offs = torch.zeros((R, Bm + 1), device=dev, dtype=torch.int64)
         offs[:, 1:] = cnt.cumsum(dim=1)
         K.attn_bwd_dkdv_blocks[(R * Bm * nh,)](
@@ -1687,7 +1700,20 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         counts = getattr(base, '_pool_cpu', None)
         if counts is None:
             raise RuntimeError('blocks_fixed 未携带 _pool_cpu——分段器出口被绕过')
-        bid_full = base[None, :].to(torch.int32).expand(B, T).contiguous()
+        # blocks_fixed 经 _IDX_CACHE 全局缓存（同一对象贯穿全部层/步），
+        # bid_full 是该对象内容的纯整型函数（transport only）——按 (B, device)
+        # 缓存在对象上，消掉每层每步的 [B, T] int32 expand+contiguous 分配
+        # 及其在 autograd 图里的逐层持有。
+        _bkey = (int(B), str(dev))
+        _bc = getattr(base, '_bidfull_cache', None)
+        if _bc is None:
+            _bc = {}
+            base._bidfull_cache = _bc
+        bid_full = _bc.get(_bkey)
+        if bid_full is None:
+            with torch.inference_mode(False):
+                bid_full = base[None, :].to(torch.int32).expand(B, T).contiguous()
+            _bc[_bkey] = bid_full
         counts_rows = [counts[0]] * B
         nblks = [len(counts[0])] * B
         hons = None
