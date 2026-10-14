@@ -235,6 +235,14 @@ class PoolGeometry:
 _GEOM_CACHE = {}
 _GEOM_CACHE_CAP = 16
 _ARANGE_CACHE = {}
+_ARANGE_CACHE_CAP = 8
+
+
+def _full_arange_evict():
+    # 与 _GEOM_CACHE 同一套 FIFO 淘汰：(B, T, Bm) 组合数无天然上界
+    # （例如 eval 长度扫描），缓存条目数必须有上界。
+    while len(_ARANGE_CACHE) >= _ARANGE_CACHE_CAP:
+        _ARANGE_CACHE.pop(next(iter(_ARANGE_CACHE)))
 
 
 def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
@@ -254,6 +262,7 @@ def _full_arange_cached(B, T, Bm, device):
     key = (int(B), int(T), int(Bm), str(device))
     out = _ARANGE_CACHE.get(key)
     if out is None:
+        _full_arange_evict()
         out = torch.arange(Bm, device=device, dtype=torch.int32)[None, None, :].expand(B, T, Bm).contiguous()
         _ARANGE_CACHE[key] = out
     return out
@@ -527,13 +536,18 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     t_idx = torch.arange(T, device=dev)[None, :, None]
     causal = t_idx > last_tok[:, None, :].to(torch.int64)
     scores = torch.zeros((R, T, Bm), device=dev, dtype=torch.float32)
+    # fp32 升型整体只做一次（逐片 cast 的值与整张 cast 后取片逐位一致）：
+    # 否则每个头都重复拷贝一次 qI / kI / w_idx 的 fp32 版本。
+    qIf = qI if qI.dtype == torch.float32 else qI.to(torch.float32)
+    kIf = kI if kI.dtype == torch.float32 else kI.to(torch.float32)
+    wf = w_idx if w_idx.dtype == torch.float32 else w_idx.to(torch.float32)
     for i in range(nIH):
         # mul/relu 原地（s_i 是本轮新出的临时量，relu(x)>0 ⟺ x>0 逐位一致）；
         # add_ 与 += 同一个核——每轮少两份 [R, T, Bm] 临时分配。
-        s_i = torch.einsum('rth,rbh->rtb', qI[:, :, i, :].to(torch.float32), kI[:, :, i, :].to(torch.float32))
+        s_i = torch.einsum('rth,rbh->rtb', qIf[:, :, i, :], kIf[:, :, i, :])
         s_i *= iscale
         F.relu_(s_i)
-        scores.add_(s_i * w_idx[:, :, i:i + 1].to(torch.float32))
+        scores.add_(s_i * wf[:, :, i:i + 1])
     scores = scores.to(dtype)
     masked_lse = torch.where(causal, scores, torch.full_like(scores, _NEG_INF))
     lse = torch.logsumexp(masked_lse, dim=-1)
@@ -595,6 +609,10 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
     dqI = torch.zeros_like(qI) if need_dq else None
     dkI = torch.zeros_like(kI) if need_dk else None
     dw = torch.zeros_like(w_idx) if need_dw else None
+    # kI / w_idx 与 t 分块无关：fp32 升型在分块循环外只做一次（整型内容
+    # 不变，逐位一致），消掉每个 t-chunk × 每头的重复拷贝。
+    kIf = kI if kI.dtype == torch.float32 else kI.to(torch.float32)
+    wf = w_idx if w_idx.dtype == torch.float32 else w_idx.to(torch.float32)
     for t0 in range(0, T, t_chunk):
         t1 = min(t0 + t_chunk, T)
         q_c = qI[:, t0:t1].to(torch.float32)
@@ -602,10 +620,10 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
         for i in range(nIH):
             # 原地 relu：后面用到的 (s_i > 0) 与 relu(s_i)>0 逐位同真，
             # dw 用的 relu(s_i) 即本张量自身——不再保留 relu 前的副本。
-            s_list.append(F.relu_(torch.einsum('rth,rbh->rtb', q_c[:, :, i, :], kI[:, :, i, :].to(torch.float32)) * iscale))
+            s_list.append(F.relu_(torch.einsum('rth,rbh->rtb', q_c[:, :, i, :], kIf[:, :, i, :]) * iscale))
         s_all = torch.zeros_like(s_list[0])
         for i in range(nIH):
-            s_all.add_(s_list[i] * w_idx[:, t0:t1, i:i + 1].to(torch.float32))
+            s_all.add_(s_list[i] * wf[:, t0:t1, i:i + 1])
         causal_c = causal[:, t0:t1]
         masked = torch.where(causal_c, s_all, torch.full_like(s_all, _NEG_INF))
         lse = torch.logsumexp(masked, dim=-1)
@@ -615,9 +633,9 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
         ds = torch.where(causal_c & torch.isfinite(s_all), ds, torch.zeros_like(ds))
         for i in range(nIH):
             s_i = s_list[i]
-            g = ds * w_idx[:, t0:t1, i:i + 1].to(torch.float32) * (s_i > 0) * iscale
+            g = ds * wf[:, t0:t1, i:i + 1] * (s_i > 0) * iscale
             if need_dq:
-                dqI[:, t0:t1, i, :] += torch.einsum('rtb,rbh->rth', g, kI[:, :, i, :].to(torch.float32)).to(dtype)
+                dqI[:, t0:t1, i, :] += torch.einsum('rtb,rbh->rth', g, kIf[:, :, i, :]).to(dtype)
             if need_dk:
                 dkI[:, :, i, :] += torch.einsum('rtb,rth->rbh', g, q_c[:, :, i, :]).to(dtype)
             if need_dw:
