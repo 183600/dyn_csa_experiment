@@ -628,7 +628,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     decay = [p for n_, p in model.named_parameters() if p.requires_grad and (not is_no_decay(n_)) and (not is_delta(n_))]
     ndecay = [p for n_, p in model.named_parameters() if p.requires_grad and is_no_decay(n_) and (not is_delta(n_))]
     dpar = [p for n_, p in model.named_parameters() if p.requires_grad and is_delta(n_)]
-    opt = torch.optim.AdamW([{'params': decay, 'weight_decay': weight_decay, 'lr_scale': 1.0}, {'params': ndecay, 'weight_decay': 0.0, 'lr_scale': 1.0}, {'params': dpar, 'weight_decay': 0.0, 'lr_scale': delta_lr_mult}], lr=lr)
+    opt = torch.optim.AdamW([{'params': decay, 'weight_decay': weight_decay, 'lr_scale': 1.0}, {'params': ndecay, 'weight_decay': 0.0, 'lr_scale': 1.0}, {'params': dpar, 'weight_decay': 0.0, 'lr_scale': delta_lr_mult}], lr=lr, foreach=True)
 
     def lr_at(step):
         if warmup > 0 and step < warmup:
@@ -1335,7 +1335,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 # 随机源在建模前一刻定界：同 seed 下各臂的共享组件（tok/head/MLP）必须同构
                 L.set_seed(seed)
                 model = L.SmallGPT(vocab, 256, 6, 8, 32, 512, cfgs, mlp_ratio=mr).to(DEVICE)
-                opt = torch.optim.AdamW(model.parameters(), lr=0.0003)
+                opt = torch.optim.AdamW(model.parameters(), lr=0.0003, foreach=True)
                 model.train()
                 cache = {'ids': None, 'tgt': None, 'age': 10 ** 9, 'epoch': 0}
 
