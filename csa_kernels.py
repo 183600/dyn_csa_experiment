@@ -535,42 +535,51 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     dtype = qI.dtype
     t_idx = torch.arange(T, device=dev)[None, :, None]
     causal = t_idx > last_tok[:, None, :].to(torch.int64)
-    scores = torch.zeros((R, T, Bm), device=dev, dtype=torch.float32)
     # fp32 升型整体只做一次（逐片 cast 的值与整张 cast 后取片逐位一致）：
     # 否则每个头都重复拷贝一次 qI / kI / w_idx 的 fp32 版本。
     qIf = qI if qI.dtype == torch.float32 else qI.to(torch.float32)
     kIf = kI if kI.dtype == torch.float32 else kI.to(torch.float32)
     wf = w_idx if w_idx.dtype == torch.float32 else w_idx.to(torch.float32)
-    for i in range(nIH):
-        # mul/relu 原地（s_i 是本轮新出的临时量，relu(x)>0 ⟺ x>0 逐位一致）；
-        # add_ 与 += 同一个核——每轮少两份 [R, T, Bm] 临时分配。
-        s_i = torch.einsum('rth,rbh->rtb', qIf[:, :, i, :], kIf[:, :, i, :])
-        s_i *= iscale
-        F.relu_(s_i)
-        scores.add_(s_i * wf[:, :, i:i + 1])
-    scores = scores.to(dtype)
-    masked_lse = torch.where(causal, scores, torch.full_like(scores, _NEG_INF))
-    lse = torch.logsumexp(masked_lse, dim=-1)
-    cf = causal & torch.isfinite(scores)
-    work = torch.where(cf, scores, torch.full_like(scores, _NEG_INF))
     k_out = min(int(topk), Bm)
     bcol = torch.arange(Bm, device=dev, dtype=torch.int64)[None, None, :]
     big = torch.full_like(bcol, Bm + 1)
-    has_causal = causal.any(dim=-1)
-    pad_blk = torch.where(causal, bcol, big).min(dim=-1).values
-    pad_blk = torch.where(has_causal, pad_blk, torch.zeros_like(pad_blk))
-    # 逐轮「首达最大值」提取 == 稳定降序排序的前缀（tie 取最早下标，
-    # 见上文 docstring）：一次 torch.sort 替代 k 轮全宽 max/where/min 循环。
-    sval, sidx = torch.sort(work, dim=-1, descending=True, stable=True)
-    top_val = sval[:, :, :k_out]
-    top_idx = sidx[:, :, :k_out]
-    has = top_val > -1e30
-    idx = torch.where(has, top_idx, pad_blk[:, :, None]).to(torch.int32)
-    valid = has
-    sv = top_val - lse[:, :, None]
-    sv = torch.where(has & torch.isfinite(lse)[:, :, None],
-                     torch.exp(sv), torch.zeros_like(sv))
-    soft = torch.where(sv == sv, sv, torch.zeros_like(sv))
+    idx = torch.empty((R, T, k_out), device=dev, dtype=torch.int32)
+    valid = torch.empty((R, T, k_out), device=dev, dtype=torch.bool)
+    soft = torch.empty((R, T, k_out), device=dev, dtype=torch.float32)
+    # 逐行独立的 (r,t) 归约（mask/lse/sort/topk）：按 t 分块与整幅计算的
+    # 每行值逐位一致（同 kernel、同归约顺序），峰值显存按块封顶。
+    t_chunk = max(1, min(T, (256 << 20) // max(R * Bm * 32, 1)))
+    for t0 in range(0, T, t_chunk):
+        t1 = min(t0 + t_chunk, T)
+        causal_c = causal[:, t0:t1]
+        scores = torch.zeros((R, t1 - t0, Bm), device=dev, dtype=torch.float32)
+        for i in range(nIH):
+            # mul/relu 原地（s_i 是本轮新出的临时量，relu(x)>0 ⟺ x>0 逐位一致）；
+            # add_ 与 += 同一个核——每轮少两份 [R, t, Bm] 临时分配。
+            s_i = torch.einsum('rth,rbh->rtb', qIf[:, t0:t1, i, :], kIf[:, :, i, :])
+            s_i *= iscale
+            F.relu_(s_i)
+            scores.add_(s_i * wf[:, :, i:i + 1])
+        scores = scores.to(dtype)
+        masked_lse = torch.where(causal_c, scores, torch.full_like(scores, _NEG_INF))
+        lse = torch.logsumexp(masked_lse, dim=-1)
+        cf = causal_c & torch.isfinite(scores)
+        work = torch.where(cf, scores, torch.full_like(scores, _NEG_INF))
+        has_causal = causal_c.any(dim=-1)
+        pad_blk = torch.where(causal_c, bcol, big).min(dim=-1).values
+        pad_blk = torch.where(has_causal, pad_blk, torch.zeros_like(pad_blk))
+        # 逐轮「首达最大值」提取 == 稳定降序排序的前缀（tie 取最早下标，
+        # 见上文 docstring）：一次 torch.sort 替代 k 轮全宽 max/where/min 循环。
+        sval, sidx = torch.sort(work, dim=-1, descending=True, stable=True)
+        top_val = sval[:, :, :k_out]
+        top_idx = sidx[:, :, :k_out]
+        has = top_val > -1e30
+        valid[:, t0:t1] = has
+        idx[:, t0:t1] = torch.where(has, top_idx, pad_blk[:, :, None]).to(torch.int32)
+        sv = top_val - lse[:, :, None]
+        sv = torch.where(has & torch.isfinite(lse)[:, :, None],
+                         torch.exp(sv), torch.zeros_like(sv))
+        soft[:, t0:t1] = torch.where(sv == sv, sv, torch.zeros_like(sv))
     return idx, valid, soft.to(dtype)
 
 

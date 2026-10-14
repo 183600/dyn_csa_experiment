@@ -330,23 +330,33 @@ def causal_adaptive_threshold(sim, target_block_tokens):
             'adaptive 分段器不支持该序列长度——请改用 chunking="cosine_learnable"')
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
     # 1-D (single row) or 2-D (batched rows) — every op is rowwise
-    # independent, so the batched form is value-identical per row while
-    # issuing one kernel chain instead of one per row.
+    # independent, so row-chunking the batch dim is value-identical per row:
+    # same kernels, same per-row reduction order, but peak transient memory
+    # scales with the chunk instead of the full batch.
     squeeze = sim.dim() == 1
     x = (sim.unsqueeze(0) if squeeze else sim).detach().float()
     n = x.shape[-1]
     idx = _arange_cache(n, sim.device)
-    masked = torch.where(idx[None, None, :] <= idx[None, :, None], x[:, None, :], float('inf'))
-    srt = masked.sort(dim=-1).values
     pos = q * idx
     lo = pos.floor().long()
     frac = pos - lo
-    lo_v = srt.gather(-1, lo.clamp(max=n - 1).expand(x.shape[0], n)[..., None]).squeeze(-1)
-    hi_v = srt.gather(-1, (lo + 1).clamp(max=n - 1).expand(x.shape[0], n)[..., None]).squeeze(-1)
-    interp = lo_v * (1.0 - frac) + hi_v * frac
+    lo_c = lo.clamp(max=n - 1)[..., None]
+    hi_c = (lo + 1).clamp(max=n - 1)[..., None]
     use_hi = (frac > 0.0) & (lo + 1 <= idx)
-    out = torch.where(use_hi, interp, lo_v)
-    out = torch.where(idx == 0, torch.full_like(out, float('-inf')), out)
+    first_row = idx == 0
+    # chunk budget keeps the transient [rows, n, n] sort input bounded.
+    row_chunk = max(1, (256 << 20) // max(n * n * 4, 1))
+    out = torch.empty_like(x)
+    for r0 in range(0, x.shape[0], row_chunk):
+        b = min(row_chunk, x.shape[0] - r0)
+        masked = torch.where(idx[None, None, :] <= idx[None, :, None],
+                             x[r0:r0 + b, None, :], float('inf'))
+        srt = masked.sort(dim=-1).values
+        lo_v = srt.gather(-1, lo_c.expand(b, n, 1)).squeeze(-1)
+        hi_v = srt.gather(-1, hi_c.expand(b, n, 1)).squeeze(-1)
+        interp = lo_v * (1.0 - frac) + hi_v * frac
+        oc = torch.where(use_hi, interp, lo_v)
+        out[r0:r0 + b] = torch.where(first_row, torch.full_like(oc, float('-inf')), oc)
     out = out.to(sim.device)
     return out.squeeze(0) if squeeze else out
 
@@ -569,8 +579,19 @@ def first_occurrence_mask(idx):
     # that stability places first — which is the earliest original column.
     # Identical output on either branch.
     if idx.shape[1] <= 64:
-        dup = (idx[:, :, None] == idx[:, None, :]).triu_(1).any(dim=1)
-        return ~dup
+        # rowwise-independent: chunk rows to bound the transient [rows,k,k]
+        # comparison matrix; per-row results are identical either way.
+        k = idx.shape[1]
+        row_chunk = max(1, (128 << 20) // max(k * k, 1))
+        if row_chunk >= idx.shape[0]:
+            dup = (idx[:, :, None] == idx[:, None, :]).triu_(1).any(dim=1)
+            return ~dup
+        out = torch.empty_like(idx, dtype=torch.bool)
+        for r0 in range(0, idx.shape[0], row_chunk):
+            r1 = min(r0 + row_chunk, idx.shape[0])
+            dup = (idx[r0:r1, :, None] == idx[r0:r1, None, :]).triu_(1).any(dim=1)
+            out[r0:r1] = ~dup
+        return out
     order = torch.argsort(idx, dim=1, stable=True)
     sorted_idx = idx.gather(1, order)
     first = torch.ones_like(sorted_idx, dtype=torch.bool)
