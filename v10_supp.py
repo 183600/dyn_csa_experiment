@@ -67,6 +67,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
     k = int(round(rho * n_far))
     nll_sum = []
     n_tok = []
+    _sum_parts = []
     n_ch = max(1, int(cfg['chunk']))
     if chunk_mem is not None:
         n_ch = max(1, min(n_ch, int(chunk_mem.get(eval_len, n_ch))))
@@ -109,13 +110,16 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
             raise
         tgt = ids[:, 1:]
         _ce = F.cross_entropy(logits.reshape(-1, vocab), tgt[:, -target:].reshape(-1), reduction='none').view(len(rows), target)
-        _sums = _ce.sum(dim=1, dtype=torch.float64).tolist()
-        nll_sum.extend(map(float, _sums))
+        # keep each chunk's fp64 row-sums on device (fp64 values unchanged);
+        # one host transfer at the end instead of a per-chunk .tolist() sync.
+        _sum_parts.append(_ce.sum(dim=1, dtype=torch.float64))
         n_tok.extend([target] * len(rows))
-        del ids, logits, tgt, _ce, _sums
+        del ids, logits, tgt, _ce
         if chunk_mem is not None:
             chunk_mem[eval_len] = n_ch
         i = j
+    if _sum_parts:
+        nll_sum.extend(map(float, torch.cat(_sum_parts).tolist()))
     return (nll_sum, n_tok)
 
 def _cell_ppl(nll_sum, n_tok):

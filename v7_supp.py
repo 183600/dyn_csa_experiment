@@ -213,7 +213,9 @@ class HybridAttentionRoPE(L.HybridAttention):
                     # gate has length T-1 (consecutive-pair cosine similarities),
                     # so the honoured mask must too (cf. exp_lib._single_rope).
                     _hon = torch.zeros(T - 1, dtype=gate.dtype, device=gate.device)
-                    _hon[list(_hon_d)] = 1.0
+                    # batched one-shot index upload instead of a Python-list
+                    # __setitem__ (which re-converts the list each forward)
+                    _hon[torch.as_tensor(list(_hon_d), dtype=torch.long, device=gate.device)] = 1.0
                     _soft_hon = gate * _hon
                     _shs = _soft_hon.sum()
                     gate_mean = (float(nblk - 1) + _shs - _shs.detach()) / T
@@ -519,14 +521,22 @@ class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
         return L.Block(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
 
     def forward(self, ids, logits_tail=None):
+        x = self.trunk(ids)
+        if logits_tail:
+            x = x[:, -logits_tail:]
+        return self.head(x)
+
+    def trunk(self, ids):
+        # RoPE embedding form of exp_lib.SmallGPT.trunk — trunk is dispatched
+        # here by the inherited ce_loss; comp_reg terms accumulate in the same
+        # order as the old two-pass forward (zeros init + per-block adds).
         T = ids.shape[1]
         x = self.tok(ids)
         if getattr(self, 'use_abs_pe', True):
             x = x + self.pos(L._arange_cache(T, ids.device))
-        for blk in self.blocks:
-            x = blk(x)
         reg = torch.zeros((), device=ids.device)
         for blk in self.blocks:
+            x = blk(x)
             gm = blk.attn.last_gate_mean
             if gm is not None:
                 Lb = max(blk.attn.cfg.target_block_tokens, 1)
@@ -538,9 +548,7 @@ class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
                     gm = tot / len(gm)
                 reg = reg + mult * (gm * Lb - 1.0) ** 2
         self.comp_reg = reg
-        if logits_tail:
-            x = x[:, -logits_tail:]
-        return self.head(self.norm(x))
+        return self.norm(x)
 
 def make_layer_cfgs_v7(n_layers, variant):
     if variant == 'csa_fixed_rope':
@@ -671,9 +679,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             for g in opt.param_groups:
                 g['lr'] = base * g.get('lr_scale', 1.0)
             x, y = next(bpe)
-            logits = model(x)
-            ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
             logits = None
+            ce = model.ce_loss(x, y, vocab)
             loss = ce + comp_lambda * model.comp_reg
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -945,6 +952,11 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
         correct = np.zeros_like(tgt, dtype=bool)
         span = min(seq_len, max_pos) if getattr(model, 'use_abs_pe', True) else seq_len
         tail = 2 * n_pairs
+        # targets uploaded once and the per-chunk comparison done on-device:
+        # only the [n_seq, tail-1] bool strip crosses the bus at the end instead
+        # of an [chunk, tail-1] argmax download (with its CUDA sync) per chunk.
+        tgt_dev = L._h2d_async(tgt, torch.int64, device)
+        correct_dev = torch.zeros(n_seq, tail - 1, dtype=torch.bool, device=device)
         i = 0
         while i < n_seq:
             j = min(i + chunk, n_seq)
@@ -962,11 +974,12 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
                 chunk = max(1, chunk // 2)
                 print(f'[niah] eval OOM; retrying with chunk={chunk}')
                 continue
-            pred = logits[:, :-1].argmax(-1).cpu().numpy()
-            t = tgt[i:j, -(tail - 1):]
-            correct[i:j, -(tail - 1):] = (pred == t) & (t >= 0)
+            _t = tgt_dev[i:j, -(tail - 1):]
+            correct_dev[i:j] = (logits[:, :-1].argmax(-1) == _t) & (_t >= 0)
             del x, logits
             i = j
+        correct[:, -(tail - 1):] = correct_dev.cpu().numpy()
+        del tgt_dev, correct_dev
         scored_cols = tail - 1
         m = np.zeros_like(tgt, dtype=bool)
         m[:, -scored_cols:] = tgt[:, -scored_cols:] >= 0

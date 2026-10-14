@@ -724,22 +724,20 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     Zam = _take_2d(Zas, g_a)
     Xbm = _take_2d(Xbs, g_b)
     Zbm = _take_2d(Zbs, g_b)
-    # Mask before the position-embedding add and restrict the add to valid
-    # lanes: invalid (pad) lanes are set to -inf either way, and an -inf lane
-    # contributes exactly 0 through the softmax/nan_to_num below, so the
-    # forward values and the B_pos gradients (zero on invalid lanes in both
-    # forms) are identical to the add-everything-then-mask form — while the
-    # gather+add now only touches valid lanes on ragged dynamic layouts.
-    _ma3 = mask_a[:, :, None].expand_as(Zam)
-    _mb3 = mask_b[:, :, None].expand_as(Zbm)
+    # Position-embedding add restricted to valid lanes arithmetically
+    # (one fused multiply-add, no boolean nonzero/index_put and no ragged
+    # gather): multiplying by the 0/1 mask adds exactly the same values on
+    # valid lanes and exactly 0 on pad lanes; pad lanes are then overwritten
+    # with -inf. Forward values and B_pos gradients (zero on invalid lanes in
+    # both forms) are identical to the previous boolean-index form.
+    Zam = Zam + B_pos_a[_pos_a][None] * mask_a[:, :, None]
+    Zbm = Zbm + B_pos_b[b_off] * mask_b[:, :, None]
     # the fill mask broadcasts: masked_fill_ accepts a broadcastable mask, so
     # the negation materializes [B, L, 1] instead of the full [B, L, c] form —
     # the same booleans reach every lane (broadcast reads are exact), and the
     # smaller mask is what autograd saves for the masked_fill backward.
     Zam.masked_fill_(~mask_a[:, :, None], float('-inf'))
     Zbm.masked_fill_(~mask_b[:, :, None], float('-inf'))
-    Zam[_ma3] += B_pos_a[_pos_a].expand(Zam.shape[0], -1, -1)[_ma3]
-    Zbm[_mb3] += B_pos_b[b_off][_mb3]
     WinZ = torch.cat([Zam, Zbm], 1)
     sc = F.softmax(WinZ, dim=1)
     sc = torch.nan_to_num(sc)
@@ -786,15 +784,14 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     Xb = _take_2d(Xs, g)
     Zb = _take_2d(Zs, g)
     WinZ = Zb
-    # Same valid-lane-only position add as _pool_ordered: pad lanes are -inf
-    # before/after either form, and their (exactly zero) softmax gradient is
-    # unchanged, so the values and gradients are identical to masking after a
-    # full-width add.
-    _m3 = mask[:, :, None].expand_as(WinZ)
+    # Same arithmetic valid-lane-only position add as _pool_ordered: the 0/1
+    # mask multiply adds exactly the same values on valid lanes and 0 on pad
+    # lanes, which the fill then sets to -inf — identical values and gradients
+    # to the previous boolean-index form, without the index_put/ragged gather.
+    WinZ = WinZ + B_pos[_pos_a][None] * mask[:, :, None]
     # broadcast fill mask (same argument as _pool_ordered): identical booleans
     # per lane, without materializing the full-size negated mask.
     WinZ.masked_fill_(~mask[:, :, None], float('-inf'))
-    WinZ[_m3] += B_pos[_pos_a].expand(WinZ.shape[0], -1, -1)[_m3]
     sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
     comp = (sc * Xb).sum(1)
     return (comp, order[last_idx], B)
@@ -1729,12 +1726,20 @@ class SmallGPT(nn.Module):
         return Block(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
 
     def forward(self, ids, logits_tail=None):
+        x = self.trunk(ids)
+        if logits_tail:
+            x = x[:, -logits_tail:]
+        return self.head(x)
+
+    def trunk(self, ids):
+        # Full forward minus the LM head; sets self.comp_reg exactly as forward
+        # did (the reg terms are accumulated inside the single block loop — same
+        # addition order as the previous two-pass form).
         T = ids.shape[1]
         x = self.tok(ids) + self.pos.weight[:T]
-        for blk in self.blocks:
-            x = blk(x)
         reg = None
         for blk in self.blocks:
+            x = blk(x)
             gm = blk.attn.last_gate_mean
             if gm is not None:
                 Lb = max(blk.attn.cfg.target_block_tokens, 1)
@@ -1749,9 +1754,22 @@ class SmallGPT(nn.Module):
         if reg is None:
             reg = torch.zeros((), device=ids.device)
         self.comp_reg = reg
-        if logits_tail:
-            x = x[:, -logits_tail:]
-        return self.head(self.norm(x))
+        return self.norm(x)
+
+    def ce_loss(self, ids, targets, vocab, chunk=64):
+        # LM-head cross-entropy computed in time chunks: the chunk sums add to
+        # the same total as the full-batch form (up to fp reduction order), so
+        # the scalar and its gradients are unchanged, while the peak logits
+        # transient is ~1/chunk of the full [B, T, vocab] tensor — the dominant
+        # memory term of a training step.
+        h = self.trunk(ids)
+        n_tok = targets.numel()
+        ce = None
+        for s in range(0, ids.shape[1], chunk):
+            lg = self.head(h[:, s:s + chunk])
+            c = F.cross_entropy(lg.reshape(-1, vocab), targets[:, s:s + chunk].reshape(-1), reduction='sum')
+            ce = c if ce is None else ce + c
+        return ce / n_tok
 OVERLAP = 8
 _WARM_KEY_RE = re.compile('.*::w(\\d+)::seed\\d+$')
 
@@ -3321,9 +3339,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             for g in opt.param_groups:
                 g['lr'] = base * g.get('lr_scale', 1.0)
             x, y = next(bpe)
-            logits = model(x)
-            ce = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
-            del x, y, logits
+            ce = model.ce_loss(x, y, vocab)
+            del x, y
             loss = ce + comp_lambda * model.comp_reg
             opt.zero_grad(set_to_none=True)
             loss.backward()
