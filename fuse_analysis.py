@@ -231,7 +231,11 @@ def main(argv=None):
     lines.append('# fuse vs no-fuse — 零 GPU 边界统计对比（全部数字由落盘产物计算）\n')
     _abl_n = {v: len(_seeds_of(v)) for v in ('hybrid_csa_dyn', 'hybrid_csa_dyn_fuse', 'csa_dyn_fuse')}
     _core_n = len(_seeds_of('csa_dynamic'))
-    lines.append(f'> 数据来源：`results_lm_v4_abl/summary.json`（1500 步 × {_abl_n} seeds/variant，seq 512）与\n> `results_lm_v3_1500/summary.json`（同配置核心面板，csa_dynamic × {_core_n} seeds）。无权重、无 GPU，\n> 仅使用每条 run 记录的 `stats`（逐层边界对齐 + 块长统计）与 `ppl_history`。\n')
+    if len(set(_abl_n.values())) == 1:
+        _abl_n_txt = str(next(iter(_abl_n.values())))
+    else:
+        _abl_n_txt = '、'.join((f'`{v}` {n}' for v, n in sorted(_abl_n.items())))
+    lines.append(f'> 数据来源：`results_lm_v4_abl/summary.json`（1500 步 × {_abl_n_txt} seeds/variant，seq 512）与\n> `results_lm_v3_1500/summary.json`（同配置核心面板，csa_dynamic × {_core_n} seeds）。无权重、无 GPU，\n> 仅使用每条 run 记录的 `stats`（逐层边界对齐 + 块长统计）与 `ppl_history`。\n')
     lines.append('**容差说明（诚实记录）**：落盘的边界对齐只在 `tol=1` 下计算（`boundary_alignment(..., tol=1)`），逐 token 的切点位置未保存、模型权重未保存，因此**无法离线重算其它容差**。下文改用 precision / recall / 相对随机基线的超额（excess）分解来回答「F1 提升从哪来、是否真实」——这一分解对容差选择不敏感。\n')
     def _pair_cells_ok(a, b, seeds):
         try:

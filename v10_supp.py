@@ -409,7 +409,7 @@ def _hist_by_seed(outdir, variant, raw=None):
             _new_cur = isinstance(r.get('run_cfg'), str) and r['run_cfg'].endswith(_cur_sfx)
             _old_cur = isinstance(cfg_of.get(_s0), str) and cfg_of[_s0].endswith(_cur_sfx)
             if _new_real and (synth_of.get(_s0) or (_new_cur and not _old_cur)):
-                if s in out:
+                if s != _s0 and s in out:
                     print(f'[stats] {sp}: seed {s} of `{variant}` matches the curve of seed {_s0} but a DIFFERENT record already holds seed {s} — the panel is ambiguous; keeping the existing admissions and dropping this record')
                     continue
                 seen.pop(fp)
