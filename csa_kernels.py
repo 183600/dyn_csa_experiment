@@ -617,8 +617,11 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     - top-k 掩码是因果 ∧ 有限（cf），与 eager 的 `cf = causal & finite`
       一致；tie 规则 = 稳定降序排序的最早下标——逐轮「首达最大值」提取
       与 torch.sort(stable=True, descending=True) 的前缀严格同序；
-    - 有效槽位不足 k 时，尾部以 pad_blk（首个因果块；无因果块时为 0）
-      填充，valid=False——与 eager 的 compaction+padding 一致；
+    - 有效槽位不足 k 时，尾部以块 0 填充，valid=False——与 eager 的
+      compaction+padding 逐位一致（eager 的 pad_blk 恒为 0：池化给出的
+      last_tok 单调不减，首个因果块必为块 0，两种形式对所有池化输入
+      同值；此处直接取 eager 形式，非单调 last_tok 的独立调用也不再
+      分叉）；
     - soft 在无效槽位直接置 0（eager 在下游乘 keep=0，值等价）。
     """
     R, T, nIH, hd = qI.shape
@@ -634,8 +637,6 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     kIf = kI if kI.dtype == torch.float32 else kI.to(torch.float32)
     wf = w_idx if w_idx.dtype == torch.float32 else w_idx.to(torch.float32)
     k_out = min(int(topk), Bm)
-    bcol = torch.arange(Bm, device=dev, dtype=torch.int64)[None, None, :]
-    big = torch.full_like(bcol, Bm + 1)
     idx = torch.empty((R, T, k_out), device=dev, dtype=torch.int32)
     valid = torch.empty((R, T, k_out), device=dev, dtype=torch.bool)
     soft = torch.empty((R, T, k_out), device=dev, dtype=torch.float32)
@@ -666,9 +667,9 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
         lse = torch.logsumexp(masked_lse, dim=-1)
         cf = causal_c & torch.isfinite(scores)
         work = torch.where(cf, scores, torch.full_like(scores, _NEG_INF))
-        has_causal = causal_c.any(dim=-1)
-        pad_blk = torch.where(causal_c, bcol, big).min(dim=-1).values
-        pad_blk = torch.where(has_causal, pad_blk, torch.zeros_like(pad_blk))
+        # pad 恒为块 0（eager 形式；池化 last_tok 单调时与「首个因果块」
+        # 同值——那种形式的首个因果块必为块 0）。
+        pad_blk = torch.zeros((R, t1 - t0), device=dev, dtype=torch.int64)
         # 逐轮「首达最大值」提取 == 稳定降序排序的前缀（tie 取最早下标，
         # 见上文 docstring）：一次 torch.sort 替代 k 轮全宽 max/where/min 循环。
         sval, sidx = torch.sort(work, dim=-1, descending=True, stable=True)
@@ -1062,7 +1063,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
 class FusedSparseAttention(torch.autograd.Function):
     """稀疏注意力的可微封装：前向 = A 路径（与 eager 的直通估计器前向值
     严格一致）；反向按 _attn_bwd_ref 的 A+S 双路分解（triton 后端为同公式
-    的三内核版：统计 / dq / dk-dv-dsoft）。"""
+    的四内核版：统计 / dq / dk-dv / dsoft）。"""
 
     @staticmethod
     def forward(ctx, impl, q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale):
@@ -1282,9 +1283,9 @@ def _kernels():
         lse = tl.where(has_nan, float('nan'), tl.where(has_pinf, float('inf'), lse))
         work = tl.where(causal & finite, s, float('-inf'))
         BIG = Bm + 1
-        pad = tl.min(tl.where(causal, b, BIG), 0)
-        has_causal = tl.sum(tl.where(causal, 1, 0), 0) > 0
-        pad = tl.where(has_causal, pad, 0)
+        # pad 恒为块 0（eager 形式；池化 last_tok 单调时与「首个因果块」
+        # 同值——那种形式的首个因果块必为块 0）。
+        pad = tl.zeros([], tl.int64)
         for j in tl.static_range(K):
             m = tl.max(work, 0)
             # work 的泳道非有限即 -inf：与 eager 的 cf = causal & isfinite
@@ -1308,7 +1309,9 @@ def _kernels():
 
 # ---------------------------------------------------------------------------
 # 注意力 Triton 内核：前向（flash 式在线 softmax，sink 作初值质量）与
-# 反向三内核（stats / dq / dk-dv-dsoft）。块泳道按 (t, j) 逐条 gather（选择
+# 反向四内核（stats / dq / dk-dv / dsoft——dsoft 是跨头求和，(r,b,h) 网格
+# 表达不了，独立成一个 (r, t 块) 网格、每泳道单写者、寄存器定序累加的
+# 内核）。块泳道按 (t, j) 逐条 gather（选择
 # 逐行不同，无法共享 K tile）；滑窗泳道以共享 K_sw tile 的标准带状 flash
 # 循环处理。全部累加为固定顺序（无原子加）。
 #
@@ -1405,13 +1408,11 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
             HAS_VALID=valid is not None, HAS_SOFT=soft is not None, HAS_SINK=sink is not None,
             DOT=_dot_prec(), num_warps=4)
     dk_blk = dv_blk = dk_sw = dv_sw = dsoft = None
-    if need_dkb or need_dvb or need_dsoft:
+    if need_dkb or need_dvb:
         # attn_bwd_dkdv_blocks 对网格内每个 (r,b,h) 无条件 store（NEED_DK/
-        # NEED_DV 与这里的分配条件一致），因此 dk/dv 缓冲无需零初始化；
-        # dsoft 仅 ok 泳道写入，必须保留 zeros。
+        # NEED_DV 与这里的分配条件一致），因此 dk/dv 缓冲无需零初始化。
         dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
         dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
-        dsoft = torch.zeros((R, T, nb), device=dev, dtype=dtype) if need_dsoft else q
         flat = topk_idx.reshape(R, T * nb)
         # 稳定排序只依赖键值与位置：int32 键的稳定 argsort 与 int64 形式
         # 给出同一排列（同样的整数、同样的 tie 顺序），只在输出转 int32
@@ -1428,10 +1429,19 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         K.attn_bwd_dkdv_blocks[(R * Bm * nh,)](
             q, k_blk, v_blk, topk_idx, valid_c, last_tok, soft_c, sink_arg, dO,
             mA, ZA, mS, ZS, GA, GS,
-            dk_blk, dv_blk, dsoft, order, offs, T, Bm, nb, float(scale),
+            dk_blk, dv_blk, order, offs, T, Bm, nb, float(scale),
             NH=nh, HD=hd, HAS_VALID=valid is not None, HAS_SOFT=soft is not None,
             HAS_SINK=sink is not None,
-            NEED_DK=need_dkb, NEED_DV=need_dvb, NEED_DSOFT=need_dsoft, num_warps=1)
+            NEED_DK=need_dkb, NEED_DV=need_dvb, num_warps=1)
+    if need_dsoft:
+        # dsoft 是跨头求和（ref 反向在头循环里 +=），(r,b,h) 网格的
+        # dkdv_blocks 表达不了——由独立内核完成：每个 (t,j) 泳道恰好一个
+        # 写者、头按固定顺序寄存器累加，每个 (t,j) 都被无条件 store。
+        dsoft = torch.empty((R, T, nb), device=dev, dtype=dtype)
+        K.attn_bwd_dsoft[(R * triton.cdiv(T, BT),)](
+            q, k_blk, v_blk, topk_idx, valid_c, last_tok, soft_c, dO,
+            mS, ZS, GS, dsoft, T, Bm, float(scale),
+            NB=nb, NH=nh, HD=hd, BT=BT, HAS_VALID=valid is not None, num_warps=4)
     if need_dksw or need_dvsw:
         # attn_bwd_dkdv_window 对每个 (r,p,h) 同样无条件 store——empty 即可。
         dk_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else q
@@ -1706,18 +1716,20 @@ def _attach_attn_kernels(ns):
     @triton.jit
     def attn_bwd_dkdv_blocks(q_ptr, kb_ptr, vb_ptr, idx_ptr, valid_ptr, lt_ptr, soft_ptr, sink_ptr, dO_ptr,
                              mA_ptr, ZA_ptr, mS_ptr, ZS_ptr, GA_ptr, GS_ptr,
-                             dkb_ptr, dvb_ptr, dsoft_ptr, csr_ptr, cso_ptr,
+                             dkb_ptr, dvb_ptr, csr_ptr, cso_ptr,
                              T, Bm, NB, SCALE,
                              NH: tl.constexpr, HD: tl.constexpr,
                              HAS_VALID: tl.constexpr, HAS_SOFT: tl.constexpr, HAS_SINK: tl.constexpr,
-                             NEED_DK: tl.constexpr, NEED_DV: tl.constexpr, NEED_DSOFT: tl.constexpr):
+                             NEED_DK: tl.constexpr, NEED_DV: tl.constexpr):
         pid = tl.program_id(0)
         h = pid % NH
         rb = pid // NH
         b = rb % Bm
         r = rb // Bm
-        seg0 = tl.load(cso_ptr + r * (Bm + 1) + b)
-        seg1 = tl.load(cso_ptr + r * (Bm + 1) + b + 1)
+        # r*(T*NB) 在 R·T·NB ≥ 2³¹ 的超大配置下会溢出 int32——先行升型
+        # （其余寻址都经 src/ti 的 int64 广播，此处是唯一的纯 int32 链）。
+        seg0 = tl.load(cso_ptr + r.to(tl.int64) * (Bm + 1) + b)
+        seg1 = tl.load(cso_ptr + r.to(tl.int64) * (Bm + 1) + b + 1)
         d = tl.arange(0, HD)
         kb_v = tl.load(kb_ptr + ((r * Bm + b) * NH + h) * HD + d).to(tl.float32)
         vb_v = tl.load(vb_ptr + ((r * Bm + b) * NH + h) * HD + d).to(tl.float32)
@@ -1757,9 +1769,6 @@ def _attach_attn_kernels(ns):
                     PS = tl.exp(zS - mS) / ZSs
                     dzS = PS * (g - GS)
                     dz += dzS
-                    if NEED_DSOFT:
-                        ds = tl.where(sf >= 1e-12, dzS / tl.maximum(sf, 1e-12), 0.0)
-                        tl.store(dsoft_ptr + (r * T + tt) * NB + jj, ds.to(dsoft_ptr.dtype.element_ty))
                 if NEED_DK:
                     dk_acc += dz * q_v * SCALE
                 if NEED_DV:
@@ -1770,6 +1779,60 @@ def _attach_attn_kernels(ns):
             tl.store(dvb_ptr + ((r * Bm + b) * NH + h) * HD + d, dv_acc.to(dvb_ptr.dtype.element_ty))
 
     ns.attn_bwd_dkdv_blocks = attn_bwd_dkdv_blocks
+
+    @triton.jit
+    def attn_bwd_dsoft(q_ptr, kb_ptr, vb_ptr, idx_ptr, valid_ptr, lt_ptr, soft_ptr, dO_ptr,
+                       mS_ptr, ZS_ptr, GS_ptr, dsoft_ptr,
+                       T, Bm, SCALE,
+                       NB: tl.constexpr, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr,
+                       HAS_VALID: tl.constexpr):
+        # dsoft = Σ_h dzS_h / sf —— ref 反向在头循环里 += 的同一个跨头求和。
+        # dkdv_blocks 的网格是 (r, b, h)，表达不了它：同一 (t, j) 泳道会被
+        # nh 个程序写同一地址（末写者胜、且永远拼不出头求和）。故独立成
+        # 内核：网格 (r, t 块)，每个 (t, j) 恰好一个写者，头贡献按
+        # static_range(NH) 的固定顺序在寄存器里累加——无原子、无跨程序
+        # 写，归约顺序与 ref 的头升序一致；逐头贡献先舍入到输出 dtype 再
+        # 累加，与 ref 的 `.to(dtype)` 后 += 同一步骤。
+        pid = tl.program_id(0)
+        n_t = tl.cdiv(T, BT)
+        pid_t = pid % n_t
+        r = pid // n_t
+        t0 = pid_t * BT
+        t = t0 + tl.arange(0, BT)
+        tm = t < T
+        ti = t.to(tl.int64)
+        d = tl.arange(0, HD)
+        for j in tl.static_range(NB):
+            src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
+            lt_j = tl.load(lt_ptr + r * Bm + src, mask=tm, other=0).to(tl.int64)
+            ok = tm & (ti > lt_j)
+            if HAS_VALID:
+                vj = tl.load(valid_ptr + ((r * T + ti) * NB + j), mask=tm, other=0)
+                ok = ok & (vj != 0)
+            sf = tl.load(soft_ptr + ((r * T + ti) * NB + j), mask=tm, other=0.0).to(tl.float32)
+            lam = tl.where(sf > 0.0, tl.log(tl.maximum(sf, 1e-12)), -3.402823466e38)
+            acc = tl.zeros((BT,), tl.float32)
+            for h in tl.static_range(NH):
+                st = (r * T + ti) * NH + h
+                q_v = tl.load(q_ptr + ((r * T + ti[:, None]) * NH + h) * HD + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+                k_v = tl.load(kb_ptr + ((r * Bm + src[:, None]) * NH + h) * HD + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+                dO_v = tl.load(dO_ptr + ((r * T + ti[:, None]) * NH + h) * HD + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+                v_v = tl.load(vb_ptr + ((r * Bm + src[:, None]) * NH + h) * HD + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+                mS = tl.load(mS_ptr + st, mask=tm, other=0.0)
+                ZS = tl.load(ZS_ptr + st, mask=tm, other=1.0)
+                GS = tl.load(GS_ptr + st, mask=tm, other=0.0)
+                ZSs = tl.where(ZS == 0.0, 1.0, ZS)
+                z = tl.sum(q_v * k_v, 1) * SCALE
+                zS = tl.maximum(z + lam, -3.402823466e38)
+                zS = tl.where(ok, zS, float('-inf'))
+                PS = tl.exp(zS - mS) / ZSs
+                g = tl.sum(dO_v * v_v, 1)
+                dzS = PS * (g - GS)
+                ds_h = tl.where(sf >= 1e-12, dzS / tl.maximum(sf, 1e-12), 0.0)
+                acc += ds_h.to(dsoft_ptr.dtype.element_ty).to(tl.float32)
+            tl.store(dsoft_ptr + ((r * T + ti) * NB + j), acc.to(dsoft_ptr.dtype.element_ty), mask=tm)
+
+    ns.attn_bwd_dsoft = attn_bwd_dsoft
 
     @triton.jit
     def attn_bwd_dkdv_window(q_ptr, ksw_ptr, vsw_ptr, sink_ptr, dO_ptr,
