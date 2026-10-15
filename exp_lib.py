@@ -68,6 +68,37 @@ def code_stamp():
     本值为准——裸比 CODE_SEMANTICS 会把内核模式的全部记录误判为陈旧，
     使 resume 静默失效、面板被标 `_stale_cfg`。"""
     return f'{CODE_SEMANTICS}{_kernel_stamp()}'
+
+# ---- 可选激活重算（CSA_CKPT，默认关闭；规模档位的显存出口）----
+# 与 ce_loss / gathered_attention / _pool_trainable 的既有 checkpoint 同型
+# （design_notes §6.1「重算同一纯函数」的 transport 论证）：被包的前向无
+# RNG、是输入与权重的纯函数，反向用保存的输入按同一确定性分解重算，前向
+# 值与梯度与直调形式逐位一致。未设置时执行路径与指纹逐字节不变；开关本身
+# 不改任何到达算子的值，与 CSA_PAR / CSA_CPU_THREADS 同类，不进入
+# run_cfg 指纹（§3.1）。
+#   mlp   —— 每个 MLP 前向包一层非重入 checkpoint：省下仓库最宽的单层
+#            激活（fc1 输出 [B·T, 4·d]），代价是反向多一次 fc1+gelu。
+#   block —— 在 mlp 之上，对无 gate_mean 侧信道的臂（chunking !=
+#            'cosine_learnable'）整块包一层 checkpoint：块输入 [B, T, d]
+#            成为唯一保存的层间激活。cosine_learnable 臂的 gate_mean 经
+#            属性逃逸出块（trunk 的 comp_reg 读它），而 checkpoint 的初向
+#            前向在 no_grad 下运行会剥掉它的图（v9 _V9_CKPT 的同一限
+#            制），故这些臂自动回退到 mlp 级并提示一次。块内既有的池化 /
+#            gather 注意力 / sink 分块 checkpoint 在反向重算时照旧包裹
+#            （嵌套非重入 checkpoint 是 torch 支持、v9 驱动已在使用的形
+#            式）；_CKPT_NEST 使内层 MLP 不再重复包裹，避免多一次重算。
+_CKPT_NEST = [0]
+_CKPT_WARNED = set()
+
+def _ckpt_mode():
+    raw = os.environ.get('CSA_CKPT', '').strip().lower()
+    if raw in ('', '0', 'off', 'none', 'false'):
+        return ''
+    if raw in ('mlp', 'block'):
+        return raw
+    raise ValueError(f"unknown CSA_CKPT value {os.environ.get('CSA_CKPT')!r} (expected unset/'0' (off), 'mlp', or 'block')")
+
+_CKPT = {'on': _ckpt_mode()}
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
 RUN_ABL = dict(RUN, outdir='results_lm_v4_abl', variants=ABL_VARIANTS, seeds=[0] if QUICK else [0, 1, 2, 3, 4])
@@ -1971,6 +2002,14 @@ class MLP(nn.Module):
                 nn.init.kaiming_uniform_(self.fc2.weight, a=math.sqrt(5), generator=init_gen)
 
     def forward(self, x):
+        if _CKPT['on'] in ('mlp', 'block') and _CKPT_NEST[0] == 0 and torch.is_grad_enabled() and x.requires_grad:
+            # 非重入 checkpoint（模块顶 CSA_CKPT 说明）：重算同一纯函数，
+            # 前向值与梯度逐位一致。_CKPT_NEST > 0 时外层块已被 checkpoint
+            # 覆盖，内层不再包裹以免多一次重算。
+            return torch.utils.checkpoint.checkpoint(self._fwd, x, use_reentrant=False)
+        return self._fwd(x)
+
+    def _fwd(self, x):
         return self.fc2(F.gelu(self.fc1(x)))
 
 class Block(nn.Module):
@@ -1983,9 +2022,27 @@ class Block(nn.Module):
         self.mlp = MLP(d, int(round(d * mlp_ratio)), init_gen=mlp_gen)
 
     def forward(self, x):
+        if _CKPT['on'] == 'block' and torch.is_grad_enabled() and x.requires_grad:
+            if self.attn.cfg.chunking != 'cosine_learnable':
+                return torch.utils.checkpoint.checkpoint(self._fwd_ckpt, x, use_reentrant=False)
+            if 'cosine' not in _CKPT_WARNED:
+                _CKPT_WARNED.add('cosine')
+                print('[CSA_CKPT] block 级重算不覆盖 cosine_learnable 臂（gate_mean 经属性逃逸出块，初向前向的 no_grad 会剥掉它的图——v9 _V9_CKPT 的同一限制）；这些臂回退到 mlp 级，其余臂整块重算')
+        return self._fwd(x)
+
+    def _fwd(self, x):
         x = x + self.attn(self.n1(x))
         x = x + self.mlp(self.n2(x))
         return x
+
+    def _fwd_ckpt(self, x):
+        # checkpoint 的初向前向与反向重算都经这里：置位期间内层 MLP 不再
+        # 重复包裹（外层已不保存它的激活），避免反向多一次 MLP 重算。
+        _CKPT_NEST[0] += 1
+        try:
+            return self._fwd(x)
+        finally:
+            _CKPT_NEST[0] -= 1
 
 class SmallGPT(nn.Module):
 
@@ -2359,6 +2416,22 @@ def _fineweb_disk_dtype(vocab):
         return np.int32
     raise ValueError(f'vocab {vocab} exceeds the id range representable by the on-disk corpus cache')
 
+def _npy_serve_int32(path):
+    # 传输层（design_notes §6.1）：磁盘上的 uint16/int32 与 served 的 int32
+    # 是同一组精确整数；经 mmap 分块转换（而不是整载入再 .astype）把峰值
+    # 宿主内存从「原数组 + 目标数组」压到目标数组一份——规模档位下这是
+    # 数十 GB 与翻倍的差别。served 的 int32 字节与直接 astype 形式逐一
+    # 相同（_ids_fp 的内容指纹、batch_iter 的对象身份键都不变）。
+    mm = np.load(path, mmap_mode='r')
+    src = np.asarray(mm)
+    if src.dtype == np.int32:
+        return np.array(src)
+    out = np.empty(src.shape, dtype=np.int32)
+    for s in range(0, src.size, 1 << 24):
+        e = min(s + (1 << 24), src.size)
+        out[s:e] = src[s:e]
+    return out
+
 def _fineweb_local_rows(env_value):
     """Offline FineWeb-Edu stand-in: FWEDU_LOCAL_JSONL lists files or
     directories (os.pathsep-separated; directories expand to their sorted
@@ -2458,7 +2531,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             return _hit
         print('[data] loading cached fineweb token ids ...')
         meta = json.load(open(me_path, encoding='utf-8'))
-        train_ids = np.load(tr_path).astype(np.int32)
+        train_ids = _npy_serve_int32(tr_path)
         if meta.get('src_fp') != _ids_fp(train_ids):
             print('[data] WARNING: the cached fineweb train_ids do not match the fingerprint in the meta file — the cache is corrupt or was mixed across builds; REBUILDING it')
         else:
@@ -2599,7 +2672,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 except OSError:
                     pass
                 raise
-        train_ids = np.load(tr_path).astype(np.int32)
+        train_ids = _npy_serve_int32(tr_path)
         atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids), 'source': source, 'fit_docs': fit_docs, 'disk_dtype': np.dtype(disk_dt).str, 'seq_len': int(seq_len), 'n_train_tokens': int(n_train_tokens), 'val_seqs': int(val_seqs)}, indent=0)
         print('[data] cached fineweb token ids to disk (resume-safe)')
         _out = (train_ids, val_batch, vocab, tok, val_bnd)

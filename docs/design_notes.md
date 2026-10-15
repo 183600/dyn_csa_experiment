@@ -137,6 +137,23 @@ q_chunk ∈ {128, 1024, 7}）输出与 `q.grad` 逐位相同。但 `_take_2d` �
   上传/下载的传输形状——门控布尔值、块 id、honoured 掩码逐一相同，
   §6.1 的原有论证对 B=1 逐字成立；`_gate_signal` 与 `_single` 内联
   门控的算子序列本就逐行相同。
+- `CSA_CKPT`（默认关闭）的激活重算是「重算同一纯函数」的 transport
+  形式：`mlp` 级包的 MLP 前向无 RNG、是输入与权重的纯函数，反向用
+  保存的输入按同一确定性分解重算，前向值与梯度与直调形式逐位一致
+  （同 ce_loss / gathered_attention / _pool_trainable 的既有
+  checkpoint 论证）。`block` 级只覆盖无 gate_mean 侧信道的臂
+  （chunking != 'cosine_learnable'）：gate_mean 经属性逃逸出块，
+  checkpoint 初向前向的 no_grad 会剥掉它的图，故 cosine_learnable
+  臂自动回退到 mlp 级（v9 _V9_CKPT 的同一限制）。块内既有的池化 /
+  gather 注意力 / sink 分块 checkpoint 在反向重算时照旧包裹（嵌套
+  非重入 checkpoint 是 torch 支持的形式），`_CKPT_NEST` 使内层 MLP
+  不重复包裹。开关不改任何到达算子的值，与 CSA_PAR / CSA_CPU_THREADS
+  同类，不进入 run_cfg 指纹（§3.1）。
+- `load_fineweb_edu` 的语料 served 经 `_npy_serve_int32` 由 mmap 分块
+  转换（而非整载入再 `.astype`）：磁盘上的 uint16/int32 与 served 的
+  int32 是同一组精确整数，served 字节与直接 astype 形式逐一相同
+  （`_ids_fp` 的内容指纹与 `batch_iter` 的对象身份键都不变），只压
+  峰值宿主内存。
 
 ## 6.2 宿主侧算法的整数等价
 
