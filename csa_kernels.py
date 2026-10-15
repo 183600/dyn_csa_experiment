@@ -489,8 +489,12 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     has_b = Xb is not None and W > 0
     gXa = torch.zeros_like(Xa) if need_xa else None
     gZa = torch.zeros_like(Za) if need_za else None
-    gXb = torch.zeros_like(Xb) if (need_xb and has_b) else None
-    gZb = torch.zeros_like(Zb) if (need_zb and has_b) else None
+    # W_b == 0（overlap=0 / 单块行）时 B 泳道为空：eager 的 autograd 图里
+    # 这些张量仍在（空 gather/空求和），拿到的是零梯度张量而不是 None——
+    # None 会让 AdamW 整参数跳过（连 weight decay 都不施加），零张量则与
+    # eager 的更新逐步一致，退化几何下两模式不得分流。
+    gXb = torch.zeros_like(Xb) if (need_xb and Xb is not None) else None
+    gZb = torch.zeros_like(Zb) if (need_zb and Zb is not None) else None
     gBpa = torch.zeros_like(B_pos_a) if need_bpa else None
     jA = torch.arange(L, device=dev)
     g_a, av_all = geom.gather_geom()
@@ -577,7 +581,10 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
             gBpb_keys.append(b_off[:, b0:b1].reshape(-1))
             gBpb_vals.append(glogit_b.reshape(-1, c))
     gBpb = None
-    if need_bpb and has_b:
+    if need_bpb:
+        # 同 gXb/gZb：W_b == 0 时 keys/vals 为空，段和返回全零——与 eager
+        # 空泳道图的零梯度一致（HCA 把同一 B_pos 作 a/b 两参传入，零项
+        # 不改变 autograd 对同一张量的梯度求和）。
         keys = torch.cat(gBpb_keys) if gBpb_keys else torch.zeros(0, device=dev, dtype=torch.long)
         vals = torch.cat(gBpb_vals) if gBpb_vals else torch.zeros(0, c, device=dev, dtype=torch.float32)
         gBpb = _det_scatter_add(B_pos_b.shape[0], keys, vals, dev, B_pos_b.dtype)
@@ -625,14 +632,14 @@ class FusedPool(torch.autograd.Function):
 def pool_variable_blocks_kernel(Xa, Xb, Za, Zb, bid, geom, B_pos_a, B_pos_b, impl=None):
     """`exp_lib.pool_variable_blocks` 的内核路径（批量化：R 行一次过）。
     返回 (comp [R, Bm, c], last_tok [R, Bm] int32, Bm)。"""
-    impl = impl or kernel_backend() or 'ref'
+    impl = impl or _op_impl('POOL')
     comp = FusedPool.apply(impl, Xa, Xb, Za, Zb, bid, geom, B_pos_a, B_pos_b)
     return comp, geom.last_tok, geom.Bm
 
 
 def pool_blocks_single_kernel(X, Z, bid, geom, B_pos, impl=None):
     """`exp_lib.pool_blocks_single` 的内核路径（HCA：仅 A 泳道）。"""
-    impl = impl or kernel_backend() or 'ref'
+    impl = impl or _op_impl('POOL')
     comp = FusedPool.apply(impl, X, None, Z, None, bid, geom, B_pos, B_pos)
     return comp, geom.last_tok, geom.Bm
 
@@ -699,7 +706,10 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
             else:
                 s_i *= iscale
             F.relu_(s_i)
-            scores.add_(s_i * wf[:, :, i:i + 1])
+            # wf 必须与 s_i 切到同一个 t 分块：s_i 是 [R, t1-t0, Bm] 的块内
+            # 临时量，漏掉 t0:t1 切片时 [R, T, 1] 的 wf 在分块域（R·Bm 大、
+            # t_chunk < T）直接广播失败，整块域两者是同一批行。
+            scores.add_(s_i * wf[:, t0:t1, i:i + 1])
         scores = scores.to(dtype)
         masked_lse = torch.where(causal_c, scores, torch.full_like(scores, _NEG_INF))
         lse = torch.logsumexp(masked_lse, dim=-1)
@@ -846,9 +856,9 @@ class FusedIndexer(torch.autograd.Function):
 
 def lightning_indexer_kernel(qI, kI, w_idx, last_tok, topk, impl=None):
     """`exp_lib.lightning_indexer`（learned 模式、return_mask=False）的内核
-    路径。qI [R,T,nIH,hd]、kI [R,Bm,nIH,hd]、w_idx [R,T,nIH]、
+    路径。    qI [R,T,nIH,hd]、kI [R,Bm,nIH,hd]、w_idx [R,T,nIH]、
     last_tok [R,Bm]。返回 (idx, valid, soft)。"""
-    impl = impl or kernel_backend() or 'ref'
+    impl = impl or _op_impl('IDX')
     return FusedIndexer.apply(impl, qI, kI, w_idx, last_tok, int(topk))
 
 
@@ -1111,6 +1121,11 @@ class FusedSparseAttention(torch.autograd.Function):
         else:
             out = _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale)
         ctx.save_for_backward(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink)
+        # 反向必须跑与前向同一个后端：前向拿到的是调用方解析好的 impl
+        # （gathered_attention_kernel 经 _op_impl('ATTN')），反向若在环境
+        # 变量上重新解析，显式 impl= 的调用（bench/selfcheck）就会 silently
+        # 混成 triton 前向 + torch 参考反向。
+        ctx.impl = impl
         ctx.w = int(w)
         ctx.scale = float(scale)
         return out
@@ -1121,7 +1136,7 @@ class FusedSparseAttention(torch.autograd.Function):
         if dO is None:
             return (None,) * 13
         dO = dO.contiguous()
-        impl = _op_impl('ATTN')
+        impl = ctx.impl
         if impl == 'triton':
             grads = _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink,
                                      ctx.w, ctx.scale, dO, ctx.needs_input_grad)
@@ -1142,6 +1157,11 @@ def gathered_attention_kernel(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w
     q [R,T,nh,hd]、k_blk/v_blk [R,Bm,nh,hd]、k_sw/v_sw [R,T,nh,hd]、
     topk_idx [R,T,nb] int、sel_valid [R,T,nb] bool（None = 全有效，HCA）、
     soft [R,T,nb]（None = 无先验，HCA）、sink_logits [nh]。
+
+    前置约定：每行 topk_idx 的块 id 互不相同（无放回选择——索引器出口
+    与 HCA 的 arange 展开恒满足）。eager 的 gathered_attention 默认做
+    first-occurrence 去重，本路径不做；含重复块 id 的行会被重复计数，
+    与 eager 产生分歧——直接调用时必须先自行去重。
     """
     impl = impl or _op_impl('ATTN')
     return FusedSparseAttention.apply(impl, q, k_blk, v_blk, k_sw, v_sw, topk_idx,
@@ -1234,7 +1254,10 @@ def _kernels():
         if HAS_B:
             xb = tl.load(Xb_ptr + (r * T + gB[:, None]) * C + cs[None, :], mask=b_ok[:, None] & cm[None, :], other=0.0).to(tl.float32)
             acc += tl.sum(eb * xb, 0) / Zs
-        tl.store(comp_ptr + (r * Bm + b) * C + cs, acc.to(comp_ptr.dtype.element_ty), mask=cm)
+        # store 基址升 int64：(r·Bm + b)·C 在 R·Bm·C ≥ 2³¹ 的超大配置下按
+        # int32 求值会溢出（gather 侧都经 gA/gB 的 int64 广播，只有这条
+        # 输出链是纯 int32）。
+        tl.store(comp_ptr + (r * Bm + b).to(tl.int64) * C + cs, acc.to(comp_ptr.dtype.element_ty), mask=cm)
 
     ns.pool_fwd = pool_fwd
 
@@ -1453,10 +1476,10 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
         dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
         flat = topk_idx.reshape(R, T * nb)
-        # 稳定排序只依赖键值与位置：int32 键的稳定 argsort 与 int64 形式
-        # 给出同一排列（同样的整数、同样的 tie 顺序），只在输出转 int32
-        # 时窄化一次（同值整数，index transport）。
-        order = flat.argsort(dim=1, stable=True).to(torch.int32).contiguous()
+        # 稳定排序只依赖键值与位置。order 保留 int64：lane 值域是
+        # [0, T·nb)，T·nb ≥ 2³¹ 的超大配置下窄化到 int32 会翻负、内核再
+        # 按 lane//NB 寻址即越界——不省这一份内存。
+        order = flat.argsort(dim=1, stable=True).contiguous()
         # 整数直方图（等价于逐行 bincount(minlength=Bm) 的 scatter_add_ 形
         # 式）：行号并入键后一次 bincount——整数计数精确且与写入顺序无关
         # （整数加法可交换、无舍入）。
@@ -1765,8 +1788,6 @@ def _attach_attn_kernels(ns):
         rb = pid // NH
         b = rb % Bm
         r = rb // Bm
-        # r*(T*NB) 在 R·T·NB ≥ 2³¹ 的超大配置下会溢出 int32——先行升型
-        # （其余寻址都经 src/ti 的 int64 广播，此处是唯一的纯 int32 链）。
         seg0 = tl.load(cso_ptr + r.to(tl.int64) * (Bm + 1) + b)
         seg1 = tl.load(cso_ptr + r.to(tl.int64) * (Bm + 1) + b + 1)
         d = tl.arange(0, HD)
@@ -1777,7 +1798,10 @@ def _attach_attn_kernels(ns):
         # 循环不变量：本程序只服务块 b，last_tok 在段循环外只载一次（同一值）。
         lt_b = tl.load(lt_ptr + r * Bm + b).to(tl.int64)
         for k in range(seg0, seg1):
-            lane = tl.load(csr_ptr + r * (T * NB) + k).to(tl.int64)
+            # r*(T*NB) 在 R·T·NB ≥ 2³¹ 的超大配置下按 int32 求值会溢出
+            # （int64 的 k 要到加法才参与升型）——先升 r 再连乘，整条链
+            # 保持 int64（其余寻址都经 src/ti 的 int64 广播）。
+            lane = tl.load(csr_ptr + r.to(tl.int64) * T * NB + k).to(tl.int64)
             tt = lane // NB
             jj = lane % NB
             if HAS_VALID:
@@ -2020,7 +2044,13 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     - 门控正则 gate_mean 与 eager 的 (nblk-1 + Σ gate·hon)/T 逐行同式。
     """
     cfg = attn.cfg
-    impl = impl or kernel_backend()
+    # 逐算子解析后端：显式 impl= 强制全部三算子（selfcheck/bench 口径）；
+    # impl=None 时各算子吃自己的 CSA_KERNEL_{POOL,IDX,ATTN} 覆盖（空则跟随
+    # 全局 CSA_KERNEL）——此前这里解析单一 impl 贯通三算子，逐算子覆盖在
+    # 模型级路径上是死开关。
+    impl_pool = impl or _op_impl('POOL')
+    impl_idx = impl or _op_impl('IDX')
+    impl_attn = impl or _op_impl('ATTN')
     B, T, d = x.shape
     dev = x.device
     if cfg.fuse_mode != 'none':
@@ -2085,10 +2115,10 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     Za = pre_all['Za']
     q = F.normalize(pre_all['q'].view(B, T, attn.nh, attn.hd), dim=-1)
     if cfg.kind == 'hca':
-        comp, last_tok, _Bn = pool_blocks_single_kernel(Ca, Za, bid_full, geom, attn.B_pos_a, impl=impl)
+        comp, last_tok, _Bn = pool_blocks_single_kernel(Ca, Za, bid_full, geom, attn.B_pos_a, impl=impl_pool)
     else:
         comp, last_tok, _Bn = pool_variable_blocks_kernel(Ca, pre_all['Cb'], Za, pre_all['Zb'], bid_full, geom,
-                                                          attn.B_pos_a, attn.B_pos_b, impl=impl)
+                                                          attn.B_pos_a, attn.B_pos_b, impl=impl_pool)
     attn_kv = torch.zeros_like(comp) if cfg.content_mode == 'zero' else comp
     core_kv = F.normalize(attn_kv, dim=-1)
     kv_local = F.normalize(Ca, dim=-1)
@@ -2113,11 +2143,11 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         qI = pre_all['qI'].view(B, T, nIH, hd)
         w_idx = pre_all['w_idx']
         kI = (comp.reshape(B * Bm, kv) @ attn.W_DK).view(B, Bm, nIH, hd)
-        topk_idx, valid, soft = lightning_indexer_kernel(qI, kI, w_idx, last_tok, cfg.index_topk, impl=impl)
+        topk_idx, valid, soft = lightning_indexer_kernel(qI, kI, w_idx, last_tok, cfg.index_topk, impl=impl_idx)
     sink = attn.sink if cfg.use_sink else None
     out = gathered_attention_kernel(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw,
                                     cfg.sliding_window, 1.0,
-                                    soft=soft, sink_logits=sink, sel_valid=valid, impl=impl)
+                                    soft=soft, sink_logits=sink, sel_valid=valid, impl=impl_attn)
     outs = attn.W_o(out.reshape(B, T, attn.nh * attn.hd))
     attn.last_gate_mean = _gate_mean_batched(attn, cfg, T, B, gate_sigs, hons, nblks)
     return outs
