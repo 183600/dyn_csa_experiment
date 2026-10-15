@@ -1579,7 +1579,17 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         L.set_seed(seed)
         cfgs = L.make_layer_cfgs(6, v)
         train_ids = L.load_wikitext(train_len, 8000000)[0]
-        _tr = L.train_variant(v, train_ids, None, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=batch_size, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=_deadline, return_model=True)
+        try:
+            _tr = L.train_variant(v, train_ids, None, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=batch_size, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=_deadline, return_model=True)
+        except Exception:
+            # A raised train_variant leaves no record_run behind, so the
+            # pre-booked estimate would stay reserved forever (serial mode:
+            # this process is alive, reconcile cannot refund our pid).
+            if guard is not None:
+                guard.record_run(time.time() - t0, 0, 256, 6, train_len, batch_size)
+                if booked:
+                    guard.book(-booked, token=_book_tok)
+            raise
         if _tr.get('cap_truncated'):
             print(f'  [p1l-train] {v:18s} s{seed} TRUNCATED by the cap — not saved, will retry')
             _sd_tr = _tr.get('steps_done')

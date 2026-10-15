@@ -355,6 +355,44 @@ def _job_watchdog_seconds(job, ctx):
         return 12.0 * 3600.0
 
 
+def _note_watchdog_kill(job, elapsed_seconds):
+    """Feed a watchdog kill back into the TimeGuard calibration.
+
+    A killed cell never calls record_run, so without this hook the pace
+    calibration (and the watchdog bound derived from it) stays too low and
+    the same healthy cell is killed at the same wall-clock point on every
+    resume.  Mirrors the estimate parameters of _job_watchdog_seconds."""
+    try:
+        import exp_lib as _L
+        cap = (job or {}).get("guard_cap")
+        if not cap:
+            return
+        guard = _L.TimeGuard(cap)
+        kind = job.get("kind")
+        if kind in ("run", "warm"):
+            cfg = job.get("cfg") or {}
+            guard.note_watchdog_kill(
+                elapsed_seconds, cfg.get("steps"),
+                d=cfg.get("d", 256), n_layers=cfg.get("n_layers", 6),
+                seq_len=cfg.get("seq_len", 512),
+                batch_size=cfg.get("batch_size", 12),
+            )
+        elif kind == "lenphase":
+            p = job.get("payload") or {}
+            guard.note_watchdog_kill(
+                elapsed_seconds, p.get("steps", 3000),
+                d=256, n_layers=6,
+                seq_len=p.get("train_len", 512),
+                batch_size=p.get("batch_size", 12),
+            )
+    except Exception as e:
+        print(
+            f"[par] WARNING: watchdog-kill pace note failed: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+
+
 def _reconcile_guards(jobs):
     """Refund TimeGuard bookings whose booking process is dead (killed
     child, aborted dispatch, instance shutdown): without this, phantom
@@ -518,6 +556,7 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                         )
                         _terminate_entries([entry])
                         _reconcile_guards([entry["job"]])
+                        _note_watchdog_kill(entry["job"], elapsed)
                         entry["log_f"].close()
                         entry["done"] = True
                         result = {

@@ -590,7 +590,15 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
             # mul/relu 原地（s_i 是本轮新出的临时量，relu(x)>0 ⟺ x>0 逐位一致）；
             # add_ 与 += 同一个核——每轮少两份 [R, t, Bm] 临时分配。
             s_i = torch.einsum('rth,rbh->rtb', qIf[:, t0:t1, i, :], kIf[:, :, i, :])
-            s_i *= iscale
+            if dtype != torch.float32:
+                # eager 的逐头舍入结构：einsum 输出按 dtype 舍入一次，mul_ 再
+                # 舍入一次（bf16/fp16 张量乘 python 标量按 fp32 计算后舍回），
+                # 末段 einsum 才按 fp32 累加、输出舍入一次。低精度下漏掉这两次
+                # 中间舍入会翻转近 tie 的选择次序（G0 的 idx 逐位判据会炸）。
+                s_i = s_i.to(dtype)
+                s_i = s_i * iscale
+            else:
+                s_i *= iscale
             F.relu_(s_i)
             scores.add_(s_i * wf[:, :, i:i + 1])
         scores = scores.to(dtype)
