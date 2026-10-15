@@ -112,6 +112,8 @@ SCALE_LADDER = {'S1': dict(d=768, n_layers=12, n_heads=12, d_head=64), 'S2': dic
 B_ARMS = ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic']
 RUN_S1 = dict(RUN, dataset='fineweb', vocab_size=B_VOCAB, d=768, n_layers=12, n_heads=12, d_head=64, seq_len=8192, batch_size=8, n_train_tokens=5000000000, steps=76294, warmup=2000, eval_every=4000, eval_subset=32, val_seqs=512, seeds=[0, 1, 2, 3], outdir='results_b_s1', variants=B_ARMS)
 M0_CAP = dict(total_hours=700.0, margin=0.93, already_hours=0.0, state_path='run_time_state_m0.json')
+RUN_S2 = dict(RUN_S1, d=1024, n_layers=16, n_heads=16, n_train_tokens=12000000000, steps=183105, warmup=4000, eval_every=8000, seeds=[0, 1, 2], outdir='results_b_s2')
+M2_CAP = dict(total_hours=500.0, margin=0.93, already_hours=0.0, state_path='run_time_state_m2.json')
 
 _CPU_DEV = torch.device('cpu')
 _DEV_STR = {}

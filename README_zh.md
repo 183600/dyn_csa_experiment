@@ -122,6 +122,7 @@ python m0_supp.py data     # 构建 / 校验 FineWeb-Edu 缓存（M0_TOKENS=… 
 python m0_supp.py smoke    # 端到端自检：B 档数据路径 + 三条注意力路径
 python m0_supp.py kernel   # G0 套件：kernel/eager 数值对照 + 吞吐基准
 python m0_supp.py full     # S1 主面板（5 臂 × 4 seeds；CSA_PAR=auto 可用）
+M0_PANEL=S2 python m0_supp.py full   # S2 主面板（5 臂 × 3 seeds × 12B；M2_CAP_HOURS 可覆盖）
 ```
 
 - 语料：FineWeb-Edu（默认 `sample-10BT` 配置），自训 32k BPE；npy 缓存 + sha256

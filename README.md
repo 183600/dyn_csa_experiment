@@ -133,6 +133,7 @@ python m0_supp.py data     # build / verify the FineWeb-Edu cache (M0_TOKENS=…
 python m0_supp.py smoke    # end-to-end self-check on the B-tier data path
 python m0_supp.py kernel   # G0 suite: kernel/eager numerical comparison + throughput
 python m0_supp.py full     # the S1 panel (5 arms × 4 seeds; CSA_PAR=auto works)
+M0_PANEL=S2 python m0_supp.py full   # the S2 panel (5 arms × 3 seeds × 12B; M2_CAP_HOURS override)
 ```
 
 - Corpus: FineWeb-Edu (default `sample-10BT` config), self-trained 32k BPE;

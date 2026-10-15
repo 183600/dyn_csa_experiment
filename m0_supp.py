@@ -25,12 +25,18 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
            CPU / 无 triton 时验证 torch 参考后端（数值语义层）。
   full     S1 主面板（5 臂 × 4 seeds × 5B token，results_b_s1/）。
            CSA_PAR=auto 一卡一实验（par.py 零改动，§7 排班口径）。
+           M0_PANEL=S2 切换到 S2 主面板（RUN_S2：同 B_ARMS、同
+           seq8192/bs8 几何，5 臂 × 3 seeds × 12B token，results_b_s2/，
+           规划值口径同 §5/§6 的 M2 主面板份额）；面板选择只影响 run 配置
+           与记账，data / smoke / kernel 与面板无关。
 
-运行时上限：M0_CAP（可用 M0_CAP_HOURS 覆盖），状态文件
-run_time_state_m0.json；超限单元拒绝启动、中途到达上限则硬截断且不留
-半条测量。注意（compute_plan §3 的前提判断，不是缺陷）：Triton 内核
-（G0 判据）就绪之前，eager 路径的预计耗时会让 TimeGuard 直接拒绝启动
-S1 单元——此时应先完成内核与 kernel/eager 数值对照。
+运行时上限：按面板取 M0_CAP / M2_CAP（可用 M0_CAP_HOURS /
+M2_CAP_HOURS 覆盖），状态文件 run_time_state_m0.json /
+run_time_state_m2.json（内核模式 .k 后缀，两面板互不混账）；超限单元
+拒绝启动、中途到达上限则硬截断且不留半条测量。注意（compute_plan
+§3 的前提判断，不是缺陷）：Triton 内核（G0 判据）就绪之前，eager
+路径的预计耗时会让 TimeGuard 直接拒绝启动面板单元——此时应先完成
+内核与 kernel/eager 数值对照。
 """
 import gc, json, os, shutil, subprocess, sys, time, traceback
 for _stream in (sys.stdout, sys.stderr):
@@ -224,17 +230,23 @@ def run_kernel():
 
 
 def run_full():
-    cap = dict(L.M0_CAP)
-    _env = os.environ.get('M0_CAP_HOURS')
+    panel = (os.environ.get('M0_PANEL') or 'S1').strip().upper()
+    if panel not in ('S1', 'S2'):
+        print(f"[m0] unknown M0_PANEL {panel!r}; expected 'S1' or 'S2'.  Nothing was started.")
+        raise SystemExit(2)
+    run_cfg, cap, cap_env = (L.RUN_S1, L.M0_CAP, 'M0_CAP_HOURS') if panel == 'S1' else (L.RUN_S2, L.M2_CAP, 'M2_CAP_HOURS')
+    cap = dict(cap)
+    _env = os.environ.get(cap_env)
     if _env:
+        print(f'[m0] {cap_env}={_env} 覆盖默认上限 {cap["total_hours"]} 卡时')
         cap['total_hours'] = float(_env)
-        print(f'[m0] M0_CAP_HOURS={_env} 覆盖默认上限 {L.M0_CAP["total_hours"]} 卡时')
     guard = L.TimeGuard(cap)
     guard.report()
-    print('[m0] 提示（compute_plan §3）：内核（G0）就绪前 eager 预计耗时会被 TimeGuard 拒绝启动——先完成三算子 Triton 化与 kernel/eager 数值对照，再回到这里跑 S1 主面板。')
-    push_ok = git_push('m0: S1 主面板启动（B 档，5 臂 × 4 seeds × 5B token）')
-    L.run(L.RUN_S1, guard=guard, label='M0/S1 B 档主面板（5 臂 × 4 seeds × 5B token）')
-    push_ok &= git_push('m0: S1 主面板完成一轮（results_b_s1 为本地实验产物，不入库；量值以 summary.json 现算为准）')
+    _what = f'{panel} 主面板（B 档，{len(run_cfg["variants"])} 臂 × {len(run_cfg["seeds"])} seeds × {run_cfg["n_train_tokens"] / 1e9:g}B token）'
+    print(f'[m0] 提示（compute_plan §3）：内核（G0）就绪前 eager 预计耗时会被 TimeGuard 拒绝启动——先完成三算子 Triton 化与 kernel/eager 数值对照，再回到这里跑 {_what}。')
+    push_ok = git_push(f'm0: {_what}启动（产出目录 {run_cfg["outdir"]}/）')
+    L.run(run_cfg, guard=guard, label=f'M0/{_what}')
+    push_ok &= git_push(f'm0: {_what}完成一轮（{run_cfg["outdir"]} 为本地实验产物，不入库；量值以 summary.json 现算为准）')
     guard.report()
     print('\n[m0] DONE.')
     schedule_shutdown(90 if push_ok else 2400)
