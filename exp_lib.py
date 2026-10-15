@@ -69,15 +69,15 @@ def code_stamp():
     使 resume 静默失效、面板被标 `_stale_cfg`。"""
     return f'{CODE_SEMANTICS}{_kernel_stamp()}'
 
-# ---- 可选激活重算（CSA_CKPT，默认关闭；规模档位的显存出口）----
+# ---- 可选激活重算（CSA_CKPT，默认关闭）----
 # 与 ce_loss / gathered_attention / _pool_trainable 的既有 checkpoint 同型
 # （design_notes §6.1「重算同一纯函数」的 transport 论证）：被包的前向无
 # RNG、是输入与权重的纯函数，反向用保存的输入按同一确定性分解重算，前向
 # 值与梯度与直调形式逐位一致。未设置时执行路径与指纹逐字节不变；开关本身
 # 不改任何到达算子的值，与 CSA_PAR / CSA_CPU_THREADS 同类，不进入
 # run_cfg 指纹（§3.1）。
-#   mlp   —— 每个 MLP 前向包一层非重入 checkpoint：省下仓库最宽的单层
-#            激活（fc1 输出 [B·T, 4·d]），代价是反向多一次 fc1+gelu。
+#   mlp   —— 每个 MLP 前向包一层非重入 checkpoint：fc1 输出 [B·T, 4·d]
+#            不保存，反向用保存的输入按同一确定性分解重算 fc1+gelu。
 #   block —— 在 mlp 之上，对无 gate_mean 侧信道的臂（chunking !=
 #            'cosine_learnable'）整块包一层 checkpoint：块输入 [B, T, d]
 #            成为唯一保存的层间激活。cosine_learnable 臂的 gate_mean 经
@@ -86,7 +86,7 @@ def code_stamp():
 #            制），故这些臂自动回退到 mlp 级并提示一次。块内既有的池化 /
 #            gather 注意力 / sink 分块 checkpoint 在反向重算时照旧包裹
 #            （嵌套非重入 checkpoint 是 torch 支持、v9 驱动已在使用的形
-#            式）；_CKPT_NEST 使内层 MLP 不再重复包裹，避免多一次重算。
+#            式）；_CKPT_NEST 使内层 MLP 不再重复包裹。
 _CKPT_NEST = [0]
 _CKPT_WARNED = set()
 
@@ -2418,10 +2418,9 @@ def _fineweb_disk_dtype(vocab):
 
 def _npy_serve_int32(path):
     # 传输层（design_notes §6.1）：磁盘上的 uint16/int32 与 served 的 int32
-    # 是同一组精确整数；经 mmap 分块转换（而不是整载入再 .astype）把峰值
-    # 宿主内存从「原数组 + 目标数组」压到目标数组一份——规模档位下这是
-    # 数十 GB 与翻倍的差别。served 的 int32 字节与直接 astype 形式逐一
-    # 相同（_ids_fp 的内容指纹、batch_iter 的对象身份键都不变）。
+    # 是同一组精确整数；经 mmap 分块转换（而不是整载入再 .astype）。
+    # served 的 int32 字节与直接 astype 形式逐一相同（_ids_fp 的内容指纹、
+    # batch_iter 的对象身份键都不变）。
     mm = np.load(path, mmap_mode='r')
     src = np.asarray(mm)
     if src.dtype == np.int32:
