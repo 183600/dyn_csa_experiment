@@ -35,6 +35,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
@@ -390,11 +391,19 @@ def _causal_donor(device, width):
     _PINNED_KEYS.clear()
     _PINNED_KEYS.add((dev_s, 'causal', _CAUSAL_DONOR))
     _CAUSAL_TRI = (dev_s, tri)
-    _cache_put(_MASK_CACHE, (dev_s, 'causal', _CAUSAL_DONOR), tri, _MASK_CACHE_BUDGET_BYTES, _mask_cache_total)
+    _cache_put(_MASK_CACHE, (dev_s, 'causal', _CAUSAL_DONOR), tri, _mask_budget(width), _mask_cache_total)
     return (tri, dev_s)
 _IDX_CACHE = {}
 _IDX_CACHE_BYTES = 0
 _MASK_CACHE_BUDGET_BYTES = 192 << 20
+
+def _mask_budget(n):
+    # [T,T] fp32 mask 单张占 4·T² 字节；pinned 的 causal donor 与
+    # bandw/cw/cwf 三种形式需要同时驻留。扁平 192MB 预算在 T 较大时连一张
+    # 都放不下——按驱逐规则它们每层每步都被逐出并确定性重建（值相同，但
+    # 白付一轮 empty+fill+triu(+clone+add) 的分配与写带宽）。预算随 T 放大
+    # 让这几张 mask 共存；只影响缓存命中，不影响任何值。
+    return max(_MASK_CACHE_BUDGET_BYTES, 6 * int(n) * int(n) * 4)
 
 def _cache_bytes(t):
     if t is None:
@@ -501,7 +510,7 @@ def causal_window_mask_f(T, window, device, dtype):
     if m is None:
         with torch.inference_mode(False):
             m = base.to(dtype)
-        _cache_put(_MASK_CACHE, key, m, _MASK_CACHE_BUDGET_BYTES, _mask_cache_total)
+        _cache_put(_MASK_CACHE, key, m, _mask_budget(T), _mask_cache_total)
     return m
 
 def _attn_transient_budget(device):
@@ -536,7 +545,7 @@ def _mask_buffer(n, device, kind):
         raise ValueError(f'unknown mask kind {kind!r}')
     with torch.inference_mode(False):
         buf = torch.zeros((n, n), device=device)
-    _cache_put(_MASK_CACHE, key, buf, _MASK_CACHE_BUDGET_BYTES, _mask_cache_total)
+    _cache_put(_MASK_CACHE, key, buf, _mask_budget(n), _mask_cache_total)
     return buf
 
 def causal_mask(T, device):
@@ -552,7 +561,7 @@ def window_band(T, window, device):
     buf = _MASK_CACHE.get(key)
     if buf is None:
         buf = _tri_full(T, device, -int(window))
-        _cache_put(_MASK_CACHE, key, buf, _MASK_CACHE_BUDGET_BYTES, _mask_cache_total)
+        _cache_put(_MASK_CACHE, key, buf, _mask_budget(T), _mask_cache_total)
     return buf
 
 def causal_window_mask(T, window, device):
@@ -564,7 +573,7 @@ def causal_window_mask(T, window, device):
         with torch.inference_mode(False):
             m = causal_mask(T, device).clone()
             m.add_(window_band(T, window, device))
-        _cache_put(_MASK_CACHE, key, m, _MASK_CACHE_BUDGET_BYTES, _mask_cache_total)
+        _cache_put(_MASK_CACHE, key, m, _mask_budget(T), _mask_cache_total)
     return m
 
 def _window_block_offset(n, w, n_blk, device):
@@ -886,27 +895,40 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     if _geom is not None:
         g_a, mask_a, g_b, mask_b, b_off, _pos_a = _geom
     else:
-        # built outside inference mode for the same reason as _pool_parts: a
-        # cache first filled during eval must still serve training (an
-        # inference tensor saved for backward would raise); the mode guard
-        # changes no values.
-        with torch.inference_mode(False):
-            pos = _range_cache(0, max_len, dev)
-            _gp = starts[:, None] + pos[None, :]
-            mask_a = _gp < ends[:, None]
-            # These three index tensors feed gathers only; once the masks (which
-            # need the unclamped values) are built, the clamps run in place — the
-            # same clamp on the same values.
-            g_a = _gp.clamp_(max=n - 1)
-            _W_b = max(_ov_hi if _ov_hi is not None else 0, 0)
-            op = _range_cache(0, _W_b, dev)
-            mask_b = op[None, :] < ov_len[:, None]
-            g_b = (ov_start[:, None] + op[None, :]).clamp_(max=n - 1)
-            b_off = (ov_start[:, None] - starts_prev[:, None] + op[None, :]).clamp_(max=B_pos_b.shape[0] - 1)
-            _lim = B_pos_a.shape[0] - 1
-            _pos_a = pos if max_len <= B_pos_a.shape[0] else pos.clamp(max=_lim)
-        if _cpu is not None and len(_cpu[0]) == B:
-            _pool_geom_put(block_ids, _gkey, (g_a, mask_a, g_b, mask_b, b_off, _pos_a))
+        # Host form first (the same exact-integer build _pool_parts_host makes
+        # for the parts — design notes §6.2): for the dynamic segmenter's
+        # per-step block-ids objects the device build below issues ~9 small
+        # kernels per row per layer per step; the host form replaces them with
+        # two staged uploads of identical values.  None means fall back to the
+        # on-device form, whose values are identical.
+        _host = None
+        if _POOL_PARTS_HOST and _cpu is not None and len(_cpu[0]) == B:
+            _host = _pool_geom_host_var(_cpu[0], B, ov, n, max_len, _ov_hi, B_pos_a.shape[0], B_pos_b.shape[0], dev)
+        if _host is not None:
+            g_a, mask_a, g_b, mask_b, b_off, _pos_a = _host
+            _pool_geom_put(block_ids, _gkey, _host)
+        else:
+            # built outside inference mode for the same reason as _pool_parts: a
+            # cache first filled during eval must still serve training (an
+            # inference tensor saved for backward would raise); the mode guard
+            # changes no values.
+            with torch.inference_mode(False):
+                pos = _range_cache(0, max_len, dev)
+                _gp = starts[:, None] + pos[None, :]
+                mask_a = _gp < ends[:, None]
+                # These three index tensors feed gathers only; once the masks (which
+                # need the unclamped values) are built, the clamps run in place — the
+                # same clamp on the same values.
+                g_a = _gp.clamp_(max=n - 1)
+                _W_b = max(_ov_hi if _ov_hi is not None else 0, 0)
+                op = _range_cache(0, _W_b, dev)
+                mask_b = op[None, :] < ov_len[:, None]
+                g_b = (ov_start[:, None] + op[None, :]).clamp_(max=n - 1)
+                b_off = (ov_start[:, None] - starts_prev[:, None] + op[None, :]).clamp_(max=B_pos_b.shape[0] - 1)
+                _lim = B_pos_a.shape[0] - 1
+                _pos_a = pos if max_len <= B_pos_a.shape[0] else pos.clamp(max=_lim)
+            if _cpu is not None and len(_cpu[0]) == B:
+                _pool_geom_put(block_ids, _gkey, (g_a, mask_a, g_b, mask_b, b_off, _pos_a))
     Xam = _take_2d(Xas, g_a)
     Zam = _take_2d(Zas, g_a)
     Xbm = _take_2d(Xbs, g_b)
@@ -927,7 +949,9 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     Zbm.masked_fill_(~mask_b[:, :, None], float('-inf'))
     WinZ = torch.cat([Zam, Zbm], 1)
     sc = F.softmax(WinZ, dim=1)
-    sc = torch.nan_to_num(sc)
+    # sc 是 softmax 新产出的张量（无别名），nan_to_num 原地进行——同一核
+    # 心的逐元素映射，值与出位版逐位相同，省一份同形分配。
+    sc = torch.nan_to_num_(sc)
     sc_a = sc[:, :max_len]
     sc_b = sc[:, max_len:]
     comp = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
@@ -959,18 +983,28 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     if _geom is not None:
         g, mask, _pos_a = _geom
     else:
-        # same inference_mode(False) guard as _pool_parts: the cached tensors
-        # must be normal tensors even when first built during eval.
-        with torch.inference_mode(False):
-            pos = _range_cache(0, max_len, dev)
-            _gp = starts[:, None] + pos[None, :]
-            mask = _gp < ends[:, None]
-            # g feeds the gathers only; the mask needs the unclamped values, so it is
-            # built first and the clamp runs in place (same kernel, same integers).
-            g = _gp.clamp_(max=n - 1)
-            _pos_a = pos if max_len <= B_pos.shape[0] else pos.clamp(max=B_pos.shape[0] - 1)
-        if _cpu is not None and len(_cpu[0]) == B:
-            _pool_geom_put(block_ids, _gkey, (g, mask, _pos_a))
+        # host form first — same exact-integer argument as _pool_ordered (the
+        # values are identical to the device build; only the location of the
+        # integer math and the transport change, §6.1/§6.2).
+        _host = None
+        if _POOL_PARTS_HOST and _cpu is not None and len(_cpu[0]) == B:
+            _host = _pool_geom_host_single(_cpu[0], B, n, max_len, B_pos.shape[0], dev)
+        if _host is not None:
+            g, mask, _pos_a = _host
+            _pool_geom_put(block_ids, _gkey, _host)
+        else:
+            # same inference_mode(False) guard as _pool_parts: the cached tensors
+            # must be normal tensors even when first built during eval.
+            with torch.inference_mode(False):
+                pos = _range_cache(0, max_len, dev)
+                _gp = starts[:, None] + pos[None, :]
+                mask = _gp < ends[:, None]
+                # g feeds the gathers only; the mask needs the unclamped values, so it is
+                # built first and the clamp runs in place (same kernel, same integers).
+                g = _gp.clamp_(max=n - 1)
+                _pos_a = pos if max_len <= B_pos.shape[0] else pos.clamp(max=B_pos.shape[0] - 1)
+            if _cpu is not None and len(_cpu[0]) == B:
+                _pool_geom_put(block_ids, _gkey, (g, mask, _pos_a))
     Xb = _take_2d(Xs, g)
     Zb = _take_2d(Zs, g)
     WinZ = Zb
@@ -982,7 +1016,8 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     # broadcast fill mask (same argument as _pool_ordered): identical booleans
     # per lane, without materializing the full-size negated mask.
     WinZ.masked_fill_(~mask[:, :, None], float('-inf'))
-    sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
+    # softmax 的输出是新鲜张量，nan_to_num 原地（同上的逐元素等价论证）。
+    sc = torch.nan_to_num_(F.softmax(WinZ, dim=1))
     comp = (sc * Xb).sum(1)
     # same identity-order fast path as _pool_ordered: order[last_idx] over the
     # cached arange returns exactly last_idx (index transport, §6.1).
@@ -1112,21 +1147,29 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     if query_chunk is None:
         raise ValueError("lightning_indexer: query_chunk=None is not 'use the default'; pass the default (2048) explicitly or omit the argument")
     query_chunk = max(1, min(int(query_chunk), n))
-    chunks = []
     _iscale = hd ** (-0.5)
+    _nchunks = -(-n // query_chunk)
+    scores = None
     for s in range(0, n, query_chunk):
         e = min(s + query_chunk, n)
         if random_select:
             z = torch.sin(_ri[s:e] * 12.9898 + _jc) * 43758.5453
             z = (z - torch.floor(z)) * 2.0 - 1.0
-            chunks.append(z.to(H.dtype))
+            c = z.to(H.dtype)
         else:
             raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI)
             raw.mul_(_iscale)
             F.relu(raw, inplace=True)
-            chunks.append(torch.einsum('inb,ni->nb', raw, w_idx[s:e]))
-    scores = chunks[0] if len(chunks) == 1 else torch.cat(chunks, 0)
-    del chunks
+            c = torch.einsum('inb,ni->nb', raw, w_idx[s:e])
+        if _nchunks == 1:
+            scores = c
+        else:
+            # 多 chunk 时预分配整幅再逐块写入：同样的值落到同样的行（拷贝
+            # 逐位精确），与 cat 的结果一致，但 chunk 不再全部同时驻留，也
+            # 省去 cat 自身的整幅临时分配。
+            if scores is None:
+                scores = torch.empty(n, B, device=c.device, dtype=c.dtype)
+            scores[s:e] = c
     out_dtype = scores.dtype
     if out_valid is None and return_mask:
         out_valid = []
@@ -1139,7 +1182,8 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     # the sub_ node records the identical broadcast gradient); exp_ is the
     # same story (its backward saves the output, as the out-of-place form).
     soft = scores.gather(1, idx.long()).sub_(_lse).exp_()
-    soft = torch.nan_to_num(soft)
+    # gather/sub_/exp_ 的产出是新鲜张量，nan_to_num 原地（同一逐元素映射）。
+    soft = torch.nan_to_num_(soft)
     del scores, _lse
     m = None
     if return_mask:
@@ -1347,6 +1391,18 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         out[s:e] = _einsum('qhm,qmhd->qhd', attn, Vset)
     return out
 
+def _gathered_attention_trainable(*args, **kwargs):
+    # 训练时以重算代替保存：gathered_attention 内部按 chunk 物化的
+    # Kset/Vset/logits/attn（每行每层 O(T·M·nh·hd)）原本全部被 autograd 保留
+    # 到反向；包一层非重入 checkpoint 后只保留输入（topk_idx/win/soft 等索引
+    # 与小表 O(T·M)，q/k/v 本就被上游算子保留），反向时按同一确定性分解重算
+    # 前向。函数内无 RNG，且 mem_budget 经 _ATB_EPOCH 缓存在一次运行内不变，
+    # 因此 chunk 边界与每个中间值逐位相同——反向得到的梯度与原形式逐位一致
+    # （design notes §6.1 的 transport 论证在「重算同一纯函数」上的形式）。
+    if torch.is_grad_enabled() and args[0].requires_grad:
+        return torch.utils.checkpoint.checkpoint(gathered_attention, *args, use_reentrant=False, **kwargs)
+    return gathered_attention(*args, **kwargs)
+
 @dataclass
 class AttnCfg:
     kind: str = 'csa'
@@ -1519,7 +1575,10 @@ class HybridAttention(nn.Module):
             logits.add_(mask[s:e])
             if sink_view is not None:
                 lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
-                attn = logits.sub(lse).exp_()
+                # logits 是本轮 einsum 新产出的张量（随即删除，无其他读者），
+                # sub 原地进行——与 lightning_indexer 注释记录的同一等价论证，
+                # 省一份 [B, nh, rows, T] 分配。
+                attn = logits.sub_(lse).exp_()
                 del logits, lse
             else:
                 attn = torch.softmax(logits, -1)
@@ -1793,12 +1852,12 @@ class HybridAttention(nn.Module):
             # first-occurrence dedup inside gathered_attention is provably the
             # all-True mask and is skipped (identical keep mask).
             topk_idx = _arange_exp_cache(T, Bn, x.device)
-            out = gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None, topk_distinct=True)
+            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None, topk_distinct=True)
         else:
             topk = cfg.index_topk
             _sel_valid_box = []
             _, topk_idx, soft = lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box)
-            out = gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0])
+            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0])
         return (self.W_o(out.reshape(T, self.nh * self.hd)), gate_mean)
 
     def forward(self, x):
@@ -1979,16 +2038,28 @@ class SmallGPT(nn.Module):
         self.comp_reg = reg
         return self.norm(x)
 
+    def _ce_head_chunk(self, h_chunk, tgt_chunk, vocab):
+        lg = self.head(h_chunk)
+        return F.cross_entropy(lg.reshape(-1, vocab), tgt_chunk.reshape(-1), reduction='sum')
+
     def ce_loss(self, ids, targets, vocab, chunk=64):
         # LM-head cross-entropy computed in time chunks: the chunk sums add to
         # the same total as the full-batch form (up to fp reduction order), so
         # the scalar and its gradients are unchanged.
+        # 训练时每个 chunk 包一层非重入 checkpoint：原本所有 chunk 的
+        # logits/log_softmax（合计 O(B·T·V)，长序列下是最大单项显存）都保留到
+        # loss.backward()；现在反向按 chunk 重算同一份 logits（同一 GEMM、无
+        # RNG，值逐位相同），保留量降到 O(B·chunk·V)。chunk 反传的执行次序由
+        # 求和链的拓扑结构决定，两种形式相同，因此梯度逐位一致。
         h = self.trunk(ids)
         n_tok = targets.numel()
         ce = None
+        _ck = torch.is_grad_enabled() and h.requires_grad
         for s in range(0, ids.shape[1], chunk):
-            lg = self.head(h[:, s:s + chunk])
-            c = F.cross_entropy(lg.reshape(-1, vocab), targets[:, s:s + chunk].reshape(-1), reduction='sum')
+            if _ck:
+                c = torch.utils.checkpoint.checkpoint(self._ce_head_chunk, h[:, s:s + chunk], targets[:, s:s + chunk], vocab, use_reentrant=False)
+            else:
+                c = self._ce_head_chunk(h[:, s:s + chunk], targets[:, s:s + chunk], vocab)
             ce = c if ce is None else ce + c
         return ce / n_tok
 OVERLAP = 8
@@ -3650,8 +3721,10 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 _dls = [(li, dl) for li, dl in _dls if dl is not None]
                 if _dls:
                     # one device sync for all layers instead of one per layer
-                    for li, _v in zip([li for li, _ in _dls], torch.stack([dl for _, dl in _dls]).tolist()):
-                        delta_trace.setdefault(f'L{li}', []).append([step, float(_v)])
+                    # (no_grad: 纯读取 Parameter 的值做日志，不需要 autograd 节点)
+                    with torch.no_grad():
+                        for li, _v in zip([li for li, _ in _dls], torch.stack([dl for _, dl in _dls]).tolist()):
+                            delta_trace.setdefault(f'L{li}', []).append([step, float(_v)])
                 print(f'  step {step:4d}  loss {_lv:.4f}  lr {opt.param_groups[0]['lr']:.2e}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
     finally:
         if _gc_relief:

@@ -112,6 +112,42 @@ def _next_pow2(n):
     return max(p, 1)
 
 
+def _det_scatter_add_multi(n_rows, indices, values_list, device, dtype):
+    """_det_scatter_add 的多值表形式：同一组键只排一次序、只做一次段定位，
+    各值表分别段和（段和沿列独立归约——每张表的结果与逐张调用
+    _det_scatter_add 逐位一致，共享的只是排序与段结构）。values_list 中的
+    None 原样返回 None。dk/dv（或 dksw/dvsw）的键逐元素相同，走这里省掉
+    每头一半的 argsort。"""
+    idx = indices.reshape(-1).to(torch.int64)
+    n_rows = int(n_rows)
+    outs = [None if v is None else torch.zeros((n_rows, *v.shape[1:]), device=device, dtype=dtype) for v in values_list]
+    if idx.numel() == 0:
+        return outs
+    order = torch.argsort(idx, stable=True)
+    idx_s = idx.index_select(0, order)
+    end = torch.zeros_like(idx_s, dtype=torch.bool)
+    if idx_s.numel() > 1:
+        end[:-1] = idx_s[1:] != idx_s[:-1]
+    end[-1] = True
+    seg_end = torch.nonzero(end, as_tuple=False).reshape(-1)
+    seg_id = idx_s.index_select(0, seg_end)
+    keep = (seg_id >= 0) & (seg_id < n_rows)
+    seg_id_k = seg_id[keep]
+    lo_idx = seg_end[:-1]
+    for values, out in zip(values_list, outs):
+        if values is None:
+            continue
+        val_s = values.index_select(0, order).to(torch.float32)
+        csum = val_s.cumsum_(dim=0)
+        hi = csum.index_select(0, seg_end)
+        lo = torch.zeros_like(hi)
+        if seg_end.numel() > 1:
+            lo[1:] = csum.index_select(0, lo_idx)
+        seg_sum = hi - lo
+        out.index_copy_(0, seg_id_k, seg_sum[keep].to(dtype))
+    return outs
+
+
 def _det_scatter_add(n_rows, indices, values, device, dtype):
     """确定性 scatter-累加（values 为 [N] 或 [N, D]）：同键的值按稳定排序
     后的固定顺序做前缀和，段和 = 段尾前缀 − 段首前的前缀。
@@ -121,28 +157,7 @@ def _det_scatter_add(n_rows, indices, values, device, dtype):
     累加顺序依赖线程调度；本实现先把 (key, value) 平铺后按 key 稳定排序，
     段内顺序因此只由 (key, 原下标) 决定，cumsum 的分组与线程数无关。
     """
-    idx = indices.reshape(-1).to(torch.int64)
-    out = torch.zeros((int(n_rows), *values.shape[1:]), device=device, dtype=dtype)
-    if idx.numel() == 0:
-        return out
-    order = torch.argsort(idx, stable=True)
-    idx_s = idx.index_select(0, order)
-    val_s = values.index_select(0, order).to(torch.float32)
-    csum = val_s.cumsum_(dim=0)
-    end = torch.zeros_like(idx_s, dtype=torch.bool)
-    if idx_s.numel() > 1:
-        end[:-1] = idx_s[1:] != idx_s[:-1]
-    end[-1] = True
-    seg_end = torch.nonzero(end, as_tuple=False).reshape(-1)
-    seg_id = idx_s.index_select(0, seg_end)
-    hi = csum.index_select(0, seg_end)
-    lo = torch.zeros_like(hi)
-    if seg_end.numel() > 1:
-        lo[1:] = csum.index_select(0, seg_end[:-1])
-    seg_sum = hi - lo
-    keep = (seg_id >= 0) & (seg_id < int(n_rows))
-    out.index_copy_(0, seg_id[keep], seg_sum[keep].to(dtype))
-    return out
+    return _det_scatter_add_multi(n_rows, indices, [values], device, dtype)[0]
 
 
 class PoolGeometry:
@@ -168,38 +183,43 @@ class PoolGeometry:
         R = len(counts_rows)
         Bm = max((len(c) for c in counts_rows), default=0)
         Bm = max(Bm, 1)
+        # 全部表都是整型：先按行填入 counts，之后用 2D numpy 一次性求
+        # ends/starts/overlap 几何（整数的 cumsum/移位/clamp 沿轴逐位精确，
+        # 与逐行循环同一套公式同一批值——逐位一致，只省掉 O(R) 轮 numpy
+        # 调用；动态臂每层每步重建时这是主要的 host 开销）。
         counts_np = np.zeros((R, Bm), dtype=np.int64)
         nblk_np = np.zeros((R,), dtype=np.int64)
-        ends_np = np.zeros((R, Bm), dtype=np.int64)
-        starts_np = np.zeros((R, Bm), dtype=np.int64)
-        last_np = np.full((R, Bm), T - 1, dtype=np.int64)
-        ov_start_np = np.zeros((R, Bm), dtype=np.int64)
-        ov_len_np = np.zeros((R, Bm), dtype=np.int64)
-        starts_prev_np = np.zeros((R, Bm), dtype=np.int64)
-        max_len = 1
-        max_ov = 0
         for r, counts in enumerate(counts_rows):
             n = len(counts)
             nblk_np[r] = n
-            if n == 0:
-                continue
-            c = np.asarray(counts, dtype=np.int64)
-            counts_np[r, :n] = c
-            ends_row = np.cumsum(c)
-            ends_np[r, :n] = ends_row
-            starts_np[r, :n] = ends_row - c
-            last_np[r, :n] = np.clip(ends_row - 1, 0, T - 1)
-            max_len = max(max_len, int(c.max()))
-            if overlap is not None:
-                end_prev = np.concatenate([[-1], ends_row[:-1]])
-                starts_prev = np.concatenate([[0], (ends_row - c)[:-1]])
-                ov_start = np.maximum(end_prev - int(overlap), starts_prev)
-                ov_len_row = end_prev - ov_start
-                starts_prev_np[r, :n] = starts_prev
-                ov_start_np[r, :n] = ov_start
-                ov_len_np[r, :n] = ov_len_row
-                if n > 1:
-                    max_ov = max(max_ov, int(ov_len_row[1:].max(initial=0)))
+            if n:
+                counts_np[r, :n] = counts
+        ends_full = np.cumsum(counts_np, axis=1, dtype=np.int64)
+        starts_full = ends_full - counts_np
+        colmask = np.arange(Bm)[None, :] < nblk_np[:, None]
+        ends_np = np.where(colmask, ends_full, 0)
+        starts_np = np.where(colmask, starts_full, 0)
+        last_np = np.where(colmask, np.clip(ends_full - 1, 0, T - 1), T - 1)
+        max_len = max(1, int(counts_np.max(initial=0)))
+        if overlap is not None:
+            end_prev_full = np.concatenate([np.full((R, 1), -1, dtype=np.int64), ends_full[:, :-1]], axis=1)
+            starts_prev_full = np.concatenate([np.zeros((R, 1), dtype=np.int64), starts_full[:, :-1]], axis=1)
+            ov_start_full = np.maximum(end_prev_full - int(overlap), starts_prev_full)
+            ov_len_full = end_prev_full - ov_start_full
+            starts_prev_np = np.where(colmask, starts_prev_full, 0)
+            ov_start_np = np.where(colmask, ov_start_full, 0)
+            ov_len_np = np.where(colmask, ov_len_full, 0)
+            # 与逐行形式相同的 max_ov 口径：只统计列 1..n-1（列 0 无 overlap，
+            # 其 ov_len 恒负/零且被逐行形式的 [1:] 切片排除）。
+            if Bm > 1:
+                max_ov = int(np.where(colmask[:, 1:], ov_len_full[:, 1:], 0).max(initial=0))
+            else:
+                max_ov = 0
+        else:
+            ov_start_np = np.zeros((R, Bm), dtype=np.int64)
+            ov_len_np = np.zeros((R, Bm), dtype=np.int64)
+            starts_prev_np = np.zeros((R, Bm), dtype=np.int64)
+            max_ov = 0
         W_b = max_ov if overlap is not None else 0
         to_i32 = lambda a: torch.from_numpy(a.astype(np.int32)).to(device)
         self.R, self.Bm, self.T = R, Bm, T
@@ -280,15 +300,23 @@ def _full_arange_evict():
 
 
 def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
-    key = (tuple(tuple(int(x) for x in c) for c in counts_rows),
+    # 键 = 行 counts 对象的身份（条目强引用这些对象，因此 id 在条目存活期间
+    # 唯一且稳定，不可能撞上复用）；fix 臂全程复用同一分段器出口对象必命中，
+    # 动态臂每步拿到新对象必 miss——与原内容键的命中语义一致（counts 表按
+    # 约定不可变，与 exp_lib `_pool_parts` 缓存于对象身份同一论证），但键
+    # 构造从 O(总块数) 次 Python int() 降到 O(R)。
+    key = (tuple(id(c) for c in counts_rows),
            None if overlap is None else int(overlap), int(T),
            str(device), int(max_block))
-    geom = _GEOM_CACHE.get(key)
-    if geom is None:
-        if len(_GEOM_CACHE) >= _GEOM_CACHE_CAP:
-            _GEOM_CACHE.pop(next(iter(_GEOM_CACHE)))
-        geom = PoolGeometry(counts_rows, overlap, T, device, max_block)
-        _GEOM_CACHE[key] = geom
+    ent = _GEOM_CACHE.get(key)
+    if ent is not None:
+        refs, geom = ent
+        if len(refs) == len(counts_rows) and all(a is b for a, b in zip(refs, counts_rows)):
+            return geom
+    if len(_GEOM_CACHE) >= _GEOM_CACHE_CAP:
+        _GEOM_CACHE.pop(next(iter(_GEOM_CACHE)))
+    geom = PoolGeometry(counts_rows, overlap, T, device, max_block)
+    _GEOM_CACHE[key] = (tuple(counts_rows), geom)
     return geom
 
 
@@ -853,10 +881,11 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     dv_blk32 = torch.zeros((R * Bm * nh, hd), device=dev, dtype=torch.float32) if need_dvb else None
     dk_sw32 = torch.zeros((R * T * nh, hd), device=dev, dtype=torch.float32) if need_dksw else None
     dv_sw32 = torch.zeros((R * T * nh, hd), device=dev, dtype=torch.float32) if need_dvsw else None
-    dk_keys, dk_vals = [], []
-    dksw_keys, dksw_vals = [], []
-    dv_keys, dv_vals = [], []
-    dvsw_keys, dvsw_vals = [], []
+    # dk/dv 共享同一组键（同 (chunk,h) 构造的 keyb），dksw/dvsw 共享 keyw：
+    # 键表按组收集一次，flush 时一次 argsort/段定位服务两张值表。
+    dk_vals, dv_vals = [], []
+    dksw_vals, dvsw_vals = [], []
+    dkdv_b_keys, dkdv_w_keys = [], []
     lt_l = last_tok.to(torch.int64)
     chunks = []
     for t0 in range(0, T, tc):
@@ -877,14 +906,19 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         keyw = (r_idx.expand(R, t1 - t0, w) * T + src_win) * nh if (need_dksw or need_dvsw) else None
         chunks.append((t0, t1, src_sel, src_win, lane_ok, soft_l, anyrow, keyb, keyw))
 
-    def _flush(keys_list, vals_list, buf, n_rows):
+    def _flush(keys_list, vals_lists, bufs, n_rows):
         # 逐头 flush 后清空碎片列表，释放本轮引用的全部 chunk 碎片。
+        # 同组（键相同）的值表共享一次排序段和（逐位一致，见
+        # _det_scatter_add_multi）；bufs 中的 None（未请求的梯度）跳过。
         if keys_list:
             keys = torch.cat(keys_list)
-            vals = torch.cat(vals_list)
-            buf += _det_scatter_add(n_rows, keys, vals, dev, torch.float32)
+            vals = [torch.cat(vl) if vl else None for vl in vals_lists]
+            for buf, res in zip(bufs, _det_scatter_add_multi(n_rows, keys, vals, dev, torch.float32)):
+                if buf is not None and res is not None:
+                    buf += res
         keys_list.clear()
-        vals_list.clear()
+        for vl in vals_lists:
+            vl.clear()
 
     for h in range(nh):
         q_all = q[:, :, h, :].to(torch.float32)
@@ -953,23 +987,21 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             if need_dkb or need_dksw:
                 dkl = torch.einsum('rtm,rtd->rtmd', dz, qh) * scale
                 if need_dkb:
-                    dk_keys.append((keyb + h).reshape(-1))
                     dk_vals.append(dkl[:, :, :nb].reshape(-1, hd))
                 if need_dksw:
-                    dksw_keys.append((keyw + h).reshape(-1))
                     dksw_vals.append(dkl[:, :, nb:].reshape(-1, hd))
             if need_dvb or need_dvsw:
                 dvl = torch.einsum('rtm,rtd->rtmd', P_A_f, dOh)
                 if need_dvb:
-                    dv_keys.append((keyb + h).reshape(-1))
                     dv_vals.append(dvl[:, :, :nb].reshape(-1, hd))
                 if need_dvsw:
-                    dvsw_keys.append((keyw + h).reshape(-1))
                     dvsw_vals.append(dvl[:, :, nb:].reshape(-1, hd))
-        _flush(dk_keys, dk_vals, dk_blk32, R * Bm * nh)
-        _flush(dksw_keys, dksw_vals, dk_sw32, R * T * nh)
-        _flush(dv_keys, dv_vals, dv_blk32, R * Bm * nh)
-        _flush(dvsw_keys, dvsw_vals, dv_sw32, R * T * nh)
+            if need_dkb or need_dvb:
+                dkdv_b_keys.append((keyb + h).reshape(-1))
+            if need_dksw or need_dvsw:
+                dkdv_w_keys.append((keyw + h).reshape(-1))
+        _flush(dkdv_b_keys, [dk_vals, dv_vals], [dk_blk32, dv_blk32], R * Bm * nh)
+        _flush(dkdv_w_keys, [dksw_vals, dvsw_vals], [dk_sw32, dv_sw32], R * T * nh)
     dk_blk = dk_blk32.to(dtype).view(R, Bm, nh, hd) if need_dkb else None
     dk_sw = dk_sw32.to(dtype).view(R, T, nh, hd) if need_dksw else None
     dv_blk = dv_blk32.to(dtype).view(R, Bm, nh, hd) if need_dvb else None
@@ -1292,8 +1324,11 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
             DOT=_dot_prec(), num_warps=4)
     dk_blk = dv_blk = dk_sw = dv_sw = dsoft = None
     if need_dkb or need_dvb or need_dsoft:
-        dk_blk = torch.zeros((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
-        dv_blk = torch.zeros((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
+        # attn_bwd_dkdv_blocks 对网格内每个 (r,b,h) 无条件 store（NEED_DK/
+        # NEED_DV 与这里的分配条件一致），因此 dk/dv 缓冲无需零初始化；
+        # dsoft 仅 ok 泳道写入，必须保留 zeros。
+        dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
+        dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
         dsoft = torch.zeros((R, T, nb), device=dev, dtype=dtype) if need_dsoft else q
         flat = topk_idx.reshape(R, T * nb).to(torch.int64)
         order = flat.argsort(dim=1, stable=True).to(torch.int32).contiguous()
@@ -1311,8 +1346,10 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
             HAS_SINK=sink is not None,
             NEED_DK=need_dkb, NEED_DV=need_dvb, NEED_DSOFT=need_dsoft, num_warps=1)
     if need_dksw or need_dvsw:
-        dk_sw = torch.zeros((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else q
-        dv_sw = torch.zeros((R, T, nh, hd), device=dev, dtype=dtype) if need_dvsw else q
+        # attn_bwd_dkdv_window 对每个 (r,p,h) 同样无条件 store——empty 即可
+        # （长序列下这两张是最大的反向缓冲，零初始化是纯浪费的写流量）。
+        dk_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else q
+        dv_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dvsw else q
         K.attn_bwd_dkdv_window[(R * T * nh,)](
             q, k_sw, v_sw, sink_arg, dO, mA, ZA, mS, ZS, GA, GS,
             dk_sw, dv_sw, T, int(w), float(scale),
