@@ -154,7 +154,69 @@ jobs:
           CLEAN_TIMEOUT=$((30*60))    # 30m
           APPLY_TIMEOUT=$((60*60))    # 1h（算力申请.md 检查）
 
-          # provider 选择策略：仅使用 Kimi（Moonshot 官方 API），不再调用 NVIDIA
+          # ================= provider 策略：Kimi 优先，失效则切 deepseek =================
+          # Kimi（Moonshot 官方 API）仍为主力；一旦健康检查失败或连续调用失败，
+          # 自动切换到 opencode Zen 网关的免费模型 deepseek-v4.1-flash-free
+          # （opencode 客户端内调用免鉴权），且 deepseek 一旦启用便反复重试不放弃。
+          KIMI_MODEL="moonshot/kimi-k3"
+          FALLBACK_MODEL="opencode/deepseek-v4.1-flash-free"
+          CURRENT_PROVIDER="kimi"
+
+          # ---------- 思考强度（仅 deepseek 兜底路径）：max > high > 不设置 ----------
+          # kimi-k3 直连 Moonshot 端点未定义 variant，不设置思考强度。
+          # deepseek 先从 opencode 模型目录（models.dev）解析其支持的
+          # reasoning effort 档位：有 max 选 max，没有 max 选 high，否则不设置。
+          # 检测失败时兜底 max（无效 variant 会被 opencode 静默忽略）。
+          opencode models opencode --refresh >/dev/null 2>&1 || true
+          cat > /tmp/detect_variant.py <<'PYEOF'
+          import json, os, sys
+          try:
+              p = os.path.expanduser('~/.cache/opencode/models.json')
+              with open(p) as f:
+                  d = json.load(f)
+              m = d.get('opencode', {}).get('models', {}).get('deepseek-v4.1-flash-free')
+              if m is None:
+                  print('UNKNOWN')
+                  sys.exit()
+              values = []
+              for o in (m.get('reasoning_options') or []):
+                  values.extend(o.get('values') or [])
+              for cand in ('max', 'high'):
+                  if cand in values:
+                      print(cand)
+                      sys.exit()
+              print('NONE')
+          except Exception:
+              print('UNKNOWN')
+          PYEOF
+          VRESULT=$(python3 /tmp/detect_variant.py 2>/dev/null)
+          case "$VRESULT" in
+            max|high) VARIANT="$VRESULT" ;;
+            NONE)     VARIANT="" ;;
+            *)        VARIANT="max" ;;
+          esac
+          echo "[info] primary=$KIMI_MODEL | fallback=$FALLBACK_MODEL | deepseek思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
+
+          # ---------- Kimi 健康检查 ----------
+          kimi_alive() {
+            local code
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+                   -H "Authorization: Bearer ${KIMI_API_KEY}" \
+                   'https://api.moonshot.cn/v1/models' 2>/dev/null)
+            echo "[info] Kimi 健康检查 /v1/models -> HTTP ${code:-timeout}"
+            case "$code" in
+              2*) return 0 ;;
+              *)  return 1 ;;
+            esac
+          }
+
+          if kimi_alive; then
+            CURRENT_PROVIDER="kimi"
+          else
+            CURRENT_PROVIDER="deepseek"
+            echo "[info] Kimi 端点不可用，本轮直接使用 deepseek 兜底"
+          fi
+
           i=0
           FAIL_COUNT=0
           RATE_COUNT=0
@@ -239,26 +301,51 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 单阶段执行（带重试） ----------
+          # ---------- 单阶段执行（Kimi 失效自动降级 deepseek，deepseek 反复重试） ----------
           # 参数: phase_name  prompt  timeout_seconds
-          # 返回: 0 成功 / 124|137|143 超时被杀 / 1 放弃
+          # 返回: 0 成功 / 124|137|143 超时被杀（预算耗尽，改动照常提交）/ 1 时间用尽
           run_phase() {
             local phase="$1" prompt="$2" budget="$3"
             local attempt=0
             FAIL_COUNT=0
             RATE_COUNT=0
 
-            while [ $attempt -lt 3 ]; do
+            while :; do
               attempt=$((attempt+1))
 
-              if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              local NOW=$(date +%s)
+              if [ "$NOW" -ge "$DEADLINE" ]; then
                 echo "[info] phase=$phase 全局时间已用尽，跳过"
                 return 1
               fi
+              local REMAIN=$(( DEADLINE - NOW ))
+              [ "$budget" -gt "$REMAIN" ] && budget="$REMAIN"
+              if [ "$budget" -le 60 ]; then
+                echo "[info] phase=$phase 剩余时间不足，跳过"
+                return 1
+              fi
 
-              echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=kimi ==========="
+              echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER ==========="
 
-              timeout --kill-after=180 "$budget" opencode run "$prompt" 2>&1 | tee "$OUT"
+              # 防止 agent 写入的 opencode 配置干扰后续调用：
+              # kimi 路径恢复官方模板，deepseek 路径确保无自定义配置
+              if [ "$CURRENT_PROVIDER" = "kimi" ]; then
+                cp -f "$HOME/.config/opencode/opencode.kimi.json" \
+                      "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
+              else
+                rm -f "$HOME/.config/opencode/opencode.json" \
+                      "$HOME/.config/opencode/opencode.jsonc" \
+                      "$HOME/.config/opencode/config.json" 2>/dev/null
+              fi
+              rm -f ./opencode.json ./opencode.jsonc ./.opencode.json 2>/dev/null
+
+              if [ "$CURRENT_PROVIDER" = "kimi" ]; then
+                timeout --kill-after=180 "$budget" opencode run -m "$KIMI_MODEL" "$prompt" 2>&1 | tee "$OUT"
+              elif [ -n "$VARIANT" ]; then
+                timeout --kill-after=180 "$budget" opencode run -m "$FALLBACK_MODEL" --variant "$VARIANT" "$prompt" 2>&1 | tee "$OUT"
+              else
+                timeout --kill-after=180 "$budget" opencode run -m "$FALLBACK_MODEL" "$prompt" 2>&1 | tee "$OUT"
+              fi
               local EC=$?
 
               # 成功
@@ -266,19 +353,23 @@ jobs:
                 return 0
               fi
 
-              # 超时 / 被杀
+              # 超时 / 被杀：阶段预算耗尽属正常结束，改动照常提交
               if [ $EC -eq 124 ] || [ $EC -eq 137 ] || [ $EC -eq 143 ]; then
                 echo "[warn] phase=$phase 超时/被杀 (exit=$EC)"
                 return $EC
               fi
 
-              # 429 限流
-              if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
-                RATE_COUNT=$((RATE_COUNT+1))
-                echo "[warn] phase=$phase 命中 Kimi 限流(429) (连续: $RATE_COUNT)"
-                if [ $RATE_COUNT -ge 8 ]; then
-                  echo "[warn] 连续 8 次限流，放弃该阶段"
-                  return 1
+              # 429 限流 / 免费额度限制
+              if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier"; then
+                if [ "$CURRENT_PROVIDER" = "kimi" ]; then
+                  RATE_COUNT=$((RATE_COUNT+1))
+                  echo "[warn] phase=$phase 命中 Kimi 限流(429) (连续: $RATE_COUNT)"
+                  if [ $RATE_COUNT -ge 8 ]; then
+                    echo "[warn] Kimi 连续 8 次限流，切换 deepseek 兜底（本轮后续均用 deepseek）"
+                    CURRENT_PROVIDER="deepseek"
+                  fi
+                else
+                  echo "[warn] phase=$phase 命中 deepseek 限流/免费额度限制，180s 后重试 (attempt=$attempt)"
                 fi
                 sleep 180
                 continue
@@ -286,13 +377,21 @@ jobs:
 
               # 其它非零退出
               RATE_COUNT=0
-              FAIL_COUNT=$((FAIL_COUNT+1))
-              echo "[warn] phase=$phase Kimi 调用失败 (连续: $FAIL_COUNT)"
-              if [ $FAIL_COUNT -ge 3 ]; then
-                echo "[warn] 连续 3 次失败，放弃该阶段"
-                return 1
+              if [ "$CURRENT_PROVIDER" = "kimi" ]; then
+                FAIL_COUNT=$((FAIL_COUNT+1))
+                echo "[warn] phase=$phase Kimi 调用失败 (连续: $FAIL_COUNT)"
+                if [ $FAIL_COUNT -ge 3 ]; then
+                  echo "[warn] Kimi 连续 3 次失败，切换 deepseek 兜底（本轮后续均用 deepseek）"
+                  CURRENT_PROVIDER="deepseek"
+                  FAIL_COUNT=0
+                fi
+                sleep 30
+                continue
               fi
-              sleep 30
+
+              # deepseek 失败：反复尝试，直到阶段预算或全局时间用尽
+              echo "[warn] phase=$phase deepseek 调用失败 (exit=$EC)，60s 后重试 (attempt=$attempt)"
+              sleep 60
             done
 
             return 1
@@ -341,6 +440,7 @@ jobs:
         if: always()
         run: |
           set +e
+          rm -f opencode.json opencode.jsonc .opencode.json 2>/dev/null
           find . -type f -name 'REPORT*.md'          -not -path './.git/*' -delete
           find . -type f -name 'autodl_budget*.json' -not -path './.git/*' -delete
           if [ -d docs ]; then
