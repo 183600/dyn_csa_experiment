@@ -294,3 +294,22 @@ JSON 往返会按名字把整数键写成字符串；`by_len`（及类似的分�
 `ppl_history`、`by_len`、`ppl_mean`、warmup `ppl` 与聚合表，并断言
 `TimeGuard` 的 run 计数不被预订膨胀、子进程日志数量与 cell 数一致、
 全 skip 的重跑不 spawn 任何子进程。
+
+## 14. 代码语义戳的唯一出口是 `code_stamp()`
+
+`exp_lib.code_stamp()` 的 docstring 明确要求：一切「记录是否当前」的判定
+（`result_is_current` 的 code 实参、`_cs...` 后缀匹配、checkpoint 的
+`code` 字段）都必须以它为准。eager 模式下它逐字节等于 `CODE_SEMANTICS`；
+内核模式（`CSA_KERNEL`）下追加 `-tk1:<backend>` 后缀。因此 v7 驱动链的
+`CKPT_CODE`（warmup / NIAH / lenphase 的记录戳与 checkpoint 戳）以及
+v8/v10/v11/fuse_analysis 的 `_cs` 后缀与 `_code` 比较一律经
+`code_stamp()` 解析——裸比 `CODE_SEMANTICS` 会把内核测得的记录错盖
+eager 戳（与真正的 eager 记录错误配对，§3.1 的污染方向），或把内核记录
+误判为陈旧使 resume 静默失效、面板被标 `_stale_cfg`。零 GPU 的
+`build_report.py` 不 import exp_lib、只服务 eager 的 v7 面板，仍按源码正
+则读取 `CODE_SEMANTICS`，属同一值。
+
+同一口径的另一处：`csa_kernels.sparse_layer_forward` 与 eager `_single`
+同口径收集 `attn._stats` / `attn._cuts`（同一组块 id，bincount 与切点逐
+一相同，仅 eval 期触发），内核模式的记录因此携带与 eager 完全一致的块
+长分布与边界对齐诊断；缺了它，内核面板的机制性指标会静默缺席。

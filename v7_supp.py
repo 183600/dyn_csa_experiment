@@ -604,7 +604,11 @@ def install_patches():
     L.SmallGPT = smallgpt_factory
     _PATCHES_INSTALLED = True
 install_patches()
-CKPT_CODE = L.CKPT_CODE
+# 代码语义戳必须以 exp_lib.code_stamp() 为准（其 docstring 的明确要求）：
+# eager 模式下与历史值逐字节相同；内核模式（CSA_KERNEL）下追加 -tk1 后缀，
+# 否则这些 cell 会被内核路径测得却盖 eager 戳，与真正的 eager 记录错误配对
+# （design_notes §3.1），或把内核记录误判为陈旧使 resume 静默失效。
+CKPT_CODE = L.code_stamp()
 ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 

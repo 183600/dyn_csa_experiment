@@ -53,7 +53,7 @@ def _variant_records(variant):
             _RESOLVED[rkey] = {}
         else:
             if len(groups) > 1:
-                _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
+                _cur_sfx = f'_cs{L.code_stamp()}'
 
                 def _stamped(recs):
                     return any((isinstance(r, dict) and isinstance(r.get('run_cfg'), str) and r['run_cfg'].endswith(_cur_sfx) for r in recs.values()))

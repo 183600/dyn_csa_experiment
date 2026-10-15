@@ -1967,6 +1967,16 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         counts_rows = [counts[0]] * B
         nblks = [len(counts[0])] * B
         hons = None
+    if attn._stats is not None:
+        # 与 eager `_single` 同口径的块统计：输入是同一组块 id（int32 与
+        # int64 的 bincount/不等比较结果逐一相同），每条目同样一行一条。
+        # 只在 eval（compression_report 经 enable_block_stats 开启）时触发，
+        # 训练前向零开销——没有它内核模式的记录会丢掉全部块长/边界诊断。
+        for _b in range(B):
+            attn._stats.append(torch.bincount(bid_full[_b]))
+        if attn._cuts is not None:
+            for _b in range(B):
+                attn._cuts.append((bid_full[_b, 1:] != bid_full[_b, :-1]).nonzero(as_tuple=True)[0] + 1)
     overlap = cfg.overlap if cfg.kind == 'csa' else None
     geom = _pool_geometry_cached(counts_rows, overlap, T, dev, cfg.max_block)
     Ca = pre_all['Ca']

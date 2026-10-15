@@ -303,7 +303,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                 continue
             _me += 1
             _rc = _v.get('run_cfg')
-            if (isinstance(_rc, str) and _rc.endswith(f'_cs{L.CODE_SEMANTICS}')) or (_v.get('_code') == L.CODE_SEMANTICS):
+            if (isinstance(_rc, str) and _rc.endswith(f'_cs{L.code_stamp()}')) or (_v.get('_code') == L.CODE_SEMANTICS):
                 _st += 1
         if _tot:
             _prov_panels.append((_p.split('/')[0], _tot, _me, _st, _sy))
@@ -353,13 +353,13 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
         _rows_by_v = {}
         for v in V10.P3MT_PAYLOAD['variants']:
             _rv = [r for r in mech_sum.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None) and ('by_len' in r)]
-            _cur = [r for r in _rv if r.get('_code') == L.CODE_SEMANTICS]
+            _cur = [r for r in _rv if r.get('_code') == L.code_stamp()]
             if _cur:
                 if len(_cur) < len(_rv):
                     print(f'[v11 report] {v}: {len(_rv) - len(_cur)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur)} current one(s)')
                 _rv = _cur
             elif _rv:
-                print(f'[v11 report] {v}: no by-length record carries the current code semantics ({L.CODE_SEMANTICS}) — quoting all {len(_rv)} (they predate it; re-run P4MT to refresh)')
+                print(f'[v11 report] {v}: no by-length record carries the current code semantics ({L.code_stamp()}) — quoting all {len(_rv)} (they predate it; re-run P4MT to refresh)')
             _rows_by_v[v] = _rv
         n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
         if len(n_by_v) > 1:
@@ -563,7 +563,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     A('')
     A('上表每一个 PPL 都是**测量值**，但它们不是在同一天由同一版代码测出来的。训练记录把代码语义连同超参写进 `run_cfg` 指纹（尾部 `_cs{CODE_SEMANTICS}`）；`result_is_current` 只认指纹与当前戳一致的记录，缺戳的记录一律按**陈旧**处理并重算——这是保守方向，宁可重跑也不静默复用。')
     A('')
-    A(f'**当前戳：`{L.CODE_SEMANTICS}`。** 全仓库 `results_*/summary.json` 共 {_prov_total} 条记录，其中 {_prov_synth} 条是 `synthesized`（从旧 `aggregate.json` 重建，无权重、无 PPL 之外的信息）；{_prov_measured} 条实测记录（`ppl` 可用）中带代码戳的为 **{_prov_stamped}** （{_prov_pct:.1f}%），无戳 {_prov_unstamped} 条。')
+    A(f'**当前戳：`{L.code_stamp()}`。** 全仓库 `results_*/summary.json` 共 {_prov_total} 条记录，其中 {_prov_synth} 条是 `synthesized`（从旧 `aggregate.json` 重建，无权重、无 PPL 之外的信息）；{_prov_measured} 条实测记录（`ppl` 可用）中带代码戳的为 **{_prov_stamped}** （{_prov_pct:.1f}%），无戳 {_prov_unstamped} 条。')
     A('')
     if _prov_stamped == 0 and _prov_measured:
         A('> **⚠ 本仓库全部实测记录均无代码戳。** 这些面板产生于戳建立之前，因此**无法仅凭落盘产物证明**它们由与当前代码语义一致的代码测得。这不等于数字有误——各面板与其 `analysis_*/`、`REPORT_*.md` 内部自洽，且本报告是由 `results_*/` 实时重算得到——但任何「结果由当前代码复现」的主张都**没有工件层面的依据**。要让某个面板获得这一保证，必须让它重跑一次（续跑逻辑会自动重跑缺戳的 cell）。')

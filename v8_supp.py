@@ -104,7 +104,7 @@ def _panel_block(panel):
                 _gk = json.dumps(r.get('run_cfg'), sort_keys=True, default=str)
                 by_cfg.setdefault(_gk, {})[s] = r
                 raw_cfg[_gk] = r.get('run_cfg')
-            _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
+            _cur_sfx = f'_cs{L.code_stamp()}'
             _ranked = sorted(by_cfg.items(), key=lambda kv: (not (isinstance(raw_cfg.get(kv[0]), str) and raw_cfg[kv[0]].endswith(_cur_sfx)), -len(kv[1])))
             _kept_cfg = raw_cfg.get(_ranked[0][0])
             if len(by_cfg) > 1:

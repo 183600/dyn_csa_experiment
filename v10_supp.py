@@ -405,7 +405,7 @@ def _hist_by_seed(outdir, variant, raw=None):
         if fp in seen:
             _s0 = seen[fp]
             _new_real = not r.get('synthesized')
-            _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
+            _cur_sfx = f'_cs{L.code_stamp()}'
             _new_cur = isinstance(r.get('run_cfg'), str) and r['run_cfg'].endswith(_cur_sfx)
             _old_cur = isinstance(cfg_of.get(_s0), str) and cfg_of[_s0].endswith(_cur_sfx)
             if _new_real and (synth_of.get(_s0) or (_new_cur and not _old_cur)):
@@ -425,8 +425,8 @@ def _hist_by_seed(outdir, variant, raw=None):
                     print(f'[stats] {sp}: seed {s} of `{variant}` is a REAL record but its curve is IDENTICAL to the one already admitted for seed {seen[fp]}; keeping seed {seen[fp]} (the first admission) and dropping seed {s} so the curve is not counted twice.')
                 continue
         if s in out:
-            _new_cur2 = isinstance(r.get('run_cfg'), str) and r['run_cfg'].endswith(f'_cs{L.CODE_SEMANTICS}')
-            _old_cur2 = isinstance(cfg_of.get(s), str) and cfg_of[s].endswith(f'_cs{L.CODE_SEMANTICS}')
+            _new_cur2 = isinstance(r.get('run_cfg'), str) and r['run_cfg'].endswith(f'_cs{L.code_stamp()}')
+            _old_cur2 = isinstance(cfg_of.get(s), str) and cfg_of[s].endswith(f'_cs{L.code_stamp()}')
             if not r.get('synthesized') and synth_of.get(s):
                 out.pop(s, None)
                 synth_of.pop(s, None)
@@ -470,7 +470,7 @@ def _hist_by_seed(outdir, variant, raw=None):
         for s in out:
             _groups.setdefault(json.dumps(cfg_of.get(s), sort_keys=True, default=str), []).append(s)
         if len(_groups) > 1:
-            _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
+            _cur_sfx = f'_cs{L.code_stamp()}'
             _ranked = sorted(_groups.values(), key=lambda g: (not any((isinstance(cfg_of.get(_s), str) and cfg_of[_s].endswith(_cur_sfx) for _s in g)), -len(g)))
             _keep = _ranked[0]
             _dropped = sorted((s for s in out if s not in set(_keep)))
@@ -481,7 +481,7 @@ def _hist_by_seed(outdir, variant, raw=None):
                 del out[s]
                 synth_of.pop(s, None)
                 cfg_of.pop(s, None)
-    _cur_sfx = f'_cs{L.CODE_SEMANTICS}'
+    _cur_sfx = f'_cs{L.code_stamp()}'
     _stale = sorted((s for s in out if not (isinstance(cfg_of.get(s), str) and cfg_of[s].endswith(_cur_sfx))))
     if _stale:
         print(f'[stats] {sp}: `{variant}` curve(s) at seed(s) {_stale} are stamped with an OLDER code semantics than the current run_cfg suffix — they are kept on disk but excluded from every crossover/pairing statistic; re-run this cell to measure them with the current code')
@@ -795,13 +795,13 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         _rows_by_v = {}
         for v in P3MT_PAYLOAD['variants']:
             _rv = [r for r in mech_sum.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None) and ('by_len' in r)]
-            _cur = [r for r in _rv if r.get('_code') == L.CODE_SEMANTICS]
+            _cur = [r for r in _rv if r.get('_code') == L.code_stamp()]
             if _cur:
                 if len(_cur) < len(_rv):
                     print(f'[v10 report] {v}: {len(_rv) - len(_cur)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur)} current one(s)')
                 _rv = _cur
             elif _rv:
-                print(f'[v10 report] {v}: no by-length record carries the current code semantics ({L.CODE_SEMANTICS}) — quoting all {len(_rv)} (they predate it; re-run the training phase to refresh)')
+                print(f'[v10 report] {v}: no by-length record carries the current code semantics ({L.code_stamp()}) — quoting all {len(_rv)} (they predate it; re-run the training phase to refresh)')
             _rows_by_v[v] = _rv
         n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
         if len(n_by_v) > 1:
