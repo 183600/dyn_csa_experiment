@@ -844,10 +844,11 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     # 头在外、t-chunk 在内：各 (t,h) 独立。chunk 内的几何/掩码/soft 常量
     # 与 h 无关——头循环外按 chunk 预算一次（同值，省 nh× 的 gather/比较/
     # zeros/分配；soft_l[:, :, :nb] 同时兼作原逐头重置的 sf cast）。
-    # 键值梯度碎片全部汇入 4 组全局列表，循环结束后每缓冲只做一次
-    # _det_scatter_add：键含 +h 故跨头键不相交；同键条目在合并后的列表中
-    # 仍按 chunk 升序（头内 chunk 顺序不变），稳定排序段和的组内序与
-    # 原逐头 flush 逐元素一致。
+    # 键值梯度碎片按头收集、逐头 flush：键含 +h 故跨头键不相交，头内条目
+    # 保持 chunk 升序——每个 (key) 组的稳定排序段和与跨头合并后一次
+    # flush 的组内序逐元素一致（原实现的等价性论证逐字适用），但峰值显存
+    # 从「全部头 × 全部 chunk 的 [R·T·M·nh·hd] fp32 碎片同时驻留」降到
+    # 单头量级。这一点在规模扩大时是从 O(nh) 到 O(1) 的驻留因子差距。
     dk_blk32 = torch.zeros((R * Bm * nh, hd), device=dev, dtype=torch.float32) if need_dkb else None
     dv_blk32 = torch.zeros((R * Bm * nh, hd), device=dev, dtype=torch.float32) if need_dvb else None
     dk_sw32 = torch.zeros((R * T * nh, hd), device=dev, dtype=torch.float32) if need_dksw else None
@@ -875,6 +876,16 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         keyb = (r_idx.expand(R, t1 - t0, nb) * Bm + src_sel) * nh if (need_dkb or need_dvb) else None
         keyw = (r_idx.expand(R, t1 - t0, w) * T + src_win) * nh if (need_dksw or need_dvsw) else None
         chunks.append((t0, t1, src_sel, src_win, lane_ok, soft_l, anyrow, keyb, keyw))
+
+    def _flush(keys_list, vals_list, buf, n_rows):
+        # 逐头 flush 后清空碎片列表，释放本轮引用的全部 chunk 碎片。
+        if keys_list:
+            keys = torch.cat(keys_list)
+            vals = torch.cat(vals_list)
+            buf += _det_scatter_add(n_rows, keys, vals, dev, torch.float32)
+        keys_list.clear()
+        vals_list.clear()
+
     for h in range(nh):
         q_all = q[:, :, h, :].to(torch.float32)
         dO_all = dO[:, :, h, :].to(torch.float32)
@@ -955,16 +966,10 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 if need_dvsw:
                     dvsw_keys.append((keyw + h).reshape(-1))
                     dvsw_vals.append(dvl[:, :, nb:].reshape(-1, hd))
-    def _flush(keys_list, vals_list, buf, n_rows):
-        if not keys_list:
-            return
-        keys = torch.cat(keys_list)
-        vals = torch.cat(vals_list)
-        buf += _det_scatter_add(n_rows, keys, vals, dev, torch.float32)
-    _flush(dk_keys, dk_vals, dk_blk32, R * Bm * nh)
-    _flush(dksw_keys, dksw_vals, dk_sw32, R * T * nh)
-    _flush(dv_keys, dv_vals, dv_blk32, R * Bm * nh)
-    _flush(dvsw_keys, dvsw_vals, dv_sw32, R * T * nh)
+        _flush(dk_keys, dk_vals, dk_blk32, R * Bm * nh)
+        _flush(dksw_keys, dksw_vals, dk_sw32, R * T * nh)
+        _flush(dv_keys, dv_vals, dv_blk32, R * Bm * nh)
+        _flush(dvsw_keys, dvsw_vals, dv_sw32, R * T * nh)
     dk_blk = dk_blk32.to(dtype).view(R, Bm, nh, hd) if need_dkb else None
     dk_sw = dk_sw32.to(dtype).view(R, T, nh, hd) if need_dksw else None
     dv_blk = dv_blk32.to(dtype).view(R, Bm, nh, hd) if need_dvb else None
