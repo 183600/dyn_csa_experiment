@@ -665,7 +665,10 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     dev = qI.device
     dtype = qI.dtype
     t_idx = torch.arange(T, device=dev)[None, :, None]
-    causal = t_idx > last_tok[:, None, :].to(torch.int64)
+    # causal 只在 t 分块切片上消费：循环内按片做同一整数比较（last_tok 的
+    # int64 升型循环外一次），布尔值与全幅形式逐格相同，[R, T, Bm] 全幅
+    # 掩码不再物化。
+    lt64 = last_tok.to(torch.int64)
     # fp32 升型整体只做一次（逐片 cast 的值与整张 cast 后取片逐位一致）：
     # 否则每个头都重复拷贝一次 qI / kI / w_idx 的 fp32 版本。
     qIf = qI if qI.dtype == torch.float32 else qI.to(torch.float32)
@@ -680,7 +683,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     t_chunk = max(1, min(T, (256 << 20) // max(R * Bm * 32, 1)))
     for t0 in range(0, T, t_chunk):
         t1 = min(t0 + t_chunk, T)
-        causal_c = causal[:, t0:t1]
+        causal_c = t_idx[:, t0:t1] > lt64[:, None, :]
         scores = torch.zeros((R, t1 - t0, Bm), device=dev, dtype=torch.float32)
         for i in range(nIH):
             # mul/relu 原地（s_i 是本轮新出的临时量，relu(x)>0 ⟺ x>0 逐位一致）；
@@ -743,17 +746,17 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
     dev = qI.device
     dtype = qI.dtype
     t_idx = torch.arange(T, device=dev)[None, :, None]
-    causal = t_idx > last_tok[:, None, :].to(torch.int64)
+    # 同 _indexer_fwd_ref：causal 按 t 分块现算（同一整数比较），全幅
+    # [R, T, Bm] 掩码不物化。
+    lt64 = last_tok.to(torch.int64)
     gsf = gs.to(torch.float32)
     softf = soft.to(torch.float32)
     Gt = (gsf * softf).sum(dim=-1)
-    Mk = torch.zeros((R, T, Bm + 1), device=dev, dtype=torch.float32)
     if idx.numel():
-        # pad 槽位（重复的 pad_blk）投到哑列：scatter_ 对重复下标的胜者未定义，
-        # 但哑列上全部候选值都是 0，且有效槽位彼此互不相同——切片后即精确。
-        dst = torch.where(valid, idx.to(torch.int64), torch.full_like(idx.to(torch.int64), Bm))
-        Mk.scatter_(2, dst, (gsf * softf) * valid.to(torch.float32))
-    Mk = Mk[:, :, :Bm]
+        # 一次升型供全循环复用（同一批整数）：pad 槽位（重复的 pad_blk）投到
+        # 哑列 Bm——scatter_ 对重复下标的胜者未定义，但哑列上全部候选值都是
+        # 0，且有效槽位彼此互不相同——切片后即精确。
+        idx_l = idx.to(torch.int64)
     dqI = torch.zeros_like(qI) if need_dq else None
     dkI = torch.zeros_like(kI) if need_dk else None
     dw = torch.zeros_like(w_idx) if need_dw else None
@@ -763,6 +766,13 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
     wf = w_idx if w_idx.dtype == torch.float32 else w_idx.to(torch.float32)
     for t0 in range(0, T, t_chunk):
         t1 = min(t0 + t_chunk, T)
+        # Mk 随 t 分块构建（全幅 [R, T, Bm+1] 不再物化）：逐 chunk 的 scatter
+        # 键/值就是全幅形式对应行的切片，逐行无碰撞——切片后的值逐位一致。
+        Mk = torch.zeros((R, t1 - t0, Bm + 1), device=dev, dtype=torch.float32)
+        if idx.numel():
+            dst = torch.where(valid[:, t0:t1], idx_l[:, t0:t1], Bm)
+            Mk.scatter_(2, dst, (gsf[:, t0:t1] * softf[:, t0:t1]) * valid[:, t0:t1].to(torch.float32))
+        Mk = Mk[:, :, :Bm]
         q_c = qI[:, t0:t1].to(torch.float32)
         s_list = []
         for i in range(nIH):
@@ -787,12 +797,12 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
             # 前向末段 einsum 的输出舍入：lse/e 必须从前向实际选择的
             # 同一批舍入分数重算。
             s_all = s_all.to(dtype)
-        causal_c = causal[:, t0:t1]
+        causal_c = t_idx[:, t0:t1] > lt64[:, None, :]
         masked = torch.where(causal_c, s_all, torch.full_like(s_all, _NEG_INF))
         lse = torch.logsumexp(masked, dim=-1)
         row_ok = torch.isfinite(lse)
         e = torch.where(row_ok[:, :, None], torch.exp(masked - lse[:, :, None]), torch.zeros_like(masked))
-        ds = Mk[:, t0:t1] - e * Gt[:, t0:t1, None]
+        ds = Mk - e * Gt[:, t0:t1, None]
         ds = torch.where(causal_c & torch.isfinite(s_all), ds, torch.zeros_like(ds))
         for i in range(nIH):
             s_i = s_list[i]

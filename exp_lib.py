@@ -1152,8 +1152,12 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     # valid lanes and exactly 0 on pad lanes; pad lanes are then overwritten
     # with -inf. Forward values and B_pos gradients (zero on invalid lanes in
     # both forms) are identical to the previous boolean-index form.
-    Zam = Zam + B_pos_a[_pos_a][None] * mask_a[:, :, None]
-    Zbm = Zbm + B_pos_b[b_off] * mask_b[:, :, None]
+    # += on the fresh _take_2d outputs: the same elementwise kernel with the
+    # same values as the out-of-place add, minus one full [B, L, c] temporary
+    # per lane stack (AddBackward saves no tensor, and the only downstream
+    # consumer chain — masked_fill_/cat/softmax — keeps no pre-add version).
+    Zam += B_pos_a[_pos_a][None] * mask_a[:, :, None]
+    Zbm += B_pos_b[b_off] * mask_b[:, :, None]
     # the fill mask broadcasts: masked_fill_ accepts a broadcastable mask, so
     # the negation materializes [B, L, 1] instead of the full [B, L, c] form —
     # the same booleans reach every lane (broadcast reads are exact), and the
@@ -1166,7 +1170,8 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
     sc_a = sc[:, :max_len]
     sc_b = sc[:, max_len:]
-    comp = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
+    comp = (sc_a * Xam).sum(1)
+    comp += (sc_b * Xbm).sum(1)
     # Identity-order fast path: when `order` is the cached arange, the gather
     # order[last_idx] returns exactly last_idx (arange[i] == i, exact integers
     # — index transport, design notes §6.1), so the gather kernel is skipped.
@@ -1224,7 +1229,9 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     # mask multiply adds exactly the same values on valid lanes and 0 on pad
     # lanes, which the fill then sets to -inf — identical values and gradients
     # to the previous boolean-index form, without the index_put/ragged gather.
-    WinZ = WinZ + B_pos[_pos_a][None] * mask[:, :, None]
+    # += on the fresh _take_2d output (same elementwise kernel and values as
+    # the out-of-place add; see _pool_ordered).
+    WinZ += B_pos[_pos_a][None] * mask[:, :, None]
     # broadcast fill mask (same argument as _pool_ordered): identical booleans
     # per lane, without materializing the full-size negated mask.
     WinZ.masked_fill_(~mask[:, :, None], float('-inf'))
@@ -1271,16 +1278,24 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     keep = cf.gather(1, order_w)
     dest = keep.cumsum(dim=1)
     dest -= 1
-    dest.clamp_(min=0)
-    grid = _arange_cache(n, scores.device)[:, None].expand(n, _w_keep)
-    kept = torch.full((n, _w_keep), -1, dtype=torch.int32, device=scores.device)
     # int64 -> int32 narrowing, on the kept slice only — same integers
     # (index transport, design notes §6.1).  keep/dest are already exactly
     # _w_keep wide (keep = cf.gather(1, order_w), dest = keep.cumsum), so the
     # old [:, :_w_keep] re-slices were identity views and are dropped.
     order_k = order_w.to(torch.int32)
-    kept[grid[keep], dest[keep]] = order_k[keep]
-    del grid
+    # Sentinel-column scatter instead of the boolean-mask assignment
+    # (kept[grid[keep], dest[keep]] = order_k[keep]): masked advanced indexing
+    # goes through nonzero and forces a host sync — three times per call here,
+    # on the hottest selection path.  Within a row the kept lanes hold distinct
+    # cumsum ranks (0..cnt-1), so every scatter target column has exactly one
+    # writer; lanes failing `keep` are redirected to a sentinel column that is
+    # sliced away (its undefined winner never leaves the pad).  The kept
+    # columns are therefore the same exact integers as the masked-assignment
+    # form (host-side integer equivalence, design notes §6.2), with no sync.
+    tgt = torch.where(keep, dest, _w_keep)
+    kept = torch.full((n, _w_keep + 1), -1, dtype=torch.int32, device=scores.device)
+    kept.scatter_(1, tgt, order_k)
+    kept = kept[:, :_w_keep]
     # last_tok from either pooling path is non-decreasing (a cumsum of
     # non-negative counts followed by the monotone (ends-1).clamp(0, n-1)),
     # so every row of `causal` is a prefix of Trues: the first-max argmax of
@@ -1376,8 +1391,15 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     for s in range(0, n, query_chunk):
         e = min(s + query_chunk, n)
         if random_select:
-            z = torch.sin(_ri[s:e] * 12.9898 + _jc) * 43758.5453
-            z = (z - torch.floor(z)) * 2.0 - 1.0
+            # same elementwise op chain with in-place tails: each op is the
+            # same kernel on the same values (no fusion, no reassociation —
+            # note x-floor(x) is NOT frac() for negatives), so the scores are
+            # bit-identical minus the dead [chunk, B] float64 temporaries.
+            z = _ri[s:e] * 12.9898 + _jc
+            z.sin_()
+            z.mul_(43758.5453)
+            z.sub_(torch.floor(z))
+            z.mul_(2.0).sub_(1.0)
             c = z.to(H.dtype)
         else:
             raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI)
@@ -1532,7 +1554,11 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _tk2 = _take_2d
     _einsum = torch.einsum
     if _has_all:
-        _plan = [(_s, _e := (_s + q_chunk if _s + q_chunk < n else n), sel_blk_all[_s:_e], None if keep_all is None else keep_all[_s:_e], nvalid_all[_s:_e], None if anyrow_all is None else anyrow_all[_s:_e]) for _s in range(0, n, q_chunk)]
+        # Only the keep/nvalid/anyrow slices are consumed below; the whole-row
+        # sel_blk_all / valid_all tables are fully absorbed into them and die
+        # here instead of staying pinned through the chunk loop.
+        _plan = [(None if keep_all is None else keep_all[_s:_s + q_chunk], nvalid_all[_s:_s + q_chunk], None if anyrow_all is None else anyrow_all[_s:_s + q_chunk]) for _s in range(0, n, q_chunk)]
+        del sel_blk_all, valid_all
     else:
         _plan = None
     for s in range(0, n, q_chunk):
@@ -1541,10 +1567,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             e = n
         qseg = q[s:e]
         if _plan is not None:
-            _p = _plan[s // q_chunk]
-            keep = _p[3]
-            nvalid = _p[4]
-            anyrow = _p[5]
+            keep, nvalid, anyrow = _plan[s // q_chunk]
         else:
             sel_blk = sel_blk_all[s:e]
             keep = None
@@ -1573,7 +1596,11 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             Kset = torch.cat([_tk2(k_blk, _sel_rows), _tk2(k_sw, _win_rows)], 1)
             Vset = torch.cat([_tk2(v_blk, _sel_rows), _tk2(v_sw, _win_rows)], 1)
             logits = _einsum('qhd,qmhd->qhm', qseg, Kset)
-            logits.mul_(scale)
+            if scale != 1.0:
+                # x·1.0 is the IEEE identity (and grad·1.0 is bit-identical on
+                # the backward Mul node), so the in-repo scale=1.0 path skips
+                # the multiply kernel outright; non-1.0 callers keep it.
+                logits.mul_(scale)
             logits.masked_fill_(nvalid, _MINL)
             attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
             if not _has_sink:
@@ -1595,9 +1622,11 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         soft_log_g = torch.log(soft_g.clamp_min(1e-12))
         soft_log_g.masked_fill_(soft_g <= 0, _MINL)
         blk_logits = _einsum('qhd,qmhd->qhm', qseg, kb)
-        blk_logits.mul_(scale)
+        if scale != 1.0:
+            blk_logits.mul_(scale)
         win_logits = _einsum('qhd,qmhd->qhm', qseg, kw)
-        win_logits.mul_(scale)
+        if scale != 1.0:
+            win_logits.mul_(scale)
         logits = torch.cat([blk_logits, win_logits], -1)
         soft_logits = logits.clone()
         soft_logits[:, :, :_nb].add_(soft_log_g[:, None, :]).clamp_min_(_MINL)
@@ -1809,7 +1838,10 @@ class HybridAttention(nn.Module):
 
     def _sink_attn_chunk(self, q_c, k, v, mask_c, sink_view, scale):
         logits = torch.einsum('bnhd,bmhd->bhnm', q_c, k)
-        logits.mul_(scale)
+        if scale != 1.0:
+            # same IEEE-identity skip as gathered_attention (x·1.0 and its
+            # backward grad·1.0 are bit-identical to no-op).
+            logits.mul_(scale)
         logits.add_(mask_c)
         if sink_view is not None:
             lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
@@ -2060,10 +2092,26 @@ class HybridAttention(nn.Module):
         index_kv = comp_kv
         attn_kv = torch.zeros_like(comp_kv) if cfg.content_mode == 'zero' else comp_kv
         if self._stats is not None:
-            self._stats.append(torch.bincount(bid))
+            # scatter_add of exact integer ones is order-independent (integer
+            # addition commutes, no rounding), so the counts are the same
+            # exact integers bincount returns — without bincount's max
+            # read-back, which forces a host sync per row per layer.
+            _bc = torch.zeros(int(nblk), dtype=torch.int64, device=bid.device)
+            _bc.scatter_add_(0, bid if bid.dtype == torch.int64 else bid.long(), torch.ones_like(bid, dtype=torch.int64))
+            self._stats.append(_bc)
             if self._cuts is not None:
-                cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
-                self._cuts.append(cuts)
+                _cpu = getattr(bid, '_pool_cpu', None)
+                if _cpu is not None and sum(_cpu[0]) == T:
+                    # host-side integer equivalence (design notes §6.2): cut
+                    # positions are the prefix sums of the same counts table
+                    # that generated bid — the identical integers to the
+                    # nonzero(diff)+1 form, with no device sync.  Consumers
+                    # accept numpy rows directly (compression_report's
+                    # _tcut_ix split and boundary_alignment's np.asarray).
+                    self._cuts.append(np.cumsum(np.asarray(_cpu[0], dtype=np.int64))[:-1])
+                else:
+                    cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
+                    self._cuts.append(cuts)
         core_kv = F.normalize(attn_kv, dim=-1)
         kv_local = F.normalize(Ca_raw, dim=-1)
         if x.device.type == 'cuda':
@@ -3351,7 +3399,13 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
             if _k < _flat:
                 _g = torch.Generator().manual_seed(int(eval_seed))
                 _sel = torch.randperm(_flat, generator=_g)[:_k]
-                _sel_sorted = torch.sort(_sel).values.to(device)
+                # keep the sorted host copy: per-chunk membership bounds are
+                # integer range queries on a sorted table — searchsorted on the
+                # host gives the same slice the boolean-mask form selected
+                # (host-side integer equivalence, design notes §6.2), and the
+                # count being zero lets the chunk skip its upload AND trunk.
+                _sel_host = torch.sort(_sel).values
+                _sel_sorted = _sel_host.to(device)
                 print(f'[eval_ppl] scoring a uniform sample of {_k}/{_flat} target rows (eval_rows={int(eval_rows)}, eval_seed={int(eval_seed)}) — this is a SAMPLED estimate, not the full-set PPL')
             else:
                 print(f'[eval_ppl] eval_rows={int(eval_rows)} covers the whole {_flat}-row target space; scoring the FULL set (this is the population statistic, not a sample)')
@@ -3369,24 +3423,31 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
         else:
             _vhost = torch.as_tensor(val_batch)
         _async = _vhost.is_pinned()
+        _span = max(0, int(val_batch.shape[1]) - 1)
         for i in range(0, val_batch.shape[0], chunk):
+            _lo = _hi = 0
+            if _sel is not None:
+                # Host-side range count on the sorted selection: chunks with
+                # no sampled target contribute nothing to nll/ntok, so both
+                # the H2D and the trunk forward are skipped (the values that
+                # do accumulate are unchanged; the trunk's comp_reg side
+                # effect is unread in eval and overwritten by the next trunk).
+                _base = i * _span
+                _wide = min(chunk, int(val_batch.shape[0]) - i) * _span
+                if _wide > 0:
+                    _lo = int(torch.searchsorted(_sel_host, _base))
+                    _hi = int(torch.searchsorted(_sel_host, _base + _wide))
+                if _hi <= _lo:
+                    continue
+            elif _span == 0:
+                continue
             ids = _vhost[i:i + chunk].to(device, non_blocking=_async)
             # Trunk + per-slice LM head; comp_reg / need_reg handling is
             # identical to model(ids) because forward() itself is exactly
             # trunk() followed by head().
             h = model.trunk(ids)
-            _span = max(0, ids.shape[1] - 1)
-            if _span == 0:
-                del ids, h
-                continue
             if _sel is not None:
-                _base = i * _span
-                _wide = int(ids.shape[0]) * _span
-                _m = (_sel_sorted >= _base) & (_sel_sorted < _base + _wide)
-                _local = _sel_sorted[_m] - _base
-                if _local.numel() == 0:
-                    del ids, h
-                    continue
+                _local = _sel_sorted[_lo:_hi] - _base
                 _ri = torch.div(_local, _span, rounding_mode='floor')
                 _ci = _local - _ri * _span
                 # gather the selected hidden rows BEFORE the head: each output
@@ -3852,6 +3913,13 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
         ids = torch.as_tensor(np.asarray(val_batch[_r0:min(_r0 + 16, n_used)])).to(device)
         _ = model(ids, logits_tail=1)
         del ids
+    # one stacked device read for every dynamic layer's delta_logit instead
+    # of a per-layer .item() sync (same scalars, same floats).
+    _dl_layers = [(li, blk.attn.delta_logit) for li, blk in enumerate(model.blocks)
+                  if blk.attn.cfg.dynamic and getattr(blk.attn, 'delta_logit', None) is not None]
+    _dl_vals = {}
+    if _dl_layers:
+        _dl_vals = {li: float(v) for (li, _), v in zip(_dl_layers, torch.stack([p.detach() for _, p in _dl_layers]).tolist())}
     for li, blk in enumerate(model.blocks):
         attn = blk.attn
         st = attn._stats
@@ -3866,7 +3934,7 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
         entry = {'blocks': n_blocks, 'avg_len': seq_len / max(n_blocks, 1.0), 'len_mean': _vals[0], 'len_std': _vals[1], 'len_min': int(_vals[2]), 'len_max': int(_vals[3]), 'frac_at_min': _vals[4], 'frac_at_max': _vals[5]}
         del _sc, _vals
         if attn.cfg.dynamic and getattr(attn, 'delta_logit', None) is not None:
-            entry['delta'] = float(attn.delta_logit.item())
+            entry['delta'] = _dl_vals[li]
         if val_bnd is not None and attn._cuts:
             n_seq_ref = min(len(attn._cuts), val_bnd.shape[0])
             if n_seq_ref < len(attn._cuts):
