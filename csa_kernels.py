@@ -533,7 +533,12 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
                 gZb += torch.where(ok2[:, :, None], _take_lane(glogit_b, r_idx, b2c - b0, j2c), zero).to(dtype)
         if need_bpa:
             gsum = glogit_a.sum(dim=(0, 1))
-            gBpa[:gsum.shape[0]] += gsum.to(B_pos_a.dtype)
+            # 前向把 pos_a 钳到 B_pos_a 末行（见上方 clamp）：超程泳道的
+            # 梯度必须按同一钳位语义累加进末行，而不是按形状截断或报错。
+            _rows = min(int(gsum.shape[0]), int(gBpa.shape[0]))
+            gBpa[:_rows] += gsum[:_rows].to(B_pos_a.dtype)
+            if _rows < int(gsum.shape[0]):
+                gBpa[_rows - 1] += gsum[_rows:].sum(dim=0).to(B_pos_a.dtype)
         if need_bpb and has_b:
             gBpb_keys.append(b_off[:, b0:b1].reshape(-1))
             gBpb_vals.append(glogit_b.reshape(-1, c))
@@ -671,7 +676,9 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
         sval, sidx = torch.sort(work, dim=-1, descending=True, stable=True)
         top_val = sval[:, :, :k_out]
         top_idx = sidx[:, :, :k_out]
-        has = top_val > -1e30
+        # 与 eager 的 keep = cf.gather(...)（cf = causal & isfinite）同口径：
+        # 有限的极端负分是有效选择，只有 -inf 填充位无效。
+        has = top_val > float('-inf')
         valid[:, t0:t1] = has
         idx[:, t0:t1] = torch.where(has, top_idx, pad_blk[:, :, None]).to(torch.int32)
         sv = top_val - lse[:, :, None]
@@ -727,10 +734,25 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
         for i in range(nIH):
             # 原地 relu：后面用到的 (s_i > 0) 与 relu(s_i)>0 逐位同真，
             # dw 用的 relu(s_i) 即本张量自身——不再保留 relu 前的副本。
-            s_list.append(F.relu_(torch.einsum('rth,rbh->rtb', q_c[:, :, i, :], kIf[:, :, i, :]) * iscale))
-        s_all = torch.zeros_like(s_list[0])
+            s_i = torch.einsum('rth,rbh->rtb', q_c[:, :, i, :], kIf[:, :, i, :])
+            if dtype != torch.float32:
+                # 与前向（_indexer_fwd_ref）同一逐头舍入结构：反向的 relu
+                # 掩码与下方 softmax 归一化必须作用在前向实际使用的舍入
+                # 分数上，梯度才与（舍入后的）前向函数共轭。
+                s_i = s_i.to(dtype)
+                s_i = s_i * iscale
+            else:
+                s_i *= iscale
+            s_list.append(F.relu_(s_i))
+        # fp32 累加器（与前向的 scores 容器同口径——即使 s_i 已按 dtype
+        # 舍入，跨头累加也在 fp32 进行）。
+        s_all = torch.zeros((R, t1 - t0, Bm), device=dev, dtype=torch.float32)
         for i in range(nIH):
             s_all.add_(s_list[i] * wf[:, t0:t1, i:i + 1])
+        if dtype != torch.float32:
+            # 前向末段 einsum 的输出舍入：lse/e 必须从前向实际选择的
+            # 同一批舍入分数重算。
+            s_all = s_all.to(dtype)
         causal_c = causal[:, t0:t1]
         masked = torch.where(causal_c, s_all, torch.full_like(s_all, _NEG_INF))
         lse = torch.logsumexp(masked, dim=-1)
@@ -1105,10 +1127,13 @@ _KERNELS = None
 
 
 def _dot_prec():
-    """tl.dot 的输入精度：默认 tf32（H800 张量核；与 eager 的差异属于
-    内核变体的容差口径，见模块 docstring），CSA_KERNEL_TF32=0 时用 ieee
-    （逐位口径的 fp32 FMA，用于数值排查）。"""
-    return 'tf32' if (_env_cached('CSA_KERNEL_TF32') or '1').strip().lower() not in ('0', 'false', 'off') else 'ieee'
+    """tl.dot 的输入精度：默认 ieee（逐位口径的 fp32 FMA——eager 的 fp32
+    einsum 也是 ieee，默认必须保证 kernel/eager 是同一函数，否则 indexer
+    的近 tie 选择会被 ~1e-3 的 tf32 噪声翻转、且同一 softmax 内滑窗泳道
+    (tl.dot) 与块泳道 (tl.sum) 精度不对称）；CSA_KERNEL_TF32=1 时显式
+    切换到 tf32（H800 张量核吞吐实验，与 eager 的差异属容差口径）。
+    bf16 输入不受此开关影响（张量核对 bf16 输入精确、fp32 累加）。"""
+    return 'tf32' if (_env_cached('CSA_KERNEL_TF32') or '0').strip().lower() not in ('0', 'false', 'off') else 'ieee'
 
 
 def _kernels():
@@ -1157,7 +1182,9 @@ def _kernels():
             bpb = tl.load(Bpb_ptr + boff[:, None] * C + cs[None, :], mask=cm[None, :], other=0.0).to(tl.float32)
             lb = tl.where(b_ok[:, None], zb + bpb, float('-inf'))
             m = tl.maximum(m, tl.max(lb, 0))
-        m = tl.maximum(m, -1e30)
+        # 全掩泳道兜底取 0（ea=exp(-inf-0)=0、Z=0 走 Zs 守卫）；有限极值
+        # 不钳位（见 idx_topk 的同口径注释）。
+        m = tl.where(m == float('-inf'), 0.0, m)
         ea = tl.exp(la - m[None, :])
         Z = tl.sum(ea, 0)
         if HAS_B:
@@ -1202,9 +1229,23 @@ def _kernels():
                 q_i = tl.load(qI_ptr + ((r * TF + tg[:, None]) * N_IH + i) * HD + d[None, :], mask=tm[:, None] & dm[None, :], other=0.0).to(tl.float32)
                 w_i = tl.load(w_ptr + (r * TF + tg) * N_IH + i, mask=tm, other=0.0).to(tl.float32)
                 k_t = tl.load(kI_ptr + ((r * Bm + bi[:, None]) * N_IH + i) * HD + d[None, :], mask=bm[:, None] & dm[None, :], other=0.0).to(tl.float32)
-                s = tl.dot(q_i, tl.trans(k_t), input_precision=DOT) * ISCALE
+                s = tl.dot(q_i, tl.trans(k_t), input_precision=DOT)
+                if qI_ptr.dtype.element_ty == tl.float32:
+                    s = s * ISCALE
+                else:
+                    # 复现 eager 的逐头舍入结构（einsum 输出按输入 dtype
+                    # 舍入一次、乘 iscale 再舍入一次）；低精度下漏掉这两次
+                    # 中间舍入会翻转近 tie 的选择次序（G0 的 idx 逐位判据
+                    # 会炸）。ref 后端的同款结构见 _indexer_fwd_ref。
+                    s = s.to(qI_ptr.dtype.element_ty).to(tl.float32)
+                    s = (s * ISCALE).to(qI_ptr.dtype.element_ty).to(tl.float32)
                 acc += tl.where(s > 0.0, s, 0.0) * w_i[:, None]
-            tl.store(scores_ptr + (r * T + ti[:, None]) * Bm + bi[None, :], acc, mask=tm[:, None] & bm[None, :])
+            out_s = acc
+            if qI_ptr.dtype.element_ty != tl.float32:
+                # 末段 einsum 的输出舍入（fp32 累加后按 dtype 舍入一次），
+                # 与 eager/ref 的选择输入逐位对齐。
+                out_s = acc.to(qI_ptr.dtype.element_ty).to(tl.float32)
+            tl.store(scores_ptr + (r * T + ti[:, None]) * Bm + bi[None, :], out_s, mask=tm[:, None] & bm[None, :])
 
     ns.idx_score = idx_score
 
@@ -1234,7 +1275,10 @@ def _kernels():
         has_nan = tl.sum(tl.where(masked != masked, 1.0, 0.0), 0) > 0.0
         has_pinf = tl.sum(tl.where(masked == float('inf'), 1.0, 0.0), 0) > 0.0
         m0 = tl.max(masked, 0)
-        m_safe = tl.maximum(m0, -1e30)
+        # 全掩行兜底取 0（exp(-inf-0)=0、lse=-inf，与 eager 的全 -inf
+        # logsumexp 同值）；有限行一律用真 max——钳位哨兵会在「全部有效
+        # logit < 哨兵」时背离 eager 的归一化。
+        m_safe = tl.where(m0 == float('-inf'), 0.0, m0)
         e = tl.exp(masked - m_safe)
         Ssum = tl.sum(e, 0)
         lse = m_safe + tl.log(Ssum)
@@ -1246,7 +1290,9 @@ def _kernels():
         pad = tl.where(has_causal, pad, 0)
         for j in tl.static_range(K):
             m = tl.max(work, 0)
-            has = m > -1e30
+            # work 的泳道非有限即 -inf：与 eager 的 cf = causal & isfinite
+            # 同口径（有限的极端负分也是有效选择）。
+            has = m > float('-inf')
             pick = tl.min(tl.where(work == m, b, BIG), 0)
             work = tl.where(has & (b == pick), float('-inf'), work)
             use = tl.where(has, pick, pad)
@@ -2246,7 +2292,11 @@ def selfcheck_model(variant='csa_dynamic', impl='ref', seed=0, device=None, T=64
     """模型级对照：同种子构建 SmallGPT，eager vs 内核模式的前向 loss 与
     全部参数梯度的相对误差（配对纪律：同一配置指纹口径的两种实现）。"""
     import exp_lib as L
-    device = device or torch.device('cpu')
+    if device is None:
+        # triton 内核只接受 CUDA 指针——不显式传 device 时按后端选择，
+        # 否则在 CUDA 机器上 triton 对照会落在 CPU 张量上直接崩溃
+        # （模型级 kernel/eager 等价性将从未被真正验证）。
+        device = torch.device('cuda') if (impl == 'triton' and torch.cuda.is_available()) else torch.device('cpu')
     d, n_layers, n_heads, d_head = 64, 2, 4, 16
     vocab = 128
     ids = torch.randint(0, vocab, (B, T), generator=torch.Generator().manual_seed(seed + 5)).to(device)

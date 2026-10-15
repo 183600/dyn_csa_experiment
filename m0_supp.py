@@ -162,8 +162,9 @@ def run_kernel():
 
     判据：
     - 数值一致性：三算子 + 模型级的 kernel/eager 同种子对照（值与全部
-      梯度；fp32 容差 5e-3，bf16 容差 5e-2——归约分组不同带来的浮点噪声
-      口径，见 design_notes §5 的同类漂移讨论）；
+      梯度；容差按后端分级——ref 为同算法张量表达，fp32 1e-4 / bf16
+      2e-2；triton 为独立内核实现，fp32 5e-3 / bf16 5e-2，属归约分组
+      不同的浮点噪声口径，见 design_notes §5 的同类漂移讨论）；
     - 基准（仅 CUDA + triton）：稀疏注意力算子有效速率，判据口径见
       docs/compute_plan.md §6。
     """
@@ -180,7 +181,12 @@ def run_kernel():
     fail = False
     for impl in backends:
         for dt in dtypes:
-            tol = 5e-3 if dt == torch.float32 else 5e-2
+            # 容差按后端分级：ref 与 eager 是同一算法的张量表达，残差只剩
+            # 归约重结合（fp32 ~1e-6、bf16 个别条目 1-ULP 翻转），必须远严
+            # 于 triton（独立内核实现：在线 softmax/分块归约的结构性重排）。
+            # 一刀切宽容差会让 ref 后端掩盖中小幅度的真实算法性回归。
+            tol = {(False, False): 1e-4, (False, True): 2e-2,
+                   (True, False): 5e-3, (True, True): 5e-2}[(impl == 'triton', dt != torch.float32)]
             for seed in (0, 1):
                 res = ck.selfcheck_operators(device=dev, dtype=dt, impl=impl, seed=seed, verbose=False)
                 worst_k = max(res, key=res.get)
@@ -192,11 +198,12 @@ def run_kernel():
     B_m = int(os.environ.get('M0_KERNEL_B') or 2)
     for impl in backends:
         for variant in ('csa_fixed', 'csa_dynamic', 'hybrid_dynamic'):
-            res = ck.selfcheck_model(variant=variant, impl=impl, seed=0, T=T_m, B=B_m)
-            # 梯度判据：范数相对误差 < 1e-4（主）；逐条目相对误差 < 5e-2
-            # （上限——归约分组不同带来的逐条目漂移属 design_notes §5 记录
-            # 在案的同类 ULP 漂移，前向 ce 逐位一致是更强的主判据）。
-            ok = res['ce_abs_diff'] < 1e-5 and res['grad_norm_rel'] < 1e-4 and res['grad_max_rel'] < 5e-2
+            res = ck.selfcheck_model(variant=variant, impl=impl, seed=0, T=T_m, B=B_m, device=dev)
+            # 梯度判据：范数相对误差 < 1e-4（主）；逐条目相对误差按后端
+            # 分级（ref 1e-3 / triton 5e-2——同算子级的分级理由；前向 ce
+            # 逐位一致是更强的主判据）。
+            gmax_tol = 5e-2 if impl == 'triton' else 1e-3
+            ok = res['ce_abs_diff'] < 1e-5 and res['grad_norm_rel'] < 1e-4 and res['grad_max_rel'] < gmax_tol
             fail |= not ok
             print(f'[kernel] 模型对照 impl={impl:<6} {variant:<14}: {"OK" if ok else "FAIL"}')
     tflops = {}
