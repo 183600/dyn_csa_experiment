@@ -28,8 +28,8 @@ if _NEEDED:
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
 import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections
-from bisect import bisect_right as _bisect_right
 from math import comb
+from bisect import bisect_right as _bisect_right
 from dataclasses import dataclass
 import numpy as np
 import torch
@@ -948,10 +948,9 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     Zam.masked_fill_(~mask_a[:, :, None], float('-inf'))
     Zbm.masked_fill_(~mask_b[:, :, None], float('-inf'))
     WinZ = torch.cat([Zam, Zbm], 1)
-    sc = F.softmax(WinZ, dim=1)
-    # sc 是 softmax 新产出的张量（无别名），nan_to_num 原地进行——同一核
-    # 心的逐元素映射，值与出位版逐位相同，省一份同形分配。
-    sc = torch.nan_to_num_(sc)
+    # softmax 的反向保存其输出，nan_to_num 必须出位（原地会改写保存值，
+    # SoftmaxBackward 版本检查失败）；值与任何原地形式逐位相同。
+    sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
     sc_a = sc[:, :max_len]
     sc_b = sc[:, max_len:]
     comp = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
@@ -1016,8 +1015,8 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     # broadcast fill mask (same argument as _pool_ordered): identical booleans
     # per lane, without materializing the full-size negated mask.
     WinZ.masked_fill_(~mask[:, :, None], float('-inf'))
-    # softmax 的输出是新鲜张量，nan_to_num 原地（同上的逐元素等价论证）。
-    sc = torch.nan_to_num_(F.softmax(WinZ, dim=1))
+    # 同 _pool_ordered：softmax 反向保存输出，nan_to_num 出位。
+    sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
     comp = (sc * Xb).sum(1)
     # same identity-order fast path as _pool_ordered: order[last_idx] over the
     # cached arange returns exactly last_idx (index transport, §6.1).
@@ -1182,8 +1181,9 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     # the sub_ node records the identical broadcast gradient); exp_ is the
     # same story (its backward saves the output, as the out-of-place form).
     soft = scores.gather(1, idx.long()).sub_(_lse).exp_()
-    # gather/sub_/exp_ 的产出是新鲜张量，nan_to_num 原地（同一逐元素映射）。
-    soft = torch.nan_to_num_(soft)
+    # nan_to_num 必须出位：exp_ 的反向保存其输出张量，原地 nan_to_num_ 会
+    # 改写该保存值、使 ExpBackward 的版本检查失败（反向报错）。
+    soft = torch.nan_to_num(soft)
     del scores, _lse
     m = None
     if return_mask:
@@ -1403,6 +1403,19 @@ def _gathered_attention_trainable(*args, **kwargs):
         return torch.utils.checkpoint.checkpoint(gathered_attention, *args, use_reentrant=False, **kwargs)
     return gathered_attention(*args, **kwargs)
 
+def _pool_trainable(fn, *args, **kwargs):
+    # 训练时以重算代替保留：池化内部物化的 Xam/Zam/Xbm/Zbm/WinZ 与 softmax
+    # 输出（每行每层 O(n_blocks·L·c_kv)，随上下文长度线性增长）原本全部保留
+    # 到反向；包一层非重入 checkpoint 后只保留输入（Ca/Z 等经 _pre 融合投影
+    # 产出的切片本就被上游保留，bid/B_pos 是小表）。重算是同一纯函数：池化
+    # 内部无 RNG，整数几何缓存挂在不可变的 block_ids 对象上（_pool_parts /
+    # _pool_geom，design notes §6.2），反向重算必命中同一几何，前向值与梯度
+    # 逐位一致；int 型的 n_blocks 返回值原样透传。eval 下（无梯度）零开销
+    # 直调。
+    if torch.is_grad_enabled() and args[0].requires_grad:
+        return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False, **kwargs)
+    return fn(*args, **kwargs)
+
 @dataclass
 class AttnCfg:
     kind: str = 'csa'
@@ -1568,23 +1581,35 @@ class HybridAttention(nn.Module):
         if _budget is not None:
             _per_row = max(1, 3 * B * self.nh * T) * q.element_size()
             row_chunk = max(1, min(row_chunk, int(_budget) // _per_row))
+        # 训练时每个行块包一层非重入 checkpoint：各块的 [B, nh, rows, T]
+        # logits/attn（合计 O(B·nh·T²)，长序列下稠密 sink 臂的最大单项保留）
+        # 原本保留到反向；现在反向按块重算同一份值（无 RNG、预算口径经
+        # _ATB_EPOCH 在运行内不变、mask 是缓存的常量张量——块边界与中间值
+        # 逐位相同，梯度与原形式逐位一致，同 ce_loss 分块重算的论证）。
+        _ck = torch.is_grad_enabled() and q.requires_grad
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
-            logits = torch.einsum('bnhd,bmhd->bhnm', q[:, s:e], k)
-            logits.mul_(scale)
-            logits.add_(mask[s:e])
-            if sink_view is not None:
-                lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
-                # logits 是本轮 einsum 新产出的张量（随即删除，无其他读者），
-                # sub 原地进行——与 lightning_indexer 注释记录的同一等价论证，
-                # 省一份 [B, nh, rows, T] 分配。
-                attn = logits.sub_(lse).exp_()
-                del logits, lse
+            if _ck:
+                out[:, s:e] = torch.utils.checkpoint.checkpoint(self._sink_attn_chunk, q[:, s:e], k, v, mask[s:e], sink_view, scale, use_reentrant=False)
             else:
-                attn = torch.softmax(logits, -1)
-                del logits
-            out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)
+                out[:, s:e] = self._sink_attn_chunk(q[:, s:e], k, v, mask[s:e], sink_view, scale)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
+
+    def _sink_attn_chunk(self, q_c, k, v, mask_c, sink_view, scale):
+        logits = torch.einsum('bnhd,bmhd->bhnm', q_c, k)
+        logits.mul_(scale)
+        logits.add_(mask_c)
+        if sink_view is not None:
+            lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
+            # logsumexp 的反向保留其输入 logits，sub 必须出位（保留值与新
+            # 张量上的 exp_ 原地——exp 反向保存的输出此后再无人改写）；原地
+            # sub_ 会使 logsumexp 保存的张量版本失效，反向直接报错。
+            attn = logits.sub(lse).exp_()
+            del logits, lse
+        else:
+            attn = torch.softmax(logits, -1)
+            del logits
+        return torch.einsum('bhnm,bmhd->bnhd', attn, v)
 
     def _split(self, kvh):
         nh, hd = (self.nh, self.hd)
@@ -1817,9 +1842,9 @@ class HybridAttention(nn.Module):
             Za = x @ self.W_aZ
             Zb = x @ self.W_bZ if self.W_bZ is not None else None
         if cfg.kind == 'hca':
-            comp_kv, last_tok, Bn = pool_blocks_single(Ca_raw, Za, self.B_pos_a, bid, n_blocks=nblk, monotonic=True)
+            comp_kv, last_tok, Bn = _pool_trainable(pool_blocks_single, Ca_raw, Za, self.B_pos_a, bid, n_blocks=nblk, monotonic=True)
         else:
-            comp_kv, last_tok, Bn = pool_variable_blocks(Ca_raw, Cb_raw, Za, Zb, bid, self.B_pos_a, self.B_pos_b, cfg.overlap, n_blocks=nblk, monotonic=True)
+            comp_kv, last_tok, Bn = _pool_trainable(pool_variable_blocks, Ca_raw, Cb_raw, Za, Zb, bid, self.B_pos_a, self.B_pos_b, cfg.overlap, n_blocks=nblk, monotonic=True)
         index_kv = comp_kv
         attn_kv = torch.zeros_like(comp_kv) if cfg.content_mode == 'zero' else comp_kv
         if self._stats is not None:
