@@ -101,6 +101,22 @@ def kernel_stamp():
     return '' if backend == '' else f'-{KERNEL_STAMP}:{backend}'
 
 
+_ENV_CACHE = {}
+
+
+def _env_cached(name):
+    """进程内缓存的环境变量读取：这些开关（CSA_KERNEL_TF32 /
+    CSA_KERNEL_{POOL,IDX,ATTN} / CSA_KERNEL_IDX_CHUNK）在仓库内从不被
+    运行期改写（只有 CSA_KERNEL 本身按设计每次 forward 重读，不走这里），
+    与 _TRITON_STATE 同为 cache-once 模式；每次内核启动前的 getenv 开销
+    因此只付一次。"""
+    v = _ENV_CACHE.get(name, None)
+    if v is None:
+        v = os.environ.get(name)
+        _ENV_CACHE[name] = v
+    return v
+
+
 def _finfo_min(dtype):
     return torch.finfo(dtype).min if dtype.is_floating_point else 0.0
 
@@ -220,16 +236,25 @@ class PoolGeometry:
             starts_prev_np = np.zeros((R, Bm), dtype=np.int64)
             max_ov = 0
         W_b = max_ov if overlap is not None else 0
-        to_i32 = lambda a: torch.from_numpy(a.astype(np.int32)).to(device)
+        # 8 张 int32 几何表打包进一条宿主缓冲、一次 H2D（同样的 int32 值、
+        # 同样的 int64→int32 窄化，transport only），设备侧按只读视图切分；
+        # 动态臂每步重建几何，延迟从 8 次传输降到 1 次。
+        flat = np.empty(7 * R * Bm + R, dtype=np.int32)
+        for _i, _a in enumerate((counts_np, ends_np, starts_np, last_np,
+                                 ov_start_np, ov_len_np, starts_prev_np)):
+            flat[_i * R * Bm:(_i + 1) * R * Bm] = _a.reshape(-1)
+        flat[7 * R * Bm:] = nblk_np
+        _buf = torch.from_numpy(flat).to(device)
+        _v = _buf[:7 * R * Bm].view(7, R, Bm)
         self.R, self.Bm, self.T = R, Bm, T
-        self.counts = to_i32(counts_np)
-        self.ends = to_i32(ends_np)
-        self.starts = to_i32(starts_np)
-        self.last_tok = to_i32(last_np)
-        self.ov_start = to_i32(ov_start_np)
-        self.ov_len = to_i32(ov_len_np)
-        self.starts_prev = to_i32(starts_prev_np)
-        self.n_blocks = to_i32(nblk_np)
+        self.counts = _v[0]
+        self.ends = _v[1]
+        self.starts = _v[2]
+        self.last_tok = _v[3]
+        self.ov_start = _v[4]
+        self.ov_len = _v[5]
+        self.starts_prev = _v[6]
+        self.n_blocks = _buf[7 * R * Bm:]
         self.max_len = int(max_len)
         self.W_b = int(W_b)
         self.overlap = overlap
@@ -289,13 +314,18 @@ _GEOM_CACHE = {}
 _GEOM_CACHE_CAP = 16
 _ARANGE_CACHE = {}
 _ARANGE_CACHE_CAP = 8
+_ARANGE_CACHE_BYTES = [0]
+_ARANGE_CACHE_BUDGET = 512 << 20
 
 
-def _full_arange_evict():
+def _full_arange_evict(need=0):
     # 与 _GEOM_CACHE 同一套 FIFO 淘汰：(B, T, Bm) 组合数无天然上界
-    # （例如 eval 长度扫描），缓存条目数必须有上界。
-    while len(_ARANGE_CACHE) >= _ARANGE_CACHE_CAP:
-        _ARANGE_CACHE.pop(next(iter(_ARANGE_CACHE)))
+    # （例如 eval 长度扫描），缓存条目数与驻留字节都必须有上界。
+    while _ARANGE_CACHE and (len(_ARANGE_CACHE) >= _ARANGE_CACHE_CAP or
+                             _ARANGE_CACHE_BYTES[0] + need > _ARANGE_CACHE_BUDGET):
+        _k0 = next(iter(_ARANGE_CACHE))
+        _t0 = _ARANGE_CACHE.pop(_k0)
+        _ARANGE_CACHE_BYTES[0] -= _t0.numel() * _t0.element_size()
 
 
 def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
@@ -322,9 +352,10 @@ def _full_arange_cached(B, T, Bm, device):
     key = (int(B), int(T), int(Bm), str(device))
     out = _ARANGE_CACHE.get(key)
     if out is None:
-        _full_arange_evict()
+        _full_arange_evict(int(B) * int(T) * int(Bm) * 4)
         out = torch.arange(Bm, device=device, dtype=torch.int32)[None, None, :].expand(B, T, Bm).contiguous()
         _ARANGE_CACHE[key] = out
+        _ARANGE_CACHE_BYTES[0] += out.numel() * out.element_size()
     return out
 
 
@@ -743,7 +774,7 @@ class FusedIndexer(torch.autograd.Function):
         dqI, dkI, dw = _indexer_bwd_ref(
             gs, idx, valid, soft, qI, kI, w_idx, last_tok,
             need_dq=bool(ng[1]), need_dk=bool(ng[2]), need_dw=bool(ng[3]),
-            t_chunk=int(os.environ.get('CSA_KERNEL_IDX_CHUNK') or 128))
+            t_chunk=int(_env_cached('CSA_KERNEL_IDX_CHUNK') or 128))
         return (None, dqI, dkI, dw, None, None)
 
 
@@ -1060,7 +1091,7 @@ def gathered_attention_kernel(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w
 def _op_impl(op):
     """逐算子的后端覆盖：CSA_KERNEL_POOL / _IDX / _ATTN ∈ {'', 'triton', 'ref'}
     （空 = 跟随全局 CSA_KERNEL）。用于 GPU 上的分算子排查。"""
-    forced = (os.environ.get(f'CSA_KERNEL_{op}') or '').strip().lower()
+    forced = (_env_cached(f'CSA_KERNEL_{op}') or '').strip().lower()
     if forced in ('triton', 'ref'):
         return forced
     return kernel_backend() or 'ref'
@@ -1077,7 +1108,7 @@ def _dot_prec():
     """tl.dot 的输入精度：默认 tf32（H800 张量核；与 eager 的差异属于
     内核变体的容差口径，见模块 docstring），CSA_KERNEL_TF32=0 时用 ieee
     （逐位口径的 fp32 FMA，用于数值排查）。"""
-    return 'tf32' if (os.environ.get('CSA_KERNEL_TF32') or '1').strip().lower() not in ('0', 'false', 'off') else 'ieee'
+    return 'tf32' if (_env_cached('CSA_KERNEL_TF32') or '1').strip().lower() not in ('0', 'false', 'off') else 'ieee'
 
 
 def _kernels():
@@ -1143,9 +1174,14 @@ def _kernels():
     ns.pool_fwd = pool_fwd
 
     # ---------- 算子 2：索引打分 ----------
+    # T0/TF：打分按 query 行分块启动（scores 缓冲封顶）；T0 是本块的全局行
+    # 偏移，TF 是完整序列长（qI/w 的行 stride），scores/输出按块内 T 寻址。
+    # T0=0、TF=T 时寻址与不分块形式完全一致（同一批全局行、同一批值）。
+    # HDP：点积泳道宽（>= 16 的 2 幂）；hd < HDP 时 d 泳道零填充——零乘积
+    # 向点积累加恰好贡献 +0.0，分数逐位不变，hd 不再要求是 2 的幂或 >= 16。
     @triton.jit
-    def idx_score(qI_ptr, kI_ptr, w_ptr, scores_ptr, T, Bm, ISCALE,
-                  N_IH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
+    def idx_score(qI_ptr, kI_ptr, w_ptr, scores_ptr, T0, TF, T, Bm, ISCALE,
+                  N_IH: tl.constexpr, HD: tl.constexpr, HDP: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
                   DOT: tl.constexpr):
         pid = tl.program_id(0)
         n_t = tl.cdiv(T, BT)
@@ -1154,16 +1190,18 @@ def _kernels():
         t = pid_t * BT + tl.arange(0, BT)
         tm = t < T
         ti = t.to(tl.int64)
-        d = tl.arange(0, HD)
+        tg = (T0 + t).to(tl.int64)
+        d = tl.arange(0, HDP)
+        dm = d < HD
         for b0 in range(0, Bm, BB):
             bcol = b0 + tl.arange(0, BB)
             bm = bcol < Bm
             bi = bcol.to(tl.int64)
             acc = tl.zeros((BT, BB), dtype=tl.float32)
             for i in tl.static_range(N_IH):
-                q_i = tl.load(qI_ptr + ((r * T + ti[:, None]) * N_IH + i) * HD + d[None, :], mask=tm[:, None], other=0.0).to(tl.float32)
-                w_i = tl.load(w_ptr + (r * T + ti) * N_IH + i, mask=tm, other=0.0).to(tl.float32)
-                k_t = tl.load(kI_ptr + ((r * Bm + bi[:, None]) * N_IH + i) * HD + d[None, :], mask=bm[:, None], other=0.0).to(tl.float32)
+                q_i = tl.load(qI_ptr + ((r * TF + tg[:, None]) * N_IH + i) * HD + d[None, :], mask=tm[:, None] & dm[None, :], other=0.0).to(tl.float32)
+                w_i = tl.load(w_ptr + (r * TF + tg) * N_IH + i, mask=tm, other=0.0).to(tl.float32)
+                k_t = tl.load(kI_ptr + ((r * Bm + bi[:, None]) * N_IH + i) * HD + d[None, :], mask=bm[:, None] & dm[None, :], other=0.0).to(tl.float32)
                 s = tl.dot(q_i, tl.trans(k_t), input_precision=DOT) * ISCALE
                 acc += tl.where(s > 0.0, s, 0.0) * w_i[:, None]
             tl.store(scores_ptr + (r * T + ti[:, None]) * Bm + bi[None, :], acc, mask=tm[:, None] & bm[None, :])
@@ -1171,8 +1209,14 @@ def _kernels():
     ns.idx_score = idx_score
 
     # ---------- 算子 2：top-k 提取（逐轮首达最大值；tie = 最早下标） ----------
+    # T0/TF 与 idx_score 同义：因果比较用全局位置 T0+t，scores 按块内行、
+    # idx/valid/soft 输出按全局行寻址。逐轮的软分直接取本轮最大值 m：has
+    # 为真时 masked[pick] 与 m 是同一个 fp32 值（work 只在非因果/非有限
+    # 泳道与 masked 不同，而那些泳道使 has 为假），has 为假时 sv 被紧随的
+    # where/nan 守卫清零——两种情形都与旧的全宽 extract 归约同值，每轮省
+    # 一次全宽归约。
     @triton.jit
-    def idx_topk(scores_ptr, last_tok_ptr, idx_ptr, valid_ptr, soft_ptr, T, Bm,
+    def idx_topk(scores_ptr, last_tok_ptr, idx_ptr, valid_ptr, soft_ptr, T0, TF, T, Bm,
                  K: tl.constexpr, BB: tl.constexpr):
         pid = tl.program_id(0)
         r = pid // T
@@ -1180,9 +1224,11 @@ def _kernels():
         b = tl.arange(0, BB).to(tl.int64)
         bm = b < Bm
         rt = (r * T + t).to(tl.int64)
+        tg = (T0 + t).to(tl.int64)
+        rt_out = r * TF + tg
         s = tl.load(scores_ptr + rt * Bm + b, mask=bm, other=float('-inf')).to(tl.float32)
-        lt = tl.load(last_tok_ptr + r * Bm + b, mask=bm, other=T - 1).to(tl.int64)
-        causal = (t.to(tl.int64) > lt) & bm
+        lt = tl.load(last_tok_ptr + r * Bm + b, mask=bm, other=TF - 1).to(tl.int64)
+        causal = (tg > lt) & bm
         finite = (s - s) == 0.0
         masked = tl.where(causal, s, float('-inf'))
         has_nan = tl.sum(tl.where(masked != masked, 1.0, 0.0), 0) > 0.0
@@ -1204,13 +1250,12 @@ def _kernels():
             pick = tl.min(tl.where(work == m, b, BIG), 0)
             work = tl.where(has & (b == pick), float('-inf'), work)
             use = tl.where(has, pick, pad)
-            s0 = tl.sum(tl.where(b == pick, masked, 0.0), 0)
-            sv = tl.exp(s0 - lse)
+            sv = tl.exp(m - lse)
             sv = tl.where(has, sv, 0.0)
             sv = tl.where(sv == sv, sv, 0.0)
-            tl.store(idx_ptr + rt * K + j, use.to(tl.int32))
-            tl.store(valid_ptr + rt * K + j, has.to(tl.int8))
-            tl.store(soft_ptr + rt * K + j, sv.to(soft_ptr.dtype.element_ty))
+            tl.store(idx_ptr + rt_out * K + j, use.to(tl.int32))
+            tl.store(valid_ptr + rt_out * K + j, has.to(tl.int8))
+            tl.store(soft_ptr + rt_out * K + j, sv.to(soft_ptr.dtype.element_ty))
 
     ns.idx_topk = idx_topk
 
@@ -1324,14 +1369,19 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
         dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
         dsoft = torch.zeros((R, T, nb), device=dev, dtype=dtype) if need_dsoft else q
-        flat = topk_idx.reshape(R, T * nb).to(torch.int64)
+        flat = topk_idx.reshape(R, T * nb)
+        # 稳定排序只依赖键值与位置：int32 键的稳定 argsort 与 int64 形式
+        # 给出同一排列（同样的整数、同样的 tie 顺序），只在输出转 int32
+        # 时窄化一次（同值整数，index transport）。
         order = flat.argsort(dim=1, stable=True).to(torch.int32).contiguous()
-        # 整数直方图（等价于逐行 bincount(minlength=Bm)）：整数键的
-        # scatter_add_ 精确且与写入顺序无关（整数加法可交换、无舍入）。
-        cnt = torch.zeros((R, Bm), device=dev, dtype=torch.int64)
-        cnt.scatter_add_(1, flat, torch.ones_like(flat))
+        # 整数直方图（等价于逐行 bincount(minlength=Bm) 的 scatter_add_ 形
+        # 式）：行号并入键后一次 bincount——整数计数精确且与写入顺序无关
+        # （整数加法可交换、无舍入），省掉 ones 缓冲与一次全宽写。
+        _keys = flat.to(torch.int64) + (torch.arange(R, device=dev, dtype=torch.int64) * Bm)[:, None]
+        cnt = torch.bincount(_keys.reshape(-1), minlength=R * Bm).reshape(R, Bm)
         offs = torch.zeros((R, Bm + 1), device=dev, dtype=torch.int64)
         offs[:, 1:] = cnt.cumsum(dim=1)
+        del flat, _keys, cnt
         K.attn_bwd_dkdv_blocks[(R * Bm * nh,)](
             q, k_blk, v_blk, topk_idx, valid_c, last_tok, soft_c, sink_arg, dO,
             mA, ZA, mS, ZS, GA, GS,
@@ -1347,7 +1397,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
             q, k_sw, v_sw, sink_arg, dO, mA, ZA, mS, ZS, GA, GS,
             dk_sw, dv_sw, T, int(w), float(scale),
             NH=nh, HD=hd, HAS_SINK=sink is not None, HAS_SOFT=soft is not None,
-            NEED_DK=need_dksw, NEED_DV=need_dvsw, num_warps=1)
+            NEED_DK=need_dksw, NEED_DV=need_dvsw, BW=64, num_warps=4)
     dsink = None
     if need_dsink:
         sk = sink_c.to(torch.float32).view(1, 1, nh)
@@ -1630,15 +1680,17 @@ def _attach_attn_kernels(ns):
         vb_v = tl.load(vb_ptr + ((r * Bm + b) * NH + h) * HD + d).to(tl.float32)
         dk_acc = tl.zeros((HD,), tl.float32)
         dv_acc = tl.zeros((HD,), tl.float32)
+        # 循环不变量：本程序只服务块 b，last_tok 在段循环外只载一次（同一值）。
+        lt_b = tl.load(lt_ptr + r * Bm + b).to(tl.int64)
         for k in range(seg0, seg1):
             lane = tl.load(csr_ptr + r * (T * NB) + k).to(tl.int64)
             tt = lane // NB
             jj = lane % NB
             if HAS_VALID:
                 # Match attn_fwd / attn_bwd_stats: validity AND causality.
-                ok = (tl.load(valid_ptr + (r * T + tt) * NB + jj) != 0) & (tt > tl.load(lt_ptr + r * Bm + b).to(tl.int64))
+                ok = (tl.load(valid_ptr + (r * T + tt) * NB + jj) != 0) & (tt > lt_b)
             else:
-                ok = tt > tl.load(lt_ptr + r * Bm + b).to(tl.int64)
+                ok = tt > lt_b
             if ok:
                 q_v = tl.load(q_ptr + ((r * T + tt) * NH + h) * HD + d).to(tl.float32)
                 dO_v = tl.load(dO_ptr + ((r * T + tt) * NH + h) * HD + d).to(tl.float32)
@@ -1682,7 +1734,7 @@ def _attach_attn_kernels(ns):
                              dksw_ptr, dvsw_ptr, T, W, SCALE,
                              NH: tl.constexpr, HD: tl.constexpr, HAS_SINK: tl.constexpr,
                              HAS_SOFT: tl.constexpr,
-                             NEED_DK: tl.constexpr, NEED_DV: tl.constexpr):
+                             NEED_DK: tl.constexpr, NEED_DV: tl.constexpr, BW: tl.constexpr):
         pid = tl.program_id(0)
         h = pid % NH
         rp = pid // NH
@@ -1696,29 +1748,36 @@ def _attach_attn_kernels(ns):
         t_hi = p + W
         if t_hi > T:
             t_hi = T
-        for tt in range(p, t_hi):
-            q_v = tl.load(q_ptr + ((r * T + tt) * NH + h) * HD + d).to(tl.float32)
-            dO_v = tl.load(dO_ptr + ((r * T + tt) * NH + h) * HD + d).to(tl.float32)
-            z = tl.sum(q_v * k_v) * SCALE
-            st = (r * T + tt) * NH + h
-            mA = tl.load(mA_ptr + st)
-            ZA = tl.load(ZA_ptr + st)
-            GA = tl.load(GA_ptr + st)
-            ZAs = tl.where(ZA == 0.0, 1.0, ZA)
-            PA = tl.exp(z - mA) / ZAs
-            g = tl.sum(dO_v * v_v)
-            dz = PA * (g - GA)
+        # tt 沿 [p, p+W) 连续——按 [BW, HD] 分片矢量载入替代逐 tt 标量循环：
+        # 片内固定树形归约、片间按 tt 升序累加（与逐 tt 循环同为固定顺序
+        # 归约，内核变体口径见模块 docstring）。掩码泳道经 other=0 载入后
+        # z=0、PA=exp(0)/1、g=0，各贡献项（dz·q、PA·dO）恰为 0。
+        for tt0 in range(p, t_hi, BW):
+            tt = tt0 + tl.arange(0, BW)
+            tm2 = tt < t_hi
+            tt64 = tt.to(tl.int64)
+            q_t = tl.load(q_ptr + ((r * T + tt64[:, None]) * NH + h) * HD + d[None, :], mask=tm2[:, None], other=0.0).to(tl.float32)
+            dO_t = tl.load(dO_ptr + ((r * T + tt64[:, None]) * NH + h) * HD + d[None, :], mask=tm2[:, None], other=0.0).to(tl.float32)
+            z_t = tl.sum(q_t * k_v[None, :], 1) * SCALE
+            st = (r * T + tt64) * NH + h
+            mA_t = tl.load(mA_ptr + st, mask=tm2, other=0.0)
+            ZA_t = tl.load(ZA_ptr + st, mask=tm2, other=1.0)
+            GA_t = tl.load(GA_ptr + st, mask=tm2, other=0.0)
+            ZAs_t = tl.where(ZA_t == 0.0, 1.0, ZA_t)
+            PA_t = tl.exp(z_t - mA_t) / ZAs_t
+            g_t = tl.sum(dO_t * v_v[None, :], 1)
+            dz_t = PA_t * (g_t - GA_t)
             if HAS_SOFT:
-                GS = tl.load(GS_ptr + st)
-                mS = tl.load(mS_ptr + st)
-                ZS = tl.load(ZS_ptr + st)
-                ZSs = tl.where(ZS == 0.0, 1.0, ZS)
-                PS = tl.exp(z - mS) / ZSs
-                dz += PS * (g - GS)
+                GS_t = tl.load(GS_ptr + st, mask=tm2, other=0.0)
+                mS_t = tl.load(mS_ptr + st, mask=tm2, other=0.0)
+                ZS_t = tl.load(ZS_ptr + st, mask=tm2, other=1.0)
+                ZSs_t = tl.where(ZS_t == 0.0, 1.0, ZS_t)
+                PS_t = tl.exp(z_t - mS_t) / ZSs_t
+                dz_t += PS_t * (g_t - GS_t)
             if NEED_DK:
-                dk_acc += dz * q_v * SCALE
+                dk_acc += tl.sum(dz_t[:, None] * q_t * SCALE, 0)
             if NEED_DV:
-                dv_acc += PA * dO_v
+                dv_acc += tl.sum(PA_t[:, None] * dO_t, 0)
         if NEED_DK:
             tl.store(dksw_ptr + ((r * T + p) * NH + h) * HD + d, dk_acc.to(dksw_ptr.dtype.element_ty))
         if NEED_DV:
@@ -1758,30 +1817,41 @@ def _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     return comp
 
 
+# scores 分块缓冲的字节上限（fp32 [R, T_c, Bm]）：打分/top-k 两内核按
+# query 行分块启动，scores 从不按全幅 [R, T, Bm] 物化——每行的值与全幅
+# 形式逐位一致（每个 (r, t) 程序只读写自己的行），长上下文 / 大批量的
+# 瞬态峰值由 O(R·T·Bm) 封顶为 O(R·T_c·Bm)。
+_IDX_SCORES_CAP_BYTES = 128 << 20
+
+
 def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk):
     K = _kernels()
     triton = K.triton
     R, T, nIH, hd = qI.shape
     Bm = kI.shape[1]
-    assert hd >= 16 and hd & (hd - 1) == 0, 'triton indexer 打分内核要求 hd 为 2 的幂且 >= 16（其余形状走 ref 后端）'
     assert Bm <= 8192, 'Bm > 8192 超出单程序泳道寄存器上限——走 ref 后端'
-    assert R * T * Bm < 2 ** 31, 'scores 张量元素数超出 int32 寻址上限——走 ref 后端并分块'
     qI = qI.contiguous()
     kI = kI.contiguous()
     w_idx = w_idx.contiguous()
     last_tok = last_tok.contiguous()
-    scores = torch.empty((R, T, Bm), device=qI.device, dtype=torch.float32)
-    BT, BB = 64, 64
-    K.idx_score[(R * triton.cdiv(T, BT),)](qI, kI, w_idx, scores, T, Bm, hd ** -0.5,
-                                           N_IH=nIH, HD=hd, BT=BT, BB=BB,
-                                           DOT=_dot_prec(), num_warps=4)
+    # 打分泳道宽补到 >= 16 的 2 幂（零填充泳道对点积恰好贡献 +0.0，分数
+    # 逐位不变），hd 不再要求是 2 的幂或 >= 16。
+    HDP = max(_next_pow2(hd), 16)
     k_out = min(int(topk), Bm)
     BB2 = _next_pow2(Bm)
     idx = torch.empty((R, T, k_out), device=qI.device, dtype=torch.int32)
     valid_i8 = torch.empty((R, T, k_out), device=qI.device, dtype=torch.int8)
     soft = torch.empty((R, T, k_out), device=qI.device, dtype=qI.dtype)
-    K.idx_topk[(R * T,)](scores, last_tok, idx, valid_i8, soft, T, Bm,
-                         K=k_out, BB=BB2, num_warps=8 if BB2 >= 1024 else 4)
+    BT, BB = 64, 64
+    T_c = max(1, min(T, _IDX_SCORES_CAP_BYTES // max(R * Bm * 4, 1)))
+    scores = torch.empty((R, T_c, Bm), device=qI.device, dtype=torch.float32)
+    for t0 in range(0, T, T_c):
+        tc = min(T_c, T - t0)
+        K.idx_score[(R * triton.cdiv(tc, BT),)](qI, kI, w_idx, scores, t0, T, tc, Bm, hd ** -0.5,
+                                                N_IH=nIH, HD=hd, HDP=HDP, BT=BT, BB=BB,
+                                                DOT=_dot_prec(), num_warps=4)
+        K.idx_topk[(R * tc,)](scores, last_tok, idx, valid_i8, soft, t0, T, tc, Bm,
+                              K=k_out, BB=BB2, num_warps=8 if BB2 >= 1024 else 4)
     return idx, valid_i8.view(torch.bool), soft
 
 
@@ -1829,7 +1899,10 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         nblks = [pb[1] for pb in pre_blocks]
         hons = None
         bid_full = torch.stack(bids, 0).to(torch.int32).contiguous()
-        counts_rows = [getattr(bd, '_pool_cpu', None)[0] for bd in bids]
+        counts_rows = [getattr(bd, '_pool_cpu', None) for bd in bids]
+        if any(c is None for c in counts_rows):
+            raise RuntimeError('块几何缺少 _pool_cpu counts——分段器出口被绕过')
+        counts_rows = [c[0] for c in counts_rows]
     else:
         base = _exp_blocks_fixed(T, cfg.block_size, dev)
         counts = getattr(base, '_pool_cpu', None)

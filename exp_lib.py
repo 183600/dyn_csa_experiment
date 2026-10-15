@@ -29,7 +29,6 @@ import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
 import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections
 from math import comb
-from bisect import bisect_right as _bisect_right
 from dataclasses import dataclass
 import numpy as np
 import torch
@@ -114,6 +113,19 @@ B_ARMS = ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hyb
 RUN_S1 = dict(RUN, dataset='fineweb', vocab_size=B_VOCAB, d=768, n_layers=12, n_heads=12, d_head=64, seq_len=8192, batch_size=8, n_train_tokens=5000000000, steps=76294, warmup=2000, eval_every=4000, eval_subset=32, val_seqs=512, seeds=[0, 1, 2, 3], outdir='results_b_s1', variants=B_ARMS)
 M0_CAP = dict(total_hours=700.0, margin=0.93, already_hours=0.0, state_path='run_time_state_m0.json')
 
+_CPU_DEV = torch.device('cpu')
+_DEV_STR = {}
+
+def _dev_str(device):
+    # str(device) is a pure formatting function of the device object; caching
+    # it per object avoids re-formatting on every staged-upload / cache-key
+    # build (same string, host-side only).
+    s = _DEV_STR.get(device)
+    if s is None:
+        s = str(device)
+        _DEV_STR[device] = s
+    return s
+
 def block_readable(pos, last_tok):
     return pos[:, None] > last_tok[None, :]
 
@@ -156,6 +168,7 @@ def _segment(n, want_cut_list, min_block, max_block):
     counts = []
     p = 0
     si = 0
+    hj = 0
     ns = len(slots)
     append = counts.append
     hon_set = honoured.__setitem__
@@ -176,8 +189,16 @@ def _segment(n, want_cut_list, min_block, max_block):
         append(q - p)
         if q < n and nc <= q - 1:
             # honour the LATEST pending slot (largest wanted slot <= q - 1),
-            # exactly as the token-by-token scan's `pending_slot` overwrite does
-            hon_set(slots[_bisect_right(slots, q - 1, si) - 1], 1.0)
+            # exactly as the token-by-token scan's `pending_slot` overwrite
+            # does.  q is non-decreasing across iterations (p advances to the
+            # previous q), so the honoured pointer hj only moves forward: it
+            # ends at bisect_right(slots, q - 1) — and since every slot[:si]
+            # is < p <= q - 1, bisecting from si lands on the same index —
+            # hence slots[hj - 1] is exactly slots[bisect_right(slots, q - 1,
+            # si) - 1], the same honoured slot as the per-block C bisect.
+            while hj < ns and slots[hj] <= q - 1:
+                hj += 1
+            hon_set(slots[hj - 1], 1.0)
         p = q
     bids = np.repeat(np.arange(len(counts), dtype=np.int64), np.asarray(counts, dtype=np.int64))
     if cacheable:
@@ -207,7 +228,7 @@ def _h2d_stage(shape, dtype, device):
     shape = tuple(int(_s) for _s in shape)
     if not shape or 0 in shape:
         return (None, None)
-    key = (str(device), dtype, shape)
+    key = (_dev_str(device), dtype, shape)
     ent = _H2D_POOL.get(key)
     if ent is None:
         est = int(np.prod(shape, dtype=np.int64)) * torch.empty((), dtype=dtype).element_size() * _H2D_POOL_SLOTS
@@ -295,7 +316,7 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
     nblks = []
     hons = []
     for _g in gate_lists:
-        _b, _nb, _hon = blocks_from_cuts(T, _g, min_block, max_block, torch.device('cpu'), return_count=True, return_honoured=True)
+        _b, _nb, _hon = blocks_from_cuts(T, _g, min_block, max_block, _CPU_DEV, return_count=True, return_honoured=True)
         bids_cpu.append(_b)
         nblks.append(_nb)
         hons.append(_hon)
@@ -690,21 +711,18 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
 
 _POOL_PARTS_HOST = True
 _POOL_PARTS_BUCKET = 256
+_POOL_GEOM_BUCKET = 1024
 
-def _pool_parts_host(block_ids, B, ov, n, counts_l):
-    # Host-side integer build of the pooling geometry (design notes §6.2):
-    # every part is an exact integer function of the cut table's own counts
-    # list (block_ids._pool_cpu[0] — the same list that generated block_ids),
-    # so each value is the same integer the bincount/cumsum form below
-    # produces (cumsum / shifts / clamps on int64 are exact on either side).
-    # The whole geometry rides one flat staged upload (transport only, §6.1);
-    # the parts are views into that single buffer (they are only ever read
-    # downstream, never mutated),
-    # and the bucket-padding tail is never read.  `_h2d_async` builds the
-    # buffer outside inference mode, so a part first filled during eval can
-    # still serve training, exactly like the on-device form.  Returns None
-    # when the host form cannot serve; the caller then falls back to the
-    # on-device form, whose values are identical.
+def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
+    # Host-side integer flat of the pooling parts (design notes §6.2): every
+    # value is an exact integer function of the cut table's own counts list
+    # (block_ids._pool_cpu[0] — the same list that generated block_ids), so
+    # each value is the same integer the bincount/cumsum form produces
+    # (cumsum / shifts / clamps on int64 are exact on either side).  Returns
+    # (flat_int64 ndarray, total) — flat is zero-padded to a pad_to multiple
+    # and the padded tail is never read — or None when the host form cannot
+    # serve; the caller then falls back to the on-device form, whose values
+    # are identical.
     try:
         B = int(B)
         n = int(n)
@@ -714,7 +732,7 @@ def _pool_parts_host(block_ids, B, ov, n, counts_l):
         ends_np = np.cumsum(counts_np, dtype=np.int64)
         nseg = 8 if ov is not None else 4
         total = nseg * B
-        pad = (-total) % _POOL_PARTS_BUCKET
+        pad = (-total) % int(pad_to) if pad_to > 1 else 0
         # Flat layout: [counts | ends | starts | last_idx (| end_prev |
         # starts_prev | ov_start | ov_len)] followed by the zero pad; the
         # integers uploaded are identical to the per-segment form.
@@ -738,28 +756,44 @@ def _pool_parts_host(block_ids, B, ov, n, counts_l):
             np.maximum(flat[7 * B:8 * B], 0, out=flat[7 * B:8 * B])  # block 0 无 overlap：几何表自身保持非负
         if pad:
             flat[total:] = 0
-        buf = _h2d_async(flat, torch.long, block_ids.device)
-        # the bucket pad is sliced off first; the unbound segment views are
-        # read-only views into buf.
-        return buf[:total].view(nseg, B).unbind(0)
+        return (flat, total)
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
 
-def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, dev):
-    # Host-side integer/bool build of the variable-block gather geometry
-    # (design notes §6.2): g_a/mask_a/g_b/mask_b/b_off/_pos_a are exact
+def _pool_parts_host(block_ids, B, ov, n, counts_l):
+    # Host-side build of the pooling geometry (see _pool_parts_flat for the
+    # exact-integer argument).  The whole geometry rides one flat staged
+    # upload (transport only, §6.1); the parts are views into that single
+    # buffer (they are only ever read downstream, never mutated),
+    # and the bucket-padding tail is never read.  `_h2d_async` builds the
+    # buffer outside inference mode, so a part first filled during eval can
+    # still serve training, exactly like the on-device form.  Returns None
+    # when the host form cannot serve; the caller then falls back to the
+    # on-device form, whose values are identical.
+    _built = _pool_parts_flat(counts_l, B, ov, n, _POOL_PARTS_BUCKET)
+    if _built is None:
+        return None
+    try:
+        flat, total = _built
+        buf = _h2d_async(flat, torch.long, block_ids.device)
+        # the bucket pad is sliced off first; the unbound segment views are
+        # read-only views into buf.
+        return buf[:total].view(8 if ov is not None else 4, int(B)).unbind(0)
+    except (RuntimeError, TypeError, ValueError, AttributeError):
+        return None
+
+def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows):
+    # Host-side integer/bool flats of the variable-block gather geometry
+    # (design notes §6.2): g_a/mask_a/g_b/mask_b/b_off/pos_a are exact
     # integer/bool functions of the cut table's own counts (the same counts
-    # _pool_parts_host already mirrors) plus the shape scalars, so the numpy
+    # _pool_parts_flat already mirrors) plus the shape scalars, so the numpy
     # form below produces values identical to the on-device build in
     # _pool_ordered — only the location of the integer math and the
-    # transport change (§6.1).  The int64 parts ride one flat staged upload
-    # and the two bool masks a second one (the same staged pinned pool
-    # _pool_parts_host uses); the returned tensors are read-only views into
-    # those buffers (the same aliasing argument the parts make — downstream
-    # they feed gathers / mask multiplies / negated-mask fills only).  The
-    # fixed segmenter keeps its build-once/cache path.  Returns None when
-    # the host form cannot serve; the caller then falls back to the
-    # on-device form, whose values are identical.
+    # transport change (§6.1).  Returns (flat_i, flat_b, n_a, n_b, W_b,
+    # max_len) — flat_i holds [g_a | g_b | b_off | pos_a] and flat_b holds
+    # [mask_a | mask_b] — or None when the host form cannot serve; the
+    # caller then falls back to the on-device form, whose values are
+    # identical.
     try:
         B = int(B)
         n = int(n)
@@ -797,23 +831,53 @@ def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, de
         flat_i[n_a:n_a + n_b] = g_b_np.ravel()
         flat_i[n_a + n_b:n_a + 2 * n_b] = b_off_np.ravel()
         flat_i[n_a + 2 * n_b:] = pos_a_np
+        flat_b = np.empty(n_a + n_b, dtype=np.bool_)
+        flat_b[0:n_a] = mask_a_np.ravel()
+        flat_b[n_a:] = mask_b_np.ravel()
+        return (flat_i, flat_b, n_a, n_b, W_b, max_len)
+    except (RuntimeError, TypeError, ValueError, AttributeError):
+        return None
+
+def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, dev):
+    # Host-side build of the variable-block gather geometry (see
+    # _pool_geom_flat_var for the exact-integer argument).  The int64 parts
+    # ride one flat staged upload and the two bool masks a second one (the
+    # same staged pinned pool _pool_parts_host uses); the returned tensors
+    # are read-only views into those buffers (the same aliasing argument the
+    # parts make — downstream they feed gathers / mask multiplies /
+    # negated-mask fills only).  Both flats are bucket-padded so the staged
+    # pool's shape keys stay bounded as (B, max_len, W_b) varies across
+    # steps; the pad tails are never read.  The fixed segmenter keeps its
+    # build-once/cache path.  Returns None when the host form cannot serve;
+    # the caller then falls back to the on-device form, whose values are
+    # identical.
+    _built = _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows)
+    if _built is None:
+        return None
+    try:
+        B = int(B)
+        flat_i, flat_b, n_a, n_b, W_b, max_len = _built
+        _pi = (-len(flat_i)) % _POOL_GEOM_BUCKET
+        if _pi:
+            flat_i = np.concatenate((flat_i, np.zeros(_pi, dtype=np.int64)))
         buf = _h2d_async(flat_i, torch.long, dev)
         g_a = buf[0:n_a].view(B, max_len)
         g_b = buf[n_a:n_a + n_b].view(B, W_b)
         b_off = buf[n_a + n_b:n_a + 2 * n_b].view(B, W_b)
-        pos_a = buf[n_a + 2 * n_b:]
-        flat_b = np.empty(n_a + n_b, dtype=np.bool_)
-        flat_b[0:n_a] = mask_a_np.ravel()
-        flat_b[n_a:] = mask_b_np.ravel()
+        pos_a = buf[n_a + 2 * n_b:n_a + 2 * n_b + max_len]
+        _pb = (-len(flat_b)) % _POOL_GEOM_BUCKET
+        if _pb:
+            flat_b = np.concatenate((flat_b, np.zeros(_pb, dtype=np.bool_)))
         mbuf = _h2d_async(flat_b, torch.bool, dev)
-        return (g_a, mbuf[0:n_a].view(B, max_len), g_b, mbuf[n_a:].view(B, W_b), b_off, pos_a)
+        # the bucket pad tail is never read: every view has an explicit end.
+        return (g_a, mbuf[0:n_a].view(B, max_len), g_b, mbuf[n_a:n_a + n_b].view(B, W_b), b_off, pos_a)
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
 
-def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
-    # Single-block-form twin of _pool_geom_host_var (pool_blocks_single's
-    # g/mask/_pos_a): same exact-integer host build (§6.2), same staged
-    # transport (§6.1), same None-means-device-fallback contract.
+def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows):
+    # Single-block-form twin of _pool_geom_flat_single's variable sibling
+    # (pool_blocks_single's g/mask/pos_a flats): same exact-integer host
+    # build (§6.2).  Returns (flat_i, mask_np, n_g, max_len) or None.
     try:
         B = int(B)
         n = int(n)
@@ -833,9 +897,31 @@ def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
         flat_i = np.empty(n_g + max_len, dtype=np.int64)
         flat_i[0:n_g] = gp.ravel()
         flat_i[n_g:] = pos_a_np
+        return (flat_i, mask_np, n_g, max_len)
+    except (RuntimeError, TypeError, ValueError, AttributeError):
+        return None
+
+def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
+    # Single-block-form twin of _pool_geom_host_var (pool_blocks_single's
+    # g/mask/_pos_a): same exact-integer host build (§6.2), same staged
+    # transport (§6.1) with bucket-padded flats (bounded pool shape keys,
+    # unread pad tails), same None-means-device-fallback contract.
+    _built = _pool_geom_flat_single(counts_l, B, n, max_len, p_rows)
+    if _built is None:
+        return None
+    try:
+        B = int(B)
+        flat_i, mask_np, n_g, max_len = _built
+        _pi = (-len(flat_i)) % _POOL_GEOM_BUCKET
+        if _pi:
+            flat_i = np.concatenate((flat_i, np.zeros(_pi, dtype=np.int64)))
         buf = _h2d_async(flat_i, torch.long, dev)
-        mask = _h2d_async(mask_np, torch.bool, dev).view(B, max_len)
-        return (buf[0:n_g].view(B, max_len), mask, buf[n_g:])
+        mask_np = mask_np.ravel()
+        _pb = (-mask_np.size) % _POOL_GEOM_BUCKET
+        if _pb:
+            mask_np = np.concatenate((mask_np, np.zeros(_pb, dtype=np.bool_)))
+        mask = _h2d_async(mask_np, torch.bool, dev)[:n_g].view(B, max_len)
+        return (buf[0:n_g].view(B, max_len), mask, buf[n_g:n_g + max_len])
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
 
@@ -901,6 +987,112 @@ def _pool_geom_put(block_ids, key, geom):
     if len(cache) < 8:
         cache[key] = geom
     return geom
+
+def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
+    # Batched pool-geometry prefetch for the per-row sparse path (transport
+    # only, design notes §6.1/§6.2).  Each row's parts / gather geometry is
+    # the same exact-integer host build the lazy path performs inside
+    # _pool_parts / _pool_ordered / pool_blocks_single (the same flat
+    # builders above, the same per-row `_pool_cpu` counts); here the whole
+    # batch's flats are concatenated into ONE staged upload per dtype class
+    # (one int64, one bool) per layer instead of ~3 per row, and the per-row
+    # views are attached to each row's block-ids object under exactly the
+    # keys the lazy lookups use — so _pool_parts / _pool_geom hit them
+    # verbatim, including on the _pool_trainable recompute in backward.
+    # Rows whose host build cannot serve are skipped; their lazy path falls
+    # back to the value-identical on-device build.  The concatenated tails
+    # are bucket-padded (bounded staged-pool shape keys; pad never read).
+    if not _POOL_PARTS_HOST:
+        return
+    cfg = attn.cfg
+    _csa = cfg.kind == 'csa'
+    ov = int(cfg.overlap) if _csa else None
+    pa_rows = int(attn.B_pos_a.shape[0])
+    pb_rows = int(attn.B_pos_b.shape[0]) if _csa else 1
+    rows = []
+    for _pb in pre_blocks:
+        bid, nblk = _pb[0], int(_pb[1])
+        _cpu = getattr(bid, '_pool_cpu', None)
+        if _cpu is None or len(_cpu[0]) != nblk or nblk <= 0:
+            rows.append(None)
+            continue
+        counts_l = _cpu[0]
+        max_len = _cpu[1]
+        if _csa:
+            _ov_hi = min(ov, _cpu[2]) if nblk > 1 else -1
+            _g = _pool_geom_flat_var(counts_l, nblk, ov, n, max_len, _ov_hi, pa_rows, pb_rows)
+        else:
+            _g = _pool_geom_flat_single(counts_l, nblk, n, max_len, pa_rows)
+        _p = _pool_parts_flat(counts_l, nblk, ov, n)
+        if _g is None or _p is None:
+            rows.append(None)
+            continue
+        rows.append((bid, nblk, _p, _g))
+    if not any(rows):
+        return
+    _ints = []
+    _bools = []
+    for _r in rows:
+        if _r is None:
+            continue
+        _ints.append(_r[2][0])
+        _ints.append(_r[3][0])
+        _bools.append(_r[3][1].ravel())
+    flat_i = np.concatenate(_ints)
+    _pi = (-len(flat_i)) % _POOL_GEOM_BUCKET
+    if _pi:
+        flat_i = np.concatenate((flat_i, np.zeros(_pi, dtype=np.int64)))
+    buf_i = _h2d_async(flat_i, torch.long, dev)
+    flat_b = np.concatenate(_bools)
+    _pbk = (-len(flat_b)) % _POOL_GEOM_BUCKET
+    if _pbk:
+        flat_b = np.concatenate((flat_b, np.zeros(_pbk, dtype=np.bool_)))
+    buf_b = _h2d_async(flat_b, torch.bool, dev)
+    off_i = 0
+    off_b = 0
+    for _r in rows:
+        if _r is None:
+            continue
+        bid, nblk, _p, _g = _r
+        _ptot = _p[1]
+        parts = buf_i[off_i:off_i + _ptot].view(8 if _csa else 4, nblk).unbind(0)
+        off_i += _ptot
+        if _csa:
+            _fi, _fb, n_a, n_b, W_b, max_len = _g
+            g_a = buf_i[off_i:off_i + n_a].view(nblk, max_len)
+            g_b = buf_i[off_i + n_a:off_i + n_a + n_b].view(nblk, W_b)
+            b_off = buf_i[off_i + n_a + n_b:off_i + n_a + 2 * n_b].view(nblk, W_b)
+            pos_a = buf_i[off_i + n_a + 2 * n_b:off_i + n_a + 2 * n_b + max_len]
+            off_i += n_a + 2 * n_b + max_len
+            mask_a = buf_b[off_b:off_b + n_a].view(nblk, max_len)
+            mask_b = buf_b[off_b + n_a:off_b + n_a + n_b].view(nblk, W_b)
+            off_b += n_a + n_b
+            geom = (g_a, mask_a, g_b, mask_b, b_off, pos_a)
+            pkey = (nblk, ov, int(n))
+            gkey = ('vo', nblk, ov, int(n), pa_rows, pb_rows)
+        else:
+            _fi, mask_np, n_g, max_len = _g
+            g = buf_i[off_i:off_i + n_g].view(nblk, max_len)
+            pos_a = buf_i[off_i + n_g:off_i + n_g + max_len]
+            off_i += n_g + max_len
+            mask = buf_b[off_b:off_b + n_g].view(nblk, max_len)
+            off_b += n_g
+            geom = (g, mask, pos_a)
+            pkey = (nblk, -1, int(n))
+            gkey = ('so', nblk, int(n), pa_rows)
+        try:
+            _c1 = getattr(bid, '_pool_gpu', None)
+            if _c1 is None:
+                _c1 = {}
+                bid._pool_gpu = _c1
+            _c1[pkey] = parts
+            _c2 = getattr(bid, '_pool_geom', None)
+            if _c2 is None:
+                _c2 = {}
+                bid._pool_geom = _c2
+            _c2[gkey] = geom
+        except (AttributeError, RuntimeError):
+            pass
 
 def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, Fd, dev, B, order, order_is_identity=False):
     counts, ends, starts, last_idx, end_prev, starts_prev, ov_start, ov_len = _pool_parts(block_ids, B, overlap, n)
@@ -1172,8 +1364,20 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         raise ValueError("lightning_indexer: query_chunk=None is not 'use the default'; pass the default (2048) explicitly or omit the argument")
     query_chunk = max(1, min(int(query_chunk), n))
     _iscale = hd ** (-0.5)
-    _nchunks = -(-n // query_chunk)
-    scores = None
+    # 选择 + soft 尾部与打分同一逐 chunk 节奏融合执行：其中每个算子（masked
+    # where/稳定排序/cumsum/scatter/logsumexp/gather/逐元素 exp）都按 query
+    # 行独立——chunk 行切片上的值与全宽形式的对应行逐位一致（同 _indexer_
+    # selection 内部 grid 只标记 chunk 内行号；CopySlices 反向把逐行梯度
+    # 切片原样回传，与 forward 的 outs[b] = o 同一 transport 论证，§6.1）。
+    # 全宽的 [n, B] scores / masked / int64 order 因此从不物化——长上下文
+    # 下该瞬态从 O(n·B) 降到 O(chunk·B)。
+    _kw = max(min(int(topk), int(B)), 0)
+    idx = torch.empty(n, _kw, device=dev, dtype=torch.int32)
+    soft = None
+    if out_valid is None and return_mask:
+        out_valid = []
+    _valid_parts = [] if out_valid is not None else None
+    out_dtype = None
     for s in range(0, n, query_chunk):
         e = min(s + query_chunk, n)
         if random_select:
@@ -1185,30 +1389,27 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             raw.mul_(_iscale)
             F.relu(raw, inplace=True)
             c = torch.einsum('inb,ni->nb', raw, w_idx[s:e])
-        if _nchunks == 1:
-            scores = c
-        else:
-            # 多 chunk 时预分配整幅再逐块写入：同样的值落到同样的行（拷贝
-            # 逐位精确），结果与 cat 一致。
-            if scores is None:
-                scores = torch.empty(n, B, device=c.device, dtype=c.dtype)
-            scores[s:e] = c
-    out_dtype = scores.dtype
-    if out_valid is None and return_mask:
-        out_valid = []
-    with torch.no_grad():
-        idx = _indexer_selection(scores, causal, k, out_valid=out_valid)
-    scores.masked_fill_(_ncausal, float('-inf'))
-    _lse = torch.logsumexp(scores, dim=-1, keepdim=True)
-    # the gather output is fresh and nothing downstream needs the pre-subtract
-    # values, so the subtraction runs in place (same kernel, same values, and
-    # the sub_ node records the identical broadcast gradient); exp_ is the
-    # same story (its backward saves the output, as the out-of-place form).
-    soft = scores.gather(1, idx.long()).sub_(_lse).exp_()
-    # nan_to_num 必须出位：exp_ 的反向保存其输出张量，原地 nan_to_num_ 会
-    # 改写该保存值、使 ExpBackward 的版本检查失败（反向报错）。
-    soft = torch.nan_to_num(soft)
-    del scores, _lse
+        if out_dtype is None:
+            out_dtype = c.dtype
+            soft = torch.empty(n, _kw, device=c.device, dtype=out_dtype)
+        with torch.no_grad():
+            _box = []
+            _ic = _indexer_selection(c, causal[s:e], k, out_valid=_box)
+        idx[s:e] = _ic
+        if _valid_parts is not None:
+            _valid_parts.append(_box[0])
+        c.masked_fill_(_ncausal[s:e], float('-inf'))
+        _lse = torch.logsumexp(c, dim=-1, keepdim=True)
+        # the gather output is fresh and nothing downstream needs the pre-subtract
+        # values, so the subtraction runs in place (same kernel, same values, and
+        # the sub_ node records the identical broadcast gradient); exp_ is the
+        # same story (its backward saves the output, as the out-of-place form).
+        # nan_to_num 必须出位：exp_ 的反向保存其输出张量，原地 nan_to_num_ 会
+        # 改写该保存值、使 ExpBackward 的版本检查失败（反向报错）。
+        soft[s:e] = torch.nan_to_num(c.gather(1, _ic.long()).sub_(_lse).exp_())
+        del c, _lse, _ic
+    if _valid_parts is not None:
+        out_valid[:] = [_valid_parts[0] if len(_valid_parts) == 1 else torch.cat(_valid_parts, 0)]
     m = None
     if return_mask:
         valid_cols = out_valid[0]
@@ -1954,6 +2155,8 @@ class HybridAttention(nn.Module):
                 raise RuntimeError('CSA_KERNEL 只覆盖 learned-indexer / 非 fuse 的 csa·hca 臂；'
                                    'fuse_mode 或 indexer_mode 不同的臂请 unset CSA_KERNEL 后走 eager')
             return _CK.sparse_layer_forward(self, x, pre_all, gate_sigs, pre_blocks)
+        if pre_blocks is not None:
+            _prefetch_pool_geometry(self, pre_blocks, T, x.device)
         # Preallocate the batch output and write each row's attention output in
         # place: the stacked buffer holds exactly the tensor torch.stack would
         # have built (a per-row copy into the same layout), and the CopySlices
@@ -3747,6 +3950,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             return lr * (step + 1) / warmup
         t = (step - warmup) / max(steps - warmup, 1)
         return lr * (0.1 + 0.45 * (1.0 + math.cos(math.pi * t)))
+    # lr_scale is only ever set at optimizer construction (never mutated), so
+    # the per-group multiplier list is built once instead of re-read per step.
+    _lr_scales = [g.get('lr_scale', 1.0) for g in opt.param_groups]
     bpe = batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
     _eval_batch = val_batch[:eval_subset] if val_batch is not None else None
     t0 = time.time()
@@ -3771,8 +3977,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 truncated = True
                 break
             base = lr_at(step)
-            for g in opt.param_groups:
-                g['lr'] = base * g.get('lr_scale', 1.0)
+            for g, _ls in zip(opt.param_groups, _lr_scales):
+                g['lr'] = base * _ls
             x, y = next(bpe)
             ce = model.ce_loss(x, y, vocab)
             del x, y
