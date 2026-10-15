@@ -152,55 +152,51 @@ def _segment(n, want_cut_list, min_block, max_block):
         if hit is not None:
             _SEGMENT_CACHE.move_to_end(key)
             return hit
-    # Closed form of the original greedy scan: with p the start of the current
-    # block, the next cut lands at min(p + max_block, max(p + min_block,
-    # next_cut[p] + 1)), where next_cut[p] is the earliest wanted-cut slot >= p
-    # (slot ci is the boundary between tokens ci and ci+1, scanned when the scan
-    # reaches token ci + 1).  A cut at q honours the LAST wanted slot that was
-    # already pending by then (the largest slot in [p, q - 1]) — the greedy
-    # scan keeps overwriting `pending_slot` as later wanted slots arrive before
-    # the cut fires.  The results are exactly those of the token-by-token scan.
+    # Successor-table form of the original greedy scan: with p the start of
+    # the current block, the next block start is f(p) = min(p + max_block,
+    # max(p + min_block, next_cut[p] + 1), n) (never less than p + 1), where
+    # next_cut[p] is the earliest wanted-cut slot >= p (slot ci is the
+    # boundary between tokens ci and ci+1, scanned when the scan reaches
+    # token ci + 1).  f is a pure integer function of p, so the whole table
+    # is built by vectorised integer ops and the scan itself is then a plain
+    # table walk from 0 — the same block starts the token-by-token form
+    # produced.  A cut at q honours the LAST wanted slot that was already
+    # pending by then (the largest slot in [p, q - 1], i.e.
+    # slots[bisect_right(slots, q - 1) - 1]) — computed vectorised over the
+    # block ends, the same dict the pointer form built.
     _BIG = n + 1
     # `want_cut_list` arrives as a python list (per-row `.tolist()`) or as a
     # numpy bool row (the batched `_hoist_blocks_from_cuts` path); normalising
     # through np.asarray is a no-op for the latter.  Same booleans either way.
-    slots = np.nonzero(np.asarray(want_cut_list, dtype=bool))[0].tolist()
-    honoured = {}
-    counts = []
-    p = 0
-    si = 0
-    hj = 0
+    slots = np.nonzero(np.asarray(want_cut_list, dtype=bool))[0]
     ns = len(slots)
-    append = counts.append
-    hon_set = honoured.__setitem__
+    pos = np.arange(n + 1, dtype=np.int64)
+    if ns:
+        si = np.searchsorted(slots, pos, side='left')
+        nc = np.where(si < ns, slots[np.minimum(si, ns - 1)], _BIG)
+    else:
+        nc = np.full(n + 1, _BIG, dtype=np.int64)
+    nxt = np.minimum(pos + int(max_block), np.maximum(pos + int(min_block), nc + 1))
+    np.minimum(nxt, n, out=nxt)
+    np.maximum(nxt, pos + 1, out=nxt)
+    nxt_l = nxt.tolist()
+    starts = []
+    ap = starts.append
+    p = 0
     while p < n:
-        while si < ns and slots[si] < p:
-            si += 1
-        nc = slots[si] if si < ns else _BIG
-        t = p + min_block
-        if nc + 1 > t:
-            t = nc + 1
-        q = p + max_block
-        if t < q:
-            q = t
-        if q > n:
-            q = n
-        if q <= p:
-            q = p + 1
-        append(q - p)
-        if q < n and nc <= q - 1:
-            # honour the LATEST pending slot (largest wanted slot <= q - 1),
-            # exactly as the token-by-token scan's `pending_slot` overwrite
-            # does.  q is non-decreasing across iterations (p advances to the
-            # previous q), so the honoured pointer hj only moves forward: it
-            # ends at bisect_right(slots, q - 1) — and since every slot[:si]
-            # is < p <= q - 1, bisecting from si lands on the same index —
-            # hence slots[hj - 1] is exactly slots[bisect_right(slots, q - 1,
-            # si) - 1], the same honoured slot as the per-block C bisect.
-            while hj < ns and slots[hj] <= q - 1:
-                hj += 1
-            hon_set(slots[hj - 1], 1.0)
-        p = q
+        ap(p)
+        p = nxt_l[p]
+    sa = np.asarray(starts, dtype=np.int64)
+    ends = np.empty(len(sa), dtype=np.int64)
+    ends[:-1] = sa[1:]
+    ends[-1] = n
+    counts = (ends - sa).tolist()
+    honoured = {}
+    if ns:
+        sel = (ends < n) & (nc[sa] <= ends - 1)
+        if sel.any():
+            hj = np.searchsorted(slots, ends[sel] - 1, side='right')
+            honoured = {int(s): 1.0 for s in slots[hj - 1]}
     bids = np.repeat(np.arange(len(counts), dtype=np.int64), np.asarray(counts, dtype=np.int64))
     if cacheable:
         while len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
