@@ -713,7 +713,7 @@ def sec_p1t():
 
     def _nblocks_measured(base_variant):
         # memoized: the summary table is not mutated inside sec_p1t, and this
-        # function is a pure, expensive full-table scan per variant.
+        # function is a pure full-table scan per variant.
         if base_variant in _nblocks_cache:
             return _nblocks_cache[base_variant]
         _vals = []

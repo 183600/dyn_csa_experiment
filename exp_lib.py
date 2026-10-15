@@ -117,9 +117,8 @@ _CPU_DEV = torch.device('cpu')
 _DEV_STR = {}
 
 def _dev_str(device):
-    # str(device) is a pure formatting function of the device object; caching
-    # it per object avoids re-formatting on every staged-upload / cache-key
-    # build (same string, host-side only).
+    # str(device) is a pure formatting function of the device object: the same
+    # string every time, host-side only — cache it per object.
     s = _DEV_STR.get(device)
     if s is None:
         s = str(device)
@@ -683,9 +682,8 @@ def _block_order(block_ids, n):
 
 def _n_blocks_cached(block_ids):
     # block_ids is treated as immutable by the pooling caches (_pool_gpu /
-    # _pool_geom), so its max+1 is a constant of the object; caching it avoids
-    # a max().item() GPU->CPU sync on every pooled layer/step.  First call per
-    # object still syncs and computes the identical value.
+    # _pool_geom), so its max+1 is a constant of the object — cache it per
+    # object.  First call per object computes the identical value.
     B = getattr(block_ids, '_pool_nblocks', None)
     if B is None:
         B = int(block_ids.max().item()) + 1
@@ -995,7 +993,7 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
     # _pool_parts / _pool_ordered / pool_blocks_single (the same flat
     # builders above, the same per-row `_pool_cpu` counts); here the whole
     # batch's flats are concatenated into ONE staged upload per dtype class
-    # (one int64, one bool) per layer instead of ~3 per row, and the per-row
+    # (one int64, one bool) per layer instead of per row, and the per-row
     # views are attached to each row's block-ids object under exactly the
     # keys the lazy lookups use — so _pool_parts / _pool_geom hit them
     # verbatim, including on the _pool_trainable recompute in backward.
@@ -1369,8 +1367,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     # 行独立——chunk 行切片上的值与全宽形式的对应行逐位一致（同 _indexer_
     # selection 内部 grid 只标记 chunk 内行号；CopySlices 反向把逐行梯度
     # 切片原样回传，与 forward 的 outs[b] = o 同一 transport 论证，§6.1）。
-    # 全宽的 [n, B] scores / masked / int64 order 因此从不物化——长上下文
-    # 下该瞬态从 O(n·B) 降到 O(chunk·B)。
+    # 全宽的 [n, B] scores / masked / int64 order 因此从不物化。
     _kw = max(min(int(topk), int(B)), 0)
     idx = torch.empty(n, _kw, device=dev, dtype=torch.int32)
     soft = None
@@ -2208,7 +2205,7 @@ class MLP(nn.Module):
         if _CKPT['on'] in ('mlp', 'block') and _CKPT_NEST[0] == 0 and torch.is_grad_enabled() and x.requires_grad:
             # 非重入 checkpoint（模块顶 CSA_CKPT 说明）：重算同一纯函数，
             # 前向值与梯度逐位一致。_CKPT_NEST > 0 时外层块已被 checkpoint
-            # 覆盖，内层不再包裹以免多一次重算。
+            # 覆盖，内层不再包裹。
             return torch.utils.checkpoint.checkpoint(self._fwd, x, use_reentrant=False)
         return self._fwd(x)
 
@@ -2240,7 +2237,7 @@ class Block(nn.Module):
 
     def _fwd_ckpt(self, x):
         # checkpoint 的初向前向与反向重算都经这里：置位期间内层 MLP 不再
-        # 重复包裹（外层已不保存它的激活），避免反向多一次 MLP 重算。
+        # 重复包裹（外层已不保存它的激活）。
         _CKPT_NEST[0] += 1
         try:
             return self._fwd(x)
@@ -3951,15 +3948,14 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         t = (step - warmup) / max(steps - warmup, 1)
         return lr * (0.1 + 0.45 * (1.0 + math.cos(math.pi * t)))
     # lr_scale is only ever set at optimizer construction (never mutated), so
-    # the per-group multiplier list is built once instead of re-read per step.
+    # the per-group multiplier list is captured once here.
     _lr_scales = [g.get('lr_scale', 1.0) for g in opt.param_groups]
     bpe = batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
     _eval_batch = val_batch[:eval_subset] if val_batch is not None else None
     t0 = time.time()
     losses = []
     _lbuf = []
-    # deque with a fixed capacity drops the oldest scalar for free instead of
-    # an O(50) list rebuild every step; the window contents are identical.
+    # deque with a fixed capacity; the window contents are identical.
     _tail = collections.deque(maxlen=50)
     ppl_hist = []
     delta_trace = {}

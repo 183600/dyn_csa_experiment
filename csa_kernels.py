@@ -108,8 +108,7 @@ def _env_cached(name):
     """进程内缓存的环境变量读取：这些开关（CSA_KERNEL_TF32 /
     CSA_KERNEL_{POOL,IDX,ATTN} / CSA_KERNEL_IDX_CHUNK）在仓库内从不被
     运行期改写（只有 CSA_KERNEL 本身按设计每次 forward 重读，不走这里），
-    与 _TRITON_STATE 同为 cache-once 模式；每次内核启动前的 getenv 开销
-    因此只付一次。"""
+    与 _TRITON_STATE 同为 cache-once 模式。"""
     v = _ENV_CACHE.get(name, None)
     if v is None:
         v = os.environ.get(name)
@@ -237,8 +236,7 @@ class PoolGeometry:
             max_ov = 0
         W_b = max_ov if overlap is not None else 0
         # 8 张 int32 几何表打包进一条宿主缓冲、一次 H2D（同样的 int32 值、
-        # 同样的 int64→int32 窄化，transport only），设备侧按只读视图切分；
-        # 动态臂每步重建几何，延迟从 8 次传输降到 1 次。
+        # 同样的 int64→int32 窄化，transport only），设备侧按只读视图切分。
         flat = np.empty(7 * R * Bm + R, dtype=np.int32)
         for _i, _a in enumerate((counts_np, ends_np, starts_np, last_np,
                                  ov_start_np, ov_len_np, starts_prev_np)):
@@ -411,7 +409,7 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
         b1 = min(b0 + ch, Bm)
         av = av_all[:, b0:b1]
         # 这些 logit 张量都是本轮新算出的临时量（无别名），fill 原地进行——
-        # 值与出位版逐位相同，省一份同形分配。
+        # 值与出位版逐位相同。
         logit_a = _gather_rows(Za, g_a[:, b0:b1]) + Bp_a[None, None] * av
         logit_a.masked_fill_(~av, _NEG_INF)
         if has_b:
@@ -479,7 +477,7 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
         b1 = min(b0 + ch, Bm)
         av = av_all[:, b0:b1]
         # 这些 logit 张量都是本轮新算出的临时量（无别名），fill 原地进行——
-        # 值与出位版逐位相同，省一份同形分配。
+        # 值与出位版逐位相同。
         logit_a = _gather_rows(Za, g_a[:, b0:b1]) + Bp_a[None, None] * av
         logit_a.masked_fill_(~av, _NEG_INF)
         if has_b:
@@ -650,13 +648,13 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
         scores = torch.zeros((R, t1 - t0, Bm), device=dev, dtype=torch.float32)
         for i in range(nIH):
             # mul/relu 原地（s_i 是本轮新出的临时量，relu(x)>0 ⟺ x>0 逐位一致）；
-            # add_ 与 += 同一个核——每轮少两份 [R, t, Bm] 临时分配。
+            # add_ 与 += 同一个核。
             s_i = torch.einsum('rth,rbh->rtb', qIf[:, t0:t1, i, :], kIf[:, :, i, :])
             if dtype != torch.float32:
                 # eager 的逐头舍入结构：einsum 输出按 dtype 舍入一次，mul_ 再
                 # 舍入一次（bf16/fp16 张量乘 python 标量按 fp32 计算后舍回），
                 # 末段 einsum 才按 fp32 累加、输出舍入一次。低精度下漏掉这两次
-                # 中间舍入会翻转近 tie 的选择次序（G0 的 idx 逐位判据会炸）。
+                # 中间舍入会翻转近 tie 的选择次序。
                 s_i = s_i.to(dtype)
                 s_i = s_i * iscale
             else:
@@ -1131,7 +1129,7 @@ def _dot_prec():
     einsum 也是 ieee，默认必须保证 kernel/eager 是同一函数，否则 indexer
     的近 tie 选择会被 ~1e-3 的 tf32 噪声翻转、且同一 softmax 内滑窗泳道
     (tl.dot) 与块泳道 (tl.sum) 精度不对称）；CSA_KERNEL_TF32=1 时显式
-    切换到 tf32（H800 张量核吞吐实验，与 eager 的差异属容差口径）。
+    切换到 tf32（与 eager 的差异属容差口径）。
     bf16 输入不受此开关影响（张量核对 bf16 输入精确、fp32 累加）。"""
     return 'tf32' if (_env_cached('CSA_KERNEL_TF32') or '0').strip().lower() not in ('0', 'false', 'off') else 'ieee'
 
@@ -1235,8 +1233,8 @@ def _kernels():
                 else:
                     # 复现 eager 的逐头舍入结构（einsum 输出按输入 dtype
                     # 舍入一次、乘 iscale 再舍入一次）；低精度下漏掉这两次
-                    # 中间舍入会翻转近 tie 的选择次序（G0 的 idx 逐位判据
-                    # 会炸）。ref 后端的同款结构见 _indexer_fwd_ref。
+                    # 中间舍入会翻转近 tie 的选择次序。ref 后端的同款结构
+                    # 见 _indexer_fwd_ref。
                     s = s.to(qI_ptr.dtype.element_ty).to(tl.float32)
                     s = (s * ISCALE).to(qI_ptr.dtype.element_ty).to(tl.float32)
                 acc += tl.where(s > 0.0, s, 0.0) * w_i[:, None]
@@ -1254,8 +1252,7 @@ def _kernels():
     # idx/valid/soft 输出按全局行寻址。逐轮的软分直接取本轮最大值 m：has
     # 为真时 masked[pick] 与 m 是同一个 fp32 值（work 只在非因果/非有限
     # 泳道与 masked 不同，而那些泳道使 has 为假），has 为假时 sv 被紧随的
-    # where/nan 守卫清零——两种情形都与旧的全宽 extract 归约同值，每轮省
-    # 一次全宽归约。
+    # where/nan 守卫清零——两种情形都与旧的全宽 extract 归约同值。
     @triton.jit
     def idx_topk(scores_ptr, last_tok_ptr, idx_ptr, valid_ptr, soft_ptr, T0, TF, T, Bm,
                  K: tl.constexpr, BB: tl.constexpr):
@@ -1422,7 +1419,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         order = flat.argsort(dim=1, stable=True).to(torch.int32).contiguous()
         # 整数直方图（等价于逐行 bincount(minlength=Bm) 的 scatter_add_ 形
         # 式）：行号并入键后一次 bincount——整数计数精确且与写入顺序无关
-        # （整数加法可交换、无舍入），省掉 ones 缓冲与一次全宽写。
+        # （整数加法可交换、无舍入）。
         _keys = flat.to(torch.int64) + (torch.arange(R, device=dev, dtype=torch.int64) * Bm)[:, None]
         cnt = torch.bincount(_keys.reshape(-1), minlength=R * Bm).reshape(R, Bm)
         offs = torch.zeros((R, Bm + 1), device=dev, dtype=torch.int64)
@@ -1864,9 +1861,8 @@ def _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
 
 
 # scores 分块缓冲的字节上限（fp32 [R, T_c, Bm]）：打分/top-k 两内核按
-# query 行分块启动，scores 从不按全幅 [R, T, Bm] 物化——每行的值与全幅
-# 形式逐位一致（每个 (r, t) 程序只读写自己的行），长上下文 / 大批量的
-# 瞬态峰值由 O(R·T·Bm) 封顶为 O(R·T_c·Bm)。
+# query 行分块启动，scores 不按全幅 [R, T, Bm] 物化——每行的值与全幅
+# 形式逐位一致（每个 (r, t) 程序只读写自己的行）。
 _IDX_SCORES_CAP_BYTES = 128 << 20
 
 
@@ -2293,9 +2289,7 @@ def selfcheck_model(variant='csa_dynamic', impl='ref', seed=0, device=None, T=64
     全部参数梯度的相对误差（配对纪律：同一配置指纹口径的两种实现）。"""
     import exp_lib as L
     if device is None:
-        # triton 内核只接受 CUDA 指针——不显式传 device 时按后端选择，
-        # 否则在 CUDA 机器上 triton 对照会落在 CPU 张量上直接崩溃
-        # （模型级 kernel/eager 等价性将从未被真正验证）。
+        # triton 内核只接受 CUDA 指针——不显式传 device 时按后端选择。
         device = torch.device('cuda') if (impl == 'triton' and torch.cuda.is_available()) else torch.device('cpu')
     d, n_layers, n_heads, d_head = 64, 2, 4, 16
     vocab = 128
