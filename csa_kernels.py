@@ -620,8 +620,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     - 有效槽位不足 k 时，尾部以块 0 填充，valid=False——与 eager 的
       compaction+padding 逐位一致（eager 的 pad_blk 恒为 0：池化给出的
       last_tok 单调不减，首个因果块必为块 0，两种形式对所有池化输入
-      同值；此处直接取 eager 形式，非单调 last_tok 的独立调用也不再
-      分叉）；
+      同值；此处直接取 eager 形式）；
     - soft 在无效槽位直接置 0（eager 在下游乘 keep=0，值等价）。
     """
     R, T, nIH, hd = qI.shape

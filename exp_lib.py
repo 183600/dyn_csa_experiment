@@ -4060,8 +4060,7 @@ class TimeGuard:
         # 内核模式使用独立的状态文件：两档速率标定不可互相污染（同一
         # state 文件会把 eager 的 sps 标定用于内核单元的预计耗时）。
         # 幂等：cap_spec() 导出的就是已盖章路径，par.py 子进程按它重建
-        # TimeGuard 时不得再加一次后缀（否则全部子进程记账落进 *.k.k 影子
-        # 文件，驱动真正执行的 .k 文件永远看不到并行 cell 的 GPU 秒）。
+        # TimeGuard 时不得再加一次后缀。
         if _kernel_stamp() and not self.state_path.endswith('.k'):
             self.state_path = self.state_path + '.k'
         self.state = self._load_state()
