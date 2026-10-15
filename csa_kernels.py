@@ -674,7 +674,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     t_idx = torch.arange(T, device=dev)[None, :, None]
     # causal 只在 t 分块切片上消费：循环内按片做同一整数比较（last_tok 的
     # int64 升型循环外一次），布尔值与全幅形式逐格相同，[R, T, Bm] 全幅
-    # 掩码不再物化。
+    # 掩码不物化。
     lt64 = last_tok.to(torch.int64)
     # fp32 升型整体只做一次（逐片 cast 的值与整张 cast 后取片逐位一致）：
     # 否则每个头都重复拷贝一次 qI / kI / w_idx 的 fp32 版本。
@@ -776,7 +776,7 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
     wf = w_idx if w_idx.dtype == torch.float32 else w_idx.to(torch.float32)
     for t0 in range(0, T, t_chunk):
         t1 = min(t0 + t_chunk, T)
-        # Mk 随 t 分块构建（全幅 [R, T, Bm+1] 不再物化）：逐 chunk 的 scatter
+        # Mk 随 t 分块构建（全幅 [R, T, Bm+1] 不物化）：逐 chunk 的 scatter
         # 键/值就是全幅形式对应行的切片，逐行无碰撞——切片后的值逐位一致。
         Mk = torch.zeros((R, t1 - t0, Bm + 1), device=dev, dtype=torch.float32)
         if idx.numel():
@@ -1478,7 +1478,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         flat = topk_idx.reshape(R, T * nb)
         # 稳定排序只依赖键值与位置。order 保留 int64：lane 值域是
         # [0, T·nb)，T·nb ≥ 2³¹ 的超大配置下窄化到 int32 会翻负、内核再
-        # 按 lane//NB 寻址即越界——不省这一份内存。
+        # 按 lane//NB 寻址即越界。
         order = flat.argsort(dim=1, stable=True).contiguous()
         # 整数直方图（等价于逐行 bincount(minlength=Bm) 的 scatter_add_ 形
         # 式）：行号并入键后一次 bincount——整数计数精确且与写入顺序无关
@@ -2046,8 +2046,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     cfg = attn.cfg
     # 逐算子解析后端：显式 impl= 强制全部三算子（selfcheck/bench 口径）；
     # impl=None 时各算子吃自己的 CSA_KERNEL_{POOL,IDX,ATTN} 覆盖（空则跟随
-    # 全局 CSA_KERNEL）——此前这里解析单一 impl 贯通三算子，逐算子覆盖在
-    # 模型级路径上是死开关。
+    # 全局 CSA_KERNEL）。
     impl_pool = impl or _op_impl('POOL')
     impl_idx = impl or _op_impl('IDX')
     impl_attn = impl or _op_impl('ATTN')

@@ -1153,9 +1153,9 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     # with -inf. Forward values and B_pos gradients (zero on invalid lanes in
     # both forms) are identical to the previous boolean-index form.
     # += on the fresh _take_2d outputs: the same elementwise kernel with the
-    # same values as the out-of-place add, minus one full [B, L, c] temporary
-    # per lane stack (AddBackward saves no tensor, and the only downstream
-    # consumer chain — masked_fill_/cat/softmax — keeps no pre-add version).
+    # same values as the out-of-place add (AddBackward saves no tensor, and
+    # the only downstream consumer chain — masked_fill_/cat/softmax — keeps
+    # no pre-add version).
     Zam += B_pos_a[_pos_a][None] * mask_a[:, :, None]
     Zbm += B_pos_b[b_off] * mask_b[:, :, None]
     # the fill mask broadcasts: masked_fill_ accepts a broadcastable mask, so
@@ -1285,13 +1285,13 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     order_k = order_w.to(torch.int32)
     # Sentinel-column scatter instead of the boolean-mask assignment
     # (kept[grid[keep], dest[keep]] = order_k[keep]): masked advanced indexing
-    # goes through nonzero and forces a host sync — three times per call here,
-    # on the hottest selection path.  Within a row the kept lanes hold distinct
-    # cumsum ranks (0..cnt-1), so every scatter target column has exactly one
-    # writer; lanes failing `keep` are redirected to a sentinel column that is
-    # sliced away (its undefined winner never leaves the pad).  The kept
-    # columns are therefore the same exact integers as the masked-assignment
-    # form (host-side integer equivalence, design notes §6.2), with no sync.
+    # goes through nonzero and forces a host sync.  Within a row the kept
+    # lanes hold distinct cumsum ranks (0..cnt-1), so every scatter target
+    # column has exactly one writer; lanes failing `keep` are redirected to a
+    # sentinel column that is sliced away (its undefined winner never leaves
+    # the pad).  The kept columns are therefore the same exact integers as the
+    # masked-assignment form (host-side integer equivalence, design notes
+    # §6.2), with no sync.
     tgt = torch.where(keep, dest, _w_keep)
     kept = torch.full((n, _w_keep + 1), -1, dtype=torch.int32, device=scores.device)
     kept.scatter_(1, tgt, order_k)
@@ -1394,7 +1394,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             # same elementwise op chain with in-place tails: each op is the
             # same kernel on the same values (no fusion, no reassociation —
             # note x-floor(x) is NOT frac() for negatives), so the scores are
-            # bit-identical minus the dead [chunk, B] float64 temporaries.
+            # bit-identical.
             z = _ri[s:e] * 12.9898 + _jc
             z.sin_()
             z.mul_(43758.5453)
@@ -1555,8 +1555,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _einsum = torch.einsum
     if _has_all:
         # Only the keep/nvalid/anyrow slices are consumed below; the whole-row
-        # sel_blk_all / valid_all tables are fully absorbed into them and die
-        # here instead of staying pinned through the chunk loop.
+        # sel_blk_all / valid_all tables are fully absorbed into them.
         _plan = [(None if keep_all is None else keep_all[_s:_s + q_chunk], nvalid_all[_s:_s + q_chunk], None if anyrow_all is None else anyrow_all[_s:_s + q_chunk]) for _s in range(0, n, q_chunk)]
         del sel_blk_all, valid_all
     else:
@@ -2094,8 +2093,7 @@ class HybridAttention(nn.Module):
         if self._stats is not None:
             # scatter_add of exact integer ones is order-independent (integer
             # addition commutes, no rounding), so the counts are the same
-            # exact integers bincount returns — without bincount's max
-            # read-back, which forces a host sync per row per layer.
+            # exact integers bincount returns.
             _bc = torch.zeros(int(nblk), dtype=torch.int64, device=bid.device)
             _bc.scatter_add_(0, bid if bid.dtype == torch.int64 else bid.long(), torch.ones_like(bid, dtype=torch.int64))
             self._stats.append(_bc)
