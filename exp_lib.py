@@ -489,6 +489,21 @@ def _arange_exp_cache(n, m, device):
         _cache_put(_IDX_CACHE, key, a, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return a
 
+def causal_window_mask_f(T, window, device, dtype):
+    """causal_window_mask 的目标 dtype 形式（逐元素 cast 对 0/-inf 精确；
+    缓存键含 dtype，mask 下游只读——消掉同一 (T, window, dtype) 在每个
+    稀疏层、每个 step 的 [T,T] 重分配）。dtype 相同则无新分配。"""
+    base = causal_window_mask(T, window, device)
+    if base.dtype == dtype:
+        return base
+    key = (str(device), 'cwf', int(T), int(window), str(dtype))
+    m = _MASK_CACHE.get(key)
+    if m is None:
+        with torch.inference_mode(False):
+            m = base.to(dtype)
+        _cache_put(_MASK_CACHE, key, m, _MASK_CACHE_BUDGET_BYTES, _mask_cache_total)
+    return m
+
 def _attn_transient_budget(device):
     key = (str(device), _ATB_EPOCH)
     if key in _ATB_CACHE:
@@ -1481,7 +1496,7 @@ class HybridAttention(nn.Module):
         if self.sink is None:
             sdpa_kw = dict(scale=scale)
             if self.cfg.window > 0:
-                sdpa_kw['attn_mask'] = causal_window_mask(T, self.cfg.window, x.device).to(q.dtype)
+                sdpa_kw['attn_mask'] = causal_window_mask_f(T, self.cfg.window, x.device, q.dtype)
             else:
                 sdpa_kw['is_causal'] = True
             out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
@@ -2706,13 +2721,15 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     # in int32: every operand and the sum are < 2**31, so the int32 result
     # holds exactly the same integers as the int64 form.
     _idx_i32 = n + seq_len + 1 < 2 ** 31
-    cols = np.arange(seq_len + 1, dtype=np.int32 if _idx_i32 else np.int64)
+    _idx_dt = np.int32 if _idx_i32 else np.int64
+    cols = np.arange(seq_len + 1, dtype=_idx_dt)
+    # 复用一张 [B, seq_len+1] 索引缓冲（np.add out= 逐位同值；h2d 路径经
+    # _h2d_stage 的 pinned 暂存同步拷贝，下一轮的覆写发生在设备拷贝提交
+    # 之后；CPU 路径 host[idx] 则立即实现）。
+    idx_np = np.empty((batch_size, seq_len + 1), dtype=_idx_dt)
     while True:
-        starts = rng.integers(0, n + 1, size=batch_size)
-        if _idx_i32:
-            idx_np = starts[:, None].astype(np.int32) + cols[None, :]
-        else:
-            idx_np = starts[:, None] + cols[None, :]
+        starts = rng.integers(0, n + 1, size=batch_size).astype(_idx_dt, copy=False)
+        np.add(starts[:, None], cols[None, :], out=idx_np)
         idx = torch.from_numpy(idx_np)
         if host.device.type == 'cuda':
             ids = host[_h2d_async(idx, idx.dtype, host.device)]
