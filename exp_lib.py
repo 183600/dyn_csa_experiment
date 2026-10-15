@@ -332,8 +332,8 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
     # 1-D (single row) or 2-D (batched rows) — every op is rowwise
     # independent, so row-chunking the batch dim is value-identical per row:
-    # same kernels, same per-row reduction order, but peak transient memory
-    # scales with the chunk instead of the full batch.
+    # same kernels, same per-row reduction order, with intermediate tensors
+    # bounded by the chunk.
     squeeze = sim.dim() == 1
     x = (sim.unsqueeze(0) if squeeze else sim).detach().float()
     n = x.shape[-1]
@@ -345,7 +345,7 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     hi_c = (lo + 1).clamp(max=n - 1)[..., None]
     use_hi = (frac > 0.0) & (lo + 1 <= idx)
     first_row = idx == 0
-    # chunk budget keeps the transient [rows, n, n] sort input bounded.
+    # row chunking keeps the transient [rows, n, n] sort input bounded.
     row_chunk = max(1, (256 << 20) // max(n * n * 4, 1))
     out = torch.empty_like(x)
     for r0 in range(0, x.shape[0], row_chunk):
@@ -399,10 +399,8 @@ _MASK_CACHE_BUDGET_BYTES = 192 << 20
 
 def _mask_budget(n):
     # [T,T] fp32 mask 单张占 4·T² 字节；pinned 的 causal donor 与
-    # bandw/cw/cwf 三种形式需要同时驻留。扁平 192MB 预算在 T 较大时连一张
-    # 都放不下——按驱逐规则它们每层每步都被逐出并确定性重建（值相同，但
-    # 白付一轮 empty+fill+triu(+clone+add) 的分配与写带宽）。预算随 T 放大
-    # 让这几张 mask 共存；只影响缓存命中，不影响任何值。
+    # bandw/cw/cwf 三种形式需要同时驻留，上限随 T 放大让这几张 mask
+    # 共存；只影响缓存命中，不影响任何值。
     return max(_MASK_CACHE_BUDGET_BYTES, 6 * int(n) * int(n) * 4)
 
 def _cache_bytes(t):
@@ -727,12 +725,10 @@ def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, de
     # and the two bool masks a second one (the same staged pinned pool
     # _pool_parts_host uses); the returned tensors are read-only views into
     # those buffers (the same aliasing argument the parts make — downstream
-    # they feed gathers / mask multiplies / negated-mask fills only).  For
-    # the dynamic segmenter's per-row block-ids objects this replaces the
-    # ~9 small device kernels the on-device build issues per row per layer
-    # per step; the fixed segmenter keeps its build-once/cache path.  Returns
-    # None when the host form cannot serve; the caller then falls back to
-    # the on-device form, whose values are identical.
+    # they feed gathers / mask multiplies / negated-mask fills only).  The
+    # fixed segmenter keeps its build-once/cache path.  Returns None when
+    # the host form cannot serve; the caller then falls back to the
+    # on-device form, whose values are identical.
     try:
         B = int(B)
         n = int(n)
@@ -896,10 +892,8 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         g_a, mask_a, g_b, mask_b, b_off, _pos_a = _geom
     else:
         # Host form first (the same exact-integer build _pool_parts_host makes
-        # for the parts — design notes §6.2): for the dynamic segmenter's
-        # per-step block-ids objects the device build below issues ~9 small
-        # kernels per row per layer per step; the host form replaces them with
-        # two staged uploads of identical values.  None means fall back to the
+        # for the parts — design notes §6.2): the host form produces values
+        # identical to the on-device build below.  None means fall back to the
         # on-device form, whose values are identical.
         _host = None
         if _POOL_PARTS_HOST and _cpu is not None and len(_cpu[0]) == B:
@@ -1164,8 +1158,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             scores = c
         else:
             # 多 chunk 时预分配整幅再逐块写入：同样的值落到同样的行（拷贝
-            # 逐位精确），与 cat 的结果一致，但 chunk 不再全部同时驻留，也
-            # 省去 cat 自身的整幅临时分配。
+            # 逐位精确），结果与 cat 一致。
             if scores is None:
                 scores = torch.empty(n, B, device=c.device, dtype=c.dtype)
             scores[s:e] = c
@@ -1392,26 +1385,19 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     return out
 
 def _gathered_attention_trainable(*args, **kwargs):
-    # 训练时以重算代替保存：gathered_attention 内部按 chunk 物化的
-    # Kset/Vset/logits/attn（每行每层 O(T·M·nh·hd)）原本全部被 autograd 保留
-    # 到反向；包一层非重入 checkpoint 后只保留输入（topk_idx/win/soft 等索引
-    # 与小表 O(T·M)，q/k/v 本就被上游算子保留），反向时按同一确定性分解重算
-    # 前向。函数内无 RNG，且 mem_budget 经 _ATB_EPOCH 缓存在一次运行内不变，
-    # 因此 chunk 边界与每个中间值逐位相同——反向得到的梯度与原形式逐位一致
-    # （design notes §6.1 的 transport 论证在「重算同一纯函数」上的形式）。
+    # 训练时包一层非重入 checkpoint，反向按同一确定性分解重算前向。函数内
+    # 无 RNG，且 mem_budget 经 _ATB_EPOCH 缓存在一次运行内不变，因此 chunk
+    # 边界与每个中间值逐位相同，梯度与直调形式逐位一致（design notes §6.1
+    # 的 transport 论证在「重算同一纯函数」上的形式）。
     if torch.is_grad_enabled() and args[0].requires_grad:
         return torch.utils.checkpoint.checkpoint(gathered_attention, *args, use_reentrant=False, **kwargs)
     return gathered_attention(*args, **kwargs)
 
 def _pool_trainable(fn, *args, **kwargs):
-    # 训练时以重算代替保留：池化内部物化的 Xam/Zam/Xbm/Zbm/WinZ 与 softmax
-    # 输出（每行每层 O(n_blocks·L·c_kv)，随上下文长度线性增长）原本全部保留
-    # 到反向；包一层非重入 checkpoint 后只保留输入（Ca/Z 等经 _pre 融合投影
-    # 产出的切片本就被上游保留，bid/B_pos 是小表）。重算是同一纯函数：池化
-    # 内部无 RNG，整数几何缓存挂在不可变的 block_ids 对象上（_pool_parts /
-    # _pool_geom，design notes §6.2），反向重算必命中同一几何，前向值与梯度
-    # 逐位一致；int 型的 n_blocks 返回值原样透传。eval 下（无梯度）零开销
-    # 直调。
+    # 训练时包一层非重入 checkpoint，反向重算同一纯函数：池化内部无 RNG，
+    # 整数几何缓存挂在不可变的 block_ids 对象上（_pool_parts / _pool_geom，
+    # design notes §6.2），反向重算必命中同一几何，前向值与梯度逐位一致；
+    # int 型的 n_blocks 返回值原样透传。eval 下（无梯度）直调。
     if torch.is_grad_enabled() and args[0].requires_grad:
         return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False, **kwargs)
     return fn(*args, **kwargs)
@@ -1581,11 +1567,10 @@ class HybridAttention(nn.Module):
         if _budget is not None:
             _per_row = max(1, 3 * B * self.nh * T) * q.element_size()
             row_chunk = max(1, min(row_chunk, int(_budget) // _per_row))
-        # 训练时每个行块包一层非重入 checkpoint：各块的 [B, nh, rows, T]
-        # logits/attn（合计 O(B·nh·T²)，长序列下稠密 sink 臂的最大单项保留）
-        # 原本保留到反向；现在反向按块重算同一份值（无 RNG、预算口径经
-        # _ATB_EPOCH 在运行内不变、mask 是缓存的常量张量——块边界与中间值
-        # 逐位相同，梯度与原形式逐位一致，同 ce_loss 分块重算的论证）。
+        # 训练时每个行块包一层非重入 checkpoint：反向按块重算同一份值（无
+        # RNG、row_chunk 经 _ATB_EPOCH 在运行内不变、mask 是缓存的常量张量
+        # ——块边界与中间值逐位相同，梯度与不分块形式逐位一致，同 ce_loss
+        # 分块重算的论证）。
         _ck = torch.is_grad_enabled() and q.requires_grad
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
@@ -2071,10 +2056,8 @@ class SmallGPT(nn.Module):
         # LM-head cross-entropy computed in time chunks: the chunk sums add to
         # the same total as the full-batch form (up to fp reduction order), so
         # the scalar and its gradients are unchanged.
-        # 训练时每个 chunk 包一层非重入 checkpoint：原本所有 chunk 的
-        # logits/log_softmax（合计 O(B·T·V)，长序列下是最大单项显存）都保留到
-        # loss.backward()；现在反向按 chunk 重算同一份 logits（同一 GEMM、无
-        # RNG，值逐位相同），保留量降到 O(B·chunk·V)。chunk 反传的执行次序由
+        # 训练时每个 chunk 包一层非重入 checkpoint：反向按 chunk 重算同一份
+        # logits（同一 GEMM、无 RNG，值逐位相同）；chunk 反传的执行次序由
         # 求和链的拓扑结构决定，两种形式相同，因此梯度逐位一致。
         h = self.trunk(ids)
         n_tok = targets.numel()

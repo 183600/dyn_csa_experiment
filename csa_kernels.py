@@ -116,8 +116,8 @@ def _det_scatter_add_multi(n_rows, indices, values_list, device, dtype):
     """_det_scatter_add 的多值表形式：同一组键只排一次序、只做一次段定位，
     各值表分别段和（段和沿列独立归约——每张表的结果与逐张调用
     _det_scatter_add 逐位一致，共享的只是排序与段结构）。values_list 中的
-    None 原样返回 None。dk/dv（或 dksw/dvsw）的键逐元素相同，走这里省掉
-    每头一半的 argsort。"""
+    None 原样返回 None。dk/dv（或 dksw/dvsw）的键逐元素相同，共用同一组
+    排序与段结构。"""
     idx = indices.reshape(-1).to(torch.int64)
     n_rows = int(n_rows)
     outs = [None if v is None else torch.zeros((n_rows, *v.shape[1:]), device=device, dtype=dtype) for v in values_list]
@@ -185,8 +185,7 @@ class PoolGeometry:
         Bm = max(Bm, 1)
         # 全部表都是整型：先按行填入 counts，之后用 2D numpy 一次性求
         # ends/starts/overlap 几何（整数的 cumsum/移位/clamp 沿轴逐位精确，
-        # 与逐行循环同一套公式同一批值——逐位一致，只省掉 O(R) 轮 numpy
-        # 调用；动态臂每层每步重建时这是主要的 host 开销）。
+        # 与逐行循环同一套公式同一批值——逐位一致）。
         counts_np = np.zeros((R, Bm), dtype=np.int64)
         nblk_np = np.zeros((R,), dtype=np.int64)
         for r, counts in enumerate(counts_rows):
@@ -302,9 +301,8 @@ def _full_arange_evict():
 def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
     # 键 = 行 counts 对象的身份（条目强引用这些对象，因此 id 在条目存活期间
     # 唯一且稳定，不可能撞上复用）；fix 臂全程复用同一分段器出口对象必命中，
-    # 动态臂每步拿到新对象必 miss——与原内容键的命中语义一致（counts 表按
-    # 约定不可变，与 exp_lib `_pool_parts` 缓存于对象身份同一论证），但键
-    # 构造从 O(总块数) 次 Python int() 降到 O(R)。
+    # 动态臂每步拿到新对象必 miss——命中语义与内容键一致（counts 表按约定
+    # 不可变，与 exp_lib `_pool_parts` 缓存于对象身份同一论证）。
     key = (tuple(id(c) for c in counts_rows),
            None if overlap is None else int(overlap), int(T),
            str(device), int(max_block))
@@ -796,8 +794,7 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     tc = _attn_t_chunk(R, M, nh, hd)
     # 头在外、t-chunk 在内：各 (t,h) 的前向计算相互独立，循环顺序交换
     # 不改变任何元素值。chunk 内的 src_sel/lt_sel/sel_ok/src_win/win_ok/
-    # anyrow 全部与 h 无关——在头循环外按 chunk 预算一次（同值，省 nh×
-    # 的 gather/比较/分配）。
+    # anyrow 全部与 h 无关——在头循环外按 chunk 各算一次（同值）。
     lt_l = last_tok.to(torch.int64)
     chunks = []
     for t0 in range(0, T, tc):
@@ -870,13 +867,11 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     r_idx = torch.arange(R, device=dev)[:, None, None]
     tc = _attn_t_chunk(R, M, nh, hd)
     # 头在外、t-chunk 在内：各 (t,h) 独立。chunk 内的几何/掩码/soft 常量
-    # 与 h 无关——头循环外按 chunk 预算一次（同值，省 nh× 的 gather/比较/
-    # zeros/分配；soft_l[:, :, :nb] 同时兼作原逐头重置的 sf cast）。
+    # 与 h 无关——头循环外按 chunk 各算一次（同值；soft_l[:, :, :nb] 同时
+    # 兼作逐头重置的 sf cast）。
     # 键值梯度碎片按头收集、逐头 flush：键含 +h 故跨头键不相交，头内条目
     # 保持 chunk 升序——每个 (key) 组的稳定排序段和与跨头合并后一次
-    # flush 的组内序逐元素一致（原实现的等价性论证逐字适用），但峰值显存
-    # 从「全部头 × 全部 chunk 的 [R·T·M·nh·hd] fp32 碎片同时驻留」降到
-    # 单头量级。这一点在规模扩大时是从 O(nh) 到 O(1) 的驻留因子差距。
+    # flush 的组内序逐元素一致。
     dk_blk32 = torch.zeros((R * Bm * nh, hd), device=dev, dtype=torch.float32) if need_dkb else None
     dv_blk32 = torch.zeros((R * Bm * nh, hd), device=dev, dtype=torch.float32) if need_dvb else None
     dk_sw32 = torch.zeros((R * T * nh, hd), device=dev, dtype=torch.float32) if need_dksw else None
@@ -1296,8 +1291,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     need_dsink = bool(needs[10]) and sink is not None
     BT, BW = 64, 64
     # soft 统计量（mS/ZS/GS）只在 HAS_SOFT 下被 attn_bwd_stats 写、被
-    # attn_bwd_dq / dkdv 内核读；soft=None（HCA 臂）时给 1 元素占位缓冲，
-    # 省 3 张 [R,T,nh] fp32 的分配与写流量。
+    # attn_bwd_dq / dkdv 内核读；soft=None（HCA 臂）时给 1 元素占位缓冲。
     mA = torch.empty((R, T, nh), device=dev, dtype=torch.float32)
     ZA = torch.empty((R, T, nh), device=dev, dtype=torch.float32)
     GA = torch.empty((R, T, nh), device=dev, dtype=torch.float32)
@@ -1346,8 +1340,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
             HAS_SINK=sink is not None,
             NEED_DK=need_dkb, NEED_DV=need_dvb, NEED_DSOFT=need_dsoft, num_warps=1)
     if need_dksw or need_dvsw:
-        # attn_bwd_dkdv_window 对每个 (r,p,h) 同样无条件 store——empty 即可
-        # （长序列下这两张是最大的反向缓冲，零初始化是纯浪费的写流量）。
+        # attn_bwd_dkdv_window 对每个 (r,p,h) 同样无条件 store——empty 即可。
         dk_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else q
         dv_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dvsw else q
         K.attn_bwd_dkdv_window[(R * T * nh,)](
