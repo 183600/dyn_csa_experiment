@@ -385,8 +385,7 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
     # 1-D (single row) or 2-D (batched rows) — every op is rowwise
     # independent, so row-chunking the batch dim is value-identical per row:
-    # same kernels, same per-row reduction order, with intermediate tensors
-    # bounded by the chunk.
+    # same kernels, same per-row reduction order.
     squeeze = sim.dim() == 1
     x = (sim.unsqueeze(0) if squeeze else sim).detach().float()
     n = x.shape[-1]
@@ -521,8 +520,7 @@ def _window_geometry(n, w, device):
         # int32 index transport (design notes §6.1): every clamped position is
         # an exact integer in [0, n) < 2**31, so the narrowed table addresses
         # exactly the same k_sw rows as the int64 form — index_select accepts
-        # int32 directly (as the indexer's topk already relies on), and the
-        # per-chunk index traffic is halved.
+        # int32 directly (as the indexer's topk already relies on).
         pair = (win_idx_raw.clamp(min=0).to(torch.int32), win_idx_raw >= 0)
     _cache_put(_IDX_CACHE, key, pair, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return pair
@@ -1180,9 +1178,9 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     sc_b = sc[:, max_len:]
     comp = (sc_a * Xam).sum(1)
     comp += (sc_b * Xbm).sum(1)
-    # Identity-order fast path: when `order` is the cached arange, the gather
-    # order[last_idx] returns exactly last_idx (arange[i] == i, exact integers
-    # — index transport, design notes §6.1), so the gather kernel is skipped.
+    # Identity-order path: when `order` is the cached arange, order[last_idx]
+    # returns exactly last_idx (arange[i] == i, exact integers — index
+    # transport, design notes §6.1).
     return (comp, last_idx if order_is_identity else order[last_idx], B)
 
 def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
@@ -1315,8 +1313,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     valid_cols = kept >= 0
     # the invalid lanes hold exactly the -1 sentinel, so clamping the kept
     # buffer to 0 replaces the where(valid, kept, 0) selection lane-for-lane
-    # (block ids are >= 0 and are never rewritten) — same integers, without
-    # materialising the [n, _w_keep] where output.
+    # (block ids are >= 0 and are never rewritten) — same integers.
     kept.clamp_min_(0)
     idx_out = kept
     if out_valid is not None:
@@ -1585,8 +1582,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _MINL = _finfo_min(k_blk.dtype)
     # Index transport (design notes §6.1): int32 and int64 index tensors hold
     # the same exact integers, and advanced indexing / equality comparisons on
-    # them return bitwise identical values, so the upcast to int64 is skipped
-    # when the selection already arrives as int32.
+    # them return bitwise identical values.
     topk_l = topk_idx if topk_idx.dtype in (torch.int32, torch.int64) else topk_idx.long()
     sel_blk_all = pos_all[:, None] > last_tok[topk_l]
     # the keep mask and the [selected|window] valid mask are per-row functions of
@@ -1596,8 +1592,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # sweeps).
     # `topk_distinct=True` asserts every row of topk_idx holds distinct block
     # ids (the read-everything HCA arm passes an arange expansion), in which
-    # case first_occurrence_mask is provably all-True and is skipped — the keep
-    # mask is then identical to the computed form.
+    # case first_occurrence_mask is provably all-True — the keep mask is then
+    # identical to the computed form.
     if n * topk_l.shape[1] * topk_l.shape[1] <= _FO_FULL_CAP_BYTES:
         keep_all = sel_valid
         if topk_l.shape[1] > 1 and not topk_distinct:
@@ -1679,8 +1675,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             logits = _einsum('qhd,qmhd->qhm', qseg, Kset)
             if scale != 1.0:
                 # x·1.0 is the IEEE identity (and grad·1.0 is bit-identical on
-                # the backward Mul node), so the in-repo scale=1.0 path skips
-                # the multiply kernel outright; non-1.0 callers keep it.
+                # the backward Mul node), so scaling by 1.0 is a no-op.
                 logits.mul_(scale)
             logits.masked_fill_(nvalid, _MINL)
             attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
@@ -1921,8 +1916,8 @@ class HybridAttention(nn.Module):
     def _sink_attn_chunk(self, q_c, k, v, mask_c, sink_view, scale):
         logits = torch.einsum('bnhd,bmhd->bhnm', q_c, k)
         if scale != 1.0:
-            # same IEEE-identity skip as gathered_attention (x·1.0 and its
-            # backward grad·1.0 are bit-identical to no-op).
+            # same IEEE identity as gathered_attention (x·1.0 and its backward
+            # grad·1.0 are bit-identical to no-op).
             logits.mul_(scale)
         logits.add_(mask_c)
         if sink_view is not None:
@@ -3545,8 +3540,7 @@ def signflip_p_floor(n):
         return float('nan')
     if n <= 0:
         return float('nan')
-    # same value as 2/2**n but computed in the float exponent range, so a
-    # large seed count can no longer overflow the intermediate `1 << n`
+    # same value as 2.0 / 2**n, evaluated in the float exponent range.
     return math.ldexp(2.0, -n)
 
 def finite_range(named_values):
@@ -3990,8 +3984,7 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
                 # keep the sorted host copy: per-chunk membership bounds are
                 # integer range queries on a sorted table — searchsorted on the
                 # host gives the same slice the boolean-mask form selected
-                # (host-side integer equivalence, design notes §6.2), and the
-                # count being zero lets the chunk skip its upload AND trunk.
+                # (host-side integer equivalence, design notes §6.2).
                 _sel_host = torch.sort(_sel).values
                 _sel_sorted = _sel_host.to(device)
                 print(f'[eval_ppl] scoring a uniform sample of {_k}/{_flat} target rows (eval_rows={int(eval_rows)}, eval_seed={int(eval_seed)}) — this is a SAMPLED estimate, not the full-set PPL')
@@ -4016,10 +4009,9 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
             _lo = _hi = 0
             if _sel is not None:
                 # Host-side range count on the sorted selection: chunks with
-                # no sampled target contribute nothing to nll/ntok, so both
-                # the H2D and the trunk forward are skipped (the values that
-                # do accumulate are unchanged; the trunk's comp_reg side
-                # effect is unread in eval and overwritten by the next trunk).
+                # no sampled target contribute nothing to nll/ntok (the trunk's
+                # comp_reg side effect is unread in eval and overwritten by the
+                # next trunk).
                 _base = i * _span
                 _wide = min(chunk, int(val_batch.shape[0]) - i) * _span
                 if _wide > 0:
@@ -4492,12 +4484,10 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
     if int(n_sample) < 1:
         raise ValueError(f'compression_report: n_sample must be >= 1, got {n_sample!r}; the report is an average over the sequences it scores, so there is nothing to measure with no sequence scored')
     n_used = min(n_sample, val_batch.shape[0])
-    # inference_mode (the decorator) already covers the forward pass — a nested
-    # no_grad would be a redundant context manager per call, identical values.
+    # inference_mode (the decorator) already covers the forward pass.
     for _r0 in range(0, n_used, 16):
         # as_tensor accepts numpy arrays AND torch tensors (eval_ppl already
-        # uses it); wrapping with asarray first avoids sharing memory with a
-        # caller-owned numpy buffer.
+        # uses it).
         ids = torch.as_tensor(np.asarray(val_batch[_r0:min(_r0 + 16, n_used)])).to(device)
         _ = model(ids, logits_tail=1)
         del ids
@@ -4656,7 +4646,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 _dls = [(li, getattr(blk.attn, 'delta_logit', None)) for li, blk in enumerate(model.blocks)]
                 _dls = [(li, dl) for li, dl in _dls if dl is not None]
                 if _dls:
-                    # one device sync for all layers instead of one per layer
                     # (no_grad: 纯读取 Parameter 的值做日志，不需要 autograd 节点)
                     with torch.no_grad():
                         for li, _v in zip([li for li, _ in _dls], torch.stack([dl for _, dl in _dls]).tolist()):

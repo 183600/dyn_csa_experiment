@@ -557,11 +557,11 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
 
 P3SS_CFG = dict(L.RUN, outdir='results_lm_v10_scale_s', d=128, n_layers=4, n_heads=4, d_head=32, seq_len=512, batch_size=12, n_train_tokens=40000000, steps=8000, warmup=100, eval_every=250, eval_subset=64, variants=['csa_fixed', 'full'])
 P3SL_CFG = dict(L.RUN, outdir='results_lm_v10_scale_l', d=512, n_layers=10, n_heads=16, d_head=32, seq_len=512, batch_size=12, n_train_tokens=40000000, steps=4000, warmup=100, eval_every=250, eval_subset=64, variants=['csa_fixed', 'full'])
-# ---- 规模混杂修复（评审点 1）：等训练 token 与等计算预算的大模型臂 ----
+# ---- 规模对照臂：等训练 token 与等计算量的大模型臂 ----
 # P3SS（d128/L4×8000 步 ≈ 49.15M token）与 P3SL（d512/L10×4000 步 ≈ 24.58M
 # token）的累计 token 相差一倍，原面板的跨规模终点差异不能单独归因于规模。
 # P3SL_TOK：大模型 8000 步，token 与 P3SS 完全对齐；P3SL_FLOP：大模型步数
-# 按参数量比例缩到与 P3SS 总计算预算（~6·N·D 代理）对齐（steps 运行期由
+# 按参数量比例缩到与 P3SS 总计算量（~6·N·D 代理）对齐（steps 运行期由
 # _flop_matched_steps 确定性计算，避免在 import 期构建模型——§7 导入零副作用）。
 P3SL_TOK_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_l8k', steps=8000)
 P3SL_FLOP_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_lflop', steps=None)
@@ -569,7 +569,7 @@ P3SL_FLOP_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_lflop', steps=None)
 def _flop_matched_steps(small_cfg, large_cfg, min_steps=250):
     """Deterministic equal-total-compute step count for the large scale arm.
 
-    计算预算用 6·N·D 代理（N=参数量，D=token 数）：先在 CPU 上按面板配置
+    计算量用 6·N·D 代理（N=参数量，D=token 数）：先在 CPU 上按面板配置
     构建两个面板的模型（不碰 DEVICE、无 RNG 副作用），取两臂（csa/full）
     参数量的平均值，large_steps = small_steps · N_small / N_large。结果打印
     完整推导以供审计；确定性：同一代码下重复调用逐位相同（count_params 是

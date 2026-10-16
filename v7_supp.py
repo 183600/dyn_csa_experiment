@@ -77,7 +77,7 @@ def apply_rope(x, cos, sin, rope_dim):
     x2 = x[..., half:rope_dim]
     # same elementwise expressions, written straight into one output buffer:
     # the two cats only ever copied these values, so the result is
-    # bit-identical while one full-width intermediate (rot) is not allocated.
+    # bit-identical.
     out = torch.empty_like(x)
     out[..., :half] = x1 * cos - x2 * sin
     out[..., half:rope_dim] = x1 * sin + x2 * cos
@@ -276,8 +276,8 @@ class HybridAttentionRoPE(L.HybridAttention):
         # Both branches hold distinct block ids per row: the HCA arm passes the
         # arange expansion, the csa arm's no-replacement indexer selection fills
         # the valid slots with distinct columns and only the tail pads repeat
-        # block 0 (already invalidated by sel_valid).  Declaring it lets
-        # _rope_attn skip first_occurrence_mask; the keep mask is identical.
+        # block 0 (already invalidated by sel_valid) — the keep mask is
+        # identical to the computed form.
         out = self._rope_attn(qn, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink, rd, soft=soft, sel_valid=sel_valid, topk_distinct=True)
         return (self.W_o(out.reshape(T, nh * hd)), gate_mean)
 
@@ -294,12 +294,10 @@ class HybridAttentionRoPE(L.HybridAttention):
             _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
             q_chunk = min(q_chunk, _max_rows)
         cos, sin = rope_cos_sin(hd, rope_dim, L._arange_cache(T, dev), dev, rope_base)
-        # RoPE is applied to the query chunk inside the loop instead of to a
-        # full [T, nh, hd] copy: every rotated position depends only on the
-        # same position of q, so the per-chunk rotation is bit-identical (and
-        # each q position is rotated by exactly one chunk, so q.grad is the
-        # same sum of disjoint contributions) — it just drops the full-width
-        # qr buffer.
+        # RoPE is applied to the query chunk inside the loop: every rotated
+        # position depends only on the same position of q, so the per-chunk
+        # rotation is bit-identical (and each q position is rotated by exactly
+        # one chunk, so q.grad is the same sum of disjoint contributions).
         _lt = last_tok.long()
         bc, bs = (cos[_lt], sin[_lt])
         k_blk_r = apply_rope(k_blk, bc[:, None, :], bs[:, None, :], rope_dim)
@@ -316,8 +314,8 @@ class HybridAttentionRoPE(L.HybridAttention):
         # see exp_lib.gathered_attention: these per-row masks are hoisted under
         # L._FO_FULL_CAP_BYTES; the hoisted values are bitwise identical to the
         # per-chunk forms.  `topk_distinct=True` (the read-everything HCA arm's
-        # arange expansion) makes first_occurrence_mask provably all-True, so
-        # it is skipped — the keep mask is then identical to the computed form.
+        # arange expansion) makes first_occurrence_mask provably all-True — the
+        # keep mask is then identical to the computed form.
         if T * topk_l.shape[1] * topk_l.shape[1] <= L._FO_FULL_CAP_BYTES:
             _keep_all = sel_valid
             if topk_l.shape[1] > 1 and not topk_distinct:
@@ -365,9 +363,8 @@ class HybridAttentionRoPE(L.HybridAttention):
             raw_logits = torch.einsum('qhd,qmhd->qhm', qc, Kset)
             if scale != 1.0:
                 # x·1.0 is the IEEE identity (and its backward Mul node maps
-                # grad·1.0 identically), so the in-repo scale=1.0 path skips
-                # the multiply kernel outright — same values as exp_lib's
-                # gathered_attention.
+                # grad·1.0 identically), so scaling by 1.0 is a no-op — same
+                # values as exp_lib's gathered_attention.
                 raw_logits.mul_(scale)
             if soft is None:
                 logits = raw_logits.masked_fill_(_nvalid, _MINL)
@@ -484,7 +481,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                     pre_blocks = L._hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
             elif self.cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (self.cfg.dynamic and self.cfg.kind != 'hca'):
                 # same batch-level geometry hoist as exp_lib.HybridAttention.forward:
-                # one host transfer per layer instead of B, values identical.
+                # values identical.
                 pre_blocks = self._cut_blocks_batched(x)
             # Preallocate the batch output and write each row's attention output
             # in place — the same transport-only, value-identical form as
