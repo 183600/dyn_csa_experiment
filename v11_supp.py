@@ -47,7 +47,9 @@ def make_guard():
     return g
 
 def P4MT_CFG(seeds=(0, 1, 2, 3, 4, 5)):
-    return dict(V10.P3MT_PAYLOAD, seeds=list(seeds))
+    # P3MT_PAYLOAD 变体列表已扩展（v10 评审响应：从头训练控制），但 P4MT 的语义
+    # 是「既有 RoPE 双臂的种子补齐」——显式钉死原始两臂，不受 v10 扩展影响。
+    return dict(V10.P3MT_PAYLOAD, seeds=list(seeds), variants=['csa_fixed_rope', 'full_rope'])
 
 def run_p4mt(payload=None, guard=None, label='v11 P4MT', par=None):
     if payload is None:
@@ -55,7 +57,9 @@ def run_p4mt(payload=None, guard=None, label='v11 P4MT', par=None):
     return V.run_lenphase(payload, guard=guard, label=label, par=par)
 
 def P4MP_CFG(seeds=(0, 1, 2, 3, 4, 5)):
-    return dict(V10.PROBE, seeds=list(seeds))
+    # 同 P4MT：P4MP 只补既有 uniform 协议的探针 cell；新腐坏模式/NIAH/scratch
+    # 控制由 v12 的 P5MP 负责（避免把 v11 的收官语义静默改掉）。
+    return dict(V10.PROBE, seeds=list(seeds), variants=['csa_fixed_rope', 'full_rope'], modes={'uniform': list(V10.PROBE['rhos'])}, niah=None)
 P4SS_CFG = dict(V10.P3SS_CFG)
 P4SL_CFG = dict(V10.P3SL_CFG)
 P4F_CFG = dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['csa_fixed', 'full'])
@@ -105,7 +109,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
             if r.get('probe_params') is None:
                 _bad_cells.append((_k, 'no probe_params'))
                 continue
-            pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
+            pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), str(r.get('mode', 'uniform')), json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
             grp = cells.setdefault(pk, {})
             if r['seed'] in grp:
                 _dup_cells.append((_k, pk[:4], r['seed']))
@@ -116,10 +120,10 @@ def v11_analysis(out='analysis_v11/stats.json'):
         if _dup_cells:
             print(f'[v11 stats] {len(_dup_cells)} probe record(s) share a (cell, probe_params, seed) identity — their PPL is ambiguous and they are dropped from the pooling: ' + ', '.join((f'{k}' for k, _c, _s in _dup_cells[:4])))
         probe_cells = []
-        for (v, arm, Ln, rho, _pp, _cd, _recipe), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
+        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
-            assert means, (v, arm, Ln, rho)
-            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': json.loads(_pp), '_code': _cd, 'recipe': _recipe, 'mean': float(np.mean(list(means.values()))), 'std': float(np.std(list(means.values()), ddof=1)) if len(means) > 1 else 0.0, 'n': len(means)})
+            assert means, (v, arm, Ln, rho, mode)
+            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': json.loads(_pp), '_code': _cd, 'recipe': _recipe, 'mean': float(np.mean(list(means.values()))), 'std': float(np.std(list(means.values()), ddof=1)) if len(means) > 1 else 0.0, 'n': len(means)})
         contrasts = {}
 
         # O(1) lookup instead of a full probe_cells scan per contrast arm; the
@@ -127,10 +131,12 @@ def v11_analysis(out='analysis_v11/stats.json'):
         # ambiguity/unambiguous outcomes (and the picked cell) are unchanged.
         _cell_idx = {}
         for c in probe_cells:
-            _cell_idx.setdefault((c['variant'], c['arm'], c['eval_len'], c['rho']), []).append(c)
+            _cell_idx.setdefault((c['variant'], c['arm'], c['eval_len'], c['rho'], c['mode']), []).append(c)
 
         def cell_mean(v, arm, Ln, rho):
-            hits = _cell_idx.get((v, arm, Ln, rho), [])
+            # v11 的收官语义只覆盖 uniform 协议的既有臂；v12 引入的新腐坏
+            # 模式/NIAH cell 不进入 v11 的任何统计（它们属于 v12 的分析）。
+            hits = _cell_idx.get((v, arm, Ln, rho, 'uniform'), [])
             if not hits:
                 return {}
             if len(hits) > 1:
@@ -434,7 +440,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
             for v, arm in arm_order:
                 row = []
                 for rho in rhos:
-                    m = [c for c in cells if (c['variant'], c['arm'], c['eval_len'], c['rho']) == (v, arm, Ln, rho)]
+                    m = [c for c in cells if (c['variant'], c['arm'], c['eval_len'], c['rho'], c.get('mode', 'uniform')) == (v, arm, Ln, rho, 'uniform')]
                     row.append(f'{m[0]['mean']:.2f}' if len(m) == 1 else '—')
                     if len(m) > 1:
                         print(f'[report] {v}+{arm} L={Ln} rho={rho}: {len(m)} parameterisations of the cell exist — the table omits the cell (the paired test refuses it too)')

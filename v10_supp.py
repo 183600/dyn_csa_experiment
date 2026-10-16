@@ -48,15 +48,43 @@ def make_guard():
                     print(f'[v10] WARNING: cannot read {src} ({type(e).__name__}: {e}) — this run starts UNCALIBRATED (the first admission uses the conservative default)')
     return g
 P3MT_PAYLOAD = dict(outdir='results_v10_mech', variants=['csa_fixed_rope', 'full_rope'], eval_lens=[512, 1024, 2048, 4096], steps=3000, train_len=512, vocab=8192)
-PROBE = dict(outdir='results_v10_mech', ckpt_dir='results_v10_mech/ckpt', summary='results_v10_mech/distractor.json', variants=['csa_fixed_rope', 'full_rope'], seeds=[0, 1, 2], eval_lens=[2048, 4096], rhos=[0.0, 0.125, 0.25, 0.5], target=512, n_seq=16, chunk=4, arms=['dense', 'learned', 'randidx', 'allblocks'])
+# 从头训练的选择器对照（评审点 2）：与 csa_fixed_rope / full_rope 完全同一配方
+# （3000 步、同数据、同种子）训练，唯一差异是选择方式本身。P3MT 的 variants
+# 扩入它们后，既有 ckpt 的 recipe 逐字节不变（recipe 只含 per-variant 的 mr 与
+# 语料指纹），resume 不会重训已完成的臂。
+SCRATCH_CONTROLS = ['csa_fixed_rope_randidx', 'csa_fixed_rope_allblocks']
+P3MT_PAYLOAD_CONTROLS = dict(P3MT_PAYLOAD, variants=SCRATCH_CONTROLS)
+# 干扰注入的腐坏模式（评审点 3）：
+#   uniform —— 既有协议：远端 ρ 比例 token 替换为词表均匀随机 token（历史
+#              cell 键不带 mode 后缀，完全向后兼容）；
+#   natural —— 自然干扰：被替换 token 取自同一验证面板的另一条真实序列的
+#              相同位置（保持自然语言统计、破坏与目标的相关性）；
+#   mask    —— 远端整体屏蔽为 <pad>（保留长度与位置，移除信息）：测「干净
+#              远端上下文到底带来多少收益」；
+#   delete  —— 远端整体删除（输入只剩目标区，RoPE 相对位置自洽）：同上
+#              问题的另一口径。
+PROBE_MODES = {'uniform': [0.0, 0.125, 0.25, 0.5], 'natural': [0.125, 0.25, 0.5], 'mask': [1.0], 'delete': [1.0]}
+NIAH_NATURAL = dict(summary='results_v10_mech/niah_natural.json', n_pairs=8, n_seq=16, conditions=['clean', 'distract'], rho=0.5)
+PROBE = dict(outdir='results_v10_mech', ckpt_dir='results_v10_mech/ckpt', summary='results_v10_mech/distractor.json', variants=['csa_fixed_rope', 'full_rope'], seeds=[0, 1, 2], eval_lens=[2048, 4096], rhos=[0.0, 0.125, 0.25, 0.5], modes=dict(PROBE_MODES), target=512, n_seq=16, chunk=4, arms=['dense', 'learned', 'randidx', 'allblocks'], arm_overrides={}, niah=dict(NIAH_NATURAL))
 
-def _arm_of(variant, arm):
+def _arm_of(variant, arm, cfg=None):
+    _ov = (cfg or {}).get('arm_overrides') or {}
+    if variant in _ov:
+        return arm in _ov[variant]
     if variant == 'full_rope':
         return arm == 'dense'
     return arm in ('learned', 'randidx', 'allblocks')
 
+MASK_TOKEN_ID = 0  # <pad>：mask 模式的远端屏蔽填充 token
+
 @torch.inference_mode()
-def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, chunk_mem=None):
+def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, chunk_mem=None, mode='uniform'):
+    """Score the clean 512-token target zone under a corrupted far context.
+
+    mode='uniform'（默认）与历史实现逐字节一致：同一 (eval_len, 行号, ρ)
+    播种的均匀随机替换、同 token 重采样、同上传与同评分路径。其余模式见
+    PROBE_MODES 注释。所有模式的腐坏对同一 (行, ρ, mode) 在臂间逐字节相同
+    （只依赖行号与配置，不依赖臂/模型种子），保持严格配对。"""
     target = cfg['target']
     vocab = int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
     # corruptible context positions: input positions outside the scored
@@ -64,32 +92,53 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
     # eval_len - target (it predicts ids[eval_len - target + 1]), so the
     # clean context spans ids[0 : eval_len - target]
     n_far = eval_len - target
-    k = int(round(rho * n_far))
     nll_sum = []
     n_tok = []
     _sum_parts = []
     n_ch = max(1, int(cfg['chunk']))
     if chunk_mem is not None:
         n_ch = max(1, min(n_ch, int(chunk_mem.get(eval_len, n_ch))))
+    if mode not in ('uniform', 'natural', 'mask', 'delete'):
+        raise ValueError(f'_distractor_ppls: unknown corruption mode {mode!r} (expected uniform/natural/mask/delete)')
+    if mode in ('mask', 'delete') and abs(float(rho) - 1.0) > 1e-9:
+        raise ValueError(f"mode {mode!r} is an all-or-nothing condition and only admits rho=1.0 (got {rho!r}); partial masking is a different question and is not this probe")
     i = 0
     while i < n_seq:
         j = min(i + n_ch, n_seq)
         rows = []
         for jj in range(i, j):
-            _rk = (eval_len, jj, rho, vocab, int(cfg['target']))
+            _rk = (eval_len, jj, float(rho), vocab, int(cfg['target']), mode)
             _row = row_cache.get(_rk) if row_cache is not None else None
             if _row is None:
-                ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
-                if k > 0:
-                    rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
-                    pos = rng.choice(n_far, size=k, replace=False)
-                    _draw = rng.integers(0, vocab, size=k)
-                    _same = _draw == ids[pos]
-                    while _same.any():
-                        _draw[_same] = rng.integers(0, vocab, size=int(_same.sum()))
-                        _same = _draw == ids[pos]
-                    ids[pos] = _draw
-                _row = ids
+                if mode == 'delete':
+                    # the far context is REMOVED, not filled: the model sees only
+                    # the final target+1 tokens (RoPE is relative, so the kept
+                    # tokens' pairwise structure is unchanged)
+                    _row = np.asarray(val_ids[jj, eval_len - target:eval_len + 1], dtype=np.int64).copy()
+                else:
+                    ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
+                    k = int(round(rho * n_far))
+                    if mode == 'mask':
+                        ids[:n_far] = MASK_TOKEN_ID
+                    elif k > 0:
+                        if mode == 'uniform':
+                            rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
+                            pos = rng.choice(n_far, size=k, replace=False)
+                            _draw = rng.integers(0, vocab, size=k)
+                            _same = _draw == ids[pos]
+                            while _same.any():
+                                _draw[_same] = rng.integers(0, vocab, size=int(_same.sum()))
+                                _same = _draw == ids[pos]
+                            ids[pos] = _draw
+                        else:
+                            # natural: paired other-row natural tokens at the same
+                            # seeded position grid; collisions with the original
+                            # token are KEPT (they are part of natural statistics)
+                            rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
+                            pos = rng.choice(n_far, size=k, replace=False)
+                            _src = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
+                            ids[pos] = np.asarray(val_ids[_src, pos], dtype=np.int64)
+                    _row = ids
                 if row_cache is not None:
                     row_cache[_rk] = _row
             rows.append(_row)
@@ -141,7 +190,7 @@ def _probe_fingerprint(cfg):
 def _fp_norm(p):
     if not isinstance(p, dict):
         return p
-    return {k: v for k, v in p.items() if k != 'chunk'}
+    return {k: v for k, v in p.items() if k not in ('chunk', 'mode')}
 
 def _recipe_norm(recipe):
     if not isinstance(recipe, str):
@@ -150,8 +199,153 @@ def _recipe_norm(recipe):
     # mlp_match_ref field, not everything up to the '-' inside the df hashes.
     return re.sub(r'_mr[^_]*', '_mr*', recipe)
 
-def _probe_params_current(rec, fp):
-    return isinstance(rec, dict) and _fp_norm(rec.get('probe_params')) == _fp_norm(fp)
+def _probe_params_current(rec, fp, mode='uniform'):
+    """Mode-aware probe-param currency.  uniform cells keep the historical
+    fingerprint exactly (records without a 'mode' field are uniform), so the
+    v10/v11 uniform panels stay resumable; non-uniform cells additionally carry
+    their mode inside probe_params and only match records of the same mode."""
+    if not isinstance(rec, dict) or not isinstance(rec.get('probe_params'), dict):
+        return False
+    if rec['probe_params'].get('mode', 'uniform') != mode:
+        return False
+    return _fp_norm(rec['probe_params']) == _fp_norm(fp)
+
+def _probe_defs(cfg):
+    """The (eval_len, rho, mode) grid of a probe config.  Absent 'modes' means
+    the legacy uniform-only protocol (cfg['rhos'])."""
+    _modes = cfg.get('modes') or {'uniform': list(cfg['rhos'])}
+    out = []
+    for _mode, _rhos in _modes.items():
+        for Ln in cfg['eval_lens']:
+            for rho in _rhos:
+                out.append((int(Ln), float(rho), str(_mode)))
+    return out
+
+def _niah_cell_key(v, seed, arm, Ln, cond):
+    return f'{v}::s{seed}::{arm}::L{Ln}::niah::{cond}'
+
+def _niah_fingerprint(cfg):
+    _n = cfg.get('niah') or {}
+    _need = max((int(_x) for _x in cfg['eval_lens'])) + 1
+    _tl = int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
+    return {'n_seq': int(_n.get('n_seq', cfg['n_seq'])), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'n_pairs': int(_n.get('n_pairs', 8)), 'val_seq_len': max(_tl, _need), 'stat': 'niah_natural_v1'}
+
+def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, condition, rho=0.5):
+    """Far-necessary-information task on NATURAL text (review point 3).
+
+    每条序列 = [远端自然文本（内嵌 n_pairs 个 key→value 耦合）] + [目标区：
+    自然文本收尾 + n_pairs 个查询 key]。查询 key 之后紧跟的正确 token 是
+    远端出现过的配对 value——正确预测必须依赖远端信息。`distract` 条件在
+    腐坏网格（与 uniform 模式同一播种）上把远端自然 token 换成另一行的
+    自然 token（自然语言干扰），但**绝不腐坏耦合位置**——针保持干净，
+    干扰只加在草料上。所有随机性由 (seed, 行号) 决定，臂间逐字节一致。
+    Returns (ids[n_seq, eval_len+1], q_cols, q_vals, stats)：q_cols 为
+    **目标尾区内相对的 logits 列号**（预测 answer 的那一列），q_vals 为正确
+    答案 token。"""
+    rng = np.random.default_rng(seed)
+    n_far = eval_len - target
+    if n_far < 4 * n_pairs + 8:
+        raise ValueError(f'NIAH-natural: far region ({n_far} tokens) too small for {n_pairs} couples at eval_len={eval_len}')
+    if 2 * n_pairs > target - 1:
+        raise ValueError(f'NIAH-natural: {n_pairs} query couples do not fit inside the {target}-token target zone')
+    key_hi = max(4, vocab // 4)
+    val_lo = 3 * vocab // 4
+    rows = np.asarray(val_ids[:n_seq, :eval_len + 1], dtype=np.int64).copy()
+    q_cols = np.zeros((n_seq, n_pairs), dtype=np.int64)
+    q_vals = np.zeros((n_seq, n_pairs), dtype=np.int64)
+    dists = np.zeros((n_seq, n_pairs), dtype=np.int64)
+    _src_rows = (np.arange(n_seq) + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
+    for i in range(n_seq):
+        keys = rng.choice(np.arange(4, key_hi), size=n_pairs, replace=False)
+        vals = rng.choice(np.arange(val_lo, vocab), size=n_pairs, replace=False)
+        band = n_far // n_pairs
+        couple_pos = set()
+        for jp in range(n_pairs):
+            kp = jp * band + (band // 2 if band > 2 else 1)
+            kp = min(kp, n_far - 2)
+            vp = kp + 1
+            rows[i, kp] = keys[jp]
+            rows[i, vp] = vals[jp]
+            couple_pos.update((kp, vp))
+        if condition == 'distract':
+            k = int(round(rho * n_far))
+            if k > 0:
+                crng = np.random.default_rng((eval_len * 1000003 + i * 10007) * 1048576 + int(round(rho * 1048576)))
+                pos = crng.choice(n_far, size=k, replace=False)
+                pos = np.array([p for p in pos if int(p) not in couple_pos], dtype=np.int64)
+                if pos.size:
+                    rows[i, pos] = np.asarray(val_ids[_src_rows[i], pos], dtype=np.int64)
+        order = rng.permutation(n_pairs)
+        qz = eval_len + 1 - 2 * n_pairs
+        for j, pj in enumerate(order):
+            kp = qz + 2 * j
+            rows[i, kp] = keys[pj]
+            rows[i, kp + 1] = vals[pj]  # the answer slot holds the gold token
+            # logits columns are RELATIVE to the target tail: the model returns
+            # logits for input positions (eval_len - target)..(eval_len - 1),
+            # so the column that predicts the answer (position kp+1) is
+            # kp - (eval_len - target).
+            q_cols[i, j] = kp - (eval_len - target)
+            q_vals[i, j] = vals[pj]
+            _far_kp = pj * band + (band // 2 if band > 2 else 1)
+            _far_kp = min(_far_kp, n_far - 2)
+            dists[i, j] = kp - (_far_kp + 1)
+    stats = {'n_pairs': int(n_pairs), 'eval_len': int(eval_len), 'target': int(target), 'condition': str(condition), 'rho': float(rho) if condition == 'distract' else 0.0, 'dist_mean': float(dists.mean()), 'dist_min': int(dists.min()), 'dist_max': int(dists.max()), 'couple_positions_excluded_from_distract': True}
+    return (rows, q_cols, q_vals, stats)
+
+@torch.inference_mode()
+def _niah_ppls(model, val_ids, eval_len, n_seq, cfg, condition, row_cache=None, chunk_mem=None):
+    """Evaluate the NIAH-natural task: top-1 accuracy + mean answer NLL."""
+    _n = cfg.get('niah') or {}
+    n_pairs = int(_n.get('n_pairs', 8))
+    vocab = int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
+    target = int(cfg['target'])
+    rho = float(_n.get('rho', 0.5)) if condition == 'distract' else 0.0
+    _key = (eval_len, condition, n_pairs, vocab, target, float(rho))
+    _built = row_cache.get(_key) if row_cache is not None else None
+    if _built is None:
+        _built = _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed=(eval_len * 7919 + 104729), condition=condition, rho=rho)
+        if row_cache is not None:
+            row_cache[_key] = _built
+    ids_np, q_cols, q_vals, stats = _built
+    n_ch = max(1, int(cfg['chunk']))
+    if chunk_mem is not None:
+        n_ch = max(1, min(n_ch, int(chunk_mem.get((eval_len, 'niah'), n_ch))))
+    n_correct = 0
+    n_q = 0
+    nll_parts = []
+    i = 0
+    while i < n_seq:
+        j = min(i + n_ch, n_seq)
+        ids = L._h2d_async(ids_np[i:j], torch.int64, DEVICE)
+        try:
+            logits = model(ids[:, :-1], logits_tail=target)
+        except RuntimeError as _oe:
+            del ids
+            if 'out of memory' in str(_oe).lower() and n_ch > 1:
+                if DEVICE.type == 'cuda':
+                    torch.cuda.empty_cache()
+                n_ch = max(1, n_ch // 2)
+                if chunk_mem is not None:
+                    chunk_mem[(eval_len, 'niah')] = n_ch
+                print(f'[niah-nat] eval device-memory exhaustion; retrying with chunk={n_ch}')
+                continue
+            raise
+        _lc = torch.as_tensor(q_cols[i:j], dtype=torch.long, device=logits.device)
+        _lv = L._h2d_async(q_vals[i:j], torch.int64, DEVICE)
+        _lg = torch.gather(logits, 1, _lc.unsqueeze(-1).expand(-1, -1, logits.size(-1)))
+        _nll = F.cross_entropy(_lg.reshape(-1, vocab), _lv.reshape(-1), reduction='none').view(j - i, n_pairs)
+        n_correct += int((_lg.argmax(-1) == _lv).sum())
+        n_q += int(_lv.numel())
+        nll_parts.append(_nll)
+        del ids, logits, _lg, _lv, _nll
+        if chunk_mem is not None:
+            chunk_mem[(eval_len, 'niah')] = n_ch
+        i = j
+    if not nll_parts:
+        return {'acc': float('nan'), 'nll': float('nan'), 'n': 0, **stats}
+    _nll_all = torch.cat(nll_parts)
+    return {'acc': float(n_correct) / max(n_q, 1), 'nll': float(_nll_all.mean()), 'n': int(n_q), **stats}
 
 def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     """Run exactly ONE (variant, seed) probe cell: load the trained checkpoint
@@ -180,7 +374,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         print(f'[p3mp] SKIP {v} s{seed}: no checkpoint {ck} (run phase P3MT first)')
         out['status'] = 'skipped_no_ckpt'
         return out
-    _defs = [(Ln, rho) for Ln in cfg['eval_lens'] for rho in cfg['rhos']]
+    _defs = _probe_defs(cfg)
     try:
         d = V._load_ckpt(ck)
     except Exception as _cle:
@@ -205,23 +399,40 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         return out
     _ck_recipe = d.get('recipe')
 
-    def _cell_stale(_key, _fp_x, _summary=None):
+    def _cell_stale(_key, _fp_x, _summary=None, _mode='uniform'):
         _rec = (_summary if _summary is not None else L.locked_json_read(spath)).get(_key)
-        return not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_x) and (_rec or {}).get('recipe') == _ck_recipe)
+        return not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_x, _mode) and (_rec or {}).get('recipe') == _ck_recipe)
     _vocab_ck = int(d.get('vocab', 8192))
     if cfg.get('vocab') is not None and int(cfg['vocab']) != _vocab_ck:
         print(f"[p3mp] {v} s{seed}: probe cfg vocab={int(cfg['vocab'])} differs from the checkpoint's vocab={_vocab_ck} — using the checkpoint's (the model is what is being scored)")
     _pcfg = dict(cfg, vocab=_vocab_ck)
     _fp = _probe_fingerprint(_pcfg)
+    _niah_cfg = cfg.get('niah') or None
+    _nspath = _niah_cfg.get('summary') if _niah_cfg else None
+    _nfp = _niah_fingerprint(_pcfg) if _niah_cfg else None
+    _nconds = list(_niah_cfg.get('conditions', ['clean', 'distract'])) if _niah_cfg else []
+
+    def _niah_stale(_key, _summary_n):
+        _rec = (_summary_n or {}).get(_key)
+        return not (isinstance(_rec, dict) and (_rec.get('task') == 'niah_natural') and (isinstance(_rec.get('acc'), (int, float)) and (not isinstance(_rec.get('acc'), bool)) and math.isfinite(float(_rec['acc']))) and (isinstance(_rec.get('nll'), (int, float)) and (not isinstance(_rec.get('nll'), bool)) and math.isfinite(float(_rec['nll']))) and _rec.get('_code') == V.CKPT_CODE and _rec.get('probe_params') == _nfp and _rec.get('recipe') == _ck_recipe)
     _summary = L.locked_json_read(spath)
+    _summary_n = L.locked_json_read(_nspath) if _nspath else {}
     _todo = False
     for arm in cfg['arms']:
-        if not _arm_of(v, arm):
+        if not _arm_of(v, arm, cfg):
             continue
-        for Ln, rho in _defs:
-            if _cell_stale(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}', _fp, _summary):
+        for Ln, rho, mode in _defs:
+            if _cell_stale(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}' + (f'::{mode}' if mode != 'uniform' else ''), _fp, _summary, mode):
                 _todo = True
                 break
+        if (not _todo) and _nspath:
+            for Ln in cfg['eval_lens']:
+                for cond in _nconds:
+                    if _niah_stale(_niah_cell_key(v, seed, arm, Ln, cond), _summary_n):
+                        _todo = True
+                        break
+                if _todo:
+                    break
         if _todo:
             break
     if not _todo:
@@ -232,7 +443,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     _row_cache = {}
     _chunk_mem = {}
     for arm in cfg['arms']:
-        if not _arm_of(v, arm):
+        if not _arm_of(v, arm, cfg):
             continue
         if guard is not None and not guard.can_start(0):
             print(f'[cap] SKIP probe {v} s{seed} arm {arm}: headroom exhausted ({max(guard.remaining_hours(), 0.0):.2f} h left) — re-run the phase to continue')
@@ -240,16 +451,20 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
                 out['status'] = 'skipped_cap'
             break
 
-        def _cell_key(_Ln, _rho, _arm=arm, _v=v, _seed=seed):
-            return f'{_v}::s{_seed}::{_arm}::L{_Ln}::r{_rho}'
-        _stale_param = [f'L{Ln}::r{rho}' for Ln, rho in _defs if (_summary.get(_cell_key(Ln, rho)) or {}).get('probe_params') is not None and (not _probe_params_current(_summary.get(_cell_key(Ln, rho)), _fp))]
+        def _cell_key(_Ln, _rho, _mode='uniform', _arm=arm, _v=v, _seed=seed):
+            _k = f'{_v}::s{_seed}::{_arm}::L{_Ln}::r{_rho}'
+            if _mode != 'uniform':
+                _k += f'::{_mode}'
+            return _k
+        _stale_param = [f'L{Ln}::r{rho}::{mode}' for Ln, rho, mode in _defs if (_summary.get(_cell_key(Ln, rho, mode)) or {}).get('probe_params') is not None and (not _probe_params_current(_summary.get(_cell_key(Ln, rho, mode)), _fp, mode))]
         if _stale_param:
             print(f'[p3mp] {v} s{seed} {arm}: re-probing {len(_stale_param)} cell(s) whose stored probe parameters differ from the current config ({', '.join(_stale_param[:3])}{('…' if len(_stale_param) > 3 else '')})')
-        _stale_w = [f'L{Ln}::r{rho}' for Ln, rho in _defs if (_summary.get(_cell_key(Ln, rho)) or {}).get('ppl_mean') is not None and (_summary.get(_cell_key(Ln, rho)) or {}).get('recipe') != _ck_recipe]
+        _stale_w = [f'L{Ln}::r{rho}::{mode}' for Ln, rho, mode in _defs if (_summary.get(_cell_key(Ln, rho, mode)) or {}).get('ppl_mean') is not None and (_summary.get(_cell_key(Ln, rho, mode)) or {}).get('recipe') != _ck_recipe]
         if _stale_w:
             print(f'[p3mp] {v} s{seed} {arm}: re-probing {len(_stale_w)} cell(s) that were measured under different weights (stored recipe does not match the current checkpoint) — reusing them would quote the old weights')
-        cells = [(Ln, rho) for Ln, rho in _defs if _cell_stale(_cell_key(Ln, rho), _fp, _summary)]
-        if not cells:
+        cells = [(Ln, rho, mode) for Ln, rho, mode in _defs if _cell_stale(_cell_key(Ln, rho, mode), _fp, _summary, mode)]
+        _niah_cells = [(Ln, cond) for Ln in cfg['eval_lens'] for cond in _nconds if _niah_stale(_niah_cell_key(v, seed, arm, Ln, cond), _summary_n)] if _nspath else []
+        if not cells and not _niah_cells:
             continue
         if model is None:
             _arch = (int(d.get('d', 256)), int(d.get('n_layers', 6)), int(d.get('n_heads', 8)), int(d.get('d_head', 32)))
@@ -266,18 +481,25 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             ac.index_topk = 10 ** 6 if arm == 'allblocks' else getattr(c0, 'index_topk', 32)
         t0 = time.time()
         _pending = {}
-        for _ci, (Ln, rho) in enumerate(cells, 1):
-            key = _cell_key(Ln, rho)
-            nll_sum, n_tok = _distractor_ppls(model, val_ids, Ln, rho, _pcfg['n_seq'], _pcfg, row_cache=_row_cache, chunk_mem=_chunk_mem)
+        for _ci, (Ln, rho, mode) in enumerate(cells, 1):
+            key = _cell_key(Ln, rho, mode)
+            nll_sum, n_tok = _distractor_ppls(model, val_ids, Ln, rho, _pcfg['n_seq'], _pcfg, row_cache=_row_cache, chunk_mem=_chunk_mem, mode=mode)
             cell_ppl = _cell_ppl(nll_sum, n_tok)
             per_seq = [float('inf') if s / t > 709.0 else math.exp(s / t) for s, t in zip(nll_sum, n_tok)]
-            _pending[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp, 'recipe': _ck_recipe}
+            _fp_rec = dict(_fp, mode=mode) if mode != 'uniform' else _fp
+            _pending[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp_rec, 'recipe': _ck_recipe}
             print(f'  [p3mp] {key:44s} PPL={cell_ppl:8.2f}', flush=True)
             if _ci % 8 == 0:
                 L.locked_json_update(spath, (lambda s, _p=dict(_pending): (s.update(_p), s)[1]), indent=1)
                 _pending.clear()
         if _pending:
             L.locked_json_update(spath, (lambda s, _p=dict(_pending): (s.update(_p), s)[1]), indent=1)
+        for Ln, cond in _niah_cells:
+            res = _niah_ppls(model, val_ids, Ln, _pcfg['n_seq'], _pcfg, cond, row_cache=_row_cache, chunk_mem=_chunk_mem)
+            key = _niah_cell_key(v, seed, arm, Ln, cond)
+            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), '_code': V.CKPT_CODE, 'probe_params': _nfp, 'recipe': _ck_recipe}
+            L.locked_json_update(_nspath, (lambda s, _p=dict({key: rec}): (s.update(_p), s)[1]), indent=1)
+            print(f"  [niah] {key:48s} acc={rec['acc']:.3f} nll={rec['nll']:.3f}", flush=True)
         if guard is not None:
             guard.record_run(time.time() - t0, 0, 0, 0, 0, 0)
     if model is not None:
@@ -315,7 +537,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
         except Exception as _e:
             print(f'[p3mp] FATAL: {_msp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — without it no checkpoint can be attributed to a training recipe, so the probe would score unknown weights.  Move it aside to re-train.')
             raise
-    print(f'[p3mp] val slice {val_ids.shape}, arms={cfg['arms']}, rhos={cfg['rhos']}')
+    print(f'[p3mp] val slice {val_ids.shape}, arms={cfg['arms']}, modes={cfg.get('modes') or {'uniform': cfg['rhos']}}' + (f", niah={cfg['niah']}" if cfg.get('niah') else ''))
     cells = [(v, seed) for v in cfg['variants'] for seed in cfg['seeds']]
     _ran_parallel = False
     if len(cells) > 1:
@@ -335,7 +557,41 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
 
 P3SS_CFG = dict(L.RUN, outdir='results_lm_v10_scale_s', d=128, n_layers=4, n_heads=4, d_head=32, seq_len=512, batch_size=12, n_train_tokens=40000000, steps=8000, warmup=100, eval_every=250, eval_subset=64, variants=['csa_fixed', 'full'])
 P3SL_CFG = dict(L.RUN, outdir='results_lm_v10_scale_l', d=512, n_layers=10, n_heads=16, d_head=32, seq_len=512, batch_size=12, n_train_tokens=40000000, steps=4000, warmup=100, eval_every=250, eval_subset=64, variants=['csa_fixed', 'full'])
-PHASES = [('P3MT', 'lenphase', P3MT_PAYLOAD, [0, 1, 2]), ('P3MP', 'probe', PROBE, None), ('P3T', 'run', V9.P2T_CFG, [2, 3]), ('P3SS', 'run', P3SS_CFG, [0, 1]), ('P3SL', 'run', P3SL_CFG, [0, 1])]
+# ---- 规模混杂修复（评审点 1）：等训练 token 与等计算预算的大模型臂 ----
+# P3SS（d128/L4×8000 步 ≈ 49.15M token）与 P3SL（d512/L10×4000 步 ≈ 24.58M
+# token）的累计 token 相差一倍，原面板的跨规模终点差异不能单独归因于规模。
+# P3SL_TOK：大模型 8000 步，token 与 P3SS 完全对齐；P3SL_FLOP：大模型步数
+# 按参数量比例缩到与 P3SS 总计算预算（~6·N·D 代理）对齐（steps 运行期由
+# _flop_matched_steps 确定性计算，避免在 import 期构建模型——§7 导入零副作用）。
+P3SL_TOK_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_l8k', steps=8000)
+P3SL_FLOP_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_lflop', steps=None)
+
+def _flop_matched_steps(small_cfg, large_cfg, min_steps=250):
+    """Deterministic equal-total-compute step count for the large scale arm.
+
+    计算预算用 6·N·D 代理（N=参数量，D=token 数）：先在 CPU 上按面板配置
+    构建两个面板的模型（不碰 DEVICE、无 RNG 副作用），取两臂（csa/full）
+    参数量的平均值，large_steps = small_steps · N_small / N_large。结果打印
+    完整推导以供审计；确定性：同一代码下重复调用逐位相同（count_params 是
+    形状的纯函数）。步数下限 250（warmup=100 时余下学习率调度仍有意义）。"""
+    counts = {}
+    deriv = []
+    for _tag, _cfg in (('small', small_cfg), ('large', large_cfg)):
+        _per = {}
+        for _v in _cfg['variants']:
+            _cfgs = L.make_layer_cfgs(_cfg['n_layers'], _v)
+            _m = L.SmallGPT(8192, _cfg['d'], _cfg['n_layers'], _cfg['n_heads'], _cfg['d_head'], _cfg['seq_len'], _cfgs)
+            _n = L.count_params(_m)
+            _per[_v] = int(_n)
+            del _m
+        counts[_tag] = float(np.mean(list(_per.values())))
+        deriv.append(f'{_tag}: { { _v: int(_n) for _v, _n in _per.items() } } (mean {counts[_tag]:.0f})')
+    _ratio = counts['small'] / counts['large']
+    steps = max(int(min_steps), int(round(small_cfg['steps'] * _ratio)))
+    print(f'[v10] flop-matched steps: {'; '.join(deriv)}; ratio={_ratio:.6g} -> large_steps={steps} (floored at {min_steps})')
+    return steps
+
+PHASES = [('P3MT', 'lenphase', P3MT_PAYLOAD, [0, 1, 2]), ('P3MTC', 'lenphase', P3MT_PAYLOAD_CONTROLS, [0, 1, 2]), ('P3MP', 'probe', PROBE, None), ('P3T', 'run', V9.P2T_CFG, [2, 3]), ('P3SS', 'run', P3SS_CFG, [0, 1]), ('P3SL', 'run', P3SL_CFG, [0, 1]), ('P3SL2', 'run', P3SL_TOK_CFG, [0, 1]), ('P3SL3', 'run', P3SL_FLOP_CFG, [0, 1])]
 
 def run_phase(name, guard, par=None):
     V9._install_ckpt_patch()
@@ -346,6 +602,9 @@ def run_phase(name, guard, par=None):
             continue
         if seeds:
             payload = dict(payload, seeds=list(seeds))
+        if pname == 'P3SL3' and payload.get('steps') is None:
+            # equal-compute arm: steps derived deterministically at run time
+            payload = dict(payload, steps=_flop_matched_steps(P3SS_CFG, payload))
         if isinstance(_ctx, dict):
             _ctx = dict(_ctx, module='v10_supp', ckpt_install=True, ckpt_flag=bool(_ctx.get('ckpt_flag')) or pname == 'P3T')
         if kind == 'lenphase':
@@ -548,7 +807,7 @@ def _tokens_per_step(outdir, fallback=None, raw=None):
     return float(rates[0])
 
 def _scale_crossovers():
-    panels = {'d128_L4': dict(outdir='results_lm_v10_scale_s', d=128, n_layers=4, batch=12, seq=512), 'd256_L6': dict(outdir='results_lm_v3_long', d=256, n_layers=6, batch=12, seq=512), 'd384_L8': dict(outdir='results_lm_v5_scale', d=384, n_layers=8, batch=8, seq=1024), 'd512_L10': dict(outdir='results_lm_v10_scale_l', d=512, n_layers=10, batch=12, seq=512)}
+    panels = {'d128_L4': dict(outdir='results_lm_v10_scale_s', d=128, n_layers=4, batch=12, seq=512), 'd256_L6': dict(outdir='results_lm_v3_long', d=256, n_layers=6, batch=12, seq=512), 'd384_L8': dict(outdir='results_lm_v5_scale', d=384, n_layers=8, batch=8, seq=1024), 'd512_L10': dict(outdir='results_lm_v10_scale_l', d=512, n_layers=10, batch=12, seq=512), 'd512_L10_tok': dict(outdir='results_lm_v10_scale_l8k', d=512, n_layers=10, batch=12, seq=512), 'd512_L10_flop': dict(outdir='results_lm_v10_scale_lflop', d=512, n_layers=10, batch=12, seq=512)}
     out = {}
     for label, p in panels.items():
         _raw = None
@@ -619,6 +878,123 @@ def _scale_crossovers():
         out[label] = entry
     return out
 
+_SCALE_PANEL_SPECS = {'P3SS': dict(outdir='results_lm_v10_scale_s', d=128, n_layers=4, batch=12, seq=512, steps=8000, note='small arm, 8000 steps (~49.15M tokens)'), 'P3SL': dict(outdir='results_lm_v10_scale_l', d=512, n_layers=10, batch=12, seq=512, steps=4000, note='large arm as originally run, 4000 steps (~24.58M tokens — HALF the small arm budget)'), 'P3SL_TOK': dict(outdir='results_lm_v10_scale_l8k', d=512, n_layers=10, batch=12, seq=512, steps=8000, note='token-matched large arm, 8000 steps (~49.15M tokens)'), 'P3SL_FLOP': dict(outdir='results_lm_v10_scale_lflop', d=512, n_layers=10, batch=12, seq=512, steps=None, note='compute-matched large arm (steps = 8000 * N_small/N_large, floored at 250)')}
+
+def _panel_endpoint(hists, tps):
+    """Final-eval gap + token count of a panel: csa_fixed vs full, seed-paired."""
+    common = sorted(set(hists['csa_fixed']) & set(hists['full']))
+    if not common:
+        return None
+    per_seed = {}
+    for s in common:
+        da, db = (dict(hists['csa_fixed'][s]), dict(hists['full'][s]))
+        steps = sorted(set(da) & set(db))
+        if not steps:
+            continue
+        last = steps[-1]
+        per_seed[s] = {'step': int(last), 'gap': float(da[last] - db[last]), 'ppl_csa': float(da[last]), 'ppl_full': float(db[last])}
+    if not per_seed:
+        return None
+    dl = [per_seed[s]['gap'] for s in sorted(per_seed)]
+    out = V.exact_sign_permutation(dl)
+    out['seeds'] = sorted(per_seed)
+    out['tokens'] = (float(per_seed[max(per_seed)]['step']) * tps) if tps else None
+    out['per_seed'] = per_seed
+    return out
+
+def _panel_convergence(hists):
+    """Plateau diagnostic per (variant, seed): relative PPL improvement over
+    the last quarter of the eval grid — evidence (or its absence) that the
+    panel is trained to (near-)convergence before any 'post-convergence
+    advantage reversal' claim (review point 1)."""
+    out = {}
+    for v, h in hists.items():
+        per_seed = {}
+        for s, hist in h.items():
+            pts = sorted((int(t), float(x)) for t, x in dict(hist).items())
+            if len(pts) < 4:
+                per_seed[s] = {'rel_improve_last_quarter': float('nan'), 'plateaued': None}
+                continue
+            q = pts[max(0, int(len(pts) * 0.75) - 1)]
+            last = pts[-1]
+            denom = max(abs(last[1]), 1e-9)
+            rel = (q[1] - last[1]) / denom
+            per_seed[s] = {'rel_improve_last_quarter': float(rel), 'plateaued': bool(rel < 0.01)}
+        _vals = [x['rel_improve_last_quarter'] for x in per_seed.values() if math.isfinite(x['rel_improve_last_quarter'])]
+        out[v] = {'per_seed': per_seed, 'median_rel_improve': float(np.median(_vals)) if _vals else float('nan'), 'n_plateaued': int(sum((1 for x in per_seed.values() if x['plateaued']))), 'n': len(per_seed)}
+    return out
+
+def _equal_token_slices():
+    """Review point 1 — the scale panels' endpoints confound model size with
+    cumulative training tokens.  This analysis re-reads the SAME curves at
+    matched token counts (and, when the matched arms exist, at matched total
+    compute), so a cross-scale endpoint difference can no longer be silently
+    attributed to scale alone."""
+    conf = {}
+    _panel_hists = {}
+    for name, spec in _SCALE_PANEL_SPECS.items():
+        _sp = os.path.join(spec['outdir'], 'summary.json')
+        _raw = None
+        if os.path.exists(_sp):
+            try:
+                with open(_sp, encoding='utf-8') as _f:
+                    _raw = json.load(_f)
+            except Exception:
+                _raw = None
+        ha = _hist_by_seed(spec['outdir'], 'csa_fixed', raw=_raw)
+        hb = _hist_by_seed(spec['outdir'], 'full', raw=_raw)
+        _stale = sorted(getattr(ha, 'stale_cfg_seeds', set()) | getattr(hb, 'stale_cfg_seeds', set()))
+        for _h in (ha, hb):
+            for s in _stale:
+                _h.pop(s, None)
+        _panel_hists[name] = {'csa_fixed': ha, 'full': hb}
+        hists = _panel_hists[name]
+        tps = _tokens_per_step(spec['outdir'], fallback=spec['batch'] * spec['seq'], raw=_raw)
+        entry = {'status': 'ok', **{k: v for k, v in spec.items() if k != 'steps'}, 'tokens_per_step': tps, 'convergence': _panel_convergence(hists) if (ha or hb) else {}}
+        if spec['steps'] is not None:
+            entry['declared_steps'] = spec['steps']
+        _ep = _panel_endpoint(hists, tps)
+        if _ep is not None:
+            entry['endpoint'] = _ep
+        else:
+            entry['status'] = 'missing'
+        conf[name] = entry
+
+    def _gap_at(name, step):
+        h = _panel_hists.get(name) or {}
+        if not h:
+            return {}
+        per_seed = {}
+        for s in sorted(set(h['csa_fixed']) & set(h['full'])):
+            da, db = (dict(h['csa_fixed'][s]), dict(h['full'][s]))
+            if step in da and step in db:
+                per_seed[s] = float(da[step] - db[step])
+        return per_seed
+
+    # equal-token paired slices: small vs each large arm on the SHARED step grid
+    # (all v10 scale panels share batch*seq = 12*512, so equal steps == equal
+    # tokens; the calibrated tokens/step of each panel is respected anyway)
+    slices = {}
+    _h_s = _panel_hists.get('P3SS') or {}
+    _tps_s = (conf.get('P3SS') or {}).get('tokens_per_step')
+    if _h_s and _tps_s:
+        _common_steps = sorted(set.intersection(*[set(dict(_h_s['csa_fixed'][s])) for s in _h_s['csa_fixed']], *[set(dict(_h_s['full'][s])) for s in _h_s['full']])) if (_h_s['csa_fixed'] and _h_s['full']) else []
+        for name in ('P3SL', 'P3SL_TOK', 'P3SL_FLOP'):
+            _tps_l = (conf.get(name) or {}).get('tokens_per_step')
+            if not _tps_l:
+                continue
+            for step in _common_steps:
+                _g_s = _gap_at('P3SS', step)
+                _g_l = _gap_at(name, step)
+                common = sorted(set(_g_s) & set(_g_l))
+                if not common:
+                    continue
+                dg = [_g_l[s] - _g_s[s] for s in common]
+                res = V.exact_sign_permutation(dg)
+                tokens = step * _tps_s
+                slices[f'{name} - P3SS @ {tokens / 1000000.0:.2f}M tokens (gap_L - gap_S)'] = {'n': res['n'], 'mean': res['mean'], 'std': res.get('std', 0.0), 'p_exact_signflip': res['p_exact_signflip'], 'per_seed': res.get('per_seed'), 'p_floor': res.get('p_floor'), 'cohens_dz': res.get('cohens_dz'), 'seeds': common, 'gap_L': {str(s): _g_l[s] for s in common}, 'gap_S': {str(s): _g_s[s] for s in common}, 'note': 'positive = the CSA-dense gap is larger in the large arm AT THE SAME cumulative tokens'}
+    return {'panels': conf, 'equal_token_slices': slices}
+
 def v10_analysis(out='analysis_v10/stats.json'):
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     probe = {}
@@ -652,10 +1028,14 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if r.get('probe_params') is None:
                 _bad_cells.append((k, 'no probe_params'))
                 continue
-            key = (r['variant'], r['arm'], r['eval_len'], r['rho'], json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
+            _mode = str(r.get('mode', 'uniform'))
+            # the grouping key carries the mode EXPLICITLY (probe_params' mode
+            # field is normalised out by _fp_norm): uniform and natural cells
+            # at the same rho must never merge into one pooled cell.
+            key = (r['variant'], r['arm'], r['eval_len'], r['rho'], _mode, json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
             grp = cells.setdefault(key, {})
             if r['seed'] in grp:
-                _dup_cells.append((k, key[:4], r['seed']))
+                _dup_cells.append((k, key[:5], r['seed']))
                 continue
             grp[r['seed']] = r
         if _dup_cells:
@@ -664,10 +1044,10 @@ def v10_analysis(out='analysis_v10/stats.json'):
         if _new_bad:
             print(f'[v10 stats] {len(_new_bad)} record(s) in {sp} lack `probe_params` and are dropped from every mean/paired statistic: ' + ', '.join((f'{k}({why})' for k, why in _new_bad[:4])))
         probe_cells = []
-        for (v, arm, Ln, rho, _pp, _cd, _recipe), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
+        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
-            assert means, (v, arm, Ln, rho)
-            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
+            assert means, (v, arm, Ln, rho, mode)
+            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
         contrasts = {}
 
         # O(1) lookup instead of a full probe_cells scan per contrast arm; the
@@ -675,32 +1055,182 @@ def v10_analysis(out='analysis_v10/stats.json'):
         # ambiguity/unambiguous outcomes (and the picked cell) are unchanged.
         _cell_idx = {}
         for c in probe_cells:
-            _cell_idx.setdefault((c['variant'], c['arm'], c['eval_len'], c['rho']), []).append(c)
+            _cell_idx.setdefault((c['variant'], c['arm'], c['eval_len'], c['rho'], c['mode']), []).append(c)
 
-        def cell_mean(v, arm, Ln, rho):
-            hits = _cell_idx.get((v, arm, Ln, rho), [])
+        def cell_mean(v, arm, Ln, rho, mode='uniform'):
+            hits = _cell_idx.get((v, arm, Ln, rho, mode), [])
             if len(hits) > 1:
-                print(f'[v10 stats] ({v}/{arm}/L{Ln}/r{rho}) holds {len(hits)} distinct probe parameterisations/recipes/code stamps — no unambiguous cell, so the contrast is omitted rather than pooled across them')
+                print(f'[v10 stats] ({v}/{arm}/L{Ln}/r{rho}/{mode}) holds {len(hits)} distinct probe parameterisations/recipes/code stamps — no unambiguous cell, so the contrast is omitted rather than pooled across them')
                 return {}
             return hits[0] if hits else {}
+
+        def _pairable(a, b, Ln, rho, tag, mode='uniform'):
+            if _fp_norm(a.get('probe_params')) != _fp_norm(b.get('probe_params')):
+                print(f'[v10 stats] L{Ln} r{rho} {mode} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
+                return False
+            if a.get('_code') != b.get('_code') or _recipe_norm(a.get('recipe')) != _recipe_norm(b.get('recipe')):
+                print(f"[v10 stats] L{Ln} r{rho} {mode} {tag}: the two arms carry DIFFERENT code/recipe stamps (learned {a.get('_code')}/{a.get('recipe')} vs {b.get('_code')}/{b.get('recipe')}) — pairing them would mix two measurement semantics, so the contrast is omitted; re-run the stale arm's phase to refresh it")
+                return False
+            return True
+
+        def _add_contrast(name, a, b):
+            common = sorted(set(a['ppl_by_seed']) & set(b['ppl_by_seed']))
+            if len(common) >= 2:
+                dl = [b['ppl_by_seed'][s] - a['ppl_by_seed'][s] for s in common]
+                contrasts[name] = V.exact_sign_permutation(dl)
+                contrasts[name]['seeds'] = common
+        # ---- legacy uniform-mode contrasts (names unchanged for report compat) ----
         for Ln in PROBE['eval_lens']:
             for rho in PROBE['rhos']:
-                learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho)
+                learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho, 'uniform')
                 for arm, tag in (('dense', 'full_rope(dense)'), ('randidx', 'csa+randidx'), ('allblocks', 'csa+allblocks')):
-                    other = cell_mean('full_rope', 'dense', Ln, rho) if arm == 'dense' else cell_mean('csa_fixed_rope', arm, Ln, rho)
+                    other = cell_mean('full_rope', 'dense', Ln, rho, 'uniform') if arm == 'dense' else cell_mean('csa_fixed_rope', arm, Ln, rho, 'uniform')
                     if not learned or not other:
                         continue
-                    if _fp_norm(learned.get('probe_params')) != _fp_norm(other.get('probe_params')):
-                        print(f'[v10 stats] L{Ln} r{rho} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
+                    if not _pairable(learned, other, Ln, rho, tag):
                         continue
-                    if learned.get('_code') != other.get('_code') or _recipe_norm(learned.get('recipe')) != _recipe_norm(other.get('recipe')):
-                        print(f"[v10 stats] L{Ln} r{rho} {tag}: the two arms carry DIFFERENT code/recipe stamps (learned {learned.get('_code')}/{learned.get('recipe')} vs {other.get('_code')}/{other.get('recipe')}) — pairing them would mix two measurement semantics, so the contrast is omitted; re-run the stale arm's phase to refresh it")
+                    _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other)
+        # ---- from-scratch selector controls (review point 2) ----
+        for Ln in PROBE['eval_lens']:
+            for rho in PROBE['rhos']:
+                learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho, 'uniform')
+                if not learned:
+                    continue
+                for tag, ov, oarm in (('csa_randtrain', 'csa_fixed_rope_randidx', 'learned'), ('csa_alltrain', 'csa_fixed_rope_allblocks', 'learned')):
+                    other = cell_mean(ov, oarm, Ln, rho, 'uniform')
+                    if not other or not _pairable(learned, other, Ln, rho, tag):
                         continue
-                    common = sorted(set(learned['ppl_by_seed']) & set(other['ppl_by_seed']))
-                    if len(common) >= 2:
-                        dl = [other['ppl_by_seed'][s] - learned['ppl_by_seed'][s] for s in common]
-                        contrasts[f'L{Ln} r{rho}: {tag} - csa+learned'] = V.exact_sign_permutation(dl)
-        probe = {'cells': probe_cells, 'contrasts': contrasts}
+                    _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other)
+                # mismatch decomposition: test-time intervention minus the
+                # trained-with-that-selection control at the same (L, rho)
+                for tag, tt_arm, sv in (('mismatch(random): csa+randidx - csa_randtrain', 'randidx', 'csa_fixed_rope_randidx'), ('mismatch(allblocks): csa+allblocks - csa_alltrain', 'allblocks', 'csa_fixed_rope_allblocks')):
+                    tt = cell_mean('csa_fixed_rope', tt_arm, Ln, rho, 'uniform')
+                    sc = cell_mean(sv, 'learned', Ln, rho, 'uniform')
+                    if not tt or not sc or not _pairable(tt, sc, Ln, rho, tag):
+                        continue
+                    _add_contrast(f'L{Ln} r{rho}: {tag}', sc, tt)
+                # architecture-aligned dense (review point 5): full_rope minus
+                # the all-blocks CSA twin (same projections/norm/RoPE/sink)
+                dense = cell_mean('full_rope', 'dense', Ln, rho, 'uniform')
+                allt = cell_mean('csa_fixed_rope_allblocks', 'learned', Ln, rho, 'uniform')
+                if dense and allt and _pairable(dense, allt, Ln, rho, 'arch-aligned'):
+                    _add_contrast(f'L{Ln} r{rho}: arch-aligned: full_rope - csa_alltrain', allt, dense)
+        # ---- delta-NLL on the corruption modes (review point 3) ----
+        delta_nll = {}
+
+        def _nll_tok(rec):
+            try:
+                ns = [float(x) for x in (rec.get('nll_sum') or [])]
+                nt = [int(x) for x in (rec.get('n_tok') or [])]
+            except (TypeError, ValueError):
+                return float('nan')
+            tot = sum(nt)
+            if not nt or tot <= 0:
+                return float('nan')
+            v = math.fsum(ns) / tot
+            return v if math.isfinite(v) else float('nan')
+
+        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe), by_seed in sorted(cells.items()):
+            if mode == 'uniform' and abs(float(rho)) < 1e-12:
+                continue
+            # the clean baseline is the SAME arm's rho=0 uniform cell under the
+            # same parameterisation/code/recipe; deltas are per-seed paired
+            clean_key = (v, arm, Ln, 0.0, 'uniform', _pp, _cd, _recipe)
+            clean_grp = cells.get(clean_key) or {}
+            if not clean_grp:
+                continue
+            per_seed = {}
+            for s, r in by_seed.items():
+                cr = clean_grp.get(s)
+                if cr is None:
+                    continue
+                a, b = (_nll_tok(r), _nll_tok(cr))
+                if math.isfinite(a) and math.isfinite(b):
+                    per_seed[s] = a - b
+            if len(per_seed) >= 1:
+                means = {s: per_seed[s] for s in sorted(per_seed)}
+                _dl = list(means.values())
+                entry = {'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'n': len(_dl), 'mean': float(np.mean(_dl)), 'std': float(np.std(_dl, ddof=1)) if len(_dl) > 1 else 0.0, 'per_seed': means, 'clean_nll_by_seed': {s: _nll_tok(r) for s, r in clean_grp.items() if math.isfinite(_nll_tok(r))}, 'note': 'delta = NLL_corrupted - NLL_clean, nats per target token (review point 3)'}
+                delta_nll[f'{v}::{arm}::L{Ln}::{mode}::r{rho}'] = entry
+        # paired delta-NLL contrasts between arms at the same (L, mode, rho)
+        for Ln in PROBE['eval_lens']:
+            _modes = (PROBE.get('modes') or {}).keys() or ['uniform']
+            for mode in [m for m in _modes if m != 'uniform'] + ['uniform']:
+                _rhos = ((PROBE.get('modes') or {}).get(mode) or ([r for r in PROBE['rhos'] if r > 0] if mode == 'uniform' else []))
+                for rho in [r for r in _rhos if r > 0]:
+                    learned = delta_nll.get(f'csa_fixed_rope::learned::L{Ln}::{mode}::r{rho}')
+                    for arm, tag in (('dense', 'full_rope::dense'), ('randidx', 'csa_fixed_rope::randidx'), ('allblocks', 'csa_fixed_rope::allblocks')):
+                        other = delta_nll.get(f'{tag}::L{Ln}::{mode}::r{rho}')
+                        if not learned or not other:
+                            continue
+                        common = sorted(set(learned['per_seed']) & set(other['per_seed']))
+                        if len(common) >= 2:
+                            dl = [other['per_seed'][s] - learned['per_seed'][s] for s in common]
+                            res = V.exact_sign_permutation(dl)
+                            res['seeds'] = common
+                            contrasts[f'ΔNLL L{Ln} {mode} r{rho}: {arm} - csa+learned'] = res
+        # ---- Holm correction over the whole contrast family (review point 4) ----
+        holm = {}
+        _fam = [(k, v.get('p_exact_signflip')) for k, v in contrasts.items() if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))]
+        if _fam:
+            holm = L.holm_adjust(_fam)
+            _rej = [k for k, v in holm.items() if v.get('reject')]
+            print(f'[v10 stats] Holm step-down over the {len(_fam)}-contrast family (EXPLORATORY — not pre-registered): {len(_rej)} survive at alpha=0.05' + (f': {sorted(_rej)[:4]}' if _rej else ''))
+        probe = {'cells': probe_cells, 'contrasts': contrasts, 'delta_nll': delta_nll, 'holm_exploratory': holm}
+        # ---- NIAH-natural (review point 3, far-necessity task) ----
+        _nsp = (PROBE.get('niah') or {}).get('summary')
+        if _nsp and os.path.exists(_nsp):
+            try:
+                nraw = json.load(open(_nsp, encoding='utf-8'))
+            except Exception as _e:
+                print(f'[stats] WARNING: {_nsp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — the NIAH-natural panel is skipped')
+                nraw = {}
+            ncells = {}
+            for _k, r in nraw.items():
+                if not isinstance(r, dict) or r.get('task') != 'niah_natural':
+                    continue
+                if r.get('variant') is None or r.get('seed') is None or r.get('arm') is None or r.get('condition') is None:
+                    continue
+                nkey = (r['variant'], r['arm'], r['eval_len'], r['condition'], json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
+                grp = ncells.setdefault(nkey, {})
+                if r['seed'] in grp:
+                    continue
+                grp[r['seed']] = r
+            niah_cells = []
+            for (v, arm, Ln, cond, _pp, _cd, _recipe), by_seed in sorted(ncells.items(), key=lambda kv: kv[0]):
+                accs = {s: r['acc'] for s, r in by_seed.items()}
+                nlls = {s: r['nll'] for s, r in by_seed.items()}
+                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'acc_mean': float(np.mean(list(accs.values()))), 'nll_mean': float(np.mean(list(nlls.values()))), 'n': len(accs), 'n_pairs': next(iter(by_seed.values())).get('n_pairs'), 'dist_mean': next(iter(by_seed.values())).get('dist_mean')})
+            niah_contrasts = {}
+            _nidx = {}
+            for c in niah_cells:
+                _nidx.setdefault((c['variant'], c['arm'], c['eval_len'], c['condition']), []).append(c)
+
+            def _ncell(v, arm, Ln, cond):
+                hits = _nidx.get((v, arm, Ln, cond), [])
+                return hits[0] if len(hits) == 1 else {}
+            for Ln in PROBE['eval_lens']:
+                for cond in (PROBE.get('niah') or {}).get('conditions', ['clean', 'distract']):
+                    learned = _ncell('csa_fixed_rope', 'learned', Ln, cond)
+                    for arm, tag in (('dense', 'full_rope'), ('randidx', 'csa_fixed_rope'), ('allblocks', 'csa_fixed_rope')):
+                        other = _ncell('full_rope', 'dense', Ln, cond) if arm == 'dense' else _ncell(tag, arm, Ln, cond)
+                        if not learned or not other:
+                            continue
+                        common = sorted(set(learned['acc_by_seed']) & set(other['acc_by_seed']))
+                        if len(common) >= 2:
+                            res = V.exact_sign_permutation([other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common])
+                            res['seeds'] = common
+                            niah_contrasts[f'NIAH-nat L{Ln} {cond}: {arm} - learned (answer NLL)'] = res
+                    for tag, ov in (('csa_randtrain', 'csa_fixed_rope_randidx'), ('csa_alltrain', 'csa_fixed_rope_allblocks')):
+                        other = _ncell(ov, 'learned', Ln, cond)
+                        if not learned or not other:
+                            continue
+                        common = sorted(set(learned['nll_by_seed']) & set(other['nll_by_seed']))
+                        if len(common) >= 2:
+                            res = V.exact_sign_permutation([other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common])
+                            res['seeds'] = common
+                            niah_contrasts[f'NIAH-nat L{Ln} {cond}: {tag} - learned (answer NLL)'] = res
+            probe['niah_natural'] = {'cells': niah_cells, 'contrasts': niah_contrasts}
     xo = _scale_crossovers()
 
     def _is_recon(v):
@@ -737,7 +1267,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
     add('seq2k(bs1): topk512 - m1', seq2k, 'csa_fixed_topk512', 'csa_fix_m1', 'results_lm_v9_seq2k')
     add('seq2k(bs1): topk8 - topk512', seq2k, 'csa_fixed_topk8', 'csa_fixed_topk512', 'results_lm_v9_seq2k')
     panel = V8._panel_block
-    out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'seq2k_bs1_panel': panel(seq2k), 'comparisons': comparisons}
+    scale_conf = _equal_token_slices()
+    out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale_confounds': scale_conf, 'seq2k_bs1_panel': panel(seq2k), 'comparisons': comparisons}
     L.atomic_write_json(out, out_d, indent=2)
     print(f'[v10 stats] wrote {out}')
     for k, v in comparisons.items():
@@ -790,6 +1321,8 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A('v10 落实 v9 收官后评审的三项升级：(1) 把 v7 P1L 的 sparse 正面发现（CSA+RoPE 长度外推显著优于 dense-RoPE）从附带观察升级为机制性主结果——远距干扰注入实验直接检验「稀疏掩码滤除远距噪声」假设；(2) 新增 d=128/4L 与 d=512/10L 两个规模，与既有 d=256/d=384 面板组成 4 点反转交叉点标度读数（预注册交叉判据）；(3) 把 v9 唯一仍处 p 值分辨率下限的面板（seq-2048 topk 扫描）从 n=2 补到 n=4。')
     A('')
+    A('**本版修订（评审 5 点）**：(a) P3MTC 补同预算从头训练的选择器对照（randidx / allblocks）并补逐项对齐的 dense 对照；(b) 干扰注入扩展为 uniform / natural / mask / delete 四种腐坏模式并按 ΔNLL 口径报告，另增 NIAH-natural 远端必要信息任务；(c) P3SL2/P3SL3 补等训练 token 与等计算预算的大模型臂，统计新增等 token 切片与收敛（平台期）诊断；(d) 全部配对比较报告逐种子 Δ、效应量 d_z、p 值分辨率下限与 Holm 校正，明确探索性/确认性证据边界（确认性评估见 `v12_supp.py` 与冻结清单 `confirmation_frozen.json`）。')
+    A('')
     A('---')
     A('')
     A('## P3M 长度外推优势的机制验证（远距干扰注入）')
@@ -798,7 +1331,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     if mech_sum:
         _rows_by_v = {}
-        for v in P3MT_PAYLOAD['variants']:
+        for v in list(P3MT_PAYLOAD['variants']) + SCRATCH_CONTROLS:
             _rv = [r for r in mech_sum.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None) and ('by_len' in r)]
             _cur = [r for r in _rv if r.get('_code') == L.code_stamp()]
             if _cur:
@@ -881,34 +1414,36 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     if cells:
         lens = sorted({c['eval_len'] for c in cells})
         rhos = PROBE['rhos']
-        arm_order = [('full_rope', 'dense'), ('csa_fixed_rope', 'learned'), ('csa_fixed_rope', 'randidx'), ('csa_fixed_rope', 'allblocks')]
+        arm_order = [('full_rope', 'dense'), ('csa_fixed_rope', 'learned'), ('csa_fixed_rope', 'randidx'), ('csa_fixed_rope', 'allblocks'), ('csa_fixed_rope_randidx', 'learned'), ('csa_fixed_rope_allblocks', 'learned')]
         for Ln in lens:
             _n_ln = max([c.get('n', 0) for c in cells if c['eval_len'] == Ln] or [0])
-            A(f'**目标区 PPL（eval_len={Ln}，至多 {_n_ln or "?"} seeds 平均）**：')
+            A(f'**目标区 PPL（eval_len={Ln}，至多 {_n_ln or "?"} seeds 平均；uniform 腐坏模式）**：')
             A('')
             A('| 臂 | ' + ' | '.join((f'ρ={r:g}' for r in rhos)) + ' |')
             A('|---|' + '---|' * len(rhos))
             for v, arm in arm_order:
                 row = []
                 for rho in rhos:
-                    m = [c['mean'] for c in cells if (c['variant'], c['arm'], c['eval_len'], c['rho']) == (v, arm, Ln, rho)]
+                    m = [c['mean'] for c in cells if (c['variant'], c['arm'], c['eval_len'], c['rho'], c.get('mode', 'uniform')) == (v, arm, Ln, rho, 'uniform')]
                     row.append(f'{m[0]:.2f}' if len(m) == 1 else '—')
                     if len(m) > 1:
                         print(f'[report] {v}+{arm} L={Ln} rho={rho}: {len(m)} parameterisations of the cell exist — the table omits the cell (the paired test refuses it too)')
                 A(f'| `{v}`+{arm} | ' + ' | '.join(row) + ' |')
             A('')
     contr = probe.get('contrasts', {})
-    if contr:
-        A('**配对检验（exact sign-flip，Δ = 对照臂 − 学习选择臂，>0 表示学习选择更抗噪）：**')
+    _legacy_keys = [k for k in contr if ' - csa+learned' in k and any((t in k for t in ('full_rope(dense)', 'csa+randidx', 'csa+allblocks'))) and not k.startswith('ΔNLL')]
+    _legacy = {k: contr[k] for k in _legacy_keys}
+    if _legacy:
+        A('**配对检验（exact sign-flip，Δ = 对照臂 − 学习选择臂，>0 表示学习选择更抗噪；uniform 模式）：**')
         A('')
         A('| 比较 | n | Δ mean±std | p (exact) |')
         A('|---|---|---|---|')
-        for k, v in contr.items():
+        for k, v in _legacy.items():
             A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
         A('')
 
         def _rng(tag):
-            _lo, _hi, _nonf = L.finite_range(((k, v.get('mean')) for k, v in contr.items() if tag in k))
+            _lo, _hi, _nonf = L.finite_range(((k, v.get('mean')) for k, v in _legacy.items() if tag in k))
             if _nonf:
                 print(f'[v10 report] WARNING: {len(_nonf)} contrast(s) in {tag!r} carry a non-finite mean and are excluded from the reported range: {sorted(_nonf)[:3]}')
             return None if _lo is None else (_lo, _hi)
@@ -917,13 +1452,13 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             return 'n/a' if not r else f'{r[0]:+.{nd}f}~{r[1]:+.{nd}f}'
 
         def _all_sig(tag, alpha=0.05):
-            vs = [(k, v) for k, v in contr.items() if tag in k]
+            vs = [(k, v) for k, v in _legacy.items() if tag in k]
             if not vs:
                 return False
             return all((v['mean'] > 0 and v.get('p_exact_signflip', 1.0) < alpha for _k, v in vs))
         dn, ab, ri = (_rng('dense'), _rng('allblocks'), _rng('randidx'))
         ri_sig = _all_sig('randidx')
-        _n_by_c = [(k, v.get('n', 0)) for k, v in contr.items() if 'omitted' not in v]
+        _n_by_c = [(k, v.get('n', 0)) for k, v in _legacy.items() if 'omitted' not in v]
         n_min = min((n for _k, n in _n_by_c), default=0)
         _bind = [k for k, n in _n_by_c if n == n_min]
         n_min_ri = min((n for k, n in _n_by_c if 'randidx' in k), default=0)
@@ -933,6 +1468,74 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         _dtxt = '正值表示「看得见远距噪声就会受害」，支持限制远距注意力暴露带来抗噪性' if _dpos else '区间并非全正，「远距暴露致害」的方向在本轮产物上不成立，以配对数字为准'
         A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——{_dtxt}；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，' + ('该种子数下无法达到 0.05 显著性' if not (p_floor <= 0.05) else '分辨率已足以达到 0.05，未显著是数据结论而非分辨率上限') + '），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
         A('')
+    # ---- P3M-2：从头训练的选择器对照（评审点 2）----
+    _new_c = {k: v for k, v in contr.items() if k not in _legacy and not k.startswith('ΔNLL')}
+    if _new_c:
+        A('### P3M-2 从头训练的选择器对照（同预算）')
+        A('')
+        A('**背景（评审点 2）**：测试时把已训练模型的选择器替换为随机/全块，只能回答「模型是否依赖原选择器」，不能回答「学习式选择是否优于训练充分的随机选择或全块读取」——后两者的测试时干预改变了模型训练时适应的输入分布，性能下降可能来自失配本身。P3MTC 按与 P3MT **完全相同的配方**（3000 步、同数据、同种子）从头训练两个对照：`csa_fixed_rope_randidx`（训练期选择即随机）与 `csa_fixed_rope_allblocks`（训练期就读全部块；与 `csa_fixed_rope` 逐项同构——同 c_kv 压缩、同 qk_norm、同 RoPE、同 sink/窗口，仅选择方式不同，因此它同时是**逐项对齐的 dense 对照**，评审点 5）。')
+        A('')
+        A('| 比较 | n | Δ mean±std | d_z | p (exact) | p 下限 |')
+        A('|---|---|---|---|---|---|')
+        for k, v in sorted(_new_c.items()):
+            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v.get('cohens_dz', float('nan')):+.2f} | {v['p_exact_signflip']:.3f} | {v.get('p_floor', float('nan')):.3f} |')
+        A('')
+        A('> `mismatch(…)` 行 = 测试时干预 − 同预算从头训练对照（同 L、同 ρ）：正值说明性能损失中**不能**归因于「训练分布失配」的部分；`arch-aligned` 行 = dense − 全块 CSA 孪生（两者仅剩 KV 压缩投影与分块读取方式之差）。')
+        A('')
+    # ---- ΔNLL：污染增量（评审点 3）----
+    dnll = probe.get('delta_nll') or {}
+    if dnll:
+        A('### P3M-3 污染增量 ΔNLL（按 NLL 口径，含干净条件基线）')
+        A('')
+        A('**口径（评审点 3）**：ΔNLL = NLL_污染 − NLL_干净（nats/目标 token，逐种子配对）。腐坏模式：`uniform`（均匀随机 token，既有协议）、`natural`（其他真实序列同位置 token）、`mask`（远端整体屏蔽为 `<pad>`）、`delete`（远端整体删除，仅剩目标区）。`mask`/`delete` 回答「干净远端上下文到底带来多少收益」；`natural` 与 `uniform` 之差回答「更自然的干扰是否更难过滤」。')
+        A('')
+        A('| 臂 | L | 模式 | ρ | ΔNLL mean±std | n | 干净 NLL |')
+        A('|---|---|---|---|---|---|---|')
+        _clean_nll_cache = {}
+        for k in sorted(dnll):
+            e = dnll[k]
+            _ck = f"{e['variant']}::{e['arm']}::L{e['eval_len']}"
+            if _ck not in _clean_nll_cache:
+                _cl = [x for x in dnll.values() if x['variant'] == e['variant'] and x['arm'] == e['arm'] and x['eval_len'] == e['eval_len'] and x['mode'] == 'uniform' and abs(float(x['rho'])) < 1e-12]
+                _clean_nll_cache[_ck] = float(np.mean([np.mean(list(x.get('clean_nll_by_seed', {}).values())) for x in _cl])) if _cl else float('nan')
+            A(f"| `{e['variant']}::{e['arm']}` | {e['eval_len']} | {e['mode']} | {e['rho']:g} | {e['mean']:+.4f} ± {e.get('std', 0):.4f} | {e['n']} | {_clean_nll_cache[_ck]:.4f} |")
+        A('')
+        _dnll_c = {k: v for k, v in contr.items() if k.startswith('ΔNLL')}
+        if _dnll_c:
+            A('| ΔNLL 配对比较（ΔΔNLL = 臂间污染增量之差） | n | Δ mean±std | p (exact) |')
+            A('|---|---|---|---|')
+            for k, v in sorted(_dnll_c.items()):
+                A(f'| {k} | {v['n']} | {v['mean']:+.4f} ± {v.get('std', 0):.4f} | {v['p_exact_signflip']:.3f} |')
+            A('')
+        A('> **替代解释提示**：某臂 ΔNLL 小也可能因为它本来就很少利用远端上下文（干净 NLL 更高）——读表时必须把 ΔNLL 与干净 NLL 列一起看；`mask`/`delete` 行给出干净远端的收益幅度作为参照系。')
+        A('')
+    # ---- NIAH-natural：远端必要信息任务（评审点 3）----
+    niah = probe.get('niah_natural') or {}
+    if niah.get('cells'):
+        A('### P3M-4 远端必要信息任务（NIAH-natural，自然文本 + 自然干扰）')
+        A('')
+        A('**设计（评审点 3）**：序列 = 远端自然文本（内嵌 8 个 key→value 耦合）+ 目标区（自然文本收尾 + 8 个查询 key）。查询 key 的下一个 token 的正确答案只在远端出现——正确预测**必须**利用远距信息；`distract` 条件把 ρ=0.5 的远端草料换成其他真实序列的 token（自然语言干扰），但**绝不腐坏耦合位置**。报告 answer top-1 准确率与 answer NLL（已按各臂 clean/distract 成对）。')
+        A('')
+        A('| 臂 | L | 条件 | acc | answer NLL | n |')
+        A('|---|---|---|---|---|---|')
+        for c in sorted(niah['cells'], key=lambda c: (c['eval_len'], c['condition'], c['variant'], c['arm'])):
+            A(f"| `{c['variant']}::{c['arm']}` | {c['eval_len']} | {c['condition']} | {c['acc_mean']:.3f} | {c['nll_mean']:.3f} | {c['n']} |")
+        A('')
+        if niah.get('contrasts'):
+            A('| NIAH 配对比较（Δ = 对照臂 − 学习选择，answer NLL，>0 = 学习选择更好） | n | Δ mean±std | p (exact) |')
+            A('|---|---|---|---|')
+            for k, v in sorted(niah['contrasts'].items()):
+                A(f'| {k} | {v['n']} | {v['mean']:+.3f} ± {v.get('std', 0):.3f} | {v['p_exact_signflip']:.3f} |')
+            A('')
+        A('> 该任务直接检验「长距离信息**利用**能力」，与上面的干扰鲁棒性互补：鲁棒性高 + 检索利用不差，才支持「稀疏选择在滤噪的同时保留了有用远距信息」；若只有鲁棒性而检索差，则更符合「本来就少用远端」的替代解释。')
+        A('')
+    A('### 统计口径（评审点 4）')
+    A('')
+    _n_all = sorted({v.get('n', 0) for v in contr.values() if isinstance(v, dict) and 'omitted' not in v})
+    A(f'- 每个配对比较都给出逐种子 Δ、效应量 d_z 与该 n 下的双侧精确符号翻转 p 值下限 2/2^n（本表 n 集合 {_n_all}）。')
+    A('- 上表全部 p 值按 **Holm step-down** 在本报告的对比族内做了多重校正（`analysis_v10/stats.json` 的 `probe.holm_exploratory`）；该校正族**未预先注册**，因此校正后的 p 只能防止过度宣称，不能当作确认性证据。')
+    A('- v7→v11 的多轮追加实验与既有面板属于**探索性**证据；确认性检验见 `v12_supp.py`（冻结清单 `confirmation_frozen.json`：固定主比较、终点、种子数，用 wiki.test.raw 独立 test split 一次性评估）。')
+    A('')
     A('---')
     A('')
     A('## P3S 反转交叉点的标度读数（4 个模型规模）')
@@ -990,6 +1593,43 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         _r2s = f'（R²={fit["r2"]:.2f}）' if 'r2' in fit else '（n=2，R² 恒为 1，不报告拟合优度）'
         A(f'**趋势拟合（仅供参考）**：在 {fit['n_points']} 个已观测交叉点上，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}{_r2s}——负斜率 = 规模越大交叉越早。' + (f'点数已扣除{'、'.join(_excl)}；' if _excl else '') + '点数少且部分格子删失，只作方向性证据，不作精确幂律主张。')
         A('')
+    sc = st.get('scale_confounds') or {}
+    if sc:
+        A('### P3S-2 规模混杂控制（评审点 1：等训练 token / 等计算预算 / 收敛证据）')
+        A('')
+        A('**背景**：P3SS（d=128/4L，8000 步 ≈ 49.15M token）与 P3SL（d=512/10L，4000 步 ≈ 24.58M token）的累计 token 相差一倍——跨规模终点差异不能单独归因于规模。本节把同一批曲线在**相同累计 token**处切片配对（gap_L − gap_S，逐种子），并给出等 token（`P3SL_TOK`，8000 步）与等计算预算（`P3SL_FLOP`，按参数量比例缩步数）两个大模型臂，以及各面板的收敛（平台期）诊断。')
+        A('')
+        _panels = sc.get('panels') or {}
+        if _panels:
+            A('| 面板 | 预算 | 末步 token | 末点 gap (csa−full) mean±std | n | 末点 p (exact) | 平台化种子 |')
+            A('|---|---|---|---|---|---|---|')
+            for name in ('P3SS', 'P3SL', 'P3SL_TOK', 'P3SL_FLOP'):
+                e = _panels.get(name) or {}
+                if not e or e.get('status') != 'ok':
+                    A(f'| {name} | — | — | 数据缺失 | 0 | — | — |')
+                    continue
+                _ep = e.get('endpoint') or {}
+                _tok = e.get('tokens_per_step')
+                _ntok = (f"{(_ep.get('tokens') or 0) / 1000000.0:.2f}M" if _ep and _ep.get('tokens') else 'n/a')
+                _conv = e.get('convergence') or {}
+                _pl = [f"{_v.get('n_plateaued', 0)}/{_v.get('n', 0)}" for _v in _conv.values()]
+                A(f"| {name} | {e.get('note', '')} | {_ntok} | {_ep.get('mean', float('nan')):+.2f} ± {_ep.get('std', 0):.2f} | {_ep.get('n', 0)} | {_ep.get('p_exact_signflip', float('nan')):.3f} | {'/'.join(_pl) or '—'} |")
+            A('')
+            _conv_warn = [name for name, e in _panels.items() if e.get('status') == 'ok' and any(((e.get('convergence') or {}).get(v) or {}).get('n_plateaued', 0) == 0 for v in ('csa_fixed', 'full'))]
+            if _conv_warn:
+                A(f'> **收敛证据不足**：{_conv_warn} 面板在最后四分之一 eval 窗口的相对改进 ≥1%（未平台化）——「收敛后优势反转」的主张在该面板上**不成立**，只有「窗口内交叉」的读数有效。')
+                A('')
+        _slices = sc.get('equal_token_slices') or {}
+        if _slices:
+            A('**等 token 切片（gap_L − gap_S，同累计 token 处逐种子配对；>0 = 大模型在同 token 处 CSA−dense 差距更大）：**')
+            A('')
+            A('| 切片 | n | Δ mean±std | d_z | p (exact) |')
+            A('|---|---|---|---|---|')
+            for k, v in sorted(_slices.items()):
+                A(f'| {k} | {v.get('n', 0)} | {v.get('mean', float('nan')):+.2f} ± {v.get('std', 0):.2f} | {v.get('cohens_dz', float('nan')):+.2f} | {v.get('p_exact_signflip', float('nan')):.3f} |')
+            A('')
+            A('> `P3SL_FLOP` 的步数 = 8000 × N_small/N_large（参数量按面板两臂平均，CPU 上确定性计数；下限 250），即**大模型只花小模型的总计算预算**——该臂的 gap 是「同预算下规模效应」的直接读数。')
+            A('')
     A('---')
     A('')
     A('## P3T seq-2048 topk 扫描补种子（n=2 → n=4）')
@@ -1026,11 +1666,13 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A('| 路径 | 内容 |')
     A('|---|---|')
-    A('| `results_v10_mech/` | P3M：两臂重训权重（ckpt/，*.pt 不入库）+ by-length 复现表 + 干扰注入探针 `distractor.json` |')
+    A('| `results_v10_mech/` | P3M：两臂重训权重（ckpt/，*.pt 不入库）+ by-length 复现表 + 干扰注入探针 `distractor.json`（uniform/natural/mask/delete 模式）+ NIAH-natural `niah_natural.json` |')
     A('| `results_lm_v10_scale_s/` | P3S：d=128/4L 交叉定位面板（8000 步） |')
     A('| `results_lm_v10_scale_l/` | P3S：d=512/10L 交叉定位面板（4000 步） |')
+    A('| `results_lm_v10_scale_l8k/` | P3S-2：等 token 大模型臂（8000 步，评审点 1） |')
+    A('| `results_lm_v10_scale_lflop/` | P3S-2：等计算预算大模型臂（评审点 1） |')
     A('| `results_lm_v9_seq2k/` | P3T：topk 扫描追加 seeds 2/3 后的 4-seed 面板 |')
-    A('| `analysis_v10/stats.json` | 探针对比、交叉定位与配对符号翻转检验 |')
+    A('| `analysis_v10/stats.json` | 探针对比（含 ΔNLL、Holm）、交叉定位、等 token 切片与配对符号翻转检验 |')
     A('| `v10_supp.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
     A('')
     L.atomic_write_text(out, '\n'.join(lines) + '\n')
@@ -1054,7 +1696,7 @@ def run_full():
     guard = make_guard()
     guard.report()
     print(f'[v10] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
-    git_push('v10: supplementary driver (P3M distractor-injection mechanism + P3S crossover scaling + P3T topk seeds 2/3)')
+    git_push('v10: supplementary driver (P3M distractor-injection mechanism + P3S crossover scaling + P3T topk seeds 2/3 + reviewer-response: scratch selector controls, corruption modes/NIAH, token/compute-matched scale arms)')
     import par
     _ctx = par.resolve_ctx(label='v10')
     all_ok = True
@@ -1085,20 +1727,27 @@ def run_full():
     schedule_shutdown(120 if all_ok else 2400)
 
 def run_smoke():
-    print('[smoke] 1) tiny lenphase ckpt + distractor probe roundtrip')
+    print('[smoke] 1) tiny lenphase ckpts + extended distractor probe roundtrip (all modes + NIAH + a scratch control)')
     L.set_seed(0)
     payload = dict(P3MT_PAYLOAD, outdir='results_smoke_v10', seeds=[0], steps=40, eval_lens=[512, 1024])
     import shutil
     shutil.rmtree('results_smoke_v10', ignore_errors=True)
-    V.run_lenphase(dict(payload, variants=['csa_fixed_rope']), guard=None, label='v10 smoke', par=False)
-    pcfg = dict(PROBE, outdir='results_smoke_v10', ckpt_dir='results_smoke_v10/ckpt', summary='results_smoke_v10/distractor.json', variants=['csa_fixed_rope'], seeds=[0], eval_lens=[1024], rhos=[0.0, 0.5], n_seq=4, chunk=2)
+    V.run_lenphase(dict(payload, variants=['csa_fixed_rope', 'csa_fixed_rope_randidx']), guard=None, label='v10 smoke', par=False)
+    pcfg = dict(PROBE, outdir='results_smoke_v10', ckpt_dir='results_smoke_v10/ckpt', summary='results_smoke_v10/distractor.json', variants=['csa_fixed_rope', 'csa_fixed_rope_randidx'], seeds=[0], eval_lens=[1024], rhos=[0.0, 0.5], modes={'uniform': [0.0, 0.5], 'natural': [0.5], 'mask': [1.0], 'delete': [1.0]}, n_seq=4, chunk=2, niah=dict(NIAH_NATURAL, summary='results_smoke_v10/niah_natural.json', n_pairs=2, n_seq=4, conditions=['clean', 'distract']), arm_overrides={'csa_fixed_rope_randidx': ['learned']})
     s = run_probe(pcfg, guard=None, label='v10 smoke', par=False)
-    got = {(r['arm'], r['rho']) for r in s.values()}
-    want = {('learned', 0.0), ('learned', 0.5), ('randidx', 0.0), ('randidx', 0.5), ('allblocks', 0.0), ('allblocks', 0.5)}
-    assert want <= got, f'probe cells missing: {want - got}'
-    print(f'  probe roundtrip OK ({len(s)} cells)')
+    got = {(r.get('mode', 'uniform'), r['arm'], r['rho']) for r in s.values()}
+    _want = {('uniform', 'learned', 0.0), ('uniform', 'learned', 0.5), ('uniform', 'randidx', 0.0), ('uniform', 'randidx', 0.5), ('uniform', 'allblocks', 0.0), ('uniform', 'allblocks', 0.5), ('natural', 'learned', 0.5), ('natural', 'randidx', 0.5), ('natural', 'allblocks', 0.5), ('mask', 'learned', 1.0), ('mask', 'randidx', 1.0), ('mask', 'allblocks', 1.0), ('delete', 'learned', 1.0), ('delete', 'randidx', 1.0), ('delete', 'allblocks', 1.0)}
+    assert _want <= got, f'probe cells missing: {_want - got} (got {sorted(got)})'
+    niah_sum = {}
+    _nsp = 'results_smoke_v10/niah_natural.json'
+    if os.path.exists(_nsp):
+        niah_sum = json.load(open(_nsp, encoding='utf-8'))
+    _niah_got = {(r.get('arm'), r.get('condition')) for r in niah_sum.values() if isinstance(r, dict)}
+    _niah_want = {('learned', 'clean'), ('learned', 'distract'), ('randidx', 'clean'), ('randidx', 'distract'), ('allblocks', 'clean'), ('allblocks', 'distract')}
+    assert _niah_want <= _niah_got, f'NIAH cells missing: {_niah_want - _niah_got} (got {sorted(_niah_got)})'
+    print(f'  probe roundtrip OK ({len(s)} corruption cells + {len(niah_sum)} NIAH cells)')
     shutil.rmtree('results_smoke_v10', ignore_errors=True)
-    print('[smoke] 2) forward/backward at the two new scales')
+    print('[smoke] 2) forward/backward at the two new scales + the scratch-control rope variants')
     for d, nl, nh in ((128, 4, 4), (512, 10, 16)):
         for v in ('csa_fixed', 'full'):
             cfgs = L.make_layer_cfgs(nl, v)
@@ -1112,6 +1761,23 @@ def run_smoke():
             gc.collect()
             if DEVICE.type == 'cuda':
                 torch.cuda.empty_cache()
+    for v in SCRATCH_CONTROLS:
+        cfgs = L.make_layer_cfgs(6, v)
+        m = L.SmallGPT(8192, 256, 6, 8, 32, 512, cfgs).to(DEVICE)
+        x = torch.randint(0, 8192, (2, 512), device=DEVICE)
+        out = m(x)
+        loss = F.cross_entropy(out.reshape(-1, 8192), x.reshape(-1)) + 0.05 * m.comp_reg
+        loss.backward()
+        print(f'  d=256 L=6 {v:32s} out={tuple(out.shape)} loss={loss.item():.3f} params={L.count_params(m) / 1000000.0:.2f}M')
+        del m, out, loss, x
+        gc.collect()
+        if DEVICE.type == 'cuda':
+            torch.cuda.empty_cache()
+    print('[smoke] 2b) flop-matched steps are deterministic')
+    _fs1 = _flop_matched_steps(P3SS_CFG, P3SL_CFG)
+    _fs2 = _flop_matched_steps(P3SS_CFG, P3SL_CFG)
+    assert _fs1 == _fs2 and _fs1 >= 250, f'flop-matched steps not deterministic: {_fs1} vs {_fs2}'
+    print(f'  flop-matched steps OK ({_fs1})')
     print('[smoke] 3) zero-GPU analysis/report on current artifacts (scratch outputs, real artifacts untouched)')
     build_report(out='results_smoke_v10/REPORT_v10.md', stats_p='results_smoke_v10/stats.json')
     shutil.rmtree('results_smoke_v10', ignore_errors=True)

@@ -2728,6 +2728,171 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     gc.collect()
     return (train_ids, val_batch, vocab, tok, val_bnd)
 
+# ---- 独立最终 test split（wiki.test.raw，冻结后一次性评估，见 design_notes §17）
+_WT103_TEST_MEMO = {}
+_WT103_TEST_MEMO_CAP = 2
+
+def _text_fp(rows):
+    """sha256 of a list of text rows (fit-corpus provenance for the test cache)."""
+    h = hashlib.sha256()
+    for r in rows:
+        h.update(r.encode('utf-8', errors='replace'))
+        h.update(b'\n')
+    return h.hexdigest()[:16]
+
+def _tokenise_row_chunks(row_chunks, cap_tokens, label, tok, eos_id):
+    """Standalone twin of load_wikitext's nested stream_tokenise with the exact
+    same chunking / eos / cap / flush behaviour (1<<22 chunks, row-chunk 10000,
+    [:cap_tokens] truncation) so the served ids obey the same discipline."""
+    chunks = []
+    cur = []
+    n_have = 0
+
+    def _flush():
+        if cur:
+            chunks.append(np.array(cur, dtype=np.int64))
+            cur.clear()
+    for rows in row_chunks:
+        rows = [r for r in rows if r.strip()]
+        for enc in tok.encode_batch(rows):
+            cur.extend(enc.ids)
+            cur.append(eos_id)
+        if len(cur) >= (1 << 22):
+            _flush()
+        n_have = sum(c.size for c in chunks) + len(cur)
+        if n_have >= cap_tokens:
+            break
+        print(f'    [{label}] {n_have} tokens so far')
+    _flush()
+    if not chunks:
+        return np.empty(0, dtype=np.int64)
+    ids = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+    return ids[:cap_tokens]
+
+def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache'):
+    """Load the WikiText-103 **test** split as (n_seqs, seq_len) int64 rows.
+
+    只读 wiki.test.raw（本地 dump 或 HF test split），绝不触碰 train/validation，
+    因此可作冻结后的独立最终评估数据（design_notes §17 的「未参与方法选择的
+    数据」）。与 load_wikitext 同一套纪律：npy 缓存 + sha256 内容指纹 + 原子写；
+    分词器用与主语料完全相同的拟合过程（同一份 train 前 50k 行，确定性
+    BPE）重建，并把拟合语料指纹存进 meta 以供审计。缓存命中只校验自身
+    指纹；train 语料被更换时应删除整个 wt103_cache/（README「Reproducing」
+    一节同款约定），否则 test 缓存不会跟随重建——这是显式记录的边界，
+    不是静默的失效路径。"""
+    from datasets import load_dataset
+    os.makedirs(cache_dir, exist_ok=True)
+    tag = f'v1_sl{seq_len}_v{vocab_size}_ns{n_seqs}'
+    te_path = os.path.join(cache_dir, f'test_ids_{tag}.npy')
+    tb_path = os.path.join(cache_dir, f'test_bnd_{tag}.npy')
+    me_path = os.path.join(cache_dir, f'test_meta_{tag}.json')
+    tk_path = os.path.join(cache_dir, f'test_tok_{tag}.json')
+    if all((os.path.exists(p) for p in (te_path, tb_path, me_path))):
+        _sig = tuple((os.path.getsize(_p), os.path.getmtime(_p)) for _p in (te_path, tb_path, me_path))
+        _mkey = (os.path.abspath(cache_dir), tag, _sig)
+        _hit = _WT103_TEST_MEMO.get(_mkey)
+        if _hit is not None:
+            print('[data] serving TEST token ids from the in-process memo (same cache files, already verified) ...')
+            return _hit
+        print('[data] loading cached TEST token ids ...')
+        test_ids = np.load(te_path)
+        meta = json.load(open(me_path, encoding='utf-8'))
+        if meta.get('src_fp') != _ids_fp(test_ids):
+            print('[data] WARNING: the cached test_ids do not match the fingerprint in the test meta file — the cache is corrupt or was mixed across builds; REBUILDING it')
+        else:
+            test_bnd = np.load(tb_path)
+            out = (test_ids, meta['vocab'], None, test_bnd)
+            if len(_WT103_TEST_MEMO) >= _WT103_TEST_MEMO_CAP:
+                _WT103_TEST_MEMO.pop(next(iter(_WT103_TEST_MEMO)))
+            _WT103_TEST_MEMO[_mkey] = out
+            return out
+    # cold build: source the test rows (local dump first, HF otherwise)
+    test_rows = None
+    raw_txt = os.environ.get('WT103_RAW_TXT')
+    _cands = []
+    if raw_txt:
+        _cands.append(raw_txt)
+    _cands.append(os.path.join(os.path.dirname(os.path.abspath(cache_dir)), 'wt103_raw'))
+    _cands.append('/root/wt103_raw')
+    for cand in _cands:
+        _f = os.path.join(cand, 'wiki.test.raw')
+        if os.path.exists(_f):
+            test_rows = _read_raw_rows(_f)
+            print(f'[data] local wikitext-103 TEST split at {_f} ({len(test_rows)} rows)')
+            break
+    if test_rows is None:
+        ds = None
+        last_err = None
+        for repo in ('Salesforce/wikitext', 'wikitext'):
+            try:
+                ds = load_dataset(repo, 'wikitext-103-raw-v1', cache_dir=cache_dir)
+                break
+            except Exception as e:
+                last_err = e
+        if ds is None:
+            raise last_err if last_err is not None else RuntimeError('load_wikitest: no test-split source available (local dump wiki.test.raw or the HF dataset)')
+        test_rows = ds['test']['text']
+    # tokenizer: identical fit to load_wikitext (first <=50k TRAIN rows, deterministic BPE)
+    train_fit_rows = None
+    for cand in _cands:
+        _f = os.path.join(cand, 'wiki.train.raw')
+        if os.path.exists(_f):
+            train_fit_rows = _read_raw_rows(_f)[:50000]
+            break
+    if train_fit_rows is None:
+        if ds is None:
+            for repo in ('Salesforce/wikitext', 'wikitext'):
+                try:
+                    ds = load_dataset(repo, 'wikitext-103-raw-v1', cache_dir=cache_dir)
+                    break
+                except Exception as e:
+                    last_err = e
+            if ds is None:
+                raise last_err if last_err is not None else RuntimeError('load_wikitest: no train source to fit the shared tokenizer')
+        train_fit_rows = ds['train'].select(range(min(len(ds['train']), 50000)))['text']
+    tok = build_tokenizer(list(train_fit_rows), vocab_size)
+    vocab = tok.get_vocab_size()
+    eos_id = tok.token_to_id('<eos>')
+    # vocabulary consistency with any existing train-side cache: a mismatch means
+    # the two corpora builds cannot be paired — refuse rather than serve it.
+    import glob as _glob
+    for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v4_*.json')):
+        try:
+            _mv = json.load(open(_mp, encoding='utf-8')).get('vocab')
+        except Exception:
+            continue
+        if _mv is not None and int(_mv) != int(vocab):
+            raise RuntimeError(f'load_wikitest: the freshly fitted tokenizer (vocab={vocab}) disagrees with the cached train corpus (vocab={_mv} in {_mp}) — the splits cannot be paired; delete wt103_cache/ and rebuild both')
+    print(f'[data] tokenising TEST split (cap {n_seqs * seq_len + seq_len} tokens) ...')
+    _trows = list(test_rows) if not isinstance(test_rows, list) else test_rows
+    ids = _tokenise_row_chunks([_trows[s:s + 10000] for s in range(0, len(_trows), 10000)], n_seqs * seq_len + seq_len, 'test', tok, eos_id)
+    n_have = min(len(ids) // seq_len, n_seqs)
+    if n_have < n_seqs:
+        print(f'[data] WARNING: test split yields only {n_have} full rows (< {n_seqs} requested) — the final-test evaluation runs on {n_have} rows')
+    test_batch = ids[:n_have * seq_len].reshape(n_have, seq_len)
+    print(f'[data] TEST rows = {n_have} (seq_len={seq_len}, vocab={vocab})')
+    bnd_ids = sorted(boundary_token_ids(tok, eos_id))
+    test_bnd = np.isin(test_batch, bnd_ids)
+    for _p, _a in ((te_path, test_batch), (tb_path, test_bnd)):
+        _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(_p)), prefix=os.path.basename(_p) + '.', suffix='.tmp')
+        try:
+            with os.fdopen(_fd, 'wb') as _fh:
+                np.save(_fh, _a)
+            os.replace(_tmp, _p)
+        except BaseException:
+            try:
+                os.unlink(_tmp)
+            except OSError:
+                pass
+            raise
+    atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(test_batch), 'fit_fp': _text_fp(train_fit_rows)}, indent=0)
+    try:
+        tok.save(tk_path)
+    except Exception as _e:
+        print(f'[data] NOTE: could not persist the test tokenizer ({type(_e).__name__}: {_e}) — a rebuild will re-fit it deterministically')
+    print('[data] cached TEST token ids to disk (held-out split; final evaluation only)')
+    return (test_batch, vocab, tok, test_bnd)
+
 _FWEB_MEMO = {}
 _FWEB_MEMO_CAP = 2
 
@@ -3281,6 +3446,46 @@ def by_len_cells(rows, Ln, variant=None):
         if ppl_is_usable(cell.get('ppl')):
             out.append(cell)
     return out
+
+def holm_adjust(named_pvals, alpha=0.05):
+    """Holm-Bonferroni step-down adjustment over a family of comparisons.
+
+    输入 [(name, p), ...]（NaN/越界的 p 记为无法校正并原样透传，不进入排序），
+    输出 {name: {'p_raw', 'p_holm', 'rank', 'reject', 'm_effective'}}。
+    family 的定义必须由调用方预先声明（预注册的族用冻结清单，探索性的族
+    明示「未预注册」），本函数只做数学，不做族的选择——族的选择正是
+    多重比较问题的来源（design_notes §4/§17）。"""
+    fam = []
+    invalid = {}
+    for name, p in named_pvals:
+        try:
+            pv = float(p)
+        except (TypeError, ValueError):
+            pv = float('nan')
+        if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
+            invalid[str(name)] = {'p_raw': p, 'p_holm': None, 'rank': None, 'reject': False, 'reason': 'p not in [0,1] or not finite'}
+            continue
+        fam.append((str(name), pv))
+    out = dict(invalid)
+    m = len(fam)
+    order = sorted(fam, key=lambda kv: kv[1])
+    prev = 0.0
+    for i, (name, p) in enumerate(order):
+        adj = min(1.0, (m - i) * p)
+        prev = max(prev, adj)
+        out[name] = {'p_raw': p, 'p_holm': float(prev), 'rank': i + 1, 'reject': bool(prev <= alpha), 'm_effective': m}
+    return out
+
+def signflip_p_floor(n):
+    """双侧精确符号翻转检验在 n 个种子下的最小可达 p 值（2/2^n）；
+    n<=0 返回 NaN。用于报告「未显著是分辨率上限还是数据结论」。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return float('nan')
+    if n <= 0:
+        return float('nan')
+    return 2.0 / float(1 << n)
 
 def finite_range(named_values):
     vals, dropped = ([], [])

@@ -25,6 +25,9 @@
 | `v9_supp.py` | **v9 驱动**：P2T（seq-2048 的 topk 扫描，`batch_size=1`）与 P2S3（RoPE 20k 长跑的第三个 seed） |
 | `v10_supp.py` | **v10 驱动**：P3M 长度外推机制 + 干扰项注入探针、P3S 交叉面板扩规模、P3T topk 扫描补至 4 seeds |
 | `v11_supp.py` | **v11 驱动**：统计收尾——干扰探针扩到 n=6（P4MT/P4MP）、交叉面板扩到 n=4（P4S）、d=384 配对臂扩到 n=4（P4F） |
+| `v12_supp.py` | **v12 确认驱动（评审响应）**：P5C 把从头训练的选择器对照（`csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`）补到 n=6，P5MP 跑扩展腐坏模式探针（uniform/natural/mask/delete + NIAH-natural）到 n=6，P5S2/P5S3 补等 token 与等计算预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估** |
+| `confirmation_frozen.json` | **预注册冻结清单**（入库）：冻结臂、种子 0-5、终点、精确符号翻转 + Holm、决策规则——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
+| `DECISION_LOG.md` | **决策日志**（入库）：每个版本为什么跑/不跑什么、看到什么、据此决定了什么——探索/确认分离的书面轨迹 |
 | `m0_supp.py` | **M0/S1 驱动（已选定 B 档）**：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力吞吐基准）、`full`（S1 主面板）；见下文“B 档 M0/S1”与 `docs/compute_plan.md` |
 | `build_report.py` | 零 GPU 报告构建器：从 `results_*/` + `analysis_*/` 产物重建 v7 报告（所有数字现算，绝不硬编码） |
 | `fuse_analysis.py` | 零 GPU fuse 对比驱动：从 `results_*/summary.json` 重算逐层边界对齐（tol=1）、块长统计与 PPL 曲线 |
@@ -58,9 +61,14 @@ pip install datasets tokenizers matplotlib
 # 只读这两个文件，对其分词可逐 token 复现 `wt103_cache/*.npy` 缓存，
 # 因此该回退是纯可用性路径，不会改变任何测量结果。
 # 若 `wt103_cache/` 已有缓存，语料直接由缓存提供，完全无需下载。
+# v12 P5T 的独立最终测试另读 `wiki.test.raw`（load_wikitest，同一目录
+# 搜索路径；该 split 此前任何阶段都不读）。更换 train 语料后请删除整个
+# wt103_cache/ 重建（test 缓存不会跟随静默重建）。
 
 # 1) 端到端校验整个流水线（smoke，不 push）：
 python run_gapfill.py smoke
+python v10_supp.py smoke           # 同时覆盖新腐坏模式 + NIAH + 从头训练对照
+python v12_supp.py smoke           # 同时覆盖冻结最终测试的完整往返
 
 # 2) 正式补充实验（受运行时上限约束）：
 nohup python run_gapfill.py full > run_v6.log 2>&1 &
@@ -192,12 +200,36 @@ python v10_supp.py analysis       # 零 GPU 统计 -> analysis_v10/
 python v10_supp.py report         # 从磁盘重建 REPORT_v10.md（零 GPU）
 ```
 
-阶段（均可续跑）：P3MT（重训两个 RoPE 臂，P1L 配方）、P3MP（仅评估的
-远距离干扰注入：成对污染上下文、干净的 512-token 目标，对比
-learned-selection / dense / random-indexer / see-everything 各臂）、
-P3T（topk 扫描 seeds 2/3 → n=4）、P3SS/P3SL（d=128/4L 8000 步与
-d=512/10L 4000 步交叉面板）。成对污染协议与预注册交叉判据的设计依据见
+阶段（均可续跑）：P3MT（重训两个 RoPE 臂，P1L 配方）、P3MTC（**同预算
+从头训练的选择器对照**：`csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`，
+后者同时充当逐项对齐的 dense 孪生臂）、P3MP（仅评估的远距离干扰注入：
+成对污染上下文、干净的 512-token 目标，对比 learned-selection / dense /
+random-indexer / see-everything 各臂，**uniform / natural / mask / delete
+四种腐坏模式** + NIAH-natural 远端必要信息任务）、P3T（topk 扫描
+seeds 2/3 → n=4）、P3SS/P3SL（d=128/4L 8000 步与 d=512/10L 4000 步交叉
+面板）、P3SL2/P3SL3（**等 token 与等计算预算的大模型臂**——规模混杂修复，
+见 `docs/design_notes.md` §16）。成对污染协议、预注册交叉判据、腐坏模式/
+ΔNLL 口径（§15）与「测试时干预 vs 从头训练对照」的区别（§18）见
 `docs/design_notes.md`。
+
+### v12 确认套件（探索 / 确认分离）
+
+```bash
+python v12_supp.py smoke           # 端到端自检（微型 ckpt + 冻结清单副本）
+python v12_supp.py phase P5C       # 选择器对照补到 n=6（可续跑；0-2 由 P3MTC 覆盖）
+python v12_supp.py phase P5MP      # 扩展探针（全部模式 + NIAH + 对照）补到 n=6
+python v12_supp.py phase P5S2      # 等 token 大规模臂（8000 步）
+python v12_supp.py phase P5S3      # 等计算预算大规模臂（参数量比例缩步）
+python v12_supp.py phase P5T       # 冻结后的最终测试（读 wiki.test.raw，需冻结清单）
+python v12_supp.py analysis        # 零 GPU：共享 v10 统计 + 冻结确认性统计
+python v12_supp.py report          # 从磁盘重建 REPORT_v12.md（零 GPU）
+```
+
+P5T 在 `confirmation_frozen.json` 缺失时拒绝运行，代码语义戳与清单不一致
+时同样拒绝（必须显式重冻结）。test split（`wiki.test.raw`，经
+`load_wikitest`）**只**被 P5T 读取——此前所有 phase 只读 train/valid。
+首次 test split 评估之后禁止追加冻结比较或种子（构造性选择偏差，见
+`DECISION_LOG.md`）。
 
 ### v8 / v9 收尾套件
 

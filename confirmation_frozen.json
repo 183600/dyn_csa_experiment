@@ -1,0 +1,64 @@
+{
+  "frozen_at": "2026-10-16",
+  "purpose": "Pre-registered confirmation plan: v6-v11 (and the v10/v12 reviewer-response extensions) all selected methods, arms, comparisons and seeds on the SAME validation split, so their p-values are exploratory. This manifest freezes the main comparisons, endpoints, seed count and statistics BEFORE any WikiText-103 test-split evaluation, and the confirmation data (wiki.test.raw) has never been read by any earlier phase.",
+  "code_semantics_expected": "v11.125",
+  "arms": [
+    "csa_fixed_rope",
+    "full_rope",
+    "csa_fixed_rope_randidx",
+    "csa_fixed_rope_allblocks"
+  ],
+  "seeds": [0, 1, 2, 3, 4, 5],
+  "training_recipe": "P3MT/P4MT/P5C: 3000 steps, seq 512, batch 12 (~18.4M tokens/run), identical data order per seed; csa_fixed_rope & full_rope via P4MT (seeds 0-5), controls via P5C (seeds 0-5, same recipe and outdir).",
+  "eval": {
+    "data": "wiki.test.raw via exp_lib.load_wikitest (held out; the ONLY phase allowed to read it)",
+    "by_length_ppl": [512, 1024, 2048, 4096],
+    "distractor_probe": {
+      "mode": "uniform",
+      "rhos": [0.0, 0.125, 0.25, 0.5],
+      "eval_lens": [2048, 4096],
+      "target": 512,
+      "n_seq": 16
+    }
+  },
+  "primary_comparisons": [
+    {
+      "name": "main: csa_fixed_rope - full_rope @ L4096 (test)",
+      "a": "csa_fixed_rope",
+      "b": "full_rope",
+      "endpoint": "by_len.ppl@4096",
+      "hypothesis_direction": "csa_fixed_rope better (negative delta) would confirm the sparse length-extrapolation advantage seen on validation"
+    },
+    {
+      "name": "control: csa_fixed_rope_randidx - csa_fixed_rope @ L4096 (test)",
+      "a": "csa_fixed_rope_randidx",
+      "b": "csa_fixed_rope",
+      "endpoint": "by_len.ppl@4096",
+      "hypothesis_direction": "positive delta would confirm that learned selection beats a TRAINED random selector at equal budget (the test-time intervention cannot answer this)"
+    },
+    {
+      "name": "control: csa_fixed_rope_allblocks - csa_fixed_rope @ L4096 (test)",
+      "a": "csa_fixed_rope_allblocks",
+      "b": "csa_fixed_rope",
+      "endpoint": "by_len.ppl@4096",
+      "hypothesis_direction": "positive delta would confirm that learned top-32 selection beats TRAINED all-block reading at equal budget"
+    },
+    {
+      "name": "aligned-dense: full_rope - csa_fixed_rope_allblocks @ L4096 (test)",
+      "a": "full_rope",
+      "b": "csa_fixed_rope_allblocks",
+      "endpoint": "by_len.ppl@4096",
+      "hypothesis_direction": "isolates block-compression/KV-projection from selection: same-projection dense-style reading vs standard dense attention"
+    }
+  ],
+  "statistics": {
+    "test": "exact two-sided sign-flip over paired per-seed deltas",
+    "n_seeds": 6,
+    "p_floor": 0.03125,
+    "family": "primary_comparisons only (m=4)",
+    "correction": "holm step-down",
+    "decision_rule": "A comparison is CONFIRMED only if p_holm < 0.05 AND its direction matches the validation-panel estimate; otherwise the claim stays exploratory. Probe/delta-NLL/NIAH results on the test split are reported descriptively (secondary) and carry no significance claims.",
+    "seed_policy": "seeds 0-5 fixed above; no seeds may be added after the first test-split evaluation (adding seeds after seeing results is selection bias by construction). Missing seeds at run time are reported as-is (smaller honest n), never topped up."
+  },
+  "history_note": "Frozen in the same commit that introduces v12_supp.py / the reviewer-response fixes; the test split has never been read by the codebase before (README previously documented only train/valid)."
+}

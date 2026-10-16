@@ -27,6 +27,9 @@ needed to reproduce the results on a machine of your own.
 | `v9_supp.py` | **the v9 driver**: P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
 | `v10_supp.py` | **the v10 driver**: P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
 | `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
+| `v12_supp.py` | **the v12 confirmation driver (reviewer-response)**: P5C trains the from-scratch selector controls (`csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`) at n=6, P5MP runs the extended corruption-mode probe (uniform/natural/mask/delete + NIAH-natural) at n=6, P5S2/P5S3 add the token-matched and compute-matched large-scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` |
+| `confirmation_frozen.json` | **pre-registered confirmation plan** (tracked): frozen arms, seeds 0-5, endpoints, exact sign-flip + Holm, decision rule — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
+| `DECISION_LOG.md` | **decision log** (tracked): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail |
 | `m0_supp.py` | **the M0/S1 driver (adopted B tier)**: entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below and `docs/compute_plan.md` |
 | `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk, never hard-coded) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
@@ -65,6 +68,8 @@ pip install datasets tokenizers matplotlib
 
 # 1) validate the whole pipeline end to end (smoke run, no push):
 python run_gapfill.py smoke
+python v10_supp.py smoke           # also covers the new corruption modes + NIAH + controls
+python v12_supp.py smoke           # also covers the frozen final-test roundtrip
 
 # 2) the real supplementary study (bounded by the run-time cap):
 nohup python run_gapfill.py full > run_v6.log 2>&1 &
@@ -217,12 +222,40 @@ python v10_supp.py report         # rebuild REPORT_v10.md from disk (zero GPU)
 ```
 
 Phases (each resumable): P3MT (retrain the two RoPE arms, the P1L recipe),
-P3MP (eval-only far-distance distractor injection: paired corrupted
-contexts, clean 512-token target, learned-selection vs dense vs
-random-indexer vs see-everything arms), P3T (topk sweep seeds 2/3 → n=4),
-P3SS/P3SL (d=128/4L 8000-step and d=512/10L 4000-step crossover panels).
+P3MTC (**from-scratch selector controls under the exact same budget**:
+`csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`; the latter doubles as
+the item-by-item-aligned dense twin), P3MP (eval-only far-distance distractor
+injection: paired corrupted contexts, clean 512-token target, learned-selection
+vs dense vs random-indexer vs see-everything arms, **uniform / natural /
+mask / delete corruption modes** + the NIAH-natural far-necessity task), P3T
+(topk sweep seeds 2/3 → n=4), P3SS/P3SL (d=128/4L 8000-step and d=512/10L
+4000-step crossover panels), P3SL2/P3SL3 (**token-matched and
+compute-matched large arms** — the scale-confound fix; see
+docs/design_notes.md §16).
 See `docs/design_notes.md` for the design rationale behind the
-paired-corruption protocol and the pre-registered crossover criterion.
+paired-corruption protocol, the pre-registered crossover criterion, the
+corruption-mode/ΔNLL semantics (§15) and the intervention-vs-trained-control
+distinction (§18).
+
+### v12 confirmation suite (exploration / confirmation split)
+
+```bash
+python v12_supp.py smoke           # end-to-end self-check (tiny ckpts + a smoke freeze manifest)
+python v12_supp.py phase P5C       # selector controls to n=6 (resumable; 0-2 covered by P3MTC)
+python v12_supp.py phase P5MP      # extended probe (all modes + NIAH + controls) to n=6
+python v12_supp.py phase P5S2      # token-matched large scale arm (8000 steps)
+python v12_supp.py phase P5S3      # compute-matched large scale arm (param-ratio steps)
+python v12_supp.py phase P5T       # FROZEN final test on wiki.test.raw (requires the freeze manifest)
+python v12_supp.py analysis        # zero-GPU: shared v10 stats + frozen final-test stats
+python v12_supp.py report          # rebuild REPORT_v12.md from disk (zero GPU)
+```
+
+P5T refuses to run without `confirmation_frozen.json`, and refuses again if
+the code-semantics stamp no longer matches the manifest (a conscious re-freeze
+is required). The test split (`wiki.test.raw`, via `load_wikitest`) is read by
+P5T **only** — every earlier phase reads train/valid exclusively. After the
+first test-split evaluation, no frozen comparison or seed may be added
+(selection bias by construction; see `DECISION_LOG.md`).
 
 ### v8 / v9 close-out suites
 

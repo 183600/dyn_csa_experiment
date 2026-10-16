@@ -549,6 +549,19 @@ class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
 def make_layer_cfgs_v7(n_layers, variant):
     if variant == 'csa_fixed_rope':
         return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
+    if variant == 'csa_fixed_rope_randidx':
+        # 从头训练的随机选择对照（评审点 2）：与 csa_fixed_rope 逐字段一致，
+        # 仅 indexer_mode='random'。它回答的是「训练充分的随机选择」而非
+        # 「测试时把已训练模型的选择器换成随机」——后者（v10 P3MP 的
+        # randidx 臂）测的是依赖性，本变体测的是选择方式本身的优劣。
+        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='random', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
+    if variant == 'csa_fixed_rope_allblocks':
+        # 从头训练的全块读取对照（评审点 2 + 5）：与 csa_fixed_rope 同一
+        # c_kv 压缩 / qk_norm / RoPE / sink / 窗口投影，仅 index_topk 覆盖
+        # 全部块（lightning_indexer 内部 k=min(topk, B)）。它同时是
+        # 「逐项对齐的 dense」——与 full_rope 的差别只剩 KV 压缩投影与
+        # 分块读取方式，不再是投影/归一化/编码的混合差异。
+        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=1000000, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_dynamic_rope':
         return [AttnCfgRope(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'hybrid_fixed_rope':
@@ -1015,8 +1028,27 @@ def exact_sign_permutation(deltas):
     d = d[np.isfinite(d)]
     n = len(d)
     n_dropped = int(len(d_in) - n)
+
+    def _extras(res, d, n):
+        """效应量与逐种子差值（评审点 4）：报告必须给出逐种子 Δ 与
+        d_z（配对差均值/样本标准差），并把该 n 下的 p 值分辨率下限
+        一并写出，避免把分辨率上限误读为数据结论。纯增量字段。"""
+        res['per_seed'] = [float(x) for x in d.tolist()]
+        res['p_floor'] = math.ldexp(2.0, -int(n)) if n > 0 else float('nan')
+        _sd = res.get('std', 0.0)
+        _mu = res.get('mean', float('nan'))
+        if (not isinstance(_sd, (int, float))) or (not math.isfinite(_mu)):
+            res['cohens_dz'] = float('nan')
+        elif _sd > 1e-12:
+            res['cohens_dz'] = float(_mu / _sd)
+        elif abs(_mu) < 1e-300:
+            res['cohens_dz'] = 0.0
+        else:
+            res['cohens_dz'] = float('inf') if _mu > 0 else float('-inf')
+        res['test'] = 'exact two-sided sign-flip over paired per-seed deltas'
+        return res
     if n == 0:
-        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'p_exact_signflip': float('nan'), 'n_flips': 0, 'n_dropped': n_dropped}
+        return _extras({'n': 0, 'mean': float('nan'), 'std': float('nan'), 'p_exact_signflip': float('nan'), 'n_flips': 0, 'n_dropped': n_dropped}, d, n)
     obs = abs(d.mean())
     if n > 20:
         rng = np.random.default_rng(0)
@@ -1028,7 +1060,7 @@ def exact_sign_permutation(deltas):
             signs = np.where(rng.random((bs, n)) < 0.5, 1.0, -1.0)
             cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
         p = float(cnt / (B + 1))
-        return {'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': B, 'n_dropped': n_dropped}
+        return _extras({'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': B, 'n_dropped': n_dropped}, d, n)
     cnt = 0
     total = 1 << n
     bitpos = np.arange(n, dtype=np.int64)[None, :]
@@ -1039,7 +1071,7 @@ def exact_sign_permutation(deltas):
         flips = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
         cnt += int((np.abs((flips * d[None, :]).mean(1)) >= obs - 1e-12).sum())
     p = float(cnt / total)
-    return {'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': int(total), 'n_dropped': n_dropped}
+    return _extras({'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': int(total), 'n_dropped': n_dropped}, d, n)
 
 def flops_analysis(outdir='analysis_v7', seq_lens=None):
     os.makedirs(outdir, exist_ok=True)
