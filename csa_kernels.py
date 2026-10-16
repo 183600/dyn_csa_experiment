@@ -198,8 +198,8 @@ def _seg_structure(keys, n_rows):
 def _seg_apply(seg, values, out_flat):
     """按共享段结构把一个头的值表归约进逐头 fp32 扁平行：值经同一排列
     gather 后 cumsum，段和写入 seg_id 行（调用方保证 out_flat 已清零；
-    未被任何键覆盖的行保持零，与旧「零初始化全头缓冲后按 seg_id·nh+h
-    写入、末尾一次 cast」逐头 cast 的形式逐位一致）。"""
+    未被任何键覆盖的行保持零，与「零初始化全头缓冲后按 seg_id·nh+h
+    写入、末尾一次 cast」逐头 cast 的参考形式逐位一致）。"""
     order, seg_end, seg_id_k, keep = seg
     val_s = values.index_select(0, order).to(torch.float32)
     csum = val_s.cumsum_(dim=0)
@@ -402,11 +402,10 @@ _POOL_CHUNK_HARD_BYTES = 512 << 20
 
 
 def _pool_chunk_b(R, Ltot, c, temps=1):
-    # 软预算决定常规 chunk（旧口径不变）；硬顶只在单 chunk 的 ~temps 份
-    # [R,ch,·,c] 临时量峰值可能越界时收紧（fwd 的 logit/sc/gather 约 6
-    # 份，bwd 再加 gsc/glogit 约 8 份）——常规规模下分块与旧值一致、
-    # 迭代次数不变，只在超大几何（长块 × 宽通道 × 大批次）下生效。
-    # chunk 只划分独立的块列，宽度不影响任何逐块值。
+    # 软上限决定常规 chunk；硬顶只在单 chunk 的 ~temps 份 [R,ch,·,c]
+    # 临时量峰值可能越界时收紧（fwd 的 logit/sc/gather 约 6 份，bwd 再
+    # 加 gsc/glogit 约 8 份）。chunk 只划分独立的块列，宽度不影响任何
+    # 逐块值。
     per_block = max(1, int(R) * int(Ltot) * int(c) * 4)
     ch = max(1, min(int(_POOL_CHUNK_BYTES) // per_block, 4096))
     return max(1, min(ch, int(_POOL_CHUNK_HARD_BYTES) // max(1, int(temps) * per_block)))
@@ -437,8 +436,7 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     L, W = geom.max_len, geom.W_b
     has_b = Xb is not None and W > 0
     assert Za.shape[-1] == c, 'pool 语义要求 X 与 Z 同宽（kv_dim）'
-    # 每个块列都被下方的分块循环恰好写一次：零初始化是白跑的一遍全幅
-    # 写，直接 empty。
+    # 每个块列都被下方的分块循环恰好写一次，故直接 empty。
     comp = torch.empty((R, Bm, c), device=dev, dtype=dtype)
     jA = torch.arange(L, device=dev)
     g_a, av_all = geom.gather_geom()
@@ -454,9 +452,9 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
         b1 = min(b0 + ch, Bm)
         av = av_all[:, b0:b1]
         # 这些 logit 张量都是本轮新算出的临时量（无别名），fill 原地进行——
-        # 值与出位版逐位相同。无效泳道随即被 masked_fill_ 覆盖为 -inf，
-        # 旧的 * av / * vm 置零乘法是死计算（被覆盖 lanes 的最终值与乘前
-        # 无关，含 NaN/inf 边角——masked_fill 一律改写）。
+        # 值与出位版逐位相同。无效泳道随即被 masked_fill_ 覆盖为 -inf
+        # （被覆盖 lanes 的最终值与乘前无关，含 NaN/inf 边角——masked_fill
+        # 一律改写）。
         logit_a = _gather_rows(Za, g_a[:, b0:b1]) + Bp_a[None, None]
         logit_a.masked_fill_(~av, _NEG_INF)
         if has_b:
@@ -533,9 +531,8 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
         b1 = min(b0 + ch, Bm)
         av = av_all[:, b0:b1]
         # 这些 logit 张量都是本轮新算出的临时量（无别名），fill 原地进行——
-        # 值与出位版逐位相同。无效泳道随即被 masked_fill_ 覆盖为 -inf，
-        # 旧的 * av / * vm 置零乘法是死计算（被覆盖 lanes 的最终值与乘前
-        # 无关，masked_fill 一律改写）。
+        # 值与出位版逐位相同。无效泳道随即被 masked_fill_ 覆盖为 -inf
+        # （被覆盖 lanes 的最终值与乘前无关，masked_fill 一律改写）。
         logit_a = _gather_rows(Za, g_a[:, b0:b1]) + Bp_a[None, None]
         logit_a.masked_fill_(~av, _NEG_INF)
         if has_b:
@@ -692,9 +689,9 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     # int64 升型循环外一次），布尔值与全幅形式逐格相同，[R, T, Bm] 全幅
     # 掩码不物化。
     lt64 = last_tok.to(torch.int64)
-    # 工作精度 = max(dtype, fp32)（fp32/bf16/fp16 输入与旧硬编码 fp32 口径
-    # 逐位一致；fp64 输入全 fp64，前向/反向同一精度合同）。升型整体只做
-    # 一次（逐片 cast 的值与整张 cast 后取片逐位一致）。
+    # 工作精度 = max(dtype, fp32)（fp32/bf16/fp16 输入取 fp32；fp64 输入
+    # 全 fp64，前向/反向同一精度合同）。升型整体只做一次（逐片 cast 的值
+    # 与整张 cast 后取片逐位一致）。
     acc = torch.promote_types(dtype, torch.float32)
     qIf = qI if qI.dtype == acc else qI.to(acc)
     kIf = kI if kI.dtype == acc else kI.to(acc)
@@ -774,18 +771,16 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
     dtype = qI.dtype
     if t_chunk is None:
         # 每 chunk 同时存活的 [R,tc,Bm] 级临时量约 nIH+8 份（Mk、s_list、
-        # s_all、masked、e、ds 及逐元素中间量）：旧固定 128 在大 Bm 下
-        # 超预算、小 Bm 下白白多跑 T/128 轮循环。chunk 只划分独立的
-        # (r,t) 行（dkI 的跨 chunk 累加分组属低阶位口径，与
-        # CSA_KERNEL_IDX_CHUNK 覆盖同理）。
+        # s_all、masked、e、ds 及逐元素中间量）：t_chunk 按此封顶。
+        # chunk 只划分独立的 (r,t) 行（dkI 的跨 chunk 累加分组属低阶位
+        # 口径，与 CSA_KERNEL_IDX_CHUNK 覆盖同理）。
         t_chunk = max(1, min(T, (192 << 20) // max(int(R) * int(Bm) * 4 * (int(nIH) + 8), 1)))
     t_idx = torch.arange(T, device=dev)[None, :, None]
     # 同 _indexer_fwd_ref：causal 按 t 分块现算（同一整数比较），全幅
     # [R, T, Bm] 掩码不物化。
     lt64 = last_tok.to(torch.int64)
-    # 工作精度 = max(dtype, fp32)：fp32 / bf16 / fp16 输入下与硬编码 fp32
-    # 的旧口径逐位一致；fp64 输入下全 fp64（旧口径把 e/ds 升成 fp64 后与
-    # fp32 的 kIf/q_c 在同一 einsum 里混 dtype，反向直接报错）。
+    # 工作精度 = max(dtype, fp32)：fp32 / bf16 / fp16 输入取 fp32，
+    # fp64 输入全 fp64，前向/反向同一精度合同。
     acc = torch.promote_types(dtype, torch.float32)
     gsf = gs.to(acc)
     softf = soft.to(acc)
@@ -815,7 +810,7 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
         s_list = []
         for i in range(nIH):
             # 原地 relu：后面用到的 (s_i > 0) 与 relu(s_i)>0 逐位同真，
-            # dw 用的 relu(s_i) 即本张量自身——不再保留 relu 前的副本。
+            # dw 用的 relu(s_i) 即本张量自身。
             s_i = torch.einsum('rth,rbh->rtb', q_c[:, :, i, :], kIf[:, :, i, :])
             if dtype != torch.float32:
                 # 与前向（_indexer_fwd_ref）同一逐头舍入结构：反向的 relu
@@ -901,9 +896,8 @@ _ATTN_REF_BUDGET = 256 << 20
 def _attn_t_chunk(R, M, nh, hd):
     # 头循环在 t-chunk 之外（见 _attn_fwd_ref/_attn_bwd_ref）：同时存活的
     # 临时量只是单个头的若干 [R,tc,M,hd] 级张量（gather 出的 K/V 两半、
-    # bwd 的 Kl/Vl 拼接与 dk/dv 泳道碎片，合计约 6 份），与 nh 无关——
-    # 旧口径把预算除以 nh，chunk 数被人为放大约 nh/6 倍。chunk 只划分
-    # 独立的 (r,t) 行，宽度不影响任何元素值。
+    # bwd 的 Kl/Vl 拼接与 dk/dv 泳道碎片，合计约 6 份），与 nh 无关。
+    # chunk 只划分独立的 (r,t) 行，宽度不影响任何元素值。
     per_t = max(1, 6 * int(R) * int(M) * int(hd) * 4)
     return max(1, min(int(_ATTN_REF_BUDGET) // per_t, 256))
 
@@ -934,11 +928,10 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     tc = _attn_t_chunk(R, M, nh, hd)
     # 头在外、t-chunk 在内：各 (t,h) 的前向计算相互独立，循环顺序交换
     # 不改变任何元素值。chunk 内的 lt_sel/sel_ok/src_win/win_ok/anyrow
-    # 全部与 h 无关——在头循环外按 chunk 各算一次（同值）。topk 的 int64
-    # 升型不在循环外整幅物化：chunks 只持有 int32 原张量的行切片（视图，
-    # 同批精确整数），int64 形式在头循环内按 chunk 现算（同值，HCA 臂的
-    # [R,T,Bm] 全幅 int64 由此不再出现）；lt_sel 只用于构造 sel_ok，不进
-    # chunks 清单。
+    # 全部与 h 无关——在头循环外按 chunk 各算一次（同值）。chunks 只持有
+    # topk 的 int32 原张量行切片（视图，同批精确整数），int64 形式在头
+    # 循环内按 chunk 现算（同值）；lt_sel 只用于构造 sel_ok，不进 chunks
+    # 清单。
     lt_l = last_tok.to(torch.int64)
     chunks = []
     for t0 in range(0, T, tc):
@@ -1013,16 +1006,14 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     # 头在外、t-chunk 在内：各 (t,h) 独立。chunk 内的几何/掩码/soft 常量
     # 与 h 无关——头循环外按 chunk 各算一次（同值；soft_l[:, :, :nb] 同时
     # 兼作逐头重置的 sf cast）。topk 行切片只以原 dtype 视图入清单，
-    # int64 升型在头循环内按 chunk 现算（同批精确整数——HCA 臂的
-    # [R,T,Bm] 全幅 int64 不再物化）；lt_sel 只用于构造 sel_ok，不入清单。
+    # int64 升型在头循环内按 chunk 现算（同批精确整数）；lt_sel 只用于
+    # 构造 sel_ok，不入清单。
     # 键值梯度碎片按头收集、逐头归约：dk/dv（或 dksw/dvsw）的键逐元素
     # 相同、不含头维，段结构预建一次、全部头共用（见 _seg_structure）。
     # 碎片按 (r,t,j) 全局行序直接写进 [R,T,·,hd] 扁平缓冲（同键条目的
-    # 相对顺序与旧的逐 chunk 拼接+排序 flush 形式逐元素一致，排序序列
-    # 与段和不变；拼接缓冲与 cat 拷贝消除），归约目标从 [R·Bm·nh,hd] /
-    # [R·T·nh,hd] 的全头 fp32 累加器改为逐头复用的 [R·Bm,hd] / [R·T,hd]
-    # 单 slab（段和逐头 cast 进 dtype 出口行——与旧的全头 fp32 累加后
-    # 一次 cast 逐位一致），峰值 fp32 占用降至约 1/nh。
+    # 相对顺序与逐 chunk 拼接+排序 flush 形式逐元素一致，排序序列与段和
+    # 不变），归约目标为逐头复用的 [R·Bm,hd] / [R·T,hd] 单 slab（段和逐头
+    # cast 进 dtype 出口行——与全头 fp32 累加后一次 cast 逐位一致）。
     lt_l = last_tok.to(torch.int64)
     dk_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dkb else None
     dv_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dvb else None
@@ -1065,9 +1056,8 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
 
     def _flush(h, frags, slabs, seg, outs):
         # dk/dv（或 dksw/dvsw）键逐元素相同，共享同一次排序段和；段和写
-        # 进逐头 slab 的 seg_id 行（slab 每头清零——未被选择覆盖的行与
-        # 旧的全头零缓冲同值），随后逐头 cast 进 dtype 出口；None（未请
-        # 求的梯度）跳过。
+        # 进逐头 slab 的 seg_id 行（slab 每头清零——未被选择覆盖的行保持
+        # 零），随后逐头 cast 进 dtype 出口；None（未请求的梯度）跳过。
         for frag, slab, out in zip(frags, slabs, outs):
             if frag is None:
                 continue
@@ -1316,7 +1306,7 @@ def _kernels():
     # 偏移，TF 是完整序列长（qI/w 的行 stride），scores/输出按块内 T 寻址。
     # T0=0、TF=T 时寻址与不分块形式完全一致（同一批全局行、同一批值）。
     # HDP：点积泳道宽（>= 16 的 2 幂）；hd < HDP 时 d 泳道零填充——零乘积
-    # 向点积累加恰好贡献 +0.0，分数逐位不变，hd 不再要求是 2 的幂或 >= 16。
+    # 向点积累加恰好贡献 +0.0，分数逐位不变；hd 无需是 2 的幂或 >= 16。
     @triton.jit
     def idx_score(qI_ptr, kI_ptr, w_ptr, scores_ptr, T0, TF, T, Bm, ISCALE,
                   N_IH: tl.constexpr, HD: tl.constexpr, HDP: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
@@ -1365,7 +1355,7 @@ def _kernels():
     # idx/valid/soft 输出按全局行寻址。逐轮的软分直接取本轮最大值 m：has
     # 为真时 masked[pick] 与 m 是同一个 fp32 值（work 只在非因果/非有限
     # 泳道与 masked 不同，而那些泳道使 has 为假），has 为假时 sv 被紧随的
-    # where/nan 守卫清零——两种情形都与旧的全宽 extract 归约同值。
+    # where/nan 守卫清零——两种情形都与全宽 extract 归约同值。
     @triton.jit
     def idx_topk(scores_ptr, last_tok_ptr, idx_ptr, valid_ptr, soft_ptr, T0, TF, T, Bm,
                  K: tl.constexpr, BB: tl.constexpr):
@@ -2053,7 +2043,7 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk):
     w_idx = w_idx.contiguous()
     last_tok = last_tok.contiguous()
     # 打分泳道宽补到 >= 16 的 2 幂（零填充泳道对点积恰好贡献 +0.0，分数
-    # 逐位不变），hd 不再要求是 2 的幂或 >= 16。
+    # 逐位不变）；hd 无需是 2 的幂或 >= 16。
     HDP = max(_next_pow2(hd), 16)
     k_out = min(int(topk), Bm)
     BB2 = _next_pow2(Bm)

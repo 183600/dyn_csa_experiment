@@ -547,8 +547,7 @@ def _arange_exp_cache(n, m, device):
 
 def causal_window_mask_f(T, window, device, dtype):
     """causal_window_mask 的目标 dtype 形式（逐元素 cast 对 0/-inf 精确；
-    缓存键含 dtype，mask 下游只读——消掉同一 (T, window, dtype) 在每个
-    稀疏层、每个 step 的 [T,T] 重分配）。dtype 相同则无新分配。"""
+    缓存键含 dtype，mask 下游只读）。dtype 相同则无新分配。"""
     base = causal_window_mask(T, window, device)
     if base.dtype == dtype:
         return base
@@ -1280,8 +1279,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     dest -= 1
     # int64 -> int32 narrowing, on the kept slice only — same integers
     # (index transport, design notes §6.1).  keep/dest are already exactly
-    # _w_keep wide (keep = cf.gather(1, order_w), dest = keep.cumsum), so the
-    # old [:, :_w_keep] re-slices were identity views and are dropped.
+    # _w_keep wide (keep = cf.gather(1, order_w), dest = keep.cumsum).
     order_k = order_w.to(torch.int32)
     # Sentinel-column scatter instead of the boolean-mask assignment
     # (kept[grid[keep], dest[keep]] = order_k[keep]): masked advanced indexing
@@ -1298,9 +1296,9 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     kept = kept[:, :_w_keep]
     # last_tok from either pooling path is non-decreasing (a cumsum of
     # non-negative counts followed by the monotone (ends-1).clamp(0, n-1)),
-    # so every row of `causal` is a prefix of Trues: the first-max argmax of
-    # the old cast form returns 0 for any row with a readable block, and 0
-    # for an all-False row (ties resolve to index 0) — identically zero.
+    # so every row of `causal` is a prefix of Trues: the first-max argmax
+    # returns 0 for any row with a readable block, and 0 for an all-False
+    # row (ties resolve to index 0) — identically zero.
     # The padded lanes are masked downstream via the selection-valid mask
     # either way, so the zeros are the same integers the argmax produced
     # (host-side integer equivalence, design notes §6.2).
@@ -1374,12 +1372,9 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         raise ValueError("lightning_indexer: query_chunk=None is not 'use the default'; pass the default (2048) explicitly or omit the argument")
     query_chunk = max(1, min(int(query_chunk), n))
     # 瞬态封顶（只收紧 chunk 行数——下方注释已论证逐 chunk 融合与全宽
-    # 形式逐行逐位一致；用固定 256MB 而不是随机器空闲显存波动的口径，
-    # 分块边界是 (n, B, nIH, dtype) 的纯函数，跨机器确定）：每 chunk 同时
-    # 物化 raw [nIH,·,B]、scores、masked、int64 order 与 keep/dest/tgt 等
-    # 选择表，旧代码对 query_chunk 不设预算，宽 B（长序列多块）下瞬态
-    # 无界。现行规模下该 cap 不触发（边界与旧值一致），只在更大的块数下
-    # 收紧。
+    # 形式逐行逐位一致；用固定 256MB 的口径，分块边界是 (n, B, nIH, dtype)
+    # 的纯函数，跨机器确定）：每 chunk 同时物化 raw [nIH,·,B]、scores、
+    # masked、int64 order 与 keep/dest/tgt 等选择表。
     _iper = int(B) * (int(nIH) * int(H.element_size()) + 40) + 64
     if _iper > 0:
         query_chunk = max(1, min(query_chunk, (256 << 20) // _iper))
@@ -1596,14 +1591,13 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             valid = torch.cat([sel_blk, win_valid_all[s:e]], dim=1)
             nvalid = ~valid[:, None, :]
             anyrow = None if _has_sink else valid.any(-1)
-        # Two half-gathers instead of a per-call cat of [k_blk|k_sw] (and the
-        # same for V): the block half of the old stacked index table was
-        # topk_l[:, j] (rows 0..n_blk-1 of the stacked tensor == k_blk rows)
-        # and the window half was win_idx + n_blk, so rows n_blk+j of the
-        # stacked tensor == row j of k_sw.  index_select returns exactly the
-        # same source rows, so the gathered values — and hence every
-        # downstream value — are bit-identical to the cat-then-gather form
-        # (index re-plumbing only, design notes §6.1).
+        # Two half-gathers (and the same for V): the block half gathers the
+        # k_blk rows topk_l addresses (rows 0..n_blk-1 of the stacked tensor
+        # == k_blk rows) and the window half gathers k_sw at win_idx (rows
+        # n_blk+j of the stacked tensor == row j of k_sw).  index_select
+        # returns exactly the same source rows, so the gathered values — and
+        # hence every downstream value — are bit-identical to the
+        # cat-then-gather form (index re-plumbing only, design notes §6.1).
         _sel_rows = topk_l[s:e]
         _win_rows = win_idx[s:e]
         if soft is None:
@@ -1622,11 +1616,10 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             out[s:e] = _einsum('qhm,qmhd->qhd', attn, Vset)
             continue
         Vset = torch.cat([_tk2(v_blk, _sel_rows), _tk2(v_sw, _win_rows)], 1)
-        # The soft branch only ever read Kset through its [selected|window]
-        # halves, so the halves are gathered directly and the full-width K
-        # cat is skipped: a cat's slices hold exactly the copied values of
-        # the two gather outputs, so kb/kw — the operands the two logits
-        # einsums save for backward — are bit-identical to the
+        # The soft branch reads Kset only through its [selected|window]
+        # halves, gathered directly here: a cat's slices hold exactly the
+        # copied values of the two gather outputs, so kb/kw — the operands
+        # the two logits einsums save for backward — are bit-identical to the
         # cat-then-slice form (index re-plumbing only, design notes §6.1).
         kb = _tk2(k_blk, _sel_rows)
         kw = _tk2(k_sw, _win_rows)
