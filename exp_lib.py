@@ -3818,20 +3818,48 @@ def _variant_seed_map(summary):
     return recs, amb
 
 def _paired_seed_deltas(recs, a, b):
-    """Per-seed (a − b) deltas over seeds where BOTH arms have a measurable
-    record AND `pair_reason` confirms identical run_cfg / training budget.
-    Returns (deltas, shared_seeds, skipped) with skipped = [(seed, reason)]."""
-    ra = {s: r for (v, _t, s), r in recs.items() if v == a}
-    rb = {s: r for (v, _t, s), r in recs.items() if v == b}
-    shared = sorted(set(ra) & set(rb))
-    deltas, skipped = [], []
-    for s in shared:
-        reason = pair_reason(ra[s], rb[s])
-        if reason is not None:
-            skipped.append((s, reason))
+    """Per-protocol-condition per-seed (a − b) deltas over seeds where BOTH arms
+    have a measurable record AND `pair_reason` confirms identical run_cfg /
+    training budget.
+
+    Protocol conditions are matched exactly as `_print_pairs` does: equal
+    non-empty tags pair together, and a tagged arm may pair against a pure-base
+    ('') arm.  Two DIFFERENT non-empty conditions are never pooled — collapsing
+    them (keying only on the seed) would fabricate seed counts and compare
+    different measurement protocols (design_notes §3.3).
+
+    Returns {(tag_a, tag_b): (deltas, shared_seeds, skipped)} with
+    skipped = [(seed, reason)]."""
+    ra = {(t, s): r for (v, t, s), r in recs.items() if v == a}
+    rb = {(t, s): r for (v, t, s), r in recs.items() if v == b}
+    _a_t = {t for t, _s in ra}
+    _b_t = {t for t, _s in rb}
+    _a_pure = _a_t == {''}
+    _b_pure = _b_t == {''}
+    conds = []
+    if '' in _a_t and '' in _b_t:
+        conds.append(('', ''))
+    for tag in sorted(_a_t | _b_t):
+        if not tag:
             continue
-        deltas.append(float(ra[s]['ppl']) - float(rb[s]['ppl']))
-    return deltas, shared, skipped
+        if tag in _a_t and tag in _b_t:
+            conds.append((tag, tag))
+        if tag in _a_t and _b_pure:
+            conds.append((tag, ''))
+        if tag in _b_t and _a_pure:
+            conds.append(('', tag))
+    out = {}
+    for ts, bs in conds:
+        seeds = sorted({s for t, s in ra if t == ts} & {s for t, s in rb if t == bs})
+        deltas, skipped = [], []
+        for s in seeds:
+            reason = pair_reason(ra[ts, s], rb[bs, s])
+            if reason is not None:
+                skipped.append((s, reason))
+                continue
+            deltas.append(float(ra[ts, s]['ppl']) - float(rb[bs, s]['ppl']))
+        out[(ts, bs)] = (deltas, seeds, skipped)
+    return out
 
 def methodology_audit(summary, design=None, *, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True):
     """Zero-GPU audit of controlled comparison, ablation completeness and
@@ -3851,17 +3879,25 @@ def methodology_audit(summary, design=None, *, alpha=0.05, min_n=3, outdir=None,
         complete = 0
         for a, b, note in contrasts:
             a_present, b_present = (a in present, b in present)
-            deltas, shared, skipped = _paired_seed_deltas(recs, a, b)
-            st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
+            conds = _paired_seed_deltas(recs, a, b)
             _cfg_a = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == a), None)
             _cfg_b = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == b), None)
-            st.update({'with': a, 'without': b, 'note': note, 'n_shared': len(shared), 'n_skipped': len(skipped), 'skipped_reasons': sorted({reason for _s, reason in skipped}), 'controlled': bool(deltas) and (not skipped), 'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b, 'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None})
-            entries.append(st)
-            if a_present and b_present:
+            _any_delta = False
+            for (ts, bs), (deltas, shared, skipped) in sorted(conds.items()):
+                st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
+                st.update({'with': a, 'without': b, 'note': note, 'tag_with': ts, 'tag_without': bs, 'n_shared': len(shared), 'n_skipped': len(skipped), 'skipped_reasons': sorted({reason for _s, reason in skipped}), 'controlled': bool(deltas) and (not skipped), 'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b, 'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None})
+                entries.append(st)
                 if deltas:
+                    _any_delta = True
+            if a_present and b_present:
+                if _any_delta:
                     complete += 1
-                elif skipped:
-                    report['warnings'].append('%s: `%s` vs `%s` both measured but NO seed clears the same-run_cfg gate — %s' % (comp, a, b, '; '.join(sorted({reason for _s, reason in skipped}))))
+                else:
+                    _why = sorted({reason for (_dl, _sh, _sk) in conds.values() for _s, reason in _sk})
+                    if _why:
+                        report['warnings'].append('%s: `%s` vs `%s` both measured but NO seed clears the same-run_cfg gate — %s' % (comp, a, b, '; '.join(_why)))
+                    else:
+                        report['warnings'].append('%s: `%s` vs `%s` both measured but share no common protocol condition/seed — no contrast computed' % (comp, a, b))
             elif a_present != b_present:
                 report['warnings'].append('%s: incomplete leave-one-out `%s` vs `%s` — missing `%s`' % (comp, a, b, a if not a_present else b))
             else:
@@ -3891,7 +3927,8 @@ def _print_methodology_audit(report):
         for e in live:
             _c = 'controlled (same run_cfg)' if e['controlled'] else ('UNCONTROLLED: ' + '; '.join(e['skipped_reasons']))
             _p = ('%.4f' % e['p_exact_signflip']) if math.isfinite(e['p_exact_signflip']) else 'n/a'
-            print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p))
+            _tag = '' if e.get('tag_with', '') == e.get('tag_without', '') == '' else '   [%s vs %s]' % (e.get('tag_with') or '(base)', e.get('tag_without') or '(base)')
+            print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p, _tag))
             print('        %s | %s' % (_c, e['effect_vs_noise']))
     if report['unverified_components']:
         print('  unverified innovations (no complete leave-one-out contrast measured): ' + ', '.join(report['unverified_components']))
