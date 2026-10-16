@@ -268,8 +268,8 @@ def _h2d_async(host_src, dtype, device):
     # inference_mode(False) guard keeps the result a normal tensor even when the
     # caller runs under inference_mode (eval), so it can later serve as an
     # autograd index tensor.  CUDA uploads stage through the pooled pinned
-    # buffers of `_h2d_stage` (same bit-exact copy, no per-call host pinning);
-    # the pin-per-call form below remains as the fallback.
+    # buffers of `_h2d_stage` (same bit-exact copy); the fallback form below
+    # remains available.
     with torch.inference_mode(False):
         t = torch.as_tensor(host_src, dtype=dtype)
         if t.device == device:
@@ -997,8 +997,8 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
     # _pool_parts / _pool_ordered / pool_blocks_single (the same flat
     # builders above, the same per-row `_pool_cpu` counts); here the whole
     # batch's flats are concatenated into ONE staged upload per dtype class
-    # (one int64, one bool) per layer instead of per row, and the per-row
-    # views are attached to each row's block-ids object under exactly the
+    # (one int64, one bool) per layer, and the per-row views are attached to
+    # each row's block-ids object under exactly the
     # keys the lazy lookups use — so _pool_parts / _pool_geom hit them
     # verbatim, including on the _pool_trainable recompute in backward.
     # Rows whose host build cannot serve are skipped; their lazy path falls
@@ -1152,12 +1152,11 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     Zam = _take_2d(Zas, g_a)
     Xbm = _take_2d(Xbs, g_b)
     Zbm = _take_2d(Zbs, g_b)
-    # Position-embedding add restricted to valid lanes arithmetically
-    # (one fused multiply-add, no boolean nonzero/index_put and no ragged
-    # gather): multiplying by the 0/1 mask adds exactly the same values on
-    # valid lanes and exactly 0 on pad lanes; pad lanes are then overwritten
-    # with -inf. Forward values and B_pos gradients (zero on invalid lanes in
-    # both forms) are identical to the previous boolean-index form.
+    # Position-embedding add restricted to valid lanes arithmetically:
+    # multiplying by the 0/1 mask adds exactly the same values on valid lanes
+    # and exactly 0 on pad lanes; pad lanes are then overwritten with -inf.
+    # Forward values and B_pos gradients (zero on invalid lanes in both forms)
+    # are identical to the boolean-index form.
     # += on the fresh _take_2d outputs: the same elementwise kernel with the
     # same values as the out-of-place add (AddBackward saves no tensor, and
     # the only downstream consumer chain — masked_fill_/cat/softmax — keeps
@@ -1165,9 +1164,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     Zam += B_pos_a[_pos_a][None] * mask_a[:, :, None]
     Zbm += B_pos_b[b_off] * mask_b[:, :, None]
     # the fill mask broadcasts: masked_fill_ accepts a broadcastable mask, so
-    # the negation materializes [B, L, 1] instead of the full [B, L, c] form —
-    # the same booleans reach every lane (broadcast reads are exact), and the
-    # smaller mask is what autograd saves for the masked_fill backward.
+    # the same booleans reach every lane (broadcast reads are exact).
     Zam.masked_fill_(~mask_a[:, :, None], float('-inf'))
     Zbm.masked_fill_(~mask_b[:, :, None], float('-inf'))
     WinZ = torch.cat([Zam, Zbm], 1)
@@ -1288,15 +1285,12 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     # (index transport, design notes §6.1).  keep/dest are already exactly
     # _w_keep wide (keep = cf.gather(1, order_w), dest = keep.cumsum).
     order_k = order_w.to(torch.int32)
-    # Sentinel-column scatter instead of the boolean-mask assignment
-    # (kept[grid[keep], dest[keep]] = order_k[keep]): masked advanced indexing
-    # goes through nonzero and forces a host sync.  Within a row the kept
-    # lanes hold distinct cumsum ranks (0..cnt-1), so every scatter target
-    # column has exactly one writer; lanes failing `keep` are redirected to a
-    # sentinel column that is sliced away (its undefined winner never leaves
-    # the pad).  The kept columns are therefore the same exact integers as the
-    # masked-assignment form (host-side integer equivalence, design notes
-    # §6.2), with no sync.
+    # Sentinel-column scatter. Within a row the kept lanes hold distinct
+    # cumsum ranks (0..cnt-1), so every scatter target column has exactly one
+    # writer; lanes failing `keep` are redirected to a sentinel column that is
+    # sliced away (its undefined winner never leaves the pad).  The kept
+    # columns are therefore the same exact integers as the masked-assignment
+    # form (host-side integer equivalence, design notes §6.2).
     tgt = torch.where(keep, dest, _w_keep)
     kept = torch.full((n, _w_keep + 1), -1, dtype=torch.int32, device=scores.device)
     kept.scatter_(1, tgt, order_k)
@@ -1493,11 +1487,10 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     if return_mask:
         valid_cols = out_valid[0]
         with torch.no_grad():
-            # Build the (n, B) mask directly instead of scattering into an
-            # (n, B+1) sentinel scratch and slicing off the last column with a
-            # contiguous() copy: only the valid selections are written (1.0
-            # each; duplicate writes of the same cell are idempotent), so the
-            # values are bit-identical to the sentinel form's [.., :B] slice.
+            # Build the (n, B) mask: only the valid selections are written
+            # (1.0 each; duplicate writes of the same cell are idempotent), so
+            # the values are bit-identical to the sentinel form's [.., :B]
+            # slice.
             _il = idx.long()
             _rows = _arange_cache(n, dev)[:, None].expand(n, _il.shape[1])
             m = torch.zeros(n, B, device=dev, dtype=out_dtype)
@@ -1849,8 +1842,7 @@ class HybridAttention(nn.Module):
     def _full_batched(self, x):
         B, T, _ = x.shape
         if x.device.type == 'cuda':
-            # Fused q/k/v projection (CUDA only — see _pre): one GEMM over the
-            # concatenated weight columns instead of three.  Each output
+            # Fused q/k/v projection (CUDA only — see _pre): each output
             # column is an independent dot product over the input dim, so the
             # sliced results are bit-identical to the three separate
             # self.W_*(x) calls (the same row/column independence the
@@ -2058,7 +2050,6 @@ class HybridAttention(nn.Module):
             return ([None] * B, None)
         cfg = self.cfg
         # rowwise batched cumsum — same per-row values as the unbind/stack loop
-        # but one scan kernel instead of B launches plus a stack copy
         prefix_mean = torch.cumsum(sim, dim=-1)
         prefix_mean.div_(_range_cache(1, sim.shape[-1] + 1, x.device))
         tau = prefix_mean + self.delta_logit
@@ -2070,10 +2061,9 @@ class HybridAttention(nn.Module):
         # Batched hoist of the per-row cosine cut computation in the
         # cosine_abs / cosine_adaptive / dynamic branches of `_single` (design
         # notes §6.1): the batched normalize + last-dim reduce is the same
-        # row-independent form _gate_signals already relies on.  The whole
-        # batch makes ONE host transfer (a .cpu() sync per layer) instead of B.
-        # Every integer reaching _single is identical to the per-row
-        # blocks_from_cosine form (same cuts, same segmenter).
+        # row-independent form _gate_signals already relies on.  Every integer
+        # reaching _single is identical to the per-row blocks_from_cosine form
+        # (same cuts, same segmenter).
         cfg = self.cfg
         B, T, _d = x.shape
         if T <= 1:
@@ -2190,8 +2180,7 @@ class HybridAttention(nn.Module):
         core_kv = F.normalize(attn_kv, dim=-1)
         kv_local = F.normalize(Ca_raw, dim=-1)
         if x.device.type == 'cuda':
-            # Fused K/V head (CUDA only — see _pre): one GEMM over the
-            # row-concatenated inputs instead of two.  Every output row is a
+            # Fused K/V head (CUDA only — see _pre): every output row is a
             # function of its own input row only, so the split halves are
             # bit-identical to the two self.W_kvhead(...) calls (row
             # independence, design notes §6.1).
@@ -2273,8 +2262,8 @@ class HybridAttention(nn.Module):
                 pre_blocks = _hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
         elif self.cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (self.cfg.dynamic and self.cfg.kind != 'hca'):
             # same batch-level geometry hoist for the fixed/adaptive cosine
-            # paths: one host transfer per layer instead of B (the cut booleans
-            # and the resulting block ids are identical to the per-row form).
+            # paths (the cut booleans and the resulting block ids are identical
+            # to the per-row form).
             pre_blocks = self._cut_blocks_batched(x)
         if _CK is not None and self.cfg.kind in ('csa', 'hca') and _CK.kernel_enabled():
             # 内核路径（CSA_KERNEL；独立变体，与 eager 统计对照，不逐位承诺）。
@@ -2680,8 +2669,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     eos_id = tok.token_to_id('<eos>')
 
     def stream_tokenise(split, cap_tokens, label, _ds=ds, _tok=tok, _eos=eos_id):
-        # Ids accumulate in bounded numpy chunks instead of one Python list of
-        # ints; the int64 values produced are unchanged.  Rows go through the
+        # Ids accumulate in bounded numpy chunks; the int64 values produced are
+        # unchanged.  Rows go through the
         # boundary / cap-truncation behaviour) are identical to the
         # per-`encode` form.
         chunks = []
@@ -4649,7 +4638,6 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
             continue
         lens = torch.cat([t if torch.is_tensor(t) else torch.as_tensor(t) for t in st]).float()
         n_blocks = sum((t.numel() for t in st)) / len(st)
-        # one stacked transfer for all scalar stats instead of a GPU→CPU sync each
         _sc = torch.stack([lens.mean(), lens.std() if lens.numel() > 1 else torch.zeros((), device=lens.device, dtype=lens.dtype), lens.min().float(), lens.max().float(), (lens <= attn.cfg.min_block).float().mean(), (lens >= attn.cfg.max_block).float().mean()])
         _vals = _sc.tolist()
         entry = {'blocks': n_blocks, 'avg_len': seq_len / max(n_blocks, 1.0), 'len_mean': _vals[0], 'len_std': _vals[1], 'len_min': int(_vals[2]), 'len_max': int(_vals[3]), 'frac_at_min': _vals[4], 'frac_at_max': _vals[5]}

@@ -194,8 +194,7 @@ def _fmt_pm(cell, std=None):
     return f'{mean:.2f} ±{std or 0.0:.2f}'
 
 def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
-    # v9_analysis returns exactly the object it writes to stats_p — reuse it
-    # instead of re-reading/re-parsing the file from disk.
+    # v9_analysis returns exactly the object it writes to stats_p.
     st = v9_analysis(out=stats_p)
     seq2k = st['seq2k_bs1_panel']
     seq2k_old = st.get('seq2k_bs3_panel_historical', {})

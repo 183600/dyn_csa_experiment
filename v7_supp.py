@@ -125,8 +125,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         cfg = self.cfg
         if x.device.type == 'cuda':
             # Fused q/k/v projection (CUDA only — same transport-only form as
-            # exp_lib.HybridAttention._full_batched, design notes §6.1): one
-            # GEMM over the concatenated weight columns instead of three.  Every
+            # exp_lib.HybridAttention._full_batched, design notes §6.1): every
             # output column is an independent dot product over the input dim, so
             # the sliced halves are bit-identical to the three separate
             # self.W_*(x) calls (and their per-column grads are too).
@@ -177,8 +176,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
             return self.W_o(out.reshape(B, T, self.nh * self.hd))
         # windowed and full masks are mutually exclusive: pick the one the call
-        # actually uses instead of materializing the causal mask and discarding
-        # it (both are cached constants, so values are unchanged).
+        # actually uses (both are cached constants, so values are unchanged).
         if cfg.window > 0:
             mask = L.causal_window_mask(T, cfg.window, x.device)
         else:
@@ -250,8 +248,6 @@ class HybridAttentionRoPE(L.HybridAttention):
                     # gate has length T-1 (consecutive-pair cosine similarities),
                     # so the honoured mask must too (cf. exp_lib._single_rope).
                     _hon = torch.zeros(T - 1, dtype=gate.dtype, device=gate.device)
-                    # batched one-shot index upload instead of a Python-list
-                    # __setitem__ (which re-converts the list each forward)
                     _hon[torch.as_tensor(list(_hon_d), dtype=torch.long, device=gate.device)] = 1.0
                     _soft_hon = gate * _hon
                     _shs = _soft_hon.sum()
@@ -383,9 +379,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 valid = torch.cat([sel, _wvalid_all[s:e]], 1)
                 _nvalid = ~valid[:, None, :]
                 _anyrow = valid.any(-1) if sink is None else None
-            # Two half-gathers instead of a per-call cat of [k_blk|k_sw]:
             # ib selects rows of k_blk_r / v_blk and _wi_all selects rows of
-            # k_sw_r / v_sw — exactly the rows the old cat-then-gather form
+            # k_sw_r / v_sw — exactly the rows the cat-then-gather form
             # addressed through the +n_blk offsets, so every gathered value is
             # bit-identical (index re-plumbing only, §6.1).
             Kset = torch.cat([L._take_2d(k_blk_r, ib), L._take_2d(k_sw_r, _wi_all[s:e])], 1)
@@ -708,8 +703,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     t0 = time.time()
     losses, ppl_hist, warm_hist, switch_ppl = ([], [], [], None)
     _lbuf = []
-    # fixed-capacity window: deque auto-drops the oldest scalar instead of an
-    # O(50) list rebuild every step; the surviving window contents (and hence
+    # fixed-capacity window: the surviving window contents (and hence
     # final_loss_smoothed) are identical to the list form.
     _tail = collections.deque(maxlen=50)
     model.train()

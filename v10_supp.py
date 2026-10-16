@@ -159,8 +159,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
             raise
         tgt = ids[:, 1:]
         _ce = F.cross_entropy(logits.reshape(-1, vocab), tgt[:, -target:].reshape(-1), reduction='none').view(len(rows), target)
-        # keep each chunk's fp64 row-sums on device (fp64 values unchanged);
-        # one host transfer at the end instead of a per-chunk .tolist() sync.
+        # keep each chunk's fp64 row-sums on device (fp64 values unchanged).
         _sum_parts.append(_ce.sum(dim=1, dtype=torch.float64))
         n_tok.extend([target] * len(rows))
         del ids, logits, tgt, _ce
@@ -1058,9 +1057,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
             probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
         contrasts = {}
 
-        # O(1) lookup instead of a full probe_cells scan per contrast arm; the
-        # grouped lists are exactly what the scan would have collected, so the
-        # ambiguity/unambiguous outcomes (and the picked cell) are unchanged.
+        # The grouped lists are exactly what a scan of probe_cells would have
+        # collected, so the ambiguity/unambiguous outcomes (and the picked
+        # cell) are unchanged.
         _cell_idx = {}
         for c in probe_cells:
             _cell_idx.setdefault((c['variant'], c['arm'], c['eval_len'], c['rho'], c['mode']), []).append(c)

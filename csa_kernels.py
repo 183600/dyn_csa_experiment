@@ -959,10 +959,9 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             Vw = _gather_rows(vw_h, src_win).to(torch.float32)
             zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1)
             if scale != 1.0:
-                # x·1.0 is the IEEE identity, so the scale=1.0 path skips the
-                # multiply kernel; the fresh cat output is safe to scale in
-                # place (same elementwise kernel and values as the out-of-place
-                # form, and the CatBackward is unaffected).
+                # x·1.0 is the IEEE identity; the fresh cat output is safe to
+                # scale in place (same elementwise kernel and values as the
+                # out-of-place form, and the CatBackward is unaffected).
                 zA.mul_(scale)
             zA.masked_fill_(~lane_ok, MINL)
             if sink_v is None:
@@ -1090,8 +1089,8 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             Vl = torch.cat([Vb, Vw], dim=-2)
             zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1)
             if scale != 1.0:
-                # same IEEE-identity skip as the forward ref: in-place on the
-                # fresh cat output, same values as the out-of-place form.
+                # same IEEE identity as the forward ref: in-place on the fresh
+                # cat output, same values as the out-of-place form.
                 zA.mul_(scale)
             zA.masked_fill_(~lane_ok, MINL)
             g = torch.einsum('rtd,rtmd->rtm', dOh, Vl)
