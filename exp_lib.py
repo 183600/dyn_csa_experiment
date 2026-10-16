@@ -3466,6 +3466,13 @@ def pair_reason(ra, rb):
         return 'unverifiable run_cfg'
     if ra.get('run_cfg') != rb.get('run_cfg'):
         return 'different run_cfg'
+    # Controlled-variable gate for the settings the run fingerprint does not
+    # carry (optimizer identity / betas / eps, LR-schedule shape, grad-clip,
+    # augmentation).  Only enforced when BOTH records recorded the descriptor,
+    # so legacy records without it still pair exactly as before.
+    _ka, _kb = (ra.get('train_knobs'), rb.get('train_knobs'))
+    if _ka is not None and _kb is not None and _ka != _kb:
+        return 'different train_knobs (optimizer / lr schedule / grad-clip / augmentation)'
     bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
     if bad:
         absent = [k for k in bad if ra.get(k) is None and rb.get(k) is None]
@@ -3595,21 +3602,29 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3):
     """Paired contrast summary with an explicit effect-vs-seed-noise verdict.
 
     Reports n, mean, sample std (ddof=1), sem, Cohen's d_z, the exact
-    sign-flip p, the p-resolution floor at this n, and three booleans:
+    sign-flip p, the p-resolution floor at this n, and four booleans:
 
-      underpowered      — n < `min_n` (the 3-seed floor the reporting rules
-                          require for a key experiment);
-      within_seed_noise — |mean| <= std, i.e. the seed-to-seed spread alone is
-                          at least as large as the reported effect (a +0.2%
-                          mean with 0.5% std is NOT a usable gain);
-      significant       — p < alpha AND NOT within_seed_noise.
+      underpowered       — n < `min_n` (the 3-seed floor the reporting rules
+                           require for a key experiment);
+      resolution_limited — the smallest p the exact sign-flip test can reach
+                           at this n (2/2**n) is still > alpha, so NO effect,
+                           however large, can ever clear the significance bar
+                           at this seed count.  This is a resolution ceiling,
+                           not evidence against the effect, and must not be
+                           read as "no effect";
+      within_seed_noise  — |mean| <= std, i.e. the seed-to-seed spread alone is
+                           at least as large as the reported effect (a +0.2%
+                           mean with 0.5% std is NOT a usable gain);
+      significant        — p < alpha AND NOT within_seed_noise.
 
     Requiring both the test AND the effect-vs-spread check means a large-n
-    p-value can never dress up a sub-noise effect as a real improvement."""
+    p-value can never dress up a sub-noise effect as a real improvement, while
+    `resolution_limited` stops a small-n panel from being read as a negative
+    result when only the test's granularity, not the data, bound the p."""
     d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(float(x))], dtype=float)
     n = int(d.size)
     if n == 0:
-        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'underpowered': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data'}
+        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data'}
     mean = float(d.mean())
     std = float(d.std(ddof=1)) if n > 1 else 0.0
     sem = float(std / math.sqrt(n)) if n > 1 else float('nan')
@@ -3620,18 +3635,22 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3):
         dz = 0.0
     else:
         dz = float('inf') if mean > 0 else float('-inf')
+    p_floor = signflip_p_floor(n)
     underpowered = n < int(min_n)
+    resolution_limited = bool(math.isfinite(p_floor) and p_floor > alpha)
     within_seed_noise = abs(mean) <= std
     significant = bool(math.isfinite(p) and p < alpha and (not within_seed_noise))
     if underpowered:
-        verdict = 'underpowered (n<3)'
+        verdict = 'underpowered (n<%d)' % int(min_n)
     elif within_seed_noise:
         verdict = 'effect within seed noise (|mean|<=std)'
     elif significant:
         verdict = 'effect exceeds seed noise (p<%.3g)' % alpha
+    elif resolution_limited:
+        verdict = 'not decidable at this n: exact-test p floor %.4g > alpha (add seeds to resolve; this is a resolution ceiling, not a null result)' % p_floor
     else:
         verdict = 'not significant at this n (p>=%.3g)' % alpha
-    return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'p_exact_signflip': float(p), 'p_floor': signflip_p_floor(n), 'underpowered': underpowered, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict}
+    return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict}
 
 # `mt` (matched-variant set) and `mr` (mlp_match_ref) can themselves contain
 # underscores (e.g. `full_rope`, `csa_dynamic`), so those two values are
@@ -3861,38 +3880,93 @@ def _paired_seed_deltas(recs, a, b):
         out[(ts, bs)] = (deltas, seeds, skipped)
     return out
 
+def _knobs_equal_across_arms(recs, arms, key):
+    """Compare a per-record descriptor (`run_cfg`, `train_knobs`, ...) across
+    the arms of one component.  Returns True/False/None: True when at least two
+    arms expose the key and all exposed values agree, False when any two
+    disagree, None when fewer than two arms expose it (unverifiable)."""
+    vals = []
+    for a in arms:
+        for (v, _t, _s), r in recs.items():
+            if v != a:
+                continue
+            if key in r and r.get(key) is not None:
+                vals.append(json.dumps(r.get(key), sort_keys=True, default=str))
+            break
+    if len(vals) < 2:
+        return None
+    return len(set(vals)) == 1
+
 def methodology_audit(summary, design=None, *, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True):
     """Zero-GPU audit of controlled comparison, ablation completeness and
     statistical reliability for one panel's `summary` dict.
 
     For every declared leave-one-out contrast it recomputes the per-seed paired
     delta (a strict same-run_cfg pairing), the mean±std / d_z / exact sign-flip
-    p, and flags underpowered (n<3) and noise-level (|mean| <= std) effects.
-    Components with no complete contrast are listed as unverified.  Returns the
-    report dict and, when `outdir` is given, writes `methodology_audit.json`."""
+    p, and flags underpowered (n<min_n) and noise-level (|mean| <= std) effects.
+
+    A component counts as VERIFIED only when at least one contrast is BOTH
+    controlled (same run_cfg / train_knobs) AND adequately powered (n >= min_n)
+    — a one-seed contrast no longer certifies an innovation.  Components are
+    split into `verified_components`, `underpowered_components` (a controlled
+    contrast exists but every one is below `min_n`), `noise_level_components`
+    (adequately powered but no contrast is significant) and
+    `unverified_components` (no controlled contrast at all).  The
+    `controlled_variables` section reports, per component, whether the arms
+    actually share the training knobs / optimizer descriptor.
+
+    Returns the report dict and, when `outdir` is given, writes
+    `methodology_audit.json`."""
     design = ABLATION_DESIGN if design is None else design
     recs, amb = _variant_seed_map(summary)
     present = sorted({v for (v, _t, _s) in recs})
-    report = {'variants_present': present, 'n_measurable': len(recs), 'ambiguous': sorted(amb), 'components': {}, 'unverified_components': [], 'warnings': []}
+    try:
+        _min_sig_n = 1 + int(math.ceil(math.log2(1.0 / float(alpha)))) if 0.0 < float(alpha) < 1.0 else 0
+    except (ValueError, ZeroDivisionError):
+        _min_sig_n = 0
+    report = {'variants_present': present, 'n_measurable': len(recs), 'ambiguous': sorted(amb),
+              'min_n': int(min_n), 'alpha': float(alpha), 'min_seeds_for_significance': _min_sig_n,
+              'components': {},
+              'verified_components': [], 'significant_components': [],
+              'resolution_limited_components': [], 'underpowered_components': [],
+              'noise_level_components': [], 'unverified_components': [],
+              'incomplete_components': [], 'controlled_variables': {}, 'warnings': []}
     for comp, contrasts in design.items():
         entries = []
-        complete = 0
+        arms = set()
+        n_measured = 0
+        n_controlled = 0
+        n_powered = 0
+        n_significant = 0
+        n_powered_noise_free = 0
         for a, b, note in contrasts:
+            arms.update((a, b))
             a_present, b_present = (a in present, b in present)
             conds = _paired_seed_deltas(recs, a, b)
             _cfg_a = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == a), None)
             _cfg_b = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == b), None)
-            _any_delta = False
+            _contrast_measured = False
+            _contrast_controlled = False
+            _contrast_powered = False
             for (ts, bs), (deltas, shared, skipped) in sorted(conds.items()):
                 st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
                 st.update({'with': a, 'without': b, 'note': note, 'tag_with': ts, 'tag_without': bs, 'n_shared': len(shared), 'n_skipped': len(skipped), 'skipped_reasons': sorted({reason for _s, reason in skipped}), 'controlled': bool(deltas) and (not skipped), 'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b, 'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None})
                 entries.append(st)
                 if deltas:
-                    _any_delta = True
+                    _contrast_measured = True
+                if st['controlled']:
+                    _contrast_controlled = True
+                    if st['n'] >= int(min_n):
+                        _contrast_powered = True
+                        if not st['within_seed_noise']:
+                            n_powered_noise_free += 1
+                if st['significant']:
+                    n_significant += 1
+            n_measured += int(_contrast_measured)
+            n_controlled += int(_contrast_controlled)
+            n_powered += int(_contrast_powered)
             if a_present and b_present:
-                if _any_delta:
-                    complete += 1
-                else:
+                if not _contrast_measured:
                     _why = sorted({reason for (_dl, _sh, _sk) in conds.values() for _s, reason in _sk})
                     if _why:
                         report['warnings'].append('%s: `%s` vs `%s` both measured but NO seed clears the same-run_cfg gate — %s' % (comp, a, b, '; '.join(_why)))
@@ -3903,7 +3977,25 @@ def methodology_audit(summary, design=None, *, alpha=0.05, min_n=3, outdir=None,
             else:
                 report['warnings'].append('%s: neither `%s` nor `%s` measured — no leave-one-out for this component yet' % (comp, a, b))
         report['components'][comp] = entries
-        if complete == 0:
+        report['controlled_variables'][comp] = {
+            'run_cfg_equal': _knobs_equal_across_arms(recs, arms, 'run_cfg'),
+            'train_knobs_equal': _knobs_equal_across_arms(recs, arms, 'train_knobs'),
+            'arms_present': sorted(a for a in arms if a in present),
+        }
+        if n_powered > 0:
+            report['verified_components'].append(comp)
+            if n_significant > 0:
+                report['significant_components'].append(comp)
+            elif n_powered_noise_free > 0:
+                report['resolution_limited_components'].append(comp)
+            else:
+                report['noise_level_components'].append(comp)
+        elif n_measured > 0:
+            if n_controlled > 0:
+                report['underpowered_components'].append(comp)
+            else:
+                report['unverified_components'].append(comp)
+        else:
             report['unverified_components'].append(comp)
     if write and outdir:
         try:
@@ -3919,19 +4011,33 @@ def _print_methodology_audit(report):
     print('\n========== methodology audit: controlled comparison / ablation / statistics ==========')
     print('  variants with measurable records: ' + (', '.join(report['variants_present']) or '(none)'))
     print('  Δ = with-module − without-module (perplexity; negative = the module helps).')
+    print('  a component is VERIFIED only by a controlled contrast with n>=%d; p is the exact sign-flip p, floor = 2/2^n.' % int(report.get('min_n', 3)))
     for comp, entries in report['components'].items():
         live = [e for e in entries if e['n_shared'] > 0]
         if not live:
             continue
-        print('  [%s]' % comp)
+        _cv = report.get('controlled_variables', {}).get(comp, {})
+        _kn = _cv.get('train_knobs_equal')
+        _kn_s = {True: 'optimizer/schedule knobs shared', False: 'OPTIMIZER/SCHEDULE KNOBS DIFFER', None: 'optimizer/schedule knobs not recorded (legacy or absent)'}[_kn]
+        print('  [%s]  %s; arms=%s' % (comp, _kn_s, ','.join(_cv.get('arms_present') or []) or 'none'))
         for e in live:
             _c = 'controlled (same run_cfg)' if e['controlled'] else ('UNCONTROLLED: ' + '; '.join(e['skipped_reasons']))
             _p = ('%.4f' % e['p_exact_signflip']) if math.isfinite(e['p_exact_signflip']) else 'n/a'
             _tag = '' if e.get('tag_with', '') == e.get('tag_without', '') == '' else '   [%s vs %s]' % (e.get('tag_with') or '(base)', e.get('tag_without') or '(base)')
             print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p, _tag))
             print('        %s | %s' % (_c, e['effect_vs_noise']))
+    if report['verified_components']:
+        print('  verified innovations (>=1 controlled, powered contrast): ' + ', '.join(report['verified_components']))
+    if report.get('significant_components'):
+        print('  significant (effect exceeds seed noise AND p<alpha): ' + ', '.join(report['significant_components']))
+    if report.get('resolution_limited_components'):
+        print('  resolution-limited (effect exceeds seed noise but the exact p floor > alpha at this n; need n>=%d for p<%g — add seeds, do NOT read as a null): ' % (int(report.get('min_seeds_for_significance', 0)), float(report.get('alpha', 0.05))) + ', '.join(report['resolution_limited_components']))
+    if report.get('noise_level_components'):
+        print('  noise-level (effect within seed noise across all contrasts): ' + ', '.join(report['noise_level_components']))
+    if report.get('underpowered_components'):
+        print('  underpowered innovations (contrasts exist but n<%d — add seeds before claiming an effect): ' % int(report.get('min_n', 3)) + ', '.join(report['underpowered_components']))
     if report['unverified_components']:
-        print('  unverified innovations (no complete leave-one-out contrast measured): ' + ', '.join(report['unverified_components']))
+        print('  unverified innovations (no controlled leave-one-out contrast): ' + ', '.join(report['unverified_components']))
     for w in report['warnings']:
         print('  [warn] ' + w)
     print('======================================================================================')
@@ -4600,6 +4706,40 @@ def is_no_decay(name):
 def is_delta_param(name):
     return 'delta_logit' in name
 
+# ---- 受控变量描述符：优化器 / 调度 / 裁剪 / 数据增强 ----
+# 对比实验要求「除待验证模块外，优化器、学习率策略、训练轮数、数据增强等设置
+# 必须完全一致」。这些设置此前是 train_variant 内的硬编码常量，因此对所有臂
+# 天然一致，但 run_cfg 指纹并不显式记录它们——一旦扩规模时为某条臂单独改优化
+# 器/调度（或将来引入数据增强），两条记录仍可能通过 `pair_reason` 的同
+# run_cfg 门槛而被静默配对。这里把它们提为模块常量，并把同一组常量导出成
+# `training_knobs()` 描述符，随每条记录落盘；`pair_reason` 对两条都带该字段的
+# 记录额外要求逐字段相等（缺字段的历史记录不受影响），审计则把该描述符打印
+# 出来「证明」两臂共享优化器与调度，而不是只靠断言。
+OPT_ADAMW_BETAS = (0.9, 0.999)
+OPT_ADAMW_EPS = 1e-08
+GRAD_CLIP_NORM = 1.0
+LR_FLOOR_MULT = 0.1
+LR_COSINE_AMP = 0.45
+
+def training_knobs():
+    """Canonical, JSON-safe descriptor of the optimisation / schedule /
+    gradient-clipping / augmentation settings shared by every arm of a
+    controlled panel.  Pure function of the module constants above, so it is
+    identical across all arms unless a future scaled run deliberately diverges
+    one (in which case `pair_reason` refuses to pair the records)."""
+    return {
+        'optimizer': 'AdamW',
+        'foreach': True,
+        'betas': list(OPT_ADAMW_BETAS),
+        'eps': OPT_ADAMW_EPS,
+        'param_groups': 'decay (wd) | no-decay (wd=0) | delta_logit (wd=0, lr x delta_lr_mult)',
+        'grad_clip_norm': GRAD_CLIP_NORM,
+        'lr_schedule': 'linear_warmup_then_cosine',
+        'lr_floor_mult': LR_FLOOR_MULT,
+        'lr_cosine_amp': LR_COSINE_AMP,
+        'augmentation': 'none',
+    }
+
 def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False):
     if steps < 1:
         raise ValueError(f'train_variant needs steps >= 1, got steps={steps}')
@@ -4619,7 +4759,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # addcmul / sqrt are elementwise, so every element sees the identical
     # rounding sequence), so the update is bit-identical to the single-tensor
     # form, and on CUDA it pins the already-default foreach path.
-    opt = torch.optim.AdamW([{'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': 1.0}, {'params': ndecay_params, 'weight_decay': 0.0, 'lr_scale': 1.0}, {'params': delta_params, 'weight_decay': 0.0, 'lr_scale': delta_lr_mult}], lr=lr, foreach=True)
+    opt = torch.optim.AdamW([{'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': 1.0}, {'params': ndecay_params, 'weight_decay': 0.0, 'lr_scale': 1.0}, {'params': delta_params, 'weight_decay': 0.0, 'lr_scale': delta_lr_mult}], lr=lr, betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, foreach=True)
     if delta_params:
         print(f'    delta_logit params: {len(delta_params)} (lr x{delta_lr_mult:g})')
 
@@ -4627,7 +4767,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         if warmup > 0 and step < warmup:
             return lr * (step + 1) / warmup
         t = (step - warmup) / max(steps - warmup, 1)
-        return lr * (0.1 + 0.45 * (1.0 + math.cos(math.pi * t)))
+        return lr * (LR_FLOOR_MULT + LR_COSINE_AMP * (1.0 + math.cos(math.pi * t)))
     # lr_scale is only ever set at optimizer construction (never mutated), so
     # the per-group multiplier list is captured once here.
     _lr_scales = [g.get('lr_scale', 1.0) for g in opt.param_groups]
@@ -4662,7 +4802,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             loss = ce + comp_lambda * model.comp_reg
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             opt.step()
             _ce_d = ce.detach()
             _lbuf.append(_ce_d)
@@ -4716,7 +4856,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace}
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs()}
     if return_model:
         result['_model'] = model
     else:

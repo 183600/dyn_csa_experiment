@@ -416,24 +416,41 @@ test split 的缓存纪律与主语料相同（npy + sha256 + 原子写），另
 `<outdir>/methodology_audit.json`。它把评审要求的三件事变成可复核的读数：
 
 - **受控变量**：每条对比先用 `pair_reason` 做严格同 `run_cfg` 配对——
-  优化器（AdamW/foreach）、学习率与 warmup/余弦调度、权重衰减、
-  `delta_lr_mult`、训练步数与 token 数、comp 正则、模型形状、数据指纹与
-  确定性档全部一致，只有层架构（`variant`）不同；`run_cfg_knobs` 只是把
-  该串解码成可读字段便于展示，**真正的门槛仍是整串相等**。被 `pair_reason`
-  拒掉的种子不计入 n，并在 `skipped_reasons` 里点名。
+  学习率、权重衰减、`delta_lr_mult`、训练步数与 token 数、warmup、comp
+  正则、模型形状、数据指纹与确定性档全部一致，只有层架构（`variant`）
+  不同；`run_cfg_knobs` 只是把该串解码成可读字段便于展示，**真正的门槛仍是
+  整串相等**。`run_cfg` 不承载的优化器/调度设置由独立的 `training_knobs()`
+  描述符补足：优化器（AdamW/foreach）、betas/eps、LR 调度形状
+  （warmup→cosine 的 floor/幅度）、梯度裁剪与数据增强一律提为模块常量
+  （`OPT_ADAMW_*` / `GRAD_CLIP_NORM` / `LR_FLOOR_MULT` / `LR_COSINE_AMP`），
+  随每条记录落盘；`train_variant` 实际用的就是这些常量，因此所有臂天然
+  共享。`pair_reason` 对**两条都带该字段**的记录额外要求逐字段相等（缺
+  字段的历史记录不受影响）——一旦扩规模时为某条臂单独改优化器或调度，
+  配对会被明确拒绝并在审计里点名，而不是静默产生一个「换了优化器」的
+  假提升。被 `pair_reason` 拒掉的种子不计入 n，并在 `skipped_reasons`
+  里点名。
 - **消融完整性**：`ABLATION_DESIGN` 声明式地列出每个创新点的留一对照。
   去一法只在**固定分块**下做是不充分的（`csa_fix_*`），因此同一组去一法
   在**动态分块**（提出的主方法）下也有对应臂 `csa_dyn_randidx` /
   `csa_dyn_zerocont` / `csa_dyn_nosink`（与 `csa_dynamic` 逐字段同构，仅
-  待验证模块不同）。没有任何一条完整对照的创新点会被列进
-  `unverified_components`，缺哪个臂会被逐条 warn，而不是靠「有对照」含糊
-  带过。
+  待验证模块不同）。创新点的验证状态按**功效分级**，而不是「有对照即
+  可」：只有至少一条对比**既受控又达到 `min_n`（默认 3）个种子**，
+  该创新点才算 `verified_components`；只有单种子/欠功效对比的被列入
+  `underpowered_components`，完全没有受控对比的列入
+  `unverified_components`，缺哪个臂会被逐条 warn。审计同时为每个创新点
+  导出 `controlled_variables`（`run_cfg_equal` / `train_knobs_equal`），
+  把「两臂共享优化器与调度」变成落盘读数。
 - **统计可靠性**：`paired_effect_stats` 给逐种子 Δ 的 mean±std（ddof=1）、
   `cohens_dz`、精确符号翻转 p 与该 n 的 p 下限，并显式标出
-  `underpowered`（n<3）与 `within_seed_noise`（|mean| ≤ std，即 +0.2%
-  的均值配 0.5% 的方差这种噪声级「提升」）；`significant` 同时要求
-  p<α 且效应大于种子噪声，避免大 n 的 p 值把亚噪声效应包装成真实增益。
-  核心配对表 `_print_pairs` 同样改用该统计，逐条打印 p 与噪声判词。
+  `underpowered`（n<`min_n`）、`resolution_limited`（精确检验在该 n 的
+  最小可达 p 仍 > α，即**无论效应多大都不可能达到显著性**——这是分辨率
+  上限、不是零结果）与 `within_seed_noise`（|mean| ≤ std，即 +0.2% 的
+  均值配 0.5% 的方差这种噪声级「提升」）；`significant` 同时要求 p<α 且
+  效应大于种子噪声，避免大 n 的 p 值把亚噪声效应包装成真实增益。α=0.05
+  时符号翻转检验须 n≥6 才可能显著，审计据此把「效应大于噪声但 n 不足以
+  判定」的对比单列为 `resolution_limited_components`，与分析建议「优先
+  补种子」一致。核心配对表 `_print_pairs` 同样改用该统计，逐条打印 p 与
+  噪声/分辨率判词。
 
 `exact_signflip_p` 对 n≤20 穷举 2ⁿ 符号翻转（确定性、与各驱动套件同一
 检验），n>20 用确定性正态近似；`signflip_p_floor` 给出分辨率下限，使
