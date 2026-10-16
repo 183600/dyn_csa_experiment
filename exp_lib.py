@@ -2209,8 +2209,8 @@ class HybridAttention(nn.Module):
             # 无梯度（评估）时 gathered_attention 的 soft 直通分支整体是死
             # 的（_soft_live=False 见其注释），索引器据此不物化 soft 尾部，
             # 并以 soft_form=True 固定走软分支的硬部分解——两者前向 bit 与
-            # 传入 soft 的形式完全一致，只省掉无梯度下不产生任何下游值的
-            # 计算。有梯度时条件为 False，图与取值和原先逐一相同。
+            # 传入 soft 的形式完全一致。有梯度时条件为 False，走传入 soft
+            # 的完整图。
             _need_soft = torch.is_grad_enabled()
             _, topk_idx, soft = lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=_pool_ends_host(bid), need_soft=_need_soft)
             out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], soft_form=True)
