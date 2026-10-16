@@ -27,7 +27,7 @@ if _NEEDED:
         print(f"[setup] could not install {', '.join(_NEEDED)} ({type(_pip_err).__name__}: {_pip_err}) — continuing; a code path that actually needs them will raise ImportError")
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections
+import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, bisect
 from math import comb
 from dataclasses import dataclass
 import numpy as np
@@ -1316,7 +1316,29 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
 
 _TOPK_CLAMP_WARNED = set()
 
-def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_mask=True, query_chunk=2048, random_select=False, pre_qI=None, pre_w=None, out_valid=None):
+def _pool_ends_host(bid):
+    # 宿主侧「块结束位置（独占）」表：cumsum 的分段器 counts（_pool_cpu[0]）。
+    # 池化侧 last_tok 由同一 counts 的 cumsum-1 生成（monotonic 顺序下
+    # order 为恒等），且 counts 逐项 ≤ n，clamp(0, n-1) 从不改写任何值，
+    # 故 ends[j]-1 与 last_tok[j] 是同一批整数（design notes §6.2 的宿主侧
+    # 整数等价）。缓存挂在不可变的 block_ids 对象上（与 _pool_parts 同一
+    # 约定）；缺失/形状不符时返回 None，调用方回退全宽。
+    ends = getattr(bid, '_pool_ends_host', None)
+    if ends is None:
+        _cpu = getattr(bid, '_pool_cpu', None)
+        if _cpu is None:
+            return None
+        try:
+            ends = [int(v) for v in itertools.accumulate(_cpu[0])]
+        except (TypeError, ValueError):
+            return None
+        try:
+            bid._pool_ends_host = ends
+        except (AttributeError, RuntimeError):
+            pass
+    return ends
+
+def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_mask=True, query_chunk=2048, random_select=False, pre_qI=None, pre_w=None, out_valid=None, causal_ends_host=None, need_soft=True):
     n = H.shape[0]
     B = comp_kv.shape[0]
     dev = H.device
@@ -1386,6 +1408,15 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     # 切片原样回传，与 forward 的 outs[b] = o 同一 transport 论证，§6.1）。
     # 全宽的 [n, B] scores / masked / int64 order 因此从不物化。
     _kw = max(min(int(topk), int(B)), 0)
+    # 列收窄（仅当调用方给出宿主侧 ends 且长度与 B 相符）：行 pos 的可读块
+    # 集合是 {b : ends[b] ≤ pos}（last_tok[b] = ends[b]-1，counts 逐项 ≥ 0
+    # 使 ends 非降），chunk 内 pos ≤ e-1，故可读列全部落在前缀
+    # [0, bisect_right(ends, e-1)) 内；被截去的列对 chunk 内每一行都是
+    # causal=False，在 _indexer_selection 里一律 masked 成 -inf、keep=False
+    # ——截断只缩短 -inf 尾部，有限项的稳定降序序与 keep/dest/pad 整数逐位
+    # 不变（被丢掉的 -inf 平局列无论选中与否都进不了 kept）。tie 规则两分支
+    # 同理（'latest' 在 [0, B') 内的相对序与全宽一致）。
+    _colw = causal_ends_host if (causal_ends_host is not None and len(causal_ends_host) == B) else None
     idx = torch.empty(n, _kw, device=dev, dtype=torch.int32)
     soft = None
     if out_valid is None and return_mask:
@@ -1412,13 +1443,28 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             c = torch.einsum('inb,ni->nb', raw, w_idx[s:e])
         if out_dtype is None:
             out_dtype = c.dtype
-            soft = torch.empty(n, _kw, device=c.device, dtype=out_dtype)
+            if need_soft:
+                soft = torch.empty(n, _kw, device=c.device, dtype=out_dtype)
+        _csel = c
+        _ccausal = causal[s:e]
+        if _colw is not None:
+            # 切片列的值即全宽对应列的值（索引搬运，design notes §6.1）。
+            _wsel = max(1, min(bisect.bisect_right(_colw, e - 1), B))
+            _csel = c[:, :_wsel]
+            _ccausal = _ccausal[:, :_wsel]
         with torch.no_grad():
             _box = []
-            _ic = _indexer_selection(c, causal[s:e], k, out_valid=_box)
+            _ic = _indexer_selection(_csel, _ccausal, k, out_valid=_box)
         idx[s:e] = _ic
         if _valid_parts is not None:
             _valid_parts.append(_box[0])
+        if not need_soft:
+            # need_soft=False 的调用方（无梯度评估）只消费 idx：soft 是
+            # gathered_attention 直通分支（该分支在无梯度下被 _soft_live 整体
+            # 跳过）的唯一下游，故整条 soft 尾部不物化（不改变 idx 的任何
+            # 整数，也不改变下游任何前向 bit）。
+            del c, _ic
+            continue
         c.masked_fill_(_ncausal[s:e], float('-inf'))
         _lse = torch.logsumexp(c, dim=-1, keepdim=True)
         # the gather output is fresh and nothing downstream needs the pre-subtract
@@ -1496,7 +1542,7 @@ def _finfo_min(dtype):
         _FO_MINL[dtype] = v
     return v
 
-def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=512, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False):
+def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=512, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False, soft_form=False):
     n = q.shape[0]
     dev = q.device
     if mem_budget_bytes is None:
@@ -1562,6 +1608,15 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _has_sv = sel_valid is not None
     _dedup = (not topk_distinct) and _nb > 1
     _has_sink = sink_logits is not None
+    # soft 只经直通 (soft_attn - soft_attn.detach()).add_(attn) 进入前向值：
+    # soft_attn 是 _sink_split_softmax/nan_to_num 之后的输出、恒有限，x - x
+    # 精确相消为 +0.0，且 0.0 加回 attn 逐位不变（attn 全元非负，无 -0.0
+    # 符号翻转），故跳过该分支不改变任何前向 bit；该子图对 soft/q/K/V 的梯度
+    # 也恒为 0（d(x - detach(x)) = 0），因此仅当确有相关张量需要梯度时才保留
+    # 它。训练/checkpoint 重算都在 grad 开启下运行，条件与首次前向一致。
+    _soft_live = soft is not None and torch.is_grad_enabled() and any(
+        _t is not None and getattr(_t, 'requires_grad', False)
+        for _t in (soft, q, k_blk, v_blk, k_sw, v_sw, sink_logits))
     _tk2 = _take_2d
     _einsum = torch.einsum
     if _has_all:
@@ -1600,7 +1655,10 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # cat-then-gather form (index re-plumbing only, design notes §6.1).
         _sel_rows = topk_l[s:e]
         _win_rows = win_idx[s:e]
-        if soft is None:
+        # soft_form=True 在 soft=None 时仍选用软分支的硬部分解（两个半段
+        # logits + cat），供调用方在跳过（无梯度下已死的）soft 尾部后保持
+        # 硬分支逐位一致；它不改变任何取值，只固定走哪套既有分解。
+        if soft is None and not soft_form:
             Kset = torch.cat([_tk2(k_blk, _sel_rows), _tk2(k_sw, _win_rows)], 1)
             Vset = torch.cat([_tk2(v_blk, _sel_rows), _tk2(v_sw, _win_rows)], 1)
             logits = _einsum('qhd,qmhd->qhm', qseg, Kset)
@@ -1623,11 +1681,6 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # cat-then-slice form (index re-plumbing only, design notes §6.1).
         kb = _tk2(k_blk, _sel_rows)
         kw = _tk2(k_sw, _win_rows)
-        soft_g = soft[s:e]
-        if keep is not None:
-            soft_g = soft_g * keep
-        soft_log_g = torch.log(soft_g.clamp_min(1e-12))
-        soft_log_g.masked_fill_(soft_g <= 0, _MINL)
         blk_logits = _einsum('qhd,qmhd->qhm', qseg, kb)
         if scale != 1.0:
             blk_logits.mul_(scale)
@@ -1635,13 +1688,20 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         if scale != 1.0:
             win_logits.mul_(scale)
         logits = torch.cat([blk_logits, win_logits], -1)
-        soft_logits = logits.clone()
-        soft_logits[:, :, :_nb].add_(soft_log_g[:, None, :]).clamp_min_(_MINL)
-        soft_logits.masked_fill_(nvalid, _MINL)
-        soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
+        if _soft_live:
+            soft_g = soft[s:e]
+            if keep is not None:
+                soft_g = soft_g * keep
+            soft_log_g = torch.log(soft_g.clamp_min(1e-12))
+            soft_log_g.masked_fill_(soft_g <= 0, _MINL)
+            soft_logits = logits.clone()
+            soft_logits[:, :, :_nb].add_(soft_log_g[:, None, :]).clamp_min_(_MINL)
+            soft_logits.masked_fill_(nvalid, _MINL)
+            soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
         logits.masked_fill_(nvalid, _MINL)
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
-        attn = (soft_attn - soft_attn.detach()).add_(attn)
+        if _soft_live:
+            attn = (soft_attn - soft_attn.detach()).add_(attn)
         if not _has_sink:
             attn.mul_(anyrow[:, None, None])
         out[s:e] = _einsum('qhm,qmhd->qhd', attn, Vset)
@@ -2146,8 +2206,14 @@ class HybridAttention(nn.Module):
         else:
             topk = cfg.index_topk
             _sel_valid_box = []
-            _, topk_idx, soft = lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box)
-            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0])
+            # 无梯度（评估）时 gathered_attention 的 soft 直通分支整体是死
+            # 的（_soft_live=False 见其注释），索引器据此不物化 soft 尾部，
+            # 并以 soft_form=True 固定走软分支的硬部分解——两者前向 bit 与
+            # 传入 soft 的形式完全一致，只省掉无梯度下不产生任何下游值的
+            # 计算。有梯度时条件为 False，图与取值和原先逐一相同。
+            _need_soft = torch.is_grad_enabled()
+            _, topk_idx, soft = lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=_pool_ends_host(bid), need_soft=_need_soft)
+            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], soft_form=True)
         return (self.W_o(out.reshape(T, self.nh * self.hd)), gate_mean)
 
     def forward(self, x):
