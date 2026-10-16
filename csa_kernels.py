@@ -1255,7 +1255,7 @@ def _kernels():
         pid_c = pid % nc
         rb = pid // nc
         b = rb % Bm
-        r = rb // Bm
+        r = (rb // Bm).to(tl.int64)
         cs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         cm = cs < C
         st = tl.load(starts_ptr + r * Bm + b).to(tl.int64)
@@ -1294,9 +1294,9 @@ def _kernels():
         if HAS_B:
             xb = tl.load(Xb_ptr + (r * T + gB[:, None]) * C + cs[None, :], mask=b_ok[:, None] & cm[None, :], other=0.0).to(tl.float32)
             acc += tl.sum(eb * xb, 0) / Zs
-        # store 基址升 int64：(r·Bm + b)·C 在 R·Bm·C ≥ 2³¹ 的超大配置下按
-        # int32 求值会溢出（gather 侧都经 gA/gB 的 int64 广播，只有这条
-        # 输出链是纯 int32）。
+        # r 从 pid 派生时就升到 int64，因此行基址 (r·T + gA/gB) 与输出基址
+        # (r·Bm + b)·C 全在 int64 下求值：R·T·C 或 R·Bm·C ≥ 2³¹ 的超大配置下，
+        # int32 的基址乘法会回绕并静默读到/写到错误的行。
         tl.store(comp_ptr + (r * Bm + b).to(tl.int64) * C + cs, acc.to(comp_ptr.dtype.element_ty), mask=cm)
 
     ns.pool_fwd = pool_fwd

@@ -3535,7 +3535,9 @@ def signflip_p_floor(n):
         return float('nan')
     if n <= 0:
         return float('nan')
-    return 2.0 / float(1 << n)
+    # same value as 2/2**n but computed in the float exponent range, so a
+    # large seed count can no longer overflow the intermediate `1 << n`
+    return math.ldexp(2.0, -n)
 
 def finite_range(named_values):
     vals, dropped = ([], [])

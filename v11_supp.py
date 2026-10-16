@@ -309,7 +309,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                 continue
             _me += 1
             _rc = _v.get('run_cfg')
-            if (isinstance(_rc, str) and _rc.endswith(f'_cs{L.code_stamp()}')) or (_v.get('_code') == L.CODE_SEMANTICS):
+            if (isinstance(_rc, str) and _rc.endswith(f'_cs{L.code_stamp()}')) or (_v.get('_code') == L.code_stamp()):
                 _st += 1
         if _tot:
             _prov_panels.append((_p.split('/')[0], _tot, _me, _st, _sy))
