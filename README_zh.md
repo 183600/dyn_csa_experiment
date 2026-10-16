@@ -1,10 +1,10 @@
 # Dynamic-Block CSA + HCA — WikiText-103 对照实验
 
+[English](README.md) | **中文说明**
+
 在小型从零训练语言模型（BPE-8k，WikiText-103）中，对**压缩块稀疏注意力**
 （CSA / HCA，固定分块与动态分块）与稠密注意力进行受控对比研究。本仓库包含
 实验代码以及在自己机器上复现结果所需的全部内容。
-
-**English** | [中文说明](README.md)
 
 ## 仓库结构
 
@@ -16,10 +16,10 @@
 
 | 路径 | 说明 |
 |---|---|
-| `exp_lib.py` | **核心库，也是唯一的代码来源（source of truth）**：模型、CSA/HCA 注意力、池化、indexer、分段器、训练循环、聚合与统计 |
+| `exp_lib.py` | **核心库，也是唯一的代码来源**：模型、CSA/HCA 注意力、池化、indexer、分段器、训练循环、聚合与统计 |
 | `csa_kernels.py` | **三算子融合内核路径**（docs/compute_plan.md §3 的 M0 工作包）：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文「Triton 内核路径（M0/G0）」 |
 | `run_gapfill.py` | **v6 驱动**：最小可发表补充实验，支持断点续跑，受运行时上限约束，每阶段完成后自动 push，结束后自动关机 |
-| `par.py` | **任务级并行执行器（可选）**：每个独立实验占一张 GPU 卡——见下文"任务级并行" |
+| `par.py` | **任务级并行执行器（可选）**：每个独立实验占一张 GPU 卡——见下文「任务级并行」 |
 | `v7_supp.py` | **v7 驱动**：回应 reviewer 的补充实验套件——P0R RoPE+QK-norm、P0W 稠密预热、P0E 40k 步长跑、P2S 规模重播种、P1L 长度外推、P1T topk 扫描 |
 | `v8_supp.py` | **v8 驱动**：P1S（规模面板补齐至 4 seeds）与 P2R（RoPE+QK-norm 20k 步长跑） |
 | `v9_supp.py` | **v9 驱动**：P2T（seq-2048 的 topk 扫描，`batch_size=1`）与 P2S3（RoPE 20k 长跑的第三个 seed） |

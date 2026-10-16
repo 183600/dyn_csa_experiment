@@ -10,11 +10,14 @@ needed to reproduce the results on a machine of your own.
 
 ## Repository layout
 
-仓库只保留**源码、驱动脚本与设计文档**。所有实验结果目录（`results_*/`）、
-零 GPU 分析目录（`analysis_*/`）、逐版报告（`REPORT*.md`）与运行状态文件
-都**不入库**——它们由下面的驱动脚本在跑实验的机器上重新生成，需要时本地
-复现即可（见下一节的命令）。`.gitignore` 已把这几类路径挡在仓库外（`docs/`
-只保留 `design_notes.md` 与 `compute_plan.md`）。
+The repository keeps only **source code, driver scripts and design
+documents**. All experiment result directories (`results_*/`), zero-GPU
+analysis directories (`analysis_*/`), per-version reports (`REPORT*.md`) and
+run-state files are **not tracked** — the driver scripts below regenerate them
+on whatever machine runs the experiments, so you can simply reproduce them
+locally whenever needed (see the commands in the next section). `.gitignore`
+already keeps those path families out of the repository (`docs/` retains only
+`design_notes.md` and `compute_plan.md`).
 
 | path | what |
 |---|---|
@@ -38,17 +41,18 @@ needed to reproduce the results on a machine of your own.
 | `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
 | `docs/compute_plan.md` | **compute plan**: the scale-up roadmap (0.14B–1.3B ladder, FineWeb-Edu, Triton-kernel prerequisite), H800-hour budget tiers and gated milestones M0–M4; the former application draft is no longer kept in the repo |
 
-> **`exp_lib.py` 是唯一的代码来源（source of truth），直接改它。**
+> **`exp_lib.py` is the single source of truth — edit it directly.**
 
-### 重新生成实验产物
+### Regenerating the experiment artifacts
 
-结果目录与报告都不在仓库里。要重新得到它们：
+Result directories and reports are not kept in the repository. To obtain them
+again:
 
 ```bash
-python run_gapfill.py smoke      # 端到端自检，零 GPU 消耗
-python run_gapfill.py full       # v6 主实验（受运行时上限约束）
-python v7_supp.py ...            # 各版本补充实验，子命令见对应脚本的 docstring
-python build_report.py           # 从落盘的 results_*/ + analysis_*/ 重建报告
+python run_gapfill.py smoke      # end-to-end self-check, zero GPU cost
+python run_gapfill.py full       # the v6 main experiment (bounded by the run-time cap)
+python v7_supp.py ...            # per-version supplementary runs; subcommands in each script's docstring
+python build_report.py           # rebuild the report from on-disk results_*/ + analysis_*/
 ```
 
 ## Reproducing (any CUDA box)
@@ -330,6 +334,7 @@ script pushes and shuts the instance down (cancel with
 `pkill -f v6autoshutdown`; suppress with `V6_NO_SHUTDOWN=1`, pushes with
 `V6_NO_PUSH=1`).
 
-> 量值一律以 `build_report.py` / `fuse_analysis.py` 与各 `v*_supp.py report`
-> 构建器从 `results_*/`、`analysis_*/` 落盘产物现算出的表格为准，仓库正文
-> 不写死任何量值。
+> All quantities are taken from the tables that `build_report.py` /
+> `fuse_analysis.py` and the per-version `v*_supp.py report` builders compute
+> on the fly from the on-disk `results_*/` and `analysis_*/` artifacts; no
+> quantity is ever hard-coded in the repository prose.
