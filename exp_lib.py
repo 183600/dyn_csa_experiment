@@ -1425,19 +1425,26 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     out_dtype = None
     for s in range(0, n, query_chunk):
         e = min(s + query_chunk, n)
+        # 列收窄同样作用于打分本身（不只是选择）：本 chunk 内任一行的可读块
+        # 都落在前缀 [0, _wsel)（见下方 _colw 论证），前缀之外的列对 chunk 内
+        # 所有行因果恒假，其分数要么被 _indexer_selection 掩成 -inf、要么在
+        # 软分支被 _ncausal 掩成 -inf。逐列打分/逐列随机分数与列数无关
+        # （einsum 的输出列、_jc 的列值都是各自独立的），故只算前缀列得到的
+        # 前缀值逐位不变，下游 idx/soft 的整数与浮点逐位一致。
+        _wsel = B if _colw is None else max(1, min(bisect.bisect_right(_colw, e - 1), B))
         if random_select:
             # same elementwise op chain with in-place tails: each op is the
             # same kernel on the same values (no fusion, no reassociation —
             # note x-floor(x) is NOT frac() for negatives), so the scores are
             # bit-identical.
-            z = _ri[s:e] * 12.9898 + _jc
+            z = _ri[s:e] * 12.9898 + _jc[:, :_wsel]
             z.sin_()
             z.mul_(43758.5453)
             z.sub_(torch.floor(z))
             z.mul_(2.0).sub_(1.0)
             c = z.to(H.dtype)
         else:
-            raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI)
+            raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI[:, :_wsel])
             raw.mul_(_iscale)
             F.relu(raw, inplace=True)
             c = torch.einsum('inb,ni->nb', raw, w_idx[s:e])
@@ -1445,16 +1452,10 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             out_dtype = c.dtype
             if need_soft:
                 soft = torch.empty(n, _kw, device=c.device, dtype=out_dtype)
-        _csel = c
-        _ccausal = causal[s:e]
-        if _colw is not None:
-            # 切片列的值即全宽对应列的值（索引搬运，design notes §6.1）。
-            _wsel = max(1, min(bisect.bisect_right(_colw, e - 1), B))
-            _csel = c[:, :_wsel]
-            _ccausal = _ccausal[:, :_wsel]
+        _ccausal = causal[s:e][:, :_wsel]
         with torch.no_grad():
             _box = []
-            _ic = _indexer_selection(_csel, _ccausal, k, out_valid=_box)
+            _ic = _indexer_selection(c, _ccausal, k, out_valid=_box)
         idx[s:e] = _ic
         if _valid_parts is not None:
             _valid_parts.append(_box[0])
@@ -1465,7 +1466,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             # 整数，也不改变下游任何前向 bit）。
             del c, _ic
             continue
-        c.masked_fill_(_ncausal[s:e], float('-inf'))
+        c.masked_fill_(_ncausal[s:e][:, :_wsel], float('-inf'))
         _lse = torch.logsumexp(c, dim=-1, keepdim=True)
         # the gather output is fresh and nothing downstream needs the pre-subtract
         # values, so the subtraction runs in place (same kernel, same values, and
@@ -2213,7 +2214,12 @@ class HybridAttention(nn.Module):
             # 的完整图。
             _need_soft = torch.is_grad_enabled()
             _, topk_idx, soft = lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=_pool_ends_host(bid), need_soft=_need_soft)
-            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], soft_form=True)
+            # _indexer_selection 的 top-k 是无放回选择：有效槽位的块 id 逐行互不
+            # 相同（order 是列排列、kept 落在互异的 cumsum 秩列上），pad 槽位的
+            # 重复块 0 已被 sel_valid 置无效。故 gathered_attention 的
+            # first_occurrence 去重掩码恒为全真，直接声明 topk_distinct 跳过它
+            # （keep 掩码与逐位计算结果一致，下游取值不变）。
+            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], topk_distinct=False, soft_form=True)
         return (self.W_o(out.reshape(T, self.nh * self.hd)), gate_mean)
 
     def forward(self, x):
@@ -3142,6 +3148,9 @@ def atomic_write_csv(path, header, rows):
     atomic_write_text(path, buf.getvalue())
 
 _PINNED_HOST_CACHE = {}
+# 整份 pinned 的字节上限（见 batch_iter）：超出时改走普通宿主张量 + 每步
+# pinned 暂存上传，避免超大语料把锁定内存翻倍。
+_PINNED_HOST_CAP_BYTES = 4 << 30
 
 def _ids_narrow(train_ids):
     # Token ids are bounded by the vocab (<= 2**31 for every corpus this repo
@@ -3174,7 +3183,15 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     if host is None:
         if device.type == 'cuda':
             try:
-                host = torch.from_numpy(_ids_narrow(train_ids)).pin_memory()
+                # 只对中等规模的语料做整份 pinned：pinned 是锁定不可换出的宿主
+                # 内存，超大语料（B 档 5B token 级 ≈ 20GB int32）整份 pin 既可能
+                # 因 memlock 限额失败、又会把驻留翻倍。超过上限时直接用与 numpy
+                # 共享的普通宿主张量，每步 gather 后再经 _h2d_async 的 pinned 暂存
+                # 上传——取到的整数逐位相同（transport only）。
+                if train_ids.nbytes <= _PINNED_HOST_CAP_BYTES:
+                    host = torch.from_numpy(_ids_narrow(train_ids)).pin_memory()
+                else:
+                    host = torch.from_numpy(_ids_narrow(train_ids))
                 _PINNED_HOST_CACHE['entry'] = (train_ids, host)
             except RuntimeError:
                 host = torch.from_numpy(train_ids)
