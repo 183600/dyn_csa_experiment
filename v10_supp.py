@@ -234,6 +234,11 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     for arm in cfg['arms']:
         if not _arm_of(v, arm):
             continue
+        if guard is not None and not guard.can_start(0):
+            print(f'[cap] SKIP probe {v} s{seed} arm {arm}: headroom exhausted ({max(guard.remaining_hours(), 0.0):.2f} h left) — re-run the phase to continue')
+            if model is None:
+                out['status'] = 'skipped_cap'
+            break
 
         def _cell_key(_Ln, _rho, _arm=arm, _v=v, _seed=seed):
             return f'{_v}::s{_seed}::{_arm}::L{_Ln}::r{_rho}'

@@ -624,7 +624,7 @@ def run_jobs(jobs, ctx, phase_label="phase"):
     except BaseException:
         _KILL["on"] = True
         _terminate_entries(entries)
-        _reconcile_guards([entry["job"] for entry in entries if not entry["done"]])
+        _reconcile_guards([entry["job"] for entry in entries])
         print(
             "[par] Dispatch aborted; remaining children were terminated. "
             "Completed records are preserved; time reservations of dead "

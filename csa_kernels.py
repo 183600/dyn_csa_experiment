@@ -2256,9 +2256,12 @@ def _host_bid(counts):
     return bid
 
 
-def _rel(a, b, pad_mask=None):
-    """稳健相对误差：分母带张量自身尺度的下限（近零条目不放大噪声），
-    再取逐元素最大值（pad 位置可屏蔽）。"""
+def _rel(a, b, pad_mask=None, floor_frac=1e-4):
+    """稳健相对误差：分母 = |b| + floor_frac·max|b|，再取逐元素最大值
+    （pad 位置可屏蔽）。floor_frac 必须按被比较数据的浮点精度选取：
+    纯舍入噪声 atol ≈ k·eps·max|b|，度量在近零条目上放大 k·eps/floor_frac
+    倍；floor_frac 远小于 eps 会让噪声淹没一切真实差异（fp32 eps≈1.2e-7，
+    1e-4 的下限把 1-ULP 噪声放大到 ~1e-3 量级）。"""
     af = a.detach().to(torch.float64)
     bf = b.detach().to(torch.float64)
     if pad_mask is not None:
@@ -2266,7 +2269,7 @@ def _rel(a, b, pad_mask=None):
         bf = bf[pad_mask]
     if af.numel() == 0:
         return 0.0
-    denom = bf.abs() + 1e-4 * float(bf.abs().max())
+    denom = bf.abs() + floor_frac * float(bf.abs().max())
     if not bool(denom.max()):
         # reference is all-zero: identical-zero => rel err 0; any nonzero
         # absolute difference => rel err 1 (4-decimal floor, saturating).
@@ -2292,6 +2295,10 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
     nh, d_head, d_model = 4, 16, 48
     topk, win = 8, 16
     results = {}
+    _ffloor = 1e-2 if dtype == torch.float32 else 1.0
+
+    def mrel(x, y, pad=None):
+        return _rel(x, y, pad, floor_frac=_ffloor)
 
     def rp(*shape):
         return (torch.randn(*shape, generator=gen, device=device, dtype=torch.float32) * 0.5).to(dtype)
@@ -2326,7 +2333,7 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
     names = ['comp', 'gXa', 'gXb', 'gZa', 'gZb', 'gBpa', 'gBpb']
     for i, nm in enumerate(names):
         pad = None
-        results[f'pool.{nm}'] = _rel(ker[i], ref[i])
+        results[f'pool.{nm}'] = mrel(ker[i], ref[i])
     if verbose:
         print(f'[selfcheck:{impl}:{str(dtype)}] pool  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith('pool.')))
     # Multi-chunk regression: shrinking _POOL_CHUNK_BYTES exercises the b0>0
@@ -2346,7 +2353,7 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
     finally:
         globals()['_POOL_CHUNK_BYTES'] = _saved_chunk
     for i, nm in enumerate(names):
-        results[f'pool_mc.{nm}'] = _rel(ker2[i], ref[i])
+        results[f'pool_mc.{nm}'] = mrel(ker2[i], ref[i])
     if verbose:
         print(f'[selfcheck:{impl}:{str(dtype)}] pool(mc)  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith('pool_mc.')))
 
@@ -2388,9 +2395,9 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
             ker_i = [idx, soft] + [t.grad for t in L_]
     assert torch.equal(ref_i[0].to(torch.int64), ker_i[0].to(torch.int64)), 'indexer idx 不一致（选择语义被破坏）'
     assert torch.equal(valid_e, valid), 'indexer valid 不一致（选择语义被破坏）'
-    results['idxer.soft'] = _rel(ker_i[1] * valid, ref_i[1] * valid)
+    results['idxer.soft'] = mrel(ker_i[1] * valid, ref_i[1] * valid)
     for i, nm in enumerate(['gH', 'gWDQ', 'gWDK', 'gWw']):
-        results[f'idxer.{nm}'] = _rel(ker_i[2 + i], ref_i[2 + i])
+        results[f'idxer.{nm}'] = mrel(ker_i[2 + i], ref_i[2 + i])
     if verbose:
         print(f'[selfcheck:{impl}:{str(dtype)}] idxer  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith('idxer.')))
 
@@ -2425,7 +2432,7 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
             ker_a = [out] + [t.grad for t in L_] + [sk.grad]
     names_a = ['out', 'gq', 'gkb', 'gvb', 'gksw', 'gvsw', 'gsoft', 'gsink']
     for i, nm in enumerate(names_a):
-        results[f'attn.{nm}'] = _rel(ker_a[i], ref_a[i])
+        results[f'attn.{nm}'] = mrel(ker_a[i], ref_a[i])
     if verbose:
         print(f'[selfcheck:{impl}:{str(dtype)}] attn  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith('attn.')))
 
@@ -2458,7 +2465,7 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
         names_d = ['out', 'gq', 'gkb', 'gvb', 'gksw', 'gvsw'] + (['gsoft'] if use_soft else []) + (['gsink'] if use_sink else [])
         idxs_d = [0, 1, 2, 3, 4, 5] + ([6] if use_soft else []) + ([7] if use_sink else [])
         for i, nm in zip(idxs_d, names_d):
-            results[f'attn_{cfg_tag}.{nm}'] = _rel(ker_d[i], ref_d[i])
+            results[f'attn_{cfg_tag}.{nm}'] = mrel(ker_d[i], ref_d[i])
         if verbose:
             print(f'[selfcheck:{impl}:{str(dtype)}] attn_{cfg_tag}  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith(f'attn_{cfg_tag}.')))
     return results
@@ -2498,7 +2505,7 @@ def selfcheck_model(variant='csa_dynamic', impl='ref', seed=0, device=None, T=64
         if n in grads[impl]:
             a = grads[impl][n].detach().to(torch.float64)
             b = grads[None][n].detach().to(torch.float64)
-            worst = max(worst, _rel(a, b))
+            worst = max(worst, _rel(a, b, floor_frac=1e-2))
             norm_num += (a - b).norm().item() ** 2
             norm_den += b.norm().item() ** 2
     res['grad_max_rel'] = worst

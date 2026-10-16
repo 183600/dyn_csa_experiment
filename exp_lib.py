@@ -4336,6 +4336,7 @@ class TimeGuard:
                     _lock_f.close()
 
     def spent_hours(self):
+        self.state = self._load_state()
         return self.already + self.state['booked_seconds'] / 3600.0
 
     def remaining_hours(self):
@@ -4467,6 +4468,7 @@ class TimeGuard:
         return time.time() + headroom * 3600.0
 
     def report(self):
+        self.state = self._load_state()
         print('\n==================== usage report ====================')
         print(f'  booked GPU time : {self.state['booked_seconds'] / 3600:.2f} h ({self.state.get('runs', 0)} runs)')
         for key, sps in sorted((self.state.get('sps_by_class') or {}).items()):
@@ -5181,7 +5183,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
         if prebook and est:
             guard.book(est, token=_book_tok)
             booked = est
-        if not guard.can_start(est):
+        if not guard.can_start(0 if booked else est):
             if booked:
                 guard.book(-booked, token=_book_tok)
                 booked = 0.0
@@ -5193,50 +5195,52 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
     t_run = time.time()
     rec = None
     try:
-        rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts)
+        try:
+            rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts)
 
-        def _apply(summary):
-            if rec.get('cap_truncated'):
-                _prev_ok = ppl_is_usable((summary.get(key) or {}).get('ppl'))
-                print(f'[cap] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`); ' + ('keeping the previous record instead.' if _prev_ok else 'the key is left ABSENT, not written as a stub.') + ' Raise RUN_CAP and re-run to retry this cell.')
-                if not _prev_ok:
-                    summary.pop(key, None)
-                    out['truncated'] = True
-            else:
-                rec['run_cfg'] = fp
-                rec['_code'] = f'{CODE_SEMANTICS}{_kernel_stamp()}'
-                assert fp.endswith(f'_cs{rec['_code']}'), (fp, rec['_code'])
-                summary[key] = rec
-            return summary
-        locked_json_update(summary_path, _apply)
-        if out.get('truncated'):
-            out['status'] = 'truncated'
-    except Exception as e:
-        import traceback
-        import sys as _sys
-        out['status'] = 'error'
-        out['error'] = f'{e}'
+            def _apply(summary):
+                if rec.get('cap_truncated'):
+                    _prev_ok = ppl_is_usable((summary.get(key) or {}).get('ppl'))
+                    print(f'[cap] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`); ' + ('keeping the previous record instead.' if _prev_ok else 'the key is left ABSENT, not written as a stub.') + ' Raise RUN_CAP and re-run to retry this cell.')
+                    if not _prev_ok:
+                        summary.pop(key, None)
+                        out['truncated'] = True
+                else:
+                    rec['run_cfg'] = fp
+                    rec['_code'] = f'{CODE_SEMANTICS}{_kernel_stamp()}'
+                    assert fp.endswith(f'_cs{rec['_code']}'), (fp, rec['_code'])
+                    summary[key] = rec
+                return summary
+            locked_json_update(summary_path, _apply)
+            if out.get('truncated'):
+                out['status'] = 'truncated'
+        except Exception as e:
+            import traceback
+            import sys as _sys
+            out['status'] = 'error'
+            out['error'] = f'{e}'
 
-        def _apply_err(summary):
-            if key in summary and ppl_is_usable((summary.get(key) or {}).get('ppl')):
-                print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (the error record holds no `ppl` and must not replace it); the failed attempt is still booked to the guard below.')
-                print(traceback.format_exc(), file=_sys.stderr)
-            else:
-                summary[key] = {'variant': v, 'seed': seed, 'error': traceback.format_exc()}
-                print(f'[{key}] FAILED: {e}')
-            return summary
-        locked_json_update(summary_path, _apply_err)
-    if guard is not None:
-        steps_done = 0
-        calib_s = None
-        if isinstance(rec, dict) and rec.get('steps_done'):
-            steps_done = int(rec['steps_done'])
-        elif isinstance(rec, dict) and 'ppl' in rec:
-            steps_done = int(cfg['steps'])
-            calib_s = rec.get('train_time_s')
-        guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'], calib_seconds=calib_s)
-        if booked:
-            guard.book(-booked, token=_book_tok)
+            def _apply_err(summary):
+                if key in summary and ppl_is_usable((summary.get(key) or {}).get('ppl')):
+                    print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (the error record holds no `ppl` and must not replace it); the failed attempt is still booked to the guard below.')
+                    print(traceback.format_exc(), file=_sys.stderr)
+                else:
+                    summary[key] = {'variant': v, 'seed': seed, 'error': traceback.format_exc()}
+                    print(f'[{key}] FAILED: {e}')
+                return summary
+            locked_json_update(summary_path, _apply_err)
+    finally:
+        if guard is not None:
+            steps_done = 0
+            calib_s = None
+            if isinstance(rec, dict) and rec.get('steps_done'):
+                steps_done = int(rec['steps_done'])
+            elif isinstance(rec, dict) and 'ppl' in rec:
+                steps_done = int(cfg['steps'])
+                calib_s = rec.get('train_time_s')
+            guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'], calib_seconds=calib_s)
+            if booked:
+                guard.book(-booked, token=_book_tok)
     gc.collect()
     if DEVICE.type == 'cuda':
         torch.cuda.empty_cache()

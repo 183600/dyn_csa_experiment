@@ -776,7 +776,7 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
         if prebook and est:
             guard.book(est, token=_book_tok)
             booked = est
-        if not guard.can_start(est):
+        if not guard.can_start(0 if booked else est):
             if booked:
                 guard.book(-booked, token=_book_tok)
             print(f'[cap] SKIP {key}: projected {est / 3600:.2f} h would pass the configured cap')
@@ -788,45 +788,47 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
         _deadline = guard.deadline_ts()
     rec = None
     try:
-        rec = train_warmup(v, train_ids, val_batch, vocab, seed=seed, warm_steps=warm, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=_deadline)
+        try:
+            rec = train_warmup(v, train_ids, val_batch, vocab, seed=seed, warm_steps=warm, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=_deadline)
 
-        def _apply(summary):
-            if rec.get('cap_truncated'):
-                print(f'[cap] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`) and the key is left ABSENT. Raise the cap and re-run to retry this cell.')
-                summary.pop(key, None)
-                out['truncated'] = True
-            else:
-                summary[key] = rec
-                summary[key]['_code'] = CKPT_CODE
-                summary[key]['run_cfg'] = fp
-            return summary
-        L.locked_json_update(spath, _apply)
-        if out.get('truncated'):
-            out['status'] = 'truncated'
-    except Exception as e:
-        out['status'] = 'error'
-        out['error'] = f'{e}'
+            def _apply(summary):
+                if rec.get('cap_truncated'):
+                    print(f'[cap] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`) and the key is left ABSENT. Raise the cap and re-run to retry this cell.')
+                    summary.pop(key, None)
+                    out['truncated'] = True
+                else:
+                    summary[key] = rec
+                    summary[key]['_code'] = CKPT_CODE
+                    summary[key]['run_cfg'] = fp
+                return summary
+            L.locked_json_update(spath, _apply)
+            if out.get('truncated'):
+                out['status'] = 'truncated'
+        except Exception as e:
+            out['status'] = 'error'
+            out['error'] = f'{e}'
 
-        def _apply_err(summary):
-            if L.result_is_current(summary.get(key), CKPT_CODE, 'ppl'):
-                print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (current under this code semantics; the error record holds no `ppl` and must not replace it)')
-                print(traceback.format_exc())
-            else:
-                summary[key] = {'variant': v, 'seed': seed, 'warm_steps': warm, 'error': traceback.format_exc()}
-                print(f'[{key}] FAILED: {e}')
-            return summary
-        L.locked_json_update(spath, _apply_err)
-    if guard is not None:
-        steps_done = 0
-        calib_s = None
-        if isinstance(rec, dict) and rec.get('steps_done'):
-            steps_done = int(rec['steps_done'])
-        elif isinstance(rec, dict) and 'ppl' in rec:
-            steps_done = int(cfg['steps'])
-            calib_s = rec.get('train_time_s')
-        guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'], calib_seconds=calib_s)
-        if booked:
-            guard.book(-booked, token=_book_tok)
+            def _apply_err(summary):
+                if L.result_is_current(summary.get(key), CKPT_CODE, 'ppl'):
+                    print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (current under this code semantics; the error record holds no `ppl` and must not replace it)')
+                    print(traceback.format_exc())
+                else:
+                    summary[key] = {'variant': v, 'seed': seed, 'warm_steps': warm, 'error': traceback.format_exc()}
+                    print(f'[{key}] FAILED: {e}')
+                return summary
+            L.locked_json_update(spath, _apply_err)
+    finally:
+        if guard is not None:
+            steps_done = 0
+            calib_s = None
+            if isinstance(rec, dict) and rec.get('steps_done'):
+                steps_done = int(rec['steps_done'])
+            elif isinstance(rec, dict) and 'ppl' in rec:
+                steps_done = int(cfg['steps'])
+                calib_s = rec.get('train_time_s')
+            guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'], calib_seconds=calib_s)
+            if booked:
+                guard.book(-booked, token=_book_tok)
     gc.collect()
     if DEVICE.type == 'cuda':
         torch.cuda.empty_cache()
@@ -1570,7 +1572,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             if prebook and est:
                 guard.book(est, token=_book_tok)
                 booked = est
-            if not guard.can_start(est):
+            if not guard.can_start(0 if booked else est):
                 if booked:
                     guard.book(-booked, token=_book_tok)
                 print(f'[cap] SKIP lenphase train {v} s{seed}')

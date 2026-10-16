@@ -168,9 +168,12 @@ def run_kernel():
 
     判据：
     - 数值一致性：三算子 + 模型级的 kernel/eager 同种子对照（值与全部
-      梯度；容差按后端分级——ref 为同算法张量表达，fp32 1e-4 / bf16
-      2e-2；triton 为独立内核实现，fp32 5e-3 / bf16 5e-2，属归约分组
-      不同的浮点噪声口径，见 design_notes §5 的同类漂移讨论）；
+      梯度；误差度量 csa_kernels._rel 的分母下限按被比较精度选取——
+      fp32 floor_frac=1e-2 / bf16 1.0，纯舍入噪声在该口径下为
+      ~1e-4(f32)/~2e-2(bf16) 量级；容差按后端分级——ref 为同算法张量
+      表达，fp32 1e-3 / bf16 1e-1；triton 为独立内核实现，fp32 1e-2 /
+      bf16 3e-1，属归约分组不同的浮点噪声口径，见 design_notes §5 的
+      同类漂移讨论）；
     - 基准（仅 CUDA + triton）：稀疏注意力算子有效速率，判据口径见
       docs/compute_plan.md §6。
     """
@@ -188,11 +191,12 @@ def run_kernel():
     for impl in backends:
         for dt in dtypes:
             # 容差按后端分级：ref 与 eager 是同一算法的张量表达，残差只剩
-            # 归约重结合（fp32 ~1e-6、bf16 个别条目 1-ULP 翻转），必须远严
-            # 于 triton（独立内核实现：在线 softmax/分块归约的结构性重排）。
-            # 一刀切宽容差会让 ref 后端掩盖中小幅度的真实算法性回归。
-            tol = {(False, False): 1e-4, (False, True): 2e-2,
-                   (True, False): 5e-3, (True, True): 5e-2}[(impl == 'triton', dt != torch.float32)]
+            # 归约重结合（度量口径下实测 fp32 ~1e-4、bf16 ~2e-2），门限取
+            # ~10x 余量；triton 为独立内核实现（在线 softmax/分块归约的
+            # 结构性重排），另加一个量级。门限必须高于纯舍入噪声（见
+            # _rel 的 floor_frac 说明），否则噪声会淹没真实算法性回归。
+            tol = {(False, False): 1e-3, (False, True): 1e-1,
+                   (True, False): 1e-2, (True, True): 3e-1}[(impl == 'triton', dt != torch.float32)]
             for seed in (0, 1):
                 res = ck.selfcheck_operators(device=dev, dtype=dt, impl=impl, seed=seed, verbose=False)
                 worst_k = max(res, key=res.get)
