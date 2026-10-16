@@ -730,10 +730,13 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
             # 临时量，整块域两者是同一批行。
             scores.add_(s_i * wf[:, t0:t1, i:i + 1])
         scores = scores.to(dtype)
-        masked_lse = torch.where(causal_c, scores, torch.full_like(scores, _NEG_INF))
+        # where 的标量分支与 full_like/zeros_like 逐位同值（标量按 dtype
+        # 精确表示、元素级选择同一比较结果），且省去每 chunk 一张
+        # [R, tc, Bm] 的常量填充临时量。
+        masked_lse = torch.where(causal_c, scores, _NEG_INF)
         lse = torch.logsumexp(masked_lse, dim=-1)
         cf = causal_c & torch.isfinite(scores)
-        work = torch.where(cf, scores, torch.full_like(scores, _NEG_INF))
+        work = torch.where(cf, scores, _NEG_INF)
         # pad 恒为块 0（eager 形式；池化 last_tok 单调时与「首个因果块」
         # 同值——那种形式的首个因果块必为块 0）。
         pad_blk = torch.zeros((R, t1 - t0), device=dev, dtype=torch.int64)
@@ -749,8 +752,8 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
         idx[:, t0:t1] = torch.where(has, top_idx, pad_blk[:, :, None]).to(torch.int32)
         sv = top_val - lse[:, :, None]
         sv = torch.where(has & torch.isfinite(lse)[:, :, None],
-                         torch.exp(sv), torch.zeros_like(sv))
-        soft[:, t0:t1] = torch.where(sv == sv, sv, torch.zeros_like(sv))
+                         torch.exp(sv), 0.0)
+        soft[:, t0:t1] = torch.where(sv == sv, sv, 0.0)
     return idx, valid, soft.to(dtype)
 
 
@@ -836,12 +839,14 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
             # 同一批舍入分数重算。
             s_all = s_all.to(dtype)
         causal_c = t_idx[:, t0:t1] > lt64[:, None, :]
-        masked = torch.where(causal_c, s_all, torch.full_like(s_all, _NEG_INF))
+        # 同 _indexer_fwd_ref：标量分支省去每 chunk 三张 [R, tc, Bm] 常量
+        # 填充临时量，值与 full_like/zeros_like 形式逐位一致。
+        masked = torch.where(causal_c, s_all, _NEG_INF)
         lse = torch.logsumexp(masked, dim=-1)
         row_ok = torch.isfinite(lse)
-        e = torch.where(row_ok[:, :, None], torch.exp(masked - lse[:, :, None]), torch.zeros_like(masked))
+        e = torch.where(row_ok[:, :, None], torch.exp(masked - lse[:, :, None]), 0.0)
         ds = Mk - e * Gt[:, t0:t1, None]
-        ds = torch.where(causal_c & torch.isfinite(s_all), ds, torch.zeros_like(ds))
+        ds = torch.where(causal_c & torch.isfinite(s_all), ds, 0.0)
         for i in range(nIH):
             s_i = s_list[i]
             g = ds * wf[:, t0:t1, i:i + 1] * (s_i > 0) * iscale

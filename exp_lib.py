@@ -605,6 +605,8 @@ def causal_window_mask_f(T, window, device, dtype):
         _cache_put(_MASK_CACHE, key, m, _mask_budget(T), _mask_cache_total)
     return m
 
+_ATTN_TRANSIENT_CAP_BYTES = 2 << 30
+
 def _attn_transient_budget(device):
     key = (_dev_str(device), _ATB_EPOCH)
     if key in _ATB_CACHE:
@@ -613,7 +615,16 @@ def _attn_transient_budget(device):
     try:
         if device.type == 'cuda':
             free, _total = torch.cuda.mem_get_info(device)
-            val = max(64 << 20, int(free) // 4)
+            # 预算除随空闲量 1/4 外再封顶 _ATTN_TRANSIENT_CAP_BYTES：free//4
+            # 在大显存卡上是数 GB～十余 GB，而 dense-sink 行块的
+            # [B,nh,chunk,T] logits/attn 双临时量与 gathered_attention 的
+            # [chunk,M,h,d] gather 都随 chunk 宽度线性放大——S 档
+            # （T=8192+、B~10^3 泳道）下会物化 6–18 GB 的瞬态。行分块是
+            # 纯行划分（任意宽度下逐行值逐位相同，见 gathered_attention
+            # 的 chunk 注释），封顶只收窄分块、等比例压低峰值显存；当前
+            # 面板（T≤1024）的分块宽度受 min(1024,·) 与 q_chunk=128 的
+            # 静态上限支配，预算从不触顶，分块与既有记录完全一致。
+            val = max(64 << 20, min(int(free) // 4, _ATTN_TRANSIENT_CAP_BYTES))
     except Exception:
         val = None
     _ATB_CACHE[key] = val
@@ -1220,11 +1231,16 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         Zbm = _take_2d(Zbs, g_b[_b0:_b1])
         _ma = mask_a[_b0:_b1]
         _mb = mask_b[_b0:_b1]
-        # Position-embedding add restricted to valid lanes arithmetically:
-        # multiplying by the 0/1 mask adds exactly the same values on valid
-        # lanes and exactly 0 on pad lanes; pad lanes are then overwritten with
-        # -inf.  Forward values and B_pos gradients (zero on invalid lanes in
-        # both forms) are identical to the boolean-index form.
+        # Position-embedding add as a plain broadcast: pad lanes receive the
+        # position row too, but the masked_fill_ right after overwrites them
+        # with -inf, so the forward values are identical to the masked-multiply
+        # form (and to the boolean-index form) lane for lane.  The B_pos
+        # gradients are identical too: the incoming grad at filled lanes is
+        # exactly zero (MaskedFillBackward zeroes them, and softmax backward
+        # gives P=0 there as well), so summing it with or without the 0/1 mask
+        # multiply yields the same values bit for bit — while the broadcast
+        # form skips a [chunk, L, Fd]-sized multiply temporary and one
+        # elementwise kernel per chunk.
         # += on the fresh _take_2d outputs: the same elementwise kernel with
         # the same values as the out-of-place add (AddBackward saves no tensor,
         # and the only downstream consumer chain — masked_fill_/cat/softmax —
@@ -1305,13 +1321,15 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         Xb = _take_2d(Xs, g[_b0:_b1])
         Zb = _take_2d(Zs, g[_b0:_b1])
         WinZ = Zb
-        # Same arithmetic valid-lane-only position add as _pool_ordered: the 0/1
-        # mask multiply adds exactly the same values on valid lanes and 0 on pad
-        # lanes, which the fill then sets to -inf — identical values and gradients
-        # to the boolean-index form.
+        # Same plain-broadcast position add as _pool_ordered: the fill right
+        # after overwrites the pad lanes with -inf, and the incoming grad at
+        # those lanes is exactly zero (MaskedFillBackward / softmax P=0), so
+        # the values and the B_pos gradients are identical to the
+        # masked-multiply and boolean-index forms — minus one [chunk, L, Fd]
+        # temporary and one elementwise kernel per chunk.
         # += on the fresh _take_2d output (same elementwise kernel and values as
         # the out-of-place add; see _pool_ordered).
-        WinZ += _bpos[None] * mask[_b0:_b1, :, None]
+        WinZ += _bpos[None]
         # broadcast fill mask (same argument as _pool_ordered): identical booleans
         # per lane.
         WinZ.masked_fill_(~mask[_b0:_b1, :, None], float('-inf'))
@@ -1655,7 +1673,17 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # the same exact integers, and advanced indexing / equality comparisons on
     # them return bitwise identical values.
     topk_l = topk_idx if topk_idx.dtype in (torch.int32, torch.int64) else topk_idx.long()
-    sel_blk_all = pos_all[:, None] > last_tok[topk_l]
+    # The read-everything HCA arm passes the cached arange expansion (every
+    # row is exactly arange(B)): last_tok[topk_l] then gathers one identical
+    # copy of last_tok per row, so the same bool table comes out of a plain
+    # broadcast comparison against last_tok — same integers compared, bitwise
+    # the same output (§6.1), minus the [n, nb] int64 gather intermediate
+    # (at S-tier, T=8192 with B~10^3 lanes, that is a multi-hundred-MB
+    # transient).  Identity with the cached table (not a content scan) is the
+    # guard, so any other caller falls back to the gather form unchanged.
+    _arange_sel = (topk_l.shape[1] == last_tok.shape[0]
+                   and topk_l is _IDX_CACHE.get((_dev_str(dev), 'arangeexp', int(n), int(topk_l.shape[1]))))
+    sel_blk_all = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
     # the keep mask and the [selected|window] valid mask are per-row functions of
     # the same inputs, so their full-width forms are bitwise identical to the
     # per-chunk forms; they are hoisted out of the chunk loop under
