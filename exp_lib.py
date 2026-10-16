@@ -514,7 +514,12 @@ def _window_geometry(n, w, device):
     rel = _range_cache(0, w, device)
     with torch.inference_mode(False):
         win_idx_raw = pos[:, None] - (w - 1) + rel[None, :]
-        pair = (win_idx_raw.clamp(min=0), win_idx_raw >= 0)
+        # int32 index transport (design notes §6.1): every clamped position is
+        # an exact integer in [0, n) < 2**31, so the narrowed table addresses
+        # exactly the same k_sw rows as the int64 form — index_select accepts
+        # int32 directly (as the indexer's topk already relies on), and the
+        # per-chunk index traffic is halved.
+        pair = (win_idx_raw.clamp(min=0).to(torch.int32), win_idx_raw >= 0)
     _cache_put(_IDX_CACHE, key, pair, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return pair
 
@@ -1304,7 +1309,12 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     # (host-side integer equivalence, design notes §6.2).
     pad_blk = torch.zeros(n, dtype=torch.int32, device=scores.device)
     valid_cols = kept >= 0
-    idx_out = torch.where(valid_cols, kept, pad_blk[:, None])
+    # the invalid lanes hold exactly the -1 sentinel, so clamping the kept
+    # buffer to 0 replaces the where(valid, kept, 0) selection lane-for-lane
+    # (block ids are >= 0 and are never rewritten) — same integers, without
+    # materialising the [n, _w_keep] where output.
+    kept.clamp_min_(0)
+    idx_out = kept
     if out_valid is not None:
         if k_req > _w_keep:
             valid_cols = torch.cat([valid_cols, torch.zeros(n, k_req - _w_keep, dtype=torch.bool, device=scores.device)], dim=1)

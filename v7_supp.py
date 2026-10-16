@@ -73,11 +73,17 @@ def rope_cos_sin(head_dim, rope_dim, positions, device, base=10000.0):
 
 def apply_rope(x, cos, sin, rope_dim):
     half = rope_dim // 2
-    xr = x[..., :rope_dim]
-    xp = x[..., rope_dim:]
-    x1, x2 = (xr[..., :half], xr[..., half:])
-    rot = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1)
-    return torch.cat([rot, xp], -1)
+    x1 = x[..., :half]
+    x2 = x[..., half:rope_dim]
+    # same elementwise expressions, written straight into one output buffer:
+    # the two cats only ever copied these values, so the result is
+    # bit-identical while one full-width intermediate (rot) is not allocated.
+    out = torch.empty_like(x)
+    out[..., :half] = x1 * cos - x2 * sin
+    out[..., half:rope_dim] = x1 * sin + x2 * cos
+    if rope_dim < x.shape[-1]:
+        out[..., rope_dim:] = x[..., rope_dim:]
+    return out
 
 @dataclasses.dataclass
 class AttnCfgRope(L.AttnCfg):
@@ -288,7 +294,12 @@ class HybridAttentionRoPE(L.HybridAttention):
             _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
             q_chunk = min(q_chunk, _max_rows)
         cos, sin = rope_cos_sin(hd, rope_dim, L._arange_cache(T, dev), dev, rope_base)
-        qr = apply_rope(q, cos[:, None, :], sin[:, None, :], rope_dim)
+        # RoPE is applied to the query chunk inside the loop instead of to a
+        # full [T, nh, hd] copy: every rotated position depends only on the
+        # same position of q, so the per-chunk rotation is bit-identical (and
+        # each q position is rotated by exactly one chunk, so q.grad is the
+        # same sum of disjoint contributions) — it just drops the full-width
+        # qr buffer.
         _lt = last_tok.long()
         bc, bs = (cos[_lt], sin[_lt])
         k_blk_r = apply_rope(k_blk, bc[:, None, :], bs[:, None, :], rope_dim)
@@ -350,8 +361,14 @@ class HybridAttentionRoPE(L.HybridAttention):
             # bit-identical (index re-plumbing only, §6.1).
             Kset = torch.cat([L._take_2d(k_blk_r, ib), L._take_2d(k_sw_r, _wi_all[s:e])], 1)
             Vset = torch.cat([L._take_2d(v_blk, ib), L._take_2d(v_sw, _wi_all[s:e])], 1)
-            raw_logits = torch.einsum('qhd,qmhd->qhm', qr[s:e], Kset)
-            raw_logits.mul_(scale)
+            qc = apply_rope(q[s:e], cos[s:e, None, :], sin[s:e, None, :], rope_dim)
+            raw_logits = torch.einsum('qhd,qmhd->qhm', qc, Kset)
+            if scale != 1.0:
+                # x·1.0 is the IEEE identity (and its backward Mul node maps
+                # grad·1.0 identically), so the in-repo scale=1.0 path skips
+                # the multiply kernel outright — same values as exp_lib's
+                # gathered_attention.
+                raw_logits.mul_(scale)
             if soft is None:
                 logits = raw_logits.masked_fill_(_nvalid, _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
@@ -414,7 +431,8 @@ class HybridAttentionRoPE(L.HybridAttention):
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
             logits = torch.einsum('bthd,bshd->bths', q[:, s:e], k)
-            logits.mul_(scale)
+            if scale != 1.0:
+                logits.mul_(scale)
             logits.add_(mask[s:e][:, None, :])
             zflat = logits.reshape(B * (e - s), nh, T)
             if sink is None:
