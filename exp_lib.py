@@ -2900,6 +2900,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
             return out
     # cold build: source the test rows (local dump first, HF otherwise)
     test_rows = None
+    ds = None
     raw_txt = os.environ.get('WT103_RAW_TXT')
     _cands = []
     if raw_txt:
