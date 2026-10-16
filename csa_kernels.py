@@ -177,10 +177,9 @@ def _det_scatter_add(n_rows, indices, values, device, dtype):
 
 def _seg_structure(keys, n_rows):
     """跨头共享的段归约结构（与 _det_scatter_add_multi 同一套固定顺序
-    归约）。注意力反向的 dk/dv 键含头维（base·nh + h）：同一批 base 键对
-    每个头只差一个常量偏移，稳定排序给出同一排列、同一批段边界，因此
-    argsort 与段定位全部头共用一次，段内累加顺序与逐头排序形式逐元素
-    一致。"""
+    归约）。注意力反向的 dk/dv 键不含头维：同一批键对每个头给出同一
+    排列、同一批段边界，因此 argsort 与段定位全部头共用一次，段内累加
+    顺序与逐头排序形式逐元素一致。"""
     idx = keys.reshape(-1).to(torch.int64)
     n_rows = int(n_rows)
     order = torch.argsort(idx, stable=True)
@@ -196,11 +195,11 @@ def _seg_structure(keys, n_rows):
     return (order, seg_end, seg_id[keep], keep)
 
 
-def _seg_apply(seg, values, out_flat, h, nh):
-    """按共享段结构把一个头的值表归约进扁平梯度缓冲的 head=h 行：值经
-    同一排列 gather 后 cumsum，段和写入 seg_id·nh + h——即旧键
-    (base·nh + h) 排序定位到的同一批行；每行每头恰写一次，与旧形式的
-    零初始化后 += 同值。"""
+def _seg_apply(seg, values, out_flat):
+    """按共享段结构把一个头的值表归约进逐头 fp32 扁平行：值经同一排列
+    gather 后 cumsum，段和写入 seg_id 行（调用方保证 out_flat 已清零；
+    未被任何键覆盖的行保持零，与旧「零初始化全头缓冲后按 seg_id·nh+h
+    写入、末尾一次 cast」逐头 cast 的形式逐位一致）。"""
     order, seg_end, seg_id_k, keep = seg
     val_s = values.index_select(0, order).to(torch.float32)
     csum = val_s.cumsum_(dim=0)
@@ -209,7 +208,7 @@ def _seg_apply(seg, values, out_flat, h, nh):
     if seg_end.numel() > 1:
         lo[1:] = csum.index_select(0, seg_end[:-1])
     seg_sum = hi - lo
-    out_flat.index_copy_(0, seg_id_k * int(nh) + int(h), seg_sum[keep])
+    out_flat.index_copy_(0, seg_id_k, seg_sum[keep])
 
 
 class PoolGeometry:
@@ -399,11 +398,18 @@ def _full_arange_cached(B, T, Bm, device):
 # ============================================================================
 
 _POOL_CHUNK_BYTES = 64 << 20
+_POOL_CHUNK_HARD_BYTES = 512 << 20
 
 
-def _pool_chunk_b(R, Ltot, c):
+def _pool_chunk_b(R, Ltot, c, temps=1):
+    # 软预算决定常规 chunk（旧口径不变）；硬顶只在单 chunk 的 ~temps 份
+    # [R,ch,·,c] 临时量峰值可能越界时收紧（fwd 的 logit/sc/gather 约 6
+    # 份，bwd 再加 gsc/glogit 约 8 份）——常规规模下分块与旧值一致、
+    # 迭代次数不变，只在超大几何（长块 × 宽通道 × 大批次）下生效。
+    # chunk 只划分独立的块列，宽度不影响任何逐块值。
     per_block = max(1, int(R) * int(Ltot) * int(c) * 4)
-    return max(1, min(int(_POOL_CHUNK_BYTES) // per_block, 4096))
+    ch = max(1, min(int(_POOL_CHUNK_BYTES) // per_block, 4096))
+    return max(1, min(ch, int(_POOL_CHUNK_HARD_BYTES) // max(1, int(temps) * per_block)))
 
 
 def _gather_rows(x, idx):
@@ -431,7 +437,9 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     L, W = geom.max_len, geom.W_b
     has_b = Xb is not None and W > 0
     assert Za.shape[-1] == c, 'pool 语义要求 X 与 Z 同宽（kv_dim）'
-    comp = torch.zeros((R, Bm, c), device=dev, dtype=dtype)
+    # 每个块列都被下方的分块循环恰好写一次：零初始化是白跑的一遍全幅
+    # 写，直接 empty。
+    comp = torch.empty((R, Bm, c), device=dev, dtype=dtype)
     jA = torch.arange(L, device=dev)
     g_a, av_all = geom.gather_geom()
     pos_a = jA.clamp(max=int(B_pos_a.shape[0]) - 1)
@@ -441,17 +449,19 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
         g_b = geom.gather_geom_b()
         b_off = geom.b_off(B_pos_b.shape[0]).to(dev)
         Bp_b = B_pos_b[b_off].to(dtype)
-    ch = _pool_chunk_b(R, L + (W if has_b else 0), c)
+    ch = _pool_chunk_b(R, L + (W if has_b else 0), c, temps=6)
     for b0 in range(0, Bm, ch):
         b1 = min(b0 + ch, Bm)
         av = av_all[:, b0:b1]
         # 这些 logit 张量都是本轮新算出的临时量（无别名），fill 原地进行——
-        # 值与出位版逐位相同。
-        logit_a = _gather_rows(Za, g_a[:, b0:b1]) + Bp_a[None, None] * av
+        # 值与出位版逐位相同。无效泳道随即被 masked_fill_ 覆盖为 -inf，
+        # 旧的 * av / * vm 置零乘法是死计算（被覆盖 lanes 的最终值与乘前
+        # 无关，含 NaN/inf 边角——masked_fill 一律改写）。
+        logit_a = _gather_rows(Za, g_a[:, b0:b1]) + Bp_a[None, None]
         logit_a.masked_fill_(~av, _NEG_INF)
         if has_b:
             vm = jB[None, None, :, None] < geom.ov_len.to(torch.int64)[:, b0:b1, None, None]
-            logit_b = _gather_rows(Zb, g_b[:, b0:b1]) + Bp_b[:, b0:b1] * vm
+            logit_b = _gather_rows(Zb, g_b[:, b0:b1]) + Bp_b[:, b0:b1]
             logit_b.masked_fill_(~vm, _NEG_INF)
             WinZ = torch.cat([logit_a, logit_b], dim=2)
         else:
@@ -512,19 +522,25 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     ov_start_l = _i64['ov_start']
     nblk_l = _i64['n_blocks'][:, None]
     gBpb_keys, gBpb_vals = [], []
-    ch = _pool_chunk_b(R, L + (W if has_b else 0), c)
+    ch = _pool_chunk_b(R, L + (W if has_b else 0), c, temps=8)
+    # 单 chunk（ch >= Bm）时 in_ch / b2 的 chunk 范围条件恒真（geom 与 bid
+    # 同源——Bm 由同一分段表的 counts 给出，bid 值恒 < Bm）：where(全真,
+    # x, 0) 逐位返回 x（含 ±0/NaN），直接省略该选择核。
+    single_chunk = ch >= Bm
     # 广播用的零标量只读，逐 chunk 重建是同一常量——循环外只建一次。
     zero32 = torch.zeros((), device=dev, dtype=torch.float32)
     for b0 in range(0, Bm, ch):
         b1 = min(b0 + ch, Bm)
         av = av_all[:, b0:b1]
         # 这些 logit 张量都是本轮新算出的临时量（无别名），fill 原地进行——
-        # 值与出位版逐位相同。
-        logit_a = _gather_rows(Za, g_a[:, b0:b1]) + Bp_a[None, None] * av
+        # 值与出位版逐位相同。无效泳道随即被 masked_fill_ 覆盖为 -inf，
+        # 旧的 * av / * vm 置零乘法是死计算（被覆盖 lanes 的最终值与乘前
+        # 无关，masked_fill 一律改写）。
+        logit_a = _gather_rows(Za, g_a[:, b0:b1]) + Bp_a[None, None]
         logit_a.masked_fill_(~av, _NEG_INF)
         if has_b:
             vm = jB[None, None, :, None] < geom.ov_len.to(torch.int64)[:, b0:b1, None, None]
-            logit_b = _gather_rows(Zb, g_b[:, b0:b1]) + Bp_b[:, b0:b1] * vm
+            logit_b = _gather_rows(Zb, g_b[:, b0:b1]) + Bp_b[:, b0:b1]
             logit_b.masked_fill_(~vm, _NEG_INF)
             WinZ = torch.cat([logit_a, logit_b], dim=2)
         else:
@@ -542,7 +558,7 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
             glogit_b = None
         glogit_a = sc_a * (gsc_a - Srow[:, :, None])
         if need_xa or need_za:
-            in_ch = (bid_l >= b0) & (bid_l < b1)
+            in_ch = None if single_chunk else (bid_l >= b0) & (bid_l < b1)
             sel = bid_l.clamp(b0, b1 - 1)
             jA_t = (t_idx - starts_l.gather(1, sel)).clamp(0, L - 1)
             dc_sel = dcomp.gather(1, sel[:, :, None].expand(R, T, c)).to(torch.float32)
@@ -551,15 +567,16 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
                 # global clamped block id into chunk coordinates before the
                 # lane gather (starts_l/dcomp stay global-indexed above).
                 sc_a_sel = _take_lane(sc_a, r_idx, sel - b0, jA_t)
-                gXa += torch.where(in_ch[:, :, None], sc_a_sel * dc_sel, zero32).to(dtype)
+                gXa += (sc_a_sel * dc_sel).to(dtype) if single_chunk else torch.where(in_ch[:, :, None], sc_a_sel * dc_sel, zero32).to(dtype)
             if need_za:
                 gl_a_sel = _take_lane(glogit_a, r_idx, sel - b0, jA_t)
-                gZa += torch.where(in_ch[:, :, None], gl_a_sel, zero32).to(dtype)
+                gZa += gl_a_sel.to(dtype) if single_chunk else torch.where(in_ch[:, :, None], gl_a_sel, zero32).to(dtype)
         if has_b and (need_xb or need_zb):
             b2 = (bid_l + 1).clamp(0, Bm - 1)
             j2 = t_idx - ov_start_l.gather(1, b2)
             ok2 = (j2 >= 0) & (bid_l + 1 < nblk_l) & (bid_l + 1 < Bm)
-            ok2 = ok2 & (b2 >= b0) & (b2 < b1)
+            if not single_chunk:
+                ok2 = ok2 & (b2 >= b0) & (b2 < b1)
             b2c = b2.clamp(b0, b1 - 1)
             j2c = j2.clamp(0, W - 1)
             dc2 = dcomp.gather(1, b2c[:, :, None].expand(R, T, c)).to(torch.float32)
@@ -733,7 +750,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
 
 
 def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
-                     need_dq, need_dk, need_dw, t_chunk=128):
+                     need_dq, need_dk, need_dw, t_chunk=None):
     """索引反向（两后端共用；按 t 分块，块内 einsum，固定顺序累加）。
 
     选择本身不可微；梯度只经 soft 回传：
@@ -752,6 +769,13 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
     iscale = hd ** -0.5
     dev = qI.device
     dtype = qI.dtype
+    if t_chunk is None:
+        # 每 chunk 同时存活的 [R,tc,Bm] 级临时量约 nIH+8 份（Mk、s_list、
+        # s_all、masked、e、ds 及逐元素中间量）：旧固定 128 在大 Bm 下
+        # 超预算、小 Bm 下白白多跑 T/128 轮循环。chunk 只划分独立的
+        # (r,t) 行（dkI 的跨 chunk 累加分组属低阶位口径，与
+        # CSA_KERNEL_IDX_CHUNK 覆盖同理）。
+        t_chunk = max(1, min(T, (192 << 20) // max(int(R) * int(Bm) * 4 * (int(nIH) + 8), 1)))
     t_idx = torch.arange(T, device=dev)[None, :, None]
     # 同 _indexer_fwd_ref：causal 按 t 分块现算（同一整数比较），全幅
     # [R, T, Bm] 掩码不物化。
@@ -844,10 +868,11 @@ class FusedIndexer(torch.autograd.Function):
         if gs is None:
             return (None,) * 6
         ng = ctx.needs_input_grad
+        _ic = (_env_cached('CSA_KERNEL_IDX_CHUNK') or '').strip()
         dqI, dkI, dw = _indexer_bwd_ref(
             gs, idx, valid, soft, qI, kI, w_idx, last_tok,
             need_dq=bool(ng[1]), need_dk=bool(ng[2]), need_dw=bool(ng[3]),
-            t_chunk=int(_env_cached('CSA_KERNEL_IDX_CHUNK') or 128))
+            t_chunk=int(_ic) if _ic else None)
         return (None, dqI, dkI, dw, None, None)
 
 
@@ -863,11 +888,16 @@ def lightning_indexer_kernel(qI, kI, w_idx, last_tok, topk, impl=None):
 # 算子 3：稀疏注意力（`gathered_attention` 的内核路径）
 # ============================================================================
 
-_ATTN_REF_BUDGET = 64 << 20
+_ATTN_REF_BUDGET = 256 << 20
 
 
 def _attn_t_chunk(R, M, nh, hd):
-    per_t = max(1, int(R) * int(M) * int(nh) * int(hd) * 4)
+    # 头循环在 t-chunk 之外（见 _attn_fwd_ref/_attn_bwd_ref）：同时存活的
+    # 临时量只是单个头的若干 [R,tc,M,hd] 级张量（gather 出的 K/V 两半、
+    # bwd 的 Kl/Vl 拼接与 dk/dv 泳道碎片，合计约 6 份），与 nh 无关——
+    # 旧口径把预算除以 nh，chunk 数被人为放大约 nh/6 倍。chunk 只划分
+    # 独立的 (r,t) 行，宽度不影响任何元素值。
+    per_t = max(1, 6 * int(R) * int(M) * int(hd) * 4)
     return max(1, min(int(_ATTN_REF_BUDGET) // per_t, 256))
 
 
@@ -892,37 +922,41 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     t_idx = torch.arange(T, device=dev)[None, :, None]
     if valid is None:
         valid = torch.ones_like(topk_idx, dtype=torch.bool)
-    topk_l = topk_idx.to(torch.int64)
     win_raw = (t_idx - (w - 1) + torch.arange(w, device=dev)[None, None, :]).expand(R, T, w)
     sink_v = torch.nan_to_num(sink).to(dtype) if sink is not None else None
     tc = _attn_t_chunk(R, M, nh, hd)
     # 头在外、t-chunk 在内：各 (t,h) 的前向计算相互独立，循环顺序交换
-    # 不改变任何元素值。chunk 内的 src_sel/lt_sel/sel_ok/src_win/win_ok/
-    # anyrow 全部与 h 无关——在头循环外按 chunk 各算一次（同值）。
+    # 不改变任何元素值。chunk 内的 lt_sel/sel_ok/src_win/win_ok/anyrow
+    # 全部与 h 无关——在头循环外按 chunk 各算一次（同值）。topk 的 int64
+    # 升型不在循环外整幅物化：chunks 只持有 int32 原张量的行切片（视图，
+    # 同批精确整数），int64 形式在头循环内按 chunk 现算（同值，HCA 臂的
+    # [R,T,Bm] 全幅 int64 由此不再出现）；lt_sel 只用于构造 sel_ok，不进
+    # chunks 清单。
     lt_l = last_tok.to(torch.int64)
     chunks = []
     for t0 in range(0, T, tc):
         t1 = min(t0 + tc, T)
-        src_sel = topk_l[:, t0:t1]
-        lt_sel = lt_l.gather(1, src_sel.reshape(R, -1)).view(R, t1 - t0, nb)
+        src32 = topk_idx[:, t0:t1]
+        lt_sel = lt_l.gather(1, src32.to(torch.int64).reshape(R, -1)).view(R, t1 - t0, nb)
         sel_ok = valid[:, t0:t1] & (t_idx[:, t0:t1, :] > lt_sel)
         src_win = win_raw[:, t0:t1, :].clamp(min=0)
         win_ok = win_raw[:, t0:t1, :] >= 0
         lane_ok = torch.cat([sel_ok, win_ok], dim=-1)
         anyrow = (sel_ok.any(dim=-1) | win_ok.any(dim=-1)) if sink_v is None else None
-        chunks.append((t0, t1, src_sel, src_win, lane_ok, anyrow))
+        chunks.append((t0, t1, src32, src_win, lane_ok, anyrow))
     for h in range(nh):
-        q_all = q[:, :, h, :].to(torch.float32)
-        kb_all = k_blk[:, :, h, :].to(torch.float32)
-        kw_all = k_sw[:, :, h, :].to(torch.float32)
-        vb_all = v_blk[:, :, h, :].to(torch.float32)
-        vw_all = v_sw[:, :, h, :].to(torch.float32)
-        for (t0, t1, src_sel, src_win, lane_ok, anyrow) in chunks:
-            qh = q_all[:, t0:t1]
-            Kb = _gather_rows(kb_all, src_sel)
-            Kw = _gather_rows(kw_all, src_win)
-            Vb = _gather_rows(vb_all, src_sel)
-            Vw = _gather_rows(vw_all, src_win)
+        q_h = q[:, :, h, :]
+        kb_h = k_blk[:, :, h, :]
+        kw_h = k_sw[:, :, h, :]
+        vb_h = v_blk[:, :, h, :]
+        vw_h = v_sw[:, :, h, :]
+        for (t0, t1, src32, src_win, lane_ok, anyrow) in chunks:
+            src_sel = src32.to(torch.int64)
+            qh = q_h[:, t0:t1].to(torch.float32)
+            Kb = _gather_rows(kb_h, src_sel).to(torch.float32)
+            Kw = _gather_rows(kw_h, src_win).to(torch.float32)
+            Vb = _gather_rows(vb_h, src_sel).to(torch.float32)
+            Vw = _gather_rows(vw_h, src_win).to(torch.float32)
             zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1) * scale
             zA.masked_fill_(~lane_ok, MINL)
             if sink_v is None:
@@ -962,7 +996,6 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     t_idx = torch.arange(T, device=dev)[None, :, None]
     if valid is None:
         valid = torch.ones_like(topk_idx, dtype=torch.bool)
-    topk_l = topk_idx.to(torch.int64)
     win_raw = (t_idx - (w - 1) + torch.arange(w, device=dev)[None, None, :]).expand(R, T, w)
     sink_v = torch.nan_to_num(sink).to(dtype) if sink is not None else None
     dq = torch.zeros_like(q) if need_dq else None
@@ -972,24 +1005,30 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     tc = _attn_t_chunk(R, M, nh, hd)
     # 头在外、t-chunk 在内：各 (t,h) 独立。chunk 内的几何/掩码/soft 常量
     # 与 h 无关——头循环外按 chunk 各算一次（同值；soft_l[:, :, :nb] 同时
-    # 兼作逐头重置的 sf cast）。
-    # 键值梯度碎片按头收集、逐头归约：键含头维的部分（+h）跨头只差常量
-    # 偏移，稳定排序的排列与段边界跨头完全相同（见 _seg_structure），故
-    # 段结构按不含头维的 base 键预建一次、全部头共用；头内条目保持
-    # chunk 升序，组内累加顺序与逐头排序 flush 逐元素一致。
-    dk_blk32 = torch.zeros((R * Bm * nh, hd), device=dev, dtype=torch.float32) if need_dkb else None
-    dv_blk32 = torch.zeros((R * Bm * nh, hd), device=dev, dtype=torch.float32) if need_dvb else None
-    dk_sw32 = torch.zeros((R * T * nh, hd), device=dev, dtype=torch.float32) if need_dksw else None
-    dv_sw32 = torch.zeros((R * T * nh, hd), device=dev, dtype=torch.float32) if need_dvsw else None
-    # dk/dv 共享同一组键（同 (chunk,h) 构造的 keyb），dksw/dvsw 共享 keyw。
-    dk_vals, dv_vals = [], []
-    dksw_vals, dvsw_vals = [], []
+    # 兼作逐头重置的 sf cast）。topk 行切片只以原 dtype 视图入清单，
+    # int64 升型在头循环内按 chunk 现算（同批精确整数——HCA 臂的
+    # [R,T,Bm] 全幅 int64 不再物化）；lt_sel 只用于构造 sel_ok，不入清单。
+    # 键值梯度碎片按头收集、逐头归约：dk/dv（或 dksw/dvsw）的键逐元素
+    # 相同、不含头维，段结构预建一次、全部头共用（见 _seg_structure）。
+    # 碎片按 (r,t,j) 全局行序直接写进 [R,T,·,hd] 扁平缓冲（同键条目的
+    # 相对顺序与旧的逐 chunk 拼接+排序 flush 形式逐元素一致，排序序列
+    # 与段和不变；拼接缓冲与 cat 拷贝消除），归约目标从 [R·Bm·nh,hd] /
+    # [R·T·nh,hd] 的全头 fp32 累加器改为逐头复用的 [R·Bm,hd] / [R·T,hd]
+    # 单 slab（段和逐头 cast 进 dtype 出口行——与旧的全头 fp32 累加后
+    # 一次 cast 逐位一致），峰值 fp32 占用降至约 1/nh。
     lt_l = last_tok.to(torch.int64)
+    dk_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dkb else None
+    dv_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dvb else None
+    dksw_frag = torch.empty((R, T, w, hd), device=dev, dtype=torch.float32) if need_dksw else None
+    dvsw_frag = torch.empty((R, T, w, hd), device=dev, dtype=torch.float32) if need_dvsw else None
+    keyb = torch.empty((R, T, nb), device=dev, dtype=torch.int64) if (need_dkb or need_dvb) else None
+    keyw = torch.empty((R, T, w), device=dev, dtype=torch.int64) if (need_dksw or need_dvsw) else None
     chunks = []
     for t0 in range(0, T, tc):
         t1 = min(t0 + tc, T)
-        src_sel = topk_l[:, t0:t1]
-        lt_sel = lt_l.gather(1, src_sel.reshape(R, -1)).view(R, t1 - t0, nb)
+        src32 = topk_idx[:, t0:t1]
+        src64 = src32.to(torch.int64)
+        lt_sel = lt_l.gather(1, src64.reshape(R, -1)).view(R, t1 - t0, nb)
         sel_ok = valid[:, t0:t1] & (t_idx[:, t0:t1, :] > lt_sel)
         src_win = win_raw[:, t0:t1, :].clamp(min=0)
         win_ok = win_raw[:, t0:t1, :] >= 0
@@ -999,38 +1038,51 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         if soft is not None:
             soft_l = torch.zeros((R, t1 - t0, nb + w), device=dev, dtype=torch.float32)
             soft_l[:, :, :nb] = soft[:, t0:t1, :].to(torch.float32)
-        # 键基按需（int 精确）：不含头维的 base 键——(r,src)/窗口部分与
-        # h 无关，头维在归约落行时才以 seg_id·nh + h 加回（_seg_apply）。
-        keyb = r_idx.expand(R, t1 - t0, nb) * Bm + src_sel if (need_dkb or need_dvb) else None
-        keyw = r_idx.expand(R, t1 - t0, w) * T + src_win if (need_dksw or need_dvsw) else None
-        chunks.append((t0, t1, src_sel, src_win, lane_ok, soft_l, anyrow, keyb, keyw))
-    seg_b = _seg_structure(torch.cat([_c[7].reshape(-1) for _c in chunks]), R * Bm) if (need_dkb or need_dvb) else None
-    seg_w = _seg_structure(torch.cat([_c[8].reshape(-1) for _c in chunks]), R * T) if (need_dksw or need_dvsw) else None
+        # 键基按需（int 精确）：(r,src)/窗口部分与 h 无关。
+        if keyb is not None:
+            keyb[:, t0:t1] = r_idx.expand(R, t1 - t0, nb) * Bm + src64
+        if keyw is not None:
+            keyw[:, t0:t1] = r_idx.expand(R, t1 - t0, w) * T + src_win
+        chunks.append((t0, t1, src32, src_win, lane_ok, soft_l, anyrow))
+    seg_b = _seg_structure(keyb.reshape(-1), R * Bm) if keyb is not None else None
+    seg_w = _seg_structure(keyw.reshape(-1), R * T) if keyw is not None else None
+    # 逐头归约出口（dtype）与头间复用的逐头 fp32 归约 slab。
+    dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else None
+    dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else None
+    dk_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else None
+    dv_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dvsw else None
+    dk_slab = torch.zeros((R * Bm, hd), device=dev, dtype=torch.float32) if need_dkb else None
+    dv_slab = torch.zeros((R * Bm, hd), device=dev, dtype=torch.float32) if need_dvb else None
+    dksw_slab = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if need_dksw else None
+    dvsw_slab = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if need_dvsw else None
 
-    def _flush(h, vals_lists, bufs, seg):
-        # 逐头归约后清空碎片列表，释放本轮引用的全部 chunk 碎片。
-        # dk/dv（或 dksw/dvsw）键逐元素相同，共享同一次排序段和；bufs 中
-        # 的 None（未请求的梯度）跳过。
-        for vl, buf in zip(vals_lists, bufs):
-            if vl and buf is not None:
-                _seg_apply(seg, torch.cat(vl), buf, h, nh)
-        for vl in vals_lists:
-            vl.clear()
+    def _flush(h, frags, slabs, seg, outs):
+        # dk/dv（或 dksw/dvsw）键逐元素相同，共享同一次排序段和；段和写
+        # 进逐头 slab 的 seg_id 行（slab 每头清零——未被选择覆盖的行与
+        # 旧的全头零缓冲同值），随后逐头 cast 进 dtype 出口；None（未请
+        # 求的梯度）跳过。
+        for frag, slab, out in zip(frags, slabs, outs):
+            if frag is None:
+                continue
+            slab.zero_()
+            _seg_apply(seg, frag.view(-1, hd), slab)
+            out[:, :, h, :] = slab.view(out.shape[0], out.shape[1], hd).to(dtype)
 
     for h in range(nh):
-        q_all = q[:, :, h, :].to(torch.float32)
-        dO_all = dO[:, :, h, :].to(torch.float32)
-        kb_all = k_blk[:, :, h, :].to(torch.float32)
-        kw_all = k_sw[:, :, h, :].to(torch.float32)
-        vb_all = v_blk[:, :, h, :].to(torch.float32)
-        vw_all = v_sw[:, :, h, :].to(torch.float32)
-        for (t0, t1, src_sel, src_win, lane_ok, soft_l, anyrow, keyb, keyw) in chunks:
-            qh = q_all[:, t0:t1]
-            dOh = dO_all[:, t0:t1]
-            Kb = _gather_rows(kb_all, src_sel)
-            Kw = _gather_rows(kw_all, src_win)
-            Vb = _gather_rows(vb_all, src_sel)
-            Vw = _gather_rows(vw_all, src_win)
+        q_h = q[:, :, h, :]
+        dO_h = dO[:, :, h, :]
+        kb_h = k_blk[:, :, h, :]
+        kw_h = k_sw[:, :, h, :]
+        vb_h = v_blk[:, :, h, :]
+        vw_h = v_sw[:, :, h, :]
+        for (t0, t1, src32, src_win, lane_ok, soft_l, anyrow) in chunks:
+            src_sel = src32.to(torch.int64)
+            qh = q_h[:, t0:t1].to(torch.float32)
+            dOh = dO_h[:, t0:t1].to(torch.float32)
+            Kb = _gather_rows(kb_h, src_sel).to(torch.float32)
+            Kw = _gather_rows(kw_h, src_win).to(torch.float32)
+            Vb = _gather_rows(vb_h, src_sel).to(torch.float32)
+            Vw = _gather_rows(vw_h, src_win).to(torch.float32)
             Kl = torch.cat([Kb, Kw], dim=-2)
             Vl = torch.cat([Vb, Vw], dim=-2)
             zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1) * scale
@@ -1084,21 +1136,17 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             if need_dkb or need_dksw:
                 dkl = torch.einsum('rtm,rtd->rtmd', dz, qh) * scale
                 if need_dkb:
-                    dk_vals.append(dkl[:, :, :nb].reshape(-1, hd))
+                    dk_frag[:, t0:t1] = dkl[:, :, :nb]
                 if need_dksw:
-                    dksw_vals.append(dkl[:, :, nb:].reshape(-1, hd))
+                    dksw_frag[:, t0:t1] = dkl[:, :, nb:]
             if need_dvb or need_dvsw:
                 dvl = torch.einsum('rtm,rtd->rtmd', P_A_f, dOh)
                 if need_dvb:
-                    dv_vals.append(dvl[:, :, :nb].reshape(-1, hd))
+                    dv_frag[:, t0:t1] = dvl[:, :, :nb]
                 if need_dvsw:
-                    dvsw_vals.append(dvl[:, :, nb:].reshape(-1, hd))
-        _flush(h, [dk_vals, dv_vals], [dk_blk32, dv_blk32], seg_b)
-        _flush(h, [dksw_vals, dvsw_vals], [dk_sw32, dv_sw32], seg_w)
-    dk_blk = dk_blk32.to(dtype).view(R, Bm, nh, hd) if need_dkb else None
-    dk_sw = dk_sw32.to(dtype).view(R, T, nh, hd) if need_dksw else None
-    dv_blk = dv_blk32.to(dtype).view(R, Bm, nh, hd) if need_dvb else None
-    dv_sw = dv_sw32.to(dtype).view(R, T, nh, hd) if need_dvsw else None
+                    dvsw_frag[:, t0:t1] = dvl[:, :, nb:]
+        _flush(h, (dk_frag, dv_frag), (dk_slab, dv_slab), seg_b, (dk_blk, dv_blk))
+        _flush(h, (dksw_frag, dvsw_frag), (dksw_slab, dvsw_slab), seg_w, (dk_sw, dv_sw))
     return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)
 
 

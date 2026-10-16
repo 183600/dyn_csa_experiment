@@ -411,7 +411,7 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     return out.squeeze(0) if squeeze else out
 
 def blocks_fixed(n, block_size, device):
-    key = (str(device), 'blkfix', int(n), int(block_size))
+    key = (_dev_str(device), 'blkfix', int(n), int(block_size))
     hit = _IDX_CACHE.get(key)
     if hit is not None:
         return hit
@@ -432,7 +432,7 @@ _CAUSAL_TRI = None
 
 def _causal_donor(device, width):
     global _CAUSAL_TRI
-    dev_s = str(device)
+    dev_s = _dev_str(device)
     held = _CAUSAL_TRI
     if held is not None and held[0] == dev_s and (held[1].shape[0] >= int(width)):
         return (held[1], dev_s)
@@ -497,7 +497,7 @@ def _attb_bump_epoch():
 _HALF = 0.5
 
 def _arange_cache(n, device):
-    key = (str(device), 'arange', int(n))
+    key = (_dev_str(device), 'arange', int(n))
     a = _IDX_CACHE.get(key)
     if a is None:
         with torch.inference_mode(False):
@@ -506,7 +506,7 @@ def _arange_cache(n, device):
     return a
 
 def _window_geometry(n, w, device):
-    key = (str(device), 'wingeo', int(n), int(w))
+    key = (_dev_str(device), 'wingeo', int(n), int(w))
     hit = _IDX_CACHE.get(key)
     if hit is not None:
         return hit
@@ -521,7 +521,7 @@ def _window_geometry(n, w, device):
 def _range_cache(lo, hi, device):
     if lo == 0:
         return _arange_cache(hi, device)
-    key = (str(device), 'arange2', int(lo), int(hi))
+    key = (_dev_str(device), 'arange2', int(lo), int(hi))
     a = _IDX_CACHE.get(key)
     if a is None:
         with torch.inference_mode(False):
@@ -537,7 +537,7 @@ def _arange_exp_cache(n, m, device):
     # inference mode so a table first filled during eval can still serve as an
     # autograd index tensor in training; only ever read downstream (row slices
     # feeding gathers), never mutated.
-    key = (str(device), 'arangeexp', int(n), int(m))
+    key = (_dev_str(device), 'arangeexp', int(n), int(m))
     a = _IDX_CACHE.get(key)
     if a is None:
         with torch.inference_mode(False):
@@ -552,7 +552,7 @@ def causal_window_mask_f(T, window, device, dtype):
     base = causal_window_mask(T, window, device)
     if base.dtype == dtype:
         return base
-    key = (str(device), 'cwf', int(T), int(window), str(dtype))
+    key = (_dev_str(device), 'cwf', int(T), int(window), str(dtype))
     m = _MASK_CACHE.get(key)
     if m is None:
         with torch.inference_mode(False):
@@ -561,7 +561,7 @@ def causal_window_mask_f(T, window, device, dtype):
     return m
 
 def _attn_transient_budget(device):
-    key = (str(device), _ATB_EPOCH)
+    key = (_dev_str(device), _ATB_EPOCH)
     if key in _ATB_CACHE:
         return _ATB_CACHE[key]
     val = None
@@ -584,7 +584,7 @@ def _tri_full(n, device, k):
 def _mask_buffer(n, device, kind):
     if kind == 'causal':
         return _tri_full(n, device, 1)
-    key = (str(device), kind, int(n))
+    key = (_dev_str(device), kind, int(n))
     buf = _MASK_CACHE.get(key)
     if buf is not None:
         return buf
@@ -604,7 +604,7 @@ def causal_mask(T, device):
 def window_band(T, window, device):
     if window <= 0 or window >= T:
         return _mask_buffer(T, device, 'zero')
-    key = (str(device), 'bandw', int(T), int(window))
+    key = (_dev_str(device), 'bandw', int(T), int(window))
     buf = _MASK_CACHE.get(key)
     if buf is None:
         buf = _tri_full(T, device, -int(window))
@@ -614,7 +614,7 @@ def window_band(T, window, device):
 def causal_window_mask(T, window, device):
     if window <= 0 or window >= T:
         return causal_mask(T, device)
-    key = (str(device), 'cw', int(T), int(window))
+    key = (_dev_str(device), 'cw', int(T), int(window))
     m = _MASK_CACHE.get(key)
     if m is None:
         with torch.inference_mode(False):
@@ -624,7 +624,7 @@ def causal_window_mask(T, window, device):
     return m
 
 def _window_block_offset(n, w, n_blk, device):
-    key = (str(device), 'winoff', int(n), int(w), int(n_blk))
+    key = (_dev_str(device), 'winoff', int(n), int(w), int(n_blk))
     hit = _IDX_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1358,8 +1358,8 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             _TOPK_CLAMP_WARNED.add(_wk)
             print(f'[lightning_indexer] requested topk={int(topk)} but only B={int(B)} blocks are available; effective selection is clamped to all {int(k)} blocks for this call')
     if random_select:
-        _ri_key = (str(dev), 'rs_ri', int(n))
-        _jc_key = (str(dev), 'rs_jc', int(B))
+        _ri_key = (_dev_str(dev), 'rs_ri', int(n))
+        _jc_key = (_dev_str(dev), 'rs_jc', int(B))
         _ri = _IDX_CACHE.get(_ri_key)
         if _ri is None:
             with torch.inference_mode(False):
@@ -1373,6 +1373,16 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     if query_chunk is None:
         raise ValueError("lightning_indexer: query_chunk=None is not 'use the default'; pass the default (2048) explicitly or omit the argument")
     query_chunk = max(1, min(int(query_chunk), n))
+    # 瞬态封顶（只收紧 chunk 行数——下方注释已论证逐 chunk 融合与全宽
+    # 形式逐行逐位一致；用固定 256MB 而不是随机器空闲显存波动的口径，
+    # 分块边界是 (n, B, nIH, dtype) 的纯函数，跨机器确定）：每 chunk 同时
+    # 物化 raw [nIH,·,B]、scores、masked、int64 order 与 keep/dest/tgt 等
+    # 选择表，旧代码对 query_chunk 不设预算，宽 B（长序列多块）下瞬态
+    # 无界。现行规模下该 cap 不触发（边界与旧值一致），只在更大的块数下
+    # 收紧。
+    _iper = int(B) * (int(nIH) * int(H.element_size()) + 40) + 64
+    if _iper > 0:
+        query_chunk = max(1, min(query_chunk, (256 << 20) // _iper))
     _iscale = hd ** (-0.5)
     # 选择 + soft 尾部与打分同一逐 chunk 节奏融合执行：其中每个算子（masked
     # where/稳定排序/cumsum/scatter/logsumexp/gather/逐元素 exp）都按 query
@@ -1491,14 +1501,22 @@ def _finfo_min(dtype):
         _FO_MINL[dtype] = v
     return v
 
-def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False):
+def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=512, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False):
     n = q.shape[0]
     dev = q.device
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
+    if mem_budget_bytes is None:
+        # CPU/未知设备没有 free-memory 口径：封顶 256MB 瞬态（只收紧
+        # chunk 行数——chunk 是纯行划分，任何宽度下逐行值逐位相同）。
+        mem_budget_bytes = 256 << 20
     _heads = q.shape[1] if q.dim() == 3 else 1
     _M = max(1, int(topk_idx.shape[1]) + int(w))
-    _per_row = 2 * _M * _heads * int(q.shape[-1]) + 2 * _M * _heads
+    # K/V 两侧各经「两半 gather + cat」：cat 期间两半与整幅并存，K/V 项
+    # 按 2 倍计（Kset 与 Vset 不同时达到峰值——Vset 在 logits 之后——
+    # 但 soft 分支的 kb/kw 与 soft_logits 会跨越两次 softmax 存活，2 倍
+    # 口径对两种分支都封住峰值）。
+    _per_row = 4 * _M * _heads * int(q.shape[-1]) + 2 * _M * _heads
     _bytes_per_chunk_row = _per_row * q.element_size()
     _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
     if _bindable and _bytes_per_chunk_row > 0:
