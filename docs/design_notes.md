@@ -408,3 +408,33 @@ test split 的缓存纪律与主语料相同（npy + sha256 + 原子写），另
   「在尽可能相同的投影、归一化、位置编码下分别改变分块方式与选择方式」
   的落点。`arch-aligned` 对比（full_rope − allblocks 孪生）因此是比
   dense−csa 更干净的分块/压缩效应读数。
+
+## 19. 对比实验 / 消融 / 统计可靠性的自动审计
+
+`exp_lib` 在每个面板聚合时（`_dump_aggregate`）对 `summary.json` 跑一次
+零 GPU 的 `methodology_audit`，结果同时打印并写入
+`<outdir>/methodology_audit.json`。它把评审要求的三件事变成可复核的读数：
+
+- **受控变量**：每条对比先用 `pair_reason` 做严格同 `run_cfg` 配对——
+  优化器（AdamW/foreach）、学习率与 warmup/余弦调度、权重衰减、
+  `delta_lr_mult`、训练步数与 token 数、comp 正则、模型形状、数据指纹与
+  确定性档全部一致，只有层架构（`variant`）不同；`run_cfg_knobs` 只是把
+  该串解码成可读字段便于展示，**真正的门槛仍是整串相等**。被 `pair_reason`
+  拒掉的种子不计入 n，并在 `skipped_reasons` 里点名。
+- **消融完整性**：`ABLATION_DESIGN` 声明式地列出每个创新点的留一对照。
+  去一法只在**固定分块**下做是不充分的（`csa_fix_*`），因此同一组去一法
+  在**动态分块**（提出的主方法）下也有对应臂 `csa_dyn_randidx` /
+  `csa_dyn_zerocont` / `csa_dyn_nosink`（与 `csa_dynamic` 逐字段同构，仅
+  待验证模块不同）。没有任何一条完整对照的创新点会被列进
+  `unverified_components`，缺哪个臂会被逐条 warn，而不是靠「有对照」含糊
+  带过。
+- **统计可靠性**：`paired_effect_stats` 给逐种子 Δ 的 mean±std（ddof=1）、
+  `cohens_dz`、精确符号翻转 p 与该 n 的 p 下限，并显式标出
+  `underpowered`（n<3）与 `within_seed_noise`（|mean| ≤ std，即 +0.2%
+  的均值配 0.5% 的方差这种噪声级「提升」）；`significant` 同时要求
+  p<α 且效应大于种子噪声，避免大 n 的 p 值把亚噪声效应包装成真实增益。
+  核心配对表 `_print_pairs` 同样改用该统计，逐条打印 p 与噪声判词。
+
+`exact_signflip_p` 对 n≤20 穷举 2ⁿ 符号翻转（确定性、与各驱动套件同一
+检验），n>20 用确定性正态近似；`signflip_p_floor` 给出分辨率下限，使
+「未显著」能区分是分辨率上限还是数据结论。

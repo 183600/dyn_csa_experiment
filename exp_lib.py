@@ -99,7 +99,11 @@ def _ckpt_mode():
 
 _CKPT = {'on': _ckpt_mode()}
 RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000000, steps=500 if QUICK else 1500, warmup=50, lr=0.0003, weight_decay=0.1, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=250, eval_subset=128, seeds=[0] if QUICK else [0, 1, 2, 3, 4], outdir='results_lm_v3_1500', variants=['full', 'full_matched', 'full_cos', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'])
-ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'full_sink']
+# 消融臂：`csa_fix_*` 是固定分块下对学习式 indexer / 池化内容 / sink / top-k
+# 的去一法对照；`csa_dyn_*` 是同一组去一法在**动态分块**（主方法）下的对照——
+# 只报固定分块下的去一法无法支撑「该模块在提出的动态方法里各自有用」。两组
+# 都是「与 csa_dynamic / csa_fixed 逐字段同构，仅待验证模块不同」。
+ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'full_sink']
 RUN_ABL = dict(RUN, outdir='results_lm_v4_abl', variants=ABL_VARIANTS, seeds=[0] if QUICK else [0, 1, 2, 3, 4])
 RUN_LONG = dict(RUN, n_train_tokens=2000000 if QUICK else 110000000, steps=500 if QUICK else 20000, warmup=200, eval_every=1000, seeds=[0] if QUICK else [0, 1, 2, 3], outdir='results_lm_v3_long', variants=['full', 'full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn'])
 RUN_SCALE = dict(RUN, d=384, n_layers=8, n_heads=12, d_head=32, seq_len=1024, batch_size=8, n_train_tokens=2000000 if QUICK else 40000000, steps=500 if QUICK else 4000, warmup=100, eval_every=500, seeds=[0] if QUICK else [0, 1, 2], outdir='results_lm_v5_scale', variants=['full', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic'])
@@ -2518,6 +2522,12 @@ def make_layer_cfgs(n_layers, variant):
             cfgs.append(AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=8))
         elif variant == 'csa_fix_topk64':
             cfgs.append(AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=64))
+        elif variant == 'csa_dyn_randidx':
+            cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, indexer_mode='random'))
+        elif variant == 'csa_dyn_zerocont':
+            cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, content_mode='zero'))
+        elif variant == 'csa_dyn_nosink':
+            cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, use_sink=False))
         elif variant == 'csa_fixed_fullpov':
             cfgs.append(AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=128, index_topk=32))
         elif variant == 'csa_dynamic_fullpov':
@@ -3550,6 +3560,103 @@ def finite_range(named_values):
         return (None, None, dropped)
     return (min(vals), max(vals), dropped)
 
+def exact_signflip_p(deltas):
+    """Two-sided exact sign-flip test over paired per-seed deltas.
+
+    H0: the per-seed difference is symmetric about 0.  For n <= 20 every one
+    of the 2**n sign assignments is enumerated (deterministic, and the same
+    test the driver suites report); for larger n a deterministic normal
+    approximation with continuity correction is used instead, so a report
+    never depends on a random draw.  Non-finite deltas are dropped (the count
+    is returned).  Pure function over its input — used by the aggregate audit
+    so the core panel reports the same p the per-phase suites do, rather than
+    a bare mean±std a reviewer could mistake for evidence."""
+    d_in = [float(x) for x in deltas]
+    d = np.asarray([x for x in d_in if math.isfinite(x)], dtype=float)
+    n = int(d.size)
+    n_dropped = len(d_in) - n
+    if n == 0:
+        return {'n': 0, 'p': float('nan'), 'n_dropped': n_dropped, 'method': 'none'}
+    obs = abs(float(d.mean()))
+    if n <= 20:
+        total = 1 << n
+        cnt = 0
+        bitpos = np.arange(n, dtype=np.int64)[None, :]
+        step = max(1, min(total, (1 << 22) // max(n, 1)))
+        for off in range(0, total, step):
+            bs = min(step, total - off)
+            masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
+            signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
+            cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
+        return {'n': n, 'p': float(cnt / total), 'n_dropped': n_dropped, 'method': 'exact'}
+    sd = float(d.std(ddof=1)) if n > 1 else 0.0
+    if sd <= 1e-300:
+        p = 0.0 if obs > 0 else 1.0
+    else:
+        z = obs * math.sqrt(n) / sd
+        p = math.erfc(z / math.sqrt(2.0))
+    return {'n': n, 'p': float(min(1.0, p)), 'n_dropped': n_dropped, 'method': 'normal-approx'}
+
+def paired_effect_stats(deltas, alpha=0.05, min_n=3):
+    """Paired contrast summary with an explicit effect-vs-seed-noise verdict.
+
+    Reports n, mean, sample std (ddof=1), sem, Cohen's d_z, the exact
+    sign-flip p, the p-resolution floor at this n, and three booleans:
+
+      underpowered      — n < `min_n` (the 3-seed floor the reporting rules
+                          require for a key experiment);
+      within_seed_noise — |mean| <= std, i.e. the seed-to-seed spread alone is
+                          at least as large as the reported effect (a +0.2%
+                          mean with 0.5% std is NOT a usable gain);
+      significant       — p < alpha AND NOT within_seed_noise.
+
+    Requiring both the test AND the effect-vs-spread check means a large-n
+    p-value can never dress up a sub-noise effect as a real improvement."""
+    d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(float(x))], dtype=float)
+    n = int(d.size)
+    if n == 0:
+        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'underpowered': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data'}
+    mean = float(d.mean())
+    std = float(d.std(ddof=1)) if n > 1 else 0.0
+    sem = float(std / math.sqrt(n)) if n > 1 else float('nan')
+    p = exact_signflip_p(d)['p']
+    if std > 1e-12:
+        dz = float(mean / std)
+    elif abs(mean) < 1e-300:
+        dz = 0.0
+    else:
+        dz = float('inf') if mean > 0 else float('-inf')
+    underpowered = n < int(min_n)
+    within_seed_noise = abs(mean) <= std
+    significant = bool(math.isfinite(p) and p < alpha and (not within_seed_noise))
+    if underpowered:
+        verdict = 'underpowered (n<3)'
+    elif within_seed_noise:
+        verdict = 'effect within seed noise (|mean|<=std)'
+    elif significant:
+        verdict = 'effect exceeds seed noise (p<%.3g)' % alpha
+    else:
+        verdict = 'not significant at this n (p>=%.3g)' % alpha
+    return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'p_exact_signflip': float(p), 'p_floor': signflip_p_floor(n), 'underpowered': underpowered, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict}
+
+# `mt` (matched-variant set) and `mr` (mlp_match_ref) can themselves contain
+# underscores (e.g. `full_rope`, `csa_dynamic`), so those two values are
+# captured lazily up to the next literal key rather than by `[^_]+`.
+_RUN_CFG_RE = re.compile('^steps(?P<steps>[^_]+)_sl(?P<sl>[^_]+)_bs(?P<bs>[^_]+)_nt(?P<nt>[^_]+)_lr(?P<lr>[^_]+)_wd(?P<wd>[^_]+)_d(?P<d>[^_]+)_L(?P<L>[^_]+)_H(?P<H>[^_]+)_Dh(?P<Dh>[^_]+)_v(?P<v>[^_]+)_wu(?P<wu>[^_]+)_cl(?P<cl>[^_]+)_dlm(?P<dlm>[^_]+)_mt(?P<mt>.*?)_mr(?P<mr>.*?)_ee(?P<ee>[^_]+)_es(?P<es>[^_]+)_det(?P<det>[^_]+)_df(?P<df>.+?)_cs(?P<cs>.+)$')
+
+def run_cfg_knobs(fp):
+    """Best-effort decode of a `_run_fp` string into its named training knobs.
+
+    Used only for the audit display: it lets the report SHOW that two arms
+    share optimizer / schedule / budget / data, instead of asserting it.
+    `{}` means the string predates the current layout or is malformed.  The
+    authoritative controlled-variable gate is still whole-string equality in
+    `pair_reason` — this decoder never substitutes for it."""
+    if not isinstance(fp, str):
+        return {}
+    m = _RUN_CFG_RE.match(fp)
+    return m.groupdict() if m else {}
+
 def variant_presence(outdir):
     out = {}
     sp = os.path.join(outdir, 'summary.json')
@@ -3659,6 +3766,144 @@ def ppl_by_seed_grouped(outdir):
     for (_v, _t, _s), (_k, _r) in read_panel(outdir).items():
         grouped.setdefault((_v, _t), {})[_s] = _r
     return grouped
+
+# ---- 对比实验 / 消融 / 统计可靠性的声明式审计（零 GPU）----
+# 每个「创新点」按留一法（leave-one-out）写出「带模块」与「去模块」的对照
+# 臂。审计对每条对照：(1) 用 `pair_reason` 验证两臂严格同 run_cfg——优化器、
+# 学习率调度、权重衰减、训练步数/ token、warmup、comp 正则、模型形状、数据
+# 指纹与确定性档全部一致，只有层架构（variant）不同；(2) 逐种子配对给出
+# mean±std、d_z 与精确符号翻转 p；(3) 用 |mean| <= std 标出「噪声级提升」、
+# 用 n<3 标出欠功效；(4) 汇总每个创新点是否至少有一条完整留一对照。
+# 符号约定：Δ = 「带模块」−「去模块」，PPL 越低越好，故 Δ<0 = 模块有用。
+ABLATION_DESIGN = {
+    'dynamic_blocking': [
+        ('csa_dynamic', 'csa_fixed', 'dynamic vs fixed blocking (CSA)'),
+        ('hybrid_dynamic', 'hybrid_fixed', 'dynamic vs fixed blocking (CSA+HCA hybrid)'),
+    ],
+    'learned_selection': [
+        ('csa_fixed', 'csa_fix_randidx', 'learned top-k vs random selection (fixed blocking)'),
+        ('csa_dynamic', 'csa_dyn_randidx', 'learned top-k vs random selection (dynamic blocking)'),
+    ],
+    'content_pooling': [
+        ('csa_fixed', 'csa_fix_zerocont', 'pooled block content vs zero content (fixed blocking)'),
+        ('csa_dynamic', 'csa_dyn_zerocont', 'pooled block content vs zero content (dynamic blocking)'),
+    ],
+    'attention_sink': [
+        ('csa_fixed', 'csa_fix_nosink', 'sink on vs off (fixed blocking)'),
+        ('csa_dynamic', 'csa_dyn_nosink', 'sink on vs off (dynamic blocking)'),
+        ('full_sink', 'full', 'sink on vs off (dense control)'),
+    ],
+    'local_fusion': [
+        ('csa_dyn_fuse', 'csa_dynamic', 'learned local fusion on vs off (CSA)'),
+        ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn', 'learned local fusion on vs off (hybrid)'),
+    ],
+    'hybrid_hierarchy': [
+        ('hybrid_csa_dyn', 'csa_dynamic', 'CSA+HCA hybrid vs CSA-only (dynamic blocking)'),
+    ],
+}
+
+def _variant_seed_map(summary):
+    """{(variant, protocol, seed): rec} for measurable, non-synthesized records
+    with an unambiguous seed, plus the set of (variant, protocol, seed) triples
+    that hold more than one record (ambiguous → excluded, first key wins).
+    This is the single reader `_print_pairs` and `methodology_audit` share."""
+    _legacy_ok = legacy_warm_tags(summary)
+    recs = {}
+    amb = set()
+    for _k, r in summary.items():
+        if not (isinstance(r, dict) and ppl_is_usable(r.get('ppl')) and ('seed' in r) and (not r.get('synthesized'))):
+            continue
+        rk = _record_identity(r, _k, _legacy_ok)
+        if rk is None or rk in amb:
+            continue
+        if rk in recs:
+            amb.add(rk)
+            recs.pop(rk, None)
+            continue
+        recs[rk] = r
+    return recs, amb
+
+def _paired_seed_deltas(recs, a, b):
+    """Per-seed (a − b) deltas over seeds where BOTH arms have a measurable
+    record AND `pair_reason` confirms identical run_cfg / training budget.
+    Returns (deltas, shared_seeds, skipped) with skipped = [(seed, reason)]."""
+    ra = {s: r for (v, _t, s), r in recs.items() if v == a}
+    rb = {s: r for (v, _t, s), r in recs.items() if v == b}
+    shared = sorted(set(ra) & set(rb))
+    deltas, skipped = [], []
+    for s in shared:
+        reason = pair_reason(ra[s], rb[s])
+        if reason is not None:
+            skipped.append((s, reason))
+            continue
+        deltas.append(float(ra[s]['ppl']) - float(rb[s]['ppl']))
+    return deltas, shared, skipped
+
+def methodology_audit(summary, design=None, *, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True):
+    """Zero-GPU audit of controlled comparison, ablation completeness and
+    statistical reliability for one panel's `summary` dict.
+
+    For every declared leave-one-out contrast it recomputes the per-seed paired
+    delta (a strict same-run_cfg pairing), the mean±std / d_z / exact sign-flip
+    p, and flags underpowered (n<3) and noise-level (|mean| <= std) effects.
+    Components with no complete contrast are listed as unverified.  Returns the
+    report dict and, when `outdir` is given, writes `methodology_audit.json`."""
+    design = ABLATION_DESIGN if design is None else design
+    recs, amb = _variant_seed_map(summary)
+    present = sorted({v for (v, _t, _s) in recs})
+    report = {'variants_present': present, 'n_measurable': len(recs), 'ambiguous': sorted(amb), 'components': {}, 'unverified_components': [], 'warnings': []}
+    for comp, contrasts in design.items():
+        entries = []
+        complete = 0
+        for a, b, note in contrasts:
+            a_present, b_present = (a in present, b in present)
+            deltas, shared, skipped = _paired_seed_deltas(recs, a, b)
+            st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
+            _cfg_a = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == a), None)
+            _cfg_b = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == b), None)
+            st.update({'with': a, 'without': b, 'note': note, 'n_shared': len(shared), 'n_skipped': len(skipped), 'skipped_reasons': sorted({reason for _s, reason in skipped}), 'controlled': bool(deltas) and (not skipped), 'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b, 'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None})
+            entries.append(st)
+            if a_present and b_present:
+                if deltas:
+                    complete += 1
+                elif skipped:
+                    report['warnings'].append('%s: `%s` vs `%s` both measured but NO seed clears the same-run_cfg gate — %s' % (comp, a, b, '; '.join(sorted({reason for _s, reason in skipped}))))
+            elif a_present != b_present:
+                report['warnings'].append('%s: incomplete leave-one-out `%s` vs `%s` — missing `%s`' % (comp, a, b, a if not a_present else b))
+            else:
+                report['warnings'].append('%s: neither `%s` nor `%s` measured — no leave-one-out for this component yet' % (comp, a, b))
+        report['components'][comp] = entries
+        if complete == 0:
+            report['unverified_components'].append(comp)
+    if write and outdir:
+        try:
+            os.makedirs(outdir, exist_ok=True)
+            atomic_write_json(os.path.join(outdir, 'methodology_audit.json'), report)
+        except Exception as e:
+            print('[audit] could not write methodology_audit.json: %s: %s' % (type(e).__name__, e))
+    if verbose:
+        _print_methodology_audit(report)
+    return report
+
+def _print_methodology_audit(report):
+    print('\n========== methodology audit: controlled comparison / ablation / statistics ==========')
+    print('  variants with measurable records: ' + (', '.join(report['variants_present']) or '(none)'))
+    print('  Δ = with-module − without-module (perplexity; negative = the module helps).')
+    for comp, entries in report['components'].items():
+        live = [e for e in entries if e['n_shared'] > 0]
+        if not live:
+            continue
+        print('  [%s]' % comp)
+        for e in live:
+            _c = 'controlled (same run_cfg)' if e['controlled'] else ('UNCONTROLLED: ' + '; '.join(e['skipped_reasons']))
+            _p = ('%.4f' % e['p_exact_signflip']) if math.isfinite(e['p_exact_signflip']) else 'n/a'
+            print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p))
+            print('        %s | %s' % (_c, e['effect_vs_noise']))
+    if report['unverified_components']:
+        print('  unverified innovations (no complete leave-one-out contrast measured): ' + ', '.join(report['unverified_components']))
+    for w in report['warnings']:
+        print('  [warn] ' + w)
+    print('======================================================================================')
 
 def add_paired(*_a, **_kw):
     raise NotImplementedError('use v9_supp.add_paired (exp_lib cannot import v7_supp)')
@@ -5180,25 +5425,12 @@ def _print_table(agg):
     print('================================================================')
 
 def _print_pairs(summary):
-    recs = {}
-    _pair_amb = []
-    _amb = set()
-    _legacy_ok = legacy_warm_tags(summary)
-    for _k, r in summary.items():
-        if not (isinstance(r, dict) and ppl_is_usable(r.get('ppl')) and ('seed' in r) and (not r.get('synthesized'))):
-            continue
-        rk = _record_identity(r, _k, _legacy_ok)
-        if rk is None or rk in _amb:
-            continue
-        if rk in recs:
-            _amb.add(rk)
-            _pair_amb.append(rk)
-            recs.pop(rk)
-            continue
-        recs[rk] = r
+    recs, _amb = _variant_seed_map(summary)
+    _pair_amb = sorted(_amb)
     _pair_skip = []
-    PAIRS = [('csa_dynamic', 'csa_fixed'), ('hybrid_dynamic', 'hybrid_fixed'), ('hybrid_csa_dyn', 'hybrid_fixed'), ('hybrid_hca_dyn', 'hybrid_fixed'), ('csa_dyn_fuse', 'csa_dynamic'), ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn'), ('csa_fix_randidx', 'csa_fixed'), ('csa_fix_zerocont', 'csa_fixed'), ('csa_fix_nosink', 'csa_fixed'), ('csa_fix_topk8', 'csa_fixed'), ('csa_fix_topk64', 'csa_fixed'), ('full_sink', 'full')]
+    PAIRS = [('csa_dynamic', 'csa_fixed'), ('hybrid_dynamic', 'hybrid_fixed'), ('hybrid_csa_dyn', 'hybrid_fixed'), ('hybrid_hca_dyn', 'hybrid_fixed'), ('csa_dyn_fuse', 'csa_dynamic'), ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn'), ('csa_fix_randidx', 'csa_fixed'), ('csa_fix_zerocont', 'csa_fixed'), ('csa_fix_nosink', 'csa_fixed'), ('csa_fix_topk8', 'csa_fixed'), ('csa_fix_topk64', 'csa_fixed'), ('csa_dyn_randidx', 'csa_dynamic'), ('csa_dyn_zerocont', 'csa_dynamic'), ('csa_dyn_nosink', 'csa_dynamic'), ('full_sink', 'full')]
     print('\n========== paired per-seed deltas (a − b, positive = a worse) ==========')
+    print('  (p = exact two-sided sign-flip over the paired per-seed deltas; a noise-level Δ is flagged even if p is small)')
     if _pair_amb:
         print('  [skip] a (variant, protocol, seed) triple holds more than one measured record, so its PPL is ambiguous — no delta printed for : ' + ', '.join(sorted((f'{v}/{t or '-'}/s{s}' for v, t, s in set(_pair_amb)))[:4]))
     for a, b in PAIRS:
@@ -5235,10 +5467,10 @@ def _print_pairs(summary):
         if _sk:
             _pair_skip.append((a, b, len(_sk), len(common), sorted({r for _s, r in _sk})))
         for (ts, bs), dl in sorted(_by_cond.items()):
-            d = np.array(dl, dtype=float)
-            std = float(d.std(ddof=1)) if len(d) > 1 else 0.0
+            st = paired_effect_stats(dl)
+            _p = ('%.4f' % st['p_exact_signflip']) if math.isfinite(st['p_exact_signflip']) else 'n/a'
             _lab = '' if ts == bs == '' else f'   [{ts or '(untagged)'} vs {bs or '(untagged)'}]'
-            print(f'  {a:22s} − {b:22s} = {d.mean():+7.2f} ± {std:5.2f}   (n={len(d)}){_lab}')
+            print(f'  {a:22s} − {b:22s} = {st["mean"]:+7.2f} ± {st["std"]:5.2f}   (n={st["n"]}, p={_p}, {st["effect_vs_noise"]}){_lab}')
     if _pair_skip:
         print('  [skip] seed(s) rejected by the run_cfg/load gate (see `pair_reason`); the printed n counts only the pairs that cleared it —')
         for _a, _b, _nsk, _ncom, _why in _pair_skip:
@@ -5644,6 +5876,10 @@ def _dump_aggregate(outdir, summary):
     _save_csv(_pub, outdir)
     _print_table(_pub)
     _print_pairs(records_for_readers)
+    try:
+        methodology_audit(records_for_readers, outdir=outdir, verbose=True)
+    except Exception as e:
+        print(f'[audit] methodology audit failed ({type(e).__name__}: {e}) — the panel is still aggregated; the audit is advisory and never blocks a run')
     _plot(records_for_readers, agg, outdir)
     return agg
 
