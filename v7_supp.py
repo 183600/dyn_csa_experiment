@@ -343,8 +343,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             # ib selects rows of k_blk_r / v_blk and _wi_all selects rows of
             # k_sw_r / v_sw — exactly the rows the old cat-then-gather form
             # addressed through the +n_blk offsets, so every gathered value is
-            # bit-identical (index re-plumbing only, §6.1), minus two full
-            # [n_blk+T, nh, hd] copies per call.
+            # bit-identical (index re-plumbing only, §6.1).
             Kset = torch.cat([L._take_2d(k_blk_r, ib), L._take_2d(k_sw_r, _wi_all[s:e])], 1)
             Vset = torch.cat([L._take_2d(v_blk, ib), L._take_2d(v_sw, _wi_all[s:e])], 1)
             raw_logits = torch.einsum('qhd,qmhd->qhm', qr[s:e], Kset)
@@ -467,8 +466,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 pre_blocks = self._cut_blocks_batched(x)
             # Preallocate the batch output and write each row's attention output
             # in place — the same transport-only, value-identical form as
-            # exp_lib.HybridAttention.forward (design notes §6.1), minus one full
-            # [B, T, d] intermediate and one cat kernel per layer per step.
+            # exp_lib.HybridAttention.forward (design notes §6.1).
             outs = torch.empty(B, T, x.shape[-1], device=x.device, dtype=x.dtype)
             gates = []
             for b in range(B):

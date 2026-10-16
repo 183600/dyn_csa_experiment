@@ -303,7 +303,7 @@ class PoolGeometry:
     def gather_geom(self):
         """A 泳道的纯几何 gather 常量 (g_a [R,Bm,L] int64, av_all [R,Bm,L,1]
         bool)——内容是 geom 的纯整型函数，只读消费；缓存论证与 b_off /
-        _GEOM_CACHE 同（消掉每次 fwd/bwd 调用对 [R,Bm,L] 的重建）。"""
+        _GEOM_CACHE 同。"""
         if self._ga_cache is None:
             jA = torch.arange(self.max_len, device=self.starts.device)
             g_a = (self.starts.to(torch.int64)[:, :, None] + jA[None, None, :]).clamp(max=int(self.T) - 1)
@@ -322,7 +322,7 @@ class PoolGeometry:
 
     def i64_views(self):
         """geom 标量表的 int64 形式（int64 原型的 .to 是 no-op，非原型的
-        cast 结果在此缓存，避免每次调用逐张重cast）。"""
+        cast 结果在此缓存）。"""
         if self._i64 is None:
             self._i64 = dict(starts=self.starts.to(torch.int64),
                              counts=self.counts.to(torch.int64),
@@ -490,9 +490,8 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     gXa = torch.zeros_like(Xa) if need_xa else None
     gZa = torch.zeros_like(Za) if need_za else None
     # W_b == 0（overlap=0 / 单块行）时 B 泳道为空：eager 的 autograd 图里
-    # 这些张量仍在（空 gather/空求和），拿到的是零梯度张量而不是 None——
-    # None 会让 AdamW 整参数跳过（连 weight decay 都不施加），零张量则与
-    # eager 的更新逐步一致，退化几何下两模式不得分流。
+    # 这些张量仍在（空 gather/空求和），拿到的是零梯度张量而不是 None；
+    # 零张量与 eager 的更新逐步一致，退化几何下两模式不得分流。
     gXb = torch.zeros_like(Xb) if (need_xb and Xb is not None) else None
     gZb = torch.zeros_like(Zb) if (need_zb and Zb is not None) else None
     gBpa = torch.zeros_like(B_pos_a) if need_bpa else None
@@ -676,8 +675,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     # int64 升型循环外一次），布尔值与全幅形式逐格相同，[R, T, Bm] 全幅
     # 掩码不物化。
     lt64 = last_tok.to(torch.int64)
-    # fp32 升型整体只做一次（逐片 cast 的值与整张 cast 后取片逐位一致）：
-    # 否则每个头都重复拷贝一次 qI / kI / w_idx 的 fp32 版本。
+    # fp32 升型整体只做一次（逐片 cast 的值与整张 cast 后取片逐位一致）。
     qIf = qI if qI.dtype == torch.float32 else qI.to(torch.float32)
     kIf = kI if kI.dtype == torch.float32 else kI.to(torch.float32)
     wf = w_idx if w_idx.dtype == torch.float32 else w_idx.to(torch.float32)
@@ -707,8 +705,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
                 s_i *= iscale
             F.relu_(s_i)
             # wf 必须与 s_i 切到同一个 t 分块：s_i 是 [R, t1-t0, Bm] 的块内
-            # 临时量，漏掉 t0:t1 切片时 [R, T, 1] 的 wf 在分块域（R·Bm 大、
-            # t_chunk < T）直接广播失败，整块域两者是同一批行。
+            # 临时量，整块域两者是同一批行。
             scores.add_(s_i * wf[:, t0:t1, i:i + 1])
         scores = scores.to(dtype)
         masked_lse = torch.where(causal_c, scores, torch.full_like(scores, _NEG_INF))
@@ -771,7 +768,7 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
     dkI = torch.zeros_like(kI) if need_dk else None
     dw = torch.zeros_like(w_idx) if need_dw else None
     # kI / w_idx 与 t 分块无关：fp32 升型在分块循环外只做一次（整型内容
-    # 不变，逐位一致），消掉每个 t-chunk × 每头的重复拷贝。
+    # 不变，逐位一致）。
     kIf = kI if kI.dtype == torch.float32 else kI.to(torch.float32)
     wf = w_idx if w_idx.dtype == torch.float32 else w_idx.to(torch.float32)
     for t0 in range(0, T, t_chunk):
@@ -1122,9 +1119,7 @@ class FusedSparseAttention(torch.autograd.Function):
             out = _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale)
         ctx.save_for_backward(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink)
         # 反向必须跑与前向同一个后端：前向拿到的是调用方解析好的 impl
-        # （gathered_attention_kernel 经 _op_impl('ATTN')），反向若在环境
-        # 变量上重新解析，显式 impl= 的调用（bench/selfcheck）就会 silently
-        # 混成 triton 前向 + torch 参考反向。
+        # （gathered_attention_kernel 经 _op_impl('ATTN')）。
         ctx.impl = impl
         ctx.w = int(w)
         ctx.scale = float(scale)
@@ -2083,8 +2078,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
             raise RuntimeError('blocks_fixed 未携带 _pool_cpu——分段器出口被绕过')
         # blocks_fixed 经 _IDX_CACHE 全局缓存（同一对象贯穿全部层/步），
         # bid_full 是该对象内容的纯整型函数（transport only）——按 (B, device)
-        # 缓存在对象上，消掉每层每步的 [B, T] int32 expand+contiguous 分配
-        # 及其在 autograd 图里的逐层持有。
+        # 缓存在对象上。
         _bkey = (int(B), str(dev))
         _bc = getattr(base, '_bidfull_cache', None)
         if _bc is None:

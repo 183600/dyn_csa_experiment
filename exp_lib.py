@@ -1303,8 +1303,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     # for an all-False row (ties resolve to index 0) — identically zero.
     # The padded lanes are masked downstream via the selection-valid mask
     # either way, so the zeros are the same integers the argmax produced
-    # (host-side integer equivalence, design notes §6.2), minus the cast /
-    # argmax / cast round trip per call.
+    # (host-side integer equivalence, design notes §6.2).
     pad_blk = torch.zeros(n, dtype=torch.int32, device=scores.device)
     valid_cols = kept >= 0
     idx_out = torch.where(valid_cols, kept, pad_blk[:, None])
@@ -1435,8 +1434,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             # (n, B+1) sentinel scratch and slicing off the last column with a
             # contiguous() copy: only the valid selections are written (1.0
             # each; duplicate writes of the same cell are idempotent), so the
-            # values are bit-identical to the sentinel form's [.., :B] slice —
-            # one less full-width allocation and one less copy per call.
+            # values are bit-identical to the sentinel form's [.., :B] slice.
             _il = idx.long()
             _rows = _arange_cache(n, dev)[:, None].expand(n, _il.shape[1])
             m = torch.zeros(n, B, device=dev, dtype=out_dtype)
@@ -1587,8 +1585,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # stacked tensor == row j of k_sw.  index_select returns exactly the
         # same source rows, so the gathered values — and hence every
         # downstream value — are bit-identical to the cat-then-gather form
-        # (index re-plumbing only, design notes §6.1), minus two full
-        # [n_blk+T, nh, hd] copies per call.
+        # (index re-plumbing only, design notes §6.1).
         _sel_rows = topk_l[s:e]
         _win_rows = win_idx[s:e]
         if soft is None:
@@ -1993,8 +1990,7 @@ class HybridAttention(nn.Module):
         # cosine_abs / cosine_adaptive / dynamic branches of `_single` (design
         # notes §6.1): the batched normalize + last-dim reduce is the same
         # row-independent form _gate_signals already relies on.  The whole
-        # batch makes ONE host transfer (a .cpu() sync per layer) instead of B
-        # — the per-row form pays a device sync per row per layer per step.
+        # batch makes ONE host transfer (a .cpu() sync per layer) instead of B.
         # Every integer reaching _single is identical to the per-row
         # blocks_from_cosine form (same cuts, same segmenter).
         cfg = self.cfg
@@ -2202,8 +2198,7 @@ class HybridAttention(nn.Module):
         # place: the stacked buffer holds exactly the tensor torch.stack would
         # have built (a per-row copy into the same layout), and the CopySlices
         # backward hands each row the identical grad slice — value-identical to
-        # the stack form (transport only, design notes §6.1), minus one full
-        # [B, T, d] intermediate and one cat kernel per layer per step.
+        # the stack form (transport only, design notes §6.1).
         outs = torch.empty(B, T, d, device=x.device, dtype=x.dtype)
         gates = []
         for b in range(B):
