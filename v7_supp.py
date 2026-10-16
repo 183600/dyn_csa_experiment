@@ -123,9 +123,36 @@ class HybridAttentionRoPE(L.HybridAttention):
             return super()._full_batched(x)
         B, T, _ = x.shape
         cfg = self.cfg
-        q = self.W_q(x).view(B, T, self.nh, self.hd)
-        k = self.W_k(x).view(B, T, self.nh, self.hd)
-        v = self.W_v(x).view(B, T, self.nh, self.hd)
+        if x.device.type == 'cuda':
+            # Fused q/k/v projection (CUDA only — same transport-only form as
+            # exp_lib.HybridAttention._full_batched, design notes §6.1): one
+            # GEMM over the concatenated weight columns instead of three.  Every
+            # output column is an independent dot product over the input dim, so
+            # the sliced halves are bit-identical to the three separate
+            # self.W_*(x) calls (and their per-column grads are too).
+            _nhq = self.nh * self.hd
+            if torch.is_grad_enabled():
+                _wqkv = torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0)
+            else:
+                # eval-only weight-concat cache, keyed on the source weights'
+                # autograd `_version` counters (bumped by every in-place
+                # optimizer update) exactly like exp_lib's `_wcat_cache`.
+                _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version, self.W_q.weight.device)
+                _hit = self._wcat_cache.get('qkv')
+                if _hit is None or _hit[0] != _key:
+                    with torch.inference_mode(False):
+                        _hit = (_key, torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0))
+                    self._wcat_cache['qkv'] = _hit
+                _wqkv = _hit[1]
+            _qkv = F.linear(x, _wqkv)
+            q = _qkv[..., :_nhq].reshape(B, T, self.nh, self.hd)
+            k = _qkv[..., _nhq:2 * _nhq].reshape(B, T, self.nh, self.hd)
+            v = _qkv[..., 2 * _nhq:].reshape(B, T, self.nh, self.hd)
+            del _qkv, _wqkv
+        else:
+            q = self.W_q(x).view(B, T, self.nh, self.hd)
+            k = self.W_k(x).view(B, T, self.nh, self.hd)
+            v = self.W_v(x).view(B, T, self.nh, self.hd)
         if cfg.qk_norm:
             q = self.q_norm(q)
             k = self.kv_norm(k)
@@ -149,9 +176,13 @@ class HybridAttentionRoPE(L.HybridAttention):
                 sdpa_kw['is_causal'] = True
             out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
             return self.W_o(out.reshape(B, T, self.nh * self.hd))
-        mask = L.causal_mask(T, x.device)
+        # windowed and full masks are mutually exclusive: pick the one the call
+        # actually uses instead of materializing the causal mask and discarding
+        # it (both are cached constants, so values are unchanged).
         if cfg.window > 0:
             mask = L.causal_window_mask(T, cfg.window, x.device)
+        else:
+            mask = L.causal_mask(T, x.device)
         sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1)
         out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
         row_chunk = max(1, min(T, 1024))

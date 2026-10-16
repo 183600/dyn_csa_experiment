@@ -957,7 +957,13 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             Kw = _gather_rows(kw_h, src_win).to(torch.float32)
             Vb = _gather_rows(vb_h, src_sel).to(torch.float32)
             Vw = _gather_rows(vw_h, src_win).to(torch.float32)
-            zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1) * scale
+            zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1)
+            if scale != 1.0:
+                # x·1.0 is the IEEE identity, so the scale=1.0 path skips the
+                # multiply kernel; the fresh cat output is safe to scale in
+                # place (same elementwise kernel and values as the out-of-place
+                # form, and the CatBackward is unaffected).
+                zA.mul_(scale)
             zA.masked_fill_(~lane_ok, MINL)
             if sink_v is None:
                 P_A = torch.softmax(zA, dim=-1) * (anyrow[:, :, None] if anyrow is not None else 1.0)
@@ -1082,7 +1088,11 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             Vw = _gather_rows(vw_h, src_win).to(torch.float32)
             Kl = torch.cat([Kb, Kw], dim=-2)
             Vl = torch.cat([Vb, Vw], dim=-2)
-            zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1) * scale
+            zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1)
+            if scale != 1.0:
+                # same IEEE-identity skip as the forward ref: in-place on the
+                # fresh cat output, same values as the out-of-place form.
+                zA.mul_(scale)
             zA.masked_fill_(~lane_ok, MINL)
             g = torch.einsum('rtd,rtmd->rtm', dOh, Vl)
             gh = g * (anyrow[:, :, None] if anyrow is not None else 1.0)
@@ -1125,13 +1135,18 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                     dsink[h] += acc.to(dtype)
             dz = dzA if dzS is None else dzA + dzS
             if dq is not None:
-                dq[:, t0:t1, h, :] += torch.einsum('rtm,rtmd->rtd', dz, Kl).mul(scale).to(dtype)
+                _dq = torch.einsum('rtm,rtmd->rtd', dz, Kl)
+                if scale != 1.0:
+                    _dq.mul_(scale)
+                dq[:, t0:t1, h, :] += _dq.to(dtype)
             if dsoft is not None and dzS is not None:
                 dl = dzS[:, :, :nb]
                 sf = soft_l[:, :, :nb]
                 dsoft[:, t0:t1, :] += torch.where(sf >= 1e-12, dl / sf.clamp_min(1e-12), torch.zeros_like(dl)).to(dtype)
             if need_dkb or need_dksw:
-                dkl = torch.einsum('rtm,rtd->rtmd', dz, qh) * scale
+                dkl = torch.einsum('rtm,rtd->rtmd', dz, qh)
+                if scale != 1.0:
+                    dkl.mul_(scale)
                 if need_dkb:
                     dk_frag[:, t0:t1] = dkl[:, :, :nb]
                 if need_dksw:
