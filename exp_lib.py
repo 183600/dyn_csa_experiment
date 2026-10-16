@@ -1543,7 +1543,7 @@ def _finfo_min(dtype):
         _FO_MINL[dtype] = v
     return v
 
-def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=512, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False, soft_form=False):
+def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False, soft_form=False):
     n = q.shape[0]
     dev = q.device
     if mem_budget_bytes is None:
@@ -2659,6 +2659,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     fit_text = ds['train'].select(range(fit_rows))['text']
     tok = build_tokenizer(fit_text, vocab_size)
     vocab = tok.get_vocab_size()
+    fit_fp = _text_fp(fit_text)
     del fit_text
     gc.collect()
     eos_id = tok.token_to_id('<eos>')
@@ -2702,6 +2703,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     print(f'[data] tokenising train (cap {n_train_tokens} tokens) ...')
     train_ids = stream_tokenise('train', n_train_tokens + seq_len, 'train')
     print(f'[data] train tokens = {len(train_ids)}  vocab = {vocab}')
+    if len(train_ids) < n_train_tokens + seq_len:
+        print(f'[data] WARNING: the train split ran dry at {len(train_ids)} tokens (< requested {n_train_tokens + seq_len}); runs configured for the advertised token budget will train on fewer tokens than advertised')
     print('[data] tokenising validation ...')
     val_ids = stream_tokenise('validation', val_seqs * seq_len + seq_len, 'val')
     n_val = min(len(val_ids) // seq_len, val_seqs)
@@ -2722,7 +2725,14 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             except OSError:
                 pass
             raise
-    atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids)}, indent=0)
+    atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids), 'fit_fp': fit_fp}, indent=0)
+    try:
+        # persist the exact tokenizer that produced this cache so the held-out
+        # test split can be verified against it by full vocab identity (size
+        # alone is not identity: different merges can share a vocab size).
+        tok.save(os.path.join(cache_dir, f'tok_{tag}.json'))
+    except Exception as _te:
+        print(f'[data] NOTE: could not persist the train tokenizer ({type(_te).__name__}: {_te})')
     print('[data] cached token ids to disk (resume-safe)')
     del ds
     gc.collect()
@@ -2855,13 +2865,30 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
     eos_id = tok.token_to_id('<eos>')
     # vocabulary consistency with any existing train-side cache: a mismatch means
     # the two corpora builds cannot be paired — refuse rather than serve it.
+    # A persisted train tokenizer is compared by FULL vocab identity (id->token
+    # mapping), not merely by size: two BPE fits can share a vocab size with
+    # different merges, in which case the id spaces are un-pairable.  Legacy
+    # caches without a persisted tokenizer fall back to the size check.
     import glob as _glob
-    for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v4_*.json')):
+    _test_vocab = dict(tok.get_vocab())
+    _train_tok_paths = _glob.glob(os.path.join(cache_dir, 'tok_v4_*.json'))
+    for _tp in _train_tok_paths:
         try:
-            _mv = json.load(open(_mp, encoding='utf-8')).get('vocab')
+            from tokenizers import Tokenizer as _Tok
+            _tt = _Tok.from_file(_tp)
         except Exception:
             continue
-        if _mv is not None and int(_mv) != int(vocab):
+        if dict(_tt.get_vocab()) != _test_vocab:
+            raise RuntimeError(f'load_wikitest: the freshly fitted test tokenizer is not identical to the cached train tokenizer ({_tp}) — same-size vocabularies can still use different merges, so the splits cannot be paired; delete wt103_cache/ and rebuild both')
+    for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v4_*.json')):
+        try:
+            _mt = json.load(open(_mp, encoding='utf-8'))
+        except Exception:
+            continue
+        _mv = _mt.get('vocab')
+        if _mv is None:
+            continue
+        if int(_mv) != int(vocab):
             raise RuntimeError(f'load_wikitest: the freshly fitted tokenizer (vocab={vocab}) disagrees with the cached train corpus (vocab={_mv} in {_mp}) — the splits cannot be paired; delete wt103_cache/ and rebuild both')
     print(f'[data] tokenising TEST split (cap {n_seqs * seq_len + seq_len} tokens) ...')
     _trows = list(test_rows) if not isinstance(test_rows, list) else test_rows
@@ -2902,6 +2929,16 @@ def _fineweb_disk_dtype(vocab):
     if vocab < 2 ** 31:
         return np.int32
     raise ValueError(f'vocab {vocab} exceeds the id range representable by the on-disk corpus cache')
+
+def _disk_ids_chunk(buf, disk_dt, vocab):
+    # Range check must run on the pre-cast Python ints: once the array is
+    # uint16 its max is <= 65535 by construction, so checking it afterwards
+    # can never fire (and an out-of-range id would already have wrapped on
+    # numpy builds that silently overflow).  `_fineweb_disk_dtype` returns
+    # uint16 only for vocab <= 65536, so this is a defensive guard.
+    if disk_dt is np.uint16 and buf and max(buf) > 65535:
+        raise ValueError(f'token id {max(buf)} exceeds the uint16 cache range (vocab={vocab}) — widen _fineweb_disk_dtype before rebuilding')
+    return np.array(buf, dtype=disk_dt)
 
 def _npy_serve_int32(path):
     # 传输层（design_notes §6.1）：磁盘上的 uint16/int32 与 served 的 int32
@@ -3003,7 +3040,14 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
       - val_batch is int64 (eval paths feed targets straight to cross entropy).
     """
     os.makedirs(cache_dir, exist_ok=True)
-    tag = f'v1_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}_fw{source}_fd{fit_docs}'
+    # A local stand-in corpus must never share a cache tag with the hub source:
+    # otherwise a cache built from FWEDU_LOCAL_JSONL would be served on a later
+    # hub run (the self-fingerprint cannot tell the two corpora apart).  The
+    # marker only appears when the local path is active, so existing hub caches
+    # keep their exact filenames.
+    _local_env = os.environ.get('FWEDU_LOCAL_JSONL', '').strip()
+    _local_tag = f'_loc{hashlib.sha1(_local_env.encode("utf-8")).hexdigest()[:8]}' if _local_env else ''
+    tag = f'v1_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}_fw{source}_fd{fit_docs}{_local_tag}'
     tr_path = os.path.join(cache_dir, f'train_ids_{tag}.npy')
     va_path = os.path.join(cache_dir, f'val_batch_{tag}.npy')
     vp_path = os.path.join(cache_dir, f'val_bnd_{tag}.npy')
@@ -3073,10 +3117,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                     buf.extend(enc.ids)
                     buf.append(eos_id)
                     if len(buf) >= (1 << 22):
-                        chunk = np.array(buf, dtype=disk_dt)
-                        if disk_dt is np.uint16 and int(chunk.max()) > 65535:
-                            raise ValueError(f'token id {int(chunk.max())} exceeds the uint16 cache range (vocab={vocab}) — widen _fineweb_disk_dtype before rebuilding')
-                        chunk.tofile(fh)
+                        _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                         n_train_total += len(buf)
                         buf = []
                         if (n_train_total >> 26) > _marks:
@@ -3086,14 +3127,13 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                         stop = True
                         break
             if buf:
-                chunk = np.array(buf, dtype=disk_dt)
-                if disk_dt is np.uint16 and int(chunk.max()) > 65535:
-                    raise ValueError(f'token id {int(chunk.max())} exceeds the uint16 cache range (vocab={vocab}) — widen _fineweb_disk_dtype before rebuilding')
-                chunk.tofile(fh)
+                _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                 n_train_total += len(buf)
                 buf = []
         n_train = min(n_train_total, cap_train)
         print(f'[data] train tokens = {n_train}  vocab = {vocab}')
+        if n_train < cap_train:
+            print(f'[data] WARNING: the source ran dry at {n_train} train tokens (< requested cap {cap_train}); runs configured for the advertised token budget will train on fewer tokens than advertised')
         print('[data] tokenising fineweb validation holdout ...')
         with open(raw_val, 'wb') as fh:
             stop = False
@@ -3105,14 +3145,14 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                     buf.extend(enc.ids)
                     buf.append(eos_id)
                     if len(buf) >= (1 << 22):
-                        np.array(buf, dtype=disk_dt).tofile(fh)
+                        _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                         n_val_total += len(buf)
                         buf = []
                     if n_val_total + len(buf) >= cap_val:
                         stop = True
                         break
             if buf:
-                np.array(buf, dtype=disk_dt).tofile(fh)
+                _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                 n_val_total += len(buf)
                 buf = []
         n_val_tokens = min(n_val_total, cap_val)
@@ -3159,7 +3199,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                     pass
                 raise
         train_ids = _npy_serve_int32(tr_path)
-        atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids), 'source': source, 'fit_docs': fit_docs, 'disk_dtype': np.dtype(disk_dt).str, 'seq_len': int(seq_len), 'n_train_tokens': int(n_train_tokens), 'val_seqs': int(val_seqs)}, indent=0)
+        atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids), 'source': source, 'fit_docs': fit_docs, 'disk_dtype': np.dtype(disk_dt).str, 'seq_len': int(seq_len), 'n_train_tokens': int(n_train_tokens), 'n_train_actual': int(n_train), 'val_seqs': int(val_seqs)}, indent=0)
         print('[data] cached fineweb token ids to disk (resume-safe)')
         _out = (train_ids, val_batch, vocab, tok, val_bnd)
         if len(_FWEB_MEMO) >= _FWEB_MEMO_CAP:

@@ -918,7 +918,7 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     M = nb + w
     dev = q.device
     dtype = q.dtype
-    MINL = _finfo_min(dtype)
+    MINL = _finfo_min(torch.float32)
     out = torch.empty_like(q)
     t_idx = torch.arange(T, device=dev)[None, :, None]
     if valid is None:
@@ -991,7 +991,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     Bm = k_blk.shape[1]
     dev = q.device
     dtype = q.dtype
-    MINL = _finfo_min(dtype)
+    MINL = _finfo_min(torch.float32)
     M = nb + w
     t_idx = torch.arange(T, device=dev)[None, :, None]
     if valid is None:
@@ -1314,7 +1314,7 @@ def _kernels():
         pid = tl.program_id(0)
         n_t = tl.cdiv(T, BT)
         pid_t = pid % n_t
-        r = pid // n_t
+        r = (pid // n_t).to(tl.int64)
         t = pid_t * BT + tl.arange(0, BT)
         tm = t < T
         ti = t.to(tl.int64)
@@ -1360,11 +1360,11 @@ def _kernels():
     def idx_topk(scores_ptr, last_tok_ptr, idx_ptr, valid_ptr, soft_ptr, T0, TF, T, Bm,
                  K: tl.constexpr, BB: tl.constexpr):
         pid = tl.program_id(0)
-        r = pid // T
+        r = (pid // T).to(tl.int64)
         t = pid % T
         b = tl.arange(0, BB).to(tl.int64)
         bm = b < Bm
-        rt = (r * T + t).to(tl.int64)
+        rt = r * T + t
         tg = (T0 + t).to(tl.int64)
         rt_out = r * TF + tg
         s = tl.load(scores_ptr + rt * Bm + b, mask=bm, other=float('-inf')).to(tl.float32)
@@ -1581,7 +1581,7 @@ def _attach_attn_kernels(ns):
         pid_t = pid % n_t
         rh = pid // n_t
         h = rh % NH
-        r = rh // NH
+        r = (rh // NH).to(tl.int64)
         t0 = pid_t * BT
         t = t0 + tl.arange(0, BT)
         tm = t < T
@@ -1650,7 +1650,7 @@ def _attach_attn_kernels(ns):
         pid_t = pid % n_t
         rh = pid // n_t
         h = rh % NH
-        r = rh // NH
+        r = (rh // NH).to(tl.int64)
         t0 = pid_t * BT
         t = t0 + tl.arange(0, BT)
         tm = t < T
@@ -1747,7 +1747,7 @@ def _attach_attn_kernels(ns):
         pid_t = pid % n_t
         rh = pid // n_t
         h = rh % NH
-        r = rh // NH
+        r = (rh // NH).to(tl.int64)
         t0 = pid_t * BT
         t = t0 + tl.arange(0, BT)
         tm = t < T
@@ -1827,7 +1827,7 @@ def _attach_attn_kernels(ns):
         h = pid % NH
         rb = pid // NH
         b = rb % Bm
-        r = rb // Bm
+        r = (rb // Bm).to(tl.int64)
         seg0 = tl.load(cso_ptr + r.to(tl.int64) * (Bm + 1) + b)
         seg1 = tl.load(cso_ptr + r.to(tl.int64) * (Bm + 1) + b + 1)
         d = tl.arange(0, HD)
@@ -1899,7 +1899,7 @@ def _attach_attn_kernels(ns):
         pid = tl.program_id(0)
         n_t = tl.cdiv(T, BT)
         pid_t = pid % n_t
-        r = pid // n_t
+        r = (pid // n_t).to(tl.int64)
         t0 = pid_t * BT
         t = t0 + tl.arange(0, BT)
         tm = t < T
@@ -1947,7 +1947,7 @@ def _attach_attn_kernels(ns):
         pid = tl.program_id(0)
         h = pid % NH
         rp = pid // NH
-        r = rp // T
+        r = (rp // T).to(tl.int64)
         p = (rp % T).to(tl.int64)
         d = tl.arange(0, HD)
         k_v = tl.load(ksw_ptr + ((r * T + p) * NH + h) * HD + d).to(tl.float32)

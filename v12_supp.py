@@ -124,6 +124,26 @@ def _load_manifest(path):
     _exp = m.get('code_semantics_expected')
     if _exp is not None and str(_exp) != str(L.CODE_SEMANTICS):
         raise SystemExit(f'[v12] REFUSE: freeze manifest expects code semantics {_exp!r} but the current code is {L.CODE_SEMANTICS!r} — the code changed after freezing; re-freeze consciously (update {path} with a dated note) instead of silently testing new code under the old pre-registration')
+    # The statistics block is a pre-registration contract: the analyzer must
+    # implement exactly the frozen test/correction, so a mismatch is refused
+    # rather than silently computed and mislabelled in the report.
+    _stat = m.get('statistics') or {}
+    _ns = _stat.get('n_seeds')
+    if _ns is not None and int(_ns) != len(m['seeds']):
+        raise SystemExit(f'[v12] REFUSE: freeze manifest declares n_seeds={_ns} but lists {len(m["seeds"])} seeds — the pre-registered resolution and the seed list disagree')
+    _test = str(_stat.get('test', 'exact two-sided sign-flip over paired per-seed deltas')).lower()
+    if 'sign-flip' not in _test and 'sign flip' not in _test:
+        raise SystemExit(f'[v12] REFUSE: freeze manifest pre-registers test {_stat.get("test")!r}, but this analyzer only implements the exact two-sided sign-flip test — update the code or re-freeze')
+    _corr = str(_stat.get('correction', 'holm step-down')).lower()
+    if 'holm' not in _corr:
+        raise SystemExit(f'[v12] REFUSE: freeze manifest pre-registers correction {_stat.get("correction")!r}, but this analyzer only implements Holm step-down — update the code or re-freeze')
+    for comp in m['primary_comparisons']:
+        for _k in ('name', 'a', 'b'):
+            if not comp.get(_k):
+                raise SystemExit(f'[v12] REFUSE: a frozen primary comparison lacks {_k!r} ({comp!r})')
+        _es = comp.get('expected_sign')
+        if _es is not None and str(_es).lower() not in ('positive', 'negative'):
+            raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} has expected_sign={_es!r} (expected "positive", "negative", or null)')
     return m
 
 @torch.inference_mode()
@@ -160,12 +180,15 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
         return out
     _ck_recipe = d.get('recipe')
     eval_lens = [int(x) for x in manifest.get('eval', {}).get('by_length_ppl', cfg['eval_lens'])]
+    _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))
     _cur = L.locked_json_read(spath).get(f'{v}::s{seed}')
 
     def _stale(rec):
         if not isinstance(rec, dict):
             return True
         if rec.get('_code') != V.CKPT_CODE or rec.get('recipe') != _ck_recipe:
+            return True
+        if rec.get('data_fp') != _dfp:
             return True
         bl = rec.get('by_len') or {}
         return not all((L.by_len_cells([rec], Ln) for Ln in eval_lens))
@@ -184,7 +207,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
         torch.cuda.empty_cache()
 
     def _merge(summary):
-        summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params'), 'by_len': r, 'split': 'test', 'data_fp': L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1)), '_code': V.CKPT_CODE, 'recipe': _ck_recipe}
+        summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params'), 'by_len': r, 'split': 'test', 'data_fp': _dfp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe}
         print(f'  [p5t] {v:32s} s{seed} ' + '  '.join((f'L{k}={vv.get("ppl", float("nan")):.2f}' for k, vv in sorted(r.items()))))
         return summary
     L.locked_json_update(spath, _merge)
@@ -259,6 +282,9 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         a, b = (comp['a'], comp['b'])
         ep = comp.get('endpoint', 'by_len.ppl@4096')
         Ln = int(str(ep).rsplit('@', 1)[-1])
+        exp_sign = comp.get('expected_sign')
+        if exp_sign is not None:
+            exp_sign = str(exp_sign).lower()
         da, db = ({}, {})
         for r in raw.values():
             if not (isinstance(r, dict) and r.get('split') == 'test'):
@@ -267,23 +293,51 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             c = bl.get(Ln, bl.get(str(Ln)))
             if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')):
                 if r.get('variant') == a:
-                    da[r.get('seed')] = float(c['ppl'])
+                    da[r.get('seed')] = (float(c['ppl']), r.get('data_fp'))
                 if r.get('variant') == b:
-                    db[r.get('seed')] = float(c['ppl'])
-        common = sorted(set(da) & set(db))
+                    db[r.get('seed')] = (float(c['ppl']), r.get('data_fp'))
+        # a paired delta is only valid on ONE held-out slice: both arms' records
+        # for a seed must carry the same test-split fingerprint (a rebuilt cache
+        # would otherwise pair numbers measured on different rows).
+        common = sorted((s for s in set(da) & set(db) if da[s][1] == db[s][1]))
         if len(common) < 2:
-            stats['comparisons'][name] = {'omitted': f'no seed pair survives at the frozen endpoint (a: {sorted(da)}, b: {sorted(db)})', 'n': 0}
+            stats['comparisons'][name] = {'omitted': f'<2 seed pairs share one held-out test slice at the frozen endpoint (a: {sorted(da)}, b: {sorted(db)})', 'n': 0, 'expected_sign': exp_sign}
             continue
-        dl = [da[s] - db[s] for s in common]
+        dl = [da[s][0] - db[s][0] for s in common]
         res = V.exact_sign_permutation(dl)
         res['seeds'] = common
+        res['data_fp'] = da[common[0]][1]
         res['delta_definition'] = f'{a} - {b} (paired per seed, test split)'
+        res['expected_sign'] = exp_sign
+        if exp_sign in ('positive', 'negative') and math.isfinite(res.get('mean', float('nan'))):
+            res['direction_ok'] = bool((res['mean'] > 0) == (exp_sign == 'positive'))
+        else:
+            res['direction_ok'] = None
         stats['comparisons'][name] = res
-    _fam = [(k, v.get('p_exact_signflip')) for k, v in stats['comparisons'].items() if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))]
+    # Holm is corrected over the DECLARED frozen family, not over whichever
+    # comparisons happened to produce a finite p: an omitted comparison enters
+    # with p=1.0 so a missing arm can never shrink m and relax the correction.
+    _fam = []
+    for k, v in stats['comparisons'].items():
+        p = v.get('p_exact_signflip')
+        _fam.append((k, float(p) if isinstance(p, (int, float)) and math.isfinite(p) else 1.0))
     if _fam:
         stats['holm'] = L.holm_adjust(_fam)
-    _rej = [k for k, v in stats['holm'].items() if v.get('reject')]
-    print(f'[p5t stats] {len(_fam)} frozen primary comparison(s); {len(_rej)} survive Holm at alpha=0.05' + (f': {sorted(_rej)}' if _rej else ''))
+    _rej = [k for k, v in stats['holm'].items() if v.get('p_holm') is not None and float(v['p_holm']) < 0.05]
+    # the pre-registered decision rule requires BOTH p_holm < alpha AND the
+    # observed direction to match the validation-panel estimate (a null
+    # expected_sign marks a non-directional mechanism readout).  The strict `<`
+    # matches the manifest's `p_holm < 0.05` (the generic holm_adjust uses `<=`).
+    _conf = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') in (True, None)]
+    stats['confirmed'] = _conf
+    _m = len(manifest['primary_comparisons'])
+    _fl = L.signflip_p_floor(len(manifest['seeds']))
+    if math.isfinite(_fl):
+        _min_holm = min(1.0, _m * _fl)
+        stats['min_attainable_p_holm'] = _min_holm
+        if _min_holm > 0.05:
+            print(f'[p5t stats] WARNING: with n={len(manifest["seeds"])} seeds and a Holm family of m={_m}, the smallest attainable Holm p is {_min_holm:.4f} > 0.05 — under the frozen plan NO comparison can be confirmed regardless of the data (the pre-registration is conservative by construction).')
+    print(f'[p5t stats] {len(_fam)} frozen primary comparison(s); {len(_rej)} survive Holm; {len(_conf)} also match the pre-registered direction')
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     L.atomic_write_json(out, stats, indent=2)
     print(f'[p5t stats] wrote {out}')
@@ -371,23 +425,30 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('')
     comps = ft.get('comparisons') or {}
     if comps:
-        A('| 冻结主比较（test split，配对） | n | Δ mean±std | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 |')
-        A('|---|---|---|---|---|---|---|---|')
+        A('| 冻结主比较（test split，配对） | n | Δ mean±std | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
+        A('|---|---|---|---|---|---|---|---|---|')
         holm = ft.get('holm') or {}
         for k, v in comps.items():
             if 'omitted' in v:
-                A(f'| {k} | 0 | —（{v["omitted"]}） | — | — | — | — | — |')
+                A(f'| {k} | 0 | —（{v["omitted"]}） | — | — | — | — | — | — |')
                 continue
             _h = holm.get(k) or {}
             _hp = f'{_h.get("p_holm", float("nan")):.3f}' if _h.get('p_holm') is not None else '—'
-            _hr = '✔' if _h.get('reject') else '✘'
-            A(f'| {k} | {v["n"]} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} |')
+            _hr = '✔' if (_h.get('p_holm') is not None and float(_h['p_holm']) < 0.05) else '✘'
+            _dir = v.get('direction_ok')
+            _ds = '—（非方向性）' if _dir is None else ('✔' if _dir else '✘')
+            A(f'| {k} | {v["n"]} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
         A('')
-        _n_sig = [k for k, v in holm.items() if v.get('reject')]
-        if _n_sig:
-            A(f'**确认结果**：{len(_n_sig)}/{len(comps)} 个冻结主比较在 Holm 校正后于 test split 上成立（{sorted(_n_sig)}）——这是预注册规则下的确认性证据。')
+        _conf = ft.get('confirmed')
+        if _conf is None:
+            _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') in (True, None))]
+        if _conf:
+            A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
         else:
-            A('**确认结果**：没有冻结主比较在 Holm 校正后于 test split 上成立。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
+            A('**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < 0.05」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
+        if ft.get('min_attainable_p_holm') is not None:
+            A('')
+            A(f"（诊断：n 个种子与 m 元 Holm 族下，最小可达 Holm p = {ft['min_attainable_p_holm']:.4f}；若该值 > 0.05，则冻结方案在构造上无法给出确认，这是保守预注册的结果而非数据结论。）")
         A('')
     A('---')
     A('')
@@ -467,7 +528,7 @@ def run_smoke():
     payload = dict(V10.P3MT_PAYLOAD, outdir='results_smoke_v12', seeds=[0], steps=40, eval_lens=[512, 1024])
     V.run_lenphase(dict(payload, variants=['csa_fixed_rope', 'csa_fixed_rope_allblocks']), guard=None, label='v12 smoke', par=False)
     # a smoke freeze manifest: same schema, tiny arms/seeds, current code stamp
-    _smoke_manifest = {'frozen_at': time.strftime('%Y-%m-%d'), 'code_semantics_expected': L.CODE_SEMANTICS, 'arms': ['csa_fixed_rope', 'csa_fixed_rope_allblocks'], 'seeds': [0], 'primary_comparisons': [{'name': 'smoke: allblocks_scratch - learned @ L1024', 'a': 'csa_fixed_rope_allblocks', 'b': 'csa_fixed_rope', 'endpoint': 'by_len.ppl@1024'}], 'statistics': {'test': 'exact two-sided sign-flip', 'n_seeds': 1, 'p_floor': 2.0, 'family': 'primary_comparisons', 'correction': 'holm step-down', 'decision_rule': 'smoke only'}, 'eval': {'by_length_ppl': [512, 1024], 'distractor_probe': {'mode': 'uniform', 'rhos': [0.0, 0.5], 'eval_lens': [1024], 'target': 512, 'n_seq': 4}}}
+    _smoke_manifest = {'frozen_at': time.strftime('%Y-%m-%d'), 'code_semantics_expected': L.CODE_SEMANTICS, 'arms': ['csa_fixed_rope', 'csa_fixed_rope_allblocks'], 'seeds': [0], 'primary_comparisons': [{'name': 'smoke: allblocks_scratch - learned @ L1024', 'a': 'csa_fixed_rope_allblocks', 'b': 'csa_fixed_rope', 'endpoint': 'by_len.ppl@1024'}], 'statistics': {'test': 'exact two-sided sign-flip', 'n_seeds': 1, 'p_floor': 1.0, 'family': 'primary_comparisons', 'correction': 'holm step-down', 'decision_rule': 'smoke only'}, 'eval': {'by_length_ppl': [512, 1024], 'distractor_probe': {'mode': 'uniform', 'rhos': [0.0, 0.5], 'eval_lens': [1024], 'target': 512, 'n_seq': 4}}}
     _mpath = 'results_smoke_v12/frozen.json'
     L.atomic_write_json(_mpath, _smoke_manifest, indent=2)
     # smoke test data: rows from the (tiny local dump or HF) validation split,

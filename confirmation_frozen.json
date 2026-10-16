@@ -27,6 +27,7 @@
       "a": "csa_fixed_rope",
       "b": "full_rope",
       "endpoint": "by_len.ppl@4096",
+      "expected_sign": "negative",
       "hypothesis_direction": "csa_fixed_rope better (negative delta) would confirm the sparse length-extrapolation advantage seen on validation"
     },
     {
@@ -34,6 +35,7 @@
       "a": "csa_fixed_rope_randidx",
       "b": "csa_fixed_rope",
       "endpoint": "by_len.ppl@4096",
+      "expected_sign": "positive",
       "hypothesis_direction": "positive delta would confirm that learned selection beats a TRAINED random selector at equal budget (the test-time intervention cannot answer this)"
     },
     {
@@ -41,6 +43,7 @@
       "a": "csa_fixed_rope_allblocks",
       "b": "csa_fixed_rope",
       "endpoint": "by_len.ppl@4096",
+      "expected_sign": "positive",
       "hypothesis_direction": "positive delta would confirm that learned top-32 selection beats TRAINED all-block reading at equal budget"
     },
     {
@@ -48,7 +51,8 @@
       "a": "full_rope",
       "b": "csa_fixed_rope_allblocks",
       "endpoint": "by_len.ppl@4096",
-      "hypothesis_direction": "isolates block-compression/KV-projection from selection: same-projection dense-style reading vs standard dense attention"
+      "expected_sign": null,
+      "hypothesis_direction": "isolates block-compression/KV-projection from selection: same-projection dense-style reading vs standard dense attention (non-directional mechanism readout)"
     }
   ],
   "statistics": {

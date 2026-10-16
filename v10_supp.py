@@ -885,20 +885,28 @@ def _panel_endpoint(hists, tps):
     common = sorted(set(hists['csa_fixed']) & set(hists['full']))
     if not common:
         return None
+    # The sign-flip test must compare every seed at the SAME training step, so
+    # take the last step present in both arms for EVERY compared seed (the
+    # intersection, not each seed's own last step — a seed with a shorter eval
+    # grid would otherwise contribute a delta measured at a different budget).
+    common_steps = None
+    for s in common:
+        da, db = (dict(hists['csa_fixed'][s]), dict(hists['full'][s]))
+        steps = set(da) & set(db)
+        common_steps = steps if common_steps is None else (common_steps & steps)
+    if not common_steps:
+        return None
+    last = max(common_steps)
     per_seed = {}
     for s in common:
         da, db = (dict(hists['csa_fixed'][s]), dict(hists['full'][s]))
-        steps = sorted(set(da) & set(db))
-        if not steps:
-            continue
-        last = steps[-1]
         per_seed[s] = {'step': int(last), 'gap': float(da[last] - db[last]), 'ppl_csa': float(da[last]), 'ppl_full': float(db[last])}
     if not per_seed:
         return None
     dl = [per_seed[s]['gap'] for s in sorted(per_seed)]
     out = V.exact_sign_permutation(dl)
     out['seeds'] = sorted(per_seed)
-    out['tokens'] = (float(per_seed[max(per_seed)]['step']) * tps) if tps else None
+    out['tokens'] = (float(last) * tps) if tps else None
     out['per_seed'] = per_seed
     return out
 
