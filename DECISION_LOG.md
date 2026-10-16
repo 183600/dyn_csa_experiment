@@ -166,3 +166,18 @@
   3. `python audit_gates.py causality` / `leakage` / `report`（零 GPU 审计）
   4. 之后按原顺序 P5MP → P5S2/P5S3 → P5T（首次 P5T 会写入冻结锁）
   5. 每个正式版本用 `archive_release.py make <tag>` 出归档并发布只读副本
+
+## 2026-10-17 — review2-fixes 并入 main（用户指令）
+- **决策**：按用户指令把 `review2-fixes`（评审二轮 11 点核查与修复）并入
+  `main`。先 rebase 到 CI 自动提交 `f8a8a7d`（iteration 2-perf：exp_lib
+  新增 `_pool_block_chunk`，与新增统计函数无重叠，自动合并无冲突）；
+  树级对账确认修复内容 2448+/187- 与原分支完全一致、零丢失；rebase 后
+  `test_review_fixes.py` 复验 19/19 通过（CPU torch 2.14.1+cpu）。
+- **推送方式**：普通 push（无 force、不取消任何运行）。`Continuous Loop`
+  workflow 仅 schedule 触发、无 push 触发器，此次推送不排队新 job；
+  在跑的 #38925516052 启动时已 checkout 自身 SHA，不受影响；
+  `.github/` 全程未被本轮任何提交触碰。
+- **后续注意**：main 上 opencode 自动迭代与人工修复自此共存于同一历史；
+  自动提交若再改 `exp_lib.py`/`v12_supp.py`，冲突解决原则为
+  「统计语义优先、性能优化其次」，且每次合并后复跑
+  `test_review_fixes.py`（19 项，零 GPU）。
