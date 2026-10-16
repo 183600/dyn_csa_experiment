@@ -734,6 +734,19 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
 _POOL_PARTS_HOST = True
 _POOL_PARTS_BUCKET = 256
 _POOL_GEOM_BUCKET = 1024
+# Transient cap for the block-pooling gathers/mixes (fixed byte budget, so the
+# block-chunk boundaries are a pure function of the shapes — the forward and
+# the checkpoint recompute split identically).  Each block's pooled vector is
+# computed from its own tokens/overlap lanes only, so processing blocks in
+# any grouping yields the same per-block values bit-for-bit; raising this only
+# trades peak memory for fewer Python iterations.
+_POOL_TRANSIENT_BUDGET_BYTES = 256 << 20
+
+def _pool_block_chunk(B, per_block_elems, elem_size):
+    # Number of blocks whose gather/softmax/mix transients fit the fixed
+    # budget; >= 1 and never more than B (so short sequences run one chunk).
+    _per = max(1, int(per_block_elems) * int(elem_size))
+    return max(1, min(int(B), _POOL_TRANSIENT_BUDGET_BYTES // _per))
 
 def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
     # Host-side integer flat of the pooling parts (design notes §6.2): every
@@ -1168,33 +1181,50 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
                 _pos_a = pos if max_len <= B_pos_a.shape[0] else pos.clamp(max=_lim)
             if _cpu is not None and len(_cpu[0]) == B:
                 _pool_geom_put(block_ids, _gkey, (g_a, mask_a, g_b, mask_b, b_off, _pos_a))
-    Xam = _take_2d(Xas, g_a)
-    Zam = _take_2d(Zas, g_a)
-    Xbm = _take_2d(Xbs, g_b)
-    Zbm = _take_2d(Zbs, g_b)
-    # Position-embedding add restricted to valid lanes arithmetically:
-    # multiplying by the 0/1 mask adds exactly the same values on valid lanes
-    # and exactly 0 on pad lanes; pad lanes are then overwritten with -inf.
-    # Forward values and B_pos gradients (zero on invalid lanes in both forms)
-    # are identical to the boolean-index form.
-    # += on the fresh _take_2d outputs: the same elementwise kernel with the
-    # same values as the out-of-place add (AddBackward saves no tensor, and
-    # the only downstream consumer chain — masked_fill_/cat/softmax — keeps
-    # no pre-add version).
-    Zam += B_pos_a[_pos_a][None] * mask_a[:, :, None]
-    Zbm += B_pos_b[b_off] * mask_b[:, :, None]
-    # the fill mask broadcasts: masked_fill_ accepts a broadcastable mask, so
-    # the same booleans reach every lane (broadcast reads are exact).
-    Zam.masked_fill_(~mask_a[:, :, None], float('-inf'))
-    Zbm.masked_fill_(~mask_b[:, :, None], float('-inf'))
-    WinZ = torch.cat([Zam, Zbm], 1)
-    # softmax 的反向保存其输出，nan_to_num 必须出位（原地会改写保存值，
-    # SoftmaxBackward 版本检查失败）；值与任何原地形式逐位相同。
-    sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
-    sc_a = sc[:, :max_len]
-    sc_b = sc[:, max_len:]
-    comp = (sc_a * Xam).sum(1)
-    comp += (sc_b * Xbm).sum(1)
+    # Every block's pooled vector is a function of its own block lanes and
+    # overlap lanes only (the softmax normalization and the weighted sum are
+    # both within one block), so the blocks are processed in budget-sized
+    # chunks: each chunk's gathers/mix are bit-identical to the same rows of
+    # the unchunked form, and `comp` is written row-for-row.  Short sequences
+    # fit one chunk (identical to the previous single-shot form).
+    _Fd = int(Xas.shape[1])
+    _Wb = int(g_b.shape[1])
+    # Conservative per-block element count: Xam+Zam+Xbm+Zbm + WinZ + sc
+    # (float lanes) plus the two boolean masks.
+    _per_elems = (4 * int(max_len) + 4 * _Wb) * _Fd + 8 * (int(max_len) + _Wb)
+    _chunk = _pool_block_chunk(B, _per_elems, Xas.element_size())
+    _bpa = B_pos_a[_pos_a]
+    comp = torch.empty(B, _Fd, device=dev, dtype=Xas.dtype)
+    for _b0 in range(0, B, _chunk):
+        _b1 = min(_b0 + _chunk, B)
+        Xam = _take_2d(Xas, g_a[_b0:_b1])
+        Zam = _take_2d(Zas, g_a[_b0:_b1])
+        Xbm = _take_2d(Xbs, g_b[_b0:_b1])
+        Zbm = _take_2d(Zbs, g_b[_b0:_b1])
+        _ma = mask_a[_b0:_b1]
+        _mb = mask_b[_b0:_b1]
+        # Position-embedding add restricted to valid lanes arithmetically:
+        # multiplying by the 0/1 mask adds exactly the same values on valid
+        # lanes and exactly 0 on pad lanes; pad lanes are then overwritten with
+        # -inf.  Forward values and B_pos gradients (zero on invalid lanes in
+        # both forms) are identical to the boolean-index form.
+        # += on the fresh _take_2d outputs: the same elementwise kernel with
+        # the same values as the out-of-place add (AddBackward saves no tensor,
+        # and the only downstream consumer chain — masked_fill_/cat/softmax —
+        # keeps no pre-add version).
+        Zam += _bpa[None] * _ma[:, :, None]
+        Zbm += B_pos_b[b_off[_b0:_b1]] * _mb[:, :, None]
+        # the fill mask broadcasts: masked_fill_ accepts a broadcastable mask,
+        # so the same booleans reach every lane (broadcast reads are exact).
+        Zam.masked_fill_(~_ma[:, :, None], float('-inf'))
+        Zbm.masked_fill_(~_mb[:, :, None], float('-inf'))
+        WinZ = torch.cat([Zam, Zbm], 1)
+        # softmax 的反向保存其输出，nan_to_num 必须出位（原地会改写保存值，
+        # SoftmaxBackward 版本检查失败）；值与任何原地形式逐位相同。
+        sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
+        sc_a = sc[:, :max_len]
+        sc_b = sc[:, max_len:]
+        comp[_b0:_b1] = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
     # Identity-order path: when `order` is the cached arange, order[last_idx]
     # returns exactly last_idx (arange[i] == i, exact integers — index
     # transport, design notes §6.1).
@@ -1245,22 +1275,33 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
                 _pos_a = pos if max_len <= B_pos.shape[0] else pos.clamp(max=B_pos.shape[0] - 1)
             if _cpu is not None and len(_cpu[0]) == B:
                 _pool_geom_put(block_ids, _gkey, (g, mask, _pos_a))
-    Xb = _take_2d(Xs, g)
-    Zb = _take_2d(Zs, g)
-    WinZ = Zb
-    # Same arithmetic valid-lane-only position add as _pool_ordered: the 0/1
-    # mask multiply adds exactly the same values on valid lanes and 0 on pad
-    # lanes, which the fill then sets to -inf — identical values and gradients
-    # to the previous boolean-index form, without the index_put/ragged gather.
-    # += on the fresh _take_2d output (same elementwise kernel and values as
-    # the out-of-place add; see _pool_ordered).
-    WinZ += B_pos[_pos_a][None] * mask[:, :, None]
-    # broadcast fill mask (same argument as _pool_ordered): identical booleans
-    # per lane, without materializing the full-size negated mask.
-    WinZ.masked_fill_(~mask[:, :, None], float('-inf'))
-    # 同 _pool_ordered：softmax 反向保存输出，nan_to_num 出位。
-    sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
-    comp = (sc * Xb).sum(1)
+    # Block-chunked exactly as _pool_ordered: each block's pooled vector is a
+    # function of its own lanes only, so the grouping never changes a value;
+    # one chunk for short sequences (identical to the previous single-shot form).
+    _Fd = int(Xs.shape[1])
+    # Conservative per-block element count: Xb + Zb(WinZ) + sc plus the mask.
+    _per_elems = 3 * int(max_len) * _Fd + 4 * int(max_len)
+    _chunk = _pool_block_chunk(B, _per_elems, Xs.element_size())
+    _bpos = B_pos[_pos_a]
+    comp = torch.empty(B, _Fd, device=dev, dtype=Xs.dtype)
+    for _b0 in range(0, B, _chunk):
+        _b1 = min(_b0 + _chunk, B)
+        Xb = _take_2d(Xs, g[_b0:_b1])
+        Zb = _take_2d(Zs, g[_b0:_b1])
+        WinZ = Zb
+        # Same arithmetic valid-lane-only position add as _pool_ordered: the 0/1
+        # mask multiply adds exactly the same values on valid lanes and 0 on pad
+        # lanes, which the fill then sets to -inf — identical values and gradients
+        # to the previous boolean-index form, without the index_put/ragged gather.
+        # += on the fresh _take_2d output (same elementwise kernel and values as
+        # the out-of-place add; see _pool_ordered).
+        WinZ += _bpos[None] * mask[_b0:_b1, :, None]
+        # broadcast fill mask (same argument as _pool_ordered): identical booleans
+        # per lane, without materializing the full-size negated mask.
+        WinZ.masked_fill_(~mask[_b0:_b1, :, None], float('-inf'))
+        # 同 _pool_ordered：softmax 反向保存输出，nan_to_num 出位。
+        sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
+        comp[_b0:_b1] = (sc * Xb).sum(1)
     # same identity-order fast path as _pool_ordered: order[last_idx] over the
     # cached arange returns exactly last_idx (index transport, §6.1).
     return (comp, last_idx if _ident else order[last_idx], B)
