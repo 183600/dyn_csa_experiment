@@ -3149,7 +3149,7 @@ def atomic_write_csv(path, header, rows):
 
 _PINNED_HOST_CACHE = {}
 # 整份 pinned 的字节上限（见 batch_iter）：超出时改走普通宿主张量 + 每步
-# pinned 暂存上传，避免超大语料把锁定内存翻倍。
+# pinned 暂存上传。
 _PINNED_HOST_CAP_BYTES = 4 << 30
 
 def _ids_narrow(train_ids):
@@ -3183,11 +3183,10 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     if host is None:
         if device.type == 'cuda':
             try:
-                # 只对中等规模的语料做整份 pinned：pinned 是锁定不可换出的宿主
-                # 内存，超大语料（B 档 5B token 级 ≈ 20GB int32）整份 pin 既可能
-                # 因 memlock 限额失败、又会把驻留翻倍。超过上限时直接用与 numpy
-                # 共享的普通宿主张量，每步 gather 后再经 _h2d_async 的 pinned 暂存
-                # 上传——取到的整数逐位相同（transport only）。
+                # 只对不超过 _PINNED_HOST_CAP_BYTES 的语料做整份 pinned：
+                # 超过上限时直接用与 numpy 共享的普通宿主张量，每步 gather 后再经
+                # _h2d_async 的 pinned 暂存上传——取到的整数逐位相同（transport
+                # only）。
                 if train_ids.nbytes <= _PINNED_HOST_CAP_BYTES:
                     host = torch.from_numpy(_ids_narrow(train_ids)).pin_memory()
                 else:

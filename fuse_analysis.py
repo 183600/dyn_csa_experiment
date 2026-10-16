@@ -171,7 +171,7 @@ def sample_std(deltas, axis=None):
     if axis is None:
         # Fast path: when nothing is non-finite, d[np.isfinite(d)] is a copy
         # of the same values in the same order, so np.std on `d` directly is
-        # bitwise-identical and skips the mask + compaction allocation.
+        # bitwise-identical.
         if not np.isfinite(d).all():
             d = d[np.isfinite(d)]
         return float(np.std(d, ddof=1)) if d.size > 1 else 0.0

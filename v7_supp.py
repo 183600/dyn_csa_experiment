@@ -1348,8 +1348,7 @@ def run_niah_phase(payload, guard=None, label=''):
                         eps = _seed * 100003 + cache['epoch'] * 7919
                         ids, tgt, _, _kd = build_niah_batch(12, 512, 4, _vocab, seed=eps)
                         # staged non-blocking upload — the same bit-exact
-                        # transport as batch_iter's staging path (§6.1),
-                        # instead of two blocking H2D copies per rebuild.
+                        # transport as batch_iter's staging path (§6.1).
                         cache['ids'] = L._h2d_async(ids, torch.int64, DEVICE)
                         cache['tgt'] = L._h2d_async(tgt, torch.int64, DEVICE)
                         cache['age'] = 0
