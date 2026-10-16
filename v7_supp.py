@@ -688,13 +688,20 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     decay = [p for n_, p in model.named_parameters() if p.requires_grad and (not is_no_decay(n_)) and (not is_delta(n_))]
     ndecay = [p for n_, p in model.named_parameters() if p.requires_grad and is_no_decay(n_) and (not is_delta(n_))]
     dpar = [p for n_, p in model.named_parameters() if p.requires_grad and is_delta(n_)]
-    opt = torch.optim.AdamW([{'params': decay, 'weight_decay': weight_decay, 'lr_scale': 1.0}, {'params': ndecay, 'weight_decay': 0.0, 'lr_scale': 1.0}, {'params': dpar, 'weight_decay': 0.0, 'lr_scale': delta_lr_mult}], lr=lr, foreach=True)
+    # Optimizer / betas / eps come from the SAME module constants every other
+    # arm trains under (L.OPT_ADAMW_BETAS / L.OPT_ADAMW_EPS): a duplicated
+    # literal here would silently diverge the warmup arms from the rest of
+    # the study the day those constants are retuned for a scaled run, and the
+    # divergence would be invisible to the run_cfg fingerprint.  The record's
+    # `train_knobs` descriptor (checked field-by-field by `pair_reason`)
+    # makes the shared settings an auditable fact instead of an assumption.
+    opt = torch.optim.AdamW([{'params': decay, 'weight_decay': weight_decay, 'lr_scale': 1.0}, {'params': ndecay, 'weight_decay': 0.0, 'lr_scale': 1.0}, {'params': dpar, 'weight_decay': 0.0, 'lr_scale': delta_lr_mult}], lr=lr, betas=L.OPT_ADAMW_BETAS, eps=L.OPT_ADAMW_EPS, foreach=True)
 
     def lr_at(step):
         if warmup > 0 and step < warmup:
             return lr * (step + 1) / warmup
         t = (step - warmup) / max(steps - warmup, 1)
-        return lr * (0.1 + 0.45 * (1.0 + math.cos(math.pi * t)))
+        return lr * (L.LR_FLOOR_MULT + L.LR_COSINE_AMP * (1.0 + math.cos(math.pi * t)))
     bpe = L.batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
     _eval_batch = val_batch[:eval_subset]
     warm_on = warm_steps > 0
@@ -737,7 +744,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             loss = ce + comp_lambda * model.comp_reg
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), L.GRAD_CLIP_NORM)
             opt.step()
             _lbuf.append(ce.detach())
             _tail.append(ce.detach())
@@ -773,7 +780,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}}
+    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': L.training_knobs()}
     del model, opt, bpe, decay, ndecay, dpar
     gc.collect()
     if device.type == 'cuda':
@@ -1328,7 +1335,7 @@ def schedule_shutdown(delay_s=120):
     subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown -h now'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f'[v7] instance shuts down in {delay_s}s.')
 LONG_EXT = dict(L.RUN_LONG, steps=40000, n_train_tokens=110000000, eval_every=2000, outdir='results_lm_v7_long40')
-PHASES = [('P0R', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_rope', variants=ROPE_VARIANTS, steps=1500, matched=set(PARAM_MATCHED_V7), mlp_match_ref='csa_fixed_rope'), seeds=[0, 1, 2])), ('P0W', 'warm', dict(cfg=dict(L.RUN_LONG, outdir='results_lm_v7_warmup', variants=['csa_fixed']), seeds=[0, 1], warm_grid=(0, 5000, 10000))), ('P1L', 'len', dict(outdir='results_len', vocab=8192, steps=3000, train_len=512, eval_lens=[512, 1024, 2048, 4096], variants=['full', 'csa_fixed', 'full_rope', 'csa_fixed_rope'])), ('P2S', 'plain', dict(cfg=dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic']), seeds=[2, 3])), ('P1T', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_seq2k', seq_len=2048, batch_size=3, steps=1500, variants=['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']), seeds=[0, 1])), ('P0E', 'plain', dict(cfg=dict(LONG_EXT, variants=['csa_fixed', 'full']), seeds=[0, 1]))]
+PHASES = [('P0R', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_rope', variants=ROPE_VARIANTS, steps=1500, matched=set(PARAM_MATCHED_V7), mlp_match_ref='csa_fixed_rope'), seeds=[0, 1, 2])), ('P0W', 'warm', dict(cfg=dict(L.RUN_LONG, outdir='results_lm_v7_warmup', variants=['csa_fixed']), seeds=[0, 1, 2], warm_grid=(0, 5000, 10000))), ('P1L', 'len', dict(outdir='results_len', vocab=8192, steps=3000, train_len=512, eval_lens=[512, 1024, 2048, 4096], variants=['full', 'csa_fixed', 'full_rope', 'csa_fixed_rope'])), ('P2S', 'plain', dict(cfg=dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic']), seeds=[2, 3])), ('P1T', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_seq2k', seq_len=2048, batch_size=3, steps=1500, variants=['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']), seeds=[0, 1])), ('P0E', 'plain', dict(cfg=dict(LONG_EXT, variants=['csa_fixed', 'full']), seeds=[0, 1]))]
 
 def run_phase(name, guard, only=None, par=None):
     import par as _par

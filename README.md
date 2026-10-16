@@ -69,6 +69,9 @@ pip install datasets tokenizers matplotlib
 # and no dump or network access is needed at all.
 
 # 1) validate the whole pipeline end to end (smoke run, no push):
+#    (covers dense / fixed / dynamic arms AND the leave-one-out ablation
+#     forward paths: random indexer, zero content, sink off, learned fusion,
+#     HCA layers, dense+sink control)
 python run_gapfill.py smoke
 python v10_supp.py smoke           # also covers the new corruption modes + NIAH + controls
 python v12_supp.py smoke           # also covers the frozen final-test roundtrip
@@ -79,13 +82,18 @@ tail -f run_v6.log
 ```
 
 `run_gapfill.py full` runs, in order (each phase is resumable; re-running the
-same command skips completed `variant::seed` pairs):
+same command skips completed `variant::seed` pairs).  The cheap, statistically
+foundational panels run first so a run-time-capped box secures them before the
+20k-step long runs; every phase schedules at least the 3-seed floor the
+methodology audit requires (`min_n`), and seed-completion passes (P2S / P3T /
+P4SS / P5C …) top individual panels up to n=4–6:
 
 | phase | output dir | what |
 |---|---|---|
-| P-LONG | `results_lm_v3_long` | hybrid_fixed / hybrid_dynamic / hybrid_csa_dyn at seed 2 → 3-seed long-run table |
 | P-CORE | `results_lm_v3_1500` | 9-variant core table, 1500 steps x 3 seeds |
-| P-SCALE | `results_lm_v5_scale` | d=384 / 8 layers / seq-1024 probe, 5 variants x 2 seeds x 4000 steps |
+| P-ABL | `results_lm_v4_abl` | leave-one-out ablation table — in-panel references (`full` / `csa_fixed` / `csa_dynamic` / `hybrid_fixed` / `hybrid_dynamic`) + `csa_fix_*` / `csa_dyn_*` module-off arms, fuse/HCA/topk arms, 1500 steps x 3 seeds |
+| P-SCALE | `results_lm_v5_scale` | d=384 / 8 layers / seq-1024 probe, 5 variants x 3 seeds x 4000 steps |
+| P-LONG | `results_lm_v3_long` | hybrid_fixed / hybrid_dynamic / hybrid_csa_dyn at seeds 0-2 → 3-seed long-run table |
 
 `full` is bounded by the run-time cap described at the end of this section.
 

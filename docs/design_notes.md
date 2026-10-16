@@ -489,8 +489,17 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   去一法只在**固定分块**下做是不充分的（`csa_fix_*`），因此同一组去一法
   在**动态分块**（提出的主方法）下也有对应臂 `csa_dyn_randidx` /
   `csa_dyn_zerocont` / `csa_dyn_nosink`（与 `csa_dynamic` 逐字段同构，仅
-  待验证模块不同）。创新点的验证状态按**功效分级**，而不是「有对照即
-  可」：只有至少一条对比**既受控又达到 `min_n`（默认 3）个种子**，
+  待验证模块不同）。去一法要成立，**「Full」与各「Full−X」臂必须落在同一
+  面板里**——`pair_reason` 的配对与 `methodology_audit` 的审计都按单面板
+  `summary.json` 进行，参照臂不在面板内时审计只能报「缺臂」。因此
+  `RUN_ABL` 自含参照臂（`full` / `csa_fixed` / `csa_dynamic` /
+  `hybrid_fixed` / `hybrid_dynamic`；`csa_dynamic` 与 `hybrid_csa_dyn`
+  即各去一法的「Full」），并由 v6 驱动的 **P-ABL 阶段**实际排程
+  （`run_gapfill.py full`，seeds 0-2 ≥ `min_n`；`RUN_ABL` 声明的 5-seed
+  全集留给后续补种子 pass）。v6 smoke 同步覆盖消融臂的全部独有前向路径
+  （随机 indexer / 零内容 / 无 sink / fuse / HCA / dense+sink），使 P-ABL
+  不会在烧掉数小时后才暴露坏臂。创新点的验证状态按**功效分级**，而不是
+  「有对照即可」：只有至少一条对比**既受控又达到 `min_n`（默认 3）个种子**，
   该创新点才算 `verified_components`；只有单种子/欠功效对比的被列入
   `underpowered_components`，完全没有受控对比的列入
   `unverified_components`，缺哪个臂会被逐条 warn。审计同时为每个创新点
@@ -506,7 +515,13 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   时符号翻转检验须 n≥6 才可能显著，审计据此把「效应大于噪声但 n 不足以
   判定」的对比单列为 `resolution_limited_components`，与分析建议「优先
   补种子」一致。核心配对表 `_print_pairs` 同样改用该统计，逐条打印 p 与
-  噪声/分辨率判词。
+  噪声/分辨率判词。**排程侧同一下限**：v6/v7 驱动的每个面板阶段至少排
+  `min_n` 个种子（P-CORE / P-ABL / P-SCALE / P-LONG seeds 0-2，P0W 每
+  warm 条件 3 seeds——历史上 P-LONG 只排 seed 2、P-SCALE 只排 2 种子、
+  P0W 只排 2 种子，全新复现时这些面板将永远低于自己声明的下限），更细的
+  面板由补种子阶段加到 n=4–6；v7 `train_warmup` 的优化器 / betas / eps /
+  LR 调度 / 裁剪全部取自 `exp_lib` 模块常量并向记录写 `train_knobs`，
+  消除第二份会静默漂移的字面量。
 
 `exact_signflip_p` 对 n≤20 穷举 2ⁿ 符号翻转（确定性、与各驱动套件同一
 检验），n>20 用确定性正态近似；`signflip_p_floor` 给出分辨率下限，使

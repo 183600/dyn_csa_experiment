@@ -386,13 +386,21 @@ def run_full():
     if _long_snapshot:
         L.atomic_write_json(os.path.join(REPO, 'results_lm_v3_long', 'aggregate.json.v6bak'), _long_snapshot, indent=2)
     push_ok = git_push('v6: rebuild results_lm_v3_long/summary.json from committed aggregate')
-    L.run({**L.RUN_LONG, 'variants': LONG_GAP_VARIANTS}, seeds=[2], guard=guard, label='P-LONG hybrid seed2 (complete 3-seed table)')
-    merge_long_aggregate(os.path.join(REPO, 'results_lm_v3_long'), _long_snapshot)
-    push_ok &= git_push('v6: results_lm_v3_long hybrid variants at seed 2 — 3-seed long-run table complete')
+    # Phase order: the statistically foundational, cheap panels first (core
+    # table -> its leave-one-out ablations -> scale probe), the 20k-step
+    # long runs LAST.  A run-time-capped fresh box then secures the n>=3
+    # core/ablation/scale tables before the long runs can eat the remaining
+    # budget; on a box that already holds the panels every phase just resumes
+    # and the order costs nothing.
     L.run(L.RUN, seeds=[0, 1, 2], guard=guard, label='P-CORE 1500-step core table (results_lm_v3_1500)')
     push_ok &= git_push('v6: results_lm_v3_1500 — 9-variant core table, 1500 steps x 3 seeds')
-    L.run(L.RUN_SCALE, seeds=[0, 1], guard=guard, label='P-SCALE d=384/8L/seq1024 probe (results_lm_v5_scale)')
-    push_ok &= git_push('v6: results_lm_v5_scale — model-scale probe (d=384, 8L, seq1024, 5 variants x 2 seeds)')
+    L.run(L.RUN_ABL, seeds=[0, 1, 2], guard=guard, label='P-ABL leave-one-out ablation table (results_lm_v4_abl)')
+    push_ok &= git_push('v6: results_lm_v4_abl — leave-one-out ablation table (in-panel references + abl arms), 1500 steps x 3 seeds')
+    L.run(L.RUN_SCALE, seeds=[0, 1, 2], guard=guard, label='P-SCALE d=384/8L/seq1024 probe (results_lm_v5_scale)')
+    push_ok &= git_push('v6: results_lm_v5_scale — model-scale probe (d=384, 8L, seq1024, 5 variants x 3 seeds)')
+    L.run({**L.RUN_LONG, 'variants': LONG_GAP_VARIANTS}, seeds=[0, 1, 2], guard=guard, label='P-LONG hybrid 3-seed long-run table (results_lm_v3_long)')
+    merge_long_aggregate(os.path.join(REPO, 'results_lm_v3_long'), _long_snapshot)
+    push_ok &= git_push('v6: results_lm_v3_long hybrid variants at seeds 0-2 — 3-seed long-run table complete')
     guard.report()
     print('\n[v6] ALL PHASES DONE.')
     schedule_shutdown(90 if push_ok else 2400)
@@ -400,7 +408,13 @@ def run_full():
         print('[v6] WARNING: final push failed — instance stays up 40 min for a retry, then shuts down. Results are safe on the data disk either way.')
 
 def run_smoke():
-    smoke_cfg = dict(L.RUN, outdir='results_smoke', variants=['full', 'csa_fixed', 'hybrid_dynamic'], steps=60, eval_every=30, n_train_tokens=1000000, seeds=[0])
+    # The smoke must exercise every forward path the `full` phases schedule:
+    # dense, fixed-block CSA and the dynamic hybrid, PLUS the leave-one-out
+    # ablation arms of P-ABL (random indexer selection, zero pooled content,
+    # sink off, learned local fusion, the HCA layer kind, and the dense
+    # sink control) — otherwise a broken ablation arm would only surface
+    # after P-CORE/P-LONG burned hours on a real box.
+    smoke_cfg = dict(L.RUN, outdir='results_smoke', variants=['full', 'csa_fixed', 'hybrid_dynamic', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'csa_dyn_fuse', 'hybrid_hca_dyn', 'full_sink'], steps=60, eval_every=30, n_train_tokens=1000000, seeds=[0])
     L.run(smoke_cfg, seeds=[0], guard=None, label='SMOKE (60 steps)', par=False)
     _sp = os.path.join('results_smoke', 'summary.json')
     _got = {}

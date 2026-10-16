@@ -68,6 +68,8 @@ pip install datasets tokenizers matplotlib
 # wt103_cache/ 重建（test 缓存不会跟随静默重建）。
 
 # 1) 端到端校验整个流水线（smoke，不 push）：
+#    （除 dense / 固定 / 动态臂外，还覆盖去一法消融的全部独有前向路径：
+#     随机 indexer、零内容池化、关 sink、learned fusion、HCA 层、dense+sink 对照）
 python run_gapfill.py smoke
 python v10_supp.py smoke           # 同时覆盖新腐坏模式 + NIAH + 从头训练对照
 python v12_supp.py smoke           # 同时覆盖冻结最终测试的完整往返
@@ -78,13 +80,17 @@ tail -f run_v6.log
 ```
 
 `run_gapfill.py full` 按顺序运行（每阶段可断点续跑；重跑同一命令会跳过
-已完成的 `variant::seed` 组合）：
+已完成的 `variant::seed` 组合）。便宜且统计上根本性的面板排在最前，
+受运行时上限约束的机器先拿到 n≥3 的核心/消融/规模表，20k 步长跑最后；
+每个阶段都至少排满方法学审计要求的 3-seed 下限（`min_n`），个别面板
+再由补种子阶段（P2S / P3T / P4SS / P5C …）加到 n=4–6：
 
 | 阶段 | 输出目录 | 内容 |
 |---|---|---|
-| P-LONG | `results_lm_v3_long` | hybrid_fixed / hybrid_dynamic / hybrid_csa_dyn，seed 2 → 三 seed 长跑表 |
 | P-CORE | `results_lm_v3_1500` | 9 变体核心表，1500 步 × 3 seeds |
-| P-SCALE | `results_lm_v5_scale` | d=384 / 8 层 / seq-1024 探针，5 变体 × 2 seeds × 4000 步 |
+| P-ABL | `results_lm_v4_abl` | 去一法消融表——面板内参照臂（`full` / `csa_fixed` / `csa_dynamic` / `hybrid_fixed` / `hybrid_dynamic`）+ `csa_fix_*` / `csa_dyn_*` 去模块臂，以及 fuse/HCA/topk 臂，1500 步 × 3 seeds |
+| P-SCALE | `results_lm_v5_scale` | d=384 / 8 层 / seq-1024 探针，5 变体 × 3 seeds × 4000 步 |
+| P-LONG | `results_lm_v3_long` | hybrid_fixed / hybrid_dynamic / hybrid_csa_dyn，seeds 0-2 → 三 seed 长跑表 |
 
 `full` 受本节末尾描述的运行时上限约束。
 

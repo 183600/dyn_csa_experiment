@@ -104,7 +104,15 @@ RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000
 # 只报固定分块下的去一法无法支撑「该模块在提出的动态方法里各自有用」。两组
 # 都是「与 csa_dynamic / csa_fixed 逐字段同构，仅待验证模块不同」。
 ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'full_sink']
-RUN_ABL = dict(RUN, outdir='results_lm_v4_abl', variants=ABL_VARIANTS, seeds=[0] if QUICK else [0, 1, 2, 3, 4])
+# 去一法要成立，「Full」与各「Full−X」臂必须落在**同一个面板**里：ABLATION_DESIGN
+# 的每条对照都靠 pair_reason 在同一 run_cfg 下逐种子配对，methodology_audit 也按
+# 单面板 summary 审计——参照臂不在面板内时该面板只能报「缺臂」，撑不起任何
+# 「各模块都有用」的结论。因此消融面板自含参照臂（csa_dynamic / hybrid_csa_dyn
+# 即去一法的「Full」；full 供 full_sink 的 dense sink 对照）。参照臂列在最前：
+# 历史机器上 resume 直接跳过，全新机器上预算被 cap 截断时它们最先完成，缺的
+# 只是 abl 臂而不是整套对照。
+ABL_REFS = ['full', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic']
+RUN_ABL = dict(RUN, outdir='results_lm_v4_abl', variants=ABL_REFS + ABL_VARIANTS, seeds=[0] if QUICK else [0, 1, 2, 3, 4])
 RUN_LONG = dict(RUN, n_train_tokens=2000000 if QUICK else 110000000, steps=500 if QUICK else 20000, warmup=200, eval_every=1000, seeds=[0] if QUICK else [0, 1, 2, 3], outdir='results_lm_v3_long', variants=['full', 'full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn'])
 RUN_SCALE = dict(RUN, d=384, n_layers=8, n_heads=12, d_head=32, seq_len=1024, batch_size=8, n_train_tokens=2000000 if QUICK else 40000000, steps=500 if QUICK else 4000, warmup=100, eval_every=500, seeds=[0] if QUICK else [0, 1, 2], outdir='results_lm_v5_scale', variants=['full', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic'])
 # ---- B 档规模阶梯（docs/compute_plan.md §4–§5；档位已选定 B 进取）----
