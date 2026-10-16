@@ -692,21 +692,24 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     # int64 升型循环外一次），布尔值与全幅形式逐格相同，[R, T, Bm] 全幅
     # 掩码不物化。
     lt64 = last_tok.to(torch.int64)
-    # fp32 升型整体只做一次（逐片 cast 的值与整张 cast 后取片逐位一致）。
-    qIf = qI if qI.dtype == torch.float32 else qI.to(torch.float32)
-    kIf = kI if kI.dtype == torch.float32 else kI.to(torch.float32)
-    wf = w_idx if w_idx.dtype == torch.float32 else w_idx.to(torch.float32)
+    # 工作精度 = max(dtype, fp32)（fp32/bf16/fp16 输入与旧硬编码 fp32 口径
+    # 逐位一致；fp64 输入全 fp64，前向/反向同一精度合同）。升型整体只做
+    # 一次（逐片 cast 的值与整张 cast 后取片逐位一致）。
+    acc = torch.promote_types(dtype, torch.float32)
+    qIf = qI if qI.dtype == acc else qI.to(acc)
+    kIf = kI if kI.dtype == acc else kI.to(acc)
+    wf = w_idx if w_idx.dtype == acc else w_idx.to(acc)
     k_out = min(int(topk), Bm)
     idx = torch.empty((R, T, k_out), device=dev, dtype=torch.int32)
     valid = torch.empty((R, T, k_out), device=dev, dtype=torch.bool)
-    soft = torch.empty((R, T, k_out), device=dev, dtype=torch.float32)
+    soft = torch.empty((R, T, k_out), device=dev, dtype=acc)
     # 逐行独立的 (r,t) 归约（mask/lse/sort/topk）：按 t 分块与整幅计算的
     # 每行值逐位一致（同 kernel、同归约顺序），中间张量按 t 块封顶。
     t_chunk = max(1, min(T, (256 << 20) // max(R * Bm * 32, 1)))
     for t0 in range(0, T, t_chunk):
         t1 = min(t0 + t_chunk, T)
         causal_c = t_idx[:, t0:t1] > lt64[:, None, :]
-        scores = torch.zeros((R, t1 - t0, Bm), device=dev, dtype=torch.float32)
+        scores = torch.zeros((R, t1 - t0, Bm), device=dev, dtype=acc)
         for i in range(nIH):
             # mul/relu 原地（s_i 是本轮新出的临时量，relu(x)>0 ⟺ x>0 逐位一致）；
             # add_ 与 += 同一个核。
@@ -780,8 +783,12 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
     # 同 _indexer_fwd_ref：causal 按 t 分块现算（同一整数比较），全幅
     # [R, T, Bm] 掩码不物化。
     lt64 = last_tok.to(torch.int64)
-    gsf = gs.to(torch.float32)
-    softf = soft.to(torch.float32)
+    # 工作精度 = max(dtype, fp32)：fp32 / bf16 / fp16 输入下与硬编码 fp32
+    # 的旧口径逐位一致；fp64 输入下全 fp64（旧口径把 e/ds 升成 fp64 后与
+    # fp32 的 kIf/q_c 在同一 einsum 里混 dtype，反向直接报错）。
+    acc = torch.promote_types(dtype, torch.float32)
+    gsf = gs.to(acc)
+    softf = soft.to(acc)
     Gt = (gsf * softf).sum(dim=-1)
     if idx.numel():
         # 一次升型供全循环复用（同一批整数）：pad 槽位（重复的 pad_blk）投到
@@ -791,20 +798,20 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
     dqI = torch.zeros_like(qI) if need_dq else None
     dkI = torch.zeros_like(kI) if need_dk else None
     dw = torch.zeros_like(w_idx) if need_dw else None
-    # kI / w_idx 与 t 分块无关：fp32 升型在分块循环外只做一次（整型内容
-    # 不变，逐位一致）。
-    kIf = kI if kI.dtype == torch.float32 else kI.to(torch.float32)
-    wf = w_idx if w_idx.dtype == torch.float32 else w_idx.to(torch.float32)
+    # kI / w_idx 与 t 分块无关：工作精度升型在分块循环外只做一次（整型
+    # 内容不变，逐位一致）。
+    kIf = kI if kI.dtype == acc else kI.to(acc)
+    wf = w_idx if w_idx.dtype == acc else w_idx.to(acc)
     for t0 in range(0, T, t_chunk):
         t1 = min(t0 + t_chunk, T)
         # Mk 随 t 分块构建（全幅 [R, T, Bm+1] 不物化）：逐 chunk 的 scatter
         # 键/值就是全幅形式对应行的切片，逐行无碰撞——切片后的值逐位一致。
-        Mk = torch.zeros((R, t1 - t0, Bm + 1), device=dev, dtype=torch.float32)
+        Mk = torch.zeros((R, t1 - t0, Bm + 1), device=dev, dtype=acc)
         if idx.numel():
             dst = torch.where(valid[:, t0:t1], idx_l[:, t0:t1], Bm)
-            Mk.scatter_(2, dst, (gsf[:, t0:t1] * softf[:, t0:t1]) * valid[:, t0:t1].to(torch.float32))
+            Mk.scatter_(2, dst, (gsf[:, t0:t1] * softf[:, t0:t1]) * valid[:, t0:t1].to(acc))
         Mk = Mk[:, :, :Bm]
-        q_c = qI[:, t0:t1].to(torch.float32)
+        q_c = qI[:, t0:t1].to(acc)
         s_list = []
         for i in range(nIH):
             # 原地 relu：后面用到的 (s_i > 0) 与 relu(s_i)>0 逐位同真，
@@ -819,9 +826,9 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
             else:
                 s_i *= iscale
             s_list.append(F.relu_(s_i))
-        # fp32 累加器（与前向的 scores 容器同口径——即使 s_i 已按 dtype
-        # 舍入，跨头累加也在 fp32 进行）。
-        s_all = torch.zeros((R, t1 - t0, Bm), device=dev, dtype=torch.float32)
+        # 工作精度累加器（与前向的 scores 容器同口径——即使 s_i 已按
+        # dtype 舍入，跨头累加也在工作精度进行）。
+        s_all = torch.zeros((R, t1 - t0, Bm), device=dev, dtype=acc)
         for i in range(nIH):
             s_all.add_(s_list[i] * wf[:, t0:t1, i:i + 1])
         if dtype != torch.float32:
