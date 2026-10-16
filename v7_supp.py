@@ -267,8 +267,12 @@ class HybridAttentionRoPE(L.HybridAttention):
             _, topk_idx, soft = L.lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, cfg.index_topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box)
             sel_valid = _sel_valid_box[0]
         sink = self.sink if cfg.use_sink else None
-        # cfg.kind == 'hca' passes the distinct-per-row arange expansion
-        out = self._rope_attn(qn, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink, rd, soft=soft, sel_valid=sel_valid, topk_distinct=cfg.kind == 'hca')
+        # Both branches hold distinct block ids per row: the HCA arm passes the
+        # arange expansion, the csa arm's no-replacement indexer selection fills
+        # the valid slots with distinct columns and only the tail pads repeat
+        # block 0 (already invalidated by sel_valid).  Declaring it lets
+        # _rope_attn skip first_occurrence_mask; the keep mask is identical.
+        out = self._rope_attn(qn, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink, rd, soft=soft, sel_valid=sel_valid, topk_distinct=True)
         return (self.W_o(out.reshape(T, nh * hd)), gate_mean)
 
     def _rope_attn(self, q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, sink, rope_dim, q_chunk=128, soft=None, rope_base=10000.0, mem_budget_bytes=None, sel_valid=None, topk_distinct=False):

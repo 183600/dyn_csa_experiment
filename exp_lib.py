@@ -2219,7 +2219,7 @@ class HybridAttention(nn.Module):
             # 重复块 0 已被 sel_valid 置无效。故 gathered_attention 的
             # first_occurrence 去重掩码恒为全真，直接声明 topk_distinct 跳过它
             # （keep 掩码与逐位计算结果一致，下游取值不变）。
-            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], topk_distinct=False, soft_form=True)
+            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], topk_distinct=True, soft_form=True)
         return (self.W_o(out.reshape(T, self.nh * self.hd)), gate_mean)
 
     def forward(self, x):
