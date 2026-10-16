@@ -152,9 +152,8 @@ def cosine_similarity_consecutive(H, eps=1e-08):
 _SEGMENT_CACHE = collections.OrderedDict()
 _SEGMENT_CACHE_CAP = 4096
 # Per-length host position table arange(n + 1) reused across segmenter calls
-# (read-only): the dynamic segmenter runs once per row per layer per step, so
-# this O(n) host allocation is rebuilt constantly for a fixed sequence length.
-# Pure cache — the same integers `np.arange(n + 1)` returns every call.
+# (read-only).  Pure cache — the same integers `np.arange(n + 1)` returns
+# every call.
 _SEG_POS_CACHE = {}
 _SEG_POS_CACHE_CAP = 16
 
@@ -242,11 +241,11 @@ def _h2d_stage(shape, dtype, device):
     # it would otherwise hand to `torch.tensor(..., device=device)` and
     # `commit()` enqueues the H2D copy; the copy is bit-exact regardless of
     # which staging buffer (if any) it leaves from, so every value reaching
-    # the device is identical to the pin-per-call form.  Each slot is guarded
-    # by a CUDA event recorded after its last enqueue, so a slot is never
-    # rewritten while an earlier async copy from it is still in flight; when
-    # every slot is busy (or the pool cannot serve at all) the caller falls
-    # back to the pin-per-call form, again with identical values.
+    # the device is identical.  Each slot is guarded by a CUDA event recorded
+    # after its last enqueue, so a slot is never rewritten while an earlier
+    # async copy from it is still in flight; when every slot is busy (or the
+    # pool cannot serve at all) the caller falls back to a direct pinned copy,
+    # again with identical values.
     if device.type != 'cuda' or not torch.cuda.is_available():
         return (None, None)
     shape = tuple(int(_s) for _s in shape)
@@ -542,10 +541,9 @@ def _window_geometry(n, w, device):
         # int32 arithmetic throughout (design notes §6.1): every position is an
         # exact integer in [-(w-1), n) and the sequence lengths this repo uses
         # lie far inside the int32 range, so the table holds bitwise the same
-        # integers as the int64 form — index_select accepts int32 directly —
-        # while the [n, w] position table is half the size.  The validity mask
-        # is read off the pre-clamp table, so it sees the same negative
-        # positions either way.
+        # integers as the int64 form — index_select accepts int32 directly.
+        # The validity mask is read off the pre-clamp table, so it sees the
+        # same negative positions either way.
         win_idx = pos.to(torch.int32)[:, None] - (w - 1) + rel.to(torch.int32)[None, :]
         valid = win_idx >= 0
         win_idx.clamp_(min=0)
@@ -742,17 +740,16 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
 _POOL_PARTS_HOST = True
 _POOL_PARTS_BUCKET = 256
 _POOL_GEOM_BUCKET = 1024
-# Transient cap for the block-pooling gathers/mixes (fixed byte budget, so the
-# block-chunk boundaries are a pure function of the shapes — the forward and
-# the checkpoint recompute split identically).  Each block's pooled vector is
-# computed from its own tokens/overlap lanes only, so processing blocks in
-# any grouping yields the same per-block values bit-for-bit; raising this only
-# trades peak memory for fewer Python iterations.
+# Block-chunking of the block-pooling gathers/mixes: the chunk boundaries are
+# a pure function of the shapes, so the forward and the checkpoint recompute
+# split identically.  Each block's pooled vector is computed from its own
+# tokens/overlap lanes only, so processing blocks in any grouping yields the
+# same per-block values bit-for-bit.
 _POOL_TRANSIENT_BUDGET_BYTES = 256 << 20
 
 def _pool_block_chunk(B, per_block_elems, elem_size):
-    # Number of blocks whose gather/softmax/mix transients fit the fixed
-    # budget; >= 1 and never more than B (so short sequences run one chunk).
+    # Number of blocks per chunk; >= 1 and never more than B (so short
+    # sequences run one chunk).
     _per = max(1, int(per_block_elems) * int(elem_size))
     return max(1, min(int(B), _POOL_TRANSIENT_BUDGET_BYTES // _per))
 
@@ -1191,10 +1188,9 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
                 _pool_geom_put(block_ids, _gkey, (g_a, mask_a, g_b, mask_b, b_off, _pos_a))
     # Every block's pooled vector is a function of its own block lanes and
     # overlap lanes only (the softmax normalization and the weighted sum are
-    # both within one block), so the blocks are processed in budget-sized
-    # chunks: each chunk's gathers/mix are bit-identical to the same rows of
-    # the unchunked form, and `comp` is written row-for-row.  Short sequences
-    # fit one chunk (identical to the previous single-shot form).
+    # both within one block), so the blocks are processed in chunks: each
+    # chunk's gathers/mix are bit-identical to the same rows of the unchunked
+    # form, and `comp` is written row-for-row.
     _Fd = int(Xas.shape[1])
     _Wb = int(g_b.shape[1])
     # Conservative per-block element count: Xam+Zam+Xbm+Zbm + WinZ + sc
@@ -1284,8 +1280,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
             if _cpu is not None and len(_cpu[0]) == B:
                 _pool_geom_put(block_ids, _gkey, (g, mask, _pos_a))
     # Block-chunked exactly as _pool_ordered: each block's pooled vector is a
-    # function of its own lanes only, so the grouping never changes a value;
-    # one chunk for short sequences (identical to the previous single-shot form).
+    # function of its own lanes only, so the grouping never changes a value.
     _Fd = int(Xs.shape[1])
     # Conservative per-block element count: Xb + Zb(WinZ) + sc plus the mask.
     _per_elems = 3 * int(max_len) * _Fd + 4 * int(max_len)
@@ -1300,12 +1295,12 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         # Same arithmetic valid-lane-only position add as _pool_ordered: the 0/1
         # mask multiply adds exactly the same values on valid lanes and 0 on pad
         # lanes, which the fill then sets to -inf — identical values and gradients
-        # to the previous boolean-index form, without the index_put/ragged gather.
+        # to the boolean-index form.
         # += on the fresh _take_2d output (same elementwise kernel and values as
         # the out-of-place add; see _pool_ordered).
         WinZ += _bpos[None] * mask[_b0:_b1, :, None]
         # broadcast fill mask (same argument as _pool_ordered): identical booleans
-        # per lane, without materializing the full-size negated mask.
+        # per lane.
         WinZ.masked_fill_(~mask[_b0:_b1, :, None], float('-inf'))
         # 同 _pool_ordered：softmax 反向保存输出，nan_to_num 出位。
         sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
@@ -1471,10 +1466,10 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     if query_chunk is None:
         raise ValueError("lightning_indexer: query_chunk=None is not 'use the default'; pass the default (2048) explicitly or omit the argument")
     query_chunk = max(1, min(int(query_chunk), n))
-    # 瞬态封顶（只收紧 chunk 行数——下方注释已论证逐 chunk 融合与全宽
-    # 形式逐行逐位一致；用固定 256MB 的口径，分块边界是 (n, B, nIH, dtype)
-    # 的纯函数，跨机器确定）：每 chunk 同时物化 raw [nIH,·,B]、scores、
-    # masked、int64 order 与 keep/dest/tgt 等选择表。
+    # chunk 行数上限（下方注释已论证逐 chunk 融合与全宽形式逐行逐位一致；
+    # 分块边界是 (n, B, nIH, dtype) 的纯函数，跨机器确定）：每 chunk 同时
+    # 物化 raw [nIH,·,B]、scores、masked、int64 order 与 keep/dest/tgt 等
+    # 选择表。
     _iper = int(B) * (int(nIH) * int(H.element_size()) + 40) + 64
     if _iper > 0:
         query_chunk = max(1, min(query_chunk, (256 << 20) // _iper))
@@ -1626,15 +1621,12 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
     if mem_budget_bytes is None:
-        # CPU/未知设备没有 free-memory 口径：封顶 256MB 瞬态（只收紧
-        # chunk 行数——chunk 是纯行划分，任何宽度下逐行值逐位相同）。
+        # CPU/未知设备：使用固定上限（chunk 是纯行划分，任何宽度下逐行值
+        # 逐位相同）。
         mem_budget_bytes = 256 << 20
     _heads = q.shape[1] if q.dim() == 3 else 1
     _M = max(1, int(topk_idx.shape[1]) + int(w))
-    # K/V 两侧各经「两半 gather + cat」：cat 期间两半与整幅并存，K/V 项
-    # 按 2 倍计（Kset 与 Vset 不同时达到峰值——Vset 在 logits 之后——
-    # 但 soft 分支的 kb/kw 与 soft_logits 会跨越两次 softmax 存活，2 倍
-    # 口径对两种分支都封住峰值）。
+    # 分块行字节估算（保守上界）。
     _per_row = 4 * _M * _heads * int(q.shape[-1]) + 2 * _M * _heads
     _bytes_per_chunk_row = _per_row * q.element_size()
     _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
@@ -2027,10 +2019,10 @@ class HybridAttention(nn.Module):
                 z = F.pad(fx.transpose(1, 2), (k - 1, 0))
                 pre['fused'] = F.conv1d(z, self.fuse_conv.weight, groups=fx.shape[-1]).transpose(1, 2)
             return pre
-        # Fused projection (CUDA): all x @ W terms run as ONE GEMM over the
-        # concatenated weight columns (row-independent output columns, so the
-        # per-slice values — and the per-column grads — are bit-identical to
-        # the per-projection form, design notes §6.1).
+        # Batched projection (CUDA): all x @ W terms run over the concatenated
+        # weight columns (row-independent output columns, so the per-slice
+        # values — and the per-column grads — are bit-identical to the
+        # per-projection form, design notes §6.1).
         _mats = [self.W_q.weight.t(), self.W_aKV]
         _keys = ['q', 'Ca']
         # weights are transposed below for a single F.linear (addmm) call, so
@@ -2243,9 +2235,9 @@ class HybridAttention(nn.Module):
                     # host-side integer equivalence (design notes §6.2): cut
                     # positions are the prefix sums of the same counts table
                     # that generated bid — the identical integers to the
-                    # nonzero(diff)+1 form, with no device sync.  Consumers
-                    # accept numpy rows directly (compression_report's
-                    # _tcut_ix split and boundary_alignment's np.asarray).
+                    # nonzero(diff)+1 form.  Consumers accept numpy rows
+                    # directly (compression_report's _tcut_ix split and
+                    # boundary_alignment's np.asarray).
                     self._cuts.append(np.cumsum(np.asarray(_cpu[0], dtype=np.int64))[:-1])
                 else:
                     cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
@@ -4806,8 +4798,7 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
         ids = torch.as_tensor(np.asarray(val_batch[_r0:min(_r0 + 16, n_used)])).to(device)
         _ = model(ids, logits_tail=1)
         del ids
-    # one stacked device read for every dynamic layer's delta_logit instead
-    # of a per-layer .item() sync (same scalars, same floats).
+    # every dynamic layer's delta_logit (same scalars, same floats).
     _dl_layers = [(li, blk.attn.delta_logit) for li, blk in enumerate(model.blocks)
                   if blk.attn.cfg.dynamic and getattr(blk.attn, 'delta_logit', None) is not None]
     _dl_vals = {}

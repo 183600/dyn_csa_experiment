@@ -528,7 +528,7 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     ch = _pool_chunk_b(R, L + (W if has_b else 0), c, temps=8)
     # 单 chunk（ch >= Bm）时 in_ch / b2 的 chunk 范围条件恒真（geom 与 bid
     # 同源——Bm 由同一分段表的 counts 给出，bid 值恒 < Bm）：where(全真,
-    # x, 0) 逐位返回 x（含 ±0/NaN），直接省略该选择核。
+    # x, 0) 逐位返回 x（含 ±0/NaN）。
     single_chunk = ch >= Bm
     # 广播用的零标量只读，逐 chunk 重建是同一常量——循环外只建一次。
     zero32 = torch.zeros((), device=dev, dtype=torch.float32)
@@ -738,7 +738,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
         # 同值——那种形式的首个因果块必为块 0）。
         pad_blk = torch.zeros((R, t1 - t0), device=dev, dtype=torch.int64)
         # 逐轮「首达最大值」提取 == 稳定降序排序的前缀（tie 取最早下标，
-        # 见上文 docstring）：一次 torch.sort 替代 k 轮全宽 max/where/min 循环。
+        # 见上文 docstring）。
         sval, sidx = torch.sort(work, dim=-1, descending=True, stable=True)
         top_val = sval[:, :, :k_out]
         top_idx = sidx[:, :, :k_out]
@@ -1976,7 +1976,7 @@ def _attach_attn_kernels(ns):
         t_hi = p + W
         if t_hi > T:
             t_hi = T
-        # tt 沿 [p, p+W) 连续——按 [BW, HD] 分片矢量载入替代逐 tt 标量循环：
+        # tt 沿 [p, p+W) 连续——按 [BW, HD] 分片载入：
         # 片内固定树形归约、片间按 tt 升序累加（与逐 tt 循环同为固定顺序
         # 归约，内核变体口径见模块 docstring）。掩码泳道经 other=0 载入后
         # z=0、PA=exp(0)/1、g=0，各贡献项（dz·q、PA·dO）恰为 0。
