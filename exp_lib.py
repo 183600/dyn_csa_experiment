@@ -143,6 +143,21 @@ def cosine_similarity_consecutive(H, eps=1e-08):
 # either policy would return, so no value downstream can change.
 _SEGMENT_CACHE = collections.OrderedDict()
 _SEGMENT_CACHE_CAP = 4096
+# Per-length host position table arange(n + 1) reused across segmenter calls
+# (read-only): the dynamic segmenter runs once per row per layer per step, so
+# this O(n) host allocation is rebuilt constantly for a fixed sequence length.
+# Pure cache — the same integers `np.arange(n + 1)` returns every call.
+_SEG_POS_CACHE = {}
+_SEG_POS_CACHE_CAP = 16
+
+def _seg_pos(n):
+    pos = _SEG_POS_CACHE.get(n)
+    if pos is None:
+        pos = np.arange(n + 1, dtype=np.int64)
+        if len(_SEG_POS_CACHE) >= _SEG_POS_CACHE_CAP:
+            _SEG_POS_CACHE.pop(next(iter(_SEG_POS_CACHE)))
+        _SEG_POS_CACHE[n] = pos
+    return pos
 
 def _segment(n, want_cut_list, min_block, max_block):
     cacheable = n <= 64
@@ -174,7 +189,7 @@ def _segment(n, want_cut_list, min_block, max_block):
     # through np.asarray is a no-op for the latter.  Same booleans either way.
     slots = np.nonzero(np.asarray(want_cut_list, dtype=bool))[0]
     ns = len(slots)
-    pos = np.arange(n + 1, dtype=np.int64)
+    pos = _seg_pos(n)
     if ns:
         si = np.searchsorted(slots, pos, side='left')
         nc = np.where(si < ns, slots[np.minimum(si, ns - 1)], _BIG)
@@ -516,12 +531,17 @@ def _window_geometry(n, w, device):
     pos = _arange_cache(n, device)
     rel = _range_cache(0, w, device)
     with torch.inference_mode(False):
-        win_idx_raw = pos[:, None] - (w - 1) + rel[None, :]
-        # int32 index transport (design notes §6.1): every clamped position is
-        # an exact integer in [0, n) < 2**31, so the narrowed table addresses
-        # exactly the same k_sw rows as the int64 form — index_select accepts
-        # int32 directly (as the indexer's topk already relies on).
-        pair = (win_idx_raw.clamp(min=0).to(torch.int32), win_idx_raw >= 0)
+        # int32 arithmetic throughout (design notes §6.1): every position is an
+        # exact integer in [-(w-1), n) and the sequence lengths this repo uses
+        # lie far inside the int32 range, so the table holds bitwise the same
+        # integers as the int64 form — index_select accepts int32 directly —
+        # while the [n, w] position table is half the size.  The validity mask
+        # is read off the pre-clamp table, so it sees the same negative
+        # positions either way.
+        win_idx = pos.to(torch.int32)[:, None] - (w - 1) + rel.to(torch.int32)[None, :]
+        valid = win_idx >= 0
+        win_idx.clamp_(min=0)
+        pair = (win_idx, valid)
     _cache_put(_IDX_CACHE, key, pair, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return pair
 
@@ -1303,18 +1323,22 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     # The padded lanes are masked downstream via the selection-valid mask
     # either way, so the zeros are the same integers the argmax produced
     # (host-side integer equivalence, design notes §6.2).
-    pad_blk = torch.zeros(n, dtype=torch.int32, device=scores.device)
-    valid_cols = kept >= 0
     # the invalid lanes hold exactly the -1 sentinel, so clamping the kept
     # buffer to 0 replaces the where(valid, kept, 0) selection lane-for-lane
-    # (block ids are >= 0 and are never rewritten) — same integers.
-    kept.clamp_min_(0)
-    idx_out = kept
+    # (block ids are >= 0 and are never rewritten) — same integers.  The
+    # validity mask is an exact function of the pre-clamp kept buffer and is
+    # only consumed when the caller asks for it, so it (and the pad-block
+    # constant, needed only when k exceeds the available lanes) is built only
+    # on the branch that reads it.
     if out_valid is not None:
+        valid_cols = kept >= 0
         if k_req > _w_keep:
             valid_cols = torch.cat([valid_cols, torch.zeros(n, k_req - _w_keep, dtype=torch.bool, device=scores.device)], dim=1)
         out_valid[:] = [valid_cols]
+    kept.clamp_min_(0)
+    idx_out = kept
     if k_req > _w_keep:
+        pad_blk = torch.zeros(n, dtype=torch.int32, device=scores.device)
         pad = pad_blk[:, None].expand(n, k_req - _w_keep)
         idx_out = torch.cat([idx_out, pad], dim=1)
     return idx_out
