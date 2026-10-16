@@ -1,6 +1,7 @@
 {
-  "frozen_at": "2026-10-16",
-  "purpose": "Pre-registered confirmation plan: v6-v11 (and the v10/v12 reviewer-response extensions) all selected methods, arms, comparisons and seeds on the SAME validation split, so their p-values are exploratory. This manifest freezes the main comparisons, endpoints, seed count and statistics BEFORE any WikiText-103 test-split evaluation, and the confirmation data (wiki.test.raw) has never been read by any earlier phase.",
+  "manifest_version": 2,
+  "frozen_at": "2026-10-17",
+  "purpose": "Pre-registered confirmation plan: v6-v11 (and the v10/v12 reviewer-response extensions) all selected methods, arms, comparisons and seeds on the SAME validation split, so their p-values are exploratory. This manifest freezes the main comparisons, endpoints, seed count and statistics BEFORE any WikiText-103 test-split evaluation, and the confirmation data (wiki.test.raw) has never been read by any earlier phase. v2 (review-2 revision): the seed count was raised 6 -> 12 and the manifest gained a machine-checkable binding block and a scope declaration; the revision was made strictly BEFORE any test-split evaluation (no P5T result has ever existed -- no results_lm_test/ record, no commit touching the test split), which is the only condition under which a pre-registration may be revised without selection bias.",
   "code_semantics_expected": "v11.125",
   "arms": [
     "csa_fixed_rope",
@@ -8,11 +9,48 @@
     "csa_fixed_rope_randidx",
     "csa_fixed_rope_allblocks"
   ],
-  "seeds": [0, 1, 2, 3, 4, 5],
-  "training_recipe": "P3MT/P4MT/P5C: 3000 steps, seq 512, batch 12 (~18.4M tokens/run), identical data order per seed; csa_fixed_rope & full_rope via P4MT (seeds 0-5), controls via P5C (seeds 0-5, same recipe and outdir).",
+  "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+  "training_recipe": "P3MT/P4MT/P5C: 3000 steps, seq 512, batch 12 (18.4M tokens consumed per run over the 8M-token train cache; identical data order per seed), all four arms under one config; csa_fixed_rope & full_rope via P3MT/P4MT (seeds 0-5) + P5C (seeds 6-11), controls via P3MTC/P5C (seeds 0-11, same recipe and outdir).",
+  "binding": {
+    "training_recipe_signature": {
+      "steps": 3000,
+      "sl": 512,
+      "bs": 12,
+      "nt": 8000000,
+      "lr": 0.0003,
+      "wd": 0.1,
+      "d": 256,
+      "L": 6,
+      "H": 8,
+      "Dh": 32,
+      "v": 8192,
+      "wu": 50,
+      "cl": 0.05,
+      "dlm": 10.0,
+      "ee": 250,
+      "es": 128
+    },
+    "training_recipe_note": "Machine-checkable subset of the run_cfg fingerprint (keys as decoded by exp_lib.run_cfg_knobs). mt/mr/det/df/cs are deliberately NOT pinned: they bind variant/environment/data/code and are verified separately (_code stamp, data_fp, manifest sha). Any record whose recipe fails this signature is refused by the confirmation statistics entry.",
+    "test_slice": {
+      "loader": "exp_lib.load_wikitest",
+      "seq_len_rule": "max(by_length_ppl)+1",
+      "n_seqs": 16,
+      "fingerprint_rule": "exp_lib._ids_fp over the flattened (n_seqs, seq_len) rows; every record must carry the same non-null data_fp; the first P5T access writes it into results_lm_test/.freeze_lock.json"
+    },
+    "tokenizer": {
+      "fit": "same deterministic BPE fit as load_wikitext (first <=50k TRAIN rows only, vocab 8192)",
+      "check": "load_wikitest hard-compares the full id->token vocabulary against any cached train tokenizer and refuses on mismatch"
+    },
+    "checkpoint": {
+      "stamp": "v11.125 (= exp_lib.CODE_SEMANTICS; records carry _code, ckpt carries code)",
+      "hash": "sha256 of the .pt file, stored per record as ckpt_sha256 at P5T evaluation time"
+    }
+  },
   "eval": {
     "data": "wiki.test.raw via exp_lib.load_wikitest (held out; the ONLY phase allowed to read it)",
+    "n_seqs_clean": 16,
     "by_length_ppl": [512, 1024, 2048, 4096],
+    "per_document": "bylen records additionally store ppl_per_seq (per-row PPL) so document-sampling uncertainty can be stratified; n_seqs=16 does NOT cover the language-population distribution and population-level claims are out of scope (design_notes section 20)",
     "distractor_probe": {
       "mode": "uniform",
       "rhos": [0.0, 0.125, 0.25, 0.5],
@@ -20,6 +58,11 @@
       "target": 512,
       "n_seq": 16
     }
+  },
+  "scope": {
+    "confirmatory_claims": "ONLY fixed-chunk CSA mechanism claims: learned top-k selection vs trained controls, sparse length extrapolation vs full RoPE attention, and block-compression/KV-projection effects at the frozen endpoints.",
+    "not_covered": "dynamic chunking vs fixed chunking, semantic value of dynamic boundaries, HCA advantages, and dynamic-chunking scaling laws are NOT covered by this confirmation (no dynamic arm, no HCA comparison is frozen here).",
+    "required_for": "those claims require their own pre-registered freeze (arms, seeds, endpoints) before their first test-split access; until then they stay exploratory regardless of how the fixed-chunk confirmation turns out."
   },
   "primary_comparisons": [
     {
@@ -57,12 +100,40 @@
   ],
   "statistics": {
     "test": "exact two-sided sign-flip over paired per-seed deltas",
-    "n_seeds": 6,
-    "p_floor": 0.03125,
+    "n_seeds": 12,
+    "p_floor": 0.00048828125,
+    "alpha": 0.05,
     "family": "primary_comparisons only (m=4)",
     "correction": "holm step-down",
+    "min_attainable_p_holm": 0.001953125,
+    "min_consistency_for_first_gate": 11,
+    "power_first_holm_gate": {
+      "q=0.80": 0.275,
+      "q=0.85": 0.443,
+      "q=0.90": 0.659,
+      "q=0.95": 0.882
+    },
+    "power_note": "q = probability that a single seed's paired delta falls in the pre-registered direction. Power is computed for the FIRST Holm gate (the hardest). 12 seeds was chosen so the plan is not merely mathematically able to reject (>= 8 seeds) but has moderate power at optimistic q; at q=0.8 power is only ~0.28 -- mathematical possibility is NOT sufficient power, and the validation panels' sign-consistency rates are the only (exploratory) source for calibrating q. exp_lib.signflip_power recomputes this table deterministically.",
+    "validity_assumptions": "the exact sign-flip p requires within-seed exchangeability: both arms of a pair share everything stochastic except the arm itself (identical per-seed data order over the shared cache, same eval rows, same corruption grid; init RNG is seeded per seed -- architecture-induced RNG consumption differences are part of the arm). Seed-number equality alone does not provide this; see design_notes section 20.",
     "decision_rule": "A comparison is CONFIRMED only if p_holm < 0.05 AND its direction matches the validation-panel estimate; otherwise the claim stays exploratory. Probe/delta-NLL/NIAH results on the test split are reported descriptively (secondary) and carry no significance claims.",
-    "seed_policy": "seeds 0-5 fixed above; no seeds may be added after the first test-split evaluation (adding seeds after seeing results is selection bias by construction). Missing seeds at run time are reported as-is (smaller honest n), never topped up."
+    "seed_policy": "seeds 0-11 fixed above; no seeds may be added after the first test-split evaluation (adding seeds after seeing results is selection bias by construction). Missing seeds at run time are reported as-is (smaller honest n), never topped up. The load-time power gate refuses any future manifest whose min attainable Holm p exceeds alpha."
   },
-  "history_note": "Frozen in the same commit that introduces v12_supp.py / the reviewer-response fixes; the test split has never been read by the codebase before (README previously documented only train/valid)."
+  "revision": {
+    "history": [
+      {
+        "version": 1,
+        "date": "2026-10-16",
+        "change": "initial freeze: 6 seeds, two-sided exact sign-flip, Holm/4, p_floor 0.03125",
+        "defect": "min attainable Holm p = 4 x 2/2^6 = 0.125 > 0.05 -- confirmation probability identically zero by construction (review-2 issue 1); flagged at analysis time only, as a 'conservative' warning"
+      },
+      {
+        "version": 2,
+        "date": "2026-10-17",
+        "change": "seeds 6 -> 12 (min attainable Holm p 0.125 -> 0.00195; power table recorded); added machine-checkable binding block (training_recipe_signature, test-slice rule, tokenizer fit, checkpoint stamp/hash); added scope declaration (fixed-chunk claims only); P5C now trains all four frozen arms at manifest seeds; strict record admission + freeze-lock enforced in v12_supp.py",
+        "precondition_verified": "no test-split evaluation had occurred at revision time: results_lm_test/ has never existed on any machine, no P5T/phase commit exists in git history, and load_wikitest had never been called by any driver"
+      }
+    ],
+    "rule": "any further revision requires either (a) proof that no test-split access has occurred (git history + absent lock + absent bylen records), or (b) V12_REFREEZE=1 after access, which permanently downgrades the earlier round to exploratory in DECISION_LOG.md"
+  },
+  "history_note": "v1 frozen 2026-10-16 in the commit that introduced v12_supp.py; v2 revised 2026-10-17 in the review-2 fixes commit (see DECISION_LOG.md). The test split has never been read by the codebase before (README previously documented only train/valid)."
 }

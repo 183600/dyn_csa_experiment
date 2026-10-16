@@ -3625,7 +3625,14 @@ def exact_signflip_p(deltas):
     never depends on a random draw.  Non-finite deltas are dropped (the count
     is returned).  Pure function over its input — used by the aggregate audit
     so the core panel reports the same p the per-phase suites do, rather than
-    a bare mean±std a reviewer could mistake for evidence."""
+    a bare mean±std a reviewer could mistake for evidence.
+
+    有效性假设（评审二轮·意见九，必须在预注册文档同步声明）：精确符号翻转
+    检验的 p 值正确性依赖「配对内交换性」——每个种子下的两臂共享除臂本身
+    之外的一切随机因素（同数据顺序、同评测行、同腐坏网格；初始化 RNG 按
+    种子播种，臂间参数量差异对 RNG 流的扰动属于「臂」的一部分）。种子编号
+    相同本身不提供该保证；design_notes §20 记录了本仓库逐因素的控制方式
+    与残余风险（训练随机性进入种间方差、文档抽样进入 doc 层方差）。"""
     d_in = [float(x) for x in deltas]
     d = np.asarray([x for x in d_in if math.isfinite(x)], dtype=float)
     n = int(d.size)
@@ -3705,6 +3712,109 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3):
     else:
         verdict = 'not significant at this n (p>=%.3g)' % alpha
     return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict}
+
+# ---- 预注册功效 / 分辨率工具（评审二轮·意见一/九） ------------------------------
+# 动机：一个冻结方案如果「无论数据多强都不可能达到 p_holm < α」，它不是
+# 保守，而是确认概率恒为零的构造缺陷。下面的函数把这件事变成加载清单时
+# 就能机器判定的硬门槛，而不是统计阶段的一句「保守」警告。
+
+def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
+    """双侧精确符号翻转 + Holm 校正族的最小可达 Holm p。
+
+    最小原始 p = 2/2^n（全部种子同向）；Holm 第一道门乘以族大小 m，故
+    最小可达 p_holm = min(1, m * 2/2^n)。若该值 > alpha，则该方案在构造上
+    无法确认任何比较——这是分辨率上限，不是「保守的选择」，应当在读到
+    任何测试数据之前修订（加种子 / 缩族 / 改检验），而不是事后再解释。"""
+    try:
+        n = int(n_seeds)
+        m = int(m_comparisons)
+    except (TypeError, ValueError):
+        return float('nan')
+    if n <= 0 or m <= 0:
+        return float('nan')
+    return min(1.0, m * signflip_p_floor(n))
+
+
+def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
+    """通过 Holm 第一道门所需的最小同向种子数 k_min（双侧精确检验）。
+
+    若 k 个种子同向（n−k 反向），精确双侧 p = 2·P(Bin(n, 1/2) ≤ n−k)；
+    第一道门要求 m·p < alpha。返回使 m·p(k) < alpha 的最小 k；若全部
+    n 个同向仍不够，返回 None（方案不可能确认）。"""
+    try:
+        n = int(n_seeds)
+        m = int(m_comparisons)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0 or m <= 0:
+        return None
+    total = 1 << n
+    best = None
+    for k in range(n, -1, -1):
+        tail = sum(math.comb(n, i) for i in range(0, n - k + 1))
+        p = 2.0 * tail / total
+        if m * p < alpha:
+            best = k  # keep descending: p(k) grows monotonically as k shrinks,
+            # so the last k that still clears the gate is the MINIMUM k
+        else:
+            break
+    return best
+
+
+def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
+    """每种子同向概率为 q 时，通过 Holm 第一道门的功效。
+
+    P(Bin(n, q) ≥ k_min)。q 的含义：在真效应方向上，单个种子的配对 Δ
+    落在预注册方向的概率（含种子间噪声）。功效对 q 敏感——预注册时必须
+    报告 q 的假设来源（如 validation 面板的同向率），不得只报「数学上
+    可能」。n<=0 或方案不可能确认时返回 0.0。"""
+    kmin = signflip_min_consistency(n_seeds, m_comparisons, alpha)
+    if kmin is None or kmin <= 0:
+        return 0.0 if kmin is None else 1.0
+    try:
+        n = int(n_seeds)
+        q = float(q)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (0.0 <= q <= 1.0) or n <= 0:
+        return 0.0
+    pw = sum(math.comb(n, k) * (q ** k) * ((1.0 - q) ** (n - k)) for k in range(kmin, n + 1))
+    return float(min(1.0, pw))
+
+
+def tost_paired(deltas, margin, conf=0.90):
+    """配对 TOST 等价性检验（G0 训练级等价门槛的统计件，评审二轮·意见八）。
+
+    「未发现显著差异 ≠ 等价」：等价性必须预设 margin 并检验 |mean| 落在
+    (−margin, +margin) 内。这里用配对 t 的正态近似（n 小时偏保守声明见
+    返回值 method）；返回两侧单边 p、conf 水平 CI 与 `equivalent` 判定。
+    margin 必须由计划预先注册（如 kernel/eager 面板平均 PPL 相对差 <1%）；
+    本函数不替调用方选择 margin。n<2 或 margin<=0 时不判定。"""
+    d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(float(x))], dtype=float)
+    n = int(d.size)
+    out = {'n': n, 'margin': float(margin), 'conf': float(conf), 'equivalent': None, 'method': 'paired-t normal-approx (n>=6 recommended; pre-registered margin required)'}
+    if n < 2 or not (margin > 0):
+        out['note'] = 'not decidable (n<2 or non-positive margin)'
+        return out
+    mean = float(d.mean())
+    sd = float(d.std(ddof=1))
+    out['mean'] = mean
+    se = sd / math.sqrt(n)
+    zc = {0.80: 1.2815515655446004, 0.90: 1.6448536269514722, 0.95: 1.959963984540054}.get(round(float(conf), 4))
+    if zc is None:
+        zc = 1.6448536269514722
+        out['note'] = 'conf not in {0.80, 0.90, 0.95}: fell back to 0.90'
+    out['ci'] = [mean - zc * se, mean + zc * se]
+    if se <= 1e-300:
+        p_hi = 1.0 if mean > margin else 0.0  # degenerate: mean above the upper bound cannot be rejected as 'below it'
+        p_lo = 1.0 if mean < -margin else 0.0
+    else:
+        p_hi = 0.5 * math.erfc((margin - mean) / (math.sqrt(2.0) * se))  # H0: mean >= margin  (P(Z >= (margin-mean)/se))
+        p_lo = 0.5 * math.erfc((mean + margin) / (math.sqrt(2.0) * se))  # H0: mean <= -margin  (P(Z <= (-margin-mean)/se) = 0.5*erfc((mean+margin)/(sqrt2*se)))
+    out['p_tost'] = float(max(p_hi, p_lo))
+    out['equivalent'] = bool(p_hi < 0.05 and p_lo < 0.05)
+    out['ci_within_margin'] = bool(out['ci'][0] > -margin and out['ci'][1] < margin)
+    return out
 
 # `mt` (matched-variant set) and `mr` (mlp_match_ref) can themselves contain
 # underscores (e.g. `full_rope`, `csa_dynamic`), so those two values are

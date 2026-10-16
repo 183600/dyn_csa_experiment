@@ -57,13 +57,30 @@ P3MT_PAYLOAD_CONTROLS = dict(P3MT_PAYLOAD, variants=SCRATCH_CONTROLS)
 # 干扰注入的腐坏模式（评审点 3）：
 #   uniform —— 既有协议：远端 ρ 比例 token 替换为词表均匀随机 token（历史
 #              cell 键不带 mode 后缀，完全向后兼容）；
-#   natural —— 自然干扰：被替换 token 取自同一验证面板的另一条真实序列的
-#              相同位置（保持自然语言统计、破坏与目标的相关性）；
+#   natural —— 真实 token 同位置换（评审二轮·意见六概念更名）：保持
+#              unigram/词频统计，但逐位置拼接破坏句法、语义与篇章结构——
+#              只支持「对真实语料 token 替换的鲁棒性」，不支持「对自然
+#              长文档干扰的鲁棒性」（报告标签 realistic-token，§15 修订）；
 #   mask    —— 远端整体屏蔽为 <pad>（保留长度与位置，移除信息）：测「干净
-#              远端上下文到底带来多少收益」；
+#              远端上下文到底带来多少收益」。<pad> 对远端是分布外输入，
+#              只作互补探针、与 delete 成对解读（§15 修订）；
 #   delete  —— 远端整体删除（输入只剩目标区，RoPE 相对位置自洽）：同上
-#              问题的另一口径。
-PROBE_MODES = {'uniform': [0.0, 0.125, 0.25, 0.5], 'natural': [0.125, 0.25, 0.5], 'mask': [1.0], 'delete': [1.0]}
+#              问题的另一口径，同时改变长度与上下文结构；
+#   span    —— 连续句段替换（评审二轮·意见六新增）：远端 k 个 token 换成
+#              供体行的连续片段（段长 PROBE_SPAN_LEN，默认 32）——段内保
+#              持局部句法，段间与跨位置连贯性被破坏；ρ 为名义值，实际
+#              替换量 = 段数 × 段长（可由同一确定性公式复算）；
+#   doc     —— 完整无关文档上下文替换（ρ 恒 1.0，新增）：远端整段换成
+#              供体行的连续等长切片（协议不允许改变 eval_len，故以等长
+#              替换实现「插入无关文档」的科学问题，长度与位置受控）；
+#   topical —— 主题相近供体的同位置替换（新增）：供体行 = 与本行远端
+#              unigram Jaccard 相似度最高的其他行（确定性、无 RNG），
+#              再做 natural 式同位置替换——「主题相近但答案无关」的
+#              最廉价近似。
+#   全部模式的腐坏只依赖 (eval_len, 行号, ρ, mode, span_len)——与臂/模型
+#   种子无关，同一 (行, ρ, mode) 在臂间逐字节相同，严格配对成立。
+PROBE_MODES = {'uniform': [0.0, 0.125, 0.25, 0.5], 'natural': [0.125, 0.25, 0.5], 'mask': [1.0], 'delete': [1.0], 'span': [0.125, 0.25, 0.5], 'doc': [1.0], 'topical': [0.25, 0.5]}
+PROBE_SPAN_LEN = 32
 NIAH_NATURAL = dict(summary='results_v10_mech/niah_natural.json', n_pairs=8, n_seq=16, conditions=['clean', 'distract'], rho=0.5)
 PROBE = dict(outdir='results_v10_mech', ckpt_dir='results_v10_mech/ckpt', summary='results_v10_mech/distractor.json', variants=['csa_fixed_rope', 'full_rope'], seeds=[0, 1, 2], eval_lens=[2048, 4096], rhos=[0.0, 0.125, 0.25, 0.5], modes=dict(PROBE_MODES), target=512, n_seq=16, chunk=4, arms=['dense', 'learned', 'randidx', 'allblocks'], arm_overrides={}, niah=dict(NIAH_NATURAL))
 
@@ -75,7 +92,118 @@ def _arm_of(variant, arm, cfg=None):
         return arm == 'dense'
     return arm in ('learned', 'randidx', 'allblocks')
 
-MASK_TOKEN_ID = 0  # <pad>：mask 模式的远端屏蔽填充 token
+MASK_TOKEN_ID = 0  # <pad>：mask 模式的远端屏蔽填充 token（分布外输入，§15 修订已声明）
+
+_CORRUPT_MODES = ('uniform', 'natural', 'mask', 'delete', 'span', 'doc', 'topical')
+
+
+def _topical_donor(val_ids, jj, n_far, exclude):
+    """Deterministic most-similar donor row for the `topical` mode.
+
+    供体 = 与第 jj 行远端 unigram 集合 Jaccard 相似度最高的其他行（排除
+    自身与 `exclude`）。纯整数/集合运算、无 RNG、无臂依赖——同一 (面板,
+    行号) 在臂间给出同一供体，严格配对不受影响。平手时取行号最小者
+    （集合运算的确定性顺序）。"""
+    rows = val_ids.shape[0]
+    _base = set(np.asarray(val_ids[jj, :n_far], dtype=np.int64).tolist())
+    best, best_sim = None, -1.0
+    for cand in range(rows):
+        if cand == jj or cand in exclude:
+            continue
+        _c = set(np.asarray(val_ids[cand, :n_far], dtype=np.int64).tolist())
+        if not _base and not _c:
+            sim = 0.0
+        else:
+            inter = len(_base & _c)
+            union = len(_base | _c)
+            sim = (inter / union) if union else 0.0
+        if sim > best_sim:
+            best, best_sim = cand, sim
+    return best
+
+
+def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE_SPAN_LEN):
+    """Build ONE corrupted evaluation row (pure, arm/model-seed independent).
+
+    输入 val_ids 为 (n_rows, >=eval_len+1) 的 token 面板；返回长度
+    eval_len+1 的 int64 行。四种历史模式（uniform/natural/mask/delete）与
+    既有实现逐字节一致（同一 RNG 播种、同一调用顺序——见 _distractor_ppls
+    的行缓存键）。三种新模式（span/doc/topical，评审二轮·意见六）同样只
+    依赖 (eval_len, jj, rho, mode, span_len)，保证臂间严格配对。"""
+    n_far = eval_len - target
+    if mode not in _CORRUPT_MODES:
+        raise ValueError(f'_corrupt_row: unknown corruption mode {mode!r} (expected one of {_CORRUPT_MODES})')
+    if mode in ('mask', 'delete', 'doc') and abs(float(rho) - 1.0) > 1e-9:
+        raise ValueError(f"mode {mode!r} is an all-or-nothing condition and only admits rho=1.0 (got {rho!r}); partial masking is a different question and is not this probe")
+    if mode == 'delete':
+        # the far context is REMOVED, not filled: the model sees only
+        # the final target+1 tokens (RoPE is relative, so the kept
+        # tokens' pairwise structure is unchanged)
+        return np.asarray(val_ids[jj, eval_len - target:eval_len + 1], dtype=np.int64).copy()
+    ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
+    k = int(round(rho * n_far))
+    if mode == 'mask':
+        ids[:n_far] = MASK_TOKEN_ID
+        return ids
+    if mode == 'doc':
+        # whole far context replaced by ONE contiguous slice of another row
+        # (length- and position-controlled "unrelated document" context)
+        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
+        _src = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
+        _row_len = min(val_ids.shape[1], eval_len + 1)
+        _max_off = _row_len - n_far
+        _off = int(rng.integers(0, max(1, _max_off))) if _max_off > 0 else 0
+        ids[:n_far] = np.asarray(val_ids[_src, _off:_off + n_far], dtype=np.int64)
+        return ids
+    if k <= 0:
+        return ids
+    if mode == 'uniform':
+        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
+        pos = rng.choice(n_far, size=k, replace=False)
+        _draw = rng.integers(0, vocab, size=k)
+        _same = _draw == ids[pos]
+        while _same.any():
+            _draw[_same] = rng.integers(0, vocab, size=int(_same.sum()))
+            _same = _draw == ids[pos]
+        ids[pos] = _draw
+        return ids
+    if mode in ('natural', 'topical'):
+        # natural: paired other-row realistic tokens at the same seeded
+        # position grid; collisions with the original token are KEPT (they
+        # are part of the realistic-token statistics).
+        # topical: same protocol, but the donor row is the most unigram-similar
+        # row (topic proxy) instead of the fixed-offset row.
+        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
+        pos = rng.choice(n_far, size=k, replace=False)
+        if mode == 'topical':
+            _nat = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
+            _src = _topical_donor(val_ids, jj, n_far, exclude={_nat})
+            if _src is None:
+                _src = _nat
+        else:
+            _src = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
+        ids[pos] = np.asarray(val_ids[_src, pos], dtype=np.int64)
+        return ids
+    if mode == 'span':
+        # contiguous sentence-like segments from the donor row: local syntax
+        # inside each span survives, cross-span coherence is destroyed.
+        # actual coverage = len(starts) * seg (recomputable from the same
+        # deterministic formula — rho is nominal for this mode).
+        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
+        seg = max(1, int(span_len))
+        n_seg = max(1, int(math.ceil(k / seg)))
+        seg = min(seg, n_far)
+        _row_len = min(val_ids.shape[1], eval_len + 1)
+        _starts_hi = n_far - seg + 1
+        starts = rng.choice(_starts_hi, size=min(n_seg, _starts_hi), replace=False)
+        _src = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
+        _off_hi = _row_len - seg + 1
+        for s in starts:
+            o = int(rng.integers(0, _off_hi)) if _off_hi > 1 else 0
+            ids[int(s):int(s) + seg] = np.asarray(val_ids[_src, o:o + seg], dtype=np.int64)
+        return ids
+    raise ValueError(f'_corrupt_row: unknown corruption mode {mode!r} (expected one of {_CORRUPT_MODES})')
+
 
 @torch.inference_mode()
 def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, chunk_mem=None, mode='uniform'):
@@ -98,10 +226,11 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
     n_ch = max(1, int(cfg['chunk']))
     if chunk_mem is not None:
         n_ch = max(1, min(n_ch, int(chunk_mem.get(eval_len, n_ch))))
-    if mode not in ('uniform', 'natural', 'mask', 'delete'):
-        raise ValueError(f'_distractor_ppls: unknown corruption mode {mode!r} (expected uniform/natural/mask/delete)')
-    if mode in ('mask', 'delete') and abs(float(rho) - 1.0) > 1e-9:
+    if mode not in _CORRUPT_MODES:
+        raise ValueError(f'_distractor_ppls: unknown corruption mode {mode!r} (expected one of {_CORRUPT_MODES})')
+    if mode in ('mask', 'delete', 'doc') and abs(float(rho) - 1.0) > 1e-9:
         raise ValueError(f"mode {mode!r} is an all-or-nothing condition and only admits rho=1.0 (got {rho!r}); partial masking is a different question and is not this probe")
+    _span_len = int(cfg.get('span_len') or PROBE_SPAN_LEN)
     i = 0
     while i < n_seq:
         j = min(i + n_ch, n_seq)
@@ -110,35 +239,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
             _rk = (eval_len, jj, float(rho), vocab, int(cfg['target']), mode)
             _row = row_cache.get(_rk) if row_cache is not None else None
             if _row is None:
-                if mode == 'delete':
-                    # the far context is REMOVED, not filled: the model sees only
-                    # the final target+1 tokens (RoPE is relative, so the kept
-                    # tokens' pairwise structure is unchanged)
-                    _row = np.asarray(val_ids[jj, eval_len - target:eval_len + 1], dtype=np.int64).copy()
-                else:
-                    ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
-                    k = int(round(rho * n_far))
-                    if mode == 'mask':
-                        ids[:n_far] = MASK_TOKEN_ID
-                    elif k > 0:
-                        if mode == 'uniform':
-                            rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
-                            pos = rng.choice(n_far, size=k, replace=False)
-                            _draw = rng.integers(0, vocab, size=k)
-                            _same = _draw == ids[pos]
-                            while _same.any():
-                                _draw[_same] = rng.integers(0, vocab, size=int(_same.sum()))
-                                _same = _draw == ids[pos]
-                            ids[pos] = _draw
-                        else:
-                            # natural: paired other-row natural tokens at the same
-                            # seeded position grid; collisions with the original
-                            # token are KEPT (they are part of natural statistics)
-                            rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
-                            pos = rng.choice(n_far, size=k, replace=False)
-                            _src = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
-                            ids[pos] = np.asarray(val_ids[_src, pos], dtype=np.int64)
-                    _row = ids
+                _row = _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=_span_len)
                 if row_cache is not None:
                     row_cache[_rk] = _row
             rows.append(_row)
@@ -566,13 +667,20 @@ P3SL_TOK_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_l8k', steps=8000)
 P3SL_FLOP_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_lflop', steps=None)
 
 def _flop_matched_steps(small_cfg, large_cfg, min_steps=250):
-    """Deterministic equal-total-compute step count for the large scale arm.
+    """Deterministic equal-total-compute PROXY step count for the large arm.
 
-    计算量用 6·N·D 代理（N=参数量，D=token 数）：先在 CPU 上按面板配置
-    构建两个面板的模型（不碰 DEVICE、无 RNG 副作用），取两臂（csa/full）
-    参数量的平均值，large_steps = small_steps · N_small / N_large。结果打印
-    完整推导以供审计；确定性：同一代码下重复调用逐位相同（count_params 是
-    形状的纯函数）。步数下限 250（warmup=100 时余下学习率调度仍有意义）。"""
+    评审二轮·意见七修订：这里的「等计算」是 6·N·D 参数量代理（N=参数量，
+    D=token 数），**不是实测等 FLOPs**——稀疏选择、池化、注意力与激活重算
+    的成本不与参数量成比例；若触发步数下限，也会偏离原目标预算。面板报告
+    必须把它称为「6ND 参数量代理预算臂」，并同时报告实际 token 数、参数
+    量、估篇 FLOPs（audit_gates.train_flops_estimate）与 TimeGuard 实测
+    耗时；等 token 与等算力是不同问题，须分别陈述。步数推导：先在 CPU
+    上按面板配置构建两个面板的模型（不碰 DEVICE、无 RNG 副作用），取两
+    臂（csa/full）参数量的平均值，large_steps = small_steps ·
+    N_small / N_large。结果打印完整推导以供审计；确定性：同一代码下重复
+    调用逐位相同（count_params 是形状的纯函数）。步数下限 250（warmup=100
+    时余下学习率调度仍有意义）——触发下限时必须如实报告「代理预算被下限
+    偏离」，不得写成严格匹配。"""
     counts = {}
     deriv = []
     for _tag, _cfg in (('small', small_cfg), ('large', large_cfg)):
@@ -586,8 +694,9 @@ def _flop_matched_steps(small_cfg, large_cfg, min_steps=250):
         counts[_tag] = float(np.mean(list(_per.values())))
         deriv.append(f'{_tag}: { { _v: int(_n) for _v, _n in _per.items() } } (mean {counts[_tag]:.0f})')
     _ratio = counts['small'] / counts['large']
-    steps = max(int(min_steps), int(round(small_cfg['steps'] * _ratio)))
-    print(f'[v10] flop-matched steps: {'; '.join(deriv)}; ratio={_ratio:.6g} -> large_steps={steps} (floored at {min_steps})')
+    _raw = int(round(small_cfg['steps'] * _ratio))
+    steps = max(int(min_steps), _raw)
+    print(f'[v10] 6ND-param-proxy-matched steps (a PROXY, not measured FLOPs): {"; ".join(deriv)}; ratio={_ratio:.6g} -> large_steps={steps}' + (f'  [NOTE: floored at {min_steps} (raw {_raw}) — the proxy budget is deviated by the floor, report it as such]' if steps > _raw else ''))
     return steps
 
 PHASES = [('P3MT', 'lenphase', P3MT_PAYLOAD, [0, 1, 2]), ('P3MTC', 'lenphase', P3MT_PAYLOAD_CONTROLS, [0, 1, 2]), ('P3MP', 'probe', PROBE, None), ('P3T', 'run', V9.P2T_CFG, [2, 3]), ('P3SS', 'run', P3SS_CFG, [0, 1]), ('P3SL', 'run', P3SL_CFG, [0, 1]), ('P3SL2', 'run', P3SL_TOK_CFG, [0, 1]), ('P3SL3', 'run', P3SL_FLOP_CFG, [0, 1])]
@@ -910,10 +1019,16 @@ def _panel_endpoint(hists, tps):
     return out
 
 def _panel_convergence(hists):
-    """Plateau diagnostic per (variant, seed): relative PPL improvement over
-    the last quarter of the eval grid — evidence (or its absence) that the
-    panel is trained to (near-)convergence before any 'post-convergence
-    advantage reversal' claim (review point 1)."""
+    """Plateau-in-budget diagnostic per (variant, seed) — NOT a convergence
+    proof (review-2 issue 7 revision).
+
+    相对 PPL 改进 < 1%（最后四分之一 eval 窗口）只能排除「仍在快速下降」
+    的情形；学习率衰减、平台期、评测噪声或优化停滞都可能满足该条件。
+    因此本诊断只允许谈论「预算内平台期后」的读数（crossing-after-plateau-
+    under-budget），不得写成「收敛后」或「渐近优势反转」——后者需要更长
+    训练、合理学习率续训与重复验证（design_notes §16 修订）。保留
+    `plateaued` 键以兼容既有分析产物；新增 `claim_allowed` 明示允许的
+    主张级别。"""
     out = {}
     for v, h in hists.items():
         per_seed = {}
@@ -928,7 +1043,7 @@ def _panel_convergence(hists):
             rel = (q[1] - last[1]) / denom
             per_seed[s] = {'rel_improve_last_quarter': float(rel), 'plateaued': bool(rel < 0.01)}
         _vals = [x['rel_improve_last_quarter'] for x in per_seed.values() if math.isfinite(x['rel_improve_last_quarter'])]
-        out[v] = {'per_seed': per_seed, 'median_rel_improve': float(np.median(_vals)) if _vals else float('nan'), 'n_plateaued': int(sum((1 for x in per_seed.values() if x['plateaued']))), 'n': len(per_seed)}
+        out[v] = {'per_seed': per_seed, 'median_rel_improve': float(np.median(_vals)) if _vals else float('nan'), 'n_plateaued': int(sum((1 for x in per_seed.values() if x['plateaued']))), 'n': len(per_seed), 'diagnostic': 'plateau-in-budget (NOT proof of convergence: lr decay, stalls or eval noise can also satisfy it)', 'claim_allowed': 'crossing-after-plateau-under-budget only; asymptotic/post-convergence claims need longer training + lr-continuation + replication'}
     return out
 
 def _equal_token_slices():
@@ -1108,9 +1223,16 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     if not other or not _pairable(learned, other, Ln, rho, tag):
                         continue
                     _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other)
-                # mismatch decomposition: test-time intervention minus the
-                # trained-with-that-selection control at the same (L, rho)
-                for tag, tt_arm, sv in (('mismatch(random): csa+randidx - csa_randtrain', 'randidx', 'csa_fixed_rope_randidx'), ('mismatch(allblocks): csa+allblocks - csa_alltrain', 'allblocks', 'csa_fixed_rope_allblocks')):
+                # intervention-vs-retrain gap (review-2 issue 5: NOT a causal
+                # mismatch decomposition): test-time intervention minus the
+                # trained-with-that-selection control at the same (L, rho).
+                # For losses the positive direction means the intervention
+                # scores WORSE than retraining that selection — a gap that MAY
+                # itself contain train/test-mismatch cost (plus optimisation
+                # adaptation and parameter differences), so it must be read as
+                # a raw performance gap, never as 'the part that cannot be
+                # attributed to mismatch'.
+                for tag, tt_arm, sv in (('retrain-gap(random): csa+randidx - csa_randtrain', 'randidx', 'csa_fixed_rope_randidx'), ('retrain-gap(allblocks): csa+allblocks - csa_alltrain', 'allblocks', 'csa_fixed_rope_allblocks')):
                     tt = cell_mean('csa_fixed_rope', tt_arm, Ln, rho, 'uniform')
                     sc = cell_mean(sv, 'learned', Ln, rho, 'uniform')
                     if not tt or not sc or not _pairable(tt, sc, Ln, rho, tag):
@@ -1487,7 +1609,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         for k, v in sorted(_new_c.items()):
             A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v.get('cohens_dz', float('nan')):+.2f} | {v['p_exact_signflip']:.3f} | {v.get('p_floor', float('nan')):.3f} |')
         A('')
-        A('> `mismatch(…)` 行 = 测试时干预 − 同预算从头训练对照（同 L、同 ρ）：正值说明性能损失中**不能**归因于「训练分布失配」的部分；`arch-aligned` 行 = dense − 全块 CSA 孪生（两者仅剩 KV 压缩投影与分块读取方式之差）。')
+        A('> `retrain-gap(…)` 行 = 测试时干预 − 同预算从头训练对照（同 L、同 ρ）。评审二轮·意见五修订：对越低越好的损失，正值说明干预比重新训练**更差**，该差距本身**可能包含**训练—测试失配的代价，也混合了优化适应与参数差异——它是「干预与重新训练的性能差」，**不是**已完成的因果失配分解，不得把简单相减解释为「不能归因于失配的部分」。`arch-aligned` 行 = dense − 全块 CSA 孪生（两者仅剩 KV 压缩投影与分块读取方式之差）。')
         A('')
     # ---- ΔNLL：污染增量（评审点 3）----
     dnll = probe.get('delta_nll') or {}
@@ -1602,9 +1724,9 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         A('')
     sc = st.get('scale_confounds') or {}
     if sc:
-        A('### P3S-2 规模混杂控制（评审点 1：等训练 token / 等计算预算 / 收敛证据）')
+        A('### P3S-2 规模混杂控制（评审点 1 + 评审二轮·意见七修订：等训练 token / 6ND 代理预算 / 预算内平台期）')
         A('')
-        A('**背景**：P3SS（d=128/4L，8000 步 ≈ 49.15M token）与 P3SL（d=512/10L，4000 步 ≈ 24.58M token）的累计 token 相差一倍——跨规模终点差异不能单独归因于规模。本节把同一批曲线在**相同累计 token**处切片配对（gap_L − gap_S，逐种子），并给出等 token（`P3SL_TOK`，8000 步）与等计算预算（`P3SL_FLOP`，按参数量比例缩步数）两个大模型臂，以及各面板的收敛（平台期）诊断。')
+        A('**背景**：P3SS（d=128/4L，8000 步 ≈ 49.15M token）与 P3SL（d=512/10L，4000 步 ≈ 24.58M token）的累计 token 相差一倍——跨规模终点差异不能单独归因于规模。本节把同一批曲线在**相同累计 token**处切片配对（gap_L − gap_S，逐种子），并给出等 token（`P3SL_TOK`，8000 步）与 6ND 参数量代理预算（`P3SL_FLOP`，按参数量比例缩步数——**代理预算，非实测等 FLOPs**，须另见实测耗时与估篇 FLOPs）两个大模型臂，以及各面板的预算内平台期诊断（平台期 ≠ 收敛，只支持「预算内平台期后」读数）。')
         A('')
         _panels = sc.get('panels') or {}
         if _panels:
@@ -1624,8 +1746,10 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             A('')
             _conv_warn = [name for name, e in _panels.items() if e.get('status') == 'ok' and any(((e.get('convergence') or {}).get(v) or {}).get('n_plateaued', 0) == 0 for v in ('csa_fixed', 'full'))]
             if _conv_warn:
-                A(f'> **收敛证据不足**：{_conv_warn} 面板在最后四分之一 eval 窗口的相对改进 ≥1%（未平台化）——「收敛后优势反转」的主张在该面板上**不成立**，只有「窗口内交叉」的读数有效。')
+                A(f'> **预算内平台期证据不足**：{_conv_warn} 面板在最后四分之一 eval 窗口的相对改进 ≥1%（未平台化）——「平台期后交叉」的主张在该面板上**不成立**，只有「窗口内交叉」的读数有效。')
                 A('')
+            A('> 评审二轮·意见七：即使全部种子平台化，也只允许「预算内平台期后交叉」的读数；「渐近优势反转」「收敛后更差」需要更长训练、学习率续训与重复验证，本面板不提供。')
+            A('')
         _slices = sc.get('equal_token_slices') or {}
         if _slices:
             A('**等 token 切片（gap_L − gap_S，同累计 token 处逐种子配对；>0 = 大模型在同 token 处 CSA−dense 差距更大）：**')
@@ -1673,11 +1797,11 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A('| 路径 | 内容 |')
     A('|---|---|')
-    A('| `results_v10_mech/` | P3M：两臂重训权重（ckpt/，*.pt 不入库）+ by-length 复现表 + 干扰注入探针 `distractor.json`（uniform/natural/mask/delete 模式）+ NIAH-natural `niah_natural.json` |')
+    A('| `results_v10_mech/` | P3M：两臂重训权重（ckpt/，*.pt 不入库）+ by-length 复现表 + 干扰注入探针 `distractor.json`（uniform/natural/mask/delete + 评审二轮新增 span/doc/topical 模式；natural = realistic-token，§15 修订）+ NIAH-natural `niah_natural.json` |')
     A('| `results_lm_v10_scale_s/` | P3S：d=128/4L 交叉定位面板（8000 步） |')
     A('| `results_lm_v10_scale_l/` | P3S：d=512/10L 交叉定位面板（4000 步） |')
     A('| `results_lm_v10_scale_l8k/` | P3S-2：等 token 大模型臂（8000 步，评审点 1） |')
-    A('| `results_lm_v10_scale_lflop/` | P3S-2：等计算预算大模型臂（评审点 1） |')
+    A('| `results_lm_v10_scale_lflop/` | P3S-2：6ND 参数量代理预算大模型臂（非实测等 FLOPs，评审点 1） |')
     A('| `results_lm_v9_seq2k/` | P3T：topk 扫描追加 seeds 2/3 后的 4-seed 面板 |')
     A('| `analysis_v10/stats.json` | 探针对比（含 ΔNLL、Holm）、交叉定位、等 token 切片与配对符号翻转检验 |')
     A('| `v10_supp.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')

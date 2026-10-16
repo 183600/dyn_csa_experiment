@@ -27,9 +27,11 @@ needed to reproduce the results on a machine of your own.
 | `v9_supp.py` | **the v9 driver**: P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
 | `v10_supp.py` | **the v10 driver**: P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
 | `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
-| `v12_supp.py` | **the v12 confirmation driver (reviewer-response)**: P5C trains the from-scratch selector controls (`csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`) at n=6, P5MP runs the extended corruption-mode probe (uniform/natural/mask/delete + NIAH-natural) at n=6, P5S2/P5S3 add the token-matched and compute-matched large-scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` |
-| `confirmation_frozen.json` | **pre-registered confirmation plan** (tracked): frozen arms, seeds 0-5, endpoints, exact sign-flip + Holm, decision rule — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
-| `DECISION_LOG.md` | **decision log** (tracked): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail |
+| `v12_supp.py` | **the v12 confirmation driver (reviewer-response + review-2 hardening)**: P5C trains all four frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-document PPL records |
+| `confirmation_frozen.json` | **pre-registered confirmation plan v2** (tracked): frozen arms, seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
+| `DECISION_LOG.md` | **decision log** (tracked, restored 2026-10-17): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail; formal releases additionally archive per-seed results via `archive_release.py` |
+| `audit_gates.py` | **review-2 verification entry points** (zero-experiment): data-leakage audits (tokenizer provenance, vocab identity, train/test overlap), CPU causality unit checks (prefix invariance, label shift, decode consistency), block-attribution / boundary-vs-random / length-consistency / baseline-fairness / failure-concentration / budget-reconciliation audits and prefill-decode-kv-growth measurement utilities |
+| `archive_release.py` | **immutable evidence archiver**: packs per-release artifacts (results, analyses, reports, freeze lock, decision log, environment, checkpoint hashes) into a tar.gz with a per-file SHA-256 manifest and an independent `verify` subcommand — the git repo stays source-only (design_notes §8) while every formal release gets an auditable fixed archive |
 | `m0_supp.py` | **the M0/S1 driver (adopted B tier)**: entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below and `docs/compute_plan.md` |
 | `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk, never hard-coded) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
@@ -226,8 +228,9 @@ P3MTC (**from-scratch selector controls under the exact same budget**:
 `csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`; the latter doubles as
 the item-by-item-aligned dense twin), P3MP (eval-only far-distance distractor
 injection: paired corrupted contexts, clean 512-token target, learned-selection
-vs dense vs random-indexer vs see-everything arms, **uniform / natural /
-mask / delete corruption modes** + the NIAH-natural far-necessity task), P3T
+vs dense vs random-indexer vs see-everything arms, **uniform /
+realistic-token (natural) / mask / delete + review-2 span / doc / topical
+corruption modes** + the NIAH-natural far-necessity task), P3T
 (topk sweep seeds 2/3 → n=4), P3SS/P3SL (d=128/4L 8000-step and d=512/10L
 4000-step crossover panels), P3SL2/P3SL3 (**token-matched and
 compute-matched large arms** — the scale-confound fix; see
@@ -241,8 +244,8 @@ distinction (§18).
 
 ```bash
 python v12_supp.py smoke           # end-to-end self-check (tiny ckpts + a smoke freeze manifest)
-python v12_supp.py phase P5C       # selector controls to n=6 (resumable; 0-2 covered by P3MTC)
-python v12_supp.py phase P5MP      # extended probe (all modes + NIAH + controls) to n=6
+python v12_supp.py phase P5C       # train all four frozen arms at the manifest seed list (resumable; 0-5 main arms covered by P3MT/P4MT)
+python v12_supp.py phase P5MP      # extended probe (all modes + NIAH + controls) at the manifest seed list
 python v12_supp.py phase P5S2      # token-matched large scale arm (8000 steps)
 python v12_supp.py phase P5S3      # compute-matched large scale arm (param-ratio steps)
 python v12_supp.py phase P5T       # FROZEN final test on wiki.test.raw (requires the freeze manifest)
@@ -250,12 +253,31 @@ python v12_supp.py analysis        # zero-GPU: shared v10 stats + frozen final-t
 python v12_supp.py report          # rebuild REPORT_v12.md from disk (zero GPU)
 ```
 
-P5T refuses to run without `confirmation_frozen.json`, and refuses again if
-the code-semantics stamp no longer matches the manifest (a conscious re-freeze
-is required). The test split (`wiki.test.raw`, via `load_wikitest`) is read by
-P5T **only** — every earlier phase reads train/valid exclusively. After the
-first test-split evaluation, no frozen comparison or seed may be added
-(selection bias by construction; see `DECISION_LOG.md`).
+P5T refuses to run without `confirmation_frozen.json`, refuses a manifest whose
+smallest attainable Holm p exceeds alpha (a plan that cannot confirm is a design
+defect, not conservatism — the seed count was revised 6 -> 12 before any
+test-split access for exactly this reason), refuses records that fail the
+strict admission gate (seed whitelist, uniqueness, non-null test-slice
+fingerprint, code/recipe match, manifest sha binding), and locks the plan at
+the first test-split access (`.freeze_lock.json`). The test split
+(`wiki.test.raw`, via `load_wikitest`) is read by P5T **only** — every earlier
+phase reads train/valid exclusively. After the first test-split evaluation, no
+frozen comparison or seed may be added (selection bias by construction; see
+`DECISION_LOG.md`).
+
+**Scope (review-2 issue 4)**: the confirmation covers ONLY fixed-chunk CSA
+mechanism claims. Dynamic chunking vs fixed chunking, semantic boundary value,
+HCA advantages and dynamic-chunking scaling laws are NOT covered by this
+freeze and need their own pre-registration.
+
+**Verification entry points (review-2 issue 11)** — zero-experiment audits:
+
+```bash
+python audit_gates.py causality   # CPU unit audit: prefix invariance / label shift / decode consistency
+python audit_gates.py leakage     # tokenizer provenance, vocab identity, train/test overlap
+python audit_gates.py report      # run every locally-verifiable audit -> audit_report.json
+python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # dry-run an evidence archive
+```
 
 ### v8 / v9 close-out suites
 

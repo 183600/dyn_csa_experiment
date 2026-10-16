@@ -1549,6 +1549,14 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                 _ntok = int(ids.shape[0]) * (Ln - 1)
                 ppl = math.exp(_t / max(_ntok, 1))
                 out[Ln] = {'ppl': float(ppl), 'n_tok': _ntok, 'truncated': False, 'eval_span': Ln}
+                # per-document rows (review-2 issue 9b): the pooled ppl above is
+                # UNCHANGED (same reduction); these extra rows only make the
+                # document-sampling uncertainty visible and stratifiable
+                # (doc-level deltas vs seed-level variance).  Rows are the
+                # panel's fixed eval rows, so the list order is stable.
+                if Ln >= 2:
+                    out[Ln]['ppl_per_seq'] = [float(math.exp(float(v) / (Ln - 1))) for v in _cum[:, Ln - 2].tolist()]
+                    out[Ln]['n_seq'] = int(ids.shape[0])
             del x, nll_cols, _cum
             if device.type == 'cuda':
                 torch.cuda.empty_cache()

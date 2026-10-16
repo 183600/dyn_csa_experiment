@@ -25,9 +25,11 @@
 | `v9_supp.py` | **v9 驱动**：P2T（seq-2048 的 topk 扫描，`batch_size=1`）与 P2S3（RoPE 20k 长跑的第三个 seed） |
 | `v10_supp.py` | **v10 驱动**：P3M 长度外推机制 + 干扰项注入探针、P3S 交叉面板扩规模、P3T topk 扫描补至 4 seeds |
 | `v11_supp.py` | **v11 驱动**：统计收尾——干扰探针扩到 n=6（P4MT/P4MP）、交叉面板扩到 n=4（P4S）、d=384 配对臂扩到 n=4（P4F） |
-| `v12_supp.py` | **v12 确认驱动（评审响应）**：P5C 把从头训练的选择器对照（`csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`）补到 n=6，P5MP 跑扩展腐坏模式探针（uniform/natural/mask/delete + NIAH-natural）到 n=6，P5S2/P5S3 补等 token 与等计算预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估** |
-| `confirmation_frozen.json` | **预注册冻结清单**（入库）：冻结臂、种子 0-5、终点、精确符号翻转 + Holm、决策规则——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
-| `DECISION_LOG.md` | **决策日志**（入库）：每个版本为什么跑/不跑什么、看到什么、据此决定了什么——探索/确认分离的书面轨迹 |
+| `v12_supp.py` | **v12 确认驱动（评审响应 + 评审二轮加固）**：P5C 按清单种子列表训练全部四个冻结臂，P5MP 跑扩展腐坏模式探针（uniform/realistic-token/mask/delete + 评审二轮新增 span/doc/topical + NIAH-natural），P5S2/P5S3 补等 token 与 6ND 参数量代理预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估**——含加载期功效硬门槛（数学上不可能确认的清单直接拒绝）、严格记录准入（种子白名单/唯一记录/单一冻结切片/配方签名/manifest 哈希）、首次访问冻结锁与逐文档 PPL 落盘 |
+| `confirmation_frozen.json` | **预注册冻结清单 v2**（入库）：冻结臂、种子 0-11（在任何 test-split 访问**之前**由 6 修订为 12，含功效表）、终点、精确符号翻转 + Holm、决策规则、机器可校验的绑定块与范围声明——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
+| `DECISION_LOG.md` | **决策日志**（入库，2026-10-17 恢复）：每个版本为什么跑/不跑什么、看到什么、据此决定了什么——探索/确认分离的书面轨迹；正式版本的逐种子证据另由 `archive_release.py` 归档 |
+| `audit_gates.py` | **评审二轮的可执行审计入口**（零实验）：数据泄漏（分词器来源/词表一致性/文档重叠）、纯 CPU 因果性单元审计（前缀不变性/标签移位/解码一致性）、分块归因/边界 vs 随机基线/长度口径/基线公平/失败集中度/预算对账与 prefill-decode-内存测量工具 |
+| `archive_release.py` | **不可变证据归档器**：把每个正式版本的产物（结果/分析/报告/冻结锁/决策日志/环境/权重哈希）打包为带逐文件 sha256 清单的 tar.gz，附独立 verify 子命令——Git 主仓仍只承载源码（design_notes §8），归档发布到只读位置 |
 | `m0_supp.py` | **M0/S1 驱动（已选定 B 档）**：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力吞吐基准）、`full`（S1 主面板）；见下文“B 档 M0/S1”与 `docs/compute_plan.md` |
 | `build_report.py` | 零 GPU 报告构建器：从 `results_*/` + `analysis_*/` 产物重建 v7 报告（所有数字现算，绝不硬编码） |
 | `fuse_analysis.py` | 零 GPU fuse 对比驱动：从 `results_*/summary.json` 重算逐层边界对齐（tol=1）、块长统计与 PPL 曲线 |
@@ -204,32 +206,50 @@ python v10_supp.py report         # 从磁盘重建 REPORT_v10.md（零 GPU）
 从头训练的选择器对照**：`csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`，
 后者同时充当逐项对齐的 dense 孪生臂）、P3MP（仅评估的远距离干扰注入：
 成对污染上下文、干净的 512-token 目标，对比 learned-selection / dense /
-random-indexer / see-everything 各臂，**uniform / natural / mask / delete
-四种腐坏模式** + NIAH-natural 远端必要信息任务）、P3T（topk 扫描
-seeds 2/3 → n=4）、P3SS/P3SL（d=128/4L 8000 步与 d=512/10L 4000 步交叉
-面板）、P3SL2/P3SL3（**等 token 与等计算预算的大模型臂**——规模混杂修复，
-见 `docs/design_notes.md` §16）。成对污染协议、预注册交叉判据、腐坏模式/
-ΔNLL 口径（§15）与「测试时干预 vs 从头训练对照」的区别（§18）见
-`docs/design_notes.md`。
+random-indexer / see-everything 各臂，**uniform / realistic-token（natural）/
+mask / delete + 评审二轮新增 span / doc / topical 腐坏模式** + NIAH-natural
+远端必要信息任务）、P3T（topk 扫描 seeds 2/3 → n=4）、P3SS/P3SL（
+d=128/4L 8000 步与 d=512/10L 4000 步交叉面板）、P3SL2/P3SL3（**等 token
+与 6ND 参数量代理预算的大模型臂**——规模混杂修复，代理 ≠ 实测等
+FLOPs，见 `docs/design_notes.md` §16）。成对污染协议、预注册交叉判据、
+腐坏模式/ΔNLL 口径（§15）与「测试时干预 vs 从头训练对照」的区别
+（§18）见 `docs/design_notes.md`。
 
 ### v12 确认套件（探索 / 确认分离）
 
 ```bash
 python v12_supp.py smoke           # 端到端自检（微型 ckpt + 冻结清单副本）
-python v12_supp.py phase P5C       # 选择器对照补到 n=6（可续跑；0-2 由 P3MTC 覆盖）
-python v12_supp.py phase P5MP      # 扩展探针（全部模式 + NIAH + 对照）补到 n=6
+python v12_supp.py phase P5C       # 按清单种子训练全部四个冻结臂（可续跑；主臂 0-5 由 P3MT/P4MT 覆盖）
+python v12_supp.py phase P5MP      # 扩展探针（全部模式 + NIAH + 对照），种子取自清单
 python v12_supp.py phase P5S2      # 等 token 大规模臂（8000 步）
-python v12_supp.py phase P5S3      # 等计算预算大规模臂（参数量比例缩步）
+python v12_supp.py phase P5S3      # 6ND 参数量代理预算大规模臂（参数量比例缩步）
 python v12_supp.py phase P5T       # 冻结后的最终测试（读 wiki.test.raw，需冻结清单）
 python v12_supp.py analysis        # 零 GPU：共享 v10 统计 + 冻结确认性统计
 python v12_supp.py report          # 从磁盘重建 REPORT_v12.md（零 GPU）
 ```
 
 P5T 在 `confirmation_frozen.json` 缺失时拒绝运行，代码语义戳与清单不一致
-时同样拒绝（必须显式重冻结）。test split（`wiki.test.raw`，经
-`load_wikitest`）**只**被 P5T 读取——此前所有 phase 只读 train/valid。
-首次 test split 评估之后禁止追加冻结比较或种子（构造性选择偏差，见
-`DECISION_LOG.md`）。
+时同样拒绝（必须显式重冻结），**最小可达 Holm p > α 的清单直接拒绝**
+（数学上不可能确认 = 设计缺陷，种子数 6→12 的修订因此发生），记录准入
+失败（种子白名单/歧义重复/混切片/配方签名/manifest 哈希）时拒绝，首次
+test 访问写入冻结锁 `.freeze_lock.json`（此后清单/test 变更即拒绝，
+V12_REFREEZE=1 显式改冻结并把前轮降级为探索性）。test split
+（`wiki.test.raw`，经 `load_wikitest`）**只**被 P5T 读取——此前所有
+phase 只读 train/valid。首次 test split 评估之后禁止追加冻结比较或种子
+（构造性选择偏差，见 `DECISION_LOG.md`）。
+
+**范围声明（评审二轮·意见四）**：本确认只覆盖**固定分块 CSA 机制**的主张；
+动态分块优于固定分块、动态边界的语义价值、HCA 的优劣与动态分块的规模
+规律**不在本确认内**，需要各自的预注册冻结。
+
+**可执行审计入口（评审二轮·意见十一，零实验）**：
+
+```bash
+python audit_gates.py causality   # 纯 CPU 单元审计：前缀不变性 / 标签移位 / 解码一致性
+python audit_gates.py leakage     # 分词器来源 / 词表一致性 / train-test 文档重叠
+python audit_gates.py report      # 运行本地可核验的全部审计 -> audit_report.json
+python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # 证据归档 dry-run
+```
 
 ### v8 / v9 收尾套件
 
