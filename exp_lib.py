@@ -205,13 +205,22 @@ def _segment(n, want_cut_list, min_block, max_block):
     nxt = np.minimum(pos + int(max_block), np.maximum(pos + int(min_block), nc + 1))
     np.minimum(nxt, n, out=nxt)
     np.maximum(nxt, pos + 1, out=nxt)
-    nxt_l = nxt.tolist()
+    # The successor table is a contiguous int64 array; a memoryview reads the
+    # same exact integers as `nxt.tolist()` (a Python int per slot) for each
+    # successor, without first materialising an O(n) Python list.  The walk is
+    # one Python step per block, so for long sequences (#blocks ~ n) this
+    # avoids a large per-call allocation; the fallback to tolist covers any
+    # non-contiguous / non-buffer dtype.
+    try:
+        nxt_walk = nxt.data if nxt.flags['C_CONTIGUOUS'] else nxt.tolist()
+    except (AttributeError, BufferError, ValueError):
+        nxt_walk = nxt.tolist()
     starts = []
     ap = starts.append
     p = 0
     while p < n:
         ap(p)
-        p = nxt_l[p]
+        p = nxt_walk[p]
     sa = np.asarray(starts, dtype=np.int64)
     ends = np.empty(len(sa), dtype=np.int64)
     ends[:-1] = sa[1:]
@@ -222,7 +231,11 @@ def _segment(n, want_cut_list, min_block, max_block):
         sel = (ends < n) & (nc[sa] <= ends - 1)
         if sel.any():
             hj = np.searchsorted(slots, ends[sel] - 1, side='right')
-            honoured = {int(s): 1.0 for s in slots[hj - 1]}
+            # dict.fromkeys over the `.tolist()` view builds the identical
+            # {python-int slot: 1.0} mapping (first-occurrence order, duplicate
+            # slots collapsed) in one C-level pass instead of a per-slot Python
+            # comprehension — same keys, same values, same insertion order.
+            honoured = dict.fromkeys(slots[hj - 1].tolist(), 1.0)
     bids = np.repeat(np.arange(len(counts), dtype=np.int64), np.asarray(counts, dtype=np.int64))
     if cacheable:
         while len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
