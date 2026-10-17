@@ -195,12 +195,12 @@ class HybridAttentionRoPE(L.HybridAttention):
             scale = 1.0 / math.sqrt(self.hd)
         # windowed and full masks are mutually exclusive: pick the one the call
         # actually uses (both are cached constants, so values are unchanged).
-        # Beyond the row cap, each chunk builds only its own identical slice.
+        # Both branches produce the same mask values: a full cached mask
+        # within the row cap, or the matching row slice per chunk beyond it.
         _use_full_mask = T * T * 4 <= L._DENSE_MASK_ROW_CAP_BYTES
-        # A sliding-window SDPA call needs the whole [T, T] additive mask, so
-        # a long context would allocate T^2 bytes there.  Keep SDPA only while
-        # the mask fits the row cap; the chunked path below also supports a
-        # missing sink (sink_view=None).
+        # A sliding-window SDPA call needs the full additive mask, so it is
+        # used only within the row cap; the chunked path below also supports
+        # a missing sink (sink_view=None).
         if self.sink is None and (cfg.window <= 0 or _use_full_mask):
             sdpa_kw = dict(scale=scale)
             if cfg.window > 0:

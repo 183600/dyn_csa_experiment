@@ -834,13 +834,12 @@ def t_overfit_guard_source_key():
 
 
 # ---------------------------------------------------------------------------
-# G. scale-safety regressions
+# G. scale-safety checks
 # ---------------------------------------------------------------------------
 
-def t_long_window_avoids_full_mask():
-    # A sliding-window full-attention layer needs a [T, T] additive mask for
-    # SDPA.  Beyond the row cap it must take the chunked mask path instead;
-    # the fallback must also work for a layer with NO sink (sink_view=None).
+def t_long_window_chunked_mask():
+    # A sliding-window full-attention layer uses the chunked mask path beyond
+    # the row cap; that path must also work with no sink (sink_view=None).
     torch.manual_seed(0)
     cfg = [L.AttnCfg(kind='full', window=5)]
     m = L.SmallGPT(64, 32, 1, 4, 8, 32, cfg, mlp_ratio=2).eval()
@@ -853,7 +852,7 @@ def t_long_window_avoids_full_mask():
     old_w = L.causal_window_mask
 
     def _boom(*_a, **_k):
-        raise AssertionError('a full sliding-window [T, T] mask was allocated beyond the row cap')
+        raise AssertionError('the full-mask path was used beyond the row cap')
     try:
         L._DENSE_MASK_ROW_CAP_BYTES = 1
         L.causal_window_mask_f = _boom
@@ -867,7 +866,7 @@ def t_long_window_avoids_full_mask():
     assert torch.allclose(got, ref, atol=1e-5, rtol=1e-4), 'the chunked long-window path changed the attention output'
 
 
-def t_v7_long_window_avoids_full_mask():
+def t_v7_long_window_chunked_mask():
     # Same contract for the v7 RoPE full-attention twin.
     torch.manual_seed(0)
     cfg = V7.AttnCfgRope(kind='full', rope=True, rope_dim=8, window=5)
@@ -881,7 +880,7 @@ def t_v7_long_window_avoids_full_mask():
     old_w = L.causal_window_mask
 
     def _boom(*_a, **_k):
-        raise AssertionError('v7 allocated a full sliding-window [T, T] mask beyond the row cap')
+        raise AssertionError('v7 used the full-mask path beyond the row cap')
     try:
         L._DENSE_MASK_ROW_CAP_BYTES = 1
         L.causal_window_mask_f = _boom
@@ -896,8 +895,7 @@ def t_v7_long_window_avoids_full_mask():
 
 
 def t_indexer_empty_sequence():
-    # n == 0 must return the same shapes as a non-empty call instead of
-    # failing on the empty gather/concat tail.
+    # n == 0 must return the same shapes as a non-empty call.
     d, nIH = 8, 2
     H = torch.randn(0, d)
     comp = torch.randn(0, d)
@@ -909,8 +907,8 @@ def t_indexer_empty_sequence():
 
 
 def t_underpowered_never_verified():
-    # A liberal alpha must not let an underpowered contrast be called
-    # 'verified': the n floor is a precondition for every positive verdict.
+    # An underpowered contrast is never called 'verified', regardless of
+    # alpha: the n floor is a precondition for every positive verdict.
     entries = [{'controlled': True, 'n': 2, 'significant_global': True,
                 'within_seed_noise': False, 'param_controlled': True,
                 'p_exact_signflip': 0.5}]
@@ -965,8 +963,8 @@ def main():
     _check('F3 overfit guard source key', t_overfit_guard_source_key)
     _check('F4 shared-storage cache accounting', t_cache_bytes_shared_storage)
     _check('F5 atomic checkpoint save', t_atomic_torch_save)
-    _check('G1 long-window path avoids full mask', t_long_window_avoids_full_mask)
-    _check('G2 v7 long-window path avoids full mask', t_v7_long_window_avoids_full_mask)
+    _check('G1 long-window chunked mask', t_long_window_chunked_mask)
+    _check('G2 v7 long-window chunked mask', t_v7_long_window_chunked_mask)
     _check('G3 empty-sequence indexer', t_indexer_empty_sequence)
     _check('G4 underpowered is never verified', t_underpowered_never_verified)
     fails = [r for r in _results if r[1] != 'PASS']

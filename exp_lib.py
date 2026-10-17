@@ -151,13 +151,10 @@ def block_readable(pos, last_tok):
 _CONSEC_COS_CHUNK_BYTES = 64 << 20
 
 def cosine_similarity_consecutive(H, eps=1e-08):
-    # Consecutive-pair cosine similarity with a bounded transient.  The
-    # normalized rows and the elementwise product are pure per-position
-    # functions, so processing the time axis in chunks changes no value; it
-    # only avoids holding both the normalized copy and the [.., T-1, d]
-    # product for the whole sequence (multi-GB at long T / large d).  The
-    # unchunked form is used whenever it already fits the budget, keeping the
-    # historical kernel shapes for the existing panels.
+    # Consecutive-pair cosine similarity.  The normalized rows and the
+    # elementwise product are pure per-position functions, so processing the
+    # time axis in chunks changes no value; the unchunked form is used when
+    # the whole sequence fits in one chunk.
     if H.dim() < 2:
         h = F.normalize(H, dim=-1, eps=eps)
         return (h[1:] * h[:-1]).sum(dim=-1)
@@ -660,12 +657,10 @@ def _causal_window_mask_build(T, window, device, dtype):
 _DENSE_MASK_ROW_CAP_BYTES = 256 << 20
 
 def _dense_causal_window_rows(T, window, s, e, device, dtype):
-    # Row slice [s:e] of the cached dense causal/window additive mask, built
-    # on demand.  The allowed lanes are exactly (i-window < j <= i) with the
-    # same 0.0 / -inf constants, so the values are identical to
-    # `_causal_window_mask_build(...)[s:e]`; only the [T, T] allocation
-    # disappears.  Used when a full mask would exceed the row cap (long
-    # contexts), where holding T^2 would dominate memory.
+    # Row slice [s:e] of the dense causal/window additive mask.  The allowed
+    # lanes are exactly (i-window < j <= i) with the same 0.0 / -inf
+    # constants, so the values are identical to
+    # `_causal_window_mask_build(...)[s:e]`.
     pos = _arange_cache(T, device)
     q = pos[s:e, None]
     j = pos[None, :]
@@ -1165,10 +1160,6 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
         if _cpu is None or len(_cpu[0]) != nblk or nblk <= 0:
             rows.append(None)
             continue
-        # An already populated (block-ids object, shape) cache needs no host
-        # rebuild or upload at all.  The fixed segmenter shares one block-ids
-        # object across every row/layer/step, so after the first layer only
-        # the dynamic arm (fresh per-row objects) still reaches the upload.
         _pkey = (nblk, ov if _csa else -1, int(n))
         _gkey = (('vo', nblk, ov, int(n), pa_rows, pb_rows) if _csa
                  else ('so', nblk, int(n), pa_rows))
@@ -1646,9 +1637,8 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     # score/soft path stays full width; top-k selection goes through the
     # stable top-k in `_rank_blocks`.
     if n == 0:
-        # Empty sequence: no rows to select for.  Return the same shapes the
-        # non-empty path would (including a valid-cols flag when requested)
-        # instead of letting the gather/concatenate tail fail on an empty list.
+        # Empty sequence: return the same shapes the non-empty path would,
+        # including the valid-cols flag when requested.
         idx = torch.empty(0, _kw, device=dev, dtype=torch.int32)
         soft = torch.empty(0, _kw, device=dev, dtype=H.dtype) if need_soft else None
         if out_valid is not None:
@@ -1879,8 +1869,6 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         del sel_blk_all, valid_all
     else:
         _plan = None
-    # Hoist the stacked-window row table once per call (cached, exact int32)
-    # instead of allocating a [chunk, w] offset tensor in every chunk.
     _win_off_tab = _window_block_offset(n, w, _nblk_rows, dev) if _win_off else None
     for s in range(0, n, q_chunk):
         e = s + q_chunk
@@ -2133,14 +2121,12 @@ class HybridAttention(nn.Module):
             scale = 1.0
         else:
             scale = 1.0 / math.sqrt(self.hd)
-        # A full [T, T] mask is cached for ordinary lengths; beyond the row
-        # cap each row chunk builds exactly its own slice on demand, so the
-        # T^2 resident table never exists.  The slice values are identical.
+        # Both branches build the same additive mask values: a full cached
+        # mask within the row cap, or the matching row slice per chunk beyond
+        # it.  The fused SDPA path for a sliding window needs the full mask,
+        # so it is used only within the row cap; otherwise the chunked manual
+        # path below is used (sink-free chunks are supported).
         _use_full_mask = T * T * 4 <= _DENSE_MASK_ROW_CAP_BYTES
-        # SDPA needs the whole additive mask for a sliding window, so a long
-        # context would materialise T^2 bytes there too.  Keep the fused SDPA
-        # path only while the mask fits the same row cap; otherwise take the
-        # chunked manual path below (sink-free chunks are supported).
         if self.sink is None and (self.cfg.window <= 0 or _use_full_mask):
             sdpa_kw = dict(scale=scale)
             if self.cfg.window > 0:
@@ -2170,9 +2156,8 @@ class HybridAttention(nn.Module):
         _ck = torch.is_grad_enabled() and q.requires_grad
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
-            # A tuple is the row-mask recipe, not a tensor: keeping it out of
-            # the checkpoint's saved inputs lets the recompute rebuild the
-            # identical slice instead of retaining every chunk's mask.
+            # A tuple is the row-mask recipe, not a tensor: the checkpointed
+            # recompute rebuilds the identical slice.
             _mask_c = mask[s:e] if _use_full_mask else (s, e, T, self.cfg.window)
             if _ck:
                 out[:, s:e] = torch.utils.checkpoint.checkpoint(self._sink_attn_chunk, q[:, s:e], k, v, _mask_c, sink_view, scale, use_reentrant=False)
@@ -6195,8 +6180,8 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
     the same seed must reproduce the complete short loss curve (exactly on
     CPU; within ``tol`` on a GPU whose kernels are not bitwise deterministic),
     while a different seed must actually change it.  The report is persisted
-    with the panel, so a reproducibility regression is visible instead of
-    being an assumption.  The check is advisory by default
+    with the panel, so a reproducibility problem is visible instead of being
+    an assumption.  The check is advisory by default
     (``CSA_REQUIRE_REPRO=1`` makes a failure fatal, ``CSA_SKIP_REPRO=1``
     skips it); it never changes the RNG state of the following training cell.
     """
