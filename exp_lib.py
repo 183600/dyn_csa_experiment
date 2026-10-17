@@ -4291,6 +4291,501 @@ def tost_paired(deltas, margin, conf=0.90):
     out['ci_within_margin'] = bool(out['ci'][0] > -margin and out['ci'][1] < margin)
     return out
 
+
+# ---- 跨规模推断（scale ladder）：相对效应、异质性、趋势 ---------------------
+# 动机：把 d=128 与 d=512 的「绝对 PPL 差」直接相减，会把基线 PPL 本身的
+# 规模差异混进效应里（PPL 不是跨规模可加的）。跨规模的比较必须先转成
+# 无量纲效应（同一语料/分词器内的配对 log 比），再谈趋势；跨语料/跨分词器
+# 则不能用 PPL 直接比较（需要 bits-per-byte 之类的归一化，见 design_notes
+# §22）。下列函数只做数学，不替调用方选择族或预注册方向。
+
+def _gammaincc(a, x):
+    """正则化上不完全伽马 Q(a,x)，用于 Cochran Q 的卡方尾概率。"""
+    if not (a > 0.0) or (not math.isfinite(x)) or x < 0.0:
+        return float('nan')
+    if x == 0.0:
+        return 1.0
+    gln = math.lgamma(a)
+    if x < a + 1.0:
+        ap = float(a)
+        s = 1.0 / a
+        d = s
+        for _ in range(1000):
+            ap += 1.0
+            d *= x / ap
+            s += d
+            if abs(d) < abs(s) * 1e-15:
+                break
+        p = s * math.exp(-x + a * math.log(x) - gln)
+        return float(min(1.0, max(0.0, 1.0 - p)))
+    tiny = 1e-300
+    b = x + 1.0 - a
+    c = 1.0 / tiny
+    d = 1.0 / b
+    h = d
+    for i in range(1, 1000):
+        an = -float(i) * (float(i) - a)
+        b += 2.0
+        d = an * d + b
+        if abs(d) < tiny:
+            d = tiny
+        c = b + an / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-15:
+            break
+    return float(min(1.0, max(0.0, math.exp(-x + a * math.log(x) - gln) * h)))
+
+
+def _betacf(a, b, x):
+    """不完全贝塔函数的连分式（Numerical Recipes 口径）。"""
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+    for m in range(1, 500):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-15:
+            break
+    return h
+
+
+def _betai(a, b, x):
+    """正则化不完全贝塔 I_x(a,b)。"""
+    if not (a > 0.0 and b > 0.0) or not math.isfinite(x):
+        return float('nan')
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    bt = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+                  + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return float(bt * _betacf(a, b, x) / a)
+    return float(1.0 - bt * _betacf(b, a, 1.0 - x) / b)
+
+
+def _student_t_sf(t, df):
+    """Student t 的上尾概率 P(T >= t)。"""
+    if not (df > 0.0) or not math.isfinite(t):
+        return float('nan')
+    x = df / (df + t * t)
+    tail = 0.5 * _betai(df / 2.0, 0.5, x)
+    return float(tail if t >= 0 else 1.0 - tail)
+
+
+def student_t_two_sided_p(t, df):
+    """双侧 Student t 检验 p 值（小样本斜率/交互推断用）。"""
+    sf = _student_t_sf(abs(float(t)), float(df))
+    if not math.isfinite(sf):
+        return float('nan')
+    return float(min(1.0, 2.0 * sf))
+
+
+def _t_critical(conf, df):
+    """双侧置信区间的 t 临界值；用二分求解，避免依赖 scipy。"""
+    if not (0.0 < conf < 1.0) or not (df > 0.0):
+        return float('nan')
+    target = (1.0 - conf) / 2.0
+    lo, hi = 0.0, 1000.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if _student_t_sf(mid, df) > target:
+            lo = mid
+        else:
+            hi = mid
+    return float(0.5 * (lo + hi))
+
+
+def chi2_sf(x, df):
+    """卡方分布上尾概率 P(chi2_df >= x)（Cochran Q 用）。"""
+    if not (df > 0.0) or not math.isfinite(x):
+        return float('nan')
+    if x <= 0.0:
+        return 1.0
+    return _gammaincc(df / 2.0, x / 2.0)
+
+
+def paired_log_ratio(with_values, without_values, seeds=None):
+    """把逐种子绝对差转成跨规模可比的 log 效应：log(with / without)。
+
+    正值 = with 臂的 PPL 更高（更差）；零 = 无差异。log 比在乘性尺度上
+    对称，且不随基线 PPL 的规模漂移——这是跨 d/token 预算比较的前提。
+    只接受有限正数对；非正/非有限对整对丢弃并计数（不会静默变成 NaN）。
+    """
+    wa = list(with_values)
+    wb = list(without_values)
+    if len(wa) != len(wb):
+        raise ValueError('paired_log_ratio needs equal-length vectors (%d vs %d)' % (len(wa), len(wb)))
+    ss = list(range(len(wa))) if seeds is None else list(seeds)
+    if len(ss) != len(wa):
+        raise ValueError('paired_log_ratio seeds length %d does not match vectors length %d' % (len(ss), len(wa)))
+    effects, kept, dropped = [], [], []
+    for s, a, b in zip(ss, wa, wb):
+        try:
+            fa, fb = float(a), float(b)
+        except (TypeError, ValueError):
+            dropped.append(s)
+            continue
+        if not (math.isfinite(fa) and math.isfinite(fb) and fa > 0.0 and fb > 0.0):
+            dropped.append(s)
+            continue
+        effects.append(float(math.log(fa) - math.log(fb)))
+        kept.append(s)
+    return {'effects': effects, 'seeds': kept, 'n': len(effects), 'n_dropped': len(dropped), 'dropped_seeds': dropped,
+            'convention': 'effect = log(with) - log(without); positive = with arm has higher PPL (worse)'}
+
+
+def _scale_points(points):
+    """Normalise [{label, scale, effects, seeds}] / [(scale, effects)] inputs."""
+    out = []
+    for i, p in enumerate(points or []):
+        if isinstance(p, dict):
+            eff = p.get('effects')
+            scale = p.get('scale')
+            label = p.get('label', i)
+            seeds = p.get('seeds')
+        elif isinstance(p, (tuple, list)) and len(p) >= 2:
+            scale, eff = p[0], p[1]
+            label = i
+            seeds = p[2] if len(p) > 2 else None
+        else:
+            continue
+        if eff is None:
+            continue
+        try:
+            vals = list(eff)
+        except TypeError:
+            continue
+        if seeds is None:
+            keep = [(j, v) for j, v in enumerate(vals)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))]
+            seeds_kept = [j for j, _v in keep]
+            effects = [float(v) for _j, v in keep]
+        else:
+            seeds = list(seeds)
+            if len(seeds) != len(vals):
+                raise ValueError('scale point %r: seeds length %d does not match effects length %d' % (label, len(seeds), len(vals)))
+            keep = [(s, v) for s, v in zip(seeds, vals)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))]
+            seeds_kept = [s for s, _v in keep]
+            effects = [float(v) for _s, v in keep]
+        try:
+            sc = float(scale)
+        except (TypeError, ValueError):
+            sc = float('nan')
+        out.append({'label': str(label), 'scale': sc, 'effects': effects, 'seeds': seeds_kept})
+    return out
+
+
+def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
+    """跨规模的随机效应元分析（DerSimonian-Laird）+ 异质性诊断。
+
+    输入是**已经无量纲化**的逐种子效应（通常来自
+    `paired_log_ratio`），每个规模点一份。输出每个点的 mean/se/CI，
+    Cochran Q、I²、tau²、固定/随机效应合并值与预测区间。
+
+    关键口径：不同规模估计的不是同一个总体参数。只有异质性不显著
+    （I² 低、Q 的 p>=alpha）且点数足够时才把 pooled 当作「共同效应」；
+    否则 `poolable=False`，pooled 只作描述性摘要，结论必须按规模分开报。
+    """
+    pts = _scale_points(points)
+    per = []
+    for p in pts:
+        d = np.asarray(p['effects'], dtype=float)
+        n = int(d.size)
+        row = {'label': p['label'], 'scale': p['scale'], 'n': n}
+        if n:
+            m = float(d.mean())
+            sd = float(d.std(ddof=1)) if n > 1 else float('nan')
+            se = float(sd / math.sqrt(n)) if (n > 1 and math.isfinite(sd)) else float('nan')
+            row.update({'mean': m, 'std': sd, 'se': se, 'underpowered': n < int(min_seeds)})
+            if n > 1:
+                tc = _t_critical(1.0 - float(alpha), n - 1)
+                row['ci'] = [m - tc * se, m + tc * se]
+        else:
+            row.update({'mean': float('nan'), 'std': float('nan'), 'se': float('nan'), 'underpowered': True})
+        per.append(row)
+    usable = [r for r in per if r['n'] > 1 and math.isfinite(r.get('se', float('nan'))) and r['se'] > 0.0]
+    out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'per_point': per,
+           'n_points': len(per), 'n_usable': len(usable),
+           'convention': 'input effects are scale-free; positive = with arm worse (higher PPL)'}
+    if not usable:
+        out.update({'status': 'insufficient_within_scale_replication', 'poolable': False,
+                    'note': 'every scale point has n<2 or zero within-scale variance; no random-effects weights can be formed'})
+        return out
+    w = np.asarray([1.0 / (r['se'] ** 2) for r in usable], dtype=float)
+    y = np.asarray([r['mean'] for r in usable], dtype=float)
+    sw = float(w.sum())
+    mu_fe = float((w * y).sum() / sw)
+    q = float((w * (y - mu_fe) ** 2).sum())
+    df = len(usable) - 1
+    p_q = chi2_sf(q, df) if df > 0 else float('nan')
+    i2 = float(max(0.0, (q - df) / q) * 100.0) if (df > 0 and q > 0) else 0.0
+    c = float(sw - (w ** 2).sum() / sw)
+    tau2 = float(max(0.0, (q - df) / c)) if (df > 0 and c > 0) else 0.0
+    ws = 1.0 / (np.asarray([r['se'] ** 2 for r in usable], dtype=float) + tau2)
+    sws = float(ws.sum())
+    mu_re = float((ws * y).sum() / sws)
+    se_re = float(math.sqrt(1.0 / sws))
+    tc = _t_critical(1.0 - float(alpha), max(1, df))
+    out.update({'fixed_effect': {'mean': mu_fe, 'se': float(math.sqrt(1.0 / sw)), 'ci': [mu_fe - _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw), mu_fe + _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw)]},
+                'random_effects': {'mean': mu_re, 'se': se_re, 'ci': [mu_re - tc * se_re, mu_re + tc * se_re]},
+                'heterogeneity': {'Q': q, 'df': int(df), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
+                                  'method': 'Cochran Q + DerSimonian-Laird tau^2'},
+                'prediction_interval': [mu_re - tc * math.sqrt(tau2 + se_re ** 2), mu_re + tc * math.sqrt(tau2 + se_re ** 2)],
+                'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0 and (not math.isfinite(p_q) or p_q >= alpha)),
+                'note': 'poolable requires >=3 scales, I2<=50% and a non-significant Q; otherwise report per-scale effects only'})
+    out['status'] = 'ok'
+    return out
+
+
+def scale_interaction(low_effects, high_effects, *, low_label='low', high_label='high', seeds=None, alpha=0.05, min_n=3):
+    """同一批种子在两个规模点上的**效应变化**（交互）的精确检验。
+
+    Δ = effect_high − effect_low（effect 已无量纲化）。正值表示该效应在
+    更大规模上更大（若 effect 是 log PPL 比，则正值 = 大模型上相对劣势
+    更大）。逐种子配对后做精确符号翻转检验，避免把「大规模 PPL 基线更高」
+    误读成「效应随规模变大」。
+    """
+    a = list(low_effects)
+    b = list(high_effects)
+    if len(a) != len(b):
+        raise ValueError('scale_interaction needs equal-length effects (%d vs %d)' % (len(a), len(b)))
+    ss = list(range(len(a))) if seeds is None else list(seeds)
+    if len(ss) != len(a):
+        raise ValueError('scale_interaction seeds length does not match effects')
+    diff, kept = [], []
+    for s, x, y in zip(ss, a, b):
+        try:
+            fx, fy = float(x), float(y)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fx) and math.isfinite(fy):
+            diff.append(fy - fx)
+            kept.append(s)
+    st = paired_effect_stats(diff, alpha=alpha, min_n=min_n)
+    st.update({'low_label': str(low_label), 'high_label': str(high_label), 'seeds': kept,
+               'convention': 'delta = effect_high - effect_low; positive = effect is larger at the higher scale',
+               'claim_level': 'confirmatory only if n>=%d and p_floor<alpha' % int(min_n)})
+    return st
+
+
+def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=True):
+    """尺度阶梯上的效应趋势：相对效应 ~ log(scale) 的加权回归 + 精确配对检验。
+
+    `points` 每项为 {label, scale, effects, seeds}（或 (scale, effects, seeds)）。
+    effects 必须是**无量纲**的逐种子效应（`paired_log_ratio` 的输出），
+    不能直接塞入绝对 PPL 差——否则斜率只反映基线 PPL 随规模的变化。
+
+    推断分两层：
+      1. 优先用「完整种子」的逐种子斜率：同一种子在每个规模点都有观测时，
+         对每个种子拟合 log(scale) 斜率，再对这些斜率做精确符号翻转检验。
+         p 下限仍是 2/2^n，因此 n=4 时 0.125，n<6 的描述性读数不能称为
+         「趋势已确认」。
+      2. 没有完整种子时，退化为规模点均值的加权回归，用 t 区间与 t 检验，
+         并明确标注 `paired=False`（点间独立、不能利用配对降噪）。
+    同时报告两点交互（最小 vs 最大规模）和异质性；异质性高时不得用单一
+    斜率概括整个阶梯。"""
+    pts = _scale_points(points)
+    pts = [p for p in pts if math.isfinite(p['scale']) and p['scale'] > 0.0 and p['effects']]
+    pts.sort(key=lambda p: p['scale'])
+    labels = [p['label'] for p in pts]
+    out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'min_points': int(min_points),
+           'n_points': len(pts), 'labels': labels,
+           'scales': [p['scale'] for p in pts],
+           'min_seeds_for_significance': signflip_min_n_for_holm(1, alpha),
+           'convention': 'effects must be scale-free (e.g. paired log PPL ratio); positive = with arm worse'}
+    if len(pts) < 2:
+        out.update({'status': 'insufficient_points', 'verdict': 'insufficient_points'})
+        return out
+    x = np.asarray([math.log10(p['scale']) if log_scale else p['scale'] for p in pts], dtype=float)
+    y = np.asarray([float(np.mean(p['effects'])) for p in pts], dtype=float)
+    n = np.asarray([float(len(p['effects'])) for p in pts], dtype=float)
+    sw = float(n.sum())
+    xbar = float((n * x).sum() / sw)
+    ybar = float((n * y).sum() / sw)
+    sxx = float((n * (x - xbar) ** 2).sum())
+    if sxx <= 0.0:
+        out.update({'status': 'degenerate_scale_axis', 'verdict': 'degenerate_scale_axis'})
+        return out
+    slope = float((n * (x - xbar) * (y - ybar)).sum() / sxx)
+    intercept = float(ybar - slope * xbar)
+    k = len(pts)
+    resid = y - (slope * x + intercept)
+    wls = {'slope': slope, 'intercept': intercept, 'x_transform': 'log10' if log_scale else 'linear',
+           'weights': 'n_seeds per scale', 'r2': (1.0 - float((n * resid ** 2).sum() / (n * (y - ybar) ** 2).sum())) if float((n * (y - ybar) ** 2).sum()) > 0 else float('nan')}
+    if k > 2:
+        sigma2 = float((n * resid ** 2).sum() / (k - 2))
+        se = float(math.sqrt(sigma2 / sxx))
+        tc = _t_critical(1.0 - float(alpha), k - 2)
+        tstat = slope / se if se > 0 else float('inf')
+        wls.update({'se': se, 'ci': [slope - tc * se, slope + tc * se],
+                    'p': student_t_two_sided_p(tstat, k - 2), 'df': k - 2})
+    out['wls'] = wls
+    # paired per-seed slopes: complete cases only (same seed at every scale)
+    by_seed = {}
+    for p in pts:
+        for s, e in zip(p['seeds'], p['effects']):
+            by_seed.setdefault(s, {})[p['label']] = float(e)
+    complete = sorted([s for s, m in by_seed.items() if all(lb in m for lb in labels)], key=str)
+    paired = {'n_complete_seeds': len(complete), 'seeds': complete, 'labels': labels}
+    if len(complete) >= 2:
+        slopes = []
+        for s in complete:
+            yy = np.asarray([by_seed[s][lb] for lb in labels], dtype=float)
+            yybar = float((n * yy).sum() / sw)
+            slopes.append(float((n * (x - xbar) * (yy - yybar)).sum() / sxx))
+        slopes = np.asarray(slopes, dtype=float)
+        st = paired_effect_stats(slopes, alpha=alpha, min_n=min_seeds)
+        tc = _t_critical(1.0 - float(alpha), len(slopes) - 1)
+        se_s = float(slopes.std(ddof=1) / math.sqrt(len(slopes))) if len(slopes) > 1 else float('nan')
+        paired.update({'slope_mean': float(slopes.mean()), 'slope_std': float(slopes.std(ddof=1)) if len(slopes) > 1 else float('nan'),
+                       'se': se_s, 'ci': [float(slopes.mean()) - tc * se_s, float(slopes.mean()) + tc * se_s] if math.isfinite(se_s) else None,
+                       'p_exact_signflip': st['p_exact_signflip'], 'p_floor': st['p_floor'],
+                       'resolution_limited': st['resolution_limited'], 'underpowered': st['underpowered'],
+                       'within_seed_noise': st['within_seed_noise'], 'significant': st['significant'],
+                       'per_seed_slopes': {str(s): float(v) for s, v in zip(complete, slopes)}})
+    else:
+        paired.update({'note': 'no complete seed across every scale point; the paired exact test is unavailable'})
+    out['paired'] = paired
+    # extreme-scale interaction (smallest vs largest) on shared seeds
+    lo, hi = pts[0], pts[-1]
+    lo_map = dict(zip(lo['seeds'], lo['effects']))
+    hi_map = dict(zip(hi['seeds'], hi['effects']))
+    shared = sorted(set(lo_map) & set(hi_map), key=str)
+    inter = scale_interaction([lo_map[s] for s in shared], [hi_map[s] for s in shared],
+                              low_label=lo['label'], high_label=hi['label'], seeds=shared,
+                              alpha=alpha, min_n=min_seeds) if len(shared) >= 2 else {'n': len(shared), 'note': 'fewer than 2 shared seeds'}
+    out['interaction_extremes'] = inter
+    # heterogeneity over the point means (weights = n)
+    if k >= 2:
+        mu = ybar
+        q = float((n * (y - mu) ** 2).sum())
+        dfh = k - 1
+        p_q = chi2_sf(q, dfh)
+        i2 = float(max(0.0, (q - dfh) / q) * 100.0) if q > 0 else 0.0
+        c = float(n.sum() - (n ** 2).sum() / n.sum())
+        tau2 = float(max(0.0, (q - dfh) / c)) if c > 0 else 0.0
+        out['heterogeneity'] = {'Q': q, 'df': int(dfh), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
+                                'note': 'Q over scale-point mean effects (weights = n); high I2 means a single slope is not an adequate summary'}
+    p_primary = paired.get('p_exact_signflip') if len(complete) >= 2 else wls.get('p')
+    resolution_limited = bool(paired.get('resolution_limited')) if len(complete) >= 2 else (k <= 2)
+    sig = bool(p_primary is not None and math.isfinite(float(p_primary)) and float(p_primary) < alpha
+               and not resolution_limited)
+    het = out.get('heterogeneity') or {}
+    heterogeneous = bool(float(het.get('I2_percent') or 0.0) > 75.0 or (isinstance(het.get('p'), float) and math.isfinite(het['p']) and het['p'] < alpha))
+    out['primary_inference'] = 'paired per-seed slope (exact sign-flip)' if len(complete) >= 2 else 'WLS point-mean t-test (unpaired scales)'
+    out['p_primary'] = float(p_primary) if isinstance(p_primary, (int, float)) and math.isfinite(float(p_primary)) else None
+    out['significant'] = sig
+    out['resolution_limited'] = resolution_limited
+    if heterogeneous:
+        verdict = 'heterogeneous_trend'
+    elif sig:
+        verdict = 'effect_decreases_with_scale' if slope < 0 else 'effect_increases_with_scale'
+    elif resolution_limited:
+        verdict = 'resolution_limited'
+    else:
+        verdict = 'no_detectable_trend'
+    out['verdict'] = verdict
+    out['benefit_grows_with_scale'] = (bool(sig and slope < 0) if not heterogeneous else None)
+    if k < int(min_points):
+        out['note'] = 'fewer than min_points=%d scales: slope is descriptive even if the exact test rejects' % int(min_points)
+    return out
+
+
+def loglog_regression(points, *, alpha=0.05):
+    """log10(y) ~ log10(x) 回归，带斜率 CI / p / R² / 留一稳定性。
+
+    用于规模律读数（如 crossover tokens ~ d_model）。`points` 接受
+    [(x, y)] 或 [{label, x, y}]；只保留有限正数。点数 k>=3 时给出斜率的
+    t 区间与双侧 p；k=2 时直线是恒等拟合，只报斜率并显式标注「无残差
+    自由度、无 R²」。x 本身的测量误差未计入（观测性拟合，不是因果估计）。
+    """
+    rows = []
+    for i, p in enumerate(points or []):
+        if isinstance(p, dict):
+            x, y, label = p.get('x'), p.get('y'), p.get('label', i)
+        elif isinstance(p, (tuple, list)) and len(p) >= 2:
+            x, y, label = p[0], p[1], i
+        else:
+            continue
+        try:
+            fx, fy = float(x), float(y)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fx) and math.isfinite(fy) and fx > 0.0 and fy > 0.0:
+            rows.append((str(label), fx, fy))
+    out = {'alpha': float(alpha), 'n_points': len(rows), 'labels': [r[0] for r in rows],
+           'note': 'observational log-log fit; x measurement error is not modelled'}
+    if len(rows) < 2:
+        out.update({'status': 'insufficient_points'})
+        return out
+    x = np.log10(np.asarray([r[1] for r in rows], dtype=float))
+    y = np.log10(np.asarray([r[2] for r in rows], dtype=float))
+    xbar, ybar = float(x.mean()), float(y.mean())
+    sxx = float(((x - xbar) ** 2).sum())
+    if sxx <= 0.0:
+        out.update({'status': 'degenerate_x'})
+        return out
+    slope = float(((x - xbar) * (y - ybar)).sum() / sxx)
+    intercept = float(ybar - slope * xbar)
+    pred = slope * x + intercept
+    resid = y - pred
+    ss_res = float((resid ** 2).sum())
+    ss_tot = float(((y - ybar) ** 2).sum())
+    out.update({'status': 'ok', 'slope': slope, 'exponent': slope, 'intercept': intercept,
+                'law': 'y = %.6g * x^%.6g' % (10 ** intercept, slope)})
+    k = len(rows)
+    if k >= 3:
+        sigma2 = ss_res / (k - 2)
+        se = float(math.sqrt(sigma2 / sxx))
+        tc = _t_critical(1.0 - float(alpha), k - 2)
+        out.update({'se': se, 'ci': [slope - tc * se, slope + tc * se],
+                    'p': student_t_two_sided_p(slope / se, k - 2) if se > 0 else float('nan'),
+                    'df': k - 2, 'r2': (1.0 - ss_res / ss_tot) if ss_tot > 0 else float('nan'),
+                    'residual_sigma_log10': float(math.sqrt(sigma2))})
+        loo = []
+        for i in range(k):
+            xx = np.delete(x, i)
+            yy = np.delete(y, i)
+            xb, yb = float(xx.mean()), float(yy.mean())
+            s = float(((xx - xb) * (yy - yb)).sum() / ((xx - xb) ** 2).sum())
+            loo.append({'label': rows[i][0], 'slope': s})
+        out['leave_one_out'] = loo
+        out['leave_one_out_slope_range'] = [float(min(v['slope'] for v in loo)), float(max(v['slope'] for v in loo))]
+    else:
+        out.update({'r2': None, 'ci': None, 'p': None,
+                    'note': out['note'] + '; k=2 gives an exact line with no residual degrees of freedom, so no CI/R2/p is reported'})
+    return out
+
+
 # `mt` (matched-variant set) and `mr` (mlp_match_ref) can themselves contain
 # underscores (e.g. `full_rope`, `csa_dynamic`), so those two values are
 # captured lazily up to the next literal key rather than by `[^_]+`.
