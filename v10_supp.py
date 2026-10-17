@@ -671,10 +671,10 @@ def _flop_matched_steps(small_cfg, large_cfg, min_steps=250):
 
     评审二轮·意见七修订：这里的「等计算」是 6·N·D 参数量代理（N=参数量，
     D=token 数），**不是实测等 FLOPs**——稀疏选择、池化、注意力与激活重算
-    的开销不与参数量成比例；若触发步数下限，也会偏离原目标规模。面板报告
+    的计算量不与参数量成比例；若触发步数下限，也会偏离原目标规模。面板报告
     必须把它称为「6ND 参数量代理规模臂」，并同时报告实际 token 数、参数
     量、估篇 FLOPs（audit_gates.train_flops_estimate）与 TimeGuard 实测
-    用时；等 token 与等算力是不同问题，须分别陈述。步数推导：先在 CPU
+    用时；等 token 与等计算量是不同问题，须分别陈述。步数推导：先在 CPU
     上按面板配置构建两个面板的模型（不碰 DEVICE、无 RNG 副作用），取两
     臂（csa/full）参数量的平均值，large_steps = small_steps ·
     N_small / N_large。结果打印完整推导以供审计；确定性：同一代码下重复
@@ -696,7 +696,7 @@ def _flop_matched_steps(small_cfg, large_cfg, min_steps=250):
     _ratio = counts['small'] / counts['large']
     _raw = int(round(small_cfg['steps'] * _ratio))
     steps = max(int(min_steps), _raw)
-    print(f'[v10] 6ND-param-proxy-matched steps (a PROXY, not measured FLOPs): {"; ".join(deriv)}; ratio={_ratio:.6g} -> large_steps={steps}' + (f'  [NOTE: floored at {min_steps} (raw {_raw}) — the proxy budget is deviated by the floor, report it as such]' if steps > _raw else ''))
+    print(f'[v10] 6ND-param-proxy-matched steps (a PROXY, not measured FLOPs): {"; ".join(deriv)}; ratio={_ratio:.6g} -> large_steps={steps}' + (f'  [NOTE: floored at {min_steps} (raw {_raw}) — the proxy target is deviated by the floor, report it as such]' if steps > _raw else ''))
     return steps
 
 PHASES = [('P3MT', 'lenphase', P3MT_PAYLOAD, [0, 1, 2]), ('P3MTC', 'lenphase', P3MT_PAYLOAD_CONTROLS, [0, 1, 2]), ('P3MP', 'probe', PROBE, None), ('P3T', 'run', V9.P2T_CFG, [2, 3]), ('P3SS', 'run', P3SS_CFG, [0, 1]), ('P3SL', 'run', P3SL_CFG, [0, 1]), ('P3SL2', 'run', P3SL_TOK_CFG, [0, 1]), ('P3SL3', 'run', P3SL_FLOP_CFG, [0, 1])]
@@ -986,7 +986,7 @@ def _scale_crossovers():
         out[label] = entry
     return out
 
-_SCALE_PANEL_SPECS = {'P3SS': dict(outdir='results_lm_v10_scale_s', d=128, n_layers=4, batch=12, seq=512, steps=8000, note='small arm, 8000 steps (~49.15M tokens)'), 'P3SL': dict(outdir='results_lm_v10_scale_l', d=512, n_layers=10, batch=12, seq=512, steps=4000, note='large arm as originally run, 4000 steps (~24.58M tokens — HALF the small arm budget)'), 'P3SL_TOK': dict(outdir='results_lm_v10_scale_l8k', d=512, n_layers=10, batch=12, seq=512, steps=8000, note='token-matched large arm, 8000 steps (~49.15M tokens)'), 'P3SL_FLOP': dict(outdir='results_lm_v10_scale_lflop', d=512, n_layers=10, batch=12, seq=512, steps=None, note='compute-matched large arm (steps = 8000 * N_small/N_large, floored at 250)')}
+_SCALE_PANEL_SPECS = {'P3SS': dict(outdir='results_lm_v10_scale_s', d=128, n_layers=4, batch=12, seq=512, steps=8000, note='small arm, 8000 steps (~49.15M tokens)'), 'P3SL': dict(outdir='results_lm_v10_scale_l', d=512, n_layers=10, batch=12, seq=512, steps=4000, note='large arm as originally run, 4000 steps (~24.58M tokens — HALF the small arm training length)'), 'P3SL_TOK': dict(outdir='results_lm_v10_scale_l8k', d=512, n_layers=10, batch=12, seq=512, steps=8000, note='token-matched large arm, 8000 steps (~49.15M tokens)'), 'P3SL_FLOP': dict(outdir='results_lm_v10_scale_lflop', d=512, n_layers=10, batch=12, seq=512, steps=None, note='compute-matched large arm (steps = 8000 * N_small/N_large, floored at 250)')}
 
 def _panel_endpoint(hists, tps):
     """Final-eval gap + token count of a panel: csa_fixed vs full, seed-paired."""
@@ -1019,13 +1019,13 @@ def _panel_endpoint(hists, tps):
     return out
 
 def _panel_convergence(hists):
-    """Plateau-in-budget diagnostic per (variant, seed) — NOT a convergence
+    """Plateau-in-training-window diagnostic per (variant, seed) — NOT a convergence
     proof (review-2 issue 7 revision).
 
     相对 PPL 改进 < 1%（最后四分之一 eval 窗口）只能排除「仍在快速下降」
     的情形；学习率衰减、平台期、评测噪声或优化停滞都可能满足该条件。
     因此本诊断只允许谈论「规模内平台期后」的读数（crossing-after-plateau-
-    under-budget），不得写成「收敛后」或「渐近优势反转」——后者需要更长
+    in-window），不得写成「收敛后」或「渐近优势反转」——后者需要更长
     训练、合理学习率续训与重复验证（design_notes §16 修订）。保留
     `plateaued` 键以兼容既有分析产物；新增 `claim_allowed` 明示允许的
     主张级别。"""
@@ -1043,7 +1043,7 @@ def _panel_convergence(hists):
             rel = (q[1] - last[1]) / denom
             per_seed[s] = {'rel_improve_last_quarter': float(rel), 'plateaued': bool(rel < 0.01)}
         _vals = [x['rel_improve_last_quarter'] for x in per_seed.values() if math.isfinite(x['rel_improve_last_quarter'])]
-        out[v] = {'per_seed': per_seed, 'median_rel_improve': float(np.median(_vals)) if _vals else float('nan'), 'n_plateaued': int(sum((1 for x in per_seed.values() if x['plateaued']))), 'n': len(per_seed), 'diagnostic': 'plateau-in-budget (NOT proof of convergence: lr decay, stalls or eval noise can also satisfy it)', 'claim_allowed': 'crossing-after-plateau-under-budget only; asymptotic/post-convergence claims need longer training + lr-continuation + replication'}
+        out[v] = {'per_seed': per_seed, 'median_rel_improve': float(np.median(_vals)) if _vals else float('nan'), 'n_plateaued': int(sum((1 for x in per_seed.values() if x['plateaued']))), 'n': len(per_seed), 'diagnostic': 'plateau-in-training-window (NOT proof of convergence: lr decay, stalls or eval noise can also satisfy it)', 'claim_allowed': 'crossing-after-plateau-in-window only; asymptotic/post-convergence claims need longer training + lr-continuation + replication'}
     return out
 
 def _equal_token_slices():

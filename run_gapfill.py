@@ -382,7 +382,7 @@ def schedule_shutdown(delay_s=90):
 def run_overfit(cfg=None, variants=None, steps=None):
     """Pre-flight small-batch overfit sanity check.
 
-    Runs BEFORE any expensive panel: one fixed batch, zero weight decay, zero
+    Runs BEFORE any full panel: one fixed batch, zero weight decay, zero
     compression penalty, no augmentation.  A failure is a hard stop (the full
     run must not start).  Passing is necessary, not sufficient — data
     augmentation / feature-alignment / label-mapping problems can still survive.
@@ -548,5 +548,5 @@ if __name__ == '__main__':
                 traceback.print_exc()
             schedule_shutdown(2400)
         else:
-            print(f'\n[v6] CRASHED in `{mode}` mode — the tree can hold half-written throwaway output, so NOTHING was committed or pushed and no shutdown was scheduled.  Fix the defect and re-run; `smoke` exists to catch exactly this.')
+            print(f'\n[v6] CRASHED in `{mode}` mode — the tree can hold half-written throwaway output, so NOTHING was committed or pushed and no shutdown was scheduled.  Repair the defect and re-run; `smoke` exists to catch exactly this.')
         sys.exit(1)

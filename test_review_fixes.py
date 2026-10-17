@@ -130,7 +130,7 @@ if _HAVE_TORCH:
 def _legacy_corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target):
     """The PRE-refactor inline algorithm, replayed bit-for-bit (uniform /
     natural / mask / delete). Any divergence means the extraction changed a
-    measured value — the strongest regression this suite guards against."""
+    measured value — the strongest invariant this suite checks."""
     n_far = eval_len - target
     if mode == 'delete':
         return np.asarray(val_ids[jj, eval_len - target:eval_len + 1], dtype=np.int64).copy()
@@ -1409,7 +1409,7 @@ def t_data_quality_report():
 
 
 def t_split_sizes_explicit_never_negative():
-    # Explicit sizes and fractional targets can overdraw the row budget; the
+    # Explicit sizes and fractional targets can overdraw the remaining rows; the
     # filler must clamp rather than emit a negative split.
     cases = ({'train_frac': 0.05, 'val_frac': 0.9, 'test_frac': 0.05, 'train_size': 9},
              {'train_frac': 0.8, 'val_frac': 0.1, 'test_frac': 0.1, 'val_size': 9})
@@ -1484,7 +1484,7 @@ def main():
     _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)
     _check('C10 audit resolution classification', t_audit_resolution_classification)
     _check('C11 controlled-variable gate: mixed train_knobs', t_pair_reason_train_knobs_mixed)
-    _check('C12 seed-budget plan', t_seed_plan)
+    _check('C12 seed plan', t_seed_plan)
     _check('C13 family Holm + verified baseline + param control', t_audit_family_holm_and_verified)
     _check('C14 compression-regularizer loss ablation', t_ablation_design_loss_term)
     _check('C15 optimizer knobs enter the resume fingerprint', t_training_knobs_in_resume_fingerprint)
@@ -1496,7 +1496,7 @@ def main():
     _check('C18 leave-one-out ablation completeness', t_ablation_completeness_leave_one_out)
     _check('C19 full-factorial ablation completeness', t_ablation_completeness_full_factorial)
     _check('C20 panel ablation flag does not overclaim', t_panel_ablation_flag_does_not_overclaim)
-    _check('A7 adaptive-threshold memory guard', t_adaptive_threshold_guard)
+    _check('A7 adaptive-threshold capacity guard', t_adaptive_threshold_guard)
     _check('A8 empty segmenter', t_segment_empty)
     _check('A8a uniform-stride cut boundary', t_segment_uniform_stride_only_when_all_cuts)
     _check('A8b empty pooling geometry', t_empty_pool_geometry)
@@ -1530,7 +1530,7 @@ def main():
     _check('G4 underpowered is never verified', t_underpowered_never_verified)
     _check('H1 hypothesis direction conflict', t_hypothesis_direction_conflict)
     _check('H2 metric policy + macro/micro/weighted F1 + PR/ROC-AUC', t_metric_policy_and_classification_metrics)
-    _check('H3 equal-budget baseline tuning audit', t_baseline_tuning_audit)
+    _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
     _check('I1 chronological split contract', t_leakage_safe_split_contract)
     _check('I2 whole-group split contract', t_group_split_contract)
     _check('I3 preprocessing fitted on train only', t_preprocessor_train_only)

@@ -791,16 +791,9 @@ def _tri_full(n, device, k):
 
 def _mask_buffer(n, device, kind):
     if kind == 'causal':
-        # Boolean masked-lane table (True = j > i), the form `_sink_attn_chunk`
-        # consumes via masked_fill_: the old fp32 donor held exactly 0.0 / -inf
-        # and was ADDED to the logits, and x + 0.0 == x for every finite x
-        # except -0.0 -> +0.0 (whose exp is 1.0 either way, so the softmax row
-        # sums — and every downstream value/grad — are bit-identical), while
-        # the masked lanes are written to exactly the same -inf constant the
-        # additive form produced.  Storing the [width, width] donor as bool
-        # keeps the same lane table in width**2 bytes instead of 4·width**2
-        # (the [T,T] mask resident size dominates mask-cache memory as T
-        # grows); only the representation changes, never a value.
+        # Boolean masked-lane table (True = j > i), consumed by
+        # `_sink_attn_chunk` via masked_fill_; the masked lanes are written
+        # to -inf.
         with torch.inference_mode(False):
             return torch.ones((n, n), device=device, dtype=torch.bool).triu_(1)
     key = (_dev_str(device), kind, int(n))
@@ -831,10 +824,8 @@ def window_band(T, window, device):
     return buf
 
 def causal_window_mask(T, window, device):
-    # Boolean masked-lane table (True = masked): the same lanes the additive
-    # fp32 build filled with -inf, consumed by `_sink_attn_chunk`'s
-    # masked_fill_ — bit-identical logits after the fill (see
-    # `_mask_buffer`'s causal note), T²/8 bytes resident instead of 4·T².
+    # Boolean masked-lane table (True = masked), consumed by
+    # `_sink_attn_chunk`'s masked_fill_.
     if window <= 0 or window >= T:
         return causal_mask(T, device)
     key = (_dev_str(device), 'cw', int(T), int(window))
@@ -958,11 +949,8 @@ def _pool_block_chunk(B, per_block_elems, elem_size):
 
 def _pool_counts_clean(bid, B):
     # "Every block carries at least one token" is a pure function of the
-    # segmenter's immutable counts table.  Cache it on the block-ids object
-    # (the same per-object cache convention as _pool_parts/_pool_geom): the
-    # fixed segmenter shares one object across every layer/step, so this
-    # avoids a Python min() over all block counts on each pooling call as the
-    # sequence (and therefore the block list) grows.
+    # segmenter's immutable counts table; cache it on the block-ids object
+    # (the same per-object cache convention as _pool_parts/_pool_geom).
     try:
         B = int(B)
     except (TypeError, ValueError):
@@ -1915,16 +1903,10 @@ _FO_FULL_CAP_BYTES = 64 << 20
 _FO_MINL = {}
 
 def _attn_full_width_ok(n, k, w, need_dedup):
-    # Resident bytes of the hoisted (full-width) selection tables: the block
-    # read mask [n, k], the [selected|window] valid mask [n, k + w], the
-    # per-row any-reduction [n], and — only when first-occurrence dedup is
-    # actually needed — its keep mask [n, k].  The old test charged n·k²
-    # *elements* regardless of dedup, which forced the per-chunk fallback for
-    # read-everything arms (topk_distinct=True) as soon as the block count
-    # grew: at T=8192 / block 64 an HCA layer holds k=128, but n·k² = 134M
-    # tripped the 64MB cap even though the real tables are ~2MB.  The
-    # per-chunk form is value-identical, so this only changes which
-    # value-identical path runs.
+    # Element count of the hoisted selection tables: the block read mask
+    # [n, k], the [selected|window] valid mask [n, k + w], the per-row
+    # any-reduction [n], and — only when first-occurrence dedup is needed —
+    # its keep mask [n, k].  The per-chunk form is value-identical.
     elems = int(n) * (int(k) + int(w) + 1 + (int(k) if need_dedup else 0))
     return elems <= _FO_FULL_CAP_BYTES
 
@@ -3307,7 +3289,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     train_ids = stream_tokenise('train', n_train_tokens + seq_len, 'train')
     print(f'[data] train tokens = {len(train_ids)}  vocab = {vocab}')
     if len(train_ids) < n_train_tokens + seq_len:
-        print(f'[data] WARNING: the train split ran dry at {len(train_ids)} tokens (< requested {n_train_tokens + seq_len}); runs configured for the advertised token budget will train on fewer tokens than advertised')
+        print(f'[data] WARNING: the train split ran dry at {len(train_ids)} tokens (< requested {n_train_tokens + seq_len}); runs configured for the advertised token target will train on fewer tokens than advertised')
     print('[data] tokenising validation ...')
     val_ids = stream_tokenise('validation', val_seqs * seq_len + seq_len, 'val')
     n_val = min(len(val_ids) // seq_len, val_seqs)
@@ -3838,7 +3820,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         n_train = min(n_train_total, cap_train)
         print(f'[data] train tokens = {n_train}  vocab = {vocab}')
         if n_train < cap_train:
-            print(f'[data] WARNING: the source ran dry at {n_train} train tokens (< requested cap {cap_train}); runs configured for the advertised token budget will train on fewer tokens than advertised')
+            print(f'[data] WARNING: the source ran dry at {n_train} train tokens (< requested cap {cap_train}); runs configured for the advertised token target will train on fewer tokens than advertised')
         print('[data] tokenising fineweb validation holdout ...')
         with open(raw_val, 'wb') as fh:
             stop = False
@@ -4141,9 +4123,7 @@ _PINNED_HOST_CACHE = {}
 # 整份 pinned 的字节上限（见 batch_iter）：超出时改走普通宿主张量 + 每步
 # pinned 暂存上传。
 _PINNED_HOST_CAP_BYTES = 4 << 30
-# 语料整份驻留 GPU 的字节上限（见 batch_iter）。每步只取 B·(seq_len+1) 个
-# 整数，走 pinned 宿主张量 + 每步暂存上传的代价远小于把几百 MB 语料钉在
-# 显存里；上限随模型规模保持不变，所以扩规模时显存不会被语料缓存吃掉。
+# 语料整份驻留缓存的字节上限（见 batch_iter）；超出时按步暂存。
 _GPU_CORPUS_CACHE_BYTES = 64 << 20
 
 def _ids_narrow(train_ids):
@@ -5079,7 +5059,7 @@ def run_cfg_knobs(fp):
     """Best-effort decode of a `_run_fp` string into its named training knobs.
 
     Used only for the audit display: it lets the report SHOW that two arms
-    share optimizer / schedule / budget / data, instead of asserting it.
+    share optimizer / schedule / training length / data, instead of asserting it.
     `{}` means the string predates the current layout or is malformed.  The
     authoritative controlled-variable gate is still whole-string equality in
     `pair_reason` — this decoder never substitutes for it."""
@@ -5203,7 +5183,7 @@ def ppl_by_seed_grouped(outdir):
 # 臂。审计对每条对照：(1) 用 `pair_reason` 验证两臂严格同 run_cfg——优化器、
 # 学习率调度、权重衰减、训练步数/ token、warmup、comp 正则、模型形状、数据
 # 指纹与确定性档全部一致，只有层架构（variant）不同；(2) 逐种子配对给出
-# mean±std、d_z 与精确符号翻转 p；(3) 用 |mean| <= std 标出「噪声级提升」、
+# mean±std、d_z 与精确符号翻转 p；(3) 用 |mean| <= std 标出「差异落在种子噪声内」、
 # 用 n<3 标出欠功效；(4) 汇总每个创新点是否至少有一条完整留一对照。
 # 符号约定：Δ = 「带模块」−「去模块」，PPL 越低越好，故 Δ<0 = 模块有用。
 ABLATION_DESIGN = {
@@ -5257,7 +5237,7 @@ BASELINE_DESIGN = {
 # 是否存在差异，不允许声称方向性优势）。
 HYPOTHESIS_DESIGN = {
     'dynamic_blocking': {
-        'statement': 'Content-adaptive dynamic blocking lowers validation PPL versus fixed blocking at the same parameter count, data order and training budget.',
+        'statement': 'Content-adaptive dynamic blocking lowers validation PPL versus fixed blocking at the same parameter count, data order and training length.',
         'mechanism': 'Learned cosine boundaries place cuts at low-similarity token transitions, so fewer cross-boundary tokens are compressed together.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
@@ -5285,7 +5265,7 @@ HYPOTHESIS_DESIGN = {
         'falsifier': 'Removing the sink does not increase PPL beyond seed noise, or improves it.',
     },
     'compression_regularizer': {
-        'statement': 'The compression regularizer lowers validation PPL at the same architecture and optimization budget.',
+        'statement': 'The compression regularizer lowers validation PPL at the same architecture and optimization setting.',
         'mechanism': 'The loss term discourages degenerate block boundaries and keeps compression from collapsing to fixed chunks.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
@@ -5299,7 +5279,7 @@ HYPOTHESIS_DESIGN = {
         'falsifier': 'The learned gate matches or loses to the fixed fusion rule after Holm correction.',
     },
     'hybrid_hierarchy': {
-        'statement': 'The CSA+HCA hybrid lowers validation PPL versus CSA-only at matched parameters and budget.',
+        'statement': 'The CSA+HCA hybrid lowers validation PPL versus CSA-only at matched parameters and training length.',
         'mechanism': 'Alternating local HCA layers and sparse CSA layers cover complementary short- and long-range structure.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
@@ -5309,8 +5289,8 @@ HYPOTHESIS_DESIGN = {
 
 BASELINE_HYPOTHESIS_DESIGN = {
     'compression_vs_matched_dense': {
-        'statement': 'Dynamic CSA lowers validation PPL versus parameter-matched dense baselines under identical data, optimizer, schedule and budget.',
-        'mechanism': 'Sparse compressed reads can preserve long-range access at lower attention cost while the parameter-matched MLP keeps capacity equal.',
+        'statement': 'Dynamic CSA lowers validation PPL versus parameter-matched dense baselines under identical data, optimizer, schedule and training length.',
+        'mechanism': 'Sparse compressed reads can preserve long-range access while the parameter-matched MLP keeps capacity equal.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
         'falsifier': 'A matched dense baseline matches or beats CSA after Holm correction, or the parameter matching fails.',
@@ -5562,7 +5542,7 @@ def metric_policy_audit(summary=None, policy=None):
     return out
 
 def baseline_tuning_audit(selected=None, path=None, protocol=None):
-    """Audit the equal-budget baseline-tuning evidence.
+    """Audit the equal-search baseline-tuning evidence.
 
     A win over an untuned dense baseline establishes only that the proposed
     model beats a straw man.  This audit requires, for every compared arm:
@@ -5692,7 +5672,7 @@ def _variant_seed_map(summary):
 def _paired_seed_deltas(recs, a, b):
     """Per-protocol-condition per-seed (a − b) deltas over seeds where BOTH arms
     have a measurable record AND `pair_reason` confirms identical run_cfg /
-    training budget.
+    training length.
 
     Protocol conditions are matched exactly as `_print_pairs` does: equal
     non-empty tags pair together, and a tagged arm may pair against a pure-base
@@ -5845,7 +5825,7 @@ def controlled_variables_report(recs, arms):
     # Seed/protocol coverage: arm means are only directly comparable when
     # every arm averaged the same seeds under the same measurement protocol.
     # Paired contrasts already use only shared seeds, but an unequal arm still
-    # changes the descriptive mean±std and can hide a lost seed (OOM / cap /
+    # changes the descriptive mean±std and can hide a lost seed (crash / cap /
     # error).  Report the exact coverage; None means no arm has a record.
     _seed_sets = {}
     for (v, t, s) in recs:
@@ -6014,7 +5994,7 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
         ALL 2**k combinations must be mapped, present and unique; a 7-of-8
         panel is reported with its exact missing combination (e.g. C alone)
         rather than being described as a full factorial.  This is the
-        more-expensive design the task brief allows as an alternative to
+        larger design the task brief allows as an alternative to
         leave-one-out.
 
     Returns a machine-readable dict; never raises on a partial panel.
@@ -6106,7 +6086,7 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
     return out
 
 def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, variants=None):
-    """Prospective seed budget for a planned panel.
+    """Prospective seed plan for a planned panel.
 
     Returns the declared family size and the minimum n at which a
     Holm-corrected exact sign-flip test could reject at `alpha` if every seed
@@ -6440,7 +6420,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         report['untuned_verified_baselines'] = [] if _tv else list(report.get('verified_baselines') or [])
         if not _tv:
             report['warnings'].append(
-                'baseline claims have no verified equal-budget tuning artifact (%s) — a win over an untuned baseline is not evidence that the method beats a well-tuned baseline; run baseline_tune.py and put baseline_tuning.json next to this panel'
+                'baseline claims have no verified equal-search tuning artifact (%s) — a win over an untuned baseline is not evidence that the method beats a well-tuned baseline; run baseline_tune.py and put baseline_tuning.json next to this panel'
                 % (report['baseline_tuning'].get('status') or 'missing'))
     if report['hypotheses_missing']:
         report['warnings'].append('no pre-registered hypothesis for: ' + ', '.join(sorted(set(report['hypotheses_missing']))) + ' — direction cannot be checked, so a significant result is at most measured')
@@ -6543,7 +6523,7 @@ def _print_methodology_audit(report):
         if report.get('verified_baselines'):
             print('  statistically verified baseline claims (NOT yet evidence against a tuned baseline): ' + ', '.join(report['verified_baselines']))
         if report.get('tuned_verified_baselines'):
-            print('  tuned verified baseline claims (equal-budget tuning artifact present): ' + ', '.join(report['tuned_verified_baselines']))
+            print('  tuned verified baseline claims (equal-search tuning artifact present): ' + ', '.join(report['tuned_verified_baselines']))
         if report.get('untuned_verified_baselines'):
             print('  statistically verified but UNTUNED baseline claims (not evidence against a tuned baseline): ' + ', '.join(report['untuned_verified_baselines']))
         if report.get('direction_conflict_baselines'):
@@ -7250,7 +7230,7 @@ def _cluster_expected_matches(win, cl, tol, P, n_pos, approx_flag=None):
         _work = _subset_work(a_max, rmax)
         if approx_flag is not None:
             approx_flag.append((a_max, _AMP_WORK_CAP, _work))
-        print(f'[stats] WARNING: `_random_cut_precision` is APPROXIMATING: a single candidate component holds {a_max} positions and needs {_work} subset scorings, past the enumeration budget of {_AMP_WORK_CAP}, so `bnd_rand` (and hence `bnd_excess`) for this sample is a Monte-Carlo estimate ({_AMP_FALLBACK_DRAWS} draws), NOT the exact probability the other panels report.  Record it as `bnd_rand_exact: False` and do not pool it with the exact readings.')
+        print(f'[stats] WARNING: `_random_cut_precision` is APPROXIMATING: a single candidate component holds {a_max} positions and needs {_work} subset scorings, past the enumeration limit of {_AMP_WORK_CAP}, so `bnd_rand` (and hence `bnd_excess`) for this sample is a Monte-Carlo estimate ({_AMP_FALLBACK_DRAWS} draws), NOT the exact probability the other panels report.  Record it as `bnd_rand_exact: False` and do not pool it with the exact readings.')
         seed = (int(n_pos) * 1000003 + int(P) * 10007 + int(tol) * 101 + int(a) * 17 + cl_t[0]) % 2 ** 32
         rng = np.random.default_rng(seed)
         wts = []
@@ -7271,15 +7251,15 @@ def _cluster_expected_matches(win, cl, tol, P, n_pos, approx_flag=None):
             # sizes, one draw each, so the actual number of draws never
             # exceeds the declared _AMP_FALLBACK_DRAWS limit.
             _keep = set(order[:_AMP_FALLBACK_DRAWS])
-            budget = [1 if i in _keep else 0 for i in range(nb_r)]
+            draws = [1 if i in _keep else 0 for i in range(nb_r)]
         else:
             per = max(1, _AMP_FALLBACK_DRAWS // nb_r)
-            budget = [per] * nb_r
+            draws = [per] * nb_r
             for i in range(_AMP_FALLBACK_DRAWS - per * nb_r):
-                budget[order[i % nb_r]] += 1
+                draws[order[i % nb_r]] += 1
         total = 0.0
         for i, (r, lw) in enumerate(wts):
-            n_draw = budget[i]
+            n_draw = draws[i]
             if n_draw <= 0:
                 continue
             subs = [_sample_r_subset(rng, A, r) for _ in range(n_draw)]
@@ -7996,7 +7976,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     elif not loss_decreased:
         report['diagnosis'] = 'loss did not decrease on the fixed batch (optimizer/step or graph is not wired through)'
     else:
-        report['diagnosis'] = 'loss did not converge on a single repeated batch within the step budget'
+        report['diagnosis'] = 'loss did not converge on a single repeated batch within the step limit'
     del model, opt, ids_full, x, y
     gc.collect()
     if device.type == 'cuda':
@@ -8198,7 +8178,7 @@ def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False):
         if not r['passed']:
             _msg = f"same-machine reproducibility check FAILED for `{v}` ({r['diagnosis']})"
             if _want_strict:
-                raise RuntimeError(_msg + ' — CSA_REQUIRE_REPRO=1 makes this fatal. Fix the seed/kernel nondeterminism or unset the flag to accept it.')
+                raise RuntimeError(_msg + ' — CSA_REQUIRE_REPRO=1 makes this fatal. Correct the seed/kernel nondeterminism or unset the flag to accept it.')
             print(f'[repro] WARNING: {_msg}; the panel will record the failure (set CSA_REQUIRE_REPRO=1 to make it fatal, CSA_SKIP_REPRO=1 to skip)')
     return reports
 
@@ -9408,7 +9388,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
     _planned_keys = [f'{v}::seed{seed}' for seed in cfg.get('seeds') or [] for v in cfg.get('variants') or []]
     # Crash-safe tracking: publish the panel's identity (code/data versions,
-    # hyperparameters, planned cells) BEFORE the first expensive cell can be
+    # hyperparameters, planned cells) BEFORE the first cell can be
     # killed.  The final write below flips the status to complete and lists
     # every planned cell that produced no measurement.
     write_run_manifest(outdir, cfg, fp, prov, _read_summary_json(summary_path), sanity=(_sanity or None), reproducibility=(_repro or None), status='running', planned_cells=_planned_keys, started_at=_panel_started)

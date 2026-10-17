@@ -30,7 +30,7 @@
   failures     失败与缺失：error 记录按臂集中度（选择偏差读数，零 GPU）
   budget       规模核算：6ND 代理 FLOPs 估算 + TimeGuard 实测用时对账
                （理论 FLOPs ≠ 实测速度，两者并列报告，零 GPU）
-  efficiency   prefill/decode/峰值内存测量工具（需要模型；给出可复用函数
+  efficiency   prefill/decode/容量读数工具（需要模型；给出可复用函数
                与 CPU 微型演示——不是实验，是测量代码自检）
   report       汇总运行本地可执行的全部审计，输出 audit_report.json
 
@@ -501,14 +501,14 @@ def audit_causality():
 
 
 # ---------------------------------------------------------------------------
-# 3) attribution：动态/固定分块的块数、压缩率、计算开销对齐读数
+# 3) attribution：动态/固定分块的块数、压缩率、计算量对齐读数
 # ---------------------------------------------------------------------------
 
 def audit_attribution(outdirs=None):
     """动态分块归因审计（零 GPU，读 results_*/summary.json + ckpt 元数据）。
 
     评审问题：固定块与动态块是否匹配实际块数、压缩率、可读摘要数量和
-    计算开销。本审计从落盘训练记录的 by_len / _stats / 参数量字段重算
+    计算量。本审计从落盘训练记录的 by_len / _stats / 参数量字段重算
     每臂的：参数量、（若启用块统计）块长分布与边界对齐读数，并输出
     「臂间块数是否对齐」的对照表。检查 `attn._stats`（enable_block_stats
     收集的块 id bincount，design_notes §14 同口径）是否在场。"""
@@ -640,7 +640,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
     核验点：冻结四臂的 run_cfg（lr/wd/steps/token/warmup/形状）逐字段一致
     （exp_lib.pair_reason 口径）；train_knobs（优化器/betas/eps/裁剪/调度）
     一致；mlp_ratio 只在「参数量匹配」臂上有差异且被显式记录。任何臂间
-    单独调参会在此被点名，而不是混进「提升」里。"""
+    单独调参会在此被点名，而不是混进「方法效果」里。"""
     summ = _load(summary_path)
     if summ is None:
         out = {'status': 'not_verifiable_locally', 'note': f'{summary_path} absent — needs the training records of the frozen arms'}
@@ -691,7 +691,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
             cv = L.controlled_variables_report(recs_map, _cv_arms)
             out['controlled_variables'] = cv
             if cv.get('run_cfg_equal') is False:
-                problems.append('run_cfg differs across arms — the training budget / data / architecture knobs are not controlled; pair_reason would refuse every pairing')
+                problems.append('run_cfg differs across arms — the training length / data / architecture knobs are not controlled; pair_reason would refuse every pairing')
             if cv.get('train_knobs_equal') is False:
                 problems.append('train_knobs differ across arms (optimizer / betas / eps / lr-schedule / grad-clip / augmentation) — a gain from a different optimizer is not a gain from the method')
             if cv.get('hyperparams_equal') is False:
@@ -719,7 +719,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
                         problems.append(f'{a}: a record whose run_cfg does not equal the {ref_arm} reference (pair_reason would refuse this pairing)')
                         break
         # Seed coverage: arm means are only comparable if they average the
-        # same seeds.  An arm that silently lost a seed (OOM / cap / error)
+        # same seeds.  An arm that silently lost a seed (crash / cap / error)
         # must not be compared against one that kept it.
         if all(all(r.get('run_cfg') is not None for r in per_arm[a]) for a in per_arm):
             _cover = {}
@@ -737,7 +737,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
     out['tuning'] = L.baseline_tuning_audit(path=os.path.join(REPO, 'results_baseline_tuning', 'baseline_tuning.json'))
     out['warnings'] = warnings
     if not out['tuning'].get('tuning_verified'):
-        out['warnings'].append('no equal-budget baseline tuning artifact — a win over these baselines is not yet evidence against a well-tuned baseline; run baseline_tune.py')
+        out['warnings'].append('no equal-search baseline tuning artifact — a win over these baselines is not yet evidence against a well-tuned baseline; run baseline_tune.py')
     out['status'] = ('fail' if problems else
                      'warn' if out['warnings'] else
                      ('not_verifiable_locally' if _unverifiable else 'ok'))
@@ -752,7 +752,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
 def audit_failures(outdirs=None):
     """失败集中度（零 GPU）：error/NaN/截断记录按臂分布的读数。
 
-    评审问题：OOM/NaN/超时是否集中在某些臂；仅保留成功运行是否构成
+    评审问题：崩溃/NaN/超时是否集中在某些臂；仅保留成功运行是否构成
     选择偏差。本审计把 error 记录按 (臂, 错误类型) 计数，并给出描述性
     集中度（不主张显著性——小样本下显著性检验本身功效不足）。"""
     out = {'status': 'ok', 'panels': {}}
@@ -882,15 +882,15 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
 # ---------------------------------------------------------------------------
 
 def train_flops_estimate(params, tokens, attn_overhead=0.35):
-    """6ND 估算 + 注意力开销系数（评审二轮·意见七：代理 ≠ 实测）。
+    """6ND 估算 + 注意力项系数（评审二轮·意见七：代理 ≠ 实测）。
 
     6·N·D 是前向+反向的主流近似；稀疏选择/池化/激活重算与长序列注意力
-    不与参数量成比例，这里用一个**显式声明的**注意力开销系数给上界感，
+    不与参数量成比例，这里用一个**显式声明的**注意力项系数给上界感，
     报告时必须同时给出 TimeGuard 实测秒数——两个口径并列，不得只报其一。"""
     n = float(params)
     d_tok = float(tokens)
     base = 6.0 * n * d_tok
-    return {'flops_6nd': base, 'flops_with_attn_proxy': base * (1.0 + attn_overhead), 'attn_overhead_assumed': attn_overhead, 'note': 'analytic PROXY, not measured throughput; pair with TimeGuard seconds before any efficiency claim'}
+    return {'flops_6nd': base, 'flops_with_attn_proxy': base * (1.0 + attn_overhead), 'attn_overhead_assumed': attn_overhead, 'note': 'analytic PROXY, not a measurement; report alongside TimeGuard seconds'}
 
 
 def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.json'), panels=(('results_lm_v10_scale_s', 'csa_fixed', 8000), ('results_lm_v10_scale_l8k', 'csa_fixed', 8000), ('results_lm_v10_scale_lflop', 'csa_fixed', None))):
@@ -926,7 +926,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
 # ---------------------------------------------------------------------------
 
 def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
-    """端到端 prefill / 增量 decode 计时 + 峰值内存（测量代码，非实验）。
+    """端到端 prefill / 增量 decode 计时 + 峰值设备占用（测量代码，非实验）。
 
     评审问题：理论 FLOPs 被当成实测速度。本函数给出可复用的测量口径：
     prefill = 整段前向一次的墙钟；decode = 逐 token 前缀推进的墙钟与

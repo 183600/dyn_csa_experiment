@@ -96,7 +96,7 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
             raise ValueError(f'explicit split sizes {sizes} exceed n={n}')
         # Fill unspecified entries, letting the last one absorb the remainder.
         # Earlier unspecified splits take their fractional target only while
-        # rows remain; clamping to the remaining budget keeps every size
+        # rows remain; clamping to the remaining count keeps every size
         # non-negative even when an explicit size or a large fraction would
         # otherwise overdraw it (the last split then takes whatever is left).
         fracs = (train_frac, val_frac, test_frac)

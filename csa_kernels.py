@@ -441,7 +441,7 @@ def _gather_rows(x, idx):
 
 
 def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
-    """池化前向的 torch 参考实现（按块分块，内存有界）。
+    """池化前向的 torch 参考实现（按块分块）。
 
     eager 语义对齐点：
     - 泳道 logits：Za[g] + B_pos_a[j]（A 泳道）/ Zb[g] + B_pos_b[b_off]
@@ -2155,7 +2155,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     """csa/hca 层的批量化内核前向（对应 eager 的 forward 稀疏分支 + _single）。
 
     输入：attn = HybridAttention 实例；x [B, T, d]；pre_all/gate_sigs/pre_blocks
-    = exp_lib.HybridAttention.forward 已算好的批量提升（门控信号 / 块几何）。
+    = exp_lib.HybridAttention.forward 已算好的批量门控信号 / 块几何。
     返回 outs [B, T, d]，并按 eager 同口径设置 attn.last_gate_mean。
 
     语义对齐（相对 eager 的 _single）：
@@ -2181,7 +2181,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         raise RuntimeError('CSA_KERNEL 只支持 learned indexer（indexer_mode != "learned" 的臂请回退 eager）')
     if cfg.chunking == 'cosine_learnable':
         if pre_blocks is None or gate_sigs is None:
-            raise RuntimeError('cosine_learnable 层需要 forward 提升的门控信号与块几何')
+            raise RuntimeError('cosine_learnable 层需要 forward 预计算的门控信号与块几何')
         bids = [pb[0] for pb in pre_blocks]
         nblks = [pb[1] for pb in pre_blocks]
         hons = [pb[2] for pb in pre_blocks]
@@ -2250,10 +2250,9 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     _kvh = attn.W_kvhead(torch.cat([core_kv.reshape(B * Bm, kv), kv_local.reshape(B * T, kv)], 0))
     _rows = B * Bm + B * T
     _nhq = attn.nh * attn.hd
-    # One row-wise normalize over the fused K columns replaces the two
-    # per-half normalizations: each row's norm/divide is independent, so the
-    # values are identical while one allocation/launch and one transient
-    # table disappear (the same form exp_lib._single uses).  V needs no
+    # One row-wise normalize over the fused K columns: each row's norm/divide
+    # is independent, so the values are identical to the two per-half
+    # normalizations (the same form exp_lib._single uses).  V needs no
     # normalization.
     _k_all = F.normalize(_kvh[:, :_nhq].view(_rows, attn.nh, attn.hd), dim=-1)
     _v_all = _kvh[:, _nhq:].view(_rows, attn.nh, attn.hd)
@@ -2427,7 +2426,7 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
         results[f'pool.{nm}'] = mrel(ker[i], ref[i])
     if verbose:
         print(f'[selfcheck:{impl}:{str(dtype)}] pool  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith('pool.')))
-    # Multi-chunk regression: shrinking _POOL_CHUNK_BYTES exercises the b0>0
+    # Multi-chunk check: shrinking _POOL_CHUNK_BYTES exercises the b0>0
     # rebasing in the chunked backward (the default chunk size would keep this
     # tiny case single-chunk).
     _saved_chunk = _POOL_CHUNK_BYTES

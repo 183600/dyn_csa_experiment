@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""baseline_tune.py — equal-budget tuning for the simple baselines and the
+"""baseline_tune.py — equal-search tuning for the simple baselines and the
 proposed attention arm.
 
 Why this exists: a sparse/dynamic arm that only beats a dense baseline at the
@@ -67,7 +67,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         search_steps = int(base['steps'])
     search_seed = int(protocol.get('search_seed', 0))
     os.makedirs(outdir, exist_ok=True)
-    print(f'[tune] equal-budget grid: {len(arms)} arms x {len(trials)} trials x {search_steps} steps, selection={protocol["selection_metric"]} on {protocol["selection_split"]}')
+    print(f'[tune] equal-search grid: {len(arms)} arms x {len(trials)} trials x {search_steps} steps, selection={protocol["selection_metric"]} on {protocol["selection_split"]}')
     L.overfit_guard(arms, steps=200, vocab=256)
     per_arm = {a: [] for a in arms}
     for ti, knobs in enumerate(trials):
@@ -126,7 +126,7 @@ def _relaxed_pair_reason(a, b, tuned_arms):
     architecture changes.  After independent tuning, the selected lr/wd/warmup
     may legitimately differ per arm.  This rule therefore requires every
     non-tuned field to match (data/val fingerprints, steps, tokens, params) and
-    records the fact that both arms received the same declared search budget.
+    records the fact that both arms received the same declared search range.
     It is deliberately a separate rule: strict architectural contrasts and
     tuned-vs-tuned contrasts must not be silently pooled.
     """
@@ -149,7 +149,7 @@ def _relaxed_pair_reason(a, b, tuned_arms):
     except (TypeError, ValueError):
         pass
     if tuned_arms.get(a.get('variant')) != tuned_arms.get(b.get('variant')):
-        return 'arms did not receive the same declared tuning budget'
+        return 'arms did not receive the same declared tuning range'
     return None
 
 

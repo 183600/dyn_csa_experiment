@@ -329,5 +329,5 @@ if __name__ == '__main__':
                 traceback.print_exc()
             schedule_shutdown(2400)
         else:
-            print(f'\n[m0] CRASHED in `{mode}` mode — the tree can hold half-written throwaway output, so NOTHING was committed or pushed and no shutdown was scheduled.  Fix the defect and re-run; `smoke` exists to catch exactly this.')
+            print(f'\n[m0] CRASHED in `{mode}` mode — the tree can hold half-written throwaway output, so NOTHING was committed or pushed and no shutdown was scheduled.  Repair the defect and re-run; `smoke` exists to catch exactly this.')
         sys.exit(1)

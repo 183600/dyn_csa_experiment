@@ -1139,7 +1139,7 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
                 if chunk <= 1:
                     raise
                 chunk = max(1, chunk // 2)
-                print(f'[niah] eval OOM; retrying with chunk={chunk}')
+                print(f'[niah] eval device-memory exhaustion; retrying with chunk={chunk}')
                 continue
             _t = tgt_dev[i:j, -(tail - 1):]
             correct_dev[i:j] = (logits[:, :-1].argmax(-1) == _t) & (_t >= 0)
