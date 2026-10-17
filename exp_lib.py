@@ -563,6 +563,10 @@ _CAUSAL_DONOR = -1
 _CAUSAL_TRI = None
 
 def _causal_donor(device, width):
+    # 单一共享 bool donor（True = j > i 的被掩 lane）：同一 [width, width]
+    # 表按 [:T, :T] 切片服务一切 T <= width；_mask_buffer 的 causal 分支
+    # 说明它替代旧 fp32 0/-inf 加性 donor 的逐位论证。donor 永驻
+    #（pinned key），随 width 单调重建。
     global _CAUSAL_TRI
     dev_s = _dev_str(device)
     held = _CAUSAL_TRI
@@ -579,10 +583,10 @@ _IDX_CACHE_BYTES = 0
 _MASK_CACHE_BUDGET_BYTES = 192 << 20
 
 def _mask_budget(n):
-    # [T,T] fp32 mask 单张占 4·T² 字节；pinned 的 causal donor 与
-    # bandw/cw/cwf 三种形式需要同时驻留，上限随 T 放大让这几张 mask
-    # 共存；只影响缓存命中，不影响任何值。
-    return max(_MASK_CACHE_BUDGET_BYTES, 6 * int(n) * int(n) * 4)
+    # 驻留 mask 尺寸随 T 增长：pinned 的 causal donor 与 cw 现为 bool 表
+    #（各 T² 字节），cwf（SDPA 的加性形式）与 bandw/zero 仍为 4·T² 字节；
+    # 上限随 T 放大让这几张 mask 共存，只影响缓存命中，不影响任何值。
+    return max(_MASK_CACHE_BUDGET_BYTES, 6 * int(n) * int(n))
 
 def _cache_bytes(t):
     if t is None:
@@ -716,26 +720,31 @@ def _causal_window_mask_build(T, window, device, dtype):
 
 _DENSE_MASK_ROW_CAP_BYTES = 256 << 20
 
-def _dense_causal_window_rows(T, window, s, e, device, dtype):
-    # Row slice [s:e] of the dense causal/window additive mask.  The allowed
-    # lanes are exactly (i-window < j <= i) with the same 0.0 / -inf
-    # constants, so the values are identical to
-    # `_causal_window_mask_build(...)[s:e]`.
-    pos = _arange_cache(T, device)
-    q = pos[s:e, None]
-    j = pos[None, :]
-    if window <= 0 or window >= T:
-        bad = j > q
-    else:
-        bad = (j > q) | (j <= q - int(window))
+def _dense_causal_window_rows(T, window, s, e, device):
+    # Row slice [s:e] of the dense causal/window masked-lane table: allowed
+    # lanes are exactly (i-window < j <= i), the same lanes
+    # `_causal_window_mask_build` fills with -inf, so masked_fill_ with this
+    # table writes exactly the -inf the additive row slice added.  The bool
+    # table is T/4 smaller than the fp32 rows and replaces the per-chunk
+    # [rows, T] fp32 zeros+fill materialization entirely (the fill runs
+    # straight on the logits).  Built outside inference mode so a row slice
+    # first built during eval can still serve training (masked_fill_ saves
+    # the mask for backward).
     with torch.inference_mode(False):
-        m = torch.zeros((e - s, T), device=device, dtype=dtype)
-    m.masked_fill_(bad, float('-inf'))
-    return m
+        pos = _arange_cache(T, device)
+        q = pos[s:e, None]
+        j = pos[None, :]
+        if window <= 0 or window >= T:
+            bad = j > q
+        else:
+            bad = (j > q) | (j <= q - int(window))
+        return bad
 
 def causal_window_mask_f(T, window, device, dtype):
-    """causal_window_mask 的目标 dtype 形式（逐元素 cast 对 0/-inf 精确；
-    缓存键含 dtype，mask 下游只读）。dtype 相同则无新分配。"""
+    """SDPA 的加性 0/-inf mask（attn_mask 只吃加性形式；0 与 -inf 的逐元素
+    cast 对任何浮点 dtype 精确，缓存键含 dtype，mask 下游只读）。dtype 相同
+    则无新分配。window<=0/>=T 的因果分支由 bool donor（`causal_mask`）现做
+    masked_fill 重建——0.0/-inf 与旧 fp32 donor 的 .to(dtype) 逐元素相同。"""
     key = (_dev_str(device), 'cwf', int(T), int(window), str(dtype))
     if window <= 0 or window >= T:
         base = causal_mask(T, device)
@@ -744,7 +753,8 @@ def causal_window_mask_f(T, window, device, dtype):
         m = _MASK_CACHE.get(key)
         if m is None:
             with torch.inference_mode(False):
-                m = base.to(dtype)
+                m = torch.zeros((T, T), device=device, dtype=dtype)
+                m.masked_fill_(base, float('-inf'))
             _cache_put(_MASK_CACHE, key, m, _mask_budget(T), _mask_cache_total)
         return m
     m = _MASK_CACHE.get(key)
@@ -781,7 +791,18 @@ def _tri_full(n, device, k):
 
 def _mask_buffer(n, device, kind):
     if kind == 'causal':
-        return _tri_full(n, device, 1)
+        # Boolean masked-lane table (True = j > i), the form `_sink_attn_chunk`
+        # consumes via masked_fill_: the old fp32 donor held exactly 0.0 / -inf
+        # and was ADDED to the logits, and x + 0.0 == x for every finite x
+        # except -0.0 -> +0.0 (whose exp is 1.0 either way, so the softmax row
+        # sums — and every downstream value/grad — are bit-identical), while
+        # the masked lanes are written to exactly the same -inf constant the
+        # additive form produced.  Storing the [width, width] donor as bool
+        # keeps the same lane table in width**2 bytes instead of 4·width**2
+        # (the [T,T] mask resident size dominates mask-cache memory as T
+        # grows); only the representation changes, never a value.
+        with torch.inference_mode(False):
+            return torch.ones((n, n), device=device, dtype=torch.bool).triu_(1)
     key = (_dev_str(device), kind, int(n))
     buf = _MASK_CACHE.get(key)
     if buf is not None:
@@ -810,12 +831,18 @@ def window_band(T, window, device):
     return buf
 
 def causal_window_mask(T, window, device):
+    # Boolean masked-lane table (True = masked): the same lanes the additive
+    # fp32 build filled with -inf, consumed by `_sink_attn_chunk`'s
+    # masked_fill_ — bit-identical logits after the fill (see
+    # `_mask_buffer`'s causal note), T²/8 bytes resident instead of 4·T².
     if window <= 0 or window >= T:
         return causal_mask(T, device)
     key = (_dev_str(device), 'cw', int(T), int(window))
     m = _MASK_CACHE.get(key)
     if m is None:
-        m = _causal_window_mask_build(T, window, device, torch.float32)
+        with torch.inference_mode(False):
+            pos = _arange_cache(T, device)
+            m = (pos[None, :] > pos[:, None]) | (pos[None, :] <= pos[:, None] - int(window))
         _cache_put(_MASK_CACHE, key, m, _mask_budget(T), _mask_cache_total)
     return m
 
@@ -2289,11 +2316,12 @@ class HybridAttention(nn.Module):
             scale = 1.0
         else:
             scale = 1.0 / math.sqrt(self.hd)
-        # Both branches build the same additive mask values: a full cached
-        # mask within the row cap, or the matching row slice per chunk beyond
-        # it.  The fused SDPA path for a sliding window needs the full mask,
-        # so it is used only within the row cap; otherwise the chunked manual
-        # path below is used (sink-free chunks are supported).
+        # Both branches build the same masked-lane tables: a full cached
+        # bool mask within the row cap, or the matching row slice per chunk
+        # beyond it.  The fused SDPA path for a sliding window needs the full
+        # additive mask (causal_window_mask_f), so it is used only within the
+        # row cap; otherwise the chunked manual path below is used (sink-free
+        # chunks are supported).
         _use_full_mask = T * T * 4 <= _DENSE_MASK_ROW_CAP_BYTES
         if self.sink is None and (self.cfg.window <= 0 or _use_full_mask):
             sdpa_kw = dict(scale=scale)
@@ -2336,13 +2364,21 @@ class HybridAttention(nn.Module):
     def _sink_attn_chunk(self, q_c, k, v, mask_c, sink_view, scale):
         if isinstance(mask_c, tuple):
             s, e, T, window = mask_c
-            mask_c = _dense_causal_window_rows(T, window, s, e, q_c.device, torch.float32)
+            mask_c = _dense_causal_window_rows(T, window, s, e, q_c.device)
         logits = torch.einsum('bnhd,bmhd->bhnm', q_c, k)
         if scale != 1.0:
             # same IEEE identity as gathered_attention (x·1.0 and its backward
             # grad·1.0 are bit-identical to no-op).
             logits.mul_(scale)
-        logits.add_(mask_c)
+        # The mask is the boolean masked-lane table; the fill writes exactly
+        # the -inf the additive 0/-inf form added.  x + 0.0 == x except
+        # -0.0 -> +0.0 (exp is 1.0 either way, so the softmax/logsumexp row
+        # reduction sees the same finite lane values in the same order and
+        # every downstream value is bit-identical), and the fill's backward
+        # zeroes exactly the lanes the softmax backward already scaled by
+        # p_i == 0 in the additive form — unmasked lanes pass the identical
+        # grad through in both forms.
+        logits.masked_fill_(mask_c, float('-inf'))
         if sink_view is not None:
             lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
             # logsumexp 的反向保留其输入 logits，sub 必须出位（保留值与新

@@ -225,10 +225,14 @@ class HybridAttentionRoPE(L.HybridAttention):
             row_chunk = max(1, min(row_chunk, int(_budget) // _per_row))
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
-            _mask_c = mask[s:e] if _use_full_mask else L._dense_causal_window_rows(T, cfg.window, s, e, x.device, torch.float32)
+            _mask_c = mask[s:e] if _use_full_mask else L._dense_causal_window_rows(T, cfg.window, s, e, x.device)
             logits = torch.einsum('bnhd,bmhd->bhnm', q[:, s:e], k)
             logits.mul_(scale)
-            logits.add_(_mask_c)
+            # bool masked-lane table -> fill: same -inf lanes the additive
+            # 0/-inf form added (exp(-0.0) == exp(+0.0) == 1.0 keeps the row
+            # reduction bit-identical; the fill's backward zeroes exactly the
+            # lanes the softmax backward already scaled by p_i == 0).
+            logits.masked_fill_(_mask_c, float('-inf'))
             if sink_view is not None:
                 lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
                 attn = logits.sub(lse).exp_()
@@ -522,8 +526,11 @@ class HybridAttentionRoPE(L.HybridAttention):
             logits = torch.einsum('bthd,bshd->bths', q[:, s:e], k)
             if scale != 1.0:
                 logits.mul_(scale)
-            _mask_c = mask[s:e] if _use_full_mask else L._dense_causal_window_rows(T, win if win is not None else 0, s, e, x.device, torch.float32)
-            logits.add_(_mask_c[:, None, :])
+            _mask_c = mask[s:e] if _use_full_mask else L._dense_causal_window_rows(T, win if win is not None else 0, s, e, x.device)
+            # bool masked-lane table -> fill: bit-identical logits to the
+            # additive 0/-inf form (same lanes get -inf; x + 0.0 == x except
+            # the sign of zero, whose exp is 1.0 either way).
+            logits.masked_fill_(_mask_c[:, None, :], float('-inf'))
             zflat = logits.reshape(B * (e - s), nh, T)
             if sink is None:
                 attn = L.sink_softmax(zflat, sink)
