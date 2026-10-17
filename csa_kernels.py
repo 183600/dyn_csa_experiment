@@ -2240,20 +2240,28 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     else:
         comp, last_tok, _Bn = pool_variable_blocks_kernel(Ca, pre_all['Cb'], Za, pre_all['Zb'], bid_full, geom,
                                                           attn.B_pos_a, attn.B_pos_b, impl=impl_pool)
-    attn_kv = torch.zeros_like(comp) if cfg.content_mode == 'zero' else comp
-    core_kv = F.normalize(attn_kv, dim=-1)
+    # Same value as normalizing the zero table (0/eps == 0), without the
+    # normalize kernel/transient for the zero-content ablation.
+    core_kv = (torch.zeros_like(comp) if cfg.content_mode == 'zero'
+               else F.normalize(comp, dim=-1))
     kv_local = F.normalize(Ca, dim=-1)
     Bm = geom.Bm
     kv = core_kv.shape[-1]
     _kvh = attn.W_kvhead(torch.cat([core_kv.reshape(B * Bm, kv), kv_local.reshape(B * T, kv)], 0))
-    _kb, _vb = attn._split(_kvh[:B * Bm])
-    _kw, _vw = attn._split(_kvh[B * Bm:])
-    k_blk = _kb.view(B, Bm, attn.nh, attn.hd)
-    v_blk = _vb.view(B, Bm, attn.nh, attn.hd)
-    k_sw = _kw.view(B, T, attn.nh, attn.hd)
-    v_sw = _vw.view(B, T, attn.nh, attn.hd)
-    k_blk = F.normalize(k_blk, dim=-1)
-    k_sw = F.normalize(k_sw, dim=-1)
+    _rows = B * Bm + B * T
+    _nhq = attn.nh * attn.hd
+    # One row-wise normalize over the fused K columns replaces the two
+    # per-half normalizations: each row's norm/divide is independent, so the
+    # values are identical while one allocation/launch and one transient
+    # table disappear (the same form exp_lib._single uses).  V needs no
+    # normalization.
+    _k_all = F.normalize(_kvh[:, :_nhq].view(_rows, attn.nh, attn.hd), dim=-1)
+    _v_all = _kvh[:, _nhq:].view(_rows, attn.nh, attn.hd)
+    k_blk = _k_all[:B * Bm].view(B, Bm, attn.nh, attn.hd)
+    k_sw = _k_all[B * Bm:].view(B, T, attn.nh, attn.hd)
+    v_blk = _v_all[:B * Bm].view(B, Bm, attn.nh, attn.hd)
+    v_sw = _v_all[B * Bm:].view(B, T, attn.nh, attn.hd)
+    del _kvh, _k_all, _v_all
     if cfg.kind == 'hca':
         topk_idx = _full_arange_cached(B, T, Bm, dev, contiguous=impl_attn == 'triton')
         valid = None

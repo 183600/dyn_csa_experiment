@@ -401,9 +401,10 @@ class HybridAttentionRoPE(L.HybridAttention):
         # per-chunk forms.  `topk_distinct=True` (the read-everything HCA arm's
         # arange expansion) makes first_occurrence_mask provably all-True — the
         # keep mask is then identical to the computed form.
-        if T * topk_l.shape[1] * topk_l.shape[1] <= L._FO_FULL_CAP_BYTES:
+        _dedup = (not topk_distinct) and topk_l.shape[1] > 1
+        if L._attn_full_width_ok(T, topk_l.shape[1], w, _dedup):
             _keep_all = sel_valid
-            if topk_l.shape[1] > 1 and not topk_distinct:
+            if _dedup:
                 _ddk_all = L.first_occurrence_mask(topk_l)
                 _keep_all = _ddk_all if _keep_all is None else _keep_all & _ddk_all
             if _keep_all is not None:

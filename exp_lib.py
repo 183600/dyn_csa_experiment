@@ -929,6 +929,29 @@ def _pool_block_chunk(B, per_block_elems, elem_size):
     _per = max(1, int(per_block_elems) * int(elem_size))
     return max(1, min(int(B), _POOL_TRANSIENT_BUDGET_BYTES // _per))
 
+def _pool_counts_clean(bid, B):
+    # "Every block carries at least one token" is a pure function of the
+    # segmenter's immutable counts table.  Cache it on the block-ids object
+    # (the same per-object cache convention as _pool_parts/_pool_geom): the
+    # fixed segmenter shares one object across every layer/step, so this
+    # avoids a Python min() over all block counts on each pooling call as the
+    # sequence (and therefore the block list) grows.
+    try:
+        B = int(B)
+    except (TypeError, ValueError):
+        return False
+    hit = getattr(bid, '_pool_clean', None)
+    if hit is not None and hit[0] == B:
+        return hit[1]
+    _cpu = getattr(bid, '_pool_cpu', None)
+    ok = bool(B > 0 and _cpu is not None and len(_cpu[0]) == B
+              and _cpu[0] and min(_cpu[0]) > 0)
+    try:
+        bid._pool_clean = (B, ok)
+    except (AttributeError, RuntimeError):
+        pass
+    return ok
+
 def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
     # Host-side integer flat of the pooling parts (design notes §6.2): every
     # value is an exact integer function of the cut table's own counts list
@@ -1405,8 +1428,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     # host counts we can prove that here, so the defensive nan_to_num is
     # unnecessary; the fallback keeps the defensive form for externally built
     # tables.
-    _clean = (B > 0 and _cpu is not None and len(_cpu[0]) == B
-              and bool(_cpu[0]) and min(_cpu[0]) > 0)
+    _clean = _pool_counts_clean(block_ids, B)
     comp = torch.empty(B, _Fd, device=dev, dtype=Xas.dtype)
     for _b0 in range(0, B, _chunk):
         _b1 = min(_b0 + _chunk, B)
@@ -1500,8 +1522,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     _per_elems = 3 * int(max_len) * _Fd + 4 * int(max_len)
     _chunk = _pool_block_chunk(B, _per_elems, Xs.element_size())
     _bpos = B_pos[_pos_a]
-    _clean = (B > 0 and _cpu is not None and len(_cpu[0]) == B
-              and bool(_cpu[0]) and min(_cpu[0]) > 0)
+    _clean = _pool_counts_clean(block_ids, B)
     comp = torch.empty(B, _Fd, device=dev, dtype=Xs.dtype)
     for _b0 in range(0, B, _chunk):
         _b1 = min(_b0 + _chunk, B)
@@ -1866,6 +1887,20 @@ def _sink_split_softmax(logits, sink_logits, want_sink=True):
 _FO_FULL_CAP_BYTES = 64 << 20
 _FO_MINL = {}
 
+def _attn_full_width_ok(n, k, w, need_dedup):
+    # Resident bytes of the hoisted (full-width) selection tables: the block
+    # read mask [n, k], the [selected|window] valid mask [n, k + w], the
+    # per-row any-reduction [n], and — only when first-occurrence dedup is
+    # actually needed — its keep mask [n, k].  The old test charged n·k²
+    # *elements* regardless of dedup, which forced the per-chunk fallback for
+    # read-everything arms (topk_distinct=True) as soon as the block count
+    # grew: at T=8192 / block 64 an HCA layer holds k=128, but n·k² = 134M
+    # tripped the 64MB cap even though the real tables are ~2MB.  The
+    # per-chunk form is value-identical, so this only changes which
+    # value-identical path runs.
+    elems = int(n) * (int(k) + int(w) + 1 + (int(k) if need_dedup else 0))
+    return elems <= _FO_FULL_CAP_BYTES
+
 def _finfo_min(dtype):
     # torch.finfo(dtype).min is a pure function of the dtype — the same
     # constant on every call, so it is memoised per dtype (host-side, no
@@ -1947,9 +1982,11 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # ids (the read-everything HCA arm passes an arange expansion), in which
     # case first_occurrence_mask is provably all-True — the keep mask is then
     # identical to the computed form.
-    if n * topk_l.shape[1] * topk_l.shape[1] <= _FO_FULL_CAP_BYTES:
+    _nb = int(topk_l.shape[1])
+    _dedup = (not topk_distinct) and _nb > 1
+    if _attn_full_width_ok(n, _nb, w, _dedup):
         keep_all = sel_valid
-        if topk_l.shape[1] > 1 and not topk_distinct:
+        if _dedup:
             _ddk_all = first_occurrence_mask(topk_l)
             keep_all = _ddk_all if keep_all is None else keep_all & _ddk_all
         if keep_all is not None:
@@ -1962,7 +1999,6 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         anyrow_all = valid_all.any(-1) if sink_logits is None else None
     else:
         keep_all = valid_all = nvalid_all = anyrow_all = None
-    _nb = int(topk_l.shape[1])
     # The chunk-invariant dispatch is computed once, above the row-chunk
     # loop: which mask/validity source each chunk reads and which of the two
     # attention forms runs are pure functions of the call-level arguments.
@@ -1970,7 +2006,6 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # unchanged.
     _has_all = valid_all is not None
     _has_sv = sel_valid is not None
-    _dedup = (not topk_distinct) and _nb > 1
     _has_sink = sink_logits is not None
     # soft 只经直通 (soft_attn - soft_attn.detach()).add_(attn) 进入前向值：
     # soft_attn 是 _sink_split_softmax/nan_to_num 之后的输出、恒有限，x - x
@@ -2417,9 +2452,15 @@ class HybridAttention(nn.Module):
         if sim.numel() == 0:
             return None
         cfg = self.cfg
-        prefix_mean = torch.cumsum(sim, 0) / _range_cache(1, sim.numel() + 1, x.device)
-        tau = prefix_mean + self.delta_logit
-        gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
+        # In-place tails over the fresh cumsum output: same op order
+        # (divide -> add -> subtract -> divide) and therefore the same
+        # values, without two [T-1] temporaries.
+        prefix_mean = torch.cumsum(sim, 0)
+        prefix_mean.div_(_range_cache(1, sim.numel() + 1, x.device))
+        prefix_mean.add_(self.delta_logit)
+        prefix_mean.sub_(sim)
+        prefix_mean.div_(max(cfg.temperature, 0.001))
+        gate = torch.sigmoid_(prefix_mean)
         return (gate, gate.detach() > _HALF)
 
     def _gate_signals(self, x, pre_all=None):
@@ -2445,11 +2486,16 @@ class HybridAttention(nn.Module):
         if sim.shape[-1] == 0:
             return ([None] * B, None)
         cfg = self.cfg
-        # rowwise batched cumsum — same per-row values as the unbind/stack loop
+        # rowwise batched cumsum — same per-row values as the unbind/stack loop.
+        # The fresh cumsum output carries the divide/add/subtract/divide tails
+        # in place, preserving the op order (and values) while dropping the
+        # [B, T-1] tau/intermediate tables.
         prefix_mean = torch.cumsum(sim, dim=-1)
         prefix_mean.div_(_range_cache(1, sim.shape[-1] + 1, x.device))
-        tau = prefix_mean + self.delta_logit
-        gate = torch.sigmoid_((tau - sim).div_(max(cfg.temperature, 0.001)))
+        prefix_mean.add_(self.delta_logit)
+        prefix_mean.sub_(sim)
+        prefix_mean.div_(max(cfg.temperature, 0.001))
+        gate = torch.sigmoid_(prefix_mean)
         gate_b = gate.detach() > _HALF
         return ([(gate[b], gate_b[b]) for b in range(B)], gate_b)
 
@@ -2492,12 +2538,15 @@ class HybridAttention(nn.Module):
                 fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
                 sim = cosine_similarity_consecutive(fused)
                 if sim.numel() == 0:
-                    tau = torch.tensor(0.0, device=x.device)
                     gate = torch.tensor([], device=x.device)
                 else:
-                    prefix_mean = torch.cumsum(sim, 0) / _range_cache(1, sim.numel() + 1, x.device)
-                    tau = prefix_mean + self.delta_logit
-                    gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
+                    # same in-place tails as _gate_signal (same values)
+                    prefix_mean = torch.cumsum(sim, 0)
+                    prefix_mean.div_(_range_cache(1, sim.numel() + 1, x.device))
+                    prefix_mean.add_(self.delta_logit)
+                    prefix_mean.sub_(sim)
+                    prefix_mean.div_(max(cfg.temperature, 0.001))
+                    gate = torch.sigmoid_(prefix_mean)
                 gate_bool = None
                 gate_list = None
                 if gate.numel():
@@ -2551,7 +2600,6 @@ class HybridAttention(nn.Module):
         else:
             comp_kv, last_tok, Bn = _pool_trainable(pool_variable_blocks, Ca_raw, Cb_raw, Za, Zb, bid, self.B_pos_a, self.B_pos_b, cfg.overlap, n_blocks=nblk, monotonic=True)
         index_kv = comp_kv
-        attn_kv = torch.zeros_like(comp_kv) if cfg.content_mode == 'zero' else comp_kv
         if self._stats is not None:
             # scatter_add of exact integer ones is order-independent (integer
             # addition commutes, no rounding), so the counts are the same
@@ -2572,7 +2620,11 @@ class HybridAttention(nn.Module):
                 else:
                     cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
                     self._cuts.append(cuts)
-        core_kv = F.normalize(attn_kv, dim=-1)
+        # Normalizing an all-zero content table is exactly zero (0/eps == 0),
+        # so the zero-content ablation skips the normalize kernel and its
+        # transient copy while keeping the same values.
+        core_kv = (torch.zeros_like(comp_kv) if cfg.content_mode == 'zero'
+                   else F.normalize(comp_kv, dim=-1))
         kv_local = F.normalize(Ca_raw, dim=-1)
         if x.device.type == 'cuda':
             # Fused K/V head (CUDA only — see _pre): every output row is a
