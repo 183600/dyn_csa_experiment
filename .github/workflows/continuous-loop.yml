@@ -95,7 +95,7 @@ jobs:
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      - name: Configure opencode (independent families - NVIDIA GLM 50% / DeepSeek 50%)
+      - name: Configure opencode (independent families - NVIDIA GLM 20% / DeepSeek 80%)
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -151,16 +151,16 @@ jobs:
           APPLY_TIMEOUT=$((60*60))    # 1h（算力申请.md 检查）
 
           # ================= provider 策略：独立双家族（失效只在家族内级联，不跨家族） =================
-          # NVIDIA 家族（50%）：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
+          # NVIDIA 家族（20%）：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
           #             自动降级 glm-5.3-flash（https://integrate.api.nvidia.com/v1）；
           #             两者都不可用时保持本家族重试，绝不切换到 DeepSeek 家族。
-          # DeepSeek 家族（50%）：DeepSeek 官方 API（https://api.deepseek.com/v1，
+          # DeepSeek 家族（80%）：DeepSeek 官方 API（https://api.deepseek.com/v1，
           #             模型默认 deepseek-chat，官方稳定别名，探测目录自动校准）
           #             → opencode Zen 免费 deepseek（deepseek-v4.1-flash-free）
           #             → big-pickle；全链不可用时保持本家族重试，绝不切换到 NVIDIA 家族。
           # 家族由 run_phase 在每个阶段开始时掷骰确定（NVIDIA_PROB%），阶段内固定。
           # harness 永远是 opencode：所有 provider 一律通过 `opencode run -m ...` 调用。
-          NVIDIA_PROB=50
+          NVIDIA_PROB=20
           FREE_MODEL="opencode/deepseek-v4.1-flash-free"
           # DeepSeek 家族内兜底：官方与免费 deepseek 均不可用时，切换同为 Zen 网关
           #           免费的 big-pickle（Big Pickle）。
