@@ -2937,10 +2937,12 @@ _IDS_FP_MEMO = {}
 _IDS_FP_MEMO_CAP = 4
 
 def _ids_fp(train_ids):
-    # Pure function of the buffer bytes, memoised on (data pointer,
+    # Pure function of the token values, memoised on (data pointer,
     # layout) with a strong ref to the array (so the keyed pointer can
-    # never be recycled while the entry lives).  Same bytes in -> same
-    # digest out, always.
+    # never be recycled while the entry lives).  Same tokens in -> same
+    # digest out, always.  Sub-int32 storage (the uint16 FineWeb cache) is
+    # hashed through its canonical int32 form, so a corpus keeps the exact
+    # fingerprint it had before the storage width was reduced.
     try:
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
     except (AttributeError, TypeError):
@@ -2951,9 +2953,13 @@ def _ids_fp(train_ids):
             return _hit[1]
     _h = hashlib.sha256()
     _mv = np.ascontiguousarray(train_ids)
+    _widen = _mv.dtype in (np.dtype(np.uint8), np.dtype(np.uint16))
     _cs = 1 << 24
     for _off in range(0, len(_mv), _cs):
-        _h.update(_mv[_off:_off + _cs].data)
+        _part = _mv[_off:_off + _cs]
+        if _widen:
+            _part = _part.astype(np.int32, copy=False)
+        _h.update(_part.data)
     _fp = _h.hexdigest()[:16]
     if _key is not None:
         if len(_IDS_FP_MEMO) >= _IDS_FP_MEMO_CAP:
@@ -3299,12 +3305,15 @@ def _disk_ids_chunk(buf, disk_dt, vocab):
     return np.array(buf, dtype=disk_dt)
 
 def _npy_serve_int32(path):
-    # 传输层（design_notes §6.1）：磁盘上的 uint16/int32 与 served 的 int32
-    # 是同一组精确整数；经 mmap 分块转换（而不是整载入再 .astype）。
-    # served 的 int32 字节与直接 astype 形式逐一相同（_ids_fp 的内容指纹、
-    # batch_iter 的对象身份键都不变）。
+    # 传输层（design_notes §6.1）：磁盘上的 uint16/int32 都是同一组精确
+    # 整数。uint16 缓存原宽驻留（每 token 2 字节），batch_iter 在 gather
+    # 后立即加宽回 int64，因此产出的 batch 与 int32 驻留形式逐位相同；
+    # _ids_fp 对窄整型按规范 int32 形式取指纹，缓存指纹也不变。对 int32
+    # 缓存仍经 mmap 分块复制（而不是整载入再 .astype）。
     mm = np.load(path, mmap_mode='r')
     src = np.asarray(mm)
+    if src.dtype in (np.uint8, np.uint16):
+        return np.array(src)
     if src.dtype == np.int32:
         return np.array(src)
     out = np.empty(src.shape, dtype=np.int32)
@@ -3415,8 +3424,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     in-process memo keyed on (file size, mtime).  Differences forced by the
     scale band:
       - token ids are cached on disk at 2 bytes/token (uint16, guarded by the
-        actual vocab) and served as int32; every consumer widens ids back to
-        int64 per batch exactly as the int64 corpora always did, so yielded
+        actual vocab) and served at that width; every consumer widens ids back
+        to int64 per batch exactly as the int64 corpora always did, so yielded
         batches are bit-identical to the int64-storage form;
       - the corpus is built in one streaming pass (fit tokenizer on the first
         `fit_docs` documents, then train tokens up to n_train_tokens + seq_len,
@@ -3811,11 +3820,11 @@ _PINNED_HOST_CAP_BYTES = 4 << 30
 
 def _ids_narrow(train_ids):
     # Token ids are bounded by the vocab (<= 2**31 for every corpus this repo
-    # produces), so the resident copy (GPU, or pinned host staging) is stored
-    # int32 and widened back to int64 right after each batch gather, leaving
-    # the yielded batch bit-identical.  The guard keeps any hypothetical
-    # out-of-range corpus on the int64 path.
-    if train_ids.dtype == np.int32:
+    # produces), so the resident copy (GPU, or pinned host staging) stays at
+    # its compact width (uint8/uint16/int32) and is widened back to int64
+    # right after each batch gather, leaving the yielded batch bit-identical.
+    # The guard keeps any hypothetical out-of-range corpus on the int64 path.
+    if train_ids.dtype in (np.uint8, np.uint16, np.int32):
         return train_ids
     if train_ids.size and int(train_ids.max()) < 2 ** 31:
         return train_ids.astype(np.int32)
@@ -5751,9 +5760,15 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     locked_json_update(path, _merge)
     return path
 
+_EVAL_TOKENS_PER_CHUNK = 1 << 17
+
 @torch.inference_mode()
 def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
-    chunk = max(1, int(chunk))
+    # A chunk is a set of independent sequences (no cross-row op in the
+    # model), so capping it by token count bounds eval memory at long
+    # contexts without changing any per-row value.
+    _span = max(1, int(val_batch.shape[1]) - 1)
+    chunk = min(max(1, int(chunk)), max(1, _EVAL_TOKENS_PER_CHUNK // _span))
     was_training = model.training
     model.eval()
     need_reg_layers = [blk.attn for blk in model.blocks if hasattr(blk.attn, 'need_reg')]
@@ -6276,11 +6291,14 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
     if int(n_sample) < 1:
         raise ValueError(f'compression_report: n_sample must be >= 1, got {n_sample!r}; the report is an average over the sequences it scores, so there is nothing to measure with no sequence scored')
     n_used = min(n_sample, val_batch.shape[0])
-    # inference_mode (the decorator) already covers the forward pass.
-    for _r0 in range(0, n_used, 16):
+    _row_chunk = max(1, min(16, _EVAL_TOKENS_PER_CHUNK // max(seq_len, 1)))
+    # inference_mode (the decorator) already covers the forward pass.  The
+    # sampled sequences are independent, so the row grouping only bounds the
+    # transient working set.
+    for _r0 in range(0, n_used, _row_chunk):
         # as_tensor accepts numpy arrays AND torch tensors (eval_ppl already
         # uses it).
-        ids = torch.as_tensor(np.asarray(val_batch[_r0:min(_r0 + 16, n_used)])).to(device)
+        ids = torch.as_tensor(np.asarray(val_batch[_r0:min(_r0 + _row_chunk, n_used)])).to(device)
         _ = model(ids, logits_tail=1)
         del ids
     # every dynamic layer's delta_logit (same scalars, same floats).
@@ -6387,6 +6405,32 @@ def training_knobs():
         'augmentation': 'none',
     }
 
+def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs):
+    # Explicit CSA_CKPT always wins.  Otherwise, on a CUDA box with little
+    # headroom, fall back to activation recomputation: the working set grows
+    # with tokens x layers x d, while recomputation keeps only the block
+    # inputs.  The recomputed forward is the same pure function, so values and
+    # gradients are unchanged (the contract documented at the top).
+    if os.environ.get('CSA_CKPT', '').strip():
+        return None, None
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        return None, None
+    try:
+        free, _total = torch.cuda.mem_get_info(device)
+    except Exception:
+        return None, None
+    tok = max(1, int(batch_size)) * max(1, int(seq_len))
+    hidden = max(1, int(round(int(d) * float(mlp_ratio))))
+    act = int(n_layers) * tok * (hidden + 8 * int(d)) * 4
+    need = act + 16 * int(n_param)
+    if free >= need + need // 3:
+        return None, need
+    has_gate = any(getattr(c, 'chunking', '') == 'cosine_learnable' for c in cfgs)
+    # Block-level recompute saves the residual stream too, but it cannot cover
+    # the gate-mean side channel; those arms use the MLP-level fallback.
+    mode = 'mlp' if (has_gate or free >= (need * 3) // 4) else 'block'
+    return mode, need
+
 def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False):
     if steps < 1:
         raise ValueError(f'train_variant needs steps >= 1, got steps={steps}')
@@ -6433,6 +6477,16 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # Cyclic GC is disabled for the step loop; collections still run at a
     # fixed cadence and the original GC state is restored on every exit path.
     _gc_relief = gc.isenabled()
+    _ckpt_saved = _CKPT['on']
+    _auto_ckpt, _auto_need = _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs)
+    if _auto_ckpt:
+        _CKPT['on'] = _auto_ckpt
+        _free = None
+        try:
+            _free = int(torch.cuda.mem_get_info(device)[0])
+        except Exception:
+            pass
+        print(f'    [mem] free={(_free or 0) / 2**30:.1f}GiB  est_working_set={(_auto_need or 0) / 2**30:.1f}GiB  -> activation checkpoint ({_auto_ckpt})')
     if _gc_relief:
         gc.disable()
     try:
@@ -6477,6 +6531,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                             delta_trace.setdefault(f'L{li}', []).append([step, float(_v)])
                 print(f'  step {step:4d}  loss {_lv:.4f}  lr {opt.param_groups[0]['lr']:.2e}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
     finally:
+        _CKPT['on'] = _ckpt_saved
         if _gc_relief:
             gc.enable()
     wall = time.time() - t0

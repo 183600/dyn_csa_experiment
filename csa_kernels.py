@@ -1568,18 +1568,20 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
         dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
         flat = topk_idx.reshape(R, T * nb)
-        # 稳定排序只依赖键值与位置。order 保留 int64：lane 值域是
+        # 逐行排序/计数（各行互相独立，稳定序逐位不变）：全幅 argsort 的
+        # 工作区与 [R, T·nb] 的 int64 键表不再同时驻留，长序列下的峰值
+        # 由一次性 R 行降为单行。order 保留 int64：lane 值域是
         # [0, T·nb)，T·nb ≥ 2³¹ 的超大配置下窄化到 int32 会翻负、内核再
         # 按 lane//NB 寻址即越界。
-        order = flat.argsort(dim=1, stable=True).contiguous()
-        # 整数直方图（等价于逐行 bincount(minlength=Bm) 的 scatter_add_ 形
-        # 式）：行号并入键后一次 bincount——整数计数精确且与写入顺序无关
-        # （整数加法可交换、无舍入）。
-        _keys = flat.to(torch.int64) + (torch.arange(R, device=dev, dtype=torch.int64) * Bm)[:, None]
-        cnt = torch.bincount(_keys.reshape(-1), minlength=R * Bm).reshape(R, Bm)
+        order = torch.empty((R, T * nb), device=dev, dtype=torch.int64)
+        cnt = torch.empty((R, Bm), device=dev, dtype=torch.int64)
+        for _r in range(R):
+            _fr = flat[_r]
+            order[_r] = _fr.argsort(stable=True)
+            cnt[_r] = torch.bincount(_fr.to(torch.int64), minlength=Bm)
         offs = torch.zeros((R, Bm + 1), device=dev, dtype=torch.int64)
         offs[:, 1:] = cnt.cumsum(dim=1)
-        del flat, _keys, cnt
+        del flat, cnt
         K.attn_bwd_dkdv_blocks[(R * Bm * nh,)](
             q, k_blk, v_blk, topk_idx, valid_c, last_tok, soft_c, sink_arg, dO,
             mA, ZA, mS, ZS, GA, GS,
