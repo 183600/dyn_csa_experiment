@@ -633,7 +633,7 @@ def t_train_variant_reproducible():
 
 
 def t_overfit_detects_broken_optimizer():
-    # lr=0 is the canonical "gradients computed but never applied" plumbing bug.
+    # lr=0 is the canonical "gradients computed but never applied" failure mode.
     r = L.overfit_sanity_check('full', seed=0, steps=5, lr=0.0, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=16, batch_size=2, vocab=256)
     assert r['passed'] is False, 'a run whose parameters never update must FAIL the sanity check'
     assert r['params_changed'] is False and r['loss_decreased'] is False
@@ -715,7 +715,7 @@ def t_attention_zero_blocks_keeps_window():
 
 def t_atomic_torch_save():
     # Checkpoint writes use a unique same-directory temp and replace atomically;
-    # a failed/interrupted writer must not leave a shared `*.tmp` behind.
+    # an interrupted writer must not leave a shared `*.tmp` behind.
     d = tempfile.mkdtemp()
     try:
         p = os.path.join(d, 'ckpt.pt')
@@ -732,10 +732,8 @@ def t_atomic_torch_save():
 
 
 def t_cache_bytes_shared_storage():
-    # A stride-0 expand is a view: it must be charged its resident storage
-    # (O(m)), not numel (O(n*m)).  Otherwise the HCA arange expansion looks
-    # larger than the whole index-cache budget and every later _cache_put
-    # evicts the other (reusable) geometry tables.
+    # A stride-0 expand is a view: _cache_bytes charges its resident storage,
+    # not its numel.
     base = torch.arange(64, dtype=torch.int32)
     expanded = base.expand(4096, 64)
     assert L._cache_bytes(expanded) == L._cache_bytes(base), 'an expand must charge its base storage, not numel'
@@ -743,7 +741,7 @@ def t_cache_bytes_shared_storage():
     cache = {}
     L._cache_put(cache, 'arange', base, 8192, L._idx_cache_total)
     L._cache_put(cache, 'expand', expanded, 8192, L._idx_cache_total)
-    assert set(cache) == {'arange', 'expand'}, 'a shared-storage view evicted an unrelated cache entry (cache thrash)'
+    assert set(cache) == {'arange', 'expand'}, 'a shared-storage view evicted an unrelated cache entry'
 
 
 def t_overfit_guard_source_key():

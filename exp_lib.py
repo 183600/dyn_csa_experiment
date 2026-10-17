@@ -505,13 +505,10 @@ def _cache_bytes(t):
         return sum((_cache_bytes(_v) for _v in t))
     try:
         nbytes = int(t.numel()) * int(t.element_size())
-        # Views can share storage: a stride-0 expand (the HCA arange
-        # expansion) has numel O(n·m) but occupies O(m).  Charging the full
-        # numel would make that one entry look larger than the whole cache
-        # budget, so every later _cache_put would evict all other tables and
-        # rebuild them on the next call — cache thrash instead of reuse.  The
-        # resident storage is the correct (conservative) charge for a view;
-        # min() keeps a sliced view of a larger buffer from over-counting.
+        # Views can share storage: charge the resident storage when it is
+        # smaller than numel (a stride-0 expand has numel O(n·m) but occupies
+        # O(m)); min() keeps a sliced view of a larger buffer from
+        # over-counting.
         try:
             nbytes = min(nbytes, int(t.untyped_storage().nbytes()))
         except Exception:
@@ -604,11 +601,9 @@ def _arange_exp_cache(n, m, device):
     # autograd index tensor in training; only ever read downstream (row slices
     # feeding gathers), never mutated.
     #
-    # The table is stored as a stride-0 expand of one [m] arange instead of a
-    # materialised repeat: every row holds the same exact integers, advanced
-    # indexing / slicing / cat read them identically, and nothing downstream
-    # writes to the table, so the resident footprint is O(m) rather than O(n·m)
-    # (the largest single index table in the HCA arm at long T).
+    # The table is a stride-0 expand of one [m] arange: every row holds the
+    # same exact integers, advanced indexing / slicing / cat read them
+    # identically, and nothing downstream writes to the table.
     key = (_dev_str(device), 'arangeexp', int(n), int(m))
     a = _IDX_CACHE.get(key)
     if a is None:
@@ -1273,7 +1268,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         # uses): pad lanes are overwritten with -inf right after, and their
         # incoming grad is exactly zero (MaskedFillBackward / softmax P=0), so
         # forward values and B_pos gradients are identical to the masked-multiply
-        # form — without materialising a full [chunk, max_len, c] product.
+        # form.
         # += on the fresh _take_2d outputs: the same elementwise kernel with the
         # same values as the out-of-place add (AddBackward saves no tensor, and
         # the only downstream consumer chain — masked_fill_/cat/softmax — keeps
@@ -1288,10 +1283,6 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         # softmax 的反向保存其输出，nan_to_num 必须出位（原地会改写保存值，
         # SoftmaxBackward 版本检查失败）；值与任何原地形式逐位相同。
         sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
-        # Drop the logit side before the X gathers: sc fully determines the
-        # weights, so the X lanes can be fetched afterwards.  Values are
-        # unchanged (the same gathers), but the peak no longer holds both the
-        # logit stack and the X-lane stack at once.
         del WinZ, Zam, Zbm
         Xam = _take_2d(Xas, g_a[_b0:_b1])
         Xbm = _take_2d(Xbs, g_b[_b0:_b1])
@@ -1856,9 +1847,6 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         if soft is None and not soft_form:
             Kset = _tk2(k_all, _rows)
             logits = _einsum('qhd,qmhd->qhm', qseg, Kset)
-            # K is consumed by the logits only; release it before gathering V
-            # so the two [chunk, M, h, d] lane stacks never coexist.  The same
-            # rows are gathered below, so every value is unchanged.
             del Kset
             if scale != 1.0:
                 # x·1.0 is the IEEE identity (and grad·1.0 is bit-identical on
@@ -1874,8 +1862,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # concatenated V gather below holds exactly the same rows as two
         # separate gathers + cat, while the per-half K gathers feed the two
         # logits einsums with the same operands (index re-plumbing only,
-        # design notes §6.1).  V is gathered only after the attention weights
-        # are final, so its lane stack does not coexist with the K halves.
+        # design notes §6.1).
         kb = _tk2(k_blk, _sel_rows)
         kw = _tk2(k_sw, _win_local)
         blk_logits = _einsum('qhd,qmhd->qhm', qseg, kb)

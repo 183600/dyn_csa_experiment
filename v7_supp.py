@@ -109,9 +109,7 @@ def gather_rows(x, idx):
     return picked.reshape(idx.shape[0], idx.shape[1], *lead)
 
 def _atomic_torch_save(obj, path):
-    # Unique same-directory temp: two workers must never write through one
-    # fixed `path + '.tmp'` (one could rename it while the other is still
-    # writing).  The save itself is unchanged; the replace stays atomic.
+    # Write through a unique same-directory temp file, then replace atomically.
     d = os.path.dirname(os.path.abspath(path)) or '.'
     os.makedirs(d, exist_ok=True)
     _fd, _tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + '.', suffix='.tmp')
@@ -365,18 +363,16 @@ class HybridAttentionRoPE(L.HybridAttention):
         # same int32 index transport as exp_lib.gathered_attention (§6.1):
         # identical integers, identical gathered values.
         topk_l = topk_idx if topk_idx.dtype in (torch.int32, torch.int64) else topk_idx.long()
-        # same broadcast fast path as exp_lib.gathered_attention: the cached
-        # arange expansion makes last_tok[topk_l] one identical copy per row, so
-        # a broadcast comparison gives the same booleans without materialising
-        # the [n, k] gathered table.
+        # Same index comparison as exp_lib.gathered_attention: with the cached
+        # arange expansion every row of last_tok[topk_l] is identical, so a
+        # broadcast comparison gives the same booleans.
         _arange_sel = (topk_l.shape[1] == last_tok.shape[0]
                        and topk_l is L._IDX_CACHE.get((L._dev_str(dev), 'arangeexp', int(T), int(topk_l.shape[1]))))
         _sel_all = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
         # The K/V halves are stacked once and gathered with one combined row
         # index per chunk, exactly as exp_lib.gathered_attention does: the
-        # selected rows are the two old gather outputs concatenated in the same
-        # order, so the values are bit-identical and two per-chunk cats plus two
-        # index_select calls disappear.
+        # selected rows are the two separate gather outputs concatenated in the
+        # same order, so the values are bit-identical.
         _nblk_rows = k_blk_r.shape[0]
         _has_sw = k_sw_r is not None and v_sw is not None
         if _has_sw:
@@ -436,8 +432,6 @@ class HybridAttentionRoPE(L.HybridAttention):
             Kset = L._take_2d(k_all, _rows)
             qc = apply_rope(q[s:e], cos[s:e, None, :], sin[s:e, None, :], rope_dim)
             raw_logits = torch.einsum('qhd,qmhd->qhm', qc, Kset)
-            # K is consumed by the logits only; V is gathered after the
-            # attention weights are final so the two lane stacks never coexist.
             del Kset
             if scale != 1.0:
                 # x·1.0 is the IEEE identity (and its backward Mul node maps
