@@ -601,6 +601,76 @@ def t_provenance_and_manifest():
 
 
 # ---------------------------------------------------------------------------
+# E5-E8. 进一步的可复现性 / 训练追踪回归
+# ---------------------------------------------------------------------------
+
+def t_dataloader_seeding_helpers():
+    ds = torch.utils.data.TensorDataset(torch.arange(64, dtype=torch.long).unsqueeze(1))
+
+    def order(seed):
+        dl = L.deterministic_dataloader(ds, batch_size=8, shuffle=True, seed=seed)
+        return [int(v) for b in dl for v in b[0]]
+    assert order(7) == order(7), 'same DataLoader seed must reproduce the shuffled order'
+    assert order(7) != order(8), 'a different DataLoader seed must change the shuffled order'
+    # worker RNGs are derived from torch.initial_seed(), not OS entropy
+    def worker_draw():
+        torch.manual_seed(11)
+        L.seed_worker(0)
+        return (random.random(), float(np.random.random()), float(torch.rand(1).item()))
+    assert worker_draw() == worker_draw(), 'seed_worker must reproduce Python/NumPy/Torch worker RNG streams'
+
+
+def t_train_variant_reproducible():
+    ids = np.arange(8192, dtype=np.int64) % 997
+    val = (np.arange(64, dtype=np.int64) % 997).reshape(2, 32)
+    kw = dict(d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, steps=4, lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0, eval_every=0, mlp_ratio=4.0, device=torch.device('cpu'), log_every=0)
+    a = L.train_variant('full', ids, val, 997, seed=3, **kw)
+    b = L.train_variant('full', ids, val, 997, seed=3, **kw)
+    c = L.train_variant('full', ids, val, 997, seed=4, **kw)
+    assert a['losses'] == b['losses'], 'same seed must reproduce the whole training loss curve'
+    assert a['ppl'] == b['ppl'] and a['rng_fp'] == b['rng_fp'], 'same seed must reproduce the final PPL and RNG fingerprint'
+    assert a['losses'] != c['losses'], 'a different seed must change the loss curve'
+
+
+def t_overfit_detects_broken_optimizer():
+    # lr=0 is the canonical "gradients computed but never applied" plumbing bug.
+    r = L.overfit_sanity_check('full', seed=0, steps=5, lr=0.0, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=16, batch_size=2, vocab=256)
+    assert r['passed'] is False, 'a run whose parameters never update must FAIL the sanity check'
+    assert r['params_changed'] is False and r['loss_decreased'] is False
+    assert 'did not update' in r['diagnosis']
+
+
+def t_experiment_ledger():
+    d = tempfile.mkdtemp()
+    try:
+        ids = np.arange(4096, dtype=np.int64) % 997
+        val = (np.arange(128, dtype=np.int64) % 997).reshape(4, 32)
+        cfg = dict(outdir=d, seq_len=32, batch_size=2, n_train_tokens=4096, steps=3, lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0, delta_lr_mult=10.0, eval_every=0, eval_subset=2, d=64, n_layers=2, n_heads=4, d_head=16, dataset='unit', seeds=[0], variants=['full'])
+        prov = L.experiment_provenance(cfg, train_ids=ids, val_batch=val, vocab=997)
+        fp = L._run_fp(cfg, 64, 2, 4, 16, 997, ids, val)
+        out = L._run_cell(cfg, 'full', 0, fp=fp, train_ids=ids, val_batch=val, vocab=997, prov=prov)
+        assert out['status'] == 'ok' and out.get('run_id')
+        summary = json.load(open(os.path.join(d, 'summary.json'), encoding='utf-8'))
+        rec = summary['full::seed0']
+        assert rec.get('run_id') == out['run_id'] and rec.get('hyperparams') and rec.get('provenance')
+        lines = open(os.path.join(d, 'experiments.jsonl'), encoding='utf-8').read().strip().splitlines()
+        assert len(lines) == 1, f'one completed cell must append exactly one ledger line (got {len(lines)})'
+        ev = json.loads(lines[0])
+        for k in ('run_id', 'run_cfg', 'seed', 'provenance', 'hyperparams', 'data_fp', 'metrics', 'losses', 'ppl_history'):
+            assert k in ev, f'experiment ledger entry missing {k}'
+        assert ev['status'] == 'ok' and ev['run_id'] == out['run_id'] and len(ev['losses']) == 3
+        san = {'kind': 'small_batch_overfit_sanity_panel', 'passed': True, 'reports': []}
+        L.write_run_manifest(d, cfg, fp, prov, summary, sanity=san)
+        m = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
+        entry = m['panels'][fp]
+        cell = entry['cells']['full::seed0']
+        assert entry['sanity'] == san and entry['experiment_log'] == 'experiments.jsonl'
+        assert cell['run_id'] == out['run_id'] and cell['data_fp'] and cell['curve_summary']['n_points'] == 3
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # F. 稀疏路径的逐位契约 / 边界回归
 # ---------------------------------------------------------------------------
 
@@ -739,6 +809,10 @@ def main():
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
     _check('E3 small-batch overfit sanity', t_overfit_sanity)
     _check('E4 provenance + run manifest', t_provenance_and_manifest)
+    _check('E5 DataLoader/worker seeding', t_dataloader_seeding_helpers)
+    _check('E6 end-to-end training reproducibility', t_train_variant_reproducible)
+    _check('E7 overfit check detects broken optimizer', t_overfit_detects_broken_optimizer)
+    _check('E8 append-only experiment ledger + manifest', t_experiment_ledger)
     _check('F1 indexer column-narrowing exactness', t_indexer_column_narrowing_exact)
     _check('F2 zero-block attention keeps window', t_attention_zero_blocks_keeps_window)
     _check('F3 overfit guard source key', t_overfit_guard_source_key)

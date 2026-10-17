@@ -3574,6 +3574,56 @@ def atomic_write_csv(path, header, rows):
             w.writerow(list(r))
     atomic_write_text(path, buf.getvalue())
 
+def new_experiment_id(prefix='run'):
+    """A collision-resistant id for one experiment attempt.
+
+    Uses wall-clock time + pid + OS entropy (never the Python/NumPy/Torch RNG
+    streams, so taking an id cannot perturb a seeded run).  The id is written
+    into the record and the append-only experiment log, making repeated
+    attempts of the same (variant, seed, run_cfg) distinguishable."""
+    return f'{prefix}-{time.strftime("%Y%m%dT%H%M%S", time.gmtime())}-{os.getpid()}-{os.urandom(4).hex()}'
+
+def append_jsonl(path, record):
+    """Append one JSON object to a shared JSONL log under an exclusive flock.
+
+    Append-only tracking is deliberately separate from summary.json: summary's
+    keys are the resume identity `variant::seed`, so a rerun legitimately
+    overwrites an old value.  The JSONL ledger keeps every attempt (including
+    failures and cap truncations), which is what makes the paper trail
+    auditable after the fact.  A write failure is the caller's to report; this
+    helper never swallows a partially written line (single write + flush)."""
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    line = json.dumps(_jsonable(record), sort_keys=True, ensure_ascii=False, default=float) + '\n'
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    with open(path, 'a', encoding='utf-8') as f:
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            if fcntl is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+def log_experiment_event(outdir, event):
+    """Append a trace event to `outdir/experiments.jsonl` (never raises).
+
+    Tracking is diagnostic infrastructure: a full disk or a read-only archive
+    must not destroy a completed training cell.  The warning names the path so
+    the missing ledger is visible rather than silent."""
+    try:
+        path = os.path.join(outdir, 'experiments.jsonl')
+        append_jsonl(path, event)
+        return path
+    except Exception as _e:
+        print(f'[track] WARNING: could not append to {os.path.join(outdir, "experiments.jsonl")} ({type(_e).__name__}: {_e}) — the training record itself is unaffected')
+        return None
+
 _PINNED_HOST_CACHE = {}
 # 整份 pinned 的字节上限（见 batch_iter）：超出时改走普通宿主张量 + 每步
 # pinned 暂存上传。
@@ -4641,12 +4691,30 @@ def set_seed(seed):
     _attb_bump_epoch()
     torch.manual_seed(seed)
     _pin_cpu_threads()
+    # Pin the backend determinism switches on CPU too: the cuDNN flags are
+    # inert without CUDA, while CSA_DETERMINISTIC must still enable torch's
+    # deterministic-algorithm mode on a CPU box (a CPU run is a first-class
+    # reproduction target).  CUDA RNGs are seeded explicitly below.
+    _pin_cuda_determinism()
     if torch.cuda.is_available():
         # manual_seed already covers all devices; the explicit current-device
         # call documents the contract and is harmless.
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        _pin_cuda_determinism()
+    # TensorFlow is not a dependency of this repo, but a future/embedded
+    # TensorFlow path must not become an unseeded RNG source.  Only touch it
+    # when the user has already imported it (never import TensorFlow here:
+    # that would double the import cost of every CPU-only run).
+    _tf = sys.modules.get('tensorflow')
+    if _tf is not None:
+        try:
+            _tf.random.set_seed(seed)
+            try:
+                _tf.config.experimental.enable_op_determinism()
+            except Exception:
+                pass
+        except Exception as _tfe:
+            print(f'[determinism] could not seed the already-imported TensorFlow RNG ({type(_tfe).__name__}: {_tfe})')
     return seed
 _CPU_THREADS_PINNED = None
 
@@ -4688,11 +4756,34 @@ def dataloader_generator(seed):
     return g
 
 def seed_worker(worker_id):
-    """DataLoader worker_init_fn: seed Python/NumPy from torch's per-worker
-    base seed (PyTorch already seeds torch itself per worker)."""
+    """DataLoader worker_init_fn: seed Python/NumPy/Torch from torch's
+    per-worker base seed.  PyTorch already seeds its own worker RNG before
+    calling this hook; re-seeding it explicitly documents the contract and
+    also covers older versions where a custom generator changes the base."""
     _seed = int(torch.initial_seed()) % (2 ** 32)
     random.seed(_seed)
     np.random.seed(_seed)
+    torch.manual_seed(_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_seed)
+
+def dataloader_kwargs(seed):
+    """DataLoader kwargs that pin BOTH the sampler order and worker RNGs.
+
+    Scale path: `DataLoader(ds, **L.dataloader_kwargs(seed), num_workers=n)`.
+    The generator controls shuffling/sampling; worker_init_fn derives each
+    worker's Python/NumPy RNG from the same seed tree instead of OS entropy.
+    """
+    return {'generator': dataloader_generator(seed), 'worker_init_fn': seed_worker}
+
+def deterministic_dataloader(dataset, *, seed=0, **kwargs):
+    """Thin `torch.utils.data.DataLoader` wrapper with reproducible seeding.
+
+    Existing caller-supplied `generator` / `worker_init_fn` are respected."""
+    from torch.utils.data import DataLoader
+    kwargs.setdefault('generator', dataloader_generator(seed))
+    kwargs.setdefault('worker_init_fn', seed_worker)
+    return DataLoader(dataset, **kwargs)
 
 def _pin_cpu_threads():
     global _CPU_THREADS_PINNED
@@ -4749,6 +4840,8 @@ def _jsonable(v):
         return sorted((_jsonable(x) for x in v), key=str)
     if isinstance(v, (list, tuple)):
         return [_jsonable(x) for x in v]
+    if isinstance(v, np.ndarray):
+        return _jsonable(v.tolist())
     if isinstance(v, np.generic):
         return v.item()
     if isinstance(v, (str, int, float, bool)) or v is None:
@@ -4781,13 +4874,18 @@ def environment_snapshot():
     import platform
     env = {
         'python': sys.version.split()[0],
+        'executable': sys.executable,
         'platform': platform.platform(),
+        'machine': platform.machine(),
+        'processor': platform.processor(),
+        'cpu_count': os.cpu_count(),
         'torch': torch.__version__,
         'numpy': np.__version__,
         'cuda_available': bool(torch.cuda.is_available()),
         'cuda_version': torch.version.cuda,
         'cudnn_version': torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
         'gpu_names': _gpu_names(),
+        'cuda_device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
         'determinism': determinism_label(),
         'cudnn_deterministic': bool(torch.backends.cudnn.deterministic),
         'cudnn_benchmark': bool(torch.backends.cudnn.benchmark),
@@ -4838,13 +4936,24 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
     })
     return hp
 
-def write_run_manifest(outdir, cfg, run_cfg, prov, summary):
+def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None):
     """Merge one panel's provenance/config/outcome summary into
     `outdir/run_manifest.json` under the same flock used by summary.json.
 
     The per-record `losses` / `ppl_history` curves stay in summary.json (to
-    avoid duplicating large arrays); each manifest cell points at its key."""
+    avoid duplicating large arrays); each manifest cell points at its key.
+    `sanity` (the small-batch overfit reports) is embedded when supplied, or
+    read back from `outdir/overfit_sanity.json` so an auto-preflight is
+    traceable without a second manual record."""
     os.makedirs(outdir, exist_ok=True)
+    if sanity is None:
+        _san_path = os.path.join(outdir, 'overfit_sanity.json')
+        if os.path.exists(_san_path):
+            try:
+                with open(_san_path, encoding='utf-8') as _sf:
+                    sanity = json.load(_sf)
+            except Exception as _se:
+                print(f'[track] WARNING: could not read {_san_path} for the run manifest ({type(_se).__name__}: {_se})')
     cells = {}
     for seed in cfg.get('seeds') or []:
         for v in cfg.get('variants') or []:
@@ -4852,9 +4961,15 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary):
             rec = summary.get(key)
             if not isinstance(rec, dict) or not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
                 continue
+            _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
+            _loss_nums = [float(x) for x in _losses if isinstance(x, (int, float)) and not isinstance(x, bool)]
+            _ph = rec.get('ppl_history') if isinstance(rec.get('ppl_history'), list) else []
             cells[key] = {
                 'variant': v,
                 'seed': int(seed),
+                'run_id': rec.get('run_id'),
+                'started_at': rec.get('started_at'),
+                'finished_at': rec.get('finished_at'),
                 'ppl': rec.get('ppl'),
                 'steps': rec.get('steps'),
                 'tokens_seen': rec.get('tokens_seen'),
@@ -4862,15 +4977,23 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary):
                 'train_time_s': rec.get('train_time_s'),
                 'final_loss_smoothed': rec.get('final_loss_smoothed'),
                 'rng_fp': rec.get('rng_fp'),
+                'data_fp': rec.get('data_fp'),
+                'val_fp': rec.get('val_fp'),
                 'code_stamp': rec.get('_code'),
+                'hyperparams': rec.get('hyperparams'),
+                'curve_summary': {'n_points': len(_losses), 'first': _loss_nums[0] if _loss_nums else None, 'last': _loss_nums[-1] if _loss_nums else None, 'best': min(_loss_nums) if _loss_nums else None, 'ppl_history_points': len(_ph)},
                 'curve_ref': f'summary.json#{key}.losses',
                 'ppl_history_ref': f'summary.json#{key}.ppl_history',
+                'sanity_ref': rec.get('sanity_ref') or ('overfit_sanity.json' if sanity else None),
             }
     entry = {
         'run_cfg': run_cfg,
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'config': _jsonable(cfg),
         'provenance': prov,
+        'sanity': sanity,
+        'experiment_log': 'experiments.jsonl',
         'cells': cells,
     }
     path = os.path.join(outdir, 'run_manifest.json')
@@ -5716,6 +5839,7 @@ def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_
     initial_loss, initial_acc = _lm_batch_metrics(model, x, y, vocab)
     loss_curve = []
     acc_curve = []
+    grad_norm_curve = []
     grad_norm = float('nan')
     grad_finite = True
     n_grad_none = 0
@@ -5740,6 +5864,7 @@ def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_
             grad_norm = 0.0
             grad_finite = False
         n_grad_none = _none
+        grad_norm_curve.append(float(grad_norm))
         if grad_clip:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
         opt.step()
@@ -5754,7 +5879,11 @@ def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_
     _p_after = torch.cat([p.detach().reshape(-1) for p in model.parameters()])
     params_changed = not bool(torch.equal(_p_before, _p_after))
     best_loss = min(loss_curve) if loss_curve else float('nan')
-    passed = bool(math.isfinite(final_loss) and final_loss <= float(target_loss) and final_acc >= float(target_acc) and grad_finite and params_changed and math.isfinite(best_loss) and best_loss <= float(target_loss))
+    # A correct optimizer must also move the loss DOWN, not merely end below
+    # the target by luck.  Keep this in `passed`: a path that starts below the
+    # target and never updates (lr=0) must still fail.
+    loss_decreased = bool(math.isfinite(initial_loss) and math.isfinite(final_loss) and final_loss < initial_loss)
+    passed = bool(math.isfinite(final_loss) and final_loss <= float(target_loss) and final_acc >= float(target_acc) and grad_finite and params_changed and math.isfinite(best_loss) and best_loss <= float(target_loss) and loss_decreased)
     report = {
         'kind': 'small_batch_overfit_sanity',
         'variant': variant,
@@ -5772,8 +5901,11 @@ def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_
         'final_loss': float(final_loss),
         'final_accuracy': float(final_acc),
         'best_loss': float(best_loss),
+        'loss_decreased': bool(loss_decreased),
+        'loss_reduction': float(initial_loss - final_loss) if math.isfinite(initial_loss) and math.isfinite(final_loss) else None,
         'loss_curve': [float(v) for v in loss_curve],
         'accuracy_curve': acc_curve,
+        'grad_norm_curve': grad_norm_curve,
         'grad_norm_last': float(grad_norm),
         'grad_all_finite': bool(grad_finite),
         'params_without_grad': int(n_grad_none),
@@ -5782,7 +5914,14 @@ def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_
         'target_accuracy': float(target_acc),
     }
     report['passed'] = passed
-    report['diagnosis'] = 'ok' if passed else ('no/finite gradients or parameters did not update' if not (grad_finite and params_changed) else 'loss did not converge on a single repeated batch')
+    if passed:
+        report['diagnosis'] = 'ok'
+    elif not (grad_finite and params_changed):
+        report['diagnosis'] = 'no/finite gradients or parameters did not update'
+    elif not loss_decreased:
+        report['diagnosis'] = 'loss did not decrease on the fixed batch (optimizer/step or graph is not wired through)'
+    else:
+        report['diagnosis'] = 'loss did not converge on a single repeated batch within the step budget'
     del model, opt, ids_full, x, y
     gc.collect()
     if device.type == 'cuda':
@@ -5790,6 +5929,15 @@ def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_
     return report
 
 _OVERFIT_GUARD = {}
+# Reports of the checks that actually ran (the boolean guard above is the
+# resume cache; this is the evidence written into the run manifest).  Keyed
+# like _OVERFIT_GUARD by (variant, source).
+_OVERFIT_REPORTS = {}
+
+def overfit_reports(*, source=None):
+    """Copy of the small-batch reports gathered in this process, optionally
+    filtered to source 'synthetic' or 'data'.  Pure read for tracking."""
+    return {k: dict(v) for k, v in _OVERFIT_REPORTS.items() if source is None or k[1] == source}
 
 def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, vocab=1024, train_ids=None, force=False, target_loss=0.05, target_acc=0.99):
     """Run `overfit_sanity_check` once per variant per process and hard-stop
@@ -5803,21 +5951,28 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
         print('[overfit] guard SKIPPED (CSA_SKIP_OVERFIT is set) — this run has no small-batch safety check')
         return []
     src = 'data' if train_ids is not None else 'synthetic'
+    # The data cache key includes the actual token fingerprint AND the vocab
+    # size: two panels in one process can run on different corpora/word pieces,
+    # and a pass on corpus A must never certify corpus B.  A synthetic-keyed
+    # pass remains subsumed by ANY passed data check (same model plumbing).
+    _data_key = None
+    if src == 'data':
+        _arr = np.asarray(train_ids)
+        _data_key = (int(vocab), _ids_fp(_arr if _arr.ndim == 1 else np.ascontiguousarray(_arr).reshape(-1)))
 
     def _known(v):
-        # A data-path check exercises the real token stream, while a passed
-        # data check subsumes a synthetic one (same model path, a superset of
-        # the synthetic input space).
         if src == 'data':
-            return (v, 'data') in _OVERFIT_GUARD
-        return (v, 'synthetic') in _OVERFIT_GUARD or (v, 'data') in _OVERFIT_GUARD
+            return (v, 'data', *_data_key) in _OVERFIT_GUARD
+        return (v, 'synthetic') in _OVERFIT_GUARD or any(k[0] == v and k[1] == 'data' for k in _OVERFIT_GUARD)
     todo = [v for v in variants if force or not _known(v)]
     if not todo:
         return []
     reports = []
     for v in todo:
         r = overfit_sanity_check(v, seed=seed, steps=steps, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=train_ids, target_loss=target_loss, target_acc=target_acc)
-        _OVERFIT_GUARD[(v, src)] = bool(r['passed'])
+        _key = (v, 'data', *_data_key) if src == 'data' else (v, 'synthetic')
+        _OVERFIT_GUARD[_key] = bool(r['passed'])
+        _OVERFIT_REPORTS[_key] = r
         reports.append(r)
         print(f"[overfit] {v:<24} loss {r['initial_loss']:.3f} -> {r['final_loss']:.4f}  acc {r['final_accuracy'] * 100:.1f}%  grad_finite={r['grad_all_finite']}  params_changed={r['params_changed']}  {'PASS' if r['passed'] else 'FAIL'}")
         if not r['passed']:
@@ -6809,6 +6964,10 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
     if v not in ratios:
         ratios[v] = variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=cfg.get('matched'), ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
     out = {'status': 'ok', 'key': key, 'variant': v, 'seed': seed}
+    _run_id = new_experiment_id('cell')
+    _started_at = time.strftime('%Y-%m-%dT%H:%M:%S')
+    _t_start = time.time()
+    out['run_id'] = _run_id
     deadline_ts = None
     booked = 0.0
     _book_tok = f'run|{key}|pid{os.getpid()}'
@@ -6823,6 +6982,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                 booked = 0.0
             print(f'[cap] SKIP {key}: projected {est / 3600:.2f} h would pass the configured cap (headroom {max(guard.total_hours - guard.spent_hours(), 0.0):.2f} h)')
             out['status'] = 'skipped_cap'
+            log_experiment_event(outdir, {'kind': 'cell', 'run_id': _run_id, 'status': 'skipped_cap', 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': code_stamp(), 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'reason': 'projected runtime would pass the configured cap'})
             return out
         deadline_ts = guard.deadline_ts()
         if booked:
@@ -6855,11 +7015,21 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                     rec['hyperparams'] = _hp
                     rec['data_fp'] = _prov['data'].get('train_fp')
                     rec['val_fp'] = _prov['data'].get('val_fp')
+                    rec['run_id'] = _run_id
+                    rec['started_at'] = _started_at
+                    rec['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+                    if os.path.exists(os.path.join(outdir, 'overfit_sanity.json')):
+                        rec['sanity_ref'] = 'overfit_sanity.json'
                     summary[key] = rec
                 return summary
             locked_json_update(summary_path, _apply)
             if out.get('truncated'):
                 out['status'] = 'truncated'
+                log_experiment_event(outdir, {'kind': 'cell', 'run_id': _run_id, 'status': 'truncated', 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': code_stamp(), 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'steps_done': rec.get('steps_done'), 'reason': 'hard runtime cap reached; partial record not written'})
+            elif isinstance(rec, dict) and not rec.get('cap_truncated'):
+                _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
+                _ev = {'kind': 'cell', 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': rec.get('finished_at'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': rec.get('_code') or code_stamp(), 'provenance': rec.get('provenance'), 'hyperparams': rec.get('hyperparams'), 'data_fp': rec.get('data_fp'), 'val_fp': rec.get('val_fp'), 'rng_fp': rec.get('rng_fp'), 'metrics': {'ppl': rec.get('ppl'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed')}, 'curve_summary': {'n_points': len(_losses), 'first': _losses[0] if _losses else None, 'last': _losses[-1] if _losses else None, 'best': min(_losses) if _losses else None}, 'losses': _losses, 'ppl_history': rec.get('ppl_history'), 'sanity_ref': rec.get('sanity_ref')}
+                log_experiment_event(outdir, _ev)
         except Exception as e:
             import traceback
             import sys as _sys
@@ -6875,6 +7045,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                     print(f'[{key}] FAILED: {e}')
                 return summary
             locked_json_update(summary_path, _apply_err)
+            log_experiment_event(outdir, {'kind': 'cell', 'run_id': _run_id, 'status': 'error', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': code_stamp(), 'error': f'{e}', 'traceback': traceback.format_exc()})
     finally:
         if guard is not None:
             steps_done = 0
@@ -6929,7 +7100,8 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     d_head = cfg.get('d_head', 32)
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
-    overfit_guard(cfg.get('variants') or [])
+    # Cheap synthetic pre-flight before the (possibly slow) corpus load.
+    _sanity = list(overfit_guard(cfg.get('variants') or []))
     _attb_bump_epoch()
     t_data = time.time()
     train_ids, val_batch, vocab, _, val_bnd = load_run_corpus(cfg)
@@ -6957,6 +7129,30 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         _pin_cuda_determinism()
     fp = _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch)
     prov = experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
+    # The real data-path check: the synthetic pass above cannot catch a broken
+    # real token stream / vocabulary mapping.  It is a superset of the model
+    # plumbing check, so a pass here is the stronger evidence; both reports
+    # are persisted with the panel.
+    try:
+        _sanity += list(overfit_guard(cfg.get('variants') or [], train_ids=train_ids, vocab=vocab))
+    except RuntimeError:
+        raise
+    if not _sanity:
+        # The guard is process-cached (correctly, so repeated phases do not
+        # retrain the probe).  Recover THIS variant set's evidence from the
+        # cache so a fresh outdir still gets a persisted sanity record.  Data
+        # reports are matched on the current corpus+vocab, never a stale one.
+        _want = set(cfg.get('variants') or [])
+        _cur_data = (int(vocab), _ids_fp(train_ids))
+        _sanity = [dict(r) for (v, src, *rest), r in _OVERFIT_REPORTS.items() if v in _want and (src == 'synthetic' or (len(rest) >= 2 and (rest[0], rest[1]) == _cur_data))]
+    if _sanity:
+        atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), {
+            'kind': 'small_batch_overfit_sanity_panel',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'passed': all(bool(r.get('passed')) for r in _sanity),
+            'provenance': prov,
+            'reports': _sanity,
+        })
     cells, stale_dropped = _plan_run(cfg, summary_path, fp)
     dropped_truncations = []
     ratios = {}
@@ -6996,7 +7192,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             print(f'    {_k}')
         if len(_still) != len(stale_dropped):
             print(f'    ({len(stale_dropped) - len(_still)} of them succeeded and carry a fresh record.)')
-    write_run_manifest(outdir, cfg, fp, prov, summary)
+    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=(_sanity or None))
     _finish_panel(outdir, summary)
     return (summary, None)
 
