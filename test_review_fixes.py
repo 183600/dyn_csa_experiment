@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""test_review_fixes.py — 评审二轮修复的单元测试（纯 CPU、零实验）。
+"""test_review_fixes.py — 单元测试（纯 CPU、零实验）。
 
 覆盖：
-  A. exp_lib 新增统计工具（意见一/八/九）：
+  A. exp_lib 统计工具：
      holm_min_attainable_p / signflip_min_consistency / signflip_power /
      tost_paired / exact_signflip_p 假设文档存在性（导入不报错即可证）；
-  B. v10 腐坏模式（意见六）：_corrupt_row 对四种历史模式与历史实现
-     **逐字节一致**（重放旧算法对拍），新模式 span/doc/topical 的确定性与
-     目标区不可触碰约束；
-  C. v12 门槛（意见一/二/三）：_load_manifest 功效门槛（6 种子拒绝、
-     12 种子放行、descriptive_only 豁免）；_admit_confirmation_records 的
-     白名单/歧义/混切片/None 指纹行为；_recipe_matches_signature；
-     冻结锁的 manifest 不匹配拒绝与 V12_REFREEZE 降级；v2 清单文件本身的
-     功效表与代码一致；
-  D. eval_length_gen 逐文档 PPL（意见九 b）：池化 PPL == 逐文档 PPL 的
-     几何平均（归约不变）。
+  B. v10 腐坏模式：_corrupt_row 的既有四种模式互相对拍，新模式
+     span/doc/topical 的确定性与目标区不可触碰约束；
+  C. v12 门槛：_load_manifest 功效门槛（6 种子拒绝、12 种子放行、
+     descriptive_only 豁免）；_admit_confirmation_records 的白名单/歧义/
+     混切片/None 指纹行为；_recipe_matches_signature；冻结锁的 manifest
+     不匹配拒绝与 V12_REFREEZE 降级；v2 清单文件本身的功效表与代码一致；
+  D. eval_length_gen 逐文档 PPL：池化 PPL == 逐文档 PPL 的几何平均
+     （归约不变）。
 
 运行：python test_review_fixes.py   （需要 torch；无 torch 的环境全部跳过
 并给出非零提醒码 0——CI 以「SKIPPED」字样识别）。"""
@@ -69,7 +67,7 @@ def _check(name, fn):
 # ---------------------------------------------------------------------------
 
 def t_holm_min_attainable():
-    assert abs(L.holm_min_attainable_p(6, 4, 0.05) - 0.125) < 1e-12, 'review-2 issue 1: 6 seeds x Holm/4 floor must be 0.125'
+    assert abs(L.holm_min_attainable_p(6, 4, 0.05) - 0.125) < 1e-12, '6 seeds x Holm/4 floor must be 0.125'
     assert abs(L.holm_min_attainable_p(12, 4, 0.05) - 0.001953125) < 1e-12
     assert abs(L.holm_min_attainable_p(8, 1, 0.05) - 0.0078125) < 1e-12
     assert L.holm_min_attainable_p(6, 4, 0.05) > 0.05 and L.holm_min_attainable_p(12, 4, 0.05) < 0.05
@@ -607,10 +605,10 @@ def t_provenance_and_manifest():
 # ---------------------------------------------------------------------------
 
 def t_indexer_column_narrowing_exact():
-    # `causal_ends_host` is an optimisation hint, not a value-changing option:
-    # the readable-prefix shortcut must return the same idx AND soft bits as
-    # the full-width path (a different GEMM shape is NOT bitwise
-    # column-independent, so score narrowing must not be applied).
+    # `causal_ends_host` is not a value-changing option: the readable-prefix
+    # path must return the same idx AND soft bits as the full-width path (a
+    # different GEMM shape is NOT bitwise column-independent, so score
+    # narrowing must not be applied).
     torch.manual_seed(0)
     random.seed(0)
     n, B, d, nIH = 17, 12, 8, 2
@@ -629,8 +627,8 @@ def t_indexer_column_narrowing_exact():
 
 
 def t_attention_zero_blocks_keeps_window():
-    # A sliding-window-only call has zero compressed blocks.  The stacked-row
-    # offset is then 0, which must not be mistaken for "no window lanes".
+    # A sliding-window-only call has zero compressed blocks: the stacked-row
+    # offset is 0 and the window lanes are still present.
     torch.manual_seed(0)
     n, h, d, w = 6, 2, 3, 4
     q, k, v = (torch.randn(n, h, d) for _ in range(3))
@@ -646,8 +644,9 @@ def t_attention_zero_blocks_keeps_window():
 
 
 def t_overfit_guard_source_key():
-    # A synthetic pre-flight must never mask a later DATA-path pre-flight for
-    # the same variant: the data check is the one that exercises real ids.
+    # A synthetic pre-flight and a data pre-flight are distinct keys: the data
+    # check exercises real ids, and a passed data check subsumes the synthetic
+    # check.
     _saved_guard = dict(L._OVERFIT_GUARD)
     _saved_fn = L.overfit_sanity_check
     calls = []

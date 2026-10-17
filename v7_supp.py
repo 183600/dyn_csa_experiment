@@ -74,11 +74,10 @@ def rope_cos_sin(head_dim, rope_dim, positions, device, base=10000.0):
 def apply_rope(x, cos, sin, rope_dim):
     half = rope_dim // 2
     if rope_dim > x.shape[-1]:
-        # Historical (pre-slice-write) form for an over-long rope_dim: the
-        # rotate half of the row and keep an empty passthrough tail.  The
-        # slice-write fast path below cannot express that case (the second
-        # write would exceed the output width), so fall back rather than
-        # raising where the public helper used to return a value.
+        # Over-long rope_dim: rotate the available half of the row and keep
+        # an empty passthrough tail.  The slice-write path below cannot
+        # express that case (the second write would exceed the output width),
+        # so use the general cat form.
         xr = x[..., :rope_dim]
         xp = x[..., rope_dim:]
         x1, x2 = (xr[..., :half], xr[..., half:])

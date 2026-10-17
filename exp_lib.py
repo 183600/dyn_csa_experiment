@@ -603,10 +603,8 @@ def _causal_window_mask_build(T, window, device, dtype):
     # Direct construction of the causal sliding-window additive mask in the
     # target dtype: allowed lanes (i-window < j <= i) get exactly 0.0 and every
     # other lane exactly -inf — the same two constants the causal + band
-    # addition and the elementwise cast produce.  A single reusable boolean
-    # scratch is triangularised twice, so the construction holds only the
-    # output (plus one bool plane) instead of materialising the causal donor,
-    # the band and their sum as three full [T, T] fp32 intermediates.
+    # addition and the elementwise cast produce.  A boolean scratch is
+    # triangularised twice to fill the two masked regions.
     with torch.inference_mode(False):
         m = torch.zeros((T, T), device=device, dtype=dtype)
         far = torch.ones((T, T), device=device, dtype=torch.bool)
@@ -1363,17 +1361,13 @@ def _rank_blocks(masked, B, ties, k=None):
     # to int32 on the kept slice only.  Same integers on every path (index
     # transport, design notes §6.1).
     #
-    # Only the first k columns are ever consumed by _indexer_selection, so for
-    # k < B the full stable sort is replaced by a stable top-k that returns
-    # exactly the same columns in the same order: the k-th largest value is
-    # found with torch.topk, all strictly larger entries are kept, and the
-    # remaining slots are filled from equal entries in original column order
-    # (the stable-sort tie rule).  The selected k candidates are then ordered
-    # by score with a stable argsort — the same value/column order the full
-    # sort produces on its first k columns.  This drops the O(B log B) sort
-    # and its [n, B] int64 index table to O(B log k) and [n, k], which is what
-    # matters when B (the compressed block count) grows with the sequence at
-    # scale.
+    # Only the first k columns are ever consumed by _indexer_selection.  For
+    # k < B, return exactly the columns the full stable sort would produce:
+    # the k-th largest value is found with torch.topk, all strictly larger
+    # entries are kept, and the remaining slots are filled from equal entries
+    # in original column order (the stable-sort tie rule).  The selected k
+    # candidates are then ordered by score with a stable argsort — the same
+    # value/column order as the first k columns of the full sort.
     kk = B if k is None else min(max(int(k), 0), B)
     if kk <= 0:
         return torch.empty((masked.shape[0], 0), dtype=torch.long, device=masked.device)
@@ -1573,8 +1567,8 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     # the prefix scores (and therefore the log-sum-exp and near-tie ordering)
     # can drift by ULPs.  The repo's comparability contract requires the same
     # inputs to produce the same bits as the un-narrowed implementation, so the
-    # score/soft path stays full width; the top-k selection itself is still
-    # cheap thanks to the stable top-k in `_rank_blocks`.
+    # score/soft path stays full width; top-k selection goes through the
+    # stable top-k in `_rank_blocks`.
     idx = torch.empty(n, _kw, device=dev, dtype=torch.int32)
     soft = None
     if out_valid is None and return_mask:
@@ -1719,10 +1713,9 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # The V halves are laid out contiguously once and gathered with one
     # combined row index per chunk: the selected rows of `v_all` are exactly
     # the two gather outputs concatenated in the same order, so Vset holds
-    # bit-identical values while one per-chunk cat and one index_select call
-    # disappear.  The plain path does the same for K (the soft path keeps two
-    # contiguous K gathers, see below).  Window rows are offset past the block
-    # rows (index transport, §6.1).
+    # bit-identical values.  The plain path does the same for K (the soft path
+    # keeps two contiguous K gathers, see below).  Window rows are offset past
+    # the block rows (index transport, §6.1).
     _nblk_rows = k_blk.shape[0]
     _has_sw = k_sw is not None and v_sw is not None
     if _has_sw:
@@ -1830,10 +1823,9 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         _sel_rows = topk_l[s:e]
         _win_local = win_idx[s:e]
         _win_rows = _win_local + _win_off if _win_off else _win_local
-        # A window with zero compressed blocks has _win_off == 0; keying the
-        # concatenation on the offset (rather than on `_has_sw`) would then
-        # drop the window lanes entirely.  `_has_sw` is the actual contract:
-        # offset 0 is a valid stacked-row base when k_blk holds no rows.
+        # `_has_sw` is the contract for stacking window lanes: the row offset
+        # may be 0 when k_blk holds no rows, and that is still a valid
+        # stacked-row base.
         _rows = torch.cat([_sel_rows, _win_rows], 1) if _has_sw else _sel_rows
         # soft_form=True 在 soft=None 时仍选用软分支的硬部分解（两个半段
         # logits + cat），供调用方在跳过（无梯度下已死的）soft 尾部后保持
@@ -1854,10 +1846,10 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             continue
         Vset = _tk2(v_all, _rows)
         # The soft branch reads its K halves as two contiguous gathers: the
-        # concatenated V gather above holds exactly the same rows as the old
-        # two gathers + cat, while the per-half K gathers feed the two logits
-        # einsums with the same operands they always saved (index re-plumbing
-        # only, design notes §6.1).
+        # concatenated V gather above holds exactly the same rows as two
+        # separate gathers + cat, while the per-half K gathers feed the two
+        # logits einsums with the same operands (index re-plumbing only,
+        # design notes §6.1).
         kb = _tk2(k_blk, _sel_rows)
         kw = _tk2(k_sw, _win_local)
         blk_logits = _einsum('qhd,qmhd->qhm', qseg, kb)
@@ -5786,11 +5778,9 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
     src = 'data' if train_ids is not None else 'synthetic'
 
     def _known(v):
-        # A DATA-path check is the stronger one and must never be skipped just
-        # because the synthetic check already ran for the same variant: the
-        # whole point of the data check is to exercise the real token stream.
-        # A synthetic request, however, is subsumed by a passed data check
-        # (same model path, a superset of the synthetic input space).
+        # A data-path check exercises the real token stream, while a passed
+        # data check subsumes a synthetic one (same model path, a superset of
+        # the synthetic input space).
         if src == 'data':
             return (v, 'data') in _OVERFIT_GUARD
         return (v, 'synthetic') in _OVERFIT_GUARD or (v, 'data') in _OVERFIT_GUARD

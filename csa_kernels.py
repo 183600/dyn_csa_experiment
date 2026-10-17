@@ -670,11 +670,10 @@ def _stable_topk_desc(x, k):
     """Stable descending top-k of the last dim, tie = earliest column.
 
     Returns (values, indices) with exactly the first k columns of
-    torch.sort(x, dim=-1, descending=True, stable=True).  For k << B this
-    avoids the full O(B log B) sort and its [..., B] int64 index table: the
-    k-th value is found with topk, all strictly larger entries are kept and
-    the remaining slots are filled from equal entries in column order (the
-    stable tie rule), then the k candidates are ordered by a stable argsort.
+    torch.sort(x, dim=-1, descending=True, stable=True): the k-th value is
+    found with topk, all strictly larger entries are kept and the remaining
+    slots are filled from equal entries in column order (the stable tie
+    rule), then the k candidates are ordered by a stable argsort.
     """
     B = x.shape[-1]
     kk = min(int(k), B)
