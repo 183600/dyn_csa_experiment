@@ -96,7 +96,7 @@ def t_tost():
     above = [0.05, 0.052, 0.049, 0.051, 0.05, 0.048]
     r2 = L.tost_paired(above, margin=0.01)
     assert r2['equivalent'] is False and r2['p_tost'] > 0.05, f'mean far above margin must NOT be equivalent: {r2}'
-    # direction check (the review-2 regression the erfc sign bug would cause):
+    # direction check:
     far = [0.9, 0.95, 0.85, 1.0, 0.92, 0.88]
     r3 = L.tost_paired(far, margin=0.1)
     assert r3['equivalent'] is False, 'mean ~0.9 vs margin 0.1 must not be equivalent even with noise'
@@ -343,9 +343,7 @@ def t_freeze_lock():
 
 def t_p1l_recipe_signature():
     # P5T evaluates checkpoints written by v7's length-phase writer, whose
-    # recipe is the bespoke `p1l_...` format (not a run_cfg fingerprint).  The
-    # shipped frozen signature must accept it, otherwise every frozen
-    # checkpoint is refused as a recipe mismatch.
+    # recipe is the bespoke `p1l_...` format (not a run_cfg fingerprint).
     with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
         v2 = json.load(f)
     sig = v2['binding']['training_recipe_signature']
@@ -389,13 +387,12 @@ def t_audit_resolution_classification():
 
 
 def t_adaptive_threshold_guard():
-    # The implementation row-chunks: a large batch with a moderate T is
-    # feasible and must not be rejected; a single long row whose per-chunk
-    # peak genuinely exceeds the budget must be rejected.
+    # Row chunking keeps a large batch feasible; a single excessively long row
+    # is refused.
     L.causal_adaptive_threshold(torch.randn(64, 4096), 16)
     try:
         L.causal_adaptive_threshold(torch.randn(16000), 16)
-        raise AssertionError('a single 16000-token row materialises ~4 GB and must be refused')
+        raise AssertionError('a single 16000-token row exceeds the supported limit and must be refused')
     except RuntimeError:
         pass
 

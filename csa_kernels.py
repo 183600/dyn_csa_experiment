@@ -731,8 +731,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
             scores.add_(s_i * wf[:, t0:t1, i:i + 1])
         scores = scores.to(dtype)
         # where 的标量分支与 full_like/zeros_like 逐位同值（标量按 dtype
-        # 精确表示、元素级选择同一比较结果），且省去每 chunk 一张
-        # [R, tc, Bm] 的常量填充临时量。
+        # 精确表示、元素级选择同一比较结果）。
         masked_lse = torch.where(causal_c, scores, _NEG_INF)
         lse = torch.logsumexp(masked_lse, dim=-1)
         cf = causal_c & torch.isfinite(scores)
@@ -839,8 +838,7 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
             # 同一批舍入分数重算。
             s_all = s_all.to(dtype)
         causal_c = t_idx[:, t0:t1] > lt64[:, None, :]
-        # 同 _indexer_fwd_ref：标量分支省去每 chunk 三张 [R, tc, Bm] 常量
-        # 填充临时量，值与 full_like/zeros_like 形式逐位一致。
+        # 同 _indexer_fwd_ref：标量分支与 full_like/zeros_like 形式逐位一致。
         masked = torch.where(causal_c, s_all, _NEG_INF)
         lse = torch.logsumexp(masked, dim=-1)
         row_ok = torch.isfinite(lse)

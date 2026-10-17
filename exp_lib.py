@@ -115,7 +115,7 @@ ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_
 # 单面板 summary 审计——参照臂不在面板内时该面板只能报「缺臂」，撑不起任何
 # 「各模块都有用」的结论。因此消融面板自含参照臂（csa_dynamic / hybrid_csa_dyn
 # 即去一法的「Full」；full 供 full_sink 的 dense sink 对照）。参照臂列在最前：
-# 历史机器上 resume 直接跳过，全新机器上预算被 cap 截断时它们最先完成，缺的
+# 历史机器上 resume 直接跳过，全新机器上被 cap 截断时它们最先完成，缺的
 # 只是 abl 臂而不是整套对照。
 ABL_REFS = ['full', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic']
 RUN_ABL = dict(RUN, outdir='results_lm_v4_abl', variants=ABL_REFS + ABL_VARIANTS, seeds=[0] if QUICK else [0, 1, 2, 3, 4])
@@ -217,11 +217,8 @@ def _segment(n, want_cut_list, min_block, max_block):
     np.minimum(nxt, n, out=nxt)
     np.maximum(nxt, pos + 1, out=nxt)
     # The successor table is a contiguous int64 array; a memoryview reads the
-    # same exact integers as `nxt.tolist()` (a Python int per slot) for each
-    # successor, without first materialising an O(n) Python list.  The walk is
-    # one Python step per block, so for long sequences (#blocks ~ n) this
-    # avoids a large per-call allocation; the fallback to tolist covers any
-    # non-contiguous / non-buffer dtype.
+    # same exact integers as `nxt.tolist()` for each successor.  The fallback
+    # to tolist covers any non-contiguous / non-buffer dtype.
     try:
         nxt_walk = nxt.data if nxt.flags['C_CONTIGUOUS'] else nxt.tolist()
     except (AttributeError, BufferError, ValueError):
@@ -244,8 +241,7 @@ def _segment(n, want_cut_list, min_block, max_block):
             hj = np.searchsorted(slots, ends[sel] - 1, side='right')
             # dict.fromkeys over the `.tolist()` view builds the identical
             # {python-int slot: 1.0} mapping (first-occurrence order, duplicate
-            # slots collapsed) in one C-level pass instead of a per-slot Python
-            # comprehension — same keys, same values, same insertion order.
+            # slots collapsed), with the same keys, values and insertion order.
             honoured = dict.fromkeys(slots[hj - 1].tolist(), 1.0)
     bids = np.repeat(np.arange(len(counts), dtype=np.int64), np.asarray(counts, dtype=np.int64))
     if cacheable:
@@ -420,10 +416,7 @@ def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=Fals
 def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
-    # 闭式因果分位数按行分块（见下方 row_chunk），单块峰值才是真正的内存
-    # 上界：masked + 排序值 + int64 排序索引 ≈ 16·rows·T² 字节。用这个
-    # 上界做 fail-fast，既不会误拒大 batch（峰值与 B 无关），也不会对
-    # 单行超长序列放行到数 GB 的分配——fail-fast 而不是让内核 OOM。
+    # 闭式因果分位数按行分块；超限时 fail-fast（见下方 row_chunk）。
     n = sim.shape[-1]
     _rows_total = int(sim.shape[0]) if sim.dim() == 2 else 1
     _row_chunk_est = max(1, (256 << 20) // max(n * n * 4, 1))
@@ -447,7 +440,7 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     hi_c = (lo + 1).clamp(max=n - 1)[..., None]
     use_hi = (frac > 0.0) & (lo + 1 <= idx)
     first_row = idx == 0
-    # row chunking keeps the transient [rows, n, n] sort input bounded.
+    # row chunking keeps the per-chunk sort input bounded.
     row_chunk = max(1, (256 << 20) // max(n * n * 4, 1))
     out = torch.empty_like(x)
     for r0 in range(0, x.shape[0], row_chunk):
@@ -630,15 +623,9 @@ def _attn_transient_budget(device):
     try:
         if device.type == 'cuda':
             free, _total = torch.cuda.mem_get_info(device)
-            # 预算除随空闲量 1/4 外再封顶 _ATTN_TRANSIENT_CAP_BYTES：free//4
-            # 在大显存卡上是数 GB～十余 GB，而 dense-sink 行块的
-            # [B,nh,chunk,T] logits/attn 双临时量与 gathered_attention 的
-            # [chunk,M,h,d] gather 都随 chunk 宽度线性放大——S 档
-            # （T=8192+、B~10^3 泳道）下会物化 6–18 GB 的瞬态。行分块是
-            # 纯行划分（任意宽度下逐行值逐位相同，见 gathered_attention
-            # 的 chunk 注释），封顶只收窄分块、等比例压低峰值显存；当前
-            # 面板（T≤1024）的分块宽度受 min(1024,·) 与 q_chunk=128 的
-            # 静态上限支配，预算从不触顶，分块与既有记录完全一致。
+            # 预算随空闲量缩放，并封顶 _ATTN_TRANSIENT_CAP_BYTES；行分块是
+            # 纯行划分（任意宽度下逐行值逐位相同，见 gathered_attention 的
+            # chunk 注释），因此预算变化只影响分块宽度，不改变任何值。
             val = max(64 << 20, min(int(free) // 4, _ATTN_TRANSIENT_CAP_BYTES))
     except Exception:
         val = None
@@ -1336,8 +1323,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         # after overwrites the pad lanes with -inf, and the incoming grad at
         # those lanes is exactly zero (MaskedFillBackward / softmax P=0), so
         # the values and the B_pos gradients are identical to the
-        # masked-multiply and boolean-index forms — minus one [chunk, L, Fd]
-        # temporary and one elementwise kernel per chunk.
+        # masked-multiply and boolean-index forms.
         # += on the fresh _take_2d output (same elementwise kernel and values as
         # the out-of-place add; see _pool_ordered).
         WinZ += _bpos[None]
@@ -1688,10 +1674,9 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # row is exactly arange(B)): last_tok[topk_l] then gathers one identical
     # copy of last_tok per row, so the same bool table comes out of a plain
     # broadcast comparison against last_tok — same integers compared, bitwise
-    # the same output (§6.1), minus the [n, nb] int64 gather intermediate
-    # (at S-tier, T=8192 with B~10^3 lanes, that is a multi-hundred-MB
-    # transient).  Identity with the cached table (not a content scan) is the
-    # guard, so any other caller falls back to the gather form unchanged.
+    # the same output (§6.1).  Identity with the cached table (not a content
+    # scan) is the guard, so any other caller falls back to the gather form
+    # unchanged.
     _arange_sel = (topk_l.shape[1] == last_tok.shape[0]
                    and topk_l is _IDX_CACHE.get((_dev_str(dev), 'arangeexp', int(n), int(topk_l.shape[1]))))
     sel_blk_all = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
@@ -1968,10 +1953,7 @@ class HybridAttention(nn.Module):
             if torch.is_grad_enabled():
                 _wqkv = torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0)
             else:
-                # dtype belongs in the key: Module.to(dtype)/.half() replaces
-                # the parameter data WITHOUT bumping `_version`, so a key made
-                # only of versions+device would serve a stale fused weight of
-                # the old dtype after an in-place precision change.
+                # Key on versions, dtype and device of the source weights.
                 _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version,
                         self.W_q.weight.dtype, self.W_k.weight.dtype, self.W_v.weight.dtype,
                         self.W_q.weight.device)
@@ -2100,8 +2082,7 @@ class HybridAttention(nn.Module):
         if torch.is_grad_enabled():
             _wcat = torch.cat([_m.t() for _m in _mats], dim=0)
         else:
-            # dtype too: .to(dtype)/.half() does not bump `_version`, so a
-            # versions+device key would serve the pre-conversion fused weight.
+            # Key on versions, dtype and device of the source weights.
             _key = tuple(_m._version for _m in _mats) + tuple(_m.dtype for _m in _mats) + (_mats[0].device,)
             _hit = self._wcat_cache.get('pre')
             if _hit is None or _hit[0] != _key:
@@ -3295,10 +3276,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             raise RuntimeError(f'load_fineweb_edu: only {n_train} train tokens available (need > seq_len+1 = {seq_len + 1}) — the source is too small for the requested cap')
 
         def _finalise_npy(raw_path, dst_path, count):
-            # Unique temp name (mkstemp): a fixed `dst_path + '.tmp'` lets two
-            # concurrent cold builds write through the same memmap, and one can
-            # rename it while the other is still writing.  Same-directory temp
-            # keeps os.replace atomic (same filesystem).
+            # Write through a unique same-directory temp file, then replace
+            # atomically.
             _fd, npy_tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(dst_path)),
                                             prefix=os.path.basename(dst_path) + '.', suffix='.tmp')
             os.close(_fd)
@@ -5494,7 +5473,7 @@ class TimeGuard:
         self.already = float(cap.get('already_hours', 0.0))
         self.state_path = cap.get('state_path', 'run_time_state.json')
         # 内核模式使用独立的状态文件：两档速率标定不可互相污染（同一
-        # state 文件会把 eager 的 sps 标定用于内核单元的预计耗时）。
+        # state 文件会把 eager 的 sps 标定用于内核单元）。
         # 幂等：cap_spec() 导出的就是已盖章路径，par.py 子进程按它重建
         # TimeGuard 时不得再加一次后缀。
         if _kernel_stamp() and not self.state_path.endswith('.k'):
@@ -6487,13 +6466,10 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             return out
         deadline_ts = guard.deadline_ts()
         if booked:
-            # `spent_hours()` includes this cell's own pre-booking, but that
-            # reservation is the time this cell is ABOUT to use — not time
-            # already spent.  Without adding it back here the cell's wall-clock
-            # deadline shrinks by its own estimate (a lone 6 h cell under a
-            # 9.3 h cap would be truncated after 3.3 h, and after one truncated
-            # attempt it could never finish).  Other cells' bookings stay
-            # subtracted, which is exactly the shared-headroom contract.
+            # `spent_hours()` includes this cell's own pre-booking, which is
+            # the time this cell is about to use rather than time already
+            # spent, so add it back here.  Other cells' bookings stay
+            # subtracted (shared-headroom contract).
             deadline_ts += booked
         print(f'[cap] {key}: projected {est / 60:.0f} min, booked so far {guard.state['booked_seconds'] / 3600:.2f} h')
     t_run = time.time()

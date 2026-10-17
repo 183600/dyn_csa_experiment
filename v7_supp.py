@@ -134,11 +134,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 _wqkv = torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0)
             else:
                 # eval-only weight-concat cache, keyed on the source weights'
-                # autograd `_version` counters (bumped by every in-place
-                # optimizer update) exactly like exp_lib's `_wcat_cache`.
-                # dtype is part of the key: .to(dtype)/.half() does not bump
-                # `_version`, so a versions+device key would serve a stale
-                # fused weight of the previous dtype.
+                # autograd `_version` counters, dtype and device, exactly like
+                # exp_lib's `_wcat_cache`.
                 _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version,
                         self.W_q.weight.dtype, self.W_k.weight.dtype, self.W_v.weight.dtype,
                         self.W_q.weight.device)
@@ -1026,8 +1023,7 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
         span = min(seq_len, max_pos) if getattr(model, 'use_abs_pe', True) else seq_len
         tail = 2 * n_pairs
         # targets uploaded once and the per-chunk comparison done on-device:
-        # only the [n_seq, tail-1] bool strip crosses the bus at the end instead
-        # of an [chunk, tail-1] argmax download (with its CUDA sync) per chunk.
+        # only the [n_seq, tail-1] bool strip crosses the bus at the end.
         tgt_dev = L._h2d_async(tgt, torch.int64, device)
         correct_dev = torch.zeros(n_seq, tail - 1, dtype=torch.bool, device=device)
         i = 0

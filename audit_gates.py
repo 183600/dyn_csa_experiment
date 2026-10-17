@@ -396,9 +396,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
         if not ref_cfg or None in ref_cfg:
             # Length-phase / checkpoint-backed records carry `by_len` and a
             # code stamp but no run_cfg fingerprint, so cross-arm recipe
-            # equality is NOT verifiable from this summary.  Report that
-            # honestly instead of flagging every arm as unfair (which would
-            # turn a missing field into a false FAIL).
+            # equality is NOT verifiable from this summary.
             _unverifiable = True
             out['note'] = 'this panel\'s records carry no run_cfg fingerprint (e.g. length-phase records) — cross-arm training-recipe equality cannot be verified from this summary; run the fairness audit on the run-level summary that owns the run_cfg records'
         else:
