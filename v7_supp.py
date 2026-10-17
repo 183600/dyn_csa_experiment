@@ -349,7 +349,26 @@ class HybridAttentionRoPE(L.HybridAttention):
         # same int32 index transport as exp_lib.gathered_attention (§6.1):
         # identical integers, identical gathered values.
         topk_l = topk_idx if topk_idx.dtype in (torch.int32, torch.int64) else topk_idx.long()
-        _sel_all = pos_all[:, None] > last_tok[topk_l]
+        # same broadcast fast path as exp_lib.gathered_attention: the cached
+        # arange expansion makes last_tok[topk_l] one identical copy per row, so
+        # a broadcast comparison gives the same booleans without materialising
+        # the [n, k] gathered table.
+        _arange_sel = (topk_l.shape[1] == last_tok.shape[0]
+                       and topk_l is L._IDX_CACHE.get((L._dev_str(dev), 'arangeexp', int(T), int(topk_l.shape[1]))))
+        _sel_all = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
+        # The K/V halves are stacked once and gathered with one combined row
+        # index per chunk, exactly as exp_lib.gathered_attention does: the
+        # selected rows are the two old gather outputs concatenated in the same
+        # order, so the values are bit-identical and two per-chunk cats plus two
+        # index_select calls disappear.
+        _nblk_rows = k_blk_r.shape[0]
+        _has_sw = k_sw_r is not None and v_sw is not None
+        if _has_sw:
+            k_all = torch.cat([k_blk_r, k_sw_r], 0)
+            v_all = torch.cat([v_blk, v_sw], 0)
+        else:
+            k_all, v_all = (k_blk_r, v_blk)
+        _win_off = _nblk_rows if _has_sw else 0
         # see exp_lib.gathered_attention: these per-row masks are hoisted under
         # L._FO_FULL_CAP_BYTES; the hoisted values are bitwise identical to the
         # per-chunk forms.  `topk_distinct=True` (the read-everything HCA arm's
@@ -395,10 +414,15 @@ class HybridAttentionRoPE(L.HybridAttention):
             # k_sw_r / v_sw — exactly the rows the cat-then-gather form
             # addressed through the +n_blk offsets, so every gathered value is
             # bit-identical (index re-plumbing only, §6.1).
-            Kset = torch.cat([L._take_2d(k_blk_r, ib), L._take_2d(k_sw_r, _wi_all[s:e])], 1)
-            Vset = torch.cat([L._take_2d(v_blk, ib), L._take_2d(v_sw, _wi_all[s:e])], 1)
+            _iw = _wi_all[s:e]
+            _iw_rows = _iw + _win_off if _win_off else _iw
+            _rows = torch.cat([ib, _iw_rows], 1) if _has_sw else ib
+            Kset = L._take_2d(k_all, _rows)
             qc = apply_rope(q[s:e], cos[s:e, None, :], sin[s:e, None, :], rope_dim)
             raw_logits = torch.einsum('qhd,qmhd->qhm', qc, Kset)
+            # K is consumed by the logits only; V is gathered after the
+            # attention weights are final so the two lane stacks never coexist.
+            del Kset
             if scale != 1.0:
                 # x·1.0 is the IEEE identity (and its backward Mul node maps
                 # grad·1.0 identically), so scaling by 1.0 is a no-op — same
@@ -426,7 +450,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 attn = (soft_attn - soft_attn.detach()).add_(attn)
                 if sink is None:
                     attn.mul_(_anyrow[:, None, None])
-            out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vset)
+            out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, L._take_2d(v_all, _rows))
         return out
     def _dense_warmup_forward(self, x):
         B, T, _ = x.shape

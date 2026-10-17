@@ -591,11 +591,18 @@ def _arange_exp_cache(n, m, device):
     # inference mode so a table first filled during eval can still serve as an
     # autograd index tensor in training; only ever read downstream (row slices
     # feeding gathers), never mutated.
+    #
+    # The table is stored as a stride-0 expand of one [m] arange instead of a
+    # materialised repeat: every row holds the same exact integers, advanced
+    # indexing / slicing / cat read them identically, and nothing downstream
+    # writes to the table, so the resident footprint is O(m) rather than O(n·m)
+    # (the largest single index table in the HCA arm at long T).
     key = (_dev_str(device), 'arangeexp', int(n), int(m))
     a = _IDX_CACHE.get(key)
     if a is None:
         with torch.inference_mode(False):
-            a = torch.arange(int(m), device=device, dtype=torch.int32).repeat(int(n), 1)
+            base = torch.arange(int(m), device=device, dtype=torch.int32)
+            a = base.expand(int(n), int(m))
         _cache_put(_IDX_CACHE, key, a, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return a
 
@@ -1246,24 +1253,21 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     comp = torch.empty(B, _Fd, device=dev, dtype=Xas.dtype)
     for _b0 in range(0, B, _chunk):
         _b1 = min(_b0 + _chunk, B)
-        Xam = _take_2d(Xas, g_a[_b0:_b1])
         Zam = _take_2d(Zas, g_a[_b0:_b1])
-        Xbm = _take_2d(Xbs, g_b[_b0:_b1])
         Zbm = _take_2d(Zbs, g_b[_b0:_b1])
         _ma = mask_a[_b0:_b1]
         _mb = mask_b[_b0:_b1]
-        # Position-embedding add restricted to valid lanes arithmetically:
-        # multiplying by the 0/1 mask adds exactly the same values on valid
-        # lanes and exactly 0 on pad lanes; pad lanes are then overwritten with
-        # -inf.  Forward values and B_pos gradients (zero on invalid lanes in
-        # both forms) are identical to the boolean-index form.  (The
-        # single-block path below uses the equivalent plain-broadcast form.)
-        # += on the fresh _take_2d outputs: the same elementwise kernel with
-        # the same values as the out-of-place add (AddBackward saves no tensor,
-        # and the only downstream consumer chain — masked_fill_/cat/softmax —
-        # keeps no pre-add version).
-        Zam += _bpa[None] * _ma[:, :, None]
-        Zbm += B_pos_b[b_off[_b0:_b1]] * _mb[:, :, None]
+        # Plain-broadcast position add (same form pool_blocks_single already
+        # uses): pad lanes are overwritten with -inf right after, and their
+        # incoming grad is exactly zero (MaskedFillBackward / softmax P=0), so
+        # forward values and B_pos gradients are identical to the masked-multiply
+        # form — without materialising a full [chunk, max_len, c] product.
+        # += on the fresh _take_2d outputs: the same elementwise kernel with the
+        # same values as the out-of-place add (AddBackward saves no tensor, and
+        # the only downstream consumer chain — masked_fill_/cat/softmax — keeps
+        # no pre-add version).
+        Zam += _bpa[None]
+        Zbm += B_pos_b[b_off[_b0:_b1]]
         # the fill mask broadcasts: masked_fill_ accepts a broadcastable mask,
         # so the same booleans reach every lane (broadcast reads are exact).
         Zam.masked_fill_(~_ma[:, :, None], float('-inf'))
@@ -1272,6 +1276,13 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         # softmax 的反向保存其输出，nan_to_num 必须出位（原地会改写保存值，
         # SoftmaxBackward 版本检查失败）；值与任何原地形式逐位相同。
         sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
+        # Drop the logit side before the X gathers: sc fully determines the
+        # weights, so the X lanes can be fetched afterwards.  Values are
+        # unchanged (the same gathers), but the peak no longer holds both the
+        # logit stack and the X-lane stack at once.
+        del WinZ, Zam, Zbm
+        Xam = _take_2d(Xas, g_a[_b0:_b1])
+        Xbm = _take_2d(Xbs, g_b[_b0:_b1])
         sc_a = sc[:, :max_len]
         sc_b = sc[:, max_len:]
         comp[_b0:_b1] = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
@@ -1832,8 +1843,11 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # 硬分支逐位一致；它不改变任何取值，只固定走哪套既有分解。
         if soft is None and not soft_form:
             Kset = _tk2(k_all, _rows)
-            Vset = _tk2(v_all, _rows)
             logits = _einsum('qhd,qmhd->qhm', qseg, Kset)
+            # K is consumed by the logits only; release it before gathering V
+            # so the two [chunk, M, h, d] lane stacks never coexist.  The same
+            # rows are gathered below, so every value is unchanged.
+            del Kset
             if scale != 1.0:
                 # x·1.0 is the IEEE identity (and grad·1.0 is bit-identical on
                 # the backward Mul node), so scaling by 1.0 is a no-op.
@@ -1842,14 +1856,14 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
             if not _has_sink:
                 attn.mul_(anyrow[:, None, None])
-            out[s:e] = _einsum('qhm,qmhd->qhd', attn, Vset)
+            out[s:e] = _einsum('qhm,qmhd->qhd', attn, _tk2(v_all, _rows))
             continue
-        Vset = _tk2(v_all, _rows)
         # The soft branch reads its K halves as two contiguous gathers: the
-        # concatenated V gather above holds exactly the same rows as two
+        # concatenated V gather below holds exactly the same rows as two
         # separate gathers + cat, while the per-half K gathers feed the two
         # logits einsums with the same operands (index re-plumbing only,
-        # design notes §6.1).
+        # design notes §6.1).  V is gathered only after the attention weights
+        # are final, so its lane stack does not coexist with the K halves.
         kb = _tk2(k_blk, _sel_rows)
         kw = _tk2(k_sw, _win_local)
         blk_logits = _einsum('qhd,qmhd->qhm', qseg, kb)
@@ -1859,6 +1873,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         if scale != 1.0:
             win_logits.mul_(scale)
         logits = torch.cat([blk_logits, win_logits], -1)
+        del kb, kw, blk_logits, win_logits
         if _soft_live:
             soft_g = soft[s:e]
             if keep is not None:
@@ -1875,7 +1890,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             attn = (soft_attn - soft_attn.detach()).add_(attn)
         if not _has_sink:
             attn.mul_(anyrow[:, None, None])
-        out[s:e] = _einsum('qhm,qmhd->qhd', attn, Vset)
+        out[s:e] = _einsum('qhm,qmhd->qhd', attn, _tk2(v_all, _rows))
     return out
 
 def _gathered_attention_trainable(*args, **kwargs):
