@@ -862,6 +862,10 @@ def _n_blocks_cached(block_ids):
     # object.  First call per object computes the identical value.  When the
     # segmenter already attached its host-side counts, their length is the
     # same block count without a device reduction + host sync.
+    if block_ids.numel() == 0:
+        # No tokens -> no blocks (the same total form as _segment/blocks_from_cuts;
+        # max() on an empty tensor would raise instead of returning 0).
+        return 0
     B = getattr(block_ids, '_pool_nblocks', None)
     if B is None:
         _cpu = getattr(block_ids, '_pool_cpu', None)
@@ -878,6 +882,10 @@ def _n_blocks_cached(block_ids):
 def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n_blocks=None, monotonic=False):
     n, Fd = Xa.shape
     dev = Xa.device
+    if n == 0:
+        # Empty sequence: no blocks to pool.  Keep the same return contract as
+        # the non-empty path instead of reaching the empty-tensor reductions.
+        return (Xa[:0], torch.empty(0, dtype=torch.long, device=dev), 0)
     B = int(n_blocks) if n_blocks is not None else _n_blocks_cached(block_ids)
     order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
     if _ident:
@@ -1424,6 +1432,9 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
 def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     n = X.shape[0]
     dev = X.device
+    if n == 0:
+        # Same empty-sequence contract as pool_variable_blocks.
+        return (X[:0], torch.empty(0, dtype=torch.long, device=dev), 0)
     B = int(n_blocks) if n_blocks is not None else _n_blocks_cached(block_ids)
     order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
     if _ident:
@@ -4776,7 +4787,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     is the best trial under that metric.  Missing evidence is reported as
     `not_verifiable_locally`, never as a pass.
     """
-    protocol = BASELINE_TUNING_PROTOCOL if protocol is None else protocol
+    _explicit_protocol = protocol is not None
     if selected is None and path:
         if os.path.exists(path):
             try:
@@ -4786,6 +4797,14 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         else:
             return {'status': 'not_verifiable_locally', 'tuning_verified': False,
                     'problems': [f'{path} absent — run baseline_tune.py before claiming a baseline win']}
+    # An artifact records the protocol it was produced under.  Use it when the
+    # caller did not pass one explicitly, so a legitimate smoke/subset run is
+    # audited against its own declared grid instead of the full global grid
+    # (the latter reported the subset's deliberately absent arms as "missing").
+    if not _explicit_protocol and isinstance(selected, dict) and isinstance(selected.get('protocol'), dict):
+        protocol = selected['protocol']
+    else:
+        protocol = BASELINE_TUNING_PROTOCOL if protocol is None else protocol
     if not isinstance(selected, dict) or not isinstance(selected.get('arms'), dict):
         return {'status': 'not_verifiable_locally', 'tuning_verified': False,
                 'problems': ['no baseline_tuning artifact (expected {"arms": {...}})']}

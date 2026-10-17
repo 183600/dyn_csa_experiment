@@ -108,7 +108,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     }
     path = os.path.join(outdir, 'baseline_tuning.json')
     L.atomic_write_json(path, artifact)
-    audit = L.baseline_tuning_audit(path=path)
+    audit = L.baseline_tuning_audit(path=path, protocol=protocol)
     print(f'[tune] artifact: {path}  audit={audit.get("status")}')
     if not audit.get('tuning_verified'):
         raise RuntimeError(f'[tune] tuning artifact failed its own audit: {audit.get("problems")}')

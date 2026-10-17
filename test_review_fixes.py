@@ -471,6 +471,19 @@ def t_adaptive_threshold_guard():
         pass
 
 
+def t_empty_pool_geometry():
+    dev = torch.device('cpu')
+    ids = torch.empty(0, dtype=torch.long, device=dev)
+    assert L._n_blocks_cached(ids) == 0, 'an empty block table has zero blocks, not a max() error'
+    comp, last_tok, B = L.pool_variable_blocks(torch.empty(0, 4), torch.empty(0, 4),
+                                               torch.empty(0, 4), torch.empty(0, 4), ids,
+                                               torch.empty(4, 4), torch.empty(4, 4), 1)
+    assert comp.shape == (0, 4) and last_tok.shape == (0,) and B == 0
+    comp, last_tok, B = L.pool_blocks_single(torch.empty(0, 4), torch.empty(0, 4),
+                                             torch.empty(4, 4), ids)
+    assert comp.shape == (0, 4) and last_tok.shape == (0,) and B == 0
+
+
 def t_segment_empty():
     bids, hon, counts = L._segment(0, [], 2, 128)
     assert bids.size == 0 and hon == {} and counts == []
@@ -1058,6 +1071,11 @@ def t_baseline_tuning_audit():
            'arms': {'full_matched': _arm([10.0, 11.0]), 'csa_dynamic': _arm([9.0, 9.5])}}
     r = L.baseline_tuning_audit(art, protocol=protocol)
     assert r['tuning_verified'] is True, r
+    # An artifact carries the protocol it was produced under (the smoke panel
+    # deliberately schedules a subset); the audit must use it when the caller
+    # does not pass one explicitly.
+    r_auto = L.baseline_tuning_audit(dict(art, protocol=protocol))
+    assert r_auto['tuning_verified'] is True, r_auto
     bad = json.loads(json.dumps(art))
     bad['arms']['csa_dynamic']['trials'] = bad['arms']['csa_dynamic']['trials'][:1]
     r2 = L.baseline_tuning_audit(bad, protocol=protocol)
@@ -1098,6 +1116,7 @@ def main():
     _check('C14 compression-regularizer loss ablation', t_ablation_design_loss_term)
     _check('A7 adaptive-threshold memory guard', t_adaptive_threshold_guard)
     _check('A8 empty segmenter', t_segment_empty)
+    _check('A8b empty pooling geometry', t_empty_pool_geometry)
     _check('C6 shipped manifest v2 consistency', t_shipped_manifest_consistency)
     _check('C7 frozen seeds single source', t_frozen_seeds)
     _check('C8 doc-level analysis', t_doc_level_analysis)
