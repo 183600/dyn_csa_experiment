@@ -599,17 +599,40 @@ def _arange_exp_cache(n, m, device):
         _cache_put(_IDX_CACHE, key, a, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return a
 
+def _causal_window_mask_build(T, window, device, dtype):
+    # Direct construction of the causal sliding-window additive mask in the
+    # target dtype: allowed lanes (i-window < j <= i) get exactly 0.0 and every
+    # other lane exactly -inf — the same two constants the causal + band
+    # addition and the elementwise cast produce.  A single reusable boolean
+    # scratch is triangularised twice, so the construction holds only the
+    # output (plus one bool plane) instead of materialising the causal donor,
+    # the band and their sum as three full [T, T] fp32 intermediates.
+    with torch.inference_mode(False):
+        m = torch.zeros((T, T), device=device, dtype=dtype)
+        far = torch.ones((T, T), device=device, dtype=torch.bool)
+        far.tril_(-int(window))
+        m.masked_fill_(far, float('-inf'))
+        far.fill_(True).triu_(1)
+        m.masked_fill_(far, float('-inf'))
+    return m
+
 def causal_window_mask_f(T, window, device, dtype):
     """causal_window_mask 的目标 dtype 形式（逐元素 cast 对 0/-inf 精确；
     缓存键含 dtype，mask 下游只读）。dtype 相同则无新分配。"""
-    base = causal_window_mask(T, window, device)
-    if base.dtype == dtype:
-        return base
     key = (_dev_str(device), 'cwf', int(T), int(window), str(dtype))
+    if window <= 0 or window >= T:
+        base = causal_mask(T, device)
+        if base.dtype == dtype:
+            return base
+        m = _MASK_CACHE.get(key)
+        if m is None:
+            with torch.inference_mode(False):
+                m = base.to(dtype)
+            _cache_put(_MASK_CACHE, key, m, _mask_budget(T), _mask_cache_total)
+        return m
     m = _MASK_CACHE.get(key)
     if m is None:
-        with torch.inference_mode(False):
-            m = base.to(dtype)
+        m = _causal_window_mask_build(T, window, device, dtype)
         _cache_put(_MASK_CACHE, key, m, _mask_budget(T), _mask_cache_total)
     return m
 
@@ -675,9 +698,7 @@ def causal_window_mask(T, window, device):
     key = (_dev_str(device), 'cw', int(T), int(window))
     m = _MASK_CACHE.get(key)
     if m is None:
-        with torch.inference_mode(False):
-            m = causal_mask(T, device).clone()
-            m.add_(window_band(T, window, device))
+        m = _causal_window_mask_build(T, window, device, torch.float32)
         _cache_put(_MASK_CACHE, key, m, _mask_budget(T), _mask_cache_total)
     return m
 
@@ -1337,14 +1358,51 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     # cached arange returns exactly last_idx (index transport, §6.1).
     return (comp, last_idx if _ident else order[last_idx], B)
 
-def _rank_blocks(masked, B, ties):
+def _rank_blocks(masked, B, ties, k=None):
     # The sort indices are consumed by the int64 gathers below and narrowed
     # to int32 on the kept slice only.  Same integers on every path (index
     # transport, design notes §6.1).
-    if ties == 'earliest':
-        return torch.sort(masked, dim=1, stable=True, descending=True).indices
-    order = torch.sort(masked.flip(1), dim=1, stable=True, descending=True).indices
-    return torch.sub(B - 1, order, out=order)
+    #
+    # Only the first k columns are ever consumed by _indexer_selection, so for
+    # k < B the full stable sort is replaced by a stable top-k that returns
+    # exactly the same columns in the same order: the k-th largest value is
+    # found with torch.topk, all strictly larger entries are kept, and the
+    # remaining slots are filled from equal entries in original column order
+    # (the stable-sort tie rule).  The selected k candidates are then ordered
+    # by score with a stable argsort — the same value/column order the full
+    # sort produces on its first k columns.  This drops the O(B log B) sort
+    # and its [n, B] int64 index table to O(B log k) and [n, k], which is what
+    # matters when B (the compressed block count) grows with the sequence at
+    # scale.
+    kk = B if k is None else min(max(int(k), 0), B)
+    if kk <= 0:
+        return torch.empty((masked.shape[0], 0), dtype=torch.long, device=masked.device)
+    if kk >= B:
+        if ties == 'earliest':
+            return torch.sort(masked, dim=1, stable=True, descending=True).indices
+        order = torch.sort(masked.flip(1), dim=1, stable=True, descending=True).indices
+        return torch.sub(B - 1, order, out=order)
+    src = masked.flip(1) if ties == 'latest' else masked
+    kth = torch.topk(src, kk, dim=1, sorted=True).values[:, -1:]
+    gt = src > kth
+    eq = src == kth
+    # gt has at most kk - 1 entries (the k-th value itself is not strictly
+    # greater), so `need` is non-negative and selects exactly kk columns.
+    need = (kk - gt.sum(dim=1, keepdim=True)).clamp_min(0)
+    sel = gt | (eq & (eq.cumsum(dim=1) <= need))
+    rank = sel.cumsum(dim=1) - 1
+    n, _ = src.shape
+    # Scatter the selected source columns into [n, kk] (column order); the
+    # sentinel column kk absorbs the non-selected lanes and is sliced away.
+    cols = torch.arange(B, device=src.device)[None, :].expand(n, B)
+    buf = torch.zeros(n, kk + 1, dtype=torch.long, device=src.device)
+    buf.scatter_(1, torch.where(sel, rank, kk), cols)
+    cand = buf[:, :kk]
+    order = torch.argsort(src.gather(1, cand), dim=1, stable=True, descending=True)
+    cand = cand.gather(1, order)
+    if ties == 'latest':
+        cand = B - 1 - cand
+    return cand
 
 def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     n, B = scores.shape
@@ -1361,7 +1419,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     # torch.where picks bit-identical values (scores or the -inf constant) —
     # the same selection masked_fill produced.
     masked = torch.where(cf, scores, float('-inf'))
-    order = _rank_blocks(masked, B, ties)
+    order = _rank_blocks(masked, B, ties, k=min(k, B))
     _w_keep = min(int(k), B)
     # Only the first _w_keep order columns are ever consumed (the k >= B and
     # k < B forms both reduce to usable[:, :_w_keep]), so the mask gather runs
@@ -1666,6 +1724,24 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     pos_all = _arange_cache(n, dev)
     win_idx, win_valid_all = _window_geometry(n, w, dev)
     _MINL = _finfo_min(k_blk.dtype)
+    # The V halves are laid out contiguously once and gathered with one
+    # combined row index per chunk: the selected rows of `v_all` are exactly
+    # the two gather outputs concatenated in the same order, so Vset holds
+    # bit-identical values while one per-chunk cat and one index_select call
+    # disappear.  The plain path does the same for K (the soft path keeps two
+    # contiguous K gathers, see below).  Window rows are offset past the block
+    # rows (index transport, §6.1).
+    _nblk_rows = k_blk.shape[0]
+    _has_sw = k_sw is not None and v_sw is not None
+    if _has_sw:
+        v_all = torch.cat([v_blk, v_sw], 0)
+        # The K halves are concatenated only for the plain (soft=None,
+        # soft_form=False) path; the soft path keeps its two contiguous
+        # gathers, which the two logits einsums consume directly.
+        k_all = torch.cat([k_blk, k_sw], 0) if (soft is None and not soft_form) else None
+    else:
+        k_all, v_all = (k_blk, v_blk)
+    _win_off = _nblk_rows if _has_sw else 0
     # Index transport (design notes §6.1): int32 and int64 index tensors hold
     # the same exact integers, and advanced indexing / equality comparisons on
     # them return bitwise identical values.
@@ -1760,13 +1836,15 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # hence every downstream value — are bit-identical to the
         # cat-then-gather form (index re-plumbing only, design notes §6.1).
         _sel_rows = topk_l[s:e]
-        _win_rows = win_idx[s:e]
+        _win_local = win_idx[s:e]
+        _win_rows = _win_local + _win_off if _win_off else _win_local
+        _rows = torch.cat([_sel_rows, _win_rows], 1) if _win_off else _sel_rows
         # soft_form=True 在 soft=None 时仍选用软分支的硬部分解（两个半段
         # logits + cat），供调用方在跳过（无梯度下已死的）soft 尾部后保持
         # 硬分支逐位一致；它不改变任何取值，只固定走哪套既有分解。
         if soft is None and not soft_form:
-            Kset = torch.cat([_tk2(k_blk, _sel_rows), _tk2(k_sw, _win_rows)], 1)
-            Vset = torch.cat([_tk2(v_blk, _sel_rows), _tk2(v_sw, _win_rows)], 1)
+            Kset = _tk2(k_all, _rows)
+            Vset = _tk2(v_all, _rows)
             logits = _einsum('qhd,qmhd->qhm', qseg, Kset)
             if scale != 1.0:
                 # x·1.0 is the IEEE identity (and grad·1.0 is bit-identical on
@@ -1778,14 +1856,14 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
                 attn.mul_(anyrow[:, None, None])
             out[s:e] = _einsum('qhm,qmhd->qhd', attn, Vset)
             continue
-        Vset = torch.cat([_tk2(v_blk, _sel_rows), _tk2(v_sw, _win_rows)], 1)
-        # The soft branch reads Kset only through its [selected|window]
-        # halves, gathered directly here: a cat's slices hold exactly the
-        # copied values of the two gather outputs, so kb/kw — the operands
-        # the two logits einsums save for backward — are bit-identical to the
-        # cat-then-slice form (index re-plumbing only, design notes §6.1).
+        Vset = _tk2(v_all, _rows)
+        # The soft branch reads its K halves as two contiguous gathers: the
+        # concatenated V gather above holds exactly the same rows as the old
+        # two gathers + cat, while the per-half K gathers feed the two logits
+        # einsums with the same operands they always saved (index re-plumbing
+        # only, design notes §6.1).
         kb = _tk2(k_blk, _sel_rows)
-        kw = _tk2(k_sw, _win_rows)
+        kw = _tk2(k_sw, _win_local)
         blk_logits = _einsum('qhd,qmhd->qhm', qseg, kb)
         if scale != 1.0:
             blk_logits.mul_(scale)

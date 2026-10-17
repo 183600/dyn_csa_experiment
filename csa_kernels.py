@@ -666,6 +666,39 @@ def pool_blocks_single_kernel(X, Z, bid, geom, B_pos, impl=None):
 # 算子 2：索引打分 + top-k 选择（`lightning_indexer` + `_indexer_selection`）
 # ============================================================================
 
+def _stable_topk_desc(x, k):
+    """Stable descending top-k of the last dim, tie = earliest column.
+
+    Returns (values, indices) with exactly the first k columns of
+    torch.sort(x, dim=-1, descending=True, stable=True).  For k << B this
+    avoids the full O(B log B) sort and its [..., B] int64 index table: the
+    k-th value is found with topk, all strictly larger entries are kept and
+    the remaining slots are filled from equal entries in column order (the
+    stable tie rule), then the k candidates are ordered by a stable argsort.
+    """
+    B = x.shape[-1]
+    kk = min(int(k), B)
+    if kk <= 0:
+        empty = x[..., :0]
+        return empty, torch.empty(x.shape[:-1] + (0,), dtype=torch.long, device=x.device)
+    if kk >= B:
+        val, idx = torch.sort(x, dim=-1, descending=True, stable=True)
+        return val, idx
+    kth = torch.topk(x, kk, dim=-1, sorted=True).values[..., -1:]
+    gt = x > kth
+    eq = x == kth
+    need = (kk - gt.sum(dim=-1, keepdim=True)).clamp_min(0)
+    sel = gt | (eq & (eq.cumsum(dim=-1) <= need))
+    rank = sel.cumsum(dim=-1) - 1
+    lead = x.shape[:-1]
+    cols = torch.arange(B, device=x.device).expand(lead + (B,))
+    buf = torch.zeros(lead + (kk + 1,), dtype=torch.long, device=x.device)
+    buf.scatter_(-1, torch.where(sel, rank, kk), cols)
+    cand = buf[..., :kk]
+    order = torch.argsort(x.gather(-1, cand), dim=-1, stable=True, descending=True)
+    cand = cand.gather(-1, order)
+    return x.gather(-1, cand), cand
+
 def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     """torch 参考实现（与 Triton 内核同一套算法分解）。
 
@@ -741,9 +774,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
         pad_blk = torch.zeros((R, t1 - t0), device=dev, dtype=torch.int64)
         # 逐轮「首达最大值」提取 == 稳定降序排序的前缀（tie 取最早下标，
         # 见上文 docstring）。
-        sval, sidx = torch.sort(work, dim=-1, descending=True, stable=True)
-        top_val = sval[:, :, :k_out]
-        top_idx = sidx[:, :, :k_out]
+        top_val, top_idx = _stable_topk_desc(work, k_out)
         # 与 eager 的 keep = cf.gather(...)（cf = causal & isfinite）同口径：
         # 有限的极端负分是有效选择，只有 -inf 填充位无效。
         has = top_val > float('-inf')
