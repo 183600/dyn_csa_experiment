@@ -526,6 +526,75 @@ def t_provenance_and_manifest():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# F. 稀疏路径的逐位契约 / 边界回归
+# ---------------------------------------------------------------------------
+
+def t_indexer_column_narrowing_exact():
+    # `causal_ends_host` is an optimisation hint, not a value-changing option:
+    # the readable-prefix shortcut must return the same idx AND soft bits as
+    # the full-width path (a different GEMM shape is NOT bitwise
+    # column-independent, so score narrowing must not be applied).
+    torch.manual_seed(0)
+    random.seed(0)
+    n, B, d, nIH = 17, 12, 8, 2
+    H = torch.randn(n, d)
+    comp = torch.randn(B, d)
+    W_DQ = torch.randn(d, d)
+    W_DK = torch.randn(d, d)
+    W_w = torch.randn(nIH, d)
+    ends = sorted(random.sample(range(1, n + 1), B))
+    last = torch.tensor([e - 1 for e in ends])
+    for rs in (False, True):
+        a = L.lightning_indexer(H, comp, last, W_DQ, W_DK, W_w, nIH, 4, return_mask=False, random_select=rs, causal_ends_host=ends, need_soft=True)
+        b = L.lightning_indexer(H, comp, last, W_DQ, W_DK, W_w, nIH, 4, return_mask=False, random_select=rs, causal_ends_host=None, need_soft=True)
+        assert torch.equal(a[1], b[1]), 'column narrowing changed the selected block ids'
+        assert torch.equal(a[2], b[2]), 'column narrowing changed the soft prior by ULPs'
+
+
+def t_attention_zero_blocks_keeps_window():
+    # A sliding-window-only call has zero compressed blocks.  The stacked-row
+    # offset is then 0, which must not be mistaken for "no window lanes".
+    torch.manual_seed(0)
+    n, h, d, w = 6, 2, 3, 4
+    q, k, v = (torch.randn(n, h, d) for _ in range(3))
+    topk = torch.empty(n, 0, dtype=torch.int32)
+    last = torch.empty(0, dtype=torch.long)
+    got = L.gathered_attention(q, torch.empty(0, h, d), torch.empty(0, h, d), topk, last, k, v, w, 0.5, q_chunk=2, mem_budget_bytes=1 << 20)
+    ref = torch.empty_like(q)
+    for i in range(n):
+        lo = max(0, i - w + 1)
+        attn = torch.softmax(torch.einsum('hd,mhd->hm', q[i], k[lo:i + 1]) * 0.5, dim=-1)
+        ref[i] = torch.einsum('hm,mhd->hd', attn, v[lo:i + 1])
+    assert torch.allclose(got, ref, atol=1e-6, rtol=1e-5), 'the sliding-window lanes were dropped when k_blk held zero rows'
+
+
+def t_overfit_guard_source_key():
+    # A synthetic pre-flight must never mask a later DATA-path pre-flight for
+    # the same variant: the data check is the one that exercises real ids.
+    _saved_guard = dict(L._OVERFIT_GUARD)
+    _saved_fn = L.overfit_sanity_check
+    calls = []
+    try:
+        L._OVERFIT_GUARD.clear()
+        def _stub(v, **kw):
+            calls.append(kw.get('train_ids') is not None)
+            return {'passed': True, 'initial_loss': 1.0, 'final_loss': 0.0, 'final_accuracy': 1.0, 'grad_all_finite': True, 'params_changed': True, 'diagnosis': 'ok'}
+        L.overfit_sanity_check = _stub
+        L.overfit_guard(['probe'])
+        assert calls == [False], f'a synthetic check should run once: {calls}'
+        calls.clear()
+        L.overfit_guard(['probe'], train_ids=np.arange(64, dtype=np.int64))
+        assert calls == [True], f'a DATA check must not be skipped just because a synthetic check passed: {calls}'
+        calls.clear()
+        L.overfit_guard(['probe'])
+        assert calls == [], f'a synthetic check is subsumed by a passed data check: {calls}'
+    finally:
+        L.overfit_sanity_check = _saved_fn
+        L._OVERFIT_GUARD.clear()
+        L._OVERFIT_GUARD.update(_saved_guard)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED (no torch in this environment)')
@@ -558,6 +627,9 @@ def main():
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
     _check('E3 small-batch overfit sanity', t_overfit_sanity)
     _check('E4 provenance + run manifest', t_provenance_and_manifest)
+    _check('F1 indexer column-narrowing exactness', t_indexer_column_narrowing_exact)
+    _check('F2 zero-block attention keeps window', t_attention_zero_blocks_keeps_window)
+    _check('F3 overfit guard source key', t_overfit_guard_source_key)
     fails = [r for r in _results if r[1] != 'PASS']
     print(f'\n[test] {len(_results) - len(fails)}/{len(_results)} passed')
     return 1 if fails else 0

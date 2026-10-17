@@ -33,7 +33,7 @@ if _NEEDED:
         print(f"[setup] could not install {', '.join(_NEEDED)} ({type(_pip_err).__name__}: {_pip_err}) — continuing; a code path that actually needs them will raise ImportError")
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, bisect
+import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections
 from math import comb
 from dataclasses import dataclass
 import numpy as np
@@ -1567,15 +1567,14 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     # 切片原样回传，与 forward 的 outs[b] = o 同一 transport 论证，§6.1）。
     # 全宽的 [n, B] scores / masked / int64 order 因此从不物化。
     _kw = max(min(int(topk), int(B)), 0)
-    # 列收窄（仅当调用方给出宿主侧 ends 且长度与 B 相符）：行 pos 的可读块
-    # 集合是 {b : ends[b] ≤ pos}（last_tok[b] = ends[b]-1，counts 逐项 ≥ 0
-    # 使 ends 非降），chunk 内 pos ≤ e-1，故可读列全部落在前缀
-    # [0, bisect_right(ends, e-1)) 内；被截去的列对 chunk 内每一行都是
-    # causal=False，在 _indexer_selection 里一律 masked 成 -inf、keep=False
-    # ——截断只缩短 -inf 尾部，有限项的稳定降序序与 keep/dest/pad 整数逐位
-    # 不变（被丢掉的 -inf 平局列无论选中与否都进不了 kept）。tie 规则两分支
-    # 同理（'latest' 在 [0, B') 内的相对序与全宽一致）。
-    _colw = causal_ends_host if (causal_ends_host is not None and len(causal_ends_host) == B) else None
+    # `causal_ends_host` is kept in the signature for callers, but the score
+    # columns are NOT narrowed to the readable prefix.  Narrowing changes the
+    # GEMM shape, and a GEMM is not bitwise column-independent across shapes:
+    # the prefix scores (and therefore the log-sum-exp and near-tie ordering)
+    # can drift by ULPs.  The repo's comparability contract requires the same
+    # inputs to produce the same bits as the un-narrowed implementation, so the
+    # score/soft path stays full width; the top-k selection itself is still
+    # cheap thanks to the stable top-k in `_rank_blocks`.
     idx = torch.empty(n, _kw, device=dev, dtype=torch.int32)
     soft = None
     if out_valid is None and return_mask:
@@ -1584,26 +1583,19 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     out_dtype = None
     for s in range(0, n, query_chunk):
         e = min(s + query_chunk, n)
-        # 列收窄同样作用于打分本身（不只是选择）：本 chunk 内任一行的可读块
-        # 都落在前缀 [0, _wsel)（见下方 _colw 论证），前缀之外的列对 chunk 内
-        # 所有行因果恒假，其分数要么被 _indexer_selection 掩成 -inf、要么在
-        # 软分支被 _ncausal 掩成 -inf。逐列打分/逐列随机分数与列数无关
-        # （einsum 的输出列、_jc 的列值都是各自独立的），故只算前缀列得到的
-        # 前缀值逐位不变，下游 idx/soft 的整数与浮点逐位一致。
-        _wsel = B if _colw is None else max(1, min(bisect.bisect_right(_colw, e - 1), B))
         if random_select:
             # same elementwise op chain with in-place tails: each op is the
             # same kernel on the same values (no fusion, no reassociation —
             # note x-floor(x) is NOT frac() for negatives), so the scores are
             # bit-identical.
-            z = _ri[s:e] * 12.9898 + _jc[:, :_wsel]
+            z = _ri[s:e] * 12.9898 + _jc
             z.sin_()
             z.mul_(43758.5453)
             z.sub_(torch.floor(z))
             z.mul_(2.0).sub_(1.0)
             c = z.to(H.dtype)
         else:
-            raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI[:, :_wsel])
+            raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI)
             raw.mul_(_iscale)
             F.relu(raw, inplace=True)
             c = torch.einsum('inb,ni->nb', raw, w_idx[s:e])
@@ -1611,7 +1603,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             out_dtype = c.dtype
             if need_soft:
                 soft = torch.empty(n, _kw, device=c.device, dtype=out_dtype)
-        _ccausal = causal[s:e][:, :_wsel]
+        _ccausal = causal[s:e]
         with torch.no_grad():
             _box = []
             _ic = _indexer_selection(c, _ccausal, k, out_valid=_box)
@@ -1625,7 +1617,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             # 整数，也不改变下游任何前向 bit）。
             del c, _ic
             continue
-        c.masked_fill_(_ncausal[s:e][:, :_wsel], float('-inf'))
+        c.masked_fill_(_ncausal[s:e], float('-inf'))
         _lse = torch.logsumexp(c, dim=-1, keepdim=True)
         # the gather output is fresh and nothing downstream needs the pre-subtract
         # values, so the subtraction runs in place (same kernel, same values, and
@@ -1838,7 +1830,11 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         _sel_rows = topk_l[s:e]
         _win_local = win_idx[s:e]
         _win_rows = _win_local + _win_off if _win_off else _win_local
-        _rows = torch.cat([_sel_rows, _win_rows], 1) if _win_off else _sel_rows
+        # A window with zero compressed blocks has _win_off == 0; keying the
+        # concatenation on the offset (rather than on `_has_sw`) would then
+        # drop the window lanes entirely.  `_has_sw` is the actual contract:
+        # offset 0 is a valid stacked-row base when k_blk holds no rows.
+        _rows = torch.cat([_sel_rows, _win_rows], 1) if _has_sw else _sel_rows
         # soft_form=True 在 soft=None 时仍选用软分支的硬部分解（两个半段
         # logits + cat），供调用方在跳过（无梯度下已死的）soft 尾部后保持
         # 硬分支逐位一致；它不改变任何取值，只固定走哪套既有分解。
@@ -5528,7 +5524,14 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
     src = 'data' if train_ids is not None else 'synthetic'
 
     def _known(v):
-        return any(((v, 'data') in _OVERFIT_GUARD, (v, 'synthetic') in _OVERFIT_GUARD))
+        # A DATA-path check is the stronger one and must never be skipped just
+        # because the synthetic check already ran for the same variant: the
+        # whole point of the data check is to exercise the real token stream.
+        # A synthetic request, however, is subsumed by a passed data check
+        # (same model path, a superset of the synthetic input space).
+        if src == 'data':
+            return (v, 'data') in _OVERFIT_GUARD
+        return (v, 'synthetic') in _OVERFIT_GUARD or (v, 'data') in _OVERFIT_GUARD
     todo = [v for v in variants if force or not _known(v)]
     if not todo:
         return []
