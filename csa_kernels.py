@@ -1000,14 +1000,16 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     win_raw = (t_idx - (w - 1) + torch.arange(w, device=dev)[None, None, :]).expand(R, T, w)
     sink_v = torch.nan_to_num(sink).to(dtype) if sink is not None else None
     tc = _attn_t_chunk(R, M, nh, hd)
-    # 头在外、t-chunk 在内：各 (t,h) 的前向计算相互独立，循环顺序交换
+    # t-chunk 在外、头在内：各 (t,h) 的前向计算相互独立，循环顺序交换
     # 不改变任何元素值。chunk 内的 lt_sel/sel_ok/src_win/win_ok/anyrow
-    # 全部与 h 无关——在头循环外按 chunk 各算一次（同值）。chunks 只持有
-    # topk 的 int32 原张量行切片（视图，同批精确整数），int64 形式在头
-    # 循环内按 chunk 现算（同值）；lt_sel 只用于构造 sel_ok，不进 chunks
-    # 清单。
+    # 全部与 h 无关——按 chunk 各算一次、用完即释放，因此不必同时保留
+    # 所有 chunk 的几何表。
     lt_l = last_tok.to(torch.int64)
-    chunks = []
+    q_heads = [q[:, :, h, :] for h in range(nh)]
+    kb_heads = [k_blk[:, :, h, :] for h in range(nh)]
+    kw_heads = [k_sw[:, :, h, :] for h in range(nh)]
+    vb_heads = [v_blk[:, :, h, :] for h in range(nh)]
+    vw_heads = [v_sw[:, :, h, :] for h in range(nh)]
     for t0 in range(0, T, tc):
         t1 = min(t0 + tc, T)
         src32 = topk_idx[:, t0:t1]
@@ -1017,20 +1019,13 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         win_ok = win_raw[:, t0:t1, :] >= 0
         lane_ok = torch.cat([sel_ok, win_ok], dim=-1)
         anyrow = (sel_ok.any(dim=-1) | win_ok.any(dim=-1)) if sink_v is None else None
-        chunks.append((t0, t1, src32, src_win, lane_ok, anyrow))
-    for h in range(nh):
-        q_h = q[:, :, h, :]
-        kb_h = k_blk[:, :, h, :]
-        kw_h = k_sw[:, :, h, :]
-        vb_h = v_blk[:, :, h, :]
-        vw_h = v_sw[:, :, h, :]
-        for (t0, t1, src32, src_win, lane_ok, anyrow) in chunks:
-            src_sel = src32.to(torch.int64)
-            qh = q_h[:, t0:t1].to(torch.float32)
-            Kb = _gather_rows(kb_h, src_sel).to(torch.float32)
-            Kw = _gather_rows(kw_h, src_win).to(torch.float32)
-            Vb = _gather_rows(vb_h, src_sel).to(torch.float32)
-            Vw = _gather_rows(vw_h, src_win).to(torch.float32)
+        src_sel = src32.to(torch.int64)
+        for h in range(nh):
+            qh = q_heads[h][:, t0:t1].to(torch.float32)
+            Kb = _gather_rows(kb_heads[h], src_sel).to(torch.float32)
+            Kw = _gather_rows(kw_heads[h], src_win).to(torch.float32)
+            Vb = _gather_rows(vb_heads[h], src_sel).to(torch.float32)
+            Vw = _gather_rows(vw_heads[h], src_win).to(torch.float32)
             zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1)
             if scale != 1.0:
                 # x·1.0 is the IEEE identity; the fresh cat output is safe to
@@ -1045,6 +1040,7 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 P_A = torch.softmax(zext, dim=-1)[..., 1:]
             Vl = torch.cat([Vb, Vw], dim=-2)
             out[:, t0:t1, h, :] = torch.einsum('rtm,rtmd->rtd', P_A, Vl).to(dtype)
+        del src32, lt_sel, sel_ok, src_win, win_ok, lane_ok, anyrow, src_sel
     return out
 
 
@@ -1604,19 +1600,16 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
         dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
         flat = topk_idx.reshape(R, T * nb)
-        # 逐行排序（各行互相独立，稳定序逐位不变）；order 保留 int64：
-        # lane 值域是 [0, T·nb)，T·nb ≥ 2³¹ 的超大配置下窄化到 int32 会
-        # 翻负、内核再按 lane//NB 寻址即越界。
-        order = torch.empty((R, T * nb), device=dev, dtype=torch.int64)
+        # 各行互相独立，稳定序逐位不变；order 保留 int64：lane 值域是
+        # [0, T·nb)，T·nb ≥ 2³¹ 的超大配置下窄化到 int32 会翻负、内核
+        # 再按 lane//NB 寻址即越界。
+        order = torch.argsort(flat, dim=1, stable=True)
         # 计数是整数（块 id 非负且 < Bm），scatter_add_ 与逐行 bincount
         # 给出同一组精确整数。
         flat_l = flat.to(torch.int64)
         cnt = torch.zeros((R, Bm), device=dev, dtype=torch.int64)
         cnt.scatter_add_(1, flat_l, torch.ones_like(flat_l))
         del flat_l
-        _sort_buf = torch.empty(T * nb, device=dev, dtype=flat.dtype)
-        for _r in range(R):
-            torch.sort(flat[_r], stable=True, out=(_sort_buf, order[_r]))
         offs = torch.zeros((R, Bm + 1), device=dev, dtype=torch.int64)
         offs[:, 1:] = cnt.cumsum(dim=1)
         del flat, cnt
