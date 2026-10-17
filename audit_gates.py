@@ -25,6 +25,8 @@
                （边界需 precision/recall/随机基线，NIAH 需 answer NLL）
   tuning       基线调参：主方法与简单基线是否获得同一搜索网格与范围
                （读 results_baseline_tuning/baseline_tuning.json）
+  methodology  受控对比 / 消融完整性 / 统计可靠性：逐臂全种子设置一致性、
+               每个创新点的留一对照是否完整、n 与 mean±std（零 GPU）
   failures     失败与缺失：error 记录按臂集中度（选择偏差读数，零 GPU）
   budget       规模核算：6ND 代理 FLOPs 估算 + TimeGuard 实测用时对账
                （理论 FLOPs ≠ 实测速度，两者并列报告，零 GPU）
@@ -773,6 +775,55 @@ def audit_tuning(path=None):
 
 
 # ---------------------------------------------------------------------------
+# 7d) methodology：受控对比 / 消融完整性 / 统计可靠性
+# ---------------------------------------------------------------------------
+
+def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True):
+    """对比实验与消融审计（零 GPU，读落盘 summary）。
+
+    对每个结果目录复用 `exp_lib.methodology_audit`，并额外给出三项面板级
+    读数：
+      * controlled_variables：逐臂全部种子记录（不是只看第一条）的
+        run_cfg / train_knobs / structured hyperparams 一致性；
+      * ablation_completeness：本面板实际进入族的创新点是否每个都具备全部
+        声明的留一对照（缺臂会点名，部分组合不能支撑「各自有用」）；
+      * arm_summary：每条臂的 n、mean±std 与是否达到 min_n（关键实验至少
+        3–5 个种子的可复核读数）。
+
+    没有 `results_*/summary.json` 时返回 not_verifiable_locally，而不是
+    伪造一个通过。"""
+    L = _import_exp_lib()
+    dirs = list(outdirs) if outdirs is not None else list(_iter_result_dirs())
+    out = {'status': 'ok', 'alpha': float(alpha), 'min_n': int(min_n), 'panels': {}}
+    for d in dirs:
+        _dir = d if os.path.isabs(d) else os.path.join(REPO, d)
+        summ = _load(os.path.join(_dir, 'summary.json'))
+        if not summ:
+            continue
+        rep = L.methodology_audit(summ, design=design, alpha=alpha, min_n=min_n,
+                                  outdir=_dir, write=write, verbose=False)
+        _panel = {
+            'ablation_complete': rep.get('ablation_complete'),
+            'ablation_completeness': rep.get('ablation_completeness'),
+            'controlled_variables': rep.get('controlled_variables'),
+            'arm_summary': rep.get('arm_summary'),
+            'arms_below_min_seeds': rep.get('arms_below_min_seeds'),
+            'verified_components': rep.get('verified_components'),
+            'unverified_components': rep.get('unverified_components'),
+            'incomplete_components': rep.get('incomplete_components'),
+            'warnings': rep.get('warnings'),
+        }
+        out['panels'][d] = _panel
+        if _panel['arms_below_min_seeds'] or _panel['warnings']:
+            out['status'] = 'warn'
+    if not out['panels']:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = 'no results_*/summary.json found — run the experiment phases first; the audit is zero-GPU over saved records'
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 8) 规模核算：6ND 代理 FLOPs 估算 + 实测用时对账
 # ---------------------------------------------------------------------------
 
@@ -882,7 +933,7 @@ def audit_efficiency_demo():
 # ---------------------------------------------------------------------------
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'failures': audit_failures(), 'budget': audit_budget()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -896,7 +947,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'methodology': audit_methodology, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

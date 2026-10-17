@@ -42,6 +42,7 @@ try:
     import v12_supp as V12
     import v7_supp as V7
     import audit_gates as A
+    import baseline_tune as BT
     _HAVE_TORCH = True
 except Exception as _e:  # pragma: no cover
     print(f'[test] SKIPPED: cannot import the repo modules here ({type(_e).__name__}: {_e}); run on a box with CPU torch')
@@ -400,6 +401,7 @@ def t_seed_plan():
     assert p['declared_contrasts'] >= 10, p
     assert p['min_seeds_for_family_significance'] > 3
     assert p['sufficient_for_family_rejection'] is False
+    assert 'ablation_completeness' in p and p['ablation_complete'] is True, p
     req = p['min_seeds_for_family_significance']
     assert L.holm_min_attainable_p(req, p['declared_contrasts'], 0.05) <= 0.05
     assert L.holm_min_attainable_p(req - 1, p['declared_contrasts'], 0.05) > 0.05
@@ -459,6 +461,124 @@ def t_ablation_design_loss_term():
     for comp, contrasts in L.ABLATION_DESIGN.items():
         assert contrasts and all(len(t) == 3 for t in contrasts), f'{comp}: malformed leave-one-out design'
     assert any(v == 'csa_dyn_nocomp' for v in L.ABL_VARIANTS), 'the loss ablation arm must be scheduled by RUN_ABL'
+
+
+def t_training_knobs_in_resume_fingerprint():
+    cfg = dict(steps=1, seq_len=8, batch_size=1, n_train_tokens=10, lr=0.0003,
+               weight_decay=0.1, warmup=1, comp_lambda=0.05, delta_lr_mult=10.0)
+    tr = np.arange(16, dtype=np.int64)
+    va = np.arange(8, dtype=np.int64).reshape(1, 8)
+    fp1 = L._run_fp(dict(cfg), 8, 1, 1, 8, 16, tr, va)
+    fp2 = L._run_fp(dict(cfg), 8, 1, 1, 8, 16, tr, va)
+    assert fp1 == fp2 and '_tk' in fp1, (fp1, fp2)
+    assert L.run_cfg_knobs(fp1).get('tk') == L.training_knobs_fingerprint()
+    orig = L.training_knobs
+    fp3 = None
+    try:
+        L.training_knobs = lambda: dict(orig(), grad_clip_norm=2.0)
+        fp3 = L._run_fp(dict(cfg), 8, 1, 1, 8, 16, tr, va)
+    finally:
+        L.training_knobs = orig
+    assert fp3 is not None and fp3 != fp1, 'changing optimizer/schedule/clip knobs must invalidate resume (no silent mixed panel)'
+
+
+def t_controlled_variables_all_seed_records():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    s = {}
+    for i in range(3):
+        s[f'a::seed{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=49.0, params=100, train_knobs=dict(knobs))
+        s[f'b::seed{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=50.0, params=100, train_knobs=dict(knobs))
+    # One seed of arm `a` silently ran with a different optimizer setting: the
+    # panel-level audit must flag the mixed arm, even though the first record
+    # looks identical and pair_reason refuses only that seed.
+    s['a::seed0']['train_knobs'] = dict(knobs, grad_clip_norm=2.0)
+    r = L.methodology_audit(s, design={'c': [('a', 'b', 'x')]}, baselines={}, verbose=False)
+    cv = r['controlled_variables']['c']
+    assert cv['train_knobs_equal'] is False, cv
+    assert 'a' in cv['within_arm_mixed'], cv
+    assert r['components']['c'][0]['n_paired'] == 2, r['components']['c'][0]
+
+
+def t_tuned_pairing_keeps_optimizer_gate():
+    knobs = L.training_knobs()
+    a = dict(variant='a', steps=1, tokens_seen=1, data_fp='d', val_fp='v', params=100,
+             train_knobs=knobs)
+    b = dict(a, variant='b')
+    assert BT._relaxed_pair_reason(a, b, {'a': 3, 'b': 3}) is None
+    b2 = dict(b, train_knobs=dict(knobs, grad_clip_norm=2.0))
+    why = BT._relaxed_pair_reason(a, b2, {'a': 3, 'b': 3})
+    assert why and 'train_knobs' in why, why
+    b3 = dict(b)
+    b3.pop('train_knobs')
+    why2 = BT._relaxed_pair_reason(a, b3, {'a': 3, 'b': 3})
+    assert why2 and 'unverifiable train_knobs' in why2, why2
+
+
+def t_arm_mean_std_and_relative_effect():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    a_vals = [10.0, 10.2, 9.8, 10.1, 9.9]
+    s = {}
+    for i, ppl in enumerate(a_vals):
+        s[f'a::seed{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=ppl, params=100, train_knobs=knobs)
+        s[f'b::seed{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=10.0, params=100, train_knobs=knobs)
+    r = L.methodology_audit(s, design={'c': [('a', 'b', 'x')]}, baselines={}, verbose=False)
+    arm = r['arm_summary']['a']
+    assert arm['n_seeds'] == 5 and arm['meets_min_seeds'] is True, arm
+    assert abs(arm['ppl_mean'] - float(np.mean(a_vals))) < 1e-12
+    assert abs(arm['ppl_std'] - float(np.std(a_vals, ddof=1))) < 1e-12
+    assert r['arms_below_min_seeds'] == [], r['arms_below_min_seeds']
+    e = r['components']['c'][0]
+    assert e['n_paired'] == 5 and e['without_mean'] == 10.0, e
+    assert abs(e['relative_effect_pct'] - 100.0 * e['mean'] / e['without_mean']) < 1e-9, e
+
+
+def t_ablation_completeness_leave_one_out():
+    design = {'A': [('full', 'full-A', '')],
+              'B': [('full', 'full-B', '')],
+              'C': [('full', 'full-C', '')]}
+    r = L.ablation_completeness_audit(design, ['full', 'full-A', 'full-B'])
+    assert r['complete'] is False and r['incomplete_components'] == ['C'], r
+    assert r['missing_arms']['C'] == ['full-C'], r
+    r2 = L.ablation_completeness_audit(design, ['full', 'full-A', 'full-B', 'full-C'])
+    assert r2['complete'] is True and r2['incomplete_components'] == [], r2
+
+
+def t_ablation_completeness_full_factorial():
+    arms = {(): 'none', ('A',): 'A', ('B',): 'B', ('C',): 'C',
+            ('A', 'B'): 'AB', ('A', 'C'): 'AC', ('B', 'C'): 'BC'}
+    r = L.ablation_completeness_audit(arms_by_combo=arms)
+    assert r['mode'] == 'full-factorial' and r['complete'] is False, r
+    assert r['missing_combos'] == [['A', 'B', 'C']], r
+    arms[('A', 'B', 'C')] = 'ABC'
+    r2 = L.ablation_completeness_audit(arms_by_combo=arms)
+    assert r2['complete'] is True and r2['n_mapped'] == 8, r2
+    # A mapped but not-run arm is still incomplete.
+    r3 = L.ablation_completeness_audit(arms_by_combo=arms, present=list(arms.values())[:-1])
+    assert r3['complete'] is False and r3['missing_arms'], r3
+
+
+def t_panel_ablation_flag_does_not_overclaim():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    s = {}
+    for i in range(3):
+        for v, ppl in (('full', 50.0), ('full-A', 51.0)):
+            s[f'{v}::seed{i}'] = dict(variant=v, seed=i, run_cfg=fp, steps=1,
+                                      tokens_seen=1, ppl=ppl, params=100,
+                                      train_knobs=knobs)
+    design = {'A': [('full', 'full-A', '')], 'B': [('full', 'full-B', '')]}
+    r = L.methodology_audit(s, design=design, baselines={}, verbose=False)
+    # A itself is complete, but the panel as a whole omitted B entirely; the
+    # panel-level flag must not call that a complete ablation.
+    assert r['ablation_completeness']['complete'] is True, r['ablation_completeness']
+    assert r['ablation_complete'] is False, r['ablation_complete']
+    assert r['ablation_completeness']['omitted_components'] == ['B'], r['ablation_completeness']
 
 
 def t_adaptive_threshold_guard():
@@ -1299,6 +1419,13 @@ def main():
     _check('C12 seed-budget plan', t_seed_plan)
     _check('C13 family Holm + verified baseline + param control', t_audit_family_holm_and_verified)
     _check('C14 compression-regularizer loss ablation', t_ablation_design_loss_term)
+    _check('C15 optimizer knobs enter the resume fingerprint', t_training_knobs_in_resume_fingerprint)
+    _check('C16 controlled variables inspect every seed record', t_controlled_variables_all_seed_records)
+    _check('C17 arm n / mean±std / relative effect', t_arm_mean_std_and_relative_effect)
+    _check('C17b tuned pairing keeps optimizer gate', t_tuned_pairing_keeps_optimizer_gate)
+    _check('C18 leave-one-out ablation completeness', t_ablation_completeness_leave_one_out)
+    _check('C19 full-factorial ablation completeness', t_ablation_completeness_full_factorial)
+    _check('C20 panel ablation flag does not overclaim', t_panel_ablation_flag_does_not_overclaim)
     _check('A7 adaptive-threshold memory guard', t_adaptive_threshold_guard)
     _check('A8 empty segmenter', t_segment_empty)
     _check('A8a uniform-stride cut boundary', t_segment_uniform_stride_only_when_all_cuts)

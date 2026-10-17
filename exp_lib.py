@@ -4985,7 +4985,7 @@ def loglog_regression(points, *, alpha=0.05):
 # `mt` (matched-variant set) and `mr` (mlp_match_ref) can themselves contain
 # underscores (e.g. `full_rope`, `csa_dynamic`), so those two values are
 # captured lazily up to the next literal key rather than by `[^_]+`.
-_RUN_CFG_RE = re.compile('^steps(?P<steps>[^_]+)_sl(?P<sl>[^_]+)_bs(?P<bs>[^_]+)_nt(?P<nt>[^_]+)_lr(?P<lr>[^_]+)_wd(?P<wd>[^_]+)_d(?P<d>[^_]+)_L(?P<L>[^_]+)_H(?P<H>[^_]+)_Dh(?P<Dh>[^_]+)_v(?P<v>[^_]+)_wu(?P<wu>[^_]+)_cl(?P<cl>[^_]+)_dlm(?P<dlm>[^_]+)_mt(?P<mt>.*?)_mr(?P<mr>.*?)_ee(?P<ee>[^_]+)_es(?P<es>[^_]+)_det(?P<det>[^_]+)_df(?P<df>.+?)_cs(?P<cs>.+)$')
+_RUN_CFG_RE = re.compile('^steps(?P<steps>[^_]+)_sl(?P<sl>[^_]+)_bs(?P<bs>[^_]+)_nt(?P<nt>[^_]+)_lr(?P<lr>[^_]+)_wd(?P<wd>[^_]+)_d(?P<d>[^_]+)_L(?P<L>[^_]+)_H(?P<H>[^_]+)_Dh(?P<Dh>[^_]+)_v(?P<v>[^_]+)_wu(?P<wu>[^_]+)_cl(?P<cl>[^_]+)_dlm(?P<dlm>[^_]+)_mt(?P<mt>.*?)_mr(?P<mr>.*?)_ee(?P<ee>[^_]+)_es(?P<es>[^_]+)_det(?P<det>[^_]+)_df(?P<df>.+?)(?:_tk(?P<tk>[0-9a-f]+))?_cs(?P<cs>.+)$')
 
 def run_cfg_knobs(fp):
     """Best-effort decode of a `_run_fp` string into its named training knobs.
@@ -5664,6 +5664,116 @@ def _knobs_equal_across_arms(recs, arms, key):
         return None
     return len(set(vals)) == 1
 
+# Settings that must be identical across arms of a controlled contrast.  The
+# first two are the authoritative descriptors already used by `pair_reason`;
+# the rest are read from the structured `hyperparams` copy so a future setting
+# that never made it into the compact run_cfg string is still checked.
+_CONTROL_HYPER_KEYS = (
+    'steps', 'tokens_seen', 'lr', 'weight_decay', 'warmup', 'batch_size',
+    'seq_len', 'd', 'n_layers', 'n_heads', 'd_head', 'mlp_ratio',
+    'comp_lambda', 'delta_lr_mult', 'dataset', 'data_version',
+)
+
+def _canon_setting(v):
+    """Canonical JSON spelling of one setting value (None stays 'missing')."""
+    if v is None:
+        return None
+    return json.dumps(_jsonable(v), sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=True, default=str)
+
+def _setting_values(recs, arms, getter):
+    vals = {a: set() for a in arms}
+    for (v, _t, _s), r in recs.items():
+        if v not in vals:
+            continue
+        val = getter(r)
+        if val is not None:
+            vals[v].add(val)
+    return vals
+
+def _setting_control(vals_by_arm, *, check_within_arm=True):
+    """Aggregate one setting across arms.
+
+    Returns `equal` (True/False/None), every arm's distinct values, the arms
+    whose own seeds disagree (mixed protocol inside one arm), and arms with
+    no value.  `equal=None` means unverifiable (legacy record), never a pass.
+    """
+    arms = list(vals_by_arm)
+    nonempty = {a: v for a, v in vals_by_arm.items() if v}
+    mixed = sorted(a for a, v in nonempty.items() if len(v) > 1) if check_within_arm else []
+    missing = sorted(a for a in arms if not vals_by_arm.get(a))
+    if not nonempty:
+        equal = None
+    elif mixed:
+        equal = False
+    elif len(nonempty) < len(arms):
+        equal = None
+    else:
+        union = set().union(*nonempty.values())
+        equal = bool(len(union) == 1)
+    return {'equal': equal, 'within_arm_mixed': mixed, 'missing_arms': missing,
+            'values': {a: sorted(v) for a, v in nonempty.items()}}
+
+def controlled_variables_report(recs, arms):
+    """Per-component controlled-variable audit across ALL seed records.
+
+    `pair_reason` is the per-seed hard gate; this report is the panel-level
+    diagnostic.  It differs from the old first-record check in three ways:
+    every record of an arm is inspected (so seed 0 and seed 4 cannot silently
+    run under different protocols), a disagreement inside one arm is flagged,
+    and the structured `hyperparams` copy is checked for settings that the
+    compact run_cfg string does not carry.  The return keeps the historical
+    `run_cfg_equal` / `train_knobs_equal` keys and adds the detail.
+    """
+    arms = sorted(set(arms))
+    run_cfg = _setting_control(_setting_values(
+        recs, arms, lambda r: _canon_setting(r.get('run_cfg'))))
+    train_knobs = _setting_control(_setting_values(
+        recs, arms, lambda r: _canon_setting(r.get('train_knobs'))))
+    hyper = {}
+    for key in _CONTROL_HYPER_KEYS:
+        hyper[key] = _setting_control(_setting_values(
+            recs, arms, lambda r, k=key: _canon_setting((r.get('hyperparams') or {}).get(k))))
+    hp_checked = [k for k, v in hyper.items()
+                  if any(v['values'].get(a) for a in arms)]
+    hp_diffs = [k for k in hp_checked if hyper[k]['equal'] is False]
+    hp_unknown = [k for k in hp_checked if hyper[k]['equal'] is None]
+    if not hp_checked:
+        hp_equal = None
+    elif hp_diffs:
+        hp_equal = False
+    elif hp_unknown:
+        hp_equal = None
+    else:
+        hp_equal = True
+    mixed = sorted(set(run_cfg['within_arm_mixed']) | set(train_knobs['within_arm_mixed'])
+                   | {a for k in hp_checked for a in hyper[k]['within_arm_mixed']})
+    diff_values = {}
+    for key, ctl in (('run_cfg', run_cfg), ('train_knobs', train_knobs)):
+        if ctl['equal'] is False:
+            diff_values[key] = ctl['values']
+    for key in hp_diffs:
+        diff_values['hyperparams.' + key] = hyper[key]['values']
+    controlled = None
+    flags = [run_cfg['equal'], train_knobs['equal'], hp_equal]
+    if any(f is False for f in flags):
+        controlled = False
+    elif all(f is True for f in flags):
+        controlled = True
+    return {
+        'arms': arms,
+        'n_records': {a: sum(1 for (v, _t, _s) in recs if v == a) for a in arms},
+        'run_cfg_equal': run_cfg['equal'],
+        'train_knobs_equal': train_knobs['equal'],
+        'hyperparams_equal': hp_equal,
+        'controlled': controlled,
+        'within_arm_mixed': mixed,
+        'differences': diff_values,
+        'checked_hyperparam_keys': sorted(hp_checked),
+        'hyperparam_differences': hp_diffs,
+        'unverifiable_hyperparam_keys': hp_unknown,
+    }
+
 def _params_of_arm(recs, arm):
     for (v, _t, _s), r in recs.items():
         if v != arm:
@@ -5773,6 +5883,117 @@ def _scope_design(design, present):
             out[comp] = contrasts
     return out
 
+def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None,
+                                verbose=False):
+    """Zero-GPU completeness check for a leave-one-out OR full-factorial design.
+
+    Leave-one-out mode (default)
+        `design` is the `ABLATION_DESIGN` shape: component -> list of
+        (with_arm, without_arm, note).  A component is COMPLETE only when
+        **every** declared contrast has both arms in `present`.  `present=None`
+        checks the design's structure without requiring the arms to be run.
+        This is the condition for the claim "each module is useful": a
+        component measured only through a combined arm (e.g. A+B vs baseline)
+        stays incomplete, and the missing arm is named instead of being
+        silently dropped from the correction family.
+
+    Full-factorial mode (`arms_by_combo` given)
+        The mapping keys are component-name tuples (or '+'-joined strings,
+        with ''/'none' for the empty combination) and values are arm ids.
+        ALL 2**k combinations must be mapped, present and unique; a 7-of-8
+        panel is reported with its exact missing combination (e.g. C alone)
+        rather than being described as a full factorial.  This is the
+        more-expensive design the task brief allows as an alternative to
+        leave-one-out.
+
+    Returns a machine-readable dict; never raises on a partial panel.
+    """
+    out = {'mode': 'leave-one-out', 'complete': False,
+           'complete_components': [], 'incomplete_components': [],
+           'components': {}, 'missing_arms': {}, 'structural_errors': []}
+    present_set = None if present is None else set(present)
+
+    if arms_by_combo is not None:
+        out.update({'mode': 'full-factorial', 'components': [],
+                    'n_required': 0, 'n_mapped': 0,
+                    'missing_combos': [], 'duplicate_combos': [],
+                    'missing_arms': [], 'arms': {}})
+        combos = {}
+        components = set()
+        for key, arm in arms_by_combo.items():
+            if isinstance(key, str):
+                _raw = [x.strip() for x in re.split(r'[+,|]', key) if x.strip()]
+                combo = tuple(sorted(x for x in _raw if x.lower() not in ('none', 'empty', 'baseline', '0')))
+            else:
+                combo = tuple(sorted(str(x) for x in (key or ())))
+            combos.setdefault(combo, []).append(arm)
+            components.update(combo)
+        components = sorted(components)
+        required = []
+        for r in range(len(components) + 1):
+            required.extend(tuple(c) for c in itertools.combinations(components, r))
+        required_set = set(required)
+        mapped_set = set(combos)
+        missing = sorted(required_set - mapped_set)
+        extra = sorted(mapped_set - required_set)
+        duplicate = sorted(c for c, arms in combos.items() if len(set(arms)) > 1)
+        absent = []
+        for combo, arms in combos.items():
+            for arm in set(arms):
+                if present_set is not None and arm not in present_set:
+                    absent.append({'combo': list(combo), 'arm': arm})
+        out.update({
+            'components': components,
+            'n_required': len(required),
+            'n_mapped': len(combos),
+            'missing_combos': [list(c) for c in missing],
+            'extra_combos': [list(c) for c in extra],
+            'duplicate_combos': [list(c) for c in duplicate],
+            'missing_arms': absent,
+            'arms': {('+'.join(c) if c else 'none'): sorted(set(a)) for c, a in combos.items()},
+        })
+        out['complete'] = bool(len(components) >= 1 and not missing and not extra
+                               and not duplicate and not absent)
+        if verbose:
+            print('[ablation] full-factorial components=%s mapped=%d/%d missing=%s'
+                  % (components, len(combos), len(required),
+                     ['+'.join(c) or 'none' for c in missing] or 'none'))
+        return out
+
+    if design is None:
+        design = ABLATION_DESIGN
+    for comp, contrasts in design.items():
+        rows, missing = [], set()
+        for item in contrasts:
+            if not isinstance(item, (tuple, list)) or len(item) < 2:
+                out['structural_errors'].append('%s: malformed contrast %r' % (comp, item))
+                continue
+            a, b = item[0], item[1]
+            ap = present_set is None or a in present_set
+            bp = present_set is None or b in present_set
+            rows.append({'with': a, 'without': b,
+                         'note': item[2] if len(item) > 2 else '',
+                         'with_present': ap, 'without_present': bp,
+                         'complete': bool(ap and bp)})
+            if not ap:
+                missing.add(a)
+            if not bp:
+                missing.add(b)
+        complete = bool(rows) and all(r['complete'] for r in rows)
+        out['components'][comp] = {'declared': len(rows), 'complete': complete,
+                                   'contrasts': rows,
+                                   'missing_arms': sorted(missing)}
+        if missing:
+            out['missing_arms'][comp] = sorted(missing)
+        (out['complete_components'] if complete else out['incomplete_components']).append(comp)
+    out['complete'] = bool(out['components']) and not out['incomplete_components'] \
+        and not out['structural_errors']
+    if verbose:
+        print('[ablation] leave-one-out complete=%s; missing: %s'
+              % (out['complete'],
+                 '; '.join('%s=%s' % (c, ','.join(a)) for c, a in sorted(out['missing_arms'].items())) or 'none'))
+    return out
+
 def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, variants=None):
     """Prospective seed budget for a planned panel.
 
@@ -5786,10 +6007,15 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
         if baselines is None:
             baselines = BASELINE_DESIGN
     baselines = {} if baselines is None else baselines
+    _present = None
     if variants is not None:
         _present = set(variants or ())
         design = _scope_design(design, _present)
         baselines = _scope_design(baselines, _present)
+    _ablation = (ablation_completeness_audit(design, _present) if design else
+                 {'mode': 'leave-one-out', 'complete': None, 'components': {},
+                  'complete_components': [], 'incomplete_components': [],
+                  'missing_arms': {}})
     m = sum(len(v) for v in design.values()) + sum(len(v) for v in baselines.values())
     req = signflip_min_n_for_holm(m, alpha)
     try:
@@ -5799,6 +6025,8 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
     return {'n_seeds': n, 'declared_contrasts': int(m), 'alpha': float(alpha),
             'min_seeds_for_family_significance': req,
             'sufficient_for_family_rejection': bool(req is not None and n >= req),
+            'ablation_completeness': _ablation,
+            'ablation_complete': _ablation.get('complete'),
             'note': 'a panel below the minimum is DESCRIPTIVE ONLY: the exact-test resolution floor, not the observed effect, bounds its p value'}
 
 def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True):
@@ -5855,6 +6083,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
               'direction_conflict_baselines': [], 'tuned_verified_baselines': [],
               'untuned_verified_baselines': [],
               'incomplete_components': [], 'controlled_variables': {},
+              'ablation_completeness': {}, 'ablation_complete': None,
+              'arm_summary': {}, 'arms_below_min_seeds': [],
               'component_seed_requirements': {}, 'baseline_seed_requirements': {},
               'hypotheses': {}, 'metric_audit': {}, 'baseline_tuning': {},
               'family': {}, 'warnings': []}
@@ -5875,17 +6105,45 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 _contrast_measured = False
                 for (ts, bs), (deltas, shared, skipped) in sorted(conds.items()):
                     st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
+                    _skipped_seeds = {s for s, _why in skipped}
+                    _passed = [s for s in shared if s not in _skipped_seeds]
+                    _a_vals = [float(recs[(a, ts, s)]['ppl']) for s in _passed]
+                    _b_vals = [float(recs[(b, bs, s)]['ppl']) for s in _passed]
+                    if _a_vals and _b_vals:
+                        _a_mean = float(np.mean(_a_vals))
+                        _b_mean = float(np.mean(_b_vals))
+                        _a_std = float(np.std(_a_vals, ddof=1)) if len(_a_vals) > 1 else 0.0
+                        _b_std = float(np.std(_b_vals, ddof=1)) if len(_b_vals) > 1 else 0.0
+                        _rel_effect = (100.0 * float(st['mean']) / _b_mean) if _b_mean > 0 else float('nan')
+                        _rel_std = (100.0 * float(st['std']) / _b_mean) if _b_mean > 0 else float('nan')
+                        if float(st['std']) > 0:
+                            _noise_ratio = abs(float(st['mean'])) / float(st['std'])
+                        elif abs(float(st['mean'])) <= 1e-12:
+                            _noise_ratio = 0.0
+                        else:
+                            _noise_ratio = float('inf')
+                    else:
+                        _a_mean = _b_mean = _a_std = _b_std = float('nan')
+                        _rel_effect = _rel_std = _noise_ratio = float('nan')
                     _hyp = _hypothesis_spec(comp, kind)
                     _pred = (_hyp or {}).get('predicted_sign')
                     _obs = _sign_of(st.get('mean')) if st.get('n') else None
                     st.update({'with': a, 'without': b, 'note': note, 'kind': kind,
                                'tag_with': ts, 'tag_without': bs,
                                'n_shared': len(shared), 'n_skipped': len(skipped),
+                               'n_paired': len(_passed), 'seeds': _passed,
                                'skipped_reasons': sorted({reason for _s, reason in skipped}),
                                'controlled': bool(deltas) and (not skipped),
                                'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b,
                                'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None,
                                'param_rel_diff': _rel, 'param_controlled': _param_ok,
+                               'with_mean': _a_mean, 'with_std': _a_std,
+                               'without_mean': _b_mean, 'without_std': _b_std,
+                               'relative_effect_pct': _rel_effect,
+                               'relative_noise_pct': _rel_std,
+                               'signal_to_noise': _noise_ratio,
+                               'mean_pm_std': ('%+.4f +/- %.4f' % (float(st['mean']), float(st['std']))
+                                               if st.get('n') else 'n/a'),
                                'hypothesis': (_hyp or {}).get('statement'),
                                'hypothesis_mechanism': (_hyp or {}).get('mechanism'),
                                'hypothesis_falsifier': (_hyp or {}).get('falsifier'),
@@ -5936,6 +6194,36 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     _present_set = set(present)
     _scoped_design = _scope_design(design, _present_set)
     _scoped_baselines = _scope_design(baselines, _present_set)
+    if _scoped_design:
+        report['ablation_completeness'] = ablation_completeness_audit(_scoped_design, _present_set)
+        report['ablation_complete'] = bool(report['ablation_completeness'].get('complete'))
+        for _comp in report['ablation_completeness'].get('incomplete_components') or []:
+            _miss = report['ablation_completeness'].get('missing_arms', {}).get(_comp) or []
+            report['warnings'].append('%s: ablation is INCOMPLETE — missing arm(s) %s; this component cannot support a "useful" claim until every declared contrast is present'
+                                      % (_comp, ', '.join(_miss) or '(unspecified)'))
+    else:
+        report['ablation_completeness'] = {'mode': 'leave-one-out', 'complete': None,
+                                           'components': {}, 'complete_components': [],
+                                           'incomplete_components': [], 'missing_arms': {}}
+        report['ablation_complete'] = None
+    # Arm-level mean±std: the seed reliability is visible even for arms that
+    # are not part of a declared contrast.  Group by protocol so different
+    # evaluation/warmup conditions never get pooled into a fake larger n.
+    _arm_groups = {}
+    for (v, t, s), r in recs.items():
+        _arm_groups.setdefault((v, str(t or '')), {})[s] = float(r['ppl'])
+    for (v, t), _by_seed in sorted(_arm_groups.items()):
+        _vals = [_by_seed[s] for s in sorted(_by_seed)]
+        _key = v if not t else '%s::%s' % (v, t)
+        report['arm_summary'][_key] = {
+            'variant': v, 'protocol': t, 'n_seeds': len(_vals),
+            'seeds': sorted(_by_seed),
+            'ppl_mean': float(np.mean(_vals)),
+            'ppl_std': float(np.std(_vals, ddof=1)) if len(_vals) > 1 else 0.0,
+            'meets_min_seeds': len(_vals) >= int(min_n),
+        }
+        if len(_vals) < int(min_n):
+            report['arms_below_min_seeds'].append(_key)
     declared_m = sum(len(v) for v in _scoped_design.values()) + sum(len(v) for v in _scoped_baselines.values())
     all_entries = [e for group in (comp_entries, base_entries) for entries in group.values() for e in entries]
     m_family = max(declared_m, len(all_entries))
@@ -5981,12 +6269,18 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 lists['measured'].append(comp)
             report[group_name][comp] = entries
             _arms = meta[comp]['arms']
-            report['controlled_variables'][comp] = {
-                'run_cfg_equal': _knobs_equal_across_arms(recs, _arms, 'run_cfg'),
-                'train_knobs_equal': _knobs_equal_across_arms(recs, _arms, 'train_knobs'),
+            _cv = controlled_variables_report(recs, _arms)
+            _cv.update({
                 'arms_present': sorted(a for a in _arms if a in present),
                 'param_matched': all(e.get('param_controlled') is True for e in entries) if entries else None,
-            }
+            })
+            report['controlled_variables'][comp] = _cv
+            if _cv.get('within_arm_mixed'):
+                report['warnings'].append('%s: arm(s) %s mix DIFFERENT protocols within one arm across seeds — a seed-averaged claim would pool incompatible runs'
+                                          % (comp, ', '.join(_cv['within_arm_mixed'])))
+            if _cv.get('hyperparam_differences'):
+                report['warnings'].append('%s: structured hyperparameters differ across arms (%s) even where run_cfg matches — the comparison is not fully controlled'
+                                          % (comp, ', '.join(_cv['hyperparam_differences'])))
             _req_key = 'component_seed_requirements' if kind == 'component' else 'baseline_seed_requirements'
             report[_req_key][comp] = {
                 'declared_contrasts': int(len(contrasts)),
@@ -5999,6 +6293,19 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
 
     _publish('components', design, comp_entries, comp_meta, 'component', require_param_match=False)
     _publish('baselines', baselines, base_entries, base_meta, 'baseline', require_param_match=True)
+
+    # A panel is a *complete ablation* only if every declared innovation has
+    # its full leave-one-out set AND no declared innovation is entirely
+    # unmeasured.  The scoped completeness above can be True while other
+    # components were simply never scheduled; exposing them as
+    # `omitted_components` prevents the panel-level flag from over-claiming.
+    if report.get('ablation_completeness'):
+        report['ablation_completeness']['omitted_components'] = list(report.get('unverified_components') or [])
+        if report['ablation_completeness'].get('complete') is None:
+            report['ablation_complete'] = None
+        else:
+            report['ablation_complete'] = bool(report['ablation_completeness'].get('complete')) \
+                and not report.get('unverified_components')
 
     report['metric_audit'] = metric_policy_audit(summary)
     if report['metric_audit'].get('warnings'):
@@ -6038,6 +6345,28 @@ def _print_methodology_audit(report):
     print('  family: %d declared contrasts, m_eff=%s; Holm p is the family-corrected p.' % (int(_fam.get('declared_contrasts') or 0), _fam.get('effective_m')))
     if _fam.get('min_seeds_for_family_significance'):
         print('  minimum seeds for a family-corrected rejection at alpha=%g: n>=%d (below this every p is resolution-limited).' % (float(report.get('alpha', 0.05)), int(_fam['min_seeds_for_family_significance'])))
+    _abl = report.get('ablation_completeness') or {}
+    if _abl:
+        _missing = '; '.join('%s=%s' % (c, ','.join(a))
+                             for c, a in sorted((_abl.get('missing_arms') or {}).items()))
+        _omitted = _abl.get('omitted_components') or []
+        if _abl.get('complete') is None:
+            _state, _tail = 'not applicable', ' — no declared ablation contrast is measured in this panel'
+        elif report.get('ablation_complete'):
+            _state, _tail = 'complete', ''
+        else:
+            _detail = _missing or '(unspecified)'
+            if _omitted:
+                _detail += '; omitted components: ' + ', '.join(_omitted)
+            _state, _tail = 'INCOMPLETE', ' — missing ' + _detail
+        print('  ablation completeness (%s): %s%s'
+              % (_abl.get('mode'), _state, _tail))
+    if report.get('arm_summary'):
+        print('  arm means (mean ± sample std over seeds):')
+        for _k, _e in report['arm_summary'].items():
+            print('    %-30s n=%-2d  %.4f ± %.4f%s' % (
+                _k, _e['n_seeds'], _e['ppl_mean'], _e['ppl_std'],
+                '' if _e['meets_min_seeds'] else '  (BELOW min_n)'))
     for comp, entries in report['components'].items():
         live = [e for e in entries if e['n_shared'] > 0]
         if not live:
@@ -6053,6 +6382,11 @@ def _print_methodology_audit(report):
             _phs = ('%.4f' % _ph) if isinstance(_ph, (int, float)) and math.isfinite(_ph) else 'n/a'
             _tag = '' if e.get('tag_with', '') == e.get('tag_without', '') == '' else '   [%s vs %s]' % (e.get('tag_with') or '(base)', e.get('tag_without') or '(base)')
             print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s  p_Holm=%s%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p, _phs, _tag))
+            print('        with %.4f±%.4f vs without %.4f±%.4f; relative Δ=%+.2f%% of baseline, seed noise=%.2f%% (SNR=%.2f)' % (
+                e.get('with_mean', float('nan')), e.get('with_std', float('nan')),
+                e.get('without_mean', float('nan')), e.get('without_std', float('nan')),
+                e.get('relative_effect_pct', float('nan')), e.get('relative_noise_pct', float('nan')),
+                e.get('signal_to_noise', float('nan'))))
             print('        %s | %s' % (_c, e['effect_vs_noise']))
     if report['verified_components']:
         print('  verified innovations (controlled AND family-Holm p<alpha AND |Δ|>seed noise): ' + ', '.join(report['verified_components']))
@@ -7203,6 +7537,24 @@ def training_knobs():
         'lr_cosine_amp': LR_COSINE_AMP,
         'augmentation': 'none',
     }
+
+def training_knobs_fingerprint():
+    """Short, stable digest of the shared optimisation/training descriptor.
+
+    `run_cfg` already pins lr / wd / warmup / steps / tokens / architecture /
+    data, but it deliberately does not carry the optimizer identity, betas,
+    eps, LR-schedule shape, grad-clip or augmentation.  Those used to live
+    only in the per-record `train_knobs` copy, which `pair_reason` checks at
+    analysis time.  That leaves a resume hole: changing one of the module
+    constants would keep every old `run_cfg` valid, so `_plan_run` would skip
+    the cells and silently mix old-optimizer and new-optimizer records in one
+    panel.  Putting this digest in the resume fingerprint closes that hole —
+    a changed descriptor invalidates the old cells just like a changed lr.
+    Unset/legacy fingerprints simply decode without a `tk` field.
+    """
+    blob = json.dumps(training_knobs(), sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:12]
 
 def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs):
     # Explicit CSA_CKPT always wins.  Otherwise, on a CUDA box, fall back to
@@ -8654,7 +9006,7 @@ def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch):
         _mkey = ','.join(sorted((str(_x) for _x in _mg)))
     cfg.setdefault('warmup', 50)
     cfg.setdefault('comp_lambda', 0.05)
-    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_cs{CODE_SEMANTICS}{_kernel_stamp()}'
+    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_tk{training_knobs_fingerprint()}_cs{CODE_SEMANTICS}{_kernel_stamp()}'
 
 
 def _plan_run(cfg, summary_path, fp):
@@ -8881,6 +9233,12 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
                 print('[seed-plan] this panel declares %d controlled contrasts; with n=%d seeds the family-corrected exact-test floor is above alpha, so results are DESCRIPTIVE ONLY. '
                       'A family-corrected rejection needs n>=%d (raise the seed list or narrow the pre-registered family before claiming significance).'
                       % (_sp['declared_contrasts'], _sp['n_seeds'], _sp['min_seeds_for_family_significance']))
+            if _sp.get('ablation_complete') is False:
+                _abl = _sp.get('ablation_completeness') or {}
+                print('[seed-plan] ABLATION INCOMPLETE for this panel: missing %s. '
+                      'A component with only a partial combination cannot support the claim that each module is useful; add the named full-minus-X arm (or run the full factorial).'
+                      % '; '.join('%s=%s' % (_c, ','.join(_a))
+                                  for _c, _a in sorted((_abl.get('missing_arms') or {}).items())))
     except Exception as _sp_err:
         print(f'[seed-plan] note unavailable ({type(_sp_err).__name__}: {_sp_err}) — continuing')
     if torch.cuda.is_available():

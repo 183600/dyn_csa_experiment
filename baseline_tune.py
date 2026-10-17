@@ -133,6 +133,15 @@ def _relaxed_pair_reason(a, b, tuned_arms):
     for k in ('steps', 'tokens_seen', 'data_fp', 'val_fp'):
         if a.get(k) is not None and b.get(k) is not None and a.get(k) != b.get(k):
             return f'{k} differs ({a.get(k)!r} vs {b.get(k)!r})'
+    # Tuning may change lr/wd/warmup, but it must never silently change the
+    # optimizer, betas/eps, LR-schedule shape, grad-clip or augmentation.  The
+    # strict `pair_reason` already enforces this for architecture contrasts;
+    # the relaxed tuned rule must not become a back door around it.
+    ka, kb = a.get('train_knobs'), b.get('train_knobs')
+    if (ka is None) != (kb is None):
+        return 'unverifiable train_knobs (only one record carries the optimizer/schedule/augmentation descriptor)'
+    if ka is not None and ka != kb:
+        return 'different train_knobs (optimizer / LR-schedule / grad-clip / augmentation)'
     try:
         pa, pb = int(a.get('params')), int(b.get('params'))
         if abs(pa - pb) / float(max(pa, pb, 1)) > 0.01:
@@ -193,12 +202,32 @@ def _run_final(base, outdir, protocol, selected):
                 seeds.append(seed)
             st = L.paired_effect_stats(deltas)
             st.update({'with': method, 'without': baseline, 'seeds': seeds,
-                       'skipped': skipped, 'pairing_rule': 'tuned_equal_budget'})
+                       'skipped': skipped, 'pairing_rule': 'tuned_equal_budget',
+                       'mean_pm_std': (f'{st["mean"]:+.4f} +/- {st["std"]:.4f}' if st.get('n') else 'n/a')})
             comparison['contrasts'][f'{method} - {baseline}'] = st
+    # The tuned contrasts form their own family: each baseline is a separate
+    # claim, so raw p values must not be read as if only one comparison was
+    # run.  Apply the same Holm step-down used everywhere else and record the
+    # exact-test resolution floor instead of leaving "not significant" to be
+    # mistaken for a null when n is too small.
+    _named = [(name, st.get('p_exact_signflip')) for name, st in comparison['contrasts'].items()]
+    _holm = L.holm_adjust(_named, alpha=0.05) if _named else {}
+    _m = len(_named)
+    for name, st in comparison['contrasts'].items():
+        _h = _holm.get(name) or {}
+        st['p_holm'] = _h.get('p_holm')
+        st['significant_holm'] = bool(_h.get('reject') and (not st.get('within_seed_noise'))
+                                      and st.get('controlled', True))
+    comparison['family'] = {
+        'name': 'tuned_equal_budget_baselines',
+        'm': _m, 'alpha': 0.05, 'correction': 'holm step-down',
+        'min_seeds_for_family_significance': L.signflip_min_n_for_holm(_m, 0.05) if _m else None,
+        'note': 'per-arm validation-selected hyperparameters; a tuned win is NOT a strict same-run_cfg architectural contrast',
+    }
     L.atomic_write_json(os.path.join(final_dir, 'tuned_comparison.json'), comparison)
     print('\n[tune] tuned-vs-tuned paired contrasts (Δ = method − baseline; negative PPL is better):')
     for name, st in comparison['contrasts'].items():
-        print(f'  {name:48s} n={st["n"]}  Δ={st["mean"]:+.4f} ± {st["std"]:.4f}  p={st["p_exact_signflip"]:.4f}  {st["effect_vs_noise"]}')
+        print(f'  {name:48s} n={st["n"]}  Δ={st["mean"]:+.4f} ± {st["std"]:.4f}  p={st["p_exact_signflip"]:.4f}  p_Holm={st.get("p_holm")}  {st["effect_vs_noise"]}')
 
 
 def run_smoke():

@@ -499,7 +499,13 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   带该字段、另一条不带也判为 unverifiable**——否则新旧记录混用时，换了
   优化器的那条会静默通过，正是本门槛要防的假提升。两条都不带（纯历史
   记录）才保留旧的兼容路径。被拒的种子不计入 n，并在 `skipped_reasons`
-  里点名。`BASELINE_DESIGN` 另把主方法与参数对齐稠密基线
+  里点名。`training_knobs()` 的摘要还进入 `_run_fp` 的 `_tk` 字段：改变
+  优化器 / betas / eps / 调度 / 裁剪 / 增强常量会像改变 lr 一样使旧
+  `run_cfg` 失效并按正常 resume 规则重训，而不是留下旧优化器记录冒充新
+  协议。面板级 `controlled_variables_report` 检查**该臂的全部种子记录**
+  （不是只看第一条）的 `run_cfg`、`train_knobs` 与结构化 `hyperparams`
+  关键字段，并点名「同一条臂内不同种子用了不同协议」的混合情况。
+  `BASELINE_DESIGN` 另把主方法与参数对齐稠密基线
   （`full_sw128_matched` / `full_matched`）的对比纳入同一套门槛，并额外
   要求两者参数量相对差 ≤1%（`param_controlled`）；参数不匹配的基线主张
   不计为 verified。
@@ -518,7 +524,12 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   （`run_gapfill.py full`，seeds 0-2 ≥ `min_n`；`RUN_ABL` 声明的 5-seed
   全集留给后续补种子 pass）。v6 smoke 同步覆盖消融臂的全部独有前向路径
   （随机 indexer / 零内容 / 无 sink / fuse / HCA / dense+sink），使 P-ABL
-  不会在烧掉数小时后才暴露坏臂。
+  不会在烧掉数小时后才暴露坏臂。`ablation_completeness_audit` 把「完整性」
+  变成机器读数：留一法下每个创新点必须**全部声明的对照都两臂在场**才算
+  complete，缺哪个臂会被点名；它也接受 `arms_by_combo` 的全因子 2^k 映射
+  （全因子是更昂贵的替代方案），8 种组合少一种（例如只有 A/B/C 的单独臂
+  和 AB/AC/BC，漏掉 C 或 ABC）会给出精确的缺失组合，而不是把 7/8 面板
+  描述成全因子。部分组合因此不能再支撑「每个模块都有用」的结论。
 - **验证分级（不再把「有对照」写成「已证明」）**：`verified_components`
   只收**受控 + 参数受控（基线）+ 族内 Holm 校正后 p<α + 效应大于种子噪声**
   的创新点；仅达到 `min_n` 的对照列入 `measured_components`（描述性），
@@ -532,7 +543,13 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   最小可达 p 仍 > α，即**无论效应多大都不可能达到显著性**——这是分辨率
   上限、不是零结果）与 `within_seed_noise`（|mean| ≤ std，即 +0.2% 的
   均值配 0.5% 的方差这种噪声级「提升」）；`significant` 同时要求 p<α 且
-  效应大于种子噪声，避免大 n 的 p 值把亚噪声效应包装成真实增益。
+  效应大于种子噪声，避免大 n 的 p 值把亚噪声效应包装成真实增益。每条
+  对照还落盘 `with_mean±with_std` / `without_mean±without_std`、
+  `relative_effect_pct`（Δ 占基线 PPL 的百分比）、`relative_noise_pct`
+  与 `signal_to_noise`，因此「0.2% 的提升配 0.5% 的种子标准差」可以直接
+  从记录复核，而不必反推原始数字。`arm_summary` 对每条臂按 (variant,
+  protocol) 给出 n、mean±std 与 `meets_min_seeds`，关键实验低于 `min_n`
+  的臂进入 `arms_below_min_seeds`。
 - **多重比较**：审计对整个声明族（`ABLATION_DESIGN`，以及面板里实际排了
   参数对齐稠密臂时的 `BASELINE_DESIGN`）做 **Holm step-down**，每个对比
   同时给出 `p_holm_global`。族按「本面板能测到的声明」划定：一个组件至少
