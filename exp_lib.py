@@ -5842,6 +5842,27 @@ def controlled_variables_report(recs, arms):
             diff_values[key] = ctl['values']
     for key in hp_diffs:
         diff_values['hyperparams.' + key] = hyper[key]['values']
+    # Seed/protocol coverage: arm means are only directly comparable when
+    # every arm averaged the same seeds under the same measurement protocol.
+    # Paired contrasts already use only shared seeds, but an unequal arm still
+    # changes the descriptive mean±std and can hide a lost seed (OOM / cap /
+    # error).  Report the exact coverage; None means no arm has a record.
+    _seed_sets = {}
+    for (v, t, s) in recs:
+        if v not in arms:
+            continue
+        _ss = _as_seed_int(s)
+        if _ss is None:
+            continue
+        _seed_sets.setdefault(v, set()).add((str(t or ''), _ss))
+    seed_coverage = {a: sorted(_seed_sets.get(a, set())) for a in arms}
+    _nonempty = [frozenset(v) for v in seed_coverage.values() if v]
+    if not _nonempty:
+        seed_coverage_equal = None
+    elif any(not v for v in seed_coverage.values()):
+        seed_coverage_equal = None
+    else:
+        seed_coverage_equal = bool(len(set(_nonempty)) == 1)
     controlled = None
     flags = [run_cfg['equal'], train_knobs['equal'], hp_equal]
     if any(f is False for f in flags):
@@ -5860,6 +5881,8 @@ def controlled_variables_report(recs, arms):
         'checked_hyperparam_keys': sorted(hp_checked),
         'hyperparam_differences': hp_diffs,
         'unverifiable_hyperparam_keys': hp_unknown,
+        'seed_coverage': seed_coverage,
+        'seed_coverage_equal': seed_coverage_equal,
     }
 
 def _params_of_arm(recs, arm):
@@ -6369,6 +6392,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             if _cv.get('hyperparam_differences'):
                 report['warnings'].append('%s: structured hyperparameters differ across arms (%s) even where run_cfg matches — the comparison is not fully controlled'
                                           % (comp, ', '.join(_cv['hyperparam_differences'])))
+            if _cv.get('seed_coverage_equal') is False:
+                _cov = '; '.join(
+                    '%s={%s}' % (a, ','.join('%s:%s' % (t or 'base', s)
+                                             for t, s in _cv['seed_coverage'].get(a) or []))
+                    for a in _cv.get('arms') or [])
+                report['warnings'].append('%s: arms do NOT share the same seed/protocol coverage (%s) — arm means are over different seed sets and the extra/missing seeds must not be read as a paired contrast; pair only the shared seeds (n_paired) or restore the missing cells'
+                                          % (comp, _cov))
             _req_key = 'component_seed_requirements' if kind == 'component' else 'baseline_seed_requirements'
             report[_req_key][comp] = {
                 'declared_contrasts': int(len(contrasts)),

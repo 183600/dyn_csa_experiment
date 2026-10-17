@@ -16,6 +16,8 @@
 
 运行：python test_review_fixes.py   （需要 torch；无 torch 的环境全部跳过
 并给出非零提醒码 0——CI 以「SKIPPED」字样识别）。"""
+import contextlib
+import io
 import json
 import math
 import os
@@ -461,6 +463,14 @@ def t_ablation_design_loss_term():
     for comp, contrasts in L.ABLATION_DESIGN.items():
         assert contrasts and all(len(t) == 3 for t in contrasts), f'{comp}: malformed leave-one-out design'
     assert any(v == 'csa_dyn_nocomp' for v in L.ABL_VARIANTS), 'the loss ablation arm must be scheduled by RUN_ABL'
+    # Every arm named by a declared contrast must be in the SAME panel as its
+    # reference.  A declared-but-unscheduled arm silently turns a complete
+    # leave-one-out design into a partial one at run time.
+    declared = {x for cs in L.ABLATION_DESIGN.values()
+                for a, b, _n in cs for x in (a, b)}
+    missing = declared - set(L.RUN_ABL['variants'])
+    assert not missing, f'declared ablation arms not scheduled by RUN_ABL: {sorted(missing)}'
+    assert L.ablation_completeness_audit(L.ABLATION_DESIGN, L.RUN_ABL['variants'])['complete'] is True
 
 
 def t_training_knobs_in_resume_fingerprint():
@@ -500,6 +510,64 @@ def t_controlled_variables_all_seed_records():
     assert cv['train_knobs_equal'] is False, cv
     assert 'a' in cv['within_arm_mixed'], cv
     assert r['components']['c'][0]['n_paired'] == 2, r['components']['c'][0]
+
+
+def t_seed_coverage_warning():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    s = {}
+    for i in range(3):
+        s[f'a::seed{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=49.0, params=100, train_knobs=knobs)
+        if i < 2:
+            s[f'b::seed{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                    ppl=50.0, params=100, train_knobs=knobs)
+    r = L.methodology_audit(s, design={'c': [('a', 'b', 'x')]}, baselines={}, verbose=False)
+    cv = r['controlled_variables']['c']
+    assert cv['seed_coverage_equal'] is False, cv
+    assert any('seed/protocol coverage' in w for w in r['warnings']), r['warnings']
+    assert r['components']['c'][0]['n_paired'] == 2, r['components']['c'][0]
+
+
+def t_fairness_cross_arm_controls():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+
+    def _panel(*, knob_override=None, drop_seed=None):
+        s = {}
+        for i in range(3):
+            for arm, ppl in (('a', 10.0), ('b', 11.0)):
+                if arm == 'b' and i == drop_seed:
+                    continue
+                kk = dict(knobs)
+                if knob_override == (arm, i):
+                    kk['grad_clip_norm'] = 2.0
+                s[f'{arm}::seed{i}'] = dict(
+                    variant=arm, seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                    ppl=ppl, params=100, train_knobs=kk)
+        return s
+
+    with tempfile.TemporaryDirectory() as td:
+        def _run(summary):
+            path = os.path.join(td, 'summary.json')
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(summary, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                return A.audit_fairness(path, arms=['a', 'b'])
+
+        ok = _run(_panel())
+        assert ok['controlled_variables']['train_knobs_equal'] is True, ok['controlled_variables']
+        assert not any('train_knobs differ' in p for p in ok['problems']), ok['problems']
+        # A different optimizer/clip in ONE arm must fail even when every arm
+        # is internally consistent — the old per-arm distinct-count check
+        # could not see this cross-arm violation.
+        bad = _run(_panel(knob_override=('b', 1)))
+        assert bad['status'] == 'fail', bad
+        assert any('train_knobs differ across arms' in p for p in bad['problems']), bad['problems']
+        # Missing seed in one arm: arm means would be over different seeds.
+        cov = _run(_panel(drop_seed=2))
+        assert cov['status'] == 'fail', cov
+        assert any('seed/protocol coverage differs' in p for p in cov['problems']), cov['problems']
 
 
 def t_tuned_pairing_keeps_optimizer_gate():
@@ -1421,6 +1489,8 @@ def main():
     _check('C14 compression-regularizer loss ablation', t_ablation_design_loss_term)
     _check('C15 optimizer knobs enter the resume fingerprint', t_training_knobs_in_resume_fingerprint)
     _check('C16 controlled variables inspect every seed record', t_controlled_variables_all_seed_records)
+    _check('C16a audit flags unequal seed coverage (lost seed)', t_seed_coverage_warning)
+    _check('C16b fairness audit checks cross-arm optimizer + seed coverage', t_fairness_cross_arm_controls)
     _check('C17 arm n / mean±std / relative effect', t_arm_mean_std_and_relative_effect)
     _check('C17b tuned pairing keeps optimizer gate', t_tuned_pairing_keeps_optimizer_gate)
     _check('C18 leave-one-out ablation completeness', t_ablation_completeness_leave_one_out)

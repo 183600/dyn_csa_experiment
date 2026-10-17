@@ -653,16 +653,55 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
         if not (isinstance(r, dict) and r.get('variant') in arms):
             continue
         per_arm.setdefault(r['variant'], []).append(r)
-    out = {'status': 'ok', 'arms': {}}
+    out = {'status': 'ok', 'arms': {}, 'controlled_variables': None,
+           'seed_coverage': {}}
     problems = []
+    warnings = []
+    arms_present = [a for a in arms if a in per_arm]
     for a, recs in per_arm.items():
         cfgs = {r.get('run_cfg') for r in recs}
-        knobs = {json.dumps(r.get('train_knobs'), sort_keys=True) for r in recs}
-        out['arms'][a] = {'n_records': len(recs), 'n_distinct_run_cfg': len(cfgs), 'n_distinct_train_knobs': len(knobs), 'params': sorted({r.get('params') for r in recs}, key=lambda x: (x is None, x))}
+        knob_vals = {json.dumps(r.get('train_knobs'), sort_keys=True)
+                     for r in recs if r.get('train_knobs') is not None}
+        n_missing_knobs = sum(1 for r in recs if r.get('train_knobs') is None)
+        seeds = sorted({int(r['seed']) for r in recs
+                        if isinstance(r.get('seed'), (int, float))
+                        and not isinstance(r.get('seed'), bool)})
+        out['arms'][a] = {
+            'n_records': len(recs), 'seeds': seeds, 'n_seeds': len(seeds),
+            'n_distinct_run_cfg': len(cfgs),
+            'n_distinct_train_knobs': len(knob_vals),
+            'n_missing_train_knobs': n_missing_knobs,
+            'params': sorted({r.get('params') for r in recs},
+                             key=lambda x: (x is None, x)),
+        }
         if len(cfgs) > 1:
             problems.append(f'{a}: {len(cfgs)} distinct run_cfg values within one arm — mixed protocols inside an arm')
+        if len(knob_vals) > 1:
+            problems.append(f'{a}: {len(knob_vals)} distinct train_knobs values within one arm — mixed optimizer/schedule settings inside an arm')
     _unverifiable = False
     if len(per_arm) >= 2:
+        # The cross-arm check must use the SAME gate as the statistics
+        # (`pair_reason`): identical run_cfg AND identical train_knobs AND the
+        # same steps/tokens.  Counting distinct values per arm (the old form)
+        # only detects mixing *inside* one arm; one arm could still run a
+        # different optimizer while every arm looked internally consistent.
+        recs_map, _amb = L._variant_seed_map(summ)
+        _cv_arms = [a for a in arms if a in per_arm]
+        if recs_map and len(_cv_arms) >= 1:
+            cv = L.controlled_variables_report(recs_map, _cv_arms)
+            out['controlled_variables'] = cv
+            if cv.get('run_cfg_equal') is False:
+                problems.append('run_cfg differs across arms — the training budget / data / architecture knobs are not controlled; pair_reason would refuse every pairing')
+            if cv.get('train_knobs_equal') is False:
+                problems.append('train_knobs differ across arms (optimizer / betas / eps / lr-schedule / grad-clip / augmentation) — a gain from a different optimizer is not a gain from the method')
+            if cv.get('hyperparams_equal') is False:
+                problems.append('structured hyperparameters differ across arms: ' + ', '.join(cv.get('hyperparam_differences') or []) + ' — the comparison is not fully controlled')
+            for _arm in cv.get('within_arm_mixed') or []:
+                problems.append(f'{_arm}: seeds mix DIFFERENT run_cfg/train_knobs/hyperparameter values inside one arm')
+            for _key in ('run_cfg', 'train_knobs', 'hyperparams'):
+                _eq = cv.get(_key + '_equal')
+                if _eq is None:
+                    warnings.append(f'{_key} equality across arms is UNVERIFIABLE (some records omit it / differ in coverage) — do not read the arm means as a controlled contrast')
         ref_arm = arms[0] if arms[0] in per_arm else next(iter(per_arm))
         ref_cfg = {r.get('run_cfg') for r in per_arm[ref_arm]}
         if not ref_cfg or None in ref_cfg:
@@ -679,9 +718,24 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
                     if r.get('run_cfg') is None or r.get('run_cfg') not in ref_cfg:
                         problems.append(f'{a}: a record whose run_cfg does not equal the {ref_arm} reference (pair_reason would refuse this pairing)')
                         break
+        # Seed coverage: arm means are only comparable if they average the
+        # same seeds.  An arm that silently lost a seed (OOM / cap / error)
+        # must not be compared against one that kept it.
+        if all(all(r.get('run_cfg') is not None for r in per_arm[a]) for a in per_arm):
+            _cover = {}
+            for (v, t, s) in recs_map:
+                if v in per_arm:
+                    _cover.setdefault(v, set()).add((str(t or ''), int(s)))
+            out['seed_coverage'] = {a: sorted(_cover.get(a, set())) for a in arms_present}
+            _sets = {a: frozenset(_cover.get(a, set())) for a in arms_present}
+            if len(set(_sets.values())) > 1:
+                _detail = '; '.join('%s={%s}' % (a, ','.join('%s:%s' % (t or 'base', s)
+                                                              for t, s in sorted(_sets[a])))
+                                    for a in arms_present)
+                problems.append('arm seed/protocol coverage differs (%s) — arm means are over different seeds; pair only the shared seeds or restore the missing cells' % _detail)
     out['problems'] = problems
     out['tuning'] = L.baseline_tuning_audit(path=os.path.join(REPO, 'results_baseline_tuning', 'baseline_tuning.json'))
-    out['warnings'] = []
+    out['warnings'] = warnings
     if not out['tuning'].get('tuning_verified'):
         out['warnings'].append('no equal-budget baseline tuning artifact — a win over these baselines is not yet evidence against a well-tuned baseline; run baseline_tune.py')
     out['status'] = ('fail' if problems else
