@@ -928,8 +928,11 @@ class FusedIndexer(torch.autograd.Function):
     @staticmethod
     def forward(ctx, impl, qI, kI, w_idx, last_tok, topk, need_soft=True):
         # A caller may request the no-soft form only when no gradient can
-        # reach it; under grad mode the S path always needs the prior.
-        need_soft = bool(need_soft) or torch.is_grad_enabled()
+        # reach it; when any differentiable input needs the prior, keep it.
+        # `ctx.needs_input_grad` must be used here: torch.is_grad_enabled()
+        # is False inside a custom autograd Function's forward, so it cannot
+        # detect that a backward will be built.
+        need_soft = bool(need_soft) or any(ctx.needs_input_grad[1:4])
         if impl == 'triton':
             idx, valid, soft = _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=need_soft)
         else:

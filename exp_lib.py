@@ -1739,6 +1739,12 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         qI = (pre_qI if pre_qI is not None else H @ W_DQ).view(n, nIH, hd).transpose(0, 1)
         kI = (comp_kv @ W_DK).view(B, nIH, hd).transpose(0, 1)
         w_idx = pre_w if pre_w is not None else F.linear(H, W_w)
+        # The no-soft form is only safe when no differentiable path reaches
+        # the indexer (the S prior is the only route for its gradients).  A
+        # caller that asks for no-soft while the indexer tensors require grad
+        # would otherwise silently detach it, so re-enable the prior here.
+        if not need_soft and any((_t is not None and _t.requires_grad for _t in (qI, kI, w_idx))):
+            need_soft = True
     pos = _arange_cache(n, dev)
     # causal (and its negation) are exact bool functions of (pos, last_tok).
     # The fixed segmenter's pooled last_tok is ONE shared cached tensor read
@@ -3001,8 +3007,12 @@ class SmallGPT(nn.Module):
         ce = None
         _ck = torch.is_grad_enabled() and h.requires_grad
         if _ck and h.device.type != 'cuda':
-            _rows = min(int(chunk), int(ids.shape[1]))
-            _saved = 3 * int(ids.shape[0]) * _rows * int(vocab) * 4
+            # Every chunk's logits stay alive in the graph until backward, so
+            # the retained total is budgeted over the whole sequence (not just
+            # one chunk); otherwise a longer sequence keeps every chunk's
+            # logits and can exhaust host memory even though each individual
+            # chunk passes the limit.
+            _saved = 3 * int(ids.shape[0]) * int(ids.shape[1]) * int(vocab) * 4
             _ck = not _cpu_saved_ok(_saved, _CPU_CE_CKPT_BYTES)
         for s in range(0, ids.shape[1], chunk):
             if _ck:
