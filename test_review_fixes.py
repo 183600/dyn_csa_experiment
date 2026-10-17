@@ -643,6 +643,39 @@ def t_attention_zero_blocks_keeps_window():
     assert torch.allclose(got, ref, atol=1e-6, rtol=1e-5), 'the sliding-window lanes were dropped when k_blk held zero rows'
 
 
+def t_atomic_torch_save():
+    # Checkpoint writes use a unique same-directory temp and replace atomically;
+    # a failed/interrupted writer must not leave a shared `*.tmp` behind.
+    d = tempfile.mkdtemp()
+    try:
+        p = os.path.join(d, 'ckpt.pt')
+        V7._atomic_torch_save({'a': torch.arange(3)}, p)
+        got = torch.load(p, weights_only=False)
+        assert torch.equal(got['a'], torch.arange(3))
+        leftovers = [f for f in os.listdir(d) if f.endswith('.tmp')]
+        assert not leftovers, f'incomplete temp files left behind: {leftovers}'
+        V7._atomic_torch_save({'a': torch.arange(4)}, p)
+        got = torch.load(p, weights_only=False)
+        assert got['a'].numel() == 4, 'the atomic replace did not publish the new checkpoint'
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def t_cache_bytes_shared_storage():
+    # A stride-0 expand is a view: it must be charged its resident storage
+    # (O(m)), not numel (O(n*m)).  Otherwise the HCA arange expansion looks
+    # larger than the whole index-cache budget and every later _cache_put
+    # evicts the other (reusable) geometry tables.
+    base = torch.arange(64, dtype=torch.int32)
+    expanded = base.expand(4096, 64)
+    assert L._cache_bytes(expanded) == L._cache_bytes(base), 'an expand must charge its base storage, not numel'
+    assert L._cache_bytes(expanded) < expanded.numel() * expanded.element_size()
+    cache = {}
+    L._cache_put(cache, 'arange', base, 8192, L._idx_cache_total)
+    L._cache_put(cache, 'expand', expanded, 8192, L._idx_cache_total)
+    assert set(cache) == {'arange', 'expand'}, 'a shared-storage view evicted an unrelated cache entry (cache thrash)'
+
+
 def t_overfit_guard_source_key():
     # A synthetic pre-flight and a data pre-flight are distinct keys: the data
     # check exercises real ids, and a passed data check subsumes the synthetic
@@ -709,6 +742,8 @@ def main():
     _check('F1 indexer column-narrowing exactness', t_indexer_column_narrowing_exact)
     _check('F2 zero-block attention keeps window', t_attention_zero_blocks_keeps_window)
     _check('F3 overfit guard source key', t_overfit_guard_source_key)
+    _check('F4 shared-storage cache accounting', t_cache_bytes_shared_storage)
+    _check('F5 atomic checkpoint save', t_atomic_torch_save)
     fails = [r for r in _results if r[1] != 'PASS']
     print(f'\n[test] {len(_results) - len(fails)}/{len(_results)} passed')
     return 1 if fails else 0

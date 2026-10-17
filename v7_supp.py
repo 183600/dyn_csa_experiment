@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 for _stream in (sys.stdout, sys.stderr):
@@ -108,9 +109,24 @@ def gather_rows(x, idx):
     return picked.reshape(idx.shape[0], idx.shape[1], *lead)
 
 def _atomic_torch_save(obj, path):
-    _tmp = path + '.tmp'
-    torch.save(obj, _tmp)
-    os.replace(_tmp, path)
+    # Unique same-directory temp: two workers must never write through one
+    # fixed `path + '.tmp'` (one could rename it while the other is still
+    # writing).  The save itself is unchanged; the replace stays atomic.
+    d = os.path.dirname(os.path.abspath(path)) or '.'
+    os.makedirs(d, exist_ok=True)
+    _fd, _tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + '.', suffix='.tmp')
+    try:
+        with os.fdopen(_fd, 'wb') as _fh:
+            torch.save(obj, _fh)
+            _fh.flush()
+            os.fsync(_fh.fileno())
+        os.replace(_tmp, path)
+    except BaseException:
+        try:
+            os.unlink(_tmp)
+        except OSError:
+            pass
+        raise
 
 def _load_ckpt(path):
     try:

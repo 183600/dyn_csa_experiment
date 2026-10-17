@@ -504,7 +504,19 @@ def _cache_bytes(t):
     if isinstance(t, (tuple, list)):
         return sum((_cache_bytes(_v) for _v in t))
     try:
-        return int(t.numel()) * int(t.element_size())
+        nbytes = int(t.numel()) * int(t.element_size())
+        # Views can share storage: a stride-0 expand (the HCA arange
+        # expansion) has numel O(n·m) but occupies O(m).  Charging the full
+        # numel would make that one entry look larger than the whole cache
+        # budget, so every later _cache_put would evict all other tables and
+        # rebuild them on the next call — cache thrash instead of reuse.  The
+        # resident storage is the correct (conservative) charge for a view;
+        # min() keeps a sliced view of a larger buffer from over-counting.
+        try:
+            nbytes = min(nbytes, int(t.untyped_storage().nbytes()))
+        except Exception:
+            pass
+        return nbytes
     except Exception:
         return 0
 
