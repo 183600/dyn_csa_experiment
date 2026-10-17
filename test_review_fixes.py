@@ -490,6 +490,26 @@ def t_segment_empty():
     assert L._segment(1, [], 2, 128)[2] == [1]
 
 
+def t_segment_uniform_stride_only_when_all_cuts():
+    # A wanted cut at n-1 sits after the final token and cannot short-circuit
+    # the walk.  {1} for n=2 has n-1 slots but leaves slot 0 unset, so the
+    # first block must still run to the end (count 2), not take the short
+    # uniform stride.  This is the boundary the uniform-stride fast path must
+    # not absorb.
+    bids, hon, counts = L._segment(2, [False, True], 1, 2)
+    assert counts == [2] and bids.tolist() == [0, 0] and hon == {}, (bids, hon, counts)
+    # n=3, two wanted slots including n-1: still NOT the all-cuts case.
+    bids, hon, counts = L._segment(3, [False, True, True], 1, 2)
+    assert counts == [2, 1] and bids.tolist() == [0, 0, 1] and hon == {1: 1.0}, (bids, hon, counts)
+    bids, hon, counts = L._segment(3, [True, False, True], 1, 2)
+    assert counts == [1, 2] and bids.tolist() == [0, 1, 1] and hon == {0: 1.0}, (bids, hon, counts)
+    # All answer-forcing slots (0..n-2) present -> the uniform stride is exact.
+    bids, hon, counts = L._segment(3, [True, True, True], 1, 2)
+    assert counts == [1, 1, 1] and bids.tolist() == [0, 1, 2], (bids, hon, counts)
+    bids, _, counts = L._segment(4, [True, True, False, True], 1, 3)
+    assert counts == [1, 1, 2] and bids.tolist() == [0, 1, 2, 2], (bids, counts)
+
+
 def t_shipped_manifest_consistency():
     with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
         v2 = json.load(f)
@@ -1116,6 +1136,7 @@ def main():
     _check('C14 compression-regularizer loss ablation', t_ablation_design_loss_term)
     _check('A7 adaptive-threshold memory guard', t_adaptive_threshold_guard)
     _check('A8 empty segmenter', t_segment_empty)
+    _check('A8a uniform-stride cut boundary', t_segment_uniform_stride_only_when_all_cuts)
     _check('A8b empty pooling geometry', t_empty_pool_geometry)
     _check('C6 shipped manifest v2 consistency', t_shipped_manifest_consistency)
     _check('C7 frozen seeds single source', t_frozen_seeds)

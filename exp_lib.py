@@ -233,7 +233,13 @@ def _segment(n, want_cut_list, min_block, max_block):
         _stride = _mb
     elif ns == 0:
         _stride = _xb if _xb >= 1 else 1
-    elif ns == n - 1:
+    elif (n >= 2 and ns >= n - 1
+          and int(slots[0]) == 0 and int(slots[n - 2]) == n - 2):
+        # A wanted slot at n-1 is a boundary after the final token and does
+        # not change the walk, so "every answer-forcing slot" is 0..n-2, not
+        # merely a count of n-1 wanted slots: {1} for n=2 also has n-1 slots
+        # but leaves slot 0 unset, in which case the first block must run to
+        # the cut (count 2), not to the short stride.
         _stride = max(1, min(_mb, _xb))
     if _stride is not None:
         counts = [_stride] * (n // _stride)
