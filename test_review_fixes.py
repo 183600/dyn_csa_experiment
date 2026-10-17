@@ -21,6 +21,7 @@
 import json
 import math
 import os
+import random
 import shutil
 import sys
 import tempfile
@@ -464,6 +465,70 @@ def t_eval_per_seq():
         assert abs(geo - cell['ppl']) / cell['ppl'] < 1e-6, f'pooled ppl must equal the geometric mean of per-seq ppl at L{Ln} (reduction-invariance)'
 
 
+# ---------------------------------------------------------------------------
+# E. 可复现性与实验追踪（随机种子 / 小批量过拟合 / provenance）
+# ---------------------------------------------------------------------------
+
+def t_seed_reproducible():
+    def draw():
+        L.set_seed(12345)
+        return (random.random(), float(np.random.random()), float(torch.rand(1).item()), L.rng_fingerprint())
+    a = draw()
+    b = draw()
+    assert a == b, f'same seed must reproduce Python/NumPy/Torch draws and the RNG fingerprint: {a} vs {b}'
+    L.set_seed(54321)
+    d = (random.random(), float(np.random.random()), float(torch.rand(1).item()))
+    assert d != a[:3], 'a different seed must change the RNG stream'
+
+
+def t_batch_iter_reproducible():
+    ids = np.arange(5000, dtype=np.int64) % 997
+    b1 = next(L.batch_iter(ids, 32, 4, torch.device('cpu'), seed=7))
+    b2 = next(L.batch_iter(ids, 32, 4, torch.device('cpu'), seed=7))
+    assert torch.equal(b1[0], b2[0]) and torch.equal(b1[1], b2[1]), 'batch_iter must be seeded by the run seed'
+    b3 = next(L.batch_iter(ids, 32, 4, torch.device('cpu'), seed=8))
+    assert not torch.equal(b1[0], b3[0]), 'a different data seed must change the batch order'
+
+
+def t_overfit_sanity():
+    r = L.overfit_sanity_check('full', seed=0, steps=200, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256)
+    assert r['passed'] is True, r
+    assert r['final_loss'] <= r['target_loss'], f"final loss {r['final_loss']} did not reach {r['target_loss']}"
+    assert r['final_accuracy'] >= r['target_accuracy'], f"final accuracy {r['final_accuracy']} did not reach {r['target_accuracy']}"
+    assert r['grad_all_finite'] and r['params_changed'], 'gradients must be finite and applied'
+    assert r['regularization']['weight_decay'] == 0.0 and r['regularization']['comp_lambda'] == 0.0
+    # the check must also work when the batch is sampled from a real token stream
+    ids = np.asarray(np.random.default_rng(3).integers(0, 256, size=1024), dtype=np.int64)
+    r2 = L.overfit_sanity_check('csa_dynamic', seed=0, steps=200, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=24, batch_size=2, vocab=256, train_ids=ids)
+    assert r2['passed'] is True and r2['data_source'] == 'train_ids', r2
+
+
+def t_provenance_and_manifest():
+    tr = np.arange(512, dtype=np.int64) % 97
+    va = np.arange(64, dtype=np.int64).reshape(2, 32) % 97
+    prov = L.experiment_provenance({'dataset': 'unit', 'n_train_tokens': 512, 'seq_len': 32}, train_ids=tr, val_batch=va, vocab=97)
+    for k in ('code', 'environment', 'data'):
+        assert k in prov, f'provenance missing {k}'
+    for k in ('code_semantics', 'code_stamp', 'git_commit', 'git_dirty'):
+        assert k in prov['code'], f'code provenance missing {k}'
+    for k in ('python', 'torch', 'numpy', 'determinism'):
+        assert k in prov['environment'], f'environment provenance missing {k}'
+    assert prov['data']['train_fp'] and prov['data']['val_fp'] and prov['data']['vocab_size'] == 97
+    hp = L.run_hyperparameters({'steps': 10, 'seeds': [0], 'variants': ['full'], 'outdir': 'x', 'n_train_tokens': 512, 'seq_len': 32}, seed=3, d=64, n_layers=2, n_heads=4, d_head=16, vocab=97, mlp_ratio=4.0)
+    assert hp['seed'] == 3 and hp['data_seed'] == 3 and hp['train_knobs']['optimizer'] == 'AdamW'
+    d = tempfile.mkdtemp()
+    try:
+        summary = {'full::seed0': {'ppl': 10.0, 'steps': 10, 'tokens_seen': 320, 'params': 100, 'train_time_s': 1.0, 'final_loss_smoothed': 2.3, 'rng_fp': 'abc', '_code': L.code_stamp(), 'losses': [3.0, 2.3], 'ppl_history': [[10, 10.0]]}}
+        cfg = {'seeds': [0], 'variants': ['full'], 'outdir': d, 'n_train_tokens': 512, 'seq_len': 32}
+        path = L.write_run_manifest(d, cfg, 'FP', prov, summary)
+        m = json.load(open(path, encoding='utf-8'))
+        assert m['manifest_version'] == 1 and 'FP' in m['panels'], m
+        assert m['panels']['FP']['cells']['full::seed0']['ppl'] == 10.0
+        assert m['panels']['FP']['provenance']['data']['train_fp'] == prov['data']['train_fp']
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED (no torch in this environment)')
@@ -492,6 +557,10 @@ def main():
     _check('C7 frozen seeds single source', t_frozen_seeds)
     _check('C8 doc-level analysis', t_doc_level_analysis)
     _check('D1 eval per-seq ppl', t_eval_per_seq)
+    _check('E1 seed reproducibility', t_seed_reproducible)
+    _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
+    _check('E3 small-batch overfit sanity', t_overfit_sanity)
+    _check('E4 provenance + run manifest', t_provenance_and_manifest)
     fails = [r for r in _results if r[1] != 'PASS']
     print(f'\n[test] {len(_results) - len(fails)}/{len(_results)} passed')
     return 1 if fails else 0

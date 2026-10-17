@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, math, os, shutil, statistics, subprocess, sys, traceback
+import json, math, os, shutil, statistics, subprocess, sys, time, traceback
 import copy
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
@@ -379,7 +379,39 @@ def schedule_shutdown(delay_s=90):
     subprocess.Popen(['bash', '-c', f'sleep {delay_s}; echo {marker}; shutdown -h now'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f'[v6] instance will SHUT DOWN in {delay_s}s. (cancel: pkill -f {marker})')
 
+def run_overfit(cfg=None, variants=None, steps=None):
+    """Pre-flight small-batch overfit sanity check.
+
+    Runs BEFORE any expensive panel: one fixed batch, zero weight decay, zero
+    compression penalty, no augmentation.  A failure is a hard stop (the full
+    run must not start).  Passing is necessary, not sufficient — data
+    augmentation / feature-alignment / label-mapping bugs can still survive.
+    """
+    cfg = dict(L.RUN if cfg is None else cfg)
+    cfg.setdefault('outdir', 'results_overfit_sanity')
+    variants = list(variants or ['full', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic', 'hybrid_hca_dyn'])
+    train_ids, val_batch, vocab, _, _ = L.load_run_corpus(cfg)
+    print(f'\n[overfit] small-batch sanity check: {len(variants)} variant(s), one fixed batch, wd=0, comp_lambda=0, no augmentation')
+    reports = L.overfit_guard(variants, steps=int(steps or 300), train_ids=train_ids, vocab=vocab, force=True)
+    if not reports:
+        return []
+    ok = all(r['passed'] for r in reports)
+    os.makedirs(cfg['outdir'], exist_ok=True)
+    L.atomic_write_json(os.path.join(cfg['outdir'], 'overfit_sanity.json'), {
+        'kind': 'small_batch_overfit_sanity_panel',
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'passed': ok,
+        'provenance': L.experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab),
+        'reports': reports,
+    })
+    if not ok:
+        _bad = [r['variant'] for r in reports if not r['passed']]
+        raise RuntimeError(f'small-batch overfit sanity check FAILED for {_bad} — do NOT start the full run; this points at a gradient/loss/label plumbing bug (see {cfg["outdir"]}/overfit_sanity.json)')
+    print('[overfit] PASSED (necessary, not sufficient — keep the intermediate-result checks)')
+    return reports
+
 def run_full():
+    run_overfit(cfg=dict(L.RUN, outdir='results_overfit_sanity'))
     guard = L.TimeGuard(L.RUN_CAP)
     guard.report()
     _synth_summary, _long_snapshot = synthesize_long_summary()
@@ -415,6 +447,7 @@ def run_smoke():
     # sink control) — otherwise a broken ablation arm would only surface
     # after P-CORE/P-LONG burned hours on a real box.
     smoke_cfg = dict(L.RUN, outdir='results_smoke', variants=['full', 'csa_fixed', 'hybrid_dynamic', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'csa_dyn_fuse', 'hybrid_hca_dyn', 'full_sink'], steps=60, eval_every=30, n_train_tokens=1000000, seeds=[0])
+    run_overfit(cfg=smoke_cfg, variants=['full', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic', 'hybrid_hca_dyn'], steps=250)
     L.run(smoke_cfg, seeds=[0], guard=None, label='SMOKE (60 steps)', par=False)
     _sp = os.path.join('results_smoke', 'summary.json')
     _got = {}
@@ -434,8 +467,8 @@ if __name__ == '__main__':
     if mode in ('-h', '--help'):
         print(__doc__ or '')
         raise SystemExit(0)
-    if mode not in ('smoke', 'full'):
-        print(f"[v6] unknown mode {mode!r}; expected 'smoke' or 'full' (no argument means 'full').  Nothing was started.")
+    if mode not in ('smoke', 'overfit', 'full'):
+        print(f"[v6] unknown mode {mode!r}; expected 'smoke', 'overfit' or 'full' (no argument means 'full').  Nothing was started.")
         raise SystemExit(2)
     try:
         _gpu = torch.cuda.get_device_name(0)
@@ -445,6 +478,8 @@ if __name__ == '__main__':
     try:
         if mode == 'smoke':
             run_smoke()
+        elif mode == 'overfit':
+            run_overfit()
         elif mode == 'full':
             run_full()
         else:

@@ -1,5 +1,11 @@
 import os
 os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+# PYTHONHASHSEED only takes effect when it is set before the interpreter
+# starts; setting it here is a best-effort propagation to child processes
+# (par.py workers, resumed runs).  The experiment itself never depends on
+# set/dict iteration order, but pinning it closes the last Python-level
+# nondeterminism source on repeat runs of the same machine.
+os.environ.setdefault('PYTHONHASHSEED', '0')
 _cpu_thr = os.environ.get('CSA_CPU_THREADS', '').strip() or '1'
 os.environ.setdefault('OMP_NUM_THREADS', _cpu_thr)
 os.environ.setdefault('MKL_NUM_THREADS', _cpu_thr)
@@ -4288,15 +4294,71 @@ def add_paired(*_a, **_kw):
     raise NotImplementedError('use v9_supp.add_paired (exp_lib cannot import v7_supp)')
 
 def set_seed(seed):
+    """Seed every RNG that can affect a run: Python ``random``, NumPy's
+    legacy global RNG, PyTorch's CPU RNG and every CUDA device, plus the
+    Python hash seed (best effort for child processes).  Returns the integer
+    seed so callers can record exactly what was used.  torch's deterministic
+    algorithm / cuDNN switches are pinned at the same time, so two runs with
+    the same seed on the same machine follow the same kernels."""
+    seed = int(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     _attb_bump_epoch()
     torch.manual_seed(seed)
     _pin_cpu_threads()
     if torch.cuda.is_available():
+        # manual_seed already covers all devices; the explicit current-device
+        # call documents the contract and is harmless.
+        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         _pin_cuda_determinism()
+    return seed
 _CPU_THREADS_PINNED = None
+
+def rng_fingerprint():
+    """Digest of the *current* Python/NumPy/Torch/CUDA RNG state.
+
+    Recorded immediately after `set_seed(seed)` in every training record.  Two
+    runs with the same seed on the same stack must produce the same digest;
+    a mismatch means some import/construction consumed randomness before the
+    run started (and therefore that the seed is not fully controlled).  The
+    digest is a diagnostic only: it never enters the resume fingerprint."""
+    h = hashlib.sha256()
+    h.update(repr(random.getstate()).encode('utf-8', 'replace'))
+    _ns = np.random.get_state()
+    h.update(str(_ns[0]).encode('ascii', 'replace'))
+    h.update(np.asarray(_ns[1], dtype=np.uint64).tobytes())
+    h.update(repr((_ns[2], _ns[3], _ns[4])).encode('ascii', 'replace'))
+    h.update(torch.get_rng_state().numpy().tobytes())
+    if torch.cuda.is_available():
+        try:
+            for _st in torch.cuda.get_rng_state_all():
+                h.update(_st.cpu().numpy().tobytes())
+        except Exception:
+            # a broken CUDA context is reported elsewhere; the CPU part of
+            # the fingerprint is still a useful diagnostic
+            pass
+    return h.hexdigest()[:16]
+
+def dataloader_generator(seed):
+    """A torch.Generator for a future torch DataLoader (scale path).
+
+    The current loader is `batch_iter`, which is seeded directly by the run
+    seed.  This helper is for DataLoader-based code: pass it as
+    ``DataLoader(..., generator=L.dataloader_generator(seed))`` and pass
+    ``worker_init_fn=L.seed_worker`` so worker RNGs are derived from the same
+    seed instead of the OS entropy pool."""
+    g = torch.Generator()
+    g.manual_seed(int(seed))
+    return g
+
+def seed_worker(worker_id):
+    """DataLoader worker_init_fn: seed Python/NumPy from torch's per-worker
+    base seed (PyTorch already seeds torch itself per worker)."""
+    _seed = int(torch.initial_seed()) % (2 ** 32)
+    random.seed(_seed)
+    np.random.seed(_seed)
 
 def _pin_cpu_threads():
     global _CPU_THREADS_PINNED
@@ -4343,6 +4405,150 @@ def determinism_label():
     if torch.are_deterministic_algorithms_enabled():
         return 'strict' if not torch.is_deterministic_algorithms_warn_only_enabled() else 'warn'
     return 'cudnn' if torch.backends.cudnn.deterministic else 'off'
+
+def _jsonable(v):
+    """Recursively convert a config/provenance value to JSON-safe data.
+    Sets are sorted so two equal configs always serialise identically."""
+    if isinstance(v, dict):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (set, frozenset)):
+        return sorted((_jsonable(x) for x in v), key=str)
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    return str(v)
+
+def _git_provenance():
+    """HEAD / branch / dirty state, with a bounded dirty-file list.  Never
+    raises: a source tarball without .git is still a valid experiment."""
+    def _run(*args):
+        try:
+            p = subprocess.run(['git', *args], cwd=os.path.dirname(os.path.abspath(__file__)), capture_output=True, text=True, timeout=20)
+            return p.stdout.strip() if p.returncode == 0 else None
+        except Exception:
+            return None
+    head = _run('rev-parse', 'HEAD')
+    branch = _run('rev-parse', '--abbrev-ref', 'HEAD')
+    dirty = _run('status', '--porcelain')
+    files = dirty.splitlines() if dirty else []
+    return {'git_commit': head, 'git_branch': branch, 'git_dirty': bool(files), 'git_dirty_count': len(files), 'git_dirty_files': files[:20]}
+
+def _gpu_names():
+    try:
+        return [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else []
+    except Exception:
+        return []
+
+def environment_snapshot():
+    """Compact software/hardware snapshot for experiment tracking."""
+    import platform
+    env = {
+        'python': sys.version.split()[0],
+        'platform': platform.platform(),
+        'torch': torch.__version__,
+        'numpy': np.__version__,
+        'cuda_available': bool(torch.cuda.is_available()),
+        'cuda_version': torch.version.cuda,
+        'cudnn_version': torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
+        'gpu_names': _gpu_names(),
+        'determinism': determinism_label(),
+        'cudnn_deterministic': bool(torch.backends.cudnn.deterministic),
+        'cudnn_benchmark': bool(torch.backends.cudnn.benchmark),
+        'deterministic_algorithms': bool(torch.are_deterministic_algorithms_enabled()),
+        'tf32_matmul': bool(torch.backends.cuda.matmul.allow_tf32) if torch.cuda.is_available() else None,
+        'tf32_cudnn': bool(torch.backends.cudnn.allow_tf32) if torch.cuda.is_available() else None,
+        'cpu_threads': int(torch.get_num_threads()),
+        'pythonhashseed': os.environ.get('PYTHONHASHSEED'),
+        'flags': {k: os.environ.get(k) for k in ('CSA_KERNEL', 'CSA_CKPT', 'CSA_DETERMINISTIC', 'CSA_CPU_THREADS', 'CUBLAS_WORKSPACE_CONFIG')},
+    }
+    for _mod, _key in (('tokenizers', 'tokenizers'), ('datasets', 'datasets')):
+        try:
+            env[_key] = __import__(_mod).__version__
+        except Exception:
+            env[_key] = None
+    return env
+
+def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
+    """Everything needed to identify a panel: code version (semantic stamp
+    + git commit), environment, and the exact data bytes seen."""
+    data = {'dataset': cfg.get('dataset') or 'wikitext', 'requested_train_tokens': cfg.get('n_train_tokens'), 'seq_len': cfg.get('seq_len')}
+    if train_ids is not None:
+        data['train_tokens'] = int(len(train_ids))
+        data['train_fp'] = _ids_fp(train_ids)
+    if val_batch is not None:
+        _vb = np.ascontiguousarray(val_batch).reshape(-1)
+        data['val_sequences'] = int(np.asarray(val_batch).shape[0])
+        data['val_fp'] = _ids_fp(_vb)
+    if vocab is not None:
+        data['vocab_size'] = int(vocab)
+    return {'code': {'code_semantics': CODE_SEMANTICS, 'code_stamp': code_stamp(), 'kernel_stamp': _kernel_stamp(), **_git_provenance()}, 'environment': environment_snapshot(), 'data': data}
+
+def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_ratio):
+    """Structured hyper-parameter record (the run_cfg string stays the
+    pairing gate; this is the human/machine-readable copy)."""
+    hp = {str(k): _jsonable(v) for k, v in cfg.items() if k not in ('seeds', 'variants', 'outdir')}
+    hp.update({
+        'seed': int(seed),
+        'data_seed': int(seed),
+        'd': int(d),
+        'n_layers': int(n_layers),
+        'n_heads': int(n_heads),
+        'd_head': int(d_head),
+        'vocab_size': int(vocab),
+        'mlp_ratio': float(mlp_ratio),
+        'dataset': cfg.get('dataset') or 'wikitext',
+        'train_knobs': training_knobs(),
+    })
+    return hp
+
+def write_run_manifest(outdir, cfg, run_cfg, prov, summary):
+    """Merge one panel's provenance/config/outcome summary into
+    `outdir/run_manifest.json` under the same flock used by summary.json.
+
+    The per-record `losses` / `ppl_history` curves stay in summary.json (to
+    avoid duplicating large arrays); each manifest cell points at its key."""
+    os.makedirs(outdir, exist_ok=True)
+    cells = {}
+    for seed in cfg.get('seeds') or []:
+        for v in cfg.get('variants') or []:
+            key = f'{v}::seed{seed}'
+            rec = summary.get(key)
+            if not isinstance(rec, dict) or not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
+                continue
+            cells[key] = {
+                'variant': v,
+                'seed': int(seed),
+                'ppl': rec.get('ppl'),
+                'steps': rec.get('steps'),
+                'tokens_seen': rec.get('tokens_seen'),
+                'params': rec.get('params'),
+                'train_time_s': rec.get('train_time_s'),
+                'final_loss_smoothed': rec.get('final_loss_smoothed'),
+                'rng_fp': rec.get('rng_fp'),
+                'code_stamp': rec.get('_code'),
+                'curve_ref': f'summary.json#{key}.losses',
+                'ppl_history_ref': f'summary.json#{key}.ppl_history',
+            }
+    entry = {
+        'run_cfg': run_cfg,
+        'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'config': _jsonable(cfg),
+        'provenance': prov,
+        'cells': cells,
+    }
+    path = os.path.join(outdir, 'run_manifest.json')
+
+    def _merge(m):
+        if not isinstance(m, dict):
+            m = {}
+        m['manifest_version'] = m.get('manifest_version') or 1
+        m.setdefault('panels', {})[run_cfg] = entry
+        return m
+    locked_json_update(path, _merge)
+    return path
 
 @torch.inference_mode()
 def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
@@ -4984,6 +5190,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if steps < 1:
         raise ValueError(f'train_variant needs steps >= 1, got steps={steps}')
     set_seed(seed)
+    _rng_fp = rng_fingerprint()
     _attb_bump_epoch()
     if variant in PARAM_MATCHED | PARAM_MATCHED_V7 and float(mlp_ratio) == 4.0:
         raise ValueError(f'{variant} is a PARAM-MATCHED baseline but was given the default mlp_ratio=4; its MLP must be widened to match its sparse reference arm, or the comparison is not parameter-controlled. Pass mlp_ratio=variant_mlp_ratio(variant, vocab, d=..., n_layers=..., n_heads=..., d_head=..., seq_len=...).')
@@ -5096,7 +5303,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs()}
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids)}
     if return_model:
         result['_model'] = model
     else:
@@ -5106,6 +5313,177 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if device.type == 'cuda':
         torch.cuda.empty_cache()
     return result
+
+@torch.no_grad()
+def _lm_batch_metrics(model, x, y, vocab, chunk=64):
+    """Mean cross-entropy and next-token accuracy on one fixed batch."""
+    was_training = model.training
+    model.eval()
+    try:
+        h = model.trunk(x)
+        total = 0.0
+        correct = 0
+        n = 0
+        for s in range(0, x.shape[1], chunk):
+            sl = slice(s, min(s + chunk, x.shape[1]))
+            lg = model.head(h[:, sl, :])
+            tg = y[:, sl]
+            total += float(F.cross_entropy(lg.reshape(-1, vocab), tg.reshape(-1), reduction='sum'))
+            correct += int((lg.argmax(-1) == tg).sum())
+            n += int(tg.numel())
+        return (total / max(n, 1)), (correct / max(n, 1))
+    finally:
+        model.train(was_training)
+
+def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256, train_ids=None, device=None, target_loss=0.05, target_acc=0.99, mlp_ratio=None, grad_clip=1.0):
+    """Small-batch overfit sanity check (necessary, not sufficient).
+
+    Take ONE fixed batch (sampled once from `train_ids`, or synthetic ids when
+    none is supplied), disable every regulariser (weight decay = 0, the
+    compression penalty = 0; the model has no dropout), and optimise only that
+    batch.  A correct training path drives the LM loss towards 0 and the
+    next-token accuracy towards 100%.  Failure means a serious plumbing bug
+    (loss not connected to the graph, gradients not applied, wrong labels,
+    etc.) — do NOT launch a full run until it passes.
+
+    Passing does NOT prove the data pipeline / augmentation / label mapping is
+    correct, so keep the intermediate-result checks as well.
+
+    Returns a JSON-safe report; `passed` is False when any criterion fails.
+    """
+    if int(d) != int(n_heads) * int(d_head):
+        raise ValueError(f'overfit_sanity_check: d={d} must equal n_heads*d_head={n_heads}*{d_head}')
+    device = DEVICE if device is None else device
+    set_seed(seed)
+    _rng_fp = rng_fingerprint()
+    if train_ids is not None:
+        arr = np.asarray(train_ids)
+        if arr.ndim != 1:
+            raise ValueError('overfit_sanity_check: train_ids must be one-dimensional')
+        if len(arr) < seq_len + 1:
+            raise ValueError(f'overfit_sanity_check: need at least seq_len+1={seq_len + 1} tokens, got {len(arr)}')
+        _rng = np.random.default_rng(int(seed))
+        _hi = len(arr) - seq_len
+        starts = _rng.integers(0, _hi, size=int(batch_size))
+        chunk = np.stack([arr[int(s):int(s) + seq_len + 1] for s in starts]).astype(np.int64, copy=False)
+        _data_fp = _ids_fp(chunk.reshape(-1))
+    else:
+        _rng = np.random.default_rng(int(seed))
+        chunk = _rng.integers(0, max(int(vocab), 1), size=(int(batch_size), seq_len + 1), dtype=np.int64)
+        _data_fp = _ids_fp(chunk.reshape(-1))
+    ids_full = torch.from_numpy(chunk).to(device)
+    x, y = ids_full[:, :-1], ids_full[:, 1:]
+    if mlp_ratio is None:
+        mlp_ratio = variant_mlp_ratio(variant, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=seq_len, matched=PARAM_MATCHED | PARAM_MATCHED_V7)
+    cfgs = make_layer_cfgs(n_layers, variant)
+    model = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
+    _p_before = torch.cat([p.detach().reshape(-1) for p in model.parameters()]).clone()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, weight_decay=0.0, foreach=True)
+    initial_loss, initial_acc = _lm_batch_metrics(model, x, y, vocab)
+    loss_curve = []
+    acc_curve = []
+    grad_norm = float('nan')
+    grad_finite = True
+    n_grad_none = 0
+    model.train()
+    for step in range(int(steps)):
+        ce = model.ce_loss(x, y, vocab)
+        opt.zero_grad(set_to_none=True)
+        ce.backward()
+        _gs = []
+        _none = 0
+        for _n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.grad is None:
+                _none += 1
+                continue
+            _gs.append(p.grad.detach())
+        if _gs:
+            grad_norm = math.sqrt(sum((float(g.double().pow(2).sum()) for g in _gs)))
+            grad_finite = all(bool(torch.isfinite(g).all()) for g in _gs)
+        else:
+            grad_norm = 0.0
+            grad_finite = False
+        n_grad_none = _none
+        if grad_clip:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+        opt.step()
+        _l = float(ce.detach())
+        loss_curve.append(_l)
+        if (step + 1) % max(1, int(steps) // 20) == 0 or step == int(steps) - 1:
+            _a = _lm_batch_metrics(model, x, y, vocab)[1]
+            acc_curve.append([step + 1, _a])
+        if _l != _l or not math.isfinite(_l):
+            break
+    final_loss, final_acc = _lm_batch_metrics(model, x, y, vocab)
+    _p_after = torch.cat([p.detach().reshape(-1) for p in model.parameters()])
+    params_changed = not bool(torch.equal(_p_before, _p_after))
+    best_loss = min(loss_curve) if loss_curve else float('nan')
+    passed = bool(math.isfinite(final_loss) and final_loss <= float(target_loss) and final_acc >= float(target_acc) and grad_finite and params_changed and math.isfinite(best_loss) and best_loss <= float(target_loss))
+    report = {
+        'kind': 'small_batch_overfit_sanity',
+        'variant': variant,
+        'seed': int(seed),
+        'steps': int(steps),
+        'lr': float(lr),
+        'batch_shape': [int(batch_size), int(seq_len)],
+        'vocab_size': int(vocab),
+        'data_source': 'train_ids' if train_ids is not None else 'synthetic',
+        'data_fp': _data_fp,
+        'rng_fp': _rng_fp,
+        'regularization': {'weight_decay': 0.0, 'comp_lambda': 0.0, 'dropout': 0.0, 'augmentation': 'none'},
+        'initial_loss': float(initial_loss),
+        'initial_accuracy': float(initial_acc),
+        'final_loss': float(final_loss),
+        'final_accuracy': float(final_acc),
+        'best_loss': float(best_loss),
+        'loss_curve': [float(v) for v in loss_curve],
+        'accuracy_curve': acc_curve,
+        'grad_norm_last': float(grad_norm),
+        'grad_all_finite': bool(grad_finite),
+        'params_without_grad': int(n_grad_none),
+        'params_changed': bool(params_changed),
+        'target_loss': float(target_loss),
+        'target_accuracy': float(target_acc),
+    }
+    report['passed'] = passed
+    report['diagnosis'] = 'ok' if passed else ('no/finite gradients or parameters did not update' if not (grad_finite and params_changed) else 'loss did not converge on a single repeated batch')
+    del model, opt, ids_full, x, y
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    return report
+
+_OVERFIT_GUARD = {}
+
+def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, vocab=1024, train_ids=None, force=False, target_loss=0.05, target_acc=0.99):
+    """Run `overfit_sanity_check` once per variant per process and hard-stop
+    on failure.  Called automatically by `run()` before the first panel and by
+    the length/checkpoint phases, so every training driver inherits the check.
+
+    `CSA_SKIP_OVERFIT=1` is the explicit escape hatch (e.g. a debugging box
+    with a deliberately broken batch); it prints a loud skip line instead.
+    Passing is necessary, not sufficient."""
+    if os.environ.get('CSA_SKIP_OVERFIT', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        print('[overfit] guard SKIPPED (CSA_SKIP_OVERFIT is set) — this run has no small-batch safety check')
+        return []
+    src = 'data' if train_ids is not None else 'synthetic'
+
+    def _known(v):
+        return any(((v, 'data') in _OVERFIT_GUARD, (v, 'synthetic') in _OVERFIT_GUARD))
+    todo = [v for v in variants if force or not _known(v)]
+    if not todo:
+        return []
+    reports = []
+    for v in todo:
+        r = overfit_sanity_check(v, seed=seed, steps=steps, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=train_ids, target_loss=target_loss, target_acc=target_acc)
+        _OVERFIT_GUARD[(v, src)] = bool(r['passed'])
+        reports.append(r)
+        print(f"[overfit] {v:<24} loss {r['initial_loss']:.3f} -> {r['final_loss']:.4f}  acc {r['final_accuracy'] * 100:.1f}%  grad_finite={r['grad_all_finite']}  params_changed={r['params_changed']}  {'PASS' if r['passed'] else 'FAIL'}")
+        if not r['passed']:
+            raise RuntimeError(f'small-batch overfit sanity check FAILED for `{v}` ({r["diagnosis"]}) — do NOT start or continue this run; this points at a gradient/loss/label plumbing bug.  Inspect the returned report and set CSA_SKIP_OVERFIT=1 only if you deliberately accept the risk.')
+    return reports
 
 class TimeGuard:
     BASE = (256, 6, 512, 12)
@@ -6073,7 +6451,7 @@ def _plan_run(cfg, summary_path, fp):
     return cells, stale_dropped
 
 
-def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None, val_batch=None, vocab=None, val_bnd=None, prebook=False):
+def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None, val_batch=None, vocab=None, val_bnd=None, prebook=False, prov=None):
     """Run exactly ONE (variant, seed) training cell and merge its record into
     outdir/summary.json under the lock.
 
@@ -6123,6 +6501,8 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
     try:
         try:
             rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts)
+            _prov = prov if prov is not None else experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
+            _hp = run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v])
 
             def _apply(summary):
                 if rec.get('cap_truncated'):
@@ -6135,6 +6515,10 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                     rec['run_cfg'] = fp
                     rec['_code'] = f'{CODE_SEMANTICS}{_kernel_stamp()}'
                     assert fp.endswith(f'_cs{rec['_code']}'), (fp, rec['_code'])
+                    rec['provenance'] = _prov
+                    rec['hyperparams'] = _hp
+                    rec['data_fp'] = _prov['data'].get('train_fp')
+                    rec['val_fp'] = _prov['data'].get('val_fp')
                     summary[key] = rec
                 return summary
             locked_json_update(summary_path, _apply)
@@ -6209,6 +6593,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     d_head = cfg.get('d_head', 32)
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
+    overfit_guard(cfg.get('variants') or [])
     _attb_bump_epoch()
     t_data = time.time()
     train_ids, val_batch, vocab, _, val_bnd = load_run_corpus(cfg)
@@ -6221,6 +6606,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     if torch.cuda.is_available():
         _pin_cuda_determinism()
     fp = _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch)
+    prov = experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
     cells, stale_dropped = _plan_run(cfg, summary_path, fp)
     dropped_truncations = []
     ratios = {}
@@ -6244,7 +6630,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             _ran_parallel = True
     if not _ran_parallel:
         for v, seed in cells:
-            res = _run_cell(cfg, v, seed, guard=guard, ratios=ratios, fp=fp, train_ids=train_ids, val_batch=val_batch, vocab=vocab, val_bnd=val_bnd)
+            res = _run_cell(cfg, v, seed, guard=guard, ratios=ratios, fp=fp, train_ids=train_ids, val_batch=val_batch, vocab=vocab, val_bnd=val_bnd, prov=prov)
             if res.get('truncated'):
                 dropped_truncations.append(res['key'])
     summary = _read_summary_json(summary_path)
@@ -6260,6 +6646,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             print(f'    {_k}')
         if len(_still) != len(stale_dropped):
             print(f'    ({len(stale_dropped) - len(_still)} of them succeeded and carry a fresh record.)')
+    write_run_manifest(outdir, cfg, fp, prov, summary)
     _finish_panel(outdir, summary)
     return (summary, None)
 

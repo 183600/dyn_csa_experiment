@@ -144,7 +144,32 @@ def run_data():
     print(f'\n[m0-data] cache READY: train tokens = {len(train_ids):,}  vocab = {vocab}  val sequences = {val_batch.shape[0]}  (built/verified in {dt / 60:.1f} min)')
     print(f'[m0-data] 供 full / smoke 直接复用；离线重建用 FWEDU_LOCAL_JSONL，换 cap 用 M0_TOKENS（新 cap = 新缓存文件，旧面板指纹不受影响）')
 
+def run_overfit_check(variants=None, steps=250):
+    """Pre-flight small-batch overfit check on synthetic ids (independent of
+    the corpus, so it cannot be blocked by a 5B-token cache build).  A failure
+    is a hard stop before any panel is allowed to start."""
+    variants = list(variants or L.B_ARMS)
+    print(f'\n[overfit] small-batch sanity check: {len(variants)} variant(s), wd=0, comp_lambda=0, no augmentation')
+    reports = L.overfit_guard(variants, steps=int(steps), vocab=256)
+    if not reports:
+        return []
+    ok = all(r['passed'] for r in reports)
+    os.makedirs('results_overfit_sanity_m0', exist_ok=True)
+    L.atomic_write_json('results_overfit_sanity_m0/overfit_sanity.json', {
+        'kind': 'small_batch_overfit_sanity_panel',
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'passed': ok,
+        'provenance': L.experiment_provenance({'dataset': 'synthetic', 'n_train_tokens': 0, 'seq_len': 32}),
+        'reports': reports,
+    })
+    if not ok:
+        _bad = [r['variant'] for r in reports if not r['passed']]
+        raise RuntimeError(f'small-batch overfit sanity check FAILED for {_bad} — do NOT start training; inspect results_overfit_sanity_m0/overfit_sanity.json')
+    print('[overfit] PASSED (necessary, not sufficient)')
+    return reports
+
 def run_smoke():
+    run_overfit_check()
     seq = int(os.environ.get('M0_SMOKE_SEQ') or L.RUN_S1['seq_len'])
     steps = int(os.environ.get('M0_SMOKE_STEPS') or 12)
     smoke_cfg = dict(L.RUN_S1, d=64, n_layers=2, n_heads=4, d_head=16, batch_size=1, seq_len=seq, steps=steps, warmup=2, eval_every=max(steps // 2, 1), eval_subset=2, val_seqs=2, n_train_tokens=int(os.environ.get('M0_SMOKE_TOKENS') or 200000), fw_fit_docs=int(os.environ.get('M0_SMOKE_FIT_DOCS') or 400), seeds=[0], outdir='results_smoke_m0', variants=['full', 'csa_fixed', 'csa_dynamic'])
@@ -161,6 +186,7 @@ def run_smoke():
         print(f'\n[smoke] FAILED: no usable PPL was measured for {_bad} — the B-tier path (fineweb corpus / seq-{seq} geometry) is degraded; results_smoke_m0/ is KEPT for inspection instead of being deleted.')
         sys.exit(1)
     shutil.rmtree('results_smoke_m0', ignore_errors=True)
+    shutil.rmtree('results_overfit_sanity_m0', ignore_errors=True)
     print(f'\n[smoke] PASSED — fineweb 数据路径与 seq-{seq} 的稠密/固定/动态三条注意力路径端到端可用；smoke 输出已删除，未触碰任何实验目录。')
 
 def run_kernel():
@@ -234,6 +260,7 @@ def run_kernel():
 
 
 def run_full():
+    run_overfit_check()
     panel = (os.environ.get('M0_PANEL') or 'S1').strip().upper()
     if panel not in ('S1', 'S2'):
         print(f"[m0] unknown M0_PANEL {panel!r}; expected 'S1' or 'S2'.  Nothing was started.")

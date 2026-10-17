@@ -1630,6 +1630,8 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     batch_size = payload.get('batch_size', 12)
     spath = os.path.join(outdir, 'summary.json')
     out = {'status': 'ok', 'key': f'{v}::seed{seed}', 'variant': v, 'seed': seed}
+    _prov_cfg = {'dataset': 'wikitext', 'n_train_tokens': 8000000, 'seq_len': train_len}
+    _tr = None
     need = max(eval_lens) + 1
     if val_ids is None:
         val_ids = L.load_wikitext(max(train_len, need), 4000000)[1]
@@ -1747,7 +1749,21 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             except (TypeError, ValueError):
                 continue
         _merged.update(r)
-        summary[key] = {'variant': v, 'seed': seed, 'params': _ckp['params'], 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE}
+        _rec = {'variant': v, 'seed': seed, 'params': _ckp['params'], 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE}
+        try:
+            _prov = L.experiment_provenance(_prov_cfg, train_ids=(train_ids if _tr is not None else None), val_batch=val_ids, vocab=vocab)
+            _rec['provenance'] = _prov
+            _rec['hyperparams'] = L.run_hyperparameters({'steps': steps, 'n_train_tokens': _prov_cfg['n_train_tokens'], 'seq_len': train_len, 'batch_size': batch_size, 'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 50, 'comp_lambda': 0.05, 'delta_lr_mult': 10.0}, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, vocab=vocab, mlp_ratio=mr)
+            _rec['data_fp'] = _prov['data'].get('train_fp') or _prov['data'].get('val_fp')
+            _rec['val_fp'] = _prov['data'].get('val_fp')
+            if _tr is not None:
+                _rec['rng_fp'] = _tr.get('rng_fp')
+                _rec['losses'] = _tr.get('losses')
+                _rec['ppl_history'] = _tr.get('ppl_history')
+                _rec['train_knobs'] = _tr.get('train_knobs')
+        except Exception as _pe:
+            print(f'[p1l] WARNING: could not attach provenance to {key} ({type(_pe).__name__}: {_pe})')
+        summary[key] = _rec
         print(f'  [p1l] {v:18s} s{seed} ' + '  '.join((f'L{k}={vv.get('ppl', float('nan')):.2f}' for k, vv in sorted(_merged.items()))))
         return summary
     L.locked_json_update(spath, _merge)
@@ -1769,6 +1785,7 @@ def run_lenphase(payload, guard=None, label='', par=None):
     ckpt_dir = os.path.join(outdir, 'ckpt')
     os.makedirs(ckpt_dir, exist_ok=True)
     variants = payload['variants']
+    L.overfit_guard(list(variants))
     eval_lens = payload['eval_lens']
     seeds = list(payload.get('seeds', [0, 1, 2]))
     steps = payload.get('steps', 3000)
