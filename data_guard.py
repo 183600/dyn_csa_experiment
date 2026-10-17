@@ -294,7 +294,11 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
         blocks = []
         start = 0
         for size in sizes:
-            blocks.append(np.sort(order[start:start + size]))
+            # Preserve the chronological order: the caller indexes its data
+            # with these arrays, so sorting the row indices would silently
+            # return each split in original row order (e.g. val times
+            # [7, 6]) instead of time order.
+            blocks.append(order[start:start + size].copy())
             start += size
         return dict(zip(SPLIT_NAMES, blocks))
     return chronological_split_indices(

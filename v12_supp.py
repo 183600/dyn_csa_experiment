@@ -425,7 +425,12 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
         # regenerated at the same path under the same code/recipe would
         # otherwise be silently evaluated by the old record's numbers.
         _rec_sha = rec.get('ckpt_sha256')
-        if _rec_sha is not None and _ck_sha is not None and _rec_sha != _ck_sha:
+        # When the current checkpoint can be hashed, the record must carry the
+        # SAME hash.  A record with no stored hash (written when hashing was
+        # unavailable, or before this binding existed) cannot be shown to
+        # belong to the weights now on disk, so it is re-evaluated rather than
+        # silently resumed.
+        if _ck_sha is not None and _rec_sha != _ck_sha:
             return True
         bl = rec.get('by_len') or {}
         return not all((L.by_len_cells([rec], Ln) for Ln in eval_lens))

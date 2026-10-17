@@ -287,6 +287,17 @@ def _probe_fingerprint(cfg):
     _tl = int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
     return {'n_seq': int(cfg['n_seq']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'val_seq_len': max(_tl, _need), 'stat': 'ppl_pooled_nll_v5'}
 
+def _probe_fp_for_mode(fp, cfg, mode):
+    """Add the parameters a corruption mode actually consumes.
+
+    `span` corruption changes with `span_len`; the historical probe_params for
+    every other mode are kept byte-identical so their resume stays valid.
+    Without this, changing span_len would silently reuse measurements made
+    with the old span geometry."""
+    if mode == 'span':
+        return dict(fp, span_len=int(cfg.get('span_len') or PROBE_SPAN_LEN))
+    return fp
+
 def _fp_norm(p):
     if not isinstance(p, dict):
         return p
@@ -324,11 +335,16 @@ def _probe_defs(cfg):
 def _niah_cell_key(v, seed, arm, Ln, cond):
     return f'{v}::s{seed}::{arm}::L{Ln}::niah::{cond}'
 
-def _niah_fingerprint(cfg):
+def _niah_fingerprint(cfg, condition=None):
     _n = cfg.get('niah') or {}
     _need = max((int(_x) for _x in cfg['eval_lens'])) + 1
     _tl = int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
-    return {'n_seq': int(_n.get('n_seq', cfg['n_seq'])), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'n_pairs': int(_n.get('n_pairs', 8)), 'val_seq_len': max(_tl, _need), 'stat': 'niah_natural_v1'}
+    fp = {'n_seq': int(_n.get('n_seq', cfg['n_seq'])), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'n_pairs': int(_n.get('n_pairs', 8)), 'val_seq_len': max(_tl, _need), 'stat': 'niah_natural_v1'}
+    if condition == 'distract':
+        # The distractor condition's corruption density is part of the
+        # measurement; the clean condition does not read rho.
+        fp['dist_rho'] = float(_n.get('rho', 0.5))
+    return fp
 
 def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, condition, rho=0.5):
     """Far-necessary-information task on NATURAL text (review point 3).
@@ -514,12 +530,14 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     _fp = _probe_fingerprint(_pcfg)
     _niah_cfg = cfg.get('niah') or None
     _nspath = _niah_cfg.get('summary') if _niah_cfg else None
-    _nfp = _niah_fingerprint(_pcfg) if _niah_cfg else None
     _nconds = list(_niah_cfg.get('conditions', ['clean', 'distract'])) if _niah_cfg else []
 
-    def _niah_stale(_key, _summary_n):
+    def _niah_fp_of(_cond):
+        return _niah_fingerprint(_pcfg, condition=_cond)
+
+    def _niah_stale(_key, _summary_n, _fp_n=None):
         _rec = (_summary_n or {}).get(_key)
-        return not (isinstance(_rec, dict) and (_rec.get('task') == 'niah_natural') and (isinstance(_rec.get('acc'), (int, float)) and (not isinstance(_rec.get('acc'), bool)) and math.isfinite(float(_rec['acc']))) and (isinstance(_rec.get('nll'), (int, float)) and (not isinstance(_rec.get('nll'), bool)) and math.isfinite(float(_rec['nll']))) and _rec.get('_code') == V.CKPT_CODE and _rec.get('probe_params') == _nfp and _rec.get('recipe') == _ck_recipe)
+        return not (isinstance(_rec, dict) and (_rec.get('task') == 'niah_natural') and (isinstance(_rec.get('acc'), (int, float)) and (not isinstance(_rec.get('acc'), bool)) and math.isfinite(float(_rec['acc']))) and (isinstance(_rec.get('nll'), (int, float)) and (not isinstance(_rec.get('nll'), bool)) and math.isfinite(float(_rec['nll']))) and _rec.get('_code') == V.CKPT_CODE and _rec.get('probe_params') == (_niah_fp_of('clean') if _fp_n is None else _fp_n) and _rec.get('recipe') == _ck_recipe)
     _summary = L.locked_json_read(spath)
     _summary_n = L.locked_json_read(_nspath) if _nspath else {}
     _todo = False
@@ -527,13 +545,13 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         if not _arm_of(v, arm, cfg):
             continue
         for Ln, rho, mode in _defs:
-            if _cell_stale(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}' + (f'::{mode}' if mode != 'uniform' else ''), _fp, _summary, mode):
+            if _cell_stale(f'{v}::s{seed}::{arm}::L{Ln}::r{rho}' + (f'::{mode}' if mode != 'uniform' else ''), _probe_fp_for_mode(_fp, _pcfg, mode), _summary, mode):
                 _todo = True
                 break
         if (not _todo) and _nspath:
             for Ln in cfg['eval_lens']:
                 for cond in _nconds:
-                    if _niah_stale(_niah_cell_key(v, seed, arm, Ln, cond), _summary_n):
+                    if _niah_stale(_niah_cell_key(v, seed, arm, Ln, cond), _summary_n, _niah_fp_of(cond)):
                         _todo = True
                         break
                 if _todo:
@@ -561,14 +579,14 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             if _mode != 'uniform':
                 _k += f'::{_mode}'
             return _k
-        _stale_param = [f'L{Ln}::r{rho}::{mode}' for Ln, rho, mode in _defs if (_summary.get(_cell_key(Ln, rho, mode)) or {}).get('probe_params') is not None and (not _probe_params_current(_summary.get(_cell_key(Ln, rho, mode)), _fp, mode))]
+        _stale_param = [f'L{Ln}::r{rho}::{mode}' for Ln, rho, mode in _defs if (_summary.get(_cell_key(Ln, rho, mode)) or {}).get('probe_params') is not None and (not _probe_params_current(_summary.get(_cell_key(Ln, rho, mode)), _probe_fp_for_mode(_fp, _pcfg, mode), mode))]
         if _stale_param:
             print(f'[p3mp] {v} s{seed} {arm}: re-probing {len(_stale_param)} cell(s) whose stored probe parameters differ from the current config ({', '.join(_stale_param[:3])}{('…' if len(_stale_param) > 3 else '')})')
         _stale_w = [f'L{Ln}::r{rho}::{mode}' for Ln, rho, mode in _defs if (_summary.get(_cell_key(Ln, rho, mode)) or {}).get('ppl_mean') is not None and (_summary.get(_cell_key(Ln, rho, mode)) or {}).get('recipe') != _ck_recipe]
         if _stale_w:
             print(f'[p3mp] {v} s{seed} {arm}: re-probing {len(_stale_w)} cell(s) that were measured under different weights (stored recipe does not match the current checkpoint) — reusing them would quote the old weights')
-        cells = [(Ln, rho, mode) for Ln, rho, mode in _defs if _cell_stale(_cell_key(Ln, rho, mode), _fp, _summary, mode)]
-        _niah_cells = [(Ln, cond) for Ln in cfg['eval_lens'] for cond in _nconds if _niah_stale(_niah_cell_key(v, seed, arm, Ln, cond), _summary_n)] if _nspath else []
+        cells = [(Ln, rho, mode) for Ln, rho, mode in _defs if _cell_stale(_cell_key(Ln, rho, mode), _probe_fp_for_mode(_fp, _pcfg, mode), _summary, mode)]
+        _niah_cells = [(Ln, cond) for Ln in cfg['eval_lens'] for cond in _nconds if _niah_stale(_niah_cell_key(v, seed, arm, Ln, cond), _summary_n, _niah_fp_of(cond))] if _nspath else []
         if not cells and not _niah_cells:
             continue
         if model is None:
@@ -591,7 +609,8 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             nll_sum, n_tok = _distractor_ppls(model, val_ids, Ln, rho, _pcfg['n_seq'], _pcfg, row_cache=_row_cache, chunk_mem=_chunk_mem, mode=mode)
             cell_ppl = _cell_ppl(nll_sum, n_tok)
             per_seq = [float('inf') if s / t > 709.0 else math.exp(s / t) for s, t in zip(nll_sum, n_tok)]
-            _fp_rec = dict(_fp, mode=mode) if mode != 'uniform' else _fp
+            _fp_base = _probe_fp_for_mode(_fp, _pcfg, mode)
+            _fp_rec = dict(_fp_base, mode=mode) if mode != 'uniform' else _fp_base
             _pending[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp_rec, 'recipe': _ck_recipe}
             _log_metrics[key] = {'ppl_mean': float(cell_ppl), 'n_seq': len(per_seq)}
             print(f'  [p3mp] {key:44s} PPL={cell_ppl:8.2f}', flush=True)
@@ -603,7 +622,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         for Ln, cond in _niah_cells:
             res = _niah_ppls(model, val_ids, Ln, _pcfg['n_seq'], _pcfg, cond, row_cache=_row_cache, chunk_mem=_chunk_mem)
             key = _niah_cell_key(v, seed, arm, Ln, cond)
-            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), '_code': V.CKPT_CODE, 'probe_params': _nfp, 'recipe': _ck_recipe}
+            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), '_code': V.CKPT_CODE, 'probe_params': _niah_fp_of(cond), 'recipe': _ck_recipe}
             L.locked_json_update(_nspath, (lambda s, _p=dict({key: rec}): (s.update(_p), s)[1]), indent=1)
             _log_metrics[key] = {'acc': float(rec['acc']), 'nll': float(rec['nll']), 'n_queries': int(rec['n_queries'])}
             print(f"  [niah] {key:48s} acc={rec['acc']:.3f} nll={rec['nll']:.3f}", flush=True)

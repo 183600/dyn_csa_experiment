@@ -131,8 +131,11 @@ def _relaxed_pair_reason(a, b, tuned_arms):
     tuned-vs-tuned contrasts must not be silently pooled.
     """
     for k in ('steps', 'tokens_seen', 'data_fp', 'val_fp'):
-        if a.get(k) is not None and b.get(k) is not None and a.get(k) != b.get(k):
-            return f'{k} differs ({a.get(k)!r} vs {b.get(k)!r})'
+        _va, _vb = a.get(k), b.get(k)
+        if _va is None or _vb is None:
+            return f'unverifiable {k} (at least one record omits it)'
+        if _va != _vb:
+            return f'{k} differs ({_va!r} vs {_vb!r})'
     # Tuning may change lr/wd/warmup, but it must never silently change the
     # optimizer, betas/eps, LR-schedule shape, grad-clip or augmentation.  The
     # strict `pair_reason` already enforces this for architecture contrasts;

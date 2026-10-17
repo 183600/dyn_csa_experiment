@@ -922,6 +922,26 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
     return dqI, dkI, dw
 
 
+_SHAPE_FALLBACK_WARNED = set()
+
+
+def _warn_shape_fallback(op, detail):
+    key = (str(op), str(detail))
+    if key in _SHAPE_FALLBACK_WARNED:
+        return
+    _SHAPE_FALLBACK_WARNED.add(key)
+    print(f'[kernel] {op}: {detail} — falling back to the torch-reference backend for this shape '
+          '(the reference twin implements the same algorithm; values are the same up to the '
+          'declared backend tolerance)')
+
+
+def _indexer_impl_for_shape(impl, kI):
+    if impl == 'triton' and int(kI.shape[1]) > 8192:
+        _warn_shape_fallback('indexer', f'Bm={int(kI.shape[1])} exceeds the Triton register/lane limit 8192')
+        return 'ref'
+    return impl
+
+
 class FusedIndexer(torch.autograd.Function):
     """索引打分 + top-k 选择的可微封装：idx/valid 不可微（离散选择），
     soft 的梯度经 _indexer_bwd_ref 回传到 qI / kI / w。"""
@@ -934,6 +954,7 @@ class FusedIndexer(torch.autograd.Function):
         # is False inside a custom autograd Function's forward, so it cannot
         # detect that a backward will be built.
         need_soft = bool(need_soft) or any(ctx.needs_input_grad[1:4])
+        impl = _indexer_impl_for_shape(impl, kI)
         if impl == 'triton':
             idx, valid, soft = _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=need_soft)
         else:
@@ -1236,6 +1257,16 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
 # 算子 3 的可微封装 + 公共入口
 # ============================================================================
 
+def _attn_impl_for_shape(impl, q, w):
+    if impl != 'triton':
+        return impl
+    hd = int(q.shape[-1])
+    if int(w) < 1 or hd < 16 or (hd & (hd - 1)) != 0:
+        _warn_shape_fallback('attention', f'w={int(w)}, hd={hd} require w >= 1 and a power-of-two hd >= 16')
+        return 'ref'
+    return impl
+
+
 class FusedSparseAttention(torch.autograd.Function):
     """稀疏注意力的可微封装：前向 = A 路径（与 eager 的直通估计器前向值
     严格一致）；反向按 _attn_bwd_ref 的 A+S 双路分解（triton 后端为同公式
@@ -1243,6 +1274,7 @@ class FusedSparseAttention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, impl, q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale):
+        impl = _attn_impl_for_shape(impl, q, w)
         if impl == 'triton':
             out = _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale)
         else:

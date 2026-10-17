@@ -1695,6 +1695,11 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     return idx_out
 
 _TOPK_CLAMP_WARNED = set()
+# Above this many elements an [T, B] causal/negated mask pair is no longer
+# retained on last_tok: the per-query-chunk form is value-identical and bounds
+# the transient to one chunk (the dynamic arms have B ~ T / block_size, so the
+# full table grows quadratically with sequence length).
+_READABLE_CACHE_MAX_ELEMS = 4 << 20
 
 def _pool_ends_host(bid):
     # 宿主侧「块结束位置（独占）」表：cumsum 的分段器 counts（_pool_cpu[0]）。
@@ -1738,25 +1743,35 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     pos = _arange_cache(n, dev)
     # causal (and its negation) are exact bool functions of (pos, last_tok).
     # The fixed segmenter's pooled last_tok is ONE shared cached tensor read
-    # by every row/layer/step, so the pair is cached on that tensor object —
-    # the same bitwise-safe cache-on-immutable-object argument as
-    # _pool_parts/_pool_geom (design notes §6.2).  Both masks are only ever
-    # read downstream (masked_fill sources, no_grad selection); the dynamic
-    # per-row last_tok objects simply miss and rebuild (identical values).
+    # by every row/layer/step, so a SMALL pair is cached on that tensor object
+    # — the same bitwise-safe cache-on-immutable-object argument as
+    # _pool_parts/_pool_geom (design notes §6.2).  The table is [T, B] with
+    # B ~ T / block_size for the dynamic arms, i.e. quadratic in the sequence
+    # length; caching it at long context would retain gigabytes per last_tok
+    # object.  Above the element cap we therefore build the exact same mask
+    # per query chunk below (value-identical slices) and cache nothing.
     # Built outside inference mode so a pair first filled during eval can
     # still serve training (masked_fill_ saves the mask for backward).
     _rkey = (int(n), int(last_tok.shape[0]))
     _rc = getattr(last_tok, '_readable_cache', None)
+    _causal_full = _ncausal_full = None
     if _rc is not None and _rc[0] == _rkey:
-        causal, _ncausal = _rc[1:3]
-    else:
+        _causal_full, _ncausal_full = _rc[1:3]
+    elif int(n) * int(last_tok.shape[0]) <= _READABLE_CACHE_MAX_ELEMS:
         with torch.inference_mode(False):
-            causal = block_readable(pos, last_tok)
-            _ncausal = ~causal
+            _causal_full = block_readable(pos, last_tok)
+            _ncausal_full = ~_causal_full
         try:
-            last_tok._readable_cache = (_rkey, causal, _ncausal)
+            last_tok._readable_cache = (_rkey, _causal_full, _ncausal_full)
         except (AttributeError, RuntimeError):
             pass
+
+    def _causal_of(_s, _e):
+        if _causal_full is not None:
+            return _causal_full[_s:_e], _ncausal_full[_s:_e]
+        with torch.inference_mode(False):
+            _c = block_readable(pos[_s:_e], last_tok)
+        return _c, ~_c
     k = min(topk, B)
     if k < int(topk):
         _wk = (int(topk), int(B))
@@ -1839,7 +1854,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             out_dtype = c.dtype
             if need_soft:
                 soft = torch.empty(n, _kw, device=c.device, dtype=out_dtype)
-        _ccausal = causal[s:e]
+        _ccausal, _nccausal = _causal_of(s, e)
         with torch.no_grad():
             _box = []
             _ic = _indexer_selection(c, _ccausal, k, out_valid=_box)
@@ -1851,13 +1866,13 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             # gathered_attention 直通分支（该分支在无梯度下被 _soft_live 整体
             # 跳过）的唯一下游，故整条 soft 尾部不物化（不改变 idx 的任何
             # 整数，也不改变下游任何前向 bit）。
-            del c, _ic, _ccausal
+            del c, _ic, _ccausal, _nccausal
             if random_select:
                 del z
             else:
                 del raw
             continue
-        c.masked_fill_(_ncausal[s:e], float('-inf'))
+        c.masked_fill_(_nccausal, float('-inf'))
         _lse = torch.logsumexp(c, dim=-1, keepdim=True)
         # the gather output is fresh and nothing downstream needs the pre-subtract
         # values, so the subtraction runs in place (same kernel, same values, and
@@ -1866,7 +1881,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         # nan_to_num 必须出位：exp_ 的反向保存其输出张量，原地 nan_to_num_ 会
         # 改写该保存值、使 ExpBackward 的版本检查失败（反向报错）。
         soft[s:e] = torch.nan_to_num(c.gather(1, _ic.long()).sub_(_lse).exp_())
-        del c, _lse, _ic, _ccausal
+        del c, _lse, _ic, _ccausal, _nccausal
         if random_select:
             del z
         else:
@@ -1877,15 +1892,22 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     if return_mask:
         valid_cols = out_valid[0]
         with torch.no_grad():
-            # Build the (n, B) mask: only the valid selections are written
-            # (1.0 each; duplicate writes of the same cell are idempotent), so
-            # the values are bit-identical to the sentinel form's [.., :B]
-            # slice.
+            # Build the (n, B) mask chunk-by-chunk: only the valid selections
+            # are written (1.0 each; duplicate writes of the same cell are
+            # idempotent), and each chunk is masked with the same causal slice
+            # the full-table form would read.  The (n, B) result is the output
+            # itself; the transient [n, B] negation table is never materialised
+            # at long context.
             _il = idx.long()
-            _rows = _arange_cache(n, dev)[:, None].expand(n, _il.shape[1])
+            _ar = _arange_cache(n, dev)
             m = torch.zeros(n, B, device=dev, dtype=out_dtype)
-            m[_rows[valid_cols], _il[valid_cols]] = 1.0
-            m.masked_fill_(_ncausal, 0.0)
+            for _s in range(0, n, query_chunk):
+                _e = min(_s + query_chunk, n)
+                _vc = valid_cols[_s:_e]
+                _rows = _ar[_s:_e, None].expand(_e - _s, _il.shape[1])
+                m[_rows[_vc], _il[_s:_e][_vc]] = 1.0
+                _, _ncc = _causal_of(_s, _e)
+                m[_s:_e].masked_fill_(_ncc, 0.0)
     return (m, idx, soft)
 
 class _SinkWiden(torch.autograd.Function):
@@ -2006,12 +2028,13 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # unchanged.
     _arange_sel = (topk_l.shape[1] == last_tok.shape[0]
                    and topk_l is _IDX_CACHE.get((_dev_str(dev), 'arangeexp', int(n), int(topk_l.shape[1]))))
-    sel_blk_all = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
     # the keep mask and the [selected|window] valid mask are per-row functions of
     # the same inputs, so their full-width forms are bitwise identical to the
     # per-chunk forms; they are hoisted out of the chunk loop under
     # _FO_FULL_CAP_BYTES (the chunked fallback below covers very wide top-k
-    # sweeps).
+    # sweeps).  The full [n, k] block table itself is built ONLY in the
+    # full-width branch: building it before the size check would defeat the
+    # chunked fallback at long context (HCA has B ~ T / block_size).
     # `topk_distinct=True` asserts every row of topk_idx holds distinct block
     # ids (the read-everything HCA arm passes an arange expansion), in which
     # case first_occurrence_mask is provably all-True — the keep mask is then
@@ -2019,6 +2042,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _nb = int(topk_l.shape[1])
     _dedup = (not topk_distinct) and _nb > 1
     if _attn_full_width_ok(n, _nb, w, _dedup):
+        sel_blk_all = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
         keep_all = sel_valid
         if _dedup:
             _ddk_all = first_occurrence_mask(topk_l)
@@ -2032,7 +2056,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         nvalid_all = ~valid_all[:, None, :]
         anyrow_all = valid_all.any(-1) if sink_logits is None else None
     else:
-        keep_all = valid_all = nvalid_all = anyrow_all = None
+        sel_blk_all = keep_all = valid_all = nvalid_all = anyrow_all = None
     # The chunk-invariant dispatch is computed once, above the row-chunk
     # loop: which mask/validity source each chunk reads and which of the two
     # attention forms runs are pure functions of the call-level arguments.
@@ -2068,7 +2092,10 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         if _plan is not None:
             keep, nvalid, anyrow = _plan[s // q_chunk]
         else:
-            sel_blk = sel_blk_all[s:e]
+            # per-chunk form of the full-width table (same integers, same
+            # booleans; only the transient is bounded by q_chunk).
+            _lt_rows = last_tok[None, :] if _arange_sel else last_tok[topk_l[s:e]]
+            sel_blk = pos_all[s:e, None] > _lt_rows
             keep = None
             if _has_sv:
                 keep = sel_valid[s:e]
@@ -3652,10 +3679,21 @@ def _npy_serve_int32(path):
     # 缓存指纹也不变。
     mm = np.load(path, mmap_mode='r')
     src = np.asarray(mm)
-    if src.dtype in (np.uint8, np.uint16):
-        return np.array(src)
-    if src.dtype == np.int32:
-        return np.array(src)
+    if not np.issubdtype(src.dtype, np.integer):
+        raise TypeError(f'_npy_serve_int32: expected an integer token cache at {path}, got dtype {src.dtype}')
+    if src.dtype in (np.uint8, np.uint16, np.int32):
+        # Serve the memory-mapped view directly.  The corpus is read-only and
+        # every consumer gathers a batch at a time, so copying the whole cache
+        # into RAM (which doubles the resident corpus at 5B-60B tokens) is
+        # unnecessary; the returned values are identical.
+        return src
+    # Wider integer cache: narrow to int32 only after proving every id fits.
+    # A silent wrap (e.g. 2**32 + 5 -> 5) would pass the downstream
+    # vocab-range check for small vocabularies and corrupt the corpus.
+    if src.size:
+        _mn, _mx = int(src.min()), int(src.max())
+        if _mn < 0 or _mx > 2 ** 31 - 1:
+            raise ValueError(f'_npy_serve_int32: token ids in {path} span [{_mn}, {_mx}], outside the int32 transport range')
     out = np.empty(src.shape, dtype=np.int32)
     for s in range(0, src.size, 1 << 24):
         e = min(s + (1 << 24), src.size)
