@@ -1508,21 +1508,28 @@ def _rank_blocks(masked, B, ties, k=None):
         order = torch.sort(masked.flip(1), dim=1, stable=True, descending=True).indices
         return torch.sub(B - 1, order, out=order)
     src = masked.flip(1) if ties == 'latest' else masked
+    n, _ = src.shape
     kth = torch.topk(src, kk, dim=1, sorted=True).values[:, -1:]
-    gt = src > kth
-    eq = src == kth
     # gt has at most kk - 1 entries (the k-th value itself is not strictly
     # greater), so `need` is non-negative and selects exactly kk columns.
-    need = (kk - gt.sum(dim=1, keepdim=True)).clamp_min(0)
-    sel = gt | (eq & (eq.cumsum(dim=1) <= need))
-    rank = sel.cumsum(dim=1) - 1
-    n, _ = src.shape
+    # Prefix ranks are int32 (B < 2^31): the same exact integers as the int64
+    # form, at half the bytes, and the non-selected lanes are filled with the
+    # sentinel column in place instead of materialising another [n, B] table.
+    gt = src > kth
+    eq = src == kth
+    need = (kk - gt.sum(dim=1)).clamp_min(0).to(torch.int32)
+    eq_cum = torch.cumsum(eq, dim=1, dtype=torch.int32)
+    sel = gt | (eq & (eq_cum <= need[:, None]))
+    del eq_cum
+    rank = torch.cumsum(sel, dim=1, dtype=torch.int32)
+    rank -= 1
+    rank.masked_fill_(~sel, kk)
     # Scatter the selected source columns into [n, kk] (column order); the
     # sentinel column kk absorbs the non-selected lanes and is sliced away.
-    cols = torch.arange(B, device=src.device)[None, :].expand(n, B)
-    buf = torch.zeros(n, kk + 1, dtype=torch.long, device=src.device)
-    buf.scatter_(1, torch.where(sel, rank, kk), cols)
-    cand = buf[:, :kk]
+    cols = torch.arange(B, device=src.device, dtype=torch.int32)[None, :].expand(n, B)
+    buf = torch.empty(n, kk + 1, dtype=torch.int32, device=src.device)
+    buf.scatter_(1, rank, cols)
+    cand = buf[:, :kk].long()
     order = torch.argsort(src.gather(1, cand), dim=1, stable=True, descending=True)
     cand = cand.gather(1, order)
     if ties == 'latest':

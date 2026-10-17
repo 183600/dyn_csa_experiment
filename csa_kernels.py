@@ -683,19 +683,33 @@ def _stable_topk_desc(x, k):
     if kk >= B:
         val, idx = torch.sort(x, dim=-1, descending=True, stable=True)
         return val, idx
-    kth = torch.topk(x, kk, dim=-1, sorted=True).values[..., -1:]
-    gt = x > kth
-    eq = x == kth
-    need = (kk - gt.sum(dim=-1, keepdim=True)).clamp_min(0)
-    sel = gt | (eq & (eq.cumsum(dim=-1) <= need))
-    rank = sel.cumsum(dim=-1) - 1
     lead = x.shape[:-1]
-    cols = torch.arange(B, device=x.device).expand(lead + (B,))
-    buf = torch.zeros(lead + (kk + 1,), dtype=torch.long, device=x.device)
-    buf.scatter_(-1, torch.where(sel, rank, kk), cols)
-    cand = buf[..., :kk]
-    order = torch.argsort(x.gather(-1, cand), dim=-1, stable=True, descending=True)
-    cand = cand.gather(-1, order)
+    m = 1
+    for _s in lead:
+        m *= int(_s)
+    dev = x.device
+    flat = x.reshape(m, B)
+    kth = torch.topk(flat, kk, dim=1, sorted=True).values[:, -1:]
+    # Same candidate construction as exp_lib._rank_blocks: strictly greater
+    # entries plus the earliest equal-to-kth entries.  Prefix ranks are int32
+    # (B < 2^31) and the sentinel is filled in place — no full-width int64
+    # temporaries and no device sync.
+    gt = flat > kth
+    eq = flat == kth
+    need = (kk - gt.sum(dim=1)).clamp_min(0).to(torch.int32)
+    eq_cum = torch.cumsum(eq, dim=1, dtype=torch.int32)
+    sel = gt | (eq & (eq_cum <= need[:, None]))
+    del eq_cum
+    rank = torch.cumsum(sel, dim=1, dtype=torch.int32)
+    rank -= 1
+    rank.masked_fill_(~sel, kk)
+    cols = torch.arange(B, device=dev, dtype=torch.int32)[None, :].expand(m, B)
+    buf = torch.empty(m, kk + 1, dtype=torch.int32, device=dev)
+    buf.scatter_(1, rank, cols)
+    cand = buf[:, :kk].long()
+    order = torch.argsort(flat.gather(1, cand), dim=1, stable=True, descending=True)
+    cand = cand.gather(1, order)
+    cand = cand.reshape(lead + (kk,))
     return x.gather(-1, cand), cand
 
 def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
@@ -1568,17 +1582,22 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
         dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
         flat = topk_idx.reshape(R, T * nb)
-        # 逐行排序/计数（各行互相独立，稳定序逐位不变）：全幅 argsort 的
+        # 逐行排序（各行互相独立，稳定序逐位不变）：全幅 argsort 的
         # 工作区与 [R, T·nb] 的 int64 键表不再同时驻留，长序列下的峰值
         # 由一次性 R 行降为单行。order 保留 int64：lane 值域是
         # [0, T·nb)，T·nb ≥ 2³¹ 的超大配置下窄化到 int32 会翻负、内核再
-        # 按 lane//NB 寻址即越界。
+        # 按 lane//NB 寻址即越界。排序写入预分配的 order 行（复用同一个
+        # values 缓冲），不再为每行另分配一份索引表。
         order = torch.empty((R, T * nb), device=dev, dtype=torch.int64)
-        cnt = torch.empty((R, Bm), device=dev, dtype=torch.int64)
+        # 计数是整数（块 id 非负且 < Bm），scatter_add_ 与逐行 bincount
+        # 给出同一组精确整数——这里一次完成，省掉 R 次内核启动。
+        flat_l = flat.to(torch.int64)
+        cnt = torch.zeros((R, Bm), device=dev, dtype=torch.int64)
+        cnt.scatter_add_(1, flat_l, torch.ones_like(flat_l))
+        del flat_l
+        _sort_buf = torch.empty(T * nb, device=dev, dtype=flat.dtype)
         for _r in range(R):
-            _fr = flat[_r]
-            order[_r] = _fr.argsort(stable=True)
-            cnt[_r] = torch.bincount(_fr.to(torch.int64), minlength=Bm)
+            torch.sort(flat[_r], stable=True, out=(_sort_buf, order[_r]))
         offs = torch.zeros((R, Bm + 1), device=dev, dtype=torch.int64)
         offs[:, 1:] = cnt.cumsum(dim=1)
         del flat, cnt
