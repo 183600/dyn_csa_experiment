@@ -532,6 +532,11 @@ class HybridAttentionRoPE(L.HybridAttention):
         return self.W_o(out.reshape(B, T, nh * hd))
 
     def forward(self, x):
+        B, T, d = x.shape
+        if B == 0 or T == 0:
+            # Same empty-input contract as exp_lib.HybridAttention.forward.
+            self.last_gate_mean = None
+            return x.new_empty((B, T, d))
         if getattr(self, '_dense_warmup', False) and self.cfg.kind in ('csa', 'hca'):
             self.last_gate_mean = None
             return self._dense_warmup_forward(x)
@@ -715,6 +720,9 @@ def install_patches():
     _orig_forward = L.HybridAttention.forward
 
     def forward_warmup_aware(self, x):
+        if x.shape[0] == 0 or x.shape[1] == 0:
+            self.last_gate_mean = None
+            return x.new_empty(x.shape)
         if getattr(self, '_dense_warmup', False) and self.cfg.kind in ('csa', 'hca'):
             self.last_gate_mean = None
             return HybridAttentionRoPE._dense_warmup_forward(self, x)

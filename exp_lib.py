@@ -2547,10 +2547,17 @@ class HybridAttention(nn.Module):
         return (self.W_o(out.reshape(T, self.nh * self.hd)), gate_mean)
 
     def forward(self, x):
+        B, T, d = x.shape
+        if B == 0 or T == 0:
+            # No tokens (or no rows): every attention kind returns the same
+            # empty [B, T, d] result.  The pooling/indexer paths are defined
+            # for empty input, but segmenter-derived tensors have no extrema
+            # to read, so short-circuit before touching them.
+            self.last_gate_mean = None
+            return x.new_empty((B, T, d))
         if self.cfg.kind == 'full':
             self.last_gate_mean = None
             return self._full_batched(x)
-        B, T, d = x.shape
         flat = x.reshape(B * T, d)
         pre_flat = self._pre(flat, fuse_x=x)
         pre_all = None
@@ -2695,6 +2702,12 @@ class SmallGPT(nn.Module):
     def __init__(self, vocab, d, n_layers, n_heads, d_head, max_seq, layer_cfgs, mlp_ratio=4):
         super().__init__()
         _rng_state = torch.get_rng_state()
+        _cuda_rng_state = None
+        if torch.cuda.is_available():
+            try:
+                _cuda_rng_state = torch.cuda.get_rng_state_all()
+            except Exception:
+                _cuda_rng_state = None
         shared = int(torch.randint(0, 2 ** 31 - 1, (1,)).item())
         g = torch.Generator().manual_seed(shared)
         self.tok = nn.Embedding(vocab, d)
@@ -2709,11 +2722,18 @@ class SmallGPT(nn.Module):
             torch.manual_seed(shared + 104729 * (i + 1))
             mlp_g = torch.Generator().manual_seed(shared + 1299709 * (i + 1))
             self.blocks.append(self._make_block(d, n_heads, d_head, c, mlp_ratio, mlp_g))
-        # Per-block init temporarily reseeds the GLOBAL torch RNG above; restore the
-        # caller's state so model construction never perturbs data shuffling / dropout
-        # / later model construction (which would otherwise couple the data order to
-        # n_layers and break paired-experiment isolation).
+        # Per-block init temporarily reseeds the GLOBAL torch RNG above; restore
+        # the caller's state so model construction never perturbs data shuffling /
+        # dropout / later model construction (which would otherwise couple the
+        # data order to n_layers and break paired-experiment isolation).
+        # `torch.manual_seed` also reseeds every CUDA device, so the CPU state
+        # alone is not enough on a GPU box: restore the CUDA streams too.
         torch.set_rng_state(_rng_state)
+        if _cuda_rng_state is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.set_rng_state_all(_cuda_rng_state)
+            except Exception:
+                pass
         self.norm = RMSNorm(d)
         self.max_seq = max_seq
 
@@ -3293,14 +3313,8 @@ def _npy_serve_int32(path):
         out[s:e] = src[s:e]
     return out
 
-def _fineweb_local_rows(env_value):
-    """Offline FineWeb-Edu stand-in: FWEDU_LOCAL_JSONL lists files or
-    directories (os.pathsep-separated; directories expand to their sorted
-    *.jsonl / *.json / *.txt).  Every non-empty line is a document — either a
-    JSON object with a "text" field (the FineWeb-Edu row shape) or plain text.
-    Pure availability path for air-gapped kernel-dev machines; the corpus a
-    panel trains on is still bound by the content fingerprint, so a local
-    stand-in can never be confused with a genuine FineWeb-Edu cache."""
+def _fineweb_local_files(env_value):
+    """Resolve FWEDU_LOCAL_JSONL to the ordered list of local documents files."""
     import glob
     files = []
     for cand in str(env_value).split(os.pathsep):
@@ -3314,7 +3328,43 @@ def _fineweb_local_rows(env_value):
             files.extend(sorted(glob.glob(cand)))
         else:
             files.append(cand)
-    files = [f for f in files if os.path.isfile(f)]
+    return [f for f in files if os.path.isfile(f)]
+
+def _fineweb_local_source_fingerprint(env_value):
+    """Cheap identity of the local stand-in source (paths, sizes, mtimes).
+
+    The token cache's own `src_fp` only proves that the cached ids match the
+    cache meta; it cannot see that the *source* files changed.  Without this,
+    editing/replacing a local jsonl while keeping the same FWEDU_LOCAL_JSONL
+    path would silently serve the old corpus under the old fingerprint.  The
+    signature makes such a rebuilt cache non-confusable; it changes whenever a
+    source file is added/removed/replaced (mtime/size change)."""
+    files = _fineweb_local_files(env_value)
+    if not files:
+        return None
+    h = hashlib.sha1()
+    for path in files:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        h.update(os.path.abspath(path).encode('utf-8', 'replace'))
+        h.update(b'\0')
+        h.update(str(int(st.st_size)).encode('ascii'))
+        h.update(b'\0')
+        h.update(str(int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9)))).encode('ascii'))
+        h.update(b'\0')
+    return h.hexdigest()[:16]
+
+def _fineweb_local_rows(env_value):
+    """Offline FineWeb-Edu stand-in: FWEDU_LOCAL_JSONL lists files or
+    directories (os.pathsep-separated; directories expand to their sorted
+    *.jsonl / *.json / *.txt).  Every non-empty line is a document — either a
+    JSON object with a "text" field (the FineWeb-Edu row shape) or plain text.
+    Pure availability path for air-gapped kernel-dev machines; the corpus a
+    panel trains on is still bound by the content fingerprint, so a local
+    stand-in can never be confused with a genuine FineWeb-Edu cache."""
+    files = _fineweb_local_files(env_value)
     if not files:
         raise RuntimeError(f'FWEDU_LOCAL_JSONL is set ({env_value!r}) but resolves to no readable file — point it at FineWeb-Edu style jsonl/txt files, or unset it to stream from the hub')
     print(f'[data] local FineWeb-Edu stand-in corpus: {len(files)} file(s) ({files[0]}{" ..." if len(files) > 1 else ""})')
@@ -3385,6 +3435,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     # keep their exact filenames.
     _local_env = os.environ.get('FWEDU_LOCAL_JSONL', '').strip()
     _local_tag = f'_loc{hashlib.sha1(_local_env.encode("utf-8")).hexdigest()[:8]}' if _local_env else ''
+    _local_sig = _fineweb_local_source_fingerprint(_local_env) if _local_env else None
     tag = f'v1_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}_fw{source}_fd{fit_docs}{_local_tag}'
     tr_path = os.path.join(cache_dir, f'train_ids_{tag}.npy')
     va_path = os.path.join(cache_dir, f'val_batch_{tag}.npy')
@@ -3392,7 +3443,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
         _sig = tuple((os.path.getsize(p), os.path.getmtime(p)) for p in (tr_path, va_path, vp_path, me_path))
-        _mkey = (os.path.abspath(cache_dir), tag, _sig)
+        _mkey = (os.path.abspath(cache_dir), tag, _sig, _local_sig)
         _hit = _FWEB_MEMO.get(_mkey)
         if _hit is not None:
             print('[data] serving fineweb token ids from the in-process memo (same cache files, already verified) ...')
@@ -3402,6 +3453,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         train_ids = _npy_serve_int32(tr_path)
         if meta.get('src_fp') != _ids_fp(train_ids):
             print('[data] WARNING: the cached fineweb train_ids do not match the fingerprint in the meta file — the cache is corrupt or was mixed across builds; REBUILDING it')
+        elif _local_sig is not None and meta.get('local_source_sig') != _local_sig:
+            print('[data] WARNING: the local FineWeb-Edu stand-in source changed since this cache was built — REBUILDING the cache (a stale corpus must not keep its old fingerprint)')
         else:
             val_batch = np.load(va_path).astype(np.int64)
             val_bnd = np.load(vp_path)
@@ -3548,12 +3601,12 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                     pass
                 raise
         train_ids = _npy_serve_int32(tr_path)
-        atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids), 'source': source, 'fit_docs': fit_docs, 'disk_dtype': np.dtype(disk_dt).str, 'seq_len': int(seq_len), 'n_train_tokens': int(n_train_tokens), 'n_train_actual': int(n_train), 'val_seqs': int(val_seqs)}, indent=0)
+        atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids), 'local_source_sig': _local_sig, 'source': source, 'fit_docs': fit_docs, 'disk_dtype': np.dtype(disk_dt).str, 'seq_len': int(seq_len), 'n_train_tokens': int(n_train_tokens), 'n_train_actual': int(n_train), 'val_seqs': int(val_seqs)}, indent=0)
         print('[data] cached fineweb token ids to disk (resume-safe)')
         _out = (train_ids, val_batch, vocab, tok, val_bnd)
         if len(_FWEB_MEMO) >= _FWEB_MEMO_CAP:
             _FWEB_MEMO.pop(next(iter(_FWEB_MEMO)))
-        _FWEB_MEMO[(os.path.abspath(cache_dir), tag, tuple((os.path.getsize(p), os.path.getmtime(p)) for p in (tr_path, va_path, vp_path, me_path)))] = _out
+        _FWEB_MEMO[(os.path.abspath(cache_dir), tag, tuple((os.path.getsize(p), os.path.getmtime(p)) for p in (tr_path, va_path, vp_path, me_path)), _local_sig)] = _out
         return _out
     finally:
         for _raw in (raw_train, raw_val):
