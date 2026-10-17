@@ -41,6 +41,7 @@ try:
     import v10_supp as V10
     import v12_supp as V12
     import v7_supp as V7
+    import audit_gates as A
     _HAVE_TORCH = True
 except Exception as _e:  # pragma: no cover
     print(f'[test] SKIPPED: cannot import the repo modules here ({type(_e).__name__}: {_e}); run on a box with CPU torch')
@@ -1071,6 +1072,11 @@ def t_metric_policy_and_classification_metrics():
     score = [0.0] * 990 + [1.0] * 10
     mb = L.classification_metrics(y, y_score=score, labels=[0, 1])
     assert mb['roc_auc'] == 1.0 and abs(mb['pr_auc'] - 1.0) < 1e-12, mb
+    # The same endpoint expressed as a 2-D probability matrix must use the
+    # positive-class column, not the whole matrix.
+    score2 = np.stack([1.0 - np.asarray(score), np.asarray(score)], axis=1)
+    m2 = L.classification_metrics(y, y_score=score2, labels=[0, 1])
+    assert m2['roc_auc'] == 1.0 and abs(m2['pr_auc'] - 1.0) < 1e-12, m2
     # Boundary metrics without precision/recall/random baseline must warn.
     bad = {'full::seed0': {'variant': 'full', 'seed': 0, 'ppl': 10.0,
                            'stats': {'L0_csa_fix': {'bnd_f1': 0.4}}}}
@@ -1214,6 +1220,33 @@ def t_data_quality_report():
     assert rep4['status'] == 'fail'
 
 
+def t_split_sizes_explicit_never_negative():
+    # Explicit sizes and fractional targets can overdraw the row budget; the
+    # filler must clamp rather than emit a negative split.
+    cases = ({'train_frac': 0.05, 'val_frac': 0.9, 'test_frac': 0.05, 'train_size': 9},
+             {'train_frac': 0.8, 'val_frac': 0.1, 'test_frac': 0.1, 'val_size': 9})
+    for kwargs in cases:
+        idx = L.chronological_split_indices(10, **kwargs)
+        sizes = [len(idx[k]) for k in ('train', 'val', 'test')]
+        assert sum(sizes) == 10 and all(s >= 0 for s in sizes), (kwargs, sizes)
+    # The normal explicit-size reconciliation is unchanged.
+    idx = L.chronological_split_indices(10, train_size=6)
+    assert [len(idx[k]) for k in ('train', 'val', 'test')] == [6, 1, 3]
+
+
+def t_audit_split_sequence_overlap():
+    # A 1-D token cache stores train as a stream: a validation row overlapping
+    # at an arbitrary offset must still be detected (not only at aligned rows).
+    train = np.arange(40, dtype=np.int64)
+    rows = np.array([[5, 6, 7, 8], [100, 101, 102, 103]], dtype=np.int64)
+    assert A._row_overlap_count(train, rows) == 1
+    assert A._row_overlap_count(train, rows, chunk_tokens=8) == 1
+    assert A._row_overlap_count(train, np.array([[36, 37, 38, 39]]), chunk_tokens=8) == 1
+    # 2-D tables keep the exact aligned-row contract.
+    table = np.array([[1, 2], [3, 4], [5, 6]])
+    assert A._row_overlap_count(table, np.array([[3, 4], [9, 9]])) == 1
+
+
 def t_categorical_and_cache_guards():
     same = L.categorical_shift_report([1, 2, 2, 3], [1, 2, 2, 3])
     assert same['js_divergence'] < 1e-12 and same['total_variation'] < 1e-12
@@ -1306,6 +1339,8 @@ def main():
     _check('I3 preprocessing fitted on train only', t_preprocessor_train_only)
     _check('I4 data-quality/leakage report', t_data_quality_report)
     _check('I5 categorical shift + cache guards', t_categorical_and_cache_guards)
+    _check('I6 explicit split sizes stay non-negative', t_split_sizes_explicit_never_negative)
+    _check('I7 split audit finds sequence-level row overlap', t_audit_split_sequence_overlap)
     fails = [r for r in _results if r[1] != 'PASS']
     print(f'\n[test] {len(_results) - len(fails)}/{len(_results)} passed')
     return 1 if fails else 0

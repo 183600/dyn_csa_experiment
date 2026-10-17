@@ -176,6 +176,89 @@ def _sample_tokens(arr, cap=1000000, seed=0):
     return a[idx]
 
 
+def _window_hashes(values, width):
+    """Polynomial hashes of every length-``width`` window (uint64 wrap)."""
+    import numpy as np
+    a = np.asarray(values).reshape(-1)
+    if width <= 0 or a.size < width:
+        return np.empty(0, dtype=np.uint64)
+    a = a.astype(np.uint64, copy=False)
+    base = np.uint64(1000003)
+    mod = 1 << 64
+    pow_b = np.empty(width, dtype=np.uint64)
+    pow_b[0] = 1
+    if width > 1:
+        pow_b[1:] = np.multiply.accumulate(np.full(width - 1, base, dtype=np.uint64))
+    h0 = int(np.sum(a[:width] * pow_b[::-1], dtype=np.uint64))
+    count = a.size - width + 1
+    if count == 1:
+        return np.asarray([h0], dtype=np.uint64)
+    b_width = int(pow_b[-1]) * int(base) % mod
+    c = a[width:] - a[:count - 1] * np.uint64(b_width)
+    inv = pow(int(base), -1, mod)
+    inv_pow = np.multiply.accumulate(np.full(count - 1, np.uint64(inv), dtype=np.uint64))
+    pref = np.cumsum(c * inv_pow, dtype=np.uint64)
+    b_pow = np.empty(count, dtype=np.uint64)
+    b_pow[0] = 1
+    if count > 1:
+        b_pow[1:] = np.multiply.accumulate(np.full(count - 1, base, dtype=np.uint64))
+    out = np.empty(count, dtype=np.uint64)
+    out[0] = np.uint64(h0)
+    out[1:] = b_pow[1:] * (np.uint64(h0) + pref)
+    return out
+
+
+def _row_overlap_count(train, rows, chunk_tokens=1 << 20):
+    """Count unique ``rows`` that occur verbatim in ``train``.
+
+    A token cache stores the training side as a flat token stream, so a row
+    overlap is a *subsequence* match, not an aligned row-index match.  The
+    2-D case uses exact row keys; the 1-D case scans all windows with a
+    rolling hash and verifies every candidate against the actual tokens, so
+    no match can be missed and hash collisions cannot create one.
+    """
+    import numpy as np
+    import data_guard as DG
+    train = np.asarray(train)
+    rows = np.asarray(rows)
+    if rows.ndim == 1:
+        rows = rows.reshape(1, -1)
+    if rows.size == 0:
+        return 0
+    if train.ndim == 2:
+        return len(set(DG._row_keys(train)) & set(DG._row_keys(rows)))
+    if train.ndim != 1:
+        return 0
+    uniq = np.unique(rows, axis=0)
+    width = int(uniq.shape[1])
+    if width <= 0 or train.size < width:
+        return 0
+    val_hashes = np.asarray([int(_window_hashes(row, width)[0]) for row in uniq], dtype=np.uint64)
+    by_hash = {}
+    for i, h in enumerate(val_hashes.tolist()):
+        by_hash.setdefault(h, []).append(i)
+    matched = set()
+    step = max(1, int(chunk_tokens))
+    start = 0
+    total = int(train.size)
+    while start < total and len(matched) < len(uniq):
+        end = min(total, start + step + width - 1)
+        seg = np.asarray(train[start:end])
+        hashes = _window_hashes(seg, width)
+        if hashes.size:
+            for i in np.nonzero(np.isin(hashes, val_hashes))[0]:
+                for r in by_hash.get(int(hashes[i]), ()):
+                    if r in matched:
+                        continue
+                    pos = start + int(i)
+                    if np.array_equal(np.asarray(train[pos:pos + width]), uniq[r]):
+                        matched.add(r)
+        if end >= total:
+            break
+        start += step
+    return len(matched)
+
+
 def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                            js_fail=0.25, min_shift_tokens=5000):
     """Audit the *split contract* for every cached corpus on disk.
@@ -259,10 +342,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
 
             # Exact duplicate rows across train/val/test.  This is row-level
             # leakage regardless of how the split was generated.
-            tr_rows = tr[:min(int(tr.shape[0]), int(max_rows))]
-            tr_keys = set(DG._row_keys(tr_rows))
-            val_keys = DG._row_keys(va)
-            shared_val = len(set(val_keys) & tr_keys)
+            shared_val = _row_overlap_count(tr, va)
             rec['exact_row_overlap_train_val'] = int(shared_val)
             if shared_val:
                 rec['status'] = 'fail'
@@ -284,9 +364,8 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 break
             if te is not None:
                 rec['test_shape'] = list(te.shape)
-                test_keys = DG._row_keys(te)
-                shared_test = len(set(test_keys) & tr_keys)
-                shared_val_test = len(set(test_keys) & set(val_keys))
+                shared_test = _row_overlap_count(tr, te)
+                shared_val_test = _row_overlap_count(va, te)
                 rec['exact_row_overlap_train_test'] = int(shared_test)
                 rec['exact_row_overlap_val_test'] = int(shared_val_test)
                 if shared_test:

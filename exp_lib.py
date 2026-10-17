@@ -5410,8 +5410,13 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None):
     }
     if y_score is not None and labels.size == 2:
         y_bin = (y_true == labels[-1]).astype(np.int64)
-        out['roc_auc'] = _binary_roc_auc(y_bin, y_score)
-        out['pr_auc'] = _binary_average_precision(y_bin, y_score)
+        # A 2-D score matrix is column-per-label: the binary endpoint uses the
+        # positive class (labels[-1]) column, exactly as the argmax prediction
+        # above does.
+        _score = np.asarray(y_score, dtype=float)
+        _bin_score = _score[:, -1] if _score.ndim == 2 else _score.ravel()
+        out['roc_auc'] = _binary_roc_auc(y_bin, _bin_score)
+        out['pr_auc'] = _binary_average_precision(y_bin, _bin_score)
         if out['pr_auc'] is not None and out['roc_auc'] is not None:
             rare = min(float(np.mean(y_bin)), 1.0 - float(np.mean(y_bin)))
             out['imbalance_warning'] = ('positives rarer than 1:1000 — PR-AUC is the primary ranking metric; ROC-AUC can look optimistic'

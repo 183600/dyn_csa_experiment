@@ -95,16 +95,20 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
         if sum(v for v in sizes if v is not None) > n:
             raise ValueError(f'explicit split sizes {sizes} exceed n={n}')
         # Fill unspecified entries, letting the last one absorb the remainder.
+        # Earlier unspecified splits take their fractional target only while
+        # rows remain; clamping to the remaining budget keeps every size
+        # non-negative even when an explicit size or a large fraction would
+        # otherwise overdraw it (the last split then takes whatever is left).
         fracs = (train_frac, val_frac, test_frac)
-        n_unspecified = sum(v is None for v in sizes)
-        for i in range(3):
-            if sizes[i] is None:
-                if n_unspecified == 1 or i == max(j for j in range(3) if sizes[j] is None):
-                    sizes[i] = n - sum(v for v in sizes if v is not None)
-                else:
-                    sizes[i] = int(math.floor(n * fracs[i]))
-                n_unspecified -= 1
-        if sum(sizes) != n:
+        unspecified = [i for i in range(3) if sizes[i] is None]
+        remaining = n - sum(v for v in sizes if v is not None)
+        for i in unspecified[:-1]:
+            take = min(int(math.floor(n * fracs[i])), remaining)
+            sizes[i] = take
+            remaining -= take
+        if unspecified:
+            sizes[unspecified[-1]] = remaining
+        if sum(sizes) != n or any(v < 0 for v in sizes):
             raise ValueError(f'could not reconcile split sizes {sizes} with n={n}')
         return tuple(int(v) for v in sizes)
 
