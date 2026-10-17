@@ -859,10 +859,16 @@ def _block_order(block_ids, n):
 def _n_blocks_cached(block_ids):
     # block_ids is treated as immutable by the pooling caches (_pool_gpu /
     # _pool_geom), so its max+1 is a constant of the object — cache it per
-    # object.  First call per object computes the identical value.
+    # object.  First call per object computes the identical value.  When the
+    # segmenter already attached its host-side counts, their length is the
+    # same block count without a device reduction + host sync.
     B = getattr(block_ids, '_pool_nblocks', None)
     if B is None:
-        B = int(block_ids.max().item()) + 1
+        _cpu = getattr(block_ids, '_pool_cpu', None)
+        if _cpu is not None and len(_cpu[0]) > 0:
+            B = len(_cpu[0])
+        else:
+            B = int(block_ids.max().item()) + 1
         try:
             block_ids._pool_nblocks = B
         except (AttributeError, RuntimeError):
