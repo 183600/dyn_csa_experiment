@@ -46,6 +46,9 @@ __all__ = [
     'data_quality_report',
     'categorical_shift_report',
     'duplicate_mask',
+    'sequence_duplicate_mask',
+    'sequence_overlap_rows',
+    'corpus_split_report',
 ]
 
 SPLIT_NAMES = ('train', 'val', 'test')
