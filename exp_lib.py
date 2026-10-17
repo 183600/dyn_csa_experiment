@@ -5639,7 +5639,15 @@ def _git_provenance():
     branch = _run('rev-parse', '--abbrev-ref', 'HEAD')
     dirty = _run('status', '--porcelain')
     files = dirty.splitlines() if dirty else []
-    return {'git_commit': head, 'git_branch': branch, 'git_dirty': bool(files), 'git_dirty_count': len(files), 'git_dirty_files': files[:20]}
+    # A commit id alone does NOT identify a dirty work tree: two runs from the
+    # same HEAD with different uncommitted edits would otherwise claim the
+    # same code version.  Hash the diff and the status instead of storing the
+    # (possibly secret-bearing) contents.  Untracked files are included via
+    # the status hash; their contents are left to the operator to archive.
+    def _sha(text):
+        return hashlib.sha256((text or '').encode('utf-8', 'replace')).hexdigest()[:16]
+    diff_text = _run('diff', '--no-color', '--no-ext-diff', 'HEAD')
+    return {'git_commit': head, 'git_branch': branch, 'git_dirty': bool(files), 'git_dirty_count': len(files), 'git_dirty_files': files[:20], 'git_status_sha256': _sha(dirty), 'git_diff_sha256': _sha(diff_text)}
 
 def _gpu_names():
     try:
@@ -5681,10 +5689,27 @@ def environment_snapshot():
             env[_key] = None
     return env
 
+def _data_version(data):
+    """Stable content digest of the corpus identity recorded in a panel.
+
+    The token fingerprints already hash the exact ids seen; this composite
+    makes the *data version* a single field a reader can compare across runs
+    (dataset/protocol, token counts, vocabulary and both split fingerprints)
+    without knowing which individual fields the loader happened to expose.
+    """
+    keys = ('dataset', 'source', 'fw_fit_docs', 'requested_train_tokens', 'train_tokens', 'seq_len', 'vocab_size', 'val_sequences', 'train_fp', 'val_fp')
+    payload = {k: data.get(k) for k in keys if data.get(k) is not None}
+    blob = json.dumps(_jsonable(payload), sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
 def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
     """Everything needed to identify a panel: code version (semantic stamp
-    + git commit), environment, and the exact data bytes seen."""
+    + git commit + dirty-worktree digest), environment, and the exact data
+    bytes seen (token fingerprints + a composite data version)."""
     data = {'dataset': cfg.get('dataset') or 'wikitext', 'requested_train_tokens': cfg.get('n_train_tokens'), 'seq_len': cfg.get('seq_len')}
+    for _k in ('cache_dir', 'fw_source', 'fw_fit_docs'):
+        if cfg.get(_k) is not None:
+            data[_k if _k != 'fw_source' else 'source'] = cfg.get(_k)
     if train_ids is not None:
         data['train_tokens'] = int(len(train_ids))
         data['train_fp'] = _ids_fp(train_ids)
@@ -5694,9 +5719,10 @@ def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
         data['val_fp'] = _ids_fp(_vb)
     if vocab is not None:
         data['vocab_size'] = int(vocab)
+    data['data_version'] = _data_version(data)
     return {'code': {'code_semantics': CODE_SEMANTICS, 'code_stamp': code_stamp(), 'kernel_stamp': _kernel_stamp(), **_git_provenance()}, 'environment': environment_snapshot(), 'data': data}
 
-def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_ratio):
+def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_ratio, data_version=None):
     """Structured hyper-parameter record (the run_cfg string stays the
     pairing gate; this is the human/machine-readable copy)."""
     hp = {str(k): _jsonable(v) for k, v in cfg.items() if k not in ('seeds', 'variants', 'outdir')}
@@ -5712,9 +5738,11 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
         'dataset': cfg.get('dataset') or 'wikitext',
         'train_knobs': training_knobs(),
     })
+    if data_version is not None:
+        hp['data_version'] = str(data_version)
     return hp
 
-def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reproducibility=None):
+def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reproducibility=None, *, status=None, planned_cells=None, started_at=None):
     """Merge one panel's provenance/config/outcome summary into
     `outdir/run_manifest.json` under the same flock used by summary.json.
 
@@ -5723,7 +5751,13 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     `sanity` (the small-batch overfit reports) and `reproducibility` (the
     duplicate-run seed check) are embedded when supplied, or read back from
     `outdir/overfit_sanity.json` / `outdir/reproducibility.json` so an
-    auto-preflight is traceable without a second manual record."""
+    auto-preflight is traceable without a second manual record.
+
+    `status` / `planned_cells` make the manifest a crash-safe tracking record:
+    `run()` writes it with status='running' before the first cell, so a killed
+    process still leaves the code version, config, data version and the list
+    of planned cells on disk; the final call marks it complete and lists any
+    cell that produced no measurement."""
     os.makedirs(outdir, exist_ok=True)
     if sanity is None:
         _san_path = os.path.join(outdir, 'overfit_sanity.json')
@@ -5772,6 +5806,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                 'rng_fp': rec.get('rng_fp'),
                 'data_fp': rec.get('data_fp'),
                 'val_fp': rec.get('val_fp'),
+                'data_version': rec.get('data_version') or prov.get('data', {}).get('data_version'),
                 'code_stamp': rec.get('_code'),
                 'hyperparams': rec.get('hyperparams'),
                 'curve_summary': {'n_points': len(_losses), 'first': _loss_nums[0] if _loss_nums else None, 'last': _loss_nums[-1] if _loss_nums else None, 'best': min(_loss_nums) if _loss_nums else None, 'ppl_history_points': len(_ph)},
@@ -5779,16 +5814,25 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                 'ppl_history_ref': f'summary.json#{key}.ppl_history',
                 'sanity_ref': rec.get('sanity_ref') or ('overfit_sanity.json' if sanity else None),
             }
+    if planned_cells is None:
+        planned_cells = [f'{v}::seed{seed}' for seed in cfg.get('seeds') or [] for v in cfg.get('variants') or []]
+    planned_cells = [str(_k) for _k in dict.fromkeys(planned_cells)]
     entry = {
         'run_cfg': run_cfg,
-        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'status': status or 'complete',
+        'created_at': started_at or time.strftime('%Y-%m-%dT%H:%M:%S'),
         'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'config': _jsonable(cfg),
         'provenance': prov,
+        'data_version': prov.get('data', {}).get('data_version'),
         'sanity': sanity,
         'reproducibility': reproducibility,
         'experiment_log': 'experiments.jsonl',
         'tracking_schema': 2,
+        'planned_cells': planned_cells,
+        'n_planned': len(planned_cells),
+        'n_completed': len(cells),
+        'missing_cells': [k for k in planned_cells if k not in cells],
         'cells': cells,
     }
     path = os.path.join(outdir, 'run_manifest.json')
@@ -5797,7 +5841,10 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         if not isinstance(m, dict):
             m = {}
         m['manifest_version'] = m.get('manifest_version') or 1
-        m.setdefault('panels', {})[run_cfg] = entry
+        _prev = m.setdefault('panels', {}).get(run_cfg)
+        if isinstance(_prev, dict) and _prev.get('created_at') and status != 'running':
+            entry['created_at'] = _prev['created_at']
+        m['panels'][run_cfg] = entry
         return m
     locked_json_update(path, _merge)
     return path
@@ -6684,6 +6731,9 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     grad_norm = float('nan')
     grad_finite = True
     n_grad_none = 0
+    _none_names = []
+    _n_trainable = 0
+    _n_with_grad = 0
     model.train()
     for step in range(int(steps)):
         ce = model.ce_loss(x, y, vocab)
@@ -6691,11 +6741,16 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         ce.backward()
         _gs = []
         _none = 0
+        _none_names = []
+        _n_trainable = 0
         for _n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
+            _n_trainable += 1
             if p.grad is None:
                 _none += 1
+                if len(_none_names) < 50:
+                    _none_names.append(_n)
                 continue
             _gs.append(p.grad.detach())
         if _gs:
@@ -6705,6 +6760,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
             grad_norm = 0.0
             grad_finite = False
         n_grad_none = _none
+        _n_with_grad = len(_gs)
         grad_norm_curve.append(float(grad_norm))
         if grad_clip:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
@@ -6750,7 +6806,12 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         'grad_norm_last': float(grad_norm),
         'grad_all_finite': bool(grad_finite),
         'params_without_grad': int(n_grad_none),
+        'params_without_grad_names': list(_none_names),
+        'trainable_params': int(_n_trainable),
+        'params_with_grad': int(_n_with_grad),
+        'grad_coverage': (float(_n_with_grad) / float(_n_trainable) if _n_trainable else 0.0),
         'params_changed': bool(params_changed),
+        'batch_reused': True,
         'target_loss': float(target_loss),
         'target_accuracy': float(target_acc),
     }
@@ -6821,9 +6882,15 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
         _data_key = (int(vocab), _ids_fp(_arr if _arr.ndim == 1 else np.ascontiguousarray(_arr).reshape(-1)))
 
     def _known(v):
+        # Only a PASSED check may certify a variant.  A cached failure must be
+        # retried (or re-raised) on the next call: treating any present key as
+        # "already checked" would let a caller that caught the first failure
+        # bypass the hard stop on a later phase in the same process.
         if src == 'data':
-            return (v, 'data', *_data_key) in _OVERFIT_GUARD
-        return (v, 'synthetic') in _OVERFIT_GUARD or any(k[0] == v and k[1] == 'data' for k in _OVERFIT_GUARD)
+            return _OVERFIT_GUARD.get((v, 'data', *_data_key)) is True
+        return _OVERFIT_GUARD.get((v, 'synthetic')) is True or any(
+            _k[0] == v and _k[1] == 'data' and _OVERFIT_GUARD.get(_k) is True
+            for _k in list(_OVERFIT_GUARD))
     todo = [v for v in variants if force or not _known(v)]
     if not todo:
         return []
@@ -6944,7 +7011,9 @@ def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False):
         return []
     _want_strict = os.environ.get('CSA_REQUIRE_REPRO', '').strip().lower() in ('1', 'true', 'yes', 'on')
     _base = (int(seed), int(steps), str(DEVICE), determinism_label())
-    todo = [v for v in variants if force or (v, *_base) not in _REPRO_GUARD]
+    # As in overfit_guard, a cached FAILURE is not a certificate: retry it so a
+    # later phase cannot silently inherit the failed status as "already done".
+    todo = [v for v in variants if force or _REPRO_GUARD.get((v, *_base)) is not True]
     reports = []
     for v in todo:
         r = reproducibility_check(v, seed=seed, steps=steps, tol=tol)
@@ -7983,7 +8052,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
         try:
             rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts)
             _prov = prov if prov is not None else experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
-            _hp = run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v])
+            _hp = run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v], data_version=_prov.get('data', {}).get('data_version'))
 
             def _apply(summary):
                 if rec.get('cap_truncated'):
@@ -8000,6 +8069,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                     rec['hyperparams'] = _hp
                     rec['data_fp'] = _prov['data'].get('train_fp')
                     rec['val_fp'] = _prov['data'].get('val_fp')
+                    rec['data_version'] = _prov['data'].get('data_version')
                     rec['run_id'] = _run_id
                     rec['started_at'] = _started_at
                     rec['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
@@ -8013,7 +8083,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                 log_experiment_event(outdir, {'kind': 'cell', 'run_id': _run_id, 'status': 'truncated', 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': code_stamp(), 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'steps_done': rec.get('steps_done'), 'reason': 'hard runtime cap reached; partial record not written'})
             elif isinstance(rec, dict) and not rec.get('cap_truncated'):
                 _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
-                _ev = {'kind': 'cell', 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': rec.get('finished_at'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': rec.get('_code') or code_stamp(), 'provenance': rec.get('provenance'), 'hyperparams': rec.get('hyperparams'), 'data_fp': rec.get('data_fp'), 'val_fp': rec.get('val_fp'), 'rng_fp': rec.get('rng_fp'), 'metrics': {'ppl': rec.get('ppl'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed')}, 'curve_summary': {'n_points': len(_losses), 'first': _losses[0] if _losses else None, 'last': _losses[-1] if _losses else None, 'best': min(_losses) if _losses else None}, 'losses': _losses, 'ppl_history': rec.get('ppl_history'), 'sanity_ref': rec.get('sanity_ref')}
+                _ev = {'kind': 'cell', 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': rec.get('finished_at'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': rec.get('_code') or code_stamp(), 'provenance': rec.get('provenance'), 'hyperparams': rec.get('hyperparams'), 'data_fp': rec.get('data_fp'), 'val_fp': rec.get('val_fp'), 'data_version': rec.get('data_version'), 'rng_fp': rec.get('rng_fp'), 'metrics': {'ppl': rec.get('ppl'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed')}, 'curve_summary': {'n_points': len(_losses), 'first': _losses[0] if _losses else None, 'last': _losses[-1] if _losses else None, 'best': min(_losses) if _losses else None}, 'losses': _losses, 'ppl_history': rec.get('ppl_history'), 'sanity_ref': rec.get('sanity_ref')}
                 log_experiment_event(outdir, _ev)
         except Exception as e:
             import traceback
@@ -8157,6 +8227,12 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         })
     cells, stale_dropped = _plan_run(cfg, summary_path, fp)
     _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
+    _planned_keys = [f'{v}::seed{seed}' for seed in cfg.get('seeds') or [] for v in cfg.get('variants') or []]
+    # Crash-safe tracking: publish the panel's identity (code/data versions,
+    # hyperparameters, planned cells) BEFORE the first expensive cell can be
+    # killed.  The final write below flips the status to complete and lists
+    # every planned cell that produced no measurement.
+    write_run_manifest(outdir, cfg, fp, prov, _read_summary_json(summary_path), sanity=(_sanity or None), reproducibility=(_repro or None), status='running', planned_cells=_planned_keys, started_at=_panel_started)
     log_experiment_event(outdir, {
         'kind': 'panel_start', 'tracking_schema': 2, 'label': label or outdir,
         'run_cfg': fp, 'code': code_stamp(), 'started_at': _panel_started,
@@ -8205,7 +8281,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             print(f'    {_k}')
         if len(_still) != len(stale_dropped):
             print(f'    ({len(stale_dropped) - len(_still)} of them succeeded and carry a fresh record.)')
-    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=(_sanity or None), reproducibility=(_repro or None))
+    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=(_sanity or None), reproducibility=(_repro or None), status='complete', planned_cells=_planned_keys, started_at=_panel_started)
     _agg = _finish_panel(outdir, summary)
     _cell_keys = {f'{v}::seed{seed}' for v, seed in cells}
     _measured = {k for k in _cell_keys if isinstance(summary.get(k), dict) and ppl_is_usable((summary.get(k) or {}).get('ppl')) and not (summary.get(k) or {}).get('synthesized')}

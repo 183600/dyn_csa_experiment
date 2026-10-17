@@ -650,11 +650,12 @@ def t_provenance_and_manifest():
     prov = L.experiment_provenance({'dataset': 'unit', 'n_train_tokens': 512, 'seq_len': 32}, train_ids=tr, val_batch=va, vocab=97)
     for k in ('code', 'environment', 'data'):
         assert k in prov, f'provenance missing {k}'
-    for k in ('code_semantics', 'code_stamp', 'git_commit', 'git_dirty'):
+    for k in ('code_semantics', 'code_stamp', 'git_commit', 'git_dirty', 'git_status_sha256', 'git_diff_sha256'):
         assert k in prov['code'], f'code provenance missing {k}'
     for k in ('python', 'torch', 'numpy', 'determinism'):
         assert k in prov['environment'], f'environment provenance missing {k}'
     assert prov['data']['train_fp'] and prov['data']['val_fp'] and prov['data']['vocab_size'] == 97
+    assert prov['data'].get('data_version'), 'data provenance must carry a composite data_version'
     hp = L.run_hyperparameters({'steps': 10, 'seeds': [0], 'variants': ['full'], 'outdir': 'x', 'n_train_tokens': 512, 'seq_len': 32}, seed=3, d=64, n_layers=2, n_heads=4, d_head=16, vocab=97, mlp_ratio=4.0)
     assert hp['seed'] == 3 and hp['data_seed'] == 3 and hp['train_knobs']['optimizer'] == 'AdamW'
     d = tempfile.mkdtemp()
@@ -736,8 +737,80 @@ def t_experiment_ledger():
         cell = entry['cells']['full::seed0']
         assert entry['sanity'] == san and entry['experiment_log'] == 'experiments.jsonl'
         assert cell['run_id'] == out['run_id'] and cell['data_fp'] and cell['curve_summary']['n_points'] == 3
+        assert cell.get('data_version') == prov['data']['data_version']
+        assert entry.get('status') == 'complete' and entry.get('n_completed') == 1
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def t_data_version_identity():
+    cfg = {'dataset': 'unit', 'n_train_tokens': 512, 'seq_len': 32, 'cache_dir': './unit_cache'}
+    tr = np.arange(512, dtype=np.int64) % 97
+    va = np.arange(64, dtype=np.int64).reshape(2, 32) % 97
+    a = L.experiment_provenance(cfg, train_ids=tr, val_batch=va, vocab=97)['data']
+    b = L.experiment_provenance(cfg, train_ids=tr.copy(), val_batch=va.copy(), vocab=97)['data']
+    assert a['data_version'] == b['data_version'], 'same data must yield the same data_version'
+    tr2 = tr.copy()
+    tr2[0] = (int(tr2[0]) + 1) % 97
+    c = L.experiment_provenance(cfg, train_ids=tr2, val_batch=va, vocab=97)['data']
+    assert c['data_version'] != a['data_version'], 'changing one token must change data_version'
+    d = L.experiment_provenance(cfg, train_ids=tr, val_batch=va, vocab=98)['data']
+    assert d['data_version'] != a['data_version'], 'changing the vocabulary must change data_version'
+    assert a['dataset'] == 'unit' and a['cache_dir'] == './unit_cache'
+
+
+def t_manifest_running_then_complete():
+    d = tempfile.mkdtemp()
+    try:
+        tr = np.arange(512, dtype=np.int64) % 97
+        va = np.arange(64, dtype=np.int64).reshape(2, 32) % 97
+        cfg = {'seeds': [0, 1], 'variants': ['full'], 'outdir': d, 'n_train_tokens': 512, 'seq_len': 32}
+        prov = L.experiment_provenance(cfg, train_ids=tr, val_batch=va, vocab=97)
+        planned = ['full::seed0', 'full::seed1']
+        L.write_run_manifest(d, cfg, 'FP', prov, {}, status='running', planned_cells=planned, started_at='T0')
+        e = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))['panels']['FP']
+        assert e['status'] == 'running' and e['n_planned'] == 2 and e['n_completed'] == 0
+        assert e['missing_cells'] == planned and e['created_at'] == 'T0'
+        summary = {'full::seed0': {'ppl': 10.0, 'steps': 3, 'tokens_seen': 192, 'params': 100, 'train_time_s': 1.0, 'final_loss_smoothed': 2.3, 'rng_fp': 'abc', '_code': L.code_stamp(), 'losses': [3.0, 2.3], 'ppl_history': []}}
+        L.write_run_manifest(d, cfg, 'FP', prov, summary, status='complete', planned_cells=planned, started_at='T0')
+        e = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))['panels']['FP']
+        assert e['status'] == 'complete' and e['n_completed'] == 1 and e['missing_cells'] == ['full::seed1']
+        assert e['created_at'] == 'T0', 'a final update must not reset the panel start time'
+        assert e['data_version'] == prov['data']['data_version']
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def t_failed_guard_is_retried():
+    _saved_guard = dict(L._OVERFIT_GUARD)
+    _saved_reports = dict(L._OVERFIT_REPORTS)
+    _saved_fn = L.overfit_sanity_check
+    calls = []
+    try:
+        L._OVERFIT_GUARD.clear()
+        L._OVERFIT_REPORTS.clear()
+
+        def _stub(v, **kw):
+            calls.append(v)
+            ok = len(calls) > 1
+            return {'passed': ok, 'initial_loss': 1.0, 'final_loss': 0.0 if ok else 9.0,
+                    'final_accuracy': 1.0 if ok else 0.0, 'grad_all_finite': True,
+                    'params_changed': True, 'diagnosis': 'ok' if ok else 'broken'}
+        L.overfit_sanity_check = _stub
+        try:
+            L.overfit_guard(['probe'])
+            raise AssertionError('a failed probe must be a hard stop')
+        except RuntimeError:
+            pass
+        assert calls == ['probe']
+        L.overfit_guard(['probe'])
+        assert calls == ['probe', 'probe'], 'a cached FAILURE must be retried, not treated as a completed check'
+    finally:
+        L.overfit_sanity_check = _saved_fn
+        L._OVERFIT_GUARD.clear()
+        L._OVERFIT_GUARD.update(_saved_guard)
+        L._OVERFIT_REPORTS.clear()
+        L._OVERFIT_REPORTS.update(_saved_reports)
 
 
 # ---------------------------------------------------------------------------
@@ -1041,6 +1114,9 @@ def main():
     _check('E6 end-to-end training reproducibility', t_train_variant_reproducible)
     _check('E7 overfit check detects broken optimizer', t_overfit_detects_broken_optimizer)
     _check('E8 append-only experiment ledger + manifest', t_experiment_ledger)
+    _check('E9 data_version identity', t_data_version_identity)
+    _check('E10 crash-safe manifest status/planned cells', t_manifest_running_then_complete)
+    _check('E11 failed overfit guard is retried', t_failed_guard_is_retried)
     _check('F1 indexer column-narrowing exactness', t_indexer_column_narrowing_exact)
     _check('F2 zero-block attention keeps window', t_attention_zero_blocks_keeps_window)
     _check('F3 overfit guard source key', t_overfit_guard_source_key)
