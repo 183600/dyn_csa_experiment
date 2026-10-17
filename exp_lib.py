@@ -171,12 +171,15 @@ def cosine_similarity_consecutive(H, eps=1e-08):
         return (h[..., 1:, :] * h[..., :-1, :]).sum(dim=-1)
     _step = _rows - 1
     _lead_sl = (slice(None),) * (H.dim() - 2)
-    parts = []
+    # Preallocate the final [.., T-1] result and fill the per-chunk slices
+    # (each value is the same per-pair reduction as before); the chunk list +
+    # cat form held the whole result twice.
+    out = H.new_empty(H.shape[:-2] + (T - 1,))
     for s in range(0, T - 1, _step):
         e = min(s + _rows, T)
         h = F.normalize(H[_lead_sl + (slice(s, e), slice(None))], dim=-1, eps=eps)
-        parts.append((h[..., 1:, :] * h[..., :-1, :]).sum(dim=-1))
-    return torch.cat(parts, dim=-1)
+        out[_lead_sl + (slice(s, e - 1),)] = (h[..., 1:, :] * h[..., :-1, :]).sum(dim=-1)
+    return out
 
 # LRU memo of exact segmenter outputs (OrderedDict, O(1) eviction by recency)
 # — a pure cache: hits return the identical (bids, honoured, counts) triple
@@ -215,6 +218,52 @@ def _segment(n, want_cut_list, min_block, max_block):
         if hit is not None:
             _SEGMENT_CACHE.move_to_end(key)
             return hit
+    # `want_cut_list` arrives as a python list (per-row `.tolist()`) or as a
+    # numpy bool row (the batched `_hoist_blocks_from_cuts` path); normalising
+    # through np.asarray is a no-op for the latter.  Same booleans either way.
+    slots = np.nonzero(np.asarray(want_cut_list, dtype=bool))[0]
+    ns = len(slots)
+    _mb, _xb = (int(min_block), int(max_block))
+    # Uniform-stride closed forms.  When the next-cut signal cannot change the
+    # successor (min_block == max_block), when no slot is wanted, or when every
+    # slot is wanted, the successor is p + stride for a constant stride.  The
+    # counts/bids below are exactly the same integers the general table walk
+    # produces (the block starts are an arithmetic progression), so this only
+    # avoids the O(n) successor/scan tables and their temporaries.
+    _stride = None
+    if _mb >= 1 and _mb == _xb:
+        _stride = _mb
+    elif ns == 0:
+        _stride = _xb if _xb >= 1 else 1
+    elif ns == n - 1:
+        _stride = max(1, min(_mb, _xb))
+    if _stride is not None:
+        counts = [_stride] * (n // _stride)
+        _rem = n % _stride
+        if _rem:
+            counts.append(_rem)
+        bids = np.repeat(np.arange(len(counts), dtype=np.int64), np.asarray(counts, dtype=np.int64))
+        honoured = {}
+        if ns:
+            # Non-final block ends are stride, 2*stride, ...; the honoured
+            # slot of a block is the last wanted slot before its end, and only
+            # when that slot lies inside the block.  Same keys/insertion order
+            # as the general table walk (dict.fromkeys over increasing slots).
+            _ends = np.arange(1, len(counts) + 1, dtype=np.int64) * _stride
+            _ends[-1] = n
+            _ends = _ends[:-1]
+            if _ends.size:
+                _hi = np.searchsorted(slots, _ends - 1, side='right')
+                _ok = _hi > 0
+                _cand = np.where(_ok, slots[np.maximum(_hi - 1, 0)], -1)
+                _ok &= _cand >= (_ends - _stride)
+                if _ok.any():
+                    honoured = dict.fromkeys(_cand[_ok].tolist(), 1.0)
+        if cacheable:
+            while len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
+                _SEGMENT_CACHE.popitem(last=False)
+            _SEGMENT_CACHE[key] = (bids, honoured, counts)
+        return (bids, honoured, counts)
     # Successor-table form of the original greedy scan: with p the start of
     # the current block, the next block start is f(p) = min(p + max_block,
     # max(p + min_block, next_cut[p] + 1), n) (never less than p + 1), where
@@ -228,11 +277,6 @@ def _segment(n, want_cut_list, min_block, max_block):
     # slots[bisect_right(slots, q - 1) - 1]) — computed vectorised over the
     # block ends, the same dict the pointer form built.
     _BIG = n + 1
-    # `want_cut_list` arrives as a python list (per-row `.tolist()`) or as a
-    # numpy bool row (the batched `_hoist_blocks_from_cuts` path); normalising
-    # through np.asarray is a no-op for the latter.  Same booleans either way.
-    slots = np.nonzero(np.asarray(want_cut_list, dtype=bool))[0]
-    ns = len(slots)
     pos = _seg_pos(n)
     if ns:
         si = np.searchsorted(slots, pos, side='left')
@@ -926,7 +970,7 @@ def _pool_parts_host(block_ids, B, ov, n, counts_l):
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
 
-def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows):
+def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pad_to=1):
     # Host-side integer/bool flats of the variable-block gather geometry
     # (design notes §6.2): g_a/mask_a/g_b/mask_b/b_off/pos_a are exact
     # integer/bool functions of the cut table's own counts (the same counts
@@ -952,9 +996,6 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows):
         ends_np = np.cumsum(counts_np, dtype=np.int64)
         starts_np = ends_np - counts_np
         pos = np.arange(max_len, dtype=np.int64)
-        gp = starts_np[:, None] + pos[None, :]
-        mask_a_np = gp < ends_np[:, None]
-        np.minimum(gp, n - 1, out=gp)
         op = np.arange(W_b, dtype=np.int64)
         end_prev = np.empty(B, dtype=np.int64)
         end_prev[0] = -1
@@ -964,20 +1005,34 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows):
         starts_prev[1:] = starts_np[:-1]
         ov_start = np.maximum(end_prev - ov, starts_prev)
         ov_len = np.maximum(end_prev - ov_start, 0)
-        mask_b_np = op[None, :] < ov_len[:, None]
-        g_b_np = np.minimum(ov_start[:, None] + op[None, :], n - 1)
-        b_off_np = np.minimum(ov_start[:, None] - starts_prev[:, None] + op[None, :], pb_rows - 1)
-        pos_a_np = pos if max_len <= pa_rows else np.minimum(pos, pa_rows - 1)
         n_a = B * max_len
         n_b = B * W_b
-        flat_i = np.empty(n_a + 2 * n_b + max_len, dtype=np.int64)
-        flat_i[0:n_a] = gp.ravel()
-        flat_i[n_a:n_a + n_b] = g_b_np.ravel()
-        flat_i[n_a + n_b:n_a + 2 * n_b] = b_off_np.ravel()
-        flat_i[n_a + 2 * n_b:] = pos_a_np
-        flat_b = np.empty(n_a + n_b, dtype=np.bool_)
-        flat_b[0:n_a] = mask_a_np.ravel()
-        flat_b[n_a:] = mask_b_np.ravel()
+        # Build every part directly in the final flats (the same integer ops
+        # as before, just with in-place numpy destinations): the ragged
+        # [B, max_len] / [B, W_b] temporaries never exist.  Requested padding
+        # is part of the same allocation, so the caller never has to copy the
+        # flat again to bucket-align it.
+        _pi = (-(n_a + 2 * n_b + max_len)) % int(pad_to) if int(pad_to) > 1 else 0
+        _pb = (-(n_a + n_b)) % int(pad_to) if int(pad_to) > 1 else 0
+        flat_i = np.empty(n_a + 2 * n_b + max_len + _pi, dtype=np.int64)
+        flat_b = np.empty(n_a + n_b + _pb, dtype=np.bool_)
+        gp = flat_i[0:n_a].reshape(B, max_len)
+        np.add(starts_np[:, None], pos[None, :], out=gp)
+        np.less(gp, ends_np[:, None], out=flat_b[0:n_a].reshape(B, max_len))
+        np.minimum(gp, n - 1, out=gp)
+        g_b = flat_i[n_a:n_a + n_b].reshape(B, W_b)
+        np.add(ov_start[:, None], op[None, :], out=g_b)
+        np.less(op[None, :], ov_len[:, None], out=flat_b[n_a:n_a + n_b].reshape(B, W_b))
+        np.minimum(g_b, n - 1, out=g_b)
+        b_off = flat_i[n_a + n_b:n_a + 2 * n_b].reshape(B, W_b)
+        np.subtract(ov_start[:, None], starts_prev[:, None], out=b_off)
+        np.add(b_off, op[None, :], out=b_off)
+        np.minimum(b_off, pb_rows - 1, out=b_off)
+        pos_a = flat_i[n_a + 2 * n_b:n_a + 2 * n_b + max_len]
+        if max_len <= pa_rows:
+            pos_a[:] = pos
+        else:
+            np.minimum(pos, pa_rows - 1, out=pos_a)
         return (flat_i, flat_b, n_a, n_b, W_b, max_len)
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
@@ -995,30 +1050,26 @@ def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, de
     # build-once/cache path.  Returns None when the host form cannot serve;
     # the caller then falls back to the on-device form, whose values are
     # identical.
-    _built = _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows)
+    _built = _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, _POOL_GEOM_BUCKET)
     if _built is None:
         return None
     try:
         B = int(B)
         flat_i, flat_b, n_a, n_b, W_b, max_len = _built
-        _pi = (-len(flat_i)) % _POOL_GEOM_BUCKET
-        if _pi:
-            flat_i = np.concatenate((flat_i, np.zeros(_pi, dtype=np.int64)))
+        # `_pool_geom_flat_var` already bucket-pads both flats inside their
+        # single allocation (no second full-size copy).
         buf = _h2d_async(flat_i, torch.long, dev)
         g_a = buf[0:n_a].view(B, max_len)
         g_b = buf[n_a:n_a + n_b].view(B, W_b)
         b_off = buf[n_a + n_b:n_a + 2 * n_b].view(B, W_b)
         pos_a = buf[n_a + 2 * n_b:n_a + 2 * n_b + max_len]
-        _pb = (-len(flat_b)) % _POOL_GEOM_BUCKET
-        if _pb:
-            flat_b = np.concatenate((flat_b, np.zeros(_pb, dtype=np.bool_)))
         mbuf = _h2d_async(flat_b, torch.bool, dev)
         # the bucket pad tail is never read: every view has an explicit end.
         return (g_a, mbuf[0:n_a].view(B, max_len), g_b, mbuf[n_a:n_a + n_b].view(B, W_b), b_off, pos_a)
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
 
-def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows):
+def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
     # Single-block-form twin of _pool_geom_flat_single's variable sibling
     # (pool_blocks_single's g/mask/pos_a flats): same exact-integer host
     # build (§6.2).  Returns (flat_i, mask_np, n_g, max_len) or None.
@@ -1033,14 +1084,20 @@ def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows):
         ends_np = np.cumsum(counts_np, dtype=np.int64)
         starts_np = ends_np - counts_np
         pos = np.arange(max_len, dtype=np.int64)
-        gp = starts_np[:, None] + pos[None, :]
-        mask_np = gp < ends_np[:, None]
-        np.minimum(gp, n - 1, out=gp)
-        pos_a_np = pos if max_len <= p_rows else np.minimum(pos, p_rows - 1)
         n_g = B * max_len
-        flat_i = np.empty(n_g + max_len, dtype=np.int64)
-        flat_i[0:n_g] = gp.ravel()
-        flat_i[n_g:] = pos_a_np
+        _pi = (-(n_g + max_len)) % int(pad_to) if int(pad_to) > 1 else 0
+        _pb = (-n_g) % int(pad_to) if int(pad_to) > 1 else 0
+        flat_i = np.empty(n_g + max_len + _pi, dtype=np.int64)
+        mask_np = np.empty(n_g + _pb, dtype=np.bool_)
+        gp = flat_i[0:n_g].reshape(B, max_len)
+        np.add(starts_np[:, None], pos[None, :], out=gp)
+        np.less(gp, ends_np[:, None], out=mask_np[0:n_g].reshape(B, max_len))
+        np.minimum(gp, n - 1, out=gp)
+        pos_a = flat_i[n_g:n_g + max_len]
+        if max_len <= p_rows:
+            pos_a[:] = pos
+        else:
+            np.minimum(pos, p_rows - 1, out=pos_a)
         return (flat_i, mask_np, n_g, max_len)
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
@@ -1050,20 +1107,14 @@ def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
     # g/mask/_pos_a): same exact-integer host build (§6.2), same staged
     # transport (§6.1) with bucket-padded flats (bounded pool shape keys,
     # unread pad tails), same None-means-device-fallback contract.
-    _built = _pool_geom_flat_single(counts_l, B, n, max_len, p_rows)
+    _built = _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, _POOL_GEOM_BUCKET)
     if _built is None:
         return None
     try:
         B = int(B)
         flat_i, mask_np, n_g, max_len = _built
-        _pi = (-len(flat_i)) % _POOL_GEOM_BUCKET
-        if _pi:
-            flat_i = np.concatenate((flat_i, np.zeros(_pi, dtype=np.int64)))
+        # Both flats are already bucket-padded in their single allocation.
         buf = _h2d_async(flat_i, torch.long, dev)
-        mask_np = mask_np.ravel()
-        _pb = (-mask_np.size) % _POOL_GEOM_BUCKET
-        if _pb:
-            mask_np = np.concatenate((mask_np, np.zeros(_pb, dtype=np.bool_)))
         mask = _h2d_async(mask_np, torch.bool, dev)[:n_g].view(B, max_len)
         return (buf[0:n_g].view(B, max_len), mask, buf[n_g:n_g + max_len])
     except (RuntimeError, TypeError, ValueError, AttributeError):
@@ -1182,23 +1233,36 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
         rows.append((bid, nblk, _p, _g))
     if not any(rows):
         return
-    _ints = []
-    _bools = []
+    _tot_i = 0
+    _tot_b = 0
     for _r in rows:
         if _r is None:
             continue
-        _ints.append(_r[2][0])
-        _ints.append(_r[3][0])
-        _bools.append(_r[3][1].ravel())
-    flat_i = np.concatenate(_ints)
-    _pi = (-len(flat_i)) % _POOL_GEOM_BUCKET
-    if _pi:
-        flat_i = np.concatenate((flat_i, np.zeros(_pi, dtype=np.int64)))
+        _tot_i += len(_r[2][0]) + len(_r[3][0])
+        _tot_b += len(_r[3][1].ravel())
+    # One padded allocation per dtype class, filled row-by-row: the previous
+    # concatenate-then-concatenate form held the whole payload twice on the
+    # host.  The pad tails are never read.
+    flat_i = np.empty(_tot_i + (-_tot_i) % _POOL_GEOM_BUCKET, dtype=np.int64)
+    flat_b = np.empty(_tot_b + (-_tot_b) % _POOL_GEOM_BUCKET, dtype=np.bool_)
+    _oi = 0
+    _ob = 0
+    for _r in rows:
+        if _r is None:
+            continue
+        _pflat = _r[2][0]
+        _gflat = _r[3][0]
+        _bflat = _r[3][1].ravel()
+        _n = len(_pflat)
+        flat_i[_oi:_oi + _n] = _pflat
+        _oi += _n
+        _n = len(_gflat)
+        flat_i[_oi:_oi + _n] = _gflat
+        _oi += _n
+        _n = len(_bflat)
+        flat_b[_ob:_ob + _n] = _bflat
+        _ob += _n
     buf_i = _h2d_async(flat_i, torch.long, dev)
-    flat_b = np.concatenate(_bools)
-    _pbk = (-len(flat_b)) % _POOL_GEOM_BUCKET
-    if _pbk:
-        flat_b = np.concatenate((flat_b, np.zeros(_pbk, dtype=np.bool_)))
     buf_b = _h2d_async(flat_b, torch.bool, dev)
     off_i = 0
     off_b = 0
