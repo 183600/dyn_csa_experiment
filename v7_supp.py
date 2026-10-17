@@ -218,11 +218,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             mask = None
         sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1) if self.sink is not None else None
         out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
-        row_chunk = max(1, min(T, 1024))
-        _budget = L._attn_transient_budget(x.device)
-        if _budget is not None:
-            _per_row = max(1, 3 * B * self.nh * T) * q.element_size()
-            row_chunk = max(1, min(row_chunk, int(_budget) // _per_row))
+        row_chunk = L._full_attn_row_chunk(x.device, B, self.nh, T, q.element_size())
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
             _mask_c = mask[s:e] if _use_full_mask else L._dense_causal_window_rows(T, cfg.window, s, e, x.device)
@@ -341,7 +337,11 @@ class HybridAttentionRoPE(L.HybridAttention):
             topk_idx = L._arange_exp_cache(T, Bn, x.device)
         else:
             _sel_valid_box = []
-            _, topk_idx, soft = L.lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, cfg.index_topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box)
+            # Eval does not need the soft prior tensor: the straight-through
+            # S path is dead without gradients, so its whole tail is skipped
+            # (same contract as exp_lib._single).
+            _need_soft = torch.is_grad_enabled()
+            _, topk_idx, soft = L.lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, cfg.index_topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, need_soft=_need_soft)
             sel_valid = _sel_valid_box[0]
         sink = self.sink if cfg.use_sink else None
         # Both branches hold distinct block ids per row: the HCA arm passes the
@@ -516,11 +516,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 is_causal=True, scale=scale).transpose(1, 2)
             return self.W_o(out.reshape(B, T, nh * hd))
         out = torch.empty(B, T, nh, hd, device=x.device, dtype=q.dtype)
-        row_chunk = max(1, min(T, 1024))
-        _budget = L._attn_transient_budget(x.device)
-        if _budget is not None:
-            _per_row = max(1, 3 * B * nh * T) * q.element_size()
-            row_chunk = max(1, min(row_chunk, int(_budget) // _per_row))
+        row_chunk = L._full_attn_row_chunk(x.device, B, nh, T, q.element_size())
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
             logits = torch.einsum('bthd,bshd->bths', q[:, s:e], k)

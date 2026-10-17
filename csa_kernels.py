@@ -727,7 +727,7 @@ def _stable_topk_desc(x, k):
     cand = cand.reshape(lead + (kk,))
     return x.gather(-1, cand), cand
 
-def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
+def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=True):
     """torch 参考实现（与 Triton 内核同一套算法分解）。
 
     返回 (idx [R,T,k] int32, valid [R,T,k] bool, soft [R,T,k])。
@@ -765,7 +765,9 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
     k_out = min(int(topk), Bm)
     idx = torch.empty((R, T, k_out), device=dev, dtype=torch.int32)
     valid = torch.empty((R, T, k_out), device=dev, dtype=torch.bool)
-    soft = torch.empty((R, T, k_out), device=dev, dtype=acc)
+    # Soft is a training-only prior (the straight-through S path is dead
+    # without gradients), so eval skips its allocation and tail entirely.
+    soft = torch.empty((R, T, k_out), device=dev, dtype=acc) if need_soft else None
     # 逐行独立的 (r,t) 归约（mask/lse/sort/topk）：按 t 分块与整幅计算的
     # 每行值逐位一致（同 kernel、同归约顺序），中间张量按 t 块封顶。
     t_chunk = max(1, min(T, (256 << 20) // max(R * Bm * 32, 1)))
@@ -793,8 +795,9 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
         scores = scores.to(dtype)
         # where 的标量分支与 full_like/zeros_like 逐位同值（标量按 dtype
         # 精确表示、元素级选择同一比较结果）。
-        masked_lse = torch.where(causal_c, scores, _NEG_INF)
-        lse = torch.logsumexp(masked_lse, dim=-1)
+        if need_soft:
+            masked_lse = torch.where(causal_c, scores, _NEG_INF)
+            lse = torch.logsumexp(masked_lse, dim=-1)
         cf = causal_c & torch.isfinite(scores)
         work = torch.where(cf, scores, _NEG_INF)
         # pad 恒为块 0（eager 形式；池化 last_tok 单调时与「首个因果块」
@@ -808,11 +811,12 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk):
         has = top_val > float('-inf')
         valid[:, t0:t1] = has
         idx[:, t0:t1] = torch.where(has, top_idx, pad_blk[:, :, None]).to(torch.int32)
-        sv = top_val - lse[:, :, None]
-        sv = torch.where(has & torch.isfinite(lse)[:, :, None],
-                         torch.exp(sv), 0.0)
-        soft[:, t0:t1] = torch.where(sv == sv, sv, 0.0)
-    return idx, valid, soft.to(dtype)
+        if need_soft:
+            sv = top_val - lse[:, :, None]
+            sv = torch.where(has & torch.isfinite(lse)[:, :, None],
+                             torch.exp(sv), 0.0)
+            soft[:, t0:t1] = torch.where(sv == sv, sv, 0.0)
+    return idx, valid, (soft.to(dtype) if need_soft else None)
 
 
 def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
@@ -922,11 +926,14 @@ class FusedIndexer(torch.autograd.Function):
     soft 的梯度经 _indexer_bwd_ref 回传到 qI / kI / w。"""
 
     @staticmethod
-    def forward(ctx, impl, qI, kI, w_idx, last_tok, topk):
+    def forward(ctx, impl, qI, kI, w_idx, last_tok, topk, need_soft=True):
+        # A caller may request the no-soft form only when no gradient can
+        # reach it; under grad mode the S path always needs the prior.
+        need_soft = bool(need_soft) or torch.is_grad_enabled()
         if impl == 'triton':
-            idx, valid, soft = _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk)
+            idx, valid, soft = _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=need_soft)
         else:
-            idx, valid, soft = _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk)
+            idx, valid, soft = _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=need_soft)
         ctx.save_for_backward(qI, kI, w_idx, last_tok, idx, valid, soft)
         ctx.topk = int(topk)
         return idx, valid, soft
@@ -935,22 +942,22 @@ class FusedIndexer(torch.autograd.Function):
     def backward(ctx, gidx, gvalid, gs):
         qI, kI, w_idx, last_tok, idx, valid, soft = ctx.saved_tensors
         if gs is None:
-            return (None,) * 6
+            return (None,) * 7
         ng = ctx.needs_input_grad
         _ic = (_env_cached('CSA_KERNEL_IDX_CHUNK') or '').strip()
         dqI, dkI, dw = _indexer_bwd_ref(
             gs, idx, valid, soft, qI, kI, w_idx, last_tok,
             need_dq=bool(ng[1]), need_dk=bool(ng[2]), need_dw=bool(ng[3]),
             t_chunk=int(_ic) if _ic else None)
-        return (None, dqI, dkI, dw, None, None)
+        return (None, dqI, dkI, dw, None, None, None)
 
 
-def lightning_indexer_kernel(qI, kI, w_idx, last_tok, topk, impl=None):
+def lightning_indexer_kernel(qI, kI, w_idx, last_tok, topk, impl=None, need_soft=True):
     """`exp_lib.lightning_indexer`（learned 模式、return_mask=False）的内核
     路径。    qI [R,T,nIH,hd]、kI [R,Bm,nIH,hd]、w_idx [R,T,nIH]、
     last_tok [R,Bm]。返回 (idx, valid, soft)。"""
     impl = impl or _op_impl('IDX')
-    return FusedIndexer.apply(impl, qI, kI, w_idx, last_tok, int(topk))
+    return FusedIndexer.apply(impl, qI, kI, w_idx, last_tok, int(topk), bool(need_soft))
 
 
 # ============================================================================
@@ -2115,7 +2122,7 @@ def _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
 _IDX_SCORES_CAP_BYTES = 128 << 20
 
 
-def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk):
+def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
     K = _kernels()
     triton = K.triton
     R, T, nIH, hd = qI.shape
@@ -2143,7 +2150,7 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk):
                                                 DOT=_dot_prec(), num_warps=4)
         K.idx_topk[(R * tc,)](scores, last_tok, idx, valid_i8, soft, t0, T, tc, Bm,
                               K=k_out, BB=BB2, num_warps=8 if BB2 >= 1024 else 4)
-    return idx, valid_i8.view(torch.bool), soft
+    return idx, valid_i8.view(torch.bool), (soft if need_soft else None)
 
 
 # ============================================================================
@@ -2271,7 +2278,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         qI = pre_all['qI'].view(B, T, nIH, hd)
         w_idx = pre_all['w_idx']
         kI = (comp.reshape(B * Bm, kv) @ attn.W_DK).view(B, Bm, nIH, hd)
-        topk_idx, valid, soft = lightning_indexer_kernel(qI, kI, w_idx, last_tok, cfg.index_topk, impl=impl_idx)
+        topk_idx, valid, soft = lightning_indexer_kernel(qI, kI, w_idx, last_tok, cfg.index_topk, impl=impl_idx, need_soft=torch.is_grad_enabled())
     sink = attn.sink if cfg.use_sink else None
     out = gathered_attention_kernel(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw,
                                     cfg.sliding_window, 1.0,

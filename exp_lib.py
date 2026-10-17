@@ -782,6 +782,21 @@ def _attn_transient_budget(device):
     _ATB_CACHE[key] = val
     return val
 
+_FULL_ATTN_TRANSIENT_BYTES = 256 << 20
+
+def _full_attn_row_chunk(device, B, nh, T, elem_size, max_rows=1024):
+    # Row chunk for the sink-capable dense path: the logits table is
+    # [B, nh, rows, T], so bounding `rows` bounds its peak bytes.  A CUDA
+    # device uses its measured free-memory budget; every other device uses a
+    # fixed transient cap (the same 256 MiB `gathered_attention` already
+    # uses).  Chunking is a pure row partition, so no value changes.
+    row_chunk = max(1, min(int(T), int(max_rows)))
+    budget = _attn_transient_budget(device)
+    if budget is None:
+        budget = _FULL_ATTN_TRANSIENT_BYTES
+    per_row = max(1, 3 * int(B) * int(nh) * int(T)) * int(elem_size)
+    return max(1, min(row_chunk, int(budget) // per_row))
+
 def _tri_full(n, device, k):
     with torch.inference_mode(False):
         m = torch.empty((n, n), device=device)
@@ -1477,6 +1492,11 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         sc_a = sc[:, :max_len]
         sc_b = sc[:, max_len:]
         comp[_b0:_b1] = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
+        # Release this chunk's saved activations before the next chunk's
+        # gathers allocate: Python assigns the next iteration's names only
+        # after evaluating its right-hand sides, so without this the previous
+        # chunk's tables would stay alive at the next chunk's peak.
+        del sc, sc_a, sc_b, Xam, Xbm, _ma, _mb
     # Identity-order path: when `order` is the cached arange, order[last_idx]
     # returns exactly last_idx (arange[i] == i, exact integers — index
     # transport, design notes §6.1).
@@ -1558,6 +1578,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         # 同 _pool_ordered：softmax 反向保存输出，nan_to_num 出位。
         sc = F.softmax(WinZ, dim=1) if _clean else torch.nan_to_num(F.softmax(WinZ, dim=1))
         comp[_b0:_b1] = (sc * Xb).sum(1)
+        del WinZ, Xb, Zb, sc
     # same identity-order fast path as _pool_ordered: order[last_idx] over the
     # cached arange returns exactly last_idx (index transport, §6.1).
     return (comp, last_idx if _ident else order[last_idx], B)
@@ -1834,7 +1855,11 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             # gathered_attention 直通分支（该分支在无梯度下被 _soft_live 整体
             # 跳过）的唯一下游，故整条 soft 尾部不物化（不改变 idx 的任何
             # 整数，也不改变下游任何前向 bit）。
-            del c, _ic
+            del c, _ic, _ccausal
+            if random_select:
+                del z
+            else:
+                del raw
             continue
         c.masked_fill_(_ncausal[s:e], float('-inf'))
         _lse = torch.logsumexp(c, dim=-1, keepdim=True)
@@ -1845,7 +1870,11 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         # nan_to_num 必须出位：exp_ 的反向保存其输出张量，原地 nan_to_num_ 会
         # 改写该保存值、使 ExpBackward 的版本检查失败（反向报错）。
         soft[s:e] = torch.nan_to_num(c.gather(1, _ic.long()).sub_(_lse).exp_())
-        del c, _lse, _ic
+        del c, _lse, _ic, _ccausal
+        if random_select:
+            del z
+        else:
+            del raw
     if _valid_parts is not None:
         out_valid[:] = [_valid_parts[0] if len(_valid_parts) == 1 else torch.cat(_valid_parts, 0)]
     m = None
@@ -2085,6 +2114,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             if not _has_sink:
                 attn.mul_(anyrow[:, None, None])
             out[s:e] = _einsum('qhm,qmhd->qhd', attn, _tk2(v_all, _rows))
+            del logits, attn, nvalid, anyrow, keep, _sel_rows, _win_local, _win_rows, _rows, qseg
             continue
         # The soft branch reads its K halves as two contiguous gathers: the
         # concatenated V gather below holds exactly the same rows as two
@@ -2127,7 +2157,26 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         if not _has_sink:
             attn.mul_(anyrow[:, None, None])
         out[s:e] = _einsum('qhm,qmhd->qhd', attn, _tk2(v_all, _rows))
+        # Drop this chunk's tables before the next chunk's gathers allocate
+        # (same peak-memory reason as the pooling loop).  `soft_attn` only
+        # exists on the live-soft path.
+        del logits, attn, nvalid, anyrow, keep, _sel_rows, _win_local, _win_rows, _rows, qseg
+        if _soft_live:
+            del soft_attn
     return out
+
+# CPU-only activation-checkpoint policy: recomputation is a pure speed/memory
+# trade, and this box has no VRAM budget to protect.  Still bound the extra
+# resident activations so scaling a CPU run does not turn into an OOM: below
+# the per-call limits the saved tensors are kept (faster), above them the
+# existing recompute path runs unchanged.  CUDA always keeps recompute.
+_CPU_ACTIVE_BATCH = [1]
+_CPU_GATHER_CKPT_BYTES = 512 << 20
+_CPU_POOL_CKPT_BYTES = 64 << 20
+_CPU_CE_CKPT_BYTES = 128 << 20
+
+def _cpu_saved_ok(saved_bytes, limit):
+    return torch.is_grad_enabled() and saved_bytes < int(limit)
 
 def _gathered_attention_trainable(*args, **kwargs):
     # 训练时包一层非重入 checkpoint，反向按同一确定性分解重算前向。函数内
@@ -2137,6 +2186,12 @@ def _gathered_attention_trainable(*args, **kwargs):
     # 跳过 checkpoint 的 RNG 状态存取（preserve_rng_state=False）——省掉
     # 每次调用的 CUDA RNG 快照/恢复，重算不消耗也不改写任何随机流。
     if torch.is_grad_enabled() and args[0].requires_grad:
+        q = args[0]
+        if q.device.type != 'cuda':
+            _M = int(args[3].shape[1]) + int(args[7])
+            _saved = 2 * int(q.numel()) * max(1, _M) * int(q.element_size()) * int(_CPU_ACTIVE_BATCH[0])
+            if _cpu_saved_ok(_saved, _CPU_GATHER_CKPT_BYTES):
+                return gathered_attention(*args, **kwargs)
         return torch.utils.checkpoint.checkpoint(gathered_attention, *args, use_reentrant=False, preserve_rng_state=False, **kwargs)
     return gathered_attention(*args, **kwargs)
 
@@ -2147,6 +2202,11 @@ def _pool_trainable(fn, *args, **kwargs):
     # int 型的 n_blocks 返回值原样透传。eval 下（无梯度）直调。池化同样
     # 无 RNG，所以 checkpoint 不需要保存/恢复随机流。
     if torch.is_grad_enabled() and args[0].requires_grad:
+        x = args[0]
+        if x.device.type != 'cuda':
+            _saved = 16 * int(x.numel()) * int(x.element_size()) * int(_CPU_ACTIVE_BATCH[0])
+            if _cpu_saved_ok(_saved, _CPU_POOL_CKPT_BYTES):
+                return fn(*args, **kwargs)
         return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False, preserve_rng_state=False, **kwargs)
     return fn(*args, **kwargs)
 
@@ -2322,11 +2382,7 @@ class HybridAttention(nn.Module):
             mask = None
         sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1) if self.sink is not None else None
         out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
-        row_chunk = max(1, min(T, 1024))
-        _budget = _attn_transient_budget(x.device)
-        if _budget is not None:
-            _per_row = max(1, 3 * B * self.nh * T) * q.element_size()
-            row_chunk = max(1, min(row_chunk, int(_budget) // _per_row))
+        row_chunk = _full_attn_row_chunk(x.device, B, self.nh, T, q.element_size())
         # 训练时每个行块包一层非重入 checkpoint：反向按块重算同一份值（无
         # RNG、row_chunk 经 _ATB_EPOCH 在运行内不变、mask 是缓存的常量张量
         # ——块边界与中间值逐位相同，梯度与不分块形式逐位一致，同 ce_loss
@@ -2768,12 +2824,17 @@ class HybridAttention(nn.Module):
         # the stack form (transport only, design notes §6.1).
         outs = torch.empty(B, T, d, device=x.device, dtype=x.dtype)
         gates = []
-        for b in range(B):
-            pre = pres[b]
-            o, g = self._single(x[b], pre=pre, gate_sig=None if gate_sigs is None else gate_sigs[b], pre_blocks=None if pre_blocks is None else pre_blocks[b])
-            outs[b] = o
-            if g is not None:
-                gates.append(g)
+        _prev_batch = _CPU_ACTIVE_BATCH[0]
+        _CPU_ACTIVE_BATCH[0] = int(B)
+        try:
+            for b in range(B):
+                pre = pres[b]
+                o, g = self._single(x[b], pre=pre, gate_sig=None if gate_sigs is None else gate_sigs[b], pre_blocks=None if pre_blocks is None else pre_blocks[b])
+                outs[b] = o
+                if g is not None:
+                    gates.append(g)
+        finally:
+            _CPU_ACTIVE_BATCH[0] = _prev_batch
         if not gates:
             self.last_gate_mean = None
         else:
@@ -2939,6 +3000,10 @@ class SmallGPT(nn.Module):
         n_tok = targets.numel()
         ce = None
         _ck = torch.is_grad_enabled() and h.requires_grad
+        if _ck and h.device.type != 'cuda':
+            _rows = min(int(chunk), int(ids.shape[1]))
+            _saved = 3 * int(ids.shape[0]) * _rows * int(vocab) * 4
+            _ck = not _cpu_saved_ok(_saved, _CPU_CE_CKPT_BYTES)
         for s in range(0, ids.shape[1], chunk):
             if _ck:
                 c = torch.utils.checkpoint.checkpoint(self._ce_head_chunk, h[:, s:s + chunk], targets[:, s:s + chunk], vocab, use_reentrant=False, preserve_rng_state=False)
