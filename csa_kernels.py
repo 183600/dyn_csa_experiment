@@ -1478,7 +1478,7 @@ def _kernels():
     # where/nan 守卫清零——两种情形都与全宽 extract 归约同值。
     @triton.jit
     def idx_topk(scores_ptr, last_tok_ptr, idx_ptr, valid_ptr, soft_ptr, T0, TF, T, Bm,
-                 K: tl.constexpr, BB: tl.constexpr):
+                 K: tl.constexpr, BB: tl.constexpr, HAS_SOFT: tl.constexpr):
         pid = tl.program_id(0)
         r = (pid // T).to(tl.int64)
         t = pid % T
@@ -1491,18 +1491,22 @@ def _kernels():
         lt = tl.load(last_tok_ptr + r * Bm + b, mask=bm, other=TF - 1).to(tl.int64)
         causal = (tg > lt) & bm
         finite = (s - s) == 0.0
-        masked = tl.where(causal, s, float('-inf'))
-        has_nan = tl.sum(tl.where(masked != masked, 1.0, 0.0), 0) > 0.0
-        has_pinf = tl.sum(tl.where(masked == float('inf'), 1.0, 0.0), 0) > 0.0
-        m0 = tl.max(masked, 0)
-        # 全掩行兜底取 0（exp(-inf-0)=0、lse=-inf，与 eager 的全 -inf
-        # logsumexp 同值）；有限行一律用真 max——钳位哨兵会在「全部有效
-        # logit < 哨兵」时背离 eager 的归一化。
-        m_safe = tl.where(m0 == float('-inf'), 0.0, m0)
-        e = tl.exp(masked - m_safe)
-        Ssum = tl.sum(e, 0)
-        lse = m_safe + tl.log(Ssum)
-        lse = tl.where(has_nan, float('nan'), tl.where(has_pinf, float('inf'), lse))
+        # lse / exp tail only feeds the training-only soft prior; when the
+        # caller does not need it the whole reduction is compile-time
+        # eliminated (idx/valid are independent of it).
+        if HAS_SOFT:
+            masked = tl.where(causal, s, float('-inf'))
+            has_nan = tl.sum(tl.where(masked != masked, 1.0, 0.0), 0) > 0.0
+            has_pinf = tl.sum(tl.where(masked == float('inf'), 1.0, 0.0), 0) > 0.0
+            m0 = tl.max(masked, 0)
+            # 全掩行兜底取 0（exp(-inf-0)=0、lse=-inf，与 eager 的全 -inf
+            # logsumexp 同值）；有限行一律用真 max——钳位哨兵会在「全部有效
+            # logit < 哨兵」时背离 eager 的归一化。
+            m_safe = tl.where(m0 == float('-inf'), 0.0, m0)
+            e = tl.exp(masked - m_safe)
+            Ssum = tl.sum(e, 0)
+            lse = m_safe + tl.log(Ssum)
+            lse = tl.where(has_nan, float('nan'), tl.where(has_pinf, float('inf'), lse))
         work = tl.where(causal & finite, s, float('-inf'))
         BIG = Bm + 1
         # pad 恒为块 0（eager 形式；池化 last_tok 单调时与「首个因果块」
@@ -1516,12 +1520,13 @@ def _kernels():
             pick = tl.min(tl.where(work == m, b, BIG), 0)
             work = tl.where(has & (b == pick), float('-inf'), work)
             use = tl.where(has, pick, pad)
-            sv = tl.exp(m - lse)
-            sv = tl.where(has, sv, 0.0)
-            sv = tl.where(sv == sv, sv, 0.0)
             tl.store(idx_ptr + rt_out * K + j, use.to(tl.int32))
             tl.store(valid_ptr + rt_out * K + j, has.to(tl.int8))
-            tl.store(soft_ptr + rt_out * K + j, sv.to(soft_ptr.dtype.element_ty))
+            if HAS_SOFT:
+                sv = tl.exp(m - lse)
+                sv = tl.where(has, sv, 0.0)
+                sv = tl.where(sv == sv, sv, 0.0)
+                tl.store(soft_ptr + rt_out * K + j, sv.to(soft_ptr.dtype.element_ty))
 
     ns.idx_topk = idx_topk
 
@@ -2170,7 +2175,12 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
     BB2 = _next_pow2(Bm)
     idx = torch.empty((R, T, k_out), device=qI.device, dtype=torch.int32)
     valid_i8 = torch.empty((R, T, k_out), device=qI.device, dtype=torch.int8)
-    soft = torch.empty((R, T, k_out), device=qI.device, dtype=qI.dtype)
+    # The soft prior is training-only (its straight-through path is dead
+    # without gradients), so eval skips both its allocation and the kernel's
+    # lse/exp tail.  The dummy pointer is never dereferenced when HAS_SOFT is
+    # false (the branch is compile-time eliminated).
+    soft = torch.empty((R, T, k_out), device=qI.device, dtype=qI.dtype) if need_soft else None
+    soft_arg = soft if soft is not None else idx
     BT, BB = 64, 64
     T_c = max(1, min(T, _IDX_SCORES_CAP_BYTES // max(R * Bm * 4, 1)))
     scores = torch.empty((R, T_c, Bm), device=qI.device, dtype=torch.float32)
@@ -2179,9 +2189,10 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
         K.idx_score[(R * triton.cdiv(tc, BT),)](qI, kI, w_idx, scores, t0, T, tc, Bm, hd ** -0.5,
                                                 N_IH=nIH, HD=hd, HDP=HDP, BT=BT, BB=BB,
                                                 DOT=_dot_prec(), num_warps=4)
-        K.idx_topk[(R * tc,)](scores, last_tok, idx, valid_i8, soft, t0, T, tc, Bm,
-                              K=k_out, BB=BB2, num_warps=8 if BB2 >= 1024 else 4)
-    return idx, valid_i8.view(torch.bool), (soft if need_soft else None)
+        K.idx_topk[(R * tc,)](scores, last_tok, idx, valid_i8, soft_arg, t0, T, tc, Bm,
+                              K=k_out, BB=BB2, HAS_SOFT=bool(need_soft),
+                              num_warps=8 if BB2 >= 1024 else 4)
+    return idx, valid_i8.view(torch.bool), soft
 
 
 # ============================================================================

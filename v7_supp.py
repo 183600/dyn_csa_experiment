@@ -795,6 +795,14 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     _gc_relief = gc.isenabled()
     if _gc_relief:
         gc.disable()
+    # Same CUDA working-set guard as exp_lib.train_variant: when the free
+    # memory cannot hold the estimated activations, recompute the identical
+    # pure forward during backward.  Values/gradients are unchanged; the
+    # explicit CSA_CKPT setting still wins.
+    _ckpt_saved = L._CKPT['on']
+    _auto_ckpt, _ = L._auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs)
+    if _auto_ckpt:
+        L._CKPT['on'] = _auto_ckpt
     try:
         for step in range(steps):
             if deadline_ts is not None and time.time() > deadline_ts:
@@ -837,6 +845,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
                     _lbuf.clear()
                 print(f'  step {step:5d}  loss {float(losses[-1]):.4f}  lr {opt.param_groups[0]['lr']:.2e}  dense={getattr(model.blocks[0].attn, '_dense_warmup', False)}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
     finally:
+        L._CKPT['on'] = _ckpt_saved
         if _gc_relief:
             gc.enable()
     wall = time.time() - t0
