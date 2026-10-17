@@ -203,10 +203,15 @@ class HybridAttentionRoPE(L.HybridAttention):
             return self.W_o(out.reshape(B, T, self.nh * self.hd))
         # windowed and full masks are mutually exclusive: pick the one the call
         # actually uses (both are cached constants, so values are unchanged).
-        if cfg.window > 0:
-            mask = L.causal_window_mask(T, cfg.window, x.device)
+        # Beyond the row cap, each chunk builds only its own identical slice.
+        _use_full_mask = T * T * 4 <= L._DENSE_MASK_ROW_CAP_BYTES
+        if _use_full_mask:
+            if cfg.window > 0:
+                mask = L.causal_window_mask(T, cfg.window, x.device)
+            else:
+                mask = L.causal_mask(T, x.device)
         else:
-            mask = L.causal_mask(T, x.device)
+            mask = None
         sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1)
         out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
         row_chunk = max(1, min(T, 1024))
@@ -216,9 +221,10 @@ class HybridAttentionRoPE(L.HybridAttention):
             row_chunk = max(1, min(row_chunk, int(_budget) // _per_row))
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
+            _mask_c = mask[s:e] if _use_full_mask else L._dense_causal_window_rows(T, cfg.window, s, e, x.device, torch.float32)
             logits = torch.einsum('bnhd,bmhd->bhnm', q[:, s:e], k)
             logits.mul_(scale)
-            logits.add_(mask[s:e])
+            logits.add_(_mask_c)
             lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
             attn = logits.sub(lse).exp_()
             del logits, lse
@@ -381,6 +387,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         else:
             k_all, v_all = (k_blk_r, v_blk)
         _win_off = _nblk_rows if _has_sw else 0
+        _win_off_tab = L._window_block_offset(T, w, _nblk_rows, dev) if _win_off else None
         # see exp_lib.gathered_attention: these per-row masks are hoisted under
         # L._FO_FULL_CAP_BYTES; the hoisted values are bitwise identical to the
         # per-chunk forms.  `topk_distinct=True` (the read-everything HCA arm's
@@ -427,7 +434,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             # addressed through the +n_blk offsets, so every gathered value is
             # bit-identical (index re-plumbing only, §6.1).
             _iw = _wi_all[s:e]
-            _iw_rows = _iw + _win_off if _win_off else _iw
+            _iw_rows = _win_off_tab[s:e] if _win_off_tab is not None else _iw
             _rows = torch.cat([ib, _iw_rows], 1) if _has_sw else ib
             Kset = L._take_2d(k_all, _rows)
             qc = apply_rope(q[s:e], cos[s:e, None, :], sin[s:e, None, :], rope_dim)
@@ -468,10 +475,14 @@ class HybridAttentionRoPE(L.HybridAttention):
         scale = 1.0
         use_rope = isinstance(self.cfg, AttnCfgRope) and self.cfg.rope
         rd = min(getattr(self.cfg, 'rope_dim', 0), hd)
-        mask = L.causal_mask(T, x.device)
         win = getattr(self, '_dense_max_T', None)
-        if win is not None and win < T:
-            mask = L.causal_window_mask(T, win, x.device)
+        _use_full_mask = T * T * 4 <= L._DENSE_MASK_ROW_CAP_BYTES
+        if _use_full_mask:
+            mask = L.causal_mask(T, x.device)
+            if win is not None and win < T:
+                mask = L.causal_window_mask(T, win, x.device)
+        else:
+            mask = None
         Ca = x @ self.W_aKV
         q = F.normalize(self.W_q(x).view(B, T, nh, hd), dim=-1)
         norm_kv = getattr(self.cfg, 'qk_norm', False)
@@ -502,7 +513,8 @@ class HybridAttentionRoPE(L.HybridAttention):
             logits = torch.einsum('bthd,bshd->bths', q[:, s:e], k)
             if scale != 1.0:
                 logits.mul_(scale)
-            logits.add_(mask[s:e][:, None, :])
+            _mask_c = mask[s:e] if _use_full_mask else L._dense_causal_window_rows(T, win if win is not None else 0, s, e, x.device, torch.float32)
+            logits.add_(_mask_c[:, None, :])
             zflat = logits.reshape(B * (e - s), nh, T)
             if sink is None:
                 attn = L.sink_softmax(zflat, sink)

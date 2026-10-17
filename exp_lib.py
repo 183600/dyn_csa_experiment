@@ -148,9 +148,38 @@ def _dev_str(device):
 def block_readable(pos, last_tok):
     return pos[:, None] > last_tok[None, :]
 
+_CONSEC_COS_CHUNK_BYTES = 64 << 20
+
 def cosine_similarity_consecutive(H, eps=1e-08):
-    h = F.normalize(H, dim=-1, eps=eps)
-    return (h[1:] * h[:-1]).sum(dim=-1)
+    # Consecutive-pair cosine similarity with a bounded transient.  The
+    # normalized rows and the elementwise product are pure per-position
+    # functions, so processing the time axis in chunks changes no value; it
+    # only avoids holding both the normalized copy and the [.., T-1, d]
+    # product for the whole sequence (multi-GB at long T / large d).  The
+    # unchunked form is used whenever it already fits the budget, keeping the
+    # historical kernel shapes for the existing panels.
+    if H.dim() < 2:
+        h = F.normalize(H, dim=-1, eps=eps)
+        return (h[1:] * h[:-1]).sum(dim=-1)
+    T = int(H.shape[-2])
+    if T <= 1:
+        return H.new_empty(H.shape[:-2] + (0,))
+    lead = 1
+    for _s in H.shape[:-2]:
+        lead *= int(_s)
+    _row_bytes = max(1, lead * int(H.shape[-1]) * H.element_size())
+    _rows = max(2, _CONSEC_COS_CHUNK_BYTES // _row_bytes)
+    if _rows >= T:
+        h = F.normalize(H, dim=-1, eps=eps)
+        return (h[..., 1:, :] * h[..., :-1, :]).sum(dim=-1)
+    _step = _rows - 1
+    _lead_sl = (slice(None),) * (H.dim() - 2)
+    parts = []
+    for s in range(0, T - 1, _step):
+        e = min(s + _rows, T)
+        h = F.normalize(H[_lead_sl + (slice(s, e), slice(None))], dim=-1, eps=eps)
+        parts.append((h[..., 1:, :] * h[..., :-1, :]).sum(dim=-1))
+    return torch.cat(parts, dim=-1)
 
 # LRU memo of exact segmenter outputs (OrderedDict, O(1) eviction by recency)
 # — a pure cache: hits return the identical (bids, honoured, counts) triple
@@ -626,6 +655,27 @@ def _causal_window_mask_build(T, window, device, dtype):
         m.masked_fill_(far, float('-inf'))
         far.fill_(True).triu_(1)
         m.masked_fill_(far, float('-inf'))
+    return m
+
+_DENSE_MASK_ROW_CAP_BYTES = 256 << 20
+
+def _dense_causal_window_rows(T, window, s, e, device, dtype):
+    # Row slice [s:e] of the cached dense causal/window additive mask, built
+    # on demand.  The allowed lanes are exactly (i-window < j <= i) with the
+    # same 0.0 / -inf constants, so the values are identical to
+    # `_causal_window_mask_build(...)[s:e]`; only the [T, T] allocation
+    # disappears.  Used when a full mask would exceed the row cap (long
+    # contexts), where holding T^2 would dominate memory.
+    pos = _arange_cache(T, device)
+    q = pos[s:e, None]
+    j = pos[None, :]
+    if window <= 0 or window >= T:
+        bad = j > q
+    else:
+        bad = (j > q) | (j <= q - int(window))
+    with torch.inference_mode(False):
+        m = torch.zeros((e - s, T), device=device, dtype=dtype)
+    m.masked_fill_(bad, float('-inf'))
     return m
 
 def causal_window_mask_f(T, window, device, dtype):
@@ -1113,6 +1163,18 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
         bid, nblk = _pb[0], int(_pb[1])
         _cpu = getattr(bid, '_pool_cpu', None)
         if _cpu is None or len(_cpu[0]) != nblk or nblk <= 0:
+            rows.append(None)
+            continue
+        # An already populated (block-ids object, shape) cache needs no host
+        # rebuild or upload at all.  The fixed segmenter shares one block-ids
+        # object across every row/layer/step, so after the first layer only
+        # the dynamic arm (fresh per-row objects) still reaches the upload.
+        _pkey = (nblk, ov if _csa else -1, int(n))
+        _gkey = (('vo', nblk, ov, int(n), pa_rows, pb_rows) if _csa
+                 else ('so', nblk, int(n), pa_rows))
+        _pc = getattr(bid, '_pool_gpu', None)
+        _gc = getattr(bid, '_pool_geom', None)
+        if _pc is not None and _gc is not None and _pkey in _pc and _gkey in _gc:
             rows.append(None)
             continue
         counts_l = _cpu[0]
@@ -1807,6 +1869,9 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         del sel_blk_all, valid_all
     else:
         _plan = None
+    # Hoist the stacked-window row table once per call (cached, exact int32)
+    # instead of allocating a [chunk, w] offset tensor in every chunk.
+    _win_off_tab = _window_block_offset(n, w, _nblk_rows, dev) if _win_off else None
     for s in range(0, n, q_chunk):
         e = s + q_chunk
         if e > n:
@@ -1836,7 +1901,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # cat-then-gather form (index re-plumbing only, design notes §6.1).
         _sel_rows = topk_l[s:e]
         _win_local = win_idx[s:e]
-        _win_rows = _win_local + _win_off if _win_off else _win_local
+        _win_rows = _win_off_tab[s:e] if _win_off_tab is not None else _win_local
         # `_has_sw` is the contract for stacking window lanes: the row offset
         # may be 0 when k_blk holds no rows, and that is still a valid
         # stacked-row base.
@@ -2066,10 +2131,17 @@ class HybridAttention(nn.Module):
                 sdpa_kw['is_causal'] = True
             out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
             return self.W_o(out.reshape(B, T, self.nh * self.hd))
-        if self.cfg.window > 0:
-            mask = causal_window_mask(T, self.cfg.window, x.device)
+        # A full [T, T] mask is cached for ordinary lengths; beyond the row
+        # cap each row chunk builds exactly its own slice on demand, so the
+        # T^2 resident table never exists.  The slice values are identical.
+        _use_full_mask = T * T * 4 <= _DENSE_MASK_ROW_CAP_BYTES
+        if _use_full_mask:
+            if self.cfg.window > 0:
+                mask = causal_window_mask(T, self.cfg.window, x.device)
+            else:
+                mask = causal_mask(T, x.device)
         else:
-            mask = causal_mask(T, x.device)
+            mask = None
         sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1) if self.sink is not None else None
         out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
         row_chunk = max(1, min(T, 1024))
@@ -2084,13 +2156,20 @@ class HybridAttention(nn.Module):
         _ck = torch.is_grad_enabled() and q.requires_grad
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
+            # A tuple is the row-mask recipe, not a tensor: keeping it out of
+            # the checkpoint's saved inputs lets the recompute rebuild the
+            # identical slice instead of retaining every chunk's mask.
+            _mask_c = mask[s:e] if _use_full_mask else (s, e, T, self.cfg.window)
             if _ck:
-                out[:, s:e] = torch.utils.checkpoint.checkpoint(self._sink_attn_chunk, q[:, s:e], k, v, mask[s:e], sink_view, scale, use_reentrant=False)
+                out[:, s:e] = torch.utils.checkpoint.checkpoint(self._sink_attn_chunk, q[:, s:e], k, v, _mask_c, sink_view, scale, use_reentrant=False)
             else:
-                out[:, s:e] = self._sink_attn_chunk(q[:, s:e], k, v, mask[s:e], sink_view, scale)
+                out[:, s:e] = self._sink_attn_chunk(q[:, s:e], k, v, _mask_c, sink_view, scale)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
 
     def _sink_attn_chunk(self, q_c, k, v, mask_c, sink_view, scale):
+        if isinstance(mask_c, tuple):
+            s, e, T, window = mask_c
+            mask_c = _dense_causal_window_rows(T, window, s, e, q_c.device, torch.float32)
         logits = torch.einsum('bnhd,bmhd->bhnm', q_c, k)
         if scale != 1.0:
             # same IEEE identity as gathered_attention (x·1.0 and its backward
@@ -2230,8 +2309,7 @@ class HybridAttention(nn.Module):
                 # itself, exactly like _gate_signal's inline form)
                 return ([self._gate_signal(x[b], None) for b in range(B)], None)
             fused = x.detach()
-        h = F.normalize(fused, dim=-1, eps=1e-08)
-        sim = (h[:, 1:] * h[:, :-1]).sum(dim=-1)
+        sim = cosine_similarity_consecutive(fused, eps=1e-08)
         if sim.shape[-1] == 0:
             return ([None] * B, None)
         cfg = self.cfg
@@ -2254,8 +2332,7 @@ class HybridAttention(nn.Module):
         B, T, _d = x.shape
         if T <= 1:
             return None
-        _h = F.normalize(x.detach(), dim=-1, eps=1e-08)
-        sim = (_h[:, 1:] * _h[:, :-1]).sum(dim=-1)
+        sim = cosine_similarity_consecutive(x.detach(), eps=1e-08)
         if cfg.chunking == 'cosine_adaptive' or cfg.adaptive:
             tau = causal_adaptive_threshold(sim, cfg.target_block_tokens)
         else:
