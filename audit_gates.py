@@ -862,6 +862,15 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
             'verified_components': rep.get('verified_components'),
             'unverified_components': rep.get('unverified_components'),
             'incomplete_components': rep.get('incomplete_components'),
+            # Seed robustness / capacity confounding are per-contrast reads;
+            # surface them at panel level so a report reader does not have to
+            # know the nested entry layout to notice them.
+            'seed_driven_components': sorted(
+                c for c, es in (rep.get('components') or {}).items()
+                if any(e.get('seed_driven') for e in es)),
+            'capacity_confounded_components': sorted(
+                c for c, es in (rep.get('components') or {}).items()
+                if any(e.get('capacity_confounded') for e in es)),
             'warnings': rep.get('warnings'),
         }
         out['panels'][d] = _panel

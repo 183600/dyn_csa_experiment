@@ -82,6 +82,9 @@ def t_min_consistency():
     assert L.signflip_min_consistency(6, 4, 0.05) is None, 'n=6, m=4: even 6/6 cannot clear the gate'
     assert L.signflip_min_consistency(8, 1, 0.05) == 8
     assert L.signflip_min_consistency(6, 1, 0.05) == 6
+    # Scale-up: the planning math must not overflow int->float at large n.
+    big = L.signflip_min_consistency(2000, 10, 0.05)
+    assert big is not None and 0 < big < 2000, big
 
 
 def t_power():
@@ -89,6 +92,8 @@ def t_power():
     pw = L.signflip_power(12, 4, 0.9, 0.05)
     assert abs(pw - 0.659) < 0.01, f'q=0.9 power at first Holm gate should be ~0.659, got {pw:.4f}'
     assert L.signflip_power(12, 4, 0.8, 0.05) < 0.30
+    pw_big = L.signflip_power(2000, 10, 0.55, 0.05)
+    assert 0.0 < pw_big <= 1.0 and math.isfinite(pw_big), pw_big
 
 
 def t_tost():
@@ -605,6 +610,79 @@ def t_arm_mean_std_and_relative_effect():
     assert abs(e['relative_effect_pct'] - 100.0 * e['mean'] / e['without_mean']) < 1e-9, e
 
 
+def t_paired_effect_seed_robustness():
+    stable = L.paired_effect_stats([-1.0, -1.1, -0.9, -1.0])
+    assert stable['seed_driven'] is False and stable['seed_robust'] is True, stable
+    assert stable['ci95_low'] < stable['mean'] < stable['ci95_high'], stable
+    # One outlier seed makes the aggregate mean positive, but dropping it
+    # flips the sign: the direction is owned by a single seed.
+    fragile = L.paired_effect_stats([-2.0, -2.0, -2.0, -2.0, 8.5])
+    assert fragile['mean'] > 0 and fragile['seed_driven'] is True, fragile
+    assert fragile['seed_robust'] is False, fragile
+    assert 'UNSTABLE' in fragile['effect_vs_noise'], fragile
+    # The audit must surface it instead of silently certifying the mean.
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    a_vals = [51.5, 51.5, 51.5, 51.5, 42.0]
+    s = {}
+    for i, ppl in enumerate(a_vals):
+        s[f'a::seed{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=ppl, params=100, train_knobs=knobs)
+        s[f'b::seed{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=50.0, params=100, train_knobs=knobs)
+    r = L.methodology_audit(s, design={'c': [('a', 'b', 'x')]}, baselines={}, verbose=False)
+    e = r['components']['c'][0]
+    assert e['seed_driven'] is True and e['seed_robust'] is False, e
+    assert any('SEED-DRIVEN' in w for w in r['warnings']), r['warnings']
+
+
+def t_capacity_confound_warning():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    s = {}
+    for i in range(3):
+        s[f'a::seed{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=49.0, params=1200, train_knobs=knobs)
+        s[f'b::seed{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=50.0, params=1000, train_knobs=knobs)
+    r = L.methodology_audit(s, design={'c': [('a', 'b', 'x')]}, baselines={}, verbose=False)
+    e = r['components']['c'][0]
+    assert e['param_controlled'] is False and e['capacity_confounded'] is True, e
+    assert any('CAPACITY' in w or 'capacity' in w for w in r['warnings']), r['warnings']
+
+
+def t_component_pair_requires_same_mlp_ratio():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+
+    def _hp(mlp):
+        return {'steps': 1, 'tokens_seen': 1, 'lr': 0.0003, 'weight_decay': 0.1,
+                'warmup': 1, 'batch_size': 1, 'seq_len': 8, 'd': 8, 'n_layers': 1,
+                'n_heads': 1, 'd_head': 8, 'mlp_ratio': mlp, 'comp_lambda': 0.05,
+                'delta_lr_mult': 10.0, 'dataset': 'unit', 'data_version': 'v'}
+    s = {}
+    for i in range(3):
+        s[f'a::seed{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=49.0, params=100, train_knobs=knobs, hyperparams=_hp(4.0))
+        s[f'b::seed{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=50.0, params=100, train_knobs=knobs, hyperparams=_hp(8.0))
+    # Same run_cfg/train_knobs but a different MLP width is a capacity change,
+    # not the module under test: a module ablation must not pair it.
+    r = L.methodology_audit(s, design={'c': [('a', 'b', 'x')]}, baselines={}, verbose=False)
+    e = r['components']['c'][0]
+    assert e['controlled'] is False and e['n_paired'] == 0, e
+    assert any('hyperparams.mlp_ratio' in w for w in r['warnings']), r['warnings']
+    # A baseline contrast may legitimately widen the MLP for parameter
+    # matching; there the parameter-count gate (not mlp_ratio equality) rules.
+    for i in range(3):
+        s[f'a::seed{i}']['params'] = 100
+        s[f'b::seed{i}']['params'] = 100
+    base_design = {'compression_vs_matched_dense': [('a', 'b', 'x')]}
+    rb = L.methodology_audit(s, design={}, baselines=base_design, verbose=False)
+    eb = rb['baselines']['compression_vs_matched_dense'][0]
+    assert eb['n_paired'] == 3 and eb['controlled'] is True, eb
+
+
 def t_ablation_completeness_leave_one_out():
     design = {'A': [('full', 'full-A', '')],
               'B': [('full', 'full-B', '')],
@@ -628,6 +706,17 @@ def t_ablation_completeness_full_factorial():
     # A mapped but not-run arm is still incomplete.
     r3 = L.ablation_completeness_audit(arms_by_combo=arms, present=list(arms.values())[:-1])
     assert r3['complete'] is False and r3['missing_arms'], r3
+
+
+def t_full_factorial_rejects_reused_arm():
+    arms = {(): 'none', ('A',): 'A', ('B',): 'B', ('C',): 'C',
+            ('A', 'B'): 'AB', ('A', 'C'): 'AC', ('B', 'C'): 'BC',
+            ('A', 'B', 'C'): 'AB'}
+    r = L.ablation_completeness_audit(arms_by_combo=arms)
+    assert r['mode'] == 'full-factorial' and r['complete'] is False, r
+    assert 'AB' in r['reused_arms'], r
+    arms[('A', 'B', 'C')] = 'ABC'
+    assert L.ablation_completeness_audit(arms_by_combo=arms)['complete'] is True
 
 
 def t_panel_ablation_flag_does_not_overclaim():
@@ -1552,6 +1641,10 @@ def main():
     _check('C17b tuned pairing keeps optimizer gate', t_tuned_pairing_keeps_optimizer_gate)
     _check('C18 leave-one-out ablation completeness', t_ablation_completeness_leave_one_out)
     _check('C19 full-factorial ablation completeness', t_ablation_completeness_full_factorial)
+    _check('C19a full-factorial rejects a reused arm id', t_full_factorial_rejects_reused_arm)
+    _check('C17c paired effect CI + leave-one-seed robustness', t_paired_effect_seed_robustness)
+    _check('C17d capacity-confounding warning on module ablation', t_capacity_confound_warning)
+    _check('C17e module ablation requires identical structured hyperparameters', t_component_pair_requires_same_mlp_ratio)
     _check('C20 panel ablation flag does not overclaim', t_panel_ablation_flag_does_not_overclaim)
     _check('A7 adaptive-threshold capacity guard', t_adaptive_threshold_guard)
     _check('A8 empty segmenter', t_segment_empty)

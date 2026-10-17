@@ -522,6 +522,11 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   协议。面板级 `controlled_variables_report` 检查**该臂的全部种子记录**
   （不是只看第一条）的 `run_cfg`、`train_knobs` 与结构化 `hyperparams`
   关键字段，并点名「同一条臂内不同种子用了不同协议」的混合情况。
+  模块消融的**逐种子配对**还额外过 `_hyperparam_reason`：`run_cfg` 不
+  承载的 `mlp_ratio` 等结构化字段必须逐项相等（两边都缺才走历史兼容
+  路径）；同一 run_cfg 但 MLP 宽度不同的两条记录不会进入模块效应统计。
+  基线对比不使用该条门槛——它的 MLP 宽度本来就是为参数量对齐而改的，
+  由 `param_controlled` 单独把关。
   `BASELINE_DESIGN` 另把主方法与参数对齐稠密基线
   （`full_sw128_matched` / `full_matched`）的对比纳入同一套门槛，并额外
   要求两者参数量相对差 ≤1%（`param_controlled`）；参数不匹配的基线主张
@@ -546,7 +551,10 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   complete，缺哪个臂会被点名；它也接受 `arms_by_combo` 的全因子 2^k 映射
   （全因子是更昂贵的替代方案），8 种组合少一种（例如只有 A/B/C 的单独臂
   和 AB/AC/BC，漏掉 C 或 ABC）会给出精确的缺失组合，而不是把 7/8 面板
-  描述成全因子。部分组合因此不能再支撑「每个模块都有用」的结论。
+  描述成全因子。全因子模式另要求**每个组合一个独立臂**：同一个臂 id 被
+  映射到两个组合（例如 A 与 AB 复用同一条 run）会进入 `reused_arms` 并
+  判为不完整，因为这样的表无法把效应归因到组合。部分组合因此不能再支撑
+  「每个模块都有用」的结论。
 - **验证分级（不再把「有对照」写成「已证明」）**：`verified_components`
   只收**受控 + 参数受控（基线）+ 族内 Holm 校正后 p<α + 效应大于种子噪声**
   的创新点；仅达到 `min_n` 的对照列入 `measured_components`（描述性），
@@ -564,9 +572,19 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   对照还落盘 `with_mean±with_std` / `without_mean±without_std`、
   `relative_effect_pct`（Δ 占基线 PPL 的百分比）、`relative_noise_pct`
   与 `signal_to_noise`，因此「0.2% 的提升配 0.5% 的种子标准差」可以直接
-  从记录复核，而不必反推原始数字。`arm_summary` 对每条臂按 (variant,
-  protocol) 给出 n、mean±std 与 `meets_min_seeds`，关键实验低于 `min_n`
-  的臂进入 `arms_below_min_seeds`。
+  从记录复核，而不必反推原始数字。`paired_effect_stats` 还给出 Δ 的 95%
+  置信区间（t 区间；3–5 个种子时不用正态近似）与**去一种子稳定性**
+  （`loo_means` / `seed_driven` / `seed_robust`）：若丢掉任意一个种子就使
+  均值变号，则该方向由单个种子主导，审计写入 SEED-DRIVEN 警告——显著 p
+  不等于机制效应稳定。`arm_summary` 对每条臂按 (variant, protocol) 给出
+  n、mean±std 与 `meets_min_seeds`，关键实验低于 `min_n` 的臂进入
+  `arms_below_min_seeds`。模块消融的参数量差异 >1% 时另标
+  `capacity_confounded`：增益可能来自新增参数而非机制，报告必须给出参数
+  差或补参数对齐对照（基线对比本来就把参数对齐作为硬门槛）。
+  `signflip_min_consistency` / `signflip_power` 的二项尾概率走正则化不完全
+  贝塔 / log 空间（不再是 `comb(n,k)/2**n` 的整数转浮点），因此补种子计划
+  扩到上千个种子也不会溢出；`paired_effect_stats` 的去一种子扫描是 O(n)
+  单遍（总数减单个种子），不会因规模扩大变成平方复杂度。
 - **多重比较**：审计对整个声明族（`ABLATION_DESIGN`，以及面板里实际排了
   参数对齐稠密臂时的 `BASELINE_DESIGN`）做 **Holm step-down**，每个对比
   同时给出 `p_holm_global`。族按「本面板能测到的声明」划定：一个组件至少

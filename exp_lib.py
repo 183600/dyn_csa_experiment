@@ -4355,6 +4355,34 @@ def pair_reason(ra, rb):
         return f'disagreeing {sorted(bad)}'
     return None
 
+def _hyperparam_reason(ra, rb):
+    """Strict structured-hyperparameter gate for a module ablation pair.
+
+    `run_cfg` pins the compact training recipe, but the structured
+    `hyperparams` copy additionally carries `mlp_ratio` (and any future key
+    that never made it into the string).  Two records with equal run_cfg can
+    still differ in MLP width, which is a capacity change rather than the
+    module under test.  Both records must carry the descriptor (legacy/legacy
+    is the only permissive path) and every checked key must agree.
+
+    Baseline-vs-method contrasts do NOT use this gate: their MLP width is
+    deliberately widened for parameter matching, and `_param_control` is the
+    authoritative check there."""
+    ha, hb = ra.get('hyperparams'), rb.get('hyperparams')
+    if ha is None and hb is None:
+        return None
+    if not isinstance(ha, dict) or not isinstance(hb, dict):
+        return 'unverifiable hyperparams (one record carries no structured copy)'
+    for k in _CONTROL_HYPER_KEYS:
+        va, vb = ha.get(k), hb.get(k)
+        if va is None and vb is None:
+            continue
+        if va is None or vb is None:
+            return f'unverifiable hyperparams.{k}'
+        if _canon_setting(va) != _canon_setting(vb):
+            return f'different hyperparams.{k} ({va!r} vs {vb!r})'
+    return None
+
 def ppl_is_usable(v):
     return isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v) and (v > 0.0)
 
@@ -4495,6 +4523,16 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3):
                            mean with 0.5% std is NOT a usable gain);
       significant        — p < alpha AND NOT within_seed_noise.
 
+    It additionally reports a two-sided 95% CI for the mean effect and a
+    leave-one-seed-out (LOO) stability read: with the 3-5 seeds the reporting
+    rules require, a significant mean can still be driven by a single seed.
+    `seed_driven` is True when dropping any one seed flips the sign of the
+    mean (or makes it exactly zero), i.e. the direction is not stable across
+    seeds even though the aggregate test may look significant.  The LOO pass
+    is a single O(n) sweep (a running sum minus each seed), so it stays cheap
+    when a scale-up panel reaches hundreds of seeds; `ci95` uses the t
+    critical value rather than a hard-coded z.
+
     Requiring both the test AND the effect-vs-spread check means a large-n
     p-value can never dress up a sub-noise effect as a real improvement, while
     `resolution_limited` stops a small-n panel from being read as a negative
@@ -4502,7 +4540,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3):
     d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(float(x))], dtype=float)
     n = int(d.size)
     if n == 0:
-        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data'}
+        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data'}
     mean = float(d.mean())
     std = float(d.std(ddof=1)) if n > 1 else 0.0
     sem = float(std / math.sqrt(n)) if n > 1 else float('nan')
@@ -4518,6 +4556,24 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3):
     resolution_limited = bool(math.isfinite(p_floor) and p_floor > alpha)
     within_seed_noise = abs(mean) <= std
     significant = bool(math.isfinite(p) and p < alpha and (not within_seed_noise))
+    # Two-sided 95% CI on the paired mean (t interval; the normal approximation
+    # is intentionally avoided at the 3-5 seed counts this repo reports).
+    ci_lo = ci_hi = float('nan')
+    if n > 1 and math.isfinite(sem):
+        tc = _t_critical(0.95, n - 1)
+        if math.isfinite(tc):
+            ci_lo, ci_hi = mean - tc * sem, mean + tc * sem
+    # Leave-one-seed-out stability: does any single seed own the direction?
+    loo_means = []
+    seed_driven = None
+    if n >= 3:
+        _total = float(d.sum())
+        loo_means = [(_total - float(d[i])) / (n - 1) for i in range(n)]
+        seed_driven = False
+        if abs(mean) > 1e-300:
+            _full_sign = 1.0 if mean > 0 else -1.0
+            seed_driven = any((_m == 0.0) or ((_m > 0) != (_full_sign > 0)) for _m in loo_means)
+    seed_robust = None if seed_driven is None else (not seed_driven)
     if underpowered:
         verdict = 'underpowered (n<%d)' % int(min_n)
     elif within_seed_noise:
@@ -4528,7 +4584,9 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3):
         verdict = 'not decidable at this n: exact-test p floor %.4g > alpha (add seeds to resolve; this is a resolution ceiling, not a null result)' % p_floor
     else:
         verdict = 'not significant at this n (p>=%.3g)' % alpha
-    return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict}
+    if seed_driven:
+        verdict += ' | UNSTABLE: dropping one seed flips the mean sign'
+    return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict}
 
 # ---- 预注册功效 / 分辨率工具（评审二轮·意见一/九） ------------------------------
 # 动机：一个冻结方案如果「无论数据多强都不可能达到 p_holm < α」，它落在
@@ -4577,12 +4635,45 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     return None
 
 
+def _binom_cdf_half(n, m):
+    """P(Bin(n, 1/2) <= m), evaluated in log space.
+
+    The planning tools are called with growing seed counts at scale.  The
+    direct form `2.0 * sum(comb(n, i)) / 2**n` overflows `float` once n is
+    large (int-to-float conversion), even though the probability is perfectly
+    representable.  This implementation uses lgamma log-sum-exp for the small
+    tail and symmetry for the upper half, so it stays finite for any n."""
+    n = int(n)
+    m = int(m)
+    if n <= 0:
+        return 1.0 if m >= 0 else 0.0
+    if m < 0:
+        return 0.0
+    if m >= n:
+        return 1.0
+    if m * 2 >= n:
+        # P(X <= m) = 1 - P(X <= n-m-1) with n-m-1 < n/2.
+        return float(1.0 - _binom_cdf_half(n, n - m - 1))
+    # Regularized incomplete beta: P(Bin(n,1/2) <= m) = I_{1/2}(n-m, m+1).
+    # O(1) in m, so a scale-up to thousands of seeds does not turn the seed
+    # planner into an O(n^2) lgamma loop.
+    v = _betai(n - m, m + 1, 0.5)
+    if math.isfinite(v):
+        return float(min(1.0, max(0.0, v)))
+    log2n = n * math.log(2.0)
+    logs = [math.lgamma(n + 1) - math.lgamma(i + 1) - math.lgamma(n - i + 1) - log2n
+            for i in range(0, m + 1)]
+    mx = max(logs)
+    return float(min(1.0, math.exp(mx) * math.fsum(math.exp(x - mx) for x in logs)))
+
+
 def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     """通过 Holm 第一道门所需的最小同向种子数 k_min（双侧精确检验）。
 
     若 k 个种子同向（n−k 反向），精确双侧 p = 2·P(Bin(n, 1/2) ≤ n−k)；
     第一道门要求 m·p < alpha。返回使 m·p(k) < alpha 的最小 k；若全部
-    n 个同向仍不够，返回 None（方案不可能确认）。"""
+    n 个同向仍不够，返回 None（方案不可能确认）。二项尾概率在 log 空间
+    计算，因此大 n（规模扩展后的补种子计划）也不会整数溢出。"""
     try:
         n = int(n_seeds)
         m = int(m_comparisons)
@@ -4590,11 +4681,9 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
         return None
     if n <= 0 or m <= 0:
         return None
-    total = 1 << n
     best = None
     for k in range(n, -1, -1):
-        tail = sum(math.comb(n, i) for i in range(0, n - k + 1))
-        p = 2.0 * tail / total
+        p = 2.0 * _binom_cdf_half(n, n - k)
         if m * p < alpha:
             best = k  # keep descending: p(k) grows monotonically as k shrinks,
             # so the last k that still clears the gate is the MINIMUM k
@@ -4609,7 +4698,9 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
     P(Bin(n, q) ≥ k_min)。q 的含义：在真效应方向上，单个种子的配对 Δ
     落在预注册方向的概率（含种子间噪声）。功效对 q 敏感——预注册时必须
     报告 q 的假设来源（如 validation 面板的同向率），不得只报「数学上
-    可能」。n<=0 或方案不可能确认时返回 0.0。"""
+    可能」。n<=0 或方案不可能确认时返回 0.0。尾部概率用正则化不完全
+    贝塔函数计算（P(X<=k-1)=I_{1-q}(n-k+1,k)），大 n 下不会因
+    `comb(n,k)*q**k` 的整数/浮点溢出而失败。"""
     kmin = signflip_min_consistency(n_seeds, m_comparisons, alpha)
     if kmin is None or kmin <= 0:
         return 0.0 if kmin is None else 1.0
@@ -4620,8 +4711,20 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
         return 0.0
     if not (0.0 <= q <= 1.0) or n <= 0:
         return 0.0
-    pw = sum(math.comb(n, k) * (q ** k) * ((1.0 - q) ** (n - k)) for k in range(kmin, n + 1))
-    return float(min(1.0, pw))
+    if q >= 1.0:
+        return 1.0
+    if q <= 0.0:
+        return 0.0
+    cdf = _betai(n - kmin + 1, kmin, 1.0 - q)
+    if not math.isfinite(cdf):
+        # Fallback: log-space binomial tail (slower, but still overflow-free).
+        logq, log1q = math.log(q), math.log1p(-q)
+        logs = [math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
+                + k * logq + (n - k) * log1q for k in range(kmin, n + 1)]
+        mx = max(logs)
+        pw = math.exp(mx) * math.fsum(math.exp(x - mx) for x in logs)
+        return float(min(1.0, pw))
+    return float(min(1.0, max(0.0, 1.0 - cdf)))
 
 
 def tost_paired(deltas, margin, conf=0.90):
@@ -5772,7 +5875,7 @@ def _variant_seed_map(summary):
         recs[rk] = r
     return recs, amb
 
-def _paired_seed_deltas(recs, a, b):
+def _paired_seed_deltas(recs, a, b, *, strict_hyper=False):
     """Per-protocol-condition per-seed (a − b) deltas over seeds where BOTH arms
     have a measurable record AND `pair_reason` confirms identical run_cfg /
     training length.
@@ -5782,6 +5885,12 @@ def _paired_seed_deltas(recs, a, b):
     ('') arm.  Two DIFFERENT non-empty conditions are never pooled — collapsing
     them (keying only on the seed) would fabricate seed counts and compare
     different measurement protocols (design_notes §3.3).
+
+    With `strict_hyper=True` (module ablations), the structured
+    `hyperparams` copy must also agree on every `_CONTROL_HYPER_KEYS` field
+    (notably `mlp_ratio`), so a capacity change cannot ride along with the
+    module toggle.  Baseline contrasts leave it off because their MLP width is
+    intentionally matched via a different parameter count.
 
     Returns {(tag_a, tag_b): (deltas, shared_seeds, skipped)} with
     skipped = [(seed, reason)]."""
@@ -5809,6 +5918,8 @@ def _paired_seed_deltas(recs, a, b):
         deltas, skipped = [], []
         for s in seeds:
             reason = pair_reason(ra[ts, s], rb[bs, s])
+            if reason is None and strict_hyper:
+                reason = _hyperparam_reason(ra[ts, s], rb[bs, s])
             if reason is not None:
                 skipped.append((s, reason))
                 continue
@@ -6109,7 +6220,7 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
         out.update({'mode': 'full-factorial', 'components': [],
                     'n_required': 0, 'n_mapped': 0,
                     'missing_combos': [], 'duplicate_combos': [],
-                    'missing_arms': [], 'arms': {}})
+                    'reused_arms': {}, 'missing_arms': [], 'arms': {}})
         combos = {}
         components = set()
         for key, arm in arms_by_combo.items():
@@ -6130,6 +6241,15 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
         extra = sorted(mapped_set - required_set)
         duplicate = sorted(c for c, arms in combos.items() if len(set(arms)) > 1)
         absent = []
+        # In a full factorial every combination must be its OWN arm.  Reusing
+        # one arm id for two combinations (e.g. mapping A and B to the same
+        # run) silently makes the 2**k table impossible to attribute, so it is
+        # a structural failure rather than a complete design.
+        _arm_combos = {}
+        for combo, arms in combos.items():
+            for arm in set(arms):
+                _arm_combos.setdefault(arm, set()).add(combo)
+        reused = {arm: sorted(cs) for arm, cs in _arm_combos.items() if len(cs) > 1}
         for combo, arms in combos.items():
             for arm in set(arms):
                 if present_set is not None and arm not in present_set:
@@ -6141,15 +6261,17 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
             'missing_combos': [list(c) for c in missing],
             'extra_combos': [list(c) for c in extra],
             'duplicate_combos': [list(c) for c in duplicate],
+            'reused_arms': {str(a): [list(c) for c in cs] for a, cs in reused.items()},
             'missing_arms': absent,
             'arms': {('+'.join(c) if c else 'none'): sorted(set(a)) for c, a in combos.items()},
         })
         out['complete'] = bool(len(components) >= 1 and not missing and not extra
-                               and not duplicate and not absent)
+                               and not duplicate and not absent and not reused)
         if verbose:
-            print('[ablation] full-factorial components=%s mapped=%d/%d missing=%s'
+            print('[ablation] full-factorial components=%s mapped=%d/%d missing=%s%s'
                   % (components, len(combos), len(required),
-                     ['+'.join(c) or 'none' for c in missing] or 'none'))
+                     ['+'.join(c) or 'none' for c in missing] or 'none',
+                     (' reused_arms=%s' % (sorted(reused) or 'none')) if reused else ''))
         return out
 
     if design is None:
@@ -6290,7 +6412,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             for a, b, note in contrasts:
                 arms.update((a, b))
                 a_present, b_present = (a in present, b in present)
-                conds = _paired_seed_deltas(recs, a, b)
+                conds = _paired_seed_deltas(recs, a, b, strict_hyper=(kind == 'component'))
                 _cfg_a = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == a), None)
                 _cfg_b = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == b), None)
                 _rel, _param_ok = _param_control(recs, a, b)
@@ -6329,11 +6451,17 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b,
                                'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None,
                                'param_rel_diff': _rel, 'param_controlled': _param_ok,
+                               'capacity_confounded': (_param_ok is False),
                                'with_mean': _a_mean, 'with_std': _a_std,
                                'without_mean': _b_mean, 'without_std': _b_std,
                                'relative_effect_pct': _rel_effect,
                                'relative_noise_pct': _rel_std,
                                'signal_to_noise': _noise_ratio,
+                               'ci95_low': st.get('ci95_low'),
+                               'ci95_high': st.get('ci95_high'),
+                               'seed_driven': st.get('seed_driven'),
+                               'seed_robust': st.get('seed_robust'),
+                               'loo_means': st.get('loo_means'),
                                'mean_pm_std': ('%+.4f +/- %.4f' % (float(st['mean']), float(st['std']))
                                                if st.get('n') else 'n/a'),
                                'hypothesis': (_hyp or {}).get('statement'),
@@ -6346,6 +6474,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     entries.append(st)
                     if deltas:
                         _contrast_measured = True
+                        if st.get('seed_driven'):
+                            report['warnings'].append(
+                                '%s: `%s` vs `%s` (n=%d) is SEED-DRIVEN — dropping any one seed flips the sign of the mean, so the direction is not stable across seeds even if the aggregate p looks small; report the per-seed deltas and add seeds before treating it as a mechanism effect'
+                                % (comp, a, b, int(st.get('n') or 0)))
                 if a_present and b_present:
                     if not _contrast_measured:
                         _why = sorted({reason for (_dl, _sh, _sk) in conds.values() for _s, reason in _sk})
@@ -6361,6 +6493,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     report['warnings'].append('%s: `%s` vs `%s` differ in parameter count by %.2f%% — NOT parameter-controlled, so this baseline claim is not counted as verified' % (comp, a, b, 100.0 * (_rel or 0.0)))
                 elif kind == 'baseline' and _param_ok is None and a_present and b_present:
                     report['warnings'].append('%s: `%s` vs `%s` carry no usable `params` — parameter control is UNVERIFIABLE, so this baseline claim is not counted as verified' % (comp, a, b))
+                elif kind == 'component' and _param_ok is False:
+                    report['warnings'].append('%s: `%s` vs `%s` differ in parameter count by %.2f%% — part of this module effect may be a capacity (parameter-count) effect rather than the mechanism; report the parameter delta or add a parameter-matched control before claiming the mechanism is useful' % (comp, a, b, 100.0 * (_rel or 0.0)))
             out[comp] = entries
             meta[comp] = {'arms': arms}
         return out, meta
@@ -6586,6 +6720,14 @@ def _print_methodology_audit(report):
                 e.get('without_mean', float('nan')), e.get('without_std', float('nan')),
                 e.get('relative_effect_pct', float('nan')), e.get('relative_noise_pct', float('nan')),
                 e.get('signal_to_noise', float('nan'))))
+            _lo, _hi = e.get('ci95_low'), e.get('ci95_high')
+            if isinstance(_lo, (int, float)) and isinstance(_hi, (int, float)) and math.isfinite(_lo) and math.isfinite(_hi):
+                print('        95%% CI for Δ: [%+.4f, %+.4f]%s' % (
+                    _lo, _hi, '; SEED-DRIVEN (dropping one seed flips the sign)' if e.get('seed_driven') else ''))
+            elif e.get('seed_driven'):
+                print('        SEED-DRIVEN: dropping one seed flips the sign of the mean')
+            if e.get('capacity_confounded'):
+                print('        CAPACITY CONFOUND: parameter counts differ by %.2f%% — report the parameter delta or add a parameter-matched control' % (100.0 * float(e.get('param_rel_diff') or 0.0)))
             print('        %s | %s' % (_c, e['effect_vs_noise']))
     if report['verified_components']:
         print('  verified innovations (controlled AND family-Holm p<alpha AND |Δ|>seed noise): ' + ', '.join(report['verified_components']))
