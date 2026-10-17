@@ -561,6 +561,15 @@ def t_batch_iter_reproducible():
     assert not torch.equal(b1[0], b3[0]), 'a different data seed must change the batch order'
 
 
+def t_batch_iter_uint16():
+    ids64 = np.arange(5000, dtype=np.int64) % 997
+    ids16 = ids64.astype(np.uint16)
+    a = next(L.batch_iter(ids64, 32, 4, torch.device('cpu'), seed=7))
+    b = next(L.batch_iter(ids16, 32, 4, torch.device('cpu'), seed=7))
+    assert a[0].dtype == b[0].dtype == torch.int64, 'batch_iter must widen the gathered ids back to int64'
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]), 'the uint16 transport form must yield the exact int64 batch (CPU index kernels lack uint16)'
+
+
 def t_overfit_sanity():
     r = L.overfit_sanity_check('full', seed=0, steps=200, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256)
     assert r['passed'] is True, r
@@ -1022,6 +1031,7 @@ def main():
     _check('D1 eval per-seq ppl', t_eval_per_seq)
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
+    _check('E2b batch_iter uint16 transport', t_batch_iter_uint16)
     _check('E3 small-batch overfit sanity', t_overfit_sanity)
     _check('E3b preflight RNG-state preservation', t_rng_state_preserved_by_preflight)
     _check('E3c duplicate-run reproducibility check', t_reproducibility_check)

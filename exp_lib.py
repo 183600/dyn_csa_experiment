@@ -3894,9 +3894,16 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
                     host = torch.from_numpy(_ids_narrow(train_ids))
                 _PINNED_HOST_CACHE['entry'] = (train_ids, host)
             except RuntimeError:
-                host = torch.from_numpy(train_ids)
+                host = torch.from_numpy(_ids_narrow(train_ids))
         else:
-            host = torch.from_numpy(train_ids)
+            _host_ids = _ids_narrow(train_ids)
+            # PyTorch's CPU index kernel does not implement uint8/uint16
+            # gathers (the uint16 FineWeb cache would fail here), so widen
+            # those two transport widths to int32 on the CPU host only.
+            # CUDA keeps the compact width; its gather widens to int64 below.
+            if _host_ids.dtype in (np.uint8, np.uint16):
+                _host_ids = _host_ids.astype(np.int32, copy=False)
+            host = torch.from_numpy(_host_ids)
     # Transport-only narrowing (design notes §6.1): every gather index is an
     # exact integer bounded by n + seq_len, so when that bound fits in int32
     # the index tensor is uploaded / consumed as int32 and the gathered ids
