@@ -1101,8 +1101,8 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     r_idx = torch.arange(R, device=dev)[:, None, None]
     tc = _attn_t_chunk(R, M, nh, hd)
     # 头在外、t-chunk 在内：各 (t,h) 独立。chunk 内的几何/掩码/soft 常量
-    # 与 h 无关——头循环外按 chunk 各算一次（同值；soft_l[:, :, :nb] 同时
-    # 兼作逐头重置的 sf cast）。topk 行切片只以原 dtype 视图入清单，
+    # 与 h 无关——头循环外按 chunk 各算一次（同值；soft_c 同时兼作逐头
+    # 重置的 sf cast）。topk 行切片只以原 dtype 视图入清单，
     # int64 升型在头循环内按 chunk 现算（同批精确整数）；lt_sel 只用于
     # 构造 sel_ok，不入清单。
     # 键值梯度碎片按头收集、逐头归约：dk/dv（或 dksw/dvsw）的键逐元素
@@ -1112,10 +1112,6 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     # 不变），归约目标为逐头复用的 [R·Bm,hd] / [R·T,hd] 单 slab（段和逐头
     # cast 进 dtype 出口行——与全头 fp32 累加后一次 cast 逐位一致）。
     lt_l = last_tok.to(torch.int64)
-    dk_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dkb else None
-    dv_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dvb else None
-    dksw_frag = torch.empty((R, T, w, hd), device=dev, dtype=torch.float32) if need_dksw else None
-    dvsw_frag = torch.empty((R, T, w, hd), device=dev, dtype=torch.float32) if need_dvsw else None
     keyb = torch.empty((R, T, nb), device=dev, dtype=torch.int64) if (need_dkb or need_dvb) else None
     keyw = torch.empty((R, T, w), device=dev, dtype=torch.int64) if (need_dksw or need_dvsw) else None
     chunks = []
@@ -1129,18 +1125,25 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         win_ok = win_raw[:, t0:t1, :] >= 0
         lane_ok = torch.cat([sel_ok, win_ok], dim=-1)
         anyrow = (sel_ok.any(dim=-1) | win_ok.any(dim=-1)) if sink_v is None else None
-        soft_l = None
-        if soft is not None:
-            soft_l = torch.zeros((R, t1 - t0, nb + w), device=dev, dtype=torch.float32)
-            soft_l[:, :, :nb] = soft[:, t0:t1, :].to(torch.float32)
+        # The window lanes never carry a soft prior; keep only the block
+        # columns instead of padding a full-width [R, t, nb + w] table.
+        soft_c = soft[:, t0:t1, :].to(torch.float32) if soft is not None else None
         # 键基按需（int 精确）：(r,src)/窗口部分与 h 无关。
         if keyb is not None:
             keyb[:, t0:t1] = r_idx.expand(R, t1 - t0, nb) * Bm + src64
         if keyw is not None:
             keyw[:, t0:t1] = r_idx.expand(R, t1 - t0, w) * T + src_win
-        chunks.append((t0, t1, src32, src_win, lane_ok, soft_l, anyrow))
+        chunks.append((t0, t1, src32, src_win, lane_ok, soft_c, anyrow))
     seg_b = _seg_structure(keyb.reshape(-1), R * Bm) if keyb is not None else None
     seg_w = _seg_structure(keyw.reshape(-1), R * T) if keyw is not None else None
+    # The segment structures own their own permutation/segment tables; the key
+    # tables are no longer needed, so release them before the per-head
+    # gradient fragments are allocated.
+    del keyb, keyw
+    dk_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dkb else None
+    dv_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dvb else None
+    dksw_frag = torch.empty((R, T, w, hd), device=dev, dtype=torch.float32) if need_dksw else None
+    dvsw_frag = torch.empty((R, T, w, hd), device=dev, dtype=torch.float32) if need_dvsw else None
     # 逐头归约出口（dtype）与头间复用的逐头 fp32 归约 slab。
     dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else None
     dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else None
@@ -1169,7 +1172,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         kw_h = k_sw[:, :, h, :]
         vb_h = v_blk[:, :, h, :]
         vw_h = v_sw[:, :, h, :]
-        for (t0, t1, src32, src_win, lane_ok, soft_l, anyrow) in chunks:
+        for (t0, t1, src32, src_win, lane_ok, soft_c, anyrow) in chunks:
             src_sel = src32.to(torch.int64)
             qh = q_h[:, t0:t1].to(torch.float32)
             dOh = dO_h[:, t0:t1].to(torch.float32)
@@ -1188,19 +1191,19 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             g = torch.einsum('rtd,rtmd->rtm', dOh, Vl)
             gh = g * (anyrow[:, :, None] if anyrow is not None else 1.0)
             P_S = GS = dzS = P_sinkS = P_sinkA = None
-            if soft_l is not None:
+            if soft_c is not None:
                 # S 路径（soft 先验）与 sink 无关——eager 的直通估计器在
                 # use_sink=False 时同样有 S 路梯度。
-                lam = torch.log(soft_l.clamp_min(1e-12))
-                lam = lam.masked_fill(soft_l <= 0, MINL)
+                lam = torch.log(soft_c.clamp_min(1e-12))
+                lam = lam.masked_fill(soft_c <= 0, MINL)
                 zS = zA.clone()
-                zS[:, :, :nb] = (zA[:, :, :nb] + lam[:, :, :nb]).clamp_min(MINL)
+                zS[:, :, :nb] = (zA[:, :, :nb] + lam).clamp_min(MINL)
             if sink_v is None:
                 P_A = torch.softmax(zA, dim=-1)
                 P_A_f = P_A * (anyrow[:, :, None] if anyrow is not None else 1.0)
                 GA = (P_A * gh).sum(dim=-1)
                 dzA = P_A * (gh - GA[:, :, None])
-                if soft_l is not None:
+                if soft_c is not None:
                     P_S = torch.softmax(zS, dim=-1)
                     GS = (P_S * gh).sum(dim=-1)
                     dzS = P_S * (gh - GS[:, :, None])
@@ -1212,7 +1215,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 P_A_f = P_A
                 GA = (P_A * gh).sum(dim=-1)
                 dzA = P_A * (gh - GA[:, :, None])
-                if soft_l is not None:
+                if soft_c is not None:
                     zextS = torch.cat([sink_v[h].expand(R, t1 - t0, 1), zS], dim=-1)
                     P_fullS = torch.softmax(zextS, dim=-1)
                     P_S = P_fullS[..., 1:]
@@ -1232,7 +1235,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 dq[:, t0:t1, h, :] += _dq.to(dtype)
             if dsoft is not None and dzS is not None:
                 dl = dzS[:, :, :nb]
-                sf = soft_l[:, :, :nb]
+                sf = soft_c
                 dsoft[:, t0:t1, :] += torch.where(sf >= 1e-12, dl / sf.clamp_min(1e-12), torch.zeros_like(dl)).to(dtype)
             if need_dkb or need_dksw:
                 dkl = torch.einsum('rtm,rtd->rtmd', dz, qh)

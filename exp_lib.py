@@ -211,6 +211,50 @@ def _seg_pos(n):
         _SEG_POS_CACHE[n] = pos
     return pos
 
+_SEG_WALK_PROBE = 32
+_SEG_VEC_MIN = 512
+
+def _successor_starts(n, nxt):
+    # Starts of the monotone successor walk p -> nxt[p] (nxt[p] > p, nxt[n] = n).
+    # A short prefix is walked directly; when the walk is long (dense cuts),
+    # the rest is generated in doubling batches with a jump table, so the
+    # number of Python-level iterations stays bounded as n grows.
+    starts = [0]
+    p = int(nxt[0])
+    left = _SEG_WALK_PROBE - 1
+    while p < n and left > 0:
+        starts.append(p)
+        p = int(nxt[p])
+        left -= 1
+    if p >= n:
+        return np.asarray(starts, dtype=np.int64)
+    k = len(starts)
+    if (n - p) * k > max(_SEG_VEC_MIN, n // 8) * max(p, 1):
+        jump = nxt
+        step = 1
+        while step < k:
+            jump = jump[jump]
+            step <<= 1
+        out = np.asarray(starts, dtype=np.int64)
+        while True:
+            nxts = jump[out]
+            keep = nxts < n
+            if not keep.any():
+                break
+            out = np.concatenate([out, nxts[keep]])
+            if not keep.all():
+                break
+            jump = jump[jump]
+        return out
+    try:
+        walk = nxt.data if nxt.flags['C_CONTIGUOUS'] else nxt.tolist()
+    except (AttributeError, BufferError, ValueError):
+        walk = nxt.tolist()
+    while p < n:
+        starts.append(p)
+        p = walk[p]
+    return np.asarray(starts, dtype=np.int64)
+
 def _segment(n, want_cut_list, min_block, max_block):
     if n <= 0:
         # No tokens -> no blocks.  Returning the empty triple here (instead of
@@ -301,20 +345,10 @@ def _segment(n, want_cut_list, min_block, max_block):
     nxt = np.minimum(pos + int(max_block), np.maximum(pos + int(min_block), nc + 1))
     np.minimum(nxt, n, out=nxt)
     np.maximum(nxt, pos + 1, out=nxt)
-    # The successor table is a contiguous int64 array; a memoryview reads the
-    # same exact integers as `nxt.tolist()` for each successor.  The fallback
-    # to tolist covers any non-contiguous / non-buffer dtype.
-    try:
-        nxt_walk = nxt.data if nxt.flags['C_CONTIGUOUS'] else nxt.tolist()
-    except (AttributeError, BufferError, ValueError):
-        nxt_walk = nxt.tolist()
-    starts = []
-    ap = starts.append
-    p = 0
-    while p < n:
-        ap(p)
-        p = nxt_walk[p]
-    sa = np.asarray(starts, dtype=np.int64)
+    # The walk never reads nxt[n]; the jump-table form does, so keep the
+    # sentinel inside the table.
+    nxt[-1] = n
+    sa = _successor_starts(n, nxt)
     ends = np.empty(len(sa), dtype=np.int64)
     ends[:-1] = sa[1:]
     ends[-1] = n
@@ -941,6 +975,21 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
 _POOL_PARTS_HOST = True
 _POOL_PARTS_BUCKET = 256
 _POOL_GEOM_BUCKET = 1024
+_NP_RANGE_CACHE = {}
+
+def _np_range(n):
+    # Read-only arange source for the host pooling flats; callers write into
+    # separate `out=` destinations and never mutate the returned array.
+    n = int(n)
+    a = _NP_RANGE_CACHE.get(n)
+    if a is None:
+        a = np.arange(n, dtype=np.int64)
+        a.flags.writeable = False
+        if len(_NP_RANGE_CACHE) >= 64:
+            _NP_RANGE_CACHE.pop(next(iter(_NP_RANGE_CACHE)))
+        _NP_RANGE_CACHE[n] = a
+    return a
+
 # Block-chunking of the block-pooling gathers/mixes: the chunk boundaries are
 # a pure function of the shapes, so the forward and the checkpoint recompute
 # split identically.  Each block's pooled vector is computed from its own
@@ -1068,8 +1117,8 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
             return None
         ends_np = np.cumsum(counts_np, dtype=np.int64)
         starts_np = ends_np - counts_np
-        pos = np.arange(max_len, dtype=np.int64)
-        op = np.arange(W_b, dtype=np.int64)
+        pos = _np_range(max_len)
+        op = _np_range(W_b)
         end_prev = np.empty(B, dtype=np.int64)
         end_prev[0] = -1
         end_prev[1:] = ends_np[:-1]
@@ -1152,7 +1201,7 @@ def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
             return None
         ends_np = np.cumsum(counts_np, dtype=np.int64)
         starts_np = ends_np - counts_np
-        pos = np.arange(max_len, dtype=np.int64)
+        pos = _np_range(max_len)
         n_g = B * max_len
         _pi = (-(n_g + max_len)) % int(pad_to) if int(pad_to) > 1 else 0
         _pb = (-n_g) % int(pad_to) if int(pad_to) > 1 else 0
@@ -1615,7 +1664,9 @@ def _rank_blocks(masked, B, ties, k=None):
     cols = torch.arange(B, device=src.device, dtype=torch.int32)[None, :].expand(n, B)
     buf = torch.empty(n, kk + 1, dtype=torch.int32, device=src.device)
     buf.scatter_(1, rank, cols)
+    del rank, sel, cols
     cand = buf[:, :kk].long()
+    del buf, kth
     order = torch.argsort(src.gather(1, cand), dim=1, stable=True, descending=True)
     cand = cand.gather(1, order)
     if ties == 'latest':
@@ -1638,6 +1689,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     # the same selection masked_fill produced.
     masked = torch.where(cf, scores, float('-inf'))
     order = _rank_blocks(masked, B, ties, k=min(k, B))
+    del masked
     _w_keep = min(int(k), B)
     # Only the first _w_keep order columns are ever consumed (the k >= B and
     # k < B forms both reduce to usable[:, :_w_keep]), so the mask gather runs
@@ -4291,7 +4343,7 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     # 之后；CPU 路径 host[idx] 则立即实现）。
     idx_np = np.empty((batch_size, seq_len + 1), dtype=_idx_dt)
     while True:
-        starts = rng.integers(0, n + 1, size=batch_size).astype(_idx_dt, copy=False)
+        starts = rng.integers(0, n + 1, size=batch_size, dtype=_idx_dt)
         np.add(starts[:, None], cols[None, :], out=idx_np)
         if host_np is not None:
             ids = torch.from_numpy(host_np[idx_np])
