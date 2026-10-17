@@ -51,6 +51,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -225,6 +226,33 @@ def _recipe_signature(manifest):
     return sig if isinstance(sig, dict) and sig else None
 
 
+# The length-checkpoint writer (v7_supp.run_lenphase_cell — used by P3MT /
+# P4MT / P5C, the phases whose checkpoints P5T evaluates) records a bespoke
+# `p1l_...` recipe, NOT a run_cfg fingerprint.  It carries the same training
+# knobs under different names (`tl` = train length, `v` = vocab, ...).  The
+# architecture there is hard-wired (256 / 6L / 8H / 32Dh) and there is no
+# in-training eval (val_batch=None), so `ee`/`es` are not part of that recipe.
+_P1L_RECIPE_RE = re.compile(
+    r'^p1l_steps(?P<steps>[^_]+)_tl(?P<sl>[^_]+)_v(?P<v>[^_]+)_bs(?P<bs>[^_]+)'
+    r'_lr(?P<lr>[^_]+)_nt(?P<nt>[^_]+)_wu(?P<wu>[^_]+)_wd(?P<wd>[^_]+)'
+    r'_cl(?P<cl>[^_]+)_dlm(?P<dlm>[^_]+)_mr(?P<mr>[^_-]+)')
+_P1L_ARCH = {'d': '256', 'L': '6', 'H': '8', 'Dh': '32'}
+
+
+def _recipe_knobs(recipe):
+    """Decode either a `_run_fp` fingerprint or the P1L length-checkpoint
+    recipe into the named knob dict.  `{}` means neither format."""
+    knobs = L.run_cfg_knobs(recipe)
+    if knobs:
+        return knobs
+    m = _P1L_RECIPE_RE.match(recipe) if isinstance(recipe, str) else None
+    if not m:
+        return {}
+    out = dict(m.groupdict())
+    out.update(_P1L_ARCH)
+    return out
+
+
 def _recipe_matches_signature(recipe, sig):
     """Check a run_cfg/recipe string against the frozen training-recipe
     signature (review-2 issue 2: the stats entry must verify WHAT produced the
@@ -232,17 +260,23 @@ def _recipe_matches_signature(recipe, sig):
 
     sig 只声明要钉死的字段（键名与 run_cfg_knobs 的解码一致：steps/sl/bs/
     nt/lr/wd/d/L/H/Dh/v/wu/cl/dlm/ee/es）；mt/mr/det/df/cs 与变体/环境/数据
-    绑定，不由签名钉死。recipe 不可解码或任一声明字段不匹配 → False。"""
+    绑定，不由签名钉死。recipe 不可解码或任一声明字段不匹配 → False。
+    长度 checkpoint 的 `p1l_` 配方按同一组语义键解码（见 `_recipe_knobs`）；
+    该路径不运行训练中验证，故 `ee`/`es`（只影响中间评测、不影响权重）不
+    由它承载，不因此拒绝整条记录。"""
     if not isinstance(sig, dict) or not sig:
         return True
     if not isinstance(recipe, str):
         return False
-    knobs = L.run_cfg_knobs(recipe)
-    if not isinstance(knobs, dict):
+    knobs = _recipe_knobs(recipe)
+    if not isinstance(knobs, dict) or not knobs:
         return False
+    _is_p1l = recipe.startswith('p1l_')
     for k, want in sig.items():
         got = knobs.get(k)
         if got is None:
+            if _is_p1l and k in ('ee', 'es'):
+                continue
             return False
         try:
             if float(got) != float(want):
@@ -291,10 +325,25 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp):
             lock = json.load(open(lp, encoding='utf-8'))
         except Exception as e:
             raise SystemExit(f'[v12] REFUSE: freeze lock {lp} exists but cannot be parsed ({type(e).__name__}: {e}) — delete it only if you can prove no test-split record was ever written under it')
-        if lock.get('manifest_sha256') != _sha:
+        _manifest_changed = lock.get('manifest_sha256') != _sha
+        if _manifest_changed:
             if not os.environ.get('V12_REFREEZE'):
                 raise SystemExit(f'[v12] REFUSE: the test split was already accessed under a DIFFERENT frozen manifest (lock {lp}: {lock.get("manifest_sha256")} != current {_sha}, locked_at={lock.get("locked_at")}). Changing the plan after seeing test data is selection bias by construction. To consciously re-freeze, set V12_REFREEZE=1 — the earlier round must then be reported as exploratory in DECISION_LOG.md.')
             print(f'[v12] WARNING: V12_REFREEZE=1 — running under a manifest that differs from the locked one ({lock.get("manifest_sha256")} -> {_sha}); the earlier round is DOWNGRADED to exploratory and this must be recorded in DECISION_LOG.md')
+            # Persist the conscious re-freeze: keeping the OLD hash in the lock
+            # would make every later run under the new plan refuse (and would
+            # lose the fact that a refreeze happened).  The superseded plan is
+            # retained for the exploratory record.
+            prev = {_k: lock.get(_k) for _k in ('manifest_sha256', 'test_ids_fp', 'locked_at', 'frozen_at')}
+            lock['superseded'] = list(lock.get('superseded') or []) + [prev]
+            lock.update({'manifest_sha256': _sha,
+                         'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST),
+                         'frozen_at': manifest.get('frozen_at'),
+                         'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                         'code_semantics': L.CODE_SEMANTICS,
+                         'note': 're-frozen under V12_REFREEZE=1: the previous plan is downgraded to exploratory (record it in DECISION_LOG.md)'})
+            L.atomic_write_json(lp, lock, indent=2)
+            print(f'[v12] freeze lock UPDATED: {lp} (manifest {str(_sha)[:12]}…; {len(lock["superseded"])} superseded plan(s) kept)')
         if test_ids_fp is not None and lock.get('test_ids_fp') not in (None, test_ids_fp):
             raise SystemExit(f'[v12] REFUSE: the held-out test slice changed after the first access (lock has ids_fp {lock.get("test_ids_fp")}, current {test_ids_fp}) — the test data itself is part of the freeze; investigate before proceeding')
         return lock
@@ -355,6 +404,11 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
     eval_lens = [int(x) for x in manifest.get('eval', {}).get('by_length_ppl', cfg['eval_lens'])]
     _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))
     _cur = L.locked_json_read(spath).get(f'{v}::s{seed}')
+    _ck_sha = None
+    try:
+        _ck_sha = _file_sha256(ck)
+    except Exception as _he:
+        print(f'[p5t] NOTE {v} s{seed}: could not hash the checkpoint file ({type(_he).__name__}: {_he}) — the record will carry ckpt_sha256=null (weaker binding)')
 
     def _stale(rec):
         if not isinstance(rec, dict):
@@ -365,6 +419,12 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
             return True
         if _msha is not None and rec.get('manifest_sha256') != _msha:
             return True  # the manifest changed after this record was written
+        # The record must belong to the SAME weights now on disk: a checkpoint
+        # regenerated at the same path under the same code/recipe would
+        # otherwise be silently evaluated by the old record's numbers.
+        _rec_sha = rec.get('ckpt_sha256')
+        if _rec_sha is not None and _ck_sha is not None and _rec_sha != _ck_sha:
+            return True
         bl = rec.get('by_len') or {}
         return not all((L.by_len_cells([rec], Ln) for Ln in eval_lens))
     if not _stale(_cur):
@@ -375,16 +435,15 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
     model = L.SmallGPT(int(d.get('vocab', 8192)), *_arch, d.get('train_len', 512), [copy.deepcopy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
     model.load_state_dict(d.pop('sd'))
     model.eval()
-    r = V.eval_length_gen(model, test_ids, eval_lens, DEVICE, max_pos=None)
+    # score EVERY loaded row: test_ids is the frozen slice already sliced to
+    # the manifest's n_seqs_clean, and data_fp is computed over all of them.
+    # eval_length_gen's default (n_seq=8) would silently measure only the
+    # first 8 rows while the lock/fingerprint claim the full 16-row slice.
+    r = V.eval_length_gen(model, test_ids, eval_lens, DEVICE, max_pos=None, n_seq=int(test_ids.shape[0]))
     del model
     gc.collect()
     if DEVICE.type == 'cuda':
         torch.cuda.empty_cache()
-    _ck_sha = None
-    try:
-        _ck_sha = _file_sha256(ck)
-    except Exception as _he:
-        print(f'[p5t] NOTE {v} s{seed}: could not hash the checkpoint file ({type(_he).__name__}: {_he}) — the record will carry ckpt_sha256=null (weaker binding)')
 
     def _merge(summary):
         # by_len now also carries ppl_per_seq (per-document rows, review-2

@@ -340,6 +340,71 @@ def t_freeze_lock():
             del os.environ['V12_REFREEZE']
 
 
+def t_p1l_recipe_signature():
+    # P5T evaluates checkpoints written by v7's length-phase writer, whose
+    # recipe is the bespoke `p1l_...` format (not a run_cfg fingerprint).  The
+    # shipped frozen signature must accept it, otherwise every frozen
+    # checkpoint is refused as a recipe mismatch.
+    with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+        v2 = json.load(f)
+    sig = v2['binding']['training_recipe_signature']
+    p1l = ('p1l_steps3000_tl512_v8192_bs12_lr0.0003_nt8000000_wu50_wd0.1_'
+           'cl0.05_dlm10.0_mr4-csa_fixed_rope_dfdeadbeef')
+    assert V12._recipe_knobs(p1l)['steps'] == '3000'
+    assert V12._recipe_knobs(p1l)['sl'] == '512'
+    assert V12._recipe_matches_signature(p1l, sig) is True, 'the P1L checkpoint recipe must satisfy the shipped signature'
+    assert V12._recipe_matches_signature(p1l.replace('steps3000', 'steps40'), sig) is False
+    assert V12._recipe_matches_signature('p1l_garbage', sig) is False
+
+
+def t_aggregate_seed_normalization():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    base = dict(variant='csa_dynamic', run_cfg=fp, steps=1, tokens_seen=1, params=100, ppl=10.0)
+    raw = {'a::seed0': dict(base, seed=0), 'b::seed0': dict(base, seed='0')}
+    try:
+        L.aggregate(raw)
+        raise AssertionError('seed 0 and "0" are the same seed and must trip the ambiguous-duplicate guard, not be counted as n=2')
+    except ValueError:
+        pass
+
+
+def t_audit_resolution_classification():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+
+    def _summary(deltas):
+        s = {}
+        for i, d in enumerate(deltas):
+            s[f'a::seed{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1, tokens_seen=1, params=100, ppl=50.0 + d)
+            s[f'b::seed{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1, tokens_seen=1, params=100, ppl=50.0)
+        return s
+    design = {'c': [('a', 'b', 'test')]}
+    # n=6, effect > noise, p=0.0625 > alpha, but the exact-test floor (0.031)
+    # is BELOW alpha -> a genuine null-ish reading, NOT a resolution ceiling.
+    r = L.methodology_audit(_summary([1, 1, 1, 1, 1, -0.5]), design=design, verbose=False)
+    assert 'c' in r['noise_level_components'] and 'c' not in r['resolution_limited_components'], r
+    # n=4 strong effect -> the floor (0.125) is above alpha -> resolution-limited.
+    r2 = L.methodology_audit(_summary([1, 1, 1, 0.9]), design=design, verbose=False)
+    assert 'c' in r2['resolution_limited_components'], r2
+
+
+def t_adaptive_threshold_guard():
+    # The implementation row-chunks: a large batch with a moderate T is
+    # feasible and must not be rejected; a single long row whose per-chunk
+    # peak genuinely exceeds the budget must be rejected.
+    L.causal_adaptive_threshold(torch.randn(64, 4096), 16)
+    try:
+        L.causal_adaptive_threshold(torch.randn(16000), 16)
+        raise AssertionError('a single 16000-token row materialises ~4 GB and must be refused')
+    except RuntimeError:
+        pass
+
+
+def t_segment_empty():
+    bids, hon, counts = L._segment(0, [], 2, 128)
+    assert bids.size == 0 and hon == {} and counts == []
+    assert L._segment(1, [], 2, 128)[2] == [1]
+
+
 def t_shipped_manifest_consistency():
     with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
         v2 = json.load(f)
@@ -417,7 +482,12 @@ def main():
     _check('C2 admission gate exclusions', t_admission_gate)
     _check('C3 admission gate refusals', t_admission_refuses)
     _check('C4 recipe signature', t_recipe_signature)
+    _check('C4b P1L checkpoint recipe signature', t_p1l_recipe_signature)
     _check('C5 freeze lock', t_freeze_lock)
+    _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)
+    _check('C10 audit resolution classification', t_audit_resolution_classification)
+    _check('A7 adaptive-threshold memory guard', t_adaptive_threshold_guard)
+    _check('A8 empty segmenter', t_segment_empty)
     _check('C6 shipped manifest v2 consistency', t_shipped_manifest_consistency)
     _check('C7 frozen seeds single source', t_frozen_seeds)
     _check('C8 doc-level analysis', t_doc_level_analysis)

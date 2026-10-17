@@ -136,7 +136,12 @@ class HybridAttentionRoPE(L.HybridAttention):
                 # eval-only weight-concat cache, keyed on the source weights'
                 # autograd `_version` counters (bumped by every in-place
                 # optimizer update) exactly like exp_lib's `_wcat_cache`.
-                _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version, self.W_q.weight.device)
+                # dtype is part of the key: .to(dtype)/.half() does not bump
+                # `_version`, so a versions+device key would serve a stale
+                # fused weight of the previous dtype.
+                _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version,
+                        self.W_q.weight.dtype, self.W_k.weight.dtype, self.W_v.weight.dtype,
+                        self.W_q.weight.device)
                 _hit = self._wcat_cache.get('qkv')
                 if _hit is None or _hit[0] != _key:
                     with torch.inference_mode(False):
@@ -850,6 +855,11 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
     _deadline = None
     if guard is not None:
         _deadline = guard.deadline_ts()
+        if booked:
+            # the guard's spent total already contains this cell's own
+            # pre-booking; add it back so the cell is not truncated by the
+            # estimate of the time it is about to use (see exp_lib._run_cell).
+            _deadline += booked
     rec = None
     try:
         try:
@@ -1670,6 +1680,11 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                 return out
         t0 = time.time()
         _deadline = guard.deadline_ts() if guard is not None else None
+        if _deadline is not None and booked:
+            # subtract this cell's own pre-booking from the elapsed side (see
+            # exp_lib._run_cell): the reservation is future time for this
+            # cell, not time already spent.
+            _deadline += booked
         L.set_seed(seed)
         cfgs = L.make_layer_cfgs(6, v)
         train_ids = L.load_wikitext(train_len, 8000000)[0]

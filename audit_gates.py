@@ -389,18 +389,28 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
         out['arms'][a] = {'n_records': len(recs), 'n_distinct_run_cfg': len(cfgs), 'n_distinct_train_knobs': len(knobs), 'params': sorted({r.get('params') for r in recs}, key=lambda x: (x is None, x))}
         if len(cfgs) > 1:
             problems.append(f'{a}: {len(cfgs)} distinct run_cfg values within one arm — mixed protocols inside an arm')
+    _unverifiable = False
     if len(per_arm) >= 2:
         ref_arm = arms[0] if arms[0] in per_arm else next(iter(per_arm))
         ref_cfg = {r.get('run_cfg') for r in per_arm[ref_arm]}
-        for a, recs in per_arm.items():
-            if a == ref_arm:
-                continue
-            for r in recs:
-                if r.get('run_cfg') is None or r.get('run_cfg') not in ref_cfg:
-                    problems.append(f'{a}: a record whose run_cfg does not equal the {ref_arm} reference (pair_reason would refuse this pairing)')
-                    break
+        if not ref_cfg or None in ref_cfg:
+            # Length-phase / checkpoint-backed records carry `by_len` and a
+            # code stamp but no run_cfg fingerprint, so cross-arm recipe
+            # equality is NOT verifiable from this summary.  Report that
+            # honestly instead of flagging every arm as unfair (which would
+            # turn a missing field into a false FAIL).
+            _unverifiable = True
+            out['note'] = 'this panel\'s records carry no run_cfg fingerprint (e.g. length-phase records) — cross-arm training-recipe equality cannot be verified from this summary; run the fairness audit on the run-level summary that owns the run_cfg records'
+        else:
+            for a, recs in per_arm.items():
+                if a == ref_arm:
+                    continue
+                for r in recs:
+                    if r.get('run_cfg') is None or r.get('run_cfg') not in ref_cfg:
+                        problems.append(f'{a}: a record whose run_cfg does not equal the {ref_arm} reference (pair_reason would refuse this pairing)')
+                        break
     out['problems'] = problems
-    out['status'] = 'fail' if problems else 'ok'
+    out['status'] = 'fail' if problems else ('not_verifiable_locally' if _unverifiable else 'ok')
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 

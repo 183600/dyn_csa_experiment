@@ -167,6 +167,11 @@ def _seg_pos(n):
     return pos
 
 def _segment(n, want_cut_list, min_block, max_block):
+    if n <= 0:
+        # No tokens -> no blocks.  Returning the empty triple here (instead of
+        # indexing ends[-1] on an empty array) keeps the public entry points
+        # total for empty/negative-length inputs.
+        return (np.empty(0, dtype=np.int64), {}, [])
     cacheable = n <= 64
     # uint8 cast of the booleans is exactly 0/1 per slot — the same byte string
     # `bytes(bytearray(1 if _c else 0 ...))` built, without a Python-level
@@ -409,13 +414,17 @@ def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=Fals
 def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
-    # 闭式因果分位数是 O(B·T²) 内存与逐行排序：长上下文臂请改用
-    # cosine_learnable 分块器；此处 fail-fast 而不是让内核 OOM。
+    # 闭式因果分位数按行分块（见下方 row_chunk），单块峰值才是真正的内存
+    # 上界：masked + 排序值 + int64 排序索引 ≈ 16·rows·T² 字节。用这个
+    # 上界做 fail-fast，既不会误拒大 batch（峰值与 B 无关），也不会对
+    # 单行超长序列放行到数 GB 的分配——fail-fast 而不是让内核 OOM。
     n = sim.shape[-1]
-    _sq_bytes = sim.shape[0] * n * n if sim.dim() == 2 else n * n
-    if _sq_bytes * 4 > 1 << 30:
+    _rows_total = int(sim.shape[0]) if sim.dim() == 2 else 1
+    _row_chunk_est = max(1, (256 << 20) // max(n * n * 4, 1))
+    _peak_bytes = min(_rows_total, _row_chunk_est) * n * n * 16
+    if _peak_bytes > 1 << 30:
         raise RuntimeError(
-            f'causal_adaptive_threshold 的因果分位数闭式为 O(B·T²)（本次需 ~{_sq_bytes * 4 / 2**30:.1f} GB）: '
+            f'causal_adaptive_threshold 的因果分位数闭式为 O(rows·T²)（单块峰值 ~{_peak_bytes / 2**30:.1f} GB）: '
             'adaptive 分段器不支持该序列长度——请改用 chunking="cosine_learnable"')
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
     # 1-D (single row) or 2-D (batched rows) — every op is rowwise
@@ -1231,16 +1240,12 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         Zbm = _take_2d(Zbs, g_b[_b0:_b1])
         _ma = mask_a[_b0:_b1]
         _mb = mask_b[_b0:_b1]
-        # Position-embedding add as a plain broadcast: pad lanes receive the
-        # position row too, but the masked_fill_ right after overwrites them
-        # with -inf, so the forward values are identical to the masked-multiply
-        # form (and to the boolean-index form) lane for lane.  The B_pos
-        # gradients are identical too: the incoming grad at filled lanes is
-        # exactly zero (MaskedFillBackward zeroes them, and softmax backward
-        # gives P=0 there as well), so summing it with or without the 0/1 mask
-        # multiply yields the same values bit for bit — while the broadcast
-        # form skips a [chunk, L, Fd]-sized multiply temporary and one
-        # elementwise kernel per chunk.
+        # Position-embedding add restricted to valid lanes arithmetically:
+        # multiplying by the 0/1 mask adds exactly the same values on valid
+        # lanes and exactly 0 on pad lanes; pad lanes are then overwritten with
+        # -inf.  Forward values and B_pos gradients (zero on invalid lanes in
+        # both forms) are identical to the boolean-index form.  (The
+        # single-block path below uses the equivalent plain-broadcast form.)
         # += on the fresh _take_2d outputs: the same elementwise kernel with
         # the same values as the out-of-place add (AddBackward saves no tensor,
         # and the only downstream consumer chain — masked_fill_/cat/softmax —
@@ -1957,7 +1962,13 @@ class HybridAttention(nn.Module):
             if torch.is_grad_enabled():
                 _wqkv = torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0)
             else:
-                _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version, self.W_q.weight.device)
+                # dtype belongs in the key: Module.to(dtype)/.half() replaces
+                # the parameter data WITHOUT bumping `_version`, so a key made
+                # only of versions+device would serve a stale fused weight of
+                # the old dtype after an in-place precision change.
+                _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version,
+                        self.W_q.weight.dtype, self.W_k.weight.dtype, self.W_v.weight.dtype,
+                        self.W_q.weight.device)
                 _hit = self._wcat_cache.get('qkv')
                 if _hit is None or _hit[0] != _key:
                     with torch.inference_mode(False):
@@ -2083,7 +2094,9 @@ class HybridAttention(nn.Module):
         if torch.is_grad_enabled():
             _wcat = torch.cat([_m.t() for _m in _mats], dim=0)
         else:
-            _key = tuple(_m._version for _m in _mats) + (_mats[0].device,)
+            # dtype too: .to(dtype)/.half() does not bump `_version`, so a
+            # versions+device key would serve the pre-conversion fused weight.
+            _key = tuple(_m._version for _m in _mats) + tuple(_m.dtype for _m in _mats) + (_mats[0].device,)
             _hit = self._wcat_cache.get('pre')
             if _hit is None or _hit[0] != _key:
                 with torch.inference_mode(False):
@@ -3276,20 +3289,33 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             raise RuntimeError(f'load_fineweb_edu: only {n_train} train tokens available (need > seq_len+1 = {seq_len + 1}) — the source is too small for the requested cap')
 
         def _finalise_npy(raw_path, dst_path, count):
-            npy_tmp = dst_path + '.tmp'
-            mm = np.lib.format.open_memmap(npy_tmp, mode='w+', dtype=disk_dt, shape=(int(count),))
-            done = 0
-            with open(raw_path, 'rb') as rf:
-                while done < count:
-                    take = min(1 << 22, count - done)
-                    chunk = np.fromfile(rf, dtype=disk_dt, count=take)
-                    if chunk.size < take:
-                        raise RuntimeError(f'load_fineweb_edu: raw staging file {raw_path} is shorter than the encoded count — aborting the cache write')
-                    mm[done:done + take] = chunk
-                    done += take
-            mm.flush()
-            del mm
-            os.replace(npy_tmp, dst_path)
+            # Unique temp name (mkstemp): a fixed `dst_path + '.tmp'` lets two
+            # concurrent cold builds write through the same memmap, and one can
+            # rename it while the other is still writing.  Same-directory temp
+            # keeps os.replace atomic (same filesystem).
+            _fd, npy_tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(dst_path)),
+                                            prefix=os.path.basename(dst_path) + '.', suffix='.tmp')
+            os.close(_fd)
+            try:
+                mm = np.lib.format.open_memmap(npy_tmp, mode='w+', dtype=disk_dt, shape=(int(count),))
+                done = 0
+                with open(raw_path, 'rb') as rf:
+                    while done < count:
+                        take = min(1 << 22, count - done)
+                        chunk = np.fromfile(rf, dtype=disk_dt, count=take)
+                        if chunk.size < take:
+                            raise RuntimeError(f'load_fineweb_edu: raw staging file {raw_path} is shorter than the encoded count — aborting the cache write')
+                        mm[done:done + take] = chunk
+                        done += take
+                mm.flush()
+                del mm
+                os.replace(npy_tmp, dst_path)
+            except BaseException:
+                try:
+                    os.unlink(npy_tmp)
+                except OSError:
+                    pass
+                raise
 
         _finalise_npy(raw_train, tr_path, n_train)
         val_disk = np.fromfile(raw_val, dtype=disk_dt, count=n_val * seq_len)
@@ -4098,7 +4124,9 @@ def _knobs_equal_across_arms(recs, arms, key):
                 continue
             if key in r and r.get(key) is not None:
                 vals.append(json.dumps(r.get(key), sort_keys=True, default=str))
-            break
+                break
+            # keep scanning this arm: a legacy/first record without the key
+            # must not mask a later record that does record it.
     if len(vals) < 2:
         return None
     return len(set(vals)) == 1
@@ -4145,6 +4173,7 @@ def methodology_audit(summary, design=None, *, alpha=0.05, min_n=3, outdir=None,
         n_powered = 0
         n_significant = 0
         n_powered_noise_free = 0
+        n_powered_res_limited = 0
         for a, b, note in contrasts:
             arms.update((a, b))
             a_present, b_present = (a in present, b in present)
@@ -4166,6 +4195,8 @@ def methodology_audit(summary, design=None, *, alpha=0.05, min_n=3, outdir=None,
                         _contrast_powered = True
                         if not st['within_seed_noise']:
                             n_powered_noise_free += 1
+                            if st.get('resolution_limited'):
+                                n_powered_res_limited += 1
                 if st['significant']:
                     n_significant += 1
             n_measured += int(_contrast_measured)
@@ -4192,7 +4223,12 @@ def methodology_audit(summary, design=None, *, alpha=0.05, min_n=3, outdir=None,
             report['verified_components'].append(comp)
             if n_significant > 0:
                 report['significant_components'].append(comp)
-            elif n_powered_noise_free > 0:
+            elif n_powered_res_limited > 0:
+                # Only a contrast whose exact-test p FLOOR is still above
+                # alpha is resolution-limited (design_notes §19).  A powered,
+                # non-noise contrast that simply failed to reach significance
+                # at an n large enough to reach it is a null-ish reading, not
+                # a resolution ceiling — do not tell the reader to add seeds.
                 report['resolution_limited_components'].append(comp)
             else:
                 report['noise_level_components'].append(comp)
@@ -5470,11 +5506,17 @@ def aggregate(summary):
         if v is None:
             v = str(key).split('::', 1)[0]
         per_variant.setdefault((v, _protocol_tag(rec, key)), []).append(rec)
+    def _seed_key(s):
+        # JSON round-trips can leave the same seed as 0 or "0"; the rest of the
+        # readers normalise through `_as_seed_int`.  Keying dedup/pairing on the
+        # raw value would count one seed twice and fabricate an extra n.
+        n = _as_seed_int(s)
+        return s if n is None else n
     _dups = {}
     for k, recs in per_variant.items():
         cnt = {}
         for r in recs:
-            s = r['seed']
+            s = _seed_key(r['seed'])
             cnt[s] = cnt.get(s, 0) + 1
         bad = sorted((s for s, c in cnt.items() if c > 1))
         if bad:
@@ -5504,7 +5546,7 @@ def aggregate(summary):
     def _by_seed(recs):
         out, dup = ({}, [])
         for r in recs:
-            s = r['seed']
+            s = _seed_key(r['seed'])
             if s in out:
                 dup.append(s)
             out[s] = r
@@ -6066,6 +6108,15 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             out['status'] = 'skipped_cap'
             return out
         deadline_ts = guard.deadline_ts()
+        if booked:
+            # `spent_hours()` includes this cell's own pre-booking, but that
+            # reservation is the time this cell is ABOUT to use — not time
+            # already spent.  Without adding it back here the cell's wall-clock
+            # deadline shrinks by its own estimate (a lone 6 h cell under a
+            # 9.3 h cap would be truncated after 3.3 h, and after one truncated
+            # attempt it could never finish).  Other cells' bookings stay
+            # subtracted, which is exactly the shared-headroom contract.
+            deadline_ts += booked
         print(f'[cap] {key}: projected {est / 60:.0f} min, booked so far {guard.state['booked_seconds'] / 3600:.2f} h')
     t_run = time.time()
     rec = None
