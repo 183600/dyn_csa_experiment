@@ -704,7 +704,9 @@ def _stable_topk_desc(x, k):
         m *= int(_s)
     dev = x.device
     flat = x.reshape(m, B)
-    kth = torch.topk(flat, kk, dim=1, sorted=True).values[:, -1:]
+    # Clone the single k-th column so the full [m, kk] topk values buffer is
+    # released immediately (a bare column view would keep it alive).
+    kth = torch.topk(flat, kk, dim=1, sorted=True).values[:, -1].unsqueeze(1).clone()
     # Same candidate construction as exp_lib._rank_blocks: strictly greater
     # entries plus the earliest equal-to-kth entries.  Prefix ranks use int32
     # (B < 2^31), the same exact integers; the sentinel is filled in place.
@@ -2186,7 +2188,12 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         bids = [pb[0] for pb in pre_blocks]
         nblks = [pb[1] for pb in pre_blocks]
         hons = [pb[2] for pb in pre_blocks]
-        bid_full = torch.stack(bids, 0).to(torch.int32).contiguous()
+        # Write the rows directly into the int32 device table: the exact same
+        # block ids the int64 stack-then-cast produced, without the temporary
+        # [B, T] int64 stack (a batch-sized peak saving).
+        bid_full = torch.empty((B, T), dtype=torch.int32, device=dev)
+        for _b, _bd in enumerate(bids):
+            bid_full[_b].copy_(_bd)
         counts_rows = [getattr(bd, '_pool_cpu', None) for bd in bids]
         if any(c is None for c in counts_rows):
             raise RuntimeError('块几何缺少 _pool_cpu counts——分段器出口被绕过')
@@ -2195,7 +2202,9 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         bids = [pb[0] for pb in pre_blocks]
         nblks = [pb[1] for pb in pre_blocks]
         hons = None
-        bid_full = torch.stack(bids, 0).to(torch.int32).contiguous()
+        bid_full = torch.empty((B, T), dtype=torch.int32, device=dev)
+        for _b, _bd in enumerate(bids):
+            bid_full[_b].copy_(_bd)
         counts_rows = [getattr(bd, '_pool_cpu', None) for bd in bids]
         if any(c is None for c in counts_rows):
             raise RuntimeError('块几何缺少 _pool_cpu counts——分段器出口被绕过')

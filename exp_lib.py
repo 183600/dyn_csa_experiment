@@ -1585,13 +1585,17 @@ def _rank_blocks(masked, B, ties, k=None):
     if kk <= 0:
         return torch.empty((masked.shape[0], 0), dtype=torch.long, device=masked.device)
     if kk >= B:
+        # argsort returns exactly the same stable permutation as sort(...).indices
+        # while skipping the sorted-values tensor (a full [n, B] allocation).
         if ties == 'earliest':
-            return torch.sort(masked, dim=1, stable=True, descending=True).indices
-        order = torch.sort(masked.flip(1), dim=1, stable=True, descending=True).indices
+            return torch.argsort(masked, dim=1, stable=True, descending=True)
+        order = torch.argsort(masked.flip(1), dim=1, stable=True, descending=True)
         return torch.sub(B - 1, order, out=order)
     src = masked.flip(1) if ties == 'latest' else masked
     n, _ = src.shape
-    kth = torch.topk(src, kk, dim=1, sorted=True).values[:, -1:]
+    # Keep only the k-th value: a bare column view would keep the whole
+    # [n, kk] topk values buffer alive for the rest of the selection.
+    kth = torch.topk(src, kk, dim=1, sorted=True).values[:, -1].unsqueeze(1).clone()
     # gt has at most kk - 1 entries (the k-th value itself is not strictly
     # greater), so `need` is non-negative and selects exactly kk columns.
     # Prefix ranks use int32 (B < 2^31): the same exact integers as the int64
@@ -1628,8 +1632,8 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
             out_valid[:] = [torch.zeros(n, 0, dtype=torch.bool, device=scores.device)]
         return torch.empty(n, 0, device=scores.device, dtype=torch.int32)
     k = min(k_req, B)
-    finite = torch.isfinite(scores)
-    cf = causal & finite
+    # One boolean table instead of a separate finite mask plus the AND result.
+    cf = causal & torch.isfinite(scores)
     # torch.where picks bit-identical values (scores or the -inf constant) —
     # the same selection masked_fill produced.
     masked = torch.where(cf, scores, float('-inf'))
@@ -3306,10 +3310,12 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         # per-`encode` form.
         chunks = []
         cur = []
-        n_have = 0
+        n_flushed = 0
 
         def _flush():
+            nonlocal n_flushed
             if cur:
+                n_flushed += len(cur)
                 chunks.append(np.array(cur, dtype=np.int64))
                 cur.clear()
 
@@ -3322,7 +3328,9 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                 cur.append(_eos)
             if len(cur) >= (1 << 22):
                 _flush()
-            n_have = sum(c.size for c in chunks) + len(cur)
+            # Running token count: same integer as summing the chunk sizes,
+            # without walking every accumulated chunk on each row block.
+            n_have = n_flushed + len(cur)
             if n_have >= cap_tokens:
                 break
             if start and start % 50000 == 0:
@@ -3404,10 +3412,12 @@ def _tokenise_row_chunks(row_chunks, cap_tokens, label, tok, eos_id):
     [:cap_tokens] truncation) so the served ids obey the same discipline."""
     chunks = []
     cur = []
-    n_have = 0
+    n_flushed = 0
 
     def _flush():
+        nonlocal n_flushed
         if cur:
+            n_flushed += len(cur)
             chunks.append(np.array(cur, dtype=np.int64))
             cur.clear()
     for rows in row_chunks:
@@ -3417,7 +3427,7 @@ def _tokenise_row_chunks(row_chunks, cap_tokens, label, tok, eos_id):
             cur.append(eos_id)
         if len(cur) >= (1 << 22):
             _flush()
-        n_have = sum(c.size for c in chunks) + len(cur)
+        n_have = n_flushed + len(cur)
         if n_have >= cap_tokens:
             break
         print(f'    [{label}] {n_have} tokens so far')
@@ -4193,6 +4203,7 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         raise ValueError(f'batch_iter needs len(train_ids) > seq_len+1 to sample causal windows, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
     train_ids = np.asarray(train_ids)
     host = None
+    host_np = None
     cached = _PINNED_HOST_CACHE.get('entry')
     if cached is not None and cached[0] is train_ids and cached[1].shape[0] == train_ids.shape[0]:
         host = cached[1]
@@ -4218,12 +4229,15 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
                 host = torch.from_numpy(_ids_narrow(train_ids))
         else:
             _host_ids = _ids_narrow(train_ids)
-            # PyTorch's CPU index kernel lacks uint8/uint16 gathers, so widen
-            # those two transport widths to int32 on the CPU host only.
-            # CUDA keeps the transport width; its gather widens to int64 below.
             if _host_ids.dtype in (np.uint8, np.uint16):
-                _host_ids = _host_ids.astype(np.int32, copy=False)
-            host = torch.from_numpy(_host_ids)
+                # PyTorch's CPU index kernel lacks uint8/uint16 gathers.  Rather
+                # than widening the whole corpus to int32 (a 2-4x resident copy
+                # that grows with the token count), gather the narrow array with
+                # NumPy per batch and widen only the [B, seq_len+1] result —
+                # the same exact token ids, no corpus-sized allocation.
+                host_np = _host_ids
+            else:
+                host = torch.from_numpy(_host_ids)
     # Transport-only narrowing (design notes §6.1): every gather index is an
     # exact integer bounded by n + seq_len, so when that bound fits in int32
     # the index tensor is uploaded / consumed as int32 and the gathered ids
@@ -4241,11 +4255,14 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     while True:
         starts = rng.integers(0, n + 1, size=batch_size).astype(_idx_dt, copy=False)
         np.add(starts[:, None], cols[None, :], out=idx_np)
-        idx = torch.from_numpy(idx_np)
-        if host.device.type == 'cuda':
-            ids = host[_h2d_async(idx, idx.dtype, host.device)]
+        if host_np is not None:
+            ids = torch.from_numpy(host_np[idx_np])
         else:
-            ids = host[idx]
+            idx = torch.from_numpy(idx_np)
+            if host.device.type == 'cuda':
+                ids = host[_h2d_async(idx, idx.dtype, host.device)]
+            else:
+                ids = host[idx]
         if ids.dtype != torch.int64:
             # widen back right after the gather: the yielded ids are
             # bit-identical to the int64 form.
