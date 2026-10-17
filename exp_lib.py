@@ -1374,6 +1374,13 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     _per_elems = (4 * int(max_len) + 4 * _Wb) * _Fd + 8 * (int(max_len) + _Wb)
     _chunk = _pool_block_chunk(B, _per_elems, Xas.element_size())
     _bpa = B_pos_a[_pos_a]
+    # Every real block carries at least one token (the segmenters only emit
+    # positive counts), so the A lanes always contain a finite logit and the
+    # softmax cannot produce NaN/Inf.  When the block-ids object exposes its
+    # host counts we can prove that here and skip the full-size nan_to_num
+    # copy; the fallback keeps the defensive form for externally built tables.
+    _clean = (B > 0 and _cpu is not None and len(_cpu[0]) == B
+              and bool(_cpu[0]) and min(_cpu[0]) > 0)
     comp = torch.empty(B, _Fd, device=dev, dtype=Xas.dtype)
     for _b0 in range(0, B, _chunk):
         _b1 = min(_b0 + _chunk, B)
@@ -1399,7 +1406,9 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         WinZ = torch.cat([Zam, Zbm], 1)
         # softmax 的反向保存其输出，nan_to_num 必须出位（原地会改写保存值，
         # SoftmaxBackward 版本检查失败）；值与任何原地形式逐位相同。
-        sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
+        # The safe-count path skips the copy entirely: nan_to_num over the
+        # finite softmax output is the identity.
+        sc = F.softmax(WinZ, dim=1) if _clean else torch.nan_to_num(F.softmax(WinZ, dim=1))
         del WinZ, Zam, Zbm
         Xam = _take_2d(Xas, g_a[_b0:_b1])
         Xbm = _take_2d(Xbs, g_b[_b0:_b1])
@@ -1463,6 +1472,8 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     _per_elems = 3 * int(max_len) * _Fd + 4 * int(max_len)
     _chunk = _pool_block_chunk(B, _per_elems, Xs.element_size())
     _bpos = B_pos[_pos_a]
+    _clean = (B > 0 and _cpu is not None and len(_cpu[0]) == B
+              and bool(_cpu[0]) and min(_cpu[0]) > 0)
     comp = torch.empty(B, _Fd, device=dev, dtype=Xs.dtype)
     for _b0 in range(0, B, _chunk):
         _b1 = min(_b0 + _chunk, B)
@@ -1481,7 +1492,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         # per lane.
         WinZ.masked_fill_(~mask[_b0:_b1, :, None], float('-inf'))
         # 同 _pool_ordered：softmax 反向保存输出，nan_to_num 出位。
-        sc = torch.nan_to_num(F.softmax(WinZ, dim=1))
+        sc = F.softmax(WinZ, dim=1) if _clean else torch.nan_to_num(F.softmax(WinZ, dim=1))
         comp[_b0:_b1] = (sc * Xb).sum(1)
     # same identity-order fast path as _pool_ordered: order[last_idx] over the
     # cached arange returns exactly last_idx (index transport, §6.1).
@@ -1520,7 +1531,7 @@ def _rank_blocks(masked, B, ties, k=None):
     need = (kk - gt.sum(dim=1)).clamp_min(0).to(torch.int32)
     eq_cum = torch.cumsum(eq, dim=1, dtype=torch.int32)
     sel = gt | (eq & (eq_cum <= need[:, None]))
-    del eq_cum
+    del eq_cum, gt, eq, need
     rank = torch.cumsum(sel, dim=1, dtype=torch.int32)
     rank -= 1
     rank.masked_fill_(~sel, kk)
@@ -1561,7 +1572,10 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     # exactly the elementwise AND of the two per-mask gathers.
     order_w = order[:, :_w_keep]
     keep = cf.gather(1, order_w)
-    dest = keep.cumsum(dim=1)
+    # Integer prefix ranks fit in int32 (k <= B < 2**31): the same exact
+    # integers as the default int64 cumsum at half the bytes, and the scatter
+    # below then needs no int64 index temporary.
+    dest = keep.cumsum(dim=1, dtype=torch.int32)
     dest -= 1
     # int64 -> int32 narrowing, on the kept slice only — same integers
     # (index transport, design notes §6.1).  keep/dest are already exactly
@@ -1834,7 +1848,7 @@ def _finfo_min(dtype):
         _FO_MINL[dtype] = v
     return v
 
-def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False, soft_form=False):
+def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False, soft_form=False, v_stacked=None):
     n = q.shape[0]
     dev = q.device
     if mem_budget_bytes is None:
@@ -1866,7 +1880,12 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _nblk_rows = k_blk.shape[0]
     _has_sw = k_sw is not None and v_sw is not None
     if _has_sw:
-        v_all = torch.cat([v_blk, v_sw], 0)
+        # `v_stacked` lets a caller that already owns a row-contiguous
+        # [blocks | window] V view (the fused KV head in `_single`) hand it in
+        # directly: gathering its rows yields exactly the rows of
+        # cat([v_blk, v_sw]) in the same order, so the values are bit-identical
+        # while the cat copy (a full block+window V table) is never allocated.
+        v_all = v_stacked if v_stacked is not None else torch.cat([v_blk, v_sw], 0)
         # The K halves are concatenated only for the plain (soft=None,
         # soft_form=False) path; the soft path keeps its two contiguous
         # gathers, which the two logits einsums consume directly.
@@ -2017,6 +2036,10 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             soft_logits[:, :, :_nb].add_(soft_log_g[:, None, :]).clamp_min_(_MINL)
             soft_logits.masked_fill_(nvalid, _MINL)
             soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
+            # soft_logits is dead once soft_attn is built; release it before the
+            # plain path allocates its own attention table, lowering the peak
+            # for long contexts without changing any value.
+            del soft_logits, soft_log_g
         logits.masked_fill_(nvalid, _MINL)
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
         if _soft_live:
@@ -2521,10 +2544,15 @@ class HybridAttention(nn.Module):
             _kvh = self.W_kvhead(torch.cat([core_kv, kv_local], 0))
             k_blk, v_blk = self._split(_kvh[:_Bn])
             k_sw, v_sw = self._split(_kvh[_Bn:])
+            # Row-contiguous [blocks | window] view of the V columns: the same
+            # values as cat([v_blk, v_sw]) without the extra allocation.  The
+            # views keep `_kvh` alive exactly as v_blk/v_sw already did.
+            v_stacked = _kvh[:, self.nh * self.hd:].view(_Bn + T, self.nh, self.hd)
             del _kvh
         else:
             k_blk, v_blk = self._split(self.W_kvhead(core_kv))
             k_sw, v_sw = self._split(self.W_kvhead(kv_local))
+            v_stacked = None
         k_blk = F.normalize(k_blk, dim=-1)
         k_sw = F.normalize(k_sw, dim=-1)
         if cfg.kind == 'hca':
@@ -2534,7 +2562,7 @@ class HybridAttention(nn.Module):
             # first-occurrence dedup inside gathered_attention is provably the
             # all-True mask and is skipped (identical keep mask).
             topk_idx = _arange_exp_cache(T, Bn, x.device)
-            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None, topk_distinct=True)
+            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None, topk_distinct=True, v_stacked=v_stacked)
         else:
             topk = cfg.index_topk
             _sel_valid_box = []
@@ -2550,7 +2578,7 @@ class HybridAttention(nn.Module):
             # 重复块 0 已被 sel_valid 置无效。故 gathered_attention 的
             # first_occurrence 去重掩码恒为全真，直接声明 topk_distinct 跳过它
             # （keep 掩码与逐位计算结果一致，下游取值不变）。
-            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], topk_distinct=True, soft_form=True)
+            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], topk_distinct=True, soft_form=True, v_stacked=v_stacked)
         return (self.W_o(out.reshape(T, self.nh * self.hd)), gate_mean)
 
     def forward(self, x):
