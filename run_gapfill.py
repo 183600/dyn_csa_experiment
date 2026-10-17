@@ -389,7 +389,7 @@ def run_overfit(cfg=None, variants=None, steps=None):
     """
     cfg = dict(L.RUN if cfg is None else cfg)
     cfg.setdefault('outdir', 'results_overfit_sanity')
-    variants = list(variants or ['full', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic', 'hybrid_hca_dyn'])
+    variants = list(variants or ['full', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic', 'hybrid_hca_dyn', 'csa_dyn_nocomp'])
     train_ids, val_batch, vocab, _, _ = L.load_run_corpus(cfg)
     print(f'\n[overfit] small-batch sanity check: {len(variants)} variant(s), one fixed batch, wd=0, comp_lambda=0, no augmentation')
     reports = L.overfit_guard(variants, steps=int(steps or 300), train_ids=train_ids, vocab=vocab, force=True)
@@ -439,6 +439,47 @@ def run_full():
     if not push_ok:
         print('[v6] WARNING: final push failed — instance stays up 40 min for a retry, then shuts down. Results are safe on the data disk either way.')
 
+def run_topup():
+    """Seed top-up for the leave-one-out ablation panel (P-ABL).
+
+    Re-runs the SAME `RUN_ABL` config with a longer seed list; completed
+    (variant, seed) cells are skipped by the normal resume logic, so this only
+    pays for the missing seeds.  The default target comes from
+    `exp_lib.methodology_seed_plan` (the family-corrected exact-test floor),
+    NOT from a hard-coded 3 — a 3-seed panel cannot reach significance at
+    alpha=0.05 no matter how large the effect is.  Override with
+    `ABL_SEED_TARGET=<n>`.
+    """
+    plan = L.methodology_seed_plan(0, baselines={}, variants=L.RUN_ABL['variants'])
+    _default = plan.get('min_seeds_for_family_significance') or 6
+    try:
+        target = int(os.environ.get('ABL_SEED_TARGET') or _default)
+    except (TypeError, ValueError):
+        raise SystemExit(f"ABL_SEED_TARGET must be an integer, got {os.environ.get('ABL_SEED_TARGET')!r}")
+    if target < 1:
+        raise SystemExit('ABL_SEED_TARGET must be >= 1')
+    print(f'[topup] P-ABL seed target n={target} (declared contrasts={plan["declared_contrasts"]}, '
+          f'family-corrected minimum={plan["min_seeds_for_family_significance"]}); existing seeds are resumed, only missing cells run.')
+    guard = L.TimeGuard(L.RUN_CAP)
+    guard.report()
+    L.run(L.RUN_ABL, seeds=list(range(target)), guard=guard,
+          label=f'P-ABL seed top-up to n={target} (results_lm_v4_abl)')
+    _core_raw = os.environ.get('CORE_SEED_TARGET')
+    if _core_raw:
+        try:
+            _core_target = int(_core_raw)
+        except (TypeError, ValueError):
+            raise SystemExit(f'CORE_SEED_TARGET must be an integer, got {_core_raw!r}')
+        if _core_target < 1:
+            raise SystemExit('CORE_SEED_TARGET must be >= 1')
+        print(f'[topup] P-CORE seed target n={_core_target} (baseline claims live in this panel; resume-safe)')
+        L.run(L.RUN, seeds=list(range(_core_target)), guard=guard,
+              label=f'P-CORE seed top-up to n={_core_target} (results_lm_v3_1500)')
+    ok = git_push(f'v6: P-ABL/P-CORE seed top-up (P-ABL n={target}' + (f", P-CORE n={_core_target}" if _core_raw else '') + '; resume-safe)')
+    guard.report()
+    print(f'\n[v6] TOP-UP DONE (target n={target}).')
+    schedule_shutdown(90 if ok else 2400)
+
 def run_smoke():
     # The smoke must exercise every forward path the `full` phases schedule:
     # dense, fixed-block CSA and the dynamic hybrid, PLUS the leave-one-out
@@ -446,8 +487,8 @@ def run_smoke():
     # sink off, learned local fusion, the HCA layer kind, and the dense
     # sink control) — otherwise a broken ablation arm would only surface
     # after P-CORE/P-LONG burned hours on a real box.
-    smoke_cfg = dict(L.RUN, outdir='results_smoke', variants=['full', 'csa_fixed', 'hybrid_dynamic', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'csa_dyn_fuse', 'hybrid_hca_dyn', 'full_sink'], steps=60, eval_every=30, n_train_tokens=1000000, seeds=[0])
-    run_overfit(cfg=smoke_cfg, variants=['full', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic', 'hybrid_hca_dyn'], steps=250)
+    smoke_cfg = dict(L.RUN, outdir='results_smoke', variants=['full', 'csa_fixed', 'hybrid_dynamic', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'csa_dyn_nocomp', 'csa_dyn_fuse', 'hybrid_hca_dyn', 'full_sink'], steps=60, eval_every=30, n_train_tokens=1000000, seeds=[0])
+    run_overfit(cfg=smoke_cfg, variants=['full', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic', 'hybrid_hca_dyn', 'csa_dyn_nocomp'], steps=250)
     L.run(smoke_cfg, seeds=[0], guard=None, label='SMOKE (60 steps)', par=False)
     _sp = os.path.join('results_smoke', 'summary.json')
     _got = {}
@@ -467,8 +508,8 @@ if __name__ == '__main__':
     if mode in ('-h', '--help'):
         print(__doc__ or '')
         raise SystemExit(0)
-    if mode not in ('smoke', 'overfit', 'full'):
-        print(f"[v6] unknown mode {mode!r}; expected 'smoke', 'overfit' or 'full' (no argument means 'full').  Nothing was started.")
+    if mode not in ('smoke', 'overfit', 'topup', 'full'):
+        print(f"[v6] unknown mode {mode!r}; expected 'smoke', 'overfit', 'topup' or 'full' (no argument means 'full').  Nothing was started.")
         raise SystemExit(2)
     try:
         _gpu = torch.cuda.get_device_name(0)
@@ -480,13 +521,15 @@ if __name__ == '__main__':
             run_smoke()
         elif mode == 'overfit':
             run_overfit()
+        elif mode == 'topup':
+            run_topup()
         elif mode == 'full':
             run_full()
         else:
             raise SystemExit(f'unknown mode: {mode}')
     except Exception:
         traceback.print_exc()
-        if mode == 'full':
+        if mode in ('full', 'topup'):
             print('\n[v6] CRASHED — attempting a partial-results push, then the instance stays up 40 min for remote debugging before auto-shutdown (cancel with: pkill -f v6autoshutdown).')
             try:
                 git_push('v6: PARTIAL — run_gapfill crashed, see run_v6.log (resume by re-running: completed runs are skipped)')

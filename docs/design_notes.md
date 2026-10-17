@@ -469,7 +469,9 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
 
 `exp_lib` 在每个面板聚合时（`_dump_aggregate`）对 `summary.json` 跑一次
 零 GPU 的 `methodology_audit`，结果同时打印并写入
-`<outdir>/methodology_audit.json`。它把评审要求的三件事变成可复核的读数：
+`<outdir>/methodology_audit.json`；面板开训前 `run()` 还会用
+`methodology_seed_plan` 打印该面板的种子预算。它把评审要求的三件事变成
+可复核的读数：
 
 - **受控变量**：每条对比先用 `pair_reason` 做严格同 `run_cfg` 配对——
   学习率、权重衰减、`delta_lr_mult`、训练步数与 token 数、warmup、comp
@@ -480,17 +482,22 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   （warmup→cosine 的 floor/幅度）、梯度裁剪与数据增强一律提为模块常量
   （`OPT_ADAMW_*` / `GRAD_CLIP_NORM` / `LR_FLOOR_MULT` / `LR_COSINE_AMP`），
   随每条记录落盘；`train_variant` 实际用的就是这些常量，因此所有臂天然
-  共享。`pair_reason` 对**两条都带该字段**的记录额外要求逐字段相等（缺
-  字段的历史记录不受影响）——一旦扩规模时为某条臂单独改优化器或调度，
-  配对会被明确拒绝并在审计里点名，而不是静默产生一个「换了优化器」的
-  假提升。被 `pair_reason` 拒掉的种子不计入 n，并在 `skipped_reasons`
-  里点名。
+  共享。`pair_reason` 对两条都带该字段的记录要求逐字段相等；**只有一条
+  带该字段、另一条不带也判为 unverifiable**——否则新旧记录混用时，换了
+  优化器的那条会静默通过，正是本门槛要防的假提升。两条都不带（纯历史
+  记录）才保留旧的兼容路径。被拒的种子不计入 n，并在 `skipped_reasons`
+  里点名。`BASELINE_DESIGN` 另把主方法与参数对齐稠密基线
+  （`full_sw128_matched` / `full_matched`）的对比纳入同一套门槛，并额外
+  要求两者参数量相对差 ≤1%（`param_controlled`）；参数不匹配的基线主张
+  不计为 verified。
 - **消融完整性**：`ABLATION_DESIGN` 声明式地列出每个创新点的留一对照。
   去一法只在**固定分块**下做是不充分的（`csa_fix_*`），因此同一组去一法
   在**动态分块**（提出的主方法）下也有对应臂 `csa_dyn_randidx` /
   `csa_dyn_zerocont` / `csa_dyn_nosink`（与 `csa_dynamic` 逐字段同构，仅
-  待验证模块不同）。去一法要成立，**「Full」与各「Full−X」臂必须落在同一
-  面板里**——`pair_reason` 的配对与 `methodology_audit` 的审计都按单面板
+  待验证模块不同）；压缩正则这一**损失项**也有 `csa_dyn_nocomp`
+  （`comp_lambda_mult=0`，同一 `run_cfg` 的 `cl` 不变，配对门槛因此仍能
+  通过），对应 `compression_regularizer` 去一法。去一法要成立，**「Full」
+  与各「Full−X」臂必须落在同一面板里**——`pair_reason` 的配对与 `methodology_audit` 的审计都按单面板
   `summary.json` 进行，参照臂不在面板内时审计只能报「缺臂」。因此
   `RUN_ABL` 自含参照臂（`full` / `csa_fixed` / `csa_dynamic` /
   `hybrid_fixed` / `hybrid_dynamic`；`csa_dynamic` 与 `hybrid_csa_dyn`
@@ -498,33 +505,44 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   （`run_gapfill.py full`，seeds 0-2 ≥ `min_n`；`RUN_ABL` 声明的 5-seed
   全集留给后续补种子 pass）。v6 smoke 同步覆盖消融臂的全部独有前向路径
   （随机 indexer / 零内容 / 无 sink / fuse / HCA / dense+sink），使 P-ABL
-  不会在烧掉数小时后才暴露坏臂。创新点的验证状态按**功效分级**，而不是
-  「有对照即可」：只有至少一条对比**既受控又达到 `min_n`（默认 3）个种子**，
-  该创新点才算 `verified_components`；只有单种子/欠功效对比的被列入
-  `underpowered_components`，完全没有受控对比的列入
-  `unverified_components`，缺哪个臂会被逐条 warn。审计同时为每个创新点
-  导出 `controlled_variables`（`run_cfg_equal` / `train_knobs_equal`），
-  把「两臂共享优化器与调度」变成落盘读数。
+  不会在烧掉数小时后才暴露坏臂。
+- **验证分级（不再把「有对照」写成「已证明」）**：`verified_components`
+  只收**受控 + 参数受控（基线）+ 族内 Holm 校正后 p<α + 效应大于种子噪声**
+  的创新点；仅达到 `min_n` 的对照列入 `measured_components`（描述性），
+  单种子/欠功效列入 `underpowered_components`，完全没有受控对比列入
+  `unverified_components`，缺哪个臂会被逐条 warn。审计为每个创新点导出
+  `controlled_variables`（`run_cfg_equal` / `train_knobs_equal` /
+  `param_matched`）与 `component_seed_requirements`。
 - **统计可靠性**：`paired_effect_stats` 给逐种子 Δ 的 mean±std（ddof=1）、
   `cohens_dz`、精确符号翻转 p 与该 n 的 p 下限，并显式标出
   `underpowered`（n<`min_n`）、`resolution_limited`（精确检验在该 n 的
   最小可达 p 仍 > α，即**无论效应多大都不可能达到显著性**——这是分辨率
   上限、不是零结果）与 `within_seed_noise`（|mean| ≤ std，即 +0.2% 的
   均值配 0.5% 的方差这种噪声级「提升」）；`significant` 同时要求 p<α 且
-  效应大于种子噪声，避免大 n 的 p 值把亚噪声效应包装成真实增益。α=0.05
-  时符号翻转检验须 n≥6 才可能显著，审计据此把「效应大于噪声但 n 不足以
-  判定」的对比单列为 `resolution_limited_components`，与分析建议「优先
-  补种子」一致。核心配对表 `_print_pairs` 同样改用该统计，逐条打印 p 与
-  噪声/分辨率判词。**排程侧同一下限**：v6/v7 驱动的每个面板阶段至少排
-  `min_n` 个种子（P-CORE / P-ABL / P-SCALE / P-LONG seeds 0-2，P0W 每
-  warm 条件 3 seeds——历史上 P-LONG 只排 seed 2、P-SCALE 只排 2 种子、
-  P0W 只排 2 种子，全新复现时这些面板将永远低于自己声明的下限），更细的
-  面板由补种子阶段加到 n=4–6；v7 `train_warmup` 的优化器 / betas / eps /
-  LR 调度 / 裁剪全部取自 `exp_lib` 模块常量并向记录写 `train_knobs`，
-  消除第二份会静默漂移的字面量。
+  效应大于种子噪声，避免大 n 的 p 值把亚噪声效应包装成真实增益。
+- **多重比较**：审计对整个声明族（`ABLATION_DESIGN`，以及面板里实际排了
+  参数对齐稠密臂时的 `BASELINE_DESIGN`）做 **Holm step-down**，每个对比
+  同时给出 `p_holm_global`。族按「本面板能测到的声明」划定：一个组件至少
+  有一条完整对比（两臂都在场）才进入族；一旦进入，它的**全部**声明槽位都
+  保留（缺失臂用 dummy p=1 占位），因此不完整的消融不能靠少报比较来「买」
+  更低的 p。没有排基线臂的纯消融面板不把未测试的基线主张计入族。每个创新
+  点另有族内 `p_holm_component` 供细读，但 `verified` 以全局保守口径为准。`methodology_seed_plan` 给出该族在 α 下**数学上可能拒绝**
+  所需的最小 n（α=0.05、单比较 n≥6；m 元族约需 2ⁿ ≥ 2m/α），开训前就把
+  n=3–5 的面板标为描述性，避免事后把分辨率上限读成零结果。
+- **排程侧同一下限**：v6/v7 驱动的每个面板阶段至少排 `min_n` 个种子
+  （P-CORE / P-ABL / P-SCALE / P-LONG seeds 0-2，P0W 每 warm 条件 3
+  seeds），更细的面板由补种子阶段加到 n=4–6；v7 `train_warmup` 的优化器 /
+  betas / eps / LR 调度 / 裁剪全部取自 `exp_lib` 模块常量并向记录写
+  `train_knobs`，消除第二份会静默漂移的字面量。需要族级确认的面板应按
+  `methodology_seed_plan` 的返回值排种子，而不是沿用「3 个种子即可」的
+  旧口径。达到族级下限的实际路径是 `python run_gapfill.py topup`
+  （`ABL_SEED_TARGET=<n>` 可覆盖默认值）：它沿用同一 `RUN_ABL` 配置与
+  同一 `summary.json`，resume 跳过已完成单元，只补缺失的种子；参数对齐
+  稠密基线所在的 P-CORE 可用 `CORE_SEED_TARGET=<n>` 一并补齐。
 
 `exact_signflip_p` 对 n≤20 穷举 2ⁿ 符号翻转（确定性、与各驱动套件同一
-检验），n>20 用确定性正态近似；`signflip_p_floor` 给出分辨率下限，使
+检验），n>20 用确定性正态近似；`signflip_p_floor` 给出单比较的分辨率下限，
+`holm_min_attainable_p` / `signflip_min_n_for_holm` 给出族级下限，使
 「未显著」能区分是分辨率上限还是数据结论。
 
 ## 20. 统计检验的假设、边界与外部有效性（评审二轮·意见九/十一新增）

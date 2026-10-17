@@ -386,6 +386,82 @@ def t_audit_resolution_classification():
     assert 'c' in r2['resolution_limited_components'], r2
 
 
+def t_pair_reason_train_knobs_mixed():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    a = dict(variant='a', seed=0, run_cfg=fp, steps=1, tokens_seen=1, ppl=10.0, train_knobs=L.training_knobs())
+    b = dict(variant='b', seed=0, run_cfg=fp, steps=1, tokens_seen=1, ppl=11.0)
+    r = L.pair_reason(a, b)
+    assert r is not None and 'unverifiable train_knobs' in r, f'one-sided train_knobs presence must be refused, got {r!r}'
+    r2 = L.pair_reason({k: v for k, v in a.items() if k != 'train_knobs'}, b)
+    assert r2 is None, 'both records missing the descriptor is the legacy path and may still pair'
+
+
+def t_seed_plan():
+    p = L.methodology_seed_plan(3)
+    assert p['declared_contrasts'] >= 10, p
+    assert p['min_seeds_for_family_significance'] > 3
+    assert p['sufficient_for_family_rejection'] is False
+    req = p['min_seeds_for_family_significance']
+    assert L.holm_min_attainable_p(req, p['declared_contrasts'], 0.05) <= 0.05
+    assert L.holm_min_attainable_p(req - 1, p['declared_contrasts'], 0.05) > 0.05
+    assert L.methodology_seed_plan(req)['sufficient_for_family_rejection'] is True
+
+
+def t_audit_family_holm_and_verified():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+
+    def _summary(n, effect=-1.0):
+        s = {}
+        for i in range(n):
+            s[f'csa_dynamic::seed{i}'] = dict(variant='csa_dynamic', seed=i, run_cfg=fp, steps=1, tokens_seen=1, ppl=50.0 + effect, params=1000, train_knobs=knobs)
+            s[f'full_sw128_matched::seed{i}'] = dict(variant='full_sw128_matched', seed=i, run_cfg=fp, steps=1, tokens_seen=1, ppl=50.0, params=1001, train_knobs=knobs)
+        return s
+    # Only the baseline component is actually present in this panel, so the
+    # correction family is its two declared contrasts, not every unmeasured
+    # ablation claim.
+    r3 = L.methodology_audit(_summary(3), verbose=False)
+    assert r3['family']['effective_m'] == 2, r3['family']
+    assert 'compression_vs_matched_dense' in r3['resolution_limited_baselines'], r3['resolution_limited_baselines']
+    assert 'compression_vs_matched_dense' not in r3['verified_baselines']
+    r6 = L.methodology_audit(_summary(6), verbose=False)
+    assert r6['family']['effective_m'] == 2
+    assert 'compression_vs_matched_dense' not in r6['verified_baselines'], 'm=2 needs n>=7 for a Holm-corrected rejection'
+    # n=7: all seeds same sign now clears the family-corrected gate.
+    r7 = L.methodology_audit(_summary(7), verbose=False)
+    assert 'compression_vs_matched_dense' in r7['verified_baselines'], r7['verified_baselines']
+    e = r7['baselines']['compression_vs_matched_dense'][0]
+    assert e['p_holm_global'] > e['p_exact_signflip'], 'Holm-adjusted p must be >= raw p'
+    # an incomplete component keeps ALL its declared slots (dummy p=1), so a
+    # missing arm cannot shrink the family.
+    design = {'c': [('a', 'b', 'x'), ('a', 'c', 'y')]}
+    incomplete = {'a::seed0': dict(variant='a', seed=0, run_cfg=fp, steps=1, tokens_seen=1, ppl=49.0, params=100, train_knobs=knobs),
+                  'b::seed0': dict(variant='b', seed=0, run_cfg=fp, steps=1, tokens_seen=1, ppl=50.0, params=100, train_knobs=knobs)}
+    ri = L.methodology_audit(incomplete, design=design, baselines={}, verbose=False)
+    assert ri['family']['declared_contrasts'] == 2 and ri['family']['effective_m'] == 2, ri['family']
+    # parameter mismatch is a hard control failure for a baseline claim
+    s = _summary(7)
+    for i in range(7):
+        s[f'full_sw128_matched::seed{i}']['params'] = 2000
+    rbad = L.methodology_audit(s, verbose=False)
+    assert 'compression_vs_matched_dense' not in rbad['verified_baselines'], rbad['verified_baselines']
+    assert 'compression_vs_matched_dense' in rbad['unverified_baselines']
+
+
+def t_ablation_design_loss_term():
+    assert 'compression_regularizer' in L.ABLATION_DESIGN, 'the compression loss term must have a leave-one-out arm'
+    pairs = L.ABLATION_DESIGN['compression_regularizer']
+    assert any(a == 'csa_dynamic' and b == 'csa_dyn_nocomp' for a, b, _n in pairs), pairs
+    cfgs = L.make_layer_cfgs(2, 'csa_dyn_nocomp')
+    assert all(getattr(c, 'comp_lambda_mult', None) == 0.0 for c in cfgs), 'the nocomp arm must zero the loss multiplier'
+    ref = L.make_layer_cfgs(2, 'csa_dynamic')
+    assert all(getattr(c, 'comp_lambda_mult', 1.0) == 1.0 for c in ref), 'the full arm must keep the regularizer'
+    # every declared invention still has at least one concrete contrast
+    for comp, contrasts in L.ABLATION_DESIGN.items():
+        assert contrasts and all(len(t) == 3 for t in contrasts), f'{comp}: malformed leave-one-out design'
+    assert any(v == 'csa_dyn_nocomp' for v in L.ABL_VARIANTS), 'the loss ablation arm must be scheduled by RUN_ABL'
+
+
 def t_adaptive_threshold_guard():
     # Row chunking keeps a large batch feasible; a single excessively long row
     # is refused.
@@ -617,6 +693,10 @@ def main():
     _check('C5 freeze lock', t_freeze_lock)
     _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)
     _check('C10 audit resolution classification', t_audit_resolution_classification)
+    _check('C11 controlled-variable gate: mixed train_knobs', t_pair_reason_train_knobs_mixed)
+    _check('C12 seed-budget plan', t_seed_plan)
+    _check('C13 family Holm + verified baseline + param control', t_audit_family_holm_and_verified)
+    _check('C14 compression-regularizer loss ablation', t_ablation_design_loss_term)
     _check('A7 adaptive-threshold memory guard', t_adaptive_threshold_guard)
     _check('A8 empty segmenter', t_segment_empty)
     _check('C6 shipped manifest v2 consistency', t_shipped_manifest_consistency)

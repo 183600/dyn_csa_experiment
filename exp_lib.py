@@ -109,7 +109,7 @@ RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000
 # 的去一法对照；`csa_dyn_*` 是同一组去一法在**动态分块**（主方法）下的对照——
 # 只报固定分块下的去一法无法支撑「该模块在提出的动态方法里各自有用」。两组
 # 都是「与 csa_dynamic / csa_fixed 逐字段同构，仅待验证模块不同」。
-ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'full_sink']
+ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'csa_dyn_nocomp', 'full_sink']
 # 去一法要成立，「Full」与各「Full−X」臂必须落在**同一个面板**里：ABLATION_DESIGN
 # 的每条对照都靠 pair_reason 在同一 run_cfg 下逐种子配对，methodology_audit 也按
 # 单面板 summary 审计——参照臂不在面板内时该面板只能报「缺臂」，撑不起任何
@@ -2692,6 +2692,13 @@ def make_layer_cfgs(n_layers, variant):
             cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, content_mode='zero'))
         elif variant == 'csa_dyn_nosink':
             cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, use_sink=False))
+        elif variant == 'csa_dyn_nocomp':
+            # Loss-term ablation C: identical architecture, optimizer, LR
+            # schedule, budget and data as `csa_dynamic`; only the compression
+            # regularizer's multiplier is zeroed.  Keeping run_cfg's `cl`
+            # unchanged is what lets `pair_reason` pair the two arms while the
+            # actual loss term differs — the thing under test.
+            cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, comp_lambda_mult=0.0))
         elif variant == 'csa_fixed_fullpov':
             cfgs.append(AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=128, index_topk=32))
         elif variant == 'csa_dynamic_fullpov':
@@ -3649,10 +3656,18 @@ def pair_reason(ra, rb):
         return 'different run_cfg'
     # Controlled-variable gate for the settings the run fingerprint does not
     # carry (optimizer identity / betas / eps, LR-schedule shape, grad-clip,
-    # augmentation).  Only enforced when BOTH records recorded the descriptor,
-    # so legacy records without it still pair exactly as before.
+    # augmentation).  BOTH records must carry the descriptor or BOTH must omit
+    # it (legacy-vs-legacy); a one-sided descriptor is unverifiable and is
+    # refused rather than silently paired.
     _ka, _kb = (ra.get('train_knobs'), rb.get('train_knobs'))
-    if _ka is not None and _kb is not None and _ka != _kb:
+    # Mixed presence is itself unverifiable: a record that carries the
+    # descriptor and one that does not cannot be shown to share the optimizer /
+    # schedule / clipping / augmentation settings, and silently pairing them is
+    # exactly the uncontrolled comparison this gate exists to prevent.  Only
+    # legacy-vs-legacy (both absent) keeps the historical permissive path.
+    if (_ka is None) != (_kb is None):
+        return 'unverifiable train_knobs (only one record carries the optimizer / lr-schedule / augmentation descriptor)'
+    if _ka is not None and _ka != _kb:
         return 'different train_knobs (optimizer / lr schedule / grad-clip / augmentation)'
     bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
     if bad:
@@ -3860,6 +3875,31 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     if n <= 0 or m <= 0:
         return float('nan')
     return min(1.0, m * signflip_p_floor(n))
+
+
+def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
+    """Smallest seed count n for which a Holm-corrected exact sign-flip test
+    can reach p_holm <= alpha EVEN IF every seed moves in the predicted
+    direction.  Returns None when no n <= n_max reaches it.
+
+    This is the planning counterpart of `holm_min_attainable_p`: it turns
+    "3-5 seeds" into an explicit statement of what those seeds can and cannot
+    establish.  At alpha=0.05 a single comparison needs n>=6; a family of m
+    comparisons needs roughly 2**n >= 2*m/alpha.  A panel scheduled below the
+    returned n is descriptive only (the exact-test floor, not the data, bounds
+    the p value), so the audit labels it resolution-limited instead of reading
+    it as a null result."""
+    try:
+        m = int(m_comparisons)
+        a = float(alpha)
+    except (TypeError, ValueError):
+        return None
+    if m <= 0 or not (0.0 < a < 1.0):
+        return None
+    for n in range(1, int(n_max) + 1):
+        if holm_min_attainable_p(n, m, a) <= a + 1e-15:
+            return n
+    return None
 
 
 def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
@@ -4097,12 +4137,26 @@ ABLATION_DESIGN = {
         ('csa_dynamic', 'csa_dyn_nosink', 'sink on vs off (dynamic blocking)'),
         ('full_sink', 'full', 'sink on vs off (dense control)'),
     ],
+    'compression_regularizer': [
+        ('csa_dynamic', 'csa_dyn_nocomp', 'compression regularizer on vs off (dynamic blocking; the loss-term ablation)'),
+    ],
     'local_fusion': [
         ('csa_dyn_fuse', 'csa_dynamic', 'learned local fusion on vs off (CSA)'),
         ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn', 'learned local fusion on vs off (hybrid)'),
     ],
     'hybrid_hierarchy': [
         ('hybrid_csa_dyn', 'csa_dynamic', 'CSA+HCA hybrid vs CSA-only (dynamic blocking)'),
+    ],
+}
+
+# 主方法 vs 参数对齐基线的对比也属于「受控对比」：它回答的是方法本身是否
+# 优于同参数量、同优化器、同预算、同数据的稠密基线，而不是只回答「消融臂
+# 之间谁高谁低」。两条基线都来自 `variant_mlp_ratio` 的参数对齐（MLP 加宽
+# 到与 csa_dynamic 相同），因此 `param_controlled` 是这条对比的硬读数。
+BASELINE_DESIGN = {
+    'compression_vs_matched_dense': [
+        ('csa_dynamic', 'full_sw128_matched', 'dynamic CSA vs parameter-matched windowed dense'),
+        ('csa_dynamic', 'full_matched', 'dynamic CSA vs parameter-matched full dense'),
     ],
 }
 
@@ -4190,114 +4244,293 @@ def _knobs_equal_across_arms(recs, arms, key):
         return None
     return len(set(vals)) == 1
 
-def methodology_audit(summary, design=None, *, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True):
+def _params_of_arm(recs, arm):
+    for (v, _t, _s), r in recs.items():
+        if v != arm:
+            continue
+        p = r.get('params')
+        try:
+            return int(p)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+def _param_control(recs, a, b):
+    """Relative parameter-count difference between two arms, and whether it is
+    small enough to call them parameter-controlled (<=1%).  None means one or
+    both records do not expose `params` (unverifiable, not a mismatch)."""
+    pa, pb = _params_of_arm(recs, a), _params_of_arm(recs, b)
+    if pa is None or pb is None:
+        return (None, None)
+    rel = abs(pa - pb) / float(max(pa, pb, 1))
+    return (float(rel), bool(rel <= 0.01))
+
+def _holm_assign(entries, m_family, alpha, out_key):
+    """Attach a Holm step-down adjusted p to each entry over the declared
+    family.  `m_family` is the DECLARED number of contrasts, not just the ones
+    with data: a missing arm must not shrink the correction family (that would
+    make an incomplete ablation look better-powered than it is).  Dummy p=1
+    entries fill the difference."""
+    named = []
+    for i, e in enumerate(entries):
+        p = e.get('p_exact_signflip')
+        if isinstance(p, (int, float)) and math.isfinite(float(p)):
+            named.append((str(i), float(p)))
+    m_eff = max(int(m_family), len(entries), len(named))
+    for j in range(m_eff - len(named)):
+        named.append((f'__missing_{j}', 1.0))
+    h = holm_adjust(named, alpha=alpha)
+    for i, e in enumerate(entries):
+        rec = h.get(str(i))
+        e[out_key] = rec.get('p_holm') if isinstance(rec, dict) else None
+
+def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_match=False):
+    """One status per declared innovation / baseline claim.
+
+    verified            — a controlled, parameter-controlled (for baselines)
+                          contrast is significant after the family-wise Holm
+                          correction AND its effect exceeds seed noise;
+    measured            — a controlled contrast exists with n >= min_n, but no
+                          corrected significance (the old `verified` bar, now
+                          reported under an honest name);
+    resolution_limited  — a controlled, non-noise contrast exists whose
+                          family-corrected exact-test p floor is still above
+                          alpha at this n (add seeds; never read as a null);
+    underpowered        — controlled contrasts exist but every one is n < min_n;
+    noise_level         — powered contrasts exist but all effects are within
+                          seed noise (|mean| <= std);
+    unverified          — no controlled contrast (missing arm / config mismatch).
+    """
+    usable = [e for e in entries if e.get('controlled') and (not require_param_match or e.get('param_controlled') is True)]
+    if not usable:
+        return 'unverified'
+    powered = [e for e in usable if int(e.get('n') or 0) >= int(min_n)]
+    if not powered:
+        return 'underpowered'
+    if any(e.get('significant_global') for e in usable):
+        return 'verified'
+    noise_free = [e for e in powered if not e.get('within_seed_noise')]
+    if not noise_free:
+        return 'noise_level'
+    for e in noise_free:
+        fl = holm_min_attainable_p(e.get('n') or 0, m_family, alpha)
+        if math.isfinite(fl) and fl > alpha:
+            return 'resolution_limited'
+    return 'noise_level'
+
+def _scope_design(design, present):
+    """Keep only claims this panel actually tests: a component enters the
+    family when at least one of its declared contrasts has BOTH arms measured.
+    Once in, all of its declared contrasts keep their slots (missing arms are
+    dummies), so an incomplete ablation cannot shrink its own correction."""
+    out = {}
+    present = set(present or ())
+    for comp, contrasts in design.items():
+        if any(a in present and b in present for a, b, _n in contrasts):
+            out[comp] = contrasts
+    return out
+
+def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, variants=None):
+    """Prospective seed budget for a planned panel.
+
+    Returns the declared family size and the minimum n at which a
+    Holm-corrected exact sign-flip test could reject at `alpha` if every seed
+    moved in the predicted direction.  Drivers call this BEFORE training so a
+    3-seed panel is labelled descriptive up front instead of being read after
+    the fact as a failed confirmation.  Pure function; never blocks a run."""
+    if design is None:
+        design = ABLATION_DESIGN
+        if baselines is None:
+            baselines = BASELINE_DESIGN
+    baselines = {} if baselines is None else baselines
+    if variants is not None:
+        _present = set(variants or ())
+        design = _scope_design(design, _present)
+        baselines = _scope_design(baselines, _present)
+    m = sum(len(v) for v in design.values()) + sum(len(v) for v in baselines.values())
+    req = signflip_min_n_for_holm(m, alpha)
+    try:
+        n = int(n_seeds)
+    except (TypeError, ValueError):
+        n = 0
+    return {'n_seeds': n, 'declared_contrasts': int(m), 'alpha': float(alpha),
+            'min_seeds_for_family_significance': req,
+            'sufficient_for_family_rejection': bool(req is not None and n >= req),
+            'note': 'a panel below the minimum is DESCRIPTIVE ONLY: the exact-test resolution floor, not the observed effect, bounds its p value'}
+
+def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True):
     """Zero-GPU audit of controlled comparison, ablation completeness and
     statistical reliability for one panel's `summary` dict.
 
-    For every declared leave-one-out contrast it recomputes the per-seed paired
-    delta (a strict same-run_cfg pairing), the mean±std / d_z / exact sign-flip
-    p, and flags underpowered (n<min_n) and noise-level (|mean| <= std) effects.
+    For every declared leave-one-out contrast (and, by default, the primary
+    parameter-matched dense baselines) it recomputes the per-seed paired delta
+    under a strict same-run_cfg / same-train_knobs gate, the mean±std / d_z /
+    exact sign-flip p, and flags underpowered (n<min_n), noise-level
+    (|mean| <= std) and resolution-limited (the exact-test p floor is above
+    alpha) results.
 
-    A component counts as VERIFIED only when at least one contrast is BOTH
-    controlled (same run_cfg / train_knobs) AND adequately powered (n >= min_n)
-    — a one-seed contrast no longer certifies an innovation.  Components are
-    split into `verified_components`, `underpowered_components` (a controlled
-    contrast exists but every one is below `min_n`), `noise_level_components`
-    (adequately powered but no contrast is significant) and
-    `unverified_components` (no controlled contrast at all).  The
-    `controlled_variables` section reports, per component, whether the arms
-    actually share the training knobs / optimizer descriptor.
+    Multiple comparisons are corrected with Holm step-down over the declared
+    family.  A missing arm does NOT shrink the family (dummy p=1 entries keep
+    the declared m), so an incomplete ablation cannot buy a lower p.  A
+    component is `verified` only when a controlled contrast is significant
+    AFTER that correction and its effect exceeds seed noise; merely having
+    n>=min_n is reported as `measured` (descriptive), never as verification.
+    Per-component Holm results are also exported, because the reviewer-facing
+    claim is usually per innovation, while the global correction is the
+    conservative cross-component reading.
 
     Returns the report dict and, when `outdir` is given, writes
     `methodology_audit.json`."""
+    default_design = design is None
     design = ABLATION_DESIGN if design is None else design
     recs, amb = _variant_seed_map(summary)
     present = sorted({v for (v, _t, _s) in recs})
+    if baselines is None:
+        # Baseline claims belong to THIS panel's family only when a matched
+        # dense arm was actually scheduled.  A pure ablation panel without
+        # full_matched/full_sw128_matched is not testing the baseline claim,
+        # so including its (missing) slots would only inflate the correction
+        # family and mislabel an untested comparison as "unverified".
+        _base_arms = {x for _cs in BASELINE_DESIGN.values() for _a, _b, _n in _cs for x in (_a, _b)}
+        baselines = BASELINE_DESIGN if (default_design and (_base_arms & set(present))) else {}
     try:
-        _min_sig_n = 1 + int(math.ceil(math.log2(1.0 / float(alpha)))) if 0.0 < float(alpha) < 1.0 else 0
+        _min_sig_n = signflip_min_n_for_holm(1, alpha) or 0
     except (ValueError, ZeroDivisionError):
         _min_sig_n = 0
     report = {'variants_present': present, 'n_measurable': len(recs), 'ambiguous': sorted(amb),
               'min_n': int(min_n), 'alpha': float(alpha), 'min_seeds_for_significance': _min_sig_n,
-              'components': {},
-              'verified_components': [], 'significant_components': [],
+              'components': {}, 'baselines': {},
+              'verified_components': [], 'measured_components': [],
+              'significant_components': [], 'nominally_significant_components': [],
               'resolution_limited_components': [], 'underpowered_components': [],
               'noise_level_components': [], 'unverified_components': [],
-              'incomplete_components': [], 'controlled_variables': {}, 'warnings': []}
-    for comp, contrasts in design.items():
-        entries = []
-        arms = set()
-        n_measured = 0
-        n_controlled = 0
-        n_powered = 0
-        n_significant = 0
-        n_powered_noise_free = 0
-        n_powered_res_limited = 0
-        for a, b, note in contrasts:
-            arms.update((a, b))
-            a_present, b_present = (a in present, b in present)
-            conds = _paired_seed_deltas(recs, a, b)
-            _cfg_a = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == a), None)
-            _cfg_b = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == b), None)
-            _contrast_measured = False
-            _contrast_controlled = False
-            _contrast_powered = False
-            for (ts, bs), (deltas, shared, skipped) in sorted(conds.items()):
-                st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
-                st.update({'with': a, 'without': b, 'note': note, 'tag_with': ts, 'tag_without': bs, 'n_shared': len(shared), 'n_skipped': len(skipped), 'skipped_reasons': sorted({reason for _s, reason in skipped}), 'controlled': bool(deltas) and (not skipped), 'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b, 'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None})
-                entries.append(st)
-                if deltas:
-                    _contrast_measured = True
-                if st['controlled']:
-                    _contrast_controlled = True
-                    if st['n'] >= int(min_n):
-                        _contrast_powered = True
-                        if not st['within_seed_noise']:
-                            n_powered_noise_free += 1
-                            if st.get('resolution_limited'):
-                                n_powered_res_limited += 1
-                if st['significant']:
-                    n_significant += 1
-            n_measured += int(_contrast_measured)
-            n_controlled += int(_contrast_controlled)
-            n_powered += int(_contrast_powered)
-            if a_present and b_present:
-                if not _contrast_measured:
-                    _why = sorted({reason for (_dl, _sh, _sk) in conds.values() for _s, reason in _sk})
-                    if _why:
-                        report['warnings'].append('%s: `%s` vs `%s` both measured but NO seed clears the same-run_cfg gate — %s' % (comp, a, b, '; '.join(_why)))
-                    else:
-                        report['warnings'].append('%s: `%s` vs `%s` both measured but share no common protocol condition/seed — no contrast computed' % (comp, a, b))
-            elif a_present != b_present:
-                report['warnings'].append('%s: incomplete leave-one-out `%s` vs `%s` — missing `%s`' % (comp, a, b, a if not a_present else b))
-            else:
-                report['warnings'].append('%s: neither `%s` nor `%s` measured — no leave-one-out for this component yet' % (comp, a, b))
-        report['components'][comp] = entries
-        report['controlled_variables'][comp] = {
-            'run_cfg_equal': _knobs_equal_across_arms(recs, arms, 'run_cfg'),
-            'train_knobs_equal': _knobs_equal_across_arms(recs, arms, 'train_knobs'),
-            'arms_present': sorted(a for a in arms if a in present),
-        }
-        if n_powered > 0:
-            report['verified_components'].append(comp)
-            if n_significant > 0:
-                report['significant_components'].append(comp)
-            elif n_powered_res_limited > 0:
-                # Only a contrast whose exact-test p FLOOR is still above
-                # alpha is resolution-limited (design_notes §19).  A powered,
-                # non-noise contrast that simply failed to reach significance
-                # at an n large enough to reach it is a null-ish reading, not
-                # a resolution ceiling — do not tell the reader to add seeds.
-                report['resolution_limited_components'].append(comp)
-            else:
-                report['noise_level_components'].append(comp)
-        elif n_measured > 0:
-            if n_controlled > 0:
-                report['underpowered_components'].append(comp)
-            else:
-                report['unverified_components'].append(comp)
-        else:
-            report['unverified_components'].append(comp)
+              'verified_baselines': [], 'measured_baselines': [],
+              'significant_baselines': [], 'nominally_significant_baselines': [],
+              'resolution_limited_baselines': [], 'underpowered_baselines': [],
+              'noise_level_baselines': [], 'unverified_baselines': [],
+              'incomplete_components': [], 'controlled_variables': {},
+              'component_seed_requirements': {}, 'baseline_seed_requirements': {},
+              'family': {}, 'warnings': []}
+
+    def _collect(design_group, kind):
+        out = {}
+        meta = {}
+        for comp, contrasts in design_group.items():
+            entries = []
+            arms = set()
+            for a, b, note in contrasts:
+                arms.update((a, b))
+                a_present, b_present = (a in present, b in present)
+                conds = _paired_seed_deltas(recs, a, b)
+                _cfg_a = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == a), None)
+                _cfg_b = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == b), None)
+                _rel, _param_ok = _param_control(recs, a, b)
+                _contrast_measured = False
+                for (ts, bs), (deltas, shared, skipped) in sorted(conds.items()):
+                    st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
+                    st.update({'with': a, 'without': b, 'note': note, 'kind': kind,
+                               'tag_with': ts, 'tag_without': bs,
+                               'n_shared': len(shared), 'n_skipped': len(skipped),
+                               'skipped_reasons': sorted({reason for _s, reason in skipped}),
+                               'controlled': bool(deltas) and (not skipped),
+                               'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b,
+                               'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None,
+                               'param_rel_diff': _rel, 'param_controlled': _param_ok})
+                    entries.append(st)
+                    if deltas:
+                        _contrast_measured = True
+                if a_present and b_present:
+                    if not _contrast_measured:
+                        _why = sorted({reason for (_dl, _sh, _sk) in conds.values() for _s, reason in _sk})
+                        if _why:
+                            report['warnings'].append('%s: `%s` vs `%s` both measured but NO seed clears the same-run_cfg/train_knobs gate — %s' % (comp, a, b, '; '.join(_why)))
+                        else:
+                            report['warnings'].append('%s: `%s` vs `%s` both measured but share no common protocol condition/seed — no contrast computed' % (comp, a, b))
+                elif a_present != b_present:
+                    report['warnings'].append('%s: incomplete %s `%s` vs `%s` — missing `%s`' % (comp, kind, a, b, a if not a_present else b))
+                else:
+                    report['warnings'].append('%s: neither `%s` nor `%s` measured — no %s for this %s yet' % (comp, a, b, 'leave-one-out' if kind == 'component' else 'baseline contrast', kind))
+                if kind == 'baseline' and _param_ok is False:
+                    report['warnings'].append('%s: `%s` vs `%s` differ in parameter count by %.2f%% — NOT parameter-controlled, so this baseline claim is not counted as verified' % (comp, a, b, 100.0 * (_rel or 0.0)))
+                elif kind == 'baseline' and _param_ok is None and a_present and b_present:
+                    report['warnings'].append('%s: `%s` vs `%s` carry no usable `params` — parameter control is UNVERIFIABLE, so this baseline claim is not counted as verified' % (comp, a, b))
+            out[comp] = entries
+            meta[comp] = {'arms': arms}
+        return out, meta
+
+    comp_entries, comp_meta = _collect(design, 'component')
+    base_entries, base_meta = _collect(baselines, 'baseline')
+    # Family = claims this panel can test (a component with no measured pair
+    # is not part of the correction burden).  Within a tested component, all
+    # declared contrasts keep their slots, so an incomplete ablation cannot
+    # buy a smaller m by omitting an arm.
+    _present_set = set(present)
+    _scoped_design = _scope_design(design, _present_set)
+    _scoped_baselines = _scope_design(baselines, _present_set)
+    declared_m = sum(len(v) for v in _scoped_design.values()) + sum(len(v) for v in _scoped_baselines.values())
+    all_entries = [e for group in (comp_entries, base_entries) for entries in group.values() for e in entries]
+    m_family = max(declared_m, len(all_entries))
+    _holm_assign(all_entries, m_family, alpha, 'p_holm_global')
+    _holm_assign(all_entries, m_family, alpha, 'p_holm_family')
+    for e in all_entries:
+        _ph = e.get('p_holm_global')
+        e['significant_global'] = bool(_ph is not None and float(_ph) < alpha and (not e.get('within_seed_noise')) and e.get('controlled'))
+        e['significant_family'] = e['significant_global']
+    report['family'] = {
+        'name': ('ABLATION_DESIGN+BASELINE_DESIGN' if _scoped_baselines else 'ABLATION_DESIGN') + ' (exploratory; not pre-registered)',
+        'declared_contrasts': int(declared_m),
+        'effective_m': int(m_family),
+        'alpha': float(alpha),
+        'min_seeds_for_family_significance': signflip_min_n_for_holm(m_family, alpha),
+        'note': 'Holm step-down over every declared contrast; missing arms keep their slot (dummy p=1). A panel below min_seeds_for_family_significance is resolution-limited, however large the observed effect.',
+    }
+
+    def _publish(group_name, design_group, entries_by_comp, meta, kind, require_param_match):
+        status_names = ('verified', 'measured', 'significant', 'nominally_significant',
+                        'resolution_limited', 'underpowered', 'noise_level', 'unverified')
+        lists = {s: [] for s in status_names}
+        for comp, contrasts in design_group.items():
+            entries = entries_by_comp.get(comp, [])
+            # Per-component Holm: the family is this innovation's own declared
+            # contrasts (the reviewer usually asks "is THIS module useful?").
+            m_comp = max(len(contrasts), len(entries))
+            _holm_assign(entries, m_comp, alpha, 'p_holm_component')
+            for e in entries:
+                _phc = e.get('p_holm_component')
+                e['significant_component'] = bool(_phc is not None and float(_phc) < alpha and (not e.get('within_seed_noise')) and e.get('controlled'))
+            status = _classify_group_status(entries, min_n=min_n, alpha=alpha, m_family=m_family,
+                                            require_param_match=require_param_match)
+            lists[status].append(comp)
+            if status == 'verified':
+                # `verified` is the corrected-significance tier; keep the
+                # historical `significant_*` key pointing at the same set so
+                # downstream readers do not silently lose the signal.
+                lists['significant'].append(comp)
+            if any(e.get('significant') for e in entries if e.get('controlled')):
+                lists['nominally_significant'].append(comp)
+            if any(int(e.get('n') or 0) >= int(min_n) and e.get('controlled') for e in entries):
+                lists['measured'].append(comp)
+            report[group_name][comp] = entries
+            _arms = meta[comp]['arms']
+            report['controlled_variables'][comp] = {
+                'run_cfg_equal': _knobs_equal_across_arms(recs, _arms, 'run_cfg'),
+                'train_knobs_equal': _knobs_equal_across_arms(recs, _arms, 'train_knobs'),
+                'arms_present': sorted(a for a in _arms if a in present),
+                'param_matched': all(e.get('param_controlled') is True for e in entries) if entries else None,
+            }
+            _req_key = 'component_seed_requirements' if kind == 'component' else 'baseline_seed_requirements'
+            report[_req_key][comp] = {
+                'declared_contrasts': int(len(contrasts)),
+                'min_seeds_for_component_significance': signflip_min_n_for_holm(len(contrasts), alpha),
+                'min_seeds_for_family_significance': signflip_min_n_for_holm(m_family, alpha),
+            }
+        for status in status_names:
+            report[f'{status}_{group_name}'] = lists[status]
+        return lists
+
+    _publish('components', design, comp_entries, comp_meta, 'component', require_param_match=False)
+    _publish('baselines', baselines, base_entries, base_meta, 'baseline', require_param_match=True)
+
     if write and outdir:
         try:
             os.makedirs(outdir, exist_ok=True)
@@ -4312,7 +4545,10 @@ def _print_methodology_audit(report):
     print('\n========== methodology audit: controlled comparison / ablation / statistics ==========')
     print('  variants with measurable records: ' + (', '.join(report['variants_present']) or '(none)'))
     print('  Δ = with-module − without-module (perplexity; negative = the module helps).')
-    print('  a component is VERIFIED only by a controlled contrast with n>=%d; p is the exact sign-flip p, floor = 2/2^n.' % int(report.get('min_n', 3)))
+    _fam = report.get('family') or {}
+    print('  family: %d declared contrasts, m_eff=%s; Holm p is the family-corrected p.' % (int(_fam.get('declared_contrasts') or 0), _fam.get('effective_m')))
+    if _fam.get('min_seeds_for_family_significance'):
+        print('  minimum seeds for a family-corrected rejection at alpha=%g: n>=%d (below this every p is resolution-limited).' % (float(report.get('alpha', 0.05)), int(_fam['min_seeds_for_family_significance'])))
     for comp, entries in report['components'].items():
         live = [e for e in entries if e['n_shared'] > 0]
         if not live:
@@ -4324,21 +4560,47 @@ def _print_methodology_audit(report):
         for e in live:
             _c = 'controlled (same run_cfg)' if e['controlled'] else ('UNCONTROLLED: ' + '; '.join(e['skipped_reasons']))
             _p = ('%.4f' % e['p_exact_signflip']) if math.isfinite(e['p_exact_signflip']) else 'n/a'
+            _ph = e.get('p_holm_global')
+            _phs = ('%.4f' % _ph) if isinstance(_ph, (int, float)) and math.isfinite(_ph) else 'n/a'
             _tag = '' if e.get('tag_with', '') == e.get('tag_without', '') == '' else '   [%s vs %s]' % (e.get('tag_with') or '(base)', e.get('tag_without') or '(base)')
-            print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p, _tag))
+            print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s  p_Holm=%s%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p, _phs, _tag))
             print('        %s | %s' % (_c, e['effect_vs_noise']))
     if report['verified_components']:
-        print('  verified innovations (>=1 controlled, powered contrast): ' + ', '.join(report['verified_components']))
-    if report.get('significant_components'):
-        print('  significant (effect exceeds seed noise AND p<alpha): ' + ', '.join(report['significant_components']))
+        print('  verified innovations (controlled AND family-Holm p<alpha AND |Δ|>seed noise): ' + ', '.join(report['verified_components']))
+    if report.get('measured_components'):
+        print('  measured innovations (controlled contrast with n>=%d; descriptive unless also verified): ' % int(report.get('min_n', 3)) + ', '.join(report['measured_components']))
+    if report.get('nominally_significant_components'):
+        print('  nominally significant (raw p<alpha, before family correction): ' + ', '.join(report['nominally_significant_components']))
     if report.get('resolution_limited_components'):
-        print('  resolution-limited (effect exceeds seed noise but the exact p floor > alpha at this n; need n>=%d for p<%g — add seeds, do NOT read as a null): ' % (int(report.get('min_seeds_for_significance', 0)), float(report.get('alpha', 0.05))) + ', '.join(report['resolution_limited_components']))
+        print('  resolution-limited (non-noise effect, but the family-corrected p floor > alpha at this n; need n>=%s — add seeds, do NOT read as a null): ' % str((_fam.get('min_seeds_for_family_significance') or '?')) + ', '.join(report['resolution_limited_components']))
     if report.get('noise_level_components'):
         print('  noise-level (effect within seed noise across all contrasts): ' + ', '.join(report['noise_level_components']))
     if report.get('underpowered_components'):
         print('  underpowered innovations (contrasts exist but n<%d — add seeds before claiming an effect): ' % int(report.get('min_n', 3)) + ', '.join(report['underpowered_components']))
     if report['unverified_components']:
         print('  unverified innovations (no controlled leave-one-out contrast): ' + ', '.join(report['unverified_components']))
+    if report.get('baselines'):
+        print('  --- primary baseline claims (parameter-matched dense control) ---')
+        for comp, entries in report['baselines'].items():
+            live = [e for e in entries if e['n_shared'] > 0]
+            if not live:
+                continue
+            _pc = report.get('controlled_variables', {}).get(comp, {}).get('param_matched')
+            print('  [%s]  parameter-controlled=%s' % (comp, _pc))
+            for e in live:
+                _p = ('%.4f' % e['p_exact_signflip']) if math.isfinite(e['p_exact_signflip']) else 'n/a'
+                _ph = e.get('p_holm_global')
+                _phs = ('%.4f' % _ph) if isinstance(_ph, (int, float)) and math.isfinite(_ph) else 'n/a'
+                print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s  p_Holm=%s  params=%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p, _phs, ('yes' if e.get('param_controlled') else ('no' if e.get('param_controlled') is False else 'n/a'))))
+                print('        %s | %s' % ('controlled (same run_cfg)' if e['controlled'] else ('UNCONTROLLED: ' + '; '.join(e['skipped_reasons'])), e['effect_vs_noise']))
+        if report.get('verified_baselines'):
+            print('  verified baseline claims: ' + ', '.join(report['verified_baselines']))
+        if report.get('nominally_significant_baselines'):
+            print('  nominally significant baseline claims (raw p<alpha): ' + ', '.join(report['nominally_significant_baselines']))
+        if report.get('resolution_limited_baselines'):
+            print('  resolution-limited baseline claims: ' + ', '.join(report['resolution_limited_baselines']))
+        if report.get('unverified_baselines'):
+            print('  unverified baseline claims (missing/incomplete/param-mismatched): ' + ', '.join(report['unverified_baselines']))
     for w in report['warnings']:
         print('  [warn] ' + w)
     print('======================================================================================')
@@ -6244,7 +6506,7 @@ def _fmt_pair(main, spread, width, main_fmt, spread_fmt, absent='—', main_cap=
 def _print_table(agg):
     print('\n============== validation perplexity (corpus per run cfg) ==============')
     print(f'{'variant':{_TW['variant']}s} {'PPL mean±std':>{_TW['ppl']}s} {'Δvs full':>{_TW['d']}s} {'Δvs sw128m':>{_TW['d2']}s} {'params(M)':>{_TW['params']}s} {'seeds':>{_TW['seeds']}s} {'blklen':>{_TW['blklen']}s} {'bndF1':>{_TW['bnd']}s}')
-    order = ['full', 'full_matched', 'full_cos', 'full_sink', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn', 'hybrid_hca_dyn', 'hybrid_csa_dyn_fuse']
+    order = ['full', 'full_matched', 'full_cos', 'full_sink', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'csa_dyn_fuse', 'csa_dyn_nocomp', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn', 'hybrid_hca_dyn', 'hybrid_csa_dyn_fuse']
     rows = [v for v in order if v in agg] + [v for v in agg if v not in order]
     for v in rows:
         e = agg[v]
@@ -6278,7 +6540,7 @@ def _print_pairs(summary):
     recs, _amb = _variant_seed_map(summary)
     _pair_amb = sorted(_amb)
     _pair_skip = []
-    PAIRS = [('csa_dynamic', 'csa_fixed'), ('hybrid_dynamic', 'hybrid_fixed'), ('hybrid_csa_dyn', 'hybrid_fixed'), ('hybrid_hca_dyn', 'hybrid_fixed'), ('csa_dyn_fuse', 'csa_dynamic'), ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn'), ('csa_fix_randidx', 'csa_fixed'), ('csa_fix_zerocont', 'csa_fixed'), ('csa_fix_nosink', 'csa_fixed'), ('csa_fix_topk8', 'csa_fixed'), ('csa_fix_topk64', 'csa_fixed'), ('csa_dyn_randidx', 'csa_dynamic'), ('csa_dyn_zerocont', 'csa_dynamic'), ('csa_dyn_nosink', 'csa_dynamic'), ('full_sink', 'full')]
+    PAIRS = [('csa_dynamic', 'csa_fixed'), ('hybrid_dynamic', 'hybrid_fixed'), ('hybrid_csa_dyn', 'hybrid_fixed'), ('hybrid_hca_dyn', 'hybrid_fixed'), ('csa_dyn_fuse', 'csa_dynamic'), ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn'), ('csa_fix_randidx', 'csa_fixed'), ('csa_fix_zerocont', 'csa_fixed'), ('csa_fix_nosink', 'csa_fixed'), ('csa_fix_topk8', 'csa_fixed'), ('csa_fix_topk64', 'csa_fixed'), ('csa_dyn_randidx', 'csa_dynamic'), ('csa_dyn_zerocont', 'csa_dynamic'), ('csa_dyn_nosink', 'csa_dynamic'), ('csa_dyn_nocomp', 'csa_dynamic'), ('full_sink', 'full')]
     print('\n========== paired per-seed deltas (a − b, positive = a worse) ==========')
     print('  (p = exact two-sided sign-flip over the paired per-seed deltas; a noise-level Δ is flagged even if p is small)')
     if _pair_amb:
@@ -6338,7 +6600,7 @@ def _plot(summary, agg, outdir):
     import matplotlib.pyplot as plt
     if not agg:
         return
-    order = ['full', 'full_matched', 'full_cos', 'full_sink', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn', 'hybrid_hca_dyn', 'hybrid_csa_dyn_fuse']
+    order = ['full', 'full_matched', 'full_cos', 'full_sink', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'csa_dyn_fuse', 'csa_dyn_nocomp', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn', 'hybrid_hca_dyn', 'hybrid_csa_dyn_fuse']
     vs = [v for v in order if v in agg] + [v for v in agg if v not in order]
     fig, ax = plt.subplots(1, 5, figsize=(27, 4.5))
     ps = [agg[v]['ppl_mean'] for v in vs]
@@ -6660,6 +6922,20 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     _read_summary_json(summary_path)
     if label:
         print(f'\n########## phase: {label} — {len(cfg['variants'])} variants x seeds {cfg['seeds']} x {cfg['steps']} steps ##########')
+    # Prospective seed-budget note: a panel that contains an ablation arm is
+    # checked BEFORE training so its seed count is not mistaken for a
+    # confirmation after the fact.  This never blocks a run.
+    try:
+        _vs = set(cfg.get('variants') or [])
+        _declared_pairs = [(_a, _b) for _contrasts in list(ABLATION_DESIGN.values()) + list(BASELINE_DESIGN.values()) for _a, _b, _n in _contrasts]
+        if any(_a in _vs and _b in _vs for _a, _b in _declared_pairs):
+            _sp = methodology_seed_plan(len(cfg['seeds']), variants=cfg.get('variants'))
+            if _sp.get('min_seeds_for_family_significance') and not _sp.get('sufficient_for_family_rejection'):
+                print('[seed-plan] this panel declares %d controlled contrasts; with n=%d seeds the family-corrected exact-test floor is above alpha, so results are DESCRIPTIVE ONLY. '
+                      'A family-corrected rejection needs n>=%d (raise the seed list or narrow the pre-registered family before claiming significance).'
+                      % (_sp['declared_contrasts'], _sp['n_seeds'], _sp['min_seeds_for_family_significance']))
+    except Exception as _sp_err:
+        print(f'[seed-plan] note unavailable ({type(_sp_err).__name__}: {_sp_err}) — continuing')
     if torch.cuda.is_available():
         _pin_cuda_determinism()
     fp = _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch)
