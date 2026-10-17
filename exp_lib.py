@@ -4409,6 +4409,415 @@ BASELINE_DESIGN = {
     ],
 }
 
+# 预注册科学假设：每个被审计的「创新点」在跑任何一格里就必须写清楚
+# 「预期的机制、方向、主指标与可推翻条件」。审计据此把显著但方向相反的
+# 结果判为 direction_conflict，而不是事后改口把它解释成支持。没有进入
+# 本表的组件（例如测试里的自定义 design）不施加方向门槛，但仍会出现在
+# `hypotheses_missing` 中，提示补写假设。
+# predicted_sign 的符号与 ABLATION_DESIGN 的 Δ = with − without 一致：
+# −1 表示「带模块应降低 PPL」，+1 表示应升高，0 表示方向未预设（只检验
+# 是否存在差异，不允许声称方向性优势）。
+HYPOTHESIS_DESIGN = {
+    'dynamic_blocking': {
+        'statement': 'Content-adaptive dynamic blocking lowers validation PPL versus fixed blocking at the same parameter count, data order and training budget.',
+        'mechanism': 'Learned cosine boundaries place cuts at low-similarity token transitions, so fewer cross-boundary tokens are compressed together.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'falsifier': 'No family-Holm-corrected PPL reduction, a reduction within seed noise, or a reduction that reverses when fixed/dynamic blocking is swapped.',
+    },
+    'learned_selection': {
+        'statement': 'Learned top-k block selection lowers validation PPL versus random selection with the same number of attended blocks.',
+        'mechanism': 'Query-conditioned indexer scores retrieve blocks that carry token-relevant content instead of an arbitrary subset.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'falsifier': 'Random selection matches or beats learned selection after Holm correction, or the gap is within seed noise.',
+    },
+    'content_pooling': {
+        'statement': 'Pooling block content (rather than zero content) lowers validation PPL at the same block geometry.',
+        'mechanism': 'Compressed content retains token identity so the indexer and attention see informative block keys/values.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'falsifier': 'Zeroing block content does not increase PPL beyond seed noise.',
+    },
+    'attention_sink': {
+        'statement': 'An attention sink lowers validation PPL by giving off-context probability mass a stable destination.',
+        'mechanism': 'The sink absorbs attention that would otherwise be forced onto unrelated blocks, reducing normalization pressure.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'falsifier': 'Removing the sink does not increase PPL beyond seed noise, or improves it.',
+    },
+    'compression_regularizer': {
+        'statement': 'The compression regularizer lowers validation PPL at the same architecture and optimization budget.',
+        'mechanism': 'The loss term discourages degenerate block boundaries and keeps compression from collapsing to fixed chunks.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'falsifier': 'Zeroing the regularizer does not increase PPL beyond seed noise, or improves it.',
+    },
+    'local_fusion': {
+        'statement': 'Learned local fusion lowers validation PPL versus the fixed fusion rule.',
+        'mechanism': 'A learned gate can trade off sparse block reads against the guaranteed local window per layer.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'falsifier': 'The learned gate matches or loses to the fixed fusion rule after Holm correction.',
+    },
+    'hybrid_hierarchy': {
+        'statement': 'The CSA+HCA hybrid lowers validation PPL versus CSA-only at matched parameters and budget.',
+        'mechanism': 'Alternating local HCA layers and sparse CSA layers cover complementary short- and long-range structure.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'falsifier': 'The hybrid matches or loses to CSA-only after Holm correction.',
+    },
+}
+
+BASELINE_HYPOTHESIS_DESIGN = {
+    'compression_vs_matched_dense': {
+        'statement': 'Dynamic CSA lowers validation PPL versus parameter-matched dense baselines under identical data, optimizer, schedule and budget.',
+        'mechanism': 'Sparse compressed reads can preserve long-range access at lower attention cost while the parameter-matched MLP keeps capacity equal.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'falsifier': 'A matched dense baseline matches or beats CSA after Holm correction, or the parameter matching fails.',
+    },
+}
+
+# 基线调参协议：主方法与基线必须获得相同的搜索预算、在同一训练集上拟合、
+# 在验证集上按同一指标选择。`baseline_tune.py` 读取本表；审计读取落盘的
+# `baseline_tuning.json`，没有该产物时只报「不可核验」，不会把未调参的
+# 弱基线当成已验证的对照。
+BASELINE_TUNING_PROTOCOL = {
+    'selection_metric': 'ppl',
+    'selection_split': 'validation',
+    'direction': 'lower_is_better',
+    'search_seed': 0,
+    'final_seeds': [0, 1, 2],
+    'arms': ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic'],
+    'trials': [
+        {'lr': 0.0001, 'weight_decay': 0.1, 'warmup': 50},
+        {'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 50},
+        {'lr': 0.0003, 'weight_decay': 0.05, 'warmup': 50},
+        {'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 100},
+    ],
+    'note': 'Every arm gets the same declared trials and the same selection split. A tuning trial may never read the held-out test split; test is used once after selection.',
+}
+
+# 指标口径表：每个任务的主指标、方向、不平衡处理与聚合方式都显式写出。
+# `metric_policy_audit` 用它检查落盘记录，避免「只报 accuracy」「F1 没写
+# macro/micro/weighted」「极度不平衡仍以 ROC-AUC 为主」这类不可复核的读数。
+METRIC_POLICY = {
+    'lm_perplexity': {
+        'task': 'language_modeling',
+        'primary': 'ppl',
+        'direction': 'lower_is_better',
+        'secondary': ['nll', 'next_token_accuracy'],
+        'imbalance': 'not_applicable',
+        'aggregation': 'token_weighted',
+        'note': 'PPL is the primary endpoint; next-token accuracy is diagnostic only and must never replace it.',
+    },
+    'boundary_alignment': {
+        'task': 'binary_boundary_detection',
+        'primary': 'f1',
+        'direction': 'higher_is_better',
+        'secondary': ['precision', 'recall', 'random_precision', 'precision_excess_over_random'],
+        'imbalance': 'positives_are_a_small_fraction_of_cut_positions',
+        'aggregation': 'macro_over_sequences',
+        'note': 'Never report cut accuracy: the negative class dominates. Always report precision, recall, F1 and the matched-length random baseline together.',
+    },
+    'niah_retrieval': {
+        'task': 'multi_class_retrieval',
+        'primary': 'top1_accuracy',
+        'direction': 'higher_is_better',
+        'secondary': ['answer_nll'],
+        'chance': '1/vocab',
+        'imbalance': 'chance_accuracy_is_tiny_but_the_task_is_not_a_binary_imbalance_metric',
+        'aggregation': 'query_unweighted',
+        'note': 'Top-1 accuracy is reported with answer NLL; PR-AUC/ROC-AUC are not substitutes for a 8192-way retrieval endpoint and must not be invented from top-1 labels.',
+    },
+    'binary_classification': {
+        'task': 'binary_classification',
+        'primary': 'f1',
+        'direction': 'higher_is_better',
+        'secondary': ['precision', 'recall', 'pr_auc', 'roc_auc', 'balanced_accuracy'],
+        'imbalance': 'report prevalence; prefer PR-AUC when positives are rarer than 1:1000',
+        'aggregation': 'binary',
+        'note': 'F1 must state the averaging rule; for binary tasks it is the positive-class F1.',
+    },
+    'multiclass_classification': {
+        'task': 'multiclass_classification',
+        'primary': 'f1_macro',
+        'direction': 'higher_is_better',
+        'secondary': ['f1_micro', 'f1_weighted', 'balanced_accuracy', 'per_class_recall'],
+        'imbalance': 'macro averaging is required when class frequencies differ; micro equals accuracy for single-label tasks',
+        'aggregation': 'macro',
+        'note': 'Every reported F1 must name macro, micro or weighted; report per-class recall when macro and micro disagree.',
+    },
+}
+
+def _binary_roc_auc(y, score):
+    """Rank-based ROC-AUC for a binary endpoint (ties get average ranks)."""
+    y = np.asarray(y).astype(np.int64)
+    score = np.asarray(score, dtype=float)
+    pos = y == 1
+    n_pos, n_neg = int(pos.sum()), int((~pos).sum())
+    if n_pos == 0 or n_neg == 0:
+        return None
+    order = np.argsort(score, kind='mergesort')
+    ranks = np.empty(score.size, dtype=float)
+    sorted_score = score[order]
+    i = 0
+    while i < order.size:
+        j = i + 1
+        while j < order.size and sorted_score[j] == sorted_score[i]:
+            j += 1
+        ranks[order[i:j]] = 0.5 * ((i + 1) + j)
+        i = j
+    return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
+def _binary_average_precision(y, score):
+    """Average precision (the step-wise PR-AUC) for a binary endpoint."""
+    y = np.asarray(y).astype(np.int64)
+    score = np.asarray(score, dtype=float)
+    n_pos = int((y == 1).sum())
+    if n_pos == 0:
+        return None
+    order = np.argsort(-score, kind='mergesort')
+    ys, ss = y[order], score[order]
+    tp = np.cumsum(ys)
+    fp = np.cumsum(1 - ys)
+    last = np.r_[np.nonzero(np.diff(ss))[0], ss.size - 1]
+    tp, fp = tp[last], fp[last]
+    precision = tp / np.maximum(tp + fp, 1)
+    recall = tp / max(n_pos, 1)
+    return float(np.sum(np.diff(np.r_[0.0, recall]) * precision))
+
+def classification_metrics(y_true, y_score=None, y_pred=None, labels=None):
+    """Imbalance-aware classification summary without a sklearn dependency.
+
+    Always returns accuracy, balanced accuracy and per-class precision/recall/
+    F1; reports **macro, micro and weighted** F1 separately (they can disagree
+    sharply under class imbalance).  For a binary endpoint with scores it also
+    returns PR-AUC (average precision) and ROC-AUC.  The caller must still
+    choose the endpoint that matches the research question; this helper only
+    makes the choice explicit and computable.
+    """
+    y_true = np.asarray(y_true).ravel()
+    if labels is None:
+        if y_score is not None and np.asarray(y_score).ndim == 2:
+            labels = np.arange(np.asarray(y_score).shape[1])
+        else:
+            labels = np.unique(y_true)
+            if y_pred is not None:
+                labels = np.unique(np.concatenate([labels, np.asarray(y_pred).ravel()]))
+    labels = np.asarray(labels)
+    if y_pred is None:
+        if y_score is None:
+            raise ValueError('classification_metrics needs y_pred or y_score')
+        score = np.asarray(y_score)
+        if score.ndim == 2:
+            y_pred = labels[np.argmax(score, axis=1)]
+        elif labels.size == 2:
+            y_pred = np.where(score.ravel() >= 0.5, labels[-1], labels[0])
+        else:
+            raise ValueError('a 1-D y_score is only interpretable for a binary endpoint')
+    y_pred = np.asarray(y_pred).ravel()
+    if y_true.shape != y_pred.shape:
+        raise ValueError(f'y_true {y_true.shape} and y_pred {y_pred.shape} differ')
+    per_class = {}
+    supports = []
+    f1s = []
+    rs = []
+    total_tp = total_fp = total_fn = 0
+    for lab in labels:
+        tp = int(np.sum((y_true == lab) & (y_pred == lab)))
+        fp = int(np.sum((y_true != lab) & (y_pred == lab)))
+        fn = int(np.sum((y_true == lab) & (y_pred != lab)))
+        support = int(np.sum(y_true == lab))
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        per_class[str(lab)] = {'precision': precision, 'recall': recall, 'f1': f1, 'support': support}
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+        if support:
+            supports.append(support)
+            f1s.append(f1)
+            rs.append(recall)
+    micro_f1 = 2 * total_tp / max(2 * total_tp + total_fp + total_fn, 1)
+    macro_f1 = float(np.mean(f1s)) if f1s else 0.0
+    weighted_f1 = float(np.average(f1s, weights=supports)) if supports else 0.0
+    out = {
+        'n': int(y_true.size),
+        'labels': [str(x) for x in labels],
+        'prevalence': {str(lab): float(np.mean(y_true == lab)) for lab in labels},
+        'accuracy': float(np.mean(y_true == y_pred)) if y_true.size else None,
+        'balanced_accuracy': float(np.mean(rs)) if rs else None,
+        'f1_macro': macro_f1,
+        'f1_micro': float(micro_f1),
+        'f1_weighted': weighted_f1,
+        'precision_macro': float(np.mean([v['precision'] for v in per_class.values()])) if per_class else 0.0,
+        'recall_macro': float(np.mean(rs)) if rs else 0.0,
+        'per_class': per_class,
+        'f1_averaging': 'macro, micro and weighted are all reported; the caller must name the primary one',
+    }
+    if y_score is not None and labels.size == 2:
+        y_bin = (y_true == labels[-1]).astype(np.int64)
+        out['roc_auc'] = _binary_roc_auc(y_bin, y_score)
+        out['pr_auc'] = _binary_average_precision(y_bin, y_score)
+        if out['pr_auc'] is not None and out['roc_auc'] is not None:
+            rare = min(float(np.mean(y_bin)), 1.0 - float(np.mean(y_bin)))
+            out['imbalance_warning'] = ('positives rarer than 1:1000 — PR-AUC is the primary ranking metric; ROC-AUC can look optimistic'
+                                        if rare < 1e-3 else None)
+    return out
+
+def metric_policy_audit(summary=None, policy=None):
+    """Check the declared metric contract and the records that claim to meet it.
+
+    The audit never selects a metric for the experimenter.  It checks that each
+    task's primary metric, direction, imbalance policy and aggregation are
+    declared, and that a panel which reports boundary or retrieval results also
+    reports the companion metrics needed to interpret them (precision/recall and
+    the random baseline for boundaries; answer NLL for retrieval)."""
+    policy = METRIC_POLICY if policy is None else policy
+    out = {'status': 'ok', 'policies': {}, 'checks': [], 'warnings': []}
+    for name, p in policy.items():
+        missing = [k for k in ('task', 'primary', 'direction', 'aggregation', 'imbalance') if not p.get(k)]
+        out['policies'][name] = {'primary': p.get('primary'), 'direction': p.get('direction'),
+                                 'aggregation': p.get('aggregation'), 'imbalance': p.get('imbalance'),
+                                 'complete': not missing}
+        if missing:
+            out['warnings'].append(f'metric policy `{name}` is missing {missing}')
+    if summary:
+        recs = [r for r in summary.values() if isinstance(r, dict)]
+        lm = [r for r in recs if ppl_is_usable(r.get('ppl'))]
+        out['checks'].append({'metric': 'ppl', 'policy': 'lm_perplexity', 'records': len(lm),
+                              'ok': bool(lm) and all(math.isfinite(float(r['ppl'])) for r in lm)})
+        bnd = []
+        niah = []
+        for r in recs:
+            if r.get('task') == 'niah_natural':
+                niah.append(r)
+            for layer in (r.get('stats') or {}).values() if isinstance(r.get('stats'), dict) else []:
+                if isinstance(layer, dict) and 'bnd_f1' in layer:
+                    bnd.append(layer)
+        if bnd:
+            missing = [k for k in ('bnd_prec', 'bnd_rec', 'bnd_rand') if not all(k in b for b in bnd)]
+            out['checks'].append({'metric': 'boundary_alignment', 'policy': 'boundary_alignment',
+                                  'records': len(bnd), 'ok': not missing, 'missing': missing})
+            if missing:
+                out['warnings'].append(f'boundary metrics report F1 without {missing}; F1 alone cannot be interpreted against the random-cut baseline')
+        if niah:
+            missing = [k for k in ('acc', 'nll') if not all(k in b for b in niah)]
+            out['checks'].append({'metric': 'niah_retrieval', 'policy': 'niah_retrieval',
+                                  'records': len(niah), 'ok': not missing, 'missing': missing})
+            if missing:
+                out['warnings'].append(f'NIAH reports top-1 without {missing}; answer NLL is required alongside retrieval accuracy')
+        for r in recs:
+            # Generic guard: a record that exposes a bare `accuracy` for a
+            # classification-style task but no F1 must be treated as incomplete.
+            if r.get('task') in ('classification', 'binary_classification', 'multiclass_classification') and 'accuracy' in r and 'f1_macro' not in r:
+                out['warnings'].append(f"{r.get('variant', '?')} reports accuracy without F1/averaging for a classification task")
+    out['status'] = 'warn' if out['warnings'] else 'ok'
+    return out
+
+def baseline_tuning_audit(selected=None, path=None, protocol=None):
+    """Audit the equal-budget baseline-tuning evidence.
+
+    A win over an untuned dense baseline establishes only that the proposed
+    model beats a straw man.  This audit requires, for every compared arm:
+    the *same declared trial grid*, the *same selection split* (validation,
+    never test), the *same selection metric*, and a selected config that really
+    is the best trial under that metric.  Missing evidence is reported as
+    `not_verifiable_locally`, never as a pass.
+    """
+    protocol = BASELINE_TUNING_PROTOCOL if protocol is None else protocol
+    if selected is None and path:
+        if os.path.exists(path):
+            try:
+                selected = json.load(open(path, encoding='utf-8'))
+            except Exception as e:
+                return {'status': 'fail', 'tuning_verified': False, 'problems': [f'cannot parse {path}: {type(e).__name__}: {e}']}
+        else:
+            return {'status': 'not_verifiable_locally', 'tuning_verified': False,
+                    'problems': [f'{path} absent — run baseline_tune.py before claiming a baseline win']}
+    if not isinstance(selected, dict) or not isinstance(selected.get('arms'), dict):
+        return {'status': 'not_verifiable_locally', 'tuning_verified': False,
+                'problems': ['no baseline_tuning artifact (expected {"arms": {...}})']}
+    arms = selected['arms']
+    metric = selected.get('selection_metric') or protocol.get('selection_metric')
+    split = selected.get('selection_split') or protocol.get('selection_split')
+    direction = selected.get('direction') or protocol.get('direction')
+    problems = []
+    if split != 'validation':
+        problems.append(f'selection split is {split!r}; hyperparameters must be selected on validation, never test')
+    if metric != protocol.get('selection_metric'):
+        problems.append(f'selection metric {metric!r} differs from the declared {protocol.get("selection_metric")!r}')
+    if direction not in ('lower_is_better', 'higher_is_better'):
+        problems.append(f'unknown selection direction {direction!r}')
+    declared = {json.dumps(t, sort_keys=True, default=str) for t in (protocol.get('trials') or [])}
+    signatures = {}
+    n_trials = {}
+    for arm, entry in arms.items():
+        trials = entry.get('trials') if isinstance(entry, dict) else None
+        if not isinstance(trials, list) or not trials:
+            problems.append(f'{arm}: no trial records')
+            continue
+        cfgs = [json.dumps(t.get('config') or {}, sort_keys=True, default=str) for t in trials if isinstance(t, dict)]
+        signatures[arm] = tuple(sorted(cfgs))
+        n_trials[arm] = len(cfgs)
+        if declared and any(c not in declared for c in cfgs):
+            problems.append(f'{arm}: a trial is outside the declared BASELINE_TUNING_PROTOCOL grid')
+        chosen = entry.get('selected') or entry.get('selected_config')
+        if not isinstance(chosen, dict):
+            problems.append(f'{arm}: no selected config')
+            continue
+        chosen_sig = json.dumps(chosen, sort_keys=True, default=str)
+        if chosen_sig not in cfgs:
+            problems.append(f'{arm}: selected config is not one of its recorded trials')
+        vals = []
+        for t in trials:
+            v = t.get(metric) if isinstance(t, dict) else None
+            if isinstance(v, (int, float)) and math.isfinite(float(v)):
+                vals.append(float(v))
+        chosen_value = entry.get('selected_metric_value')
+        if chosen_value is None:
+            chosen_value = chosen.get(metric)
+        if not vals:
+            problems.append(f'{arm}: no finite {metric} in its trials')
+        elif not isinstance(chosen_value, (int, float)) or not math.isfinite(float(chosen_value)):
+            problems.append(f'{arm}: no finite selected {metric} value')
+        elif direction == 'lower_is_better':
+            if float(chosen_value) > min(vals) + 1e-12:
+                problems.append(f'{arm}: selected trial is not the minimum-{metric} trial')
+        else:
+            if float(chosen_value) < max(vals) - 1e-12:
+                problems.append(f'{arm}: selected trial is not the maximum-{metric} trial')
+    if signatures:
+        if len(set(signatures.values())) != 1:
+            problems.append('arms did not search the same trial grid — tuning budgets are unequal')
+        if len(set(n_trials.values())) != 1:
+            problems.append('arms did not receive the same number of tuning trials — tuning budgets are unequal')
+    final_records = selected.get('final_records') or {}
+    if final_records:
+        for arm, entry in arms.items():
+            chosen = entry.get('selected') or entry.get('selected_config') or {}
+            hits = [r for k, r in final_records.items() if k.startswith(f'{arm}::') and isinstance(r, dict)]
+            if not hits:
+                problems.append(f'{arm}: tuning artifact claims final records but none are bound to this arm')
+                continue
+            for r in hits:
+                hp = r.get('hyperparams') or {}
+                for _k in ('lr', 'weight_decay', 'warmup'):
+                    if _k in chosen and hp.get(_k) is not None and float(hp[_k]) != float(chosen[_k]):
+                        problems.append(f'{arm}: final record {_k}={hp[_k]} does not match the selected {chosen[_k]}')
+                        break
+    required = set(protocol.get('arms') or [])
+    if required and not required.issubset(set(arms)):
+        problems.append(f'missing tuning evidence for arms {sorted(required - set(arms))}')
+    out = {'status': 'ok' if not problems else 'fail', 'tuning_verified': not problems,
+           'selection_metric': metric, 'selection_split': split,
+           'n_trials': n_trials, 'same_search_space': (len(set(signatures.values())) <= 1) if signatures else None,
+           'arms': sorted(arms), 'problems': problems}
+    return out
+
 def _variant_seed_map(summary):
     """{(variant, protocol, seed): rec} for measurable, non-synthesized records
     with an unambiguous seed, plus the set of (variant, protocol, seed) triples
@@ -4533,12 +4942,30 @@ def _holm_assign(entries, m_family, alpha, out_key):
         rec = h.get(str(i))
         e[out_key] = rec.get('p_holm') if isinstance(rec, dict) else None
 
+def _hypothesis_spec(comp, kind):
+    table = HYPOTHESIS_DESIGN if kind == 'component' else BASELINE_HYPOTHESIS_DESIGN
+    return table.get(comp)
+
+def _sign_of(x):
+    if not isinstance(x, (int, float)) or isinstance(x, bool) or not math.isfinite(float(x)):
+        return None
+    if float(x) > 0:
+        return 1
+    if float(x) < 0:
+        return -1
+    return 0
+
 def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_match=False):
     """One status per declared innovation / baseline claim.
 
     verified            — a controlled, parameter-controlled (for baselines)
                           contrast is significant after the family-wise Holm
-                          correction AND its effect exceeds seed noise;
+                          correction, its effect exceeds seed noise, AND (when
+                          a pre-registered hypothesis exists) the sign matches
+                          the predicted direction;
+    direction_conflict  — a corrected significant effect exists but it points
+                          against the pre-registered direction.  This is
+                          evidence AGAINST the stated mechanism, never support;
     measured            — a controlled contrast exists with n >= min_n, but no
                           corrected significance (the old `verified` bar, now
                           reported under an honest name);
@@ -4558,7 +4985,10 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
     # alpha cannot turn an underpowered contrast into a 'verified' one.
     if not powered:
         return 'underpowered'
-    if any(e.get('significant_global') for e in powered):
+    sig = [e for e in powered if e.get('significant_global')]
+    if sig:
+        if any(e.get('direction_consistent') is False for e in sig):
+            return 'direction_conflict'
         return 'verified'
     noise_free = [e for e in powered if not e.get('within_seed_noise')]
     if not noise_free:
@@ -4655,12 +5085,16 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
               'significant_components': [], 'nominally_significant_components': [],
               'resolution_limited_components': [], 'underpowered_components': [],
               'noise_level_components': [], 'unverified_components': [],
+              'direction_conflict_components': [], 'hypotheses_missing': [],
               'verified_baselines': [], 'measured_baselines': [],
               'significant_baselines': [], 'nominally_significant_baselines': [],
               'resolution_limited_baselines': [], 'underpowered_baselines': [],
               'noise_level_baselines': [], 'unverified_baselines': [],
+              'direction_conflict_baselines': [], 'tuned_verified_baselines': [],
+              'untuned_verified_baselines': [],
               'incomplete_components': [], 'controlled_variables': {},
               'component_seed_requirements': {}, 'baseline_seed_requirements': {},
+              'hypotheses': {}, 'metric_audit': {}, 'baseline_tuning': {},
               'family': {}, 'warnings': []}
 
     def _collect(design_group, kind):
@@ -4679,6 +5113,9 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 _contrast_measured = False
                 for (ts, bs), (deltas, shared, skipped) in sorted(conds.items()):
                     st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
+                    _hyp = _hypothesis_spec(comp, kind)
+                    _pred = (_hyp or {}).get('predicted_sign')
+                    _obs = _sign_of(st.get('mean')) if st.get('n') else None
                     st.update({'with': a, 'without': b, 'note': note, 'kind': kind,
                                'tag_with': ts, 'tag_without': bs,
                                'n_shared': len(shared), 'n_skipped': len(skipped),
@@ -4686,7 +5123,14 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                'controlled': bool(deltas) and (not skipped),
                                'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b,
                                'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None,
-                               'param_rel_diff': _rel, 'param_controlled': _param_ok})
+                               'param_rel_diff': _rel, 'param_controlled': _param_ok,
+                               'hypothesis': (_hyp or {}).get('statement'),
+                               'hypothesis_mechanism': (_hyp or {}).get('mechanism'),
+                               'hypothesis_falsifier': (_hyp or {}).get('falsifier'),
+                               'primary_metric': (_hyp or {}).get('primary_metric'),
+                               'predicted_sign': _pred, 'observed_sign': _obs,
+                               'direction_consistent': (None if (_pred is None or _obs is None)
+                                                        else (_pred == 0 or _pred == _obs))})
                     entries.append(st)
                     if deltas:
                         _contrast_measured = True
@@ -4711,6 +5155,18 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
 
     comp_entries, comp_meta = _collect(design, 'component')
     base_entries, base_meta = _collect(baselines, 'baseline')
+    for comp in design:
+        _hyp = _hypothesis_spec(comp, 'component')
+        if _hyp is None:
+            report['hypotheses_missing'].append(comp)
+        else:
+            report['hypotheses'][comp] = dict(_hyp, kind='component')
+    for comp in baselines:
+        _hyp = _hypothesis_spec(comp, 'baseline')
+        if _hyp is None:
+            report['hypotheses_missing'].append(comp)
+        else:
+            report['hypotheses'][comp] = dict(_hyp, kind='baseline')
     # Family = claims this panel can test (a component with no measured pair
     # is not part of the correction burden).  Within a tested component, all
     # declared contrasts keep their slots, so an incomplete ablation cannot
@@ -4737,7 +5193,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     }
 
     def _publish(group_name, design_group, entries_by_comp, meta, kind, require_param_match):
-        status_names = ('verified', 'measured', 'significant', 'nominally_significant',
+        status_names = ('verified', 'direction_conflict', 'measured', 'significant', 'nominally_significant',
                         'resolution_limited', 'underpowered', 'noise_level', 'unverified')
         lists = {s: [] for s in status_names}
         for comp, contrasts in design_group.items():
@@ -4782,6 +5238,26 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     _publish('components', design, comp_entries, comp_meta, 'component', require_param_match=False)
     _publish('baselines', baselines, base_entries, base_meta, 'baseline', require_param_match=True)
 
+    report['metric_audit'] = metric_policy_audit(summary)
+    if report['metric_audit'].get('warnings'):
+        report['warnings'].extend(report['metric_audit']['warnings'])
+    _tune_path = None
+    if outdir:
+        _tune_path = os.path.join(outdir, 'baseline_tuning.json')
+    elif os.path.isdir('results_baseline_tuning'):
+        _tune_path = os.path.join('results_baseline_tuning', 'baseline_tuning.json')
+    report['baseline_tuning'] = baseline_tuning_audit(path=_tune_path)
+    if _scoped_baselines:
+        _tv = bool(report['baseline_tuning'].get('tuning_verified'))
+        report['tuned_verified_baselines'] = list(report.get('verified_baselines') or []) if _tv else []
+        report['untuned_verified_baselines'] = [] if _tv else list(report.get('verified_baselines') or [])
+        if not _tv:
+            report['warnings'].append(
+                'baseline claims have no verified equal-budget tuning artifact (%s) — a win over an untuned baseline is not evidence that the method beats a well-tuned baseline; run baseline_tune.py and put baseline_tuning.json next to this panel'
+                % (report['baseline_tuning'].get('status') or 'missing'))
+    if report['hypotheses_missing']:
+        report['warnings'].append('no pre-registered hypothesis for: ' + ', '.join(sorted(set(report['hypotheses_missing']))) + ' — direction cannot be checked, so a significant result is at most measured')
+
     if write and outdir:
         try:
             os.makedirs(outdir, exist_ok=True)
@@ -4822,6 +5298,8 @@ def _print_methodology_audit(report):
         print('  measured innovations (controlled contrast with n>=%d; descriptive unless also verified): ' % int(report.get('min_n', 3)) + ', '.join(report['measured_components']))
     if report.get('nominally_significant_components'):
         print('  nominally significant (raw p<alpha, before family correction): ' + ', '.join(report['nominally_significant_components']))
+    if report.get('direction_conflict_components'):
+        print('  DIRECTION CONFLICT (significant but opposite to the pre-registered hypothesis): ' + ', '.join(report['direction_conflict_components']))
     if report.get('resolution_limited_components'):
         print('  resolution-limited (non-noise effect, but the family-corrected p floor > alpha at this n; need n>=%s — add seeds, do NOT read as a null): ' % str((_fam.get('min_seeds_for_family_significance') or '?')) + ', '.join(report['resolution_limited_components']))
     if report.get('noise_level_components'):
@@ -4844,8 +5322,18 @@ def _print_methodology_audit(report):
                 _phs = ('%.4f' % _ph) if isinstance(_ph, (int, float)) and math.isfinite(_ph) else 'n/a'
                 print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s  p_Holm=%s  params=%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p, _phs, ('yes' if e.get('param_controlled') else ('no' if e.get('param_controlled') is False else 'n/a'))))
                 print('        %s | %s' % ('controlled (same run_cfg)' if e['controlled'] else ('UNCONTROLLED: ' + '; '.join(e['skipped_reasons'])), e['effect_vs_noise']))
+        _mt = report.get('metric_audit') or {}
+        print('  metric policy: %s (warnings: %d)' % (_mt.get('status') or 'n/a', len(_mt.get('warnings') or [])))
+        _bt = report.get('baseline_tuning') or {}
+        print('  baseline tuning: status=%s tuning_verified=%s' % (_bt.get('status'), _bt.get('tuning_verified')))
         if report.get('verified_baselines'):
-            print('  verified baseline claims: ' + ', '.join(report['verified_baselines']))
+            print('  statistically verified baseline claims (NOT yet evidence against a tuned baseline): ' + ', '.join(report['verified_baselines']))
+        if report.get('tuned_verified_baselines'):
+            print('  tuned verified baseline claims (equal-budget tuning artifact present): ' + ', '.join(report['tuned_verified_baselines']))
+        if report.get('untuned_verified_baselines'):
+            print('  statistically verified but UNTUNED baseline claims (not evidence against a tuned baseline): ' + ', '.join(report['untuned_verified_baselines']))
+        if report.get('direction_conflict_baselines'):
+            print('  DIRECTION CONFLICT baseline claims: ' + ', '.join(report['direction_conflict_baselines']))
         if report.get('nominally_significant_baselines'):
             print('  nominally significant baseline claims (raw p<alpha): ' + ', '.join(report['nominally_significant_baselines']))
         if report.get('resolution_limited_baselines'):

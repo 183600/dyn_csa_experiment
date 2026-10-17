@@ -581,3 +581,44 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   评分口径、基线公平、失败集中度、预算对账与效率测量统一为可执行子命
   令——「不能排除」的问题必须有可运行的核验入口，而不是留在评审回复
   的清单里。
+
+## 21. 实验设计与准备的三条硬门槛
+
+### 21.1 预注册假设与方向一致的验证
+
+`exp_lib.HYPOTHESIS_DESIGN` / `BASELINE_HYPOTHESIS_DESIGN` 为每个声明式
+对照写出 statement / mechanism / `predicted_sign` / primary metric /
+falsifier。Δ 的符号沿用「带模块 − 去模块」：`predicted_sign=-1` 表示
+预期降低 PPL。审计在 `verified` 之外新增 `direction_conflict`：一个
+族内 Holm 校正后显著、但方向与预注册相反的结果，只能算**反对该机制**
+的证据，不能事后改写成支持。没有进入假设表的组件不施加方向门槛，但会
+进入 `hypotheses_missing` 警告。
+
+### 21.2 基线必须与主方法同预算调参
+
+`exp_lib.BASELINE_TUNING_PROTOCOL` 声明同一组搜索 trial、同一验证集选择
+指标（PPL，越低越好）与相同的 final seeds；`baseline_tune.py` 对
+`full_matched` / `full_sw128_matched` / `csa_fixed` / `csa_dynamic`
+逐臂跑同一网格并落盘 `baseline_tuning.json`。`baseline_tuning_audit`
+要求：同一 trial 网格、同一 trial 数、只在 validation 上选择、选中项
+确为该臂最优。`methodology_audit` 把统计上显著但没有该产物的基线声明
+放进 `untuned_verified_baselines` 并给出警告——未调参的弱基线只能
+证明复杂模型比稻草人强；只有 `tuned_verified_baselines` 才支持
+「优于精心调优的基线」。调参后的逐臂最优配置允许 lr/wd/warmup 不同，
+因此其配对由 `baseline_tune.py` 的 `tuned_comparison.json` 按
+「data/val 指纹、steps、tokens、参数量一致 + 等搜索预算」单独报告，
+绝不与严格同 run_cfg 的架构对照混池。
+
+### 21.3 指标口径显式化
+
+`exp_lib.METRIC_POLICY` 声明每个任务的主指标、方向、聚合方式与不平衡
+处理；`metric_policy_audit` / `audit_gates.py metrics` 核验落盘记录：
+
+- LM 以 PPL 为主指标（token-weighted），next-token accuracy 只是诊断；
+- 边界检测的正类只占切割位置的一小部分，禁止报 cut accuracy，必须
+  同时给 precision / recall / F1 与匹配块长的随机基线；
+- NIAH 是 8192 路检索，主指标为 top-1 accuracy，必须同时给 answer NLL；
+  不能把 top-1 标签伪造成 PR-AUC/ROC-AUC；
+- 通用分类入口 `classification_metrics` 同时返回 macro / micro / weighted
+  F1、balanced accuracy、逐类 recall；二分类有分数时另给 PR-AUC 与
+  ROC-AUC，并在正类比例低于 1:1000 时显式提示以 PR-AUC 为主。

@@ -19,6 +19,10 @@
                （同一组目标 token 被评分）与截断检查（零 GPU）
   fairness     基线公平：冻结臂间 run_cfg/train_knobs/lr/warmup/调参机会
                一致性与 mlp_ratio 审计（零 GPU）
+  metrics      指标口径：主指标/方向/聚合/不平衡声明与记录级伴随指标
+               （边界需 precision/recall/随机基线，NIAH 需 answer NLL）
+  tuning       基线调参：主方法与简单基线是否获得同一搜索网格与预算
+               （读 results_baseline_tuning/baseline_tuning.json）
   failures     失败与缺失：error 记录按臂集中度（选择偏差读数，零 GPU）
   budget       规模预算：6ND 代理 FLOPs 估算 + TimeGuard 实测耗时对账
                （理论 FLOPs ≠ 实测速度，两者并列报告，零 GPU）
@@ -408,7 +412,13 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
                         problems.append(f'{a}: a record whose run_cfg does not equal the {ref_arm} reference (pair_reason would refuse this pairing)')
                         break
     out['problems'] = problems
-    out['status'] = 'fail' if problems else ('not_verifiable_locally' if _unverifiable else 'ok')
+    out['tuning'] = L.baseline_tuning_audit(path=os.path.join(REPO, 'results_baseline_tuning', 'baseline_tuning.json'))
+    out['warnings'] = []
+    if not out['tuning'].get('tuning_verified'):
+        out['warnings'].append('no equal-budget baseline tuning artifact — a win over these baselines is not yet evidence against a well-tuned baseline; run baseline_tune.py')
+    out['status'] = ('fail' if problems else
+                     'warn' if out['warnings'] else
+                     ('not_verifiable_locally' if _unverifiable else 'ok'))
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -444,6 +454,54 @@ def audit_failures(outdirs=None):
     if not out['panels']:
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no error records found in local results (or no results) — run after each phase on the experiment machine; failures are already written as error records by the drivers'
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 7b) metrics：指标口径与不平衡处理
+# ---------------------------------------------------------------------------
+
+def audit_metrics(outdirs=None):
+    """指标口径审计（零 GPU）：主指标/方向/聚合/不平衡声明 + 落盘记录核验。
+
+    评审要求：类别不平衡不能只看 accuracy；多分类 F1 必须注明 macro/
+    micro/weighted；极度不平衡优先 PR-AUC；指标必须对齐任务目标。本审计
+    先检查 `exp_lib.METRIC_POLICY` 是否完整声明，再对本地面板检查边界
+    指标是否同时给出 precision/recall/随机基线、NIAH 是否同时给出 answer
+    NLL。缺失只标 warn/不可核验，不伪造一个「通过」。"""
+    L = _import_exp_lib()
+    out = {'status': 'ok', 'policy': L.metric_policy_audit(), 'panels': {}}
+    dirs = outdirs or list(_iter_result_dirs())
+    for d in dirs:
+        summ = _load(os.path.join(d, 'summary.json'))
+        if not summ:
+            continue
+        rep = L.metric_policy_audit(summ)
+        out['panels'][d] = {'status': rep['status'], 'checks': rep['checks'], 'warnings': rep['warnings']}
+        if rep['warnings']:
+            out['status'] = 'warn'
+    if out['policy']['warnings']:
+        out['status'] = 'warn'
+    if not out['panels']:
+        out['note'] = 'no local summaries — policy declarations were checked; record-level checks run on the experiment machine'
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 7c) tuning：基线调参预算对账
+# ---------------------------------------------------------------------------
+
+def audit_tuning(path=None):
+    """基线调参审计（零 GPU）：主方法与简单基线是否用了同一搜索网格/预算。
+
+    没有 `baseline_tuning.json` 时返回 `not_verifiable_locally`——未调参的
+    基线只能证明复杂模型比稻草人强，不能写成「优于精心调优的基线」。"""
+    L = _import_exp_lib()
+    if path is None:
+        path = os.path.join(REPO, 'results_baseline_tuning', 'baseline_tuning.json')
+    out = L.baseline_tuning_audit(path=path)
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -558,7 +616,7 @@ def audit_efficiency_demo():
 # ---------------------------------------------------------------------------
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'failures': audit_failures(), 'budget': audit_budget()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'failures': audit_failures(), 'budget': audit_budget()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -572,7 +630,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

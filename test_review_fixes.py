@@ -915,6 +915,79 @@ def t_underpowered_never_verified():
     assert L._classify_group_status(entries, min_n=3, alpha=0.6, m_family=1) == 'underpowered'
 
 
+
+# ---------------------------------------------------------------------------
+# H. 实验设计与准备：假设方向 / 指标口径 / 基线调参
+# ---------------------------------------------------------------------------
+
+def t_hypothesis_direction_conflict():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    s = {}
+    for i in range(7):
+        s[f'csa_dynamic::seed{i}'] = dict(variant='csa_dynamic', seed=i, run_cfg=fp, steps=1,
+                                         tokens_seen=1, ppl=51.0, params=100)
+        s[f'csa_fixed::seed{i}'] = dict(variant='csa_fixed', seed=i, run_cfg=fp, steps=1,
+                                       tokens_seen=1, ppl=50.0, params=100)
+    design = {'dynamic_blocking': [('csa_dynamic', 'csa_fixed', 'dynamic vs fixed')]}
+    r = L.methodology_audit(s, design=design, baselines={}, verbose=False)
+    assert 'dynamic_blocking' in r['direction_conflict_components'], r
+    assert 'dynamic_blocking' not in r['verified_components'], 'a significant opposite-direction result must never be called verified'
+    e = r['components']['dynamic_blocking'][0]
+    assert e['predicted_sign'] == -1 and e['observed_sign'] == 1 and e['direction_consistent'] is False, e
+    # Reverse the direction and the same effect becomes support.
+    for i in range(7):
+        s[f'csa_dynamic::seed{i}']['ppl'] = 49.0
+    r2 = L.methodology_audit(s, design=design, baselines={}, verbose=False)
+    assert 'dynamic_blocking' in r2['verified_components'], r2
+    assert r2['components']['dynamic_blocking'][0]['direction_consistent'] is True
+
+
+def t_metric_policy_and_classification_metrics():
+    pol = L.metric_policy_audit()
+    assert pol['status'] == 'ok', pol
+    assert pol['policies']['multiclass_classification']['aggregation'] == 'macro'
+    y = [0] * 990 + [1] * 10
+    pred_all_majority = [0] * 1000
+    m = L.classification_metrics(y, y_pred=pred_all_majority, labels=[0, 1])
+    assert abs(m['accuracy'] - 0.99) < 1e-12
+    assert abs(m['f1_macro'] - 0.49748743718592964) < 1e-9, m
+    assert abs(m['f1_micro'] - 0.99) < 1e-12 and abs(m['f1_weighted'] - 0.9850251256281407) < 1e-9, m
+    assert 'macro, micro and weighted' in m['f1_averaging']
+    score = [0.0] * 990 + [1.0] * 10
+    mb = L.classification_metrics(y, y_score=score, labels=[0, 1])
+    assert mb['roc_auc'] == 1.0 and abs(mb['pr_auc'] - 1.0) < 1e-12, mb
+    # Boundary metrics without precision/recall/random baseline must warn.
+    bad = {'full::seed0': {'variant': 'full', 'seed': 0, 'ppl': 10.0,
+                           'stats': {'L0_csa_fix': {'bnd_f1': 0.4}}}}
+    ma = L.metric_policy_audit(bad)
+    assert ma['status'] == 'warn' and any('boundary' in w for w in ma['warnings']), ma
+
+
+def t_baseline_tuning_audit():
+    trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
+    def _arm(ppls):
+        rows = [{'config': dict(c), 'ppl': p} for c, p in zip(trials, ppls)]
+        best = min(rows, key=lambda r: r['ppl'])
+        return {'trials': rows, 'selected': dict(best['config']),
+                'selected_metric_value': best['ppl']}
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['full_matched', 'csa_dynamic'])
+    art = {'selection_metric': 'ppl', 'selection_split': 'validation',
+           'direction': 'lower_is_better',
+           'arms': {'full_matched': _arm([10.0, 11.0]), 'csa_dynamic': _arm([9.0, 9.5])}}
+    r = L.baseline_tuning_audit(art, protocol=protocol)
+    assert r['tuning_verified'] is True, r
+    bad = json.loads(json.dumps(art))
+    bad['arms']['csa_dynamic']['trials'] = bad['arms']['csa_dynamic']['trials'][:1]
+    r2 = L.baseline_tuning_audit(bad, protocol=protocol)
+    assert r2['tuning_verified'] is False and any('same number' in p or 'same trial grid' in p for p in r2['problems']), r2
+    leak = json.loads(json.dumps(art))
+    leak['selection_split'] = 'test'
+    r3 = L.baseline_tuning_audit(leak, protocol=protocol)
+    assert r3['tuning_verified'] is False and any('validation' in p for p in r3['problems']), r3
+
+
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED (no torch in this environment)')
@@ -967,6 +1040,9 @@ def main():
     _check('G2 v7 long-window chunked mask', t_v7_long_window_chunked_mask)
     _check('G3 empty-sequence indexer', t_indexer_empty_sequence)
     _check('G4 underpowered is never verified', t_underpowered_never_verified)
+    _check('H1 hypothesis direction conflict', t_hypothesis_direction_conflict)
+    _check('H2 metric policy + macro/micro/weighted F1 + PR/ROC-AUC', t_metric_policy_and_classification_metrics)
+    _check('H3 equal-budget baseline tuning audit', t_baseline_tuning_audit)
     fails = [r for r in _results if r[1] != 'PASS']
     print(f'\n[test] {len(_results) - len(fails)}/{len(_results)} passed')
     return 1 if fails else 0
