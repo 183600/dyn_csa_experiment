@@ -1000,6 +1000,7 @@ def run_warmup_cell_job(job):
     """Child-process entry for one warmup cell (invoked by par.py)."""
     cfg = dict(job['cfg'])
     guard = L.TimeGuard(job['guard_cap']) if job.get('guard_cap') else None
+    L.set_seed(int(job['seed']))
     train_ids, val_batch, vocab, _, val_bnd = L.load_wikitext(cfg['seq_len'], cfg['n_train_tokens'])
     # pin determinism BEFORE the fingerprint (run_warmup does the same in the
     # parent; `_warm_fp` embeds `determinism_label()`)
@@ -1018,11 +1019,25 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
     n_heads = cfg.get('n_heads', 8)
     d_head = cfg.get('d_head', 32)
     t_data = time.time()
+    L.set_seed(int((list(seeds) or [0])[0]))
     train_ids, val_batch, vocab, _, val_bnd = L.load_wikitext(cfg['seq_len'], cfg['n_train_tokens'])
     if guard is not None:
         guard.record_run(time.time() - t_data, 0, 0, 0, 0, 0)
     spath = os.path.join(outdir, 'summary.json')
     L.locked_json_read(spath)
+    # Warmup training uses the real corpus through its own train_warmup loop,
+    # so the generic run() pre-flight never sees it.  Check the actual token
+    # stream before launching the 20k-step P0W cells.
+    L.overfit_guard(list(variants), train_ids=train_ids, vocab=vocab)
+    _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
+    _panel_prov = L.experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
+    L.log_experiment_event(outdir, {
+        'kind': 'panel_start', 'tracking_schema': 2, 'label': label or outdir,
+        'phase': 'warmup', 'started_at': _panel_started,
+        'config': L._jsonable(cfg), 'seeds': list(seeds),
+        'variants': list(variants), 'warm_grid': list(warm_grid),
+        'code': CKPT_CODE, 'provenance': _panel_prov,
+    })
     print(f'\n########## v7 phase: {label} — {len(variants)} variants x warm {warm_grid} x seeds {seeds} x {cfg['steps']} steps ##########')
     ratios = {}
     for v in variants:
@@ -1065,6 +1080,20 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
             print(f'    {_k}')
         if len(_still) != len(stale_dropped):
             print(f'    ({len(stale_dropped) - len(_still)} of them succeeded and carry a fresh record.)')
+    _measured = sum(1 for _r in summary.values()
+                    if isinstance(_r, dict) and L.ppl_is_usable(_r.get('ppl'))
+                    and not _r.get('synthesized'))
+    L.log_experiment_event(outdir, {
+        'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
+        'phase': 'warmup', 'started_at': _panel_started,
+        'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'n_cells_planned': len(cells), 'n_cells_measured': _measured,
+        'n_cells_missing': max(0, len(cells) - _measured),
+        'n_stale_dropped': len(stale_dropped),
+        'n_truncated': len(dropped_truncations),
+        'summary_ref': os.path.basename(spath), 'code': CKPT_CODE,
+        'provenance': _panel_prov,
+    })
     return summary
 
 def build_niah_batch(n_seq, seq_len, n_pairs=4, vocab=8192, seed=0):
@@ -1464,6 +1493,18 @@ def run_niah_phase(payload, guard=None, label=''):
     seeds = list(payload.get('seeds', [0, 1, 2]))
     vocab = payload.get('vocab', 8192)
     n_steps = payload.get('steps', 4000)
+    # This phase has its own training loop (synthetic NIAH task), so the
+    # generic run() pre-flight does not cover it.  Check the model/loss/
+    # gradient plumbing before the first checkpoint is written.
+    L.overfit_guard(list(variants), vocab=int(vocab))
+    _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
+    _panel_prov = L.experiment_provenance({'dataset': 'synthetic_niah', 'n_train_tokens': 0, 'seq_len': 512})
+    L.log_experiment_event(outdir, {
+        'kind': 'panel_start', 'tracking_schema': 2, 'label': label or outdir,
+        'phase': 'niah', 'started_at': _panel_started,
+        'config': L._jsonable(payload), 'seeds': seeds, 'variants': list(variants),
+        'seq_lens': list(seq_lens), 'code': CKPT_CODE, 'provenance': _panel_prov,
+    })
     spath = os.path.join(outdir, 'summary.json')
     summary = {}
     if os.path.exists(spath):
@@ -1619,6 +1660,19 @@ def run_niah_phase(payload, guard=None, label=''):
             del model, _ckp
             gc.collect()
             torch.cuda.empty_cache()
+    _measured = len({(r.get('variant'), r.get('seed')) for r in summary.values()
+                     if isinstance(r, dict) and isinstance(r.get('acc'), (int, float))
+                     and not isinstance(r.get('acc'), bool) and math.isfinite(float(r['acc']))})
+    L.log_experiment_event(outdir, {
+        'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
+        'phase': 'niah', 'started_at': _panel_started,
+        'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'n_cells_planned': len(variants) * len(seeds),
+        'n_cells_measured': _measured,
+        'n_cells_missing': max(0, len(variants) * len(seeds) - _measured),
+        'summary_ref': os.path.basename(spath), 'code': CKPT_CODE,
+        'provenance': _panel_prov,
+    })
     _niah_plot(summary, outdir, seq_lens)
     return summary
 
@@ -1726,6 +1780,9 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     _lp_t0 = time.time()
     _prov_cfg = {'dataset': 'wikitext', 'n_train_tokens': 8000000, 'seq_len': train_len}
     _tr = None
+    # Seed before serving any data: a cache built in this child process must
+    # not draw from the OS entropy pool.  Training re-seeds in train_variant.
+    L.set_seed(seed)
     need = max(eval_lens) + 1
     if val_ids is None:
         val_ids = L.load_wikitext(max(train_len, need), 4000000)[1]
@@ -1785,6 +1842,13 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         cfgs = L.make_layer_cfgs(6, v)
         train_ids = L.load_wikitext(train_len, 8000000)[0]
         try:
+            # The parent ran only the SYNTHETIC pre-flight.  The real token
+            # stream can still be broken (vocabulary mapping, cache mixing,
+            # label shift downstream), so run the same small-batch overfit
+            # probe on the actual corpus before spending hours training.  The
+            # probe is RNG-preserving, so it cannot perturb this cell.
+            L.overfit_guard([v], train_ids=train_ids, vocab=vocab, steps=150,
+                            seq_len=min(64, int(train_len)), batch_size=2)
             _tr = L.train_variant(v, train_ids, None, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=batch_size, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=_deadline, return_model=True)
         except Exception:
             # A raised train_variant leaves no record_run behind, so the
@@ -1891,10 +1955,20 @@ def run_lenphase(payload, guard=None, label='', par=None):
     _read = L.locked_json_read(spath)
     need = max(eval_lens) + 1
     _t_data = time.time()
+    L.set_seed(int((seeds or [0])[0]))
     _, val_ids, _, _, _ = L.load_wikitext(max(train_len, need), 4000000)
     if guard is not None:
         guard.record_run(time.time() - _t_data, 0, 0, 0, 0, 0)
     print(f'[p1l] val slice {val_ids.shape}, eval_lens={eval_lens}, seeds={seeds}')
+    _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
+    _panel_prov = L.experiment_provenance({'dataset': 'wikitext', 'n_train_tokens': 8000000, 'seq_len': train_len}, val_batch=val_ids, vocab=vocab)
+    L.log_experiment_event(outdir, {
+        'kind': 'panel_start', 'tracking_schema': 2, 'label': label or outdir,
+        'phase': 'lenphase', 'started_at': _panel_started,
+        'config': L._jsonable(payload), 'seeds': seeds, 'variants': list(variants),
+        'eval_lens': list(eval_lens), 'code': CKPT_CODE,
+        'provenance': _panel_prov,
+    })
     _ran_parallel = False
     cells = [(v, seed) for v in variants for seed in seeds]
     if len(cells) > 1:
@@ -1910,6 +1984,21 @@ def run_lenphase(payload, guard=None, label='', par=None):
         for v, seed in cells:
             run_lenphase_cell(payload, v, seed, guard=guard, val_ids=val_ids)
     summary = L.locked_json_read(spath)
+    _measured = 0
+    for _r in summary.values():
+        if not isinstance(_r, dict) or not isinstance(_r.get('by_len'), dict):
+            continue
+        if any(isinstance(_c, dict) and L.ppl_is_usable(_c.get('ppl')) for _c in _r['by_len'].values()):
+            _measured += 1
+    L.log_experiment_event(outdir, {
+        'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
+        'phase': 'lenphase', 'started_at': _panel_started,
+        'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'n_cells_planned': len(cells), 'n_cells_measured': _measured,
+        'n_cells_missing': max(0, len(cells) - _measured),
+        'summary_ref': os.path.basename(spath),
+        'provenance': _panel_prov, 'code': CKPT_CODE,
+    })
     _lenplot(summary, eval_lens, outdir)
     return summary
 

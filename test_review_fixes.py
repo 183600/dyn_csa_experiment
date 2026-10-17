@@ -960,6 +960,8 @@ def t_experiment_ledger():
         assert cell['run_id'] == out['run_id'] and cell['data_fp'] and cell['curve_summary']['n_points'] == 3
         assert cell.get('data_version') == prov['data']['data_version']
         assert entry.get('status') == 'complete' and entry.get('n_completed') == 1
+        integ = entry.get('tracking_integrity') or {}
+        assert integ.get('n_cells') == 1 and integ.get('with_curve') == 1 and integ.get('with_rng_fp') == 1, integ
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -1133,6 +1135,51 @@ def t_overfit_guard_source_key():
         L.overfit_sanity_check = _saved_fn
         L._OVERFIT_GUARD.clear()
         L._OVERFIT_GUARD.update(_saved_guard)
+
+
+def t_overfit_guard_config_aware():
+    # A cached PASS certifies only the exact probe that produced it.  Changing
+    # the step budget or the convergence targets must invalidate the cache; a
+    # lenient probe must not silently certify a stricter one.
+    _saved_guard = dict(L._OVERFIT_GUARD)
+    _saved_reports = dict(L._OVERFIT_REPORTS)
+    _saved_fn = L.overfit_sanity_check
+    calls = []
+    try:
+        L._OVERFIT_GUARD.clear()
+        L._OVERFIT_REPORTS.clear()
+
+        def _stub(v, **kw):
+            calls.append((int(kw.get('steps', -1)), float(kw.get('target_loss', -1))))
+            return {'passed': True, 'initial_loss': 1.0, 'final_loss': 0.0,
+                    'final_accuracy': 1.0, 'grad_all_finite': True,
+                    'params_changed': True, 'diagnosis': 'ok'}
+
+        L.overfit_sanity_check = _stub
+        L.overfit_guard(['probe'], steps=10)
+        L.overfit_guard(['probe'], steps=10)
+        assert calls == [(10, 0.05)], f'the identical probe must be cached once: {calls}'
+        L.overfit_guard(['probe'], steps=20)
+        assert calls == [(10, 0.05), (20, 0.05)], f'a changed step budget must re-run the probe: {calls}'
+        L.overfit_guard(['probe'], steps=20, target_loss=0.001)
+        assert calls == [(10, 0.05), (20, 0.05), (20, 0.001)], f'a stricter target must re-run the probe: {calls}'
+        _rep = list(L._OVERFIT_REPORTS.values())[0]
+        assert _rep.get('guard_probe_config', {}).get('schema') == 2
+        assert _rep.get('guard_probe_key')
+    finally:
+        L.overfit_sanity_check = _saved_fn
+        L._OVERFIT_GUARD.clear()
+        L._OVERFIT_GUARD.update(_saved_guard)
+        L._OVERFIT_REPORTS.clear()
+        L._OVERFIT_REPORTS.update(_saved_reports)
+
+
+def t_environment_snapshot_identity():
+    env = L.environment_snapshot()
+    for k in ('gpu_identity', 'cuda_visible_devices', 'float32_matmul_precision',
+              'cublas_workspace_config'):
+        assert k in env, f'environment snapshot missing {k}'
+    assert isinstance(env['gpu_identity'], list)
 
 
 
@@ -1532,6 +1579,8 @@ def main():
     _check('F1 indexer column-narrowing exactness', t_indexer_column_narrowing_exact)
     _check('F2 zero-block attention keeps window', t_attention_zero_blocks_keeps_window)
     _check('F3 overfit guard source key', t_overfit_guard_source_key)
+    _check('F3b overfit guard probe-config key', t_overfit_guard_config_aware)
+    _check('F3c environment identity/snapshot fields', t_environment_snapshot_identity)
     _check('F4 shared-storage cache accounting', t_cache_bytes_shared_storage)
     _check('F5 atomic checkpoint save', t_atomic_torch_save)
     _check('G1 long-window chunked mask', t_long_window_chunked_mask)

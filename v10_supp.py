@@ -456,9 +456,14 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     os.makedirs(outdir, exist_ok=True)
     spath = cfg['summary']
     out = {'status': 'ok', 'key': f'{v}::s{seed}', 'variant': v, 'seed': seed}
+    _pc_run_id = L.new_experiment_id('probe')
+    _pc_started = time.strftime('%Y-%m-%dT%H:%M:%S')
+    _pc_t0 = time.time()
+    _log_metrics = {}
     need = max(cfg['eval_lens']) + 1
     train_len = int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
     if val_ids is None:
+        L.set_seed(int(seed))
         val_ids = L.load_wikitext(max(train_len, need), 4000000)[1]
     if mech_summ is None:
         mech_summ = {}
@@ -588,6 +593,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             per_seq = [float('inf') if s / t > 709.0 else math.exp(s / t) for s, t in zip(nll_sum, n_tok)]
             _fp_rec = dict(_fp, mode=mode) if mode != 'uniform' else _fp
             _pending[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp_rec, 'recipe': _ck_recipe}
+            _log_metrics[key] = {'ppl_mean': float(cell_ppl), 'n_seq': len(per_seq)}
             print(f'  [p3mp] {key:44s} PPL={cell_ppl:8.2f}', flush=True)
             if _ci % 8 == 0:
                 L.locked_json_update(spath, (lambda s, _p=dict(_pending): (s.update(_p), s)[1]), indent=1)
@@ -599,9 +605,26 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             key = _niah_cell_key(v, seed, arm, Ln, cond)
             rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), '_code': V.CKPT_CODE, 'probe_params': _nfp, 'recipe': _ck_recipe}
             L.locked_json_update(_nspath, (lambda s, _p=dict({key: rec}): (s.update(_p), s)[1]), indent=1)
+            _log_metrics[key] = {'acc': float(rec['acc']), 'nll': float(rec['nll']), 'n_queries': int(rec['n_queries'])}
             print(f"  [niah] {key:48s} acc={rec['acc']:.3f} nll={rec['nll']:.3f}", flush=True)
         if guard is not None:
             guard.record_run(time.time() - t0, 0, 0, 0, 0, 0)
+    if _log_metrics:
+        L.log_experiment_event(outdir, {
+            'kind': 'cell', 'tracking_schema': 2, 'run_id': _pc_run_id,
+            'status': 'ok', 'started_at': _pc_started,
+            'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'elapsed_s': time.time() - _pc_t0, 'key': f'{v}::s{seed}',
+            'variant': v, 'seed': int(seed), 'run_cfg': _ck_recipe,
+            'code': V.CKPT_CODE,
+            'provenance': _tr.get('provenance'),
+            'hyperparams': _tr.get('hyperparams'),
+            'data_fp': _tr.get('data_fp'), 'val_fp': _tr.get('val_fp'),
+            'rng_fp': _tr.get('rng_fp'),
+            'metrics': {'n_probe_cells': len(_log_metrics),
+                        'probe_results': _log_metrics},
+            'losses': _tr.get('losses'), 'ppl_history': _tr.get('ppl_history'),
+        })
     if model is not None:
         del model
         gc.collect()
@@ -625,6 +648,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
     need = max(cfg['eval_lens']) + 1
     train_len = int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
     _t_data = time.time()
+    L.set_seed(int((list(cfg.get('seeds') or [0]) or [0])[0]))
     _, val_ids, _, _, _ = L.load_wikitext(max(train_len, need), 4000000)
     if guard is not None:
         guard.record_run(time.time() - _t_data, 0, 0, 0, 0, 0)
@@ -638,6 +662,15 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
             print(f'[p3mp] FATAL: {_msp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — without it no checkpoint can be attributed to a training recipe, so the probe would score unknown weights.  Move it aside to re-train.')
             raise
     print(f'[p3mp] val slice {val_ids.shape}, arms={cfg['arms']}, modes={cfg.get('modes') or {'uniform': cfg['rhos']}}' + (f", niah={cfg['niah']}" if cfg.get('niah') else ''))
+    _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
+    _panel_prov = L.experiment_provenance({'dataset': 'wikitext', 'n_train_tokens': cfg.get('n_train_tokens') or 8000000, 'seq_len': train_len}, val_batch=val_ids, vocab=cfg.get('vocab') or 8192)
+    L.log_experiment_event(outdir, {
+        'kind': 'panel_start', 'tracking_schema': 2, 'label': label or outdir,
+        'phase': 'probe', 'started_at': _panel_started,
+        'config': L._jsonable(cfg), 'seeds': list(cfg['seeds']),
+        'variants': list(cfg['variants']), 'code': V.CKPT_CODE,
+        'provenance': _panel_prov,
+    })
     cells = [(v, seed) for v in cfg['variants'] for seed in cfg['seeds']]
     _ran_parallel = False
     if len(cells) > 1:
@@ -652,6 +685,18 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
         for v, seed in cells:
             run_probe_cell(cfg, v, seed, guard=guard, val_ids=val_ids, mech_summ=mech_summ)
     summary = L.locked_json_read(spath)
+    _measured = len({(_r.get('variant'), _r.get('seed')) for _r in summary.values()
+                     if isinstance(_r, dict)
+                     and (L.ppl_is_usable(_r.get('ppl_mean')) or _r.get('task') == 'niah_natural')})
+    L.log_experiment_event(outdir, {
+        'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
+        'phase': 'probe', 'started_at': _panel_started,
+        'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'n_cells_planned': len(cells), 'n_cells_measured': _measured,
+        'n_cells_missing': max(0, len(cells) - _measured),
+        'summary_ref': os.path.basename(spath), 'code': V.CKPT_CODE,
+        'provenance': _panel_prov,
+    })
     print(f'[p3mp] wrote {spath} ({len(summary)} cells)')
     return summary
 

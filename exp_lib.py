@@ -6844,6 +6844,31 @@ def _gpu_names():
     except Exception:
         return []
 
+def _gpu_identity():
+    """Per-visible-GPU identity used to explain (not eliminate) cross-machine
+    drift: name, UUID, total memory and compute capability.  Never raises."""
+    out = []
+    if not torch.cuda.is_available():
+        return out
+    try:
+        n = int(torch.cuda.device_count())
+    except Exception:
+        return out
+    for i in range(n):
+        try:
+            p = torch.cuda.get_device_properties(i)
+            out.append({
+                'index': i,
+                'name': getattr(p, 'name', None),
+                'uuid': str(getattr(p, 'uuid', '')) or None,
+                'total_memory_bytes': int(getattr(p, 'total_memory', 0)) or None,
+                'major': int(getattr(p, 'major', 0)),
+                'minor': int(getattr(p, 'minor', 0)),
+            })
+        except Exception as e:
+            out.append({'index': i, 'error': f'{type(e).__name__}: {e}'})
+    return out
+
 def environment_snapshot():
     """Compact software/hardware snapshot for experiment tracking."""
     import platform
@@ -6860,14 +6885,19 @@ def environment_snapshot():
         'cuda_version': torch.version.cuda,
         'cudnn_version': torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
         'gpu_names': _gpu_names(),
+        'gpu_identity': _gpu_identity(),
         'cuda_device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
         'determinism': determinism_label(),
         'cudnn_deterministic': bool(torch.backends.cudnn.deterministic),
         'cudnn_benchmark': bool(torch.backends.cudnn.benchmark),
         'deterministic_algorithms': bool(torch.are_deterministic_algorithms_enabled()),
         'tf32_matmul': bool(torch.backends.cuda.matmul.allow_tf32) if torch.cuda.is_available() else None,
         'tf32_cudnn': bool(torch.backends.cudnn.allow_tf32) if torch.cuda.is_available() else None,
+        'float32_matmul_precision': torch.get_float32_matmul_precision(),
+        'cublas_workspace_config': os.environ.get('CUBLAS_WORKSPACE_CONFIG'),
         'cpu_threads': int(torch.get_num_threads()),
+        'cpu_interop_threads': int(torch.get_num_interop_threads()) if hasattr(torch, 'get_num_interop_threads') else None,
         'pythonhashseed': os.environ.get('PYTHONHASHSEED'),
         'flags': {k: os.environ.get(k) for k in ('CSA_KERNEL', 'CSA_CKPT', 'CSA_DETERMINISTIC', 'CSA_CPU_THREADS', 'CSA_SKIP_OVERFIT', 'CSA_REQUIRE_REPRO', 'CSA_SKIP_REPRO', 'CUBLAS_WORKSPACE_CONFIG')},
     }
@@ -7006,6 +7036,18 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     if planned_cells is None:
         planned_cells = [f'{v}::seed{seed}' for seed in cfg.get('seeds') or [] for v in cfg.get('variants') or []]
     planned_cells = [str(_k) for _k in dict.fromkeys(planned_cells)]
+    # Machine-checkable completeness of the per-cell trace.  A record without
+    # provenance/hyperparameters/RNG fingerprint/curve is still a measurement,
+    # but it must not silently look as traceable as a complete one.
+    _integrity = {
+        'n_cells': len(cells),
+        'with_provenance': sum(1 for c in cells.values() if c.get('data_fp') and c.get('code_stamp')),
+        'with_hyperparams': sum(1 for c in cells.values() if c.get('hyperparams')),
+        'with_rng_fp': sum(1 for c in cells.values() if c.get('rng_fp')),
+        'with_data_version': sum(1 for c in cells.values() if c.get('data_version')),
+        'with_curve': sum(1 for c in cells.values() if (c.get('curve_summary') or {}).get('n_points')),
+        'with_sanity_ref': sum(1 for c in cells.values() if c.get('sanity_ref')),
+    }
     entry = {
         'run_cfg': run_cfg,
         'status': status or 'complete',
@@ -7022,6 +7064,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         'n_planned': len(planned_cells),
         'n_completed': len(cells),
         'missing_cells': [k for k in planned_cells if k not in cells],
+        'tracking_integrity': _integrity,
         'cells': cells,
     }
     path = os.path.join(outdir, 'run_manifest.json')
@@ -7977,6 +8020,13 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     # target and never updates (lr=0) must still fail.
     loss_decreased = bool(math.isfinite(initial_loss) and math.isfinite(final_loss) and final_loss < initial_loss)
     passed = bool(math.isfinite(final_loss) and final_loss <= float(target_loss) and final_acc >= float(target_acc) and grad_finite and params_changed and math.isfinite(best_loss) and best_loss <= float(target_loss) and loss_decreased)
+    _chance = math.log(max(int(vocab), 2))
+    # Intermediate-result evidence kept alongside the pass/fail bit: a sanity
+    # check that only reports "PASS" hides WHICH part of the pipeline was
+    # exercised.  These are diagnostics, not extra pass criteria.
+    _label_shift_ok = bool(torch.equal(y, ids_full[:, 1:]))
+    _initial_near_chance = bool(math.isfinite(initial_loss) and abs(float(initial_loss) - _chance) <= max(0.5 * _chance, 1.0))
+    _finite_curve = all(math.isfinite(float(v)) for v in loss_curve)
     report = {
         'kind': 'small_batch_overfit_sanity',
         'variant': variant,
@@ -8010,6 +8060,16 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         'batch_reused': True,
         'target_loss': float(target_loss),
         'target_accuracy': float(target_acc),
+        'expected_initial_loss_log_vocab': float(_chance),
+        'intermediate_checks': {
+            'labels_are_next_token_shift': _label_shift_ok,
+            'initial_loss_near_log_vocab': _initial_near_chance,
+            'loss_curve_all_finite': bool(_finite_curve),
+            'grad_all_finite': bool(grad_finite),
+            'params_changed': bool(params_changed),
+            'loss_decreased': bool(loss_decreased),
+            'grad_coverage': (float(_n_with_grad) / float(_n_trainable) if _n_trainable else 0.0),
+        },
     }
     report['passed'] = passed
     if passed:
@@ -8048,8 +8108,37 @@ def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_
 _OVERFIT_GUARD = {}
 # Reports of the checks that actually ran (the boolean guard above is the
 # resume cache; this is the evidence written into the run manifest).  Keyed
-# like _OVERFIT_GUARD by (variant, source).
+# like _OVERFIT_GUARD by (variant, source, ...).
 _OVERFIT_REPORTS = {}
+
+_OVERFIT_ARCH = {'d': 64, 'n_layers': 2, 'n_heads': 4, 'd_head': 16}
+
+def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_loss, target_acc):
+    """Exact probe configuration that a cached PASS is allowed to certify.
+
+    A pass only proves that THIS tiny run can overfit (same step budget, batch
+    size, sequence length, targets, architecture and code semantics).  Without
+    these fields in the cache key a lax probe (e.g. one step, target_loss=100)
+    would silently satisfy a later strict probe, turning the safety gate into a
+    formality.  The code stamp is included because changing the trainer/loss
+    must invalidate an old pass even when the numeric knobs look identical.
+    """
+    return {
+        'schema': 2,
+        'seed': int(seed),
+        'steps': int(steps),
+        'seq_len': int(seq_len),
+        'batch_size': int(batch_size),
+        'vocab': int(vocab),
+        'target_loss': float(target_loss),
+        'target_accuracy': float(target_acc),
+        'architecture': dict(_OVERFIT_ARCH),
+        'code': code_stamp(),
+    }
+
+def _overfit_probe_digest(cfg):
+    blob = json.dumps(cfg, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
 
 def overfit_reports(*, source=None):
     """Copy of the small-batch reports gathered in this process, optionally
@@ -8061,21 +8150,27 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
     on failure.  Called automatically by `run()` before the first panel and by
     the length/checkpoint phases, so every training driver inherits the check.
 
-    `CSA_SKIP_OVERFIT=1` is the explicit escape hatch (e.g. a diagnostic box
-    with a deliberately broken batch); it prints a loud skip line instead.
-    Passing is necessary, not sufficient."""
+    The in-process cache is keyed by the FULL probe configuration (seed, step
+    budget, shape, targets, architecture, code) as well as the corpus bytes, so
+    a lenient probe can never certify a stricter one.  `CSA_SKIP_OVERFIT=1` is
+    the explicit escape hatch (e.g. a diagnostic box with a deliberately broken
+    batch); it prints a loud skip line instead.  Passing is necessary, not
+    sufficient."""
     if os.environ.get('CSA_SKIP_OVERFIT', '').strip().lower() in ('1', 'true', 'yes', 'on'):
         print('[overfit] guard SKIPPED (CSA_SKIP_OVERFIT is set) — this run has no small-batch safety check')
         return []
     src = 'data' if train_ids is not None else 'synthetic'
-    # The data cache key includes the actual token fingerprint AND the vocab
-    # size: two panels in one process can run on different corpora/word pieces,
-    # and a pass on corpus A must never certify corpus B.  A synthetic-keyed
-    # pass remains subsumed by ANY passed data check (same model plumbing).
+    _probe_cfg = _overfit_probe_config(seed=seed, steps=steps, seq_len=seq_len, batch_size=batch_size, vocab=vocab, target_loss=target_loss, target_acc=target_acc)
+    _cfg_key = _overfit_probe_digest(_probe_cfg)
+    # The data cache key keeps the vocab + token fingerprint in the first two
+    # trailing slots (run() recovers them to rebuild the panel evidence) and
+    # appends the probe-config digest.  A pass on corpus A can never certify
+    # corpus B, and a pass with a different probe budget can never certify a
+    # stricter call.
     _data_key = None
     if src == 'data':
         _arr = np.asarray(train_ids)
-        _data_key = (int(vocab), _ids_fp(_arr if _arr.ndim == 1 else np.ascontiguousarray(_arr).reshape(-1)))
+        _data_key = (int(vocab), _ids_fp(_arr if _arr.ndim == 1 else np.ascontiguousarray(_arr).reshape(-1)), _cfg_key)
 
     def _known(v):
         # Only a PASSED check may certify a variant.  A cached failure must be
@@ -8084,16 +8179,18 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
         # bypass the hard stop on a later phase in the same process.
         if src == 'data':
             return _OVERFIT_GUARD.get((v, 'data', *_data_key)) is True
-        return _OVERFIT_GUARD.get((v, 'synthetic')) is True or any(
-            _k[0] == v and _k[1] == 'data' and _OVERFIT_GUARD.get(_k) is True
+        return _OVERFIT_GUARD.get((v, 'synthetic', _cfg_key)) is True or any(
+            _k[0] == v and _k[1] == 'data' and _k[-1] == _cfg_key and _OVERFIT_GUARD.get(_k) is True
             for _k in list(_OVERFIT_GUARD))
     todo = [v for v in variants if force or not _known(v)]
     if not todo:
         return []
     reports = []
     for v in todo:
-        r = overfit_sanity_check(v, seed=seed, steps=steps, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=train_ids, target_loss=target_loss, target_acc=target_acc)
-        _key = (v, 'data', *_data_key) if src == 'data' else (v, 'synthetic')
+        r = overfit_sanity_check(v, seed=seed, steps=steps, d=_OVERFIT_ARCH['d'], n_layers=_OVERFIT_ARCH['n_layers'], n_heads=_OVERFIT_ARCH['n_heads'], d_head=_OVERFIT_ARCH['d_head'], seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=train_ids, target_loss=target_loss, target_acc=target_acc)
+        r['guard_probe_config'] = _probe_cfg
+        r['guard_probe_key'] = _cfg_key
+        _key = (v, 'data', *_data_key) if src == 'data' else (v, 'synthetic', _cfg_key)
         _OVERFIT_GUARD[_key] = bool(r['passed'])
         _OVERFIT_REPORTS[_key] = r
         reports.append(r)
@@ -8195,24 +8292,36 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
         r['diagnosis'] = 'ok'
     return r
 
+def _repro_guard_base(*, seed=0, steps=3, tol=1e-06):
+    """Cache key shared by the guard and run()'s evidence recovery.
+
+    Strictly a description of the probe that produced a PASS: changing the
+    tolerance, step budget, device, determinism level or code invalidates the
+    cached certificate.  A pass under a loose tolerance must never be reused
+    for a stricter request."""
+    return (int(seed), int(steps), float(tol), str(DEVICE), determinism_label(), code_stamp())
+
 def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False):
-    """Run ``reproducibility_check`` once per (variant, seed) per process.
+    """Run ``reproducibility_check`` once per (variant, probe config) per process.
 
     Mirrors ``overfit_guard``: results are cached as evidence, a skip env var
     is explicit and loud, and a failure is a warning unless the caller sets
     ``CSA_REQUIRE_REPRO=1`` (strict reproducibility is not free on every GPU
-    kernel, so it is opt-in).  Returns the reports that ran in this call."""
+    kernel, so it is opt-in).  The cache key includes the tolerance and code
+    stamp as well as the seed/device, so a loose probe cannot certify a
+    stricter one.  Returns the reports that ran in this call."""
     if os.environ.get('CSA_SKIP_REPRO', '').strip().lower() in ('1', 'true', 'yes', 'on'):
         print('[repro] guard SKIPPED (CSA_SKIP_REPRO is set) — this run has no same-machine seed check')
         return []
     _want_strict = os.environ.get('CSA_REQUIRE_REPRO', '').strip().lower() in ('1', 'true', 'yes', 'on')
-    _base = (int(seed), int(steps), str(DEVICE), determinism_label())
+    _base = _repro_guard_base(seed=seed, steps=steps, tol=tol)
     # As in overfit_guard, a cached FAILURE is not a certificate: retry it so a
     # later phase cannot silently inherit the failed status as "already done".
     todo = [v for v in variants if force or _REPRO_GUARD.get((v, *_base)) is not True]
     reports = []
     for v in todo:
         r = reproducibility_check(v, seed=seed, steps=steps, tol=tol)
+        r['guard_probe_key'] = '|'.join((str(x) for x in _base))
         key = (v, *_base)
         _REPRO_GUARD[key] = bool(r['passed'])
         _REPRO_REPORTS[key] = r
@@ -9351,6 +9460,11 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     d_head = cfg.get('d_head', 32)
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
+    # Seed the panel-level data-construction path (tokenizer fitting, cache
+    # rebuilds, any future DataLoader setup) before the corpus is served.
+    # Per-cell training re-seeds itself inside train_variant, so this cannot
+    # change a recorded cell; it only closes an unseeded first-build path.
+    set_seed(int((cfg.get('seeds') or [0])[0]))
     # Synthetic pre-flight before the corpus load.
     _sanity = list(overfit_guard(cfg.get('variants') or []))
     _attb_bump_epoch()
@@ -9415,7 +9529,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     _repro = list(reproducibility_guard(cfg.get('variants') or []))
     if not _repro:
         _want = set(cfg.get('variants') or [])
-        _base = (0, 3, str(DEVICE), determinism_label())
+        _base = _repro_guard_base(seed=0, steps=3, tol=1e-06)
         _repro = [dict(r) for k, r in _REPRO_REPORTS.items() if k[0] in _want and k[1:] == _base]
     if _repro:
         atomic_write_json(os.path.join(outdir, 'reproducibility.json'), {
