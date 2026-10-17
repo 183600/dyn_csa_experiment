@@ -771,6 +771,91 @@ def t_overfit_guard_source_key():
         L._OVERFIT_GUARD.update(_saved_guard)
 
 
+
+# ---------------------------------------------------------------------------
+# G. scale-safety regressions
+# ---------------------------------------------------------------------------
+
+def t_long_window_avoids_full_mask():
+    # A sliding-window full-attention layer needs a [T, T] additive mask for
+    # SDPA.  Beyond the row cap it must take the chunked mask path instead;
+    # the fallback must also work for a layer with NO sink (sink_view=None).
+    torch.manual_seed(0)
+    cfg = [L.AttnCfg(kind='full', window=5)]
+    m = L.SmallGPT(64, 32, 1, 4, 8, 32, cfg, mlp_ratio=2).eval()
+    ids = torch.randint(0, 64, (2, 23))
+    with torch.no_grad():
+        ref = m(ids)
+
+    old_cap = L._DENSE_MASK_ROW_CAP_BYTES
+    old_f = L.causal_window_mask_f
+    old_w = L.causal_window_mask
+
+    def _boom(*_a, **_k):
+        raise AssertionError('a full sliding-window [T, T] mask was allocated beyond the row cap')
+    try:
+        L._DENSE_MASK_ROW_CAP_BYTES = 1
+        L.causal_window_mask_f = _boom
+        L.causal_window_mask = _boom
+        with torch.no_grad():
+            got = m(ids)
+    finally:
+        L._DENSE_MASK_ROW_CAP_BYTES = old_cap
+        L.causal_window_mask_f = old_f
+        L.causal_window_mask = old_w
+    assert torch.allclose(got, ref, atol=1e-5, rtol=1e-4), 'the chunked long-window path changed the attention output'
+
+
+def t_v7_long_window_avoids_full_mask():
+    # Same contract for the v7 RoPE full-attention twin.
+    torch.manual_seed(0)
+    cfg = V7.AttnCfgRope(kind='full', rope=True, rope_dim=8, window=5)
+    m = V7.HybridAttentionRoPE(32, 4, 8, cfg).eval()
+    x = torch.randn(2, 23, 32)
+    with torch.no_grad():
+        ref = m(x)
+
+    old_cap = L._DENSE_MASK_ROW_CAP_BYTES
+    old_f = L.causal_window_mask_f
+    old_w = L.causal_window_mask
+
+    def _boom(*_a, **_k):
+        raise AssertionError('v7 allocated a full sliding-window [T, T] mask beyond the row cap')
+    try:
+        L._DENSE_MASK_ROW_CAP_BYTES = 1
+        L.causal_window_mask_f = _boom
+        L.causal_window_mask = _boom
+        with torch.no_grad():
+            got = m(x)
+    finally:
+        L._DENSE_MASK_ROW_CAP_BYTES = old_cap
+        L.causal_window_mask_f = old_f
+        L.causal_window_mask = old_w
+    assert torch.allclose(got, ref, atol=1e-5, rtol=1e-4), 'the v7 chunked long-window path changed the attention output'
+
+
+def t_indexer_empty_sequence():
+    # n == 0 must return the same shapes as a non-empty call instead of
+    # failing on the empty gather/concat tail.
+    d, nIH = 8, 2
+    H = torch.randn(0, d)
+    comp = torch.randn(0, d)
+    W_DQ, W_DK, W_w = torch.randn(d, d), torch.randn(d, d), torch.randn(nIH, d)
+    valid = []
+    m, idx, soft = L.lightning_indexer(H, comp, torch.empty(0, dtype=torch.long), W_DQ, W_DK, W_w, nIH, 4, out_valid=valid)
+    assert idx.shape == (0, 0) and soft.shape == (0, 0) and m.shape == (0, 0), (idx.shape, soft.shape, m.shape)
+    assert len(valid) == 1 and valid[0].shape == (0, 0), 'the valid-cols output must be empty too'
+
+
+def t_underpowered_never_verified():
+    # A liberal alpha must not let an underpowered contrast be called
+    # 'verified': the n floor is a precondition for every positive verdict.
+    entries = [{'controlled': True, 'n': 2, 'significant_global': True,
+                'within_seed_noise': False, 'param_controlled': True,
+                'p_exact_signflip': 0.5}]
+    assert L._classify_group_status(entries, min_n=3, alpha=0.6, m_family=1) == 'underpowered'
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED (no torch in this environment)')
@@ -816,6 +901,10 @@ def main():
     _check('F3 overfit guard source key', t_overfit_guard_source_key)
     _check('F4 shared-storage cache accounting', t_cache_bytes_shared_storage)
     _check('F5 atomic checkpoint save', t_atomic_torch_save)
+    _check('G1 long-window path avoids full mask', t_long_window_avoids_full_mask)
+    _check('G2 v7 long-window path avoids full mask', t_v7_long_window_avoids_full_mask)
+    _check('G3 empty-sequence indexer', t_indexer_empty_sequence)
+    _check('G4 underpowered is never verified', t_underpowered_never_verified)
     fails = [r for r in _results if r[1] != 'PASS']
     print(f'\n[test] {len(_results) - len(fails)}/{len(_results)} passed')
     return 1 if fails else 0

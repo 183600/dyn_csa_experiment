@@ -193,18 +193,22 @@ class HybridAttentionRoPE(L.HybridAttention):
             scale = 1.0
         else:
             scale = 1.0 / math.sqrt(self.hd)
-        if self.sink is None:
-            sdpa_kw = dict(scale=scale)
-            if cfg.window > 0:
-                sdpa_kw['attn_mask'] = L.causal_window_mask(T, cfg.window, x.device).to(q.dtype)
-            else:
-                sdpa_kw['is_causal'] = True
-            out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
-            return self.W_o(out.reshape(B, T, self.nh * self.hd))
         # windowed and full masks are mutually exclusive: pick the one the call
         # actually uses (both are cached constants, so values are unchanged).
         # Beyond the row cap, each chunk builds only its own identical slice.
         _use_full_mask = T * T * 4 <= L._DENSE_MASK_ROW_CAP_BYTES
+        # A sliding-window SDPA call needs the whole [T, T] additive mask, so
+        # a long context would allocate T^2 bytes there.  Keep SDPA only while
+        # the mask fits the row cap; the chunked path below also supports a
+        # missing sink (sink_view=None).
+        if self.sink is None and (cfg.window <= 0 or _use_full_mask):
+            sdpa_kw = dict(scale=scale)
+            if cfg.window > 0:
+                sdpa_kw['attn_mask'] = L.causal_window_mask_f(T, cfg.window, x.device, q.dtype)
+            else:
+                sdpa_kw['is_causal'] = True
+            out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
+            return self.W_o(out.reshape(B, T, self.nh * self.hd))
         if _use_full_mask:
             if cfg.window > 0:
                 mask = L.causal_window_mask(T, cfg.window, x.device)
@@ -212,7 +216,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 mask = L.causal_mask(T, x.device)
         else:
             mask = None
-        sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1)
+        sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1) if self.sink is not None else None
         out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
         row_chunk = max(1, min(T, 1024))
         _budget = L._attn_transient_budget(x.device)
@@ -225,9 +229,13 @@ class HybridAttentionRoPE(L.HybridAttention):
             logits = torch.einsum('bnhd,bmhd->bhnm', q[:, s:e], k)
             logits.mul_(scale)
             logits.add_(_mask_c)
-            lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
-            attn = logits.sub(lse).exp_()
-            del logits, lse
+            if sink_view is not None:
+                lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
+                attn = logits.sub(lse).exp_()
+                del lse
+            else:
+                attn = torch.softmax(logits, -1)
+            del logits
             out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
 

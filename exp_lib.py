@@ -1645,6 +1645,16 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     # inputs to produce the same bits as the un-narrowed implementation, so the
     # score/soft path stays full width; top-k selection goes through the
     # stable top-k in `_rank_blocks`.
+    if n == 0:
+        # Empty sequence: no rows to select for.  Return the same shapes the
+        # non-empty path would (including a valid-cols flag when requested)
+        # instead of letting the gather/concatenate tail fail on an empty list.
+        idx = torch.empty(0, _kw, device=dev, dtype=torch.int32)
+        soft = torch.empty(0, _kw, device=dev, dtype=H.dtype) if need_soft else None
+        if out_valid is not None:
+            out_valid[:] = [torch.zeros(0, _kw, device=dev, dtype=torch.bool)]
+        m = torch.zeros(0, B, device=dev, dtype=H.dtype) if return_mask else None
+        return (m, idx, soft)
     idx = torch.empty(n, _kw, device=dev, dtype=torch.int32)
     soft = None
     if out_valid is None and return_mask:
@@ -2123,7 +2133,15 @@ class HybridAttention(nn.Module):
             scale = 1.0
         else:
             scale = 1.0 / math.sqrt(self.hd)
-        if self.sink is None:
+        # A full [T, T] mask is cached for ordinary lengths; beyond the row
+        # cap each row chunk builds exactly its own slice on demand, so the
+        # T^2 resident table never exists.  The slice values are identical.
+        _use_full_mask = T * T * 4 <= _DENSE_MASK_ROW_CAP_BYTES
+        # SDPA needs the whole additive mask for a sliding window, so a long
+        # context would materialise T^2 bytes there too.  Keep the fused SDPA
+        # path only while the mask fits the same row cap; otherwise take the
+        # chunked manual path below (sink-free chunks are supported).
+        if self.sink is None and (self.cfg.window <= 0 or _use_full_mask):
             sdpa_kw = dict(scale=scale)
             if self.cfg.window > 0:
                 sdpa_kw['attn_mask'] = causal_window_mask_f(T, self.cfg.window, x.device, q.dtype)
@@ -2131,10 +2149,6 @@ class HybridAttention(nn.Module):
                 sdpa_kw['is_causal'] = True
             out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
             return self.W_o(out.reshape(B, T, self.nh * self.hd))
-        # A full [T, T] mask is cached for ordinary lengths; beyond the row
-        # cap each row chunk builds exactly its own slice on demand, so the
-        # T^2 resident table never exists.  The slice values are identical.
-        _use_full_mask = T * T * 4 <= _DENSE_MASK_ROW_CAP_BYTES
         if _use_full_mask:
             if self.cfg.window > 0:
                 mask = causal_window_mask(T, self.cfg.window, x.device)
@@ -4438,9 +4452,11 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
     if not usable:
         return 'unverified'
     powered = [e for e in usable if int(e.get('n') or 0) >= int(min_n)]
+    # The n floor is a precondition for every positive verdict: a liberal
+    # alpha cannot turn an underpowered contrast into a 'verified' one.
     if not powered:
         return 'underpowered'
-    if any(e.get('significant_global') for e in usable):
+    if any(e.get('significant_global') for e in powered):
         return 'verified'
     noise_free = [e for e in powered if not e.get('within_seed_noise')]
     if not noise_free:
