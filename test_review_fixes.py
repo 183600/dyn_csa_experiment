@@ -1107,6 +1107,138 @@ def t_baseline_tuning_audit():
 
 
 
+# ---------------------------------------------------------------------------
+# I. leakage-safe data splitting / preprocessing
+# ---------------------------------------------------------------------------
+
+def t_leakage_safe_split_contract():
+    idx = L.chronological_split_indices(100, 0.7, 0.2, 0.1)
+    assert [len(idx[k]) for k in ('train', 'val', 'test')] == [70, 20, 10], idx
+    assert idx['train'][0] == 0 and idx['train'][-1] == 69
+    assert idx['val'][0] == 70 and idx['test'][-1] == 99
+    assert L.assert_no_split_leakage(idx['train'], idx['val'], idx['test']) is True
+    # The split is contiguous in input order: no row from a later block can
+    # appear in an earlier one.
+    assert all(np.all(np.diff(idx[k]) == 1) for k in ('train', 'val', 'test'))
+    # A shuffled time split must be rejected even when the row indices are
+    # disjoint.
+    t = np.arange(100)
+    try:
+        L.assert_no_split_leakage(np.array([0, 2]), np.array([1]), np.array([3]), time=t)
+    except ValueError as e:
+        assert 'temporal leakage' in str(e)
+    else:
+        raise AssertionError('future rows in the training split must be rejected')
+    # Reordering by an explicit time column keeps the chronology.
+    order = np.array([5, 0, 3, 1, 6, 2, 4])
+    ti = L.split_indices(7, time=order, train_frac=4 / 7, val_frac=2 / 7, test_frac=1 / 7)
+    assert np.max(order[ti['train']]) <= np.min(order[ti['val']])
+    assert np.max(order[ti['val']]) <= np.min(order[ti['test']])
+    L.assert_no_split_leakage(ti['train'], ti['val'], ti['test'], time=order)
+
+
+def t_group_split_contract():
+    groups = np.repeat(np.arange(30), 2)
+    idx = L.grouped_chronological_split_indices(60, groups, 0.6, 0.2, 0.2)
+    L.assert_no_split_leakage(idx['train'], idx['val'], idx['test'], groups=groups)
+    gsets = {k: {groups[i] for i in idx[k]} for k in ('train', 'val', 'test')}
+    assert not (gsets['train'] & gsets['val'])
+    assert not (gsets['train'] & gsets['test'])
+    assert not (gsets['val'] & gsets['test'])
+    assert max(gsets['train']) < min(gsets['val']) < min(gsets['test'])
+    # A deliberately shuffled group order is still assigned whole.
+    shuffled = np.roll(groups, 7)
+    idx2 = L.split_indices(60, groups=shuffled, train_frac=0.6, val_frac=0.2, test_frac=0.2)
+    g2 = {k: {shuffled[i] for i in idx2[k]} for k in ('train', 'val', 'test')}
+    assert not (g2['train'] & g2['val']) and not (g2['train'] & g2['test']) and not (g2['val'] & g2['test'])
+
+
+def t_preprocessor_train_only():
+    tr = np.array([[0.0, 10.0], [2.0, 10.0], [np.nan, 10.0], [1.0, 10.0]])
+    va = np.array([[1000.0, 10.0], [np.inf, 10.0]])
+    prep = L.LeakageSafePreprocessor(scale='standard', clip_quantiles=None,
+                                     missing='mean')
+    xtr = prep.fit_transform(tr)
+    xva = prep.transform(va)
+    assert np.all(np.isfinite(xtr)) and np.all(np.isfinite(xva))
+    st = prep.get_stats()
+    assert abs(st['features'][0]['center'] - 1.0) < 1e-12, st
+    # The holdout did not influence the statistics: fitting on train+holdout
+    # would move the center by >100x, so a leak cannot hide.
+    prep_all = L.LeakageSafePreprocessor(scale='standard', clip_quantiles=None,
+                                         missing='mean').fit(np.vstack([tr, va]))
+    assert abs(prep_all.get_stats()['features'][0]['center'] - 1.0) > 100
+    before = prep.get_stats()
+    prep.transform(va)
+    assert prep.get_stats() == before, 'transform must never update statistics'
+    # Constant features stay finite (factor 1), and a saved/restored model is
+    # numerically identical.
+    assert np.all(np.isfinite(prep.transform(np.array([[np.nan, np.nan]]))))
+    restored = L.LeakageSafePreprocessor.from_stats(before)
+    assert np.allclose(restored.transform(va), xva, equal_nan=True)
+    # A preprocessor cannot be used before fitting or with the wrong width.
+    try:
+        L.LeakageSafePreprocessor().transform(tr)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('transform before fit must fail')
+    try:
+        prep.transform(np.zeros((2, 3)))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('feature-width mismatch must fail')
+
+
+def t_data_quality_report():
+    X = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 0.0], [2.0, 1.0]])
+    rep = L.data_quality_report(X, y=[0, 1, 1, 0],
+                                train_idx=[0, 1], val_idx=[2], test_idx=[3])
+    assert rep['status'] == 'fail', rep
+    assert rep['checks']['duplicate_rows_across_splits']['train__val'] == 1
+    assert rep['checks']['label_conflicts_on_duplicate_rows'] == 1
+    Y = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]])
+    rep2 = L.data_quality_report(Y, train_idx=[0], val_idx=[1], test_idx=[2, 3])
+    assert rep2['status'] == 'warnings', rep2
+    assert rep2['checks']['nan_count'] + rep2['checks']['inf_count'] == 0
+    Xn = Y.copy()
+    Xn[2, 0] = np.nan
+    Xn[3, 0] = np.inf
+    rep3 = L.data_quality_report(Xn, train_idx=[0], val_idx=[1], test_idx=[2, 3])
+    assert rep3['checks']['nan_count'] == 1 and rep3['checks']['inf_count'] == 1
+    # Group boundaries are part of the report, not a matter of trust.
+    rep4 = L.data_quality_report(Y, groups=np.array(['a', 'a', 'b', 'c']),
+                                 train_idx=[0], val_idx=[1], test_idx=[2, 3])
+    assert rep4['checks']['group_overlap']['train__val'] == 1
+    assert rep4['status'] == 'fail'
+
+
+def t_categorical_and_cache_guards():
+    same = L.categorical_shift_report([1, 2, 2, 3], [1, 2, 2, 3])
+    assert same['js_divergence'] < 1e-12 and same['total_variation'] < 1e-12
+    shifted = L.categorical_shift_report([1, 1, 1, 1], [9, 9, 9, 9])
+    assert shifted['js_divergence'] > 0.5 and shifted['unseen_rate'] == 1.0
+    # The cache-hit guard must reject a validation file whose content no
+    # longer matches the recorded fingerprint.
+    tr = np.arange(32, dtype=np.int64) % 11
+    va = np.arange(16, dtype=np.int64).reshape(2, 8) % 11
+    meta = {'src_fp': L._ids_fp(tr), 'val_fp': L._ids_fp(va.reshape(-1)),
+            'vocab': 11, 'split_strategy': 'official_train_validation_test',
+            'shuffle_at_split': False, 'tokenizer_fit_split': 'train'}
+    assert L._cached_split_problems(meta, tr, va, np.zeros_like(va, dtype=bool), 11, seq_len=8) == []
+    bad = dict(meta, val_fp='not-the-validation-fingerprint')
+    assert any('validation id fingerprint' in p for p in
+               L._cached_split_problems(bad, tr, va, np.zeros_like(va, dtype=bool), 11, seq_len=8))
+    bad2 = dict(meta, shuffle_at_split=True)
+    assert any('shuffled split' in p for p in
+               L._cached_split_problems(bad2, tr, va, np.zeros_like(va, dtype=bool), 11, seq_len=8))
+    bad3 = dict(meta, tokenizer_fit_split='test')
+    assert any('tokenizer' in p for p in
+               L._cached_split_problems(bad3, tr, va, np.zeros_like(va, dtype=bool), 11, seq_len=8))
+
+
+
 
 def main():
     if not _HAVE_TORCH:
@@ -1169,6 +1301,11 @@ def main():
     _check('H1 hypothesis direction conflict', t_hypothesis_direction_conflict)
     _check('H2 metric policy + macro/micro/weighted F1 + PR/ROC-AUC', t_metric_policy_and_classification_metrics)
     _check('H3 equal-budget baseline tuning audit', t_baseline_tuning_audit)
+    _check('I1 chronological split contract', t_leakage_safe_split_contract)
+    _check('I2 whole-group split contract', t_group_split_contract)
+    _check('I3 preprocessing fitted on train only', t_preprocessor_train_only)
+    _check('I4 data-quality/leakage report', t_data_quality_report)
+    _check('I5 categorical shift + cache guards', t_categorical_and_cache_guards)
     fails = [r for r in _results if r[1] != 'PASS']
     print(f'\n[test] {len(_results) - len(fails)}/{len(_results)} passed')
     return 1 if fails else 0

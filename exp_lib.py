@@ -37,6 +37,18 @@ import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, 
 from math import comb
 from dataclasses import dataclass
 import numpy as np
+# Leakage-safe split/preprocessing contract (dependency-free NumPy module).
+# Re-exported here so every driver can use the same implementation:
+#   chronological_split / split_indices / grouped_chronological_split,
+#   assert_no_split_leakage, LeakageSafePreprocessor (SafeScaler),
+#   prepare_features, data_quality_report, categorical_shift_report.
+from data_guard import (
+    chronological_split, chronological_split_indices,
+    grouped_chronological_split, grouped_chronological_split_indices,
+    split_indices, train_val_test_split, assert_no_split_leakage,
+    LeakageSafePreprocessor, SafeScaler, prepare_features, fit_preprocessor,
+    data_quality_report, categorical_shift_report, duplicate_mask,
+)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -3038,6 +3050,71 @@ def _ids_fp(train_ids):
         _IDS_FP_MEMO[_key] = (train_ids, _fp)
     return _fp
 
+def _validate_token_ids(ids, vocab, label='token ids'):
+    """Hard range check for a token-id array before it enters a cache/batch.
+
+    A negative or out-of-vocabulary id would either index an embedding row
+    outside the model (Python/NumPy wraparound) or silently mask corruption in
+    the split.  This is cheap relative to tokenisation and runs on every cold
+    build and every cache hit.
+    """
+    arr = np.asarray(ids)
+    if arr.size == 0:
+        return arr
+    if not np.issubdtype(arr.dtype, np.integer):
+        raise TypeError(f'{label}: expected integer token ids, got dtype {arr.dtype}')
+    mn, mx = int(arr.min()), int(arr.max())
+    if mn < 0 or mx >= int(vocab):
+        raise ValueError(f'{label}: token id range [{mn}, {mx}] is outside vocab [0, {int(vocab)})')
+    return arr
+
+
+def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=None):
+    """Reasons a cached (train, val) pair cannot be trusted.
+
+    The metadata carries content fingerprints for BOTH sides.  Checking only
+    the train fingerprint lets a stale/mixed validation file be served under a
+    valid train cache — exactly the situation in which validation (or test)
+    rows leak into the tuning split.  New caches always record ``val_fp``;
+    legacy caches without it are accepted with an explicit warning so existing
+    results remain reproducible, but their validation bytes are not silently
+    blessed as verified.
+    """
+    problems = []
+    try:
+        vocab = int(vocab)
+    except (TypeError, ValueError):
+        return ['metadata has no usable vocab size']
+    if meta.get('src_fp') != _ids_fp(train_ids):
+        problems.append('train id fingerprint does not match the meta file')
+    vb = np.asarray(val_batch)
+    if vb.ndim != 2:
+        problems.append(f'validation batch is not 2-D (shape {vb.shape})')
+    elif vb.shape[0] == 0:
+        problems.append('validation batch is empty')
+    elif seq_len is not None and vb.shape[1] != int(seq_len):
+        problems.append(f'validation sequence length {vb.shape[1]} != requested {seq_len}')
+    if np.asarray(val_bnd).shape != vb.shape:
+        problems.append(f'validation boundary mask shape {np.asarray(val_bnd).shape} != {vb.shape}')
+    if 'val_fp' in meta and meta.get('val_fp') != _ids_fp(vb.reshape(-1)):
+        problems.append('validation id fingerprint does not match the meta file')
+    if meta.get('shuffle_at_split') is True:
+        problems.append('metadata records a shuffled split; time/group order cannot be trusted')
+    if meta.get('tokenizer_fit_split') not in (None, 'train'):
+        problems.append(f"tokenizer was fitted on {meta.get('tokenizer_fit_split')!r}, not train")
+    if not problems:
+        for _arr, _label in ((train_ids, 'cached train_ids'), (vb, 'cached val_batch')):
+            try:
+                _validate_token_ids(_arr, vocab, _label)
+            except (TypeError, ValueError) as _e:
+                problems.append(str(_e))
+    return problems
+
+
+def _cache_warning(what, problems):
+    print(f'[data] WARNING: the cached {what} cannot be verified ({"; ".join(problems)}) — REBUILDING it so a mixed/stale split is never silently served')
+
+
 _WT103_MEMO = {}
 _WT103_MEMO_CAP = 4
 
@@ -3066,12 +3143,16 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         print('[data] loading cached token ids ...')
         train_ids = np.load(tr_path)
         meta = json.load(open(me_path, encoding='utf-8'))
-        if meta.get('src_fp') != _ids_fp(train_ids):
-            print('[data] WARNING: the cached train_ids do not match the fingerprint in the meta file — the cache is corrupt or was mixed across builds; REBUILDING it')
+        val_batch = np.load(va_path)
+        val_bnd = np.load(vp_path)
+        _problems = _cached_split_problems(meta, train_ids, val_batch, val_bnd,
+                                           meta.get('vocab'), seq_len=seq_len)
+        if _problems:
+            _cache_warning('WikiText train/validation split', _problems)
         else:
-            val_batch = np.load(va_path)
-            val_bnd = np.load(vp_path)
-            _out = (train_ids, val_batch, meta['vocab'], None, val_bnd)
+            if 'val_fp' not in meta:
+                print('[data] NOTE: this is a legacy cache without a validation fingerprint; its file bytes are range/shape-checked but its split membership cannot be independently re-derived. New caches record val_fp.')
+            _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
             if len(_WT103_MEMO) >= _WT103_MEMO_CAP:
                 _WT103_MEMO.pop(next(iter(_WT103_MEMO)))
             _WT103_MEMO[_mkey] = _out
@@ -3143,6 +3224,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     val_ids = stream_tokenise('validation', val_seqs * seq_len + seq_len, 'val')
     n_val = min(len(val_ids) // seq_len, val_seqs)
     val_batch = val_ids[:n_val * seq_len].reshape(n_val, seq_len)
+    _validate_token_ids(train_ids, vocab, 'wikitext train_ids')
+    _validate_token_ids(val_batch, vocab, 'wikitext val_batch')
     print(f'[data] val sequences = {n_val} (seq_len={seq_len})')
     bnd_ids = sorted(boundary_token_ids(tok, eos_id))
     val_bnd = np.isin(val_batch, bnd_ids)
@@ -3159,7 +3242,18 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             except OSError:
                 pass
             raise
-    atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids), 'fit_fp': fit_fp}, indent=0)
+    atomic_write_json(me_path, {
+        'vocab': vocab,
+        'src_fp': _ids_fp(train_ids),
+        'val_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
+        'fit_fp': fit_fp,
+        'split_strategy': 'official_train_validation_test',
+        'shuffle_at_split': False,
+        'tokenizer_fit_split': 'train',
+        'train_tokens': int(len(train_ids)),
+        'val_sequences': int(val_batch.shape[0]),
+        'seq_len': int(seq_len),
+    }, indent=0)
     try:
         # persist the exact tokenizer that produced this cache so the held-out
         # test split can be verified against it by full vocab identity (size
@@ -3241,10 +3335,42 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
         print('[data] loading cached TEST token ids ...')
         test_ids = np.load(te_path)
         meta = json.load(open(me_path, encoding='utf-8'))
+        test_bnd = np.load(tb_path)
+        _problems = []
         if meta.get('src_fp') != _ids_fp(test_ids):
-            print('[data] WARNING: the cached test_ids do not match the fingerprint in the test meta file — the cache is corrupt or was mixed across builds; REBUILDING it')
+            _problems.append('test id fingerprint does not match the test meta file')
+        if np.asarray(test_bnd).shape != np.asarray(test_ids).shape:
+            _problems.append(f'test boundary mask shape {np.asarray(test_bnd).shape} != {np.asarray(test_ids).shape}')
+        if meta.get('shuffle_at_split') is True:
+            _problems.append('metadata records a shuffled split')
+        if meta.get('tokenizer_fit_split') not in (None, 'train'):
+            _problems.append(f"tokenizer was fitted on {meta.get('tokenizer_fit_split')!r}, not train")
+        # A cached test set is only pairable if its tokenizer was fitted on the
+        # SAME train prefix as the train/validation cache.  Verifying this on
+        # the cold path is not enough: a swapped test cache would otherwise
+        # serve a tokenizer that saw test text.
+        _train_fit_fps = set()
+        import glob as _glob2
+        for _mp in _glob2.glob(os.path.join(cache_dir, 'meta_v4_*.json')):
+            try:
+                _mt = json.load(open(_mp, encoding='utf-8'))
+            except Exception:
+                continue
+            if _mt.get('fit_fp'):
+                _train_fit_fps.add(_mt['fit_fp'])
+        if _train_fit_fps and meta.get('fit_fp') not in _train_fit_fps:
+            raise RuntimeError(
+                'load_wikitest: the cached test split was tokenised with a fit '
+                f"corpus fingerprint {meta.get('fit_fp')!r} that is absent from "
+                'the train cache metas — this test cache cannot be paired with '
+                'the current train/validation split; delete the test cache and '
+                'rebuild it from the same train tokenizer')
+        if meta.get('fit_fp') and not _train_fit_fps:
+            print('[data] NOTE: no train-cache meta found; the cached TEST fit provenance cannot be cross-checked locally')
+        if _problems:
+            _cache_warning('WikiText test split', _problems)
         else:
-            test_bnd = np.load(tb_path)
+            _validate_token_ids(test_ids, meta['vocab'], 'cached test_ids')
             out = (test_ids, meta['vocab'], None, test_bnd)
             if len(_WT103_TEST_MEMO) >= _WT103_TEST_MEMO_CAP:
                 _WT103_TEST_MEMO.pop(next(iter(_WT103_TEST_MEMO)))
@@ -3332,6 +3458,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
     if n_have < n_seqs:
         print(f'[data] WARNING: test split yields only {n_have} full rows (< {n_seqs} requested) — the final-test evaluation runs on {n_have} rows')
     test_batch = ids[:n_have * seq_len].reshape(n_have, seq_len)
+    _validate_token_ids(test_batch, vocab, 'wikitext test_batch')
     print(f'[data] TEST rows = {n_have} (seq_len={seq_len}, vocab={vocab})')
     bnd_ids = sorted(boundary_token_ids(tok, eos_id))
     test_bnd = np.isin(test_batch, bnd_ids)
@@ -3347,7 +3474,16 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
             except OSError:
                 pass
             raise
-    atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(test_batch), 'fit_fp': _text_fp(train_fit_rows)}, indent=0)
+    atomic_write_json(me_path, {
+        'vocab': vocab,
+        'src_fp': _ids_fp(test_batch),
+        'fit_fp': _text_fp(train_fit_rows),
+        'split_strategy': 'official_dataset_test_split',
+        'shuffle_at_split': False,
+        'tokenizer_fit_split': 'train',
+        'test_sequences': int(test_batch.shape[0]),
+        'seq_len': int(seq_len),
+    }, indent=0)
     try:
         tok.save(tk_path)
     except Exception as _e:
@@ -3371,8 +3507,12 @@ def _disk_ids_chunk(buf, disk_dt, vocab):
     # can never fire (and an out-of-range id would already have wrapped on
     # numpy builds that silently overflow).  `_fineweb_disk_dtype` returns
     # uint16 only for vocab <= 65536, so this is a defensive guard.
-    if disk_dt is np.uint16 and buf and max(buf) > 65535:
-        raise ValueError(f'token id {max(buf)} exceeds the uint16 cache range (vocab={vocab}) — widen _fineweb_disk_dtype before rebuilding')
+    if buf:
+        _mn, _mx = min(buf), max(buf)
+        if _mn < 0 or _mx >= int(vocab):
+            raise ValueError(f'token id range [{_mn}, {_mx}] is outside vocab [0, {int(vocab)}) — refusing to cache a corrupted corpus')
+        if disk_dt is np.uint16 and _mx > 65535:
+            raise ValueError(f'token id {_mx} exceeds the uint16 cache range (vocab={vocab}) — widen _fineweb_disk_dtype before rebuilding')
     return np.array(buf, dtype=disk_dt)
 
 def _npy_serve_int32(path):
@@ -3537,11 +3677,18 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         else:
             val_batch = np.load(va_path).astype(np.int64)
             val_bnd = np.load(vp_path)
-            _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
-            if len(_FWEB_MEMO) >= _FWEB_MEMO_CAP:
-                _FWEB_MEMO.pop(next(iter(_FWEB_MEMO)))
-            _FWEB_MEMO[_mkey] = _out
-            return _out
+            _problems = _cached_split_problems(meta, train_ids, val_batch, val_bnd,
+                                               meta.get('vocab'), seq_len=seq_len)
+            if _problems:
+                _cache_warning('FineWeb train/validation split', _problems)
+            else:
+                if 'val_fp' not in meta:
+                    print('[data] NOTE: this is a legacy FineWeb cache without a validation fingerprint; shape/range checks passed but split membership cannot be independently re-derived. New caches record val_fp.')
+                _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
+                if len(_FWEB_MEMO) >= _FWEB_MEMO_CAP:
+                    _FWEB_MEMO.pop(next(iter(_FWEB_MEMO)))
+                _FWEB_MEMO[_mkey] = _out
+                return _out
     rows = _fineweb_rows(source)
     fit_text = []
     for _i, doc in enumerate(rows):
@@ -3664,6 +3811,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         _finalise_npy(raw_train, tr_path, n_train)
         val_disk = np.fromfile(raw_val, dtype=disk_dt, count=n_val * seq_len)
         val_batch = val_disk.astype(np.int64).reshape(n_val, seq_len)
+        _validate_token_ids(val_batch, vocab, 'fineweb val_batch')
         bnd_ids = sorted(boundary_token_ids(tok, eos_id))
         val_bnd = np.isin(val_batch, bnd_ids)
         print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
@@ -3680,7 +3828,25 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                     pass
                 raise
         train_ids = _npy_serve_int32(tr_path)
-        atomic_write_json(me_path, {'vocab': vocab, 'src_fp': _ids_fp(train_ids), 'local_source_sig': _local_sig, 'source': source, 'fit_docs': fit_docs, 'disk_dtype': np.dtype(disk_dt).str, 'seq_len': int(seq_len), 'n_train_tokens': int(n_train_tokens), 'n_train_actual': int(n_train), 'val_seqs': int(val_seqs)}, indent=0)
+        _validate_token_ids(train_ids, vocab, 'fineweb train_ids')
+        atomic_write_json(me_path, {
+            'vocab': vocab,
+            'src_fp': _ids_fp(train_ids),
+            'val_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
+            'local_source_sig': _local_sig,
+            'source': source,
+            'fit_docs': fit_docs,
+            'disk_dtype': np.dtype(disk_dt).str,
+            'seq_len': int(seq_len),
+            'n_train_tokens': int(n_train_tokens),
+            'n_train_actual': int(n_train),
+            'val_seqs': int(val_seqs),
+            'val_sequences': int(val_batch.shape[0]),
+            'split_strategy': 'chronological_document_disjoint',
+            'split_order': ['tokenizer_fit', 'train', 'validation'],
+            'shuffle_at_split': False,
+            'tokenizer_fit_split': 'train',
+        }, indent=0)
         print('[data] cached fineweb token ids to disk (resume-safe)')
         _out = (train_ids, val_batch, vocab, tok, val_bnd)
         if len(_FWEB_MEMO) >= _FWEB_MEMO_CAP:

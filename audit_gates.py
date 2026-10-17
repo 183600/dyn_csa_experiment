@@ -9,6 +9,8 @@
 子命令（python audit_gates.py <cmd>）：
   leakage      数据泄漏：分词器拟合源（train-only）、train/test 词表一致性、
                缓存指纹自洽、train/test 文档重叠率（n-gram/shingle）
+  split        划分纪律：元数据声明的时序/非打乱/群组构造、跨 split 完全
+               重复行、train/holdout 词分布偏移（Jensen-Shannon）
   causality    自回归正确性：纯 CPU 微型模型上的前缀不变性、标签移位、
                池化/选择器因果性、逐 token 解码 vs 整段前向一致性
   attribution  动态/固定分块归因：从落盘 summary 重算每臂块数、压缩率、
@@ -154,6 +156,191 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
             out['checks']['doc_overlap'] = 'npy caches absent'
     except Exception as e:
         out['checks']['doc_overlap'] = f'failed ({type(e).__name__}: {e})'
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 1b) split discipline：划分顺序 / 群组完整性 / 重复行 / 分布偏移
+# ---------------------------------------------------------------------------
+
+def _sample_tokens(arr, cap=1000000, seed=0):
+    """Deterministic sample of a token array (for distribution comparisons)."""
+    import numpy as np
+    a = np.asarray(arr).reshape(-1)
+    if a.size <= cap:
+        return a
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(a.size, size=int(cap), replace=False)
+    idx.sort()
+    return a[idx]
+
+
+def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
+                           js_fail=0.25, min_shift_tokens=5000):
+    """Audit the *split contract* for every cached corpus on disk.
+
+    Unlike ``audit_leakage`` (tokenizer provenance and document overlap), this
+    gate checks the split itself:
+
+      * the metadata declares an ordered/non-shuffled split and a train-only
+        tokenizer fit;
+      * validation and test contain no exact row duplicated from train;
+      * no group/document spans two sides (for FineWeb, document-disjoint
+        chronological construction is recorded and the cache metadata keeps
+        the validation fingerprint);
+      * train vs holdout token distributions are compared with Jensen-Shannon
+        divergence (a shift is reported explicitly rather than silently
+        assumed away).
+
+    Exact duplicate rows across splits are a hard failure.  Distribution or
+    legacy-metadata issues are warnings because they need a scientific
+    judgement, not an automatic rebuild.
+    """
+    import glob
+    import numpy as np
+    sys.path.insert(0, REPO)
+    import data_guard as DG
+
+    if cache_dirs is None:
+        cache_dirs = [os.path.join(REPO, 'wt103_cache'),
+                      os.path.join(REPO, 'fineweb_cache')]
+    out = {'status': 'ok', 'caches': {}, 'warnings': []}
+
+    def _fail(msg):
+        out['warnings'].append(msg)
+        out['status'] = 'fail'
+
+    def _warn(msg):
+        out['warnings'].append(msg)
+        if out['status'] == 'ok':
+            out['status'] = 'warnings'
+
+    for cd in cache_dirs:
+        if not os.path.isdir(cd):
+            continue
+        cache = {'status': 'ok', 'corpora': {}}
+        out['caches'][os.path.abspath(cd)] = cache
+        for mp in sorted(glob.glob(os.path.join(cd, 'meta_*.json'))):
+            if os.path.basename(mp).startswith('test_meta_'):
+                continue
+            meta = _load(mp)
+            if not isinstance(meta, dict):
+                continue
+            tag = os.path.basename(mp)[len('meta_'):-len('.json')]
+            trp = os.path.join(cd, f'train_ids_{tag}.npy')
+            vap = os.path.join(cd, f'val_batch_{tag}.npy')
+            if not (os.path.exists(trp) and os.path.exists(vap)):
+                continue
+            rec = {'status': 'ok', 'meta': os.path.basename(mp)}
+            try:
+                tr = np.load(trp, mmap_mode='r')
+                va = np.load(vap, mmap_mode='r')
+            except Exception as e:
+                rec['status'] = 'fail'
+                rec['error'] = f'{type(e).__name__}: {e}'
+                _fail(f'{cd}/{tag}: cache unreadable ({rec["error"]})')
+                cache['corpora'][tag] = rec
+                continue
+            rec['train_shape'] = list(tr.shape)
+            rec['val_shape'] = list(va.shape)
+            rec['declared_split_strategy'] = meta.get('split_strategy') or 'legacy_unrecorded'
+            rec['shuffle_at_split'] = meta.get('shuffle_at_split')
+            rec['tokenizer_fit_split'] = meta.get('tokenizer_fit_split')
+            rec['val_fingerprint_recorded'] = bool(meta.get('val_fp'))
+            if meta.get('shuffle_at_split') is True:
+                rec['status'] = 'fail'
+                _fail(f'{cd}/{tag}: metadata declares a shuffled split')
+            if meta.get('tokenizer_fit_split') not in (None, 'train'):
+                rec['status'] = 'fail'
+                _fail(f'{cd}/{tag}: tokenizer fit split is {meta.get("tokenizer_fit_split")!r}, not train')
+            if meta.get('split_strategy') is None:
+                _warn(f'{cd}/{tag}: legacy cache has no split_strategy/tokenizer provenance metadata; rebuild it to make the split auditable')
+
+            # Exact duplicate rows across train/val/test.  This is row-level
+            # leakage regardless of how the split was generated.
+            tr_rows = tr[:min(int(tr.shape[0]), int(max_rows))]
+            tr_keys = set(DG._row_keys(tr_rows))
+            val_keys = DG._row_keys(va)
+            shared_val = len(set(val_keys) & tr_keys)
+            rec['exact_row_overlap_train_val'] = int(shared_val)
+            if shared_val:
+                rec['status'] = 'fail'
+                _fail(f'{cd}/{tag}: {shared_val} validation rows exactly duplicate a training row')
+            # The test cache filename carries its own seq_len/vocab/ns tag;
+            # match on the sequence length recorded in the train meta rather
+            # than guessing one file.
+            test_files = sorted(glob.glob(os.path.join(cd, 'test_ids_*.npy')))
+            te = None
+            for tf in test_files:
+                try:
+                    cand = np.load(tf, mmap_mode='r')
+                except Exception:
+                    continue
+                if meta.get('seq_len') is not None and cand.shape[1] != int(meta['seq_len']):
+                    continue
+                te = cand
+                rec['test_file'] = os.path.basename(tf)
+                break
+            if te is not None:
+                rec['test_shape'] = list(te.shape)
+                test_keys = DG._row_keys(te)
+                shared_test = len(set(test_keys) & tr_keys)
+                shared_val_test = len(set(test_keys) & set(val_keys))
+                rec['exact_row_overlap_train_test'] = int(shared_test)
+                rec['exact_row_overlap_val_test'] = int(shared_val_test)
+                if shared_test:
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: {shared_test} test rows exactly duplicate a training row')
+                if shared_val_test:
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: {shared_val_test} test rows exactly duplicate a validation row')
+            else:
+                rec['test_file'] = None
+
+            # Token-distribution shift: compare holdout marginals with the
+            # training reference (never the other way round).
+            tr_tok = _sample_tokens(tr, cap=1000000, seed=0)
+            va_tok = _sample_tokens(va, cap=1000000, seed=1)
+            rec['train_val_shift'] = DG.categorical_shift_report(tr_tok, va_tok)
+            # A handful of holdout tokens cannot estimate a distribution; mark
+            # the reading as unreliable instead of emitting a huge JS value.
+            rec['train_val_shift']['reliable'] = bool(
+                tr_tok.size >= int(min_shift_tokens) and
+                va_tok.size >= int(min_shift_tokens))
+            jsv = rec['train_val_shift']['js_divergence']
+            if rec['train_val_shift']['reliable']:
+                if jsv >= float(js_fail):
+                    _warn(f'{cd}/{tag}: train/val token JS divergence {jsv:.3f} >= {js_fail} — material distribution shift')
+                elif jsv >= float(js_warn):
+                    _warn(f'{cd}/{tag}: train/val token JS divergence {jsv:.3f} >= {js_warn}')
+            else:
+                _warn(f'{cd}/{tag}: train/val distribution shift not estimable from {va_tok.size} holdout tokens (need >= {min_shift_tokens})')
+            if te is not None:
+                te_tok = _sample_tokens(te, cap=1000000, seed=2)
+                rec['train_test_shift'] = DG.categorical_shift_report(tr_tok, te_tok)
+                rec['train_test_shift']['reliable'] = bool(
+                    tr_tok.size >= int(min_shift_tokens) and
+                    te_tok.size >= int(min_shift_tokens))
+                jst = rec['train_test_shift']['js_divergence']
+                if rec['train_test_shift']['reliable']:
+                    if jst >= float(js_fail):
+                        _warn(f'{cd}/{tag}: train/test token JS divergence {jst:.3f} >= {js_fail} — material distribution shift')
+                    elif jst >= float(js_warn):
+                        _warn(f'{cd}/{tag}: train/test token JS divergence {jst:.3f} >= {js_warn}')
+                else:
+                    _warn(f'{cd}/{tag}: train/test distribution shift not estimable from {te_tok.size} test tokens (need >= {min_shift_tokens})')
+            cache['corpora'][tag] = rec
+            if rec['status'] == 'fail':
+                cache['status'] = 'fail'
+                out['status'] = 'fail'
+            elif out['status'] == 'ok' and rec['status'] == 'warnings':
+                cache['status'] = 'warnings'
+                out['status'] = 'warnings'
+        if not cache['corpora']:
+            cache['status'] = 'not_verifiable_locally'
+    if not out['caches']:
+        out['status'] = 'not_verifiable_locally'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -616,7 +803,7 @@ def audit_efficiency_demo():
 # ---------------------------------------------------------------------------
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'failures': audit_failures(), 'budget': audit_budget()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'failures': audit_failures(), 'budget': audit_budget()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -630,7 +817,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
