@@ -736,6 +736,7 @@ PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
 def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None):
     L.set_seed(seed)
+    _rng_fp = L.rng_fingerprint()
     L._attb_bump_epoch()
     if variant in set(L.PARAM_MATCHED) | set(PARAM_MATCHED_V7) and float(mlp_ratio) == 4.0:
         raise ValueError(f'{variant} is a PARAM-MATCHED baseline but was given the default mlp_ratio=4; its MLP must be widened to match its sparse reference arm, or the comparison is not parameter-controlled. Pass mlp_ratio=L.variant_mlp_ratio(...).')
@@ -846,7 +847,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': L.training_knobs()}
+    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': L.training_knobs(), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids)}
     del model, opt, bpe, decay, ndecay, dpar
     gc.collect()
     if device.type == 'cuda':
@@ -913,6 +914,8 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
             out['status'] = 'skipped_cap'
             return out
     t_run = time.time()
+    _run_id = L.new_experiment_id('warm')
+    _started_at = time.strftime('%Y-%m-%dT%H:%M:%S')
     _deadline = None
     if guard is not None:
         _deadline = guard.deadline_ts()
@@ -925,6 +928,9 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
     try:
         try:
             rec = train_warmup(v, train_ids, val_batch, vocab, seed=seed, warm_steps=warm, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=_deadline)
+            _prov = L.experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
+            _hp = L.run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v])
+            _hp['warm_steps'] = int(warm)
 
             def _apply(summary):
                 if rec.get('cap_truncated'):
@@ -935,10 +941,21 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
                     summary[key] = rec
                     summary[key]['_code'] = CKPT_CODE
                     summary[key]['run_cfg'] = fp
+                    summary[key]['provenance'] = _prov
+                    summary[key]['hyperparams'] = _hp
+                    summary[key]['run_id'] = _run_id
+                    summary[key]['started_at'] = _started_at
+                    summary[key]['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+                    if os.path.exists(os.path.join(outdir, 'overfit_sanity.json')):
+                        summary[key]['sanity_ref'] = 'overfit_sanity.json'
                 return summary
             L.locked_json_update(spath, _apply)
             if out.get('truncated'):
                 out['status'] = 'truncated'
+                L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _run_id, 'status': 'truncated', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'key': key, 'variant': v, 'seed': int(seed), 'warm_steps': int(warm), 'run_cfg': fp, 'code': CKPT_CODE, 'reason': 'hard runtime cap reached; partial record not written'})
+            elif isinstance(rec, dict) and not rec.get('cap_truncated'):
+                _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
+                L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - t_run, 'key': key, 'variant': v, 'seed': int(seed), 'warm_steps': int(warm), 'run_cfg': fp, 'code': CKPT_CODE, 'provenance': _prov, 'hyperparams': _hp, 'data_fp': rec.get('data_fp'), 'rng_fp': rec.get('rng_fp'), 'metrics': {'ppl': rec.get('ppl'), 'ppl_at_switch': rec.get('ppl_at_switch'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed')}, 'curve_summary': {'n_points': len(_losses), 'first': _losses[0] if _losses else None, 'last': _losses[-1] if _losses else None, 'best': min(_losses) if _losses else None}, 'losses': _losses, 'ppl_history': rec.get('ppl_history'), 'ppl_history_dense_prefix': rec.get('ppl_history_dense_prefix')})
         except Exception as e:
             out['status'] = 'error'
             out['error'] = f'{e}'
@@ -952,6 +969,7 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
                     print(f'[{key}] FAILED: {e}')
                 return summary
             L.locked_json_update(spath, _apply_err)
+            L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _run_id, 'status': 'error', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - t_run, 'key': key, 'variant': v, 'seed': int(seed), 'warm_steps': int(warm), 'run_cfg': fp, 'code': CKPT_CODE, 'error': f'{e}', 'traceback': traceback.format_exc()})
     finally:
         if guard is not None:
             steps_done = 0
@@ -1491,6 +1509,8 @@ def run_niah_phase(payload, guard=None, label=''):
                 cfgs = L.make_layer_cfgs(6, v)
                 # 随机源在建模前一刻定界：同 seed 下各臂的共享组件（tok/head/MLP）必须同构
                 L.set_seed(seed)
+                _niah_rng_fp = L.rng_fingerprint()
+                _niah_losses = []
                 model = L.SmallGPT(vocab, 256, 6, 8, 32, 512, cfgs, mlp_ratio=mr).to(DEVICE)
                 opt = torch.optim.AdamW(model.parameters(), lr=0.0003, foreach=True)
                 model.train()
@@ -1526,6 +1546,7 @@ def run_niah_phase(payload, guard=None, label=''):
                         lg = model(x)
                         ce = F.cross_entropy(lg[:, :-1].reshape(-1, vocab), y.reshape(-1), ignore_index=-100)
                         loss = ce + 0.05 * model.comp_reg
+                        _niah_losses.append(float(ce.detach()))
                         opt.zero_grad(set_to_none=True)
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1544,9 +1565,11 @@ def run_niah_phase(payload, guard=None, label=''):
                     if guard is not None:
                         guard.record_run(time.time() - t0, step, 256, 6, 512, 12)
                     continue
-                _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'params': L.count_params(model)}, ck)
+                _n_params = L.count_params(model)
+                _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'params': _n_params, 'rng_fp': _niah_rng_fp, 'losses': _niah_losses, 'steps': n_steps}, ck)
                 if guard is not None:
                     guard.record_run(time.time() - t0, n_steps, 256, 6, 512, 12)
+                L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'status': 'ok', 'started_at': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t0)), 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - t0, 'key': f'{v}::seed{seed}::niah_train', 'variant': v, 'seed': int(seed), 'run_cfg': _recipe, 'code': CKPT_CODE, 'rng_fp': _niah_rng_fp, 'hyperparams': {'steps': int(n_steps), 'seq_len': 512, 'batch_size': 12, 'lr': 0.0003, 'weight_decay': 0.0, 'comp_lambda': 0.05, 'mlp_ratio': float(mr)}, 'metrics': {'params': _n_params, 'steps': int(n_steps), 'final_loss': _niah_losses[-1] if _niah_losses else None, 'train_time_s': time.time() - t0}, 'curve_summary': {'n_points': len(_niah_losses), 'first': _niah_losses[0] if _niah_losses else None, 'last': _niah_losses[-1] if _niah_losses else None, 'best': min(_niah_losses) if _niah_losses else None}, 'losses': _niah_losses})
                 del model, opt
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -1690,6 +1713,9 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     batch_size = payload.get('batch_size', 12)
     spath = os.path.join(outdir, 'summary.json')
     out = {'status': 'ok', 'key': f'{v}::seed{seed}', 'variant': v, 'seed': seed}
+    _lp_run_id = L.new_experiment_id('p1l')
+    _lp_started = time.strftime('%Y-%m-%dT%H:%M:%S')
+    _lp_t0 = time.time()
     _prov_cfg = {'dataset': 'wikitext', 'n_train_tokens': 8000000, 'seq_len': train_len}
     _tr = None
     need = max(eval_lens) + 1
@@ -1775,7 +1801,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             torch.cuda.empty_cache()
             return out
         model = _tr.pop('_model')
-        _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model)}, ck)
+        _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model), 'rng_fp': _tr.get('rng_fp'), 'losses': _tr.get('losses'), 'ppl_history': _tr.get('ppl_history'), 'steps': steps}, ck)
         if guard is not None:
             guard.record_run(time.time() - t0, steps, 256, 6, train_len, batch_size, calib_seconds=_tr.get('train_time_s'))
             if booked:
@@ -1827,6 +1853,8 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         print(f'  [p1l] {v:18s} s{seed} ' + '  '.join((f'L{k}={vv.get('ppl', float('nan')):.2f}' for k, vv in sorted(_merged.items()))))
         return summary
     L.locked_json_update(spath, _merge)
+    _ev_rec = L.locked_json_read(spath).get(key) or {}
+    L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _lp_run_id, 'status': 'ok', 'started_at': _lp_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _lp_t0, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': _recipe, 'code': CKPT_CODE, 'provenance': _ev_rec.get('provenance'), 'hyperparams': _ev_rec.get('hyperparams'), 'data_fp': _ev_rec.get('data_fp'), 'val_fp': _ev_rec.get('val_fp'), 'rng_fp': _ev_rec.get('rng_fp'), 'metrics': {'params': _ev_rec.get('params'), 'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in (_ev_rec.get('by_len') or {}).items()}, 'train_time_s': (_tr or {}).get('train_time_s')}, 'losses': _ev_rec.get('losses'), 'ppl_history': _ev_rec.get('ppl_history')})
     del model, _ckp
     gc.collect()
     torch.cuda.empty_cache()

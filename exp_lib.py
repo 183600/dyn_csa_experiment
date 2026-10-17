@@ -4823,6 +4823,63 @@ def rng_fingerprint():
             pass
     return h.hexdigest()[:16]
 
+def capture_rng_state():
+    """Snapshot every RNG stream a short diagnostic may consume.
+
+    Diagnostics such as the small-batch overfit probe and the duplicate-run
+    reproducibility probe call ``set_seed`` themselves.  Without a snapshot
+    they would advance the process-wide RNG streams and silently couple a
+    later training cell to how many probes ran before it.  The returned object
+    is opaque: restore it with ``restore_rng_state``.
+    """
+    state = {'python': random.getstate(), 'numpy': np.random.get_state(), 'torch': torch.get_rng_state()}
+    if torch.cuda.is_available():
+        try:
+            state['cuda'] = torch.cuda.get_rng_state_all()
+        except Exception:
+            state['cuda'] = None
+    else:
+        state['cuda'] = None
+    return state
+
+def restore_rng_state(state):
+    """Restore a snapshot from ``capture_rng_state`` (best effort on CUDA).
+
+    Restoring is what makes the pre-flight checks side-effect free: the
+    training cell that follows sees exactly the RNG state it would have seen
+    if the checks had never run, so adding/diagnosing a probe cannot change a
+    recorded loss curve.  A broken CUDA context is reported by the caller's
+    training loop; the CPU streams are still restored here."""
+    if not isinstance(state, dict):
+        return
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'])
+    if state.get('cuda') is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(state['cuda'])
+        except Exception:
+            pass
+
+class _preserve_rng_state:
+    """Context manager: run a diagnostic without perturbing the RNG streams.
+
+    Also restores ``PYTHONHASHSEED`` because ``set_seed`` updates it for child
+    processes; a probe must not leave that environment mutation behind."""
+
+    def __enter__(self):
+        self._env = os.environ.get('PYTHONHASHSEED')
+        self._state = capture_rng_state()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        restore_rng_state(self._state)
+        if self._env is None:
+            os.environ.pop('PYTHONHASHSEED', None)
+        else:
+            os.environ['PYTHONHASHSEED'] = self._env
+        return False
+
 def dataloader_generator(seed):
     """A torch.Generator for a future torch DataLoader (scale path).
 
@@ -4974,7 +5031,7 @@ def environment_snapshot():
         'tf32_cudnn': bool(torch.backends.cudnn.allow_tf32) if torch.cuda.is_available() else None,
         'cpu_threads': int(torch.get_num_threads()),
         'pythonhashseed': os.environ.get('PYTHONHASHSEED'),
-        'flags': {k: os.environ.get(k) for k in ('CSA_KERNEL', 'CSA_CKPT', 'CSA_DETERMINISTIC', 'CSA_CPU_THREADS', 'CUBLAS_WORKSPACE_CONFIG')},
+        'flags': {k: os.environ.get(k) for k in ('CSA_KERNEL', 'CSA_CKPT', 'CSA_DETERMINISTIC', 'CSA_CPU_THREADS', 'CSA_SKIP_OVERFIT', 'CSA_REQUIRE_REPRO', 'CSA_SKIP_REPRO', 'CUBLAS_WORKSPACE_CONFIG')},
     }
     for _mod, _key in (('tokenizers', 'tokenizers'), ('datasets', 'datasets')):
         try:
@@ -5016,15 +5073,16 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
     })
     return hp
 
-def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None):
+def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reproducibility=None):
     """Merge one panel's provenance/config/outcome summary into
     `outdir/run_manifest.json` under the same flock used by summary.json.
 
     The per-record `losses` / `ppl_history` curves stay in summary.json (to
     avoid duplicating large arrays); each manifest cell points at its key.
-    `sanity` (the small-batch overfit reports) is embedded when supplied, or
-    read back from `outdir/overfit_sanity.json` so an auto-preflight is
-    traceable without a second manual record."""
+    `sanity` (the small-batch overfit reports) and `reproducibility` (the
+    duplicate-run seed check) are embedded when supplied, or read back from
+    `outdir/overfit_sanity.json` / `outdir/reproducibility.json` so an
+    auto-preflight is traceable without a second manual record."""
     os.makedirs(outdir, exist_ok=True)
     if sanity is None:
         _san_path = os.path.join(outdir, 'overfit_sanity.json')
@@ -5034,6 +5092,20 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None):
                     sanity = json.load(_sf)
             except Exception as _se:
                 print(f'[track] WARNING: could not read {_san_path} for the run manifest ({type(_se).__name__}: {_se})')
+        if isinstance(sanity, dict) and sanity.get('run_cfg') not in (None, run_cfg):
+            print(f'[track] WARNING: {_san_path} belongs to a DIFFERENT run_cfg ({sanity.get("run_cfg")!r} != {run_cfg!r}) — not embedding it in this panel (a stale pre-flight must not certify a new config)')
+            sanity = None
+    if reproducibility is None:
+        _rep_path = os.path.join(outdir, 'reproducibility.json')
+        if os.path.exists(_rep_path):
+            try:
+                with open(_rep_path, encoding='utf-8') as _rf:
+                    reproducibility = json.load(_rf)
+            except Exception as _re:
+                print(f'[track] WARNING: could not read {_rep_path} for the run manifest ({type(_re).__name__}: {_re})')
+        if isinstance(reproducibility, dict) and reproducibility.get('run_cfg') not in (None, run_cfg):
+            print(f'[track] WARNING: {_rep_path} belongs to a DIFFERENT run_cfg ({reproducibility.get("run_cfg")!r} != {run_cfg!r}) — not embedding it in this panel (a stale pre-flight must not certify a new config)')
+            reproducibility = None
     cells = {}
     for seed in cfg.get('seeds') or []:
         for v in cfg.get('variants') or []:
@@ -5073,7 +5145,9 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None):
         'config': _jsonable(cfg),
         'provenance': prov,
         'sanity': sanity,
+        'reproducibility': reproducibility,
         'experiment_log': 'experiments.jsonl',
+        'tracking_schema': 2,
         'cells': cells,
     }
     path = os.path.join(outdir, 'run_manifest.json')
@@ -5872,7 +5946,7 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64):
     finally:
         model.train(was_training)
 
-def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256, train_ids=None, device=None, target_loss=0.05, target_acc=0.99, mlp_ratio=None, grad_clip=1.0):
+def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256, train_ids=None, device=None, target_loss=0.05, target_acc=0.99, mlp_ratio=None, grad_clip=1.0):
     """Small-batch overfit sanity check (necessary, not sufficient).
 
     Take ONE fixed batch (sampled once from `train_ids`, or synthetic ids when
@@ -6008,6 +6082,25 @@ def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_
         torch.cuda.empty_cache()
     return report
 
+def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256, train_ids=None, device=None, target_loss=0.05, target_acc=0.99, mlp_ratio=None, grad_clip=1.0):
+    """Side-effect-free wrapper around the small-batch overfit probe.
+
+    The probe deliberately reseeds the process to ``seed`` and then trains a
+    tiny model.  Saving/restoring every RNG stream around it keeps the probe
+    from changing the stream seen by the real training cell that follows, so
+    the diagnostic itself can never alter a recorded loss curve.  The report
+    additionally records the before/after RNG fingerprint as evidence that
+    the preservation contract held.
+    """
+    _fp_before = rng_fingerprint()
+    with _preserve_rng_state():
+        report = _overfit_sanity_check_impl(variant, seed=seed, steps=steps, lr=lr, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=train_ids, device=device, target_loss=target_loss, target_acc=target_acc, mlp_ratio=mlp_ratio, grad_clip=grad_clip)
+    _fp_after = rng_fingerprint()
+    report['rng_fp_before'] = _fp_before
+    report['rng_fp_after'] = _fp_after
+    report['rng_state_preserved'] = bool(_fp_before == _fp_after)
+    return report
+
 _OVERFIT_GUARD = {}
 # Reports of the checks that actually ran (the boolean guard above is the
 # resume cache; this is the evidence written into the run manifest).  Keyed
@@ -6058,6 +6151,131 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
         if not r['passed']:
             raise RuntimeError(f'small-batch overfit sanity check FAILED for `{v}` ({r["diagnosis"]}) — do NOT start or continue this run; this points at a gradient/loss/label plumbing bug.  Inspect the returned report and set CSA_SKIP_OVERFIT=1 only if you deliberately accept the risk.')
     return reports
+
+_REPRO_GUARD = {}
+_REPRO_REPORTS = {}
+
+def _repro_tiny_losses(variant, seed, *, steps=3, d=32, n_layers=1, n_heads=4, d_head=8, seq_len=16, batch_size=2, vocab=64, lr=0.003, device=None):
+    """Run one very short, fully seeded training stream and return its losses.
+
+    Uses a synthetic fixed batch (sampled from its own NumPy generator, so the
+    data stream cannot consume the model's PyTorch RNG) and disables weight
+    decay.  Two calls with the same ``seed`` must agree bit-for-bit on the same
+    stack; that is the property the pre-flight reproducibility guard checks.
+    """
+    device = DEVICE if device is None else device
+    set_seed(seed)
+    _rng = np.random.default_rng(int(seed) + 7919)
+    ids_np = _rng.integers(0, int(vocab), size=(int(batch_size), int(seq_len) + 1), dtype=np.int64)
+    ids = torch.from_numpy(ids_np).to(device)
+    x, y = ids[:, :-1], ids[:, 1:]
+    cfgs = make_layer_cfgs(int(n_layers), variant)
+    model = SmallGPT(int(vocab), int(d), int(n_layers), int(n_heads), int(d_head), int(seq_len), cfgs, mlp_ratio=4).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=float(lr), betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, weight_decay=0.0, foreach=True)
+    model.train()
+    losses = []
+    try:
+        for _ in range(int(steps)):
+            ce = model.ce_loss(x, y, int(vocab))
+            opt.zero_grad(set_to_none=True)
+            ce.backward()
+            opt.step()
+            losses.append(float(ce.detach()))
+    finally:
+        del model, opt, ids, x, y, ids_np
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+    return losses
+
+def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=None):
+    """Two identical tiny runs + one different-seed run, compared.
+
+    This is the automated version of "same seed, same result on this box":
+    the same seed must reproduce the complete short loss curve (exactly on
+    CPU; within ``tol`` on a GPU whose kernels are not bitwise deterministic),
+    while a different seed must actually change it.  The report is persisted
+    with the panel, so a reproducibility regression is visible instead of
+    being an assumption.  The check is advisory by default
+    (``CSA_REQUIRE_REPRO=1`` makes a failure fatal, ``CSA_SKIP_REPRO=1``
+    skips it); it never changes the RNG state of the following training cell.
+    """
+    device = DEVICE if device is None else device
+    _fp_before = rng_fingerprint()
+    with _preserve_rng_state():
+        a = _repro_tiny_losses(variant, seed, steps=steps, device=device)
+        b = _repro_tiny_losses(variant, seed, steps=steps, device=device)
+        c = _repro_tiny_losses(variant, int(seed) + 1, steps=steps, device=device)
+    _fp_after = rng_fingerprint()
+    _n = min(len(a), len(b))
+    max_diff = max((abs(a[i] - b[i]) for i in range(_n)), default=float('inf'))
+    different_seed_diff = max((abs(a[i] - c[i]) for i in range(min(len(a), len(c)))), default=0.0)
+    finite = all(math.isfinite(v) for v in a + b + c)
+    bitwise = bool(a == b)
+    passed = bool(finite and max_diff <= float(tol) and different_seed_diff > 0.0)
+    r = {
+        'kind': 'duplicate_run_reproducibility',
+        'variant': variant,
+        'seed': int(seed),
+        'steps': int(steps),
+        'tol': float(tol),
+        'device': str(device),
+        'determinism': determinism_label(),
+        'same_seed_losses_a': a,
+        'same_seed_losses_b': b,
+        'different_seed_losses': c,
+        'max_abs_diff_same_seed': float(max_diff),
+        'bitwise_identical': bitwise,
+        'different_seed_changes_curve': bool(different_seed_diff > 0.0),
+        'different_seed_max_abs_diff': float(different_seed_diff),
+        'all_finite': bool(finite),
+        'rng_fp_before': _fp_before,
+        'rng_fp_after': _fp_after,
+        'rng_state_preserved': bool(_fp_before == _fp_after),
+        'passed': passed,
+    }
+    if not passed:
+        if not finite:
+            r['diagnosis'] = 'non-finite loss in a tiny seeded run'
+        elif max_diff > float(tol):
+            r['diagnosis'] = 'same seed did not reproduce the short loss curve on this machine/stack'
+        else:
+            r['diagnosis'] = 'a different seed produced the identical loss curve (seed is not wired into the run)'
+    else:
+        r['diagnosis'] = 'ok'
+    return r
+
+def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False):
+    """Run ``reproducibility_check`` once per (variant, seed) per process.
+
+    Mirrors ``overfit_guard``: results are cached as evidence, a skip env var
+    is explicit and loud, and a failure is a warning unless the caller sets
+    ``CSA_REQUIRE_REPRO=1`` (strict reproducibility is not free on every GPU
+    kernel, so it is opt-in).  Returns the reports that ran in this call."""
+    if os.environ.get('CSA_SKIP_REPRO', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        print('[repro] guard SKIPPED (CSA_SKIP_REPRO is set) — this run has no same-machine seed check')
+        return []
+    _want_strict = os.environ.get('CSA_REQUIRE_REPRO', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    _base = (int(seed), int(steps), str(DEVICE), determinism_label())
+    todo = [v for v in variants if force or (v, *_base) not in _REPRO_GUARD]
+    reports = []
+    for v in todo:
+        r = reproducibility_check(v, seed=seed, steps=steps, tol=tol)
+        key = (v, *_base)
+        _REPRO_GUARD[key] = bool(r['passed'])
+        _REPRO_REPORTS[key] = r
+        reports.append(r)
+        print(f"[repro] {v:<24} same-seed max|Δ|={r['max_abs_diff_same_seed']:.3e}  different-seed Δ={r['different_seed_max_abs_diff']:.3e}  bitwise={r['bitwise_identical']}  {'PASS' if r['passed'] else 'FAIL'}")
+        if not r['passed']:
+            _msg = f"same-machine reproducibility check FAILED for `{v}` ({r['diagnosis']})"
+            if _want_strict:
+                raise RuntimeError(_msg + ' — CSA_REQUIRE_REPRO=1 makes this fatal. Fix the seed/kernel nondeterminism or unset the flag to accept it.')
+            print(f'[repro] WARNING: {_msg}; the panel will record the failure (set CSA_REQUIRE_REPRO=1 to make it fatal, CSA_SKIP_REPRO=1 to skip)')
+    return reports
+
+def reproducibility_reports():
+    """Copy of the reproducibility reports gathered in this process."""
+    return {k: dict(v) for k, v in _REPRO_REPORTS.items()}
 
 class TimeGuard:
     BASE = (256, 6, 512, 12)
@@ -7229,11 +7447,39 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), {
             'kind': 'small_batch_overfit_sanity_panel',
             'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'run_cfg': fp,
+            'label': label or outdir,
             'passed': all(bool(r.get('passed')) for r in _sanity),
             'provenance': prov,
             'reports': _sanity,
         })
+    _repro = list(reproducibility_guard(cfg.get('variants') or []))
+    if not _repro:
+        _want = set(cfg.get('variants') or [])
+        _base = (0, 3, str(DEVICE), determinism_label())
+        _repro = [dict(r) for k, r in _REPRO_REPORTS.items() if k[0] in _want and k[1:] == _base]
+    if _repro:
+        atomic_write_json(os.path.join(outdir, 'reproducibility.json'), {
+            'kind': 'duplicate_run_reproducibility_panel',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'run_cfg': fp,
+            'label': label or outdir,
+            'passed': all(bool(r.get('passed')) for r in _repro),
+            'provenance': prov,
+            'reports': _repro,
+        })
     cells, stale_dropped = _plan_run(cfg, summary_path, fp)
+    _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
+    log_experiment_event(outdir, {
+        'kind': 'panel_start', 'tracking_schema': 2, 'label': label or outdir,
+        'run_cfg': fp, 'code': code_stamp(), 'started_at': _panel_started,
+        'config': _jsonable(cfg), 'seeds': list(cfg.get('seeds') or []),
+        'variants': list(cfg.get('variants') or []),
+        'n_cells_planned': len(cells), 'n_cells_resumed': (len(cfg.get('seeds') or []) * len(cfg.get('variants') or []) - len(cells)),
+        'provenance': prov,
+        'sanity': ({'passed': all(bool(r.get('passed')) for r in _sanity), 'n_reports': len(_sanity), 'ref': 'overfit_sanity.json'} if _sanity else None),
+        'reproducibility': ({'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro), 'ref': 'reproducibility.json'} if _repro else None),
+    })
     dropped_truncations = []
     ratios = {}
     _ran_parallel = False
@@ -7272,8 +7518,20 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             print(f'    {_k}')
         if len(_still) != len(stale_dropped):
             print(f'    ({len(stale_dropped) - len(_still)} of them succeeded and carry a fresh record.)')
-    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=(_sanity or None))
-    _finish_panel(outdir, summary)
+    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=(_sanity or None), reproducibility=(_repro or None))
+    _agg = _finish_panel(outdir, summary)
+    _cell_keys = {f'{v}::seed{seed}' for v, seed in cells}
+    _measured = {k for k in _cell_keys if isinstance(summary.get(k), dict) and ppl_is_usable((summary.get(k) or {}).get('ppl')) and not (summary.get(k) or {}).get('synthesized')}
+    log_experiment_event(outdir, {
+        'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
+        'run_cfg': fp, 'code': code_stamp(), 'started_at': _panel_started,
+        'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'n_cells_planned': len(cells), 'n_cells_measured': len(_measured),
+        'n_cells_missing': max(0, len(cells) - len(_measured)),
+        'n_truncated': len(dropped_truncations), 'n_stale_dropped': len(stale_dropped),
+        'aggregate_ref': 'aggregate.json', 'summary_ref': 'summary.json',
+        'aggregate': {str(v): {kk: e.get(kk) for kk in ('n', 'n_seeds', 'ppl_mean', 'ppl_std', 'params') if kk in e} for v, e in (_agg or {}).items() if isinstance(e, dict)},
+    })
     return (summary, None)
 
 def _dump_aggregate(outdir, summary):

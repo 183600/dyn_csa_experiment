@@ -574,6 +574,67 @@ def t_overfit_sanity():
     assert r2['passed'] is True and r2['data_source'] == 'train_ids', r2
 
 
+def t_rng_state_preserved_by_preflight():
+    L.set_seed(777)
+    fp0 = L.rng_fingerprint()
+    r = L.overfit_sanity_check('full', seed=1, steps=5, d=32, n_layers=1, n_heads=4, d_head=8, seq_len=16, batch_size=2, vocab=64)
+    assert r['rng_state_preserved'] is True, r
+    assert L.rng_fingerprint() == fp0, 'the overfit probe must not advance the process RNG streams'
+    rr = L.reproducibility_check('full', seed=2, steps=2)
+    assert rr['rng_state_preserved'] is True, rr
+    assert L.rng_fingerprint() == fp0, 'the reproducibility probe must not advance the process RNG streams'
+
+
+def t_reproducibility_check():
+    r = L.reproducibility_check('full', seed=0, steps=3)
+    assert r['passed'] is True, r
+    assert r['max_abs_diff_same_seed'] <= r['tol'], f'same seed must reproduce the short loss curve: {r}'
+    if not torch.cuda.is_available():
+        assert r['bitwise_identical'] is True, f'same seed must reproduce the short loss curve exactly on CPU: {r}'
+    assert r['different_seed_changes_curve'] is True, 'a different seed must change the short loss curve'
+    assert r['rng_state_preserved'] is True
+    # the cache/guard records evidence without re-running
+    reports = L.reproducibility_guard(['full'])
+    assert reports and reports[0]['passed'] is True
+
+
+def t_panel_tracking_events():
+    d = tempfile.mkdtemp()
+    _saved_load = L.load_run_corpus
+    _old_skip_overfit = os.environ.get('CSA_SKIP_OVERFIT')
+    _old_skip_repro = os.environ.get('CSA_SKIP_REPRO')
+    try:
+        ids = np.arange(4096, dtype=np.int64) % 997
+        val = (np.arange(128, dtype=np.int64) % 997).reshape(4, 32)
+        L.load_run_corpus = lambda cfg: (ids, val, 997, None, None)
+        os.environ['CSA_SKIP_OVERFIT'] = '1'
+        os.environ['CSA_SKIP_REPRO'] = '1'
+        cfg = dict(outdir=d, seq_len=32, batch_size=2, n_train_tokens=4096, steps=3, lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0, delta_lr_mult=10.0, eval_every=0, eval_subset=2, d=64, n_layers=2, n_heads=4, d_head=16, dataset='unit', seeds=[0], variants=['full'])
+        summary, _ = L.run(cfg, label='tracking-unit')
+        assert 'full::seed0' in summary
+        lines = [json.loads(x) for x in open(os.path.join(d, 'experiments.jsonl'), encoding='utf-8').read().strip().splitlines()]
+        kinds = [x.get('kind') for x in lines]
+        assert 'panel_start' in kinds and 'panel_finish' in kinds, kinds
+        assert kinds.count('cell') == 1, kinds
+        st = next(x for x in lines if x.get('kind') == 'panel_start')
+        for k in ('run_cfg', 'code', 'config', 'seeds', 'variants', 'provenance'):
+            assert k in st, f'panel_start missing {k}'
+        m = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
+        entry = m['panels'][L._run_fp(cfg, 64, 2, 4, 16, 997, ids, val)]
+        assert entry.get('tracking_schema') == 2 and 'reproducibility' in entry
+    finally:
+        L.load_run_corpus = _saved_load
+        if _old_skip_overfit is None:
+            os.environ.pop('CSA_SKIP_OVERFIT', None)
+        else:
+            os.environ['CSA_SKIP_OVERFIT'] = _old_skip_overfit
+        if _old_skip_repro is None:
+            os.environ.pop('CSA_SKIP_REPRO', None)
+        else:
+            os.environ['CSA_SKIP_REPRO'] = _old_skip_repro
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def t_provenance_and_manifest():
     tr = np.arange(512, dtype=np.int64) % 97
     va = np.arange(64, dtype=np.int64).reshape(2, 32) % 97
@@ -891,7 +952,10 @@ def main():
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
     _check('E3 small-batch overfit sanity', t_overfit_sanity)
+    _check('E3b preflight RNG-state preservation', t_rng_state_preserved_by_preflight)
+    _check('E3c duplicate-run reproducibility check', t_reproducibility_check)
     _check('E4 provenance + run manifest', t_provenance_and_manifest)
+    _check('E4b panel tracking events', t_panel_tracking_events)
     _check('E5 DataLoader/worker seeding', t_dataloader_seeding_helpers)
     _check('E6 end-to-end training reproducibility', t_train_variant_reproducible)
     _check('E7 overfit check detects broken optimizer', t_overfit_detects_broken_optimizer)

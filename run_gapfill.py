@@ -397,13 +397,24 @@ def run_overfit(cfg=None, variants=None, steps=None):
         return []
     ok = all(r['passed'] for r in reports)
     os.makedirs(cfg['outdir'], exist_ok=True)
+    _prov = L.experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
     L.atomic_write_json(os.path.join(cfg['outdir'], 'overfit_sanity.json'), {
         'kind': 'small_batch_overfit_sanity_panel',
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'passed': ok,
-        'provenance': L.experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab),
+        'provenance': _prov,
         'reports': reports,
     })
+    _repro = L.reproducibility_guard(variants)
+    if _repro:
+        L.atomic_write_json(os.path.join(cfg['outdir'], 'reproducibility.json'), {
+            'kind': 'duplicate_run_reproducibility_panel',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'passed': all(bool(r.get('passed')) for r in _repro),
+            'provenance': _prov,
+            'reports': _repro,
+        })
+    L.log_experiment_event(cfg['outdir'], {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and all(bool(r.get('passed')) for r in _repro) else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': {'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro)}})
     if not ok:
         _bad = [r['variant'] for r in reports if not r['passed']]
         raise RuntimeError(f'small-batch overfit sanity check FAILED for {_bad} — do NOT start the full run; this points at a gradient/loss/label plumbing bug (see {cfg["outdir"]}/overfit_sanity.json)')

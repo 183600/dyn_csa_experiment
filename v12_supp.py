@@ -367,6 +367,9 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
     _msha = manifest.get('manifest_sha256')
     _sig = _recipe_signature(manifest)
     out = {'status': 'ok', 'key': f'{v}::s{seed}', 'variant': v, 'seed': seed}
+    _ft_run_id = L.new_experiment_id('p5t')
+    _ft_started = time.strftime('%Y-%m-%dT%H:%M:%S')
+    _ft_t0 = time.time()
     ck = os.path.join(cfg['ckpt_dir'], f'{v}_seed{seed}.pt')
     if not os.path.exists(ck):
         print(f'[p5t] SKIP {v} s{seed}: no checkpoint {ck} (run P3MT/P4MT/P5C first)')
@@ -452,6 +455,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
         print(f'  [p5t] {v:32s} s{seed} ' + '  '.join((f'L{k}={vv.get("ppl", float("nan")):.2f}' for k, vv in sorted(r.items()))))
         return summary
     L.locked_json_update(spath, _merge)
+    L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'run_id': _ft_run_id, 'status': 'ok', 'started_at': _ft_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _ft_t0, 'key': f'{v}::s{seed}', 'variant': v, 'seed': int(seed), 'split': 'test', 'code': V.CKPT_CODE, 'manifest_sha256': _msha, 'recipe': _ck_recipe, 'ckpt_sha256': _ck_sha, 'data_fp': _dfp, 'params': _tr.get('params'), 'metrics': {'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in r.items()}}})
     del d
     return out
 
