@@ -1858,7 +1858,7 @@ def _finfo_min(dtype):
         _FO_MINL[dtype] = v
     return v
 
-def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False, soft_form=False, v_stacked=None):
+def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False, soft_form=False, v_stacked=None, k_stacked=None):
     n = q.shape[0]
     dev = q.device
     if mem_budget_bytes is None:
@@ -1895,10 +1895,14 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # directly: gathering its rows yields exactly the rows of
         # cat([v_blk, v_sw]) in the same order, so the values are bit-identical.
         v_all = v_stacked if v_stacked is not None else torch.cat([v_blk, v_sw], 0)
-        # The K halves are concatenated only for the plain (soft=None,
-        # soft_form=False) path; the soft path keeps its two contiguous
-        # gathers, which the two logits einsums consume directly.
-        k_all = torch.cat([k_blk, k_sw], 0) if (soft is None and not soft_form) else None
+        # `k_stacked` is the analogous row-contiguous [blocks | window] K
+        # table (the normalized K columns of the fused KV head in `_single`).
+        # Handing it in removes the full-width cat copy; the soft path can
+        # gather both halves from it with the window-offset row index.
+        if k_stacked is not None:
+            k_all = k_stacked
+        else:
+            k_all = torch.cat([k_blk, k_sw], 0) if (soft is None and not soft_form) else None
     else:
         k_all, v_all = (k_blk, v_blk)
     _win_off = _nblk_rows if _has_sw else 0
@@ -2025,8 +2029,14 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # separate gathers + cat, while the per-half K gathers feed the two
         # logits einsums with the same operands (index re-plumbing only,
         # design notes §6.1).
-        kb = _tk2(k_blk, _sel_rows)
-        kw = _tk2(k_sw, _win_local)
+        if k_all is not None:
+            # The combined table holds the same rows as the two halves:
+            # block rows at the front and window row j at n_blk + j.
+            kb = _tk2(k_all, _sel_rows)
+            kw = _tk2(k_all, _win_rows)
+        else:
+            kb = _tk2(k_blk, _sel_rows)
+            kw = _tk2(k_sw, _win_local)
         blk_logits = _einsum('qhd,qmhd->qhm', qseg, kb)
         if scale != 1.0:
             blk_logits.mul_(scale)
@@ -2061,18 +2071,21 @@ def _gathered_attention_trainable(*args, **kwargs):
     # 训练时包一层非重入 checkpoint，反向按同一确定性分解重算前向。函数内
     # 无 RNG，且分块上限经 _ATB_EPOCH 缓存在一次运行内不变，因此 chunk
     # 边界与每个中间值逐位相同，梯度与直调形式逐位一致（design notes §6.1
-    # 的 transport 论证在「重算同一纯函数」上的形式）。
+    # 的 transport 论证在「重算同一纯函数」上的形式）。函数内无 RNG，故
+    # 跳过 checkpoint 的 RNG 状态存取（preserve_rng_state=False）——省掉
+    # 每次调用的 CUDA RNG 快照/恢复，重算不消耗也不改写任何随机流。
     if torch.is_grad_enabled() and args[0].requires_grad:
-        return torch.utils.checkpoint.checkpoint(gathered_attention, *args, use_reentrant=False, **kwargs)
+        return torch.utils.checkpoint.checkpoint(gathered_attention, *args, use_reentrant=False, preserve_rng_state=False, **kwargs)
     return gathered_attention(*args, **kwargs)
 
 def _pool_trainable(fn, *args, **kwargs):
     # 训练时包一层非重入 checkpoint，反向重算同一纯函数：池化内部无 RNG，
     # 整数几何缓存挂在不可变的 block_ids 对象上（_pool_parts / _pool_geom，
     # design notes §6.2），反向重算必命中同一几何，前向值与梯度逐位一致；
-    # int 型的 n_blocks 返回值原样透传。eval 下（无梯度）直调。
+    # int 型的 n_blocks 返回值原样透传。eval 下（无梯度）直调。池化同样
+    # 无 RNG，所以 checkpoint 不需要保存/恢复随机流。
     if torch.is_grad_enabled() and args[0].requires_grad:
-        return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False, **kwargs)
+        return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False, preserve_rng_state=False, **kwargs)
     return fn(*args, **kwargs)
 
 @dataclass
@@ -2262,7 +2275,7 @@ class HybridAttention(nn.Module):
             # recompute rebuilds the identical slice.
             _mask_c = mask[s:e] if _use_full_mask else (s, e, T, self.cfg.window)
             if _ck:
-                out[:, s:e] = torch.utils.checkpoint.checkpoint(self._sink_attn_chunk, q[:, s:e], k, v, _mask_c, sink_view, scale, use_reentrant=False)
+                out[:, s:e] = torch.utils.checkpoint.checkpoint(self._sink_attn_chunk, q[:, s:e], k, v, _mask_c, sink_view, scale, use_reentrant=False, preserve_rng_state=False)
             else:
                 out[:, s:e] = self._sink_attn_chunk(q[:, s:e], k, v, _mask_c, sink_view, scale)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
@@ -2550,19 +2563,28 @@ class HybridAttention(nn.Module):
             # independence, design notes §6.1).
             _Bn = int(core_kv.shape[0])
             _kvh = self.W_kvhead(torch.cat([core_kv, kv_local], 0))
-            k_blk, v_blk = self._split(_kvh[:_Bn])
-            k_sw, v_sw = self._split(_kvh[_Bn:])
             # Row-contiguous [blocks | window] view of the V columns: the same
             # values as cat([v_blk, v_sw]).  The views keep `_kvh` alive exactly
             # as v_blk/v_sw already did.
             v_stacked = _kvh[:, self.nh * self.hd:].view(_Bn + T, self.nh, self.hd)
+            v_blk = v_stacked[:_Bn]
+            v_sw = v_stacked[_Bn:]
+            # Normalize both K halves in one row-wise pass over the fused K
+            # columns: each row's norm/divide is independent, so the values are
+            # the same as the two per-half normalizations, while the result is
+            # one contiguous [blocks | window] table the gather can consume
+            # without the later cat copy.  `_kvh` stays alive through v_stacked.
+            k_stacked = F.normalize(_kvh[:, :self.nh * self.hd].view(_Bn + T, self.nh, self.hd), dim=-1)
+            k_blk = k_stacked[:_Bn]
+            k_sw = k_stacked[_Bn:]
             del _kvh
         else:
             k_blk, v_blk = self._split(self.W_kvhead(core_kv))
             k_sw, v_sw = self._split(self.W_kvhead(kv_local))
             v_stacked = None
-        k_blk = F.normalize(k_blk, dim=-1)
-        k_sw = F.normalize(k_sw, dim=-1)
+            k_stacked = None
+            k_blk = F.normalize(k_blk, dim=-1)
+            k_sw = F.normalize(k_sw, dim=-1)
         if cfg.kind == 'hca':
             # cached int32 expansion — the same exact integers as the int64
             # arange expand narrowed to int32 (index transport, §6.1).  Every
@@ -2570,7 +2592,7 @@ class HybridAttention(nn.Module):
             # first-occurrence dedup inside gathered_attention is provably the
             # all-True mask and is skipped (identical keep mask).
             topk_idx = _arange_exp_cache(T, Bn, x.device)
-            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None, topk_distinct=True, v_stacked=v_stacked)
+            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None, topk_distinct=True, v_stacked=v_stacked, k_stacked=k_stacked)
         else:
             topk = cfg.index_topk
             _sel_valid_box = []
@@ -2586,7 +2608,7 @@ class HybridAttention(nn.Module):
             # 重复块 0 已被 sel_valid 置无效。故 gathered_attention 的
             # first_occurrence 去重掩码恒为全真，直接声明 topk_distinct 跳过它
             # （keep 掩码与逐位计算结果一致，下游取值不变）。
-            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], topk_distinct=True, soft_form=True, v_stacked=v_stacked)
+            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], topk_distinct=True, soft_form=True, v_stacked=v_stacked, k_stacked=k_stacked)
         return (self.W_o(out.reshape(T, self.nh * self.hd)), gate_mean)
 
     def forward(self, x):
@@ -2702,7 +2724,7 @@ class MLP(nn.Module):
             # 非重入 checkpoint（模块顶 CSA_CKPT 说明）：重算同一纯函数，
             # 前向值与梯度逐位一致。_CKPT_NEST > 0 时外层块已被 checkpoint
             # 覆盖，内层不再包裹。
-            return torch.utils.checkpoint.checkpoint(self._fwd, x, use_reentrant=False)
+            return torch.utils.checkpoint.checkpoint(self._fwd, x, use_reentrant=False, preserve_rng_state=False)
         return self._fwd(x)
 
     def _fwd(self, x):
@@ -2720,7 +2742,7 @@ class Block(nn.Module):
     def forward(self, x):
         if _CKPT['on'] == 'block' and torch.is_grad_enabled() and x.requires_grad:
             if self.attn.cfg.chunking != 'cosine_learnable':
-                return torch.utils.checkpoint.checkpoint(self._fwd_ckpt, x, use_reentrant=False)
+                return torch.utils.checkpoint.checkpoint(self._fwd_ckpt, x, use_reentrant=False, preserve_rng_state=False)
             if 'cosine' not in _CKPT_WARNED:
                 _CKPT_WARNED.add('cosine')
                 print('[CSA_CKPT] block 级重算不覆盖 cosine_learnable 臂（gate_mean 经属性逃逸出块，初向前向的 no_grad 会剥掉它的图——v9 _V9_CKPT 的同一限制）；这些臂回退到 mlp 级，其余臂整块重算')
@@ -2831,7 +2853,7 @@ class SmallGPT(nn.Module):
         _ck = torch.is_grad_enabled() and h.requires_grad
         for s in range(0, ids.shape[1], chunk):
             if _ck:
-                c = torch.utils.checkpoint.checkpoint(self._ce_head_chunk, h[:, s:s + chunk], targets[:, s:s + chunk], vocab, use_reentrant=False)
+                c = torch.utils.checkpoint.checkpoint(self._ce_head_chunk, h[:, s:s + chunk], targets[:, s:s + chunk], vocab, use_reentrant=False, preserve_rng_state=False)
             else:
                 c = self._ce_head_chunk(h[:, s:s + chunk], targets[:, s:s + chunk], vocab)
             ce = c if ce is None else ce + c
@@ -3859,6 +3881,10 @@ _PINNED_HOST_CACHE = {}
 # 整份 pinned 的字节上限（见 batch_iter）：超出时改走普通宿主张量 + 每步
 # pinned 暂存上传。
 _PINNED_HOST_CAP_BYTES = 4 << 30
+# 语料整份驻留 GPU 的字节上限（见 batch_iter）。每步只取 B·(seq_len+1) 个
+# 整数，走 pinned 宿主张量 + 每步暂存上传的代价远小于把几百 MB 语料钉在
+# 显存里；上限随模型规模保持不变，所以扩规模时显存不会被语料缓存吃掉。
+_GPU_CORPUS_CACHE_BYTES = 64 << 20
 
 def _ids_narrow(train_ids):
     # Token ids are bounded by the vocab (<= 2**31 for every corpus this repo
@@ -3882,7 +3908,7 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     cached = _PINNED_HOST_CACHE.get('entry')
     if cached is not None and cached[0] is train_ids and cached[1].shape[0] == train_ids.shape[0]:
         host = cached[1]
-    elif device.type == 'cuda' and train_ids.nbytes <= (512 << 20):
+    elif device.type == 'cuda' and train_ids.nbytes <= _GPU_CORPUS_CACHE_BYTES:
         try:
             host = torch.from_numpy(_ids_narrow(train_ids)).to(device)
             _PINNED_HOST_CACHE['entry'] = (train_ids, host)

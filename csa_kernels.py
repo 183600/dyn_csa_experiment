@@ -357,6 +357,16 @@ _ARANGE_CACHE_BYTES = [0]
 _ARANGE_CACHE_BUDGET = 512 << 20
 
 
+def _arange_nbytes(t):
+    # Charge the resident storage, not numel: an expand view occupies Bm ints
+    # while its logical shape is [B, T, Bm].  The ref backend keeps that view
+    # (no copy), so accounting by numel would evict it immediately.
+    try:
+        return int(t.untyped_storage().nbytes())
+    except Exception:
+        return int(t.numel()) * int(t.element_size())
+
+
 def _full_arange_evict(need=0):
     # 与 _GEOM_CACHE 同一套 FIFO 淘汰：(B, T, Bm) 组合数无天然上界
     # （例如 eval 长度扫描），缓存条目数与驻留字节都必须有上界。
@@ -364,7 +374,7 @@ def _full_arange_evict(need=0):
                              _ARANGE_CACHE_BYTES[0] + need > _ARANGE_CACHE_BUDGET):
         _k0 = next(iter(_ARANGE_CACHE))
         _t0 = _ARANGE_CACHE.pop(_k0)
-        _ARANGE_CACHE_BYTES[0] -= _t0.numel() * _t0.element_size()
+        _ARANGE_CACHE_BYTES[0] -= _arange_nbytes(_t0)
 
 
 def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
@@ -387,14 +397,20 @@ def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
     return geom
 
 
-def _full_arange_cached(B, T, Bm, device):
-    key = (int(B), int(T), int(Bm), str(device))
+def _full_arange_cached(B, T, Bm, device, contiguous=True):
+    # `contiguous=False` returns a stride-0 expand view: every row holds the
+    # same exact integers, which is all the torch-reference backend reads
+    # (advanced indexing / gathers / comparisons).  It occupies Bm ints
+    # instead of B·T·Bm.  The triton kernels address the index tensor with
+    # pointer arithmetic, so that backend asks for the contiguous copy.
+    key = (int(B), int(T), int(Bm), str(device), bool(contiguous))
     out = _ARANGE_CACHE.get(key)
     if out is None:
-        _full_arange_evict(int(B) * int(T) * int(Bm) * 4)
-        out = torch.arange(Bm, device=device, dtype=torch.int32)[None, None, :].expand(B, T, Bm).contiguous()
+        base = torch.arange(Bm, device=device, dtype=torch.int32)[None, None, :].expand(B, T, Bm)
+        out = base.contiguous() if contiguous else base
+        _full_arange_evict(_arange_nbytes(out))
         _ARANGE_CACHE[key] = out
-        _ARANGE_CACHE_BYTES[0] += out.numel() * out.element_size()
+        _ARANGE_CACHE_BYTES[0] += _arange_nbytes(out)
     return out
 
 
@@ -2239,7 +2255,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     k_blk = F.normalize(k_blk, dim=-1)
     k_sw = F.normalize(k_sw, dim=-1)
     if cfg.kind == 'hca':
-        topk_idx = _full_arange_cached(B, T, Bm, dev)
+        topk_idx = _full_arange_cached(B, T, Bm, dev, contiguous=impl_attn == 'triton')
         valid = None
         soft = None
     else:
