@@ -95,16 +95,18 @@ jobs:
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      - name: Configure opencode (DeepSeek official 50% / NVIDIA GLM 50%)
+      - name: Configure opencode (independent families - NVIDIA GLM 50% / DeepSeek 50%)
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           mkdir -p ~/.config/opencode
-          # provider 配置模板由主循环的探测脚本按线上目录实时生成：
-          #   opencode.deepseek.json —— DeepSeek 官方 API（主力，50%）
-          #   opencode.nvidia.json   —— NVIDIA glm-5.3 / glm-5-3-flash（副选，50%）
-          # opencode Zen 免费 deepseek（兜底）无需任何配置文件。
+          # provider 配置模板由主循环的探测脚本按线上目录实时生成（独立双家族）：
+          #   opencode.deepseek.json      —— DeepSeek 官方 API（DeepSeek 家族首选）
+          #   opencode.nvidia.json        —— NVIDIA glm-5.3（NVIDIA 家族首选）
+          #   opencode.nvidia-flash.json  —— NVIDIA glm-5.3-flash（NVIDIA 家族内降级）
+          # opencode Zen 免费 deepseek / big-pickle（DeepSeek 家族内兜底）无需任何配置文件。
+          # 两大家族相互独立：失效只在家族内级联，绝不跨家族回退。
           # harness 永远是 opencode：所有 provider 一律通过 `opencode run -m ...` 调用。
           echo "[info] opencode 配置目录就绪；provider 模板将在主循环探测后生成"
 
@@ -148,21 +150,24 @@ jobs:
           CLEAN_TIMEOUT=$((30*60))    # 30m
           APPLY_TIMEOUT=$((60*60))    # 1h（算力申请.md 检查）
 
-          # ================= provider 策略：50% DeepSeek 官方 / 50% NVIDIA GLM =================
-          # 主力（50%）：DeepSeek 官方 API —— https://api.deepseek.com/v1，
-          #             模型默认 deepseek-chat（官方稳定别名，探测目录自动校准）；
-          # 副选（50%）：https://integrate.api.nvidia.com/v1 的 glm-5.3
-          #             （目录中不存在时自动改用 glm-5-3-flash）；
-          # 兜底：DeepSeek 与 NVIDIA 都不可用时，临时用 opencode Zen 免费
-          #       deepseek（deepseek-v4.1-flash-free）保活循环，恢复后自动切回。
+          # ================= provider 策略：独立双家族（失效只在家族内级联，不跨家族） =================
+          # NVIDIA 家族（50%）：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
+          #             自动降级 glm-5.3-flash（https://integrate.api.nvidia.com/v1）；
+          #             两者都不可用时保持本家族重试，绝不切换到 DeepSeek 家族。
+          # DeepSeek 家族（50%）：DeepSeek 官方 API（https://api.deepseek.com/v1，
+          #             模型默认 deepseek-chat，官方稳定别名，探测目录自动校准）
+          #             → opencode Zen 免费 deepseek（deepseek-v4.1-flash-free）
+          #             → big-pickle；全链不可用时保持本家族重试，绝不切换到 NVIDIA 家族。
+          # 家族由 run_phase 在每个阶段开始时掷骰确定（NVIDIA_PROB%），阶段内固定。
           # harness 永远是 opencode：所有 provider 一律通过 `opencode run -m ...` 调用。
           NVIDIA_PROB=50
           FREE_MODEL="opencode/deepseek-v4.1-flash-free"
-          # ⭐ 兜底：免费 deepseek-v4.1-flash-free 不可用（限流/下线/调用失败）时，
-          #           切换同为 Zen 网关免费的 big-pickle（Big Pickle）。
+          # DeepSeek 家族内兜底：官方与免费 deepseek 均不可用时，切换同为 Zen 网关
+          #           免费的 big-pickle（Big Pickle）。
           PICKLE_MODEL="opencode/big-pickle"
           DEEPSEEK_MODEL=""
           NVIDIA_MODEL=""
+          NVIDIA_FLASH_MODEL=""
           CURRENT_PROVIDER=""
           PROVIDER_BROKEN=""
 
@@ -238,8 +243,11 @@ jobs:
             DEEPSEEK_MODEL=""; return 1
           }
 
-          # ---------- NVIDIA GLM 探测：优先 glm-5.3，没有则 glm-5-3-flash ----------
-          # 探测成功同时把 nvidia provider 配置写入 ~/.config/opencode/opencode.nvidia.json。
+          # ---------- NVIDIA GLM 探测（NVIDIA 家族内两级：glm-5.3 → glm-5.3-flash） ----------
+          # 用法: probe_nvidia.py <primary|flash> —— primary 探测 glm-5.3（非 flash 版，
+          # 目录中不存在时输出 NOMODEL，由调用方在 NVIDIA 家族内降级 flash）；
+          # flash 探测 glm-5.3-flash。探测成功分别把 provider 配置写入
+          # opencode.nvidia.json / opencode.nvidia-flash.json。
           cat > /tmp/probe_nvidia.py <<'PYEOF'
           import json, os, sys, urllib.request
 
@@ -249,6 +257,8 @@ jobs:
 
           def norm(s):
               return s.lower().replace('.', '-').replace('_', '-')
+
+          mode = sys.argv[1] if len(sys.argv) > 1 else 'primary'
 
           key = os.environ.get('NVIDIA_API_KEY', '').strip()
           if not key:
@@ -271,14 +281,15 @@ jobs:
                   return (0 if norm(x.rsplit('/', 1)[-1]) == target else 1, len(x))
               return sorted(cands, key=keyf)[0]
 
-          primary = [i for i in ids if 'glm-5-3' in norm(i) and 'flash' not in norm(i)]
-          flash = [i for i in ids if 'glm-5-3' in norm(i) and 'flash' in norm(i)]
-          mid = pick(primary, 'glm-5-3') or pick(flash, 'glm-5-3-flash')
+          if mode == 'flash':
+              mid = pick([i for i in ids if 'glm-5-3' in norm(i) and 'flash' in norm(i)], 'glm-5-3-flash')
+          else:
+              mid = pick([i for i in ids if 'glm-5-3' in norm(i) and 'flash' not in norm(i)], 'glm-5-3')
           if not mid:
               emit('NOMODEL')
 
           cfg = {}
-          base = sys.argv[1] if len(sys.argv) > 1 else ''
+          base = sys.argv[2] if len(sys.argv) > 2 else ''
           if base and os.path.exists(base):
               try:
                   with open(base) as f:
@@ -297,9 +308,12 @@ jobs:
               'models': {mid: {'name': mid}},
           }
           cfg['model'] = 'nvidia/' + mid
+          cfg_path = os.path.expanduser(
+              '~/.config/opencode/opencode.nvidia-flash.json' if mode == 'flash'
+              else '~/.config/opencode/opencode.nvidia.json')
           try:
-              os.makedirs(os.path.expanduser('~/.config/opencode'), exist_ok=True)
-              with open(os.path.expanduser('~/.config/opencode/opencode.nvidia.json'), 'w') as f:
+              os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+              with open(cfg_path, 'w') as f:
                   json.dump(cfg, f, indent=2, ensure_ascii=False)
           except Exception:
               pass
@@ -307,13 +321,16 @@ jobs:
           PYEOF
 
           probe_nvidia() {
+            # $1: primary|flash —— 分别探测 glm-5.3 / glm-5.3-flash
             local out st mid
-            out="$(python3 /tmp/probe_nvidia.py 2>/dev/null)" || out="DOWN"
+            out="$(python3 /tmp/probe_nvidia.py "$1" 2>/dev/null)" || out="DOWN"
             st="${out%% *}"; mid="${out#* }"
             if [ "$st" = "OK" ] && [ "$mid" != "$out" ] && [ -n "$mid" ]; then
-              NVIDIA_MODEL="$mid"; return 0
+              if [ "$1" = "flash" ]; then NVIDIA_FLASH_MODEL="$mid"; else NVIDIA_MODEL="$mid"; fi
+              return 0
             fi
-            NVIDIA_MODEL=""; return 1
+            if [ "$1" = "flash" ]; then NVIDIA_FLASH_MODEL=""; else NVIDIA_MODEL=""; fi
+            return 1
           }
 
           # ---------- 切换 provider（每次调用都重写配置，防 agent 篡改） ----------
@@ -335,6 +352,11 @@ jobs:
                       "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
                 CURRENT_PROVIDER="nvidia"
                 ;;
+              nvidia_flash)
+                cp -f "$HOME/.config/opencode/opencode.nvidia-flash.json" \
+                      "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
+                CURRENT_PROVIDER="nvidia_flash"
+                ;;
               free)
                 rm -f "$HOME/.config/opencode/opencode.json" \
                       "$HOME/.config/opencode/opencode.jsonc" \
@@ -346,64 +368,53 @@ jobs:
             RATE_COUNT=0
           }
 
-          # ---------- 每次调用按 50/50 抽样选 provider，失效自动换边 ----------
+          # ---------- provider 家族化选择（独立级联，不跨家族） ----------
+          # NVIDIA 家族：glm-5.3 → glm-5.3-flash；DeepSeek 家族：官方 → 免费 deepseek → big-pickle。
+          # 任一家族全链失效时只重置本家族重试，绝不回退到另一个家族。
           pick_provider() {
-            local roll=$((RANDOM % 100)) want alt
-            if [ "$roll" -lt "$NVIDIA_PROB" ]; then want="nvidia"; else want="deepseek"; fi
-
-            if [ "$want" = "nvidia" ]; then
-              if ! is_broken nvidia && probe_nvidia; then
-                switch_provider nvidia
-                echo "[info] 抽中 NVIDIA GLM（${NVIDIA_PROB}%）：$NVIDIA_MODEL"
-                return 0
+            local fam="${1:-deepseek}" round
+            for round in 1 2; do
+              if [ "$fam" = "nvidia" ]; then
+                if ! is_broken nvidia && probe_nvidia primary; then
+                  switch_provider nvidia
+                  echo "[info] NVIDIA 家族：使用 glm-5.3（$NVIDIA_MODEL）"
+                  return 0
+                fi
+                if ! is_broken nvidia_flash && probe_nvidia flash; then
+                  switch_provider nvidia_flash
+                  echo "[info] NVIDIA 家族：glm-5.3 不可用，降级 glm-5.3-flash（$NVIDIA_FLASH_MODEL）"
+                  return 0
+                fi
+              else
+                if ! is_broken deepseek && probe_deepseek; then
+                  switch_provider deepseek
+                  echo "[info] DeepSeek 家族：使用 DeepSeek 官方 API（$DEEPSEEK_MODEL）"
+                  return 0
+                fi
+                if ! is_broken free; then
+                  switch_provider free
+                  echo "[info] DeepSeek 家族：官方端点不可用，改用 opencode 免费 deepseek（$FREE_MODEL）"
+                  return 0
+                fi
+                if ! is_broken pickle; then
+                  switch_provider pickle
+                  echo "[info] DeepSeek 家族：免费 deepseek 不可用，改用 big-pickle（$PICKLE_MODEL）"
+                  return 0
+                fi
               fi
-              echo "[info] 抽中 NVIDIA 但端点/模型不可用（无 key / 失效 / 无 glm-5.3(-flash)），回退 DeepSeek 官方"
+              # 本家族成员全部失效：清空失效标记后再探一轮（第二轮仍失败则返回失败）
+              [ "$round" -eq 1 ] && PROVIDER_BROKEN=""
+            done
+            if [ "$fam" = "nvidia" ]; then
+              echo "[warn] NVIDIA 家族（glm-5.3 / glm-5.3-flash）均不可用——独立策略不切换 DeepSeek 家族，稍后重试"
             else
-              if ! is_broken deepseek && probe_deepseek; then
-                switch_provider deepseek
-                echo "[info] 使用 DeepSeek 官方 API（$((100-NVIDIA_PROB))%）：$DEEPSEEK_MODEL"
-                return 0
-              fi
-              echo "[info] DeepSeek 官方端点不可用，尝试 NVIDIA"
+              echo "[warn] DeepSeek 家族（官方 / 免费 deepseek / big-pickle）均不可用——独立策略不切换 NVIDIA 家族，稍后重试"
             fi
-
-            if [ "$want" = "nvidia" ]; then alt="deepseek"; else alt="nvidia"; fi
-            if [ "$alt" = "deepseek" ]; then
-              if ! is_broken deepseek && probe_deepseek; then
-                switch_provider deepseek
-                echo "[info] 回退 DeepSeek 官方：$DEEPSEEK_MODEL"
-                return 0
-              fi
-            else
-              if ! is_broken nvidia && probe_nvidia; then
-                switch_provider nvidia
-                echo "[info] 回退 NVIDIA GLM：$NVIDIA_MODEL"
-                return 0
-              fi
-            fi
-
-            # 两个官方端点都不可用：opencode Zen 免费 deepseek 兜底保活
-            if ! is_broken free; then
-              switch_provider free
-              echo "[warn] DeepSeek/NVIDIA 均不可用，本轮使用 opencode Zen 免费 deepseek 兜底"
-              return 0
-            fi
-
-            # ⭐ 免费兜底 deepseek 也不可用：切换 big-pickle（同为 Zen 网关免费模型）
-            if ! is_broken pickle; then
-              switch_provider pickle
-              echo "[warn] 免费 deepseek 兜底不可用，本轮改用 big-pickle：$PICKLE_MODEL"
-              return 0
-            fi
-
-            echo "[warn] 所有 provider 本阶段均失败过，重置失效标记继续尝试"
-            PROVIDER_BROKEN=""
-            switch_provider free
-            return 0
+            return 1
           }
 
           # ---------- 思考强度（仅免费 deepseek 兜底路径）：max > high > 不设置 ----------
-          # DeepSeek 官方与 NVIDIA GLM 走 openai-compatible 端点，不设置思考强度。
+          # DeepSeek 官方与 NVIDIA 家族（glm-5.3 / glm-5.3-flash）走 openai-compatible 端点，不设置思考强度。
           # 免费兜底先从 opencode 模型目录（models.dev）解析其支持的
           # reasoning effort 档位：有 max 选 max，没有 max 选 high，否则不设置。
           # 检测失败时兜底 max（无效 variant 会被 opencode 静默忽略）。
@@ -435,7 +446,7 @@ jobs:
             NONE)     VARIANT="" ;;
             *)        VARIANT="max" ;;
           esac
-          echo "[info] DeepSeek官方=$((100-NVIDIA_PROB))% | NVIDIA GLM=${NVIDIA_PROB}% | 兜底=$FREE_MODEL | 兜底思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
+          echo "[info] 独立双家族：NVIDIA(glm-5.3→glm-5.3-flash)=${NVIDIA_PROB}% | DeepSeek(官方→免费→big-pickle)=$((100-NVIDIA_PROB))% | 免费路径思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
 
           i=0
           FAIL_COUNT=0
@@ -533,7 +544,7 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 单阶段执行（50/50 抽样选 provider，失效自动换边，反复重试） ----------
+          # ---------- 单阶段执行（每阶段掷骰定家族，家族内独立级联，反复重试） ----------
           # 参数: phase_name  prompt  timeout_seconds
           # 返回: 0 成功 / 124|137|143 超时被杀（预算耗尽，改动照常提交）/ 1 时间用尽
           run_phase() {
@@ -542,6 +553,9 @@ jobs:
             FAIL_COUNT=0
             RATE_COUNT=0
             PROVIDER_BROKEN=""
+            # 家族掷骰（每阶段一次，阶段内固定）：NVIDIA 家族与 DeepSeek 家族相互独立
+            local fam_roll=$((RANDOM % 100)) PHASE_FAMILY
+            if [ "$fam_roll" -lt "$NVIDIA_PROB" ]; then PHASE_FAMILY="nvidia"; else PHASE_FAMILY="deepseek"; fi
 
             while :; do
               attempt=$((attempt+1))
@@ -558,17 +572,22 @@ jobs:
                 return 1
               fi
 
-              pick_provider
+              if ! pick_provider "$PHASE_FAMILY"; then
+                echo "[warn] phase=$phase 家族=$PHASE_FAMILY 本轮全部不可用，180s 后重试 (attempt=$attempt)"
+                sleep 180
+                continue
+              fi
               local MODEL_DESC="$FREE_MODEL"
               case "$CURRENT_PROVIDER" in
-                deepseek) MODEL_DESC="deepseek/$DEEPSEEK_MODEL" ;;
-                nvidia)   MODEL_DESC="nvidia/$NVIDIA_MODEL" ;;
-                pickle)   MODEL_DESC="$PICKLE_MODEL" ;;
+                deepseek)     MODEL_DESC="deepseek/$DEEPSEEK_MODEL" ;;
+                nvidia)       MODEL_DESC="nvidia/$NVIDIA_MODEL" ;;
+                nvidia_flash) MODEL_DESC="nvidia/$NVIDIA_FLASH_MODEL" ;;
+                pickle)       MODEL_DESC="$PICKLE_MODEL" ;;
               esac
               echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER | model=$MODEL_DESC ==========="
 
               # 防止 agent 写入的 opencode 配置干扰后续调用：
-              # deepseek/nvidia 路径恢复探测生成的模板，free 路径确保无自定义配置
+              # deepseek/nvidia/nvidia_flash 路径恢复探测生成的模板，free 路径确保无自定义配置
               # （switch_provider 已处理 ~/.config/opencode/，这里只清仓库内残留）
               rm -f ./opencode.json ./opencode.jsonc ./.opencode.json 2>/dev/null
 
@@ -580,6 +599,10 @@ jobs:
                 nvidia)
                   record_model "nvidia/$NVIDIA_MODEL"
                   timeout --kill-after=180 "$budget" opencode run -m "nvidia/$NVIDIA_MODEL" "$prompt" 2>&1 | tee "$OUT"
+                  ;;
+                nvidia_flash)
+                  record_model "nvidia/$NVIDIA_FLASH_MODEL"
+                  timeout --kill-after=180 "$budget" opencode run -m "nvidia/$NVIDIA_FLASH_MODEL" "$prompt" 2>&1 | tee "$OUT"
                   ;;
                 pickle)
                   # big-pickle 无 reasoning effort 档位，不传 --variant
@@ -608,7 +631,7 @@ jobs:
                 return $EC
               fi
 
-              # 429 限流 / 免费额度限制：标记当前 provider 本阶段失效，换边重试
+              # 429 限流 / 免费额度限制：标记当前 provider 本阶段失效，家族内降级重试
               if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier"; then
                 RATE_COUNT=$((RATE_COUNT+1))
                 mark_broken "$CURRENT_PROVIDER"
