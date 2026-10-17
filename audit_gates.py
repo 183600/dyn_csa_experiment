@@ -28,8 +28,7 @@
   methodology  受控对比 / 消融完整性 / 统计可靠性：逐臂全种子设置一致性、
                每个创新点的留一对照是否完整、n 与 mean±std（零 GPU）
   failures     失败与缺失：error 记录按臂集中度（选择偏差读数，零 GPU）
-  budget       规模核算：6ND 代理 FLOPs 估算 + TimeGuard 实测用时对账
-               （理论 FLOPs ≠ 实测速度，两者并列报告，零 GPU）
+  budget       规模核算：6ND 估算 + TimeGuard 记录对账（零 GPU）
   efficiency   prefill/decode/容量读数工具（需要模型；给出可复用函数
                与 CPU 微型演示——不是实验，是测量代码自检）
   report       汇总运行本地可执行的全部审计，输出 audit_report.json
@@ -682,9 +681,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
     if len(per_arm) >= 2:
         # The cross-arm check must use the SAME gate as the statistics
         # (`pair_reason`): identical run_cfg AND identical train_knobs AND the
-        # same steps/tokens.  Counting distinct values per arm (the old form)
-        # only detects mixing *inside* one arm; one arm could still run a
-        # different optimizer while every arm looked internally consistent.
+        # same steps/tokens.
         recs_map, _amb = L._variant_seed_map(summ)
         _cv_arms = [a for a in arms if a in per_arm]
         if recs_map and len(_cv_arms) >= 1:
@@ -878,15 +875,14 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
 
 
 # ---------------------------------------------------------------------------
-# 8) 规模核算：6ND 代理 FLOPs 估算 + 实测用时对账
+# 8) 规模核算：6ND 估算 + TimeGuard 记录对账
 # ---------------------------------------------------------------------------
 
 def train_flops_estimate(params, tokens, attn_overhead=0.35):
-    """6ND 估算 + 注意力项系数（评审二轮·意见七：代理 ≠ 实测）。
+    """6ND 估算 + 注意力项系数。
 
-    6·N·D 是前向+反向的主流近似；稀疏选择/池化/激活重算与长序列注意力
-    不与参数量成比例，这里用一个**显式声明的**注意力项系数给上界感，
-    报告时必须同时给出 TimeGuard 实测秒数——两个口径并列，不得只报其一。"""
+    6·N·D 是前向+反向的常用近似；稀疏选择/池化/激活重算与长序列注意力
+    不与参数量成比例，因此用一个**显式声明的**注意力项系数。"""
     n = float(params)
     d_tok = float(tokens)
     base = 6.0 * n * d_tok
@@ -926,13 +922,10 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
 # ---------------------------------------------------------------------------
 
 def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
-    """端到端 prefill / 增量 decode 计时 + 峰值设备占用（测量代码，非实验）。
+    """端到端 prefill / 增量 decode 计时（测量代码，非实验）。
 
-    评审问题：理论 FLOPs 被当成实测速度。本函数给出可复用的测量口径：
     prefill = 整段前向一次的墙钟；decode = 逐 token 前缀推进的墙钟与
-    每 token 均摊；峰值设备占用（CUDA 时）经 torch.cuda.max_memory_allocated
-    记录。KV 缓存增长在本仓库的稀疏臂上是块摘要级的，直接以
-    max_memory_allocated 随长度的差值读出，不做理论推断。"""
+    每 token 均摊。"""
     import torch
     import time as _t
     res = {'n_tokens': int(ids.shape[1])}
@@ -977,7 +970,7 @@ def audit_efficiency_demo():
     ids = torch.randint(0, 256, (1, 128), dtype=torch.long)
     res = measure_prefill_decode(model, ids, dev, warmup=0, iters=1)
     res['status'] = 'ok'
-    res['note'] = 'CPU demo of the measurement harness; run measure_prefill_decode on the real checkpoints (per arm, per length) for the efficiency panel — analytic FLOPs (audit_budget) and measured wall-clock are reported side by side, never merged'
+    res['note'] = 'CPU demo of the measurement harness; run measure_prefill_decode on the real checkpoints (per arm, per length) for the efficiency panel'
     print(json.dumps(res, ensure_ascii=False, indent=2))
     return res
 

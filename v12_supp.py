@@ -12,8 +12,7 @@
            评审二轮新增 span/doc/topical 腐坏 + NIAH-natural + 从头训练
            对照臂）；
   P5S2  —— 等训练 token 的大模型规模臂（P3SL_TOK，8000 步）；
-  P5S3  —— 6ND 参数量代理规模的大模型规模臂（P3SL_FLOP，参数量比例缩步，
-           非实测等 FLOPs——评审二轮·意见七口径）；
+  P5S3  —— 6ND 参数量代理规模的大模型规模臂（P3SL_FLOP，参数量比例缩步）；
   P5T   —— **冻结后的独立最终测试**：按仓库根的冻结清单
            `confirmation_frozen.json`（预注册主比较、终点、种子数、检验与
            校正规则），在 WikiText-103 的 held-out test split（wiki.test.raw，
@@ -440,7 +439,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
     model.eval()
     # score EVERY loaded row: test_ids is the frozen slice already sliced to
     # the manifest's n_seqs_clean, and data_fp is computed over all of them.
-    # eval_length_gen's default (n_seq=8) would silently measure only the
+    # eval_length_gen's default (n_seq=8) would measure only the
     # first 8 rows while the lock/fingerprint claim the full 16-row slice.
     r = V.eval_length_gen(model, test_ids, eval_lens, DEVICE, max_pos=None, n_seq=int(test_ids.shape[0]))
     del model

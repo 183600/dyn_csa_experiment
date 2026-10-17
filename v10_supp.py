@@ -669,14 +669,12 @@ P3SL_FLOP_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_lflop', steps=None)
 def _flop_matched_steps(small_cfg, large_cfg, min_steps=250):
     """Deterministic equal-total-compute PROXY step count for the large arm.
 
-    评审二轮·意见七修订：这里的「等计算」是 6·N·D 参数量代理（N=参数量，
-    D=token 数），**不是实测等 FLOPs**——稀疏选择、池化、注意力与激活重算
-    的计算量不与参数量成比例；若触发步数下限，也会偏离原目标规模。面板报告
-    必须把它称为「6ND 参数量代理规模臂」，并同时报告实际 token 数、参数
-    量、估篇 FLOPs（audit_gates.train_flops_estimate）与 TimeGuard 实测
-    用时；等 token 与等计算量是不同问题，须分别陈述。步数推导：先在 CPU
-    上按面板配置构建两个面板的模型（不碰 DEVICE、无 RNG 副作用），取两
-    臂（csa/full）参数量的平均值，large_steps = small_steps ·
+    这里的「等计算」是 6·N·D 参数量代理（N=参数量，D=token 数），不是实测
+    等 FLOPs——稀疏选择、池化、注意力与激活重算的计算量不与参数量成比例；
+    若触发步数下限，也会偏离原目标规模。面板报告必须把它称为「6ND 参数
+    量代理规模臂」，并分别陈述等 token 与等计算量。步数推导：先在 CPU 上
+    按面板配置构建两个面板的模型（不碰 DEVICE、无 RNG 副作用），取两臂
+    （csa/full）参数量的平均值，large_steps = small_steps ·
     N_small / N_large。结果打印完整推导以供审计；确定性：同一代码下重复
     调用逐位相同（count_params 是形状的纯函数）。步数下限 250（warmup=100
     时余下学习率调度仍有意义）——触发下限时必须如实报告「代理值被下限
@@ -711,7 +709,7 @@ def run_phase(name, guard, par=None):
         if seeds:
             payload = dict(payload, seeds=list(seeds))
         if pname == 'P3SL3' and payload.get('steps') is None:
-            # equal-compute arm: steps derived deterministically at run time
+            # proxy-compute arm: steps derived deterministically at run time
             payload = dict(payload, steps=_flop_matched_steps(P3SS_CFG, payload))
         if isinstance(_ctx, dict):
             _ctx = dict(_ctx, module='v10_supp', ckpt_install=True, ckpt_flag=bool(_ctx.get('ckpt_flag')) or pname == 'P3T')

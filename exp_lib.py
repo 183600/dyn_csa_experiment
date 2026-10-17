@@ -183,8 +183,7 @@ def cosine_similarity_consecutive(H, eps=1e-08):
         return (h[..., 1:, :] * h[..., :-1, :]).sum(dim=-1)
     _step = _rows - 1
     _lead_sl = (slice(None),) * (H.dim() - 2)
-    # Preallocate the final [.., T-1] result and fill the per-chunk slices
-    # (each value is the same per-pair reduction as before).
+    # Fill the per-chunk slices of the [.., T-1] result.
     out = H.new_empty(H.shape[:-2] + (T - 1,))
     for s in range(0, T - 1, _step):
         e = min(s + _rows, T)
@@ -565,8 +564,8 @@ _CAUSAL_TRI = None
 def _causal_donor(device, width):
     # 单一共享 bool donor（True = j > i 的被掩 lane）：同一 [width, width]
     # 表按 [:T, :T] 切片服务一切 T <= width；_mask_buffer 的 causal 分支
-    # 说明它替代旧 fp32 0/-inf 加性 donor 的逐位论证。donor 永驻
-    #（pinned key），随 width 单调重建。
+    # 说明其与加性 donor 的逐位对应。donor 永驻（pinned key），随 width
+    # 单调重建。
     global _CAUSAL_TRI
     dev_s = _dev_str(device)
     held = _CAUSAL_TRI
@@ -583,9 +582,8 @@ _IDX_CACHE_BYTES = 0
 _MASK_CACHE_BUDGET_BYTES = 192 << 20
 
 def _mask_budget(n):
-    # 驻留 mask 尺寸随 T 增长：pinned 的 causal donor 与 cw 现为 bool 表
-    #（各 T² 字节），cwf（SDPA 的加性形式）与 bandw/zero 仍为 4·T² 字节；
-    # 上限随 T 放大让这几张 mask 共存，只影响缓存命中，不影响任何值。
+    # mask 表随 T 增长；上限随 T 放大让这几张 mask 共存，只影响缓存命中，
+    # 不影响任何值。
     return max(_MASK_CACHE_BUDGET_BYTES, 6 * int(n) * int(n))
 
 def _cache_bytes(t):
@@ -595,10 +593,9 @@ def _cache_bytes(t):
         return sum((_cache_bytes(_v) for _v in t))
     try:
         nbytes = int(t.numel()) * int(t.element_size())
-        # Views can share storage: charge the resident storage when it is
-        # smaller than numel (a stride-0 expand has numel O(n·m) but occupies
-        # O(m)); min() keeps a sliced view of a larger buffer from
-        # over-counting.
+        # Views can share storage: charge min(logical size, storage size) so a
+        # stride-0 expand and a sliced view of a larger buffer are not
+        # over-counted.
         try:
             nbytes = min(nbytes, int(t.untyped_storage().nbytes()))
         except Exception:
@@ -724,12 +721,9 @@ def _dense_causal_window_rows(T, window, s, e, device):
     # Row slice [s:e] of the dense causal/window masked-lane table: allowed
     # lanes are exactly (i-window < j <= i), the same lanes
     # `_causal_window_mask_build` fills with -inf, so masked_fill_ with this
-    # table writes exactly the -inf the additive row slice added.  The bool
-    # table is T/4 smaller than the fp32 rows and replaces the per-chunk
-    # [rows, T] fp32 zeros+fill materialization entirely (the fill runs
-    # straight on the logits).  Built outside inference mode so a row slice
-    # first built during eval can still serve training (masked_fill_ saves
-    # the mask for backward).
+    # table writes exactly the -inf the additive row slice added.  Built
+    # outside inference mode so a row slice first built during eval can still
+    # serve training (masked_fill_ saves the mask for backward).
     with torch.inference_mode(False):
         pos = _arange_cache(T, device)
         q = pos[s:e, None]
@@ -742,9 +736,9 @@ def _dense_causal_window_rows(T, window, s, e, device):
 
 def causal_window_mask_f(T, window, device, dtype):
     """SDPA 的加性 0/-inf mask（attn_mask 只吃加性形式；0 与 -inf 的逐元素
-    cast 对任何浮点 dtype 精确，缓存键含 dtype，mask 下游只读）。dtype 相同
-    则无新分配。window<=0/>=T 的因果分支由 bool donor（`causal_mask`）现做
-    masked_fill 重建——0.0/-inf 与旧 fp32 donor 的 .to(dtype) 逐元素相同。"""
+    cast 对任何浮点 dtype 精确，缓存键含 dtype，mask 下游只读）。
+    window<=0/>=T 的因果分支由 bool donor（`causal_mask`）经 masked_fill
+    重建。"""
     key = (_dev_str(device), 'cwf', int(T), int(window), str(dtype))
     if window <= 0 or window >= T:
         base = causal_mask(T, device)
@@ -773,7 +767,7 @@ def _attn_transient_budget(device):
     try:
         if device.type == 'cuda':
             free, _total = torch.cuda.mem_get_info(device)
-            # 上限随空闲量缩放，并封顶 _ATTN_TRANSIENT_CAP_BYTES；行分块是
+            # 上限由设备状态决定并封顶 _ATTN_TRANSIENT_CAP_BYTES；行分块是
             # 纯行划分（任意宽度下逐行值逐位相同，见 gathered_attention 的
             # chunk 注释），因此上限变化只影响分块宽度，不改变任何值。
             val = max(64 << 20, min(int(free) // 4, _ATTN_TRANSIENT_CAP_BYTES))
@@ -786,10 +780,8 @@ _FULL_ATTN_TRANSIENT_BYTES = 256 << 20
 
 def _full_attn_row_chunk(device, B, nh, T, elem_size, max_rows=1024):
     # Row chunk for the sink-capable dense path: the logits table is
-    # [B, nh, rows, T], so bounding `rows` bounds its peak bytes.  A CUDA
-    # device uses its measured free-memory budget; every other device uses a
-    # fixed transient cap (the same 256 MiB `gathered_attention` already
-    # uses).  Chunking is a pure row partition, so no value changes.
+    # [B, nh, rows, T], so bounding `rows` bounds the table.  Chunking is a
+    # pure row partition, so no value changes.
     row_chunk = max(1, min(int(T), int(max_rows)))
     budget = _attn_transient_budget(device)
     if budget is None:
@@ -879,8 +871,8 @@ def first_occurrence_mask(idx):
     # that stability places first — which is the earliest original column.
     # Identical output on either branch.
     if idx.shape[1] <= 64:
-        # rowwise-independent: chunk rows to bound the transient [rows,k,k]
-        # comparison matrix; per-row results are identical either way.
+        # rowwise-independent: chunk rows; per-row results are identical
+        # either way.
         k = idx.shape[1]
         row_chunk = max(1, (128 << 20) // max(k * k, 1))
         if row_chunk >= idx.shape[0]:
@@ -1088,10 +1080,8 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         ov_len = np.maximum(end_prev - ov_start, 0)
         n_a = B * max_len
         n_b = B * W_b
-        # Build every part directly in the final flats (the same integer ops
-        # as before, just with in-place numpy destinations).  Requested padding
-        # is part of the same allocation, so the caller never has to copy the
-        # flat again to bucket-align it.
+        # Build every part directly in the final flats with in-place numpy
+        # destinations.  Requested padding is part of the same allocation.
         _pi = (-(n_a + 2 * n_b + max_len)) % int(pad_to) if int(pad_to) > 1 else 0
         _pb = (-(n_a + n_b)) % int(pad_to) if int(pad_to) > 1 else 0
         flat_i = np.empty(n_a + 2 * n_b + max_len + _pi, dtype=np.int64)
@@ -1492,10 +1482,6 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         sc_a = sc[:, :max_len]
         sc_b = sc[:, max_len:]
         comp[_b0:_b1] = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
-        # Release this chunk's saved activations before the next chunk's
-        # gathers allocate: Python assigns the next iteration's names only
-        # after evaluating its right-hand sides, so without this the previous
-        # chunk's tables would stay alive at the next chunk's peak.
         del sc, sc_a, sc_b, Xam, Xbm, _ma, _mb
     # Identity-order path: when `order` is the cached arange, order[last_idx]
     # returns exactly last_idx (arange[i] == i, exact integers — index
@@ -1742,7 +1728,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         # The no-soft form is only safe when no differentiable path reaches
         # the indexer (the S prior is the only route for its gradients).  A
         # caller that asks for no-soft while the indexer tensors require grad
-        # would otherwise silently detach it, so re-enable the prior here.
+        # would otherwise detach it, so re-enable the prior here.
         if not need_soft and any((_t is not None and _t.requires_grad for _t in (qI, kI, w_idx))):
             need_soft = True
     pos = _arange_cache(n, dev)
@@ -1966,7 +1952,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         mem_budget_bytes = 256 << 20
     _heads = q.shape[1] if q.dim() == 3 else 1
     _M = max(1, int(topk_idx.shape[1]) + int(w))
-    # 分块行字节估算（保守上界）。
+    # 分块行估算（保守上界）。
     _per_row = 4 * _M * _heads * int(q.shape[-1]) + 2 * _M * _heads
     _bytes_per_chunk_row = _per_row * q.element_size()
     _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
@@ -1994,8 +1980,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         v_all = v_stacked if v_stacked is not None else torch.cat([v_blk, v_sw], 0)
         # `k_stacked` is the analogous row-contiguous [blocks | window] K
         # table (the normalized K columns of the fused KV head in `_single`).
-        # Handing it in removes the full-width cat copy; the soft path can
-        # gather both halves from it with the window-offset row index.
+        # The soft path can gather both halves from it with the window-offset
+        # row index.
         if k_stacked is not None:
             k_all = k_stacked
         else:
@@ -2153,8 +2139,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             soft_logits[:, :, :_nb].add_(soft_log_g[:, None, :]).clamp_min_(_MINL)
             soft_logits.masked_fill_(nvalid, _MINL)
             soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
-            # soft_logits is dead once soft_attn is built; release it before the
-            # plain path builds its own attention table.
+            # soft_logits is dead once soft_attn is built.
             del soft_logits, soft_log_g
         logits.masked_fill_(nvalid, _MINL)
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
@@ -2163,19 +2148,15 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         if not _has_sink:
             attn.mul_(anyrow[:, None, None])
         out[s:e] = _einsum('qhm,qmhd->qhd', attn, _tk2(v_all, _rows))
-        # Drop this chunk's tables before the next chunk's gathers allocate
-        # (same peak-memory reason as the pooling loop).  `soft_attn` only
-        # exists on the live-soft path.
+        # `soft_attn` only exists on the live-soft path.
         del logits, attn, nvalid, anyrow, keep, _sel_rows, _win_local, _win_rows, _rows, qseg
         if _soft_live:
             del soft_attn
     return out
 
-# CPU-only activation-checkpoint policy: recomputation is a pure speed/memory
-# trade, and this box has no VRAM budget to protect.  Still bound the extra
-# resident activations so scaling a CPU run does not turn into an OOM: below
-# the per-call limits the saved tensors are kept (faster), above them the
-# existing recompute path runs unchanged.  CUDA always keeps recompute.
+# CPU-only activation-checkpoint policy: below the per-call limits the saved
+# tensors are kept; above them the existing recompute path runs unchanged.
+# CUDA always keeps recompute.
 _CPU_ACTIVE_BATCH = [1]
 _CPU_GATHER_CKPT_BYTES = 512 << 20
 _CPU_POOL_CKPT_BYTES = 64 << 20
@@ -2189,8 +2170,8 @@ def _gathered_attention_trainable(*args, **kwargs):
     # 无 RNG，且分块上限经 _ATB_EPOCH 缓存在一次运行内不变，因此 chunk
     # 边界与每个中间值逐位相同，梯度与直调形式逐位一致（design notes §6.1
     # 的 transport 论证在「重算同一纯函数」上的形式）。函数内无 RNG，故
-    # 跳过 checkpoint 的 RNG 状态存取（preserve_rng_state=False）——省掉
-    # 每次调用的 CUDA RNG 快照/恢复，重算不消耗也不改写任何随机流。
+    # 跳过 checkpoint 的 RNG 状态存取（preserve_rng_state=False），重算不
+    # 消耗也不改写任何随机流。
     if torch.is_grad_enabled() and args[0].requires_grad:
         q = args[0]
         if q.device.type != 'cuda':
@@ -2701,8 +2682,7 @@ class HybridAttention(nn.Module):
                     cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
                     self._cuts.append(cuts)
         # Normalizing an all-zero content table is exactly zero (0/eps == 0),
-        # so the zero-content ablation skips the normalize kernel and its
-        # transient copy while keeping the same values.
+        # so the zero-content ablation keeps the same values.
         core_kv = (torch.zeros_like(comp_kv) if cfg.content_mode == 'zero'
                    else F.normalize(comp_kv, dim=-1))
         kv_local = F.normalize(Ca_raw, dim=-1)
@@ -2719,11 +2699,10 @@ class HybridAttention(nn.Module):
             v_stacked = _kvh[:, self.nh * self.hd:].view(_Bn + T, self.nh, self.hd)
             v_blk = v_stacked[:_Bn]
             v_sw = v_stacked[_Bn:]
-            # Normalize both K halves in one row-wise pass over the fused K
-            # columns: each row's norm/divide is independent, so the values are
-            # the same as the two per-half normalizations, while the result is
-            # one contiguous [blocks | window] table the gather can consume
-            # without the later cat copy.  `_kvh` stays alive through v_stacked.
+            # Normalize both K halves over the fused K columns: each row's
+            # norm/divide is independent, so the values are the same as the two
+            # per-half normalizations.  The result is one contiguous
+            # [blocks | window] table.  `_kvh` stays alive through v_stacked.
             k_stacked = F.normalize(_kvh[:, :self.nh * self.hd].view(_Bn + T, self.nh, self.hd), dim=-1)
             k_blk = k_stacked[:_Bn]
             k_sw = k_stacked[_Bn:]
@@ -2823,11 +2802,11 @@ class HybridAttention(nn.Module):
             return _CK.sparse_layer_forward(self, x, pre_all, gate_sigs, pre_blocks)
         if pre_blocks is not None:
             _prefetch_pool_geometry(self, pre_blocks, T, x.device)
-        # Preallocate the batch output and write each row's attention output in
-        # place: the stacked buffer holds exactly the tensor torch.stack would
-        # have built (a per-row copy into the same layout), and the CopySlices
-        # backward hands each row the identical grad slice — value-identical to
-        # the stack form (transport only, design notes §6.1).
+        # Write each row's attention output into the batch output: the stacked
+        # buffer holds exactly the tensor torch.stack would have built (a
+        # per-row copy into the same layout), and the CopySlices backward hands
+        # each row the identical grad slice — value-identical to the stack form
+        # (transport only, design notes §6.1).
         outs = torch.empty(B, T, d, device=x.device, dtype=x.dtype)
         gates = []
         _prev_batch = _CPU_ACTIVE_BATCH[0]
@@ -2968,8 +2947,8 @@ class SmallGPT(nn.Module):
 
     def trunk(self, ids):
         # Full forward minus the LM head; sets self.comp_reg exactly as forward
-        # did (the reg terms are accumulated inside the single block loop — same
-        # addition order as the previous two-pass form).
+        # did (the reg terms are accumulated inside the single block loop — the
+        # same addition order as the full forward).
         T = ids.shape[1]
         x = self.tok(ids) + self.pos.weight[:T]
         reg = None
@@ -3008,10 +2987,7 @@ class SmallGPT(nn.Module):
         _ck = torch.is_grad_enabled() and h.requires_grad
         if _ck and h.device.type != 'cuda':
             # Every chunk's logits stay alive in the graph until backward, so
-            # the retained total is budgeted over the whole sequence (not just
-            # one chunk); otherwise a longer sequence keeps every chunk's
-            # logits and can exhaust host memory even though each individual
-            # chunk passes the limit.
+            # the limit covers the whole sequence, not just one chunk.
             _saved = 3 * int(ids.shape[0]) * int(ids.shape[1]) * int(vocab) * 4
             _ck = not _cpu_saved_ok(_saved, _CPU_CE_CKPT_BYTES)
         for s in range(0, ids.shape[1], chunk):
@@ -3200,8 +3176,7 @@ def _validate_token_ids(ids, vocab, label='token ids'):
 
     A negative or out-of-vocabulary id would either index an embedding row
     outside the model (Python/NumPy wraparound) or silently mask corruption in
-    the split.  This is cheap relative to tokenisation and runs on every cold
-    build and every cache hit.
+    the split.  It runs on every cold build and every cache hit.
     """
     arr = np.asarray(ids)
     if arr.size == 0:
@@ -3272,9 +3247,9 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     vp_path = os.path.join(cache_dir, f'val_bnd_{tag}.npy')
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
-        # In-process memo: the served bytes are exactly what a fresh
+        # In-process memo: the served arrays are exactly what a fresh
         # load would return and the returned objects keep their identity,
-        # so the identity-keyed resident-corpus cache in batch_iter
+        # so the identity-keyed corpus cache in batch_iter
         # (_PINNED_HOST_CACHE) behaves exactly as it would without the
         # memo.  The memo key carries every file's size+mtime, so an
         # externally rebuilt cache is re-read (and re-verified) instead
@@ -3355,9 +3330,9 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         _flush()
         if not chunks:
             return np.empty(0, dtype=np.int64)
-        # a single chunk is handed out directly (a copy of the same values);
-        # the concatenation and the [:cap_tokens] truncation are the same
-        # integers the single-list form produced.
+        # a single chunk is handed out directly; the concatenation and the
+        # [:cap_tokens] truncation are the same integers the single-list form
+        # produced.
         ids = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
         return ids[:cap_tokens]
     print(f'[data] tokenising train (cap {n_train_tokens} tokens) ...')
@@ -3492,7 +3467,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
             _problems.append(f"tokenizer was fitted on {meta.get('tokenizer_fit_split')!r}, not train")
         # A cached test set is only pairable if its tokenizer was fitted on the
         # SAME train prefix as the train/validation cache.  Verifying this on
-        # the cold path is not enough: a swapped test cache would otherwise
+        # the cold path is not enough: a swapped test cache could otherwise
         # serve a tokenizer that saw test text.
         _train_fit_fps = set()
         import glob as _glob2
@@ -3695,14 +3670,12 @@ def _fineweb_local_files(env_value):
     return [f for f in files if os.path.isfile(f)]
 
 def _fineweb_local_source_fingerprint(env_value):
-    """Cheap identity of the local stand-in source (paths, sizes, mtimes).
+    """Identity of the local stand-in source (paths, sizes, mtimes).
 
     The token cache's own `src_fp` only proves that the cached ids match the
-    cache meta; it cannot see that the *source* files changed.  Without this,
-    editing/replacing a local jsonl while keeping the same FWEDU_LOCAL_JSONL
-    path would silently serve the old corpus under the old fingerprint.  The
-    signature makes such a rebuilt cache non-confusable; it changes whenever a
-    source file is added/removed/replaced (mtime/size change)."""
+    cache meta; it cannot see that the *source* files changed.  The signature
+    changes whenever a source file is added/removed/replaced (mtime/size
+    change), so a rebuilt cache is non-confusable with an older one."""
     files = _fineweb_local_files(env_value)
     if not files:
         return None
@@ -4195,15 +4168,15 @@ def log_experiment_event(outdir, event):
         return None
 
 _PINNED_HOST_CACHE = {}
-# 整份 pinned 的字节上限（见 batch_iter）：超出时改走普通宿主张量 + 每步
+# 整份 pinned 缓存的上限（见 batch_iter）：超出时改走普通宿主张量 + 每步
 # pinned 暂存上传。
 _PINNED_HOST_CAP_BYTES = 4 << 30
-# 语料整份驻留缓存的字节上限（见 batch_iter）；超出时按步暂存。
+# 语料整份缓存的上限（见 batch_iter）；超出时按步暂存。
 _GPU_CORPUS_CACHE_BYTES = 64 << 20
 
 def _ids_narrow(train_ids):
     # Token ids are bounded by the vocab (<= 2**31 for every corpus this repo
-    # produces), so the resident copy (GPU, or pinned host staging) keeps its
+    # produces), so the cached copy (GPU, or pinned host staging) keeps its
     # transport width (uint8/uint16/int32) and is widened back to int64 right
     # after each batch gather, leaving the yielded batch bit-identical.  The
     # guard keeps any hypothetical out-of-range corpus on the int64 path.
@@ -4305,13 +4278,13 @@ def pair_reason(ra, rb):
     # carry (optimizer identity / betas / eps, LR-schedule shape, grad-clip,
     # augmentation).  BOTH records must carry the descriptor or BOTH must omit
     # it (legacy-vs-legacy); a one-sided descriptor is unverifiable and is
-    # refused rather than silently paired.
+    # refused.
     _ka, _kb = (ra.get('train_knobs'), rb.get('train_knobs'))
     # Mixed presence is itself unverifiable: a record that carries the
     # descriptor and one that does not cannot be shown to share the optimizer /
-    # schedule / clipping / augmentation settings, and silently pairing them is
-    # exactly the uncontrolled comparison this gate exists to prevent.  Only
-    # legacy-vs-legacy (both absent) keeps the historical permissive path.
+    # schedule / clipping / augmentation settings, and pairing them is exactly
+    # the uncontrolled comparison this gate exists to prevent.  Only
+    # legacy-vs-legacy (both absent) keeps the permissive path.
     if (_ka is None) != (_kb is None):
         return 'unverifiable train_knobs (only one record carries the optimizer / lr-schedule / augmentation descriptor)'
     if _ka is not None and _ka != _kb:
@@ -5861,11 +5834,10 @@ def controlled_variables_report(recs, arms):
     """Per-component controlled-variable audit across ALL seed records.
 
     `pair_reason` is the per-seed hard gate; this report is the panel-level
-    diagnostic.  It differs from the old first-record check in three ways:
-    every record of an arm is inspected (so seed 0 and seed 4 cannot silently
-    run under different protocols), a disagreement inside one arm is flagged,
-    and the structured `hyperparams` copy is checked for settings that the
-    compact run_cfg string does not carry.  The return keeps the historical
+    diagnostic.  Every record of an arm is inspected (so seed 0 and seed 4
+    cannot run under different protocols), a disagreement inside one arm is
+    flagged, and the structured `hyperparams` copy is checked for settings
+    that the compact run_cfg string does not carry.  The return keeps the
     `run_cfg_equal` / `train_knobs_equal` keys and adds the detail.
     """
     arms = sorted(set(arms))
@@ -6005,8 +5977,7 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
                           against the pre-registered direction.  This is
                           evidence AGAINST the stated mechanism, never support;
     measured            — a controlled contrast exists with n >= min_n, but no
-                          corrected significance (the old `verified` bar, now
-                          reported under an honest name);
+                          corrected significance;
     resolution_limited  — a controlled, non-noise contrast exists whose
                           family-corrected exact-test p floor is still above
                           alpha at this n (add seeds; never read as a null);
@@ -6061,7 +6032,7 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
         This is the condition for the claim "each module is useful": a
         component measured only through a combined arm (e.g. A+B vs baseline)
         stays incomplete, and the missing arm is named instead of being
-        silently dropped from the correction family.
+        omitted from the correction family.
 
     Full-factorial mode (`arms_by_combo` given)
         The mapping keys are component-name tuples (or '+'-joined strings,
@@ -7716,13 +7687,10 @@ def training_knobs_fingerprint():
 
     `run_cfg` already pins lr / wd / warmup / steps / tokens / architecture /
     data, but it deliberately does not carry the optimizer identity, betas,
-    eps, LR-schedule shape, grad-clip or augmentation.  Those used to live
-    only in the per-record `train_knobs` copy, which `pair_reason` checks at
-    analysis time.  That leaves a resume hole: changing one of the module
-    constants would keep every old `run_cfg` valid, so `_plan_run` would skip
-    the cells and silently mix old-optimizer and new-optimizer records in one
-    panel.  Putting this digest in the resume fingerprint closes that hole —
-    a changed descriptor invalidates the old cells just like a changed lr.
+    eps, LR-schedule shape, grad-clip or augmentation.  Those live in the
+    per-record `train_knobs` copy, which `pair_reason` checks at analysis
+    time.  Putting this digest in the resume fingerprint makes a changed
+    descriptor invalidate the old cells just like a changed lr.
     Unset/legacy fingerprints simply decode without a `tk` field.
     """
     blob = json.dumps(training_knobs(), sort_keys=True, separators=(',', ':'),
@@ -8331,7 +8299,7 @@ class TimeGuard:
                     # serial phase that ran before this parallel one): every
                     # second booked so far has no per-token representation,
                     # so it ALL becomes the untracked remainder.  Defaulting
-                    # it to 0 would silently erase those seconds from the
+                    # it to 0 would erase those seconds from the
                     # booked total on the next refund's recompute — the cap
                     # would then never fill in parallel mode.
                     self.state['booked_untracked'] = max(0.0, float(self.state.get('booked_seconds', 0.0)) - sum(float(b.get('seconds', 0.0)) for b in bookings.values()))
@@ -8501,7 +8469,7 @@ class TimeGuard:
         this hook the calibration (and hence the watchdog bound
         max(3*est, est+1h) derived from it) would stay wrong and the same
         healthy cell would be killed at the same wall-clock point on every
-        resume (uncalibrated slow hardware, CPU workers).  Lifting the floor
+        resume (uncalibrated hardware, CPU workers).  Lifting the floor
         to the kill time itself makes the next bound ~3.45x larger, so the
         retry window grows geometrically until a healthy cell fits; a truly
         hung cell is still killed on every attempt, just later."""
@@ -9383,7 +9351,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     d_head = cfg.get('d_head', 32)
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
-    # Cheap synthetic pre-flight before the (possibly slow) corpus load.
+    # Synthetic pre-flight before the corpus load.
     _sanity = list(overfit_guard(cfg.get('variants') or []))
     _attb_bump_epoch()
     t_data = time.time()

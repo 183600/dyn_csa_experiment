@@ -39,7 +39,7 @@
 
 内核变体标识：`KERNEL_STAMP`。内核模式开启时 exp_lib 的 run_cfg 指纹与
 `_code` 戳追加 `-tk1:<backend>`，eager 记录的指纹逐字节不变（配对纪律，
-design_notes §3.1）。G0 数值对照与微基准的驱动入口是
+design_notes §3.1）。G0 数值对照的驱动入口是
 `python m0_supp.py kernel`。
 """
 import math
@@ -358,9 +358,8 @@ _ARANGE_CACHE_BUDGET = 512 << 20
 
 
 def _arange_nbytes(t):
-    # Charge the resident storage, not numel: an expand view occupies Bm ints
-    # while its logical shape is [B, T, Bm].  The ref backend keeps that view
-    # (no copy), so accounting by numel would evict it immediately.
+    # Physical size of `t`: an expand view's storage is smaller than its
+    # logical shape, and the ref backend keeps that view.
     try:
         return int(t.untyped_storage().nbytes())
     except Exception:
@@ -369,7 +368,7 @@ def _arange_nbytes(t):
 
 def _full_arange_evict(need=0):
     # 与 _GEOM_CACHE 同一套 FIFO 淘汰：(B, T, Bm) 组合数无天然上界
-    # （例如 eval 长度扫描），缓存条目数与驻留字节都必须有上界。
+    # （例如 eval 长度扫描），缓存条目数必须有上界。
     while _ARANGE_CACHE and (len(_ARANGE_CACHE) >= _ARANGE_CACHE_CAP or
                              _ARANGE_CACHE_BYTES[0] + need > _ARANGE_CACHE_BUDGET):
         _k0 = next(iter(_ARANGE_CACHE))
@@ -400,9 +399,9 @@ def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
 def _full_arange_cached(B, T, Bm, device, contiguous=True):
     # `contiguous=False` returns a stride-0 expand view: every row holds the
     # same exact integers, which is all the torch-reference backend reads
-    # (advanced indexing / gathers / comparisons).  It occupies Bm ints
-    # instead of B·T·Bm.  The triton kernels address the index tensor with
-    # pointer arithmetic, so that backend asks for the contiguous copy.
+    # (advanced indexing / gathers / comparisons).  The triton kernels address
+    # the index tensor with pointer arithmetic, so that backend asks for the
+    # contiguous copy.
     key = (int(B), int(T), int(Bm), str(device), bool(contiguous))
     out = _ARANGE_CACHE.get(key)
     if out is None:
@@ -766,7 +765,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=True):
     idx = torch.empty((R, T, k_out), device=dev, dtype=torch.int32)
     valid = torch.empty((R, T, k_out), device=dev, dtype=torch.bool)
     # Soft is a training-only prior (the straight-through S path is dead
-    # without gradients), so eval skips its allocation and tail entirely.
+    # without gradients).
     soft = torch.empty((R, T, k_out), device=dev, dtype=acc) if need_soft else None
     # 逐行独立的 (r,t) 归约（mask/lse/sort/topk）：按 t 分块与整幅计算的
     # 每行值逐位一致（同 kernel、同归约顺序），中间张量按 t 块封顶。
@@ -1385,7 +1384,7 @@ def _kernels():
             acc += tl.sum(eb * xb, 0) / Zs
         # r 从 pid 派生时就升到 int64，因此行基址 (r·T + gA/gB) 与输出基址
         # (r·Bm + b)·C 全在 int64 下求值：R·T·C 或 R·Bm·C ≥ 2³¹ 的超大配置下，
-        # int32 的基址乘法会回绕并静默读到/写到错误的行。
+        # int32 不足以表示这些基址。
         tl.store(comp_ptr + (r * Bm + b).to(tl.int64) * C + cs, acc.to(comp_ptr.dtype.element_ty), mask=cm)
 
     ns.pool_fwd = pool_fwd
@@ -1601,7 +1600,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     dk_blk = dv_blk = dk_sw = dv_sw = dsoft = None
     if need_dkb or need_dvb:
         # attn_bwd_dkdv_blocks 对网格内每个 (r,b,h) 无条件 store（NEED_DK/
-        # NEED_DV 与这里的分配条件一致），因此 dk/dv 缓冲无需零初始化。
+        # NEED_DV 与这里的分配条件一致）。
         dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
         dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
         flat = topk_idx.reshape(R, T * nb)
@@ -2119,9 +2118,9 @@ def _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     return comp
 
 
-# scores 分块缓冲的字节上限（fp32 [R, T_c, Bm]）：打分/top-k 两内核按
-# query 行分块启动，scores 不按全幅 [R, T, Bm] 物化——每行的值与全幅
-# 形式逐位一致（每个 (r, t) 程序只读写自己的行）。
+# scores 分块上限（fp32 [R, T_c, Bm]）：打分/top-k 两内核按 query 行分块
+# 启动，scores 不按全幅 [R, T, Bm] 物化——每行的值与全幅形式逐位一致
+# （每个 (r, t) 程序只读写自己的行）。
 _IDX_SCORES_CAP_BYTES = 128 << 20
 
 
@@ -2177,7 +2176,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     - 门控正则 gate_mean 与 eager 的 (nblk-1 + Σ gate·hon)/T 逐行同式。
     """
     cfg = attn.cfg
-    # 逐算子解析后端：显式 impl= 强制全部三算子（selfcheck/bench 口径）；
+    # 逐算子解析后端：显式 impl= 强制全部三算子；
     # impl=None 时各算子吃自己的 CSA_KERNEL_{POOL,IDX,ATTN} 覆盖（空则跟随
     # 全局 CSA_KERNEL）。
     impl_pool = impl or _op_impl('POOL')
@@ -2250,8 +2249,8 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     else:
         comp, last_tok, _Bn = pool_variable_blocks_kernel(Ca, pre_all['Cb'], Za, pre_all['Zb'], bid_full, geom,
                                                           attn.B_pos_a, attn.B_pos_b, impl=impl_pool)
-    # Same value as normalizing the zero table (0/eps == 0), without the
-    # normalize kernel/transient for the zero-content ablation.
+    # Same value as normalizing the zero table (0/eps == 0) for the
+    # zero-content ablation.
     core_kv = (torch.zeros_like(comp) if cfg.content_mode == 'zero'
                else F.normalize(comp, dim=-1))
     kv_local = F.normalize(Ca, dim=-1)

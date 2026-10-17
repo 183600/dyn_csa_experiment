@@ -584,8 +584,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 # same batch-level geometry hoist as exp_lib.HybridAttention.forward:
                 # values identical.
                 pre_blocks = self._cut_blocks_batched(x)
-            # Preallocate the batch output and write each row's attention output
-            # in place — the same transport-only, value-identical form as
+            # Write each row's attention output into the batch output — the
+            # same transport-only, value-identical form as
             # exp_lib.HybridAttention.forward (design notes §6.1).
             outs = torch.empty(B, T, x.shape[-1], device=x.device, dtype=x.dtype)
             gates = []
@@ -739,9 +739,8 @@ def install_patches():
     _PATCHES_INSTALLED = True
 install_patches()
 # 代码语义戳必须以 exp_lib.code_stamp() 为准（其 docstring 的明确要求）：
-# eager 模式下与历史值逐字节相同；内核模式（CSA_KERNEL）下追加 -tk1 后缀，
-# 否则这些 cell 会被内核路径测得却盖 eager 戳，与真正的 eager 记录错误配对
-# （design_notes §3.1），或把内核记录误判为陈旧使 resume 静默失效。
+# eager 模式下与历史值相同；内核模式（CSA_KERNEL）下追加 -tk1 后缀
+# （design_notes §3.1）。
 CKPT_CODE = L.code_stamp()
 ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
@@ -768,10 +767,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     ndecay = [p for n_, p in model.named_parameters() if p.requires_grad and is_no_decay(n_) and (not is_delta(n_))]
     dpar = [p for n_, p in model.named_parameters() if p.requires_grad and is_delta(n_)]
     # Optimizer / betas / eps come from the SAME module constants every other
-    # arm trains under (L.OPT_ADAMW_BETAS / L.OPT_ADAMW_EPS): a duplicated
-    # literal here would silently diverge the warmup arms from the rest of
-    # the study the day those constants are retuned for a scaled run, and the
-    # divergence would be invisible to the run_cfg fingerprint.  The record's
+    # arm trains under (L.OPT_ADAMW_BETAS / L.OPT_ADAMW_EPS).  The record's
     # `train_knobs` descriptor (checked field-by-field by `pair_reason`)
     # makes the shared settings an auditable fact instead of an assumption.
     opt = torch.optim.AdamW([{'params': decay, 'weight_decay': weight_decay, 'lr_scale': 1.0}, {'params': ndecay, 'weight_decay': 0.0, 'lr_scale': 1.0}, {'params': dpar, 'weight_decay': 0.0, 'lr_scale': delta_lr_mult}], lr=lr, betas=L.OPT_ADAMW_BETAS, eps=L.OPT_ADAMW_EPS, foreach=True)

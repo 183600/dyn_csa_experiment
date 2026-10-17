@@ -100,8 +100,8 @@ def layers_of(variant, seeds, dyn_only=True):
     if dyn_only:
         ks = [k for k in ks if 'dyn' in k]
     # Sort numerically by layer index: stats-dict insertion order is not
-    # guaranteed to be layer order, and an unsorted list would silently
-    # connect per-layer plot points in the wrong x order.
+    # guaranteed to be layer order; an unsorted list would connect per-layer
+    # plot points in the wrong x order.
     return sorted(ks, key=lambda k: int(k.split('_')[0][1:]))
 
 @functools.lru_cache(maxsize=None)

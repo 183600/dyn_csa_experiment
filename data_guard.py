@@ -593,8 +593,7 @@ def _matrix_fingerprint(X):
     arr = np.asarray(X, dtype=np.float64)
     h = hashlib.sha256()
     h.update(str(arr.shape).encode('ascii'))
-    # Hash in bounded row blocks so fingerprinting a large training matrix
-    # does not allocate a second full-size copy.
+    # Hash in bounded row blocks.
     for start in range(0, arr.shape[0], 1 << 20):
         h.update(np.ascontiguousarray(arr[start:start + (1 << 20)]).tobytes())
     return h.hexdigest()[:16]

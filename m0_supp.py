@@ -211,8 +211,7 @@ def run_kernel():
       表达，fp32 1e-3 / bf16 1e-1；triton 为独立内核实现，fp32 1e-2 /
       bf16 3e-1，属归约分组不同的浮点噪声口径，见 design_notes §5 的
       同类漂移讨论）；
-    - 基准（仅 CUDA + triton）：稀疏注意力算子有效速率，判据口径见
-      docs/compute_plan.md §6。
+    - 基准（仅 CUDA + triton）：判据口径见 docs/compute_plan.md §6。
     """
     import csa_kernels as ck
     dev = L.DEVICE
@@ -228,10 +227,9 @@ def run_kernel():
     for impl in backends:
         for dt in dtypes:
             # 容差按后端分级：ref 与 eager 是同一算法的张量表达，残差只剩
-            # 归约重结合（度量口径下实测 fp32 ~1e-4、bf16 ~2e-2），门限取
-            # ~10x 余量；triton 为独立内核实现（在线 softmax/分块归约的
+            # 归约重结合；triton 为独立内核实现（在线 softmax/分块归约的
             # 结构性重排），另加一个量级。门限必须高于纯舍入噪声（见
-            # _rel 的 floor_frac 说明），否则噪声会淹没真实算法性回归。
+            # _rel 的 floor_frac 说明），否则噪声会淹没真实差异。
             tol = {(False, False): 1e-3, (False, True): 1e-1,
                    (True, False): 1e-2, (True, True): 3e-1}[(impl == 'triton', dt != torch.float32)]
             for seed in (0, 1):

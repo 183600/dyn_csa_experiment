@@ -429,12 +429,11 @@ def run_full():
     if _long_snapshot:
         L.atomic_write_json(os.path.join(REPO, 'results_lm_v3_long', 'aggregate.json.v6bak'), _long_snapshot, indent=2)
     push_ok = git_push('v6: rebuild results_lm_v3_long/summary.json from committed aggregate')
-    # Phase order: the statistically foundational, cheap panels first (core
-    # table -> its leave-one-out ablations -> scale probe), the 20k-step
-    # long runs LAST.  A run-time-capped fresh box then secures the n>=3
-    # core/ablation/scale tables before the long runs can consume the
-    # remaining allowance; on a box that already holds the panels every phase
-    # just resumes and the order adds nothing.
+    # Phase order: the statistically foundational panels first (core table ->
+    # its leave-one-out ablations -> scale probe), the 20k-step long runs
+    # LAST.  The n>=3 core/ablation/scale tables are secured before the long
+    # runs; on a box that already holds the panels every phase just resumes
+    # and the order adds nothing.
     L.run(L.RUN, seeds=[0, 1, 2], guard=guard, label='P-CORE 1500-step core table (results_lm_v3_1500)')
     push_ok &= git_push('v6: results_lm_v3_1500 — 9-variant core table, 1500 steps x 3 seeds')
     L.run(L.RUN_ABL, seeds=[0, 1, 2], guard=guard, label='P-ABL leave-one-out ablation table (results_lm_v4_abl)')
@@ -497,7 +496,7 @@ def run_smoke():
     # ablation arms of P-ABL (random indexer selection, zero pooled content,
     # sink off, learned local fusion, the HCA layer kind, and the dense
     # sink control) — otherwise a broken ablation arm would only surface
-    # after P-CORE/P-LONG burned hours on a real box.
+    # after the full panels.
     smoke_cfg = dict(L.RUN, outdir='results_smoke', variants=['full', 'csa_fixed', 'hybrid_dynamic', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'csa_dyn_nocomp', 'csa_dyn_fuse', 'hybrid_hca_dyn', 'full_sink'], steps=60, eval_every=30, n_train_tokens=1000000, seeds=[0])
     run_overfit(cfg=smoke_cfg, variants=['full', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic', 'hybrid_hca_dyn', 'csa_dyn_nocomp'], steps=250)
     L.run(smoke_cfg, seeds=[0], guard=None, label='SMOKE (60 steps)', par=False)

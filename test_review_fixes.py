@@ -559,8 +559,7 @@ def t_fairness_cross_arm_controls():
         assert ok['controlled_variables']['train_knobs_equal'] is True, ok['controlled_variables']
         assert not any('train_knobs differ' in p for p in ok['problems']), ok['problems']
         # A different optimizer/clip in ONE arm must fail even when every arm
-        # is internally consistent — the old per-arm distinct-count check
-        # could not see this cross-arm violation.
+        # is internally consistent.
         bad = _run(_panel(knob_override=('b', 1)))
         assert bad['status'] == 'fail', bad
         assert any('train_knobs differ across arms' in p for p in bad['problems']), bad['problems']
@@ -894,7 +893,7 @@ def t_provenance_and_manifest():
 
 
 # ---------------------------------------------------------------------------
-# E5-E8. 进一步的可复现性 / 训练追踪回归
+# E5-E8. 进一步的可复现性 / 训练追踪检查
 # ---------------------------------------------------------------------------
 
 def t_dataloader_seeding_helpers():
@@ -1036,7 +1035,7 @@ def t_failed_guard_is_retried():
 
 
 # ---------------------------------------------------------------------------
-# F. 稀疏路径的逐位契约 / 边界回归
+# F. 稀疏路径的逐位契约 / 边界检查
 # ---------------------------------------------------------------------------
 
 def t_indexer_column_narrowing_exact():
@@ -1097,7 +1096,7 @@ def t_atomic_torch_save():
 
 
 def t_cache_bytes_shared_storage():
-    # A stride-0 expand is a view: _cache_bytes charges its resident storage,
+    # A stride-0 expand is a view: _cache_bytes charges its physical storage,
     # not its numel.
     base = torch.arange(64, dtype=torch.int32)
     expanded = base.expand(4096, 64)
