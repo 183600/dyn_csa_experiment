@@ -671,15 +671,15 @@ def _flop_matched_steps(small_cfg, large_cfg, min_steps=250):
 
     评审二轮·意见七修订：这里的「等计算」是 6·N·D 参数量代理（N=参数量，
     D=token 数），**不是实测等 FLOPs**——稀疏选择、池化、注意力与激活重算
-    的成本不与参数量成比例；若触发步数下限，也会偏离原目标预算。面板报告
-    必须把它称为「6ND 参数量代理预算臂」，并同时报告实际 token 数、参数
+    的开销不与参数量成比例；若触发步数下限，也会偏离原目标规模。面板报告
+    必须把它称为「6ND 参数量代理规模臂」，并同时报告实际 token 数、参数
     量、估篇 FLOPs（audit_gates.train_flops_estimate）与 TimeGuard 实测
-    耗时；等 token 与等算力是不同问题，须分别陈述。步数推导：先在 CPU
+    用时；等 token 与等算力是不同问题，须分别陈述。步数推导：先在 CPU
     上按面板配置构建两个面板的模型（不碰 DEVICE、无 RNG 副作用），取两
     臂（csa/full）参数量的平均值，large_steps = small_steps ·
     N_small / N_large。结果打印完整推导以供审计；确定性：同一代码下重复
     调用逐位相同（count_params 是形状的纯函数）。步数下限 250（warmup=100
-    时余下学习率调度仍有意义）——触发下限时必须如实报告「代理预算被下限
+    时余下学习率调度仍有意义）——触发下限时必须如实报告「代理值被下限
     偏离」，不得写成严格匹配。"""
     counts = {}
     deriv = []
@@ -996,7 +996,7 @@ def _panel_endpoint(hists, tps):
     # The sign-flip test must compare every seed at the SAME training step, so
     # take the last step present in both arms for EVERY compared seed (the
     # intersection, not each seed's own last step — a seed with a shorter eval
-    # grid would otherwise contribute a delta measured at a different budget).
+    # grid would otherwise contribute a delta measured at a different scale).
     common_steps = None
     for s in common:
         da, db = (dict(hists['csa_fixed'][s]), dict(hists['full'][s]))
@@ -1024,7 +1024,7 @@ def _panel_convergence(hists):
 
     相对 PPL 改进 < 1%（最后四分之一 eval 窗口）只能排除「仍在快速下降」
     的情形；学习率衰减、平台期、评测噪声或优化停滞都可能满足该条件。
-    因此本诊断只允许谈论「预算内平台期后」的读数（crossing-after-plateau-
+    因此本诊断只允许谈论「规模内平台期后」的读数（crossing-after-plateau-
     under-budget），不得写成「收敛后」或「渐近优势反转」——后者需要更长
     训练、合理学习率续训与重复验证（design_notes §16 修订）。保留
     `plateaued` 键以兼容既有分析产物；新增 `claim_allowed` 明示允许的
@@ -1228,9 +1228,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 # trained-with-that-selection control at the same (L, rho).
                 # For losses the positive direction means the intervention
                 # scores WORSE than retraining that selection — a gap that MAY
-                # itself contain train/test-mismatch cost (plus optimisation
+                # itself contain train/test-mismatch effects (plus optimisation
                 # adaptation and parameter differences), so it must be read as
-                # a raw performance gap, never as 'the part that cannot be
+                # a raw difference, never as 'the part that cannot be
                 # attributed to mismatch'.
                 for tag, tt_arm, sv in (('retrain-gap(random): csa+randidx - csa_randtrain', 'randidx', 'csa_fixed_rope_randidx'), ('retrain-gap(allblocks): csa+allblocks - csa_alltrain', 'allblocks', 'csa_fixed_rope_allblocks')):
                     tt = cell_mean('csa_fixed_rope', tt_arm, Ln, rho, 'uniform')
@@ -1450,7 +1450,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A('v10 落实 v9 收官后评审的三项升级：(1) 把 v7 P1L 的 sparse 正面发现（CSA+RoPE 长度外推显著优于 dense-RoPE）从附带观察升级为机制性主结果——远距干扰注入实验直接检验「稀疏掩码滤除远距噪声」假设；(2) 新增 d=128/4L 与 d=512/10L 两个规模，与既有 d=256/d=384 面板组成 4 点反转交叉点标度读数（预注册交叉判据）；(3) 把 v9 唯一仍处 p 值分辨率下限的面板（seq-2048 topk 扫描）从 n=2 补到 n=4。')
     A('')
-    A('**本版修订（评审 5 点）**：(a) P3MTC 补同预算从头训练的选择器对照（randidx / allblocks）并补逐项对齐的 dense 对照；(b) 干扰注入扩展为 uniform / natural / mask / delete 四种腐坏模式并按 ΔNLL 口径报告，另增 NIAH-natural 远端必要信息任务；(c) P3SL2/P3SL3 补等训练 token 与等计算预算的大模型臂，统计新增等 token 切片与收敛（平台期）诊断；(d) 全部配对比较报告逐种子 Δ、效应量 d_z、p 值分辨率下限与 Holm 校正，明确探索性/确认性证据边界（确认性评估见 `v12_supp.py` 与冻结清单 `confirmation_frozen.json`）。')
+    A('**本版修订（评审 5 点）**：(a) P3MTC 补同计算量从头训练的选择器对照（randidx / allblocks）并补逐项对齐的 dense 对照；(b) 干扰注入扩展为 uniform / natural / mask / delete 四种腐坏模式并按 ΔNLL 口径报告，另增 NIAH-natural 远端必要信息任务；(c) P3SL2/P3SL3 补等训练 token 与等计算量的大模型臂，统计新增等 token 切片与收敛（平台期）诊断；(d) 全部配对比较报告逐种子 Δ、效应量 d_z、p 值分辨率下限与 Holm 校正，明确探索性/确认性证据边界（确认性评估见 `v12_supp.py` 与冻结清单 `confirmation_frozen.json`）。')
     A('')
     A('---')
     A('')
@@ -1600,16 +1600,16 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     # ---- P3M-2：从头训练的选择器对照（评审点 2）----
     _new_c = {k: v for k, v in contr.items() if k not in _legacy and not k.startswith('ΔNLL')}
     if _new_c:
-        A('### P3M-2 从头训练的选择器对照（同预算）')
+        A('### P3M-2 从头训练的选择器对照（同规模）')
         A('')
-        A('**背景（评审点 2）**：测试时把已训练模型的选择器替换为随机/全块，只能回答「模型是否依赖原选择器」，不能回答「学习式选择是否优于训练充分的随机选择或全块读取」——后两者的测试时干预改变了模型训练时适应的输入分布，性能下降可能来自失配本身。P3MTC 按与 P3MT **完全相同的配方**（3000 步、同数据、同种子）从头训练两个对照：`csa_fixed_rope_randidx`（训练期选择即随机）与 `csa_fixed_rope_allblocks`（训练期就读全部块；与 `csa_fixed_rope` 逐项同构——同 c_kv 压缩、同 qk_norm、同 RoPE、同 sink/窗口，仅选择方式不同，因此它同时是**逐项对齐的 dense 对照**，评审点 5）。')
+        A('**背景（评审点 2）**：测试时把已训练模型的选择器替换为随机/全块，只能回答「模型是否依赖原选择器」，不能回答「学习式选择是否优于训练充分的随机选择或全块读取」——后两者的测试时干预改变了模型训练时适应的输入分布，效果下降可能来自失配本身。P3MTC 按与 P3MT **完全相同的配方**（3000 步、同数据、同种子）从头训练两个对照：`csa_fixed_rope_randidx`（训练期选择即随机）与 `csa_fixed_rope_allblocks`（训练期就读全部块；与 `csa_fixed_rope` 逐项同构——同 c_kv 压缩、同 qk_norm、同 RoPE、同 sink/窗口，仅选择方式不同，因此它同时是**逐项对齐的 dense 对照**，评审点 5）。')
         A('')
         A('| 比较 | n | Δ mean±std | d_z | p (exact) | p 下限 |')
         A('|---|---|---|---|---|---|')
         for k, v in sorted(_new_c.items()):
             A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v.get('cohens_dz', float('nan')):+.2f} | {v['p_exact_signflip']:.3f} | {v.get('p_floor', float('nan')):.3f} |')
         A('')
-        A('> `retrain-gap(…)` 行 = 测试时干预 − 同预算从头训练对照（同 L、同 ρ）。评审二轮·意见五修订：对越低越好的损失，正值说明干预比重新训练**更差**，该差距本身**可能包含**训练—测试失配的代价，也混合了优化适应与参数差异——它是「干预与重新训练的性能差」，**不是**已完成的因果失配分解，不得把简单相减解释为「不能归因于失配的部分」。`arch-aligned` 行 = dense − 全块 CSA 孪生（两者仅剩 KV 压缩投影与分块读取方式之差）。')
+        A('> `retrain-gap(…)` 行 = 测试时干预 − 同规模从头训练对照（同 L、同 ρ）。评审二轮·意见五修订：对越低越好的损失，正值说明干预比重新训练**更差**，该差距本身**可能包含**训练—测试失配的代价，也混合了优化适应与参数差异——它是「干预与重新训练的效果差」，**不是**已完成的因果失配分解，不得把简单相减解释为「不能归因于失配的部分」。`arch-aligned` 行 = dense − 全块 CSA 孪生（两者仅剩 KV 压缩投影与分块读取方式之差）。')
         A('')
     # ---- ΔNLL：污染增量（评审点 3）----
     dnll = probe.get('delta_nll') or {}
@@ -1724,13 +1724,13 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         A('')
     sc = st.get('scale_confounds') or {}
     if sc:
-        A('### P3S-2 规模混杂控制（评审点 1 + 评审二轮·意见七修订：等训练 token / 6ND 代理预算 / 预算内平台期）')
+        A('### P3S-2 规模混杂控制（评审点 1 + 评审二轮·意见七修订：等训练 token / 6ND 代理规模 / 规模内平台期）')
         A('')
-        A('**背景**：P3SS（d=128/4L，8000 步 ≈ 49.15M token）与 P3SL（d=512/10L，4000 步 ≈ 24.58M token）的累计 token 相差一倍——跨规模终点差异不能单独归因于规模。本节把同一批曲线在**相同累计 token**处切片配对（gap_L − gap_S，逐种子），并给出等 token（`P3SL_TOK`，8000 步）与 6ND 参数量代理预算（`P3SL_FLOP`，按参数量比例缩步数——**代理预算，非实测等 FLOPs**，须另见实测耗时与估篇 FLOPs）两个大模型臂，以及各面板的预算内平台期诊断（平台期 ≠ 收敛，只支持「预算内平台期后」读数）。')
+        A('**背景**：P3SS（d=128/4L，8000 步 ≈ 49.15M token）与 P3SL（d=512/10L，4000 步 ≈ 24.58M token）的累计 token 相差一倍——跨规模终点差异不能单独归因于规模。本节把同一批曲线在**相同累计 token**处切片配对（gap_L − gap_S，逐种子），并给出等 token（`P3SL_TOK`，8000 步）与 6ND 参数量代理规模（`P3SL_FLOP`，按参数量比例缩步数——**代理规模，非实测等 FLOPs**，须另见实测用时与估篇 FLOPs）两个大模型臂，以及各面板的规模内平台期诊断（平台期 ≠ 收敛，只支持「规模内平台期后」读数）。')
         A('')
         _panels = sc.get('panels') or {}
         if _panels:
-            A('| 面板 | 预算 | 末步 token | 末点 gap (csa−full) mean±std | n | 末点 p (exact) | 平台化种子 |')
+            A('| 面板 | 规模 | 末步 token | 末点 gap (csa−full) mean±std | n | 末点 p (exact) | 平台化种子 |')
             A('|---|---|---|---|---|---|---|')
             for name in ('P3SS', 'P3SL', 'P3SL_TOK', 'P3SL_FLOP'):
                 e = _panels.get(name) or {}
@@ -1746,9 +1746,9 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             A('')
             _conv_warn = [name for name, e in _panels.items() if e.get('status') == 'ok' and any(((e.get('convergence') or {}).get(v) or {}).get('n_plateaued', 0) == 0 for v in ('csa_fixed', 'full'))]
             if _conv_warn:
-                A(f'> **预算内平台期证据不足**：{_conv_warn} 面板在最后四分之一 eval 窗口的相对改进 ≥1%（未平台化）——「平台期后交叉」的主张在该面板上**不成立**，只有「窗口内交叉」的读数有效。')
+                A(f'> **规模内平台期证据不足**：{_conv_warn} 面板在最后四分之一 eval 窗口的相对改进 ≥1%（未平台化）——「平台期后交叉」的主张在该面板上**不成立**，只有「窗口内交叉」的读数有效。')
                 A('')
-            A('> 评审二轮·意见七：即使全部种子平台化，也只允许「预算内平台期后交叉」的读数；「渐近优势反转」「收敛后更差」需要更长训练、学习率续训与重复验证，本面板不提供。')
+            A('> 评审二轮·意见七：即使全部种子平台化，也只允许「规模内平台期后交叉」的读数；「渐近优势反转」「收敛后更差」需要更长训练、学习率续训与重复验证，本面板不提供。')
             A('')
         _slices = sc.get('equal_token_slices') or {}
         if _slices:
@@ -1759,7 +1759,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             for k, v in sorted(_slices.items()):
                 A(f'| {k} | {v.get('n', 0)} | {v.get('mean', float('nan')):+.2f} ± {v.get('std', 0):.2f} | {v.get('cohens_dz', float('nan')):+.2f} | {v.get('p_exact_signflip', float('nan')):.3f} |')
             A('')
-            A('> `P3SL_FLOP` 的步数 = 8000 × N_small/N_large（参数量按面板两臂平均，CPU 上确定性计数；下限 250），即**大模型只花小模型的总计算预算**——该臂的 gap 是「同预算下规模效应」的直接读数。')
+            A('> `P3SL_FLOP` 的步数 = 8000 × N_small/N_large（参数量按面板两臂平均，CPU 上确定性计数；下限 250），即**大模型与小模型的总计算量代理对齐**——该臂的 gap 是「同计算量下规模效应」的直接读数。')
             A('')
     A('---')
     A('')
@@ -1801,7 +1801,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('| `results_lm_v10_scale_s/` | P3S：d=128/4L 交叉定位面板（8000 步） |')
     A('| `results_lm_v10_scale_l/` | P3S：d=512/10L 交叉定位面板（4000 步） |')
     A('| `results_lm_v10_scale_l8k/` | P3S-2：等 token 大模型臂（8000 步，评审点 1） |')
-    A('| `results_lm_v10_scale_lflop/` | P3S-2：6ND 参数量代理预算大模型臂（非实测等 FLOPs，评审点 1） |')
+    A('| `results_lm_v10_scale_lflop/` | P3S-2：6ND 参数量代理规模大模型臂（非实测等 FLOPs，评审点 1） |')
     A('| `results_lm_v9_seq2k/` | P3T：topk 扫描追加 seeds 2/3 后的 4-seed 面板 |')
     A('| `analysis_v10/stats.json` | 探针对比（含 ΔNLL、Holm）、交叉定位、等 token 切片与配对符号翻转检验 |')
     A('| `v10_supp.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')

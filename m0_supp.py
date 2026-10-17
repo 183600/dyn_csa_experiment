@@ -35,7 +35,7 @@ M2_CAP_HOURS 覆盖），状态文件 run_time_state_m0.json /
 run_time_state_m2.json（内核模式 .k 后缀，两面板互不混账）；超限单元
 拒绝启动、中途到达上限则硬截断且不留半条测量。注意（compute_plan
 §3 的前提判断，不是缺陷）：Triton 内核（G0 判据）就绪之前，eager
-路径的预计耗时会让 TimeGuard 直接拒绝启动面板单元——此时应先完成
+路径的预计用时会让 TimeGuard 直接拒绝启动面板单元——此时应先完成
 内核与 kernel/eager 数值对照。
 """
 import gc, json, os, shutil, subprocess, sys, time, traceback
@@ -285,7 +285,7 @@ def run_full():
     guard = L.TimeGuard(cap)
     guard.report()
     _what = f'{panel} 主面板（B 档，{len(run_cfg["variants"])} 臂 × {len(run_cfg["seeds"])} seeds × {run_cfg["n_train_tokens"] / 1e9:g}B token）'
-    print(f'[m0] 提示（compute_plan §3）：内核（G0）就绪前 eager 预计耗时会被 TimeGuard 拒绝启动——先完成三算子 Triton 化与 kernel/eager 数值对照，再回到这里跑 {_what}。')
+    print(f'[m0] 提示（compute_plan §3）：内核（G0）就绪前 eager 预计用时会被 TimeGuard 拒绝启动——先完成三算子 Triton 化与 kernel/eager 数值对照，再回到这里跑 {_what}。')
     push_ok = git_push(f'm0: {_what}启动（产出目录 {run_cfg["outdir"]}/）')
     L.run(run_cfg, guard=guard, label=f'M0/{_what}')
     push_ok &= git_push(f'm0: {_what}完成一轮（{run_cfg["outdir"]} 为本地实验产物，不入库；量值以 summary.json 现算为准）')
@@ -322,7 +322,7 @@ if __name__ == '__main__':
     except Exception:
         traceback.print_exc()
         if mode == 'full':
-            print('\n[m0] CRASHED — attempting a partial-results push, then the instance stays up 40 min for remote debugging before auto-shutdown (cancel with: pkill -f m0autoshutdown).')
+            print('\n[m0] CRASHED — attempting a partial-results push, then the instance stays up 40 min for remote diagnosis before auto-shutdown (cancel with: pkill -f m0autoshutdown).')
             try:
                 git_push('m0: PARTIAL — run crashed, see run_m0.log (resume by re-running: completed runs are skipped)')
             except Exception:

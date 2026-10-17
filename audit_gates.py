@@ -21,10 +21,10 @@
                一致性与 mlp_ratio 审计（零 GPU）
   metrics      指标口径：主指标/方向/聚合/不平衡声明与记录级伴随指标
                （边界需 precision/recall/随机基线，NIAH 需 answer NLL）
-  tuning       基线调参：主方法与简单基线是否获得同一搜索网格与预算
+  tuning       基线调参：主方法与简单基线是否获得同一搜索网格与范围
                （读 results_baseline_tuning/baseline_tuning.json）
   failures     失败与缺失：error 记录按臂集中度（选择偏差读数，零 GPU）
-  budget       规模预算：6ND 代理 FLOPs 估算 + TimeGuard 实测耗时对账
+  budget       规模核算：6ND 代理 FLOPs 估算 + TimeGuard 实测用时对账
                （理论 FLOPs ≠ 实测速度，两者并列报告，零 GPU）
   efficiency   prefill/decode/峰值内存测量工具（需要模型；给出可复用函数
                与 CPU 微型演示——不是实验，是测量代码自检）
@@ -135,7 +135,7 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
         _tr = sorted(_g.glob(os.path.join(cache_dir, 'train_ids_*.npy')))
         if _te and _tr:
             te = np.load(_te[0])
-            tr = np.load(_tr[0])[: 4000000]  # cap the train side for speed
+            tr = np.load(_tr[0])[: 4000000]  # fixed-size train-side sample
             def _shingles(mat, k, cap_rows):
                 s = set()
                 rows = min(mat.shape[0], cap_rows)
@@ -233,16 +233,16 @@ def audit_causality():
 
 
 # ---------------------------------------------------------------------------
-# 3) attribution：动态/固定分块的块数、压缩率、计算成本对齐读数
+# 3) attribution：动态/固定分块的块数、压缩率、计算开销对齐读数
 # ---------------------------------------------------------------------------
 
 def audit_attribution(outdirs=None):
     """动态分块归因审计（零 GPU，读 results_*/summary.json + ckpt 元数据）。
 
     评审问题：固定块与动态块是否匹配实际块数、压缩率、可读摘要数量和
-    计算成本。本审计从落盘训练记录的 by_len / _stats / 参数量字段重算
+    计算开销。本审计从落盘训练记录的 by_len / _stats / 参数量字段重算
     每臂的：参数量、（若启用块统计）块长分布与边界对齐读数，并输出
-    「臂间块预算是否对齐」的对照表。检查 `attn._stats`（enable_block_stats
+    「臂间块数是否对齐」的对照表。检查 `attn._stats`（enable_block_stats
     收集的块 id bincount，design_notes §14 同口径）是否在场。"""
     out = {'status': 'ok', 'panels': {}}
     L = _import_exp_lib()
@@ -490,11 +490,11 @@ def audit_metrics(outdirs=None):
 
 
 # ---------------------------------------------------------------------------
-# 7c) tuning：基线调参预算对账
+# 7c) tuning：基线调参范围对账
 # ---------------------------------------------------------------------------
 
 def audit_tuning(path=None):
-    """基线调参审计（零 GPU）：主方法与简单基线是否用了同一搜索网格/预算。
+    """基线调参审计（零 GPU）：主方法与简单基线是否用了同一搜索网格/范围。
 
     没有 `baseline_tuning.json` 时返回 `not_verifiable_locally`——未调参的
     基线只能证明复杂模型比稻草人强，不能写成「优于精心调优的基线」。"""
@@ -507,7 +507,7 @@ def audit_tuning(path=None):
 
 
 # ---------------------------------------------------------------------------
-# 8) budget：6ND 代理 FLOPs 估算 + 实测耗时对账
+# 8) 规模核算：6ND 代理 FLOPs 估算 + 实测用时对账
 # ---------------------------------------------------------------------------
 
 def train_flops_estimate(params, tokens, attn_overhead=0.35):
@@ -523,7 +523,7 @@ def train_flops_estimate(params, tokens, attn_overhead=0.35):
 
 
 def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.json'), panels=(('results_lm_v10_scale_s', 'csa_fixed', 8000), ('results_lm_v10_scale_l8k', 'csa_fixed', 8000), ('results_lm_v10_scale_lflop', 'csa_fixed', None))):
-    """规模预算对账（零 GPU）：每面板 6ND 估算 + 已记账实测秒数。"""
+    """规模核算（零 GPU）：每面板 6ND 估算 + 已记账实测秒数。"""
     out = {'status': 'ok', 'panels': {}}
     for d, v, steps in panels:
         summ = _load(os.path.join(d, 'summary.json'))
@@ -551,7 +551,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
 
 
 # ---------------------------------------------------------------------------
-# 9) efficiency：prefill/decode/内存测量工具（含 CPU 微型自检）
+# 9) 测量工具：prefill/decode 与容量读数（含 CPU 微型自检）
 # ---------------------------------------------------------------------------
 
 def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
@@ -559,7 +559,7 @@ def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
 
     评审问题：理论 FLOPs 被当成实测速度。本函数给出可复用的测量口径：
     prefill = 整段前向一次的墙钟；decode = 逐 token 前缀推进的墙钟与
-    每 token 均摊；峰值显存（CUDA 时）经 torch.cuda.max_memory_allocated
+    每 token 均摊；峰值设备占用（CUDA 时）经 torch.cuda.max_memory_allocated
     记录。KV 缓存增长在本仓库的稀疏臂上是块摘要级的，直接以
     max_memory_allocated 随长度的差值读出，不做理论推断。"""
     import torch

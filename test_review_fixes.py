@@ -474,7 +474,7 @@ def t_adaptive_threshold_guard():
 def t_empty_pool_geometry():
     dev = torch.device('cpu')
     ids = torch.empty(0, dtype=torch.long, device=dev)
-    assert L._n_blocks_cached(ids) == 0, 'an empty block table has zero blocks, not a max() error'
+    assert L._n_blocks_cached(ids) == 0, 'an empty block table has zero blocks'
     comp, last_tok, B = L.pool_variable_blocks(torch.empty(0, 4), torch.empty(0, 4),
                                                torch.empty(0, 4), torch.empty(0, 4), ids,
                                                torch.empty(4, 4), torch.empty(4, 4), 1)

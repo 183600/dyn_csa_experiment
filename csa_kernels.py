@@ -86,7 +86,7 @@ def kernel_backend():
                 "CSA_KERNEL=1 requires CUDA and an importable triton, "
                 f"but cuda={torch.cuda.is_available()} triton={triton_importable()}; "
                 "unset CSA_KERNEL to stay on the eager path, or use CSA_KERNEL=ref for the "
-                "torch-reference backend (CPU-debuggable)")
+                "torch-reference backend (CPU-checkable)")
         return 'triton'
     if mode == 'auto':
         if torch.cuda.is_available() and triton_importable():
@@ -407,8 +407,8 @@ _POOL_CHUNK_HARD_BYTES = 512 << 20
 
 
 def _pool_chunk_b(R, Ltot, c, temps=1):
-    # 软上限决定常规 chunk；硬顶只在单 chunk 的 ~temps 份 [R,ch,·,c]
-    # 临时量峰值可能越界时收紧（fwd 的 logit/sc/gather 约 6 份，bwd 再
+    # 软上限决定常规 chunk；硬顶在单 chunk 的 ~temps 份 [R,ch,·,c]
+    # 临时量较大时收紧（fwd 的 logit/sc/gather 约 6 份，bwd 再
     # 加 gsc/glogit 约 8 份）。chunk 只划分独立的块列，宽度不影响任何
     # 逐块值。
     per_block = max(1, int(R) * int(Ltot) * int(c) * 4)
@@ -2280,7 +2280,7 @@ def _exp_blocks_fixed(n, block_size, device):
 
 
 # ============================================================================
-# G0 自检：算子级 kernel/eager 数值对照 + 模型级前反向对照 + 微基准
+# G0 自检：算子级 kernel/eager 数值对照 + 模型级前反向对照
 # （驱动入口：python m0_supp.py kernel）
 # ============================================================================
 

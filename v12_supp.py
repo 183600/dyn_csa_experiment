@@ -12,7 +12,7 @@
            评审二轮新增 span/doc/topical 腐坏 + NIAH-natural + 从头训练
            对照臂）；
   P5S2  —— 等训练 token 的大模型规模臂（P3SL_TOK，8000 步）；
-  P5S3  —— 6ND 参数量代理预算的大模型规模臂（P3SL_FLOP，参数量比例缩步，
+  P5S3  —— 6ND 参数量代理规模的大模型规模臂（P3SL_FLOP，参数量比例缩步，
            非实测等 FLOPs——评审二轮·意见七口径）；
   P5T   —— **冻结后的独立最终测试**：按仓库根的冻结清单
            `confirmation_frozen.json`（预注册主比较、终点、种子数、检验与

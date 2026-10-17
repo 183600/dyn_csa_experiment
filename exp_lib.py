@@ -745,9 +745,9 @@ def _attn_transient_budget(device):
     try:
         if device.type == 'cuda':
             free, _total = torch.cuda.mem_get_info(device)
-            # 预算随空闲量缩放，并封顶 _ATTN_TRANSIENT_CAP_BYTES；行分块是
+            # 上限随空闲量缩放，并封顶 _ATTN_TRANSIENT_CAP_BYTES；行分块是
             # 纯行划分（任意宽度下逐行值逐位相同，见 gathered_attention 的
-            # chunk 注释），因此预算变化只影响分块宽度，不改变任何值。
+            # chunk 注释），因此上限变化只影响分块宽度，不改变任何值。
             val = max(64 << 20, min(int(free) // 4, _ATTN_TRANSIENT_CAP_BYTES))
     except Exception:
         val = None
@@ -859,12 +859,10 @@ def _block_order(block_ids, n):
 def _n_blocks_cached(block_ids):
     # block_ids is treated as immutable by the pooling caches (_pool_gpu /
     # _pool_geom), so its max+1 is a constant of the object — cache it per
-    # object.  First call per object computes the identical value.  When the
-    # segmenter already attached its host-side counts, their length is the
-    # same block count without a device reduction + host sync.
+    # object.  When the segmenter already attached its host-side counts,
+    # their length is the same block count.
     if block_ids.numel() == 0:
-        # No tokens -> no blocks (the same total form as _segment/blocks_from_cuts;
-        # max() on an empty tensor would raise instead of returning 0).
+        # No tokens -> no blocks (the same total form as _segment/blocks_from_cuts).
         return 0
     B = getattr(block_ids, '_pool_nblocks', None)
     if B is None:
@@ -884,7 +882,7 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
     dev = Xa.device
     if n == 0:
         # Empty sequence: no blocks to pool.  Keep the same return contract as
-        # the non-empty path instead of reaching the empty-tensor reductions.
+        # the non-empty path.
         return (Xa[:0], torch.empty(0, dtype=torch.long, device=dev), 0)
     B = int(n_blocks) if n_blocks is not None else _n_blocks_cached(block_ids)
     order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
@@ -2061,7 +2059,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
 
 def _gathered_attention_trainable(*args, **kwargs):
     # 训练时包一层非重入 checkpoint，反向按同一确定性分解重算前向。函数内
-    # 无 RNG，且 mem_budget 经 _ATB_EPOCH 缓存在一次运行内不变，因此 chunk
+    # 无 RNG，且分块上限经 _ATB_EPOCH 缓存在一次运行内不变，因此 chunk
     # 边界与每个中间值逐位相同，梯度与直调形式逐位一致（design notes §6.1
     # 的 transport 论证在「重算同一纯函数」上的形式）。
     if torch.is_grad_enabled() and args[0].requires_grad:
@@ -2905,7 +2903,7 @@ def make_layer_cfgs(n_layers, variant):
             cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, use_sink=False))
         elif variant == 'csa_dyn_nocomp':
             # Loss-term ablation C: identical architecture, optimizer, LR
-            # schedule, budget and data as `csa_dynamic`; only the compression
+            # schedule, scale and data as `csa_dynamic`; only the compression
             # regularizer's multiplier is zeroed.  Keeping run_cfg's `cl`
             # unchanged is what lets `pair_reason` pair the two arms while the
             # actual loss term differs — the thing under test.
@@ -4436,7 +4434,7 @@ def paired_log_ratio(with_values, without_values, seeds=None):
     """把逐种子绝对差转成跨规模可比的 log 效应：log(with / without)。
 
     正值 = with 臂的 PPL 更高（更差）；零 = 无差异。log 比在乘性尺度上
-    对称，且不随基线 PPL 的规模漂移——这是跨 d/token 预算比较的前提。
+    对称，且不随基线 PPL 的规模漂移——这是跨 d/token 规模比较的前提。
     只接受有限正数对；非正/非有限对整对丢弃并计数（不会静默变成 NaN）。
     """
     wa = list(with_values)
@@ -4953,7 +4951,7 @@ ABLATION_DESIGN = {
 }
 
 # 主方法 vs 参数对齐基线的对比也属于「受控对比」：它回答的是方法本身是否
-# 优于同参数量、同优化器、同预算、同数据的稠密基线，而不是只回答「消融臂
+# 优于同参数量、同优化器、同训练规模、同数据的稠密基线，而不是只回答「消融臂
 # 之间谁高谁低」。两条基线都来自 `variant_mlp_ratio` 的参数对齐（MLP 加宽
 # 到与 csa_dynamic 相同），因此 `param_controlled` 是这条对比的硬读数。
 BASELINE_DESIGN = {
@@ -5033,7 +5031,7 @@ BASELINE_HYPOTHESIS_DESIGN = {
     },
 }
 
-# 基线调参协议：主方法与基线必须获得相同的搜索预算、在同一训练集上拟合、
+# 基线调参协议：主方法与基线必须获得相同的搜索范围、在同一训练集上拟合、
 # 在验证集上按同一指标选择。`baseline_tune.py` 读取本表；审计读取落盘的
 # `baseline_tuning.json`，没有该产物时只报「不可核验」，不会把未调参的
 # 弱基线当成已验证的对照。
@@ -5293,9 +5291,8 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             return {'status': 'not_verifiable_locally', 'tuning_verified': False,
                     'problems': [f'{path} absent — run baseline_tune.py before claiming a baseline win']}
     # An artifact records the protocol it was produced under.  Use it when the
-    # caller did not pass one explicitly, so a legitimate smoke/subset run is
-    # audited against its own declared grid instead of the full global grid
-    # (the latter reported the subset's deliberately absent arms as "missing").
+    # caller did not pass one explicitly, so a smoke/subset run is audited
+    # against its own declared grid.
     if not _explicit_protocol and isinstance(selected, dict) and isinstance(selected.get('protocol'), dict):
         protocol = selected['protocol']
     else:
@@ -5936,7 +5933,7 @@ def set_seed(seed):
     # TensorFlow is not a dependency of this repo, but a future/embedded
     # TensorFlow path must not become an unseeded RNG source.  Only touch it
     # when the user has already imported it (never import TensorFlow here:
-    # that would double the import cost of every CPU-only run).
+    # that would make every CPU-only run import it needlessly).
     _tf = sys.modules.get('tensorflow')
     if _tf is not None:
         try:
@@ -6615,9 +6612,9 @@ def _cluster_expected_matches(win, cl, tol, P, n_pos, approx_flag=None):
         nb_r = len(wts)
         order = sorted(range(nb_r), key=lambda i: -wts[i][1])
         if nb_r > _AMP_FALLBACK_DRAWS:
-            # More candidate sizes than the draw budget: keep the top-weight
+            # More candidate sizes than the draw limit: keep the top-weight
             # sizes, one draw each, so the actual number of draws never
-            # exceeds the declared _AMP_FALLBACK_DRAWS budget.
+            # exceeds the declared _AMP_FALLBACK_DRAWS limit.
             _keep = set(order[:_AMP_FALLBACK_DRAWS])
             budget = [1 if i in _keep else 0 for i in range(nb_r)]
         else:
@@ -7006,9 +7003,9 @@ def training_knobs():
 
 def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs):
     # Explicit CSA_CKPT always wins.  Otherwise, on a CUDA box, fall back to
-    # activation recomputation when the estimated working set does not fit the
-    # free memory.  The recomputed forward is the same pure function, so values
-    # and gradients are unchanged (the contract documented at the top).
+    # activation recomputation when the estimated working set is large.  The
+    # recomputed forward is the same pure function, so values and gradients
+    # are unchanged (the contract documented at the top).
     if os.environ.get('CSA_CKPT', '').strip():
         return None, None
     if device.type != 'cuda' or not torch.cuda.is_available():
@@ -7190,7 +7187,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     none is supplied), disable every regulariser (weight decay = 0, the
     compression penalty = 0; the model has no dropout), and optimise only that
     batch.  A correct training path drives the LM loss towards 0 and the
-    next-token accuracy towards 100%.  Failure means a serious plumbing bug
+    next-token accuracy towards 100%.  Failure means a serious plumbing fault
     (loss not connected to the graph, gradients not applied, wrong labels,
     etc.) — do NOT launch a full run until it passes.
 
@@ -7368,7 +7365,7 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
     on failure.  Called automatically by `run()` before the first panel and by
     the length/checkpoint phases, so every training driver inherits the check.
 
-    `CSA_SKIP_OVERFIT=1` is the explicit escape hatch (e.g. a debugging box
+    `CSA_SKIP_OVERFIT=1` is the explicit escape hatch (e.g. a diagnostic box
     with a deliberately broken batch); it prints a loud skip line instead.
     Passing is necessary, not sufficient."""
     if os.environ.get('CSA_SKIP_OVERFIT', '').strip().lower() in ('1', 'true', 'yes', 'on'):
@@ -7406,7 +7403,7 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
         reports.append(r)
         print(f"[overfit] {v:<24} loss {r['initial_loss']:.3f} -> {r['final_loss']:.4f}  acc {r['final_accuracy'] * 100:.1f}%  grad_finite={r['grad_all_finite']}  params_changed={r['params_changed']}  {'PASS' if r['passed'] else 'FAIL'}")
         if not r['passed']:
-            raise RuntimeError(f'small-batch overfit sanity check FAILED for `{v}` ({r["diagnosis"]}) — do NOT start or continue this run; this points at a gradient/loss/label plumbing bug.  Inspect the returned report and set CSA_SKIP_OVERFIT=1 only if you deliberately accept the risk.')
+            raise RuntimeError(f'small-batch overfit sanity check FAILED for `{v}` ({r["diagnosis"]}) — do NOT start or continue this run; this points at a gradient/loss/label plumbing fault.  Inspect the returned report and set CSA_SKIP_OVERFIT=1 only if you deliberately accept the risk.')
     return reports
 
 _REPRO_GUARD = {}
@@ -8546,7 +8543,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             # `spent_hours()` includes this cell's own pre-booking, which is
             # the time this cell is about to use rather than time already
             # spent, so add it back here.  Other cells' bookings stay
-            # subtracted (shared-headroom contract).
+            # subtracted (shared-cap contract).
             deadline_ts += booked
         print(f'[cap] {key}: projected {est / 60:.0f} min, booked so far {guard.state['booked_seconds'] / 3600:.2f} h')
     t_run = time.time()
@@ -8669,7 +8666,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     _read_summary_json(summary_path)
     if label:
         print(f'\n########## phase: {label} — {len(cfg['variants'])} variants x seeds {cfg['seeds']} x {cfg['steps']} steps ##########')
-    # Prospective seed-budget note: a panel that contains an ablation arm is
+    # Prospective seed-plan note: a panel that contains an ablation arm is
     # checked BEFORE training so its seed count is not mistaken for a
     # confirmation after the fact.  This never blocks a run.
     try:

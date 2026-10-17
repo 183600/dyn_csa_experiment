@@ -259,8 +259,8 @@ def _dump_log_tail(entry, n=40):
             entry["log_path"], encoding="utf-8", errors="replace"
         ) as stream:
             # deque(maxlen) keeps only the last n lines resident: the same
-            # tail lines as readlines()[-n:] without holding the whole
-            # child log in memory on a failure path.
+            # tail lines as readlines()[-n:] without retaining the whole
+            # child log on a failure path.
             tail = collections.deque(stream, maxlen=n)
         print(f"[par] ---- {entry['log_path']} ----", flush=True)
         sys.stdout.writelines("  " + line for line in tail)

@@ -385,7 +385,7 @@ def run_overfit(cfg=None, variants=None, steps=None):
     Runs BEFORE any expensive panel: one fixed batch, zero weight decay, zero
     compression penalty, no augmentation.  A failure is a hard stop (the full
     run must not start).  Passing is necessary, not sufficient — data
-    augmentation / feature-alignment / label-mapping bugs can still survive.
+    augmentation / feature-alignment / label-mapping problems can still survive.
     """
     cfg = dict(L.RUN if cfg is None else cfg)
     cfg.setdefault('outdir', 'results_overfit_sanity')
@@ -417,7 +417,7 @@ def run_overfit(cfg=None, variants=None, steps=None):
     L.log_experiment_event(cfg['outdir'], {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and all(bool(r.get('passed')) for r in _repro) else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': {'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro)}})
     if not ok:
         _bad = [r['variant'] for r in reports if not r['passed']]
-        raise RuntimeError(f'small-batch overfit sanity check FAILED for {_bad} — do NOT start the full run; this points at a gradient/loss/label plumbing bug (see {cfg["outdir"]}/overfit_sanity.json)')
+        raise RuntimeError(f'small-batch overfit sanity check FAILED for {_bad} — do NOT start the full run; this points at a gradient/loss/label plumbing fault (see {cfg["outdir"]}/overfit_sanity.json)')
     print('[overfit] PASSED (necessary, not sufficient — keep the intermediate-result checks)')
     return reports
 
@@ -432,9 +432,9 @@ def run_full():
     # Phase order: the statistically foundational, cheap panels first (core
     # table -> its leave-one-out ablations -> scale probe), the 20k-step
     # long runs LAST.  A run-time-capped fresh box then secures the n>=3
-    # core/ablation/scale tables before the long runs can eat the remaining
-    # budget; on a box that already holds the panels every phase just resumes
-    # and the order costs nothing.
+    # core/ablation/scale tables before the long runs can consume the
+    # remaining allowance; on a box that already holds the panels every phase
+    # just resumes and the order adds nothing.
     L.run(L.RUN, seeds=[0, 1, 2], guard=guard, label='P-CORE 1500-step core table (results_lm_v3_1500)')
     push_ok &= git_push('v6: results_lm_v3_1500 — 9-variant core table, 1500 steps x 3 seeds')
     L.run(L.RUN_ABL, seeds=[0, 1, 2], guard=guard, label='P-ABL leave-one-out ablation table (results_lm_v4_abl)')
@@ -541,7 +541,7 @@ if __name__ == '__main__':
     except Exception:
         traceback.print_exc()
         if mode in ('full', 'topup'):
-            print('\n[v6] CRASHED — attempting a partial-results push, then the instance stays up 40 min for remote debugging before auto-shutdown (cancel with: pkill -f v6autoshutdown).')
+            print('\n[v6] CRASHED — attempting a partial-results push, then the instance stays up 40 min for remote diagnosis before auto-shutdown (cancel with: pkill -f v6autoshutdown).')
             try:
                 git_push('v6: PARTIAL — run_gapfill crashed, see run_v6.log (resume by re-running: completed runs are skipped)')
             except Exception:
