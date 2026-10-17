@@ -691,9 +691,8 @@ def _stable_topk_desc(x, k):
     flat = x.reshape(m, B)
     kth = torch.topk(flat, kk, dim=1, sorted=True).values[:, -1:]
     # Same candidate construction as exp_lib._rank_blocks: strictly greater
-    # entries plus the earliest equal-to-kth entries.  Prefix ranks are int32
-    # (B < 2^31) and the sentinel is filled in place — no full-width int64
-    # temporaries and no device sync.
+    # entries plus the earliest equal-to-kth entries.  Prefix ranks use int32
+    # (B < 2^31), the same exact integers; the sentinel is filled in place.
     gt = flat > kth
     eq = flat == kth
     need = (kk - gt.sum(dim=1)).clamp_min(0).to(torch.int32)
@@ -946,16 +945,14 @@ _ATTN_REF_BUDGET = 256 << 20
 
 
 def _attn_t_chunk(R, M, nh, hd):
-    # 头循环在 t-chunk 之外（见 _attn_fwd_ref/_attn_bwd_ref）：同时存活的
-    # 临时量只是单个头的若干 [R,tc,M,hd] 级张量（gather 出的 K/V 两半、
-    # bwd 的 Kl/Vl 拼接与 dk/dv 泳道碎片，合计约 6 份），与 nh 无关。
-    # chunk 只划分独立的 (r,t) 行，宽度不影响任何元素值。
+    # 头循环在 t-chunk 之外；chunk 只划分独立的 (r,t) 行，宽度不影响任何
+    # 元素值。
     per_t = max(1, 6 * int(R) * int(M) * int(hd) * 4)
     return max(1, min(int(_ATTN_REF_BUDGET) // per_t, 256))
 
 
 def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale):
-    """torch 参考实现（按 t 分块 × 逐头，内存有界）。
+    """torch 参考实现（按 t 分块 × 逐头）。
 
     泳道布局与 eager 一致：[top-k 块泳道 | 滑窗泳道]，共 M = nb + w 条。
     前向值 = **A 路径**（plain softmax 注意力）——eager 的直通估计器
@@ -1582,15 +1579,12 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
         dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
         flat = topk_idx.reshape(R, T * nb)
-        # 逐行排序（各行互相独立，稳定序逐位不变）：全幅 argsort 的
-        # 工作区与 [R, T·nb] 的 int64 键表不再同时驻留，长序列下的峰值
-        # 由一次性 R 行降为单行。order 保留 int64：lane 值域是
-        # [0, T·nb)，T·nb ≥ 2³¹ 的超大配置下窄化到 int32 会翻负、内核再
-        # 按 lane//NB 寻址即越界。排序写入预分配的 order 行（复用同一个
-        # values 缓冲），不再为每行另分配一份索引表。
+        # 逐行排序（各行互相独立，稳定序逐位不变）；order 保留 int64：
+        # lane 值域是 [0, T·nb)，T·nb ≥ 2³¹ 的超大配置下窄化到 int32 会
+        # 翻负、内核再按 lane//NB 寻址即越界。
         order = torch.empty((R, T * nb), device=dev, dtype=torch.int64)
         # 计数是整数（块 id 非负且 < Bm），scatter_add_ 与逐行 bincount
-        # 给出同一组精确整数——这里一次完成，省掉 R 次内核启动。
+        # 给出同一组精确整数。
         flat_l = flat.to(torch.int64)
         cnt = torch.zeros((R, Bm), device=dev, dtype=torch.int64)
         cnt.scatter_add_(1, flat_l, torch.ones_like(flat_l))

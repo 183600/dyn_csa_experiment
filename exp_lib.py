@@ -172,8 +172,7 @@ def cosine_similarity_consecutive(H, eps=1e-08):
     _step = _rows - 1
     _lead_sl = (slice(None),) * (H.dim() - 2)
     # Preallocate the final [.., T-1] result and fill the per-chunk slices
-    # (each value is the same per-pair reduction as before); the chunk list +
-    # cat form held the whole result twice.
+    # (each value is the same per-pair reduction as before).
     out = H.new_empty(H.shape[:-2] + (T - 1,))
     for s in range(0, T - 1, _step):
         e = min(s + _rows, T)
@@ -228,8 +227,7 @@ def _segment(n, want_cut_list, min_block, max_block):
     # successor (min_block == max_block), when no slot is wanted, or when every
     # slot is wanted, the successor is p + stride for a constant stride.  The
     # counts/bids below are exactly the same integers the general table walk
-    # produces (the block starts are an arithmetic progression), so this only
-    # avoids the O(n) successor/scan tables and their temporaries.
+    # produces (the block starts are an arithmetic progression).
     _stride = None
     if _mb >= 1 and _mb == _xb:
         _stride = _mb
@@ -493,7 +491,7 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     _peak_bytes = min(_rows_total, _row_chunk_est) * n * n * 16
     if _peak_bytes > 1 << 30:
         raise RuntimeError(
-            f'causal_adaptive_threshold 的因果分位数闭式为 O(rows·T²)（单块峰值 ~{_peak_bytes / 2**30:.1f} GB）: '
+            'causal_adaptive_threshold 的因果分位数闭式为 O(rows·T²)，超出安全上限: '
             'adaptive 分段器不支持该序列长度——请改用 chunking="cosine_learnable"')
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
     # 1-D (single row) or 2-D (batched rows) — every op is rowwise
@@ -1008,8 +1006,7 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         n_a = B * max_len
         n_b = B * W_b
         # Build every part directly in the final flats (the same integer ops
-        # as before, just with in-place numpy destinations): the ragged
-        # [B, max_len] / [B, W_b] temporaries never exist.  Requested padding
+        # as before, just with in-place numpy destinations).  Requested padding
         # is part of the same allocation, so the caller never has to copy the
         # flat again to bucket-align it.
         _pi = (-(n_a + 2 * n_b + max_len)) % int(pad_to) if int(pad_to) > 1 else 0
@@ -1056,8 +1053,7 @@ def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, de
     try:
         B = int(B)
         flat_i, flat_b, n_a, n_b, W_b, max_len = _built
-        # `_pool_geom_flat_var` already bucket-pads both flats inside their
-        # single allocation (no second full-size copy).
+        # `_pool_geom_flat_var` already bucket-pads both flats.
         buf = _h2d_async(flat_i, torch.long, dev)
         g_a = buf[0:n_a].view(B, max_len)
         g_b = buf[n_a:n_a + n_b].view(B, W_b)
@@ -1113,7 +1109,7 @@ def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
     try:
         B = int(B)
         flat_i, mask_np, n_g, max_len = _built
-        # Both flats are already bucket-padded in their single allocation.
+        # Both flats are already bucket-padded.
         buf = _h2d_async(flat_i, torch.long, dev)
         mask = _h2d_async(mask_np, torch.bool, dev)[:n_g].view(B, max_len)
         return (buf[0:n_g].view(B, max_len), mask, buf[n_g:n_g + max_len])
@@ -1240,9 +1236,8 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
             continue
         _tot_i += len(_r[2][0]) + len(_r[3][0])
         _tot_b += len(_r[3][1].ravel())
-    # One padded allocation per dtype class, filled row-by-row: the previous
-    # concatenate-then-concatenate form held the whole payload twice on the
-    # host.  The pad tails are never read.
+    # One padded allocation per dtype class, filled row-by-row.  The pad tails
+    # are never read.
     flat_i = np.empty(_tot_i + (-_tot_i) % _POOL_GEOM_BUCKET, dtype=np.int64)
     flat_b = np.empty(_tot_b + (-_tot_b) % _POOL_GEOM_BUCKET, dtype=np.bool_)
     _oi = 0
@@ -1377,8 +1372,9 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     # Every real block carries at least one token (the segmenters only emit
     # positive counts), so the A lanes always contain a finite logit and the
     # softmax cannot produce NaN/Inf.  When the block-ids object exposes its
-    # host counts we can prove that here and skip the full-size nan_to_num
-    # copy; the fallback keeps the defensive form for externally built tables.
+    # host counts we can prove that here, so the defensive nan_to_num is
+    # unnecessary; the fallback keeps the defensive form for externally built
+    # tables.
     _clean = (B > 0 and _cpu is not None and len(_cpu[0]) == B
               and bool(_cpu[0]) and min(_cpu[0]) > 0)
     comp = torch.empty(B, _Fd, device=dev, dtype=Xas.dtype)
@@ -1406,8 +1402,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         WinZ = torch.cat([Zam, Zbm], 1)
         # softmax 的反向保存其输出，nan_to_num 必须出位（原地会改写保存值，
         # SoftmaxBackward 版本检查失败）；值与任何原地形式逐位相同。
-        # The safe-count path skips the copy entirely: nan_to_num over the
-        # finite softmax output is the identity.
+        # The safe-count path uses the finite softmax directly.
         sc = F.softmax(WinZ, dim=1) if _clean else torch.nan_to_num(F.softmax(WinZ, dim=1))
         del WinZ, Zam, Zbm
         Xam = _take_2d(Xas, g_a[_b0:_b1])
@@ -1523,9 +1518,9 @@ def _rank_blocks(masked, B, ties, k=None):
     kth = torch.topk(src, kk, dim=1, sorted=True).values[:, -1:]
     # gt has at most kk - 1 entries (the k-th value itself is not strictly
     # greater), so `need` is non-negative and selects exactly kk columns.
-    # Prefix ranks are int32 (B < 2^31): the same exact integers as the int64
-    # form, at half the bytes, and the non-selected lanes are filled with the
-    # sentinel column in place instead of materialising another [n, B] table.
+    # Prefix ranks use int32 (B < 2^31): the same exact integers as the int64
+    # form; the non-selected lanes are filled with the sentinel column in
+    # place.
     gt = src > kth
     eq = src == kth
     need = (kk - gt.sum(dim=1)).clamp_min(0).to(torch.int32)
@@ -1573,8 +1568,8 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     order_w = order[:, :_w_keep]
     keep = cf.gather(1, order_w)
     # Integer prefix ranks fit in int32 (k <= B < 2**31): the same exact
-    # integers as the default int64 cumsum at half the bytes, and the scatter
-    # below then needs no int64 index temporary.
+    # integers as the default int64 cumsum; the scatter below therefore needs
+    # no int64 index.
     dest = keep.cumsum(dim=1, dtype=torch.int32)
     dest -= 1
     # int64 -> int32 narrowing, on the kept slice only — same integers
@@ -1883,8 +1878,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # `v_stacked` lets a caller that already owns a row-contiguous
         # [blocks | window] V view (the fused KV head in `_single`) hand it in
         # directly: gathering its rows yields exactly the rows of
-        # cat([v_blk, v_sw]) in the same order, so the values are bit-identical
-        # while the cat copy (a full block+window V table) is never allocated.
+        # cat([v_blk, v_sw]) in the same order, so the values are bit-identical.
         v_all = v_stacked if v_stacked is not None else torch.cat([v_blk, v_sw], 0)
         # The K halves are concatenated only for the plain (soft=None,
         # soft_form=False) path; the soft path keeps its two contiguous
@@ -2037,8 +2031,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             soft_logits.masked_fill_(nvalid, _MINL)
             soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
             # soft_logits is dead once soft_attn is built; release it before the
-            # plain path allocates its own attention table, lowering the peak
-            # for long contexts without changing any value.
+            # plain path builds its own attention table.
             del soft_logits, soft_log_g
         logits.masked_fill_(nvalid, _MINL)
         attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
@@ -2545,8 +2538,8 @@ class HybridAttention(nn.Module):
             k_blk, v_blk = self._split(_kvh[:_Bn])
             k_sw, v_sw = self._split(_kvh[_Bn:])
             # Row-contiguous [blocks | window] view of the V columns: the same
-            # values as cat([v_blk, v_sw]) without the extra allocation.  The
-            # views keep `_kvh` alive exactly as v_blk/v_sw already did.
+            # values as cat([v_blk, v_sw]).  The views keep `_kvh` alive exactly
+            # as v_blk/v_sw already did.
             v_stacked = _kvh[:, self.nh * self.hd:].view(_Bn + T, self.nh, self.hd)
             del _kvh
         else:
@@ -2976,8 +2969,8 @@ def _ids_fp(train_ids):
     # layout) with a strong ref to the array (so the keyed pointer can
     # never be recycled while the entry lives).  Same tokens in -> same
     # digest out, always.  Sub-int32 storage (the uint16 FineWeb cache) is
-    # hashed through its canonical int32 form, so a corpus keeps the exact
-    # fingerprint it had before the storage width was reduced.
+    # hashed through its canonical int32 form, so a corpus keeps the same
+    # fingerprint regardless of storage width.
     try:
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
     except (AttributeError, TypeError):
@@ -3341,10 +3334,9 @@ def _disk_ids_chunk(buf, disk_dt, vocab):
 
 def _npy_serve_int32(path):
     # 传输层（design_notes §6.1）：磁盘上的 uint16/int32 都是同一组精确
-    # 整数。uint16 缓存原宽驻留（每 token 2 字节），batch_iter 在 gather
-    # 后立即加宽回 int64，因此产出的 batch 与 int32 驻留形式逐位相同；
-    # _ids_fp 对窄整型按规范 int32 形式取指纹，缓存指纹也不变。对 int32
-    # 缓存仍经 mmap 分块复制（而不是整载入再 .astype）。
+    # 整数。batch_iter 在 gather 后立即加宽回 int64，因此产出的 batch 与
+    # int32 驻留形式逐位相同；_ids_fp 对窄整型按规范 int32 形式取指纹，
+    # 缓存指纹也不变。
     mm = np.load(path, mmap_mode='r')
     src = np.asarray(mm)
     if src.dtype in (np.uint8, np.uint16):
@@ -3855,10 +3847,10 @@ _PINNED_HOST_CAP_BYTES = 4 << 30
 
 def _ids_narrow(train_ids):
     # Token ids are bounded by the vocab (<= 2**31 for every corpus this repo
-    # produces), so the resident copy (GPU, or pinned host staging) stays at
-    # its compact width (uint8/uint16/int32) and is widened back to int64
-    # right after each batch gather, leaving the yielded batch bit-identical.
-    # The guard keeps any hypothetical out-of-range corpus on the int64 path.
+    # produces), so the resident copy (GPU, or pinned host staging) keeps its
+    # transport width (uint8/uint16/int32) and is widened back to int64 right
+    # after each batch gather, leaving the yielded batch bit-identical.  The
+    # guard keeps any hypothetical out-of-range corpus on the int64 path.
     if train_ids.dtype in (np.uint8, np.uint16, np.int32):
         return train_ids
     if train_ids.size and int(train_ids.max()) < 2 ** 31:
@@ -3897,10 +3889,9 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
                 host = torch.from_numpy(_ids_narrow(train_ids))
         else:
             _host_ids = _ids_narrow(train_ids)
-            # PyTorch's CPU index kernel does not implement uint8/uint16
-            # gathers (the uint16 FineWeb cache would fail here), so widen
+            # PyTorch's CPU index kernel lacks uint8/uint16 gathers, so widen
             # those two transport widths to int32 on the CPU host only.
-            # CUDA keeps the compact width; its gather widens to int64 below.
+            # CUDA keeps the transport width; its gather widens to int64 below.
             if _host_ids.dtype in (np.uint8, np.uint16):
                 _host_ids = _host_ids.astype(np.int32, copy=False)
             host = torch.from_numpy(_host_ids)
@@ -5854,8 +5845,7 @@ _EVAL_TOKENS_PER_CHUNK = 1 << 17
 @torch.inference_mode()
 def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
     # A chunk is a set of independent sequences (no cross-row op in the
-    # model), so capping it by token count bounds eval memory at long
-    # contexts without changing any per-row value.
+    # model), so capping it by token count does not change any per-row value.
     _span = max(1, int(val_batch.shape[1]) - 1)
     chunk = min(max(1, int(chunk)), max(1, _EVAL_TOKENS_PER_CHUNK // _span))
     was_training = model.training
@@ -6382,8 +6372,8 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
     n_used = min(n_sample, val_batch.shape[0])
     _row_chunk = max(1, min(16, _EVAL_TOKENS_PER_CHUNK // max(seq_len, 1)))
     # inference_mode (the decorator) already covers the forward pass.  The
-    # sampled sequences are independent, so the row grouping only bounds the
-    # transient working set.
+    # sampled sequences are independent, so the row grouping does not change
+    # any value.
     for _r0 in range(0, n_used, _row_chunk):
         # as_tensor accepts numpy arrays AND torch tensors (eval_ppl already
         # uses it).
@@ -6495,11 +6485,10 @@ def training_knobs():
     }
 
 def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs):
-    # Explicit CSA_CKPT always wins.  Otherwise, on a CUDA box with little
-    # headroom, fall back to activation recomputation: the working set grows
-    # with tokens x layers x d, while recomputation keeps only the block
-    # inputs.  The recomputed forward is the same pure function, so values and
-    # gradients are unchanged (the contract documented at the top).
+    # Explicit CSA_CKPT always wins.  Otherwise, on a CUDA box, fall back to
+    # activation recomputation when the estimated working set does not fit the
+    # free memory.  The recomputed forward is the same pure function, so values
+    # and gradients are unchanged (the contract documented at the top).
     if os.environ.get('CSA_CKPT', '').strip():
         return None, None
     if device.type != 'cuda' or not torch.cuda.is_available():
@@ -6515,8 +6504,8 @@ def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len
     if free >= need + need // 3:
         return None, need
     has_gate = any(getattr(c, 'chunking', '') == 'cosine_learnable' for c in cfgs)
-    # Block-level recompute saves the residual stream too, but it cannot cover
-    # the gate-mean side channel; those arms use the MLP-level fallback.
+    # Block-level recompute cannot cover the gate-mean side channel; those
+    # arms use the MLP-level fallback.
     mode = 'mlp' if (has_gate or free >= (need * 3) // 4) else 'block'
     return mode, need
 
@@ -6567,15 +6556,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # fixed cadence and the original GC state is restored on every exit path.
     _gc_relief = gc.isenabled()
     _ckpt_saved = _CKPT['on']
-    _auto_ckpt, _auto_need = _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs)
+    _auto_ckpt, _ = _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs)
     if _auto_ckpt:
         _CKPT['on'] = _auto_ckpt
-        _free = None
-        try:
-            _free = int(torch.cuda.mem_get_info(device)[0])
-        except Exception:
-            pass
-        print(f'    [mem] free={(_free or 0) / 2**30:.1f}GiB  est_working_set={(_auto_need or 0) / 2**30:.1f}GiB  -> activation checkpoint ({_auto_ckpt})')
     if _gc_relief:
         gc.disable()
     try:
