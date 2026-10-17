@@ -1458,6 +1458,17 @@ def t_categorical_and_cache_guards():
                L._cached_split_problems(bad3, tr, va, np.zeros_like(va, dtype=bool), 11, seq_len=8))
 
 
+def t_public_exports_resolve():
+    # __all__ is an API contract: every advertised name must exist, and a
+    # star-import must not fail.  A stale entry (a name added to __all__ but
+    # never implemented) breaks `from data_guard import *` at import time.
+    import data_guard as DG
+    missing = [name for name in DG.__all__ if not hasattr(DG, name)]
+    assert not missing, f'data_guard.__all__ advertises undefined names: {missing}'
+    ns = {}
+    exec('from data_guard import *', ns)
+    for name in DG.__all__:
+        assert name in ns, f'{name} was not exported by a star-import'
 
 
 def main():
@@ -1537,6 +1548,7 @@ def main():
     _check('I5 categorical shift + cache guards', t_categorical_and_cache_guards)
     _check('I6 explicit split sizes stay non-negative', t_split_sizes_explicit_never_negative)
     _check('I7 split audit finds sequence-level row overlap', t_audit_split_sequence_overlap)
+    _check('I8 public exports resolve (star-import safe)', t_public_exports_resolve)
     fails = [r for r in _results if r[1] != 'PASS']
     print(f'\n[test] {len(_results) - len(fails)}/{len(_results)} passed')
     return 1 if fails else 0
