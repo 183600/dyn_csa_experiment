@@ -4476,9 +4476,9 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3):
     return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict}
 
 # ---- 预注册功效 / 分辨率工具（评审二轮·意见一/九） ------------------------------
-# 动机：一个冻结方案如果「无论数据多强都不可能达到 p_holm < α」，它不是
-# 保守，而是确认概率恒为零的构造缺陷。下面的函数把这件事变成加载清单时
-# 就能机器判定的硬门槛，而不是统计阶段的一句「保守」警告。
+# 动机：一个冻结方案如果「无论数据多强都不可能达到 p_holm < α」，它落在
+# 分辨率上限而不是「保守」。下面的函数把这件事变成加载清单时就能机器判定
+# 的硬门槛，而不是统计阶段的一句「保守」警告。
 
 def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     """双侧精确符号翻转 + Holm 校正族的最小可达 Holm p。
@@ -8116,7 +8116,7 @@ _OVERFIT_ARCH = {'d': 64, 'n_layers': 2, 'n_heads': 4, 'd_head': 16}
 def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_loss, target_acc):
     """Exact probe configuration that a cached PASS is allowed to certify.
 
-    A pass only proves that THIS tiny run can overfit (same step budget, batch
+    A pass only proves that THIS tiny run can overfit (same step count, batch
     size, sequence length, targets, architecture and code semantics).  Without
     these fields in the cache key a lax probe (e.g. one step, target_loss=100)
     would silently satisfy a later strict probe, turning the safety gate into a
@@ -8151,7 +8151,7 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
     the length/checkpoint phases, so every training driver inherits the check.
 
     The in-process cache is keyed by the FULL probe configuration (seed, step
-    budget, shape, targets, architecture, code) as well as the corpus bytes, so
+    count, shape, targets, architecture, code) as well as the corpus bytes, so
     a lenient probe can never certify a stricter one.  `CSA_SKIP_OVERFIT=1` is
     the explicit escape hatch (e.g. a diagnostic box with a deliberately broken
     batch); it prints a loud skip line instead.  Passing is necessary, not
@@ -8165,7 +8165,7 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
     # The data cache key keeps the vocab + token fingerprint in the first two
     # trailing slots (run() recovers them to rebuild the panel evidence) and
     # appends the probe-config digest.  A pass on corpus A can never certify
-    # corpus B, and a pass with a different probe budget can never certify a
+    # corpus B, and a pass with a different probe step count can never certify a
     # stricter call.
     _data_key = None
     if src == 'data':
@@ -8296,7 +8296,7 @@ def _repro_guard_base(*, seed=0, steps=3, tol=1e-06):
     """Cache key shared by the guard and run()'s evidence recovery.
 
     Strictly a description of the probe that produced a PASS: changing the
-    tolerance, step budget, device, determinism level or code invalidates the
+    tolerance, step count, device, determinism level or code invalidates the
     cached certificate.  A pass under a loose tolerance must never be reused
     for a stricter request."""
     return (int(seed), int(steps), float(tol), str(DEVICE), determinism_label(), code_stamp())

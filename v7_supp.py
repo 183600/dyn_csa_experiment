@@ -641,7 +641,7 @@ class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
     def trunk(self, ids):
         # RoPE embedding form of exp_lib.SmallGPT.trunk — trunk is dispatched
         # here by the inherited ce_loss; comp_reg terms accumulate in the same
-        # order as the old two-pass forward (zeros init + per-block adds).
+        # order as the full forward (zeros init + per-block adds).
         T = ids.shape[1]
         x = self.tok(ids)
         if getattr(self, 'use_abs_pe', True):
@@ -1845,8 +1845,8 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             # The parent ran only the SYNTHETIC pre-flight.  The real token
             # stream can still be broken (vocabulary mapping, cache mixing,
             # label shift downstream), so run the same small-batch overfit
-            # probe on the actual corpus before spending hours training.  The
-            # probe is RNG-preserving, so it cannot perturb this cell.
+            # probe on the actual corpus before starting the cell.  The probe
+            # is RNG-preserving, so it cannot perturb this cell.
             L.overfit_guard([v], train_ids=train_ids, vocab=vocab, steps=150,
                             seq_len=min(64, int(train_len)), batch_size=2)
             _tr = L.train_variant(v, train_ids, None, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=batch_size, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=_deadline, return_model=True)

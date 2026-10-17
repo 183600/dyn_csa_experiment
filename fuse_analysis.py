@@ -618,7 +618,7 @@ def main(argv=None):
         _x_ppl_txt = f'，跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL' if _x_ppl is not None and np.isfinite(_x_ppl) else '，跨面板纯 CSA 对比未测量'
         _c3 = f'3. **PPL 同样不变**：两条验证 PPL 轨迹全程重叠（见 `fuse_ppl_traj.png`），同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')}）{_x_ppl_txt}——{_ppl_floor_txt}。\n'
     if _blk_stable and not _f1_sig and not _ppl_sig and (_f1_d is not None) and (_ppl_d is not None):
-        _c4 = '4. **结论写法（可直接引用）**：在 1500 步训练量区间，用于边界检测的邻域表示融合是一个**惰性旋钮（inert knob）**——它既没有稳定改善动态分块的边界对齐质量，在上文第 2 条核验通过的范围内也没有改变块长分布，更没有转化为语言建模收益。这与全套实验的主结论一致：该训练量下 LM 损失对分块质量不敏感（v4 全部消融臂停在同一 PPL 水平），且动态分块母轴本身在 4 个面板（核心表/20k 长跑/RoPE/scale）都与固定分块贴平。\n'
+        _c4 = '4. **结论写法（限定在本轮产物内）**：上述条件在本轮产物上成立，因此不做「fuse 有稳定收益」的正面断言；更强的结论需要新的 run。\n'
     else:
         _c4 = '4. **结论写法**：本轮产物**不满足**「惰性旋钮」的全部前置条件（第 1–3 条中至少一条报错、显著或越界）——不作「fuse 是惰性旋钮」的断言，以第 1–3 条各自的实测结果为准。\n'
     lines.append(_c1 + _blk_line + _c3 + _c4 + '5. **遗留（如需更强断言）**：本分析限于 tol=1（落盘唯一容差）与 1500 步训练量区间；其它容差或收敛区间（20k 步）的断言需要新 run。\n')

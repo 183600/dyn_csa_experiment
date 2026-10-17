@@ -195,11 +195,9 @@ def synthesize_long_summary():
     for _v in _split:
         print(f'[synth] REFUSING to synthesize `{_v}`: this aggregate key is a run_cfg-split group, so it cannot be mapped back to one canonical per-seed record — re-run the panel to get per-seed records; only this key is skipped')
     _unaligned = {v for v, _n, _r in _unaligned} | set(_split) | set(_cfg_refused)
-    # One indexed pass over summary replaces the per-value O(len(summary))
-    # scan for a covering real record: group the real (non-synthesized,
-    # usable, full-steps) records by (variant, protocol, seed) once, then each
-    # reconstructed value only walks its own tiny bucket with the identical
-    # match conditions as before.
+    # Group the real (non-synthesized, usable, full-steps) records by
+    # (variant, protocol, seed) once, then each reconstructed value only walks
+    # its own bucket with the identical match conditions.
     _twin_idx = {}
     for _k, _r in summary.items():
         if not isinstance(_r, dict) or _r.get('synthesized'):

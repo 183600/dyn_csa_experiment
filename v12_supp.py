@@ -176,8 +176,8 @@ def _load_manifest(path):
     # ---- review-2 issue 1: a plan that CANNOT confirm is refused at load time.
     # 6 seeds x two-sided sign-flip x Holm/4 has a smallest attainable Holm p of
     # m * 2/2^n = 0.125 > 0.05: confirmation probability is ZERO BY CONSTRUCTION,
-    # which is a design defect, not "conservatism".  Descriptive-only manifests
-    # (smoke) may opt out explicitly.
+    # which is a resolution limit, not "conservatism".  Descriptive-only
+    # manifests (smoke) may opt out explicitly.
     _alpha = float(_stat.get('alpha', 0.05))
     _n = len(m['seeds'])
     _m_family = len(m['primary_comparisons'])

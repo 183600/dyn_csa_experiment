@@ -1139,7 +1139,7 @@ def t_overfit_guard_source_key():
 
 def t_overfit_guard_config_aware():
     # A cached PASS certifies only the exact probe that produced it.  Changing
-    # the step budget or the convergence targets must invalidate the cache; a
+    # the step count or the convergence targets must invalidate the cache; a
     # lenient probe must not silently certify a stricter one.
     _saved_guard = dict(L._OVERFIT_GUARD)
     _saved_reports = dict(L._OVERFIT_REPORTS)
@@ -1160,7 +1160,7 @@ def t_overfit_guard_config_aware():
         L.overfit_guard(['probe'], steps=10)
         assert calls == [(10, 0.05)], f'the identical probe must be cached once: {calls}'
         L.overfit_guard(['probe'], steps=20)
-        assert calls == [(10, 0.05), (20, 0.05)], f'a changed step budget must re-run the probe: {calls}'
+        assert calls == [(10, 0.05), (20, 0.05)], f'a changed step count must re-run the probe: {calls}'
         L.overfit_guard(['probe'], steps=20, target_loss=0.001)
         assert calls == [(10, 0.05), (20, 0.05), (20, 0.001)], f'a stricter target must re-run the probe: {calls}'
         _rep = list(L._OVERFIT_REPORTS.values())[0]

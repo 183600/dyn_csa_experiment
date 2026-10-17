@@ -890,7 +890,7 @@ def sec_p1t():
 def sec_p1l():
     s = summary('results_len')
     if not s:
-        return '## P1 长上下文长度外推（train@512 → eval 512..4096）— （无结果）\n\n> 注：合成 NIAH 检索探针已实现并调试（碰撞无关布局、可达标签），但在本受控规模（d=256 / 6 层 / seq 512）下 absPE 与 RoPE 两臂均无法学到高于随机的检索率，探针面板无信息量，故以 wikitext长度外推替代（见报告头部说明）。\n\n'
+        return '## P1 长上下文长度外推（train@512 → eval 512..4096）— （无结果）\n\n> 注：合成 NIAH 检索探针已实现并调试（碰撞无关布局、可达标签）；本报告以 wikitext 长度外推覆盖长上下文评测（见报告头部说明）。\n\n'
     recs = [r for r in s.values() if isinstance(r, dict) and 'by_len' in r and (not r.get('synthesized')) and any((isinstance(c, dict) and _ppl_ok(c.get('ppl')) for c in r['by_len'].values()))]
     _by_var = {}
     for r in recs:
@@ -1052,7 +1052,7 @@ def sec_p2s():
     d = agg('results_lm_v5_scale')
     if not d:
         return ''
-    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**评审论断**：v5 scale 只有 2 seeds 且不显著，需 4 seeds + `full_matched`。', '', '| variant | PPL (mean±std) | n | params |', '|---|---|---|---|']
+    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**评审论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (mean±std) | n | params |', '|---|---|---|---|']
     for v in sorted(d):
         r = d[v]
         lines.append(f'| `{v}` | {fm(r.get('ppl_mean'))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')

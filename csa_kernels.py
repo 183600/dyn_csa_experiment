@@ -1002,8 +1002,7 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     tc = _attn_t_chunk(R, M, nh, hd)
     # t-chunk 在外、头在内：各 (t,h) 的前向计算相互独立，循环顺序交换
     # 不改变任何元素值。chunk 内的 lt_sel/sel_ok/src_win/win_ok/anyrow
-    # 全部与 h 无关——按 chunk 各算一次、用完即释放，因此不必同时保留
-    # 所有 chunk 的几何表。
+    # 全部与 h 无关，按 chunk 各算一次。
     lt_l = last_tok.to(torch.int64)
     q_heads = [q[:, :, h, :] for h in range(nh)]
     kb_heads = [k_blk[:, :, h, :] for h in range(nh)]
