@@ -212,26 +212,15 @@ class HybridAttentionRoPE(L.HybridAttention):
         else:
             mask = None
         sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1) if self.sink is not None else None
-        out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
         row_chunk = L._full_attn_row_chunk(x.device, B, self.nh, T, q.element_size())
-        for s in range(0, T, row_chunk):
-            e = min(s + row_chunk, T)
-            _mask_c = mask[s:e] if _use_full_mask else L._dense_causal_window_rows(T, cfg.window, s, e, x.device)
-            logits = torch.einsum('bnhd,bmhd->bhnm', q[:, s:e], k)
-            logits.mul_(scale)
-            # bool masked-lane table -> fill: same -inf lanes the additive
-            # 0/-inf form added (exp(-0.0) == exp(+0.0) == 1.0 keeps the row
-            # reduction bit-identical; the fill's backward zeroes exactly the
-            # lanes the softmax backward already scaled by p_i == 0).
-            logits.masked_fill_(_mask_c, float('-inf'))
-            if sink_view is not None:
-                lse = torch.logaddexp(sink_view, torch.logsumexp(logits, dim=-1, keepdim=True))
-                attn = logits.sub(lse).exp_()
-                del lse
-            else:
-                attn = torch.softmax(logits, -1)
-            del logits
-            out[:, s:e] = torch.einsum('bhnm,bmhd->bnhd', attn, v)
+        # Reuse the base-class row loop / whole-loop checkpoint (same chunk
+        # partition, same masked-lane fill and softmax, values unchanged).
+        if torch.is_grad_enabled() and q.requires_grad:
+            out = torch.utils.checkpoint.checkpoint(
+                self._sink_attn_loop, q, k, v, mask, _use_full_mask, sink_view,
+                scale, row_chunk, use_reentrant=False, preserve_rng_state=False)
+        else:
+            out = self._sink_attn_loop(q, k, v, mask, _use_full_mask, sink_view, scale, row_chunk)
         return self.W_o(out.reshape(B, T, self.nh * self.hd))
 
     def _single_rope(self, x, pre=None, gate_sig=None, pre_blocks=None):
@@ -610,9 +599,28 @@ class BlockRoPE(nn.Module):
         self.mlp = L.MLP(d, int(round(d * mlp_ratio)), init_gen=mlp_gen)
 
     def forward(self, x):
+        # Same activation-checkpoint policy as exp_lib.Block: the recomputed
+        # forward is the identical pure function, so values/gradients are
+        # unchanged; cosine_learnable arms keep their gate side channel and
+        # fall back to the MLP-level checkpoint.
+        if L._CKPT['on'] == 'block' and torch.is_grad_enabled() and x.requires_grad:
+            if getattr(self.attn.cfg, 'chunking', '') != 'cosine_learnable':
+                return torch.utils.checkpoint.checkpoint(
+                    self._fwd_ckpt, x, use_reentrant=False, preserve_rng_state=False)
+        return self._fwd(x)
+
+    def _fwd(self, x):
         x = x + self.attn(self.n1(x))
         x = x + self.mlp(self.n2(x))
         return x
+
+    def _fwd_ckpt(self, x):
+        # Suppress the inner MLP checkpoint while the outer block recomputes.
+        L._CKPT_NEST[0] += 1
+        try:
+            return self._fwd(x)
+        finally:
+            L._CKPT_NEST[0] -= 1
 
 class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
 

@@ -844,30 +844,40 @@ def _window_attn_chunk(q_c, k, v, s, e, lo, window, scale):
     pos = _arange_cache(int(k.shape[1]), dev)
     qpos = pos[s:e, None]
     kpos = pos[lo:e][None, :]
-    allowed = (kpos <= qpos) & (kpos > qpos - int(window))
-    mask = torch.zeros((e - s, e - lo), device=dev, dtype=q_c.dtype)
-    mask.masked_fill_(~allowed, float('-inf'))
+    # Build the additive mask directly: fill the allowed causal-window lanes
+    # with 0.0 instead of materialising (and then negating) a second temporary
+    # boolean table.  The resulting lane values are exactly the 0.0/-inf table
+    # SDPA consumed before.
+    mask = torch.full((e - s, e - lo), float('-inf'), device=dev, dtype=q_c.dtype)
+    mask.masked_fill_((kpos <= qpos) & (kpos > qpos - int(window)), 0.0)
     out = F.scaled_dot_product_attention(
         q_c.transpose(1, 2), k[:, lo:e].transpose(1, 2), v[:, lo:e].transpose(1, 2),
         attn_mask=mask, scale=scale)
     return out.transpose(1, 2)
 
-def _window_attn_local(q, k, v, window, scale):
+def _window_attn_local_impl(q, k, v, window, scale):
     B, T, nh, hd = q.shape
     out = torch.empty_like(q)
     row_chunk = _full_attn_row_chunk(q.device, B, nh, T, q.element_size())
     row_chunk = max(1, min(int(T), row_chunk, max(int(window), 32)))
-    _ck = torch.is_grad_enabled() and q.requires_grad
     for s in range(0, T, row_chunk):
         e = min(s + row_chunk, T)
         lo = max(0, s - int(window) + 1)
-        if _ck:
-            out[:, s:e] = torch.utils.checkpoint.checkpoint(
-                _window_attn_chunk, q[:, s:e], k, v, s, e, lo, int(window), scale,
-                use_reentrant=False, preserve_rng_state=False)
-        else:
-            out[:, s:e] = _window_attn_chunk(q[:, s:e], k, v, s, e, lo, int(window), scale)
+        out[:, s:e] = _window_attn_chunk(q[:, s:e], k, v, s, e, lo, int(window), scale)
     return out
+
+def _window_attn_local(q, k, v, window, scale):
+    # One checkpoint around the whole row loop instead of one per row chunk:
+    # the recomputed function is the same pure row partition, so values and
+    # gradients are unchanged, while a long sequence no longer creates one
+    # autograd/checkpoint node (and one saved-input tuple) per chunk.  The
+    # row chunk is recomputed from the same deterministic budget, so backward
+    # reproduces the forward partition exactly.
+    if torch.is_grad_enabled() and q.requires_grad:
+        return torch.utils.checkpoint.checkpoint(
+            _window_attn_local_impl, q, k, v, int(window), scale,
+            use_reentrant=False, preserve_rng_state=False)
+    return _window_attn_local_impl(q, k, v, window, scale)
 
 def _tri_full(n, device, k):
     with torch.inference_mode(False):
@@ -2494,23 +2504,30 @@ class HybridAttention(nn.Module):
         else:
             mask = None
         sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1) if self.sink is not None else None
-        out = torch.empty(B, T, self.nh, self.hd, device=x.device, dtype=q.dtype)
         row_chunk = _full_attn_row_chunk(x.device, B, self.nh, T, q.element_size())
-        # 训练时每个行块包一层非重入 checkpoint：反向按块重算同一份值（无
-        # RNG、row_chunk 经 _ATB_EPOCH 在运行内不变、mask 是缓存的常量张量
-        # ——块边界与中间值逐位相同，梯度与不分块形式逐位一致，同 ce_loss
-        # 分块重算的论证）。
-        _ck = torch.is_grad_enabled() and q.requires_grad
+        # 训练时整段注意力循环包一层非重入 checkpoint（而不是每个行块一层）：
+        # 反向仍按同一份纯行划分重算，值/梯度不变；长序列下的 checkpoint
+        # 节点数与保存的输入元组从「每块一份」降为「整段一份」。
+        # row_chunk 在运行内经 _ATB_EPOCH 不变，mask 是缓存的常量张量，
+        # 因此重算的块边界与中间值逐位相同（同 ce_loss 分块重算的论证）。
+        if torch.is_grad_enabled() and q.requires_grad:
+            out = torch.utils.checkpoint.checkpoint(
+                self._sink_attn_loop, q, k, v, mask, _use_full_mask, sink_view,
+                scale, row_chunk, use_reentrant=False, preserve_rng_state=False)
+        else:
+            out = self._sink_attn_loop(q, k, v, mask, _use_full_mask, sink_view, scale, row_chunk)
+        return self.W_o(out.reshape(B, T, self.nh * self.hd))
+
+    def _sink_attn_loop(self, q, k, v, mask, use_full_mask, sink_view, scale, row_chunk):
+        B, T = q.shape[0], q.shape[1]
+        out = torch.empty(B, T, self.nh, self.hd, device=q.device, dtype=q.dtype)
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
             # A tuple is the row-mask recipe, not a tensor: the checkpointed
             # recompute rebuilds the identical slice.
-            _mask_c = mask[s:e] if _use_full_mask else (s, e, T, self.cfg.window)
-            if _ck:
-                out[:, s:e] = torch.utils.checkpoint.checkpoint(self._sink_attn_chunk, q[:, s:e], k, v, _mask_c, sink_view, scale, use_reentrant=False, preserve_rng_state=False)
-            else:
-                out[:, s:e] = self._sink_attn_chunk(q[:, s:e], k, v, _mask_c, sink_view, scale)
-        return self.W_o(out.reshape(B, T, self.nh * self.hd))
+            _mask_c = mask[s:e] if use_full_mask else (s, e, T, self.cfg.window)
+            out[:, s:e] = self._sink_attn_chunk(q[:, s:e], k, v, _mask_c, sink_view, scale)
+        return out
 
     def _sink_attn_chunk(self, q_c, k, v, mask_c, sink_view, scale):
         if isinstance(mask_c, tuple):
