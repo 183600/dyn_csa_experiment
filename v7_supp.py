@@ -1725,7 +1725,30 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
     out = {}
     _within = [int(Ln) for Ln in eval_lens if max_pos is None or int(Ln) <= max_pos]
     _trunc_lens = [int(Ln) for Ln in eval_lens if max_pos is not None and int(Ln) > max_pos]
+    # The compression regulariser is a training side channel: disabling it for
+    # scoring skips the gate-honour bookkeeping without touching any logit
+    # (the block geometry is still built), exactly as eval_ppl does.
+    _reg_layers = [blk.attn for blk in model.blocks if hasattr(blk.attn, 'need_reg')]
+    _reg_prior = [_a.need_reg for _a in _reg_layers]
+    for _a in _reg_layers:
+        _a.need_reg = False
     try:
+        # LM-head logits are computed a time slice at a time: each output row
+        # is an independent function of its hidden row, so per-token NLLs are
+        # bit-identical to the full-table form while the [rows, L, vocab]
+        # table is never materialised (the dominant VRAM term at scale).
+        def _head_ce_none(_h, _tgt, _rows, _span):
+            _nll = torch.empty((_rows, _span), dtype=torch.float32, device=device)
+            _budget = 128 << 20
+            _hchunk = max(1, min(_span, _budget // max(_rows * int(model.head.out_features) * 4, 1)))
+            _hchunk = min(_hchunk, 256)
+            for _s in range(0, _span, _hchunk):
+                _e = min(_s + _hchunk, _span)
+                _lg = model.head(_h[:, _s:_e, :])
+                _ce = F.cross_entropy(_lg.transpose(1, 2), _tgt[:, _s:_e], reduction='none')
+                _nll[:, _s:_e] = _ce
+                del _lg, _ce
+            return _nll
         if _within:
             _Lmax = max(_within)
             ids = np.asarray(val_ids[:n_seq, :_Lmax], dtype=np.int64)
@@ -1736,7 +1759,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
             while _r < int(ids.shape[0]):
                 _sub = x[_r:_r + _chunk]
                 try:
-                    logits = model(_sub)
+                    _h = model.trunk(_sub)
                 except RuntimeError as _oe:
                     if 'out of memory' in str(_oe).lower() and _chunk > 1:
                         _chunk = max(1, _chunk // 2)
@@ -1744,8 +1767,8 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                             torch.cuda.empty_cache()
                         continue
                     raise
-                nll_cols[_r:_r + _chunk] = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), _sub[:, 1:].reshape(-1), reduction='none').double().view(int(_sub.shape[0]), _Lmax - 1)
-                del logits
+                nll_cols[_r:_r + _chunk] = _head_ce_none(_h, _sub[:, 1:], int(_sub.shape[0]), _Lmax - 1).double()
+                del _h
                 _r += _chunk
             _cum = nll_cols.cumsum(dim=1)
             for Ln in _within:
@@ -1777,7 +1800,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                 while _r < int(ids.shape[0]):
                     _sub = x[_r:_r + _chunk]
                     try:
-                        logits = model(_sub)
+                        _h = model.trunk(_sub)
                     except RuntimeError as _oe:
                         if 'out of memory' in str(_oe).lower() and _chunk > 1:
                             _chunk = max(1, _chunk // 2)
@@ -1785,9 +1808,13 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                                 torch.cuda.empty_cache()
                             continue
                         raise
-                    nll += F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), _sub[:, 1:].reshape(-1), reduction='sum').double()
+                    # Keep the per-token losses in a small float32 table and
+                    # sum once, so the reduction order matches the previous
+                    # full-logits cross_entropy(reduction='sum').
+                    _nll_rows = _head_ce_none(_h, _sub[:, 1:], int(_sub.shape[0]), int(_sub.shape[1]) - 1)
+                    nll += _nll_rows.sum().double()
                     ntok += int(_sub[:, 1:].numel())
-                    del logits
+                    del _h, _nll_rows
                     _r += _chunk
                 ppl = math.exp(float(nll) / max(ntok, 1))
                 out[int(Ln)] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': int(x.shape[1])}
@@ -1797,6 +1824,8 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
             except Exception as e:
                 out[int(Ln)] = {'error': f'{type(e).__name__}: {e}'}
     finally:
+        for _a, _prev in zip(_reg_layers, _reg_prior):
+            _a.need_reg = _prev
         model.train(was)
     return out
 

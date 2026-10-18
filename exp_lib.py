@@ -5884,7 +5884,7 @@ def _ngram_eval_parts(eval_ids):
         return arr.ravel(), arr[:, :-1].ravel(), arr[:, 1:].ravel()
     raise ValueError('eval ids must be 1-D or 2-D (sequences x length)')
 
-def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpolation=1.0):
+def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpolation=1.0, _counts=None):
     """Token-weighted NLL/PPL for a tuned count model.
 
     order=1 is the unigram model (a context-free linear/count baseline);
@@ -5906,7 +5906,11 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
                 'n_tokens': 0, 'nll': float('nan'), 'ppl': float('nan')}
     if all_eval.size and (int(all_eval.min()) < 0 or int(all_eval.max()) >= vocab_size):
         raise ValueError('ngram baseline: eval ids outside [0, vocab_size)')
-    counts = _ngram_train_counts(ids, vocab_size)
+    # The count tables are a pure function of (train_ids, vocab_size) and do
+    # not depend on the smoothing hyper-parameters, so a tuning grid can build
+    # them once and hand the same tables to every trial (identical values,
+    # one O(n log n) pass / one set of count arrays instead of one per trial).
+    counts = _ngram_train_counts(ids, vocab_size) if _counts is None else _counts
     uni_counts = counts[0]
     denom = float(uni_counts.sum()) + alpha * vocab_size
     uni_prob = (uni_counts + alpha) / denom
@@ -5952,6 +5956,11 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
     arms = protocol.get('arms') or {}
     grids = protocol.get('grids') or {}
     trials_by_arm = {}
+    # Build the corpus count tables once for the whole grid (lazily, so an
+    # empty evaluation set still short-circuits without touching the corpus):
+    # every trial below consumes the identical arrays — the trial
+    # hyper-parameters only affect the smoothing on top of them.
+    _shared_counts = None
     for arm, meta in arms.items():
         order = int((meta or {}).get('order', 1))
         grid = grids.get(arm) or {}
@@ -5963,8 +5972,11 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
                 cfg = {'order': order, 'alpha': float(alpha)}
                 if order == 2:
                     cfg['interpolation'] = float(lam)
+                if _shared_counts is None:
+                    _shared_counts = _ngram_train_counts(np.asarray(train_ids, dtype=np.int64).ravel(), vocab_size)
                 sc = ngram_lm_score(train_ids, eval_ids, vocab_size, order=order,
-                                    alpha=float(alpha), interpolation=float(lam))
+                                    alpha=float(alpha), interpolation=float(lam),
+                                    _counts=_shared_counts)
                 rows.append({'config': cfg, 'ppl': sc['ppl'], 'nll': sc['nll'],
                              'n_tokens': sc['n_tokens'], 'steps': 0, 'tokens_seen': int(sc['n_tokens'])})
         if not rows:
