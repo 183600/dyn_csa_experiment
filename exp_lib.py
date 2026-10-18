@@ -90,13 +90,120 @@ def _kernel_stamp():
     except Exception:
         return ''
 
+def _eager_batch_active():
+    """True when CSA_EAGER_BATCH selects the batched reference twin.
+
+    That path changes the numerical implementation (it is not the eager
+    row-by-row bitwise contract), so it must enter `_code` exactly like a
+    kernel backend.  Default (unset) leaves every existing stamp unchanged."""
+    return os.environ.get('CSA_EAGER_BATCH', '').strip().lower() in ('1', 'true', 'yes', 'ref')
+
 def code_stamp():
     """当前代码+内核模式写进每条记录的 `_code` 戳（eager = CODE_SEMANTICS
     本身；内核模式追加变体后缀）。一切「记录是否当前」
     的判定（result_is_current 的 code 实参、`_cs...` 后缀匹配）都必须以
     本值为准——裸比 CODE_SEMANTICS 会把内核模式的全部记录误判为陈旧，
     使 resume 静默失效、面板被标 `_stale_cfg`。"""
-    return f'{CODE_SEMANTICS}{_kernel_stamp()}'
+    return f'{CODE_SEMANTICS}{_kernel_stamp()}' + ('-eb1' if _eager_batch_active() else '')
+
+
+# ---- G0 gate ---------------------------------------------------------------
+# The scale panels are only allowed to start after the kernel/eager
+# equivalence certificate exists and matches this code/env.  `m0_supp.py
+# kernel` writes it; `TimeGuard(require_g0=True)` / `run(cfg.require_g0)` read
+# it before any data is loaded or GPU time is booked.  An operator who
+# deliberately wants eager debugging can set CSA_ALLOW_UNVERIFIED_EAGER=1; the
+# override is printed and recorded in the panel manifest/config.
+G0_CERT_ENV = 'CSA_G0_CERT'
+DEFAULT_G0_CERT = os.path.join('results_m0_g0', 'g0_certificate.json')
+G0_OVERRIDE_ENV = 'CSA_ALLOW_UNVERIFIED_EAGER'
+
+def g0_certificate_path():
+    return os.environ.get(G0_CERT_ENV) or DEFAULT_G0_CERT
+
+def _g0_mismatch(cert):
+    """Return the first reason the certificate does not certify THIS tree."""
+    if not isinstance(cert, dict):
+        return 'certificate is not a JSON object'
+    if cert.get('status') != 'pass':
+        return f"certificate status is {cert.get('status')!r}, not 'pass'"
+    if not cert.get('numeric_pass'):
+        return 'operator/model numeric equivalence did not pass'
+    if not cert.get('benchmark_pass'):
+        return 'G0 throughput benchmark did not pass (CUDA+triton required)'
+    if not cert.get('training_tost_pass'):
+        return 'training-level TOST equivalence did not pass'
+    if str(cert.get('code_semantics')) != str(CODE_SEMANTICS):
+        return f"code semantics {cert.get('code_semantics')!r} != current {CODE_SEMANTICS!r}"
+    if str(cert.get('kernel_stamp') or '') != str(_kernel_stamp() or ''):
+        return f"kernel stamp {cert.get('kernel_stamp')!r} != current {_kernel_stamp()!r}"
+    _cur = _git_provenance()
+    if cert.get('git_commit') and _cur.get('git_commit') and cert['git_commit'] != _cur['git_commit']:
+        return f"git commit changed since the certificate ({cert['git_commit'][:12]}… != {_cur['git_commit'][:12]}…)"
+    if cert.get('git_diff_sha256') is not None and _cur.get('git_diff_sha256') is not None:
+        if cert.get('git_diff_sha256') != _cur.get('git_diff_sha256'):
+            return 'the worktree differs from the tree that produced the certificate'
+    return None
+
+def load_g0_certificate(path=None):
+    p = path or g0_certificate_path()
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def require_g0(context='scale panel', path=None):
+    """Fail closed unless a valid G0 certificate exists for this tree.
+
+    Returns the certificate on success, or {'status': 'override'} when the
+    explicit debug override is set (the caller must record that fact)."""
+    p = path or g0_certificate_path()
+    cert = load_g0_certificate(p)
+    if cert is None:
+        _why = f'no G0 certificate at {p}'
+    else:
+        _why = _g0_mismatch(cert)
+        if _why is None:
+            return cert
+    if os.environ.get(G0_OVERRIDE_ENV, '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        print(f'[g0] WARNING: {context} starting WITHOUT a valid G0 certificate ({_why}); '
+              f'{G0_OVERRIDE_ENV}=1 is an explicit debug override. This run must be '
+              'reported as eager/unverified and must not enter a confirmatory table.')
+        return {'status': 'override', 'reason': _why, 'path': p}
+    raise SystemExit(
+        f'[g0] REFUSE: {context} requires a passed G0 kernel/eager equivalence '
+        f'certificate, but {_why}. Run `python m0_supp.py kernel` on the target '
+        f'(CUDA+triton) machine to produce {p}. For an explicitly unverified eager '
+        f'debug run set {G0_OVERRIDE_ENV}=1 (never for a formal panel).')
+
+def file_sha256(path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+def state_dict_sha256(sd):
+    """Order-stable digest of tensor names/shapes/dtypes and raw bytes.
+
+    This is the checkpoint identity that can be written INSIDE the same file
+    (the file's own SHA-256 cannot be).  P5T compares it with the training
+    record and with the loaded tensors, so swapping two same-shaped arms or
+    seeds is detected even when file names are correct."""
+    h = hashlib.sha256()
+    for k in sorted(sd):
+        v = sd[k]
+        h.update(str(k).encode('utf-8'))
+        h.update(str(tuple(v.shape)).encode('ascii'))
+        h.update(str(v.dtype).encode('ascii'))
+        h.update(v.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
 
 # ---- 可选激活重算（CSA_CKPT，默认关闭）----
 # 与 ce_loss / gathered_attention / _pool_trainable 的既有 checkpoint 同型
