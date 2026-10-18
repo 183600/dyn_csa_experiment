@@ -44,7 +44,7 @@ if _NEEDED:
         print(f"[setup] {_msg}")
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections
+import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading
 from math import comb
 from dataclasses import dataclass
 import numpy as np
@@ -386,21 +386,37 @@ _H2D_POOL_BYTES = [0]
 _H2D_POOL_CAP = 96 << 20
 _H2D_POOL_SLOTS = 4
 _H2D_POOL_MAX_ENTRIES = 256
+# `batch_iter` prefetches on a producer thread, so staging-pool access is now
+# concurrent with the training thread.  A slot is reserved (`_H2D_BUSY`) from
+# the moment it is handed out until `commit()` records the copy event, which
+# prevents two threads from writing the same pinned buffer before either copy
+# is enqueued.
+_H2D_BUSY = object()
+_H2D_POOL_LOCK = threading.RLock()
 
-def _h2d_pool_evict(need=0):
+def _h2d_pool_evict_locked(need=0):
     # An entry is only released when all of its recorded H2D copies have
     # completed, so no pinned buffer can be freed while a copy is in flight.
     while _H2D_POOL and (_H2D_POOL_BYTES[0] + int(need) > _H2D_POOL_CAP
                           or len(_H2D_POOL) >= _H2D_POOL_MAX_ENTRIES):
         victim = None
-        for _k, _e in _H2D_POOL.items():
-            if all(_ev is None or _ev.query() for _, _ev in _e['slots']):
+        for _k, _e in list(_H2D_POOL.items()):
+            free = True
+            for _, _ev in _e['slots']:
+                if _ev is _H2D_BUSY or (_ev is not None and not _ev.query()):
+                    free = False
+                    break
+            if free:
                 victim = _k
                 break
         if victim is None:
             break
         _e = _H2D_POOL.pop(victim)
         _H2D_POOL_BYTES[0] -= int(_e.get('bytes', 0))
+
+def _h2d_pool_evict(need=0):
+    with _H2D_POOL_LOCK:
+        _h2d_pool_evict_locked(need)
 
 def _h2d_stage(shape, dtype, device):
     # Pinned-staging pool for CUDA uploads — transport only (design notes
@@ -419,38 +435,48 @@ def _h2d_stage(shape, dtype, device):
     if not shape or 0 in shape:
         return (None, None)
     key = (_dev_str(device), dtype, shape)
-    ent = _H2D_POOL.get(key)
-    if ent is None:
-        est = int(np.prod(shape, dtype=np.int64)) * torch.empty((), dtype=dtype).element_size() * _H2D_POOL_SLOTS
-        _h2d_pool_evict(est)
-        if _H2D_POOL_BYTES[0] + est > _H2D_POOL_CAP:
-            return (None, None)
-        try:
-            with torch.inference_mode(False):
-                slots = [[torch.empty(shape, dtype=dtype).pin_memory(), None] for _ in range(_H2D_POOL_SLOTS)]
-        except (RuntimeError, TypeError):
-            return (None, None)
-        _H2D_POOL_BYTES[0] += est
-        ent = {'slots': slots, 'rr': 0, 'bytes': est}
-        _H2D_POOL[key] = ent
-    slots = ent['slots']
-    n = len(slots)
-    for _ in range(n):
-        i = ent['rr'] % n
-        ent['rr'] += 1
-        buf, ev = slots[i]
-        if ev is None or ev.query():
-            def commit(_buf=buf, _slot=slots[i]):
+    with _H2D_POOL_LOCK:
+        ent = _H2D_POOL.get(key)
+        if ent is None:
+            est = int(np.prod(shape, dtype=np.int64)) * torch.empty((), dtype=dtype).element_size() * _H2D_POOL_SLOTS
+            _h2d_pool_evict_locked(est)
+            if _H2D_POOL_BYTES[0] + est > _H2D_POOL_CAP:
+                return (None, None)
+            try:
                 with torch.inference_mode(False):
-                    dev_t = _buf.to(device, non_blocking=True)
-                    ev2 = _slot[1]
-                    if ev2 is None:
-                        ev2 = torch.cuda.Event()
-                    ev2.record()
-                    _slot[1] = ev2
-                return dev_t
-            return (buf, commit)
-    return (None, None)
+                    slots = [[torch.empty(shape, dtype=dtype).pin_memory(), None] for _ in range(_H2D_POOL_SLOTS)]
+            except (RuntimeError, TypeError):
+                return (None, None)
+            _H2D_POOL_BYTES[0] += est
+            ent = {'slots': slots, 'rr': 0, 'bytes': est}
+            _H2D_POOL[key] = ent
+        slots = ent['slots']
+        n = len(slots)
+        for _ in range(n):
+            i = ent['rr'] % n
+            ent['rr'] += 1
+            buf, ev = slots[i]
+            if ev is None or (ev is not _H2D_BUSY and ev.query()):
+                slots[i][1] = _H2D_BUSY
+
+                def commit(_buf=buf, _slot=slots[i], _device=device):
+                    try:
+                        # Record the guard event on the target device's stream
+                        # (a pool entry is keyed by device, so multi-GPU copies
+                        # must not be guarded by another device's default stream).
+                        with torch.inference_mode(False), torch.cuda.device(_device):
+                            dev_t = _buf.to(_device, non_blocking=True)
+                            ev2 = torch.cuda.Event()
+                            ev2.record()
+                    except BaseException:
+                        # Keep the conservative reservation: an enqueue may
+                        # already have succeeded before the failure.
+                        raise
+                    with _H2D_POOL_LOCK:
+                        _slot[1] = ev2
+                    return dev_t
+                return (buf, commit)
+        return (None, None)
 
 def _h2d_async(host_src, dtype, device):
     # Same values as torch.tensor(host_src, dtype=dtype, device=device):
@@ -510,15 +536,19 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
     # the host segmenter once per distinct row instead of once per batch row.
     _uniq = []
     _slot = []
+    _seen = {}
     for _g in gate_lists:
         _a = np.asarray(_g, dtype=bool)
-        for _j, _u in enumerate(_uniq):
-            if _a.shape == _u.shape and np.array_equal(_a, _u):
-                _slot.append(_j)
-                break
-        else:
+        # Exact O(rows*T) dedup: the old pairwise scan was O(rows^2*T) and
+        # would dominate the segmenter at larger batch/sequence sizes.  The
+        # byte key is exact (no hash-collision contract change).
+        _k = (_a.shape, _a.tobytes())
+        _j = _seen.get(_k)
+        if _j is None:
+            _j = len(_uniq)
+            _seen[_k] = _j
             _uniq.append(_a)
-            _slot.append(len(_uniq) - 1)
+        _slot.append(_j)
     _cache = []
     for _a in _uniq:
         _cache.append(blocks_from_cuts(T, _a, min_block, max_block, _CPU_DEV, return_count=True, return_honoured=True))
@@ -3217,11 +3247,11 @@ class SmallGPT(nn.Module):
         self.boundary_decisions = int(bdec)
         return self.norm(x)
 
-    def _ce_head_chunk(self, h_chunk, tgt_chunk, vocab):
+    def _ce_head_chunk(self, h_chunk, tgt_chunk, vocab, ignore_index=-100):
         lg = self.head(h_chunk)
-        return F.cross_entropy(lg.reshape(-1, vocab), tgt_chunk.reshape(-1), reduction='sum')
+        return F.cross_entropy(lg.reshape(-1, vocab), tgt_chunk.reshape(-1), reduction='sum', ignore_index=ignore_index)
 
-    def ce_loss(self, ids, targets, vocab, chunk=64):
+    def ce_loss(self, ids, targets, vocab, chunk=64, ignore_index=None):
         # LM-head cross-entropy computed in time chunks: the chunk sums add to
         # the same total as the full-batch form (up to fp reduction order), so
         # the scalar and its gradients are unchanged.
@@ -3229,7 +3259,17 @@ class SmallGPT(nn.Module):
         # logits（同一 GEMM、无 RNG，值逐位相同）；chunk 反传的执行次序由
         # 求和链的拓扑结构决定，两种形式相同，因此梯度逐位一致。
         h = self.trunk(ids)
-        n_tok = targets.numel()
+        # When targets contain ignored positions, the mean must be taken over
+        # the valid targets only (F.cross_entropy's own reduction), exactly as
+        # the unchunked form did.  The default None keeps the hot training path
+        # free of an extra device reduction/sync: every target is valid there.
+        if ignore_index is None:
+            _ign = -100
+            n_tok = int(targets.numel())
+        else:
+            _ign = int(ignore_index)
+            n_tok = int((targets != _ign).sum().item())
+        n_tok = max(n_tok, 1)
         ce = None
         _ck = torch.is_grad_enabled() and h.requires_grad
         if _ck and h.device.type != 'cuda':
@@ -3237,11 +3277,16 @@ class SmallGPT(nn.Module):
             # the limit covers the whole sequence, not just one chunk.
             _saved = 3 * int(ids.shape[0]) * int(ids.shape[1]) * int(vocab) * 4
             _ck = not _cpu_saved_ok(_saved, _CPU_CE_CKPT_BYTES)
-        for s in range(0, ids.shape[1], chunk):
+        # The trunk must see the full input (block geometry depends on T), but
+        # a next-token target table is one column shorter; score only the rows
+        # that have a target, exactly like the original logits[:, :-1] form.
+        n_cols = min(int(ids.shape[1]), int(targets.shape[1]))
+        for s in range(0, n_cols, chunk):
+            e = min(s + chunk, n_cols)
             if _ck:
-                c = torch.utils.checkpoint.checkpoint(self._ce_head_chunk, h[:, s:s + chunk], targets[:, s:s + chunk], vocab, use_reentrant=False, preserve_rng_state=False)
+                c = torch.utils.checkpoint.checkpoint(self._ce_head_chunk, h[:, s:e], targets[:, s:e], vocab, _ign, use_reentrant=False, preserve_rng_state=False)
             else:
-                c = self._ce_head_chunk(h[:, s:s + chunk], targets[:, s:s + chunk], vocab)
+                c = self._ce_head_chunk(h[:, s:e], targets[:, s:e], vocab, _ign)
             ce = c if ce is None else ce + c
         return ce / n_tok
 OVERLAP = 8
@@ -3403,19 +3448,33 @@ def _array_file_path(arr):
     file's size+mtime so a rebuilt cache can never reuse a stale digest."""
     cur = arr
     seen = set()
-    for _ in range(4):
+    arr_shape = tuple(getattr(arr, 'shape', ()))
+    arr_strides = getattr(arr, 'strides', None)
+    arr_dtype = getattr(arr, 'dtype', None)
+    arr_nbytes = int(getattr(arr, 'nbytes', -1))
+    for _ in range(8):
         fn = getattr(cur, 'filename', None)
         if isinstance(fn, (str, bytes, os.PathLike)):
             try:
                 fn = os.fspath(fn)
-                # Only the whole backing array may reuse the file's sidecar;
-                # a slice has a different digest and must be hashed itself.
-                same = (int(getattr(cur, 'nbytes', -1)) == int(arr.nbytes)
-                        and getattr(cur, 'shape', None) == getattr(arr, 'shape', None)
-                        and getattr(cur, 'strides', None) == getattr(arr, 'strides', None))
-                if same and os.path.isfile(fn):
+                st = os.stat(fn)
+                off = int(getattr(cur, 'offset', 0) or 0)
+                nb = int(getattr(cur, 'nbytes', -1))
+                # Only a view that covers the whole backing file may reuse the
+                # file's sidecar.  The old identity comparison below used to
+                # accept ANY memmap slice (cur was arr itself), which could
+                # return the full-file digest for a shorter prefix.  Requiring
+                # the byte range to span [offset, file end], the same layout as
+                # `arr`, and the same reinterpretation dtype makes a slice
+                # fall through to its own content hash.
+                same = (off >= 0 and nb >= 0 and off + nb == int(st.st_size)
+                        and nb == arr_nbytes
+                        and tuple(getattr(cur, 'shape', ())) == arr_shape
+                        and getattr(cur, 'strides', None) == arr_strides
+                        and np.dtype(getattr(cur, 'dtype', arr_dtype)) == np.dtype(arr_dtype))
+                if same:
                     return fn
-            except OSError:
+            except (OSError, TypeError, ValueError):
                 pass
         cur = getattr(cur, 'base', None)
         if cur is None or id(cur) in seen:
@@ -3446,9 +3505,14 @@ def _ids_fp(train_ids):
             _st = os.stat(_path)
             _stat = (int(getattr(_st, 'st_size', 0)), int(getattr(_st, 'st_mtime_ns', int(_st.st_mtime * 1e9))))
             _side = _path + '.idsfp.json'
+            _tshape = tuple(int(_x) for _x in np.shape(train_ids))
+            _tdtype = np.dtype(np.asarray(train_ids).dtype).str
             with open(_side, encoding='utf-8') as _sf:
                 _rec = json.load(_sf)
-            if (int(_rec.get('size', -1)), int(_rec.get('mtime_ns', -1))) == _stat and isinstance(_rec.get('fp'), str):
+            if ((int(_rec.get('size', -1)), int(_rec.get('mtime_ns', -1))) == _stat
+                    and isinstance(_rec.get('fp'), str)
+                    and _rec.get('dtype') == _tdtype
+                    and tuple(_rec.get('shape') or ()) == _tshape):
                 _fp = _rec['fp']
                 if _key is not None:
                     if len(_IDS_FP_MEMO) >= _IDS_FP_MEMO_CAP:
@@ -3473,8 +3537,11 @@ def _ids_fp(train_ids):
         _IDS_FP_MEMO[_key] = (train_ids, _fp)
     if _side is not None and _stat is not None:
         try:
-            atomic_write_json(_side, {'size': _stat[0], 'mtime_ns': _stat[1], 'fp': _fp})
-        except OSError:
+            _rec_out = {'size': _stat[0], 'mtime_ns': _stat[1], 'fp': _fp,
+                        'dtype': np.dtype(np.asarray(train_ids).dtype).str,
+                        'shape': [int(_x) for _x in np.shape(train_ids)]}
+            atomic_write_json(_side, _rec_out)
+        except (OSError, TypeError, ValueError):
             pass
     return _fp
 
@@ -9004,7 +9071,13 @@ class _BlockStats:
         if self.n == 0 or self.total == 0:
             return None
         mean = self.s / self.total
-        var = max(self.ss / self.total - mean * mean, 0.0)
+        # Match the concatenated form's sample standard deviation
+        # (torch.std's default Bessel correction); with a single observation
+        # the original reports 0.0.
+        if self.total > 1:
+            var = max((self.ss - self.s * self.s / self.total) / (self.total - 1), 0.0)
+        else:
+            var = 0.0
         return {
             'blocks': self.blocks / self.n,
             'avg_len': seq_len / max(self.blocks / self.n, 1.0),

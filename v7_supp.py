@@ -1701,9 +1701,11 @@ def run_niah_phase(payload, guard=None, label=''):
                         # Chunked LM head + cross-entropy (the inherited
                         # ce_loss path): the full [B, T, vocab] logits table is
                         # never materialised, and each time chunk is recomputed
-                        # in backward.  Same targets/ignore_index and the same
-                        # scalar up to the documented chunked-reduction order.
-                        ce = model.ce_loss(x, y, vocab)
+                        # in backward.  The trunk still sees the full T-token
+                        # input (block geometry is T-dependent); ce_loss scores
+                        # the first T-1 hidden rows against y and averages over
+                        # the valid NIAH targets only (targets use -100).
+                        ce = model.ce_loss(x, y, vocab, ignore_index=-100)
                         loss = ce + 0.05 * model.comp_reg
                         # Keep the detached scalar on the device and move a
                         # whole block at the cadence the other loops use: the
