@@ -1998,6 +1998,74 @@ def t_preprocessor_train_only():
         raise AssertionError('feature-width mismatch must fail')
 
 
+def t_preprocessor_fill_is_consistent():
+    # A requested imputation constant outside the training quantiles must be
+    # applied identically in fit and transform.  If fit clips it but transform
+    # does not, the fitted scale no longer centres its own training matrix.
+    X = np.array([[10.0], [11.0], [12.0], [np.nan]])
+    prep = L.LeakageSafePreprocessor(scale='standard', missing=0.0,
+                                     clip_quantiles=(0.1, 0.9))
+    xtr = prep.fit_transform(X)
+    assert abs(float(xtr.mean())) < 1e-12, xtr
+    assert np.allclose(prep.transform(np.array([[np.nan]])), xtr[-1:]), (prep.transform(np.array([[np.nan]])), xtr[-1:])
+    # numpy scalar constants are accepted; NaN/Inf constants are refused.
+    assert L.LeakageSafePreprocessor(missing=np.float32(0.0)).missing == 0.0
+    for bad in (float('nan'), float('inf'), -float('inf')):
+        try:
+            L.LeakageSafePreprocessor(missing=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'non-finite missing constant {bad!r} must be rejected')
+
+
+def t_leakage_checks_validate_inputs():
+    # Too-short time/group arrays must not silently disable the check.
+    try:
+        L.assert_no_split_leakage([0], [1], [2], time=[0, 1])
+    except ValueError as e:
+        assert 'time has length' in str(e), e
+    else:
+        raise AssertionError('short time array must be rejected')
+    try:
+        L.assert_no_split_leakage([0], [1], [2], groups=['a', 'b'])
+    except ValueError as e:
+        assert 'groups has length' in str(e), e
+    else:
+        raise AssertionError('short group array must be rejected')
+    # NaN timestamps cannot define a chronological order.
+    try:
+        L.assert_no_split_leakage([0], [1], [2], time=[0.0, np.nan, 2.0])
+    except ValueError as e:
+        assert 'NaN/Inf' in str(e), e
+    else:
+        raise AssertionError('NaN time must be rejected')
+    # NaN is a single group id; the same group must not span two splits just
+    # because NaN != NaN.
+    g = np.array([np.nan, np.nan, 2.0, 3.0])
+    try:
+        L.assert_no_split_leakage([0], [1], [2, 3], groups=g)
+    except ValueError as e:
+        assert 'share group ids' in str(e), e
+    else:
+        raise AssertionError('a NaN group crossing splits must be rejected')
+    # Empty data still splits into three empty parts.
+    idx = L.chronological_split_indices(0)
+    assert all(len(idx[k]) == 0 for k in ('train', 'val', 'test')), idx
+
+
+def t_categorical_shift_empty_reference():
+    r = L.categorical_shift_report([], [1, 2, 3])
+    assert r['n_reference'] == 0 and r['n_holdout'] == 3, r
+    assert r['unseen_rate'] == 1.0 and r['total_variation'] > 0.0, r
+    try:
+        L.categorical_shift_report([1, 2], [1, 2], max_categories=0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('max_categories=0 must be rejected')
+
+
 def t_data_quality_report():
     X = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 0.0], [2.0, 1.0]])
     rep = L.data_quality_report(X, y=[0, 1, 1, 0],
@@ -2187,7 +2255,10 @@ def main():
     _check('I1 chronological split contract', t_leakage_safe_split_contract)
     _check('I2 whole-group split contract', t_group_split_contract)
     _check('I3 preprocessing fitted on train only', t_preprocessor_train_only)
+    _check('I3b imputation fill is identical in fit and transform', t_preprocessor_fill_is_consistent)
+    _check('I3c leakage checks validate time/group inputs', t_leakage_checks_validate_inputs)
     _check('I4 data-quality/leakage report', t_data_quality_report)
+    _check('I5a categorical shift handles an empty reference', t_categorical_shift_empty_reference)
     _check('I5 categorical shift + cache guards', t_categorical_and_cache_guards)
     _check('I6 explicit split sizes stay non-negative', t_split_sizes_explicit_never_negative)
     _check('I7 split audit finds sequence-level row overlap', t_audit_split_sequence_overlap)

@@ -347,6 +347,27 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             if meta.get('split_strategy') is None:
                 _warn(f'{cd}/{tag}: legacy cache has no split_strategy/tokenizer provenance metadata; rebuild it to make the split auditable')
 
+            # Data-cleaning coverage: non-finite values are a hard failure (an
+            # embedding index or loss built from them is undefined), and exact
+            # duplicates inside the holdout are reported.  Integer token caches
+            # cannot represent NaN/Inf, so only float caches are scanned.
+            for _name, _arr in (('train', tr), ('val', va)):
+                if np.issubdtype(np.asarray(_arr).dtype, np.integer):
+                    rec[f'nonfinite_{_name}'] = 0
+                    continue
+                _bad = int(np.size(_arr) - np.isfinite(_arr).sum())
+                rec[f'nonfinite_{_name}'] = _bad
+                if _bad:
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: {_bad} NaN/Inf values in the {_name} split')
+            if np.asarray(va).ndim == 2:
+                _dup_val = int(DG.duplicate_mask(np.asarray(va)).sum())
+                rec['duplicate_rows_within_val'] = _dup_val
+                if _dup_val:
+                    _warn(f'{cd}/{tag}: {_dup_val} duplicate validation rows '
+                          '(deduplicate before scoring, or report it as a '
+                          'sampling artefact)')
+
             # Exact duplicate rows across train/val/test.  This is row-level
             # leakage regardless of how the split was generated.
             shared_val = _row_overlap_count(tr, va)
@@ -371,6 +392,19 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 break
             if te is not None:
                 rec['test_shape'] = list(te.shape)
+                if np.issubdtype(np.asarray(te).dtype, np.integer):
+                    rec['nonfinite_test'] = 0
+                else:
+                    _bad_te = int(np.size(te) - np.isfinite(te).sum())
+                    rec['nonfinite_test'] = _bad_te
+                    if _bad_te:
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: {_bad_te} NaN/Inf values in the test split')
+                if np.asarray(te).ndim == 2:
+                    _dup_te = int(DG.duplicate_mask(np.asarray(te)).sum())
+                    rec['duplicate_rows_within_test'] = _dup_te
+                    if _dup_te:
+                        _warn(f'{cd}/{tag}: {_dup_te} duplicate test rows')
                 shared_test = _row_overlap_count(tr, te)
                 shared_val_test = _row_overlap_count(va, te)
                 rec['exact_row_overlap_train_test'] = int(shared_test)

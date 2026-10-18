@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import numbers
 
 import numpy as np
 
@@ -112,6 +113,10 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
             raise ValueError(f'could not reconcile split sizes {sizes} with n={n}')
         return tuple(int(v) for v in sizes)
 
+    if n == 0:
+        # An empty dataset splits into three empty (non-overlapping) parts;
+        # requiring one row per non-empty split would be impossible.
+        return (0, 0, 0)
     frac_sum = train_frac + val_frac + test_frac
     if frac_sum <= 0:
         raise ValueError('at least one split fraction must be positive')
@@ -210,6 +215,7 @@ def _group_order(groups, order=None):
         groups = groups.reshape(-1)
     first = {}
     for i, g in enumerate(groups.tolist()):
+        g = _group_key(g)
         if g not in first:
             first[g] = i
     if order is None:
@@ -219,6 +225,7 @@ def _group_order(groups, order=None):
         raise ValueError('order must be a 1-D array with one value per row')
     key = {}
     for i, g in enumerate(groups.tolist()):
+        g = _group_key(g)
         v = order[i]
         if g not in key or v < key[g]:
             key[g] = v
@@ -245,7 +252,7 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
     order_groups, first = _group_order(groups, order)
     members = {}
     for i, g in enumerate(groups.tolist()):
-        members.setdefault(g, []).append(i)
+        members.setdefault(_group_key(g), []).append(i)
     out = {name: [] for name in SPLIT_NAMES}
     current = 0
     for g in order_groups:
@@ -306,6 +313,15 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
         train_size=train_size, val_size=val_size, test_size=test_size)
 
 
+def _group_key(value):
+    """Hashable group identity; NaN is one group, not one group per NaN."""
+    if isinstance(value, (float, np.floating)):
+        f = float(value)
+        if math.isnan(f):
+            return ('__nan__',)
+    return value
+
+
 def _assert_index_and_group_disjoint(split_idx, groups=None):
     sets = {name: set(np.asarray(split_idx[name]).reshape(-1).tolist())
             for name in SPLIT_NAMES}
@@ -315,7 +331,8 @@ def _assert_index_and_group_disjoint(split_idx, groups=None):
                 raise ValueError(f'{a} and {b} indices overlap')
     if groups is not None:
         groups = np.asarray(groups)
-        gsets = {name: {groups[i] for i in sets[name]} for name in SPLIT_NAMES}
+        gsets = {name: {_group_key(groups[i]) for i in sets[name]}
+                 for name in SPLIT_NAMES}
         for i, a in enumerate(SPLIT_NAMES):
             for b in SPLIT_NAMES[i + 1:]:
                 if gsets[a] & gsets[b]:
@@ -334,11 +351,37 @@ def assert_no_split_leakage(train_idx, val_idx, test_idx, *, groups=None,
     when the row indices themselves are disjoint.
     """
     split_idx = {'train': train_idx, 'val': val_idx, 'test': test_idx}
-    _assert_index_and_group_disjoint(split_idx, groups)
+    max_index = -1
+    for name in SPLIT_NAMES:
+        arr = np.asarray(split_idx[name]).reshape(-1)
+        if arr.size:
+            max_index = max(max_index, int(arr.max()))
+    if groups is not None:
+        groups = np.asarray(groups)
+        if groups.ndim != 1:
+            groups = groups.reshape(-1)
+        if max_index >= 0 and groups.size <= max_index:
+            raise ValueError(
+                f'groups has length {groups.size}, but split indices reach '
+                f'{max_index}; pass one group id per row')
     if time is not None:
         time = np.asarray(time)
         if time.ndim != 1:
             time = time.reshape(-1)
+        if max_index >= 0 and time.size <= max_index:
+            raise ValueError(
+                f'time has length {time.size}, but split indices reach '
+                f'{max_index}; pass one timestamp per row')
+        try:
+            if not np.all(np.isfinite(time)):
+                raise ValueError('time contains NaN/Inf; a temporal split '
+                                 'cannot be verified against missing timestamps')
+        except TypeError:
+            # Non-numeric time (e.g. datetime64/objects) has no isfinite();
+            # ordering checks below still apply.
+            pass
+    _assert_index_and_group_disjoint(split_idx, groups)
+    if time is not None:
         for a, b in (('train', 'val'), ('val', 'test'), ('train', 'test')):
             ia = np.asarray(split_idx[a], dtype=np.int64).reshape(-1)
             ib = np.asarray(split_idx[b], dtype=np.int64).reshape(-1)
@@ -398,8 +441,14 @@ class LeakageSafePreprocessor:
                  clip_quantiles=(0.001, 0.999), clip_z=None, eps=_EPS):
         if scale not in ('standard', 'robust', 'minmax', 'none'):
             raise ValueError(f'unknown scale={scale!r}')
-        if not (isinstance(missing, (int, float)) or
-                missing in ('median', 'mean', 'zero')):
+        if isinstance(missing, (numbers.Real, np.integer, np.floating)):
+            missing = float(missing)
+            if not math.isfinite(missing):
+                raise ValueError(
+                    f'missing must be a finite constant or one of '
+                    f"'median'/'mean'/'zero', got {missing!r}")
+        elif not (isinstance(missing, str) and
+                  missing in ('median', 'mean', 'zero')):
             raise ValueError(f'unknown missing={missing!r}')
         if clip_quantiles is not None:
             lo, hi = clip_quantiles
@@ -452,8 +501,13 @@ class LeakageSafePreprocessor:
             else:
                 q_lo, q_hi = -np.inf, np.inf
             clipped = np.clip(col, q_lo, q_hi) if np.isfinite(q_lo) else col
-            imputed = np.where(np.isfinite(clipped), clipped, min(max(fill, q_lo), q_hi)
-                               if np.isfinite(q_lo) else fill)
+            # Clip observed values, then use the imputation constant verbatim.
+            # transform() does exactly the same, so a callable fitted on the
+            # training rows and then applied to them reproduces the fitted
+            # statistics.  (Clipping the fill itself here but not in
+            # transform() would make fit and transform disagree whenever the
+            # requested constant lies outside the training quantiles.)
+            imputed = np.where(np.isfinite(clipped), clipped, fill)
             # Scaling statistics are computed on the training values after the
             # same impute/clip operation that transform() will apply.  They are
             # never recomputed from validation/test data.
@@ -724,7 +778,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     # Group integrity.
     if groups is not None:
         groups = _as_1d(groups, 'groups', n)
-        gsets = {name: {groups[i] for i in split_rows[name]}
+        gsets = {name: {_group_key(groups[i]) for i in split_rows[name]}
                  for name in SPLIT_NAMES}
         group_cross = {}
         for a, b in (('train', 'val'), ('train', 'test'), ('val', 'test')):
@@ -855,16 +909,19 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
     """
     ref = np.asarray(reference).reshape(-1)
     hold = np.asarray(holdout).reshape(-1)
-    if ref.size == 0 or hold.size == 0:
+    if hold.size == 0:
         return {'js_divergence': 0.0, 'total_variation': 0.0,
-                'n_reference': int(ref.size), 'n_holdout': int(hold.size),
+                'n_reference': int(ref.size), 'n_holdout': 0,
                 'unseen_rate': 0.0}
     if max_categories is not None:
+        max_categories = int(max_categories)
+        if max_categories < 1:
+            raise ValueError('max_categories must be positive or None')
         cat = np.unique(ref)
         if cat.size > max_categories:
             # Keep the most frequent reference categories plus an "other" bin.
             vals, counts = np.unique(ref, return_counts=True)
-            keep = np.sort(vals[np.argsort(-counts)[:int(max_categories) - 1]])
+            keep = np.sort(vals[np.argsort(-counts)[:max_categories - 1]])
         else:
             keep = cat
     else:
@@ -892,9 +949,12 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
 
     tv = 0.5 * float(np.sum(np.abs(p - q)))
     js = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
-    unseen = 0.0
     if keep.size:
         unseen = float(np.mean(~np.isin(hold, keep)))
+    else:
+        # No reference category exists (e.g. an empty training side): every
+        # holdout token is unseen, not zero.
+        unseen = 1.0 if hold.size else 0.0
     return {
         'js_divergence': js,
         'total_variation': tv,
