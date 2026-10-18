@@ -1623,6 +1623,11 @@ def run_niah_phase(payload, guard=None, label=''):
                 L.set_seed(seed)
                 _niah_rng_fp = L.rng_fingerprint()
                 _niah_losses = []
+                _niah_buf = []
+                def _niah_flush():
+                    if _niah_buf:
+                        _niah_losses.extend(torch.stack(_niah_buf).tolist())
+                        _niah_buf.clear()
                 model = L.SmallGPT(vocab, 256, 6, 8, 32, 512, cfgs, mlp_ratio=mr).to(DEVICE)
                 opt = torch.optim.AdamW(model.parameters(), lr=0.0003, foreach=True)
                 model.train()
@@ -1658,7 +1663,13 @@ def run_niah_phase(payload, guard=None, label=''):
                         lg = model(x)
                         ce = F.cross_entropy(lg[:, :-1].reshape(-1, vocab), y.reshape(-1), ignore_index=-100)
                         loss = ce + 0.05 * model.comp_reg
-                        _niah_losses.append(float(ce.detach()))
+                        # Keep the detached scalar on the device and move a
+                        # whole block at the cadence the other loops use: the
+                        # per-step float() would otherwise force a device sync
+                        # before every backward.
+                        _niah_buf.append(ce.detach())
+                        if len(_niah_buf) >= 512:
+                            _niah_flush()
                         opt.zero_grad(set_to_none=True)
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1670,6 +1681,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 finally:
                     if _gc_relief:
                         gc.enable()
+                _niah_flush()
                 if niah_truncated:
                     del model, opt
                     gc.collect()

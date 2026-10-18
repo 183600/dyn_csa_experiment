@@ -9473,9 +9473,13 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 # able to change the boundary policy.  Centred by a running CE
                 # baseline to reduce variance; decisions are normalised so the
                 # coefficient does not scale with sequence length or depth.
-                _adv = float(ce.detach().item()) - float(_ce_baseline)
+                # This is the only arm that reads the running CE baseline, so
+                # it is also the only one that pays the host sync for it.
+                _ce_item = float(ce.detach().item())
+                _adv = _ce_item - float(_ce_baseline)
                 _bdec = max(int(getattr(model, 'boundary_decisions', 0) or 0), 1)
                 loss = ce + comp_lambda * model.comp_reg + BOUNDARY_PG_COEF * (-_adv * _blp / _bdec)
+                _ce_baseline = 0.99 * float(_ce_baseline) + 0.01 * _ce_item
             else:
                 loss = ce + comp_lambda * model.comp_reg
             loss.backward()
@@ -9484,7 +9488,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             # Gradients are not needed after the update.
             opt.zero_grad(set_to_none=True)
             _ce_d = ce.detach()
-            _ce_baseline = 0.99 * float(_ce_baseline) + 0.01 * float(_ce_d.item())
             _lbuf.append(_ce_d)
             _tail.append(_ce_d)
             # Drop this step's graph/scalar references before the next forward.
@@ -9667,8 +9670,12 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
                 continue
             _gs.append(p.grad.detach())
         if _gs:
-            grad_norm = math.sqrt(sum((float(g.double().pow(2).sum()) for g in _gs)))
-            grad_finite = all(bool(torch.isfinite(g).all()) for g in _gs)
+            # Keep the per-tensor reductions on the device and read back a
+            # single scalar: the elementwise sums are the same, and a probe on
+            # a scaled model no longer forces one host sync per parameter.
+            _sq = torch.stack([g.double().pow(2).sum() for g in _gs])
+            grad_norm = math.sqrt(float(_sq.sum()))
+            grad_finite = bool(torch.stack([torch.isfinite(g).all() for g in _gs]).all())
         else:
             grad_norm = 0.0
             grad_finite = False
