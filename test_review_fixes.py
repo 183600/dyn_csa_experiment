@@ -151,7 +151,7 @@ def t_exact_signflip_baseline():
 
 
 def _brute_signflip_p(d):
-    """Reference chunked enumeration (the pre-MITM algorithm)."""
+    """Reference chunked enumeration."""
     d = np.asarray(d, dtype=float)
     n = int(d.size)
     obs = abs(float(d.mean()))
@@ -252,7 +252,7 @@ def t_legacy_modes_bitexact():
             for jj in range(0, 9, 3):
                 a = V10._corrupt_row(_PANEL, 128, rho, mode, jj, _VOCAB, 32)
                 b = _legacy_corrupt_row(_PANEL, 128, rho, mode, jj, _VOCAB, 32)
-                assert np.array_equal(a, b), f'legacy mode {mode} rho={rho} jj={jj} diverged from the pre-refactor algorithm'
+                assert np.array_equal(a, b), f'legacy mode {mode} rho={rho} jj={jj} diverged from the reference algorithm'
 
 
 def t_corruption_deterministic_and_paired():

@@ -55,7 +55,7 @@ P3MT_PAYLOAD = dict(outdir='results_v10_mech', variants=['csa_fixed_rope', 'full
 SCRATCH_CONTROLS = ['csa_fixed_rope_randidx', 'csa_fixed_rope_allblocks']
 P3MT_PAYLOAD_CONTROLS = dict(P3MT_PAYLOAD, variants=SCRATCH_CONTROLS)
 # 干扰注入的腐坏模式（评审点 3）：
-#   uniform —— 既有协议：远端 ρ 比例 token 替换为词表均匀随机 token（历史
+#   uniform —— 既有协议：远端 ρ 比例 token 替换为词表均匀随机 token（既有
 #              cell 键不带 mode 后缀，完全向后兼容）；
 #   natural —— 真实 token 同位置换（评审二轮·意见六概念更名）：保持
 #              unigram/词频统计，但逐位置拼接破坏句法、语义与篇章结构——
@@ -126,7 +126,7 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     """Build ONE corrupted evaluation row (pure, arm/model-seed independent).
 
     输入 val_ids 为 (n_rows, >=eval_len+1) 的 token 面板；返回长度
-    eval_len+1 的 int64 行。四种历史模式（uniform/natural/mask/delete）与
+    eval_len+1 的 int64 行。四种既有模式（uniform/natural/mask/delete）与
     既有实现逐字节一致（同一 RNG 播种、同一调用顺序——见 _distractor_ppls
     的行缓存键）。三种新模式（span/doc/topical，评审二轮·意见六）同样只
     依赖 (eval_len, jj, rho, mode, span_len)，保证臂间严格配对。"""
@@ -209,7 +209,7 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
 def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, chunk_mem=None, mode='uniform'):
     """Score the clean 512-token target zone under a corrupted far context.
 
-    mode='uniform'（默认）与历史实现逐字节一致：同一 (eval_len, 行号, ρ)
+    mode='uniform'（默认）与既有实现逐字节一致：同一 (eval_len, 行号, ρ)
     播种的均匀随机替换、同 token 重采样、同上传与同评分路径。其余模式见
     PROBE_MODES 注释。所有模式的腐坏对同一 (行, ρ, mode) 在臂间逐字节相同
     （只依赖行号与配置，不依赖臂/模型种子），保持严格配对。"""
@@ -290,10 +290,10 @@ def _probe_fingerprint(cfg):
 def _probe_fp_for_mode(fp, cfg, mode):
     """Add the parameters a corruption mode actually consumes.
 
-    `span` corruption changes with `span_len`; the historical probe_params for
+    `span` corruption changes with `span_len`; the existing probe_params for
     every other mode are kept byte-identical so their resume stays valid.
     Without this, changing span_len would silently reuse measurements made
-    with the old span geometry."""
+    with a different span geometry."""
     if mode == 'span':
         return dict(fp, span_len=int(cfg.get('span_len') or PROBE_SPAN_LEN))
     return fp
@@ -311,7 +311,7 @@ def _recipe_norm(recipe):
     return re.sub(r'_mr[^_]*', '_mr*', recipe)
 
 def _probe_params_current(rec, fp, mode='uniform'):
-    """Mode-aware probe-param currency.  uniform cells keep the historical
+    """Mode-aware probe-param currency.  uniform cells keep the existing
     fingerprint exactly (records without a 'mode' field are uniform), so the
     v10/v11 uniform panels stay resumable; non-uniform cells additionally carry
     their mode inside probe_params and only match records of the same mode."""
@@ -485,7 +485,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     # only the shape/config: n_seq, target, vocab, val_seq_len).  Stored on the
     # record and checked forward-compatibly below: a stored record that carries
     # a val_fp differing from the current slice is stale and re-measured, while
-    # legacy records without the field keep their historical resume behaviour.
+    # legacy records without the field keep their existing resume behaviour.
     # v12 reuses this cell with val_ids=test_ids, so the frozen test slice gets
     # the same per-record fingerprint.
     _val_fp = L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))
@@ -732,12 +732,10 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
 
 P3SS_CFG = dict(L.RUN, outdir='results_lm_v10_scale_s', d=128, n_layers=4, n_heads=4, d_head=32, seq_len=512, batch_size=12, n_train_tokens=40000000, steps=8000, warmup=100, eval_every=250, eval_subset=64, variants=['csa_fixed', 'full'])
 P3SL_CFG = dict(L.RUN, outdir='results_lm_v10_scale_l', d=512, n_layers=10, n_heads=16, d_head=32, seq_len=512, batch_size=12, n_train_tokens=40000000, steps=4000, warmup=100, eval_every=250, eval_subset=64, variants=['csa_fixed', 'full'])
-# ---- 规模对照臂：等训练 token 与等计算量的大模型臂 ----
-# P3SS（d128/L4×8000 步 ≈ 49.15M token）与 P3SL（d512/L10×4000 步 ≈ 24.58M
-# token）的累计 token 相差一倍，原面板的跨规模终点差异不能单独归因于规模。
-# P3SL_TOK：大模型 8000 步，token 与 P3SS 完全对齐；P3SL_FLOP：大模型步数
-# 按参数量比例缩到与 P3SS 总计算量（~6·N·D 代理）对齐（steps 运行期由
-# _flop_matched_steps 确定性计算，避免在 import 期构建模型——§7 导入零副作用）。
+# ---- 规模对照臂：等训练 token 与参数量代理规模的大模型臂 ----
+# P3SL_TOK 与 P3SS 对齐累计 token；P3SL_FLOP 按参数量比例缩放步数
+# （steps 运行期由 _flop_matched_steps 确定性计算，避免在 import 期
+# 构建模型——§7 导入零副作用）。
 P3SL_TOK_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_l8k', steps=8000)
 P3SL_FLOP_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_lflop', steps=None)
 

@@ -382,7 +382,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         _arange_sel = (topk_l.shape[1] == last_tok.shape[0]
                        and topk_l is L._IDX_CACHE.get((L._dev_str(dev), 'arangeexp', int(T), int(topk_l.shape[1]))))
         _sel_all = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
-        # The K/V halves are stacked once and gathered with one combined row
+        # The K/V halves are stacked and gathered with one combined row
         # index per chunk, exactly as exp_lib.gathered_attention does: the
         # selected rows are the two separate gather outputs concatenated in the
         # same order, so the values are bit-identical.
@@ -734,7 +734,7 @@ def install_patches():
     _PATCHES_INSTALLED = True
 install_patches()
 # 代码语义戳必须以 exp_lib.code_stamp() 为准（其 docstring 的明确要求）：
-# eager 模式下与历史值相同；内核模式（CSA_KERNEL）下追加 -tk1 后缀
+# eager 模式保持既有值；内核模式（CSA_KERNEL）下追加 -tk1 后缀
 # （design_notes §3.1）。
 CKPT_CODE = L.code_stamp()
 ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']

@@ -16,13 +16,13 @@
   P5T   —— **冻结后的独立最终测试**：按仓库根的冻结清单
            `confirmation_frozen.json`（预注册主比较、终点、种子数、检验与
            校正规则），在 WikiText-103 的 held-out test split（wiki.test.raw，
-           此前任何 phase 都未读过）上一次性评估冻结臂，输出确认性统计。
+           其它 phase 不读）上一次性评估冻结臂，输出确认性统计。
 
 评审二轮新增的硬门槛（加载/运行/统计三层）：
   1. 功效门槛（意见一）：加载清单即校验「该方案是否数学上可能确认」
      （min attainable Holm p = m·2/2^n < α）。6 种子 × 双侧 × Holm/4 的
      原设计在该门槛下会被拒绝——清单 v2 已在**未读任何 test 数据**的
-     前提下把种子修订为 12（见清单 revision 块与 DECISION_LOG.md）。
+     前提下把种子修订为 12（见清单 revision 块）。
   2. 严格准入（意见二）：`finaltest_stats` 只接纳同时通过「冻结种子白名
      表、唯一记录、非空 data_fp、单一冻结 test 切片、_code 与 recipe 的
      机器校验、manifest 哈希绑定」的记录；歧义重复与混切片直接拒绝。
@@ -97,7 +97,7 @@ def make_guard():
 
 # ---- 阶段配置 -------------------------------------------------------------
 # 评审二轮·意见一修订：冻结清单把种子数从 6 修订为 12（修订发生在任何
-# test-split 评估之前，见清单 revision 块与 DECISION_LOG.md）。P5C/P5MP 的
+# test-split 评估之前，见清单 revision 块）。P5C/P5MP 的
 # 种子列表**不再是这里的硬编码**，运行期由 `_frozen_seeds()` 从冻结清单
 # 读取（单一事实来源）；P5C 同时覆盖全部四个冻结臂（主臂 0-5 已由
 # P3MT/P4MT 训练，resume 自动跳过；主臂 6-11 与对照臂统一在此补齐），
@@ -184,7 +184,7 @@ def _load_manifest(path):
     _min_holm = L.holm_min_attainable_p(_n, _m_family, _alpha)
     if math.isfinite(_min_holm) and _min_holm > _alpha and not _stat.get('descriptive_only'):
         _kmin = L.signflip_min_consistency(_n, _m_family, _alpha)
-        raise SystemExit(f'[v12] REFUSE: the frozen plan cannot confirm ANYTHING by construction — with n={_n} seeds, a two-sided exact sign-flip and a Holm family of m={_m_family}, the smallest attainable Holm p is {_min_holm:.4g} > alpha={_alpha} (all {_n} seeds one-sided still gives {_kmin is None and "insufficient" or f"k_min={_kmin} needed"}). This is a resolution ceiling, NOT a conservative design. Revise the plan BEFORE any test-split evaluation (add seeds / shrink the family / change the test) and record the revision in the manifest history and DECISION_LOG.md. ({_stat.get("descriptive_only")!r})')
+        raise SystemExit(f'[v12] REFUSE: the frozen plan cannot confirm ANYTHING by construction — with n={_n} seeds, a two-sided exact sign-flip and a Holm family of m={_m_family}, the smallest attainable Holm p is {_min_holm:.4g} > alpha={_alpha} (all {_n} seeds one-sided still gives {_kmin is None and "insufficient" or f"k_min={_kmin} needed"}). This is a resolution ceiling, NOT a conservative design. Revise the plan BEFORE any test-split evaluation (add seeds / shrink the family / change the test) and record the revision in the manifest history. ({_stat.get("descriptive_only")!r})')
     if not isinstance(m.get('seeds'), list) or not all(isinstance(s, int) and (not isinstance(s, bool)) for s in m['seeds']) or len(set(m['seeds'])) != len(m['seeds']):
         raise SystemExit(f'[v12] REFUSE: seeds must be a list of unique integers ({m.get("seeds")!r}) — seed identity is the pairing unit of the whole protocol')
     # ---- review-2 issue 3: binding block.  Optional but validated when present;
@@ -312,8 +312,8 @@ def _freeze_lock_path(outdir):
 def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp):
     """Persistent first-test-access lock (review-2 issue 3).
 
-    之前「首次测试访问后禁止修改计划」只是文档约定；现在 P5T 一旦在
-    outdir 落下首条记录（或本函数被调用），锁文件即记录 manifest sha256
+    首次测试访问后禁止修改计划：P5T 一旦在 outdir 落下首条记录（或本函数
+    被调用），锁文件即记录 manifest sha256
     与 test 切片指纹。之后的 P5T/analysis 若带着**不同的** manifest 哈希
     或不同 test 指纹运行，将被拒绝——除非显式 V12_REFREEZE=1（并大声
     打印该轮降级为探索性的警告）。"""
@@ -327,8 +327,8 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp):
         _manifest_changed = lock.get('manifest_sha256') != _sha
         if _manifest_changed:
             if not os.environ.get('V12_REFREEZE'):
-                raise SystemExit(f'[v12] REFUSE: the test split was already accessed under a DIFFERENT frozen manifest (lock {lp}: {lock.get("manifest_sha256")} != current {_sha}, locked_at={lock.get("locked_at")}). Changing the plan after seeing test data is selection bias by construction. To consciously re-freeze, set V12_REFREEZE=1 — the earlier round must then be reported as exploratory in DECISION_LOG.md.')
-            print(f'[v12] WARNING: V12_REFREEZE=1 — running under a manifest that differs from the locked one ({lock.get("manifest_sha256")} -> {_sha}); the earlier round is DOWNGRADED to exploratory and this must be recorded in DECISION_LOG.md')
+                raise SystemExit(f'[v12] REFUSE: the test split was already accessed under a DIFFERENT frozen manifest (lock {lp}: {lock.get("manifest_sha256")} != current {_sha}, locked_at={lock.get("locked_at")}). Changing the plan after seeing test data is selection bias by construction. To consciously re-freeze, set V12_REFREEZE=1 — the earlier round must then be reported as exploratory in the plan history.')
+            print(f'[v12] WARNING: V12_REFREEZE=1 — running under a manifest that differs from the locked one ({lock.get("manifest_sha256")} -> {_sha}); the earlier round is DOWNGRADED to exploratory and this must be recorded in the plan history')
             # Persist the conscious re-freeze: keeping the OLD hash in the lock
             # would make every later run under the new plan refuse (and would
             # lose the fact that a refreeze happened).  The superseded plan is
@@ -340,7 +340,7 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp):
                          'frozen_at': manifest.get('frozen_at'),
                          'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
                          'code_semantics': L.CODE_SEMANTICS,
-                         'note': 're-frozen under V12_REFREEZE=1: the previous plan is downgraded to exploratory (record it in DECISION_LOG.md)'})
+                         'note': 're-frozen under V12_REFREEZE=1: the previous plan is downgraded to exploratory (record it in the plan history)'})
             L.atomic_write_json(lp, lock, indent=2)
             print(f'[v12] freeze lock UPDATED: {lp} (manifest {str(_sha)[:12]}…; {len(lock["superseded"])} superseded plan(s) kept)')
         if test_ids_fp is not None and lock.get('test_ids_fp') not in (None, test_ids_fp):
@@ -467,7 +467,7 @@ def run_finaltest(cfg=None, guard=None):
     """Evaluate the FROZEN confirmation set on the held-out test split.
 
     只读冻结清单列出的臂/种子/终点；评估数据来自 `L.load_wikitest`（test
-    split，此前任何 phase 未读）。产物：`results_lm_test/bylen.json`（干净
+    split，其它 phase 不读）。产物：`results_lm_test/bylen.json`（干净
     by-length，含逐文档 ppl_per_seq）与 `results_lm_test/distractor.json`
     （uniform 腐坏探针）；确认性统计由 `v12_supp.py analysis` 从这些产物
     现算。
@@ -494,7 +494,7 @@ def run_finaltest(cfg=None, guard=None):
     # the test split has been read, and the slice itself is part of the freeze.
     _check_or_write_freeze_lock(outdir, manifest, _dfp)
     print(f'[p5t] manifest {cfg["manifest"]} frozen_at={manifest.get("frozen_at", "?")} sha256={manifest.get("manifest_sha256", "?")[:12]}… arms={manifest["arms"]} seeds={manifest["seeds"]}')
-    print(f'[p5t] TEST split rows {test_ids.shape} (held out; no earlier phase read this split; ids_fp={_dfp[:12]}…)')
+    print(f'[p5t] TEST split rows {test_ids.shape} (held out; no other phase reads this split; ids_fp={_dfp[:12]}…)')
     if _nseq_clean < 64:
         print(f'[p5t] NOTE: n_seqs_clean={_nseq_clean} — document-sampling uncertainty is NOT well covered at this row count; population-level claims need a larger row panel (per-doc losses are recorded in bylen.json for stratified analysis; see design_notes §20)')
     # 1) clean by-length per (arm, seed)
@@ -757,7 +757,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
     A('> 说明：本报告全部数字由 `v12_supp.py report` 从 `results_lm_test/`、`results_v10_mech/`、`analysis_v12/` 的落盘产物计算得到，无手填数值。')
     A('')
-    A('本驱动落实评审点 4/5 的确认性协议：v7→v11 的全部面板与 v10/v12 的机制扩展属于**探索性**证据；本报告只报告**冻结后**在 held-out test split（wiki.test.raw，此前任何 phase 未读）上的一次性确认评估。探索性面板的完整数字见 REPORT_v10.md / REPORT_v11.md。')
+    A('本驱动落实评审点 4/5 的确认性协议：v7→v11 的全部面板与 v10/v12 的机制扩展属于**探索性**证据；本报告只报告**冻结后**在 held-out test split（wiki.test.raw，其它 phase 不读）上的一次性确认评估。')
     A('')
     A('---')
     A('')

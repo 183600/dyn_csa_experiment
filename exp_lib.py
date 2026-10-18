@@ -80,7 +80,7 @@ def _kernel_stamp():
 
 def code_stamp():
     """当前代码+内核模式写进每条记录的 `_code` 戳（eager = CODE_SEMANTICS
-    本身，与历史逐字节一致；内核模式追加变体后缀）。一切「记录是否当前」
+    本身；内核模式追加变体后缀）。一切「记录是否当前」
     的判定（result_is_current 的 code 实参、`_cs...` 后缀匹配）都必须以
     本值为准——裸比 CODE_SEMANTICS 会把内核模式的全部记录误判为陈旧，
     使 resume 静默失效、面板被标 `_stale_cfg`。"""
@@ -103,7 +103,7 @@ def code_stamp():
 #            制），故这些臂自动回退到 mlp 级并提示一次。块内既有的池化 /
 #            gather 注意力 / sink 分块 checkpoint 在反向重算时照旧包裹
 #            （嵌套非重入 checkpoint 是 torch 支持、v9 驱动已在使用的形
-#            式）；_CKPT_NEST 使内层 MLP 不再重复包裹。
+#            式）；_CKPT_NEST 控制内层 MLP 的包裹。
 _CKPT_NEST = [0]
 _CKPT_WARNED = set()
 
@@ -127,8 +127,8 @@ ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_
 # 单面板 summary 审计——参照臂不在面板内时该面板只能报「缺臂」，撑不起任何
 # 「各模块都有用」的结论。因此消融面板自含参照臂（csa_dynamic / hybrid_csa_dyn
 # 即去一法的「Full」；full 供 full_sink 的 dense sink 对照）。参照臂列在最前：
-# 历史机器上 resume 直接跳过，全新机器上被 cap 截断时它们最先完成，缺的
-# 只是 abl 臂而不是整套对照。
+# resume 时已完成的参照臂直接跳过；被 cap 截断时它们最先完成，缺的只是
+# abl 臂而不是整套对照。
 ABL_REFS = ['full', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic']
 RUN_ABL = dict(RUN, outdir='results_lm_v4_abl', variants=ABL_REFS + ABL_VARIANTS, seeds=[0] if QUICK else [0, 1, 2, 3, 4])
 RUN_LONG = dict(RUN, n_train_tokens=2000000 if QUICK else 110000000, steps=500 if QUICK else 20000, warmup=200, eval_every=1000, seeds=[0] if QUICK else [0, 1, 2, 3], outdir='results_lm_v3_long', variants=['full', 'full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn'])
@@ -191,7 +191,7 @@ def cosine_similarity_consecutive(H, eps=1e-08):
         out[_lead_sl + (slice(s, e - 1),)] = (h[..., 1:, :] * h[..., :-1, :]).sum(dim=-1)
     return out
 
-# LRU memo of exact segmenter outputs (OrderedDict, O(1) eviction by recency)
+# LRU memo of exact segmenter outputs (OrderedDict).
 # — a pure cache: hits return the identical (bids, honoured, counts) triple
 # either policy would return, so no value downstream can change.
 _SEGMENT_CACHE = collections.OrderedDict()
@@ -262,9 +262,8 @@ def _segment(n, want_cut_list, min_block, max_block):
         return (np.empty(0, dtype=np.int64), {}, [])
     cacheable = n <= 64
     # uint8 cast of the booleans is exactly 0/1 per slot — the same byte string
-    # `bytes(bytearray(1 if _c else 0 ...))` built, without a Python-level
-    # generator per cut slot (host-side integer/bool equivalent rewrite; the
-    # cached bids/honoured/counts the key guards are unchanged).
+    # `bytes(bytearray(1 if _c else 0 ...))` built; the cached
+    # bids/honoured/counts the key guards are unchanged.
     key = (n, min_block, max_block, np.asarray(want_cut_list, dtype=np.uint8).tobytes()) if cacheable else None
     if cacheable:
         hit = _SEGMENT_CACHE.get(key)
@@ -378,10 +377,7 @@ _H2D_POOL_SLOTS = 4
 _H2D_POOL_MAX_ENTRIES = 256
 
 def _h2d_pool_evict(need=0):
-    # Dynamic-block runs hand the staging pool a new (B, T, max_len) shape
-    # every step; without eviction the pool would permanently fill with stale
-    # shapes and then fall back to pin-per-call for the rest of the run.  An
-    # entry is only released when all of its recorded H2D copies have
+    # An entry is only released when all of its recorded H2D copies have
     # completed, so no pinned buffer can be freed while a copy is in flight.
     while _H2D_POOL and (_H2D_POOL_BYTES[0] + int(need) > _H2D_POOL_CAP
                           or len(_H2D_POOL) >= _H2D_POOL_MAX_ENTRIES):
@@ -550,7 +546,7 @@ def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=Fals
         return (z, 1) if return_count and n == 1 else ((z, 0) if return_count else z)
     if sim is None:
         sim = cosine_similarity_consecutive(H)
-    # zero-copy numpy view; the segmenter sees the same booleans as a list
+    # numpy view; the segmenter sees the same booleans as a list
     cut_list = (sim < tau).cpu().numpy()
     return blocks_from_cuts(n, cut_list, min_block, max_block, dev, return_count=return_count)
 
@@ -620,8 +616,7 @@ _CAUSAL_TRI = None
 def _causal_donor(device, width):
     # 单一共享 bool donor（True = j > i 的被掩 lane）：同一 [width, width]
     # 表按 [:T, :T] 切片服务一切 T <= width；_mask_buffer 的 causal 分支
-    # 说明其与加性 donor 的逐位对应。donor 永驻（pinned key），随 width
-    # 单调重建。
+    # 说明其与加性 donor 的逐位对应。donor 为 pinned key，随 width 重建。
     global _CAUSAL_TRI
     dev_s = _dev_str(device)
     held = _CAUSAL_TRI
@@ -638,8 +633,7 @@ _IDX_CACHE_BYTES = 0
 _MASK_CACHE_BUDGET_BYTES = 192 << 20
 
 def _mask_budget(n):
-    # mask 表随 T 增长；上限随 T 放大让这几张 mask 共存，只影响缓存命中，
-    # 不影响任何值。
+    # mask 表随 T 增长；上限随 T 放大，不影响任何值。
     return max(_MASK_CACHE_BUDGET_BYTES, 6 * int(n) * int(n))
 
 def _cache_bytes(t):
@@ -739,7 +733,7 @@ def _arange_exp_cache(n, m, device):
     # Cached int32 (n, m) arange expansion for the HCA read-everything arm:
     # the same exact integers as _arange_cache(m, device).unsqueeze(0).
     # expand(n, m).to(torch.int32) (index transport, design notes §6.1); int32
-    # in, so the int64 upcast is skipped downstream (also §6.1).  Built outside
+    # in (also §6.1).  Built outside
     # inference mode so a table first filled during eval can still serve as an
     # autograd index tensor in training; only ever read downstream (row slices
     # feeding gathers), never mutated.
@@ -825,7 +819,7 @@ def _attn_transient_budget(device):
             free, _total = torch.cuda.mem_get_info(device)
             # 上限由设备状态决定并封顶 _ATTN_TRANSIENT_CAP_BYTES；行分块是
             # 纯行划分（任意宽度下逐行值逐位相同，见 gathered_attention 的
-            # chunk 注释），因此上限变化只影响分块宽度，不改变任何值。
+            # chunk 注释），不改变任何值。
             val = max(64 << 20, min(int(free) // 4, _ATTN_TRANSIENT_CAP_BYTES))
     except Exception:
         val = None
@@ -1744,7 +1738,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
             out_valid[:] = [torch.zeros(n, 0, dtype=torch.bool, device=scores.device)]
         return torch.empty(n, 0, device=scores.device, dtype=torch.int32)
     k = min(k_req, B)
-    # One boolean table instead of a separate finite mask plus the AND result.
+    # Boolean finite-and-causal table.
     cf = causal & torch.isfinite(scores)
     # torch.where picks bit-identical values (scores or the -inf constant) —
     # the same selection masked_fill produced.
@@ -1808,9 +1802,8 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     return idx_out
 
 _TOPK_CLAMP_WARNED = set()
-# Above this many elements an [T, B] causal/negated mask pair is no longer
-# retained on last_tok: the per-query-chunk form is value-identical (the
-# dynamic arms have B ~ T / block_size).
+# Above this many elements the per-query-chunk form is used on last_tok
+# (value-identical; the dynamic arms have B ~ T / block_size).
 _READABLE_CACHE_MAX_ELEMS = 4 << 20
 
 def _pool_ends_host(bid):
@@ -1858,10 +1851,9 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     # by every row/layer/step, so a SMALL pair is cached on that tensor object
     # — the same bitwise-safe cache-on-immutable-object argument as
     # _pool_parts/_pool_geom (design notes §6.2).  The table is [T, B] with
-    # B ~ T / block_size for the dynamic arms, i.e. quadratic in the sequence
-    # length; caching it at long context would retain gigabytes per last_tok
-    # object.  Above the element cap we therefore build the exact same mask
-    # per query chunk below (value-identical slices) and cache nothing.
+    # B ~ T / block_size for the dynamic arms.  Above the element cap we build
+    # the same mask per query chunk below (value-identical slices) and cache
+    # nothing.
     # Built outside inference mode so a pair first filled during eval can
     # still serve training (masked_fill_ saves the mask for backward).
     _rkey = (int(n), int(last_tok.shape[0]))
@@ -2648,8 +2640,7 @@ class HybridAttention(nn.Module):
             return None
         cfg = self.cfg
         # In-place tails over the fresh cumsum output: same op order
-        # (divide -> add -> subtract -> divide) and therefore the same
-        # values, without two [T-1] temporaries.
+        # (divide -> add -> subtract -> divide) and therefore the same values.
         prefix_mean = torch.cumsum(sim, 0)
         prefix_mean.div_(_range_cache(1, sim.numel() + 1, x.device))
         prefix_mean.add_(self.delta_logit)
@@ -2746,7 +2737,7 @@ class HybridAttention(nn.Module):
                 gate_list = None
                 if gate.numel():
                     gate_bool = gate.detach() > _HALF
-                    # .numpy() is a zero-copy view of the CPU tensor; the
+                    # .numpy() is a view of the CPU tensor; the
                     # segmenter consumes the same booleans as the .tolist()
                     # form (design notes §6.2).
                     gate_list = gate_bool.cpu().numpy()
@@ -2913,7 +2904,7 @@ class HybridAttention(nn.Module):
         if self.cfg.chunking == 'cosine_learnable':
             _raw, _gbool = self._gate_signals(x, pre_all)
             if all((_r is not None for _r in _raw)):
-                # .numpy() is a zero-copy view of the stacked CPU tensor (the
+                # .numpy() is a view of the stacked CPU tensor (the
                 # base tensor stays alive through the views); the segmenter
                 # consumes the same booleans.
                 _gl = _gbool.cpu().numpy()
@@ -3023,7 +3014,7 @@ class Block(nn.Module):
 
     def _fwd_ckpt(self, x):
         # checkpoint 的初向前向与反向重算都经这里：置位期间内层 MLP 不再
-        # 重复包裹（外层已不保存它的激活）。
+        # 重复包裹。
         _CKPT_NEST[0] += 1
         try:
             return self._fwd(x)
@@ -3785,10 +3776,8 @@ def _npy_serve_int32(path):
     if not np.issubdtype(src.dtype, np.integer):
         raise TypeError(f'_npy_serve_int32: expected an integer token cache at {path}, got dtype {src.dtype}')
     if src.dtype in (np.uint8, np.uint16, np.int32):
-        # Serve the memory-mapped view directly.  The corpus is read-only and
-        # every consumer gathers a batch at a time, so copying the whole cache
-        # into RAM (which doubles the resident corpus at 5B-60B tokens) is
-        # unnecessary; the returned values are identical.
+        # Serve the memory-mapped view directly; the corpus is read-only and
+        # the returned values are identical.
         return src
     # Wider integer cache: narrow to int32 only after proving every id fits.
     # A silent wrap (e.g. 2**32 + 5 -> 5) would pass the downstream
@@ -4827,8 +4816,6 @@ def _binom_cdf_half(n, m):
         # P(X <= m) = 1 - P(X <= n-m-1) with n-m-1 < n/2.
         return float(1.0 - _binom_cdf_half(n, n - m - 1))
     # Regularized incomplete beta: P(Bin(n,1/2) <= m) = I_{1/2}(n-m, m+1).
-    # O(1) in m, so a scale-up to thousands of seeds does not turn the seed
-    # planner into an O(n^2) lgamma loop.
     v = _betai(n - m, m + 1, 0.5)
     if math.isfinite(v):
         return float(min(1.0, max(0.0, v)))
@@ -6812,7 +6799,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             lists[status].append(comp)
             if status == 'verified':
                 # `verified` is the corrected-significance tier; keep the
-                # historical `significant_*` key pointing at the same set so
+                # existing `significant_*` key pointing at the same set so
                 # downstream readers do not silently lose the signal.
                 lists['significant'].append(comp)
             if any(e.get('significant') for e in entries if e.get('controlled')):
@@ -8127,13 +8114,13 @@ def is_delta_param(name):
 
 # ---- 受控变量描述符：优化器 / 调度 / 裁剪 / 数据增强 ----
 # 对比实验要求「除待验证模块外，优化器、学习率策略、训练轮数、数据增强等设置
-# 必须完全一致」。这些设置此前是 train_variant 内的硬编码常量，因此对所有臂
-# 天然一致，但 run_cfg 指纹并不显式记录它们——一旦扩规模时为某条臂单独改优化
-# 器/调度（或将来引入数据增强），两条记录仍可能通过 `pair_reason` 的同
-# run_cfg 门槛而被静默配对。这里把它们提为模块常量，并把同一组常量导出成
-# `training_knobs()` 描述符，随每条记录落盘；`pair_reason` 对两条都带该字段的
-# 记录额外要求逐字段相等（缺字段的历史记录不受影响），审计则把该描述符打印
-# 出来「证明」两臂共享优化器与调度，而不是只靠断言。
+# 必须完全一致」。这些设置是 train_variant 内的模块常量，对所有臂天然一致，
+# 但 run_cfg 指纹并不显式记录它们——一旦扩规模时为某条臂单独改优化器/调度
+# （或将来引入数据增强），两条记录仍可能通过 `pair_reason` 的同 run_cfg 门槛
+# 而被静默配对。这里把同一组常量导出成 `training_knobs()` 描述符，随每条记录
+# 落盘；`pair_reason` 对两条都带该字段的记录额外要求逐字段相等（缺字段的记录
+# 不受影响），审计则把该描述符打印出来「证明」两臂共享优化器与调度，而不是
+# 只靠断言。
 OPT_ADAMW_BETAS = (0.9, 0.999)
 OPT_ADAMW_EPS = 1e-08
 GRAD_CLIP_NORM = 1.0
@@ -8554,8 +8541,8 @@ _OVERFIT_ARCH = {'d': 64, 'n_layers': 2, 'n_heads': 4, 'd_head': 16}
 def _probe_arch(arch=None):
     """Effective probe architecture: the tiny default, overridden by the
     caller-supplied keys (a scaling driver can probe the architecture family
-    it is about to train — d/n_heads/d_head geometry bugs that a 4-head probe
-    can never see are caught before the panel starts)."""
+    it is about to train — d/n_heads/d_head geometry mismatches that a 4-head
+    probe can never see are caught before the panel starts)."""
     _arch = dict(_OVERFIT_ARCH)
     if arch:
         for _k in _arch:

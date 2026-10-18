@@ -69,7 +69,7 @@ def _signflip_mitm_count(deltas):
 
     Mirrors `exp_lib.exact_signflip_p`: 2**(n/2) sums per half and two
     binary searches per left sum, so n=21..40 stays exact without importing
-    torch or enumerating 2**n masks.  Threshold uses this module's historical
+    torch or enumerating 2**n masks.  Threshold uses this module's existing
     convention (abs sum vs 1e-12) so the reported p is unchanged for n<=20."""
     import numpy as _np
     d = _np.asarray(deltas, dtype=float)

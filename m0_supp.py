@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M0/S1 驱动 — B 档算力规划（已选定）的代码入口，见 docs/compute_plan.md §4–§6。
+"""M0/S1 驱动 — B 档扩规模路线图（已选定）的代码入口，见 docs/compute_plan.md §4–§6。
 
 B 档落在两处代码支撑上（均在 exp_lib.py）：
   1. FineWeb-Edu 语料与 32k BPE 分词缓存（load_fineweb_edu：npy 缓存 +
@@ -167,7 +167,7 @@ def run_overfit_check(variants=None, steps=250, arch=None):
     is a hard stop before any panel is allowed to start.
 
     `arch` optionally probes the architecture family the panel is about to
-    train (S1: d=768/12L/12H/dh64): a head/layer-geometry bug that the tiny
+    train (S1: d=768/12L/12H/dh64): a head/layer-geometry mismatch that the tiny
     default probe (d=64/2L/4H) can never see is caught before the panel
     starts.  Unset = the default tiny probe."""
     variants = list(variants or L.B_ARMS)
@@ -300,7 +300,7 @@ def run_full():
     cap = dict(cap)
     _env = os.environ.get(cap_env)
     if _env:
-        print(f'[m0] {cap_env}={_env} 覆盖默认上限 {cap["total_hours"]} 卡时')
+        print(f'[m0] {cap_env}={_env} 覆盖默认上限 {cap["total_hours"]} 小时')
         cap['total_hours'] = float(_env)
     guard = L.TimeGuard(cap)
     guard.report()

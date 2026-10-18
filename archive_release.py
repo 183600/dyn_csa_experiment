@@ -11,7 +11,6 @@ SHA-256 清单的固定归档**，可发布到任何只读位置（release 附�
   - 各 results_*/summary.json、bylen/distractor/niah 等落盘产物
   - analysis_*/ 全部统计 JSON 与 REPORT*.md
   - confirmation_frozen.json（+ 冻结锁 .freeze_lock.json 与 ckpt 哈希表）
-  - DECISION_LOG.md
   - run_time_state*.json（TimeGuard 账本）
   - 环境：python/pip/torch/CUDA 版本、requirements 快照
   - checkpoint 哈希清单（sha256 逐文件；可选把 .pt 本体一并入包）
@@ -46,7 +45,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DIRS = ['results_lm_test', 'analysis_v12']
-ENV_FILES = ['confirmation_frozen.json', 'DECISION_LOG.md']
+ENV_FILES = ['confirmation_frozen.json']
 
 
 def _sha256(path, chunk=1 << 20):

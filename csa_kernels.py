@@ -553,7 +553,7 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     # 同源——Bm 由同一分段表的 counts 给出，bid 值恒 < Bm）：where(全真,
     # x, 0) 逐位返回 x（含 ±0/NaN）。
     single_chunk = ch >= Bm
-    # 广播用的零标量只读，逐 chunk 重建是同一常量——循环外只建一次。
+    # 广播用的零标量只读，循环外建立。
     zero32 = torch.zeros((), device=dev, dtype=torch.float32)
     for b0 in range(0, Bm, ch):
         b1 = min(b0 + ch, Bm)
@@ -781,7 +781,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=True):
     # without gradients).
     soft = torch.empty((R, T, k_out), device=dev, dtype=acc) if need_soft else None
     # 逐行独立的 (r,t) 归约（mask/lse/sort/topk）：按 t 分块与整幅计算的
-    # 每行值逐位一致（同 kernel、同归约顺序），中间张量按 t 块封顶。
+    # 每行值逐位一致（同 kernel、同归约顺序），中间张量按 t 分块。
     t_chunk = max(1, min(T, (256 << 20) // max(R * Bm * 32, 1)))
     for t0 in range(0, T, t_chunk):
         t1 = min(t0 + t_chunk, T)
@@ -854,8 +854,8 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
     dev = qI.device
     dtype = qI.dtype
     if t_chunk is None:
-        # 每 chunk 同时存活的 [R,tc,Bm] 级临时量约 nIH+8 份（Mk、s_list、
-        # s_all、masked、e、ds 及逐元素中间量）：t_chunk 按此封顶。
+        # t_chunk 按每 chunk 的 [R,tc,Bm] 级临时量（Mk、s_list、s_all、
+        # masked、e、ds 及逐元素中间量）确定。
         # chunk 只划分独立的 (r,t) 行（dkI 的跨 chunk 累加分组属低阶位
         # 口径，与 CSA_KERNEL_IDX_CHUNK 覆盖同理）。
         t_chunk = max(1, min(T, (192 << 20) // max(int(R) * int(Bm) * 4 * (int(nIH) + 8), 1)))
@@ -1141,7 +1141,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         lane_ok = torch.cat([sel_ok, win_ok], dim=-1)
         anyrow = (sel_ok.any(dim=-1) | win_ok.any(dim=-1)) if sink_v is None else None
         # The window lanes never carry a soft prior; keep only the block
-        # columns instead of padding a full-width [R, t, nb + w] table.
+        # columns.
         soft_c = soft[:, t0:t1, :].to(torch.float32) if soft is not None else None
         # 键基按需（int 精确）：(r,src)/窗口部分与 h 无关。
         if keyb is not None:
@@ -1441,7 +1441,7 @@ def _kernels():
     ns.pool_fwd = pool_fwd
 
     # ---------- 算子 2：索引打分 ----------
-    # T0/TF：打分按 query 行分块启动（scores 缓冲封顶）；T0 是本块的全局行
+    # T0/TF：打分按 query 行分块启动；T0 是本块的全局行
     # 偏移，TF 是完整序列长（qI/w 的行 stride），scores/输出按块内 T 寻址。
     # T0=0、TF=T 时寻址与不分块形式完全一致（同一批全局行、同一批值）。
     # HDP：点积泳道宽（>= 16 的 2 幂）；hd < HDP 时 d 泳道零填充——零乘积
@@ -1583,7 +1583,7 @@ def _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     k_blk, v_blk = k_blk.contiguous(), v_blk.contiguous()
     k_sw, v_sw = k_sw.contiguous(), v_sw.contiguous()
     # The arange table is a stride-0 expand view; the kernels read the lane
-    # index instead of the table.
+    # index.
     topk_idx = topk_idx if idx_arange else topk_idx.contiguous()
     valid_c = valid.contiguous() if valid is not None else topk_idx
     last_tok = last_tok.contiguous()
@@ -2324,9 +2324,8 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         counts = getattr(base, '_pool_cpu', None)
         if counts is None:
             raise RuntimeError('blocks_fixed 未携带 _pool_cpu——分段器出口被绕过')
-        # blocks_fixed 经 _IDX_CACHE 全局缓存（同一对象贯穿全部层/步），
-        # bid_full 是该对象内容的纯整型函数（transport only）——按 (B, device)
-        # 缓存在对象上。
+        # bid_full 是 blocks_fixed 内容（transport only）的纯整型函数，
+        # 按 (B, device) 缓存在对象上。
         _bkey = (int(B), str(dev))
         _bc = getattr(base, '_bidfull_cache', None)
         if _bc is None:
