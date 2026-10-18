@@ -147,33 +147,27 @@ class HybridAttentionRoPE(L.HybridAttention):
             return super()._full_batched(x)
         B, T, _ = x.shape
         cfg = self.cfg
-        if x.device.type == 'cuda':
-            # Fused q/k/v projection (CUDA only — same transport-only form as
-            # exp_lib.HybridAttention._full_batched, design notes §6.1): every
-            # output column is an independent dot product over the input dim, so
-            # the sliced halves are bit-identical to the three separate
-            # self.W_*(x) calls (and their per-column grads are too).
-            _nhq = self.nh * self.hd
-            if torch.is_grad_enabled():
-                _wqkv = torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0)
-            else:
-                # eval-only weight-concat cache, keyed on the source weights'
-                # autograd `_version` counters, dtype and device, exactly like
-                # exp_lib's `_wcat_cache`.
-                _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version,
-                        self.W_q.weight.dtype, self.W_k.weight.dtype, self.W_v.weight.dtype,
-                        self.W_q.weight.device)
-                _hit = self._wcat_cache.get('qkv')
-                if _hit is None or _hit[0] != _key:
-                    with torch.inference_mode(False):
-                        _hit = (_key, torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0))
-                    self._wcat_cache['qkv'] = _hit
-                _wqkv = _hit[1]
-            _qkv = F.linear(x, _wqkv)
+        # Eval-only fused q/k/v projection (same cache contract as
+        # exp_lib.HybridAttention._full_batched).  Training uses the three
+        # separate projections so no concatenated weight is rebuilt per step.
+        _nhq = self.nh * self.hd
+        if x.device.type == 'cuda' and not torch.is_grad_enabled():
+            # eval-only weight-concat cache, keyed on the source weights'
+            # autograd `_version` counters, dtype and device, exactly like
+            # exp_lib's `_wcat_cache`.
+            _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version,
+                    self.W_q.weight.dtype, self.W_k.weight.dtype, self.W_v.weight.dtype,
+                    self.W_q.weight.device)
+            _hit = self._wcat_cache.get('qkv')
+            if _hit is None or _hit[0] != _key:
+                with torch.inference_mode(False):
+                    _hit = (_key, torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0))
+                self._wcat_cache['qkv'] = _hit
+            _qkv = F.linear(x, _hit[1])
             q = _qkv[..., :_nhq].reshape(B, T, self.nh, self.hd)
             k = _qkv[..., _nhq:2 * _nhq].reshape(B, T, self.nh, self.hd)
             v = _qkv[..., 2 * _nhq:].reshape(B, T, self.nh, self.hd)
-            del _qkv, _wqkv
+            del _qkv
         else:
             q = self.W_q(x).view(B, T, self.nh, self.hd)
             k = self.W_k(x).view(B, T, self.nh, self.hd)
@@ -382,7 +376,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         # broadcast comparison gives the same booleans.
         _arange_sel = (topk_l.shape[1] == last_tok.shape[0]
                        and topk_l is L._IDX_CACHE.get((L._dev_str(dev), 'arangeexp', int(T), int(topk_l.shape[1]))))
-        _sel_all = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
+        _sel_all = None
         # The K/V halves are stacked and gathered with one combined row
         # index per chunk, exactly as exp_lib.gathered_attention does: the
         # selected rows are the two separate gather outputs concatenated in the
@@ -403,6 +397,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         # keep mask is then identical to the computed form.
         _dedup = (not topk_distinct) and topk_l.shape[1] > 1
         if L._attn_full_width_ok(T, topk_l.shape[1], w, _dedup):
+            _sel_all = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
             _keep_all = sel_valid
             if _dedup:
                 _ddk_all = L.first_occurrence_mask(topk_l)
@@ -428,7 +423,10 @@ class HybridAttentionRoPE(L.HybridAttention):
                 _nvalid = _nvalid_all[s:e]
                 _anyrow = None if _anyrow_all is None else _anyrow_all[s:e]
             else:
-                sel = _sel_all[s:e]
+                # Row-chunked construction instead of a full [T, topk] mask
+                # when the full-width budget is exceeded.
+                sel = ((pos_all[s:e, None] > last_tok[None, :]) if _arange_sel
+                       else (pos_all[s:e, None] > last_tok[topk_l[s:e]]))
                 _keep = sel_valid[s:e] if sel_valid is not None else None
                 if ib.shape[1] > 1 and not topk_distinct:
                     _ddk = L.first_occurrence_mask(ib)

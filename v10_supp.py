@@ -97,20 +97,45 @@ MASK_TOKEN_ID = 0  # <pad>：mask 模式的远端屏蔽填充 token（分布外�
 _CORRUPT_MODES = ('uniform', 'natural', 'mask', 'delete', 'span', 'doc', 'topical')
 
 
+_TOPICAL_SETS = {}
+_TOPICAL_DONORS = {}
+
+
+def _topical_row_sets(val_ids, n_far):
+    """Per-row unigram sets for one (panel, eval_len), built once per process."""
+    key = (id(val_ids), tuple(val_ids.shape), str(val_ids.dtype), int(n_far))
+    ent = _TOPICAL_SETS.get(key)
+    if ent is not None and ent[0] is val_ids:
+        return ent[1]
+    sets = [set(np.asarray(val_ids[r, :n_far], dtype=np.int64).tolist())
+            for r in range(val_ids.shape[0])]
+    if len(_TOPICAL_SETS) >= 2:
+        _TOPICAL_SETS.pop(next(iter(_TOPICAL_SETS)))
+    _TOPICAL_SETS[key] = (val_ids, sets)
+    return sets
+
+
 def _topical_donor(val_ids, jj, n_far, exclude):
     """Deterministic most-similar donor row for the `topical` mode.
 
     供体 = 与第 jj 行远端 unigram 集合 Jaccard 相似度最高的其他行（排除
     自身与 `exclude`）。纯整数/集合运算、无 RNG、无臂依赖——同一 (面板,
     行号) 在臂间给出同一供体，严格配对不受影响。平手时取行号最小者
-    （集合运算的确定性顺序）。"""
+    （集合运算的确定性顺序）。行集合与最终供体都按 (panel, eval_len)
+    缓存，跨 seed/variant/cell 复用。"""
+    _ck = (id(val_ids), tuple(val_ids.shape), str(val_ids.dtype), int(n_far),
+           tuple(sorted(int(_x) for _x in exclude)), int(jj))
+    _hit = _TOPICAL_DONORS.get(_ck)
+    if _hit is not None and _hit[0] is val_ids:
+        return _hit[1]
     rows = val_ids.shape[0]
-    _base = set(np.asarray(val_ids[jj, :n_far], dtype=np.int64).tolist())
+    _sets = _topical_row_sets(val_ids, n_far)
+    _base = _sets[jj]
     best, best_sim = None, -1.0
     for cand in range(rows):
         if cand == jj or cand in exclude:
             continue
-        _c = set(np.asarray(val_ids[cand, :n_far], dtype=np.int64).tolist())
+        _c = _sets[cand]
         if not _base and not _c:
             sim = 0.0
         else:
@@ -119,6 +144,9 @@ def _topical_donor(val_ids, jj, n_far, exclude):
             sim = (inter / union) if union else 0.0
         if sim > best_sim:
             best, best_sim = cand, sim
+    if len(_TOPICAL_DONORS) >= 65536:
+        _TOPICAL_DONORS.pop(next(iter(_TOPICAL_DONORS)))
+    _TOPICAL_DONORS[_ck] = (val_ids, best)
     return best
 
 

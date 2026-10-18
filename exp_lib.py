@@ -611,8 +611,9 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     # 闭式因果分位数按行分块；超限时 fail-fast（见下方 row_chunk）。
     n = sim.shape[-1]
     _rows_total = int(sim.shape[0]) if sim.dim() == 2 else 1
-    _row_chunk_est = max(1, (256 << 20) // max(n * n * 4, 1))
-    _peak_bytes = min(_rows_total, _row_chunk_est) * n * n * 16
+    _row_budget = 128 << 20
+    _row_chunk_est = max(1, _row_budget // max(n * n * 12, 1))
+    _peak_bytes = min(_rows_total, _row_chunk_est) * n * n * 12
     if _peak_bytes > 1 << 30:
         raise RuntimeError(
             'causal_adaptive_threshold 的因果分位数闭式为 O(rows·T²)，超出安全上限: '
@@ -632,16 +633,21 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     hi_c = (lo + 1).clamp(max=n - 1)[..., None]
     use_hi = (frac > 0.0) & (lo + 1 <= idx)
     first_row = idx == 0
-    # row chunking keeps the per-chunk sort input bounded.
-    row_chunk = max(1, (256 << 20) // max(n * n * 4, 1))
+    # row chunking keeps the per-chunk sort input bounded; the sort writes
+    # values back into `masked` and uses a reusable index scratch.
+    row_chunk = max(1, _row_budget // max(n * n * 12, 1))
+    _idx_scratch = torch.empty((row_chunk, n, n), device=x.device, dtype=torch.int64)
     out = torch.empty_like(x)
     for r0 in range(0, x.shape[0], row_chunk):
         b = min(row_chunk, x.shape[0] - r0)
         masked = torch.where(idx[None, None, :] <= idx[None, :, None],
                              x[r0:r0 + b, None, :], float('inf'))
-        srt = masked.sort(dim=-1).values
-        lo_v = srt.gather(-1, lo_c.expand(b, n, 1)).squeeze(-1)
-        hi_v = srt.gather(-1, hi_c.expand(b, n, 1)).squeeze(-1)
+        try:
+            torch.sort(masked, dim=-1, out=(masked, _idx_scratch[:b]))
+        except RuntimeError:
+            masked = masked.sort(dim=-1).values
+        lo_v = masked.gather(-1, lo_c.expand(b, n, 1)).squeeze(-1)
+        hi_v = masked.gather(-1, hi_c.expand(b, n, 1)).squeeze(-1)
         interp = lo_v * (1.0 - frac) + hi_v * frac
         oc = torch.where(use_hi, interp, lo_v)
         out[r0:r0 + b] = torch.where(first_row, torch.full_like(oc, float('-inf')), oc)
@@ -685,11 +691,13 @@ def _causal_donor(device, width):
     return (tri, dev_s)
 _IDX_CACHE = {}
 _IDX_CACHE_BYTES = 0
-_MASK_CACHE_BUDGET_BYTES = 192 << 20
+# One global byte budget for all mask/geometry tables: a larger T must evict
+# older tables rather than raise the process-wide ceiling (per-T budgets
+# multiplied by the number of eval lengths could pin several GB).
+_MASK_CACHE_BUDGET_BYTES = 256 << 20
 
 def _mask_budget(n):
-    # mask 表随 T 增长；上限随 T 放大，不影响任何值。
-    return max(_MASK_CACHE_BUDGET_BYTES, 6 * int(n) * int(n))
+    return _MASK_CACHE_BUDGET_BYTES
 
 def _cache_bytes(t):
     if t is None:
@@ -1098,6 +1106,47 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
 _POOL_PARTS_HOST = True
 _POOL_PARTS_BUCKET = 256
 _POOL_GEOM_BUCKET = 1024
+# Content-keyed host-geometry cache: dynamic block-ids objects are rebuilt
+# every forward, so the per-object cache cannot hit; identical cut tables
+# (e.g. repeated eval passes) can reuse the same read-only flats.
+_POOL_GEOM_CONTENT = {}
+_POOL_GEOM_CONTENT_BYTES = 64 << 20
+
+
+def _pool_geom_content_get(key):
+    return _POOL_GEOM_CONTENT.get(key) if key is not None else None
+
+
+def _pool_geom_content_put(key, value):
+    if key is None:
+        return value
+    _b = 0
+    try:
+        for _v in (value if isinstance(value, (tuple, list)) else (value,)):
+            if isinstance(_v, np.ndarray):
+                _b += int(_v.nbytes)
+            elif isinstance(_v, (tuple, list)):
+                _b += sum(int(_x.nbytes) for _x in _v if isinstance(_x, np.ndarray))
+    except Exception:
+        return value
+    if _b > _POOL_GEOM_CONTENT_BYTES:
+        return value
+    total = 0
+    for _v in _POOL_GEOM_CONTENT.values():
+        for _x in (_v if isinstance(_v, (tuple, list)) else (_v,)):
+            if isinstance(_x, np.ndarray):
+                total += int(_x.nbytes)
+            elif isinstance(_x, (tuple, list)):
+                total += sum(int(_y.nbytes) for _y in _x if isinstance(_y, np.ndarray))
+    while _POOL_GEOM_CONTENT and total + _b > _POOL_GEOM_CONTENT_BYTES:
+        _old = _POOL_GEOM_CONTENT.pop(next(iter(_POOL_GEOM_CONTENT)))
+        for _x in (_old if isinstance(_old, (tuple, list)) else (_old,)):
+            if isinstance(_x, np.ndarray):
+                total -= int(_x.nbytes)
+            elif isinstance(_x, (tuple, list)):
+                total -= sum(int(_y.nbytes) for _y in _x if isinstance(_y, np.ndarray))
+    _POOL_GEOM_CONTENT[key] = value
+    return value
 _NP_RANGE_CACHE = {}
 
 def _np_range(n):
@@ -1162,6 +1211,10 @@ def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
         counts_np = np.asarray(counts_l, dtype=np.int64)
         if counts_np.shape != (B,) or n <= 0:
             return None
+        _ck = ('p', counts_np.tobytes(), B, -1 if ov is None else int(ov), n, int(pad_to))
+        _hit = _pool_geom_content_get(_ck)
+        if _hit is not None:
+            return _hit
         ends_np = np.cumsum(counts_np, dtype=np.int64)
         nseg = 8 if ov is not None else 4
         total = nseg * B
@@ -1189,7 +1242,7 @@ def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
             np.maximum(flat[7 * B:8 * B], 0, out=flat[7 * B:8 * B])  # block 0 无 overlap：几何表自身保持非负
         if pad:
             flat[total:] = 0
-        return (flat, total)
+        return _pool_geom_content_put(_ck, (flat, total))
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
 
@@ -1238,6 +1291,10 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         counts_np = np.asarray(counts_l, dtype=np.int64)
         if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or pa_rows <= 0 or pb_rows <= 0:
             return None
+        _ck = ('v', counts_np.tobytes(), B, ov, n, max_len, W_b, pa_rows, pb_rows, int(pad_to))
+        _hit = _pool_geom_content_get(_ck)
+        if _hit is not None:
+            return _hit
         ends_np = np.cumsum(counts_np, dtype=np.int64)
         starts_np = ends_np - counts_np
         pos = _np_range(max_len)
@@ -1275,7 +1332,7 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
             pos_a[:] = pos
         else:
             np.minimum(pos, pa_rows - 1, out=pos_a)
-        return (flat_i, flat_b, n_a, n_b, W_b, max_len)
+        return _pool_geom_content_put(_ck, (flat_i, flat_b, n_a, n_b, W_b, max_len))
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
 
@@ -1322,6 +1379,10 @@ def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
         counts_np = np.asarray(counts_l, dtype=np.int64)
         if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or p_rows <= 0:
             return None
+        _ck = ('s', counts_np.tobytes(), B, n, max_len, p_rows, int(pad_to))
+        _hit = _pool_geom_content_get(_ck)
+        if _hit is not None:
+            return _hit
         ends_np = np.cumsum(counts_np, dtype=np.int64)
         starts_np = ends_np - counts_np
         pos = _np_range(max_len)
@@ -1339,7 +1400,7 @@ def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
             pos_a[:] = pos
         else:
             np.minimum(pos, p_rows - 1, out=pos_a)
-        return (flat_i, mask_np, n_g, max_len)
+        return _pool_geom_content_put(_ck, (flat_i, mask_np, n_g, max_len))
     except (RuntimeError, TypeError, ValueError, AttributeError):
         return None
 
@@ -2524,31 +2585,26 @@ class HybridAttention(nn.Module):
 
     def _full_batched(self, x):
         B, T, _ = x.shape
-        if x.device.type == 'cuda':
-            # Fused q/k/v projection (CUDA only — see _pre): each output
-            # column is an independent dot product over the input dim, so the
-            # sliced results are bit-identical to the three separate
-            # self.W_*(x) calls (the same row/column independence the
-            # pre-projection hoist relies on, design notes §6.1).
-            _nhq = self.nh * self.hd
-            if torch.is_grad_enabled():
-                _wqkv = torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0)
-            else:
-                # Key on versions, dtype and device of the source weights.
-                _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version,
-                        self.W_q.weight.dtype, self.W_k.weight.dtype, self.W_v.weight.dtype,
-                        self.W_q.weight.device)
-                _hit = self._wcat_cache.get('qkv')
-                if _hit is None or _hit[0] != _key:
-                    with torch.inference_mode(False):
-                        _hit = (_key, torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0))
-                    self._wcat_cache['qkv'] = _hit
-                _wqkv = _hit[1]
-            _qkv = F.linear(x, _wqkv)
+        # Fused q/k/v projection only on the eval path, where the
+        # concatenated weight is a cached constant.  Training keeps the three
+        # separate projections: a fresh cat per forward would add an
+        # [out, in] allocation per layer per step without changing any value.
+        _nhq = self.nh * self.hd
+        if x.device.type == 'cuda' and not torch.is_grad_enabled():
+            # Key on versions, dtype and device of the source weights.
+            _key = (self.W_q.weight._version, self.W_k.weight._version, self.W_v.weight._version,
+                    self.W_q.weight.dtype, self.W_k.weight.dtype, self.W_v.weight.dtype,
+                    self.W_q.weight.device)
+            _hit = self._wcat_cache.get('qkv')
+            if _hit is None or _hit[0] != _key:
+                with torch.inference_mode(False):
+                    _hit = (_key, torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], 0))
+                self._wcat_cache['qkv'] = _hit
+            _qkv = F.linear(x, _hit[1])
             q = _qkv[..., :_nhq].reshape(B, T, self.nh, self.hd)
             k = _qkv[..., _nhq:2 * _nhq].reshape(B, T, self.nh, self.hd)
             v = _qkv[..., 2 * _nhq:].reshape(B, T, self.nh, self.hd)
-            del _qkv, _wqkv
+            del _qkv
         else:
             q = self.W_q(x).view(B, T, self.nh, self.hd)
             k = self.W_k(x).view(B, T, self.nh, self.hd)
@@ -2644,7 +2700,10 @@ class HybridAttention(nn.Module):
         if cfg.kind == 'full':
             return None
         _want_idx = cfg.kind != 'hca' and cfg.indexer_mode != 'random'
-        if x.device.type != 'cuda':
+        # Training never builds the concatenated weight: it is only a cached
+        # constant on the eval path.  The separate projections produce the
+        # same independent output columns without the per-step cat.
+        if x.device.type != 'cuda' or torch.is_grad_enabled():
             pre['q'] = self.W_q(x)
             pre['Ca'] = x @ self.W_aKV
             pre['Cb'] = x @ self.W_bKV if self.W_bKV is not None else None
@@ -2682,17 +2741,14 @@ class HybridAttention(nn.Module):
         if _want_idx:
             _mats.append(self.W_DQ)
             _keys.append('qI')
-        if torch.is_grad_enabled():
-            _wcat = torch.cat([_m.t() for _m in _mats], dim=0)
-        else:
-            # Key on versions, dtype and device of the source weights.
-            _key = tuple(_m._version for _m in _mats) + tuple(_m.dtype for _m in _mats) + (_mats[0].device,)
-            _hit = self._wcat_cache.get('pre')
-            if _hit is None or _hit[0] != _key:
-                with torch.inference_mode(False):
-                    _hit = (_key, torch.cat([_m.t() for _m in _mats], dim=0))
-                self._wcat_cache['pre'] = _hit
-            _wcat = _hit[1]
+        # Key on versions, dtype and device of the source weights.
+        _key = tuple(_m._version for _m in _mats) + tuple(_m.dtype for _m in _mats) + (_mats[0].device,)
+        _hit = self._wcat_cache.get('pre')
+        if _hit is None or _hit[0] != _key:
+            with torch.inference_mode(False):
+                _hit = (_key, torch.cat([_m.t() for _m in _mats], dim=0))
+            self._wcat_cache['pre'] = _hit
+        _wcat = _hit[1]
         _fused = F.linear(x, _wcat)
         _off = 0
         for _k, _m in zip(_keys, _mats):
@@ -3476,13 +3532,38 @@ def _array_file_path(arr):
         seen.add(id(cur))
     return None
 
+def _cache_file_sigs(paths):
+    """size+mtime_ns signature for the files a cache entry is built from."""
+    out = {}
+    for _k, _p in paths.items():
+        try:
+            _st = os.stat(_p)
+            out[_k] = [int(_st.st_size), int(_st.st_mtime_ns)]
+        except OSError:
+            return None
+    return out
+
+
+def _cache_file_sigs_match(meta, sigs):
+    rec = meta.get('file_sigs') if isinstance(meta, dict) else None
+    return bool(sigs) and isinstance(rec, dict) and all(rec.get(_k) == _v for _k, _v in sigs.items())
+
+
+def _array_id_range(arr):
+    a = np.asarray(arr)
+    if a.size == 0:
+        return None
+    return [int(a.min()), int(a.max())]
+
+
 def _ids_fp(train_ids):
-    # Pure function of the token values, memoised on (data pointer,
-    # layout) with a strong ref to the array (so the keyed pointer can
-    # never be recycled while the entry lives).  Same tokens in -> same
-    # digest out, always.  Sub-int32 storage (the uint16 FineWeb cache) is
-    # hashed through its canonical int32 form, so a corpus keeps the same
-    # fingerprint regardless of storage width.
+    # Pure function of the token values, memoised on (data pointer, layout)
+    # with a weak reference to the array: a dead entry can never alias a
+    # recycled pointer, and large corpora are not pinned in RAM by the cache.
+    # Same tokens in -> same digest out, always.  Sub-int32 storage (the
+    # uint16 FineWeb cache) is hashed through its canonical int32 form, so a
+    # corpus keeps the same fingerprint regardless of storage width.
+    import weakref as _weakref
     try:
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
     except (AttributeError, TypeError):
@@ -3490,7 +3571,10 @@ def _ids_fp(train_ids):
     if _key is not None:
         _hit = _IDS_FP_MEMO.get(_key)
         if _hit is not None:
-            return _hit[1]
+            _arr = _hit[0]() if _hit[0] is not None else None
+            if _arr is train_ids:
+                return _hit[1]
+            _IDS_FP_MEMO.pop(_key, None)
     _path = _array_file_path(train_ids)
     _stat = None
     _side = None
@@ -3509,26 +3593,40 @@ def _ids_fp(train_ids):
                     and tuple(_rec.get('shape') or ()) == _tshape):
                 _fp = _rec['fp']
                 if _key is not None:
-                    if len(_IDS_FP_MEMO) >= _IDS_FP_MEMO_CAP:
+                    try:
+                        _ref = _weakref.ref(train_ids)
+                    except TypeError:
+                        _ref = None
+                    if len(_IDS_FP_MEMO) >= _IDS_FP_MEMO_CAP and _key not in _IDS_FP_MEMO:
                         _IDS_FP_MEMO.pop(next(iter(_IDS_FP_MEMO)))
-                    _IDS_FP_MEMO[_key] = (train_ids, _fp)
+                    _IDS_FP_MEMO[_key] = (_ref, _fp)
                 return _fp
         except (OSError, ValueError, TypeError):
             pass
     _h = hashlib.sha256()
-    _mv = np.ascontiguousarray(train_ids)
-    _widen = _mv.dtype in (np.dtype(np.uint8), np.dtype(np.uint16))
+    _arr = np.asarray(train_ids)
+    _widen = _arr.dtype in (np.dtype(np.uint8), np.dtype(np.uint16))
     _cs = 1 << 24
-    for _off in range(0, len(_mv), _cs):
-        _part = _mv[_off:_off + _cs]
+    # Hash in bounded chunks.  A C-contiguous int32/int64 array is consumed
+    # without copying the whole corpus; a non-contiguous view is made
+    # contiguous one chunk at a time (same C-order bytes as the old
+    # whole-array ascontiguousarray).
+    for _off in range(0, len(_arr), _cs):
+        _part = _arr[_off:_off + _cs]
         if _widen:
             _part = _part.astype(np.int32, copy=False)
-        _h.update(_part.data)
+        elif not _part.flags.c_contiguous:
+            _part = np.ascontiguousarray(_part)
+        _h.update(memoryview(_part).cast('B'))
     _fp = _h.hexdigest()[:16]
     if _key is not None:
-        if len(_IDS_FP_MEMO) >= _IDS_FP_MEMO_CAP:
+        try:
+            _ref = _weakref.ref(train_ids)
+        except TypeError:
+            _ref = None
+        if len(_IDS_FP_MEMO) >= _IDS_FP_MEMO_CAP and _key not in _IDS_FP_MEMO:
             _IDS_FP_MEMO.pop(next(iter(_IDS_FP_MEMO)))
-        _IDS_FP_MEMO[_key] = (train_ids, _fp)
+        _IDS_FP_MEMO[_key] = (_ref, _fp)
     if _side is not None and _stat is not None:
         try:
             _rec_out = {'size': _stat[0], 'mtime_ns': _stat[1], 'fp': _fp,
@@ -3557,7 +3655,8 @@ def _validate_token_ids(ids, vocab, label='token ids'):
     return arr
 
 
-def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=None):
+def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=None,
+                           fingerprints_trusted=False, ranges_trusted=False):
     """Reasons a cached (train, val) pair cannot be trusted.
 
     The metadata carries content fingerprints for BOTH sides.  Checking only
@@ -3573,7 +3672,7 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
         vocab = int(vocab)
     except (TypeError, ValueError):
         return ['metadata has no usable vocab size']
-    if meta.get('src_fp') != _ids_fp(train_ids):
+    if not fingerprints_trusted and meta.get('src_fp') != _ids_fp(train_ids):
         problems.append('train id fingerprint does not match the meta file')
     vb = np.asarray(val_batch)
     if vb.ndim != 2:
@@ -3584,13 +3683,14 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
         problems.append(f'validation sequence length {vb.shape[1]} != requested {seq_len}')
     if np.asarray(val_bnd).shape != vb.shape:
         problems.append(f'validation boundary mask shape {np.asarray(val_bnd).shape} != {vb.shape}')
-    if 'val_fp' in meta and meta.get('val_fp') != _ids_fp(vb.reshape(-1)):
+    if (not fingerprints_trusted and 'val_fp' in meta
+            and meta.get('val_fp') != _ids_fp(vb.reshape(-1))):
         problems.append('validation id fingerprint does not match the meta file')
     if meta.get('shuffle_at_split') is True:
         problems.append('metadata records a shuffled split; time/group order cannot be trusted')
     if meta.get('tokenizer_fit_split') not in (None, 'train'):
         problems.append(f"tokenizer was fitted on {meta.get('tokenizer_fit_split')!r}, not train")
-    if not problems:
+    if not problems and not ranges_trusted:
         for _arr, _label in ((train_ids, 'cached train_ids'), (vb, 'cached val_batch')):
             try:
                 _validate_token_ids(_arr, vocab, _label)
@@ -3601,6 +3701,44 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
 
 def _cache_warning(what, problems):
     print(f'[data] WARNING: the cached {what} cannot be verified ({"; ".join(problems)}) — REBUILDING it so a mixed/stale split is never silently served')
+
+
+_MEMO_MAX_BYTES = 1 << 30
+
+
+def _memmap_backed(v):
+    cur = v
+    for _ in range(16):
+        if isinstance(cur, np.memmap) or getattr(cur, 'filename', None) is not None:
+            return True
+        cur = getattr(cur, 'base', None)
+        if cur is None or cur is v:
+            return False
+    return False
+
+
+def _memo_value_bytes(v):
+    """Rough resident bytes of a memo value; memory-mapped arrays are free."""
+    if isinstance(v, np.ndarray):
+        if _memmap_backed(v):
+            return 0
+        return int(getattr(v, 'nbytes', 0) or 0)
+    if isinstance(v, (tuple, list)):
+        return sum(_memo_value_bytes(_x) for _x in v)
+    return 0
+
+
+def _memo_put(memo, key, value, cap_items, cap_bytes=_MEMO_MAX_BYTES):
+    """Insert under a byte budget plus the historical item cap (LRU order is
+    insertion order).  A single value larger than the budget is not cached."""
+    b = _memo_value_bytes(value)
+    if b > cap_bytes:
+        return False
+    total = sum(_memo_value_bytes(_v) for _v in memo.values())
+    while memo and (len(memo) >= int(cap_items) or total + b > cap_bytes):
+        total -= _memo_value_bytes(memo.pop(next(iter(memo))))
+    memo[key] = value
+    return True
 
 
 _WT103_MEMO = {}
@@ -3633,17 +3771,19 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         meta = json.load(open(me_path, encoding='utf-8'))
         val_batch = np.load(va_path)
         val_bnd = np.load(vp_path)
+        _sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path})
+        _fast = _cache_file_sigs_match(meta, _sigs)
         _problems = _cached_split_problems(meta, train_ids, val_batch, val_bnd,
-                                           meta.get('vocab'), seq_len=seq_len)
+                                           meta.get('vocab'), seq_len=seq_len,
+                                           fingerprints_trusted=_fast,
+                                           ranges_trusted=_fast)
         if _problems:
             _cache_warning('WikiText train/validation split', _problems)
         else:
             if 'val_fp' not in meta:
                 print('[data] NOTE: this is a legacy cache without a validation fingerprint; its file bytes are range/shape-checked but its split membership cannot be independently re-derived. New caches record val_fp.')
             _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
-            if len(_WT103_MEMO) >= _WT103_MEMO_CAP:
-                _WT103_MEMO.pop(next(iter(_WT103_MEMO)))
-            _WT103_MEMO[_mkey] = _out
+            _memo_put(_WT103_MEMO, _mkey, _out, _WT103_MEMO_CAP)
             return _out
     ds = local_wikitext_if_available(cache_dir)
     if ds is None:
@@ -3734,11 +3874,14 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             except OSError:
                 pass
             raise
+    _file_sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path})
     atomic_write_json(me_path, {
         'vocab': vocab,
         'src_fp': _ids_fp(train_ids),
         'val_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
         'fit_fp': fit_fp,
+        'file_sigs': _file_sigs,
+        'id_range': {'train': _array_id_range(train_ids), 'val': _array_id_range(val_batch)},
         'split_strategy': 'official_train_validation_test',
         'shuffle_at_split': False,
         'tokenizer_fit_split': 'train',
@@ -3831,7 +3974,9 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
         meta = json.load(open(me_path, encoding='utf-8'))
         test_bnd = np.load(tb_path)
         _problems = []
-        if meta.get('src_fp') != _ids_fp(test_ids):
+        _sigs = _cache_file_sigs({'test': te_path, 'bnd': tb_path})
+        _fast = _cache_file_sigs_match(meta, _sigs)
+        if not _fast and meta.get('src_fp') != _ids_fp(test_ids):
             _problems.append('test id fingerprint does not match the test meta file')
         if np.asarray(test_bnd).shape != np.asarray(test_ids).shape:
             _problems.append(f'test boundary mask shape {np.asarray(test_bnd).shape} != {np.asarray(test_ids).shape}')
@@ -3864,11 +4009,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
         if _problems:
             _cache_warning('WikiText test split', _problems)
         else:
-            _validate_token_ids(test_ids, meta['vocab'], 'cached test_ids')
+            if not _fast:
+                _validate_token_ids(test_ids, meta['vocab'], 'cached test_ids')
             out = (test_ids, meta['vocab'], None, test_bnd)
-            if len(_WT103_TEST_MEMO) >= _WT103_TEST_MEMO_CAP:
-                _WT103_TEST_MEMO.pop(next(iter(_WT103_TEST_MEMO)))
-            _WT103_TEST_MEMO[_mkey] = out
+            _memo_put(_WT103_TEST_MEMO, _mkey, out, _WT103_TEST_MEMO_CAP)
             return out
     # cold build: source the test rows (local dump first, HF otherwise)
     test_rows = None
@@ -3968,10 +4112,13 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
             except OSError:
                 pass
             raise
+    _file_sigs = _cache_file_sigs({'test': te_path, 'bnd': tb_path})
     atomic_write_json(me_path, {
         'vocab': vocab,
         'src_fp': _ids_fp(test_batch),
         'fit_fp': _text_fp(train_fit_rows),
+        'file_sigs': _file_sigs,
+        'id_range': {'test': _array_id_range(test_batch)},
         'split_strategy': 'official_dataset_test_split',
         'shuffle_at_split': False,
         'tokenizer_fit_split': 'train',
@@ -4171,7 +4318,9 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         print('[data] loading cached fineweb token ids ...')
         meta = json.load(open(me_path, encoding='utf-8'))
         train_ids = _npy_serve_int32(tr_path)
-        if meta.get('src_fp') != _ids_fp(train_ids):
+        _sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path})
+        _fast = _cache_file_sigs_match(meta, _sigs)
+        if not _fast and meta.get('src_fp') != _ids_fp(train_ids):
             print('[data] WARNING: the cached fineweb train_ids do not match the fingerprint in the meta file — the cache is corrupt or was mixed across builds; REBUILDING it')
         elif _local_sig is not None and meta.get('local_source_sig') != _local_sig:
             print('[data] WARNING: the local FineWeb-Edu stand-in source changed since this cache was built — REBUILDING the cache (a stale corpus must not keep its old fingerprint)')
@@ -4179,16 +4328,16 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             val_batch = np.load(va_path).astype(np.int64)
             val_bnd = np.load(vp_path)
             _problems = _cached_split_problems(meta, train_ids, val_batch, val_bnd,
-                                               meta.get('vocab'), seq_len=seq_len)
+                                               meta.get('vocab'), seq_len=seq_len,
+                                               fingerprints_trusted=_fast,
+                                               ranges_trusted=_fast)
             if _problems:
                 _cache_warning('FineWeb train/validation split', _problems)
             else:
                 if 'val_fp' not in meta:
                     print('[data] NOTE: this is a legacy FineWeb cache without a validation fingerprint; shape/range checks passed but split membership cannot be independently re-derived. New caches record val_fp.')
                 _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
-                if len(_FWEB_MEMO) >= _FWEB_MEMO_CAP:
-                    _FWEB_MEMO.pop(next(iter(_FWEB_MEMO)))
-                _FWEB_MEMO[_mkey] = _out
+                _memo_put(_FWEB_MEMO, _mkey, _out, _FWEB_MEMO_CAP)
                 return _out
     rows = _fineweb_rows(source)
     fit_text = []
@@ -4330,10 +4479,13 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 raise
         train_ids = _npy_serve_int32(tr_path)
         _validate_token_ids(train_ids, vocab, 'fineweb train_ids')
+        _file_sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path})
         atomic_write_json(me_path, {
             'vocab': vocab,
             'src_fp': _ids_fp(train_ids),
             'val_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
+            'file_sigs': _file_sigs,
+            'id_range': {'train': _array_id_range(train_ids), 'val': _array_id_range(val_batch)},
             'local_source_sig': _local_sig,
             'source': source,
             'fit_docs': fit_docs,
@@ -4350,9 +4502,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         }, indent=0)
         print('[data] cached fineweb token ids to disk (resume-safe)')
         _out = (train_ids, val_batch, vocab, tok, val_bnd)
-        if len(_FWEB_MEMO) >= _FWEB_MEMO_CAP:
-            _FWEB_MEMO.pop(next(iter(_FWEB_MEMO)))
-        _FWEB_MEMO[(os.path.abspath(cache_dir), tag, tuple((os.path.getsize(p), os.path.getmtime(p)) for p in (tr_path, va_path, vp_path, me_path)), _local_sig)] = _out
+        _memo_put(_FWEB_MEMO, (os.path.abspath(cache_dir), tag, tuple((os.path.getsize(p), os.path.getmtime(p)) for p in (tr_path, va_path, vp_path, me_path)), _local_sig), _out, _FWEB_MEMO_CAP)
         return _out
     finally:
         for _raw in (raw_train, raw_val):
@@ -4587,6 +4737,17 @@ _PINNED_HOST_CAP_BYTES = 4 << 30
 # 语料整份缓存的上限（见 batch_iter）；超出时按步暂存。
 _GPU_CORPUS_CACHE_BYTES = 64 << 20
 
+
+def _gpu_corpus_cache_fits(nbytes, device):
+    """Reserve the corpus cache only when it also fits the current free VRAM."""
+    if int(nbytes) > _GPU_CORPUS_CACHE_BYTES:
+        return False
+    try:
+        free, _total = torch.cuda.mem_get_info(device)
+        return int(nbytes) <= max(0, int(free) // 4)
+    except Exception:
+        return True
+
 def _ids_narrow(train_ids):
     # Token ids are bounded by the vocab (<= 2**31 for every corpus this repo
     # produces), so the cached copy (GPU, or pinned host staging) keeps its
@@ -4610,7 +4771,7 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     cached = _PINNED_HOST_CACHE.get('entry')
     if cached is not None and cached[0] is train_ids and cached[1].shape[0] == train_ids.shape[0]:
         host = cached[1]
-    elif device.type == 'cuda' and train_ids.nbytes <= _GPU_CORPUS_CACHE_BYTES:
+    elif device.type == 'cuda' and _gpu_corpus_cache_fits(train_ids.nbytes, device):
         try:
             host = torch.from_numpy(_ids_narrow(train_ids)).to(device)
             _PINNED_HOST_CACHE['entry'] = (train_ids, host)
@@ -8870,12 +9031,35 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
 
 _EVAL_TOKENS_PER_CHUNK = 1 << 17
 
+
+def _eval_adaptive_chunk(model, val_batch, device, chunk, _free_frac=0.5, _bytes_per_value=16):
+    """Bound an evaluation chunk by both token count and currently-free VRAM.
+
+    Rows are independent, so the partition changes no value; it only keeps a
+    long-sequence eval from launching a chunk whose dense activations cannot
+    fit.  The estimate is deliberately conservative (the model width times the
+    sequence length times a small activation multiplier)."""
+    rows = int(val_batch.shape[0])
+    T = int(val_batch.shape[1])
+    span = max(1, T - 1)
+    chunk = min(max(1, int(chunk)), max(1, _EVAL_TOKENS_PER_CHUNK // span))
+    if device.type == 'cuda' and rows > 0:
+        try:
+            free, _total = torch.cuda.mem_get_info(device)
+            d = int(model.tok.weight.shape[1])
+            per_row = max(1, T * d * 4 * int(_bytes_per_value))
+            chunk = min(chunk, max(1, int(free * float(_free_frac)) // per_row))
+        except Exception:
+            pass
+    return max(1, min(chunk, rows))
+
+
 @torch.inference_mode()
 def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, return_stats=False):
     # A chunk is a set of independent sequences (no cross-row op in the
     # model), so capping it by token count does not change any per-row value.
     _span = max(1, int(val_batch.shape[1]) - 1)
-    chunk = min(max(1, int(chunk)), max(1, _EVAL_TOKENS_PER_CHUNK // _span))
+    chunk = _eval_adaptive_chunk(model, val_batch, device, chunk)
     was_training = model.training
     model.eval()
     need_reg_layers = [blk.attn for blk in model.blocks if hasattr(blk.attn, 'need_reg')]
@@ -8925,23 +9109,23 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
             _vhost = torch.as_tensor(val_batch)
         _async = _vhost.is_pinned()
         _span = max(0, int(val_batch.shape[1]) - 1)
-        for i in range(0, val_batch.shape[0], chunk):
+
+        def _run_rows(i, cur):
+            nonlocal ntok, V, nll
             _lo = _hi = 0
             if _sel is not None:
                 # Host-side range count on the sorted selection: chunks with
-                # no sampled target contribute nothing to nll/ntok (the trunk's
-                # comp_reg side effect is unread in eval and overwritten by the
-                # next trunk).
+                # no sampled target contribute nothing to nll/ntok.
                 _base = i * _span
-                _wide = min(chunk, int(val_batch.shape[0]) - i) * _span
+                _wide = min(cur, int(val_batch.shape[0]) - i) * _span
                 if _wide > 0:
                     _lo = int(torch.searchsorted(_sel_host, _base))
                     _hi = int(torch.searchsorted(_sel_host, _base + _wide))
                 if _hi <= _lo:
-                    continue
+                    return
             elif _span == 0:
-                continue
-            ids = _vhost[i:i + chunk].to(device, non_blocking=_async)
+                return
+            ids = _vhost[i:i + cur].to(device, non_blocking=_async)
             # Trunk + per-slice LM head; comp_reg / need_reg handling is
             # identical to model(ids) because forward() itself is exactly
             # trunk() followed by head().
@@ -8983,6 +9167,29 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                 ntok += int(_tgts.numel())
                 del _tgts
             del ids, h
+
+        i = 0
+        _n_rows = int(val_batch.shape[0])
+        while i < _n_rows:
+            _cur = min(chunk, _n_rows - i)
+            _nll_snap = nll.clone()
+            _rn_snap = _row_nll.clone() if return_stats else None
+            _rt_snap = _row_ntok.clone() if return_stats else None
+            try:
+                _run_rows(i, _cur)
+            except RuntimeError as _oe:
+                nll.copy_(_nll_snap)
+                if return_stats:
+                    _row_nll.copy_(_rn_snap)
+                    _row_ntok.copy_(_rt_snap)
+                if ('out of memory' in str(_oe).lower()) and _cur > 1:
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    chunk = max(1, _cur // 2)
+                    print(f'[eval_ppl] device-memory exhaustion; retrying with chunk={chunk}')
+                    continue
+                raise
+            i += _cur
     finally:
         for _a, _prev in zip(need_reg_layers, need_reg_prior):
             _a.need_reg = _prev
@@ -9500,16 +9707,31 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
     if int(n_sample) < 1:
         raise ValueError(f'compression_report: n_sample must be >= 1, got {n_sample!r}; the report is an average over the sequences it scores, so there is nothing to measure with no sequence scored')
     n_used = min(n_sample, val_batch.shape[0])
-    _row_chunk = max(1, min(16, _EVAL_TOKENS_PER_CHUNK // max(seq_len, 1)))
+    _row_chunk = _eval_adaptive_chunk(model, np.asarray(val_batch), device,
+                                      min(16, _EVAL_TOKENS_PER_CHUNK // max(seq_len, 1)))
+    _row_chunk = max(1, min(_row_chunk, n_used))
     # inference_mode (the decorator) already covers the forward pass.  The
     # sampled sequences are independent, so the row grouping does not change
     # any value.
-    for _r0 in range(0, n_used, _row_chunk):
+    _r0 = 0
+    while _r0 < n_used:
+        _cur = min(_row_chunk, n_used - _r0)
         # as_tensor accepts numpy arrays AND torch tensors (eval_ppl already
         # uses it).
-        ids = torch.as_tensor(np.asarray(val_batch[_r0:min(_r0 + _row_chunk, n_used)])).to(device)
-        _ = model(ids, logits_tail=1)
+        ids = torch.as_tensor(np.asarray(val_batch[_r0:_r0 + _cur])).to(device)
+        try:
+            _ = model(ids, logits_tail=1)
+        except RuntimeError as _oe:
+            del ids
+            if ('out of memory' in str(_oe).lower()) and _cur > 1:
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                _row_chunk = max(1, _cur // 2)
+                print(f'[compression_report] device-memory exhaustion; retrying with row_chunk={_row_chunk}')
+                continue
+            raise
         del ids
+        _r0 += _cur
     # every dynamic layer's delta_logit (same scalars, same floats).
     _dl_layers = [(li, blk.attn.delta_logit) for li, blk in enumerate(model.blocks)
                   if blk.attn.cfg.dynamic and getattr(blk.attn, 'delta_logit', None) is not None]
@@ -9663,6 +9885,23 @@ def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len
     mode = 'mlp' if (has_gate or free >= (need * 3) // 4) else 'block'
     return mode, need
 
+_CURVE_MAX_POINTS = 200000
+
+
+def _curve_extend(dst, new):
+    dst.extend(new)
+    if len(dst) > 2 * _CURVE_MAX_POINTS:
+        _idx = np.linspace(0, len(dst) - 1, num=_CURVE_MAX_POINTS).round().astype(np.int64)
+        dst[:] = [dst[int(_i)] for _i in _idx]
+
+
+def _curve_append_point(dst, point):
+    dst.append(point)
+    if len(dst) > 2 * _CURVE_MAX_POINTS:
+        _idx = np.linspace(0, len(dst) - 1, num=_CURVE_MAX_POINTS).round().astype(np.int64)
+        dst[:] = [dst[int(_i)] for _i in _idx]
+
+
 def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False):
     if steps < 1:
         raise ValueError(f'train_variant needs steps >= 1, got steps={steps}')
@@ -9722,6 +9961,10 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 print(f'  [cap] HARD cap reached before step {step} - truncating; this run is NOT recorded (raise RUN_CAP and re-run to retry it)')
                 truncated = True
                 break
+            if device.type == 'cuda' and step and step % 256 == 0:
+                # Re-sample free memory periodically instead of freezing the
+                # chunk size from the state at cell start.
+                _attb_bump_epoch()
             base = lr_at(step)
             for g, _ls in zip(opt.param_groups, _lr_scales):
                 g['lr'] = base * _ls
@@ -9755,7 +9998,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             del loss, ce
             model.comp_reg = None
             if len(_lbuf) >= 512:
-                losses.extend(torch.stack(_lbuf).tolist())
+                _curve_extend(losses, torch.stack(_lbuf).tolist())
                 _lbuf.clear()
             if (step + 1) % 1024 == 0:
                 gc.collect()
@@ -9764,7 +10007,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 ppl_hist.append([step + 1, float(sub_ppl)])
             if log_every and (step % log_every == 0 or step == steps - 1):
                 if _lbuf:
-                    losses.extend(torch.stack(_lbuf).tolist())
+                    _curve_extend(losses, torch.stack(_lbuf).tolist())
                     _lbuf.clear()
                 _lv = float(losses[-1])
                 _dls = [(li, getattr(blk.attn, 'delta_logit', None)) for li, blk in enumerate(model.blocks)]
@@ -9773,7 +10016,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     # (no_grad: 纯读取 Parameter 的值做日志，不需要 autograd 节点)
                     with torch.no_grad():
                         for li, _v in zip([li for li, _ in _dls], torch.stack([dl for _, dl in _dls]).tolist()):
-                            delta_trace.setdefault(f'L{li}', []).append([step, float(_v)])
+                            _curve_append_point(delta_trace.setdefault(f'L{li}', []), [step, float(_v)])
                 print(f'  step {step:4d}  loss {_lv:.4f}  lr {opt.param_groups[0]['lr']:.2e}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
     finally:
         _CKPT['on'] = _ckpt_saved
@@ -9810,7 +10053,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         print(f'[{variant} seed={seed}] val PPL = {ppl:.3f}  (n_tok={_eval_stats["n_tokens"]}, nll={_eval_stats["nll_sum"]:.6f})')
         print(f'    block-length diagnostics: {json.dumps(stats, default=float)}')
     if _lbuf:
-        losses.extend(torch.stack(_lbuf).tolist())
+        _curve_extend(losses, torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
     result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
@@ -9903,6 +10146,28 @@ def _batch_arrays(batch, vocab=None):
             raise ValueError(f'overfit batch inputs span [{int(xv.min())}, {int(xv.max())}], outside vocab [0, {int(vocab)})')
     return x, y
 
+def _param_change_sample(model, max_per_tensor=4096):
+    """Small, deterministic per-tensor sample for the overfit probe.
+
+    Comparing a fixed small sample avoids duplicating the whole parameter
+    vector (and its grad) just to answer "did the optimizer move anything?".
+    The sample spans the tensor uniformly, including its first and last
+    element."""
+    parts = []
+    for p in model.parameters():
+        flat = p.detach().reshape(-1)
+        n = int(flat.numel())
+        if n == 0:
+            continue
+        if n <= max_per_tensor:
+            parts.append(flat)
+        else:
+            idx = torch.linspace(0, n - 1, steps=int(max_per_tensor),
+                                 device=flat.device).round().long()
+            parts.append(flat.index_select(0, idx))
+    return torch.cat(parts) if parts else torch.empty(0)
+
+
 def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256, train_ids=None, batch=None, ignore_index=None, device=None, target_loss=0.05, target_acc=0.99, mlp_ratio=None, grad_clip=1.0):
     """Small-batch overfit sanity check (necessary, not sufficient).
 
@@ -9969,7 +10234,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         mlp_ratio = variant_mlp_ratio(variant, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=seq_len, matched=PARAM_MATCHED | PARAM_MATCHED_V7)
     cfgs = make_layer_cfgs(n_layers, variant)
     model = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
-    _p_before = torch.cat([p.detach().reshape(-1) for p in model.parameters()]).clone()
+    _p_before = _param_change_sample(model).clone()
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, weight_decay=0.0, foreach=True)
     initial_loss, initial_acc = _lm_batch_metrics(model, x, y, vocab)
     loss_curve = []
@@ -10001,11 +10266,11 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
                 continue
             _gs.append(p.grad.detach())
         if _gs:
-            # Keep the per-tensor reductions on the device and read back a
-            # single scalar: the elementwise sums are the same.
-            _sq = torch.stack([g.double().pow(2).sum() for g in _gs])
-            grad_norm = math.sqrt(float(_sq.sum()))
-            grad_finite = bool(torch.stack([torch.isfinite(g).all() for g in _gs]).all())
+            # Per-tensor vector norms on the device; only scalars are read back
+            # and no full-size double copy of any gradient is made.
+            _norms = [float(torch.linalg.vector_norm(g)) for g in _gs]
+            grad_finite = all(math.isfinite(_x) for _x in _norms)
+            grad_norm = math.sqrt(math.fsum(_x * _x for _x in _norms)) if grad_finite else float('inf')
         else:
             grad_norm = 0.0
             grad_finite = False
@@ -10023,7 +10288,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         if _l != _l or not math.isfinite(_l):
             break
     final_loss, final_acc = _lm_batch_metrics(model, x, y, vocab)
-    _p_after = torch.cat([p.detach().reshape(-1) for p in model.parameters()])
+    _p_after = _param_change_sample(model)
     params_changed = not bool(torch.equal(_p_before, _p_after))
     best_loss = min(loss_curve) if loss_curve else float('nan')
     # A correct optimizer must also move the loss DOWN, not merely end below
@@ -11512,7 +11777,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                         rec['sanity_ref'] = 'overfit_sanity.json'
                     summary[key] = rec
                 return summary
-            locked_json_update(summary_path, _apply)
+            locked_json_update(summary_path, _apply, indent=1)
             if out.get('truncated'):
                 out['status'] = 'truncated'
                 log_experiment_event(outdir, {'kind': 'cell', 'run_id': _run_id, 'status': 'truncated', 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': code_stamp(), 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'steps_done': rec.get('steps_done'), 'reason': 'hard runtime cap reached; partial record not written'})
@@ -11536,7 +11801,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                     summary[key] = {'variant': v, 'seed': seed, 'error': _err_tb}
                     print(f'[{key}] FAILED: {_err}')
                 return summary
-            locked_json_update(summary_path, _apply_err)
+            locked_json_update(summary_path, _apply_err, indent=1)
             log_experiment_event(outdir, {'kind': 'cell', 'run_id': _run_id, 'status': 'error', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': code_stamp(), 'error': f'{_err}', 'traceback': _err_tb})
     finally:
         if guard is not None:

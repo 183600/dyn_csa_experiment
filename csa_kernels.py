@@ -1136,15 +1136,11 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     # 重置的 sf cast）。topk 行切片只以原 dtype 视图入清单，
     # int64 升型在头循环内按 chunk 现算（同批精确整数）；lt_sel 只用于
     # 构造 sel_ok，不入清单。
-    # 键值梯度碎片按头收集、逐头归约：dk/dv（或 dksw/dvsw）的键逐元素
-    # 相同、不含头维，段结构预建一次、全部头共用（见 _seg_structure）。
-    # 碎片按 (r,t,j) 全局行序直接写进 [R,T,·,hd] 扁平缓冲（同键条目的
-    # 相对顺序与逐 chunk 拼接+排序 flush 形式逐元素一致，排序序列与段和
-    # 不变），归约目标为逐头复用的 [R·Bm,hd] / [R·T,hd] 单 slab（段和逐头
-    # cast 进 dtype 出口行——与全头 fp32 累加后一次 cast 逐位一致）。
+    # 键值梯度按 (t-chunk, head) 立即归约：同一 chunk 内的键只构造这一次
+    # 段结构（与头无关），每个头算完就写进 [R·Bm,hd] / [R·T,hd] 的 fp32
+    # slab，不再为整段 T 保留 [R,T,topk|window,hd] 级别的碎片。跨 chunk 的
+    # 同键贡献按 chunk 顺序累加，确定性不变。
     lt_l = last_tok.to(torch.int64)
-    keyb = torch.empty((R, T, nb), device=dev, dtype=torch.int64) if (need_dkb or need_dvb) else None
-    keyw = torch.empty((R, T, w), device=dev, dtype=torch.int64) if (need_dksw or need_dvsw) else None
     chunks = []
     for t0 in range(0, T, tc):
         t1 = min(t0 + tc, T)
@@ -1159,21 +1155,19 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         # The window lanes never carry a soft prior; keep only the block
         # columns.
         soft_c = soft[:, t0:t1, :].to(torch.float32) if soft is not None else None
-        # 键基按需（int 精确）：(r,src)/窗口部分与 h 无关。
-        if keyb is not None:
-            keyb[:, t0:t1] = r_idx.expand(R, t1 - t0, nb) * Bm + src64
-        if keyw is not None:
-            keyw[:, t0:t1] = r_idx.expand(R, t1 - t0, w) * T + src_win
-        chunks.append((t0, t1, src32, src_win, lane_ok, soft_c, anyrow))
-    seg_b = _seg_structure(keyb.reshape(-1), R * Bm) if keyb is not None else None
-    seg_w = _seg_structure(keyw.reshape(-1), R * T) if keyw is not None else None
-    # The segment structures own their own permutation/segment tables; the key
-    # tables are no longer needed.
-    del keyb, keyw
-    dk_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dkb else None
-    dv_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dvb else None
-    dksw_frag = torch.empty((R, T, w, hd), device=dev, dtype=torch.float32) if need_dksw else None
-    dvsw_frag = torch.empty((R, T, w, hd), device=dev, dtype=torch.float32) if need_dvsw else None
+        # 段结构只依赖本 chunk 的整数键；键表本身在建完段后即可释放。
+        seg_b_c = None
+        if need_dkb or need_dvb:
+            kb_keys = r_idx.expand(R, t1 - t0, nb) * Bm + src64
+            seg_b_c = _seg_structure(kb_keys.reshape(-1), R * Bm)
+            del kb_keys
+        seg_w_c = None
+        if need_dksw or need_dvsw:
+            kw_keys = r_idx.expand(R, t1 - t0, w) * T + src_win
+            seg_w_c = _seg_structure(kw_keys.reshape(-1), R * T)
+            del kw_keys
+        chunks.append((t0, t1, src32, src_win, lane_ok, soft_c, anyrow,
+                       seg_b_c, seg_w_c))
     # 逐头归约出口（dtype）与头间复用的逐头 fp32 归约 slab。
     dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else None
     dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else None
@@ -1183,17 +1177,10 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     dv_slab = torch.zeros((R * Bm, hd), device=dev, dtype=torch.float32) if need_dvb else None
     dksw_slab = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if need_dksw else None
     dvsw_slab = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if need_dvsw else None
-
-    def _flush(h, frags, slabs, seg, outs):
-        # dk/dv（或 dksw/dvsw）键逐元素相同，共享同一次排序段和；段和写
-        # 进逐头 slab 的 seg_id 行（slab 每头清零——未被选择覆盖的行保持
-        # 零），随后逐头 cast 进 dtype 出口；None（未请求的梯度）跳过。
-        for frag, slab, out in zip(frags, slabs, outs):
-            if frag is None:
-                continue
-            slab.zero_()
-            _seg_apply(seg, frag.view(-1, hd), slab)
-            out[:, :, h, :] = slab.view(out.shape[0], out.shape[1], hd).to(dtype)
+    # 每个 (chunk, head) 的局部段和先写进 scratch，再按固定 chunk 顺序
+    # 加到逐头 slab；scratch 只占一个 chunk 的几何，不随 T 增长。
+    dk_scratch = torch.zeros((R * Bm, hd), device=dev, dtype=torch.float32) if (need_dkb or need_dvb) else None
+    dksw_scratch = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if (need_dksw or need_dvsw) else None
 
     for h in range(nh):
         q_h = q[:, :, h, :]
@@ -1202,7 +1189,11 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         kw_h = k_sw[:, :, h, :]
         vb_h = v_blk[:, :, h, :]
         vw_h = v_sw[:, :, h, :]
-        for (t0, t1, src32, src_win, lane_ok, soft_c, anyrow) in chunks:
+        for _slab in (dk_slab, dv_slab, dksw_slab, dvsw_slab):
+            if _slab is not None:
+                _slab.zero_()
+        for (t0, t1, src32, src_win, lane_ok, soft_c, anyrow,
+             seg_b_c, seg_w_c) in chunks:
             src_sel = src32.to(torch.int64)
             qh = q_h[:, t0:t1].to(torch.float32)
             dOh = dO_h[:, t0:t1].to(torch.float32)
@@ -1272,17 +1263,33 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 if scale != 1.0:
                     dkl.mul_(scale)
                 if need_dkb:
-                    dk_frag[:, t0:t1] = dkl[:, :, :nb]
+                    dk_scratch.zero_()
+                    _seg_apply(seg_b_c, dkl[:, :, :nb].reshape(-1, hd), dk_scratch)
+                    dk_slab.add_(dk_scratch)
                 if need_dksw:
-                    dksw_frag[:, t0:t1] = dkl[:, :, nb:]
+                    dksw_scratch.zero_()
+                    _seg_apply(seg_w_c, dkl[:, :, nb:].reshape(-1, hd), dksw_scratch)
+                    dksw_slab.add_(dksw_scratch)
+                del dkl
             if need_dvb or need_dvsw:
                 dvl = torch.einsum('rtm,rtd->rtmd', P_A_f, dOh)
                 if need_dvb:
-                    dv_frag[:, t0:t1] = dvl[:, :, :nb]
+                    dk_scratch.zero_()
+                    _seg_apply(seg_b_c, dvl[:, :, :nb].reshape(-1, hd), dk_scratch)
+                    dv_slab.add_(dk_scratch)
                 if need_dvsw:
-                    dvsw_frag[:, t0:t1] = dvl[:, :, nb:]
-        _flush(h, (dk_frag, dv_frag), (dk_slab, dv_slab), seg_b, (dk_blk, dv_blk))
-        _flush(h, (dksw_frag, dvsw_frag), (dksw_slab, dvsw_slab), seg_w, (dk_sw, dv_sw))
+                    dksw_scratch.zero_()
+                    _seg_apply(seg_w_c, dvl[:, :, nb:].reshape(-1, hd), dksw_scratch)
+                    dvsw_slab.add_(dksw_scratch)
+                del dvl
+        if dk_blk is not None:
+            dk_blk[:, :, h, :] = dk_slab.view(R, Bm, hd).to(dtype)
+        if dv_blk is not None:
+            dv_blk[:, :, h, :] = dv_slab.view(R, Bm, hd).to(dtype)
+        if dksw_slab is not None:
+            dk_sw[:, :, h, :] = dksw_slab.view(R, T, hd).to(dtype)
+        if dvsw_slab is not None:
+            dv_sw[:, :, h, :] = dvsw_slab.view(R, T, hd).to(dtype)
     return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)
 
 
