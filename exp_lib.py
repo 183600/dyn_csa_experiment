@@ -5217,6 +5217,11 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     pts = [p for p in pts if math.isfinite(p['scale']) and p['scale'] > 0.0 and p['effects']]
     pts.sort(key=lambda p: p['scale'])
     labels = [p['label'] for p in pts]
+    if len(set(labels)) != len(labels):
+        raise ValueError('scaling_trend needs unique scale labels; got %r' % (labels,))
+    for p in pts:
+        if len(set(p['seeds'])) != len(p['seeds']):
+            raise ValueError('scale point %r has duplicate seeds %r' % (p['label'], p['seeds']))
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'min_points': int(min_points),
            'n_points': len(pts), 'labels': labels,
            'scales': [p['scale'] for p in pts],
@@ -5257,11 +5262,19 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     complete = sorted([s for s, m in by_seed.items() if all(lb in m for lb in labels)], key=str)
     paired = {'n_complete_seeds': len(complete), 'seeds': complete, 'labels': labels}
     if len(complete) >= 2:
+        # A per-seed slope has exactly one observation per scale, so every
+        # scale point carries equal weight here.  Using the point-mean weights
+        # `n` (the number of seeds completed at each scale) would let a
+        # ragged seed-completion panel bias the paired slope toward the
+        # over-represented scale, which is exactly the confound this paired
+        # path exists to remove.
+        xbar_s = float(x.mean())
+        sxx_s = float(((x - xbar_s) ** 2).sum())
         slopes = []
         for s in complete:
             yy = np.asarray([by_seed[s][lb] for lb in labels], dtype=float)
-            yybar = float((n * yy).sum() / sw)
-            slopes.append(float((n * (x - xbar) * (yy - yybar)).sum() / sxx))
+            yybar = float(yy.mean())
+            slopes.append(float(((x - xbar_s) * (yy - yybar)).sum() / sxx_s))
         slopes = np.asarray(slopes, dtype=float)
         st = paired_effect_stats(slopes, alpha=alpha, min_n=min_seeds)
         tc = _t_critical(1.0 - float(alpha), len(slopes) - 1)

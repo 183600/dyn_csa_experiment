@@ -123,6 +123,25 @@ def t_paired_effect_resolution():
     assert r['resolution_limited'] is True, 'n=4 can never reach 0.05 (floor 0.125) — descriptive tier'
 
 
+def t_scaling_trend_ragged_pairs():
+    pts = [{'label': 'A', 'scale': 0.1, 'effects': [0.0, 1.0, 2.0, 3.0], 'seeds': [0, 1, 2, 3]},
+           {'label': 'B', 'scale': 1.0, 'effects': [1.0, 0.0], 'seeds': [0, 1]}]
+    r = L.scaling_trend(pts, min_seeds=2, min_points=2)
+    assert r['paired']['per_seed_slopes'] == {'0': 1.0, '1': -1.0}, r['paired']
+    assert r['paired']['slope_mean'] == 0.0, r['paired']
+    for bad in (
+        [{'label': 'A', 'scale': 1, 'effects': [1, 2], 'seeds': [0, 1]},
+         {'label': 'A', 'scale': 2, 'effects': [2, 3], 'seeds': [0, 1]}],
+        [{'label': 'A', 'scale': 1, 'effects': [1, 2], 'seeds': [0, 0]},
+         {'label': 'B', 'scale': 2, 'effects': [2, 3], 'seeds': [0, 1]}],
+    ):
+        try:
+            L.scaling_trend(bad, min_points=2)
+            raise AssertionError('duplicate labels/seeds must be rejected instead of mis-paired')
+        except ValueError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # B. v10 corruption modes
 # ---------------------------------------------------------------------------
@@ -1617,6 +1636,7 @@ def main():
     _check('A4 tost_paired directions', t_tost)
     _check('A5 exact_signflip baseline', t_exact_signflip_baseline)
     _check('A6 paired_effect resolution_limited', t_paired_effect_resolution)
+    _check('A6b scaling_trend ragged seed panels', t_scaling_trend_ragged_pairs)
     _check('B1 legacy modes bit-exact', t_legacy_modes_bitexact)
     _check('B2 determinism + target-zone safety', t_corruption_deterministic_and_paired)
     _check('B3 new modes span/doc/topical', t_new_modes_do_something)
