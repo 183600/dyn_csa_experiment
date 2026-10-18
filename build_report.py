@@ -1193,7 +1193,7 @@ def sec_flops():
     pick = {512, 2048, 8192, 65536, 1048576}
     _xo = d.get('crossover_seq_len_csa_beats_dense')
     _xo_txt = f'**seq = {_xo}**' if _xo is not None else '**不存在**（所测长度内 CSA 均不低于 dense）'
-    lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。**这些是结构性估算**；任何「效率优势」主张必须用 `audit_gates.measure_prefill_decode` 在真实 checkpoint 上测量后另行报告。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 {_xo_txt} 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
+    lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。**这些是结构性估算**；真实延迟/吞吐/显存见下文「Measured efficiency」一节（训练时已在固定 checkpoint 上实测，`prefix-prefill` 明确不是 KV-cache 增量 decode）。没有实测数字时，不得据本节宣称效率优势。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 {_xo_txt} 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
     for r in rows:
         if not isinstance(r, dict) or r.get('seq_len') not in pick:
             continue
@@ -1262,6 +1262,94 @@ def holm_adjust(named_pvals, alpha=0.05):
         out[name] = adj
     return out
 
+def _result_summaries():
+    out = {}
+    try:
+        names = sorted(os.listdir(REPO))
+    except OSError:
+        return out
+    for name in names:
+        if not name.startswith('results_') or not os.path.isdir(os.path.join(REPO, name)):
+            continue
+        s = summary(name)
+        if isinstance(s, dict) and s:
+            out[name] = s
+    return out
+
+
+def sec_training_health():
+    rows = []
+    for name, s in _result_summaries().items():
+        for key, rec in s.items():
+            if not isinstance(rec, dict):
+                continue
+            h = rec.get('curve_health')
+            if not isinstance(h, dict):
+                continue
+            rows.append((name, key, rec, h))
+    if not rows:
+        return ''
+    lines = ['## Training-curve health (train/validation gap, over/under-fitting)', '',
+             '> Diagnostic only. `best_val_ppl` / `best_step` are reported alongside the final number; they do not replace the pre-registered final-step endpoint.', '',
+             '| panel | cell | status | best PPL @ step | final PPL | final−best | tail train slope | tail val slope | gap | curve rows | last curve 95% CI |', '|---|---|---|---|---|---|---|---|---|---|---|']
+    for name, key, rec, h in rows[:200]:
+        _hist = rec.get('health_history') or []
+        _last = _hist[-1] if _hist else {}
+        _ci = ('[%s, %s]' % (fm(_last.get('val_ci95_low')), fm(_last.get('val_ci95_high')))) if _last else 'n/a'
+        lines.append('| %s | `%s` | %s | %s @ %s | %s | %s | %s | %s | %s | %s | %s |' % (
+            name, key, h.get('status'), fm(h.get('best_val_ppl')), h.get('best_step'),
+            fm(rec.get('ppl')), fm(h.get('final_minus_best')),
+            fm(h.get('train_ce_slope_per_step'), 6), fm(h.get('val_ce_slope_per_step'), 6),
+            fm(h.get('gap_last'), 4), rec.get('eval_subset_rows'), _ci))
+    lines += ['', '> `overfitting` = train CE falling while val CE rises; `underfitting_or_stalled` = neither falls; `nonfinite` = a NaN/Inf point was recorded (see the NaN diagnostics in the same record). Curve points use `eval_subset_rows` fixed documents while the final PPL uses the full fixed validation batch; the 95% CI is a document-level interval for the curve estimate, so small differences inside the interval are evaluation noise, not a mechanism effect.', '']
+    return '\n'.join(lines) + '\n'
+
+
+def sec_efficiency():
+    rows = []
+    for name, s in _result_summaries().items():
+        for key, rec in s.items():
+            if not isinstance(rec, dict):
+                continue
+            eff = rec.get('efficiency')
+            if not isinstance(eff, dict) or eff.get('status') != 'ok':
+                continue
+            rows.append((name, key, rec, eff))
+    if not rows:
+        return ''
+    lines = ['## Measured efficiency (not analytic FLOPs)', '',
+             '> Measured on the actual checkpoint/architecture with warmup + repeated runs. `prefix_prefill` is **not** incremental decode: the model has no KV cache, so each step re-runs the whole prefix.', '',
+             '| panel | cell | params (M) | prefill p50/p95 ms | tokens/s | prefix-prefill p50 ms | peak alloc MB | peak reserved MB |', '|---|---|---|---|---|---|---|---|']
+    for name, key, rec, eff in rows[:200]:
+        p = rec.get('params')
+        pm = (p / 1e6) if isinstance(p, (int, float)) else None
+        lines.append('| %s | `%s` | %s | %s / %s | %s | %s | %s | %s |' % (
+            name, key, fm(pm), fm(eff.get('prefill_ms_p50'), 2), fm(eff.get('prefill_ms_p95'), 2),
+            fm(eff.get('tokens_per_s_prefill'), 1), fm(eff.get('prefix_prefill_ms_p50'), 2),
+            fm(eff.get('peak_mem_allocated_mb'), 1), fm(eff.get('peak_mem_reserved_mb'), 1)))
+    # Simple Pareto frontier over (PPL, prefill p50): keep points that are not
+    # dominated by another measured arm.
+    _pts = []
+    for name, key, rec, eff in rows:
+        ppl = rec.get('ppl')
+        lat = eff.get('prefill_ms_p50')
+        if isinstance(ppl, (int, float)) and math.isfinite(ppl) and isinstance(lat, (int, float)) and math.isfinite(lat):
+            _pts.append((float(lat), float(ppl), name, key))
+    _pts.sort()
+    _frontier = []
+    _best_ppl = float('inf')
+    for lat, ppl, name, key in _pts:
+        if ppl < _best_ppl:
+            _best_ppl = ppl
+            _frontier.append((lat, ppl, name, key))
+    if _frontier:
+        lines += ['', '**Pareto frontier (lower PPL at no higher prefill latency)**:', '']
+        for lat, ppl, name, key in _frontier:
+            lines.append(f'- `{name}` / `{key}`: PPL {fm(ppl)}, prefill p50 {fm(lat, 2)} ms')
+    lines += ['', '> A PPL improvement should be read together with this table: a small gain that costs an order of magnitude more latency or memory is not a deployable improvement.', '']
+    return '\n'.join(lines) + '\n'
+
+
 def sec_stats():
     d = load(os.path.join(REPO, 'analysis_v7', 'stats.json'))
     if not d:
@@ -1309,7 +1397,7 @@ def main(argv=None):
         raise SystemExit(f'build_report: unknown argument {a!r} (this builder takes none; try -h)')
     parts = [sec_header(), '---\n']
     failed = []
-    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_stats):
+    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_efficiency, sec_stats):
         try:
             parts.append(sec())
         except Exception as e:

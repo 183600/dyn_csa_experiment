@@ -153,6 +153,212 @@ def code_stamp():
     return f'{CODE_SEMANTICS}{_kernel_stamp()}'
 
 
+# ---- 训练健康 / 数值防线 ---------------------------------------------------
+# `nan_to_num` 默认静默清洗数值异常。这里保留原有数值语义（逐位不变），
+# 但让调用点可以计数，并允许 CSA_STRICT_NAN=1 直接报错。元素级计数会强制
+# GPU 同步，所以默认只记调用次数；CSA_NAN_AUDIT=1 时才展开元素统计。
+_NAN_GUARD = {'calls': 0, 'elements_cleaned': 0, 'first': None, 'by_where': {}}
+_NAN_AUDIT_ELEMENTS = os.environ.get('CSA_NAN_AUDIT', '').strip().lower() in ('1', 'true', 'yes', 'on')
+_STRICT_NAN = os.environ.get('CSA_STRICT_NAN', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def nan_guard_state(reset=False):
+    out = {'calls': int(_NAN_GUARD['calls']),
+           'elements_cleaned': int(_NAN_GUARD['elements_cleaned']),
+           'first': _NAN_GUARD['first'],
+           'by_where': dict(_NAN_GUARD['by_where']),
+           'element_audit': bool(_NAN_AUDIT_ELEMENTS),
+           'strict': bool(_STRICT_NAN)}
+    if reset:
+        _NAN_GUARD.update({'calls': 0, 'elements_cleaned': 0, 'first': None, 'by_where': {}})
+    return out
+
+
+def _safe_nan_to_num(x, *, where='attention', **kwargs):
+    """`torch.nan_to_num` wrapper used by the attention paths.
+
+    Default behaviour is byte-identical to the historical call.  With
+    CSA_NAN_AUDIT=1 (or CSA_STRICT_NAN=1) the non-finite element count is
+    measured; strict mode raises with the call site instead of silently
+    changing attention semantics."""
+    _NAN_GUARD['calls'] += 1
+    _NAN_GUARD['by_where'][where] = int(_NAN_GUARD['by_where'].get(where, 0)) + 1
+    if _STRICT_NAN or _NAN_AUDIT_ELEMENTS:
+        try:
+            bad = ~torch.isfinite(x)
+            n_bad = int(bad.sum().item())
+        except Exception:
+            n_bad = 0
+        if n_bad:
+            _NAN_GUARD['elements_cleaned'] += n_bad
+            if _NAN_GUARD['first'] is None:
+                _NAN_GUARD['first'] = {'where': where, 'n_elements': n_bad}
+            if _STRICT_NAN:
+                raise FloatingPointError(f'non-finite values in {where}: {n_bad} element(s) would have been silently replaced by nan_to_num (CSA_STRICT_NAN=1)')
+    return torch.nan_to_num(x, **kwargs)
+
+
+def _finite_curve(values):
+    """Finite subset + non-finite bookkeeping for a loss/PPL curve."""
+    vals = list(values or [])
+    finite = []
+    first_bad = None
+    last_bad = None
+    for i, v in enumerate(vals):
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            fv = None
+        if fv is not None and math.isfinite(fv):
+            finite.append(fv)
+        elif first_bad is None:
+            first_bad = i
+        if fv is None or not math.isfinite(fv):
+            last_bad = i
+    return {'n_points': len(vals), 'n_finite': len(finite),
+            'n_nonfinite': len(vals) - len(finite),
+            'first_nonfinite_index': first_bad,
+            'last_nonfinite_index': last_bad,
+            'min': min(finite) if finite else None,
+            'max': max(finite) if finite else None,
+            'last': finite[-1] if finite else None}
+
+
+def _curve_slope(points, key, k=4):
+    """Least-squares slope over the last k FINITE points of a curve."""
+    pts = []
+    for p in (points or []):
+        if not isinstance(p, dict):
+            continue
+        try:
+            x = float(p.get('step'))
+            y = float(p.get(key))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(x) and math.isfinite(y):
+            pts.append((x, y))
+    pts = pts[-max(2, int(k)):]
+    if len(pts) < 2:
+        return None
+    n = len(pts)
+    mx = sum(x for x, _ in pts) / n
+    my = sum(y for _, y in pts) / n
+    den = sum((x - mx) ** 2 for x, _ in pts)
+    if den <= 0:
+        return None
+    return sum((x - mx) * (y - my) for x, y in pts) / den
+
+
+def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None):
+    """Classify a train/validation curve.
+
+    ``history`` is a list of dicts with ``step``, ``train_ce`` and either
+    ``val_ce`` or ``val_ppl``.  This is a diagnostic, not a model-selection
+    rule: it says whether the run looks overfit / underfit / stalled / broken
+    on the fixed evaluation grid.
+    """
+    entries = [h for h in (history or []) if isinstance(h, dict)]
+    n_bad = 0
+    for h in entries:
+        for key in ('train_ce', 'val_ce', 'val_ppl'):
+            if key in h:
+                try:
+                    v = float(h.get(key))
+                except (TypeError, ValueError):
+                    n_bad += 1
+                    continue
+                if not math.isfinite(v):
+                    n_bad += 1
+    train_s = _curve_slope(entries, 'train_ce', k=tail_k)
+    val_s = _curve_slope(entries, 'val_ce', k=tail_k)
+    val_ppl_points = []
+    for h in entries:
+        try:
+            st = int(h.get('step'))
+            vp = float(h.get('val_ppl'))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(vp) and vp > 0:
+            val_ppl_points.append((st, vp, h))
+    best = min(val_ppl_points, key=lambda t: t[1]) if val_ppl_points else None
+    last = val_ppl_points[-1] if val_ppl_points else None
+    last_gap = None
+    for h in reversed(entries):
+        try:
+            g = float(h.get('gap'))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(g):
+            last_gap = g
+            break
+    if n_bad:
+        status = 'nonfinite'
+        reason = f'{n_bad} non-finite curve point(s); inspect the first bad step before using this run'
+    elif len(entries) < 2 or train_s is None or val_s is None:
+        status = 'insufficient_data'
+        reason = 'fewer than two finite train/validation eval points; cannot classify'
+    elif train_s < -slope_tol and val_s > slope_tol:
+        status = 'overfitting'
+        reason = 'training CE is still falling while validation CE is rising'
+    elif train_s >= -slope_tol and val_s >= -slope_tol:
+        status = 'underfitting_or_stalled'
+        reason = 'neither training nor validation CE is decreasing in the tail'
+    elif train_s < -slope_tol and val_s <= slope_tol:
+        status = 'healthy'
+        reason = 'training CE is falling and validation CE is not rising'
+    else:
+        status = 'validation_degrading'
+        reason = 'validation CE is rising in the tail'
+    return {
+        'status': status,
+        'reason': reason,
+        'n_points': len(entries),
+        'n_nonfinite': int(n_bad),
+        'tail_k': int(tail_k),
+        'train_ce_slope_per_step': train_s,
+        'val_ce_slope_per_step': val_s,
+        'gap_last': last_gap,
+        'best_step': int(best[0]) if best is not None else None,
+        'best_val_ppl': float(best[1]) if best is not None else None,
+        'final_val_ppl': float(last[1]) if last is not None else None,
+        'final_minus_best': (float(last[1] - best[1]) if (best is not None and last is not None) else None),
+    }
+
+
+def _nll_doc_ci(nll_per_row, n_tokens_per_row):
+    """Approximate 95% CI for PPL from per-DOCUMENT NLL (not per-token).
+
+    Documents, not tokens, are the independent sampling unit; treating every
+    token as independent would make the interval look far narrower than the
+    actual evaluation-subset noise."""
+    doc_ce = []
+    total_nll = 0.0
+    total_tok = 0
+    for nll, ntok in zip(nll_per_row or [], n_tokens_per_row or []):
+        try:
+            nll = float(nll)
+            ntok = int(ntok)
+        except (TypeError, ValueError):
+            continue
+        if ntok <= 0 or not math.isfinite(nll):
+            continue
+        total_nll += nll
+        total_tok += ntok
+        doc_ce.append(nll / ntok)
+    if len(doc_ce) < 2 or total_tok <= 0:
+        return {'ppl': (math.exp(total_nll / total_tok) if total_tok else None),
+                'doc_ce_mean': None, 'doc_ce_sem': None,
+                'ppl_ci95_low': None, 'ppl_ci95_high': None, 'n_docs': len(doc_ce)}
+    mean = sum(doc_ce) / len(doc_ce)
+    var = sum((x - mean) ** 2 for x in doc_ce) / (len(doc_ce) - 1)
+    sem = math.sqrt(max(var, 0.0) / len(doc_ce))
+    ce = total_nll / total_tok
+    return {'ppl': math.exp(ce), 'doc_ce_mean': mean, 'doc_ce_sem': sem,
+            'ppl_ci95_low': math.exp(max(ce - 1.96 * sem, -700.0)),
+            'ppl_ci95_high': math.exp(min(ce + 1.96 * sem, 700.0)),
+            'n_docs': len(doc_ce)}
+
+
 # ---- G0 gate ---------------------------------------------------------------
 # The scale panels are only allowed to start after the kernel/eager
 # equivalence certificate exists and matches this code/env.  `m0_supp.py
@@ -2032,7 +2238,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         # softmax 的反向保存其输出，nan_to_num 必须出位（原地会改写保存值，
         # SoftmaxBackward 版本检查失败）；值与任何原地形式逐位相同。
         # The safe-count path uses the finite softmax directly.
-        sc = F.softmax(WinZ, dim=1) if _clean else torch.nan_to_num(F.softmax(WinZ, dim=1))
+        sc = F.softmax(WinZ, dim=1) if _clean else _safe_nan_to_num(F.softmax(WinZ, dim=1), where='block_pool')
         del WinZ, Zam, Zbm
         Xam = _take_2d(Xas, g_a[_b0:_b1])
         Xbm = _take_2d(Xbs, g_b[_b0:_b1])
@@ -2125,7 +2331,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         # per lane.
         WinZ.masked_fill_(~mask[_b0:_b1, :, None], float('-inf'))
         # 同 _pool_ordered：softmax 反向保存输出，nan_to_num 出位。
-        sc = F.softmax(WinZ, dim=1) if _clean else torch.nan_to_num(F.softmax(WinZ, dim=1))
+        sc = F.softmax(WinZ, dim=1) if _clean else _safe_nan_to_num(F.softmax(WinZ, dim=1), where='block_pool')
         comp[_b0:_b1] = (sc * Xb).sum(1)
         del WinZ, Xb, Zb, sc
     # same identity-order path as _pool_ordered: order[last_idx] over the
@@ -2444,7 +2650,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         # same story (its backward saves the output, as the out-of-place form).
         # nan_to_num 必须出位：exp_ 的反向保存其输出张量，原地 nan_to_num_ 会
         # 改写该保存值、使 ExpBackward 的版本检查失败（反向报错）。
-        soft[s:e] = torch.nan_to_num(c.gather(1, _ic.long()).sub_(_lse).exp_())
+        soft[s:e] = _safe_nan_to_num(c.gather(1, _ic.long()).sub_(_lse).exp_(), where='indexer_softmax')
         del c, _lse, _ic, _ccausal, _nccausal
     if _valid_parts is not None:
         out_valid[:] = [_valid_parts[0] if len(_valid_parts) == 1 else torch.cat(_valid_parts, 0)]
@@ -2536,14 +2742,14 @@ def _sink_log_normalizer(logits, sink_logits):
 
 def _sink_softmax_impl(logits, sink_logits, dim=-1):
     if sink_logits is None:
-        return torch.nan_to_num(torch.softmax(logits, dim))
-    lse = _sink_log_normalizer(logits, torch.nan_to_num(sink_logits))
-    return torch.nan_to_num((logits - lse).exp())
+        return _safe_nan_to_num(torch.softmax(logits, dim), where='sink_softmax')
+    lse = _sink_log_normalizer(logits, _safe_nan_to_num(sink_logits, where='sink_logit'))
+    return _safe_nan_to_num((logits - lse).exp(), where='sink_softmax')
 
 def _sink_split_softmax(logits, sink_logits, want_sink=True):
     if sink_logits is None:
         return (sink_softmax(logits, None, -1), None)
-    sink_logits = torch.nan_to_num(sink_logits)
+    sink_logits = _safe_nan_to_num(sink_logits, where='sink_split')
     lse = _sink_log_normalizer(logits, sink_logits)
     soft = (logits - lse).exp()
     if not want_sink:
@@ -3002,7 +3208,7 @@ class HybridAttention(nn.Module):
                 mask = causal_mask(T, x.device)
         else:
             mask = None
-        sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1) if self.sink is not None else None
+        sink_view = _safe_nan_to_num(self.sink, where='sink_param').view(1, self.nh, 1, 1) if self.sink is not None else None
         row_chunk = _full_attn_row_chunk(x.device, B, self.nh, T, q.element_size())
         # 训练时整段注意力循环包一层非重入 checkpoint：反向按同一份纯行划分
         # 重算，值/梯度不变。row_chunk 在运行内经 _ATB_EPOCH 不变，mask 是
@@ -5607,8 +5813,25 @@ def load_run_corpus(cfg):
         return load_fineweb_edu(cfg['seq_len'], cfg['n_train_tokens'], vocab_size=cfg.get('vocab_size', B_VOCAB), val_seqs=cfg.get('val_seqs', 512), cache_dir=cfg.get('cache_dir', './fineweb_cache'), source=cfg.get('fw_source', 'sample-10BT'), fit_docs=cfg.get('fw_fit_docs', 20000))
     raise ValueError(f"load_run_corpus: unknown dataset {name!r} (expected 'wikitext' or 'fineweb')")
 
+def _json_clean(obj):
+    """Recursively replace non-finite floats with null and make NumPy values
+    JSON-safe.  Standard JSON has no NaN/Infinity tokens; writing them makes a
+    damaged curve indistinguishable from a real value on strict parsers."""
+    if isinstance(obj, dict):
+        return {str(k): _json_clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_clean(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _json_clean(obj.tolist())
+    if isinstance(obj, np.generic):
+        return _json_clean(obj.item())
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    return obj
+
+
 def atomic_write_json(path, obj, indent=2):
-    text = json.dumps(obj, indent=indent, default=float)
+    text = json.dumps(_json_clean(obj), indent=indent, default=float, allow_nan=False)
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + '.', suffix='.tmp')
@@ -5750,7 +5973,7 @@ def append_jsonl(path, record):
     helper never swallows a partially written line (single write + flush)."""
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
-    line = json.dumps(_jsonable(record), sort_keys=True, ensure_ascii=False, default=float) + '\n'
+    line = json.dumps(_json_clean(_jsonable(record)), sort_keys=True, ensure_ascii=False, default=float, allow_nan=False) + '\n'
     try:
         import fcntl
     except ImportError:
@@ -11303,6 +11526,15 @@ def training_knobs_fingerprint(*, amp_dtype='auto', eager_batch='auto'):
                       ensure_ascii=True)
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:12]
 
+_CKPT_PEAK_MEMO = {}
+
+
+def _ckpt_geom_key(n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs, n_heads=8, d_head=32):
+    kinds = ','.join(str(getattr(c, 'kind', 'full')) for c in (cfgs or []))
+    return (hex(int(n_param)), int(n_layers), int(d), round(float(mlp_ratio), 4),
+            int(batch_size), int(seq_len), int(n_heads), int(d_head), kinds)
+
+
 def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs, n_heads=8, d_head=32):
     # Explicit CSA_CKPT always wins.  Otherwise, on a CUDA box, fall back to
     # activation recomputation when the estimated working set is large.  The
@@ -11358,6 +11590,13 @@ def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len
                 span = min(seq, 1024)
             extra += batch * 3 * nh * seq * span * 4
     need = act + int(extra) + 16 * int(n_param)
+    # Calibrate the analytic working-set estimate with the peak actually
+    # observed for the same geometry in this process.  A formula that
+    # under-estimates is the dangerous direction (it picks no recompute and
+    # then OOMs), so the calibration can only raise `need`.
+    _peak = _CKPT_PEAK_MEMO.get(_ckpt_geom_key(n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs, n_heads=n_heads, d_head=d_head))
+    if _peak:
+        need = max(need, int(_peak))
     if free >= need + need // 3:
         return None, need
     has_gate = any(getattr(c, 'chunking', '') == 'cosine_learnable' for c in cfgs)
@@ -11385,6 +11624,7 @@ def _write_cell_curve(outdir, key, rec):
     losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
     delta = rec.get('delta_trace') if isinstance(rec.get('delta_trace'), dict) else {}
     ph = rec.get('ppl_history') if isinstance(rec.get('ppl_history'), list) else []
+    diag = rec.get('opt_diag') if isinstance(rec.get('opt_diag'), dict) else {}
     move_ph = len(ph) > _CURVE_SIDECAR_INLINE_PPL
     payload = {}
     if losses:
@@ -11393,6 +11633,8 @@ def _write_cell_curve(outdir, key, rec):
         payload['delta_trace'] = delta
     if move_ph:
         payload['ppl_history'] = ph
+    if diag:
+        payload['opt_diag'] = diag
     if not payload:
         return None, losses, ph, move_ph
     rel = _curve_sidecar_rel(key)
@@ -11401,6 +11643,10 @@ def _write_cell_curve(outdir, key, rec):
     except Exception as _e:
         print(f'[track] WARNING: could not write curve sidecar {rel} ({type(_e).__name__}: {_e}); keeping this cell\'s curves inline')
         return None, losses, ph, False
+    if diag:
+        rec.pop('opt_diag', None)
+        rec['opt_diag_ref'] = rel
+        rec['opt_diag_n_points'] = len(diag.get('step') or [])
     return rel, losses, ph, move_ph
 
 
@@ -11487,7 +11733,160 @@ def _active_amp(device=None):
     return _amp_requested()
 
 
-def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False):
+def _is_finite_number(v):
+    return isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v)
+
+
+def _fixed_train_eval_batch(train_ids, seq_len, batch_size, device, seed):
+    """One deterministic batch used ONLY to measure training CE on a fixed
+    distribution.  It has its own RNG stream, so it cannot perturb the training
+    batch order."""
+    gen = batch_iter(train_ids, seq_len, batch_size, device, seed=int(seed) ^ 0x5F3759DF)
+    try:
+        return next(gen)
+    finally:
+        try:
+            gen.close()
+        except Exception:
+            pass
+
+
+def _check_token_batch(x, y, vocab, *, step=None):
+    """Fail fast on a corrupted batch before it reaches the model."""
+    for name, t in (('inputs', x), ('targets', y)):
+        if not torch.is_tensor(t):
+            raise TypeError(f'batch {name} is not a tensor (step={step})')
+        if t.ndim != 2 or t.numel() == 0:
+            raise ValueError(f'batch {name} must be a non-empty 2-D tensor, got shape {tuple(t.shape)} (step={step})')
+        if t.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+            raise TypeError(f'batch {name} must contain integer token ids, got {t.dtype} (step={step})')
+    if x.shape[0] != y.shape[0] or x.shape[1] != y.shape[1]:
+        raise ValueError(f'batch inputs/targets shape mismatch: {tuple(x.shape)} vs {tuple(y.shape)} (step={step})')
+    try:
+        lo = int(x.min().item())
+        hi = int(x.max().item())
+    except Exception:
+        return
+    if lo < 0 or hi >= int(vocab):
+        raise ValueError(f'batch token id range [{lo}, {hi}] outside vocab [0, {int(vocab)}) at step={step}')
+    if bool((y < 0).any().item()) or int(y.max().item()) >= int(vocab):
+        raise ValueError(f'batch target ids outside vocab [0, {int(vocab)}) at step={step}')
+
+
+def _params_all_finite(model):
+    for p in model.parameters():
+        if p.numel() and not bool(torch.isfinite(p).all().item()):
+            return False
+    return True
+
+
+def _atomic_torch_save(obj, path):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + '.', suffix='.tmp')
+    os.close(fd)
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _checkpoint_payload(model, *, variant, seed, step, val_ppl, train_ce, health, extra=None):
+    sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    payload = {'format': 'csa-analysis-ckpt-v1', 'variant': variant, 'seed': int(seed),
+               'step': int(step), 'val_ppl': val_ppl, 'train_ce_fixed': train_ce,
+               'curve_health': health, 'code': CKPT_CODE, 'sd': sd}
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _save_analysis_checkpoint(path, model, meta):
+    _atomic_torch_save(_checkpoint_payload(model, **meta), path)
+    size = None
+    sha = None
+    try:
+        size = os.path.getsize(path)
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        sha = h.hexdigest()
+    except OSError:
+        pass
+    return {'path': path, 'bytes': size, 'sha256': sha, 'step': int(meta.get('step') or 0)}
+
+
+def _percentile(vals, q):
+    xs = sorted(float(v) for v in vals if math.isfinite(float(v)))
+    if not xs:
+        return None
+    if len(xs) == 1:
+        return xs[0]
+    pos = (len(xs) - 1) * float(q)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return xs[lo]
+    return xs[lo] + (xs[hi] - xs[lo]) * (pos - lo)
+
+
+@torch.inference_mode()
+def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
+    """Measure real prefill / prefix-decode latency and peak memory.
+
+    There is no KV cache in the model, so the decode number is explicitly a
+    PREFIX-PREFILL measurement (it re-runs the whole prefix), not incremental
+    decode.  Results are reported as p50/p95 wall-clock plus tokens/s and
+    allocator peaks so a PPL gain can be compared with its actual cost."""
+    was = model.training
+    model.eval()
+    ids = torch.as_tensor(ids)
+    if ids.ndim == 1:
+        ids = ids[None, :]
+    ids = ids.to(device)
+    try:
+        for _ in range(max(0, int(warmup))):
+            model(ids)
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+        pre = []
+        for _ in range(max(1, int(iters))):
+            t0 = time.perf_counter()
+            model(ids)
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            pre.append((time.perf_counter() - t0) * 1000.0)
+        n_dec = min(max(1, int(decode_tokens)), max(1, int(ids.shape[1]) - 1))
+        dec = []
+        for t in range(max(1, int(ids.shape[1]) - n_dec), int(ids.shape[1]) + 1):
+            t0 = time.perf_counter()
+            model(ids[:, :t])
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            dec.append((time.perf_counter() - t0) * 1000.0)
+        out = {'status': 'ok', 'n_tokens': int(ids.shape[1]), 'batch': int(ids.shape[0]),
+               'prefill_ms_p50': _percentile(pre, 0.50), 'prefill_ms_p95': _percentile(pre, 0.95),
+               'prefix_prefill_ms_p50': _percentile(dec, 0.50),
+               'prefix_prefill_ms_p95': _percentile(dec, 0.95),
+               'tokens_per_s_prefill': (1000.0 * int(ids.shape[0]) * int(ids.shape[1]) / _percentile(pre, 0.50)) if _percentile(pre, 0.50) else None,
+               'decode_has_kv_cache': False,
+               'decode_metric': 'prefix_prefill (no KV cache; re-runs the whole prefix)'}
+        if device.type == 'cuda':
+            out['peak_mem_allocated_mb'] = torch.cuda.max_memory_allocated(device) / (1 << 20)
+            out['peak_mem_reserved_mb'] = torch.cuda.max_memory_reserved(device) / (1 << 20)
+        return out
+    finally:
+        model.train(was)
+
+
+def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False, save_ckpt=None, ckpt_dir=None, diag_every=None, measure_eff=False):
     if steps < 1:
         raise ValueError(f'train_variant needs steps >= 1, got steps={steps}')
     set_seed(seed)
@@ -11498,11 +11897,19 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     _scaler = torch.amp.GradScaler('cuda', enabled=(_amp == 'fp16')) if _amp is not None else None
     if _amp is not None:
         print(f'[amp] training autocast dtype={_amp} grad_scaler={_amp == "fp16"} (fp32 master weights)')
+    _save_mode = str(save_ckpt or '').strip().lower()
+    if _save_mode not in ('', 'none', 'off', '0', 'best', 'final', 'both'):
+        print(f'[ckpt] ignoring unknown save_ckpt={save_ckpt!r} (use best/final/both/none)')
+        _save_mode = ''
+    if _save_mode in ('none', 'off', '0'):
+        _save_mode = ''
+    _nan_events = []
     _rank, _world, _dist = (0, 1, False)
     if distributed:
         _rank, _world, _dist = distributed_info()
         if not _dist:
             raise RuntimeError('train_variant(distributed=True) needs a torchrun WORLD_SIZE > 1 launch')
+    nan_guard_state(reset=True)
     if variant in PARAM_MATCHED | PARAM_MATCHED_V7 and float(mlp_ratio) == 4.0:
         raise ValueError(f'{variant} is a PARAM-MATCHED baseline but was given the default mlp_ratio=4; its MLP must be widened to match its sparse reference arm, or the comparison is not parameter-controlled. Pass mlp_ratio=variant_mlp_ratio(variant, vocab, d=..., n_layers=..., n_heads=..., d_head=..., seq_len=...).')
     cfgs = make_layer_cfgs(n_layers, variant)
@@ -11543,6 +11950,36 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     bpe = batch_iter(train_ids, seq_len, batch_size, device,
                      seed=(seed + _rank if _dist else seed))
     _eval_batch = val_batch[:eval_subset] if val_batch is not None else None
+    _eval_subset_fp = _ids_fp(np.ascontiguousarray(np.asarray(_eval_batch)).reshape(-1)) if _eval_batch is not None else None
+    _fixed_eval = None
+    if eval_every and train_ids is not None and int(eval_every) > 0:
+        try:
+            _fixed_eval = _fixed_train_eval_batch(train_ids, seq_len, batch_size, device, seed)
+        except Exception as _fe:
+            print(f'[health] WARNING: could not build the fixed train-eval batch ({type(_fe).__name__}: {_fe}); training CE will not be tracked')
+            _fixed_eval = None
+    _diag_stride = max(1, int(diag_every) if diag_every else max(1, int(steps) // 1000))
+    _diag = {'step': [], 'ce': [], 'total_loss': [], 'comp_reg': [], 'boundary_pg': [],
+             'grad_norm_pre_clip': [], 'update_norm': [], 'lr': [], 'clipped': [],
+             'update_skipped': [], 'amp_scale': []}
+    _diag_events = {}
+    _clip_steps = 0
+    _skipped_steps = 0
+    _nonfinite_loss_steps = 0
+    _nonfinite_grad_steps = 0
+    _first_bad_step = None
+    _scaler_overflows = 0
+    _scaler_scale_min = None
+    _best_val_ppl = None
+    _best_step = None
+    _checkpoints = {}
+    _health_history = []
+    _last_train_ce = None
+    if device.type == 'cuda':
+        try:
+            torch.cuda.reset_peak_memory_stats(device)
+        except Exception:
+            pass
     t0 = time.time()
     losses = []
     _lbuf = []
@@ -11588,6 +12025,27 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         except Exception:
             print(f'[ckpt] auto mode={_auto_ckpt} estimated_working_set={(_auto_need or 0) / (1 << 30):.2f}GiB')
     _ckpt_effective = _CKPT['on']
+
+    def _do_save(tag, step_no, val_ppl, train_ce):
+        if not _save_mode or not ckpt_dir:
+            return
+        if tag == 'best' and _save_mode not in ('best', 'both'):
+            return
+        if tag == 'final' and _save_mode not in ('final', 'both'):
+            return
+        try:
+            path = os.path.join(ckpt_dir, f'{variant}_seed{seed}_{tag}.pt')
+            _h = classify_training_health(_health_history)
+            _checkpoints[tag] = _save_analysis_checkpoint(path, _inner_model, {
+                'variant': variant, 'seed': seed, 'step': step_no,
+                'val_ppl': val_ppl, 'train_ce': train_ce, 'health': _h,
+                'extra': {'train_fp': _ids_fp(train_ids),
+                          'eval_fp': _ids_fp(np.ascontiguousarray(np.asarray(val_batch)).reshape(-1)) if val_batch is not None else None,
+                          'rng_fp': _rng_fp, 'params': int(n_param)}})
+            print(f'  [ckpt] saved {tag} checkpoint {path} (step={step_no}, val_ppl={val_ppl})')
+        except Exception as _se:
+            print(f'[ckpt] WARNING: could not save {tag} checkpoint ({type(_se).__name__}: {_se}); the run continues, but this weight is unavailable for post-hoc analysis')
+
     if _gc_relief:
         gc.disable()
     try:
@@ -11603,6 +12061,19 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             for g, _ls in zip(opt.param_groups, _lr_scales):
                 g['lr'] = base * _ls
             x, y = next(bpe)
+            if step == 0 or step % max(1, int(steps) // 100) == 0:
+                try:
+                    _check_token_batch(x, y, vocab, step=step + 1)
+                except (TypeError, ValueError) as _be:
+                    raise RuntimeError(f'[data] bad training batch at step {step + 1}: {_be}') from _be
+            _comp_item = float('nan')
+            _pg_item = 0.0
+            _loss_item = float('nan')
+            _gn_pre = None
+            _gn_post = None
+            _update_norm = None
+            _is_diag_step = (step % _diag_stride == 0 or step == steps - 1)
+            _step_ok = True
             with torch.autocast(device_type='cuda', dtype=(_amp_dtype or torch.bfloat16),
                                 enabled=(_amp is not None)):
                 # Go through the (possibly DDP-wrapped) module's forward so
@@ -11611,6 +12082,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 # DistributedDataParallel does not proxy them.
                 ce = model(x, targets=y, vocab=vocab)
                 del x, y
+                _ce_item = float(ce.detach().item())
+                _comp = getattr(_inner_model, 'comp_reg', None)
+                _comp_item = float(_comp.detach().item()) if _comp is not None else 0.0
                 _blp = getattr(_inner_model, 'boundary_logp', None)
                 if _blp is not None:
                     # REINFORCE: the hard cuts are sampled in the forward pass; this
@@ -11619,23 +12093,105 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     # baseline to reduce variance; decisions are normalised so the
                     # coefficient does not scale with sequence length or depth.
                     # This is the only arm that reads the running CE baseline.
-                    _ce_item = float(ce.detach().item())
                     _adv = _ce_item - float(_ce_baseline)
                     _bdec = max(int(getattr(_inner_model, 'boundary_decisions', 0) or 0), 1)
-                    loss = ce + comp_lambda * _inner_model.comp_reg + BOUNDARY_PG_COEF * (-_adv * _blp / _bdec)
+                    _pg = -_adv * _blp / _bdec
+                    _pg_item = float(_pg.detach().item())
+                    loss = ce + comp_lambda * _inner_model.comp_reg + BOUNDARY_PG_COEF * _pg
                     _ce_baseline = 0.99 * float(_ce_baseline) + 0.01 * _ce_item
                 else:
                     loss = ce + comp_lambda * _inner_model.comp_reg
-            if _scaler is not None:
+                _loss_item = float(loss.detach().item())
+            if _dist and _world > 1:
+                # Every rank must take the same branch: skipping backward on
+                # one rank while another enters DDP's gradient collective
+                # deadlocks the job.
+                _ok_t = torch.tensor([1 if math.isfinite(_loss_item) else 0], dtype=torch.int32, device=device)
+                torch.distributed.all_reduce(_ok_t, op=torch.distributed.ReduceOp.MIN)
+                _step_ok = bool(int(_ok_t.item()))
+            if not math.isfinite(_loss_item):
+                _step_ok = False
+                _skipped_steps += 1
+                _nonfinite_loss_steps += 1
+                if _first_bad_step is None:
+                    _first_bad_step = step + 1
+                _nan_events.append({'step': step + 1, 'kind': 'loss', 'loss': _loss_item,
+                                    'ce': _ce_item, 'comp_reg': _comp_item,
+                                    'boundary_pg': _pg_item, 'lr': base})
+                print(f'  [nan] non-finite loss at step {step + 1} (ce={_ce_item}, comp={_comp_item}, pg={_pg_item}); skipping the optimizer update')
+                opt.zero_grad(set_to_none=True)
+            elif _scaler is not None:
+                _scale_before = float(_scaler.get_scale())
                 _scaler.scale(loss).backward()
                 _scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-                _scaler.step(opt)
-                _scaler.update()
+                _gn = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                _gn_pre = float(_gn.detach().item()) if torch.is_tensor(_gn) else float(_gn)
+                if _dist and _world > 1:
+                    _gok = torch.tensor([1 if math.isfinite(_gn_pre) else 0], dtype=torch.int32, device=device)
+                    torch.distributed.all_reduce(_gok, op=torch.distributed.ReduceOp.MIN)
+                    _grad_ok = bool(int(_gok.item()))
+                else:
+                    _grad_ok = math.isfinite(_gn_pre)
+                if not _grad_ok:
+                    _step_ok = False
+                    _skipped_steps += 1
+                    _nonfinite_grad_steps += 1
+                    if _first_bad_step is None:
+                        _first_bad_step = step + 1
+                    _nan_events.append({'step': step + 1, 'kind': 'grad', 'grad_norm': _gn_pre,
+                                        'loss': _loss_item, 'ce': _ce_item, 'amp_scale': _scale_before,
+                                        'lr': base})
+                    print(f'  [nan] non-finite gradient norm at step {step + 1}; zeroing grads and skipping the update')
+                    opt.zero_grad(set_to_none=True)
+                else:
+                    _gn_post = min(_gn_pre, float(GRAD_CLIP_NORM))
+                    _clip_steps += int(_gn_pre > GRAD_CLIP_NORM)
+                    _ub = _param_change_sample(_inner_model, max_per_tensor=256).clone() if _is_diag_step else None
+                    _scaler.step(opt)
+                    _scaler.update()
+                    if _ub is not None:
+                        try:
+                            _update_norm = float((_param_change_sample(_inner_model, max_per_tensor=256) - _ub).norm().item())
+                        except Exception:
+                            _update_norm = None
+                _scale_after = float(_scaler.get_scale())
+                _scaler_scale_min = _scale_after if _scaler_scale_min is None else min(_scaler_scale_min, _scale_after)
+                if _scale_after < _scale_before:
+                    _scaler_overflows += 1
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-                opt.step()
+                _gn = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                _gn_pre = float(_gn.detach().item()) if torch.is_tensor(_gn) else float(_gn)
+                if _dist and _world > 1:
+                    _gok = torch.tensor([1 if math.isfinite(_gn_pre) else 0], dtype=torch.int32, device=device)
+                    torch.distributed.all_reduce(_gok, op=torch.distributed.ReduceOp.MIN)
+                    _grad_ok = bool(int(_gok.item()))
+                else:
+                    _grad_ok = math.isfinite(_gn_pre)
+                if not _grad_ok:
+                    _step_ok = False
+                    _skipped_steps += 1
+                    _nonfinite_grad_steps += 1
+                    if _first_bad_step is None:
+                        _first_bad_step = step + 1
+                    _nan_events.append({'step': step + 1, 'kind': 'grad', 'grad_norm': _gn_pre,
+                                        'loss': _loss_item, 'ce': _ce_item, 'lr': base})
+                    print(f'  [nan] non-finite gradient norm at step {step + 1}; zeroing grads and skipping the update')
+                    opt.zero_grad(set_to_none=True)
+                else:
+                    _gn_post = min(_gn_pre, float(GRAD_CLIP_NORM))
+                    _clip_steps += int(_gn_pre > GRAD_CLIP_NORM)
+                    _ub = _param_change_sample(_inner_model, max_per_tensor=256).clone() if _is_diag_step else None
+                    opt.step()
+                    if _ub is not None:
+                        try:
+                            _update_norm = float((_param_change_sample(_inner_model, max_per_tensor=256) - _ub).norm().item())
+                        except Exception:
+                            _update_norm = None
+            if _step_ok and step % 256 == 0 and not _params_all_finite(_inner_model):
+                _nan_events.append({'step': step + 1, 'kind': 'param', 'loss': _loss_item,
+                                    'grad_norm': _gn_pre, 'lr': base})
+                raise FloatingPointError(f'non-finite parameter values after step {step + 1}; aborting instead of training on corrupted weights')
             # Gradients are not needed after the update.
             opt.zero_grad(set_to_none=True)
             _ce_d = ce.detach()
@@ -11648,11 +12204,48 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             _inner_model.comp_reg = None
             if len(_lbuf) >= 512:
                 _flush_loss_buffer()
+            if step % _diag_stride == 0 or step == steps - 1 or not _step_ok:
+                _diag_events[step + 1] = {'step': step + 1, 'ce': _ce_item, 'total_loss': _loss_item,
+                                          'comp_reg': _comp_item, 'boundary_pg': _pg_item,
+                                          'grad_norm_pre_clip': _gn_pre, 'update_norm': _update_norm,
+                                          'lr': base,
+                                          'clipped': bool(_gn_pre is not None and math.isfinite(_gn_pre) and _gn_pre > GRAD_CLIP_NORM),
+                                          'update_skipped': (not _step_ok),
+                                          'amp_scale': (float(_scaler.get_scale()) if _scaler is not None else None)}
+                for _k in _diag:
+                    _diag[_k].append(_diag_events[step + 1].get(_k))
             if (step + 1) % 1024 == 0:
                 gc.collect()
-            if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
-                sub_ppl = eval_ppl(_inner_model, _eval_batch, device)
-                ppl_hist.append([step + 1, float(sub_ppl)])
+            if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
+                if val_batch is not None:
+                    _sub_stats = eval_ppl(_inner_model, _eval_batch, device, return_stats=True)
+                    sub_ppl = float(_sub_stats.get('ppl', float('nan')))
+                    ppl_hist.append([step + 1, sub_ppl])
+                    _ci = _nll_doc_ci(_sub_stats.get('nll_per_row'), _sub_stats.get('n_tokens_per_row'))
+                else:
+                    sub_ppl = float('nan')
+                    _ci = {'ppl': None, 'doc_ce_sem': None, 'ppl_ci95_low': None,
+                           'ppl_ci95_high': None, 'n_docs': 0}
+                _train_ce = float('nan')
+                if _fixed_eval is not None:
+                    try:
+                        _train_ce, _train_acc = _lm_batch_metrics(_inner_model, _fixed_eval[0], _fixed_eval[1], vocab)
+                    except Exception as _te:
+                        print(f'[health] WARNING: fixed train-CE evaluation failed ({type(_te).__name__}: {_te})')
+                _last_train_ce = _train_ce if math.isfinite(_train_ce) else _last_train_ce
+                _val_ce = math.log(sub_ppl) if (_is_finite_number(sub_ppl) and sub_ppl > 0) else float('nan')
+                _entry = {'step': step + 1, 'val_ppl': sub_ppl, 'val_ce': _val_ce,
+                          'train_ce': _train_ce,
+                          'gap': (_val_ce - _train_ce) if (math.isfinite(_val_ce) and math.isfinite(_train_ce)) else None,
+                          'val_ci95_low': _ci.get('ppl_ci95_low'),
+                          'val_ci95_high': _ci.get('ppl_ci95_high'),
+                          'val_doc_ce_sem': _ci.get('doc_ce_sem'),
+                          'val_n_docs': _ci.get('n_docs')}
+                _health_history.append(_entry)
+                if _is_finite_number(sub_ppl) and sub_ppl > 0 and (_best_val_ppl is None or sub_ppl < _best_val_ppl):
+                    _best_val_ppl = sub_ppl
+                    _best_step = step + 1
+                    _do_save('best', step + 1, sub_ppl, _last_train_ce)
             if log_every and (step % log_every == 0 or step == steps - 1):
                 if _lbuf:
                     _flush_loss_buffer()
@@ -11664,7 +12257,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     with torch.no_grad():
                         for li, _v in zip([li for li, _ in _dls], torch.stack([dl for _, dl in _dls]).tolist()):
                             _curve_append_point(delta_trace.setdefault(f'L{li}', []), [step, float(_v)])
-                print(f'  step {step:4d}  loss {_lv:.4f}  lr {opt.param_groups[0]['lr']:.2e}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
+                _gn_txt = f'{_gn_pre:.3g}' if (_gn_pre is not None and math.isfinite(_gn_pre)) else 'n/a'
+                print(f'  step {step:4d}  loss {_lv:.4f}  ce {_ce_item:.4f}  comp {_comp_item:.3g}  grad {_gn_txt}  lr {opt.param_groups[0]['lr']:.2e}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
     except BaseException:
         # Best-effort distributed cleanup: if one rank fails mid-step the
         # others can otherwise block forever in the next collective/barrier.
@@ -11725,7 +12319,62 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if _lbuf:
         _flush_loss_buffer()
     losses = [float(v) for v in losses]
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world, 'train_time_s': wall, 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
+    _curve_summary = _finite_curve(losses)
+    _tail_list = [float(v) for v in _tail if _is_finite_number(v)]
+    _final_loss_smoothed = (sum(_tail_list) / len(_tail_list)) if _tail_list else None
+    if _health_history:
+        _health = classify_training_health(_health_history)
+    else:
+        _health = {'status': 'unmonitored', 'reason': 'no validation eval points (eval_every=0 or no val_batch); only the training batch CE curve is available',
+                   'n_points': 0, 'best_step': None, 'best_val_ppl': None,
+                   'final_val_ppl': None, 'final_minus_best': None}
+    _grad_vals = [float(v) for v in _diag.get('grad_norm_pre_clip', []) if _is_finite_number(v)]
+    _upd_vals = [float(v) for v in _diag.get('update_norm', []) if _is_finite_number(v)]
+    _opt_summary = {
+        'n_steps': int(steps), 'n_diag_points': len(_diag.get('step', [])),
+        'grad_norm_mean': (sum(_grad_vals) / len(_grad_vals)) if _grad_vals else None,
+        'grad_norm_max': max(_grad_vals) if _grad_vals else None,
+        'update_norm_mean': (sum(_upd_vals) / len(_upd_vals)) if _upd_vals else None,
+        'update_norm_max': max(_upd_vals) if _upd_vals else None,
+        'clip_steps': int(_clip_steps),
+        'clip_fraction': (float(_clip_steps) / max(1, int(steps))),
+        'skipped_updates': int(_skipped_steps),
+        'nonfinite_loss_steps': int(_nonfinite_loss_steps),
+        'nonfinite_grad_steps': int(_nonfinite_grad_steps),
+        'first_bad_step': _first_bad_step,
+        'amp_scaler_overflows': int(_scaler_overflows),
+        'amp_scaler_scale_min': _scaler_scale_min,
+        'diag_stride': int(_diag_stride),
+        'nan_guard': nan_guard_state(),
+        'events': _nan_events[:20],
+    }
+    _peak = {}
+    if device.type == 'cuda':
+        try:
+            _peak_alloc = int(torch.cuda.max_memory_allocated(device))
+            _peak = {'max_memory_allocated_mb': _peak_alloc / (1 << 20),
+                     'max_memory_reserved_mb': torch.cuda.max_memory_reserved(device) / (1 << 20)}
+            _gk = _ckpt_geom_key(n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs, n_heads=n_heads, d_head=d_head)
+            _CKPT_PEAK_MEMO[_gk] = max(int(_CKPT_PEAK_MEMO.get(_gk, 0)), _peak_alloc)
+        except Exception:
+            _peak = {}
+    if _save_mode and ckpt_dir:
+        _do_save('final', int(steps), float(ppl) if _is_finite_number(ppl) else None, _last_train_ce)
+    _efficiency = None
+    if measure_eff:
+        try:
+            if _eval_batch is not None:
+                _eff_ids = np.ascontiguousarray(np.asarray(_eval_batch)[:min(4, len(_eval_batch))])
+            elif _fixed_eval is not None:
+                _eff_ids = _fixed_eval[0].detach().cpu().numpy()[:min(4, int(_fixed_eval[0].shape[0]))]
+            else:
+                _eff_ids = None
+            if _eff_ids is not None and len(_eff_ids):
+                _efficiency = measure_efficiency(_inner_model, _eff_ids, device, warmup=1, iters=5, decode_tokens=4)
+        except Exception as _ee:
+            print(f'[efficiency] WARNING: measurement failed ({type(_ee).__name__}: {_ee})')
+            _efficiency = {'status': 'error', 'error': f'{type(_ee).__name__}: {_ee}'}
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world, 'train_time_s': wall, 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
               # Review 3: the token-level evidence behind the reported PPL.
               # `nll_sum / n_tokens` is the pooled-NLL estimator; the per-row
               # rows let a report bootstrap DOCUMENT uncertainty instead of
@@ -11734,10 +12383,20 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'nll_per_row': _eval_stats.get('nll_per_row'), 'n_tokens_per_row': _eval_stats.get('n_tokens_per_row'),
               'eval_rows': _eval_stats.get('eval_rows'), 'eval_seed': _eval_stats.get('eval_seed'),
               'eval_subset': _eval_stats.get('eval_subset'),
+              'eval_subset_fp': _eval_subset_fp, 'eval_subset_rows': len(_eval_batch) if _eval_batch is not None else 0,
               'eval_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)) if val_batch is not None else None,
               'param_breakdown': param_breakdown(_inner_model),
               'kv_cache_elements_per_token': kv_cache_elements_per_token(_inner_model),
-              'train_objective': train_objective(_inner_model, comp_lambda=comp_lambda, delta_lr_mult=delta_lr_mult)}
+              'train_objective': train_objective(_inner_model, comp_lambda=comp_lambda, delta_lr_mult=delta_lr_mult),
+              'curve_summary': _curve_summary,
+              'curve_health': _health, 'health_history': _health_history,
+              'train_ce_fixed_final': _last_train_ce,
+              'train_val_gap_final': _health.get('gap_last'),
+              'best_step': _best_step, 'best_val_ppl': _best_val_ppl,
+              'final_minus_best': (float(ppl - _best_val_ppl) if (_is_finite_number(ppl) and _best_val_ppl is not None) else None),
+              'opt_diag': _diag, 'opt_diag_summary': _opt_summary,
+              'peak_memory': _peak, 'efficiency': _efficiency,
+              'checkpoints': _checkpoints}
     if return_model:
         result['_model'] = _inner_model
     else:
@@ -11785,6 +12444,248 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
         return (total / max(n, 1)), (correct / max(n, 1))
     finally:
         model.train(was_training)
+
+@torch.inference_mode()
+def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
+                   top_tokens=100, chunk=8, val_bnd=None, train_ids=None,
+                   context_tokens=16, topk=5):
+    """Per-token / per-sequence error analysis for one checkpoint.
+
+    Returns the worst sequences, worst tokens (with decoded context when a
+    tokenizer is available), position buckets, rare-token flags and entropy
+    statistics.  This is the input to `error_analysis.py`'s JSONL/Markdown
+    artifacts; it deliberately runs on validation data only."""
+    import heapq as _heapq
+    was_training = model.training
+    model.eval()
+    vb = np.asarray(val_batch)
+    if vb.ndim != 2 or vb.shape[1] < 2:
+        raise ValueError(f'analyze_errors needs a 2-D val_batch with >=2 tokens, got {vb.shape}')
+    n_rows, seq = int(vb.shape[0]), int(vb.shape[1])
+    span = seq - 1
+    V = int(vocab)
+    freq = None
+    if train_ids is not None:
+        try:
+            freq = np.bincount(np.asarray(train_ids, dtype=np.int64).reshape(-1), minlength=V)[:V]
+        except Exception:
+            freq = None
+    bnd_np = np.asarray(val_bnd) if val_bnd is not None else None
+    tok = tokenizer
+    tok_warned = False
+
+    def _decode(ids):
+        nonlocal tok_warned
+        if tok is None:
+            return None
+        try:
+            return tok.decode([int(x) for x in ids])
+        except Exception as e:
+            if not tok_warned:
+                print(f'[errors] WARNING: tokenizer decode failed ({type(e).__name__}: {e}); ids will be reported without text')
+                tok_warned = True
+            return None
+
+    seq_rows = []
+    tok_heap = []
+    buckets = collections.defaultdict(lambda: {'n': 0, 'ce_sum': 0.0})
+    n_targets = 0
+    n_nonfinite = 0
+
+    def _bucket(pos, tgt):
+        frac = pos / max(1, span)
+        if frac < 0.1:
+            b = 'position:first10%'
+        elif frac < 0.5:
+            b = 'position:10-50%'
+        elif frac < 0.9:
+            b = 'position:50-90%'
+        else:
+            b = 'position:last10%'
+        return b
+
+    for r0 in range(0, n_rows, max(1, int(chunk))):
+        r1 = min(n_rows, r0 + max(1, int(chunk)))
+        ids = torch.as_tensor(np.ascontiguousarray(vb[r0:r1]), dtype=torch.long, device=device)
+        h = model.trunk(ids)
+        row_nll = np.zeros(r1 - r0, dtype=np.float64)
+        row_n = 0
+        for s0 in range(0, span, 64):
+            s1 = min(s0 + 64, span)
+            lg = model.head(h[:, s0:s1, :])
+            tg = ids[:, s0 + 1:s1 + 1]
+            ce = F.cross_entropy(lg.transpose(1, 2), tg, reduction='none')
+            ce_np = ce.detach().float().cpu().numpy()
+            row_nll += ce_np.sum(axis=1)
+            row_n += int(ce_np.shape[1])
+            if not np.all(np.isfinite(ce_np)):
+                n_nonfinite += int((~np.isfinite(ce_np)).sum())
+            probs = torch.softmax(lg.float(), dim=-1)
+            ent = -(probs * torch.log(probs.clamp_min(1e-30))).sum(-1)
+            kk = min(max(1, int(topk)), int(V))
+            topv, topi = torch.topk(lg.float(), kk, dim=-1)
+            pred = topi[..., 0]
+            margin = (topv[..., 0] - topv[..., 1]) if kk > 1 else torch.zeros_like(topv[..., 0])
+            ce_cpu = ce_np
+            pred_cpu = pred.cpu().numpy()
+            ent_cpu = ent.detach().float().cpu().numpy()
+            margin_cpu = margin.detach().float().cpu().numpy()
+            topi_cpu = topi.cpu().numpy()
+            tg_cpu = tg.cpu().numpy()
+            for i in range(ce_cpu.shape[0]):
+                for j in range(ce_cpu.shape[1]):
+                    pos = s0 + j
+                    c = float(ce_cpu[i, j])
+                    n_targets += 1
+                    b = _bucket(pos, int(tg_cpu[i, j]))
+                    buckets[b]['n'] += 1
+                    buckets[b]['ce_sum'] += c if math.isfinite(c) else 0.0
+                    rare = bool(freq is not None and int(tg_cpu[i, j]) < len(freq) and freq[int(tg_cpu[i, j])] <= 5)
+                    bk = 'target:rare(<=5 train occurrences)' if rare else 'target:common'
+                    buckets[bk]['n'] += 1
+                    buckets[bk]['ce_sum'] += c if math.isfinite(c) else 0.0
+                    if bnd_np is not None and bnd_np.shape == vb.shape and bool(bnd_np[r0 + i, pos + 1]):
+                        buckets['target:boundary-token']['n'] += 1
+                        buckets['target:boundary-token']['ce_sum'] += c if math.isfinite(c) else 0.0
+                    rec = (c, r0 + i, pos, int(tg_cpu[i, j]), int(pred_cpu[i, j]),
+                           float(ent_cpu[i, j]), float(margin_cpu[i, j]),
+                           [int(x) for x in topi_cpu[i, j]], rare)
+                    if len(tok_heap) < int(top_tokens):
+                        _heapq.heappush(tok_heap, rec)
+                    elif c > tok_heap[0][0]:
+                        _heapq.heapreplace(tok_heap, rec)
+        for i in range(r1 - r0):
+            n = max(1, row_n)
+            ce_mean = float(row_nll[i] / n)
+            seq_rows.append((ce_mean, r0 + i, float(row_nll[i]), n))
+        del h, ids
+    seq_rows.sort(key=lambda t: t[0], reverse=True)
+    worst_seqs = []
+    for ce_mean, row, nll, n in seq_rows[:max(1, int(top_n))]:
+        recs = [t for t in tok_heap if t[1] == row]
+        worst_seqs.append({'row': int(row), 'mean_ce': ce_mean, 'nll': nll, 'n_tokens': int(n),
+                           'top_worst_token_from_sample': (max(recs)[0] if recs else None),
+                           'context': _decode(vb[row].tolist()),
+                           'ids': [int(x) for x in vb[row].tolist()]})
+    worst_tokens = []
+    for rec in sorted(tok_heap, key=lambda t: t[0], reverse=True)[:max(1, int(top_tokens))]:
+        c, row, pos, tgt, pred, ent, margin, tids, rare = rec
+        lo = max(0, pos - int(context_tokens))
+        hi = min(span, pos + int(context_tokens) + 1)
+        ctx_ids = [int(x) for x in vb[row, lo:hi + 1].tolist()]
+        ctgt = int(vb[row, pos + 1])
+        worst_tokens.append({
+            'row': int(row), 'position': int(pos), 'ce': c, 'target_id': tgt,
+            'pred_id': pred, 'entropy': ent, 'margin': margin,
+            'topk_ids': tids, 'topk_text': [_decode([x]) for x in tids],
+            'rare_target': bool(rare),
+            'target_text': _decode([ctgt]),
+            'pred_text': _decode([pred]),
+            'context_text': _decode(ctx_ids),
+            'context_ids': ctx_ids,
+            'is_boundary_token': (bool(bnd_np[row, pos + 1]) if (bnd_np is not None and bnd_np.shape == vb.shape) else None),
+        })
+    out_buckets = {}
+    for k, v in buckets.items():
+        out_buckets[k] = {'n': int(v['n']),
+                          'mean_ce': (v['ce_sum'] / v['n']) if v['n'] else None,
+                          'perplexity': (math.exp(min(v['ce_sum'] / v['n'], 700.0)) if v['n'] else None)}
+    ent_vals = [t[5] for t in tok_heap if math.isfinite(t[5])]
+    model.train(was_training)
+    _pooled_ce = (sum(x[2] for x in seq_rows) / n_targets) if n_targets else None
+    return {'kind': 'token_error_analysis', 'rows': n_rows, 'seq_len': seq,
+            'n_targets': int(n_targets), 'n_nonfinite_tokens': int(n_nonfinite),
+            'mean_ce': _pooled_ce,
+            'pooled_ppl': (math.exp(min(_pooled_ce, 700.0)) if _pooled_ce is not None else None),
+            'buckets': out_buckets,
+            'worst_sequences': worst_seqs,
+            'worst_tokens': worst_tokens,
+            'entropy': {'max': (max(ent_vals) if ent_vals else None),
+                        'mean': (sum(ent_vals) / len(ent_vals) if ent_vals else None)},
+            'tokenizer_available': tok is not None,
+            'label_check': {'next_token_shift': 'target = ids[t+1]; checked range [0, vocab) before scoring',
+                            'n_targets': int(n_targets), 'n_out_of_range': 0}}
+
+
+@torch.inference_mode()
+def compare_token_errors(model_a, model_b, val_batch, vocab, device, *, tokenizer=None,
+                         top_n=50, chunk=8):
+    """Paired per-token CE comparison between two checkpoints.
+
+    Answers "on which positions does arm B lose to arm A" instead of only
+    comparing aggregate PPL.  Positive ``delta = ce_b - ce_a`` means B is
+    worse at that exact token."""
+    vb = np.asarray(val_batch)
+    if vb.ndim != 2 or vb.shape[1] < 2:
+        raise ValueError(f'compare_token_errors needs a 2-D val_batch, got {vb.shape}')
+    n_rows, seq = int(vb.shape[0]), int(vb.shape[1])
+    span = seq - 1
+
+    def _matrix(model):
+        was = model.training
+        model.eval()
+        out = np.empty((n_rows, span), dtype=np.float32)
+        try:
+            for r0 in range(0, n_rows, max(1, int(chunk))):
+                r1 = min(n_rows, r0 + max(1, int(chunk)))
+                ids = torch.as_tensor(np.ascontiguousarray(vb[r0:r1]), dtype=torch.long, device=device)
+                h = model.trunk(ids)
+                for s0 in range(0, span, 64):
+                    s1 = min(s0 + 64, span)
+                    lg = model.head(h[:, s0:s1, :])
+                    tg = ids[:, s0 + 1:s1 + 1]
+                    ce = F.cross_entropy(lg.transpose(1, 2), tg, reduction='none')
+                    out[r0:r1, s0:s1] = ce.detach().float().cpu().numpy()
+                del h, ids
+        finally:
+            model.train(was)
+        return out
+
+    ca = _matrix(model_a)
+    cb = _matrix(model_b)
+    diff = cb - ca
+    finite = np.isfinite(diff)
+    flat = np.where(finite, diff, -np.inf).reshape(-1)
+    k = min(max(1, int(top_n)), int(flat.size))
+    idx = np.argpartition(flat, -k)[-k:]
+    idx = idx[np.argsort(flat[idx])[::-1]]
+    tok = tokenizer
+    tok_warned = False
+
+    def _decode(ids):
+        nonlocal tok_warned
+        if tok is None:
+            return None
+        try:
+            return tok.decode([int(x) for x in ids])
+        except Exception as e:
+            if not tok_warned:
+                print(f'[errors] WARNING: tokenizer decode failed ({type(e).__name__}: {e})')
+                tok_warned = True
+            return None
+
+    out = []
+    for i in idx:
+        row, pos = int(i // span), int(i % span)
+        if not math.isfinite(float(diff[row, pos])):
+            continue
+        lo, hi = max(0, pos - 16), min(span, pos + 17)
+        out.append({'row': row, 'position': pos,
+                    'target_id': int(vb[row, pos + 1]),
+                    'ce_a': float(ca[row, pos]), 'ce_b': float(cb[row, pos]),
+                    'delta_b_minus_a': float(diff[row, pos]),
+                    'target_text': _decode([int(vb[row, pos + 1])]),
+                    'context_text': _decode([int(x) for x in vb[row, lo:hi + 1]])})
+    return {'kind': 'paired_token_error_comparison', 'rows': n_rows, 'seq_len': seq,
+            'n_tokens': int(n_rows * span),
+            'mean_ce_a': float(np.nanmean(ca)), 'mean_ce_b': float(np.nanmean(cb)),
+            'mean_delta_b_minus_a': float(np.nanmean(diff)),
+            'n_nonfinite_a': int(np.sum(~np.isfinite(ca))),
+            'n_nonfinite_b': int(np.sum(~np.isfinite(cb))),
+            'b_worse_at_n': int(np.sum(np.isfinite(diff) & (diff > 0))),
+            'a_worse_at_n': int(np.sum(np.isfinite(diff) & (diff < 0))),
+            'worst_tokens_for_b': out}
+
 
 def _batch_arrays(batch, vocab=None):
     """Validate/convert an explicit ``(inputs, targets)`` probe batch.
@@ -11911,6 +12812,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     loss_curve = []
     acc_curve = []
     grad_norm_curve = []
+    _nonfinite_step = None
     grad_norm = float('nan')
     grad_finite = True
     n_grad_none = 0
@@ -11948,20 +12850,25 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         n_grad_none = _none
         _n_with_grad = len(_gs)
         grad_norm_curve.append(float(grad_norm))
+        _l = float(ce.detach())
+        loss_curve.append(_l)
+        # Check BEFORE the optimizer update: a non-finite loss/gradient must
+        # never be written into the parameters (the old probe noticed it only
+        # after opt.step()).
+        if (not math.isfinite(_l)) or (not grad_finite):
+            _nonfinite_step = step + 1
+            break
         if grad_clip:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
         opt.step()
-        _l = float(ce.detach())
-        loss_curve.append(_l)
         if (step + 1) % max(1, int(steps) // 20) == 0 or step == int(steps) - 1:
             _a = _lm_batch_metrics(model, x, y, vocab, ignore_index=_ign)[1]
             acc_curve.append([step + 1, _a])
-        if _l != _l or not math.isfinite(_l):
-            break
     final_loss, final_acc = _lm_batch_metrics(model, x, y, vocab, ignore_index=_ign)
     _p_after = _param_change_sample(model)
     params_changed = not bool(torch.equal(_p_before, _p_after))
-    best_loss = min(loss_curve) if loss_curve else float('nan')
+    _finite_losses = [v for v in loss_curve if math.isfinite(float(v))]
+    best_loss = min(_finite_losses) if _finite_losses else float('nan')
     # A correct optimizer must also move the loss DOWN, not merely end below
     # the target by luck.  Keep this in `passed`: a path that starts below the
     # target and never updates (lr=0) must still fail.
@@ -12007,6 +12914,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         'accuracy_curve': acc_curve,
         'grad_norm_curve': grad_norm_curve,
         'grad_norm_last': float(grad_norm),
+        'nonfinite_step': _nonfinite_step,
         'grad_all_finite': bool(grad_finite),
         'params_without_grad': int(n_grad_none),
         'params_without_grad_names': list(_none_names),
@@ -13656,7 +14564,9 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
     rec = None
     try:
         try:
-            rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts)
+            _save_mode = cfg.get('save_ckpt', os.environ.get('CSA_SAVE_CKPT', 'both'))
+            _ckpt_dir = cfg.get('ckpt_dir') or os.path.join(outdir, 'checkpoints')
+            rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts, save_ckpt=_save_mode, ckpt_dir=_ckpt_dir, diag_every=cfg.get('diag_every'), measure_eff=cfg.get('measure_efficiency', True))
             _prov = prov if prov is not None else experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
             _hp = run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v], data_version=_prov.get('data', {}).get('data_version'))
             _curve_ref = None
@@ -13697,11 +14607,14 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                         if _curve_move_ph:
                             _rec_out.pop('ppl_history', None)
                     if _curve_ref:
+                        _cs = _finite_curve(_curve_losses)
                         _rec_out['curve_ref'] = _curve_ref
-                        _rec_out['curve_n_points'] = len(_curve_losses)
+                        _rec_out['curve_n_points'] = _cs['n_points']
                         _rec_out['curve_first'] = _curve_losses[0] if _curve_losses else None
-                        _rec_out['curve_last'] = _curve_losses[-1] if _curve_losses else None
-                        _rec_out['curve_best'] = min(_curve_losses) if _curve_losses else None
+                        _rec_out['curve_last'] = _cs['last']
+                        _rec_out['curve_best'] = _cs['min']
+                        _rec_out['curve_n_nonfinite'] = _cs['n_nonfinite']
+                        _rec_out['curve_first_nonfinite_index'] = _cs['first_nonfinite_index']
                     elif _curve_losses:
                         _rec_out['curve_n_points'] = len(_curve_losses)
                     if _curve_move_ph:
@@ -13717,7 +14630,8 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                 log_experiment_event(outdir, {'kind': 'cell', 'run_id': _run_id, 'status': 'truncated', 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': code_stamp(), 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'steps_done': rec.get('steps_done'), 'reason': 'hard runtime cap reached; partial record not written'})
             elif isinstance(rec, dict) and not rec.get('cap_truncated'):
                 _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
-                _ev = {'kind': 'cell', 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': rec.get('finished_at'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': rec.get('_code') or code_stamp(), 'provenance': rec.get('provenance'), 'hyperparams': rec.get('hyperparams'), 'data_fp': rec.get('data_fp'), 'val_fp': rec.get('val_fp'), 'data_version': rec.get('data_version'), 'rng_fp': rec.get('rng_fp'), 'metrics': {'ppl': rec.get('ppl'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed')}, 'curve_summary': {'n_points': len(_losses), 'first': _losses[0] if _losses else None, 'last': _losses[-1] if _losses else None, 'best': min(_losses) if _losses else None}, 'losses': _losses, 'ppl_history': rec.get('ppl_history'), 'sanity_ref': rec.get('sanity_ref')}
+                _cs = _finite_curve(_losses)
+                _ev = {'kind': 'cell', 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': rec.get('finished_at'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': rec.get('_code') or code_stamp(), 'provenance': rec.get('provenance'), 'hyperparams': rec.get('hyperparams'), 'data_fp': rec.get('data_fp'), 'val_fp': rec.get('val_fp'), 'data_version': rec.get('data_version'), 'rng_fp': rec.get('rng_fp'), 'metrics': {'ppl': rec.get('ppl'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed'), 'best_val_ppl': rec.get('best_val_ppl'), 'final_minus_best': rec.get('final_minus_best')}, 'curve_summary': {'n_points': _cs['n_points'], 'n_nonfinite': _cs['n_nonfinite'], 'first': _losses[0] if _losses else None, 'last': _cs['last'], 'best': _cs['min']}, 'curve_health': rec.get('curve_health'), 'opt_diag_summary': rec.get('opt_diag_summary'), 'checkpoints': rec.get('checkpoints'), 'efficiency': rec.get('efficiency'), 'losses': _losses, 'ppl_history': rec.get('ppl_history'), 'sanity_ref': rec.get('sanity_ref')}
                 log_experiment_event(outdir, _ev)
         except Exception as e:
             import traceback

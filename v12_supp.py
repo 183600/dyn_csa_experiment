@@ -102,13 +102,78 @@ def make_guard():
 # 读取（单一事实来源）；P5C 同时覆盖全部四个冻结臂（主臂 0-5 已由
 # P3MT/P4MT 训练，resume 自动跳过；主臂 6-11 与对照臂统一在此补齐），
 # 否则清单扩种子后没有任何驱动会训练主臂新种子。
-P5C_CFG = dict(V10.P3MT_PAYLOAD, seeds=[0, 1, 2, 3, 4, 5], variants=['csa_fixed_rope', 'full_rope'] + list(V10.SCRATCH_CONTROLS))
+P5C_CFG = dict(V10.P3MT_PAYLOAD, seeds=[0, 1, 2, 3, 4, 5], variants=['csa_fixed_rope', 'full_rope'] + list(V10.SCRATCH_CONTROLS),
+               # Diagnostic-only validation monitoring: never used for model
+               # selection, but P5T refuses to spend the one-shot test access
+               # when a frozen arm trained through a non-finite/overfit tail.
+               diag_eval_every=250)
 P5MP_CFG = dict(V10.PROBE, seeds=[0, 1, 2, 3, 4, 5], variants=['csa_fixed_rope', 'full_rope'] + V10.SCRATCH_CONTROLS, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS})
 P5S2_CFG = dict(V10.P3SL_TOK_CFG, seeds=[0, 1])
 P5S3_CFG = dict(V10.P3SL_FLOP_CFG, seeds=[0, 1])
 TEST_OUTDIR = 'results_lm_test'
 FREEZE_MANIFEST = 'confirmation_frozen.json'
-PHASES = [('P5C', 'lenphase', P5C_CFG, None), ('P5MP', 'probe', P5MP_CFG, None), ('P5S2', 'run', P5S2_CFG, None), ('P5S3', 'run', P5S3_CFG, None), ('P5T', 'finaltest', None, None)]
+PHASES = [('P5C', 'lenphase', P5C_CFG, None), ('P5MP', 'probe', P5MP_CFG, None), ('P5S2', 'run', P5S2_CFG, None), ('P5S3', 'run', P5S3_CFG, None), ('P5H', 'health', None, None), ('P5T', 'finaltest', None, None)]
+
+def run_training_health(cfg=None):
+    """Pre-test health gate over the frozen arms/seeds.
+
+    Reads the diagnostic curves stored in each checkpoint by P5C/P3MT.  The
+    run is never allowed to change arms/seeds/endpoints; it only decides
+    whether the one-shot test access is spent or the run is stopped for
+    investigation.
+    """
+    cfg = dict(cfg or {})
+    manifest = _load_manifest(cfg.get('manifest') or FREEZE_MANIFEST)
+    ckpt_dir = cfg.get('ckpt_dir') or FINALTEST_CFG['ckpt_dir']
+    rows = {}
+    unhealthy = []
+    missing = []
+    for v in manifest['arms']:
+        for seed in manifest['seeds']:
+            key = f'{v}::s{seed}'
+            ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
+            if not os.path.exists(ck):
+                rows[key] = {'status': 'missing_checkpoint', 'path': ck}
+                missing.append(key)
+                continue
+            try:
+                d = V._load_ckpt(ck)
+            except Exception as e:
+                rows[key] = {'status': 'unreadable_checkpoint', 'error': f'{type(e).__name__}: {e}', 'path': ck}
+                unhealthy.append(key)
+                continue
+            h = d.get('curve_health') if isinstance(d, dict) else None
+            status = (h or {}).get('status', 'unmonitored')
+            rows[key] = {'status': status, 'health': h,
+                         'best_step': (d or {}).get('best_step'),
+                         'best_val_ppl': (d or {}).get('best_val_ppl'),
+                         'final_ppl': (d or {}).get('final_ppl'),
+                         'path': ck}
+            if status != 'healthy':
+                unhealthy.append(key)
+            del d
+            try:
+                gc.collect()
+            except Exception:
+                pass
+    report = {'kind': 'training_health', 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+              'manifest': cfg.get('manifest') or FREEZE_MANIFEST,
+              'n_arms': len(manifest['arms']), 'n_seeds': len(manifest['seeds']),
+              'n_cells': len(rows), 'n_missing': len(missing), 'n_unhealthy': len(unhealthy),
+              'missing': missing, 'unhealthy': unhealthy,
+              'status': ('pass' if not missing and not unhealthy else 'fail'),
+              'note': 'diagnostic only: this gate never selects a checkpoint or changes the frozen plan',
+              'cells': rows}
+    out = cfg.get('out') or os.path.join(TEST_OUTDIR, 'training_health.json')
+    L.atomic_write_json(out, report, indent=2)
+    print(f'[p5h] training health: {report["status"]} ({len(unhealthy)} unhealthy, {len(missing)} missing) -> {out}')
+    allow = os.environ.get('V12_ALLOW_UNHEALTHY', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    if report['status'] != 'pass' and not allow:
+        raise SystemExit(f'[p5h] REFUSE: frozen-arm training health is not clean ({len(unhealthy)} unhealthy, {len(missing)} missing); investigate before spending the one-shot test access (V12_ALLOW_UNHEALTHY=1 is the explicit override)')
+    if report['status'] != 'pass':
+        print('[p5h] WARNING: V12_ALLOW_UNHEALTHY=1 — continuing despite unhealthy/missing training health')
+    return report
+
 
 def run_phase(name, guard, par=None):
     import par as _par
@@ -126,6 +191,8 @@ def run_phase(name, guard, par=None):
             return V.run_lenphase(cfg, guard=guard, label=f'v12 {pname}', par=_ctx)
         if kind == 'probe':
             return V10.run_probe(cfg, guard=guard, label=f'v12 {pname}', par=_ctx)
+        if kind == 'health':
+            return run_training_health({'manifest': FREEZE_MANIFEST, 'ckpt_dir': FINALTEST_CFG['ckpt_dir'], 'out': os.path.join(TEST_OUTDIR, 'training_health.json')})
         if kind == 'finaltest':
             print('[v12] NOTE: the final-test phase has no task-level parallel path, running it serially (evaluation only, ckpt per cell)')
             return run_finaltest(dict(FINALTEST_CFG), guard=guard)
@@ -498,6 +565,37 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
     print(f'[v12] freeze lock written: {lp} (manifest {_sha[:12]}…, stage {stage}, test_ids_fp {str(test_ids_fp)[:12]}…)')
     return lock
 
+def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
+    """Refuse the one-shot test evaluation when training health is unknown or bad.
+
+    This is deliberately NOT a model-selection rule: it does not change arms,
+    seeds, steps or the endpoint.  It only prevents burning the frozen test
+    access on a run whose own diagnostic curve says non-finite/overfitting/
+    stalled.  `V12_ALLOW_UNHEALTHY=1` is the explicit, logged override.
+    """
+    if cfg.get('smoke'):
+        return None
+    health = (ckpt_meta or {}).get('curve_health') or (train_rec or {}).get('curve_health')
+    allow = os.environ.get('V12_ALLOW_UNHEALTHY', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    if not isinstance(health, dict):
+        msg = f'{v} s{seed}: no training curve/health evidence in the checkpoint or its record'
+        if allow:
+            print(f'[p5t] WARNING: {msg}; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
+            return None
+        return msg + ' — refusing to spend the one-shot test access (set V12_ALLOW_UNHEALTHY=1 only with a written justification)'
+    status = str(health.get('status') or 'unknown')
+    if status == 'healthy':
+        return None
+    if status == 'unmonitored' and allow:
+        print(f'[p5t] WARNING: {v} s{seed}: training health is unmonitored; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
+        return None
+    msg = f'{v} s{seed}: training health is {status!r} ({health.get("reason") or "no reason recorded"})'
+    if allow:
+        print(f'[p5t] WARNING: {msg}; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
+        return None
+    return msg + ' — refusing to spend the one-shot test access'
+
+
 @torch.inference_mode()
 def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
     """One (arm, seed) clean by-length evaluation on the TEST split.
@@ -540,6 +638,13 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
         print(f'[p5t] REFUSE {v} s{seed}: no current training record backs the checkpoint — the weights have no traceable provenance')
         del d
         out['status'] = 'skipped_no_provenance'
+        return out
+    _health_refusal = _training_health_gate(cfg, v, seed, d, _tr)
+    if _health_refusal:
+        print(f'[p5t] REFUSE {_health_refusal}')
+        out['status'] = 'skipped_unhealthy_training'
+        out['health'] = (d.get('curve_health') or _tr.get('curve_health'))
+        del d
         return out
     _ck_recipe = d.get('recipe')
     # structured recipe gate (review-2 issue 2): the frozen plan's training
@@ -709,6 +814,13 @@ def run_finaltest(cfg=None, guard=None):
     _lock_path = _freeze_lock_path(outdir)
     if os.path.exists(os.path.join(outdir, 'bylen.json')) and not os.path.exists(_lock_path):
         raise SystemExit(f'[v12] REFUSE: {outdir}/bylen.json exists but there is no pre-access freeze lock — the only honest interpretation is that a test-split measurement predates the lock; investigate before reusing it')
+    # Training-health gate BEFORE the one-shot test read/lock: a run whose own
+    # diagnostic curve is non-finite/overfit/stalled must be investigated, not
+    # silently evaluated on test.  This never changes the frozen plan.
+    if not _smoke:
+        run_training_health({'manifest': cfg.get('manifest') or FREEZE_MANIFEST,
+                             'ckpt_dir': cfg.get('ckpt_dir') or FINALTEST_CFG['ckpt_dir'],
+                             'out': os.path.join(outdir, 'training_health.json')})
     # Write the pre-access attestation BEFORE reading the held-out split, so a
     # manifest mismatch is discovered before the one-shot access is used.
     _check_or_write_freeze_lock(outdir, manifest, None, stage='preaccess',
@@ -1310,6 +1422,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     A('')
     A('| 路径 | 内容 |')
     A('|---|---|')
+    A(f'| `{TEST_OUTDIR}/training_health.json` | P5H：冻结臂的训练曲线健康门禁（仅诊断，不参与选择） |')
     A(f'| `{TEST_OUTDIR}/bylen.json` | P5T：冻结臂在 test split 的干净 by-length 评估 |')
     A(f'| `{TEST_OUTDIR}/distractor.json` | P5T：test split 上的 uniform 腐坏探针（描述性） |')
     A('| `analysis_v12/stats.json` | v10 扩展探针统计 + 冻结确认性统计 |')

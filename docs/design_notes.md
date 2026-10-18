@@ -841,3 +841,68 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
 - 仍存在的边界：WikiText-103 官方 split 之间有近重复文档，审计只量化、
   不删除；16 条 test 文档不覆盖语言总体；实际推理延迟/吞吐/峰值显存必须
   在真实 checkpoint 上测量，解析 FLOPs/KV 只作结构性读数。
+
+## 23. 训练健康、NaN 排查与坏案例分析（结果分析层）
+
+### 23.1 曲线必须用于判断，而不只是被记录
+
+- `train_variant` 在每个 `eval_every` 点同时评估验证 PPL 与**固定训练
+  batch** 的 CE（固定 batch 使用独立 RNG 流，不改变训练 batch 顺序）。
+  记录 `train_ce`、`val_ce`、`gap`、验证子集的逐文档 95% CI，以及
+  `curve_health`：`healthy` / `overfitting` / `underfitting_or_stalled` /
+  `validation_degrading` / `nonfinite` / `insufficient_data` /
+  `unmonitored`。
+- 同时记录 `best_step`、`best_val_ppl`、`final_minus_best`。最终表格仍用
+  预注册的 final-step PPL；best 数值只作诊断，不能在未预注册时拿来挑选
+  后再冒充固定预算比较。
+- 曲线使用的 `eval_subset_rows` 与最终 full-val 行数不同，报告必须并列，
+  不能把固定子集的波动读成 full-val 的变化。
+
+### 23.2 NaN / Inf 的系统排查顺序
+
+1. 每个（抽样）batch 进入模型前检查 dtype、形状、token id 范围；未来浮点
+   特征必须检查 `isfinite`。
+2. 前向 loss 非有限：记录 step、CE、comp_reg、PG 项、LR 和 batch 指纹，
+   **跳过该 step 的更新**，不把 NaN 写进参数。
+3. 反传后检查裁剪前梯度范数；非有限时清空梯度并跳过更新（DDP 下用
+   all-reduce 保证所有 rank 同分支，避免集合通信死锁）。
+4. fp16 记录 GradScaler 的 scale 最小值、overflow/skipped step 次数；bf16
+   路径记录是否有非有限值。
+5. 参数抽样检查发现非有限值时**中止**，而不是继续训练。
+6. `nan_to_num` 调用点保留原数值语义，但默认计数；`CSA_NAN_AUDIT=1`
+   统计被清洗的元素数，`CSA_STRICT_NAN=1` 直接抛错并打印调用位置。
+7. 若仍复现：查数据中的 NaN/Inf、`log(0)`/除零、softmax 数值溢出，再查
+   fp16 溢出，最后查梯度爆炸或学习率过大。诊断顺序写进记录的
+   `opt_diag_summary`，不依赖事后猜测。
+
+### 23.3 坏案例分析
+
+- `exp_lib.analyze_errors` 与 `error_analysis.py` 对保存的 checkpoint 输出
+  逐 token CE、argmax、top-k、entropy、margin、位置、文档行号、解码上下文；
+  同时给出最差序列、位置分桶、罕见目标 token、边界 token 分桶。
+- 输出 `bad_cases.jsonl` / `bad_cases.md` / `summary.json`。`--compare-ckpt`
+  额外输出逐 token 配对差 `paired_errors.json` / `paired_bad_cases.jsonl`，
+  回答「某臂在这些位置上系统性更差」而不是只比较总 PPL。分析默认只在
+  validation 上进行；冻结 test 的逐样本分析必须走 v12 的一次性访问协议，
+  不能在 test 上反复看错例再改设计。
+- 看到高 CE 先分清：标注/移位错误、近重复、文本本身极模糊、罕见 token、
+  长距离依赖、块边界/格式问题，还是模型盲区。没有这一步，0.1–0.5 PPL 的
+  差异无法对应到具体行为。
+
+### 23.4 效率与精度的权衡
+
+- 主训练在保存 checkpoint 后实测 prefill p50/p95、tokens/s、allocator
+  峰值；没有 KV cache 时明确标成 `prefix_prefill`，不得写成增量 decode。
+- `build_report.py` 的 Measured efficiency 表与 PPL/参数量并排；解析 FLOPs
+  只作结构性读数。微小且不显著的 PPL 涨点若伴随数量级延迟/显存成本，
+  不能称为改进。
+- 训练峰值显存按几何配置缓存，用于校准 `_auto_ckpt_mode` 的解析估算
+  （只允许上调需求，避免低估导致 OOM）。
+
+### 23.5 冻结确认的训练健康门禁
+
+- P5C 的长度阶段可在 `diag_eval_every>0` 时做**仅诊断**的固定验证切片
+  评估；它不参与 checkpoint 选择、不改变冻结臂/种子/终点。
+- v12 新增 `P5H` 训练健康阶段；`P5T` 在写冻结锁、读取 test split 之前
+  重新检查冻结臂的 `curve_health`。缺失/非有限/过拟合/停滞时拒绝消耗
+  一次性 test 访问；`V12_ALLOW_UNHEALTHY=1` 是显式、会打印的覆盖开关。

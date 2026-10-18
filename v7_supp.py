@@ -205,7 +205,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 mask = L.causal_mask(T, x.device)
         else:
             mask = None
-        sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1) if self.sink is not None else None
+        sink_view = L._safe_nan_to_num(self.sink, where='sink_param_v7').view(1, self.nh, 1, 1) if self.sink is not None else None
         row_chunk = L._full_attn_row_chunk(x.device, B, self.nh, T, q.element_size())
         # Reuse the base-class row loop / whole-loop checkpoint (same chunk
         # partition, same masked-lane fill and softmax, values unchanged).
@@ -2215,6 +2215,9 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             elif _meta.get('recipe') != _recipe:
                 stale = True
                 print(f'[p1l] {v} s{seed}: checkpoint recipe mismatch (stored {_meta.get('recipe')!r}) — RETRAINING')
+            elif int(payload.get('diag_eval_every', 0) or 0) > 0 and not isinstance(_meta.get('curve_health'), dict):
+                stale = True
+                print(f'[p1l] {v} s{seed}: checkpoint has no training-curve health record — RETRAINING so the pre-test health gate has evidence (this does not change the frozen recipe)')
             else:
                 _ckp_pre = _meta
             del _meta
@@ -2250,6 +2253,16 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         L.set_seed(seed)
         cfgs = L.make_layer_cfgs(6, v)
         train_ids = L.load_wikitext(train_len, 8000000)[0]
+        # Training-health diagnostics only: a fixed validation slice is scored
+        # on the eval grid so P5C can refuse to spend the one-shot test access
+        # on a run that is overfitting/stalled/non-finite.  It never selects a
+        # checkpoint or changes the frozen arms/seeds/endpoint.
+        _diag_eval_every = int(payload.get('diag_eval_every', 0) or 0)
+        _diag_val = None
+        if _diag_eval_every:
+            _va = np.asarray(val_ids)
+            if _va.ndim == 2 and _va.shape[1] >= train_len:
+                _diag_val = np.ascontiguousarray(_va[:min(8, int(_va.shape[0])), :int(train_len)], dtype=np.int64)
         try:
             # The parent ran only the SYNTHETIC pre-flight.  The real token
             # stream can still be broken (vocabulary mapping, cache mixing,
@@ -2272,7 +2285,9 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                 })
                 L.log_experiment_event(outdir, {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'lenphase_overfit', 'run_cfg': _pfp, 'code': CKPT_CODE, 'provenance': _p1l_prov, 'variant': v, 'seed': int(seed), 'error': f'{_fe}', 'sanity': {'passed': False}})
                 raise
-            _tr = L.train_variant(v, train_ids, None, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=batch_size, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=_deadline, return_model=True)
+            if _diag_eval_every and _diag_val is not None:
+                print(f'[p1l] {v} s{seed}: diagnostic validation slice {_diag_val.shape}, eval_every={_diag_eval_every} (health monitoring only; not used for selection)')
+            _tr = L.train_variant(v, train_ids, _diag_val, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=batch_size, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=_diag_eval_every, eval_subset=(int(_diag_val.shape[0]) if _diag_val is not None else 0), mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=_deadline, return_model=True)
         except Exception:
             # A raised train_variant leaves no record_run behind, so the
             # pre-booked estimate would stay reserved forever (serial mode:
@@ -2296,7 +2311,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             torch.cuda.empty_cache()
             return out
         model = _tr.pop('_model')
-        _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model), 'rng_fp': _tr.get('rng_fp'), 'train_fp': _tr.get('data_fp'), 'val_fp': _tr.get('eval_fp'), 'losses': _tr.get('losses'), 'ppl_history': _tr.get('ppl_history'), 'steps': steps}, ck)
+        _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model), 'rng_fp': _tr.get('rng_fp'), 'train_fp': _tr.get('data_fp'), 'val_fp': _tr.get('eval_fp'), 'losses': _tr.get('losses'), 'ppl_history': _tr.get('ppl_history'), 'curve_health': _tr.get('curve_health'), 'health_history': _tr.get('health_history'), 'opt_diag_summary': _tr.get('opt_diag_summary'), 'best_step': _tr.get('best_step'), 'best_val_ppl': _tr.get('best_val_ppl'), 'train_ce_fixed_final': _tr.get('train_ce_fixed_final'), 'steps': steps}, ck)
         if guard is not None:
             guard.record_run(time.time() - t0, steps, 256, 6, train_len, batch_size, calib_seconds=_tr.get('train_time_s'))
             if booked:
