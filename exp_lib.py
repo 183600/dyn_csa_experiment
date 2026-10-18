@@ -9850,8 +9850,13 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     return result
 
 @torch.no_grad()
-def _lm_batch_metrics(model, x, y, vocab, chunk=64):
-    """Mean cross-entropy and next-token accuracy on one fixed batch."""
+def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
+    """Mean cross-entropy and next-token accuracy on one fixed batch.
+
+    With ``ignore_index`` set, both the loss and the accuracy are reduced over
+    the valid targets only (the same denominator the caller's training loss
+    uses).  The historical non-masked path keeps its exact reduction order.
+    """
     was_training = model.training
     model.eval()
     try:
@@ -9859,27 +9864,73 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64):
         total = 0.0
         correct = 0
         n = 0
-        for s in range(0, x.shape[1], chunk):
-            sl = slice(s, min(s + chunk, x.shape[1]))
+        n_cols = min(int(x.shape[1]), int(y.shape[1]))
+        for s in range(0, n_cols, chunk):
+            sl = slice(s, min(s + chunk, n_cols))
             lg = model.head(h[:, sl, :])
             tg = y[:, sl]
-            total += float(F.cross_entropy(lg.reshape(-1, vocab), tg.reshape(-1), reduction='sum'))
-            correct += int((lg.argmax(-1) == tg).sum())
-            n += int(tg.numel())
+            if ignore_index is None:
+                total += float(F.cross_entropy(lg.reshape(-1, vocab), tg.reshape(-1), reduction='sum'))
+                correct += int((lg.argmax(-1) == tg).sum())
+                n += int(tg.numel())
+            else:
+                valid = tg != int(ignore_index)
+                if bool(valid.any()):
+                    lgf = lg.reshape(-1, vocab)[valid.reshape(-1)]
+                    tgf = tg.reshape(-1)[valid.reshape(-1)]
+                    total += float(F.cross_entropy(lgf, tgf, reduction='sum'))
+                    correct += int((lg.argmax(-1)[valid] == tg[valid]).sum())
+                    n += int(valid.sum())
         return (total / max(n, 1)), (correct / max(n, 1))
     finally:
         model.train(was_training)
 
-def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256, train_ids=None, device=None, target_loss=0.05, target_acc=0.99, mlp_ratio=None, grad_clip=1.0):
+def _batch_arrays(batch, vocab=None):
+    """Validate/convert an explicit ``(inputs, targets)`` probe batch.
+
+    Task-specific training loops (e.g. NIAH) build their own next-token
+    tensors, so the generic overfit probe must accept that exact batch rather
+    than only a 1-D token stream.  Returns int64 numpy arrays; both are 2-D,
+    same row count, inputs at least as long as targets (a next-token target
+    table is often one column shorter)."""
+    if not isinstance(batch, (tuple, list)) or len(batch) != 2:
+        raise ValueError('overfit batch must be a (inputs, targets) pair')
+    x = np.asarray(batch[0])
+    y = np.asarray(batch[1])
+    if x.ndim != 2 or y.ndim != 2:
+        raise ValueError(f'overfit batch inputs/targets must be 2-D, got {x.shape} and {y.shape}')
+    if x.shape[0] != y.shape[0]:
+        raise ValueError(f'overfit batch row mismatch: inputs {x.shape[0]} vs targets {y.shape[0]}')
+    if x.shape[1] < y.shape[1]:
+        raise ValueError(f'overfit batch targets are longer than inputs ({y.shape[1]} > {x.shape[1]})')
+    if not np.issubdtype(x.dtype, np.integer) or not np.issubdtype(y.dtype, np.integer):
+        raise TypeError('overfit batch inputs/targets must be integer token ids')
+    x = np.ascontiguousarray(x, dtype=np.int64)
+    y = np.ascontiguousarray(y, dtype=np.int64)
+    if vocab is not None:
+        # -100 / other ignore sentinels are allowed in targets; every other id
+        # must address a real embedding row, or the probe would silently test a
+        # different (wrapped-index) model than the training path.
+        xv = x.reshape(-1)
+        if xv.size and (int(xv.min()) < 0 or int(xv.max()) >= int(vocab)):
+            raise ValueError(f'overfit batch inputs span [{int(xv.min())}, {int(xv.max())}], outside vocab [0, {int(vocab)})')
+    return x, y
+
+def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256, train_ids=None, batch=None, ignore_index=None, device=None, target_loss=0.05, target_acc=0.99, mlp_ratio=None, grad_clip=1.0):
     """Small-batch overfit sanity check (necessary, not sufficient).
 
-    Take ONE fixed batch (sampled once from `train_ids`, or synthetic ids when
-    none is supplied), disable every regulariser (weight decay = 0, the
-    compression penalty = 0; the model has no dropout), and optimise only that
-    batch.  A correct training path drives the LM loss towards 0 and the
-    next-token accuracy towards 100%.  Failure means a serious plumbing fault
-    (loss not connected to the graph, gradients not applied, wrong labels,
-    etc.) — do NOT launch a full run until it passes.
+    Take ONE fixed batch (sampled once from `train_ids`, passed explicitly as
+    ``batch=(inputs, targets)``, or synthetic ids when neither is supplied),
+    disable every regulariser (weight decay = 0, the compression penalty = 0;
+    the model has no dropout), and optimise only that batch.  A correct
+    training path drives the LM loss towards 0 and the next-token accuracy
+    towards 100%.  Failure means a serious plumbing fault (loss not connected
+    to the graph, gradients not applied, wrong labels, etc.) — do NOT launch a
+    full run until it passes.
+
+    ``batch`` exists for task-specific training loops (NIAH, masked next-token
+    targets): the probe then exercises the actual input/label tensors and the
+    ``ignore_index`` convention of that loop, not merely random ids.
 
     Passing does NOT prove the data pipeline / augmentation / label mapping is
     correct, so keep the intermediate-result checks as well.
@@ -9888,10 +9939,25 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     """
     if int(d) != int(n_heads) * int(d_head):
         raise ValueError(f'overfit_sanity_check: d={d} must equal n_heads*d_head={n_heads}*{d_head}')
+    if batch is not None and train_ids is not None:
+        raise ValueError('overfit_sanity_check: pass either train_ids or batch, not both')
     device = DEVICE if device is None else device
     set_seed(seed)
     _rng_fp = rng_fingerprint()
-    if train_ids is not None:
+    _label_shift_ok = None
+    _batch_contract = None
+    _ign = None
+    ids_full = None
+    if batch is not None:
+        x_np, y_np = _batch_arrays(batch, vocab=vocab)
+        batch_size, seq_len = int(x_np.shape[0]), int(x_np.shape[1])
+        _data_fp = _ids_fp(x_np.reshape(-1)) + ':' + _ids_fp(y_np.reshape(-1))
+        _data_source = 'batch'
+        x = torch.from_numpy(x_np).to(device)
+        y = torch.from_numpy(y_np).to(device)
+        _ign = -100 if ignore_index is None else int(ignore_index)
+        _batch_contract = bool(x.shape[0] == y.shape[0] and y.shape[1] <= x.shape[1])
+    elif train_ids is not None:
         arr = np.asarray(train_ids)
         if arr.ndim != 1:
             raise ValueError('overfit_sanity_check: train_ids must be one-dimensional')
@@ -9902,12 +9968,16 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         starts = _rng.integers(0, _hi, size=int(batch_size))
         chunk = np.stack([arr[int(s):int(s) + seq_len + 1] for s in starts]).astype(np.int64, copy=False)
         _data_fp = _ids_fp(chunk.reshape(-1))
+        _data_source = 'train_ids'
+        ids_full = torch.from_numpy(chunk).to(device)
+        x, y = ids_full[:, :-1], ids_full[:, 1:]
     else:
         _rng = np.random.default_rng(int(seed))
         chunk = _rng.integers(0, max(int(vocab), 1), size=(int(batch_size), seq_len + 1), dtype=np.int64)
         _data_fp = _ids_fp(chunk.reshape(-1))
-    ids_full = torch.from_numpy(chunk).to(device)
-    x, y = ids_full[:, :-1], ids_full[:, 1:]
+        _data_source = 'synthetic'
+        ids_full = torch.from_numpy(chunk).to(device)
+        x, y = ids_full[:, :-1], ids_full[:, 1:]
     if mlp_ratio is None:
         mlp_ratio = variant_mlp_ratio(variant, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=seq_len, matched=PARAM_MATCHED | PARAM_MATCHED_V7)
     cfgs = make_layer_cfgs(n_layers, variant)
