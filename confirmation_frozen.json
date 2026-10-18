@@ -31,6 +31,16 @@
       "es": 128
     },
     "training_recipe_note": "Machine-checkable subset of the run_cfg fingerprint (keys as decoded by exp_lib.run_cfg_knobs). mt/mr/det/df/cs are deliberately NOT pinned: they bind variant/environment/data/code and are verified separately (_code stamp, data_fp, manifest sha). Any record whose recipe fails this signature is refused by the confirmation statistics entry.",
+    "training_data_fingerprint": {
+      "loader": "exp_lib.load_wikitext",
+      "seq_len": 512,
+      "n_train_tokens": 8000000,
+      "cache_dir": "wt103_cache",
+      "fingerprint_rule": "exp_lib._ids_fp over the served 1-D train ids (train_fp on every checkpoint and training record)",
+      "canonical_train_fp": null,
+      "binding_rule": "if canonical_train_fp is a non-null string, every checkpoint and every admissible record must match it; otherwise all frozen checkpoints/records must agree on ONE non-null train_fp, which the first P5T access writes into results_lm_test/.freeze_lock.json and every later run must match. Mixed or missing train_fp is a hard refusal.",
+      "note": "The literal value is intentionally not guessed here: it becomes checkable only against a built wt103_cache. Until then the run derives it from the frozen checkpoints BEFORE the first test read and locks it; a later change of training corpus is rejected."
+    },
     "test_slice": {
       "loader": "exp_lib.load_wikitest",
       "seq_len_rule": "max(by_length_ppl)+1",

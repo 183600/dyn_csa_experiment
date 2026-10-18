@@ -2044,7 +2044,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             torch.cuda.empty_cache()
             return out
         model = _tr.pop('_model')
-        _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model), 'rng_fp': _tr.get('rng_fp'), 'losses': _tr.get('losses'), 'ppl_history': _tr.get('ppl_history'), 'steps': steps}, ck)
+        _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model), 'rng_fp': _tr.get('rng_fp'), 'train_fp': _tr.get('data_fp'), 'val_fp': _tr.get('eval_fp'), 'losses': _tr.get('losses'), 'ppl_history': _tr.get('ppl_history'), 'steps': steps}, ck)
         if guard is not None:
             guard.record_run(time.time() - t0, steps, 256, 6, train_len, batch_size, calib_seconds=_tr.get('train_time_s'))
             if booked:

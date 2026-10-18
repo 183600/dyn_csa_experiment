@@ -260,6 +260,27 @@ def _recipe_signature(manifest):
     return sig if isinstance(sig, dict) and sig else None
 
 
+def _frozen_train_fp(manifest):
+    """Canonical training-corpus fingerprint declared by the frozen plan.
+
+    Accepted shapes: ``binding.training_data_fingerprint`` (string or an
+    object with ``train_fp``), ``binding.train_fp``, or a top-level
+    ``training_data_fingerprint``.  ``None`` means the manifest froze the rule
+    but not a literal value; in that case every admission/checkpoint must still
+    agree on ONE non-null train_fp and the first P5T access locks it.
+    """
+    for _obj in (manifest.get('binding') or {}, manifest):
+        if not isinstance(_obj, dict):
+            continue
+        for _k in ('training_data_fingerprint', 'train_fp', 'training_fp'):
+            _v = _obj.get(_k)
+            if isinstance(_v, dict):
+                _v = _v.get('train_fp') or _v.get('value')
+            if isinstance(_v, str) and _v:
+                return _v
+    return None
+
+
 # The length-checkpoint writer (v7_supp.run_lenphase_cell — used by P3MT /
 # P4MT / P5C, the phases whose checkpoints P5T evaluates) records a bespoke
 # `p1l_...` recipe, NOT a run_cfg fingerprint.  It carries the same training
@@ -344,14 +365,16 @@ def _freeze_lock_path(outdir):
     return os.path.join(outdir, _LOCK_NAME)
 
 
-def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access'):
+def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
+                                train_fp=None):
     """Persistent first-test-access lock (review-2 issue 3).
 
     首次测试访问后禁止修改计划：P5T 一旦在 outdir 落下首条记录（或本函数
     被调用），锁文件即记录 manifest sha256
     与 test 切片指纹。之后的 P5T/analysis 若带着**不同的** manifest 哈希
     或不同 test 指纹运行，将被拒绝——除非显式 V12_REFREEZE=1（并大声
-    打印该轮降级为探索性的警告）。"""
+    打印该轮降级为探索性的警告）。``train_fp`` 一旦记录，后续训练集
+    指纹不一致同样拒绝。"""
     lp = _freeze_lock_path(outdir)
     _sha = manifest.get('manifest_sha256')
     if os.path.exists(lp):
@@ -388,14 +411,22 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access'):
             lock['history'] = list(lock.get('history') or []) + [{'stage': 'accessed', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp}]
             L.atomic_write_json(lp, lock, indent=2)
             print(f'[v12] freeze lock updated with the first-access slice fingerprint: {lp}')
+        if train_fp is not None:
+            if lock.get('train_fp') not in (None, train_fp):
+                raise SystemExit(f'[v12] REFUSE: the training corpus changed after the first test access (lock has train_fp {lock.get("train_fp")}, current {train_fp}) — a different training set cannot enter the frozen confirmation')
+            if lock.get('train_fp') is None:
+                lock['train_fp'] = train_fp
+                lock['history'] = list(lock.get('history') or []) + [{'stage': 'train-fp', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'train_fp': train_fp}]
+                L.atomic_write_json(lp, lock, indent=2)
+                print(f'[v12] freeze lock bound to the canonical training fingerprint: {lp}')
         return lock
-    lock = {'manifest_sha256': _sha, 'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST), 'frozen_at': manifest.get('frozen_at'), 'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'stage': stage, 'code_semantics': L.code_stamp(), 'history': [{'stage': stage, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp}], 'note': 'first test-split access: the plan may not change after this point (V12_REFREEZE=1 overrides consciously, downgrading the earlier round to exploratory)'}
+    lock = {'manifest_sha256': _sha, 'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST), 'frozen_at': manifest.get('frozen_at'), 'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp, 'stage': stage, 'code_semantics': L.code_stamp(), 'history': [{'stage': stage, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp}], 'note': 'first test-split access: the plan may not change after this point (V12_REFREEZE=1 overrides consciously, downgrading the earlier round to exploratory)'}
     L.atomic_write_json(lp, lock, indent=2)
     print(f'[v12] freeze lock written: {lp} (manifest {_sha[:12]}…, stage {stage}, test_ids_fp {str(test_ids_fp)[:12]}…)')
     return lock
 
 @torch.inference_mode()
-def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
+def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
     """One (arm, seed) clean by-length evaluation on the TEST split.
 
     评审二轮·意见二/三修订：记录现在额外携带 manifest_sha256 与
@@ -446,6 +477,37 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
         del d
         out['status'] = 'skipped_recipe_mismatch'
         return out
+    # Training-corpus binding: a recipe proves the hyper-parameters, not the
+    # bytes the weights saw.  The checkpoint and its training record must name
+    # the same non-null training fingerprint, and that fingerprint must match
+    # the frozen canonical value when the manifest supplies one.
+    _tr_train_fp = _tr.get('data_fp')
+    _ck_train_fp = d.get('train_fp') or d.get('data_fp')
+    _want_train_fp = _frozen_train_fp(manifest)
+    # New frozen manifests (binding.training_data_fingerprint) require the
+    # binding unconditionally.  Legacy manifests/records without either field
+    # stay admissible so historical panels remain reproducible.
+    _require_train_fp = bool(_want_train_fp) or bool(_ck_train_fp) or bool(_tr_train_fp)
+    if _require_train_fp and (not isinstance(_tr_train_fp, str) or not _tr_train_fp):
+        print(f'[p5t] REFUSE {v} s{seed}: training record has no train_fp — the weights cannot be attributed to a specific training corpus')
+        del d
+        out['status'] = 'skipped_missing_train_fp'
+        return out
+    if _require_train_fp and (not isinstance(_ck_train_fp, str) or not _ck_train_fp):
+        print(f'[p5t] REFUSE {v} s{seed}: checkpoint has no train_fp — regenerate it with the current writer so the training corpus is traceable')
+        del d
+        out['status'] = 'skipped_missing_train_fp'
+        return out
+    if _ck_train_fp and _tr_train_fp and _ck_train_fp != _tr_train_fp:
+        print(f'[p5t] REFUSE {v} s{seed}: checkpoint train_fp {_ck_train_fp} != training-record train_fp {_tr_train_fp} — the weights and record describe different corpora')
+        del d
+        out['status'] = 'skipped_train_fp_mismatch'
+        return out
+    if _want_train_fp is not None and _tr_train_fp != _want_train_fp:
+        print(f'[p5t] REFUSE {v} s{seed}: train_fp {_tr_train_fp} does not match the FROZEN canonical training fingerprint {_want_train_fp}')
+        del d
+        out['status'] = 'skipped_train_fp_mismatch'
+        return out
     eval_lens = [int(x) for x in manifest.get('eval', {}).get('by_length_ppl', cfg['eval_lens'])]
     _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))
     _cur = L.locked_json_read(spath).get(f'{v}::s{seed}')
@@ -461,6 +523,10 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
         if rec.get('_code') != V.CKPT_CODE or rec.get('recipe') != _ck_recipe:
             return True
         if rec.get('data_fp') != _dfp:
+            return True
+        if rec.get('split') != split:
+            return True
+        if rec.get('train_fp') != _tr_train_fp:
             return True
         if _msha is not None and rec.get('manifest_sha256') != _msha:
             return True  # the manifest changed after this record was written
@@ -498,11 +564,11 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids):
     def _merge(summary):
         # by_len now also carries ppl_per_seq (per-document rows, review-2
         # issue 9b) straight from eval_length_gen; pooled ppl is unchanged.
-        summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params'), 'by_len': r, 'split': 'test', 'data_fp': _dfp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ck_sha}
+        summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params'), 'by_len': r, 'split': split, 'data_fp': _dfp, 'train_fp': _tr_train_fp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ck_sha}
         print(f'  [p5t] {v:32s} s{seed} ' + '  '.join((f'L{k}={vv.get("ppl", float("nan")):.2f}' for k, vv in sorted(r.items()))))
         return summary
     L.locked_json_update(spath, _merge)
-    L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'run_id': _ft_run_id, 'status': 'ok', 'started_at': _ft_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _ft_t0, 'key': f'{v}::s{seed}', 'variant': v, 'seed': int(seed), 'split': 'test', 'code': V.CKPT_CODE, 'manifest_sha256': _msha, 'recipe': _ck_recipe, 'ckpt_sha256': _ck_sha, 'data_fp': _dfp, 'params': _tr.get('params'), 'metrics': {'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in r.items()}}})
+    L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'run_id': _ft_run_id, 'status': 'ok', 'started_at': _ft_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _ft_t0, 'key': f'{v}::s{seed}', 'variant': v, 'seed': int(seed), 'split': split, 'code': V.CKPT_CODE, 'manifest_sha256': _msha, 'recipe': _ck_recipe, 'ckpt_sha256': _ck_sha, 'data_fp': _dfp, 'train_fp': _tr_train_fp, 'params': _tr.get('params'), 'metrics': {'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in r.items()}}})
     del d
     return out
 
@@ -525,31 +591,82 @@ def run_finaltest(cfg=None, guard=None):
     need = max([int(x) for x in manifest.get('eval', {}).get('by_length_ppl', cfg['eval_lens'])]) + 1
     _nseq_clean = int((manifest.get('eval') or {}).get('n_seqs_clean') or cfg.get('n_seq', 16))
     test_ids = cfg.get('test_ids')
+    _smoke = bool(cfg.get('smoke'))
+    if test_ids is not None:
+        # A caller-supplied slice is ONLY a plumbing smoke input.  In normal
+        # mode the test split must come from load_wikitest, otherwise a
+        # validation slice could be relabelled as "test" and then frozen.
+        if not _smoke:
+            raise SystemExit('[v12] REFUSE: test_ids injection is allowed only with cfg["smoke"]=True; the confirmation test split must be read from exp_lib.load_wikitest')
+        if 'smoke' not in os.path.basename(os.path.abspath(outdir)).lower():
+            raise SystemExit(f'[v12] REFUSE: smoke test_ids require a smoke-marked outdir (got {outdir!r}) — injected data must never enter the confirmation results directory')
+    # Derive/lock the canonical training-corpus fingerprint BEFORE the first
+    # test read.  A manifest-level value wins; otherwise every frozen training
+    # record must name the same non-null train_fp.
+    _want_train_fp = _frozen_train_fp(manifest)
+    _cand_train_fps = set()
+    if os.path.exists(cfg.get('mech_summary') or ''):
+        try:
+            _ms = json.load(open(cfg['mech_summary'], encoding='utf-8'))
+        except Exception:
+            _ms = {}
+        for _v in manifest['arms']:
+            for _s in manifest['seeds']:
+                _fp = (_ms.get(f'{_v}::seed{_s}') or {}).get('data_fp')
+                if isinstance(_fp, str) and _fp:
+                    _cand_train_fps.add(_fp)
+    if _want_train_fp is not None and _cand_train_fps and _cand_train_fps != {_want_train_fp}:
+        raise SystemExit(f'[v12] REFUSE: training records use train_fp {sorted(_cand_train_fps)}, but the frozen canonical value is {_want_train_fp}')
+    if _want_train_fp is None and len(_cand_train_fps) == 1:
+        _want_train_fp = next(iter(_cand_train_fps))
+    elif _want_train_fp is None and len(_cand_train_fps) > 1:
+        raise SystemExit(f'[v12] REFUSE: the frozen training records span {len(_cand_train_fps)} different train_fp values {sorted(_cand_train_fps)}; refusing to define a canonical training set after the fact')
     _lock_path = _freeze_lock_path(outdir)
     if os.path.exists(os.path.join(outdir, 'bylen.json')) and not os.path.exists(_lock_path):
         raise SystemExit(f'[v12] REFUSE: {outdir}/bylen.json exists but there is no pre-access freeze lock — the only honest interpretation is that a test-split measurement predates the lock; investigate before reusing it')
     # Write the pre-access attestation BEFORE reading the held-out split, so a
     # manifest mismatch is discovered before the one-shot access is used.
-    _check_or_write_freeze_lock(outdir, manifest, None, stage='preaccess')
+    _check_or_write_freeze_lock(outdir, manifest, None, stage='preaccess',
+                                train_fp=_want_train_fp)
     if test_ids is None:
         _t0 = time.time()
         test_ids, vocab_t, _, _ = L.load_wikitest(need, n_seqs=_nseq_clean)
         if guard is not None:
             guard.record_run(time.time() - _t0, 0, 0, 0, 0, 0)
     else:
-        print('[p5t] NOTE: test_ids supplied by the caller (smoke only — the real P5T always reads the held-out wiki.test.raw via load_wikitest)')
+        print('[p5t] SMOKE: test_ids supplied by the caller; records are stamped split="smoke" and are inadmissible to the confirmation statistics')
     _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))
     # review-2 issue 3: first-test-access lock — the plan may not change after
     # the test split has been read, and the slice itself is part of the freeze.
-    _check_or_write_freeze_lock(outdir, manifest, _dfp, stage='accessed')
+    _check_or_write_freeze_lock(outdir, manifest, _dfp, stage='accessed',
+                                train_fp=_want_train_fp)
+    if not _smoke:
+        # Near-duplicate train/test documents make a clean generalization claim
+        # unavailable.  Run the same zero-GPU document-overlap gate the audit
+        # uses BEFORE spending the frozen evaluation; a policy violation stops
+        # the confirmation instead of leaving it as a footnote.
+        try:
+            import audit_gates as _AG
+            _ov = _AG.audit_leakage(cache_dir=os.environ.get('WT103_CACHE_DIR', './wt103_cache'))
+            _doc = (_ov.get('checks') or {}).get('doc_overlap')
+            if isinstance(_doc, dict) and _doc.get('policy_violation'):
+                raise SystemExit(f'[v12] REFUSE: train/test document overlap Jaccard {_doc.get("jaccard")} exceeds policy_max_jaccard={_doc.get("policy_max_jaccard")} — confirmation claims are UNAVAILABLE until the near-duplicate evaluation documents are cleaned (rebuild the test cache with exp_lib.load_wikitest, which now filters them)')
+            if _ov.get('status') == 'fail':
+                raise SystemExit('[v12] REFUSE: the data-leakage audit reports a hard failure; see audit_gates.py leakage output')
+        except SystemExit:
+            raise
+        except Exception as _ove:
+            print(f'[p5t] WARNING: document-overlap precheck unavailable ({type(_ove).__name__}: {_ove})')
     print(f'[p5t] manifest {cfg["manifest"]} frozen_at={manifest.get("frozen_at", "?")} sha256={manifest.get("manifest_sha256", "?")[:12]}… arms={manifest["arms"]} seeds={manifest["seeds"]}')
     print(f'[p5t] TEST split rows {test_ids.shape} (held out; no other phase reads this split; ids_fp={_dfp[:12]}…)')
     if _nseq_clean < 64:
         print(f'[p5t] NOTE: n_seqs_clean={_nseq_clean} — document-sampling uncertainty is NOT well covered at this row count; population-level claims need a larger row panel (per-doc losses are recorded in bylen.json for stratified analysis; see design_notes §20)')
     # 1) clean by-length per (arm, seed)
+    _split_label = 'smoke' if _smoke else 'test'
     for v in manifest['arms']:
         for seed in manifest['seeds']:
-            _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids)
+            _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids,
+                                  split=_split_label)
     # 2) frozen uniform-corruption probe on the SAME test rows (secondary,
     #    descriptive-only per the manifest)
     _probe_eval = manifest.get('eval', {}).get('distractor_probe') or {}
@@ -579,10 +696,15 @@ def _admit_confirmation_records(raw, manifest):
     exp_code = L.code_stamp()  # eager-only; kernel mode is refused at load
     sig = _recipe_signature(manifest)
     msha = manifest.get('manifest_sha256')
+    want_train_fp = _frozen_train_fp(manifest)
     admitted = {}
     excluded = []
     duplicates = []
     fps = set()
+    train_fps = set()
+    _any_train_fp = any(isinstance(_r, dict) and bool(_r.get('train_fp'))
+                        for _r in (raw or {}).values())
+    _require_train_fp = bool(want_train_fp) or _any_train_fp
     for key, r in (raw or {}).items():
         if not isinstance(r, dict):
             continue
@@ -613,6 +735,10 @@ def _admit_confirmation_records(raw, manifest):
                 why = f"manifest_sha256 {str(r.get('manifest_sha256'))[:12]}… does not match the current manifest {msha[:12]}… (record from a different freeze revision)"
             elif not isinstance(r.get('data_fp'), str) or not r.get('data_fp'):
                 why = 'missing test-slice fingerprint (data_fp) — None==None pairing is not admissible'
+            elif _require_train_fp and (not isinstance(r.get('train_fp'), str) or not r.get('train_fp')):
+                why = 'missing training-corpus fingerprint (train_fp) — the weights cannot be tied to a training set'
+            elif want_train_fp is not None and r.get('train_fp') != want_train_fp:
+                why = f"train_fp {r.get('train_fp')} does not match the frozen canonical training fingerprint {want_train_fp}"
             elif sig is not None and not _recipe_matches_signature(r.get('recipe'), sig):
                 why = 'recipe does not match the frozen training_recipe signature'
             elif not isinstance(r.get('by_len'), dict) or not r.get('by_len'):
@@ -624,6 +750,8 @@ def _admit_confirmation_records(raw, manifest):
                 else:
                     admitted[(v, s_i)] = dict(r, key=key)
                     fps.add(r['data_fp'])
+                    if r.get('train_fp'):
+                        train_fps.add(r['train_fp'])
         if why:
             excluded.append(f'{key}: {why}')
     if excluded:
@@ -632,6 +760,8 @@ def _admit_confirmation_records(raw, manifest):
         raise SystemExit('[p5t stats] REFUSE: ambiguous duplicate records for the same (variant, seed): ' + '; '.join(duplicates) + ' — the paired statistics would depend on which one wins; resolve the bylen file first (this is exactly the dict-overwrite ambiguity the review flagged)')
     if len(fps) > 1:
         raise SystemExit(f'[p5t stats] REFUSE: admissible records span {len(fps)} different test-slice fingerprints ({sorted(fps)}) — the whole panel must be measured on ONE frozen test slice, not merely pairwise-equal fingerprints')
+    if len(train_fps) > 1:
+        raise SystemExit(f'[p5t stats] REFUSE: admissible records were trained on {len(train_fps)} different corpora ({sorted(train_fps)}) — all frozen arms must share the canonical training split')
     return admitted, (sorted(fps)[0] if fps else None)
 
 
@@ -1031,7 +1161,7 @@ def run_smoke():
     # smoke test data: rows from the (tiny local dump or HF) validation split,
     # standing in for the test split so the smoke never depends on wiki.test.raw
     _, val_ids, _, _, _ = L.load_wikitext(1024, 4000000)
-    cfg = dict(FINALTEST_CFG, manifest=_mpath, outdir='results_smoke_v12', ckpt_dir='results_smoke_v12/ckpt', mech_summary='results_smoke_v12/summary.json', bylen_summary='results_smoke_v12/bylen.json', probe_summary='results_smoke_v12/distractor.json', n_seq=4, chunk=2, stats_out='results_smoke_v12/test_stats.json', test_ids=np.asarray(val_ids[:4, :1025], dtype=np.int64))
+    cfg = dict(FINALTEST_CFG, manifest=_mpath, outdir='results_smoke_v12', ckpt_dir='results_smoke_v12/ckpt', mech_summary='results_smoke_v12/summary.json', bylen_summary='results_smoke_v12/bylen.json', probe_summary='results_smoke_v12/distractor.json', n_seq=4, chunk=2, stats_out='results_smoke_v12/test_stats.json', test_ids=np.asarray(val_ids[:4, :1025], dtype=np.int64), smoke=True)
     stats = run_finaltest(cfg)
     got = {r['variant'] for r in json.load(open('results_smoke_v12/bylen.json', encoding='utf-8')).values() if isinstance(r, dict)}
     assert {'csa_fixed_rope', 'csa_fixed_rope_allblocks'} <= got, f'finaltest bylen cells missing: {got}'

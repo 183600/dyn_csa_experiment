@@ -93,25 +93,69 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
     out = {'status': 'ok', 'checks': {}}
     test_meta = None
     train_meta = None
+    test_tag = None
+    train_tag = None
     import glob
+    import numpy as np
     _tm = sorted(glob.glob(os.path.join(cache_dir, 'test_meta_*.json')))
-    if _tm:
-        test_meta = _load(_tm[0])
-    _vm = sorted(glob.glob(os.path.join(cache_dir, 'meta_v4_*.json')))
-    if _vm:
-        train_meta = _load(_vm[0])
-    if test_meta is None or train_meta is None:
+    _vm = sorted(p for p in glob.glob(os.path.join(cache_dir, 'meta_*.json'))
+                 if not os.path.basename(p).startswith('test_meta_'))
+    if not _tm or not _vm:
         out['status'] = 'not_verifiable_locally'
-        out['note'] = f'{cache_dir}/ lacks test_meta_*.json or meta_v4_*.json — run the corpus loaders once (or copy the cache) to audit tokenizer provenance; the runtime hard checks in exp_lib.load_wiktest/load_wikitext remain in force meanwhile'
+        out['note'] = f'{cache_dir}/ lacks test_meta_*.json or meta_*.json — run the corpus loaders once (or copy the cache) to audit tokenizer provenance; the runtime hard checks in exp_lib.load_wiktest/load_wikitext remain in force meanwhile'
         return out
+    # Pair a train meta with the test meta that describes the SAME corpus
+    # protocol (vocab, seq_len, tokenizer fit provenance).  Taking the first
+    # filename in each glob can pair a train split with a test split built from
+    # a different vocab/seq_len/val size, making the overlap audit meaningless.
+    _pairs = []
+    for _tp in _tm:
+        _tmeta = _load(_tp)
+        if not isinstance(_tmeta, dict):
+            continue
+        _ttag = os.path.basename(_tp)[len('test_meta_'):-len('.json')]
+        for _mp in _vm:
+            _mmeta = _load(_mp)
+            if not isinstance(_mmeta, dict):
+                continue
+            if (_tmeta.get('vocab') is not None and _mmeta.get('vocab') is not None
+                    and int(_tmeta['vocab']) != int(_mmeta['vocab'])):
+                continue
+            if (_tmeta.get('seq_len') is not None and _mmeta.get('seq_len') is not None
+                    and int(_tmeta['seq_len']) != int(_mmeta['seq_len'])):
+                continue
+            if (_tmeta.get('fit_fp') and _mmeta.get('fit_fp')
+                    and _tmeta['fit_fp'] != _mmeta['fit_fp']):
+                continue
+            _pairs.append((_mp, _mmeta, _tp, _tmeta))
+    if not _pairs:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = 'no train/test cache pair shares the same vocab/seq_len/tokenizer-fit provenance; cannot audit tokenizer or split provenance without guessing'
+        return out
+    _uniq = {(os.path.basename(a), os.path.basename(c)) for a, _, c, _ in _pairs}
+    if len(_uniq) > 1:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = ('multiple train/test cache pairs match the same protocol; '
+                       'refusing to guess which one is authoritative — pass an '
+                       'explicit cache set or remove stale variants')
+        out['checks']['candidate_pairs'] = sorted('/'.join(_u) for _u in _uniq)
+        return out
+    _mp, train_meta, _tp, test_meta = _pairs[0]
+    train_tag = os.path.basename(_mp)[len('meta_'):-len('.json')]
+    test_tag = os.path.basename(_tp)[len('test_meta_'):-len('.json')]
+    out['checks']['cache_pair'] = {'train_meta': os.path.basename(_mp),
+                                   'test_meta': os.path.basename(_tp)}
     out['checks']['test_fit_fp'] = test_meta.get('fit_fp')
     out['checks']['train_src_fp'] = train_meta.get('src_fp') or train_meta.get('train_fp')
     out['checks']['test_src_fp'] = test_meta.get('src_fp')
     out['checks']['vocab_agree'] = int(test_meta.get('vocab', -1)) == int(train_meta.get('vocab', -2))
-    # b) persisted tokenizers, if both exist
+    # b) persisted tokenizers, if both exist.  Use the tag-paired files, never
+    # the first filename in the directory.
     import hashlib
-    _tt = sorted(glob.glob(os.path.join(cache_dir, 'test_tok_*.json')))
-    _vt = sorted(glob.glob(os.path.join(cache_dir, 'tok_v4_*.json')))
+    _tt = [os.path.join(cache_dir, f'test_tok_{test_tag}.json')]
+    _vt = [os.path.join(cache_dir, f'tok_{train_tag}.json')]
+    _tt = [p for p in _tt if os.path.exists(p)]
+    _vt = [p for p in _vt if os.path.exists(p)]
     if _tt and _vt:
         def _sha(p):
             h = hashlib.sha256()
@@ -130,35 +174,105 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
             out['checks']['tokenizer_vocab_identical'] = bool(dict(ta.get_vocab()) == dict(tb.get_vocab()))
         except Exception as e:
             out['checks']['tokenizer_vocab_identical'] = f'skipped ({type(e).__name__})'
-    # d) document overlap via shingles on the cached id matrices
+    # d) document overlap via deterministic SLIDING shingles on the cached id
+    # matrices.  The old audit used Python's salted `hash(tuple(...))` and
+    # non-overlapping fixed blocks, so its Jaccard changed between processes and
+    # missed documents shifted by a few tokens.  This version uses a fixed
+    # polynomial rolling hash over every window, scans uniformly spaced
+    # segments across the full train stream, and reports exactly how much was
+    # scanned so a low overlap cannot be mistaken for a full-corpus proof.
     try:
         import numpy as np
-        import glob as _g
-        _te = sorted(_g.glob(os.path.join(cache_dir, 'test_ids_*.npy')))
-        _tr = sorted(_g.glob(os.path.join(cache_dir, 'train_ids_*.npy')))
+        _te_path = os.path.join(cache_dir, f'test_ids_{test_tag}.npy')
+        _tr_path = os.path.join(cache_dir, f'train_ids_{train_tag}.npy')
+        def _unique_cache_file(expected, pattern):
+            if os.path.exists(expected):
+                return [expected]
+            _c = sorted(glob.glob(os.path.join(cache_dir, pattern)))
+            # Legacy caches may use a different tag spelling.  A single
+            # remaining candidate is unambiguous; more than one is refused
+            # instead of silently pairing the wrong configuration.
+            return _c if len(_c) == 1 else []
+        _te = _unique_cache_file(_te_path, 'test_ids_*.npy')
+        _tr = _unique_cache_file(_tr_path, 'train_ids_*.npy')
         if _te and _tr:
             te = np.load(_te[0])
-            tr = np.load(_tr[0])[: 4000000]  # fixed-size train-side sample
-            def _shingles(mat, k, cap_rows):
+            tr = np.load(_tr[0], mmap_mode='r')
+
+            def _uniform_rows(n_rows, cap):
+                if n_rows <= cap:
+                    return np.arange(n_rows, dtype=np.int64), n_rows
+                return np.unique(np.linspace(0, n_rows - 1, int(cap), dtype=np.int64)), n_rows
+
+            def _shingles(mat, k, cap_rows, cap_tokens=4000000):
                 # The training cache is a flat 1-D token stream while the test
-                # cache is 2-D; treat the 1-D stream as one row so the shingle
-                # scan is defined for both shapes.
+                # cache is 2-D; treat the 1-D stream as segments so the scan is
+                # defined for both shapes.
                 mat = np.asarray(mat)
+                if k <= 0:
+                    return np.empty(0, dtype=np.uint64), 0, 1.0
                 if mat.ndim == 1:
-                    mat = mat.reshape(1, -1)
-                s = set()
-                rows = min(mat.shape[0], cap_rows)
-                for i in range(rows):
-                    r = mat[i].tolist()
-                    for j in range(0, len(r) - k, k):
-                        s.add(hash(tuple(r[j:j + k])))
-                return s
+                    total = int(mat.size)
+                    if total <= cap_tokens:
+                        segments = [(0, total)]
+                    else:
+                        n_seg = max(1, min(64, cap_tokens // max(k, 1)))
+                        seg_len = max(int(cap_tokens) // n_seg, k + 1)
+                        starts = np.linspace(0, max(total - seg_len, 0), n_seg, dtype=np.int64)
+                        segments = [(int(s), int(min(total, s + seg_len))) for s in starts]
+                    parts = []
+                    for s, e in segments:
+                        h = _window_hashes(np.asarray(mat[s:e]), k)
+                        if h.size:
+                            parts.append(h)
+                    scanned = int(sum(e - s for s, e in segments))
+                    hashes = np.concatenate(parts) if parts else np.empty(0, dtype=np.uint64)
+                    frac = (scanned / total) if total else 1.0
+                    return np.unique(hashes), 1, float(frac)
+                rows, n_all = _uniform_rows(int(mat.shape[0]), int(cap_rows))
+                parts = [_window_hashes(np.asarray(mat[int(i)]), k) for i in rows]
+                parts = [p for p in parts if p.size]
+                hashes = np.concatenate(parts) if parts else np.empty(0, dtype=np.uint64)
+                return (np.unique(hashes), int(rows.size),
+                        (float(rows.size) / n_all) if n_all else 1.0)
+
             t0 = time.time()
-            te_s = _shingles(te, shingle, max_rows_shingled)
-            tr_s = _shingles(tr, shingle, max_rows_shingled)
-            inter = len(te_s & tr_s)
-            union = len(te_s | tr_s)
-            out['checks']['doc_overlap'] = {'shingle_k': shingle, 'train_rows_scanned': int(tr.shape[0]), 'test_rows_scanned': int(te.shape[0]), 'test_shingles': len(te_s), 'train_shingles': len(tr_s), 'shared_shingles': inter, 'jaccard': (inter / union) if union else 0.0, 'seconds': round(time.time() - t0, 1), 'policy_max_jaccard': 0.05, 'policy_violation': bool(union and (inter / union) > 0.05), 'note': 'nonzero overlap reflects WikiText-103 near-duplicate documents; report it as a boundary of generalization claims, not as leakage by itself — tokenizer fit and split handling are the leakage-critical parts and are checked separately. policy_max_jaccard=0.05 is a reporting threshold: above it, the split must be explicitly documented/waived before any cross-split generalization claim'}
+            tr_s, tr_rows, tr_frac = _shingles(tr, shingle, max_rows_shingled)
+            te_s, te_rows, te_frac = _shingles(te, shingle, max_rows_shingled)
+            inter = int(np.intersect1d(tr_s, te_s, assume_unique=True).size)
+            union = int(tr_s.size + te_s.size - inter)
+            jac = (inter / union) if union else 0.0
+            _viol = bool(union and jac > 0.05)
+            out['checks']['doc_overlap'] = {
+                'shingle_k': int(shingle),
+                'hash': 'uint64 polynomial rolling hash (fixed base 1000003), sliding windows',
+                'train_rows_scanned': int(tr_rows),
+                'test_rows_scanned': int(te_rows),
+                'train_tokens_scanned_fraction': round(float(tr_frac), 6),
+                'test_rows_scanned_fraction': round(float(te_frac), 6),
+                'test_shingles': int(te_s.size),
+                'train_shingles': int(tr_s.size),
+                'shared_shingles': inter,
+                'jaccard': jac,
+                'seconds': round(time.time() - t0, 1),
+                'policy_max_jaccard': 0.05,
+                'policy_violation': _viol,
+                'status': 'fail' if _viol else 'ok',
+                'note': ('nonzero overlap reflects WikiText-103 near-duplicate '
+                         'documents. A violation blocks a clean cross-split '
+                         'generalization/confirmation claim: clean the evaluation '
+                         'subset or report an overlap-excluded sensitivity '
+                         'analysis. Sampling fractions are reported above; '
+                         'uniformly-spaced sliding windows over the requested '
+                         'scan budget are deterministic across processes.'),
+            }
+            if _viol:
+                out['status'] = 'fail'
+                out['note'] = ('train/test document overlap exceeds policy_max_jaccard=0.05 '
+                               '— confirmation claims are UNAVAILABLE until the '
+                               'near-duplicate evaluation documents are excluded '
+                               '(or an explicit overlap-excluded sensitivity '
+                               'analysis is reported).')
         else:
             out['checks']['doc_overlap'] = 'npy caches absent'
     except Exception as e:
@@ -375,21 +489,42 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             if shared_val:
                 rec['status'] = 'fail'
                 _fail(f'{cd}/{tag}: {shared_val} validation rows exactly duplicate a training row')
-            # The test cache filename carries its own seq_len/vocab/ns tag;
-            # match on the sequence length recorded in the train meta rather
-            # than guessing one file.
-            test_files = sorted(glob.glob(os.path.join(cd, 'test_ids_*.npy')))
+            # The test cache filename carries its own seq_len/vocab/ns tag.
+            # Pair by the full protocol (test_meta vocab/seq_len/fit_fp), not
+            # by the first filename whose sequence length happens to match:
+            # a mis-paired test file makes both false positives and false
+            # negatives in the overlap audit.
+            _cands = []
+            for _tmp in sorted(glob.glob(os.path.join(cd, 'test_meta_*.json'))):
+                _tm = _load(_tmp)
+                if not isinstance(_tm, dict):
+                    continue
+                _ttag = os.path.basename(_tmp)[len('test_meta_'):-len('.json')]
+                _tfp = os.path.join(cd, f'test_ids_{_ttag}.npy')
+                if not os.path.exists(_tfp):
+                    continue
+                if meta.get('seq_len') is not None and _tm.get('seq_len') is not None and int(_tm['seq_len']) != int(meta['seq_len']):
+                    continue
+                if meta.get('vocab') is not None and _tm.get('vocab') is not None and int(_tm['vocab']) != int(meta['vocab']):
+                    continue
+                if meta.get('fit_fp') and _tm.get('fit_fp') and meta['fit_fp'] != _tm['fit_fp']:
+                    continue
+                _cands.append((_tfp, _ttag))
             te = None
-            for tf in test_files:
+            if len(_cands) == 1:
+                _tfp, _ttag = _cands[0]
                 try:
-                    cand = np.load(tf, mmap_mode='r')
+                    te = np.load(_tfp, mmap_mode='r')
+                    rec['test_file'] = os.path.basename(_tfp)
+                    rec['test_tag'] = _ttag
                 except Exception:
-                    continue
-                if meta.get('seq_len') is not None and cand.shape[1] != int(meta['seq_len']):
-                    continue
-                te = cand
-                rec['test_file'] = os.path.basename(tf)
-                break
+                    te = None
+            elif len(_cands) > 1:
+                rec['test_pairing'] = 'ambiguous'
+                rec['test_candidates'] = sorted(os.path.basename(p) for p, _ in _cands)
+                _warn(f'{cd}/{tag}: {len(_cands)} test caches match the same protocol; refusing to guess which test split to audit')
+            else:
+                rec['test_pairing'] = 'not_found'
             if te is not None:
                 rec['test_shape'] = list(te.shape)
                 if np.issubdtype(np.asarray(te).dtype, np.integer):

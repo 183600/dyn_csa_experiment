@@ -3539,12 +3539,22 @@ def _array_file_path(arr):
     return fn if same else None
 
 def _cache_file_sigs(paths):
-    """size+mtime_ns signature for the files a cache entry is built from."""
+    """size+mtime+ctime+inode signature for the files a cache entry is built from.
+
+    size+mtime alone can be preserved when a file is replaced by a same-size
+    copy (or copied with ``cp -p``).  ``ctime`` cannot be set by user code and
+    the inode changes on replacement, so a stale/mixed file no longer matches
+    its recorded signature; the content fingerprint sidecars
+    (``*.idsfp.json``) are keyed on the same fields, so they are invalidated
+    too.
+    """
     out = {}
     for _k, _p in paths.items():
         try:
             _st = os.stat(_p)
-            out[_k] = [int(_st.st_size), int(_st.st_mtime_ns)]
+            out[_k] = [int(_st.st_size), int(_st.st_mtime_ns),
+                       int(getattr(_st, 'st_ctime_ns', int(_st.st_ctime * 1e9))),
+                       int(getattr(_st, 'st_ino', 0))]
         except OSError:
             return None
     return out
@@ -3553,6 +3563,13 @@ def _cache_file_sigs(paths):
 def _cache_file_sigs_match(meta, sigs):
     rec = meta.get('file_sigs') if isinstance(meta, dict) else None
     return bool(sigs) and isinstance(rec, dict) and all(rec.get(_k) == _v for _k, _v in sigs.items())
+
+
+def _memo_file_sig(paths):
+    """In-process memo key component: includes ctime/inode, so replacing a file
+    (even with preserved size/mtime) invalidates the memo entry."""
+    s = _cache_file_sigs(paths)
+    return tuple(tuple(v) for v in s.values()) if s else None
 
 
 def _array_id_range(arr):
@@ -3587,13 +3604,17 @@ def _ids_fp(train_ids):
     if _path is not None:
         try:
             _st = os.stat(_path)
-            _stat = (int(getattr(_st, 'st_size', 0)), int(getattr(_st, 'st_mtime_ns', int(_st.st_mtime * 1e9))))
+            _stat = (int(getattr(_st, 'st_size', 0)),
+                     int(getattr(_st, 'st_mtime_ns', int(_st.st_mtime * 1e9))),
+                     int(getattr(_st, 'st_ctime_ns', int(_st.st_ctime * 1e9))),
+                     int(getattr(_st, 'st_ino', 0)))
             _side = _path + '.idsfp.json'
             _tshape = tuple(int(_x) for _x in np.shape(train_ids))
             _tdtype = np.dtype(np.asarray(train_ids).dtype).str
             with open(_side, encoding='utf-8') as _sf:
                 _rec = json.load(_sf)
-            if ((int(_rec.get('size', -1)), int(_rec.get('mtime_ns', -1))) == _stat
+            if ((int(_rec.get('size', -1)), int(_rec.get('mtime_ns', -1)),
+                 int(_rec.get('ctime_ns', -1)), int(_rec.get('inode', -1))) == _stat
                     and isinstance(_rec.get('fp'), str)
                     and _rec.get('dtype') == _tdtype
                     and tuple(_rec.get('shape') or ()) == _tshape):
@@ -3635,7 +3656,8 @@ def _ids_fp(train_ids):
         _IDS_FP_MEMO[_key] = (_ref, _fp)
     if _side is not None and _stat is not None:
         try:
-            _rec_out = {'size': _stat[0], 'mtime_ns': _stat[1], 'fp': _fp,
+            _rec_out = {'size': _stat[0], 'mtime_ns': _stat[1],
+                        'ctime_ns': _stat[2], 'inode': _stat[3], 'fp': _fp,
                         'dtype': np.dtype(np.asarray(train_ids).dtype).str,
                         'shape': [int(_x) for _x in np.shape(train_ids)]}
             atomic_write_json(_side, _rec_out)
@@ -3753,7 +3775,7 @@ _WT103_MEMO_CAP = 4
 def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_dir='./wt103_cache'):
     from datasets import load_dataset
     os.makedirs(cache_dir, exist_ok=True)
-    tag = f'v4_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}'
+    tag = f'v5_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}'
     tr_path = os.path.join(cache_dir, f'train_ids_{tag}.npy')
     va_path = os.path.join(cache_dir, f'val_batch_{tag}.npy')
     vp_path = os.path.join(cache_dir, f'val_bnd_{tag}.npy')
@@ -3766,7 +3788,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         # memo.  The memo key carries every file's size+mtime, so an
         # externally rebuilt cache is re-read (and re-verified) instead
         # of being served stale.  Callers never mutate the served arrays.
-        _sig = tuple((os.path.getsize(_p), os.path.getmtime(_p)) for _p in (tr_path, va_path, vp_path, me_path))
+        _sig = _memo_file_sig({'train': tr_path, 'val': va_path,
+                               'bnd': vp_path, 'meta': me_path})
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_MEMO.get(_mkey)
         if _hit is not None:
@@ -3781,13 +3804,19 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         _fast = _cache_file_sigs_match(meta, _sigs)
         _problems = _cached_split_problems(meta, train_ids, val_batch, val_bnd,
                                            meta.get('vocab'), seq_len=seq_len,
-                                           fingerprints_trusted=_fast,
+                                           fingerprints_trusted=False,
                                            ranges_trusted=_fast)
+        if meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget':
+            _problems.append('cache does not attest the frozen train-prefix tokenizer fit')
+        if not isinstance(meta.get('dedup'), dict):
+            _problems.append('cache does not attest whole-document exact/near duplicate filtering')
         if _problems:
             _cache_warning('WikiText train/validation split', _problems)
         else:
             if 'val_fp' not in meta:
                 print('[data] NOTE: this is a legacy cache without a validation fingerprint; its file bytes are range/shape-checked but its split membership cannot be independently re-derived. New caches record val_fp.')
+            audit_corpus_split(train_ids, val_batch, int(meta['vocab']),
+                               dataset='wikitext', meta=meta)
             _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
             _memo_put(_WT103_MEMO, _mkey, _out, _WT103_MEMO_CAP)
             return _out
@@ -3804,14 +3833,29 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             raise last_err if last_err is not None else RuntimeError('load_wikitext: no dataset repository could be loaded')
     if not hasattr(ds, '__getitem__') or 'train' not in ds or 'validation' not in ds:
         raise TypeError(f"load_wikitext: the loaded corpus object does not expose the ['train']/['validation'] splits (got {type(ds).__name__}); refusing to tokenise a corpus we cannot identify")
-    fit_rows = min(len(ds['train']), 50000)
-    fit_text = ds['train'].select(range(fit_rows))['text']
-    tok = build_tokenizer(fit_text, vocab_size)
+    # Tokenizer fit is a frozen TRAIN prefix with an explicit token budget:
+    # every document it sees is also inside the model's training region (for
+    # caps below the global budget), never a validation/test row.  The budget
+    # is fixed across the scale ladder so S1/S2/S3 share one tokenizer version.
+    _fit_cap = min(int(TOKENIZER_FIT_TOKENS), int(n_train_tokens))
+    _fit_rows_all = [r for r in ds['train']['text'] if isinstance(r, str) and r.strip()]
+    fit_text, tok, n_fit_tokens = _wikitext_fit_rows(
+        _fit_rows_all, vocab_size, _fit_cap, max_rows=50000)
+    if tok is None or not fit_text:
+        raise RuntimeError('load_wikitext: the train split has no non-empty text rows to fit the tokenizer')
     vocab = tok.get_vocab_size()
     fit_fp = _text_fp(fit_text)
+    _dedup = _DocDeduplicator()
+    _fit_doc_prefix = list(fit_text)
+    for _r in _fit_doc_prefix:
+        _dedup.is_duplicate(_r)
+    _fit_dedup = _dedup.stats()
+    _n_fit_docs = len(_fit_doc_prefix)
     del fit_text
+    del _fit_rows_all
     gc.collect()
     eos_id = tok.token_to_id('<eos>')
+    _dedup_by_split = {}
 
     def stream_tokenise(split, cap_tokens, label, _ds=ds, _tok=tok, _eos=eos_id):
         # Ids accumulate in bounded numpy chunks; the int64 values produced are
@@ -3821,6 +3865,9 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         chunks = []
         cur = []
         n_flushed = 0
+        _skipped = {'exact': 0, 'near': 0}
+        _dedup_by_split[split] = _skipped
+        _n_nonempty_seen = 0
 
         def _flush():
             nonlocal n_flushed
@@ -3833,9 +3880,25 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         for start in range(0, len(_ds[split]), row_chunk):
             rows = _ds[split][start:start + row_chunk]['text']
             rows = [r for r in rows if r.strip()]
-            for enc in _tok.encode_batch(rows):
-                cur.extend(enc.ids)
-                cur.append(_eos)
+            kept = []
+            for _j, r in enumerate(rows):
+                # The tokenizer-fit documents are the frozen TRAIN prefix and
+                # are part of the model's training stream; do not filter them
+                # out as duplicates of themselves on the first pass.
+                if split == 'train' and (_n_nonempty_seen + _j) < len(_fit_doc_prefix):
+                    kept.append(r)
+                    continue
+                _dup, _kind = _dedup.is_duplicate(r)
+                if _dup:
+                    _skipped[_kind] += 1
+                else:
+                    kept.append(r)
+            _n_nonempty_seen += len(rows)
+            rows = kept
+            if rows:
+                for enc in _tok.encode_batch(rows):
+                    cur.extend(enc.ids)
+                    cur.append(_eos)
             if len(cur) >= (1 << 22):
                 _flush()
             # Running token count: same integer as summing the chunk sizes,
@@ -3844,7 +3907,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             if n_have >= cap_tokens:
                 break
             if start and start % 50000 == 0:
-                print(f'    [{label}] {start} rows, {n_have} tokens')
+                print(f'    [{label}] {start} rows, {n_have} tokens, '
+                      f'{sum(_skipped.values())} duplicate docs skipped')
         _flush()
         if not chunks:
             return np.empty(0, dtype=np.int64)
@@ -3865,6 +3929,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     _validate_token_ids(train_ids, vocab, 'wikitext train_ids')
     _validate_token_ids(val_batch, vocab, 'wikitext val_batch')
     print(f'[data] val sequences = {n_val} (seq_len={seq_len})')
+    audit_corpus_split(train_ids, val_batch, vocab, dataset='wikitext')
     bnd_ids = sorted(boundary_token_ids(tok, eos_id))
     val_bnd = np.isin(val_batch, bnd_ids)
     print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
@@ -3888,9 +3953,17 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         'fit_fp': fit_fp,
         'file_sigs': _file_sigs,
         'id_range': {'train': _array_id_range(train_ids), 'val': _array_id_range(val_batch)},
-        'split_strategy': 'official_train_validation_test',
+        'split_strategy': 'official_train_validation_test_deduplicated',
         'shuffle_at_split': False,
         'tokenizer_fit_split': 'train',
+        'tokenizer_fit_protocol': 'train_prefix_token_budget',
+        'tokenizer_fit_token_cap': int(min(TOKENIZER_FIT_TOKENS, int(n_train_tokens))),
+        'tokenizer_fit_max_rows': 50000,
+        'tokenizer_fit_tokens': int(n_fit_tokens),
+        'tokenizer_fit_rows': int(_n_fit_docs),
+        'tokenizer_fit_docs_in_train_prefix': True,
+        'dedup': {'fit': _fit_dedup, 'splits': _dedup_by_split},
+        'group_isolation': 'whole_documents_exact_and_near_duplicate_filtered',
         'train_tokens': int(len(train_ids)),
         'val_sequences': int(val_batch.shape[0]),
         'seq_len': int(seq_len),
@@ -3956,20 +4029,22 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
     只读 wiki.test.raw（本地 dump 或 HF test split），绝不触碰 train/validation，
     因此可作冻结后的独立最终评估数据（design_notes §17 的「未参与方法选择的
     数据」）。与 load_wikitext 同一套纪律：npy 缓存 + sha256 内容指纹 + 原子写；
-    分词器用与主语料完全相同的拟合过程（同一份 train 前 50k 行，确定性
-    BPE）重建，并把拟合语料指纹存进 meta 以供审计。缓存命中只校验自身
-    指纹；train 语料被更换时应删除整个 wt103_cache/（README「Reproducing」
-    一节同款约定），否则 test 缓存不会跟随重建——这是显式记录的边界，
-    不是静默的失效路径。"""
+    分词器使用与主语料完全相同的冻结 train-prefix token 预算（预算记录在
+    train cache meta 中）重建，并把拟合语料指纹存进 meta 以供审计。构建
+    test 缓存时，与 training documents 完全相同或近重复（SimHash）的 test
+    文档会在 tokenisation 前被剔除并记录数量，从而冻结一个去重后的评估
+    子集。缓存命中会校验内容指纹、tokenizer 拟合来源和去重元数据；train
+    语料被更换时应删除整个 wt103_cache/，否则 test 缓存不会跟随重建——
+    这是显式记录的边界，不是静默的失效路径。"""
     from datasets import load_dataset
     os.makedirs(cache_dir, exist_ok=True)
-    tag = f'v1_sl{seq_len}_v{vocab_size}_ns{n_seqs}'
+    tag = f'v2_sl{seq_len}_v{vocab_size}_ns{n_seqs}'
     te_path = os.path.join(cache_dir, f'test_ids_{tag}.npy')
     tb_path = os.path.join(cache_dir, f'test_bnd_{tag}.npy')
     me_path = os.path.join(cache_dir, f'test_meta_{tag}.json')
     tk_path = os.path.join(cache_dir, f'test_tok_{tag}.json')
     if all((os.path.exists(p) for p in (te_path, tb_path, me_path))):
-        _sig = tuple((os.path.getsize(_p), os.path.getmtime(_p)) for _p in (te_path, tb_path, me_path))
+        _sig = _memo_file_sig({'test': te_path, 'bnd': tb_path, 'meta': me_path})
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_TEST_MEMO.get(_mkey)
         if _hit is not None:
@@ -3982,7 +4057,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
         _problems = []
         _sigs = _cache_file_sigs({'test': te_path, 'bnd': tb_path})
         _fast = _cache_file_sigs_match(meta, _sigs)
-        if not _fast and meta.get('src_fp') != _ids_fp(test_ids):
+        if meta.get('src_fp') != _ids_fp(test_ids):
             _problems.append('test id fingerprint does not match the test meta file')
         if np.asarray(test_bnd).shape != np.asarray(test_ids).shape:
             _problems.append(f'test boundary mask shape {np.asarray(test_bnd).shape} != {np.asarray(test_ids).shape}')
@@ -3990,13 +4065,17 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
             _problems.append('metadata records a shuffled split')
         if meta.get('tokenizer_fit_split') not in (None, 'train'):
             _problems.append(f"tokenizer was fitted on {meta.get('tokenizer_fit_split')!r}, not train")
+        if meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget':
+            _problems.append('test cache does not attest the frozen train-prefix tokenizer fit')
+        if not isinstance(meta.get('near_duplicate_cleanup'), dict):
+            _problems.append('test cache does not attest near-duplicate cleanup against train')
         # A cached test set is only pairable if its tokenizer was fitted on the
         # SAME train prefix as the train/validation cache.  Verifying this on
         # the cold path is not enough: a swapped test cache could otherwise
         # serve a tokenizer that saw test text.
         _train_fit_fps = set()
         import glob as _glob2
-        for _mp in _glob2.glob(os.path.join(cache_dir, 'meta_v4_*.json')):
+        for _mp in _glob2.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
             try:
                 _mt = json.load(open(_mp, encoding='utf-8'))
             except Exception:
@@ -4047,14 +4126,33 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
         if ds is None:
             raise last_err if last_err is not None else RuntimeError('load_wikitest: no test-split source available (local dump wiki.test.raw or the HF dataset)')
         test_rows = ds['test']['text']
-    # tokenizer: identical fit to load_wikitext (first <=50k TRAIN rows, deterministic BPE)
-    train_fit_rows = None
+    # tokenizer: identical frozen-train-prefix fit to load_wikitext.  The
+    # token budget is taken from the paired train cache when it is unique, so
+    # the test tokenizer is an exact function of the same train region.
+    import glob as _glob
+    _fit_cap = int(TOKENIZER_FIT_TOKENS)
+    _fit_max_rows = 50000
+    _train_meta_objs = []
+    for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
+        try:
+            _train_meta_objs.append(json.load(open(_mp, encoding='utf-8')))
+        except Exception:
+            continue
+    _caps = {int(_m['tokenizer_fit_token_cap']) for _m in _train_meta_objs
+             if _m.get('tokenizer_fit_token_cap') is not None}
+    _maxrows = {int(_m['tokenizer_fit_max_rows']) for _m in _train_meta_objs
+                if _m.get('tokenizer_fit_max_rows') is not None}
+    if len(_caps) == 1:
+        _fit_cap = _caps.pop()
+    if len(_maxrows) == 1:
+        _fit_max_rows = _maxrows.pop()
+    train_rows_source = None
     for cand in _cands:
         _f = os.path.join(cand, 'wiki.train.raw')
         if os.path.exists(_f):
-            train_fit_rows = _read_raw_rows(_f)[:50000]
+            train_rows_source = _read_raw_rows(_f)
             break
-    if train_fit_rows is None:
+    if train_rows_source is None:
         if ds is None:
             for repo in ('Salesforce/wikitext', 'wikitext'):
                 try:
@@ -4064,8 +4162,15 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
                     last_err = e
             if ds is None:
                 raise last_err if last_err is not None else RuntimeError('load_wikitest: no train source to fit the shared tokenizer')
-        train_fit_rows = ds['train'].select(range(min(len(ds['train']), 50000)))['text']
-    tok = build_tokenizer(list(train_fit_rows), vocab_size)
+        train_rows_source = list(ds['train']['text'])
+    # Same blank-row filtering as load_wikitext, otherwise the two tokenizer
+    # fit corpora (and therefore the vocabularies) can differ.
+    train_rows_source = [r for r in train_rows_source
+                         if isinstance(r, str) and r.strip()]
+    train_fit_rows, tok, n_fit_tokens = _wikitext_fit_rows(
+        train_rows_source, vocab_size, _fit_cap, max_rows=_fit_max_rows)
+    if tok is None or not train_fit_rows:
+        raise RuntimeError('load_wikitest: the train split has no non-empty text rows to fit the shared tokenizer')
     vocab = tok.get_vocab_size()
     eos_id = tok.token_to_id('<eos>')
     # vocabulary consistency with any existing train-side cache: a mismatch means
@@ -4076,7 +4181,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
     # caches without a persisted tokenizer fall back to the size check.
     import glob as _glob
     _test_vocab = dict(tok.get_vocab())
-    _train_tok_paths = _glob.glob(os.path.join(cache_dir, 'tok_v4_*.json'))
+    _train_tok_paths = _glob.glob(os.path.join(cache_dir, 'tok_v5_*.json'))
     for _tp in _train_tok_paths:
         try:
             from tokenizers import Tokenizer as _Tok
@@ -4085,7 +4190,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
             continue
         if dict(_tt.get_vocab()) != _test_vocab:
             raise RuntimeError(f'load_wikitest: the freshly fitted test tokenizer is not identical to the cached train tokenizer ({_tp}) — same-size vocabularies can still use different merges, so the splits cannot be paired; delete wt103_cache/ and rebuild both')
-    for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v4_*.json')):
+    for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
         try:
             _mt = json.load(open(_mp, encoding='utf-8'))
         except Exception:
@@ -4096,7 +4201,29 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
         if int(_mv) != int(vocab):
             raise RuntimeError(f'load_wikitest: the freshly fitted tokenizer (vocab={vocab}) disagrees with the cached train corpus (vocab={_mv} in {_mp}) — the splits cannot be paired; delete wt103_cache/ and rebuild both')
     print(f'[data] tokenising TEST split (cap {n_seqs * seq_len + seq_len} tokens) ...')
-    _trows = list(test_rows) if not isinstance(test_rows, list) else test_rows
+    _trows = list(test_rows) if not isinstance(test_rows, list) else list(test_rows)
+    # Freeze a near-duplicate-clean evaluation subset: any test document that
+    # exactly or near-duplicates a TRAIN document is excluded before
+    # tokenisation.  The index is built from the train split only; test rows
+    # are never used to decide what counts as a duplicate of train.
+    _test_dedup = _DocDeduplicator()
+    for _r in train_rows_source:
+        if isinstance(_r, str) and _r.strip():
+            _test_dedup.is_duplicate(_r)
+    _kept_test = []
+    _excluded = {'exact': 0, 'near': 0}
+    for _r in _trows:
+        if not isinstance(_r, str) or not _r.strip():
+            continue
+        _dup, _kind = _test_dedup.is_duplicate(_r)
+        if _dup:
+            _excluded[_kind] += 1
+        else:
+            _kept_test.append(_r)
+    if _excluded['exact'] or _excluded['near']:
+        print(f'[data] test near-duplicate cleanup: excluded {_excluded["exact"]} exact '
+              f'and {_excluded["near"]} near-duplicate documents that also occur in train')
+    _trows = _kept_test
     ids = _tokenise_row_chunks([_trows[s:s + 10000] for s in range(0, len(_trows), 10000)], n_seqs * seq_len + seq_len, 'test', tok, eos_id)
     n_have = min(len(ids) // seq_len, n_seqs)
     if n_have < n_seqs:
@@ -4125,9 +4252,21 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
         'fit_fp': _text_fp(train_fit_rows),
         'file_sigs': _file_sigs,
         'id_range': {'test': _array_id_range(test_batch)},
-        'split_strategy': 'official_dataset_test_split',
+        'split_strategy': 'official_dataset_test_split_near_duplicate_filtered',
         'shuffle_at_split': False,
         'tokenizer_fit_split': 'train',
+        'tokenizer_fit_protocol': 'train_prefix_token_budget',
+        'tokenizer_fit_token_cap': int(_fit_cap),
+        'tokenizer_fit_max_rows': int(_fit_max_rows),
+        'tokenizer_fit_tokens': int(n_fit_tokens),
+        'near_duplicate_cleanup': {
+            'policy': 'test_documents_duplicating_train_documents_removed',
+            'exact_removed': int(_excluded['exact']),
+            'near_removed': int(_excluded['near']),
+            'near_hamming_threshold': int(_test_dedup.near_threshold),
+            'source_documents': int(len(test_rows)),
+            'kept_documents': int(len(_trows)),
+        },
         'test_sequences': int(test_batch.shape[0]),
         'seq_len': int(seq_len),
     }, indent=0)
@@ -4229,6 +4368,145 @@ def _fineweb_local_source_fingerprint(env_value):
         h.update(b'\0')
     return h.hexdigest()[:16]
 
+def _doc_exact_fp(text):
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str(text).strip().encode('utf-8', errors='replace'))
+    return h.hexdigest()
+
+
+def _doc_simhash(text, *, shingle_words=5, max_shingles=128):
+    """Deterministic 64-bit SimHash over word shingles (near-duplicate key).
+
+    The shingle set is sub-sampled on an evenly spaced grid so very long
+    documents cost a bounded amount; the same text always yields the same hash
+    across processes (blake2b, no Python salted hash).
+    """
+    words = re.findall(r"[\w']+", str(text).lower())
+    if not words:
+        words = [str(text)[:512]]
+    n = min(len(words), 1 << 20)
+    words = words[:n]
+    if len(words) < shingle_words:
+        shingles = [' '.join(words)]
+    else:
+        count = len(words) - shingle_words + 1
+        if count <= max_shingles:
+            pos = range(count)
+        else:
+            pos = np.unique(np.linspace(0, count - 1, int(max_shingles), dtype=np.int64))
+        shingles = [' '.join(words[int(i):int(i) + shingle_words]) for i in pos]
+    vec = [0] * 64
+    for sh in shingles:
+        h = int.from_bytes(hashlib.blake2b(sh.encode('utf-8', errors='replace'),
+                                           digest_size=8).digest(), 'little')
+        for b in range(64):
+            vec[b] += 1 if (h >> b) & 1 else -1
+    out = 0
+    for b, v in enumerate(vec):
+        if v >= 0:
+            out |= (1 << b)
+    return out
+
+
+def _hamming64(a, b):
+    return int((int(a) ^ int(b)).bit_count())
+
+
+def _doc_id_u64(doc_id):
+    h = hashlib.blake2b(str(doc_id).encode('utf-8', errors='replace'), digest_size=8)
+    return np.uint64(int.from_bytes(h.digest(), 'little'))
+
+
+class _DocDeduplicator:
+    """Exact + near-duplicate document filter with a deterministic LSH index.
+
+    A document is a group: once seen (tokenizer fit, train or validation) any
+    exact copy or a near copy within ``near_threshold`` SimHash bits is skipped
+    on every later split.  This is what keeps a document (or a lightly edited
+    copy) from appearing on both sides of the split.
+    """
+
+    def __init__(self, *, near_threshold=3, bands=4):
+        if bands < 1 or bands > 8:
+            raise ValueError('bands must be in [1, 8]')
+        self.near_threshold = int(near_threshold)
+        self.bands = int(bands)
+        self.bits = 64 // self.bands
+        self.mask = (1 << self.bits) - 1
+        self.exact = set()
+        self.buckets = {}
+        self.n_exact_skipped = 0
+        self.n_near_skipped = 0
+        self.n_seen = 0
+
+    def _bucket_keys(self, h):
+        return [(b, (int(h) >> (b * self.bits)) & self.mask)
+                for b in range(self.bands)]
+
+    def is_duplicate(self, text):
+        fp = _doc_exact_fp(text)
+        if fp in self.exact:
+            self.n_exact_skipped += 1
+            return True, 'exact'
+        h = _doc_simhash(text)
+        for key in self._bucket_keys(h):
+            for other in self.buckets.get(key, ()):
+                if _hamming64(h, other) <= self.near_threshold:
+                    self.n_near_skipped += 1
+                    return True, 'near'
+        self.exact.add(fp)
+        self.n_seen += 1
+        for key in self._bucket_keys(h):
+            self.buckets.setdefault(key, []).append(h)
+        return False, None
+
+    def stats(self):
+        return {'policy': 'exact_content_hash+simhash_lsh',
+                'simhash_bits': 64,
+                'near_hamming_threshold': self.near_threshold,
+                'added_documents': int(self.n_seen),
+                'exact_duplicates_skipped': int(self.n_exact_skipped),
+                'near_duplicates_skipped': int(self.n_near_skipped)}
+
+
+TOKENIZER_FIT_TOKENS = 8_000_000
+
+
+def _wikitext_fit_rows(rows, vocab_size, token_cap, max_rows=50000):
+    """Select a deterministic train-prefix fit corpus within ``token_cap``.
+
+    The old code always fitted the tokenizer on up to 50k train rows, which can
+    extend past the model's token cap (and therefore past the corpus the model
+    actually trains on).  Here the candidate prefix is measured with the
+    tokenizer it is used to build; rows (or, for a single oversized row, the
+    row text) beyond the budget are shortened and the tokenizer is rebuilt
+    until the final fit text itself fits inside the cap.  The result is a
+    prefix of the train split, so it can never include validation/test text.
+    """
+    total = min(len(rows), int(max_rows))
+    if total <= 0 or int(token_cap) <= 0:
+        return [], None, 0
+    fit_text = list(rows[:total])
+    tok = None
+    n_tok = 0
+    for _ in range(24):
+        tok = build_tokenizer(fit_text, vocab_size)
+        n_tok = int(sum(len(enc.ids) + 1 for enc in tok.encode_batch(fit_text))) if fit_text else 0
+        if n_tok <= int(token_cap):
+            return fit_text, tok, n_tok
+        if len(fit_text) > 1:
+            keep = max(1, int(len(fit_text) * (float(token_cap) / max(n_tok, 1)) * 0.95))
+            fit_text = fit_text[:min(len(fit_text) - 1, keep)]
+        else:
+            text = str(fit_text[0])
+            new_len = max(1, int(len(text) * (float(token_cap) / max(n_tok, 1)) * 0.95))
+            if new_len >= len(text):
+                new_len = len(text) - 1
+            if new_len <= 0:
+                break
+            fit_text = [text[:new_len]]
+    return fit_text, tok, n_tok
+
 def _fineweb_local_rows(env_value):
     """Offline FineWeb-Edu stand-in: FWEDU_LOCAL_JSONL lists files or
     directories (os.pathsep-separated; directories expand to their sorted
@@ -4280,6 +4558,18 @@ def _fineweb_rows(source):
             print(f'    [fineweb] {n_docs} docs streamed')
         yield str(text)
 
+def _fineweb_docs(source):
+    """Ordered ``(doc_id, text)`` pairs.
+
+    ``doc_id`` is a stable content fingerprint (the only identifier available
+    for both the hub and the offline JSONL stand-in), so train/validation
+    metadata can prove document-level disjointness instead of merely claiming
+    that stream positions were different.
+    """
+    for text in _fineweb_rows(source):
+        txt = str(text)
+        yield _doc_exact_fp(txt), txt
+
 def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, cache_dir='./fineweb_cache', source='sample-10BT', fit_docs=20000):
     """B-tier corpus (docs/compute_plan.md §5): FineWeb-Edu, self-trained BPE.
 
@@ -4291,13 +4581,15 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         actual vocab) and served at that width; every consumer widens ids back
         to int64 per batch exactly as the int64 corpora always did, so yielded
         batches are bit-identical to the int64-storage form;
-      - the corpus is built in one streaming pass (fit tokenizer on the first
-        `fit_docs` documents, then train tokens up to n_train_tokens + seq_len,
-        then the validation holdout: val_seqs*seq_len + seq_len tokens drawn
-        from documents strictly after the train region — non-overlapping and
-        deterministic per protocol tag, but not necessarily token-contiguous:
-        the partial final train batch (up to one 4096-doc fetch block) is
-        discarded between the two regions);
+      - the corpus is built in one streaming pass: the tokenizer-fit documents
+        are the TRAIN PREFIX (bounded by a frozen token budget), then train
+        tokens continue up to n_train_tokens + seq_len, then the validation
+        holdout draws val_seqs*seq_len + seq_len tokens from documents strictly
+        after the train region.  Exact and near-duplicate documents are removed
+        as whole groups across all phases, document ids are written next to
+        the cache and their disjointness is re-checked on every hit.  The
+        validation region is closed per protocol tag (never reused across
+        caps); the partial final train batch is discarded between regions;
       - val_batch is int64 (eval paths feed targets straight to cross entropy).
     """
     os.makedirs(cache_dir, exist_ok=True)
@@ -4309,13 +4601,18 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     _local_env = os.environ.get('FWEDU_LOCAL_JSONL', '').strip()
     _local_tag = f'_loc{hashlib.sha1(_local_env.encode("utf-8")).hexdigest()[:8]}' if _local_env else ''
     _local_sig = _fineweb_local_source_fingerprint(_local_env) if _local_env else None
-    tag = f'v1_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}_fw{source}_fd{fit_docs}{_local_tag}'
+    tag = f'v2_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}_fw{source}_fd{fit_docs}{_local_tag}'
     tr_path = os.path.join(cache_dir, f'train_ids_{tag}.npy')
     va_path = os.path.join(cache_dir, f'val_batch_{tag}.npy')
     vp_path = os.path.join(cache_dir, f'val_bnd_{tag}.npy')
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
-    if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
-        _sig = tuple((os.path.getsize(p), os.path.getmtime(p)) for p in (tr_path, va_path, vp_path, me_path))
+    trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
+    vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
+    if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path,
+                                        trd_path, vad_path))):
+        _sig = _memo_file_sig({'train': tr_path, 'val': va_path, 'bnd': vp_path,
+                               'meta': me_path, 'train_doc_ids': trd_path,
+                               'val_doc_ids': vad_path})
         _mkey = (os.path.abspath(cache_dir), tag, _sig, _local_sig)
         _hit = _FWEB_MEMO.get(_mkey)
         if _hit is not None:
@@ -4324,9 +4621,10 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         print('[data] loading cached fineweb token ids ...')
         meta = json.load(open(me_path, encoding='utf-8'))
         train_ids = _npy_serve_int32(tr_path)
-        _sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path})
+        _sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path,
+                                  'train_doc_ids': trd_path, 'val_doc_ids': vad_path})
         _fast = _cache_file_sigs_match(meta, _sigs)
-        if not _fast and meta.get('src_fp') != _ids_fp(train_ids):
+        if meta.get('src_fp') != _ids_fp(train_ids):
             print('[data] WARNING: the cached fineweb train_ids do not match the fingerprint in the meta file — the cache is corrupt or was mixed across builds; REBUILDING it')
         elif _local_sig is not None and meta.get('local_source_sig') != _local_sig:
             print('[data] WARNING: the local FineWeb-Edu stand-in source changed since this cache was built — REBUILDING the cache (a stale corpus must not keep its old fingerprint)')
@@ -4335,27 +4633,63 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             val_bnd = np.load(vp_path)
             _problems = _cached_split_problems(meta, train_ids, val_batch, val_bnd,
                                                meta.get('vocab'), seq_len=seq_len,
-                                               fingerprints_trusted=_fast,
+                                               fingerprints_trusted=False,
                                                ranges_trusted=_fast)
+            try:
+                _trd = np.load(trd_path)
+                _vad = np.load(vad_path)
+                _shared_docs = int(np.intersect1d(_trd, _vad, assume_unique=True).size)
+                if _shared_docs:
+                    _problems.append(f'{_shared_docs} document ids occur in both train and validation')
+                if meta.get('doc_ids', {}).get('disjoint') is not True:
+                    _problems.append('cache metadata does not attest document-level disjointness')
+            except Exception as _de:
+                _problems.append(f'document-id sidecars unreadable ({type(_de).__name__}: {_de})')
+            if (meta.get('validation_region') or {}).get('policy') != 'per_cap_closed_no_cross_cap_reuse':
+                _problems.append('cache does not declare a closed per-cap validation region')
+            if (meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget'
+                    or meta.get('tokenizer_fit_docs_in_train_prefix') is not True):
+                _problems.append('cache does not attest a tokenizer fit inside the training prefix')
             if _problems:
                 _cache_warning('FineWeb train/validation split', _problems)
             else:
                 if 'val_fp' not in meta:
                     print('[data] NOTE: this is a legacy FineWeb cache without a validation fingerprint; shape/range checks passed but split membership cannot be independently re-derived. New caches record val_fp.')
+                audit_corpus_split(train_ids, val_batch, int(meta['vocab']),
+                                   dataset='fineweb', meta=meta)
                 _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
                 _memo_put(_FWEB_MEMO, _mkey, _out, _FWEB_MEMO_CAP)
                 return _out
-    rows = _fineweb_rows(source)
-    fit_text = []
-    for _i, doc in enumerate(rows):
-        if _i >= fit_docs:
+    rows = _fineweb_docs(source)
+    _dedup = _DocDeduplicator()
+    _skipped = {'fit': {'exact': 0, 'near': 0},
+                'train': {'exact': 0, 'near': 0},
+                'validation': {'exact': 0, 'near': 0}}
+    fit_pairs = []
+    while len(fit_pairs) < int(fit_docs):
+        try:
+            doc_id, doc = next(rows)
+        except StopIteration:
             break
-        fit_text.append(doc)
-    print(f'[data] training BPE tokenizer on {len(fit_text)} fineweb docs (vocab_size={vocab_size}) ...')
-    tok = build_tokenizer(fit_text, vocab_size)
+        _dup, _kind = _dedup.is_duplicate(doc)
+        if _dup:
+            _skipped['fit'][_kind] += 1
+            continue
+        fit_pairs.append((doc_id, doc))
+    _fit_cap = min(int(TOKENIZER_FIT_TOKENS), int(n_train_tokens))
+    _fit_candidates = [d for _, d in fit_pairs]
+    fit_text, tok, n_fit_tokens = _wikitext_fit_rows(
+        _fit_candidates, vocab_size, _fit_cap, max_rows=len(_fit_candidates))
+    if tok is None or not fit_text:
+        raise RuntimeError('load_fineweb_edu: no non-empty documents are available for the tokenizer fit')
+    # Keep only the documents that survived the token budget; they form the
+    # train prefix below, so the tokenizer's fit corpus is a subset of the
+    # corpus the model actually sees.
+    fit_pairs = fit_pairs[:len(fit_text)]
+    print(f'[data] training BPE tokenizer on {len(fit_text)} unique fineweb docs '
+          f'({n_fit_tokens} tokens <= fit cap {_fit_cap}, vocab_size={vocab_size}) ...')
+    # _wikitext_fit_rows already built ``tok`` on exactly this fit_text.
     vocab = tok.get_vocab_size()
-    del fit_text
-    gc.collect()
     eos_id = tok.token_to_id('<eos>')
     disk_dt = _fineweb_disk_dtype(vocab)
     cap_train = int(n_train_tokens) + int(seq_len)
@@ -4372,23 +4706,21 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     n_train_total = 0
     n_val_total = 0
     _marks = 0
+    train_doc_ids = []
+    val_doc_ids = []
 
     try:
         buf = []
         print(f'[data] tokenising fineweb train (cap {n_train_tokens} tokens, source {source}) ...')
         with open(raw_train, 'wb') as fh:
-            stop = False
-            while not stop:
-                docs = list(itertools.islice(rows, 4096))
-                if not docs:
-                    break
-                # batched encode — the same Rust pipeline per doc as `encode`,
-                # so the ids (and hence the raw staging bytes / content
-                # fingerprint) are identical to the per-`encode` form; the
-                # per-doc flush / cap checks below run in the original order.
-                for enc in tok.encode_batch(docs):
+            def _write_train_pairs(pairs):
+                nonlocal buf, n_train_total, _marks
+                if not pairs:
+                    return False
+                for (doc_id, _), enc in zip(pairs, tok.encode_batch([d for _, d in pairs])):
                     buf.extend(enc.ids)
                     buf.append(eos_id)
+                    train_doc_ids.append(_doc_id_u64(doc_id))
                     if len(buf) >= (1 << 22):
                         _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                         n_train_total += len(buf)
@@ -4397,8 +4729,29 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                             _marks = n_train_total >> 26
                             print(f'    [train] {n_train_total} tokens')
                     if n_train_total + len(buf) >= cap_train:
-                        stop = True
-                        break
+                        return True
+                return n_train_total + len(buf) >= cap_train
+
+            # The tokenizer-fit documents are the PREFIX of the training
+            # stream, not a separate region: the tokenizer sees exactly the
+            # documents the model's first tokens come from.
+            stop = _write_train_pairs(fit_pairs)
+            del fit_text, fit_pairs
+            gc.collect()
+            while not stop:
+                docs = list(itertools.islice(rows, 4096))
+                if not docs:
+                    break
+                pairs = []
+                for doc_id, doc in docs:
+                    # Whole-document dedup: a document that already appeared
+                    # (fit or train) is never emitted again.
+                    _dup, _kind = _dedup.is_duplicate(doc)
+                    if _dup:
+                        _skipped['train'][_kind] += 1
+                    else:
+                        pairs.append((doc_id, doc))
+                stop = _write_train_pairs(pairs)
             if buf:
                 _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                 n_train_total += len(buf)
@@ -4409,21 +4762,35 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             print(f'[data] WARNING: the source ran dry at {n_train} train tokens (< requested cap {cap_train}); runs configured for the advertised token target will train on fewer tokens than advertised')
         print('[data] tokenising fineweb validation holdout ...')
         with open(raw_val, 'wb') as fh:
-            stop = False
-            while not stop:
-                docs = list(itertools.islice(rows, 4096))
-                if not docs:
-                    break
-                for enc in tok.encode_batch(docs):
+            def _write_val_pairs(pairs):
+                nonlocal buf, n_val_total
+                if not pairs:
+                    return False
+                for (doc_id, _), enc in zip(pairs, tok.encode_batch([d for _, d in pairs])):
                     buf.extend(enc.ids)
                     buf.append(eos_id)
+                    val_doc_ids.append(_doc_id_u64(doc_id))
                     if len(buf) >= (1 << 22):
                         _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                         n_val_total += len(buf)
                         buf = []
                     if n_val_total + len(buf) >= cap_val:
-                        stop = True
-                        break
+                        return True
+                return n_val_total + len(buf) >= cap_val
+
+            stop = False
+            while not stop:
+                docs = list(itertools.islice(rows, 4096))
+                if not docs:
+                    break
+                pairs = []
+                for doc_id, doc in docs:
+                    _dup, _kind = _dedup.is_duplicate(doc)
+                    if _dup:
+                        _skipped['validation'][_kind] += 1
+                    else:
+                        pairs.append((doc_id, doc))
+                stop = _write_val_pairs(pairs)
             if buf:
                 _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                 n_val_total += len(buf)
@@ -4471,7 +4838,13 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         bnd_ids = sorted(boundary_token_ids(tok, eos_id))
         val_bnd = np.isin(val_batch, bnd_ids)
         print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
-        for _p, _a in ((va_path, val_batch), (vp_path, val_bnd)):
+        _train_doc_arr = np.asarray(train_doc_ids, dtype=np.uint64)
+        _val_doc_arr = np.asarray(val_doc_ids, dtype=np.uint64)
+        _shared_docs = int(np.intersect1d(_train_doc_arr, _val_doc_arr, assume_unique=True).size)
+        if _shared_docs:
+            raise RuntimeError(f'load_fineweb_edu: {_shared_docs} document ids occur in both train and validation — refusing to write a leaking split')
+        for _p, _a in ((va_path, val_batch), (vp_path, val_bnd),
+                       (trd_path, _train_doc_arr), (vad_path, _val_doc_arr)):
             _fd, _tmp = tempfile.mkstemp(dir=raw_dir, prefix=os.path.basename(_p) + '.', suffix='.tmp')
             try:
                 with os.fdopen(_fd, 'wb') as _fh:
@@ -4485,13 +4858,29 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 raise
         train_ids = _npy_serve_int32(tr_path)
         _validate_token_ids(train_ids, vocab, 'fineweb train_ids')
-        _file_sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path})
+        _file_sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path,
+                                       'train_doc_ids': trd_path, 'val_doc_ids': vad_path})
         atomic_write_json(me_path, {
             'vocab': vocab,
             'src_fp': _ids_fp(train_ids),
             'val_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
             'file_sigs': _file_sigs,
             'id_range': {'train': _array_id_range(train_ids), 'val': _array_id_range(val_batch)},
+            'doc_ids': {
+                'train_count': int(_train_doc_arr.size),
+                'validation_count': int(_val_doc_arr.size),
+                'train_fp': _ids_fp(_train_doc_arr),
+                'validation_fp': _ids_fp(_val_doc_arr),
+                'overlap': _shared_docs,
+                'disjoint': True,
+                'policy': 'whole_document_exact_and_near_duplicate_filtered',
+            },
+            'dedup': {
+                'fit': dict(_skipped['fit']),
+                'train': dict(_skipped['train']),
+                'validation': dict(_skipped['validation']),
+                **{'simhash_'+k: v for k, v in _dedup.stats().items() if k.startswith('near_') or k == 'policy'},
+            },
             'local_source_sig': _local_sig,
             'source': source,
             'fit_docs': fit_docs,
@@ -4501,14 +4890,29 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             'n_train_actual': int(n_train),
             'val_seqs': int(val_seqs),
             'val_sequences': int(val_batch.shape[0]),
-            'split_strategy': 'chronological_document_disjoint',
-            'split_order': ['tokenizer_fit', 'train', 'validation'],
+            'split_strategy': 'stream_order_document_disjoint_deduplicated',
+            'split_order': ['tokenizer_fit_prefix', 'train', 'validation'],
             'shuffle_at_split': False,
             'tokenizer_fit_split': 'train',
+            'tokenizer_fit_protocol': 'train_prefix_token_budget',
+            'tokenizer_fit_token_cap': int(_fit_cap),
+            'tokenizer_fit_tokens': int(n_fit_tokens),
+            'tokenizer_fit_docs_in_train_prefix': True,
+            'train_region_end_tokens': int(n_train),
+            'validation_region': {
+                'policy': 'per_cap_closed_no_cross_cap_reuse',
+                'start_token_approx': int(n_train_total),
+                'end_token_approx': int(n_train_total + n_val_tokens),
+                'note': ('this validation region is closed for this protocol tag; '
+                         'never reuse it as another cap\'s validation and never '
+                         'compare runs whose val_fp differs'),
+            },
         }, indent=0)
         print('[data] cached fineweb token ids to disk (resume-safe)')
+        audit_corpus_split(train_ids, val_batch, vocab, dataset='fineweb',
+                           meta=json.load(open(me_path, encoding='utf-8')))
         _out = (train_ids, val_batch, vocab, tok, val_bnd)
-        _memo_put(_FWEB_MEMO, (os.path.abspath(cache_dir), tag, tuple((os.path.getsize(p), os.path.getmtime(p)) for p in (tr_path, va_path, vp_path, me_path)), _local_sig), _out, _FWEB_MEMO_CAP)
+        _memo_put(_FWEB_MEMO, (os.path.abspath(cache_dir), tag, _memo_file_sig({'train': tr_path, 'val': va_path, 'bnd': vp_path, 'meta': me_path, 'train_doc_ids': trd_path, 'val_doc_ids': vad_path}), _local_sig), _out, _FWEB_MEMO_CAP)
         return _out
     finally:
         for _raw in (raw_train, raw_val):
@@ -4516,6 +4920,155 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 os.unlink(_raw)
             except OSError:
                 pass
+
+_CORPUS_AUDIT_MEMO = {}
+
+
+def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
+                       meta=None, max_scan_tokens=2_000_000, sample_rows=64,
+                       shift_warn=0.25, shift_fail=0.75, strict=True):
+    """Hard pre-training gate for a cached/served token split.
+
+    Runs before any model fitting and raises on a hard leakage/data-quality
+    failure: out-of-vocabulary ids, non-finite or empty holdouts, duplicate
+    rows *across* splits (exact match on a deterministic sample of the train
+    stream), non-disjoint document ids when the cache records them, and
+    materially shifted holdout token distributions.  A clean report is cached
+    by the two content fingerprints, so resume phases do not rescan.
+    """
+    import data_guard as _DG
+    tr = np.asarray(train_ids).reshape(-1)
+    va = np.asarray(val_batch)
+    report = {
+        'dataset': dataset,
+        'train_tokens': int(tr.size),
+        'val_shape': list(va.shape),
+        'vocab': int(vocab),
+        'hard_failures': [],
+        'warnings': [],
+        'meta_split_strategy': (meta or {}).get('split_strategy'),
+    }
+    key = (dataset, int(vocab), _ids_fp(tr),
+           _ids_fp(np.ascontiguousarray(va).reshape(-1)) if va.size else None)
+    _hit = _CORPUS_AUDIT_MEMO.get(key)
+    if _hit is not None:
+        return _hit
+    try:
+        _validate_token_ids(tr, vocab, f'{dataset} train_ids')
+        _validate_token_ids(va, vocab, f'{dataset} val_batch')
+    except (TypeError, ValueError) as e:
+        report['hard_failures'].append(str(e))
+    if va.ndim != 2 or va.shape[0] == 0 or va.size == 0:
+        report['hard_failures'].append(f'validation split is empty or not 2-D (shape {va.shape})')
+    if tr.size < 2:
+        report['hard_failures'].append('training stream has fewer than 2 tokens')
+    # No NaN/Inf can hide in an integer token cache, but a float cache (future
+    # feature matrix) is checked explicitly.
+    if not np.issubdtype(tr.dtype, np.integer):
+        _bad = int(np.size(tr) - np.isfinite(tr).sum())
+        report['nonfinite_train'] = _bad
+        if _bad:
+            report['hard_failures'].append(f'{_bad} NaN/Inf values in train')
+    if not np.issubdtype(va.dtype, np.integer):
+        _bad = int(np.size(va) - np.isfinite(va).sum())
+        report['nonfinite_val'] = _bad
+        if _bad:
+            report['hard_failures'].append(f'{_bad} NaN/Inf values in validation')
+
+    if va.ndim == 2 and va.size:
+        _dup = int(_DG.duplicate_mask(va).sum())
+        report['duplicate_rows_within_validation'] = _dup
+        if _dup:
+            report['warnings'].append(f'{_dup} duplicate validation rows')
+
+    # Exact cross-split row overlap on a uniformly-spaced sample of the train
+    # stream.  Small caches are scanned completely; large ones report the
+    # scanned fraction instead of pretending the sample is a proof.
+    overlap = None
+    if tr.size and va.ndim == 2 and va.shape[0]:
+        import audit_gates as _AG
+        _rows = np.unique(np.linspace(0, va.shape[0] - 1,
+                                      min(int(sample_rows), va.shape[0]),
+                                      dtype=np.int64))
+        _sample = np.asarray(va)[_rows]
+        if tr.size <= int(max_scan_tokens):
+            _segments = [tr]
+            _scanned = int(tr.size)
+        else:
+            _nseg = 16
+            _seg_len = max(int(max_scan_tokens) // _nseg,
+                           int(_sample.shape[1]) + 1)
+            _starts = np.linspace(0, max(tr.size - _seg_len, 0), _nseg, dtype=np.int64)
+            _segments = [tr[int(s):int(s) + _seg_len] for s in _starts]
+            _scanned = int(sum(s.size for s in _segments))
+        _shared = 0
+        for _seg in _segments:
+            _shared += int(_AG._row_overlap_count(_seg, _sample))
+        overlap = _shared
+        report['exact_row_overlap_in_sample'] = int(_shared)
+        report['sampled_val_rows'] = int(_rows.size)
+        report['train_tokens_scanned'] = int(_scanned)
+        report['train_tokens_scanned_fraction'] = round(
+            float(_scanned) / float(tr.size), 6) if tr.size else 1.0
+        if _shared:
+            report['hard_failures'].append(
+                f'{_shared} sampled validation rows occur verbatim in train')
+
+    # Document-level proof, when the cache carries it.
+    _docs = (meta or {}).get('doc_ids') or {}
+    if _docs:
+        report['documents'] = {k: _docs.get(k) for k in
+                               ('train_count', 'validation_count', 'overlap',
+                                'disjoint', 'policy')}
+        if _docs.get('disjoint') is not True or int(_docs.get('overlap', 0) or 0) != 0:
+            report['hard_failures'].append('cache does not attest document-disjoint train/validation splits')
+    elif dataset == 'fineweb':
+        report['warnings'].append('legacy FineWeb cache has no document-id disjointness proof')
+
+    # Training-only reference distribution; the holdout never defines it.
+    if tr.size and va.size:
+        try:
+            import audit_gates as _AG
+            _tr_s = _AG._sample_tokens(tr, cap=200000, seed=0)
+            _va_s = _AG._sample_tokens(va, cap=200000, seed=1)
+            _shift = _DG.categorical_shift_report(_tr_s, _va_s)
+            _js = float(_shift.get('js_divergence', 0.0))
+            report['train_val_token_shift'] = _shift
+            if _js >= float(shift_fail):
+                report['hard_failures'].append(
+                    f'train/validation token JS divergence {_js:.3f} >= {shift_fail}')
+            elif _js >= float(shift_warn):
+                report['warnings'].append(
+                    f'train/validation token JS divergence {_js:.3f} >= {shift_warn}')
+        except Exception as _se:
+            report['warnings'].append(f'token-shift audit unavailable ({type(_se).__name__}: {_se})')
+
+    report['status'] = 'fail' if report['hard_failures'] else (
+        'warnings' if report['warnings'] else 'ok')
+    if report['hard_failures'] and strict:
+        raise RuntimeError(
+            f'[{dataset}] DATA GATE REFUSED this split: ' +
+            '; '.join(report['hard_failures']) +
+            ' — fix the split/cache before training (no model has been fitted).')
+    _CORPUS_AUDIT_MEMO[key] = report
+    return report
+
+
+def assert_shared_validation_fp(records, *, context='comparison'):
+    """Refuse a cross-run comparison whose records were scored on different
+    validation slices (e.g. reusing a small cap's validation region under a
+    larger cap).  Returns the single shared fingerprint."""
+    fps = set()
+    for r in records:
+        if isinstance(r, dict):
+            _fp = r.get('val_fp') or (r.get('provenance') or {}).get('data', {}).get('val_fp')
+            if _fp:
+                fps.add(str(_fp))
+    if len(fps) > 1:
+        raise ValueError(f'{context}: records use {len(fps)} different validation '
+                         f'slices {sorted(fps)}; their numbers are not comparable')
+    return next(iter(fps)) if fps else None
+
 
 def load_run_corpus(cfg):
     """Serve the corpus tuple for a run cfg (data-source switch).
@@ -11901,6 +12454,21 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     _attb_bump_epoch()
     t_data = time.time()
     train_ids, val_batch, vocab, _, val_bnd = load_run_corpus(cfg)
+    # Mandatory data gate: the loaders run it too, but a driver/monkeypatched
+    # corpus cannot bypass it for a real dataset.  The report is persisted with
+    # the panel before any model is fitted.
+    if (cfg.get('dataset') or 'wikitext') in ('wikitext', 'fineweb'):
+        _da = audit_corpus_split(train_ids, val_batch, vocab,
+                                 dataset=cfg.get('dataset') or 'wikitext')
+        try:
+            atomic_write_json(os.path.join(outdir, 'data_audit.json'), {
+                'kind': 'corpus_split_data_gate',
+                'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                'dataset': cfg.get('dataset') or 'wikitext',
+                'report': _da,
+            })
+        except Exception as _dae:
+            print(f'[data] WARNING: could not persist data_audit.json ({type(_dae).__name__}: {_dae})')
     if guard is not None:
         guard.record_run(time.time() - t_data, 0, 0, 0, 0, 0)
     summary_path = os.path.join(outdir, 'summary.json')

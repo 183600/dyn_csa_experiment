@@ -296,17 +296,44 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
     if time is not None:
         time = _as_1d(time, 'time', n)
         order = np.argsort(time, kind='stable')
+        sorted_time = time[order]
         sizes = _resolve_sizes(n, train_frac, val_frac, test_frac,
                                train_size, val_size, test_size)
+        # Split boundaries must fall between timestamp groups: a repeated
+        # timestamp is one event/batch and may not straddle train/val/test.
+        # Build the list of legal cut positions (0, every timestamp change, n)
+        # and snap each cumulative target to the first legal cut at or after
+        # it.  This may move a few rows between adjacent splits, but never
+        # splits an equal-timestamp block.
+        cuts = [0]
+        for i in range(1, n):
+            try:
+                changed = bool(sorted_time[i] != sorted_time[i - 1])
+            except (TypeError, ValueError):
+                changed = True
+            if changed:
+                cuts.append(i)
+        cuts.append(n)
         blocks = []
         start = 0
+        cumulative = 0
         for size in sizes:
+            cumulative += int(size)
+            pos = int(np.searchsorted(np.asarray(cuts), cumulative, side='left'))
+            pos = min(max(pos, 0), len(cuts) - 1)
+            end = int(cuts[pos])
+            end = max(end, start)
+            if int(size) > 0 and end <= start:
+                raise ValueError(
+                    'cannot form the requested non-empty chronological split '
+                    'without cutting an equal-timestamp block; supply groups '
+                    '(grouped_chronological_split_indices) or fewer split rows')
             # Preserve the chronological order: the caller indexes its data
             # with these arrays, so sorting the row indices would silently
             # return each split in original row order (e.g. val times
             # [7, 6]) instead of time order.
-            blocks.append(order[start:start + size].copy())
-            start += size
+            blocks.append(order[start:end].copy())
+            start = end
         return dict(zip(SPLIT_NAMES, blocks))
     return chronological_split_indices(
         n, train_frac, val_frac, test_frac,
@@ -387,10 +414,16 @@ def assert_no_split_leakage(train_idx, val_idx, test_idx, *, groups=None,
             ib = np.asarray(split_idx[b], dtype=np.int64).reshape(-1)
             if ia.size == 0 or ib.size == 0:
                 continue
-            if np.max(time[ia]) > np.min(time[ib]):
+            # ``>=`` (not ``>``): rows sharing a timestamp are one event/time
+            # block.  Putting the same timestamp on two sides leaks the block's
+            # future/past into the other split even though the row indices are
+            # disjoint.  Callers must pass groups (or split at a timestamp
+            # boundary) when timestamps repeat.
+            if np.max(time[ia]) >= np.min(time[ib]):
                 raise ValueError(
                     f'temporal leakage: max {a} time '
-                    f'{np.max(time[ia])!r} > min {b} time {np.min(time[ib])!r}')
+                    f'{np.max(time[ia])!r} >= min {b} time {np.min(time[ib])!r} '
+                    '(the same timestamp/event block must not span two splits)')
     return True
 
 
@@ -702,18 +735,24 @@ def _label_key(v):
 
 
 def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=None,
-                        groups=None, clip_z=3.0, shift_threshold=0.5):
+                        groups=None, clip_z=3.0, shift_threshold=0.5,
+                        fail_on_nan_inf=True, fail_on_label_conflict=True,
+                        fail_on_duplicate_rows=False, fail_on_outliers=False,
+                        fail_on_shift=False):
     """Report the common data-cleaning failure modes before any fit.
 
     ``train_idx`` identifies the training rows.  All outlier and shift
-    statistics are computed from those rows only; when no index is supplied the
-    whole input is treated as the training reference (useful as a pre-split
-    smoke check, not as a license to fit preprocessing on all data).
+    statistics are computed from those rows only.  If a holdout index is
+    supplied, ``train_idx`` is REQUIRED: silently treating the whole table as
+    the training reference would let validation/test rows define the
+    statistics that are later applied back to them.
 
     Returns a JSON-friendly dict.  ``status`` is ``'fail'`` when exact duplicate
-    rows cross split boundaries (row-level leakage), ``'warnings'`` when
-    NaN/Inf, within-split duplicates, label conflicts, outliers or large shift
-    are present, and ``'ok'`` otherwise.
+    rows cross split boundaries (row-level leakage), groups cross splits, or a
+    hard data-quality policy fires (NaN/Inf and duplicate-row label conflicts by
+    default).  Outliers, distribution shift and within-split duplicates are
+    warnings unless the corresponding ``fail_on_*`` flag is enabled; callers
+    that consciously accept them must record the waiver in their run metadata.
     """
     X = _as_float_2d(X)
     n = X.shape[0]
@@ -731,14 +770,18 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         split_rows = {'train': np.arange(n, dtype=np.int64),
                       'val': _empty_index(), 'test': _empty_index()}
     else:
+        if idx['train'] is None and any(idx[k] is not None for k in ('val', 'test')):
+            raise ValueError(
+                'data_quality_report: train_idx is required when val_idx or '
+                'test_idx is supplied — the holdout rows must never be used as '
+                'the training reference')
         # Missing holdout indices mean "no rows on that side", never "all
         # rows": the latter would manufacture cross-split duplicates.
         split_rows = {name: (_empty_index() if idx[name] is None else idx[name])
                       for name in SPLIT_NAMES}
-        if idx['train'] is None:
-            split_rows['train'] = np.arange(n, dtype=np.int64)
     ref = split_rows['train']
     warnings = []
+    hard_failures = []
     checks = {}
 
     finite = np.isfinite(X)
@@ -748,9 +791,12 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         name: int((~finite[rows]).sum()) for name, rows in split_rows.items()
     }
     if checks['nan_count'] or checks['inf_count']:
-        warnings.append(
-            f"{checks['nan_count']} NaN and {checks['inf_count']} Inf values; "
-            'impute with training statistics before fitting')
+        _msg = (f"{checks['nan_count']} NaN and {checks['inf_count']} Inf values; "
+                'impute with training statistics before fitting')
+        if fail_on_nan_inf:
+            hard_failures.append(_msg)
+        else:
+            warnings.append(_msg)
 
     # Exact duplicates within each split.
     dup = {}
@@ -760,7 +806,11 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         dup[name] = int(len(sub) - len(set(sub)))
     checks['duplicate_rows_within_split'] = dup
     if any(dup.values()):
-        warnings.append(f'duplicate rows within splits: {dup}')
+        _msg = f'duplicate rows within splits: {dup}'
+        if fail_on_duplicate_rows:
+            hard_failures.append(_msg)
+        else:
+            warnings.append(_msg)
 
     # Exact duplicate rows across splits: a hard leakage signal.
     cross = {}
@@ -773,7 +823,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         hard_leak = hard_leak or shared > 0
     checks['duplicate_rows_across_splits'] = cross
     if hard_leak:
-        warnings.append(f'exact duplicate rows cross split boundaries: {cross}')
+        hard_failures.append(f'exact duplicate rows cross split boundaries: {cross}')
 
     # Group integrity.
     if groups is not None:
@@ -786,7 +836,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             group_cross[f'{a}__{b}'] = len(shared)
             if shared:
                 hard_leak = True
-                warnings.append(
+                hard_failures.append(
                     f'{len(shared)} group ids cross {a}/{b}; whole groups must '
                     'stay in one split')
         checks['group_overlap'] = group_cross
@@ -808,9 +858,12 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         conflicts = [k for k, labs in by_row.items() if len(labs) > 1]
         checks['label_conflicts_on_duplicate_rows'] = len(conflicts)
         if conflicts:
-            warnings.append(
-                f'{len(conflicts)} exact-duplicate feature rows carry different '
-                'labels (label noise / ambiguous annotation)')
+            _msg = (f'{len(conflicts)} exact-duplicate feature rows carry '
+                    'different labels (label noise / ambiguous annotation)')
+            if fail_on_label_conflict:
+                hard_failures.append(_msg)
+            else:
+                warnings.append(_msg)
         vals, counts = np.unique(
             [v for v in labels if v is not None], return_counts=True)
         checks['label_distribution'] = {
@@ -841,7 +894,11 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 good & ((col < q_lo[j]) | (col > q_hi[j]))))
     checks['outliers_by_split'] = out_counts
     if out_counts['train'] or out_counts['val'] or out_counts['test']:
-        warnings.append(f'outliers (training IQR rule): {out_counts}')
+        _msg = f'outliers (training IQR rule): {out_counts}'
+        if fail_on_outliers:
+            hard_failures.append(_msg)
+        else:
+            warnings.append(_msg)
 
     # Distribution shift: standardized mean difference and missing-rate delta
     # relative to training.  This is a descriptive audit, not a test.
@@ -875,17 +932,26 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             'max_abs_missing_rate_delta': float(np.max(np.abs(miss_hold - miss_train))),
         }
         if shift[name]['max_abs_standardized_mean_difference'] > shift_threshold:
-            warnings.append(
+            _msg = (
                 f'{name} covariate shift: max |SMD| = '
                 f"{shift[name]['max_abs_standardized_mean_difference']:.3f} "
                 f'(threshold {shift_threshold})')
+            if fail_on_shift:
+                hard_failures.append(_msg)
+            else:
+                warnings.append(_msg)
         if shift[name]['max_abs_missing_rate_delta'] > shift_threshold:
-            warnings.append(
+            _msg = (
                 f'{name} missingness shift: max |delta| = '
                 f"{shift[name]['max_abs_missing_rate_delta']:.3f}")
+            if fail_on_shift:
+                hard_failures.append(_msg)
+            else:
+                warnings.append(_msg)
     checks['distribution_shift_vs_train'] = shift
 
-    status = 'fail' if hard_leak else ('warnings' if warnings else 'ok')
+    status = ('fail' if (hard_leak or hard_failures)
+              else ('warnings' if warnings else 'ok'))
     return {
         'status': status,
         'n_samples': int(n),
@@ -893,6 +959,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         'n_train_reference': int(ref.size),
         'checks': checks,
         'warnings': warnings,
+        'hard_failures': hard_failures,
         'note': 'statistics are learned from train_idx only; pass the split '
                 'indices produced before any preprocessing',
     }
