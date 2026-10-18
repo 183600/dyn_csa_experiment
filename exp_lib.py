@@ -622,11 +622,20 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     n = sim.shape[-1]
     # O(T^2) per row becomes infeasible beyond the long-context band this
     # segmenter is designed for; fail fast instead of attempting a multi-GB
-    # scratch table.
-    if int(n) > 8192:
+    # scratch table.  The row/column chunking below keeps the scratch bounded,
+    # so a larger explicit limit can be opted into for a scale study.
+    _max_len = 8192
+    _env_max = os.environ.get('CSA_ADAPTIVE_MAX_TOKENS', '').strip()
+    if _env_max:
+        try:
+            _max_len = max(1, int(_env_max))
+        except ValueError:
+            print(f'[segmenter] CSA_ADAPTIVE_MAX_TOKENS={_env_max!r} is not an integer — using 8192')
+    if int(n) > _max_len:
         raise RuntimeError(
-            'causal_adaptive_threshold 的因果分位数闭式为 O(rows·T²)，超出安全上限: '
-            'adaptive 分段器不支持该序列长度——请改用 chunking="cosine_learnable"')
+            f'causal_adaptive_threshold 的因果分位数闭式为 O(rows·T²)，超出安全上限 {_max_len}: '
+            'adaptive 分段器不支持该序列长度——请改用 chunking="cosine_learnable"，'
+            '或显式提高 CSA_ADAPTIVE_MAX_TOKENS')
     q = max(1.0 / max(target_block_tokens, 1), 0.001)
     # 1-D (single row) or 2-D (batched rows) — every op is rowwise
     # independent, so row-chunking the batch dim is value-identical per row:
@@ -687,21 +696,39 @@ def blocks_fixed(n, block_size, device):
 _MASK_CACHE = {}
 _CAUSAL_DONOR = -1
 _CAUSAL_TRI = None
+# A pinned donor is never evicted, so only pin a table small enough that
+# holding it across length sweeps is harmless.  Larger tables still go
+# through the shared LRU cache (and can therefore be evicted) instead of
+# being pinned for the rest of the process.
+_CAUSAL_DONOR_PIN_BYTES = 64 << 20
 
 def _causal_donor(device, width):
     # 单一共享 bool donor（True = j > i 的被掩 lane）：同一 [width, width]
     # 表按 [:T, :T] 切片服务一切 T <= width；_mask_buffer 的 causal 分支
-    # 说明其与加性 donor 的逐位对应。donor 为 pinned key，随 width 重建。
+    # 说明其与加性 donor 的逐位对应。小表作为 pinned key 复用；超过 pin
+    # 上限的大表只进可驱逐缓存，避免长上下文长度扫描长期占用显存。
     global _CAUSAL_TRI
     dev_s = _dev_str(device)
+    width = int(width)
+    nbytes = max(0, width * width)  # bool: 1 byte/element
+    pin = nbytes <= _CAUSAL_DONOR_PIN_BYTES
+    key = (dev_s, 'causal', _CAUSAL_DONOR)
     held = _CAUSAL_TRI
-    if held is not None and held[0] == dev_s and (held[1].shape[0] >= int(width)):
+    if pin and held is not None and held[0] == dev_s and (held[1].shape[0] >= width):
         return (held[1], dev_s)
-    tri = _mask_buffer(int(width), device, 'causal')
-    _PINNED_KEYS.clear()
-    _PINNED_KEYS.add((dev_s, 'causal', _CAUSAL_DONOR))
-    _CAUSAL_TRI = (dev_s, tri)
-    _cache_put(_MASK_CACHE, (dev_s, 'causal', _CAUSAL_DONOR), tri, _mask_budget(width), _mask_cache_total)
+    if not pin:
+        held = None
+        _CAUSAL_TRI = None
+    tri = _MASK_CACHE.get(key) if not pin else None
+    if tri is not None and tri.shape[0] >= width:
+        return (tri, dev_s)
+    tri = _mask_buffer(width, device, 'causal')
+    if pin:
+        _PINNED_KEYS.add(key)
+        _CAUSAL_TRI = (dev_s, tri)
+    else:
+        _PINNED_KEYS.discard(key)
+    _cache_put(_MASK_CACHE, key, tri, _mask_budget(width), _mask_cache_total)
     return (tri, dev_s)
 _IDX_CACHE = {}
 _IDX_CACHE_BYTES = 0
@@ -910,20 +937,28 @@ def causal_window_mask_f(T, window, device, dtype):
         _cache_put(_MASK_CACHE, key, m, _mask_budget(T), _mask_cache_total)
     return m
 
-_ATTN_TRANSIENT_CAP_BYTES = 2 << 30
+_ATTN_TRANSIENT_CAP_BYTES = 512 << 20
 
 def _attn_transient_budget(device):
     key = (_dev_str(device), _ATB_EPOCH)
     if key in _ATB_CACHE:
         return _ATB_CACHE[key]
     val = None
+    cap = _ATTN_TRANSIENT_CAP_BYTES
+    _env = os.environ.get('CSA_ATTN_TRANSIENT_BYTES', '').strip()
+    if _env:
+        try:
+            cap = max(1, int(_env))
+        except ValueError:
+            print(f'[attn] CSA_ATTN_TRANSIENT_BYTES={_env!r} is not an integer — using {cap}')
     try:
         if device.type == 'cuda':
             free, _total = torch.cuda.mem_get_info(device)
-            # 上限由设备状态决定并封顶 _ATTN_TRANSIENT_CAP_BYTES；行分块是
-            # 纯行划分（任意宽度下逐行值逐位相同，见 gathered_attention 的
-            # chunk 注释），不改变任何值。
-            val = max(64 << 20, min(int(free) // 4, _ATTN_TRANSIENT_CAP_BYTES))
+            # 上限由设备状态决定并封顶 cap；行分块是纯行划分（任意宽度下
+            # 逐行值逐位相同，见 gathered_attention 的 chunk 注释），不改变
+            # 任何值。默认 cap 取 512MB，避免 24–40GB 卡在 OOM 前就分配
+            # 2GB 的 logits/attn 临时量。
+            val = max(64 << 20, min(int(free) // 4, cap))
     except Exception:
         val = None
     _ATB_CACHE[key] = val
@@ -2192,6 +2227,39 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
                 m[_s:_e].masked_fill_(_ncc, 0.0)
     return (m, idx, soft)
 
+
+def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
+                       random_select=False, pre_qI=None, pre_w=None,
+                       out_valid=None, causal_ends_host=None, need_soft=True):
+    """Training wrapper around `lightning_indexer` with activation recompute.
+
+    The indexer builds `raw`/`c`/`soft` tables of shape [T, B_blocks, nIH]
+    (plus the [T, topk] prior) that stay alive until backward.  Recomputing
+    the whole pure function in backward keeps only its inputs, matching the
+    FusedIndexer save policy and removing the CSA activation-memory cliff at
+    long T.  Values and gradients are unchanged (no RNG in the learned path
+    unless `random_select`, which is a fixed function of the row/column ids).
+    """
+    def _run(_h, _ck, _lt):
+        _m, _idx, _soft = lightning_indexer(
+            _h, _ck, _lt, W_DQ, W_DK, W_w, nIH, topk, return_mask=False,
+            random_select=random_select, pre_qI=pre_qI, pre_w=pre_w,
+            out_valid=out_valid, causal_ends_host=causal_ends_host,
+            need_soft=need_soft)
+        return _idx, _soft
+    # If an outer block/MLP checkpoint already owns this forward, do not nest
+    # a second checkpoint (the outer recompute covers the indexer too).
+    _grad = _CKPT_NEST[0] == 0 and torch.is_grad_enabled() and (
+        H.requires_grad or comp_kv.requires_grad
+        or (pre_qI is not None and pre_qI.requires_grad)
+        or (pre_w is not None and pre_w.requires_grad))
+    if _grad:
+        return torch.utils.checkpoint.checkpoint(
+            _run, H, comp_kv, last_tok, use_reentrant=False,
+            preserve_rng_state=False)
+    return _run(H, comp_kv, last_tok)
+
+
 class _SinkWiden(torch.autograd.Function):
 
     @staticmethod
@@ -3039,9 +3107,10 @@ class HybridAttention(nn.Module):
                     self._cuts.append(np.cumsum(np.asarray(_cpu[0], dtype=np.int64))[:-1])
                 else:
                     cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
-                    # Host-boundary bookkeeping is eval-only; the cut table is
-                    # kept on the host.
-                    self._cuts.append(cuts.cpu() if cuts.device.type != 'cpu' else cuts)
+                    # Keep the device tensor; compression_report concatenates
+                    # the whole table and does ONE D2H transfer, instead of a
+                    # synchronising .cpu() per row.
+                    self._cuts.append(cuts)
         # Normalizing an all-zero content table is exactly zero (0/eps == 0),
         # so the zero-content ablation keeps the same values.
         core_kv = (torch.zeros_like(comp_kv) if cfg.content_mode == 'zero'
@@ -3092,7 +3161,7 @@ class HybridAttention(nn.Module):
             # 传入 soft 的形式完全一致。有梯度时条件为 False，走传入 soft
             # 的完整图。
             _need_soft = torch.is_grad_enabled()
-            _, topk_idx, soft = lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=_pool_ends_host(bid), need_soft=_need_soft)
+            _, topk_idx, soft = _indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=_pool_ends_host(bid), need_soft=_need_soft)
             # _indexer_selection 的 top-k 是无放回选择：有效槽位的块 id 逐行互不
             # 相同（order 是列排列、kept 落在互异的 cumsum 秩列上），pad 槽位的
             # 重复块 0 已被 sel_valid 置无效。故 gathered_attention 的
@@ -3116,10 +3185,22 @@ class HybridAttention(nn.Module):
         flat = x.reshape(B * T, d)
         pre_flat = self._pre(flat, fuse_x=x)
         _kernel_path = _CK is not None and self.cfg.kind in ('csa', 'hca') and _CK.kernel_enabled()
+        # Optional batched eager path: the reference twin already consumes
+        # [B, T, ...] and issues batch GEMMs, so a multi-row run can avoid the
+        # per-row launch loop without changing any default behaviour.  Opt in
+        # with CSA_EAGER_BATCH=1 (requires CUDA; values follow the declared
+        # reference-backend tolerance, not the eager bitwise contract).
+        _eager_batch = (_CK is not None and not _kernel_path
+                        and x.device.type == 'cuda' and B > 1
+                        and self.cfg.kind in ('csa', 'hca')
+                        and self.cfg.fuse_mode == 'none'
+                        and self.cfg.indexer_mode == 'learned'
+                        and os.environ.get('CSA_EAGER_BATCH', '').strip().lower() in ('1', 'true', 'yes', 'ref'))
+        _batch_path = _kernel_path or _eager_batch
         pre_all = None
         pres = None
         if pre_flat is not None:
-            if _kernel_path:
+            if _batch_path:
                 # The kernel entry point consumes the whole [B, T, ...] batch.
                 pre_all = {}
                 for kk, v in pre_flat.items():
@@ -3173,6 +3254,8 @@ class HybridAttention(nn.Module):
             # paths (the cut booleans and the resulting block ids are identical
             # to the per-row form).
             pre_blocks = self._cut_blocks_batched(x)
+        if _eager_batch:
+            return _CK.sparse_layer_forward(self, x, pre_all, gate_sigs, pre_blocks, impl='ref')
         if _kernel_path:
             # 内核路径（CSA_KERNEL；独立变体，与 eager 统计对照，不逐位承诺）。
             # 不支持的臂在这里硬失败，绝不静默回退——否则同一面板会混入两种
@@ -3333,6 +3416,13 @@ class SmallGPT(nn.Module):
         # did (the reg terms are accumulated inside the single block loop — the
         # same addition order as the full forward).
         T = ids.shape[1]
+        _max_pos = int(self.pos.weight.shape[0])
+        if T > _max_pos:
+            raise RuntimeError(
+                f'absolute position table covers {_max_pos} tokens but the input has {T}; '
+                'a dense absolute-position arm cannot evaluate beyond its training length. '
+                'Use a RoPE arm, or pass an explicit max_pos so the evaluation span is '
+                'truncated and recorded as truncated=True (never silently score a shorter span).')
         x = self.tok(ids) + self.pos.weight[:T]
         reg = None
         blp = None
@@ -9864,15 +9954,62 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
 _EVAL_TOKENS_PER_CHUNK = 1 << 17
 
 
+def _eval_row_working_bytes(model, T, d, elem_size, bytes_per_value=8):
+    """Conservative per-row activation/workspace estimate for one eval row.
+
+    The dense `T*d` term is only the hidden-state floor.  Long-sequence peak
+    memory is usually set by the attention workspace instead: a full/sink head
+    materialises [nh, rows, T] logits, the CSA indexer scores [T, B_blocks,
+    nIH], and HCA's arange expansion is [T, B_blocks].  Estimate the largest of
+    those per layer (layers run one at a time under inference_mode) instead of
+    pretending the hidden state is the whole cost."""
+    T = max(1, int(T))
+    d = max(1, int(d))
+    elem = max(1, int(elem_size))
+    per_row = max(1, T * d * elem * max(1, int(bytes_per_value)))
+    for blk in getattr(model, 'blocks', []):
+        attn = getattr(blk, 'attn', None)
+        cfg = getattr(attn, 'cfg', None)
+        if cfg is None:
+            continue
+        nh = max(1, int(getattr(attn, 'nh', 1) or 1))
+        kind = getattr(cfg, 'kind', 'full')
+        if kind == 'full':
+            win = max(0, int(getattr(cfg, 'window', 0) or 0))
+            if 0 < win < T:
+                span = win
+            elif getattr(attn, 'sink', None) is not None or getattr(cfg, 'full_sink', False):
+                # The sink branch materialises [nh, rows, T] logits.
+                span = T
+            else:
+                # SDPA's flash/mem-efficient backend keeps O(T) state.
+                span = min(T, 1024)
+            attn_bytes = 3 * nh * T * span * elem
+        else:
+            bs = int(getattr(cfg, 'block_size', 0) or 0)
+            tgt = int(getattr(cfg, 'target_block_tokens', 0) or 0)
+            mn = max(1, int(getattr(cfg, 'min_block', 1) or 1))
+            step = max(1, bs or tgt or mn)
+            Bm = (T + step - 1) // step
+            nih = max(1, int(getattr(cfg, 'n_index_heads', 1) or 1))
+            topk = max(1, int(getattr(cfg, 'index_topk', 1) or 1))
+            attn_bytes = max(2 * T * Bm * nih * elem,
+                             2 * T * min(topk, Bm) * elem)
+            if kind == 'hca':
+                # _arange_exp_cache materialises an int32 [T, Bm] table.
+                attn_bytes = max(attn_bytes, 4 * T * Bm)
+        per_row = max(per_row, int(attn_bytes))
+    return per_row
+
+
 def _eval_adaptive_chunk(model, val_batch, device, chunk, _free_frac=0.5, _bytes_per_value=8):
     """Bound an evaluation chunk by both token count and currently-free VRAM.
 
     Rows are independent, so the partition changes no value; it only keeps a
-    long-sequence eval from launching a chunk whose dense activations cannot
-    fit.  The estimate uses the model's actual parameter element size (bf16
-    halves it) and a modest activation multiplier; an over-large chunk is
-    caught by the existing OOM retry, so the estimate no longer needs to be a
-    worst-case upper bound that collapses the chunk to one row."""
+    long-sequence eval from launching a chunk whose attention/indexer
+    workspace cannot fit.  The estimate uses the model's actual parameter
+    element size (bf16 halves it) and the real per-layer attention shape, not
+    just `T*d`; the existing OOM retry remains the final backstop."""
     rows = int(val_batch.shape[0])
     T = int(val_batch.shape[1])
     span = max(1, T - 1)
@@ -9882,7 +10019,7 @@ def _eval_adaptive_chunk(model, val_batch, device, chunk, _free_frac=0.5, _bytes
             free, _total = torch.cuda.mem_get_info(device)
             d = int(model.tok.weight.shape[1])
             elem = int(model.tok.weight.element_size())
-            per_row = max(1, T * d * elem * int(_bytes_per_value))
+            per_row = _eval_row_working_bytes(model, T, d, elem, _bytes_per_value)
             chunk = min(chunk, max(1, int(free * float(_free_frac)) // per_row))
         except Exception:
             pass
@@ -10120,15 +10257,20 @@ class _BlockStats:
         self.hi = None
         self.at_min = 0
         self.at_max = 0
+        # GPU counts are queued and folded once (one D2H) instead of
+        # synchronising after every row/layer during the report forward.
+        self._pending = []
 
-    def append(self, t):
-        if torch.is_tensor(t):
-            t = t.detach().cpu()
-        a = np.asarray(t).reshape(-1)
+    def snapshot(self):
+        d = dict(self.__dict__)
+        d['_pending'] = list(self._pending)
+        return d
+
+    def _add(self, a, n_items=1):
         if not a.size:
             return
         a = a.astype(np.float64, copy=False)
-        self.n += 1
+        self.n += int(n_items)
         self.blocks += int(a.size)
         self.total += int(a.size)
         self.s += float(a.sum())
@@ -10140,10 +10282,36 @@ class _BlockStats:
         if self.max_block is not None:
             self.at_max += int((a >= self.max_block).sum())
 
+    def append(self, t):
+        if torch.is_tensor(t) and t.device.type != 'cpu':
+            self._pending.append(t.detach())
+            self.n += 1
+            return
+        if torch.is_tensor(t):
+            t = t.detach()
+        self._add(np.asarray(t).reshape(-1))
+
+    def _flush(self):
+        if not self._pending:
+            return
+        parts = self._pending
+        self._pending = []
+        try:
+            flat = torch.cat([p.reshape(-1).to(torch.int64) for p in parts])
+        except Exception:
+            for p in parts:
+                self._add(np.asarray(p.detach().cpu()).reshape(-1), n_items=0)
+            return
+        # `append` already counted each pending sequence in self.n.
+        self._add(flat.detach().cpu().numpy(), n_items=0)
+        del flat
+
     def __len__(self):
+        self._flush()
         return self.n
 
     def summary(self, seq_len):
+        self._flush()
         if self.n == 0 or self.total == 0:
             return None
         mean = self.s / self.total
@@ -10606,7 +10774,7 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
             _st = getattr(_attn, '_stats', None)
             _cuts = getattr(_attn, '_cuts', None)
             _stats_snap.append((_attn,
-                                dict(_st.__dict__) if isinstance(_st, _BlockStats) else None,
+                                _st.snapshot() if isinstance(_st, _BlockStats) else None,
                                 list(_cuts) if _cuts is not None else None))
         # as_tensor accepts numpy arrays AND torch tensors (eval_ppl already
         # uses it).
@@ -10775,7 +10943,29 @@ def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len
     tok = max(1, int(batch_size)) * max(1, int(seq_len))
     hidden = max(1, int(round(int(d) * float(mlp_ratio))))
     act = int(n_layers) * tok * (hidden + 8 * int(d)) * 4
-    need = act + 16 * int(n_param)
+    # The block/MLP recompute modes do not cover the indexer score table or
+    # the dense attention workspace, so include them explicitly.  Otherwise a
+    # long-sequence CSA cell can look like it fits in the MLP-level mode and
+    # still OOM inside the indexer.
+    seq = max(1, int(seq_len))
+    batch = max(1, int(batch_size))
+    extra = 0
+    for c in cfgs:
+        kind = getattr(c, 'kind', 'full')
+        if kind in ('csa', 'hca'):
+            step = max(1, int(getattr(c, 'block_size', 0) or getattr(c, 'target_block_tokens', 0) or getattr(c, 'min_block', 1) or 1))
+            Bm = (seq + step - 1) // step
+            nih = max(1, int(getattr(c, 'n_index_heads', 1) or 1))
+            topk = max(1, int(getattr(c, 'index_topk', 1) or 1))
+            extra += batch * (seq * Bm * nih * 4 + seq * min(topk, Bm) * 4)
+            if kind == 'hca':
+                extra += batch * seq * Bm * 4
+        elif kind == 'full':
+            # Only the materialising sink/window loop is a per-layer extra;
+            # SDPA's memory-efficient path keeps O(T) state.
+            win = max(0, int(getattr(c, 'window', 0) or 0))
+            extra += batch * seq * (win if 0 < win < seq else d) * 4
+    need = act + int(extra) + 16 * int(n_param)
     if free >= need + need // 3:
         return None, need
     has_gate = any(getattr(c, 'chunking', '') == 'cosine_learnable' for c in cfgs)
@@ -10848,21 +11038,81 @@ def _curve_append_point(dst, point):
         dst[:] = [dst[int(_i)] for _i in _idx]
 
 
-def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False):
+def distributed_info():
+    """Return ``(rank, world_size, active)`` for a torchrun/DDP launch.
+
+    Initialises the default process group on first use when ``WORLD_SIZE > 1``
+    and no group exists yet.  Single-process runs return ``(0, 1, False)`` and
+    never touch torch.distributed, so the historical path is unchanged."""
+    if not torch.distributed.is_available():
+        return (0, 1, False)
+    if torch.distributed.is_initialized():
+        return (torch.distributed.get_rank(), torch.distributed.get_world_size(), torch.distributed.get_world_size() > 1)
+    try:
+        world = int(os.environ.get('WORLD_SIZE', '1') or 1)
+    except ValueError:
+        world = 1
+    if world <= 1:
+        return (0, 1, False)
+    backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+    torch.distributed.init_process_group(backend=backend)
+    return (torch.distributed.get_rank(), torch.distributed.get_world_size(), True)
+
+
+def is_main_process():
+    return distributed_info()[0] == 0
+
+
+def _amp_requested():
+    """Opt-in mixed-precision mode for the training path.
+
+    ``CSA_AMP=bf16`` keeps fp32 master parameters and runs the forward/loss
+    under autocast bf16 (the scale panel's memory/throughput assumption);
+    ``CSA_AMP=fp16`` additionally uses a GradScaler.  Unset means the
+    historical pure-fp32 path, so existing records stay comparable."""
+    v = os.environ.get('CSA_AMP', '').strip().lower()
+    if v in ('', '0', 'false', 'no', 'off'):
+        return None
+    if v in ('1', 'true', 'yes', 'on', 'bf16', 'bfloat16'):
+        return 'bf16'
+    if v in ('fp16', 'float16', 'half'):
+        return 'fp16'
+    print(f'[amp] CSA_AMP={v!r} is not recognised (use bf16/fp16) — using fp32')
+    return None
+
+
+def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False):
     if steps < 1:
         raise ValueError(f'train_variant needs steps >= 1, got steps={steps}')
     set_seed(seed)
     _rng_fp = rng_fingerprint()
     _attb_bump_epoch()
+    _amp = _amp_requested() if device.type == 'cuda' else None
+    _amp_dtype = torch.bfloat16 if _amp == 'bf16' else (torch.float16 if _amp == 'fp16' else None)
+    _scaler = torch.amp.GradScaler('cuda', enabled=(_amp == 'fp16')) if _amp is not None else None
+    if _amp is not None:
+        print(f'[amp] training autocast dtype={_amp} grad_scaler={_amp == "fp16"} (fp32 master weights)')
+    _rank, _world, _dist = (0, 1, False)
+    if distributed:
+        _rank, _world, _dist = distributed_info()
+        if not _dist:
+            raise RuntimeError('train_variant(distributed=True) needs a torchrun WORLD_SIZE > 1 launch')
     if variant in PARAM_MATCHED | PARAM_MATCHED_V7 and float(mlp_ratio) == 4.0:
         raise ValueError(f'{variant} is a PARAM-MATCHED baseline but was given the default mlp_ratio=4; its MLP must be widened to match its sparse reference arm, or the comparison is not parameter-controlled. Pass mlp_ratio=variant_mlp_ratio(variant, vocab, d=..., n_layers=..., n_heads=..., d_head=..., seq_len=...).')
     cfgs = make_layer_cfgs(n_layers, variant)
     model = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
+    _inner_model = model
+    if _dist and _world > 1:
+        _dev_ids = [device] if device.type == 'cuda' else None
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=_dev_ids,
+            output_device=(_dev_ids[0] if _dev_ids else None),
+            gradient_as_bucket_view=True)
     n_param = count_params(model)
     print(f'\n[{variant} seed={seed}] params={n_param / 1000000.0:.2f}M  mlp_ratio={mlp_ratio:.2f}  layers={[c.kind for c in cfgs]}')
-    decay_params = [p for n_, p in model.named_parameters() if p.requires_grad and (not is_no_decay(n_)) and (not is_delta_param(n_))]
-    ndecay_params = [p for n_, p in model.named_parameters() if p.requires_grad and is_no_decay(n_) and (not is_delta_param(n_))]
-    delta_params = [p for n_, p in model.named_parameters() if p.requires_grad and is_delta_param(n_)]
+    decay_params = [p for n_, p in _inner_model.named_parameters() if p.requires_grad and (not is_no_decay(n_)) and (not is_delta_param(n_))]
+    ndecay_params = [p for n_, p in _inner_model.named_parameters() if p.requires_grad and is_no_decay(n_) and (not is_delta_param(n_))]
+    delta_params = [p for n_, p in _inner_model.named_parameters() if p.requires_grad and is_delta_param(n_)]
     # foreach=True pins the multi-tensor AdamW implementation.  Foreach applies
     # the same per-element IEEE op chain as the single-tensor form (lerp /
     # addcmul / sqrt are elementwise, so every element sees the identical
@@ -10880,7 +11130,11 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # lr_scale is only ever set at optimizer construction (never mutated), so
     # the per-group multiplier list is captured once here.
     _lr_scales = [g.get('lr_scale', 1.0) for g in opt.param_groups]
-    bpe = batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
+    # In DDP each rank consumes a different data shard; the global batch is
+    # batch_size * world_size (recorded below).  Single-process runs keep the
+    # historical seed exactly.
+    bpe = batch_iter(train_ids, seq_len, batch_size, device,
+                     seed=(seed + _rank if _dist else seed))
     _eval_batch = val_batch[:eval_subset] if val_batch is not None else None
     t0 = time.time()
     losses = []
@@ -10919,9 +11173,15 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # fixed cadence and the original GC state is restored on every exit path.
     _gc_relief = gc.isenabled()
     _ckpt_saved = _CKPT['on']
-    _auto_ckpt, _ = _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs)
+    _auto_ckpt, _auto_need = _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs)
     if _auto_ckpt:
         _CKPT['on'] = _auto_ckpt
+        try:
+            _free_now, _ = torch.cuda.mem_get_info(device)
+            print(f'[ckpt] auto mode={_auto_ckpt} estimated_working_set={_auto_need / (1 << 30):.2f}GiB free_before={_free_now / (1 << 30):.2f}GiB (includes indexer/attention workspace)')
+        except Exception:
+            print(f'[ckpt] auto mode={_auto_ckpt} estimated_working_set={(_auto_need or 0) / (1 << 30):.2f}GiB')
+    _ckpt_effective = _CKPT['on']
     if _gc_relief:
         gc.disable()
     try:
@@ -10938,26 +11198,35 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             for g, _ls in zip(opt.param_groups, _lr_scales):
                 g['lr'] = base * _ls
             x, y = next(bpe)
-            ce = model.ce_loss(x, y, vocab)
-            del x, y
-            _blp = getattr(model, 'boundary_logp', None)
-            if _blp is not None:
-                # REINFORCE: the hard cuts are sampled in the forward pass; this
-                # score-function term makes the LM token loss (not just comp_reg)
-                # able to change the boundary policy.  Centred by a running CE
-                # baseline to reduce variance; decisions are normalised so the
-                # coefficient does not scale with sequence length or depth.
-                # This is the only arm that reads the running CE baseline.
-                _ce_item = float(ce.detach().item())
-                _adv = _ce_item - float(_ce_baseline)
-                _bdec = max(int(getattr(model, 'boundary_decisions', 0) or 0), 1)
-                loss = ce + comp_lambda * model.comp_reg + BOUNDARY_PG_COEF * (-_adv * _blp / _bdec)
-                _ce_baseline = 0.99 * float(_ce_baseline) + 0.01 * _ce_item
+            with torch.autocast(device_type='cuda', dtype=(_amp_dtype or torch.bfloat16),
+                                enabled=(_amp is not None)):
+                ce = model.ce_loss(x, y, vocab)
+                del x, y
+                _blp = getattr(model, 'boundary_logp', None)
+                if _blp is not None:
+                    # REINFORCE: the hard cuts are sampled in the forward pass; this
+                    # score-function term makes the LM token loss (not just comp_reg)
+                    # able to change the boundary policy.  Centred by a running CE
+                    # baseline to reduce variance; decisions are normalised so the
+                    # coefficient does not scale with sequence length or depth.
+                    # This is the only arm that reads the running CE baseline.
+                    _ce_item = float(ce.detach().item())
+                    _adv = _ce_item - float(_ce_baseline)
+                    _bdec = max(int(getattr(model, 'boundary_decisions', 0) or 0), 1)
+                    loss = ce + comp_lambda * model.comp_reg + BOUNDARY_PG_COEF * (-_adv * _blp / _bdec)
+                    _ce_baseline = 0.99 * float(_ce_baseline) + 0.01 * _ce_item
+                else:
+                    loss = ce + comp_lambda * model.comp_reg
+            if _scaler is not None:
+                _scaler.scale(loss).backward()
+                _scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                _scaler.step(opt)
+                _scaler.update()
             else:
-                loss = ce + comp_lambda * model.comp_reg
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-            opt.step()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                opt.step()
             # Gradients are not needed after the update.
             opt.zero_grad(set_to_none=True)
             _ce_d = ce.detach()
@@ -10967,7 +11236,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             _tail.append(_ce_d)
             # Drop this step's graph/scalar references before the next forward.
             del loss, ce
-            model.comp_reg = None
+            _inner_model.comp_reg = None
             if len(_lbuf) >= 512:
                 _flush_loss_buffer()
             if (step + 1) % 1024 == 0:
@@ -11005,6 +11274,20 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         return {'variant': variant, 'seed': seed, 'cap_truncated': True, 'steps_done': steps, 'train_time_s': wall}
+    if _dist and _world > 1 and _rank != 0:
+        # Non-zero ranks have no file-writing role; wait for rank 0's final
+        # evaluation so the whole job exits together.
+        torch.distributed.barrier()
+        _res = {'variant': variant, 'seed': seed, 'ppl': float('nan'),
+                'params': n_param, 'steps': steps, 'train_time_s': wall,
+                'distributed_rank': _rank, 'distributed_world_size': _world,
+                'tokens_seen': steps * batch_size * seq_len * _world}
+        if _lbuf:
+            _flush_loss_buffer()
+        _res['losses'] = [float(v) for v in losses]
+        if return_model:
+            _res['model'] = _inner_model
+        return _res
     if val_batch is None:
         ppl, stats = (float('nan'), {})
         _eval_stats = {'ppl': float('nan'), 'nll_sum': float('nan'), 'n_tokens': 0,
@@ -11024,7 +11307,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if _lbuf:
         _flush_loss_buffer()
     losses = [float(v) for v in losses]
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world, 'train_time_s': wall, 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
               # Review 3: the token-level evidence behind the reported PPL.
               # `nll_sum / n_tokens` is the pooled-NLL estimator; the per-row
               # rows let a report bootstrap DOCUMENT uncertainty instead of
@@ -11034,15 +11317,17 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'eval_rows': _eval_stats.get('eval_rows'), 'eval_seed': _eval_stats.get('eval_seed'),
               'eval_subset': _eval_stats.get('eval_subset'),
               'eval_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)) if val_batch is not None else None,
-              'param_breakdown': param_breakdown(model),
-              'kv_cache_elements_per_token': kv_cache_elements_per_token(model),
-              'train_objective': train_objective(model, comp_lambda=comp_lambda, delta_lr_mult=delta_lr_mult)}
+              'param_breakdown': param_breakdown(_inner_model),
+              'kv_cache_elements_per_token': kv_cache_elements_per_token(_inner_model),
+              'train_objective': train_objective(_inner_model, comp_lambda=comp_lambda, delta_lr_mult=delta_lr_mult)}
     if return_model:
-        result['_model'] = model
+        result['_model'] = _inner_model
     else:
         del model
     del opt, bpe
     gc.collect()
+    if _dist and _world > 1:
+        torch.distributed.barrier()
     # Keep the caching allocator's blocks for the next cell in this process;
     # only OOM-recovery paths return memory to the driver.
     return result

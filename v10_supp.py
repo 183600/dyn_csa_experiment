@@ -698,8 +698,6 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     if model is not None:
         del model
         gc.collect()
-        if DEVICE.type == 'cuda':
-            torch.cuda.empty_cache()
     del d
     return out
 

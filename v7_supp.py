@@ -189,7 +189,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             scale = 1.0 / math.sqrt(self.hd)
         # The sink branch builds a full cached mask within the row cap, or the
         # matching row slice per chunk beyond it.
-        _use_full_mask = T * T * 4 <= L._DENSE_MASK_ROW_CAP_BYTES
+        _use_full_mask = T * T <= L._DENSE_MASK_ROW_CAP_BYTES
         if self.sink is None:
             if 0 < cfg.window < T:
                 out = L._window_attn_local(q, k, v, cfg.window, scale)
@@ -298,7 +298,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             self._stats.append(torch.bincount(bid))
             if self._cuts is not None:
                 cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
-                self._cuts.append(cuts.cpu() if cuts.device.type != 'cpu' else cuts)
+                self._cuts.append(cuts)
         comp_n = self.kv_norm(attn_kv) if cfg.qk_norm else attn_kv
         qn = self.q_norm(q) if cfg.qk_norm else q
         sw_n = self.kv_norm(Ca_raw) if cfg.qk_norm else Ca_raw
@@ -319,7 +319,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             # S path is dead without gradients, so its whole tail is skipped
             # (same contract as exp_lib._single).
             _need_soft = torch.is_grad_enabled()
-            _, topk_idx, soft = L.lightning_indexer(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, cfg.index_topk, return_mask=False, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, need_soft=_need_soft)
+            _, topk_idx, soft = L._indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, cfg.index_topk, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, need_soft=_need_soft)
             sel_valid = _sel_valid_box[0]
         sink = self.sink if cfg.use_sink else None
         # Both branches hold distinct block ids per row: the HCA arm passes the
@@ -483,7 +483,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         use_rope = isinstance(self.cfg, AttnCfgRope) and self.cfg.rope
         rd = min(getattr(self.cfg, 'rope_dim', 0), hd)
         win = getattr(self, '_dense_max_T', None)
-        _use_full_mask = T * T * 4 <= L._DENSE_MASK_ROW_CAP_BYTES
+        _use_full_mask = T * T <= L._DENSE_MASK_ROW_CAP_BYTES
         if _use_full_mask:
             mask = L.causal_mask(T, x.device)
             if win is not None and win < T:
@@ -675,6 +675,11 @@ class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
         T = ids.shape[1]
         x = self.tok(ids)
         if getattr(self, 'use_abs_pe', True):
+            _max_pos = int(self.pos.weight.shape[0])
+            if T > _max_pos:
+                raise RuntimeError(
+                    f'absolute position table covers {_max_pos} tokens but the input has {T}; '
+                    'use a RoPE arm or pass an explicit max_pos (recorded as truncated=True)')
             x = x + self.pos(L._arange_cache(T, ids.device))
         reg = torch.zeros((), device=ids.device)
         for blk in self.blocks:
@@ -1995,8 +2000,22 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
     was = model.training
     model.eval()
     out = {}
-    _within = [int(Ln) for Ln in eval_lens if max_pos is None or int(Ln) <= max_pos]
-    _trunc_lens = [int(Ln) for Ln in eval_lens if max_pos is not None and int(Ln) > max_pos]
+    # An absolute-position model cannot score beyond its learned table.  When
+    # the caller passes max_pos=None (the "full context" request) a longer
+    # length must be an explicit error, never a silent last-max_pos slice.
+    _abs_pe = bool(getattr(model, 'use_abs_pe', True))
+    _hard_max = int(getattr(model, 'max_seq', 1 << 62)) if _abs_pe else None
+    _over = [int(Ln) for Ln in eval_lens
+             if max_pos is None and _hard_max is not None and int(Ln) > _hard_max]
+    for Ln in _over:
+        out[Ln] = {'error': (f'absolute position table covers {_hard_max} tokens; '
+                             f'cannot evaluate L={Ln} with max_pos=None — use a RoPE arm '
+                             'or pass max_pos to request the explicit truncated span'),
+                   'truncated': False, 'eval_span': None}
+    _within = [int(Ln) for Ln in eval_lens
+               if (max_pos is None or int(Ln) <= max_pos) and int(Ln) not in _over]
+    _trunc_lens = [int(Ln) for Ln in eval_lens
+                   if max_pos is not None and int(Ln) > max_pos and int(Ln) not in _over]
     # The compression regulariser is a training side channel: disabling it for
     # scoring skips the gate-honour bookkeeping without touching any logit
     # (the block geometry is still built), exactly as eval_ppl does.
@@ -2059,8 +2078,6 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                     out[Ln]['ppl_per_seq'] = [float(math.exp(float(v) / (Ln - 1))) for v in _cum[:, Ln - 2].tolist()]
                     out[Ln]['n_seq'] = int(ids.shape[0])
             del x, nll_cols, _cum
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
         _trunc_cache = {}
         _val_width = int(np.asarray(val_ids).shape[1])
         for Ln in _trunc_lens:
@@ -2111,8 +2128,6 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                 out[Ln] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': _ev_span}
                 _trunc_cache[_key] = {'ppl': float(ppl), 'n_tok': ntok, 'eval_span': _ev_span}
                 del x
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
             except Exception as e:
                 _err = f'{type(e).__name__}: {e}'
                 out[Ln] = {'error': _err}

@@ -586,8 +586,6 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
     r = V.eval_length_gen(model, test_ids, eval_lens, DEVICE, max_pos=None, n_seq=int(test_ids.shape[0]))
     del model
     gc.collect()
-    if DEVICE.type == 'cuda':
-        torch.cuda.empty_cache()
 
     def _merge(summary):
         # by_len now also carries ppl_per_seq (per-document rows, review-2

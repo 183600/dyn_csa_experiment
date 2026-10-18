@@ -963,16 +963,19 @@ def _warn_shape_fallback(op, detail):
 
 def _indexer_impl_for_shape(impl, kI):
     if impl == 'triton' and int(kI.shape[1]) > 8192:
-        # Refuse by default; an explicit opt-in keeps the torch twin available
-        # for debugging/CPU runs (the reference twin remains the documented
-        # backend for every shape there).
-        if os.environ.get('CSA_INDEXER_ALLOW_REF', '').strip().lower() in ('1', 'true', 'yes'):
-            _warn_shape_fallback('indexer', f'Bm={int(kI.shape[1])} exceeds the Triton register/lane limit 8192 (CSA_INDEXER_ALLOW_REF=1)')
-            return 'ref'
-        raise RuntimeError(
-            f'Triton indexer cannot handle Bm={int(kI.shape[1])} > 8192 (register/lane limit). '
-            'Use CSA_KERNEL=ref (explicit torch-reference backend) for this sequence length, '
-            'or set CSA_INDEXER_ALLOW_REF=1 to explicitly accept the automatic fallback.')
+        # Long-context safety: Bm grows with T/block_size, so a 32k/64k eval
+        # can exceed the Triton lane limit even though the sparse attention
+        # itself is still linear.  Degrade explicitly to the torch-reference
+        # twin (documented, same algorithm) instead of failing the run; set
+        # CSA_INDEXER_STRICT=1 to keep the old hard failure for benchmarking.
+        _strict = os.environ.get('CSA_INDEXER_STRICT', '').strip().lower() in ('1', 'true', 'yes')
+        if _strict:
+            raise RuntimeError(
+                f'Triton indexer cannot handle Bm={int(kI.shape[1])} > 8192 (register/lane limit). '
+                'Use CSA_KERNEL=ref (explicit torch-reference backend) for this sequence length, '
+                'or unset CSA_INDEXER_STRICT to accept the automatic reference fallback.')
+        _warn_shape_fallback('indexer', f'Bm={int(kI.shape[1])} exceeds the Triton register/lane limit 8192; using the torch-reference backend')
+        return 'ref'
     return impl
 
 
@@ -2370,7 +2373,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
             attn._stats.append(torch.bincount(bid_full[_b]))
         if attn._cuts is not None:
             for _b in range(B):
-                attn._cuts.append(((bid_full[_b, 1:] != bid_full[_b, :-1]).nonzero(as_tuple=True)[0] + 1).cpu())
+                attn._cuts.append((bid_full[_b, 1:] != bid_full[_b, :-1]).nonzero(as_tuple=True)[0] + 1)
     overlap = cfg.overlap if cfg.kind == 'csa' else None
     geom = _pool_geometry_cached(counts_rows, overlap, T, dev, cfg.max_block)
     Ca = pre_all['Ca']

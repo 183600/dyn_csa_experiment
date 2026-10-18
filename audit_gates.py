@@ -1173,10 +1173,10 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
 # ---------------------------------------------------------------------------
 
 def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
-    """端到端 prefill / 增量 decode 计时（测量代码，非实验）。
+    """端到端 prefill / 前缀推进计时（测量代码，非实验）。
 
-    prefill = 整段前向一次的墙钟；decode = 逐 token 前缀推进的墙钟与
-    每 token 均摊。"""
+    prefill = 整段前向一次的墙钟；所谓 decode 当前每次从 token 0 重跑完整
+    前缀，因此它是 prefix-prefill 均摊，不是有 KV cache 的增量 decode。"""
     import torch
     import time as _t
     res = {'n_tokens': int(ids.shape[1])}
@@ -1197,7 +1197,13 @@ def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
         n_dec = min(32, int(ids.shape[1]))
         for t in range(1, n_dec + 1):
             model(ids[:, :t])
-        res['decode_ms_per_token_avg'] = (_t.perf_counter() - t0) * 1000.0 / n_dec
+        _per_tok = (_t.perf_counter() - t0) * 1000.0 / n_dec
+        res['prefix_prefill_ms_per_token'] = _per_tok
+        # Backwards-compatible alias, but the name must not be read as an
+        # incremental decode measurement: there is no KV cache in this path.
+        res['decode_ms_per_token_avg'] = _per_tok
+        res['decode_has_kv_cache'] = False
+        res['decode_metric'] = 'prefix_prefill (no KV cache; re-runs the whole prefix)'
         if device.type == 'cuda':
             res['peak_mem_mb'] = torch.cuda.max_memory_allocated() / (1 << 20)
     return res
