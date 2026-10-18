@@ -185,6 +185,10 @@ def t_exact_signflip_at_scale():
     assert abs(BR.exact_signflip([0.7] * 22)['p_exact_signflip'] - 2.0 / (1 << 22)) < 1e-15
     z = L.exact_signflip_p([0.0] * 24)
     assert z['p'] == 1.0 and z['method'] == 'exact-mitm', 'every sign assignment matches a zero observed mean'
+    # The driver used by the confirmation analyzer must not silently substitute
+    # a random Monte-Carlo p-value for the pre-registered exact test at n>20.
+    v = V7.exact_sign_permutation([0.7] * 21)
+    assert abs(v['p_exact_signflip'] - 2.0 / (1 << 21)) < 1e-18 and v.get('method') == 'exact-mitm', v
     rng = np.random.default_rng(11)
     d = rng.normal(size=21)
     got = L.exact_signflip_p(d)['p']
@@ -894,6 +898,40 @@ def t_adaptive_threshold_guard():
         pass
 
 
+def t_adaptive_threshold_values():
+    # The production path row/column-chunks the sort.  That partition must not
+    # change the closed-form per-row causal quantile: compare against the
+    # unchunked definition for both a single row and a batch.
+    def reference(sim, target):
+        q = max(1.0 / max(int(target), 1), 0.001)
+        squeeze = sim.dim() == 1
+        x = (sim.unsqueeze(0) if squeeze else sim).detach().float()
+        n = x.shape[-1]
+        idx = torch.arange(n)
+        pos = q * idx
+        lo = pos.floor().long()
+        frac = pos - lo
+        lo_c = lo.clamp(max=n - 1)[..., None]
+        hi_c = (lo + 1).clamp(max=n - 1)[..., None]
+        use_hi = (frac > 0.0) & (lo + 1 <= idx)
+        first = idx == 0
+        masked = torch.where(idx[None, None, :] <= idx[None, :, None],
+                             x[:, None, :], float('inf')).sort(dim=-1).values
+        lo_v = masked.gather(-1, lo_c.expand(x.shape[0], n, 1)).squeeze(-1)
+        hi_v = masked.gather(-1, hi_c.expand(x.shape[0], n, 1)).squeeze(-1)
+        interp = lo_v * (1.0 - frac) + hi_v * frac
+        oc = torch.where(use_hi, interp, lo_v)
+        out = torch.where(first, torch.full_like(oc, float('-inf')), oc)
+        return out.squeeze(0) if squeeze else out
+
+    for shape in ((7,), (3, 11), (2, 300)):
+        for target in (1, 4, 16, 128):
+            sim = torch.randn(*shape)
+            got = L.causal_adaptive_threshold(sim, target)
+            want = reference(sim, target)
+            assert torch.equal(got, want), (shape, target, (got - want).abs().max())
+
+
 def t_empty_pool_geometry():
     dev = torch.device('cpu')
     ids = torch.empty(0, dtype=torch.long, device=dev)
@@ -990,6 +1028,14 @@ def t_eval_per_seq():
         assert 'ppl_per_seq' in cell and len(cell['ppl_per_seq']) == 3, 'per-document rows must be recorded'
         geo = math.exp(sum(math.log(p) for p in cell['ppl_per_seq']) / 3.0)
         assert abs(geo - cell['ppl']) / cell['ppl'] < 1e-6, f'pooled ppl must equal the geometric mean of per-seq ppl at L{Ln} (reduction-invariance)'
+    # The sampled path must credit per-document stats to the GLOBAL row, not
+    # to a chunk-local row.  With chunk=1 and most targets sampled, a broken
+    # offset would pile almost every token onto row 0.
+    samp = L.eval_ppl(model, ids, dev, chunk=1, eval_rows=150, eval_seed=5, return_stats=True)
+    per_row = samp['n_tokens_per_row']
+    assert sum(per_row) == int(samp['n_tokens']) == 150, (sum(per_row), samp['n_tokens'])
+    assert max(per_row) <= ids.shape[1] - 1, f'per-document token counts must stay within one row: {per_row}'
+    assert abs(sum(samp['nll_per_row']) - samp['nll_sum']) < 1e-9, 'per-document NLL must sum to the pooled NLL'
 
 
 # ---------------------------------------------------------------------------
@@ -2203,6 +2249,7 @@ def main():
     _check('C20a partial pairing keeps controlled seeds', t_partial_skipped_seed_keeps_controlled_contrast)
     _check('C20b incomplete components exported in audit report', t_audit_incomplete_components_alias)
     _check('A7 adaptive-threshold capacity guard', t_adaptive_threshold_guard)
+    _check('A7b adaptive-threshold chunked values', t_adaptive_threshold_values)
     _check('A8 empty segmenter', t_segment_empty)
     _check('A8a uniform-stride cut boundary', t_segment_uniform_stride_only_when_all_cuts)
     _check('A8b empty pooling geometry', t_empty_pool_geometry)

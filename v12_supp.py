@@ -190,6 +190,9 @@ def _load_manifest(path):
         _es = comp.get('expected_sign')
         if _es is not None and str(_es).lower() not in ('positive', 'negative'):
             raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} has expected_sign={_es!r} (expected "positive", "negative", or null)')
+    _names = [str(_c.get('name')) for _c in m['primary_comparisons']]
+    if len(set(_names)) != len(_names):
+        raise SystemExit('[v12] REFUSE: duplicate primary-comparison names would collapse the Holm family — every declared contrast needs a unique name')
     # ---- review-2 issue 1: a plan that CANNOT confirm is refused at load time.
     # 6 seeds x two-sided sign-flip x Holm/4 has a smallest attainable Holm p of
     # m * 2/2^n = 0.125 > 0.05: confirmation probability is ZERO BY CONSTRUCTION,
@@ -230,12 +233,11 @@ def _file_sig(path):
 
 
 def _file_sha256(path, chunk=1 << 20):
-    # Bind the digest to (size, mtime_ns) so an unchanged file is not re-read,
-    # while any rewrite still forces a fresh hash.
+    # Bind the digest to the full cheap identity (size, mtime, ctime, inode),
+    # so an unchanged file is not re-read while any rewrite — even one that
+    # preserves size and mtime — still forces a fresh hash.
     try:
-        _st = os.stat(path)
-        _key = (os.path.abspath(path), int(getattr(_st, 'st_size', 0)),
-                int(getattr(_st, 'st_mtime_ns', int(_st.st_mtime * 1e9))))
+        _key = (os.path.abspath(path),) + _file_sig(path)
         _hit = _FILE_SHA_CACHE.get(_key)
         if _hit is not None:
             return _hit
@@ -274,18 +276,20 @@ def _frozen_train_fp(manifest):
     """Canonical training-corpus fingerprint declared by the frozen plan.
 
     Accepted shapes: ``binding.training_data_fingerprint`` (string or an
-    object with ``train_fp``), ``binding.train_fp``, or a top-level
-    ``training_data_fingerprint``.  ``None`` means the manifest froze the rule
-    but not a literal value; in that case every admission/checkpoint must still
-    agree on ONE non-null train_fp and the first P5T access locks it.
+    object with ``canonical_train_fp`` / ``train_fp`` / ``value``),
+    ``binding.train_fp``, or a top-level ``training_data_fingerprint``.
+    ``None`` means the manifest froze the rule but not a literal value; in that
+    case every admission/checkpoint must still agree on ONE non-null train_fp
+    and the first P5T access locks it.
     """
     for _obj in (manifest.get('binding') or {}, manifest):
         if not isinstance(_obj, dict):
             continue
-        for _k in ('training_data_fingerprint', 'train_fp', 'training_fp'):
+        for _k in ('training_data_fingerprint', 'canonical_train_fp', 'train_fp', 'training_fp'):
             _v = _obj.get(_k)
             if isinstance(_v, dict):
-                _v = _v.get('train_fp') or _v.get('value')
+                _v = (_v.get('canonical_train_fp') or _v.get('train_fp')
+                      or _v.get('value'))
             if isinstance(_v, str) and _v:
                 return _v
     return None
@@ -561,9 +565,12 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
         if _ck_sig is not None and rec.get('ckpt_sig') == list(_ck_sig):
             return False
         _sha = _ensure_ck_sha()
-        if _sha is not None and rec.get('ckpt_sha256') != _sha:
-            return True
-        return False
+        if _sha is not None:
+            return rec.get('ckpt_sha256') != _sha
+        # Neither the cheap signature nor a content hash is available, so the
+        # record cannot be shown to belong to the weights on disk now.  Fail
+        # closed (re-evaluate) rather than resuming on an unverified file.
+        return True
     if not _stale(_cur):
         del d
         out['status'] = 'skipped_resume'
@@ -827,6 +834,16 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     if os.path.exists(bylen_path):
         raw = json.load(open(bylen_path, encoding='utf-8'))
     admitted, unified_fp = _admit_confirmation_records(raw, manifest)
+    # The analysis entry point is as much part of the frozen round as P5T:
+    # reuse the same persistent lock so a manifest or test-slice change after
+    # the first access is refused here too, not only during evaluation.  A
+    # non-empty confirmation file without its first-access lock is refused:
+    # a copied bylen.json alone cannot prove which plan/slice produced it.
+    if unified_fp is not None:
+        _lock_dir = os.path.dirname(os.path.abspath(bylen_path))
+        if not os.path.exists(_freeze_lock_path(_lock_dir)):
+            raise SystemExit(f'[v12] REFUSE: {bylen_path} has admissible confirmation records but no freeze lock in {_lock_dir} — refuse to analyse a copied result that cannot be tied to the first test-split access')
+        _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='accessed')
     _alpha = float((manifest.get('statistics') or {}).get('alpha', 0.05))
     stats = {'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision')}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp}, 'comparisons': {}, 'holm': {}, 'by_length': {}}
     for v in manifest['arms']:

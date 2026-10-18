@@ -656,7 +656,7 @@ def causal_adaptive_threshold(sim, target_block_tokens):
             c1 = min(c0 + col_chunk, n)
             cols = idx[c0:c1]
             masked = torch.where(idx[None, None, :] <= cols[None, :, None],
-                                 xr[:, c0:c1, None], float('inf'))
+                                 xr[:, None, :], float('inf'))
             masked = masked.sort(dim=-1).values
             lo_v = masked.gather(-1, lo_c[c0:c1].expand(b, c1 - c0, 1)).squeeze(-1)
             hi_v = masked.gather(-1, hi_c[c0:c1].expand(b, c1 - c0, 1)).squeeze(-1)
@@ -4413,12 +4413,13 @@ def _fineweb_local_files(env_value):
     return [f for f in files if os.path.isfile(f)]
 
 def _fineweb_local_source_fingerprint(env_value):
-    """Identity of the local stand-in source (paths, sizes, mtimes).
+    """Identity of the local stand-in source (paths, size, mtime, ctime, inode).
 
     The token cache's own `src_fp` only proves that the cached ids match the
     cache meta; it cannot see that the *source* files changed.  The signature
-    changes whenever a source file is added/removed/replaced (mtime/size
-    change), so a rebuilt cache is non-confusable with an older one."""
+    changes whenever a source file is added/removed/replaced — ctime/inode
+    catch even a same-size replacement that preserves mtime — so a rebuilt
+    cache is non-confusable with an older one."""
     files = _fineweb_local_files(env_value)
     if not files:
         return None
@@ -4433,6 +4434,10 @@ def _fineweb_local_source_fingerprint(env_value):
         h.update(str(int(st.st_size)).encode('ascii'))
         h.update(b'\0')
         h.update(str(int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9)))).encode('ascii'))
+        h.update(b'\0')
+        h.update(str(int(getattr(st, 'st_ctime_ns', int(st.st_ctime * 1e9)))).encode('ascii'))
+        h.update(b'\0')
+        h.update(str(int(getattr(st, 'st_ino', 0))).encode('ascii'))
         h.update(b'\0')
     return h.hexdigest()[:16]
 
@@ -4469,7 +4474,9 @@ def _doc_simhash(text, *, shingle_words=5, max_shingles=128):
          for sh in shingles),
         dtype=np.uint64, count=len(shingles))
     if hashes.size == 0:
-        return 0
+        # Keep the pre-vectorised semantics: an empty shingle set has all-zero
+        # per-bit sums, and `v >= 0` sets every bit (not the all-zero hash).
+        return (1 << 64) - 1
     bits = ((hashes[:, None] >> np.arange(64, dtype=np.uint64)[None, :]) & 1)
     vec = bits.astype(np.int64) * 2 - 1
     out = 0
@@ -4565,9 +4572,10 @@ def _wikitext_fit_rows(rows, vocab_size, token_cap, max_rows=50000):
     # retrained both up to 24 times whenever the first estimate exceeded the
     # cap.  The first over-budget measurement already yields the token/row (or
     # token/char) ratio; a conservative prefix from that ratio converges in
-    # one rebuild for realistic text, and the loop is capped at three passes
-    # as a guard against a pathological vocabulary.
-    for _pass in range(3):
+    # one rebuild for realistic text, and a small pass cap guards against a
+    # pathological vocabulary.  Never return a fit corpus that exceeds the
+    # advertised token budget.
+    for _pass in range(8):
         tok = build_tokenizer(fit_text, vocab_size)
         n_tok = int(sum(len(enc.ids) + 1 for enc in tok.encode_batch(fit_text))) if fit_text else 0
         if n_tok <= int(token_cap):
@@ -4584,7 +4592,9 @@ def _wikitext_fit_rows(rows, vocab_size, token_cap, max_rows=50000):
             if new_len <= 0:
                 break
             fit_text = [text[:new_len]]
-    return fit_text, tok, n_tok
+    raise RuntimeError(
+        f'_wikitext_fit_rows: could not shrink the tokenizer-fit corpus to the '
+        f'{int(token_cap)}-token budget (last measured {int(n_tok)} tokens)')
 
 def _fineweb_local_rows(env_value):
     """Offline FineWeb-Edu stand-in: FWEDU_LOCAL_JSONL lists files or
@@ -5413,10 +5423,17 @@ def _ids_narrow(train_ids):
         # build one shared int32 sidecar next to the cache instead and map it.
         try:
             _st = os.stat(_path)
-            _side = f'{_path}.i32-{int(_st.st_size)}-{int(getattr(_st, "st_mtime_ns", 0))}.npy'
+            # Bind the sidecar to the same identity fields the cache loaders
+            # use.  A same-size rewrite can preserve mtime (``cp -p``), so
+            # size+mtime alone could silently serve a stale int32 copy.
+            _side = (f'{_path}.i32-{int(_st.st_size)}-'
+                     f'{int(getattr(_st, "st_mtime_ns", 0))}-'
+                     f'{int(getattr(_st, "st_ctime_ns", int(_st.st_ctime * 1e9)))}-'
+                     f'{int(getattr(_st, "st_ino", 0))}.npy')
             if os.path.exists(_side):
                 _n = np.load(_side, mmap_mode='r')
-                if int(_n.size) == int(train_ids.size):
+                if (int(_n.size) == int(train_ids.size)
+                        and np.dtype(_n.dtype) == np.dtype(np.int32)):
                     _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
                     return _n
             _mx = int(train_ids.max()) if train_ids.size else -1
@@ -6252,12 +6269,15 @@ def _binom_cdf_half(n, m):
 
 
 def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
-    """通过 Holm 第一道门所需的最小同向种子数 k_min（双侧精确检验）。
+    """规划用：通过 Holm 第一道门所需的最小同向种子数 k_min。
 
-    若 k 个种子同向（n−k 反向），精确双侧 p = 2·P(Bin(n, 1/2) ≤ n−k)；
-    第一道门要求 m·p < alpha。返回使 m·p(k) < alpha 的最小 k；若全部
-    n 个同向仍不够，返回 None（方案不可能确认）。二项尾概率在 log 空间
-    计算，因此大 n（规模扩展后的补种子计划）也不会整数溢出。"""
+    若 k 个种子同向（n−k 反向），符号检验投影的 p 为
+    2·P(Bin(n, 1/2) ≤ n−k)，第一道门要求 m·p < alpha。对**绝对值相等**
+    的配对差，这个投影就等于精确双侧符号翻转 p；绝对值不等时，精确
+    sign-flip p 只会更大（更不显著），所以本函数给出的是所需同向数的
+    下界，真实数据可能仍需更多同向种子。返回使 m·p(k) < alpha 的最小
+    k；若全部 n 个同向仍不够，返回 None（方案不可能确认）。二项尾概率
+    在 log 空间计算，因此大 n（规模扩展后的补种子计划）也不会整数溢出。"""
     try:
         n = int(n_seeds)
         m = int(m_comparisons)
@@ -6280,11 +6300,12 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
     """每种子同向概率为 q 时，通过 Holm 第一道门的功效。
 
     P(Bin(n, q) ≥ k_min)。q 的含义：在真效应方向上，单个种子的配对 Δ
-    落在预注册方向的概率（含种子间噪声）。功效对 q 敏感——预注册时必须
-    报告 q 的假设来源（如 validation 面板的同向率），不得只报「数学上
-    可能」。n<=0 或方案不可能确认时返回 0.0。尾部概率用正则化不完全
-    贝塔函数计算（P(X<=k-1)=I_{1-q}(n-k+1,k)），大 n 下不会因
-    `comb(n,k)*q**k` 的整数/浮点溢出而失败。"""
+    落在预注册方向的概率（含种子间噪声）。k_min 来自等幅/符号检验投影，
+    因此这里的功效是对真实 sign-flip 功效的上界（绝对值不等时实际功效
+    更低）。功效对 q 敏感——预注册时必须报告 q 的假设来源（如 validation
+    面板的同向率），不得只报「数学上可能」。n<=0 或方案不可能确认时返回
+    0.0。尾部概率用正则化不完全贝塔函数计算（P(X<=k-1)=I_{1-q}(n-k+1,k)），
+    大 n 下不会因 `comb(n,k)*q**k` 的整数/浮点溢出而失败。"""
     kmin = signflip_min_consistency(n_seeds, m_comparisons, alpha)
     if kmin is None or kmin <= 0:
         return 0.0 if kmin is None else 1.0
@@ -9838,7 +9859,10 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                 _local = _sel_sorted[_lo:_hi] - _base
                 _ri = torch.div(_local, _span, rounding_mode='floor')
                 _ci = _local - _ri * _span
-                _src_rows = _ri
+                # `_row_nll` / `_row_ntok` are indexed by the GLOBAL document
+                # row, while `_ri` is chunk-local because it indexes this
+                # chunk's `h`/`ids`.  Offset it before the scatters.
+                _src_rows = _ri + i
                 # gather the selected hidden rows BEFORE the head: each output
                 # row of the Linear is an independent function of one hidden
                 # row, so head(h[sel]) == head(h)[sel]

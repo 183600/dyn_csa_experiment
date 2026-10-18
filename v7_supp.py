@@ -1293,22 +1293,25 @@ def exact_sign_permutation(deltas):
             res['cohens_dz'] = 0.0
         else:
             res['cohens_dz'] = float('inf') if _mu > 0 else float('-inf')
-        res['test'] = 'exact two-sided sign-flip over paired per-seed deltas'
+        res['test'] = ('exact two-sided sign-flip over paired per-seed deltas'
+                       if str(res.get('method', 'exact')).startswith('exact')
+                       else 'deterministic two-sided sign-flip normal approximation over paired per-seed deltas')
         return res
     if n == 0:
         return _extras({'n': 0, 'mean': float('nan'), 'std': float('nan'), 'p_exact_signflip': float('nan'), 'n_flips': 0, 'n_dropped': n_dropped}, d, n)
     obs = abs(d.mean())
     if n > 20:
-        rng = np.random.default_rng(0)
-        B = 200000
-        cnt = 1
-        step = max(1, min(B, (1 << 24) // max(n, 1)))
-        for off in range(0, B, step):
-            bs = min(step, B - off)
-            signs = np.where(rng.random((bs, n)) < 0.5, 1.0, -1.0)
-            cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
-        p = float(cnt / (B + 1))
-        return _extras({'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': B, 'n_dropped': n_dropped}, d, n)
+        # exp_lib keeps the test exact via meet-in-the-middle through n=40
+        # (and uses a deterministic normal approximation, never a random
+        # Monte-Carlo draw, beyond that).  Do not label a sampled p-value as
+        # an exact sign-flip p.
+        _r = L.exact_signflip_p(d)
+        return _extras({'n': n, 'mean': float(d.mean()),
+                        'std': float(d.std(ddof=1)) if n > 1 else 0.0,
+                        'p_exact_signflip': float(_r['p']),
+                        'n_flips': (int(1 << n) if _r.get('method', '').startswith('exact') else 0),
+                        'method': _r.get('method'),
+                        'n_dropped': n_dropped}, d, n)
     cnt = 0
     total = 1 << n
     bitpos = np.arange(n, dtype=np.int64)[None, :]
@@ -2072,6 +2075,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     _t_ev = time.time()
     r = eval_length_gen(model, val_ids, _need_lens, DEVICE, max_pos=mp, n_seq=n_seq)
     _ckp_params = _ckp['params']
+    _ckp_train_fp = _ckp.get('train_fp')
     if guard is not None:
         guard.record_run(time.time() - _t_ev, 0, 0, 0, 0, 0)
 
@@ -2089,13 +2093,24 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             _prov = L.experiment_provenance(_prov_cfg, train_ids=(train_ids if _tr is not None else None), val_batch=val_ids, vocab=vocab)
             _rec['provenance'] = _prov
             _rec['hyperparams'] = L.run_hyperparameters({'steps': steps, 'n_train_tokens': _prov_cfg['n_train_tokens'], 'seq_len': train_len, 'batch_size': batch_size, 'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 50, 'comp_lambda': 0.05, 'delta_lr_mult': 10.0}, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, vocab=vocab, mlp_ratio=mr)
-            _rec['data_fp'] = _prov['data'].get('train_fp') or _prov['data'].get('val_fp')
-            _rec['val_fp'] = _prov['data'].get('val_fp')
             if _tr is not None:
+                _rec['data_fp'] = _prov['data'].get('train_fp') or _prov['data'].get('val_fp')
                 _rec['rng_fp'] = _tr.get('rng_fp')
                 _rec['losses'] = _tr.get('losses')
                 _rec['ppl_history'] = _tr.get('ppl_history')
                 _rec['train_knobs'] = _tr.get('train_knobs')
+            else:
+                # A partial resume re-evaluates only missing lengths and has no
+                # fresh training record.  Preserve the corpus/optimizer
+                # provenance of the existing record; never relabel this run as
+                # having been trained on the validation slice.
+                _prev = _cur_now if isinstance(_cur_now, dict) else {}
+                _rec['data_fp'] = (_ckp_train_fp or _prev.get('data_fp')
+                                   or _prov['data'].get('val_fp'))
+                for _kk in ('rng_fp', 'losses', 'ppl_history', 'train_knobs'):
+                    if _prev.get(_kk) is not None:
+                        _rec[_kk] = _prev[_kk]
+            _rec['val_fp'] = _prov['data'].get('val_fp')
         except Exception as _pe:
             print(f'[p1l] WARNING: could not attach provenance to {key} ({type(_pe).__name__}: {_pe})')
         summary[key] = _rec

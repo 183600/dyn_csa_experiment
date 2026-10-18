@@ -1387,7 +1387,16 @@ def v10_analysis(out='analysis_v10/stats.json'):
             # `span` carries an extra span_len in probe_params (it changes the
             # corruption geometry), but the clean ρ=0 cell does not.  Strip only
             # the mode-specific key for the lookup; the measured cells keep it.
-            _pp_clean = _clean_probe_params(_pp)
+            # `_pp` is the canonical JSON string used in the grouping key, so
+            # parse it before normalising (a string is not a dict).
+            _pp_clean = _pp
+            if isinstance(_pp, str):
+                try:
+                    _pp_obj = json.loads(_pp)
+                except (TypeError, ValueError):
+                    _pp_obj = None
+                if isinstance(_pp_obj, dict):
+                    _pp_clean = json.dumps(_clean_probe_params(_pp_obj), sort_keys=True)
             clean_key = (v, arm, Ln, 0.0, 'uniform', _pp_clean, _cd, _recipe)
             clean_grp = cells.get(clean_key) or {}
             if not clean_grp:
