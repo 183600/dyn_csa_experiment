@@ -343,8 +343,7 @@ def run_simple(base_cfg=None, outdir='results_baseline_tuning', protocol=None):
     train_ids, val_batch, vocab, _tok, _val_bnd = L.load_run_corpus(base)
     # Match the neural panel's FINAL evaluation slice exactly: train_variant
     # scores the full fixed val_batch (`eval_subset` only controls the
-    # per-eval-step history).  Using eval_subset here measured the floor on 128
-    # rows while the panel PPL came from 512 — two different validation samples.
+    # per-eval-step history).
     rows = max(1, int(val_batch.shape[0]))
     eval_slice = val_batch[:rows]
     artifact = L.simple_baseline_fit(train_ids, eval_slice, vocab, protocol=protocol)

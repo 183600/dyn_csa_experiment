@@ -437,9 +437,7 @@ def run_full():
         push_ok = git_push('v6: rebuild results_lm_v3_long/summary.json from committed aggregate')
     else:
         # Reconstruction is an explicit, opt-in provenance operation: a
-        # synthesized record is a copy, not an independent run.  Running it
-        # automatically in `full` made the long panel look more complete than
-        # the measured evidence.
+        # synthesized record is a copy, not an independent run.
         print('[synth] skipped (set V6_SYNTH=1 to rebuild results_lm_v3_long/summary.json from an old aggregate)')
         _synth_summary, _long_snapshot = {}, None
         push_ok = True

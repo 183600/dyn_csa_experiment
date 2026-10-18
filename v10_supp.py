@@ -1357,8 +1357,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             # the clean baseline is the SAME arm's rho=0 uniform cell under the
             # same parameterisation/code/recipe; deltas are per-seed paired.
             # `span` carries an extra span_len in probe_params (it changes the
-            # corruption geometry), but the clean ρ=0 cell does not — comparing
-            # the full dict silently dropped EVERY span ΔNLL row.  Strip only
+            # corruption geometry), but the clean ρ=0 cell does not.  Strip only
             # the mode-specific key for the lookup; the measured cells keep it.
             _pp_clean = _clean_probe_params(_pp)
             clean_key = (v, arm, Ln, 0.0, 'uniform', _pp_clean, _cd, _recipe)

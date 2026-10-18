@@ -340,8 +340,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         # Same non-reentrant recompute contract as exp_lib._gathered_attention
         # _trainable: _rope_attn is a pure function of its inputs with no RNG,
         # so backward recomputes the same chunk decomposition and gradients are
-        # unchanged.  Without this, only the MLP-level checkpoint was active in
-        # v7 and every layer's gathered attention activations were retained.
+        # unchanged.
         q = args[0]
         if torch.is_grad_enabled() and q.requires_grad:
             return torch.utils.checkpoint.checkpoint(
@@ -515,8 +514,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         row_chunk = L._full_attn_row_chunk(x.device, B, nh, T, q.element_size())
         # Same whole-loop activation checkpoint as exp_lib._full_batched's
         # sink/window path: the row loop is a pure, RNG-free function of its
-        # inputs, so backward recomputes the identical chunks instead of
-        # retaining every [B, rows, nh, T] logits/attention table.
+        # inputs, so backward recomputes the identical chunks.
         if torch.is_grad_enabled() and q.requires_grad:
             out = torch.utils.checkpoint.checkpoint(
                 self._dense_warmup_loop, q, k, v, mask, _use_full_mask, sink, win,
@@ -863,9 +861,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             _ce_d = None
             if _blp is not None:
                 # REINFORCE baseline kept on the device: no .item() before
-                # backward, so the step does not force a host sync while the CE
-                # graph is still live.  The baseline is updated after the
-                # optimizer step, matching exp_lib's post-backward policy.
+                # backward.  The baseline is updated after the optimizer step,
+                # matching exp_lib's post-backward policy.
                 _ce_d = ce.detach()
                 if _ce_baseline is None:
                     _ce_baseline = _ce_d.new_zeros(())
@@ -1675,8 +1672,8 @@ def run_niah_phase(payload, guard=None, label=''):
                     if cache['age'] >= 4 or cache['ids'] is None:
                         eps = _seed * 100003 + cache['epoch'] * 7919
                         ids, tgt, _, _kd = build_niah_batch(12, 512, 4, _vocab, seed=eps)
-                        # staged non-blocking upload — the same bit-exact
-                        # transport as batch_iter's staging path (§6.1).
+                        # staged upload — the same bit-exact transport as
+                        # batch_iter's staging path (§6.1).
                         cache['ids'] = L._h2d_async(ids, torch.int64, DEVICE)
                         cache['tgt'] = L._h2d_async(tgt, torch.int64, DEVICE)
                         cache['age'] = 0
@@ -1699,18 +1696,14 @@ def run_niah_phase(payload, guard=None, label=''):
                             break
                         x, y = _batch()
                         # Chunked LM head + cross-entropy (the inherited
-                        # ce_loss path): the full [B, T, vocab] logits table is
-                        # never materialised, and each time chunk is recomputed
-                        # in backward.  The trunk still sees the full T-token
+                        # ce_loss path).  The trunk still sees the full T-token
                         # input (block geometry is T-dependent); ce_loss scores
                         # the first T-1 hidden rows against y and averages over
                         # the valid NIAH targets only (targets use -100).
                         ce = model.ce_loss(x, y, vocab, ignore_index=-100)
                         loss = ce + 0.05 * model.comp_reg
                         # Keep the detached scalar on the device and move a
-                        # whole block at the cadence the other loops use: the
-                        # per-step float() would otherwise force a device sync
-                        # before every backward.
+                        # whole block at the cadence the other loops use.
                         _niah_buf.append(ce.detach())
                         if len(_niah_buf) >= 512:
                             _niah_flush()
@@ -1821,8 +1814,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
     try:
         # LM-head logits are computed a time slice at a time: each output row
         # is an independent function of its hidden row, so per-token NLLs are
-        # bit-identical to the full-table form while the [rows, L, vocab]
-        # table is never materialised (the dominant VRAM term at scale).
+        # bit-identical to the full-table form.
         def _head_ce_none(_h, _tgt, _rows, _span):
             _nll = torch.empty((_rows, _span), dtype=torch.float32, device=device)
             _budget = 128 << 20
@@ -1914,7 +1906,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                             continue
                         raise
                     # Keep the per-token losses in a small float32 table and
-                    # sum once, so the reduction order matches the previous
+                    # sum once, so the reduction order matches the
                     # full-logits cross_entropy(reduction='sum').
                     _nll_rows = _head_ce_none(_h, _sub[:, 1:], int(_sub.shape[0]), int(_sub.shape[1]) - 1)
                     nll += _nll_rows.sum().double()

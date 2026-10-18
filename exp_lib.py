@@ -532,16 +532,14 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
     bids_cpu = []
     nblks = []
     hons = []
-    # Rows with identical cut masks produce identical integer geometry; run
-    # the host segmenter once per distinct row instead of once per batch row.
+    # Rows with identical cut masks produce identical integer geometry, so the
+    # host segmenter runs once per distinct row.
     _uniq = []
     _slot = []
     _seen = {}
     for _g in gate_lists:
         _a = np.asarray(_g, dtype=bool)
-        # Exact O(rows*T) dedup: the old pairwise scan was O(rows^2*T) and
-        # would dominate the segmenter at larger batch/sequence sizes.  The
-        # byte key is exact (no hash-collision contract change).
+        # The byte key is exact (no hash-collision contract change).
         _k = (_a.shape, _a.tobytes())
         _j = _seen.get(_k)
         if _j is None:
@@ -940,8 +938,8 @@ def _window_attn_local_impl(q, k, v, window, scale):
 def _window_attn_local(q, k, v, window, scale):
     # Checkpoint the whole row loop: the recomputed function is the same pure
     # row partition, so values and gradients are unchanged.  The row chunk is
-    # recomputed from the same deterministic budget, so backward reproduces the
-    # forward partition exactly.
+    # recomputed from the same deterministic allocation, so backward reproduces
+    # the forward partition exactly.
     if torch.is_grad_enabled() and q.requires_grad:
         return torch.utils.checkpoint.checkpoint(
             _window_attn_local_impl, q, k, v, int(window), scale,
@@ -2924,9 +2922,8 @@ class HybridAttention(nn.Module):
                     self._cuts.append(np.cumsum(np.asarray(_cpu[0], dtype=np.int64))[:-1])
                 else:
                     cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
-                    # Host-boundary bookkeeping is eval-only; keeping the cut
-                    # table on the host avoids pinning one device tensor per
-                    # (layer, sequence) until the whole forward finishes.
+                    # Host-boundary bookkeeping is eval-only; the cut table is
+                    # kept on the host.
                     self._cuts.append(cuts.cpu() if cuts.device.type != 'cpu' else cuts)
         # Normalizing an all-zero content table is exactly zero (0/eps == 0),
         # so the zero-content ablation keeps the same values.
@@ -3261,8 +3258,7 @@ class SmallGPT(nn.Module):
         h = self.trunk(ids)
         # When targets contain ignored positions, the mean must be taken over
         # the valid targets only (F.cross_entropy's own reduction), exactly as
-        # the unchunked form did.  The default None keeps the hot training path
-        # free of an extra device reduction/sync: every target is valid there.
+        # the unchunked form did.  The default None means every target is valid.
         if ignore_index is None:
             _ign = -100
             n_tok = int(targets.numel())
@@ -3461,12 +3457,10 @@ def _array_file_path(arr):
                 off = int(getattr(cur, 'offset', 0) or 0)
                 nb = int(getattr(cur, 'nbytes', -1))
                 # Only a view that covers the whole backing file may reuse the
-                # file's sidecar.  The old identity comparison below used to
-                # accept ANY memmap slice (cur was arr itself), which could
-                # return the full-file digest for a shorter prefix.  Requiring
-                # the byte range to span [offset, file end], the same layout as
-                # `arr`, and the same reinterpretation dtype makes a slice
-                # fall through to its own content hash.
+                # file's sidecar.  Requiring the byte range to span
+                # [offset, file end], the same layout as `arr`, and the same
+                # reinterpretation dtype makes a slice fall through to its own
+                # content hash.
                 same = (off >= 0 and nb >= 0 and off + nb == int(st.st_size)
                         and nb == arr_nbytes
                         and tuple(getattr(cur, 'shape', ())) == arr_shape
@@ -4628,11 +4622,9 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
             try:
                 # Only corpora within the cap are pinned in full.  Larger
                 # corpora are gathered from the source array in a prefetch
-                # thread (see below), so the per-step gather/disk read overlaps
-                # with GPU compute instead of blocking every step.  uint8/uint16
-                # gathers also use the NumPy path: PyTorch's CPU index kernels
-                # lack those dtypes, so pinning them would only move the failure
-                # to the first next().
+                # thread (see below).  uint8/uint16 gathers also use the NumPy
+                # path: PyTorch's CPU index kernels lack those dtypes, so
+                # pinning them would only move the failure to the first next().
                 if _narrow.dtype in (np.uint8, np.uint16):
                     host_np = _narrow
                 elif train_ids.nbytes <= _PINNED_HOST_CAP_BYTES:
@@ -4680,11 +4672,8 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
             ids = _h2d_async(ids, ids.dtype, device)
         return ids
 
-    # A CPU gather from a >4GB memmap is a synchronous read on the caller's
-    # thread today; each step therefore stalls the GPU for the whole random
-    # access.  A small bounded producer queue runs the identical seeded draw
-    # and gather one step ahead, so the next batch is ready while the current
-    # one trains.  Values and order are unchanged (same RNG, same indices).
+    # A small bounded producer queue runs the identical seeded draw and gather
+    # one step ahead.  Values and order are unchanged (same RNG, same indices).
     _prefetch = device.type == 'cuda' and (host_np is not None or (host is not None and host.device.type == 'cpu'))
     if not _prefetch:
         while True:
@@ -6454,8 +6443,7 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
         raise ValueError('ngram baseline: eval ids outside [0, vocab_size)')
     # The count tables are a pure function of (train_ids, vocab_size) and do
     # not depend on the smoothing hyper-parameters, so a tuning grid can build
-    # them once and hand the same tables to every trial (identical values,
-    # one O(n log n) pass / one set of count arrays instead of one per trial).
+    # them once and hand the same tables to every trial (identical values).
     counts = _ngram_train_counts(ids, vocab_size) if _counts is None else _counts
     uni_counts = counts[0]
     denom = float(uni_counts.sum()) + alpha * vocab_size
@@ -7145,8 +7133,8 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             # it must be described as a subset, not as the full declared grid.
             _missing_cfg = sorted(declared - set(cfgs))
             warnings.append(f'{arm}: searched a strict subset of the declared grid (missing {_missing_cfg[:2]})')
-        # Trial-level training budget: equal tuning means the same data/steps,
-        # not only the same lr grid.
+        # Trial-level training allocation: equal tuning means the same
+        # data/steps, not only the same lr grid.
         by_cfg = {}
         for t in trials:
             if not isinstance(t, dict):
@@ -7225,7 +7213,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             warnings.append(f'trials report search seeds {search_seeds_seen} but the declared set is {list(_declared_ss)}')
     elif _declared_ss is not None:
         warnings.append('trial records do not expose their search seeds — multi-seed selection cannot be verified from this artifact')
-    # Cross-arm per-config budget check (only where both records expose it).
+    # Cross-arm per-config allocation check (only where both records expose it).
     _all_sigs = set().union(*(set(b) for b in budgets.values())) if budgets else set()
     for sig in sorted(_all_sigs):
         _vals = {arm: b[sig] for arm, b in budgets.items() if sig in b}
@@ -9747,8 +9735,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 # able to change the boundary policy.  Centred by a running CE
                 # baseline to reduce variance; decisions are normalised so the
                 # coefficient does not scale with sequence length or depth.
-                # This is the only arm that reads the running CE baseline, so
-                # it is also the only one that pays the host sync for it.
+                # This is the only arm that reads the running CE baseline.
                 _ce_item = float(ce.detach().item())
                 _adv = _ce_item - float(_ce_baseline)
                 _bdec = max(int(getattr(model, 'boundary_decisions', 0) or 0), 1)
@@ -10015,8 +10002,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
             _gs.append(p.grad.detach())
         if _gs:
             # Keep the per-tensor reductions on the device and read back a
-            # single scalar: the elementwise sums are the same, and a probe on
-            # a scaled model no longer forces one host sync per parameter.
+            # single scalar: the elementwise sums are the same.
             _sq = torch.stack([g.double().pow(2).sum() for g in _gs])
             grad_norm = math.sqrt(float(_sq.sum()))
             grad_finite = bool(torch.stack([torch.isfinite(g).all() for g in _gs]).all())
@@ -11599,7 +11585,7 @@ def run_cell_job(job):
     if torch.cuda.is_available():
         _pin_cuda_determinism()
     # The parent already computed the identical fingerprint/provenance over
-    # this corpus; reuse them instead of re-reading every token in each child.
+    # this corpus; reuse them.
     fp = job.get('fp') or _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch)
     return _run_cell(cfg, job['v'], job['seed'], guard=guard, ratios={}, fp=fp, train_ids=train_ids, val_batch=val_batch, vocab=vocab, val_bnd=val_bnd, prebook=True, prov=job.get('prov'))
 

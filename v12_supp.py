@@ -220,9 +220,8 @@ def _load_manifest(path):
 _FILE_SHA_CACHE = {}
 
 def _file_sha256(path, chunk=1 << 20):
-    # Checkpoints are multi-GB and the same path is hashed once per (arm, seed)
-    # on resume.  Bind the digest to (size, mtime_ns) so an unchanged file is
-    # not re-read, while any rewrite still forces a fresh hash.
+    # Bind the digest to (size, mtime_ns) so an unchanged file is not re-read,
+    # while any rewrite still forces a fresh hash.
     try:
         _st = os.stat(path)
         _key = (os.path.abspath(path), int(getattr(_st, 'st_size', 0)),
@@ -529,9 +528,8 @@ def run_finaltest(cfg=None, guard=None):
     _lock_path = _freeze_lock_path(outdir)
     if os.path.exists(os.path.join(outdir, 'bylen.json')) and not os.path.exists(_lock_path):
         raise SystemExit(f'[v12] REFUSE: {outdir}/bylen.json exists but there is no pre-access freeze lock — the only honest interpretation is that a test-split measurement predates the lock; investigate before reusing it')
-    # Write the pre-access attestation BEFORE reading the held-out split.  The
-    # old order (read, then lock) could burn the one-shot access and only then
-    # discover a manifest mismatch.
+    # Write the pre-access attestation BEFORE reading the held-out split, so a
+    # manifest mismatch is discovered before the one-shot access is used.
     _check_or_write_freeze_lock(outdir, manifest, None, stage='preaccess')
     if test_ids is None:
         _t0 = time.time()

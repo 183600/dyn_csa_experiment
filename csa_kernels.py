@@ -283,9 +283,8 @@ class PoolGeometry:
                                  ov_start_np, ov_len_np, starts_prev_np)):
             flat[_i * R * Bm:(_i + 1) * R * Bm] = _a.reshape(-1)
         flat[7 * R * Bm:] = nblk_np
-        # Stage through the shared pinned H2D pool: the same int32 values are
-        # copied asynchronously (the source buffer is filled before commit), so
-        # a per-layer geometry upload no longer blocks the device.
+        # Stage through the shared pinned H2D pool (transport only): the source
+        # buffer is filled before commit, so the uploaded values are identical.
         import exp_lib as L
         staged, commit = L._h2d_stage((int(flat.size),), torch.int32, device)
         if staged is not None:
@@ -961,10 +960,8 @@ def _warn_shape_fallback(op, detail):
 
 def _indexer_impl_for_shape(impl, kI):
     if impl == 'triton' and int(kI.shape[1]) > 8192:
-        # Silent fallback made a long-context panel quietly switch backends, so
-        # its G0 throughput/memory numbers were no longer comparable.  Refuse
-        # by default; an explicit opt-in keeps the torch twin available for
-        # debugging/CPU runs (and the reference twin remains the documented
+        # Refuse by default; an explicit opt-in keeps the torch twin available
+        # for debugging/CPU runs (the reference twin remains the documented
         # backend for every shape there).
         if os.environ.get('CSA_INDEXER_ALLOW_REF', '').strip().lower() in ('1', 'true', 'yes'):
             _warn_shape_fallback('indexer', f'Bm={int(kI.shape[1])} exceeds the Triton register/lane limit 8192 (CSA_INDEXER_ALLOW_REF=1)')
@@ -2431,8 +2428,7 @@ def _gate_mean_batched(attn, cfg, T, B, gate_sigs, hons, nblks):
         return torch.zeros((), device=attn.B_pos_a.device if attn.B_pos_a is not None else torch.device('cpu'))
     gate_stack = torch.stack([gs[0] for gs in gate_sigs], 0)
     hon_stack = torch.stack(list(hons), 0).to(gate_stack.dtype)
-    # Stage the small host-side block-count table through the pinned pool so
-    # this per-layer upload does not add a blocking H2D sync each step.
+    # Stage the small host-side block-count table through the pinned pool.
     import exp_lib as L
     nblk_t = L._h2d_async([float(nb - 1) for nb in nblks], gate_stack.dtype, gate_stack.device)
     shs = (gate_stack * hon_stack).sum(dim=1)
