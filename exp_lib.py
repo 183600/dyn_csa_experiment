@@ -3022,8 +3022,9 @@ class HybridAttention(nn.Module):
             # scatter_add of exact integer ones is order-independent (integer
             # addition commutes, no rounding), so the counts are the same
             # exact integers bincount returns.
-            _bc = torch.zeros(int(nblk), dtype=torch.int64, device=bid.device)
-            _bc.scatter_add_(0, bid if bid.dtype == torch.int64 else bid.long(), torch.ones_like(bid, dtype=torch.int64))
+            # bincount is deterministic (no atomics) and returns the same
+            # exact integer counts as the previous integer scatter-add.
+            _bc = torch.bincount(bid.reshape(-1).long(), minlength=int(nblk))[:int(nblk)]
             self._stats.append(_bc)
             if self._cuts is not None:
                 _cpu = getattr(bid, '_pool_cpu', None)
@@ -7402,16 +7403,22 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
         raise TypeError(f'ngram baseline: train ids must be integers, got dtype {train_arr.dtype}')
     train_arr = train_arr.reshape(-1)
     eval_arr = np.asarray(eval_ids, dtype=np.int64)
+    _data = {'train_fp': _ids_fp(train_arr),
+             'val_fp': _ids_fp(np.ascontiguousarray(eval_arr).reshape(-1)),
+             'n_train_tokens': int(train_arr.size),
+             'n_eval_tokens': int(eval_arr.size)}
+    _data['data_version'] = _data_version(_data)
+    _prov = code_provenance()
+    _prov['data'] = _data
     return {
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'protocol': protocol,
         'selection_metric': protocol.get('selection_metric', 'ppl'),
         'selection_split': protocol.get('selection_split', 'validation'),
         'direction': protocol.get('direction', 'lower_is_better'),
-        'data': {'train_fp': _ids_fp(train_arr),
-                 'val_fp': _ids_fp(np.ascontiguousarray(eval_arr).reshape(-1)),
-                 'n_train_tokens': int(train_arr.size),
-                 'n_eval_tokens': int(eval_arr.size)},
+        'data': _data,
+        'data_version': _data['data_version'],
+        'provenance': _prov,
         'baselines': trials_by_arm,
         'best_baseline': best_arm,
         'best_ppl': float(trials_by_arm[best_arm]['selected_metric_value']),
@@ -9423,11 +9430,34 @@ def _pin_cpu_threads():
         print(f'[determinism] could not pin the CPU thread count to {n} ({type(e).__name__}: {e}) — a CPU run may not be reproducible')
     return n
 
+def pin_tf32(enabled=None):
+    """Pin TF32 explicitly instead of inheriting a framework default.
+
+    Reproducibility depends on the actual matmul precision mode; two boxes (or
+    two torch versions) with different defaults can otherwise disagree while
+    looking identically configured.  ``CSA_TF32=1`` opts in; the default is
+    off (highest float32 precision)."""
+    if enabled is None:
+        enabled = os.environ.get('CSA_TF32', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    enabled = bool(enabled)
+    try:
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = enabled
+            torch.backends.cudnn.allow_tf32 = enabled
+    except Exception as e:
+        print(f'[determinism] could not pin TF32 ({type(e).__name__}: {e})')
+    try:
+        torch.set_float32_matmul_precision('high' if enabled else 'highest')
+    except Exception as e:
+        print(f'[determinism] could not set float32_matmul_precision ({type(e).__name__}: {e})')
+    return enabled
+
 def _pin_cuda_determinism():
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
     os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    pin_tf32()
     mode = os.environ.get('CSA_DETERMINISTIC', '').strip().lower()
     if mode in ('1', 'true', 'yes', 'strict'):
         try:
@@ -9566,7 +9596,7 @@ def _data_version(data):
     (dataset/protocol, token counts, vocabulary and both split fingerprints)
     without knowing which individual fields the loader happened to expose.
     """
-    keys = ('dataset', 'source', 'fw_fit_docs', 'requested_train_tokens', 'train_tokens', 'seq_len', 'vocab_size', 'val_sequences', 'train_fp', 'val_fp')
+    keys = ('dataset', 'source', 'fw_fit_docs', 'requested_train_tokens', 'train_tokens', 'seq_len', 'vocab_size', 'val_sequences', 'train_fp', 'val_fp', 'eval_fp', 'cache_val_fp', 'data_extra')
     payload = {k: data.get(k) for k in keys if data.get(k) is not None}
     blob = json.dumps(_jsonable(payload), sort_keys=True, separators=(',', ':'), ensure_ascii=True)
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
@@ -9597,6 +9627,11 @@ def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
         data['val_fp'] = _ids_fp(_vb)
     if vocab is not None:
         data['vocab_size'] = int(vocab)
+    _extra = cfg.get('data_extra')
+    if isinstance(_extra, dict):
+        # Synthetic/task-specific generators (NIAH recipe, corruption modes)
+        # must be part of the data identity, not only the human note.
+        data['data_extra'] = _jsonable(_extra)
     data['data_version'] = _data_version(data)
     prov = code_provenance()
     prov['data'] = data
@@ -9622,7 +9657,7 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
         hp['data_version'] = str(data_version)
     return hp
 
-def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reproducibility=None, *, status=None, planned_cells=None, started_at=None):
+def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reproducibility=None, *, status=None, planned_cells=None, started_at=None, cell_records=None):
     """Merge one panel's provenance/config/outcome summary into
     `outdir/run_manifest.json` under the same flock used by summary.json.
 
@@ -9639,6 +9674,29 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     of planned cells on disk; the final call marks it complete and lists any
     cell that produced no measurement."""
     os.makedirs(outdir, exist_ok=True)
+
+    def _evidence_for_this_panel(doc, path, what):
+        """Only evidence stamped with THIS panel's run_cfg may enter the
+        manifest.  A run_cfg-less (legacy/hand-written) doc must say
+        ``legacy: true`` explicitly; otherwise a stale pre-flight from a reused
+        outdir could silently certify a new configuration."""
+        if doc is None:
+            return None
+        if not isinstance(doc, dict):
+            print(f'[track] WARNING: {what} evidence is not a JSON object ({type(doc).__name__}) — not embedding it in this panel')
+            return None
+        _rc = doc.get('run_cfg')
+        if _rc is None:
+            if doc.get('legacy') is True:
+                print(f'[track] WARNING: {what} evidence ({path}) has no run_cfg and is explicitly marked legacy — embedding it as unverified legacy evidence')
+                return doc
+            print(f'[track] WARNING: {what} evidence ({path}) has NO run_cfg — refusing to embed it (it cannot be tied to this panel; mark legacy=True only for a deliberately imported old record)')
+            return None
+        if _rc != run_cfg:
+            print(f'[track] WARNING: {what} evidence ({path}) belongs to a DIFFERENT run_cfg ({_rc!r} != {run_cfg!r}) — not embedding it in this panel (a stale pre-flight must not certify a new config)')
+            return None
+        return doc
+
     if sanity is None:
         _san_path = os.path.join(outdir, 'overfit_sanity.json')
         if os.path.exists(_san_path):
@@ -9647,9 +9705,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                     sanity = json.load(_sf)
             except Exception as _se:
                 print(f'[track] WARNING: could not read {_san_path} for the run manifest ({type(_se).__name__}: {_se})')
-        if isinstance(sanity, dict) and sanity.get('run_cfg') not in (None, run_cfg):
-            print(f'[track] WARNING: {_san_path} belongs to a DIFFERENT run_cfg ({sanity.get("run_cfg")!r} != {run_cfg!r}) — not embedding it in this panel (a stale pre-flight must not certify a new config)')
-            sanity = None
+    sanity = _evidence_for_this_panel(sanity, os.path.join(outdir, 'overfit_sanity.json'), 'sanity')
     if reproducibility is None:
         _rep_path = os.path.join(outdir, 'reproducibility.json')
         if os.path.exists(_rep_path):
@@ -9658,49 +9714,54 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                     reproducibility = json.load(_rf)
             except Exception as _re:
                 print(f'[track] WARNING: could not read {_rep_path} for the run manifest ({type(_re).__name__}: {_re})')
-        if isinstance(reproducibility, dict) and reproducibility.get('run_cfg') not in (None, run_cfg):
-            print(f'[track] WARNING: {_rep_path} belongs to a DIFFERENT run_cfg ({reproducibility.get("run_cfg")!r} != {run_cfg!r}) — not embedding it in this panel (a stale pre-flight must not certify a new config)')
-            reproducibility = None
-    cells = {}
-    for seed in cfg.get('seeds') or []:
-        for v in cfg.get('variants') or []:
-            key = f'{v}::seed{seed}'
-            rec = summary.get(key)
-            if not isinstance(rec, dict) or not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
-                continue
-            _curves = _cell_curve_data(outdir, rec)
-            _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else (_curves.get('losses') if isinstance(_curves.get('losses'), list) else [])
-            _loss_nums = [float(x) for x in _losses if isinstance(x, (int, float)) and not isinstance(x, bool)]
-            _ph = rec.get('ppl_history') if isinstance(rec.get('ppl_history'), list) else (_curves.get('ppl_history') if isinstance(_curves.get('ppl_history'), list) else [])
-            if not _losses and rec.get('curve_n_points') is not None:
-                _loss_nums = []
-            cells[key] = {
-                'variant': v,
-                'seed': int(seed),
-                'run_id': rec.get('run_id'),
-                'started_at': rec.get('started_at'),
-                'finished_at': rec.get('finished_at'),
-                'ppl': rec.get('ppl'),
-                'steps': rec.get('steps'),
-                'tokens_seen': rec.get('tokens_seen'),
-                'params': rec.get('params'),
-                'train_time_s': rec.get('train_time_s'),
-                'final_loss_smoothed': rec.get('final_loss_smoothed'),
-                'rng_fp': rec.get('rng_fp'),
-                'data_fp': rec.get('data_fp'),
-                'val_fp': rec.get('val_fp'),
-                'data_version': rec.get('data_version') or prov.get('data', {}).get('data_version'),
-                'code_stamp': rec.get('_code'),
-                'hyperparams': rec.get('hyperparams'),
-                'curve_summary': {'n_points': (len(_losses) if _losses else int(rec.get('curve_n_points') or 0)),
-                                  'first': _loss_nums[0] if _loss_nums else rec.get('curve_first'),
-                                  'last': _loss_nums[-1] if _loss_nums else rec.get('curve_last'),
-                                  'best': min(_loss_nums) if _loss_nums else rec.get('curve_best'),
-                                  'ppl_history_points': (len(_ph) if _ph else int(rec.get('ppl_history_n_points') or 0))},
-                'curve_ref': rec.get('curve_ref') or f'summary.json#{key}.losses',
-                'ppl_history_ref': rec.get('ppl_history_ref') or f'summary.json#{key}.ppl_history',
-                'sanity_ref': rec.get('sanity_ref') or ('overfit_sanity.json' if sanity else None),
-            }
+    reproducibility = _evidence_for_this_panel(reproducibility, os.path.join(outdir, 'reproducibility.json'), 'reproducibility')
+    if cell_records is not None:
+        # Custom phases (warmup/NIAH/lenphase) have their own summary keys and
+        # metrics (PPL with warm-grid keys, NIAH accuracy, by-length PPL).
+        # They build already-normalised cell records and use the same
+        # crash-safe manifest/provenance/integrity machinery as run().
+        cells = {str(k): dict(v) for k, v in dict(cell_records).items() if isinstance(v, dict)}
+    else:
+        cells = {}
+        for seed in cfg.get('seeds') or []:
+            for v in cfg.get('variants') or []:
+                key = f'{v}::seed{seed}'
+                rec = summary.get(key)
+                if not isinstance(rec, dict) or not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
+                    continue
+                _curves = _cell_curve_data(outdir, rec)
+                _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else (_curves.get('losses') if isinstance(_curves.get('losses'), list) else [])
+                _loss_nums = [float(x) for x in _losses if isinstance(x, (int, float)) and not isinstance(x, bool)]
+                _ph = rec.get('ppl_history') if isinstance(rec.get('ppl_history'), list) else (_curves.get('ppl_history') if isinstance(_curves.get('ppl_history'), list) else [])
+                if not _losses and rec.get('curve_n_points') is not None:
+                    _loss_nums = []
+                cells[key] = {
+                    'variant': v,
+                    'seed': int(seed),
+                    'run_id': rec.get('run_id'),
+                    'started_at': rec.get('started_at'),
+                    'finished_at': rec.get('finished_at'),
+                    'ppl': rec.get('ppl'),
+                    'steps': rec.get('steps'),
+                    'tokens_seen': rec.get('tokens_seen'),
+                    'params': rec.get('params'),
+                    'train_time_s': rec.get('train_time_s'),
+                    'final_loss_smoothed': rec.get('final_loss_smoothed'),
+                    'rng_fp': rec.get('rng_fp'),
+                    'data_fp': rec.get('data_fp'),
+                    'val_fp': rec.get('val_fp'),
+                    'data_version': rec.get('data_version') or prov.get('data', {}).get('data_version'),
+                    'code_stamp': rec.get('_code'),
+                    'hyperparams': rec.get('hyperparams'),
+                    'curve_summary': {'n_points': (len(_losses) if _losses else int(rec.get('curve_n_points') or 0)),
+                                      'first': _loss_nums[0] if _loss_nums else rec.get('curve_first'),
+                                      'last': _loss_nums[-1] if _loss_nums else rec.get('curve_last'),
+                                      'best': min(_loss_nums) if _loss_nums else rec.get('curve_best'),
+                                      'ppl_history_points': (len(_ph) if _ph else int(rec.get('ppl_history_n_points') or 0))},
+                    'curve_ref': rec.get('curve_ref') or f'summary.json#{key}.losses',
+                    'ppl_history_ref': rec.get('ppl_history_ref') or f'summary.json#{key}.ppl_history',
+                    'sanity_ref': rec.get('sanity_ref') or ('overfit_sanity.json' if sanity else None),
+                }
     if planned_cells is None:
         planned_cells = [f'{v}::seed{seed}' for seed in cfg.get('seeds') or [] for v in cfg.get('variants') or []]
     planned_cells = [str(_k) for _k in dict.fromkeys(planned_cells)]
@@ -9777,6 +9838,44 @@ def _eval_adaptive_chunk(model, val_batch, device, chunk, _free_frac=0.5, _bytes
     return max(1, min(chunk, rows))
 
 
+def _det_segment_sum(n_rows, indices, values, dtype=None):
+    """Deterministic scatter-add by stable sort + segmented prefix sums.
+
+    CUDA's ``index_add_``/``index_put_(accumulate=True)`` use atomics, so the
+    addition order (and the last-bit result) can depend on thread scheduling.
+    Sorting by (index, original position) fixes the order; segment sums are
+    then formed with a cumsum and written through ``index_copy_`` (unique
+    destinations, no atomics).  Mirrors ``csa_kernels._det_scatter_add`` but
+    keeps the caller's dtype (the per-document NLL accumulator is float64)."""
+    idx = indices.reshape(-1).to(torch.int64)
+    vals = values.reshape(-1)
+    out_dtype = dtype if dtype is not None else vals.dtype
+    out = torch.zeros(int(n_rows), device=vals.device, dtype=out_dtype)
+    if idx.numel() == 0:
+        return out
+    valid = (idx >= 0) & (idx < int(n_rows))
+    if not bool(valid.all()):
+        idx = idx[valid]
+        vals = vals[valid]
+        if idx.numel() == 0:
+            return out
+    order = torch.argsort(idx, stable=True)
+    idx_s = idx.index_select(0, order)
+    val_s = vals.index_select(0, order).to(out_dtype)
+    end = torch.ones_like(idx_s, dtype=torch.bool)
+    if idx_s.numel() > 1:
+        end[:-1] = idx_s[1:] != idx_s[:-1]
+    seg_end = torch.nonzero(end, as_tuple=False).reshape(-1)
+    csum = torch.cumsum(val_s, dim=0)
+    hi = csum.index_select(0, seg_end)
+    lo = torch.zeros_like(hi)
+    if seg_end.numel() > 1:
+        lo[1:] = csum.index_select(0, seg_end[:-1])
+    seg_sum = hi - lo
+    seg_id = idx_s.index_select(0, seg_end)
+    out.index_copy_(0, seg_id, seg_sum)
+    return out
+
 @torch.inference_mode()
 def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, return_stats=False):
     # A chunk is a set of independent sequences (no cross-row op in the
@@ -9836,7 +9935,7 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
         _span = max(0, int(val_batch.shape[1]) - 1)
 
         def _run_rows(i, cur):
-            nonlocal ntok, V, nll
+            nonlocal ntok, V, nll, _row_nll, _row_ntok
             _lo = _hi = 0
             if _sel is not None:
                 # Host-side range count on the sorted selection: chunks with
@@ -9874,8 +9973,11 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                 _ce = F.cross_entropy(_rows, _tgts, reduction='none').double()
                 nll += _ce.sum()
                 if return_stats:
-                    _row_nll.index_add_(0, _src_rows, _ce)
-                    _row_ntok.index_add_(0, _src_rows, torch.ones_like(_src_rows))
+                    # Deterministic segmented sum (no CUDA atomics): the
+                    # per-document NLL feeding the document bootstrap must be
+                    # reproducible on the same machine.
+                    _row_nll += _det_segment_sum(_row_nll.numel(), _src_rows, _ce, dtype=torch.float64)
+                    _row_ntok += _det_segment_sum(_row_ntok.numel(), _src_rows, torch.ones_like(_src_rows), dtype=torch.long)
                 ntok += int(_tgts.numel())
                 del _rows, _tgts, _ce, _src_rows
             else:
@@ -11127,6 +11229,15 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         'lr': float(lr),
         'batch_shape': [int(batch_size), int(seq_len)],
         'vocab_size': int(vocab),
+        'architecture': {'d': int(d), 'n_layers': int(n_layers), 'n_heads': int(n_heads), 'd_head': int(d_head)},
+        'mlp_ratio': float(mlp_ratio),
+        'ignore_index': _ign,
+        'label_contract': {
+            'source': _data_source,
+            'ignore_index': _ign,
+            'n_scored_targets': int((y != _ign).sum()) if _ign is not None else int(y.numel()),
+            'n_targets': int(y.numel()),
+        },
         'data_source': _data_source,
         'data_fp': _data_fp,
         'rng_fp': _rng_fp,
@@ -11218,17 +11329,21 @@ def _probe_arch(arch=None):
                 _arch[_k] = int(arch[_k])
     return _arch
 
-def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_loss, target_acc, arch=None):
+def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_loss, target_acc, arch=None, mlp_ratio=None, ignore_index=None, source='synthetic', data_fp=None):
     """Exact probe configuration that a cached PASS is allowed to certify.
 
     A pass only proves that THIS tiny run can overfit (same step count, batch
-    size, sequence length, targets, architecture and code semantics).  Without
-    these fields in the cache key a lax probe (e.g. one step, target_loss=100)
-    would silently satisfy a later strict probe, turning the safety gate into a
-    formality.  The code stamp is included because changing the trainer/loss
-    must invalidate an old pass even when the numeric knobs look identical.
+    size, sequence length, targets, architecture, MLP width, ignore-index
+    convention, data batch and code semantics).  Without these fields in the
+    cache key a lax probe (e.g. one step, target_loss=100) would silently
+    satisfy a later strict probe, turning the safety gate into a formality.
+    The code stamp is included because changing the trainer/loss must
+    invalidate an old pass even when the numeric knobs look identical.  The
+    data source/fingerprint is kept separate (`_overfit_probe_semantics`) so a
+    synthetic pass can still be subsumed by a real-data pass of the same
+    model/probe geometry.
     """
-    return {
+    cfg = {
         'schema': 2,
         'seed': int(seed),
         'steps': int(steps),
@@ -11238,73 +11353,168 @@ def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_los
         'target_loss': float(target_loss),
         'target_accuracy': float(target_acc),
         'architecture': _probe_arch(arch),
+        'mlp_ratio': (None if mlp_ratio is None else float(mlp_ratio)),
+        'ignore_index': (None if ignore_index is None else int(ignore_index)),
+        'source': str(source),
+        'data_fp': (None if data_fp is None else str(data_fp)),
         'code': code_stamp(),
     }
+    return cfg
 
 def _overfit_probe_digest(cfg):
     blob = json.dumps(cfg, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+def _overfit_probe_semantics(cfg):
+    """Digest of everything except WHERE the batch came from.
+
+    A passed real-data probe of the same architecture/MLP/step/target
+    configuration subsumes the synthetic probe; a different corpus does not
+    invalidate the model-plumbing certificate, but the data certificate itself
+    is still keyed by the full config (source + fingerprint)."""
+    sem = {k: v for k, v in (cfg or {}).items() if k not in ('source', 'data_fp')}
+    blob = json.dumps(sem, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+def probe_seq_len(seq_len, *, min_blocks=128, cap=256):
+    """Sequence length for the pre-flight probe.
+
+    A 64-token probe never exercises the real block geometry (max_block=128,
+    HCA block_size=64).  Use the panel's own length up to ``cap`` so at least
+    one multi-block schedule is covered without paying the full scale cost;
+    short panels keep their own (already short) length.  ``cap`` can be
+    overridden with ``CSA_PROBE_SEQ``.
+    """
+    raw = os.environ.get('CSA_PROBE_SEQ', '').strip()
+    if raw:
+        try:
+            return max(2, int(raw))
+        except ValueError:
+            print(f'[overfit] CSA_PROBE_SEQ={raw!r} is not an integer — using the automatic probe length')
+    s = max(2, int(seq_len))
+    return min(s, int(cap)) if s >= int(min_blocks) else s
 
 def overfit_reports(*, source=None):
     """Copy of the small-batch reports gathered in this process, optionally
     filtered to source 'synthetic' or 'data'.  Pure read for tracking."""
     return {k: dict(v) for k, v in _OVERFIT_REPORTS.items() if source is None or k[1] == source}
 
-def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, vocab=1024, train_ids=None, force=False, target_loss=0.05, target_acc=0.99, arch=None):
+def overfit_reports_for(variants, *, source=None, probe_semantics=None, probe_key=None, data_fp=None):
+    """Exact-match evidence recovery for a panel.
+
+    `run()` must persist only the probes that certify the CURRENT config: a
+    report from an older/looser probe previously written into the process cache
+    must not be attached to a new panel.  Matching is by probe semantics
+    (architecture/MLP/steps/targets/ignore-index), optional source and data
+    fingerprint, and optionally the full probe digest."""
+    _want = set(variants)
+    out = []
+    for (_v, _src, *rest), _r in _OVERFIT_REPORTS.items():
+        if _v not in _want:
+            continue
+        if source is not None and _src != source:
+            continue
+        if probe_semantics is not None and _r.get('guard_probe_semantics') != probe_semantics:
+            continue
+        if probe_key is not None and _r.get('guard_probe_key') != probe_key:
+            continue
+        if data_fp is not None and (_v, _src, *rest) and len(rest) >= 2 and rest[1] != data_fp:
+            continue
+        out.append(dict(_r))
+    return out
+
+def _overfit_ratio_for(mlp_ratio, variant):
+    if isinstance(mlp_ratio, dict):
+        return mlp_ratio.get(variant)
+    return mlp_ratio
+
+def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, vocab=1024, train_ids=None, batch=None, ignore_index=None, mlp_ratio=None, force=False, target_loss=0.05, target_acc=0.99, arch=None):
     """Run `overfit_sanity_check` once per variant per process and hard-stop
     on failure.  Called automatically by `run()` before the first panel and by
     the length/checkpoint phases, so every training driver inherits the check.
 
     The in-process cache is keyed by the FULL probe configuration (seed, step
-    count, shape, targets, architecture, code) as well as the corpus bytes, so
-    a lenient probe can never certify a stricter one.  `arch` optionally
-    overrides the probe architecture (d/n_layers/n_heads/d_head): pass the
-    panel's own geometry on the scale ladder so the probe exercises the same
-    head/layer shapes the real run will use; unset it for the tiny default
-    probe, whose cache keys are unchanged.  `CSA_SKIP_OVERFIT=1` is
+    count, shape, targets, architecture, MLP width, ignore-index convention,
+    data source/fingerprint, code) as well as the corpus bytes, so a lenient
+    probe can never certify a stricter one.  `arch` optionally overrides the
+    probe architecture (d/n_layers/n_heads/d_head): pass the panel's own
+    geometry on the scale ladder so the probe exercises the same head/layer
+    shapes the real run will use; unset it for the tiny default probe.
+    `mlp_ratio` accepts a scalar or a per-variant mapping.  `batch` accepts a
+    task-specific ``(inputs, targets)`` pair (NIAH/masked next-token targets)
+    and `ignore_index` carries that loop's label convention; passing either
+    `batch` or `train_ids` runs the data-path probe.  `CSA_SKIP_OVERFIT=1` is
     the explicit escape hatch (e.g. a diagnostic box with a deliberately broken
     batch); it prints a loud skip line instead.  Passing is necessary, not
     sufficient."""
     if os.environ.get('CSA_SKIP_OVERFIT', '').strip().lower() in ('1', 'true', 'yes', 'on'):
         print('[overfit] guard SKIPPED (CSA_SKIP_OVERFIT is set) — this run has no small-batch safety check')
         return []
-    src = 'data' if train_ids is not None else 'synthetic'
+    if batch is not None and train_ids is not None:
+        raise ValueError('overfit_guard: pass either train_ids or batch, not both')
+    variants = list(variants)
     _arch = _probe_arch(arch)
-    _probe_cfg = _overfit_probe_config(seed=seed, steps=steps, seq_len=seq_len, batch_size=batch_size, vocab=vocab, target_loss=target_loss, target_acc=target_acc, arch=_arch)
-    _cfg_key = _overfit_probe_digest(_probe_cfg)
+    _ign = None
+    _data_fp = None
+    if batch is not None:
+        src = 'batch'
+        _x, _y = _batch_arrays(batch, vocab=vocab)
+        seq_len, batch_size = int(_x.shape[1]), int(_x.shape[0])
+        _data_fp = _ids_fp(_x.reshape(-1)) + ':' + _ids_fp(_y.reshape(-1))
+        _ign = -100 if ignore_index is None else int(ignore_index)
+    elif train_ids is not None:
+        src = 'data'
+        _arr = np.asarray(train_ids)
+        _data_fp = _ids_fp(_arr if _arr.ndim == 1 else np.ascontiguousarray(_arr).reshape(-1))
+        _ign = None if ignore_index is None else int(ignore_index)
+    else:
+        src = 'synthetic'
+        _ign = None if ignore_index is None else int(ignore_index)
     if _arch != _OVERFIT_ARCH:
         print(f"[overfit] probe architecture override: d={_arch['d']} n_layers={_arch['n_layers']} n_heads={_arch['n_heads']} d_head={_arch['d_head']} (default tiny probe is d={_OVERFIT_ARCH['d']}/{_OVERFIT_ARCH['n_layers']}L/{_OVERFIT_ARCH['n_heads']}H)" )
-    # The data cache key keeps the vocab + token fingerprint in the first two
-    # trailing slots (run() recovers them to rebuild the panel evidence) and
-    # appends the probe-config digest.  A pass on corpus A can never certify
-    # corpus B, and a pass with a different probe step count can never certify a
-    # stricter call.
-    _data_key = None
-    if src == 'data':
-        _arr = np.asarray(train_ids)
-        _data_key = (int(vocab), _ids_fp(_arr if _arr.ndim == 1 else np.ascontiguousarray(_arr).reshape(-1)), _cfg_key)
+    _probe_cfgs = {}
+    _cfg_keys = {}
+    _semantics = {}
+    for v in variants:
+        _pc = _overfit_probe_config(seed=seed, steps=steps, seq_len=seq_len, batch_size=batch_size, vocab=vocab, target_loss=target_loss, target_acc=target_acc, arch=_arch, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), ignore_index=_ign, source=src, data_fp=_data_fp)
+        _probe_cfgs[v] = _pc
+        _cfg_keys[v] = _overfit_probe_digest(_pc)
+        _semantics[v] = _overfit_probe_semantics(_pc)
+
+    def _key(v):
+        if src in ('data', 'batch'):
+            return (v, src, int(vocab), _data_fp, _cfg_keys[v])
+        return (v, 'synthetic', _cfg_keys[v])
 
     def _known(v):
         # Only a PASSED check may certify a variant.  A cached failure must be
         # retried (or re-raised) on the next call: treating any present key as
         # "already checked" would let a caller that caught the first failure
         # bypass the hard stop on a later phase in the same process.
-        if src == 'data':
-            return _OVERFIT_GUARD.get((v, 'data', *_data_key)) is True
-        return _OVERFIT_GUARD.get((v, 'synthetic', _cfg_key)) is True or any(
-            _k[0] == v and _k[1] == 'data' and _k[-1] == _cfg_key and _OVERFIT_GUARD.get(_k) is True
-            for _k in list(_OVERFIT_GUARD))
+        if _OVERFIT_GUARD.get(_key(v)) is True:
+            return True
+        if src == 'synthetic':
+            # A passed data/batch probe of the same model/probe geometry
+            # subsumes the synthetic plumbing check.
+            for _k in list(_OVERFIT_GUARD):
+                if (_k[0] == v and _k[1] in ('data', 'batch')
+                        and _OVERFIT_GUARD.get(_k) is True
+                        and (_OVERFIT_REPORTS.get(_k) or {}).get('guard_probe_semantics') == _semantics[v]):
+                    return True
+        return False
+
     todo = [v for v in variants if force or not _known(v)]
     if not todo:
         return []
     reports = []
     for v in todo:
-        r = overfit_sanity_check(v, seed=seed, steps=steps, d=_arch['d'], n_layers=_arch['n_layers'], n_heads=_arch['n_heads'], d_head=_arch['d_head'], seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=train_ids, target_loss=target_loss, target_acc=target_acc)
-        r['guard_probe_config'] = _probe_cfg
-        r['guard_probe_key'] = _cfg_key
-        _key = (v, 'data', *_data_key) if src == 'data' else (v, 'synthetic', _cfg_key)
-        _OVERFIT_GUARD[_key] = bool(r['passed'])
-        _OVERFIT_REPORTS[_key] = r
+        r = overfit_sanity_check(v, seed=seed, steps=steps, d=_arch['d'], n_layers=_arch['n_layers'], n_heads=_arch['n_heads'], d_head=_arch['d_head'], seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=(train_ids if src == 'data' else None), batch=(batch if src == 'batch' else None), ignore_index=_ign, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), target_loss=target_loss, target_acc=target_acc)
+        r['guard_probe_config'] = _probe_cfgs[v]
+        r['guard_probe_key'] = _cfg_keys[v]
+        r['guard_probe_semantics'] = _semantics[v]
+        _key_v = _key(v)
+        _OVERFIT_GUARD[_key_v] = bool(r['passed'])
+        _OVERFIT_REPORTS[_key_v] = r
         reports.append(r)
         print(f"[overfit] {v:<24} loss {r['initial_loss']:.3f} -> {r['final_loss']:.4f}  acc {r['final_accuracy'] * 100:.1f}%  grad_finite={r['grad_all_finite']}  params_changed={r['params_changed']}  {'PASS' if r['passed'] else 'FAIL'}")
         if not r['passed']:
@@ -11314,22 +11524,52 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
 _REPRO_GUARD = {}
 _REPRO_REPORTS = {}
 
-def _repro_tiny_losses(variant, seed, *, steps=3, d=32, n_layers=1, n_heads=4, d_head=8, seq_len=16, batch_size=2, vocab=64, lr=0.003, device=None):
+_REPRO_ARCH = {'d': 32, 'n_layers': 1, 'n_heads': 4, 'd_head': 8}
+
+def _repro_probe_arch(arch=None):
+    got = dict(_REPRO_ARCH)
+    if arch:
+        for _k in got:
+            if arch.get(_k) is not None:
+                got[_k] = int(arch[_k])
+    return got
+
+def _repro_batch(seed, *, batch_size, seq_len, vocab, train_ids=None):
+    """Fixed probe batch + its identity.
+
+    With ``train_ids`` the batch is a deterministic slice of the REAL token
+    stream (the same corpus the panel trains on); otherwise it is synthetic.
+    The generator is separate from the model's PyTorch RNG stream."""
+    _rng = np.random.default_rng(int(seed) + 7919)
+    if train_ids is not None:
+        arr = np.asarray(train_ids).reshape(-1)
+        need = int(seq_len) + 1
+        if arr.size < need:
+            raise ValueError(f'reproducibility probe: need at least seq_len+1={need} tokens, got {arr.size}')
+        starts = _rng.integers(0, int(arr.size) - int(seq_len), size=int(batch_size))
+        chunk = np.stack([arr[int(s):int(s) + int(seq_len) + 1] for s in starts]).astype(np.int64, copy=False)
+        return chunk[:, :-1], chunk[:, 1:], _ids_fp(chunk.reshape(-1)), 'train_ids'
+    chunk = _rng.integers(0, max(int(vocab), 1), size=(int(batch_size), int(seq_len) + 1), dtype=np.int64)
+    return chunk[:, :-1], chunk[:, 1:], _ids_fp(chunk.reshape(-1)), 'synthetic'
+
+def _repro_tiny_losses(variant, seed, *, steps=3, d=32, n_layers=1, n_heads=4, d_head=8, seq_len=16, batch_size=2, vocab=64, lr=0.003, train_ids=None, mlp_ratio=None, device=None):
     """Run one very short, fully seeded training stream and return its losses.
 
-    Uses a synthetic fixed batch (sampled from its own NumPy generator, so the
-    data stream cannot consume the model's PyTorch RNG) and disables weight
-    decay.  Two calls with the same ``seed`` must agree bit-for-bit on the same
-    stack; that is the property the pre-flight reproducibility guard checks.
-    """
+    Uses a fixed batch (sampled from its own NumPy generator, so the data
+    stream cannot consume the model's PyTorch RNG) and disables weight decay.
+    Two calls with the same ``seed`` must agree bit-for-bit on the same stack;
+    that is the property the pre-flight reproducibility guard checks.  The
+    architecture/MLP/data are caller-selectable so a scale panel can repeat
+    its REAL geometry instead of a tiny proxy."""
     device = DEVICE if device is None else device
     set_seed(seed)
-    _rng = np.random.default_rng(int(seed) + 7919)
-    ids_np = _rng.integers(0, int(vocab), size=(int(batch_size), int(seq_len) + 1), dtype=np.int64)
-    ids = torch.from_numpy(ids_np).to(device)
-    x, y = ids[:, :-1], ids[:, 1:]
+    x_np, y_np, _data_fp, _src = _repro_batch(seed, batch_size=batch_size, seq_len=seq_len, vocab=vocab, train_ids=train_ids)
+    x = torch.from_numpy(np.ascontiguousarray(x_np)).to(device)
+    y = torch.from_numpy(np.ascontiguousarray(y_np)).to(device)
+    if mlp_ratio is None:
+        mlp_ratio = variant_mlp_ratio(variant, int(vocab), d=int(d), n_layers=int(n_layers), n_heads=int(n_heads), d_head=int(d_head), seq_len=int(seq_len), matched=PARAM_MATCHED | PARAM_MATCHED_V7)
     cfgs = make_layer_cfgs(int(n_layers), variant)
-    model = SmallGPT(int(vocab), int(d), int(n_layers), int(n_heads), int(d_head), int(seq_len), cfgs, mlp_ratio=4).to(device)
+    model = SmallGPT(int(vocab), int(d), int(n_layers), int(n_heads), int(d_head), int(seq_len), cfgs, mlp_ratio=mlp_ratio).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=float(lr), betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, weight_decay=0.0, foreach=True)
     model.train()
     losses = []
@@ -11341,30 +11581,60 @@ def _repro_tiny_losses(variant, seed, *, steps=3, d=32, n_layers=1, n_heads=4, d
             opt.step()
             losses.append(float(ce.detach()))
     finally:
-        del model, opt, ids, x, y, ids_np
+        del model, opt, x, y, x_np, y_np
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
     return losses
 
-def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=None):
-    """Two identical tiny runs + one different-seed run, compared.
+def _repro_probe_config(*, seed, steps, tol, arch, seq_len, batch_size, vocab, mlp_ratio, data_fp, train_ids):
+    return {
+        'schema': 2,
+        'seed': int(seed),
+        'steps': int(steps),
+        'tol': float(tol),
+        'architecture': _repro_probe_arch(arch),
+        'seq_len': int(seq_len),
+        'batch_size': int(batch_size),
+        'vocab': int(vocab),
+        'mlp_ratio': (None if mlp_ratio is None else float(mlp_ratio)),
+        'data_source': ('train_ids' if train_ids is not None else 'synthetic'),
+        'data_fp': (None if data_fp is None else str(data_fp)),
+        'device': str(DEVICE),
+        'determinism': determinism_label(),
+        'code': code_stamp(),
+    }
+
+def _repro_probe_digest(cfg):
+    blob = json.dumps(cfg, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=None, arch=None, train_ids=None, vocab=None, mlp_ratio=None, seq_len=None, batch_size=2, lr=0.003):
+    """Two identical short runs + one different-seed run, compared.
 
     This is the automated version of "same seed, same result on this box":
     the same seed must reproduce the complete short loss curve (exactly on
     CPU; within ``tol`` on a GPU whose kernels are not bitwise deterministic),
-    while a different seed must actually change it.  The report is persisted
-    with the panel, so a reproducibility problem is visible instead of being
-    an assumption.  The check is advisory by default
-    (``CSA_REQUIRE_REPRO=1`` makes a failure fatal, ``CSA_SKIP_REPRO=1``
-    skips it); it never changes the RNG state of the following training cell.
-    """
+    while a different seed must actually change it.  `arch`/`train_ids` let a
+    scale panel repeat its REAL architecture on a small fixed slice of the REAL
+    corpus rather than a tiny synthetic proxy.  The report is persisted with
+    the panel, so a reproducibility problem is visible instead of being an
+    assumption.  The check never changes the RNG state of the following
+    training cell."""
     device = DEVICE if device is None else device
+    _arch = _repro_probe_arch(arch)
+    if vocab is None:
+        vocab = (int(np.max(train_ids)) + 1) if train_ids is not None else 64
+    if seq_len is None:
+        seq_len = 16
+    # Resolve the data identity once, using the SAME generator the losses use.
+    _x, _y, _data_fp, _src = _repro_batch(seed, batch_size=batch_size, seq_len=seq_len, vocab=vocab, train_ids=train_ids)
     _fp_before = rng_fingerprint()
+    _kw = dict(steps=steps, d=_arch['d'], n_layers=_arch['n_layers'], n_heads=_arch['n_heads'], d_head=_arch['d_head'], seq_len=seq_len, batch_size=batch_size, vocab=int(vocab), lr=lr, train_ids=train_ids, mlp_ratio=mlp_ratio, device=device)
     with _preserve_rng_state():
-        a = _repro_tiny_losses(variant, seed, steps=steps, device=device)
-        b = _repro_tiny_losses(variant, seed, steps=steps, device=device)
-        c = _repro_tiny_losses(variant, int(seed) + 1, steps=steps, device=device)
+        a = _repro_tiny_losses(variant, seed, **_kw)
+        b = _repro_tiny_losses(variant, seed, **_kw)
+        c = _repro_tiny_losses(variant, int(seed) + 1, **_kw)
     _fp_after = rng_fingerprint()
     _n = min(len(a), len(b))
     max_diff = max((abs(a[i] - b[i]) for i in range(_n)), default=float('inf'))
@@ -11380,6 +11650,12 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
         'tol': float(tol),
         'device': str(device),
         'determinism': determinism_label(),
+        'architecture': _arch,
+        'mlp_ratio': (None if mlp_ratio is None else float(mlp_ratio)),
+        'seq_len': int(seq_len),
+        'batch_size': int(batch_size),
+        'data_source': _src,
+        'data_fp': _data_fp,
         'same_seed_losses_a': a,
         'same_seed_losses_b': b,
         'different_seed_losses': c,
@@ -11404,47 +11680,89 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
         r['diagnosis'] = 'ok'
     return r
 
-def _repro_guard_base(*, seed=0, steps=3, tol=1e-06):
-    """Cache key shared by the guard and run()'s evidence recovery.
+def _repro_guard_base(*, seed=0, steps=3, tol=1e-06, arch=None, vocab=None, mlp_ratio=None, seq_len=None, batch_size=2, train_ids=None, data_fp=None):
+    """Exact cache key shared by the guard and run()'s evidence recovery.
 
     Strictly a description of the probe that produced a PASS: changing the
-    tolerance, step count, device, determinism level or code invalidates the
-    cached certificate.  A pass under a loose tolerance must never be reused
-    for a stricter request."""
-    return (int(seed), int(steps), float(tol), str(DEVICE), determinism_label(), code_stamp())
+    tolerance, step count, architecture, MLP width, sequence length, vocab,
+    device, determinism level, data stream or code invalidates the cached
+    certificate.  A pass under a loose tolerance must never be reused for a
+    stricter request."""
+    _fp = data_fp
+    if _fp is None and train_ids is not None:
+        _arr = np.asarray(train_ids)
+        _fp = _ids_fp(_arr if _arr.ndim == 1 else np.ascontiguousarray(_arr).reshape(-1))
+    return _repro_probe_digest(_repro_probe_config(seed=seed, steps=steps, tol=tol, arch=arch, seq_len=(16 if seq_len is None else seq_len), batch_size=batch_size, vocab=(64 if vocab is None else vocab), mlp_ratio=mlp_ratio, data_fp=_fp, train_ids=train_ids))
 
-def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False):
-    """Run ``reproducibility_check`` once per (variant, probe config) per process.
+def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False, arch=None, train_ids=None, vocab=None, mlp_ratio=None, seq_len=None, batch_size=2, seeds=None, strict=None):
+    """Run ``reproducibility_check`` once per (variant, seed, probe config) per process.
 
     Mirrors ``overfit_guard``: results are cached as evidence, a skip env var
     is explicit and loud, and a failure is a warning unless the caller sets
-    ``CSA_REQUIRE_REPRO=1`` (strict reproducibility is not free on every GPU
-    kernel, so it is opt-in).  The cache key includes the tolerance and code
-    stamp as well as the seed/device, so a loose probe cannot certify a
-    stricter one.  Returns the reports that ran in this call."""
+    ``CSA_REQUIRE_REPRO=1`` (or passes ``strict=True``).  The cache key
+    includes the full probe configuration -- tolerance, code stamp, seed,
+    device, architecture, MLP width, sequence length, vocabulary and data
+    fingerprint -- so a loose/synthetic probe cannot certify a real one.
+    ``seeds`` lets a panel check its first and last seed; ``arch`` and
+    ``train_ids`` make it exercise the real architecture on a small slice of
+    the real corpus.  Returns the reports that ran in this call."""
     if os.environ.get('CSA_SKIP_REPRO', '').strip().lower() in ('1', 'true', 'yes', 'on'):
         print('[repro] guard SKIPPED (CSA_SKIP_REPRO is set) — this run has no same-machine seed check')
         return []
-    _want_strict = os.environ.get('CSA_REQUIRE_REPRO', '').strip().lower() in ('1', 'true', 'yes', 'on')
-    _base = _repro_guard_base(seed=seed, steps=steps, tol=tol)
+    _want_strict = (os.environ.get('CSA_REQUIRE_REPRO', '').strip().lower() in ('1', 'true', 'yes', 'on')) if strict is None else bool(strict)
+    _arch = _repro_probe_arch(arch)
+    if vocab is None:
+        vocab = (int(np.max(train_ids)) + 1) if train_ids is not None else 64
+    if seq_len is None:
+        seq_len = 16
+    _seed_list = [int(s) for s in (seeds if seeds is not None else [seed])]
+    _seed_list = list(dict.fromkeys(_seed_list))
+    _full_data_fp = None
+    if train_ids is not None:
+        _arr = np.asarray(train_ids)
+        _full_data_fp = _ids_fp(_arr if _arr.ndim == 1 else np.ascontiguousarray(_arr).reshape(-1))
+    _base_cache = {}
+
+    def _base_for(v, sd):
+        key = (v, sd)
+        if key not in _base_cache:
+            _base_cache[key] = _repro_guard_base(seed=sd, steps=steps, tol=tol, arch=_arch, vocab=vocab, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), seq_len=seq_len, batch_size=batch_size, train_ids=train_ids, data_fp=_full_data_fp)
+        return _base_cache[key]
+
     # As in overfit_guard, a cached FAILURE is not a certificate: retry it so a
     # later phase cannot silently inherit the failed status as "already done".
-    todo = [v for v in variants if force or _REPRO_GUARD.get((v, *_base)) is not True]
+    todo = [(v, sd) for v in variants for sd in _seed_list if force or _REPRO_GUARD.get((v, _base_for(v, sd))) is not True]
     reports = []
-    for v in todo:
-        r = reproducibility_check(v, seed=seed, steps=steps, tol=tol)
-        r['guard_probe_key'] = '|'.join((str(x) for x in _base))
-        key = (v, *_base)
+    for v, sd in todo:
+        r = reproducibility_check(v, seed=sd, steps=steps, tol=tol, arch=_arch, train_ids=train_ids, vocab=vocab, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), seq_len=seq_len, batch_size=batch_size)
+        _base = _base_for(v, sd)
+        r['guard_probe_key'] = _base
+        r['guard_probe_config'] = _repro_probe_config(seed=sd, steps=steps, tol=tol, arch=_arch, seq_len=seq_len, batch_size=batch_size, vocab=vocab, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), data_fp=r.get('data_fp'), train_ids=train_ids)
+        key = (v, _base)
         _REPRO_GUARD[key] = bool(r['passed'])
         _REPRO_REPORTS[key] = r
         reports.append(r)
-        print(f"[repro] {v:<24} same-seed max|Δ|={r['max_abs_diff_same_seed']:.3e}  different-seed Δ={r['different_seed_max_abs_diff']:.3e}  bitwise={r['bitwise_identical']}  {'PASS' if r['passed'] else 'FAIL'}")
+        print(f"[repro] {v:<24} seed={sd} same-seed max|Δ|={r['max_abs_diff_same_seed']:.3e}  different-seed Δ={r['different_seed_max_abs_diff']:.3e}  bitwise={r['bitwise_identical']}  {'PASS' if r['passed'] else 'FAIL'}")
         if not r['passed']:
-            _msg = f"same-machine reproducibility check FAILED for `{v}` ({r['diagnosis']})"
+            _msg = f"same-machine reproducibility check FAILED for `{v}` seed={sd} ({r['diagnosis']})"
             if _want_strict:
-                raise RuntimeError(_msg + ' — CSA_REQUIRE_REPRO=1 makes this fatal. Correct the seed/kernel nondeterminism or unset the flag to accept it.')
+                raise RuntimeError(_msg + ' — strict reproducibility is required for this run. Correct the seed/kernel nondeterminism or explicitly opt out (CSA_REQUIRE_REPRO=0).')
             print(f'[repro] WARNING: {_msg}; the panel will record the failure (set CSA_REQUIRE_REPRO=1 to make it fatal, CSA_SKIP_REPRO=1 to skip)')
     return reports
+
+def reproducibility_reports_for(variants, *, probe_key=None, data_fp=None):
+    """Exact-match recovery of reproducibility evidence for the current panel."""
+    _want = set(variants)
+    out = []
+    for _k, _r in _REPRO_REPORTS.items():
+        if _k[0] not in _want:
+            continue
+        if probe_key is not None and _k[1] != probe_key:
+            continue
+        if data_fp is not None and _r.get('data_fp') != data_fp:
+            continue
+        out.append(dict(_r))
+    return out
 
 def reproducibility_reports():
     """Copy of the reproducibility reports gathered in this process."""
@@ -12714,6 +13032,42 @@ def run_cell_job(job):
     return _run_cell(cfg, job['v'], job['seed'], guard=guard, ratios={}, fp=fp, train_ids=train_ids, val_batch=val_batch, vocab=vocab, val_bnd=val_bnd, prebook=True, prov=job.get('prov'))
 
 
+def preflight_fingerprint(cfg, *, stage, vocab=None, data_fp=None, probe_cfg=None):
+    """Stable fingerprint for a standalone pre-flight artifact.
+
+    Used when the check writes evidence before/independently of a panel
+    ``run_cfg`` (m0/run_gapfill pre-flight dirs, and a synthetic probe that
+    fails before the corpus is loaded).  It is deliberately not a resume key:
+    it exists so the evidence can state which config/code/data/probe produced
+    it."""
+    blob = json.dumps({
+        'config': _jsonable(cfg),
+        'stage': str(stage),
+        'vocab': None if vocab is None else int(vocab),
+        'data_fp': data_fp,
+        'probe_cfg': _jsonable(probe_cfg) if probe_cfg is not None else None,
+        'train_knobs': training_knobs_fingerprint(),
+        'code': code_stamp(),
+    }, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    return 'preflight-' + hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+def _is_confirmatory_cfg(cfg):
+    """A confirmation / scale panel defaults to strict determinism + a
+    mandatory real-architecture reproducibility check.
+
+    An explicit ``require_repro``/``confirm`` flag always wins; otherwise the
+    B-tier scale geometry (d>=512, multiple seeds) is treated as confirmatory.
+    Small exploratory/test panels keep the cheaper advisory path."""
+    for _k in ('confirm', 'confirmation', 'require_repro'):
+        if cfg.get(_k) is not None:
+            return bool(cfg.get(_k))
+    try:
+        _d = int(cfg.get('d', 256))
+        _nseeds = len(cfg.get('seeds') or [])
+    except (TypeError, ValueError):
+        return False
+    return bool(_d >= 512 and _nseeds >= 2)
+
 def run(cfg=None, seeds=None, guard=None, label='', par=None):
     cfg = dict(RUN) if cfg is None else dict(cfg)
     if seeds is not None:
@@ -12724,13 +13078,57 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     d_head = cfg.get('d_head', 32)
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
+    _seeds = [int(s) for s in (cfg.get('seeds') or [0])]
+    _first_seed, _last_seed = _seeds[0], _seeds[-1]
+    _variants = list(cfg.get('variants') or [])
+    _arch = {'d': int(d), 'n_layers': int(n_layers), 'n_heads': int(n_heads), 'd_head': int(d_head)}
+    # A confirmation / scale panel runs with deterministic kernels by default
+    # (an explicit CSA_DETERMINISTIC=0 still opts out) and treats the
+    # same-machine reproducibility check as mandatory below.
+    _confirm = _is_confirmatory_cfg(cfg)
+    if _confirm:
+        os.environ.setdefault('CSA_DETERMINISTIC', '1')
     # Seed the panel-level data-construction path (tokenizer fitting, cache
     # rebuilds, any future DataLoader setup) before the corpus is served.
     # Per-cell training re-seeds itself inside train_variant, so this cannot
     # change a recorded cell; it only closes an unseeded first-build path.
-    set_seed(int((cfg.get('seeds') or [0])[0]))
-    # Synthetic pre-flight before the corpus load.
-    _sanity = list(overfit_guard(cfg.get('variants') or []))
+    set_seed(_first_seed)
+    # The probe uses the panel's REAL architecture/MLP and a length that
+    # exercises the block geometry (not the old fixed seq=64 tiny proxy).
+    _probe_seq = probe_seq_len(cfg.get('seq_len', 64))
+    _probe_steps = 200
+    _probe_batch = 2
+
+    def _panel_ratios(vocab_):
+        _r = {}
+        for _v in _variants:
+            try:
+                _r[_v] = variant_mlp_ratio(_v, int(vocab_), d=int(d), n_layers=int(n_layers), n_heads=int(n_heads), d_head=int(d_head), seq_len=int(cfg.get('seq_len', 512)), matched=cfg.get('matched'), ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
+            except Exception:
+                _r[_v] = None
+        return _r
+
+    # Synthetic pre-flight before the corpus load.  The actual-data probe below
+    # is the authoritative one; this one still exercises the real model
+    # geometry so a shape/gradient fault is caught even if the corpus is slow.
+    _pre_vocab = int(cfg.get('vocab_size') or 1024)
+    _pre_ratios = _panel_ratios(_pre_vocab)
+    try:
+        _sanity = list(overfit_guard(_variants, seed=_first_seed, steps=_probe_steps, seq_len=_probe_seq, batch_size=_probe_batch, vocab=_pre_vocab, arch=_arch, mlp_ratio=_pre_ratios))
+    except RuntimeError as _fe:
+        _prov0 = experiment_provenance(cfg)
+        _reports0 = [dict(r) for _k, r in _OVERFIT_REPORTS.items() if _k[0] in set(_variants)]
+        _cfg0 = _overfit_probe_config(seed=_first_seed, steps=_probe_steps, seq_len=_probe_seq, batch_size=_probe_batch, vocab=_pre_vocab, target_loss=0.05, target_acc=0.99, arch=_arch, source='synthetic')
+        _doc0 = {
+            'kind': 'small_batch_overfit_sanity_panel', 'stage': 'synthetic_preflight',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'run_cfg': preflight_fingerprint(cfg, stage='synthetic_overfit', vocab=_pre_vocab, probe_cfg=_cfg0),
+            'label': label or outdir, 'passed': False, 'error': f'{_fe}',
+            'provenance': _prov0, 'reports': _reports0,
+        }
+        atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), _doc0)
+        log_experiment_event(outdir, {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'synthetic_overfit', 'run_cfg': _doc0['run_cfg'], 'code': code_stamp(), 'provenance': _prov0, 'error': f'{_fe}', 'sanity': {'passed': False, 'n_reports': len(_reports0)}})
+        raise
     _attb_bump_epoch()
     t_data = time.time()
     train_ids, val_batch, vocab, _, val_bnd = load_run_corpus(cfg)
@@ -12779,24 +13177,53 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         _pin_cuda_determinism()
     fp = _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch)
     prov = experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
+    ratios = _panel_ratios(vocab)
+    _data_fp = _ids_fp(train_ids)
+
+    def _data_probe_cfg(v):
+        return _overfit_probe_config(seed=_first_seed, steps=_probe_steps, seq_len=_probe_seq, batch_size=_probe_batch, vocab=vocab, target_loss=0.05, target_acc=0.99, arch=_arch, mlp_ratio=ratios.get(v), ignore_index=None, source='data', data_fp=_data_fp)
+
     # The real data-path check: the synthetic pass above cannot catch a broken
     # real token stream / vocabulary mapping.  It is a superset of the model
     # plumbing check, so a pass here is the stronger evidence; both reports
     # are persisted with the panel.
+    _data_rep = []
     try:
-        _sanity += list(overfit_guard(cfg.get('variants') or [], train_ids=train_ids, vocab=vocab))
-    except RuntimeError:
+        _data_rep = list(overfit_guard(_variants, seed=_first_seed, steps=_probe_steps, seq_len=_probe_seq, batch_size=_probe_batch, vocab=vocab, train_ids=train_ids, arch=_arch, mlp_ratio=ratios))
+        _sanity += _data_rep
+    except RuntimeError as _fe:
+        _reports = [dict(r) for _k, r in _OVERFIT_REPORTS.items() if _k[0] in set(_variants)]
+        _doc = {
+            'kind': 'small_batch_overfit_sanity_panel', 'stage': 'data_preflight',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'run_cfg': fp, 'label': label or outdir, 'passed': False,
+            'error': f'{_fe}', 'provenance': prov, 'reports': _reports,
+        }
+        atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), _doc)
+        log_experiment_event(outdir, {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'data_overfit', 'run_cfg': fp, 'code': code_stamp(), 'provenance': prov, 'error': f'{_fe}', 'sanity': {'passed': False, 'n_reports': len(_reports)}})
         raise
-    if not _sanity:
+    if not _data_rep:
         # The guard is process-cached (correctly, so repeated phases do not
-        # retrain the probe).  Recover THIS variant set's evidence from the
-        # cache so a fresh outdir still gets a persisted sanity record.  Data
-        # reports are matched on the current corpus+vocab, never a stale one.
-        _want = set(cfg.get('variants') or [])
-        _cur_data = (int(vocab), _ids_fp(train_ids))
-        _sanity = [dict(r) for (v, src, *rest), r in _OVERFIT_REPORTS.items() if v in _want and (src == 'synthetic' or (len(rest) >= 2 and (rest[0], rest[1]) == _cur_data))]
+        # retrain the probe).  Recover THIS exact probe configuration's
+        # evidence from the cache so a fresh outdir still gets a persisted
+        # sanity record; an older/looser probe must never certify this panel.
+        _sem_by_v = {v: _overfit_probe_semantics(_data_probe_cfg(v)) for v in _variants}
+        _sanity = []
+        for (_v, _src, *_rest), _r in _OVERFIT_REPORTS.items():
+            if _v not in set(_variants):
+                continue
+            if _r.get('guard_probe_semantics') != _sem_by_v.get(_v):
+                continue
+            if _src in ('data', 'batch'):
+                # Full data key: the evidence must name THIS corpus/panel.
+                if len(_rest) < 2 or _rest[1] != _data_fp:
+                    continue
+            elif _src != 'synthetic':
+                continue
+            _sanity.append(dict(_r))
+    _sanity_doc = None
     if _sanity:
-        atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), {
+        _sanity_doc = {
             'kind': 'small_batch_overfit_sanity_panel',
             'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
             'run_cfg': fp,
@@ -12804,14 +13231,39 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             'passed': all(bool(r.get('passed')) for r in _sanity),
             'provenance': prov,
             'reports': _sanity,
-        })
-    _repro = list(reproducibility_guard(cfg.get('variants') or []))
+        }
+        atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), _sanity_doc)
+    # Same-machine seed check on the REAL architecture/data, first and last
+    # panel seed.  Confirmation/scale panels require it to pass; exploratory
+    # panels record the failure but stay advisory.
+    _repro_seeds = list(dict.fromkeys([_first_seed, _last_seed]))
+    _env_strict = os.environ.get('CSA_REQUIRE_REPRO')
+    if _env_strict is None:
+        _strict_repro = bool(_confirm)
+    else:
+        _strict_repro = _env_strict.strip().lower() in ('1', 'true', 'yes', 'on')
+    try:
+        _repro = list(reproducibility_guard(_variants, seed=_first_seed, steps=3, arch=_arch, train_ids=train_ids, vocab=vocab, mlp_ratio=ratios, seq_len=_probe_seq, batch_size=_probe_batch, seeds=_repro_seeds, strict=_strict_repro))
+    except RuntimeError as _fe:
+        _reports = [dict(r) for _k, r in _REPRO_REPORTS.items() if _k[0] in set(_variants)]
+        _doc = {
+            'kind': 'duplicate_run_reproducibility_panel', 'stage': 'reproducibility_preflight',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'run_cfg': fp, 'label': label or outdir, 'passed': False,
+            'error': f'{_fe}', 'provenance': prov, 'reports': _reports,
+        }
+        atomic_write_json(os.path.join(outdir, 'reproducibility.json'), _doc)
+        log_experiment_event(outdir, {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'reproducibility', 'run_cfg': fp, 'code': code_stamp(), 'provenance': prov, 'error': f'{_fe}', 'reproducibility': {'passed': False, 'n_reports': len(_reports)}})
+        raise
     if not _repro:
-        _want = set(cfg.get('variants') or [])
-        _base = _repro_guard_base(seed=0, steps=3, tol=1e-06)
-        _repro = [dict(r) for k, r in _REPRO_REPORTS.items() if k[0] in _want and k[1:] == _base]
+        _bases = set()
+        for v in _variants:
+            for sd in _repro_seeds:
+                _bases.add(_repro_guard_base(seed=sd, steps=3, tol=1e-06, arch=_arch, vocab=vocab, mlp_ratio=ratios.get(v), seq_len=_probe_seq, batch_size=_probe_batch, train_ids=train_ids, data_fp=_data_fp))
+        _repro = [dict(r) for k, r in _REPRO_REPORTS.items() if k[0] in set(_variants) and k[1] in _bases]
+    _repro_doc = None
     if _repro:
-        atomic_write_json(os.path.join(outdir, 'reproducibility.json'), {
+        _repro_doc = {
             'kind': 'duplicate_run_reproducibility_panel',
             'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
             'run_cfg': fp,
@@ -12819,7 +13271,8 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             'passed': all(bool(r.get('passed')) for r in _repro),
             'provenance': prov,
             'reports': _repro,
-        })
+        }
+        atomic_write_json(os.path.join(outdir, 'reproducibility.json'), _repro_doc)
     cells, stale_dropped = _plan_run(cfg, summary_path, fp)
     _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
     _planned_keys = [f'{v}::seed{seed}' for seed in cfg.get('seeds') or [] for v in cfg.get('variants') or []]
@@ -12827,7 +13280,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     # hyperparameters, planned cells) BEFORE the first cell can be
     # killed.  The final write below flips the status to complete and lists
     # every planned cell that produced no measurement.
-    write_run_manifest(outdir, cfg, fp, prov, _read_summary_json(summary_path), sanity=(_sanity or None), reproducibility=(_repro or None), status='running', planned_cells=_planned_keys, started_at=_panel_started)
+    write_run_manifest(outdir, cfg, fp, prov, _read_summary_json(summary_path), sanity=_sanity_doc, reproducibility=_repro_doc, status='running', planned_cells=_planned_keys, started_at=_panel_started)
     log_experiment_event(outdir, {
         'kind': 'panel_start', 'tracking_schema': 2, 'label': label or outdir,
         'run_cfg': fp, 'code': code_stamp(), 'started_at': _panel_started,
@@ -12885,7 +13338,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             print(f'    {_k}')
         if len(_still) != len(stale_dropped):
             print(f'    ({len(stale_dropped) - len(_still)} of them succeeded and carry a fresh record.)')
-    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=(_sanity or None), reproducibility=(_repro or None), status='complete', planned_cells=_planned_keys, started_at=_panel_started)
+    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=_sanity_doc, reproducibility=_repro_doc, status='complete', planned_cells=_planned_keys, started_at=_panel_started)
     _agg = _finish_panel(outdir, summary)
     _cell_keys = {f'{v}::seed{seed}' for v, seed in cells}
     _measured = {k for k in _cell_keys if isinstance(summary.get(k), dict) and ppl_is_usable((summary.get(k) or {}).get('ppl')) and not (summary.get(k) or {}).get('synthesized')}

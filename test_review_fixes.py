@@ -1286,7 +1286,7 @@ def t_experiment_ledger():
         for k in ('run_id', 'run_cfg', 'seed', 'provenance', 'hyperparams', 'data_fp', 'metrics', 'losses', 'ppl_history'):
             assert k in ev, f'experiment ledger entry missing {k}'
         assert ev['status'] == 'ok' and ev['run_id'] == out['run_id'] and len(ev['losses']) == 3
-        san = {'kind': 'small_batch_overfit_sanity_panel', 'passed': True, 'reports': []}
+        san = {'kind': 'small_batch_overfit_sanity_panel', 'passed': True, 'reports': [], 'run_cfg': fp}
         L.write_run_manifest(d, cfg, fp, prov, summary, sanity=san)
         m = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
         entry = m['panels'][fp]

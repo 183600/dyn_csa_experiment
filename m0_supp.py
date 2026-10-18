@@ -161,7 +161,7 @@ def run_data():
     print(f'\n[m0-data] cache READY: train tokens = {len(train_ids):,}  vocab = {vocab}  val sequences = {val_batch.shape[0]}  (built/verified in {dt / 60:.1f} min)')
     print(f'[m0-data] 供 full / smoke 直接复用；离线重建用 FWEDU_LOCAL_JSONL，换 cap 用 M0_TOKENS（新 cap = 新缓存文件，旧面板指纹不受影响）')
 
-def run_overfit_check(variants=None, steps=250, arch=None):
+def run_overfit_check(variants=None, steps=250, arch=None, seq_len=None, vocab=256, mlp_ratio=None, cfg=None):
     """Pre-flight small-batch overfit check on synthetic ids (independent of
     the corpus, so it cannot be blocked by a 5B-token cache build).  A failure
     is a hard stop before any panel is allowed to start.
@@ -169,32 +169,70 @@ def run_overfit_check(variants=None, steps=250, arch=None):
     `arch` optionally probes the architecture family the panel is about to
     train (S1: d=768/12L/12H/dh64): a head/layer-geometry mismatch that the tiny
     default probe (d=64/2L/4H) can never see is caught before the panel
-    starts.  Unset = the default tiny probe."""
+    starts.  `seq_len` should exercise the real block geometry (see
+    `L.probe_seq_len`), `mlp_ratio` carries the panel's per-variant MLP widths.
+    Unset = the default tiny probe."""
     variants = list(variants or L.B_ARMS)
-    print(f'\n[overfit] small-batch sanity check: {len(variants)} variant(s), wd=0, comp_lambda=0, no augmentation')
-    reports = L.overfit_guard(variants, steps=int(steps), vocab=256, arch=arch)
+    cfg = dict(cfg or {})
+    if seq_len is None:
+        seq_len = L.probe_seq_len(cfg.get('seq_len', 512))
+    _arch = arch or None
+    print(f'\n[overfit] small-batch sanity check: {len(variants)} variant(s), wd=0, comp_lambda=0, no augmentation, arch={_arch or "tiny"}, seq_len={seq_len}')
+    _prov = L.experiment_provenance({'dataset': 'synthetic', 'n_train_tokens': 0, 'seq_len': int(seq_len)}, vocab=int(vocab))
+    _pfp = L.preflight_fingerprint(cfg, stage='m0_synthetic_overfit', vocab=int(vocab), probe_cfg={'arch': _arch, 'seq_len': int(seq_len), 'mlp_ratio': mlp_ratio})
+    os.makedirs('results_overfit_sanity_m0', exist_ok=True)
+    try:
+        reports = L.overfit_guard(variants, steps=int(steps), vocab=int(vocab),
+                                  seq_len=int(seq_len), arch=_arch,
+                                  mlp_ratio=mlp_ratio)
+    except RuntimeError as _fe:
+        _reports = [dict(r) for k, r in L._OVERFIT_REPORTS.items() if k[0] in set(variants)]
+        L.atomic_write_json('results_overfit_sanity_m0/overfit_sanity.json', {
+            'kind': 'small_batch_overfit_sanity_panel', 'stage': 'm0_preflight',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'run_cfg': _pfp,
+            'passed': False, 'error': f'{_fe}', 'provenance': _prov,
+            'reports': _reports,
+        })
+        L.log_experiment_event('results_overfit_sanity_m0', {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'm0_overfit', 'run_cfg': _pfp, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'error': f'{_fe}', 'sanity': {'passed': False, 'n_reports': len(_reports)}})
+        raise
     if not reports:
         return []
     ok = all(r['passed'] for r in reports)
-    os.makedirs('results_overfit_sanity_m0', exist_ok=True)
-    _prov = L.experiment_provenance({'dataset': 'synthetic', 'n_train_tokens': 0, 'seq_len': 32})
     L.atomic_write_json('results_overfit_sanity_m0/overfit_sanity.json', {
         'kind': 'small_batch_overfit_sanity_panel',
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'run_cfg': _pfp,
         'passed': ok,
         'provenance': _prov,
         'reports': reports,
     })
-    _repro = L.reproducibility_guard(variants)
+    _seeds = [int(x) for x in (cfg.get('seeds') or [0])]
+    _repro_seeds = list(dict.fromkeys([_seeds[0], _seeds[-1]]))
+    try:
+        _repro = L.reproducibility_guard(variants, arch=_arch, vocab=int(vocab),
+                                         mlp_ratio=mlp_ratio, seq_len=int(seq_len),
+                                         batch_size=2, seeds=_repro_seeds,
+                                         strict=L._is_confirmatory_cfg(cfg))
+    except RuntimeError as _fe:
+        _reports = [dict(r) for k, r in L._REPRO_REPORTS.items() if k[0] in set(variants)]
+        L.atomic_write_json('results_overfit_sanity_m0/reproducibility.json', {
+            'kind': 'duplicate_run_reproducibility_panel', 'stage': 'm0_preflight',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'run_cfg': _pfp,
+            'passed': False, 'error': f'{_fe}', 'provenance': _prov,
+            'reports': _reports,
+        })
+        L.log_experiment_event('results_overfit_sanity_m0', {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'm0_repro', 'run_cfg': _pfp, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'error': f'{_fe}', 'reproducibility': {'passed': False, 'n_reports': len(_reports)}})
+        raise
     if _repro:
         L.atomic_write_json('results_overfit_sanity_m0/reproducibility.json', {
             'kind': 'duplicate_run_reproducibility_panel',
             'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'run_cfg': _pfp,
             'passed': all(bool(r.get('passed')) for r in _repro),
             'provenance': _prov,
             'reports': _repro,
         })
-    L.log_experiment_event('results_overfit_sanity_m0', {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and all(bool(r.get('passed')) for r in _repro) else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': {'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro)}})
+    L.log_experiment_event('results_overfit_sanity_m0', {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and all(bool(r.get('passed')) for r in _repro) else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'run_cfg': _pfp, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': {'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro)}})
     if not ok:
         _bad = [r['variant'] for r in reports if not r['passed']]
         raise RuntimeError(f'small-batch overfit sanity check FAILED for {_bad} — do NOT start training; inspect results_overfit_sanity_m0/overfit_sanity.json')
@@ -202,10 +240,20 @@ def run_overfit_check(variants=None, steps=250, arch=None):
     return reports
 
 def run_smoke():
-    run_overfit_check()
     seq = int(os.environ.get('M0_SMOKE_SEQ') or L.RUN_S1['seq_len'])
     steps = int(os.environ.get('M0_SMOKE_STEPS') or 12)
     smoke_cfg = dict(L.RUN_S1, d=64, n_layers=2, n_heads=4, d_head=16, batch_size=1, seq_len=seq, steps=steps, warmup=2, eval_every=max(steps // 2, 1), eval_subset=2, val_seqs=2, n_train_tokens=int(os.environ.get('M0_SMOKE_TOKENS') or 200000), fw_fit_docs=int(os.environ.get('M0_SMOKE_FIT_DOCS') or 400), seeds=[0], outdir='results_smoke_m0', variants=['full', 'csa_fixed', 'csa_dynamic'])
+    _smoke_ratios = {}
+    for _v in smoke_cfg['variants']:
+        try:
+            _smoke_ratios[_v] = L.variant_mlp_ratio(_v, int(smoke_cfg.get('vocab_size') or 1024), d=64, n_layers=2, n_heads=4, d_head=16, seq_len=int(seq), matched=smoke_cfg.get('matched'), ref_variant=smoke_cfg.get('mlp_match_ref', 'csa_dynamic'))
+        except Exception:
+            _smoke_ratios[_v] = None
+    run_overfit_check(variants=smoke_cfg['variants'],
+                      arch={'d': 64, 'n_layers': 2, 'n_heads': 4, 'd_head': 16},
+                      seq_len=L.probe_seq_len(seq),
+                      vocab=int(smoke_cfg.get('vocab_size') or 1024),
+                      mlp_ratio=_smoke_ratios, cfg=smoke_cfg)
     L.run(smoke_cfg, seeds=[0], guard=None, label=f'SMOKE M0 (B 档数据路径 @ seq{seq})', par=False)
     _sp = os.path.join('results_smoke_m0', 'summary.json')
     _got = {}
@@ -291,12 +339,23 @@ def run_kernel():
 
 
 def run_full():
-    run_overfit_check()
     panel = (os.environ.get('M0_PANEL') or 'S1').strip().upper()
     if panel not in ('S1', 'S2'):
         print(f"[m0] unknown M0_PANEL {panel!r}; expected 'S1' or 'S2'.  Nothing was started.")
         raise SystemExit(2)
     run_cfg, cap, cap_env = (L.RUN_S1, L.M0_CAP, 'M0_CAP_HOURS') if panel == 'S1' else (L.RUN_S2, L.M2_CAP, 'M2_CAP_HOURS')
+    _full_ratios = {}
+    for _v in run_cfg['variants']:
+        try:
+            _full_ratios[_v] = L.variant_mlp_ratio(_v, int(run_cfg.get('vocab_size') or L.B_VOCAB), d=int(run_cfg['d']), n_layers=int(run_cfg['n_layers']), n_heads=int(run_cfg['n_heads']), d_head=int(run_cfg['d_head']), seq_len=int(run_cfg['seq_len']), matched=run_cfg.get('matched'), ref_variant=run_cfg.get('mlp_match_ref', 'csa_dynamic'))
+        except Exception:
+            _full_ratios[_v] = None
+    run_overfit_check(variants=run_cfg['variants'],
+                      arch={'d': run_cfg['d'], 'n_layers': run_cfg['n_layers'],
+                            'n_heads': run_cfg['n_heads'], 'd_head': run_cfg['d_head']},
+                      seq_len=L.probe_seq_len(run_cfg['seq_len']),
+                      vocab=int(run_cfg.get('vocab_size') or L.B_VOCAB),
+                      mlp_ratio=_full_ratios, cfg=run_cfg)
     cap = dict(cap)
     _env = os.environ.get(cap_env)
     if _env:

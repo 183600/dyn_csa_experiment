@@ -99,8 +99,21 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         raise ValueError('search_seeds must contain at least one seed')
     os.makedirs(outdir, exist_ok=True)
     print(f'[tune] equal-search grid: {len(arms)} arms x {len(trials)} trials x {search_steps} steps x {len(search_seeds)} seed(s), selection={protocol["selection_metric"]} on {protocol["selection_split"]}')
-    L.overfit_guard(arms, steps=200, vocab=256)
+    _arch = {'d': int(base.get('d', 256)), 'n_layers': int(base.get('n_layers', 6)),
+             'n_heads': int(base.get('n_heads', 8)), 'd_head': int(base.get('d_head', 32))}
+    _pre_vocab = int(base.get('vocab_size') or 1024)
+    _pre_ratios = {}
+    for _a in arms:
+        try:
+            _pre_ratios[_a] = L.variant_mlp_ratio(_a, _pre_vocab, d=_arch['d'], n_layers=_arch['n_layers'], n_heads=_arch['n_heads'], d_head=_arch['d_head'], seq_len=int(base.get('seq_len', 512)), matched=base.get('matched'), ref_variant=base.get('mlp_match_ref', 'csa_dynamic'))
+        except Exception:
+            _pre_ratios[_a] = None
+    L.overfit_guard(arms, steps=200, vocab=_pre_vocab,
+                    seq_len=L.probe_seq_len(base.get('seq_len', 512)),
+                    arch=_arch, mlp_ratio=_pre_ratios)
     per_arm = {a: [] for a in arms}
+    _prov_any = None
+    _data_version_any = None
     for ti, knobs in enumerate(trials):
         tdir = os.path.join(outdir, f'trial_{ti:02d}')
         cfg = _trial_cfg(base, tdir, arms, search_seeds, search_steps, knobs)
@@ -118,6 +131,9 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
             if len(records) < len(search_seeds):
                 print(f'[tune] WARNING: {arm} trial {ti} has only seeds {sorted(records)} of {search_seeds}; '
                       'selection uses the observed seeds and the artifact records the gap')
+            if _prov_any is None:
+                _prov_any = records[sorted(records)[0]].get('provenance')
+                _data_version_any = records[sorted(records)[0]].get('data_version')
             mean, std = _mean_std([records[s]['ppl'] for s in sorted(records)])
             _steps = {int(records[s]['steps']) for s in records if records[s].get('steps') is not None}
             _tokens = {int(records[s]['tokens_seen']) for s in records if records[s].get('tokens_seen') is not None}
@@ -162,6 +178,8 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         'final_seeds': list(protocol.get('final_seeds') or []),
         'arms': selected,
         'code': L.code_stamp(),
+        'provenance': _prov_any or L.code_provenance(),
+        'data_version': _data_version_any,
     }
     path = os.path.join(outdir, 'baseline_tuning.json')
     L.atomic_write_json(path, artifact)
@@ -230,6 +248,19 @@ def _run_final(base, outdir, protocol, selected):
             if isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl')) and 'seed' in rec:
                 merged[f'{arm}::seed{int(rec["seed"])}'] = rec
     L.atomic_write_json(os.path.join(final_dir, 'summary.json'), merged)
+    _live = [r for r in merged.values() if isinstance(r, dict)]
+    _prov = next((r.get('provenance') for r in _live if r.get('provenance')), None) or L.code_provenance()
+    _dv = next((r.get('data_version') for r in _live if r.get('data_version')), None)
+    _final_cfg = {'seeds': final_seeds, 'variants': list(selected), 'outdir': final_dir, 'n_train_tokens': base.get('n_train_tokens'), 'seq_len': base.get('seq_len')}
+    _final_fp = L.preflight_fingerprint({'selected': selected, 'seeds': final_seeds, 'base': base}, stage='baseline_final')
+    _planned = [f'{a}::seed{s}' for a in selected for s in final_seeds]
+    try:
+        L.write_run_manifest(final_dir, _final_cfg, _final_fp, _prov, merged,
+                             status='complete', planned_cells=_planned)
+        L.log_experiment_event(final_dir, {'kind': 'panel_start', 'tracking_schema': 2, 'label': 'tuned final baselines', 'run_cfg': _final_fp, 'code': L.code_stamp(), 'provenance': _prov, 'data_version': _dv, 'seeds': final_seeds, 'variants': list(selected), 'n_cells_planned': len(_planned)})
+        L.log_experiment_event(final_dir, {'kind': 'panel_finish', 'tracking_schema': 2, 'label': 'tuned final baselines', 'run_cfg': _final_fp, 'code': L.code_stamp(), 'provenance': _prov, 'data_version': _dv, 'n_cells_planned': len(_planned), 'n_cells_measured': len(merged), 'n_cells_missing': max(0, len(_planned) - len(merged))})
+    except Exception as _te:
+        print(f'[tune] WARNING: could not write the final-panel manifest/events ({type(_te).__name__}: {_te})')
     tuning = json.load(open(os.path.join(outdir, 'baseline_tuning.json'), encoding='utf-8'))
     tuning['final_outdir'] = final_dir
     tuning['final_records'] = {k: {'ppl': v.get('ppl'), 'seed': v.get('seed'),
@@ -350,6 +381,10 @@ def run_simple(base_cfg=None, outdir='results_baseline_tuning', protocol=None):
     artifact.setdefault('data', {})['cache_val_fp'] = L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1))
     artifact['data']['eval_rows'] = int(rows)
     artifact['data']['eval_fp'] = L._ids_fp(np.ascontiguousarray(eval_slice).reshape(-1))
+    artifact['data_version'] = L._data_version(artifact['data'])
+    if isinstance(artifact.get('provenance'), dict):
+        artifact['provenance']['data'] = dict(artifact['data'])
+        artifact['provenance']['data']['data_version'] = artifact['data_version']
     os.makedirs(outdir, exist_ok=True)
     path = os.path.join(outdir, 'simple_baseline.json')
     L.atomic_write_json(path, artifact)

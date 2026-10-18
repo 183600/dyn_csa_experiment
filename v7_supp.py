@@ -939,8 +939,67 @@ def _warm_fp(cfg, vocab, train_ids, val_batch):
     d_head = cfg.get('d_head', 32)
     _wu = cfg['warmup']
     _mkey = ','.join(sorted((str(_x) for _x in (set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}))))
-    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{L.determinism_label()}_df{L._ids_fp(train_ids)}-{L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_cs{CKPT_CODE}'
+    return f'warm_v2_steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_gc{L.training_knobs().get('grad_clip_norm')}_tk{L.training_knobs_fingerprint()}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{L.determinism_label()}_df{L._ids_fp(train_ids)}-{L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_cs{CKPT_CODE}'
 
+
+def _phase_cell_record(v, seed, rec, *, run_cfg, metric='ppl', key=None):
+    """Normalised manifest cell for a custom phase (warmup/NIAH/lenphase)."""
+    _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
+    _loss_nums = [float(x) for x in _losses if isinstance(x, (int, float)) and not isinstance(x, bool)]
+    _curve = {
+        'n_points': len(_loss_nums),
+        'first': _loss_nums[0] if _loss_nums else rec.get('curve_first'),
+        'last': _loss_nums[-1] if _loss_nums else rec.get('curve_last'),
+        'best': min(_loss_nums) if _loss_nums else rec.get('curve_best'),
+    }
+    if metric == 'ppl':
+        _metric = rec.get('ppl')
+    elif metric == 'acc':
+        _metric = rec.get('acc')
+    elif metric == 'by_len':
+        _vals = [float(x.get('ppl')) for x in (rec.get('by_len') or {}).values()
+                 if isinstance(x, dict) and L.ppl_is_usable(x.get('ppl'))]
+        _metric = (float(np.mean(_vals)) if _vals else None)
+    else:
+        _metric = None
+    return {
+        'variant': v,
+        'seed': int(seed),
+        'key': key,
+        'run_id': rec.get('run_id'),
+        'started_at': rec.get('started_at'),
+        'finished_at': rec.get('finished_at'),
+        'ppl': rec.get('ppl'),
+        'accuracy': rec.get('acc'),
+        'metric': metric,
+        'metric_value': _metric,
+        'steps': rec.get('steps'),
+        'tokens_seen': rec.get('tokens_seen'),
+        'params': rec.get('params'),
+        'train_time_s': rec.get('train_time_s'),
+        'final_loss_smoothed': rec.get('final_loss_smoothed'),
+        'rng_fp': rec.get('rng_fp'),
+        'data_fp': rec.get('data_fp'),
+        'val_fp': rec.get('val_fp'),
+        'data_version': rec.get('data_version') or (rec.get('provenance') or {}).get('data', {}).get('data_version'),
+        'code_stamp': rec.get('_code') or CKPT_CODE,
+        'run_cfg': rec.get('run_cfg') or run_cfg,
+        'hyperparams': rec.get('hyperparams'),
+        'curve_summary': _curve,
+        'curve_ref': rec.get('curve_ref') or (f'summary.json#{key}.losses' if key else None),
+        'sanity_ref': rec.get('sanity_ref'),
+    }
+
+def _write_phase_manifest(outdir, cfg, run_cfg, prov, *, phase, planned_cells, cell_records=None, status='running', started_at=None):
+    """Write/refresh the same crash-safe run_manifest.json used by run()."""
+    try:
+        return L.write_run_manifest(
+            outdir, cfg, run_cfg, prov, {},
+            status=status, planned_cells=list(planned_cells),
+            started_at=started_at, cell_records=cell_records)
+    except Exception as _e:
+        print(f'[track] WARNING: could not write run_manifest.json for {phase} ({type(_e).__name__}: {_e})')
+        return None
 
 def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_ids=None, val_batch=None, vocab=None, val_bnd=None, prebook=False):
     """Run exactly ONE (variant, warm-steps, seed) warmup cell with a locked
@@ -1101,10 +1160,30 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
         guard.record_run(time.time() - t_data, 0, 0, 0, 0, 0)
     spath = os.path.join(outdir, 'summary.json')
     L.locked_json_read(spath)
+    ratios = {}
+    for v in variants:
+        if v not in ratios:
+            ratios[v] = L.variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}, ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
     # Warmup training uses the real corpus through its own train_warmup loop,
     # so the generic run() pre-flight never sees it.  Check the actual token
-    # stream before launching the 20k-step P0W cells.
-    L.overfit_guard(list(variants), train_ids=train_ids, vocab=vocab)
+    # stream with the panel's real architecture/MLP and a block-length
+    # sequence before launching the 20k-step P0W cells.
+    _probe_seq = L.probe_seq_len(cfg['seq_len'])
+    try:
+        L.overfit_guard(list(variants), train_ids=train_ids, vocab=vocab,
+                        arch={'d': d, 'n_layers': n_layers, 'n_heads': n_heads, 'd_head': d_head},
+                        mlp_ratio=ratios, seq_len=_probe_seq)
+    except RuntimeError as _fe:
+        _prov0 = L.experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
+        _reps0 = [dict(r) for k, r in L._OVERFIT_REPORTS.items() if k[0] in set(variants)]
+        _pfp = L.preflight_fingerprint(cfg, stage='warmup_overfit', vocab=vocab, data_fp=L._ids_fp(train_ids), probe_cfg={'_probe_seq': _probe_seq, 'arch': {'d': d, 'n_layers': n_layers, 'n_heads': n_heads, 'd_head': d_head}})
+        L.atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), {
+            'kind': 'small_batch_overfit_sanity_panel', 'stage': 'warmup_preflight',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'run_cfg': _pfp,
+            'label': label or outdir, 'passed': False, 'error': f'{_fe}',
+            'provenance': _prov0, 'reports': _reps0,
+        })
+        raise
     _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
     _panel_prov = L.experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
     L.log_experiment_event(outdir, {
@@ -1115,13 +1194,11 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
         'code': CKPT_CODE, 'provenance': _panel_prov,
     })
     print(f'\n########## v7 phase: {label} — {len(variants)} variants x warm {warm_grid} x seeds {seeds} x {cfg['steps']} steps ##########')
-    ratios = {}
-    for v in variants:
-        if v not in ratios:
-            ratios[v] = L.variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}, ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
     if torch.cuda.is_available():
         L._pin_cuda_determinism()
     _fp = _warm_fp(cfg, vocab, train_ids, val_batch)
+    _planned = [f'{v}::w{warm}::seed{seed}' for seed in seeds for warm in warm_grid for v in variants]
+    _write_phase_manifest(outdir, cfg, _fp, _panel_prov, phase='warmup', planned_cells=_planned, status='running', started_at=_panel_started)
     cells = [(v, warm, seed) for seed in seeds for warm in warm_grid for v in variants]
     stale_dropped = []
     dropped_truncations = []
@@ -1159,6 +1236,18 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
     _measured = sum(1 for _r in summary.values()
                     if isinstance(_r, dict) and L.ppl_is_usable(_r.get('ppl'))
                     and not _r.get('synthesized'))
+    _cell_recs = {}
+    for _k in _planned:
+        _r = summary.get(_k)
+        if not isinstance(_r, dict) or not L.ppl_is_usable(_r.get('ppl')) or _r.get('synthesized'):
+            continue
+        try:
+            _v, _w, _sd = _k.split('::')
+            _cell_recs[_k] = _phase_cell_record(_v, int(_sd.replace('seed', '')), _r, run_cfg=_fp, metric='ppl', key=_k)
+            _cell_recs[_k]['warm_steps'] = int(_w.replace('w', ''))
+        except Exception:
+            continue
+    _write_phase_manifest(outdir, cfg, _fp, _panel_prov, phase='warmup', planned_cells=_planned, cell_records=_cell_recs, status='complete', started_at=_panel_started)
     L.log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
         'phase': 'warmup', 'started_at': _panel_started,
@@ -1593,17 +1682,24 @@ def run_niah_phase(payload, guard=None, label=''):
     vocab = payload.get('vocab', 8192)
     n_steps = payload.get('steps', 4000)
     # This phase has its own training loop (synthetic NIAH task), so the
-    # generic run() pre-flight does not cover it.  Check the model/loss/
-    # gradient plumbing before the first checkpoint is written.
-    L.overfit_guard(list(variants), vocab=int(vocab))
+    # generic run() pre-flight does not cover it.  The ACTUAL task batch
+    # (same key/value construction, padding and ignore_index=-100 convention)
+    # is checked below before each seed's first checkpoint is written.
     _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
-    _panel_prov = L.experiment_provenance({'dataset': 'synthetic_niah', 'n_train_tokens': 0, 'seq_len': 512})
+    _panel_prov = L.experiment_provenance({'dataset': 'synthetic_niah', 'n_train_tokens': 0, 'seq_len': 512, 'data_extra': {'generator': 'build_niah_batch', 'n_pairs': 4, 'ignore_index': -100}})
     L.log_experiment_event(outdir, {
         'kind': 'panel_start', 'tracking_schema': 2, 'label': label or outdir,
         'phase': 'niah', 'started_at': _panel_started,
         'config': L._jsonable(payload), 'seeds': seeds, 'variants': list(variants),
         'seq_lens': list(seq_lens), 'code': CKPT_CODE, 'provenance': _panel_prov,
     })
+    _niah_panel_cfg = L.preflight_fingerprint({'payload': payload}, stage='niah_panel', vocab=int(vocab))
+    _planned_niah = [f'{v}::seed{seed}' for v in variants for seed in seeds]
+    _write_phase_manifest(outdir, {'seeds': seeds, 'variants': list(variants), 'seq_len': 512},
+                          _niah_panel_cfg, _panel_prov, phase='niah',
+                          planned_cells=_planned_niah, status='running', started_at=_panel_started)
+    _recipe_by_v = {}
+    _prov_by_seed = {}
     spath = os.path.join(outdir, 'summary.json')
     summary = {}
     if os.path.exists(spath):
@@ -1617,8 +1713,28 @@ def run_niah_phase(payload, guard=None, label=''):
         mr = 4.0
         if v in PARAM_MATCHED_V7:
             mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=set(PARAM_MATCHED_V7), ref_variant=_mr_ref)
-        _recipe = f'niah_steps{n_steps}_v{vocab}_bs12_sl512_lr0.0003_mr{mr:.8g}-{_mr_ref}_reuse4'
+        _opt_sig = (f'wd0.0_b{L.OPT_ADAMW_BETAS[0]},{L.OPT_ADAMW_BETAS[1]}'
+                    f'_eps{L.OPT_ADAMW_EPS:g}_gc{L.GRAD_CLIP_NORM}_cl0.05'
+                    f'_tk{L.training_knobs_fingerprint()}')
+        _recipe = f'niah_v2_steps{n_steps}_v{vocab}_bs12_sl512_lr0.0003_mr{mr:.8g}-{_mr_ref}_{_opt_sig}_reuse4'
+        _recipe_by_v[v] = _recipe
         for seed in seeds:
+            _niah_batch_seed = int(seed) * 100003
+            _g_ids, _g_tgt, _g_dist, _g_kdist = build_niah_batch(12, 512, 4, int(vocab), seed=_niah_batch_seed)
+            _niah_batch = (_g_ids, _g_tgt)
+            _niah_batch_fp = L._ids_fp(_g_ids.reshape(-1)) + ':' + L._ids_fp(_g_tgt.reshape(-1))
+            _niah_data_recipe = {
+                'generator': 'build_niah_batch', 'n_seq': 12, 'seq_len': 512,
+                'n_pairs': 4, 'vocab': int(vocab), 'seed': _niah_batch_seed,
+                'ignore_index': -100, 'n_scored_targets': int((_g_tgt >= 0).sum()),
+                'batch_fp': _niah_batch_fp,
+            }
+            _niah_prov = L.experiment_provenance({
+                'dataset': 'synthetic_niah', 'n_train_tokens': 0, 'seq_len': 512,
+                'data_extra': _niah_data_recipe,
+            }, vocab=int(vocab))
+            _niah_knobs = L.training_knobs()
+            _prov_by_seed[int(seed)] = _niah_prov
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
             stale = False
             _ckp_pre = None
@@ -1654,6 +1770,24 @@ def run_niah_phase(payload, guard=None, label=''):
                         print(f'[cap] SKIP niah train {v} s{seed}')
                         continue
                 t0 = time.time()
+                # Small-batch overfit on the EXACT task batch (masked -100
+                # labels, query/answer positions), not a random next-token
+                # stream: a wrong NIAH label map must be caught here.
+                try:
+                    L.overfit_guard([v], batch=_niah_batch, ignore_index=-100,
+                                    vocab=int(vocab), steps=300, seq_len=512,
+                                    batch_size=12, mlp_ratio=mr,
+                                    arch={'d': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32})
+                except RuntimeError as _fe:
+                    _pfp = L.preflight_fingerprint({'payload': payload}, stage='niah_overfit', vocab=int(vocab), data_fp=_niah_batch_fp, probe_cfg=_niah_data_recipe)
+                    L.atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), {
+                        'kind': 'small_batch_overfit_sanity_panel', 'stage': 'niah_preflight',
+                        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'run_cfg': _pfp,
+                        'passed': False, 'error': f'{_fe}', 'provenance': _niah_prov,
+                        'reports': [dict(r) for k, r in L._OVERFIT_REPORTS.items() if k[0] == v],
+                    })
+                    L.log_experiment_event(outdir, {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'niah_overfit', 'run_cfg': _pfp, 'code': CKPT_CODE, 'provenance': _niah_prov, 'variant': v, 'seed': int(seed), 'error': f'{_fe}', 'sanity': {'passed': False}})
+                    raise
                 cfgs = L.make_layer_cfgs(6, v)
                 # 随机源在建模前一刻定界：同 seed 下各臂的共享组件（tok/head/MLP）必须同构
                 L.set_seed(seed)
@@ -1665,7 +1799,7 @@ def run_niah_phase(payload, guard=None, label=''):
                         _niah_losses.extend(torch.stack(_niah_buf).tolist())
                         _niah_buf.clear()
                 model = L.SmallGPT(vocab, 256, 6, 8, 32, 512, cfgs, mlp_ratio=mr).to(DEVICE)
-                opt = torch.optim.AdamW(model.parameters(), lr=0.0003, foreach=True)
+                opt = torch.optim.AdamW(model.parameters(), lr=0.0003, betas=L.OPT_ADAMW_BETAS, eps=L.OPT_ADAMW_EPS, weight_decay=0.0, foreach=True)
                 model.train()
                 cache = {'ids': None, 'tgt': None, 'age': 10 ** 9, 'epoch': 0}
 
@@ -1728,10 +1862,39 @@ def run_niah_phase(payload, guard=None, label=''):
                         guard.record_run(time.time() - t0, step, 256, 6, 512, 12)
                     continue
                 _n_params = L.count_params(model)
-                _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'params': _n_params, 'rng_fp': _niah_rng_fp, 'losses': _niah_losses, 'steps': n_steps}, ck)
+                _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'params': _n_params, 'rng_fp': _niah_rng_fp, 'losses': _niah_losses, 'steps': n_steps, 'provenance': _niah_prov, 'data_fp': _niah_batch_fp, 'data_version': (_niah_prov.get('data') or {}).get('data_version'), 'train_knobs': _niah_knobs, 'data_recipe': _niah_data_recipe}, ck)
                 if guard is not None:
                     guard.record_run(time.time() - t0, n_steps, 256, 6, 512, 12)
-                L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'status': 'ok', 'started_at': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t0)), 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - t0, 'key': f'{v}::seed{seed}::niah_train', 'variant': v, 'seed': int(seed), 'run_cfg': _recipe, 'code': CKPT_CODE, 'rng_fp': _niah_rng_fp, 'hyperparams': {'steps': int(n_steps), 'seq_len': 512, 'batch_size': 12, 'lr': 0.0003, 'weight_decay': 0.0, 'comp_lambda': 0.05, 'mlp_ratio': float(mr)}, 'metrics': {'params': _n_params, 'steps': int(n_steps), 'final_loss': _niah_losses[-1] if _niah_losses else None, 'train_time_s': time.time() - t0}, 'curve_summary': {'n_points': len(_niah_losses), 'first': _niah_losses[0] if _niah_losses else None, 'last': _niah_losses[-1] if _niah_losses else None, 'best': min(_niah_losses) if _niah_losses else None}, 'losses': _niah_losses})
+                _niah_hp = {
+                    'steps': int(n_steps), 'seq_len': 512, 'batch_size': 12,
+                    'lr': 0.0003, 'weight_decay': 0.0,
+                    'betas': list(L.OPT_ADAMW_BETAS), 'eps': L.OPT_ADAMW_EPS,
+                    'grad_clip_norm': L.GRAD_CLIP_NORM, 'comp_lambda': 0.05,
+                    'mlp_ratio': float(mr), 'optimizer': 'AdamW',
+                    'train_knobs': _niah_knobs,
+                    'data_recipe': _niah_data_recipe,
+                }
+                L.log_experiment_event(outdir, {
+                    'kind': 'cell', 'tracking_schema': 2, 'status': 'ok',
+                    'started_at': time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t0)),
+                    'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                    'elapsed_s': time.time() - t0, 'key': f'{v}::seed{seed}::niah_train',
+                    'variant': v, 'seed': int(seed), 'run_cfg': _recipe,
+                    'code': CKPT_CODE, 'rng_fp': _niah_rng_fp,
+                    'provenance': _niah_prov,
+                    'data_fp': _niah_batch_fp,
+                    'data_version': (_niah_prov.get('data') or {}).get('data_version'),
+                    'train_knobs': _niah_knobs, 'data_recipe': _niah_data_recipe,
+                    'hyperparams': _niah_hp,
+                    'metrics': {'params': _n_params, 'steps': int(n_steps),
+                                'final_loss': _niah_losses[-1] if _niah_losses else None,
+                                'train_time_s': time.time() - t0},
+                    'curve_summary': {'n_points': len(_niah_losses),
+                                      'first': _niah_losses[0] if _niah_losses else None,
+                                      'last': _niah_losses[-1] if _niah_losses else None,
+                                      'best': min(_niah_losses) if _niah_losses else None},
+                    'losses': _niah_losses,
+                })
                 del model, opt
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -1766,7 +1929,16 @@ def run_niah_phase(payload, guard=None, label=''):
                     r = {'error': f'{type(e).__name__}: {e}'}
                 if guard is not None:
                     guard.record_run(time.time() - t0, 0, 0, 0, 0, 0)
-                r.update({'variant': v, 'seed': seed, 'seq_len': Ln, 'params': _ckp['params'], 'probe_s': time.time() - t0, '_code': CKPT_CODE})
+                _niah_eval_prov = _ckp.get('provenance') or _niah_prov
+                _niah_eval_knobs = _ckp.get('train_knobs') or _niah_knobs
+                r.update({'variant': v, 'seed': seed, 'seq_len': Ln,
+                          'params': _ckp['params'], 'probe_s': time.time() - t0,
+                          '_code': CKPT_CODE, 'run_cfg': _recipe,
+                          'provenance': _niah_eval_prov,
+                          'data_fp': _ckp.get('data_fp') or _niah_batch_fp,
+                          'data_version': _ckp.get('data_version') or (_niah_eval_prov.get('data') or {}).get('data_version'),
+                          'train_knobs': _niah_eval_knobs,
+                          'data_recipe': _ckp.get('data_recipe') or _niah_data_recipe})
                 summary[key] = r
                 print(f'  [niah] {v:18s} s{seed} len={Ln:5d}  acc={r.get('acc')}  by_dist={r.get('by_dist')}')
 
@@ -1778,13 +1950,33 @@ def run_niah_phase(payload, guard=None, label=''):
                 # the ledger: without this entry a NIAH accuracy would be a
                 # summary.json number with no trace of which code/weights
                 # produced it.
-                L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'status': 'ok', 'key': key, 'variant': v, 'seed': int(seed), 'seq_len': int(Ln), 'code': CKPT_CODE, 'recipe': _ckp.get('recipe'), 'metrics': {'acc': r.get('acc'), 'n': r.get('n'), 'eval_span': r.get('eval_span'), 'params': r.get('params'), 'probe_s': r.get('probe_s')}})
+                L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'status': 'ok', 'key': key, 'variant': v, 'seed': int(seed), 'seq_len': int(Ln), 'code': CKPT_CODE, 'recipe': _ckp.get('recipe'), 'run_cfg': _recipe, 'provenance': _niah_eval_prov, 'data_fp': r.get('data_fp'), 'data_version': r.get('data_version'), 'train_knobs': _niah_eval_knobs, 'metrics': {'acc': r.get('acc'), 'n': r.get('n'), 'eval_span': r.get('eval_span'), 'params': r.get('params'), 'probe_s': r.get('probe_s')}})
             del model, _ckp
             gc.collect()
             torch.cuda.empty_cache()
     _measured = len({(r.get('variant'), r.get('seed')) for r in summary.values()
                      if isinstance(r, dict) and isinstance(r.get('acc'), (int, float))
                      and not isinstance(r.get('acc'), bool) and math.isfinite(float(r['acc']))})
+    _niah_cells = {}
+    for _v in variants:
+        for _sd in seeds:
+            _evs = [summary.get(f'{_v}::seed{_sd}::len{Ln}') for Ln in seq_lens]
+            _evs = [x for x in _evs if isinstance(x, dict) and isinstance(x.get('acc'), (int, float))
+                    and not isinstance(x.get('acc'), bool) and math.isfinite(float(x['acc']))]
+            if not _evs:
+                continue
+            _base = dict(_evs[0])
+            _accs = [float(x['acc']) for x in _evs]
+            _base['acc'] = float(np.mean(_accs))
+            _base['run_cfg'] = _recipe_by_v.get(_v)
+            _ck = _phase_cell_record(_v, int(_sd), _base, run_cfg=_recipe_by_v.get(_v), metric='acc', key=f'{_v}::seed{_sd}')
+            _ck['by_len_acc'] = {str(int(x.get('seq_len'))): x.get('acc') for x in _evs}
+            _ck['curve_ref'] = f'experiments.jsonl#{_v}::seed{_sd}::niah_train.losses'
+            _niah_cells[f'{_v}::seed{_sd}'] = _ck
+    _write_phase_manifest(outdir, {'seeds': seeds, 'variants': list(variants), 'seq_len': 512},
+                          _niah_panel_cfg, _panel_prov, phase='niah',
+                          planned_cells=_planned_niah, cell_records=_niah_cells,
+                          status='complete', started_at=_panel_started)
     L.log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
         'phase': 'niah', 'started_at': _panel_started,
@@ -1963,7 +2155,11 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     mr = 4.0
     if v in PARAM_MATCHED_V7:
         mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant='csa_fixed_rope')
-    _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs{batch_size}_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr{mr:.8g}-csa_fixed_rope_ns{n_seq}_df{L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))}'
+    _recipe = (f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs{batch_size}_lr0.0003_nt8000000_wu50_wd0.1_'
+               f'cl0.05_dlm10.0_mr{mr:.8g}-csa_fixed_rope_ns{n_seq}_'
+               f'df{L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))}'
+               f'_gc{L.GRAD_CLIP_NORM}_b{L.OPT_ADAMW_BETAS[0]},{L.OPT_ADAMW_BETAS[1]}'
+               f'_eps{L.OPT_ADAMW_EPS:g}_tk{L.training_knobs_fingerprint()}')
     ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
     stale = False
     _ckp_pre = None
@@ -2021,8 +2217,22 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             # label shift downstream), so run the same small-batch overfit
             # probe on the actual corpus before starting the cell.  The probe
             # is RNG-preserving, so it cannot perturb this cell.
-            L.overfit_guard([v], train_ids=train_ids, vocab=vocab, steps=150,
-                            seq_len=min(64, int(train_len)), batch_size=2)
+            try:
+                L.overfit_guard([v], train_ids=train_ids, vocab=vocab, steps=150,
+                                seq_len=L.probe_seq_len(train_len), batch_size=2,
+                                mlp_ratio=mr,
+                                arch={'d': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32})
+            except RuntimeError as _fe:
+                _p1l_prov = L.experiment_provenance(_prov_cfg, train_ids=train_ids, val_batch=val_ids, vocab=vocab)
+                _pfp = L.preflight_fingerprint(payload, stage='lenphase_overfit', vocab=int(vocab), data_fp=L._ids_fp(train_ids), probe_cfg={'seq_len': L.probe_seq_len(train_len), 'arch': {'d': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32}})
+                L.atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), {
+                    'kind': 'small_batch_overfit_sanity_panel', 'stage': 'lenphase_preflight',
+                    'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'run_cfg': _pfp,
+                    'passed': False, 'error': f'{_fe}', 'provenance': _p1l_prov,
+                    'reports': [dict(r) for k, r in L._OVERFIT_REPORTS.items() if k[0] == v],
+                })
+                L.log_experiment_event(outdir, {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'lenphase_overfit', 'run_cfg': _pfp, 'code': CKPT_CODE, 'provenance': _p1l_prov, 'variant': v, 'seed': int(seed), 'error': f'{_fe}', 'sanity': {'passed': False}})
+                raise
             _tr = L.train_variant(v, train_ids, None, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=batch_size, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=_deadline, return_model=True)
         except Exception:
             # A raised train_variant leaves no record_run behind, so the
@@ -2088,7 +2298,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             except (TypeError, ValueError):
                 continue
         _merged.update(r)
-        _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE, 'recipe': _recipe, 'eval_n_seq': n_seq}
+        _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE, 'recipe': _recipe, 'run_cfg': _recipe, 'eval_n_seq': n_seq}
         try:
             _prov = L.experiment_provenance(_prov_cfg, train_ids=(train_ids if _tr is not None else None), val_batch=val_ids, vocab=vocab)
             _rec['provenance'] = _prov
@@ -2111,6 +2321,8 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                     if _prev.get(_kk) is not None:
                         _rec[_kk] = _prev[_kk]
             _rec['val_fp'] = _prov['data'].get('val_fp')
+            _rec['data_version'] = _prov['data'].get('data_version')
+            _rec.setdefault('train_knobs', (_rec.get('hyperparams') or {}).get('train_knobs') or L.training_knobs())
         except Exception as _pe:
             print(f'[p1l] WARNING: could not attach provenance to {key} ({type(_pe).__name__}: {_pe})')
         summary[key] = _rec
@@ -2137,12 +2349,20 @@ def run_lenphase(payload, guard=None, label='', par=None):
     ckpt_dir = os.path.join(outdir, 'ckpt')
     os.makedirs(ckpt_dir, exist_ok=True)
     variants = payload['variants']
-    L.overfit_guard(list(variants))
     eval_lens = payload['eval_lens']
     seeds = list(payload.get('seeds', [0, 1, 2]))
     steps = payload.get('steps', 3000)
     train_len = payload.get('train_len', 512)
     vocab = payload.get('vocab', 8192)
+    _p1l_ratios = {}
+    for _v in variants:
+        try:
+            _p1l_ratios[_v] = (L.variant_mlp_ratio(_v, int(vocab), d=256, n_layers=6, n_heads=8, d_head=32, seq_len=int(train_len), matched=set(PARAM_MATCHED_V7), ref_variant='csa_fixed_rope') if _v in PARAM_MATCHED_V7 else 4.0)
+        except Exception:
+            _p1l_ratios[_v] = None
+    L.overfit_guard(list(variants), vocab=int(vocab), seq_len=L.probe_seq_len(train_len),
+                    mlp_ratio=_p1l_ratios,
+                    arch={'d': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32})
     spath = os.path.join(outdir, 'summary.json')
     _read = L.locked_json_read(spath)
     need = max(eval_lens) + 1
@@ -2161,6 +2381,11 @@ def run_lenphase(payload, guard=None, label='', par=None):
         'eval_lens': list(eval_lens), 'code': CKPT_CODE,
         'provenance': _panel_prov,
     })
+    _len_panel_cfg = L.preflight_fingerprint({'payload': payload}, stage='lenphase_panel', vocab=int(vocab))
+    _planned_len = [f'{v}::seed{seed}' for v in variants for seed in seeds]
+    _write_phase_manifest(outdir, {'seeds': seeds, 'variants': list(variants), 'seq_len': train_len},
+                          _len_panel_cfg, _panel_prov, phase='lenphase',
+                          planned_cells=_planned_len, status='running', started_at=_panel_started)
     _ran_parallel = False
     cells = [(v, seed) for v in variants for seed in seeds]
     if len(cells) > 1:
@@ -2182,6 +2407,24 @@ def run_lenphase(payload, guard=None, label='', par=None):
             continue
         if any(isinstance(_c, dict) and L.ppl_is_usable(_c.get('ppl')) for _c in _r['by_len'].values()):
             _measured += 1
+    _len_cells = {}
+    for _k in _planned_len:
+        _r = summary.get(_k)
+        if not isinstance(_r, dict) or not isinstance(_r.get('by_len'), dict):
+            continue
+        if not any(isinstance(_c, dict) and L.ppl_is_usable(_c.get('ppl')) for _c in _r['by_len'].values()):
+            continue
+        try:
+            _v, _sd = _k.split('::')
+            _len_cells[_k] = _phase_cell_record(_v, int(_sd.replace('seed', '')), _r,
+                                                run_cfg=_r.get('run_cfg'), metric='by_len', key=_k)
+            _len_cells[_k]['eval_lens'] = list(eval_lens)
+        except Exception:
+            continue
+    _write_phase_manifest(outdir, {'seeds': seeds, 'variants': list(variants), 'seq_len': train_len},
+                          _len_panel_cfg, _panel_prov, phase='lenphase',
+                          planned_cells=_planned_len, cell_records=_len_cells,
+                          status='complete', started_at=_panel_started)
     L.log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
         'phase': 'lenphase', 'started_at': _panel_started,

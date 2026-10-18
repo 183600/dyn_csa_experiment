@@ -384,7 +384,8 @@ def run_overfit(cfg=None, variants=None, steps=None):
     compression penalty, no augmentation.  A failure is a hard stop (the full
     run must not start).  Passing is necessary, not sufficient — data
     augmentation / feature-alignment / label-mapping problems can still survive.
-    """
+    The probe uses the panel's real architecture/MLP and a block-length
+    sequence, and failed evidence is persisted before the hard stop."""
     cfg = dict(L.RUN if cfg is None else cfg)
     cfg.setdefault('outdir', 'results_overfit_sanity')
     variants = list(variants or ['full', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic', 'hybrid_hca_dyn', 'csa_dyn_nocomp'])
@@ -396,30 +397,75 @@ def run_overfit(cfg=None, variants=None, steps=None):
     # point too, exactly like it does inside L.run().
     L.set_seed(int((cfg.get('seeds') or [0])[0]))
     train_ids, val_batch, vocab, _, _ = L.load_run_corpus(cfg)
-    print(f'\n[overfit] small-batch sanity check: {len(variants)} variant(s), one fixed batch, wd=0, comp_lambda=0, no augmentation')
-    reports = L.overfit_guard(variants, steps=int(steps or 300), train_ids=train_ids, vocab=vocab, force=True)
+    d = int(cfg.get('d', 256))
+    n_layers = int(cfg.get('n_layers', 6))
+    n_heads = int(cfg.get('n_heads', 8))
+    d_head = int(cfg.get('d_head', 32))
+    ratios = {}
+    for v in variants:
+        try:
+            ratios[v] = L.variant_mlp_ratio(v, int(vocab), d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=int(cfg.get('seq_len', 512)), matched=cfg.get('matched'), ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
+        except Exception:
+            ratios[v] = None
+    probe_seq = L.probe_seq_len(cfg.get('seq_len', 512))
+    arch = {'d': d, 'n_layers': n_layers, 'n_heads': n_heads, 'd_head': d_head}
+    print(f'\n[overfit] small-batch sanity check: {len(variants)} variant(s), one fixed batch, wd=0, comp_lambda=0, no augmentation, arch={arch}, seq_len={probe_seq}')
+    _prov = L.experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
+    _pfp = L.preflight_fingerprint(cfg, stage='gapfill_overfit', vocab=int(vocab), data_fp=L._ids_fp(train_ids), probe_cfg={'arch': arch, 'seq_len': probe_seq, 'mlp_ratio': ratios})
+    os.makedirs(cfg['outdir'], exist_ok=True)
+    try:
+        reports = L.overfit_guard(variants, steps=int(steps or 300), train_ids=train_ids,
+                                  vocab=vocab, seq_len=probe_seq, arch=arch,
+                                  mlp_ratio=ratios, force=True)
+    except RuntimeError as _fe:
+        _reports = [dict(r) for k, r in L._OVERFIT_REPORTS.items() if k[0] in set(variants)]
+        L.atomic_write_json(os.path.join(cfg['outdir'], 'overfit_sanity.json'), {
+            'kind': 'small_batch_overfit_sanity_panel', 'stage': 'gapfill_preflight',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'run_cfg': _pfp,
+            'passed': False, 'error': f'{_fe}', 'provenance': _prov,
+            'reports': _reports,
+        })
+        L.log_experiment_event(cfg['outdir'], {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'gapfill_overfit', 'run_cfg': _pfp, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'error': f'{_fe}', 'sanity': {'passed': False, 'n_reports': len(_reports)}})
+        raise
     if not reports:
         return []
     ok = all(r['passed'] for r in reports)
-    os.makedirs(cfg['outdir'], exist_ok=True)
-    _prov = L.experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
     L.atomic_write_json(os.path.join(cfg['outdir'], 'overfit_sanity.json'), {
         'kind': 'small_batch_overfit_sanity_panel',
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'run_cfg': _pfp,
         'passed': ok,
         'provenance': _prov,
         'reports': reports,
     })
-    _repro = L.reproducibility_guard(variants)
+    _seeds = [int(x) for x in (cfg.get('seeds') or [0])]
+    _repro_seeds = list(dict.fromkeys([_seeds[0], _seeds[-1]]))
+    try:
+        _repro = L.reproducibility_guard(variants, arch=arch, train_ids=train_ids,
+                                         vocab=vocab, mlp_ratio=ratios,
+                                         seq_len=probe_seq, batch_size=2,
+                                         seeds=_repro_seeds,
+                                         strict=L._is_confirmatory_cfg(cfg))
+    except RuntimeError as _fe:
+        _reports = [dict(r) for k, r in L._REPRO_REPORTS.items() if k[0] in set(variants)]
+        L.atomic_write_json(os.path.join(cfg['outdir'], 'reproducibility.json'), {
+            'kind': 'duplicate_run_reproducibility_panel', 'stage': 'gapfill_preflight',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'run_cfg': _pfp,
+            'passed': False, 'error': f'{_fe}', 'provenance': _prov,
+            'reports': _reports,
+        })
+        L.log_experiment_event(cfg['outdir'], {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'gapfill_repro', 'run_cfg': _pfp, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'error': f'{_fe}', 'reproducibility': {'passed': False, 'n_reports': len(_reports)}})
+        raise
     if _repro:
         L.atomic_write_json(os.path.join(cfg['outdir'], 'reproducibility.json'), {
             'kind': 'duplicate_run_reproducibility_panel',
             'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'run_cfg': _pfp,
             'passed': all(bool(r.get('passed')) for r in _repro),
             'provenance': _prov,
             'reports': _repro,
         })
-    L.log_experiment_event(cfg['outdir'], {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and all(bool(r.get('passed')) for r in _repro) else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': {'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro)}})
+    L.log_experiment_event(cfg['outdir'], {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and all(bool(r.get('passed')) for r in _repro) else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'run_cfg': _pfp, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': {'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro)}})
     if not ok:
         _bad = [r['variant'] for r in reports if not r['passed']]
         raise RuntimeError(f'small-batch overfit sanity check FAILED for {_bad} — do NOT start the full run; this points at a gradient/loss/label plumbing fault (see {cfg["outdir"]}/overfit_sanity.json)')

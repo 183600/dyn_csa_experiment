@@ -69,7 +69,13 @@ python build_report.py           # rebuild the report from on-disk results_*/ + 
 
 ```bash
 # 0) environment — Python 3.12 (see pyproject.toml / requirements.txt):
-pip install -r requirements.txt
+#    For the verified CPU test/reproduction environment use the lock (includes torch):
+pip install -r requirements.lock
+#    On a CUDA box install the matching torch wheel first, then the ranges:
+#      python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch
+#      pip install -r requirements.txt
+#    Regenerate and archive a machine-specific lock with `python -m pip freeze > requirements.lock`;
+#    requirements.lock records the verified CPU environment, not the paper-scale CUDA one.
 # The code no longer pip-installs at import time.  Set CSA_AUTO_INSTALL=1 only
 # for a throwaway environment.  The Hugging Face mirror is opt-in via
 # CSA_HF_MIRROR=1; the default endpoint is the official Hub.

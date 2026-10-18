@@ -57,9 +57,16 @@ python build_report.py           # 从落盘的 results_*/ + analysis_*/ 重建�
 
 ```bash
 # 0) 环境 — Python 3.12（见 pyproject.toml / requirements.txt）：
-pip install datasets tokenizers matplotlib
-# （代码在 import 时也会自行安装；exp_lib.py 内把 HF_ENDPOINT 指向
-#  hf-mirror.com——中国大陆以外请自行修改）
+#    CPU 复现/测试请使用已验证的 lock（含 torch）：
+pip install -r requirements.lock
+#    CUDA 机器请按本机 CUDA 版本先装 torch，再安装其余依赖：
+#      python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch
+#      pip install -r requirements.txt
+#    随后用 `python -m pip freeze > requirements.lock` 生成本机 lock 并归档；
+#    requirements.lock 记录的是已验证的 CPU 环境，不是论文规模的 CUDA 环境。
+# 代码不再在 import 时自动安装依赖；如确需临时环境可显式设置
+# CSA_AUTO_INSTALL=1。Hugging Face 镜像为 opt-in（CSA_HF_MIRROR=1），
+# 默认走官方 Hub。
 #
 # 如果 Hub 不可达，`load_wikitext` 会回退到本地原始文本：
 # 将 `WT103_RAW_TXT` 指向包含 `wiki.train.raw` / `wiki.valid.raw` 的目录
