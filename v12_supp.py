@@ -217,7 +217,21 @@ def _load_manifest(path):
     return m
 
 
+_FILE_SHA_CACHE = {}
+
 def _file_sha256(path, chunk=1 << 20):
+    # Checkpoints are multi-GB and the same path is hashed once per (arm, seed)
+    # on resume.  Bind the digest to (size, mtime_ns) so an unchanged file is
+    # not re-read, while any rewrite still forces a fresh hash.
+    try:
+        _st = os.stat(path)
+        _key = (os.path.abspath(path), int(getattr(_st, 'st_size', 0)),
+                int(getattr(_st, 'st_mtime_ns', int(_st.st_mtime * 1e9))))
+        _hit = _FILE_SHA_CACHE.get(_key)
+        if _hit is not None:
+            return _hit
+    except OSError:
+        _key = None
     h = hashlib.sha256()
     with open(path, 'rb') as f:
         while True:
@@ -225,7 +239,12 @@ def _file_sha256(path, chunk=1 << 20):
             if not b:
                 break
             h.update(b)
-    return h.hexdigest()
+    _sha = h.hexdigest()
+    if _key is not None:
+        if len(_FILE_SHA_CACHE) >= 64:
+            _FILE_SHA_CACHE.pop(next(iter(_FILE_SHA_CACHE)))
+        _FILE_SHA_CACHE[_key] = _sha
+    return _sha
 
 
 def _recipe_signature(manifest):

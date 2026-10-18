@@ -295,16 +295,16 @@ class HybridAttentionRoPE(L.HybridAttention):
             Za = x @ self.W_aZ
             Zb = x @ self.W_bZ if self.W_bZ is not None else None
         if cfg.kind == 'hca':
-            comp_kv, last_tok, Bn = L.pool_blocks_single(Ca_raw, Za, self.B_pos_a, bid, n_blocks=nblk, monotonic=True)
+            comp_kv, last_tok, Bn = L._pool_trainable(L.pool_blocks_single, Ca_raw, Za, self.B_pos_a, bid, n_blocks=nblk, monotonic=True)
         else:
-            comp_kv, last_tok, Bn = L.pool_variable_blocks(Ca_raw, Cb_raw, Za, Zb, bid, self.B_pos_a, self.B_pos_b, cfg.overlap, n_blocks=nblk, monotonic=True)
+            comp_kv, last_tok, Bn = L._pool_trainable(L.pool_variable_blocks, Ca_raw, Cb_raw, Za, Zb, bid, self.B_pos_a, self.B_pos_b, cfg.overlap, n_blocks=nblk, monotonic=True)
         index_kv = comp_kv
         attn_kv = torch.zeros_like(comp_kv) if cfg.content_mode == 'zero' else comp_kv
         if self._stats is not None:
             self._stats.append(torch.bincount(bid))
             if self._cuts is not None:
                 cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
-                self._cuts.append(cuts)
+                self._cuts.append(cuts.cpu() if cuts.device.type != 'cpu' else cuts)
         comp_n = self.kv_norm(attn_kv) if cfg.qk_norm else attn_kv
         qn = self.q_norm(q) if cfg.qk_norm else q
         sw_n = self.kv_norm(Ca_raw) if cfg.qk_norm else Ca_raw
@@ -333,8 +333,21 @@ class HybridAttentionRoPE(L.HybridAttention):
         # the valid slots with distinct columns and only the tail pads repeat
         # block 0 (already invalidated by sel_valid) — the keep mask is
         # identical to the computed form.
-        out = self._rope_attn(qn, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink, rd, soft=soft, sel_valid=sel_valid, topk_distinct=True)
+        out = self._rope_attn_trainable(qn, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink, rd, soft=soft, sel_valid=sel_valid, topk_distinct=True)
         return (self.W_o(out.reshape(T, nh * hd)), gate_mean)
+
+    def _rope_attn_trainable(self, *args, **kwargs):
+        # Same non-reentrant recompute contract as exp_lib._gathered_attention
+        # _trainable: _rope_attn is a pure function of its inputs with no RNG,
+        # so backward recomputes the same chunk decomposition and gradients are
+        # unchanged.  Without this, only the MLP-level checkpoint was active in
+        # v7 and every layer's gathered attention activations were retained.
+        q = args[0]
+        if torch.is_grad_enabled() and q.requires_grad:
+            return torch.utils.checkpoint.checkpoint(
+                self._rope_attn, *args, use_reentrant=False,
+                preserve_rng_state=False, **kwargs)
+        return self._rope_attn(*args, **kwargs)
 
     def _rope_attn(self, q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, sink, rope_dim, q_chunk=128, soft=None, rope_base=10000.0, mem_budget_bytes=None, sel_valid=None, topk_distinct=False):
         T, nh, hd = q.shape
@@ -499,14 +512,28 @@ class HybridAttentionRoPE(L.HybridAttention):
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                 is_causal=True, scale=scale).transpose(1, 2)
             return self.W_o(out.reshape(B, T, nh * hd))
-        out = torch.empty(B, T, nh, hd, device=x.device, dtype=q.dtype)
         row_chunk = L._full_attn_row_chunk(x.device, B, nh, T, q.element_size())
+        # Same whole-loop activation checkpoint as exp_lib._full_batched's
+        # sink/window path: the row loop is a pure, RNG-free function of its
+        # inputs, so backward recomputes the identical chunks instead of
+        # retaining every [B, rows, nh, T] logits/attention table.
+        if torch.is_grad_enabled() and q.requires_grad:
+            out = torch.utils.checkpoint.checkpoint(
+                self._dense_warmup_loop, q, k, v, mask, _use_full_mask, sink, win,
+                scale, row_chunk, use_reentrant=False, preserve_rng_state=False)
+        else:
+            out = self._dense_warmup_loop(q, k, v, mask, _use_full_mask, sink, win, scale, row_chunk)
+        return self.W_o(out.reshape(B, T, nh * hd))
+
+    def _dense_warmup_loop(self, q, k, v, mask, use_full_mask, sink, win, scale, row_chunk):
+        B, T, nh, hd = q.shape
+        out = torch.empty(B, T, nh, hd, device=q.device, dtype=q.dtype)
         for s in range(0, T, row_chunk):
             e = min(s + row_chunk, T)
             logits = torch.einsum('bthd,bshd->bths', q[:, s:e], k)
             if scale != 1.0:
                 logits.mul_(scale)
-            _mask_c = mask[s:e] if _use_full_mask else L._dense_causal_window_rows(T, win if win is not None else 0, s, e, x.device)
+            _mask_c = mask[s:e] if use_full_mask else L._dense_causal_window_rows(T, win if win is not None else 0, s, e, q.device)
             # bool masked-lane table -> fill: bit-identical logits to the
             # additive 0/-inf form (same lanes get -inf; x + 0.0 == x except
             # the sign of zero, whose exp is 1.0 either way).
@@ -517,7 +544,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             else:
                 attn, _sink_unused = L._sink_split_softmax(zflat, sink, want_sink=False)
             out[:, s:e] = torch.einsum('bths,bshd->bthd', attn.view(B, e - s, nh, T), v)
-        return self.W_o(out.reshape(B, T, nh * hd))
+        return out
 
     def forward(self, x):
         B, T, d = x.shape
@@ -792,6 +819,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     t0 = time.time()
     losses, ppl_hist, warm_hist, switch_ppl = ([], [], [], None)
     _lbuf = []
+    _ce_baseline = None
     # fixed-capacity window: the surviving window contents (and hence
     # final_loss_smoothed) are identical to the list form.
     _tail = collections.deque(maxlen=50)
@@ -832,9 +860,17 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             logits = None
             ce = model.ce_loss(x, y, vocab)
             _blp = getattr(model, 'boundary_logp', None)
+            _ce_d = None
             if _blp is not None:
+                # REINFORCE baseline kept on the device: no .item() before
+                # backward, so the step does not force a host sync while the CE
+                # graph is still live.  The baseline is updated after the
+                # optimizer step, matching exp_lib's post-backward policy.
+                _ce_d = ce.detach()
+                if _ce_baseline is None:
+                    _ce_baseline = _ce_d.new_zeros(())
                 _bdec = max(int(getattr(model, 'boundary_decisions', 0) or 0), 1)
-                loss = ce + comp_lambda * model.comp_reg + L.BOUNDARY_PG_COEF * (-float(ce.detach().item()) * _blp / _bdec)
+                loss = ce + comp_lambda * model.comp_reg + L.BOUNDARY_PG_COEF * (-(_ce_d - _ce_baseline) * _blp / _bdec)
             else:
                 loss = ce + comp_lambda * model.comp_reg
             loss.backward()
@@ -842,6 +878,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             opt.step()
             # No gradient is needed after the update.
             opt.zero_grad(set_to_none=True)
+            if _ce_d is not None:
+                _ce_baseline.mul_(0.99).add_(_ce_d, alpha=0.01)
             _lbuf.append(ce.detach())
             _tail.append(ce.detach())
             # Drop the step's graph references before the next forward;
@@ -1660,8 +1698,12 @@ def run_niah_phase(payload, guard=None, label=''):
                             niah_truncated = True
                             break
                         x, y = _batch()
-                        lg = model(x)
-                        ce = F.cross_entropy(lg[:, :-1].reshape(-1, vocab), y.reshape(-1), ignore_index=-100)
+                        # Chunked LM head + cross-entropy (the inherited
+                        # ce_loss path): the full [B, T, vocab] logits table is
+                        # never materialised, and each time chunk is recomputed
+                        # in backward.  Same targets/ignore_index and the same
+                        # scalar up to the documented chunked-reduction order.
+                        ce = model.ce_loss(x, y, vocab)
                         loss = ce + 0.05 * model.comp_reg
                         # Keep the detached scalar on the device and move a
                         # whole block at the cadence the other loops use: the
@@ -1832,12 +1874,28 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
             del x, nll_cols, _cum
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
+        _trunc_cache = {}
+        _val_width = int(np.asarray(val_ids).shape[1])
         for Ln in _trunc_lens:
-            trunc = False
+            Ln = int(Ln)
+            trunc = max_pos is not None and Ln > max_pos
+            # Identify the actual token slice, not just its length: for
+            # Ln > max_pos the evaluation uses the LAST max_pos tokens of the
+            # Ln-prefix, so two lengths can share a span but different rows.
+            # Only genuinely identical (start, end) slices are reused.
+            _end = min(Ln, _val_width)
+            _start = max(0, _end - int(max_pos)) if trunc else 0
+            _key = (_start, _end)
+            _cached = _trunc_cache.get(_key)
+            if _cached is not None:
+                if 'error' in _cached:
+                    out[Ln] = {'error': _cached['error']}
+                else:
+                    out[Ln] = {'ppl': _cached['ppl'], 'n_tok': _cached['n_tok'], 'truncated': trunc, 'eval_span': _cached['eval_span']}
+                continue
             ids = np.asarray(val_ids[:n_seq, :Ln], dtype=np.int64)
             if max_pos is not None and Ln > max_pos:
                 ids = ids[:, -max_pos:]
-                trunc = True
             try:
                 x = L._h2d_async(ids, torch.int64, device)
                 nll, ntok = (torch.zeros((), dtype=torch.float64, device=device), 0)
@@ -1862,12 +1920,16 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                     del _h, _nll_rows
                     _r += _chunk
                 ppl = math.exp(float(nll) / max(ntok, 1))
-                out[int(Ln)] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': int(x.shape[1])}
+                _ev_span = int(x.shape[1])
+                out[Ln] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': _ev_span}
+                _trunc_cache[_key] = {'ppl': float(ppl), 'n_tok': ntok, 'eval_span': _ev_span}
                 del x
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
             except Exception as e:
-                out[int(Ln)] = {'error': f'{type(e).__name__}: {e}'}
+                _err = f'{type(e).__name__}: {e}'
+                out[Ln] = {'error': _err}
+                _trunc_cache[_key] = {'error': _err}
     finally:
         for _a, _prev in zip(_reg_layers, _reg_prior):
             _a.need_reg = _prev

@@ -506,8 +506,24 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
     bids_cpu = []
     nblks = []
     hons = []
+    # Rows with identical cut masks produce identical integer geometry; run
+    # the host segmenter once per distinct row instead of once per batch row.
+    _uniq = []
+    _slot = []
     for _g in gate_lists:
-        _b, _nb, _hon = blocks_from_cuts(T, _g, min_block, max_block, _CPU_DEV, return_count=True, return_honoured=True)
+        _a = np.asarray(_g, dtype=bool)
+        for _j, _u in enumerate(_uniq):
+            if _a.shape == _u.shape and np.array_equal(_a, _u):
+                _slot.append(_j)
+                break
+        else:
+            _uniq.append(_a)
+            _slot.append(len(_uniq) - 1)
+    _cache = []
+    for _a in _uniq:
+        _cache.append(blocks_from_cuts(T, _a, min_block, max_block, _CPU_DEV, return_count=True, return_honoured=True))
+    for _j in _slot:
+        _b, _nb, _hon = _cache[_j]
         bids_cpu.append(_b)
         nblks.append(_nb)
         hons.append(_hon)
@@ -2878,7 +2894,10 @@ class HybridAttention(nn.Module):
                     self._cuts.append(np.cumsum(np.asarray(_cpu[0], dtype=np.int64))[:-1])
                 else:
                     cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
-                    self._cuts.append(cuts)
+                    # Host-boundary bookkeeping is eval-only; keeping the cut
+                    # table on the host avoids pinning one device tensor per
+                    # (layer, sequence) until the whole forward finishes.
+                    self._cuts.append(cuts.cpu() if cuts.device.type != 'cpu' else cuts)
         # Normalizing an all-zero content table is exactly zero (0/eps == 0),
         # so the zero-content ablation keeps the same values.
         core_kv = (torch.zeros_like(comp_kv) if cfg.content_mode == 'zero'
@@ -3375,6 +3394,35 @@ def _read_raw_rows(path):
 _IDS_FP_MEMO = {}
 _IDS_FP_MEMO_CAP = 4
 
+def _array_file_path(arr):
+    """Resolve the on-disk file backing a memmap (or a view of one).
+
+    The huge FineWeb caches are served as read-only memmap views; a sidecar
+    fingerprint next to that file lets every worker reuse the parent's digest
+    instead of re-reading the whole corpus, while remaining bound to the
+    file's size+mtime so a rebuilt cache can never reuse a stale digest."""
+    cur = arr
+    seen = set()
+    for _ in range(4):
+        fn = getattr(cur, 'filename', None)
+        if isinstance(fn, (str, bytes, os.PathLike)):
+            try:
+                fn = os.fspath(fn)
+                # Only the whole backing array may reuse the file's sidecar;
+                # a slice has a different digest and must be hashed itself.
+                same = (int(getattr(cur, 'nbytes', -1)) == int(arr.nbytes)
+                        and getattr(cur, 'shape', None) == getattr(arr, 'shape', None)
+                        and getattr(cur, 'strides', None) == getattr(arr, 'strides', None))
+                if same and os.path.isfile(fn):
+                    return fn
+            except OSError:
+                pass
+        cur = getattr(cur, 'base', None)
+        if cur is None or id(cur) in seen:
+            break
+        seen.add(id(cur))
+    return None
+
 def _ids_fp(train_ids):
     # Pure function of the token values, memoised on (data pointer,
     # layout) with a strong ref to the array (so the keyed pointer can
@@ -3390,6 +3438,25 @@ def _ids_fp(train_ids):
         _hit = _IDS_FP_MEMO.get(_key)
         if _hit is not None:
             return _hit[1]
+    _path = _array_file_path(train_ids)
+    _stat = None
+    _side = None
+    if _path is not None:
+        try:
+            _st = os.stat(_path)
+            _stat = (int(getattr(_st, 'st_size', 0)), int(getattr(_st, 'st_mtime_ns', int(_st.st_mtime * 1e9))))
+            _side = _path + '.idsfp.json'
+            with open(_side, encoding='utf-8') as _sf:
+                _rec = json.load(_sf)
+            if (int(_rec.get('size', -1)), int(_rec.get('mtime_ns', -1))) == _stat and isinstance(_rec.get('fp'), str):
+                _fp = _rec['fp']
+                if _key is not None:
+                    if len(_IDS_FP_MEMO) >= _IDS_FP_MEMO_CAP:
+                        _IDS_FP_MEMO.pop(next(iter(_IDS_FP_MEMO)))
+                    _IDS_FP_MEMO[_key] = (train_ids, _fp)
+                return _fp
+        except (OSError, ValueError, TypeError):
+            pass
     _h = hashlib.sha256()
     _mv = np.ascontiguousarray(train_ids)
     _widen = _mv.dtype in (np.dtype(np.uint8), np.dtype(np.uint16))
@@ -3404,6 +3471,11 @@ def _ids_fp(train_ids):
         if len(_IDS_FP_MEMO) >= _IDS_FP_MEMO_CAP:
             _IDS_FP_MEMO.pop(next(iter(_IDS_FP_MEMO)))
         _IDS_FP_MEMO[_key] = (train_ids, _fp)
+    if _side is not None and _stat is not None:
+        try:
+            atomic_write_json(_side, {'size': _stat[0], 'mtime_ns': _stat[1], 'fp': _fp})
+        except OSError:
+            pass
     return _fp
 
 def _validate_token_ids(ids, vocab, label='token ids'):
@@ -4485,18 +4557,24 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
             host = None
     if host is None:
         if device.type == 'cuda':
+            _narrow = _ids_narrow(train_ids)
             try:
-                # 只对不超过 _PINNED_HOST_CAP_BYTES 的语料做整份 pinned：
-                # 超过上限时直接用与 numpy 共享的普通宿主张量，每步 gather 后再经
-                # _h2d_async 的 pinned 暂存上传——取到的整数逐位相同（transport
-                # only）。
-                if train_ids.nbytes <= _PINNED_HOST_CAP_BYTES:
-                    host = torch.from_numpy(_ids_narrow(train_ids)).pin_memory()
+                # Only corpora within the cap are pinned in full.  Larger
+                # corpora are gathered from the source array in a prefetch
+                # thread (see below), so the per-step gather/disk read overlaps
+                # with GPU compute instead of blocking every step.  uint8/uint16
+                # gathers also use the NumPy path: PyTorch's CPU index kernels
+                # lack those dtypes, so pinning them would only move the failure
+                # to the first next().
+                if _narrow.dtype in (np.uint8, np.uint16):
+                    host_np = _narrow
+                elif train_ids.nbytes <= _PINNED_HOST_CAP_BYTES:
+                    host = torch.from_numpy(_narrow).pin_memory()
+                    _PINNED_HOST_CACHE['entry'] = (train_ids, host)
                 else:
-                    host = torch.from_numpy(_ids_narrow(train_ids))
-                _PINNED_HOST_CACHE['entry'] = (train_ids, host)
+                    host_np = _narrow
             except RuntimeError:
-                host = torch.from_numpy(_ids_narrow(train_ids))
+                host_np = _narrow
         else:
             _host_ids = _ids_narrow(train_ids)
             if _host_ids.dtype in (np.uint8, np.uint16):
@@ -4516,28 +4594,82 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     _idx_i32 = n + seq_len + 1 < 2 ** 31
     _idx_dt = np.int32 if _idx_i32 else np.int64
     cols = np.arange(seq_len + 1, dtype=_idx_dt)
-    # 复用一张 [B, seq_len+1] 索引缓冲（np.add out= 逐位同值；h2d 路径经
-    # _h2d_stage 的 pinned 暂存同步拷贝，下一轮的覆写发生在设备拷贝提交
-    # 之后；CPU 路径 host[idx] 则立即实现）。
     idx_np = np.empty((batch_size, seq_len + 1), dtype=_idx_dt)
-    while True:
-        starts = rng.integers(0, n + 1, size=batch_size, dtype=_idx_dt)
-        np.add(starts[:, None], cols[None, :], out=idx_np)
+
+    def _gather(idx):
         if host_np is not None:
-            ids = torch.from_numpy(host_np[idx_np])
-        else:
-            idx = torch.from_numpy(idx_np)
-            if host.device.type == 'cuda':
-                ids = host[_h2d_async(idx, idx.dtype, host.device)]
-            else:
-                ids = host[idx]
+            return torch.from_numpy(host_np[idx])
+        if host.device.type == 'cuda':
+            idx_t = torch.from_numpy(idx)
+            return host[_h2d_async(idx_t, idx_t.dtype, host.device)]
+        return host[idx]
+
+    def _prepare(ids):
         if ids.dtype != torch.int64:
             # widen back right after the gather: the yielded ids are
             # bit-identical to the int64 form.
             ids = ids.long()
         if ids.device != device:
             ids = _h2d_async(ids, ids.dtype, device)
-        yield (ids[:, :-1], ids[:, 1:])
+        return ids
+
+    # A CPU gather from a >4GB memmap is a synchronous read on the caller's
+    # thread today; each step therefore stalls the GPU for the whole random
+    # access.  A small bounded producer queue runs the identical seeded draw
+    # and gather one step ahead, so the next batch is ready while the current
+    # one trains.  Values and order are unchanged (same RNG, same indices).
+    _prefetch = device.type == 'cuda' and (host_np is not None or (host is not None and host.device.type == 'cpu'))
+    if not _prefetch:
+        while True:
+            starts = rng.integers(0, n + 1, size=batch_size, dtype=_idx_dt)
+            np.add(starts[:, None], cols[None, :], out=idx_np)
+            ids = _prepare(_gather(idx_np))
+            yield (ids[:, :-1], ids[:, 1:])
+
+    import queue as _queue
+    import threading as _threading
+    q = _queue.Queue(maxsize=2)
+    stop = _threading.Event()
+
+    def _producer():
+        try:
+            while not stop.is_set():
+                starts = rng.integers(0, n + 1, size=batch_size, dtype=_idx_dt)
+                np.add(starts[:, None], cols[None, :], out=idx_np)
+                item = _gather(idx_np)
+                while not stop.is_set():
+                    try:
+                        q.put((item, None), timeout=0.2)
+                        break
+                    except _queue.Full:
+                        continue
+        except BaseException as exc:
+            import traceback as _tb
+            try:
+                q.put((None, (exc, _tb.format_exc())))
+            except BaseException:
+                pass
+
+    th = _threading.Thread(target=_producer, name='batch-prefetch', daemon=True)
+    th.start()
+    try:
+        while True:
+            try:
+                item, err = q.get(timeout=0.2)
+            except _queue.Empty:
+                if stop.is_set() or not th.is_alive():
+                    return
+                continue
+            if err is not None:
+                exc, tb = err
+                if tb:
+                    raise RuntimeError(f'batch prefetch failed: {exc!r}\n{tb}') from exc
+                raise exc
+            ids = _prepare(item)
+            yield (ids[:, :-1], ids[:, 1:])
+    finally:
+        stop.set()
+        th.join(timeout=5.0)
 
 def count_params(m):
     return sum((p.numel() for p in m.parameters()))
@@ -8823,9 +8955,73 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
         'eval_subset': int(val_batch.shape[0]),
     }
 
+class _BlockStats:
+    """Incremental replacement for the per-sequence bincount list.
+
+    compression_report only needs the pooled mean/std/min/max/fractions over
+    block lengths, so retaining every sequence's count vector until the end of
+    a 64k-token forward wastes memory proportional to n_sample*n_layers*n_blocks.
+    Each append folds the integer counts into running moments and drops the
+    tensor immediately; values are accumulated in float64 so the pooled
+    statistics are at least as accurate as the concatenated float32 form."""
+
+    def __init__(self, min_block=None, max_block=None):
+        self.min_block = min_block
+        self.max_block = max_block
+        self.n = 0
+        self.total = 0
+        self.blocks = 0
+        self.s = 0.0
+        self.ss = 0.0
+        self.lo = None
+        self.hi = None
+        self.at_min = 0
+        self.at_max = 0
+
+    def append(self, t):
+        if torch.is_tensor(t):
+            t = t.detach().cpu()
+        a = np.asarray(t).reshape(-1)
+        if not a.size:
+            return
+        a = a.astype(np.float64, copy=False)
+        self.n += 1
+        self.blocks += int(a.size)
+        self.total += int(a.size)
+        self.s += float(a.sum())
+        self.ss += float(np.square(a).sum())
+        self.lo = float(a.min()) if self.lo is None else min(self.lo, float(a.min()))
+        self.hi = float(a.max()) if self.hi is None else max(self.hi, float(a.max()))
+        if self.min_block is not None:
+            self.at_min += int((a <= self.min_block).sum())
+        if self.max_block is not None:
+            self.at_max += int((a >= self.max_block).sum())
+
+    def __len__(self):
+        return self.n
+
+    def summary(self, seq_len):
+        if self.n == 0 or self.total == 0:
+            return None
+        mean = self.s / self.total
+        var = max(self.ss / self.total - mean * mean, 0.0)
+        return {
+            'blocks': self.blocks / self.n,
+            'avg_len': seq_len / max(self.blocks / self.n, 1.0),
+            'len_mean': mean,
+            'len_std': math.sqrt(var),
+            'len_min': int(self.lo),
+            'len_max': int(self.hi),
+            'frac_at_min': self.at_min / self.total,
+            'frac_at_max': self.at_max / self.total,
+        }
+
 def enable_block_stats(model, on):
     for blk in model.blocks:
-        blk.attn._stats = [] if on else None
+        if on:
+            blk.attn._stats = _BlockStats(getattr(blk.attn.cfg, 'min_block', None), getattr(blk.attn.cfg, 'max_block', None))
+        else:
+            blk.attn._stats = None
         blk.attn._cuts = [] if on else None
 
 def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None):
@@ -9265,12 +9461,17 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
         kind = attn.cfg.kind
         if st is None or kind == 'full' or len(st) == 0:
             continue
-        lens = torch.cat([t if torch.is_tensor(t) else torch.as_tensor(t) for t in st]).float()
-        n_blocks = sum((t.numel() for t in st)) / len(st)
-        _sc = torch.stack([lens.mean(), lens.std() if lens.numel() > 1 else torch.zeros((), device=lens.device, dtype=lens.dtype), lens.min().float(), lens.max().float(), (lens <= attn.cfg.min_block).float().mean(), (lens >= attn.cfg.max_block).float().mean()])
-        _vals = _sc.tolist()
-        entry = {'blocks': n_blocks, 'avg_len': seq_len / max(n_blocks, 1.0), 'len_mean': _vals[0], 'len_std': _vals[1], 'len_min': int(_vals[2]), 'len_max': int(_vals[3]), 'frac_at_min': _vals[4], 'frac_at_max': _vals[5]}
-        del _sc, _vals
+        if isinstance(st, _BlockStats):
+            entry = st.summary(seq_len)
+            if entry is None:
+                continue
+        else:
+            lens = torch.cat([t if torch.is_tensor(t) else torch.as_tensor(t) for t in st]).float()
+            n_blocks = sum((t.numel() for t in st)) / len(st)
+            _sc = torch.stack([lens.mean(), lens.std() if lens.numel() > 1 else torch.zeros((), device=lens.device, dtype=lens.dtype), lens.min().float(), lens.max().float(), (lens <= attn.cfg.min_block).float().mean(), (lens >= attn.cfg.max_block).float().mean()])
+            _vals = _sc.tolist()
+            entry = {'blocks': n_blocks, 'avg_len': seq_len / max(n_blocks, 1.0), 'len_mean': _vals[0], 'len_std': _vals[1], 'len_min': int(_vals[2]), 'len_max': int(_vals[3]), 'frac_at_min': _vals[4], 'frac_at_max': _vals[5]}
+            del _sc, _vals
         if attn.cfg.dynamic and getattr(attn, 'delta_logit', None) is not None:
             entry['delta'] = _dl_vals[li]
         if val_bnd is not None and attn._cuts:
@@ -11254,8 +11455,10 @@ def run_cell_job(job):
     # unpinned child would stamp a different run_cfg and break resume.
     if torch.cuda.is_available():
         _pin_cuda_determinism()
-    fp = _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch)
-    return _run_cell(cfg, job['v'], job['seed'], guard=guard, ratios={}, fp=fp, train_ids=train_ids, val_batch=val_batch, vocab=vocab, val_bnd=val_bnd, prebook=True)
+    # The parent already computed the identical fingerprint/provenance over
+    # this corpus; reuse them instead of re-reading every token in each child.
+    fp = job.get('fp') or _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch)
+    return _run_cell(cfg, job['v'], job['seed'], guard=guard, ratios={}, fp=fp, train_ids=train_ids, val_batch=val_batch, vocab=vocab, val_bnd=val_bnd, prebook=True, prov=job.get('prov'))
 
 
 def run(cfg=None, seeds=None, guard=None, label='', par=None):
@@ -11379,7 +11582,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             # cannot be imported by that name in the child, and plain
             # exp_lib matches that caller's patch state exactly.
             module = _par_ctx.get('module') or (_caller if _caller and _caller != '__main__' else 'exp_lib')
-            jobs = [dict(kind='run', module=module, label=label, cfg=cfg, v=v, seed=seed, guard_cap=(guard.cap_spec() if guard is not None else None), ckpt_flag=bool(_par_ctx.get('ckpt_flag')), ckpt_install=bool(_par_ctx.get('ckpt_install'))) for v, seed in cells]
+            jobs = [dict(kind='run', module=module, label=label, cfg=cfg, v=v, seed=seed, guard_cap=(guard.cap_spec() if guard is not None else None), ckpt_flag=bool(_par_ctx.get('ckpt_flag')), ckpt_install=bool(_par_ctx.get('ckpt_install')), fp=fp, prov=prov) for v, seed in cells]
             results = _par.run_jobs(jobs, _par_ctx, phase_label=label or outdir)
             for r, (v, seed) in zip(results, cells):
                 if not r:

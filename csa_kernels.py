@@ -283,7 +283,16 @@ class PoolGeometry:
                                  ov_start_np, ov_len_np, starts_prev_np)):
             flat[_i * R * Bm:(_i + 1) * R * Bm] = _a.reshape(-1)
         flat[7 * R * Bm:] = nblk_np
-        _buf = torch.from_numpy(flat).to(device)
+        # Stage through the shared pinned H2D pool: the same int32 values are
+        # copied asynchronously (the source buffer is filled before commit), so
+        # a per-layer geometry upload no longer blocks the device.
+        import exp_lib as L
+        staged, commit = L._h2d_stage((int(flat.size),), torch.int32, device)
+        if staged is not None:
+            staged.numpy()[:] = flat
+            _buf = commit()
+        else:
+            _buf = torch.from_numpy(flat).to(device)
         _v = _buf[:7 * R * Bm].view(7, R, Bm)
         self.R, self.Bm, self.T = R, Bm, T
         self.counts = _v[0]
@@ -952,8 +961,18 @@ def _warn_shape_fallback(op, detail):
 
 def _indexer_impl_for_shape(impl, kI):
     if impl == 'triton' and int(kI.shape[1]) > 8192:
-        _warn_shape_fallback('indexer', f'Bm={int(kI.shape[1])} exceeds the Triton register/lane limit 8192')
-        return 'ref'
+        # Silent fallback made a long-context panel quietly switch backends, so
+        # its G0 throughput/memory numbers were no longer comparable.  Refuse
+        # by default; an explicit opt-in keeps the torch twin available for
+        # debugging/CPU runs (and the reference twin remains the documented
+        # backend for every shape there).
+        if os.environ.get('CSA_INDEXER_ALLOW_REF', '').strip().lower() in ('1', 'true', 'yes'):
+            _warn_shape_fallback('indexer', f'Bm={int(kI.shape[1])} exceeds the Triton register/lane limit 8192 (CSA_INDEXER_ALLOW_REF=1)')
+            return 'ref'
+        raise RuntimeError(
+            f'Triton indexer cannot handle Bm={int(kI.shape[1])} > 8192 (register/lane limit). '
+            'Use CSA_KERNEL=ref (explicit torch-reference backend) for this sequence length, '
+            'or set CSA_INDEXER_ALLOW_REF=1 to explicitly accept the automatic fallback.')
     return impl
 
 
@@ -2348,7 +2367,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
             attn._stats.append(torch.bincount(bid_full[_b]))
         if attn._cuts is not None:
             for _b in range(B):
-                attn._cuts.append((bid_full[_b, 1:] != bid_full[_b, :-1]).nonzero(as_tuple=True)[0] + 1)
+                attn._cuts.append(((bid_full[_b, 1:] != bid_full[_b, :-1]).nonzero(as_tuple=True)[0] + 1).cpu())
     overlap = cfg.overlap if cfg.kind == 'csa' else None
     geom = _pool_geometry_cached(counts_rows, overlap, T, dev, cfg.max_block)
     Ca = pre_all['Ca']
@@ -2412,7 +2431,10 @@ def _gate_mean_batched(attn, cfg, T, B, gate_sigs, hons, nblks):
         return torch.zeros((), device=attn.B_pos_a.device if attn.B_pos_a is not None else torch.device('cpu'))
     gate_stack = torch.stack([gs[0] for gs in gate_sigs], 0)
     hon_stack = torch.stack(list(hons), 0).to(gate_stack.dtype)
-    nblk_t = torch.tensor([float(nb - 1) for nb in nblks], device=gate_stack.device, dtype=gate_stack.dtype)
+    # Stage the small host-side block-count table through the pinned pool so
+    # this per-layer upload does not add a blocking H2D sync each step.
+    import exp_lib as L
+    nblk_t = L._h2d_async([float(nb - 1) for nb in nblks], gate_stack.dtype, gate_stack.device)
     shs = (gate_stack * hon_stack).sum(dim=1)
     per_row = (nblk_t + shs - shs.detach()) / T
     gm = per_row.sum() / B
