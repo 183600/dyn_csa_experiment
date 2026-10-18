@@ -11,7 +11,8 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
 子命令：
   params   零 GPU：按 SmallGPT 实例化统计 S1–S4 的 csa_dynamic 参数量
            （32k 词表；S4 按规划的解析外推口径），对照 §5 的规划值；
-           只打印，不写任何文件。
+           写入 results_m0_params/params_audit.json（含代码/环境/git 溯源
+           戳与 experiments.jsonl 记录），同时打印。
   data     构建 / 校验 FineWeb-Edu 缓存（默认 cap = S1 的 5B token；
            M0_TOKENS 可覆盖，例如 M0_TOKENS=15000000000 先落全量缓存）。
   smoke    端到端自检：微型模型 @ seq 8192 走完 fineweb 数据路径、
@@ -115,7 +116,13 @@ def _ladder_params(name):
 
 _PLAN_PARAMS = {'S1': 0.14e9, 'S2': 0.26e9, 'S3': 0.62e9, 'S4': 1.3e9}
 
-def run_params():
+def run_params(outdir='results_m0_params'):
+    """S1–S4 参数量审计：SmallGPT 实例化统计（S1 全量对拍，S2–S4 均匀层组合，
+    S4 即规划的解析外推口径），对照 docs/compute_plan.md §5 的规划值。
+
+    结果连同代码/环境/git 溯源戳写入 `outdir/params_audit.json` 并登记
+    experiments.jsonl——参数量是 §5 预算核对的可引用数字，只打印不留痕
+    就无法追溯是哪一版代码算出的（本函数原为 console-only）。"""
     print(f'[params] SmallGPT(csa_dynamic) @ vocab={L.B_VOCAB} seq={L.RUN_S1["seq_len"]} — 实例化统计（S1 全量对拍，S2–S4 均匀层组合，S4 即规划的解析外推口径）\n')
     sc1 = L.SCALE_LADDER['S1']
     with torch.random.fork_rng():
@@ -129,12 +136,22 @@ def run_params():
         raise AssertionError(f'[params] 均匀层组合 {n_s1:,} != S1 全量实例化 {n_full:,} — 外推恒等式被破坏，停止输出（修 make_layer_cfgs / SmallGPT 的逐层同构性之后再算）')
     print(f'[params] self-check: S1 full instantiation = {n_full:,} == uniform-layer composition  OK\n')
     print(f"{'档':<4}{'配置':<28}{'参数量':>16}{'规划值(§5)':>14}{'比值':>8}")
+    tiers = []
     for name in ('S1', 'S2', 'S3', 'S4'):
         sc = L.SCALE_LADDER[name]
         n, _pl = _ladder_params(name)
         cfg_txt = f"d={sc['d']}/{sc['n_layers']}L/{sc['n_heads']}H/dh={sc['d_head']}"
         print(f"{name:<4}{cfg_txt:<28}{n:>16,}{_PLAN_PARAMS[name] / 1e9:>12.2f}B{n / _PLAN_PARAMS[name]:>8.2f}")
+        tiers.append({'tier': name, 'config': {'d': sc['d'], 'n_layers': sc['n_layers'], 'n_heads': sc['n_heads'], 'd_head': sc['d_head']}, 'params': int(n), 'plan_params': _PLAN_PARAMS[name], 'ratio_to_plan': n / _PLAN_PARAMS[name]})
     print('\n[params] 规划值来自 docs/compute_plan.md §5（约 0.14B / 0.26B / 0.62B / 1.3B）；差异超过两成即需要回改阶梯配置或修订规划。')
+    os.makedirs(outdir, exist_ok=True)
+    L.stamped_analysis('m0_params_audit', {
+        'vocab': int(L.B_VOCAB), 'seq_len': int(L.RUN_S1['seq_len']),
+        'method': 'SmallGPT instantiation count; S1 verified against a full instantiation, S2-S4 by uniform-layer composition (S4 = the planned analytic extrapolation)',
+        'self_check': {'s1_full_instantiation': int(n_full), 's1_uniform_layer_composition': int(n_s1), 'passed': bool(n_s1 == n_full)},
+        'plan_source': 'docs/compute_plan.md §5', 'tiers': tiers,
+    }, outdir=outdir, name='params_audit.json')
+    print(f'[params] wrote {outdir}/params_audit.json (stamped: code + git provenance + environment)')
 
 def run_data():
     tokens = int(os.environ.get('M0_TOKENS') or L.RUN_S1['n_train_tokens'])
@@ -144,13 +161,18 @@ def run_data():
     print(f'\n[m0-data] cache READY: train tokens = {len(train_ids):,}  vocab = {vocab}  val sequences = {val_batch.shape[0]}  (built/verified in {dt / 60:.1f} min)')
     print(f'[m0-data] 供 full / smoke 直接复用；离线重建用 FWEDU_LOCAL_JSONL，换 cap 用 M0_TOKENS（新 cap = 新缓存文件，旧面板指纹不受影响）')
 
-def run_overfit_check(variants=None, steps=250):
+def run_overfit_check(variants=None, steps=250, arch=None):
     """Pre-flight small-batch overfit check on synthetic ids (independent of
     the corpus, so it cannot be blocked by a 5B-token cache build).  A failure
-    is a hard stop before any panel is allowed to start."""
+    is a hard stop before any panel is allowed to start.
+
+    `arch` optionally probes the architecture family the panel is about to
+    train (S1: d=768/12L/12H/dh64): a head/layer-geometry bug that the tiny
+    default probe (d=64/2L/4H) can never see is caught before the expensive
+    panel starts.  Unset = the default tiny probe."""
     variants = list(variants or L.B_ARMS)
     print(f'\n[overfit] small-batch sanity check: {len(variants)} variant(s), wd=0, comp_lambda=0, no augmentation')
-    reports = L.overfit_guard(variants, steps=int(steps), vocab=256)
+    reports = L.overfit_guard(variants, steps=int(steps), vocab=256, arch=arch)
     if not reports:
         return []
     ok = all(r['passed'] for r in reports)

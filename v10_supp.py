@@ -481,6 +481,14 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     if val_ids is None:
         L.set_seed(int(seed))
         val_ids = L.load_wikitext(max(train_len, need), 4000000)[1]
+    # Fingerprint of the corpus this cell actually SCORES (probe_params records
+    # only the shape/config: n_seq, target, vocab, val_seq_len).  Stored on the
+    # record and checked forward-compatibly below: a stored record that carries
+    # a val_fp differing from the current slice is stale and re-measured, while
+    # legacy records without the field keep their historical resume behaviour.
+    # v12 reuses this cell with val_ids=test_ids, so the frozen test slice gets
+    # the same per-record fingerprint.
+    _val_fp = L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))
     if mech_summ is None:
         mech_summ = {}
         _msp = os.path.join(cfg.get('outdir') or P3MT_PAYLOAD['outdir'], 'summary.json')
@@ -522,7 +530,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
 
     def _cell_stale(_key, _fp_x, _summary=None, _mode='uniform'):
         _rec = (_summary if _summary is not None else L.locked_json_read(spath)).get(_key)
-        return not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_x, _mode) and (_rec or {}).get('recipe') == _ck_recipe)
+        return not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_x, _mode) and (_rec or {}).get('recipe') == _ck_recipe and ((_rec or {}).get('val_fp') is None or (_rec or {}).get('val_fp') == _val_fp))
     _vocab_ck = int(d.get('vocab', 8192))
     if cfg.get('vocab') is not None and int(cfg['vocab']) != _vocab_ck:
         print(f"[p3mp] {v} s{seed}: probe cfg vocab={int(cfg['vocab'])} differs from the checkpoint's vocab={_vocab_ck} — using the checkpoint's (the model is what is being scored)")
@@ -537,7 +545,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
 
     def _niah_stale(_key, _summary_n, _fp_n=None):
         _rec = (_summary_n or {}).get(_key)
-        return not (isinstance(_rec, dict) and (_rec.get('task') == 'niah_natural') and (isinstance(_rec.get('acc'), (int, float)) and (not isinstance(_rec.get('acc'), bool)) and math.isfinite(float(_rec['acc']))) and (isinstance(_rec.get('nll'), (int, float)) and (not isinstance(_rec.get('nll'), bool)) and math.isfinite(float(_rec['nll']))) and _rec.get('_code') == V.CKPT_CODE and _rec.get('probe_params') == (_niah_fp_of('clean') if _fp_n is None else _fp_n) and _rec.get('recipe') == _ck_recipe)
+        return not (isinstance(_rec, dict) and (_rec.get('task') == 'niah_natural') and (isinstance(_rec.get('acc'), (int, float)) and (not isinstance(_rec.get('acc'), bool)) and math.isfinite(float(_rec['acc']))) and (isinstance(_rec.get('nll'), (int, float)) and (not isinstance(_rec.get('nll'), bool)) and math.isfinite(float(_rec['nll']))) and _rec.get('_code') == V.CKPT_CODE and _rec.get('probe_params') == (_niah_fp_of('clean') if _fp_n is None else _fp_n) and _rec.get('recipe') == _ck_recipe and (_rec.get('val_fp') is None or _rec.get('val_fp') == _val_fp))
     _summary = L.locked_json_read(spath)
     _summary_n = L.locked_json_read(_nspath) if _nspath else {}
     _todo = False
@@ -611,7 +619,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             per_seq = [float('inf') if s / t > 709.0 else math.exp(s / t) for s, t in zip(nll_sum, n_tok)]
             _fp_base = _probe_fp_for_mode(_fp, _pcfg, mode)
             _fp_rec = dict(_fp_base, mode=mode) if mode != 'uniform' else _fp_base
-            _pending[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], '_code': V.CKPT_CODE, 'probe_params': _fp_rec, 'recipe': _ck_recipe}
+            _pending[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _fp_rec, 'recipe': _ck_recipe}
             _log_metrics[key] = {'ppl_mean': float(cell_ppl), 'n_seq': len(per_seq)}
             print(f'  [p3mp] {key:44s} PPL={cell_ppl:8.2f}', flush=True)
             if _ci % 8 == 0:
@@ -622,7 +630,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         for Ln, cond in _niah_cells:
             res = _niah_ppls(model, val_ids, Ln, _pcfg['n_seq'], _pcfg, cond, row_cache=_row_cache, chunk_mem=_chunk_mem)
             key = _niah_cell_key(v, seed, arm, Ln, cond)
-            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), '_code': V.CKPT_CODE, 'probe_params': _niah_fp_of(cond), 'recipe': _ck_recipe}
+            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _niah_fp_of(cond), 'recipe': _ck_recipe}
             L.locked_json_update(_nspath, (lambda s, _p=dict({key: rec}): (s.update(_p), s)[1]), indent=1)
             _log_metrics[key] = {'acc': float(rec['acc']), 'nll': float(rec['nll']), 'n_queries': int(rec['n_queries'])}
             print(f"  [niah] {key:48s} acc={rec['acc']:.3f} nll={rec['nll']:.3f}", flush=True)
@@ -640,6 +648,9 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             'hyperparams': _tr.get('hyperparams'),
             'data_fp': _tr.get('data_fp'), 'val_fp': _tr.get('val_fp'),
             'rng_fp': _tr.get('rng_fp'),
+            # the corpus THIS probe scored (training fingerprints above
+            # describe the weights; this one describes the measurement input)
+            'probe_val_fp': _val_fp,
             'metrics': {'n_probe_cells': len(_log_metrics),
                         'probe_results': _log_metrics},
             'losses': _tr.get('losses'), 'ppl_history': _tr.get('ppl_history'),
@@ -1460,7 +1471,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
     panel = V8._panel_block
     scale_conf = _equal_token_slices()
     out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale_confounds': scale_conf, 'seq2k_bs1_panel': panel(seq2k), 'comparisons': comparisons}
-    L.atomic_write_json(out, out_d, indent=2)
+    out_d = L.stamped_analysis('v10_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[v10 stats] wrote {out}')
     for k, v in comparisons.items():
         if 'omitted' in v:

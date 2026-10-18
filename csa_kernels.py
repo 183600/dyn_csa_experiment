@@ -2751,7 +2751,12 @@ def bench_attention(device, impl='triton', R=8, T=8192, nh=12, hd=64, topk=32, w
     （均按注意力项计数 / 墙钟）。
     """
     device = torch.device(device)
-    gen = torch.Generator().manual_seed(1234)
+    # Device-matched generator: on CPU this is bit-identical to the old
+    # torch.Generator() form, while a CPU generator handed to CUDA factory
+    # calls (or Tensor.normal_) is a device mismatch.  The benchmark is
+    # timing-only, so pinning every draw also makes repeated invocations
+    # reproducible instead of dependent on ambient RNG state.
+    gen = torch.Generator(device=device).manual_seed(1234)
     Bm = Bm or max(T // 4, topk + 1)
     q = F.normalize(torch.randn(R, T, nh, hd, generator=gen, device=device, dtype=dtype), dim=-1)
     k_blk = F.normalize(torch.randn(R, Bm, nh, hd, generator=gen, device=device, dtype=dtype), dim=-1)
@@ -2769,7 +2774,14 @@ def bench_attention(device, impl='triton', R=8, T=8192, nh=12, hd=64, topk=32, w
     def step():
         out = gathered_attention_kernel(q, k_blk, v_blk, sel, lt, k_sw, v_sw, win, 1.0,
                                         soft=soft, sink_logits=sink, sel_valid=valid, impl=impl)
-        g = torch.randn_like(out)
+        # Seed the backward gradient from the benchmark's own generator
+        # instead of the ambient global stream: randn_like draws from torch's
+        # default RNG, so repeated bench invocations in one process would
+        # otherwise consume (and depend on) unrelated RNG state.  The values
+        # never affect the timing being measured, but pinning them keeps the
+        # whole benchmark run-to-run reproducible.
+        g = torch.empty_like(out)
+        g.normal_(0.0, 1.0, generator=gen)
         out.backward(g)
         q.grad = None
         k_blk.grad = None

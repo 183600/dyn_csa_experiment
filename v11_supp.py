@@ -211,7 +211,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
     add('scale384: csa_fixed - full', scale384, 'csa_fixed', 'full', 'results_lm_v5_scale')
     add('scale384: csa_fixed - full_sw128_matched', scale384, 'csa_fixed', 'full_sw128_matched', 'results_lm_v5_scale')
     out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale384_panel': panel(scale384), 'comparisons': comparisons}
-    L.atomic_write_json(out, out_d, indent=2)
+    out_d = L.stamped_analysis('v11_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[v11 stats] wrote {out}')
     for k, v in contrasts_headline(probe).items():
         print(f'  {k:44s} Δ={v['mean']:+7.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}')

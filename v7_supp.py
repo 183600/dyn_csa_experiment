@@ -965,6 +965,12 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
                     summary[key]['_code'] = CKPT_CODE
                     summary[key]['run_cfg'] = fp
                     summary[key]['provenance'] = _prov
+                    # Same top-level traceability fields the exp_lib record
+                    # carries: run_manifest integrity counters and any reader
+                    # that audits a record without unwrapping `provenance`
+                    # need them at record level, not only nested.
+                    summary[key]['data_version'] = (_prov.get('data') or {}).get('data_version')
+                    summary[key]['val_fp'] = (_prov.get('data') or {}).get('val_fp')
                     summary[key]['hyperparams'] = _hp
                     summary[key]['run_id'] = _run_id
                     summary[key]['started_at'] = _started_at
@@ -978,7 +984,7 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
                 L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _run_id, 'status': 'truncated', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'key': key, 'variant': v, 'seed': int(seed), 'warm_steps': int(warm), 'run_cfg': fp, 'code': CKPT_CODE, 'reason': 'hard runtime cap reached; partial record not written'})
             elif isinstance(rec, dict) and not rec.get('cap_truncated'):
                 _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
-                L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - t_run, 'key': key, 'variant': v, 'seed': int(seed), 'warm_steps': int(warm), 'run_cfg': fp, 'code': CKPT_CODE, 'provenance': _prov, 'hyperparams': _hp, 'data_fp': rec.get('data_fp'), 'rng_fp': rec.get('rng_fp'), 'metrics': {'ppl': rec.get('ppl'), 'ppl_at_switch': rec.get('ppl_at_switch'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed')}, 'curve_summary': {'n_points': len(_losses), 'first': _losses[0] if _losses else None, 'last': _losses[-1] if _losses else None, 'best': min(_losses) if _losses else None}, 'losses': _losses, 'ppl_history': rec.get('ppl_history'), 'ppl_history_dense_prefix': rec.get('ppl_history_dense_prefix')})
+                L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - t_run, 'key': key, 'variant': v, 'seed': int(seed), 'warm_steps': int(warm), 'run_cfg': fp, 'code': CKPT_CODE, 'provenance': _prov, 'hyperparams': _hp, 'data_fp': rec.get('data_fp'), 'data_version': (_prov.get('data') or {}).get('data_version'), 'val_fp': (_prov.get('data') or {}).get('val_fp'), 'rng_fp': rec.get('rng_fp'), 'sanity_ref': ('overfit_sanity.json' if os.path.exists(os.path.join(outdir, 'overfit_sanity.json')) else None), 'metrics': {'ppl': rec.get('ppl'), 'ppl_at_switch': rec.get('ppl_at_switch'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed')}, 'curve_summary': {'n_points': len(_losses), 'first': _losses[0] if _losses else None, 'last': _losses[-1] if _losses else None, 'best': min(_losses) if _losses else None}, 'losses': _losses, 'ppl_history': rec.get('ppl_history'), 'ppl_history_dense_prefix': rec.get('ppl_history_dense_prefix')})
         except Exception as e:
             out['status'] = 'error'
             out['error'] = f'{e}'
@@ -1284,7 +1290,11 @@ def flops_analysis(outdir='analysis_v7', seq_lens=None):
     cross = next((r['seq_len'] for r in rows if r['csa_over_dense'] < 1.0), None)
     if cross is None:
         print('[flops] NOTE: under this accounting CSA is NOT cheaper than dense at any tested length — no crossover exists in this config; reporting None.')
-    L.atomic_write_json(os.path.join(outdir, 'flops_analytic.json'), {'config': {'d': d, 'heads': H, 'd_head': Dh, 'layers': L_layers, 'm': m, 'topk': k, 'window': w, 'm_hca': mph}, 'crossover_seq_len_csa_beats_dense': cross, 'rows': rows})
+    # The analytic crossover is a quotable claim (it reaches REPORT_v7.md and
+    # the README table), so the artifact carries the code/git provenance and a
+    # ledger entry like every measured panel — an unstamped json could not be
+    # told apart from one regenerated after a formula change.
+    L.stamped_analysis('flops_analytic', {'config': {'d': d, 'heads': H, 'd_head': Dh, 'layers': L_layers, 'm': m, 'topk': k, 'window': w, 'm_hca': mph}, 'crossover_seq_len_csa_beats_dense': cross, 'rows': rows}, outdir=outdir, name='flops_analytic.json')
     L.atomic_write_csv(os.path.join(outdir, 'flops_analytic.csv'), None, rows)
     _flops_plot(rows, outdir)
     print(f'[flops] crossover (CSA cheaper than dense) at seq = {cross}')
@@ -1426,7 +1436,7 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         res['n_skipped_config_mismatch'] = len(skipped)
         res['n_unstamped'] = unstamped
         out_d['comparisons'][name] = res
-    L.atomic_write_json(out, out_d)
+    out_d = L.stamped_analysis('v7_bootstrap_stats', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[stats] wrote {out}')
     for k, v in out_d['comparisons'].items():
         if 'omitted' in v:
@@ -1656,6 +1666,10 @@ def run_niah_phase(payload, guard=None, label=''):
                         s[_k] = _r
                         return s
                     L.locked_json_update(spath, _put_niah_err)
+                    # the failure is a measurement outcome too — it must reach
+                    # the ledger or the panel counts a cell that summary.json
+                    # shows as failed but experiments.jsonl never saw at all
+                    L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'status': 'error', 'key': key, 'variant': v, 'seed': int(seed), 'seq_len': int(Ln), 'code': CKPT_CODE, 'error': 'cuda_context_poisoned_before_eval'})
                     break
                 t0 = time.time()
                 try:
@@ -1672,6 +1686,12 @@ def run_niah_phase(payload, guard=None, label=''):
                     s[_k] = _r
                     return s
                 L.locked_json_update(spath, _put_niah)
+                # Every eval record that lands in summary.json must also reach
+                # the ledger: without this entry a NIAH accuracy would be a
+                # summary.json number with no trace of which code/weights
+                # produced it (the training cell above IS logged; the evals it
+                # produced used to be the gap).
+                L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'status': 'ok', 'key': key, 'variant': v, 'seed': int(seed), 'seq_len': int(Ln), 'code': CKPT_CODE, 'recipe': _ckp.get('recipe'), 'metrics': {'acc': r.get('acc'), 'n': r.get('n'), 'eval_span': r.get('eval_span'), 'params': r.get('params'), 'probe_s': r.get('probe_s')}})
             del model, _ckp
             gc.collect()
             torch.cuda.empty_cache()

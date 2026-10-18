@@ -388,6 +388,13 @@ def run_overfit(cfg=None, variants=None, steps=None):
     cfg = dict(L.RUN if cfg is None else cfg)
     cfg.setdefault('outdir', 'results_overfit_sanity')
     variants = list(variants or ['full', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic', 'hybrid_hca_dyn', 'csa_dyn_nocomp'])
+    # Seed BEFORE the corpus is served — this entry point can be the first
+    # thing a process runs (`run_gapfill.py overfit` / the first phase of
+    # `full`), and L.run()'s own pre-load set_seed is not reached yet.  The
+    # loaders are deterministic today, but the seeding contract (every
+    # corpus-construction path runs after a seed) must hold for this entry
+    # point too, exactly like it does inside L.run().
+    L.set_seed(int((cfg.get('seeds') or [0])[0]))
     train_ids, val_batch, vocab, _, _ = L.load_run_corpus(cfg)
     print(f'\n[overfit] small-batch sanity check: {len(variants)} variant(s), one fixed batch, wd=0, comp_lambda=0, no augmentation')
     reports = L.overfit_guard(variants, steps=int(steps or 300), train_ids=train_ids, vocab=vocab, force=True)

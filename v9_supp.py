@@ -175,7 +175,7 @@ def v9_analysis(out='analysis_v9/stats.json'):
     add('long20k(abs): csa_fixed - full', abs_long_f, 'csa_fixed', 'full', 'results_lm_v3_long')
     panel = V8._panel_block
     out_d = {'seq2k_bs1_panel': panel(seq2k), 'seq2k_bs3_panel_historical': panel(seq2k_v7), 'rope20k_panel': panel(rope20k), 'comparisons': comparisons}
-    L.atomic_write_json(out, out_d, indent=2)
+    out_d = L.stamped_analysis('v9_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[v9 stats] wrote {out}')
     for k, v in comparisons.items():
         if 'omitted' in v:

@@ -4302,6 +4302,36 @@ def log_experiment_event(outdir, event):
         print(f'[track] WARNING: could not append to {os.path.join(outdir, "experiments.jsonl")} ({type(_e).__name__}: {_e}) — the training record itself is unaffected')
         return None
 
+def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True):
+    """Return `payload` merged with the standard traceability stamp — and
+    optionally persist it plus an experiments.jsonl entry.
+
+    A derived number (statistic, audit verdict, analytic FLOPs table, kernel
+    validation report, parameter count) is quotable in a report only if the
+    artifact records WHICH code produced it, when, and under which
+    environment/git state — the same provenance spine a training record
+    carries.  Without this, re-deriving an analysis after a code change is
+    indistinguishable from re-deriving the original, and a stale artifact
+    silently masquerades as current.  `kind` identifies the artifact family;
+    `payload` is the analysis body; `outdir`+`name` persist the stamped record
+    atomically; `event` additionally appends a ledger entry so analysis runs
+    appear in the same experiments.jsonl trace as training panels.
+
+    The stamp overwrites its own keys (`kind`/`created_at`/`code`/
+    `provenance`), so re-stamping a loaded record on rewrite updates the
+    trace instead of accumulating stale copies."""
+    rec = dict(payload) if isinstance(payload, dict) else {'result': payload}
+    rec['kind'] = kind
+    rec['created_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    rec['code'] = code_stamp()
+    rec['provenance'] = code_provenance()
+    if outdir is not None and name:
+        path = os.path.join(outdir, name)
+        atomic_write_json(path, rec)
+        if event:
+            log_experiment_event(outdir, {'kind': 'analysis', 'tracking_schema': 2, 'artifact': name, 'created_at': rec['created_at'], 'code': rec['code'], 'label': kind, 'status': 'ok'})
+    return rec
+
 _PINNED_HOST_CACHE = {}
 # 整份 pinned 缓存的上限（见 batch_iter）：超出时改走普通宿主张量 + 每步
 # pinned 暂存上传。
@@ -7205,6 +7235,15 @@ def _data_version(data):
     blob = json.dumps(_jsonable(payload), sort_keys=True, separators=(',', ':'), ensure_ascii=True)
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
 
+def code_provenance():
+    """Code + environment provenance block, without any data section.
+
+    Shared by `experiment_provenance` (training/panel records, which append the
+    data fingerprints) and by `stamped_analysis` (derived/audit artifacts,
+    which have no data of their own — their inputs are other stamped records
+    or on-disk panels, so a `data` block here would be misleading)."""
+    return {'code': {'code_semantics': CODE_SEMANTICS, 'code_stamp': code_stamp(), 'kernel_stamp': _kernel_stamp(), **_git_provenance()}, 'environment': environment_snapshot()}
+
 def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
     """Everything needed to identify a panel: code version (semantic stamp
     + git commit + dirty-worktree digest), environment, and the exact data
@@ -7223,7 +7262,9 @@ def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
     if vocab is not None:
         data['vocab_size'] = int(vocab)
     data['data_version'] = _data_version(data)
-    return {'code': {'code_semantics': CODE_SEMANTICS, 'code_stamp': code_stamp(), 'kernel_stamp': _kernel_stamp(), **_git_provenance()}, 'environment': environment_snapshot(), 'data': data}
+    prov = code_provenance()
+    prov['data'] = data
+    return prov
 
 def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_ratio, data_version=None):
     """Structured hyper-parameter record (the run_cfg string stays the
@@ -8405,7 +8446,19 @@ _OVERFIT_REPORTS = {}
 
 _OVERFIT_ARCH = {'d': 64, 'n_layers': 2, 'n_heads': 4, 'd_head': 16}
 
-def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_loss, target_acc):
+def _probe_arch(arch=None):
+    """Effective probe architecture: the tiny default, overridden by the
+    caller-supplied keys (a scaling driver can probe the architecture family
+    it is about to train — d/n_heads/d_head geometry bugs that a 4-head probe
+    can never see are caught before the expensive panel starts)."""
+    _arch = dict(_OVERFIT_ARCH)
+    if arch:
+        for _k in _arch:
+            if arch.get(_k) is not None:
+                _arch[_k] = int(arch[_k])
+    return _arch
+
+def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_loss, target_acc, arch=None):
     """Exact probe configuration that a cached PASS is allowed to certify.
 
     A pass only proves that THIS tiny run can overfit (same step count, batch
@@ -8424,7 +8477,7 @@ def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_los
         'vocab': int(vocab),
         'target_loss': float(target_loss),
         'target_accuracy': float(target_acc),
-        'architecture': dict(_OVERFIT_ARCH),
+        'architecture': _probe_arch(arch),
         'code': code_stamp(),
     }
 
@@ -8437,14 +8490,18 @@ def overfit_reports(*, source=None):
     filtered to source 'synthetic' or 'data'.  Pure read for tracking."""
     return {k: dict(v) for k, v in _OVERFIT_REPORTS.items() if source is None or k[1] == source}
 
-def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, vocab=1024, train_ids=None, force=False, target_loss=0.05, target_acc=0.99):
+def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, vocab=1024, train_ids=None, force=False, target_loss=0.05, target_acc=0.99, arch=None):
     """Run `overfit_sanity_check` once per variant per process and hard-stop
     on failure.  Called automatically by `run()` before the first panel and by
     the length/checkpoint phases, so every training driver inherits the check.
 
     The in-process cache is keyed by the FULL probe configuration (seed, step
     count, shape, targets, architecture, code) as well as the corpus bytes, so
-    a lenient probe can never certify a stricter one.  `CSA_SKIP_OVERFIT=1` is
+    a lenient probe can never certify a stricter one.  `arch` optionally
+    overrides the probe architecture (d/n_layers/n_heads/d_head): pass the
+    panel's own geometry on the scale ladder so the probe exercises the same
+    head/layer shapes the real run will use; unset it for the tiny default
+    probe, whose cache keys are unchanged.  `CSA_SKIP_OVERFIT=1` is
     the explicit escape hatch (e.g. a diagnostic box with a deliberately broken
     batch); it prints a loud skip line instead.  Passing is necessary, not
     sufficient."""
@@ -8452,8 +8509,11 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
         print('[overfit] guard SKIPPED (CSA_SKIP_OVERFIT is set) — this run has no small-batch safety check')
         return []
     src = 'data' if train_ids is not None else 'synthetic'
-    _probe_cfg = _overfit_probe_config(seed=seed, steps=steps, seq_len=seq_len, batch_size=batch_size, vocab=vocab, target_loss=target_loss, target_acc=target_acc)
+    _arch = _probe_arch(arch)
+    _probe_cfg = _overfit_probe_config(seed=seed, steps=steps, seq_len=seq_len, batch_size=batch_size, vocab=vocab, target_loss=target_loss, target_acc=target_acc, arch=_arch)
     _cfg_key = _overfit_probe_digest(_probe_cfg)
+    if _arch != _OVERFIT_ARCH:
+        print(f"[overfit] probe architecture override: d={_arch['d']} n_layers={_arch['n_layers']} n_heads={_arch['n_heads']} d_head={_arch['d_head']} (default tiny probe is d={_OVERFIT_ARCH['d']}/{_OVERFIT_ARCH['n_layers']}L/{_OVERFIT_ARCH['n_heads']}H)" )
     # The data cache key keeps the vocab + token fingerprint in the first two
     # trailing slots (run() recovers them to rebuild the panel evidence) and
     # appends the probe-config digest.  A pass on corpus A can never certify
@@ -8479,7 +8539,7 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
         return []
     reports = []
     for v in todo:
-        r = overfit_sanity_check(v, seed=seed, steps=steps, d=_OVERFIT_ARCH['d'], n_layers=_OVERFIT_ARCH['n_layers'], n_heads=_OVERFIT_ARCH['n_heads'], d_head=_OVERFIT_ARCH['d_head'], seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=train_ids, target_loss=target_loss, target_acc=target_acc)
+        r = overfit_sanity_check(v, seed=seed, steps=steps, d=_arch['d'], n_layers=_arch['n_layers'], n_heads=_arch['n_heads'], d_head=_arch['d_head'], seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=train_ids, target_loss=target_loss, target_acc=target_acc)
         r['guard_probe_config'] = _probe_cfg
         r['guard_probe_key'] = _cfg_key
         _key = (v, 'data', *_data_key) if src == 'data' else (v, 'synthetic', _cfg_key)
@@ -9728,6 +9788,12 @@ def run_cell_job(job):
     if isinstance(_matched, (list, tuple)):
         cfg['matched'] = set(_matched)
     guard = TimeGuard(job['guard_cap']) if job.get('guard_cap') else None
+    # Seed the child BEFORE the corpus is served, exactly like run() does in
+    # the parent and like the v7/v10 child entries (run_warmup_cell_job /
+    # run_probe_cell_job) already do: today's loaders consume no RNG, but a
+    # future loader step that does (a sampled val slice, a DataLoader shuffle)
+    # must not silently become the one unseeded construction path.
+    set_seed(int(job['seed']))
     train_ids, val_batch, vocab, _, val_bnd = load_run_corpus(cfg)
     d = cfg.get('d', 256)
     n_layers = cfg.get('n_layers', 6)

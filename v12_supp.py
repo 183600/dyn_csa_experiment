@@ -722,7 +722,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             stats['doc_sampling_note'] = f'per-document rows recorded (n_docs={_n_doc}); between-doc variance is reported per comparison in doc_sampling — n_docs<64 does not cover the language-population distribution, population-level claims need a larger row panel'
     print(f'[p5t stats] admitted {len(admitted)}/{len(manifest["arms"]) * _n} frozen (arm, seed) cells on slice {str(unified_fp)[:12]}…; {len(_fam)} frozen primary comparison(s); {len(_rej)} survive Holm; {len(_conf)} also match the pre-registered direction')
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
-    L.atomic_write_json(out, stats, indent=2)
+    stats = L.stamped_analysis('finaltest_stats', stats, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[p5t stats] wrote {out}')
     return stats
 
@@ -733,7 +733,9 @@ def v12_analysis(out='analysis_v12/stats.json'):
     st = json.load(open(out, encoding='utf-8'))
     if os.path.exists(os.path.join(TEST_OUTDIR, 'bylen.json')):
         st['finaltest'] = finaltest_stats()
-        L.atomic_write_json(out, st, indent=2)
+        # this file's LAST writer is v12_analysis: re-stamp so the trace names
+        # the code that produced the final content, not the earlier v10 pass
+        st = L.stamped_analysis('v12_analysis', st, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     return st
 
 def _fmt_pm(cell):

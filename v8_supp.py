@@ -139,7 +139,7 @@ def v8_analysis(out='analysis_v8/stats.json'):
     add('rope20k: csa_fixed_rope - full_rope', rope20k, 'csa_fixed_rope', 'full_rope', 'results_lm_v8_rope20k')
     add('long20k(abs): csa_fixed - full', abs_long_f, 'csa_fixed', 'full', 'results_lm_v3_long')
     out_d = {'scale_panel': _panel_block(scale), 'rope20k_panel': _panel_block(rope20k), 'comparisons': comparisons}
-    L.atomic_write_json(out, out_d, indent=2)
+    out_d = L.stamped_analysis('v8_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[v8 stats] wrote {out}')
     for k, v in comparisons.items():
         if 'omitted' in v:

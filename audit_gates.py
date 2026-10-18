@@ -993,7 +993,13 @@ def run_report(out='audit_report.json'):
     L_atomic = None
     try:
         L = _import_exp_lib()
+        # The audit verdicts are quotable claims: stamp code/git provenance and
+        # append a ledger entry so an audit artifact regenerated after a code
+        # change is distinguishable from the original (the ledger lives under
+        # analysis_audit/; the artifact itself stays at the documented path).
+        res = L.stamped_analysis('audit_report', res)
         L.atomic_write_json(os.path.join(REPO, out), res, indent=2)
+        L.log_experiment_event('analysis_audit', {'kind': 'analysis', 'tracking_schema': 2, 'artifact': out, 'created_at': res.get('created_at'), 'code': res.get('code'), 'label': 'audit_report', 'status': 'ok', 'audits': sorted(k for k in res if k not in ('kind', 'created_at', 'code', 'provenance', 'generated_at'))})
         print(f'[audit] wrote {out}')
     except Exception as e:
         with open(os.path.join(REPO, out), 'w', encoding='utf-8') as f:
