@@ -219,6 +219,16 @@ def _load_manifest(path):
 
 _FILE_SHA_CACHE = {}
 
+
+def _file_sig(path):
+    """Cheap change detector for a checkpoint: (size, mtime_ns, ctime_ns, inode)."""
+    st = os.stat(path)
+    return (int(getattr(st, 'st_size', 0)),
+            int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9))),
+            int(getattr(st, 'st_ctime_ns', int(st.st_ctime * 1e9))),
+            int(getattr(st, 'st_ino', 0)))
+
+
 def _file_sha256(path, chunk=1 << 20):
     # Bind the digest to (size, mtime_ns) so an unchanged file is not re-read,
     # while any rewrite still forces a fresh hash.
@@ -513,13 +523,24 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
     _cur = L.locked_json_read(spath).get(f'{v}::s{seed}')
     _ck_sha = None
     try:
-        _ck_sha = _file_sha256(ck)
-    except Exception as _he:
-        print(f'[p5t] NOTE {v} s{seed}: could not hash the checkpoint file ({type(_he).__name__}: {_he}) — the record will carry ckpt_sha256=null (weaker binding)')
+        _ck_sig = _file_sig(ck)
+    except Exception:
+        _ck_sig = None
+
+    def _ensure_ck_sha():
+        nonlocal _ck_sha
+        if _ck_sha is None:
+            try:
+                _ck_sha = _file_sha256(ck)
+            except Exception as _he:
+                print(f'[p5t] NOTE {v} s{seed}: could not hash the checkpoint file ({type(_he).__name__}: {_he}) — the record will carry ckpt_sha256=null (weaker binding)')
+        return _ck_sha
 
     def _stale(rec):
         if not isinstance(rec, dict):
             return True
+        # All cheap identity checks first: a stale record must not pay for a
+        # full-file SHA-256 when it is going to be re-evaluated anyway.
         if rec.get('_code') != V.CKPT_CODE or rec.get('recipe') != _ck_recipe:
             return True
         if rec.get('data_fp') != _dfp:
@@ -530,19 +551,19 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
             return True
         if _msha is not None and rec.get('manifest_sha256') != _msha:
             return True  # the manifest changed after this record was written
-        # The record must belong to the SAME weights now on disk: a checkpoint
-        # regenerated at the same path under the same code/recipe would
-        # otherwise be silently evaluated by the old record's numbers.
-        _rec_sha = rec.get('ckpt_sha256')
-        # When the current checkpoint can be hashed, the record must carry the
-        # SAME hash.  A record with no stored hash (written when hashing was
-        # unavailable, or before this binding existed) cannot be shown to
-        # belong to the weights now on disk, so it is re-evaluated rather than
-        # silently resumed.
-        if _ck_sha is not None and _rec_sha != _ck_sha:
-            return True
         bl = rec.get('by_len') or {}
-        return not all((L.by_len_cells([rec], Ln) for Ln in eval_lens))
+        if not all((L.by_len_cells([rec], Ln) for Ln in eval_lens)):
+            return True
+        # The record must belong to the SAME weights now on disk.  A cheap
+        # (size, mtime_ns, ctime_ns, inode) signature recorded at write time
+        # settles the unchanged case without reading the checkpoint; only a
+        # missing/different signature needs the content hash.
+        if _ck_sig is not None and rec.get('ckpt_sig') == list(_ck_sig):
+            return False
+        _sha = _ensure_ck_sha()
+        if _sha is not None and rec.get('ckpt_sha256') != _sha:
+            return True
+        return False
     if not _stale(_cur):
         del d
         out['status'] = 'skipped_resume'
@@ -564,7 +585,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
     def _merge(summary):
         # by_len now also carries ppl_per_seq (per-document rows, review-2
         # issue 9b) straight from eval_length_gen; pooled ppl is unchanged.
-        summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params'), 'by_len': r, 'split': split, 'data_fp': _dfp, 'train_fp': _tr_train_fp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ck_sha}
+        summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params'), 'by_len': r, 'split': split, 'data_fp': _dfp, 'train_fp': _tr_train_fp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ensure_ck_sha(), 'ckpt_sig': (list(_ck_sig) if _ck_sig is not None else None)}
         print(f'  [p5t] {v:32s} s{seed} ' + '  '.join((f'L{k}={vv.get("ppl", float("nan")):.2f}' for k, vv in sorted(r.items()))))
         return summary
     L.locked_json_update(spath, _merge)

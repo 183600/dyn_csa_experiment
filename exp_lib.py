@@ -383,9 +383,12 @@ def _segment(n, want_cut_list, min_block, max_block):
 
 _H2D_POOL = {}
 _H2D_POOL_BYTES = [0]
-_H2D_POOL_CAP = 96 << 20
-_H2D_POOL_SLOTS = 4
-_H2D_POOL_MAX_ENTRIES = 256
+try:
+    _H2D_POOL_CAP = max(96, int(os.environ.get('CSA_H2D_POOL_MB', '512'))) << 20
+except (TypeError, ValueError):
+    _H2D_POOL_CAP = 512 << 20
+_H2D_POOL_SLOTS = 8
+_H2D_POOL_MAX_ENTRIES = 512
 # `batch_iter` prefetches on a producer thread, so staging-pool access is now
 # concurrent with the training thread.  A slot is reserved (`_H2D_BUSY`) from
 # the moment it is handed out until `commit()` records the copy event, which
@@ -496,6 +499,11 @@ def _h2d_async(host_src, dtype, device):
         if staged is not None:
             staged.copy_(t)
             return commit()
+        # A single upload larger than a quarter of the pool would pin (and
+        # keep alive) a huge staging block; a direct H2D copy from pageable
+        # memory avoids the extra pin/copy cycle for that rare case.
+        if t.nbytes * 4 > _H2D_POOL_CAP:
+            return t.to(device)
         try:
             t = t.pin_memory()
         except RuntimeError:
@@ -608,13 +616,13 @@ def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=Fals
 def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
-    # 闭式因果分位数按行分块；超限时 fail-fast（见下方 row_chunk）。
+    # 闭式因果分位数按 (行, 列) 分块；分块是纯行/列划分，每个输出元素仍由
+    # 同一个排序后因果行上的同两个秩插值得到，值不变。
     n = sim.shape[-1]
-    _rows_total = int(sim.shape[0]) if sim.dim() == 2 else 1
-    _row_budget = 128 << 20
-    _row_chunk_est = max(1, _row_budget // max(n * n * 12, 1))
-    _peak_bytes = min(_rows_total, _row_chunk_est) * n * n * 12
-    if _peak_bytes > 1 << 30:
+    # O(T^2) per row becomes infeasible beyond the long-context band this
+    # segmenter is designed for; fail fast instead of attempting a multi-GB
+    # scratch table.
+    if int(n) > 8192:
         raise RuntimeError(
             'causal_adaptive_threshold 的因果分位数闭式为 O(rows·T²)，超出安全上限: '
             'adaptive 分段器不支持该序列长度——请改用 chunking="cosine_learnable"')
@@ -633,24 +641,29 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     hi_c = (lo + 1).clamp(max=n - 1)[..., None]
     use_hi = (frac > 0.0) & (lo + 1 <= idx)
     first_row = idx == 0
-    # row chunking keeps the per-chunk sort input bounded; the sort writes
-    # values back into `masked` and uses a reusable index scratch.
-    row_chunk = max(1, _row_budget // max(n * n * 12, 1))
-    _idx_scratch = torch.empty((row_chunk, n, n), device=x.device, dtype=torch.int64)
+    # Keep the per-sort scratch bounded: a sort materialises values plus an
+    # int64 index (12 bytes) on top of the 4-byte comparison table.  Column
+    # chunking also avoids ever materialising the full [rows, T, T] tensor.
+    _pair_bytes = 16
+    _budget = 128 << 20
+    col_chunk = max(1, min(int(n), 64))
+    row_chunk = max(1, _budget // max(col_chunk * int(n) * _pair_bytes, 1))
     out = torch.empty_like(x)
     for r0 in range(0, x.shape[0], row_chunk):
         b = min(row_chunk, x.shape[0] - r0)
-        masked = torch.where(idx[None, None, :] <= idx[None, :, None],
-                             x[r0:r0 + b, None, :], float('inf'))
-        try:
-            torch.sort(masked, dim=-1, out=(masked, _idx_scratch[:b]))
-        except RuntimeError:
+        xr = x[r0:r0 + b]
+        for c0 in range(0, n, col_chunk):
+            c1 = min(c0 + col_chunk, n)
+            cols = idx[c0:c1]
+            masked = torch.where(idx[None, None, :] <= cols[None, :, None],
+                                 xr[:, c0:c1, None], float('inf'))
             masked = masked.sort(dim=-1).values
-        lo_v = masked.gather(-1, lo_c.expand(b, n, 1)).squeeze(-1)
-        hi_v = masked.gather(-1, hi_c.expand(b, n, 1)).squeeze(-1)
-        interp = lo_v * (1.0 - frac) + hi_v * frac
-        oc = torch.where(use_hi, interp, lo_v)
-        out[r0:r0 + b] = torch.where(first_row, torch.full_like(oc, float('-inf')), oc)
+            lo_v = masked.gather(-1, lo_c[c0:c1].expand(b, c1 - c0, 1)).squeeze(-1)
+            hi_v = masked.gather(-1, hi_c[c0:c1].expand(b, c1 - c0, 1)).squeeze(-1)
+            interp = lo_v * (1.0 - frac[c0:c1]) + hi_v * frac[c0:c1]
+            oc = torch.where(use_hi[c0:c1], interp, lo_v)
+            out[r0:r0 + b, c0:c1] = torch.where(first_row[c0:c1],
+                                                torch.full_like(oc, float('-inf')), oc)
     out = out.to(sim.device)
     return out.squeeze(0) if squeeze else out
 
@@ -727,20 +740,46 @@ def _is_pinned_key(key):
     return key in _PINNED_KEYS
 _PINNED_KEYS = set()
 
+# Running per-cache byte totals.  Recomputing the total by walking every entry
+# on each insertion (and again after every eviction) turns cache maintenance
+# into O(n^2) once a long length/window sweep has produced many tables.
+_CACHE_STATS = {}
+
+
+def _cache_item_bytes(key, value, total_of):
+    n = _cache_bytes(value)
+    if total_of is _idx_cache_total:
+        n += 128 * len(key)
+    return n
+
+
+def _cache_stat(cache):
+    st = _CACHE_STATS.get(id(cache))
+    if st is None or st.get('obj') is not cache:
+        st = {'obj': cache, 'total': 0}
+        _CACHE_STATS[id(cache)] = st
+    return st
+
+
 def _evictable_limit(cache, limit, total_of):
-    pinned = sum((_cache_bytes(v) for k, v in cache.items() if _is_pinned_key(k)))
+    pinned = sum((_cache_bytes(cache[k]) for k in _PINNED_KEYS if k in cache))
     return limit - pinned if pinned < limit else 0
 
+
 def _cache_put(cache, key, tensor, limit, total_of):
+    st = _cache_stat(cache)
+    if key in cache:
+        st['total'] -= _cache_item_bytes(key, cache[key], total_of)
     cache[key] = tensor
-    total = total_of(cache)
+    st['total'] += _cache_item_bytes(key, tensor, total_of)
+    total = st['total']
     evictable = _evictable_limit(cache, limit, total_of)
     while total > limit and total > evictable and (len(cache) > 1):
         oldest = next((k for k in cache if not _is_pinned_key(k)), None)
         if oldest is None:
             break
-        cache.pop(oldest)
-        total = total_of(cache)
+        st['total'] -= _cache_item_bytes(oldest, cache.pop(oldest), total_of)
+        total = st['total']
     return total
 _ATB_CACHE = {}
 _ATB_EPOCH = 0
@@ -1212,21 +1251,23 @@ def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
     try:
         B = int(B)
         n = int(n)
-        counts_np = np.asarray(counts_l, dtype=np.int64)
+        counts_np = np.asarray(counts_l, dtype=np.int32)
         if counts_np.shape != (B,) or n <= 0:
             return None
         _ck = ('p', counts_np.tobytes(), B, -1 if ov is None else int(ov), n, int(pad_to))
         _hit = _pool_geom_content_get(_ck)
         if _hit is not None:
             return _hit
-        ends_np = np.cumsum(counts_np, dtype=np.int64)
+        ends_np = np.cumsum(counts_np, dtype=np.int32)
         nseg = 8 if ov is not None else 4
         total = nseg * B
         pad = (-total) % int(pad_to) if pad_to > 1 else 0
         # Flat layout: [counts | ends | starts | last_idx (| end_prev |
         # starts_prev | ov_start | ov_len)] followed by the zero pad; the
-        # integers uploaded are identical to the per-segment form.
-        flat = np.empty(total + pad, dtype=np.int64)
+        # integers uploaded are identical to the per-segment form.  Index
+        # transport is int32 (sequence lengths are far inside int32 range),
+        # halving the geometry bytes and the H2D transfer.
+        flat = np.empty(total + pad, dtype=np.int32)
         flat[0:B] = counts_np
         flat[B:2 * B] = ends_np
         starts_np = flat[2 * B:3 * B]
@@ -1292,21 +1333,21 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         W_b = max(int(ov_hi), 0)
         pa_rows = int(pa_rows)
         pb_rows = int(pb_rows)
-        counts_np = np.asarray(counts_l, dtype=np.int64)
+        counts_np = np.asarray(counts_l, dtype=np.int32)
         if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or pa_rows <= 0 or pb_rows <= 0:
             return None
         _ck = ('v', counts_np.tobytes(), B, ov, n, max_len, W_b, pa_rows, pb_rows, int(pad_to))
         _hit = _pool_geom_content_get(_ck)
         if _hit is not None:
             return _hit
-        ends_np = np.cumsum(counts_np, dtype=np.int64)
+        ends_np = np.cumsum(counts_np, dtype=np.int32)
         starts_np = ends_np - counts_np
-        pos = _np_range(max_len)
-        op = _np_range(W_b)
-        end_prev = np.empty(B, dtype=np.int64)
+        pos = _np_range(max_len).astype(np.int32, copy=False)
+        op = _np_range(W_b).astype(np.int32, copy=False)
+        end_prev = np.empty(B, dtype=np.int32)
         end_prev[0] = -1
         end_prev[1:] = ends_np[:-1]
-        starts_prev = np.empty(B, dtype=np.int64)
+        starts_prev = np.empty(B, dtype=np.int32)
         starts_prev[0] = 0
         starts_prev[1:] = starts_np[:-1]
         ov_start = np.maximum(end_prev - ov, starts_prev)
@@ -1317,7 +1358,7 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         # destinations.  Requested padding is part of the same allocation.
         _pi = (-(n_a + 2 * n_b + max_len)) % int(pad_to) if int(pad_to) > 1 else 0
         _pb = (-(n_a + n_b)) % int(pad_to) if int(pad_to) > 1 else 0
-        flat_i = np.empty(n_a + 2 * n_b + max_len + _pi, dtype=np.int64)
+        flat_i = np.empty(n_a + 2 * n_b + max_len + _pi, dtype=np.int32)
         flat_b = np.empty(n_a + n_b + _pb, dtype=np.bool_)
         gp = flat_i[0:n_a].reshape(B, max_len)
         np.add(starts_np[:, None], pos[None, :], out=gp)
@@ -1360,7 +1401,7 @@ def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, de
         B = int(B)
         flat_i, flat_b, n_a, n_b, W_b, max_len = _built
         # `_pool_geom_flat_var` already bucket-pads both flats.
-        buf = _h2d_async(flat_i, torch.long, dev)
+        buf = _h2d_async(flat_i, torch.int32, dev)
         g_a = buf[0:n_a].view(B, max_len)
         g_b = buf[n_a:n_a + n_b].view(B, W_b)
         b_off = buf[n_a + n_b:n_a + 2 * n_b].view(B, W_b)
@@ -1380,20 +1421,20 @@ def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
         n = int(n)
         max_len = int(max_len)
         p_rows = int(p_rows)
-        counts_np = np.asarray(counts_l, dtype=np.int64)
+        counts_np = np.asarray(counts_l, dtype=np.int32)
         if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or p_rows <= 0:
             return None
         _ck = ('s', counts_np.tobytes(), B, n, max_len, p_rows, int(pad_to))
         _hit = _pool_geom_content_get(_ck)
         if _hit is not None:
             return _hit
-        ends_np = np.cumsum(counts_np, dtype=np.int64)
+        ends_np = np.cumsum(counts_np, dtype=np.int32)
         starts_np = ends_np - counts_np
-        pos = _np_range(max_len)
+        pos = _np_range(max_len).astype(np.int32, copy=False)
         n_g = B * max_len
         _pi = (-(n_g + max_len)) % int(pad_to) if int(pad_to) > 1 else 0
         _pb = (-n_g) % int(pad_to) if int(pad_to) > 1 else 0
-        flat_i = np.empty(n_g + max_len + _pi, dtype=np.int64)
+        flat_i = np.empty(n_g + max_len + _pi, dtype=np.int32)
         mask_np = np.empty(n_g + _pb, dtype=np.bool_)
         gp = flat_i[0:n_g].reshape(B, max_len)
         np.add(starts_np[:, None], pos[None, :], out=gp)
@@ -1420,7 +1461,7 @@ def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
         B = int(B)
         flat_i, mask_np, n_g, max_len = _built
         # Both flats are already bucket-padded.
-        buf = _h2d_async(flat_i, torch.long, dev)
+        buf = _h2d_async(flat_i, torch.int32, dev)
         mask = _h2d_async(mask_np, torch.bool, dev)[:n_g].view(B, max_len)
         return (buf[0:n_g].view(B, max_len), mask, buf[n_g:n_g + max_len])
     except (RuntimeError, TypeError, ValueError, AttributeError):
@@ -1548,7 +1589,7 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
         _tot_b += len(_r[3][1].ravel())
     # One padded allocation per dtype class, filled row-by-row.  The pad tails
     # are never read.
-    flat_i = np.empty(_tot_i + (-_tot_i) % _POOL_GEOM_BUCKET, dtype=np.int64)
+    flat_i = np.empty(_tot_i + (-_tot_i) % _POOL_GEOM_BUCKET, dtype=np.int32)
     flat_b = np.empty(_tot_b + (-_tot_b) % _POOL_GEOM_BUCKET, dtype=np.bool_)
     _oi = 0
     _ob = 0
@@ -1567,7 +1608,7 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
         _n = len(_bflat)
         flat_b[_ob:_ob + _n] = _bflat
         _ob += _n
-    buf_i = _h2d_async(flat_i, torch.long, dev)
+    buf_i = _h2d_async(flat_i, torch.int32, dev)
     buf_b = _h2d_async(flat_b, torch.bool, dev)
     off_i = 0
     off_b = 0
@@ -2173,18 +2214,31 @@ def sink_softmax(logits, sink_logits, dim=-1):
     with torch.no_grad():
         return _sink_softmax_impl(logits, sink_logits, dim).detach()
 
+def _sink_log_normalizer(logits, sink_logits):
+    # Same normalizer as a softmax over the widened [sink | logits] row, but
+    # without materialising a copy of the full logits table just to add one
+    # column.  `logaddexp` is the two-term log-sum-exp, so the softmax values
+    # and their gradients are the same partition function.
+    return torch.logaddexp(
+        sink_logits.view(1, -1, 1),
+        torch.logsumexp(logits, dim=-1, keepdim=True))
+
+
 def _sink_softmax_impl(logits, sink_logits, dim=-1):
     if sink_logits is None:
         return torch.nan_to_num(torch.softmax(logits, dim))
-    z = _SinkWiden.apply(logits, torch.nan_to_num(sink_logits))
-    return torch.nan_to_num(torch.softmax(z, -1)[..., 1:])
+    lse = _sink_log_normalizer(logits, torch.nan_to_num(sink_logits))
+    return torch.nan_to_num((logits - lse).exp())
 
 def _sink_split_softmax(logits, sink_logits, want_sink=True):
     if sink_logits is None:
         return (sink_softmax(logits, None, -1), None)
-    z = _SinkWiden.apply(logits, torch.nan_to_num(sink_logits))
-    soft = torch.softmax(z, -1)[..., 1:]
-    return (soft, 1.0 - soft.sum(-1) if want_sink else None)
+    sink_logits = torch.nan_to_num(sink_logits)
+    lse = _sink_log_normalizer(logits, sink_logits)
+    soft = (logits - lse).exp()
+    if not want_sink:
+        return (soft, None)
+    return (soft, (sink_logits.view(1, -1, 1) - lse).exp())
 
 _FO_FULL_CAP_BYTES = 64 << 20
 _FO_MINL = {}
@@ -2620,8 +2674,9 @@ class HybridAttention(nn.Module):
         else:
             scale = 1.0 / math.sqrt(self.hd)
         # The sink branch builds a full cached bool mask within the row cap,
-        # or the matching row slice per chunk beyond it.
-        _use_full_mask = T * T * 4 <= _DENSE_MASK_ROW_CAP_BYTES
+        # or the matching row slice per chunk beyond it.  The cached table is
+        # bool (one byte per element), not a 4-byte additively-typed mask.
+        _use_full_mask = T * T <= _DENSE_MASK_ROW_CAP_BYTES
         if self.sink is None:
             if 0 < self.cfg.window < T:
                 out = _window_attn_local(q, k, v, self.cfg.window, scale)
@@ -3796,7 +3851,10 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             print('[data] serving token ids from the in-process memo (same cache files, already verified) ...')
             return _hit
         print('[data] loading cached token ids ...')
-        train_ids = np.load(tr_path)
+        # Serve the train ids as a read-only mapping so every process (and the
+        # parallel workers' corpus cache) shares the OS page cache instead of
+        # holding a private in-RAM copy of the whole corpus.
+        train_ids = np.load(tr_path, mmap_mode='r')
         meta = json.load(open(me_path, encoding='utf-8'))
         val_batch = np.load(va_path)
         val_bnd = np.load(vp_path)
@@ -3838,7 +3896,19 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     # caps below the global budget), never a validation/test row.  The budget
     # is fixed across the scale ladder so S1/S2/S3 share one tokenizer version.
     _fit_cap = min(int(TOKENIZER_FIT_TOKENS), int(n_train_tokens))
-    _fit_rows_all = [r for r in ds['train']['text'] if isinstance(r, str) and r.strip()]
+    # Only the frozen prefix is needed for the tokenizer fit; materialising the
+    # entire train split's text (WikiText-103 is ~100M tokens) would double the
+    # cold-build peak for no benefit.
+    _fit_rows_all = []
+    _n_train_rows = len(ds['train'])
+    _row_step = 5000
+    for _start in range(0, _n_train_rows, _row_step):
+        if len(_fit_rows_all) >= 50000:
+            break
+        _rows = ds['train'][_start:min(_start + _row_step, _n_train_rows)]['text']
+        _fit_rows_all.extend(r for r in _rows if isinstance(r, str) and r.strip())
+        if len(_fit_rows_all) > 50000:
+            del _fit_rows_all[50000:]
     fit_text, tok, n_fit_tokens = _wikitext_fit_rows(
         _fit_rows_all, vocab_size, _fit_cap, max_rows=50000)
     if tok is None or not fit_text:
@@ -3846,7 +3916,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     vocab = tok.get_vocab_size()
     fit_fp = _text_fp(fit_text)
     _dedup = _DocDeduplicator()
-    _fit_doc_prefix = list(fit_text)
+    _fit_doc_prefix = fit_text
     for _r in _fit_doc_prefix:
         _dedup.is_duplicate(_r)
     _fit_dedup = _dedup.stats()
@@ -3857,26 +3927,20 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     eos_id = tok.token_to_id('<eos>')
     _dedup_by_split = {}
 
-    def stream_tokenise(split, cap_tokens, label, _ds=ds, _tok=tok, _eos=eos_id):
-        # Ids accumulate in bounded numpy chunks; the int64 values produced are
-        # unchanged.  Rows go through the
-        # boundary / cap-truncation behaviour) are identical to the
-        # per-`encode` form.
-        chunks = []
-        cur = []
-        n_flushed = 0
+    def stream_tokenise(split, cap_tokens, label, _ds=ds, _tok=tok, _eos=eos_id,
+                        _dtype=np.int32):
+        # Write directly into one preallocated array: the corpus cap is the
+        # target size, and the old list-of-chunks form held every chunk plus
+        # the concatenated copy at peak.  The integer values and the
+        # [:cap_tokens] truncation are identical to the per-`encode` form.
+        cap_tokens = max(0, int(cap_tokens))
+        arr = np.empty(cap_tokens, dtype=_dtype)
+        cursor = 0
         _skipped = {'exact': 0, 'near': 0}
         _dedup_by_split[split] = _skipped
         _n_nonempty_seen = 0
-
-        def _flush():
-            nonlocal n_flushed
-            if cur:
-                n_flushed += len(cur)
-                chunks.append(np.array(cur, dtype=np.int64))
-                cur.clear()
-
         row_chunk = 10000
+        _stop = False
         for start in range(0, len(_ds[split]), row_chunk):
             rows = _ds[split][start:start + row_chunk]['text']
             rows = [r for r in rows if r.strip()]
@@ -3894,36 +3958,40 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                 else:
                     kept.append(r)
             _n_nonempty_seen += len(rows)
-            rows = kept
-            if rows:
-                for enc in _tok.encode_batch(rows):
-                    cur.extend(enc.ids)
-                    cur.append(_eos)
-            if len(cur) >= (1 << 22):
-                _flush()
-            # Running token count: same integer as summing the chunk sizes,
-            # without walking every accumulated chunk on each row block.
-            n_have = n_flushed + len(cur)
-            if n_have >= cap_tokens:
+            if kept:
+                for enc in _tok.encode_batch(kept):
+                    ids = enc.ids
+                    take = min(len(ids), cap_tokens - cursor)
+                    if take > 0:
+                        arr[cursor:cursor + take] = ids[:take]
+                        cursor += take
+                    if cursor >= cap_tokens:
+                        _stop = True
+                        break
+                    arr[cursor] = _eos
+                    cursor += 1
+                    if cursor >= cap_tokens:
+                        _stop = True
+                        break
+            if _stop or cursor >= cap_tokens:
                 break
             if start and start % 50000 == 0:
-                print(f'    [{label}] {start} rows, {n_have} tokens, '
+                print(f'    [{label}] {start} rows, {cursor} tokens, '
                       f'{sum(_skipped.values())} duplicate docs skipped')
-        _flush()
-        if not chunks:
-            return np.empty(0, dtype=np.int64)
-        # a single chunk is handed out directly; the concatenation and the
-        # [:cap_tokens] truncation are the same integers the single-list form
-        # produced.
-        ids = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
-        return ids[:cap_tokens]
+        if cursor < arr.size:
+            # Do not keep a huge virtual allocation alive when the source ran
+            # dry well before the configured cap.
+            exact = arr[:cursor].copy()
+            del arr
+            return exact
+        return arr
     print(f'[data] tokenising train (cap {n_train_tokens} tokens) ...')
-    train_ids = stream_tokenise('train', n_train_tokens + seq_len, 'train')
+    train_ids = stream_tokenise('train', n_train_tokens + seq_len, 'train', _dtype=np.int32)
     print(f'[data] train tokens = {len(train_ids)}  vocab = {vocab}')
     if len(train_ids) < n_train_tokens + seq_len:
         print(f'[data] WARNING: the train split ran dry at {len(train_ids)} tokens (< requested {n_train_tokens + seq_len}); runs configured for the advertised token target will train on fewer tokens than advertised')
     print('[data] tokenising validation ...')
-    val_ids = stream_tokenise('validation', val_seqs * seq_len + seq_len, 'val')
+    val_ids = stream_tokenise('validation', val_seqs * seq_len + seq_len, 'val', _dtype=np.int64)
     n_val = min(len(val_ids) // seq_len, val_seqs)
     val_batch = val_ids[:n_val * seq_len].reshape(n_val, seq_len)
     _validate_token_ids(train_ids, vocab, 'wikitext train_ids')
@@ -4395,14 +4463,17 @@ def _doc_simhash(text, *, shingle_words=5, max_shingles=128):
         else:
             pos = np.unique(np.linspace(0, count - 1, int(max_shingles), dtype=np.int64))
         shingles = [' '.join(words[int(i):int(i) + shingle_words]) for i in pos]
-    vec = [0] * 64
-    for sh in shingles:
-        h = int.from_bytes(hashlib.blake2b(sh.encode('utf-8', errors='replace'),
-                                           digest_size=8).digest(), 'little')
-        for b in range(64):
-            vec[b] += 1 if (h >> b) & 1 else -1
+    hashes = np.fromiter(
+        (int.from_bytes(hashlib.blake2b(sh.encode('utf-8', errors='replace'),
+                                        digest_size=8).digest(), 'little')
+         for sh in shingles),
+        dtype=np.uint64, count=len(shingles))
+    if hashes.size == 0:
+        return 0
+    bits = ((hashes[:, None] >> np.arange(64, dtype=np.uint64)[None, :]) & 1)
+    vec = bits.astype(np.int64) * 2 - 1
     out = 0
-    for b, v in enumerate(vec):
+    for b, v in enumerate(vec.sum(axis=0).tolist()):
         if v >= 0:
             out |= (1 << b)
     return out
@@ -4443,8 +4514,9 @@ class _DocDeduplicator:
         return [(b, (int(h) >> (b * self.bits)) & self.mask)
                 for b in range(self.bands)]
 
-    def is_duplicate(self, text):
-        fp = _doc_exact_fp(text)
+    def is_duplicate(self, text, fp=None):
+        if fp is None:
+            fp = _doc_exact_fp(text)
         if fp in self.exact:
             self.n_exact_skipped += 1
             return True, 'exact'
@@ -4489,17 +4561,24 @@ def _wikitext_fit_rows(rows, vocab_size, token_cap, max_rows=50000):
     fit_text = list(rows[:total])
     tok = None
     n_tok = 0
-    for _ in range(24):
+    # BPE training + a full encode are linear in the fit corpus.  The old loop
+    # retrained both up to 24 times whenever the first estimate exceeded the
+    # cap.  The first over-budget measurement already yields the token/row (or
+    # token/char) ratio; a conservative prefix from that ratio converges in
+    # one rebuild for realistic text, and the loop is capped at three passes
+    # as a guard against a pathological vocabulary.
+    for _pass in range(3):
         tok = build_tokenizer(fit_text, vocab_size)
         n_tok = int(sum(len(enc.ids) + 1 for enc in tok.encode_batch(fit_text))) if fit_text else 0
         if n_tok <= int(token_cap):
             return fit_text, tok, n_tok
+        ratio = float(token_cap) / max(n_tok, 1) * (0.9 if _pass else 0.95)
         if len(fit_text) > 1:
-            keep = max(1, int(len(fit_text) * (float(token_cap) / max(n_tok, 1)) * 0.95))
+            keep = max(1, int(len(fit_text) * ratio))
             fit_text = fit_text[:min(len(fit_text) - 1, keep)]
         else:
             text = str(fit_text[0])
-            new_len = max(1, int(len(text) * (float(token_cap) / max(n_tok, 1)) * 0.95))
+            new_len = max(1, int(len(text) * ratio))
             if new_len >= len(text):
                 new_len = len(text) - 1
             if new_len <= 0:
@@ -4671,7 +4750,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             doc_id, doc = next(rows)
         except StopIteration:
             break
-        _dup, _kind = _dedup.is_duplicate(doc)
+        _dup, _kind = _dedup.is_duplicate(doc, fp=doc_id)
         if _dup:
             _skipped['fit'][_kind] += 1
             continue
@@ -4706,8 +4785,12 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     n_train_total = 0
     n_val_total = 0
     _marks = 0
-    train_doc_ids = []
-    val_doc_ids = []
+    # Compact document-id accumulators: a Python list of int objects costs
+    # ~28-32 bytes per document; an unsigned-64 array stores the same ids in
+    # 8 bytes and converts to NumPy without an object-by-object pass.
+    import array as _array_mod
+    train_doc_ids = _array_mod.array('Q')
+    val_doc_ids = _array_mod.array('Q')
 
     try:
         buf = []
@@ -4720,7 +4803,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 for (doc_id, _), enc in zip(pairs, tok.encode_batch([d for _, d in pairs])):
                     buf.extend(enc.ids)
                     buf.append(eos_id)
-                    train_doc_ids.append(_doc_id_u64(doc_id))
+                    train_doc_ids.append(int(_doc_id_u64(doc_id)))
                     if len(buf) >= (1 << 22):
                         _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                         n_train_total += len(buf)
@@ -4746,7 +4829,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 for doc_id, doc in docs:
                     # Whole-document dedup: a document that already appeared
                     # (fit or train) is never emitted again.
-                    _dup, _kind = _dedup.is_duplicate(doc)
+                    _dup, _kind = _dedup.is_duplicate(doc, fp=doc_id)
                     if _dup:
                         _skipped['train'][_kind] += 1
                     else:
@@ -4769,7 +4852,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 for (doc_id, _), enc in zip(pairs, tok.encode_batch([d for _, d in pairs])):
                     buf.extend(enc.ids)
                     buf.append(eos_id)
-                    val_doc_ids.append(_doc_id_u64(doc_id))
+                    val_doc_ids.append(int(_doc_id_u64(doc_id)))
                     if len(buf) >= (1 << 22):
                         _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                         n_val_total += len(buf)
@@ -4785,7 +4868,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                     break
                 pairs = []
                 for doc_id, doc in docs:
-                    _dup, _kind = _dedup.is_duplicate(doc)
+                    _dup, _kind = _dedup.is_duplicate(doc, fp=doc_id)
                     if _dup:
                         _skipped['validation'][_kind] += 1
                     else:
@@ -4838,8 +4921,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         bnd_ids = sorted(boundary_token_ids(tok, eos_id))
         val_bnd = np.isin(val_batch, bnd_ids)
         print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
-        _train_doc_arr = np.asarray(train_doc_ids, dtype=np.uint64)
-        _val_doc_arr = np.asarray(val_doc_ids, dtype=np.uint64)
+        _train_doc_arr = np.frombuffer(train_doc_ids, dtype=np.uint64).copy() if train_doc_ids else np.empty(0, dtype=np.uint64)
+        _val_doc_arr = np.frombuffer(val_doc_ids, dtype=np.uint64).copy() if val_doc_ids else np.empty(0, dtype=np.uint64)
         _shared_docs = int(np.intersect1d(_train_doc_arr, _val_doc_arr, assume_unique=True).size)
         if _shared_docs:
             raise RuntimeError(f'load_fineweb_edu: {_shared_docs} document ids occur in both train and validation — refusing to write a leaking split')
@@ -5292,7 +5375,7 @@ def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True):
 _PINNED_HOST_CACHE = {}
 # 整份 pinned 缓存的上限（见 batch_iter）：超出时改走普通宿主张量 + 每步
 # pinned 暂存上传。
-_PINNED_HOST_CAP_BYTES = 4 << 30
+_PINNED_HOST_CAP_BYTES = 256 << 20
 # 语料整份缓存的上限（见 batch_iter）；超出时按步暂存。
 _GPU_CORPUS_CACHE_BYTES = 64 << 20
 
@@ -5307,6 +5390,9 @@ def _gpu_corpus_cache_fits(nbytes, device):
     except Exception:
         return True
 
+_NARROW_MEMO = {}
+
+
 def _ids_narrow(train_ids):
     # Token ids are bounded by the vocab (<= 2**31 for every corpus this repo
     # produces), so the cached copy (GPU, or pinned host staging) keeps its
@@ -5315,8 +5401,53 @@ def _ids_narrow(train_ids):
     # guard keeps any hypothetical out-of-range corpus on the int64 path.
     if train_ids.dtype in (np.uint8, np.uint16, np.int32):
         return train_ids
+    import weakref as _weakref
+    _key = id(train_ids)
+    _hit = _NARROW_MEMO.get(_key)
+    if _hit is not None and _hit[0]() is train_ids:
+        return _hit[1]
+    _path = getattr(train_ids, 'filename', None)
+    if _path and train_ids.size:
+        # A disk-backed corpus is mapped read-only.  Materialising an int32
+        # copy in every worker would multiply host memory by the worker count;
+        # build one shared int32 sidecar next to the cache instead and map it.
+        try:
+            _st = os.stat(_path)
+            _side = f'{_path}.i32-{int(_st.st_size)}-{int(getattr(_st, "st_mtime_ns", 0))}.npy'
+            if os.path.exists(_side):
+                _n = np.load(_side, mmap_mode='r')
+                if int(_n.size) == int(train_ids.size):
+                    _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+                    return _n
+            _mx = int(train_ids.max()) if train_ids.size else -1
+            if _mx < 2 ** 31:
+                _dir = os.path.dirname(os.path.abspath(_side)) or '.'
+                _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(_side) + '.', suffix='.tmp')
+                os.close(_fd)
+                try:
+                    _mm = np.lib.format.open_memmap(_tmp, mode='w+', dtype=np.int32, shape=(int(train_ids.size),))
+                    _step = 1 << 24
+                    for _s in range(0, int(train_ids.size), _step):
+                        _e = min(_s + _step, int(train_ids.size))
+                        _mm[_s:_e] = train_ids[_s:_e]
+                    _mm.flush()
+                    del _mm
+                    os.replace(_tmp, _side)
+                except BaseException:
+                    try:
+                        os.unlink(_tmp)
+                    except OSError:
+                        pass
+                    raise
+                _n = np.load(_side, mmap_mode='r')
+                _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+                return _n
+        except (OSError, ValueError, TypeError):
+            pass
     if train_ids.size and int(train_ids.max()) < 2 ** 31:
-        return train_ids.astype(np.int32)
+        _n = train_ids.astype(np.int32)
+        _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+        return _n
     return train_ids
 
 def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
@@ -5325,20 +5456,23 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     if n <= 0:
         raise ValueError(f'batch_iter needs len(train_ids) > seq_len+1 to sample causal windows, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
     train_ids = np.asarray(train_ids)
+    _narrow = _ids_narrow(train_ids)
+    _devkey = _dev_str(device)
     host = None
     host_np = None
     cached = _PINNED_HOST_CACHE.get('entry')
-    if cached is not None and cached[0] is train_ids and cached[1].shape[0] == train_ids.shape[0]:
+    if (cached is not None and cached[0] is train_ids
+            and cached[1].shape[0] == train_ids.shape[0]
+            and cached[2] == _devkey):
         host = cached[1]
-    elif device.type == 'cuda' and _gpu_corpus_cache_fits(train_ids.nbytes, device):
+    elif device.type == 'cuda' and _gpu_corpus_cache_fits(_narrow.nbytes, device):
         try:
-            host = torch.from_numpy(_ids_narrow(train_ids)).to(device)
-            _PINNED_HOST_CACHE['entry'] = (train_ids, host)
+            host = torch.from_numpy(_narrow).to(device)
+            _PINNED_HOST_CACHE['entry'] = (train_ids, host, _devkey)
         except RuntimeError:
             host = None
     if host is None:
         if device.type == 'cuda':
-            _narrow = _ids_narrow(train_ids)
             try:
                 # Only corpora within the cap are pinned in full.  Larger
                 # corpora are gathered from the source array in a prefetch
@@ -5347,22 +5481,21 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
                 # pinning them would only move the failure to the first next().
                 if _narrow.dtype in (np.uint8, np.uint16):
                     host_np = _narrow
-                elif train_ids.nbytes <= _PINNED_HOST_CAP_BYTES:
+                elif _narrow.nbytes <= _PINNED_HOST_CAP_BYTES:
                     host = torch.from_numpy(_narrow).pin_memory()
-                    _PINNED_HOST_CACHE['entry'] = (train_ids, host)
+                    _PINNED_HOST_CACHE['entry'] = (train_ids, host, _devkey)
                 else:
                     host_np = _narrow
             except RuntimeError:
                 host_np = _narrow
         else:
-            _host_ids = _ids_narrow(train_ids)
-            if _host_ids.dtype in (np.uint8, np.uint16):
+            if _narrow.dtype in (np.uint8, np.uint16):
                 # PyTorch's CPU index kernel lacks uint8/uint16 gathers.  Gather
                 # the narrow array with NumPy per batch and widen only the
                 # [B, seq_len+1] result — the same exact token ids.
-                host_np = _host_ids
+                host_np = _narrow
             else:
-                host = torch.from_numpy(_host_ids)
+                host = torch.from_numpy(_narrow)
     # Transport-only narrowing (design notes §6.1): every gather index is an
     # exact integer bounded by n + seq_len, so when that bound fits in int32
     # the index tensor is uploaded / consumed as int32 and the gathered ids
@@ -9514,9 +9647,12 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
             rec = summary.get(key)
             if not isinstance(rec, dict) or not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
                 continue
-            _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
+            _curves = _cell_curve_data(outdir, rec)
+            _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else (_curves.get('losses') if isinstance(_curves.get('losses'), list) else [])
             _loss_nums = [float(x) for x in _losses if isinstance(x, (int, float)) and not isinstance(x, bool)]
-            _ph = rec.get('ppl_history') if isinstance(rec.get('ppl_history'), list) else []
+            _ph = rec.get('ppl_history') if isinstance(rec.get('ppl_history'), list) else (_curves.get('ppl_history') if isinstance(_curves.get('ppl_history'), list) else [])
+            if not _losses and rec.get('curve_n_points') is not None:
+                _loss_nums = []
             cells[key] = {
                 'variant': v,
                 'seed': int(seed),
@@ -9535,9 +9671,13 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                 'data_version': rec.get('data_version') or prov.get('data', {}).get('data_version'),
                 'code_stamp': rec.get('_code'),
                 'hyperparams': rec.get('hyperparams'),
-                'curve_summary': {'n_points': len(_losses), 'first': _loss_nums[0] if _loss_nums else None, 'last': _loss_nums[-1] if _loss_nums else None, 'best': min(_loss_nums) if _loss_nums else None, 'ppl_history_points': len(_ph)},
-                'curve_ref': f'summary.json#{key}.losses',
-                'ppl_history_ref': f'summary.json#{key}.ppl_history',
+                'curve_summary': {'n_points': (len(_losses) if _losses else int(rec.get('curve_n_points') or 0)),
+                                  'first': _loss_nums[0] if _loss_nums else rec.get('curve_first'),
+                                  'last': _loss_nums[-1] if _loss_nums else rec.get('curve_last'),
+                                  'best': min(_loss_nums) if _loss_nums else rec.get('curve_best'),
+                                  'ppl_history_points': (len(_ph) if _ph else int(rec.get('ppl_history_n_points') or 0))},
+                'curve_ref': rec.get('curve_ref') or f'summary.json#{key}.losses',
+                'ppl_history_ref': rec.get('ppl_history_ref') or f'summary.json#{key}.ppl_history',
                 'sanity_ref': rec.get('sanity_ref') or ('overfit_sanity.json' if sanity else None),
             }
     if planned_cells is None:
@@ -9591,13 +9731,15 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
 _EVAL_TOKENS_PER_CHUNK = 1 << 17
 
 
-def _eval_adaptive_chunk(model, val_batch, device, chunk, _free_frac=0.5, _bytes_per_value=16):
+def _eval_adaptive_chunk(model, val_batch, device, chunk, _free_frac=0.5, _bytes_per_value=8):
     """Bound an evaluation chunk by both token count and currently-free VRAM.
 
     Rows are independent, so the partition changes no value; it only keeps a
     long-sequence eval from launching a chunk whose dense activations cannot
-    fit.  The estimate is deliberately conservative (the model width times the
-    sequence length times a small activation multiplier)."""
+    fit.  The estimate uses the model's actual parameter element size (bf16
+    halves it) and a modest activation multiplier; an over-large chunk is
+    caught by the existing OOM retry, so the estimate no longer needs to be a
+    worst-case upper bound that collapses the chunk to one row."""
     rows = int(val_batch.shape[0])
     T = int(val_batch.shape[1])
     span = max(1, T - 1)
@@ -9606,7 +9748,8 @@ def _eval_adaptive_chunk(model, val_batch, device, chunk, _free_frac=0.5, _bytes
         try:
             free, _total = torch.cuda.mem_get_info(device)
             d = int(model.tok.weight.shape[1])
-            per_row = max(1, T * d * 4 * int(_bytes_per_value))
+            elem = int(model.tok.weight.element_size())
+            per_row = max(1, T * d * elem * int(_bytes_per_value))
             chunk = min(chunk, max(1, int(free * float(_free_frac)) // per_row))
         except Exception:
             pass
@@ -9655,13 +9798,15 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                 print(f'[eval_ppl] eval_rows={int(eval_rows)} covers the whole {_flat}-row target space; scoring the FULL set (this is the population statistic, not a sample)')
         _vhost = None
         if device.type == 'cuda':
+            _vdev = _dev_str(device)
             _vc = _PINNED_HOST_CACHE.get('val')
-            if _vc is not None and _vc[0] is val_batch and _vc[1] == tuple(val_batch.shape):
+            if (_vc is not None and _vc[0] is val_batch and _vc[1] == tuple(val_batch.shape)
+                    and _vc[3] == _vdev):
                 _vhost = _vc[2]
             else:
                 try:
                     _vhost = torch.as_tensor(val_batch).pin_memory()
-                    _PINNED_HOST_CACHE['val'] = (val_batch, tuple(val_batch.shape), _vhost)
+                    _PINNED_HOST_CACHE['val'] = (val_batch, tuple(val_batch.shape), _vhost, _vdev)
                 except RuntimeError:
                     _vhost = torch.as_tensor(val_batch)
         else:
@@ -9948,8 +10093,8 @@ def _lgamma_comb(n, k):
     if k == 0 or k == n:
         return 0.0
     return math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
-_AMP_WORK_CAP = (1 << 16) - 1
-_AMP_FALLBACK_DRAWS = 8192
+_AMP_WORK_CAP = (1 << 12) - 1
+_AMP_FALLBACK_DRAWS = 2048
 
 def _cluster_expected_matches(win, cl, tol, P, n_pos, approx_flag=None):
     w = len(win)
@@ -10463,6 +10608,53 @@ def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len
     return mode, need
 
 _CURVE_MAX_POINTS = 200000
+_CURVE_SIDECAR_INLINE_PPL = 4096
+
+
+def _curve_sidecar_rel(key):
+    safe = ''.join(ch if (ch.isalnum() or ch in '._:-') else '_' for ch in str(key))
+    return f'curves/{safe}.json'
+
+
+def _write_cell_curve(outdir, key, rec):
+    """Move per-cell curve arrays out of the shared summary file.
+
+    The summary is rewritten (and re-parsed) under the panel lock after every
+    cell; embedding a 200k-point loss curve makes that cost grow with
+    cells x curve length.  Each cell's arrays go to its own sidecar and the
+    summary keeps only scalar metadata plus a reference."""
+    losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
+    delta = rec.get('delta_trace') if isinstance(rec.get('delta_trace'), dict) else {}
+    ph = rec.get('ppl_history') if isinstance(rec.get('ppl_history'), list) else []
+    move_ph = len(ph) > _CURVE_SIDECAR_INLINE_PPL
+    payload = {}
+    if losses:
+        payload['losses'] = losses
+    if delta:
+        payload['delta_trace'] = delta
+    if move_ph:
+        payload['ppl_history'] = ph
+    if not payload:
+        return None, losses, ph, move_ph
+    rel = _curve_sidecar_rel(key)
+    try:
+        atomic_write_json(os.path.join(outdir, rel), payload, indent=0)
+    except Exception as _e:
+        print(f'[track] WARNING: could not write curve sidecar {rel} ({type(_e).__name__}: {_e}); keeping this cell\'s curves inline')
+        return None, losses, ph, False
+    return rel, losses, ph, move_ph
+
+
+def _cell_curve_data(outdir, rec):
+    ref = rec.get('curve_ref') if isinstance(rec, dict) else None
+    if not ref:
+        return {}
+    try:
+        with open(os.path.join(outdir, ref), encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _curve_extend(dst, new):
@@ -10518,6 +10710,29 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     _lbuf = []
     # deque with a fixed capacity; the window contents are identical.
     _tail = collections.deque(maxlen=50)
+    # Loss scalars are copied to a pinned host buffer asynchronously as they
+    # are produced; the flush waits on one event instead of stacking on the
+    # GPU and synchronising at every log point.
+    _loss_stage = None
+    _loss_ev = None
+    if device.type == 'cuda':
+        try:
+            _loss_stage = torch.empty(512, dtype=torch.float32, pin_memory=True)
+            _loss_ev = torch.cuda.Event()
+        except Exception:
+            _loss_stage = None
+            _loss_ev = None
+
+    def _flush_loss_buffer():
+        if not _lbuf:
+            return
+        if _loss_stage is not None and len(_lbuf) <= _loss_stage.numel():
+            _loss_ev.record()
+            _loss_ev.synchronize()
+            _curve_extend(losses, _loss_stage[:len(_lbuf)].tolist())
+        else:
+            _curve_extend(losses, torch.stack(_lbuf).tolist())
+        _lbuf.clear()
     ppl_hist = []
     _ce_baseline = 0.0
     delta_trace = {}
@@ -10570,13 +10785,14 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             opt.zero_grad(set_to_none=True)
             _ce_d = ce.detach()
             _lbuf.append(_ce_d)
+            if _loss_stage is not None and len(_lbuf) <= _loss_stage.numel():
+                _loss_stage[len(_lbuf) - 1].copy_(_ce_d, non_blocking=True)
             _tail.append(_ce_d)
             # Drop this step's graph/scalar references before the next forward.
             del loss, ce
             model.comp_reg = None
             if len(_lbuf) >= 512:
-                _curve_extend(losses, torch.stack(_lbuf).tolist())
-                _lbuf.clear()
+                _flush_loss_buffer()
             if (step + 1) % 1024 == 0:
                 gc.collect()
             if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
@@ -10584,8 +10800,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 ppl_hist.append([step + 1, float(sub_ppl)])
             if log_every and (step % log_every == 0 or step == steps - 1):
                 if _lbuf:
-                    _curve_extend(losses, torch.stack(_lbuf).tolist())
-                    _lbuf.clear()
+                    _flush_loss_buffer()
                 _lv = float(losses[-1])
                 _dls = [(li, getattr(blk.attn, 'delta_logit', None)) for li, blk in enumerate(model.blocks)]
                 _dls = [(li, dl) for li, dl in _dls if dl is not None]
@@ -10630,8 +10845,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         print(f'[{variant} seed={seed}] val PPL = {ppl:.3f}  (n_tok={_eval_stats["n_tokens"]}, nll={_eval_stats["nll_sum"]:.6f})')
         print(f'    block-length diagnostics: {json.dumps(stats, default=float)}')
     if _lbuf:
-        _curve_extend(losses, torch.stack(_lbuf).tolist())
-        _lbuf.clear()
+        _flush_loss_buffer()
     losses = [float(v) for v in losses]
     result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
               # Review 3: the token-level evidence behind the reported PPL.
@@ -10652,8 +10866,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         del model
     del opt, bpe
     gc.collect()
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
+    # Keep the caching allocator's blocks for the next cell in this process;
+    # only OOM-recovery paths return memory to the driver.
     return result
 
 @torch.no_grad()
@@ -11652,14 +11866,24 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
     ntok_mat = np.stack([b for _, b in rows], axis=0)         # [S, R]
     rng = np.random.default_rng(int(seed))
+    nll_col = nll_mat.sum(axis=0)
+    ntok_col = ntok_mat.sum(axis=0)
     vals = np.empty(int(n_boot), dtype=float)
-    for b in range(int(n_boot)):
-        idx = rng.integers(0, R, size=R)
-        nt = float(ntok_mat[:, idx].sum())
-        if nt <= 0:
-            vals[b] = np.nan
-            continue
-        vals[b] = math.exp(float(nll_mat[:, idx].sum()) / nt)
+    # Multinomial bootstrap counts replace one advanced-index allocation per
+    # draw: a single [chunk, R] count matrix is reused, so cost and memory stay
+    # O(chunk*R) instead of O(n_boot*S*R) temporary gathers.
+    _chunk = 256
+    _b = 0
+    while _b < int(n_boot):
+        _nb = min(_chunk, int(n_boot) - _b)
+        counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb)
+        nt = counts @ ntok_col
+        nn = counts @ nll_col
+        ok = nt > 0
+        out = np.full(_nb, np.nan, dtype=float)
+        out[ok] = np.exp(nn[ok] / nt[ok])
+        vals[_b:_b + _nb] = out
+        _b += _nb
     vals = vals[np.isfinite(vals) & (vals > 0)]
     if vals.size < max(20, int(0.5 * n_boot)):
         return None
@@ -12127,14 +12351,20 @@ def _plot(summary, agg, outdir):
     ax[1].set_title('Model size')
     ax[1].grid(alpha=0.3, axis='y')
     for v in vs:
-        recs = [r for r in agg[v].get('_group_records', []) if isinstance(r, dict) and 'losses' in r and (not r.get('synthesized')) and isinstance(r.get('losses'), list) and r['losses'] and all((isinstance(x, (int, float)) and math.isfinite(x) for x in r['losses']))]
-        if not recs:
+        _curves = []
+        for _r in agg[v].get('_group_records', []):
+            if not isinstance(_r, dict) or _r.get('synthesized'):
+                continue
+            _loss = _r.get('losses') if isinstance(_r.get('losses'), list) else _cell_curve_data(outdir, _r).get('losses')
+            if isinstance(_loss, list) and _loss and all((isinstance(x, (int, float)) and math.isfinite(x) for x in _loss)):
+                _curves.append(_loss)
+        if not _curves:
             continue
-        _lens = sorted({len(r['losses']) for r in recs})
+        _lens = sorted({len(_c) for _c in _curves})
         if len(_lens) > 1:
             print(f'[_plot] {v}: seeds trained a DIFFERENT number of steps {_lens} — the training curve is drawn over the shared prefix of {_lens[0]} step(s) only.')
-        n_pt = min((len(r['losses']) for r in recs))
-        curve = np.mean([np.array(r['losses'][:n_pt], dtype=float) for r in recs], axis=0)
+        n_pt = min((len(_c) for _c in _curves))
+        curve = np.mean([np.array(_c[:n_pt], dtype=float) for _c in _curves], axis=0)
         k = max(1, n_pt // 50)
         _num = np.convolve(curve, np.ones(k), mode='same')
         _den = np.convolve(np.ones_like(curve), np.ones(k), mode='same')
@@ -12332,6 +12562,12 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts)
             _prov = prov if prov is not None else experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
             _hp = run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v], data_version=_prov.get('data', {}).get('data_version'))
+            _curve_ref = None
+            _curve_losses = []
+            _curve_ph = []
+            _curve_move_ph = False
+            if not rec.get('cap_truncated'):
+                _curve_ref, _curve_losses, _curve_ph, _curve_move_ph = _write_cell_curve(outdir, key, rec)
 
             def _apply(summary):
                 if rec.get('cap_truncated'):
@@ -12354,9 +12590,31 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                     rec['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
                     if os.path.exists(os.path.join(outdir, 'overfit_sanity.json')):
                         rec['sanity_ref'] = 'overfit_sanity.json'
-                    summary[key] = rec
+                    _rec_out = rec
+                    _has_curve = bool(_curve_ref) or _curve_move_ph
+                    if _has_curve:
+                        _rec_out = dict(rec)
+                        if _curve_ref:
+                            _rec_out.pop('losses', None)
+                            _rec_out.pop('delta_trace', None)
+                        if _curve_move_ph:
+                            _rec_out.pop('ppl_history', None)
+                    if _curve_ref:
+                        _rec_out['curve_ref'] = _curve_ref
+                        _rec_out['curve_n_points'] = len(_curve_losses)
+                        _rec_out['curve_first'] = _curve_losses[0] if _curve_losses else None
+                        _rec_out['curve_last'] = _curve_losses[-1] if _curve_losses else None
+                        _rec_out['curve_best'] = min(_curve_losses) if _curve_losses else None
+                    elif _curve_losses:
+                        _rec_out['curve_n_points'] = len(_curve_losses)
+                    if _curve_move_ph:
+                        _rec_out['ppl_history_ref'] = _curve_ref
+                        _rec_out['ppl_history_n_points'] = len(_curve_ph)
+                    elif _curve_ph:
+                        _rec_out['ppl_history_n_points'] = len(_curve_ph)
+                    summary[key] = _rec_out
                 return summary
-            locked_json_update(summary_path, _apply, indent=1)
+            locked_json_update(summary_path, _apply, indent=None)
             if out.get('truncated'):
                 out['status'] = 'truncated'
                 log_experiment_event(outdir, {'kind': 'cell', 'run_id': _run_id, 'status': 'truncated', 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': code_stamp(), 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'steps_done': rec.get('steps_done'), 'reason': 'hard runtime cap reached; partial record not written'})
@@ -12380,7 +12638,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                     summary[key] = {'variant': v, 'seed': seed, 'error': _err_tb}
                     print(f'[{key}] FAILED: {_err}')
                 return summary
-            locked_json_update(summary_path, _apply_err, indent=1)
+            locked_json_update(summary_path, _apply_err, indent=None)
             log_experiment_event(outdir, {'kind': 'cell', 'run_id': _run_id, 'status': 'error', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': code_stamp(), 'error': f'{_err}', 'traceback': _err_tb})
     finally:
         if guard is not None:
@@ -12395,8 +12653,6 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             if booked:
                 guard.book(-booked, token=_book_tok)
     gc.collect()
-    if DEVICE.type == 'cuda':
-        torch.cuda.empty_cache()
     return out
 
 
@@ -12571,6 +12827,15 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             # exp_lib matches that caller's patch state exactly.
             module = _par_ctx.get('module') or (_caller if _caller and _caller != '__main__' else 'exp_lib')
             jobs = [dict(kind='run', module=module, label=label, cfg=cfg, v=v, seed=seed, guard_cap=(guard.cap_spec() if guard is not None else None), ckpt_flag=bool(_par_ctx.get('ckpt_flag')), ckpt_install=bool(_par_ctx.get('ckpt_install')), fp=fp, prov=prov) for v, seed in cells]
+            # Children re-serve the corpus from the shared on-disk cache; the
+            # parent no longer needs its reference (or the loader memo entry)
+            # once the jobs are dispatched.
+            for _memo in (_WT103_MEMO, _FWEB_MEMO):
+                for _mk, _mv in list(_memo.items()):
+                    if isinstance(_mv, tuple) and _mv and _mv[0] is train_ids:
+                        _memo.pop(_mk, None)
+            del train_ids, val_batch, val_bnd
+            gc.collect()
             results = _par.run_jobs(jobs, _par_ctx, phase_label=label or outdir)
             for r, (v, seed) in zip(results, cells):
                 if not r:

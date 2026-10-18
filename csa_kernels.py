@@ -644,7 +644,10 @@ def _take_lane(lane4, r_idx, blk_idx, lane_idx):
     """[R, B, L, c] 泳道张量按 (r, blk_idx[r,t], lane_idx[r,t]) 取 [R, T, c]——
     纯 gather，无累加（A 泳道双射 / B 泳道至多一处的两处用途都满足）。"""
     R, B, L, c = lane4.shape
-    row = (r_idx.reshape(-1) * B + blk_idx.reshape(-1).clamp(0, B - 1))
+    # r_idx is an expanded arange; build the flat row index directly instead
+    # of materialising the expansion first.
+    row = (torch.arange(R, device=r_idx.device)[:, None] * B
+           + blk_idx.clamp(0, B - 1)).reshape(-1)
     col = lane_idx.reshape(-1).clamp(0, L - 1)
     out = lane4.reshape(R * B, L, c)[row, col]
     return out.reshape(r_idx.shape[0], r_idx.shape[1], c)
@@ -1141,34 +1144,9 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     # slab，不再为整段 T 保留 [R,T,topk|window,hd] 级别的碎片。跨 chunk 的
     # 同键贡献按 chunk 顺序累加，确定性不变。
     lt_l = last_tok.to(torch.int64)
-    chunks = []
-    for t0 in range(0, T, tc):
-        t1 = min(t0 + tc, T)
-        src32 = topk_idx[:, t0:t1]
-        src64 = src32.to(torch.int64)
-        lt_sel = lt_l.gather(1, src64.reshape(R, -1)).view(R, t1 - t0, nb)
-        sel_ok = valid[:, t0:t1] & (t_idx[:, t0:t1, :] > lt_sel)
-        src_win = win_raw[:, t0:t1, :].clamp(min=0)
-        win_ok = win_raw[:, t0:t1, :] >= 0
-        lane_ok = torch.cat([sel_ok, win_ok], dim=-1)
-        anyrow = (sel_ok.any(dim=-1) | win_ok.any(dim=-1)) if sink_v is None else None
-        # The window lanes never carry a soft prior; keep only the block
-        # columns.
-        soft_c = soft[:, t0:t1, :].to(torch.float32) if soft is not None else None
-        # 段结构只依赖本 chunk 的整数键；键表本身在建完段后即可释放。
-        seg_b_c = None
-        if need_dkb or need_dvb:
-            kb_keys = r_idx.expand(R, t1 - t0, nb) * Bm + src64
-            seg_b_c = _seg_structure(kb_keys.reshape(-1), R * Bm)
-            del kb_keys
-        seg_w_c = None
-        if need_dksw or need_dvsw:
-            kw_keys = r_idx.expand(R, t1 - t0, w) * T + src_win
-            seg_w_c = _seg_structure(kw_keys.reshape(-1), R * T)
-            del kw_keys
-        chunks.append((t0, t1, src32, src_win, lane_ok, soft_c, anyrow,
-                       seg_b_c, seg_w_c))
-    # 逐头归约出口（dtype）与头间复用的逐头 fp32 归约 slab。
+    # 逐 (head, chunk) 构建几何：早期版本先把整段 T 的 src/掩码/soft/段结构
+    # 全部装进 `chunks`，长序列下这些"按 chunk"的表实际按全 T 保留。现在
+    # 每个 chunk 的头循环内现算、用完即释放，峰值只随一个 chunk 增长。
     dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else None
     dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else None
     dk_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else None
@@ -1177,8 +1155,6 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     dv_slab = torch.zeros((R * Bm, hd), device=dev, dtype=torch.float32) if need_dvb else None
     dksw_slab = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if need_dksw else None
     dvsw_slab = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if need_dvsw else None
-    # 每个 (chunk, head) 的局部段和先写进 scratch，再按固定 chunk 顺序
-    # 加到逐头 slab；scratch 只占一个 chunk 的几何，不随 T 增长。
     dk_scratch = torch.zeros((R * Bm, hd), device=dev, dtype=torch.float32) if (need_dkb or need_dvb) else None
     dksw_scratch = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if (need_dksw or need_dvsw) else None
 
@@ -1192,8 +1168,27 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         for _slab in (dk_slab, dv_slab, dksw_slab, dvsw_slab):
             if _slab is not None:
                 _slab.zero_()
-        for (t0, t1, src32, src_win, lane_ok, soft_c, anyrow,
-             seg_b_c, seg_w_c) in chunks:
+        for t0 in range(0, T, tc):
+            t1 = min(t0 + tc, T)
+            src32 = topk_idx[:, t0:t1]
+            src64 = src32.to(torch.int64)
+            lt_sel = lt_l.gather(1, src64.reshape(R, -1)).view(R, t1 - t0, nb)
+            sel_ok = valid[:, t0:t1] & (t_idx[:, t0:t1, :] > lt_sel)
+            src_win = win_raw[:, t0:t1, :].clamp(min=0)
+            win_ok = win_raw[:, t0:t1, :] >= 0
+            lane_ok = torch.cat([sel_ok, win_ok], dim=-1)
+            anyrow = (sel_ok.any(dim=-1) | win_ok.any(dim=-1)) if sink_v is None else None
+            soft_c = soft[:, t0:t1, :].to(torch.float32) if soft is not None else None
+            seg_b_c = None
+            if need_dkb or need_dvb:
+                kb_keys = r_idx.expand(R, t1 - t0, nb) * Bm + src64
+                seg_b_c = _seg_structure(kb_keys.reshape(-1), R * Bm)
+                del kb_keys
+            seg_w_c = None
+            if need_dksw or need_dvsw:
+                kw_keys = r_idx.expand(R, t1 - t0, w) * T + src_win
+                seg_w_c = _seg_structure(kw_keys.reshape(-1), R * T)
+                del kw_keys
             src_sel = src32.to(torch.int64)
             qh = q_h[:, t0:t1].to(torch.float32)
             dOh = dO_h[:, t0:t1].to(torch.float32)
@@ -1282,6 +1277,10 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                     _seg_apply(seg_w_c, dvl[:, :, nb:].reshape(-1, hd), dksw_scratch)
                     dvsw_slab.add_(dksw_scratch)
                 del dvl
+            del (src32, src64, lt_sel, sel_ok, src_win, win_ok, lane_ok, anyrow,
+                 soft_c, seg_b_c, seg_w_c, src_sel, qh, dOh, Kb, Kw, Vb, Vw,
+                 Kl, Vl, zA, g, gh, P_S, GS, dzS, P_sinkS, P_sinkA, P_A,
+                 P_A_f, GA, dzA, dz)
         if dk_blk is not None:
             dk_blk[:, :, h, :] = dk_slab.view(R, Bm, hd).to(dtype)
         if dv_blk is not None:
