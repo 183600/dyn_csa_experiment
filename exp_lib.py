@@ -845,6 +845,36 @@ def _full_attn_row_chunk(device, B, nh, T, elem_size, max_rows=1024):
     per_row = max(1, 3 * int(B) * int(nh) * int(T)) * int(elem_size)
     return max(1, min(row_chunk, int(budget) // per_row))
 
+def _window_attn_chunk(q_c, k, v, s, e, lo, window, scale):
+    dev = q_c.device
+    pos = _arange_cache(int(k.shape[1]), dev)
+    qpos = pos[s:e, None]
+    kpos = pos[lo:e][None, :]
+    allowed = (kpos <= qpos) & (kpos > qpos - int(window))
+    mask = torch.zeros((e - s, e - lo), device=dev, dtype=q_c.dtype)
+    mask.masked_fill_(~allowed, float('-inf'))
+    out = F.scaled_dot_product_attention(
+        q_c.transpose(1, 2), k[:, lo:e].transpose(1, 2), v[:, lo:e].transpose(1, 2),
+        attn_mask=mask, scale=scale)
+    return out.transpose(1, 2)
+
+def _window_attn_local(q, k, v, window, scale):
+    B, T, nh, hd = q.shape
+    out = torch.empty_like(q)
+    row_chunk = _full_attn_row_chunk(q.device, B, nh, T, q.element_size())
+    row_chunk = max(1, min(int(T), row_chunk, max(int(window), 32)))
+    _ck = torch.is_grad_enabled() and q.requires_grad
+    for s in range(0, T, row_chunk):
+        e = min(s + row_chunk, T)
+        lo = max(0, s - int(window) + 1)
+        if _ck:
+            out[:, s:e] = torch.utils.checkpoint.checkpoint(
+                _window_attn_chunk, q[:, s:e], k, v, s, e, lo, int(window), scale,
+                use_reentrant=False, preserve_rng_state=False)
+        else:
+            out[:, s:e] = _window_attn_chunk(q[:, s:e], k, v, s, e, lo, int(window), scale)
+    return out
+
 def _tri_full(n, device, k):
     with torch.inference_mode(False):
         m = torch.empty((n, n), device=device)
@@ -2453,20 +2483,16 @@ class HybridAttention(nn.Module):
             scale = 1.0
         else:
             scale = 1.0 / math.sqrt(self.hd)
-        # Both branches build the same masked-lane tables: a full cached
-        # bool mask within the row cap, or the matching row slice per chunk
-        # beyond it.  The fused SDPA path for a sliding window needs the full
-        # additive mask (causal_window_mask_f), so it is used only within the
-        # row cap; otherwise the chunked manual path below is used (sink-free
-        # chunks are supported).
+        # The sink branch builds a full cached bool mask within the row cap,
+        # or the matching row slice per chunk beyond it.
         _use_full_mask = T * T * 4 <= _DENSE_MASK_ROW_CAP_BYTES
-        if self.sink is None and (self.cfg.window <= 0 or _use_full_mask):
-            sdpa_kw = dict(scale=scale)
-            if self.cfg.window > 0:
-                sdpa_kw['attn_mask'] = causal_window_mask_f(T, self.cfg.window, x.device, q.dtype)
-            else:
-                sdpa_kw['is_causal'] = True
-            out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
+        if self.sink is None:
+            if 0 < self.cfg.window < T:
+                out = _window_attn_local(q, k, v, self.cfg.window, scale)
+                return self.W_o(out.reshape(B, T, self.nh * self.hd))
+            out = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                is_causal=True, scale=scale).transpose(1, 2)
             return self.W_o(out.reshape(B, T, self.nh * self.hd))
         if _use_full_mask:
             if self.cfg.window > 0:

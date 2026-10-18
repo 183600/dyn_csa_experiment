@@ -193,21 +193,16 @@ class HybridAttentionRoPE(L.HybridAttention):
             scale = 1.0
         else:
             scale = 1.0 / math.sqrt(self.hd)
-        # windowed and full masks are mutually exclusive: pick the one the call
-        # actually uses (both are cached constants, so values are unchanged).
-        # Both branches produce the same mask values: a full cached mask
-        # within the row cap, or the matching row slice per chunk beyond it.
+        # The sink branch builds a full cached mask within the row cap, or the
+        # matching row slice per chunk beyond it.
         _use_full_mask = T * T * 4 <= L._DENSE_MASK_ROW_CAP_BYTES
-        # A sliding-window SDPA call needs the full additive mask, so it is
-        # used only within the row cap; the chunked path below also supports
-        # a missing sink (sink_view=None).
-        if self.sink is None and (cfg.window <= 0 or _use_full_mask):
-            sdpa_kw = dict(scale=scale)
-            if cfg.window > 0:
-                sdpa_kw['attn_mask'] = L.causal_window_mask_f(T, cfg.window, x.device, q.dtype)
-            else:
-                sdpa_kw['is_causal'] = True
-            out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **sdpa_kw).transpose(1, 2)
+        if self.sink is None:
+            if 0 < cfg.window < T:
+                out = L._window_attn_local(q, k, v, cfg.window, scale)
+                return self.W_o(out.reshape(B, T, self.nh * self.hd))
+            out = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                is_causal=True, scale=scale).transpose(1, 2)
             return self.W_o(out.reshape(B, T, self.nh * self.hd))
         if _use_full_mask:
             if cfg.window > 0:
