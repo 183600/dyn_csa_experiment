@@ -250,7 +250,7 @@ RNG 流、不改返回内容，因此不触碰 §3.1 的可比性（`CODE_SEMANT
 ## 8. 仓库边界
 
 仓库只承载**源码、驱动脚本与设计文档**：实验结果目录、分析目录、逐版
-报告、运行状态文件都不入库（`.gitignore` 白名单保证，`docs/` 仅留本文档）。
+报告、运行状态文件都不入库（`.gitignore` 白名单保证，`docs/` 仅留 `design_notes.md` 与 `compute_plan.md`）。
 实测数字一律由零 GPU 的报告构建器从落盘产物现算，不写死在任何仓库
 文件中——写死的数字在仓库内没有可复核的来源，代码一改就会与报告静默
 矛盾。
@@ -752,3 +752,92 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
 对请求的每个标签取平均（样本中缺席的标签按 F1=0 计入，不会被静默丢掉）。
 `metric_policy_audit` 另外检查：F1 记录必须注明 averaging 口径；1:1000
 以下只报 ROC-AUC 或缺 PR-AUC 流行率底线的记录会告警。
+
+
+## 22. 评审三（review 3）后的统计与证据硬化
+
+本节记录本轮实际改动的口径，避免把「代码里有字段」误读成「结论已确认」。
+
+### 22.1 PPL 聚合与不确定性
+
+- 训练/长度评估现在同时落盘 `nll_sum`、`n_tokens`、逐文档 `nll_per_row` /
+  `n_tokens_per_row`（`eval_ppl(..., return_stats=True)`；长度面板另存
+  `nll_per_seq`）。
+- `aggregate` 的主聚合改为 `ppl_pooled = exp(ΣNLL / Σtokens)`，并保留
+  `ppl_mean_arithmetic`、`ppl_median`、IQR、seed-level t 区间与文档
+  bootstrap 区间。旧记录缺 NLL 时明确回退为 `arithmetic_seed_mean_fallback`，
+  不伪装成 pooled。
+- 报告仍打印 seed 标准差，但必须标成 **seed-level**；文档 bootstrap 才是
+  评测文档抽样不确定性。`eval_subset` 只控制训练过程中的曲线评估；最终
+  PPL 仍用完整固定验证批（历史口径），该区别在记录中由 `eval_rows` /
+  `eval_fp` 显式化。
+
+### 22.2 符号翻转检验的假设与敏感性
+
+- `paired_effect_stats` 现同时给出符号计数、paired bootstrap 区间、
+  Wilcoxon signed-rank 敏感性 p（n≤16 精确）、以及调用方提供两臂数值时的
+  **unpaired** bootstrap 区间。
+- 这些都只是敏感性读数；主检验仍是 seed-level 精确符号翻转。相同 seed
+  不等于随机分配处理，架构导致的 RNG/优化轨迹差异属于「臂」的一部分。
+  p 值永远是 seed-level，不是 token-level。
+
+### 22.3 族级校正与显著性措辞
+
+- v7/v8/v9/v10/v11 的 analysis 与 `build_report.py` 都对**展示出来的**
+  比较族做 Holm step-down；被省略/无效的比较保留 dummy p=1 槽位，不能靠
+  少报比较来缩小 m。
+- 报告正文的「显著」必须同时满足：n≥6（否则精确检验下限 >0.05 或
+  族校正不可达）、原始 p<0.05、Holm p<0.05、|mean|>std、且通过
+  `run_cfg`/`train_knobs` 配对门禁。任一不满足只能写「方向性 / 名义显著 /
+  未过校正」，不得写「证伪」「机制性」「更稳固」。
+
+### 22.4 训练目标、参数与 KV 的公平性字段
+
+- 每条记录新增 `train_objective`（comp_reg 是否实际生效、delta_logit 的
+  LR 倍数是否实际生效、boundary policy）与 `param_breakdown`
+  （total/attention/MLP/embedding/head/active）、
+  `kv_cache_elements_per_token`。
+- `methodology_audit` 对同一 `run_cfg` 但目标不同的对照给出
+  `objective_confounded` 警告与 `mechanism_claim_allowed=False`。这不会
+  阻止配对（那会让所有 dense-vs-sparse 对比消失），但会阻止把它写成
+  「隔离机制」。
+- 参数量匹配容差统一为 1%（`_param_control` 与报告共用）；冻结确认的
+  准入还检查 params 相对差与完整 seed 覆盖。
+
+### 22.5 动态边界的梯度来源（重要）
+
+- 默认 `csa_dynamic` 的硬切分是 `gate.detach() > 0.5`，在 `no_grad` 中
+  生成块边界；LM 交叉熵**不能**通过离散边界反传。`delta_logit` 与
+  `fuse_conv` 只从 `comp_reg` 得到梯度，`W_DQ/W_DK/W_w` 走的是 soft
+  attention 的 straight-through 代理，不是 top-k 身份。因此默认臂应描述为
+  「余弦阈值 + 由压缩率正则训练的标量偏移」。
+- 新增 opt-in `csa_dynamic_task`：切分决策按 gate 概率采样，训练损失加入
+  score-function 项 `-(CE - baseline) * logπ / n_decisions`。这才是「任务
+  损失可训练边界」的臂；它已加入 `ABL_VARIANTS` / `ABLATION_DESIGN`。
+- `csa_dyn_nocomp` 把 `comp_lambda_mult` 置零，同时冻结了 `delta_logit`
+  的唯一梯度来源；它是「损失项移除」臂，不是「仅关正则、其余完全不变」
+  的臂，报告必须这样写。
+
+### 22.6 合成记录、长度与规模
+
+- `run_gapfill.synthesize_long_summary` 生成的 `synthesized` 记录只用于
+  历史曲线展示；v10/v11 的 crossover 现在**先剔除**这些 seed，而不是
+  事后标记。拟合至少需要 3 个独立、预算可比的点，否则只报
+  `insufficient_points`，不报斜率/幂律。
+- 长度面板统一在 512 训练、在 512–4096 评估，`n_seq` 写入 recipe 与记录；
+  这是**长度外推探针**，不是长上下文训练。块数/选择率随长度变化，报告
+  必须并列给出。
+- 交叉规模面板的 batch/seq/steps/eval 网格并不相同；报告保留
+  「方向性、非幂律」措辞，不把 4 个点拟合成 scaling law。
+
+### 22.7 证据归档与环境
+
+- `archive_release.py` 现在打包 `DECISION_LOG.md`、`requirements.txt`、
+  `requirements.lock`、冻结锁、逐文件 SHA-256 清单、checkpoint 哈希、
+  `pip freeze` 与环境快照；`verify` 独立复核。
+- `exp_lib` 不再在 import 时自动 pip install；`HF_ENDPOINT` 默认官方，
+  `CSA_HF_MIRROR=1` 才使用镜像。`pyproject.toml` 声明 Python ≥3.12，
+  `requirements.txt` 给兼容范围，发布时用 `pip freeze > requirements.lock`。
+- 仍存在的边界：WikiText-103 官方 split 之间有近重复文档，审计只量化、
+  不删除；16 条 test 文档不覆盖语言总体；实际推理延迟/吞吐/峰值显存必须
+  在真实 checkpoint 上测量，解析 FLOPs/KV 只作结构性读数。

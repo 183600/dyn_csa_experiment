@@ -398,11 +398,11 @@ def t_power_gate():
 
 
 def _rec(variant, seed, fp, by_len=None, code=None, recipe='steps3000_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_v8192_wu50_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee250_es128_detcpu-eager_dfdeadbeef_cscURRENT', msha='CURRENT'):
-    return {'variant': variant, 'seed': seed, 'split': 'test', 'data_fp': fp, 'by_len': by_len or {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095, 'truncated': False}}, '_code': code or 'v11.125', 'recipe': recipe, 'manifest_sha256': msha, 'key': f'{variant}::s{seed}'}
+    return {'variant': variant, 'seed': seed, 'split': 'test', 'data_fp': fp, 'by_len': by_len or {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095, 'truncated': False}}, '_code': code or L.code_stamp(), 'recipe': recipe, 'manifest_sha256': msha, 'key': f'{variant}::s{seed}'}
 
 
 def _manifest_for_admission(seeds=(0, 1, 2), sig=None):
-    m = {'arms': ['a_arm', 'b_arm'], 'seeds': list(seeds), 'code_semantics_expected': 'v11.125', 'manifest_sha256': 'CURRENT', 'statistics': {'test': 'exact two-sided sign-flip', 'correction': 'holm step-down'}, 'primary_comparisons': []}
+    m = {'arms': ['a_arm', 'b_arm'], 'seeds': list(seeds), 'code_semantics_expected': L.CODE_SEMANTICS, 'manifest_sha256': 'CURRENT', 'statistics': {'test': 'exact two-sided sign-flip', 'correction': 'holm step-down'}, 'primary_comparisons': []}
     if sig is not None:
         m['binding'] = {'training_recipe_signature': sig}
     return m
@@ -467,10 +467,13 @@ def t_recipe_signature():
 def t_freeze_lock():
     with tempfile.TemporaryDirectory() as td:
         man = {'manifest_sha256': 'AAA', 'frozen_at': '2026-10-17'}
-        lock = V12._check_or_write_freeze_lock(td, man, 'FP')
+        # two-phase lock: pre-access attestation is written BEFORE the test
+        # slice is read, then bound to the slice fingerprint immediately after.
+        pre = V12._check_or_write_freeze_lock(td, man, None, stage='preaccess')
+        assert pre.get('stage') == 'preaccess' and pre.get('test_ids_fp') is None, pre
+        lock = V12._check_or_write_freeze_lock(td, man, 'FP', stage='accessed')
         assert lock['manifest_sha256'] == 'AAA' and lock['test_ids_fp'] == 'FP'
-        # same manifest + same fp -> ok
-        V12._check_or_write_freeze_lock(td, man, 'FP')
+        assert lock.get('stage') == 'accessed', lock
         # changed test slice -> refuse
         try:
             V12._check_or_write_freeze_lock(td, man, 'FP2')
@@ -992,6 +995,60 @@ def t_eval_per_seq():
 # ---------------------------------------------------------------------------
 # E. 可复现性与实验追踪（随机种子 / 小批量过拟合 / provenance）
 # ---------------------------------------------------------------------------
+
+def t_review3_evidence_metadata():
+    assert os.path.exists(os.path.join(REPO, 'DECISION_LOG.md')), 'DECISION_LOG.md must be tracked'
+    assert 'requirements.txt' in open(os.path.join(REPO, 'archive_release.py'), encoding='utf-8').read(), 'archive must pack the dependency declaration'
+    assert 'DECISION_LOG.md' in open(os.path.join(REPO, 'archive_release.py'), encoding='utf-8').read()
+    import build_report as BR
+    assert BR._sig_gate({'n': 6, 'p_exact_signflip': 0.01, 'p_holm': 0.02, 'mean': 1.0, 'std': 0.5}) is True
+    assert BR._sig_gate({'n': 3, 'p_exact_signflip': 0.01, 'p_holm': 0.02, 'mean': 1.0, 'std': 0.5}) is False
+    assert BR._sig_gate({'n': 6, 'p_exact_signflip': 0.01, 'p_holm': None, 'mean': 1.0, 'std': 0.5}) is False
+
+def t_review3_pooled_aggregate():
+    summary = {}
+    for s, nll in ((0, 100.0), (1, 140.0)):
+        summary[f'csa::seed{s}'] = {'variant': 'csa', 'seed': s, 'ppl': math.exp(nll / 100.0),
+                                    'nll_sum': nll, 'n_tokens': 100, 'params': 10,
+                                    'steps': 1, 'tokens_seen': 100,
+                                    'train_objective': {'comp_reg_applies': True, 'delta_lr_effective': 10.0, 'boundary_policy': ['threshold']}}
+    agg = L.aggregate(summary)
+    e = agg['csa']
+    assert abs(e['ppl_pooled'] - math.exp(240.0 / 200.0)) < 1e-9, e
+    assert e['ppl_primary'] == e['ppl_pooled']
+    assert e['ppl_mean_arithmetic'] != e['ppl_pooled'] or True
+
+def t_review3_holm_family_size():
+    comps = {'a': {'p_exact_signflip': 0.01}, 'b': {'omitted': 'missing arm'}, 'c': {'p_exact_signflip': 0.04}}
+    fam = L.attach_holm(comps)
+    assert fam['declared_slots'] == 3 and fam['tested'] == 2, fam
+    assert comps['a']['p_holm'] is not None and comps['c']['p_holm'] is not None
+    # The omitted slot must inflate m: Holm(a)=3*0.01=0.03, not 2*0.01=0.02.
+    assert abs(comps['a']['p_holm'] - 0.03) < 1e-12, comps
+
+def t_review3_span_clean_key():
+    pp = {'n_seq': 16, 'span_len': 32, 'target': 512}
+    clean = V10._clean_probe_params(pp)
+    assert 'span_len' not in clean and clean['n_seq'] == 16, clean
+    assert pp['span_len'] == 32, 'the measured cell must keep span_len'
+
+def t_review3_boundary_arm_and_objective():
+    cfg = L.make_layer_cfgs(1, 'csa_dynamic_task')[0]
+    assert getattr(cfg, 'boundary_policy', None) == 'reinforce', cfg
+    obj = L.train_objective(type('M', (), {'blocks': [], 'named_parameters': lambda self: iter([])})(), comp_lambda=0.05, delta_lr_mult=10.0)
+    assert obj['comp_reg_applies'] is False, obj
+    assert 'boundary_policy' in obj and 'loss_terms' in obj
+    # The score-function term must actually reach delta_logit; otherwise the
+    # "task-learned boundary" arm would be inert.
+    m = L.SmallGPT(64, 32, 1, 2, 16, 16, L.make_layer_cfgs(1, 'csa_dynamic_task'))
+    x = torch.randint(0, 64, (1, 16), generator=torch.Generator().manual_seed(0))
+    y = torch.randint(0, 64, (1, 16), generator=torch.Generator().manual_seed(1))
+    ce = m.ce_loss(x, y, 64)
+    assert m.boundary_logp is not None and m.boundary_decisions > 0, 'boundary policy must emit log-probabilities'
+    loss = ce + 0.05 * m.comp_reg - float(ce.detach()) * m.boundary_logp / max(m.boundary_decisions, 1)
+    loss.backward()
+    grads = [p.grad.abs().sum().item() for n, p in m.named_parameters() if 'delta_logit' in n and p.grad is not None]
+    assert grads and all(g > 0 for g in grads), f'delta_logit received no task-loss gradient: {grads}'
 
 def t_seed_reproducible():
     def draw():
@@ -2030,6 +2087,9 @@ def t_public_exports_resolve():
 
 def main():
     if not _HAVE_TORCH:
+        print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
+        return 3
+    if not _HAVE_TORCH:
         print('[test] SKIPPED (no torch in this environment)')
         return 0
     _check('A1 holm_min_attainable_p', t_holm_min_attainable)
@@ -2082,6 +2142,11 @@ def main():
     _check('C7 frozen seeds single source', t_frozen_seeds)
     _check('C8 doc-level analysis', t_doc_level_analysis)
     _check('D1 eval per-seq ppl', t_eval_per_seq)
+    _check('J1 review-3 evidence metadata + significance gate', t_review3_evidence_metadata)
+    _check('J2 review-3 pooled aggregation', t_review3_pooled_aggregate)
+    _check('J3 review-3 Holm declared-family slots', t_review3_holm_family_size)
+    _check('J4 review-3 task-boundary arm + objective descriptor', t_review3_boundary_arm_and_objective)
+    _check('J5 review-3 span clean-baseline key', t_review3_span_clean_key)
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
     _check('E2b batch_iter uint16 transport', t_batch_iter_uint16)

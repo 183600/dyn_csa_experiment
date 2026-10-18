@@ -151,6 +151,12 @@ def _load_manifest(path):
         if field not in m:
             raise SystemExit(f'[v12] REFUSE: freeze manifest {path} lacks the required field {field!r} — refusing to guess the pre-registration')
     _exp = m.get('code_semantics_expected')
+    if L._kernel_stamp():
+        # The frozen plan was pre-registered for the eager measurement
+        # semantics.  Kernel mode appends '-tk1:<backend>' to `_code`, so the
+        # load gate and the admission gate would disagree and P5T could burn
+        # the one-shot test access before admitting zero records.
+        raise SystemExit(f'[v12] REFUSE: CSA_KERNEL is set ({L._kernel_stamp()!r}) but the frozen confirmation plan is EAGER-only; unset CSA_KERNEL or re-freeze explicitly')
     if _exp is not None and str(_exp) != str(L.CODE_SEMANTICS):
         raise SystemExit(f'[v12] REFUSE: freeze manifest expects code semantics {_exp!r} but the current code is {L.CODE_SEMANTICS!r} — the code changed after freezing; re-freeze consciously (update {path} with a dated note) instead of silently testing new code under the old pre-registration')
     # The statistics block is a pre-registration contract: the analyzer must
@@ -160,6 +166,17 @@ def _load_manifest(path):
     _ns = _stat.get('n_seeds')
     if _ns is not None and int(_ns) != len(m['seeds']):
         raise SystemExit(f'[v12] REFUSE: freeze manifest declares n_seeds={_ns} but lists {len(m["seeds"])} seeds — the pre-registered resolution and the seed list disagree')
+    _bind = m.get('binding') or {}
+    _ts = (_bind.get('test_slice') or {}) if isinstance(_bind, dict) else {}
+    _eval = m.get('eval') or {}
+    if _ts and _eval:
+        _ts_n = _ts.get('n_seqs')
+        _ev_n = _eval.get('n_seqs_clean')
+        if _ts_n is not None and _ev_n is not None and int(_ts_n) != int(_ev_n):
+            raise SystemExit(f'[v12] REFUSE: binding.test_slice.n_seqs={_ts_n} disagrees with eval.n_seqs_clean={_ev_n} — the machine-checkable binding block and the evaluation plan must describe the same slice')
+    _tokb = (_bind.get('tokenizer') or {}) if isinstance(_bind, dict) else {}
+    if _tokb and str(_tokb.get('fit', '')).lower() and 'train' not in str(_tokb.get('fit', '')).lower():
+        raise SystemExit(f'[v12] REFUSE: binding.tokenizer.fit={_tokb.get("fit")!r} is not the train-only fit required by the freeze')
     _test = str(_stat.get('test', 'exact two-sided sign-flip over paired per-seed deltas')).lower()
     if 'sign-flip' not in _test and 'sign flip' not in _test:
         raise SystemExit(f'[v12] REFUSE: freeze manifest pre-registers test {_stat.get("test")!r}, but this analyzer only implements the exact two-sided sign-flip test — update the code or re-freeze')
@@ -309,7 +326,7 @@ def _freeze_lock_path(outdir):
     return os.path.join(outdir, _LOCK_NAME)
 
 
-def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp):
+def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access'):
     """Persistent first-test-access lock (review-2 issue 3).
 
     首次测试访问后禁止修改计划：P5T 一旦在 outdir 落下首条记录（或本函数
@@ -345,10 +362,18 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp):
             print(f'[v12] freeze lock UPDATED: {lp} (manifest {str(_sha)[:12]}…; {len(lock["superseded"])} superseded plan(s) kept)')
         if test_ids_fp is not None and lock.get('test_ids_fp') not in (None, test_ids_fp):
             raise SystemExit(f'[v12] REFUSE: the held-out test slice changed after the first access (lock has ids_fp {lock.get("test_ids_fp")}, current {test_ids_fp}) — the test data itself is part of the freeze; investigate before proceeding')
+        if test_ids_fp is not None and lock.get('test_ids_fp') is None:
+            # two-phase lock: the pre-access record was written before the
+            # first read; bind the exact slice immediately after it.
+            lock['test_ids_fp'] = test_ids_fp
+            lock['stage'] = 'accessed'
+            lock['history'] = list(lock.get('history') or []) + [{'stage': 'accessed', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp}]
+            L.atomic_write_json(lp, lock, indent=2)
+            print(f'[v12] freeze lock updated with the first-access slice fingerprint: {lp}')
         return lock
-    lock = {'manifest_sha256': _sha, 'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST), 'frozen_at': manifest.get('frozen_at'), 'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'code_semantics': L.CODE_SEMANTICS, 'note': 'first test-split access: the plan may not change after this point (V12_REFREEZE=1 overrides consciously, downgrading the earlier round to exploratory)'}
+    lock = {'manifest_sha256': _sha, 'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST), 'frozen_at': manifest.get('frozen_at'), 'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'stage': stage, 'code_semantics': L.code_stamp(), 'history': [{'stage': stage, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp}], 'note': 'first test-split access: the plan may not change after this point (V12_REFREEZE=1 overrides consciously, downgrading the earlier round to exploratory)'}
     L.atomic_write_json(lp, lock, indent=2)
-    print(f'[v12] freeze lock written: {lp} (manifest {_sha[:12]}…, test_ids_fp {str(test_ids_fp)[:12]}…)')
+    print(f'[v12] freeze lock written: {lp} (manifest {_sha[:12]}…, stage {stage}, test_ids_fp {str(test_ids_fp)[:12]}…)')
     return lock
 
 @torch.inference_mode()
@@ -482,6 +507,13 @@ def run_finaltest(cfg=None, guard=None):
     need = max([int(x) for x in manifest.get('eval', {}).get('by_length_ppl', cfg['eval_lens'])]) + 1
     _nseq_clean = int((manifest.get('eval') or {}).get('n_seqs_clean') or cfg.get('n_seq', 16))
     test_ids = cfg.get('test_ids')
+    _lock_path = _freeze_lock_path(outdir)
+    if os.path.exists(os.path.join(outdir, 'bylen.json')) and not os.path.exists(_lock_path):
+        raise SystemExit(f'[v12] REFUSE: {outdir}/bylen.json exists but there is no pre-access freeze lock — the only honest interpretation is that a test-split measurement predates the lock; investigate before reusing it')
+    # Write the pre-access attestation BEFORE reading the held-out split.  The
+    # old order (read, then lock) could burn the one-shot access and only then
+    # discover a manifest mismatch.
+    _check_or_write_freeze_lock(outdir, manifest, None, stage='preaccess')
     if test_ids is None:
         _t0 = time.time()
         test_ids, vocab_t, _, _ = L.load_wikitest(need, n_seqs=_nseq_clean)
@@ -492,7 +524,7 @@ def run_finaltest(cfg=None, guard=None):
     _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))
     # review-2 issue 3: first-test-access lock — the plan may not change after
     # the test split has been read, and the slice itself is part of the freeze.
-    _check_or_write_freeze_lock(outdir, manifest, _dfp)
+    _check_or_write_freeze_lock(outdir, manifest, _dfp, stage='accessed')
     print(f'[p5t] manifest {cfg["manifest"]} frozen_at={manifest.get("frozen_at", "?")} sha256={manifest.get("manifest_sha256", "?")[:12]}… arms={manifest["arms"]} seeds={manifest["seeds"]}')
     print(f'[p5t] TEST split rows {test_ids.shape} (held out; no other phase reads this split; ids_fp={_dfp[:12]}…)')
     if _nseq_clean < 64:
@@ -527,7 +559,7 @@ def _admit_confirmation_records(raw, manifest):
     返回 (admitted[(variant, seed)] -> record, unified data_fp)。"""
     arms = list(manifest['arms'])
     seed_whitelist = {int(s) for s in manifest['seeds']}
-    exp_code = manifest.get('code_semantics_expected')
+    exp_code = L.code_stamp()  # eager-only; kernel mode is refused at load
     sig = _recipe_signature(manifest)
     msha = manifest.get('manifest_sha256')
     admitted = {}
@@ -634,14 +666,27 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _lens = sorted({int(k) for r in rows for k in (r.get('by_len') or {})})
         for Ln in _lens:
             _by_seed = {}
+            _nll_sum = 0.0
+            _n_tok = 0
+            _pool_ok = True
             for r in rows:
                 bl = r.get('by_len') or {}
                 c = bl.get(Ln, bl.get(str(Ln)))
                 if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')):
                     _by_seed[r.get('seed')] = float(c['ppl'])
+                    _nll, _nt = c.get('nll_sum'), c.get('n_tok')
+                    if isinstance(_nll, (int, float)) and isinstance(_nt, (int, float)) and _nt > 0 and math.isfinite(float(_nll)):
+                        _nll_sum += float(_nll)
+                        _n_tok += int(_nt)
+                    else:
+                        _pool_ok = False
             if _by_seed:
                 _dl = list(_by_seed.values())
-                stats['by_length'].setdefault(v, {})[str(Ln)] = {'mean': float(np.mean(_dl)), 'n': len(_dl), 'ppl_by_seed': {str(s): p for s, p in _by_seed.items()}}
+                _pooled = math.exp(_nll_sum / _n_tok) if (_pool_ok and _n_tok > 0) else None
+                stats['by_length'].setdefault(v, {})[str(Ln)] = {'mean': float(_pooled if _pooled is not None else np.mean(_dl)),
+                                                                  'mean_arithmetic': float(np.mean(_dl)),
+                                                                  'ppl_pooled': _pooled, 'n_tokens': _n_tok,
+                                                                  'n': len(_dl), 'ppl_by_seed': {str(s): p for s, p in _by_seed.items()}, 'params': next((r.get('params') for r in rows if isinstance(r.get('params'), (int, float))), None), 'n_seqs': next((c.get('n_seq') for _r in rows for c in [((_r.get('by_len') or {}).get(Ln) or (_r.get('by_len') or {}).get(str(Ln)) or {})] if isinstance(c, dict) and c.get('n_seq') is not None), None)}
     for comp in manifest['primary_comparisons']:
         name = comp['name']
         a, b = (comp['a'], comp['b'])
@@ -676,6 +721,20 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             continue
         res = V.exact_sign_permutation(dl)
         res['seeds'] = common
+        res['coverage_ok'] = bool(len(common) == len(manifest['seeds']))
+        res['missing_seeds'] = sorted(set(int(s) for s in manifest['seeds']) - set(int(s) for s in common))
+        _pa = [recs_a[s].get('params') for s in common if isinstance(recs_a[s].get('params'), (int, float))]
+        _pb = [recs_b[s].get('params') for s in common if isinstance(recs_b[s].get('params'), (int, float))]
+        if _pa and _pb:
+            _am, _bm = float(np.mean(_pa)), float(np.mean(_pb))
+            _rel = abs(_am - _bm) / max(_am, _bm, 1.0)
+            res['param_matched'] = bool(_rel <= 0.01)
+            res['param_rel_diff'] = float(_rel)
+            res['params_a'] = _am
+            res['params_b'] = _bm
+        else:
+            res['param_matched'] = None
+            res['param_rel_diff'] = None
         res['data_fp'] = unified_fp
         res['manifest_sha256'] = manifest.get('manifest_sha256')
         res['delta_definition'] = f'{a} - {b} (paired per seed, test split)'
@@ -702,8 +761,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # observed direction to match the validation-panel estimate (a null
     # expected_sign marks a non-directional mechanism readout).  The strict `<`
     # matches the manifest's `p_holm < 0.05` (the generic holm_adjust uses `<=`).
-    _conf = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') in (True, None)]
+    _conf = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is True
+             and stats['comparisons'].get(k, {}).get('param_matched') is not False
+             and stats['comparisons'].get(k, {}).get('coverage_ok') is True]
     stats['confirmed'] = _conf
+    stats['significant_nondirectional'] = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is None]
+    stats['not_confirmed_reasons'] = {k: {'param_matched': stats['comparisons'].get(k, {}).get('param_matched'),
+                                          'coverage_ok': stats['comparisons'].get(k, {}).get('coverage_ok'),
+                                          'direction_ok': stats['comparisons'].get(k, {}).get('direction_ok')}
+                                      for k in _rej if k not in _conf}
     _m = len(manifest['primary_comparisons'])
     _n = len(manifest['seeds'])
     _fl = L.signflip_p_floor(_n)
@@ -806,41 +872,52 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     bl = ft.get('by_length') or {}
     if bl:
         _lens = sorted({int(k) for v in bl.values() for k in v})
-        A('| 臂 | ' + ' | '.join((f'PPL@{Ln}' for Ln in _lens)) + ' |')
-        A('|---|' + '---|' * len(_lens))
+        A('| 臂 | params | n_seq | ' + ' | '.join((f'PPL@{Ln}' for Ln in _lens)) + ' |')
+        A('|---|---|---|' + '---|' * len(_lens))
         for v in sorted(bl):
             row = []
+            _p0 = None
+            _n0 = None
             for Ln in _lens:
                 e = bl[v].get(str(Ln))
+                if isinstance(e, dict):
+                    if _p0 is None:
+                        _p0 = e.get('params')
+                    if _n0 is None:
+                        _n0 = e.get('n_seqs')
                 row.append(f'{e["mean"]:.2f} (n={e["n"]})' if e else '—')
-            A(f'| `{v}` | ' + ' | '.join(row) + ' |')
+            A('| `%s` | %s | %s | ' % (v, _p0 if _p0 is not None else '—', _n0 if _n0 is not None else '—') + ' | '.join(row) + ' |')
         A('')
     else:
         A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python v12_supp.py phase P5C`（现覆盖全部四个冻结臂、种子数取自清单；主臂 0-5 已由 P3MT/P4MT 训练，resume 自动跳过），然后 `python v12_supp.py phase P5T`。冻结清单已入库（见上），随时可以执行；执行前请勿据任何 validation 读数调整冻结内容。')
         A('')
     comps = ft.get('comparisons') or {}
     if comps:
-        A('| 冻结主比较（test split，配对） | n | Δ mean±std | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
-        A('|---|---|---|---|---|---|---|---|---|')
+        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | Δ mean±std | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
+        A('|---|---|---|---|---|---|---|---|---|---|---|')
         holm = ft.get('holm') or {}
         for k, v in comps.items():
             if 'omitted' in v:
-                A(f'| {k} | 0 | —（{v["omitted"]}） | — | — | — | — | — | — |')
+                A(f'| {k} | 0 | — | — | —（{v["omitted"]}） | — | — | — | — | — | — |')
                 continue
             _h = holm.get(k) or {}
             _hp = f'{_h.get("p_holm", float("nan")):.3f}' if _h.get('p_holm') is not None else '—'
             _hr = '✔' if (_h.get('p_holm') is not None and float(_h['p_holm']) < 0.05) else '✘'
             _dir = v.get('direction_ok')
             _ds = '—（非方向性）' if _dir is None else ('✔' if _dir else '✘')
-            A(f'| {k} | {v["n"]} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
+            A(f'| {k} | {v["n"]} | {v.get("coverage_ok")} | {v.get("param_matched")} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
         A('')
         _conf = ft.get('confirmed')
         if _conf is None:
-            _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') in (True, None))]
+            _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') is True) and (comps.get(k, {}).get('param_matched') is not False) and (comps.get(k, {}).get('coverage_ok') is True)]
         if _conf:
             A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
         else:
             A('**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < 0.05」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
+        _nd = ft.get('significant_nondirectional') or []
+        if _nd:
+            A('')
+            A(f'**非方向性机制读数**：{sorted(_nd)} 在 Holm 校正后达到 p<0.05，但冻结清单未给方向（expected_sign=null），只能作为机制读数，不能计入「方向符合预注册」的确认集合。')
         if ft.get('min_attainable_p_holm') is not None:
             A('')
             A(f"（诊断：n 个种子与 m 元 Holm 族下，最小可达 Holm p = {ft['min_attainable_p_holm']:.4f}。加载期功效门槛已拒绝「数学上不可能确认」的清单；若此处仍 > 0.05，说明有绕过门槛的旧状态，需回查清单与记录的来源。）")

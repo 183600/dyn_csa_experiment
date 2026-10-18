@@ -1,5 +1,9 @@
 import os
-os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+# Reproducibility: do NOT silently redirect the Hugging Face Hub to a mirror.
+# The mirror may lag/differ from the official Hub; opt in explicitly when the
+# official endpoint is unreachable.
+if os.environ.get('CSA_HF_MIRROR', '').strip().lower() in ('1', 'true', 'yes'):
+    os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 # PYTHONHASHSEED only takes effect when it is set before the interpreter
 # starts; setting it here is a best-effort propagation to child processes
 # (par.py workers, resumed runs).  The experiment itself never depends on
@@ -26,11 +30,18 @@ for _pkg in ('datasets', 'tokenizers', 'matplotlib'):
     except ImportError:
         _NEEDED.append(_pkg)
 if _NEEDED:
-    print(f"[setup] installing missing package(s): {', '.join(_NEEDED)}")
-    try:
-        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', *_NEEDED])
-    except Exception as _pip_err:
-        print(f"[setup] could not install {', '.join(_NEEDED)} ({type(_pip_err).__name__}: {_pip_err}) — continuing; a code path that actually needs them will raise ImportError")
+    # Import-time pip install is a reproducibility hazard: it silently changes
+    # the environment and can fetch a different version on every run.  It is
+    # now opt-in; the normal path tells the user what to install.
+    _msg = f"missing optional package(s): {', '.join(_NEEDED)}; install the pinned requirements (requirements.txt / requirements.lock) before running"
+    if os.environ.get('CSA_AUTO_INSTALL', '').strip().lower() in ('1', 'true', 'yes'):
+        print(f"[setup] CSA_AUTO_INSTALL=1 — installing {', '.join(_NEEDED)} (not pinned; archive the resulting pip freeze)")
+        try:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', *_NEEDED])
+        except Exception as _pip_err:
+            print(f"[setup] could not install {', '.join(_NEEDED)} ({type(_pip_err).__name__}: {_pip_err}) — continuing; a code path that actually needs them will raise ImportError")
+    else:
+        print(f"[setup] {_msg}")
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
 import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections
@@ -121,7 +132,7 @@ RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000
 # 的去一法对照；`csa_dyn_*` 是同一组去一法在**动态分块**（主方法）下的对照——
 # 只报固定分块下的去一法无法支撑「该模块在提出的动态方法里各自有用」。两组
 # 都是「与 csa_dynamic / csa_fixed 逐字段同构，仅待验证模块不同」。
-ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'csa_dyn_nocomp', 'full_sink']
+ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'csa_dyn_nocomp', 'csa_dynamic_task', 'full_sink']
 # 去一法要成立，「Full」与各「Full−X」臂必须落在**同一个面板**里：ABLATION_DESIGN
 # 的每条对照都靠 pair_reason 在同一 run_cfg 下逐种子配对，methodology_audit 也按
 # 单面板 summary 审计——参照臂不在面板内时该面板只能报「缺臂」，撑不起任何
@@ -2376,6 +2387,11 @@ class AttnCfg:
     full_sink: bool = False
     fuse_mode: str = 'none'
     fuse_kernel: int = 5
+    # 'threshold' preserves the historical hard-cut behaviour.  'reinforce'
+    # samples the cut decisions and adds a score-function term for the LM loss,
+    # so the task objective can actually learn the boundary policy instead of
+    # only the compression-rate regularizer (review 3 issue 6).
+    boundary_policy: str = 'threshold'
 
 class HybridAttention(nn.Module):
 
@@ -2389,6 +2405,8 @@ class HybridAttention(nn.Module):
         nn.init.xavier_uniform_(self.W_q.weight)
         nn.init.xavier_uniform_(self.W_o.weight)
         self.last_gate_mean = None
+        self.last_boundary_logp = None
+        self.last_boundary_decisions = 0
         self.need_reg = True
         self._stats = None
         self._cuts = None
@@ -2674,6 +2692,12 @@ class HybridAttention(nn.Module):
         prefix_mean.add_(self.delta_logit)
         prefix_mean.sub_(sim)
         prefix_mean.div_(max(cfg.temperature, 0.001))
+        if getattr(cfg, 'boundary_policy', 'threshold') == 'reinforce' and torch.is_grad_enabled():
+            logits = prefix_mean
+            gate = torch.sigmoid(logits)
+            gate_bool = torch.bernoulli(gate).bool()
+            logp = -F.binary_cross_entropy_with_logits(logits, gate_bool.to(gate.dtype), reduction='sum')
+            return (gate, gate_bool, logp)
         gate = torch.sigmoid_(prefix_mean)
         return (gate, gate.detach() > _HALF)
 
@@ -2709,6 +2733,12 @@ class HybridAttention(nn.Module):
         prefix_mean.add_(self.delta_logit)
         prefix_mean.sub_(sim)
         prefix_mean.div_(max(cfg.temperature, 0.001))
+        if getattr(cfg, 'boundary_policy', 'threshold') == 'reinforce' and torch.is_grad_enabled():
+            logits = prefix_mean
+            gate = torch.sigmoid(logits)
+            gate_b = torch.bernoulli(gate).bool()
+            logp = -F.binary_cross_entropy_with_logits(logits, gate_b.to(gate.dtype), reduction='none').sum(dim=-1)
+            return ([(gate[b], gate_b[b], logp[b]) for b in range(B)], gate_b, logp)
         gate = torch.sigmoid_(prefix_mean)
         gate_b = gate.detach() > _HALF
         return ([(gate[b], gate_b[b]) for b in range(B)], gate_b)
@@ -2734,6 +2764,8 @@ class HybridAttention(nn.Module):
 
     def _single(self, x, pre=None, gate_sig=None, pre_blocks=None):
         cfg = self.cfg
+        self.last_boundary_logp = None
+        self.last_boundary_decisions = 0
         T = x.shape[0]
         assert cfg.kind in ('csa', 'hca'), 'dense layers go through _full_batched'
         scale = 1.0
@@ -2747,7 +2779,10 @@ class HybridAttention(nn.Module):
         gate_mean = None
         if cfg.chunking == 'cosine_learnable':
             if gate_sig is not None:
-                gate, gate_list = gate_sig
+                gate, gate_list = gate_sig[0], gate_sig[1]
+                if len(gate_sig) > 2:
+                    self.last_boundary_logp = gate_sig[2]
+                    self.last_boundary_decisions = int(gate.numel())
             else:
                 fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
                 sim = cosine_similarity_consecutive(fused)
@@ -2764,7 +2799,17 @@ class HybridAttention(nn.Module):
                 gate_bool = None
                 gate_list = None
                 if gate.numel():
-                    gate_bool = gate.detach() > _HALF
+                    if getattr(cfg, 'boundary_policy', 'threshold') == 'reinforce' and torch.is_grad_enabled():
+                        # score-function path: the hard cuts are sampled, and
+                        # the log-probability is returned so the LM loss can
+                        # train the boundary policy (not just comp_reg).
+                        _logits = torch.logit(gate.clamp(1e-7, 1 - 1e-7))
+                        gate_bool = torch.bernoulli(gate).bool()
+                        self.last_boundary_logp = -F.binary_cross_entropy_with_logits(
+                            _logits, gate_bool.to(gate.dtype), reduction='sum')
+                        self.last_boundary_decisions = int(gate.numel())
+                    else:
+                        gate_bool = gate.detach() > _HALF
                     # .numpy() is a view of the CPU tensor; the
                     # segmenter consumes the same booleans as the .tolist()
                     # form (design notes §6.2).
@@ -2949,13 +2994,14 @@ class HybridAttention(nn.Module):
         # to the per-row inline form for ANY batch size (design notes §6.1), so
         # it also serves B == 1 (e.g. the seq-2048 topk sweep).
         if self.cfg.chunking == 'cosine_learnable':
-            _raw, _gbool = self._gate_signals(x, pre_all)
+            _gs = self._gate_signals(x, pre_all)
+            _raw, _gbool = _gs[0], _gs[1]
             if all((_r is not None for _r in _raw)):
                 # .numpy() is a view of the stacked CPU tensor (the
                 # base tensor stays alive through the views); the segmenter
                 # consumes the same booleans.
                 _gl = _gbool.cpu().numpy()
-                gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gl)]
+                gate_sigs = [(tuple(_r) if len(_r) == 3 else (_r[0], _g)) for _r, _g in zip(_raw, _gl)]
                 # Batched block geometry for the whole batch; every value is
                 # identical to the per-row form (see _hoist_blocks_from_cuts).
                 pre_blocks = _hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
@@ -3107,6 +3153,8 @@ class SmallGPT(nn.Module):
                 pass
         self.norm = RMSNorm(d)
         self.max_seq = max_seq
+        self.boundary_logp = None
+        self.boundary_decisions = 0
 
     def _make_block(self, d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=None):
         return Block(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
@@ -3124,6 +3172,8 @@ class SmallGPT(nn.Module):
         T = ids.shape[1]
         x = self.tok(ids) + self.pos.weight[:T]
         reg = None
+        blp = None
+        bdec = 0
         for blk in self.blocks:
             x = blk(x)
             gm = blk.attn.last_gate_mean
@@ -3137,9 +3187,15 @@ class SmallGPT(nn.Module):
                     gm = tot / len(gm)
                 term = mult * (gm * Lb - 1.0) ** 2
                 reg = term if reg is None else reg + term
+            _lp = getattr(blk.attn, 'last_boundary_logp', None)
+            if _lp is not None:
+                blp = _lp if blp is None else blp + _lp
+                bdec += int(getattr(blk.attn, 'last_boundary_decisions', 0) or 0)
         if reg is None:
             reg = torch.zeros((), device=ids.device)
         self.comp_reg = reg
+        self.boundary_logp = blp
+        self.boundary_decisions = int(bdec)
         return self.norm(x)
 
     def _ce_head_chunk(self, h_chunk, tgt_chunk, vocab):
@@ -3234,6 +3290,13 @@ def make_layer_cfgs(n_layers, variant):
             cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, content_mode='zero'))
         elif variant == 'csa_dyn_nosink':
             cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, use_sink=False))
+        elif variant == 'csa_dynamic_task':
+            # Opt-in end-to-end boundary arm (review 3 issue 6): identical to
+            # csa_dynamic except the hard cuts are sampled and trained by the
+            # LM loss through a score-function term.  This is a NEW arm; the
+            # historical csa_dynamic remains threshold/comp_reg-only and must
+            # not be described as task-learned.
+            cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, boundary_policy='reinforce'))
         elif variant == 'csa_dyn_nocomp':
             # Loss-term ablation C: identical architecture, optimizer, LR
             # schedule, scale and data as `csa_dynamic`; only the compression
@@ -4479,6 +4542,112 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
 def count_params(m):
     return sum((p.numel() for p in m.parameters()))
 
+def param_breakdown(m):
+    """Parameter counts by functional group, for every record.
+
+    A headline comparison that only reports `params` invites the reviewer's
+    question "which parameters, and is the comparison capacity-matched?".
+    This is a deterministic structure-only count (no forward pass, no RNG):
+    total / attention / attention projections / indexer / MLP / norms /
+    embeddings / LM head, plus the active count (equal to total here; no MoE).
+    """
+    out = {'total': 0, 'attention': 0, 'attention_qo': 0, 'attention_kv': 0,
+           'attention_indexer': 0, 'mlp': 0, 'norms': 0, 'embedding': 0,
+           'lm_head': 0, 'other': 0, 'active': 0, 'n_layers': 0, 'n_heads': 0, 'd_head': 0}
+    for name, p in m.named_parameters():
+        n = int(p.numel())
+        out['total'] += n
+        if name.startswith('tok.') or name.startswith('pos.'):
+            out['embedding'] += n
+        elif name.startswith('head.'):
+            out['lm_head'] += n
+        elif name.startswith('norm.') or '.norm' in name:
+            out['norms'] += n
+        elif name.startswith('blocks.'):
+            if '.mlp.' in name:
+                out['mlp'] += n
+                out['attention'] += 0
+            elif '.attn.' in name:
+                out['attention'] += n
+                if any(k in name for k in ('W_DQ', 'W_DK', 'W_w', 'index')):
+                    out['attention_indexer'] += n
+                elif any(k in name for k in ('W_kvhead', 'W_aKV', 'W_bKV', 'W_aZ', 'W_bZ', 'B_pos')):
+                    out['attention_kv'] += n
+                else:
+                    out['attention_qo'] += n
+            else:
+                out['other'] += n
+        else:
+            out['other'] += n
+    try:
+        out['n_layers'] = len(m.blocks)
+        first = m.blocks[0].attn
+        out['n_heads'] = int(getattr(first, 'nh', 0) or 0)
+        out['d_head'] = int(getattr(first, 'hd', 0) or 0)
+    except Exception:
+        pass
+    out['active'] = out['total']
+    out['attention_share'] = (out['attention'] / out['total']) if out['total'] else 0.0
+    return out
+
+def kv_cache_elements_per_token(m):
+    """KV-cache elements stored per token per layer (dtype-independent).
+
+    Full attention keeps K and V of width n_heads*d_head; CSA/HCA keep the
+    compressed [c_kv | c_kv] lanes (plus the indexer's query projection is
+    weights, not cache).  This is the structural quantity behind any
+    "KV-cache ratio" claim; memory bytes additionally need dtype/allocator
+    overhead and are measured by the efficiency harness, not inferred here.
+    """
+    total = 0
+    per_layer = []
+    for blk in getattr(m, 'blocks', []):
+        a = blk.attn
+        c = a.cfg
+        if c.kind == 'full':
+            n = 2 * int(getattr(a, 'nh', 0)) * int(getattr(a, 'hd', 0))
+        else:
+            n = 2 * int(getattr(c, 'c_kv', 0))
+        per_layer.append(int(n))
+        total += int(n)
+    return {'elements_per_token_total': int(total), 'per_layer': per_layer,
+            'note': 'elements, not bytes; multiply by dtype size and add allocator/block overhead for measured memory'}
+
+def train_objective(m, *, comp_lambda=0.0, delta_lr_mult=1.0):
+    """Describe the ACTUAL optimisation objective of an arm.
+
+    Review 3: dense and sparse arms do not share an objective — sparse arms
+    add `comp_lambda * comp_reg` and give `delta_logit` a different LR.  A
+    comparison is only mechanism-clean when these descriptors match.  The
+    values are read from the built model (not from the variant name), so a
+    future arm cannot silently claim to be matched.
+    """
+    layers = [blk.attn for blk in getattr(m, 'blocks', [])]
+    policies = sorted({str(getattr(a.cfg, 'boundary_policy', 'threshold')) for a in layers})
+    # `need_reg` is True on every HybridAttention instance, including dense
+    # layers (the flag is a capability, not an applied term).  The actual
+    # regularizer exists only for cosine_learnable gates, whose trunk computes
+    # `last_gate_mean`; deriving this from `need_reg` falsely labels dense and
+    # fixed-CSA arms as having a compression objective.
+    reg_layers = sum(1 for a in layers if str(getattr(a.cfg, 'chunking', '')) == 'cosine_learnable')
+    _named = dict(m.named_parameters())
+    delta_names = [n for n in _named if 'delta_logit' in n]
+    delta_params = sum(int(_named[n].numel()) for n in delta_names)
+    applies = bool(comp_lambda) and reg_layers > 0
+    return {
+        'comp_lambda': float(comp_lambda),
+        'comp_reg_layers': int(reg_layers),
+        'comp_reg_applies': bool(applies),
+        'comp_lambda_effective': float(comp_lambda) if applies else 0.0,
+        'delta_param_count': int(delta_params),
+        'delta_lr_mult': float(delta_lr_mult),
+        'delta_lr_effective': float(delta_lr_mult) if delta_params else 1.0,
+        'boundary_policy': policies,
+        'loss_terms': ['ce'] + (['comp_reg'] if applies else []) + (
+            ['boundary_policy_gradient'] if any(p != 'threshold' for p in policies) else []),
+        'note': 'mechanism-clean comparisons require comp_reg_applies, delta_lr_effective and boundary_policy to match across arms',
+    }
+
 def result_is_current(rec, code, *required_keys):
     if not isinstance(rec, dict) or not rec:
         return False
@@ -4550,6 +4719,30 @@ def _hyperparam_reason(ra, rb):
             return f'different hyperparams.{k} ({va!r} vs {vb!r})'
     return None
 
+def objective_reason(ra, rb):
+    """Compare the ACTUAL loss/optimizer objective of two arms.
+
+    `run_cfg` carries the compression weight `cl` and the delta-LR multiplier
+    `dlm` for both arms, but dense arms do not apply `comp_reg` at all and have
+    no `delta_logit`.  Same run_cfg therefore does NOT mean same objective;
+    this helper makes the difference explicit instead of silently pairing
+    `ce` with `ce + comp_lambda*comp_reg`.  It returns None when the records
+    carry matching objective descriptors, a reason string otherwise, and
+    'unverifiable ...' when the descriptors are absent/one-sided (legacy
+    records keep the permissive path, but the state is reported)."""
+    oa, ob = ra.get('train_objective'), rb.get('train_objective')
+    if oa is None and ob is None:
+        return 'unverifiable train_objective (legacy records carry no objective descriptor)'
+    if (oa is None) != (ob is None):
+        return 'unverifiable train_objective (only one record carries the objective descriptor)'
+    if not isinstance(oa, dict) or not isinstance(ob, dict):
+        return 'unverifiable train_objective (malformed descriptor)'
+    diffs = []
+    for k in ('comp_reg_applies', 'delta_lr_effective', 'boundary_policy'):
+        if oa.get(k) != ob.get(k):
+            diffs.append(k)
+    return ('objective differs: ' + ', '.join(diffs)) if diffs else None
+
 def ppl_is_usable(v):
     return isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v) and (v > 0.0)
 
@@ -4603,6 +4796,58 @@ def holm_adjust(named_pvals, alpha=0.05):
         prev = max(prev, adj)
         out[name] = {'p_raw': p, 'p_holm': float(prev), 'rank': i + 1, 'reject': bool(prev <= alpha), 'm_effective': m}
     return out
+
+def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', exploratory=True):
+    """Attach `p_holm` to every non-omitted comparison in a dict and return a
+    family descriptor.
+
+    A report that prints many raw p-values without a correction invites
+    multiple-comparison over-reading.  The family is whatever the caller
+    displays (not silently shrunk by omitted rows: those keep a dummy p=1).
+    `exploratory=True` is a hard label, not a decoration: Holm limits
+    over-claiming but cannot turn validation-selected v7-v11 panels into
+    pre-registered confirmation (design_notes §17).
+    """
+    pairs, omitted, tested = [], [], 0
+    for k, v in (comparisons or {}).items():
+        if not isinstance(v, dict):
+            pairs.append((str(k), 1.0))
+            omitted.append(str(k))
+            continue
+        if 'omitted' in v:
+            omitted.append(str(k))
+            # A declared-but-omitted comparison keeps a dummy p=1 slot: the
+            # family size must be the DECLARED family, not the subset that
+            # happened to be measurable (same rule as methodology_audit).
+            pairs.append((str(k), 1.0))
+            continue
+        p = v.get('p_exact_signflip')
+        if p is None:
+            p = v.get('p')
+        try:
+            p = float(p)
+        except (TypeError, ValueError):
+            p = float('nan')
+        if math.isfinite(p) and 0.0 <= p <= 1.0:
+            pairs.append((str(k), p))
+            tested += 1
+        else:
+            pairs.append((str(k), 1.0))
+    h = holm_adjust(pairs, alpha=alpha) if pairs else {}
+    for k, v in (comparisons or {}).items():
+        if isinstance(v, dict):
+            v['p_holm'] = (h.get(str(k)) or {}).get('p_holm')
+    return {
+        'name': family,
+        'declared_slots': int(len(comparisons or {})),
+        'tested': int(tested),
+        'omitted': omitted,
+        'alpha': float(alpha),
+        'correction': 'holm step-down',
+        'evidence_level': 'exploratory' if exploratory else 'confirmatory',
+        'note': ('Holm over the displayed family; the panels were selected on the validation split, '
+                 'so corrected p-values still are not confirmation') if exploratory else 'pre-registered family',
+    }
 
 def signflip_p_floor(n):
     """双侧精确符号翻转检验在 n 个种子下的最小可达 p 值（2/2^n）；
@@ -4713,7 +4958,82 @@ def exact_signflip_p(deltas):
         p = math.erfc(z / math.sqrt(2.0))
     return {'n': n, 'p': float(min(1.0, p)), 'n_dropped': n_dropped, 'method': 'normal-approx'}
 
-def paired_effect_stats(deltas, alpha=0.05, min_n=3):
+def _percentile_ci(vals, lo=2.5, hi=97.5):
+    v = [float(x) for x in vals if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))]
+    if len(v) < 2:
+        return None
+    v.sort()
+    def _pct(q):
+        pos = (len(v) - 1) * q / 100.0
+        i = int(math.floor(pos))
+        j = min(i + 1, len(v) - 1)
+        return v[i] + (v[j] - v[i]) * (pos - i)
+    return [_pct(lo), _pct(hi)]
+
+def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
+    d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)
+    if d.size < 2:
+        return None
+    rng = np.random.default_rng(int(seed))
+    idx = rng.integers(0, d.size, size=(int(n_boot), d.size))
+    means = d[idx].mean(axis=1)
+    return _percentile_ci(means.tolist())
+
+def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=20261018):
+    a = np.asarray([float(x) for x in with_values if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)
+    b = np.asarray([float(x) for x in without_values if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)
+    if a.size < 2 or b.size < 2:
+        return None
+    rng = np.random.default_rng(int(seed))
+    ai = rng.integers(0, a.size, size=(int(n_boot), a.size))
+    bi = rng.integers(0, b.size, size=(int(n_boot), b.size))
+    diff = a[ai].mean(axis=1) - b[bi].mean(axis=1)
+    return _percentile_ci(diff.tolist())
+
+def wilcoxon_signed_rank_p(deltas):
+    """Two-sided exact Wilcoxon signed-rank p for n<=16 (normal approximation
+    above that).  Reported as a SENSITIVITY check, not as a replacement for
+    the sign-flip test: it assumes symmetric paired differences, which the
+    review correctly says is not guaranteed by sharing a seed number."""
+    d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)
+    d = d[np.abs(d) > 1e-15]
+    n = int(d.size)
+    if n == 0:
+        return {'p': float('nan'), 'method': 'none', 'n_nonzero': 0}
+    order = np.argsort(np.abs(d))
+    ranks = np.empty(n, dtype=float)
+    _abs = np.abs(d)[order]
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and abs(_abs[j] - _abs[i]) <= 1e-15:
+            j += 1
+        ranks[order[i:j]] = (i + j + 1) / 2.0  # average rank (1-based)
+        i = j
+    w_plus = float(ranks[d > 0].sum())
+    total = float(ranks.sum())
+    w = min(w_plus, total - w_plus)
+    if n <= 16:
+        cnt = 0
+        for mask in range(1 << n):
+            s = 0.0
+            for k in range(n):
+                if mask & (1 << k):
+                    s += ranks[k]
+            if s <= w + 1e-12 or s >= total - w - 1e-12:
+                cnt += 1
+        p = min(1.0, cnt / float(1 << n))
+        return {'p': float(p), 'method': 'exact', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w}
+    mu = total / 2.0
+    var = float((ranks ** 2).sum()) / 4.0
+    if var <= 0:
+        return {'p': float('nan'), 'method': 'normal', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w}
+    z = (abs(w_plus - mu) - 0.5) / math.sqrt(var)
+    p = math.erfc(max(0.0, z) / math.sqrt(2.0))
+    return {'p': float(p), 'method': 'normal', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w,
+            'note': 'normal approximation; exact enumeration is only used for n<=16'}
+
+def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_values=None):
     """Paired contrast summary with an explicit effect-vs-seed-noise verdict.
 
     Reports n, mean, sample std (ddof=1), sem, Cohen's d_z, the exact
@@ -4748,7 +5068,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3):
     d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(float(x))], dtype=float)
     n = int(d.size)
     if n == 0:
-        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data'}
+        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None}
     mean = float(d.mean())
     std = float(d.std(ddof=1)) if n > 1 else 0.0
     sem = float(std / math.sqrt(n)) if n > 1 else float('nan')
@@ -4794,7 +5114,24 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3):
         verdict = 'not significant at this n (p>=%.3g)' % alpha
     if seed_driven:
         verdict += ' | UNSTABLE: dropping one seed flips the mean sign'
-    return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict}
+    # Robustness readouts the review asks for: the exact sign-flip test is a
+    # seed-level sign test, so report the sign split, a paired bootstrap CI, a
+    # Wilcoxon sensitivity p, and — when the caller supplies both arms — an
+    # UNPAIRED bootstrap that does not assume exchangeability.  None of these
+    # turns the seed into a token-level unit; they make the assumption visible.
+    _sign = {'positive': int((d > 0).sum()), 'negative': int((d < 0).sum()), 'zero': int((d == 0).sum())}
+    _wil = wilcoxon_signed_rank_p(d)
+    _paired_ci = paired_bootstrap_ci(d)
+    _unpaired_ci = None
+    if with_values is not None and without_values is not None:
+        _unpaired_ci = unpaired_bootstrap_ci(with_values, without_values)
+    _assumption = ('exact sign-flip is valid as a sign test under symmetric paired differences; '
+                   'same seed does NOT randomise the arm, and architecture-induced RNG/optimisation '
+                   'differences are part of the arm. p is SEED-level, never token-level.')
+    return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
+            'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
+            'p_wilcoxon': _wil.get('p'), 'p_wilcoxon_method': _wil.get('method'),
+            'ci95_paired_bootstrap': _paired_ci, 'ci95_unpaired_bootstrap': _unpaired_ci}
 
 # ---- 预注册功效 / 分辨率工具（评审二轮·意见一/九） ------------------------------
 # 动机：一个冻结方案如果「无论数据多强都不可能达到 p_holm < α」，它落在
@@ -5723,7 +6060,10 @@ ABLATION_DESIGN = {
         ('full_sink', 'full', 'sink on vs off (dense control)'),
     ],
     'compression_regularizer': [
-        ('csa_dynamic', 'csa_dyn_nocomp', 'compression regularizer on vs off (dynamic blocking; the loss-term ablation)'),
+        ('csa_dynamic', 'csa_dyn_nocomp', 'compression regularizer on vs off (dynamic blocking; the loss-term ablation; note this also freezes delta_logit because comp_reg was its only gradient source)'),
+    ],
+    'task_learned_boundary': [
+        ('csa_dynamic_task', 'csa_dynamic', 'sampled cut policy trained by the LM loss vs hard threshold + comp_reg only'),
     ],
     'local_fusion': [
         ('csa_dyn_fuse', 'csa_dynamic', 'learned local fusion on vs off (CSA)'),
@@ -5789,12 +6129,19 @@ HYPOTHESIS_DESIGN = {
         'primary_metric': 'ppl',
         'falsifier': 'Zeroing the regularizer does not increase PPL beyond seed noise, or improves it.',
     },
-    'local_fusion': {
-        'statement': 'Learned local fusion lowers validation PPL versus the fixed fusion rule.',
-        'mechanism': 'A learned gate can trade off sparse block reads against the guaranteed local window per layer.',
+    'task_learned_boundary': {
+        'statement': 'Training the sampled cut policy with the LM loss (score-function term) lowers validation PPL versus the hard-threshold + comp_reg-only gate.',
+        'mechanism': 'The LM objective can trade compression against language-modelling loss directly instead of optimizing only a compression-rate surrogate.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
-        'falsifier': 'The learned gate matches or loses to the fixed fusion rule after Holm correction.',
+        'falsifier': 'The task-trained policy matches or loses to the threshold gate after Holm correction, or its variance makes the panel unusable.',
+    },
+    'local_fusion': {
+        'statement': 'The learned fusion convolution lowers validation PPL versus the fixed identity fusion rule.',
+        'mechanism': 'The fusion convolution reshapes the cosine segmentation signal; it does NOT gate the local window, so this is a boundary-signal smoothing contrast, not a learned sparse/local trade-off.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'falsifier': 'The learned fusion convolution matches or loses to the identity rule after Holm correction.',
     },
     'hybrid_hierarchy': {
         'statement': 'The CSA+HCA hybrid lowers validation PPL versus CSA-only at matched parameters and training length.',
@@ -7325,11 +7672,20 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 _rel, _param_ok = _param_control(recs, a, b)
                 _contrast_measured = False
                 for (ts, bs), (deltas, shared, skipped) in sorted(conds.items()):
-                    st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
                     _skipped_seeds = {s for s, _why in skipped}
                     _passed = [s for s in shared if s not in _skipped_seeds]
                     _a_vals = [float(recs[(a, ts, s)]['ppl']) for s in _passed]
                     _b_vals = [float(recs[(b, bs, s)]['ppl']) for s in _passed]
+                    st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n, with_values=_a_vals, without_values=_b_vals)
+                    _obj = sorted({objective_reason(recs[(a, ts, s)], recs[(b, bs, s)]) for s in _passed})
+                    _obj_bad = [x for x in _obj if x and x.startswith('objective differs')]
+                    st['objective_matched'] = (False if _obj_bad else (True if all(x is None for x in _obj) else None))
+                    st['objective_differences'] = _obj_bad or [x for x in _obj if x and x.startswith('unverifiable')]
+                    if _obj_bad:
+                        st['mechanism_claim_allowed'] = False
+                        report.setdefault('objective_confounded', []).append(
+                            '%s vs %s: %s — same run_cfg but different actual loss/optimizer objective; '
+                            'the contrast is a system-level comparison, not an isolated mechanism' % (a, b, '; '.join(_obj_bad)))
                     if _a_vals and _b_vals:
                         _a_mean = float(np.mean(_a_vals))
                         _b_mean = float(np.mean(_b_vals))
@@ -7479,14 +7835,19 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     # evaluation/warmup conditions never get pooled into a fake larger n.
     _arm_groups = {}
     for (v, t, s), r in recs.items():
-        _arm_groups.setdefault((v, str(t or '')), {})[s] = float(r['ppl'])
+        _arm_groups.setdefault((v, str(t or '')), {})[s] = r
     for (v, t), _by_seed in sorted(_arm_groups.items()):
-        _vals = [_by_seed[s] for s in sorted(_by_seed)]
+        _vals = [float(_by_seed[s]['ppl']) for s in sorted(_by_seed)]
         _key = v if not t else '%s::%s' % (v, t)
+        _pooled, _nll_tot, _ntok_tot = _pooled_ppl_from_records([_by_seed[s] for s in sorted(_by_seed)])
         report['arm_summary'][_key] = {
             'variant': v, 'protocol': t, 'n_seeds': len(_vals),
             'seeds': sorted(_by_seed),
             'ppl_mean': float(np.mean(_vals)),
+            'ppl_mean_arithmetic': float(np.mean(_vals)),
+            'ppl_pooled': _pooled,
+            'ppl_primary': (float(_pooled) if _pooled is not None else float(np.mean(_vals))),
+            'nll_sum': _nll_tot, 'n_tokens': _ntok_tot,
             'ppl_std': float(np.std(_vals, ddof=1)) if len(_vals) > 1 else 0.0,
             'meets_min_seeds': len(_vals) >= int(min_n),
         }
@@ -7542,7 +7903,11 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             _cv.update({
                 'arms_present': sorted(a for a in _arms if a in present),
                 'param_matched': all(e.get('param_controlled') is True for e in entries) if entries else None,
+                'objective_matched': (all(e.get('objective_matched') is True for e in entries) if entries else None),
+                'objective_differences': sorted({x for e in entries for x in (e.get('objective_differences') or []) if 'differs' in str(x)}),
             })
+            if _cv.get('objective_differences'):
+                report['warnings'].append('%s: arms share run_cfg but not the actual training objective (%s) — the contrast is a system-level comparison, not an isolated mechanism claim' % (comp, '; '.join(_cv['objective_differences'])))
             report['controlled_variables'][comp] = _cv
             if _cv.get('within_arm_mixed'):
                 report['warnings'].append('%s: arm(s) %s mix DIFFERENT protocols within one arm across seeds — a seed-averaged claim would pool incompatible runs'
@@ -7633,22 +7998,33 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             if _cands:
                 _ref_key, _ref = min(_cands, key=lambda kv: float(kv[1]['ppl_mean']))
                 _panel_val_fps = {r.get('val_fp') for r in recs.values() if r.get('val_fp')}
+                _panel_eval_fps = {r.get('eval_fp') for r in recs.values() if r.get('eval_fp')}
                 _sb_data = _sb.get('data') or {}
                 # `cache_val_fp` is the full validation cache fingerprint (the
                 # one panel records carry); `val_fp`/`eval_fp` describe the
                 # exact rows scored by the floor.  Prefer the cache-level fp
-                # for the comparability gate.
+                # for the comparability gate, but additionally require the
+                # EXACT eval-row fingerprint when both sides carry it — a
+                # 128-row floor and a 512-row panel PPL are different samples.
                 _sb_val_fp = _sb_data.get('cache_val_fp') or _sb_data.get('val_fp')
+                _sb_eval_fp = _sb_data.get('eval_fp')
                 _comparable = None
                 if _sb_val_fp and _panel_val_fps:
                     _comparable = _sb_val_fp in _panel_val_fps
+                if _comparable is True and _sb_eval_fp and _panel_eval_fps:
+                    if _sb_eval_fp not in _panel_eval_fps:
+                        _comparable = False
+                        report['warnings'].append(
+                            'simple-baseline eval row fingerprint differs from the panel final-eval rows — the floor and the panel scored different validation documents; the beats-floor comparison is refused')
                 report['simple_baseline'].update({
                     'panel_reference_arm': _ref_key,
-                    'panel_reference_ppl': float(_ref['ppl_mean']),
+                    'panel_reference_ppl': float(_ref.get('ppl_primary', _ref['ppl_mean'])),
                     'panel_reference_protocol': _ref.get('protocol'),
                     'panel_val_fp': (sorted(_panel_val_fps)[:3] or None),
+                    'panel_eval_fp': (sorted(_panel_eval_fps)[:3] or None),
+                    'simple_eval_fp': _sb_eval_fp,
                     'comparable_to_panel': _comparable,
-                    'panel_beats_simple_floor': (bool(float(_ref['ppl_mean']) < float(_sb.get('best_ppl')))
+                    'panel_beats_simple_floor': (bool(float(_ref.get('ppl_primary', _ref['ppl_mean'])) < float(_sb.get('best_ppl')))
                                                  if _comparable is True and _sb.get('best_ppl') is not None
                                                  else None),
                 })
@@ -7661,7 +8037,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 elif report['simple_baseline'].get('panel_beats_simple_floor') is False:
                     report['warnings'].append(
                         'the panel\'s best declared-arm PPL (%.4f, %s) does not beat the tuned count-model floor (%.4f, %s) — the mechanism claim lacks the most basic baseline'
-                        % (float(_ref['ppl_mean']), _ref_key, float(_sb.get('best_ppl')),
+                        % (float(_ref.get('ppl_primary', _ref['ppl_mean'])), _ref_key, float(_sb.get('best_ppl')),
                            _sb.get('best_baseline') or 'count-model'))
     if report['hypotheses_missing']:
         report['warnings'].append('no pre-registered hypothesis for: ' + ', '.join(sorted(set(report['hypotheses_missing']))) + ' — direction cannot be checked, so a significant result is at most measured')
@@ -7704,7 +8080,7 @@ def _print_methodology_audit(report):
         print('  arm means (mean ± sample std over seeds):')
         for _k, _e in report['arm_summary'].items():
             print('    %-30s n=%-2d  %.4f ± %.4f%s' % (
-                _k, _e['n_seeds'], _e['ppl_mean'], _e['ppl_std'],
+                _k, _e['n_seeds'], _e.get('ppl_primary', _e['ppl_mean']), _e['ppl_std'],
                 '' if _e['meets_min_seeds'] else '  (BELOW min_n)'))
     for comp, entries in report['components'].items():
         live = [e for e in entries if e['n_shared'] > 0]
@@ -8308,7 +8684,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
 _EVAL_TOKENS_PER_CHUNK = 1 << 17
 
 @torch.inference_mode()
-def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
+def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, return_stats=False):
     # A chunk is a set of independent sequences (no cross-row op in the
     # model), so capping it by token count does not change any per-row value.
     _span = max(1, int(val_batch.shape[1]) - 1)
@@ -8318,6 +8694,12 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
     need_reg_layers = [blk.attn for blk in model.blocks if hasattr(blk.attn, 'need_reg')]
     need_reg_prior = [_a.need_reg for _a in need_reg_layers]
     nll = torch.zeros((), dtype=torch.float64, device=device)
+    # Per-document NLL (review 3: eval-subset uncertainty must be visible, not
+    # only the seed-to-seed spread).  Rows are the fixed evaluation documents;
+    # with eval_rows sampling, a row with no sampled target gets 0 tokens and
+    # is excluded by the bootstrap consumer.
+    _row_nll = torch.zeros(int(val_batch.shape[0]), dtype=torch.float64, device=device) if return_stats else None
+    _row_ntok = torch.zeros(int(val_batch.shape[0]), dtype=torch.long, device=device) if return_stats else None
     for _a in need_reg_layers:
         _a.need_reg = False
     try:
@@ -8381,6 +8763,7 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
                 _local = _sel_sorted[_lo:_hi] - _base
                 _ri = torch.div(_local, _span, rounding_mode='floor')
                 _ci = _local - _ri * _span
+                _src_rows = _ri
                 # gather the selected hidden rows BEFORE the head: each output
                 # row of the Linear is an independent function of one hidden
                 # row, so head(h[sel]) == head(h)[sel]
@@ -8389,9 +8772,13 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
                     V = _rows.size(-1)
                 _tgts = ids[_ri, _ci + 1]
                 del _ri, _ci
-                nll += F.cross_entropy(_rows, _tgts, reduction='sum').double()
+                _ce = F.cross_entropy(_rows, _tgts, reduction='none').double()
+                nll += _ce.sum()
+                if return_stats:
+                    _row_nll.index_add_(0, _src_rows, _ce)
+                    _row_ntok.index_add_(0, _src_rows, torch.ones_like(_src_rows))
                 ntok += int(_tgts.numel())
-                del _rows, _tgts
+                del _rows, _tgts, _ce, _src_rows
             else:
                 _tgts = ids[:, 1:]
                 for _s0 in range(0, _span, 64):
@@ -8399,8 +8786,13 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
                     _lg = model.head(h[:, _sl, :])
                     if V is None:
                         V = _lg.size(-1)
-                    nll += F.cross_entropy(_lg.transpose(1, 2), _tgts[:, _sl], reduction='sum').double()
-                    del _lg
+                    _ce = F.cross_entropy(_lg.transpose(1, 2), _tgts[:, _sl], reduction='none').double()
+                    nll += _ce.sum()
+                    if return_stats:
+                        _b = int(_ce.shape[0])
+                        _row_nll[i:i + _b] += _ce.sum(dim=1)
+                        _row_ntok[i:i + _b] += int(_ce.shape[1])
+                    del _lg, _ce
                 ntok += int(_tgts.numel())
                 del _tgts
             del ids, h
@@ -8409,11 +8801,27 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0):
             _a.need_reg = _prev
         model.train(was_training)
     if not ntok:
-        return float('nan')
+        if not return_stats:
+            return float('nan')
+        return {'ppl': float('nan'), 'nll_sum': float('nan'), 'n_tokens': 0,
+                'nll_per_row': [], 'n_tokens_per_row': [], 'eval_rows': int(eval_rows) if eval_rows is not None else None,
+                'eval_seed': int(eval_seed), 'eval_subset': int(val_batch.shape[0])}
     try:
-        return math.exp(nll.item() / ntok)
+        ppl = math.exp(nll.item() / ntok)
     except OverflowError:
-        return float('inf')
+        ppl = float('inf')
+    if not return_stats:
+        return ppl
+    return {
+        'ppl': float(ppl),
+        'nll_sum': float(nll.item()),
+        'n_tokens': int(ntok),
+        'nll_per_row': [float(x) for x in _row_nll.detach().cpu().tolist()],
+        'n_tokens_per_row': [int(x) for x in _row_ntok.detach().cpu().tolist()],
+        'eval_rows': int(eval_rows) if eval_rows is not None else None,
+        'eval_seed': int(eval_seed),
+        'eval_subset': int(val_batch.shape[0]),
+    }
 
 def enable_block_stats(model, on):
     for blk in model.blocks:
@@ -8928,6 +9336,10 @@ OPT_ADAMW_BETAS = (0.9, 0.999)
 OPT_ADAMW_EPS = 1e-08
 GRAD_CLIP_NORM = 1.0
 LR_FLOOR_MULT = 0.1
+# Score-function coefficient for `boundary_policy='reinforce'`.  Only arms that
+# opt in pay this term; the threshold path is byte-identical to the historical
+# loss (ce + comp_lambda * comp_reg).
+BOUNDARY_PG_COEF = 1.0
 LR_COSINE_AMP = 0.45
 
 def training_knobs():
@@ -9029,6 +9441,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # deque with a fixed capacity; the window contents are identical.
     _tail = collections.deque(maxlen=50)
     ppl_hist = []
+    _ce_baseline = 0.0
     delta_trace = {}
     model.train()
     truncated = False
@@ -9053,13 +9466,25 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             x, y = next(bpe)
             ce = model.ce_loss(x, y, vocab)
             del x, y
-            loss = ce + comp_lambda * model.comp_reg
+            _blp = getattr(model, 'boundary_logp', None)
+            if _blp is not None:
+                # REINFORCE: the hard cuts are sampled in the forward pass; this
+                # score-function term makes the LM token loss (not just comp_reg)
+                # able to change the boundary policy.  Centred by a running CE
+                # baseline to reduce variance; decisions are normalised so the
+                # coefficient does not scale with sequence length or depth.
+                _adv = float(ce.detach().item()) - float(_ce_baseline)
+                _bdec = max(int(getattr(model, 'boundary_decisions', 0) or 0), 1)
+                loss = ce + comp_lambda * model.comp_reg + BOUNDARY_PG_COEF * (-_adv * _blp / _bdec)
+            else:
+                loss = ce + comp_lambda * model.comp_reg
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             opt.step()
             # Gradients are not needed after the update.
             opt.zero_grad(set_to_none=True)
             _ce_d = ce.detach()
+            _ce_baseline = 0.99 * float(_ce_baseline) + 0.01 * float(_ce_d.item())
             _lbuf.append(_ce_d)
             _tail.append(_ce_d)
             # Drop this step's graph/scalar references before the next forward.
@@ -9106,16 +9531,37 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         return {'variant': variant, 'seed': seed, 'cap_truncated': True, 'steps_done': steps, 'train_time_s': wall}
     if val_batch is None:
         ppl, stats = (float('nan'), {})
+        _eval_stats = {'ppl': float('nan'), 'nll_sum': float('nan'), 'n_tokens': 0,
+                       'nll_per_row': [], 'n_tokens_per_row': [], 'eval_rows': None,
+                       'eval_seed': 0, 'eval_subset': 0}
     else:
-        ppl = eval_ppl(model, val_batch, device)
+        # Final measurement uses the FULL fixed validation batch (the historical
+        # definition); `eval_subset` only controls the per-eval-step history.
+        # Keeping this distinction byte-compatible matters: `_run_fp` pins the
+        # full val fingerprint, and changing the final row count without a
+        # CODE_SEMANTICS bump would silently mix two PPL definitions on resume.
+        _eval_stats = eval_ppl(model, val_batch, device, return_stats=True)
+        ppl = float(_eval_stats['ppl'])
         stats = compression_report(model, val_batch, device, val_bnd=val_bnd)
-        print(f'[{variant} seed={seed}] val PPL = {ppl:.3f}')
+        print(f'[{variant} seed={seed}] val PPL = {ppl:.3f}  (n_tok={_eval_stats["n_tokens"]}, nll={_eval_stats["nll_sum"]:.6f})')
         print(f'    block-length diagnostics: {json.dumps(stats, default=float)}')
     if _lbuf:
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids)}
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
+              # Review 3: the token-level evidence behind the reported PPL.
+              # `nll_sum / n_tokens` is the pooled-NLL estimator; the per-row
+              # rows let a report bootstrap DOCUMENT uncertainty instead of
+              # treating the seed as the only source of error.
+              'nll_sum': _eval_stats.get('nll_sum'), 'n_tokens': _eval_stats.get('n_tokens'),
+              'nll_per_row': _eval_stats.get('nll_per_row'), 'n_tokens_per_row': _eval_stats.get('n_tokens_per_row'),
+              'eval_rows': _eval_stats.get('eval_rows'), 'eval_seed': _eval_stats.get('eval_seed'),
+              'eval_subset': _eval_stats.get('eval_subset'),
+              'eval_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)) if val_batch is not None else None,
+              'param_breakdown': param_breakdown(model),
+              'kv_cache_elements_per_token': kv_cache_elements_per_token(model),
+              'train_objective': train_objective(model, comp_lambda=comp_lambda, delta_lr_mult=delta_lr_mult)}
     if return_model:
         result['_model'] = model
     else:
@@ -9967,6 +10413,78 @@ def _group_params(recs):
                 continue
     return None
 
+def _pooled_ppl_from_records(recs):
+    """Token-pooled PPL: exp(sum NLL / sum N tokens) over all seeds.
+
+    This is the estimator the review asks for; the arithmetic mean of per-seed
+    PPLs is kept as `ppl_mean_arithmetic` for backward compatibility but is no
+    longer the primary aggregate when token counts exist.  Records that predate
+    `nll_sum`/`n_tokens` cannot be pooled and fall back explicitly."""
+    nlls, nts = [], []
+    for r in recs:
+        nll, nt = r.get('nll_sum'), r.get('n_tokens')
+        if not isinstance(nll, (int, float)) or isinstance(nll, bool) or not math.isfinite(float(nll)):
+            return None, None, None
+        if not isinstance(nt, (int, float)) or isinstance(nt, bool) or float(nt) <= 0:
+            return None, None, None
+        nlls.append(float(nll))
+        nts.append(float(nt))
+    total_n, total_t = float(sum(nlls)), float(sum(nts))
+    if total_t <= 0:
+        return None, None, None
+    return math.exp(total_n / total_t), total_n, int(total_t)
+
+def _seed_t_ci(ppls, alpha=0.05):
+    n = len(ppls)
+    if n < 2:
+        return None
+    mu = float(np.mean(ppls))
+    sd = float(np.std(ppls, ddof=1))
+    try:
+        tc = _t_critical(1.0 - alpha, n - 1)
+    except Exception:
+        return None
+    half = tc * sd / math.sqrt(n)
+    return [mu - half, mu + half]
+
+def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
+    """Document-level bootstrap CI for the pooled PPL.
+
+    Rows are the fixed evaluation documents shared by every seed; resampling
+    ROWS (not tokens) preserves the within-document correlation.  If any
+    record lacks per-row NLL, no CI is invented — the caller must see the
+    missing-evidence state rather than a narrow interval computed from the
+    wrong unit.
+    """
+    rows = []
+    for r in recs:
+        nll = r.get('nll_per_row')
+        ntok = r.get('n_tokens_per_row')
+        if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
+            return None
+        rows.append((np.asarray(nll, dtype=float), np.asarray(ntok, dtype=float)))
+    if len({len(a) for a, _ in rows}) != 1:
+        return None
+    R = len(rows[0][0])
+    if R == 0:
+        return None
+    nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
+    ntok_mat = np.stack([b for _, b in rows], axis=0)         # [S, R]
+    rng = np.random.default_rng(int(seed))
+    vals = np.empty(int(n_boot), dtype=float)
+    for b in range(int(n_boot)):
+        idx = rng.integers(0, R, size=R)
+        nt = float(ntok_mat[:, idx].sum())
+        if nt <= 0:
+            vals[b] = np.nan
+            continue
+        vals[b] = math.exp(float(nll_mat[:, idx].sum()) / nt)
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    if vals.size < max(20, int(0.5 * n_boot)):
+        return None
+    lo, hi = np.percentile(vals, [2.5, 97.5])
+    return [float(lo), float(hi)]
+
 def aggregate(summary):
 
     def _protocol_tag(rec, key=None):
@@ -10079,7 +10597,35 @@ def aggregate(summary):
         _recs_sorted = sorted(recs, key=_seed_sort_key)
         recs = _recs_sorted
         ppls = np.array([r['ppl'] for r in recs], dtype=float)
-        entry = {'variant': v, 'protocol': tag, 'n_seeds': len(recs), 'ppl_mean': float(ppls.mean()), 'ppl_std': float(ppls.std(ddof=1)) if len(ppls) > 1 else 0.0, 'ppls': [float(p) for p in ppls], 'seeds': [r.get('seed') for r in recs], 'params': _group_params(recs), 'tokens_seen': recs[0].get('tokens_seen')}
+        _pooled, _nll_total, _ntok_total = _pooled_ppl_from_records(recs)
+        _sorted = np.sort(ppls)
+        _med = float(np.median(_sorted))
+        _q1, _q3 = (float(np.percentile(_sorted, 25)), float(np.percentile(_sorted, 75))) if len(_sorted) >= 2 else (_med, _med)
+        entry = {'variant': v, 'protocol': tag, 'n_seeds': len(recs),
+                 'ppl_mean': float(ppls.mean()),
+                 'ppl_mean_arithmetic': float(ppls.mean()),
+                 'ppl_std': float(ppls.std(ddof=1)) if len(ppls) > 1 else 0.0,
+                 'ppls': [float(p) for p in ppls], 'seeds': [r.get('seed') for r in recs],
+                 'params': _group_params(recs), 'tokens_seen': recs[0].get('tokens_seen'),
+                 'ppl_median': _med, 'ppl_iqr': [_q1, _q3],
+                 'ppl_ci95_seed_t': _seed_t_ci(ppls),
+                 'nll_sum': _nll_total, 'n_tokens': _ntok_total,
+                 'ppl_pooled': (_pooled if _pooled is not None else None),
+                 'ppl_ci95_doc_bootstrap': _doc_bootstrap_ppl_ci(recs),
+                 'ppl_aggregation': ('pooled_token_nll' if _pooled is not None else 'arithmetic_seed_mean_fallback (records lack nll_sum/n_tokens)'),
+                 'ppl_primary': (float(_pooled) if _pooled is not None else float(ppls.mean()))}
+        _pb = next((r.get('param_breakdown') for r in recs if isinstance(r.get('param_breakdown'), dict)), None)
+        if _pb:
+            entry['param_breakdown'] = _pb
+            entry['params_total'] = _pb.get('total')
+            entry['params_attention'] = _pb.get('attention')
+            entry['params_mlp'] = _pb.get('mlp')
+            entry['params_embedding'] = _pb.get('embedding')
+            entry['active_params'] = _pb.get('active')
+            entry['attention_param_share'] = _pb.get('attention_share')
+        _kv = next((r.get('kv_cache_elements_per_token') for r in recs if isinstance(r.get('kv_cache_elements_per_token'), dict)), None)
+        if _kv:
+            entry['kv_cache_elements_per_token'] = _kv
         if _fp_idx is not None:
             entry['run_cfg_class'] = _fp_idx
             entry['run_cfg'] = recs[0].get('run_cfg')
@@ -10289,7 +10835,7 @@ def _print_table(agg):
     for v in rows:
         e = agg[v]
         _n = e['n_seeds']
-        ppl = _fmt_pair(e['ppl_mean'], e.get('ppl_std', 0.0), _TW['ppl'], '8.2f', '5.2f', main_cap='.2f') if _n > 1 else _fmt_cell(e['ppl_mean'], _TW['ppl'], '.2f')
+        ppl = _fmt_pair(e.get('ppl_primary', e['ppl_mean']), e.get('ppl_std', 0.0), _TW['ppl'], '8.2f', '5.2f', main_cap='.2f') if _n > 1 else _fmt_cell(e.get('ppl_primary', e['ppl_mean']), _TW['ppl'], '.2f')
         d = e.get('dPPL_vs_full_mean')
         dd = _fmt_pair(d, e.get('dPPL_vs_full_std', 0.0), _TW['d'], '+8.2f', '5.2f', main_cap='+.2f')
         d2 = e.get('dPPL_vs_sw128m_mean')
@@ -10368,7 +10914,7 @@ def _print_pairs(summary):
     print('=' * 78)
 
 def _save_csv(agg, outdir):
-    cols = ['variant', 'ppl_mean', 'ppl_std', 'dPPL_vs_full_mean', 'dPPL_vs_full_std', 'dPPL_vs_sw128m_mean', 'dPPL_vs_sw128m_std', 'n_seeds', 'params', 'avg_dyn_block_len', 'boundary_f1_dyn', 'boundary_excess_dyn']
+    cols = ['variant', 'ppl_primary', 'ppl_mean', 'ppl_pooled', 'ppl_std', 'dPPL_vs_full_mean', 'dPPL_vs_full_std', 'dPPL_vs_sw128m_mean', 'dPPL_vs_sw128m_std', 'n_seeds', 'params', 'avg_dyn_block_len', 'boundary_f1_dyn', 'boundary_excess_dyn']
     rows = [{'variant': v, **{c: e.get(c, '') for c in cols[1:]}} for v, e in agg.items()]
     atomic_write_csv(os.path.join(outdir, 'aggregate.csv'), cols, rows)
 
@@ -10381,7 +10927,7 @@ def _plot(summary, agg, outdir):
     order = ['full', 'full_matched', 'full_cos', 'full_sink', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'csa_dyn_fuse', 'csa_dyn_nocomp', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn', 'hybrid_hca_dyn', 'hybrid_csa_dyn_fuse']
     vs = [v for v in order if v in agg] + [v for v in agg if v not in order]
     fig, ax = plt.subplots(1, 5, figsize=(27, 4.5))
-    ps = [agg[v]['ppl_mean'] for v in vs]
+    ps = [agg[v].get('ppl_primary', agg[v]['ppl_mean']) for v in vs]
     es = [agg[v]['ppl_std'] for v in vs]
     ax[0].bar(range(len(vs)), ps, yerr=es, capsize=3, color='steelblue')
     ax[0].set_xticks(range(len(vs)))

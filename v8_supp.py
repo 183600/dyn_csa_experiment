@@ -138,7 +138,7 @@ def v8_analysis(out='analysis_v8/stats.json'):
         add(f'scale: {a} - {b}', scale, a, b, 'results_lm_v5_scale')
     add('rope20k: csa_fixed_rope - full_rope', rope20k, 'csa_fixed_rope', 'full_rope', 'results_lm_v8_rope20k')
     add('long20k(abs): csa_fixed - full', abs_long_f, 'csa_fixed', 'full', 'results_lm_v3_long')
-    out_d = {'scale_panel': _panel_block(scale), 'rope20k_panel': _panel_block(rope20k), 'comparisons': comparisons}
+    out_d = {'scale_panel': _panel_block(scale), 'rope20k_panel': _panel_block(rope20k), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v8 scale + rope20k + long20k')}
     out_d = L.stamped_analysis('v8_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[v8 stats] wrote {out}')
     for k, v in comparisons.items():

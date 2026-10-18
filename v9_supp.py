@@ -174,7 +174,7 @@ def v9_analysis(out='analysis_v9/stats.json'):
     add('rope20k: csa_fixed_rope - full_rope', rope20k, 'csa_fixed_rope', 'full_rope', 'results_lm_v8_rope20k')
     add('long20k(abs): csa_fixed - full', abs_long_f, 'csa_fixed', 'full', 'results_lm_v3_long')
     panel = V8._panel_block
-    out_d = {'seq2k_bs1_panel': panel(seq2k), 'seq2k_bs3_panel_historical': panel(seq2k_v7), 'rope20k_panel': panel(rope20k), 'comparisons': comparisons}
+    out_d = {'seq2k_bs1_panel': panel(seq2k), 'seq2k_bs3_panel_historical': panel(seq2k_v7), 'rope20k_panel': panel(rope20k), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v9 seq2k + rope20k + long20k')}
     out_d = L.stamped_analysis('v9_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[v9 stats] wrote {out}')
     for k, v in comparisons.items():
@@ -192,6 +192,10 @@ def _fmt_pm(cell, std=None):
     else:
         mean = cell
     return f'{mean:.2f} ±{std or 0.0:.2f}'
+
+def _holm_txt(v):
+    _p = v.get('p_holm') if isinstance(v, dict) else None
+    return f'{_p:.3f}' if isinstance(_p, (int, float)) and math.isfinite(float(_p)) else 'n/a'
 
 def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     # v9_analysis returns exactly the object it writes to stats_p.
@@ -223,6 +227,8 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     lines = []
     A = lines.append
     A('# CSA / HCA 受控机制研究 — v9 补实验报告（topk 扫描补齐 + RoPE 长跑第三种子）')
+    A('> **证据等级：探索性（exploratory）**。本面板的比较/种子是观察 validation 结果后选择的；Holm 校正只限制过度宣称，不等于预注册确认。')
+    A('')
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
     A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
@@ -276,14 +282,14 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
         A('')
     A('**配对检验（exact sign-flip）**：')
     A('')
-    A('| 比较 | n | Δ (a−b) mean±std | p (exact) |')
-    A('|---|---|---|---|')
+    A('| 比较 | n | Δ (a−b) mean±std | p (exact) | p_Holm |')
+    A('|---|---|---|---|---|')
     for k, v in comp.items():
         if k.startswith('seq2k'):
             if 'omitted' in v:
                 A(f'| {k} | 0 | —（{v['omitted']}） | — |')
                 continue
-            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
+            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {_holm_txt(v)} |')
     A('')
     A('**结论读法**：若完整扫描证实 m=1（纯 DSA）不差于压缩 CSA，则「压缩不是瓶颈」的方向性结论在完整扫描下成立（按表）；选择率甜点位置由 5 点全貌直接给出。')
     A('')
@@ -298,8 +304,8 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     for v, p in rope.items():
         A(f'| `{v}` | {_fmt_pm(p)} | {p['n']} |')
     A('')
-    A('| 比较 | n | Δ mean±std | p (exact) |')
-    A('|---|---|---|---|')
+    A('| 比较 | n | Δ mean±std | p (exact) | p_Holm |')
+    A('|---|---|---|---|---|')
     for k in ['rope20k: csa_fixed_rope - full_rope', 'long20k(abs): csa_fixed - full']:
         if k not in comp:
             continue
@@ -307,13 +313,13 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
         if 'omitted' in v:
             A(f'| {k} | 0 | —（{v['omitted']}） | — |')
             continue
-        A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
+        A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {_holm_txt(v)} |')
     A('')
     _r20 = comp.get('rope20k: csa_fixed_rope - full_rope') or {}
     if _r20 and 'omitted' not in _r20:
         c = _r20
         _dir20 = '落后' if c['mean'] > 0 else '领先'
-        _tail20 = '——与 abs-PE 长跑的「渐近线反转」同向，中心负结果在论文自己的位置编码方案下复现，且达到与其镜像面板相同的种子数。' if c['mean'] > 0 else '——方向与 abs-PE 长跑的「渐近线反转」**相反**，「同向复现」的读法在本轮产物上不成立，以该配对数字为准。'
+        _tail20 = '——与 abs-PE 长跑的「渐近线反转」方向同向；但 n<6 时精确检验下限 >0.05，只能作方向性读数，不能写「复现」或「显著」。' if c['mean'] > 0 else '——方向与 abs-PE 长跑的「渐近线反转」**相反**，「同向复现」的读法在本轮产物上不成立，以该配对数字为准。'
         A(f'**结论**：RoPE 面板上 `csa_fixed_rope` {_dir20} `full_rope` **{abs(c['mean']):.2f} PPL**（n={c['n']}，p={c['p_exact_signflip']:.3f}）' + _tail20)
     _a20 = comp.get('long20k(abs): csa_fixed - full') or {}
     if _a20 and 'omitted' in _a20:

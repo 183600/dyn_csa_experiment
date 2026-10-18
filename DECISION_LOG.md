@@ -1,0 +1,78 @@
+# DECISION_LOG — exploratory / confirmatory paper trail
+
+This file is the human-readable decision log. It records **why** each version
+ran what it ran and **what evidence level** the result belongs to. It is not a
+results table: the numeric artifacts live in `results_*/` and in the immutable
+release archive produced by `archive_release.py`.
+
+> **History note.** The repository snapshot used for this reconstruction has a
+> single squashed baseline commit, so the original per-commit decision log
+> cannot be recovered from git. The entries below are reconstructed from
+> `README.md`, `docs/design_notes.md`, `confirmation_frozen.json` and the
+> driver docstrings. Missing details are marked *not recorded in this
+> snapshot* rather than invented. The file is now tracked and guarded by the
+> CI loop; it is also packed by `archive_release.py`.
+
+## Evidence levels
+
+- **Exploratory** — a panel whose variants, seeds, endpoints, hyperparameters or
+  comparisons were chosen after looking at the same validation split. Its
+  p-values (even Holm-corrected) are descriptive and cannot be promoted to
+  confirmation by relabelling.
+- **Confirmatory** — a pre-registered freeze (`confirmation_frozen.json`) with
+  fixed arms, seeds, endpoints, correction and decision rule, evaluated on the
+  held-out WikiText-103 test split exactly once. The current freeze covers
+  **fixed-chunk CSA mechanism claims only** (see its `scope` block).
+- **Evidence archive** — a released `release_<tag>.tar.gz` plus SHA-256
+  manifest, containing per-seed records, configs, environment, checkpoint
+  hashes, failure/coverage records and the freeze lock. The Git repo stays
+  source-only by design (`docs/design_notes.md` §8).
+
+## Timeline (reconstructed)
+
+| version | what was run / decided | evidence level |
+|---|---|---|
+| v6 (`run_gapfill.py`) | core 9-variant table, leave-one-out ablation, scale probe, long runs; 3-seed floor; results kept out of Git | exploratory |
+| v7 (`v7_supp.py`) | reviewer response: RoPE + QK-norm, dense warmup, 40k-step long run, scale re-seeding, length extrapolation, top-k sweep; analytic FLOPs / KV table | exploratory |
+| v8 (`v8_supp.py`) | scale panel to 4 seeds; RoPE 20k long run | exploratory |
+| v9 (`v9_supp.py`) | seq-2048 top-k sweep at batch size 1; third RoPE-20k seed | exploratory |
+| v10 (`v10_supp.py`) | from-scratch random-indexer / all-block controls, distractor-injection probe (uniform / realistic-token / mask / delete + span / doc / topical), NIAH-natural, crossover scaling, equal-token and 6ND-proxy large arms | exploratory |
+| v11 (`v11_supp.py`) | statistical close-out: distractor probe to n=6, crossover panels to n=4, d=384 paired arms; seed-level sign-flip with resolution floors | exploratory |
+| v12 (`v12_supp.py`) | **freeze**: fixed-chunk CSA confirmation plan v2 (12 seeds, 4 primary comparisons, exact sign-flip + Holm, held-out test split, freeze lock, strict record admission, per-document PPL); v1 was rejected by the load-time power gate (6 seeds × Holm/4 has minimum attainable p=0.125) | confirmatory plan |
+| review 2 | seed count revised 6→12 **before any test-split access**; scope block added; two-phase freeze lock; kernel mode refused for the frozen plan; evidence archiver; leakage/causality/fairness audits | frozen plan revision |
+| review 3 (this commit) | pooled-NLL PPL + per-document NLL; pooled/bootstrap/ Wilcoxon sensitivity; Holm in v7–v11 and `build_report`; objective/parameter/KV descriptors; opt-in task-learned boundary arm (`csa_dynamic_task`); synthesized records excluded from crossover; span-ΔNLL lookup fixed; kernel-stamp consistency; `DECISION_LOG.md` restored and guarded; dependency/Python declarations | code/evidence hardening |
+
+## What the v12 freeze does and does not cover
+
+Covered: fixed-chunk CSA vs parameter-matched dense, trained random-indexer and
+trained all-block controls at L4096, on the held-out test split.
+
+Not covered: dynamic chunking vs fixed chunking, semantic value of dynamic
+boundaries, HCA advantages, dynamic-chunking scaling laws. Those claims stay
+**exploratory** and require their own pre-registered freeze before a first
+test-split access.
+
+## Re-freeze rule
+
+Any change to `confirmation_frozen.json` after the first test-split access
+requires `V12_REFREEZE=1`, downgrades the earlier round to exploratory, and
+must be recorded here with date, reason and the old/new manifest hashes. The
+freeze lock (`results_lm_test/.freeze_lock.json`) is written **before** the
+first read and updated with the test-slice fingerprint immediately after it;
+the archive includes its hash. Do not delete the lock unless you can prove no
+test-split record was ever written.
+
+## Known limitations (not hidden)
+
+- The validation split was reused for selection throughout v6–v11; those
+  panels cannot be made confirmatory retroactively.
+- Small seed counts (n=3–6) give exact sign-flip p floors of 0.25–0.031; many
+  old cells are resolution-limited, not null.
+- The default `csa_dynamic` gate is a cosine threshold with a learned scalar
+  offset trained by the compression regularizer; it is **not** trained
+  end-to-end by the LM loss. `csa_dynamic_task` is the opt-in score-function
+  arm that makes the boundary policy task-trained.
+- Efficiency claims from analytic FLOPs/KV are structural, not measured
+  latency/throughput/memory; use the efficiency harness on real checkpoints.
+- WikiText-103 has near-duplicate documents across official splits; the
+  leakage audit quantifies the overlap, it does not remove it.

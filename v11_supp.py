@@ -161,7 +161,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
                         dl = [other['ppl_by_seed'][s] - learned['ppl_by_seed'][s] for s in common]
                         contrasts[f'L{Ln} r{rho}: {tag} - csa+learned'] = V.exact_sign_permutation(dl)
                         contrasts[f'L{Ln} r{rho}: {tag} - csa+learned']['seeds'] = common
-        probe = {'cells': probe_cells, 'contrasts': contrasts}
+        probe = {'cells': probe_cells, 'contrasts': contrasts, 'holm_exploratory': L.attach_holm(contrasts, family='v11 distractor probe contrasts')}
         _n_cell_max = max((c['n'] for c in probe_cells), default=0)
         _n_pair_max = max((v['n'] for v in contrasts.values()), default=0)
         _n_pair_min = min((v['n'] for v in contrasts.values()), default=0)
@@ -188,7 +188,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
         print(f'[v11 stats] crossover fit: dropped {_lab!r} — its panel publishes no tokens/step rate, so its token axis is unknown')
     for _lab in _recon:
         print(f'[v11 stats] crossover fit: dropped {_lab!r} — its trajectory is a RECONSTRUCTION, so the point is not an independent run')
-    if len(pts) >= 2:
+    if len(pts) >= 3:
         xs = np.log10([p[0] for p in pts])
         ys = np.log10([max(p[1], 1.0) for p in pts])
         A = np.vstack([xs, np.ones_like(xs)]).T
@@ -202,6 +202,9 @@ def v11_analysis(out='analysis_v11/stats.json'):
             fit['r2'] = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
         else:
             fit['note'] += '; WARNING: n=2 — R² 恒为 1（恒等式），斜率不具显著性，仅供参考'
+    else:
+        fit = {'n_points': len(pts), 'status': 'insufficient_points',
+               'note': 'fewer than 3 independent, budget-comparable crossover points: no log-log slope or power-law claim is computed'}
     scale384 = V10._ppl_by_seed('results_lm_v5_scale', full=True)
     panel = V8._panel_block
     comparisons = {}
@@ -210,7 +213,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
         V9.add_paired(comparisons, name, panel_d, a, b, who='v11 ', outdir=outdir)
     add('scale384: csa_fixed - full', scale384, 'csa_fixed', 'full', 'results_lm_v5_scale')
     add('scale384: csa_fixed - full_sw128_matched', scale384, 'csa_fixed', 'full_sw128_matched', 'results_lm_v5_scale')
-    out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale384_panel': panel(scale384), 'comparisons': comparisons}
+    out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale384_panel': panel(scale384), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v11 scale384 + seq2k comparisons')}
     out_d = L.stamped_analysis('v11_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[v11 stats] wrote {out}')
     for k, v in contrasts_headline(probe).items():
@@ -325,6 +328,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     _n384_txt = f'n={n384}' if n384_ok else f'n={_n384_set}（`full` 臂 n={_n384_full}）'
     _head_n = f'n={n_contr_max}' if n_tree_min == n_contr_max else f'n={n_tree_min}–{n_contr_max}'
     A(f'# CSA / HCA 受控机制研究 — v11 补实验报告（统计分辨率收尾：主结果 {_head_n}、规模面板 {_xo_txt}）')
+    A('> **证据等级：探索性（exploratory）**。本面板的比较/种子是观察 validation 结果后选择的；Holm 校正只限制过度宣称，不等于预注册确认。')
+    A('')
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
     A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
@@ -450,15 +455,15 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     if contr:
         A('**配对检验（exact sign-flip，Δ = 对照臂 − 学习选择臂）：**')
         A('')
-        A('| 比较 | n | Δ mean±std | p (exact) |')
-        A('|---|---|---|---|')
+        A('| 比较 | n | Δ mean±std | p (exact) | p_Holm |')
+        A('|---|---|---|---|---|')
         for k, v in contr.items():
             _tag_n = f'{v['n']}' if v['n'] >= n_cells_max else f'{v['n']}（未配满，cell n={n_cells_max}）'
-            A(f'| {k} | {_tag_n} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
+            A(f'| {k} | {_tag_n} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |')
         A('')
         n6 = [v for v in contr.values() if v['n'] >= 6]
         if n6:
-            sig = [v for v in n6 if v['p_exact_signflip'] < 0.05]
+            sig = [v for v in n6 if v.get('p_holm') is not None and v.get('p_holm') < 0.05]
             _weakest = min((v['n'] for v in n6))
             if floor_p_tree >= 0.05:
                 _tree_txt = f'本面板最弱的对比仍有 n={n_tree_min}，其下限为 {floor_p_tree:.3f}，跨不过 0.05——因此本报告的一切显著性主张只对上面的 n>={_weakest} 行成立，凡引用最弱对比（n={n_tree_min}）的段落一律按效应量 + 方向同向性表述。'
@@ -483,7 +488,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
         _vs = [(k, v) for k, v in contr.items() if tag in k]
         if not _vs:
             return False
-        return all((v['mean'] > 0 and v.get('p_exact_signflip', 1.0) < alpha for _k, v in _vs))
+        return all((v['mean'] > 0 and v.get('p_holm') is not None and v.get('p_holm', 1.0) < alpha and v.get('n', 0) >= 6 for _k, v in _vs))
     dn, ab, ri = (_rng('dense'), _rng('allblocks'), _rng('randidx'))
     ri_sig = _all_sig('randidx')
     ri_all_pos = bool(ri) and ri[0] > 0.0
@@ -544,8 +549,12 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
         A('**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步与 seed 均值轨迹同为有效读数。')
     A('')
     if fit:
-        _r2s = f'（R²={fit["r2"]:.2f}）' if 'r2' in fit else '（n=2，R² 恒为 1，不报告拟合优度）'
-        A(f'**趋势拟合（仅供参考）**：{fit['n_points']} 个已观测交叉点，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}{_r2s}。方向性证据，不作精确幂律主张。')
+        if 'slope' not in fit:
+            A(f'**趋势拟合**：不足 3 个独立、预算可比的交叉点（n={fit.get("n_points", 0)}）；按 `insufficient_points` 处理，不报告斜率或幂律。')
+            A('')
+        else:
+            _r2s = f'（R²={fit["r2"]:.2f}）' if 'r2' in fit else '（仅 2 点，R² 恒为 1，不报告拟合优度）'
+            A(f'**趋势拟合（仅供参考）**：{fit['n_points']} 个已观测交叉点，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}{_r2s}。方向性证据，不作精确幂律主张。')
         A('')
     if scale384:
         A(f'**d=384 面板（P4F 后，实际 {_n384_txt}）：**')

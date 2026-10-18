@@ -1,0 +1,29 @@
+# Evidence release index
+
+Git tracks source only (`results_*/`, `analysis_*/`, `REPORT*.md`, caches and
+checkpoints are gitignored). A numeric claim is auditable only through an
+**evidence release**: a `release_<tag>.tar.gz` plus its SHA-256 manifest,
+published to a read-only location, containing per-seed records, configs,
+environment, checkpoint hashes, failure/coverage records and the freeze lock.
+
+No formal evidence release is bundled in this source snapshot. Every future
+release must add a row here (and should be recorded in `DECISION_LOG.md`):
+
+| tag | date | Git commit | archive URL / object key | archive SHA-256 | manifest SHA-256 | verifier |
+|---|---|---|---|---|---|---|
+| _none yet_ | — | — | — | — | — | — |
+
+Build and verify:
+
+```bash
+python archive_release.py plan  v13 --dirs results_lm_test analysis_v12
+python archive_release.py make  v13 --dirs results_lm_test analysis_v12 --include-ckpt
+python archive_release.py verify archive/release_v13.tar.gz
+```
+
+`archive_release.py` packs `DECISION_LOG.md`, `confirmation_frozen.json`,
+`requirements.txt`, `requirements.lock` (if present), the freeze lock and a
+per-file SHA-256 manifest; `verify` recomputes every hash independently.
+
+A release without a verifier URL or without the `verify` output should be
+treated as **not auditable**, regardless of the numbers in its report.

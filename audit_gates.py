@@ -158,7 +158,7 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
             tr_s = _shingles(tr, shingle, max_rows_shingled)
             inter = len(te_s & tr_s)
             union = len(te_s | tr_s)
-            out['checks']['doc_overlap'] = {'shingle_k': shingle, 'train_rows_scanned': int(tr.shape[0]), 'test_rows_scanned': int(te.shape[0]), 'test_shingles': len(te_s), 'train_shingles': len(tr_s), 'shared_shingles': inter, 'jaccard': (inter / union) if union else 0.0, 'seconds': round(time.time() - t0, 1), 'note': 'nonzero overlap reflects WikiText-103 near-duplicate documents; report it as a boundary of generalization claims, not as leakage by itself — tokenizer fit and split handling are the leakage-critical parts and are checked separately'}
+            out['checks']['doc_overlap'] = {'shingle_k': shingle, 'train_rows_scanned': int(tr.shape[0]), 'test_rows_scanned': int(te.shape[0]), 'test_shingles': len(te_s), 'train_shingles': len(tr_s), 'shared_shingles': inter, 'jaccard': (inter / union) if union else 0.0, 'seconds': round(time.time() - t0, 1), 'policy_max_jaccard': 0.05, 'policy_violation': bool(union and (inter / union) > 0.05), 'note': 'nonzero overlap reflects WikiText-103 near-duplicate documents; report it as a boundary of generalization claims, not as leakage by itself — tokenizer fit and split handling are the leakage-critical parts and are checked separately. policy_max_jaccard=0.05 is a reporting threshold: above it, the split must be explicitly documented/waived before any cross-split generalization claim'}
         else:
             out['checks']['doc_overlap'] = 'npy caches absent'
     except Exception as e:

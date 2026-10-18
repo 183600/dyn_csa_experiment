@@ -430,10 +430,19 @@ def run_full():
     run_overfit(cfg=dict(L.RUN, outdir='results_overfit_sanity'))
     guard = L.TimeGuard(L.RUN_CAP)
     guard.report()
-    _synth_summary, _long_snapshot = synthesize_long_summary()
-    if _long_snapshot:
-        L.atomic_write_json(os.path.join(REPO, 'results_lm_v3_long', 'aggregate.json.v6bak'), _long_snapshot, indent=2)
-    push_ok = git_push('v6: rebuild results_lm_v3_long/summary.json from committed aggregate')
+    if os.environ.get('V6_SYNTH', '').strip().lower() in ('1', 'true', 'yes'):
+        _synth_summary, _long_snapshot = synthesize_long_summary()
+        if _long_snapshot:
+            L.atomic_write_json(os.path.join(REPO, 'results_lm_v3_long', 'aggregate.json.v6bak'), _long_snapshot, indent=2)
+        push_ok = git_push('v6: rebuild results_lm_v3_long/summary.json from committed aggregate')
+    else:
+        # Reconstruction is an explicit, opt-in provenance operation: a
+        # synthesized record is a copy, not an independent run.  Running it
+        # automatically in `full` made the long panel look more complete than
+        # the measured evidence.
+        print('[synth] skipped (set V6_SYNTH=1 to rebuild results_lm_v3_long/summary.json from an old aggregate)')
+        _synth_summary, _long_snapshot = {}, None
+        push_ok = True
     # Phase order: the statistically foundational panels first (core table ->
     # its leave-one-out ablations -> scale probe), the 20k-step long runs
     # LAST.  The n>=3 core/ablation/scale tables are secured before the long

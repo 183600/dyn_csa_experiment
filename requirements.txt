@@ -1,0 +1,10 @@
+# Runtime dependencies for dyn_csa_experiment.
+# These are compatibility ranges, not a lock.  On the experiment machine run:
+#   python -m pip freeze > requirements.lock
+# and archive requirements.lock with the release (archive_release.py records it).
+# The code no longer pip-installs at import time; install explicitly.
+torch>=2.8,<3
+numpy>=2.0,<3
+tokenizers>=0.20,<1
+datasets>=3.0,<5
+matplotlib>=3.8,<4

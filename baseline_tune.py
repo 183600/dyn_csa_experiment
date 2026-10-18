@@ -341,10 +341,11 @@ def run_simple(base_cfg=None, outdir='results_baseline_tuning', protocol=None):
     # B-tier FineWeb path), so the count-model floor and the neural panel use
     # the same corpus and vocabulary.
     train_ids, val_batch, vocab, _tok, _val_bnd = L.load_run_corpus(base)
-    # Match the neural panel's evaluation slice exactly: train_variant scores
-    # val_batch[:eval_subset], so the count-model floor must use the same rows
-    # or the PPL comparison mixes two different validation samples.
-    rows = max(1, min(int(base.get('eval_subset', 128)), int(val_batch.shape[0])))
+    # Match the neural panel's FINAL evaluation slice exactly: train_variant
+    # scores the full fixed val_batch (`eval_subset` only controls the
+    # per-eval-step history).  Using eval_subset here measured the floor on 128
+    # rows while the panel PPL came from 512 — two different validation samples.
+    rows = max(1, int(val_batch.shape[0]))
     eval_slice = val_batch[:rows]
     artifact = L.simple_baseline_fit(train_ids, eval_slice, vocab, protocol=protocol)
     artifact.setdefault('data', {})['cache_val_fp'] = L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1))

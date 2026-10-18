@@ -45,7 +45,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DIRS = ['results_lm_test', 'analysis_v12']
-ENV_FILES = ['confirmation_frozen.json']
+ENV_FILES = ['confirmation_frozen.json', 'DECISION_LOG.md', 'RELEASES.md', 'requirements.txt', 'requirements.lock']
 
 
 def _sha256(path, chunk=1 << 20):
@@ -160,6 +160,11 @@ def cmd_plan(tag, dirs, include_ckpt=False):
 
 
 def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
+    _required = ['DECISION_LOG.md', 'RELEASES.md', 'confirmation_frozen.json']
+    _missing = [f for f in _required if not os.path.exists(os.path.join(REPO, f))]
+    if _missing:
+        print(f'[archive] REFUSE: formal release is missing required provenance file(s): {_missing}')
+        return 1
     files = _collect(dirs, include_ckpt)
     if not files:
         print('[archive] REFUSE: nothing to archive — the named result dirs do not exist here; run this on the machine holding the artifacts')

@@ -8,6 +8,14 @@ dynamic blocking) vs dense attention in a small from-scratch LM (BPE-8k,
 WikiText-103). This repository contains the experiment code and everything
 needed to reproduce the results on a machine of your own.
 
+> **Version naming.** `v12` is the driver/study generation; `CODE_SEMANTICS =`
+> `v11.125` is the library measurement-semantics stamp that the frozen plan
+> binds. They are not the same numbering scheme, and the mismatch is intentional.
+
+> **Evidence levels.** v6-v11 are exploratory (selected on the same validation
+split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
+`DECISION_LOG.md` and `docs/design_notes.md` §17/§20.
+
 ## Repository layout
 
 The repository keeps only **source code, driver scripts and design
@@ -32,11 +40,13 @@ already keeps those path families out of the repository (`docs/` retains only
 | `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
 | `v12_supp.py` | **the v12 confirmation driver (reviewer-response + review-2 hardening)**: P5C trains all four frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-document PPL records |
 | `confirmation_frozen.json` | **pre-registered confirmation plan v2** (tracked): frozen arms, seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
-| `DECISION_LOG.md` | **decision log** (tracked, restored 2026-10-17): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail; formal releases additionally archive per-seed results via `archive_release.py` |
+| `RELEASES.md` | **evidence release index**: where each immutable `release_<tag>.tar.gz` + SHA-256 manifest is published; the Git repo itself stays source-only |
+| `pyproject.toml` / `requirements.txt` | Python ≥3.12 and dependency declarations; install explicitly (no import-time pip install) |
+| `DECISION_LOG.md` | **decision log** (tracked; reconstructed 2026-10-18 from the README/design notes/manifest because the snapshot has one squashed commit): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail; formal releases additionally archive per-seed results via `archive_release.py` |
 | `audit_gates.py` | **review-2 verification entry points** (zero-experiment): data-leakage audits (tokenizer provenance, vocab identity, train/test overlap), CPU causality unit checks (prefix invariance, label shift, decode consistency), block-attribution / boundary-vs-random / length-consistency / baseline-fairness / failure-concentration / budget-reconciliation audits and prefill-decode-kv-growth measurement utilities |
 | `archive_release.py` | **immutable evidence archiver**: packs per-release artifacts (results, analyses, reports, freeze lock, decision log, environment, checkpoint hashes) into a tar.gz with a per-file SHA-256 manifest and an independent `verify` subcommand — the git repo stays source-only (design_notes §8) while every formal release gets an auditable fixed archive |
 | `m0_supp.py` | **the M0/S1 driver (adopted B tier)**: entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below and `docs/compute_plan.md` |
-| `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk, never hard-coded) |
+| `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk; protocol constants and analytic FLOPs assumptions are explicit inputs, not measurements) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
 | `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
 | `docs/compute_plan.md` | **compute plan**: the scale-up roadmap (0.14B–1.3B ladder, FineWeb-Edu, Triton-kernel prerequisite), H800-hour budget tiers and gated milestones M0–M4; the former application draft is no longer kept in the repo |
@@ -58,10 +68,11 @@ python build_report.py           # rebuild the report from on-disk results_*/ + 
 ## Reproducing (any CUDA box)
 
 ```bash
-# 0) environment — Python 3.12, torch 2.8.0+cu128, plus:
-pip install datasets tokenizers matplotlib
-# (the code also pip-installs these itself on import; HF_ENDPOINT is set to
-#  hf-mirror.com inside exp_lib.py — change it if you are outside CN)
+# 0) environment — Python 3.12 (see pyproject.toml / requirements.txt):
+pip install -r requirements.txt
+# The code no longer pip-installs at import time.  Set CSA_AUTO_INSTALL=1 only
+# for a throwaway environment.  The Hugging Face mirror is opt-in via
+# CSA_HF_MIRROR=1; the default endpoint is the official Hub.
 #
 # If the Hub is unreachable, `load_wikitext` falls back to a local raw dump:
 # point `WT103_RAW_TXT` at a directory holding `wiki.train.raw` /
@@ -121,7 +132,9 @@ CSA_PAR=2 CSA_PAR_GPUS=0,3 python v10_supp.py phase P3SL
 What it guarantees (see `docs/design_notes.md` §13 for the full contracts):
 
 - **identical numbers** — each cell seeds its own RNG in its own process, so
-  the parallel pass reproduces the serial pass bit-for-bit; fingerprints,
+  the parallel pass is designed to reproduce the serial pass; the bit-for-bit
+  equivalence check is a local scripts-side test, not a CI-enforced guarantee;
+  fingerprints,
   resume rules and `CODE_SEMANTICS` are unchanged;
 - **merge-safe artifacts** — all `summary.json` updates go through an
   flock-guarded load-modify-write, so concurrently finishing runs never lose
@@ -270,8 +283,10 @@ smallest attainable Holm p exceeds alpha (a plan that cannot confirm is a design
 defect, not conservatism — the seed count was revised 6 -> 12 before any
 test-split access for exactly this reason), refuses records that fail the
 strict admission gate (seed whitelist, uniqueness, non-null test-slice
-fingerprint, code/recipe match, manifest sha binding), and locks the plan at
-the first test-split access (`.freeze_lock.json`). The test split
+fingerprint, code/recipe match, manifest sha binding), and writes the freeze
+lock (`.freeze_lock.json`) **before** the first test-split read, then binds the
+test-slice fingerprint immediately after it. Kernel mode is refused for this
+eager-only frozen plan. The test split
 (`wiki.test.raw`, via `load_wikitest`) is read by P5T **only** — every earlier
 phase reads train/valid exclusively. After the first test-split evaluation, no
 frozen comparison or seed may be added (selection bias by construction; see
@@ -338,3 +353,37 @@ script pushes and shuts the instance down (cancel with
 > `fuse_analysis.py` and the per-version `v*_supp.py report` builders compute
 > on the fly from the on-disk `results_*/` and `analysis_*/` artifacts; no
 > quantity is ever hard-coded in the repository prose.
+
+## Review-3 hardening (what changed)
+
+- **PPL aggregation**: training/length records now carry `nll_sum`,
+  `n_tokens` and per-document NLL; `aggregate` reports `ppl_pooled =
+  exp(ΣNLL/Σtokens)` as `ppl_primary` (with the arithmetic seed mean,
+  median/IQR, seed-level t interval and document bootstrap kept alongside).
+  The final PPL is still measured on the full fixed validation batch;
+  `eval_subset` only controls the in-training curve.
+- **Statistics**: v7–v11 analysis and `build_report.py` attach Holm
+  step-down over the displayed family (omitted comparisons keep a dummy p=1
+  slot). Report prose may say “significant” only when n≥6, raw p<0.05, Holm
+  p<0.05 and |mean|>std.
+- **Sign-flip assumptions**: `paired_effect_stats` now also reports the sign
+  split, a paired bootstrap interval, an exact Wilcoxon sensitivity p, and an
+  unpaired bootstrap interval when both arms are supplied. The primary p
+  remains seed-level.
+- **Objectives/parameters**: each record carries a `train_objective`
+  descriptor (does `comp_reg` actually apply? is the delta-LR effective? what
+  boundary policy?) plus `param_breakdown` and
+  `kv_cache_elements_per_token`. `methodology_audit` flags same-run_cfg but
+  different-objective contrasts as system-level, not isolated mechanism.
+- **Boundary learning**: the default `csa_dynamic` remains a cosine threshold
+  with a learned scalar offset trained by `comp_reg`; it is **not**
+  task-learned. The new opt-in `csa_dynamic_task` samples cuts and adds a
+  score-function term, and is scheduled in the ablation panel.
+- **Synthesized records**: `run_gapfill.py full` no longer reconstructs the
+  long summary unless `V6_SYNTH=1`; crossover statistics exclude synthesized
+  seeds entirely and refuse a slope with fewer than 3 independent points.
+- **Reproducibility**: `pyproject.toml` declares Python ≥3.12,
+  `requirements.txt` plus a verified CPU `requirements.lock` are tracked,
+  import-time pip install and the HF mirror are opt-in (`CSA_AUTO_INSTALL=1`, `CSA_HF_MIRROR=1`), and
+  `archive_release.py` packs `DECISION_LOG.md`, the dependency declarations,
+  the freeze lock and a SHA-256 manifest. See `RELEASES.md`.

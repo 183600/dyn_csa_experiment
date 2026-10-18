@@ -831,7 +831,12 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             x, y = next(bpe)
             logits = None
             ce = model.ce_loss(x, y, vocab)
-            loss = ce + comp_lambda * model.comp_reg
+            _blp = getattr(model, 'boundary_logp', None)
+            if _blp is not None:
+                _bdec = max(int(getattr(model, 'boundary_decisions', 0) or 0), 1)
+                loss = ce + comp_lambda * model.comp_reg + L.BOUNDARY_PG_COEF * (-float(ce.detach().item()) * _blp / _bdec)
+            else:
+                loss = ce + comp_lambda * model.comp_reg
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), L.GRAD_CLIP_NORM)
             opt.step()
@@ -869,14 +874,23 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             torch.cuda.empty_cache()
         return {'cap_truncated': True, 'steps_done': steps, 'train_time_s': wall}
     del x, y, logits, ce, loss
-    ppl = L.eval_ppl(model, val_batch, device)
+    _eval_stats = L.eval_ppl(model, val_batch, device, return_stats=True)
+    ppl = float(_eval_stats['ppl'])
     stats = L.compression_report(model, val_batch, device, val_bnd=val_bnd)
     print(f'[{variant} seed={seed} warm={warm_steps}] val PPL = {ppl:.3f}  ({wall / 60:.1f} min)')
     if _lbuf:
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': L.training_knobs(), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids)}
+    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': L.training_knobs(), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids),
+           'nll_sum': _eval_stats.get('nll_sum'), 'n_tokens': _eval_stats.get('n_tokens'),
+           'nll_per_row': _eval_stats.get('nll_per_row'), 'n_tokens_per_row': _eval_stats.get('n_tokens_per_row'),
+           'eval_rows': _eval_stats.get('eval_rows'), 'eval_seed': _eval_stats.get('eval_seed'),
+           'eval_subset': _eval_stats.get('eval_subset'),
+           'eval_fp': L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
+           'param_breakdown': L.param_breakdown(model),
+           'kv_cache_elements_per_token': L.kv_cache_elements_per_token(model),
+           'train_objective': L.train_objective(model, comp_lambda=comp_lambda, delta_lr_mult=delta_lr_mult)}
     del model, opt, bpe, decay, ndecay, dpar
     gc.collect()
     if device.type == 'cuda':
@@ -1444,6 +1458,20 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         res['n_skipped_config_mismatch'] = len(skipped)
         res['n_unstamped'] = unstamped
         out_d['comparisons'][name] = res
+    # Family-wise correction over the report's five pre-listed comparisons
+    # (review 3 issue 3).  This is a guard against multiple-comparison
+    # over-reading; the panel remains EXPLORATORY because its comparisons and
+    # seeds were chosen after seeing validation results (design_notes §17).
+    _pairs = [(k, float(v.get('p_exact_signflip'))) for k, v in out_d['comparisons'].items()
+              if isinstance(v, dict) and isinstance(v.get('p_exact_signflip'), (int, float))
+              and math.isfinite(float(v['p_exact_signflip']))]
+    _h = L.holm_adjust(_pairs) if _pairs else {}
+    for _k, _v in out_d['comparisons'].items():
+        if isinstance(_v, dict):
+            _v['p_holm'] = (_h.get(_k) or {}).get('p_holm') if _k in _h else None
+    out_d['family'] = {'declared': len(out_d['comparisons']), 'tested': len(_pairs), 'alpha': 0.05,
+                       'correction': 'holm step-down', 'evidence_level': 'exploratory',
+                       'note': 'v7 panels were selected on the validation split; Holm limits over-reading but does not make them confirmatory'}
     out_d = L.stamped_analysis('v7_bootstrap_stats', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[stats] wrote {out}')
     for k, v in out_d['comparisons'].items():
@@ -1451,7 +1479,9 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
             print(f'  {k:34s} omitted — {v['omitted']}')
             continue
         warn = f'  [{v['n_skipped_config_mismatch']} seed(s) dropped: config mismatch]' if v.get('n_skipped_config_mismatch') else ''
-        print(f'  {k:34s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}{warn}')
+        _ph = v.get('p_holm')
+        _pht = ('%.3f' % _ph) if isinstance(_ph, (int, float)) and math.isfinite(float(_ph)) else 'n/a'
+        print(f'  {k:34s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  p_Holm={_pht}  n={v['n']}{warn}')
     return out_d
 
 def git_push(msg):
@@ -1493,7 +1523,7 @@ def schedule_shutdown(delay_s=120):
     subprocess.Popen(['bash', '-c', f'sleep {delay_s}; shutdown -h now'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f'[v7] instance shuts down in {delay_s}s.')
 LONG_EXT = dict(L.RUN_LONG, steps=40000, n_train_tokens=110000000, eval_every=2000, outdir='results_lm_v7_long40')
-PHASES = [('P0R', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_rope', variants=ROPE_VARIANTS, steps=1500, matched=set(PARAM_MATCHED_V7), mlp_match_ref='csa_fixed_rope'), seeds=[0, 1, 2])), ('P0W', 'warm', dict(cfg=dict(L.RUN_LONG, outdir='results_lm_v7_warmup', variants=['csa_fixed']), seeds=[0, 1, 2], warm_grid=(0, 5000, 10000))), ('P1L', 'len', dict(outdir='results_len', vocab=8192, steps=3000, train_len=512, eval_lens=[512, 1024, 2048, 4096], variants=['full', 'csa_fixed', 'full_rope', 'csa_fixed_rope'])), ('P2S', 'plain', dict(cfg=dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic']), seeds=[2, 3])), ('P1T', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_seq2k', seq_len=2048, batch_size=3, steps=1500, variants=['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']), seeds=[0, 1])), ('P0E', 'plain', dict(cfg=dict(LONG_EXT, variants=['csa_fixed', 'full']), seeds=[0, 1]))]
+PHASES = [('P0R', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_rope', variants=ROPE_VARIANTS, steps=1500, matched=set(PARAM_MATCHED_V7), mlp_match_ref='csa_fixed_rope'), seeds=[0, 1, 2])), ('P0W', 'warm', dict(cfg=dict(L.RUN_LONG, outdir='results_lm_v7_warmup', variants=['csa_fixed']), seeds=[0, 1, 2], warm_grid=(0, 5000, 10000))), ('P1L', 'len', dict(outdir='results_len', vocab=8192, steps=3000, train_len=512, eval_lens=[512, 1024, 2048, 4096], n_seq=16, variants=['full', 'csa_fixed', 'full_rope', 'csa_fixed_rope'])), ('P2S', 'plain', dict(cfg=dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic']), seeds=[2, 3])), ('P1T', 'plain', dict(cfg=dict(L.RUN, outdir='results_lm_v7_seq2k', seq_len=2048, batch_size=3, steps=1500, variants=['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']), seeds=[0, 1])), ('P0E', 'plain', dict(cfg=dict(LONG_EXT, variants=['csa_fixed', 'full']), seeds=[0, 1]))]
 
 def run_phase(name, guard, only=None, par=None):
     import par as _par
@@ -1719,7 +1749,7 @@ def run_niah_phase(payload, guard=None, label=''):
     return summary
 
 @torch.inference_mode()
-def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=None):
+def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=None):
     was = model.training
     model.eval()
     out = {}
@@ -1775,7 +1805,10 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=8, max_pos=N
                 _t = float(_cum[:, Ln - 2].sum()) if Ln >= 2 else 0.0
                 _ntok = int(ids.shape[0]) * (Ln - 1)
                 ppl = math.exp(_t / max(_ntok, 1))
-                out[Ln] = {'ppl': float(ppl), 'n_tok': _ntok, 'truncated': False, 'eval_span': Ln}
+                out[Ln] = {'ppl': float(ppl), 'n_tok': _ntok, 'n_tokens': _ntok, 'truncated': False, 'eval_span': Ln,
+                           'nll_sum': float(_t),
+                           'nll_per_seq': [float(v) for v in _cum[:, Ln - 2].tolist()],
+                           'n_seq': int(ids.shape[0])}
                 # per-document rows (review-2 issue 9b): the pooled ppl above is
                 # UNCHANGED (same reduction); these extra rows only make the
                 # document-sampling uncertainty visible and stratifiable
@@ -1840,6 +1873,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     ckpt_dir = os.path.join(outdir, 'ckpt')
     os.makedirs(ckpt_dir, exist_ok=True)
     eval_lens = payload['eval_lens']
+    n_seq = int(payload.get('n_seq', 16))
     steps = payload.get('steps', 3000)
     train_len = payload.get('train_len', 512)
     vocab = payload.get('vocab', 8192)
@@ -1860,7 +1894,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     mr = 4.0
     if v in PARAM_MATCHED_V7:
         mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant='csa_fixed_rope')
-    _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs{batch_size}_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr{mr:.8g}-csa_fixed_rope_df{L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))}'
+    _recipe = f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs{batch_size}_lr0.0003_nt8000000_wu50_wd0.1_cl0.05_dlm10.0_mr{mr:.8g}-csa_fixed_rope_ns{n_seq}_df{L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))}'
     ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
     stale = False
     _ckp_pre = None
@@ -1955,17 +1989,22 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     key = f'{v}::seed{seed}'
     _cur = L.locked_json_read(spath).get(key)
     _need_lens = list(eval_lens)
-    if L.result_is_current(_cur, CKPT_CODE, 'by_len'):
+    if L.result_is_current(_cur, CKPT_CODE, 'by_len') and _cur.get('recipe') == _recipe:
         _need_lens = [Ln for Ln in eval_lens if not L.by_len_cells([_cur], Ln)]
         if not _need_lens:
             return out
         print(f'[resume] {key}: by_len record is stamped current but at least one eval length holds no usable measurement (error cell) — re-evaluating the missing lengths')
+    elif L.result_is_current(_cur, CKPT_CODE, 'by_len'):
+        # A PPL measured on a different document count / recipe is a different
+        # quantity.  Re-evaluate all lengths instead of merging 8-doc and
+        # 16-doc cells under one key.
+        print(f'[resume] {key}: by_len record was measured under a DIFFERENT recipe ({_cur.get("recipe")!r} != {_recipe!r}) — re-evaluating all lengths')
     _ckp = _ckp_pre if _ckp_pre is not None else _load_ckpt(ck)
     model = L.SmallGPT(_ckp.get('vocab', vocab), 256, 6, 8, 32, _ckp.get('train_len', train_len), _ckp['cfg'], mlp_ratio=_ckp['mlp_ratio']).to(DEVICE)
     model.load_state_dict(_ckp['sd'])
     mp = None if not getattr(model, 'use_abs_pe', True) else _ckp.get('max_seq', train_len)
     _t_ev = time.time()
-    r = eval_length_gen(model, val_ids, _need_lens, DEVICE, max_pos=mp)
+    r = eval_length_gen(model, val_ids, _need_lens, DEVICE, max_pos=mp, n_seq=n_seq)
     _ckp_params = _ckp['params']
     if guard is not None:
         guard.record_run(time.time() - _t_ev, 0, 0, 0, 0, 0)
@@ -1979,7 +2018,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             except (TypeError, ValueError):
                 continue
         _merged.update(r)
-        _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE}
+        _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE, 'recipe': _recipe, 'eval_n_seq': n_seq}
         try:
             _prov = L.experiment_provenance(_prov_cfg, train_ids=(train_ids if _tr is not None else None), val_batch=val_ids, vocab=vocab)
             _rec['provenance'] = _prov

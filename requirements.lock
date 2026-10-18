@@ -1,0 +1,10 @@
+# Verified CPU environment for the review-3 test suite (Python 3.12.15).
+# This is NOT the CUDA reference environment used for the paper-scale runs:
+# those must regenerate their own lock with `python -m pip freeze` and archive
+# it (archive_release.py records `pip freeze` and the GPU identity).  Pinning
+# the CPU versions here makes the zero-GPU test/audit path reproducible.
+numpy==2.5.4
+torch==2.14.1
+tokenizers==0.23.3
+datasets==5.1.0
+matplotlib==3.11.2

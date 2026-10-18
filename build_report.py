@@ -48,6 +48,22 @@ def fm(x, nd=2):
 def sp(x, nd=2):
     return f'±{x:.{nd}f}' if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(x) else ''
 
+def _ppl_value(entry):
+    """Primary PPL aggregate: pooled token-level NLL when the records carry it,
+    otherwise the historical arithmetic seed mean (explicitly labelled)."""
+    if not isinstance(entry, dict):
+        return None
+    for k in ('ppl_primary', 'ppl_pooled', 'ppl_mean'):
+        v = entry.get(k)
+        if isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v):
+            return float(v)
+    return None
+
+def _ppl_tag(entry):
+    if isinstance(entry, dict) and entry.get('ppl_pooled') is not None:
+        return 'pooled'
+    return 'mean(PPL)' if isinstance(entry, dict) else 'n/a'
+
 def _hist_points(r):
     for _pt in (r.get('ppl_history') or []) if isinstance(r, dict) else []:
         try:
@@ -202,7 +218,29 @@ def _code_semantics():
             return m.group(1) if m else None
     except Exception:
         return None
-_CUR_CS = _code_semantics()
+
+def _kernel_stamp():
+    """Mirror exp_lib.code_stamp()'s kernel suffix without importing torch.
+
+    `_code` carries '-tk1:<backend>' under CSA_KERNEL; comparing it to the bare
+    CODE_SEMANTICS labels every current kernel record stale (design_notes §14).
+    For `auto` the real backend depends on CUDA/triton availability, so a
+    report should run with the same explicit CSA_KERNEL value the panel used;
+    an ambiguous `auto` produces a non-matching stamp and therefore a visible
+    stale warning rather than a false 'current' claim.
+    """
+    mode = os.environ.get('CSA_KERNEL', '').strip().lower()
+    if mode in ('', '0', 'off', 'none', 'false'):
+        return ''
+    if mode == 'ref':
+        return '-tk1:ref'
+    if mode in ('1', 'true', 'on', 'triton'):
+        return '-tk1:triton'
+    if mode == 'auto':
+        return '-tk1:auto'
+    return ''
+
+_CUR_CS = (_code_semantics() or '') + _kernel_stamp()
 
 def _finite_ppls(r):
     ppls = r.get('ppls') or r.get('ppl_list') or []
@@ -385,7 +423,21 @@ def paired_row(a_records, b_records):
     return (kept, dl, st)
 
 def sec_header():
-    return f'# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）\n> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n> 说明：本报告全部数字由 `build_report.py` 从 `results_*/`、`analysis_v7/`\n> 的落盘产物计算得到，无手填数值。\n\n本报告汇总补充实验。所有新变体\n（RoPE+QK-norm、dense-warmup、topk 扫描、m=1、长度外推）都经由 **完全相同的\n训练/优化器/LR/评测/TimeGuard 代码路径**（对 `exp_lib` 的 `make_layer_cfgs`/\n`SmallGPT` 做 monkey-patch 注入），以保证可比性。长上下文证据采用\n**wikitext 长度外推探针**（train@512 → eval 512..4096），以自然语料覆盖\n长上下文评测。\n\n'
+    return ('# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n'
+            f'> 生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")}\n'
+            '> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）\n'
+            '> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n'
+            '> **证据等级：探索性（exploratory）**。本报告的面板/种子/比较是在同一 validation split 上选择后观察的；'
+            'Holm 校正只限制过度宣称，不能把这些结果变成预注册确认。确认性证据见 `confirmation_frozen.json` / v12。\n'
+            '> 说明：本报告全部数字由 `build_report.py` 从 `results_*/`、`analysis_v7/`\n'
+            '> 的落盘产物计算得到，无手填数值。\n\n'
+            '本报告汇总补充实验。所有新变体\n'
+            '（RoPE+QK-norm、dense-warmup、topk 扫描、m=1、长度外推）都经由 **完全相同的\n'
+            '训练/优化器/LR/评测/TimeGuard 代码路径**（对 `exp_lib` 的 `make_layer_cfgs`/\n'
+            '`SmallGPT` 做 monkey-patch 注入），以保证可比性。长上下文证据采用\n'
+            '**wikitext 长度外推探针**（train@512 → eval 512..4096）：这是**外推探针，不是长上下文训练**；\n'
+            '块数/选择率、位置编码与截断随长度同时变化，报告须并列这些混淆项。\n\n')
+
 _MODULE_NOTE = '本模块只读：从 `results_*/` 与 `analysis_v7/` 的落盘产物计算\n报告全文，不 import torch（也不 import exp_lib）。上面那段\n模块说明文字以 `_MODULE_NOTE` 命名保留，不参与报告正文的渲染。'
 
 def sec_p0r():
@@ -398,9 +450,9 @@ def sec_p0r():
     for a, b in pairs:
         ea, eb = (_agg_entry(ab, a), _agg_entry(rope, b))
         if ea is not None and eb is not None:
-            pa, pb = (_finite_or_none(ea.get('ppl_mean')), _finite_or_none(eb.get('ppl_mean')))
+            pa, pb = (_ppl_value(ea), _ppl_value(eb))
             if pa is None or pb is None:
-                print(f'[report] sec_p0r: `{a}`/`{b}` lacks a finite ppl_mean — row omitted rather than printed as n/a arithmetic')
+                print(f'[report] sec_p0r: `{a}`/`{b}` lacks a finite PPL aggregate — row omitted rather than printed as n/a arithmetic')
                 continue
             lines.append(f'| `{a}` | {fm(pa)} {sp(ea.get('ppl_std'))} | {fm(pb)} {sp(eb.get('ppl_std'))} | **{pb - pa:+.2f}** | {_params_m(ea)} / {_params_m(eb)} |')
         else:
@@ -410,16 +462,16 @@ def sec_p0r():
     _cf_r, _fu_r = (_agg_entry(rope, 'csa_fixed_rope'), _agg_entry(rope, 'full_rope'))
     _mt = _agg_entry(ab, 'full_matched')
     if _cf is not None and _cf_r is not None and (_fu_r is not None) and (_fu is not None):
-        _means = [_finite_or_none(_e.get('ppl_mean')) for _e in (_cf, _fu, _cf_r, _fu_r)]
+        _means = [_ppl_value(_e) for _e in (_cf, _fu, _cf_r, _fu_r)]
         if any((m is None for m in _means)):
-            print('[report] sec_p0r: one of the four arm entries lacks a finite ppl_mean — group-gap block omitted')
+            print('[report] sec_p0r: one of the four arm entries lacks a finite PPL aggregate — group-gap block omitted')
             return '\n'.join(lines) + '\n'
         g_abs = _means[0] - _means[1]
-        _mtm = _finite_or_none((_mt or {}).get('ppl_mean'))
-        g_abs_m = _cf['ppl_mean'] - _mtm if _mtm is not None else float('nan')
-        g_rope = _cf_r['ppl_mean'] - _fu_r['ppl_mean']
-        d_abs = _fu['ppl_mean'] - _fu_r['ppl_mean']
-        d_sp = _cf['ppl_mean'] - _cf_r['ppl_mean']
+        _mtm = _ppl_value(_mt)
+        g_abs_m = _means[0] - _mtm if _mtm is not None else float('nan')
+        g_rope = _means[2] - _means[3]
+        d_abs = _means[1] - _means[3]
+        d_sp = _means[0] - _means[2]
         _has_mt = _mtm is not None
         rope_unmatched = unmatched_tag(_cf_r, _fu_r)
         _pgap_r = param_gap(_cf_r, _fu_r)
@@ -446,8 +498,12 @@ def sec_p0r():
         if _has_mt:
             if _pair_mt is not None:
                 _st_mt = _pair_mt[2]
+                # Single pre-specified contrast in this block: Holm over a
+                # one-element family is the raw p; the n>=6 / noise gate in
+                # `_sig_gate` still applies.
+                _st_mt['p_holm'] = _st_mt.get('p_exact_signflip')
                 _mt_stat = f'配对符号翻转 n={_st_mt['n']}、p={_st_mt['p_exact_signflip']:.3f}（Δ mean={_st_mt['mean']:+.2f}）'
-                _mt_sig = _st_mt['p_exact_signflip'] <= 0.05
+                _mt_sig = _sig_gate(_st_mt)
                 _mt_gap = _st_mt['mean']
             else:
                 _mt_stat = '本面板没有可通过配对门禁的同配置种子对，显著性无法检验'
@@ -455,9 +511,9 @@ def sec_p0r():
                 _mt_gap = g_abs_m
             if _mt_gap > 0:
                 if _mt_sig:
-                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍显著落后（{_mt_stat}），**P0-3 的混淆假设被证伪**，反而**强化**了论文的负结果——sparse 在该训练量下的落后是机制性的。'
+                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍落后且通过「n≥6 + Holm + 效应>噪声」门槛（{_mt_stat}），**不支持 PE 混淆解释**；但这是该受控面板上的证据，不外推为普遍机制。'
                 else:
-                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）方向仍为落后（{_mt_stat}），**P0-3 的混淆假设被证伪**——sparse 在该训练量下的落后是机制性的；其显著性按配对检验的实际分辨率表述，不作超出分辨率的显著性主张。'
+                    _p0r_concl = f'**结论（方向性，未确认）**：PE 错配的证据方向与「sparse 劣势」一致。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）方向仍为落后（{_mt_stat}），但未通过显著性/族校正门槛，因此只能说**不能据此排除** PE 混淆，不能写成「混淆假设被证伪」或「机制性落后」。'
             else:
                 _p0r_concl = f'**结论**：{_gain_txt}；但参数对齐的 absPE 数字中 `csa_fixed` 不再落后 `full_matched`（Δ={_mt_gap:+.2f} PPL，{_mt_stat}）——与原论断方向相反，**P0-3 的混淆假设在本轮未被证伪**，PE 错配不能排除在 sparse 的差距之外。'
         else:
@@ -577,20 +633,21 @@ def sec_p0w():
             _d = _st['mean']
             _floor = 2.0 / (1 << _st['n']) if _st['n'] and _st['n'] <= 20 else 1.0 / 200001.0
             _same_dir = all((x != 0 and (x > 0) == (_d > 0) for x in _dd))
-            if _st['p_exact_signflip'] > 0.05:
-                _verdict = f'n={_st['n']} 时 p={_st['p_exact_signflip']:.4f}（检验下限 {_floor:.3f}），**不构成显著**，' + ('各 seed 方向一致' if _same_dir else '方向不一致')
+            _gate_ok = _sig_gate(_st)
+            if not _gate_ok:
+                _verdict = f'n={_st['n']} 时 p={_st['p_exact_signflip']:.4f}（检验下限 {_floor:.3f}），**不构成显著/未过族校正**，' + ('各 seed 方向一致，仅作方向性读数' if _same_dir else '方向不一致')
             else:
-                _verdict = f'n={_st['n']} 时 p={_st['p_exact_signflip']:.4f}，**显著**'
+                _verdict = f'n={_st['n']} 时 p={_st['p_exact_signflip']:.4f}、p_Holm={_st.get("p_holm", float("nan")):.4f}，**显著**'
             _parts.append(f'`{v}` warm={w}：{_d:+.2f} PPL vs from-scratch 基线（{_verdict}）')
             _ds.append(_d)
-            _ds_sig.append(bool(_st['p_exact_signflip'] <= 0.05))
+            _ds_sig.append(_gate_ok)
         if _parts:
             _conc.append('；'.join(_parts) + '。')
         else:
             _conc.append('（该面板无可配对的可测量记录，无法给出结论。）')
         if _ds and all((x > 0 for x in _ds)):
             if any(_ds_sig):
-                _conc.append('即 dense 预热**不能**拯救 sparse 臂，过度预热反而有害——论文的 from-scratch 对比是保守的，**P0-1 的质疑被证伪**，负结果更稳固。')
+                _conc.append('即在该受控网格上 dense 预热未带来可检测的改善；这支持「from-scratch 对比不是靠预热缺失制造的优势」，但不足以写「证伪」或「负结果更稳固」（需预注册确认）。')
             else:
                 _conc.append('各 warm 档方向一致（预热更差），dense 预热在方向上**未能**拯救 sparse 臂，但没有一档达到配对检验的显著性（分辨率见上）——**P0-1 的质疑按方向不成立，按显著性则既不能证伪也不能确认**，须补更多 seeds 后再判。')
         elif _ds and all((x < 0 for x in _ds)):
@@ -616,10 +673,10 @@ def sec_p0e():
         if isinstance(_r, dict) and _measurable(_r) and isinstance(_r.get('tokens_seen'), (int, float)) and _r['tokens_seen'] > 0:
             _tok_hdr = f'~{_r['tokens_seen'] / 1e6:.0f}M tokens'
             break
-    lines = [f'## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / {_tok_hdr}）', '', '**评审论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (mean±std) | n | params |', '|---|---|---|---|']
+    lines = [f'## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / {_tok_hdr}）', '', '**评审论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (pooled/mean; ±seed sd) | n | params |', '|---|---|---|---|']
     for v in sorted(d):
         r = d[v]
-        lines.append(f'| `{v}` | {fm(r.get('ppl_mean'))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
+        lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
     _s_items = _prefer_one_cfg([_kv for _kv in s.items() if isinstance(_kv[1], dict) and 'variant' in _kv[1] and _measurable(_kv[1])], lambda kv: (kv[1].get('variant'), kv[1].get('run_cfg')), who='sec_p0e')
     trajs = collections.defaultdict(lambda: collections.defaultdict(dict))
     _dropped_pts = 0
@@ -791,7 +848,7 @@ def sec_p1t():
         elif r.get('ppls') or r.get('ppl_list'):
             mean, std, n = (None, None, 0)
         else:
-            mean, std, n = (r.get('ppl_mean'), r.get('ppl_std'), r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n', 0))
+            mean, std, n = (_ppl_value(r), r.get('ppl_std'), r.get('n_seeds') if r.get('n_seeds') is not None else r.get('n', 0))
         _bv = v.split('@')[0].split('#')[0]
         if _bv == 'csa_fix_m1':
             sr = _sr(32, _bv, ' (m=1, topk=32)')
@@ -841,7 +898,7 @@ def sec_p1t():
         r = _agg_entry(d, f'csa_fixed_topk{k}')
         if r is not None:
             ppls = _finite_ppls(r)
-            m = sum(ppls) / len(ppls) if ppls else _finite_or_none(r.get('ppl_mean'))
+            m = sum(ppls) / len(ppls) if ppls else _ppl_value(r)
             if isinstance(m, (int, float)):
                 rows_k.append((k, m))
     if len(rows_k) >= 3:
@@ -865,7 +922,7 @@ def sec_p1t():
         if not r:
             return None
         ppls = _finite_ppls(r)
-        return sum(ppls) / len(ppls) if ppls else _finite_or_none(r.get('ppl_mean'))
+        return sum(ppls) / len(ppls) if ppls else _ppl_value(r)
     m1m, t8m, t32m = (_mean(m1), _mean(t8), _mean(t32))
 
     lines += ['', '**结论（基于已完成的扫描点）**：', '']
@@ -912,7 +969,7 @@ def sec_p1t():
         _pair = paired_row(_recs.get('csa_fixed_topk8', {}), _recs.get('csa_fixed_topk32', {}))
         if _pair is not None:
             _kept, _dl, _st = _pair
-            _sig_txt = '显示该差距**达到 p≤0.05**，按显著性读法处理。' if _st['p_exact_signflip'] <= 0.05 else '显示该差距仍在噪声量级内，**不构成显著性主张**，只作方向性参考。'
+            _sig_txt = '显示该差距**达到 p≤0.05 且通过族校正/噪声门槛**，按显著性读法处理。' if _sig_gate(_st) else '显示该差距未通过「n≥6 + 原始 p<0.05 + Holm + 效应大于 seed 噪声」门槛，**不构成显著性主张**，只作方向性参考。'
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；配对的精确符号翻转检验（n={_st['n']}，p={_st['p_exact_signflip']:.3f}，Δ(topk8−topk32) mean={_st['mean']:+.2f} PPL）{_sig_txt}')
         else:
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；面板上没有可通过 pairing 门禁的同配置种子对，topk8 与 topk32 之差（{_gap:.2f} PPL）无法配对检验，只作方向性参考。')
@@ -1090,10 +1147,10 @@ def sec_p2s():
     d = agg('results_lm_v5_scale')
     if not d:
         return ''
-    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**评审论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (mean±std) | n | params |', '|---|---|---|---|']
+    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**评审论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (pooled/mean; ±seed sd) | n | params |', '|---|---|---|---|']
     for v in sorted(d):
         r = d[v]
-        lines.append(f'| `{v}` | {fm(r.get('ppl_mean'))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
+        lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
     ps = per_seed_records('results_lm_v5_scale')
     pairs = [('csa_fixed', 'full'), ('csa_fixed', 'full_sw128_matched'), ('csa_fixed', 'full_matched'), ('csa_dynamic', 'full'), ('hybrid_dynamic', 'full')]
     _agg = d
@@ -1136,7 +1193,7 @@ def sec_flops():
     pick = {512, 2048, 8192, 65536, 1048576}
     _xo = d.get('crossover_seq_len_csa_beats_dense')
     _xo_txt = f'**seq = {_xo}**' if _xo is not None else '**不存在**（所测长度内 CSA 均不低于 dense）'
-    lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 {_xo_txt} 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
+    lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。**这些是结构性估算，不是实测吞吐/延迟/显存**；实际成本还包括 MLP、QKV 投影、池化、动态分段、indexer/top-k、gather、内存访问、kernel launch、反向与 KV 更新。任何「效率优势」主张必须用 `audit_gates.measure_prefill_decode` 在真实 checkpoint 上测量后另行报告。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 {_xo_txt} 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
     for r in rows:
         if not isinstance(r, dict) or r.get('seq_len') not in pick:
             continue
@@ -1161,24 +1218,84 @@ def sec_flops():
         lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。优势随序列变长继续放大（{_trend}）。稀疏的收益是随长度增长的，并非在任意长度上都成立。', '']
     return '\n'.join(lines) + '\n'
 
+def _sig_gate(st, alpha=0.05, min_n=6):
+    """Conservative significance gate for report prose.
+
+    Requires n>=6 (the exact sign-flip floor at n<6 is >alpha, so no n<6 panel
+    can support a significance claim), raw p<alpha, Holm p<alpha when present,
+    and |mean|>std (effect bigger than seed noise).  A missing Holm value is
+    treated as NOT corrected — the report may say "nominal" but never
+    "significant" until a family correction has actually been attached.
+    """
+    if not isinstance(st, dict):
+        return False
+    n = st.get('n') or 0
+    p = st.get('p_exact_signflip')
+    ph = st.get('p_holm')
+    mean, std = st.get('mean'), st.get('std')
+    try:
+        if int(n) < int(min_n):
+            return False
+        if p is None or not (float(p) < alpha):
+            return False
+        if ph is None or not (float(ph) < alpha):
+            return False
+        if mean is None or std is None or abs(float(mean)) <= float(std):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+def holm_adjust(named_pvals, alpha=0.05):
+    """Holm step-down over the report's displayed family (local copy: this
+    builder intentionally does not import torch/exp_lib).  Missing/invalid
+    p-values keep a dummy p=1 slot so the family size is not silently shrunk."""
+    items = [(str(k), float(v)) for k, v in named_pvals]
+    m = len(items)
+    order = sorted(range(m), key=lambda i: items[i][1])
+    out = {}
+    prev = 0.0
+    for rank, i in enumerate(order, start=1):
+        name, p = items[i]
+        adj = min(1.0, max(prev, (m - rank + 1) * p))
+        prev = adj
+        out[name] = adj
+    return out
+
 def sec_stats():
     d = load(os.path.join(REPO, 'analysis_v7', 'stats.json'))
     if not d:
         return ''
-    lines = ['## 配对符号翻转检验（sign-flip permutation）', '', 'n≤4 时 bootstrap 无意义，改用符号翻转：n≤20 枚举全部 2^n 种符号组合得精确双侧 p 值；n>20 为固定种子的 Monte-Carlo 符号翻转（B=200000，p 分辨率下限 1/200001）。n 很小时 p 的分辨率有限是统计事实，报告 Δ 与方向同向性。', '', '| 比较 | Δ(mean) | p |', '|---|---|---|']
+    lines = ['## 配对符号翻转检验（sign-flip permutation）', '', 'n≤4 时 bootstrap 无意义，改用符号翻转：n≤20 枚举全部 2^n 种符号组合得精确双侧 p 值；n>20 为固定种子的 Monte-Carlo 符号翻转（B=200000，p 分辨率下限 1/200001）。n 很小时 p 的分辨率有限是统计事实，报告 Δ 与方向同向性。', '', '> **证据等级：探索性（v7 面板）**。Holm 列在本报告展示的对比族内做 step-down 校正，防止把多格 p<0.05 读成多个发现；它不是预注册确认，也不能把 v7–v11 已看过的数据变成确认性证据（见 docs/design_notes.md §17）。', '', '| 比较 | Δ(mean) | p | p_Holm |', '|---|---|---|---|']
     items = d.get('comparisons', {}) if isinstance(d, dict) else {}
     if not items and isinstance(d, dict):
         items = {k: v for k, v in d.items() if isinstance(v, dict) and (v.get('mean') is not None or v.get('delta') is not None)}
+    _pairs = []
     for k, v in items.items():
-        if isinstance(v, dict):
-            if 'omitted' in v:
-                lines.append(f'| {k} | —（{v['omitted']}） | — |')
-                continue
-            _dv = v.get('mean') if v.get('mean') is not None else v.get('delta')
+        _pv = None
+        if isinstance(v, dict) and 'omitted' not in v:
             _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
-            _mc = v.get('method') == 'mc' or (v.get('method') is None and isinstance(v.get('n'), (int, float)) and v['n'] > 20)
-            lines.append(f'| {k} | {fm(_dv)} | {fm(_pv, 4)}{' (MC)' if _mc else ''} |')
-    lines.append('')
+            try:
+                _pv = float(_pv)
+            except (TypeError, ValueError):
+                _pv = None
+        # Omitted/invalid comparisons keep a dummy p=1 slot so a report cannot
+        # shrink its own correction family by dropping a failed comparison.
+        _pairs.append((k, _pv if (_pv is not None and math.isfinite(_pv) and 0.0 <= _pv <= 1.0) else 1.0))
+    _holm = holm_adjust(_pairs, alpha=0.05) if _pairs else {}
+    for k, v in items.items():
+        if not isinstance(v, dict):
+            continue
+        if 'omitted' in v:
+            lines.append('| %s | —（%s） | — | — |' % (k, v.get('omitted')))
+            continue
+        _dv = v.get('mean') if v.get('mean') is not None else v.get('delta')
+        _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
+        _ph = _holm.get(k)
+        _mc = v.get('method') == 'mc' or (v.get('method') is None and isinstance(v.get('n'), (int, float)) and v['n'] > 20)
+        _pt = fm(_pv, 4) + (' (MC)' if _mc else '')
+        lines.append('| %s | %s | %s | %s |' % (k, fm(_dv), _pt, fm(_ph, 4)))
+    lines += ['', '> 若未校正 p<0.05 而 p_Holm≥0.05，只能写「名义上显著、族内未校正通过」，不能写成显著效应。', '']
     return '\n'.join(lines) + '\n'
 
 def main(argv=None):

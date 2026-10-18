@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dyn-csa-experiment"
+version = "0.0.0"
+description = "Controlled WikiText-103 study of compressed-block sparse attention"
+requires-python = ">=3.12"
+dependencies = [
+  "torch>=2.8,<3",
+  "numpy>=2.0,<3",
+  "tokenizers>=0.20,<1",
+  "datasets>=3.0,<5",
+  "matplotlib>=3.8,<4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]

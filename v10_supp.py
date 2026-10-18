@@ -310,6 +310,18 @@ def _recipe_norm(recipe):
     # mlp_match_ref field, not everything up to the '-' inside the df hashes.
     return re.sub(r'_mr[^_]*', '_mr*', recipe)
 
+def _clean_probe_params(pp):
+    """probe_params used for the ρ=0 clean-baseline lookup.
+
+    `span` carries an extra `span_len` (it changes corruption geometry); the
+    clean uniform ρ=0 cell does not.  Comparing the full dict silently dropped
+    EVERY span ΔNLL row, so the lookup strips only this mode-specific key."""
+    if not isinstance(pp, dict):
+        return pp
+    out = dict(pp)
+    out.pop('span_len', None)
+    return out
+
 def _probe_params_current(rec, fp, mode='uniform'):
     """Mode-aware probe-param currency.  uniform cells keep the existing
     fingerprint exactly (records without a 'mode' field are uniform), so the
@@ -1003,8 +1015,17 @@ def _scale_crossovers():
         if _stale_seeds:
             print(f'[stats] {label}: seed(s) {_stale_seeds} were measured under an older code-stamp — a code change must invalidate and recompute, not be reused, so they are excluded from this {label} crossover fit')
         common = sorted((set(ha) & set(hb)) - set(_stale_seeds))
+        _synth_seeds = sorted(s for s in common
+                              if getattr(ha, 'per_seed_synth', {}).get(s) or getattr(hb, 'per_seed_synth', {}).get(s))
+        if _synth_seeds:
+            # A reconstructed curve is a copy of an OLD aggregate, not an
+            # independent run.  It may be displayed as provenance, but it must
+            # not enter a crossover position, a mean trajectory or a fit.
+            print(f'[stats] {label}: seed(s) {_synth_seeds} carry a SYNTHESIZED reconstruction — excluded from every crossover statistic (not an independent run)')
+            common = [s for s in common if s not in set(_synth_seeds)]
         if not common:
-            out[label] = {'status': 'missing', **p}
+            out[label] = {'status': 'reconstruction_only' if _synth_seeds else 'missing', **p,
+                          'excluded_reconstructed': _synth_seeds}
             continue
         _cfg_a = getattr(ha, 'per_seed_cfg', {})
         _cfg_b = getattr(hb, 'per_seed_cfg', {})
@@ -1047,7 +1068,7 @@ def _scale_crossovers():
         steps = sorted(set.intersection(*[set(das[s]) for s in common], *[set(dbs[s]) for s in common]))
         gap_mean = [float(np.mean([das[s][t] for s in common]) - np.mean([dbs[s][t] for s in common])) for t in steps]
         xo_m, crossed_m = _crossover_step(steps, gap_mean)
-        entry = {'status': 'ok', **p, 'seeds': common, 'tokens_per_step': tps, 'per_seed': per_seed, 'per_seed_synth': {str(s): bool(getattr(ha, 'per_seed_synth', {}).get(s) or getattr(hb, 'per_seed_synth', {}).get(s)) for s in common}, 'mean_crossover_step': xo_m, 'mean_crossed': crossed_m, 'mean_traj': {'steps': steps, 'gap': gap_mean}}
+        entry = {'status': 'ok', **p, 'seeds': common, 'excluded_reconstructed': _synth_seeds, 'tokens_per_step': tps, 'per_seed': per_seed, 'per_seed_synth': {str(s): bool(getattr(ha, 'per_seed_synth', {}).get(s) or getattr(hb, 'per_seed_synth', {}).get(s)) for s in common}, 'mean_crossover_step': xo_m, 'mean_crossed': crossed_m, 'mean_traj': {'steps': steps, 'gap': gap_mean}}
         if tps is not None and crossed_m and math.isfinite(xo_m):
             entry['mean_crossover_tokens'] = xo_m * tps
         elif tps is None:
@@ -1334,8 +1355,13 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if mode == 'uniform' and abs(float(rho)) < 1e-12:
                 continue
             # the clean baseline is the SAME arm's rho=0 uniform cell under the
-            # same parameterisation/code/recipe; deltas are per-seed paired
-            clean_key = (v, arm, Ln, 0.0, 'uniform', _pp, _cd, _recipe)
+            # same parameterisation/code/recipe; deltas are per-seed paired.
+            # `span` carries an extra span_len in probe_params (it changes the
+            # corruption geometry), but the clean ρ=0 cell does not — comparing
+            # the full dict silently dropped EVERY span ΔNLL row.  Strip only
+            # the mode-specific key for the lookup; the measured cells keep it.
+            _pp_clean = _clean_probe_params(_pp)
+            clean_key = (v, arm, Ln, 0.0, 'uniform', _pp_clean, _cd, _recipe)
             clean_grp = cells.get(clean_key) or {}
             if not clean_grp:
                 continue
@@ -1374,6 +1400,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
         _fam = [(k, v.get('p_exact_signflip')) for k, v in contrasts.items() if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))]
         if _fam:
             holm = L.holm_adjust(_fam)
+            for _k, _v in contrasts.items():
+                if isinstance(_v, dict):
+                    _v['p_holm'] = (holm.get(_k) or {}).get('p_holm') if _k in holm else None
             _rej = [k for k, v in holm.items() if v.get('reject')]
             print(f'[v10 stats] Holm step-down over the {len(_fam)}-contrast family (EXPLORATORY — not pre-registered): {len(_rej)} survive at alpha=0.05' + (f': {sorted(_rej)[:4]}' if _rej else ''))
         probe = {'cells': probe_cells, 'contrasts': contrasts, 'delta_nll': delta_nll, 'holm_exploratory': holm}
@@ -1444,7 +1473,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
     if recon:
         print(f'[stats] crossover fit: {recon} carry a token rate but their trajectory is a RECONSTRUCTION, not a measurement — excluded from the log-log fit (the points count independent runs)')
     fit = {}
-    if len(pts) >= 2:
+    if len(pts) >= 3:
         xs = np.log10([p[0] for p in pts])
         ys = np.log10([max(p[1], 1.0) for p in pts])
         A = np.vstack([xs, np.ones_like(xs)]).T
@@ -1458,6 +1487,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
             fit['r2'] = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
         else:
             fit['note'] += '; WARNING: n=2 — R² 恒为 1（恒等式），斜率不具显著性，仅供参考'
+    else:
+        fit = {'n_points': len(pts), 'status': 'insufficient_points',
+               'note': 'fewer than 3 independent, budget-comparable crossover points: no log-log slope or power-law claim is computed'}
     seq2k = _ppl_by_seed('results_lm_v9_seq2k', full=True)
     comparisons = {}
 
@@ -1468,7 +1500,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
     add('seq2k(bs1): topk8 - topk512', seq2k, 'csa_fixed_topk8', 'csa_fixed_topk512', 'results_lm_v9_seq2k')
     panel = V8._panel_block
     scale_conf = _equal_token_slices()
-    out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale_confounds': scale_conf, 'seq2k_bs1_panel': panel(seq2k), 'comparisons': comparisons}
+    out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale_confounds': scale_conf, 'seq2k_bs1_panel': panel(seq2k), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v10 seq2k comparisons')}
     out_d = L.stamped_analysis('v10_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[v10 stats] wrote {out}')
     for k, v in comparisons.items():
@@ -1514,6 +1546,8 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     lines = []
     A = lines.append
     A('# CSA / HCA 受控机制研究 — v10 补实验报告（外推机制 + 反转点标度 + topk 补种子）')
+    A('> **证据等级：探索性（exploratory）**。本面板的比较/种子是观察 validation 结果后选择的；Holm 校正只限制过度宣称，不等于预注册确认。')
+    A('')
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
     A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
@@ -1636,10 +1670,10 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     if _legacy:
         A('**配对检验（exact sign-flip，Δ = 对照臂 − 学习选择臂，>0 表示学习选择更抗噪；uniform 模式）：**')
         A('')
-        A('| 比较 | n | Δ mean±std | p (exact) |')
-        A('|---|---|---|---|')
+        A('| 比较 | n | Δ mean±std | p (exact) | p_Holm |')
+        A('|---|---|---|---|---|')
         for k, v in _legacy.items():
-            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
+            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |')
         A('')
 
         def _rng(tag):
@@ -1790,8 +1824,12 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             _excl.append(f'{len(fit['excluded_reconstructed'])} 个规模（{', '.join(fit['excluded_reconstructed'])}）的轨迹是重构件而非测量')
         if fit.get('excluded_no_rate'):
             _excl.append(f'{len(fit['excluded_no_rate'])} 个规模无 token 速率')
-        _r2s = f'（R²={fit["r2"]:.2f}）' if 'r2' in fit else '（n=2，R² 恒为 1，不报告拟合优度）'
-        A(f'**趋势拟合（仅供参考）**：在 {fit['n_points']} 个已观测交叉点上，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}{_r2s}——负斜率 = 规模越大交叉越早。' + (f'点数已扣除{'、'.join(_excl)}；' if _excl else '') + '点数少且部分格子删失，只作方向性证据，不作精确幂律主张。')
+        if 'slope' not in fit:
+            A(f'**趋势拟合**：不足 3 个独立、预算可比的交叉点（n={fit.get("n_points", 0)}）；按 `insufficient_points` 处理，不报告斜率或幂律。')
+            A('')
+        else:
+            _r2s = f'（R²={fit["r2"]:.2f}）' if 'r2' in fit else '（仅 2 点，R² 恒为 1，不报告拟合优度）'
+            A(f'**趋势拟合（仅供参考）**：在 {fit['n_points']} 个已观测交叉点上，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}{_r2s}——负斜率 = 规模越大交叉越早。' + (f'点数已扣除{'、'.join(_excl)}；' if _excl else '') + '点数少且部分格子删失，只作方向性证据，不作精确幂律主张。')
         A('')
     sc = st.get('scale_confounds') or {}
     if sc:
