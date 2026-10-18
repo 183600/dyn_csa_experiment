@@ -190,6 +190,10 @@ def t_exact_signflip_at_scale():
     got = L.exact_signflip_p(d)['p']
     ref = _brute_signflip_p(d)
     assert abs(got - ref) < 1e-15, f'MITM count must match full enumeration at n=21 ({got} vs {ref})'
+    # The zero-GPU report builder must use the same n*1e-12 tie tolerance as
+    # exp_lib; a 1e-12 sum threshold can disagree near the decision boundary.
+    assert abs(BR.exact_signflip(d)['p_exact_signflip'] - got) < 1e-15, (
+        BR.exact_signflip(d)['p_exact_signflip'], got)
 
 
 def t_paired_effect_resolution():
@@ -1608,6 +1612,75 @@ def t_simple_baseline_ngram_and_audit():
     bad2['baselines'].pop('unigram')
     r2 = L.simple_baseline_audit(bad2, protocol=proto)
     assert r2['baseline_verified'] is False and any('missing' in p for p in r2['problems']), r2
+    # A flat 1-D evaluation stream is ONE row: only its first token is
+    # unconditioned.  Scoring the whole stream as row-first tokens too used to
+    # double-count every token and inflate PPL by orders of magnitude.
+    flat = val[0]
+    for order, lam in ((2, 0.5), (2, 1.0)):
+        two_d = L.ngram_lm_score(train, val[:1], vocab, order=order, alpha=0.1, interpolation=lam)
+        one_d = L.ngram_lm_score(train, flat, vocab, order=order, alpha=0.1, interpolation=lam)
+        assert abs(two_d['nll'] - one_d['nll']) < 1e-12, (order, lam, two_d, one_d)
+        assert abs(two_d['ppl'] - one_d['ppl']) < 1e-9, (order, lam, two_d, one_d)
+    # interpolation=0 must reduce to the unigram model, not to a PPL computed
+    # from the row-first tokens alone.
+    uni = L.ngram_lm_score(train, val, vocab, order=1, alpha=0.1)
+    zero = L.ngram_lm_score(train, val, vocab, order=2, alpha=0.1, interpolation=0.0)
+    assert abs(uni['nll'] - zero['nll']) < 1e-12 and abs(uni['ppl'] - zero['ppl']) < 1e-9, (uni, zero)
+
+
+def t_simple_baseline_driver_serves_the_panel_corpus():
+    # `run_simple` must go through load_run_corpus (the panel's dataset) and
+    # must not raise NameError while fingerprinting the validation slice.
+    rng = np.random.default_rng(3)
+    train = rng.integers(0, 24, size=400)
+    val = rng.integers(0, 24, size=(2, 9))
+    bnd = np.zeros_like(val, dtype=bool)
+    seen = {}
+    orig = L.load_run_corpus
+
+    def fake(cfg):
+        seen['dataset'] = cfg.get('dataset')
+        return train, val, 24, None, bnd
+
+    out = tempfile.mkdtemp(prefix='simple_driver_')
+    L.load_run_corpus = fake
+    try:
+        art = BT.run_simple(dict(L.RUN, dataset='fineweb', seq_len=9, n_train_tokens=400,
+                                 val_seqs=2, eval_subset=2), outdir=out)
+    finally:
+        L.load_run_corpus = orig
+        shutil.rmtree(out, ignore_errors=True)
+    assert seen.get('dataset') == 'fineweb', seen
+    assert art['data']['n_eval_tokens'] == val.size and art['best_ppl'] > 0, art
+
+
+def t_audit_leakage_handles_flat_train_cache():
+    cache = tempfile.mkdtemp(prefix='leak_flat_')
+    try:
+        train = np.arange(60, dtype=np.int64)
+        test = np.stack([np.arange(0, 30), np.arange(30, 60)]).astype(np.int64)
+        np.save(os.path.join(cache, 'train_ids_x.npy'), train)
+        np.save(os.path.join(cache, 'test_ids_x.npy'), test)
+        with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': 'train'}, f)
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': 'test'}, f)
+        out = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        overlap = out['checks'].get('doc_overlap')
+        assert isinstance(overlap, dict), overlap
+        assert overlap['shared_shingles'] > 0, overlap
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
+
+
+def t_fuse_sample_std_negative_axis():
+    import fuse_analysis as FA
+    x = np.arange(24, dtype=float).reshape(2, 3, 4)
+    for axis in (0, 1, 2, -1, -2, -3):
+        got = FA.sample_std(x, axis=axis)
+        want = np.std(x, axis=axis, ddof=1)
+        assert np.asarray(got).shape == np.asarray(want).shape, (axis, np.asarray(got).shape, np.asarray(want).shape)
+        assert np.allclose(got, want, atol=1e-12), (axis, got, want)
 
 
 def t_classification_positive_label_and_rare_floor():
@@ -1917,6 +1990,9 @@ def main():
     _check('H4 tuned count-model floor + audit', t_simple_baseline_ngram_and_audit)
     _check('H5 positive-label / rare-positive PR-AUC / macro-F1 averaging', t_classification_positive_label_and_rare_floor)
     _check('H6 hypothesis completeness + metric alignment + direction=0', t_hypothesis_audit_completeness_and_metric_alignment)
+    _check('H7 simple-baseline driver uses the panel corpus (no NameError)', t_simple_baseline_driver_serves_the_panel_corpus)
+    _check('H8 leakage audit handles a flat 1-D train cache', t_audit_leakage_handles_flat_train_cache)
+    _check('H9 fuse sample_std accepts negative axes', t_fuse_sample_std_negative_axis)
     _check('I1 chronological split contract', t_leakage_safe_split_contract)
     _check('I2 whole-group split contract', t_group_split_contract)
     _check('I3 preprocessing fitted on train only', t_preprocessor_train_only)

@@ -5928,20 +5928,29 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     lam = float(interpolation)
     if not (0.0 <= lam <= 1.0):
         raise ValueError('interpolation must be in [0, 1]')
-    # First token of each row: unigram only (no cross-row conditioning).
+    # First token of each row: unigram only (no cross-row conditioning).  A
+    # 1-D evaluation stream is ONE row, so only its first token is
+    # unconditioned; scoring the whole stream here as well as in the bigram
+    # term below would double-count every token.
     first = np.asarray(eval_ids, dtype=np.int64)
-    first = first if first.ndim == 1 else first[:, 0]
+    first = first[:1] if first.ndim == 1 else first[:, 0]
     first = first.ravel()
     nll_sum = float(-log_uni[first].sum())
-    if lam > 0.0 and prev.size:
-        keys = prev * vocab_size + nxt
-        idx = np.searchsorted(uniq, keys)
-        idx_clip = np.minimum(idx, max(uniq.size - 1, 0))
-        hit = (idx < uniq.size) & (uniq[idx_clip] == keys) if uniq.size else np.zeros(keys.shape, dtype=bool)
-        c_pair = np.where(hit, pair_counts[idx_clip], 0).astype(np.float64)
-        c_ctx = ctx[prev].astype(np.float64)
-        p_bg = np.where(c_ctx > 0.0, (c_pair + alpha) / (c_ctx + alpha * vocab_size), uni_prob[nxt])
-        p = lam * p_bg + (1.0 - lam) * uni_prob[nxt]
+    if prev.size:
+        if lam > 0.0:
+            keys = prev * vocab_size + nxt
+            idx = np.searchsorted(uniq, keys)
+            idx_clip = np.minimum(idx, max(uniq.size - 1, 0))
+            hit = (idx < uniq.size) & (uniq[idx_clip] == keys) if uniq.size else np.zeros(keys.shape, dtype=bool)
+            c_pair = np.where(hit, pair_counts[idx_clip], 0).astype(np.float64)
+            c_ctx = ctx[prev].astype(np.float64)
+            p_bg = np.where(c_ctx > 0.0, (c_pair + alpha) / (c_ctx + alpha * vocab_size), uni_prob[nxt])
+            p = lam * p_bg + (1.0 - lam) * uni_prob[nxt]
+        else:
+            # interpolation=0 is the pure unigram model: the conditional
+            # term must still contribute, otherwise only the row-first
+            # tokens are scored and the reported PPL collapses towards 1.
+            p = uni_prob[nxt]
         nll_sum += float(-np.log(np.maximum(p, np.finfo(float).tiny)).sum())
     n_tokens = int(all_eval.size)
     nll = float(nll_sum / n_tokens) if n_tokens else float('nan')
@@ -5977,7 +5986,13 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
                               'trials': rows,
                               'order': order}
     best_arm = min(trials_by_arm, key=lambda a: float(trials_by_arm[a]['selected_metric_value']))
-    train_arr = np.asarray(train_ids, dtype=np.int64).ravel()
+    # Do not widen the (possibly memory-mapped, 5B-token) training stream to
+    # int64 just to fingerprint it: `_ids_fp` hashes the canonical chunked
+    # form of any integer width and accepts the memmap directly.
+    train_arr = np.asarray(train_ids)
+    if not np.issubdtype(train_arr.dtype, np.integer):
+        raise TypeError(f'ngram baseline: train ids must be integers, got dtype {train_arr.dtype}')
+    train_arr = train_arr.reshape(-1)
     eval_arr = np.asarray(eval_ids, dtype=np.int64)
     return {
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
@@ -10511,19 +10526,21 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
         except Exception as e:
             import traceback
             import sys as _sys
+            _err = e
+            _err_tb = traceback.format_exc()
             out['status'] = 'error'
-            out['error'] = f'{e}'
+            out['error'] = f'{_err}'
 
             def _apply_err(summary):
                 if key in summary and ppl_is_usable((summary.get(key) or {}).get('ppl')):
-                    print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (the error record holds no `ppl` and must not replace it); the failed attempt is still booked to the guard below.')
-                    print(traceback.format_exc(), file=_sys.stderr)
+                    print(f'[{key}] FAILED: {_err} — keeping the previous MEASURED record (the error record holds no `ppl` and must not replace it); the failed attempt is still booked to the guard below.')
+                    print(_err_tb, file=_sys.stderr)
                 else:
-                    summary[key] = {'variant': v, 'seed': seed, 'error': traceback.format_exc()}
-                    print(f'[{key}] FAILED: {e}')
+                    summary[key] = {'variant': v, 'seed': seed, 'error': _err_tb}
+                    print(f'[{key}] FAILED: {_err}')
                 return summary
             locked_json_update(summary_path, _apply_err)
-            log_experiment_event(outdir, {'kind': 'cell', 'run_id': _run_id, 'status': 'error', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': code_stamp(), 'error': f'{e}', 'traceback': traceback.format_exc()})
+            log_experiment_event(outdir, {'kind': 'cell', 'run_id': _run_id, 'status': 'error', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': code_stamp(), 'error': f'{_err}', 'traceback': _err_tb})
     finally:
         if guard is not None:
             steps_done = 0

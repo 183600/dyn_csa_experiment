@@ -175,14 +175,22 @@ def sample_std(deltas, axis=None):
         if not np.isfinite(d).all():
             d = d[np.isfinite(d)]
         return float(np.std(d, ddof=1)) if d.size > 1 else 0.0
+    if not isinstance(axis, (int, np.integer)):
+        raise TypeError(f'axis must be an integer, got {axis!r}')
+    axis = int(axis)
+    if axis < 0:
+        axis += d.ndim
+    if not (0 <= axis < d.ndim):
+        raise ValueError(f'axis {axis} is out of bounds for an array with {d.ndim} dimension(s)')
+    out_shape = d.shape[:axis] + d.shape[axis + 1:]
     if d.shape[axis] < 2:
-        return np.zeros(d.shape[:axis] + d.shape[axis + 1:])
+        return np.zeros(out_shape)
     srt = np.moveaxis(d, axis, 0).reshape(d.shape[axis], -1)
     out = np.zeros(srt.shape[1])
     for j in range(srt.shape[1]):
         col = srt[:, j][np.isfinite(srt[:, j])]
         out[j] = float(np.std(col, ddof=1)) if col.size > 1 else 0.0
-    return out.reshape(d.shape[:axis] + d.shape[axis + 1:])
+    return out.reshape(out_shape)
 
 def _row_nanmean(M):
     # With no NaNs, a 2-D mean along the (contiguous) last axis is

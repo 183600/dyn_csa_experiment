@@ -75,7 +75,9 @@ def _signflip_mitm_count(deltas):
     d = _np.asarray(deltas, dtype=float)
     n = int(d.size)
     total = abs(float(d.sum()))
-    thr = total - 1e-12
+    # Same tie tolerance as exp_lib._signflip_mitm_count: the compared means
+    # differ by at most 1e-12, i.e. the sums by n*1e-12.
+    thr = total - 1e-12 * n
     if thr <= 0.0:
         return 1 << n
 

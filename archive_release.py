@@ -114,7 +114,18 @@ def _collect(dirs, include_ckpt=False):
         p = os.path.join(REPO, f)
         if os.path.exists(p):
             files.append(p)
-    return files
+    # The freeze lock can already be reached by the directory walk above;
+    # duplicate tar members with the same name are ambiguous on extraction,
+    # so keep the first occurrence only.
+    seen = set()
+    unique = []
+    for p in files:
+        key = os.path.abspath(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(p)
+    return unique
 
 
 def _ckpt_hash_table(dirs):

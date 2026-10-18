@@ -995,19 +995,21 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
                 _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
                 L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - t_run, 'key': key, 'variant': v, 'seed': int(seed), 'warm_steps': int(warm), 'run_cfg': fp, 'code': CKPT_CODE, 'provenance': _prov, 'hyperparams': _hp, 'data_fp': rec.get('data_fp'), 'data_version': (_prov.get('data') or {}).get('data_version'), 'val_fp': (_prov.get('data') or {}).get('val_fp'), 'rng_fp': rec.get('rng_fp'), 'sanity_ref': ('overfit_sanity.json' if os.path.exists(os.path.join(outdir, 'overfit_sanity.json')) else None), 'metrics': {'ppl': rec.get('ppl'), 'ppl_at_switch': rec.get('ppl_at_switch'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed')}, 'curve_summary': {'n_points': len(_losses), 'first': _losses[0] if _losses else None, 'last': _losses[-1] if _losses else None, 'best': min(_losses) if _losses else None}, 'losses': _losses, 'ppl_history': rec.get('ppl_history'), 'ppl_history_dense_prefix': rec.get('ppl_history_dense_prefix')})
         except Exception as e:
+            _err = e
+            _err_tb = traceback.format_exc()
             out['status'] = 'error'
-            out['error'] = f'{e}'
+            out['error'] = f'{_err}'
 
             def _apply_err(summary):
                 if L.result_is_current(summary.get(key), CKPT_CODE, 'ppl'):
-                    print(f'[{key}] FAILED: {e} — keeping the previous MEASURED record (current under this code semantics; the error record holds no `ppl` and must not replace it)')
-                    print(traceback.format_exc())
+                    print(f'[{key}] FAILED: {_err} — keeping the previous MEASURED record (current under this code semantics; the error record holds no `ppl` and must not replace it)')
+                    print(_err_tb)
                 else:
-                    summary[key] = {'variant': v, 'seed': seed, 'warm_steps': warm, 'error': traceback.format_exc()}
-                    print(f'[{key}] FAILED: {e}')
+                    summary[key] = {'variant': v, 'seed': seed, 'warm_steps': warm, 'error': _err_tb}
+                    print(f'[{key}] FAILED: {_err}')
                 return summary
             L.locked_json_update(spath, _apply_err)
-            L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _run_id, 'status': 'error', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - t_run, 'key': key, 'variant': v, 'seed': int(seed), 'warm_steps': int(warm), 'run_cfg': fp, 'code': CKPT_CODE, 'error': f'{e}', 'traceback': traceback.format_exc()})
+            L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _run_id, 'status': 'error', 'started_at': _started_at, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - t_run, 'key': key, 'variant': v, 'seed': int(seed), 'warm_steps': int(warm), 'run_cfg': fp, 'code': CKPT_CODE, 'error': f'{_err}', 'traceback': _err_tb})
     finally:
         if guard is not None:
             steps_done = 0
@@ -1938,6 +1940,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     mp = None if not getattr(model, 'use_abs_pe', True) else _ckp.get('max_seq', train_len)
     _t_ev = time.time()
     r = eval_length_gen(model, val_ids, _need_lens, DEVICE, max_pos=mp)
+    _ckp_params = _ckp['params']
     if guard is not None:
         guard.record_run(time.time() - _t_ev, 0, 0, 0, 0, 0)
 
@@ -1950,7 +1953,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             except (TypeError, ValueError):
                 continue
         _merged.update(r)
-        _rec = {'variant': v, 'seed': seed, 'params': _ckp['params'], 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE}
+        _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE}
         try:
             _prov = L.experiment_provenance(_prov_cfg, train_ids=(train_ids if _tr is not None else None), val_batch=val_ids, vocab=vocab)
             _rec['provenance'] = _prov
