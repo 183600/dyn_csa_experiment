@@ -10,10 +10,14 @@ arm, selects on validation PPL, and writes the trial/selection record that
 ``exp_lib.baseline_tuning_audit`` verifies.
 
 Subcommands:
+  simple  fit and tune the trivial count-model floor (unigram / bigram) on the
+          training split, select on validation, write simple_baseline.json
   smoke   tiny end-to-end run of the tuning + selection + audit round-trip
   full    the real tuning panel (defaults to exp_lib.RUN; BT_SEARCH_STEPS /
-          BT_TRIAL_LIMIT / BT_SKIP_FINAL can bound it)
-  report  zero-GPU: audit results_baseline_tuning/baseline_tuning.json
+          BT_TRIAL_LIMIT / BT_SKIP_FINAL / BT_SKIP_SIMPLE can bound it); runs
+          the count-model floor first unless BT_SKIP_SIMPLE=1
+  report  zero-GPU: audit results_baseline_tuning/baseline_tuning.json and
+          simple_baseline.json
 
 The held-out test split is NEVER read here.  Hyperparameters are selected on
 the validation split; the final comparison re-uses exactly those selections.
@@ -56,6 +60,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     """Run the declared grid, select per arm on validation PPL, then optionally
     retrain each arm at its selected config across the final seed list."""
     protocol = dict(L.BASELINE_TUNING_PROTOCOL if protocol is None else protocol)
+    declared_trials = list(protocol['trials'])
     base = dict(L.RUN if base_cfg is None else base_cfg)
     arms = list(protocol['arms'])
     trials = list(protocol['trials'])
@@ -95,20 +100,26 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                          'params': best.get('params'), 'run_cfg': best.get('run_cfg'),
                          'trials': per_arm[arm]}
         print(f'[tune] {arm:22s} best PPL {best["ppl"]:.4f} at {best["config"]}')
+    artifact_protocol = dict(protocol)
+    artifact_protocol['trials'] = [dict(t) for t in trials]
     artifact = {
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'protocol': protocol,
+        'protocol': artifact_protocol,
         'selection_metric': protocol['selection_metric'],
         'selection_split': protocol['selection_split'],
         'direction': protocol['direction'],
         'search_seed': search_seed,
         'search_steps': search_steps,
+        'declared_trials': len(declared_trials),
+        'trials_run': len(trials),
+        'search_complete': bool(len(trials) == len(declared_trials)),
+        'final_seeds': list(protocol.get('final_seeds') or []),
         'arms': selected,
         'code': L.code_stamp(),
     }
     path = os.path.join(outdir, 'baseline_tuning.json')
     L.atomic_write_json(path, artifact)
-    audit = L.baseline_tuning_audit(path=path, protocol=protocol)
+    audit = L.baseline_tuning_audit(path=path)
     print(f'[tune] artifact: {path}  audit={audit.get("status")}')
     if not audit.get('tuning_verified'):
         raise RuntimeError(f'[tune] tuning artifact failed its own audit: {audit.get("problems")}')
@@ -233,6 +244,41 @@ def _run_final(base, outdir, protocol, selected):
         print(f'  {name:48s} n={st["n"]}  Δ={st["mean"]:+.4f} ± {st["std"]:.4f}  p={st["p_exact_signflip"]:.4f}  p_Holm={st.get("p_holm")}  {st["effect_vs_noise"]}')
 
 
+def run_simple(base_cfg=None, outdir='results_baseline_tuning', protocol=None):
+    """Fit/tune the trivial count-model floor on the real corpus.
+
+    This is deliberately the FIRST baseline: a unigram/bigram count model whose
+    smoothing (and bigram interpolation) is selected on the validation split.
+    If a neural mechanism cannot beat this floor, there is no point in asking
+    whether it beats a tuned dense Transformer.
+    """
+    base = dict(L.RUN if base_cfg is None else base_cfg)
+    train_ids, val_batch, vocab, _tok, _val_bnd = L.load_wikitext(
+        base['seq_len'], base['n_train_tokens'], vocab_size=base.get('vocab_size', 8192),
+        val_seqs=base.get('val_seqs', 512), cache_dir=base.get('cache_dir', './wt103_cache'))
+    # Match the neural panel's evaluation slice exactly: train_variant scores
+    # val_batch[:eval_subset], so the count-model floor must use the same rows
+    # or the PPL comparison mixes two different validation samples.
+    rows = max(1, min(int(base.get('eval_subset', 128)), int(val_batch.shape[0])))
+    eval_slice = val_batch[:rows]
+    artifact = L.simple_baseline_fit(train_ids, eval_slice, vocab, protocol=protocol)
+    artifact.setdefault('data', {})['cache_val_fp'] = L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1))
+    artifact['data']['eval_rows'] = int(rows)
+    artifact['data']['eval_fp'] = L._ids_fp(np.ascontiguousarray(eval_slice).reshape(-1))
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, 'simple_baseline.json')
+    L.atomic_write_json(path, artifact)
+    audit = L.simple_baseline_audit(path=path)
+    print('[simple] best count-model floor: %s PPL=%.4f  audit=%s' % (
+        artifact.get('best_baseline'), float(artifact.get('best_ppl') or float('nan')), audit.get('status')))
+    for arm, entry in sorted((artifact.get('baselines') or {}).items()):
+        print('  %-8s selected %s  validation PPL=%.4f' % (
+            arm, entry.get('selected'), float(entry.get('selected_metric_value') or float('nan'))))
+    if not audit.get('baseline_verified'):
+        raise RuntimeError(f'[simple] count-model artifact failed its audit: {audit.get("problems")}')
+    return artifact
+
+
 def run_smoke():
     base = dict(L.RUN, d=32, n_layers=1, n_heads=2, d_head=16, seq_len=32, batch_size=2,
                 n_train_tokens=8000, steps=2, warmup=1, eval_every=1, eval_subset=2,
@@ -249,19 +295,28 @@ def run_smoke():
 def run_report():
     path = os.path.join('results_baseline_tuning', 'baseline_tuning.json')
     report = L.baseline_tuning_audit(path=path)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    return report
+    simple = L.simple_baseline_audit(path=os.path.join('results_baseline_tuning', 'simple_baseline.json'))
+    print(json.dumps({'baseline_tuning': report, 'simple_baseline': simple}, ensure_ascii=False, indent=2))
+    return {'baseline_tuning': report, 'simple_baseline': simple}
 
 
 if __name__ == '__main__':
     _cmd = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _cmd == 'smoke':
         run_smoke()
+    elif _cmd == 'simple':
+        base = dict(L.RUN)
+        if os.environ.get('BT_BASE_OUTDIR'):
+            base['outdir'] = os.environ['BT_BASE_OUTDIR']
+        run_simple(base, outdir=os.environ.get('BT_OUTDIR', 'results_baseline_tuning'))
     elif _cmd == 'full':
         base = dict(L.RUN)
         if os.environ.get('BT_BASE_OUTDIR'):
             base['outdir'] = os.environ['BT_BASE_OUTDIR']
-        run_tuning(base, outdir=os.environ.get('BT_OUTDIR', 'results_baseline_tuning'),
+        _od = os.environ.get('BT_OUTDIR', 'results_baseline_tuning')
+        if os.environ.get('BT_SKIP_SIMPLE', '').strip().lower() not in ('1', 'true', 'yes'):
+            run_simple(base, outdir=_od)
+        run_tuning(base, outdir=_od,
                    trial_limit=(int(os.environ['BT_TRIAL_LIMIT']) if os.environ.get('BT_TRIAL_LIMIT') else None),
                    search_steps=(int(os.environ['BT_SEARCH_STEPS']) if os.environ.get('BT_SEARCH_STEPS') else None),
                    final=(os.environ.get('BT_SKIP_FINAL', '').strip().lower() not in ('1', 'true', 'yes')))

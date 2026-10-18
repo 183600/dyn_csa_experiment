@@ -1576,6 +1576,92 @@ def t_baseline_tuning_audit():
 
 
 
+def t_simple_baseline_ngram_and_audit():
+    rng = np.random.default_rng(7)
+    vocab = 32
+    train = rng.integers(0, vocab, size=600)
+    val = rng.integers(0, vocab, size=(4, 25))
+    proto = dict(L.SIMPLE_BASELINE_POLICY,
+                 arms={'unigram': {'order': 1}, 'bigram': {'order': 2}},
+                 grids={'unigram': {'alpha': [0.1, 1.0]},
+                        'bigram': {'alpha': [0.1, 1.0], 'interpolation': [0.5, 1.0]}})
+    u = L.ngram_lm_score(train, val, vocab, order=1, alpha=0.1)
+    b = L.ngram_lm_score(train, val, vocab, order=2, alpha=0.1, interpolation=0.5)
+    assert u['n_tokens'] == val.size and b['n_tokens'] == val.size, (u, b)
+    assert math.isfinite(u['ppl']) and math.isfinite(b['ppl']) and u['ppl'] > 0 and b['ppl'] > 0
+    art = L.simple_baseline_fit(train, val, vocab, protocol=proto)
+    assert art['best_baseline'] in ('unigram', 'bigram')
+    best = min(e['selected_metric_value'] for e in art['baselines'].values())
+    assert abs(float(art['best_ppl']) - float(best)) < 1e-12, art
+    assert art['data']['val_fp'] and art['data']['n_eval_tokens'] == val.size
+    audit = L.simple_baseline_audit(art, protocol=proto)
+    assert audit['baseline_verified'] is True, audit
+    # A selected value that is not the selected config's own trial value is a
+    # fabricated result, even if it happens to equal the grid minimum.
+    bad = json.loads(json.dumps(art))
+    arm = bad['best_baseline']
+    bad['baselines'][arm]['selected_metric_value'] = float(bad['baselines'][arm]['selected_metric_value']) + 1.0
+    rbad = L.simple_baseline_audit(bad, protocol=proto)
+    assert rbad['baseline_verified'] is False and any('does not match' in p for p in rbad['problems']), rbad
+    # Missing an arm is not evidence that the floor was tuned.
+    bad2 = json.loads(json.dumps(art))
+    bad2['baselines'].pop('unigram')
+    r2 = L.simple_baseline_audit(bad2, protocol=proto)
+    assert r2['baseline_verified'] is False and any('missing' in p for p in r2['problems']), r2
+
+
+def t_classification_positive_label_and_rare_floor():
+    y = np.array([0] * 2000 + [1])
+    # Positive class 1 is the rare class here (1:2000).
+    score = (y == 1).astype(float)
+    m = L.classification_metrics(y, y_score=score, labels=[0, 1], positive_label=1)
+    assert m['positive_label'] == '1' and m['f1_positive'] is not None, m
+    assert m['roc_auc'] == 1.0 and abs(m['pr_auc'] - 1.0) < 1e-12, m
+    assert m['pr_auc_prevalence'] == 1.0 / 2001.0 and abs(m['pr_auc_lift_over_prevalence'] - (1.0 - 1.0 / 2001.0)) < 1e-12, m
+    assert m['imbalance_warning'] and 'PR-AUC' in m['imbalance_warning'], m
+    # Naming the other class as positive reverses the same ranking endpoint.
+    m2 = L.classification_metrics(y, y_score=score, labels=[0, 1], positive_label=0)
+    assert m2['positive_label'] == '0' and m2['roc_auc'] == 0.0, m2
+    # A zero-support label requested by the caller must not be dropped from
+    # macro F1 (that would make a one-class prediction look like a perfect
+    # macro classifier).
+    y0 = np.array([0] * 10 + [1] * 10)
+    pred = np.zeros_like(y0)
+    m3 = L.classification_metrics(y0, y_pred=pred, labels=[0, 1, 2])
+    assert abs(m3['f1_macro'] - (2.0 / 3.0 / 3.0)) < 1e-12, m3
+    assert m3['f1_primary_average'] == 'macro'
+    # Record-level policy: F1 without averaging, and rare ROC-AUC without
+    # PR-AUC/prevalence, must warn.
+    bad = {'r::seed0': {'variant': 'r', 'task': 'binary_classification', 'f1': 0.4,
+                        'roc_auc': 0.99, 'prevalence': {'0': 0.9995, '1': 0.0005}}}
+    ma = L.metric_policy_audit(bad)
+    assert ma['status'] == 'warn', ma
+    assert any('averaging' in w for w in ma['warnings']), ma
+    assert any('PR-AUC' in w for w in ma['warnings']), ma
+
+
+def t_hypothesis_audit_completeness_and_metric_alignment():
+    good = L.hypothesis_audit(L.HYPOTHESIS_DESIGN, 'component')
+    assert good['status'] == 'ok' and not good['invalid'], good
+    assert 'dynamic_blocking' in good['hypotheses'], good
+    bad_table = {
+        'h0': {'statement': 'x', 'mechanism': 'y', 'predicted_sign': 0,
+               'primary_metric': 'ndcg', 'falsifier': 'z'},
+        'h1': {'statement': 'x'},
+    }
+    r = L.hypothesis_audit(bad_table, 'component')
+    assert r['status'] == 'warn', r
+    assert 'h0' in r['direction_unspecified'] and 'h0' in r['metric_unknown'], r
+    assert 'h1' in r['invalid'] and any('incomplete' in w for w in r['warnings']), r
+    # A predicted_sign=0 result is significant but cannot be called verified.
+    entries = [{'controlled': True, 'n': 7, 'significant_global': True,
+                'within_seed_noise': False, 'param_controlled': True,
+                'predicted_sign': 0, 'direction_consistent': True}]
+    assert L._classify_group_status(entries, min_n=3, alpha=0.05, m_family=1) == 'direction_unspecified'
+
+
+
+
 # ---------------------------------------------------------------------------
 # I. leakage-safe data splitting / preprocessing
 # ---------------------------------------------------------------------------
@@ -1828,6 +1914,9 @@ def main():
     _check('H1 hypothesis direction conflict', t_hypothesis_direction_conflict)
     _check('H2 metric policy + macro/micro/weighted F1 + PR/ROC-AUC', t_metric_policy_and_classification_metrics)
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
+    _check('H4 tuned count-model floor + audit', t_simple_baseline_ngram_and_audit)
+    _check('H5 positive-label / rare-positive PR-AUC / macro-F1 averaging', t_classification_positive_label_and_rare_floor)
+    _check('H6 hypothesis completeness + metric alignment + direction=0', t_hypothesis_audit_completeness_and_metric_alignment)
     _check('I1 chronological split contract', t_leakage_safe_split_contract)
     _check('I2 whole-group split contract', t_group_split_contract)
     _check('I3 preprocessing fitted on train only', t_preprocessor_train_only)

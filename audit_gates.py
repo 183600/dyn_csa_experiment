@@ -825,6 +825,37 @@ def audit_tuning(path=None):
     return out
 
 
+def audit_simple_baseline(path=None):
+    """简单基线地板审计（零 GPU）。
+
+    复杂模型必须先战胜一个**调过参**的最简基线（这里是训练集计数的
+    unigram/bigram 模型，平滑/插值在验证集上选）。没有
+    `simple_baseline.json` 时返回 not_verifiable_locally，不能把「比稻草人
+    强」写成「机制有效」。"""
+    L = _import_exp_lib()
+    if path is None:
+        path = os.path.join(REPO, 'results_baseline_tuning', 'simple_baseline.json')
+    out = L.simple_baseline_audit(path=path)
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+def audit_hypotheses():
+    """预注册假设完整性 / 指标对齐审计（零 GPU）。
+
+    每个声明式对照必须有 statement / mechanism / predicted_sign /
+    primary_metric / falsifier；primary_metric 必须是 METRIC_POLICY 里
+    真实定义的端点，predicted_sign=0 不能支撑方向性优势。"""
+    L = _import_exp_lib()
+    out = {'status': 'ok',
+           'component': L.hypothesis_audit(L.HYPOTHESIS_DESIGN, 'component'),
+           'baseline': L.hypothesis_audit(L.BASELINE_HYPOTHESIS_DESIGN, 'baseline')}
+    if out['component']['status'] != 'ok' or out['baseline']['status'] != 'ok':
+        out['status'] = 'warn'
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 7d) methodology：受控对比 / 消融完整性 / 统计可靠性
 # ---------------------------------------------------------------------------
@@ -989,7 +1020,7 @@ def audit_efficiency_demo():
 # ---------------------------------------------------------------------------
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -1009,7 +1040,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'methodology': audit_methodology, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

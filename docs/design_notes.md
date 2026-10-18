@@ -677,7 +677,9 @@ falsifier。Δ 的符号沿用「带模块 − 去模块」：`predicted_sign=-1
 `full_matched` / `full_sw128_matched` / `csa_fixed` / `csa_dynamic`
 逐臂跑同一网格并落盘 `baseline_tuning.json`。`baseline_tuning_audit`
 要求：同一 trial 网格、同一 trial 数、只在 validation 上选择、选中项
-确为该臂最优。`methodology_audit` 把统计上显著但没有该产物的基线声明
+确为该臂最优，且 `selected_metric_value` 必须是**该选中 config 自己**的
+trial 值（不能拿另一个 trial 的最小值冒充）；trial 记录暴露
+steps/tokens 时还要求跨臂训练预算一致。`methodology_audit` 把统计上显著但没有该产物的基线声明
 放进 `untuned_verified_baselines` 并给出警告——未调参的弱基线只能
 证明复杂模型比稻草人强；只有 `tuned_verified_baselines` 才支持
 「优于精心调优的基线」。调参后的逐臂最优配置允许 lr/wd/warmup 不同，
@@ -698,3 +700,46 @@ falsifier。Δ 的符号沿用「带模块 − 去模块」：`predicted_sign=-1
 - 通用分类入口 `classification_metrics` 同时返回 macro / micro / weighted
   F1、balanced accuracy、逐类 recall；二分类有分数时另给 PR-AUC 与
   ROC-AUC，并在正类比例低于 1:1000 时显式提示以 PR-AUC 为主。
+
+### 21.4 先立最简单的基线：计数模型地板
+
+复杂机制的第一道对照不是另一个 Transformer，而是**调过参的最简基线**。
+`exp_lib.SIMPLE_BASELINE_POLICY` 定下训练集计数的 unigram / bigram 模型
+（unigram 是 context-free 线性计数模型；bigram 用 unigram 插值），平滑
+系数与插值权重只在 validation 上选，**不读 test**。`baseline_tune.py
+simple` / `full`（默认先跑 simple）落盘 `simple_baseline.json`：
+
+- `simple_baseline_fit` / `ngram_lm_score` 是纯函数：按行边界评分（每行
+  首 token 只由 unigram 预测，不跨行借用前一行末 token），PPL 为
+  token-weighted，与 LM 指标口径一致；`baseline_tune.py simple` 用
+  `val_batch[:eval_subset]` 的同一批行与神经面板比较，并把完整验证缓存的
+  指纹写进 `data.cache_val_fp`（比较门槛）与 `data.eval_fp`（实际评分
+  切片）；
+- `simple_baseline_audit` 要求 selected config 确为最优、selected 值确为
+  **该 config** 的 trial 值、各 trial 评估 token 数一致、只选在
+  validation；缺失产物只报 `not_verifiable_locally`；
+- `methodology_audit` 在 val 指纹一致时把面板主方法 PPL 与地板并排报告：
+  主方法没打过地板会给出警告（`panel_beats_simple_floor=False`），
+  指纹不一致则标 `comparable_to_panel=False` 并禁止引用该比较。
+
+地板比较不是「机制优于稠密基线」的证据；它只是排除「复杂模型连最简
+计数模型都不如」这一最基本的设计失败。稠密基线的同预算调参仍由 21.2
+单独把关，两条证据不得混池。
+
+### 21.5 假设完整性与指标对齐的机器审计
+
+`hypothesis_audit` 把 21.1 的约定变成机器读数：每个声明式对照必须写全
+statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
+`primary_metric` 必须是 `METRIC_POLICY` 真正定义的端点；`predicted_sign=0`
+只允许「是否存在差异」的探索性假设，`_classify_group_status` 会把它归入
+`direction_unspecified`，不能被写成方向性优势。`methodology_audit`
+输出 `hypothesis_audit` 与 `hypotheses_incomplete`，缺字段/指标未声明
+在解释任何数字之前就会出现在 warnings 里。
+
+`classification_metrics` 的 `positive_label` 参数显式指定正类（默认仍为
+`labels[-1]`，与 sklearn 对齐），并新增 `f1_positive` / `f1_primary` /
+`f1_primary_average`、`pr_auc_prevalence` 与
+`pr_auc_lift_over_prevalence`：PR-AUC 必须对照正类流行率读取，macro F1
+对请求的每个标签取平均（样本中缺席的标签按 F1=0 计入，不会被静默丢掉）。
+`metric_policy_audit` 另外检查：F1 记录必须注明 averaging 口径；1:1000
+以下只报 ROC-AUC 或缺 PR-AUC 流行率底线的记录会告警。

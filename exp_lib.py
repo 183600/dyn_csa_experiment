@@ -5848,6 +5848,261 @@ BASELINE_TUNING_PROTOCOL = {
     'note': 'Every arm gets the same declared trials and the same selection split. A tuning trial may never read the held-out test split; test is used once after selection.',
 }
 
+# 最简单基线协议（先立地板，再谈复杂模型）：语言模型的 trivial floor 是
+# 在**训练集**上数出来的 unigram / bigram 计数模型，平滑与插值系数只在
+# **验证集**上选择。主方法如果不能显著优于这个地板，就不值得进入与稠密
+# Transformer 的机制对比；反过来，复杂模型只战胜未调参的弱基线也不算
+# 证据。`baseline_tune.py simple` 生成 `simple_baseline.json`，审计函数
+# 核验搜索范围、选择集与选中项；`methodology_audit` 会把它与面板的主方法
+# 读数并排报告（只有 val 指纹一致时才比较）。
+SIMPLE_BASELINE_POLICY = {
+    'selection_metric': 'ppl',
+    'selection_split': 'validation',
+    'direction': 'lower_is_better',
+    'arms': {
+        'unigram': {'order': 1, 'description': 'training-set unigram counts with add-alpha smoothing (a linear/count model)'},
+        'bigram': {'order': 2, 'description': 'training-set bigram counts interpolated with the unigram model'},
+    },
+    'grids': {
+        'unigram': {'alpha': [0.01, 0.1, 1.0]},
+        'bigram': {'alpha': [0.01, 0.1, 1.0], 'interpolation': [0.5, 0.9, 1.0]},
+    },
+    'note': 'Counts are fitted on the training token stream only; smoothing/interpolation is selected on validation PPL. The held-out test split is never read. This is a sanity floor, not a tuned neural baseline.',
+}
+
+def _ngram_train_counts(train_ids, vocab_size):
+    """Return (unigram counts, bigram key counts, bigram context counts)."""
+    ids = np.asarray(train_ids, dtype=np.int64).ravel()
+    vocab_size = int(vocab_size)
+    if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= vocab_size):
+        raise ValueError('ngram baseline: train ids outside [0, vocab_size)')
+    uni = np.bincount(ids, minlength=vocab_size).astype(np.float64)
+    if ids.size < 2:
+        return uni, np.empty(0, dtype=np.int64), np.zeros(vocab_size, dtype=np.int64), np.empty(0, dtype=np.int64)
+    prev, nxt = ids[:-1], ids[1:]
+    keys = prev * vocab_size + nxt
+    uniq, counts = np.unique(keys, return_counts=True)
+    ctx = np.bincount(prev, minlength=vocab_size).astype(np.int64)
+    return uni, uniq, ctx, counts
+
+def _ngram_eval_parts(eval_ids):
+    arr = np.asarray(eval_ids, dtype=np.int64)
+    if arr.ndim == 1:
+        return arr, arr[:-1], arr[1:]
+    if arr.ndim == 2:
+        return arr.ravel(), arr[:, :-1].ravel(), arr[:, 1:].ravel()
+    raise ValueError('eval ids must be 1-D or 2-D (sequences x length)')
+
+def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpolation=1.0):
+    """Token-weighted NLL/PPL for a tuned count model.
+
+    order=1 is the unigram model (a context-free linear/count baseline);
+    order=2 conditions each token on the previous token and interpolates the
+    smoothed conditional with the unigram distribution.  Row boundaries are
+    respected: the first token of every evaluation row is scored by the
+    unigram model, never by the previous row's last token.  The effect size is
+    token-weighted, matching the LM metric policy."""
+    ids = np.asarray(train_ids, dtype=np.int64).ravel()
+    vocab_size = int(vocab_size)
+    alpha = float(alpha)
+    if alpha <= 0:
+        raise ValueError('alpha must be positive')
+    if order not in (1, 2):
+        raise ValueError('order must be 1 (unigram) or 2 (bigram)')
+    all_eval, prev, nxt = _ngram_eval_parts(eval_ids)
+    if all_eval.size == 0:
+        return {'order': int(order), 'alpha': alpha, 'interpolation': float(interpolation),
+                'n_tokens': 0, 'nll': float('nan'), 'ppl': float('nan')}
+    if all_eval.size and (int(all_eval.min()) < 0 or int(all_eval.max()) >= vocab_size):
+        raise ValueError('ngram baseline: eval ids outside [0, vocab_size)')
+    counts = _ngram_train_counts(ids, vocab_size)
+    uni_counts = counts[0]
+    denom = float(uni_counts.sum()) + alpha * vocab_size
+    uni_prob = (uni_counts + alpha) / denom
+    log_uni = np.log(np.maximum(uni_prob, np.finfo(float).tiny))
+    if order == 1:
+        nll = float(-log_uni[all_eval].sum() / all_eval.size)
+        return {'order': 1, 'alpha': alpha, 'interpolation': 0.0,
+                'n_tokens': int(all_eval.size), 'nll': nll, 'ppl': float(math.exp(nll))}
+    _uni, uniq, ctx, pair_counts = counts
+    lam = float(interpolation)
+    if not (0.0 <= lam <= 1.0):
+        raise ValueError('interpolation must be in [0, 1]')
+    # First token of each row: unigram only (no cross-row conditioning).
+    first = np.asarray(eval_ids, dtype=np.int64)
+    first = first if first.ndim == 1 else first[:, 0]
+    first = first.ravel()
+    nll_sum = float(-log_uni[first].sum())
+    if lam > 0.0 and prev.size:
+        keys = prev * vocab_size + nxt
+        idx = np.searchsorted(uniq, keys)
+        idx_clip = np.minimum(idx, max(uniq.size - 1, 0))
+        hit = (idx < uniq.size) & (uniq[idx_clip] == keys) if uniq.size else np.zeros(keys.shape, dtype=bool)
+        c_pair = np.where(hit, pair_counts[idx_clip], 0).astype(np.float64)
+        c_ctx = ctx[prev].astype(np.float64)
+        p_bg = np.where(c_ctx > 0.0, (c_pair + alpha) / (c_ctx + alpha * vocab_size), uni_prob[nxt])
+        p = lam * p_bg + (1.0 - lam) * uni_prob[nxt]
+        nll_sum += float(-np.log(np.maximum(p, np.finfo(float).tiny)).sum())
+    n_tokens = int(all_eval.size)
+    nll = float(nll_sum / n_tokens) if n_tokens else float('nan')
+    return {'order': 2, 'alpha': alpha, 'interpolation': lam,
+            'n_tokens': n_tokens, 'nll': nll, 'ppl': float(math.exp(nll)) if math.isfinite(nll) else float('nan')}
+
+def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
+    """Run the declared count-model grid and select per baseline on validation."""
+    protocol = dict(SIMPLE_BASELINE_POLICY if protocol is None else protocol)
+    arms = protocol.get('arms') or {}
+    grids = protocol.get('grids') or {}
+    trials_by_arm = {}
+    for arm, meta in arms.items():
+        order = int((meta or {}).get('order', 1))
+        grid = grids.get(arm) or {}
+        alphas = list(grid.get('alpha') or [0.1])
+        interps = list(grid.get('interpolation') or [1.0]) if order == 2 else [0.0]
+        rows = []
+        for alpha in alphas:
+            for lam in interps:
+                cfg = {'order': order, 'alpha': float(alpha)}
+                if order == 2:
+                    cfg['interpolation'] = float(lam)
+                sc = ngram_lm_score(train_ids, eval_ids, vocab_size, order=order,
+                                    alpha=float(alpha), interpolation=float(lam))
+                rows.append({'config': cfg, 'ppl': sc['ppl'], 'nll': sc['nll'],
+                             'n_tokens': sc['n_tokens'], 'steps': 0, 'tokens_seen': int(sc['n_tokens'])})
+        if not rows:
+            raise RuntimeError(f'simple baseline {arm}: empty declared grid')
+        best = min(rows, key=lambda r: float(r['ppl']))
+        trials_by_arm[arm] = {'selected': dict(best['config']),
+                              'selected_metric_value': float(best['ppl']),
+                              'trials': rows,
+                              'order': order}
+    best_arm = min(trials_by_arm, key=lambda a: float(trials_by_arm[a]['selected_metric_value']))
+    train_arr = np.asarray(train_ids, dtype=np.int64).ravel()
+    eval_arr = np.asarray(eval_ids, dtype=np.int64)
+    return {
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'protocol': protocol,
+        'selection_metric': protocol.get('selection_metric', 'ppl'),
+        'selection_split': protocol.get('selection_split', 'validation'),
+        'direction': protocol.get('direction', 'lower_is_better'),
+        'data': {'train_fp': _ids_fp(train_arr),
+                 'val_fp': _ids_fp(np.ascontiguousarray(eval_arr).reshape(-1)),
+                 'n_train_tokens': int(train_arr.size),
+                 'n_eval_tokens': int(eval_arr.size)},
+        'baselines': trials_by_arm,
+        'best_baseline': best_arm,
+        'best_ppl': float(trials_by_arm[best_arm]['selected_metric_value']),
+        'code': code_stamp(),
+    }
+
+def simple_baseline_audit(artifact=None, path=None, protocol=None):
+    """Audit the tuned count-model floor artifact.
+
+    The artifact must show a validation-only search, a selected config that is
+    actually the best recorded trial, and consistent evaluation-token counts.
+    A missing/invalid artifact is `not_verifiable_locally`, never a pass."""
+    _explicit = protocol is not None
+    if artifact is None and path:
+        if os.path.exists(path):
+            try:
+                artifact = json.load(open(path, encoding='utf-8'))
+            except Exception as e:
+                return {'status': 'fail', 'baseline_verified': False,
+                        'problems': [f'cannot parse {path}: {type(e).__name__}: {e}']}
+        else:
+            return {'status': 'not_verifiable_locally', 'baseline_verified': False,
+                    'problems': [f'{path} absent — run baseline_tune.py simple before claiming the trivial floor was tuned']}
+    if not _explicit and isinstance(artifact, dict) and isinstance(artifact.get('protocol'), dict):
+        protocol = artifact['protocol']
+    else:
+        protocol = SIMPLE_BASELINE_POLICY if protocol is None else protocol
+    if not isinstance(artifact, dict) or not isinstance(artifact.get('baselines'), dict):
+        return {'status': 'not_verifiable_locally', 'baseline_verified': False,
+                'problems': ['no simple_baseline artifact (expected {"baselines": {...}})']}
+    problems = []
+    warnings = []
+    metric = artifact.get('selection_metric') or protocol.get('selection_metric')
+    split = artifact.get('selection_split') or protocol.get('selection_split')
+    direction = artifact.get('direction') or protocol.get('direction')
+    if split != 'validation':
+        problems.append(f'selection split is {split!r}; count-model smoothing must be selected on validation, never test')
+    if metric != protocol.get('selection_metric'):
+        problems.append(f'selection metric {metric!r} differs from the declared {protocol.get("selection_metric")!r}')
+    if direction != 'lower_is_better':
+        problems.append(f'count-model selection direction is {direction!r}; PPL is lower-is-better')
+    declared_arms = set((protocol.get('arms') or {}).keys())
+    baselines = artifact['baselines']
+    missing = sorted(declared_arms - set(baselines))
+    if missing:
+        problems.append(f'missing simple-baseline evidence for arms {missing}')
+    n_tokens_by_arm = {}
+    selected_values = {}
+    for arm, entry in baselines.items():
+        if not isinstance(entry, dict):
+            problems.append(f'{arm}: malformed baseline entry')
+            continue
+        trials = entry.get('trials')
+        if not isinstance(trials, list) or not trials:
+            problems.append(f'{arm}: no trial records')
+            continue
+        cfgs = [json.dumps(t.get('config') or {}, sort_keys=True, default=str) for t in trials if isinstance(t, dict)]
+        chosen = entry.get('selected') or entry.get('selected_config')
+        if not isinstance(chosen, dict):
+            problems.append(f'{arm}: no selected config')
+            continue
+        chosen_sig = json.dumps(chosen, sort_keys=True, default=str)
+        if chosen_sig not in cfgs:
+            problems.append(f'{arm}: selected config is not one of its recorded trials')
+            continue
+        chosen_trial = next(t for t in trials if isinstance(t, dict)
+                            and json.dumps(t.get('config') or {}, sort_keys=True, default=str) == chosen_sig)
+        vals = [float(t[metric]) for t in trials
+                if isinstance(t, dict) and isinstance(t.get(metric), (int, float))
+                and not isinstance(t.get(metric), bool) and math.isfinite(float(t[metric]))]
+        if not vals:
+            problems.append(f'{arm}: no finite {metric} in its trials')
+            continue
+        chosen_value = entry.get('selected_metric_value')
+        if chosen_value is None:
+            chosen_value = chosen_trial.get(metric)
+        if not isinstance(chosen_value, (int, float)) or isinstance(chosen_value, bool) or not math.isfinite(float(chosen_value)):
+            problems.append(f'{arm}: no finite selected {metric} value')
+            continue
+        selected_values[arm] = float(chosen_value)
+        if abs(float(chosen_value) - float(chosen_trial[metric])) > 1e-12:
+            problems.append(f'{arm}: selected_metric_value does not match the selected trial')
+        if float(chosen_value) > min(vals) + 1e-12:
+            problems.append(f'{arm}: selected trial is not the minimum-{metric} trial')
+        nt = {int(t.get('n_tokens')) for t in trials if isinstance(t, dict) and t.get('n_tokens') is not None}
+        if len(nt) > 1:
+            problems.append(f'{arm}: trials evaluated different token counts {sorted(nt)} — PPLs are not comparable')
+        n_tokens_by_arm[arm] = sorted(nt)
+    if len({tuple(v) for v in n_tokens_by_arm.values()}) > 1:
+        problems.append('simple baselines evaluated different token counts; report a common token-weighted floor')
+    data = artifact.get('data') or {}
+    if not data.get('val_fp'):
+        warnings.append('artifact has no validation fingerprint — the panel comparison cannot verify it used the same validation slice')
+    best_name = None
+    if selected_values:
+        best_name = min(selected_values, key=selected_values.get)
+        reported = artifact.get('best_baseline') or artifact.get('best_arm')
+        reported_ppl = artifact.get('best_ppl')
+        if reported is not None and reported != best_name:
+            problems.append(f'best_baseline={reported!r} is not the minimum selected arm ({best_name!r})')
+        if isinstance(reported_ppl, (int, float)) and abs(float(reported_ppl) - selected_values[best_name]) > 1e-12:
+            problems.append('best_ppl does not match the minimum selected arm')
+    out = {'status': 'ok' if not problems else 'fail',
+           'baseline_verified': not problems,
+           'selection_metric': metric, 'selection_split': split,
+           'arms': sorted(baselines), 'selected_values': selected_values,
+           'best_baseline': best_name,
+           'best_ppl': (selected_values.get(best_name) if best_name is not None else None),
+           'n_eval_tokens': n_tokens_by_arm,
+           'data': data, 'problems': problems, 'warnings': warnings}
+    if warnings and not problems:
+        out['status'] = 'warn'
+    return out
+
 # 指标口径表：每个任务的主指标、方向、不平衡处理与聚合方式都显式写出。
 # `metric_policy_audit` 用它检查落盘记录，避免「只报 accuracy」「F1 没写
 # macro/micro/weighted」「极度不平衡仍以 ROC-AUC 为主」这类不可复核的读数。
@@ -5864,6 +6119,7 @@ METRIC_POLICY = {
     'boundary_alignment': {
         'task': 'binary_boundary_detection',
         'primary': 'f1',
+        'primary_average': 'macro_over_sequences',
         'direction': 'higher_is_better',
         'secondary': ['precision', 'recall', 'random_precision', 'precision_excess_over_random'],
         'imbalance': 'positives_are_a_small_fraction_of_cut_positions',
@@ -5883,6 +6139,7 @@ METRIC_POLICY = {
     'binary_classification': {
         'task': 'binary_classification',
         'primary': 'f1',
+        'primary_average': 'binary_positive_class',
         'direction': 'higher_is_better',
         'secondary': ['precision', 'recall', 'pr_auc', 'roc_auc', 'balanced_accuracy'],
         'imbalance': 'report prevalence; prefer PR-AUC when positives are rarer than 1:1000',
@@ -5892,6 +6149,7 @@ METRIC_POLICY = {
     'multiclass_classification': {
         'task': 'multiclass_classification',
         'primary': 'f1_macro',
+        'primary_average': 'macro',
         'direction': 'higher_is_better',
         'secondary': ['f1_micro', 'f1_weighted', 'balanced_accuracy', 'per_class_recall'],
         'imbalance': 'macro averaging is required when class frequencies differ; micro equals accuracy for single-label tasks',
@@ -5899,6 +6157,74 @@ METRIC_POLICY = {
         'note': 'Every reported F1 must name macro, micro or weighted; report per-class recall when macro and micro disagree.',
     },
 }
+
+_HYPOTHESIS_REQUIRED = ('statement', 'mechanism', 'predicted_sign', 'primary_metric', 'falsifier')
+
+def hypothesis_audit(table=None, kind='component', names=None, policy=None):
+    """Pre-registration completeness / metric-alignment audit.
+
+    A hypothesis is only actionable before an experiment if it states the
+    expected mechanism, the signed direction of the primary metric, and a
+    falsifier.  This audit also checks that the declared primary metric is one
+    the project's ``METRIC_POLICY`` actually defines, so a hypothesis cannot
+    silently target an unmeasured quantity (e.g. accuracy for an imbalanced
+    endpoint, or ROC-AUC for a 1:1000 task).  `names` limits the audit to the
+    declared comparisons in the current panel; missing table entries are
+    reported by the caller as `hypotheses_missing`.
+
+    Direction `predicted_sign=0` is legal for an exploratory "difference
+    exists" hypothesis, but it can never support a directional superiority
+    claim; such components are listed separately as direction_unspecified."""
+    if table is None:
+        table = HYPOTHESIS_DESIGN if kind == 'component' else BASELINE_HYPOTHESIS_DESIGN
+    policy = METRIC_POLICY if policy is None else policy
+    allowed = set()
+    for p in policy.values():
+        for key in ('primary', 'secondary'):
+            val = p.get(key)
+            if isinstance(val, str):
+                allowed.add(val)
+            elif isinstance(val, (list, tuple)):
+                allowed.update(str(x) for x in val)
+    wanted = set(names) if names is not None else set(table)
+    out = {'status': 'ok', 'kind': kind, 'hypotheses': {},
+           'invalid': [], 'metric_unknown': [], 'direction_unspecified': [],
+           'warnings': []}
+    for name in sorted(wanted):
+        spec = table.get(name)
+        if not isinstance(spec, dict):
+            out['invalid'].append(name)
+            out['warnings'].append(f'{kind} hypothesis `{name}` is missing from the pre-registered table')
+            continue
+        issues = []
+        for key in _HYPOTHESIS_REQUIRED:
+            val = spec.get(key)
+            if key == 'predicted_sign':
+                if isinstance(val, bool) or val not in (-1, 0, 1):
+                    issues.append(f'predicted_sign={val!r} (must be -1, 0 or 1)')
+            elif not isinstance(val, str) or not val.strip():
+                issues.append(f'{key} is empty or not a string')
+        pm = spec.get('primary_metric')
+        metric_known = bool(isinstance(pm, str) and pm in allowed)
+        pred = spec.get('predicted_sign')
+        row = {'statement': spec.get('statement'), 'mechanism': spec.get('mechanism'),
+               'predicted_sign': pred, 'primary_metric': pm,
+               'falsifier': spec.get('falsifier'),
+               'direction_specified': (pred in (-1, 1)),
+               'metric_declared_in_policy': metric_known,
+               'complete': not issues}
+        out['hypotheses'][name] = row
+        if issues:
+            out['invalid'].append(name)
+            out['warnings'].append(f'{kind} hypothesis `{name}` is incomplete: ' + '; '.join(issues))
+        if not metric_known:
+            out['metric_unknown'].append(name)
+            out['warnings'].append(f'{kind} hypothesis `{name}` declares primary_metric={pm!r}, which METRIC_POLICY does not define')
+        if pred == 0:
+            out['direction_unspecified'].append(name)
+            out['warnings'].append(f'{kind} hypothesis `{name}` has predicted_sign=0 — it can test for a difference but cannot support a directional advantage claim')
+    out['status'] = 'warn' if out['warnings'] else 'ok'
+    return out
 
 def _binary_roc_auc(y, score):
     """Rank-based ROC-AUC for a binary endpoint (ties get average ranks)."""
@@ -5937,15 +6263,23 @@ def _binary_average_precision(y, score):
     recall = tp / max(n_pos, 1)
     return float(np.sum(np.diff(np.r_[0.0, recall]) * precision))
 
-def classification_metrics(y_true, y_score=None, y_pred=None, labels=None):
+def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, positive_label=None):
     """Imbalance-aware classification summary without a sklearn dependency.
 
     Always returns accuracy, balanced accuracy and per-class precision/recall/
     F1; reports **macro, micro and weighted** F1 separately (they can disagree
-    sharply under class imbalance).  For a binary endpoint with scores it also
-    returns PR-AUC (average precision) and ROC-AUC.  The caller must still
-    choose the endpoint that matches the research question; this helper only
-    makes the choice explicit and computable.
+    sharply under class imbalance; macro includes every requested label, with
+    F1=0 for a label the predictions never recover).  For a binary endpoint
+    with scores it also returns PR-AUC (average precision), ROC-AUC, the
+    positive-class prevalence and the PR-AUC lift over that prevalence, so a
+    rare-positive PR-AUC can be read against its chance floor.  The caller must
+    still choose the endpoint that matches the research question; this helper
+    only makes the choice explicit and computable.
+
+    `positive_label` names the class whose score/probability column is the
+    positive endpoint.  If omitted it defaults to ``labels[-1]`` (the sklearn
+    convention for sorted binary labels), but callers with reversed or
+    non-numeric labels should pass it explicitly rather than relying on order.
     """
     y_true = np.asarray(y_true).ravel()
     if labels is None:
@@ -5956,6 +6290,19 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None):
             if y_pred is not None:
                 labels = np.unique(np.concatenate([labels, np.asarray(y_pred).ravel()]))
     labels = np.asarray(labels)
+    if labels.size == 0:
+        raise ValueError('classification_metrics needs at least one label')
+    pos = None
+    if labels.size == 2:
+        if positive_label is None:
+            pos = labels[-1]
+        else:
+            hits = np.where(labels == positive_label)[0]
+            if hits.size == 0:
+                raise ValueError(f'positive_label={positive_label!r} is not in labels {labels.tolist()}')
+            pos = labels[int(hits[0])]
+    elif positive_label is not None:
+        raise ValueError('positive_label is only meaningful for a binary endpoint')
     if y_pred is None:
         if y_score is None:
             raise ValueError('classification_metrics needs y_pred or y_score')
@@ -5963,7 +6310,10 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None):
         if score.ndim == 2:
             y_pred = labels[np.argmax(score, axis=1)]
         elif labels.size == 2:
-            y_pred = np.where(score.ravel() >= 0.5, labels[-1], labels[0])
+            if score.size != y_true.size:
+                raise ValueError(f'y_score {score.shape} and y_true {y_true.shape} differ')
+            neg = labels[0] if pos == labels[-1] else labels[-1]
+            y_pred = np.where(score.ravel() >= 0.5, pos, neg)
         else:
             raise ValueError('a 1-D y_score is only interpretable for a binary endpoint')
     y_pred = np.asarray(y_pred).ravel()
@@ -5973,6 +6323,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None):
     supports = []
     f1s = []
     rs = []
+    all_f1s = []
     total_tp = total_fp = total_fn = 0
     for lab in labels:
         tp = int(np.sum((y_true == lab) & (y_pred == lab)))
@@ -5983,6 +6334,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None):
         recall = tp / (tp + fn) if tp + fn else 0.0
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
         per_class[str(lab)] = {'precision': precision, 'recall': recall, 'f1': f1, 'support': support}
+        all_f1s.append(f1)
         total_tp += tp
         total_fp += fp
         total_fn += fn
@@ -5991,50 +6343,79 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None):
             f1s.append(f1)
             rs.append(recall)
     micro_f1 = 2 * total_tp / max(2 * total_tp + total_fp + total_fn, 1)
-    macro_f1 = float(np.mean(f1s)) if f1s else 0.0
+    # Macro averages over the requested label set (zero-support labels count
+    # as 0, as in sklearn), so a rare class cannot be dropped from the macro
+    # score merely because it happens to be absent from this sample.
+    macro_f1 = float(np.mean(all_f1s)) if all_f1s else 0.0
     weighted_f1 = float(np.average(f1s, weights=supports)) if supports else 0.0
+    f1_positive = per_class[str(pos)]['f1'] if pos is not None else None
     out = {
         'n': int(y_true.size),
         'labels': [str(x) for x in labels],
+        'positive_label': (str(pos) if pos is not None else None),
         'prevalence': {str(lab): float(np.mean(y_true == lab)) for lab in labels},
         'accuracy': float(np.mean(y_true == y_pred)) if y_true.size else None,
         'balanced_accuracy': float(np.mean(rs)) if rs else None,
         'f1_macro': macro_f1,
         'f1_micro': float(micro_f1),
         'f1_weighted': weighted_f1,
+        'f1_positive': f1_positive,
+        'f1_primary': (f1_positive if pos is not None else macro_f1),
+        'f1_primary_average': ('binary_positive_class' if pos is not None else 'macro'),
         'precision_macro': float(np.mean([v['precision'] for v in per_class.values()])) if per_class else 0.0,
         'recall_macro': float(np.mean(rs)) if rs else 0.0,
         'per_class': per_class,
         'f1_averaging': 'macro, micro and weighted are all reported; the caller must name the primary one',
     }
     if y_score is not None and labels.size == 2:
-        y_bin = (y_true == labels[-1]).astype(np.int64)
+        y_bin = (y_true == pos).astype(np.int64)
         # A 2-D score matrix is column-per-label: the binary endpoint uses the
-        # positive class (labels[-1]) column, exactly as the argmax prediction
-        # above does.
+        # named positive-class column, not an assumed last column.
         _score = np.asarray(y_score, dtype=float)
-        _bin_score = _score[:, -1] if _score.ndim == 2 else _score.ravel()
+        if _score.ndim == 2:
+            _pos_idx = int(np.where(labels == pos)[0][0])
+            _bin_score = _score[:, _pos_idx]
+        else:
+            _bin_score = _score.ravel()
+        if _bin_score.size != y_bin.size:
+            raise ValueError(f'y_score {_score.shape} does not match y_true {y_true.shape}')
         out['roc_auc'] = _binary_roc_auc(y_bin, _bin_score)
         out['pr_auc'] = _binary_average_precision(y_bin, _bin_score)
+        prevalence = float(np.mean(y_bin))
+        out['pr_auc_prevalence'] = prevalence
+        if out['pr_auc'] is not None:
+            out['pr_auc_lift_over_prevalence'] = float(out['pr_auc'] - prevalence)
         if out['pr_auc'] is not None and out['roc_auc'] is not None:
-            rare = min(float(np.mean(y_bin)), 1.0 - float(np.mean(y_bin)))
+            rare = min(prevalence, 1.0 - prevalence)
             out['imbalance_warning'] = ('positives rarer than 1:1000 — PR-AUC is the primary ranking metric; ROC-AUC can look optimistic'
                                         if rare < 1e-3 else None)
+    elif labels.size == 2 and out.get('positive_label') is not None:
+        prev = out['prevalence'].get(str(pos), 0.0)
+        if min(prev, 1.0 - prev) < 1e-3:
+            out['imbalance_warning'] = ('positives rarer than 1:1000 — report PR-AUC with scores; F1 must name its averaging rule and recall should be reported per class')
     return out
 
 def metric_policy_audit(summary=None, policy=None):
     """Check the declared metric contract and the records that claim to meet it.
 
     The audit never selects a metric for the experimenter.  It checks that each
-    task's primary metric, direction, imbalance policy and aggregation are
-    declared, and that a panel which reports boundary or retrieval results also
-    reports the companion metrics needed to interpret them (precision/recall and
-    the random baseline for boundaries; answer NLL for retrieval)."""
+    task's primary metric, direction, aggregation and imbalance policy are
+    declared; that every F1 endpoint names its averaging rule (macro, micro,
+    weighted or binary-positive); and that a panel which reports boundary,
+    retrieval or classification results also reports the companion metrics
+    needed to interpret them (precision/recall plus random baseline for
+    boundaries; answer NLL for retrieval; PR-AUC alongside ROC-AUC for rare
+    positives)."""
     policy = METRIC_POLICY if policy is None else policy
     out = {'status': 'ok', 'policies': {}, 'checks': [], 'warnings': []}
     for name, p in policy.items():
         missing = [k for k in ('task', 'primary', 'direction', 'aggregation', 'imbalance') if not p.get(k)]
-        out['policies'][name] = {'primary': p.get('primary'), 'direction': p.get('direction'),
+        primary = str(p.get('primary') or '')
+        if primary.startswith('f1') and not p.get('primary_average'):
+            missing.append('primary_average')
+        out['policies'][name] = {'primary': p.get('primary'),
+                                 'primary_average': p.get('primary_average'),
+                                 'direction': p.get('direction'),
                                  'aggregation': p.get('aggregation'), 'imbalance': p.get('imbalance'),
                                  'complete': not missing}
         if missing:
@@ -6055,7 +6436,8 @@ def metric_policy_audit(summary=None, policy=None):
         if bnd:
             missing = [k for k in ('bnd_prec', 'bnd_rec', 'bnd_rand') if not all(k in b for b in bnd)]
             out['checks'].append({'metric': 'boundary_alignment', 'policy': 'boundary_alignment',
-                                  'records': len(bnd), 'ok': not missing, 'missing': missing})
+                                  'records': len(bnd), 'ok': not missing, 'missing': missing,
+                                  'f1_average': 'macro_over_sequences'})
             if missing:
                 out['warnings'].append(f'boundary metrics report F1 without {missing}; F1 alone cannot be interpreted against the random-cut baseline')
         if niah:
@@ -6064,11 +6446,33 @@ def metric_policy_audit(summary=None, policy=None):
                                   'records': len(niah), 'ok': not missing, 'missing': missing})
             if missing:
                 out['warnings'].append(f'NIAH reports top-1 without {missing}; answer NLL is required alongside retrieval accuracy')
+        classify_tasks = ('classification', 'binary_classification', 'multiclass_classification')
         for r in recs:
+            task = r.get('task')
             # Generic guard: a record that exposes a bare `accuracy` for a
             # classification-style task but no F1 must be treated as incomplete.
-            if r.get('task') in ('classification', 'binary_classification', 'multiclass_classification') and 'accuracy' in r and 'f1_macro' not in r:
+            if task in classify_tasks and 'accuracy' in r and 'f1_macro' not in r:
                 out['warnings'].append(f"{r.get('variant', '?')} reports accuracy without F1/averaging for a classification task")
+            # F1 without a stated averaging rule is not a reproducible metric.
+            f1_keys = [k for k in ('f1', 'f1_macro', 'f1_micro', 'f1_weighted', 'f1_positive') if k in r]
+            if task in classify_tasks and f1_keys and not (r.get('f1_averaging') or r.get('f1_primary_average')):
+                out['warnings'].append(f"{r.get('variant', '?')} reports {f1_keys} without naming macro/micro/weighted/binary averaging")
+            # A rare-positive panel that reports only ROC-AUC is exactly the
+            # optimistic-score failure mode this policy exists to prevent.
+            prevalence = None
+            for key in ('prevalence', 'positive_prevalence'):
+                val = r.get(key)
+                if isinstance(val, dict) and len(val) == 2:
+                    prevalence = min(float(x) for x in val.values())
+                    break
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    prevalence = min(float(val), 1.0 - float(val))
+                    break
+            if task in classify_tasks and prevalence is not None and prevalence < 1e-3:
+                if r.get('roc_auc') is not None and r.get('pr_auc') is None:
+                    out['warnings'].append(f"{r.get('variant', '?')} reports ROC-AUC but no PR-AUC at prevalence {prevalence:.2e} (<1:1000); PR-AUC is the primary ranking metric here")
+                if r.get('pr_auc') is not None and r.get('pr_auc_prevalence') is None:
+                    out['warnings'].append(f"{r.get('variant', '?')} reports a rare-positive PR-AUC without its prevalence floor; PR-AUC must be read against chance prevalence")
     out['status'] = 'warn' if out['warnings'] else 'ok'
     return out
 
@@ -6077,10 +6481,13 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
 
     A win over an untuned dense baseline establishes only that the proposed
     model beats a straw man.  This audit requires, for every compared arm:
-    the *same declared trial grid*, the *same selection split* (validation,
-    never test), the *same selection metric*, and a selected config that really
-    is the best trial under that metric.  Missing evidence is reported as
-    `not_verifiable_locally`, never as a pass.
+    the *same declared trial grid*, the *same number of trials*, the *same
+    selection split* (validation, never test), the *same selection metric*, a
+    selected config that really is the best recorded trial, and a
+    `selected_metric_value` that is the value of **that** config (not merely
+    the minimum of some other trial).  When trial records expose
+    steps/tokens_seen, the training budget must also agree across arms.
+    Missing evidence is reported as `not_verifiable_locally`, never as a pass.
     """
     _explicit_protocol = protocol is not None
     if selected is None and path:
@@ -6107,6 +6514,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     split = selected.get('selection_split') or protocol.get('selection_split')
     direction = selected.get('direction') or protocol.get('direction')
     problems = []
+    warnings = []
     if split != 'validation':
         problems.append(f'selection split is {split!r}; hyperparameters must be selected on validation, never test')
     if metric != protocol.get('selection_metric'):
@@ -6116,6 +6524,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     declared = {json.dumps(t, sort_keys=True, default=str) for t in (protocol.get('trials') or [])}
     signatures = {}
     n_trials = {}
+    budgets = {}
     for arm, entry in arms.items():
         trials = entry.get('trials') if isinstance(entry, dict) else None
         if not isinstance(trials, list) or not trials:
@@ -6125,7 +6534,27 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         signatures[arm] = tuple(sorted(cfgs))
         n_trials[arm] = len(cfgs)
         if declared and any(c not in declared for c in cfgs):
-            problems.append(f'{arm}: a trial is outside the declared BASELINE_TUNING_PROTOCOL grid')
+            problems.append(f'{arm}: a trial is outside the declared grid')
+        elif declared and set(cfgs) != declared:
+            # Equal-but-partial search is allowed for smoke/bounded runs, but
+            # it must be described as a subset, not as the full declared grid.
+            _missing_cfg = sorted(declared - set(cfgs))
+            warnings.append(f'{arm}: searched a strict subset of the declared grid (missing {_missing_cfg[:2]})')
+        # Trial-level training budget: equal tuning means the same data/steps,
+        # not only the same lr grid.
+        by_cfg = {}
+        for t in trials:
+            if not isinstance(t, dict):
+                continue
+            sig = json.dumps(t.get('config') or {}, sort_keys=True, default=str)
+            by_cfg[sig] = (t.get('steps'), t.get('tokens_seen'))
+        budgets[arm] = by_cfg
+        _steps = {v[0] for v in by_cfg.values() if v[0] is not None}
+        _toks = {v[1] for v in by_cfg.values() if v[1] is not None}
+        if len(_steps) > 1:
+            problems.append(f'{arm}: trials used different step budgets {sorted(_steps)}')
+        if len(_toks) > 1:
+            problems.append(f'{arm}: trials saw different token counts {sorted(_toks)}')
         chosen = entry.get('selected') or entry.get('selected_config')
         if not isinstance(chosen, dict):
             problems.append(f'{arm}: no selected config')
@@ -6133,50 +6562,89 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         chosen_sig = json.dumps(chosen, sort_keys=True, default=str)
         if chosen_sig not in cfgs:
             problems.append(f'{arm}: selected config is not one of its recorded trials')
+            continue
+        chosen_trial = next(t for t in trials if isinstance(t, dict)
+                            and json.dumps(t.get('config') or {}, sort_keys=True, default=str) == chosen_sig)
         vals = []
         for t in trials:
             v = t.get(metric) if isinstance(t, dict) else None
-            if isinstance(v, (int, float)) and math.isfinite(float(v)):
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)):
                 vals.append(float(v))
         chosen_value = entry.get('selected_metric_value')
         if chosen_value is None:
-            chosen_value = chosen.get(metric)
+            chosen_value = chosen_trial.get(metric)
         if not vals:
             problems.append(f'{arm}: no finite {metric} in its trials')
-        elif not isinstance(chosen_value, (int, float)) or not math.isfinite(float(chosen_value)):
+        elif not isinstance(chosen_value, (int, float)) or isinstance(chosen_value, bool) or not math.isfinite(float(chosen_value)):
             problems.append(f'{arm}: no finite selected {metric} value')
-        elif direction == 'lower_is_better':
-            if float(chosen_value) > min(vals) + 1e-12:
-                problems.append(f'{arm}: selected trial is not the minimum-{metric} trial')
         else:
-            if float(chosen_value) < max(vals) - 1e-12:
-                problems.append(f'{arm}: selected trial is not the maximum-{metric} trial')
+            _ctv = chosen_trial.get(metric)
+            if not isinstance(_ctv, (int, float)) or isinstance(_ctv, bool) or not math.isfinite(float(_ctv)):
+                problems.append(f'{arm}: selected trial has no finite {metric}')
+            elif abs(float(_ctv) - float(chosen_value)) > 1e-12:
+                problems.append(f'{arm}: selected_metric_value={chosen_value} is not the value of the selected config ({_ctv})')
+            if direction == 'lower_is_better':
+                if float(chosen_value) > min(vals) + 1e-12:
+                    problems.append(f'{arm}: selected trial is not the minimum-{metric} trial')
+            else:
+                if float(chosen_value) < max(vals) - 1e-12:
+                    problems.append(f'{arm}: selected trial is not the maximum-{metric} trial')
     if signatures:
         if len(set(signatures.values())) != 1:
             problems.append('arms did not search the same trial grid — tuning budgets are unequal')
         if len(set(n_trials.values())) != 1:
             problems.append('arms did not receive the same number of tuning trials — tuning budgets are unequal')
+    # Cross-arm per-config budget check (only where both records expose it).
+    _all_sigs = set().union(*(set(b) for b in budgets.values())) if budgets else set()
+    for sig in sorted(_all_sigs):
+        _vals = {arm: b[sig] for arm, b in budgets.items() if sig in b}
+        _st = {v[0] for v in _vals.values() if v[0] is not None}
+        _tk = {v[1] for v in _vals.values() if v[1] is not None}
+        if len(_st) > 1 or len(_tk) > 1:
+            problems.append(f'trial {sig[:48]} uses different steps/tokens across arms (steps={sorted(_st)}, tokens={sorted(_tk)})')
+            break
+    if selected.get('search_complete') is False:
+        warnings.append('the search grid was truncated (search_complete=False); it is equal across arms, but describe it as a bounded search, not the full declared grid')
     final_records = selected.get('final_records') or {}
+    final_seeds = selected.get('final_seeds') or protocol.get('final_seeds') or []
     if final_records:
         for arm, entry in arms.items():
             chosen = entry.get('selected') or entry.get('selected_config') or {}
-            hits = [r for k, r in final_records.items() if k.startswith(f'{arm}::') and isinstance(r, dict)]
+            hits = [(k, r) for k, r in final_records.items()
+                    if k.startswith(f'{arm}::') and isinstance(r, dict)]
             if not hits:
                 problems.append(f'{arm}: tuning artifact claims final records but none are bound to this arm')
                 continue
-            for r in hits:
+            _seeds = [int(r['seed']) for _k, r in hits if r.get('seed') is not None]
+            if len(_seeds) != len(set(_seeds)):
+                problems.append(f'{arm}: duplicate final records for the same seed')
+            if final_seeds:
+                _need = {int(s) for s in final_seeds}
+                _miss = sorted(_need - set(_seeds))
+                if _miss:
+                    problems.append(f'{arm}: final records miss declared seeds {_miss}')
+            for _k, r in hits:
                 hp = r.get('hyperparams') or {}
-                for _k in ('lr', 'weight_decay', 'warmup'):
-                    if _k in chosen and hp.get(_k) is not None and float(hp[_k]) != float(chosen[_k]):
-                        problems.append(f'{arm}: final record {_k}={hp[_k]} does not match the selected {chosen[_k]}')
+                for _kn in ('lr', 'weight_decay', 'warmup'):
+                    if _kn in chosen and hp.get(_kn) is not None and float(hp[_kn]) != float(chosen[_kn]):
+                        problems.append(f'{arm}: final record {_kn}={hp[_kn]} does not match the selected {chosen[_kn]}')
                         break
+                if r.get('variant') is not None and r.get('variant') != arm:
+                    problems.append(f'{arm}: final record key {_k} carries variant={r.get("variant")!r}')
     required = set(protocol.get('arms') or [])
     if required and not required.issubset(set(arms)):
         problems.append(f'missing tuning evidence for arms {sorted(required - set(arms))}')
+    _grid_complete = None
+    if signatures and declared:
+        _grid_complete = all(set(sig) == declared for sig in signatures.values())
     out = {'status': 'ok' if not problems else 'fail', 'tuning_verified': not problems,
            'selection_metric': metric, 'selection_split': split,
            'n_trials': n_trials, 'same_search_space': (len(set(signatures.values())) <= 1) if signatures else None,
-           'arms': sorted(arms), 'problems': problems}
+           'search_complete': selected.get('search_complete') if selected.get('search_complete') is not None else _grid_complete,
+           'grid_complete': _grid_complete,
+           'arms': sorted(arms), 'problems': problems, 'warnings': warnings}
+    if warnings and not problems:
+        out['status'] = 'warn'
     return out
 
 def _variant_seed_map(summary):
@@ -6467,6 +6935,9 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
     direction_conflict  — a corrected significant effect exists but it points
                           against the pre-registered direction.  This is
                           evidence AGAINST the stated mechanism, never support;
+    direction_unspecified — significant, but the hypothesis explicitly declared
+                          predicted_sign=0; it cannot support a directional
+                          advantage claim;
     measured            — a controlled contrast exists with n >= min_n, but no
                           corrected significance;
     resolution_limited  — a controlled, non-noise contrast exists whose
@@ -6489,6 +6960,8 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
     if sig:
         if any(e.get('direction_consistent') is False for e in sig):
             return 'direction_conflict'
+        if any(e.get('predicted_sign') == 0 for e in sig):
+            return 'direction_unspecified'
         return 'verified'
     noise_free = [e for e in powered if not e.get('within_seed_noise')]
     if not noise_free:
@@ -6721,11 +7194,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
               'noise_level_baselines': [], 'unverified_baselines': [],
               'direction_conflict_baselines': [], 'tuned_verified_baselines': [],
               'untuned_verified_baselines': [],
+              'direction_unspecified_components': [], 'direction_unspecified_baselines': [],
               'incomplete_components': [], 'controlled_variables': {},
               'ablation_completeness': {}, 'ablation_complete': None,
               'arm_summary': {}, 'arms_below_min_seeds': [],
               'component_seed_requirements': {}, 'baseline_seed_requirements': {},
-              'hypotheses': {}, 'metric_audit': {}, 'baseline_tuning': {},
+              'hypotheses': {}, 'hypotheses_incomplete': [], 'hypothesis_audit': {},
+              'metric_audit': {}, 'baseline_tuning': {}, 'simple_baseline': {},
               'family': {}, 'warnings': []}
 
     def _collect(design_group, kind):
@@ -6838,6 +7313,19 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             report['hypotheses_missing'].append(comp)
         else:
             report['hypotheses'][comp] = dict(_hyp, kind='baseline')
+    # Completeness / metric-alignability of the pre-registered hypotheses.
+    # A missing field or an undeclared metric is a design defect found before
+    # any number is interpreted; it is reported, not silently defaulted.
+    _ha_comp = hypothesis_audit(HYPOTHESIS_DESIGN, 'component', names=list(design))
+    _ha_base = hypothesis_audit(BASELINE_HYPOTHESIS_DESIGN, 'baseline', names=list(baselines))
+    report['hypothesis_audit'] = {'component': _ha_comp, 'baseline': _ha_base}
+    for _ha in (_ha_comp, _ha_base):
+        for _w in _ha.get('warnings') or []:
+            report['warnings'].append(_w)
+        report['hypotheses_incomplete'].extend(
+            n for n in (_ha.get('invalid') or []) if n not in report['hypotheses_incomplete'])
+        report['hypotheses_incomplete'].extend(
+            n for n in (_ha.get('metric_unknown') or []) if n not in report['hypotheses_incomplete'])
     # Family = claims this panel can test (a component with no measured pair
     # is not part of the correction burden).  Within a tested component, all
     # declared contrasts keep their slots, so an incomplete ablation cannot
@@ -6894,8 +7382,9 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     }
 
     def _publish(group_name, design_group, entries_by_comp, meta, kind, require_param_match):
-        status_names = ('verified', 'direction_conflict', 'measured', 'significant', 'nominally_significant',
-                        'resolution_limited', 'underpowered', 'noise_level', 'unverified')
+        status_names = ('verified', 'direction_conflict', 'direction_unspecified', 'measured',
+                        'significant', 'nominally_significant', 'resolution_limited',
+                        'underpowered', 'noise_level', 'unverified')
         lists = {s: [] for s in status_names}
         for comp, contrasts in design_group.items():
             entries = entries_by_comp.get(comp, [])
@@ -6982,6 +7471,69 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             report['warnings'].append(
                 'baseline claims have no verified equal-search tuning artifact (%s) — a win over an untuned baseline is not evidence that the method beats a well-tuned baseline; run baseline_tune.py and put baseline_tuning.json next to this panel'
                 % (report['baseline_tuning'].get('status') or 'missing'))
+    # Trivial-floor evidence: a tuned count model must be beaten before the
+    # neural mechanism is compared with the tuned dense baselines.  The
+    # comparison is only made when the artifact and the panel share a
+    # validation fingerprint (or the panel records none, in which case the
+    # result is explicitly marked unverified rather than assumed comparable).
+    _sb_path = None
+    if outdir:
+        _sb_path = os.path.join(outdir, 'simple_baseline.json')
+    elif os.path.isdir('results_baseline_tuning'):
+        _sb_path = os.path.join('results_baseline_tuning', 'simple_baseline.json')
+    report['simple_baseline'] = simple_baseline_audit(path=_sb_path)
+    if _scoped_baselines:
+        _sb = report['simple_baseline']
+        if not _sb.get('baseline_verified'):
+            report['warnings'].append(
+                'no verified tuned count-model floor (%s) — run baseline_tune.py simple and place simple_baseline.json next to this panel; a neural model that has not been shown to beat the trivial floor should not be interpreted as evidence for the mechanism'
+                % (_sb.get('status') or 'missing'))
+        else:
+            _main_arms = set()
+            for _cs in list(_scoped_design.values()) + list(_scoped_baselines.values()):
+                for _a, _b, _n in _cs:
+                    _main_arms.add(_a)
+                    _main_arms.add(_b)
+            _cands = [(k, v) for k, v in (report.get('arm_summary') or {}).items()
+                      if v.get('variant') in _main_arms]
+            # Prefer the panel's base protocol; a warmup/length protocol is a
+            # different condition and must not be silently mixed in.
+            _base_cands = [(k, v) for k, v in _cands if not v.get('protocol')]
+            if _base_cands:
+                _cands = _base_cands
+            if _cands:
+                _ref_key, _ref = min(_cands, key=lambda kv: float(kv[1]['ppl_mean']))
+                _panel_val_fps = {r.get('val_fp') for r in recs.values() if r.get('val_fp')}
+                _sb_data = _sb.get('data') or {}
+                # `cache_val_fp` is the full validation cache fingerprint (the
+                # one panel records carry); `val_fp`/`eval_fp` describe the
+                # exact rows scored by the floor.  Prefer the cache-level fp
+                # for the comparability gate.
+                _sb_val_fp = _sb_data.get('cache_val_fp') or _sb_data.get('val_fp')
+                _comparable = None
+                if _sb_val_fp and _panel_val_fps:
+                    _comparable = _sb_val_fp in _panel_val_fps
+                report['simple_baseline'].update({
+                    'panel_reference_arm': _ref_key,
+                    'panel_reference_ppl': float(_ref['ppl_mean']),
+                    'panel_reference_protocol': _ref.get('protocol'),
+                    'panel_val_fp': (sorted(_panel_val_fps)[:3] or None),
+                    'comparable_to_panel': _comparable,
+                    'panel_beats_simple_floor': (bool(float(_ref['ppl_mean']) < float(_sb.get('best_ppl')))
+                                                 if _comparable is True and _sb.get('best_ppl') is not None
+                                                 else None),
+                })
+                if _comparable is False:
+                    report['warnings'].append(
+                        'simple-baseline artifact and this panel do not share a validation fingerprint — the floor comparison is NOT comparable and must not be quoted')
+                elif _comparable is None:
+                    report['warnings'].append(
+                        'the floor comparison is UNVERIFIABLE: panel records and/or the simple-baseline artifact lack a shared validation fingerprint; do not quote a beats-floor claim')
+                elif report['simple_baseline'].get('panel_beats_simple_floor') is False:
+                    report['warnings'].append(
+                        'the panel\'s best declared-arm PPL (%.4f, %s) does not beat the tuned count-model floor (%.4f, %s) — the mechanism claim lacks the most basic baseline'
+                        % (float(_ref['ppl_mean']), _ref_key, float(_sb.get('best_ppl')),
+                           _sb.get('best_baseline') or 'count-model'))
     if report['hypotheses_missing']:
         report['warnings'].append('no pre-registered hypothesis for: ' + ', '.join(sorted(set(report['hypotheses_missing']))) + ' — direction cannot be checked, so a significant result is at most measured')
 
@@ -7062,6 +7614,8 @@ def _print_methodology_audit(report):
         print('  nominally significant (raw p<alpha, before family correction): ' + ', '.join(report['nominally_significant_components']))
     if report.get('direction_conflict_components'):
         print('  DIRECTION CONFLICT (significant but opposite to the pre-registered hypothesis): ' + ', '.join(report['direction_conflict_components']))
+    if report.get('direction_unspecified_components'):
+        print('  direction-unspecified (significant, but the hypothesis declared predicted_sign=0): ' + ', '.join(report['direction_unspecified_components']))
     if report.get('resolution_limited_components'):
         print('  resolution-limited (non-noise effect, but the family-corrected p floor > alpha at this n; need n>=%s — add seeds, do NOT read as a null): ' % str((_fam.get('min_seeds_for_family_significance') or '?')) + ', '.join(report['resolution_limited_components']))
     if report.get('noise_level_components'):
@@ -7088,6 +7642,14 @@ def _print_methodology_audit(report):
         print('  metric policy: %s (warnings: %d)' % (_mt.get('status') or 'n/a', len(_mt.get('warnings') or [])))
         _bt = report.get('baseline_tuning') or {}
         print('  baseline tuning: status=%s tuning_verified=%s' % (_bt.get('status'), _bt.get('tuning_verified')))
+        _sb = report.get('simple_baseline') or {}
+        if _sb:
+            print('  count-model floor: status=%s baseline_verified=%s best=%s PPL=%s' % (
+                _sb.get('status'), _sb.get('baseline_verified'), _sb.get('best_baseline'), _sb.get('best_ppl')))
+            if _sb.get('panel_beats_simple_floor') is not None:
+                print('    panel reference %s PPL=%.4f; comparable=%s; beats simple floor=%s' % (
+                    _sb.get('panel_reference_arm'), float(_sb.get('panel_reference_ppl') or float('nan')),
+                    _sb.get('comparable_to_panel'), _sb.get('panel_beats_simple_floor')))
         if report.get('verified_baselines'):
             print('  statistically verified baseline claims (NOT yet evidence against a tuned baseline): ' + ', '.join(report['verified_baselines']))
         if report.get('tuned_verified_baselines'):
