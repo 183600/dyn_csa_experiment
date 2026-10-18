@@ -254,17 +254,7 @@ def run_smoke():
                       seq_len=L.probe_seq_len(seq),
                       vocab=int(smoke_cfg.get('vocab_size') or 1024),
                       mlp_ratio=_smoke_ratios, cfg=smoke_cfg)
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-    _smoke_t0 = time.time()
     L.run(smoke_cfg, seeds=[0], guard=None, label=f'SMOKE M0 (B 档数据路径 @ seq{seq})', par=False)
-    _smoke_wall = time.time() - _smoke_t0
-    _smoke_tok = max(1, int(steps)) * int(smoke_cfg['batch_size']) * int(seq) * len(smoke_cfg['variants'])
-    if torch.cuda.is_available():
-        _peak_mb = torch.cuda.max_memory_allocated() / (1 << 20)
-        print(f'[smoke] measured wall={_smoke_wall:.1f}s tokens~{_smoke_tok} throughput~{_smoke_tok / max(_smoke_wall, 1e-9):.0f} tok/s peak_gpu_mem={_peak_mb:.0f}MB')
-    else:
-        print(f'[smoke] measured wall={_smoke_wall:.1f}s tokens~{_smoke_tok} throughput~{_smoke_tok / max(_smoke_wall, 1e-9):.0f} tok/s (CPU)')
     _sp = os.path.join('results_smoke_m0', 'summary.json')
     _got = {}
     if os.path.exists(_sp):

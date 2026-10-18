@@ -130,7 +130,7 @@ def _g0_mismatch(cert):
     if not cert.get('numeric_pass'):
         return 'operator/model numeric equivalence did not pass'
     if not cert.get('benchmark_pass'):
-        return 'G0 throughput benchmark did not pass (CUDA+triton required)'
+        return 'G0 kernel/eager certificate did not pass (CUDA+triton required)'
     if not cert.get('training_tost_pass'):
         return 'training-level TOST equivalence did not pass'
     if str(cert.get('code_semantics')) != str(CODE_SEMANTICS):
@@ -607,9 +607,8 @@ def _h2d_async(host_src, dtype, device):
         if staged is not None:
             staged.copy_(t)
             return commit()
-        # A single upload larger than a quarter of the pool would pin (and
-        # keep alive) a huge staging block; a direct H2D copy from pageable
-        # memory avoids the extra pin/copy cycle for that rare case.
+        # A single upload larger than a quarter of the pool is copied directly
+        # rather than pinned as a staging block.
         if t.nbytes * 4 > _H2D_POOL_CAP:
             return t.to(device)
         try:
@@ -727,10 +726,9 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     # 闭式因果分位数按 (行, 列) 分块；分块是纯行/列划分，每个输出元素仍由
     # 同一个排序后因果行上的同两个秩插值得到，值不变。
     n = sim.shape[-1]
-    # O(T^2) per row becomes infeasible beyond the long-context band this
-    # segmenter is designed for; fail fast instead of attempting a multi-GB
-    # scratch table.  The row/column chunking below keeps the scratch bounded,
-    # so a larger explicit limit can be opted into for a scale study.
+    # Reject lengths beyond the band this segmenter is designed for.  The
+    # row/column chunking below keeps the scratch bounded, so a larger
+    # explicit limit can be opted into for a scale study.
     _max_len = 8192
     _env_max = os.environ.get('CSA_ADAPTIVE_MAX_TOKENS', '').strip()
     if _env_max:
@@ -760,7 +758,7 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     first_row = idx == 0
     # Keep the per-sort scratch bounded: a sort materialises values plus an
     # int64 index (12 bytes) on top of the 4-byte comparison table.  Column
-    # chunking also avoids ever materialising the full [rows, T, T] tensor.
+    # chunking keeps the largest temporary below the full [rows, T, T] tensor.
     _pair_bytes = 16
     _budget = 128 << 20
     col_chunk = max(1, min(int(n), 64))
@@ -803,17 +801,16 @@ def blocks_fixed(n, block_size, device):
 _MASK_CACHE = {}
 _CAUSAL_DONOR = -1
 _CAUSAL_TRI = None
-# A pinned donor is never evicted, so only pin a table small enough that
-# holding it across length sweeps is harmless.  Larger tables still go
-# through the shared LRU cache (and can therefore be evicted) instead of
-# being pinned for the rest of the process.
+# A pinned donor is never evicted, so only pin a table small enough to hold
+# across length sweeps.  Larger tables go through the shared LRU cache and
+# can therefore be evicted.
 _CAUSAL_DONOR_PIN_BYTES = 64 << 20
 
 def _causal_donor(device, width):
     # 单一共享 bool donor（True = j > i 的被掩 lane）：同一 [width, width]
     # 表按 [:T, :T] 切片服务一切 T <= width；_mask_buffer 的 causal 分支
     # 说明其与加性 donor 的逐位对应。小表作为 pinned key 复用；超过 pin
-    # 上限的大表只进可驱逐缓存，避免长上下文长度扫描长期占用显存。
+    # 上限的大表只进可驱逐缓存。
     global _CAUSAL_TRI
     dev_s = _dev_str(device)
     width = int(width)
@@ -839,9 +836,9 @@ def _causal_donor(device, width):
     return (tri, dev_s)
 _IDX_CACHE = {}
 _IDX_CACHE_BYTES = 0
-# One global byte budget for all mask/geometry tables: a larger T must evict
-# older tables rather than raise the process-wide ceiling (per-T budgets
-# multiplied by the number of eval lengths could pin several GB).
+# One global byte ceiling for all mask/geometry tables: a larger T must evict
+# earlier tables rather than raise the process-wide ceiling (per-T limits
+# multiplied by the number of eval lengths could grow to several GB).
 _MASK_CACHE_BUDGET_BYTES = 256 << 20
 
 def _mask_budget(n):
@@ -875,9 +872,7 @@ def _is_pinned_key(key):
     return key in _PINNED_KEYS
 _PINNED_KEYS = set()
 
-# Running per-cache byte totals.  Recomputing the total by walking every entry
-# on each insertion (and again after every eviction) turns cache maintenance
-# into O(n^2) once a long length/window sweep has produced many tables.
+# Running per-cache byte totals, maintained incrementally on insert/evict.
 _CACHE_STATS = {}
 
 
@@ -1321,7 +1316,7 @@ def _pool_geom_content_put(key, value):
         return value
     if _b > _POOL_GEOM_CONTENT_BYTES:
         return value
-    # A running byte count and an item cap keep insertion O(1) even after a
+    # A running byte count and an item cap bound the table count even after a
     # long run has produced tens of thousands of distinct geometry tables.
     _old = _POOL_GEOM_CONTENT.pop(key, None)
     if _old is not None:
@@ -1408,8 +1403,7 @@ def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
         # Flat layout: [counts | ends | starts | last_idx (| end_prev |
         # starts_prev | ov_start | ov_len)] followed by the zero pad; the
         # integers uploaded are identical to the per-segment form.  Index
-        # transport is int32 (sequence lengths are far inside int32 range),
-        # halving the geometry bytes and the H2D transfer.
+        # transport is int32 (sequence lengths are far inside int32 range).
         flat = np.empty(total + pad, dtype=np.int32)
         flat[0:B] = counts_np
         flat[B:2 * B] = ends_np
@@ -2343,8 +2337,7 @@ def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
     The indexer builds `raw`/`c`/`soft` tables of shape [T, B_blocks, nIH]
     (plus the [T, topk] prior) that stay alive until backward.  Recomputing
     the whole pure function in backward keeps only its inputs, matching the
-    FusedIndexer save policy and removing the CSA activation-memory cliff at
-    long T.  Values and gradients are unchanged (no RNG in the learned path
+    FusedIndexer save policy.  Values and gradients are unchanged (no RNG in the learned path
     unless `random_select`, which is a fixed function of the row/column ids).
     """
     def _run(_h, _ck, _lt):
@@ -3196,10 +3189,8 @@ class HybridAttention(nn.Module):
         index_kv = comp_kv
         if self._stats is not None:
             # scatter_add of exact integer ones is order-independent (integer
-            # addition commutes, no rounding), so the counts are the same
-            # exact integers bincount returns.
-            # bincount is deterministic (no atomics) and returns the same
-            # exact integer counts as the previous integer scatter-add.
+            # addition commutes, no rounding).  bincount is deterministic
+            # (no atomics) and returns the same exact integer counts.
             _bc = torch.bincount(bid.reshape(-1).long(), minlength=int(nblk))[:int(nblk)]
             self._stats.append(_bc)
             if self._cuts is not None:
@@ -3215,8 +3206,7 @@ class HybridAttention(nn.Module):
                 else:
                     cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
                     # Keep the device tensor; compression_report concatenates
-                    # the whole table and does ONE D2H transfer, instead of a
-                    # synchronising .cpu() per row.
+                    # the whole table and transfers it in one batched copy.
                     self._cuts.append(cuts)
         # Normalizing an all-zero content table is exactly zero (0/eps == 0),
         # so the zero-content ablation keeps the same values.
@@ -3292,11 +3282,10 @@ class HybridAttention(nn.Module):
         flat = x.reshape(B * T, d)
         pre_flat = self._pre(flat, fuse_x=x)
         _kernel_path = _CK is not None and self.cfg.kind in ('csa', 'hca') and _CK.kernel_enabled()
-        # Optional batched eager path: the reference twin already consumes
-        # [B, T, ...] and issues batch GEMMs, so a multi-row run can avoid the
-        # per-row launch loop without changing any default behaviour.  Opt in
-        # with CSA_EAGER_BATCH=1 (requires CUDA; values follow the declared
-        # reference-backend tolerance, not the eager bitwise contract).
+        # Optional batched eager path: the reference twin consumes
+        # [B, T, ...] and issues batch GEMMs.  Opt in with CSA_EAGER_BATCH=1
+        # (requires CUDA; values follow the declared reference-backend
+        # tolerance, not the eager bitwise contract).
         _eager_batch = (_CK is not None and not _kernel_path
                         and x.device.type == 'cuda' and B > 1
                         and self.cfg.kind in ('csa', 'hca')
@@ -3762,9 +3751,9 @@ def _array_file_path(arr):
     """Resolve the on-disk file backing a memmap (or a whole-file view of one).
 
     The huge FineWeb caches are served as read-only memmap views; a sidecar
-    fingerprint next to that file lets every worker reuse the parent's digest
-    instead of re-reading the whole corpus, while remaining bound to the
-    file's size+mtime so a rebuilt cache can never reuse a stale digest.
+    fingerprint next to that file lets every worker reuse the parent's digest,
+    while remaining bound to the file's size+mtime so a rebuilt cache can never
+    reuse a stale digest.
 
     Only the root logical memmap (the deepest memmap in arr's base chain) may
     supply the sidecar.  `arr` must then have that root's exact layout and data
@@ -3806,8 +3795,8 @@ def _cache_file_sigs(paths):
 
     size+mtime alone can be preserved when a file is replaced by a same-size
     copy (or copied with ``cp -p``).  ``ctime`` cannot be set by user code and
-    the inode changes on replacement, so a stale/mixed file no longer matches
-    its recorded signature; the content fingerprint sidecars
+    the inode changes on replacement, so a stale/mixed file does not match its
+    recorded signature; the content fingerprint sidecars
     (``*.idsfp.json``) are keyed on the same fields, so they are invalidated
     too.
     """
@@ -3845,7 +3834,7 @@ def _array_id_range(arr):
 def _ids_fp(train_ids):
     # Pure function of the token values, memoised on (data pointer, layout)
     # with a weak reference to the array: a dead entry can never alias a
-    # recycled pointer, and large corpora are not pinned in RAM by the cache.
+    # recycled pointer, and large corpora are not retained by the cache.
     # Same tokens in -> same digest out, always.  Sub-int32 storage (the
     # uint16 FineWeb cache) is hashed through its canonical int32 form, so a
     # corpus keeps the same fingerprint regardless of storage width.
@@ -4020,8 +4009,8 @@ def _memo_value_bytes(v):
 
 
 def _memo_put(memo, key, value, cap_items, cap_bytes=_MEMO_MAX_BYTES):
-    """Insert under a byte budget plus the historical item cap (LRU order is
-    insertion order).  A single value larger than the budget is not cached."""
+    """Insert under a byte ceiling plus the item cap (LRU order is insertion
+    order).  A single value larger than the ceiling is not cached."""
     b = _memo_value_bytes(value)
     if b > cap_bytes:
         return False
@@ -4062,8 +4051,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             return _hit
         print('[data] loading cached token ids ...')
         # Serve the train ids as a read-only mapping so every process (and the
-        # parallel workers' corpus cache) shares the OS page cache instead of
-        # holding a private in-RAM copy of the whole corpus.
+        # parallel workers' corpus cache) shares the OS page cache.
         train_ids = np.load(tr_path, mmap_mode='r')
         meta = json.load(open(me_path, encoding='utf-8'))
         val_batch = np.load(va_path)
@@ -4124,14 +4112,13 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             raise last_err if last_err is not None else RuntimeError('load_wikitext: no dataset repository could be loaded')
     if not hasattr(ds, '__getitem__') or 'train' not in ds or 'validation' not in ds:
         raise TypeError(f"load_wikitext: the loaded corpus object does not expose the ['train']/['validation'] splits (got {type(ds).__name__}); refusing to tokenise a corpus we cannot identify")
-    # Tokenizer fit is a frozen TRAIN prefix with an explicit token budget:
+    # Tokenizer fit is a frozen TRAIN prefix with an explicit token cap:
     # every document it sees is also inside the model's training region (for
-    # caps below the global budget), never a validation/test row.  The budget
+    # caps below the global cap), never a validation/test row.  The cap
     # is fixed across the scale ladder so S1/S2/S3 share one tokenizer version.
     _fit_cap = min(int(TOKENIZER_FIT_TOKENS), int(n_train_tokens))
-    # Only the frozen prefix is needed for the tokenizer fit; materialising the
-    # entire train split's text (WikiText-103 is ~100M tokens) would double the
-    # cold-build peak for no benefit.
+    # Only the frozen prefix is needed for the tokenizer fit; the rest of the
+    # train split's text does not enter the fit.
     _fit_rows_all = []
     _n_train_rows = len(ds['train'])
     _row_step = 5000
@@ -4150,7 +4137,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     fit_fp = _text_fp(fit_text)
     _dedup = _DocDeduplicator()
     # Seed the deduplicator with the FULL rows of the fit prefix.  The token
-    # budget may truncate the text of the final fit row; seeding with the
+    # cap may truncate the text of the final fit row; seeding with the
     # truncated view would leave that training document absent from the exact
     # duplicate index, so a full copy in validation/test could slip through.
     _fit_doc_prefix = list(_fit_rows_all[:len(fit_text)])
@@ -4167,9 +4154,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     def stream_tokenise(split, cap_tokens, label, _ds=ds, _tok=tok, _eos=eos_id,
                         _dtype=np.int32):
         # Write directly into one preallocated array: the corpus cap is the
-        # target size, and the old list-of-chunks form held every chunk plus
-        # the concatenated copy at peak.  The integer values and the
-        # [:cap_tokens] truncation are identical to the per-`encode` form.
+        # target size.  The integer values and the [:cap_tokens] truncation are
+        # identical to the per-`encode` form.
         cap_tokens = max(0, int(cap_tokens))
         arr = np.empty(cap_tokens, dtype=_dtype)
         cursor = 0
@@ -4355,7 +4341,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
     只读 wiki.test.raw（本地 dump 或 HF test split），绝不触碰 train/validation，
     因此可作冻结后的独立最终评估数据（design_notes §17 的「未参与方法选择的
     数据」）。与 load_wikitext 同一套纪律：npy 缓存 + sha256 内容指纹 + 原子写；
-    分词器使用与主语料完全相同的冻结 train-prefix token 预算（预算记录在
+    分词器使用与主语料完全相同的冻结 train-prefix token 上限（上限记录在
     train cache meta 中）重建，并把拟合语料指纹存进 meta 以供审计。构建
     test 缓存时，与 training documents 完全相同或近重复（SimHash）的 test
     文档会在 tokenisation 前被剔除并记录数量，从而冻结一个去重后的评估
@@ -4453,7 +4439,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
             raise last_err if last_err is not None else RuntimeError('load_wikitest: no test-split source available (local dump wiki.test.raw or the HF dataset)')
         test_rows = ds['test']['text']
     # tokenizer: identical frozen-train-prefix fit to load_wikitext.  The
-    # token budget is taken from the paired train cache when it is unique, so
+    # token cap is taken from the paired train cache when it is unique, so
     # the test tokenizer is an exact function of the same train region.
     import glob as _glob
     _fit_cap = int(TOKENIZER_FIT_TOKENS)
@@ -4677,7 +4663,7 @@ def _fineweb_local_source_fingerprint(env_value):
     cache meta; it cannot see that the *source* files changed.  The signature
     changes whenever a source file is added/removed/replaced — ctime/inode
     catch even a same-size replacement that preserves mtime — so a rebuilt
-    cache is non-confusable with an older one."""
+    cache is non-confusable with a stale one."""
     files = _fineweb_local_files(env_value)
     if not files:
         return None
@@ -4709,7 +4695,7 @@ def _doc_simhash(text, *, shingle_words=5, max_shingles=128):
     """Deterministic 64-bit SimHash over word shingles (near-duplicate key).
 
     The shingle set is sub-sampled on an evenly spaced grid so very long
-    documents cost a bounded amount; the same text always yields the same hash
+    documents stay bounded; the same text always yields the same hash
     across processes (blake2b, no Python salted hash).
     """
     words = re.findall(r"[\w']+", str(text).lower())
@@ -4812,13 +4798,11 @@ TOKENIZER_FIT_TOKENS = 8_000_000
 def _wikitext_fit_rows(rows, vocab_size, token_cap, max_rows=50000):
     """Select a deterministic train-prefix fit corpus within ``token_cap``.
 
-    The old code always fitted the tokenizer on up to 50k train rows, which can
-    extend past the model's token cap (and therefore past the corpus the model
-    actually trains on).  Here the candidate prefix is measured with the
-    tokenizer it is used to build; rows (or, for a single oversized row, the
-    row text) beyond the budget are shortened and the tokenizer is rebuilt
-    until the final fit text itself fits inside the cap.  The result is a
-    prefix of the train split, so it can never include validation/test text.
+    The candidate prefix is measured with the tokenizer it is used to build;
+    rows (or, for a single oversized row, the row text) beyond the cap are
+    shortened and the tokenizer is rebuilt until the final fit text itself
+    fits inside the cap.  The result is a prefix of the train split, so it can
+    never include validation/test text.
     """
     total = min(len(rows), int(max_rows))
     if total <= 0 or int(token_cap) <= 0:
@@ -4826,13 +4810,12 @@ def _wikitext_fit_rows(rows, vocab_size, token_cap, max_rows=50000):
     fit_text = list(rows[:total])
     tok = None
     n_tok = 0
-    # BPE training + a full encode are linear in the fit corpus.  The old loop
-    # retrained both up to 24 times whenever the first estimate exceeded the
-    # cap.  The first over-budget measurement already yields the token/row (or
-    # token/char) ratio; a conservative prefix from that ratio converges in
-    # one rebuild for realistic text, and a small pass cap guards against a
-    # pathological vocabulary.  Never return a fit corpus that exceeds the
-    # advertised token budget.
+    # BPE training + a full encode are linear in the fit corpus.  The first
+    # measurement already yields the token/row (or token/char) ratio; a
+    # conservative prefix from that ratio converges in one rebuild for
+    # realistic text, and a small pass cap guards against a pathological
+    # vocabulary.  Never return a fit corpus that exceeds the advertised
+    # token cap.
     for _pass in range(8):
         tok = build_tokenizer(fit_text, vocab_size)
         n_tok = int(sum(len(enc.ids) + 1 for enc in tok.encode_batch(fit_text))) if fit_text else 0
@@ -4852,7 +4835,7 @@ def _wikitext_fit_rows(rows, vocab_size, token_cap, max_rows=50000):
             fit_text = [text[:new_len]]
     raise RuntimeError(
         f'_wikitext_fit_rows: could not shrink the tokenizer-fit corpus to the '
-        f'{int(token_cap)}-token budget (last measured {int(n_tok)} tokens)')
+        f'{int(token_cap)}-token cap (last measured {int(n_tok)} tokens)')
 
 def _fineweb_local_rows(env_value):
     """Offline FineWeb-Edu stand-in: FWEDU_LOCAL_JSONL lists files or
@@ -4929,7 +4912,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         to int64 per batch exactly as the int64 corpora always did, so yielded
         batches are bit-identical to the int64-storage form;
       - the corpus is built in one streaming pass: the tokenizer-fit documents
-        are the TRAIN PREFIX (bounded by a frozen token budget), then train
+        are the TRAIN PREFIX (bounded by a frozen token cap), then train
         tokens continue up to n_train_tokens + seq_len, then the validation
         holdout draws val_seqs*seq_len + seq_len tokens from documents strictly
         after the train region.  Exact and near-duplicate documents are removed
@@ -5029,7 +5012,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         _fit_candidates, vocab_size, _fit_cap, max_rows=len(_fit_candidates))
     if tok is None or not fit_text:
         raise RuntimeError('load_fineweb_edu: no non-empty documents are available for the tokenizer fit')
-    # Keep only the documents that survived the token budget; they form the
+    # Keep only the documents that survived the token cap; they form the
     # train prefix below, so the tokenizer's fit corpus is a subset of the
     # corpus the model actually sees.
     fit_pairs = fit_pairs[:len(fit_text)]
@@ -5053,9 +5036,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     n_train_total = 0
     n_val_total = 0
     _marks = 0
-    # Compact document-id accumulators: a Python list of int objects costs
-    # ~28-32 bytes per document; an unsigned-64 array stores the same ids in
-    # 8 bytes and converts to NumPy without an object-by-object pass.
+    # Compact document-id accumulators: an unsigned-64 array converts to
+    # NumPy without an object-by-object pass.
     import array as _array_mod
     train_doc_ids = _array_mod.array('Q')
     val_doc_ids = _array_mod.array('Q')
@@ -5649,7 +5631,7 @@ _GPU_CORPUS_CACHE_BYTES = 64 << 20
 
 
 def _gpu_corpus_cache_fits(nbytes, device):
-    """Reserve the corpus cache only when it also fits the current free VRAM."""
+    """Reserve the corpus cache only when it also fits the current free device capacity."""
     if int(nbytes) > _GPU_CORPUS_CACHE_BYTES:
         return False
     try:
@@ -5676,9 +5658,8 @@ def _ids_narrow(train_ids):
         return _hit[1]
     _path = getattr(train_ids, 'filename', None)
     if _path and train_ids.size:
-        # A disk-backed corpus is mapped read-only.  Materialising an int32
-        # copy in every worker would multiply host memory by the worker count;
-        # build one shared int32 sidecar next to the cache instead and map it.
+        # A disk-backed corpus is mapped read-only.  Workers share one int32
+        # sidecar next to the cache.
         try:
             _st = os.stat(_path)
             # Bind the sidecar to the same identity fields the cache loaders
@@ -8173,7 +8154,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     selected config that really is the best recorded trial, and a
     `selected_metric_value` that is the value of **that** config (not merely
     the minimum of some other trial).  When trial records expose
-    steps/tokens_seen, the training budget must also agree across arms.  When
+    steps/tokens_seen, the training allocation must also agree across arms.  When
     they expose `seeds` / `seed_ppls`, the aggregate must be the mean of those
     per-seed values and every arm must select on the same search-seed set —
     otherwise one arm's winner can be a noise draw even though lr grids match.
@@ -10073,12 +10054,12 @@ _EVAL_TOKENS_PER_CHUNK = 1 << 17
 def _eval_row_working_bytes(model, T, d, elem_size, bytes_per_value=8):
     """Conservative per-row activation/workspace estimate for one eval row.
 
-    The dense `T*d` term is only the hidden-state floor.  Long-sequence peak
-    memory is usually set by the attention workspace instead: a full/sink head
-    materialises [nh, rows, T] logits, the CSA indexer scores [T, B_blocks,
+    The dense `T*d` term is only the hidden-state floor.  Long-sequence
+    workspace is usually set by the attention workspace instead: a full/sink
+    head materialises [nh, rows, T] logits, the CSA indexer scores [T, B_blocks,
     nIH], and HCA's arange expansion is [T, B_blocks].  Estimate the largest of
-    those per layer (layers run one at a time under inference_mode) instead of
-    pretending the hidden state is the whole cost."""
+    those per layer (layers run one at a time under inference_mode) rather than
+    the hidden state alone."""
     T = max(1, int(T))
     d = max(1, int(d))
     elem = max(1, int(elem_size))
@@ -10133,7 +10114,7 @@ def _eval_row_working_bytes(model, T, d, elem_size, bytes_per_value=8):
 
 
 def _eval_adaptive_chunk(model, val_batch, device, chunk, _free_frac=0.5, _bytes_per_value=8):
-    """Bound an evaluation chunk by both token count and currently-free VRAM.
+    """Bound an evaluation chunk by both token count and currently-free device capacity.
 
     Rows are independent, so the partition changes no value; it only keeps a
     long-sequence eval from launching a chunk whose attention/indexer
@@ -10387,8 +10368,7 @@ class _BlockStats:
         self.hi = None
         self.at_min = 0
         self.at_max = 0
-        # GPU counts are queued and folded once (one D2H) instead of
-        # synchronising after every row/layer during the report forward.
+        # GPU counts are queued and folded once at report time.
         self._pending = []
 
     def snapshot(self):
@@ -11050,7 +11030,7 @@ def training_knobs_fingerprint():
     eps, LR-schedule shape, grad-clip or augmentation.  Those live in the
     per-record `train_knobs` copy, which `pair_reason` checks at analysis
     time.  Putting this digest in the resume fingerprint makes a changed
-    descriptor invalidate the old cells just like a changed lr.
+    descriptor invalidate earlier cells just like a changed lr.
     Unset/legacy fingerprints simply decode without a `tk` field.
     """
     blob = json.dumps(training_knobs(), sort_keys=True, separators=(',', ':'),
@@ -11133,7 +11113,7 @@ def _write_cell_curve(outdir, key, rec):
     """Move per-cell curve arrays out of the shared summary file.
 
     The summary is rewritten (and re-parsed) under the panel lock after every
-    cell; embedding a 200k-point loss curve makes that cost grow with
+    cell; embedding a 200k-point loss curve makes that work grow with
     cells x curve length.  Each cell's arrays go to its own sidecar and the
     summary keeps only scalar metadata plus a reference."""
     losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
@@ -11213,9 +11193,8 @@ def _amp_requested():
     """Opt-in mixed-precision mode for the training path.
 
     ``CSA_AMP=bf16`` keeps fp32 master parameters and runs the forward/loss
-    under autocast bf16 (the scale panel's memory/throughput assumption);
-    ``CSA_AMP=fp16`` additionally uses a GradScaler.  Unset means the
-    historical pure-fp32 path, so existing records stay comparable."""
+    under autocast bf16; ``CSA_AMP=fp16`` additionally uses a GradScaler.
+    Unset means the pure-fp32 path, so existing records stay comparable."""
     v = os.environ.get('CSA_AMP', '').strip().lower()
     if v in ('', '0', 'false', 'no', 'off'):
         return None
@@ -11288,8 +11267,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # deque with a fixed capacity; the window contents are identical.
     _tail = collections.deque(maxlen=50)
     # Loss scalars are copied to a pinned host buffer asynchronously as they
-    # are produced; the flush waits on one event instead of stacking on the
-    # GPU and synchronising at every log point.
+    # are produced, then flushed once.
     _loss_stage = None
     _loss_ev = None
     if device.type == 'cuda':
@@ -11337,8 +11315,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 truncated = True
                 break
             if device.type == 'cuda' and step and step % 256 == 0:
-                # Re-sample free memory periodically instead of freezing the
-                # chunk size from the state at cell start.
+                # Re-sample free memory periodically.
                 _attb_bump_epoch()
             base = lr_at(step)
             for g, _ls in zip(opt.param_groups, _lr_scales):
@@ -11488,7 +11465,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if _dist and _world > 1:
         torch.distributed.barrier()
     # Keep the caching allocator's blocks for the next cell in this process;
-    # only OOM-recovery paths return memory to the driver.
+    # only OOM-recovery paths clear the allocator cache.
     return result
 
 @torch.no_grad()
@@ -11876,7 +11853,7 @@ def probe_seq_len(seq_len, *, min_blocks=128, cap=256):
 
     A 64-token probe never exercises the real block geometry (max_block=128,
     HCA block_size=64).  Use the panel's own length up to ``cap`` so at least
-    one multi-block schedule is covered without paying the full scale cost;
+    one multi-block schedule is covered without running the full-scale probe;
     short panels keep their own (already short) length.  ``cap`` can be
     overridden with ``CSA_PROBE_SEQ``.
     """
@@ -11898,8 +11875,8 @@ def overfit_reports_for(variants, *, source=None, probe_semantics=None, probe_ke
     """Exact-match evidence recovery for a panel.
 
     `run()` must persist only the probes that certify the CURRENT config: a
-    report from an older/looser probe previously written into the process cache
-    must not be attached to a new panel.  Matching is by probe semantics
+    report written under different or looser settings must not be attached to a
+    new panel.  Matching is by probe semantics
     (architecture/MLP/steps/targets/ignore-index), optional source and data
     fingerprint, and optionally the full probe digest."""
     _want = set(variants)
@@ -12706,9 +12683,8 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     nll_col = nll_mat.sum(axis=0)
     ntok_col = ntok_mat.sum(axis=0)
     vals = np.empty(int(n_boot), dtype=float)
-    # Multinomial bootstrap counts replace one advanced-index allocation per
-    # draw: a single [chunk, R] count matrix is reused, so cost and memory stay
-    # O(chunk*R) instead of O(n_boot*S*R) temporary gathers.
+    # Multinomial bootstrap counts: a single [chunk, R] count matrix is reused
+    # across draws.
     _chunk = 256
     _b = 0
     while _b < int(n_boot):
@@ -13552,7 +13528,7 @@ def _is_confirmatory_cfg(cfg):
 
     An explicit ``require_repro``/``confirm`` flag always wins; otherwise the
     B-tier scale geometry (d>=512, multiple seeds) is treated as confirmatory.
-    Small exploratory/test panels keep the cheaper advisory path."""
+    Small exploratory/test panels keep the advisory path."""
     for _k in ('confirm', 'confirmation', 'require_repro'):
         if cfg.get(_k) is not None:
             return bool(cfg.get(_k))
@@ -13589,7 +13565,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     # change a recorded cell; it only closes an unseeded first-build path.
     set_seed(_first_seed)
     # The probe uses the panel's REAL architecture/MLP and a length that
-    # exercises the block geometry (not the old fixed seq=64 tiny proxy).
+    # exercises the block geometry rather than a fixed 64-token proxy.
     _probe_seq = probe_seq_len(cfg.get('seq_len', 64))
     _probe_steps = 200
     _probe_batch = 2
@@ -13701,7 +13677,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         # The guard is process-cached (correctly, so repeated phases do not
         # retrain the probe).  Recover THIS exact probe configuration's
         # evidence from the cache so a fresh outdir still gets a persisted
-        # sanity record; an older/looser probe must never certify this panel.
+        # sanity record; a looser probe must never certify this panel.
         _sem_by_v = {v: _overfit_probe_semantics(_data_probe_cfg(v)) for v in _variants}
         _sanity = []
         for (_v, _src, *_rest), _r in _OVERFIT_REPORTS.items():
@@ -13800,8 +13776,8 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             module = _par_ctx.get('module') or (_caller if _caller and _caller != '__main__' else 'exp_lib')
             jobs = [dict(kind='run', module=module, label=label, cfg=cfg, v=v, seed=seed, guard_cap=(guard.cap_spec() if guard is not None else None), ckpt_flag=bool(_par_ctx.get('ckpt_flag')), ckpt_install=bool(_par_ctx.get('ckpt_install')), fp=fp, prov=prov) for v, seed in cells]
             # Children re-serve the corpus from the shared on-disk cache; the
-            # parent no longer needs its reference (or the loader memo entry)
-            # once the jobs are dispatched.
+            # parent can release its reference (and the loader memo entry) once
+            # the jobs are dispatched.
             for _memo in (_WT103_MEMO, _FWEB_MEMO):
                 for _mk, _mv in list(_memo.items()):
                     if isinstance(_mv, tuple) and _mv and _mv[0] is train_ids:

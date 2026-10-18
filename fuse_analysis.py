@@ -142,10 +142,8 @@ def _axis_steps(histories):
 def signflip(deltas):
     # Delegate to the repository-wide deterministic implementation: exact
     # enumeration up to n=20, exact meet-in-the-middle up to n=40, and a
-    # deterministic normal approximation beyond that.  The previous
-    # Monte-Carlo path for n>20 carried sampling error that was not visible
-    # to the report and could not be pooled with the exact p-values used by
-    # the other panels.
+    # deterministic normal approximation beyond that.  This keeps the result
+    # poolable with the exact p-values used by the other panels.
     r = L.exact_signflip_p([float(x) for x in np.asarray(deltas, dtype=float).reshape(-1)])
     if r.get('method') == 'none':
         return None

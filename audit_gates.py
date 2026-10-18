@@ -175,12 +175,10 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
         except Exception as e:
             out['checks']['tokenizer_vocab_identical'] = f'skipped ({type(e).__name__})'
     # d) document overlap via deterministic SLIDING shingles on the cached id
-    # matrices.  The old audit used Python's salted `hash(tuple(...))` and
-    # non-overlapping fixed blocks, so its Jaccard changed between processes and
-    # missed documents shifted by a few tokens.  This version uses a fixed
-    # polynomial rolling hash over every window, scans uniformly spaced
-    # segments across the full train stream, and reports exactly how much was
-    # scanned so a low overlap cannot be mistaken for a full-corpus proof.
+    # matrices.  A fixed polynomial rolling hash over every window, uniform
+    # segments across the full train stream, and an explicit scanned fraction
+    # keep the Jaccard estimate reproducible and prevent a low overlap from
+    # being mistaken for a full-corpus proof.
     try:
         import numpy as np
         _te_path = os.path.join(cache_dir, f'test_ids_{test_tag}.npy')

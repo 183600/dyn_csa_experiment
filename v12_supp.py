@@ -411,12 +411,11 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
         _dirty = False
         if _manifest_changed or _test_changed or _train_changed:
             print(f'[v12] WARNING: V12_REFREEZE=1 — the locked plan/test/train identity changed (manifest {lock.get("manifest_sha256")} -> {_sha}, test_ids_fp {lock.get("test_ids_fp")} -> {test_ids_fp}, train_fp {lock.get("train_fp")} -> {train_fp}); the earlier round is DOWNGRADED to exploratory and this must be recorded in the plan history')
-            # Persist the conscious re-freeze: keeping the OLD hash/fingerprints
-            # in the lock would make every later run under the new plan refuse
-            # (and would lose the fact that a refreeze happened).  The
+            # Persist the conscious re-freeze: under the new plan the lock must
+            # carry the new identity so later runs do not refuse, and the
             # superseded plan is retained for the exploratory record.  The lock
             # is written ONCE below, after every check has passed, so a failure
-            # can never leave a half-updated (new plan + old fingerprints) file.
+            # can never leave a half-updated (new plan + stale fingerprints) file.
             prev = {_k: lock.get(_k) for _k in ('manifest_sha256', 'test_ids_fp', 'train_fp', 'locked_at', 'frozen_at')}
             lock['superseded'] = list(lock.get('superseded') or []) + [prev]
             lock.update({'manifest_sha256': _sha,
@@ -686,7 +685,7 @@ def run_finaltest(cfg=None, guard=None):
     if not _smoke:
         # Near-duplicate train/test documents make a clean generalization claim
         # unavailable.  Run the same zero-GPU document-overlap gate the audit
-        # uses BEFORE spending the frozen evaluation; a policy violation stops
+        # uses BEFORE the frozen evaluation; a policy violation stops
         # the confirmation instead of leaving it as a footnote.
         try:
             import audit_gates as _AG
@@ -1008,7 +1007,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         # a paired delta is only valid on ONE held-out slice; the admission
         # gate has already enforced that EVERY admissible record shares the
         # same frozen fingerprint, so pairing cannot mix slices (and a missing
-        # fingerprint could never enter here — None==None no longer passes).
+        # fingerprint could never enter here — None==None is rejected).
         common = sorted(set(recs_a) & set(recs_b))
         if len(common) < 2:
             stats['comparisons'][name] = {'omitted': f'<2 seed pairs admissible at the frozen endpoint (a: {sorted(recs_a)}, b: {sorted(recs_b)}; whitelist {manifest["seeds"]})', 'n': 0, 'expected_sign': exp_sign}

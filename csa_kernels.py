@@ -966,8 +966,8 @@ def _indexer_impl_for_shape(impl, kI):
         # Long-context safety: Bm grows with T/block_size, so a 32k/64k eval
         # can exceed the Triton lane limit even though the sparse attention
         # itself is still linear.  Degrade explicitly to the torch-reference
-        # twin (documented, same algorithm) instead of failing the run; set
-        # CSA_INDEXER_STRICT=1 to keep the old hard failure for benchmarking.
+        # twin (documented, same algorithm); set CSA_INDEXER_STRICT=1 to
+        # reject this shape instead.
         _strict = os.environ.get('CSA_INDEXER_STRICT', '').strip().lower() in ('1', 'true', 'yes')
         if _strict:
             raise RuntimeError(

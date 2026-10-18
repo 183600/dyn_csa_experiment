@@ -423,8 +423,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 _nvalid = _nvalid_all[s:e]
                 _anyrow = None if _anyrow_all is None else _anyrow_all[s:e]
             else:
-                # Row-chunked construction instead of a full [T, topk] mask
-                # when the full-width budget is exceeded.
+                # Row-chunked construction when the full-width mask is not
+                # built.
                 sel = ((pos_all[s:e, None] > last_tok[None, :]) if _arange_sel
                        else (pos_all[s:e, None] > last_tok[topk_l[s:e]]))
                 _keep = sel_valid[s:e] if sel_valid is not None else None
@@ -2011,8 +2011,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
     _hard_max = int(getattr(model, 'max_seq', 1 << 62)) if _abs_pe else None
     # `max_pos` may only shorten the span; it can never exceed the absolute
     # position table.  Clamping here keeps every downstream slice inside the
-    # table (an oversized max_pos used to let short lengths hit trunk() beyond
-    # max_seq and long lengths score a silently invalid span).
+    # table for both short and long lengths.
     _eff_max = max_pos
     if _abs_pe and _hard_max is not None:
         _eff_max = _hard_max if max_pos is None else min(int(max_pos), _hard_max)
