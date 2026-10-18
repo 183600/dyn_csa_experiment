@@ -533,11 +533,8 @@ class HybridAttentionRoPE(L.HybridAttention):
             B, T, d = x.shape
             flat = x.reshape(B * T, d)
             pre_flat = self._pre(flat, fuse_x=x)
-            # The per-row path only reads its own [T, ...] slice of the fused
-            # projection, so keep those slices as views instead of
-            # materialising a contiguous [B, T, ...] copy of every projection
-            # (same element values, less transient memory).  _gate_signals
-            # only needs the fused table.
+            # The per-row path reads only its own [T, ...] slice of the fused
+            # projection; _gate_signals needs only the fused table.
             pre_all = None
             pres = None
             if pre_flat is not None:
@@ -552,8 +549,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                             _row[kk] = v[b]
                         else:
                             _sl = v[b * T:(b + 1) * T]
-                            # qI feeds the indexer GEMM; keep its original
-                            # contiguous layout (a tiny copy).
+                            # qI feeds the indexer GEMM, which expects a
+                            # contiguous operand.
                             _row[kk] = _sl.contiguous() if kk == 'qI' else _sl
                     pres.append(_row)
             if pres is None:

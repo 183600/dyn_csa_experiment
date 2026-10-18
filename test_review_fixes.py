@@ -245,8 +245,7 @@ def t_scaling_trend_primary_direction_and_floor():
     assert r2['significant'] is False and r2['verdict'] == 'underpowered', r2
 
     # A perfect three-point ladder is not "heterogeneous": lack-of-fit Q is
-    # zero, so the trend verdict must survive (the old grand-mean Q labelled
-    # every monotone ladder heterogeneous).
+    # zero, so the trend verdict must survive.
     r3 = L.scaling_trend(_pts(6), min_seeds=3, min_points=3)
     assert r3['heterogeneity']['Q'] == 0.0 and r3['heterogeneity']['I2_percent'] == 0.0, r3['heterogeneity']
     assert r3['significant'] is True and r3['verdict'] == 'effect_increases_with_scale', r3
@@ -1738,16 +1737,14 @@ def t_simple_baseline_ngram_and_audit():
     r2 = L.simple_baseline_audit(bad2, protocol=proto)
     assert r2['baseline_verified'] is False and any('missing' in p for p in r2['problems']), r2
     # A flat 1-D evaluation stream is ONE row: only its first token is
-    # unconditioned.  Scoring the whole stream as row-first tokens too used to
-    # double-count every token and inflate PPL by orders of magnitude.
+    # unconditioned, and the two call forms must score the same tokens.
     flat = val[0]
     for order, lam in ((2, 0.5), (2, 1.0)):
         two_d = L.ngram_lm_score(train, val[:1], vocab, order=order, alpha=0.1, interpolation=lam)
         one_d = L.ngram_lm_score(train, flat, vocab, order=order, alpha=0.1, interpolation=lam)
         assert abs(two_d['nll'] - one_d['nll']) < 1e-12, (order, lam, two_d, one_d)
         assert abs(two_d['ppl'] - one_d['ppl']) < 1e-9, (order, lam, two_d, one_d)
-    # interpolation=0 must reduce to the unigram model, not to a PPL computed
-    # from the row-first tokens alone.
+    # interpolation=0 must reduce to the unigram model.
     uni = L.ngram_lm_score(train, val, vocab, order=1, alpha=0.1)
     zero = L.ngram_lm_score(train, val, vocab, order=2, alpha=0.1, interpolation=0.0)
     assert abs(uni['nll'] - zero['nll']) < 1e-12 and abs(uni['ppl'] - zero['ppl']) < 1e-9, (uni, zero)
@@ -1755,7 +1752,7 @@ def t_simple_baseline_ngram_and_audit():
 
 def t_simple_baseline_driver_serves_the_panel_corpus():
     # `run_simple` must go through load_run_corpus (the panel's dataset) and
-    # must not raise NameError while fingerprinting the validation slice.
+    # fingerprint the validation slice.
     rng = np.random.default_rng(3)
     train = rng.integers(0, 24, size=400)
     val = rng.integers(0, 24, size=(2, 9))
@@ -2119,7 +2116,7 @@ def main():
     _check('H4 tuned count-model floor + audit', t_simple_baseline_ngram_and_audit)
     _check('H5 positive-label / rare-positive PR-AUC / macro-F1 averaging', t_classification_positive_label_and_rare_floor)
     _check('H6 hypothesis completeness + metric alignment + direction=0', t_hypothesis_audit_completeness_and_metric_alignment)
-    _check('H7 simple-baseline driver uses the panel corpus (no NameError)', t_simple_baseline_driver_serves_the_panel_corpus)
+    _check('H7 simple-baseline driver uses the panel corpus', t_simple_baseline_driver_serves_the_panel_corpus)
     _check('H8 leakage audit handles a flat 1-D train cache', t_audit_leakage_handles_flat_train_cache)
     _check('H9 fuse sample_std accepts negative axes', t_fuse_sample_std_negative_axis)
     _check('I1 chronological split contract', t_leakage_safe_split_contract)

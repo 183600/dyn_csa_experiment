@@ -133,7 +133,7 @@
         "precondition_verified": "no test-split evaluation had occurred at revision time: results_lm_test/ has never existed on any machine, no P5T/phase commit exists in git history, and load_wikitest had never been called by any driver"
       }
     ],
-    "rule": "any further revision requires either (a) proof that no test-split access has occurred (git history + absent lock + absent bylen records), or (b) V12_REFREEZE=1 after access, which permanently downgrades the earlier round to exploratory in DECISION_LOG.md"
+    "rule": "any further revision requires either (a) proof that no test-split access has occurred (git history + absent lock + absent bylen records), or (b) V12_REFREEZE=1 after access, which permanently downgrades the earlier round to exploratory in the plan history above"
   },
-  "history_note": "v1 frozen 2026-10-16 in the commit that introduced v12_supp.py; v2 revised 2026-10-17 in the review-2 fixes commit (see DECISION_LOG.md). The test split has never been read by the codebase before (README previously documented only train/valid)."
+  "history_note": "v1 frozen 2026-10-16 in the commit that introduced v12_supp.py; v2 revised 2026-10-17 in the review-2 revision commit (see the plan history above). The test split has never been read by the codebase before (earlier documentation covered only train/valid)."
 }

@@ -843,12 +843,10 @@ _WINDOW_MASK_CACHE = {}
 _WINDOW_MASK_BUDGET_BYTES = 64 << 20
 
 def _window_attn_mask(T, window, s, e, lo, device, dtype):
-    # The row-chunk mask is a pure function of (T, window, s, e, lo, dtype,
-    # device): the same chunk of every layer/step reads the identical 0.0/-inf
-    # table.  Caching it keeps the transient allocation to the first build and
-    # lets later passes reuse the read-only tensor (SDPA never mutates the
-    # mask).  Built outside inference mode so a table first created during
-    # eval remains a normal tensor for a later training recompute.
+    # Row-chunk mask: a pure function of (T, window, s, e, lo, dtype, device),
+    # so every layer/step reuses the same read-only 0.0/-inf table (SDPA never
+    # mutates the mask).  Built outside inference mode so a table first created
+    # during eval remains a normal tensor for a later training recompute.
     key = (_dev_str(device), 'winmask', int(T), int(window), int(s), int(e), int(lo), str(dtype))
     mask = _WINDOW_MASK_CACHE.get(key)
     if mask is None:
@@ -856,9 +854,8 @@ def _window_attn_mask(T, window, s, e, lo, device, dtype):
             pos = _arange_cache(int(T), device)
             qpos = pos[s:e, None]
             kpos = pos[lo:e][None, :]
-            # Build the additive mask directly: fill the allowed
-            # causal-window lanes with 0.0 instead of materialising (and then
-            # negating) a second temporary boolean table.
+            # Build the additive mask: set the allowed causal-window lanes to
+            # 0.0 and the remaining lanes to -inf.
             mask = torch.full((e - s, e - lo), float('-inf'), device=device, dtype=dtype)
             mask.masked_fill_((kpos <= qpos) & (kpos > qpos - int(window)), 0.0)
         _cache_put(_WINDOW_MASK_CACHE, key, mask, _WINDOW_MASK_BUDGET_BYTES, _mask_cache_total)
@@ -884,12 +881,10 @@ def _window_attn_local_impl(q, k, v, window, scale):
     return out
 
 def _window_attn_local(q, k, v, window, scale):
-    # One checkpoint around the whole row loop instead of one per row chunk:
-    # the recomputed function is the same pure row partition, so values and
-    # gradients are unchanged, while a long sequence no longer creates one
-    # autograd/checkpoint node (and one saved-input tuple) per chunk.  The
-    # row chunk is recomputed from the same deterministic budget, so backward
-    # reproduces the forward partition exactly.
+    # Checkpoint the whole row loop: the recomputed function is the same pure
+    # row partition, so values and gradients are unchanged.  The row chunk is
+    # recomputed from the same deterministic budget, so backward reproduces the
+    # forward partition exactly.
     if torch.is_grad_enabled() and q.requires_grad:
         return torch.utils.checkpoint.checkpoint(
             _window_attn_local_impl, q, k, v, int(window), scale,
@@ -2522,11 +2517,10 @@ class HybridAttention(nn.Module):
             mask = None
         sink_view = torch.nan_to_num(self.sink).view(1, self.nh, 1, 1) if self.sink is not None else None
         row_chunk = _full_attn_row_chunk(x.device, B, self.nh, T, q.element_size())
-        # 训练时整段注意力循环包一层非重入 checkpoint（而不是每个行块一层）：
-        # 反向仍按同一份纯行划分重算，值/梯度不变；长序列下的 checkpoint
-        # 节点数与保存的输入元组从「每块一份」降为「整段一份」。
-        # row_chunk 在运行内经 _ATB_EPOCH 不变，mask 是缓存的常量张量，
-        # 因此重算的块边界与中间值逐位相同（同 ce_loss 分块重算的论证）。
+        # 训练时整段注意力循环包一层非重入 checkpoint：反向按同一份纯行划分
+        # 重算，值/梯度不变。row_chunk 在运行内经 _ATB_EPOCH 不变，mask 是
+        # 缓存的常量张量，因此重算的块边界与中间值逐位相同（同 ce_loss
+        # 分块重算的论证）。
         if torch.is_grad_enabled() and q.requires_grad:
             out = torch.utils.checkpoint.checkpoint(
                 self._sink_attn_loop, q, k, v, mask, _use_full_mask, sink_view,
@@ -2930,12 +2924,8 @@ class HybridAttention(nn.Module):
                 _cols = {kk: (None if v is None else v.unbind(0)) for kk, v in pre_all.items()}
                 pres = [{kk: (None if vv is None else vv[b]) for kk, vv in _cols.items()} for b in range(B)]
             else:
-                # The eager row path only reads its own [T, ...] slice of the
-                # fused projection.  Slicing the flat output per row keeps
-                # those as views instead of materialising a contiguous
-                # [B, T, ...] copy of every projection (the reshape of a
-                # non-contiguous column slice always allocates).  The element
-                # values fed to _single are unchanged.
+                # The eager row path reads only its own [T, ...] slice of the
+                # fused projection; each row is sliced from the flat output.
                 pre_all = {'fused': pre_flat.get('fused')}
                 pres = []
                 for b in range(B):
@@ -2947,9 +2937,8 @@ class HybridAttention(nn.Module):
                             _row[kk] = v[b]
                         else:
                             _sl = v[b * T:(b + 1) * T]
-                            # qI feeds the indexer GEMM; keep its pre-change
-                            # contiguous layout (a tiny copy) so the GEMM sees
-                            # exactly the same operand strides as before.
+                            # qI feeds the indexer GEMM, which expects a
+                            # contiguous operand.
                             _row[kk] = _sl.contiguous() if kk == 'qI' else _sl
                     pres.append(_row)
         if pres is None:
@@ -5428,10 +5417,8 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out['interaction_extremes'] = inter
     # Heterogeneity is the LACK OF FIT around the fitted slope, not the spread
     # of the point means around their grand mean: a clean monotone ladder has
-    # a large grand-mean Q by construction, so the old form labelled every
-    # k>=3 trend "heterogeneous" even when every point sat exactly on the
-    # line.  Residual Q (df=k-2) asks the question the verdict actually needs:
-    # is a single slope an adequate summary?
+    # a large grand-mean Q by construction.  Residual Q (df=k-2) asks the
+    # question the verdict needs: is a single slope an adequate summary?
     if k >= 2:
         q = float((n * resid ** 2).sum())
         dfh = k - 2
@@ -5934,8 +5921,7 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
         raise ValueError('interpolation must be in [0, 1]')
     # First token of each row: unigram only (no cross-row conditioning).  A
     # 1-D evaluation stream is ONE row, so only its first token is
-    # unconditioned; scoring the whole stream here as well as in the bigram
-    # term below would double-count every token.
+    # unconditioned; the remaining tokens are scored by the conditional term.
     first = np.asarray(eval_ids, dtype=np.int64)
     first = first[:1] if first.ndim == 1 else first[:, 0]
     first = first.ravel()
@@ -5952,8 +5938,7 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
             p = lam * p_bg + (1.0 - lam) * uni_prob[nxt]
         else:
             # interpolation=0 is the pure unigram model: the conditional
-            # term must still contribute, otherwise only the row-first
-            # tokens are scored and the reported PPL collapses towards 1.
+            # term contributes the unigram probability of every other token.
             p = uni_prob[nxt]
         nll_sum += float(-np.log(np.maximum(p, np.finfo(float).tiny)).sum())
     n_tokens = int(all_eval.size)
@@ -5990,9 +5975,8 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
                               'trials': rows,
                               'order': order}
     best_arm = min(trials_by_arm, key=lambda a: float(trials_by_arm[a]['selected_metric_value']))
-    # Do not widen the (possibly memory-mapped, 5B-token) training stream to
-    # int64 just to fingerprint it: `_ids_fp` hashes the canonical chunked
-    # form of any integer width and accepts the memmap directly.
+    # `_ids_fp` hashes the canonical chunked form of any integer width and
+    # accepts the training stream (possibly a memmap) directly.
     train_arr = np.asarray(train_ids)
     if not np.issubdtype(train_arr.dtype, np.integer):
         raise TypeError(f'ngram baseline: train ids must be integers, got dtype {train_arr.dtype}')
@@ -7461,10 +7445,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         report['ablation_completeness'] = ablation_completeness_audit(_scoped_design, _present_set)
         report['ablation_complete'] = bool(report['ablation_completeness'].get('complete'))
         # Top-level alias: `audit_gates.py methodology` and downstream readers
-        # consume `incomplete_components` from the audit report.  Leaving the
-        # initializer's empty list in place made a partial leave-one-out panel
-        # look complete even while `ablation_completeness` named the missing
-        # arm.  Keep both views consistent.
+        # consume `incomplete_components` from the audit report, so both views
+        # must stay consistent.
         report['incomplete_components'] = list(
             report['ablation_completeness'].get('incomplete_components') or [])
         report['missing_ablation_arms'] = dict(

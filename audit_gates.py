@@ -141,10 +141,8 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
             tr = np.load(_tr[0])[: 4000000]  # fixed-size train-side sample
             def _shingles(mat, k, cap_rows):
                 # The training cache is a flat 1-D token stream while the test
-                # cache is 2-D; treating the 1-D stream as one row keeps the
-                # shingle scan defined for both shapes (previously it raised
-                # `TypeError: object of type 'int' has no len()` and the whole
-                # overlap check was reported as failed).
+                # cache is 2-D; treat the 1-D stream as one row so the shingle
+                # scan is defined for both shapes.
                 mat = np.asarray(mat)
                 if mat.ndim == 1:
                     mat = mat.reshape(1, -1)

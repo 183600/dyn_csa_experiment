@@ -338,9 +338,8 @@ def run_simple(base_cfg=None, outdir='results_baseline_tuning', protocol=None):
     """
     base = dict(L.RUN if base_cfg is None else base_cfg)
     # Serve the corpus selected by the panel config (WikiText-103, or the
-    # B-tier FineWeb path).  Hard-wiring load_wikitext here silently measured
-    # the count-model floor on a different corpus/vocabulary than the neural
-    # panel it is meant to be compared with.
+    # B-tier FineWeb path), so the count-model floor and the neural panel use
+    # the same corpus and vocabulary.
     train_ids, val_batch, vocab, _tok, _val_bnd = L.load_run_corpus(base)
     # Match the neural panel's evaluation slice exactly: train_variant scores
     # val_batch[:eval_subset], so the count-model floor must use the same rows
