@@ -309,7 +309,7 @@ def _prefer_one_cfg(items, cfg_of, who=''):
     if dropped:
         print(f'[report] {who}: {len(dropped)} record(s) sit in a minority run_cfg group of their variant — pooling across configurations is not allowed, so one group per variant is kept (the current code stamp preferred) and the rest are dropped from this table')
     return kept
-PARAM_MATCH_TOL = 0.015
+PARAM_MATCH_TOL = 0.01  # same 1% gate as exp_lib._param_control
 PARAM_MATCH_SMALL = 0.3
 PARAM_MATCH_ARCH = 0.06
 
