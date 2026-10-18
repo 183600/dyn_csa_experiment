@@ -533,24 +533,31 @@ class HybridAttentionRoPE(L.HybridAttention):
             B, T, d = x.shape
             flat = x.reshape(B * T, d)
             pre_flat = self._pre(flat, fuse_x=x)
+            # The per-row path only reads its own [T, ...] slice of the fused
+            # projection, so keep those slices as views instead of
+            # materialising a contiguous [B, T, ...] copy of every projection
+            # (same element values, less transient memory).  _gate_signals
+            # only needs the fused table.
             pre_all = None
+            pres = None
             if pre_flat is not None:
-                pre_all = {}
-                for kk, v in pre_flat.items():
-                    if v is None:
-                        pre_all[kk] = None
-                    elif kk == 'fused':
-                        pre_all[kk] = v
-                    else:
-                        pre_all[kk] = v.reshape(B, T, *v.shape[1:])
-            # unbind hands out the same per-row views as v[b], exactly as in
-            # exp_lib.HybridAttention.forward; the views feeding _single_rope
-            # are identical.
-            if pre_all is None:
+                pre_all = {'fused': pre_flat.get('fused')}
+                pres = []
+                for b in range(B):
+                    _row = {}
+                    for kk, v in pre_flat.items():
+                        if v is None:
+                            _row[kk] = None
+                        elif kk == 'fused':
+                            _row[kk] = v[b]
+                        else:
+                            _sl = v[b * T:(b + 1) * T]
+                            # qI feeds the indexer GEMM; keep its original
+                            # contiguous layout (a tiny copy).
+                            _row[kk] = _sl.contiguous() if kk == 'qI' else _sl
+                    pres.append(_row)
+            if pres is None:
                 pres = [None] * B
-            else:
-                _cols = {kk: (None if v is None else v.unbind(0)) for kk, v in pre_all.items()}
-                pres = [{kk: (None if vv is None else vv[b]) for kk, vv in _cols.items()} for b in range(B)]
             gate_sigs = None
             pre_blocks = None
             # same value-identical hoist as exp_lib.HybridAttention.forward,

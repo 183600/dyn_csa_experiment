@@ -839,17 +839,34 @@ def _full_attn_row_chunk(device, B, nh, T, elem_size, max_rows=1024):
     per_row = max(1, 3 * int(B) * int(nh) * int(T)) * int(elem_size)
     return max(1, min(row_chunk, int(budget) // per_row))
 
+_WINDOW_MASK_CACHE = {}
+_WINDOW_MASK_BUDGET_BYTES = 64 << 20
+
+def _window_attn_mask(T, window, s, e, lo, device, dtype):
+    # The row-chunk mask is a pure function of (T, window, s, e, lo, dtype,
+    # device): the same chunk of every layer/step reads the identical 0.0/-inf
+    # table.  Caching it keeps the transient allocation to the first build and
+    # lets later passes reuse the read-only tensor (SDPA never mutates the
+    # mask).  Built outside inference mode so a table first created during
+    # eval remains a normal tensor for a later training recompute.
+    key = (_dev_str(device), 'winmask', int(T), int(window), int(s), int(e), int(lo), str(dtype))
+    mask = _WINDOW_MASK_CACHE.get(key)
+    if mask is None:
+        with torch.inference_mode(False):
+            pos = _arange_cache(int(T), device)
+            qpos = pos[s:e, None]
+            kpos = pos[lo:e][None, :]
+            # Build the additive mask directly: fill the allowed
+            # causal-window lanes with 0.0 instead of materialising (and then
+            # negating) a second temporary boolean table.
+            mask = torch.full((e - s, e - lo), float('-inf'), device=device, dtype=dtype)
+            mask.masked_fill_((kpos <= qpos) & (kpos > qpos - int(window)), 0.0)
+        _cache_put(_WINDOW_MASK_CACHE, key, mask, _WINDOW_MASK_BUDGET_BYTES, _mask_cache_total)
+    return mask
+
 def _window_attn_chunk(q_c, k, v, s, e, lo, window, scale):
     dev = q_c.device
-    pos = _arange_cache(int(k.shape[1]), dev)
-    qpos = pos[s:e, None]
-    kpos = pos[lo:e][None, :]
-    # Build the additive mask directly: fill the allowed causal-window lanes
-    # with 0.0 instead of materialising (and then negating) a second temporary
-    # boolean table.  The resulting lane values are exactly the 0.0/-inf table
-    # SDPA consumed before.
-    mask = torch.full((e - s, e - lo), float('-inf'), device=dev, dtype=q_c.dtype)
-    mask.masked_fill_((kpos <= qpos) & (kpos > qpos - int(window)), 0.0)
+    mask = _window_attn_mask(int(k.shape[1]), window, s, e, lo, dev, q_c.dtype)
     out = F.scaled_dot_product_attention(
         q_c.transpose(1, 2), k[:, lo:e].transpose(1, 2), v[:, lo:e].transpose(1, 2),
         attn_mask=mask, scale=scale)
@@ -2896,23 +2913,47 @@ class HybridAttention(nn.Module):
             return self._full_batched(x)
         flat = x.reshape(B * T, d)
         pre_flat = self._pre(flat, fuse_x=x)
+        _kernel_path = _CK is not None and self.cfg.kind in ('csa', 'hca') and _CK.kernel_enabled()
         pre_all = None
+        pres = None
         if pre_flat is not None:
-            pre_all = {}
-            for kk, v in pre_flat.items():
-                if v is None:
-                    pre_all[kk] = None
-                elif kk == 'fused':
-                    pre_all[kk] = v
-                else:
-                    pre_all[kk] = v.reshape(B, T, *v.shape[1:])
-        # unbind hands out the same per-row views as v[b]; the views feeding
-        # _single are identical.
-        if pre_all is None:
+            if _kernel_path:
+                # The kernel entry point consumes the whole [B, T, ...] batch.
+                pre_all = {}
+                for kk, v in pre_flat.items():
+                    if v is None:
+                        pre_all[kk] = None
+                    elif kk == 'fused':
+                        pre_all[kk] = v
+                    else:
+                        pre_all[kk] = v.reshape(B, T, *v.shape[1:])
+                _cols = {kk: (None if v is None else v.unbind(0)) for kk, v in pre_all.items()}
+                pres = [{kk: (None if vv is None else vv[b]) for kk, vv in _cols.items()} for b in range(B)]
+            else:
+                # The eager row path only reads its own [T, ...] slice of the
+                # fused projection.  Slicing the flat output per row keeps
+                # those as views instead of materialising a contiguous
+                # [B, T, ...] copy of every projection (the reshape of a
+                # non-contiguous column slice always allocates).  The element
+                # values fed to _single are unchanged.
+                pre_all = {'fused': pre_flat.get('fused')}
+                pres = []
+                for b in range(B):
+                    _row = {}
+                    for kk, v in pre_flat.items():
+                        if v is None:
+                            _row[kk] = None
+                        elif kk == 'fused':
+                            _row[kk] = v[b]
+                        else:
+                            _sl = v[b * T:(b + 1) * T]
+                            # qI feeds the indexer GEMM; keep its pre-change
+                            # contiguous layout (a tiny copy) so the GEMM sees
+                            # exactly the same operand strides as before.
+                            _row[kk] = _sl.contiguous() if kk == 'qI' else _sl
+                    pres.append(_row)
+        if pres is None:
             pres = [None] * B
-        else:
-            _cols = {kk: (None if v is None else v.unbind(0)) for kk, v in pre_all.items()}
-            pres = [{kk: (None if vv is None else vv[b]) for kk, vv in _cols.items()} for b in range(B)]
         gate_sigs = None
         pre_blocks = None
         # The batched gate-signal / block-geometry hoist below is value-identical
@@ -2934,7 +2975,7 @@ class HybridAttention(nn.Module):
             # paths (the cut booleans and the resulting block ids are identical
             # to the per-row form).
             pre_blocks = self._cut_blocks_batched(x)
-        if _CK is not None and self.cfg.kind in ('csa', 'hca') and _CK.kernel_enabled():
+        if _kernel_path:
             # 内核路径（CSA_KERNEL；独立变体，与 eager 统计对照，不逐位承诺）。
             # 不支持的臂在这里硬失败，绝不静默回退——否则同一面板会混入两种
             # 实现的记录。
