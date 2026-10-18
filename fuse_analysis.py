@@ -140,31 +140,16 @@ def _axis_steps(histories):
     return sorted(common)
 
 def signflip(deltas):
-    d = np.asarray(deltas, dtype=float)
-    d = d[np.isfinite(d)]
-    if d.size == 0:
+    # Delegate to the repository-wide deterministic implementation: exact
+    # enumeration up to n=20, exact meet-in-the-middle up to n=40, and a
+    # deterministic normal approximation beyond that.  The previous
+    # Monte-Carlo path for n>20 carried sampling error that was not visible
+    # to the report and could not be pooled with the exact p-values used by
+    # the other panels.
+    r = L.exact_signflip_p([float(x) for x in np.asarray(deltas, dtype=float).reshape(-1)])
+    if r.get('method') == 'none':
         return None
-    n = len(d)
-    obs = abs(d.mean())
-    if n > 20:
-        rng = np.random.default_rng(0)
-        B = 200000
-        cnt = 1
-        step = max(1, min(B, (1 << 24) // max(n, 1)))
-        for off in range(0, B, step):
-            bs = min(step, B - off)
-            signs = np.where(rng.random((bs, n)) < 0.5, 1.0, -1.0)
-            cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
-        return cnt / (B + 1)
-    total = 1 << n
-    bitpos = np.arange(n, dtype=np.int64)
-    step = max(1, min(total, (1 << 24) // max(n, 1)))
-    cnt = 0
-    for off in range(0, total, step):
-        masks = np.arange(off, min(off + step, total), dtype=np.int64)
-        signs = (((masks[:, None] >> bitpos) & 1) * 2 - 1).astype(float)
-        cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
-    return cnt / total
+    return r['p']
 
 def sample_std(deltas, axis=None):
     d = np.asarray(deltas, dtype=float)
@@ -322,17 +307,23 @@ def main(argv=None):
         d_ppl = (pa - pb)[_keep]
         d_ppl = d_ppl[np.isfinite(d_ppl)]
         if len(d_f1) and len(d_ppl):
-            p_f1 = signflip(d_f1)
-            p_ppl = signflip(d_ppl)
+            _rf1 = L.exact_signflip_p([float(x) for x in np.asarray(d_f1, dtype=float).reshape(-1)])
+            _rppl = L.exact_signflip_p([float(x) for x in np.asarray(d_ppl, dtype=float).reshape(-1)])
+            p_f1 = _rf1['p']
+            p_ppl = _rppl['p']
             _n_f1 = len(d_f1)
             lines.append(f'\n**配对精确符号翻转检验（n={_n_f1}，按 seed 配对）**：')
             if not _gate_ok:
                 lines.append(f'> 注：{len(SEEDS) - len(_ok_seeds)} 个 seed 未通过配置/训练量配对门禁（{_why}），已按本仓库惯例排除——Δ 与 p 值只在可配对的 {_ok_seeds} 上计算，跨配置的种子差不进入检验。')
             _d_f1m = d_f1.mean()
             _n_same = int(((d_f1 != 0) & ((d_f1 > 0) == (_d_f1m > 0))).sum())
-            lines.append(f'- 层均边界 F1：Δ = {_d_f1m:+.4f} ± {sample_std(d_f1):.4f}，{_n_same}/{_n_f1} 同向，p(exact) = {p_f1:.3f}')
-            _ppl_floor0 = 2.0 / (1 << len(d_ppl)) if len(d_ppl) <= 20 else 1.0 / 200001.0
-            lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p(exact) = {p_ppl:.3f}（n={len(d_ppl)} 时 p 分辨率下限 {_ppl_floor0:.3f}）\n')
+            lines.append(f'- 层均边界 F1：Δ = {_d_f1m:+.4f} ± {sample_std(d_f1):.4f}，{_n_same}/{_n_f1} 同向，p({_rf1["method"]}) = {p_f1:.3f}')
+            _n_ppl = len(d_ppl)
+            _ppl_floor0 = (2.0 / (1 << _n_ppl) if _n_ppl <= 20
+                           else (1.0 / (1 << _n_ppl) if _n_ppl <= 40 else 0.0))
+            _floor_txt = (f'（n={_n_ppl} 时 p 分辨率下限 {_ppl_floor0:.3f}）'
+                          if _ppl_floor0 > 0 else f'（n={_n_ppl} 使用确定性正态近似，无离散分辨率下限）')
+            lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p({_rppl["method"]}) = {p_ppl:.3f}{_floor_txt}\n')
         elif not _ok_seeds:
             p_f1 = p_ppl = None
             lines.append(f'\n**配对检验：未执行。** 上述两臂不满足本仓库的可配对条件（{_why}）——它们的训练配置无法证明相同，**不给出 p 值**、不进入任何显著性主张。\n')

@@ -662,7 +662,11 @@ class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
             return BlockRoPE(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
         return L.Block(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
 
-    def forward(self, ids, logits_tail=None):
+    def forward(self, ids, logits_tail=None, targets=None, vocab=None):
+        if targets is not None:
+            if vocab is None:
+                raise ValueError('forward(targets=...) requires vocab')
+            return self.ce_loss(ids, targets, vocab)
         x = self.trunk(ids)
         if logits_tail:
             x = x[:, -logits_tail:]
@@ -836,7 +840,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     # backward.  Values/gradients are unchanged; the explicit CSA_CKPT
     # setting still wins.
     _ckpt_saved = L._CKPT['on']
-    _auto_ckpt, _ = L._auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs)
+    _auto_ckpt, _ = L._auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs, n_heads=n_heads, d_head=d_head)
     if _auto_ckpt:
         L._CKPT['on'] = _auto_ckpt
     try:
@@ -2005,6 +2009,13 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
     # length must be an explicit error, never a silent last-max_pos slice.
     _abs_pe = bool(getattr(model, 'use_abs_pe', True))
     _hard_max = int(getattr(model, 'max_seq', 1 << 62)) if _abs_pe else None
+    # `max_pos` may only shorten the span; it can never exceed the absolute
+    # position table.  Clamping here keeps every downstream slice inside the
+    # table (an oversized max_pos used to let short lengths hit trunk() beyond
+    # max_seq and long lengths score a silently invalid span).
+    _eff_max = max_pos
+    if _abs_pe and _hard_max is not None:
+        _eff_max = _hard_max if max_pos is None else min(int(max_pos), _hard_max)
     _over = [int(Ln) for Ln in eval_lens
              if max_pos is None and _hard_max is not None and int(Ln) > _hard_max]
     for Ln in _over:
@@ -2013,9 +2024,9 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                              'or pass max_pos to request the explicit truncated span'),
                    'truncated': False, 'eval_span': None}
     _within = [int(Ln) for Ln in eval_lens
-               if (max_pos is None or int(Ln) <= max_pos) and int(Ln) not in _over]
+               if (_eff_max is None or int(Ln) <= _eff_max) and int(Ln) not in _over]
     _trunc_lens = [int(Ln) for Ln in eval_lens
-                   if max_pos is not None and int(Ln) > max_pos and int(Ln) not in _over]
+                   if _eff_max is not None and int(Ln) > _eff_max and int(Ln) not in _over]
     # The compression regulariser is a training side channel: disabling it for
     # scoring skips the gate-honour bookkeeping without touching any logit
     # (the block geometry is still built), exactly as eval_ppl does.
@@ -2082,13 +2093,13 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
         _val_width = int(np.asarray(val_ids).shape[1])
         for Ln in _trunc_lens:
             Ln = int(Ln)
-            trunc = max_pos is not None and Ln > max_pos
+            trunc = _eff_max is not None and Ln > _eff_max
             # Identify the actual token slice, not just its length: for
-            # Ln > max_pos the evaluation uses the LAST max_pos tokens of the
+            # Ln > _eff_max the evaluation uses the LAST _eff_max tokens of the
             # Ln-prefix, so two lengths can share a span but different rows.
             # Only genuinely identical (start, end) slices are reused.
             _end = min(Ln, _val_width)
-            _start = max(0, _end - int(max_pos)) if trunc else 0
+            _start = max(0, _end - int(_eff_max)) if trunc else 0
             _key = (_start, _end)
             _cached = _trunc_cache.get(_key)
             if _cached is not None:
@@ -2098,8 +2109,8 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                     out[Ln] = {'ppl': _cached['ppl'], 'n_tok': _cached['n_tok'], 'truncated': trunc, 'eval_span': _cached['eval_span']}
                 continue
             ids = np.asarray(val_ids[:n_seq, :Ln], dtype=np.int64)
-            if max_pos is not None and Ln > max_pos:
-                ids = ids[:, -max_pos:]
+            if trunc:
+                ids = ids[:, -int(_eff_max):]
             try:
                 x = L._h2d_async(ids, torch.int64, device)
                 nll, ntok = (torch.zeros((), dtype=torch.float64, device=device), 0)
@@ -2314,6 +2325,16 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                 continue
         _merged.update(r)
         _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE, 'recipe': _recipe, 'run_cfg': _recipe, 'eval_n_seq': n_seq}
+        _prev_resume = _cur_now if isinstance(_cur_now, dict) else {}
+        # Fail closed OUTSIDE the provenance try/except below: a validation
+        # fingerprint is NOT a training fingerprint.  Writing one here would
+        # let a later confirmation round treat the run as trained on the eval
+        # slice; retraining (which records the real corpus) is the only honest
+        # recovery.
+        _resume_fp = (_ckp_train_fp or _prev_resume.get('data_fp')) if _tr is None else None
+        if _tr is None and (not isinstance(_resume_fp, str) or not _resume_fp):
+            raise RuntimeError(
+                f'[p1l] REFUSE resume {key}: neither the checkpoint nor the existing record carries a training-corpus fingerprint (data_fp); re-run training / regenerate the checkpoint instead of relabelling the validation slice as the training corpus')
         try:
             _prov = L.experiment_provenance(_prov_cfg, train_ids=(train_ids if _tr is not None else None), val_batch=val_ids, vocab=vocab)
             _rec['provenance'] = _prov
@@ -2327,14 +2348,12 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             else:
                 # A partial resume re-evaluates only missing lengths and has no
                 # fresh training record.  Preserve the corpus/optimizer
-                # provenance of the existing record; never relabel this run as
-                # having been trained on the validation slice.
-                _prev = _cur_now if isinstance(_cur_now, dict) else {}
-                _rec['data_fp'] = (_ckp_train_fp or _prev.get('data_fp')
-                                   or _prov['data'].get('val_fp'))
+                # provenance of the existing record (the fail-closed check
+                # above already guaranteed a real training fingerprint).
+                _rec['data_fp'] = _resume_fp
                 for _kk in ('rng_fp', 'losses', 'ppl_history', 'train_knobs'):
-                    if _prev.get(_kk) is not None:
-                        _rec[_kk] = _prev[_kk]
+                    if _prev_resume.get(_kk) is not None:
+                        _rec[_kk] = _prev_resume[_kk]
             _rec['val_fp'] = _prov['data'].get('val_fp')
             _rec['data_version'] = _prov['data'].get('data_version')
             _rec.setdefault('train_knobs', (_rec.get('hyperparams') or {}).get('train_knobs') or L.training_knobs())

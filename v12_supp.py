@@ -397,15 +397,27 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
         except Exception as e:
             raise SystemExit(f'[v12] REFUSE: freeze lock {lp} exists but cannot be parsed ({type(e).__name__}: {e}) — delete it only if you can prove no test-split record was ever written under it')
         _manifest_changed = lock.get('manifest_sha256') != _sha
-        if _manifest_changed:
-            if not os.environ.get('V12_REFREEZE'):
+        _test_changed = (test_ids_fp is not None
+                         and lock.get('test_ids_fp') not in (None, test_ids_fp))
+        _train_changed = (train_fp is not None
+                          and lock.get('train_fp') not in (None, train_fp))
+        _refreeze = bool(os.environ.get('V12_REFREEZE'))
+        if (_manifest_changed or _test_changed or _train_changed) and not _refreeze:
+            if _manifest_changed:
                 raise SystemExit(f'[v12] REFUSE: the test split was already accessed under a DIFFERENT frozen manifest (lock {lp}: {lock.get("manifest_sha256")} != current {_sha}, locked_at={lock.get("locked_at")}). Changing the plan after seeing test data is selection bias by construction. To consciously re-freeze, set V12_REFREEZE=1 — the earlier round must then be reported as exploratory in the plan history.')
-            print(f'[v12] WARNING: V12_REFREEZE=1 — running under a manifest that differs from the locked one ({lock.get("manifest_sha256")} -> {_sha}); the earlier round is DOWNGRADED to exploratory and this must be recorded in the plan history')
-            # Persist the conscious re-freeze: keeping the OLD hash in the lock
-            # would make every later run under the new plan refuse (and would
-            # lose the fact that a refreeze happened).  The superseded plan is
-            # retained for the exploratory record.
-            prev = {_k: lock.get(_k) for _k in ('manifest_sha256', 'test_ids_fp', 'locked_at', 'frozen_at')}
+            if _test_changed:
+                raise SystemExit(f'[v12] REFUSE: the held-out test slice changed after the first access (lock has ids_fp {lock.get("test_ids_fp")}, current {test_ids_fp}) — the test data itself is part of the freeze; investigate before proceeding (V12_REFREEZE=1 consciously re-freezes to a new slice)')
+            raise SystemExit(f'[v12] REFUSE: the training corpus changed after the first test access (lock has train_fp {lock.get("train_fp")}, current {train_fp}) — a different training set cannot enter the frozen confirmation (V12_REFREEZE=1 consciously re-freezes to a new corpus)')
+        _dirty = False
+        if _manifest_changed or _test_changed or _train_changed:
+            print(f'[v12] WARNING: V12_REFREEZE=1 — the locked plan/test/train identity changed (manifest {lock.get("manifest_sha256")} -> {_sha}, test_ids_fp {lock.get("test_ids_fp")} -> {test_ids_fp}, train_fp {lock.get("train_fp")} -> {train_fp}); the earlier round is DOWNGRADED to exploratory and this must be recorded in the plan history')
+            # Persist the conscious re-freeze: keeping the OLD hash/fingerprints
+            # in the lock would make every later run under the new plan refuse
+            # (and would lose the fact that a refreeze happened).  The
+            # superseded plan is retained for the exploratory record.  The lock
+            # is written ONCE below, after every check has passed, so a failure
+            # can never leave a half-updated (new plan + old fingerprints) file.
+            prev = {_k: lock.get(_k) for _k in ('manifest_sha256', 'test_ids_fp', 'train_fp', 'locked_at', 'frozen_at')}
             lock['superseded'] = list(lock.get('superseded') or []) + [prev]
             lock.update({'manifest_sha256': _sha,
                          'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST),
@@ -413,26 +425,31 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
                          'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
                          'code_semantics': L.CODE_SEMANTICS,
                          'note': 're-frozen under V12_REFREEZE=1: the previous plan is downgraded to exploratory (record it in the plan history)'})
-            L.atomic_write_json(lp, lock, indent=2)
-            print(f'[v12] freeze lock UPDATED: {lp} (manifest {str(_sha)[:12]}…; {len(lock["superseded"])} superseded plan(s) kept)')
-        if test_ids_fp is not None and lock.get('test_ids_fp') not in (None, test_ids_fp):
-            raise SystemExit(f'[v12] REFUSE: the held-out test slice changed after the first access (lock has ids_fp {lock.get("test_ids_fp")}, current {test_ids_fp}) — the test data itself is part of the freeze; investigate before proceeding')
+            if _test_changed:
+                lock['test_ids_fp'] = test_ids_fp
+                lock['stage'] = 'accessed'
+                lock['history'] = list(lock.get('history') or []) + [{'stage': 'refreeze-test-fp', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'superseded_test_ids_fp': prev.get('test_ids_fp')}]
+            if _train_changed:
+                lock['train_fp'] = train_fp
+                lock['history'] = list(lock.get('history') or []) + [{'stage': 'refreeze-train-fp', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'train_fp': train_fp, 'superseded_train_fp': prev.get('train_fp')}]
+            _dirty = True
         if test_ids_fp is not None and lock.get('test_ids_fp') is None:
             # two-phase lock: the pre-access record was written before the
             # first read; bind the exact slice immediately after it.
             lock['test_ids_fp'] = test_ids_fp
             lock['stage'] = 'accessed'
             lock['history'] = list(lock.get('history') or []) + [{'stage': 'accessed', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp}]
+            _dirty = True
+        if train_fp is not None and lock.get('train_fp') is None:
+            lock['train_fp'] = train_fp
+            lock['history'] = list(lock.get('history') or []) + [{'stage': 'train-fp', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'train_fp': train_fp}]
+            _dirty = True
+        if _dirty:
             L.atomic_write_json(lp, lock, indent=2)
-            print(f'[v12] freeze lock updated with the first-access slice fingerprint: {lp}')
-        if train_fp is not None:
-            if lock.get('train_fp') not in (None, train_fp):
-                raise SystemExit(f'[v12] REFUSE: the training corpus changed after the first test access (lock has train_fp {lock.get("train_fp")}, current {train_fp}) — a different training set cannot enter the frozen confirmation')
-            if lock.get('train_fp') is None:
-                lock['train_fp'] = train_fp
-                lock['history'] = list(lock.get('history') or []) + [{'stage': 'train-fp', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'train_fp': train_fp}]
-                L.atomic_write_json(lp, lock, indent=2)
-                print(f'[v12] freeze lock bound to the canonical training fingerprint: {lp}')
+            if _manifest_changed or _test_changed or _train_changed:
+                print(f'[v12] freeze lock UPDATED: {lp} (manifest {str(_sha)[:12]}…; {len(lock["superseded"])} superseded plan(s) kept)')
+            else:
+                print(f'[v12] freeze lock updated with the first-access slice/train fingerprint: {lp}')
         return lock
     lock = {'manifest_sha256': _sha, 'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST), 'frozen_at': manifest.get('frozen_at'), 'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp, 'stage': stage, 'code_semantics': L.code_stamp(), 'history': [{'stage': stage, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp}], 'note': 'first test-split access: the plan may not change after this point (V12_REFREEZE=1 overrides consciously, downgrading the earlier round to exploratory)'}
     L.atomic_write_json(lp, lock, indent=2)
@@ -817,6 +834,114 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     return {'n_docs': int(n_docs), 'n_seeds': len(common), 'per_doc_delta_mean': float(arr.mean()), 'between_doc_sd': float(arr.std(ddof=1)) if n_docs > 1 else 0.0, 'mean_within_doc_seed_sd': float(np.mean(within)), 'note': 'between_doc_sd reflects DOCUMENT-sampling uncertainty; n_seqs<64 does not cover the language-population distribution — enlarge the row panel for population-level claims (design_notes §20)'}
 
 
+def _test_probe_stats(probe_path, manifest, slice_fp):
+    """Descriptive summary of the P5T test-split distractor probe.
+
+    The probe is measured on the SAME held-out slice as the primary by-length
+    panel (records carry `val_fp`), so admission here applies the same
+    identity checks: frozen arm/seed whitelist, matching test fingerprint,
+    matching code semantics and training recipe.  This is explicitly
+    secondary/descriptive and never enters the Holm family or the
+    confirmation decision."""
+    out = {'path': probe_path, 'slice_fp': slice_fp, 'available': False,
+           'n_records': 0, 'n_admitted': 0, 'n_excluded': 0,
+           'cells': [], 'contrasts': {},
+           'note': 'test-split descriptive secondary evidence; not part of the frozen primary family or the Holm correction'}
+    if not slice_fp or not probe_path or not os.path.exists(probe_path):
+        return out
+    try:
+        raw = json.load(open(probe_path, encoding='utf-8'))
+    except Exception as e:
+        out['error'] = f'{type(e).__name__}: {e}'
+        return out
+    if not isinstance(raw, dict):
+        out['error'] = 'probe summary is not a JSON object'
+        return out
+    out['available'] = True
+    out['n_records'] = len(raw)
+    arms = set(manifest['arms'])
+    seeds = {int(s) for s in manifest['seeds']}
+    exp_code = L.code_stamp()
+    sig = _recipe_signature(manifest)
+    groups = {}
+    excluded = []
+    for key, r in raw.items():
+        if not isinstance(r, dict):
+            excluded.append(f'{key}: not a dict')
+            continue
+        why = None
+        if r.get('variant') not in arms:
+            why = f"variant {r.get('variant')!r} is not one of the frozen arms"
+        elif r.get('seed') not in seeds:
+            why = f"seed {r.get('seed')!r} is outside the frozen whitelist"
+        elif r.get('val_fp') != slice_fp:
+            why = f"val_fp {str(r.get('val_fp'))[:12]}… does not match the frozen test slice {str(slice_fp)[:12]}…"
+        elif exp_code is not None and r.get('_code') != exp_code:
+            why = f"_code {r.get('_code')!r} does not match the frozen code semantics {exp_code!r}"
+        elif sig is not None and not _recipe_matches_signature(r.get('recipe'), sig):
+            why = 'recipe does not match the frozen training_recipe signature'
+        elif not L.ppl_is_usable(r.get('ppl_mean')):
+            why = 'ppl_mean is not a usable measurement'
+        elif r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:
+            why = 'missing arm/eval_len/rho'
+        if why:
+            excluded.append(f'{key}: {why}')
+            continue
+        mode = str(r.get('mode', 'uniform'))
+        ident = (r['variant'], r['arm'], int(r['eval_len']), float(r['rho']), mode,
+                 json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True),
+                 str(r.get('recipe')), str(r.get('_code')))
+        grp = groups.setdefault(ident, {})
+        if r['seed'] in grp:
+            excluded.append(f'{key}: duplicate (cell, seed) identity — the pooled mean would be ambiguous')
+            continue
+        grp[r['seed']] = float(r['ppl_mean'])
+    out['n_excluded'] = len(excluded)
+    out['n_admitted'] = sum(len(g) for g in groups.values())
+    by_visible = {}
+    for ident, by_seed in groups.items():
+        v, arm, Ln, rho, mode = ident[:5]
+        by_visible.setdefault((v, arm, Ln, rho, mode), []).append((ident, by_seed))
+    for (v, arm, Ln, rho, mode), entries in sorted(by_visible.items()):
+        if len(entries) > 1:
+            # multiple probe parameterisations/recipes for one readable cell:
+            # report each separately, but never pool them.
+            for ident, by_seed in entries:
+                out['cells'].append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho,
+                                     'mode': mode, 'n': len(by_seed),
+                                     'mean': float(np.mean(list(by_seed.values()))),
+                                     'ppl_by_seed': {str(sd): p for sd, p in sorted(by_seed.items())},
+                                     'ambiguous_cell': True})
+            continue
+        _ident, by_seed = entries[0]
+        out['cells'].append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho,
+                             'mode': mode, 'n': len(by_seed),
+                             'mean': float(np.mean(list(by_seed.values()))),
+                             'ppl_by_seed': {str(sd): p for sd, p in sorted(by_seed.items())}})
+    # Descriptive paired contrasts against the learned arm on the same slice.
+    _idx = {}
+    for c in out['cells']:
+        if not c.get('ambiguous_cell'):
+            _idx[(c['variant'], c['arm'], c['eval_len'], c['rho'], c['mode'])] = c['ppl_by_seed']
+    for (v, arm, Ln, rho, mode), learned in sorted(_idx.items()):
+        if arm != 'learned':
+            continue
+        for (_v, other_arm, _Ln, _rho, _mode), other in sorted(_idx.items()):
+            if _v != v or _Ln != Ln or _rho != rho or _mode != mode or other_arm == 'learned':
+                continue
+            common = sorted(set(learned) & set(other), key=float)
+            if len(common) < 2:
+                continue
+            dl = [other[s] - learned[s] for s in common]
+            res = V.exact_sign_permutation(dl)
+            res['seeds'] = [int(s) for s in common]
+            res['delta_definition'] = f'{other_arm} - learned (paired per seed, test split, descriptive)'
+            out['contrasts'][f'L{Ln} r{rho} [{mode}] {other_arm} - learned'] = res
+    if excluded:
+        print('[p5t probe] EXCLUDED test-probe records (named, never silent):\n  - ' + '\n  - '.join(excluded[:20]) + ('' if len(excluded) <= 20 else f'\n  … {len(excluded) - 20} more'))
+    return out
+
+
 def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analysis_v12/test_stats.json'):
     """Zero-GPU: paired confirmation statistics under the frozen plan.
 
@@ -843,7 +968,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             raise SystemExit(f'[v12] REFUSE: {bylen_path} has admissible confirmation records but no freeze lock in {_lock_dir} — refuse to analyse a copied result that cannot be tied to the first test-split access')
         _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='accessed')
     _alpha = float((manifest.get('statistics') or {}).get('alpha', 0.05))
-    stats = {'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision')}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp}, 'comparisons': {}, 'holm': {}, 'by_length': {}}
+    stats = {'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision')}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp}, 'comparisons': {}, 'holm': {}, 'by_length': {}, 'probe': _test_probe_stats(probe_path, manifest, unified_fp)}
     for v in manifest['arms']:
         rows = [r for (rv, s), r in admitted.items() if rv == v]
         _lens = sorted({int(k) for r in rows for k in (r.get('by_len') or {})})
@@ -1108,6 +1233,28 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         if _dsn:
             A('')
             A(f"（文档抽样：{_dsn}）")
+        A('')
+    _pr = ft.get('probe') or {}
+    if _pr.get('available') and _pr.get('cells'):
+        A('### P5T test split 干扰探针（描述性二次证据，不进入确认性检验）')
+        A('')
+        A(f"> 与主表同一 held-out 切片（fp `{str(_pr.get('slice_fp'))[:12]}…`），按冻结臂/种子/配方/代码语义准入（{_pr.get('n_admitted')} 条记录，剔除 {_pr.get('n_excluded')} 条）。本表只作描述性二次证据，**不参与 Holm 校正，也不影响确认结论**；validation 探针的探索性读数见 `analysis_v12/stats.json` 的 v10 部分。")
+        A('')
+        A('| 臂 | arm | L | rho | mode | n | PPL mean |')
+        A('|---|---|---|---|---|---|---|')
+        for _c in _pr['cells']:
+            _amb = '（歧义：多个探针参数化，未合并）' if _c.get('ambiguous_cell') else ''
+            A(f"| `{_c['variant']}` | {_c['arm']} | {_c['eval_len']} | {_c['rho']} | {_c['mode']} | {_c['n']} | {_c['mean']:.2f}{_amb} |")
+        A('')
+        _pctr = _pr.get('contrasts') or {}
+        if _pctr:
+            A('| 描述性配对差（test split） | n | Δ mean | p (exact) |')
+            A('|---|---|---|---|')
+            for _k, _v in _pctr.items():
+                A(f"| {_k} | {_v.get('n')} | {_v.get('mean', float('nan')):+.2f} | {_v.get('p_exact_signflip', float('nan')):.3f} |")
+            A('')
+    elif _pr:
+        A('**P5T test split 干扰探针**：本次运行未找到可采纳的 test 探针记录，统计已显式标注为不可用。')
         A('')
     A('---')
     A('')

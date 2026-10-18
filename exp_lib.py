@@ -3405,7 +3405,16 @@ class SmallGPT(nn.Module):
     def _make_block(self, d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=None):
         return Block(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
 
-    def forward(self, ids, logits_tail=None):
+    def forward(self, ids, logits_tail=None, targets=None, vocab=None):
+        # When `targets` is supplied this returns the training CE loss instead
+        # of logits.  The DDP wrapper only proxies `forward`, so routing the
+        # loss through it is what lets DDP install its reducer hooks; calling
+        # `ce_loss` directly on the inner module would silently skip the
+        # gradient all-reduce.
+        if targets is not None:
+            if vocab is None:
+                raise ValueError('forward(targets=...) requires vocab')
+            return self.ce_loss(ids, targets, vocab)
         x = self.trunk(ids)
         if logits_tail:
             x = x[:, -logits_tail:]
@@ -9976,11 +9985,14 @@ def _eval_row_working_bytes(model, T, d, elem_size, bytes_per_value=8):
         kind = getattr(cfg, 'kind', 'full')
         if kind == 'full':
             win = max(0, int(getattr(cfg, 'window', 0) or 0))
-            if 0 < win < T:
-                span = win
-            elif getattr(attn, 'sink', None) is not None or getattr(cfg, 'full_sink', False):
-                # The sink branch materialises [nh, rows, T] logits.
+            # A sink forces the materialising `_sink_attn_loop` path for the
+            # whole sequence even when a window is configured, so the sink
+            # check must come first (otherwise [nh, rows, T] logits are
+            # undercounted as [nh, rows, win]).
+            if getattr(attn, 'sink', None) is not None or getattr(cfg, 'full_sink', False):
                 span = T
+            elif 0 < win < T:
+                span = win
             else:
                 # SDPA's flash/mem-efficient backend keeps O(T) state.
                 span = min(T, 1024)
@@ -9993,8 +10005,19 @@ def _eval_row_working_bytes(model, T, d, elem_size, bytes_per_value=8):
             Bm = (T + step - 1) // step
             nih = max(1, int(getattr(cfg, 'n_index_heads', 1) or 1))
             topk = max(1, int(getattr(cfg, 'index_topk', 1) or 1))
-            attn_bytes = max(2 * T * Bm * nih * elem,
-                             2 * T * min(topk, Bm) * elem)
+            hd = max(1, int(getattr(attn, 'hd', 1) or 1))
+            win = max(0, int(getattr(cfg, 'sliding_window', 0) or 0))
+            # HCA reads every block (arange expansion), so its effective
+            # selection width is Bm; CSA only scores min(topk, Bm) blocks.
+            nb_eff = Bm if kind == 'hca' else min(topk, Bm)
+            M = nb_eff + win
+            # gathered_attention materialises the gathered K and V rows
+            # ([rows, M, nh, hd]) plus the hard logits/attn ([rows, nh, M]);
+            # the live-soft twin roughly doubles the logits side.  All terms
+            # scale with the head count and include the sliding-window lanes.
+            gather_bytes = (4 * M * nh * hd + 2 * M * nh) * elem
+            index_bytes = 2 * T * Bm * nih * elem
+            attn_bytes = max(index_bytes, gather_bytes)
             if kind == 'hca':
                 # _arange_exp_cache materialises an int32 [T, Bm] table.
                 attn_bytes = max(attn_bytes, 4 * T * Bm)
@@ -10927,7 +10950,7 @@ def training_knobs_fingerprint():
                       ensure_ascii=True)
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:12]
 
-def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs):
+def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs, n_heads=8, d_head=32):
     # Explicit CSA_CKPT always wins.  Otherwise, on a CUDA box, fall back to
     # activation recomputation when the estimated working set is large.  The
     # recomputed forward is the same pure function, so values and gradients
@@ -10950,6 +10973,8 @@ def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len
     seq = max(1, int(seq_len))
     batch = max(1, int(batch_size))
     extra = 0
+    nh = max(1, int(n_heads))
+    hd = max(1, int(d_head))
     for c in cfgs:
         kind = getattr(c, 'kind', 'full')
         if kind in ('csa', 'hca'):
@@ -10957,14 +10982,28 @@ def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len
             Bm = (seq + step - 1) // step
             nih = max(1, int(getattr(c, 'n_index_heads', 1) or 1))
             topk = max(1, int(getattr(c, 'index_topk', 1) or 1))
-            extra += batch * (seq * Bm * nih * 4 + seq * min(topk, Bm) * 4)
+            win = max(0, int(getattr(c, 'sliding_window', 0) or 0))
+            nb_eff = Bm if kind == 'hca' else min(topk, Bm)
+            M = nb_eff + win
+            # Indexer score table plus the gathered K/V + logits workspace;
+            # both scale with the head count and the sliding-window lanes.
+            index_bytes = seq * Bm * nih * 4
+            gather_bytes = (4 * M * nh * hd + 2 * M * nh) * 4
+            extra += batch * max(index_bytes, gather_bytes)
             if kind == 'hca':
                 extra += batch * seq * Bm * 4
         elif kind == 'full':
-            # Only the materialising sink/window loop is a per-layer extra;
-            # SDPA's memory-efficient path keeps O(T) state.
+            # A sink materialises the full [B, nh, T, T] logits regardless of
+            # any configured window; otherwise only the sparse window/loop is
+            # an extra, and SDPA's memory-efficient path keeps O(T) state.
             win = max(0, int(getattr(c, 'window', 0) or 0))
-            extra += batch * seq * (win if 0 < win < seq else d) * 4
+            if getattr(c, 'full_sink', False):
+                span = seq
+            elif 0 < win < seq:
+                span = win
+            else:
+                span = min(seq, 1024)
+            extra += batch * 3 * nh * seq * span * 4
     need = act + int(extra) + 16 * int(n_param)
     if free >= need + need // 3:
         return None, need
@@ -11173,7 +11212,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # fixed cadence and the original GC state is restored on every exit path.
     _gc_relief = gc.isenabled()
     _ckpt_saved = _CKPT['on']
-    _auto_ckpt, _auto_need = _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs)
+    _auto_ckpt, _auto_need = _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs, n_heads=n_heads, d_head=d_head)
     if _auto_ckpt:
         _CKPT['on'] = _auto_ckpt
         try:
@@ -11200,9 +11239,13 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             x, y = next(bpe)
             with torch.autocast(device_type='cuda', dtype=(_amp_dtype or torch.bfloat16),
                                 enabled=(_amp is not None)):
-                ce = model.ce_loss(x, y, vocab)
+                # Go through the (possibly DDP-wrapped) module's forward so
+                # DDP can install its gradient-sync hooks; custom attributes
+                # and methods always live on `_inner_model` because
+                # DistributedDataParallel does not proxy them.
+                ce = model(x, targets=y, vocab=vocab)
                 del x, y
-                _blp = getattr(model, 'boundary_logp', None)
+                _blp = getattr(_inner_model, 'boundary_logp', None)
                 if _blp is not None:
                     # REINFORCE: the hard cuts are sampled in the forward pass; this
                     # score-function term makes the LM token loss (not just comp_reg)
@@ -11212,11 +11255,11 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     # This is the only arm that reads the running CE baseline.
                     _ce_item = float(ce.detach().item())
                     _adv = _ce_item - float(_ce_baseline)
-                    _bdec = max(int(getattr(model, 'boundary_decisions', 0) or 0), 1)
-                    loss = ce + comp_lambda * model.comp_reg + BOUNDARY_PG_COEF * (-_adv * _blp / _bdec)
+                    _bdec = max(int(getattr(_inner_model, 'boundary_decisions', 0) or 0), 1)
+                    loss = ce + comp_lambda * _inner_model.comp_reg + BOUNDARY_PG_COEF * (-_adv * _blp / _bdec)
                     _ce_baseline = 0.99 * float(_ce_baseline) + 0.01 * _ce_item
                 else:
-                    loss = ce + comp_lambda * model.comp_reg
+                    loss = ce + comp_lambda * _inner_model.comp_reg
             if _scaler is not None:
                 _scaler.scale(loss).backward()
                 _scaler.unscale_(opt)
@@ -11242,13 +11285,13 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             if (step + 1) % 1024 == 0:
                 gc.collect()
             if eval_every and val_batch is not None and ((step + 1) % eval_every == 0 or step == steps - 1):
-                sub_ppl = eval_ppl(model, _eval_batch, device)
+                sub_ppl = eval_ppl(_inner_model, _eval_batch, device)
                 ppl_hist.append([step + 1, float(sub_ppl)])
             if log_every and (step % log_every == 0 or step == steps - 1):
                 if _lbuf:
                     _flush_loss_buffer()
                 _lv = float(losses[-1])
-                _dls = [(li, getattr(blk.attn, 'delta_logit', None)) for li, blk in enumerate(model.blocks)]
+                _dls = [(li, getattr(blk.attn, 'delta_logit', None)) for li, blk in enumerate(_inner_model.blocks)]
                 _dls = [(li, dl) for li, dl in _dls if dl is not None]
                 if _dls:
                     # (no_grad: 纯读取 Parameter 的值做日志，不需要 autograd 节点)
@@ -11256,6 +11299,15 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                         for li, _v in zip([li for li, _ in _dls], torch.stack([dl for _, dl in _dls]).tolist()):
                             _curve_append_point(delta_trace.setdefault(f'L{li}', []), [step, float(_v)])
                 print(f'  step {step:4d}  loss {_lv:.4f}  lr {opt.param_groups[0]['lr']:.2e}  ({(time.time() - t0) / max(step + 1, 1) * 1000:.0f}ms/step)')
+    except BaseException:
+        # Best-effort distributed cleanup: if one rank fails mid-step the
+        # others can otherwise block forever in the next collective/barrier.
+        if _dist and _world > 1:
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception:
+                pass
+        raise
     finally:
         _CKPT['on'] = _ckpt_saved
         if _gc_relief:
@@ -11299,9 +11351,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         # Keeping this distinction byte-compatible matters: `_run_fp` pins the
         # full val fingerprint, and changing the final row count without a
         # CODE_SEMANTICS bump would silently mix two PPL definitions on resume.
-        _eval_stats = eval_ppl(model, val_batch, device, return_stats=True)
+        _eval_stats = eval_ppl(_inner_model, val_batch, device, return_stats=True)
         ppl = float(_eval_stats['ppl'])
-        stats = compression_report(model, val_batch, device, val_bnd=val_bnd)
+        stats = compression_report(_inner_model, val_batch, device, val_bnd=val_bnd)
         print(f'[{variant} seed={seed}] val PPL = {ppl:.3f}  (n_tok={_eval_stats["n_tokens"]}, nll={_eval_stats["nll_sum"]:.6f})')
         print(f'    block-length diagnostics: {json.dumps(stats, default=float)}')
     if _lbuf:
