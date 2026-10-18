@@ -2006,6 +2006,46 @@ def t_group_split_contract():
     assert not (g2['train'] & g2['val']) and not (g2['train'] & g2['test']) and not (g2['val'] & g2['test'])
 
 
+def t_group_split_respects_time_windows():
+    # Whole groups on one side is necessary but not sufficient: two groups
+    # whose time windows overlap must not be placed on opposite sides, or the
+    # shared window leaks future/past information across the split.
+    groups = np.repeat(np.arange(10), 2)
+    time = np.repeat(np.arange(10) * 10, 2)
+    idx = L.grouped_chronological_split_indices(20, groups, 0.5, 0.25, 0.25,
+                                                order=time)
+    L.assert_no_split_leakage(idx['train'], idx['val'], idx['test'],
+                              groups=groups, time=time)
+    try:
+        L.grouped_chronological_split_indices(
+            8, [0, 0, 1, 1, 2, 2, 3, 3], 0.5, 0.25, 0.25,
+            order=[0, 10, 5, 15, 20, 30, 25, 35])
+    except ValueError as e:
+        assert 'temporal leakage' in str(e), e
+    else:
+        raise AssertionError('overlapping group time windows must be rejected')
+    # A missing ordering key cannot define a chronological split.
+    try:
+        L.split_indices(4, time=[0, 1, np.nan, 3])
+    except ValueError as e:
+        assert 'NaN/Inf' in str(e), e
+    else:
+        raise AssertionError('NaN time must be rejected before sorting')
+
+
+def t_data_quality_report_index_disjointness():
+    X = np.arange(8, dtype=float).reshape(4, 2)
+    rep = L.data_quality_report(X, train_idx=[0, 1], val_idx=[1], test_idx=[2])
+    assert rep['status'] == 'fail', rep
+    assert rep['checks']['split_index_overlap']['train__val'] == 1, rep
+    try:
+        L.data_quality_report(X, train_idx=[], val_idx=[1])
+    except ValueError as e:
+        assert 'training reference is empty' in str(e), e
+    else:
+        raise AssertionError('an empty training reference must not define holdout statistics')
+
+
 def t_preprocessor_train_only():
     tr = np.array([[0.0, 10.0], [2.0, 10.0], [np.nan, 10.0], [1.0, 10.0]])
     va = np.array([[1000.0, 10.0], [np.inf, 10.0]])
@@ -2301,10 +2341,12 @@ def main():
     _check('H9 fuse sample_std accepts negative axes', t_fuse_sample_std_negative_axis)
     _check('I1 chronological split contract', t_leakage_safe_split_contract)
     _check('I2 whole-group split contract', t_group_split_contract)
+    _check('I2b grouped split keeps overlapping time windows together', t_group_split_respects_time_windows)
     _check('I3 preprocessing fitted on train only', t_preprocessor_train_only)
     _check('I3b imputation fill is identical in fit and transform', t_preprocessor_fill_is_consistent)
     _check('I3c leakage checks validate time/group inputs', t_leakage_checks_validate_inputs)
     _check('I4 data-quality/leakage report', t_data_quality_report)
+    _check('I4b data-quality report checks split index disjointness', t_data_quality_report_index_disjointness)
     _check('I5a categorical shift handles an empty reference', t_categorical_shift_empty_reference)
     _check('I5 categorical shift + cache guards', t_categorical_and_cache_guards)
     _check('I6 explicit split sizes stay non-negative', t_split_sizes_explicit_never_negative)

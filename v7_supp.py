@@ -2151,7 +2151,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     L.set_seed(seed)
     need = max(eval_lens) + 1
     if val_ids is None:
-        val_ids = L.load_wikitext(max(train_len, need), 4000000)[1]
+        val_ids = L.load_wikitext(max(train_len, need), 8000000)[1]
     mr = 4.0
     if v in PARAM_MATCHED_V7:
         mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant='csa_fixed_rope')
@@ -2368,7 +2368,7 @@ def run_lenphase(payload, guard=None, label='', par=None):
     need = max(eval_lens) + 1
     _t_data = time.time()
     L.set_seed(int((seeds or [0])[0]))
-    _, val_ids, _, _, _ = L.load_wikitext(max(train_len, need), 4000000)
+    _, val_ids, _, _, _ = L.load_wikitext(max(train_len, need), 8000000)
     if guard is not None:
         guard.record_run(time.time() - _t_data, 0, 0, 0, 0, 0)
     print(f'[p1l] val slice {val_ids.shape}, eval_lens={eval_lens}, seeds={seeds}')

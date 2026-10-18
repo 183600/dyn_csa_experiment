@@ -482,6 +482,42 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                           '(deduplicate before scoring, or report it as a '
                           'sampling artefact)')
 
+            # Whole-document (group) integrity.  The loaders write one doc-id
+            # per emitted document; checking the sidecars proves no group
+            # straddles train/validation instead of trusting the build flag.
+            _trd_path = os.path.join(cd, f'train_doc_ids_{tag}.npy')
+            _vad_path = os.path.join(cd, f'val_doc_ids_{tag}.npy')
+            _mdoc = meta.get('doc_ids') or {}
+            if os.path.exists(_trd_path) and os.path.exists(_vad_path):
+                try:
+                    _trd = np.load(_trd_path)
+                    _vad = np.load(_vad_path)
+                    _shared_docs = int(np.intersect1d(_trd, _vad).size)
+                    rec['documents'] = {
+                        'train_count': int(np.asarray(_trd).size),
+                        'validation_count': int(np.asarray(_vad).size),
+                        'overlap': _shared_docs,
+                    }
+                    if _shared_docs:
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: {_shared_docs} document ids occur in '
+                              'both train and validation (group leakage)')
+                    if _mdoc and _mdoc.get('disjoint') is not True:
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: cache metadata does not attest '
+                              'document-disjoint splits')
+                    if _mdoc and int(_mdoc.get('overlap', 0) or 0) != 0:
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: cache metadata records a nonzero '
+                              'train/validation document overlap')
+                except Exception as _de:
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: document-id sidecars unreadable ({type(_de).__name__}: {_de})')
+            elif _mdoc:
+                rec['status'] = 'fail'
+                _fail(f'{cd}/{tag}: cache metadata records document ids but the '
+                      'sidecar files are missing')
+
             # Exact duplicate rows across train/val/test.  This is row-level
             # leakage regardless of how the split was generated.
             shared_val = _row_overlap_count(tr, va)

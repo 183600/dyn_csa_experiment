@@ -208,6 +208,27 @@ def chronological_split(data, train_frac=0.8, val_frac=0.1, test_frac=0.1,
 train_val_test_split = chronological_split
 
 
+def _assert_order_finite(order, *, name='order'):
+    """Reject missing/non-finite ordering keys before they define a split.
+
+    A NaN timestamp sorts to an arbitrary position and can silently place a
+    group on the wrong side of a chronological boundary.  Object/string keys
+    have no numeric finiteness contract and are left to the caller.
+    """
+    arr = np.asarray(order)
+    try:
+        if np.issubdtype(arr.dtype, np.datetime64):
+            if np.any(np.isnat(arr)):
+                raise ValueError(f'{name} contains NaT; a temporal split needs '
+                                 'a well-defined order')
+        elif np.issubdtype(arr.dtype, np.number):
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f'{name} contains NaN/Inf; a temporal split '
+                                 'needs a well-defined order')
+    except TypeError:
+        pass
+
+
 def _group_order(groups, order=None):
     """Order group ids by first appearance or by their minimum timestamp."""
     groups = np.asarray(groups)
@@ -223,6 +244,7 @@ def _group_order(groups, order=None):
     order = np.asarray(order)
     if order.ndim != 1 or order.shape[0] != groups.shape[0]:
         raise ValueError('order must be a 1-D array with one value per row')
+    _assert_order_finite(order)
     key = {}
     for i, g in enumerate(groups.tolist()):
         g = _group_key(g)
@@ -264,6 +286,13 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
     # Groups must be pairwise disjoint even if the caller supplied a target
     # that forced a large group to one side.
     _assert_index_and_group_disjoint(res, groups)
+    if order is not None:
+        # Whole groups are on one side, but two groups whose time intervals
+        # overlap must not land on opposite sides: that would still leak the
+        # other side's future/past through the shared time window.  Refuse the
+        # split instead of returning a silently leaking one.
+        assert_no_split_leakage(res['train'], res['val'], res['test'],
+                                groups=groups, time=order)
     return res
 
 
@@ -295,6 +324,7 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
             train_size=train_size, val_size=val_size, test_size=test_size)
     if time is not None:
         time = _as_1d(time, 'time', n)
+        _assert_order_finite(time, name='time')
         order = np.argsort(time, kind='stable')
         sorted_time = time[order]
         sizes = _resolve_sizes(n, train_frac, val_frac, test_frac,
@@ -780,9 +810,35 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         split_rows = {name: (_empty_index() if idx[name] is None else idx[name])
                       for name in SPLIT_NAMES}
     ref = split_rows['train']
+    if ref.size == 0 and (split_rows['val'].size or split_rows['test'].size):
+        raise ValueError(
+            'data_quality_report: the training reference is empty while '
+            'validation/test rows were supplied; holdout rows must never be '
+            'used as the reference that defines the statistics')
     warnings = []
     hard_failures = []
     checks = {}
+
+    # The split indices themselves must be disjoint.  Cross-split duplicate
+    # keys below only catch equal feature rows; an index repeated in two
+    # splits is leakage even if the feature table happened to be mutated
+    # between indexing operations.
+    index_overlap = {}
+    for i, a in enumerate(SPLIT_NAMES):
+        for b in SPLIT_NAMES[i + 1:]:
+            shared = np.intersect1d(split_rows[a], split_rows[b])
+            index_overlap[f'{a}__{b}'] = int(shared.size)
+            if shared.size:
+                hard_failures.append(
+                    f'{shared.size} row indices are assigned to both {a} and {b}')
+    checks['split_index_overlap'] = index_overlap
+    checks['duplicate_split_indices'] = {
+        name: int(rows.size - np.unique(rows).size)
+        for name, rows in split_rows.items()
+    }
+    if any(checks['duplicate_split_indices'].values()):
+        warnings.append(f'duplicate row indices within splits: '
+                        f"{checks['duplicate_split_indices']}")
 
     finite = np.isfinite(X)
     checks['nan_count'] = int(np.isnan(X).sum())

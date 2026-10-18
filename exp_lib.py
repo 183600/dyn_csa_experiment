@@ -45,6 +45,7 @@ if _NEEDED:
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
 import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading
+import array
 from math import comb
 from dataclasses import dataclass
 import numpy as np
@@ -3836,6 +3837,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     va_path = os.path.join(cache_dir, f'val_batch_{tag}.npy')
     vp_path = os.path.join(cache_dir, f'val_bnd_{tag}.npy')
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
+    trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
+    vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
         # In-process memo: the served arrays are exactly what a fresh
         # load would return and the returned objects keep their identity,
@@ -3869,6 +3872,29 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             _problems.append('cache does not attest the frozen train-prefix tokenizer fit')
         if not isinstance(meta.get('dedup'), dict):
             _problems.append('cache does not attest whole-document exact/near duplicate filtering')
+        # Document ids are the group identity.  When the cache carries them,
+        # prove the groups are disjoint instead of trusting the build-time
+        # deduplicator; a sidecar pair that disagrees with the metadata is a
+        # mixed cache and must be rebuilt.
+        _has_doc_meta = bool(meta.get('doc_ids'))
+        _has_doc_files = os.path.exists(trd_path) and os.path.exists(vad_path)
+        if _has_doc_files:
+            try:
+                _trd = np.load(trd_path)
+                _vad = np.load(vad_path)
+                _shared_docs = int(np.intersect1d(_trd, _vad).size)
+                if _shared_docs:
+                    _problems.append(
+                        f'{_shared_docs} document ids occur in both train and validation')
+                _mdoc = meta.get('doc_ids') or {}
+                if _mdoc and (_mdoc.get('disjoint') is not True
+                              or int(_mdoc.get('overlap', 0) or 0) != 0):
+                    _problems.append(
+                        'cache metadata does not attest document-disjoint train/validation splits')
+            except Exception as _de:
+                _problems.append(f'document-id sidecars unreadable ({type(_de).__name__}: {_de})')
+        elif _has_doc_meta:
+            _problems.append('cache metadata records document ids but the sidecar files are missing')
         if _problems:
             _cache_warning('WikiText train/validation split', _problems)
         else:
@@ -3917,7 +3943,11 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     vocab = tok.get_vocab_size()
     fit_fp = _text_fp(fit_text)
     _dedup = _DocDeduplicator()
-    _fit_doc_prefix = fit_text
+    # Seed the deduplicator with the FULL rows of the fit prefix.  The token
+    # budget may truncate the text of the final fit row; seeding with the
+    # truncated view would leave that training document absent from the exact
+    # duplicate index, so a full copy in validation/test could slip through.
+    _fit_doc_prefix = list(_fit_rows_all[:len(fit_text)])
     for _r in _fit_doc_prefix:
         _dedup.is_duplicate(_r)
     _fit_dedup = _dedup.stats()
@@ -3937,6 +3967,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         cap_tokens = max(0, int(cap_tokens))
         arr = np.empty(cap_tokens, dtype=_dtype)
         cursor = 0
+        _doc_ids = array.array('Q')
         _skipped = {'exact': 0, 'near': 0}
         _dedup_by_split[split] = _skipped
         _n_nonempty_seen = 0
@@ -3950,7 +3981,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                 # The tokenizer-fit documents are the frozen TRAIN prefix and
                 # are part of the model's training stream; do not filter them
                 # out as duplicates of themselves on the first pass.
-                if split == 'train' and (_n_nonempty_seen + _j) < len(_fit_doc_prefix):
+                if split == 'train' and (_n_nonempty_seen + _j) < _n_fit_docs:
                     kept.append(r)
                     continue
                 _dup, _kind = _dedup.is_duplicate(r)
@@ -3960,8 +3991,9 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                     kept.append(r)
             _n_nonempty_seen += len(rows)
             if kept:
-                for enc in _tok.encode_batch(kept):
+                for _row, enc in zip(kept, _tok.encode_batch(kept)):
                     ids = enc.ids
+                    _doc_ids.append(int(_doc_id_u64(_doc_exact_fp(_row))))
                     take = min(len(ids), cap_tokens - cursor)
                     if take > 0:
                         arr[cursor:cursor + take] = ids[:take]
@@ -3979,30 +4011,40 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             if start and start % 50000 == 0:
                 print(f'    [{label}] {start} rows, {cursor} tokens, '
                       f'{sum(_skipped.values())} duplicate docs skipped')
+        _doc_arr = (np.frombuffer(_doc_ids, dtype=np.uint64).copy()
+                    if _doc_ids else np.empty(0, dtype=np.uint64))
         if cursor < arr.size:
             # Do not keep a huge virtual allocation alive when the source ran
             # dry well before the configured cap.
             exact = arr[:cursor].copy()
             del arr
-            return exact
-        return arr
+            return exact, _doc_arr
+        return arr, _doc_arr
     print(f'[data] tokenising train (cap {n_train_tokens} tokens) ...')
-    train_ids = stream_tokenise('train', n_train_tokens + seq_len, 'train', _dtype=np.int32)
+    train_ids, train_doc_ids = stream_tokenise(
+        'train', n_train_tokens + seq_len, 'train', _dtype=np.int32)
     print(f'[data] train tokens = {len(train_ids)}  vocab = {vocab}')
     if len(train_ids) < n_train_tokens + seq_len:
         print(f'[data] WARNING: the train split ran dry at {len(train_ids)} tokens (< requested {n_train_tokens + seq_len}); runs configured for the advertised token target will train on fewer tokens than advertised')
     print('[data] tokenising validation ...')
-    val_ids = stream_tokenise('validation', val_seqs * seq_len + seq_len, 'val', _dtype=np.int64)
+    val_ids, val_doc_ids = stream_tokenise(
+        'validation', val_seqs * seq_len + seq_len, 'val', _dtype=np.int64)
     n_val = min(len(val_ids) // seq_len, val_seqs)
     val_batch = val_ids[:n_val * seq_len].reshape(n_val, seq_len)
     _validate_token_ids(train_ids, vocab, 'wikitext train_ids')
     _validate_token_ids(val_batch, vocab, 'wikitext val_batch')
     print(f'[data] val sequences = {n_val} (seq_len={seq_len})')
+    _shared_docs = int(np.intersect1d(train_doc_ids, val_doc_ids).size)
+    if _shared_docs:
+        raise RuntimeError(
+            f'load_wikitext: {_shared_docs} document ids occur in both train and '
+            'validation — refusing to write a leaking split')
     audit_corpus_split(train_ids, val_batch, vocab, dataset='wikitext')
     bnd_ids = sorted(boundary_token_ids(tok, eos_id))
     val_bnd = np.isin(val_batch, bnd_ids)
     print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
-    for _p, _a in ((tr_path, train_ids), (va_path, val_batch), (vp_path, val_bnd)):
+    for _p, _a in ((tr_path, train_ids), (va_path, val_batch), (vp_path, val_bnd),
+                   (trd_path, train_doc_ids), (vad_path, val_doc_ids)):
         _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(_p)), prefix=os.path.basename(_p) + '.', suffix='.tmp')
         try:
             with os.fdopen(_fd, 'wb') as _fh:
@@ -4031,6 +4073,15 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         'tokenizer_fit_tokens': int(n_fit_tokens),
         'tokenizer_fit_rows': int(_n_fit_docs),
         'tokenizer_fit_docs_in_train_prefix': True,
+        'doc_ids': {
+            'train_count': int(train_doc_ids.size),
+            'validation_count': int(val_doc_ids.size),
+            'train_fp': _ids_fp(train_doc_ids),
+            'validation_fp': _ids_fp(val_doc_ids),
+            'overlap': _shared_docs,
+            'disjoint': True,
+            'policy': 'whole_document_exact_and_near_duplicate_filtered',
+        },
         'dedup': {'fit': _fit_dedup, 'splits': _dedup_by_split},
         'group_isolation': 'whole_documents_exact_and_near_duplicate_filtered',
         'train_tokens': int(len(train_ids)),

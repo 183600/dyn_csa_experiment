@@ -520,7 +520,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     train_len = int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
     if val_ids is None:
         L.set_seed(int(seed))
-        val_ids = L.load_wikitext(max(train_len, need), 4000000)[1]
+        val_ids = L.load_wikitext(max(train_len, need), 8000000)[1]
     # Fingerprint of the corpus this cell actually SCORES (probe_params records
     # only the shape/config: n_seq, target, vocab, val_seq_len).  Stored on the
     # record and checked forward-compatibly below: a stored record that carries
@@ -719,7 +719,7 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
     train_len = int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
     _t_data = time.time()
     L.set_seed(int((list(cfg.get('seeds') or [0]) or [0])[0]))
-    _, val_ids, _, _, _ = L.load_wikitext(max(train_len, need), 4000000)
+    _, val_ids, _, _, _ = L.load_wikitext(max(train_len, need), 8000000)
     if guard is not None:
         guard.record_run(time.time() - _t_data, 0, 0, 0, 0, 0)
     mech_summ = {}
