@@ -388,26 +388,39 @@ def _full_arange_evict(need=0):
 
 def _geom_nbytes(geom):
     # Charge the real (physical) storage of every integer table a geometry
-    # entry holds, including its lazily-built gather constants.  Lazy tables
-    # are only charged after they exist, so the budget tracks what is resident.
-    total = 0
+    # entry holds, including its lazily-built gather constants.  The eight
+    # scalar tables are slices of ONE packed `_buf`, and the int64 views can
+    # share storage too, so charge each underlying storage exactly once:
+    # summing ``untyped_storage().nbytes()`` per view would count the same
+    # buffer ~8 times and make a few-MB geometry look larger than the budget
+    # (which then disables the cache exactly when it is needed most).
+    seen = {}
+    def _charge(t):
+        if t is None:
+            return
+        try:
+            st = t.untyped_storage()
+            # `untyped_storage()` may return a fresh Python wrapper per call;
+            # the underlying allocation is identified by (device, ptr, bytes).
+            key = (str(st.device), int(st.data_ptr()), int(st.nbytes()))
+            if key not in seen:
+                seen[key] = int(st.nbytes())
+        except Exception:
+            key = ('logical', id(t))
+            if key not in seen:
+                seen[key] = int(t.numel()) * int(t.element_size())
     for name in ('counts', 'ends', 'starts', 'last_tok', 'ov_start', 'ov_len',
                  'starts_prev', 'n_blocks', '_b_off', '_g_b'):
-        t = getattr(geom, name, None)
-        if t is None:
-            continue
-        total += _arange_nbytes(t)
+        _charge(getattr(geom, name, None))
     ga = getattr(geom, '_ga_cache', None)
     if ga is not None:
         for t in ga:
-            if t is not None:
-                total += _arange_nbytes(t)
+            _charge(t)
     i64 = getattr(geom, '_i64', None)
     if i64:
         for t in i64.values():
-            if t is not None:
-                total += _arange_nbytes(t)
-    return total
+            _charge(t)
+    return sum(seen.values())
 
 
 def _geom_evict(need=0):
@@ -436,6 +449,11 @@ def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
             if cur != charged:
                 _GEOM_CACHE_BYTES[0] += cur - charged
                 _GEOM_CACHE[key] = (refs, geom, cur)
+                # Lazy constants can grow a resident entry past the budget;
+                # evict (possibly this or older entries) so the accounting
+                # contract "budget tracks what is resident" keeps holding.
+                if _GEOM_CACHE_BYTES[0] > _GEOM_CACHE_BUDGET:
+                    _geom_evict(0)
             return geom
         _GEOM_CACHE.pop(key, None)
         _GEOM_CACHE_BYTES[0] -= int(charged)

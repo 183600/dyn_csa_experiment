@@ -295,6 +295,49 @@ def _frozen_train_fp(manifest):
     return None
 
 
+def _frozen_implementation(manifest):
+    """Implementation-mode bindings declared by the frozen plan, if any.
+
+    `code_semantics_expected` only pins the source revision; the eager
+    row-loop vs batched twin and the AMP dtype are machine/runtime choices.
+    Newer manifests can pin them with ``eager_batch_expected`` /
+    ``amp_dtype_expected`` (top level, or the same names without the suffix).
+    Absent fields leave the historical permissive path unchanged, but when a
+    field IS declared every admitted record must prove it ran that way through
+    its own `train_knobs` (never by re-deriving the current box's CUDA state).
+    """
+    impl = {}
+    for _k in ('eager_batch', 'amp_dtype', 'amp_grad_scaler'):
+        _v = manifest.get(_k + '_expected', manifest.get(_k))
+        if _v is not None:
+            impl[_k] = _v
+    return impl or None
+
+
+def _implementation_reason(rec, impl):
+    """Why ``rec`` fails the frozen implementation binding (None = passes)."""
+    if not impl:
+        return None
+    tk = rec.get('train_knobs')
+    if not isinstance(tk, dict):
+        return 'record lacks train_knobs required by the frozen implementation binding'
+    for _k, _want in impl.items():
+        if _k not in tk:
+            return f"train_knobs lacks {_k!r} required by the frozen implementation binding"
+        _got = tk.get(_k)
+        if _k == 'eager_batch':
+            if bool(_got) != bool(_want):
+                return f"train_knobs.eager_batch={_got!r} does not match the frozen {bool(_want)!r}"
+        elif _k == 'amp_dtype':
+            _g = _got or 'fp32'
+            _w = _want or 'fp32'
+            if str(_g).lower() != str(_w).lower():
+                return f"train_knobs.amp_dtype={_got!r} does not match the frozen {_want!r}"
+        elif bool(_got) != bool(_want):
+            return f"train_knobs.{_k}={_got!r} does not match the frozen {bool(_want)!r}"
+    return None
+
+
 # The length-checkpoint writer (v7_supp.run_lenphase_cell — used by P3MT /
 # P4MT / P5C, the phases whose checkpoints P5T evaluates) records a bespoke
 # `p1l_...` recipe, NOT a run_cfg fingerprint.  It carries the same training
@@ -401,7 +444,7 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
                          and lock.get('test_ids_fp') not in (None, test_ids_fp))
         _train_changed = (train_fp is not None
                           and lock.get('train_fp') not in (None, train_fp))
-        _refreeze = bool(os.environ.get('V12_REFREEZE'))
+        _refreeze = os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on')
         if (_manifest_changed or _test_changed or _train_changed) and not _refreeze:
             if _manifest_changed:
                 raise SystemExit(f'[v12] REFUSE: the test split was already accessed under a DIFFERENT frozen manifest (lock {lp}: {lock.get("manifest_sha256")} != current {_sha}, locked_at={lock.get("locked_at")}). Changing the plan after seeing test data is selection bias by construction. To consciously re-freeze, set V12_REFREEZE=1 — the earlier round must then be reported as exploratory in the plan history.')
@@ -737,6 +780,7 @@ def _admit_confirmation_records(raw, manifest):
     seed_whitelist = {int(s) for s in manifest['seeds']}
     exp_code = L.code_stamp()  # eager-only; kernel mode is refused at load
     sig = _recipe_signature(manifest)
+    impl = _frozen_implementation(manifest)
     msha = manifest.get('manifest_sha256')
     want_train_fp = _frozen_train_fp(manifest)
     admitted = {}
@@ -783,6 +827,8 @@ def _admit_confirmation_records(raw, manifest):
                 why = f"train_fp {r.get('train_fp')} does not match the frozen canonical training fingerprint {want_train_fp}"
             elif sig is not None and not _recipe_matches_signature(r.get('recipe'), sig):
                 why = 'recipe does not match the frozen training_recipe signature'
+            elif _implementation_reason(r, impl) is not None:
+                why = _implementation_reason(r, impl)
             elif not isinstance(r.get('by_len'), dict) or not r.get('by_len'):
                 why = 'no by_len measurement'
             else:
@@ -862,6 +908,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
     seeds = {int(s) for s in manifest['seeds']}
     exp_code = L.code_stamp()
     sig = _recipe_signature(manifest)
+    impl = _frozen_implementation(manifest)
     groups = {}
     excluded = []
     for key, r in raw.items():
@@ -879,6 +926,8 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = f"_code {r.get('_code')!r} does not match the frozen code semantics {exp_code!r}"
         elif sig is not None and not _recipe_matches_signature(r.get('recipe'), sig):
             why = 'recipe does not match the frozen training_recipe signature'
+        elif _implementation_reason(r, impl) is not None:
+            why = _implementation_reason(r, impl)
         elif not L.ppl_is_usable(r.get('ppl_mean')):
             why = 'ppl_mean is not a usable measurement'
         elif r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:

@@ -90,32 +90,67 @@ def _kernel_stamp():
     except Exception:
         return ''
 
-def _eager_batch_active():
+def _eager_batch_active(device=None, batch_size=None):
     """True when the batched reference twin should be used.
 
     On CUDA with the kernel module available, the batched twin is the default
     for B > 1; the row-by-row reference path remains available (and is the
     only path on CPU) for bitwise debugging.  ``CSA_EAGER_BATCH=0`` opts out.
     That path changes the numerical implementation (it is not the eager
-    row-by-row bitwise contract), so it enters `_code` exactly like a kernel
-    backend."""
+    row-by-row bitwise contract), so its actual mode is carried in
+    ``training_knobs()`` (and therefore in the resume fingerprint and the
+    per-record descriptor) rather than in the machine-independent `_code`
+    stamp.
+
+    ``device``/``batch_size`` are optional so callers can ask about the
+    concrete run instead of the process default.  When ``batch_size`` is
+    omitted only the device/kernel availability is considered."""
     v = os.environ.get('CSA_EAGER_BATCH', '').strip().lower()
     if v in ('0', 'false', 'no', 'off'):
         return False
     if _CK is None:
         return False
     try:
-        return bool(torch.cuda.is_available())
+        if _CK.kernel_enabled():
+            # The kernel backend replaces the eager twin entirely.
+            return False
     except Exception:
+        pass
+    if device is None:
+        device = DEVICE
+    if getattr(device, 'type', str(device)) != 'cuda':
         return False
+    if batch_size is not None and int(batch_size) <= 1:
+        return False
+    return True
+
+def _uses_batched_eager(cfgs, device=None, batch_size=None):
+    """Whether at least one layer in ``cfgs`` will take the batched twin.
+
+    Mirrors the condition in ``HybridAttention.forward`` so a record can state
+    the implementation it actually ran instead of the process default."""
+    if not _eager_batch_active(device, batch_size):
+        return False
+    return any(
+        getattr(c, 'kind', None) in ('csa', 'hca')
+        and getattr(c, 'fuse_mode', 'none') == 'none'
+        and getattr(c, 'indexer_mode', 'learned')
+        for c in cfgs
+    )
 
 def code_stamp():
     """当前代码+内核模式写进每条记录的 `_code` 戳（eager = CODE_SEMANTICS
     本身；内核模式追加变体后缀）。一切「记录是否当前」
     的判定（result_is_current 的 code 实参、`_cs...` 后缀匹配）都必须以
     本值为准——裸比 CODE_SEMANTICS 会把内核模式的全部记录误判为陈旧，
-    使 resume 静默失效、面板被标 `_stale_cfg`。"""
-    return f'{CODE_SEMANTICS}{_kernel_stamp()}' + ('-eb1' if _eager_batch_active() else '')
+    使 resume 静默失效、面板被标 `_stale_cfg`。
+
+    The eager batched-twin / AMP choices deliberately do NOT enter this
+    stamp: they depend on the machine that produced a record, so encoding
+    them here would make a zero-GPU report box label every GPU record stale.
+    They are recorded per run in ``training_knobs()`` / the run fingerprint
+    instead, which analysis reads from disk."""
+    return f'{CODE_SEMANTICS}{_kernel_stamp()}'
 
 
 # ---- G0 gate ---------------------------------------------------------------
@@ -760,7 +795,10 @@ def _causal_quantile_exact(x, cols, target_block_tokens):
     _pair_bytes = 16
     _budget = 128 << 20
     nc = max(1, int(cols.numel()))
-    col_chunk = max(1, min(nc, 64))
+    # Bound BOTH dimensions by the byte budget.  Limiting only the row count
+    # leaves a single [1, col_chunk, n] sort block unbounded (n=1M with
+    # col_chunk=64 is ~1GB, far above the advertised budget).
+    col_chunk = max(1, min(nc, 64, _budget // max(1, n * _pair_bytes)))
     row_chunk = max(1, _budget // max(col_chunk * n * _pair_bytes, 1))
     out = x.new_empty((x.shape[0], nc))
     for r0 in range(0, x.shape[0], row_chunk):
@@ -813,26 +851,34 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     if n <= _exact_len:
         out = _causal_quantile_exact(x, _arange_cache(n, sim.device), target_block_tokens)
     else:
-        # Long-context approximation: evaluate the exact causal quantile on a
-        # bounded sample of columns and interpolate the threshold in between.
-        # The first block is kept exact so early boundaries behave as before.
-        prefix = min(n, max(256, _exact_len // 8))
+        # Long-context path.  Two invariants make it prefix-consistent:
+        #   1) columns < _exact_len are computed by the SAME closed form the
+        #      short path uses (on x[:, :_exact_len], which is all a causal
+        #      quantile at those columns can see);
+        #   2) later columns use a GLOBAL sample grid fixed by the configured
+        #      maximum length and only read the last sample at or before the
+        #      column.  No `n-1` endpoint and no `n`-derived step, so
+        #      tau_T[:T'] == tau_T' for every T' < T.
+        # This also removes the old interpolation which mixed a future sample
+        # into a past column and broke the segmenter's prefix invariance.
+        exact_n = min(n, int(_exact_len))
+        pre_cols = torch.arange(exact_n, device=sim.device, dtype=torch.long)
+        pre_vals = _causal_quantile_exact(x[:, :exact_n], pre_cols, target_block_tokens)
+        warm_end = max(exact_n, 256, _exact_len // 8)
         n_samp = 1024
-        step = max(1, (n - prefix + n_samp - 1) // n_samp)
+        step = max(1, (_max_len - warm_end + n_samp - 1) // n_samp)
         samp = torch.cat([
-            torch.arange(prefix, device=sim.device, dtype=torch.long),
-            torch.arange(prefix, n, step, device=sim.device, dtype=torch.long),
-            torch.tensor([n - 1], device=sim.device, dtype=torch.long),
+            torch.arange(exact_n, min(warm_end, n), device=sim.device, dtype=torch.long),
+            torch.arange(warm_end, n, step, device=sim.device, dtype=torch.long),
         ]).unique(sorted=True)
-        sv = _causal_quantile_exact(x, samp, target_block_tokens)
-        full = torch.arange(n, device=sim.device, dtype=torch.long)
-        pos = torch.searchsorted(samp, full, right=True) - 1
-        pos = pos.clamp(0, samp.numel() - 2)
-        nxt = pos + 1
-        x0 = samp[pos].to(torch.float64)
-        x1 = samp[nxt].to(torch.float64)
-        w = ((full.to(torch.float64) - x0) / (x1 - x0).clamp_min(1.0)).to(sv.dtype)
-        out = sv[:, pos] * (1.0 - w) + sv[:, nxt] * w
+        if samp.numel() == 0:
+            out = pre_vals
+        else:
+            sv = _causal_quantile_exact(x, samp, target_block_tokens)
+            full = torch.arange(exact_n, n, device=sim.device, dtype=torch.long)
+            # Rightmost sample at or before each column: only past information.
+            pos = (torch.searchsorted(samp, full, right=True) - 1).clamp(0, samp.numel() - 1)
+            out = torch.cat([pre_vals, sv[:, pos]], dim=1)
         out[:, 0] = float('-inf')
     out = out.to(sim.device)
     return out.squeeze(0) if squeeze else out
@@ -3386,7 +3432,7 @@ class HybridAttention(nn.Module):
                         and self.cfg.kind in ('csa', 'hca')
                         and self.cfg.fuse_mode == 'none'
                         and self.cfg.indexer_mode == 'learned'
-                        and _eager_batch_active())
+                        and _eager_batch_active(x.device, B))
         _batch_path = _kernel_path or _eager_batch
         pre_all = None
         pres = None
@@ -4744,19 +4790,26 @@ def _npy_serve_int32(path):
         _side = _i32_sidecar_path(path)
         if os.path.exists(_side):
             _n = np.load(_side, mmap_mode='r')
-            if (int(_n.size) == int(src.size) and np.dtype(_n.dtype) == np.dtype(np.int32)):
+            if (int(_n.size) == int(src.size)
+                    and tuple(_n.shape) == tuple(src.shape)
+                    and np.dtype(_n.dtype) == np.dtype(np.int32)):
                 return _n
         _dir = os.path.dirname(os.path.abspath(_side)) or '.'
         _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(_side) + '.', suffix='.tmp')
         os.close(_fd)
         try:
-            _mm = np.lib.format.open_memmap(_tmp, mode='w+', dtype=np.int32, shape=(int(src.size),))
+            # Preserve the source shape: the sidecar is a drop-in replacement
+            # for the loaded cache, and a same-size but differently shaped
+            # cache must never be silently flattened to 1-D.
+            _mm = np.lib.format.open_memmap(_tmp, mode='w+', dtype=np.int32, shape=tuple(src.shape))
+            _flat_mm = _mm.reshape(-1)
+            _flat_src = src.reshape(-1)
             _step = 1 << 24
             for _s in range(0, int(src.size), _step):
                 _e = min(_s + _step, int(src.size))
-                _mm[_s:_e] = src[_s:_e]
+                _flat_mm[_s:_e] = _flat_src[_s:_e]
             _mm.flush()
-            del _mm
+            del _flat_mm, _mm
             os.replace(_tmp, _side)
         except BaseException:
             try:
@@ -6148,7 +6201,19 @@ def pair_reason(ra, rb):
     if (_ka is None) != (_kb is None):
         return 'unverifiable train_knobs (only one record carries the optimizer / lr-schedule / augmentation descriptor)'
     if _ka is not None and _ka != _kb:
-        return 'different train_knobs (optimizer / lr schedule / grad-clip / augmentation)'
+        return 'different train_knobs (optimizer / lr schedule / grad-clip / augmentation / precision)'
+    # Precision / implementation mode are also recorded at the top level on
+    # newer records.  Compare them explicitly (the descriptor above already
+    # covers records that carry it) so an fp32-vs-bf16 or row-loop-vs-batched
+    # pair cannot be treated as controlled even if some future caller omits
+    # the full descriptor.  Legacy records (neither key present) keep the
+    # historical permissive path; a one-sided key is unverifiable.
+    for _k in ('amp_dtype', 'amp_grad_scaler', 'eager_batch'):
+        _pa, _pb = (_k in ra), (_k in rb)
+        if _pa != _pb:
+            return f'unverifiable {_k} (only one record carries the precision / implementation mode)'
+        if _pa and ra.get(_k) != rb.get(_k):
+            return f'different {_k} ({ra.get(_k)!r} vs {rb.get(_k)!r})'
     bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
     if bad:
         absent = [k for k in bad if ra.get(k) is None and rb.get(k) is None]
@@ -7381,7 +7446,7 @@ def loglog_regression(points, *, alpha=0.05):
 # `mt` (matched-variant set) and `mr` (mlp_match_ref) can themselves contain
 # underscores (e.g. `full_rope`, `csa_dynamic`), so those two values are
 # captured lazily up to the next literal key rather than by `[^_]+`.
-_RUN_CFG_RE = re.compile('^steps(?P<steps>[^_]+)_sl(?P<sl>[^_]+)_bs(?P<bs>[^_]+)_nt(?P<nt>[^_]+)_lr(?P<lr>[^_]+)_wd(?P<wd>[^_]+)_d(?P<d>[^_]+)_L(?P<L>[^_]+)_H(?P<H>[^_]+)_Dh(?P<Dh>[^_]+)_v(?P<v>[^_]+)_wu(?P<wu>[^_]+)_cl(?P<cl>[^_]+)_dlm(?P<dlm>[^_]+)_mt(?P<mt>.*?)_mr(?P<mr>.*?)_ee(?P<ee>[^_]+)_es(?P<es>[^_]+)_det(?P<det>[^_]+)_df(?P<df>.+?)(?:_tk(?P<tk>[0-9a-f]+))?_cs(?P<cs>.+)$')
+_RUN_CFG_RE = re.compile('^steps(?P<steps>[^_]+)_sl(?P<sl>[^_]+)_bs(?P<bs>[^_]+)_nt(?P<nt>[^_]+)_lr(?P<lr>[^_]+)_wd(?P<wd>[^_]+)_d(?P<d>[^_]+)_L(?P<L>[^_]+)_H(?P<H>[^_]+)_Dh(?P<Dh>[^_]+)_v(?P<v>[^_]+)_wu(?P<wu>[^_]+)_cl(?P<cl>[^_]+)_dlm(?P<dlm>[^_]+)_mt(?P<mt>.*?)_mr(?P<mr>.*?)_ee(?P<ee>[^_]+)_es(?P<es>[^_]+)_det(?P<det>[^_]+)_df(?P<df>.+?)(?:_tk(?P<tk>[0-9a-f]+))?(?:_amp(?P<amp>[^_]+))?(?:_eb(?P<eb>[01]))?_cs(?P<cs>.+)$')
 
 def run_cfg_knobs(fp):
     """Best-effort decode of a `_run_fp` string into its named training knobs.
@@ -8679,6 +8744,7 @@ _CONTROL_HYPER_KEYS = (
     'steps', 'tokens_seen', 'lr', 'weight_decay', 'warmup', 'batch_size',
     'seq_len', 'd', 'n_layers', 'n_heads', 'd_head', 'mlp_ratio',
     'comp_lambda', 'delta_lr_mult', 'dataset', 'data_version',
+    'amp_dtype', 'eager_batch',
 )
 
 def _canon_setting(v):
@@ -10063,6 +10129,9 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
         'dataset': cfg.get('dataset') or 'wikitext',
         'train_knobs': training_knobs(),
     })
+    _knobs = hp['train_knobs']
+    hp['amp_dtype'] = _knobs.get('amp_dtype')
+    hp['eager_batch'] = _knobs.get('eager_batch')
     if data_version is not None:
         hp['data_version'] = str(data_version)
     return hp
@@ -11180,12 +11249,24 @@ LR_FLOOR_MULT = 0.1
 BOUNDARY_PG_COEF = 1.0
 LR_COSINE_AMP = 0.45
 
-def training_knobs():
+def training_knobs(*, amp_dtype='auto', eager_batch='auto'):
     """Canonical, JSON-safe descriptor of the optimisation / schedule /
-    gradient-clipping / augmentation settings shared by every arm of a
-    controlled panel.  Pure function of the module constants above, so it is
-    identical across all arms unless a future scaled run deliberately diverges
-    one (in which case `pair_reason` refuses to pair the records)."""
+    gradient-clipping / augmentation / precision settings shared by every arm
+    of a controlled panel.
+
+    ``amp_dtype`` and ``eager_batch`` default to the mode that `train_variant`
+    will actually use on this machine.  Callers that implement their own
+    training loop (for example v7's fp32 warm-up loop) pass their concrete
+    values so the record describes what ran instead of what the default would
+    have been.  Keeping both fields in this descriptor makes them enter the
+    resume fingerprint (`training_knobs_fingerprint`) and the per-record
+    pairing gate, so an old fp32 / row-by-row cell can never be silently
+    reused by a bf16 / batched-twin run.
+    """
+    if amp_dtype == 'auto':
+        amp_dtype = _active_amp()
+    if eager_batch == 'auto':
+        eager_batch = _eager_batch_active()
     return {
         'optimizer': 'AdamW',
         'foreach': True,
@@ -11197,20 +11278,28 @@ def training_knobs():
         'lr_floor_mult': LR_FLOOR_MULT,
         'lr_cosine_amp': LR_COSINE_AMP,
         'augmentation': 'none',
+        'amp_dtype': amp_dtype,
+        'amp_grad_scaler': amp_dtype == 'fp16',
+        'eager_batch': bool(eager_batch),
     }
 
-def training_knobs_fingerprint():
+def training_knobs_fingerprint(*, amp_dtype='auto', eager_batch='auto'):
     """Short, stable digest of the shared optimisation/training descriptor.
 
     `run_cfg` already pins lr / wd / warmup / steps / tokens / architecture /
     data, but it deliberately does not carry the optimizer identity, betas,
-    eps, LR-schedule shape, grad-clip or augmentation.  Those live in the
+    eps, LR-schedule shape, grad-clip, augmentation or the numerical
+    implementation mode (AMP dtype / batched eager twin).  Those live in the
     per-record `train_knobs` copy, which `pair_reason` checks at analysis
     time.  Putting this digest in the resume fingerprint makes a changed
     descriptor invalidate earlier cells just like a changed lr.
     Unset/legacy fingerprints simply decode without a `tk` field.
     """
-    blob = json.dumps(training_knobs(), sort_keys=True, separators=(',', ':'),
+    if amp_dtype == 'auto' and eager_batch == 'auto':
+        _knobs = training_knobs()
+    else:
+        _knobs = training_knobs(amp_dtype=amp_dtype, eager_batch=eager_batch)
+    blob = json.dumps(_knobs, sort_keys=True, separators=(',', ':'),
                       ensure_ascii=True)
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:12]
 
@@ -11380,8 +11469,22 @@ def _amp_requested():
         return 'bf16'
     if v in ('fp16', 'float16', 'half'):
         return 'fp16'
-    print(f'[amp] CSA_AMP={v!r} is not recognised (use bf16/fp16) — using bf16')
-    return 'bf16'
+    print(f'[amp] CSA_AMP={v!r} is not recognised (use bf16/fp16/0) — staying in fp32 instead of silently changing the numerical path')
+    return None
+
+
+def _active_amp(device=None):
+    """The autocast dtype the training path uses on ``device``.
+
+    The fp32 path is the historical, bitwise-stable one; AMP only applies on
+    CUDA.  Keeping this helper separate lets `training_knobs()` record the
+    concrete choice on a CPU analysis box (None) without pretending that a
+    GPU job ran in fp32."""
+    if device is None:
+        device = DEVICE
+    if getattr(device, 'type', str(device)) != 'cuda':
+        return None
+    return _amp_requested()
 
 
 def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False):
@@ -11390,7 +11493,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     set_seed(seed)
     _rng_fp = rng_fingerprint()
     _attb_bump_epoch()
-    _amp = _amp_requested() if device.type == 'cuda' else None
+    _amp = _active_amp(device)
     _amp_dtype = torch.bfloat16 if _amp == 'bf16' else (torch.float16 if _amp == 'fp16' else None)
     _scaler = torch.amp.GradScaler('cuda', enabled=(_amp == 'fp16')) if _amp is not None else None
     if _amp is not None:
@@ -11403,6 +11506,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if variant in PARAM_MATCHED | PARAM_MATCHED_V7 and float(mlp_ratio) == 4.0:
         raise ValueError(f'{variant} is a PARAM-MATCHED baseline but was given the default mlp_ratio=4; its MLP must be widened to match its sparse reference arm, or the comparison is not parameter-controlled. Pass mlp_ratio=variant_mlp_ratio(variant, vocab, d=..., n_layers=..., n_heads=..., d_head=..., seq_len=...).')
     cfgs = make_layer_cfgs(n_layers, variant)
+    _eager_batch_used = _uses_batched_eager(cfgs, device, batch_size)
     model = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
     _inner_model = model
     if _dist and _world > 1:
@@ -11621,7 +11725,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if _lbuf:
         _flush_loss_buffer()
     losses = [float(v) for v in losses]
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world, 'train_time_s': wall, 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world, 'train_time_s': wall, 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
               # Review 3: the token-level evidence behind the reported PPL.
               # `nll_sum / n_tokens` is the pooled-NLL estimator; the per-row
               # rows let a report bootstrap DOCUMENT uncertainty instead of
@@ -13451,7 +13555,9 @@ def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch):
         _mkey = ','.join(sorted((str(_x) for _x in _mg)))
     cfg.setdefault('warmup', 50)
     cfg.setdefault('comp_lambda', 0.05)
-    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_tk{training_knobs_fingerprint()}_cs{CODE_SEMANTICS}{_kernel_stamp()}'
+    _eb = int(_eager_batch_active(batch_size=cfg.get('batch_size')))
+    _amp = _active_amp() or 'fp32'
+    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_tk{training_knobs_fingerprint()}_amp{_amp}_eb{_eb}_cs{code_stamp()}'
 
 
 def _plan_run(cfg, summary_path, fp):
@@ -13569,7 +13675,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                         out['truncated'] = True
                 else:
                     rec['run_cfg'] = fp
-                    rec['_code'] = f'{CODE_SEMANTICS}{_kernel_stamp()}'
+                    rec['_code'] = code_stamp()
                     assert fp.endswith(f'_cs{rec['_code']}'), (fp, rec['_code'])
                     rec['provenance'] = _prov
                     rec['hyperparams'] = _hp

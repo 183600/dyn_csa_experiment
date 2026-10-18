@@ -781,6 +781,20 @@ install_patches()
 # eager 模式保持既有值；内核模式（CSA_KERNEL）下追加 -tk1 后缀
 # （design_notes §3.1）。
 CKPT_CODE = L.code_stamp()
+
+
+def _v7_knobs(device=None, batch_size=None):
+    """v7's own loops are pure fp32 (no autocast); record that truth rather
+    than the CUDA default AMP mode `training_knobs()` would infer."""
+    return L.training_knobs(amp_dtype=None,
+                            eager_batch=L._eager_batch_active(device, batch_size))
+
+
+def _v7_knobs_fp(device=None, batch_size=None):
+    return L.training_knobs_fingerprint(
+        amp_dtype=None, eager_batch=L._eager_batch_active(device, batch_size))
+
+
 ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
@@ -924,7 +938,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
-    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': L.training_knobs(), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids),
+    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': _v7_knobs(device, batch_size), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids),
            'nll_sum': _eval_stats.get('nll_sum'), 'n_tokens': _eval_stats.get('n_tokens'),
            'nll_per_row': _eval_stats.get('nll_per_row'), 'n_tokens_per_row': _eval_stats.get('n_tokens_per_row'),
            'eval_rows': _eval_stats.get('eval_rows'), 'eval_seed': _eval_stats.get('eval_seed'),
@@ -948,7 +962,7 @@ def _warm_fp(cfg, vocab, train_ids, val_batch):
     d_head = cfg.get('d_head', 32)
     _wu = cfg['warmup']
     _mkey = ','.join(sorted((str(_x) for _x in (set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}))))
-    return f'warm_v2_steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_gc{L.training_knobs().get('grad_clip_norm')}_tk{L.training_knobs_fingerprint()}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{L.determinism_label()}_df{L._ids_fp(train_ids)}-{L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_cs{CKPT_CODE}'
+    return f'warm_v2_steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_wu{_wu}_cl{cfg.get('comp_lambda', 0.05)}_dlm{cfg.get('delta_lr_mult', 10.0)}_gc{L.training_knobs().get('grad_clip_norm')}_tk{_v7_knobs_fp(DEVICE, cfg['batch_size'])}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{L.determinism_label()}_df{L._ids_fp(train_ids)}-{L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_cs{CKPT_CODE}'
 
 
 def _phase_cell_record(v, seed, rec, *, run_cfg, metric='ppl', key=None):
@@ -1724,7 +1738,7 @@ def run_niah_phase(payload, guard=None, label=''):
             mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=set(PARAM_MATCHED_V7), ref_variant=_mr_ref)
         _opt_sig = (f'wd0.0_b{L.OPT_ADAMW_BETAS[0]},{L.OPT_ADAMW_BETAS[1]}'
                     f'_eps{L.OPT_ADAMW_EPS:g}_gc{L.GRAD_CLIP_NORM}_cl0.05'
-                    f'_tk{L.training_knobs_fingerprint()}')
+                    f'_tk{_v7_knobs_fp(L.DEVICE, 12)}')
         _recipe = f'niah_v2_steps{n_steps}_v{vocab}_bs12_sl512_lr0.0003_mr{mr:.8g}-{_mr_ref}_{_opt_sig}_reuse4'
         _recipe_by_v[v] = _recipe
         for seed in seeds:
@@ -1742,7 +1756,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 'dataset': 'synthetic_niah', 'n_train_tokens': 0, 'seq_len': 512,
                 'data_extra': _niah_data_recipe,
             }, vocab=int(vocab))
-            _niah_knobs = L.training_knobs()
+            _niah_knobs = _v7_knobs(L.DEVICE, 12)
             _prov_by_seed[int(seed)] = _niah_prov
             ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
             stale = False
@@ -2184,7 +2198,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                f'cl0.05_dlm10.0_mr{mr:.8g}-csa_fixed_rope_ns{n_seq}_'
                f'df{L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))}'
                f'_gc{L.GRAD_CLIP_NORM}_b{L.OPT_ADAMW_BETAS[0]},{L.OPT_ADAMW_BETAS[1]}'
-               f'_eps{L.OPT_ADAMW_EPS:g}_tk{L.training_knobs_fingerprint()}')
+               f'_eps{L.OPT_ADAMW_EPS:g}_tk{_v7_knobs_fp(L.DEVICE, batch_size)}')
     ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
     stale = False
     _ckp_pre = None
@@ -2355,7 +2369,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                         _rec[_kk] = _prev_resume[_kk]
             _rec['val_fp'] = _prov['data'].get('val_fp')
             _rec['data_version'] = _prov['data'].get('data_version')
-            _rec.setdefault('train_knobs', (_rec.get('hyperparams') or {}).get('train_knobs') or L.training_knobs())
+            _rec.setdefault('train_knobs', (_rec.get('hyperparams') or {}).get('train_knobs') or _v7_knobs(L.DEVICE, batch_size))
         except Exception as _pe:
             print(f'[p1l] WARNING: could not attach provenance to {key} ({type(_pe).__name__}: {_pe})')
         summary[key] = _rec
