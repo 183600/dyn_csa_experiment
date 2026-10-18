@@ -1111,6 +1111,18 @@ _POOL_GEOM_BUCKET = 1024
 # (e.g. repeated eval passes) can reuse the same read-only flats.
 _POOL_GEOM_CONTENT = {}
 _POOL_GEOM_CONTENT_BYTES = 64 << 20
+_POOL_GEOM_CONTENT_MAX_ENTRIES = 8192
+_POOL_GEOM_CONTENT_USED = 0
+
+
+def _pool_geom_value_bytes(value):
+    _b = 0
+    for _v in (value if isinstance(value, (tuple, list)) else (value,)):
+        if isinstance(_v, np.ndarray):
+            _b += int(_v.nbytes)
+        elif isinstance(_v, (tuple, list)):
+            _b += sum(int(_x.nbytes) for _x in _v if isinstance(_x, np.ndarray))
+    return _b
 
 
 def _pool_geom_content_get(key):
@@ -1118,34 +1130,26 @@ def _pool_geom_content_get(key):
 
 
 def _pool_geom_content_put(key, value):
+    global _POOL_GEOM_CONTENT_USED
     if key is None:
         return value
-    _b = 0
     try:
-        for _v in (value if isinstance(value, (tuple, list)) else (value,)):
-            if isinstance(_v, np.ndarray):
-                _b += int(_v.nbytes)
-            elif isinstance(_v, (tuple, list)):
-                _b += sum(int(_x.nbytes) for _x in _v if isinstance(_x, np.ndarray))
+        _b = _pool_geom_value_bytes(value)
     except Exception:
         return value
     if _b > _POOL_GEOM_CONTENT_BYTES:
         return value
-    total = 0
-    for _v in _POOL_GEOM_CONTENT.values():
-        for _x in (_v if isinstance(_v, (tuple, list)) else (_v,)):
-            if isinstance(_x, np.ndarray):
-                total += int(_x.nbytes)
-            elif isinstance(_x, (tuple, list)):
-                total += sum(int(_y.nbytes) for _y in _x if isinstance(_y, np.ndarray))
-    while _POOL_GEOM_CONTENT and total + _b > _POOL_GEOM_CONTENT_BYTES:
+    # A running byte count and an item cap keep insertion O(1) even after a
+    # long run has produced tens of thousands of distinct geometry tables.
+    _old = _POOL_GEOM_CONTENT.pop(key, None)
+    if _old is not None:
+        _POOL_GEOM_CONTENT_USED -= _pool_geom_value_bytes(_old)
+    while _POOL_GEOM_CONTENT and (_POOL_GEOM_CONTENT_USED + _b > _POOL_GEOM_CONTENT_BYTES
+                                  or len(_POOL_GEOM_CONTENT) >= _POOL_GEOM_CONTENT_MAX_ENTRIES):
         _old = _POOL_GEOM_CONTENT.pop(next(iter(_POOL_GEOM_CONTENT)))
-        for _x in (_old if isinstance(_old, (tuple, list)) else (_old,)):
-            if isinstance(_x, np.ndarray):
-                total -= int(_x.nbytes)
-            elif isinstance(_x, (tuple, list)):
-                total -= sum(int(_y.nbytes) for _y in _x if isinstance(_y, np.ndarray))
+        _POOL_GEOM_CONTENT_USED -= _pool_geom_value_bytes(_old)
     _POOL_GEOM_CONTENT[key] = value
+    _POOL_GEOM_CONTENT_USED += _b
     return value
 _NP_RANGE_CACHE = {}
 
@@ -3492,45 +3496,47 @@ _IDS_FP_MEMO = {}
 _IDS_FP_MEMO_CAP = 4
 
 def _array_file_path(arr):
-    """Resolve the on-disk file backing a memmap (or a view of one).
+    """Resolve the on-disk file backing a memmap (or a whole-file view of one).
 
     The huge FineWeb caches are served as read-only memmap views; a sidecar
     fingerprint next to that file lets every worker reuse the parent's digest
     instead of re-reading the whole corpus, while remaining bound to the
-    file's size+mtime so a rebuilt cache can never reuse a stale digest."""
+    file's size+mtime so a rebuilt cache can never reuse a stale digest.
+
+    Only the root logical memmap (the deepest memmap in arr's base chain) may
+    supply the sidecar.  `arr` must then have that root's exact layout and data
+    start.  A suffix slice also ends at EOF but starts elsewhere, so its bytes
+    differ from the whole-file digest and must be hashed itself."""
+    root = None
     cur = arr
     seen = set()
-    arr_shape = tuple(getattr(arr, 'shape', ()))
-    arr_strides = getattr(arr, 'strides', None)
-    arr_dtype = getattr(arr, 'dtype', None)
-    arr_nbytes = int(getattr(arr, 'nbytes', -1))
-    for _ in range(8):
-        fn = getattr(cur, 'filename', None)
-        if isinstance(fn, (str, bytes, os.PathLike)):
-            try:
-                fn = os.fspath(fn)
-                st = os.stat(fn)
-                off = int(getattr(cur, 'offset', 0) or 0)
-                nb = int(getattr(cur, 'nbytes', -1))
-                # Only a view that covers the whole backing file may reuse the
-                # file's sidecar.  Requiring the byte range to span
-                # [offset, file end], the same layout as `arr`, and the same
-                # reinterpretation dtype makes a slice fall through to its own
-                # content hash.
-                same = (off >= 0 and nb >= 0 and off + nb == int(st.st_size)
-                        and nb == arr_nbytes
-                        and tuple(getattr(cur, 'shape', ())) == arr_shape
-                        and getattr(cur, 'strides', None) == arr_strides
-                        and np.dtype(getattr(cur, 'dtype', arr_dtype)) == np.dtype(arr_dtype))
-                if same:
-                    return fn
-            except (OSError, TypeError, ValueError):
-                pass
-        cur = getattr(cur, 'base', None)
-        if cur is None or id(cur) in seen:
-            break
+    while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
-    return None
+        if isinstance(cur, np.memmap):
+            root = cur
+        cur = getattr(cur, 'base', None)
+    if root is None:
+        return None
+    fn = getattr(root, 'filename', None)
+    if not isinstance(fn, (str, bytes, os.PathLike)):
+        return None
+    try:
+        fn = os.fspath(fn)
+        st = os.stat(fn)
+        off = int(getattr(root, 'offset', 0) or 0)
+        nb = int(getattr(root, 'nbytes', -1))
+        arr_nbytes = int(getattr(arr, 'nbytes', -1))
+        root_ptr = root.__array_interface__['data'][0]
+        arr_ptr = arr.__array_interface__['data'][0]
+        same = (off >= 0 and nb >= 0 and off + nb == int(st.st_size)
+                and arr_nbytes == nb
+                and arr_ptr == root_ptr
+                and tuple(getattr(arr, 'shape', ())) == tuple(root.shape)
+                and getattr(arr, 'strides', None) == root.strides
+                and np.dtype(arr.dtype) == np.dtype(root.dtype))
+    except (OSError, TypeError, ValueError, KeyError, AttributeError):
+        return None
+    return fn if same else None
 
 def _cache_file_sigs(paths):
     """size+mtime_ns signature for the files a cache entry is built from."""
@@ -9716,14 +9722,32 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
     _r0 = 0
     while _r0 < n_used:
         _cur = min(_row_chunk, n_used - _r0)
+        # A failed forward may already have appended per-layer block counts
+        # (the stats hook runs layer by layer).  Snapshot them so the retry
+        # cannot count the partially-processed rows twice.
+        _stats_snap = []
+        for _blk in model.blocks:
+            _attn = _blk.attn
+            _st = getattr(_attn, '_stats', None)
+            _cuts = getattr(_attn, '_cuts', None)
+            _stats_snap.append((_attn,
+                                dict(_st.__dict__) if isinstance(_st, _BlockStats) else None,
+                                list(_cuts) if _cuts is not None else None))
         # as_tensor accepts numpy arrays AND torch tensors (eval_ppl already
         # uses it).
-        ids = torch.as_tensor(np.asarray(val_batch[_r0:_r0 + _cur])).to(device)
+        ids = None
         try:
+            ids = torch.as_tensor(np.asarray(val_batch[_r0:_r0 + _cur])).to(device)
             _ = model(ids, logits_tail=1)
         except RuntimeError as _oe:
             del ids
             if ('out of memory' in str(_oe).lower()) and _cur > 1:
+                for _attn, _sd, _cuts in _stats_snap:
+                    if _sd is not None:
+                        _attn._stats.__dict__.clear()
+                        _attn._stats.__dict__.update(_sd)
+                    if _cuts is not None:
+                        _attn._cuts[:] = _cuts
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
                 _row_chunk = max(1, _cur // 2)
@@ -10236,7 +10260,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     model = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
     _p_before = _param_change_sample(model).clone()
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, weight_decay=0.0, foreach=True)
-    initial_loss, initial_acc = _lm_batch_metrics(model, x, y, vocab)
+    initial_loss, initial_acc = _lm_batch_metrics(model, x, y, vocab, ignore_index=_ign)
     loss_curve = []
     acc_curve = []
     grad_norm_curve = []
@@ -10248,7 +10272,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     _n_with_grad = 0
     model.train()
     for step in range(int(steps)):
-        ce = model.ce_loss(x, y, vocab)
+        ce = model.ce_loss(x, y, vocab, ignore_index=_ign)
         opt.zero_grad(set_to_none=True)
         ce.backward()
         _gs = []
@@ -10283,11 +10307,11 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         _l = float(ce.detach())
         loss_curve.append(_l)
         if (step + 1) % max(1, int(steps) // 20) == 0 or step == int(steps) - 1:
-            _a = _lm_batch_metrics(model, x, y, vocab)[1]
+            _a = _lm_batch_metrics(model, x, y, vocab, ignore_index=_ign)[1]
             acc_curve.append([step + 1, _a])
         if _l != _l or not math.isfinite(_l):
             break
-    final_loss, final_acc = _lm_batch_metrics(model, x, y, vocab)
+    final_loss, final_acc = _lm_batch_metrics(model, x, y, vocab, ignore_index=_ign)
     _p_after = _param_change_sample(model)
     params_changed = not bool(torch.equal(_p_before, _p_after))
     best_loss = min(loss_curve) if loss_curve else float('nan')
@@ -10300,7 +10324,8 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     # Intermediate-result evidence kept alongside the pass/fail bit: a sanity
     # check that only reports "PASS" hides WHICH part of the pipeline was
     # exercised.  These are diagnostics, not extra pass criteria.
-    _label_shift_ok = bool(torch.equal(y, ids_full[:, 1:]))
+    _label_shift_ok = (bool(torch.equal(y, ids_full[:, 1:]))
+                       if ids_full is not None else None)
     _initial_near_chance = bool(math.isfinite(initial_loss) and abs(float(initial_loss) - _chance) <= max(0.5 * _chance, 1.0))
     _finite_curve = all(math.isfinite(float(v)) for v in loss_curve)
     report = {
@@ -10311,7 +10336,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         'lr': float(lr),
         'batch_shape': [int(batch_size), int(seq_len)],
         'vocab_size': int(vocab),
-        'data_source': 'train_ids' if train_ids is not None else 'synthetic',
+        'data_source': _data_source,
         'data_fp': _data_fp,
         'rng_fp': _rng_fp,
         'regularization': {'weight_decay': 0.0, 'comp_lambda': 0.0, 'dropout': 0.0, 'augmentation': 'none'},
@@ -10339,6 +10364,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         'expected_initial_loss_log_vocab': float(_chance),
         'intermediate_checks': {
             'labels_are_next_token_shift': _label_shift_ok,
+            'batch_contract_ok': _batch_contract,
             'initial_loss_near_log_vocab': _initial_near_chance,
             'loss_curve_all_finite': bool(_finite_curve),
             'grad_all_finite': bool(grad_finite),
@@ -10362,7 +10388,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         torch.cuda.empty_cache()
     return report
 
-def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256, train_ids=None, device=None, target_loss=0.05, target_acc=0.99, mlp_ratio=None, grad_clip=1.0):
+def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256, train_ids=None, batch=None, ignore_index=None, device=None, target_loss=0.05, target_acc=0.99, mlp_ratio=None, grad_clip=1.0):
     """Side-effect-free wrapper around the small-batch overfit probe.
 
     The probe deliberately reseeds the process to ``seed`` and then trains a
@@ -10374,7 +10400,7 @@ def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_
     """
     _fp_before = rng_fingerprint()
     with _preserve_rng_state():
-        report = _overfit_sanity_check_impl(variant, seed=seed, steps=steps, lr=lr, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=train_ids, device=device, target_loss=target_loss, target_acc=target_acc, mlp_ratio=mlp_ratio, grad_clip=grad_clip)
+        report = _overfit_sanity_check_impl(variant, seed=seed, steps=steps, lr=lr, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=train_ids, batch=batch, ignore_index=ignore_index, device=device, target_loss=target_loss, target_acc=target_acc, mlp_ratio=mlp_ratio, grad_clip=grad_clip)
     _fp_after = rng_fingerprint()
     report['rng_fp_before'] = _fp_before
     report['rng_fp_after'] = _fp_after

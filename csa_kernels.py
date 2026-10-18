@@ -2523,7 +2523,7 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
     返回 {name: max_rel_err}；任何 int 不一致直接断言失败。
     """
     import exp_lib as L
-    device = device or torch.device('cpu')
+    device = torch.device('cpu') if device is None else torch.device(device)
     gen = torch.Generator().manual_seed(seed + 17)
     R, T = 3, 96
     min_block, max_block, overlap = 4, 8, 8
@@ -2715,6 +2715,8 @@ def selfcheck_model(variant='csa_dynamic', impl='ref', seed=0, device=None, T=64
     if device is None:
         # triton 内核只接受 CUDA 指针——不显式传 device 时按后端选择。
         device = torch.device('cuda') if (impl == 'triton' and torch.cuda.is_available()) else torch.device('cpu')
+    else:
+        device = torch.device(device)
     d, n_layers, n_heads, d_head = 64, 2, 4, 16
     vocab = 128
     ids = torch.randint(0, vocab, (B, T), generator=torch.Generator().manual_seed(seed + 5)).to(device)
