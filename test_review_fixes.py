@@ -45,6 +45,7 @@ try:
     import v7_supp as V7
     import audit_gates as A
     import baseline_tune as BT
+    import build_report as BR
     _HAVE_TORCH = True
 except Exception as _e:  # pragma: no cover
     print(f'[test] SKIPPED: cannot import the repo modules here ({type(_e).__name__}: {_e}); run on a box with CPU torch')
@@ -111,11 +112,75 @@ def t_tost():
     assert small_n['equivalent'] is not None
 
 
+def t_tost_student_t_and_boundary():
+    inside = [0.001, -0.002, 0.0005, -0.0009, 0.0012, -0.0003]
+    r = L.tost_paired(inside, margin=0.01)
+    assert r['equivalent'] is True, r
+    assert r['df'] == 5 and 'Student t' in r['method'], r
+    se = float(np.std(inside, ddof=1) / math.sqrt(len(inside)))
+    tc = L._t_critical(0.90, 5)
+    assert abs((r['ci'][1] - r['mean']) - tc * se) < 1e-12, 'TOST CI must use the t critical value'
+    assert (r['ci'][1] - r['mean']) > 1.6448536269514722 * se, 'at n=6 the t interval must be wider than the normal-z interval'
+    # Zero-variance sample exactly at the margin is the t limit P(T>=0)=0.5,
+    # not certainty: equality at the boundary must never be called equivalent.
+    for boundary in ([0.1] * 6, [-0.1] * 6):
+        b = L.tost_paired(boundary, margin=0.1)
+        assert b['equivalent'] is False and abs(b['p_tost'] - 0.5) < 1e-12, b
+
+
+def t_scale_input_guards():
+    try:
+        L.meta_analyze_effects([{'label': 'A', 'scale': 1.0, 'effects': [1.0, 2.0], 'seeds': [0, 0]},
+                                {'label': 'B', 'scale': 2.0, 'effects': [2.0, 3.0], 'seeds': [0, 1]}])
+        raise AssertionError('duplicate seeds inside one scale point must be rejected')
+    except ValueError:
+        pass
+    try:
+        L.meta_analyze_effects([{'label': 'A', 'scale': 1.0, 'effects': [1.0, 2.0], 'seeds': [0, 1]},
+                                {'label': 'A', 'scale': 2.0, 'effects': [2.0, 3.0], 'seeds': [0, 1]}])
+        raise AssertionError('two rows for one scale label must not be pooled as independent studies')
+    except ValueError:
+        pass
+
+
 def t_exact_signflip_baseline():
     p = L.exact_signflip_p([1.0] * 6)['p']
     assert abs(p - 0.03125) < 1e-12, 'all-same-sign n=6 two-sided p must stay 2/64'
     p12 = L.exact_signflip_p([1.0] * 12)['p']
     assert abs(p12 - 2.0 / 4096) < 1e-12
+
+
+def _brute_signflip_p(d):
+    """Reference chunked enumeration (the pre-MITM algorithm)."""
+    d = np.asarray(d, dtype=float)
+    n = int(d.size)
+    obs = abs(float(d.mean()))
+    total = 1 << n
+    cnt = 0
+    bitpos = np.arange(n, dtype=np.int64)[None, :]
+    step = max(1, min(total, (1 << 22) // max(n, 1)))
+    for off in range(0, total, step):
+        bs = min(step, total - off)
+        masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
+        signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
+        cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
+    return cnt / total
+
+
+def t_exact_signflip_at_scale():
+    for n in (21, 22, 25, 40):
+        r = L.exact_signflip_p([0.7] * n)
+        assert r['method'] == 'exact-mitm', f'n={n} must stay exact via meet-in-the-middle, got {r}'
+        assert abs(r['p'] - 2.0 / (1 << n)) < 1e-18, f'all-equal d n={n}: only +/- assignments reach the observed mean, p={r["p"]}'
+    assert BR.exact_signflip([0.7] * 22)['method'] == 'exact-mitm', 'the zero-GPU report builder must use the same exact path'
+    assert abs(BR.exact_signflip([0.7] * 22)['p_exact_signflip'] - 2.0 / (1 << 22)) < 1e-15
+    z = L.exact_signflip_p([0.0] * 24)
+    assert z['p'] == 1.0 and z['method'] == 'exact-mitm', 'every sign assignment matches a zero observed mean'
+    rng = np.random.default_rng(11)
+    d = rng.normal(size=21)
+    got = L.exact_signflip_p(d)['p']
+    ref = _brute_signflip_p(d)
+    assert abs(got - ref) < 1e-15, f'MITM count must match full enumeration at n=21 ({got} vs {ref})'
 
 
 def t_paired_effect_resolution():
@@ -1637,6 +1702,9 @@ def main():
     _check('A5 exact_signflip baseline', t_exact_signflip_baseline)
     _check('A6 paired_effect resolution_limited', t_paired_effect_resolution)
     _check('A6b scaling_trend ragged seed panels', t_scaling_trend_ragged_pairs)
+    _check('A6c meta-analysis input guards', t_scale_input_guards)
+    _check('A5b exact sign-flip at scale (MITM)', t_exact_signflip_at_scale)
+    _check('A4b TOST Student-t CI + margin boundary', t_tost_student_t_and_boundary)
     _check('B1 legacy modes bit-exact', t_legacy_modes_bitexact)
     _check('B2 determinism + target-zone safety', t_corruption_deterministic_and_paired)
     _check('B3 new modes span/doc/topical', t_new_modes_do_something)

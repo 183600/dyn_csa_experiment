@@ -4591,17 +4591,56 @@ def finite_range(named_values):
         return (None, None, dropped)
     return (min(vals), max(vals), dropped)
 
+_SIGNFLIP_ENUM_MAX_N = 20
+_SIGNFLIP_MITM_MAX_N = 40
+
+
+def _signflip_signed_sums(values):
+    """All 2**k signed sums of `values` (deterministic doubling table)."""
+    out = np.zeros(1, dtype=float)
+    for v in np.asarray(values, dtype=float):
+        out = np.concatenate((out + v, out - v))
+    return out
+
+
+def _signflip_mitm_count(d):
+    """Exact count of sign assignments with |sum(s_i*d_i)| >= |sum(d_i)|
+    using meet-in-the-middle: 2**(n/2) sums per half instead of 2**n.
+
+    For each left-half sum `a`, the admissible right-half sums are
+    `b <= -T - a` or `b >= T - a`; two binary searches count them.  This keeps
+    the test exact (no normal approximation) for the 21-40 seed range a
+    scale-up panel can reach, while the 2**20 worst-case table stays small."""
+    n = int(d.size)
+    total = abs(float(d.sum()))
+    # The n<=20 enumeration accepts |mean| >= obs - 1e-12, i.e. |sum| >=
+    # total - n*1e-12.  If that threshold is non-positive every sign
+    # assignment qualifies; the two-tail formula below would double-count.
+    if total - 1e-12 * n <= 0.0:
+        return 1 << n
+    half = n // 2
+    left = _signflip_signed_sums(d[:half])
+    right = _signflip_signed_sums(d[half:])
+    right.sort()
+    # Match the n<=20 enumeration's tolerance: mean comparison with 1e-12.
+    thr = total - 1e-12 * n
+    lo = np.searchsorted(right, -thr - left, side='right')
+    hi = np.searchsorted(right, thr - left, side='left')
+    return int(lo.sum() + (right.size - hi).sum())
+
+
 def exact_signflip_p(deltas):
     """Two-sided exact sign-flip test over paired per-seed deltas.
 
     H0: the per-seed difference is symmetric about 0.  For n <= 20 every one
-    of the 2**n sign assignments is enumerated (deterministic, and the same
-    test the driver suites report); for larger n a deterministic normal
-    approximation with continuity correction is used instead, so a report
-    never depends on a random draw.  Non-finite deltas are dropped (the count
-    is returned).  Pure function over its input — used by the aggregate audit
-    so the core panel reports the same p the per-phase suites do, rather than
-    a bare mean±std a reviewer could mistake for evidence.
+    of the 2**n sign assignments is enumerated; for 20 < n <= 40 the same
+    count is obtained exactly by meet-in-the-middle (2**(n/2) tables), which
+    matters as seed-completion panels grow.  Only n > 40 falls back to a
+    deterministic normal approximation (reported as such via `method`), so a
+    report never depends on a random draw.  Non-finite deltas are dropped
+    (the count is returned).  Pure function over its input — used by the
+    aggregate audit so the core panel reports the same p the per-phase suites
+    do, rather than a bare mean±std a reviewer could mistake for evidence.
 
     有效性假设（评审二轮·意见九，必须在预注册文档同步声明）：精确符号翻转
     检验的 p 值正确性依赖「配对内交换性」——每个种子下的两臂共享除臂本身
@@ -4616,7 +4655,7 @@ def exact_signflip_p(deltas):
     if n == 0:
         return {'n': 0, 'p': float('nan'), 'n_dropped': n_dropped, 'method': 'none'}
     obs = abs(float(d.mean()))
-    if n <= 20:
+    if n <= _SIGNFLIP_ENUM_MAX_N:
         total = 1 << n
         cnt = 0
         bitpos = np.arange(n, dtype=np.int64)[None, :]
@@ -4627,6 +4666,9 @@ def exact_signflip_p(deltas):
             signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
             cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
         return {'n': n, 'p': float(cnt / total), 'n_dropped': n_dropped, 'method': 'exact'}
+    if n <= _SIGNFLIP_MITM_MAX_N:
+        cnt = _signflip_mitm_count(d)
+        return {'n': n, 'p': float(cnt / float(1 << n)), 'n_dropped': n_dropped, 'method': 'exact-mitm'}
     sd = float(d.std(ddof=1)) if n > 1 else 0.0
     if sd <= 1e-300:
         p = 0.0 if obs > 0 else 1.0
@@ -4861,31 +4903,53 @@ def tost_paired(deltas, margin, conf=0.90):
     """配对 TOST 等价性检验（G0 训练级等价门槛的统计件，评审二轮·意见八）。
 
     「未发现显著差异 ≠ 等价」：等价性必须预设 margin 并检验 |mean| 落在
-    (−margin, +margin) 内。这里用配对 t 的正态近似（n 小时偏保守声明见
-    返回值 method）；返回两侧单边 p、conf 水平 CI 与 `equivalent` 判定。
-    margin 必须由计划预先注册（如 kernel/eager 面板平均 PPL 相对差 <1%）；
-    本函数不替调用方选择 margin。n<2 或 margin<=0 时不判定。"""
+    (−margin, +margin) 内。这里用真正的配对 t（df=n−1，`_student_t_sf` +
+    t 临界 CI），而不是把小样本 se 当作已知的正态 z——n=6 时 90% CI 的
+    t 临界值比 z 宽约 20%，用 z 会把「未判等价」误判成等价。返回两侧
+    单边 p、conf 水平 CI 与 `equivalent` 判定。margin 必须由计划预先注册
+    （如 kernel/eager 面板平均 PPL 相对差 <1%）；本函数不替调用方选择
+    margin。n<2 或 margin<=0 时不判定。"""
     d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(float(x))], dtype=float)
     n = int(d.size)
-    out = {'n': n, 'margin': float(margin), 'conf': float(conf), 'equivalent': None, 'method': 'paired-t normal-approx (n>=6 recommended; pre-registered margin required)'}
+    out = {'n': n, 'margin': float(margin), 'conf': float(conf), 'equivalent': None,
+           'method': 'paired-t (Student t, df=n-1; pre-registered margin required)'}
     if n < 2 or not (margin > 0):
         out['note'] = 'not decidable (n<2 or non-positive margin)'
         return out
     mean = float(d.mean())
     sd = float(d.std(ddof=1))
+    df = n - 1
+    # A floating-point mean of k identical values need not be bit-identical to
+    # the value (0.1*6 / 6 = 0.09999999999999999), which would turn a sample
+    # exactly ON the margin into a tiny-se "significant" rejection.  Use the
+    # identical common value when the sample is literally constant.
+    identical = bool(n > 0 and np.all(d == d[0]))
+    if identical:
+        mean = float(d[0])
     out['mean'] = mean
-    se = sd / math.sqrt(n)
-    zc = {0.80: 1.2815515655446004, 0.90: 1.6448536269514722, 0.95: 1.959963984540054}.get(round(float(conf), 4))
-    if zc is None:
-        zc = 1.6448536269514722
-        out['note'] = 'conf not in {0.80, 0.90, 0.95}: fell back to 0.90'
-    out['ci'] = [mean - zc * se, mean + zc * se]
+    out['df'] = int(df)
+    se = 0.0 if identical else sd / math.sqrt(n)
+    tc = _t_critical(float(conf), float(df))
+    if not math.isfinite(tc):
+        # _t_critical only rejects invalid conf/df; keep a deterministic
+        # fallback rather than silently returning a NaN interval.
+        tc = {0.80: 1.2815515655446004, 0.90: 1.6448536269514722, 0.95: 1.959963984540054}.get(round(float(conf), 4), 1.6448536269514722)
+        out['note'] = 't critical unavailable; fell back to the normal critical value'
+    out['t_critical'] = float(tc)
+    out['ci'] = [mean - tc * se, mean + tc * se]
     if se <= 1e-300:
-        p_hi = 1.0 if mean > margin else 0.0  # degenerate: mean above the upper bound cannot be rejected as 'below it'
-        p_lo = 1.0 if mean < -margin else 0.0
+        # Degenerate zero-variance sample.  At the margin boundary the exact
+        # t limit is P(T >= 0) = 0.5, not 0: equality cannot be declared
+        # equivalent with certainty.
+        p_hi = 1.0 if mean > margin else (0.0 if mean < margin else 0.5)
+        p_lo = 1.0 if mean < -margin else (0.0 if mean > -margin else 0.5)
     else:
-        p_hi = 0.5 * math.erfc((margin - mean) / (math.sqrt(2.0) * se))  # H0: mean >= margin  (P(Z >= (margin-mean)/se))
-        p_lo = 0.5 * math.erfc((mean + margin) / (math.sqrt(2.0) * se))  # H0: mean <= -margin  (P(Z <= (-margin-mean)/se) = 0.5*erfc((mean+margin)/(sqrt2*se)))
+        # H0_upper: mean >= margin  -> T = (margin - mean)/se
+        # H0_lower: mean <= -margin -> T = (mean + margin)/se
+        p_hi = _student_t_sf((margin - mean) / se, float(df))
+        p_lo = _student_t_sf((mean + margin) / se, float(df))
+    out['p_hi'] = float(p_hi)
+    out['p_lo'] = float(p_lo)
     out['p_tost'] = float(max(p_hi, p_lo))
     out['equivalent'] = bool(p_hi < 0.05 and p_lo < 0.05)
     out['ci_within_margin'] = bool(out['ci'][0] > -margin and out['ci'][1] < margin)
@@ -5096,6 +5160,11 @@ def _scale_points(points):
                     if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))]
             seeds_kept = [s for s, _v in keep]
             effects = [float(v) for _s, v in keep]
+        if len(set(seeds_kept)) != len(seeds_kept):
+            # A repeated seed would be counted as two independent observations
+            # and shrink every within-scale SE in meta_analyze_effects; this
+            # must be a hard error, not silently "n looks larger".
+            raise ValueError('scale point %r: duplicate seeds %r' % (label, seeds_kept))
         try:
             sc = float(scale)
         except (TypeError, ValueError):
@@ -5116,6 +5185,12 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     否则 `poolable=False`，pooled 只作描述性摘要，结论必须按规模分开报。
     """
     pts = _scale_points(points)
+    labels = [p['label'] for p in pts]
+    if len(set(labels)) != len(labels):
+        # Two rows with the same label are two estimates of the SAME scale
+        # point, but the random-effects weights below treat them as independent
+        # studies — that would double-count one scale and understate tau^2.
+        raise ValueError('meta_analyze_effects needs unique scale labels; got %r' % (labels,))
     per = []
     for p in pts:
         d = np.asarray(p['effects'], dtype=float)
@@ -5389,10 +5464,18 @@ def loglog_regression(points, *, alpha=0.05):
             xx = np.delete(x, i)
             yy = np.delete(y, i)
             xb, yb = float(xx.mean()), float(yy.mean())
-            s = float(((xx - xb) * (yy - yb)).sum() / ((xx - xb) ** 2).sum())
+            den = float(((xx - xb) ** 2).sum())
+            if den <= 0.0:
+                # Duplicate x values can leave no scale spread after dropping
+                # one point; report the undefined fit instead of raising in a
+                # report builder.
+                loo.append({'label': rows[i][0], 'slope': None, 'note': 'degenerate x-spread after dropping this point'})
+                continue
+            s = float(((xx - xb) * (yy - yb)).sum() / den)
             loo.append({'label': rows[i][0], 'slope': s})
         out['leave_one_out'] = loo
-        out['leave_one_out_slope_range'] = [float(min(v['slope'] for v in loo)), float(max(v['slope'] for v in loo))]
+        _loo_slopes = [v['slope'] for v in loo if v['slope'] is not None]
+        out['leave_one_out_slope_range'] = [float(min(_loo_slopes)), float(max(_loo_slopes))] if _loo_slopes else None
     else:
         out.update({'r2': None, 'ci': None, 'p': None,
                     'note': out['note'] + '; k=2 gives an exact line with no residual degrees of freedom, so no CI/R2/p is reported'})

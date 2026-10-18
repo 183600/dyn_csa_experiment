@@ -64,6 +64,36 @@ def sample_std(vals):
     mu = sum(vals) / n
     return (sum(((v - mu) ** 2 for v in vals)) / (n - 1)) ** 0.5
 
+def _signflip_mitm_count(deltas):
+    """Exact sign-assignment count by meet-in-the-middle (NumPy).
+
+    Mirrors `exp_lib.exact_signflip_p`: 2**(n/2) sums per half and two
+    binary searches per left sum, so n=21..40 stays exact without importing
+    torch or enumerating 2**n masks.  Threshold uses this module's historical
+    convention (abs sum vs 1e-12) so the reported p is unchanged for n<=20."""
+    import numpy as _np
+    d = _np.asarray(deltas, dtype=float)
+    n = int(d.size)
+    total = abs(float(d.sum()))
+    thr = total - 1e-12
+    if thr <= 0.0:
+        return 1 << n
+
+    def _sums(vals):
+        out = _np.zeros(1, dtype=float)
+        for v in vals:
+            out = _np.concatenate((out + v, out - v))
+        return out
+
+    half = n // 2
+    left = _sums(d[:half])
+    right = _sums(d[half:])
+    right.sort()
+    lo = _np.searchsorted(right, -thr - left, side='right')
+    hi = _np.searchsorted(right, thr - left, side='left')
+    return int(lo.sum() + (right.size - hi).sum())
+
+
 def exact_signflip(deltas):
     deltas = [float(d) for d in deltas if isinstance(d, (int, float)) and (not isinstance(d, bool)) and math.isfinite(d)]
     n = len(deltas)
@@ -72,6 +102,12 @@ def exact_signflip(deltas):
     obs = abs(sum(deltas))
     mu = sum(deltas) / n
     std = (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0
+    if 20 < n <= 40:
+        try:
+            _cnt = _signflip_mitm_count(deltas)
+            return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _cnt / (1 << n), 'method': 'exact-mitm'}
+        except ImportError:
+            pass
     if n > 20:
         B = 200000
         try:
