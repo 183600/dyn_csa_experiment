@@ -141,6 +141,15 @@ def t_scale_input_guards():
         raise AssertionError('two rows for one scale label must not be pooled as independent studies')
     except ValueError:
         pass
+    for fn, args in (
+        (L.paired_log_ratio, ([1.0, 2.0], [1.1, 2.1])),
+        (L.scale_interaction, ([1.0, 2.0], [1.1, 2.1])),
+    ):
+        try:
+            fn(*args, seeds=[0, 0])
+            raise AssertionError(f'{fn.__name__} must reject duplicate seeds instead of double-counting them')
+        except ValueError:
+            pass
 
 
 def t_exact_signflip_baseline():
@@ -205,6 +214,53 @@ def t_scaling_trend_ragged_pairs():
             raise AssertionError('duplicate labels/seeds must be rejected instead of mis-paired')
         except ValueError:
             pass
+
+
+def t_scaling_trend_primary_direction_and_floor():
+    # Ragged panel: the paired per-seed evidence is six positive slopes, while
+    # the seed-weighted WLS point means (the extra A seeds have high effects)
+    # would give a negative slope.  The verdict must follow the paired slope.
+    pts = [{'label': 'A', 'scale': 1.0, 'effects': [0.0] * 6 + [3.0] * 6,
+            'seeds': list(range(12))},
+           {'label': 'B', 'scale': 10.0, 'effects': [1.0] * 6, 'seeds': list(range(6))}]
+    r = L.scaling_trend(pts, min_seeds=3, min_points=2)
+    assert r['paired']['slope_mean'] == 1.0, r['paired']
+    assert r['wls']['slope'] < 0.0, 'the constructed unpaired fit must disagree with the paired slope'
+    assert r['significant'] is True and r['direction_slope'] == 1.0, r
+    assert r['verdict'] == 'effect_increases_with_scale', r['verdict']
+    assert r['benefit_grows_with_scale'] is False, r
+
+    # Six complete seeds reject at alpha=0.05, but with min_seeds=7 the
+    # pre-registered floor is not met: the trend must stay descriptive.
+    def _pts(seeds):
+        return [{'label': 'A', 'scale': 1.0, 'effects': [0.0] * seeds, 'seeds': list(range(seeds))},
+                {'label': 'B', 'scale': 10.0, 'effects': [1.0] * seeds, 'seeds': list(range(seeds))},
+                {'label': 'C', 'scale': 100.0, 'effects': [2.0] * seeds, 'seeds': list(range(seeds))}]
+    r2 = L.scaling_trend(_pts(6), min_seeds=7, min_points=3)
+    assert r2['p_primary'] < 0.05 and r2['underpowered'] is True, r2
+    assert r2['significant'] is False and r2['verdict'] == 'underpowered', r2
+
+    # A perfect three-point ladder is not "heterogeneous": lack-of-fit Q is
+    # zero, so the trend verdict must survive (the old grand-mean Q labelled
+    # every monotone ladder heterogeneous).
+    r3 = L.scaling_trend(_pts(6), min_seeds=3, min_points=3)
+    assert r3['heterogeneity']['Q'] == 0.0 and r3['heterogeneity']['I2_percent'] == 0.0, r3['heterogeneity']
+    assert r3['significant'] is True and r3['verdict'] == 'effect_increases_with_scale', r3
+
+    # Extra A-only seeds must not make the paired trend look heterogeneous:
+    # they contribute no paired slope in the first place.
+    ragged = _pts(6)
+    ragged[0] = {'label': 'A', 'scale': 1.0, 'effects': [0.0] * 6 + [10.0] * 6,
+                 'seeds': list(range(12))}
+    r5 = L.scaling_trend(ragged, min_seeds=3, min_points=3)
+    assert r5['heterogeneity']['I2_percent'] > 75.0, r5['heterogeneity']
+    assert r5['heterogeneity_paired']['I2_percent'] == 0.0, r5['heterogeneity_paired']
+    assert r5['significant'] is True and r5['verdict'] == 'effect_increases_with_scale', r5
+
+    # A two-point fit is a line; min_points=3 must not be reported as a trend.
+    r4 = L.scaling_trend(_pts(6)[:2], min_seeds=3, min_points=3)
+    assert r4['p_primary'] < 0.05 and r4['significant'] is False, r4
+    assert r4['verdict'] == 'insufficient_points', r4['verdict']
 
 
 # ---------------------------------------------------------------------------
@@ -1702,6 +1758,7 @@ def main():
     _check('A5 exact_signflip baseline', t_exact_signflip_baseline)
     _check('A6 paired_effect resolution_limited', t_paired_effect_resolution)
     _check('A6b scaling_trend ragged seed panels', t_scaling_trend_ragged_pairs)
+    _check('A6b2 scaling_trend primary direction + floors', t_scaling_trend_primary_direction_and_floor)
     _check('A6c meta-analysis input guards', t_scale_input_guards)
     _check('A5b exact sign-flip at scale (MITM)', t_exact_signflip_at_scale)
     _check('A4b TOST Student-t CI + margin boundary', t_tost_student_t_and_boundary)

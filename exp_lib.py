@@ -5155,6 +5155,10 @@ def paired_log_ratio(with_values, without_values, seeds=None):
     ss = list(range(len(wa))) if seeds is None else list(seeds)
     if len(ss) != len(wa):
         raise ValueError('paired_log_ratio seeds length %d does not match vectors length %d' % (len(ss), len(wa)))
+    if len(set(ss)) != len(ss):
+        # Two rows for one seed are not independent observations; downstream
+        # means/SEs would silently double-count that seed.
+        raise ValueError('paired_log_ratio got duplicate seeds %r' % (ss,))
     effects, kept, dropped = [], [], []
     for s, a, b in zip(ss, wa, wb):
         try:
@@ -5301,6 +5305,10 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     ss = list(range(len(a))) if seeds is None else list(seeds)
     if len(ss) != len(a):
         raise ValueError('scale_interaction seeds length does not match effects')
+    if len(set(ss)) != len(ss):
+        # A repeated seed would enter paired_effect_stats as two independent
+        # observations and shrink the interaction SE.
+        raise ValueError('scale_interaction got duplicate seeds %r' % (ss,))
     diff, kept = [], []
     for s, x, y in zip(ss, a, b):
         try:
@@ -5408,6 +5416,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     else:
         paired.update({'note': 'no complete seed across every scale point; the paired exact test is unavailable'})
     out['paired'] = paired
+    paired_primary = len(complete) >= 2
     # extreme-scale interaction (smallest vs largest) on shared seeds
     lo, hi = pts[0], pts[-1]
     lo_map = dict(zip(lo['seeds'], lo['effects']))
@@ -5417,38 +5426,83 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
                               low_label=lo['label'], high_label=hi['label'], seeds=shared,
                               alpha=alpha, min_n=min_seeds) if len(shared) >= 2 else {'n': len(shared), 'note': 'fewer than 2 shared seeds'}
     out['interaction_extremes'] = inter
-    # heterogeneity over the point means (weights = n)
+    # Heterogeneity is the LACK OF FIT around the fitted slope, not the spread
+    # of the point means around their grand mean: a clean monotone ladder has
+    # a large grand-mean Q by construction, so the old form labelled every
+    # k>=3 trend "heterogeneous" even when every point sat exactly on the
+    # line.  Residual Q (df=k-2) asks the question the verdict actually needs:
+    # is a single slope an adequate summary?
     if k >= 2:
-        mu = ybar
-        q = float((n * (y - mu) ** 2).sum())
-        dfh = k - 1
-        p_q = chi2_sf(q, dfh)
-        i2 = float(max(0.0, (q - dfh) / q) * 100.0) if q > 0 else 0.0
+        q = float((n * resid ** 2).sum())
+        dfh = k - 2
+        p_q = chi2_sf(q, dfh) if dfh > 0 else None
+        i2 = float(max(0.0, (q - dfh) / q) * 100.0) if (dfh > 0 and q > 0) else 0.0
         c = float(n.sum() - (n ** 2).sum() / n.sum())
-        tau2 = float(max(0.0, (q - dfh) / c)) if c > 0 else 0.0
+        tau2 = float(max(0.0, (q - dfh) / c)) if (dfh > 0 and c > 0) else 0.0
         out['heterogeneity'] = {'Q': q, 'df': int(dfh), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
-                                'note': 'Q over scale-point mean effects (weights = n); high I2 means a single slope is not an adequate summary'}
-    p_primary = paired.get('p_exact_signflip') if len(complete) >= 2 else wls.get('p')
-    resolution_limited = bool(paired.get('resolution_limited')) if len(complete) >= 2 else (k <= 2)
+                                'method': 'lack-of-fit Q around the WLS slope (weights = n)',
+                                'note': 'high I2 means the scale points deviate from a single slope; it is not the spread of a monotone ladder around its mean'}
+    # The paired path only uses seeds completed at EVERY scale.  Extra seeds at
+    # some scales cannot contribute a paired slope, so they must not decide
+    # whether the paired trend is "heterogeneous" either: report a separate
+    # lack-of-fit over the complete-seed scale means and gate the verdict on
+    # that when the paired slope is the primary inference.
+    het_for_verdict = out.get('heterogeneity') or {}
+    if paired_primary:
+        _yc = np.asarray([float(np.mean([by_seed[s][lb] for s in complete])) for lb in labels], dtype=float)
+        _sp = float(paired['slope_mean'])
+        _ip = float(_yc.mean() - _sp * x.mean())
+        _rp = _yc - (_sp * x + _ip)
+        _cp = float(len(complete))
+        _q_p = float((_cp * _rp ** 2).sum())
+        _df_p = k - 2
+        _p_p = chi2_sf(_q_p, _df_p) if _df_p > 0 else None
+        _i2_p = float(max(0.0, (_q_p - _df_p) / _q_p) * 100.0) if (_df_p > 0 and _q_p > 0) else 0.0
+        out['heterogeneity_paired'] = {'Q': _q_p, 'df': int(_df_p), 'p': _p_p,
+                                       'I2_percent': _i2_p, 'n_complete_seeds': len(complete),
+                                       'method': 'lack-of-fit over complete-seed scale means (weights = n_complete)',
+                                       'note': 'gates the paired trend verdict; the all-seed heterogeneity above stays descriptive'}
+        het_for_verdict = out['heterogeneity_paired']
+    p_primary = paired.get('p_exact_signflip') if paired_primary else wls.get('p')
+    resolution_limited = bool(paired.get('resolution_limited')) if paired_primary else (k <= 2)
+    # A trend below the pre-registered seed/scale floor is descriptive, not a
+    # confirmed effect: the paired test can reject at n<min_seeds (its p floor
+    # is 2/2**n), and a two-point "trend" is a line even when the per-seed
+    # exact test rejects.  Gate the README-level claim on the same thresholds
+    # the rest of this function reports.
+    underpowered = bool(paired.get('underpowered')) if paired_primary else False
+    too_few_scales = k < int(min_points)
     sig = bool(p_primary is not None and math.isfinite(float(p_primary)) and float(p_primary) < alpha
-               and not resolution_limited)
-    het = out.get('heterogeneity') or {}
+               and not resolution_limited and not underpowered and not too_few_scales)
+    het = het_for_verdict
     heterogeneous = bool(float(het.get('I2_percent') or 0.0) > 75.0 or (isinstance(het.get('p'), float) and math.isfinite(het['p']) and het['p'] < alpha))
-    out['primary_inference'] = 'paired per-seed slope (exact sign-flip)' if len(complete) >= 2 else 'WLS point-mean t-test (unpaired scales)'
+    # Direction must come from the same slope that carries the inference.  The
+    # WLS fit weights each scale by its seed count, so on a ragged panel its
+    # sign can disagree with the paired per-seed slope the exact test just
+    # evaluated.  Reporting a verdict from the unpaired slope would then say
+    # "decreases" while the primary evidence says "increases".
+    direction_slope = float(paired['slope_mean']) if paired_primary else slope
+    out['primary_inference'] = 'paired per-seed slope (exact sign-flip)' if paired_primary else 'WLS point-mean t-test (unpaired scales)'
     out['p_primary'] = float(p_primary) if isinstance(p_primary, (int, float)) and math.isfinite(float(p_primary)) else None
     out['significant'] = sig
     out['resolution_limited'] = resolution_limited
+    out['underpowered'] = underpowered
+    out['direction_slope'] = direction_slope
     if heterogeneous:
         verdict = 'heterogeneous_trend'
     elif sig:
-        verdict = 'effect_decreases_with_scale' if slope < 0 else 'effect_increases_with_scale'
+        verdict = 'effect_decreases_with_scale' if direction_slope < 0 else 'effect_increases_with_scale'
+    elif underpowered:
+        verdict = 'underpowered'
+    elif too_few_scales:
+        verdict = 'insufficient_points'
     elif resolution_limited:
         verdict = 'resolution_limited'
     else:
         verdict = 'no_detectable_trend'
     out['verdict'] = verdict
-    out['benefit_grows_with_scale'] = (bool(sig and slope < 0) if not heterogeneous else None)
-    if k < int(min_points):
+    out['benefit_grows_with_scale'] = (bool(sig and direction_slope < 0) if not heterogeneous else None)
+    if too_few_scales:
         out['note'] = 'fewer than min_points=%d scales: slope is descriptive even if the exact test rejects' % int(min_points)
     return out
 
