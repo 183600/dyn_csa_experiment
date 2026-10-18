@@ -461,7 +461,8 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     jA = torch.arange(L, device=dev)
     g_a, av_all = geom.gather_geom()
     pos_a = jA.clamp(max=int(B_pos_a.shape[0]) - 1)
-    Bp_a = B_pos_a[pos_a].to(dtype)
+    # Within the table the gather index is arange(L); use the slice view.
+    Bp_a = (B_pos_a[:L] if L <= B_pos_a.shape[0] else B_pos_a[pos_a]).to(dtype)
     if has_b:
         jB = torch.arange(W, device=dev)
         g_b = geom.gather_geom_b()
@@ -526,7 +527,8 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     jA = torch.arange(L, device=dev)
     g_a, av_all = geom.gather_geom()
     pos_a = jA.clamp(max=int(B_pos_a.shape[0]) - 1)
-    Bp_a = B_pos_a[pos_a].to(dtype)
+    # Within the table the gather index is arange(L); use the slice view.
+    Bp_a = (B_pos_a[:L] if L <= B_pos_a.shape[0] else B_pos_a[pos_a]).to(dtype)
     if has_b:
         jB = torch.arange(W, device=dev)
         g_b = geom.gather_geom_b()
@@ -705,8 +707,13 @@ def _stable_topk_desc(x, k):
     dev = x.device
     flat = x.reshape(m, B)
     # Clone the single k-th column so the full [m, kk] topk values buffer is
-    # released immediately (a bare column view would keep it alive).
-    kth = torch.topk(flat, kk, dim=1, sorted=True).values[:, -1].unsqueeze(1).clone()
+    # released immediately (a bare column view would keep it alive).  For a
+    # large kk the order-statistic form is the same value with a much smaller
+    # transient (and no full sorted top-k); small kk keeps the faster topk.
+    if kk * 4 >= B:
+        kth = torch.kthvalue(flat, B - kk + 1, dim=1).values.unsqueeze(1)
+    else:
+        kth = torch.topk(flat, kk, dim=1, sorted=True).values[:, -1].unsqueeze(1).clone()
     # Same candidate construction as exp_lib._rank_blocks: strictly greater
     # entries plus the earliest equal-to-kth entries.  Prefix ranks use int32
     # (B < 2^31), the same exact integers; the sentinel is filled in place.
@@ -799,6 +806,9 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=True):
         if need_soft:
             masked_lse = torch.where(causal_c, scores, _NEG_INF)
             lse = torch.logsumexp(masked_lse, dim=-1)
+            # Only lse survives; release the full masked table before the
+            # selection tables are built.
+            del masked_lse
         cf = causal_c & torch.isfinite(scores)
         work = torch.where(cf, scores, _NEG_INF)
         # pad 恒为块 0（eager 形式；池化 last_tok 单调时与「首个因果块」
@@ -909,6 +919,9 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
         e = torch.where(row_ok[:, :, None], torch.exp(masked - lse[:, :, None]), 0.0)
         ds = Mk - e * Gt[:, t0:t1, None]
         ds = torch.where(causal_c & torch.isfinite(s_all), ds, 0.0)
+        # The per-chunk normalizer/selector tables are dead once ds exists;
+        # release them before the per-head gradient einsums allocate.
+        del masked, lse, row_ok, e, Mk, s_all
         for i in range(nIH):
             s_i = s_list[i]
             g = ds * wf[:, t0:t1, i:i + 1] * (s_i > 0) * iscale

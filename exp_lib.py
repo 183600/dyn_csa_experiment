@@ -301,7 +301,9 @@ def _segment(n, want_cut_list, min_block, max_block):
         _rem = n % _stride
         if _rem:
             counts.append(_rem)
-        bids = np.repeat(np.arange(len(counts), dtype=np.int64), np.asarray(counts, dtype=np.int64))
+        # Floor division is the same exact integer block id the repeated-count
+        # form builds (uniform stride over the whole sequence).
+        bids = _np_range(n) // _stride
         honoured = {}
         if ns:
             # Non-final block ends are stride, 2*stride, ...; the honoured
@@ -352,7 +354,8 @@ def _segment(n, want_cut_list, min_block, max_block):
     ends = np.empty(len(sa), dtype=np.int64)
     ends[:-1] = sa[1:]
     ends[-1] = n
-    counts = (ends - sa).tolist()
+    counts_np = ends - sa
+    counts = counts_np.tolist()
     honoured = {}
     if ns:
         sel = (ends < n) & (nc[sa] <= ends - 1)
@@ -362,7 +365,7 @@ def _segment(n, want_cut_list, min_block, max_block):
             # {python-int slot: 1.0} mapping (first-occurrence order, duplicate
             # slots collapsed), with the same keys, values and insertion order.
             honoured = dict.fromkeys(slots[hj - 1].tolist(), 1.0)
-    bids = np.repeat(np.arange(len(counts), dtype=np.int64), np.asarray(counts, dtype=np.int64))
+    bids = np.repeat(np.arange(len(counts_np), dtype=np.int64), counts_np)
     if cacheable:
         while len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
             _SEGMENT_CACHE.popitem(last=False)
@@ -373,6 +376,25 @@ _H2D_POOL = {}
 _H2D_POOL_BYTES = [0]
 _H2D_POOL_CAP = 96 << 20
 _H2D_POOL_SLOTS = 4
+_H2D_POOL_MAX_ENTRIES = 256
+
+def _h2d_pool_evict(need=0):
+    # Dynamic-block runs hand the staging pool a new (B, T, max_len) shape
+    # every step; without eviction the pool would permanently fill with stale
+    # shapes and then fall back to pin-per-call for the rest of the run.  An
+    # entry is only released when all of its recorded H2D copies have
+    # completed, so no pinned buffer can be freed while a copy is in flight.
+    while _H2D_POOL and (_H2D_POOL_BYTES[0] + int(need) > _H2D_POOL_CAP
+                          or len(_H2D_POOL) >= _H2D_POOL_MAX_ENTRIES):
+        victim = None
+        for _k, _e in _H2D_POOL.items():
+            if all(_ev is None or _ev.query() for _, _ev in _e['slots']):
+                victim = _k
+                break
+        if victim is None:
+            break
+        _e = _H2D_POOL.pop(victim)
+        _H2D_POOL_BYTES[0] -= int(_e.get('bytes', 0))
 
 def _h2d_stage(shape, dtype, device):
     # Pinned-staging pool for CUDA uploads — transport only (design notes
@@ -394,6 +416,7 @@ def _h2d_stage(shape, dtype, device):
     ent = _H2D_POOL.get(key)
     if ent is None:
         est = int(np.prod(shape, dtype=np.int64)) * torch.empty((), dtype=dtype).element_size() * _H2D_POOL_SLOTS
+        _h2d_pool_evict(est)
         if _H2D_POOL_BYTES[0] + est > _H2D_POOL_CAP:
             return (None, None)
         try:
@@ -402,7 +425,7 @@ def _h2d_stage(shape, dtype, device):
         except (RuntimeError, TypeError):
             return (None, None)
         _H2D_POOL_BYTES[0] += est
-        ent = {'slots': slots, 'rr': 0}
+        ent = {'slots': slots, 'rr': 0, 'bytes': est}
         _H2D_POOL[key] = ent
     slots = ent['slots']
     n = len(slots)
@@ -1490,7 +1513,9 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     # (float lanes) plus the two boolean masks.
     _per_elems = (4 * int(max_len) + 4 * _Wb) * _Fd + 8 * (int(max_len) + _Wb)
     _chunk = _pool_block_chunk(B, _per_elems, Xas.element_size())
-    _bpa = B_pos_a[_pos_a]
+    # Within the embedding table the gather index is exactly arange(max_len),
+    # so a plain slice view is the same rows without an [max_len, C] copy.
+    _bpa = B_pos_a[:max_len] if max_len <= B_pos_a.shape[0] else B_pos_a[_pos_a]
     # Every real block carries at least one token (the segmenters only emit
     # positive counts), so the A lanes always contain a finite logit and the
     # softmax cannot produce NaN/Inf.  When the block-ids object exposes its
@@ -1530,8 +1555,13 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         Xbm = _take_2d(Xbs, g_b[_b0:_b1])
         sc_a = sc[:, :max_len]
         sc_b = sc[:, max_len:]
-        comp[_b0:_b1] = (sc_a * Xam).sum(1) + (sc_b * Xbm).sum(1)
-        del sc, sc_a, sc_b, Xam, Xbm, _ma, _mb
+        part = (sc_a * Xam).sum(1)
+        # Release the A-lane gather before the B-lane product allocates; the
+        # two partial sums are added in the original order.
+        del Xam
+        part = part + (sc_b * Xbm).sum(1)
+        comp[_b0:_b1] = part
+        del sc, sc_a, sc_b, Xbm, _ma, _mb, part
     # Identity-order path: when `order` is the cached arange, order[last_idx]
     # returns exactly last_idx (arange[i] == i, exact integers — index
     # transport, design notes §6.1).
@@ -1591,7 +1621,8 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     # Conservative per-block element count: Xb + Zb(WinZ) + sc plus the mask.
     _per_elems = 3 * int(max_len) * _Fd + 4 * int(max_len)
     _chunk = _pool_block_chunk(B, _per_elems, Xs.element_size())
-    _bpos = B_pos[_pos_a]
+    # Same slice-view fast path as _pool_ordered (index == arange(max_len)).
+    _bpos = B_pos[:max_len] if max_len <= B_pos.shape[0] else B_pos[_pos_a]
     _clean = _pool_counts_clean(block_ids, B)
     comp = torch.empty(B, _Fd, device=dev, dtype=Xs.dtype)
     for _b0 in range(0, B, _chunk):
@@ -1643,8 +1674,14 @@ def _rank_blocks(masked, B, ties, k=None):
     src = masked.flip(1) if ties == 'latest' else masked
     n, _ = src.shape
     # Keep only the k-th value: a bare column view would keep the whole
-    # [n, kk] topk values buffer alive for the rest of the selection.
-    kth = torch.topk(src, kk, dim=1, sorted=True).values[:, -1].unsqueeze(1).clone()
+    # [n, kk] topk values buffer alive for the rest of the selection.  For a
+    # large kk a full sorted top-k is both a big transient and slower than
+    # selecting just the k-th order statistic; the value is exactly the same
+    # (k-th largest == (B-kk+1)-th smallest).  Small kk keeps the faster topk.
+    if kk * 4 >= B:
+        kth = torch.kthvalue(src, B - kk + 1, dim=1).values.unsqueeze(1)
+    else:
+        kth = torch.topk(src, kk, dim=1, sorted=True).values[:, -1].unsqueeze(1).clone()
     # gt has at most kk - 1 entries (the k-th value itself is not strictly
     # greater), so `need` is non-negative and selects exactly kk columns.
     # Prefix ranks use int32 (B < 2^31): the same exact integers as the int64
@@ -1897,11 +1934,16 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             z.sub_(torch.floor(z))
             z.mul_(2.0).sub_(1.0)
             c = z.to(H.dtype)
+            del z
         else:
             raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI)
             raw.mul_(_iscale)
             F.relu(raw, inplace=True)
             c = torch.einsum('inb,ni->nb', raw, w_idx[s:e])
+            # `raw` is dead once the head-weighted score table exists; release
+            # it before top-k builds its full [chunk, B] selection tables (a
+            # chunk-sized peak saving at long context).
+            del raw
         if out_dtype is None:
             out_dtype = c.dtype
             if need_soft:
@@ -1919,10 +1961,6 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             # 跳过）的唯一下游，故整条 soft 尾部不物化（不改变 idx 的任何
             # 整数，也不改变下游任何前向 bit）。
             del c, _ic, _ccausal, _nccausal
-            if random_select:
-                del z
-            else:
-                del raw
             continue
         c.masked_fill_(_nccausal, float('-inf'))
         _lse = torch.logsumexp(c, dim=-1, keepdim=True)
@@ -1934,10 +1972,6 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         # 改写该保存值、使 ExpBackward 的版本检查失败（反向报错）。
         soft[s:e] = torch.nan_to_num(c.gather(1, _ic.long()).sub_(_lse).exp_())
         del c, _lse, _ic, _ccausal, _nccausal
-        if random_select:
-            del z
-        else:
-            del raw
     if _valid_parts is not None:
         out_valid[:] = [_valid_parts[0] if len(_valid_parts) == 1 else torch.cat(_valid_parts, 0)]
     m = None
@@ -2159,6 +2193,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             valid = torch.cat([sel_blk, win_valid_all[s:e]], dim=1)
             nvalid = ~valid[:, None, :]
             anyrow = None if _has_sink else valid.any(-1)
+            del sel_blk, valid
         # Two half-gathers (and the same for V): the block half gathers the
         # k_blk rows topk_l addresses (rows 0..n_blk-1 of the stacked tensor
         # == k_blk rows) and the window half gathers k_sw at win_idx (rows
