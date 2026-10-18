@@ -888,14 +888,22 @@ def t_panel_ablation_flag_does_not_overclaim():
 
 
 def t_adaptive_threshold_guard():
-    # Row chunking keeps a large batch feasible; a single excessively long row
-    # is refused.
+    # Row chunking keeps a large batch feasible; an explicit safety ceiling is
+    # still honoured.
     L.causal_adaptive_threshold(torch.randn(64, 4096), 16)
+    _old = os.environ.get('CSA_ADAPTIVE_MAX_TOKENS')
     try:
-        L.causal_adaptive_threshold(torch.randn(16000), 16)
-        raise AssertionError('a single 16000-token row exceeds the supported limit and must be refused')
-    except RuntimeError:
-        pass
+        os.environ['CSA_ADAPTIVE_MAX_TOKENS'] = '1024'
+        try:
+            L.causal_adaptive_threshold(torch.randn(16000), 16)
+            raise AssertionError('a row above the explicit safety ceiling must be refused')
+        except RuntimeError:
+            pass
+    finally:
+        if _old is None:
+            os.environ.pop('CSA_ADAPTIVE_MAX_TOKENS', None)
+        else:
+            os.environ['CSA_ADAPTIVE_MAX_TOKENS'] = _old
 
 
 def t_adaptive_threshold_values():

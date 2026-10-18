@@ -359,6 +359,8 @@ class PoolGeometry:
 # counts。
 _GEOM_CACHE = {}
 _GEOM_CACHE_CAP = 16
+_GEOM_CACHE_BYTES = [0]
+_GEOM_CACHE_BUDGET = 256 << 20
 _ARANGE_CACHE = {}
 _ARANGE_CACHE_CAP = 8
 _ARANGE_CACHE_BYTES = [0]
@@ -384,6 +386,38 @@ def _full_arange_evict(need=0):
         _ARANGE_CACHE_BYTES[0] -= _arange_nbytes(_t0)
 
 
+def _geom_nbytes(geom):
+    # Charge the real (physical) storage of every integer table a geometry
+    # entry holds, including its lazily-built gather constants.  Lazy tables
+    # are only charged after they exist, so the budget tracks what is resident.
+    total = 0
+    for name in ('counts', 'ends', 'starts', 'last_tok', 'ov_start', 'ov_len',
+                 'starts_prev', 'n_blocks', '_b_off', '_g_b'):
+        t = getattr(geom, name, None)
+        if t is None:
+            continue
+        total += _arange_nbytes(t)
+    ga = getattr(geom, '_ga_cache', None)
+    if ga is not None:
+        for t in ga:
+            if t is not None:
+                total += _arange_nbytes(t)
+    i64 = getattr(geom, '_i64', None)
+    if i64:
+        for t in i64.values():
+            if t is not None:
+                total += _arange_nbytes(t)
+    return total
+
+
+def _geom_evict(need=0):
+    while _GEOM_CACHE and (len(_GEOM_CACHE) >= _GEOM_CACHE_CAP or
+                           _GEOM_CACHE_BYTES[0] + int(need) > _GEOM_CACHE_BUDGET):
+        _k0 = next(iter(_GEOM_CACHE))
+        _e0 = _GEOM_CACHE.pop(_k0)
+        _GEOM_CACHE_BYTES[0] -= int(_e0[2])
+
+
 def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
     # 键 = 行 counts 对象的身份（条目强引用这些对象，因此 id 在条目存活期间
     # 唯一且稳定，不可能撞上复用）；fix 臂全程复用同一分段器出口对象必命中，
@@ -394,13 +428,23 @@ def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
            str(device), int(max_block))
     ent = _GEOM_CACHE.get(key)
     if ent is not None:
-        refs, geom = ent
+        refs, geom, charged = ent
         if len(refs) == len(counts_rows) and all(a is b for a, b in zip(refs, counts_rows)):
+            # Lazy gather constants may have been built since insertion;
+            # re-charge the entry so the byte budget tracks what is resident.
+            cur = _geom_nbytes(geom)
+            if cur != charged:
+                _GEOM_CACHE_BYTES[0] += cur - charged
+                _GEOM_CACHE[key] = (refs, geom, cur)
             return geom
-    if len(_GEOM_CACHE) >= _GEOM_CACHE_CAP:
-        _GEOM_CACHE.pop(next(iter(_GEOM_CACHE)))
+        _GEOM_CACHE.pop(key, None)
+        _GEOM_CACHE_BYTES[0] -= int(charged)
     geom = PoolGeometry(counts_rows, overlap, T, device, max_block)
-    _GEOM_CACHE[key] = (tuple(counts_rows), geom)
+    need = _geom_nbytes(geom)
+    if need <= _GEOM_CACHE_BUDGET:
+        _geom_evict(need)
+        _GEOM_CACHE[key] = (tuple(counts_rows), geom, need)
+        _GEOM_CACHE_BYTES[0] += need
     return geom
 
 
@@ -555,7 +599,13 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     starts_l = _i64['starts']
     ov_start_l = _i64['ov_start']
     nblk_l = _i64['n_blocks'][:, None]
-    gBpb_keys, gBpb_vals = [], []
+    # A fixed flat buffer holds every B-lane key/value exactly once: the same
+    # concatenation order as the old per-chunk list + torch.cat, but without
+    # retaining the chunk tensors and a second full copy at the end.
+    _bpb_total = int(R) * int(Bm) * int(W) if (need_bpb and has_b) else 0
+    gBpb_keys = torch.empty(_bpb_total, device=dev, dtype=torch.long) if _bpb_total else None
+    gBpb_vals = torch.empty((_bpb_total, c), device=dev, dtype=torch.float32) if _bpb_total else None
+    _bpb_off = 0
     ch = _pool_chunk_b(R, L + (W if has_b else 0), c, temps=8)
     # 单 chunk（ch >= Bm）时 in_ch / b2 的 chunk 范围条件恒真（geom 与 bid
     # 同源——Bm 由同一分段表的 counts 给出，bid 值恒 < Bm）：where(全真,
@@ -627,15 +677,23 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
             if _rows < int(gsum.shape[0]):
                 gBpa[_rows - 1] += gsum[_rows:].sum(dim=0).to(B_pos_a.dtype)
         if need_bpb and has_b:
-            gBpb_keys.append(b_off[:, b0:b1].reshape(-1))
-            gBpb_vals.append(glogit_b.reshape(-1, c))
+            _k = b_off[:, b0:b1].reshape(-1)
+            _v = glogit_b.reshape(-1, c)
+            _n = int(_k.numel())
+            gBpb_keys[_bpb_off:_bpb_off + _n] = _k
+            gBpb_vals[_bpb_off:_bpb_off + _n] = _v
+            _bpb_off += _n
     gBpb = None
     if need_bpb:
         # 同 gXb/gZb：W_b == 0 时 keys/vals 为空，段和返回全零——与 eager
         # 空泳道图的零梯度一致（HCA 把同一 B_pos 作 a/b 两参传入，零项
         # 不改变 autograd 对同一张量的梯度求和）。
-        keys = torch.cat(gBpb_keys) if gBpb_keys else torch.zeros(0, device=dev, dtype=torch.long)
-        vals = torch.cat(gBpb_vals) if gBpb_vals else torch.zeros(0, c, device=dev, dtype=torch.float32)
+        if _bpb_total:
+            keys = gBpb_keys[:_bpb_off]
+            vals = gBpb_vals[:_bpb_off]
+        else:
+            keys = torch.zeros(0, device=dev, dtype=torch.long)
+            vals = torch.zeros(0, c, device=dev, dtype=torch.float32)
         gBpb = _det_scatter_add(B_pos_b.shape[0], keys, vals, dev, B_pos_b.dtype)
     return gXa, gXb, gZa, gZb, gBpa, gBpb
 
@@ -962,20 +1020,10 @@ def _warn_shape_fallback(op, detail):
 
 
 def _indexer_impl_for_shape(impl, kI):
-    if impl == 'triton' and int(kI.shape[1]) > 8192:
-        # Long-context safety: Bm grows with T/block_size, so a 32k/64k eval
-        # can exceed the Triton lane limit even though the sparse attention
-        # itself is still linear.  Degrade explicitly to the torch-reference
-        # twin (documented, same algorithm); set CSA_INDEXER_STRICT=1 to
-        # reject this shape instead.
-        _strict = os.environ.get('CSA_INDEXER_STRICT', '').strip().lower() in ('1', 'true', 'yes')
-        if _strict:
-            raise RuntimeError(
-                f'Triton indexer cannot handle Bm={int(kI.shape[1])} > 8192 (register/lane limit). '
-                'Use CSA_KERNEL=ref (explicit torch-reference backend) for this sequence length, '
-                'or unset CSA_INDEXER_STRICT to accept the automatic reference fallback.')
-        _warn_shape_fallback('indexer', f'Bm={int(kI.shape[1])} exceeds the Triton register/lane limit 8192; using the torch-reference backend')
-        return 'ref'
+    # The scoring kernel already loops over block columns at runtime, and the
+    # runner-up path below streams the top-k over block chunks.  Long-context
+    # shapes (Bm can be tens of thousands) therefore stay on the Triton
+    # scorer instead of silently degrading to the torch reference twin.
     return impl
 
 
@@ -1757,7 +1805,7 @@ def _attach_attn_kernels(ns):
     @triton.jit
     def attn_fwd(q_ptr, kb_ptr, vb_ptr, ksw_ptr, vsw_ptr, idx_ptr, valid_ptr, lt_ptr, soft_ptr, sink_ptr, out_ptr,
                  T, Bm, W, SCALE,
-                 NB: tl.constexpr, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BW: tl.constexpr,
+                 NB, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BW: tl.constexpr,
                  HAS_VALID: tl.constexpr, HAS_SINK: tl.constexpr, IDX_ARANGE: tl.constexpr, DOT: tl.constexpr):
         pid = tl.program_id(0)
         n_t = tl.cdiv(T, BT)
@@ -1796,7 +1844,7 @@ def _attach_attn_kernels(ns):
             vt = tl.load(vsw_ptr + ((r * T + p[:, None].to(tl.int64)) * NH + h) * HD + d[None, :], mask=pm[:, None], other=0.0).to(tl.float32)
             acc = acc * alpha[:, None] + tl.dot(pa, vt, input_precision=DOT)
             m = mn
-        for j in tl.static_range(NB):
+        for j in range(NB):
             if IDX_ARANGE:
                 # Each row is exactly arange(NB): the block id is the
                 # lane index, so no dense index table is read.
@@ -1831,7 +1879,7 @@ def _attach_attn_kernels(ns):
     def attn_bwd_stats(q_ptr, kb_ptr, vb_ptr, ksw_ptr, vsw_ptr, idx_ptr, valid_ptr, lt_ptr, soft_ptr, sink_ptr, dO_ptr,
                        mA_ptr, ZA_ptr, mS_ptr, ZS_ptr, GA_ptr, GS_ptr,
                        T, Bm, W, SCALE,
-                       NB: tl.constexpr, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BW: tl.constexpr,
+                       NB, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BW: tl.constexpr,
                        HAS_VALID: tl.constexpr, HAS_SOFT: tl.constexpr, HAS_SINK: tl.constexpr,
                        IDX_ARANGE: tl.constexpr, DOT: tl.constexpr):
         pid = tl.program_id(0)
@@ -1883,7 +1931,7 @@ def _attach_attn_kernels(ns):
                 ZS = ZS * aS + tl.sum(tl.exp(z - mnS[:, None]), 1)
                 GSr = GSr * aS + tl.sum(tl.exp(z - mnS[:, None]) * g, 1)
                 mS = mnS
-        for j in tl.static_range(NB):
+        for j in range(NB):
             if IDX_ARANGE:
                 # Each row is exactly arange(NB): the block id is the
                 # lane index, so no dense index table is read.
@@ -1934,7 +1982,7 @@ def _attach_attn_kernels(ns):
     def attn_bwd_dq(q_ptr, kb_ptr, vb_ptr, ksw_ptr, vsw_ptr, idx_ptr, valid_ptr, lt_ptr, soft_ptr, sink_ptr, dO_ptr,
                     mA_ptr, ZA_ptr, mS_ptr, ZS_ptr, GA_ptr, GS_ptr, dq_ptr,
                     T, Bm, W, SCALE,
-                    NB: tl.constexpr, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BW: tl.constexpr,
+                    NB, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BW: tl.constexpr,
                     HAS_VALID: tl.constexpr, HAS_SOFT: tl.constexpr, HAS_SINK: tl.constexpr,
                     IDX_ARANGE: tl.constexpr, DOT: tl.constexpr):
         pid = tl.program_id(0)
@@ -1984,7 +2032,7 @@ def _attach_attn_kernels(ns):
                 eS = tl.exp(z - mS[:, None])
                 dz += eS / ZSs[:, None] * (g - GS[:, None])
             dqacc += tl.dot(dz, kt, input_precision=DOT) * SCALE
-        for j in tl.static_range(NB):
+        for j in range(NB):
             if IDX_ARANGE:
                 # Each row is exactly arange(NB): the block id is the
                 # lane index, so no dense index table is read.
@@ -2098,7 +2146,7 @@ def _attach_attn_kernels(ns):
     def attn_bwd_dsoft(q_ptr, kb_ptr, vb_ptr, idx_ptr, valid_ptr, lt_ptr, soft_ptr, dO_ptr,
                        mS_ptr, ZS_ptr, GS_ptr, dsoft_ptr,
                        T, Bm, SCALE,
-                       NB: tl.constexpr, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr,
+                       NB, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr,
                        HAS_VALID: tl.constexpr, IDX_ARANGE: tl.constexpr):
         # dsoft = Σ_h dzS_h / sf —— ref 反向在头循环里 += 的同一个跨头求和。
         # dkdv_blocks 的网格是 (r, b, h)，表达不了它：同一 (t, j) 泳道会被
@@ -2116,7 +2164,7 @@ def _attach_attn_kernels(ns):
         tm = t < T
         ti = t.to(tl.int64)
         d = tl.arange(0, HD)
-        for j in tl.static_range(NB):
+        for j in range(NB):
             if IDX_ARANGE:
                 # Each row is exactly arange(NB): the block id is the
                 # lane index, so no dense index table is read.
@@ -2248,12 +2296,77 @@ def _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
 _IDX_SCORES_CAP_BYTES = 128 << 20
 
 
+def _indexer_topk_chunked(scores, last_tok, t0, T, Bm, k_out, need_soft, out_dtype):
+    """Exact stable top-k for a score tile when Bm exceeds the lane limit.
+
+    `scores` is the already-materialised [R, tc, Bm] tile from idx_score.  It
+    is walked in column chunks; each chunk contributes its own stable top-k,
+    and the merged candidate table is stable-sorted again.  Candidate order is
+    chunk-major / column-minor, i.e. exactly ascending global block id, so the
+    stable descending sort reproduces the full-width tie rule (earliest
+    block wins).  Memory stays O(R * tc * (chunk + k)) instead of holding any
+    extra full-width table.
+    """
+    R, tc = int(scores.shape[0]), int(scores.shape[1])
+    dev = scores.device
+    k_out = max(0, min(int(k_out), int(Bm)))
+    # Chunk width: keep one candidate tile around a few megabytes.
+    bc = max(64, min(int(Bm), (4 << 20) // max(1, R * tc * 4)))
+    b = torch.arange(int(Bm), device=dev, dtype=torch.long)
+    lt = last_tok[:, :Bm].to(torch.int64)
+    tp = torch.arange(int(t0), int(t0) + tc, device=dev, dtype=torch.int64)[None, :, None]
+    cand_v, cand_i = [], []
+    m_run = None
+    z_run = None
+    for b0 in range(0, int(Bm), bc):
+        b1 = min(b0 + bc, int(Bm))
+        sc = scores[:, :, b0:b1]
+        causal = tp > lt[:, None, b0:b1]
+        masked = torch.where(causal, sc, float('-inf'))
+        if need_soft:
+            cm = masked.max(dim=-1).values
+            if m_run is None:
+                m_run = cm
+                cm_safe = torch.where(cm == float('-inf'), torch.zeros_like(cm), cm)
+                z_run = torch.exp(masked - cm_safe[..., None]).sum(dim=-1)
+            else:
+                mn = torch.maximum(m_run, cm)
+                mn_safe = torch.where(mn == float('-inf'), torch.zeros_like(mn), mn)
+                z_run = (z_run * torch.exp(m_run - mn_safe)
+                         + torch.exp(masked - mn_safe[..., None]).sum(dim=-1))
+                m_run = mn
+        work = torch.where(causal & torch.isfinite(sc), sc, float('-inf'))
+        val, ind = _stable_topk_desc(work, min(k_out, b1 - b0))
+        cand_v.append(val)
+        cand_i.append(ind + b0)
+    if not cand_v:
+        idx = torch.zeros((R, tc, k_out), device=dev, dtype=torch.int32)
+        valid = torch.zeros((R, tc, k_out), device=dev, dtype=torch.bool)
+        soft = torch.zeros((R, tc, k_out), device=dev, dtype=out_dtype) if need_soft else None
+        return idx, valid, soft
+    cv = torch.cat(cand_v, dim=-1)
+    ci = torch.cat(cand_i, dim=-1)
+    # The concatenated per-chunk candidates are only locally sorted, so a
+    # final stable merge is always required (including k_out == Bm, where the
+    # full selection must come back in descending order).
+    top_val, top_pos = _stable_topk_desc(cv, k_out)
+    top_idx = ci.gather(-1, top_pos)
+    valid = top_val > float('-inf')
+    idx = torch.where(valid, top_idx, torch.zeros((), device=dev, dtype=torch.long)).to(torch.int32)
+    soft = None
+    if need_soft:
+        lse = m_run + torch.log(z_run)
+        sv = torch.exp(top_val - lse[..., None])
+        sv = torch.where(valid & torch.isfinite(lse)[..., None], sv, torch.zeros_like(sv))
+        soft = torch.where(sv == sv, sv, torch.zeros_like(sv)).to(out_dtype)
+    return idx, valid, soft
+
+
 def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
     K = _kernels()
     triton = K.triton
     R, T, nIH, hd = qI.shape
     Bm = kI.shape[1]
-    assert Bm <= 8192, 'Bm > 8192 超出单程序泳道寄存器上限——走 ref 后端'
     qI = qI.contiguous()
     kI = kI.contiguous()
     w_idx = w_idx.contiguous()
@@ -2279,9 +2392,17 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
         K.idx_score[(R * triton.cdiv(tc, BT),)](qI, kI, w_idx, scores, t0, T, tc, Bm, hd ** -0.5,
                                                 N_IH=nIH, HD=hd, HDP=HDP, BT=BT, BB=BB,
                                                 DOT=_dot_prec(), num_warps=4)
-        K.idx_topk[(R * tc,)](scores, last_tok, idx, valid_i8, soft_arg, t0, T, tc, Bm,
-                              K=k_out, BB=BB2, HAS_SOFT=bool(need_soft),
-                              num_warps=8 if BB2 >= 1024 else 4)
+        if Bm <= 8192:
+            K.idx_topk[(R * tc,)](scores, last_tok, idx, valid_i8, soft_arg, t0, T, tc, Bm,
+                                  K=k_out, BB=BB2, HAS_SOFT=bool(need_soft),
+                                  num_warps=8 if BB2 >= 1024 else 4)
+        else:
+            _i, _v, _s = _indexer_topk_chunked(
+                scores, last_tok, t0, T, Bm, k_out, bool(need_soft), qI.dtype)
+            idx[:, t0:t0 + tc] = _i
+            valid_i8[:, t0:t0 + tc] = _v.to(torch.int8)
+            if soft is not None:
+                soft[:, t0:t0 + tc] = _s
     return idx, valid_i8.view(torch.bool), soft
 
 

@@ -461,12 +461,17 @@ def assert_no_split_leakage(train_idx, val_idx, test_idx, *, groups=None,
 # Leakage-safe preprocessing
 # ---------------------------------------------------------------------------
 
-def _as_float_2d(X, *, name='X'):
+def _as_numeric_2d(X, *, name='X'):
     arr = np.asarray(X)
     if arr.ndim == 1:
         arr = arr.reshape(-1, 1)
     if arr.ndim != 2:
         raise ValueError(f'{name} must be 1-D or 2-D, got shape {arr.shape}')
+    return arr
+
+
+def _as_float_2d(X, *, name='X'):
+    arr = _as_numeric_2d(X, name=name)
     try:
         arr = arr.astype(np.float64, copy=False)
     except (TypeError, ValueError):
@@ -474,6 +479,15 @@ def _as_float_2d(X, *, name='X'):
             f'{name} must be numeric; encode categorical features before '
             'calling the leakage-safe preprocessor') from None
     return arr
+
+
+def _col_float64(arr, j, name='X'):
+    try:
+        return np.asarray(arr[:, j], dtype=np.float64)
+    except (TypeError, ValueError):
+        raise TypeError(
+            f'{name} must be numeric; encode categorical features before '
+            'calling the leakage-safe preprocessor') from None
 
 
 def _finite_values(col):
@@ -542,14 +556,16 @@ class LeakageSafePreprocessor:
 
     def fit(self, X, y=None):
         """Learn imputation/clipping/scaling statistics from ``X`` (train)."""
-        X = _as_float_2d(X)
+        X = _as_numeric_2d(X)
         n, p = X.shape
         if n == 0:
             raise ValueError('cannot fit the preprocessor on zero training rows')
-        Xn = np.where(np.isfinite(X), X, np.nan)
         stats = []
         for j in range(p):
-            col = Xn[:, j]
+            # Convert one column at a time: the full matrix never needs a
+            # second float64 copy (large inputs can be float32/uint8).
+            base = _col_float64(X, j)
+            col = np.where(np.isfinite(base), base, np.nan)
             finite = col[np.isfinite(col)]
             fill = self._fill_value(finite)
             if not np.isfinite(fill):
@@ -620,14 +636,14 @@ class LeakageSafePreprocessor:
         """Apply training statistics to ``X``; never refits anything."""
         if not self.fitted_:
             raise RuntimeError('LeakageSafePreprocessor.transform called before fit')
-        X = _as_float_2d(X)
+        X = _as_numeric_2d(X)
         if X.shape[1] != self.n_features_in_:
             raise ValueError(
                 f'X has {X.shape[1]} features, but the preprocessor was fitted '
                 f'on {self.n_features_in_}')
-        out = np.empty_like(X, dtype=np.float64)
+        out = np.empty(X.shape, dtype=np.float64)
         for j, st in enumerate(self.feature_stats_):
-            col = X[:, j]
+            col = _col_float64(X, j)
             col = np.where(np.isfinite(col), col, np.nan)
             lo, hi = st['clip_lo'], st['clip_hi']
             if lo is not None and hi is not None:
@@ -708,28 +724,36 @@ def prepare_features(X_train, X_val=None, X_test=None, **kwargs):
 # ---------------------------------------------------------------------------
 
 def _matrix_fingerprint(X):
-    arr = np.asarray(X, dtype=np.float64)
+    arr = np.asarray(X)
     h = hashlib.sha256()
     h.update(str(arr.shape).encode('ascii'))
-    # Hash in bounded row blocks.
+    # Convert and hash in bounded row blocks: the whole matrix is never
+    # duplicated as float64 just to be hashed.
     for start in range(0, arr.shape[0], 1 << 20):
-        h.update(np.ascontiguousarray(arr[start:start + (1 << 20)]).tobytes())
+        block = np.asarray(arr[start:start + (1 << 20)], dtype=np.float64)
+        h.update(np.ascontiguousarray(block).tobytes())
     return h.hexdigest()[:16]
 
 
 def _row_keys(X):
     """Stable per-row keys for exact-duplicate detection (NaN-safe)."""
-    arr = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
-    finite = np.isfinite(arr)
+    src = np.asarray(X)
+    if src.ndim == 1:
+        src = src.reshape(-1, 1)
     keys = []
-    for row, ok in zip(arr, finite):
-        # NaN/Inf positions are represented explicitly so two rows are equal
-        # only when their finite values AND their non-finite patterns match.
-        h = hashlib.blake2b(digest_size=8)
-        h.update(np.ascontiguousarray(row[ok]).tobytes())
-        h.update(b'|')
-        h.update(np.packbits(~ok).tobytes())
-        keys.append(h.digest())
+    # Hash row blocks; each block is converted to float64 exactly like the
+    # old whole-matrix conversion would have done.
+    for start in range(0, src.shape[0], 1 << 16):
+        arr = np.ascontiguousarray(np.asarray(src[start:start + (1 << 16)], dtype=np.float64))
+        finite = np.isfinite(arr)
+        for row, ok in zip(arr, finite):
+            # NaN/Inf positions are represented explicitly so two rows are equal
+            # only when their finite values AND their non-finite patterns match.
+            h = hashlib.blake2b(digest_size=8)
+            h.update(np.ascontiguousarray(row[ok]).tobytes())
+            h.update(b'|')
+            h.update(np.packbits(~ok).tobytes())
+            keys.append(h.digest())
     return keys
 
 

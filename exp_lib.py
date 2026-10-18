@@ -91,12 +91,23 @@ def _kernel_stamp():
         return ''
 
 def _eager_batch_active():
-    """True when CSA_EAGER_BATCH selects the batched reference twin.
+    """True when the batched reference twin should be used.
 
+    On CUDA with the kernel module available, the batched twin is the default
+    for B > 1; the row-by-row reference path remains available (and is the
+    only path on CPU) for bitwise debugging.  ``CSA_EAGER_BATCH=0`` opts out.
     That path changes the numerical implementation (it is not the eager
-    row-by-row bitwise contract), so it must enter `_code` exactly like a
-    kernel backend.  Default (unset) leaves every existing stamp unchanged."""
-    return os.environ.get('CSA_EAGER_BATCH', '').strip().lower() in ('1', 'true', 'yes', 'ref')
+    row-by-row bitwise contract), so it enters `_code` exactly like a kernel
+    backend."""
+    v = os.environ.get('CSA_EAGER_BATCH', '').strip().lower()
+    if v in ('0', 'false', 'no', 'off'):
+        return False
+    if _CK is None:
+        return False
+    try:
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 def code_stamp():
     """当前代码+内核模式写进每条记录的 `_code` 戳（eager = CODE_SEMANTICS
@@ -549,13 +560,20 @@ def _h2d_stage(shape, dtype, device):
     with _H2D_POOL_LOCK:
         ent = _H2D_POOL.get(key)
         if ent is None:
-            est = int(np.prod(shape, dtype=np.int64)) * torch.empty((), dtype=dtype).element_size() * _H2D_POOL_SLOTS
+            per_slot = int(np.prod(shape, dtype=np.int64)) * torch.empty((), dtype=dtype).element_size()
+            # Large uploads reserve only as many slots as fit comfortably:
+            # keeping 8 copies of a hundreds-of-MB geometry would exceed the
+            # pool and force every layer onto the blocking pinned-copy
+            # fallback.  The slot count is per entry, so small uploads still
+            # use the full ring.
+            n_slots = max(1, min(int(_H2D_POOL_SLOTS), int((_H2D_POOL_CAP // 2) // max(1, per_slot))))
+            est = per_slot * n_slots
             _h2d_pool_evict_locked(est)
             if _H2D_POOL_BYTES[0] + est > _H2D_POOL_CAP:
                 return (None, None)
             try:
                 with torch.inference_mode(False):
-                    slots = [[torch.empty(shape, dtype=dtype).pin_memory(), None] for _ in range(_H2D_POOL_SLOTS)]
+                    slots = [[torch.empty(shape, dtype=dtype).pin_memory(), None] for _ in range(n_slots)]
             except (RuntimeError, TypeError):
                 return (None, None)
             _H2D_POOL_BYTES[0] += est
@@ -720,67 +738,105 @@ def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=Fals
     cut_list = (sim < tau).cpu().numpy()
     return blocks_from_cuts(n, cut_list, min_block, max_block, dev, return_count=return_count)
 
+def _causal_quantile_exact(x, cols, target_block_tokens):
+    """Closed-form causal quantile at the requested columns.
+
+    `x` is the [rows, n] work-precision similarity matrix and `cols` the
+    (ascending) column indices to evaluate.  Row/column chunking is a pure
+    partition, so the values are identical to the full-table form.
+    """
+    n = int(x.shape[-1])
+    dev = x.device
+    q = max(1.0 / max(int(target_block_tokens), 1), 0.001)
+    idx = _arange_cache(n, dev)
+    cols = cols.to(torch.long)
+    pos = q * cols.to(torch.float32)
+    lo = pos.floor().long()
+    frac = pos - lo
+    lo_c = lo.clamp(max=n - 1)
+    hi_c = (lo + 1).clamp(max=n - 1)
+    use_hi = (frac > 0.0) & (lo + 1 <= cols)
+    first_row = cols == 0
+    _pair_bytes = 16
+    _budget = 128 << 20
+    nc = max(1, int(cols.numel()))
+    col_chunk = max(1, min(nc, 64))
+    row_chunk = max(1, _budget // max(col_chunk * n * _pair_bytes, 1))
+    out = x.new_empty((x.shape[0], nc))
+    for r0 in range(0, x.shape[0], row_chunk):
+        b = min(row_chunk, x.shape[0] - r0)
+        xr = x[r0:r0 + b]
+        for c0 in range(0, nc, col_chunk):
+            c1 = min(c0 + col_chunk, nc)
+            cc = cols[c0:c1]
+            masked = torch.where(idx[None, None, :] <= cc[None, :, None],
+                                 xr[:, None, :], float('inf'))
+            masked = masked.sort(dim=-1).values
+            _lc = lo_c[c0:c1][None, :, None].expand(b, c1 - c0, 1)
+            _hc = hi_c[c0:c1][None, :, None].expand(b, c1 - c0, 1)
+            lo_v = masked.gather(-1, _lc).squeeze(-1)
+            hi_v = masked.gather(-1, _hc).squeeze(-1)
+            interp = lo_v * (1.0 - frac[c0:c1]) + hi_v * frac[c0:c1]
+            oc = torch.where(use_hi[c0:c1], interp, lo_v)
+            out[r0:r0 + b, c0:c1] = torch.where(first_row[c0:c1],
+                                                torch.full_like(oc, float('-inf')), oc)
+    return out
+
+
 def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
-    # 闭式因果分位数按 (行, 列) 分块；分块是纯行/列划分，每个输出元素仍由
-    # 同一个排序后因果行上的同两个秩插值得到，值不变。
-    n = sim.shape[-1]
-    # Reject lengths beyond the band this segmenter is designed for.  The
-    # row/column chunking below keeps the scratch bounded, so a larger
-    # explicit limit can be opted into for a scale study.
-    _max_len = 8192
+    n = int(sim.shape[-1])
+    # Hard safety ceiling only (the sampling path below is bounded), not the
+    # old 8192 rejection limit.
+    _max_len = 1 << 20
     _env_max = os.environ.get('CSA_ADAPTIVE_MAX_TOKENS', '').strip()
     if _env_max:
         try:
             _max_len = max(1, int(_env_max))
         except ValueError:
-            print(f'[segmenter] CSA_ADAPTIVE_MAX_TOKENS={_env_max!r} is not an integer — using 8192')
-    if int(n) > _max_len:
+            print(f'[segmenter] CSA_ADAPTIVE_MAX_TOKENS={_env_max!r} is not an integer — using {_max_len}')
+    if n > _max_len:
         raise RuntimeError(
-            f'causal_adaptive_threshold 的因果分位数闭式为 O(rows·T²)，超出安全上限 {_max_len}: '
-            'adaptive 分段器不支持该序列长度——请改用 chunking="cosine_learnable"，'
-            '或显式提高 CSA_ADAPTIVE_MAX_TOKENS')
-    q = max(1.0 / max(target_block_tokens, 1), 0.001)
-    # 1-D (single row) or 2-D (batched rows) — every op is rowwise
-    # independent, so row-chunking the batch dim is value-identical per row:
-    # same kernels, same per-row reduction order.
+            f'causal_adaptive_threshold 超出显式安全上限 {_max_len}（CSA_ADAPTIVE_MAX_TOKENS）: '
+            '请提高该上限或改用 chunking="cosine_learnable"')
+    # Up to this length the exact closed form (O(T^2) comparisons) is used.
+    _exact_len = 8192
+    _env_exact = os.environ.get('CSA_ADAPTIVE_EXACT_TOKENS', '').strip()
+    if _env_exact:
+        try:
+            _exact_len = max(1, int(_env_exact))
+        except ValueError:
+            print(f'[segmenter] CSA_ADAPTIVE_EXACT_TOKENS={_env_exact!r} is not an integer — using {_exact_len}')
     squeeze = sim.dim() == 1
     x = (sim.unsqueeze(0) if squeeze else sim).detach().float()
-    n = x.shape[-1]
-    idx = _arange_cache(n, sim.device)
-    pos = q * idx
-    lo = pos.floor().long()
-    frac = pos - lo
-    lo_c = lo.clamp(max=n - 1)[..., None]
-    hi_c = (lo + 1).clamp(max=n - 1)[..., None]
-    use_hi = (frac > 0.0) & (lo + 1 <= idx)
-    first_row = idx == 0
-    # Keep the per-sort scratch bounded: a sort materialises values plus an
-    # int64 index (12 bytes) on top of the 4-byte comparison table.  Column
-    # chunking keeps the largest temporary below the full [rows, T, T] tensor.
-    _pair_bytes = 16
-    _budget = 128 << 20
-    col_chunk = max(1, min(int(n), 64))
-    row_chunk = max(1, _budget // max(col_chunk * int(n) * _pair_bytes, 1))
-    out = torch.empty_like(x)
-    for r0 in range(0, x.shape[0], row_chunk):
-        b = min(row_chunk, x.shape[0] - r0)
-        xr = x[r0:r0 + b]
-        for c0 in range(0, n, col_chunk):
-            c1 = min(c0 + col_chunk, n)
-            cols = idx[c0:c1]
-            masked = torch.where(idx[None, None, :] <= cols[None, :, None],
-                                 xr[:, None, :], float('inf'))
-            masked = masked.sort(dim=-1).values
-            lo_v = masked.gather(-1, lo_c[c0:c1].expand(b, c1 - c0, 1)).squeeze(-1)
-            hi_v = masked.gather(-1, hi_c[c0:c1].expand(b, c1 - c0, 1)).squeeze(-1)
-            interp = lo_v * (1.0 - frac[c0:c1]) + hi_v * frac[c0:c1]
-            oc = torch.where(use_hi[c0:c1], interp, lo_v)
-            out[r0:r0 + b, c0:c1] = torch.where(first_row[c0:c1],
-                                                torch.full_like(oc, float('-inf')), oc)
+    if n <= _exact_len:
+        out = _causal_quantile_exact(x, _arange_cache(n, sim.device), target_block_tokens)
+    else:
+        # Long-context approximation: evaluate the exact causal quantile on a
+        # bounded sample of columns and interpolate the threshold in between.
+        # The first block is kept exact so early boundaries behave as before.
+        prefix = min(n, max(256, _exact_len // 8))
+        n_samp = 1024
+        step = max(1, (n - prefix + n_samp - 1) // n_samp)
+        samp = torch.cat([
+            torch.arange(prefix, device=sim.device, dtype=torch.long),
+            torch.arange(prefix, n, step, device=sim.device, dtype=torch.long),
+            torch.tensor([n - 1], device=sim.device, dtype=torch.long),
+        ]).unique(sorted=True)
+        sv = _causal_quantile_exact(x, samp, target_block_tokens)
+        full = torch.arange(n, device=sim.device, dtype=torch.long)
+        pos = torch.searchsorted(samp, full, right=True) - 1
+        pos = pos.clamp(0, samp.numel() - 2)
+        nxt = pos + 1
+        x0 = samp[pos].to(torch.float64)
+        x1 = samp[nxt].to(torch.float64)
+        w = ((full.to(torch.float64) - x0) / (x1 - x0).clamp_min(1.0)).to(sv.dtype)
+        out = sv[:, pos] * (1.0 - w) + sv[:, nxt] * w
+        out[:, 0] = float('-inf')
     out = out.to(sim.device)
     return out.squeeze(0) if squeeze else out
+
 
 def blocks_fixed(n, block_size, device):
     key = (_dev_str(device), 'blkfix', int(n), int(block_size))
@@ -808,6 +864,10 @@ _CAUSAL_DONOR_PIN_BYTES = 64 << 20
 
 def _causal_donor(device, width):
     # 单一共享 bool donor（True = j > i 的被掩 lane）：同一 [width, width]
+    if not _dense_mask_fits(width, 1):
+        raise RuntimeError(
+            f'refusing to materialise a full [{int(width)}, {int(width)}] bool mask '
+            f'(> {int(_DENSE_MASK_ROW_CAP_BYTES)} bytes); use the row-chunked mask path')
     # 表按 [:T, :T] 切片服务一切 T <= width；_mask_buffer 的 causal 分支
     # 说明其与加性 donor 的逐位对应。小表作为 pinned key 复用；超过 pin
     # 上限的大表只进可驱逐缓存。
@@ -904,7 +964,7 @@ def _cache_put(cache, key, tensor, limit, total_of):
     st['total'] += _cache_item_bytes(key, tensor, total_of)
     total = st['total']
     evictable = _evictable_limit(cache, limit, total_of)
-    while total > limit and total > evictable and (len(cache) > 1):
+    while total > limit and total > evictable:
         oldest = next((k for k in cache if not _is_pinned_key(k)), None)
         if oldest is None:
             break
@@ -984,6 +1044,10 @@ def _arange_exp_cache(n, m, device):
 
 def _causal_window_mask_build(T, window, device, dtype):
     # Direct construction of the causal sliding-window additive mask in the
+    if not _dense_mask_fits(T, torch.empty((), dtype=dtype).element_size()):
+        raise RuntimeError(
+            f'refusing to materialise a full [{int(T)}, {int(T)}] {dtype} mask '
+            f'(> {int(_DENSE_MASK_ROW_CAP_BYTES)} bytes); use the row-chunked mask path')
     # target dtype: allowed lanes (i-window < j <= i) get exactly 0.0 and every
     # other lane exactly -inf — the same two constants the causal + band
     # addition and the elementwise cast produce.  A boolean scratch is
@@ -997,7 +1061,15 @@ def _causal_window_mask_build(T, window, device, dtype):
         m.masked_fill_(far, float('-inf'))
     return m
 
-_DENSE_MASK_ROW_CAP_BYTES = 256 << 20
+_DENSE_MASK_ROW_CAP_BYTES = 64 << 20
+
+
+def _dense_mask_fits(T, elem_bytes=1):
+    """True when a full [T, T] mask of `elem_bytes` fits the byte budget."""
+    try:
+        return int(T) * int(T) * max(1, int(elem_bytes)) <= int(_DENSE_MASK_ROW_CAP_BYTES)
+    except Exception:
+        return False
 
 def _dense_causal_window_rows(T, window, s, e, device):
     # Row slice [s:e] of the dense causal/window masked-lane table: allowed
@@ -1109,11 +1181,22 @@ def _window_attn_chunk(q_c, k, v, s, e, lo, window, scale):
         attn_mask=mask, scale=scale)
     return out.transpose(1, 2)
 
+def _window_attn_row_chunk(device, B, nh, T, window, elem_size, max_rows=1024):
+    # A windowed chunk only needs logits of width ~window + rows, not the full
+    # sequence width.  Sizing the row block from (window + rows) keeps launch
+    # counts small even when T is very long.
+    rows = max(1, min(int(T), int(max_rows)))
+    budget = _attn_transient_budget(device)
+    if budget is None:
+        budget = _FULL_ATTN_TRANSIENT_BYTES
+    per_row = max(1, 3 * int(B) * int(nh) * (int(window) + rows)) * int(elem_size)
+    return max(1, min(rows, int(budget) // per_row))
+
+
 def _window_attn_local_impl(q, k, v, window, scale):
     B, T, nh, hd = q.shape
     out = torch.empty_like(q)
-    row_chunk = _full_attn_row_chunk(q.device, B, nh, T, q.element_size())
-    row_chunk = max(1, min(int(T), row_chunk, max(int(window), 32)))
+    row_chunk = _window_attn_row_chunk(q.device, B, nh, T, window, q.element_size())
     for s in range(0, T, row_chunk):
         e = min(s + row_chunk, T)
         lo = max(0, s - int(window) + 1)
@@ -1140,6 +1223,10 @@ def _tri_full(n, device, k):
 
 def _mask_buffer(n, device, kind):
     if kind == 'causal':
+        if not _dense_mask_fits(n, 1):
+            raise RuntimeError(
+                f'refusing to materialise a full [{int(n)}, {int(n)}] bool mask '
+                f'(> {int(_DENSE_MASK_ROW_CAP_BYTES)} bytes); use the row-chunked mask path')
         # Boolean masked-lane table (True = j > i), consumed by
         # `_sink_attn_chunk` via masked_fill_; the masked lanes are written
         # to -inf.
@@ -1151,6 +1238,10 @@ def _mask_buffer(n, device, kind):
         return buf
     if kind != 'zero':
         raise ValueError(f'unknown mask kind {kind!r}')
+    if not _dense_mask_fits(n, 4):
+        raise RuntimeError(
+            f'refusing to materialise a full [{int(n)}, {int(n)}] float mask '
+            f'(> {int(_DENSE_MASK_ROW_CAP_BYTES)} bytes); use the row-chunked mask path')
     with torch.inference_mode(False):
         buf = torch.zeros((n, n), device=device)
     _cache_put(_MASK_CACHE, key, buf, _mask_budget(n), _mask_cache_total)
@@ -1174,6 +1265,10 @@ def window_band(T, window, device):
 
 def causal_window_mask(T, window, device):
     # Boolean masked-lane table (True = masked), consumed by
+    if not _dense_mask_fits(T, 1):
+        raise RuntimeError(
+            f'refusing to materialise a full [{int(T)}, {int(T)}] bool mask '
+            f'(> {int(_DENSE_MASK_ROW_CAP_BYTES)} bytes); use the row-chunked mask path')
     # `_sink_attn_chunk`'s masked_fill_.
     if window <= 0 or window >= T:
         return causal_mask(T, device)
@@ -2346,7 +2441,7 @@ def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
             random_select=random_select, pre_qI=pre_qI, pre_w=pre_w,
             out_valid=out_valid, causal_ends_host=causal_ends_host,
             need_soft=need_soft)
-        return _idx, _soft
+        return _m, _idx, _soft
     # If an outer block/MLP checkpoint already owns this forward, do not nest
     # a second checkpoint (the outer recompute covers the indexer too).
     _grad = _CKPT_NEST[0] == 0 and torch.is_grad_enabled() and (
@@ -2845,7 +2940,7 @@ class HybridAttention(nn.Module):
         # The sink branch builds a full cached bool mask within the row cap,
         # or the matching row slice per chunk beyond it.  The cached table is
         # bool (one byte per element), not a 4-byte additively-typed mask.
-        _use_full_mask = T * T <= _DENSE_MASK_ROW_CAP_BYTES
+        _use_full_mask = _dense_mask_fits(T)
         if self.sink is None:
             if 0 < self.cfg.window < T:
                 out = _window_attn_local(q, k, v, self.cfg.window, scale)
@@ -3282,16 +3377,16 @@ class HybridAttention(nn.Module):
         flat = x.reshape(B * T, d)
         pre_flat = self._pre(flat, fuse_x=x)
         _kernel_path = _CK is not None and self.cfg.kind in ('csa', 'hca') and _CK.kernel_enabled()
-        # Optional batched eager path: the reference twin consumes
-        # [B, T, ...] and issues batch GEMMs.  Opt in with CSA_EAGER_BATCH=1
-        # (requires CUDA; values follow the declared reference-backend
-        # tolerance, not the eager bitwise contract).
+        # Batched eager path: the reference twin consumes [B, T, ...] and
+        # issues batch GEMMs.  It is the default for B > 1 on CUDA (values
+        # follow the declared reference-backend tolerance, not the eager
+        # bitwise contract); CSA_EAGER_BATCH=0 restores the row loop.
         _eager_batch = (_CK is not None and not _kernel_path
                         and x.device.type == 'cuda' and B > 1
                         and self.cfg.kind in ('csa', 'hca')
                         and self.cfg.fuse_mode == 'none'
                         and self.cfg.indexer_mode == 'learned'
-                        and os.environ.get('CSA_EAGER_BATCH', '').strip().lower() in ('1', 'true', 'yes', 'ref'))
+                        and _eager_batch_active())
         _batch_path = _kernel_path or _eager_batch
         pre_all = None
         pres = None
@@ -4613,6 +4708,15 @@ def _disk_ids_chunk(buf, disk_dt, vocab):
             raise ValueError(f'token id {_mx} exceeds the uint16 cache range (vocab={vocab}) — widen _fineweb_disk_dtype before rebuilding')
     return np.array(buf, dtype=disk_dt)
 
+def _i32_sidecar_path(path):
+    """Identity-bound int32 sidecar path for a wide on-disk token cache."""
+    st = os.stat(path)
+    return (f'{path}.i32-{int(st.st_size)}-'
+            f'{int(getattr(st, "st_mtime_ns", 0))}-'
+            f'{int(getattr(st, "st_ctime_ns", int(st.st_ctime * 1e9)))}-'
+            f'{int(getattr(st, "st_ino", 0))}.npy')
+
+
 def _npy_serve_int32(path):
     # 传输层（design_notes §6.1）：磁盘上的 uint16/int32 都是同一组精确
     # 整数。batch_iter 在 gather 后立即加宽回 int64，因此产出的 batch 与
@@ -4633,11 +4737,42 @@ def _npy_serve_int32(path):
         _mn, _mx = int(src.min()), int(src.max())
         if _mn < 0 or _mx > 2 ** 31 - 1:
             raise ValueError(f'_npy_serve_int32: token ids in {path} span [{_mn}, {_mx}], outside the int32 transport range')
-    out = np.empty(src.shape, dtype=np.int32)
-    for s in range(0, src.size, 1 << 24):
-        e = min(s + (1 << 24), src.size)
-        out[s:e] = src[s:e]
-    return out
+    # Serve an identity-bound int32 sidecar instead of copying the whole
+    # corpus into RAM: the returned values are the same exact integers and
+    # the fingerprint stays on the historical int32 canonical form.
+    try:
+        _side = _i32_sidecar_path(path)
+        if os.path.exists(_side):
+            _n = np.load(_side, mmap_mode='r')
+            if (int(_n.size) == int(src.size) and np.dtype(_n.dtype) == np.dtype(np.int32)):
+                return _n
+        _dir = os.path.dirname(os.path.abspath(_side)) or '.'
+        _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(_side) + '.', suffix='.tmp')
+        os.close(_fd)
+        try:
+            _mm = np.lib.format.open_memmap(_tmp, mode='w+', dtype=np.int32, shape=(int(src.size),))
+            _step = 1 << 24
+            for _s in range(0, int(src.size), _step):
+                _e = min(_s + _step, int(src.size))
+                _mm[_s:_e] = src[_s:_e]
+            _mm.flush()
+            del _mm
+            os.replace(_tmp, _side)
+        except BaseException:
+            try:
+                os.unlink(_tmp)
+            except OSError:
+                pass
+            raise
+        return np.load(_side, mmap_mode='r')
+    except (OSError, ValueError, TypeError):
+        # Read-only directory or a racing writer: fall back to an in-memory
+        # int32 copy (the old behaviour) rather than failing the load.
+        out = np.empty(src.shape, dtype=np.int32)
+        for s in range(0, src.size, 1 << 24):
+            e = min(s + (1 << 24), src.size)
+            out[s:e] = src[s:e]
+        return out
 
 def _fineweb_local_files(env_value):
     """Resolve FWEDU_LOCAL_JSONL to the ordered list of local documents files."""
@@ -5643,6 +5778,41 @@ def _gpu_corpus_cache_fits(nbytes, device):
 _NARROW_MEMO = {}
 
 
+def _cache_id_upper_bound(path):
+    """Recorded token-id upper bound for a cache file, when the sibling meta
+    file provides one.  Avoids a full-corpus max() scan on legacy int64 caches."""
+    if not path:
+        return None
+    base = os.path.basename(str(path))
+    d = os.path.dirname(os.path.abspath(str(path)))
+    if base.startswith('train_ids_'):
+        meta_name = 'meta_' + base[len('train_ids_'):]
+    elif base.startswith('test_ids_'):
+        meta_name = 'test_meta_' + base[len('test_ids_'):]
+    else:
+        return None
+    meta_path = os.path.join(d, os.path.splitext(meta_name)[0] + '.json')
+    try:
+        with open(meta_path, encoding='utf-8') as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return None
+    for key in ('max_id', 'max_token_id', 'token_max'):
+        try:
+            v = int(meta[key])
+            if 0 <= v < 2 ** 31:
+                return v
+        except (KeyError, TypeError, ValueError):
+            pass
+    try:
+        vocab = int(meta.get('vocab'))
+        if 0 < vocab <= 2 ** 31:
+            return vocab - 1
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def _ids_narrow(train_ids):
     # Token ids are bounded by the vocab (<= 2**31 for every corpus this repo
     # produces), so the cached copy (GPU, or pinned host staging) keeps its
@@ -5665,17 +5835,16 @@ def _ids_narrow(train_ids):
             # Bind the sidecar to the same identity fields the cache loaders
             # use.  A same-size rewrite can preserve mtime (``cp -p``), so
             # size+mtime alone could silently serve a stale int32 copy.
-            _side = (f'{_path}.i32-{int(_st.st_size)}-'
-                     f'{int(getattr(_st, "st_mtime_ns", 0))}-'
-                     f'{int(getattr(_st, "st_ctime_ns", int(_st.st_ctime * 1e9)))}-'
-                     f'{int(getattr(_st, "st_ino", 0))}.npy')
+            _side = _i32_sidecar_path(_path)
             if os.path.exists(_side):
                 _n = np.load(_side, mmap_mode='r')
                 if (int(_n.size) == int(train_ids.size)
                         and np.dtype(_n.dtype) == np.dtype(np.int32)):
                     _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
                     return _n
-            _mx = int(train_ids.max()) if train_ids.size else -1
+            _mx = _cache_id_upper_bound(_path)
+            if _mx is None:
+                _mx = int(train_ids.max()) if train_ids.size else -1
             if _mx < 2 ** 31:
                 _dir = os.path.dirname(os.path.abspath(_side)) or '.'
                 _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(_side) + '.', suffix='.tmp')
@@ -5700,7 +5869,10 @@ def _ids_narrow(train_ids):
                 return _n
         except (OSError, ValueError, TypeError):
             pass
-    if train_ids.size and int(train_ids.max()) < 2 ** 31:
+    _mx = _cache_id_upper_bound(getattr(train_ids, 'filename', None))
+    if _mx is None:
+        _mx = int(train_ids.max()) if train_ids.size else -1
+    if train_ids.size and _mx < 2 ** 31:
         _n = train_ids.astype(np.int32)
         _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
         return _n
@@ -10048,7 +10220,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     locked_json_update(path, _merge)
     return path
 
-_EVAL_TOKENS_PER_CHUNK = 1 << 17
+_EVAL_TOKENS_PER_CHUNK = 1 << 20
 
 
 def _eval_row_working_bytes(model, T, d, elem_size, bytes_per_value=8):
@@ -10104,11 +10276,16 @@ def _eval_row_working_bytes(model, T, d, elem_size, bytes_per_value=8):
             # the live-soft twin roughly doubles the logits side.  All terms
             # scale with the head count and include the sliding-window lanes.
             gather_bytes = (4 * M * nh * hd + 2 * M * nh) * elem
-            index_bytes = 2 * T * Bm * nih * elem
+            # The indexer score table is t-chunked in both backends (<=~192MB
+            # per launch), so charging the full T x Bm product per row would
+            # over-estimate by orders of magnitude at long T.  Bound it by the
+            # actual chunk workspace and let the OOM retry tighten if needed.
+            index_bytes = min(2 * T * Bm * nih * elem, 384 << 20) if kind != 'hca' else 0
             attn_bytes = max(index_bytes, gather_bytes)
             if kind == 'hca':
-                # _arange_exp_cache materialises an int32 [T, Bm] table.
-                attn_bytes = max(attn_bytes, 4 * T * Bm)
+                # _arange_exp_cache is a stride-0 expand view: its physical
+                # storage is one int32 [Bm] row, not [T, Bm].
+                attn_bytes = max(attn_bytes, 4 * Bm)
         per_row = max(per_row, int(attn_bytes))
     return per_row
 
@@ -11190,20 +11367,21 @@ def is_main_process():
 
 
 def _amp_requested():
-    """Opt-in mixed-precision mode for the training path.
+    """Mixed-precision mode for the training path.
 
-    ``CSA_AMP=bf16`` keeps fp32 master parameters and runs the forward/loss
-    under autocast bf16; ``CSA_AMP=fp16`` additionally uses a GradScaler.
-    Unset means the pure-fp32 path, so existing records stay comparable."""
+    CUDA training defaults to bf16 autocast with fp32 master parameters;
+    ``CSA_AMP=fp16`` additionally uses a GradScaler, and ``CSA_AMP=0``
+    (or false/no/off) opts back into the pure-fp32 path.  The chosen dtype is
+    recorded in each result so fp32 and autocast runs never mix silently."""
     v = os.environ.get('CSA_AMP', '').strip().lower()
-    if v in ('', '0', 'false', 'no', 'off'):
+    if v in ('0', 'false', 'no', 'off'):
         return None
-    if v in ('1', 'true', 'yes', 'on', 'bf16', 'bfloat16'):
+    if v in ('', '1', 'true', 'yes', 'on', 'bf16', 'bfloat16'):
         return 'bf16'
     if v in ('fp16', 'float16', 'half'):
         return 'fp16'
-    print(f'[amp] CSA_AMP={v!r} is not recognised (use bf16/fp16) — using fp32')
-    return None
+    print(f'[amp] CSA_AMP={v!r} is not recognised (use bf16/fp16) — using bf16')
+    return 'bf16'
 
 
 def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False):

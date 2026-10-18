@@ -97,6 +97,51 @@ MASK_TOKEN_ID = 0  # <pad>：mask 模式的远端屏蔽填充 token（分布外�
 _CORRUPT_MODES = ('uniform', 'natural', 'mask', 'delete', 'span', 'doc', 'topical')
 
 
+class _BoundedRowCache:
+    """Small byte-bounded cache for deterministic probe rows.
+
+    Rows are large (one full eval-length token vector each), so an unbounded
+    dict across lengths/rhos/modes/arms can grow to many GB of host memory.
+    FIFO eviction keeps the resident set bounded; a miss just rebuilds the
+    row from its (eval_len, row, rho, mode) seed, which is the same value.
+    """
+
+    def __init__(self, max_bytes=512 << 20):
+        self.max_bytes = int(max_bytes)
+        self._d = {}
+        self._nbytes = 0
+
+    @staticmethod
+    def _bytes(v):
+        try:
+            return int(np.asarray(v).nbytes)
+        except Exception:
+            return 0
+
+    def get(self, key, default=None):
+        return self._d.get(key, default)
+
+    def __contains__(self, key):
+        return key in self._d
+
+    def __getitem__(self, key):
+        return self._d[key]
+
+    def __setitem__(self, key, value):
+        if key in self._d:
+            self._nbytes -= self._bytes(self._d[key])
+        self._d[key] = value
+        self._nbytes += self._bytes(value)
+        while self._d and self._nbytes > self.max_bytes:
+            k0 = next(iter(self._d))
+            self._nbytes -= self._bytes(self._d.pop(k0))
+
+    def clear(self):
+        self._d.clear()
+        self._nbytes = 0
+
+
+
 _TOPICAL_SETS = {}
 _TOPICAL_DONORS = {}
 
@@ -457,12 +502,10 @@ def _niah_ppls(model, val_ids, eval_len, n_seq, cfg, condition, row_cache=None, 
     vocab = int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
     target = int(cfg['target'])
     rho = float(_n.get('rho', 0.5)) if condition == 'distract' else 0.0
-    _key = (eval_len, condition, n_pairs, vocab, target, float(rho))
-    _built = row_cache.get(_key) if row_cache is not None else None
-    if _built is None:
-        _built = _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed=(eval_len * 7919 + 104729), condition=condition, rho=rho)
-        if row_cache is not None:
-            row_cache[_key] = _built
+    # NIAH batches are fully determined by the construction parameters below;
+    # rebuilding is cheap relative to scoring and avoids retaining a full
+    # [n_seq, eval_len] id batch per (length, condition, arm) in host memory.
+    _built = _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed=(eval_len * 7919 + 104729), condition=condition, rho=rho)
     ids_np, q_cols, q_vals, stats = _built
     n_ch = max(1, int(cfg['chunk']))
     if chunk_mem is not None:
@@ -611,11 +654,11 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         out['status'] = 'skipped_resume'
         return out
     model = None
-    _row_cache = {}
     _chunk_mem = {}
     for arm in cfg['arms']:
         if not _arm_of(v, arm, cfg):
             continue
+        _row_cache = _BoundedRowCache()
         if guard is not None and not guard.can_start(0):
             print(f'[cap] SKIP probe {v} s{seed} arm {arm}: headroom exhausted ({max(guard.remaining_hours(), 0.0):.2f} h left) — re-run the phase to continue')
             if model is None:

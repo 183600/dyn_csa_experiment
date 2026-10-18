@@ -189,7 +189,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             scale = 1.0 / math.sqrt(self.hd)
         # The sink branch builds a full cached mask within the row cap, or the
         # matching row slice per chunk beyond it.
-        _use_full_mask = T * T <= L._DENSE_MASK_ROW_CAP_BYTES
+        _use_full_mask = L._dense_mask_fits(T)
         if self.sink is None:
             if 0 < cfg.window < T:
                 out = L._window_attn_local(q, k, v, cfg.window, scale)
@@ -483,7 +483,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         use_rope = isinstance(self.cfg, AttnCfgRope) and self.cfg.rope
         rd = min(getattr(self.cfg, 'rope_dim', 0), hd)
         win = getattr(self, '_dense_max_T', None)
-        _use_full_mask = T * T <= L._DENSE_MASK_ROW_CAP_BYTES
+        _use_full_mask = L._dense_mask_fits(T)
         if _use_full_mask:
             mask = L.causal_mask(T, x.device)
             if win is not None and win < T:
