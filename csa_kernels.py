@@ -399,17 +399,26 @@ def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
 def _full_arange_cached(B, T, Bm, device, contiguous=True):
     # `contiguous=False` returns a stride-0 expand view: every row holds the
     # same exact integers, which is all the torch-reference backend reads
-    # (advanced indexing / gathers / comparisons).  The triton kernels address
-    # the index tensor with pointer arithmetic, so that backend asks for the
-    # contiguous copy.
+    # (advanced indexing / gathers / comparisons) and all the triton attention
+    # kernels read once they take the HCA arange fast path (one block per
+    # lane, so the block id is the lane index itself).  Only callers that
+    # really need a dense table ask for `contiguous=True`.
     key = (int(B), int(T), int(Bm), str(device), bool(contiguous))
     out = _ARANGE_CACHE.get(key)
     if out is None:
         base = torch.arange(Bm, device=device, dtype=torch.int32)[None, None, :].expand(B, T, Bm)
         out = base.contiguous() if contiguous else base
-        _full_arange_evict(_arange_nbytes(out))
-        _ARANGE_CACHE[key] = out
-        _ARANGE_CACHE_BYTES[0] += _arange_nbytes(out)
+        if not contiguous:
+            # Identity-keyed fast path marker: shape (B,T,Bm) with stride
+            # (0,0,1) is exactly the row-constant arange table, so the
+            # attention launcher can skip both the dense table and its
+            # O(B*T*Bm) index reads without inspecting the values.
+            out._idx_arange = True
+        _need = _arange_nbytes(out)
+        _full_arange_evict(_need)
+        if _need <= _ARANGE_CACHE_BUDGET:
+            _ARANGE_CACHE[key] = out
+            _ARANGE_CACHE_BYTES[0] += _need
     return out
 
 
@@ -1291,14 +1300,20 @@ class FusedSparseAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, impl, q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale):
         impl = _attn_impl_for_shape(impl, q, w)
+        # HCA's read-everything arm passes the cached stride-0 arange table:
+        # every row is exactly arange(nb), so the triton kernels can derive
+        # the block id from the lane index instead of materializing / reading
+        # a dense [R, T, nb] table (a major peak-memory win at long context).
+        idx_arange = bool(getattr(topk_idx, '_idx_arange', False))
         if impl == 'triton':
-            out = _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale)
+            out = _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale, idx_arange)
         else:
             out = _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale)
         ctx.save_for_backward(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink)
         # 反向必须跑与前向同一个后端：前向拿到的是调用方解析好的 impl
         # （gathered_attention_kernel 经 _op_impl('ATTN')）。
         ctx.impl = impl
+        ctx.idx_arange = bool(idx_arange and impl == 'triton')
         ctx.w = int(w)
         ctx.scale = float(scale)
         return out
@@ -1312,7 +1327,7 @@ class FusedSparseAttention(torch.autograd.Function):
         impl = ctx.impl
         if impl == 'triton':
             grads = _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink,
-                                     ctx.w, ctx.scale, dO, ctx.needs_input_grad)
+                                     ctx.w, ctx.scale, dO, ctx.needs_input_grad, ctx.idx_arange)
         else:
             ng = ctx.needs_input_grad
             grads = _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink,
@@ -1564,7 +1579,7 @@ def _kernels():
 _MINL32 = -3.402823466e38
 
 
-def _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale):
+def _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale, idx_arange=False):
     K = _kernels()
     if getattr(K, 'attn_fwd', None) is None:
         _attach_attn_kernels(K)
@@ -1576,7 +1591,10 @@ def _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     q = q.contiguous()
     k_blk, v_blk = k_blk.contiguous(), v_blk.contiguous()
     k_sw, v_sw = k_sw.contiguous(), v_sw.contiguous()
-    topk_idx = topk_idx.contiguous()
+    # The arange table is a stride-0 expand view: a dense .contiguous() copy
+    # would be exactly the O(R*T*nb) allocation this path removes, and the
+    # kernels read the lane index instead of the table.
+    topk_idx = topk_idx if idx_arange else topk_idx.contiguous()
     valid_c = valid.contiguous() if valid is not None else topk_idx
     last_tok = last_tok.contiguous()
     soft_c = soft.contiguous() if soft is not None else topk_idx
@@ -1588,11 +1606,12 @@ def _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
                      out, T, Bm, int(w), float(scale),
                      NB=nb, NH=nh, HD=hd, BT=BT, BW=BW,
                      HAS_VALID=valid is not None, HAS_SINK=sink is not None,
+                     IDX_ARANGE=bool(idx_arange),
                      DOT=_dot_prec(), num_warps=4)
     return out
 
 
-def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale, dO, needs):
+def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale, dO, needs, idx_arange=False):
     K = _kernels()
     if getattr(K, 'attn_fwd', None) is None:
         _attach_attn_kernels(K)
@@ -1607,7 +1626,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     k_blk, v_blk = k_blk.contiguous(), v_blk.contiguous()
     k_sw, v_sw = k_sw.contiguous(), v_sw.contiguous()
     dO = dO.contiguous()
-    topk_idx = topk_idx.contiguous()
+    topk_idx = topk_idx if idx_arange else topk_idx.contiguous()
     valid_c = valid.contiguous() if valid is not None else topk_idx
     last_tok = last_tok.contiguous()
     soft_c = soft.contiguous() if soft is not None else topk_idx
@@ -1637,6 +1656,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         mA, ZA, mS, ZS, GA, GS, T, Bm, int(w), float(scale),
         NB=nb, NH=nh, HD=hd, BT=BT, BW=BW,
         HAS_VALID=valid is not None, HAS_SOFT=soft is not None, HAS_SINK=sink is not None,
+        IDX_ARANGE=bool(idx_arange),
         DOT=_dot_prec(), num_warps=4)
     dq = None
     if need_dq:
@@ -1646,6 +1666,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
             mA, ZA, mS, ZS, GA, GS, dq, T, Bm, int(w), float(scale),
             NB=nb, NH=nh, HD=hd, BT=BT, BW=BW,
             HAS_VALID=valid is not None, HAS_SOFT=soft is not None, HAS_SINK=sink is not None,
+            IDX_ARANGE=bool(idx_arange),
             DOT=_dot_prec(), num_warps=4)
     dk_blk = dv_blk = dk_sw = dv_sw = dsoft = None
     if need_dkb or need_dvb:
@@ -1653,27 +1674,35 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         # NEED_DV 与这里的分配条件一致）。
         dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
         dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
-        flat = topk_idx.reshape(R, T * nb)
-        # 各行互相独立，稳定序逐位不变；order 保留 int64：lane 值域是
-        # [0, T·nb)，T·nb ≥ 2³¹ 的超大配置下窄化到 int32 会翻负、内核
-        # 再按 lane//NB 寻址即越界。
-        order = torch.argsort(flat, dim=1, stable=True)
-        # 计数是整数（块 id 非负且 < Bm），scatter_add_ 与逐行 bincount
-        # 给出同一组精确整数。
-        flat_l = flat.to(torch.int64)
-        cnt = torch.zeros((R, Bm), device=dev, dtype=torch.int64)
-        cnt.scatter_add_(1, flat_l, torch.ones_like(flat_l))
-        del flat_l
-        offs = torch.zeros((R, Bm + 1), device=dev, dtype=torch.int64)
-        offs[:, 1:] = cnt.cumsum(dim=1)
-        del flat, cnt
+        if idx_arange:
+            # Every row is arange(nb): the stable block-major order is
+            # implicit (lane = t*nb + b), so no O(R*T*nb) argsort / scatter /
+            # offsets tables are needed.  The kernel derives the segment
+            # bounds from b and T directly.
+            order = offs = q
+        else:
+            flat = topk_idx.reshape(R, T * nb)
+            # 各行互相独立，稳定序逐位不变；order 保留 int64：lane 值域是
+            # [0, T·nb)，T·nb ≥ 2³¹ 的超大配置下窄化到 int32 会翻负、内核
+            # 再按 lane//NB 寻址即越界。
+            order = torch.argsort(flat, dim=1, stable=True)
+            # 计数是整数（块 id 非负且 < Bm），scatter_add_ 与逐行 bincount
+            # 给出同一组精确整数。
+            flat_l = flat.to(torch.int64)
+            cnt = torch.zeros((R, Bm), device=dev, dtype=torch.int64)
+            cnt.scatter_add_(1, flat_l, torch.ones_like(flat_l))
+            del flat_l
+            offs = torch.zeros((R, Bm + 1), device=dev, dtype=torch.int64)
+            offs[:, 1:] = cnt.cumsum(dim=1)
+            del flat, cnt
         K.attn_bwd_dkdv_blocks[(R * Bm * nh,)](
             q, k_blk, v_blk, topk_idx, valid_c, last_tok, soft_c, sink_arg, dO,
             mA, ZA, mS, ZS, GA, GS,
             dk_blk, dv_blk, order, offs, T, Bm, nb, float(scale),
             NH=nh, HD=hd, HAS_VALID=valid is not None, HAS_SOFT=soft is not None,
             HAS_SINK=sink is not None,
-            NEED_DK=need_dkb, NEED_DV=need_dvb, num_warps=1)
+            NEED_DK=need_dkb, NEED_DV=need_dvb, IDX_ARANGE=bool(idx_arange),
+            num_warps=1)
     if need_dsoft:
         # dsoft 是跨头求和（ref 反向在头循环里 +=），(r,b,h) 网格的
         # dkdv_blocks 表达不了——由独立内核完成：每个 (t,j) 泳道恰好一个
@@ -1682,7 +1711,8 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         K.attn_bwd_dsoft[(R * triton.cdiv(T, BT),)](
             q, k_blk, v_blk, topk_idx, valid_c, last_tok, soft_c, dO,
             mS, ZS, GS, dsoft, T, Bm, float(scale),
-            NB=nb, NH=nh, HD=hd, BT=BT, HAS_VALID=valid is not None, num_warps=4)
+            NB=nb, NH=nh, HD=hd, BT=BT, HAS_VALID=valid is not None,
+            IDX_ARANGE=bool(idx_arange), num_warps=4)
     if need_dksw or need_dvsw:
         # attn_bwd_dkdv_window 对每个 (r,p,h) 同样无条件 store——empty 即可。
         dk_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else q
@@ -1714,7 +1744,7 @@ def _attach_attn_kernels(ns):
     def attn_fwd(q_ptr, kb_ptr, vb_ptr, ksw_ptr, vsw_ptr, idx_ptr, valid_ptr, lt_ptr, soft_ptr, sink_ptr, out_ptr,
                  T, Bm, W, SCALE,
                  NB: tl.constexpr, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BW: tl.constexpr,
-                 HAS_VALID: tl.constexpr, HAS_SINK: tl.constexpr, DOT: tl.constexpr):
+                 HAS_VALID: tl.constexpr, HAS_SINK: tl.constexpr, IDX_ARANGE: tl.constexpr, DOT: tl.constexpr):
         pid = tl.program_id(0)
         n_t = tl.cdiv(T, BT)
         pid_t = pid % n_t
@@ -1753,7 +1783,12 @@ def _attach_attn_kernels(ns):
             acc = acc * alpha[:, None] + tl.dot(pa, vt, input_precision=DOT)
             m = mn
         for j in tl.static_range(NB):
-            src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
+            if IDX_ARANGE:
+                # Each row is exactly arange(NB): the block id is the
+                # lane index, so no dense index table is read.
+                src = tl.zeros((BT,), tl.int64) + j
+            else:
+                src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
             lt_j = tl.load(lt_ptr + r * Bm + src, mask=tm, other=0).to(tl.int64)
             ok = tm & (ti > lt_j)
             if HAS_VALID:
@@ -1783,7 +1818,8 @@ def _attach_attn_kernels(ns):
                        mA_ptr, ZA_ptr, mS_ptr, ZS_ptr, GA_ptr, GS_ptr,
                        T, Bm, W, SCALE,
                        NB: tl.constexpr, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BW: tl.constexpr,
-                       HAS_VALID: tl.constexpr, HAS_SOFT: tl.constexpr, HAS_SINK: tl.constexpr, DOT: tl.constexpr):
+                       HAS_VALID: tl.constexpr, HAS_SOFT: tl.constexpr, HAS_SINK: tl.constexpr,
+                       IDX_ARANGE: tl.constexpr, DOT: tl.constexpr):
         pid = tl.program_id(0)
         n_t = tl.cdiv(T, BT)
         pid_t = pid % n_t
@@ -1834,7 +1870,12 @@ def _attach_attn_kernels(ns):
                 GSr = GSr * aS + tl.sum(tl.exp(z - mnS[:, None]) * g, 1)
                 mS = mnS
         for j in tl.static_range(NB):
-            src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
+            if IDX_ARANGE:
+                # Each row is exactly arange(NB): the block id is the
+                # lane index, so no dense index table is read.
+                src = tl.zeros((BT,), tl.int64) + j
+            else:
+                src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
             lt_j = tl.load(lt_ptr + r * Bm + src, mask=tm, other=0).to(tl.int64)
             ok = tm & (ti > lt_j)
             if HAS_VALID:
@@ -1880,7 +1921,8 @@ def _attach_attn_kernels(ns):
                     mA_ptr, ZA_ptr, mS_ptr, ZS_ptr, GA_ptr, GS_ptr, dq_ptr,
                     T, Bm, W, SCALE,
                     NB: tl.constexpr, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BW: tl.constexpr,
-                    HAS_VALID: tl.constexpr, HAS_SOFT: tl.constexpr, HAS_SINK: tl.constexpr, DOT: tl.constexpr):
+                    HAS_VALID: tl.constexpr, HAS_SOFT: tl.constexpr, HAS_SINK: tl.constexpr,
+                    IDX_ARANGE: tl.constexpr, DOT: tl.constexpr):
         pid = tl.program_id(0)
         n_t = tl.cdiv(T, BT)
         pid_t = pid % n_t
@@ -1929,7 +1971,12 @@ def _attach_attn_kernels(ns):
                 dz += eS / ZSs[:, None] * (g - GS[:, None])
             dqacc += tl.dot(dz, kt, input_precision=DOT) * SCALE
         for j in tl.static_range(NB):
-            src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
+            if IDX_ARANGE:
+                # Each row is exactly arange(NB): the block id is the
+                # lane index, so no dense index table is read.
+                src = tl.zeros((BT,), tl.int64) + j
+            else:
+                src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
             lt_j = tl.load(lt_ptr + r * Bm + src, mask=tm, other=0).to(tl.int64)
             ok = tm & (ti > lt_j)
             if HAS_VALID:
@@ -1961,14 +2008,21 @@ def _attach_attn_kernels(ns):
                              T, Bm, NB, SCALE,
                              NH: tl.constexpr, HD: tl.constexpr,
                              HAS_VALID: tl.constexpr, HAS_SOFT: tl.constexpr, HAS_SINK: tl.constexpr,
-                             NEED_DK: tl.constexpr, NEED_DV: tl.constexpr):
+                             NEED_DK: tl.constexpr, NEED_DV: tl.constexpr, IDX_ARANGE: tl.constexpr):
         pid = tl.program_id(0)
         h = pid % NH
         rb = pid // NH
         b = rb % Bm
         r = (rb // Bm).to(tl.int64)
-        seg0 = tl.load(cso_ptr + r.to(tl.int64) * (Bm + 1) + b)
-        seg1 = tl.load(cso_ptr + r.to(tl.int64) * (Bm + 1) + b + 1)
+        if IDX_ARANGE:
+            # Every token selects all blocks: block b's lanes are exactly one
+            # per token, so the segment is [b*T, (b+1)*T) and lane
+            # k -> (t = k - b*T, j = b).  No order/offset tables are read.
+            seg0 = b.to(tl.int64) * T
+            seg1 = seg0 + T
+        else:
+            seg0 = tl.load(cso_ptr + r.to(tl.int64) * (Bm + 1) + b)
+            seg1 = tl.load(cso_ptr + r.to(tl.int64) * (Bm + 1) + b + 1)
         d = tl.arange(0, HD)
         kb_v = tl.load(kb_ptr + ((r * Bm + b) * NH + h) * HD + d).to(tl.float32)
         vb_v = tl.load(vb_ptr + ((r * Bm + b) * NH + h) * HD + d).to(tl.float32)
@@ -1977,12 +2031,16 @@ def _attach_attn_kernels(ns):
         # 循环不变量：本程序只服务块 b，last_tok 在段循环外只载一次（同一值）。
         lt_b = tl.load(lt_ptr + r * Bm + b).to(tl.int64)
         for k in range(seg0, seg1):
-            # r*(T*NB) 在 R·T·NB ≥ 2³¹ 的超大配置下按 int32 求值会溢出
-            # （int64 的 k 要到加法才参与升型）——先升 r 再连乘，整条链
-            # 保持 int64（其余寻址都经 src/ti 的 int64 广播）。
-            lane = tl.load(csr_ptr + r.to(tl.int64) * T * NB + k).to(tl.int64)
-            tt = lane // NB
-            jj = lane % NB
+            if IDX_ARANGE:
+                tt = (k - seg0).to(tl.int64)
+                jj = b
+            else:
+                # r*(T*NB) 在 R·T·NB ≥ 2³¹ 的超大配置下按 int32 求值会溢出
+                # （int64 的 k 要到加法才参与升型）——先升 r 再连乘，整条链
+                # 保持 int64（其余寻址都经 src/ti 的 int64 广播）。
+                lane = tl.load(csr_ptr + r.to(tl.int64) * T * NB + k).to(tl.int64)
+                tt = lane // NB
+                jj = lane % NB
             if HAS_VALID:
                 # Match attn_fwd / attn_bwd_stats: validity AND causality.
                 ok = (tl.load(valid_ptr + (r * T + tt) * NB + jj) != 0) & (tt > lt_b)
@@ -2027,7 +2085,7 @@ def _attach_attn_kernels(ns):
                        mS_ptr, ZS_ptr, GS_ptr, dsoft_ptr,
                        T, Bm, SCALE,
                        NB: tl.constexpr, NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr,
-                       HAS_VALID: tl.constexpr):
+                       HAS_VALID: tl.constexpr, IDX_ARANGE: tl.constexpr):
         # dsoft = Σ_h dzS_h / sf —— ref 反向在头循环里 += 的同一个跨头求和。
         # dkdv_blocks 的网格是 (r, b, h)，表达不了它：同一 (t, j) 泳道会被
         # nh 个程序写同一地址（末写者胜、且永远拼不出头求和）。故独立成
@@ -2045,7 +2103,12 @@ def _attach_attn_kernels(ns):
         ti = t.to(tl.int64)
         d = tl.arange(0, HD)
         for j in tl.static_range(NB):
-            src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
+            if IDX_ARANGE:
+                # Each row is exactly arange(NB): the block id is the
+                # lane index, so no dense index table is read.
+                src = tl.zeros((BT,), tl.int64) + j
+            else:
+                src = tl.load(idx_ptr + ((r * T + ti) * NB + j), mask=tm, other=0).to(tl.int64)
             lt_j = tl.load(lt_ptr + r * Bm + src, mask=tm, other=0).to(tl.int64)
             ok = tm & (ti > lt_j)
             if HAS_VALID:
@@ -2331,7 +2394,10 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     v_sw = _v_all[B * Bm:].view(B, T, attn.nh, attn.hd)
     del _kvh, _k_all, _v_all
     if cfg.kind == 'hca':
-        topk_idx = _full_arange_cached(B, T, Bm, dev, contiguous=impl_attn == 'triton')
+        # Always the stride-0 expand view: the ref backend reads it directly,
+        # and the triton attention kernels take the arange fast path (block id
+        # == lane index) instead of materializing an O(B*T*Bm) table.
+        topk_idx = _full_arange_cached(B, T, Bm, dev, contiguous=False)
         valid = None
         soft = None
     else:

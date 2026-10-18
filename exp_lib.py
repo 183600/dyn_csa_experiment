@@ -8114,13 +8114,21 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             ce = model.ce_loss(x, y, vocab)
             del x, y
             loss = ce + comp_lambda * model.comp_reg
-            opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             opt.step()
+            # Gradients are not needed after the update: release them now so
+            # a following eval and the next forward do not overlap with a
+            # full parameter-sized gradient buffer (values are unchanged).
+            opt.zero_grad(set_to_none=True)
             _ce_d = ce.detach()
             _lbuf.append(_ce_d)
             _tail.append(_ce_d)
+            # Drop this step's graph/scalar references now, before the next
+            # forward: otherwise the previous loss graph stays alive while the
+            # next forward builds a second one (a step-sized peak saving).
+            del loss, ce
+            model.comp_reg = None
             if len(_lbuf) >= 512:
                 losses.extend(torch.stack(_lbuf).tolist())
                 _lbuf.clear()

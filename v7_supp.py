@@ -825,12 +825,18 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             logits = None
             ce = model.ce_loss(x, y, vocab)
             loss = ce + comp_lambda * model.comp_reg
-            opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), L.GRAD_CLIP_NORM)
             opt.step()
+            # No gradient is needed after the update: release the buffers
+            # before eval / the next forward (values are unchanged).
+            opt.zero_grad(set_to_none=True)
             _lbuf.append(ce.detach())
             _tail.append(ce.detach())
+            # Drop the step's graph references before the next forward (a
+            # step-sized peak saving); trunk() rebuilds comp_reg each call.
+            loss = ce = None
+            model.comp_reg = None
             if len(_lbuf) >= 512:
                 losses.extend(torch.stack(_lbuf).tolist())
                 _lbuf.clear()
