@@ -217,8 +217,7 @@ _SEG_VEC_MIN = 512
 def _successor_starts(n, nxt):
     # Starts of the monotone successor walk p -> nxt[p] (nxt[p] > p, nxt[n] = n).
     # A short prefix is walked directly; when the walk is long (dense cuts),
-    # the rest is generated in doubling batches with a jump table, so the
-    # number of Python-level iterations stays bounded as n grows.
+    # the rest is generated in doubling batches with a jump table.
     starts = [0]
     p = int(nxt[0])
     left = _SEG_WALK_PROBE - 1
@@ -1513,8 +1512,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     # (float lanes) plus the two boolean masks.
     _per_elems = (4 * int(max_len) + 4 * _Wb) * _Fd + 8 * (int(max_len) + _Wb)
     _chunk = _pool_block_chunk(B, _per_elems, Xas.element_size())
-    # Within the embedding table the gather index is exactly arange(max_len),
-    # so a plain slice view is the same rows without an [max_len, C] copy.
+    # Within the embedding table the gather index is exactly arange(max_len).
     _bpa = B_pos_a[:max_len] if max_len <= B_pos_a.shape[0] else B_pos_a[_pos_a]
     # Every real block carries at least one token (the segmenters only emit
     # positive counts), so the A lanes always contain a finite logit and the
@@ -1556,8 +1554,8 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         sc_a = sc[:, :max_len]
         sc_b = sc[:, max_len:]
         part = (sc_a * Xam).sum(1)
-        # Release the A-lane gather before the B-lane product allocates; the
-        # two partial sums are added in the original order.
+        # Release the A-lane gather before the B-lane product; the two partial
+        # sums are added in the original order.
         del Xam
         part = part + (sc_b * Xbm).sum(1)
         comp[_b0:_b1] = part
@@ -1621,7 +1619,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     # Conservative per-block element count: Xb + Zb(WinZ) + sc plus the mask.
     _per_elems = 3 * int(max_len) * _Fd + 4 * int(max_len)
     _chunk = _pool_block_chunk(B, _per_elems, Xs.element_size())
-    # Same slice-view fast path as _pool_ordered (index == arange(max_len)).
+    # Same slice-view form as _pool_ordered (index == arange(max_len)).
     _bpos = B_pos[:max_len] if max_len <= B_pos.shape[0] else B_pos[_pos_a]
     _clean = _pool_counts_clean(block_ids, B)
     comp = torch.empty(B, _Fd, device=dev, dtype=Xs.dtype)
@@ -1645,7 +1643,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         sc = F.softmax(WinZ, dim=1) if _clean else torch.nan_to_num(F.softmax(WinZ, dim=1))
         comp[_b0:_b1] = (sc * Xb).sum(1)
         del WinZ, Xb, Zb, sc
-    # same identity-order fast path as _pool_ordered: order[last_idx] over the
+    # same identity-order path as _pool_ordered: order[last_idx] over the
     # cached arange returns exactly last_idx (index transport, §6.1).
     return (comp, last_idx if _ident else order[last_idx], B)
 
@@ -1665,19 +1663,15 @@ def _rank_blocks(masked, B, ties, k=None):
     if kk <= 0:
         return torch.empty((masked.shape[0], 0), dtype=torch.long, device=masked.device)
     if kk >= B:
-        # argsort returns exactly the same stable permutation as sort(...).indices
-        # while skipping the sorted-values tensor (a full [n, B] allocation).
+        # argsort returns exactly the same stable permutation as sort(...).indices.
         if ties == 'earliest':
             return torch.argsort(masked, dim=1, stable=True, descending=True)
         order = torch.argsort(masked.flip(1), dim=1, stable=True, descending=True)
         return torch.sub(B - 1, order, out=order)
     src = masked.flip(1) if ties == 'latest' else masked
     n, _ = src.shape
-    # Keep only the k-th value: a bare column view would keep the whole
-    # [n, kk] topk values buffer alive for the rest of the selection.  For a
-    # large kk a full sorted top-k is both a big transient and slower than
-    # selecting just the k-th order statistic; the value is exactly the same
-    # (k-th largest == (B-kk+1)-th smallest).  Small kk keeps the faster topk.
+    # Keep only the k-th value.  Either branch produces the same value
+    # (k-th largest == (B-kk+1)-th smallest).
     if kk * 4 >= B:
         kth = torch.kthvalue(src, B - kk + 1, dim=1).values.unsqueeze(1)
     else:
@@ -1785,9 +1779,8 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
 
 _TOPK_CLAMP_WARNED = set()
 # Above this many elements an [T, B] causal/negated mask pair is no longer
-# retained on last_tok: the per-query-chunk form is value-identical and bounds
-# the transient to one chunk (the dynamic arms have B ~ T / block_size, so the
-# full table grows quadratically with sequence length).
+# retained on last_tok: the per-query-chunk form is value-identical (the
+# dynamic arms have B ~ T / block_size).
 _READABLE_CACHE_MAX_ELEMS = 4 << 20
 
 def _pool_ends_host(bid):
@@ -1940,9 +1933,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             raw.mul_(_iscale)
             F.relu(raw, inplace=True)
             c = torch.einsum('inb,ni->nb', raw, w_idx[s:e])
-            # `raw` is dead once the head-weighted score table exists; release
-            # it before top-k builds its full [chunk, B] selection tables (a
-            # chunk-sized peak saving at long context).
+            # `raw` is dead once the head-weighted score table exists.
             del raw
         if out_dtype is None:
             out_dtype = c.dtype
@@ -1982,8 +1973,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             # are written (1.0 each; duplicate writes of the same cell are
             # idempotent), and each chunk is masked with the same causal slice
             # the full-table form would read.  The (n, B) result is the output
-            # itself; the transient [n, B] negation table is never materialised
-            # at long context.
+            # itself.
             _il = idx.long()
             _ar = _arange_cache(n, dev)
             m = torch.zeros(n, B, device=dev, dtype=out_dtype)
@@ -2179,7 +2169,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             keep, nvalid, anyrow = _plan[s // q_chunk]
         else:
             # per-chunk form of the full-width table (same integers, same
-            # booleans; only the transient is bounded by q_chunk).
+            # booleans).
             _lt_rows = last_tok[None, :] if _arange_sel else last_tok[topk_l[s:e]]
             sel_blk = pos_all[s:e, None] > _lt_rows
             keep = None
@@ -4385,11 +4375,9 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         else:
             _host_ids = _ids_narrow(train_ids)
             if _host_ids.dtype in (np.uint8, np.uint16):
-                # PyTorch's CPU index kernel lacks uint8/uint16 gathers.  Rather
-                # than widening the whole corpus to int32 (a 2-4x resident copy
-                # that grows with the token count), gather the narrow array with
-                # NumPy per batch and widen only the [B, seq_len+1] result —
-                # the same exact token ids, no corpus-sized allocation.
+                # PyTorch's CPU index kernel lacks uint8/uint16 gathers.  Gather
+                # the narrow array with NumPy per batch and widen only the
+                # [B, seq_len+1] result — the same exact token ids.
                 host_np = _host_ids
             else:
                 host = torch.from_numpy(_host_ids)
@@ -4646,8 +4634,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3):
     `seed_driven` is True when dropping any one seed flips the sign of the
     mean (or makes it exactly zero), i.e. the direction is not stable across
     seeds even though the aggregate test may look significant.  The LOO pass
-    is a single O(n) sweep (a running sum minus each seed), so it stays cheap
-    when a scale-up panel reaches hundreds of seeds; `ci95` uses the t
+    is a single O(n) sweep (a running sum minus each seed); `ci95` uses the t
     critical value rather than a hard-coded z.
 
     Requiring both the test AND the effect-vs-spread check means a large-n
@@ -4834,7 +4821,7 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
         return 0.0
     cdf = _betai(n - kmin + 1, kmin, 1.0 - q)
     if not math.isfinite(cdf):
-        # Fallback: log-space binomial tail (slower, but still overflow-free).
+        # Fallback: log-space binomial tail (overflow-free).
         logq, log1q = math.log(q), math.log1p(-q)
         logs = [math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
                 + k * logq + (n - k) * log1q for k in range(kmin, n + 1)]
@@ -8158,16 +8145,12 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             opt.step()
-            # Gradients are not needed after the update: release them now so
-            # a following eval and the next forward do not overlap with a
-            # full parameter-sized gradient buffer (values are unchanged).
+            # Gradients are not needed after the update.
             opt.zero_grad(set_to_none=True)
             _ce_d = ce.detach()
             _lbuf.append(_ce_d)
             _tail.append(_ce_d)
-            # Drop this step's graph/scalar references now, before the next
-            # forward: otherwise the previous loss graph stays alive while the
-            # next forward builds a second one (a step-sized peak saving).
+            # Drop this step's graph/scalar references before the next forward.
             del loss, ce
             model.comp_reg = None
             if len(_lbuf) >= 512:
@@ -8450,7 +8433,7 @@ def _probe_arch(arch=None):
     """Effective probe architecture: the tiny default, overridden by the
     caller-supplied keys (a scaling driver can probe the architecture family
     it is about to train — d/n_heads/d_head geometry bugs that a 4-head probe
-    can never see are caught before the expensive panel starts)."""
+    can never see are caught before the panel starts)."""
     _arch = dict(_OVERFIT_ARCH)
     if arch:
         for _k in _arch:

@@ -795,10 +795,10 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     _gc_relief = gc.isenabled()
     if _gc_relief:
         gc.disable()
-    # Same CUDA working-set guard as exp_lib.train_variant: when the free
-    # memory cannot hold the estimated activations, recompute the identical
-    # pure forward during backward.  Values/gradients are unchanged; the
-    # explicit CSA_CKPT setting still wins.
+    # Same CUDA checkpoint guard as exp_lib.train_variant: when activation
+    # checkpointing is selected, recompute the identical pure forward during
+    # backward.  Values/gradients are unchanged; the explicit CSA_CKPT
+    # setting still wins.
     _ckpt_saved = L._CKPT['on']
     _auto_ckpt, _ = L._auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs)
     if _auto_ckpt:
@@ -828,13 +828,12 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), L.GRAD_CLIP_NORM)
             opt.step()
-            # No gradient is needed after the update: release the buffers
-            # before eval / the next forward (values are unchanged).
+            # No gradient is needed after the update.
             opt.zero_grad(set_to_none=True)
             _lbuf.append(ce.detach())
             _tail.append(ce.detach())
-            # Drop the step's graph references before the next forward (a
-            # step-sized peak saving); trunk() rebuilds comp_reg each call.
+            # Drop the step's graph references before the next forward;
+            # trunk() rebuilds comp_reg each call.
             loss = ce = None
             model.comp_reg = None
             if len(_lbuf) >= 512:
@@ -1689,8 +1688,7 @@ def run_niah_phase(payload, guard=None, label=''):
                 # Every eval record that lands in summary.json must also reach
                 # the ledger: without this entry a NIAH accuracy would be a
                 # summary.json number with no trace of which code/weights
-                # produced it (the training cell above IS logged; the evals it
-                # produced used to be the gap).
+                # produced it.
                 L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'status': 'ok', 'key': key, 'variant': v, 'seed': int(seed), 'seq_len': int(Ln), 'code': CKPT_CODE, 'recipe': _ckp.get('recipe'), 'metrics': {'acc': r.get('acc'), 'n': r.get('n'), 'eval_span': r.get('eval_span'), 'params': r.get('params'), 'probe_s': r.get('probe_s')}})
             del model, _ckp
             gc.collect()

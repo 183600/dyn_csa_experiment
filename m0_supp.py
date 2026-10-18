@@ -36,7 +36,7 @@ M2_CAP_HOURS 覆盖），状态文件 run_time_state_m0.json /
 run_time_state_m2.json（内核模式 .k 后缀，两面板互不混账）；超限单元
 拒绝启动、中途到达上限则硬截断且不留半条测量。注意（compute_plan
 §3 的前提判断，不是缺陷）：Triton 内核（G0 判据）就绪之前，eager
-路径的预计用时会让 TimeGuard 直接拒绝启动面板单元——此时应先完成
+路径会被 TimeGuard 直接拒绝启动面板单元——此时应先完成
 内核与 kernel/eager 数值对照。
 """
 import gc, json, os, shutil, subprocess, sys, time, traceback
@@ -121,8 +121,8 @@ def run_params(outdir='results_m0_params'):
     S4 即规划的解析外推口径），对照 docs/compute_plan.md §5 的规划值。
 
     结果连同代码/环境/git 溯源戳写入 `outdir/params_audit.json` 并登记
-    experiments.jsonl——参数量是 §5 预算核对的可引用数字，只打印不留痕
-    就无法追溯是哪一版代码算出的（本函数原为 console-only）。"""
+    experiments.jsonl——参数量是可引用的数字，只打印不留痕
+    就无法追溯是哪一版代码算出的。"""
     print(f'[params] SmallGPT(csa_dynamic) @ vocab={L.B_VOCAB} seq={L.RUN_S1["seq_len"]} — 实例化统计（S1 全量对拍，S2–S4 均匀层组合，S4 即规划的解析外推口径）\n')
     sc1 = L.SCALE_LADDER['S1']
     with torch.random.fork_rng():
@@ -168,8 +168,8 @@ def run_overfit_check(variants=None, steps=250, arch=None):
 
     `arch` optionally probes the architecture family the panel is about to
     train (S1: d=768/12L/12H/dh64): a head/layer-geometry bug that the tiny
-    default probe (d=64/2L/4H) can never see is caught before the expensive
-    panel starts.  Unset = the default tiny probe."""
+    default probe (d=64/2L/4H) can never see is caught before the panel
+    starts.  Unset = the default tiny probe."""
     variants = list(variants or L.B_ARMS)
     print(f'\n[overfit] small-batch sanity check: {len(variants)} variant(s), wd=0, comp_lambda=0, no augmentation')
     reports = L.overfit_guard(variants, steps=int(steps), vocab=256, arch=arch)
@@ -305,7 +305,7 @@ def run_full():
     guard = L.TimeGuard(cap)
     guard.report()
     _what = f'{panel} 主面板（B 档，{len(run_cfg["variants"])} 臂 × {len(run_cfg["seeds"])} seeds × {run_cfg["n_train_tokens"] / 1e9:g}B token）'
-    print(f'[m0] 提示（compute_plan §3）：内核（G0）就绪前 eager 预计用时会被 TimeGuard 拒绝启动——先完成三算子 Triton 化与 kernel/eager 数值对照，再回到这里跑 {_what}。')
+    print(f'[m0] 提示（compute_plan §3）：内核（G0）就绪前 eager 路径会被 TimeGuard 拒绝启动——先完成三算子 Triton 化与 kernel/eager 数值对照，再回到这里跑 {_what}。')
     push_ok = git_push(f'm0: {_what}启动（产出目录 {run_cfg["outdir"]}/）')
     L.run(run_cfg, guard=guard, label=f'M0/{_what}')
     push_ok &= git_push(f'm0: {_what}完成一轮（{run_cfg["outdir"]} 为本地实验产物，不入库；量值以 summary.json 现算为准）')

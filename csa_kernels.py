@@ -399,20 +399,17 @@ def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
 def _full_arange_cached(B, T, Bm, device, contiguous=True):
     # `contiguous=False` returns a stride-0 expand view: every row holds the
     # same exact integers, which is all the torch-reference backend reads
-    # (advanced indexing / gathers / comparisons) and all the triton attention
-    # kernels read once they take the HCA arange fast path (one block per
-    # lane, so the block id is the lane index itself).  Only callers that
-    # really need a dense table ask for `contiguous=True`.
+    # (advanced indexing / gathers / comparisons).  The triton attention
+    # kernels interpret the table by lane index.  Callers that need a dense
+    # table ask for `contiguous=True`.
     key = (int(B), int(T), int(Bm), str(device), bool(contiguous))
     out = _ARANGE_CACHE.get(key)
     if out is None:
         base = torch.arange(Bm, device=device, dtype=torch.int32)[None, None, :].expand(B, T, Bm)
         out = base.contiguous() if contiguous else base
         if not contiguous:
-            # Identity-keyed fast path marker: shape (B,T,Bm) with stride
-            # (0,0,1) is exactly the row-constant arange table, so the
-            # attention launcher can skip both the dense table and its
-            # O(B*T*Bm) index reads without inspecting the values.
+            # Shape (B,T,Bm) with stride (0,0,1) is the row-constant arange
+            # table; mark it so the attention launcher can recognise it.
             out._idx_arange = True
         _need = _arange_nbytes(out)
         _full_arange_evict(_need)
@@ -470,7 +467,7 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     jA = torch.arange(L, device=dev)
     g_a, av_all = geom.gather_geom()
     pos_a = jA.clamp(max=int(B_pos_a.shape[0]) - 1)
-    # Within the table the gather index is arange(L); use the slice view.
+    # Within the table the gather index is arange(L).
     Bp_a = (B_pos_a[:L] if L <= B_pos_a.shape[0] else B_pos_a[pos_a]).to(dtype)
     if has_b:
         jB = torch.arange(W, device=dev)
@@ -536,7 +533,7 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     jA = torch.arange(L, device=dev)
     g_a, av_all = geom.gather_geom()
     pos_a = jA.clamp(max=int(B_pos_a.shape[0]) - 1)
-    # Within the table the gather index is arange(L); use the slice view.
+    # Within the table the gather index is arange(L).
     Bp_a = (B_pos_a[:L] if L <= B_pos_a.shape[0] else B_pos_a[pos_a]).to(dtype)
     if has_b:
         jB = torch.arange(W, device=dev)
@@ -715,10 +712,8 @@ def _stable_topk_desc(x, k):
         m *= int(_s)
     dev = x.device
     flat = x.reshape(m, B)
-    # Clone the single k-th column so the full [m, kk] topk values buffer is
-    # released immediately (a bare column view would keep it alive).  For a
-    # large kk the order-statistic form is the same value with a much smaller
-    # transient (and no full sorted top-k); small kk keeps the faster topk.
+    # Clone the single k-th column before discarding the source table.  The
+    # two branches below produce the same k-th value.
     if kk * 4 >= B:
         kth = torch.kthvalue(flat, B - kk + 1, dim=1).values.unsqueeze(1)
     else:
@@ -815,8 +810,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=True):
         if need_soft:
             masked_lse = torch.where(causal_c, scores, _NEG_INF)
             lse = torch.logsumexp(masked_lse, dim=-1)
-            # Only lse survives; release the full masked table before the
-            # selection tables are built.
+            # Only lse survives.
             del masked_lse
         cf = causal_c & torch.isfinite(scores)
         work = torch.where(cf, scores, _NEG_INF)
@@ -928,8 +922,7 @@ def _indexer_bwd_ref(gs, idx, valid, soft, qI, kI, w_idx, last_tok,
         e = torch.where(row_ok[:, :, None], torch.exp(masked - lse[:, :, None]), 0.0)
         ds = Mk - e * Gt[:, t0:t1, None]
         ds = torch.where(causal_c & torch.isfinite(s_all), ds, 0.0)
-        # The per-chunk normalizer/selector tables are dead once ds exists;
-        # release them before the per-head gradient einsums allocate.
+        # The per-chunk normalizer/selector tables are dead once ds exists.
         del masked, lse, row_ok, e, Mk, s_all
         for i in range(nIH):
             s_i = s_list[i]
@@ -1159,8 +1152,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     seg_b = _seg_structure(keyb.reshape(-1), R * Bm) if keyb is not None else None
     seg_w = _seg_structure(keyw.reshape(-1), R * T) if keyw is not None else None
     # The segment structures own their own permutation/segment tables; the key
-    # tables are no longer needed, so release them before the per-head
-    # gradient fragments are allocated.
+    # tables are no longer needed.
     del keyb, keyw
     dk_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dkb else None
     dv_frag = torch.empty((R, T, nb, hd), device=dev, dtype=torch.float32) if need_dvb else None
@@ -1301,9 +1293,8 @@ class FusedSparseAttention(torch.autograd.Function):
     def forward(ctx, impl, q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale):
         impl = _attn_impl_for_shape(impl, q, w)
         # HCA's read-everything arm passes the cached stride-0 arange table:
-        # every row is exactly arange(nb), so the triton kernels can derive
-        # the block id from the lane index instead of materializing / reading
-        # a dense [R, T, nb] table (a major peak-memory win at long context).
+        # every row is exactly arange(nb), so the triton kernels derive the
+        # block id from the lane index.
         idx_arange = bool(getattr(topk_idx, '_idx_arange', False))
         if impl == 'triton':
             out = _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale, idx_arange)
@@ -1591,9 +1582,8 @@ def _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     q = q.contiguous()
     k_blk, v_blk = k_blk.contiguous(), v_blk.contiguous()
     k_sw, v_sw = k_sw.contiguous(), v_sw.contiguous()
-    # The arange table is a stride-0 expand view: a dense .contiguous() copy
-    # would be exactly the O(R*T*nb) allocation this path removes, and the
-    # kernels read the lane index instead of the table.
+    # The arange table is a stride-0 expand view; the kernels read the lane
+    # index instead of the table.
     topk_idx = topk_idx if idx_arange else topk_idx.contiguous()
     valid_c = valid.contiguous() if valid is not None else topk_idx
     last_tok = last_tok.contiguous()
@@ -1676,8 +1666,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
         if idx_arange:
             # Every row is arange(nb): the stable block-major order is
-            # implicit (lane = t*nb + b), so no O(R*T*nb) argsort / scatter /
-            # offsets tables are needed.  The kernel derives the segment
+            # implicit (lane = t*nb + b).  The kernel derives the segment
             # bounds from b and T directly.
             order = offs = q
         else:
@@ -2252,9 +2241,9 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
     idx = torch.empty((R, T, k_out), device=qI.device, dtype=torch.int32)
     valid_i8 = torch.empty((R, T, k_out), device=qI.device, dtype=torch.int8)
     # The soft prior is training-only (its straight-through path is dead
-    # without gradients), so eval skips both its allocation and the kernel's
-    # lse/exp tail.  The dummy pointer is never dereferenced when HAS_SOFT is
-    # false (the branch is compile-time eliminated).
+    # without gradients), so eval does not build it.  The dummy pointer is
+    # never dereferenced when HAS_SOFT is false (the branch is compile-time
+    # eliminated).
     soft = torch.empty((R, T, k_out), device=qI.device, dtype=qI.dtype) if need_soft else None
     soft_arg = soft if soft is not None else idx
     BT, BB = 64, 64
@@ -2311,8 +2300,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         nblks = [pb[1] for pb in pre_blocks]
         hons = [pb[2] for pb in pre_blocks]
         # Write the rows directly into the int32 device table: the exact same
-        # block ids the int64 stack-then-cast produced, without the temporary
-        # [B, T] int64 stack (a batch-sized peak saving).
+        # block ids the int64 stack-then-cast produced.
         bid_full = torch.empty((B, T), dtype=torch.int32, device=dev)
         for _b, _bd in enumerate(bids):
             bid_full[_b].copy_(_bd)
@@ -2395,8 +2383,8 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     del _kvh, _k_all, _v_all
     if cfg.kind == 'hca':
         # Always the stride-0 expand view: the ref backend reads it directly,
-        # and the triton attention kernels take the arange fast path (block id
-        # == lane index) instead of materializing an O(B*T*Bm) table.
+        # and the triton attention kernels derive the block id from the lane
+        # index.
         topk_idx = _full_arange_cached(B, T, Bm, dev, contiguous=False)
         valid = None
         soft = None
@@ -2751,10 +2739,9 @@ def bench_attention(device, impl='triton', R=8, T=8192, nh=12, hd=64, topk=32, w
     （均按注意力项计数 / 墙钟）。
     """
     device = torch.device(device)
-    # Device-matched generator: on CPU this is bit-identical to the old
-    # torch.Generator() form, while a CPU generator handed to CUDA factory
-    # calls (or Tensor.normal_) is a device mismatch.  The benchmark is
-    # timing-only, so pinning every draw also makes repeated invocations
+    # Device-matched generator: on CPU this matches torch.Generator(), while a
+    # CPU generator handed to CUDA factory calls (or Tensor.normal_) is a
+    # device mismatch.  Pinning every draw also makes repeated invocations
     # reproducible instead of dependent on ambient RNG state.
     gen = torch.Generator(device=device).manual_seed(1234)
     Bm = Bm or max(T // 4, topk + 1)
