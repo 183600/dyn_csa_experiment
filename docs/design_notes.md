@@ -687,6 +687,15 @@ steps/tokens 时还要求跨臂训练预算一致。`methodology_audit` 把统�
 「data/val 指纹、steps、tokens、参数量一致 + 等搜索预算」单独报告，
 绝不与严格同 run_cfg 的架构对照混池。
 
+搜索本身也必须跨种子：单一种子的 validation PPL 会把种子噪声选成最优
+超参。`BASELINE_TUNING_PROTOCOL.search_seeds`（默认 `[0,1,2]`）声明同一组
+搜索种子，每个 trial 的 `ppl` 是这些种子的**均值**，`seed_ppls` / `ppl_std`
+落盘逐种子值与样本标准差；选择按均值而非单次抽样。`baseline_tuning_audit`
+在记录暴露 `seeds`/`seed_ppls` 时额外要求：聚合值确为逐种子均值、标准差
+确为样本标准差、**所有臂的所有 trial 使用同一搜索种子集**。final seeds
+另检查逐臂覆盖一致，并给出该调参族（主方法与各基线两两对比）的精确检验
+分辨率下限；种子不足时标为 resolution-limited，而不是读成零效应。
+
 ### 21.3 指标口径显式化
 
 `exp_lib.METRIC_POLICY` 声明每个任务的主指标、方向、聚合方式与不平衡

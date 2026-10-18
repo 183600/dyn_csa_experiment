@@ -1580,6 +1580,131 @@ def t_baseline_tuning_audit():
 
 
 
+def t_baseline_multi_seed_selection_audit():
+    trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
+
+    def _row(cfg, ppls, seeds=(0, 1, 2)):
+        vals = [ppls[s] for s in seeds]
+        return {'config': dict(cfg), 'ppl': float(np.mean(vals)),
+                'ppl_std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0,
+                'n_seeds': len(vals), 'seeds': list(seeds),
+                'seed_ppls': {str(s): float(ppls[s]) for s in seeds},
+                'steps': 10, 'tokens_seen': 100}
+    def _arm(rows):
+        best = min(rows, key=lambda r: r['ppl'])
+        return {'trials': rows, 'selected': dict(best['config']),
+                'selected_metric_value': best['ppl']}
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['full_matched', 'csa_dynamic'])
+    art = {'selection_metric': 'ppl', 'selection_split': 'validation',
+           'direction': 'lower_is_better', 'search_seeds': [0, 1, 2],
+           'arms': {
+               'full_matched': _arm([_row(trials[0], {0: 10, 1: 10.2, 2: 9.8}),
+                                     _row(trials[1], {0: 11, 1: 11.1, 2: 10.9})]),
+               'csa_dynamic': _arm([_row(trials[0], {0: 9, 1: 9.2, 2: 8.8}),
+                                    _row(trials[1], {0: 9.5, 1: 9.6, 2: 9.4})]),
+           }}
+    r = L.baseline_tuning_audit(art, protocol=protocol)
+    assert r['tuning_verified'] is True, r
+    assert r['search_seed_balanced'] is True and r['search_seeds'] == [0, 1, 2], r
+    # A trial's aggregate must be the mean of its own per-seed values.
+    bad = json.loads(json.dumps(art))
+    bad['arms']['csa_dynamic']['trials'][0]['ppl'] += 0.5
+    rb = L.baseline_tuning_audit(bad, protocol=protocol)
+    assert rb['tuning_verified'] is False and any('not the mean' in p for p in rb['problems']), rb
+    # Selecting some arms on more seeds than others is unequal tuning.
+    bad2 = json.loads(json.dumps(art))
+    for t in bad2['arms']['full_matched']['trials']:
+        t['seeds'] = [0, 1]
+        t['seed_ppls'] = {k: v for k, v in t['seed_ppls'].items() if k in ('0', '1')}
+        t['n_seeds'] = 2
+        t['ppl'] = float(np.mean(list(t['seed_ppls'].values())))
+        t['ppl_std'] = float(np.std(list(t['seed_ppls'].values()), ddof=1))
+    rb2 = L.baseline_tuning_audit(bad2, protocol=protocol)
+    assert rb2['tuning_verified'] is False and any('same search-seed set' in p for p in rb2['problems']), rb2
+
+
+def t_partial_skipped_seed_keeps_controlled_contrast():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    s = {}
+    for i in range(8):
+        ka = knobs if i else dict(knobs, grad_clip_norm=2.0)
+        s[f'a::seed{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=49.0, params=100, train_knobs=ka)
+        s[f'b::seed{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                                ppl=50.0, params=100, train_knobs=knobs)
+    r = L.methodology_audit(s, design={'c': [('a', 'b', 'x')]}, baselines={}, verbose=False)
+    e = r['components']['c'][0]
+    assert e['n_paired'] == 7 and e['n_skipped'] == 1, e
+    assert e['controlled'] is True and e['fully_paired'] is False, e
+    # The six+ controlled pairs still support the claim; the rejected seed is
+    # named instead of silently shrinking the evidence or erasing the contrast.
+    assert 'c' in r['verified_components'], r['verified_components']
+    assert any('controlled pair(s)' in w for w in r['warnings']), r['warnings']
+
+
+def t_audit_incomplete_components_alias():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    s = {}
+    for i in range(3):
+        for v, ppl in (('full', 50.0), ('full-A', 49.0)):
+            s[f'{v}::seed{i}'] = dict(variant=v, seed=i, run_cfg=fp, steps=1,
+                                      tokens_seen=1, ppl=ppl, params=100, train_knobs=knobs)
+    design = {'A': [('full', 'full-A', ''), ('full', 'full-A2', '')]}
+    r = L.methodology_audit(s, design=design, baselines={}, verbose=False)
+    assert r['ablation_completeness']['incomplete_components'] == ['A'], r['ablation_completeness']
+    assert r['incomplete_components'] == ['A'], r['incomplete_components']
+    assert r['missing_ablation_arms']['A'] == ['full-A2'], r['missing_ablation_arms']
+
+
+def t_baseline_tuning_driver_multiseed_selection():
+    out = tempfile.mkdtemp(prefix='tune_multiseed_')
+    trials = [{'lr': 1e-4, 'weight_decay': 0.1, 'warmup': 2},
+              {'lr': 3e-4, 'weight_decay': 0.1, 'warmup': 2}]
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['csa_fixed', 'csa_dynamic'], trials=trials,
+                    search_seeds=[0, 1, 2], final_seeds=[0, 1, 2])
+    base = dict(L.RUN, d=8, n_layers=1, n_heads=1, d_head=8, seq_len=8,
+                batch_size=1, n_train_tokens=32, steps=3, warmup=1)
+    calls = []
+    orig_run = L.run
+    orig_guard = L.overfit_guard
+
+    def fake_run(cfg, seeds=None, guard=None, label=None, **kw):
+        calls.append({'variants': list(cfg['variants']), 'seeds': list(seeds)})
+        os.makedirs(cfg['outdir'], exist_ok=True)
+        summary = {}
+        for v in cfg['variants']:
+            for s in seeds:
+                # lr=3e-4 is better for both arms; a small seed-dependent
+                # offset makes the per-seed mean/std real.
+                ppl = 20.0 - cfg['lr'] * 10000.0 + 0.1 * int(s) + (1.0 if v == 'csa_dynamic' else 0.0)
+                summary[f'{v}::seed{s}'] = {
+                    'variant': v, 'seed': int(s), 'ppl': float(ppl),
+                    'steps': cfg['steps'], 'tokens_seen': cfg['steps'] * cfg['batch_size'] * cfg['seq_len'],
+                    'params': 100, 'run_cfg': f'fake::{cfg["lr"]}::{v}',
+                }
+        with open(os.path.join(cfg['outdir'], 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(summary, f)
+
+    L.run = fake_run
+    L.overfit_guard = lambda *a, **k: None
+    try:
+        art = BT.run_tuning(base, outdir=out, protocol=protocol, final=False)
+    finally:
+        L.run = orig_run
+        L.overfit_guard = orig_guard
+        shutil.rmtree(out, ignore_errors=True)
+    assert calls and all(c['seeds'] == [0, 1, 2] for c in calls), calls
+    assert art['search_seeds'] == [0, 1, 2], art.get('search_seeds')
+    for arm, entry in art['arms'].items():
+        assert len(entry['trials']) == len(trials), entry
+        for row in entry['trials']:
+            assert row['n_seeds'] == 3 and len(row['seed_ppls']) == 3, row
+            assert abs(row['ppl'] - float(np.mean(list(row['seed_ppls'].values())))) < 1e-12, row
+        assert entry['selected']['lr'] == 3e-4, (arm, entry['selected'])
+
+
 def t_simple_baseline_ngram_and_audit():
     rng = np.random.default_rng(7)
     vocab = 32
@@ -1950,6 +2075,8 @@ def main():
     _check('C17d capacity-confounding warning on module ablation', t_capacity_confound_warning)
     _check('C17e module ablation requires identical structured hyperparameters', t_component_pair_requires_same_mlp_ratio)
     _check('C20 panel ablation flag does not overclaim', t_panel_ablation_flag_does_not_overclaim)
+    _check('C20a partial pairing keeps controlled seeds', t_partial_skipped_seed_keeps_controlled_contrast)
+    _check('C20b incomplete components exported in audit report', t_audit_incomplete_components_alias)
     _check('A7 adaptive-threshold capacity guard', t_adaptive_threshold_guard)
     _check('A8 empty segmenter', t_segment_empty)
     _check('A8a uniform-stride cut boundary', t_segment_uniform_stride_only_when_all_cuts)
@@ -1987,6 +2114,8 @@ def main():
     _check('H1 hypothesis direction conflict', t_hypothesis_direction_conflict)
     _check('H2 metric policy + macro/micro/weighted F1 + PR/ROC-AUC', t_metric_policy_and_classification_metrics)
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
+    _check('H3a multi-seed selection + equal search-seed audit', t_baseline_multi_seed_selection_audit)
+    _check('H3b tuning driver selects on the multi-seed mean', t_baseline_tuning_driver_multiseed_selection)
     _check('H4 tuned count-model floor + audit', t_simple_baseline_ngram_and_audit)
     _check('H5 positive-label / rare-positive PR-AUC / macro-F1 averaging', t_classification_positive_label_and_rare_floor)
     _check('H6 hypothesis completeness + metric alignment + direction=0', t_hypothesis_audit_completeness_and_metric_alignment)

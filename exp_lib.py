@@ -5837,6 +5837,10 @@ BASELINE_TUNING_PROTOCOL = {
     'selection_split': 'validation',
     'direction': 'lower_is_better',
     'search_seed': 0,
+    # Selection is on the MEAN validation PPL over this declared seed set, not
+    # on one seed's draw.  A single-seed selection can pick a config because
+    # of seed noise; every arm and every trial uses the same set.
+    'search_seeds': [0, 1, 2],
     'final_seeds': [0, 1, 2],
     'arms': ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic'],
     'trials': [
@@ -5845,7 +5849,7 @@ BASELINE_TUNING_PROTOCOL = {
         {'lr': 0.0003, 'weight_decay': 0.05, 'warmup': 50},
         {'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 100},
     ],
-    'note': 'Every arm gets the same declared trials and the same selection split. A tuning trial may never read the held-out test split; test is used once after selection.',
+    'note': 'Every arm gets the same declared trials, the same search-seed set and the same selection split. Selection uses mean validation PPL across search_seeds (std recorded); a single-seed draw can win on noise. Final seeds re-use only the validation-selected config and are reported as mean±std. A tuning trial may never read the held-out test split; test is used once after selection.',
 }
 
 # 最简单基线协议（先立地板，再谈复杂模型）：语言模型的 trivial floor 是
@@ -6501,7 +6505,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     selected config that really is the best recorded trial, and a
     `selected_metric_value` that is the value of **that** config (not merely
     the minimum of some other trial).  When trial records expose
-    steps/tokens_seen, the training budget must also agree across arms.
+    steps/tokens_seen, the training budget must also agree across arms.  When
+    they expose `seeds` / `seed_ppls`, the aggregate must be the mean of those
+    per-seed values and every arm must select on the same search-seed set —
+    otherwise one arm's winner can be a noise draw even though lr grids match.
+    The final-seed coverage is checked for equality and reported with the
+    family-resolution floor.
     Missing evidence is reported as `not_verifiable_locally`, never as a pass.
     """
     _explicit_protocol = protocol is not None
@@ -6540,6 +6549,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     signatures = {}
     n_trials = {}
     budgets = {}
+    search_seed_sets = {}
     for arm, entry in arms.items():
         trials = entry.get('trials') if isinstance(entry, dict) else None
         if not isinstance(trials, list) or not trials:
@@ -6548,6 +6558,44 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         cfgs = [json.dumps(t.get('config') or {}, sort_keys=True, default=str) for t in trials if isinstance(t, dict)]
         signatures[arm] = tuple(sorted(cfgs))
         n_trials[arm] = len(cfgs)
+        # Multi-seed selection: when trials expose their seed set, every trial
+        # of every arm must average the same seeds.  A trial whose `ppl` is
+        # not the mean of its own per-seed values is a fabricated aggregate.
+        _set = set()
+        for t in trials:
+            if not isinstance(t, dict):
+                continue
+            _seeds = t.get('seeds')
+            _ppls = t.get('seed_ppls')
+            if _ppls is not None and not isinstance(_ppls, dict):
+                problems.append(f'{arm}: seed_ppls is not a mapping')
+                continue
+            if _seeds is not None:
+                try:
+                    _ss = tuple(sorted({int(s) for s in _seeds}))
+                except (TypeError, ValueError):
+                    problems.append(f'{arm}: trial seeds are not integers ({_seeds!r})')
+                    continue
+                if len(_ss) != len(set(_seeds)):
+                    problems.append(f'{arm}: trial lists duplicate seeds')
+                if _ppls is not None and set(str(s) for s in _ss) != set(_ppls):
+                    problems.append(f'{arm}: trial seeds and seed_ppls keys disagree')
+                _set.add(_ss)
+            elif _ppls is not None:
+                _set.add(tuple(sorted(int(k) for k in _ppls)))
+            if isinstance(_ppls, dict) and isinstance(t.get('ppl'), (int, float)) and not isinstance(t.get('ppl'), bool):
+                _vals = [float(v) for v in _ppls.values()
+                         if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))]
+                if _vals:
+                    _m = float(np.mean(_vals))
+                    if abs(_m - float(t['ppl'])) > 1e-9 * max(1.0, abs(_m)):
+                        problems.append(f'{arm}: trial ppl is not the mean of its per-seed values')
+                    if t.get('ppl_std') is not None and len(_vals) > 1:
+                        _s = float(np.std(_vals, ddof=1))
+                        if abs(_s - float(t['ppl_std'])) > 1e-9 * max(1.0, abs(_s)):
+                            problems.append(f'{arm}: trial ppl_std is not the sample std of its per-seed values')
+        if _set:
+            search_seed_sets[arm] = _set
         if declared and any(c not in declared for c in cfgs):
             problems.append(f'{arm}: a trial is outside the declared grid')
         elif declared and set(cfgs) != declared:
@@ -6609,6 +6657,32 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             problems.append('arms did not search the same trial grid — tuning budgets are unequal')
         if len(set(n_trials.values())) != 1:
             problems.append('arms did not receive the same number of tuning trials — tuning budgets are unequal')
+    # Equal tuning includes equal SEARCH SEEDS.  If one arm selected on seeds
+    # {0} and another on {0,1,2}, their selection noise differs even though the
+    # lr grid is identical.  Only trials that expose their seed set are
+    # checkable; legacy artifacts without it stay on the untested path.
+    search_seed_balanced = None
+    search_seeds_seen = None
+    _declared_ss = protocol.get('search_seeds')
+    if _declared_ss is not None:
+        try:
+            _declared_ss = tuple(sorted({int(s) for s in _declared_ss}))
+        except (TypeError, ValueError):
+            problems.append(f'declared search_seeds are not integers ({_declared_ss!r})')
+            _declared_ss = None
+    if search_seed_sets:
+        _no_seed_info = sorted(set(arms) - set(search_seed_sets))
+        if _no_seed_info:
+            warnings.append(f'arms {_no_seed_info} do not expose their search seeds — equal search seeds cannot be verified for them')
+        if len(search_seed_sets) >= 2:
+            search_seed_balanced = len({frozenset(v) for v in search_seed_sets.values()}) == 1
+            if not search_seed_balanced:
+                problems.append('arms did not select on the same search-seed set — equal-search tuning is not verified')
+        search_seeds_seen = sorted({s for v in search_seed_sets.values() for ss in v for s in ss})
+        if _declared_ss is not None and set(search_seeds_seen) != set(_declared_ss):
+            warnings.append(f'trials report search seeds {search_seeds_seen} but the declared set is {list(_declared_ss)}')
+    elif _declared_ss is not None:
+        warnings.append('trial records do not expose their search seeds — multi-seed selection cannot be verified from this artifact')
     # Cross-arm per-config budget check (only where both records expose it).
     _all_sigs = set().union(*(set(b) for b in budgets.values())) if budgets else set()
     for sig in sorted(_all_sigs):
@@ -6622,6 +6696,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         warnings.append('the search grid was truncated (search_complete=False); it is equal across arms, but describe it as a bounded search, not the full declared grid')
     final_records = selected.get('final_records') or {}
     final_seeds = selected.get('final_seeds') or protocol.get('final_seeds') or []
+    final_seed_coverage = {}
     if final_records:
         for arm, entry in arms.items():
             chosen = entry.get('selected') or entry.get('selected_config') or {}
@@ -6633,6 +6708,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             _seeds = [int(r['seed']) for _k, r in hits if r.get('seed') is not None]
             if len(_seeds) != len(set(_seeds)):
                 problems.append(f'{arm}: duplicate final records for the same seed')
+            final_seed_coverage[arm] = sorted(set(_seeds))
             if final_seeds:
                 _need = {int(s) for s in final_seeds}
                 _miss = sorted(_need - set(_seeds))
@@ -6646,6 +6722,20 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                         break
                 if r.get('variant') is not None and r.get('variant') != arm:
                     problems.append(f'{arm}: final record key {_k} carries variant={r.get("variant")!r}')
+    final_seed_coverage_equal = None
+    final_min_seed_count = None
+    _final_family_floor = None
+    if final_seed_coverage:
+        final_seed_coverage_equal = len({tuple(v) for v in final_seed_coverage.values()}) == 1
+        final_min_seed_count = min(len(v) for v in final_seed_coverage.values())
+        if not final_seed_coverage_equal:
+            problems.append('final records do not cover the same seeds in every arm — the paired comparison would silently use different n per arm')
+        # The tuned comparison is its own family (method vs each other arm).
+        _final_family_floor = signflip_min_n_for_holm(max(1, len(arms) - 1), 0.05)
+        if final_min_seed_count < 3:
+            warnings.append(f'only {final_min_seed_count} final seed(s) per arm — the reporting floor for a key experiment is 3; treat the tuned contrast as descriptive')
+        elif _final_family_floor is not None and final_min_seed_count < _final_family_floor:
+            warnings.append(f'{final_min_seed_count} final seeds per arm cannot reach a Holm-corrected p<0.05 for {max(1, len(arms) - 1)} tuned contrast(s) (needs n>={_final_family_floor}); the tuned contrast is resolution-limited, not a null')
     required = set(protocol.get('arms') or [])
     if required and not required.issubset(set(arms)):
         problems.append(f'missing tuning evidence for arms {sorted(required - set(arms))}')
@@ -6655,6 +6745,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     out = {'status': 'ok' if not problems else 'fail', 'tuning_verified': not problems,
            'selection_metric': metric, 'selection_split': split,
            'n_trials': n_trials, 'same_search_space': (len(set(signatures.values())) <= 1) if signatures else None,
+           'search_seeds': search_seeds_seen if search_seeds_seen is not None else (_declared_ss and list(_declared_ss)),
+           'search_seed_balanced': search_seed_balanced,
+           'final_seed_coverage': final_seed_coverage,
+           'final_seed_coverage_equal': final_seed_coverage_equal,
+           'final_min_seed_count': final_min_seed_count,
+           'min_final_seeds_for_family_significance': _final_family_floor,
            'search_complete': selected.get('search_complete') if selected.get('search_complete') is not None else _grid_complete,
            'grid_complete': _grid_complete,
            'arms': sorted(arms), 'problems': problems, 'warnings': warnings}
@@ -7262,7 +7358,15 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                'n_shared': len(shared), 'n_skipped': len(skipped),
                                'n_paired': len(_passed), 'seeds': _passed,
                                'skipped_reasons': sorted({reason for _s, reason in skipped}),
-                               'controlled': bool(deltas) and (not skipped),
+                               # A contrast is controlled when at least one
+                               # pair cleared the same-config gate.  Skipped
+                               # seeds are excluded from n (and named above);
+                               # they must not erase the seeds that DID pass,
+                               # nor turn a clean n=4 contrast into
+                               # 'uncontrolled'.  `fully_paired` still records
+                               # whether every shared seed passed.
+                               'controlled': bool(deltas),
+                               'fully_paired': bool(deltas) and (not skipped),
                                'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b,
                                'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None,
                                'param_rel_diff': _rel, 'param_controlled': _param_ok,
@@ -7289,6 +7393,11 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     entries.append(st)
                     if deltas:
                         _contrast_measured = True
+                        if skipped:
+                            report['warnings'].append(
+                                '%s: `%s` vs `%s` has %d controlled pair(s) but %d seed(s) rejected by the same-run_cfg/train_knobs gate (%s) — n counts only the controlled pairs; do not read the skipped seeds as a larger sample'
+                                % (comp, a, b, len(deltas), len(skipped),
+                                   '; '.join(sorted({reason for _s, reason in skipped}))))
                         if st.get('seed_driven'):
                             report['warnings'].append(
                                 '%s: `%s` vs `%s` (n=%d) is SEED-DRIVEN — dropping any one seed flips the sign of the mean, so the direction is not stable across seeds even if the aggregate p looks small; report the per-seed deltas and add seeds before treating it as a mechanism effect'
@@ -7351,6 +7460,15 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     if _scoped_design:
         report['ablation_completeness'] = ablation_completeness_audit(_scoped_design, _present_set)
         report['ablation_complete'] = bool(report['ablation_completeness'].get('complete'))
+        # Top-level alias: `audit_gates.py methodology` and downstream readers
+        # consume `incomplete_components` from the audit report.  Leaving the
+        # initializer's empty list in place made a partial leave-one-out panel
+        # look complete even while `ablation_completeness` named the missing
+        # arm.  Keep both views consistent.
+        report['incomplete_components'] = list(
+            report['ablation_completeness'].get('incomplete_components') or [])
+        report['missing_ablation_arms'] = dict(
+            report['ablation_completeness'].get('missing_arms') or {})
         for _comp in report['ablation_completeness'].get('incomplete_components') or []:
             _miss = report['ablation_completeness'].get('missing_arms', {}).get(_comp) or []
             report['warnings'].append('%s: ablation is INCOMPLETE — missing arm(s) %s; this component cannot support a "useful" claim until every declared contrast is present'
@@ -7359,6 +7477,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         report['ablation_completeness'] = {'mode': 'leave-one-out', 'complete': None,
                                            'components': {}, 'complete_components': [],
                                            'incomplete_components': [], 'missing_arms': {}}
+        report['incomplete_components'] = []
+        report['missing_ablation_arms'] = {}
         report['ablation_complete'] = None
     # Arm-level mean±std: the seed reliability is visible even for arms that
     # are not part of a declared contrast.  Group by protocol so different

@@ -42,10 +42,11 @@ sys.path.insert(0, REPO)
 import exp_lib as L
 
 
-def _trial_cfg(base, outdir, arms, seed, steps, knobs):
+def _trial_cfg(base, outdir, arms, seeds, steps, knobs):
     cfg = dict(base)
-    cfg.update(outdir=outdir, variants=list(arms), seeds=[int(seed)], steps=int(steps),
-               lr=float(knobs['lr']), weight_decay=float(knobs['weight_decay']),
+    cfg.update(outdir=outdir, variants=list(arms), seeds=[int(s) for s in seeds],
+               steps=int(steps), lr=float(knobs['lr']),
+               weight_decay=float(knobs['weight_decay']),
                warmup=int(knobs['warmup']))
     return cfg
 
@@ -55,6 +56,15 @@ def _one_seed_record(summary, arm, seed):
     if isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl')):
         return rec
     return None
+
+
+def _mean_std(values):
+    vals = [float(v) for v in values if L.ppl_is_usable(v)]
+    if not vals:
+        return float('nan'), float('nan')
+    mean = float(np.mean(vals))
+    std = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+    return mean, std
 
 
 def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
@@ -73,24 +83,55 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     else:
         search_steps = int(base['steps'])
     search_seed = int(protocol.get('search_seed', 0))
+    # Tuning selection must not be decided by a single seed's validation
+    # noise.  The same declared search-seed set is used for every arm and
+    # every trial, and selection uses the mean validation PPL (with the
+    # across-seed std recorded).  Legacy protocols that only declare
+    # `search_seed` keep the single-seed path.
+    _raw_search_seeds = protocol.get('search_seeds')
+    if _raw_search_seeds is None:
+        _raw_search_seeds = [search_seed]
+    try:
+        search_seeds = sorted({int(s) for s in _raw_search_seeds})
+    except (TypeError, ValueError):
+        raise ValueError(f'search_seeds must be integers, got {_raw_search_seeds!r}')
+    if not search_seeds:
+        raise ValueError('search_seeds must contain at least one seed')
     os.makedirs(outdir, exist_ok=True)
-    print(f'[tune] equal-search grid: {len(arms)} arms x {len(trials)} trials x {search_steps} steps, selection={protocol["selection_metric"]} on {protocol["selection_split"]}')
+    print(f'[tune] equal-search grid: {len(arms)} arms x {len(trials)} trials x {search_steps} steps x {len(search_seeds)} seed(s), selection={protocol["selection_metric"]} on {protocol["selection_split"]}')
     L.overfit_guard(arms, steps=200, vocab=256)
     per_arm = {a: [] for a in arms}
     for ti, knobs in enumerate(trials):
         tdir = os.path.join(outdir, f'trial_{ti:02d}')
-        cfg = _trial_cfg(base, tdir, arms, search_seed, search_steps, knobs)
-        L.run(cfg, seeds=[search_seed], guard=None, label=f'baseline tuning trial {ti + 1}/{len(trials)}')
+        cfg = _trial_cfg(base, tdir, arms, search_seeds, search_steps, knobs)
+        L.run(cfg, seeds=search_seeds, guard=None, label=f'baseline tuning trial {ti + 1}/{len(trials)}')
         summary = json.load(open(os.path.join(tdir, 'summary.json'), encoding='utf-8'))
         for arm in arms:
-            rec = _one_seed_record(summary, arm, search_seed)
-            if rec is None:
+            records = {}
+            for seed in search_seeds:
+                rec = _one_seed_record(summary, arm, seed)
+                if rec is not None:
+                    records[seed] = rec
+            if not records:
                 print(f'[tune] WARNING: {arm} has no measurable PPL in trial {ti} ({tdir})')
                 continue
-            per_arm[arm].append({'config': dict(knobs), 'ppl': float(rec['ppl']),
-                                 'params': rec.get('params'), 'steps': rec.get('steps'),
-                                 'tokens_seen': rec.get('tokens_seen'),
-                                 'run_cfg': rec.get('run_cfg'), 'outdir': tdir})
+            if len(records) < len(search_seeds):
+                print(f'[tune] WARNING: {arm} trial {ti} has only seeds {sorted(records)} of {search_seeds}; '
+                      'selection uses the observed seeds and the artifact records the gap')
+            mean, std = _mean_std([records[s]['ppl'] for s in sorted(records)])
+            _steps = {int(records[s]['steps']) for s in records if records[s].get('steps') is not None}
+            _tokens = {int(records[s]['tokens_seen']) for s in records if records[s].get('tokens_seen') is not None}
+            per_arm[arm].append({
+                'config': dict(knobs), 'ppl': mean, 'ppl_std': std,
+                'n_seeds': len(records), 'seeds': sorted(records),
+                'seed_ppls': {str(s): float(records[s]['ppl']) for s in sorted(records)},
+                'params': records[sorted(records)[0]].get('params'),
+                'steps': (next(iter(_steps)) if len(_steps) == 1 else None),
+                'tokens_seen': (next(iter(_tokens)) if len(_tokens) == 1 else None),
+                'budget_by_seed': {str(s): [records[s].get('steps'), records[s].get('tokens_seen')]
+                                   for s in sorted(records)},
+                'run_cfg': records[sorted(records)[0]].get('run_cfg'), 'outdir': tdir,
+            })
     selected = {}
     for arm in arms:
         hits = [t for t in per_arm[arm] if L.ppl_is_usable(t.get('ppl'))]
@@ -101,9 +142,11 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                          'selected_metric_value': float(best['ppl']),
                          'params': best.get('params'), 'run_cfg': best.get('run_cfg'),
                          'trials': per_arm[arm]}
-        print(f'[tune] {arm:22s} best PPL {best["ppl"]:.4f} at {best["config"]}')
+        print(f'[tune] {arm:22s} best mean PPL {best["ppl"]:.4f} +/- {best["ppl_std"]:.4f} '
+              f'(n={best.get("n_seeds")}) at {best["config"]}')
     artifact_protocol = dict(protocol)
     artifact_protocol['trials'] = [dict(t) for t in trials]
+    artifact_protocol['search_seeds'] = list(search_seeds)
     artifact = {
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'protocol': artifact_protocol,
@@ -111,6 +154,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         'selection_split': protocol['selection_split'],
         'direction': protocol['direction'],
         'search_seed': search_seed,
+        'search_seeds': list(search_seeds),
         'search_steps': search_steps,
         'declared_trials': len(declared_trials),
         'trials_run': len(trials),
@@ -193,9 +237,27 @@ def _run_final(base, outdir, protocol, selected):
                                    'hyperparams': v.get('hyperparams')}
                                for k, v in merged.items()}
     L.atomic_write_json(os.path.join(final_dir, 'baseline_tuning.json'), tuning)
+    # Arm-level mean±std over the same final seed set, so the tuned table is
+    # not a single aggregate number per arm.  The paired contrast below is
+    # still computed per seed (paired by construction), not by subtracting
+    # these two means.
+    arm_summary = {}
+    for arm, entry in selected.items():
+        _recs = {int(r['seed']): float(r['ppl']) for r in merged.values()
+                 if isinstance(r, dict) and r.get('variant') == arm
+                 and r.get('seed') is not None and L.ppl_is_usable(r.get('ppl'))}
+        _vals = [_recs[s] for s in sorted(_recs)]
+        arm_summary[arm] = {
+            'n_seeds': len(_vals), 'seeds': sorted(_recs),
+            'ppl_mean': float(np.mean(_vals)) if _vals else float('nan'),
+            'ppl_std': float(np.std(_vals, ddof=1)) if len(_vals) > 1 else 0.0,
+            'selected': dict(entry.get('selected') or {}),
+        }
     tuned_arms = {a: len(entry['trials']) for a, entry in selected.items()}
     comparison = {'pairing_rule': 'tuned_equal_budget',
                   'note': 'Each arm used its own validation-selected hyperparameters; data/val fingerprints, steps, tokens and parameters are matched. This is NOT the strict same-run_cfg architectural contrast and must be reported separately.',
+                  'final_seeds': list(final_seeds),
+                  'arm_summary': arm_summary,
                   'contrasts': {}}
     for method in ('csa_dynamic',):
         if method not in selected:
@@ -204,8 +266,9 @@ def _run_final(base, outdir, protocol, selected):
             if baseline == method:
                 continue
             deltas, seeds, skipped = [], [], []
-            for seed in sorted({int(r['seed']) for r in merged.values() if r.get('variant') == method} &
-                               {int(r['seed']) for r in merged.values() if r.get('variant') == baseline}):
+            _common = sorted({int(r['seed']) for r in merged.values() if r.get('variant') == method} &
+                             {int(r['seed']) for r in merged.values() if r.get('variant') == baseline})
+            for seed in _common:
                 ra = merged.get(f'{method}::seed{seed}')
                 rb = merged.get(f'{baseline}::seed{seed}')
                 if not isinstance(ra, dict) or not isinstance(rb, dict):
@@ -217,8 +280,15 @@ def _run_final(base, outdir, protocol, selected):
                 deltas.append(float(ra['ppl']) - float(rb['ppl']))
                 seeds.append(seed)
             st = L.paired_effect_stats(deltas)
+            _base_mean = (arm_summary.get(baseline) or {}).get('ppl_mean')
+            _rel = (100.0 * float(st['mean']) / _base_mean
+                    if isinstance(_base_mean, (int, float)) and _base_mean > 0 else float('nan'))
             st.update({'with': method, 'without': baseline, 'seeds': seeds,
+                       'n_shared': len(_common), 'n_skipped': len(skipped),
                        'skipped': skipped, 'pairing_rule': 'tuned_equal_budget',
+                       'with_mean': (arm_summary.get(method) or {}).get('ppl_mean'),
+                       'without_mean': _base_mean,
+                       'relative_effect_pct': _rel,
                        'mean_pm_std': (f'{st["mean"]:+.4f} +/- {st["std"]:.4f}' if st.get('n') else 'n/a')})
             comparison['contrasts'][f'{method} - {baseline}'] = st
     # The tuned contrasts form their own family: each baseline is a separate
@@ -234,12 +304,24 @@ def _run_final(base, outdir, protocol, selected):
         st['p_holm'] = _h.get('p_holm')
         st['significant_holm'] = bool(_h.get('reject') and (not st.get('within_seed_noise'))
                                       and st.get('controlled', True))
+    _final_counts = {a: int(v.get('n_seeds') or 0) for a, v in arm_summary.items()}
     comparison['family'] = {
         'name': 'tuned_equal_budget_baselines',
         'm': _m, 'alpha': 0.05, 'correction': 'holm step-down',
+        'final_seed_count_by_arm': _final_counts,
+        'final_seed_coverage_equal': (len(set(_final_counts.values())) == 1) if _final_counts else None,
         'min_seeds_for_family_significance': L.signflip_min_n_for_holm(_m, 0.05) if _m else None,
         'note': 'per-arm validation-selected hyperparameters; a tuned win is NOT a strict same-run_cfg architectural contrast',
     }
+    if _final_counts:
+        _min_final = min(_final_counts.values())
+        _need = comparison['family']['min_seeds_for_family_significance']
+        if _min_final < 3:
+            comparison['family']['warning'] = 'fewer than 3 final seeds per arm — descriptive only'
+        elif _need is not None and _min_final < _need:
+            comparison['family']['warning'] = (
+                f'{_min_final} final seeds cannot reach Holm-corrected significance for m={_m} '
+                f'(needs n>={_need}); the contrast is resolution-limited, not a null')
     L.atomic_write_json(os.path.join(final_dir, 'tuned_comparison.json'), comparison)
     print('\n[tune] tuned-vs-tuned paired contrasts (Δ = method − baseline; negative PPL is better):')
     for name, st in comparison['contrasts'].items():
