@@ -362,7 +362,10 @@ class HybridAttentionRoPE(L.HybridAttention):
         _lt = last_tok.long()
         bc, bs = (cos[_lt], sin[_lt])
         k_blk_r = apply_rope(k_blk, bc[:, None, :], bs[:, None, :], rope_dim)
-        k_sw_r = apply_rope(k_sw, cos[:, None, :], sin[:, None, :], rope_dim)
+        # The window half is gathered (and rotated) per query chunk below,
+        # instead of materialising a full rotated [T, nh, hd] copy for every
+        # layer.  RoPE is position-wise, so rotating the gathered rows gives
+        # exactly the same values as rotating the table and then gathering.
         out = torch.empty_like(q)
         _wi_all, _wvalid_all = L._window_geometry(T, w, dev)
         pos_all = L._arange_cache(T, dev)
@@ -377,19 +380,11 @@ class HybridAttentionRoPE(L.HybridAttention):
         _arange_sel = (topk_l.shape[1] == last_tok.shape[0]
                        and topk_l is L._IDX_CACHE.get((L._dev_str(dev), 'arangeexp', int(T), int(topk_l.shape[1]))))
         _sel_all = None
-        # The K/V halves are stacked and gathered with one combined row
-        # index per chunk, exactly as exp_lib.gathered_attention does: the
-        # selected rows are the two separate gather outputs concatenated in the
-        # same order, so the values are bit-identical.
-        _nblk_rows = k_blk_r.shape[0]
-        _has_sw = k_sw_r is not None and v_sw is not None
-        if _has_sw:
-            k_all = torch.cat([k_blk_r, k_sw_r], 0)
-            v_all = torch.cat([v_blk, v_sw], 0)
-        else:
-            k_all, v_all = (k_blk_r, v_blk)
-        _win_off = _nblk_rows if _has_sw else 0
-        _win_off_tab = L._window_block_offset(T, w, _nblk_rows, dev) if _win_off else None
+        # The K/V halves are gathered separately per chunk and concatenated
+        # in the same order as the old whole-table cat-then-gather form, so
+        # every gathered value is bit-identical while the full [T, nh, hd]
+        # concatenated copies are no longer materialised per layer.
+        _has_sw = k_sw is not None and v_sw is not None
         # see exp_lib.gathered_attention: these per-row masks are hoisted under
         # L._FO_FULL_CAP_BYTES; the hoisted values are bitwise identical to the
         # per-chunk forms.  `topk_distinct=True` (the read-everything HCA arm's
@@ -441,9 +436,14 @@ class HybridAttentionRoPE(L.HybridAttention):
             # addressed through the +n_blk offsets, so every gathered value is
             # bit-identical (index re-plumbing only, §6.1).
             _iw = _wi_all[s:e]
-            _iw_rows = _win_off_tab[s:e] if _win_off_tab is not None else _iw
-            _rows = torch.cat([ib, _iw_rows], 1) if _has_sw else ib
-            Kset = L._take_2d(k_all, _rows)
+            _Kb = L._take_2d(k_blk_r, ib)
+            if _has_sw:
+                _Kw = L._take_2d(k_sw, _iw)
+                _Kw = apply_rope(_Kw, cos[_iw][:, None, :], sin[_iw][:, None, :], rope_dim)
+                Kset = torch.cat([_Kb, _Kw], 1)
+                del _Kb, _Kw
+            else:
+                Kset = _Kb
             qc = apply_rope(q[s:e], cos[s:e, None, :], sin[s:e, None, :], rope_dim)
             raw_logits = torch.einsum('qhd,qmhd->qhm', qc, Kset)
             del Kset
@@ -474,7 +474,10 @@ class HybridAttentionRoPE(L.HybridAttention):
                 attn = (soft_attn - soft_attn.detach()).add_(attn)
                 if sink is None:
                     attn.mul_(_anyrow[:, None, None])
-            out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, L._take_2d(v_all, _rows))
+            _V = (torch.cat([L._take_2d(v_blk, ib), L._take_2d(v_sw, _iw)], 1)
+                  if _has_sw else L._take_2d(v_blk, ib))
+            out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, _V)
+            del _V
         return out
     def _dense_warmup_forward(self, x):
         B, T, _ = x.shape
@@ -586,11 +589,17 @@ class HybridAttentionRoPE(L.HybridAttention):
             if self.cfg.chunking == 'cosine_learnable':
                 _raw, _gbool = self._gate_signals(x, pre_all)
                 if all((_r is not None for _r in _raw)):
-                    _gl = _gbool.cpu().numpy()
-                    gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gl)]
-                    # same batched block geometry as exp_lib.HybridAttention.forward;
-                    # every value identical to the per-row form
-                    pre_blocks = L._hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
+                    if _gbool is not None and L._device_segment_enabled(x.device):
+                        gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gbool.unbind(0))]
+                        pre_blocks = L._device_blocks_from_gate_bool(
+                            T, _gbool, self.cfg.min_block, self.cfg.max_block, x.device,
+                            want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
+                    else:
+                        _gl = _gbool.cpu().numpy()
+                        gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gl)]
+                        # same batched block geometry as exp_lib.HybridAttention.forward;
+                        # every value identical to the per-row form
+                        pre_blocks = L._hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
             elif self.cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (self.cfg.dynamic and self.cfg.kind != 'hca'):
                 # same batch-level geometry hoist as exp_lib.HybridAttention.forward:
                 # values identical.
@@ -930,9 +939,12 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             torch.cuda.empty_cache()
         return {'cap_truncated': True, 'steps_done': steps, 'train_time_s': wall}
     del x, y, logits, ce, loss
-    _eval_stats = L.eval_ppl(model, val_batch, device, return_stats=True)
+    _eval_stats = L.eval_ppl(model, val_batch, device, return_stats=True,
+                             collect_block_stats=True, val_bnd=val_bnd)
     ppl = float(_eval_stats['ppl'])
-    stats = L.compression_report(model, val_batch, device, val_bnd=val_bnd)
+    stats = _eval_stats.get('compression')
+    if stats is None:
+        stats = L.compression_report(model, val_batch, device, val_bnd=val_bnd)
     print(f'[{variant} seed={seed} warm={warm_steps}] val PPL = {ppl:.3f}  ({wall / 60:.1f} min)')
     if _lbuf:
         losses.extend(torch.stack(_lbuf).tolist())
