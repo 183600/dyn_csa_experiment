@@ -225,6 +225,26 @@ def _assert_order_finite(order, *, name='order'):
             if not np.all(np.isfinite(arr)):
                 raise ValueError(f'{name} contains NaN/Inf; a temporal split '
                                  'needs a well-defined order')
+        elif arr.dtype == object:
+            # Object arrays have no vectorised isfinite/nat test.  Inspect the
+            # scalar values so a Python float('nan') or np.datetime64('NaT')
+            # cannot sort to an arbitrary position and silently define the
+            # split.  Non-numeric/string keys are left to the caller's order.
+            for value in arr.tolist():
+                if isinstance(value, np.datetime64):
+                    if np.isnat(value):
+                        raise ValueError(
+                            f'{name} contains NaT; a temporal split needs a '
+                            'well-defined order')
+                    continue
+                try:
+                    f = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not math.isfinite(f):
+                    raise ValueError(
+                        f'{name} contains NaN/Inf; a temporal split needs a '
+                        'well-defined order')
     except TypeError:
         pass
 
@@ -503,14 +523,10 @@ def assert_no_split_leakage(train_idx, val_idx, test_idx, *, groups=None,
             raise ValueError(
                 f'time has length {time.size}, but split indices reach '
                 f'{max_index}; pass one timestamp per row')
-        try:
-            if not np.all(np.isfinite(time)):
-                raise ValueError('time contains NaN/Inf; a temporal split '
-                                 'cannot be verified against missing timestamps')
-        except TypeError:
-            # Non-numeric time (e.g. datetime64/objects) has no isfinite();
-            # ordering checks below still apply.
-            pass
+        # One validator for every dtype (numeric NaN/Inf, datetime64 NaT and
+        # object scalars).  The ordering checks below assume a well-defined
+        # order; skipping this for object arrays let a NaN timestamp pass.
+        _assert_order_finite(time, name='time')
     _assert_index_and_group_disjoint(split_idx, groups)
     if time is not None:
         for a, b in (('train', 'val'), ('val', 'test'), ('train', 'test')):
@@ -1078,11 +1094,15 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         miss_train = 1.0 - np.mean(np.isfinite(Xt), axis=0)
         miss_hold = 1.0 - np.mean(np.isfinite(Xh), axis=0)
         finite_smd = [abs(v) for v in smd if v is not None]
+        # A zero-column table is a valid (if uninformative) input.  np.max on
+        # the resulting empty vector would raise and abort the whole report.
+        _missing_delta = (float(np.max(np.abs(miss_hold - miss_train)))
+                          if miss_train.size else 0.0)
         shift[name] = {
             'max_abs_standardized_mean_difference': (
                 max(finite_smd) if finite_smd else 0.0),
             'per_feature_standardized_mean_difference': smd,
-            'max_abs_missing_rate_delta': float(np.max(np.abs(miss_hold - miss_train))),
+            'max_abs_missing_rate_delta': _missing_delta,
         }
         if shift[name]['max_abs_standardized_mean_difference'] > shift_threshold:
             _msg = (

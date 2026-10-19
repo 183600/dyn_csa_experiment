@@ -2642,6 +2642,173 @@ def t_public_exports_resolve():
         assert name in ns, f'{name} was not exported by a star-import'
 
 
+def t_sample_tokens_uniform_rejection():
+    # Force the scale-safe rejection path even on tiny arrays.  The sample must
+    # remain a uniform without-replacement draw; taking the smallest CAP of a
+    # sorted candidate pool (the previous implementation) has mean ~n/9 for
+    # cap=4, not ~n/2.
+    old = A._CHOICE_PERM_MAX_ELEMS
+    try:
+        A._CHOICE_PERM_MAX_ELEMS = 0
+        idx = np.arange(1000)
+        means = [A._sample_tokens(idx, cap=4, seed=s).mean() for s in range(200)]
+        assert 400.0 < float(np.mean(means)) < 600.0, (float(np.mean(means)), means[:5])
+        assert np.array_equal(A._sample_tokens(idx, cap=4, seed=17),
+                              A._sample_tokens(idx, cap=4, seed=17))
+        sample = A._sample_tokens(idx, cap=4, seed=17)
+        assert sample.size == 4 and len(set(sample.tolist())) == 4
+    finally:
+        A._CHOICE_PERM_MAX_ELEMS = old
+
+
+def t_audit_budget_integer_runs():
+    with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, 'run_time_state.json')
+        with open(state, 'w', encoding='utf-8') as f:
+            json.dump({'booked_seconds': 12.5, 'runs': 3}, f)
+        out = A.audit_budget(state_files=(state,), panels=())
+        assert out['measured'][state]['run_count'] == 3, out
+        with open(state, 'w', encoding='utf-8') as f:
+            json.dump({'booked_seconds': 1.0, 'runs': [1, 2]}, f)
+        out = A.audit_budget(state_files=(state,), panels=())
+        assert out['measured'][state]['run_count'] == 2, out
+
+
+def t_audit_failures_ignores_unmeasured_ppl():
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({
+                'a::seed0': {'variant': 'a', 'seed': 0, 'error': 'boom'},
+                'b::seed0': {'variant': 'b', 'seed': 0, 'ppl': float('nan')},
+                'c::seed0': {'variant': 'c', 'seed': 0, 'ppl': 12.0},
+            }, f)
+        out = A.audit_failures(outdirs=[d])
+        panel = out['panels'][d]
+        assert panel['ok_by_arm'] == {'c': 1}, panel
+        assert panel['errors_by_arm'] == {'a': 1}, panel
+
+
+def t_object_time_and_zero_feature_guards():
+    bad_time = np.array([0.0, float('nan'), 2.0], dtype=object)
+    for call in (lambda: L.assert_no_split_leakage([0], [1], [2], time=bad_time),
+                 lambda: L.split_indices(3, time=bad_time, train_frac=1 / 3,
+                                         val_frac=1 / 3, test_frac=1 / 3)):
+        try:
+            call()
+        except ValueError as e:
+            assert 'NaN/Inf' in str(e), e
+        else:
+            raise AssertionError('an object-dtype NaN timestamp must be rejected')
+    # A zero-feature table is uninformative but must not crash the report.
+    rep = L.data_quality_report(np.empty((4, 0)), train_idx=[0, 1],
+                                val_idx=[2], test_idx=[3])
+    assert rep['n_features'] == 0, rep
+
+
+def t_audit_split_warning_status():
+    with tempfile.TemporaryDirectory() as d:
+        tag = 'tiny'
+        tr = np.arange(40, dtype=np.int64)
+        va = np.arange(100, 108, dtype=np.int64).reshape(2, 4)
+        np.save(os.path.join(d, f'train_ids_{tag}.npy'), tr)
+        np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
+        # Missing split_strategy is an explicit legacy-cache warning.
+        with open(os.path.join(d, f'meta_{tag}.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 40, 'seq_len': 4}, f)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] == 'warnings', rec
+        assert out['caches'][os.path.abspath(d)]['status'] == 'warnings', out['caches']
+
+
+def t_corpus_audit_overlap_is_unique_across_windows():
+    # The same validation row repeated in two disjoint training windows is ONE
+    # overlapping validation row, not two.
+    tr = np.arange(200, dtype=np.int64) % 10
+    tr[0:3] = [7, 8, 9]
+    tr[13:16] = [7, 8, 9]
+    va = np.array([[7, 8, 9]], dtype=np.int64)
+    rep = L.audit_corpus_split(tr, va, 20, dataset='wikitext',
+                               max_scan_tokens=64, sample_rows=1, strict=False)
+    assert rep['exact_row_overlap_in_sample'] == 1, rep
+    assert rep['sampled_val_rows'] == 1, rep
+
+
+def t_audit_length_requires_eval_span():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'bylen.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'a::seed0': {'by_len': {'512': {
+                'n_tok': 511, 'eval_span': None, 'n_seq': 1}}}}, f)
+        out = A.audit_length(path)
+        assert out['status'] == 'fail', out
+        assert out['by_length']['512']['same_scored_targets_across_records'] is False, out
+
+
+def t_audit_fairness_nan_seed_does_not_crash():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'summary.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'a::seed0': {'variant': 'a', 'seed': float('nan'),
+                                    'ppl': 10.0, 'run_cfg': 'x'}}, f)
+        out = A.audit_fairness(path, arms=['a'])
+        assert out['arms']['a']['seeds'] == [], out
+
+
+def t_audit_split_empty_cache_is_not_ok():
+    with tempfile.TemporaryDirectory() as d:
+        out = A.audit_split_discipline(cache_dirs=[d])
+        assert out['status'] == 'not_verifiable_locally', out
+        assert out['caches'][os.path.abspath(d)]['status'] == 'not_verifiable_locally', out
+
+
+def t_baseline_audit_malformed_seed_keys():
+    art = {
+        'arms': {'a': {'selected': {'lr': 1e-3}, 'selected_metric_value': 1.0,
+                       'trials': [{'config': {'lr': 1e-3}, 'ppl': 1.0,
+                                   'seed_ppls': {'not-a-seed': 1.0},
+                                   'ppl_std': 'not-numeric'}]}},
+        'protocol': {'selection_metric': 'ppl', 'selection_split': 'validation',
+                     'direction': 'lower_is_better', 'trials': [{'lr': 1e-3}],
+                     'arms': ['a'], 'search_seeds': [0], 'final_seeds': [0]},
+        'selection_metric': 'ppl', 'selection_split': 'validation',
+        'direction': 'lower_is_better',
+        'final_records': {'a::seed0': {'seed': 0, 'variant': 'a',
+                                       'hyperparams': {'lr': 'not-numeric'}}},
+    }
+    out = L.baseline_tuning_audit(art)
+    assert out['status'] == 'fail', out
+    assert any('seed_ppls keys' in p for p in out['problems']), out
+
+    # A numeric seed set with a non-numeric ppl_std / selected hyperparameter
+    # must be reported, not raise ValueError inside the audit.
+    art['arms']['a']['trials'] = [{'config': {'lr': 1e-3}, 'ppl': 1.5,
+                                   'seeds': [0, 1],
+                                   'seed_ppls': {'0': 1.0, '1': 2.0},
+                                   'ppl_std': 'not-numeric'}]
+    out = L.baseline_tuning_audit(art)
+    assert any('ppl_std is not numeric' in p for p in out['problems']), out
+    assert any('is not numeric' in p for p in out['problems']), out
+
+
+def t_simple_baseline_audit_malformed_records():
+    art = {
+        'baselines': {'a': {
+            'selected': {'alpha': 0.1}, 'selected_metric_value': 1.0,
+            'trials': [{'config': {'alpha': 0.1}, 'ppl': 1.0,
+                        'n_tokens': 'not-an-int'},
+                       {'config': {'alpha': 0.2}, 'ppl': 2.0,
+                        'n_tokens': 10}]}},
+        'selection_metric': 'ppl', 'selection_split': 'validation',
+        'direction': 'lower_is_better', 'data': ['not', 'a', 'dict'],
+        'protocol': {'selection_metric': 'ppl', 'selection_split': 'validation',
+                     'direction': 'lower_is_better', 'arms': ['not-a-dict']},
+    }
+    out = L.simple_baseline_audit(art)
+    assert out['status'] == 'fail', out
+    assert any('n_tokens is not an integer' in p for p in out['problems']), out
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -2767,6 +2934,17 @@ def main():
     _check('I6 explicit split sizes stay non-negative', t_split_sizes_explicit_never_negative)
     _check('I7 split audit finds sequence-level row overlap', t_audit_split_sequence_overlap)
     _check('I8 public exports resolve (star-import safe)', t_public_exports_resolve)
+    _check('I9 rejection-sampled token audit stays uniform', t_sample_tokens_uniform_rejection)
+    _check('I10 budget audit accepts TimeGuard integer run counters', t_audit_budget_integer_runs)
+    _check('I11 failure audit does not count NaN PPL as a success', t_audit_failures_ignores_unmeasured_ppl)
+    _check('I12 object-time NaN + zero-feature data guards', t_object_time_and_zero_feature_guards)
+    _check('I13 split audit marks per-cache warnings', t_audit_split_warning_status)
+    _check('I14 corpus audit counts overlapping validation rows once', t_corpus_audit_overlap_is_unique_across_windows)
+    _check('I15 length audit refuses a missing eval span', t_audit_length_requires_eval_span)
+    _check('I16 fairness audit ignores a NaN seed instead of crashing', t_audit_fairness_nan_seed_does_not_crash)
+    _check('I17 an empty split cache is not reported as verified', t_audit_split_empty_cache_is_not_ok)
+    _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)
+    _check('I19 simple-baseline audit reports malformed records instead of crashing', t_simple_baseline_audit_malformed_records)
     fails = [r for r in _results if r[1] != 'PASS']
     print(f'\n[test] {len(_results) - len(fails)}/{len(_results)} passed')
     return 1 if fails else 0

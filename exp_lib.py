@@ -6112,9 +6112,23 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
             _starts = np.linspace(0, tr.size - _seg_len, _nseg, dtype=np.int64)
             _segments = [tr[int(s):int(s) + _seg_len] for s in _starts]
             _scanned = int(sum(s.size for s in _segments))
-        _shared = 0
-        for _seg in _segments:
-            _shared += int(_AG._row_overlap_count(_seg, _sample))
+        # Count the UNION of matched validation rows over the windows.  A
+        # repeated training row can occur in several disjoint windows, so
+        # summing per-window unique counts would report more overlapping
+        # validation rows than were sampled.  Join the windows with a token id
+        # that cannot occur in either side: any window spanning the separator
+        # then fails to equal a validation row, while each real occurrence is
+        # still seen.
+        if len(_segments) == 1:
+            _scan = _segments[0]
+        else:
+            _sentinel = max(int(np.max(tr)) if tr.size else -1,
+                            int(np.max(_sample)) if _sample.size else -1) + 1
+            _scan = np.concatenate([
+                np.concatenate([np.asarray(_seg).reshape(-1),
+                                np.asarray([_sentinel], dtype=np.int64)])
+                for _seg in _segments])
+        _shared = int(_AG._row_overlap_count(_scan, _sample))
         overlap = _shared
         report['exact_row_overlap_in_sample'] = int(_shared)
         report['sampled_val_rows'] = int(_rows.size)
@@ -8794,7 +8808,8 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         problems.append(f'selection metric {metric!r} differs from the declared {protocol.get("selection_metric")!r}')
     if direction != 'lower_is_better':
         problems.append(f'count-model selection direction is {direction!r}; PPL is lower-is-better')
-    declared_arms = set((protocol.get('arms') or {}).keys())
+    _declared = protocol.get('arms') or {}
+    declared_arms = set(_declared.keys()) if isinstance(_declared, dict) else set()
     baselines = artifact['baselines']
     missing = sorted(declared_arms - set(baselines))
     if missing:
@@ -8833,17 +8848,30 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             problems.append(f'{arm}: no finite selected {metric} value')
             continue
         selected_values[arm] = float(chosen_value)
-        if abs(float(chosen_value) - float(chosen_trial[metric])) > 1e-12:
+        _chosen_metric = chosen_trial.get(metric)
+        if not isinstance(_chosen_metric, (int, float)) or isinstance(_chosen_metric, bool) or not math.isfinite(float(_chosen_metric)):
+            problems.append(f'{arm}: selected trial has no finite {metric}')
+        elif abs(float(chosen_value) - float(_chosen_metric)) > 1e-12:
             problems.append(f'{arm}: selected_metric_value does not match the selected trial')
         if float(chosen_value) > min(vals) + 1e-12:
             problems.append(f'{arm}: selected trial is not the minimum-{metric} trial')
-        nt = {int(t.get('n_tokens')) for t in trials if isinstance(t, dict) and t.get('n_tokens') is not None}
+        nt = set()
+        for t in trials:
+            if not isinstance(t, dict) or t.get('n_tokens') is None:
+                continue
+            try:
+                nt.add(int(t.get('n_tokens')))
+            except (TypeError, ValueError):
+                problems.append(f'{arm}: trial n_tokens is not an integer ({t.get("n_tokens")!r})')
+                break
         if len(nt) > 1:
             problems.append(f'{arm}: trials evaluated different token counts {sorted(nt)} — PPLs are not comparable')
         n_tokens_by_arm[arm] = sorted(nt)
     if len({tuple(v) for v in n_tokens_by_arm.values()}) > 1:
         problems.append('simple baselines evaluated different token counts; report a common token-weighted floor')
-    data = artifact.get('data') or {}
+    data = artifact.get('data')
+    if not isinstance(data, dict):
+        data = {}
     if not data.get('val_fp'):
         warnings.append('artifact has no validation fingerprint — the panel comparison cannot verify it used the same validation slice')
     best_name = None
@@ -9327,7 +9355,11 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                     problems.append(f'{arm}: trial seeds and seed_ppls keys disagree')
                 _set.add(_ss)
             elif _ppls is not None:
-                _set.add(tuple(sorted(int(k) for k in _ppls)))
+                try:
+                    _set.add(tuple(sorted(int(k) for k in _ppls)))
+                except (TypeError, ValueError):
+                    problems.append(f'{arm}: seed_ppls keys are not integer seeds ({list(_ppls)[:3]!r})')
+                    continue
             if isinstance(_ppls, dict) and isinstance(t.get('ppl'), (int, float)) and not isinstance(t.get('ppl'), bool):
                 _vals = [float(v) for v in _ppls.values()
                          if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))]
@@ -9336,9 +9368,14 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                     if abs(_m - float(t['ppl'])) > 1e-9 * max(1.0, abs(_m)):
                         problems.append(f'{arm}: trial ppl is not the mean of its per-seed values')
                     if t.get('ppl_std') is not None and len(_vals) > 1:
-                        _s = float(np.std(_vals, ddof=1))
-                        if abs(_s - float(t['ppl_std'])) > 1e-9 * max(1.0, abs(_s)):
-                            problems.append(f'{arm}: trial ppl_std is not the sample std of its per-seed values')
+                        try:
+                            _reported_sd = float(t['ppl_std'])
+                        except (TypeError, ValueError):
+                            problems.append(f'{arm}: trial ppl_std is not numeric ({t.get("ppl_std")!r})')
+                        else:
+                            _s = float(np.std(_vals, ddof=1))
+                            if abs(_s - _reported_sd) > 1e-9 * max(1.0, abs(_s)):
+                                problems.append(f'{arm}: trial ppl_std is not the sample std of its per-seed values')
         if _set:
             search_seed_sets[arm] = _set
         if declared and any(c not in declared for c in cfgs):
@@ -9447,21 +9484,34 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             if not hits:
                 problems.append(f'{arm}: tuning artifact claims final records but none are bound to this arm')
                 continue
-            _seeds = [int(r['seed']) for _k, r in hits if r.get('seed') is not None]
+            _seeds = [s for _k, r in hits
+                      if (s := _as_seed_int(r.get('seed'))) is not None]
+            if len(_seeds) != len(hits):
+                problems.append(f'{arm}: a final record has no usable integer seed')
             if len(_seeds) != len(set(_seeds)):
                 problems.append(f'{arm}: duplicate final records for the same seed')
             final_seed_coverage[arm] = sorted(set(_seeds))
             if final_seeds:
-                _need = {int(s) for s in final_seeds}
+                _need = {s for s in (_as_seed_int(x) for x in final_seeds)
+                         if s is not None}
                 _miss = sorted(_need - set(_seeds))
                 if _miss:
                     problems.append(f'{arm}: final records miss declared seeds {_miss}')
             for _k, r in hits:
                 hp = r.get('hyperparams') or {}
                 for _kn in ('lr', 'weight_decay', 'warmup'):
-                    if _kn in chosen and hp.get(_kn) is not None and float(hp[_kn]) != float(chosen[_kn]):
-                        problems.append(f'{arm}: final record {_kn}={hp[_kn]} does not match the selected {chosen[_kn]}')
-                        break
+                    if _kn in chosen and hp.get(_kn) is not None:
+                        try:
+                            _hpv = float(hp[_kn])
+                            _selv = float(chosen[_kn])
+                        except (TypeError, ValueError):
+                            problems.append(
+                                f'{arm}: final record {_kn}={hp[_kn]!r} or the '
+                                f'selected value {chosen[_kn]!r} is not numeric')
+                            break
+                        if _hpv != _selv:
+                            problems.append(f'{arm}: final record {_kn}={hp[_kn]} does not match the selected {chosen[_kn]}')
+                            break
                 if r.get('variant') is not None and r.get('variant') != arm:
                     problems.append(f'{arm}: final record key {_k} carries variant={r.get("variant")!r}')
     final_seed_coverage_equal = None

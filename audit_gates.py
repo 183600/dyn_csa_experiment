@@ -315,8 +315,14 @@ def _sample_tokens(arr, cap=1000000, seed=0):
         idx = np.empty(0, dtype=np.int64)
         while idx.size < need:
             cand = rng.integers(0, n, size=2 * (need - idx.size), dtype=np.int64)
-            idx = np.concatenate([idx, cand])
-            idx = np.unique(idx)
+            # Keep the values in first-draw order.  Sorting the union and then
+            # truncating would take the CAP SMALLEST of the candidates, which is
+            # a biased (low-index) sample, not a uniform without-replacement
+            # draw.  Taking the first `need` distinct values in draw order is
+            # exactly the usual rejection sampler for a uniform K-subset.
+            merged = np.concatenate([idx, cand])
+            _, first = np.unique(merged, return_index=True)
+            idx = merged[np.sort(first)]
         idx = idx[:need]
     idx.sort()
     return a[idx]
@@ -453,6 +459,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
         for mp in sorted(glob.glob(os.path.join(cd, 'meta_*.json'))):
             if os.path.basename(mp).startswith('test_meta_'):
                 continue
+            _nwarn_before = len(out['warnings'])
             meta = _load(mp)
             if not isinstance(meta, dict):
                 continue
@@ -646,17 +653,32 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         _warn(f'{cd}/{tag}: train/test token JS divergence {jst:.3f} >= {js_warn}')
                 else:
                     _warn(f'{cd}/{tag}: train/test distribution shift not estimable from {te_tok.size} test tokens (need >= {min_shift_tokens})')
+            # A warning is a property of this corpus, not only of the global
+            # audit: mark the per-cache record so a caller inspecting one cache
+            # does not read it as clean while the top-level status says warnings.
+            if rec['status'] == 'ok' and len(out['warnings']) > _nwarn_before:
+                rec['status'] = 'warnings'
             cache['corpora'][tag] = rec
             if rec['status'] == 'fail':
                 cache['status'] = 'fail'
                 out['status'] = 'fail'
-            elif out['status'] == 'ok' and rec['status'] == 'warnings':
-                cache['status'] = 'warnings'
-                out['status'] = 'warnings'
+            elif rec['status'] == 'warnings':
+                # _warn already raised out['status'] to 'warnings', so gating
+                # this branch on out['status'] == 'ok' would leave the cache
+                # record labelled clean.
+                if cache['status'] == 'ok':
+                    cache['status'] = 'warnings'
+                if out['status'] == 'ok':
+                    out['status'] = 'warnings'
         if not cache['corpora']:
             cache['status'] = 'not_verifiable_locally'
-    if not out['caches']:
-        out['status'] = 'not_verifiable_locally'
+    # An existing but empty cache directory proves nothing: -- like "no cache
+    # at all" -- the split contract was not verified.  Do not leave the
+    # top-level verdict as 'ok' in that case.
+    if (not out['caches']
+            or not any(c.get('corpora') for c in out['caches'].values())):
+        if out['status'] == 'ok':
+            out['status'] = 'not_verifiable_locally'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -857,7 +879,8 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 problems.append(f'{key}: L{Ln} cell is marked truncated — it must not enter cross-length means')
     out = {'status': 'ok', 'by_length': {}}
     for Ln, e in sorted(by_len.items()):
-        ok = len(e['n_tok']) == 1 and None not in e['n_tok'] and len(e['eval_span']) == 1
+        ok = (len(e['n_tok']) == 1 and None not in e['n_tok']
+              and len(e['eval_span']) == 1 and None not in e['eval_span'])
         nseq_ok = len(e['n_seq']) <= 1
         out['by_length'][str(Ln)] = {'n_tok_values': sorted((str(x) for x in e['n_tok'])), 'eval_span_values': sorted((str(x) for x in e['eval_span'])), 'n_seq_values': sorted((str(x) for x in e['n_seq'])), 'same_scored_targets_across_records': bool(ok), 'same_n_seq_across_records': bool(nseq_ok)}
         if not ok:
@@ -903,9 +926,10 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
         knob_vals = {json.dumps(r.get('train_knobs'), sort_keys=True)
                      for r in recs if r.get('train_knobs') is not None}
         n_missing_knobs = sum(1 for r in recs if r.get('train_knobs') is None)
-        seeds = sorted({int(r['seed']) for r in recs
-                        if isinstance(r.get('seed'), (int, float))
-                        and not isinstance(r.get('seed'), bool)})
+        # NaN / non-integral floats have no seed identity; int(nan) would
+        # abort the whole audit instead of excluding the malformed record.
+        seeds = sorted({_s for r in recs
+                        if (_s := L._as_seed_int(r.get('seed'))) is not None})
         out['arms'][a] = {
             'n_records': len(recs), 'seeds': seeds, 'n_seeds': len(seeds),
             'n_distinct_run_cfg': len(cfgs),
@@ -993,6 +1017,7 @@ def audit_failures(outdirs=None):
     评审问题：崩溃/NaN/超时是否集中在某些臂；仅保留成功运行是否构成
     选择偏差。本审计把 error 记录按 (臂, 错误类型) 计数，并给出描述性
     集中度（不主张显著性——小样本下显著性检验本身功效不足）。"""
+    L = _import_exp_lib()
     out = {'status': 'ok', 'panels': {}}
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
@@ -1007,7 +1032,7 @@ def audit_failures(outdirs=None):
             v = r['variant']
             if 'error' in r or r.get('status') in ('error', 'failed'):
                 by_arm.setdefault(v, []).append(str(r.get('error') or r.get('status'))[:80])
-            elif isinstance(r.get('ppl'), (int, float)):
+            elif L.ppl_is_usable(r.get('ppl')) and not r.get('synthesized'):
                 n_ok[v] = n_ok.get(v, 0) + 1
         if by_arm:
             out['panels'][d] = {'errors_by_arm': {v: len(e) for v, e in by_arm.items()}, 'ok_by_arm': n_ok, 'error_samples': {v: e[:2] for v, e in by_arm.items()}}
@@ -1190,7 +1215,17 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
     for sf in state_files:
         st = _load(sf)
         if st is not None:
-            out.setdefault('measured', {})[sf] = {'booked_seconds': st.get('booked_seconds'), 'run_count': len(st.get('runs') or []) or st.get('run_count')}
+            # TimeGuard stores `runs` as an integer counter; older/foreign
+            # state files may store a list.  len(integer) would crash the whole
+            # audit on any machine that has actually run a cell.
+            _runs = st.get('runs')
+            if isinstance(_runs, (list, tuple, dict, set)):
+                _run_count = len(_runs)
+            elif isinstance(_runs, (int, float)) and not isinstance(_runs, bool):
+                _run_count = int(_runs)
+            else:
+                _run_count = st.get('run_count')
+            out.setdefault('measured', {})[sf] = {'booked_seconds': st.get('booked_seconds'), 'run_count': _run_count}
     if all(not isinstance(x, dict) for x in out['panels'].values()):
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'scale panels not present locally; estimates + TimeGuard bookkeeping run on the experiment machine'
