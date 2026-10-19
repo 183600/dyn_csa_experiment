@@ -1637,6 +1637,19 @@ def _range_cache(lo, hi, device):
         _cache_put(_IDX_CACHE, key, a, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return a
 
+
+def _i32_range_cache(n, device):
+    # int32 [n] arange (index transport, §6.1: the same exact integers as the
+    # int64 form, narrowed).  Read-only constant of (n, device); shared by the
+    # hot selection paths so no per-chunk arange kernel/alloc is issued.
+    key = (_dev_str(device), 'arange_i32', int(n))
+    a = _cache_get(_IDX_CACHE, key)
+    if a is None:
+        with torch.inference_mode(False):
+            a = torch.arange(n, device=device, dtype=torch.int32)
+        _cache_put(_IDX_CACHE, key, a, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
+    return a
+
 def _arange_exp_cache(n, m, device):
     # Cached int32 (n, m) arange expansion for the HCA read-everything arm:
     # the same exact integers as _arange_cache(m, device).unsqueeze(0).
@@ -2735,7 +2748,10 @@ def _rank_blocks(masked, B, ties, k=None):
     rank.masked_fill_(~sel, kk)
     # Scatter the selected source columns into [n, kk] (column order); the
     # sentinel column kk absorbs the non-selected lanes and is sliced away.
-    cols = torch.arange(B, device=src.device, dtype=torch.int32)[None, :].expand(n, B)
+    # The base arange is a read-only constant of (B, device) — the same exact
+    # integers a fresh torch.arange returns every call — so it rides the
+    # shared index-table cache instead of being rebuilt per chunk.
+    cols = _i32_range_cache(B, src.device)[None, :].expand(n, B)
     buf = torch.empty(n, kk + 1, dtype=torch.int32, device=src.device)
     buf.scatter_(1, rank, cols)
     del rank, sel, cols
@@ -3249,6 +3265,19 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     else:
         _plan = None
     _win_off_tab = _window_block_offset(n, w, _nblk_rows, dev) if _win_off else None
+    # Full-width row-table hoist: when the hoisted [n, nb + w] masks are live
+    # (`_has_all`) and the int64 rows table fits the same byte ceiling the
+    # mask hoist uses, the concatenated [selected | window] row table is
+    # built once and each chunk reads its own rows as a slice — a slice of
+    # the concatenation holds exactly the rows the per-chunk concatenation
+    # builds (same operands, same cat semantics, same integers; index
+    # transport, design notes §6.1).  Above the cap the per-chunk cat form
+    # below is value-identical.
+    _rows_full = None
+    if _has_all and _has_sw:
+        _r_elems = int(n) * (int(_nb) + int(w))
+        if _r_elems * 8 <= _FO_FULL_CAP_BYTES:
+            _rows_full = torch.cat([topk_l, (_win_off_tab if _win_off_tab is not None else win_idx)], 1)
     for s in range(0, n, q_chunk):
         e = s + q_chunk
         if e > n:
@@ -3286,7 +3315,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # `_has_sw` is the contract for stacking window lanes: the row offset
         # may be 0 when k_blk holds no rows, and that is still a valid
         # stacked-row base.
-        _rows = torch.cat([_sel_rows, _win_rows], 1) if _has_sw else _sel_rows
+        _rows = (_rows_full[s:e] if _rows_full is not None else
+                 (torch.cat([_sel_rows, _win_rows], 1) if _has_sw else _sel_rows))
         # soft_form=True 在 soft=None 时仍选用软分支的硬部分解（两个半段
         # logits + cat），供调用方在跳过（无梯度下已死的）soft 尾部后保持
         # 硬分支逐位一致；它不改变任何取值，只固定走哪套既有分解。

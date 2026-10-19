@@ -286,14 +286,38 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
 # 1b) split discipline：划分顺序 / 群组完整性 / 重复行 / 分布偏移
 # ---------------------------------------------------------------------------
 
+# Above this many elements the length-n permutation behind
+# rng.choice(..., replace=False) is no longer worth its memory in an audit
+# box (>= 2**28 * 8 B); _sample_tokens then draws the same uniform
+# without-replacement sample by rejection in O(cap) memory instead.
+_CHOICE_PERM_MAX_ELEMS = 1 << 28
+
+
 def _sample_tokens(arr, cap=1000000, seed=0):
     """Deterministic sample of a token array (for distribution comparisons)."""
     import numpy as np
     a = np.asarray(arr).reshape(-1)
     if a.size <= cap:
         return a
+    n = int(a.size)
     rng = np.random.default_rng(seed)
-    idx = rng.choice(a.size, size=int(cap), replace=False)
+    # rng.choice(..., replace=False) materialises a length-n permutation
+    # (O(n) work and memory).  That is fine for today's corpus sizes, but a
+    # scale-up corpus makes it an allocation hazard, so above the threshold
+    # where the permutation no longer fits a sane audit box the same kind of
+    # uniform without-replacement sample is drawn by rejection instead:
+    # every K-subset remains equally likely and the draw stays
+    # seed-deterministic, with O(cap) memory.
+    if n <= _CHOICE_PERM_MAX_ELEMS:
+        idx = rng.choice(n, size=int(cap), replace=False)
+    else:
+        need = int(cap)
+        idx = np.empty(0, dtype=np.int64)
+        while idx.size < need:
+            cand = rng.integers(0, n, size=2 * (need - idx.size), dtype=np.int64)
+            idx = np.concatenate([idx, cand])
+            idx = np.unique(idx)
+        idx = idx[:need]
     idx.sort()
     return a[idx]
 

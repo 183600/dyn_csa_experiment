@@ -229,11 +229,67 @@ def _assert_order_finite(order, *, name='order'):
         pass
 
 
+def _group_index_fast(groups, order=None):
+    """Vectorised (order_groups, first, members) for non-object group arrays.
+
+    Returns ``None`` for object dtypes, where the per-row dict form is the
+    only safe implementation (values may be unorderable or their elementwise
+    comparisons may raise).  Every returned value matches the per-row dict
+    loops exactly:
+
+    * ``first[g]`` is the row index of ``g``'s first appearance —
+      ``np.unique(..., return_index=True)`` reports each unique value's
+      first occurrence, and (numpy >= 2) collapses all NaNs into one value
+      whose first occurrence is the earliest NaN row, exactly like
+      ``_group_key`` collapsing NaN to the ``('__nan__',)`` singleton;
+    * ``members[g]`` lists the group's row indices in increasing order
+      (a stable argsort of the inverse ids keeps equal ids in ascending
+      original positions);
+    * ``order_groups`` is first-appearance order, or the
+      ``(min order value, first appearance)`` order when ``order`` is given
+      (``np.lexsort`` with the first indices as the secondary key).
+
+    The dict keys are the same Python scalars ``groups.tolist()`` yields in
+    the loop form (including the NaN sentinel tuple), so the two forms are
+    interchangeable for any consumer.
+    """
+    if groups.dtype == object:
+        return None
+    if order is not None:
+        order = np.asarray(order)
+        if order.dtype == object:
+            return None
+        if order.ndim != 1 or order.shape[0] != groups.shape[0]:
+            raise ValueError('order must be a 1-D array with one value per row')
+        _assert_order_finite(order)
+    uniq, first_idx, inv = np.unique(groups, return_index=True, return_inverse=True)
+    inv = np.asarray(inv).reshape(-1)
+    first_idx = np.asarray(first_idx).reshape(-1)
+    keys = [_group_key(v) for v in uniq.tolist()]
+    n_uniq = uniq.shape[0]
+    first = {keys[j]: int(first_idx[j]) for j in range(n_uniq)}
+    perm = np.argsort(inv, kind='stable')
+    inv_sorted = inv[perm]
+    bounds = np.searchsorted(inv_sorted, np.arange(n_uniq, dtype=inv.dtype), side='left')
+    ends = np.searchsorted(inv_sorted, np.arange(n_uniq, dtype=inv.dtype), side='right')
+    members = {keys[j]: perm[bounds[j]:ends[j]] for j in range(n_uniq)}
+    if order is None:
+        ranked = np.argsort(first_idx, kind='stable')
+    else:
+        mins = np.minimum.reduceat(np.asarray(order)[perm], bounds.reshape(-1))
+        ranked = np.lexsort((first_idx, mins))
+    order_groups = [keys[j] for j in ranked.tolist()]
+    return order_groups, first, members
+
+
 def _group_order(groups, order=None):
     """Order group ids by first appearance or by their minimum timestamp."""
     groups = np.asarray(groups)
     if groups.ndim != 1:
         groups = groups.reshape(-1)
+    fast = _group_index_fast(groups, order)
+    if fast is not None:
+        return fast[0], fast[1]
     first = {}
     for i, g in enumerate(groups.tolist()):
         g = _group_key(g)
@@ -271,17 +327,21 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
         raise ValueError('groups must have one entry per row')
     targets = _resolve_sizes(n, train_frac, val_frac, test_frac,
                              train_size, val_size, test_size)
-    order_groups, first = _group_order(groups, order)
-    members = {}
-    for i, g in enumerate(groups.tolist()):
-        members.setdefault(_group_key(g), []).append(i)
+    fast = _group_index_fast(groups, order)
+    if fast is not None:
+        order_groups, first, members = fast
+    else:
+        order_groups, first = _group_order(groups, order)
+        members = {}
+        for i, g in enumerate(groups.tolist()):
+            members.setdefault(_group_key(g), []).append(i)
     out = {name: [] for name in SPLIT_NAMES}
     current = 0
     for g in order_groups:
         while (current < 2 and
                len(out[SPLIT_NAMES[current]]) >= targets[current]):
             current += 1
-        out[SPLIT_NAMES[current]].extend(members[g])
+        out[SPLIT_NAMES[current]].extend(int(i) for i in members[g])
     res = {name: np.asarray(sorted(v), dtype=np.int64) for name, v in out.items()}
     # Groups must be pairwise disjoint even if the caller supplied a target
     # that forced a large group to one side.
@@ -335,15 +395,29 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
         # and snap each cumulative target to the first legal cut at or after
         # it.  This may move a few rows between adjacent splits, but never
         # splits an equal-timestamp block.
-        cuts = [0]
-        for i in range(1, n):
-            try:
-                changed = bool(sorted_time[i] != sorted_time[i - 1])
-            except (TypeError, ValueError):
-                changed = True
-            if changed:
-                cuts.append(i)
-        cuts.append(n)
+        if sorted_time.dtype == object:
+            # Elementwise comparison on object arrays can raise per element;
+            # the per-row form treats such a row as a cut.
+            cuts = [0]
+            for i in range(1, n):
+                try:
+                    changed = bool(sorted_time[i] != sorted_time[i - 1])
+                except (TypeError, ValueError):
+                    changed = True
+                if changed:
+                    cuts.append(i)
+            cuts.append(n)
+        else:
+            # Same booleans as the per-row loop, vectorised: element i of
+            # `changed` is exactly `sorted_time[i] != sorted_time[i-1]` for
+            # i in 1..n-1, and every True element contributes the same cut
+            # position i (stored at i-1, hence the +1 shift).
+            changed = np.asarray(sorted_time[1:] != sorted_time[:-1]).reshape(-1)
+            cuts = np.concatenate((
+                np.zeros(1, dtype=np.int64),
+                np.nonzero(changed)[0].astype(np.int64) + 1,
+                np.full(1, n, dtype=np.int64),
+            ))
         blocks = []
         start = 0
         cumulative = 0
