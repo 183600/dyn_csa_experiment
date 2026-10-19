@@ -1239,6 +1239,77 @@ def t_batch_iter_uint16():
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]), 'the uint16 transport form must yield the exact int64 batch (CPU index kernels lack uint16)'
 
 
+def t_batch_contract_check():
+    ids = np.arange(5000, dtype=np.int64) % 997
+    ok = L.batch_contract_check(ids, 32, 4, torch.device('cpu'), seed=7, vocab=997)
+    assert ok['passed'] is True, ok
+    assert all(ok['checks'].values()), ok['checks']
+    _orig = L.batch_iter
+
+    def _bad(train_ids, seq_len, batch_size, device, seed=0):
+        for x, _y in _orig(train_ids, seq_len, batch_size, device, seed=seed):
+            yield x, x[:, :-1]
+    L.batch_iter = _bad
+    try:
+        bad = L.batch_contract_check(ids, 32, 4, torch.device('cpu'), seed=7, vocab=997)
+    finally:
+        L.batch_iter = _orig
+    assert bad['passed'] is False, 'a loader that does not shift labels must FAIL the contract check'
+    assert bad['checks']['labels_are_next_token_shift'] is False, bad
+
+
+
+
+def t_parallel_child_env_seed():
+    import par
+    env = par._child_env('0', 17)
+    assert env['PYTHONHASHSEED'] == '17' and env['CUDA_VISIBLE_DEVICES'] == '0', {k: env.get(k) for k in ('PYTHONHASHSEED', 'CUDA_VISIBLE_DEVICES')}
+    env2 = par._child_env('0')
+    assert env2.get('PYTHONHASHSEED') == os.environ.get('PYTHONHASHSEED'), 'no-seed dispatch must not invent a hash seed'
+
+
+def t_panel_blocks_on_loader_contract_failure():
+    d = tempfile.mkdtemp()
+    _saved_load = L.load_run_corpus
+    _saved_iter = L.batch_iter
+    _old_skip_overfit = os.environ.get('CSA_SKIP_OVERFIT')
+    _old_skip_repro = os.environ.get('CSA_SKIP_REPRO')
+    try:
+        ids = np.arange(4096, dtype=np.int64) % 997
+        val = (np.arange(128, dtype=np.int64) % 997).reshape(4, 32)
+        L.load_run_corpus = lambda cfg: (ids, val, 997, None, None)
+
+        def _bad(train_ids, seq_len, batch_size, device, seed=0):
+            for x, _y in _saved_iter(train_ids, seq_len, batch_size, device, seed=seed):
+                yield x, x
+        L.batch_iter = _bad
+        os.environ['CSA_SKIP_OVERFIT'] = '1'
+        os.environ['CSA_SKIP_REPRO'] = '1'
+        cfg = {'outdir': d, 'seq_len': 32, 'batch_size': 2, 'n_train_tokens': 4096,
+               'steps': 3, 'lr': 1e-3, 'weight_decay': 0.0, 'warmup': 1,
+               'comp_lambda': 0.0, 'delta_lr_mult': 10.0, 'eval_every': 0,
+               'eval_subset': 2, 'd': 64, 'n_layers': 2, 'n_heads': 4,
+               'd_head': 16, 'dataset': 'unit', 'seeds': [0], 'variants': ['full']}
+        try:
+            L.run(cfg, label='contract-failure-unit')
+        except RuntimeError as e:
+            assert 'batch iterator contract check FAILED' in str(e), e
+        else:
+            raise AssertionError('run() must hard-stop when the real loader contract fails')
+        dc = json.load(open(os.path.join(d, 'data_contract.json'), encoding='utf-8'))
+        assert dc['passed'] is False and dc['checks']['labels_are_next_token_shift'] is False, dc
+        assert not os.path.exists(os.path.join(d, 'summary.json')), 'no training cell may start after a failed loader contract'
+    finally:
+        L.load_run_corpus = _saved_load
+        L.batch_iter = _saved_iter
+        for _k, _v in (('CSA_SKIP_OVERFIT', _old_skip_overfit), ('CSA_SKIP_REPRO', _old_skip_repro)):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def t_overfit_sanity():
     r = L.overfit_sanity_check('full', seed=0, steps=200, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256)
     assert r['passed'] is True, r
@@ -1250,6 +1321,8 @@ def t_overfit_sanity():
     ids = np.asarray(np.random.default_rng(3).integers(0, 256, size=1024), dtype=np.int64)
     r2 = L.overfit_sanity_check('csa_dynamic', seed=0, steps=200, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=24, batch_size=2, vocab=256, train_ids=ids)
     assert r2['passed'] is True and r2['data_source'] == 'train_ids', r2
+    assert r2['loader_mode'] == 'batch_iter', 'the real-data probe must exercise the production loader'
+    assert r2['intermediate_checks']['labels_are_next_token_shift'] is True, r2['intermediate_checks']
 
 
 def t_rng_state_preserved_by_preflight():
@@ -1287,19 +1360,24 @@ def t_panel_tracking_events():
         L.load_run_corpus = lambda cfg: (ids, val, 997, None, None)
         os.environ['CSA_SKIP_OVERFIT'] = '1'
         os.environ['CSA_SKIP_REPRO'] = '1'
-        cfg = dict(outdir=d, seq_len=32, batch_size=2, n_train_tokens=4096, steps=3, lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0, delta_lr_mult=10.0, eval_every=0, eval_subset=2, d=64, n_layers=2, n_heads=4, d_head=16, dataset='unit', seeds=[0], variants=['full'])
+        cfg = dict(outdir=d, seq_len=32, batch_size=2, n_train_tokens=4096, steps=3, lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0, delta_lr_mult=10.0, eval_every=0, eval_subset=2, d=64, n_layers=2, n_heads=4, d_head=16, dataset='unit', seeds=[0, 1], variants=['full'])
         summary, _ = L.run(cfg, label='tracking-unit')
-        assert 'full::seed0' in summary
+        assert 'full::seed0' in summary and 'full::seed1' in summary
         lines = [json.loads(x) for x in open(os.path.join(d, 'experiments.jsonl'), encoding='utf-8').read().strip().splitlines()]
         kinds = [x.get('kind') for x in lines]
         assert 'panel_start' in kinds and 'panel_finish' in kinds, kinds
-        assert kinds.count('cell') == 1, kinds
+        assert kinds.count('cell') == 2, kinds
         st = next(x for x in lines if x.get('kind') == 'panel_start')
         for k in ('run_cfg', 'code', 'config', 'seeds', 'variants', 'provenance'):
             assert k in st, f'panel_start missing {k}'
+        assert st['n_cells_planned'] == 2 and st['n_cells_to_run'] == 2 and st['n_cells_resumed'] == 0, st
+        fin = next(x for x in lines if x.get('kind') == 'panel_finish')
+        assert fin['n_cells_planned'] == 2 and fin['n_cells_measured'] == 2 and fin['n_cells_missing'] == 0, fin
         m = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
         entry = m['panels'][L._run_fp(cfg, 64, 2, 4, 16, 997, ids, val)]
         assert entry.get('tracking_schema') == 2 and 'reproducibility' in entry
+        assert entry['data_contract']['passed'] is True, entry.get('data_contract')
+        assert entry['evidence']['batch_iterator_contract'] is True, entry.get('evidence')
     finally:
         L.load_run_corpus = _saved_load
         if _old_skip_overfit is None:
@@ -1327,6 +1405,8 @@ def t_provenance_and_manifest():
     assert prov['data'].get('data_version'), 'data provenance must carry a composite data_version'
     hp = L.run_hyperparameters({'steps': 10, 'seeds': [0], 'variants': ['full'], 'outdir': 'x', 'n_train_tokens': 512, 'seq_len': 32}, seed=3, d=64, n_layers=2, n_heads=4, d_head=16, vocab=97, mlp_ratio=4.0)
     assert hp['seed'] == 3 and hp['data_seed'] == 3 and hp['train_knobs']['optimizer'] == 'AdamW'
+    assert hp['rng']['python'] == hp['rng']['numpy'] == hp['rng']['torch'] == hp['rng']['cuda'] == 3, hp['rng']
+    assert hp['rng']['data'] == 3 and hp['rng']['dataloader_generator'] == 3, hp['rng']
     d = tempfile.mkdtemp()
     try:
         summary = {'full::seed0': {'ppl': 10.0, 'steps': 10, 'tokens_seen': 320, 'params': 100, 'train_time_s': 1.0, 'final_loss_smoothed': 2.3, 'rng_fp': 'abc', '_code': L.code_stamp(), 'losses': [3.0, 2.3], 'ppl_history': [[10, 10.0]]}}
@@ -1358,6 +1438,11 @@ def t_dataloader_seeding_helpers():
         L.seed_worker(0)
         return (random.random(), float(np.random.random()), float(torch.rand(1).item()))
     assert worker_draw() == worker_draw(), 'seed_worker must reproduce Python/NumPy/Torch worker RNG streams'
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+    torch.manual_seed(11)
+    L.seed_worker(0)
+    assert torch.backends.cudnn.deterministic is True and torch.backends.cudnn.benchmark is False, 'a spawned worker must re-pin deterministic kernels'
 
 
 def t_train_variant_reproducible():
@@ -1400,16 +1485,19 @@ def t_experiment_ledger():
             assert k in ev, f'experiment ledger entry missing {k}'
         assert ev['status'] == 'ok' and ev['run_id'] == out['run_id'] and len(ev['losses']) == 3
         san = {'kind': 'small_batch_overfit_sanity_panel', 'passed': True, 'reports': [], 'run_cfg': fp}
-        L.write_run_manifest(d, cfg, fp, prov, summary, sanity=san)
+        dc = L.batch_contract_check(ids, cfg['seq_len'], cfg['batch_size'], torch.device('cpu'), seed=0, vocab=997)
+        dc.update({'run_cfg': fp})
+        L.write_run_manifest(d, cfg, fp, prov, summary, sanity=san, data_contract=dc)
         m = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
         entry = m['panels'][fp]
         cell = entry['cells']['full::seed0']
         assert entry['sanity'] == san and entry['experiment_log'] == 'experiments.jsonl'
+        assert entry['data_contract']['passed'] is True and entry['evidence']['batch_iterator_contract'] is True, entry.get('evidence')
         assert cell['run_id'] == out['run_id'] and cell['data_fp'] and cell['curve_summary']['n_points'] == 3
         assert cell.get('data_version') == prov['data']['data_version']
         assert entry.get('status') == 'complete' and entry.get('n_completed') == 1
         integ = entry.get('tracking_integrity') or {}
-        assert integ.get('n_cells') == 1 and integ.get('with_curve') == 1 and integ.get('with_rng_fp') == 1, integ
+        assert integ.get('n_cells') == 1 and integ.get('with_curve') == 1 and integ.get('with_rng_fp') == 1 and integ.get('with_data_contract') == 1, integ
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -2421,6 +2509,9 @@ def main():
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
     _check('E2b batch_iter uint16 transport', t_batch_iter_uint16)
+    _check('E2c real batch-iterator contract check', t_batch_contract_check)
+    _check('E2d failed loader contract blocks the panel', t_panel_blocks_on_loader_contract_failure)
+    _check('E2e parallel child gets the seed hash', t_parallel_child_env_seed)
     _check('E3 small-batch overfit sanity', t_overfit_sanity)
     _check('E3b preflight RNG-state preservation', t_rng_state_preserved_by_preflight)
     _check('E3c duplicate-run reproducibility check', t_reproducibility_check)

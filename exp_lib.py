@@ -6608,6 +6608,90 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         stop.set()
         th.join(timeout=5.0)
 
+def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=None, n_batches=2):
+    """Validate the ACTUAL training batch iterator, not a re-derived sample.
+
+    The small-batch overfit probe trains on a fixed batch; that alone cannot
+    prove the production loader shifts inputs/targets correctly, keeps every
+    id inside the vocabulary, or repeats the same stream for the same seed.
+    This check pulls a few real batches from ``batch_iter`` twice and reports
+    the loader-level contract separately.  It is cheap, consumes no global RNG
+    state, and is meant to run before a panel starts."""
+    seq_len = int(seq_len)
+    batch_size = int(batch_size)
+    n_batches = max(1, int(n_batches))
+    report = {
+        'kind': 'batch_iterator_contract',
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'seq_len': seq_len,
+        'batch_size': batch_size,
+        'seed': int(seed),
+        'vocab_size': (None if vocab is None else int(vocab)),
+        'n_batches': n_batches,
+        'device': str(device),
+        'checks': {},
+        'batches': [],
+        'passed': False,
+    }
+    checks = {
+        'shapes_ok': True,
+        'dtypes_int64': True,
+        'labels_are_next_token_shift': True,
+        'ids_within_vocab': True,
+        'same_seed_repeats_stream': True,
+        'nonempty': True,
+    }
+    try:
+        it_a = batch_iter(train_ids, seq_len, batch_size, device, seed=int(seed))
+        it_b = batch_iter(train_ids, seq_len, batch_size, device, seed=int(seed))
+        for index in range(n_batches):
+            xa, ya = next(it_a)
+            xb, yb = next(it_b)
+            checks['nonempty'] = bool(checks['nonempty'] and xa.numel() and ya.numel())
+            checks['shapes_ok'] = bool(
+                checks['shapes_ok']
+                and tuple(xa.shape) == (batch_size, seq_len)
+                and tuple(ya.shape) == (batch_size, seq_len)
+                and tuple(xb.shape) == tuple(xa.shape)
+                and tuple(yb.shape) == tuple(ya.shape))
+            checks['dtypes_int64'] = bool(
+                checks['dtypes_int64']
+                and xa.dtype == torch.int64 and ya.dtype == torch.int64
+                and xb.dtype == torch.int64 and yb.dtype == torch.int64)
+            checks['labels_are_next_token_shift'] = bool(
+                checks['labels_are_next_token_shift']
+                and ya.shape[1] == xa.shape[1]
+                and torch.equal(ya[:, :-1], xa[:, 1:]))
+            checks['same_seed_repeats_stream'] = bool(
+                checks['same_seed_repeats_stream']
+                and torch.equal(xa, xb) and torch.equal(ya, yb))
+            if vocab is not None and xa.numel() and ya.numel():
+                _v = int(vocab)
+                checks['ids_within_vocab'] = bool(
+                    checks['ids_within_vocab']
+                    and int(xa.min()) >= 0 and int(xa.max()) < _v
+                    and int(ya.min()) >= 0 and int(ya.max()) < _v)
+            report['batches'].append({
+                'index': index,
+                'input_shape': [int(_n) for _n in xa.shape],
+                'target_shape': [int(_n) for _n in ya.shape],
+                'input_min': int(xa.min()) if xa.numel() else None,
+                'input_max': int(xa.max()) if xa.numel() else None,
+                'target_min': int(ya.min()) if ya.numel() else None,
+                'target_max': int(ya.max()) if ya.numel() else None,
+            })
+        del it_a, it_b
+    except Exception as e:
+        report['error'] = f'{type(e).__name__}: {e}'
+        report['checks'] = checks
+        report['diagnosis'] = 'batch iterator failed before producing the requested batches'
+        return report
+    report['checks'] = checks
+    failed = [k for k, ok in checks.items() if not ok]
+    report['passed'] = not failed
+    report['diagnosis'] = 'ok' if not failed else 'failed checks: ' + ', '.join(failed)
+    return report
+
 def count_params(m):
     return sum((p.numel() for p in m.parameters()))
 
@@ -10461,10 +10545,14 @@ def seed_worker(worker_id):
     calling this hook; re-seeding it explicitly documents the contract and
     also covers older versions where a custom generator changes the base."""
     _seed = int(torch.initial_seed()) % (2 ** 32)
+    os.environ['PYTHONHASHSEED'] = str(_seed)
     random.seed(_seed)
     np.random.seed(_seed)
     torch.manual_seed(_seed)
+    _pin_cpu_threads()
+    _pin_cuda_determinism()
     if torch.cuda.is_available():
+        torch.cuda.manual_seed(_seed)
         torch.cuda.manual_seed_all(_seed)
 
 def dataloader_kwargs(seed):
@@ -10724,6 +10812,17 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
     hp.update({
         'seed': int(seed),
         'data_seed': int(seed),
+        'rng': {
+            'python': int(seed),
+            'numpy': int(seed),
+            'torch': int(seed),
+            'cuda': int(seed),
+            'tensorflow': int(seed),
+            'data': int(seed),
+            'eval_sampling': 0,
+            'dataloader_generator': int(seed),
+            'worker_seed_policy': 'torch.initial_seed() % 2**32',
+        },
         'd': int(d),
         'n_layers': int(n_layers),
         'n_heads': int(n_heads),
@@ -10740,16 +10839,18 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
         hp['data_version'] = str(data_version)
     return hp
 
-def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reproducibility=None, *, status=None, planned_cells=None, started_at=None, cell_records=None):
+def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reproducibility=None, *, data_contract=None, status=None, planned_cells=None, started_at=None, cell_records=None):
     """Merge one panel's provenance/config/outcome summary into
     `outdir/run_manifest.json` under the same flock used by summary.json.
 
     The per-record `losses` / `ppl_history` curves stay in summary.json (to
     avoid duplicating large arrays); each manifest cell points at its key.
-    `sanity` (the small-batch overfit reports) and `reproducibility` (the
-    duplicate-run seed check) are embedded when supplied, or read back from
-    `outdir/overfit_sanity.json` / `outdir/reproducibility.json` so an
-    auto-preflight is traceable without a second manual record.
+    `sanity` (the small-batch overfit reports), `reproducibility` (the
+    duplicate-run seed check) and `data_contract` (the real batch iterator
+    check) are embedded when supplied, or read back from
+    `outdir/overfit_sanity.json` / `outdir/reproducibility.json` /
+    `outdir/data_contract.json` so an auto-preflight is traceable without a
+    second manual record.
 
     `status` / `planned_cells` make the manifest a crash-safe tracking record:
     `run()` writes it with status='running' before the first cell, so a killed
@@ -10798,6 +10899,15 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
             except Exception as _re:
                 print(f'[track] WARNING: could not read {_rep_path} for the run manifest ({type(_re).__name__}: {_re})')
     reproducibility = _evidence_for_this_panel(reproducibility, os.path.join(outdir, 'reproducibility.json'), 'reproducibility')
+    if data_contract is None:
+        _bc_path = os.path.join(outdir, 'data_contract.json')
+        if os.path.exists(_bc_path):
+            try:
+                with open(_bc_path, encoding='utf-8') as _bf:
+                    data_contract = json.load(_bf)
+            except Exception as _be:
+                print(f'[track] WARNING: could not read {_bc_path} for the run manifest ({type(_be).__name__}: {_be})')
+    data_contract = _evidence_for_this_panel(data_contract, os.path.join(outdir, 'data_contract.json'), 'data contract')
     if cell_records is not None:
         # Custom phases (warmup/NIAH/lenphase) have their own summary keys and
         # metrics (PPL with warm-grid keys, NIAH accuracy, by-length PPL).
@@ -10859,6 +10969,12 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         'with_data_version': sum(1 for c in cells.values() if c.get('data_version')),
         'with_curve': sum(1 for c in cells.values() if (c.get('curve_summary') or {}).get('n_points')),
         'with_sanity_ref': sum(1 for c in cells.values() if c.get('sanity_ref')),
+        'with_data_contract': int(bool(isinstance(data_contract, dict) and data_contract.get('passed'))),
+    }
+    _evidence = {
+        'small_batch_overfit': (bool(sanity.get('passed')) if isinstance(sanity, dict) else None),
+        'same_machine_reproducibility': (bool(reproducibility.get('passed')) if isinstance(reproducibility, dict) else None),
+        'batch_iterator_contract': (bool(data_contract.get('passed')) if isinstance(data_contract, dict) else None),
     }
     entry = {
         'run_cfg': run_cfg,
@@ -10870,6 +10986,8 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         'data_version': prov.get('data', {}).get('data_version'),
         'sanity': sanity,
         'reproducibility': reproducibility,
+        'data_contract': data_contract,
+        'evidence': _evidence,
         'experiment_log': 'experiments.jsonl',
         'tracking_schema': 2,
         'planned_cells': planned_cells,
@@ -13368,7 +13486,8 @@ def _param_change_sample(model, max_per_tensor=4096):
 def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, vocab=256, train_ids=None, batch=None, ignore_index=None, device=None, target_loss=0.05, target_acc=0.99, mlp_ratio=None, grad_clip=1.0):
     """Small-batch overfit sanity check (necessary, not sufficient).
 
-    Take ONE fixed batch (sampled once from `train_ids`, passed explicitly as
+    Take ONE fixed batch (the first batch from the real ``batch_iter``
+    training loader when ``train_ids`` is given, passed explicitly as
     ``batch=(inputs, targets)``, or synthetic ids when neither is supplied),
     disable every regulariser (weight decay = 0, the compression penalty = 0;
     the model has no dropout), and optimise only that batch.  A correct
@@ -13395,6 +13514,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     _rng_fp = rng_fingerprint()
     _label_shift_ok = None
     _batch_contract = None
+    _loader_mode = None
     _ign = None
     ids_full = None
     if batch is not None:
@@ -13404,6 +13524,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         _data_source = 'batch'
         x = torch.from_numpy(x_np).to(device)
         y = torch.from_numpy(y_np).to(device)
+        _loader_mode = 'explicit_batch'
         _ign = -100 if ignore_index is None else int(ignore_index)
         _batch_contract = bool(x.shape[0] == y.shape[0] and y.shape[1] <= x.shape[1])
     elif train_ids is not None:
@@ -13412,19 +13533,25 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
             raise ValueError('overfit_sanity_check: train_ids must be one-dimensional')
         if len(arr) < seq_len + 1:
             raise ValueError(f'overfit_sanity_check: need at least seq_len+1={seq_len + 1} tokens, got {len(arr)}')
-        _rng = np.random.default_rng(int(seed))
-        _hi = len(arr) - seq_len
-        starts = _rng.integers(0, _hi, size=int(batch_size))
-        chunk = np.stack([arr[int(s):int(s) + seq_len + 1] for s in starts]).astype(np.int64, copy=False)
-        _data_fp = _ids_fp(chunk.reshape(-1))
+        _loader = batch_iter(arr, int(seq_len), int(batch_size), device, seed=int(seed))
+        try:
+            x, y = next(_loader)
+        finally:
+            del _loader
+        x_np = x.detach().cpu().numpy()
+        y_np = y.detach().cpu().numpy()
+        _data_fp = _ids_fp(x_np.reshape(-1)) + ':' + _ids_fp(y_np.reshape(-1))
         _data_source = 'train_ids'
-        ids_full = torch.from_numpy(chunk).to(device)
-        x, y = ids_full[:, :-1], ids_full[:, 1:]
+        _loader_mode = 'batch_iter'
+        _label_shift_ok = bool(y.shape == x.shape and y.shape[1] > 0
+                               and torch.equal(y[:, :-1], x[:, 1:]))
+        _batch_contract = bool(x.shape[0] == y.shape[0] and y.shape[1] == x.shape[1])
     else:
         _rng = np.random.default_rng(int(seed))
         chunk = _rng.integers(0, max(int(vocab), 1), size=(int(batch_size), seq_len + 1), dtype=np.int64)
         _data_fp = _ids_fp(chunk.reshape(-1))
         _data_source = 'synthetic'
+        _loader_mode = 'synthetic'
         ids_full = torch.from_numpy(chunk).to(device)
         x, y = ids_full[:, :-1], ids_full[:, 1:]
     if mlp_ratio is None:
@@ -13506,7 +13633,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     # check that only reports "PASS" hides WHICH part of the pipeline was
     # exercised.  These are diagnostics, not extra pass criteria.
     _label_shift_ok = (bool(torch.equal(y, ids_full[:, 1:]))
-                       if ids_full is not None else None)
+                       if ids_full is not None else _label_shift_ok)
     _initial_near_chance = bool(math.isfinite(initial_loss) and abs(float(initial_loss) - _chance) <= max(0.5 * _chance, 1.0))
     _finite_curve = all(math.isfinite(float(v)) for v in loss_curve)
     report = {
@@ -13527,6 +13654,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
             'n_targets': int(y.numel()),
         },
         'data_source': _data_source,
+        'loader_mode': _loader_mode,
         'data_fp': _data_fp,
         'rng_fp': _rng_fp,
         'regularization': {'weight_decay': 0.0, 'comp_lambda': 0.0, 'dropout': 0.0, 'augmentation': 'none'},
@@ -15507,6 +15635,26 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     ratios = _panel_ratios(vocab)
     _data_fp = _ids_fp(train_ids)
 
+    _data_contract = batch_contract_check(
+        train_ids, cfg['seq_len'], cfg.get('batch_size', 12), DEVICE,
+        seed=_first_seed, vocab=vocab)
+    _data_contract.update({'run_cfg': fp, 'label': label or outdir, 'provenance': prov})
+    atomic_write_json(os.path.join(outdir, 'data_contract.json'), _data_contract)
+    log_experiment_event(outdir, {
+        'kind': 'preflight', 'tracking_schema': 2,
+        'status': ('ok' if _data_contract.get('passed') else 'failed'),
+        'stage': 'batch_iterator_contract', 'run_cfg': fp,
+        'code': code_stamp(), 'provenance': prov,
+        'data_contract': {k: _data_contract.get(k) for k in
+                          ('passed', 'diagnosis', 'seq_len', 'batch_size', 'seed', 'n_batches')},
+    })
+    if not _data_contract.get('passed'):
+        raise RuntimeError(
+            'batch iterator contract check FAILED '
+            f"({_data_contract.get('diagnosis')}) — do NOT start a full run; "
+            'the actual training loader is not producing shifted, in-vocabulary, '
+            'repeatable batches. See data_contract.json.')
+
     def _data_probe_cfg(v):
         return _overfit_probe_config(seed=_first_seed, steps=_probe_steps, seq_len=_probe_seq, batch_size=_probe_batch, vocab=vocab, target_loss=0.05, target_acc=0.99, arch=_arch, mlp_ratio=ratios.get(v), ignore_index=None, source='data', data_fp=_data_fp)
 
@@ -15607,14 +15755,16 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     # hyperparameters, planned cells) BEFORE the first cell can be
     # killed.  The final write below flips the status to complete and lists
     # every planned cell that produced no measurement.
-    write_run_manifest(outdir, cfg, fp, prov, _read_summary_json(summary_path), sanity=_sanity_doc, reproducibility=_repro_doc, status='running', planned_cells=_planned_keys, started_at=_panel_started)
+    write_run_manifest(outdir, cfg, fp, prov, _read_summary_json(summary_path), sanity=_sanity_doc, reproducibility=_repro_doc, data_contract=_data_contract, status='running', planned_cells=_planned_keys, started_at=_panel_started)
     log_experiment_event(outdir, {
         'kind': 'panel_start', 'tracking_schema': 2, 'label': label or outdir,
         'run_cfg': fp, 'code': code_stamp(), 'started_at': _panel_started,
         'config': _jsonable(cfg), 'seeds': list(cfg.get('seeds') or []),
         'variants': list(cfg.get('variants') or []),
-        'n_cells_planned': len(cells), 'n_cells_resumed': (len(cfg.get('seeds') or []) * len(cfg.get('variants') or []) - len(cells)),
+        'n_cells_planned': len(_planned_keys), 'n_cells_to_run': len(cells),
+        'n_cells_resumed': max(0, len(_planned_keys) - len(cells)),
         'provenance': prov,
+        'data_contract': ({'passed': bool(_data_contract.get('passed')), 'diagnosis': _data_contract.get('diagnosis'), 'ref': 'data_contract.json'} if isinstance(_data_contract, dict) else None),
         'sanity': ({'passed': all(bool(r.get('passed')) for r in _sanity), 'n_reports': len(_sanity), 'ref': 'overfit_sanity.json'} if _sanity else None),
         'reproducibility': ({'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro), 'ref': 'reproducibility.json'} if _repro else None),
     })
@@ -15665,16 +15815,16 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             print(f'    {_k}')
         if len(_still) != len(stale_dropped):
             print(f'    ({len(stale_dropped) - len(_still)} of them succeeded and carry a fresh record.)')
-    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=_sanity_doc, reproducibility=_repro_doc, status='complete', planned_cells=_planned_keys, started_at=_panel_started)
+    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=_sanity_doc, reproducibility=_repro_doc, data_contract=_data_contract, status='complete', planned_cells=_planned_keys, started_at=_panel_started)
     _agg = _finish_panel(outdir, summary)
-    _cell_keys = {f'{v}::seed{seed}' for v, seed in cells}
-    _measured = {k for k in _cell_keys if isinstance(summary.get(k), dict) and ppl_is_usable((summary.get(k) or {}).get('ppl')) and not (summary.get(k) or {}).get('synthesized')}
+    _measured = {k for k in _planned_keys if isinstance(summary.get(k), dict) and ppl_is_usable((summary.get(k) or {}).get('ppl')) and not (summary.get(k) or {}).get('synthesized')}
     log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
         'run_cfg': fp, 'code': code_stamp(), 'started_at': _panel_started,
         'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'n_cells_planned': len(cells), 'n_cells_measured': len(_measured),
-        'n_cells_missing': max(0, len(cells) - len(_measured)),
+        'n_cells_planned': len(_planned_keys), 'n_cells_to_run': len(cells),
+        'n_cells_measured': len(_measured),
+        'n_cells_missing': max(0, len(_planned_keys) - len(_measured)),
         'n_truncated': len(dropped_truncations), 'n_stale_dropped': len(stale_dropped),
         'aggregate_ref': 'aggregate.json', 'summary_ref': 'summary.json',
         'aggregate': {str(v): {kk: e.get(kk) for kk in ('n', 'n_seeds', 'ppl_mean', 'ppl_std', 'params') if kk in e} for v, e in (_agg or {}).items() if isinstance(e, dict)},

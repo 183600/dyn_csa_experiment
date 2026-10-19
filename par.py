@@ -210,10 +210,12 @@ def _slug(value):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))[:80]
 
 
-def _child_env(slot):
+def _child_env(slot, seed=None):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(slot)
     env["PYTHONUNBUFFERED"] = "1"
+    if seed is not None:
+        env["PYTHONHASHSEED"] = str(int(seed))
     return env
 
 
@@ -524,7 +526,7 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                         entry["result_path"],
                     ],
                     cwd=REPO,
-                    env=_child_env(slots[worker]),
+                    env=_child_env(slots[worker], entry["job"].get("seed")),
                     stdout=entry["log_f"],
                     stderr=subprocess.STDOUT,
                     start_new_session=True,

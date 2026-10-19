@@ -1181,13 +1181,14 @@ def _phase_cell_record(v, seed, rec, *, run_cfg, metric='ppl', key=None):
         'sanity_ref': rec.get('sanity_ref'),
     }
 
-def _write_phase_manifest(outdir, cfg, run_cfg, prov, *, phase, planned_cells, cell_records=None, status='running', started_at=None):
+def _write_phase_manifest(outdir, cfg, run_cfg, prov, *, phase, planned_cells, cell_records=None, status='running', started_at=None, data_contract=None):
     """Write/refresh the same crash-safe run_manifest.json used by run()."""
     try:
         return L.write_run_manifest(
             outdir, cfg, run_cfg, prov, {},
             status=status, planned_cells=list(planned_cells),
-            started_at=started_at, cell_records=cell_records)
+            started_at=started_at, cell_records=cell_records,
+            data_contract=data_contract)
     except Exception as _e:
         print(f'[track] WARNING: could not write run_manifest.json for {phase} ({type(_e).__name__}: {_e})')
         return None
@@ -1388,8 +1389,28 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
     if torch.cuda.is_available():
         L._pin_cuda_determinism()
     _fp = _warm_fp(cfg, vocab, train_ids, val_batch)
+    _data_contract = L.batch_contract_check(
+        train_ids, cfg['seq_len'], cfg['batch_size'], L.DEVICE,
+        seed=int(list(seeds)[0] if seeds else 0), vocab=vocab)
+    _data_contract.update({'run_cfg': _fp, 'label': label or outdir,
+                           'provenance': _panel_prov})
+    L.atomic_write_json(os.path.join(outdir, 'data_contract.json'), _data_contract)
+    L.log_experiment_event(outdir, {
+        'kind': 'preflight', 'tracking_schema': 2,
+        'status': ('ok' if _data_contract.get('passed') else 'failed'),
+        'stage': 'batch_iterator_contract', 'run_cfg': _fp,
+        'code': CKPT_CODE, 'provenance': _panel_prov,
+        'data_contract': {k: _data_contract.get(k) for k in
+                          ('passed', 'diagnosis', 'seq_len', 'batch_size', 'seed', 'n_batches')},
+    })
+    if not _data_contract.get('passed'):
+        raise RuntimeError(
+            'batch iterator contract check FAILED '
+            f"({_data_contract.get('diagnosis')}) — the warmup panel's actual "
+            'loader is not producing shifted, in-vocabulary, repeatable batches. '
+            'See data_contract.json.')
     _planned = [f'{v}::w{warm}::seed{seed}' for seed in seeds for warm in warm_grid for v in variants]
-    _write_phase_manifest(outdir, cfg, _fp, _panel_prov, phase='warmup', planned_cells=_planned, status='running', started_at=_panel_started)
+    _write_phase_manifest(outdir, cfg, _fp, _panel_prov, phase='warmup', planned_cells=_planned, status='running', started_at=_panel_started, data_contract=_data_contract)
     cells = [(v, warm, seed) for seed in seeds for warm in warm_grid for v in variants]
     stale_dropped = []
     dropped_truncations = []
@@ -1438,7 +1459,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
             _cell_recs[_k]['warm_steps'] = int(_w.replace('w', ''))
         except Exception:
             continue
-    _write_phase_manifest(outdir, cfg, _fp, _panel_prov, phase='warmup', planned_cells=_planned, cell_records=_cell_recs, status='complete', started_at=_panel_started)
+    _write_phase_manifest(outdir, cfg, _fp, _panel_prov, phase='warmup', planned_cells=_planned, cell_records=_cell_recs, status='complete', started_at=_panel_started, data_contract=_data_contract)
     L.log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
         'phase': 'warmup', 'started_at': _panel_started,
