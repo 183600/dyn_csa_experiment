@@ -157,12 +157,6 @@ def exact_signflip(deltas):
     except ImportError:
         _np = None
     if _np is not None:
-        # Vectorized counting with an exactness guard: numpy's pairwise sum
-        # rounds differently than the reference left-to-right sum, so any mask
-        # whose vectorized |sum| lies within the classic rounding bound
-        # n*eps*sum|d| of the decision threshold is re-decided with the
-        # original per-mask Python summation; all other masks are decided
-        # identically by both summations (the bound covers the difference).
         _total = 1 << n
         _thr = obs - 1e-12 * n
         _darr = _np.asarray(deltas, dtype=float)

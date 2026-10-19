@@ -372,8 +372,6 @@ def _arange_nbytes(t):
 
 
 def _full_arange_evict(need=0):
-    # 与 _GEOM_CACHE 同一套 FIFO 淘汰：(B, T, Bm) 组合数无天然上界
-    # （例如 eval 长度扫描），缓存条目数必须有上界。
     while _ARANGE_CACHE and (len(_ARANGE_CACHE) >= _ARANGE_CACHE_CAP or
                              _ARANGE_CACHE_BYTES[0] + need > _ARANGE_CACHE_BUDGET):
         _k0 = next(iter(_ARANGE_CACHE))
@@ -480,10 +478,6 @@ _POOL_CHUNK_HARD_BYTES = 512 << 20
 
 
 def _pool_chunk_b(R, Ltot, c, temps=1):
-    # 软上限决定常规 chunk；硬顶在单 chunk 的 ~temps 份 [R,ch,·,c]
-    # 临时量较大时收紧（fwd 的 logit/sc/gather 约 6 份，bwd 再
-    # 加 gsc/glogit 约 8 份）。chunk 只划分独立的块列，宽度不影响任何
-    # 逐块值。
     per_block = max(1, int(R) * int(Ltot) * int(c) * 4)
     ch = max(1, min(int(_POOL_CHUNK_BYTES) // per_block, 4096))
     return max(1, min(ch, int(_POOL_CHUNK_HARD_BYTES) // max(1, int(temps) * per_block)))
@@ -601,7 +595,6 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     nblk_l = _i64['n_blocks'][:, None]
     _bpb_rows = int(B_pos_b.shape[0]) if need_bpb else 0
     gBpb32 = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32) if need_bpb else None
-    # 复用的段和落点（每 chunk 清零）：避免按 chunk 反复分配同一形状的临时表。
     gBpb_tmp = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32) if need_bpb else None
     ch = _pool_chunk_b(R, L + (W if has_b else 0), c, temps=8)
     # 单 chunk（ch >= Bm）时 in_ch / b2 的 chunk 范围条件恒真（geom 与 bid
@@ -2277,9 +2270,6 @@ def _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     return comp
 
 
-# scores 分块上限（fp32 [R, T_c, Bm]）：打分/top-k 两内核按 query 行分块
-# 启动，scores 不按全幅 [R, T, Bm] 物化——每行的值与全幅形式逐位一致
-# （每个 (r, t) 程序只读写自己的行）。
 _IDX_SCORES_CAP_BYTES = 128 << 20
 
 
@@ -2291,8 +2281,7 @@ def _indexer_topk_chunked(scores, last_tok, t0, T, Bm, k_out, need_soft, out_dty
     and the merged candidate table is stable-sorted again.  Candidate order is
     chunk-major / column-minor, i.e. exactly ascending global block id, so the
     stable descending sort reproduces the full-width tie rule (earliest
-    block wins).  Memory stays O(R * tc * (chunk + k)) instead of holding any
-    extra full-width table.
+    block wins).
     """
     R, tc = int(scores.shape[0]), int(scores.shape[1])
     dev = scores.device
@@ -2456,8 +2445,6 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         counts = getattr(base, '_pool_cpu', None)
         if counts is None:
             raise RuntimeError('blocks_fixed 未携带 _pool_cpu——分段器出口被绕过')
-        # bid_full 是 blocks_fixed 内容（transport only）的纯整型函数，
-        # 按 (B, device) 缓存在对象上。
         _bkey = (int(B), str(dev))
         _bc = getattr(base, '_bidfull_cache', None)
         if _bc is None:

@@ -100,10 +100,8 @@ _CORRUPT_MODES = ('uniform', 'natural', 'mask', 'delete', 'span', 'doc', 'topica
 class _BoundedRowCache:
     """Small byte-bounded cache for deterministic probe rows.
 
-    Rows are large (one full eval-length token vector each), so an unbounded
-    dict across lengths/rhos/modes/arms can grow to many GB of host memory.
-    FIFO eviction keeps the resident set bounded; a miss just rebuilds the
-    row from its (eval_len, row, rho, mode) seed, which is the same value.
+    FIFO eviction bounds the table; a miss just rebuilds the row from its
+    (eval_len, row, rho, mode) seed, which is the same value.
     """
 
     def __init__(self, max_bytes=512 << 20):

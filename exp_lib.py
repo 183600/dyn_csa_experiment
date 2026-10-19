@@ -282,10 +282,6 @@ def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None)
     train_s = _curve_slope(entries, 'train_ce', k=tail_k)
     val_s = _curve_slope(entries, 'val_ce', k=tail_k)
     if val_s is None:
-        # The classifier's contract says a point may carry either val_ce or
-        # val_ppl.  log(PPL) is CE, so a val_ppl-only history can still give
-        # the same tail slope (and the same units as slope_tol) instead of
-        # being mislabelled `insufficient_data`.
         _val_from_ppl = []
         for _p in entries:
             try:
@@ -548,9 +544,6 @@ def state_dict_sha256(sd):
         try:
             _bytes = _t.numpy().tobytes()
         except TypeError:
-            # NumPy has no bfloat16/float8 scalar type; reinterpret the raw
-            # storage bytes instead so AMP / reduced-precision state dicts
-            # remain hashable without changing the digest of supported dtypes.
             _bytes = _t.reshape(-1).view(torch.uint8).numpy().tobytes()
         h.update(_bytes)
     return h.hexdigest()
@@ -1250,14 +1243,10 @@ def _causal_quantile_rank(x, lo, frac, use_hi, first_row, q, n):
 
     `x[j]` is the k-th smallest value of the prefix `[0, c]` exactly when
     `#{i <= c : (x_i, i) < (x_j, j)} == k` under the strict order (value,
-    then index), so the per-column sort-and-gather reduces to prefix sums of
-    a comparison matrix — the same values with no `[rows, cols, n]` sort
-    workspace.  A `j`-chunk `[j0, j1)` can only influence columns `c >= j0`,
-    which halves the touched (c, j) pairs.  Falls back to nothing: the
-    caller routes non-finite inputs and sampled column grids to the sort
-    path, whose semantics this reproduces bit-for-bit for finite inputs
-    (ties give equal values regardless of order, and the arithmetic is the
-    same expression evaluated in the same dtype).
+    then index).  The caller routes non-finite inputs and sampled column
+    grids to the sort path, whose semantics this reproduces bit-for-bit for
+    finite inputs (ties give equal values regardless of order, and the
+    arithmetic is the same expression evaluated in the same dtype).
     """
     rows = int(x.shape[0])
     dev = x.device
@@ -1267,8 +1256,6 @@ def _causal_quantile_rank(x, lo, frac, use_hi, first_row, q, n):
     out_hi = x.new_empty((rows, n)) if need_hi else out_lo
     _budget = 48 << 20
     _per_elem = 12
-    # Small chunks keep the [rows, n, jc] comparison block cache-resident,
-    # which beats larger blocks despite the extra loop iterations.
     jc = max(1, min(16, _budget // max(1, n * _per_elem)))
     rb = max(1, min(16, _budget // max(1, n * jc * _per_elem)))
     for r0 in range(0, rows, rb):
@@ -1333,8 +1320,6 @@ def _causal_quantile_exact(x, cols, target_block_tokens, _full_range=False):
         return _causal_quantile_rank(x, lo, frac, use_hi, first_row, q, n)
     _pair_bytes = 16
     _budget = 128 << 20
-    # Bound BOTH dimensions by the byte ceiling.  Limiting only the row count
-    # would leave a single [1, col_chunk, n] sort block unbounded.
     col_chunk = max(1, min(nc, 64, _budget // max(1, n * _pair_bytes)))
     row_chunk = max(1, _budget // max(col_chunk * n * _pair_bytes, 1))
     out = x.new_empty((x.shape[0], nc))
@@ -1394,7 +1379,6 @@ def causal_adaptive_threshold(sim, target_block_tokens):
         raise RuntimeError(
             f'causal_adaptive_threshold 超出显式安全上限 {_max_len}（CSA_ADAPTIVE_MAX_TOKENS）: '
             '请提高该上限或改用 chunking="cosine_learnable"')
-    # Up to this length the exact closed form (O(T^2) comparisons) is used.
     # The default is 8192; the sampled long-context path must be opted into
     # explicitly (and is part of the run fingerprint through `_ae`).
     _exact_len = _adaptive_exact_limit()
@@ -1417,10 +1401,6 @@ def causal_adaptive_threshold(sim, target_block_tokens):
         pre_cols = torch.arange(exact_n, device=sim.device, dtype=torch.long)
         pre_vals = _causal_quantile_exact(x[:, :exact_n], pre_cols, target_block_tokens,
                                           _full_range=True)
-        # The warm-up prefix cannot run past the actual sequence.  With a
-        # small configured exact cutoff (CSA_ADAPTIVE_EXACT_TOKENS) n can be
-        # shorter than the 256-token warm window; an unclamped start would
-        # make the second arange have start > stop and raise.
         warm_end = min(int(n), max(exact_n, 256, _exact_len // 8))
         n_samp = 1024
         step = max(1, (_max_len - warm_end + n_samp - 1) // n_samp)
@@ -1471,7 +1451,7 @@ def _causal_donor(device, width):
     global _CAUSAL_TRI
     dev_s = _dev_str(device)
     width = int(width)
-    nbytes = max(0, width * width)  # bool: 1 byte/element
+    nbytes = max(0, width * width)
     pin = nbytes <= _CAUSAL_DONOR_PIN_BYTES
     key = (dev_s, 'causal', _CAUSAL_DONOR)
     held = _CAUSAL_TRI
@@ -1526,7 +1506,6 @@ def _is_pinned_key(key):
     return key in _PINNED_KEYS
 _PINNED_KEYS = set()
 
-# Running per-cache byte totals, maintained incrementally on insert/evict.
 _CACHE_STATS = {}
 
 
@@ -1755,9 +1734,6 @@ def _attn_transient_budget(device):
     try:
         if device.type == 'cuda':
             free, _total = torch.cuda.mem_get_info(device)
-            # 上限由设备状态决定并封顶 cap；行分块是纯行划分（任意宽度下
-            # 逐行值逐位相同，见 gathered_attention 的 chunk 注释），不改变
-            # 任何值。默认 cap 取 512MB。
             val = max(64 << 20, min(int(free) // 4, cap))
     except Exception:
         val = None
@@ -2033,8 +2009,6 @@ def _pool_geom_content_put(key, value):
         return value
     if _b > _POOL_GEOM_CONTENT_BYTES:
         return value
-    # A running byte count and an item cap bound the table count even after a
-    # long run has produced tens of thousands of distinct geometry tables.
     _old = _POOL_GEOM_CONTENT.pop(key, None)
     if _old is not None:
         _POOL_GEOM_CONTENT_USED -= _pool_geom_value_bytes(_old)
@@ -3127,12 +3101,9 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
     if mem_budget_bytes is None:
-        # CPU/未知设备：使用固定上限（chunk 是纯行划分，任何宽度下逐行值
-        # 逐位相同）。
         mem_budget_bytes = 256 << 20
     _heads = q.shape[1] if q.dim() == 3 else 1
     _M = max(1, int(topk_idx.shape[1]) + int(w))
-    # 分块行估算（保守上界）。
     _per_row = 4 * _M * _heads * int(q.shape[-1]) + 2 * _M * _heads
     _bytes_per_chunk_row = _per_row * q.element_size()
     _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
@@ -3350,11 +3321,8 @@ def _cpu_saved_ok(saved_bytes, limit):
 
 def _gathered_attention_trainable(*args, **kwargs):
     # 训练时包一层非重入 checkpoint，反向按同一确定性分解重算前向。函数内
-    # 无 RNG，且分块上限经 _ATB_EPOCH 缓存在一次运行内不变，因此 chunk
-    # 边界与每个中间值逐位相同，梯度与直调形式逐位一致（design notes §6.1
-    # 的 transport 论证在「重算同一纯函数」上的形式）。函数内无 RNG，故
-    # 跳过 checkpoint 的 RNG 状态存取（preserve_rng_state=False），重算不
-    # 消耗也不改写任何随机流。
+    # 无 RNG，因此 chunk 边界与每个中间值逐位相同，梯度与直调形式逐位一致。
+    # 重算不消耗也不改写任何随机流。
     if torch.is_grad_enabled() and args[0].requires_grad:
         q = args[0]
         if q.device.type != 'cuda':
@@ -4580,10 +4548,6 @@ def _ids_fp(train_ids):
     _arr = np.asarray(train_ids)
     _widen = _arr.dtype in (np.dtype(np.uint8), np.dtype(np.uint16))
     _cs = 1 << 24
-    # Hash in bounded chunks.  A C-contiguous int32/int64 array is consumed
-    # without copying the whole corpus; a non-contiguous view is made
-    # contiguous one chunk at a time (same C-order bytes as the old
-    # whole-array ascontiguousarray).
     for _off in range(0, len(_arr), _cs):
         _part = _arr[_off:_off + _cs]
         if _widen:
@@ -6049,9 +6013,6 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         _seg_len = max(int(max_scan_tokens) // _nseg,
                        int(_sample.shape[1]) + 1)
         if tr.size <= max(int(max_scan_tokens), _nseg * _seg_len):
-            # Scanning everything is cheaper (and never double-counts a row)
-            # than building overlapping sampled windows when the stream is
-            # only a little larger than the requested scan budget.
             _segments = [tr]
             _scanned = int(tr.size)
         else:
@@ -6368,7 +6329,6 @@ def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True):
 
 _PINNED_HOST_CACHE = {}
 _PINNED_HOST_CAP_BYTES = 256 << 20
-# 语料整份缓存的上限（见 batch_iter）；超出时按步暂存。
 _GPU_CORPUS_CACHE_BYTES = 64 << 20
 
 
@@ -6615,8 +6575,8 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
     prove the production loader shifts inputs/targets correctly, keeps every
     id inside the vocabulary, or repeats the same stream for the same seed.
     This check pulls a few real batches from ``batch_iter`` twice and reports
-    the loader-level contract separately.  It is cheap, consumes no global RNG
-    state, and is meant to run before a panel starts."""
+    the loader-level contract separately.  It consumes no global RNG state and
+    is meant to run before a panel starts."""
     seq_len = int(seq_len)
     batch_size = int(batch_size)
     n_batches = max(1, int(n_batches))
@@ -8100,9 +8060,6 @@ def loglog_regression(points, *, alpha=0.05):
     try:
         _coef = 10 ** intercept
     except OverflowError:
-        # Extreme (but finite) log-space fits can overflow the displayed
-        # coefficient; the fit itself is still valid, so keep the report
-        # total instead of raising on a formatting expression.
         _coef = float('inf')
     out.update({'status': 'ok', 'slope': slope, 'exponent': slope, 'intercept': intercept,
                 'law': 'y = %.6g * x^%.6g' % (_coef, slope)})
@@ -11328,11 +11285,10 @@ class _BlockStats:
     """Incremental replacement for the per-sequence bincount list.
 
     compression_report only needs the pooled mean/std/min/max/fractions over
-    block lengths, so retaining every sequence's count vector until the end of
-    a 64k-token forward wastes memory proportional to n_sample*n_layers*n_blocks.
-    Each append folds the integer counts into running moments and drops the
-    tensor immediately; values are accumulated in float64 so the pooled
-    statistics are at least as accurate as the concatenated float32 form."""
+    block lengths.  Each append folds the integer counts into running moments
+    and drops the tensor immediately; values are accumulated in float64 so the
+    pooled statistics are at least as accurate as the concatenated float32
+    form."""
 
     def __init__(self, min_block=None, max_block=None):
         self.min_block = min_block
@@ -12380,8 +12336,6 @@ _PARAM_FINITE_CHECK = os.environ.get('CSA_PARAM_FINITE_CHECK', 'sample').strip()
 
 
 def _params_all_finite(model):
-    # Fuse the per-parameter reductions into one boolean vector and one host
-    # sync; callers also gate how often this O(total parameters) scan runs.
     flags = [torch.isfinite(p).all() for p in model.parameters() if p.numel()]
     if not flags:
         return True
@@ -12610,9 +12564,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             _fixed_eval = None
     _diag_stride = max(1, int(diag_every) if diag_every else max(1, int(steps) // 1000))
     # Lightweight token-range/shape checks stay at roughly every 1% of the run
-    # (plus step 0 and any post-anomaly window), not once per 1024 steps: the
-    # CPU-side reduction is cheap and a single corrupted window can poison all
-    # later checkpoints.
+    # (plus step 0 and any post-anomaly window), not once per 1024 steps: a
+    # single corrupted window can poison all later checkpoints.
     _token_check_every = max(1, int(steps) // 100)
     _diag = {'step': [], 'ce': [], 'total_loss': [], 'comp_reg': [], 'boundary_pg': [],
              'grad_norm_pre_clip': [], 'update_norm': [], 'lr': [], 'clipped': [],
@@ -12716,8 +12669,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 g['lr'] = base * _ls
             x, y = next(bpe)
             # Corruption checks are a startup / anomaly guard: first batch,
-            # roughly every 1% of the run, and again after any non-finite
-            # event.  The check itself is a cheap host-side reduction.
+            # roughly every 1% of the run, and again after any non-finite event.
             if step == 0 or step % _token_check_every == 0 or _first_bad_step is not None:
                 try:
                     _check_token_batch(x, y, vocab, step=step + 1)
@@ -12856,7 +12808,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                             _update_norm = float((_param_change_sample(_inner_model, max_per_tensor=256) - _ub).norm().item())
                         except Exception:
                             _update_norm = None
-            # Full-model isfinite scans are O(parameters) and force a sync.
             # The default is a low-frequency sample (step 0, after anomalies,
             # and every 1024 steps) so a corrupted update cannot run for an
             # entire panel unnoticed; CSA_PARAM_FINITE_CHECK=full scans every
@@ -15330,10 +15281,6 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             return out
         deadline_ts = guard.deadline_ts()
         if booked:
-            # `spent_hours()` includes this cell's own pre-booking, which is
-            # the time this cell is about to use rather than time already
-            # spent, so add it back here.  Other cells' bookings stay
-            # subtracted (shared-cap contract).
             deadline_ts += booked
         print(f'[cap] {key}: projected {est / 60:.0f} min, booked so far {guard.state['booked_seconds'] / 3600:.2f} h')
     t_run = time.time()

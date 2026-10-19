@@ -1634,8 +1634,6 @@ def t_atomic_torch_save():
 
 
 def t_cache_bytes_shared_storage():
-    # A stride-0 expand is a view: _cache_bytes charges its physical storage,
-    # not its numel.
     base = torch.arange(64, dtype=torch.int32)
     expanded = base.expand(4096, 64)
     assert L._cache_bytes(expanded) == L._cache_bytes(base), 'an expand must charge its base storage, not numel'

@@ -214,9 +214,6 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
                     n_seg = max(1, min(64, cap_tokens // max(k, 1)))
                     seg_len = max(int(cap_tokens) // n_seg, k + 1)
                     if total <= max(int(cap_tokens), n_seg * seg_len):
-                        # No overlap possible; scanning the whole (slightly
-                        # over-budget) stream is deterministic and keeps the
-                        # reported scanned fraction <= 1.
                         segments = [(0, total)]
                     else:
                         # total >= n_seg*seg_len makes the equally spaced

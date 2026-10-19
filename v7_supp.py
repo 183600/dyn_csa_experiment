@@ -1247,9 +1247,6 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
     if guard is not None:
         _deadline = guard.deadline_ts()
         if booked:
-            # the guard's spent total already contains this cell's own
-            # pre-booking; add it back so the cell is not truncated by the
-            # estimate of the time it is about to use (see exp_lib._run_cell).
             _deadline += booked
     rec = None
     try:
@@ -2435,9 +2432,6 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         t0 = time.time()
         _deadline = guard.deadline_ts() if guard is not None else None
         if _deadline is not None and booked:
-            # subtract this cell's own pre-booking from the elapsed side (see
-            # exp_lib._run_cell): the reservation is future time for this
-            # cell, not time already spent.
             _deadline += booked
         L.set_seed(seed)
         cfgs = L.make_layer_cfgs(6, v)
