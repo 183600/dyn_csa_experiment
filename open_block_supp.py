@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""Open-block panel driver: maximum block length × current-open-block reading.
+
+The main experiment is a single controlled matrix on the dynamic CSA model:
+
+    max_block_tokens  ∈ {32, 64, 128, None}
+    open_block_mode   ∈ {closed, prefix_summary, prefix_singletons}
+
+with the eight cells of the main matrix (32/64 only closed, 128 and None
+with all three reading rules).  `None` means "dynamic boundaries only": no
+forced cut from a maximum length.  All arms share the same position-table
+capacity (`pool_position_capacity=129`, truncation) and the same training
+recipe; only the two declared factors change.
+
+Commands
+--------
+python open_block_supp.py smoke
+    Zero-dataset end-to-end check: all eight cells, tiny model, a few steps,
+    finite loss, open-block metadata present.
+
+python open_block_supp.py pilot  [--seeds 0] [--steps 100]
+    One short seed per cell; excluded from the formal statistics.
+
+python open_block_supp.py main   [--seeds 0,1,2,3] [--steps 1500] [--max-hours H]
+    The 8-cell × 4-seed panel.  Resumable: a cell whose record is current
+    (same code/recipe and a finite PPL) is skipped.
+
+python open_block_supp.py aux    [--seeds ...]
+    The outside-window auxiliary panel: the same three reading rules at
+    128/None, but the prefix is constructed from U_t = P_t \\ W_t only.
+
+python open_block_supp.py report [--outdir ...]
+    Paired per-seed deltas, interaction effects, exact sign-flip p-values,
+    Holm adjustment, and a Markdown report.  No GPU needed.
+
+Artifacts
+---------
+<outdir>/summary.json          per-cell records (resumable)
+<outdir>/run_manifest.json     recipe / code / data provenance
+<analysis_open_block>/stats.json + OPEN_BLOCK_REPORT.md
+"""
+import argparse
+import json
+import math
+import os
+import sys
+import time
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, 'reconfigure'):
+        try:
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+        except (ValueError, OSError):
+            pass
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, REPO)
+
+import numpy as np
+import torch
+
+import exp_lib as L
+
+
+MAIN_MATRIX = (
+    (32, 'closed', 'full_prefix'),
+    (64, 'closed', 'full_prefix'),
+    (128, 'closed', 'full_prefix'),
+    (128, 'summary', 'full_prefix'),
+    (128, 'singletons', 'full_prefix'),
+    (None, 'closed', 'full_prefix'),
+    (None, 'summary', 'full_prefix'),
+    (None, 'singletons', 'full_prefix'),
+)
+AUX_MATRIX = (
+    (128, 'closed', 'outside_window'),
+    (128, 'summary', 'outside_window'),
+    (128, 'singletons', 'outside_window'),
+    (None, 'closed', 'outside_window'),
+    (None, 'summary', 'outside_window'),
+    (None, 'singletons', 'outside_window'),
+)
+
+BASE_CFG = dict(
+    dataset='wikitext', d=256, n_layers=6, n_heads=8, d_head=32,
+    seq_len=512, batch_size=12, n_train_tokens=8_000_000, steps=1500,
+    lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05,
+    delta_lr_mult=10.0, eval_every=250, eval_subset=128, val_seqs=512,
+    seeds=[0, 1, 2, 3], outdir='results_open_block',
+)
+
+
+def _variant(max_block, mode, scope):
+    return L.open_block_variant_name(max_block, mode, scope)
+
+
+def _recipe(cfg, *, matrix, outdir):
+    d = dict(cfg)
+    d['matrix'] = [list(x) for x in matrix]
+    d['outdir'] = outdir
+    d['code'] = L.code_stamp()
+    d['semantics'] = L.CODE_SEMANTICS
+    return d
+
+
+def _run_fingerprint(cfg, *, matrix, outdir):
+    r = _recipe(cfg, matrix=matrix, outdir=outdir)
+    # The fingerprint identifies the training recipe, not which cells of the
+    # matrix happen to be scheduled in this invocation: adding a seed or an
+    # auxiliary cell must not invalidate already-finished cells.
+    r.pop('seeds', None)
+    r.pop('outdir', None)
+    r.pop('matrix', None)
+    return json.dumps(r, sort_keys=True, separators=(',', ':'))
+
+
+def _atomic_json(path, obj):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + f'.tmp{os.getpid()}'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
+    os.replace(tmp, path)
+
+
+def _load_summary(outdir):
+    p = os.path.join(outdir, 'summary.json')
+    if os.path.exists(p):
+        try:
+            with open(p, encoding='utf-8') as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception as e:
+            print(f'[open-block] WARNING: unreadable summary {p} ({type(e).__name__}: {e}); starting a fresh one')
+    return {}
+
+
+def _save_summary(outdir, summary):
+    _atomic_json(os.path.join(outdir, 'summary.json'), summary)
+
+
+def _is_current(rec, fp):
+    if not isinstance(rec, dict):
+        return False
+    if rec.get('run_fingerprint') != fp:
+        return False
+    if rec.get('code') != L.code_stamp():
+        return False
+    ppl = rec.get('ppl')
+    return isinstance(ppl, (int, float)) and not isinstance(ppl, bool) and math.isfinite(float(ppl)) and float(ppl) > 0
+
+
+def _synthetic_data(cfg, vocab=97, n_train=40000, val_rows=8):
+    rng = np.random.RandomState(cfg.get('seed', 0) if 'seed' in cfg else 0)
+    train = rng.randint(0, vocab, size=int(n_train)).astype(np.int64)
+    val = rng.randint(0, vocab, size=(int(val_rows), int(cfg['seq_len']))).astype(np.int64)
+    return train, val, int(vocab)
+
+
+def _wikitext_data(cfg):
+    train, val, vocab, _tok, val_bnd = L.load_wikitext(
+        int(cfg['seq_len']), int(cfg['n_train_tokens']),
+        vocab_size=8192, val_seqs=int(cfg.get('val_seqs', 512)))
+    return train, val, int(vocab), val_bnd
+
+
+def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
+             outdir, fp, device, max_hours=None):
+    key = f'{variant}::seed{int(seed)}'
+    summary = _load_summary(outdir)
+    if _is_current(summary.get(key), fp):
+        print(f'[open-block] skip {key} (current record)')
+        return summary[key]
+    if max_hours is not None and max_hours <= 0:
+        print(f'[open-block] stopping before {key}: --max-hours exhausted')
+        return None
+    print(f'\n===== open-block {key} =====')
+    t0 = time.time()
+    rec = L.train_variant(
+        variant, train_ids, val_batch, vocab, seed=int(seed),
+        d=int(cfg['d']), n_layers=int(cfg['n_layers']),
+        n_heads=int(cfg['n_heads']), d_head=int(cfg['d_head']),
+        seq_len=int(cfg['seq_len']), batch_size=int(cfg['batch_size']),
+        steps=int(cfg['steps']), lr=float(cfg['lr']),
+        weight_decay=float(cfg['weight_decay']), warmup=int(cfg['warmup']),
+        comp_lambda=float(cfg['comp_lambda']),
+        delta_lr_mult=float(cfg.get('delta_lr_mult', 10.0)),
+        eval_every=int(cfg.get('eval_every', 0)),
+        eval_subset=int(cfg.get('eval_subset', 128)),
+        val_bnd=val_bnd, device=device, mlp_ratio=4.0,
+        measure_eff=True, eager_batch=False,
+        amp_dtype=cfg.get('amp_dtype', 'auto'))
+    rec = dict(rec)
+    rec.pop('_model', None)
+    rec['key'] = key
+    rec['variant'] = variant
+    rec['seed'] = int(seed)
+    rec['run_fingerprint'] = fp
+    rec['code'] = L.code_stamp()
+    rec['semantics'] = L.CODE_SEMANTICS
+    rec['elapsed_s'] = time.time() - t0
+    rec['hyperparams'] = L.run_hyperparameters(
+        cfg, seed=int(seed), d=int(cfg['d']), n_layers=int(cfg['n_layers']),
+        n_heads=int(cfg['n_heads']), d_head=int(cfg['d_head']),
+        vocab=int(vocab), mlp_ratio=4.0,
+        amp_dtype=rec.get('amp_dtype', 'auto'),
+        eager_batch=rec.get('eager_batch', False))
+    rec['hyperparams']['open_block_config'] = rec.get('open_block_config')
+    summary[key] = rec
+    _save_summary(outdir, summary)
+    print(f'[open-block] {key}: NLL/token={float(rec["nll_sum"]) / max(int(rec["n_tokens"]), 1):.6f} PPL={rec["ppl"]:.4f}')
+    return rec
+
+
+def run_panel(cfg, matrix, *, device, synthetic=False, max_hours=None, label='main'):
+    outdir = cfg['outdir']
+    os.makedirs(outdir, exist_ok=True)
+    fp = _run_fingerprint(cfg, matrix=matrix, outdir=outdir)
+    if synthetic:
+        train, val, vocab = _synthetic_data(cfg)
+        val_bnd = None
+    else:
+        train, val, vocab, val_bnd = _wikitext_data(cfg)
+    manifest = {
+        'kind': 'open_block_panel', 'label': label,
+        'code': L.code_stamp(), 'semantics': L.CODE_SEMANTICS,
+        'recipe': _recipe(cfg, matrix=matrix, outdir=outdir),
+        'run_fingerprint': fp,
+        'data': {'train_len': int(len(train)), 'val_shape': list(np.asarray(val).shape),
+                 'vocab': int(vocab), 'synthetic': bool(synthetic)},
+        'started_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'cells': [f'{_variant(mb, m, sc)}::seed{s}' for s in cfg['seeds'] for mb, m, sc in matrix],
+    }
+    _atomic_json(os.path.join(outdir, 'run_manifest.json'), manifest)
+    deadline = None if max_hours is None else time.time() + float(max_hours) * 3600.0
+    done = 0
+    for seed in cfg['seeds']:
+        for mb, mode, scope in matrix:
+            variant = _variant(mb, mode, scope)
+            remain = None if deadline is None else (deadline - time.time()) / 3600.0
+            rec = _run_one(cfg, variant=variant, seed=seed, train_ids=train,
+                           val_batch=val, vocab=vocab, val_bnd=val_bnd,
+                           outdir=outdir, fp=fp, device=device, max_hours=remain)
+            if rec is not None:
+                done += 1
+    manifest['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    manifest['completed_cells'] = done
+    _atomic_json(os.path.join(outdir, 'run_manifest.json'), manifest)
+    print(f'\n[open-block] panel {label}: {done} cell(s) processed; summary={os.path.join(outdir, "summary.json")}')
+    return outdir
+
+
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
+
+def _nll_per_token(rec):
+    try:
+        n = float(rec['n_tokens'])
+        v = float(rec['nll_sum'])
+        if n > 0 and math.isfinite(v):
+            return v / n
+    except Exception:
+        pass
+    return None
+
+
+def _rec_by_cell(summary):
+    out = {}
+    for key, rec in summary.items():
+        if not isinstance(rec, dict):
+            continue
+        if not (isinstance(rec.get('ppl'), (int, float)) and math.isfinite(float(rec['ppl']))):
+            continue
+        v, _, s = key.partition('::seed')
+        try:
+            seed = int(s)
+        except Exception:
+            continue
+        nll = _nll_per_token(rec)
+        if nll is None:
+            continue
+        out[(v, seed)] = {'record': rec, 'nll': nll, 'ppl': float(rec['ppl'])}
+    return out
+
+
+def _paired(cells, va, vb, seeds):
+    ds, ppl_ds, used = [], [], []
+    for s in seeds:
+        a, b = cells.get((va, s)), cells.get((vb, s))
+        if a is None or b is None:
+            continue
+        ds.append(float(a['nll'] - b['nll']))
+        ppl_ds.append(float(a['ppl'] - b['ppl']))
+        used.append(int(s))
+    return ds, ppl_ds, used
+
+
+def _cell_diagnostics(rec):
+    """Aggregate per-layer block/prefix diagnostics for one cell."""
+    stats = rec.get('stats') if isinstance(rec, dict) else None
+    if not isinstance(stats, dict):
+        return None
+    keys_mean = ('len_mean', 'len_std', 'avg_len', 'frac_at_min', 'frac_at_max',
+                 'prefix_age_mean', 'prefix_age_p95', 'outside_window_len_mean',
+                 'outside_window_nonzero_frac', 'prefix_len_mean',
+                 'prefix_selected_rate', 'prefix_selected_any_rate',
+                 'closed_selected_mean', 'selected_mean', 'candidates_mean',
+                 'unused_slots_mean', 'history_displaced_mean',
+                 'prefix_attention_mass_mean', 'position_truncated_frac',
+                 'position_truncated_tokens', 'position_truncated_blocks',
+                 'forced_only', 'natural_only', 'forced_and_natural',
+                 'forced_total', 'natural_total', 'len_p50', 'len_p95')
+    out = {k: [] for k in keys_mean}
+    out['len_max'] = []
+    for _layer, d in stats.items():
+        if not isinstance(d, dict):
+            continue
+        for k in keys_mean:
+            v = d.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)):
+                out[k].append(float(v))
+            ob = d.get('open_block')
+            if isinstance(ob, dict):
+                v2 = ob.get(k)
+                if isinstance(v2, (int, float)) and not isinstance(v2, bool) and math.isfinite(float(v2)):
+                    out[k].append(float(v2))
+        lm = d.get('len_max')
+        if isinstance(lm, (int, float)) and math.isfinite(float(lm)):
+            out['len_max'].append(float(lm))
+    agg = {}
+    for k, vals in out.items():
+        if not vals:
+            agg[k] = None
+        elif k == 'len_max':
+            agg[k] = max(vals)
+        elif (k.startswith('position_truncated_tokens') or k.startswith('position_truncated_blocks')
+              or k in ('forced_only', 'natural_only', 'forced_and_natural',
+                       'forced_total', 'natural_total')):
+            agg[k] = sum(vals)
+        else:
+            agg[k] = sum(vals) / len(vals)
+    return agg
+
+
+def _cell_efficiency(rec):
+    if not isinstance(rec, dict):
+        return None
+    eff = rec.get('efficiency') if isinstance(rec.get('efficiency'), dict) else {}
+    out = {k: eff.get(k) for k in
+           ('prefill_ms_p50', 'prefill_ms_p95', 'tokens_per_s_prefill',
+            'prefix_prefill_ms_p50', 'prefix_prefill_ms_p95',
+            'peak_mem_allocated_mb', 'peak_mem_reserved_mb', 'status')}
+    out['train_tokens_per_s'] = rec.get('train_tokens_per_s')
+    out['train_time_s'] = rec.get('train_time_s')
+    out['peak_memory'] = rec.get('peak_memory')
+    return out if any(v is not None for v in out.values()) else None
+
+
+def _controlled_reason(a, b):
+    """Only the declared experimental factors may differ between two arms."""
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return 'missing record'
+    ha, hb = a.get('hyperparams') or {}, b.get('hyperparams') or {}
+    keys = ('steps', 'tokens_seen', 'seq_len', 'batch_size', 'lr', 'weight_decay',
+            'warmup', 'comp_lambda', 'delta_lr_mult', 'd', 'n_layers', 'n_heads',
+            'd_head', 'vocab_size', 'dataset', 'data_version', 'code', 'amp_dtype',
+            'eager_batch')
+    for k in keys:
+        va, vb = ha.get(k), hb.get(k)
+        if va is not None and vb is not None and va != vb:
+            return f'{k} differs ({va!r} != {vb!r})'
+    if a.get('code') != b.get('code'):
+        return f"code stamp differs ({a.get('code')!r} != {b.get('code')!r})"
+    if a.get('run_fingerprint') != b.get('run_fingerprint'):
+        return 'run_fingerprint differs (recipe/backend/matrix changed)'
+    for k in ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp', 'rng_fp'):
+        va, vb = a.get(k), b.get(k)
+        if va is not None and vb is not None and va != vb:
+            return f'{k} differs ({va!r} != {vb!r})'
+    oa = a.get('open_block_config') or {}
+    ob = b.get('open_block_config') or {}
+    if oa.get('fingerprint') == ob.get('fingerprint'):
+        return None
+    # The only allowed layer-level differences are max_block/open mode/scope.
+    la, lb = oa.get('layers') or [], ob.get('layers') or []
+    if len(la) != len(lb):
+        return 'different layer counts'
+    allowed = {'max_block', 'open_block_mode', 'open_block_scope'}
+    for i, (x, y) in enumerate(zip(la, lb)):
+        for k in set(x) | set(y):
+            if k in allowed:
+                continue
+            if x.get(k) != y.get(k):
+                return f'layer {i} differs in undeclared field {k}'
+    return None
+
+
+def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
+    summary = _load_summary(outdir)
+    _fps = {rec.get('run_fingerprint') for rec in summary.values()
+            if isinstance(rec, dict) and isinstance(rec.get('ppl'), (int, float))
+            and math.isfinite(float(rec.get('ppl')) or float('nan'))}
+    _fps.discard(None)
+    if len(_fps) > 1:
+        raise SystemExit(
+            f'{outdir}/summary.json mixes {len(_fps)} run fingerprints (e.g. a '
+            'pilot and a main panel); refusing to pool them. Use a separate '
+            'outdir for the pilot or remove the stale records explicitly.')
+    cells = _rec_by_cell(summary)
+    if not cells:
+        raise SystemExit(f'no usable records in {outdir}/summary.json')
+    avail_seeds = sorted({s for (_, s) in cells})
+    seeds = [int(s) for s in (seeds or avail_seeds)]
+    results = {}
+
+    def variant(mb, mode, scope='full_prefix'):
+        return _variant(mb, mode, scope)
+
+    def add(name, va, vb, *, family):
+        if name in results:
+            return results[name]
+        ds, ppl_ds, used = _paired(cells, va, vb, seeds)
+        # Controlled-comparator check on the first paired seed.
+        reasons = []
+        for s in used[:1]:
+            r = _controlled_reason(cells[(va, s)]['record'], cells[(vb, s)]['record'])
+            if r:
+                reasons.append(r)
+        st = L.paired_effect_stats(ds, alpha=0.05, min_n=3) if ds else {'n': 0}
+        st = dict(st)
+        st.update({
+            'name': name, 'family': family, 'a': va, 'b': vb,
+            'seeds': used, 'per_seed_delta_nll': ds, 'per_seed_delta_ppl': ppl_ds,
+            'delta_convention': 'a - b; negative NLL delta means a is better',
+            'controlled_violations': reasons,
+            'p_holm': None,
+        })
+        results[name] = st
+        return st
+
+    # Primary family (pre-registered three comparisons).
+    primary = []
+    primary.append(add('summary - closed @128',
+                       variant(128, 'summary'), variant(128, 'closed'), family='primary'))
+    primary.append(add('singletons - summary @128',
+                       variant(128, 'singletons'), variant(128, 'summary'), family='primary'))
+    # Interaction: (summary - closed at None) - (summary - closed at 128),
+    # computed seed-wise as Δ_none - Δ_128.
+    d_int, p_int, used_int = [], [], []
+    for s in seeds:
+        a = cells.get((variant(None, 'summary'), s))
+        b = cells.get((variant(None, 'closed'), s))
+        c = cells.get((variant(128, 'summary'), s))
+        d = cells.get((variant(128, 'closed'), s))
+        if None in (a, b, c, d):
+            continue
+        d_int.append(float((a['nll'] - b['nll']) - (c['nll'] - d['nll'])))
+        p_int.append(float((a['ppl'] - b['ppl']) - (c['ppl'] - d['ppl'])))
+        used_int.append(int(s))
+    st = dict(L.paired_effect_stats(d_int, alpha=0.05, min_n=3) if d_int else {'n': 0})
+    st.update({'name': 'interaction: summary effect (none - 128)',
+               'family': 'primary', 'a': 'summary-none - closed-none',
+               'b': 'summary-128 - closed-128', 'seeds': used_int,
+               'per_seed_delta_nll': d_int, 'per_seed_delta_ppl': p_int,
+               'delta_convention': 'negative = prefix summary gains more when no cap',
+               'controlled_violations': [], 'p_holm': None})
+    results[st['name']] = st
+
+    # Secondary descriptive cells.
+    for mb in (32, 64, 128, None):
+        for mode in ('summary', 'singletons'):
+            add(f'{mode} - closed @{mb}',
+                variant(mb, mode), variant(mb, 'closed'), family='descriptive')
+    add('singletons - summary @none',
+        variant(None, 'singletons'), variant(None, 'summary'), family='descriptive')
+    # Auxiliary outside-window panel, if present.
+    for mb in (128, None):
+        for mode in ('summary', 'singletons'):
+            va, vb = variant(mb, mode, 'outside_window'), variant(mb, 'closed', 'outside_window')
+            if (va, seeds[0]) in cells and (vb, seeds[0]) in cells:
+                add(f'{mode} - closed @{mb} (outside-window)',
+                    va, vb, family='auxiliary_outside_window')
+
+    # Holm within the declared primary family.
+    prim_names = [n for n, r in results.items() if r.get('family') == 'primary']
+    pvals = {n: results[n].get('p_exact_signflip') for n in prim_names}
+    valid = {n: float(p) for n, p in pvals.items() if isinstance(p, (int, float)) and math.isfinite(float(p))}
+    if valid:
+        adj = L.holm_adjust(list(valid.items()))
+        for n, d in adj.items():
+            results[n]['p_holm'] = d.get('p_holm')
+
+    diagnostics = {}
+    efficiency = {}
+    for (v, s), cell in cells.items():
+        d = _cell_diagnostics(cell['record'])
+        if d is not None:
+            diagnostics[f'{v}::seed{s}'] = d
+        e = _cell_efficiency(cell['record'])
+        if e is not None:
+            efficiency[f'{v}::seed{s}'] = e
+    _prim_n = [int(results[n].get('n') or 0) for n in prim_names if results[n].get('n')]
+    _prim_n_min = min(_prim_n) if _prim_n else 0
+    _holm_floor = (L.holm_min_attainable_p(_prim_n_min, len(prim_names), 0.05)
+                   if _prim_n_min and prim_names else None)
+    _holm_min_n = (L.signflip_min_n_for_holm(len(prim_names), 0.05)
+                   if prim_names else None)
+    os.makedirs(analysis_dir, exist_ok=True)
+    stats = {
+        'outdir': outdir, 'code': L.code_stamp(), 'semantics': L.CODE_SEMANTICS,
+        'seeds_requested': seeds,
+        'cells_available': sorted(f'{v}::seed{s}' for (v, s) in cells),
+        'primary_family': prim_names,
+        'primary_family_size': len(prim_names),
+        'primary_holm_floor': _holm_floor,
+        'primary_holm_min_seeds': _holm_min_n,
+        'comparisons': results,
+        'diagnostics': diagnostics,
+        'efficiency': efficiency,
+        'notes': [
+            'delta = a - b; a negative NLL delta means arm a is better.',
+            'p_exact_signflip is two-sided; with n=4 the minimum attainable p is 0.125, with n=6 it is 0.03125.',
+            'A failure to reach p<0.05 at n=4 is a resolution limit, not evidence of no effect.',
+            'The 4-seed panel is descriptive for the primary family; Holm-adjusted p-values are reported with their floors.',
+            'Interaction I = (summary - closed | no cap) - (summary - closed | 128); negative means the summary benefit grows when the cap is removed.',
+        ],
+    }
+    _atomic_json(os.path.join(analysis_dir, 'stats.json'), stats)
+    md = _render_markdown(stats)
+    with open(os.path.join(analysis_dir, 'OPEN_BLOCK_REPORT.md'), 'w', encoding='utf-8') as f:
+        f.write(md)
+    print(md)
+    return stats
+
+
+def _fmt(x, nd=4):
+    if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x)):
+        return f'{float(x):.{nd}f}'
+    return '—'
+
+
+def _render_markdown(stats):
+    lines = ['# Open-block panel: maximum block length × current-block reading', '']
+    lines.append(f'Code: `{stats["code"]}`  |  cells: {len(stats["cells_available"])}  |  seeds: {stats["seeds_requested"]}')
+    if stats.get('primary_holm_floor') is not None:
+        lines.append(f'Primary family Holm floor: `{_fmt(stats.get("primary_holm_floor"))}` at n={stats.get("seeds_requested")}; minimum seeds for a confirmatory claim: `{stats.get("primary_holm_min_seeds")}`.')
+    lines += ['', 'Delta convention: `a - b` on token NLL; negative means `a` is better.', '']
+    lines.append('| comparison | family | n | mean ΔNLL | SD | dz | exact p | Holm p | p floor | CI95 | controlled |')
+    lines.append('|---|---|---|---|---|---|---|---|---|---|---|')
+    for name, r in stats['comparisons'].items():
+        ctrl = 'ok' if not r.get('controlled_violations') else '; '.join(r['controlled_violations'])
+        ci_s = f'[{_fmt(r.get("ci95_low"))}, {_fmt(r.get("ci95_high"))}]'
+        lines.append('| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |'.format(
+            name, r.get('family', ''), r.get('n', 0), _fmt(r.get('mean')),
+            _fmt(r.get('std')), _fmt(r.get('cohens_dz')),
+            _fmt(r.get('p_exact_signflip')), _fmt(r.get('p_holm')),
+            _fmt(r.get('min_reachable_p')), ci_s, ctrl))
+    if stats.get('diagnostics'):
+        lines += ['', '## Diagnostics (per-cell means over layers; seed-level in stats.json)', '',
+                  '| cell | len_mean | len_max | frac_at_max | forced_only | natural_only | both | prefix_age_mean | outside_nonzero | prefix_sel_rate | history_displaced | pos_trunc_frac |',
+                  '|---|---|---|---|---|---|---|---|---|---|---|---|']
+        for cell, d in sorted(stats['diagnostics'].items()):
+            lines.append('| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |'.format(
+                cell, _fmt(d.get('len_mean')), _fmt(d.get('len_max'), 0),
+                _fmt(d.get('frac_at_max')), _fmt(d.get('forced_only'), 0),
+                _fmt(d.get('natural_only'), 0), _fmt(d.get('forced_and_natural'), 0),
+                _fmt(d.get('prefix_age_mean')),
+                _fmt(d.get('outside_window_nonzero_frac')),
+                _fmt(d.get('prefix_selected_rate')),
+                _fmt(d.get('history_displaced_mean')),
+                _fmt(d.get('position_truncated_frac'))))
+    if stats.get('efficiency'):
+        lines += ['', '## Efficiency (from the measured harness; no KV cache)', '',
+                  '| cell | train tokens/s | tokens/s prefill | prefill p50 ms | prefix-prefill p50 ms | peak alloc MB |',
+                  '|---|---|---|---|---|---|']
+        for cell, e in sorted(stats['efficiency'].items()):
+            lines.append('| {} | {} | {} | {} | {} | {} |'.format(
+                cell, _fmt(e.get('train_tokens_per_s'), 1),
+                _fmt(e.get('tokens_per_s_prefill'), 1),
+                _fmt(e.get('prefill_ms_p50'), 1), _fmt(e.get('prefix_prefill_ms_p50'), 1),
+                _fmt(e.get('peak_mem_allocated_mb'), 1)))
+    lines += ['', '## How to read the primary comparisons', '',
+              '- `summary - closed @128`: does a causal summary of the open block help under the default cap?',
+              '- `singletons - summary @128`: representation granularity at a fixed top-k budget.',
+              '- `interaction`: does removing the cap make the summary benefit larger? A negative value is consistent with a waiting bottleneck, but only alongside block-length, prefix-selection and window-coverage statistics.',
+              '- Prefix candidates compete for the same K slots; an empty/rare prefix selection is a selection-path fact, not evidence that prefix information is useless.',
+              '- 4 seeds cannot reach p<0.05 (floor 0.125); report the effect and its uncertainty. '
+              + (f'With the {stats.get("primary_family_size")}-comparison Holm family the minimum seed count for any confirmatory claim is {stats.get("primary_holm_min_seeds")} (Holm floor {_fmt(stats.get("primary_holm_floor"))}).'
+                 if stats.get('primary_holm_min_seeds') else 'Extend the key cells only if a significance claim is needed.')]
+    return '\n'.join(lines) + '\n'
+
+
+def cmd_smoke(args):
+    torch.manual_seed(0)
+    cfg = dict(BASE_CFG, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=64,
+               batch_size=4, n_train_tokens=8000, steps=3, warmup=1,
+               eval_every=0, eval_subset=4, seeds=[0],
+               outdir=args.outdir or 'results_open_block_smoke')
+    outdir = run_panel(cfg, MAIN_MATRIX, device=L.DEVICE, synthetic=True,
+                       label='smoke')
+    summary = _load_summary(outdir)
+    got = {k.split('::')[0] for k in summary if '::' in k}
+    want = {_variant(mb, m, sc) for mb, m, sc in MAIN_MATRIX}
+    missing = want - got
+    assert not missing, f'smoke cells missing: {missing}'
+    for k, r in summary.items():
+        assert isinstance(r.get('open_block_config'), dict), k
+        assert r['open_block_config'].get('layers'), k
+        assert math.isfinite(float(r['ppl'])), k
+    print(f'\n[open-block] smoke PASSED ({len(got)}/{len(want)} cells)')
+    return 0
+
+
+def _parse_seeds(s):
+    return [int(x) for x in str(s).split(',') if str(x).strip()]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('command', choices=['smoke', 'pilot', 'main', 'aux', 'report'])
+    ap.add_argument('--seeds', default=None)
+    ap.add_argument('--steps', type=int, default=None)
+    ap.add_argument('--seq-len', type=int, default=None)
+    ap.add_argument('--outdir', default=None)
+    ap.add_argument('--max-hours', type=float, default=None)
+    ap.add_argument('--analysis-dir', default='analysis_open_block')
+    args = ap.parse_args()
+
+    if args.command == 'smoke':
+        return cmd_smoke(args)
+
+    if args.command == 'report':
+        outdir = args.outdir or BASE_CFG['outdir']
+        analyse(outdir, seeds=_parse_seeds(args.seeds) if args.seeds else None,
+                analysis_dir=args.analysis_dir)
+        return 0
+
+    matrix = MAIN_MATRIX if args.command in ('pilot', 'main') else AUX_MATRIX
+    cfg = dict(BASE_CFG)
+    cfg['seeds'] = _parse_seeds(args.seeds) if args.seeds else ([0] if args.command == 'pilot' else BASE_CFG['seeds'])
+    if args.steps is not None:
+        cfg['steps'] = int(args.steps)
+    if args.command == 'pilot':
+        cfg['steps'] = int(args.steps or 100)
+    if args.seq_len is not None:
+        cfg['seq_len'] = int(args.seq_len)
+    if args.command == 'aux':
+        cfg['outdir'] = 'results_open_block_aux'
+    if args.outdir is not None:
+        cfg['outdir'] = args.outdir
+    run_panel(cfg, matrix, device=L.DEVICE, synthetic=False,
+              max_hours=args.max_hours,
+              label='pilot' if args.command == 'pilot' else args.command)
+    if args.command in ('main', 'aux'):
+        try:
+            analyse(cfg['outdir'], seeds=cfg['seeds'], analysis_dir=args.analysis_dir)
+        except SystemExit as e:
+            print(f'[open-block] report skipped: {e}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

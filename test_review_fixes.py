@@ -3024,6 +3024,15 @@ def main():
     _check('I17 an empty split cache is not reported as verified', t_audit_split_empty_cache_is_not_ok)
     _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)
     _check('I19 simple-baseline audit reports malformed records instead of crashing', t_simple_baseline_audit_malformed_records)
+    # Open-block reading rule: the substantive gates (causality, reference
+    # pooling, masks, edge cases, closed regression) live in test_open_block.py
+    # so they can also be run on their own.
+    try:
+        import test_open_block as _OB
+        for _name, _fn in _OB.CHECKS:
+            _check(_name, _fn)
+    except Exception as _obe:
+        _check('K0 open-block suite import', lambda: (_ for _ in ()).throw(_obe))
     fails = [r for r in _results if r[1] != 'PASS']
     print(f'\n[test] {len(_results) - len(fails)}/{len(_results)} passed')
     return 1 if fails else 0

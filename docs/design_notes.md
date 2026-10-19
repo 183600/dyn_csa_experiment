@@ -933,3 +933,165 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
 - v12 新增 `P5H` 训练健康阶段；`P5T` 在写冻结锁、读取 test split 之前
   重新检查冻结臂的 `curve_health`。缺失/非有限/过拟合/停滞时拒绝消耗
   一次性 test 访问；`V12_ALLOW_UNHEALTHY=1` 是显式、会打印的覆盖开关。
+
+## 24. Open-block reading: maximum block length × current-prefix representation
+
+### 24.1 Questions and arms
+
+The open-block panel separates two factors that the earlier single-knob
+ablations conflated:
+
+1. **Maximum block length** (`max_block_tokens`): does forcing a cut at a
+   maximum length help, with the reading rule held fixed?
+2. **Reading the still-open block** (`open_block_mode`): does the wait for the
+   current block to close create an information-access bottleneck?
+
+For a query position `t`, let `s_t` be the start of its (still open) dynamic
+block and `P_t = [s_t, t]`.  All arms share the same dynamic cut table; only
+the read stage changes:
+
+| id | read rule |
+|---|---|
+| `closed` | only blocks with `end < t` (the historical strict gate) |
+| `prefix_summary` | closed candidates + one causal pooling of `P_t` |
+| `prefix_singletons` | closed candidates + one length-1 pooled representation per token in `P_t` |
+
+`prefix_singletons` is **not** raw-token K/V.  With one A lane the softmax is
+exactly 1 and no position bias survives, so the pooled value is
+`Xa[u] = x_u @ W_aKV` (then `core_kv = normalize(.)` and `W_kvhead`), i.e. a
+length-1 compressed representation through the same module and parameters.
+A raw-token variant would be a separate `prefix_rawtokens` mode and is not
+part of this panel.
+
+The prefix is a temporary representation for the current query.  It does
+not modify `bid`; for the next query it grows with `t`, and once the block
+closes the ordinary closed-block summary takes over.  A final block summary
+and a past temporary summary of the same block are never both retained.
+
+### 24.2 Causality is enforced at construction, not by loosening the mask
+
+`block_readable()` keeps its strict `pos > last_tok` rule.  The prefix path is
+a separate, causal candidate source.  For query `t`, the current block start,
+observed prefix length, pooling inputs/weights/normalizer, indexer key,
+attention key/value, and position/block-length features all use only
+`x_{<= t}`.  In particular:
+
+- the current block's **final** length/end is never read;
+- `B_pos_a` is indexed by `u - s_t` (known at `u <= t`), never by a
+  block-tail-relative position;
+- the previous-block overlap lanes (when `overlap > 0`) are the same causal
+  lanes the closed pooling uses: block `b-1` is entirely `< s_b`;
+- `max_block=None` is converted at the segmenter entry point to an explicit
+  bound equal to the current sequence length — no hidden large constant.
+
+`prefix_summary` for the full prefix includes the same previous-block overlap
+convention as the closed pooling, so at `t = end-1` it equals that block's
+closed summary up to floating-point error.  The auxiliary `outside_window`
+scope builds the prefix from `U_t = P_t \ W_t` only and disables the overlap
+lanes (they may lie inside the local window).  If `U_t` is empty there is no
+prefix candidate.
+
+Two implementations exist for the prefix pooling: the optimized cumulative
+form (`causal_prefix_pool`) and a per-query stable-softmax reference
+(`causal_prefix_pool_reference`).  The CPU suite compares their forward
+values and gradients, and checks the block-end equality above.
+
+### 24.3 Budget, masks and implementation paths
+
+The main panel uses the **shared top-k** rule for CSA:
+`closed candidates ∪ prefix candidates` compete for the same `index_topk`
+slots.  There is no separate prefix scorer; all candidates use the same
+`qI/kI/w` path.  `_indexer_selection` pads with invalid slots when fewer than
+`K` candidates exist; padding is marked invalid and is never read, and valid
+selected ids are unique.
+
+`prefix_singletons` uses the existing local-token K/V table, because a
+length-1 pooled block is exactly `normalize(Ca_raw[u])` at the same module
+parameters.  `prefix_summary` computes its own pooled summary and then the
+same `W_kvhead`/normalization path as a closed block.
+
+The open path is implemented in the eager row loop.  `CSA_KERNEL` and the
+batched eager twin do not implement it and fail rather than silently running
+a different read rule; the same guards refuse the kernel path for a
+non-default `(max_block, pool_position_capacity)` geometry, because the
+kernel's pool-geometry cache keys on `max_block` and predates the capacity
+decoupling.  `eager_batch=False` is therefore the controlled choice for this
+panel (all arms, including `closed`).  HCA has no top-k: it reads every closed block.  An open HCA
+layer must declare `selection_budget=all_closed_plus_prefix` (an **additional**
+read slot); the main matrix uses pure CSA so all three arms share one K.
+
+### 24.4 Position capacity is decoupled
+
+`max_block_tokens` controls forced cuts only.  `pool_position_capacity` (default
+129) controls the `B_pos_a/B_pos_b` tables for every arm; positions beyond the
+capacity are truncated by `pool_position_policy='truncate'`.  The report records
+`position_truncated_tokens` / `position_truncated_blocks` and the fraction of
+block tokens affected.  The default `(max_block=128, capacity=129)` is the
+historical configuration, so the closed path is unchanged.
+
+### 24.5 Running the matrix
+
+`open_block_supp.py` defines the main matrix:
+
+```
+max_block: 32  → closed
+           64  → closed
+          128  → closed, prefix_summary, prefix_singletons
+         None  → closed, prefix_summary, prefix_singletons
+```
+
+Commands:
+
+```bash
+python test_open_block.py                 # K1-K9 causality/reference/mask gates
+python open_block_supp.py smoke           # all 8 cells, synthetic, a few steps
+python open_block_supp.py pilot --seeds 0 --steps 100
+python open_block_supp.py main --seeds 0,1,2,3 --steps 1500
+python open_block_supp.py report
+python open_block_supp.py aux             # outside-window auxiliary panel
+```
+
+`main` is resumable and refuses a record whose code stamp / recipe
+fingerprint no longer matches.  `report` computes paired per-seed NLL deltas:
+`summary - closed @128`, `singletons - summary @128`, and the interaction
+`(summary - closed | None) - (summary - closed | 128)`; it reports mean,
+sample SD, `d_z`, exact sign-flip p, Holm-adjusted p within the declared
+primary family, and the attainable-p floor.  At 4 seeds the floor is 0.125;
+this is a resolution limit, not evidence of no effect.  A controlled
+comparator permits only the declared factors (`max_block`, `open_block_mode`,
+`open_block_scope`) to differ and rejects undeclared recipe/layer differences.
+
+### 24.6 Recorded diagnostics
+
+Per validation sequence/layer (only when `compression_report` enables stats):
+
+- prefix age `a_t = t - s_t + 1`, P50/P95/max;
+- outside-window prefix length and nonzero fraction; prefix length;
+- position-capacity truncation;
+- valid prefix candidates, prefix selection rate, selected closed count,
+  selected total, unused slots, and the number of history blocks that a
+  closed-only top-k would have selected but the open selection displaced;
+- attention mass assigned to prefix slots.
+
+Efficiency (tokens/s, peak memory, prefix-prefill latency) comes from the
+existing `measure_efficiency` record.  Prefix candidates can displace history
+blocks: the main result measures "is a prefix useful under a fixed K", not
+"is extra information useful if the budget is increased".
+
+### 24.7 Interpretation boundaries
+
+- A better `closed` arm at a larger cap does not by itself prove the cap is
+  good; it only supports a block-length effect under this recipe.
+- A `prefix_summary` gain at `None` that disappears at 128 supports an
+  interaction with waiting, but must be read with block lengths, selection
+  rates and window coverage.
+- If prefix candidates are rarely selected, that says the selection path did
+  not choose them; it does not show that prefix information is useless.
+- If the gain exists only with additional read slots, it is an extra-budget
+  effect and must not be pooled with the equal-K results.
+- `full_prefix` intentionally includes tokens already inside the local
+  window (a duplicate information path).  The auxiliary `outside_window`
+  panel isolates the window-exterior gap; the two scopes must not be mixed in
+  one comparison.
+- All formal arms train from scratch; a checkpoint from a closed run switched
+  to an open mode is a diagnostic, not a substitute for training adaptation.

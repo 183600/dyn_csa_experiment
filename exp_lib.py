@@ -44,7 +44,7 @@ if _NEEDED:
         print(f"[setup] {_msg}")
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading
+import gc, copy, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading
 import array
 from math import comb
 from dataclasses import dataclass
@@ -69,7 +69,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 RUN_CAP = dict(total_hours=58.333333333333336, margin=0.93, already_hours=0.0, state_path='run_time_state.json')
-CODE_SEMANTICS = 'v11.126'
+CODE_SEMANTICS = 'v11.127'
 CKPT_CODE = CODE_SEMANTICS
 # ---- 三算子内核路径（docs/compute_plan.md §3 的 M0 工作包；实现与数值契约
 # 见 csa_kernels.py）。CSA_KERNEL 未设置时本模块的执行路径与指纹逐字节不变。
@@ -135,6 +135,9 @@ def _uses_batched_eager(cfgs, device=None, batch_size=None):
         getattr(c, 'kind', None) in ('csa', 'hca')
         and getattr(c, 'fuse_mode', 'none') == 'none'
         and getattr(c, 'indexer_mode', 'learned')
+        and getattr(c, 'open_block_mode', 'closed') == 'closed'
+        and int(getattr(c, 'max_block', 128) or 0) == 128
+        and int(getattr(c, 'position_capacity', lambda: 129)()) == 129
         for c in cfgs
     )
 
@@ -722,6 +725,11 @@ def _segment(n, want_cut_list, min_block, max_block):
         # indexing ends[-1] on an empty array) keeps the public entry points
         # total for empty/negative-length inputs.
         return (np.empty(0, dtype=np.int64), {}, [])
+    # `max_block=None` is "dynamic boundaries only".  At this entry point the
+    # sequence length is known, so it becomes an explicit safe bound that can
+    # never force a cut.  The integer arithmetic below is therefore total.
+    if max_block is None:
+        max_block = int(n)
     cacheable = n <= 64
     # uint8 cast of the booleans is exactly 0/1 per slot — the same byte string
     # `bytes(bytearray(1 if _c else 0 ...))` built; the cached
@@ -1156,6 +1164,10 @@ def _device_segment_geometry(n, cuts, min_block, max_block, device):
         return bid, counts, torch.zeros((B, max(n - 1, 0)), dtype=torch.long, device=dev)
     idx = torch.arange(n - 1, device=dev)
     big = n + 1
+    # Same explicit-safe-bound convention as the host segmenter: with a known
+    # length, "no maximum" means a bound of n, which cannot force a cut.
+    if max_block is None:
+        max_block = int(n)
     # Next wanted cut at or after each position (BIG when none), then pad the
     # two positions (n-1, n) that have no following cut.
     nc = torch.where(cuts, idx[None, :], big).flip(-1).cummin(-1).values.flip(-1)
@@ -2703,6 +2715,266 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     # cached arange returns exactly last_idx (index transport, §6.1).
     return (comp, last_idx if _ident else order[last_idx], B)
 
+# ---------------------------------------------------------------------------
+# Causal open-block (prefix) representations
+# ---------------------------------------------------------------------------
+# The prefix of the CURRENT (still open) block is a per-query temporary
+# representation: P_t = [s_t, t].  It must never change the dynamic cut table,
+# and every input to it is causal.  In particular we never use the block's
+# final length/end or a position bias computed from the block tail: the block
+# geometry is read from the segmenter's per-token ids, and the only positions
+# used are `u - s_t` for u <= t.
+#
+# `causal_prefix_pool` is the optimized implementation.  It is mathematically
+# the same softmax mixture as the repository's block pooling, but it computes
+# every prefix in one pass with a cumulative sum:
+#
+#   comp_t = (sum_{u in P_t} e_u X_u) / (sum_{u in P_t} e_u),  e_u = exp(z_u)
+#
+# where z_u = Z_u + B_pos_a[u - s_t] (plus the same previous-block overlap
+# lanes the closed block pooling uses, for the full-prefix scope).  The
+# cumulative sums are taken within a block by subtracting the cumulative sum
+# at the prefix start, so no future token enters any row.  A per-query
+# reference implementation lives next to it and the test suite checks forward
+# values and gradients against it.
+
+def _open_block_geometry(bid, n_blocks=None):
+    """Block starts/ends and the per-token in-block offset.
+
+    `bid` is the segmenter's monotone, contiguous block-id row.  The returned
+    integers are exact functions of that row; no block-tail quantity is read.
+    """
+    if bid.dim() != 1:
+        raise ValueError(f'_open_block_geometry expects a 1-D block-id row, got {tuple(bid.shape)}')
+    n = int(bid.numel())
+    if n == 0:
+        z = bid.new_empty((0,))
+        return {'n': 0, 'n_blocks': 0, 'counts': z, 'starts': z, 'ends': z,
+                'start_of_token': z, 'offset': z, 'block_of_token': z}
+    B = int(n_blocks) if n_blocks is not None else int(bid.max().item()) + 1
+    n = int(bid.numel())
+    counts = torch.bincount(bid.reshape(-1).long(), minlength=B)[:B]
+    ends = torch.cumsum(counts, 0)
+    starts = ends - counts
+    start_of_token = starts[bid.long()]
+    offset = _arange_cache(n, bid.device) - start_of_token
+    return {'n': n, 'n_blocks': B, 'counts': counts, 'starts': starts,
+            'ends': ends, 'start_of_token': start_of_token, 'offset': offset,
+            'block_of_token': bid.long()}
+
+
+def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128, window_start=None):
+    """Per-query prefix start/length and the candidate token table.
+
+    Returns a dict with:
+      start_of_token, block_of_token, offset  — block geometry
+      u_start  [T]  first token of the represented prefix (s_t, or max(s_t,
+                    window_start) for `outside_window`)
+      plen     [T]  number of represented tokens (may be 0 outside-window)
+      token_idx [T, P] candidate token ids for `prefix_singletons` (P = max
+                    plen; padded rows are clamped and masked by plen)
+      valid    [T, P] candidate validity (j < plen)
+    """
+    geo = _open_block_geometry(bid, n_blocks=n_blocks)
+    n, B = int(geo['n']), int(geo['n_blocks'])
+    dev = bid.device
+    if n == 0:
+        z = bid.new_empty((0,))
+        return {'u_start': z, 'plen': z, 'token_idx': z[:, None],
+                'valid': torch.zeros((0, 1), dtype=torch.bool, device=dev),
+                **geo}
+    t = _arange_cache(n, dev)
+    s = geo['start_of_token']
+    if str(scope) == 'full_prefix':
+        u_start = s
+        plen = (t - s + 1).clamp_min(0)
+        win_start_t = None
+    elif str(scope) == 'outside_window':
+        if window_start is None:
+            w = int(window)
+            # W_t = [max(0, t-w+1), t]; w <= 0 means no local window, so the
+            # whole prefix is outside it (window start t+1).
+            win_start_t = ((t - w + 1) if w > 0 else (t + 1)).clamp_min(0)
+        else:
+            win_start_t = window_start.to(dev).long()
+        # U_t = P_t \ W_t = [s_t, min(t, window_start-1)].  The represented
+        # prefix ALWAYS starts at the block start; what changes is where it
+        # ends (immediately before the local window), never a suffix inside
+        # the window.
+        u_start = s
+        pend = torch.minimum(t, win_start_t - 1)
+        plen = (pend - s + 1).clamp_min(0)
+    else:
+        raise ValueError(f'unknown open_block_scope {scope!r}')
+    P = int(plen.max().item()) if n else 0
+    # A full-prefix singleton table is [T, P]; for a pathological no-cap block
+    # this can be O(T^2).  Fail explicitly instead of silently exhausting GPU
+    # memory; the panel reports candidate growth and can cap/evaluate in
+    # shorter slices.
+    if n * max(P, 1) > (16 << 20):
+        raise RuntimeError(
+            f'open-block prefix candidate table would be {n}x{P} '
+            f'({n * max(P, 1)} elements); reduce max_block_tokens, use '
+            'prefix_summary instead of prefix_singletons, or evaluate in '
+            'shorter sequence slices')
+    if P <= 0:
+        token_idx = torch.zeros((n, 0), dtype=torch.long, device=dev)
+        valid = torch.zeros((n, 0), dtype=torch.bool, device=dev)
+    else:
+        j = _arange_cache(P, dev)[None, :]
+        token_idx = (u_start[:, None] + j).clamp(max=n - 1)
+        valid = j < plen[:, None]
+    return {'u_start': u_start, 'plen': plen, 'token_idx': token_idx,
+            'valid': valid, 'window_start': win_start_t, **geo}
+
+
+def _prefix_overlap_terms(geo, Xb, Zb, B_pos_b, overlap, shift, use_overlap):
+    """Previous-block overlap lanes for every prefix summary.
+
+    The overlap convention is exactly the closed block pooling's: block b>0
+    carries the last `overlap` tokens of block b-1, whose position bias index
+    is `u - start_{b-1}`.  These tokens are all < s_b <= t, hence causal.
+    The lanes are constant across the prefixes of one block, so they can be
+    folded once into the per-block initial numerator/denominator.
+    """
+    B = int(geo['n_blocks'])
+    dev = geo['starts'].device
+    Fd = int(Zb.shape[1]) if Zb is not None else (int(Xb.shape[1]) if Xb is not None else 0)
+    if (not use_overlap) or int(overlap) <= 0 or B <= 1 or Xb is None or Zb is None:
+        z = geo['starts'].new_zeros((B, Fd), dtype=torch.float32)
+        return z, z.clone(), torch.zeros((B, 0), dtype=torch.long, device=dev)
+    starts, ends = geo['starts'], geo['ends']
+    prev_start = starts[:-1]
+    prev_end = ends[:-1]
+    ov_start_prev = (prev_end - int(overlap)).clamp_min(prev_start)
+    ov_len_prev = (prev_end - ov_start_prev).clamp_min(0)
+    # block 0 has no previous block; the other rows take previous-block values
+    ov_start = torch.cat([starts[:1], ov_start_prev], 0)
+    ov_len = torch.cat([torch.zeros_like(ov_len_prev[:1]), ov_len_prev], 0)
+    prev_start_full = torch.cat([starts[:1], prev_start], 0)
+    Wb = int(ov_len.max().item()) if B else 0
+    if Wb <= 0:
+        z = geo['starts'].new_zeros((B, Fd), dtype=torch.float32)
+        return z, z.clone(), torch.zeros((B, 0), dtype=torch.long, device=dev)
+    j = _arange_cache(Wb, dev)[None, :]
+    mask = j < ov_len[:, None]
+    u = (ov_start[:, None] + j).clamp(max=int(geo['n']) - 1)
+    b_off = (ov_start[:, None] - prev_start_full[:, None] + j).clamp(
+        min=0, max=int(B_pos_b.shape[0]) - 1)
+    z_ov = Zb[u] + B_pos_b[b_off]
+    x_ov = Xb[u]
+    # `shift` is the causal per-block offset (the first A-lane logit).  It
+    # cancels in the normalized mixture and only improves the exponent range.
+    e = torch.exp(z_ov.float() - shift[:, None, :])
+    e = e * mask[:, :, None].to(e.dtype)
+    den = e.sum(1)
+    num = (e * x_ov.float()).sum(1)
+    return den, num, u
+
+
+def causal_prefix_pool(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
+                       *, n_blocks=None, scope='full_prefix', window=128,
+                       window_start=None, use_overlap=True):
+    """Optimized all-query causal prefix pooling (see block comment above).
+
+    Xa/Za are the A-lane content/position projections; Xb/Zb are the
+    previous-block overlap content/position projections (None for HCA).
+    Returns `comp` [T, Fd] whose row t is the pooling of [u_start_t, t] with
+    the same weights and position biases as the closed block pooling.
+    """
+    if Xa.dim() != 2:
+        raise ValueError(f'causal_prefix_pool expects Xa [T, Fd], got {tuple(Xa.shape)}')
+    geo = _open_block_geometry(bid, n_blocks=n_blocks)
+    T = int(geo['n'])
+    Fd = int(Xa.shape[1])
+    if T == 0:
+        return Xa[:0]
+    pg = _open_prefix_geometry(bid, n_blocks=int(geo['n_blocks']), scope=scope,
+                               window=window, window_start=window_start)
+    cap = int(B_pos_a.shape[0])
+    offset = geo['offset'].clamp(max=cap - 1)
+    z_a = Za + B_pos_a[offset]
+    # A causal per-block shift: the first A-lane logit.  It is known at the
+    # block start and cancels exactly in the normalized summary.
+    shift = z_a[geo['starts']].detach().float()
+    e = torch.exp(z_a.float() - shift[geo['block_of_token']])
+    cum_e = torch.cumsum(e, dim=0)
+    cum_x = torch.cumsum(e * Xa.float(), dim=0)
+    # Base = cumulative sum strictly before the prefix start.  For a prefix
+    # that starts at token 0 the base is zero.  The end is the prefix's own
+    # last token (t for full_prefix, immediately before W_t for
+    # outside_window), never the sequence tail.
+    base_idx = (pg['u_start'] - 1).clamp_min(0)
+    end_idx = (pg['u_start'] + pg['plen'] - 1).clamp(0, T - 1)
+    base_e = cum_e.index_select(0, base_idx)
+    base_x = cum_x.index_select(0, base_idx)
+    end_e = cum_e.index_select(0, end_idx)
+    end_x = cum_x.index_select(0, end_idx)
+    has_base = (pg['u_start'] > 0).to(e.dtype)
+    if use_overlap and Zb is not None and Xb is not None:
+        ov_den, ov_num, _ = _prefix_overlap_terms(
+            geo, Xb, Zb, B_pos_b, overlap, shift, True)
+        # outside_window excludes the overlap lanes: they may lie inside the
+        # local window, and the auxiliary scope is defined on U_t only.
+        if str(scope) == 'outside_window':
+            ov_den = torch.zeros_like(ov_den)
+            ov_num = torch.zeros_like(ov_num)
+        ov_den_t = ov_den[geo['block_of_token']]
+        ov_num_t = ov_num[geo['block_of_token']]
+    else:
+        ov_den_t = torch.zeros((T, Fd), device=Xa.device, dtype=torch.float32)
+        ov_num_t = torch.zeros((T, Fd), device=Xa.device, dtype=torch.float32)
+    den = end_e - base_e * has_base[:, None] + ov_den_t
+    num = end_x - base_x * has_base[:, None] + ov_num_t
+    # A prefix can be empty only in the outside_window scope; those rows are
+    # invalid candidates and their value is never read by the attention path.
+    comp = torch.where((pg['plen'] > 0)[:, None], num / den.clamp_min(1e-30),
+                       torch.zeros((), dtype=num.dtype, device=num.device))
+    return comp.to(Xa.dtype)
+
+
+def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
+                                 *, n_blocks=None, scope='full_prefix', window=128,
+                                 window_start=None):
+    """Per-query, numerically stable reference for `causal_prefix_pool`.
+
+    This is deliberately slow and loops over queries; it is the oracle the
+    optimized cumulative-sum form is tested against (forward and gradients).
+    """
+    geo = _open_block_geometry(bid, n_blocks=n_blocks)
+    T = int(geo['n'])
+    Fd = int(Xa.shape[1])
+    out = Xa.new_zeros((T, Fd))
+    if T == 0:
+        return out
+    pg = _open_prefix_geometry(bid, n_blocks=int(geo['n_blocks']), scope=scope,
+                               window=window, window_start=window_start)
+    cap_a = int(B_pos_a.shape[0])
+    cap_b = int(B_pos_b.shape[0])
+    starts = geo['starts'].tolist()
+    counts = geo['counts'].tolist()
+    for tt in range(T):
+        u_start = int(pg['u_start'][tt].item())
+        if int(pg['plen'][tt].item()) <= 0:
+            continue
+        idx = list(range(u_start, u_start + int(pg['plen'][tt].item())))
+        zs = [Za[u].float() + B_pos_a[min(u - int(geo['start_of_token'][tt].item()), cap_a - 1)].float() for u in idx]
+        xs = [Xa[u].float() for u in idx]
+        b = int(geo['block_of_token'][tt].item())
+        if (str(scope) == 'full_prefix' and int(overlap) > 0 and b > 0
+                and Xb is not None and Zb is not None):
+            ps, pend = int(starts[b - 1]), int(starts[b - 1]) + int(counts[b - 1])
+            ovs = max(ps, pend - int(overlap))
+            for u in range(ovs, pend):
+                zs.append(Zb[u].float() + B_pos_b[min(u - ps, cap_b - 1)].float())
+                xs.append(Xb[u].float())
+        zz = torch.stack(zs, 0)
+        xx = torch.stack(xs, 0)
+        w = torch.softmax(zz, dim=0)
+        out[tt] = (w * xx).sum(0).to(Xa.dtype)
+    return out
+
+
 def _rank_blocks(masked, B, ties, k=None):
     # The sort indices are consumed by the int64 gathers below and narrowed
     # to int32 on the kept slice only.  Same integers on every path (index
@@ -3044,6 +3316,117 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
                 _, _ncc = _causal_of(_s, _e)
                 m[_s:_e].masked_fill_(_ncc, 0.0)
     return (m, idx, soft)
+
+
+def lightning_indexer_open(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
+                           prefix_geo, prefix_kv=None, prefix_token_kv=None,
+                           prefix_kind='summary', query_chunk=2048,
+                           pre_qI=None, pre_w=None, need_soft=True):
+    """Indexer selection over `closed blocks ∪ current-prefix candidates`.
+
+    Candidate ids are combined: `0..B-1` are the closed blocks, `B..` are the
+    current-prefix candidates.  Every candidate uses the same q/k/w scoring
+    path; the prefix columns are not given a separate scorer.  `last_tok`
+    retains the strict closed-block rule (`pos > last_tok`), and the prefix
+    columns carry their own causal validity mask, so this function never
+    widens the closed read gate.
+
+    Returns `(idx, sel_valid, soft)`:
+      idx        [T, topk] combined candidate ids (padding marked invalid)
+      sel_valid  [T, topk] bool
+      soft       [T, topk] indexer softmax prior over the selected candidates
+                 (or None when `need_soft=False`)
+    """
+    if prefix_kind not in ('summary', 'singletons'):
+        raise ValueError(f'unknown prefix_kind {prefix_kind!r}')
+    n = int(H.shape[0])
+    B = int(comp_kv.shape[0])
+    dev = H.device
+    if prefix_geo is None:
+        raise ValueError('lightning_indexer_open requires prefix_geo')
+    if prefix_kind == 'summary':
+        P = 1
+        if prefix_kv is None:
+            raise ValueError('prefix_summary needs prefix_kv')
+        pref_valid = (prefix_geo['plen'][:, None] > 0)
+    else:
+        if prefix_token_kv is None:
+            raise ValueError('prefix_singletons needs prefix_token_kv')
+        P = int(prefix_geo['token_idx'].shape[1])
+        pref_valid = prefix_geo['valid']
+    hd = W_DQ.shape[1] // nIH
+    iscale = hd ** (-0.5)
+    if pre_qI is not None:
+        qI = pre_qI.view(n, nIH, hd).transpose(0, 1)
+    else:
+        qI = (H @ W_DQ).view(n, nIH, hd).transpose(0, 1)
+    kI = (comp_kv @ W_DK).view(B, nIH, hd).transpose(0, 1)
+    if pre_w is not None:
+        w_idx = pre_w
+    else:
+        w_idx = F.linear(H, W_w)
+    if prefix_kind == 'summary':
+        kIp = (prefix_kv @ W_DK).view(n, nIH, hd)
+    else:
+        kIt = (prefix_token_kv @ W_DK).view(n, nIH, hd)
+    topk = max(int(topk), 0)
+    q_chunk = max(1, min(int(query_chunk), max(n, 1)))
+    # The singleton gather is [C, P, nIH, hd]; cap it so long contexts use
+    # smaller query chunks instead of materialising a huge candidate table.
+    if P > 0:
+        _per = max(1, int(nIH) * int(P) * int(hd))
+        q_chunk = max(1, min(q_chunk, (16 << 20) // _per))
+    idx = torch.empty((n, topk), dtype=torch.int32, device=dev)
+    soft = None
+    _valid_parts = []
+    _pos = _arange_cache(n, dev)
+    for s in range(0, n, q_chunk):
+        e = min(s + q_chunk, n)
+        q = qI[:, s:e].permute(1, 0, 2)                      # [C, nIH, hd]
+        raw = torch.einsum('cid,ibd->cib', q, kI)
+        raw.mul_(iscale)
+        F.relu(raw, inplace=True)
+        c = torch.einsum('cib,ci->cb', raw, w_idx[s:e])       # [C, B]
+        if P <= 0:
+            scores = c
+            valid = (_pos[s:e, None] > last_tok[None, :])
+        elif prefix_kind == 'summary':
+            kp = kIp[s:e]                                    # [C, nIH, hd]
+            rawp = (q * kp).sum(-1)
+            rawp.mul_(iscale)
+            rawp.relu_()
+            p = (rawp * w_idx[s:e]).sum(-1, keepdim=True)     # [C, 1]
+            scores = torch.cat([c, p], 1)
+            valid = torch.cat([_pos[s:e, None] > last_tok[None, :], pref_valid[s:e]], 1)
+        else:
+            u = prefix_geo['token_idx'][s:e]                  # [C, P]
+            kg = kIt[u]                                      # [C, P, nIH, hd]
+            kg = kg.permute(0, 2, 1, 3)                       # [C, nIH, P, hd]
+            rawp = torch.einsum('cid,cipd->cip', q, kg)
+            rawp.mul_(iscale)
+            F.relu(rawp, inplace=True)
+            p = torch.einsum('cip,ci->cp', rawp, w_idx[s:e])  # [C, P]
+            scores = torch.cat([c, p], 1)
+            valid = torch.cat([_pos[s:e, None] > last_tok[None, :], pref_valid[s:e]], 1)
+        _box = []
+        with torch.no_grad():
+            _ic = _indexer_selection(scores, valid, topk, out_valid=_box)
+        idx[s:e] = _ic
+        _valid_parts.append(_box[0])
+        if need_soft:
+            if soft is None:
+                soft = torch.empty((n, topk), dtype=scores.dtype, device=dev)
+            masked = torch.where(valid, scores, torch.full((), float('-inf'), dtype=scores.dtype, device=dev))
+            lse = torch.logsumexp(masked, dim=-1, keepdim=True)
+            g = masked.gather(1, _ic.long()).sub_(lse).exp_()
+            g = torch.where(_box[0], g, torch.zeros((), dtype=g.dtype, device=dev))
+            soft[s:e] = _safe_nan_to_num(g, where='indexer_softmax_open')
+        del scores, valid, c, raw
+    sel_valid = _valid_parts[0] if len(_valid_parts) == 1 else torch.cat(_valid_parts, 0)
+    if topk <= 0:
+        sel_valid = torch.zeros((n, 0), dtype=torch.bool, device=dev)
+        soft = torch.zeros((n, 0), dtype=H.dtype, device=dev) if need_soft else None
+    return idx, sel_valid, soft
 
 
 def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
@@ -3397,6 +3780,129 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             del soft_attn
     return out
 
+
+def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
+                            k_sw, v_sw, w, scale, *, prefix_geo,
+                            prefix_kind='summary', prefix_k=None, prefix_v=None,
+                            soft=None, sink_logits=None, q_chunk=128,
+                            mem_budget_bytes=None, return_prefix_mass=False):
+    """Gathered attention with per-query prefix candidates.
+
+    `topk_idx` holds combined candidate ids (closed blocks `0..B-1`, prefix
+    candidates `B..`).  Closed rows gather from `k_blk`; prefix rows gather
+    from the per-query summary (`prefix_k`, one row per query) or from the
+    local token table (`k_sw`, for length-1 pooled singletons).  The local
+    window is concatenated exactly as in `gathered_attention`; when the
+    scope is `full_prefix`, a singleton that is also in the window is a
+    deliberate duplicate information path, not a deduplicated read.
+
+    `sel_valid` already encodes the strict closed-block gate and the causal
+    prefix scope, so no future position can be read through the candidate
+    half.  Returns `(out, prefix_mass)`; `prefix_mass` is the mean-over-heads
+    attention mass assigned to prefix candidate slots per query (zero when
+    not requested).
+    """
+    n = int(q.shape[0])
+    B = int(k_blk.shape[0])
+    K = int(topk_idx.shape[1])
+    dev = q.device
+    nh, hd = int(q.shape[1]), int(q.shape[2])
+    if mem_budget_bytes is None:
+        mem_budget_bytes = _attn_transient_budget(dev)
+    if mem_budget_bytes is None:
+        mem_budget_bytes = 256 << 20
+    M = max(1, K + int(w))
+    per_row = 4 * M * nh * hd + 2 * M * nh
+    q_chunk = max(1, min(int(q_chunk), max(1, int(mem_budget_bytes) // max(1, per_row * q.element_size()))))
+    q_chunk = max(1, min(q_chunk, n))
+    win_idx, win_valid_all = _window_geometry(n, int(w), dev)
+    _MINL = _finfo_min(k_blk.dtype)
+    out = torch.empty_like(q)
+    mass = None
+    if return_prefix_mass:
+        mass = q.new_zeros((n,))
+    for s in range(0, n, q_chunk):
+        e = min(s + q_chunk, n)
+        qseg = q[s:e]
+        ids = topk_idx[s:e].long()
+        valid = sel_valid[s:e]
+        is_pref = ids >= B
+        _safe_ids = ids.clamp(0, B - 1)
+        kb = k_blk[_safe_ids]
+        vb = v_blk[_safe_ids]
+        if prefix_kind == 'summary':
+            pk = prefix_k[s:e, None].expand(e - s, K, nh, hd)
+            pv = prefix_v[s:e, None].expand(e - s, K, nh, hd)
+        elif prefix_kind == 'singletons':
+            P = int(prefix_geo['token_idx'].shape[1])
+            if P <= 0:
+                # No represented outside-window token for any query: the
+                # candidate set is exactly the closed set.  `is_pref` is
+                # all-False, so these placeholders are never read.
+                pk = kb
+                pv = vb
+            else:
+                pid = (ids - B).clamp(0, max(P - 1, 0))
+                u = prefix_geo['token_idx'][s:e].gather(1, pid)
+                pk = k_sw[u]
+                pv = v_sw[u]
+        else:
+            raise ValueError(f'unknown prefix_kind {prefix_kind!r}')
+        Kc = torch.where(is_pref[:, :, None, None], pk, kb)
+        Vc = torch.where(is_pref[:, :, None, None], pv, vb)
+        kw = k_sw[win_idx[s:e]]
+        vw = v_sw[win_idx[s:e]]
+        Kall = torch.cat([Kc, kw], 1)
+        Vall = torch.cat([Vc, vw], 1)
+        valid_all = torch.cat([valid, win_valid_all[s:e]], 1)
+        logits = torch.einsum('qhd,qmhd->qhm', qseg, Kall)
+        if scale != 1.0:
+            logits.mul_(scale)
+        # Straight-through indexer prior: its forward contribution cancels
+        # exactly, so a no-grad/forward-only pass can skip it without changing
+        # any output value (the same argument the closed path uses).
+        _soft_live = (soft is not None and torch.is_grad_enabled())
+        attn_soft = None
+        if _soft_live:
+            soft_g = soft[s:e]
+            s_log = torch.log(soft_g.clamp_min(1e-12))
+            s_log.masked_fill_(~valid, _MINL)
+            logits_soft = logits.clone()
+            logits_soft[:, :, :K].add_(s_log[:, None, :])
+            logits_soft.masked_fill_(~valid_all[:, None, :], _MINL)
+            attn_soft, _ = _sink_split_softmax(logits_soft, sink_logits, want_sink=False)
+            del logits_soft, s_log
+        logits.masked_fill_(~valid_all[:, None, :], _MINL)
+        attn, _ = _sink_split_softmax(logits, sink_logits, want_sink=False)
+        if _soft_live:
+            attn = (attn_soft - attn_soft.detach()).add_(attn)
+            del attn_soft
+        if sink_logits is None:
+            anyrow = valid_all.any(-1)
+            attn.mul_(anyrow[:, None, None])
+        if return_prefix_mass:
+            _pm = (attn[:, :, :K] * is_pref[:, None, :].to(attn.dtype)).sum(-1).mean(-1)
+            mass[s:e] = _pm
+        out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vall)
+        del Kall, Vall, Kc, Vc, kw, vw, kb, vb, pk, pv, logits, attn, valid_all
+    return (out, mass) if return_prefix_mass else (out, None)
+
+
+def _gathered_attention_open_trainable(*args, **kwargs):
+    """Checkpoint wrapper for the open-block attention implementation."""
+    if torch.is_grad_enabled() and args[0].requires_grad:
+        q = args[0]
+        if q.device.type != 'cuda':
+            _M = int(args[3].shape[1]) + int(args[8])
+            _saved = 2 * int(q.numel()) * max(1, _M) * int(q.element_size()) * int(_CPU_ACTIVE_BATCH[0])
+            if _cpu_saved_ok(_saved, _CPU_GATHER_CKPT_BYTES):
+                return gathered_attention_open(*args, **kwargs)
+        return torch.utils.checkpoint.checkpoint(
+            gathered_attention_open, *args, use_reentrant=False,
+            preserve_rng_state=False, **kwargs)
+    return gathered_attention_open(*args, **kwargs)
+
+
 _CPU_ACTIVE_BATCH = [1]
 _CPU_GATHER_CKPT_BYTES = 512 << 20
 _CPU_POOL_CKPT_BYTES = 64 << 20
@@ -3434,6 +3940,11 @@ def _pool_trainable(fn, *args, **kwargs):
         return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False, preserve_rng_state=False, **kwargs)
     return fn(*args, **kwargs)
 
+OPEN_BLOCK_MODES = ('closed', 'prefix_summary', 'prefix_singletons')
+OPEN_BLOCK_SCOPES = ('full_prefix', 'outside_window')
+SELECTION_BUDGETS = ('shared_topk', 'all_closed_plus_prefix')
+POOL_POSITION_POLICIES = ('truncate',)
+
 @dataclass
 class AttnCfg:
     kind: str = 'csa'
@@ -3447,7 +3958,24 @@ class AttnCfg:
     target_block_tokens: int = 16
     temperature: float = 0.1
     min_block: int = 2
-    max_block: int = 128
+    # `max_block=None` means "dynamic boundaries only": no forced cut is
+    # introduced by a maximum length.  The segmenters convert it to an
+    # explicit safe bound (the current sequence length) at their entry
+    # points; it is never a hidden large constant.
+    max_block: int | None = 128
+    # Position-embedding table capacity is deliberately independent of
+    # `max_block`: every arm of the open-block panel can share the same
+    # parameters while the maximum block length varies.  Out-of-range
+    # positions are handled by `pool_position_policy` (currently `truncate`).
+    pool_position_capacity: int = 129
+    pool_position_policy: str = 'truncate'
+    # Open-block reading rule.  `closed` is the historical behaviour: only
+    # blocks whose end is strictly before the query are readable.  The two
+    # prefix modes add a causal representation of the current (still open)
+    # block to the candidate set without changing the dynamic cut table.
+    open_block_mode: str = 'closed'
+    open_block_scope: str = 'full_prefix'
+    selection_budget: str = 'shared_topk'
     sliding_window: int = 128
     c_kv: int = 128
     c_index: int = 64
@@ -3467,6 +3995,54 @@ class AttnCfg:
     # only the compression-rate regularizer (review 3 issue 6).
     boundary_policy: str = 'threshold'
 
+    def __post_init__(self):
+        if self.open_block_mode not in OPEN_BLOCK_MODES:
+            raise ValueError(f'unknown open_block_mode {self.open_block_mode!r}; expected one of {OPEN_BLOCK_MODES}')
+        if self.open_block_scope not in OPEN_BLOCK_SCOPES:
+            raise ValueError(f'unknown open_block_scope {self.open_block_scope!r}; expected one of {OPEN_BLOCK_SCOPES}')
+        if self.selection_budget not in SELECTION_BUDGETS:
+            raise ValueError(f'unknown selection_budget {self.selection_budget!r}; expected one of {SELECTION_BUDGETS}')
+        if self.pool_position_policy not in POOL_POSITION_POLICIES:
+            raise ValueError(f'unknown pool_position_policy {self.pool_position_policy!r}; expected one of {POOL_POSITION_POLICIES}')
+        if int(self.pool_position_capacity) < 1:
+            raise ValueError(f'pool_position_capacity must be >= 1, got {self.pool_position_capacity!r}')
+        if self.max_block is not None:
+            if int(self.max_block) < 1:
+                raise ValueError(f'max_block must be None or >= 1, got {self.max_block!r}')
+            if int(self.max_block) < int(self.min_block):
+                raise ValueError(f'max_block={self.max_block} is smaller than min_block={self.min_block}')
+        if self.open_block_mode != 'closed':
+            if self.kind not in ('csa', 'hca'):
+                raise ValueError(f'open_block_mode={self.open_block_mode!r} is only defined for csa/hca layers, not {self.kind!r}')
+            if self.kind == 'hca' and self.selection_budget == 'shared_topk':
+                # HCA reads every closed block (no top-k), so a "shared top-k"
+                # budget is not the rule it implements.  Make the extra-read
+                # budget explicit rather than silently pretending the two
+                # arms have the same number of slots.
+                raise ValueError('open_block_mode on an hca layer requires selection_budget="all_closed_plus_prefix": HCA reads every closed block and has no top-k budget to share; an extra prefix candidate is an ADDITIONAL read slot')
+            if self.kind == 'csa' and self.selection_budget != 'shared_topk':
+                raise ValueError(f'csa open-block layers implement selection_budget="shared_topk"; got {self.selection_budget!r}')
+
+    def max_block_bound(self, seq_len=None):
+        """Explicit safe maximum block length for the segmenters.
+
+        ``None`` is not passed into integer arithmetic: at a call site with a
+        known sequence length it becomes that length (which can never force a
+        cut), so "no maximum" is a real configuration rather than a hidden
+        fixed constant.
+        """
+        if self.max_block is not None:
+            return int(self.max_block)
+        if seq_len is None:
+            raise ValueError('max_block=None needs the sequence length to derive its explicit safe bound')
+        return int(seq_len)
+
+    def position_capacity(self):
+        return int(self.pool_position_capacity)
+
+    def position_policy(self):
+        return str(self.pool_position_policy)
+
 class HybridAttention(nn.Module):
 
     def __init__(self, d_model, n_heads, d_head, cfg: AttnCfg):
@@ -3483,6 +4059,7 @@ class HybridAttention(nn.Module):
         self.last_boundary_decisions = 0
         self.need_reg = True
         self._stats = None
+        self._prefix_stats = None
         self._cuts = None
         self.fuse_conv = None
         # Fused-weight cache (eval-only): the gateway is `not
@@ -3516,7 +4093,7 @@ class HybridAttention(nn.Module):
             self.W_bKV = None
             self.W_bZ = None
             self.W_aZ = nn.Parameter(torch.empty(d_model, self.kv_dim))
-            self.B_pos_a = nn.Parameter(torch.zeros(int(cfg.max_block) + 1, self.kv_dim))
+            self.B_pos_a = nn.Parameter(torch.zeros(int(cfg.position_capacity()), self.kv_dim))
             self.sink = nn.Parameter(torch.zeros(n_heads)) if getattr(cfg, 'use_sink', True) else None
             nn.init.xavier_uniform_(self.W_aZ)
             if cfg.chunking == 'cosine_learnable':
@@ -3529,8 +4106,8 @@ class HybridAttention(nn.Module):
         self.W_bKV = nn.Parameter(torch.empty(d_model, self.kv_dim))
         self.W_aZ = nn.Parameter(torch.empty(d_model, self.kv_dim))
         self.W_bZ = nn.Parameter(torch.empty(d_model, self.kv_dim))
-        self.B_pos_a = nn.Parameter(torch.zeros(int(cfg.max_block) + 1, self.kv_dim))
-        self.B_pos_b = nn.Parameter(torch.zeros(int(cfg.max_block) + 1, self.kv_dim))
+        self.B_pos_a = nn.Parameter(torch.zeros(int(cfg.position_capacity()), self.kv_dim))
+        self.B_pos_b = nn.Parameter(torch.zeros(int(cfg.position_capacity()), self.kv_dim))
         self.sink = nn.Parameter(torch.zeros(n_heads)) if getattr(cfg, 'use_sink', True) else None
         self.W_DQ = nn.Parameter(torch.empty(d_model, cfg.c_index))
         self.W_DK = nn.Parameter(torch.empty(self.kv_dim, cfg.c_index))
@@ -3845,6 +4422,7 @@ class HybridAttention(nn.Module):
         else:
             Cb_raw = x @ self.W_bKV if self.W_bKV is not None else None
         gate_mean = None
+        _seg_cuts = None
         if cfg.chunking == 'cosine_learnable':
             if gate_sig is not None:
                 gate, gate_list = gate_sig[0], gate_sig[1]
@@ -3896,6 +4474,7 @@ class HybridAttention(nn.Module):
                         if 0 <= _slot < len(_keep):
                             _keep[_slot] = 1.0
                     _hon_dev = _h2d_async(_keep, gate.dtype, gate.device)
+            _seg_cuts = gate_list
             if gate.numel() and self.need_reg:
                 if _hon_dev.dtype != gate.dtype:
                     _hon_dev = _hon_dev.to(gate.dtype)
@@ -3926,6 +4505,37 @@ class HybridAttention(nn.Module):
             comp_kv, last_tok, Bn = _pool_trainable(pool_blocks_single, Ca_raw, Za, self.B_pos_a, bid, n_blocks=nblk, monotonic=True)
         else:
             comp_kv, last_tok, Bn = _pool_trainable(pool_variable_blocks, Ca_raw, Cb_raw, Za, Zb, bid, self.B_pos_a, self.B_pos_b, cfg.overlap, n_blocks=nblk, monotonic=True)
+        # Open-block (current-prefix) representations.  These are computed
+        # from x_{<=t} only and never modify `bid`; the closed block table
+        # above is unchanged.  The candidate is a temporary representation of
+        # the current block for THIS query, not a future block summary.
+        _open_mode = cfg.open_block_mode
+        _prefix_geo = None
+        _prefix_comp = None
+        _prefix_kind = None
+        if _open_mode != 'closed':
+            _scope = cfg.open_block_scope
+            _prefix_geo = _open_prefix_geometry(
+                bid, n_blocks=int(nblk), scope=_scope, window=cfg.sliding_window)
+            if _open_mode == 'prefix_summary':
+                _prefix_comp = causal_prefix_pool(
+                    Ca_raw, (Cb_raw if cfg.kind == 'csa' else None), Za,
+                    (Zb if cfg.kind == 'csa' else None), bid,
+                    self.B_pos_a, (self.B_pos_b if cfg.kind == 'csa' else None),
+                    cfg.overlap, n_blocks=int(nblk), scope=_scope,
+                    window=cfg.sliding_window,
+                    use_overlap=(cfg.kind == 'csa' and _scope == 'full_prefix'))
+                _prefix_kind = 'summary'
+            elif _open_mode == 'prefix_singletons':
+                # A length-1 block through the same pooling path: with one A
+                # lane the softmax is exactly 1 and no position bias survives,
+                # so the pooled value is Ca_raw[u] (a projection of the token,
+                # NOT the raw token K/V).  The K/V table is the existing
+                # local-token table; the candidate ids still go through the
+                # same indexer/scoring path as every other candidate.
+                _prefix_kind = 'singletons'
+            else:
+                raise ValueError(f'unknown open_block_mode {_open_mode!r}')
         index_kv = comp_kv
         if self._stats is not None:
             # scatter_add of exact integer ones is order-independent (integer
@@ -3933,6 +4543,7 @@ class HybridAttention(nn.Module):
             # (no atomics) and returns the same exact integer counts.
             _bc = torch.bincount(bid.reshape(-1).long(), minlength=int(nblk))[:int(nblk)]
             self._stats.append(_bc)
+            self._stats.add_segmentation(bid, _seg_cuts, cfg.max_block)
             if self._cuts is not None:
                 _cpu = getattr(bid, '_pool_cpu', None)
                 if _cpu is not None and sum(_cpu[0]) == T:
@@ -3980,30 +4591,77 @@ class HybridAttention(nn.Module):
             k_stacked = None
             k_blk = F.normalize(k_blk, dim=-1)
             k_sw = F.normalize(k_sw, dim=-1)
+        _prefix_k = _prefix_v = None
+        if _prefix_comp is not None:
+            _pcore = (torch.zeros_like(_prefix_comp) if cfg.content_mode == 'zero'
+                      else F.normalize(_prefix_comp, dim=-1))
+            _pk, _pv = self._split(self.W_kvhead(_pcore))
+            _prefix_k = F.normalize(_pk, dim=-1)
+            _prefix_v = _pv
+        _prefix_mass = None
         if cfg.kind == 'hca':
-            # cached int32 expansion — the same exact integers as the int64
-            # arange expand narrowed to int32 (index transport, §6.1).  Every
-            # row of the arange expansion holds distinct block ids, so the
-            # first-occurrence dedup inside gathered_attention is provably the
-            # all-True mask and is skipped (identical keep mask).
-            topk_idx = _arange_exp_cache(T, Bn, x.device)
-            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None, topk_distinct=True, v_stacked=v_stacked, k_stacked=k_stacked)
+            if _open_mode == 'closed':
+                # cached int32 expansion — the same exact integers as the int64
+                # arange expand narrowed to int32 (index transport, §6.1).  Every
+                # row of the arange expansion holds distinct block ids, so the
+                # first-occurrence dedup inside gathered_attention is provably the
+                # all-True mask and is skipped (identical keep mask).
+                topk_idx = _arange_exp_cache(T, Bn, x.device)
+                out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, sink_logits=self.sink if cfg.use_sink else None, topk_distinct=True, v_stacked=v_stacked, k_stacked=k_stacked)
+            else:
+                # HCA has no top-k: every closed block is read.  Adding a
+                # prefix candidate is an ADDITIONAL read slot; the config
+                # validation refuses to label this `shared_topk`.  The main
+                # open-block panel uses CSA layers so the three arms share a
+                # fixed top-k budget.
+                _P = 1 if _prefix_kind == 'summary' else int(_prefix_geo['token_idx'].shape[1])
+                _tot = int(Bn) + int(_P)
+                topk_idx = _arange_cache(_tot, x.device)[None, :].expand(T, _tot).to(torch.int32)
+                _sel_valid = torch.ones((T, _tot), dtype=torch.bool, device=x.device)
+                out, _prefix_mass = _gathered_attention_open_trainable(
+                    q, k_blk, v_blk, topk_idx, _sel_valid, last_tok, k_sw, v_sw,
+                    cfg.sliding_window, scale, prefix_geo=_prefix_geo,
+                    prefix_kind=_prefix_kind, prefix_k=_prefix_k, prefix_v=_prefix_v,
+                    sink_logits=self.sink if cfg.use_sink else None,
+                    return_prefix_mass=(self._prefix_stats is not None))
         else:
             topk = cfg.index_topk
-            _sel_valid_box = []
-            # 无梯度（评估）时 gathered_attention 的 soft 直通分支整体是死
-            # 的（_soft_live=False 见其注释），索引器据此不物化 soft 尾部，
-            # 并以 soft_form=True 固定走软分支的硬部分解——两者前向 bit 与
-            # 传入 soft 的形式完全一致。有梯度时条件为 False，走传入 soft
-            # 的完整图。
             _need_soft = torch.is_grad_enabled()
-            _, topk_idx, soft = _indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=None, need_soft=_need_soft)
-            # _indexer_selection 的 top-k 是无放回选择：有效槽位的块 id 逐行互不
-            # 相同（order 是列排列、kept 落在互异的 cumsum 秩列上），pad 槽位的
-            # 重复块 0 已被 sel_valid 置无效。故 gathered_attention 的
-            # first_occurrence 去重掩码恒为全真，直接声明 topk_distinct 跳过它
-            # （keep 掩码与逐位计算结果一致，下游取值不变）。
-            out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], topk_distinct=True, soft_form=True, v_stacked=v_stacked, k_stacked=k_stacked)
+            if _open_mode == 'closed':
+                _sel_valid_box = []
+                # 无梯度（评估）时 gathered_attention 的 soft 直通分支整体是死
+                # 的（_soft_live=False 见其注释），索引器据此不物化 soft 尾部，
+                # 并以 soft_form=True 固定走软分支的硬部分解——两者前向 bit 与
+                # 传入 soft 的形式完全一致。有梯度时条件为 False，走传入 soft
+                # 的完整图。
+                _, topk_idx, soft = _indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=None, need_soft=_need_soft)
+                # _indexer_selection 的 top-k 是无放回选择：有效槽位的块 id 逐行互不
+                # 相同（order 是列排列、kept 落在互异的 cumsum 秩列上），pad 槽位的
+                # 重复块 0 已被 sel_valid 置无效。故 gathered_attention 的
+                # first_occurrence 去重掩码恒为全真，直接声明 topk_distinct 跳过它
+                # （keep 掩码与逐位计算结果一致，下游取值不变）。
+                out = _gathered_attention_trainable(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, cfg.sliding_window, scale, soft=soft, sink_logits=self.sink if cfg.use_sink else None, sel_valid=_sel_valid_box[0], topk_distinct=True, soft_form=True, v_stacked=v_stacked, k_stacked=k_stacked)
+            else:
+                if cfg.indexer_mode != 'learned':
+                    raise RuntimeError('open_block_mode requires the learned indexer: the random indexer has no comparable candidate score for the prefix path')
+                topk_idx, _sel_valid, soft = lightning_indexer_open(
+                    x, index_kv, last_tok, self.W_DQ, self.W_DK,
+                    self.W_w.weight, cfg.n_index_heads, topk,
+                    prefix_geo=_prefix_geo, prefix_kv=_prefix_comp,
+                    prefix_token_kv=Ca_raw, prefix_kind=_prefix_kind,
+                    pre_qI=pre['qI'] if pre is not None else None,
+                    pre_w=pre['w_idx'] if pre is not None else None,
+                    need_soft=_need_soft)
+                out, _prefix_mass = _gathered_attention_open_trainable(
+                    q, k_blk, v_blk, topk_idx, _sel_valid, last_tok, k_sw, v_sw,
+                    cfg.sliding_window, scale, prefix_geo=_prefix_geo,
+                    prefix_kind=_prefix_kind, prefix_k=_prefix_k, prefix_v=_prefix_v,
+                    soft=soft, sink_logits=self.sink if cfg.use_sink else None,
+                    return_prefix_mass=(self._prefix_stats is not None))
+        if _open_mode != 'closed' and self._prefix_stats is not None:
+            self._prefix_stats.append_from_layer(
+                _prefix_geo, T, topk_idx, _sel_valid, self.cfg,
+                prefix_mass=_prefix_mass, closed_blocks=int(Bn))
         return (self.W_o(out.reshape(T, self.nh * self.hd)), gate_mean)
 
     def forward(self, x):
@@ -4020,16 +4678,43 @@ class HybridAttention(nn.Module):
             return self._full_batched(x)
         flat = x.reshape(B * T, d)
         pre_flat = self._pre(flat, fuse_x=x)
+        _open_mode = getattr(self.cfg, 'open_block_mode', 'closed')
         _kernel_path = _CK is not None and self.cfg.kind in ('csa', 'hca') and _CK.kernel_enabled()
+        if _kernel_path and _open_mode != 'closed':
+            raise RuntimeError(
+                'CSA_KERNEL does not implement open_block_mode != "closed"; '
+                'the prefix candidate construction and its mask are only '
+                'implemented in the eager reference path.  Unset CSA_KERNEL '
+                'for open-block arms rather than silently running a different '
+                'read rule.')
+        if _kernel_path and getattr(self.cfg, 'max_block', 128) is None:
+            raise RuntimeError(
+                'CSA_KERNEL requires an explicit max_block; the no-cap '
+                'configuration is supported only by the eager segmenter. '
+                'Unset CSA_KERNEL for the max_block=None arms.')
+        if _kernel_path and (int(getattr(self.cfg, 'max_block', 128)) != 128
+                             or int(getattr(self.cfg, 'position_capacity', lambda: 129)()) != 129):
+            raise RuntimeError(
+                'CSA_KERNEL was written for the default (max_block=128, '
+                'pool_position_capacity=129) geometry; its pool-geometry '
+                'cache keys on max_block and would not carry the decoupled '
+                'position capacity.  Unset CSA_KERNEL for the open-block '
+                'panel (all arms use the eager row path).')
         # Batched eager path: the reference twin consumes [B, T, ...] and
         # issues batch GEMMs.  It is the default for B > 1 on CUDA (values
         # follow the declared reference-backend tolerance, not the eager
         # bitwise contract); CSA_EAGER_BATCH=0 restores the row loop.
+        # Open-block arms force the row path: the twin's per-query prefix
+        # construction has not been mirrored there, and mixing implementations
+        # inside one panel would confound the read rule with the backend.
         _eager_batch = (_CK is not None and not _kernel_path
                         and x.device.type == 'cuda' and B > 1
                         and self.cfg.kind in ('csa', 'hca')
                         and self.cfg.fuse_mode == 'none'
                         and self.cfg.indexer_mode == 'learned'
+                        and _open_mode == 'closed'
+                        and int(getattr(self.cfg, 'max_block', 128) or 0) == 128
+                        and int(getattr(self.cfg, 'position_capacity', lambda: 129)()) == 129
                         and _eager_batch_active(x.device, B))
         _batch_path = _kernel_path or _eager_batch
         pre_all = None
@@ -4348,7 +5033,52 @@ class SmallGPT(nn.Module):
 OVERLAP = 8
 _WARM_KEY_RE = re.compile('.*::w(\\d+)::seed\\d+$')
 
+# Open-block panel variant names.  The maximum block length and the reading
+# rule are the two experimental factors; everything else is the frozen
+# csa_dynamic recipe.  `_ow` is the auxiliary outside-window scope (U_t).
+OPEN_BLOCK_MAX_VALUES = (32, 64, 128, None)
+OPEN_BLOCK_MODES_SHORT = ('closed', 'summary', 'singletons')
+_OPEN_VARIANT_RE = re.compile(r'^csa_dynamic_mb(32|64|128|none)_(closed|summary|singletons)(_ow)?$')
+
+
+def open_block_variant_name(max_block, mode, scope='full_prefix'):
+    """Canonical variant name for one cell of the open-block matrix."""
+    if mode not in OPEN_BLOCK_MODES_SHORT:
+        raise ValueError(f'unknown open-block mode {mode!r}; expected {OPEN_BLOCK_MODES_SHORT}')
+    mb = 'none' if max_block is None else str(int(max_block))
+    if max_block is not None and int(max_block) not in (32, 64, 128):
+        raise ValueError(f'unsupported max_block {max_block!r} for the open-block variant names')
+    if scope not in OPEN_BLOCK_SCOPES:
+        raise ValueError(f'unknown scope {scope!r}')
+    return f'csa_dynamic_mb{mb}_{mode}' + ('_ow' if scope == 'outside_window' else '')
+
+
+def open_block_variants(max_values=OPEN_BLOCK_MAX_VALUES, modes=OPEN_BLOCK_MODES_SHORT,
+                        scope='full_prefix'):
+    return [open_block_variant_name(mb, mode, scope) for mb in max_values for mode in modes]
+
+
+def _open_variant_cfg(variant):
+    m = _OPEN_VARIANT_RE.match(str(variant))
+    if m is None:
+        return None
+    mb = None if m.group(1) == 'none' else int(m.group(1))
+    short = m.group(2)
+    mode = {'closed': 'closed', 'summary': 'prefix_summary',
+            'singletons': 'prefix_singletons'}[short]
+    scope = 'outside_window' if m.group(3) else 'full_prefix'
+    return AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable',
+                   target_block_tokens=4, overlap=OVERLAP, index_topk=32,
+                   temperature=0.1, min_block=2, max_block=mb,
+                   pool_position_capacity=129, pool_position_policy='truncate',
+                   open_block_mode=mode, open_block_scope=scope,
+                   selection_budget='shared_topk')
+
+
 def make_layer_cfgs(n_layers, variant):
+    _open_cfg = _open_variant_cfg(variant)
+    if _open_cfg is not None:
+        return [copy.deepcopy(_open_cfg) for _ in range(int(n_layers))]
     cfgs = []
     for i in range(n_layers):
         if variant == 'full':
@@ -6829,6 +7559,42 @@ def kv_cache_elements_per_token(m):
         total += int(n)
     return {'elements_per_token_total': int(total), 'per_layer': per_layer,
             'note': 'elements, not bytes; multiply by dtype size and add allocator/block overhead for measured memory'}
+
+def open_block_config(m):
+    """Machine-readable descriptor of every layer's read rule.
+
+    This is part of the record metadata (and the checkpoint payload).  It
+    pins the two experimental factors — maximum block length and open-block
+    reading rule — together with the position-capacity policy that is held
+    constant across arms, so a report cannot mix a record from one panel with
+    another panel's settings.
+    """
+    rows = []
+    for li, blk in enumerate(getattr(m, 'blocks', []) or []):
+        cfg = getattr(blk, 'attn', None)
+        cfg = getattr(cfg, 'cfg', None) if cfg is not None else None
+        if cfg is None:
+            continue
+        rows.append({
+            'layer': int(li),
+            'kind': str(getattr(cfg, 'kind', '')),
+            'max_block': getattr(cfg, 'max_block', None),
+            'pool_position_capacity': int(cfg.position_capacity()) if hasattr(cfg, 'position_capacity') else None,
+            'pool_position_policy': getattr(cfg, 'pool_position_policy', None),
+            'open_block_mode': getattr(cfg, 'open_block_mode', 'closed'),
+            'open_block_scope': getattr(cfg, 'open_block_scope', 'full_prefix'),
+            'selection_budget': getattr(cfg, 'selection_budget', 'shared_topk'),
+            'sliding_window': int(getattr(cfg, 'sliding_window', 0) or 0),
+            'index_topk': int(getattr(cfg, 'index_topk', 0) or 0),
+            'overlap': int(getattr(cfg, 'overlap', 0) or 0),
+        })
+    blob = json.dumps(rows, sort_keys=True, separators=(',', ':'))
+    return {'layers': rows,
+            'all_closed_default': all(r['open_block_mode'] == 'closed'
+                                      and r['max_block'] == 128
+                                      and r['pool_position_capacity'] == 129
+                                      for r in rows),
+            'fingerprint': hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]}
 
 def train_objective(m, *, comp_lambda=0.0, delta_lr_mult=1.0):
     """Describe the ACTUAL optimisation objective of an arm.
@@ -11830,6 +12596,127 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
         _out['compression'] = _compression_out
     return _out
 
+class _PrefixStats:
+    """Diagnostics for the open-block (current-prefix) reading path.
+
+    Accumulates per-query quantities only when the caller enables block stats
+    (the validation/eval report), so training keeps its fast path.  Nothing
+    here is a loss term or a model input.
+    """
+
+    def __init__(self):
+        self.n_tok = 0
+        self.n_seq = 0
+        self.age_sum = 0.0
+        self.age_max = 0
+        self.age_p95 = []
+        self.outside_len_sum = 0.0
+        self.outside_nonzero = 0
+        self.prefix_len_sum = 0.0
+        self.pos_truncated = 0
+        self.pref_valid = 0
+        self.pref_selected = 0
+        self.closed_selected = 0
+        self.slots = 0
+        self.history_displaced = 0.0
+        self.candidate_sum = 0
+        self.selected_sum = 0
+        self.prefix_mass_sum = 0.0
+        self.prefix_mass_n = 0
+        self.selected_rows = 0
+
+    def snapshot(self):
+        d = dict(self.__dict__)
+        d['age_p95'] = list(self.age_p95)
+        return d
+
+    def append_from_layer(self, geo, T, topk_idx, sel_valid, cfg, prefix_mass=None, closed_blocks=0):
+        if geo is None or T <= 0:
+            return
+        try:
+            t = torch.arange(T, device=geo['offset'].device)
+            age = geo['offset'] + 1
+            w = int(getattr(cfg, 'sliding_window', 0) or 0)
+            # W_t = [max(0, t-w+1), t]; w<=0 means no window, so the whole
+            # prefix lies outside it.  U_t length = |[s_t, window_start-1]|.
+            w_start = (t - w + 1).clamp_min(0) if w > 0 else (t + 1)
+            outside_len = (w_start - geo['start_of_token']).clamp_min(0)
+            cap = int(cfg.position_capacity())
+            pos_trunc = (geo['offset'] >= cap)
+            pref_valid = (geo['valid'] if geo['valid'].ndim == 2 else (geo['plen'][:, None] > 0))
+            k = int(topk_idx.shape[1])
+            is_pref = topk_idx.long() >= int(closed_blocks)
+            pref_sel = (sel_valid & is_pref).sum(1)
+            closed_sel = (sel_valid & ~is_pref).sum(1)
+            # A closed-only top-k would fill min(k, readable_closed) slots.
+            ends = geo['ends']
+            readable_closed = torch.searchsorted(ends, t, right=True)
+            displaced = (torch.minimum(torch.as_tensor(k, device=t.device),
+                                       readable_closed) - closed_sel).clamp_min(0)
+            self.n_tok += int(T)
+            self.n_seq += 1
+            self.age_sum += float(age.sum().item())
+            self.age_max = max(self.age_max, int(age.max().item()))
+            self.age_p95.append(age.detach().cpu())
+            self.outside_len_sum += float(outside_len.sum().item())
+            self.outside_nonzero += int((outside_len > 0).sum().item())
+            self.prefix_len_sum += float(geo['plen'].sum().item())
+            self.pos_truncated += int(pos_trunc.sum().item())
+            self.pref_valid += int(pref_valid.sum().item())
+            self.pref_selected += int(pref_sel.sum().item())
+            self.closed_selected += int(closed_sel.sum().item())
+            self.slots += int(sel_valid.numel())
+            self.candidate_sum += int(int(closed_blocks) + int(geo['token_idx'].shape[1])) * int(T)
+            self.selected_sum += int(pref_sel.sum().item()) + int(closed_sel.sum().item())
+            self.history_displaced += float(displaced.sum().item())
+            self.selected_rows += int((pref_sel > 0).sum().item())
+            if prefix_mass is not None:
+                pm = prefix_mass.detach().float()
+                self.prefix_mass_sum += float(pm.sum().item())
+                self.prefix_mass_n += int(pm.numel())
+        except Exception:
+            # Diagnostics must never take down a training/eval run.
+            return
+
+    def summary(self, seq_len=None):
+        if self.n_tok <= 0:
+            return None
+        try:
+            flat = torch.cat([x.reshape(-1) for x in self.age_p95]) if self.age_p95 else torch.empty(0)
+            p95 = float(torch.quantile(flat.float(), 0.95).item()) if flat.numel() else None
+            p50 = float(torch.quantile(flat.float(), 0.50).item()) if flat.numel() else None
+        except Exception:
+            p95 = p50 = None
+        return {
+            'n_tokens': int(self.n_tok),
+            'n_sequences': int(self.n_seq),
+            'prefix_age_mean': self.age_sum / self.n_tok,
+            'prefix_age_p50': p50,
+            'prefix_age_p95': p95,
+            'prefix_age_max': int(self.age_max),
+            'outside_window_len_mean': self.outside_len_sum / self.n_tok,
+            'outside_window_nonzero_frac': self.outside_nonzero / self.n_tok,
+            'prefix_len_mean': self.prefix_len_sum / self.n_tok,
+            'position_truncated_frac': self.pos_truncated / self.n_tok,
+            'prefix_valid_candidates_mean': self.pref_valid / self.n_tok,
+            'prefix_selected_rate': self.pref_selected / max(self.slots, 1),
+            'prefix_selected_any_rate': self.selected_rows / self.n_tok,
+            'closed_selected_mean': self.closed_selected / self.n_tok,
+            'selected_mean': self.selected_sum / self.n_tok,
+            'candidates_mean': self.candidate_sum / self.n_tok,
+            'unused_slots_mean': (self.slots - self.selected_sum) / self.n_tok,
+            'history_displaced_mean': self.history_displaced / self.n_tok,
+            'prefix_attention_mass_mean': (self.prefix_mass_sum / self.prefix_mass_n) if self.prefix_mass_n else None,
+            'slots': int(self.slots),
+        }
+
+
+def prefix_stats_summary(attn, seq_len=None):
+    st = getattr(attn, '_prefix_stats', None)
+    if isinstance(st, _PrefixStats):
+        return st.summary(seq_len)
+    return None
+
 class _BlockStats:
     """Incremental replacement for the per-sequence bincount list.
 
@@ -11839,9 +12726,18 @@ class _BlockStats:
     pooled statistics are at least as accurate as the concatenated float32
     form."""
 
-    def __init__(self, min_block=None, max_block=None):
+    def __init__(self, min_block=None, max_block=None, position_capacity=None):
         self.min_block = min_block
         self.max_block = max_block
+        self.position_capacity = position_capacity
+        self.pos_truncated_tokens = 0
+        self.pos_truncated_blocks = 0
+        self.forced_only = 0
+        self.natural_only = 0
+        self.forced_and_natural = 0
+        self.forced_total = 0
+        self.natural_total = 0
+        self._lens = []
         self.n = 0
         self.total = 0
         self.blocks = 0
@@ -11857,6 +12753,7 @@ class _BlockStats:
     def snapshot(self):
         d = dict(self.__dict__)
         d['_pending'] = list(self._pending)
+        d['_lens'] = list(self._lens)
         return d
 
     def _add(self, a, n_items=1):
@@ -11868,12 +12765,63 @@ class _BlockStats:
         self.total += int(a.size)
         self.s += float(a.sum())
         self.ss += float(np.square(a).sum())
+        self._lens.append(a.copy())
         self.lo = float(a.min()) if self.lo is None else min(self.lo, float(a.min()))
         self.hi = float(a.max()) if self.hi is None else max(self.hi, float(a.max()))
         if self.min_block is not None:
             self.at_min += int((a <= self.min_block).sum())
         if self.max_block is not None:
             self.at_max += int((a >= self.max_block).sum())
+        if self.position_capacity is not None:
+            _cap = int(self.position_capacity)
+            self.pos_truncated_tokens += int(np.maximum(a - (_cap - 1), 0).sum())
+            self.pos_truncated_blocks += int((a >= _cap).sum())
+
+    def add_segmentation(self, bid, gate_cuts, max_block):
+        """Count forced vs natural (and both) non-tail block ends.
+
+        `gate_cuts` is the segmenter's boolean cut row (length n-1).  A block
+        end `end < n` is natural when a cut was wanted at `end-1`; it is
+        forced when `max_block` is set and the block length equals it.  The
+        two categories can overlap.  Only the main dynamic path supplies a
+        cut row; callers that cannot distinguish the cause leave these
+        counters untouched rather than guessing.
+        """
+        if gate_cuts is None or bid is None:
+            return
+        try:
+            b = bid.detach() if torch.is_tensor(bid) else torch.as_tensor(bid)
+            B = int(b.max().item()) + 1 if b.numel() else 0
+            if B <= 0:
+                return
+            counts = torch.bincount(b.reshape(-1).long(), minlength=B)[:B]
+            ends = torch.cumsum(counts, 0)
+            g = gate_cuts
+            if not torch.is_tensor(g):
+                g = torch.as_tensor(g)
+            g = g.reshape(-1).to(torch.bool)
+            n = int(b.numel())
+            non_tail = ends < n
+            if int(ends.max().item()) > 0:
+                idx = (ends - 1).clamp(0, max(n - 2, 0))
+                natural = ((ends - 1) < max(n - 1, 0)) & (idx < g.numel())
+                nat = torch.zeros_like(non_tail)
+                if g.numel():
+                    nat = g[idx] & natural
+                nat = nat & non_tail
+            else:
+                nat = torch.zeros_like(non_tail)
+            if max_block is None:
+                forced = torch.zeros_like(non_tail)
+            else:
+                forced = (counts == int(max_block)) & non_tail
+            self.forced_only += int((forced & ~nat).sum().item())
+            self.natural_only += int((nat & ~forced).sum().item())
+            self.forced_and_natural += int((forced & nat).sum().item())
+            self.forced_total += int(forced.sum().item())
+            self.natural_total += int(nat.sum().item())
+        except Exception:
+            return
 
     def append(self, t):
         if torch.is_tensor(t) and t.device.type != 'cpu':
@@ -11923,15 +12871,31 @@ class _BlockStats:
             'len_min': int(self.lo),
             'len_max': int(self.hi),
             'frac_at_min': self.at_min / self.total,
-            'frac_at_max': self.at_max / self.total,
+            'frac_at_max': (self.at_max / self.total if self.max_block is not None else None),
+            'position_capacity': (int(self.position_capacity) if self.position_capacity is not None else None),
+            'position_truncated_tokens': int(self.pos_truncated_tokens),
+            'position_truncated_blocks': int(self.pos_truncated_blocks),
+            'position_truncated_frac_of_block_tokens': (self.pos_truncated_tokens / max(self.s or 1.0, 1.0)),
+            'forced_only': int(self.forced_only),
+            'natural_only': int(self.natural_only),
+            'forced_and_natural': int(self.forced_and_natural),
+            'forced_total': int(self.forced_total),
+            'natural_total': int(self.natural_total),
+            'len_p50': (float(np.percentile(np.concatenate(self._lens), 50)) if self._lens else mean),
+            'len_p95': (float(np.percentile(np.concatenate(self._lens), 95)) if self._lens else mean),
         }
 
 def enable_block_stats(model, on):
     for blk in model.blocks:
         if on:
-            blk.attn._stats = _BlockStats(getattr(blk.attn.cfg, 'min_block', None), getattr(blk.attn.cfg, 'max_block', None))
+            _mb = getattr(blk.attn.cfg, 'max_block', None)
+            blk.attn._stats = _BlockStats(getattr(blk.attn.cfg, 'min_block', None),
+                                          (None if _mb is None else int(_mb)),
+                                          position_capacity=getattr(blk.attn.cfg, 'position_capacity', lambda: None)())
+            blk.attn._prefix_stats = _PrefixStats()
         else:
             blk.attn._stats = None
+            blk.attn._prefix_stats = None
         blk.attn._cuts = [] if on else None
 
 
@@ -11945,20 +12909,25 @@ def _snapshot_block_stats(model):
     for blk in model.blocks:
         attn = blk.attn
         st = getattr(attn, '_stats', None)
+        pst = getattr(attn, '_prefix_stats', None)
         cuts = getattr(attn, '_cuts', None)
         snap.append((attn,
                      st.snapshot() if isinstance(st, _BlockStats) else None,
-                     list(cuts) if cuts is not None else None))
+                     list(cuts) if cuts is not None else None,
+                     pst.snapshot() if isinstance(pst, _PrefixStats) else None))
     return snap
 
 
 def _restore_block_stats(snap):
-    for attn, state, cuts in snap:
+    for attn, state, cuts, pstate in snap:
         if state is not None:
             attn._stats.__dict__.clear()
             attn._stats.__dict__.update(state)
         if cuts is not None:
             attn._cuts[:] = cuts
+        if pstate is not None and isinstance(getattr(attn, '_prefix_stats', None), _PrefixStats):
+            attn._prefix_stats.__dict__.clear()
+            attn._prefix_stats.__dict__.update(pstate)
 
 def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None):
     gt = np.nonzero(np.asarray(gt_mask_row)[:n - 1])[0] + 1
@@ -12419,10 +13388,26 @@ def _compression_report_summary(model, seq_len, val_bnd=None, bnd_tol=1):
         else:
             lens = torch.cat([t if torch.is_tensor(t) else torch.as_tensor(t) for t in st]).float()
             n_blocks = sum((t.numel() for t in st)) / len(st)
-            _sc = torch.stack([lens.mean(), lens.std() if lens.numel() > 1 else torch.zeros((), device=lens.device, dtype=lens.dtype), lens.min().float(), lens.max().float(), (lens <= attn.cfg.min_block).float().mean(), (lens >= attn.cfg.max_block).float().mean()])
+            _mb = getattr(attn.cfg, 'max_block', None)
+            _frac_max = (float('nan') if _mb is None else (lens >= int(_mb)).float().mean())
+            _sc = torch.stack([lens.mean(), lens.std() if lens.numel() > 1 else torch.zeros((), device=lens.device, dtype=lens.dtype), lens.min().float(), lens.max().float(), (lens <= attn.cfg.min_block).float().mean(), torch.as_tensor(_frac_max, device=lens.device, dtype=lens.dtype)])
             _vals = _sc.tolist()
             entry = {'blocks': n_blocks, 'avg_len': seq_len / max(n_blocks, 1.0), 'len_mean': _vals[0], 'len_std': _vals[1], 'len_min': int(_vals[2]), 'len_max': int(_vals[3]), 'frac_at_min': _vals[4], 'frac_at_max': _vals[5]}
             del _sc, _vals
+        _ps = prefix_stats_summary(attn, seq_len)
+        _ob_cfg = {
+            'open_block_mode': getattr(attn.cfg, 'open_block_mode', 'closed'),
+            'open_block_scope': getattr(attn.cfg, 'open_block_scope', 'full_prefix'),
+            'selection_budget': getattr(attn.cfg, 'selection_budget', 'shared_topk'),
+            'max_block': getattr(attn.cfg, 'max_block', None),
+            'max_block_effective': (int(getattr(attn.cfg, 'max_block')) if getattr(attn.cfg, 'max_block', None) is not None else seq_len),
+            'pool_position_capacity': int(getattr(attn.cfg, 'position_capacity', lambda: 0)()),
+            'pool_position_policy': getattr(attn.cfg, 'pool_position_policy', 'truncate'),
+        }
+        if _ob_cfg['open_block_mode'] != 'closed':
+            entry['open_block_config'] = _ob_cfg
+            if _ps is not None:
+                entry['open_block'] = _ps
         if attn.cfg.dynamic and getattr(attn, 'delta_logit', None) is not None:
             entry['delta'] = _dl_vals[li]
         if val_bnd is not None and attn._cuts:
@@ -13197,7 +14182,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 'val_ppl': val_ppl, 'train_ce': train_ce, 'health': _h,
                 'extra': {'train_fp': _ids_fp(train_ids),
                           'eval_fp': _ids_fp(np.ascontiguousarray(np.asarray(val_batch)).reshape(-1)) if val_batch is not None else None,
-                          'rng_fp': _rng_fp, 'params': int(n_param)}})
+                          'rng_fp': _rng_fp, 'params': int(n_param),
+                          'open_block_config': open_block_config(_inner_model)}})
             print(f'  [ckpt] saved {tag} checkpoint {path} (step={step_no}, val_ppl={val_ppl})')
         except Exception as _se:
             print(f'[ckpt] WARNING: could not save {tag} checkpoint ({type(_se).__name__}: {_se}); the run continues, but this weight is unavailable for post-hoc analysis')
@@ -13560,7 +14546,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         except Exception as _ee:
             print(f'[efficiency] WARNING: measurement failed ({type(_ee).__name__}: {_ee})')
             _efficiency = {'status': 'error', 'error': f'{type(_ee).__name__}: {_ee}'}
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world, 'train_time_s': wall, 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world, 'train_time_s': wall, 'train_tokens_per_s': ((steps * batch_size * seq_len * _world) / wall if wall and wall > 0 else None), 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
               # Review 3: the token-level evidence behind the reported PPL.
               # `nll_sum / n_tokens` is the pooled-NLL estimator; the per-row
               # rows let a report bootstrap DOCUMENT uncertainty instead of
@@ -13574,6 +14560,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'param_breakdown': param_breakdown(_inner_model),
               'kv_cache_elements_per_token': kv_cache_elements_per_token(_inner_model),
               'train_objective': train_objective(_inner_model, comp_lambda=comp_lambda, delta_lr_mult=delta_lr_mult),
+              'open_block_config': open_block_config(_inner_model),
               'curve_summary': _curve_summary,
               'curve_health': _health, 'health_history': _health_history,
               'train_ce_fixed_final': _last_train_ce,

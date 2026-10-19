@@ -76,3 +76,29 @@ test-split record was ever written.
   latency/throughput/memory; use the efficiency harness on real checkpoints.
 - WikiText-103 has near-duplicate documents across official splits; the
   leakage audit quantifies the overlap, it does not remove it.
+
+## 2026-10-19 — open-block panel (maximum block length × current-prefix reading)
+
+The two open questions — does a maximum block length help, and does the
+unreadable still-open block create an access bottleneck — were previously
+tangled in separate ablations. They are now one controlled matrix with two
+declared factors (`max_block_tokens`, `open_block_mode`) and a fixed recipe.
+The main model is pure dynamic CSA so the three read rules compete for the
+same `index_topk` slots; HCA reads every closed block and therefore cannot
+carry the same-budget label (open HCA must declare an additional-read budget
+and is not in the main matrix).
+
+The prefix is causal by construction (block start and observed length only;
+no block-final length/end or tail-relative position bias). `prefix_singletons`
+is a length-1 pooled representation through the same pooling/projection
+parameters, explicitly not raw-token K/V. The closed path is unchanged and is
+covered by a before/after regression check. Position-table capacity is
+decoupled from `max_block_tokens` (capacity 129, truncation) and recorded with
+the truncation counts.
+
+The 8-cell × 4-seed panel is exploratory until its own pre-registration:
+4 seeds have an exact sign-flip p floor of 0.125, so a non-significant result
+must be reported as resolution-limited, not as no effect. A 6-seed extension
+of the key cells is the pre-declared path to a significance claim. The
+outside-window panel is auxiliary and must not be pooled with the full-prefix
+results; the extra-read-slot panel is a separate protocol if it is needed.
