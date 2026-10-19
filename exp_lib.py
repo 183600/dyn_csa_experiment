@@ -824,17 +824,10 @@ except (TypeError, ValueError):
     _H2D_POOL_CAP = 512 << 20
 _H2D_POOL_SLOTS = 8
 _H2D_POOL_MAX_ENTRIES = 512
-# `batch_iter` prefetches on a producer thread, so staging-pool access is now
-# concurrent with the training thread.  A slot is reserved (`_H2D_BUSY`) from
-# the moment it is handed out until `commit()` records the copy event, which
-# prevents two threads from writing the same pinned buffer before either copy
-# is enqueued.
 _H2D_BUSY = object()
 _H2D_POOL_LOCK = threading.RLock()
 
 def _h2d_pool_evict_locked(need=0):
-    # An entry is only released when all of its recorded H2D copies have
-    # completed, so no pinned buffer can be freed while a copy is in flight.
     while _H2D_POOL and (_H2D_POOL_BYTES[0] + int(need) > _H2D_POOL_CAP
                           or len(_H2D_POOL) >= _H2D_POOL_MAX_ENTRIES):
         victim = None
@@ -857,16 +850,6 @@ def _h2d_pool_evict(need=0):
         _h2d_pool_evict_locked(need)
 
 def _h2d_stage(shape, dtype, device):
-    # Pinned-staging pool for CUDA uploads — transport only (design notes
-    # §6.1).  The caller fills the returned host buffer with the exact values
-    # it would otherwise hand to `torch.tensor(..., device=device)` and
-    # `commit()` enqueues the H2D copy; the copy is bit-exact regardless of
-    # which staging buffer (if any) it leaves from, so every value reaching
-    # the device is identical.  Each slot is guarded by a CUDA event recorded
-    # after its last enqueue, so a slot is never rewritten while an earlier
-    # async copy from it is still in flight; when every slot is busy (or the
-    # pool cannot serve at all) the caller falls back to a direct pinned copy,
-    # again with identical values.
     if device.type != 'cuda' or not torch.cuda.is_available():
         return (None, None)
     shape = tuple(int(_s) for _s in shape)
@@ -922,13 +905,6 @@ def _h2d_stage(shape, dtype, device):
         return (None, None)
 
 def _h2d_async(host_src, dtype, device):
-    # Same values as torch.tensor(host_src, dtype=dtype, device=device):
-    # pure transport of exact (integer or gate-mask) values.  The
-    # inference_mode(False) guard keeps the result a normal tensor even when the
-    # caller runs under inference_mode (eval), so it can later serve as an
-    # autograd index tensor.  CUDA uploads stage through the pooled pinned
-    # buffers of `_h2d_stage` (same bit-exact copy); the fallback form below
-    # remains available.
     with torch.inference_mode(False):
         t = torch.as_tensor(host_src, dtype=dtype)
         if t.device == device:
@@ -939,8 +915,6 @@ def _h2d_async(host_src, dtype, device):
         if staged is not None:
             staged.copy_(t)
             return commit()
-        # A single upload larger than a quarter of the pool is copied directly
-        # rather than pinned as a staging block.
         if t.nbytes * 4 > _H2D_POOL_CAP:
             return t.to(device)
         try:
@@ -1092,9 +1066,6 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
         bids_cpu.append(_b)
         nblks.append(_nb)
         hons.append(_hon)
-    # When the staging pool serves, the rows are written straight into the
-    # pinned buffer via a single `torch.stack(out=...)` call; the values
-    # uploaded are exactly the stacked rows either way.
     staged, commit = _h2d_stage((len(bids_cpu), T), torch.long, device)
     if staged is not None:
         torch.stack(bids_cpu, out=staged)
@@ -1203,14 +1174,6 @@ def _device_blocks_from_cuts(T, cuts, min_block, max_block, device, want_honoure
     bid, counts, hon_slot = _device_segment_geometry(int(T), cuts, min_block, max_block, device)
     B = int(bid.shape[0])
     n_blocks = (counts > 0).sum(1)
-    # One transfer per layer: the per-row counts are needed by the host
-    # geometry caches / diagnostics, but the token-length block-id table
-    # stays on device.  The download is staged through a pinned buffer and
-    # enqueued non-blocking BEFORE the honoured-mask build below, so the two
-    # overlap in-stream and the single event sync is the only host wait in
-    # this forward.  Host rows are materialised as numpy int64 copies at C
-    # speed — no per-element Python conversion — and every integer is
-    # identical to the previous `.cpu().tolist()` transport (transport only).
     packed = torch.cat([counts, n_blocks[:, None]], 1)
     staged = sync = None
     if packed.numel():
@@ -1222,10 +1185,6 @@ def _device_blocks_from_cuts(T, cuts, min_block, max_block, device, want_honoure
         hon_stack = torch.zeros((B, T - 1), dtype=hon_dtype, device=device)
         _rows = torch.arange(B, device=device)[:, None].expand_as(hon_slot)
         _ok = hon_slot >= 0
-        # No host guard: the advanced-index put with an all-false (empty)
-        # mask selects no rows and writes nothing, so skipping the
-        # `bool(_ok.any())` check removes a blocking D2H sync per layer
-        # while leaving every written value identical.
         hon_stack[_rows[_ok], hon_slot[_ok]] = 1.0
     if staged is not None:
         host = sync().numpy()
@@ -1406,9 +1365,6 @@ def blocks_fixed(n, block_size, device):
 _MASK_CACHE = {}
 _CAUSAL_DONOR = -1
 _CAUSAL_TRI = None
-# A pinned donor is never evicted, so only pin a table small enough to hold
-# across length sweeps.  Larger tables go through the shared LRU cache and
-# can therefore be evicted.
 _CAUSAL_DONOR_PIN_BYTES = 64 << 20
 
 def _causal_donor(device, width):
@@ -1417,9 +1373,6 @@ def _causal_donor(device, width):
         raise RuntimeError(
             f'refusing to materialise a full [{int(width)}, {int(width)}] bool mask '
             f'(> {int(_DENSE_MASK_ROW_CAP_BYTES)} bytes); use the row-chunked mask path')
-    # 表按 [:T, :T] 切片服务一切 T <= width；_mask_buffer 的 causal 分支
-    # 说明其与加性 donor 的逐位对应。小表作为 pinned key 复用；超过 pin
-    # 上限的大表只进可驱逐缓存。
     global _CAUSAL_TRI
     dev_s = _dev_str(device)
     width = int(width)
@@ -1445,9 +1398,6 @@ def _causal_donor(device, width):
     return (tri, dev_s)
 _IDX_CACHE = {}
 _IDX_CACHE_BYTES = 0
-# One global byte ceiling for all mask/geometry tables: a larger T must evict
-# earlier tables rather than raise the process-wide ceiling (per-T limits
-# multiplied by the number of eval lengths could grow to several GB).
 _MASK_CACHE_BUDGET_BYTES = 256 << 20
 
 def _mask_budget(n):
@@ -1654,12 +1604,7 @@ def _dense_causal_window_rows(T, window, s, e, device):
     # `_causal_window_mask_build` fills with -inf, so masked_fill_ with this
     # table writes exactly the -inf the additive row slice added.  Built
     # outside inference mode so a row slice first built during eval can still
-    # serve training (masked_fill_ saves the mask for backward).
-    #
-    # The result is a pure function of (T, window, s, e, device), so the same
-    # read-only table is reused across layers, steps and the checkpointed
-    # backward recompute.  The cache has its own byte ceiling so a very long T
-    # cannot silently retain a second dense T x T table.
+    # serve training.
     key = (_dev_str(device), 'dense-rows', int(T), int(window), int(s), int(e))
     hit = _cache_get(_DENSE_ROW_MASK_CACHE, key)
     if hit is not None:
@@ -1790,10 +1735,6 @@ def _window_attn_local_impl(q, k, v, window, scale):
     return out
 
 def _window_attn_local(q, k, v, window, scale):
-    # Checkpoint the whole row loop: the recomputed function is the same pure
-    # row partition, so values and gradients are unchanged.  The row chunk is
-    # recomputed from the same deterministic allocation, so backward reproduces
-    # the forward partition exactly.
     if torch.is_grad_enabled() and q.requires_grad:
         return torch.utils.checkpoint.checkpoint(
             _window_attn_local_impl, q, k, v, int(window), scale,
@@ -2175,8 +2116,6 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         ov_len = np.maximum(end_prev - ov_start, 0)
         n_a = B * max_len
         n_b = B * W_b
-        # Build every part directly in the final flats with in-place numpy
-        # destinations.  Requested padding is part of the same allocation.
         _pi = (-(n_a + 2 * n_b + max_len)) % int(pad_to) if int(pad_to) > 1 else 0
         _pb = (-(n_a + n_b)) % int(pad_to) if int(pad_to) > 1 else 0
         flat_i = np.empty(n_a + 2 * n_b + max_len + _pi, dtype=np.int32)
@@ -2203,18 +2142,6 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         return None
 
 def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, dev):
-    # Host-side build of the variable-block gather geometry (see
-    # _pool_geom_flat_var for the exact-integer argument).  The int64 parts
-    # ride one flat staged upload and the two bool masks a second one (the
-    # same staged pinned pool _pool_parts_host uses); the returned tensors
-    # are read-only views into those buffers (the same aliasing argument the
-    # parts make — downstream they feed gathers / mask multiplies /
-    # negated-mask fills only).  Both flats are bucket-padded so the staged
-    # pool's shape keys stay bounded as (B, max_len, W_b) varies across
-    # steps; the pad tails are never read.  The fixed segmenter keeps its
-    # build-once/cache path.  Returns None when the host form cannot serve;
-    # the caller then falls back to the on-device form, whose values are
-    # identical.
     _built = _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, _POOL_GEOM_BUCKET)
     if _built is None:
         return None
@@ -2352,19 +2279,6 @@ def _pool_geom_put(block_ids, key, geom):
     return geom
 
 def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
-    # Batched pool-geometry prefetch for the per-row sparse path (transport
-    # only, design notes §6.1/§6.2).  Each row's parts / gather geometry is
-    # the same exact-integer host build the lazy path performs inside
-    # _pool_parts / _pool_ordered / pool_blocks_single (the same flat
-    # builders above, the same per-row `_pool_cpu` counts); here the whole
-    # batch's flats are concatenated into ONE staged upload per dtype class
-    # (one int64, one bool) per layer, and the per-row views are attached to
-    # each row's block-ids object under exactly the
-    # keys the lazy lookups use — so _pool_parts / _pool_geom hit them
-    # verbatim, including on the _pool_trainable recompute in backward.
-    # Rows whose host build cannot serve are skipped; their lazy path falls
-    # back to the value-identical on-device build.  The concatenated tails
-    # are bucket-padded (bounded staged-pool shape keys; pad never read).
     if not _POOL_PARTS_HOST:
         return
     cfg = attn.cfg
@@ -2408,8 +2322,6 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
             continue
         _tot_i += len(_r[2][0]) + len(_r[3][0])
         _tot_b += len(_r[3][1].ravel())
-    # One padded allocation per dtype class, filled row-by-row.  The pad tails
-    # are never read.
     flat_i = np.empty(_tot_i + (-_tot_i) % _POOL_GEOM_BUCKET, dtype=np.int32)
     flat_b = np.empty(_tot_b + (-_tot_b) % _POOL_GEOM_BUCKET, dtype=np.bool_)
     _oi = 0
@@ -3038,11 +2950,6 @@ def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
         or (pre_qI is not None and pre_qI.requires_grad)
         or (pre_w is not None and pre_w.requires_grad))
     if _grad:
-        # The chunked indexer keeps only O(n·B) score/soft tables per layer.
-        # When that live set is small, recomputing the whole forward (and its
-        # top-k sorts) costs more than it saves; above the ceiling the existing
-        # recompute path stays in force.  Values and gradients are identical
-        # either way (the function is pure and has no RNG).
         _saved = int(H.shape[0]) * int(comp_kv.shape[0]) * (int(nIH) + 4) * int(H.element_size())
         if _saved < (32 << 20):
             _grad = False
@@ -3077,10 +2984,6 @@ def sink_softmax(logits, sink_logits, dim=-1):
         return _sink_softmax_impl(logits, sink_logits, dim).detach()
 
 def _sink_log_normalizer(logits, sink_logits):
-    # Same normalizer as a softmax over the widened [sink | logits] row, but
-    # without materialising a copy of the full logits table just to add one
-    # column.  `logaddexp` is the two-term log-sum-exp, so the softmax values
-    # and their gradients are the same partition function.
     return torch.logaddexp(
         sink_logits.view(1, -1, 1),
         torch.logsumexp(logits, dim=-1, keepdim=True))
@@ -3342,9 +3245,6 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             del soft_attn
     return out
 
-# CPU-only activation-checkpoint policy: below the per-call limits the saved
-# tensors are kept; above them the existing recompute path runs unchanged.
-# CUDA always keeps recompute.
 _CPU_ACTIVE_BATCH = [1]
 _CPU_GATHER_CKPT_BYTES = 512 << 20
 _CPU_POOL_CKPT_BYTES = 64 << 20
@@ -3505,10 +3405,6 @@ class HybridAttention(nn.Module):
 
     def _full_batched(self, x):
         B, T, _ = x.shape
-        # Fused q/k/v projection only on the eval path, where the
-        # concatenated weight is a cached constant.  Training keeps the three
-        # separate projections: a fresh cat per forward would add an
-        # [out, in] allocation per layer per step without changing any value.
         _nhq = self.nh * self.hd
         if x.device.type == 'cuda' and not torch.is_grad_enabled():
             # Key on versions, dtype and device of the source weights.
@@ -3747,8 +3643,7 @@ class HybridAttention(nn.Module):
         cfg = self.cfg
         # rowwise batched cumsum — same per-row values as the unbind/stack loop.
         # The fresh cumsum output carries the divide/add/subtract/divide tails
-        # in place, preserving the op order (and values) while dropping the
-        # [B, T-1] tau/intermediate tables.
+        # in place.
         prefix_mean = torch.cumsum(sim, dim=-1)
         prefix_mean.div_(_range_cache(1, sim.shape[-1] + 1, x.device))
         prefix_mean.add_(self.delta_logit)
@@ -3901,8 +3796,7 @@ class HybridAttention(nn.Module):
                     self._cuts.append(np.cumsum(np.asarray(_cpu[0], dtype=np.int64))[:-1])
                 else:
                     cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
-                    # Keep the device tensor; compression_report concatenates
-                    # the whole table and transfers it in one batched copy.
+                    # Keep the device tensor for compression_report.
                     self._cuts.append(cuts)
         # Normalizing an all-zero content table is exactly zero (0/eps == 0),
         # so the zero-content ablation keeps the same values.
@@ -4033,8 +3927,7 @@ class HybridAttention(nn.Module):
             if all((_r is not None for _r in _raw)):
                 if _gbool is not None and _device_segment_enabled(x.device):
                     # Device-side segmentation: the gate decisions and the
-                    # resulting block ids stay on the GPU, avoiding one
-                    # blocking D2H/H2D round trip per layer per step.
+                    # resulting block ids stay on the GPU.
                     gate_sigs = [(tuple(_r) if len(_r) == 3 else (_r[0], _g))
                                  for _r, _g in zip(_raw, _gbool.unbind(0))]
                     pre_blocks = _device_blocks_from_gate_bool(
@@ -4741,13 +4634,6 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
     vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
-        # In-process memo: the served arrays are exactly what a fresh
-        # load would return and the returned objects keep their identity,
-        # so the identity-keyed corpus cache in batch_iter
-        # (_PINNED_HOST_CACHE) behaves exactly as it would without the
-        # memo.  The memo key carries every file's size+mtime, so an
-        # externally rebuilt cache is re-read (and re-verified) instead
-        # of being served stale.  Callers never mutate the served arrays.
         _sig = _memo_file_sig({'train': tr_path, 'val': va_path,
                                'bnd': vp_path, 'meta': me_path})
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
@@ -4859,9 +4745,6 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
 
     def stream_tokenise(split, cap_tokens, label, _ds=ds, _tok=tok, _eos=eos_id,
                         _dtype=np.int32):
-        # Write directly into one preallocated array: the corpus cap is the
-        # target size.  The integer values and the [:cap_tokens] truncation are
-        # identical to the per-`encode` form.
         cap_tokens = max(0, int(cap_tokens))
         arr = np.empty(cap_tokens, dtype=_dtype)
         cursor = 0
@@ -4912,8 +4795,6 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         _doc_arr = (np.frombuffer(_doc_ids, dtype=np.uint64).copy()
                     if _doc_ids else np.empty(0, dtype=np.uint64))
         if cursor < arr.size:
-            # Do not keep a huge virtual allocation alive when the source ran
-            # dry well before the configured cap.
             exact = arr[:cursor].copy()
             del arr
             return exact, _doc_arr
@@ -5329,17 +5210,11 @@ def _i32_sidecar_path(path):
 
 
 def _npy_serve_int32(path):
-    # 传输层（design_notes §6.1）：磁盘上的 uint16/int32 都是同一组精确
-    # 整数。batch_iter 在 gather 后立即加宽回 int64，因此产出的 batch 与
-    # int32 驻留形式逐位相同；_ids_fp 对窄整型按规范 int32 形式取指纹，
-    # 缓存指纹也不变。
     mm = np.load(path, mmap_mode='r')
     src = np.asarray(mm)
     if not np.issubdtype(src.dtype, np.integer):
         raise TypeError(f'_npy_serve_int32: expected an integer token cache at {path}, got dtype {src.dtype}')
     if src.dtype in (np.uint8, np.uint16, np.int32):
-        # Serve the memory-mapped view directly; the corpus is read-only and
-        # the returned values are identical.
         return src
     # Wider integer cache: narrow to int32 only after proving every id fits.
     # A silent wrap (e.g. 2**32 + 5 -> 5) would pass the downstream
@@ -5384,8 +5259,6 @@ def _npy_serve_int32(path):
             raise
         return np.load(_side, mmap_mode='r')
     except (OSError, ValueError, TypeError):
-        # Read-only directory or a racing writer: fall back to an in-memory
-        # int32 copy rather than failing the load.
         out = np.empty(src.shape, dtype=np.int32)
         for s in range(0, src.size, 1 << 24):
             e = min(s + (1 << 24), src.size)
@@ -6393,8 +6266,6 @@ def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True):
     return rec
 
 _PINNED_HOST_CACHE = {}
-# 整份 pinned 缓存的上限（见 batch_iter）：超出时改走普通宿主张量 + 每步
-# pinned 暂存上传。
 _PINNED_HOST_CAP_BYTES = 256 << 20
 # 语料整份缓存的上限（见 batch_iter）；超出时按步暂存。
 _GPU_CORPUS_CACHE_BYTES = 64 << 20
@@ -6449,11 +6320,6 @@ def _cache_id_upper_bound(path):
 
 
 def _ids_narrow(train_ids):
-    # Token ids are bounded by the vocab (<= 2**31 for every corpus this repo
-    # produces), so the cached copy (GPU, or pinned host staging) keeps its
-    # transport width (uint8/uint16/int32) and is widened back to int64 right
-    # after each batch gather, leaving the yielded batch bit-identical.  The
-    # guard keeps any hypothetical out-of-range corpus on the int64 path.
     if train_ids.dtype in (np.uint8, np.uint16, np.int32):
         return train_ids
     import weakref as _weakref
@@ -6540,11 +6406,6 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     if host is None:
         if device.type == 'cuda':
             try:
-                # Only corpora within the cap are pinned in full.  Larger
-                # corpora are gathered from the source array in a prefetch
-                # thread (see below).  uint8/uint16 gathers also use the NumPy
-                # path: PyTorch's CPU index kernels lack those dtypes, so
-                # pinning them would only move the failure to the first next().
                 if _narrow.dtype in (np.uint8, np.uint16):
                     host_np = _narrow
                 elif _narrow.nbytes <= _PINNED_HOST_CAP_BYTES:
@@ -8246,14 +8107,6 @@ BASELINE_DESIGN = {
     ],
 }
 
-# 预注册科学假设：每个被审计的「创新点」在跑任何一格里就必须写清楚
-# 「预期的机制、方向、主指标与可推翻条件」。审计据此把显著但方向相反的
-# 结果判为 direction_conflict，而不是事后改口把它解释成支持。没有进入
-# 本表的组件（例如测试里的自定义 design）不施加方向门槛，但仍会出现在
-# `hypotheses_missing` 中，提示补写假设。
-# predicted_sign 的符号与 ABLATION_DESIGN 的 Δ = with − without 一致：
-# −1 表示「带模块应降低 PPL」，+1 表示应升高，0 表示方向未预设（只检验
-# 是否存在差异，不允许声称方向性优势）。
 HYPOTHESIS_DESIGN = {
     'dynamic_blocking': {
         'statement': 'Content-adaptive dynamic blocking lowers validation PPL versus fixed blocking at the same parameter count, data order and training length.',
@@ -9112,8 +8965,6 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             # it must be described as a subset, not as the full declared grid.
             _missing_cfg = sorted(declared - set(cfgs))
             warnings.append(f'{arm}: searched a strict subset of the declared grid (missing {_missing_cfg[:2]})')
-        # Trial-level training allocation: equal tuning means the same
-        # data/steps, not only the same lr grid.
         by_cfg = {}
         for t in trials:
             if not isinstance(t, dict):
@@ -9192,7 +9043,6 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             warnings.append(f'trials report search seeds {search_seeds_seen} but the declared set is {list(_declared_ss)}')
     elif _declared_ss is not None:
         warnings.append('trial records do not expose their search seeds — multi-seed selection cannot be verified from this artifact')
-    # Cross-arm per-config allocation check (only where both records expose it).
     _all_sigs = set().union(*(set(b) for b in budgets.values())) if budgets else set()
     for sig in sorted(_all_sigs):
         _vals = {arm: b[sig] for arm, b in budgets.items() if sig in b}
@@ -10941,16 +10791,11 @@ def _eval_row_working_bytes(model, T, d, elem_size, bytes_per_value=8):
         kind = getattr(cfg, 'kind', 'full')
         if kind == 'full':
             win = max(0, int(getattr(cfg, 'window', 0) or 0))
-            # A sink forces the materialising `_sink_attn_loop` path for the
-            # whole sequence even when a window is configured, so the sink
-            # check must come first (otherwise [nh, rows, T] logits are
-            # undercounted as [nh, rows, win]).
             if getattr(attn, 'sink', None) is not None or getattr(cfg, 'full_sink', False):
                 span = T
             elif 0 < win < T:
                 span = win
             else:
-                # SDPA's flash/mem-efficient backend keeps O(T) state.
                 span = min(T, 1024)
             attn_bytes = 3 * nh * T * span * elem
         else:
@@ -10967,15 +10812,7 @@ def _eval_row_working_bytes(model, T, d, elem_size, bytes_per_value=8):
             # selection width is Bm; CSA only scores min(topk, Bm) blocks.
             nb_eff = Bm if kind == 'hca' else min(topk, Bm)
             M = nb_eff + win
-            # gathered_attention materialises the gathered K and V rows
-            # ([rows, M, nh, hd]) plus the hard logits/attn ([rows, nh, M]);
-            # the live-soft twin roughly doubles the logits side.  All terms
-            # scale with the head count and include the sliding-window lanes.
             gather_bytes = (4 * M * nh * hd + 2 * M * nh) * elem
-            # The indexer score table is t-chunked in both backends (<=~192MB
-            # per launch), so charging the full T x Bm product per row would
-            # over-estimate by orders of magnitude at long T.  Bound it by the
-            # actual chunk workspace and let the OOM retry tighten if needed.
             index_bytes = min(2 * T * Bm * nih * elem, 384 << 20) if kind != 'hca' else 0
             attn_bytes = max(index_bytes, gather_bytes)
             if kind == 'hca':
@@ -11912,9 +11749,6 @@ OPT_ADAMW_BETAS = (0.9, 0.999)
 OPT_ADAMW_EPS = 1e-08
 GRAD_CLIP_NORM = 1.0
 LR_FLOOR_MULT = 0.1
-# Score-function coefficient for `boundary_policy='reinforce'`.  Only arms that
-# opt in pay this term; the threshold path is byte-identical to the default
-# loss (ce + comp_lambda * comp_reg).
 BOUNDARY_PG_COEF = 1.0
 LR_COSINE_AMP = 0.45
 
@@ -11997,10 +11831,6 @@ def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len
     tok = max(1, int(batch_size)) * max(1, int(seq_len))
     hidden = max(1, int(round(int(d) * float(mlp_ratio))))
     act = int(n_layers) * tok * (hidden + 8 * int(d)) * 4
-    # The block/MLP recompute modes do not cover the indexer score table or
-    # the dense attention workspace, so include them explicitly.  Otherwise a
-    # long-sequence CSA cell can look like it fits in the MLP-level mode and
-    # still OOM inside the indexer.
     seq = max(1, int(seq_len))
     batch = max(1, int(batch_size))
     extra = 0
@@ -12016,17 +11846,12 @@ def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len
             win = max(0, int(getattr(c, 'sliding_window', 0) or 0))
             nb_eff = Bm if kind == 'hca' else min(topk, Bm)
             M = nb_eff + win
-            # Indexer score table plus the gathered K/V + logits workspace;
-            # both scale with the head count and the sliding-window lanes.
             index_bytes = seq * Bm * nih * 4
             gather_bytes = (4 * M * nh * hd + 2 * M * nh) * 4
             extra += batch * max(index_bytes, gather_bytes)
             if kind == 'hca':
                 extra += batch * seq * Bm * 4
         elif kind == 'full':
-            # A sink materialises the full [B, nh, T, T] logits regardless of
-            # any configured window; otherwise only the sparse window/loop is
-            # an extra, and SDPA's memory-efficient path keeps O(T) state.
             win = max(0, int(getattr(c, 'window', 0) or 0))
             if getattr(c, 'full_sink', False):
                 span = seq
@@ -12036,10 +11861,6 @@ def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len
                 span = min(seq, 1024)
             extra += batch * 3 * nh * seq * span * 4
     need = act + int(extra) + 16 * int(n_param)
-    # Calibrate the analytic working-set estimate with the peak actually
-    # observed for the same geometry in this process.  A formula that
-    # under-estimates is the dangerous direction (it picks no recompute and
-    # then OOMs), so the calibration can only raise `need`.
     _peak = _CKPT_PEAK_MEMO.get(_ckpt_geom_key(n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs, n_heads=n_heads, d_head=d_head))
     if _peak:
         need = max(need, int(_peak))
@@ -12536,8 +12357,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     _lbuf = []
     # deque with a fixed capacity; the window contents are identical.
     _tail = collections.deque(maxlen=50)
-    # Loss scalars are copied to a pinned host buffer asynchronously as they
-    # are produced, then flushed once.
     _loss_stage = None
     _loss_ev = None
     if device.type == 'cuda':
@@ -12552,9 +12371,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         if not _lbuf:
             return
         if _loss_stage is not None and len(_lbuf) <= _loss_stage.numel():
-            # One batched device->pinned copy per flush instead of a tiny
-            # copy per training step; the staged values and their order are
-            # unchanged.
             _staged = _loss_stage[:len(_lbuf)]
             _staged.copy_(torch.stack(_lbuf), non_blocking=True)
             _loss_ev.record()
@@ -12611,7 +12427,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 truncated = True
                 break
             if device.type == 'cuda' and step and step % 256 == 0:
-                # Re-sample free memory periodically.
                 _attb_bump_epoch()
             base = lr_at(step)
             for g, _ls in zip(opt.param_groups, _lr_scales):
@@ -12651,12 +12466,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     # step.
                     _ce_item = float(ce.detach().item())
                     _comp_item = float(_comp.detach().item()) if _comp is not None else 0.0
-                    # REINFORCE: the hard cuts are sampled in the forward pass; this
-                    # score-function term makes the LM token loss (not just comp_reg)
-                    # able to change the boundary policy.  Centred by a running CE
-                    # baseline to reduce variance; decisions are normalised so the
-                    # coefficient does not scale with sequence length or depth.
-                    # This is the only arm that reads the running CE baseline.
                     _adv = _ce_item - float(_ce_baseline)
                     _bdec = max(int(getattr(_inner_model, 'boundary_decisions', 0) or 0), 1)
                     _pg = -_adv * _blp / _bdec
@@ -13001,8 +12810,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     gc.collect()
     if _dist and _world > 1:
         torch.distributed.barrier()
-    # Keep the caching allocator's blocks for the next cell in this process;
-    # only OOM-recovery paths clear the allocator cache.
     return result
 
 @torch.no_grad()
@@ -13017,11 +12824,6 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
     model.eval()
     try:
         h = model.trunk(x)
-        # Accumulate the chunk sums on the device and read back once at the
-        # end: the old form forced two host synchronisations per chunk.  The
-        # addition order (chunk ascending) is unchanged, and the fp32 chunk
-        # sums widen to fp64 exactly as `float(fp32)` did, so the reported
-        # values are identical.
         dev = h.device
         total = torch.zeros((), dtype=torch.float64, device=dev)
         correct = torch.zeros((), dtype=torch.long, device=dev)
@@ -13497,11 +13299,6 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
                 continue
             _gs.append(p.grad.detach())
         if _gs:
-            # Per-tensor vector norms on the device; only scalars are read back
-            # and no full-size double copy of any gradient is made.  The
-            # foreach form launches one norm kernel for the whole list, and all
-            # scalar results cross to the host in a single transfer instead of
-            # one synchronisation per parameter.
             try:
                 _norms = torch.stack(
                     [v.to(torch.float64) for v in torch._foreach_norm(_gs)]
@@ -15376,9 +15173,6 @@ def run_cell_job(job):
     n_layers = cfg.get('n_layers', 6)
     n_heads = cfg.get('n_heads', 8)
     d_head = cfg.get('d_head', 32)
-    # pin determinism BEFORE the fingerprint: run() does the same before its
-    # own fp, and `determinism_label()` is part of the fingerprint — an
-    # unpinned child would stamp a different run_cfg and break resume.
     if torch.cuda.is_available():
         _pin_cuda_determinism()
     # The parent already computed the identical fingerprint/provenance over

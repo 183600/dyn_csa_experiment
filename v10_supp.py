@@ -502,9 +502,6 @@ def _niah_ppls(model, val_ids, eval_len, n_seq, cfg, condition, row_cache=None, 
     vocab = int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
     target = int(cfg['target'])
     rho = float(_n.get('rho', 0.5)) if condition == 'distract' else 0.0
-    # NIAH batches are fully determined by the construction parameters below;
-    # rebuilding is cheap relative to scoring and avoids retaining a full
-    # [n_seq, eval_len] id batch per (length, condition, arm) in host memory.
     _built = _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed=(eval_len * 7919 + 104729), condition=condition, rho=rho)
     ids_np, q_cols, q_vals, stats = _built
     n_ch = max(1, int(cfg['chunk']))
@@ -1566,7 +1563,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             fit['note'] += '; WARNING: n=2 — R² 恒为 1（恒等式），斜率不具显著性，仅供参考'
     else:
         fit = {'n_points': len(pts), 'status': 'insufficient_points',
-               'note': 'fewer than 3 independent, budget-comparable crossover points: no log-log slope or power-law claim is computed'}
+               'note': 'fewer than 3 independent, training-volume-comparable crossover points: no log-log slope or power-law claim is computed'}
     seq2k = _ppl_by_seed('results_lm_v9_seq2k', full=True)
     comparisons = {}
 
@@ -1902,7 +1899,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         if fit.get('excluded_no_rate'):
             _excl.append(f'{len(fit['excluded_no_rate'])} 个规模无 token 速率')
         if 'slope' not in fit:
-            A(f'**趋势拟合**：不足 3 个独立、预算可比的交叉点（n={fit.get("n_points", 0)}）；按 `insufficient_points` 处理，不报告斜率或幂律。')
+            A(f'**趋势拟合**：不足 3 个独立、训练量可比的交叉点（n={fit.get("n_points", 0)}）；按 `insufficient_points` 处理，不报告斜率或幂律。')
             A('')
         else:
             _r2s = f'（R²={fit["r2"]:.2f}）' if 'r2' in fit else '（仅 2 点，R² 恒为 1，不报告拟合优度）'

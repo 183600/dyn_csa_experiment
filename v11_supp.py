@@ -204,7 +204,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
             fit['note'] += '; WARNING: n=2 — R² 恒为 1（恒等式），斜率不具显著性，仅供参考'
     else:
         fit = {'n_points': len(pts), 'status': 'insufficient_points',
-               'note': 'fewer than 3 independent, budget-comparable crossover points: no log-log slope or power-law claim is computed'}
+               'note': 'fewer than 3 independent, training-volume-comparable crossover points: no log-log slope or power-law claim is computed'}
     scale384 = V10._ppl_by_seed('results_lm_v5_scale', full=True)
     panel = V8._panel_block
     comparisons = {}
@@ -550,7 +550,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     A('')
     if fit:
         if 'slope' not in fit:
-            A(f'**趋势拟合**：不足 3 个独立、预算可比的交叉点（n={fit.get("n_points", 0)}）；按 `insufficient_points` 处理，不报告斜率或幂律。')
+            A(f'**趋势拟合**：不足 3 个独立、训练量可比的交叉点（n={fit.get("n_points", 0)}）；按 `insufficient_points` 处理，不报告斜率或幂律。')
             A('')
         else:
             _r2s = f'（R²={fit["r2"]:.2f}）' if 'r2' in fit else '（仅 2 点，R² 恒为 1，不报告拟合优度）'

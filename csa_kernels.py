@@ -283,8 +283,6 @@ class PoolGeometry:
                                  ov_start_np, ov_len_np, starts_prev_np)):
             flat[_i * R * Bm:(_i + 1) * R * Bm] = _a.reshape(-1)
         flat[7 * R * Bm:] = nblk_np
-        # Stage through the shared pinned H2D pool (transport only): the source
-        # buffer is filled before commit, so the uploaded values are identical.
         import exp_lib as L
         staged, commit = L._h2d_stage((int(flat.size),), torch.int32, device)
         if staged is not None:
@@ -354,9 +352,6 @@ class PoolGeometry:
         return self._b_off
 
 
-# 几何/常数表缓存：键 = 内容的纯整型函数，缓存值只读消费（与 exp_lib 的
-# _pool_parts/_arange_exp_cache 同一论证）。fix 分块臂每步传入完全相同的
-# counts。
 _GEOM_CACHE = {}
 _GEOM_CACHE_CAP = 16
 _GEOM_CACHE_BYTES = [0]
@@ -398,8 +393,6 @@ def _geom_nbytes(geom):
             return
         try:
             st = t.untyped_storage()
-            # `untyped_storage()` may return a fresh Python wrapper per call;
-            # the underlying allocation is identified by (device, ptr, bytes).
             key = (str(st.device), int(st.data_ptr()), int(st.nbytes()))
             if key not in seen:
                 seen[key] = int(st.nbytes())
@@ -430,10 +423,6 @@ def _geom_evict(need=0):
 
 
 def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
-    # 键 = 行 counts 对象的身份（条目强引用这些对象，因此 id 在条目存活期间
-    # 唯一且稳定，不可能撞上复用）；fix 臂全程复用同一分段器出口对象必命中，
-    # 动态臂每步拿到新对象必 miss——命中语义与内容键一致（counts 表按约定
-    # 不可变，与 exp_lib `_pool_parts` 缓存于对象身份同一论证）。
     key = (tuple(id(c) for c in counts_rows),
            None if overlap is None else int(overlap), int(T),
            str(device), int(max_block))
@@ -441,15 +430,10 @@ def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
     if ent is not None:
         refs, geom, charged = ent
         if len(refs) == len(counts_rows) and all(a is b for a, b in zip(refs, counts_rows)):
-            # Lazy gather constants may have been built since insertion;
-            # re-charge the entry so the byte ceiling tracks what is resident.
             cur = _geom_nbytes(geom)
             if cur != charged:
                 _GEOM_CACHE_BYTES[0] += cur - charged
                 _GEOM_CACHE[key] = (refs, geom, cur)
-                # Lazy constants can grow a resident entry past the ceiling;
-                # evict (possibly this or older entries) so the accounting
-                # contract "ceiling tracks what is resident" keeps holding.
                 if _GEOM_CACHE_BYTES[0] > _GEOM_CACHE_BUDGET:
                     _geom_evict(0)
             return geom
@@ -615,12 +599,6 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     starts_l = _i64['starts']
     ov_start_l = _i64['ov_start']
     nblk_l = _i64['n_blocks'][:, None]
-    # B_pos_b 梯度按 chunk 直接做固定顺序段和，累加进 [行数, C] 的 fp32
-    # 累加器（chunk 升序、chunk 内 (r,b,j) 行主序的稳定排序——每 chunk
-    # 的求和顺序与逐 chunk 调 _det_scatter_add 完全相同，跨 chunk 的
-    # 累加顺序固定），不再物化 [R·Bm·W, C] 的完整键/值大表：该表随
-    # R·Bm·W·C 线性增长，长序列/大 batch 下是池化反向的显存峰值，
-    # 而段和的目标只有 [B_pos_b.shape[0], C]。
     _bpb_rows = int(B_pos_b.shape[0]) if need_bpb else 0
     gBpb32 = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32) if need_bpb else None
     # 复用的段和落点（每 chunk 清零）：避免按 chunk 反复分配同一形状的临时表。
@@ -716,8 +694,6 @@ def _take_lane(lane4, r_idx, blk_idx, lane_idx):
     """[R, B, L, c] 泳道张量按 (r, blk_idx[r,t], lane_idx[r,t]) 取 [R, T, c]——
     纯 gather，无累加（A 泳道双射 / B 泳道至多一处的两处用途都满足）。"""
     R, B, L, c = lane4.shape
-    # r_idx is an expanded arange; build the flat row index directly instead
-    # of materialising the expansion first.
     row = (torch.arange(R, device=r_idx.device)[:, None] * B
            + blk_idx.clamp(0, B - 1)).reshape(-1)
     col = lane_idx.reshape(-1).clamp(0, L - 1)
@@ -1199,12 +1175,6 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     dsink = torch.zeros_like(sink) if (need_dsink and sink is not None) else None
     r_idx = torch.arange(R, device=dev)[:, None, None]
     tc = _attn_t_chunk(R, M, nh, hd)
-    # t-chunk 在外、头在内：chunk 内的几何/掩码/soft 常量以及键值梯度的
-    # 段结构（argsort + 段定位）都与头无关，同组头只算一次。头按内存预算
-    # 分组：短序列可一次覆盖全部头（最省重复排序），长序列自动退化为小
-    # 组，slab 峰值受 CSA_ATTN_GRAD_SLAB_MB（默认 64MB）约束，不会随头数
-    # 线性膨胀。跨 chunk 的同键贡献仍按 chunk 升序累加，逐元素值与逐头
-    # 形式一致。
     q_heads = [q[:, :, h, :] for h in range(nh)]
     dO_heads = [dO[:, :, h, :] for h in range(nh)]
     kb_heads = [k_blk[:, :, h, :] for h in range(nh)]
@@ -1524,9 +1494,6 @@ def _kernels():
         if HAS_B:
             xb = tl.load(Xb_ptr + (r * T + gB[:, None]) * C + cs[None, :], mask=b_ok[:, None] & cm[None, :], other=0.0).to(tl.float32)
             acc += tl.sum(eb * xb, 0) / Zs
-        # r 从 pid 派生时就升到 int64，因此行基址 (r·T + gA/gB) 与输出基址
-        # (r·Bm + b)·C 全在 int64 下求值：R·T·C 或 R·Bm·C ≥ 2³¹ 的超大配置下，
-        # int32 不足以表示这些基址。
         tl.store(comp_ptr + (r * Bm + b).to(tl.int64) * C + cs, acc.to(comp_ptr.dtype.element_ty), mask=cm)
 
     ns.pool_fwd = pool_fwd
@@ -1601,9 +1568,6 @@ def _kernels():
         lt = tl.load(last_tok_ptr + r * Bm + b, mask=bm, other=TF - 1).to(tl.int64)
         causal = (tg > lt) & bm
         finite = (s - s) == 0.0
-        # lse / exp tail only feeds the training-only soft prior; when the
-        # caller does not need it the whole reduction is compile-time
-        # eliminated (idx/valid are independent of it).
         if HAS_SOFT:
             masked = tl.where(causal, s, float('-inf'))
             has_nan = tl.sum(tl.where(masked != masked, 1.0, 0.0), 0) > 0.0
@@ -2403,8 +2367,7 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
     valid_i8 = torch.empty((R, T, k_out), device=qI.device, dtype=torch.int8)
     # The soft prior is training-only (its straight-through path is dead
     # without gradients), so eval does not build it.  The dummy pointer is
-    # never dereferenced when HAS_SOFT is false (the branch is compile-time
-    # eliminated).
+    # never dereferenced when HAS_SOFT is false.
     soft = torch.empty((R, T, k_out), device=qI.device, dtype=qI.dtype) if need_soft else None
     soft_arg = soft if soft is not None else idx
     BT, BB = 64, 64
@@ -2581,7 +2544,6 @@ def _gate_mean_batched(attn, cfg, T, B, gate_sigs, hons, nblks):
         return torch.zeros((), device=attn.B_pos_a.device if attn.B_pos_a is not None else torch.device('cpu'))
     gate_stack = torch.stack([gs[0] for gs in gate_sigs], 0)
     hon_stack = torch.stack(list(hons), 0).to(gate_stack.dtype)
-    # Stage the small host-side block-count table through the pinned pool.
     import exp_lib as L
     nblk_t = L._h2d_async([float(nb - 1) for nb in nblks], gate_stack.dtype, gate_stack.device)
     shs = (gate_stack * hon_stack).sum(dim=1)
@@ -2933,12 +2895,6 @@ def bench_attention(device, impl='triton', R=8, T=8192, nh=12, hd=64, topk=32, w
     def step():
         out = gathered_attention_kernel(q, k_blk, v_blk, sel, lt, k_sw, v_sw, win, 1.0,
                                         soft=soft, sink_logits=sink, sel_valid=valid, impl=impl)
-        # Seed the backward gradient from the benchmark's own generator
-        # instead of the ambient global stream: randn_like draws from torch's
-        # default RNG, so repeated bench invocations in one process would
-        # otherwise consume (and depend on) unrelated RNG state.  The values
-        # never affect the timing being measured, but pinning them keeps the
-        # whole benchmark run-to-run reproducible.
         g = torch.empty_like(out)
         g.normal_(0.0, 1.0, generator=gen)
         out.backward(g)

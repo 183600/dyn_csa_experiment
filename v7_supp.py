@@ -245,7 +245,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                     tau = prefix_mean + self.delta_logit
                     gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
                     hard_b = gate.detach() > L._HALF
-                    # zero-copy numpy view — same booleans as the .tolist() form
+                    # numpy view — same booleans as the .tolist() form
                     gl = hard_b.cpu().numpy()
             if gate is None:
                 bid = torch.zeros(T, dtype=torch.long, device=x.device)
@@ -380,8 +380,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                        and topk_l is L._IDX_CACHE.get((L._dev_str(dev), 'arangeexp', int(T), int(topk_l.shape[1]))))
         _sel_all = None
         # The K/V halves are gathered separately per chunk and concatenated
-        # in the same order, so every gathered value is bit-identical and the
-        # full [T, nh, hd] concatenated copy is not built.
+        # in the same order, so every gathered value is bit-identical.
         _has_sw = k_sw is not None and v_sw is not None
         # see exp_lib.gathered_attention: these per-row masks are hoisted under
         # L._FO_FULL_CAP_BYTES; the hoisted values are bitwise identical to the
@@ -982,8 +981,6 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
                 _ce_baseline.mul_(0.99).add_(_ce_d, alpha=0.01)
             _lbuf.append(ce.detach())
             _tail.append(ce.detach())
-            # Drop the step's graph references before the next forward;
-            # trunk() rebuilds comp_reg each call.
             loss = ce = None
             model.comp_reg = None
             if len(_lbuf) >= 512:
