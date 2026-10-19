@@ -2,7 +2,10 @@
   "manifest_version": 2,
   "frozen_at": "2026-10-17",
   "purpose": "Pre-registered confirmation plan: v6-v11 (and the v10/v12 reviewer-response extensions) all selected methods, arms, comparisons and seeds on the SAME validation split, so their p-values are exploratory. This manifest freezes the main comparisons, endpoints, seed count and statistics BEFORE any WikiText-103 test-split evaluation, and the confirmation data (wiki.test.raw) has never been read by any earlier phase. v2 (review-2 revision): the seed count was raised 6 -> 12 and the manifest gained a machine-checkable binding block and a scope declaration; the revision was made strictly BEFORE any test-split evaluation (no P5T result has ever existed -- no results_lm_test/ record, no commit touching the test split), which is the only condition under which a pre-registration may be revised without selection bias.",
-  "code_semantics_expected": "v11.125",
+  "code_semantics_expected": "v11.126",
+  "amp_dtype_expected": "bf16",
+  "eager_batch_expected": true,
+  "amp_grad_scaler_expected": false,
   "arms": [
     "csa_fixed_rope",
     "full_rope",
@@ -52,7 +55,7 @@
       "check": "load_wikitest hard-compares the full id->token vocabulary against any cached train tokenizer and refuses on mismatch"
     },
     "checkpoint": {
-      "stamp": "v11.125 (= exp_lib.CODE_SEMANTICS; records carry _code, ckpt carries code)",
+      "stamp": "v11.126 (= exp_lib.CODE_SEMANTICS; records carry _code, ckpt carries code)",
       "hash": "sha256 of the .pt file, stored per record as ckpt_sha256 at P5T evaluation time"
     }
   },

@@ -69,7 +69,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 RUN_CAP = dict(total_hours=58.333333333333336, margin=0.93, already_hours=0.0, state_path='run_time_state.json')
-CODE_SEMANTICS = 'v11.125'
+CODE_SEMANTICS = 'v11.126'
 CKPT_CODE = CODE_SEMANTICS
 # ---- 三算子内核路径（docs/compute_plan.md §3 的 M0 工作包；实现与数值契约
 # 见 csa_kernels.py）。CSA_KERNEL 未设置时本模块的执行路径与指纹逐字节不变。
@@ -325,6 +325,26 @@ def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None)
     }
 
 
+def _safe_exp_ppl(x):
+    """``exp`` for a PPL accumulator without raising on divergent CE.
+
+    ``math.exp`` raises once the exponent exceeds ~709.  A training run that
+    has diverged but still produced finite CE must be recorded as ``inf`` and
+    diagnosed, not crash the eval callback.  The clamp mirrors the historical
+    ``eval_ppl`` overflow behaviour while making the CI bounds consistent."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(x):
+        return float('nan')
+    if x >= 700.0:
+        return float('inf')
+    if x <= -700.0:
+        return 0.0
+    return math.exp(x)
+
+
 def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     """Approximate 95% CI for PPL from per-DOCUMENT NLL (not per-token).
 
@@ -346,16 +366,16 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         total_tok += ntok
         doc_ce.append(nll / ntok)
     if len(doc_ce) < 2 or total_tok <= 0:
-        return {'ppl': (math.exp(total_nll / total_tok) if total_tok else None),
+        return {'ppl': (_safe_exp_ppl(total_nll / total_tok) if total_tok else None),
                 'doc_ce_mean': None, 'doc_ce_sem': None,
                 'ppl_ci95_low': None, 'ppl_ci95_high': None, 'n_docs': len(doc_ce)}
     mean = sum(doc_ce) / len(doc_ce)
     var = sum((x - mean) ** 2 for x in doc_ce) / (len(doc_ce) - 1)
     sem = math.sqrt(max(var, 0.0) / len(doc_ce))
     ce = total_nll / total_tok
-    return {'ppl': math.exp(ce), 'doc_ce_mean': mean, 'doc_ce_sem': sem,
-            'ppl_ci95_low': math.exp(max(ce - 1.96 * sem, -700.0)),
-            'ppl_ci95_high': math.exp(min(ce + 1.96 * sem, 700.0)),
+    return {'ppl': _safe_exp_ppl(ce), 'doc_ce_mean': mean, 'doc_ce_sem': sem,
+            'ppl_ci95_low': _safe_exp_ppl(max(ce - 1.96 * sem, -700.0)),
+            'ppl_ci95_high': _safe_exp_ppl(min(ce + 1.96 * sem, 700.0)),
             'n_docs': len(doc_ce)}
 
 
@@ -881,6 +901,9 @@ def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_coun
         base, cnt, hon = (torch.empty(0, dtype=torch.long, device=device), 0, {})
     elif n == 1:
         base, cnt, hon = (torch.zeros(1, dtype=torch.long, device=device), 1, {})
+        # Match the device-side segmenter: every non-empty block-table object
+        # carries the host count attachment, including the single-token case.
+        base._pool_cpu = ([1], 1, 0)
     else:
         bids, hon, counts = _segment(n, want_cut_list, min_block, max_block)
         base = _h2d_async(bids, torch.long, device)
@@ -1125,6 +1148,26 @@ def _causal_quantile_exact(x, cols, target_block_tokens):
     return out
 
 
+_ADAPTIVE_EXACT_DEFAULT = 8192
+
+
+def _adaptive_exact_limit():
+    """Length up to which the adaptive segmenter uses its exact closed form.
+
+    The historical default is 8192.  Sampling above it changes block geometry,
+    so the effective limit is part of the run fingerprint (`_ae`); a panel
+    that needs the cheaper sampled path must opt in explicitly.
+    ``CSA_ADAPTIVE_EXACT_TOKENS`` selects the cutoff without editing code.
+    """
+    raw = os.environ.get('CSA_ADAPTIVE_EXACT_TOKENS', '').strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            print(f'[segmenter] CSA_ADAPTIVE_EXACT_TOKENS={raw!r} is not an integer — using {_ADAPTIVE_EXACT_DEFAULT}')
+    return _ADAPTIVE_EXACT_DEFAULT
+
+
 def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
@@ -1143,16 +1186,10 @@ def causal_adaptive_threshold(sim, target_block_tokens):
             f'causal_adaptive_threshold 超出显式安全上限 {_max_len}（CSA_ADAPTIVE_MAX_TOKENS）: '
             '请提高该上限或改用 chunking="cosine_learnable"')
     # Up to this length the exact closed form (O(T^2) comparisons) is used.
-    # Keep the default small: the exact path sorts a length-n prefix for every
-    # column, i.e. O(n^2 log n), which dominates a layer/step once n grows.
-    # Longer sequences already have a prefix-consistent sampled path.
-    _exact_len = 1024
-    _env_exact = os.environ.get('CSA_ADAPTIVE_EXACT_TOKENS', '').strip()
-    if _env_exact:
-        try:
-            _exact_len = max(1, int(_env_exact))
-        except ValueError:
-            print(f'[segmenter] CSA_ADAPTIVE_EXACT_TOKENS={_env_exact!r} is not an integer — using {_exact_len}')
+    # The 8192 default is the historical measurement semantics; the sampled
+    # long-context path must be opted into explicitly (and is part of the run
+    # fingerprint through `_ae`).
+    _exact_len = _adaptive_exact_limit()
     squeeze = sim.dim() == 1
     x = (sim.unsqueeze(0) if squeeze else sim).detach().float()
     if n <= _exact_len:
@@ -6268,6 +6305,7 @@ def _ids_narrow(train_ids):
             if os.path.exists(_side):
                 _n = np.load(_side, mmap_mode='r')
                 if (int(_n.size) == int(train_ids.size)
+                        and tuple(_n.shape) == tuple(train_ids.shape)
                         and np.dtype(_n.dtype) == np.dtype(np.int32)):
                     _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
                     return _n
@@ -6279,13 +6317,15 @@ def _ids_narrow(train_ids):
                 _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(_side) + '.', suffix='.tmp')
                 os.close(_fd)
                 try:
-                    _mm = np.lib.format.open_memmap(_tmp, mode='w+', dtype=np.int32, shape=(int(train_ids.size),))
+                    _mm = np.lib.format.open_memmap(_tmp, mode='w+', dtype=np.int32, shape=tuple(train_ids.shape))
+                    _flat_mm = _mm.reshape(-1)
+                    _flat_src = np.asarray(train_ids).reshape(-1)
                     _step = 1 << 24
                     for _s in range(0, int(train_ids.size), _step):
                         _e = min(_s + _step, int(train_ids.size))
-                        _mm[_s:_e] = train_ids[_s:_e]
+                        _flat_mm[_s:_e] = _flat_src[_s:_e]
                     _mm.flush()
-                    del _mm
+                    del _flat_mm, _mm
                     os.replace(_tmp, _side)
                 except BaseException:
                     try:
@@ -7822,7 +7862,7 @@ def loglog_regression(points, *, alpha=0.05):
 # `mt` (matched-variant set) and `mr` (mlp_match_ref) can themselves contain
 # underscores (e.g. `full_rope`, `csa_dynamic`), so those two values are
 # captured lazily up to the next literal key rather than by `[^_]+`.
-_RUN_CFG_RE = re.compile('^steps(?P<steps>[^_]+)_sl(?P<sl>[^_]+)_bs(?P<bs>[^_]+)_nt(?P<nt>[^_]+)_lr(?P<lr>[^_]+)_wd(?P<wd>[^_]+)_d(?P<d>[^_]+)_L(?P<L>[^_]+)_H(?P<H>[^_]+)_Dh(?P<Dh>[^_]+)_v(?P<v>[^_]+)_wu(?P<wu>[^_]+)_cl(?P<cl>[^_]+)_dlm(?P<dlm>[^_]+)_mt(?P<mt>.*?)_mr(?P<mr>.*?)_ee(?P<ee>[^_]+)_es(?P<es>[^_]+)_det(?P<det>[^_]+)_df(?P<df>.+?)(?:_tk(?P<tk>[0-9a-f]+))?(?:_amp(?P<amp>[^_]+))?(?:_eb(?P<eb>[01]))?_cs(?P<cs>.+)$')
+_RUN_CFG_RE = re.compile('^steps(?P<steps>[^_]+)_sl(?P<sl>[^_]+)_bs(?P<bs>[^_]+)_nt(?P<nt>[^_]+)_lr(?P<lr>[^_]+)_wd(?P<wd>[^_]+)_d(?P<d>[^_]+)_L(?P<L>[^_]+)_H(?P<H>[^_]+)_Dh(?P<Dh>[^_]+)_v(?P<v>[^_]+)_wu(?P<wu>[^_]+)_cl(?P<cl>[^_]+)_dlm(?P<dlm>[^_]+)_mt(?P<mt>.*?)_mr(?P<mr>.*?)_ee(?P<ee>[^_]+)_es(?P<es>[^_]+)_det(?P<det>[^_]+)_df(?P<df>.+?)(?:_tk(?P<tk>[0-9a-f]+))?(?:_amp(?P<amp>[^_]+))?(?:_eb(?P<eb>[01]))?(?:_ae(?P<ae>[^_]+))?_cs(?P<cs>.+)$')
 
 def run_cfg_knobs(fp):
     """Best-effort decode of a `_run_fp` string into its named training knobs.
@@ -10489,9 +10529,13 @@ def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
     prov['data'] = data
     return prov
 
-def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_ratio, data_version=None):
+def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_ratio, data_version=None, amp_dtype='auto', eager_batch='auto'):
     """Structured hyper-parameter record (the run_cfg string stays the
-    pairing gate; this is the human/machine-readable copy)."""
+    pairing gate; this is the human/machine-readable copy).
+
+    ``amp_dtype`` / ``eager_batch`` must be the values the cell ACTUALLY ran,
+    not a fresh inference from the current process's global device.  Callers
+    that already have the training record pass its two fields here."""
     hp = {str(k): _jsonable(v) for k, v in cfg.items() if k not in ('seeds', 'variants', 'outdir')}
     hp.update({
         'seed': int(seed),
@@ -10503,7 +10547,7 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
         'vocab_size': int(vocab),
         'mlp_ratio': float(mlp_ratio),
         'dataset': cfg.get('dataset') or 'wikitext',
-        'train_knobs': training_knobs(),
+        'train_knobs': training_knobs(amp_dtype=amp_dtype, eager_batch=eager_batch),
     })
     _knobs = hp['train_knobs']
     hp['amp_dtype'] = _knobs.get('amp_dtype')
@@ -10933,6 +10977,7 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
             _nll_snap = nll.clone()
             _rn_snap = _row_nll.clone() if return_stats else None
             _rt_snap = _row_ntok.clone() if return_stats else None
+            _stats_snap = _snapshot_block_stats(model) if collect_block_stats else None
             try:
                 _run_rows(i, _cur)
             except RuntimeError as _oe:
@@ -10940,6 +10985,8 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                 if return_stats:
                     _row_nll.copy_(_rn_snap)
                     _row_ntok.copy_(_rt_snap)
+                if _stats_snap is not None:
+                    _restore_block_stats(_stats_snap)
                 if ('out of memory' in str(_oe).lower()) and _cur > 1:
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
@@ -11092,6 +11139,32 @@ def enable_block_stats(model, on):
         else:
             blk.attn._stats = None
         blk.attn._cuts = [] if on else None
+
+
+def _snapshot_block_stats(model):
+    """Capture every attention layer's block-count / cut state.
+
+    A failed forward may already have appended per-layer counts and cut
+    positions.  OOM retries must restore this state together with the NLL
+    accumulators, otherwise the partially processed rows are counted twice."""
+    snap = []
+    for blk in model.blocks:
+        attn = blk.attn
+        st = getattr(attn, '_stats', None)
+        cuts = getattr(attn, '_cuts', None)
+        snap.append((attn,
+                     st.snapshot() if isinstance(st, _BlockStats) else None,
+                     list(cuts) if cuts is not None else None))
+    return snap
+
+
+def _restore_block_stats(snap):
+    for attn, state, cuts in snap:
+        if state is not None:
+            attn._stats.__dict__.clear()
+            attn._stats.__dict__.update(state)
+        if cuts is not None:
+            attn._cuts[:] = cuts
 
 def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None):
     gt = np.nonzero(np.asarray(gt_mask_row)[:n - 1])[0] + 1
@@ -11590,14 +11663,7 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
         # A failed forward may already have appended per-layer block counts
         # (the stats hook runs layer by layer).  Snapshot them so the retry
         # cannot count the partially-processed rows twice.
-        _stats_snap = []
-        for _blk in model.blocks:
-            _attn = _blk.attn
-            _st = getattr(_attn, '_stats', None)
-            _cuts = getattr(_attn, '_cuts', None)
-            _stats_snap.append((_attn,
-                                _st.snapshot() if isinstance(_st, _BlockStats) else None,
-                                list(_cuts) if _cuts is not None else None))
+        _stats_snap = _snapshot_block_stats(model)
         # as_tensor accepts numpy arrays AND torch tensors (eval_ppl already
         # uses it).
         ids = None
@@ -11607,12 +11673,7 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
         except RuntimeError as _oe:
             del ids
             if ('out of memory' in str(_oe).lower()) and _cur > 1:
-                for _attn, _sd, _cuts in _stats_snap:
-                    if _sd is not None:
-                        _attn._stats.__dict__.clear()
-                        _attn._stats.__dict__.update(_sd)
-                    if _cuts is not None:
-                        _attn._cuts[:] = _cuts
+                _restore_block_stats(_stats_snap)
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
                 _row_chunk = max(1, _cur // 2)
@@ -11911,6 +11972,67 @@ def _active_amp(device=None):
     return _amp_requested()
 
 
+def _normalise_amp_mode(v):
+    """Canonical ``None`` / ``'bf16'`` / ``'fp16'`` spelling of an AMP mode."""
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in ('', 'none', 'fp32', 'float32', 'off', '0', 'false', 'no'):
+        return None
+    if s in ('bf16', 'bfloat16'):
+        return 'bf16'
+    if s in ('fp16', 'float16', 'half'):
+        return 'fp16'
+    raise ValueError(f"unknown amp_dtype {v!r} (use bf16/fp16/fp32 or auto)")
+
+
+def _normalise_eager_batch(v):
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ('', 'auto'):
+            return None
+        if s in ('1', 'true', 'yes', 'on'):
+            return True
+        if s in ('0', 'false', 'no', 'off'):
+            return False
+    return bool(v)
+
+
+def _resolve_impl_modes(cfg=None, *, device=None):
+    """Resolve ``(amp_dtype, eager_batch)`` for one concrete run.
+
+    Explicit values in ``cfg`` always win, so a planner / report process and a
+    par.py child can recompute the same resume fingerprint from a persisted
+    manifest without probing their own CUDA state.  Only when the config says
+    ``auto`` (or omits the key) AND a concrete ``device`` is supplied is the
+    mode inferred locally.  With neither, the machine-independent canonical
+    default (fp32 / row-by-row) is used.
+
+    A frozen config naming a mode the device cannot provide is an error, not a
+    silent downgrade: the record would otherwise claim an implementation it
+    did not run.
+    """
+    cfg = {} if cfg is None else cfg
+    amp_raw = cfg.get('amp_dtype', 'auto')
+    eb_raw = cfg.get('eager_batch', 'auto')
+    amp_auto = isinstance(amp_raw, str) and amp_raw.strip().lower() == 'auto'
+    eb_auto = _normalise_eager_batch(eb_raw) is None
+
+    if amp_auto:
+        amp = _active_amp(device) if device is not None else None
+    else:
+        amp = _normalise_amp_mode(amp_raw)
+        if amp is not None and device is not None and getattr(device, 'type', str(device)) != 'cuda':
+            raise RuntimeError(f'run config requires amp_dtype={amp!r} but device={device} cannot provide CUDA autocast; pass amp_dtype=fp32 or run on CUDA instead of silently changing the numerical path')
+    if eb_auto:
+        eb = _eager_batch_active(device, cfg.get('batch_size')) if device is not None else False
+    else:
+        eb = bool(_normalise_eager_batch(eb_raw))
+        if eb and device is not None and not _eager_batch_active(device, cfg.get('batch_size')):
+            raise RuntimeError(f'run config requires eager_batch={eb!r} but device={device}/backend cannot provide the batched CUDA twin; pass eager_batch=false or fix the runtime instead of silently changing the implementation')
+    return amp, bool(eb)
+
+
 def _is_finite_number(v):
     return isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v)
 
@@ -11951,7 +12073,7 @@ def _check_token_batch(x, y, vocab, *, step=None):
         raise ValueError(f'batch target ids outside vocab [0, {int(vocab)}) at step={step}')
 
 
-_PARAM_FINITE_CHECK = os.environ.get('CSA_PARAM_FINITE_CHECK', 'off').strip().lower()
+_PARAM_FINITE_CHECK = os.environ.get('CSA_PARAM_FINITE_CHECK', 'sample').strip().lower()
 
 
 def _params_all_finite(model):
@@ -12099,13 +12221,13 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
         model.train(was)
 
 
-def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False, save_ckpt=None, ckpt_dir=None, diag_every=None, measure_eff=False):
+def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False, save_ckpt=None, ckpt_dir=None, diag_every=None, measure_eff=False, amp_dtype='auto', eager_batch='auto'):
     if steps < 1:
         raise ValueError(f'train_variant needs steps >= 1, got steps={steps}')
     set_seed(seed)
     _rng_fp = rng_fingerprint()
     _attb_bump_epoch()
-    _amp = _active_amp(device)
+    _amp, _ = _resolve_impl_modes({'amp_dtype': amp_dtype, 'eager_batch': False}, device=device)
     _amp_dtype = torch.bfloat16 if _amp == 'bf16' else (torch.float16 if _amp == 'fp16' else None)
     _scaler = torch.amp.GradScaler('cuda', enabled=(_amp == 'fp16')) if _amp is not None else None
     if _amp is not None:
@@ -12126,6 +12248,12 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if variant in PARAM_MATCHED | PARAM_MATCHED_V7 and float(mlp_ratio) == 4.0:
         raise ValueError(f'{variant} is a PARAM-MATCHED baseline but was given the default mlp_ratio=4; its MLP must be widened to match its sparse reference arm, or the comparison is not parameter-controlled. Pass mlp_ratio=variant_mlp_ratio(variant, vocab, d=..., n_layers=..., n_heads=..., d_head=..., seq_len=...).')
     cfgs = make_layer_cfgs(n_layers, variant)
+    # Validate an explicitly requested eager mode against this runtime before
+    # claiming it in the record; the concrete per-variant choice is still
+    # `_uses_batched_eager` (a variant with no CSA/HCA layer never takes the
+    # batched twin even when the backend is available).
+    _resolve_impl_modes({'amp_dtype': amp_dtype, 'eager_batch': eager_batch,
+                         'batch_size': batch_size}, device=device)
     _eager_batch_used = _uses_batched_eager(cfgs, device, batch_size)
     model = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
     _inner_model = model
@@ -12172,6 +12300,11 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             print(f'[health] WARNING: could not build the fixed train-eval batch ({type(_fe).__name__}: {_fe}); training CE will not be tracked')
             _fixed_eval = None
     _diag_stride = max(1, int(diag_every) if diag_every else max(1, int(steps) // 1000))
+    # Lightweight token-range/shape checks stay at roughly every 1% of the run
+    # (plus step 0 and any post-anomaly window), not once per 1024 steps: the
+    # CPU-side reduction is cheap and a single corrupted window can poison all
+    # later checkpoints.
+    _token_check_every = max(1, int(steps) // 100)
     _diag = {'step': [], 'ce': [], 'total_loss': [], 'comp_reg': [], 'boundary_pg': [],
              'grad_norm_pre_clip': [], 'update_norm': [], 'lr': [], 'clipped': [],
              'update_skipped': [], 'amp_scale': []}
@@ -12274,10 +12407,10 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             for g, _ls in zip(opt.param_groups, _lr_scales):
                 g['lr'] = base * _ls
             x, y = next(bpe)
-            # Corruption checks are a startup / anomaly guard, not a per-1%
-            # host sync.  Check the first batch, periodically (sparsely) and
-            # again after any non-finite event.
-            if step == 0 or (step + 1) % 1024 == 0 or _first_bad_step is not None:
+            # Corruption checks are a startup / anomaly guard: first batch,
+            # roughly every 1% of the run, and again after any non-finite
+            # event.  The check itself is a cheap host-side reduction.
+            if step == 0 or step % _token_check_every == 0 or _first_bad_step is not None:
                 try:
                     _check_token_batch(x, y, vocab, step=step + 1)
                 except (TypeError, ValueError) as _be:
@@ -12423,13 +12556,17 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                         except Exception:
                             _update_norm = None
             # Full-model isfinite scans are O(parameters) and force a sync.
-            # Default is off; occasional/after-anomaly sampling is opt-in via
-            # CSA_PARAM_FINITE_CHECK=sample (or =full for every check).
+            # The default is a low-frequency sample (step 0, after anomalies,
+            # and every 1024 steps) so a corrupted update cannot run for an
+            # entire panel unnoticed; CSA_PARAM_FINITE_CHECK=full scans every
+            # 256 steps and =off disables it.
+            _param_full = _PARAM_FINITE_CHECK in ('always', 'full', '1', 'true', 'on')
+            _param_sample = _PARAM_FINITE_CHECK in ('sample', 'auto')
             _param_check_due = (
-                _PARAM_FINITE_CHECK in ('always', 'full', '1', 'true', 'on')
-                or (_PARAM_FINITE_CHECK in ('sample', 'auto')
-                    and (step == 0 or _first_bad_step is not None)))
-            if (_step_ok and _param_check_due and step % 256 == 0
+                (_param_full and (step % 256 == 0 or _first_bad_step is not None))
+                or (_param_sample and (step == 0 or _first_bad_step is not None
+                                       or (step + 1) % 1024 == 0)))
+            if (_step_ok and _param_check_due
                     and not _params_all_finite(_inner_model)):
                 _nan_events.append({'step': step + 1, 'kind': 'param', 'loss': _loss_item,
                                     'grad_norm': _gn_pre, 'lr': base})
@@ -12621,7 +12758,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         except Exception as _ee:
             print(f'[efficiency] WARNING: measurement failed ({type(_ee).__name__}: {_ee})')
             _efficiency = {'status': 'error', 'error': f'{type(_ee).__name__}: {_ee}'}
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world, 'train_time_s': wall, 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world, 'train_time_s': wall, 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
               # Review 3: the token-level evidence behind the reported PPL.
               # `nll_sum / n_tokens` is the pooled-NLL estimator; the per-row
               # rows let a report bootstrap DOCUMENT uncertainty instead of
@@ -12718,6 +12855,9 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
         except Exception:
             freq = None
     bnd_np = np.asarray(val_bnd) if val_bnd is not None else None
+    if bnd_np is not None and bnd_np.shape != vb.shape:
+        print(f'[analyze_errors] WARNING: boundary mask shape {bnd_np.shape} != val_batch shape {vb.shape} — boundary-token statistics are OMITTED rather than computed from a misaligned/truncated mask')
+        bnd_np = None
     tok = tokenizer
     tok_warned = False
 
@@ -14751,11 +14891,16 @@ def _read_summary_json(path):
     return summary
 
 
-def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch):
+def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch, device=None):
     """The resume fingerprint of a run() cell.  The parent planner and every
     par.py child compute the exact same string: the child re-serves the token
-    ids from the same cache files, and `_ids_fp` is content-based, so the
-    fingerprint never depends on which process computed it."""
+    ids from the same cache files, and `_ids_fp` is content-based.
+
+    AMP / eager-twin modes are resolved from the run config (persisted in the
+    manifest) or from an explicitly supplied ``device``; they are never read
+    from this process's global CUDA state.  A zero-GPU planner can therefore
+    recompute a GPU panel's fingerprint from the same config, and a child
+    receives the parent's resolved modes through the job config."""
     _mg = cfg.get('matched')
     if _mg is None:
         _mkey = 'default'
@@ -14763,9 +14908,25 @@ def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch):
         _mkey = ','.join(sorted((str(_x) for _x in _mg)))
     cfg.setdefault('warmup', 50)
     cfg.setdefault('comp_lambda', 0.05)
-    _eb = int(_eager_batch_active(batch_size=cfg.get('batch_size')))
-    _amp = _active_amp() or 'fp32'
-    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_tk{training_knobs_fingerprint()}_amp{_amp}_eb{_eb}_cs{code_stamp()}'
+    _declared_impl = any(
+        (k in cfg) and not (isinstance(cfg.get(k), str) and cfg.get(k).strip().lower() == 'auto')
+        for k in ('amp_dtype', 'eager_batch'))
+    _amp_mode, _eb = _resolve_impl_modes(cfg, device=device)
+    if device is None and not _declared_impl:
+        # No machine-dependent implementation descriptor enters the content
+        # fingerprint.  Resolve to the canonical fp32/row-loop descriptor
+        # explicitly (not via training_knobs()'s global DEVICE inference).
+        try:
+            _tk = training_knobs_fingerprint(amp_dtype=None, eager_batch=False)
+        except TypeError:
+            # Keep callers that replace training_knobs() with a zero-argument
+            # test double working; their digest is the canonical one on CPU.
+            _tk = training_knobs_fingerprint()
+    else:
+        _tk = training_knobs_fingerprint(amp_dtype=_amp_mode, eager_batch=_eb)
+    _amp = _amp_mode or 'fp32'
+    _ae = _adaptive_exact_limit()
+    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_tk{_tk}_amp{_amp}_eb{int(_eb)}_ae{_ae}_cs{code_stamp()}'
 
 
 def _plan_run(cfg, summary_path, fp):
@@ -14866,9 +15027,9 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
         try:
             _save_mode = cfg.get('save_ckpt', os.environ.get('CSA_SAVE_CKPT', 'both'))
             _ckpt_dir = cfg.get('ckpt_dir') or os.path.join(outdir, 'checkpoints')
-            rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts, save_ckpt=_save_mode, ckpt_dir=_ckpt_dir, diag_every=cfg.get('diag_every'), measure_eff=cfg.get('measure_efficiency', True))
+            rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts, save_ckpt=_save_mode, ckpt_dir=_ckpt_dir, diag_every=cfg.get('diag_every'), measure_eff=cfg.get('measure_efficiency', True), amp_dtype=cfg.get('amp_dtype', 'auto'), eager_batch=cfg.get('eager_batch', 'auto'))
             _prov = prov if prov is not None else experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
-            _hp = run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v], data_version=_prov.get('data', {}).get('data_version'))
+            _hp = run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v], data_version=_prov.get('data', {}).get('data_version'), amp_dtype=rec.get('amp_dtype', 'auto'), eager_batch=rec.get('eager_batch', 'auto'))
             _curve_ref = None
             _curve_losses = []
             _curve_ph = []
@@ -14996,8 +15157,14 @@ def run_cell_job(job):
     if torch.cuda.is_available():
         _pin_cuda_determinism()
     # The parent already computed the identical fingerprint/provenance over
-    # this corpus; reuse them.
-    fp = job.get('fp') or _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch)
+    # this corpus; reuse them.  If an older job payload lacks the resolved
+    # implementation modes, resolve them from THIS child's device and pin them
+    # into the config so the fingerprint and the training record agree.
+    if 'amp_dtype' not in cfg or 'eager_batch' not in cfg:
+        _amp_mode, _eager_mode = _resolve_impl_modes(cfg, device=DEVICE)
+        cfg['amp_dtype'] = 'fp32' if _amp_mode is None else _amp_mode
+        cfg['eager_batch'] = bool(_eager_mode)
+    fp = job.get('fp') or _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch, device=DEVICE)
     return _run_cell(cfg, job['v'], job['seed'], guard=guard, ratios={}, fp=fp, train_ids=train_ids, val_batch=val_batch, vocab=vocab, val_bnd=val_bnd, prebook=True, prov=job.get('prov'))
 
 
@@ -15051,6 +15218,13 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     _first_seed, _last_seed = _seeds[0], _seeds[-1]
     _variants = list(cfg.get('variants') or [])
     _arch = {'d': int(d), 'n_layers': int(n_layers), 'n_heads': int(n_heads), 'd_head': int(d_head)}
+    # Resolve the numerical implementation ONCE for this panel and persist the
+    # concrete values in the config.  The resume fingerprint, the par.py job
+    # payloads and the manifest then all describe the same run without any
+    # later process having to infer modes from its own CUDA visibility.
+    _amp_mode, _eager_mode = _resolve_impl_modes(cfg, device=DEVICE)
+    cfg['amp_dtype'] = 'fp32' if _amp_mode is None else _amp_mode
+    cfg['eager_batch'] = bool(_eager_mode)
     # A confirmation / scale panel runs with deterministic kernels by default
     # (an explicit CSA_DETERMINISTIC=0 still opts out) and treats the
     # same-machine reproducibility check as mandatory below.
@@ -15144,7 +15318,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         print(f'[seed-plan] note unavailable ({type(_sp_err).__name__}: {_sp_err}) — continuing')
     if torch.cuda.is_available():
         _pin_cuda_determinism()
-    fp = _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch)
+    fp = _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch, device=DEVICE)
     prov = experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
     ratios = _panel_ratios(vocab)
     _data_fp = _ids_fp(train_ids)

@@ -109,7 +109,13 @@ def main(argv=None):
         tok = None
     n_rows = min(int(args.max_rows), int(val_batch.shape[0]))
     val_batch = np.ascontiguousarray(val_batch[:n_rows, :seq_len])
-    val_bnd = np.ascontiguousarray(val_bnd[:n_rows, :seq_len]) if val_bnd is not None and np.asarray(val_bnd).shape[0] >= n_rows else None
+    if val_bnd is not None:
+        _vb = np.asarray(val_bnd)
+        if _vb.ndim != 2 or _vb.shape[0] < n_rows or _vb.shape[1] < seq_len:
+            print(f'[errors] WARNING: boundary mask shape {_vb.shape} cannot cover {n_rows} rows x {seq_len} tokens — omitting boundary-token statistics instead of silently truncating them')
+            val_bnd = None
+        else:
+            val_bnd = np.ascontiguousarray(_vb[:n_rows, :seq_len])
     print(f'[errors] scoring {n_rows} validation rows x {seq_len} tokens with {os.path.basename(args.ckpt)}')
     res = L.analyze_errors(model, val_batch, vocab, device, tokenizer=tok,
                            top_n=args.top_sequences, top_tokens=args.top_tokens,

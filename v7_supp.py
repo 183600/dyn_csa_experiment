@@ -1099,7 +1099,7 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
         try:
             rec = train_warmup(v, train_ids, val_batch, vocab, seed=seed, warm_steps=warm, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=_deadline)
             _prov = L.experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
-            _hp = L.run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v])
+            _hp = L.run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v], amp_dtype=rec.get('amp_dtype', 'auto'), eager_batch=rec.get('eager_batch', 'auto'))
             _hp['warm_steps'] = int(warm)
 
             def _apply(summary):
@@ -2378,7 +2378,9 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         try:
             _prov = L.experiment_provenance(_prov_cfg, train_ids=(train_ids if _tr is not None else None), val_batch=val_ids, vocab=vocab)
             _rec['provenance'] = _prov
-            _rec['hyperparams'] = L.run_hyperparameters({'steps': steps, 'n_train_tokens': _prov_cfg['n_train_tokens'], 'seq_len': train_len, 'batch_size': batch_size, 'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 50, 'comp_lambda': 0.05, 'delta_lr_mult': 10.0}, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, vocab=vocab, mlp_ratio=mr)
+            _known_knobs = ((_tr or {}).get('train_knobs') if _tr is not None else _prev_resume.get('train_knobs'))
+            _known_knobs = _known_knobs if isinstance(_known_knobs, dict) else {}
+            _rec['hyperparams'] = L.run_hyperparameters({'steps': steps, 'n_train_tokens': _prov_cfg['n_train_tokens'], 'seq_len': train_len, 'batch_size': batch_size, 'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 50, 'comp_lambda': 0.05, 'delta_lr_mult': 10.0}, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, vocab=vocab, mlp_ratio=mr, amp_dtype=_known_knobs.get('amp_dtype', 'auto'), eager_batch=_known_knobs.get('eager_batch', 'auto'))
             if _tr is not None:
                 _rec['data_fp'] = _prov['data'].get('train_fp') or _prov['data'].get('val_fp')
                 _rec['rng_fp'] = _tr.get('rng_fp')
