@@ -809,7 +809,7 @@ def _v7_knobs_fp(device=None, batch_size=None):
 ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
-def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None):
+def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None, save_ckpt=None, ckpt_dir=None, measure_eff=True, diag_every=None):
     L.set_seed(seed)
     _rng_fp = L.rng_fingerprint()
     L._attb_bump_epoch()
@@ -822,6 +822,12 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     cfgs = L.make_layer_cfgs(n_layers, variant)
     if warm_steps > 0 and any((getattr(c, 'kind', None) != 'full' and (not getattr(c, 'use_sink', True)) for c in cfgs)):
         raise ValueError(f'{variant} disables the attention sink on its sparse layers; the dense-warmup forward is only validated against sink-enabled layers, so running it under warmup would mix two protocols')
+    _save_mode = str(save_ckpt or '').strip().lower()
+    if _save_mode not in ('', 'none', 'off', '0', 'final'):
+        print(f'[ckpt] train_warmup ignores unknown save_ckpt={save_ckpt!r} (use final/none)')
+        _save_mode = ''
+    if _save_mode in ('none', 'off', '0'):
+        _save_mode = ''
     model = L.SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
     n_param = L.count_params(model)
     print(f'\n[{variant} seed={seed}] WARMUP warm_steps={warm_steps} total={steps}  params={n_param / 1000000.0:.2f}M  mlp_ratio={mlp_ratio:.2f}')
@@ -843,6 +849,30 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         return lr * (L.LR_FLOOR_MULT + L.LR_COSINE_AMP * (1.0 + math.cos(math.pi * t)))
     bpe = L.batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
     _eval_batch = val_batch[:eval_subset]
+    # Health/NaN monitoring mirrors exp_lib.train_variant: a fixed training
+    # batch (own RNG stream, never perturbing `bpe`) tracks train CE on the
+    # eval grid so the longest runs in the study get a curve_health verdict
+    # instead of only a final number.
+    _fixed_eval = None
+    if eval_every and train_ids is not None and int(eval_every) > 0:
+        try:
+            _fixed_eval = L._fixed_train_eval_batch(train_ids, seq_len, batch_size, device, seed)
+        except Exception as _fe:
+            print(f'[health] WARNING: could not build the fixed train-eval batch ({type(_fe).__name__}: {_fe}); training CE will not be tracked')
+            _fixed_eval = None
+    _diag_stride = max(1, int(diag_every) if diag_every else max(1, int(steps) // 1000))
+    _token_check_every = max(1, int(steps) // 100)
+    _nan_events = []
+    _clip_steps = 0
+    _skipped_steps = 0
+    _nonfinite_loss_steps = 0
+    _nonfinite_grad_steps = 0
+    _first_bad_step = None
+    _health_history = []
+    _best_val_ppl = None
+    _best_step = None
+    _last_train_ce = None
+    _gn_hist = []
     warm_on = warm_steps > 0
     for _blk in model.blocks:
         _blk.attn._dense_warmup = warm_on
@@ -887,6 +917,11 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             for g in opt.param_groups:
                 g['lr'] = base * g.get('lr_scale', 1.0)
             x, y = next(bpe)
+            if step == 0 or step % _token_check_every == 0 or _first_bad_step is not None:
+                try:
+                    L._check_token_batch(x, y, vocab, step=step + 1)
+                except (TypeError, ValueError) as _be:
+                    raise RuntimeError(f'[data] bad training batch at step {step + 1}: {_be}') from _be
             logits = None
             ce = model.ce_loss(x, y, vocab)
             _blp = getattr(model, 'boundary_logp', None)
@@ -902,11 +937,47 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
                 loss = ce + comp_lambda * model.comp_reg + L.BOUNDARY_PG_COEF * (-(_ce_d - _ce_baseline) * _blp / _bdec)
             else:
                 loss = ce + comp_lambda * model.comp_reg
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), L.GRAD_CLIP_NORM)
-            opt.step()
-            # No gradient is needed after the update.
-            opt.zero_grad(set_to_none=True)
+            _loss_item = float(loss.detach().item())
+            _gn_pre = None
+            _step_ok = True
+            if not math.isfinite(_loss_item):
+                # Same contract as exp_lib.train_variant: a non-finite loss
+                # must never reach the parameters; the step is skipped and the
+                # event is recorded for the opt_diag_summary audit trail.
+                _step_ok = False
+                _skipped_steps += 1
+                _nonfinite_loss_steps += 1
+                if _first_bad_step is None:
+                    _first_bad_step = step + 1
+                _nan_events.append({'step': step + 1, 'kind': 'loss', 'loss': _loss_item,
+                                    'ce': float(ce.detach().item()), 'lr': base})
+                print(f'  [nan] non-finite loss at step {step + 1}; skipping the optimizer update')
+                opt.zero_grad(set_to_none=True)
+            else:
+                loss.backward()
+                _gn = torch.nn.utils.clip_grad_norm_(model.parameters(), L.GRAD_CLIP_NORM)
+                _gn_pre = float(_gn.detach().item()) if torch.is_tensor(_gn) else float(_gn)
+                if not math.isfinite(_gn_pre):
+                    _step_ok = False
+                    _skipped_steps += 1
+                    _nonfinite_grad_steps += 1
+                    if _first_bad_step is None:
+                        _first_bad_step = step + 1
+                    _nan_events.append({'step': step + 1, 'kind': 'grad', 'grad_norm': _gn_pre,
+                                        'loss': _loss_item, 'lr': base})
+                    print(f'  [nan] non-finite gradient norm at step {step + 1}; zeroing grads and skipping the update')
+                    opt.zero_grad(set_to_none=True)
+                else:
+                    _clip_steps += int(_gn_pre > L.GRAD_CLIP_NORM)
+                    if step % _diag_stride == 0 or step == steps - 1:
+                        _gn_hist.append(_gn_pre)
+                    opt.step()
+                    # No gradient is needed after the update.
+                    opt.zero_grad(set_to_none=True)
+            if _step_ok and (step == 0 or _first_bad_step is not None or (step + 1) % 1024 == 0) and not L._params_all_finite(model):
+                _nan_events.append({'step': step + 1, 'kind': 'param', 'loss': _loss_item,
+                                    'grad_norm': _gn_pre, 'lr': base})
+                raise FloatingPointError(f'non-finite parameter values after step {step + 1}; aborting instead of training on corrupted weights')
             if _ce_d is not None:
                 _ce_baseline.mul_(0.99).add_(_ce_d, alpha=0.01)
             _lbuf.append(ce.detach())
@@ -922,7 +993,28 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
                 gc.collect()
             if eval_every and ((step + 1) % eval_every == 0 or step == steps - 1):
                 _pv = float(L.eval_ppl(model, _eval_batch, device))
-                (warm_hist if getattr(model.blocks[0].attn, '_dense_warmup', False) else ppl_hist).append([step + 1, _pv])
+                _dense_now = getattr(model.blocks[0].attn, '_dense_warmup', False)
+                (warm_hist if _dense_now else ppl_hist).append([step + 1, _pv])
+                if not _dense_now:
+                    # Sparse-phase points only: the dense prefix is a
+                    # different protocol, so mixing it into the health
+                    # classification would compare across a protocol switch.
+                    _train_ce = None
+                    if _fixed_eval is not None:
+                        try:
+                            _train_ce, _ = L._lm_batch_metrics(model, _fixed_eval[0], _fixed_eval[1], vocab)
+                        except Exception as _te:
+                            print(f'[health] WARNING: fixed train-CE evaluation failed ({type(_te).__name__}: {_te}); train CE stays unmonitored at this point')
+                            _train_ce = None
+                    if L._is_finite_number(_train_ce):
+                        _last_train_ce = _train_ce
+                    _val_ce = math.log(_pv) if L._is_finite_number(_pv) and _pv > 0 else float('nan')
+                    _health_history.append({'step': step + 1, 'val_ppl': _pv, 'val_ce': _val_ce,
+                                            'train_ce': _train_ce,
+                                            'gap': (_val_ce - _train_ce) if (math.isfinite(_val_ce) and L._is_finite_number(_train_ce)) else None})
+                    if L._is_finite_number(_pv) and _pv > 0 and (_best_val_ppl is None or _pv < _best_val_ppl):
+                        _best_val_ppl = _pv
+                        _best_step = step + 1
             if log_every and (step % log_every == 0 or step == steps - 1):
                 if _lbuf:
                     losses.extend(torch.stack(_lbuf).tolist())
@@ -952,15 +1044,80 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
+    if _health_history:
+        _health = L.classify_training_health(_health_history)
+    else:
+        _health = {'status': 'unmonitored', 'reason': 'no sparse-phase validation eval points (eval_every=0 or all points fell in the dense prefix)',
+                   'n_points': 0, 'best_step': None, 'best_val_ppl': None,
+                   'final_val_ppl': None, 'final_minus_best': None}
+    _grad_vals = [float(v) for v in _gn_hist if L._is_finite_number(v)]
+    _opt_summary = {
+        'n_steps': int(steps), 'n_diag_points': len(_gn_hist),
+        'grad_norm_mean': (sum(_grad_vals) / len(_grad_vals)) if _grad_vals else None,
+        'grad_norm_max': max(_grad_vals) if _grad_vals else None,
+        'clip_steps': int(_clip_steps),
+        'clip_fraction': (float(_clip_steps) / max(1, int(steps))),
+        'skipped_updates': int(_skipped_steps),
+        'nonfinite_loss_steps': int(_nonfinite_loss_steps),
+        'nonfinite_grad_steps': int(_nonfinite_grad_steps),
+        'first_bad_step': _first_bad_step,
+        'diag_stride': int(_diag_stride),
+        'events': _nan_events[:20],
+    }
+    if _health.get('status') != 'healthy' and _health.get('status') != 'unmonitored':
+        print(f'[health] WARNING: {variant} seed={seed} curve_health={_health.get("status")} ({_health.get("reason")})')
+    _checkpoints = {}
+    if _save_mode and ckpt_dir:
+        try:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            _ck = os.path.join(ckpt_dir, f'{variant}_seed{seed}_final.pt')
+            _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mlp_ratio, 'vocab': vocab, 'd': d,
+                                'n_layers': n_layers, 'n_heads': n_heads, 'd_head': d_head,
+                                'train_len': seq_len, 'max_seq': seq_len, 'code': CKPT_CODE,
+                                'variant': variant, 'seed': int(seed), 'step': int(steps),
+                                'sd': model.state_dict(),
+                                'val_ppl': (float(ppl) if L._is_finite_number(ppl) else None),
+                                'curve_health': _health,
+                                'health_history': _health_history,
+                                'opt_diag_summary': _opt_summary,
+                                'best_step': _best_step, 'best_val_ppl': _best_val_ppl,
+                                'train_ce_fixed_final': _last_train_ce,
+                                'warm_steps': int(warm_steps), 'params': int(n_param),
+                                'rng_fp': _rng_fp, 'train_fp': L._ids_fp(train_ids),
+                                'val_fp': L._ids_fp(np.ascontiguousarray(np.asarray(val_batch)).reshape(-1)),
+                                'losses': losses, 'steps': int(steps)}, _ck)
+            _checkpoints['final'] = {'path': _ck, 'step': int(steps)}
+            print(f'  [ckpt] saved final checkpoint {_ck}')
+        except Exception as _se:
+            print(f'[ckpt] WARNING: could not save the final checkpoint ({type(_se).__name__}: {_se}); the run continues, but this weight is unavailable for post-hoc analysis')
+    _efficiency = None
+    if measure_eff:
+        try:
+            _eff_ids = np.ascontiguousarray(np.asarray(_eval_batch)[:min(4, int(np.asarray(_eval_batch).shape[0]))]) if _eval_batch is not None else None
+            if _eff_ids is not None and len(_eff_ids):
+                _efficiency = L.measure_efficiency(model, _eff_ids, device, warmup=1, iters=5, decode_tokens=4)
+        except Exception as _ee:
+            print(f'[efficiency] WARNING: measurement failed ({type(_ee).__name__}: {_ee})')
+            _efficiency = {'status': 'error', 'error': f'{type(_ee).__name__}: {_ee}'}
     res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': _v7_knobs(device, batch_size), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids),
            'nll_sum': _eval_stats.get('nll_sum'), 'n_tokens': _eval_stats.get('n_tokens'),
            'nll_per_row': _eval_stats.get('nll_per_row'), 'n_tokens_per_row': _eval_stats.get('n_tokens_per_row'),
            'eval_rows': _eval_stats.get('eval_rows'), 'eval_seed': _eval_stats.get('eval_seed'),
            'eval_subset': _eval_stats.get('eval_subset'),
-           'eval_fp': L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
+           'eval_fp': L._ids_fp(np.ascontiguousarray(np.asarray(val_batch)).reshape(-1)),
            'param_breakdown': L.param_breakdown(model),
            'kv_cache_elements_per_token': L.kv_cache_elements_per_token(model),
-           'train_objective': L.train_objective(model, comp_lambda=comp_lambda, delta_lr_mult=delta_lr_mult)}
+           'train_objective': L.train_objective(model, comp_lambda=comp_lambda, delta_lr_mult=delta_lr_mult),
+           'curve_health': _health, 'health_history': _health_history,
+           'opt_diag_summary': _opt_summary,
+           'best_step': _best_step, 'best_val_ppl': _best_val_ppl,
+           'final_minus_best': (float(ppl) - float(_best_val_ppl)) if (L._is_finite_number(ppl) and L._is_finite_number(_best_val_ppl)) else None,
+           'train_ce_fixed_final': _last_train_ce,
+           'train_val_gap_final': _health.get('gap_last'),
+           'eval_subset_rows': int(np.asarray(_eval_batch).shape[0]) if _eval_batch is not None else 0,
+           'nonfinite_loss_steps': int(_nonfinite_loss_steps),
+           'nonfinite_grad_steps': int(_nonfinite_grad_steps),
+           'efficiency': _efficiency, 'checkpoints': _checkpoints}
     del model, opt, bpe, decay, ndecay, dpar
     gc.collect()
     if device.type == 'cuda':

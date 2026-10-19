@@ -155,6 +155,57 @@ def t_bootstrap_mean_ci():
     assert L.bootstrap_mean_ci([1.0, float('nan'), float('inf')]) is None
 
 
+def t_training_health_classifier():
+    # Overfitting: train CE falls while val CE rises in the tail.
+    hist = [{'step': i * 100, 'train_ce': 6.0 - 0.30 * i, 'val_ce': 4.0 + 0.05 * i,
+             'val_ppl': 55.0 + 0.5 * i} for i in range(6)]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'overfitting', h
+    assert h['best_step'] is not None and h['final_minus_best'] is not None, h
+    # Underfitting/stalled: neither curve decreases.
+    hist = [{'step': i * 100, 'train_ce': 4.0 + 0.001 * i, 'val_ce': 4.0 + 0.001 * i,
+             'val_ppl': 60.0 + 0.01 * i} for i in range(6)]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'underfitting_or_stalled', h
+    # Healthy: train falls, val does not rise.
+    hist = [{'step': i * 100, 'train_ce': 6.0 - 0.30 * i, 'val_ce': 4.0 - 0.02 * i,
+             'val_ppl': 55.0 - 0.5 * i} for i in range(6)]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'healthy', h
+    # A MEASURED non-finite point must be flagged...
+    hist = [{'step': i * 100, 'train_ce': 6.0 - 0.30 * i, 'val_ce': 4.0 - 0.02 * i,
+             'val_ppl': 55.0 - 0.5 * i} for i in range(6)]
+    hist[3]['val_ppl'] = float('nan')
+    hist[3]['val_ce'] = float('nan')
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'nonfinite' and h['n_nonfinite'] == 2, h
+    # ...but an UNMONITORED train CE (None) must not be miscounted as
+    # non-finite: the val-only classification speaks, and the reason says
+    # the train curve is missing.
+    hist = [{'step': i * 100, 'train_ce': None, 'val_ce': 4.0 - 0.05 * i,
+             'val_ppl': 55.0 - 0.5 * i} for i in range(6)]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'healthy' and h['n_nonfinite'] == 0, h
+    assert 'train CE unmonitored' in h['reason'] and h['n_train_ce_measured'] == 0, h
+    hist = [{'step': i * 100, 'train_ce': None, 'val_ce': 4.0 + 0.05 * i,
+             'val_ppl': 55.0 + 0.5 * i} for i in range(6)]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'validation_degrading' and h['n_nonfinite'] == 0, h
+    hist = [{'step': i * 100, 'train_ce': None, 'val_ce': 4.0, 'val_ppl': 55.0} for i in range(6)]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'underfitting_or_stalled', h
+    # A train CE that was measured and came back NaN is still nonfinite.
+    hist = [{'step': i * 100, 'train_ce': (float('nan') if i == 2 else 6.0 - 0.3 * i),
+             'val_ce': 4.0 - 0.02 * i, 'val_ppl': 55.0 - 0.5 * i} for i in range(6)]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'nonfinite' and h['n_nonfinite'] == 1, h
+    # Too few points stays insufficient regardless of which side is missing.
+    h = L.classify_training_health([{'step': 100, 'train_ce': 5.0, 'val_ce': 4.0, 'val_ppl': 55.0}])
+    assert h['status'] == 'insufficient_data', h
+    h = L.classify_training_health([])
+    assert h['status'] == 'insufficient_data', h
+
+
 def t_v7_rope_gather_rotation_order():
     # The per-chunk RoPE refactor rotates the gathered window rows.  The
     # gathered tensor is [queries, lanes, heads, head_dim], so the position
@@ -2321,6 +2372,7 @@ def main():
     _check('A4b TOST Student-t CI + margin boundary', t_tost_student_t_and_boundary)
     _check('A4c safe exp + token-pooled document CI', t_safe_exp_and_doc_ci)
     _check('A4d deterministic document bootstrap CI', t_bootstrap_mean_ci)
+    _check('A4e training-health classifier: measured vs unmonitored vs nonfinite', t_training_health_classifier)
     _check('B1 legacy modes bit-exact', t_legacy_modes_bitexact)
     _check('B2 determinism + target-zone safety', t_corruption_deterministic_and_paired)
     _check('B3 new modes span/doc/topical', t_new_modes_do_something)

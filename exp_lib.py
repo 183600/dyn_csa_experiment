@@ -259,16 +259,26 @@ def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None)
     """
     entries = [h for h in (history or []) if isinstance(h, dict)]
     n_bad = 0
+    n_train_measured = 0
     for h in entries:
         for key in ('train_ce', 'val_ce', 'val_ppl'):
-            if key in h:
-                try:
-                    v = float(h.get(key))
-                except (TypeError, ValueError):
-                    n_bad += 1
-                    continue
-                if not math.isfinite(v):
-                    n_bad += 1
+            v = h.get(key)
+            if v is None:
+                # None = this quantity was never measured at this point
+                # (no fixed-eval batch / the evaluation failed).  It must not
+                # be counted as a non-finite MEASUREMENT: that would label a
+                # healthy validation curve `nonfinite` and block or excuse a
+                # run for the wrong reason.
+                continue
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                n_bad += 1
+                continue
+            if not math.isfinite(v):
+                n_bad += 1
+            if key == 'train_ce':
+                n_train_measured += 1
     train_s = _curve_slope(entries, 'train_ce', k=tail_k)
     val_s = _curve_slope(entries, 'val_ce', k=tail_k)
     val_ppl_points = []
@@ -294,7 +304,24 @@ def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None)
     if n_bad:
         status = 'nonfinite'
         reason = f'{n_bad} non-finite curve point(s); inspect the first bad step before using this run'
-    elif len(entries) < 2 or train_s is None or val_s is None:
+    elif len(entries) < 2:
+        status = 'insufficient_data'
+        reason = 'fewer than two finite train/validation eval points; cannot classify'
+    elif train_s is None and val_s is not None:
+        # Train CE was never measured (or has no finite tail points): fall
+        # back to a validation-only classification instead of silently
+        # reporting `nonfinite`/`insufficient_data`.  Overfitting cannot be
+        # attributed without the train curve, so the reason says so.
+        if val_s > slope_tol:
+            status = 'validation_degrading'
+            reason = 'train CE unmonitored; validation CE is rising in the tail (val-only classification)'
+        elif val_s < -slope_tol:
+            status = 'healthy'
+            reason = 'train CE unmonitored; validation CE is falling in the tail (val-only classification: overfitting cannot be ruled out without the train curve)'
+        else:
+            status = 'underfitting_or_stalled'
+            reason = 'train CE unmonitored; validation CE is flat in the tail (val-only classification)'
+    elif train_s is None or val_s is None:
         status = 'insufficient_data'
         reason = 'fewer than two finite train/validation eval points; cannot classify'
     elif train_s < -slope_tol and val_s > slope_tol:
@@ -314,6 +341,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None)
         'reason': reason,
         'n_points': len(entries),
         'n_nonfinite': int(n_bad),
+        'n_train_ce_measured': int(n_train_measured),
         'tail_k': int(tail_k),
         'train_ce_slope_per_step': train_s,
         'val_ce_slope_per_step': val_s,
@@ -12784,17 +12812,22 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     sub_ppl = float('nan')
                     _ci = {'ppl': None, 'doc_ce_sem': None, 'ppl_ci95_low': None,
                            'ppl_ci95_high': None, 'n_docs': 0}
-                _train_ce = float('nan')
+                _train_ce = None
                 if _fixed_eval is not None:
                     try:
                         _train_ce, _train_acc = _lm_batch_metrics(_inner_model, _fixed_eval[0], _fixed_eval[1], vocab)
                     except Exception as _te:
-                        print(f'[health] WARNING: fixed train-CE evaluation failed ({type(_te).__name__}: {_te})')
-                _last_train_ce = _train_ce if math.isfinite(_train_ce) else _last_train_ce
+                        print(f'[health] WARNING: fixed train-CE evaluation failed ({type(_te).__name__}: {_te}); train CE stays unmonitored at this point')
+                        _train_ce = None
+                # None = not measured (infra missing/failed); NaN = measured
+                # and non-finite.  classify_training_health counts only the
+                # latter as a non-finite curve point.
+                if _is_finite_number(_train_ce):
+                    _last_train_ce = _train_ce
                 _val_ce = math.log(sub_ppl) if (_is_finite_number(sub_ppl) and sub_ppl > 0) else float('nan')
                 _entry = {'step': step + 1, 'val_ppl': sub_ppl, 'val_ce': _val_ce,
                           'train_ce': _train_ce,
-                          'gap': (_val_ce - _train_ce) if (math.isfinite(_val_ce) and math.isfinite(_train_ce)) else None,
+                          'gap': (_val_ce - _train_ce) if (math.isfinite(_val_ce) and _is_finite_number(_train_ce)) else None,
                           'val_ci95_low': _ci.get('ppl_ci95_low'),
                           'val_ci95_high': _ci.get('ppl_ci95_high'),
                           'val_doc_ce_sem': _ci.get('doc_ce_sem'),
