@@ -1162,7 +1162,7 @@ def _device_segment_geometry(n, cuts, min_block, max_block, device):
         bid = torch.zeros((B, n), dtype=torch.long, device=dev)
         counts = torch.ones((B, 1), dtype=torch.long, device=dev) if n == 1 else torch.zeros((B, 1), dtype=torch.long, device=dev)
         return bid, counts, torch.zeros((B, max(n - 1, 0)), dtype=torch.long, device=dev)
-    idx = torch.arange(n - 1, device=dev)
+    idx = _range_cache(0, n - 1, dev)
     big = n + 1
     # Same explicit-safe-bound convention as the host segmenter: with a known
     # length, "no maximum" means a bound of n, which cannot force a cut.
@@ -1172,7 +1172,7 @@ def _device_segment_geometry(n, cuts, min_block, max_block, device):
     # two positions (n-1, n) that have no following cut.
     nc = torch.where(cuts, idx[None, :], big).flip(-1).cummin(-1).values.flip(-1)
     nc = _F.pad(nc, (0, 2), value=big)
-    pos = torch.arange(n + 1, device=dev)
+    pos = _range_cache(0, n + 1, dev)
     _mb, _xb = int(min_block), int(max_block)
     nxt = torch.minimum(pos + _xb, torch.maximum(pos + _mb, nc + 1))
     nxt = torch.minimum(nxt, torch.as_tensor(n, dtype=torch.long, device=dev))
@@ -1588,16 +1588,25 @@ def _cache_put(cache, key, tensor, limit, total_of):
     st['total'] += _cache_item_bytes(key, tensor, total_of)
     total = st['total']
     if total > limit:
-        # One oldest-first pass.  Pinned entries are skipped but never force a
-        # rescan of the keys already visited.  The eviction order and the
-        # stopping condition are unchanged.
-        for _k in list(cache.keys()):
-            if total <= limit:
+        # Oldest-first eviction without copying the whole key list on every
+        # insert (the cache can hold thousands of small index tables).  A
+        # pinned entry is rotated to the recent end so the next iteration can
+        # reach an evictable one; if a full rotation finds none, the loop
+        # stops exactly like the former single-pass form.
+        while total > limit and cache:
+            _seen = 0
+            _n = len(cache)
+            while _seen < _n and total > limit:
+                _k = next(iter(cache))
+                if _is_pinned_key(_k):
+                    cache[_k] = cache.pop(_k)
+                    _seen += 1
+                    continue
+                st['total'] -= _cache_item_bytes(_k, cache.pop(_k), total_of)
+                total = st['total']
                 break
-            if _is_pinned_key(_k):
-                continue
-            st['total'] -= _cache_item_bytes(_k, cache.pop(_k), total_of)
-            total = st['total']
+            else:
+                break
     return total
 _ATB_CACHE = {}
 _ATB_EPOCH = 0
@@ -2743,24 +2752,43 @@ def _open_block_geometry(bid, n_blocks=None):
 
     `bid` is the segmenter's monotone, contiguous block-id row.  The returned
     integers are exact functions of that row; no block-tail quantity is read.
+    The geometry is therefore cached on the immutable block-id row: every
+    open-block layer reads the same bid object, so the bincount/cumsum/gather
+    work is shared instead of rebuilt per layer.
     """
     if bid.dim() != 1:
         raise ValueError(f'_open_block_geometry expects a 1-D block-id row, got {tuple(bid.shape)}')
+    _key = -1 if n_blocks is None else int(n_blocks)
+    _cache = getattr(bid, '_open_geo_cache', None)
+    if _cache is not None:
+        _hit = _cache.get(_key)
+        if _hit is not None:
+            return _hit
     n = int(bid.numel())
     if n == 0:
         z = bid.new_empty((0,))
-        return {'n': 0, 'n_blocks': 0, 'counts': z, 'starts': z, 'ends': z,
-                'start_of_token': z, 'offset': z, 'block_of_token': z}
-    B = int(n_blocks) if n_blocks is not None else int(bid.max().item()) + 1
-    n = int(bid.numel())
-    counts = torch.bincount(bid.reshape(-1).long(), minlength=B)[:B]
-    ends = torch.cumsum(counts, 0)
-    starts = ends - counts
-    start_of_token = starts[bid.long()]
-    offset = _arange_cache(n, bid.device) - start_of_token
-    return {'n': n, 'n_blocks': B, 'counts': counts, 'starts': starts,
-            'ends': ends, 'start_of_token': start_of_token, 'offset': offset,
-            'block_of_token': bid.long()}
+        geo = {'n': 0, 'n_blocks': 0, 'counts': z, 'starts': z, 'ends': z,
+               'start_of_token': z, 'offset': z, 'block_of_token': z}
+    else:
+        B = int(n_blocks) if n_blocks is not None else int(bid.max().item()) + 1
+        bid_long = bid.long()
+        counts = torch.bincount(bid.reshape(-1).long(), minlength=B)[:B]
+        ends = torch.cumsum(counts, 0)
+        starts = ends - counts
+        start_of_token = starts[bid_long]
+        offset = _arange_cache(n, bid.device) - start_of_token
+        geo = {'n': n, 'n_blocks': B, 'counts': counts, 'starts': starts,
+               'ends': ends, 'start_of_token': start_of_token, 'offset': offset,
+               'block_of_token': bid_long}
+    try:
+        if _cache is None:
+            _cache = {}
+            bid._open_geo_cache = _cache
+        if len(_cache) < 8:
+            _cache[_key] = geo
+    except (AttributeError, RuntimeError):
+        pass
+    return geo
 
 
 def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128,
@@ -2778,14 +2806,27 @@ def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128,
                     single per-query row, not an O(T^2) table.
       valid    [T, P] candidate validity (j < plen, or plen>0 for summaries)
     """
+    _ckey = None
+    if window_start is None:
+        _ckey = (int(n_blocks) if n_blocks is not None else -1,
+                 str(scope), int(window), bool(candidate_table))
+        _pcache = getattr(bid, '_open_prefix_cache', None)
+        if _pcache is not None:
+            _hit = _pcache.get(_ckey)
+            if _hit is not None:
+                return _hit
     geo = _open_block_geometry(bid, n_blocks=n_blocks)
+    # Drop the private cache scalars attached to the shared geometry dict.
+    _base_geo = {k: v for k, v in geo.items()
+                 if not (isinstance(k, str) and k.startswith('_'))}
     n, B = int(geo['n']), int(geo['n_blocks'])
     dev = bid.device
     if n == 0:
         z = bid.new_empty((0,))
-        return {'u_start': z, 'plen': z, 'token_idx': z[:, None],
-                'valid': torch.zeros((0, 1), dtype=torch.bool, device=dev),
-                **geo}
+        out = {'u_start': z, 'plen': z, 'token_idx': z[:, None],
+               'valid': torch.zeros((0, 1), dtype=torch.bool, device=dev),
+               **_base_geo}
+        return out
     t = _arange_cache(n, dev)
     s = geo['start_of_token']
     if str(scope) == 'full_prefix':
@@ -2809,14 +2850,15 @@ def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128,
         plen = (pend - s + 1).clamp_min(0)
     else:
         raise ValueError(f'unknown open_block_scope {scope!r}')
-    P_full = int(plen.max().item()) if n else 0
     # `prefix_summary` needs only ONE candidate per query; only the singleton
     # table is [T, P].  Never materialise an O(T^2) table for a summary just
-    # because a no-cap block is long.
+    # because a no-cap block is long.  The maximum prefix length is read from
+    # the device only when the singleton table actually needs its width, so
+    # the summary path performs no GPU->CPU synchronisation.
     if not candidate_table:
         P = 1
     else:
-        P = P_full
+        P = int(plen.max().item()) if n else 0
         # A full-prefix singleton table is [T, P]; for a pathological no-cap
         # block this can be O(T^2).  Fail explicitly instead of silently
         # exhausting GPU memory; the panel reports candidate growth and can
@@ -2837,8 +2879,19 @@ def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128,
         j = _arange_cache(P, dev)[None, :]
         token_idx = (u_start[:, None] + j).clamp(max=n - 1)
         valid = j < plen[:, None]
-    return {'u_start': u_start, 'plen': plen, 'token_idx': token_idx,
-            'valid': valid, 'window_start': win_start_t, **geo}
+    out = {'u_start': u_start, 'plen': plen, 'token_idx': token_idx,
+           'valid': valid, 'window_start': win_start_t, **_base_geo}
+    if _ckey is not None:
+        try:
+            _pcache = getattr(bid, '_open_prefix_cache', None)
+            if _pcache is None:
+                _pcache = {}
+                bid._open_prefix_cache = _pcache
+            if len(_pcache) < 8:
+                _pcache[_ckey] = out
+        except (AttributeError, RuntimeError):
+            pass
+    return out
 
 
 def _prefix_overlap_values(geo, Xb, Zb, B_pos_b, overlap):
@@ -2862,7 +2915,14 @@ def _prefix_overlap_values(geo, Xb, Zb, B_pos_b, overlap):
     ov_start = torch.cat([starts[:1], ov_start_prev], 0)
     ov_len = torch.cat([torch.zeros_like(ov_len_prev[:1]), ov_len_prev], 0)
     prev_start_full = torch.cat([starts[:1], prev_start], 0)
-    Wb = int(ov_len.max().item()) if B else 0
+    # The overlap-lane width is a pure function of (geo, overlap): cache it on
+    # the shared geometry dict so the GPU->CPU maximum is read once per
+    # forward instead of once per layer.
+    _wkey = '_ov_w_' + str(int(overlap))
+    Wb = geo.get(_wkey)
+    if Wb is None:
+        Wb = int(ov_len.max().item()) if B else 0
+        geo[_wkey] = Wb
     if Wb <= 0:
         return None
     j = _arange_cache(Wb, dev)[None, :]
@@ -3206,7 +3266,13 @@ def _pool_ends_host(bid):
         if _cpu is None:
             return None
         try:
-            ends = [int(v) for v in itertools.accumulate(_cpu[0])]
+            _cnt = _cpu[0]
+            if isinstance(_cnt, np.ndarray):
+                # Large cut tables carry a NumPy counts row; the C cumsum +
+                # tolist produces the same Python integers as accumulate.
+                ends = np.cumsum(_cnt, dtype=np.int64).tolist()
+            else:
+                ends = [int(v) for v in itertools.accumulate(_cnt)]
         except (TypeError, ValueError):
             return None
         try:
@@ -4307,7 +4373,13 @@ class HybridAttention(nn.Module):
             # logsumexp 的反向保留其输入 logits，sub 必须出位（保留值与新
             # 张量上的 exp_ 原地——exp 反向保存的输出此后再无人改写）；原地
             # sub_ 会使 logsumexp 保存的张量版本失效，反向直接报错。
-            attn = logits.sub(lse).exp_()
+            # 推理（无梯度）时没有保存值，logits 也不再被读取，因此可以直接
+            # 原地归一化，省掉一张与 logits 同尺寸的临时表。
+            if torch.is_grad_enabled():
+                attn = logits.sub(lse).exp_()
+            else:
+                attn = logits.sub_(lse)
+                attn.exp_()
             del logits, lse
         else:
             attn = torch.softmax(logits, -1)
@@ -5276,8 +5348,15 @@ PUNCT_CHARS = set('.,!?;:')
 
 def boundary_token_ids(tok, eos_id):
     ids = set()
-    for i in range(tok.get_vocab_size()):
-        s = tok.decode([i]).strip()
+    _n = int(tok.get_vocab_size())
+    try:
+        # One batched decode instead of a Python-level call per vocabulary
+        # entry (32k entries on the B-tier tokenizer).
+        decoded = tok.decode_batch([[i] for i in range(_n)])
+    except (AttributeError, TypeError, ValueError):
+        decoded = [tok.decode([i]) for i in range(_n)]
+    for i, text in enumerate(decoded):
+        s = text.strip()
         if s and all((ch in PUNCT_CHARS for ch in s)):
             ids.add(i)
     ids.add(eos_id)
@@ -5738,18 +5817,24 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                 # are part of the model's training stream; do not filter them
                 # out as duplicates of themselves on the first pass.
                 if split == 'train' and (_n_nonempty_seen + _j) < _n_fit_docs:
-                    kept.append(r)
+                    kept.append((r, None))
                     continue
-                _dup, _kind = _dedup.is_duplicate(r)
+                # The deduplicator hashes the exact document anyway; reuse
+                # that fingerprint for the document-id sidecar instead of
+                # hashing every kept row a second time.
+                _fp = _doc_exact_fp(r)
+                _dup, _kind = _dedup.is_duplicate(r, fp=_fp)
                 if _dup:
                     _skipped[_kind] += 1
                 else:
-                    kept.append(r)
+                    kept.append((r, _fp))
             _n_nonempty_seen += len(rows)
             if kept:
-                for _row, enc in zip(kept, _tok.encode_batch(kept)):
+                for (_row, _fp), enc in zip(kept, _tok.encode_batch([_r for _r, _ in kept])):
                     ids = enc.ids
-                    _doc_ids.append(int(_doc_id_u64(_doc_exact_fp(_row))))
+                    if _fp is None:
+                        _fp = _doc_exact_fp(_row)
+                    _doc_ids.append(int(_doc_id_u64(_fp)))
                     take = min(len(ids), cap_tokens - cursor)
                     if take > 0:
                         arr[cursor:cursor + take] = ids[:take]
@@ -6168,12 +6253,18 @@ def _disk_ids_chunk(buf, disk_dt, vocab):
     # numpy builds that silently overflow).  `_fineweb_disk_dtype` returns
     # uint16 only for vocab <= 65536, so this is a defensive guard.
     if buf:
-        _mn, _mx = min(buf), max(buf)
+        # Convert once to int64 and take the extrema with NumPy's C loops:
+        # scanning a multi-million-element Python list twice is the slow part
+        # of the staging write at scale.  The range check still runs on the
+        # pre-cast values, so a uint16 wrap can never hide a bad id.
+        _a = np.asarray(buf, dtype=np.int64)
+        _mn, _mx = int(_a.min()), int(_a.max())
         if _mn < 0 or _mx >= int(vocab):
             raise ValueError(f'token id range [{_mn}, {_mx}] is outside vocab [0, {int(vocab)}) — refusing to cache a corrupted corpus')
         if disk_dt is np.uint16 and _mx > 65535:
             raise ValueError(f'token id {_mx} exceeds the uint16 cache range (vocab={vocab}) — widen _fineweb_disk_dtype before rebuilding')
-    return np.array(buf, dtype=disk_dt)
+        return _a if disk_dt is np.int64 else _a.astype(disk_dt)
+    return np.empty(0, dtype=disk_dt)
 
 def _i32_sidecar_path(path):
     """Identity-bound int32 sidecar path for a wide on-disk token cache."""
@@ -6299,11 +6390,14 @@ def _doc_simhash(text, *, shingle_words=5, max_shingles=128):
     documents stay bounded; the same text always yields the same hash
     across processes (blake2b, no Python salted hash).
     """
-    words = re.findall(r"[\w']+", str(text).lower())
+    # Only the first 1M words can ever be used: streaming the matches with
+    # islice keeps the working set bounded on pathologically long documents
+    # (a full findall would materialise every word before truncating).
+    import itertools as _it
+    words = [m.group() for m in _it.islice(
+        re.finditer(r"[\w']+", str(text).lower()), 1 << 20)]
     if not words:
         words = [str(text)[:512]]
-    n = min(len(words), 1 << 20)
-    words = words[:n]
     if len(words) < shingle_words:
         shingles = [' '.join(words)]
     else:
@@ -12758,7 +12852,10 @@ class _PrefixStats:
             self.n_seq += 1
             self.age_sum += float(age.sum().item())
             self.age_max = max(self.age_max, int(age.max().item()))
-            self.age_p95.append(age.detach().cpu())
+            # Ages are exact integers; int32 halves the retained diagnostic
+            # memory versus the int64 device dtype (the summary casts to
+            # float32 only when computing the quantiles).
+            self.age_p95.append(age.detach().to(torch.int32).cpu())
             self.outside_len_sum += float(outside_len.sum().item())
             self.outside_nonzero += int((outside_len > 0).sum().item())
             self.prefix_len_sum += float(geo['plen'].sum().item())

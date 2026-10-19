@@ -545,13 +545,17 @@ def _group_key(value):
 
 
 def _assert_index_and_group_disjoint(split_idx, groups=None):
-    sets = {name: set(np.asarray(split_idx[name]).reshape(-1).tolist())
-            for name in SPLIT_NAMES}
+    # Row-index disjointness is a pure set operation; intersecting the int64
+    # arrays avoids materialising every index as a Python int (the set form
+    # costs ~28 bytes/row and dominates memory on a scale-up split).
+    arrays = {name: np.asarray(split_idx[name]).reshape(-1)
+              for name in SPLIT_NAMES}
     for i, a in enumerate(SPLIT_NAMES):
         for b in SPLIT_NAMES[i + 1:]:
-            if sets[a] & sets[b]:
+            if np.intersect1d(arrays[a], arrays[b], assume_unique=False).size:
                 raise ValueError(f'{a} and {b} indices overlap')
     if groups is not None:
+        sets = {name: set(arrays[name].tolist()) for name in SPLIT_NAMES}
         groups = np.asarray(groups)
         gsets = {name: {_group_key(groups[i]) for i in sets[name]}
                  for name in SPLIT_NAMES}
@@ -888,14 +892,26 @@ def prepare_features(X_train, X_val=None, X_test=None, **kwargs):
 # Data-quality diagnostics
 # ---------------------------------------------------------------------------
 
+_HASH_BLOCK_BYTES = 64 << 20
+
+
+def _hash_row_block(width, cap):
+    """Rows per hashing block under a byte ceiling (at least one row)."""
+    return max(1, min(int(cap), _HASH_BLOCK_BYTES // max(1, 8 * int(width))))
+
+
 def _matrix_fingerprint(X):
     arr = np.asarray(X)
     h = hashlib.sha256()
     h.update(str(arr.shape).encode('ascii'))
     # Convert and hash in bounded row blocks: the whole matrix is never
-    # duplicated as float64 just to be hashed.
-    for start in range(0, arr.shape[0], 1 << 20):
-        block = np.asarray(arr[start:start + (1 << 20)], dtype=np.float64)
+    # duplicated as float64 just to be hashed, and the block row count is
+    # sized from the actual width so a wide matrix cannot allocate a
+    # gigabyte-sized block from a fixed row count.
+    _w = int(arr.shape[1]) if arr.ndim > 1 else 1
+    _step = _hash_row_block(_w, 1 << 20)
+    for start in range(0, arr.shape[0], _step):
+        block = np.asarray(arr[start:start + _step], dtype=np.float64)
         h.update(np.ascontiguousarray(block).tobytes())
     return h.hexdigest()[:16]
 
@@ -907,13 +923,32 @@ def _row_keys(X):
         src = src.reshape(-1, 1)
     keys = []
     # Hash row blocks; each block is converted to float64 before hashing.
-    for start in range(0, src.shape[0], 1 << 16):
-        arr = np.ascontiguousarray(np.asarray(src[start:start + (1 << 16)], dtype=np.float64))
+    _step = _hash_row_block(int(src.shape[1]), 1 << 16)
+    for start in range(0, src.shape[0], _step):
+        arr = np.ascontiguousarray(np.asarray(src[start:start + _step], dtype=np.float64))
         # ``-0.0 == 0.0`` but their byte patterns differ, so raw hashing would
         # miss an exact duplicate split across train/val/test.  Normalize the
         # sign of zero before hashing (NaN values are handled separately).
-        arr = np.where(arr == 0.0, 0.0, arr)
+        # The copy is only made when a zero is actually present, so the common
+        # all-nonzero block is not duplicated.
+        if np.any(arr == 0.0):
+            arr = arr.copy()
+            arr[arr == 0.0] = 0.0
         finite = np.isfinite(arr)
+        if finite.all():
+            # Fast path: every row is finite, so the old key is exactly
+            # ``row_bytes + b'|' + packbits(all-False)``.  Hashing the
+            # contiguous row view with the precomputed all-zero mask tail
+            # reproduces the historical key byte-for-byte while avoiding the
+            # per-row boolean-index copy and packbits call.
+            _tail = np.packbits(np.zeros(int(src.shape[1]), dtype=bool)).tobytes()
+            for row_view in arr.view(np.uint8):
+                h = hashlib.blake2b(digest_size=8)
+                h.update(memoryview(row_view))
+                h.update(b'|')
+                h.update(_tail)
+                keys.append(h.digest())
+            continue
         for row, ok in zip(arr, finite):
             # NaN/Inf positions are represented explicitly so two rows are equal
             # only when their finite values AND their non-finite patterns match.
