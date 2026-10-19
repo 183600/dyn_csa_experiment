@@ -2769,12 +2769,14 @@ def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128,
 
     Returns a dict with:
       start_of_token, block_of_token, offset  — block geometry
-      u_start  [T]  first token of the represented prefix (s_t, or max(s_t,
-                    window_start) for `outside_window`)
+      u_start  [T]  first token of the represented prefix (always s_t; the
+                    scope changes where it ENDS, not where it starts)
       plen     [T]  number of represented tokens (may be 0 outside-window)
       token_idx [T, P] candidate token ids for `prefix_singletons` (P = max
-                    plen; padded rows are clamped and masked by plen)
-      valid    [T, P] candidate validity (j < plen)
+                    plen; padded rows are clamped and masked by plen).  With
+                    `candidate_table=False` (the summary path) this is a
+                    single per-query row, not an O(T^2) table.
+      valid    [T, P] candidate validity (j < plen, or plen>0 for summaries)
     """
     geo = _open_block_geometry(bid, n_blocks=n_blocks)
     n, B = int(geo['n']), int(geo['n_blocks'])
@@ -12795,8 +12797,10 @@ class _BlockStats:
             self.at_max += int((a >= self.max_block).sum())
         if self.position_capacity is not None:
             _cap = int(self.position_capacity)
-            self.pos_truncated_tokens += int(np.maximum(a - (_cap - 1), 0).sum())
-            self.pos_truncated_blocks += int((a >= _cap).sum())
+            # A block of length L uses offsets 0..L-1; truncation starts at
+            # offset == capacity, i.e. only when L > capacity.
+            self.pos_truncated_tokens += int(np.maximum(a - _cap, 0).sum())
+            self.pos_truncated_blocks += int((a > _cap).sum())
 
     def add_segmentation(self, bid, gate_cuts, max_block):
         """Count forced vs natural (and both) non-tail block ends.

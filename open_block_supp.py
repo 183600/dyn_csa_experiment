@@ -29,6 +29,11 @@ python open_block_supp.py aux    [--seeds ...]
     The outside-window auxiliary panel: the same three reading rules at
     128/None, but the prefix is constructed from U_t = P_t \\ W_t only.
 
+python open_block_supp.py extended [--seeds ...]
+    Contingency panel: all 4 maximum-block values x all 3 reading rules
+    (12 cells).  Only run this if the main matrix shows an interaction trend;
+    it is not part of the 8-cell primary panel.
+
 python open_block_supp.py report [--outdir ...]
     Paired per-seed deltas, interaction effects, exact sign-flip p-values,
     Holm adjustment, and a Markdown report.  No GPU needed.
@@ -71,6 +76,11 @@ MAIN_MATRIX = (
     (None, 'closed', 'full_prefix'),
     (None, 'summary', 'full_prefix'),
     (None, 'singletons', 'full_prefix'),
+)
+EXTENDED_MATRIX = tuple(
+    (mb, mode, 'full_prefix')
+    for mb in L.OPEN_BLOCK_MAX_VALUES
+    for mode in L.OPEN_BLOCK_MODES_SHORT
 )
 AUX_MATRIX = (
     (128, 'closed', 'outside_window'),
@@ -622,7 +632,7 @@ def _parse_seeds(s):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('command', choices=['smoke', 'pilot', 'main', 'aux', 'report'])
+    ap.add_argument('command', choices=['smoke', 'pilot', 'main', 'aux', 'extended', 'report'])
     ap.add_argument('--seeds', default=None)
     ap.add_argument('--steps', type=int, default=None)
     ap.add_argument('--seq-len', type=int, default=None)
@@ -640,7 +650,12 @@ def main():
                 analysis_dir=args.analysis_dir)
         return 0
 
-    matrix = MAIN_MATRIX if args.command in ('pilot', 'main') else AUX_MATRIX
+    if args.command in ('pilot', 'main'):
+        matrix = MAIN_MATRIX
+    elif args.command == 'extended':
+        matrix = EXTENDED_MATRIX
+    else:
+        matrix = AUX_MATRIX
     cfg = dict(BASE_CFG)
     cfg['seeds'] = _parse_seeds(args.seeds) if args.seeds else ([0] if args.command == 'pilot' else BASE_CFG['seeds'])
     if args.steps is not None:
@@ -651,12 +666,14 @@ def main():
         cfg['seq_len'] = int(args.seq_len)
     if args.command == 'aux':
         cfg['outdir'] = 'results_open_block_aux'
+    if args.command == 'extended':
+        cfg['outdir'] = 'results_open_block_extended'
     if args.outdir is not None:
         cfg['outdir'] = args.outdir
     run_panel(cfg, matrix, device=L.DEVICE, synthetic=False,
               max_hours=args.max_hours,
               label='pilot' if args.command == 'pilot' else args.command)
-    if args.command in ('main', 'aux'):
+    if args.command in ('main', 'aux', 'extended'):
         try:
             analyse(cfg['outdir'], seeds=cfg['seeds'], analysis_dir=args.analysis_dir)
         except SystemExit as e:

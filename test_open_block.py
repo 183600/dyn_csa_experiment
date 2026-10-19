@@ -387,6 +387,12 @@ def t_forced_vs_natural_cuts():
     st3 = L._BlockStats(min_block=2, max_block=None)
     st3.add_segmentation(bid, torch.zeros(11, dtype=torch.bool), None)
     assert st3.forced_total == 0
+    # Capacity is a table size: length == capacity is fully represented
+    # (offsets 0..cap-1); only length > capacity truncates.
+    stc = L._BlockStats(position_capacity=4)
+    stc._add(np.array([4.0, 5.0, 7.0]))
+    assert stc.pos_truncated_tokens == (0 + 1 + 3), stc.pos_truncated_tokens
+    assert stc.pos_truncated_blocks == 2, stc.pos_truncated_blocks
 
 
 # ---------------------------------------------------------------------------

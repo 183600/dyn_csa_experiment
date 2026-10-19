@@ -101,6 +101,7 @@ python test_open_block.py         # open-block causality/reference/mask gates (C
 python open_block_supp.py smoke    # open-block matrix plumbing on a tiny synthetic run
 python open_block_supp.py main     # 8 cells x 4 seeds; resumable
 python open_block_supp.py report   # paired deltas + interaction + exact sign-flip/Holm
+python open_block_supp.py extended # contingency: all 4 caps x all 3 modes
 python v12_supp.py smoke           # also covers the frozen final-test roundtrip
 
 # 2) the real supplementary study (bounded by the run-time cap):

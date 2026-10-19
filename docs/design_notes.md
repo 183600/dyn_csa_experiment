@@ -1054,6 +1054,7 @@ python open_block_supp.py pilot --seeds 0 --steps 100
 python open_block_supp.py main --seeds 0,1,2,3 --steps 1500
 python open_block_supp.py report
 python open_block_supp.py aux             # outside-window auxiliary panel
+python open_block_supp.py extended        # contingency: 4 caps x 3 modes
 ```
 
 `main` is resumable and refuses a record whose code stamp / recipe
