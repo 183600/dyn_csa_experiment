@@ -281,6 +281,21 @@ def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None)
                 n_train_measured += 1
     train_s = _curve_slope(entries, 'train_ce', k=tail_k)
     val_s = _curve_slope(entries, 'val_ce', k=tail_k)
+    if val_s is None:
+        # The classifier's contract says a point may carry either val_ce or
+        # val_ppl.  log(PPL) is CE, so a val_ppl-only history can still give
+        # the same tail slope (and the same units as slope_tol) instead of
+        # being mislabelled `insufficient_data`.
+        _val_from_ppl = []
+        for _p in entries:
+            try:
+                _st = float(_p.get('step'))
+                _vp = float(_p.get('val_ppl'))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(_st) and math.isfinite(_vp) and _vp > 0.0:
+                _val_from_ppl.append({'step': _st, 'val_ce': math.log(_vp)})
+        val_s = _curve_slope(_val_from_ppl, 'val_ce', k=tail_k)
     val_ppl_points = []
     for h in entries:
         try:
@@ -529,7 +544,15 @@ def state_dict_sha256(sd):
         h.update(str(k).encode('utf-8'))
         h.update(str(tuple(v.shape)).encode('ascii'))
         h.update(str(v.dtype).encode('ascii'))
-        h.update(v.detach().cpu().contiguous().numpy().tobytes())
+        _t = v.detach().cpu().contiguous()
+        try:
+            _bytes = _t.numpy().tobytes()
+        except TypeError:
+            # NumPy has no bfloat16/float8 scalar type; reinterpret the raw
+            # storage bytes instead so AMP / reduced-precision state dicts
+            # remain hashable without changing the digest of supported dtypes.
+            _bytes = _t.reshape(-1).view(torch.uint8).numpy().tobytes()
+        h.update(_bytes)
     return h.hexdigest()
 
 # ---- 可选激活重算（CSA_CKPT，默认关闭）----
@@ -1394,7 +1417,11 @@ def causal_adaptive_threshold(sim, target_block_tokens):
         pre_cols = torch.arange(exact_n, device=sim.device, dtype=torch.long)
         pre_vals = _causal_quantile_exact(x[:, :exact_n], pre_cols, target_block_tokens,
                                           _full_range=True)
-        warm_end = max(exact_n, 256, _exact_len // 8)
+        # The warm-up prefix cannot run past the actual sequence.  With a
+        # small configured exact cutoff (CSA_ADAPTIVE_EXACT_TOKENS) n can be
+        # shorter than the 256-token warm window; an unclamped start would
+        # make the second arange have start > stop and raise.
+        warm_end = min(int(n), max(exact_n, 256, _exact_len // 8))
         n_samp = 1024
         step = max(1, (_max_len - warm_end + n_samp - 1) // n_samp)
         samp = torch.cat([
@@ -6018,14 +6045,20 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
                                       min(int(sample_rows), va.shape[0]),
                                       dtype=np.int64))
         _sample = np.asarray(va)[_rows]
-        if tr.size <= int(max_scan_tokens):
+        _nseg = 16
+        _seg_len = max(int(max_scan_tokens) // _nseg,
+                       int(_sample.shape[1]) + 1)
+        if tr.size <= max(int(max_scan_tokens), _nseg * _seg_len):
+            # Scanning everything is cheaper (and never double-counts a row)
+            # than building overlapping sampled windows when the stream is
+            # only a little larger than the requested scan budget.
             _segments = [tr]
             _scanned = int(tr.size)
         else:
-            _nseg = 16
-            _seg_len = max(int(max_scan_tokens) // _nseg,
-                           int(_sample.shape[1]) + 1)
-            _starts = np.linspace(0, max(tr.size - _seg_len, 0), _nseg, dtype=np.int64)
+            # 16 equally spaced windows are disjoint because the start spacing
+            # is >= _seg_len once tr.size >= _nseg * _seg_len; otherwise the
+            # same validation row could be counted by several windows.
+            _starts = np.linspace(0, tr.size - _seg_len, _nseg, dtype=np.int64)
             _segments = [tr[int(s):int(s) + _seg_len] for s in _starts]
             _scanned = int(sum(s.size for s in _segments))
         _shared = 0
@@ -6977,7 +7010,12 @@ def exact_signflip_p(deltas):
     种子播种，臂间参数量差异对 RNG 流的扰动属于「臂」的一部分）。种子编号
     相同本身不提供该保证；design_notes §20 记录了本仓库逐因素的控制方式
     与残余风险（训练随机性进入种间方差、文档抽样进入 doc 层方差）。"""
-    d_in = [float(x) for x in deltas]
+    d_in = []
+    for _x in deltas:
+        try:
+            d_in.append(float(_x))
+        except (TypeError, ValueError):
+            d_in.append(float('nan'))
     d = np.asarray([x for x in d_in if math.isfinite(x)], dtype=float)
     n = int(d.size)
     n_dropped = len(d_in) - n
@@ -7426,7 +7464,11 @@ def tost_paired(deltas, margin, conf=0.90):
 
 def _gammaincc(a, x):
     """正则化上不完全伽马 Q(a,x)，用于 Cochran Q 的卡方尾概率。"""
-    if not (a > 0.0) or (not math.isfinite(x)) or x < 0.0:
+    if not (a > 0.0) or math.isnan(x) or x < 0.0:
+        return float('nan')
+    if x == float('inf'):
+        return 0.0
+    if not math.isfinite(x):
         return float('nan')
     if x == 0.0:
         return 1.0
@@ -7518,7 +7560,13 @@ def _betai(a, b, x):
 
 def _student_t_sf(t, df):
     """Student t 的上尾概率 P(T >= t)。"""
-    if not (df > 0.0) or not math.isfinite(t):
+    if not (df > 0.0) or math.isnan(t):
+        return float('nan')
+    if t == float('inf'):
+        return 0.0
+    if t == float('-inf'):
+        return 1.0
+    if not math.isfinite(t):
         return float('nan')
     x = df / (df + t * t)
     tail = 0.5 * _betai(df / 2.0, 0.5, x)
@@ -7550,7 +7598,11 @@ def _t_critical(conf, df):
 
 def chi2_sf(x, df):
     """卡方分布上尾概率 P(chi2_df >= x)（Cochran Q 用）。"""
-    if not (df > 0.0) or not math.isfinite(x):
+    if not (df > 0.0) or math.isnan(x):
+        return float('nan')
+    if x == float('inf'):
+        return 0.0
+    if not math.isfinite(x):
         return float('nan')
     if x <= 0.0:
         return 1.0
@@ -7961,8 +8013,15 @@ def loglog_regression(points, *, alpha=0.05):
     resid = y - pred
     ss_res = float((resid ** 2).sum())
     ss_tot = float(((y - ybar) ** 2).sum())
+    try:
+        _coef = 10 ** intercept
+    except OverflowError:
+        # Extreme (but finite) log-space fits can overflow the displayed
+        # coefficient; the fit itself is still valid, so keep the report
+        # total instead of raising on a formatting expression.
+        _coef = float('inf')
     out.update({'status': 'ok', 'slope': slope, 'exponent': slope, 'intercept': intercept,
-                'law': 'y = %.6g * x^%.6g' % (10 ** intercept, slope)})
+                'law': 'y = %.6g * x^%.6g' % (_coef, slope)})
     k = len(rows)
     if k >= 3:
         sigma2 = ss_res / (k - 2)
@@ -8346,7 +8405,7 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     if order == 1:
         nll = float(-log_uni[all_eval].sum() / all_eval.size)
         return {'order': 1, 'alpha': alpha, 'interpolation': 0.0,
-                'n_tokens': int(all_eval.size), 'nll': nll, 'ppl': float(math.exp(nll))}
+                'n_tokens': int(all_eval.size), 'nll': nll, 'ppl': float(_safe_exp_ppl(nll))}
     _uni, uniq, ctx, pair_counts = counts
     lam = float(interpolation)
     if not (0.0 <= lam <= 1.0):
@@ -8376,7 +8435,7 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     n_tokens = int(all_eval.size)
     nll = float(nll_sum / n_tokens) if n_tokens else float('nan')
     return {'order': 2, 'alpha': alpha, 'interpolation': lam,
-            'n_tokens': n_tokens, 'nll': nll, 'ppl': float(math.exp(nll)) if math.isfinite(nll) else float('nan')}
+            'n_tokens': n_tokens, 'nll': nll, 'ppl': float(_safe_exp_ppl(nll)) if math.isfinite(nll) else float('nan')}
 
 def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
     """Run the declared count-model grid and select per baseline on validation."""
@@ -11297,34 +11356,64 @@ def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None):
     return (prec, rec, f1, rand_prec)
 
 def _mask_runs(near, n_pos, tol):
-    m = np.asarray(near)[1:n_pos + 1].astype(bool)
+    near_arr = np.asarray(near)
+    m = near_arr[1:n_pos + 1].astype(bool)
     if not m.any():
         return np.zeros(0, dtype=int)
+    if tol == 0:
+        # With tol=0 the neighbourhood of a boundary is the boundary itself,
+        # so every True lane is exactly one boundary -- including adjacent
+        # boundaries, which form a longer run and cannot be split by the
+        # run-length rules below (those are only meaningful for tol>0).
+        return np.nonzero(m)[0] + 1
     d = np.diff(np.concatenate([[0], m.view(np.int8), [0]]))
     starts = np.nonzero(d == 1)[0]
     ends = np.nonzero(d == -1)[0]
     lens = ends - starts
+    left_touch = bool(near_arr[0]) if near_arr.size else False
     out, ok = ([], True)
     for s, e, L in zip(starts, ends, lens):
-        if L == 2 * tol + 1:
-            out.append((s + e - 1) // 2)
-        elif s == 0 and L == tol + 1:
-            out.append(0)
-        elif e == m.size and L == tol + 1:
-            out.append(m.size - 1)
-        elif L > 2 * tol + 1:
+        if s == 0 and e == m.size:
+            # A run covering the whole sequence can come from one boundary at
+            # the centre OR from several boundaries whose neighbourhoods tile
+            # it; the post-slice mask cannot distinguish them.
             ok = False
             break
+        if s == 0:
+            if left_touch:
+                # Position 0 is inside the neighbourhood, so the leftmost
+                # possible boundary is 1; only a length-(tol+1) run pins it.
+                if L == tol + 1:
+                    out.append(0)
+                else:
+                    ok = False
+                    break
+            else:
+                # Position 0 is outside every neighbourhood: the unique
+                # minimum boundary is tol+1, and only its full 2*tol+1 run is
+                # unambiguous.
+                if L == 2 * tol + 1:
+                    out.append(tol)
+                else:
+                    ok = False
+                    break
+        elif e == m.size:
+            # The right edge is clipped by the sequence end: only the
+            # one-sided length-(tol+1) run pins the final boundary.
+            if L == tol + 1:
+                out.append(m.size - 1)
+            else:
+                ok = False
+                break
         else:
-            ok = False
-            break
+            # A fully interior neighbourhood has exactly 2*tol+1 lanes.
+            if L == 2 * tol + 1:
+                out.append((s + e - 1) // 2)
+            else:
+                ok = False
+                break
     if ok:
-        _singletons = bool((lens == 1).all())
-        if not (_singletons and tol == 0):
-            return np.asarray(sorted(set(out)), dtype=int) + 1
-        room = m.size - ends[-1]
-        if len(starts) == 1 or room >= tol:
-            return np.asarray(sorted(set(out)), dtype=int) + 1
+        return np.asarray(sorted(set(out)), dtype=int) + 1
     return None
 
 def _random_cut_precision(P, near, n_pos, tol, G, gt_bounds=None, approx_flag=None):
@@ -12252,7 +12341,15 @@ def _save_analysis_checkpoint(path, model, meta):
 
 
 def _percentile(vals, q):
-    xs = sorted(float(v) for v in vals if math.isfinite(float(v)))
+    xs = []
+    for v in vals:
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fv):
+            xs.append(fv)
+    xs.sort()
     if not xs:
         return None
     if len(xs) == 1:
@@ -14361,7 +14458,7 @@ def _pooled_ppl_from_records(recs):
     total_n, total_t = float(sum(nlls)), float(sum(nts))
     if total_t <= 0:
         return None, None, None
-    return math.exp(total_n / total_t), total_n, int(total_t)
+    return _safe_exp_ppl(total_n / total_t), total_n, int(total_t)
 
 def _seed_t_ci(ppls, alpha=0.05):
     n = len(ppls)

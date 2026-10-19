@@ -141,7 +141,7 @@ def exact_signflip(deltas):
                 _bs = min(_step, B - _off)
                 _signs = _np.where(_rng.random((_bs, n)) < 0.5, 1.0, -1.0)
                 _sums = _np.abs((_signs * _darr).sum(1))
-                cnt += int((_sums >= obs - 1e-12).sum())
+                cnt += int((_sums >= obs - 1e-12 * n).sum())
         else:
             rng = random.Random(0)
             cnt = 1
@@ -149,7 +149,7 @@ def exact_signflip(deltas):
                 s = 0.0
                 for d in deltas:
                     s += d if rng.random() < 0.5 else -d
-                if abs(s) >= obs - 1e-12:
+                if abs(s) >= obs - 1e-12 * n:
                     cnt += 1
         return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': cnt / (B + 1), 'method': 'mc'}
     try:
@@ -164,7 +164,7 @@ def exact_signflip(deltas):
         # original per-mask Python summation; all other masks are decided
         # identically by both summations (the bound covers the difference).
         _total = 1 << n
-        _thr = obs - 1e-12
+        _thr = obs - 1e-12 * n
         _darr = _np.asarray(deltas, dtype=float)
         _ebnd = n * 2.220446049250313e-16 * float(_np.abs(_darr).sum())
         _bitpos = _np.arange(n, dtype=_np.int64)
@@ -184,12 +184,14 @@ def exact_signflip(deltas):
         cnt = 0
         for mask in range(1 << n):
             s = sum((d if mask >> i & 1 else -d for i, d in enumerate(deltas)))
-            if abs(s) >= obs - 1e-12:
+            if abs(s) >= obs - 1e-12 * n:
                 cnt += 1
     mu = sum(deltas) / n
     return {'n': n, 'mean': mu, 'std': (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0, 'p_exact_signflip': cnt / (1 << n), 'method': 'exact'}
 
 def _measurable(r):
+    if not isinstance(r, dict):
+        return False
     v = r.get('ppl')
     return not r.get('synthesized') and _ppl_ok(v)
 
@@ -243,7 +245,11 @@ def _kernel_stamp():
 _CUR_CS = (_code_semantics() or '') + _kernel_stamp()
 
 def _finite_ppls(r):
+    if not isinstance(r, dict):
+        return []
     ppls = r.get('ppls') or r.get('ppl_list') or []
+    if not isinstance(ppls, (list, tuple)):
+        return []
     return [x for x in ppls if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(x) and (x > 0)]
 
 _WARM_KEY_RE = re.compile('.*::w(\\d+)::seed\\d+$')
@@ -271,6 +277,8 @@ def _legacy_warm_tags_cached(outdir):
     return _LOADED[key]
 
 def _tag_of(r, key=None, legacy_ok=None):
+    if not isinstance(r, dict):
+        return ''
     if r.get('protocol') is not None:
         return str(r['protocol'])
     if r.get('warm_steps') is not None:
@@ -314,8 +322,10 @@ PARAM_MATCH_SMALL = 0.3
 PARAM_MATCH_ARCH = 0.06
 
 def param_gap(a, b, tol=PARAM_MATCH_TOL):
-    pa = (a or {}).get('params')
-    pb = (b or {}).get('params')
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return None
+    pa = a.get('params')
+    pb = b.get('params')
     if not (isinstance(pa, (int, float)) and isinstance(pb, (int, float))):
         return None
     if pa <= 0 or pb <= 0:
@@ -378,11 +388,28 @@ def per_seed_records(outdir):
     return out
 
 def _pair_reason(ra, rb):
+    if not isinstance(ra, dict) or not isinstance(rb, dict):
+        return 'a record is not a dict'
     fa, fb = (ra.get('run_cfg'), rb.get('run_cfg'))
     if fa is None or fb is None:
         return 'unverifiable run_cfg'
     if fa != fb:
         return 'different run_cfg'
+    # The run_cfg string does not carry the optimizer identity / schedule
+    # shape / clipping / augmentation or the AMP/eager implementation mode.
+    # Mirror exp_lib.pair_reason so a zero-GPU report cannot pair cells that
+    # ran under different numerical or optimisation settings.
+    _ka, _kb = (ra.get('train_knobs'), rb.get('train_knobs'))
+    if (_ka is None) != (_kb is None):
+        return 'unverifiable train_knobs (only one record carries the optimizer / lr-schedule / augmentation descriptor)'
+    if _ka is not None and _ka != _kb:
+        return 'different train_knobs (optimizer / lr schedule / grad-clip / augmentation / precision)'
+    for _k in ('amp_dtype', 'amp_grad_scaler', 'eager_batch'):
+        _pa, _pb = (_k in ra), (_k in rb)
+        if _pa != _pb:
+            return f'unverifiable {_k} (only one record carries the precision / implementation mode)'
+        if _pa and ra.get(_k) != rb.get(_k):
+            return f'different {_k} ({ra.get(_k)!r} vs {rb.get(_k)!r})'
     bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
     if not bad:
         return None
@@ -1242,7 +1269,7 @@ def _sig_gate(st, alpha=0.05, min_n=6):
             return False
         if mean is None or std is None or abs(float(mean)) <= float(std):
             return False
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
     return True
 
@@ -1250,7 +1277,15 @@ def holm_adjust(named_pvals, alpha=0.05):
     """Holm step-down over the report's displayed family (local copy: this
     builder intentionally does not import torch/exp_lib).  Missing/invalid
     p-values keep a dummy p=1 slot so the family size is not silently shrunk."""
-    items = [(str(k), float(v)) for k, v in named_pvals]
+    items = []
+    for k, v in named_pvals:
+        try:
+            pv = float(v)
+        except (TypeError, ValueError):
+            pv = float('nan')
+        if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
+            pv = 1.0
+        items.append((str(k), pv))
     m = len(items)
     order = sorted(range(m), key=lambda i: items[i][1])
     out = {}

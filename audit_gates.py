@@ -211,12 +211,18 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
                     return np.empty(0, dtype=np.uint64), 0, 1.0
                 if mat.ndim == 1:
                     total = int(mat.size)
-                    if total <= cap_tokens:
+                    n_seg = max(1, min(64, cap_tokens // max(k, 1)))
+                    seg_len = max(int(cap_tokens) // n_seg, k + 1)
+                    if total <= max(int(cap_tokens), n_seg * seg_len):
+                        # No overlap possible; scanning the whole (slightly
+                        # over-budget) stream is deterministic and keeps the
+                        # reported scanned fraction <= 1.
                         segments = [(0, total)]
                     else:
-                        n_seg = max(1, min(64, cap_tokens // max(k, 1)))
-                        seg_len = max(int(cap_tokens) // n_seg, k + 1)
-                        starts = np.linspace(0, max(total - seg_len, 0), n_seg, dtype=np.int64)
+                        # total >= n_seg*seg_len makes the equally spaced
+                        # starts at least seg_len apart, so the windows are
+                        # disjoint and no shingle is counted twice.
+                        starts = np.linspace(0, total - seg_len, n_seg, dtype=np.int64)
                         segments = [(int(s), int(min(total, s + seg_len))) for s in starts]
                     parts = []
                     for s, e in segments:
@@ -824,14 +830,19 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             e['truncated'].add(c.get('truncated'))
             if isinstance(c.get('ppl_per_seq'), list):
                 e['n_seq'].add(len(c['ppl_per_seq']))
+            elif c.get('n_seq') is not None:
+                e['n_seq'].add(c.get('n_seq'))
             if c.get('truncated'):
                 problems.append(f'{key}: L{Ln} cell is marked truncated — it must not enter cross-length means')
     out = {'status': 'ok', 'by_length': {}}
     for Ln, e in sorted(by_len.items()):
         ok = len(e['n_tok']) == 1 and None not in e['n_tok'] and len(e['eval_span']) == 1
-        out['by_length'][str(Ln)] = {'n_tok_values': sorted((str(x) for x in e['n_tok'])), 'eval_span_values': sorted((str(x) for x in e['eval_span'])), 'n_seq_values': sorted(e['n_seq']), 'same_scored_targets_across_records': bool(ok)}
+        nseq_ok = len(e['n_seq']) <= 1
+        out['by_length'][str(Ln)] = {'n_tok_values': sorted((str(x) for x in e['n_tok'])), 'eval_span_values': sorted((str(x) for x in e['eval_span'])), 'n_seq_values': sorted((str(x) for x in e['n_seq'])), 'same_scored_targets_across_records': bool(ok), 'same_n_seq_across_records': bool(nseq_ok)}
         if not ok:
             problems.append(f'L{Ln}: records disagree on n_tok/eval_span — different target sets are being scored across arms; cross-arm comparison at this length is invalid')
+        if not nseq_ok:
+            problems.append(f'L{Ln}: records disagree on the per-document row count n_seq — the arms did not score the same documents')
     out['problems'] = problems
     out['status'] = 'fail' if problems else 'ok'
     print(json.dumps(out, ensure_ascii=False, indent=2))

@@ -2256,7 +2256,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
             for Ln in _within:
                 _t = float(_cum[:, Ln - 2].sum()) if Ln >= 2 else 0.0
                 _ntok = int(ids.shape[0]) * (Ln - 1)
-                ppl = math.exp(_t / max(_ntok, 1))
+                ppl = L._safe_exp_ppl(_t / max(_ntok, 1))
                 out[Ln] = {'ppl': float(ppl), 'n_tok': _ntok, 'n_tokens': _ntok, 'truncated': False, 'eval_span': Ln,
                            'nll_sum': float(_t),
                            'nll_per_seq': [float(v) for v in _cum[:, Ln - 2].tolist()],
@@ -2267,7 +2267,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                 # (doc-level deltas vs seed-level variance).  Rows are the
                 # panel's fixed eval rows, so the list order is stable.
                 if Ln >= 2:
-                    out[Ln]['ppl_per_seq'] = [float(math.exp(float(v) / (Ln - 1))) for v in _cum[:, Ln - 2].tolist()]
+                    out[Ln]['ppl_per_seq'] = [float(L._safe_exp_ppl(float(v) / (Ln - 1))) for v in _cum[:, Ln - 2].tolist()]
                     out[Ln]['n_seq'] = int(ids.shape[0])
             del x, nll_cols, _cum
         _trunc_cache = {}
@@ -2315,7 +2315,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                     ntok += int(_sub[:, 1:].numel())
                     del _h, _nll_rows
                     _r += _chunk
-                ppl = math.exp(float(nll) / max(ntok, 1))
+                ppl = L._safe_exp_ppl(float(nll) / max(ntok, 1))
                 _ev_span = int(x.shape[1])
                 out[Ln] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': _ev_span}
                 _trunc_cache[_key] = {'ppl': float(ppl), 'n_tok': ntok, 'eval_span': _ev_span}

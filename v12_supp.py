@@ -1195,7 +1195,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                         _pool_ok = False
             if _by_seed:
                 _dl = list(_by_seed.values())
-                _pooled = math.exp(_nll_sum / _n_tok) if (_pool_ok and _n_tok > 0) else None
+                _pooled = L._safe_exp_ppl(_nll_sum / _n_tok) if (_pool_ok and _n_tok > 0) else None
                 stats['by_length'].setdefault(v, {})[str(Ln)] = {'mean': float(_pooled if _pooled is not None else np.mean(_dl)),
                                                                   'mean_arithmetic': float(np.mean(_dl)),
                                                                   'ppl_pooled': _pooled, 'n_tokens': _n_tok,
