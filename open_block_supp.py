@@ -264,10 +264,12 @@ def _nll_per_token(rec):
     return None
 
 
-def _rec_by_cell(summary):
+def _rec_by_cell(summary, run_fingerprint=None):
     out = {}
     for key, rec in summary.items():
         if not isinstance(rec, dict):
+            continue
+        if run_fingerprint is not None and rec.get('run_fingerprint') != run_fingerprint:
             continue
         if not (isinstance(rec.get('ppl'), (int, float)) and math.isfinite(float(rec['ppl']))):
             continue
@@ -307,6 +309,7 @@ def _cell_diagnostics(rec):
                  'closed_selected_mean', 'selected_mean', 'candidates_mean',
                  'unused_slots_mean', 'history_displaced_mean',
                  'prefix_attention_mass_mean', 'position_truncated_frac',
+                 'position_truncated_frac_of_block_tokens',
                  'position_truncated_tokens', 'position_truncated_blocks',
                  'forced_only', 'natural_only', 'forced_and_natural',
                  'forced_total', 'natural_total', 'len_p50', 'len_p95')
@@ -406,7 +409,8 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
             f'{outdir}/summary.json mixes {len(_fps)} run fingerprints (e.g. a '
             'pilot and a main panel); refusing to pool them. Use a separate '
             'outdir for the pilot or remove the stale records explicitly.')
-    cells = _rec_by_cell(summary)
+    _fp = next(iter(_fps)) if len(_fps) == 1 else None
+    cells = _rec_by_cell(summary, run_fingerprint=_fp)
     if not cells:
         raise SystemExit(f'no usable records in {outdir}/summary.json')
     avail_seeds = sorted({s for (_, s) in cells})
@@ -557,11 +561,12 @@ def _render_markdown(stats):
             _fmt(r.get('min_reachable_p')), ci_s, ctrl))
     if stats.get('diagnostics'):
         lines += ['', '## Diagnostics (per-cell means over layers; seed-level in stats.json)', '',
-                  '| cell | len_mean | len_max | frac_at_max | forced_only | natural_only | both | prefix_age_mean | outside_nonzero | prefix_sel_rate | history_displaced | pos_trunc_frac |',
-                  '|---|---|---|---|---|---|---|---|---|---|---|---|']
+                  '| cell | len_mean | len_p50 | len_p95 | len_max | frac_at_max | forced_only | natural_only | both | prefix_age_mean | outside_nonzero | prefix_sel_rate | history_displaced | pos_trunc_frac |',
+                  '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|']
         for cell, d in sorted(stats['diagnostics'].items()):
-            lines.append('| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |'.format(
-                cell, _fmt(d.get('len_mean')), _fmt(d.get('len_max'), 0),
+            lines.append('| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |'.format(
+                cell, _fmt(d.get('len_mean')), _fmt(d.get('len_p50'), 2),
+                _fmt(d.get('len_p95'), 2), _fmt(d.get('len_max'), 0),
                 _fmt(d.get('frac_at_max')), _fmt(d.get('forced_only'), 0),
                 _fmt(d.get('natural_only'), 0), _fmt(d.get('forced_and_natural'), 0),
                 _fmt(d.get('prefix_age_mean')),
