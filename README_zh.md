@@ -89,6 +89,8 @@ python test_open_block.py         # 未结束块因果性/参考实现/掩码门
 python open_block_supp.py smoke    # 未结束块矩阵的微型合成自检
 python open_block_supp.py main     # 8 配置 × 4 种子；可续跑
 python open_block_supp.py report   # 配对差 + 交互效应 + 精确符号翻转/Holm
+python open_block_supp.py aux      # 窗口外辅助面板
+python open_block_supp.py extended # 应急：4 上限 × 3 模式
 python v12_supp.py smoke           # 同时覆盖冻结最终测试的完整往返
 
 # 2) 正式补充实验（受运行时上限约束）：

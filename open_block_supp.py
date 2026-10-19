@@ -436,10 +436,10 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         ds, ppl_ds, used = _paired(cells, va, vb, seeds)
         # Controlled-comparator check on the first paired seed.
         reasons = []
-        for s in used[:1]:
+        for s in used:
             r = _controlled_reason(cells[(va, s)]['record'], cells[(vb, s)]['record'])
             if r:
-                reasons.append(r)
+                reasons.append(f'seed{s}: {r}')
         st = L.paired_effect_stats(ds, alpha=0.05, min_n=3) if ds else {'n': 0}
         st = dict(st)
         st.update({
