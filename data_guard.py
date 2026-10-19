@@ -157,6 +157,70 @@ def _empty_index():
     return np.empty(0, dtype=np.int64)
 
 
+def _validated_index(values, *, name='index'):
+    """Return a non-negative ``int64`` row-index array.
+
+    Split arrays are compared by value, but NumPy also resolves negative
+    indices from the end of an array.  ``-1`` and ``n - 1`` therefore address
+    the same row while looking disjoint in a set comparison, which would let a
+    holdout row appear in the training split.  Fractional values are rejected
+    instead of being silently truncated (``0.5 -> 0``).  Bool arrays are
+    rejected too: they are masks, not row indices.
+    """
+    arr = np.asarray(values)
+    flat = arr.reshape(-1)
+    if flat.size == 0:
+        return _empty_index()
+    kind = flat.dtype.kind
+    if kind in 'iu':
+        out = flat.astype(np.int64, copy=False)
+    elif kind == 'f':
+        f = flat.astype(np.float64, copy=False)
+        if not np.all(np.isfinite(f)):
+            raise ValueError(f'{name} contains NaN/Inf; split indices must be finite')
+        if np.any(f != np.floor(f)):
+            raise ValueError(f'{name} contains non-integer row indices')
+        out = f.astype(np.int64)
+    elif kind == 'O':
+        # Reject strings, datetimes and booleans instead of coercing them:
+        # a timestamp column passed by mistake must not become row indices.
+        vals = []
+        for v in flat.tolist():
+            if isinstance(v, (bool, np.bool_)):
+                raise ValueError(
+                    f'{name} must contain integer row indices, not booleans')
+            if isinstance(v, numbers.Integral):
+                v = int(v)
+            elif isinstance(v, numbers.Real):
+                f = float(v)
+                if not math.isfinite(f) or f != math.floor(f):
+                    raise ValueError(
+                        f'{name} must contain finite integer row indices, '
+                        f'got {v!r}')
+                v = int(f)
+            else:
+                raise ValueError(
+                    f'{name} must contain integer row indices, got '
+                    f'{type(v).__name__}')
+            if v < 0:
+                raise ValueError(
+                    f'{name} contains negative row indices; use non-negative '
+                    'indices so a wraparound index cannot alias a row from '
+                    'another split')
+            if v > np.iinfo(np.int64).max:
+                raise ValueError(f'{name} contains an out-of-range row index {v}')
+            vals.append(v)
+        out = np.asarray(vals, dtype=np.int64)
+    else:
+        raise ValueError(
+            f'{name} must contain integer row indices, got dtype {flat.dtype}')
+    if np.any(out < 0):
+        raise ValueError(
+            f'{name} contains negative row indices; use non-negative indices so '
+            'a wraparound index cannot alias a row from another split')
+    return out
+
+
 def _take(data, idx):
     """Index an array/sequence with an integer index array."""
     try:
@@ -465,11 +529,18 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
 
 
 def _group_key(value):
-    """Hashable group identity; NaN is one group, not one group per NaN."""
+    """Hashable group identity; NaN/NaT rows collapse into one missing group.
+
+    A missing group id must not behave like "unique per row": otherwise rows
+    of the same missing group can be split across train/val/test and no
+    group-overlap check will ever fire.
+    """
     if isinstance(value, (float, np.floating)):
         f = float(value)
         if math.isnan(f):
             return ('__nan__',)
+    if isinstance(value, np.datetime64) and np.isnat(value):
+        return ('__nat__',)
     return value
 
 
@@ -501,10 +572,14 @@ def assert_no_split_leakage(train_idx, val_idx, test_idx, *, groups=None,
     every test time.  This catches random shuffling of time-series rows even
     when the row indices themselves are disjoint.
     """
-    split_idx = {'train': train_idx, 'val': val_idx, 'test': test_idx}
+    split_idx = {
+        'train': _validated_index(train_idx, name='train_idx'),
+        'val': _validated_index(val_idx, name='val_idx'),
+        'test': _validated_index(test_idx, name='test_idx'),
+    }
     max_index = -1
     for name in SPLIT_NAMES:
-        arr = np.asarray(split_idx[name]).reshape(-1)
+        arr = split_idx[name]
         if arr.size:
             max_index = max(max_index, int(arr.max()))
     if groups is not None:
@@ -834,6 +909,10 @@ def _row_keys(X):
     # Hash row blocks; each block is converted to float64 before hashing.
     for start in range(0, src.shape[0], 1 << 16):
         arr = np.ascontiguousarray(np.asarray(src[start:start + (1 << 16)], dtype=np.float64))
+        # ``-0.0 == 0.0`` but their byte patterns differ, so raw hashing would
+        # miss an exact duplicate split across train/val/test.  Normalize the
+        # sign of zero before hashing (NaN values are handled separately).
+        arr = np.where(arr == 0.0, 0.0, arr)
         finite = np.isfinite(arr)
         for row, ok in zip(arr, finite):
             # NaN/Inf positions are represented explicitly so two rows are equal
@@ -870,10 +949,13 @@ def _label_key(v):
         return None
     try:
         f = float(v)
-        if math.isnan(f):
-            return None
     except (TypeError, ValueError):
-        pass
+        return v
+    # NaN and infinities are not valid class/regression targets.  Treating
+    # +inf as an ordinary label would hide a corrupted target from the
+    # missing-label audit.
+    if not math.isfinite(f):
+        return None
     return v
 
 
@@ -897,13 +979,31 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     warnings unless the corresponding ``fail_on_*`` flag is enabled; callers
     that consciously accept them must record the waiver in their run metadata.
     """
+    # A NaN/negative threshold silently disables the corresponding gate
+    # (NaN compares False against everything), which is worse than an error.
+    try:
+        clip_z = float(clip_z)
+    except (TypeError, ValueError):
+        raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}') from None
+    if not math.isfinite(clip_z) or clip_z <= 0.0:
+        raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}')
+    try:
+        shift_threshold = float(shift_threshold)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f'shift_threshold must be a finite non-negative number, got '
+            f'{shift_threshold!r}') from None
+    if not math.isfinite(shift_threshold) or shift_threshold < 0.0:
+        raise ValueError(
+            f'shift_threshold must be a finite non-negative number, got '
+            f'{shift_threshold!r}')
     X = _as_float_2d(X)
     n = X.shape[0]
     idx = {'train': train_idx, 'val': val_idx, 'test': test_idx}
     for name, v in idx.items():
         if v is not None:
-            v = np.asarray(v, dtype=np.int64).reshape(-1)
-            if v.size and (v.min() < 0 or v.max() >= n):
+            v = _validated_index(v, name=f'{name}_idx')
+            if v.size and v.max() >= n:
                 raise ValueError(f'{name}_idx is out of bounds for n={n}')
             idx[name] = v
     if all(v is None for v in idx.values()):
@@ -1015,11 +1115,19 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         y = np.asarray(y).reshape(-1)
         if y.shape[0] != n:
             raise ValueError(f'y has length {y.shape[0]}, expected {n}')
-        labels = [_label_key(v) for v in y.tolist()]
+        raw_labels = y.tolist()
+        labels = [_label_key(v) for v in raw_labels]
         missing_labels = int(sum(v is None for v in labels))
-        checks['missing_labels'] = missing_labels
-        if missing_labels:
-            warnings.append(f'{missing_labels} missing labels')
+        absent_labels = int(sum(v is None for v in raw_labels))
+        nonfinite_labels = missing_labels - absent_labels
+        checks['missing_labels'] = absent_labels
+        checks['nonfinite_labels'] = nonfinite_labels
+        if absent_labels:
+            warnings.append(f'{absent_labels} missing labels')
+        if nonfinite_labels:
+            warnings.append(
+                f'{nonfinite_labels} non-finite labels (NaN/Inf); impute or '
+                'remove them before fitting')
         by_row = {}
         for i, (k, lab) in enumerate(zip(keys, labels)):
             if lab is not None:
@@ -1078,6 +1186,8 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             continue
         Xh = X[rows]
         smd = []
+        non_estimable = []
+        missing_reference = []
         for j in range(X.shape[1]):
             tv = Xt[:, j]
             hv = Xh[:, j]
@@ -1085,10 +1195,20 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             hv = hv[np.isfinite(hv)]
             if tv.size == 0 or hv.size == 0:
                 smd.append(None)
+                missing_reference.append(j)
                 continue
             sd = float(np.std(tv, ddof=0))
             if sd <= _EPS:
-                smd.append(0.0 if abs(float(np.mean(hv)) - float(np.mean(tv))) <= _EPS else None)
+                delta = abs(float(np.mean(hv)) - float(np.mean(tv)))
+                if delta <= _EPS:
+                    smd.append(0.0)
+                else:
+                    # A constant training feature has no finite SMD, but that
+                    # is not evidence of "no shift": the holdout mean is
+                    # different by construction.  Dropping it from the maximum
+                    # would report a material shift as clean.
+                    smd.append(None)
+                    non_estimable.append(j)
             else:
                 smd.append(float((np.mean(hv) - np.mean(tv)) / sd))
         miss_train = 1.0 - np.mean(np.isfinite(Xt), axis=0)
@@ -1102,8 +1222,27 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             'max_abs_standardized_mean_difference': (
                 max(finite_smd) if finite_smd else 0.0),
             'per_feature_standardized_mean_difference': smd,
+            'non_estimable_shift_features': non_estimable,
+            'features_without_reference_or_holdout_values': missing_reference,
             'max_abs_missing_rate_delta': _missing_delta,
         }
+        if non_estimable:
+            _msg = (
+                f'{name} shift not estimable for {len(non_estimable)} '
+                'zero-training-variance feature(s) whose holdout mean differs; '
+                'SMD is undefined, not zero')
+            if fail_on_shift:
+                hard_failures.append(_msg)
+            else:
+                warnings.append(_msg)
+        if missing_reference:
+            _msg = (
+                f'{name} shift not estimable for {len(missing_reference)} '
+                'feature(s) with no finite training or holdout values')
+            if fail_on_shift:
+                hard_failures.append(_msg)
+            else:
+                warnings.append(_msg)
         if shift[name]['max_abs_standardized_mean_difference'] > shift_threshold:
             _msg = (
                 f'{name} covariate shift: max |SMD| = '

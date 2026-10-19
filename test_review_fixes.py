@@ -2782,6 +2782,72 @@ def t_object_time_and_zero_feature_guards():
     assert rep['n_features'] == 0, rep
 
 
+def t_data_guard_index_label_and_shift_edges():
+    # Negative indices wrap around in NumPy: -1 and n-1 are the same row even
+    # though their values look disjoint.  Fractional indices must never be
+    # silently truncated to an int.
+    for bad_train in ([-1], [0.5], [np.nan], [True], ['0'],
+                      np.array(['2020-01-01'], dtype='datetime64[D]')):
+        try:
+            L.assert_no_split_leakage(bad_train, [], [2])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid split indices {bad_train!r} must be rejected')
+    X = np.arange(8, dtype=float).reshape(4, 2)
+    for bad_train in ([-1], [0.5]):
+        try:
+            L.data_quality_report(X, train_idx=bad_train, val_idx=[1])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'data_quality_report accepted {bad_train!r}')
+
+    # Inf is not a class/regression target; it is non-finite label noise.
+    rep = L.data_quality_report(X, y=[0, np.inf, 1, 2],
+                                train_idx=[0, 1], val_idx=[2], test_idx=[3])
+    assert rep['checks']['nonfinite_labels'] == 1, rep
+    assert rep['checks']['missing_labels'] == 0, rep
+    assert rep['status'] == 'warnings', rep
+
+    # -0.0 == 0.0 but the raw bytes differ; a duplicate across the split must
+    # still be detected.
+    Xz = np.array([[0.0, 1.0], [-0.0, 1.0], [2.0, 3.0], [4.0, 5.0]])
+    repz = L.data_quality_report(Xz, train_idx=[0], val_idx=[1], test_idx=[2, 3])
+    assert repz['checks']['duplicate_rows_across_splits']['train__val'] == 1, repz
+    assert repz['status'] == 'fail', repz
+
+    # A zero-variance training feature with a different holdout mean is an
+    # undefined SMD, not a zero shift.
+    Xc = np.array([[0.0], [0.0], [5.0], [0.0]])
+    repc = L.data_quality_report(Xc, train_idx=[0, 1, 3], val_idx=[2])
+    shift = repc['checks']['distribution_shift_vs_train']['val']
+    assert shift['non_estimable_shift_features'] == [0], repc
+    assert repc['status'] == 'warnings', repc
+
+    # A NaN/negative threshold must be an error, not a silently disabled gate.
+    for bad_kw in ({'clip_z': float('nan')}, {'clip_z': -1.0},
+                   {'shift_threshold': float('nan')},
+                   {'shift_threshold': -0.1}):
+        try:
+            L.data_quality_report(X, train_idx=[0, 1], val_idx=[2], **bad_kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'data_quality_report accepted {bad_kw!r}')
+
+    # Object-dtype NaT group ids are one missing group, so splitting them
+    # across sides is group leakage.
+    g = np.array([np.datetime64('NaT', 'D'), np.datetime64('NaT', 'D'),
+                  np.datetime64('2020-01-01', 'D')], dtype=object)
+    try:
+        L.assert_no_split_leakage([0], [1], [2], groups=g)
+    except ValueError as e:
+        assert 'share group ids' in str(e), e
+    else:
+        raise AssertionError('NaT group ids must not be split across sides')
+
+
 def t_audit_split_warning_status():
     with tempfile.TemporaryDirectory() as d:
         tag = 'tiny'
@@ -3024,6 +3090,7 @@ def main():
     _check('I17 an empty split cache is not reported as verified', t_audit_split_empty_cache_is_not_ok)
     _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)
     _check('I19 simple-baseline audit reports malformed records instead of crashing', t_simple_baseline_audit_malformed_records)
+    _check('I20 index aliasing, non-finite labels, signed-zero duplicates, undefined SMD, NaT groups', t_data_guard_index_label_and_shift_edges)
     # Open-block reading rule: the substantive gates (causality, reference
     # pooling, masks, edge cases, closed regression) live in test_open_block.py
     # so they can also be run on their own.
