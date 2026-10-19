@@ -2763,7 +2763,8 @@ def _open_block_geometry(bid, n_blocks=None):
             'block_of_token': bid.long()}
 
 
-def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128, window_start=None):
+def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128,
+                          window_start=None, candidate_table=True):
     """Per-query prefix start/length and the candidate token table.
 
     Returns a dict with:
@@ -2806,20 +2807,30 @@ def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128, w
         plen = (pend - s + 1).clamp_min(0)
     else:
         raise ValueError(f'unknown open_block_scope {scope!r}')
-    P = int(plen.max().item()) if n else 0
-    # A full-prefix singleton table is [T, P]; for a pathological no-cap block
-    # this can be O(T^2).  Fail explicitly instead of silently exhausting GPU
-    # memory; the panel reports candidate growth and can cap/evaluate in
-    # shorter slices.
-    if n * max(P, 1) > (16 << 20):
-        raise RuntimeError(
-            f'open-block prefix candidate table would be {n}x{P} '
-            f'({n * max(P, 1)} elements); reduce max_block_tokens, use '
-            'prefix_summary instead of prefix_singletons, or evaluate in '
-            'shorter sequence slices')
+    P_full = int(plen.max().item()) if n else 0
+    # `prefix_summary` needs only ONE candidate per query; only the singleton
+    # table is [T, P].  Never materialise an O(T^2) table for a summary just
+    # because a no-cap block is long.
+    if not candidate_table:
+        P = 1
+    else:
+        P = P_full
+        # A full-prefix singleton table is [T, P]; for a pathological no-cap
+        # block this can be O(T^2).  Fail explicitly instead of silently
+        # exhausting GPU memory; the panel reports candidate growth and can
+        # cap/evaluate in shorter slices.
+        if n * max(P, 1) > (16 << 20):
+            raise RuntimeError(
+                f'open-block prefix candidate table would be {n}x{P} '
+                f'({n * max(P, 1)} elements); reduce max_block_tokens, use '
+                'prefix_summary instead of prefix_singletons, or evaluate in '
+                'shorter sequence slices')
     if P <= 0:
         token_idx = torch.zeros((n, 0), dtype=torch.long, device=dev)
         valid = torch.zeros((n, 0), dtype=torch.bool, device=dev)
+    elif not candidate_table:
+        token_idx = u_start[:, None].clamp(max=max(n - 1, 0))
+        valid = (plen > 0)[:, None]
     else:
         j = _arange_cache(P, dev)[None, :]
         token_idx = (u_start[:, None] + j).clamp(max=n - 1)
@@ -2890,7 +2901,8 @@ def causal_prefix_pool(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
     if T == 0:
         return Xa[:0]
     pg = _open_prefix_geometry(bid, n_blocks=int(geo['n_blocks']), scope=scope,
-                               window=window, window_start=window_start)
+                               window=window, window_start=window_start,
+                               candidate_table=False)
     cap = int(B_pos_a.shape[0])
     offset = geo['offset'].clamp(max=cap - 1)
     z_a = Za + B_pos_a[offset]
@@ -2948,7 +2960,8 @@ def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
     if T == 0:
         return out
     pg = _open_prefix_geometry(bid, n_blocks=int(geo['n_blocks']), scope=scope,
-                               window=window, window_start=window_start)
+                               window=window, window_start=window_start,
+                               candidate_table=False)
     cap_a = int(B_pos_a.shape[0])
     cap_b = int(B_pos_b.shape[0])
     starts = geo['starts'].tolist()
@@ -4023,6 +4036,11 @@ class AttnCfg:
             if self.kind == 'csa' and self.selection_budget != 'shared_topk':
                 raise ValueError(f'csa open-block layers implement selection_budget="shared_topk"; got {self.selection_budget!r}')
 
+    @property
+    def max_block_tokens(self):
+        """Explicit experiment-facing alias for `max_block`."""
+        return self.max_block
+
     def max_block_bound(self, seq_len=None):
         """Explicit safe maximum block length for the segmenters.
 
@@ -4516,7 +4534,9 @@ class HybridAttention(nn.Module):
         if _open_mode != 'closed':
             _scope = cfg.open_block_scope
             _prefix_geo = _open_prefix_geometry(
-                bid, n_blocks=int(nblk), scope=_scope, window=cfg.sliding_window)
+                bid, n_blocks=int(nblk), scope=_scope,
+                window=cfg.sliding_window,
+                candidate_table=(_open_mode != 'prefix_summary'))
             if _open_mode == 'prefix_summary':
                 _prefix_comp = causal_prefix_pool(
                     Ca_raw, (Cb_raw if cfg.kind == 'csa' else None), Za,
@@ -7579,6 +7599,7 @@ def open_block_config(m):
             'layer': int(li),
             'kind': str(getattr(cfg, 'kind', '')),
             'max_block': getattr(cfg, 'max_block', None),
+            'max_block_tokens': getattr(cfg, 'max_block', None),
             'pool_position_capacity': int(cfg.position_capacity()) if hasattr(cfg, 'position_capacity') else None,
             'pool_position_policy': getattr(cfg, 'pool_position_policy', None),
             'open_block_mode': getattr(cfg, 'open_block_mode', 'closed'),
@@ -13400,6 +13421,7 @@ def _compression_report_summary(model, seq_len, val_bnd=None, bnd_tol=1):
             'open_block_scope': getattr(attn.cfg, 'open_block_scope', 'full_prefix'),
             'selection_budget': getattr(attn.cfg, 'selection_budget', 'shared_topk'),
             'max_block': getattr(attn.cfg, 'max_block', None),
+            'max_block_tokens': getattr(attn.cfg, 'max_block', None),
             'max_block_effective': (int(getattr(attn.cfg, 'max_block')) if getattr(attn.cfg, 'max_block', None) is not None else seq_len),
             'pool_position_capacity': int(getattr(attn.cfg, 'position_capacity', lambda: 0)()),
             'pool_position_policy': getattr(attn.cfg, 'pool_position_policy', 'truncate'),

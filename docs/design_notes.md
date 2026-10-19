@@ -960,8 +960,10 @@ the read stage changes:
 exactly 1 and no position bias survives, so the pooled value is
 `Xa[u] = x_u @ W_aKV` (then `core_kv = normalize(.)` and `W_kvhead`), i.e. a
 length-1 compressed representation through the same module and parameters.
-A raw-token variant would be a separate `prefix_rawtokens` mode and is not
-part of this panel.
+The singleton path deliberately uses `overlap=0`: with previous-block overlap
+lanes it would no longer be a length-1 representation.  The summary path keeps
+the configured overlap convention.  A raw-token variant would be a separate
+`prefix_rawtokens` mode and is not part of this panel.
 
 The prefix is a temporary representation for the current query.  It does
 not modify `bid`; for the next query it grows with `t`, and once the block
@@ -1008,7 +1010,10 @@ selected ids are unique.
 `prefix_singletons` uses the existing local-token K/V table, because a
 length-1 pooled block is exactly `normalize(Ca_raw[u])` at the same module
 parameters.  `prefix_summary` computes its own pooled summary and then the
-same `W_kvhead`/normalization path as a closed block.
+same `W_kvhead`/normalization path as a closed block.  A summary never
+materialises the per-singleton `[T, P]` candidate table; the singleton table
+is guarded at 16M elements so a pathological no-cap block fails explicitly
+instead of silently exhausting memory.
 
 The open path is implemented in the eager row loop.  `CSA_KERNEL` and the
 batched eager twin do not implement it and fail rather than silently running
