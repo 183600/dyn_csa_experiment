@@ -129,13 +129,13 @@ def t_tost_student_t_and_boundary():
 
 
 def t_safe_exp_and_doc_ci():
-    # exp(705) is finite on IEEE doubles; a fixed 700 cutoff used to turn a
-    # measurable (if divergent) run into an unmeasured ``inf`` record.
+    # A finite exponent must stay a finite PPL; only an actual IEEE overflow
+    # yields inf.
     assert math.isfinite(L._safe_exp_ppl(705.0))
     assert L._safe_exp_ppl(1000.0) == float('inf')
     assert L._safe_exp_ppl(float('nan')) != L._safe_exp_ppl(float('nan'))  # NaN stays NaN
     # Token-pooled CE and its interval must target the same estimand even when
-    # document lengths differ (the old unweighted per-doc SEM did not).
+    # document lengths differ.
     nll = [10.0, 1.0, 4.0]
     ntok = [100, 10, 20]
     ci = L._nll_doc_ci(nll, ntok)

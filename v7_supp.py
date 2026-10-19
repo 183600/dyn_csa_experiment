@@ -362,9 +362,8 @@ class HybridAttentionRoPE(L.HybridAttention):
         _lt = last_tok.long()
         bc, bs = (cos[_lt], sin[_lt])
         k_blk_r = apply_rope(k_blk, bc[:, None, :], bs[:, None, :], rope_dim)
-        # The window half is gathered (and rotated) per query chunk below,
-        # instead of materialising a full rotated [T, nh, hd] copy for every
-        # layer.  RoPE is position-wise, so rotating the gathered rows gives
+        # The window half is gathered and rotated per query chunk below.
+        # RoPE is position-wise, so rotating the gathered rows gives
         # exactly the same values as rotating the table and then gathering.
         out = torch.empty_like(q)
         _wi_all, _wvalid_all = L._window_geometry(T, w, dev)
@@ -381,9 +380,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                        and topk_l is L._IDX_CACHE.get((L._dev_str(dev), 'arangeexp', int(T), int(topk_l.shape[1]))))
         _sel_all = None
         # The K/V halves are gathered separately per chunk and concatenated
-        # in the same order as the old whole-table cat-then-gather form, so
-        # every gathered value is bit-identical while the full [T, nh, hd]
-        # concatenated copies are no longer materialised per layer.
+        # in the same order, so every gathered value is bit-identical and the
+        # full [T, nh, hd] concatenated copy is not built.
         _has_sw = k_sw is not None and v_sw is not None
         # see exp_lib.gathered_attention: these per-row masks are hoisted under
         # L._FO_FULL_CAP_BYTES; the hoisted values are bitwise identical to the

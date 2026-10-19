@@ -741,8 +741,7 @@ def _row_keys(X):
     if src.ndim == 1:
         src = src.reshape(-1, 1)
     keys = []
-    # Hash row blocks; each block is converted to float64 exactly like the
-    # old whole-matrix conversion would have done.
+    # Hash row blocks; each block is converted to float64 before hashing.
     for start in range(0, src.shape[0], 1 << 16):
         arr = np.ascontiguousarray(np.asarray(src[start:start + (1 << 16)], dtype=np.float64))
         finite = np.isfinite(arr)

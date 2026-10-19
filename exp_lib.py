@@ -338,9 +338,8 @@ def _safe_exp_ppl(x):
         return None
     if math.isnan(x):
         return float('nan')
-    # exp is finite up to ~709.78; a fixed 700 cutoff would turn finite PPLs
-    # (e.g. CE 705) into a false ``inf`` and silently drop the record.  Let
-    # the FP overflow exception define the boundary for this machine.
+    # Let the FP overflow exception define the upper boundary for this
+    # machine, so any finite exponent remains a finite PPL.
     try:
         return math.exp(x)
     except OverflowError:
@@ -411,7 +410,7 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
 # The scale panels are only allowed to start after the kernel/eager
 # equivalence certificate exists and matches this code/env.  `m0_supp.py
 # kernel` writes it; `TimeGuard(require_g0=True)` / `run(cfg.require_g0)` read
-# it before any data is loaded or GPU time is booked.  An operator who
+# it before any data is loaded or a panel starts.  An operator who
 # deliberately wants eager debugging can set CSA_ALLOW_UNVERIFIED_EAGER=1; the
 # override is printed and recorded in the panel manifest/config.
 G0_CERT_ENV = 'CSA_G0_CERT'
@@ -850,11 +849,9 @@ def _h2d_stage(shape, dtype, device):
         ent = _H2D_POOL.get(key)
         if ent is None:
             per_slot = int(np.prod(shape, dtype=np.int64)) * torch.empty((), dtype=dtype).element_size()
-            # Large uploads reserve only as many slots as fit comfortably:
-            # keeping 8 copies of a hundreds-of-MB geometry would exceed the
-            # pool and force every layer onto the blocking pinned-copy
-            # fallback.  The slot count is per entry, so small uploads still
-            # use the full ring.
+            # Large uploads reserve only as many slots as fit comfortably.
+            # The slot count is per entry, so small uploads still use the
+            # full ring.
             n_slots = max(1, min(int(_H2D_POOL_SLOTS), int((_H2D_POOL_CAP // 2) // max(1, per_slot))))
             est = per_slot * n_slots
             _h2d_pool_evict_locked(est)
@@ -1150,9 +1147,8 @@ def _causal_quantile_exact(x, cols, target_block_tokens):
     _pair_bytes = 16
     _budget = 128 << 20
     nc = max(1, int(cols.numel()))
-    # Bound BOTH dimensions by the byte budget.  Limiting only the row count
-    # leaves a single [1, col_chunk, n] sort block unbounded (n=1M with
-    # col_chunk=64 is ~1GB, far above the advertised budget).
+    # Bound BOTH dimensions by the byte ceiling.  Limiting only the row count
+    # would leave a single [1, col_chunk, n] sort block unbounded.
     col_chunk = max(1, min(nc, 64, _budget // max(1, n * _pair_bytes)))
     row_chunk = max(1, _budget // max(col_chunk * n * _pair_bytes, 1))
     out = x.new_empty((x.shape[0], nc))
@@ -1182,9 +1178,9 @@ _ADAPTIVE_EXACT_DEFAULT = 8192
 def _adaptive_exact_limit():
     """Length up to which the adaptive segmenter uses its exact closed form.
 
-    The historical default is 8192.  Sampling above it changes block geometry,
-    so the effective limit is part of the run fingerprint (`_ae`); a panel
-    that needs the cheaper sampled path must opt in explicitly.
+    The default is 8192.  Sampling above it changes block geometry, so the
+    effective limit is part of the run fingerprint (`_ae`); a panel that
+    needs the sampled path must opt in explicitly.
     ``CSA_ADAPTIVE_EXACT_TOKENS`` selects the cutoff without editing code.
     """
     raw = os.environ.get('CSA_ADAPTIVE_EXACT_TOKENS', '').strip()
@@ -1200,8 +1196,7 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
         return torch.empty(0, dtype=sim.dtype, device=sim.device)
     n = int(sim.shape[-1])
-    # Hard safety ceiling only (the sampling path below is bounded), not the
-    # old 8192 rejection limit.
+    # Hard safety ceiling only (the sampling path below is bounded).
     _max_len = 1 << 20
     _env_max = os.environ.get('CSA_ADAPTIVE_MAX_TOKENS', '').strip()
     if _env_max:
@@ -1214,9 +1209,8 @@ def causal_adaptive_threshold(sim, target_block_tokens):
             f'causal_adaptive_threshold 超出显式安全上限 {_max_len}（CSA_ADAPTIVE_MAX_TOKENS）: '
             '请提高该上限或改用 chunking="cosine_learnable"')
     # Up to this length the exact closed form (O(T^2) comparisons) is used.
-    # The 8192 default is the historical measurement semantics; the sampled
-    # long-context path must be opted into explicitly (and is part of the run
-    # fingerprint through `_ae`).
+    # The default is 8192; the sampled long-context path must be opted into
+    # explicitly (and is part of the run fingerprint through `_ae`).
     _exact_len = _adaptive_exact_limit()
     squeeze = sim.dim() == 1
     x = (sim.unsqueeze(0) if squeeze else sim).detach().float()
@@ -1231,8 +1225,7 @@ def causal_adaptive_threshold(sim, target_block_tokens):
         #      maximum length and only read the last sample at or before the
         #      column.  No `n-1` endpoint and no `n`-derived step, so
         #      tau_T[:T'] == tau_T' for every T' < T.
-        # This also removes the old interpolation which mixed a future sample
-        # into a past column and broke the segmenter's prefix invariance.
+        # The sampled grid never mixes a future sample into a past column.
         exact_n = min(n, int(_exact_len))
         pre_cols = torch.arange(exact_n, device=sim.device, dtype=torch.long)
         pre_vals = _causal_quantile_exact(x[:, :exact_n], pre_cols, target_block_tokens)
@@ -1527,9 +1520,8 @@ def _dense_causal_window_rows(T, window, s, e, device):
     #
     # The result is a pure function of (T, window, s, e, device), so the same
     # read-only table is reused across layers, steps and the checkpointed
-    # backward recompute instead of being rebuilt for every sink/full row
-    # chunk.  The cache has its own byte budget so a very long T cannot
-    # silently retain a second dense T x T table.
+    # backward recompute.  The cache has its own byte ceiling so a very long T
+    # cannot silently retain a second dense T x T table.
     key = (_dev_str(device), 'dense-rows', int(T), int(window), int(s), int(e))
     hit = _cache_get(_DENSE_ROW_MASK_CACHE, key)
     if hit is not None:
@@ -1587,8 +1579,7 @@ def _attn_transient_budget(device):
             free, _total = torch.cuda.mem_get_info(device)
             # 上限由设备状态决定并封顶 cap；行分块是纯行划分（任意宽度下
             # 逐行值逐位相同，见 gathered_attention 的 chunk 注释），不改变
-            # 任何值。默认 cap 取 512MB，避免 24–40GB 卡在 OOM 前就分配
-            # 2GB 的 logits/attn 临时量。
+            # 任何值。默认 cap 取 512MB。
             val = max(64 << 20, min(int(free) // 4, cap))
     except Exception:
         val = None
@@ -3271,7 +3262,7 @@ class AttnCfg:
     full_sink: bool = False
     fuse_mode: str = 'none'
     fuse_kernel: int = 5
-    # 'threshold' preserves the historical hard-cut behaviour.  'reinforce'
+    # 'threshold' uses hard-cut decisions.  'reinforce'
     # samples the cut decisions and adds a score-function term for the LM loss,
     # so the task objective can actually learn the boundary policy instead of
     # only the compression-rate regularizer (review 3 issue 6).
@@ -4231,7 +4222,7 @@ def make_layer_cfgs(n_layers, variant):
             # Opt-in end-to-end boundary arm (review 3 issue 6): identical to
             # csa_dynamic except the hard cuts are sampled and trained by the
             # LM loss through a score-function term.  This is a NEW arm; the
-            # historical csa_dynamic remains threshold/comp_reg-only and must
+            # csa_dynamic remains threshold/comp_reg-only and must
             # not be described as task-learned.
             cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, boundary_policy='reinforce'))
         elif variant == 'csa_dyn_nocomp':
@@ -5207,9 +5198,9 @@ def _npy_serve_int32(path):
         _mn, _mx = int(src.min()), int(src.max())
         if _mn < 0 or _mx > 2 ** 31 - 1:
             raise ValueError(f'_npy_serve_int32: token ids in {path} span [{_mn}, {_mx}], outside the int32 transport range')
-    # Serve an identity-bound int32 sidecar instead of copying the whole
-    # corpus into RAM: the returned values are the same exact integers and
-    # the fingerprint stays on the historical int32 canonical form.
+    # Serve an identity-bound int32 sidecar so workers share one mapped copy:
+    # the returned values are the same exact integers and the fingerprint
+    # stays on the int32 canonical form.
     try:
         _side = _i32_sidecar_path(path)
         if os.path.exists(_side):
@@ -5244,7 +5235,7 @@ def _npy_serve_int32(path):
         return np.load(_side, mmap_mode='r')
     except (OSError, ValueError, TypeError):
         # Read-only directory or a racing writer: fall back to an in-memory
-        # int32 copy (the old behaviour) rather than failing the load.
+        # int32 copy rather than failing the load.
         out = np.empty(src.shape, dtype=np.int32)
         for s in range(0, src.size, 1 << 24):
             e = min(s + (1 << 24), src.size)
@@ -11772,7 +11763,7 @@ OPT_ADAMW_EPS = 1e-08
 GRAD_CLIP_NORM = 1.0
 LR_FLOOR_MULT = 0.1
 # Score-function coefficient for `boundary_policy='reinforce'`.  Only arms that
-# opt in pay this term; the threshold path is byte-identical to the historical
+# opt in pay this term; the threshold path is byte-identical to the default
 # loss (ce + comp_lambda * comp_reg).
 BOUNDARY_PG_COEF = 1.0
 LR_COSINE_AMP = 0.45
@@ -12154,10 +12145,8 @@ def _params_all_finite(model):
 class _HashingWriter:
     """File proxy that hashes bytes as `torch.save` writes them.
 
-    Checkpoints used to be written and then read back in full just to compute
-    the SHA-256.  Hashing the same bytes on the way out removes that second
-    full-file read (and the page-cache pressure it creates for multi-GB
-    checkpoints)."""
+    Hashing the same bytes on the way out avoids a second full-file read for
+    the checkpoint digest."""
 
     __slots__ = ('_f', '_h')
 
@@ -12201,7 +12190,7 @@ def _atomic_torch_save(obj, path, hash_out=None):
 
 def _checkpoint_payload(model, *, variant, seed, step, val_ppl, train_ce, health, extra=None):
     # Keep the tensors where they live; torch.save streams each storage to the
-    # file, so we no longer materialise a second full CPU copy of the model.
+    # file, so a second full CPU copy of the model is not needed.
     # Loaders already use map_location='cpu' (error_analysis / v7_supp).
     sd = {k: v.detach() for k, v in model.state_dict().items()}
     payload = {'format': 'csa-analysis-ckpt-v1', 'variant': variant, 'seed': int(seed),
@@ -12239,12 +12228,12 @@ def _percentile(vals, q):
 
 @torch.inference_mode()
 def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
-    """Measure real prefill / prefix-decode latency and peak memory.
+    """Measure prefill / prefix-prefill timing and allocator peaks.
 
     There is no KV cache in the model, so the decode number is explicitly a
     PREFIX-PREFILL measurement (it re-runs the whole prefix), not incremental
     decode.  Results are reported as p50/p95 wall-clock plus tokens/s and
-    allocator peaks so a PPL gain can be compared with its actual cost."""
+    allocator peaks."""
     was = model.training
     model.eval()
     ids = torch.as_tensor(ids)
@@ -12353,7 +12342,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     _lr_scales = [g.get('lr_scale', 1.0) for g in opt.param_groups]
     # In DDP each rank consumes a different data shard; the global batch is
     # batch_size * world_size (recorded below).  Single-process runs keep the
-    # historical seed exactly.
+    # same seed exactly.
     bpe = batch_iter(train_ids, seq_len, batch_size, device,
                      seed=(seed + _rank if _dist else seed))
     _eval_batch = val_batch[:eval_subset] if val_batch is not None else None
@@ -12523,8 +12512,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     loss = ce + comp_lambda * _inner_model.comp_reg
                 _loss_item = float(loss.detach().item())
                 # CE / comp_reg are diagnostics on the ordinary path; read
-                # them only on logging/diagnostic steps (or after a bad loss)
-                # instead of forcing two extra device synchronisations per step.
+                # them only on logging/diagnostic steps (or after a bad loss).
                 _need_scalars = (_is_diag_step or not math.isfinite(_loss_item)
                                  or (log_every and (step % log_every == 0 or step == steps - 1)))
                 if _need_scalars:
@@ -12751,8 +12739,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                        'nll_per_row': [], 'n_tokens_per_row': [], 'eval_rows': None,
                        'eval_seed': 0, 'eval_subset': 0}
     else:
-        # Final measurement uses the FULL fixed validation batch (the historical
-        # definition); `eval_subset` only controls the per-eval-step history.
+        # Final measurement uses the FULL fixed validation batch;
+        # `eval_subset` only controls the per-eval-step history.
         # Keeping this distinction byte-compatible matters: `_run_fp` pins the
         # full val fingerprint, and changing the final row count without a
         # CODE_SEMANTICS bump would silently mix two PPL definitions on resume.
@@ -12957,8 +12945,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             b = 'position:last10%'
         return b
 
-    # Vectorised bucket accumulation: one bincount per chunk instead of a
-    # Python double loop over every token.
+    # Vectorised bucket accumulation: one bincount per chunk.
     _bucket_names = ['position:first10%', 'position:10-50%', 'position:50-90%',
                      'position:last10%', 'target:rare(<=5 train occurrences)',
                      'target:common', 'target:boundary-token']
@@ -13359,8 +13346,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         _l = float(ce.detach())
         loss_curve.append(_l)
         # Check BEFORE the optimizer update: a non-finite loss/gradient must
-        # never be written into the parameters (the old probe noticed it only
-        # after opt.step()).
+        # never be written into the parameters.
         if (not math.isfinite(_l)) or (not grad_finite):
             _nonfinite_step = step + 1
             break

@@ -390,10 +390,8 @@ def _geom_nbytes(geom):
     # Charge the real (physical) storage of every integer table a geometry
     # entry holds, including its lazily-built gather constants.  The eight
     # scalar tables are slices of ONE packed `_buf`, and the int64 views can
-    # share storage too, so charge each underlying storage exactly once:
-    # summing ``untyped_storage().nbytes()`` per view would count the same
-    # buffer ~8 times and make a few-MB geometry look larger than the budget
-    # (which then disables the cache exactly when it is needed most).
+    # share storage too, so charge each underlying storage exactly once
+    # rather than once per view.
     seen = {}
     def _charge(t):
         if t is None:
@@ -444,14 +442,14 @@ def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
         refs, geom, charged = ent
         if len(refs) == len(counts_rows) and all(a is b for a, b in zip(refs, counts_rows)):
             # Lazy gather constants may have been built since insertion;
-            # re-charge the entry so the byte budget tracks what is resident.
+            # re-charge the entry so the byte ceiling tracks what is resident.
             cur = _geom_nbytes(geom)
             if cur != charged:
                 _GEOM_CACHE_BYTES[0] += cur - charged
                 _GEOM_CACHE[key] = (refs, geom, cur)
-                # Lazy constants can grow a resident entry past the budget;
+                # Lazy constants can grow a resident entry past the ceiling;
                 # evict (possibly this or older entries) so the accounting
-                # contract "budget tracks what is resident" keeps holding.
+                # contract "ceiling tracks what is resident" keeps holding.
                 if _GEOM_CACHE_BYTES[0] > _GEOM_CACHE_BUDGET:
                     _geom_evict(0)
             return geom
@@ -617,9 +615,9 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     starts_l = _i64['starts']
     ov_start_l = _i64['ov_start']
     nblk_l = _i64['n_blocks'][:, None]
-    # A fixed flat buffer holds every B-lane key/value exactly once: the same
-    # concatenation order as the old per-chunk list + torch.cat, but without
-    # retaining the chunk tensors and a second full copy at the end.
+    # A fixed flat buffer holds every B-lane key/value exactly once in the
+    # same concatenation order, without retaining per-chunk tensors or a
+    # second full copy.
     _bpb_total = int(R) * int(Bm) * int(W) if (need_bpb and has_b) else 0
     gBpb_keys = torch.empty(_bpb_total, device=dev, dtype=torch.long) if _bpb_total else None
     gBpb_vals = torch.empty((_bpb_total, c), device=dev, dtype=torch.float32) if _bpb_total else None
@@ -1768,8 +1766,7 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
             order = torch.argsort(flat, dim=1, stable=True)
             # 计数是整数（块 id 非负且 < Bm），scatter_add_ 与逐行 bincount
             # 给出同一组精确整数。lane 值域 [0, T·NB) 只在确实越过 int32
-            # 时才用 int64：常规规模下 order/计数/偏移表全部用 int32，反向
-            # 每层的临时显存和带宽约减半。
+            # 时才用 int64；常规规模下 order/计数/偏移表全部用 int32。
             _narrow = int(T) * int(nb) < (1 << 31)
             _idt = torch.int32 if _narrow else torch.int64
             if _narrow:

@@ -1193,7 +1193,7 @@ def sec_flops():
     pick = {512, 2048, 8192, 65536, 1048576}
     _xo = d.get('crossover_seq_len_csa_beats_dense')
     _xo_txt = f'**seq = {_xo}**' if _xo is not None else '**不存在**（所测长度内 CSA 均不低于 dense）'
-    lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。**这些是结构性估算**；真实延迟/吞吐/显存见下文「Measured efficiency」一节（训练时已在固定 checkpoint 上实测，`prefix-prefill` 明确不是 KV-cache 增量 decode）。没有实测数字时，不得据本节宣称效率优势。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 {_xo_txt} 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
+    lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。**这些是结构性估算**；任何「效率优势」主张必须用 `audit_gates.measure_prefill_decode` 在真实 checkpoint 上测量后另行报告。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 {_xo_txt} 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
     for r in rows:
         if not isinstance(r, dict) or r.get('seq_len') not in pick:
             continue
@@ -1346,7 +1346,7 @@ def sec_efficiency():
         lines += ['', '**Pareto frontier (lower PPL at no higher prefill latency)**:', '']
         for lat, ppl, name, key in _frontier:
             lines.append(f'- `{name}` / `{key}`: PPL {fm(ppl)}, prefill p50 {fm(lat, 2)} ms')
-    lines += ['', '> A PPL improvement should be read together with this table: a small gain that costs an order of magnitude more latency or memory is not a deployable improvement.', '']
+    lines += ['', '> A PPL improvement should be read together with this table: a small gain accompanied by much higher latency or memory is not a deployable improvement.', '']
     return '\n'.join(lines) + '\n'
 
 
