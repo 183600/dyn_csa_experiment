@@ -78,8 +78,19 @@ def _import_exp_lib():
 # 1) leakage：分词器来源 / 词表一致性 / 缓存指纹 / 文档重叠
 # ---------------------------------------------------------------------------
 
-def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
+def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
+                  preferred_train_seq_len=None):
     """数据泄漏审计（零 GPU，读 wt103_cache 落盘产物）。
+
+    ``cache_dir=None`` resolves ``WT103_CACHE_DIR`` (falling back to
+    ``./wt103_cache``), the same resolver the loaders use.  The old fixed
+    default made the audit inspect a different directory from the one the
+    evaluation read.
+
+    ``preferred_train_seq_len`` disambiguates a cache directory that contains
+    more than one train meta (e.g. the 512-token training cache and a
+    4097-token probe cache).  Only train metas with that ``seq_len`` are
+    considered when at least one matches; otherwise the audit refuses to guess.
 
     核验点：
       a. test 缓存 meta 的 fit_fp（拟合语料指纹）必须来自 TRAIN 前 50k 行
@@ -87,9 +98,10 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
       b. test 侧持久化分词器与 train 侧持久化分词器逐 token 全等
          （load_wikitest 运行期同样硬校验，这里独立复核落盘副本）；
       c. train/test id 缓存的 src_fp 与文件内容指纹自洽；
-      d. train/test 文档重叠：k-gram shingle 集合的 Jaccard 与命中数
-         （WikiText-103 本身存在近重复文档；本读数给出「重叠存在多少」的
-         事实基线，供 length/generalization 主张的边界声明使用）。"""
+      d. train/test 文档重叠：k-gram shingle 的 shared/test 比例与最差单行
+         重叠比例（Jaccard 因 4M-vs-65k 的构造上限只作诊断记录）。"""
+    if cache_dir in (None, ''):
+        cache_dir = os.environ.get('WT103_CACHE_DIR') or './wt103_cache'
     out = {'status': 'ok', 'checks': {}}
     test_meta = None
     train_meta = None
@@ -105,9 +117,10 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
         out['note'] = f'{cache_dir}/ lacks test_meta_*.json or meta_*.json — run the corpus loaders once (or copy the cache) to audit tokenizer provenance; the runtime hard checks in exp_lib.load_wiktest/load_wikitext remain in force meanwhile'
         return out
     # Pair a train meta with the test meta that describes the SAME corpus
-    # protocol (vocab, seq_len, tokenizer fit provenance).  Taking the first
-    # filename in each glob can pair a train split with a test split built from
-    # a different vocab/seq_len/val size, making the overlap audit meaningless.
+    # protocol (vocab + tokenizer fit provenance).  seq_len is deliberately NOT
+    # required to match: the training cache is 512-token and the held-out cache
+    # is 4097-token by construction, and the old equality check made every real
+    # train/test pair "not_verifiable_locally".
     _pairs = []
     for _tp in _tm:
         _tmeta = _load(_tp)
@@ -121,16 +134,19 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
             if (_tmeta.get('vocab') is not None and _mmeta.get('vocab') is not None
                     and int(_tmeta['vocab']) != int(_mmeta['vocab'])):
                 continue
-            if (_tmeta.get('seq_len') is not None and _mmeta.get('seq_len') is not None
-                    and int(_tmeta['seq_len']) != int(_mmeta['seq_len'])):
-                continue
             if (_tmeta.get('fit_fp') and _mmeta.get('fit_fp')
                     and _tmeta['fit_fp'] != _mmeta['fit_fp']):
                 continue
             _pairs.append((_mp, _mmeta, _tp, _tmeta))
+    if preferred_train_seq_len is not None:
+        _pref = [p for p in _pairs
+                 if p[1].get('seq_len') is not None
+                 and int(p[1]['seq_len']) == int(preferred_train_seq_len)]
+        if _pref:
+            _pairs = _pref
     if not _pairs:
         out['status'] = 'not_verifiable_locally'
-        out['note'] = 'no train/test cache pair shares the same vocab/seq_len/tokenizer-fit provenance; cannot audit tokenizer or split provenance without guessing'
+        out['note'] = 'no train/test cache pair shares the same vocab/tokenizer-fit provenance; cannot audit tokenizer or split provenance without guessing'
         return out
     _uniq = {(os.path.basename(a), os.path.basename(c)) for a, _, c, _ in _pairs}
     if len(_uniq) > 1:
@@ -149,6 +165,9 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
     out['checks']['train_src_fp'] = train_meta.get('src_fp') or train_meta.get('train_fp')
     out['checks']['test_src_fp'] = test_meta.get('src_fp')
     out['checks']['vocab_agree'] = int(test_meta.get('vocab', -1)) == int(train_meta.get('vocab', -2))
+    _tok_problems = []
+    if not out['checks']['vocab_agree']:
+        _tok_problems.append('test/train cache vocabs disagree')
     # b) persisted tokenizers, if both exist.  Use the tag-paired files, never
     # the first filename in the directory.
     import hashlib
@@ -168,12 +187,31 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
         _a, _b = (_sha(_tt[0]), _sha(_vt[0]))
         out['checks']['tokenizer_files_identical'] = bool(_a == _b)
         out['checks']['tokenizer_sha'] = {'test': _a[:16], 'train': _b[:16]}
+        # Byte equality is diagnostic only: two equivalent tokenizers may
+        # serialize with different JSON ordering.  The ID-SPACE identity below
+        # (full id->token map) is the binding check.
         try:
             from tokenizers import Tokenizer
             ta, tb = (Tokenizer.from_file(_tt[0]), Tokenizer.from_file(_vt[0]))
-            out['checks']['tokenizer_vocab_identical'] = bool(dict(ta.get_vocab()) == dict(tb.get_vocab()))
+            _tv_eq = bool(dict(ta.get_vocab()) == dict(tb.get_vocab()))
+            out['checks']['tokenizer_vocab_identical'] = _tv_eq
+            if not _tv_eq:
+                _tok_problems.append('test/train tokenizer id->token maps differ')
         except Exception as e:
-            out['checks']['tokenizer_vocab_identical'] = f'skipped ({type(e).__name__})'
+            out['checks']['tokenizer_vocab_identical'] = f'failed ({type(e).__name__}: {e})'
+            _tok_problems.append(f'tokenizer vocab comparison failed ({type(e).__name__}: {e})')
+    else:
+        out['checks']['tokenizer_files_present'] = False
+        _tok_problems.append('a persisted train/test tokenizer file is missing; tokenizer identity cannot be verified')
+    if _tok_problems:
+        # v11.128: these used to be informational fields that never touched
+        # `status`.  They are now hard audit failures.
+        out['checks']['tokenizer_problems'] = _tok_problems
+        out['status'] = 'fail'
+        out['note'] = ('tokenizer/split provenance audit failed: ' + '; '.join(_tok_problems) +
+                       ' — the train/test id spaces cannot be shown to be paired; '
+                       'rebuild both caches with the current loaders before using '
+                       'the held-out split')
     # d) document overlap via deterministic SLIDING shingles on the cached id
     # matrices.  A fixed polynomial rolling hash over every window, uniform
     # segments across the full train stream, and an explicit scanned fraction
@@ -243,7 +281,27 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
             inter = int(np.intersect1d(tr_s, te_s, assume_unique=True).size)
             union = int(tr_s.size + te_s.size - inter)
             jac = (inter / union) if union else 0.0
-            _viol = bool(union and jac > 0.05)
+            # v11.128: Jaccard on a 4M-vs-65k shingle pair is bounded near
+            # 1.6% even when EVERY test shingle occurs in train, so the old
+            # `jaccard > 0.05` gate could never fire.  Two reachable statistics
+            # replace it: the fraction of TEST shingles shared with train, and
+            # the worst single test row's overlap fraction.
+            test_overlap = (inter / te_s.size) if te_s.size else 0.0
+            max_row_overlap = None
+            row_overlaps = []
+            if np.asarray(te).ndim == 2 and tr_s.size:
+                _tr_set = np.sort(tr_s)
+                for _i in range(int(np.asarray(te).shape[0])):
+                    _rh = _window_hashes(np.asarray(te)[_i], shingle)
+                    if _rh.size:
+                        _row_frac = float(np.isin(_rh, _tr_set).sum()) / float(_rh.size)
+                        row_overlaps.append(_row_frac)
+                if row_overlaps:
+                    max_row_overlap = float(max(row_overlaps))
+            _max_shingle_ov = float(os.environ.get('CSA_MAX_TEST_SHINGLE_OVERLAP', 0.25))
+            _max_row_ov = float(os.environ.get('CSA_MAX_TEST_ROW_OVERLAP', 0.50))
+            _viol = bool((test_overlap > _max_shingle_ov)
+                         or (max_row_overlap is not None and max_row_overlap > _max_row_ov))
             out['checks']['doc_overlap'] = {
                 'shingle_k': int(shingle),
                 'hash': 'uint64 polynomial rolling hash (fixed base 1000003), sliding windows',
@@ -255,22 +313,32 @@ def audit_leakage(cache_dir='./wt103_cache', shingle=13, max_rows_shingled=400):
                 'train_shingles': int(tr_s.size),
                 'shared_shingles': inter,
                 'jaccard': jac,
+                'test_shingle_overlap': test_overlap,
+                'max_row_overlap': max_row_overlap,
+                'row_overlap_fractions': [round(x, 6) for x in row_overlaps[:64]],
+                'rows_over_policy': int(sum(1 for x in row_overlaps if x > _max_row_ov)),
                 'seconds': round(time.time() - t0, 1),
-                'policy_max_jaccard': 0.05,
+                'policy_max_test_shingle_overlap': _max_shingle_ov,
+                'policy_max_row_overlap': _max_row_ov,
+                'policy_max_jaccard_diagnostic_only': 0.05,
                 'policy_violation': _viol,
                 'status': 'fail' if _viol else 'ok',
                 'note': ('nonzero overlap reflects WikiText-103 near-duplicate '
-                         'documents. A violation blocks a clean cross-split '
-                         'generalization/confirmation claim: clean the evaluation '
-                         'subset or report an overlap-excluded sensitivity '
+                         'documents. The gate uses reachable statistics '
+                         '(shared/test shingles and the worst test row), not the '
+                         'structurally-capped Jaccard. A violation blocks a clean '
+                         'cross-split generalization/confirmation claim: clean the '
+                         'evaluation subset or report an overlap-excluded sensitivity '
                          'analysis. Sampling fractions are reported above; '
                          'uniformly-spaced sliding windows over the requested '
                          'scan budget are deterministic across processes.'),
             }
             if _viol:
                 out['status'] = 'fail'
-                out['note'] = ('train/test document overlap exceeds policy_max_jaccard=0.05 '
-                               '— confirmation claims are UNAVAILABLE until the '
+                out['note'] = (f'train/test document overlap exceeds the frozen policy '
+                               f'(test-shingle overlap {test_overlap:.4f} > {_max_shingle_ov}, '
+                               f'max row overlap {max_row_overlap} > {_max_row_ov}) — '
+                               'confirmation claims are UNAVAILABLE until the '
                                'near-duplicate evaluation documents are excluded '
                                '(or an explicit overlap-excluded sensitivity '
                                'analysis is reported).')

@@ -2382,14 +2382,47 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     need = max(eval_lens) + 1
     if val_ids is None:
         val_ids = L.load_wikitext(max(train_len, need), 8000000)[1]
+    # v11.128: the p1l recipe must describe the implementation that ACTUALLY
+    # runs and the training corpus it actually reads.  The old recipe wrote
+    # `amp_dtype=None` (fp32) and the process-default eager flag while
+    # `train_variant` trained under bf16 on CUDA, and it bound the VALIDATION
+    # fingerprint as `df` (not the training corpus).  Both are now derived
+    # explicitly before training and carried into the checkpoint/record.
+    train_ids = L.load_wikitext(train_len, 8000000)[0]
+    _train_fp = L._ids_fp(train_ids)
+    _val_fp = L._ids_fp(val_ids)
+    _diag_eval_every = int(payload.get('diag_eval_every', 0) or 0)
+    _amp_mode, _ = L._resolve_impl_modes(
+        {'amp_dtype': payload.get('amp_dtype', 'auto'),
+         'batch_size': batch_size}, device=L.DEVICE)
+    # The ACTUAL per-arm dispatch, not the backend capability: every frozen
+    # rope arm takes the per-row `_single_rope` loop even when the CUDA batched
+    # twin exists.  Using the backend default here wrote eager_batch=True into
+    # the recipe while train_variant recorded False (and vice versa).
+    _plan_cfgs = L.make_layer_cfgs(6, v)
+    _eager_mode = L._uses_batched_eager(_plan_cfgs, L.DEVICE, batch_size)
+    _tk_fp = L.training_knobs_fingerprint(amp_dtype=_amp_mode, eager_batch=_eager_mode)
     mr = 4.0
     if v in PARAM_MATCHED_V7:
         mr = L.variant_mlp_ratio(v, vocab, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, matched=set(PARAM_MATCHED_V7), ref_variant='csa_fixed_rope')
     _recipe = (f'p1l_steps{steps}_tl{train_len}_v{vocab}_bs{batch_size}_lr0.0003_nt8000000_wu50_wd0.1_'
                f'cl0.05_dlm10.0_mr{mr:.8g}-csa_fixed_rope_ns{n_seq}_'
-               f'df{L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))}'
+               f'df{_val_fp}'
                f'_gc{L.GRAD_CLIP_NORM}_b{L.OPT_ADAMW_BETAS[0]},{L.OPT_ADAMW_BETAS[1]}'
-               f'_eps{L.OPT_ADAMW_EPS:g}_tk{_v7_knobs_fp(L.DEVICE, batch_size)}')
+               f'_eps{L.OPT_ADAMW_EPS:g}_tk{_tk_fp}'
+               f'_amp{_amp_mode or "fp32"}_eb{int(bool(_eager_mode))}'
+               f'_det{L.determinism_label()}_trfp{_train_fp}')
+    # A proper arm-independent run fingerprint for `pair_reason`: the p1l recipe
+    # above intentionally carries the per-arm `mr`, so using it as `run_cfg`
+    # made every frozen pair fail the "different run_cfg" check.
+    _run_cfg = L._run_fp({'steps': steps, 'seq_len': train_len, 'batch_size': batch_size,
+                          'n_train_tokens': 8000000, 'lr': 0.0003, 'weight_decay': 0.1,
+                          'warmup': 50, 'comp_lambda': 0.05, 'delta_lr_mult': 10.0,
+                          'eval_every': _diag_eval_every,
+                          'eval_subset': (8 if _diag_eval_every else 128),
+                          'amp_dtype': _amp_mode, 'eager_batch': _eager_mode,
+                          'mlp_match_ref': 'csa_fixed_rope'},
+                         256, 6, 8, 32, vocab, train_ids, val_ids, device=L.DEVICE)
     ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
     stale = False
     _ckp_pre = None
@@ -2406,9 +2439,10 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             elif _meta.get('recipe') != _recipe:
                 stale = True
                 print(f'[p1l] {v} s{seed}: checkpoint recipe mismatch (stored {_meta.get('recipe')!r}) — RETRAINING')
-            elif int(payload.get('diag_eval_every', 0) or 0) > 0 and not isinstance(_meta.get('curve_health'), dict):
+            elif _diag_eval_every > 0 and (not isinstance(_meta.get('curve_health'), dict)
+                                           or str((_meta.get('curve_health') or {}).get('status')) in ('unmonitored', 'insufficient_data')):
                 stale = True
-                print(f'[p1l] {v} s{seed}: checkpoint has no training-curve health record — RETRAINING so the pre-test health gate has evidence (this does not change the frozen recipe)')
+                print(f'[p1l] {v} s{seed}: checkpoint has no usable training-curve health record (status={((_meta.get("curve_health") or {}).get("status") if isinstance(_meta.get("curve_health"), dict) else None)!r}) — RETRAINING so the pre-test health gate has evidence (this does not change the frozen recipe)')
             else:
                 _ckp_pre = _meta
             del _meta
@@ -2439,13 +2473,11 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         if _deadline is not None and booked:
             _deadline += booked
         L.set_seed(seed)
-        cfgs = L.make_layer_cfgs(6, v)
-        train_ids = L.load_wikitext(train_len, 8000000)[0]
+        cfgs = _plan_cfgs
         # Training-health diagnostics only: a fixed validation slice is scored
         # on the eval grid so P5C can refuse the one-shot test access on a run
         # that is overfitting/stalled/non-finite.  It never selects a
         # checkpoint or changes the frozen arms/seeds/endpoint.
-        _diag_eval_every = int(payload.get('diag_eval_every', 0) or 0)
         _diag_val = None
         if _diag_eval_every:
             _va = np.asarray(val_ids)
@@ -2475,7 +2507,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                 raise
             if _diag_eval_every and _diag_val is not None:
                 print(f'[p1l] {v} s{seed}: diagnostic validation slice {_diag_val.shape}, eval_every={_diag_eval_every} (health monitoring only; not used for selection)')
-            _tr = L.train_variant(v, train_ids, _diag_val, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=batch_size, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=_diag_eval_every, eval_subset=(int(_diag_val.shape[0]) if _diag_val is not None else 0), mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=_deadline, return_model=True)
+            _tr = L.train_variant(v, train_ids, _diag_val, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=batch_size, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=_diag_eval_every, eval_subset=(int(_diag_val.shape[0]) if _diag_val is not None else 0), mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=_deadline, return_model=True, amp_dtype=_amp_mode, eager_batch=_eager_mode)
         except Exception:
             # A raised train_variant leaves no record_run behind, so the
             # pre-booked estimate would stay reserved forever (serial mode:
@@ -2499,7 +2531,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             torch.cuda.empty_cache()
             return out
         model = _tr.pop('_model')
-        _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model), 'rng_fp': _tr.get('rng_fp'), 'train_fp': _tr.get('data_fp'), 'val_fp': _tr.get('eval_fp'), 'losses': _tr.get('losses'), 'ppl_history': _tr.get('ppl_history'), 'curve_health': _tr.get('curve_health'), 'health_history': _tr.get('health_history'), 'opt_diag_summary': _tr.get('opt_diag_summary'), 'best_step': _tr.get('best_step'), 'best_val_ppl': _tr.get('best_val_ppl'), 'train_ce_fixed_final': _tr.get('train_ce_fixed_final'), 'steps': steps}, ck)
+        _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'run_cfg': _run_cfg, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model), 'rng_fp': _tr.get('rng_fp'), 'train_fp': _tr.get('data_fp'), 'val_fp': _tr.get('eval_fp'), 'losses': _tr.get('losses'), 'ppl_history': _tr.get('ppl_history'), 'curve_health': _tr.get('curve_health'), 'health_history': _tr.get('health_history'), 'opt_diag_summary': _tr.get('opt_diag_summary'), 'best_step': _tr.get('best_step'), 'best_val_ppl': _tr.get('best_val_ppl'), 'train_ce_fixed_final': _tr.get('train_ce_fixed_final'), 'train_knobs': _tr.get('train_knobs'), 'train_objective': _tr.get('train_objective'), 'param_breakdown': _tr.get('param_breakdown'), 'n_seq': n_seq, 'steps': steps}, ck)
         if guard is not None:
             guard.record_run(time.time() - t0, steps, 256, 6, train_len, batch_size, calib_seconds=_tr.get('train_time_s'))
             if booked:
@@ -2540,8 +2572,14 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             except (TypeError, ValueError):
                 continue
         _merged.update(r)
-        _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE, 'recipe': _recipe, 'run_cfg': _recipe, 'eval_n_seq': n_seq}
+        _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE, 'recipe': _recipe, 'run_cfg': _run_cfg, 'eval_n_seq': n_seq, 'n_seq': n_seq}
         _prev_resume = _cur_now if isinstance(_cur_now, dict) else {}
+        # `pair_reason` requires steps/tokens_seen to be present and equal;
+        # the p1l record used to omit both, so even after run_cfg was fixed
+        # every frozen pair would have been "unverifiable steps/tokens_seen".
+        _rec['steps'] = int((_tr if isinstance(_tr, dict) else _prev_resume).get('steps', steps))
+        _rec['tokens_seen'] = int((_tr if isinstance(_tr, dict) else _prev_resume).get(
+            'tokens_seen', int(steps) * int(batch_size) * int(train_len)))
         # Fail closed OUTSIDE the provenance try/except below: a validation
         # fingerprint is NOT a training fingerprint.  Writing one here would
         # let a later confirmation round treat the run as trained on the eval
@@ -2556,33 +2594,42 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             _rec['provenance'] = _prov
             _known_knobs = ((_tr or {}).get('train_knobs') if _tr is not None else _prev_resume.get('train_knobs'))
             _known_knobs = _known_knobs if isinstance(_known_knobs, dict) else {}
-            _rec['hyperparams'] = L.run_hyperparameters({'steps': steps, 'n_train_tokens': _prov_cfg['n_train_tokens'], 'seq_len': train_len, 'batch_size': batch_size, 'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 50, 'comp_lambda': 0.05, 'delta_lr_mult': 10.0}, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, vocab=vocab, mlp_ratio=mr, amp_dtype=_known_knobs.get('amp_dtype', 'auto'), eager_batch=_known_knobs.get('eager_batch', 'auto'))
+            _rec['hyperparams'] = L.run_hyperparameters({'steps': steps, 'n_train_tokens': _prov_cfg['n_train_tokens'], 'seq_len': train_len, 'batch_size': batch_size, 'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 50, 'comp_lambda': 0.05, 'delta_lr_mult': 10.0}, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, vocab=vocab, mlp_ratio=mr, amp_dtype=_known_knobs.get('amp_dtype', _amp_mode), eager_batch=_known_knobs.get('eager_batch', _eager_mode))
             if _tr is not None:
                 _rec['data_fp'] = _prov['data'].get('train_fp') or _prov['data'].get('val_fp')
                 _rec['rng_fp'] = _tr.get('rng_fp')
                 _rec['losses'] = _tr.get('losses')
                 _rec['ppl_history'] = _tr.get('ppl_history')
                 _rec['train_knobs'] = _tr.get('train_knobs')
+                _rec['train_objective'] = _tr.get('train_objective')
+                _rec['param_breakdown'] = _tr.get('param_breakdown')
             else:
                 # A partial resume re-evaluates only missing lengths and has no
                 # fresh training record.  Preserve the corpus/optimizer
                 # provenance of the existing record (the fail-closed check
                 # above already guaranteed a real training fingerprint).
                 _rec['data_fp'] = _resume_fp
-                for _kk in ('rng_fp', 'losses', 'ppl_history', 'train_knobs'):
+                for _kk in ('rng_fp', 'losses', 'ppl_history', 'train_knobs', 'train_objective', 'param_breakdown'):
                     if _prev_resume.get(_kk) is not None:
                         _rec[_kk] = _prev_resume[_kk]
             _rec['val_fp'] = _prov['data'].get('val_fp')
             _rec['data_version'] = _prov['data'].get('data_version')
-            _rec.setdefault('train_knobs', (_rec.get('hyperparams') or {}).get('train_knobs') or _v7_knobs(L.DEVICE, batch_size))
         except Exception as _pe:
             print(f'[p1l] WARNING: could not attach provenance to {key} ({type(_pe).__name__}: {_pe})')
+        # v11.128: never fabricate a train_knobs descriptor on resume.  The
+        # old `setdefault(..., _v7_knobs(...))` wrote fp32/True even when the
+        # weights were trained under bf16 and a row-loop dispatch, which made
+        # the frozen implementation binding certify a false descriptor.
+        if not isinstance(_rec.get('train_knobs'), dict):
+            raise RuntimeError(f'[p1l] REFUSE resume {key}: the record/checkpoint carries no real train_knobs descriptor; retrain instead of fabricating an implementation claim')
+        _rec.setdefault('train_objective', _prev_resume.get('train_objective'))
+        _rec.setdefault('param_breakdown', _prev_resume.get('param_breakdown'))
         summary[key] = _rec
         print(f'  [p1l] {v:18s} s{seed} ' + '  '.join((f'L{k}={vv.get('ppl', float('nan')):.2f}' for k, vv in sorted(_merged.items()))))
         return summary
     L.locked_json_update(spath, _merge)
     _ev_rec = L.locked_json_read(spath).get(key) or {}
-    L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _lp_run_id, 'status': 'ok', 'started_at': _lp_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _lp_t0, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': _recipe, 'code': CKPT_CODE, 'provenance': _ev_rec.get('provenance'), 'hyperparams': _ev_rec.get('hyperparams'), 'data_fp': _ev_rec.get('data_fp'), 'val_fp': _ev_rec.get('val_fp'), 'rng_fp': _ev_rec.get('rng_fp'), 'metrics': {'params': _ev_rec.get('params'), 'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in (_ev_rec.get('by_len') or {}).items()}, 'train_time_s': (_tr or {}).get('train_time_s')}, 'losses': _ev_rec.get('losses'), 'ppl_history': _ev_rec.get('ppl_history')})
+    L.log_experiment_event(outdir, {'kind': 'cell', 'tracking_schema': 2, 'run_id': _lp_run_id, 'status': 'ok', 'started_at': _lp_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _lp_t0, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': _run_cfg, 'code': CKPT_CODE, 'provenance': _ev_rec.get('provenance'), 'hyperparams': _ev_rec.get('hyperparams'), 'data_fp': _ev_rec.get('data_fp'), 'val_fp': _ev_rec.get('val_fp'), 'rng_fp': _ev_rec.get('rng_fp'), 'train_knobs': _ev_rec.get('train_knobs'), 'metrics': {'params': _ev_rec.get('params'), 'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in (_ev_rec.get('by_len') or {}).items()}, 'train_time_s': (_tr or {}).get('train_time_s')}, 'losses': _ev_rec.get('losses'), 'ppl_history': _ev_rec.get('ppl_history')})
     del model, _ckp
     gc.collect()
     torch.cuda.empty_cache()

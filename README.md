@@ -9,8 +9,11 @@ WikiText-103). This repository contains the experiment code and everything
 needed to reproduce the results on a machine of your own.
 
 > **Version naming.** `v12` is the driver/study generation; `CODE_SEMANTICS =`
-> `v11.125` is the library measurement-semantics stamp that the frozen plan
+> `v11.128` is the library measurement-semantics stamp that the frozen plan
 > binds. They are not the same numbering scheme, and the mismatch is intentional.
+> The frozen manifest is at `manifest_version: 3` (see its `revision.history`);
+> the continuous-loop CI is intentionally disabled until that signed commit is
+> fixed and P5T has run.
 
 > **Evidence levels.** v6-v11 are exploratory (selected on the same validation
 split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
@@ -89,7 +92,12 @@ pip install -r requirements.lock
 # reproduces the `wt103_cache/*.npy` cache token-for-token, so the
 # fallback is a pure availability path and never changes a measurement.
 # When `wt103_cache/` is already populated the corpus is served from the cache
-# and no dump or network access is needed at all.
+# and no dump or network access is needed at all.  Set `WT103_CACHE_DIR` to
+# relocate the cache; the loaders, `audit_leakage` and P5T all resolve the same
+# variable.  `v12_supp.py smoke` deliberately uses an isolated cache under its
+# smoke outdir so it can never leave a differently-tokenised file in the frozen
+# cache.  Test-cache hits verify the persisted tokenizer bytes (sha256 recorded
+# in test_meta) in addition to the train fit fingerprint.
 
 # 1) validate the whole pipeline end to end (smoke run, no push):
 #    (covers dense / fixed / dynamic arms AND the leave-one-out ablation
@@ -282,6 +290,7 @@ distinction (§18).
 
 ```bash
 python v12_supp.py smoke           # end-to-end self-check (tiny ckpts + a smoke freeze manifest)
+python v12_supp.py plan            # zero-GPU pre-flight: stamps + implementation binding + admission + power, NO test read
 python v12_supp.py phase P5C       # train all four frozen arms at the manifest seed list (resumable; 0-5 main arms covered by P3MT/P4MT)
 python v12_supp.py phase P5MP      # extended probe (all modes + NIAH + controls) at the manifest seed list
 python v12_supp.py phase P5S2      # token-matched large scale arm (8000 steps)

@@ -8,7 +8,7 @@
 
 > **证据等级**：v6–v11 为探索性（在同一 validation split 上选择后观察）；只有 v12 冻结的固定分块比较是确认性。详见 `DECISION_LOG.md` 与 `docs/design_notes.md` §17/§20。
 >
-> **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.125` 是冻结清单绑定的库测量语义戳，两者故意不同号。
+> **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结清单绑定的库测量语义戳，两者故意不同号。冻结清单当前为 `manifest_version: 3`（见其 `revision.history`）；continuous-loop CI 已被有意停用，直到签署后的提交固定且 P5T 完成。
 
 ## 仓库结构
 
@@ -244,6 +244,7 @@ FLOPs，见 `docs/design_notes.md` §16）。成对污染协议、预注册交�
 
 ```bash
 python v12_supp.py smoke           # 端到端自检（微型 ckpt + 冻结清单副本）
+python v12_supp.py plan            # 零 GPU 预检：语义戳 + 实现绑定 + 准入 + 功效，不读 test
 python v12_supp.py phase P5C       # 按清单种子训练全部四个冻结臂（可续跑；主臂 0-5 由 P3MT/P4MT 覆盖）
 python v12_supp.py phase P5MP      # 扩展探针（全部模式 + NIAH + 对照），种子取自清单
 python v12_supp.py phase P5S2      # 等 token 大规模臂（8000 步）

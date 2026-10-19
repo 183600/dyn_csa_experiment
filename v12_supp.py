@@ -35,6 +35,7 @@
 
 模式：
   python v12_supp.py smoke            # 端到端自检（微型 ckpt + 冻结清单副本）
+  python v12_supp.py plan             # 零 GPU 预检：戳/实现绑定/准入/功效，不读 test
   python v12_supp.py full             # P5C -> P5MP -> P5S2 -> P5S3 -> P5T -> report
   python v12_supp.py phase P5C        # 单阶段（可断点续跑）
   python v12_supp.py analysis         # 零 GPU：确认性统计 -> analysis_v12/
@@ -113,6 +114,7 @@ P5S3_CFG = dict(V10.P3SL_FLOP_CFG, seeds=[0, 1])
 TEST_OUTDIR = 'results_lm_test'
 FREEZE_MANIFEST = 'confirmation_frozen.json'
 PHASES = [('P5C', 'lenphase', P5C_CFG, None), ('P5MP', 'probe', P5MP_CFG, None), ('P5S2', 'run', P5S2_CFG, None), ('P5S3', 'run', P5S3_CFG, None), ('P5H', 'health', None, None), ('P5T', 'finaltest', None, None)]
+_PLAN_DONE = False
 
 def run_training_health(cfg=None):
     """Pre-test health gate over the frozen arms/seeds.
@@ -176,6 +178,12 @@ def run_training_health(cfg=None):
 
 
 def run_phase(name, guard, par=None):
+    global _PLAN_DONE
+    if name in ('P5C', 'P5MP') and not _PLAN_DONE:
+        # A direct `phase P5C` must not train 30+ GPU-hours under a plan that
+        # the P5T admission gate would reject.  `run_full` runs this once at
+        # startup; the cache avoids repeating it for each phase.
+        plan_check()
     import par as _par
     _ctx = _par.resolve_ctx(par, label=f'v12 {name}')
     for pname, kind, payload, seeds in PHASES:
@@ -241,6 +249,8 @@ def _load_manifest(path):
         _ev_n = _eval.get('n_seqs_clean')
         if _ts_n is not None and _ev_n is not None and int(_ts_n) != int(_ev_n):
             raise SystemExit(f'[v12] REFUSE: binding.test_slice.n_seqs={_ts_n} disagrees with eval.n_seqs_clean={_ev_n} — the machine-checkable binding block and the evaluation plan must describe the same slice')
+    if _eval and int(_eval.get('n_seqs_clean') or 0) <= 0:
+        raise SystemExit('[v12] REFUSE: eval.n_seqs_clean is missing/zero — the frozen row count is part of the held-out slice, not a runtime default')
     _tokb = (_bind.get('tokenizer') or {}) if isinstance(_bind, dict) else {}
     if _tokb and str(_tokb.get('fit', '')).lower() and 'train' not in str(_tokb.get('fit', '')).lower():
         raise SystemExit(f'[v12] REFUSE: binding.tokenizer.fit={_tokb.get("fit")!r} is not the train-only fit required by the freeze')
@@ -274,6 +284,20 @@ def _load_manifest(path):
         raise SystemExit(f'[v12] REFUSE: the frozen plan cannot confirm ANYTHING by construction — with n={_n} seeds, a two-sided exact sign-flip and a Holm family of m={_m_family}, the smallest attainable Holm p is {_min_holm:.4g} > alpha={_alpha} (all {_n} seeds one-sided still gives {_kmin is None and "insufficient" or f"k_min={_kmin} needed"}). This is a resolution ceiling, NOT a conservative design. Revise the plan BEFORE any test-split evaluation (add seeds / shrink the family / change the test) and record the revision in the manifest history. ({_stat.get("descriptive_only")!r})')
     if not isinstance(m.get('seeds'), list) or not all(isinstance(s, int) and (not isinstance(s, bool)) for s in m['seeds']) or len(set(m['seeds'])) != len(m['seeds']):
         raise SystemExit(f'[v12] REFUSE: seeds must be a list of unique integers ({m.get("seeds")!r}) — seed identity is the pairing unit of the whole protocol')
+    # v11.128: the declared n-floor is part of the decision rule.  Refuse a
+    # floor that is below 2, above the frozen seed count, or mathematically
+    # unable to reach Holm significance.
+    _n_min = _stat.get('min_seeds_for_confirmation')
+    if _n_min is not None:
+        try:
+            _n_min = int(_n_min)
+        except (TypeError, ValueError):
+            raise SystemExit(f'[v12] REFUSE: statistics.min_seeds_for_confirmation={_n_min!r} is not an integer')
+        if _n_min < 2 or _n_min > _n:
+            raise SystemExit(f'[v12] REFUSE: statistics.min_seeds_for_confirmation={_n_min} is outside [2, {_n}] — the declared confirmation floor must be reachable with the frozen seed list')
+        _min_holm_floor = L.holm_min_attainable_p(_n_min, _m_family, _alpha)
+        if math.isfinite(_min_holm_floor) and _min_holm_floor > _alpha and not _stat.get('descriptive_only'):
+            raise SystemExit(f'[v12] REFUSE: the declared confirmation floor n={_n_min} cannot attain Holm significance (min p={_min_holm_floor:.4g} > alpha={_alpha}); raise the floor or add seeds BEFORE any test access')
     # ---- review-2 issue 3: binding block.  Optional but validated when present;
     #     every record written under this manifest carries the manifest's sha256.
     _bind = m.get('binding') or {}
@@ -283,6 +307,20 @@ def _load_manifest(path):
         _sig = _recipe_signature({'binding': _bind})
         if (_bind.get('training_recipe_signature') is not None or _bind.get('training_recipe') is not None) and _sig is None:
             raise SystemExit(f'[v12] REFUSE: binding.training_recipe_signature must be an object of machine-checkable fields ({_bind.get("training_recipe_signature")!r})')
+        _per = _bind.get('per_arm_recipe_signature')
+        if _per is not None:
+            if not isinstance(_per, dict) or set(_per) != set(m['arms']):
+                raise SystemExit(f'[v12] REFUSE: binding.per_arm_recipe_signature must be an object keyed by exactly the frozen arms {sorted(m["arms"])} (got {_per!r})')
+            for _arm, _asig in _per.items():
+                if not isinstance(_asig, dict) or not _asig:
+                    raise SystemExit(f'[v12] REFUSE: binding.per_arm_recipe_signature[{_arm!r}] must be a non-empty object')
+                if 'mr' in _asig:
+                    try:
+                        _mr = float(_asig['mr'])
+                    except (TypeError, ValueError):
+                        raise SystemExit(f'[v12] REFUSE: per-arm mr for {_arm!r} is not numeric ({_asig["mr"]!r})')
+                    if not math.isfinite(_mr) or _mr <= 1.0:
+                        raise SystemExit(f'[v12] REFUSE: per-arm mr for {_arm!r} must be finite and > 1 ({_mr!r})')
     m['manifest_sha256'] = _file_sha256(path)
     return m
 
@@ -325,18 +363,48 @@ def _file_sha256(path, chunk=1 << 20):
     return _sha
 
 
-def _recipe_signature(manifest):
+def _recipe_signature(manifest, arm=None):
     """The frozen structured training-recipe signature (binding block).
 
     键名 `training_recipe_signature`（v2 清单）；旧名 `training_recipe`
-    仍被接受（smoke 清单与兼容路径）。"""
+    仍被接受（smoke 清单与兼容路径）。
+
+    v11.128 / manifest v3: an arm-specific signature
+    (``binding.per_arm_recipe_signature[<arm>]``) is merged on top of the
+    shared signature.  This is how the parameter-matching knob ``mr`` is
+    pinned without pretending the four arms share one value: ``full_rope`` is
+    trained at ``mr≈6.7635`` while the csa arms stay at ``mr=4``.
+    """
     _bind = manifest.get('binding') or {}
     if not isinstance(_bind, dict):
         return None
     sig = _bind.get('training_recipe_signature')
     if sig is None:
         sig = _bind.get('training_recipe')
+    if not isinstance(sig, dict) or not sig:
+        sig = None
+    if arm is not None:
+        _per = _bind.get('per_arm_recipe_signature') or {}
+        _extra = _per.get(arm) if isinstance(_per, dict) else None
+        if isinstance(_extra, dict) and _extra:
+            sig = dict(sig or {})
+            sig.update(_extra)
     return sig if isinstance(sig, dict) and sig else None
+
+
+def _train_fp_required(manifest):
+    """Whether the frozen plan makes train_fp a hard admission requirement.
+
+    A manifest that DECLARES ``binding.training_data_fingerprint`` is binding
+    even while its ``canonical_train_fp`` is still null: the run must derive
+    one value from the checkpoints before the first test read and lock it.
+    The historical ``bool(want) or bool(ckpt) or bool(record)`` rule was
+    fail-open (all three empty -> no check at all), which the review flagged.
+    """
+    _bind = manifest.get('binding') or {}
+    if not isinstance(_bind, dict):
+        return False
+    return _bind.get('training_data_fingerprint') is not None or _bind.get('train_fp') is not None
 
 
 def _frozen_train_fp(manifest):
@@ -458,7 +526,10 @@ def _recipe_matches_signature(recipe, sig):
                 continue
             return False
         try:
-            if float(got) != float(want):
+            # Recipes format floats with limited precision (e.g. mr{:.8g});
+            # compare numerically with a tolerance far tighter than any real
+            # protocol difference but wider than the formatting round-trip.
+            if not math.isclose(float(got), float(want), rel_tol=1e-6, abs_tol=1e-9):
                 return False
         except (TypeError, ValueError):
             if str(got) != str(want):
@@ -469,13 +540,15 @@ def _recipe_matches_signature(recipe, sig):
 def _frozen_seeds():
     """Seeds for the frozen-arm training phases (P5C/P5MP) — single source of
     truth is the manifest (review-2 issue 1: the seed list was revised 6->12
-    there; hard-coded phase lists must not disagree with it)."""
-    if not os.path.exists(FREEZE_MANIFEST):
-        raise SystemExit(f'[v12] REFUSE: {FREEZE_MANIFEST} not found — the frozen-arm phases train exactly the manifest seed list; a manifest-less run has no defined scope')
-    try:
-        m = json.load(open(FREEZE_MANIFEST, encoding='utf-8'))
-    except Exception as e:
-        raise SystemExit(f'[v12] REFUSE: {FREEZE_MANIFEST} cannot be parsed ({type(e).__name__}: {e})')
+    there; hard-coded phase lists must not disagree with it).
+
+    v11.128: run the FULL `_load_manifest` validation here, not just a JSON
+    seed parse.  Previously P5C/P5MP could burn 30+ GPU-hours training arms
+    under a manifest that P5T would reject at load time (stamp mismatch,
+    unresolvable power gate, binding inconsistency).  Training now refuses
+    before the first GPU-second.
+    """
+    m = _load_manifest(FREEZE_MANIFEST)
     seeds = m.get('seeds')
     if not isinstance(seeds, list) or not seeds:
         raise SystemExit(f'[v12] REFUSE: {FREEZE_MANIFEST} has no usable seed list')
@@ -597,7 +670,7 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
 
 
 @torch.inference_mode()
-def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
+def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_fp=None):
     """One (arm, seed) clean by-length evaluation on the TEST split.
 
     评审二轮·意见二/三修订：记录现在额外携带 manifest_sha256 与
@@ -609,7 +682,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
     os.makedirs(outdir, exist_ok=True)
     spath = cfg['bylen_summary']
     _msha = manifest.get('manifest_sha256')
-    _sig = _recipe_signature(manifest)
+    _sig = _recipe_signature(manifest, v)
     out = {'status': 'ok', 'key': f'{v}::s{seed}', 'variant': v, 'seed': seed}
     _ft_run_id = L.new_experiment_id('p5t')
     _ft_started = time.strftime('%Y-%m-%dT%H:%M:%S')
@@ -661,11 +734,15 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
     # the frozen canonical value when the manifest supplies one.
     _tr_train_fp = _tr.get('data_fp')
     _ck_train_fp = d.get('train_fp') or d.get('data_fp')
-    _want_train_fp = _frozen_train_fp(manifest)
-    # New frozen manifests (binding.training_data_fingerprint) require the
-    # binding unconditionally.  Legacy manifests/records without either field
-    # stay admissible so historical panels remain reproducible.
-    _require_train_fp = bool(_want_train_fp) or bool(_ck_train_fp) or bool(_tr_train_fp)
+    # v11.128: the caller passes the value derived BEFORE the first test read
+    # and written into the freeze lock.  Recomputing it here from a null
+    # manifest field (as the old code did) silently reintroduced the
+    # fail-open path and could accept a record from a different corpus.
+    _want_train_fp = train_fp if train_fp is not None else _frozen_train_fp(manifest)
+    # Manifests that DECLARE binding.training_data_fingerprint require the
+    # binding unconditionally, even while canonical_train_fp is still null.
+    # Legacy manifests/records without either field stay admissible.
+    _require_train_fp = _train_fp_required(manifest) or bool(_want_train_fp) or bool(_ck_train_fp) or bool(_tr_train_fp)
     if _require_train_fp and (not isinstance(_tr_train_fp, str) or not _tr_train_fp):
         print(f'[p5t] REFUSE {v} s{seed}: training record has no train_fp — the weights cannot be attributed to a specific training corpus')
         del d
@@ -717,6 +794,12 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
             return True
         if rec.get('train_fp') != _tr_train_fp:
             return True
+        # A record measured on a different row count is a different estimand.
+        # v11.128 stores n_seq explicitly and treats a mismatch as stale (the
+        # old cache-reuse path could mix an 8-row and a 16-row record under
+        # the same key).
+        if int(rec.get('n_seq') or -1) != int(test_ids.shape[0]):
+            return True
         if _msha is not None and rec.get('manifest_sha256') != _msha:
             return True  # the manifest changed after this record was written
         bl = rec.get('by_len') or {}
@@ -754,7 +837,22 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
     def _merge(summary):
         # by_len now also carries ppl_per_seq (per-document rows, review-2
         # issue 9b) straight from eval_length_gen; pooled ppl is unchanged.
-        summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params'), 'by_len': r, 'split': split, 'data_fp': _dfp, 'train_fp': _tr_train_fp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ensure_ck_sha(), 'ckpt_sig': (list(_ck_sig) if _ck_sig is not None else None)}
+        # v11.128: the P5T record carries the SAME provenance descriptor as its
+        # training record (`train_knobs` / `train_objective` /
+        # `param_breakdown` / `rng_fp`) plus the evaluated row count.  Without
+        # `train_knobs` the frozen implementation binding excluded ALL 48
+        # records (admitted=0) after the one-shot test access had already been
+        # burned.
+        _tk = _tr.get('train_knobs') or (d.get('train_knobs') if isinstance(d, dict) else None)
+        summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params') or (d.get('params') if isinstance(d, dict) else None), 'by_len': r, 'split': split, 'data_fp': _dfp, 'train_fp': _tr_train_fp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ensure_ck_sha(), 'ckpt_sig': (list(_ck_sig) if _ck_sig is not None else None),
+                                    'n_seq': int(test_ids.shape[0]),
+                                    'train_knobs': _tk,
+                                    'train_objective': _tr.get('train_objective') or (d.get('train_objective') if isinstance(d, dict) else None),
+                                    'param_breakdown': _tr.get('param_breakdown') or (d.get('param_breakdown') if isinstance(d, dict) else None),
+                                    'rng_fp': _tr.get('rng_fp') or (d.get('rng_fp') if isinstance(d, dict) else None),
+                                    'amp_dtype': (_tk or {}).get('amp_dtype') if isinstance(_tk, dict) else None,
+                                    'amp_grad_scaler': (_tk or {}).get('amp_grad_scaler') if isinstance(_tk, dict) else None,
+                                    'eager_batch': (_tk or {}).get('eager_batch') if isinstance(_tk, dict) else None}
         print(f'  [p5t] {v:32s} s{seed} ' + '  '.join((f'L{k}={vv.get("ppl", float("nan")):.2f}' for k, vv in sorted(r.items()))))
         return summary
     L.locked_json_update(spath, _merge)
@@ -811,6 +909,12 @@ def run_finaltest(cfg=None, guard=None):
         _want_train_fp = next(iter(_cand_train_fps))
     elif _want_train_fp is None and len(_cand_train_fps) > 1:
         raise SystemExit(f'[v12] REFUSE: the frozen training records span {len(_cand_train_fps)} different train_fp values {sorted(_cand_train_fps)}; refusing to define a canonical training set after the fact')
+    # v11.128: a manifest that DECLARES training_data_fingerprint may not fall
+    # through to a null canonical value.  Deriving it from the frozen training
+    # records is the only legal path; if that is impossible, refuse BEFORE the
+    # one-shot test read rather than discovering it per-cell afterwards.
+    if not _smoke and _train_fp_required(manifest) and _want_train_fp is None:
+        raise SystemExit('[v12] REFUSE: the frozen manifest declares a training-corpus binding but no training_fp can be derived from the frozen records — run P5C/P3MT/P4MT first and keep their summary.json; refusing to read the held-out split under an unpinned corpus')
     _lock_path = _freeze_lock_path(outdir)
     if os.path.exists(os.path.join(outdir, 'bylen.json')) and not os.path.exists(_lock_path):
         raise SystemExit(f'[v12] REFUSE: {outdir}/bylen.json exists but there is no pre-access freeze lock — the only honest interpretation is that a test-split measurement predates the lock; investigate before reusing it')
@@ -833,27 +937,37 @@ def run_finaltest(cfg=None, guard=None):
     else:
         print('[p5t] SMOKE: test_ids supplied by the caller; records are stamped split="smoke" and are inadmissible to the confirmation statistics')
     _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))
+    if int(test_ids.shape[0]) != _nseq_clean or int(test_ids.shape[1]) != need:
+        raise SystemExit(f'[v12] REFUSE: loaded test slice shape {tuple(test_ids.shape)} != the frozen ({_nseq_clean}, {need}) — the row count and sequence length are part of the pre-registration; re-freeze explicitly instead of shrinking the panel')
+    if not _smoke:
+        # v11.128: run the leakage gate BEFORE the `accessed` lock is written
+        # and before any evaluation.  A gate that can never fire (the old
+        # Jaccard<=0.05 on a 4M-vs-65k shingle pair) is not a gate, and a
+        # `not_verifiable_locally` result used to pass silently.  Both are now
+        # hard refusals; only a verifiable, clean audit unlocks the panel.
+        _cache_dir = L._wt_cache_dir()
+        _tf = ((manifest.get('binding') or {}).get('training_data_fingerprint') or {})
+        _pref_sl = _tf.get('seq_len') if isinstance(_tf, dict) else None
+        try:
+            import audit_gates as _AG
+            _ov = _AG.audit_leakage(cache_dir=_cache_dir,
+                                    preferred_train_seq_len=_pref_sl)
+        except Exception as _ove:
+            raise SystemExit(f'[v12] REFUSE: the data-leakage audit could not run ({type(_ove).__name__}: {_ove}) — a confirmation claim requires a verifiable train/test isolation audit, not an untested one')
+        if _ov.get('status') == 'not_verifiable_locally':
+            raise SystemExit(f'[v12] REFUSE: the data-leakage audit is not verifiable locally ({_ov.get("note")}) — build/pair the train and test caches under one WT103_CACHE_DIR before using the one-shot test access; an unverifiable isolation claim is a hard refusal, not a warning')
+        if _ov.get('status') == 'fail':
+            _doc = (_ov.get('checks') or {}).get('doc_overlap') or {}
+            raise SystemExit(f'[v12] REFUSE: the data-leakage audit reports a hard failure (doc_overlap={_doc if isinstance(_doc, dict) else _doc!r}); see audit_gates.py leakage output — confirmation claims are unavailable until the near-duplicate evaluation documents are excluded')
+        _doc = (_ov.get('checks') or {}).get('doc_overlap')
+        if not isinstance(_doc, dict):
+            raise SystemExit(f'[v12] REFUSE: the leakage audit did not produce a document-overlap result ({_doc!r}) — the npy caches are missing or unreadable, so train/test isolation cannot be verified before the one-shot test access')
+        if _doc.get('policy_violation'):
+            raise SystemExit(f'[v12] REFUSE: train/test document overlap (test-shingle overlap {_doc.get("test_shingle_overlap")}, max row overlap {_doc.get("max_row_overlap")}) exceeds the frozen policy — confirmation claims are UNAVAILABLE until the near-duplicate evaluation documents are cleaned (rebuild the test cache with exp_lib.load_wikitest, which filters them)')
     # review-2 issue 3: first-test-access lock — the plan may not change after
     # the test split has been read, and the slice itself is part of the freeze.
     _check_or_write_freeze_lock(outdir, manifest, _dfp, stage='accessed',
                                 train_fp=_want_train_fp)
-    if not _smoke:
-        # Near-duplicate train/test documents make a clean generalization claim
-        # unavailable.  Run the same zero-GPU document-overlap gate the audit
-        # uses BEFORE the frozen evaluation; a policy violation stops
-        # the confirmation instead of leaving it as a footnote.
-        try:
-            import audit_gates as _AG
-            _ov = _AG.audit_leakage(cache_dir=os.environ.get('WT103_CACHE_DIR', './wt103_cache'))
-            _doc = (_ov.get('checks') or {}).get('doc_overlap')
-            if isinstance(_doc, dict) and _doc.get('policy_violation'):
-                raise SystemExit(f'[v12] REFUSE: train/test document overlap Jaccard {_doc.get("jaccard")} exceeds policy_max_jaccard={_doc.get("policy_max_jaccard")} — confirmation claims are UNAVAILABLE until the near-duplicate evaluation documents are cleaned (rebuild the test cache with exp_lib.load_wikitest, which now filters them)')
-            if _ov.get('status') == 'fail':
-                raise SystemExit('[v12] REFUSE: the data-leakage audit reports a hard failure; see audit_gates.py leakage output')
-        except SystemExit:
-            raise
-        except Exception as _ove:
-            print(f'[p5t] WARNING: document-overlap precheck unavailable ({type(_ove).__name__}: {_ove})')
     print(f'[p5t] manifest {cfg["manifest"]} frozen_at={manifest.get("frozen_at", "?")} sha256={manifest.get("manifest_sha256", "?")[:12]}… arms={manifest["arms"]} seeds={manifest["seeds"]}')
     print(f'[p5t] TEST split rows {test_ids.shape} (held out; no other phase reads this split; ids_fp={_dfp[:12]}…)')
     if _nseq_clean < 64:
@@ -863,7 +977,7 @@ def run_finaltest(cfg=None, guard=None):
     for v in manifest['arms']:
         for seed in manifest['seeds']:
             _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids,
-                                  split=_split_label)
+                                  split=_split_label, train_fp=_want_train_fp)
     # 2) frozen uniform-corruption probe on the SAME test rows (secondary,
     #    descriptive-only per the manifest)
     _probe_eval = manifest.get('eval', {}).get('distractor_probe') or {}
@@ -876,6 +990,31 @@ def run_finaltest(cfg=None, guard=None):
             V10.run_probe_cell(pcfg, v, seed, guard=guard, val_ids=test_ids, mech_summ=mech_summ)
     # 3) confirmation statistics (zero GPU, from disk)
     return finaltest_stats(manifest=manifest, bylen_path=cfg['bylen_summary'], probe_path=cfg['probe_summary'], out=cfg.get('stats_out', 'analysis_v12/test_stats.json'))
+
+def _by_len_shape_reason(rec, n_seq):
+    """Why a record's by_len cells do not match the frozen (n_seq, seq_len) grid.
+
+    ``eval_length_gen`` predicts ``Ln - 1`` tokens per row, so a complete cell
+    must carry ``n_tok == n_seq * (Ln - 1)``.  The review found that the old
+    admission path never checked this: an 8-row record could be mixed with a
+    16-row one, and an empty slice produced ``ppl=1.0`` from zero tokens.
+    """
+    bl = rec.get('by_len') or {}
+    if not isinstance(bl, dict) or not bl:
+        return 'no by_len measurement'
+    for _ln, _c in bl.items():
+        if not isinstance(_c, dict):
+            return f'by_len[{_ln!r}] is not a cell object'
+        try:
+            _ln_i = int(_ln)
+        except (TypeError, ValueError):
+            return f'by_len key {_ln!r} is not an integer length'
+        _ntok = _c.get('n_tok')
+        _want = int(n_seq) * max(1, _ln_i - 1)
+        if not isinstance(_ntok, (int, float)) or isinstance(_ntok, bool) or int(_ntok) != _want:
+            return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {n_seq} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
+    return None
+
 
 def _admit_confirmation_records(raw, manifest):
     """Strict admission gate for confirmation records (review-2 issue 2).
@@ -891,10 +1030,10 @@ def _admit_confirmation_records(raw, manifest):
     arms = list(manifest['arms'])
     seed_whitelist = {int(s) for s in manifest['seeds']}
     exp_code = L.code_stamp()  # eager-only; kernel mode is refused at load
-    sig = _recipe_signature(manifest)
     impl = _frozen_implementation(manifest)
     msha = manifest.get('manifest_sha256')
     want_train_fp = _frozen_train_fp(manifest)
+    _want_nseq = int(((manifest.get('eval') or {}).get('n_seqs_clean')) or 0)
     admitted = {}
     excluded = []
     duplicates = []
@@ -902,14 +1041,18 @@ def _admit_confirmation_records(raw, manifest):
     train_fps = set()
     _any_train_fp = any(isinstance(_r, dict) and bool(_r.get('train_fp'))
                         for _r in (raw or {}).values())
-    _require_train_fp = bool(want_train_fp) or _any_train_fp
+    _require_train_fp = _train_fp_required(manifest) or bool(want_train_fp) or _any_train_fp
     for key, r in (raw or {}).items():
         if not isinstance(r, dict):
             continue
-        if r.get('split') != 'test':
-            continue  # non-test records simply do not belong to this file
         why = None
-        if r.get('variant') not in arms:
+        s_i = None
+        if r.get('split') != 'test':
+            # v11.128: named exclusion, not a silent `continue`.  The
+            # docstring promises "named, never silent"; a smoke/validation
+            # record sitting in bylen.json must be visible in the audit trail.
+            why = f"split {r.get('split')!r} is not 'test' (a non-test record cannot enter the confirmation)"
+        elif r.get('variant') not in arms:
             why = f"variant {r.get('variant')!r} is not one of the frozen arms"
         else:
             s = r.get('seed')
@@ -937,8 +1080,12 @@ def _admit_confirmation_records(raw, manifest):
                 why = 'missing training-corpus fingerprint (train_fp) — the weights cannot be tied to a training set'
             elif want_train_fp is not None and r.get('train_fp') != want_train_fp:
                 why = f"train_fp {r.get('train_fp')} does not match the frozen canonical training fingerprint {want_train_fp}"
-            elif sig is not None and not _recipe_matches_signature(r.get('recipe'), sig):
-                why = 'recipe does not match the frozen training_recipe signature'
+            elif _want_nseq and int(r.get('n_seq') or -1) != _want_nseq:
+                why = f"n_seq {r.get('n_seq')!r} != the frozen {_want_nseq} — a different row count is a different estimand"
+            elif _want_nseq and _by_len_shape_reason(r, _want_nseq) is not None:
+                why = _by_len_shape_reason(r, _want_nseq)
+            elif _recipe_signature(manifest, r.get('variant')) is not None and not _recipe_matches_signature(r.get('recipe'), _recipe_signature(manifest, r.get('variant'))):
+                why = 'recipe does not match the frozen training_recipe signature (including the per-arm mr)'
             elif _implementation_reason(r, impl) is not None:
                 why = _implementation_reason(r, impl)
             elif not isinstance(r.get('by_len'), dict) or not r.get('by_len'):
@@ -1064,8 +1211,10 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
     arms = set(manifest['arms'])
     seeds = {int(s) for s in manifest['seeds']}
     exp_code = L.code_stamp()
-    sig = _recipe_signature(manifest)
     impl = _frozen_implementation(manifest)
+    want_train_fp = _frozen_train_fp(manifest)
+    _require_train_fp = _train_fp_required(manifest) or any(
+        isinstance(_r, dict) and bool(_r.get('train_fp')) for _r in raw.values())
     groups = {}
     excluded = []
     for key, r in raw.items():
@@ -1081,8 +1230,12 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = f"val_fp {str(r.get('val_fp'))[:12]}… does not match the frozen test slice {str(slice_fp)[:12]}…"
         elif exp_code is not None and r.get('_code') != exp_code:
             why = f"_code {r.get('_code')!r} does not match the frozen code semantics {exp_code!r}"
-        elif sig is not None and not _recipe_matches_signature(r.get('recipe'), sig):
-            why = 'recipe does not match the frozen training_recipe signature'
+        elif _require_train_fp and not r.get('train_fp'):
+            why = 'missing training-corpus fingerprint (train_fp) for the probe record'
+        elif want_train_fp is not None and r.get('train_fp') != want_train_fp:
+            why = f"train_fp {r.get('train_fp')} does not match the frozen canonical training fingerprint {want_train_fp}"
+        elif _recipe_signature(manifest, r.get('variant')) is not None and not _recipe_matches_signature(r.get('recipe'), _recipe_signature(manifest, r.get('variant'))):
+            why = 'recipe does not match the frozen training_recipe signature (including the per-arm mr)'
         elif _implementation_reason(r, impl) is not None:
             why = _implementation_reason(r, impl)
         elif not L.ppl_is_usable(r.get('ppl_mean')):
@@ -1171,9 +1324,22 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _lock_dir = os.path.dirname(os.path.abspath(bylen_path))
         if not os.path.exists(_freeze_lock_path(_lock_dir)):
             raise SystemExit(f'[v12] REFUSE: {bylen_path} has admissible confirmation records but no freeze lock in {_lock_dir} — refuse to analyse a copied result that cannot be tied to the first test-split access')
-        _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='accessed')
+        _adm_train_fps = {r.get('train_fp') for r in admitted.values() if isinstance(r.get('train_fp'), str) and r.get('train_fp')}
+        _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='accessed',
+                                    train_fp=(next(iter(_adm_train_fps)) if len(_adm_train_fps) == 1 else None))
     _alpha = float((manifest.get('statistics') or {}).get('alpha', 0.05))
-    stats = {'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision')}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp}, 'comparisons': {}, 'holm': {}, 'by_length': {}, 'probe': _test_probe_stats(probe_path, manifest, unified_fp)}
+    stats = {'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision')}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp, 'n_effective_seeds': len({int(s) for (_v, s) in admitted}), 'n_declared_seeds': len(manifest['seeds'])}, 'comparisons': {}, 'holm': {}, 'by_length': {}, 'probe': _test_probe_stats(probe_path, manifest, unified_fp)}
+    # The exact sign-flip p is valid only under within-seed exchangeability.
+    # admission binds the corpus/slice/row count/recipe/code, but the RNG stream
+    # and batch order are not independently re-derivable from a record; report
+    # them instead of silently assuming them.
+    _rngs = sorted({str(r.get('rng_fp')) for r in admitted.values() if r.get('rng_fp')})
+    stats['validity'] = {
+        'rng_fp_values': _rngs,
+        'same_rng_fp': len(_rngs) <= 1,
+        'n_seq_values': sorted({int(r.get('n_seq')) for r in admitted.values() if r.get('n_seq') is not None}),
+        'note': 'exact sign-flip requires within-seed exchangeability (same data order / eval rows / corruption grid). data_fp, train_fp, n_seq and recipe are machine-checked; rng_fp is reported here but NOT enforced, so the exchangeability claim remains a declared assumption rather than a proved one.',
+    }
     for v in manifest['arms']:
         rows = [r for (rv, s), r in admitted.items() if rv == v]
         _lens = sorted({int(k) for r in rows for k in (r.get('by_len') or {})})
@@ -1215,29 +1381,48 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         # same frozen fingerprint, so pairing cannot mix slices (and a missing
         # fingerprint could never enter here — None==None is rejected).
         common = sorted(set(recs_a) & set(recs_b))
-        if len(common) < 2:
-            stats['comparisons'][name] = {'omitted': f'<2 seed pairs admissible at the frozen endpoint (a: {sorted(recs_a)}, b: {sorted(recs_b)}; whitelist {manifest["seeds"]})', 'n': 0, 'expected_sign': exp_sign}
-            continue
+        # v11.128: drop only the incomplete PAIR, not the whole comparison.
+        # The review's scenario — one L4096 cell fails -> `dl=None` -> the
+        # entire comparison is omitted — wasted 47 good cells.  Use every
+        # complete pair and report the dropped seeds.  Whether n<12 may still
+        # confirm is a PRE-REGISTERED choice (statistics.min_seeds_for_confirmation,
+        # manifest v3: 8, the mathematical minimum for Holm/4 with alpha=0.05).
         def _cell_ppl(rec):
             bl = rec.get('by_len') or {}
             c = bl.get(Ln, bl.get(str(Ln)))
             return float(c['ppl']) if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')) else None
         dl = []
+        usable = []
+        dropped = []
         for s in common:
             pa, pb = (_cell_ppl(recs_a[s]), _cell_ppl(recs_b[s]))
             if pa is None or pb is None:
-                dl = None
-                break
+                dropped.append({'seed': int(s), 'reason': f'missing usable untruncated cell at L{Ln}'})
+                continue
             dl.append(pa - pb)
-        if dl is None:
-            stats['comparisons'][name] = {'omitted': f'an admissible pair lacks a usable, untruncated cell at L{Ln}', 'n': 0, 'expected_sign': exp_sign}
+            usable.append(s)
+        if len(usable) < 2:
+            stats['comparisons'][name] = {'omitted': f'<2 complete seed pairs at the frozen endpoint (common records: {common}; usable pairs: {usable}; whitelist {manifest["seeds"]})', 'n': 0, 'expected_sign': exp_sign, 'dropped_pairs': dropped}
             continue
         res = V.exact_sign_permutation(dl)
-        res['seeds'] = common
-        res['coverage_ok'] = bool(len(common) == len(manifest['seeds']))
-        res['missing_seeds'] = sorted(set(int(s) for s in manifest['seeds']) - set(int(s) for s in common))
-        _pa = [recs_a[s].get('params') for s in common if isinstance(recs_a[s].get('params'), (int, float))]
-        _pb = [recs_b[s].get('params') for s in common if isinstance(recs_b[s].get('params'), (int, float))]
+        _n_eff = len(usable)
+        _n_min = int((manifest.get('statistics') or {}).get('min_seeds_for_confirmation') or len(manifest['seeds']))
+        res['seeds'] = usable
+        res['n_effective'] = int(_n_eff)
+        res['coverage_ok'] = bool(_n_eff == len(manifest['seeds']))
+        res['missing_seeds'] = sorted(set(int(s) for s in manifest['seeds']) - set(int(s) for s in usable))
+        res['dropped_pairs'] = dropped
+        res['min_seeds_for_confirmation'] = _n_min
+        # Diagnostics must use the n that actually entered THIS comparison.
+        # The old code always used the manifest's 12, which made p_floor /
+        # min_attainable_p_holm / power look better than the test really was.
+        _fl_eff = L.signflip_p_floor(_n_eff)
+        if math.isfinite(_fl_eff):
+            res['p_floor_effective'] = _fl_eff
+            res['min_attainable_p_holm_effective'] = L.holm_min_attainable_p(_n_eff, len(manifest['primary_comparisons']), _alpha)
+            res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_n_eff, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
+        _pa = [recs_a[s].get('params') for s in usable if isinstance(recs_a[s].get('params'), (int, float))]
+        _pb = [recs_b[s].get('params') for s in usable if isinstance(recs_b[s].get('params'), (int, float))]
         if _pa and _pb:
             _am, _bm = float(np.mean(_pa)), float(np.mean(_pb))
             _rel = abs(_am - _bm) / max(_am, _bm, 1.0)
@@ -1256,7 +1441,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             res['direction_ok'] = bool((res['mean'] > 0) == (exp_sign == 'positive'))
         else:
             res['direction_ok'] = None
-        _doc = _doc_level_analysis(recs_a, recs_b, common, Ln)
+        _doc = _doc_level_analysis(recs_a, recs_b, usable, Ln)
         if _doc is not None:
             res['doc_sampling'] = _doc
         stats['comparisons'][name] = res
@@ -1274,13 +1459,20 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # observed direction to match the validation-panel estimate (a null
     # expected_sign marks a non-directional mechanism readout).  The strict `<`
     # matches the manifest's `p_holm < 0.05` (the generic holm_adjust uses `<=`).
+    # The pre-registered decision rule (manifest v3) requires p_holm < alpha
+    # AND the observed direction AND parameter matching AND at least
+    # `min_seeds_for_confirmation` complete pairs.  `coverage_ok` (all 12
+    # seeds) is reported but is no longer an all-or-nothing veto: one failed
+    # L4096 cell may not annihilate an otherwise complete comparison.
     _conf = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is True
              and stats['comparisons'].get(k, {}).get('param_matched') is not False
-             and stats['comparisons'].get(k, {}).get('coverage_ok') is True]
+             and int(stats['comparisons'].get(k, {}).get('n_effective') or 0) >= int(stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation') or len(manifest['seeds']))]
     stats['confirmed'] = _conf
     stats['significant_nondirectional'] = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is None]
     stats['not_confirmed_reasons'] = {k: {'param_matched': stats['comparisons'].get(k, {}).get('param_matched'),
                                           'coverage_ok': stats['comparisons'].get(k, {}).get('coverage_ok'),
+                                          'n_effective': stats['comparisons'].get(k, {}).get('n_effective'),
+                                          'min_seeds_for_confirmation': stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation'),
                                           'direction_ok': stats['comparisons'].get(k, {}).get('direction_ok')}
                                       for k in _rej if k not in _conf}
     _m = len(manifest['primary_comparisons'])
@@ -1494,10 +1686,14 @@ def schedule_shutdown(delay_s=120):
     print(f'[v12] instance shuts down in {delay_s}s.')
 
 def run_full():
+    # Fail before the first GPU-second / before P5T can touch test.  This is
+    # the same zero-GPU plan check CI runs; on a real box it also verifies that
+    # the frozen manifest and this code agree.
+    plan_check()
     guard = make_guard()
     guard.report()
     print(f'[v12] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state["booked_seconds"] / 3600:.2f} h)')
-    git_push('v12: confirmation driver (frozen-manifest v2: plan-power gate + strict record admission + freeze-lock binding; P5C covers all four frozen arms at manifest seeds)')
+    git_push('v12: confirmation driver (frozen-manifest v3: zero-GPU plan gate + strict record admission + freeze-lock binding; P5C covers all four frozen arms at manifest seeds)')
     import par
     _ctx = par.resolve_ctx(label='v12')
     all_ok = True
@@ -1532,9 +1728,211 @@ def run_full():
     print('\n[v12] ALL PHASES DONE.')
     schedule_shutdown(120 if all_ok else 2400)
 
+def _plan_recipe(manifest, arm, mr):
+    """Build a P1L-format recipe string carrying the frozen signature.
+
+    This is a SYNTHETIC descriptor used only by the zero-GPU plan check; it
+    never enters a result file.  It mirrors the fields `run_lenphase_cell`
+    writes so `_recipe_matches_signature` (including the per-arm `mr`) is
+    exercised on the same code path as a real checkpoint.
+    """
+    _sig = _recipe_signature(manifest) or {}
+    _nseq = int(((manifest.get('eval') or {}).get('n_seqs_clean')) or 0)
+    return (f"p1l_steps{_sig.get('steps', 3000)}_tl{_sig.get('sl', 512)}"
+            f"_v{_sig.get('v', 8192)}_bs{_sig.get('bs', 12)}"
+            f"_lr{_sig.get('lr', 0.0003)}_nt{_sig.get('nt', 8000000)}"
+            f"_wu{_sig.get('wu', 50)}_wd{_sig.get('wd', 0.1)}"
+            f"_cl{_sig.get('cl', 0.05)}_dlm{_sig.get('dlm', 10.0)}"
+            f"_mr{float(mr):.8g}-csa_fixed_rope_ns{_nseq}"
+            f"_dfplan_gc1.0_b0.9,0.999_eps1e-08_tkplan_detplan_trfpplan")
+
+
+def plan_check(manifest_path=FREEZE_MANIFEST):
+    """Zero-GPU pre-flight for the frozen confirmation plan.
+
+    The review's most dangerous finding was that the obvious fix (align the
+    code stamp) turns P5T from "fails fast" into "burns the one-shot test
+    access, then admits 0/48 records".  This check closes that hole WITHOUT
+    reading test data: it derives the implementation descriptor from the same
+    `make_layer_cfgs` + `_uses_batched_eager` code the trainer uses, builds
+    one synthetic record per (arm, seed) with the real recipe/admission
+    schema, and runs `_admit_confirmation_records` + the power gate.
+
+    It fails if:
+      * the manifest stamp does not match this code;
+      * any frozen arm's predicted train_knobs violates the implementation
+        binding (e.g. a false eager_batch certification);
+      * a per-arm `mr` in the manifest disagrees with `variant_mlp_ratio`;
+      * any primary comparison's two arms cannot be admitted;
+      * the pre-registered minimum n cannot attain Holm significance.
+
+    Returns a report dict.  Raises `SystemExit` with all errors on failure.
+    """
+    m = _load_manifest(manifest_path)
+    errs = []
+    notes = []
+    impl = _frozen_implementation(m)
+    if not impl:
+        errs.append('manifest declares no implementation binding (eager_batch/amp_dtype); manifest v3 must bind the implementation')
+    sig = _recipe_signature(m) or {}
+    arms = list(m['arms'])
+    seeds = [int(s) for s in m['seeds']]
+    _stat = m.get('statistics') or {}
+    _alpha = float(_stat.get('alpha', 0.05))
+    _n_min = int(_stat.get('min_seeds_for_confirmation') or len(seeds))
+    _eval = m.get('eval') or {}
+    _lens = [int(x) for x in (_eval.get('by_length_ppl') or [])]
+    _nseq = int(_eval.get('n_seqs_clean') or 0)
+    if len(set(arms)) != len(arms):
+        errs.append(f'frozen arms are not unique: {arms}')
+    if not _lens:
+        errs.append('manifest eval.by_length_ppl is empty; P5T has no endpoint grid')
+    if _nseq <= 0:
+        errs.append('manifest eval.n_seqs_clean is missing/zero; the frozen row count is part of the slice')
+    if _n_min < 2 or _n_min > len(seeds):
+        errs.append(f'statistics.min_seeds_for_confirmation={_n_min} is outside [2, {len(seeds)}]')
+    _min_holm = L.holm_min_attainable_p(_n_min, len(m['primary_comparisons']), _alpha) if _n_min >= 2 else float('inf')
+    if not math.isfinite(_min_holm) or _min_holm > _alpha:
+        errs.append(f'the pre-registered minimum n={_n_min} cannot attain Holm significance (min attainable Holm p={_min_holm:.4g} > alpha={_alpha})')
+    # Predict the implementation descriptor exactly as the trainer will.
+    _dev = type('_PlanCuda', (), {'type': 'cuda'})()
+    _bs = int(sig.get('bs', 12))
+    _n_layers = int(sig.get('L', 6))
+    _amp_norm = L._normalise_amp_mode(impl.get('amp_dtype')) if impl and impl.get('amp_dtype') else None
+    _per_arm = ((m.get('binding') or {}).get('per_arm_recipe_signature') or {})
+    if _per_arm and set(_per_arm) != set(arms):
+        errs.append(f'binding.per_arm_recipe_signature must name exactly the frozen arms {sorted(arms)} (got {sorted(_per_arm)})')
+    _records = {}
+    _pred = {}
+    for arm in arms:
+        try:
+            cfgs = L.make_layer_cfgs(_n_layers, arm)
+        except Exception as _e:
+            errs.append(f'{arm}: make_layer_cfgs failed ({type(_e).__name__}: {_e})')
+            continue
+        try:
+            _eb = L._uses_batched_eager(cfgs, device=_dev, batch_size=_bs)
+        except Exception as _e:
+            errs.append(f'{arm}: _uses_batched_eager failed ({type(_e).__name__}: {_e})')
+            _eb = None
+        _tk = L.training_knobs(amp_dtype=_amp_norm, eager_batch=bool(_eb))
+        _why = _implementation_reason({'train_knobs': _tk}, impl)
+        if _why:
+            errs.append(f'{arm}: implementation binding cannot be satisfied by the real dispatch ({_why}; predicted train_knobs={_tk})')
+        if impl and 'eager_batch' in impl and _eb is not None and bool(_eb) != bool(impl['eager_batch']):
+            errs.append(f'{arm}: predicted eager_batch={bool(_eb)} != frozen {bool(impl["eager_batch"])!r}')
+        _expected_mr = None
+        if isinstance(_per_arm.get(arm), dict):
+            _expected_mr = _per_arm[arm].get('mr')
+        if _expected_mr is not None:
+            try:
+                _actual_mr = L.variant_mlp_ratio(arm, int(sig.get('v', 8192)), d=int(sig.get('d', 256)),
+                                                 n_layers=_n_layers, n_heads=int(sig.get('H', 8)),
+                                                 d_head=int(sig.get('Dh', 32)), seq_len=int(sig.get('sl', 512)),
+                                                 matched={arm}, ref_variant='csa_fixed_rope') if arm in ('full_rope', 'full_sw128_matched_rope') else 4.0
+            except Exception as _e:
+                errs.append(f'{arm}: variant_mlp_ratio failed ({type(_e).__name__}: {_e})')
+                _actual_mr = None
+            if _actual_mr is not None and not math.isclose(float(_actual_mr), float(_expected_mr), rel_tol=1e-6, abs_tol=0.0):
+                errs.append(f'{arm}: frozen mr={_expected_mr!r} != computed mr={_actual_mr!r}; the parameter-matching knob is not pinned to this code')
+        else:
+            _actual_mr = 4.0
+            notes.append(f'{arm}: no per-arm mr frozen; the recipe signature will not catch a mr mutation')
+        _recipe = _plan_recipe(m, arm, _expected_mr if _expected_mr is not None else _actual_mr)
+        _sig_arm = _recipe_signature(m, arm)
+        if _sig_arm is None:
+            errs.append(f'{arm}: no recipe signature (shared or per-arm) is declared')
+        elif not _recipe_matches_signature(_recipe, _sig_arm):
+            errs.append(f'{arm}: synthetic recipe does not satisfy the frozen signature {_sig_arm!r} (decoded {_recipe_knobs(_recipe)!r})')
+        _pred[arm] = {'eager_batch': (bool(_eb) if _eb is not None else None),
+                      'amp_dtype': _tk.get('amp_dtype'),
+                      'train_knobs': _tk, 'recipe': _recipe}
+        # Parameter matching is part of the frozen comparison contract: the
+        # analysis refuses a pair whose totals differ by >1%, but discovering
+        # that only after P5T would waste the access.  Build the real shapes
+        # here (CPU) and check it up front.
+        try:
+            _mr_for_shape = float(_expected_mr) if _expected_mr is not None else float(_actual_mr)
+            _shape_model = L.SmallGPT(int(sig.get('v', 8192)), int(sig.get('d', 256)),
+                                      _n_layers, int(sig.get('H', 8)), int(sig.get('Dh', 32)),
+                                      int(sig.get('sl', 512)), cfgs, mlp_ratio=_mr_for_shape)
+            _pred[arm]['params'] = int(L.count_params(_shape_model))
+            del _shape_model
+        except Exception as _e:
+            errs.append(f'{arm}: could not compute the parameter count for the frozen shape ({type(_e).__name__}: {_e})')
+            _pred[arm]['params'] = None
+        for s in seeds:
+            _records[f'{arm}::s{s}'] = {
+                'variant': arm, 'seed': int(s), 'split': 'test',
+                'by_len': {str(Ln): {'ppl': 100.0, 'n_tok': int(_nseq) * int(Ln - 1),
+                                     'n_seq': int(_nseq), 'ppl_per_seq': [100.0] * int(_nseq)}
+                           for Ln in _lens},
+                'data_fp': 'plan-test-slice-fp', 'train_fp': 'plan-train-fp',
+                '_code': L.code_stamp(), 'manifest_sha256': m.get('manifest_sha256'),
+                'recipe': _recipe, 'train_knobs': _tk, 'n_seq': int(_nseq),
+                'params': 11089904,
+            }
+    try:
+        admitted, _fp = _admit_confirmation_records(_records, m)
+    except SystemExit as _e:
+        errs.append(f'admission run raised: {_e}')
+        admitted = {}
+    if len(admitted) != len(arms) * len(seeds):
+        errs.append(f'admission accepted {len(admitted)}/{len(arms) * len(seeds)} synthetic frozen cells — P5T would burn the test access and then admit only this many real records')
+    _comp_report = {}
+    for comp in m['primary_comparisons']:
+        _a, _b = comp.get('a'), comp.get('b')
+        try:
+            _Ln = int(str(comp.get('endpoint', 'by_len.ppl@4096')).rsplit('@', 1)[-1])
+        except (TypeError, ValueError):
+            _Ln = None
+        _missing = [x for x in (_a, _b) if x not in arms]
+        if _missing:
+            errs.append(f'comparison {comp.get("name")!r} names arms outside the frozen list: {_missing}')
+        if _Ln is not None and _lens and _Ln not in _lens:
+            errs.append(f'comparison {comp.get("name")!r} endpoint L{_Ln} is not in eval.by_length_ppl {_lens}')
+        _low = [s for s in seeds if (_a, s) not in admitted or (_b, s) not in admitted]
+        if _low:
+            errs.append(f'comparison {comp.get("name")!r} cannot form all {len(seeds)} pairs; missing seeds {_low}')
+        _pa = (_pred.get(_a) or {}).get('params')
+        _pb = (_pred.get(_b) or {}).get('params')
+        _rel = None
+        if _pa and _pb:
+            _rel = abs(_pa - _pb) / max(_pa, _pb, 1)
+            if _rel > 0.01:
+                errs.append(f'comparison {comp.get("name")!r} is NOT parameter-matched at the frozen shapes ({_pa} vs {_pb}, rel diff {_rel:.4%} > 1%) — the analysis would refuse it after the test access')
+        _comp_report[comp.get('name')] = {'a': _a, 'b': _b, 'endpoint_L': _Ln, 'pairs_planned': len(seeds) - len(_low), 'params_a': _pa, 'params_b': _pb, 'param_rel_diff': _rel}
+    report = {'ok': not errs, 'manifest': manifest_path, 'manifest_sha256': m.get('manifest_sha256'),
+              'code_semantics': L.CODE_SEMANTICS, 'n_arms': len(arms), 'n_seeds': len(seeds),
+              'n_min_for_confirmation': _n_min, 'min_attainable_p_holm': _min_holm,
+              'predicted': _pred, 'admitted': len(admitted), 'comparisons': _comp_report,
+              'errors': errs, 'notes': notes}
+    if errs:
+        print('[v12 plan] REFUSED — the frozen plan is not runnable end-to-end:')
+        for _e in errs:
+            print(f'  - {_e}')
+        raise SystemExit('[v12 plan] FAILED: fix the plan/records BEFORE any P5C training or P5T test access')
+    print(f'[v12 plan] OK: {len(admitted)}/{len(arms) * len(seeds)} synthetic records admitted; {len(_comp_report)} comparisons form all pairs; min n={_n_min} (min Holm p={_min_holm:.4g} <= alpha={_alpha})')
+    for _a, _p in _pred.items():
+        print(f'  [plan] {_a:32s} eager_batch={_p["eager_batch"]} amp={_p["amp_dtype"]} mr={(_per_arm.get(_a) or {}).get("mr", 4.0)} params={_p.get("params")}')
+    for _n in notes:
+        print(f'  [plan][note] {_n}')
+    globals()['_PLAN_DONE'] = True
+    return report
+
+
+def run_plan(manifest_path=FREEZE_MANIFEST):
+    return plan_check(manifest_path)
+
+
 def run_smoke():
     import copy
     import shutil
+    # v11.128: smoke must never write into the frozen wt103_cache.  It used a
+    # 1M/4M-token fit cap and could leave a differently-tokenised
+    # tok_v5_*.json that makes a later cold P5T build fail AFTER the test read.
+    # An isolated cache under the smoke outdir keeps the frozen cache clean.
+    os.environ.setdefault('WT103_CACHE_DIR', os.path.join('results_smoke_v12', 'wt103_cache'))
     print('[smoke] 1) tiny frozen-confirmation roundtrip on a synthetic local test split')
     L.set_seed(0)
     shutil.rmtree('results_smoke_v12', ignore_errors=True)
@@ -1574,7 +1972,7 @@ if __name__ == '__main__':
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
-    _MODES = ('full', 'smoke', 'analysis', 'report', 'phase', 'finaltest')
+    _MODES = ('full', 'smoke', 'plan', 'analysis', 'report', 'phase', 'finaltest')
     if mode in ('-h', '--help', 'help'):
         print(__doc__)
         raise SystemExit(0)
@@ -1588,6 +1986,8 @@ if __name__ == '__main__':
     try:
         if mode == 'smoke':
             run_smoke()
+        elif mode == 'plan':
+            run_plan(sys.argv[2] if len(sys.argv) > 2 else FREEZE_MANIFEST)
         elif mode == 'analysis':
             v12_analysis()
         elif mode == 'report':

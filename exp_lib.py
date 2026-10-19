@@ -69,7 +69,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[setup] device = {DEVICE}   torch = {torch.__version__}')
 QUICK = False
 RUN_CAP = dict(total_hours=58.333333333333336, margin=0.93, already_hours=0.0, state_path='run_time_state.json')
-CODE_SEMANTICS = 'v11.127'
+CODE_SEMANTICS = 'v11.128'
 CKPT_CODE = CODE_SEMANTICS
 # ---- 三算子内核路径（docs/compute_plan.md §3 的 M0 工作包；实现与数值契约
 # 见 csa_kernels.py）。CSA_KERNEL 未设置时本模块的执行路径与指纹逐字节不变。
@@ -133,6 +133,14 @@ def _uses_batched_eager(cfgs, device=None, batch_size=None):
         return False
     return any(
         getattr(c, 'kind', None) in ('csa', 'hca')
+        # v11.128: RoPE CSA/HCA layers ALWAYS take the per-row
+        # `HybridAttentionRoPE._single_rope` loop (v7_supp.py forward), and the
+        # batched twin in csa_kernels has no RoPE/qk-norm implementation.  The
+        # old predicate ignored `rope`, so every frozen rope arm recorded
+        # eager_batch=True while actually running the row loop — a false
+        # implementation binding that the confirmation admission gate then
+        # certified.  A layer is batched only when it is NOT a rope layer.
+        and not bool(getattr(c, 'rope', False))
         and getattr(c, 'fuse_mode', 'none') == 'none'
         and getattr(c, 'indexer_mode', 'learned')
         and getattr(c, 'open_block_mode', 'closed') == 'closed'
@@ -227,8 +235,16 @@ def _finite_curve(values):
             'last': finite[-1] if finite else None}
 
 
-def _curve_slope(points, key, k=4):
-    """Least-squares slope over the last k FINITE points of a curve."""
+def _curve_slope_stats(points, key, k=4):
+    """Least-squares slope + its standard error over the last k FINITE points.
+
+    Returning the standard error is what makes the health thresholds
+    noise-aware: with four equally spaced eval points and CE noise of order
+    0.01-0.03, the slope's standard error is ~5e-5 per step, five times the
+    historical fixed ``slope_tol=1e-5``.  A fixed tolerance therefore lets the
+    *sign of the noise* decide ``healthy`` vs ``overfitting``.  Callers that
+    need a scale-free criterion compare the slope with a multiple of this SE.
+    """
     pts = []
     for p in (points or []):
         if not isinstance(p, dict):
@@ -242,23 +258,44 @@ def _curve_slope(points, key, k=4):
             pts.append((x, y))
     pts = pts[-max(2, int(k)):]
     if len(pts) < 2:
-        return None
+        return None, None
     n = len(pts)
     mx = sum(x for x, _ in pts) / n
     my = sum(y for _, y in pts) / n
     den = sum((x - mx) ** 2 for x, _ in pts)
     if den <= 0:
-        return None
-    return sum((x - mx) * (y - my) for x, y in pts) / den
+        return None, None
+    slope = sum((x - mx) * (y - my) for x, y in pts) / den
+    # Residual standard error of the slope.  With n=2 the residual dof is 0;
+    # the slope is then interpolating the two points, so no noise estimate is
+    # possible (None -> the caller falls back to the fixed floor).
+    dof = n - 2
+    if dof <= 0:
+        return slope, None
+    rss = sum((y - (my + slope * (x - mx))) ** 2 for x, y in pts)
+    se = math.sqrt((rss / dof) / den) if den > 0 else None
+    return slope, se
 
 
-def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None):
+def _curve_slope(points, key, k=4):
+    """Least-squares slope over the last k FINITE points of a curve."""
+    return _curve_slope_stats(points, key, k=k)[0]
+
+
+def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None):
     """Classify a train/validation curve.
 
     ``history`` is a list of dicts with ``step``, ``train_ce`` and either
     ``val_ce`` or ``val_ppl``.  This is a diagnostic, not a model-selection
     rule: it says whether the run looks overfit / underfit / stalled / broken
     on the fixed evaluation grid.
+
+    ``slope_tol=None`` (the default since v11.128) makes the threshold
+    noise-aware: each curve's tolerance is ``max(1e-5, 2 * SE(slope))``, where
+    SE is the least-squares standard error of the fitted tail slope.  A slope
+    must then exceed twice its own noise before it can flip a health status.
+    Pass a number to restore the historical fixed-threshold behaviour (tests
+    and callers that deliberately use a synthetic noise-free curve do this).
     """
     entries = [h for h in (history or []) if isinstance(h, dict)]
     n_bad = 0
@@ -282,8 +319,8 @@ def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None)
                 n_bad += 1
             if key == 'train_ce':
                 n_train_measured += 1
-    train_s = _curve_slope(entries, 'train_ce', k=tail_k)
-    val_s = _curve_slope(entries, 'val_ce', k=tail_k)
+    train_s, train_se = _curve_slope_stats(entries, 'train_ce', k=tail_k)
+    val_s, val_se = _curve_slope_stats(entries, 'val_ce', k=tail_k)
     if val_s is None:
         _val_from_ppl = []
         for _p in entries:
@@ -294,7 +331,14 @@ def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None)
                 continue
             if math.isfinite(_st) and math.isfinite(_vp) and _vp > 0.0:
                 _val_from_ppl.append({'step': _st, 'val_ce': math.log(_vp)})
-        val_s = _curve_slope(_val_from_ppl, 'val_ce', k=tail_k)
+        val_s, val_se = _curve_slope_stats(_val_from_ppl, 'val_ce', k=tail_k)
+    if slope_tol is None:
+        # 2-sigma slope noise.  1e-5 is kept as the floor so a perfectly
+        # linear synthetic curve still has a usable (tiny) tolerance.
+        train_tol = max(1e-5, 2.0 * train_se) if train_se is not None else 1e-5
+        val_tol = max(1e-5, 2.0 * val_se) if val_se is not None else 1e-5
+    else:
+        train_tol = val_tol = float(slope_tol)
     val_ppl_points = []
     for h in entries:
         try:
@@ -326,10 +370,10 @@ def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None)
         # back to a validation-only classification instead of silently
         # reporting `nonfinite`/`insufficient_data`.  Overfitting cannot be
         # attributed without the train curve, so the reason says so.
-        if val_s > slope_tol:
+        if val_s > val_tol:
             status = 'validation_degrading'
             reason = 'train CE unmonitored; validation CE is rising in the tail (val-only classification)'
-        elif val_s < -slope_tol:
+        elif val_s < -val_tol:
             status = 'healthy'
             reason = 'train CE unmonitored; validation CE is falling in the tail (val-only classification: overfitting cannot be ruled out without the train curve)'
         else:
@@ -338,13 +382,13 @@ def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None)
     elif train_s is None or val_s is None:
         status = 'insufficient_data'
         reason = 'fewer than two finite train/validation eval points; cannot classify'
-    elif train_s < -slope_tol and val_s > slope_tol:
+    elif train_s < -train_tol and val_s > val_tol:
         status = 'overfitting'
         reason = 'training CE is still falling while validation CE is rising'
-    elif train_s >= -slope_tol and val_s >= -slope_tol:
+    elif train_s >= -train_tol and val_s >= -val_tol:
         status = 'underfitting_or_stalled'
         reason = 'neither training nor validation CE is decreasing in the tail'
-    elif train_s < -slope_tol and val_s <= slope_tol:
+    elif train_s < -train_tol and val_s <= val_tol:
         status = 'healthy'
         reason = 'training CE is falling and validation CE is not rising'
     else:
@@ -359,6 +403,11 @@ def classify_training_health(history, *, tail_k=4, slope_tol=1e-5, gap_tol=None)
         'tail_k': int(tail_k),
         'train_ce_slope_per_step': train_s,
         'val_ce_slope_per_step': val_s,
+        'train_ce_slope_se': train_se,
+        'val_ce_slope_se': val_se,
+        'train_slope_tol': train_tol,
+        'val_slope_tol': val_tol,
+        'slope_tol_mode': ('adaptive_2se' if slope_tol is None else 'fixed'),
         'gap_last': last_gap,
         'best_step': int(best[0]) if best is not None else None,
         'best_val_ppl': float(best[1]) if best is not None else None,
@@ -5677,8 +5726,23 @@ def _memo_put(memo, key, value, cap_items, cap_bytes=_MEMO_MAX_BYTES):
 _WT103_MEMO = {}
 _WT103_MEMO_CAP = 4
 
-def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_dir='./wt103_cache'):
+def _wt_cache_dir(cache_dir=None):
+    """Resolve the WikiText cache directory, honouring ``WT103_CACHE_DIR``.
+
+    Before v11.128 the loaders hard-coded ``./wt103_cache`` while the audit
+    and the confirmation driver looked at ``WT103_CACHE_DIR``.  That meant the
+    leakage gate could audit a different directory from the one the evaluation
+    actually used.  One resolver is now shared by both loaders so there is a
+    single cache identity.
+    """
+    if cache_dir not in (None, ''):
+        return str(cache_dir)
+    return os.environ.get('WT103_CACHE_DIR') or './wt103_cache'
+
+
+def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_dir=None):
     from datasets import load_dataset
+    cache_dir = _wt_cache_dir(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
     tag = f'v5_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}'
     tr_path = os.path.join(cache_dir, f'train_ids_{tag}.npy')
@@ -5750,7 +5814,16 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         last_err = None
         for repo in ('Salesforce/wikitext', 'wikitext'):
             try:
-                ds = load_dataset(repo, 'wikitext-103-raw-v1', cache_dir=cache_dir)
+                # v11.128: request train/validation EXPLICITLY.  The historical
+                # `load_dataset(repo, config, cache_dir=...)` without `split=`
+                # materialises all three splits, including wiki.test.raw, so
+                # the claim "the test split has never been read by any earlier
+                # phase" was false at the file level.  Test is now only ever
+                # requested by load_wikitest.
+                ds = {
+                    'train': load_dataset(repo, 'wikitext-103-raw-v1', split='train', cache_dir=cache_dir),
+                    'validation': load_dataset(repo, 'wikitext-103-raw-v1', split='validation', cache_dir=cache_dir),
+                }
                 break
             except Exception as e:
                 last_err = e
@@ -5982,7 +6055,7 @@ def _tokenise_row_chunks(row_chunks, cap_tokens, label, tok, eos_id):
     ids = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
     return ids[:cap_tokens]
 
-def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache'):
+def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     """Load the WikiText-103 **test** split as (n_seqs, seq_len) int64 rows.
 
     只读 wiki.test.raw（本地 dump 或 HF test split），绝不触碰 train/validation，
@@ -5996,6 +6069,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
     语料被更换时应删除整个 wt103_cache/，否则 test 缓存不会跟随重建——
     这是显式记录的边界，不是静默的失效路径。"""
     from datasets import load_dataset
+    cache_dir = _wt_cache_dir(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
     tag = f'v2_sl{seq_len}_v{vocab_size}_ns{n_seqs}'
     te_path = os.path.join(cache_dir, f'test_ids_{tag}.npy')
@@ -6050,6 +6124,37 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
                 'rebuild it from the same train tokenizer')
         if meta.get('fit_fp') and not _train_fit_fps:
             print('[data] NOTE: no train-cache meta found; the cached TEST fit provenance cannot be cross-checked locally')
+        # v11.128: bind the actual test tokenizer bytes on EVERY cache hit.
+        # `fit_fp` hashes the fit TEXT, which two different BPE merge sets can
+        # share; it is not a tokenizer identity.  A missing identity in a
+        # legacy cache is a hard refusal for the frozen confirmation (delete
+        # the test cache and rebuild it from the same train tokenizer).
+        _tok_sha_now = None
+        if os.path.exists(tk_path):
+            try:
+                _tok_sha_now = file_sha256(tk_path)
+            except Exception as _te:
+                _problems.append(f'test tokenizer file unreadable ({type(_te).__name__}: {_te})')
+        _tok_sha_meta = meta.get('tokenizer_file_sha256')
+        if _tok_sha_meta:
+            if _tok_sha_now is None:
+                _problems.append('test meta binds a tokenizer file that is missing')
+            elif _tok_sha_now != _tok_sha_meta:
+                raise RuntimeError(f'load_wikitest: the cached test tokenizer bytes (sha256 {_tok_sha_now[:16]}…) do not match the identity recorded in test meta ({str(_tok_sha_meta)[:16]}…) — the test cache and its tokenizer are not a matched pair; delete the test cache and rebuild it')
+        else:
+            _train_toks = sorted(_glob2.glob(os.path.join(cache_dir, 'tok_v5_*.json')))
+            if _tok_sha_now is None or not _train_toks:
+                raise RuntimeError('load_wikitest: this is a legacy test cache without a tokenizer identity and without a matched train tokenizer file; refusing to serve an unpaired id space — rebuild the test cache with the current loader')
+            try:
+                from tokenizers import Tokenizer as _Tok
+                _tv = dict(_Tok.from_file(tk_path).get_vocab())
+                _trv = dict(_Tok.from_file(_train_toks[0]).get_vocab())
+            except Exception as _te:
+                raise RuntimeError(f'load_wikitest: could not compare the legacy test tokenizer with the train tokenizer ({type(_te).__name__}: {_te}); rebuild the test cache') from _te
+            if _tv != _trv:
+                raise RuntimeError('load_wikitest: the legacy test tokenizer vocabulary is not identical to the train tokenizer vocabulary — the id spaces cannot be paired; delete the test cache and rebuild it')
+        if np.asarray(test_ids).shape != (int(n_seqs), int(seq_len)):
+            raise RuntimeError(f'load_wikitest: cached test slice shape {np.asarray(test_ids).shape} != the frozen ({int(n_seqs)}, {int(seq_len)}); the frozen slice is part of the pre-registration, so a different row count must be re-frozen explicitly')
         if _problems:
             _cache_warning('WikiText test split', _problems)
         else:
@@ -6058,33 +6163,20 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
             out = (test_ids, meta['vocab'], None, test_bnd)
             _memo_put(_WT103_TEST_MEMO, _mkey, out, _WT103_TEST_MEMO_CAP)
             return out
-    # cold build: source the test rows (local dump first, HF otherwise)
+    # cold build: resolve the train tokenizer FIRST, then touch the test rows.
+    # The historical order read wiki.test.raw before validating the tokenizer,
+    # so a tokenizer/fit mismatch failed only after the held-out split had
+    # already been read.  `test_rows` is populated after the validation block
+    # below, immediately before tokenisation.
     test_rows = None
-    ds = None
+    ds_test = None
+    ds_train = None
     raw_txt = os.environ.get('WT103_RAW_TXT')
     _cands = []
     if raw_txt:
         _cands.append(raw_txt)
     _cands.append(os.path.join(os.path.dirname(os.path.abspath(cache_dir)), 'wt103_raw'))
     _cands.append('/root/wt103_raw')
-    for cand in _cands:
-        _f = os.path.join(cand, 'wiki.test.raw')
-        if os.path.exists(_f):
-            test_rows = _read_raw_rows(_f)
-            print(f'[data] local wikitext-103 TEST split at {_f} ({len(test_rows)} rows)')
-            break
-    if test_rows is None:
-        ds = None
-        last_err = None
-        for repo in ('Salesforce/wikitext', 'wikitext'):
-            try:
-                ds = load_dataset(repo, 'wikitext-103-raw-v1', cache_dir=cache_dir)
-                break
-            except Exception as e:
-                last_err = e
-        if ds is None:
-            raise last_err if last_err is not None else RuntimeError('load_wikitest: no test-split source available (local dump wiki.test.raw or the HF dataset)')
-        test_rows = ds['test']['text']
     # tokenizer: identical frozen-train-prefix fit to load_wikitext.  The
     # token cap is taken from the paired train cache when it is unique, so
     # the test tokenizer is an exact function of the same train region.
@@ -6112,16 +6204,19 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
             train_rows_source = _read_raw_rows(_f)
             break
     if train_rows_source is None:
-        if ds is None:
-            for repo in ('Salesforce/wikitext', 'wikitext'):
-                try:
-                    ds = load_dataset(repo, 'wikitext-103-raw-v1', cache_dir=cache_dir)
-                    break
-                except Exception as e:
-                    last_err = e
-            if ds is None:
-                raise last_err if last_err is not None else RuntimeError('load_wikitest: no train source to fit the shared tokenizer')
-        train_rows_source = list(ds['train']['text'])
+        for repo in ('Salesforce/wikitext', 'wikitext'):
+            try:
+                # TRAIN split only, for the frozen tokenizer fit.  Never reuse
+                # the test dataset here: fitting the tokenizer on test text
+                # would be leakage, and the old `ds` object happened to hide
+                # the distinction by holding all three splits.
+                ds_train = load_dataset(repo, 'wikitext-103-raw-v1', split='train', cache_dir=cache_dir)
+                break
+            except Exception as e:
+                last_err = e
+        if ds_train is None:
+            raise last_err if last_err is not None else RuntimeError('load_wikitest: no train source to fit the shared tokenizer')
+        train_rows_source = list(ds_train['text'])
     # Same blank-row filtering as load_wikitext, otherwise the two tokenizer
     # fit corpora (and therefore the vocabularies) can differ.
     train_rows_source = [r for r in train_rows_source
@@ -6159,6 +6254,27 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
             continue
         if int(_mv) != int(vocab):
             raise RuntimeError(f'load_wikitest: the freshly fitted tokenizer (vocab={vocab}) disagrees with the cached train corpus (vocab={_mv} in {_mp}) — the splits cannot be paired; delete wt103_cache/ and rebuild both')
+    if not _train_meta_objs:
+        raise RuntimeError('load_wikitest: no train/validation meta exists in the cache directory — build (or copy) the frozen train cache FIRST; the test tokenizer and the dedup index are functions of that train split, and touching test before it exists cannot be audited')
+    # Tokenizer and fit-cap are now validated.  ONLY NOW read the held-out rows.
+    for cand in _cands:
+        _f = os.path.join(cand, 'wiki.test.raw')
+        if os.path.exists(_f):
+            test_rows = _read_raw_rows(_f)
+            print(f'[data] local wikitext-103 TEST split at {_f} ({len(test_rows)} rows)')
+            break
+    if test_rows is None:
+        last_err = None
+        for repo in ('Salesforce/wikitext', 'wikitext'):
+            try:
+                # Only the TEST split: never materialise train/validation here.
+                ds_test = load_dataset(repo, 'wikitext-103-raw-v1', split='test', cache_dir=cache_dir)
+                break
+            except Exception as e:
+                last_err = e
+        if ds_test is None:
+            raise last_err if last_err is not None else RuntimeError('load_wikitest: no test-split source available (local dump wiki.test.raw or the HF dataset)')
+        test_rows = ds_test['text']
     print(f'[data] tokenising TEST split (cap {n_seqs * seq_len + seq_len} tokens) ...')
     _trows = list(test_rows) if not isinstance(test_rows, list) else list(test_rows)
     # Freeze a near-duplicate-clean evaluation subset: any test document that
@@ -6186,7 +6302,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
     ids = _tokenise_row_chunks([_trows[s:s + 10000] for s in range(0, len(_trows), 10000)], n_seqs * seq_len + seq_len, 'test', tok, eos_id)
     n_have = min(len(ids) // seq_len, n_seqs)
     if n_have < n_seqs:
-        print(f'[data] WARNING: test split yields only {n_have} full rows (< {n_seqs} requested) — the final-test evaluation runs on {n_have} rows')
+        # v11.128: hard failure.  The frozen plan declares n_seqs (16) as part
+        # of the slice; silently evaluating 14 rows would change the estimand
+        # and could still pass every downstream admission check.
+        raise RuntimeError(f'load_wikitest: the test split yields only {n_have} full rows but {n_seqs} are required by the frozen slice; refusing to shrink the held-out panel silently (investigate the near-duplicate cleanup / raw dump or re-freeze explicitly)')
     test_batch = ids[:n_have * seq_len].reshape(n_have, seq_len)
     _validate_token_ids(test_batch, vocab, 'wikitext test_batch')
     print(f'[data] TEST rows = {n_have} (seq_len={seq_len}, vocab={vocab})')
@@ -6205,10 +6324,24 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
                 pass
             raise
     _file_sigs = _cache_file_sigs({'test': te_path, 'bnd': tb_path})
+    # Persist the test tokenizer BEFORE writing the meta, so the meta can bind
+    # its exact bytes.  The cache-hit path used to verify only `fit_fp` (a hash
+    # of the fit TEXT), which two different BPE merge sets can share; a swapped
+    # tokenizer could then serve an unpaired id space.  The full-file sha256 is
+    # now part of the cache identity and is checked on every hit.
+    _tok_sha = None
+    try:
+        tok.save(tk_path)
+        _tok_sha = file_sha256(tk_path)
+    except Exception as _e:
+        print(f'[data] NOTE: could not persist the test tokenizer ({type(_e).__name__}: {_e}) — a rebuild will re-fit it deterministically')
     atomic_write_json(me_path, {
         'vocab': vocab,
         'src_fp': _ids_fp(test_batch),
         'fit_fp': _text_fp(train_fit_rows),
+        'tokenizer_file': os.path.basename(tk_path),
+        'tokenizer_file_sha256': _tok_sha,
+        'tokenizer_vocab_sha256': hashlib.sha256(json.dumps(dict(tok.get_vocab()), sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest(),
         'file_sigs': _file_sigs,
         'id_range': {'test': _array_id_range(test_batch)},
         'split_strategy': 'official_dataset_test_split_near_duplicate_filtered',
@@ -6229,10 +6362,6 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir='./wt103_cache
         'test_sequences': int(test_batch.shape[0]),
         'seq_len': int(seq_len),
     }, indent=0)
-    try:
-        tok.save(tk_path)
-    except Exception as _e:
-        print(f'[data] NOTE: could not persist the test tokenizer ({type(_e).__name__}: {_e}) — a rebuild will re-fit it deterministically')
     print('[data] cached TEST token ids to disk (held-out split; final evaluation only)')
     return (test_batch, vocab, tok, test_bnd)
 
@@ -13963,7 +14092,14 @@ def _active_amp(device=None):
         device = DEVICE
     if getattr(device, 'type', str(device)) != 'cuda':
         return None
-    return _amp_requested()
+    _amp = _amp_requested()
+    # v11.128: bf16 is requested unconditionally on CUDA, but pre-Ampere
+    # GPUs (V100/T4) cannot run it.  Failing here with a clear message beats
+    # training under a silently different numerical path and then having the
+    # frozen confirmation binding reject or mis-certify every record.
+    if _amp == 'bf16' and not torch.cuda.is_bf16_supported():
+        raise RuntimeError('this GPU does not support bf16 (pre-Ampere); set CSA_AMP=fp16 to train under the fp16 autocast path, or move the frozen run to an Ampere-or-newer GPU — do not run the frozen confirmation in fp32/bf16-mismatch mode')
+    return _amp
 
 
 def _normalise_amp_mode(v):

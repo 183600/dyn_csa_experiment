@@ -63,6 +63,9 @@ par_jobs/
 run_time_state.json
 .ipynb_checkpoints/run_time_state-checkpoint.json
 run_time_state*.json.lock
+# M0 engine-mode state file: a live run rewrites it, and `git add -A` must not
+# commit it (a new HEAD invalidates the G0 certificate).
+*.json.k
 
 # 临时 / 日志
 *.log

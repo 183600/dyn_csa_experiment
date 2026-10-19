@@ -217,6 +217,59 @@ def t_training_health_classifier():
     assert h['status'] == 'insufficient_data', h
 
 
+def t_training_health_noise_aware_threshold():
+    # Four equally spaced eval points with realistic CE jitter: the tail slope
+    # is +3.2e-5, five times the old fixed 1e-5 tolerance, yet it is entirely
+    # within the slope's own noise (2*SE ~ 3.4e-5).  The fixed threshold called
+    # this "overfitting"; the adaptive threshold must call it healthy.
+    hist = [{'step': 0, 'train_ce': 5.0, 'val_ce': 4.00, 'val_ppl': 54.6},
+            {'step': 250, 'train_ce': 4.5, 'val_ce': 4.02, 'val_ppl': 55.7},
+            {'step': 500, 'train_ce': 4.0, 'val_ce': 4.01, 'val_ppl': 55.1},
+            {'step': 750, 'train_ce': 3.5, 'val_ce': 4.03, 'val_ppl': 56.3}]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'healthy', h
+    assert h['slope_tol_mode'] == 'adaptive_2se', h
+    assert h['val_ce_slope_se'] is not None and h['val_slope_tol'] > 1e-5, h
+    assert h['val_ce_slope_per_step'] > 1e-5, h
+    # The historical fixed threshold is still available explicitly and still
+    # calls the same noise "overfitting" (proving the test is discriminating).
+    h_fixed = L.classify_training_health(hist, slope_tol=1e-5)
+    assert h_fixed['status'] == 'overfitting', h_fixed
+    assert h_fixed['slope_tol_mode'] == 'fixed', h_fixed
+    # A genuine rising trend must still be caught even under the adaptive rule.
+    hist_bad = [dict(hh, val_ce=4.0 + 0.01 * i, val_ppl=55.0 + 0.5 * i)
+                for i, hh in enumerate(hist)]
+    assert L.classify_training_health(hist_bad)['status'] == 'overfitting'
+
+
+def t_rope_arms_are_not_batched():
+    # The review found the implementation binding certified eager_batch=True
+    # for the rope csa arms while `HybridAttentionRoPE.forward` unconditionally
+    # took the per-row `_single_rope` loop.  The predicate now recognises rope
+    # layers, so a CUDA-capable device still yields False for all four frozen
+    # arms; a non-rope csa config remains eligible (the check is not a blanket
+    # False).
+    class _Cuda:
+        type = 'cuda'
+    for arm in ('csa_fixed_rope', 'full_rope', 'csa_fixed_rope_randidx',
+                'csa_fixed_rope_allblocks'):
+        cfgs = L.make_layer_cfgs(6, arm)
+        assert L._uses_batched_eager(cfgs, device=_Cuda(), batch_size=12) is False, arm
+    assert L._uses_batched_eager(L.make_layer_cfgs(6, 'csa_fixed'), device=_Cuda(), batch_size=12) is True
+    assert L._uses_batched_eager(L.make_layer_cfgs(6, 'csa_fixed_rope'), device=_Cuda(), batch_size=1) is False
+
+
+def t_manifest_v3_admission_can_succeed():
+    # The zero-GPU plan check is the end-to-end guard for the "obvious fix"
+    # trap: align the stamp, then admit 0/48 because P5T records lack
+    # train_knobs.  Exercise it on the shipped manifest.
+    rep = V12.plan_check(os.path.join(REPO, 'confirmation_frozen.json'))
+    assert rep['ok'] and rep['admitted'] == rep['n_arms'] * rep['n_seeds'], rep
+    assert all(c['pairs_planned'] == rep['n_seeds'] for c in rep['comparisons'].values()), rep
+    assert rep['predicted']['full_rope']['eager_batch'] is False, rep
+    assert rep['predicted']['csa_fixed_rope']['amp_dtype'] == 'bf16', rep
+
+
 def t_v7_rope_gather_rotation_order():
     # The per-chunk RoPE refactor rotates the gathered window rows.  The
     # gathered tensor is [queries, lanes, heads, head_dim], so the position
@@ -1291,24 +1344,38 @@ def t_segment_uniform_stride_only_when_all_cuts():
 def t_shipped_manifest_consistency():
     with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
         v2 = json.load(f)
-    assert v2['manifest_version'] == 2
+    assert v2['manifest_version'] == 3
     n = len(v2['seeds'])
     m = len(v2['primary_comparisons'])
     assert n == 12 and v2['seeds'] == list(range(12))
     assert v2['statistics']['n_seeds'] == n
+    assert v2['code_semantics_expected'] == L.CODE_SEMANTICS
+    assert v2.get('eager_batch_expected') is False, 'v3 must bind the real per-row RoPE dispatch'
+    assert v2.get('amp_dtype_expected') == 'bf16' and v2.get('amp_grad_scaler_expected') is False
     assert abs(v2['statistics']['p_floor'] - L.signflip_p_floor(n)) < 1e-15
     assert abs(v2['statistics']['min_attainable_p_holm'] - L.holm_min_attainable_p(n, m)) < 1e-12
     assert v2['statistics']['min_attainable_p_holm'] < 0.05
     assert v2['statistics']['min_consistency_for_first_gate'] == L.signflip_min_consistency(n, m)
+    # v3 declares a reachable confirmation floor (8 complete pairs) and it is
+    # mathematically able to reject under Holm/4.
+    assert v2['statistics']['min_seeds_for_confirmation'] == 8
+    assert L.holm_min_attainable_p(v2['statistics']['min_seeds_for_confirmation'], m) <= 0.05
     for k, want in v2['statistics']['power_first_holm_gate'].items():
         q = float(k.split('=')[1])
         got = L.signflip_power(n, m, q)
         assert abs(got - want) < 0.02, f'power table drift at {k}: manifest {want} vs code {got:.4f}'
     # the revision history must record the 6->12 change and its precondition
     hist = v2['revision']['history']
-    assert any(h.get('version') == 1 for h in hist) and any(h.get('version') == 2 for h in hist)
+    assert any(h.get('version') == 1 for h in hist) and any(h.get('version') == 2 for h in hist) and any(h.get('version') == 3 for h in hist)
+    # v3 pins the per-arm parameter-matching knob
+    per = v2.get('binding', {}).get('per_arm_recipe_signature') or {}
+    assert set(per) == set(v2['arms']), per
+    assert abs(float(per['full_rope']['mr']) - 6.76348876953125) < 1e-9, per
+    assert all(abs(float(per[a]['mr']) - 4.0) < 1e-12 for a in v2['arms'] if a != 'full_rope'), per
     # scope block present (issue 4)
     assert v2.get('scope', {}).get('not_covered'), 'scope.not_covered must name the dynamic/HCA claims that are out of scope'
+    # the compute-budget caveat must be explicit, not buried in prose
+    assert v2.get('compute_budget_disclosure', {}).get('flops'), 'v3 must disclose the dense-arm MLP/FLOPs mismatch'
 
 
 def t_frozen_seeds():
@@ -2976,6 +3043,9 @@ def main():
     _check('A4c safe exp + token-pooled document CI', t_safe_exp_and_doc_ci)
     _check('A4d deterministic document bootstrap CI', t_bootstrap_mean_ci)
     _check('A4e training-health classifier: measured vs unmonitored vs nonfinite', t_training_health_classifier)
+    _check('A4f training-health threshold is slope-noise aware (2*SE)', t_training_health_noise_aware_threshold)
+    _check('A4g rope arms never claim the batched eager twin', t_rope_arms_are_not_batched)
+    _check('A4h shipped manifest v3 admits 48/48 synthetic records end-to-end', t_manifest_v3_admission_can_succeed)
     _check('B1 legacy modes bit-exact', t_legacy_modes_bitexact)
     _check('B2 determinism + target-zone safety', t_corruption_deterministic_and_paired)
     _check('B3 new modes span/doc/topical', t_new_modes_do_something)
