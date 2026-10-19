@@ -38,8 +38,8 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
 M2_CAP_HOURS 覆盖），状态文件 run_time_state_m0.json /
 run_time_state_m2.json（内核模式 .k 后缀，两面板互不混账）；超限单元
 拒绝启动、中途到达上限则硬截断且不留半条测量。`full` 启动前先用
-`require_g0` 校验 `results_m0_g0/g0_certificate.json`（内核数值、吞吐与
-训练级 TOST 三层都由 `kernel` 子命令写出并绑定代码/内核戳/git 树）；
+`require_g0` 校验 `results_m0_g0/g0_certificate.json`（内核数值、训练级
+TOST 等检查都由 `kernel` 子命令写出并绑定代码/内核戳/git 树）；
 没有有效证书时拒绝启动，只能用 CSA_ALLOW_UNVERIFIED_EAGER=1 做显式调试。
 `full` 还会在真实面板几何上做短校准，把各臂的实测 s/step 记入 TimeGuard；
 未校准的解析外推在 S1 尺度上会高估到使全部单元被 cap 跳过的程度。
@@ -453,7 +453,7 @@ def run_kernel():
 
 
 def _calibrate_panel(run_cfg, guard, panel):
-    """Measure the real per-step cost at the panel geometry before planning.
+    """Measure the per-step rate at the panel geometry before planning.
 
     TimeGuard's uncalibrated default is a base-geometry rate extrapolated with
     an analytic factor; on the S1/S2 ladder that extrapolation is many orders
@@ -717,10 +717,8 @@ def run_full():
         print(f"[m0] unknown M0_PANEL {panel!r}; expected 'S1' or 'S2'.  Nothing was started.")
         raise SystemExit(2)
     run_cfg, cap, cap_env = (L.RUN_S1, L.M0_CAP, 'M0_CAP_HOURS') if panel == 'S1' else (L.RUN_S2, L.M2_CAP, 'M2_CAP_HOURS')
-    # The compute plan makes G0 a hard precondition for the scale panels.  The
-    # helper existed but was never called, so a typo/missing cert silently ran
-    # the eager path the plan says is infeasible at this scale.  Check before
-    # the (non-trivial) pre-flight so a missing certificate costs seconds.
+    # The compute plan makes G0 a hard precondition for the scale panels, so
+    # check it before the pre-flight work starts.
     L.require_g0(f'M0/{panel} 主面板')
     _full_ratios = {}
     for _v in run_cfg['variants']:

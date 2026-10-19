@@ -1183,7 +1183,7 @@ def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
 
     prefill = 整段前向一次的墙钟；所谓 decode 当前每次从 token 0 重跑完整
     前缀，因此它是 prefix-prefill 均摊，不是有 KV cache 的增量 decode。
-    实现在 exp_lib.measure_efficiency（p50/p95、tokens/s、allocator 峰值）。"""
+    实现在 exp_lib.measure_efficiency（p50/p95、tokens/s 等读数）。"""
     try:
         L = _import_exp_lib()
         return L.measure_efficiency(model, ids, device, warmup=warmup, iters=iters)

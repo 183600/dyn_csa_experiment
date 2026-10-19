@@ -815,12 +815,10 @@ def _segment(n, want_cut_list, min_block, max_block):
     ends[:-1] = sa[1:]
     ends[-1] = n
     counts_np = ends - sa
-    # Small tables keep the historic Python-list contract (and the LRU cache
-    # above stores exactly that form).  At scale the counts row can hold
-    # thousands of blocks per layer/step; the numpy row carries the identical
-    # integers and every consumer either calls len/max/np.asarray on it or
-    # hands it to the host-geometry builders, so materialising a Python int
-    # per block is pure overhead.
+    # Small tables keep the Python-list contract (and the LRU cache above
+    # stores exactly that form).  Larger rows stay as numpy arrays carrying the
+    # identical integers; every consumer either calls len/max/np.asarray on
+    # them or hands them to the host-geometry builders.
     counts = counts_np.tolist() if n <= 64 else counts_np
     honoured = {}
     if ns:
@@ -1228,7 +1226,7 @@ def _device_blocks_from_cuts(T, cuts, min_block, max_block, device, want_honoure
         _mx = int(cnt.max()) if nb else 0
         # numpy rows carry the same immutable-by-convention counts integers;
         # every consumer (len/max/min/sum/np.asarray/accumulate) reads them
-        # identically to the previous Python lists.
+        # identically whether the row is a list or an array.
         row._pool_cpu = (cnt, _mx, int(cnt[:-1].max()) if nb > 1 else 0)
         row._pool_nblocks = nb
         out.append((row, nb, None if hon_stack is None else hon_stack[b]))
@@ -1579,10 +1577,8 @@ def _cache_put(cache, key, tensor, limit, total_of):
     total = st['total']
     if total > limit:
         # One oldest-first pass.  Pinned entries are skipped but never force a
-        # rescan of the keys already visited (the previous `next(...)` form
-        # restarted at the oldest entry after every eviction, which was
-        # quadratic when pinned keys sat at the front).  The eviction order
-        # and the stopping condition are unchanged.
+        # rescan of the keys already visited.  The eviction order and the
+        # stopping condition are unchanged.
         for _k in list(cache.keys()):
             if total <= limit:
                 break
@@ -1685,7 +1681,7 @@ _DENSE_MASK_ROW_CAP_BYTES = 64 << 20
 
 
 def _dense_mask_fits(T, elem_bytes=1):
-    """True when a full [T, T] mask of `elem_bytes` fits the byte budget."""
+    """True when a full [T, T] mask of `elem_bytes` fits the byte ceiling."""
     try:
         return int(T) * int(T) * max(1, int(elem_bytes)) <= int(_DENSE_MASK_ROW_CAP_BYTES)
     except Exception:
@@ -2505,9 +2501,8 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         _geom = getattr(block_ids, '_pool_geom', None)
         _geom = None if _geom is None else _geom.get(_gkey)
     elif ov_len.numel():
-        # Only the two maxima are consumed below; folding them into one
-        # stacked read keeps a single device->host sync (the discarded minima
-        # were computed but never read).
+        # Only the two maxima are consumed below; fold them into one stacked
+        # read and discard the minima.
         max_len, _ov_hi = (int(v) for v in torch.stack([counts.max(), ov_len.max()]).tolist())
         _geom = None
     else:
@@ -2763,8 +2758,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
         return torch.empty(n, 0, device=scores.device, dtype=torch.int32)
     k = min(k_req, B)
     # Boolean finite-and-causal table.  `torch.isfinite` already returns a
-    # fresh tensor, so the conjunction runs in place: same booleans, one
-    # fewer full [n, B] allocation (and `causal` is read-only here).
+    # fresh tensor, so the conjunction runs in place; `causal` is read-only.
     cf = torch.isfinite(scores)
     cf.logical_and_(causal)
     # torch.where picks bit-identical values (scores or the -inf constant) —
@@ -3210,8 +3204,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _dedup = (not topk_distinct) and _nb > 1
     if _attn_full_width_ok(n, _nb, w, _dedup):
         # Build the [selected | window] table in place: the block half is
-        # written straight into its slice (the separate sel table + cat copy
-        # the old form materialised is the same boolean table, lane for lane).
+        # written straight into its slice, with no separate sel table and cat
+        # copy needed; the result is the same boolean table, lane for lane.
         valid_all = win_valid_all.new_empty((n, _nb + int(w)))
         valid_all[:, :_nb] = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
         keep_all = sel_valid
@@ -3339,8 +3333,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         else:
             # Write the two independent logits halves into one preallocated
             # [q, h, nb + w] table instead of materialising both halves and a
-            # concatenated copy (the old peak held 2x the final logits).  The
-            # slice assignment feeds the same einsum values to the same lanes.
+            # concatenated copy.  The slice assignment feeds the same einsum
+            # values to the same lanes.
             _w0 = int(_win_local.shape[1])
             logits = qseg.new_empty((qseg.shape[0], qseg.shape[1], _nb + _w0))
             logits[:, :, :_nb] = _einsum('qhd,qmhd->qhm', qseg, kb)
@@ -4718,7 +4712,7 @@ def _memmap_backed(v):
 
 
 def _memo_value_bytes(v):
-    """Rough resident bytes of a memo value; memory-mapped arrays are free."""
+    """Rough resident size of a memo value; mapped arrays are not charged."""
     if isinstance(v, np.ndarray):
         if _memmap_backed(v):
             return 0
@@ -5516,9 +5510,8 @@ class _DocDeduplicator:
         if fp is None:
             fp = _doc_exact_fp(text)
         # The content hash is a 128-bit value; storing it as a Python int
-        # keeps exactly the same identity while using ~36 bytes/document
-        # instead of the ~81-byte hex string.  At corpus scale (millions of
-        # documents) this is the dominant resident cost of the filter.
+        # keeps exactly the same identity as the hex string while representing
+        # each document with one integer.
         fp_key = int(fp, 16) if isinstance(fp, (str, bytes)) else int(fp)
         if fp_key in self.exact:
             self.n_exact_skipped += 1
@@ -6776,8 +6769,8 @@ def kv_cache_elements_per_token(m):
     Full attention keeps K and V of width n_heads*d_head; CSA/HCA keep the
     compressed [c_kv | c_kv] lanes (plus the indexer's query projection is
     weights, not cache).  This is the structural quantity behind any
-    "KV-cache ratio" claim; memory bytes additionally need dtype/allocator
-    overhead and are measured by the efficiency harness, not inferred here.
+    "KV-cache ratio" claim; storage bytes additionally need dtype/allocator
+    overhead and are measured by the harness, not inferred here.
     """
     total = 0
     per_layer = []
@@ -7268,9 +7261,9 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     Units must be the independent sampling unit.  For LM evaluation a document
     row is the unit (tokens within a document are correlated), and this helper
     is used to report **document-sampling** uncertainty, not seed-level
-    training uncertainty.  Resampling is chunked so a large document panel
-    costs O(n_boot) memory rather than O(n_boot * n_units).  The RNG is seeded,
-    so repeated report builds return the same interval.
+    training uncertainty.  Resampling is chunked, so the working set does not
+    grow with n_boot.  The RNG is seeded, so repeated report builds return the
+    same interval.
     """
     v = np.asarray([float(x) for x in values
                     if isinstance(x, (int, float)) and not isinstance(x, bool)
@@ -7304,9 +7297,10 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)
     if d.size < 2:
         return None
-    # Chunked draws keep memory at O(chunk * n) instead of O(n_boot * n): the
-    # seed-completion path can grow a panel to hundreds/thousands of seeds and
-    # paired_effect_stats calls this for every displayed contrast.
+    # Draws are generated in chunks, so the panel size does not require a
+    # correspondingly large index table: the seed-completion path can grow a
+    # panel to hundreds/thousands of seeds and paired_effect_stats calls this
+    # for every displayed contrast.
     rng = np.random.default_rng(int(seed))
     nb = int(n_boot)
     means = np.empty(max(0, nb), dtype=float)
@@ -10838,7 +10832,7 @@ def _gpu_names():
 
 def _gpu_identity():
     """Per-visible-GPU identity used to explain (not eliminate) cross-machine
-    drift: name, UUID, total memory and compute capability.  Never raises."""
+    drift: name, UUID, device capacity and compute capability.  Never raises."""
     out = []
     if not torch.cuda.is_available():
         return out
@@ -11293,8 +11287,7 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
 def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, return_stats=False,
              collect_block_stats=False, val_bnd=None, bnd_tol=1):
     # `collect_block_stats=True` enables the compression-report hooks for this
-    # same forward pass, so callers do not have to run the validation trunk a
-    # second time just to collect block-length/boundary diagnostics.
+    # same forward pass, so block-length/boundary diagnostics come from it too.
     # A chunk is a set of independent sequences (no cross-row op in the
     # model), so capping it by token count does not change any per-row value.
     _span = max(1, int(val_batch.shape[1]) - 1)
@@ -11507,7 +11500,7 @@ class _BlockStats:
         self.hi = None
         self.at_min = 0
         self.at_max = 0
-        # GPU counts are queued and folded once at report time.
+        # GPU counts are queued until a snapshot is requested.
         self._pending = []
 
     def snapshot(self):
@@ -12595,8 +12588,7 @@ def _atomic_torch_save(obj, path, hash_out=None):
 
 def _checkpoint_payload(model, *, variant, seed, step, val_ppl, train_ce, health, extra=None):
     # Keep the tensors where they live; torch.save streams each storage to the
-    # file, so a second full CPU copy of the model is not needed.
-    # Loaders already use map_location='cpu' (error_analysis / v7_supp).
+    # file.  Loaders already use map_location='cpu' (error_analysis / v7_supp).
     sd = {k: v.detach() for k, v in model.state_dict().items()}
     payload = {'format': 'csa-analysis-ckpt-v1', 'variant': variant, 'seed': int(seed),
                'step': int(step), 'val_ppl': val_ppl, 'train_ce_fixed': train_ce,
@@ -12716,7 +12708,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if variant in PARAM_MATCHED | PARAM_MATCHED_V7 and float(mlp_ratio) == 4.0:
         raise ValueError(f'{variant} is a PARAM-MATCHED baseline but was given the default mlp_ratio=4; its MLP must be widened to match its sparse reference arm, or the comparison is not parameter-controlled. Pass mlp_ratio=variant_mlp_ratio(variant, vocab, d=..., n_layers=..., n_heads=..., d_head=..., seq_len=...).')
     cfgs = make_layer_cfgs(n_layers, variant)
-    # Validate an explicitly requested eager mode against this runtime before
+    # Validate an explicitly requested eager mode against this environment before
     # claiming it in the record; the concrete per-variant choice is still
     # `_uses_batched_eager` (a variant with no CSA/HCA layer never takes the
     # batched twin even when the backend is available).
@@ -13153,8 +13145,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         _eval_stats = eval_ppl(_inner_model, val_batch, device, return_stats=True,
                                collect_block_stats=True, val_bnd=val_bnd)
         ppl = float(_eval_stats['ppl'])
-        # Reuse the statistics collected during the PPL forward instead of
-        # running the whole validation trunk a second time.
+        # Reuse the statistics collected during the PPL forward.
         stats = _eval_stats.get('compression')
         if stats is None:
             stats = compression_report(_inner_model, val_batch, device, val_bnd=val_bnd)

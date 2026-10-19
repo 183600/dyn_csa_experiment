@@ -1003,8 +1003,8 @@ def _warn_shape_fallback(op, detail):
 
 
 def _indexer_impl_for_shape(impl, kI):
-    # The scoring kernel already loops over block columns at runtime, and the
-    # runner-up path below streams the top-k over block chunks.  Long-context
+    # The scoring kernel already loops over block columns during the call, and
+    # the runner-up path below streams the top-k over block chunks.  Long-context
     # shapes (Bm can be tens of thousands) therefore stay on the Triton
     # scorer instead of silently degrading to the torch reference twin.
     return impl

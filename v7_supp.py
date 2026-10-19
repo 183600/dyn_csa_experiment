@@ -2442,8 +2442,8 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         cfgs = L.make_layer_cfgs(6, v)
         train_ids = L.load_wikitext(train_len, 8000000)[0]
         # Training-health diagnostics only: a fixed validation slice is scored
-        # on the eval grid so P5C can refuse to spend the one-shot test access
-        # on a run that is overfitting/stalled/non-finite.  It never selects a
+        # on the eval grid so P5C can refuse the one-shot test access on a run
+        # that is overfitting/stalled/non-finite.  It never selects a
         # checkpoint or changes the frozen arms/seeds/endpoint.
         _diag_eval_every = int(payload.get('diag_eval_every', 0) or 0)
         _diag_val = None

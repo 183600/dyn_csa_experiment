@@ -328,8 +328,7 @@ def t_signflip_saddlepoint_large_n():
         assert a['method'].startswith('saddlepoint'), a
         assert a['p'] == b['p'], 'saddlepoint fallback must be deterministic'
         # Fixed-seed Monte-Carlo reference (200k draws) — the saddlepoint tail
-        # must be close, while the old centered-SD normal was off by orders of
-        # magnitude for the larger shifts.
+        # must agree within tolerance for the larger shifts.
         draws = 200000
         obs = abs(d.mean())
         signs = rng.choice([-1.0, 1.0], size=(draws, n))
@@ -400,8 +399,8 @@ def t_wilcoxon_exact_dp():
                 continue
             assert got['method'] == 'exact-dp', got
             assert abs(got['p'] - brute_wilcoxon(d)) < 1e-12, (n, variant, got, brute_wilcoxon(d))
-    # The old implementation went normal at n=17; the DP stays exact well
-    # beyond the seed counts the scale ladder may top up to.
+    # The DP stays exact well beyond the seed counts the scale ladder may top
+    # up to.
     d = rng.normal(0.2, 1.0, size=100)
     a = L.wilcoxon_signed_rank_p(d)
     b = L.wilcoxon_signed_rank_p(d)

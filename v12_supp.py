@@ -104,8 +104,8 @@ def make_guard():
 # 否则清单扩种子后没有任何驱动会训练主臂新种子。
 P5C_CFG = dict(V10.P3MT_PAYLOAD, seeds=[0, 1, 2, 3, 4, 5], variants=['csa_fixed_rope', 'full_rope'] + list(V10.SCRATCH_CONTROLS),
                # Diagnostic-only validation monitoring: never used for model
-               # selection, but P5T refuses to spend the one-shot test access
-               # when a frozen arm trained through a non-finite/overfit tail.
+               # selection, but P5T refuses the one-shot test access when a
+               # frozen arm trained through a non-finite/overfit tail.
                diag_eval_every=250)
 P5MP_CFG = dict(V10.PROBE, seeds=[0, 1, 2, 3, 4, 5], variants=['csa_fixed_rope', 'full_rope'] + V10.SCRATCH_CONTROLS, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS})
 P5S2_CFG = dict(V10.P3SL_TOK_CFG, seeds=[0, 1])
@@ -119,7 +119,7 @@ def run_training_health(cfg=None):
 
     Reads the diagnostic curves stored in each checkpoint by P5C/P3MT.  The
     run is never allowed to change arms/seeds/endpoints; it only decides
-    whether the one-shot test access is spent or the run is stopped for
+    whether the one-shot test access is used or the run is stopped for
     investigation.
     """
     cfg = dict(cfg or {})
@@ -169,7 +169,7 @@ def run_training_health(cfg=None):
     print(f'[p5h] training health: {report["status"]} ({len(unhealthy)} unhealthy, {len(missing)} missing) -> {out}')
     allow = os.environ.get('V12_ALLOW_UNHEALTHY', '').strip().lower() in ('1', 'true', 'yes', 'on')
     if report['status'] != 'pass' and not allow:
-        raise SystemExit(f'[p5h] REFUSE: frozen-arm training health is not clean ({len(unhealthy)} unhealthy, {len(missing)} missing); investigate before spending the one-shot test access (V12_ALLOW_UNHEALTHY=1 is the explicit override)')
+        raise SystemExit(f'[p5h] REFUSE: frozen-arm training health is not clean ({len(unhealthy)} unhealthy, {len(missing)} missing); investigate before using the one-shot test access (V12_ALLOW_UNHEALTHY=1 is the explicit override)')
     if report['status'] != 'pass':
         print('[p5h] WARNING: V12_ALLOW_UNHEALTHY=1 — continuing despite unhealthy/missing training health')
     return report
@@ -291,7 +291,7 @@ _FILE_SHA_CACHE = {}
 
 
 def _file_sig(path):
-    """Cheap change detector for a checkpoint: (size, mtime_ns, ctime_ns, inode)."""
+    """Metadata fingerprint for a checkpoint: (size, mtime_ns, ctime_ns, inode)."""
     st = os.stat(path)
     return (int(getattr(st, 'st_size', 0)),
             int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9))),
@@ -300,7 +300,7 @@ def _file_sig(path):
 
 
 def _file_sha256(path, chunk=1 << 20):
-    # Bind the digest to the full cheap identity (size, mtime, ctime, inode),
+    # Bind the digest to the full metadata identity (size, mtime, ctime, inode),
     # so an unchanged file is not re-read while any rewrite — even one that
     # preserves size and mtime — still forces a fresh hash.
     try:
@@ -582,7 +582,7 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
         if allow:
             print(f'[p5t] WARNING: {msg}; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
             return None
-        return msg + ' — refusing to spend the one-shot test access (set V12_ALLOW_UNHEALTHY=1 only with a written justification)'
+        return msg + ' — refusing to use the one-shot test access (set V12_ALLOW_UNHEALTHY=1 only with a written justification)'
     status = str(health.get('status') or 'unknown')
     if status == 'healthy':
         return None
@@ -593,7 +593,7 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
     if allow:
         print(f'[p5t] WARNING: {msg}; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
         return None
-    return msg + ' — refusing to spend the one-shot test access'
+    return msg + ' — refusing to use the one-shot test access'
 
 
 @torch.inference_mode()
@@ -707,8 +707,8 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
     def _stale(rec):
         if not isinstance(rec, dict):
             return True
-        # All cheap identity checks first: a stale record must not pay for a
-        # full-file SHA-256 when it is going to be re-evaluated anyway.
+        # All metadata identity checks first: a stale record must not require
+        # a full-file SHA-256 when it is going to be re-evaluated anyway.
         if rec.get('_code') != V.CKPT_CODE or rec.get('recipe') != _ck_recipe:
             return True
         if rec.get('data_fp') != _dfp:
@@ -722,7 +722,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
         bl = rec.get('by_len') or {}
         if not all((L.by_len_cells([rec], Ln) for Ln in eval_lens)):
             return True
-        # The record must belong to the SAME weights now on disk.  A cheap
+        # The record must belong to the SAME weights now on disk.  A metadata
         # (size, mtime_ns, ctime_ns, inode) signature recorded at write time
         # settles the unchanged case without reading the checkpoint; only a
         # missing/different signature needs the content hash.
@@ -731,8 +731,8 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test'):
         _sha = _ensure_ck_sha()
         if _sha is not None:
             return rec.get('ckpt_sha256') != _sha
-        # Neither the cheap signature nor a content hash is available, so the
-        # record cannot be shown to belong to the weights on disk now.  Fail
+        # Neither the metadata signature nor a content hash is available, so
+        # the record cannot be shown to belong to the weights on disk now.  Fail
         # closed (re-evaluate) rather than resuming on an unverified file.
         return True
     if not _stale(_cur):
