@@ -2841,21 +2841,18 @@ def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128,
             'valid': valid, 'window_start': win_start_t, **geo}
 
 
-def _prefix_overlap_terms(geo, Xb, Zb, B_pos_b, overlap, shift, use_overlap):
-    """Previous-block overlap lanes for every prefix summary.
+def _prefix_overlap_values(geo, Xb, Zb, B_pos_b, overlap):
+    """Raw previous-block overlap lanes for every prefix summary.
 
-    The overlap convention is exactly the closed block pooling's: block b>0
-    carries the last `overlap` tokens of block b-1, whose position bias index
-    is `u - start_{b-1}`.  These tokens are all < s_b <= t, hence causal.
-    The lanes are constant across the prefixes of one block, so they can be
-    folded once into the per-block initial numerator/denominator.
+    Returns ``(x_ov, z_ov, mask, u)`` or ``None`` when there is no overlap.
+    Keeping the raw logits separate lets the caller choose one numerical
+    shift for both the A lanes and these lanes before exponentiating.
     """
     B = int(geo['n_blocks'])
     dev = geo['starts'].device
     Fd = int(Zb.shape[1]) if Zb is not None else (int(Xb.shape[1]) if Xb is not None else 0)
-    if (not use_overlap) or int(overlap) <= 0 or B <= 1 or Xb is None or Zb is None:
-        z = geo['starts'].new_zeros((B, Fd), dtype=torch.float32)
-        return z, z.clone(), torch.zeros((B, 0), dtype=torch.long, device=dev)
+    if int(overlap) <= 0 or B <= 1 or Xb is None or Zb is None:
+        return None
     starts, ends = geo['starts'], geo['ends']
     prev_start = starts[:-1]
     prev_end = ends[:-1]
@@ -2867,8 +2864,7 @@ def _prefix_overlap_terms(geo, Xb, Zb, B_pos_b, overlap, shift, use_overlap):
     prev_start_full = torch.cat([starts[:1], prev_start], 0)
     Wb = int(ov_len.max().item()) if B else 0
     if Wb <= 0:
-        z = geo['starts'].new_zeros((B, Fd), dtype=torch.float32)
-        return z, z.clone(), torch.zeros((B, 0), dtype=torch.long, device=dev)
+        return None
     j = _arange_cache(Wb, dev)[None, :]
     mask = j < ov_len[:, None]
     u = (ov_start[:, None] + j).clamp(max=int(geo['n']) - 1)
@@ -2876,12 +2872,42 @@ def _prefix_overlap_terms(geo, Xb, Zb, B_pos_b, overlap, shift, use_overlap):
         min=0, max=int(B_pos_b.shape[0]) - 1)
     z_ov = Zb[u] + B_pos_b[b_off]
     x_ov = Xb[u]
-    # `shift` is the causal per-block offset (the first A-lane logit).  It
-    # cancels in the normalized mixture and only improves the exponent range.
-    e = torch.exp(z_ov.float() - shift[:, None, :])
+    return x_ov, z_ov, mask, u
+
+
+def _prefix_overlap_terms(geo, Xb, Zb, B_pos_b, overlap, shift, use_overlap,
+                          values=None):
+    """Previous-block overlap lanes for every prefix summary.
+
+    The overlap convention is exactly the closed block pooling's: block b>0
+    carries the last `overlap` tokens of block b-1, whose position bias index
+    is `u - start_{b-1}`.  These tokens are all < s_b <= t, hence causal.
+    The lanes are constant across the prefixes of one block, so they can be
+    folded once into the per-block initial numerator/denominator.
+
+    `shift` is a single per-block offset chosen to keep every exponent in
+    range.  It cancels in the normalized mixture, so it changes no value.
+    """
+    B = int(geo['n_blocks'])
+    dev = geo['starts'].device
+    Fd = int(Zb.shape[1]) if Zb is not None else (int(Xb.shape[1]) if Xb is not None else 0)
+    if (not use_overlap) or int(overlap) <= 0 or B <= 1 or Xb is None or Zb is None:
+        z = geo['starts'].new_zeros((B, Fd), dtype=torch.float32)
+        return z, z.clone(), torch.zeros((B, 0), dtype=torch.long, device=dev)
+    if values is None:
+        values = _prefix_overlap_values(geo, Xb, Zb, B_pos_b, overlap)
+    if values is None:
+        z = geo['starts'].new_zeros((B, Fd), dtype=torch.float32)
+        return z, z.clone(), torch.zeros((B, 0), dtype=torch.long, device=dev)
+    x_ov, z_ov, mask, u = values
+    _dt = shift.dtype if shift.is_floating_point() else torch.float32
+    # Mask before exp: a padded lane is clamped to a real token id, but its
+    # logit may be far above the shift.  exp() must never see it.
+    _z_eff = z_ov.to(_dt).masked_fill(~mask[:, :, None], float('-inf'))
+    e = torch.exp(_z_eff - shift[:, None, :])
     e = e * mask[:, :, None].to(e.dtype)
     den = e.sum(1)
-    num = (e * x_ov.float()).sum(1)
+    num = (e * x_ov.to(_dt)).sum(1)
     return den, num, u
 
 
@@ -2908,42 +2934,79 @@ def causal_prefix_pool(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
     cap = int(B_pos_a.shape[0])
     offset = geo['offset'].clamp(max=cap - 1)
     z_a = Za + B_pos_a[offset]
-    # A causal per-block shift: the first A-lane logit.  It is known at the
-    # block start and cancels exactly in the normalized summary.
-    shift = z_a[geo['starts']].detach().float()
-    e = torch.exp(z_a.float() - shift[geo['block_of_token']])
-    cum_e = torch.cumsum(e, dim=0)
-    cum_x = torch.cumsum(e * Xa.float(), dim=0)
-    # Base = cumulative sum strictly before the prefix start.  For a prefix
-    # that starts at token 0 the base is zero.  The end is the prefix's own
-    # last token (t for full_prefix, immediately before W_t for
-    # outside_window), never the sequence tail.
-    base_idx = (pg['u_start'] - 1).clamp_min(0)
-    end_idx = (pg['u_start'] + pg['plen'] - 1).clamp(0, T - 1)
-    base_e = cum_e.index_select(0, base_idx)
-    base_x = cum_x.index_select(0, base_idx)
-    end_e = cum_e.index_select(0, end_idx)
-    end_x = cum_x.index_select(0, end_idx)
-    has_base = (pg['u_start'] > 0).to(e.dtype)
-    if use_overlap and Zb is not None and Xb is not None:
-        ov_den, ov_num, _ = _prefix_overlap_terms(
-            geo, Xb, Zb, B_pos_b, overlap, shift, True)
-        # outside_window excludes the overlap lanes: they may lie inside the
-        # local window, and the auxiliary scope is defined on U_t only.
-        if str(scope) == 'outside_window':
-            ov_den = torch.zeros_like(ov_den)
-            ov_num = torch.zeros_like(ov_num)
-        ov_den_t = ov_den[geo['block_of_token']]
-        ov_num_t = ov_num[geo['block_of_token']]
+    # Overlap lanes are constant for every prefix inside a block, so build
+    # their raw values once.  outside_window excludes them by definition.
+    _ov_vals = None
+    _want_ov = (use_overlap and str(scope) != 'outside_window'
+                and Zb is not None and Xb is not None)
+    if _want_ov:
+        _ov_vals = _prefix_overlap_values(geo, Xb, Zb, B_pos_b, overlap)
+
+    # Stable prefix aggregation with detached per-block shifts.  Each
+    # feature column is an independent scalar softmax, and a common shift
+    # cancels exactly in num/den: choosing the largest A-lane (and overlap)
+    # logit of the block keeps every exponent <= 0, so large logits cannot
+    # overflow.  The shift is detached, so gradients still flow through
+    # exp(z - shift); because it is only a scale factor, no future token can
+    # change the normalized summary.  The prefix sums are segmented by block
+    # id (reset at the block start) rather than a global cumsum minus a base,
+    # which avoids catastrophic cancellation across blocks.
+    _acc = torch.float64
+    _bt = geo['block_of_token']
+    _z_a_acc = z_a.detach().to(_acc)
+    _block_shift = torch.full((int(geo['n_blocks']), Fd), float('-inf'),
+                              dtype=_acc, device=Xa.device)
+    with torch.no_grad():
+        _rows = _bt[:, None].expand(T, Fd)
+        _block_shift.scatter_reduce_(0, _rows, _z_a_acc,
+                                     reduce='amax', include_self=True)
+    if _want_ov and _ov_vals is not None:
+        _, _z_ov, _ov_mask, _ = _ov_vals
+        with torch.no_grad():
+            _z_eff = _z_ov.detach().to(_acc).masked_fill(
+                ~_ov_mask[:, :, None], float('-inf'))
+            _ov_max_b = _z_eff.amax(1)
+            _brows = _arange_cache(int(_ov_max_b.shape[0]), Xa.device)[:, None].expand(
+                int(_ov_max_b.shape[0]), Fd)
+            _block_shift.scatter_reduce_(0, _brows, _ov_max_b,
+                                         reduce='amax', include_self=True)
+    # Every real block has at least one token; -inf only comes from an
+    # oversized n_blocks argument.
+    _block_shift = torch.nan_to_num(_block_shift, neginf=0.0)
+    if _want_ov and _ov_vals is not None:
+        # Same per-block shift as the A lanes: the two aggregates add
+        # directly.  Padded lanes are masked before exp (see the helper).
+        _ov_den_b, _ov_num_b, _ = _prefix_overlap_terms(
+            geo, Xb, Zb, B_pos_b, overlap, _block_shift, True, values=_ov_vals)
     else:
-        ov_den_t = torch.zeros((T, Fd), device=Xa.device, dtype=torch.float32)
-        ov_num_t = torch.zeros((T, Fd), device=Xa.device, dtype=torch.float32)
-    den = end_e - base_e * has_base[:, None] + ov_den_t
-    num = end_x - base_x * has_base[:, None] + ov_num_t
+        _ov_den_b = _ov_num_b = None
+    _e = torch.exp(z_a.to(_acc) - _block_shift[_bt])
+    d = _e
+    n = _e * Xa.to(_acc)
+    _off = 1
+    while _off < T:
+        _same = (_bt[_off:] == _bt[:-_off])[:, None]
+        _d_new = d[_off:] + d[:-_off]
+        _n_new = n[_off:] + n[:-_off]
+        d = torch.cat([d[:_off], torch.where(_same, _d_new, d[_off:])], 0)
+        n = torch.cat([n[:_off], torch.where(_same, _n_new, n[_off:])], 0)
+        _off <<= 1
+
+    # Each scope ends at a different token (t for full_prefix, immediately
+    # before W_t for outside_window); read that row of the scanned prefix.
+    end_idx = (pg['u_start'] + pg['plen'] - 1).clamp(0, T - 1)
+    d_end = d.index_select(0, end_idx)
+    n_end = n.index_select(0, end_idx)
+    if _ov_den_b is not None:
+        # Overlap lanes are constant for every prefix inside the block and
+        # already use the same per-block shift, so they are a plain addition.
+        d_end = d_end + _ov_den_b[_bt]
+        n_end = n_end + _ov_num_b[_bt]
     # A prefix can be empty only in the outside_window scope; those rows are
     # invalid candidates and their value is never read by the attention path.
-    comp = torch.where((pg['plen'] > 0)[:, None], num / den.clamp_min(1e-30),
-                       torch.zeros((), dtype=num.dtype, device=num.device))
+    comp = torch.where((pg['plen'] > 0)[:, None],
+                       n_end / d_end.clamp_min(1e-300),
+                       torch.zeros((), dtype=n_end.dtype, device=n_end.device))
     return comp.to(Xa.dtype)
 
 
@@ -4639,7 +4702,22 @@ class HybridAttention(nn.Module):
                 _P = 1 if _prefix_kind == 'summary' else int(_prefix_geo['token_idx'].shape[1])
                 _tot = int(Bn) + int(_P)
                 topk_idx = _arange_cache(_tot, x.device)[None, :].expand(T, _tot).to(torch.int32)
-                _sel_valid = torch.ones((T, _tot), dtype=torch.bool, device=x.device)
+                # The closed half still follows the strict closed-block gate
+                # (`pos > last_tok`): HCA reads every *finished* block, not
+                # the still-open current block whose pooled K/V contains
+                # future tokens.  The prefix half obeys its own causal mask:
+                # summary rows with an empty represented prefix and singleton
+                # columns at j >= plen must never be read (the singleton
+                # table pads by clamping to the last token).  Marking these
+                # slots valid would let a HCA arm attend to future tokens, so
+                # use exactly the gate the CSA path applies.
+                _pos = _arange_cache(T, x.device)
+                _closed_valid = _pos[:, None] > last_tok[None, :]
+                if _prefix_kind == 'summary':
+                    _pref_valid = (_prefix_geo['plen'][:, None] > 0)
+                else:
+                    _pref_valid = _prefix_geo['valid']
+                _sel_valid = torch.cat([_closed_valid, _pref_valid], 1)
                 out, _prefix_mass = _gathered_attention_open_trainable(
                     q, k_blk, v_blk, topk_idx, _sel_valid, last_tok, k_sw, v_sw,
                     cfg.sliding_window, scale, prefix_geo=_prefix_geo,
