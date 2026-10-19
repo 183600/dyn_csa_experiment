@@ -3010,6 +3010,15 @@ def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
         or (pre_qI is not None and pre_qI.requires_grad)
         or (pre_w is not None and pre_w.requires_grad))
     if _grad:
+        # The chunked indexer keeps only O(n·B) score/soft tables per layer.
+        # When that live set is small, recomputing the whole forward (and its
+        # top-k sorts) costs more than it saves; above the ceiling the existing
+        # recompute path stays in force.  Values and gradients are identical
+        # either way (the function is pure and has no RNG).
+        _saved = int(H.shape[0]) * int(comp_kv.shape[0]) * (int(nIH) + 4) * int(H.element_size())
+        if _saved < (32 << 20):
+            _grad = False
+    if _grad:
         return torch.utils.checkpoint.checkpoint(
             _run, H, comp_kv, last_tok, use_reentrant=False,
             preserve_rng_state=False)
@@ -3917,7 +3926,7 @@ class HybridAttention(nn.Module):
             # 传入 soft 的形式完全一致。有梯度时条件为 False，走传入 soft
             # 的完整图。
             _need_soft = torch.is_grad_enabled()
-            _, topk_idx, soft = _indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=_pool_ends_host(bid), need_soft=_need_soft)
+            _, topk_idx, soft = _indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=None, need_soft=_need_soft)
             # _indexer_selection 的 top-k 是无放回选择：有效槽位的块 id 逐行互不
             # 相同（order 是列排列、kept 落在互异的 cumsum 秩列上），pad 槽位的
             # 重复块 0 已被 sel_valid 置无效。故 gathered_attention 的
@@ -3956,7 +3965,9 @@ class HybridAttention(nn.Module):
         pres = None
         if pre_flat is not None:
             if _batch_path:
-                # The kernel entry point consumes the whole [B, T, ...] batch.
+                # The kernel / batched twin consumes the whole [B, T, ...]
+                # batch and returns before the per-row loop, so the per-row
+                # projection views are not built on this path.
                 pre_all = {}
                 for kk, v in pre_flat.items():
                     if v is None:
@@ -3965,8 +3976,6 @@ class HybridAttention(nn.Module):
                         pre_all[kk] = v
                     else:
                         pre_all[kk] = v.reshape(B, T, *v.shape[1:])
-                _cols = {kk: (None if v is None else v.unbind(0)) for kk, v in pre_all.items()}
-                pres = [{kk: (None if vv is None else vv[b]) for kk, vv in _cols.items()} for b in range(B)]
             else:
                 # The eager row path reads only its own [T, ...] slice of the
                 # fused projection; each row is sliced from the flat output.
@@ -3985,8 +3994,6 @@ class HybridAttention(nn.Module):
                             # contiguous operand.
                             _row[kk] = _sl.contiguous() if kk == 'qI' else _sl
                     pres.append(_row)
-        if pres is None:
-            pres = [None] * B
         gate_sigs = None
         pre_blocks = None
         # The batched gate-signal / block-geometry hoist below is value-identical
@@ -4029,6 +4036,8 @@ class HybridAttention(nn.Module):
                 raise RuntimeError('CSA_KERNEL 只覆盖 learned-indexer / 非 fuse 的 csa·hca 臂；'
                                    'fuse_mode 或 indexer_mode 不同的臂请 unset CSA_KERNEL 后走 eager')
             return _CK.sparse_layer_forward(self, x, pre_all, gate_sigs, pre_blocks)
+        if pres is None:
+            pres = [None] * B
         if pre_blocks is not None:
             _prefetch_pool_geometry(self, pre_blocks, T, x.device)
         # Write each row's attention output into the batch output: the stacked
@@ -12515,9 +12524,14 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         if not _lbuf:
             return
         if _loss_stage is not None and len(_lbuf) <= _loss_stage.numel():
+            # One batched device->pinned copy per flush instead of a tiny
+            # copy per training step; the staged values and their order are
+            # unchanged.
+            _staged = _loss_stage[:len(_lbuf)]
+            _staged.copy_(torch.stack(_lbuf), non_blocking=True)
             _loss_ev.record()
             _loss_ev.synchronize()
-            _curve_extend(losses, _loss_stage[:len(_lbuf)].tolist())
+            _curve_extend(losses, _staged.tolist())
         else:
             _curve_extend(losses, torch.stack(_lbuf).tolist())
         _lbuf.clear()
@@ -12742,8 +12756,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             opt.zero_grad(set_to_none=True)
             _ce_d = ce.detach()
             _lbuf.append(_ce_d)
-            if _loss_stage is not None and len(_lbuf) <= _loss_stage.numel():
-                _loss_stage[len(_lbuf) - 1].copy_(_ce_d, non_blocking=True)
             _tail.append(_ce_d)
             # Drop this step's graph/scalar references before the next forward.
             del loss, ce
@@ -12972,8 +12984,14 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
     model.eval()
     try:
         h = model.trunk(x)
-        total = 0.0
-        correct = 0
+        # Accumulate the chunk sums on the device and read back once at the
+        # end: the old form forced two host synchronisations per chunk.  The
+        # addition order (chunk ascending) is unchanged, and the fp32 chunk
+        # sums widen to fp64 exactly as `float(fp32)` did, so the reported
+        # values are identical.
+        dev = h.device
+        total = torch.zeros((), dtype=torch.float64, device=dev)
+        correct = torch.zeros((), dtype=torch.long, device=dev)
         n = 0
         n_cols = min(int(x.shape[1]), int(y.shape[1]))
         for s in range(0, n_cols, chunk):
@@ -12981,18 +12999,19 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
             lg = model.head(h[:, sl, :])
             tg = y[:, sl]
             if ignore_index is None:
-                total += float(F.cross_entropy(lg.reshape(-1, vocab), tg.reshape(-1), reduction='sum'))
-                correct += int((lg.argmax(-1) == tg).sum())
+                total += F.cross_entropy(lg.reshape(-1, vocab), tg.reshape(-1), reduction='sum').double()
+                correct += (lg.argmax(-1) == tg).sum()
                 n += int(tg.numel())
             else:
                 valid = tg != int(ignore_index)
                 if bool(valid.any()):
                     lgf = lg.reshape(-1, vocab)[valid.reshape(-1)]
                     tgf = tg.reshape(-1)[valid.reshape(-1)]
-                    total += float(F.cross_entropy(lgf, tgf, reduction='sum'))
-                    correct += int((lg.argmax(-1)[valid] == tg[valid]).sum())
+                    total += F.cross_entropy(lgf, tgf, reduction='sum').double()
+                    correct += (lg.argmax(-1)[valid] == tg[valid]).sum()
                     n += int(valid.sum())
-        return (total / max(n, 1)), (correct / max(n, 1))
+        n = max(n, 1)
+        return (float(total.item()) / n), (float(correct.item()) / n)
     finally:
         model.train(was_training)
 
@@ -13446,8 +13465,16 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
             _gs.append(p.grad.detach())
         if _gs:
             # Per-tensor vector norms on the device; only scalars are read back
-            # and no full-size double copy of any gradient is made.
-            _norms = [float(torch.linalg.vector_norm(g)) for g in _gs]
+            # and no full-size double copy of any gradient is made.  The
+            # foreach form launches one norm kernel for the whole list, and all
+            # scalar results cross to the host in a single transfer instead of
+            # one synchronisation per parameter.
+            try:
+                _norms = torch.stack(
+                    [v.to(torch.float64) for v in torch._foreach_norm(_gs)]
+                ).cpu().tolist()
+            except Exception:
+                _norms = [float(torch.linalg.vector_norm(g)) for g in _gs]
             grad_finite = all(math.isfinite(_x) for _x in _norms)
             grad_norm = math.sqrt(math.fsum(_x * _x for _x in _norms)) if grad_finite else float('inf')
         else:

@@ -623,6 +623,8 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     # 而段和的目标只有 [B_pos_b.shape[0], C]。
     _bpb_rows = int(B_pos_b.shape[0]) if need_bpb else 0
     gBpb32 = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32) if need_bpb else None
+    # 复用的段和落点（每 chunk 清零）：避免按 chunk 反复分配同一形状的临时表。
+    gBpb_tmp = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32) if need_bpb else None
     ch = _pool_chunk_b(R, L + (W if has_b else 0), c, temps=8)
     # 单 chunk（ch >= Bm）时 in_ch / b2 的 chunk 范围条件恒真（geom 与 bid
     # 同源——Bm 由同一分段表的 counts 给出，bid 值恒 < Bm）：where(全真,
@@ -697,9 +699,9 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
             _k = b_off[:, b0:b1].reshape(-1)
             _v = glogit_b.reshape(-1, c)
             _seg = _seg_structure(_k, _bpb_rows)
-            _tmp = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32)
-            _seg_apply(_seg, _v, _tmp)
-            gBpb32 += _tmp
+            gBpb_tmp.zero_()
+            _seg_apply(_seg, _v, gBpb_tmp)
+            gBpb32 += gBpb_tmp
     gBpb = None
     if need_bpb:
         # 同 gXb/gZb：W_b == 0 时无任何键，段和为全零——与 eager
@@ -1197,37 +1199,40 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     dsink = torch.zeros_like(sink) if (need_dsink and sink is not None) else None
     r_idx = torch.arange(R, device=dev)[:, None, None]
     tc = _attn_t_chunk(R, M, nh, hd)
-    # 头在外、t-chunk 在内：各 (t,h) 独立。chunk 内的几何/掩码/soft 常量
-    # 与 h 无关——头循环外按 chunk 各算一次（同值；soft_c 同时兼作逐头
-    # 重置的 sf cast）。topk 行切片只以原 dtype 视图入清单，
-    # int64 升型在头循环内按 chunk 现算（同批精确整数）；lt_sel 只用于
-    # 构造 sel_ok，不入清单。
-    # 键值梯度按 (t-chunk, head) 立即归约：同一 chunk 内的键只构造这一次
-    # 段结构（与头无关），每个头算完就写进 [R·Bm,hd] / [R·T,hd] 的 fp32
-    # slab，不再为整段 T 保留 [R,T,topk|window,hd] 级别的碎片。跨 chunk 的
-    # 同键贡献按 chunk 顺序累加，确定性不变。
+    # t-chunk 在外、头在内：chunk 内的几何/掩码/soft 常量以及键值梯度的
+    # 段结构（argsort + 段定位）都与头无关，同组头只算一次。头按内存预算
+    # 分组：短序列可一次覆盖全部头（最省重复排序），长序列自动退化为小
+    # 组，slab 峰值受 CSA_ATTN_GRAD_SLAB_MB（默认 64MB）约束，不会随头数
+    # 线性膨胀。跨 chunk 的同键贡献仍按 chunk 升序累加，逐元素值与逐头
+    # 形式一致。
+    q_heads = [q[:, :, h, :] for h in range(nh)]
+    dO_heads = [dO[:, :, h, :] for h in range(nh)]
+    kb_heads = [k_blk[:, :, h, :] for h in range(nh)]
+    kw_heads = [k_sw[:, :, h, :] for h in range(nh)]
+    vb_heads = [v_blk[:, :, h, :] for h in range(nh)]
+    vw_heads = [v_sw[:, :, h, :] for h in range(nh)]
     lt_l = last_tok.to(torch.int64)
-    # 逐 (head, chunk) 构建几何：早期版本先把整段 T 的 src/掩码/soft/段结构
-    # 全部装进 `chunks`，长序列下这些"按 chunk"的表实际按全 T 保留。现在
-    # 每个 chunk 的头循环内现算、用完即释放，峰值只随一个 chunk 增长。
+    try:
+        _slab_budget = max(1, int(os.environ.get('CSA_ATTN_GRAD_SLAB_MB', '64'))) << 20
+    except (TypeError, ValueError):
+        _slab_budget = 64 << 20
+    _per_head_bytes = 4 * hd * (
+        R * Bm * (int(bool(need_dkb)) + int(bool(need_dvb)))
+        + R * T * (int(bool(need_dksw)) + int(bool(need_dvsw))))
+    group = max(1, min(int(nh), int(_slab_budget) // max(1, int(_per_head_bytes))))
     dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else None
     dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else None
     dk_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else None
     dv_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dvsw else None
-    dk_slab = torch.zeros((R * Bm, hd), device=dev, dtype=torch.float32) if need_dkb else None
-    dv_slab = torch.zeros((R * Bm, hd), device=dev, dtype=torch.float32) if need_dvb else None
-    dksw_slab = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if need_dksw else None
-    dvsw_slab = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if need_dvsw else None
+    dk_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=torch.float32) if need_dkb else None
+    dv_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=torch.float32) if need_dvb else None
+    dksw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=torch.float32) if need_dksw else None
+    dvsw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=torch.float32) if need_dvsw else None
     dk_scratch = torch.zeros((R * Bm, hd), device=dev, dtype=torch.float32) if (need_dkb or need_dvb) else None
     dksw_scratch = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if (need_dksw or need_dvsw) else None
 
-    for h in range(nh):
-        q_h = q[:, :, h, :]
-        dO_h = dO[:, :, h, :]
-        kb_h = k_blk[:, :, h, :]
-        kw_h = k_sw[:, :, h, :]
-        vb_h = v_blk[:, :, h, :]
-        vw_h = v_sw[:, :, h, :]
+    for h0 in range(0, nh, group):
+        h1 = min(h0 + group, nh)
         for _slab in (dk_slab, dv_slab, dksw_slab, dvsw_slab):
             if _slab is not None:
                 _slab.zero_()
@@ -1252,106 +1257,107 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 kw_keys = r_idx.expand(R, t1 - t0, w) * T + src_win
                 seg_w_c = _seg_structure(kw_keys.reshape(-1), R * T)
                 del kw_keys
-            src_sel = src32.to(torch.int64)
-            qh = q_h[:, t0:t1].to(torch.float32)
-            dOh = dO_h[:, t0:t1].to(torch.float32)
-            Kb = _gather_rows(kb_h, src_sel).to(torch.float32)
-            Kw = _gather_rows(kw_h, src_win).to(torch.float32)
-            Vb = _gather_rows(vb_h, src_sel).to(torch.float32)
-            Vw = _gather_rows(vw_h, src_win).to(torch.float32)
-            Kl = torch.cat([Kb, Kw], dim=-2)
-            Vl = torch.cat([Vb, Vw], dim=-2)
-            zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1)
-            if scale != 1.0:
-                # same IEEE identity as the forward ref: in-place on the fresh
-                # cat output, same values as the out-of-place form.
-                zA.mul_(scale)
-            zA.masked_fill_(~lane_ok, MINL)
-            g = torch.einsum('rtd,rtmd->rtm', dOh, Vl)
-            gh = g * (anyrow[:, :, None] if anyrow is not None else 1.0)
-            P_S = GS = dzS = P_sinkS = P_sinkA = None
-            if soft_c is not None:
-                # S 路径（soft 先验）与 sink 无关——eager 的直通估计器在
-                # use_sink=False 时同样有 S 路梯度。
-                lam = torch.log(soft_c.clamp_min(1e-12))
-                lam = lam.masked_fill(soft_c <= 0, MINL)
-                zS = zA.clone()
-                zS[:, :, :nb] = (zA[:, :, :nb] + lam).clamp_min(MINL)
-            if sink_v is None:
-                P_A = torch.softmax(zA, dim=-1)
-                P_A_f = P_A * (anyrow[:, :, None] if anyrow is not None else 1.0)
-                GA = (P_A * gh).sum(dim=-1)
-                dzA = P_A * (gh - GA[:, :, None])
-                if soft_c is not None:
-                    P_S = torch.softmax(zS, dim=-1)
-                    GS = (P_S * gh).sum(dim=-1)
-                    dzS = P_S * (gh - GS[:, :, None])
-            else:
-                zext = torch.cat([sink_v[h].expand(R, t1 - t0, 1), zA], dim=-1)
-                P_full = torch.softmax(zext, dim=-1)
-                P_A = P_full[..., 1:]
-                P_sinkA = P_full[..., 0]
-                P_A_f = P_A
-                GA = (P_A * gh).sum(dim=-1)
-                dzA = P_A * (gh - GA[:, :, None])
-                if soft_c is not None:
-                    zextS = torch.cat([sink_v[h].expand(R, t1 - t0, 1), zS], dim=-1)
-                    P_fullS = torch.softmax(zextS, dim=-1)
-                    P_S = P_fullS[..., 1:]
-                    P_sinkS = P_fullS[..., 0]
-                    GS = (P_S * gh).sum(dim=-1)
-                    dzS = P_S * (gh - GS[:, :, None])
-                if dsink is not None:
-                    acc = (-(P_sinkA * GA)).sum(dim=(0, 1))
-                    if GS is not None:
-                        acc = acc + (-(P_sinkS * GS)).sum(dim=(0, 1))
-                    dsink[h] += acc.to(dtype)
-            dz = dzA if dzS is None else dzA + dzS
-            if dq is not None:
-                _dq = torch.einsum('rtm,rtmd->rtd', dz, Kl)
+            for h in range(h0, h1):
+                hi = h - h0
+                qh = q_heads[h][:, t0:t1].to(torch.float32)
+                dOh = dO_heads[h][:, t0:t1].to(torch.float32)
+                Kb = _gather_rows(kb_heads[h], src64).to(torch.float32)
+                Kw = _gather_rows(kw_heads[h], src_win).to(torch.float32)
+                Vb = _gather_rows(vb_heads[h], src64).to(torch.float32)
+                Vw = _gather_rows(vw_heads[h], src_win).to(torch.float32)
+                Kl = torch.cat([Kb, Kw], dim=-2)
+                Vl = torch.cat([Vb, Vw], dim=-2)
+                zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1)
                 if scale != 1.0:
-                    _dq.mul_(scale)
-                dq[:, t0:t1, h, :] += _dq.to(dtype)
-            if dsoft is not None and dzS is not None:
-                dl = dzS[:, :, :nb]
-                sf = soft_c
-                dsoft[:, t0:t1, :] += torch.where(sf >= 1e-12, dl / sf.clamp_min(1e-12), torch.zeros_like(dl)).to(dtype)
-            if need_dkb or need_dksw:
-                dkl = torch.einsum('rtm,rtd->rtmd', dz, qh)
-                if scale != 1.0:
-                    dkl.mul_(scale)
-                if need_dkb:
-                    dk_scratch.zero_()
-                    _seg_apply(seg_b_c, dkl[:, :, :nb].reshape(-1, hd), dk_scratch)
-                    dk_slab.add_(dk_scratch)
-                if need_dksw:
-                    dksw_scratch.zero_()
-                    _seg_apply(seg_w_c, dkl[:, :, nb:].reshape(-1, hd), dksw_scratch)
-                    dksw_slab.add_(dksw_scratch)
-                del dkl
-            if need_dvb or need_dvsw:
-                dvl = torch.einsum('rtm,rtd->rtmd', P_A_f, dOh)
-                if need_dvb:
-                    dk_scratch.zero_()
-                    _seg_apply(seg_b_c, dvl[:, :, :nb].reshape(-1, hd), dk_scratch)
-                    dv_slab.add_(dk_scratch)
-                if need_dvsw:
-                    dksw_scratch.zero_()
-                    _seg_apply(seg_w_c, dvl[:, :, nb:].reshape(-1, hd), dksw_scratch)
-                    dvsw_slab.add_(dksw_scratch)
-                del dvl
+                    # same IEEE identity as the forward ref: in-place on the fresh
+                    # cat output, same values as the out-of-place form.
+                    zA.mul_(scale)
+                zA.masked_fill_(~lane_ok, MINL)
+                g = torch.einsum('rtd,rtmd->rtm', dOh, Vl)
+                gh = g * (anyrow[:, :, None] if anyrow is not None else 1.0)
+                P_S = GS = dzS = P_sinkS = P_sinkA = None
+                if soft_c is not None:
+                    # S 路径（soft 先验）与 sink 无关——eager 的直通估计器在
+                    # use_sink=False 时同样有 S 路梯度。
+                    lam = torch.log(soft_c.clamp_min(1e-12))
+                    lam = lam.masked_fill(soft_c <= 0, MINL)
+                    zS = zA.clone()
+                    zS[:, :, :nb] = (zA[:, :, :nb] + lam).clamp_min(MINL)
+                if sink_v is None:
+                    P_A = torch.softmax(zA, dim=-1)
+                    P_A_f = P_A * (anyrow[:, :, None] if anyrow is not None else 1.0)
+                    GA = (P_A * gh).sum(dim=-1)
+                    dzA = P_A * (gh - GA[:, :, None])
+                    if soft_c is not None:
+                        P_S = torch.softmax(zS, dim=-1)
+                        GS = (P_S * gh).sum(dim=-1)
+                        dzS = P_S * (gh - GS[:, :, None])
+                else:
+                    zext = torch.cat([sink_v[h].expand(R, t1 - t0, 1), zA], dim=-1)
+                    P_full = torch.softmax(zext, dim=-1)
+                    P_A = P_full[..., 1:]
+                    P_sinkA = P_full[..., 0]
+                    P_A_f = P_A
+                    GA = (P_A * gh).sum(dim=-1)
+                    dzA = P_A * (gh - GA[:, :, None])
+                    if soft_c is not None:
+                        zextS = torch.cat([sink_v[h].expand(R, t1 - t0, 1), zS], dim=-1)
+                        P_fullS = torch.softmax(zextS, dim=-1)
+                        P_S = P_fullS[..., 1:]
+                        P_sinkS = P_fullS[..., 0]
+                        GS = (P_S * gh).sum(dim=-1)
+                        dzS = P_S * (gh - GS[:, :, None])
+                    if dsink is not None:
+                        acc = (-(P_sinkA * GA)).sum(dim=(0, 1))
+                        if GS is not None:
+                            acc = acc + (-(P_sinkS * GS)).sum(dim=(0, 1))
+                        dsink[h] += acc.to(dtype)
+                dz = dzA if dzS is None else dzA + dzS
+                if dq is not None:
+                    _dq = torch.einsum('rtm,rtmd->rtd', dz, Kl)
+                    if scale != 1.0:
+                        _dq.mul_(scale)
+                    dq[:, t0:t1, h, :] += _dq.to(dtype)
+                if dsoft is not None and dzS is not None:
+                    dl = dzS[:, :, :nb]
+                    sf = soft_c
+                    dsoft[:, t0:t1, :] += torch.where(sf >= 1e-12, dl / sf.clamp_min(1e-12), torch.zeros_like(dl)).to(dtype)
+                if need_dkb or need_dksw:
+                    dkl = torch.einsum('rtm,rtd->rtmd', dz, qh)
+                    if scale != 1.0:
+                        dkl.mul_(scale)
+                    if need_dkb:
+                        dk_scratch.zero_()
+                        _seg_apply(seg_b_c, dkl[:, :, :nb].reshape(-1, hd), dk_scratch)
+                        dk_slab[hi].add_(dk_scratch)
+                    if need_dksw:
+                        dksw_scratch.zero_()
+                        _seg_apply(seg_w_c, dkl[:, :, nb:].reshape(-1, hd), dksw_scratch)
+                        dksw_slab[hi].add_(dksw_scratch)
+                    del dkl
+                if need_dvb or need_dvsw:
+                    dvl = torch.einsum('rtm,rtd->rtmd', P_A_f, dOh)
+                    if need_dvb:
+                        dk_scratch.zero_()
+                        _seg_apply(seg_b_c, dvl[:, :, :nb].reshape(-1, hd), dk_scratch)
+                        dv_slab[hi].add_(dk_scratch)
+                    if need_dvsw:
+                        dksw_scratch.zero_()
+                        _seg_apply(seg_w_c, dvl[:, :, nb:].reshape(-1, hd), dksw_scratch)
+                        dvsw_slab[hi].add_(dksw_scratch)
+                    del dvl
+                del (qh, dOh, Kb, Kw, Vb, Vw, Kl, Vl, zA, g, gh, P_S, GS, dzS,
+                     P_sinkS, P_sinkA, P_A, P_A_f, GA, dzA, dz)
             del (src32, src64, lt_sel, sel_ok, src_win, win_ok, lane_ok, anyrow,
-                 soft_c, seg_b_c, seg_w_c, src_sel, qh, dOh, Kb, Kw, Vb, Vw,
-                 Kl, Vl, zA, g, gh, P_S, GS, dzS, P_sinkS, P_sinkA, P_A,
-                 P_A_f, GA, dzA, dz)
+                 soft_c, seg_b_c, seg_w_c)
         if dk_blk is not None:
-            dk_blk[:, :, h, :] = dk_slab.view(R, Bm, hd).to(dtype)
+            dk_blk[:, :, h0:h1, :] = dk_slab.view(group, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
         if dv_blk is not None:
-            dv_blk[:, :, h, :] = dv_slab.view(R, Bm, hd).to(dtype)
-        if dksw_slab is not None:
-            dk_sw[:, :, h, :] = dksw_slab.view(R, T, hd).to(dtype)
-        if dvsw_slab is not None:
-            dv_sw[:, :, h, :] = dvsw_slab.view(R, T, hd).to(dtype)
+            dv_blk[:, :, h0:h1, :] = dv_slab.view(group, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
+        if dk_sw is not None:
+            dk_sw[:, :, h0:h1, :] = dksw_slab.view(group, R, T, hd).permute(1, 2, 0, 3).to(dtype)
+        if dv_sw is not None:
+            dv_sw[:, :, h0:h1, :] = dvsw_slab.view(group, R, T, hd).permute(1, 2, 0, 3).to(dtype)
     return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)
 
 
