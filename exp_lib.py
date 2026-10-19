@@ -815,7 +815,13 @@ def _segment(n, want_cut_list, min_block, max_block):
     ends[:-1] = sa[1:]
     ends[-1] = n
     counts_np = ends - sa
-    counts = counts_np.tolist()
+    # Small tables keep the historic Python-list contract (and the LRU cache
+    # above stores exactly that form).  At scale the counts row can hold
+    # thousands of blocks per layer/step; the numpy row carries the identical
+    # integers and every consumer either calls len/max/np.asarray on it or
+    # hands it to the host-geometry builders, so materialising a Python int
+    # per block is pure overhead.
+    counts = counts_np.tolist() if n <= 64 else counts_np
     honoured = {}
     if ns:
         sel = (ends < n) & (nc[sa] <= ends - 1)
@@ -1038,8 +1044,15 @@ def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_coun
         bids, hon, counts = _segment(n, want_cut_list, min_block, max_block)
         base = _h2d_async(bids, torch.long, device)
         cnt = len(counts)
-        _mx = max(counts)
-        base._pool_cpu = (counts, _mx, max(counts[:-1]) if cnt > 1 else 0)
+        if isinstance(counts, np.ndarray):
+            # Large cut tables return their counts as a numpy row; use the
+            # vectorised extrema instead of iterating Python ints over it.
+            _mx = int(counts.max()) if counts.size else 0
+            _mx_prev = int(counts[:-1].max()) if cnt > 1 else 0
+        else:
+            _mx = max(counts)
+            _mx_prev = max(counts[:-1]) if cnt > 1 else 0
+        base._pool_cpu = (counts, _mx, _mx_prev)
     if not (return_count or return_honoured):
         return base
     out = [base]
@@ -1267,11 +1280,17 @@ def _causal_quantile_rank(x, lo, frac, use_hi, first_row, q, n):
             j1 = min(j0 + jc, n)
             xj = xr[:, j0:j1]
             jb = j1 - j0
+            # In-place conjunction keeps the comparison block count at two:
+            # `eq`/`ilt` are dead after this line and `lt` becomes the exact
+            # same strict-order comparison table `lt | (eq & ilt)` built.
             lt = xr.unsqueeze(-1) < xj.unsqueeze(1)
             eq = xr.unsqueeze(-1) == xj.unsqueeze(1)
             ilt = idx.unsqueeze(-1) < idx[j0:j1].unsqueeze(0)
-            A = lt | (eq & ilt)
-            S = A.cumsum(1, dtype=torch.int32)[:, j0:]
+            eq.logical_and_(ilt)
+            lt.logical_or_(eq)
+            del eq, ilt
+            S = lt.cumsum(1, dtype=torch.int32)[:, j0:]
+            del lt
             # Only the boundary columns c in [j0, j1) can see a j > c.
             jle = idx[j0:j1].unsqueeze(0) <= idx[j0:j1].unsqueeze(1)
             m_lo = S == lo[j0:].unsqueeze(0).unsqueeze(-1)
@@ -1279,6 +1298,7 @@ def _causal_quantile_rank(x, lo, frac, use_hi, first_row, q, n):
             hit_lo = m_lo.any(-1)
             v_lo = xj.gather(1, m_lo.to(torch.uint8).argmax(-1).long())
             out_lo_r[:, j0:] = torch.where(hit_lo, v_lo, out_lo_r[:, j0:])
+            del m_lo, hit_lo, v_lo
             if need_hi:
                 m_hi = S == (lo[j0:] + 1).unsqueeze(0).unsqueeze(-1)
                 m_hi[:, :jb] &= jle
@@ -1557,13 +1577,19 @@ def _cache_put(cache, key, tensor, limit, total_of):
     cache[key] = tensor
     st['total'] += _cache_item_bytes(key, tensor, total_of)
     total = st['total']
-    evictable = _evictable_limit(cache, limit, total_of)
-    while total > limit and total > evictable:
-        oldest = next((k for k in cache if not _is_pinned_key(k)), None)
-        if oldest is None:
-            break
-        st['total'] -= _cache_item_bytes(oldest, cache.pop(oldest), total_of)
-        total = st['total']
+    if total > limit:
+        # One oldest-first pass.  Pinned entries are skipped but never force a
+        # rescan of the keys already visited (the previous `next(...)` form
+        # restarted at the oldest entry after every eviction, which was
+        # quadratic when pinned keys sat at the front).  The eviction order
+        # and the stopping condition are unchanged.
+        for _k in list(cache.keys()):
+            if total <= limit:
+                break
+            if _is_pinned_key(_k):
+                continue
+            st['total'] -= _cache_item_bytes(_k, cache.pop(_k), total_of)
+            total = st['total']
     return total
 _ATB_CACHE = {}
 _ATB_EPOCH = 0
@@ -2062,8 +2088,13 @@ def _pool_counts_clean(bid, B):
     # `len(...) > 0` instead of bare truthiness: `_pool_cpu[0]` rows are
     # numpy arrays on the device-segmenter path, where a bare `and` test
     # would raise; the emptiness semantics are identical.
+    if _cpu is not None and len(_cpu[0]) == B and len(_cpu[0]) > 0:
+        _c0 = _cpu[0]
+        _cmin = int(_c0.min()) if hasattr(_c0, 'min') else min(_c0)
+    else:
+        _cmin = 0
     ok = bool(B > 0 and _cpu is not None and len(_cpu[0]) == B
-              and len(_cpu[0]) > 0 and min(_cpu[0]) > 0)
+              and len(_cpu[0]) > 0 and _cmin > 0)
     try:
         bid._pool_clean = (B, ok)
     except (AttributeError, RuntimeError):
@@ -2086,7 +2117,12 @@ def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
         counts_np = np.asarray(counts_l, dtype=np.int32)
         if counts_np.shape != (B,) or n <= 0:
             return None
-        _ck = ('p', counts_np.tobytes(), B, -1 if ov is None else int(ov), n, int(pad_to))
+        # The content cache exists for repeated eval passes over an identical
+        # cut table.  A very wide counts row makes each key several KiB while
+        # a training panel never repeats it, so above the small-table bound the
+        # per-object caches are the only useful layer (the values are the same
+        # either way).
+        _ck = ('p', counts_np.tobytes(), B, -1 if ov is None else int(ov), n, int(pad_to)) if B <= 1024 else None
         _hit = _pool_geom_content_get(_ck)
         if _hit is not None:
             return _hit
@@ -2167,7 +2203,7 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         counts_np = np.asarray(counts_l, dtype=np.int32)
         if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or pa_rows <= 0 or pb_rows <= 0:
             return None
-        _ck = ('v', counts_np.tobytes(), B, ov, n, max_len, W_b, pa_rows, pb_rows, int(pad_to))
+        _ck = ('v', counts_np.tobytes(), B, ov, n, max_len, W_b, pa_rows, pb_rows, int(pad_to)) if B <= 1024 else None
         _hit = _pool_geom_content_get(_ck)
         if _hit is not None:
             return _hit
@@ -2241,7 +2277,7 @@ def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
         counts_np = np.asarray(counts_l, dtype=np.int32)
         if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or p_rows <= 0:
             return None
-        _ck = ('s', counts_np.tobytes(), B, n, max_len, p_rows, int(pad_to))
+        _ck = ('s', counts_np.tobytes(), B, n, max_len, p_rows, int(pad_to)) if B <= 1024 else None
         _hit = _pool_geom_content_get(_ck)
         if _hit is not None:
             return _hit
@@ -2469,11 +2505,14 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         _geom = getattr(block_ids, '_pool_geom', None)
         _geom = None if _geom is None else _geom.get(_gkey)
     elif ov_len.numel():
-        _cmin, max_len, _ov_lo, _ov_hi = (int(v) for v in torch.stack([counts.min(), counts.max(), ov_len.min(), ov_len.max()]).tolist())
+        # Only the two maxima are consumed below; folding them into one
+        # stacked read keeps a single device->host sync (the discarded minima
+        # were computed but never read).
+        max_len, _ov_hi = (int(v) for v in torch.stack([counts.max(), ov_len.max()]).tolist())
         _geom = None
     else:
-        _cmin, max_len = (int(v) for v in torch.stack(torch.aminmax(counts)).tolist())
-        _ov_lo = _ov_hi = None
+        max_len = int(counts.max())
+        _ov_hi = None
         _geom = None
     if _geom is not None:
         g_a, mask_a, g_b, mask_b, b_off, _pos_a = _geom
@@ -2596,7 +2635,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         _gc = getattr(block_ids, '_pool_geom', None)
         _geom = None if _gc is None else _gc.get(_gkey)
     else:
-        _cmin, max_len = (int(v) for v in torch.stack(torch.aminmax(counts)).tolist())
+        max_len = int(counts.max())
     if _geom is not None:
         g, mask, _pos_a = _geom
     else:
@@ -2723,8 +2762,11 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
             out_valid[:] = [torch.zeros(n, 0, dtype=torch.bool, device=scores.device)]
         return torch.empty(n, 0, device=scores.device, dtype=torch.int32)
     k = min(k_req, B)
-    # Boolean finite-and-causal table.
-    cf = causal & torch.isfinite(scores)
+    # Boolean finite-and-causal table.  `torch.isfinite` already returns a
+    # fresh tensor, so the conjunction runs in place: same booleans, one
+    # fewer full [n, B] allocation (and `causal` is read-only here).
+    cf = torch.isfinite(scores)
+    cf.logical_and_(causal)
     # torch.where picks bit-identical values (scores or the -inf constant) —
     # the same selection masked_fill produced.
     masked = torch.where(cf, scores, float('-inf'))
@@ -3167,21 +3209,25 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _nb = int(topk_l.shape[1])
     _dedup = (not topk_distinct) and _nb > 1
     if _attn_full_width_ok(n, _nb, w, _dedup):
-        sel_blk_all = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
+        # Build the [selected | window] table in place: the block half is
+        # written straight into its slice (the separate sel table + cat copy
+        # the old form materialised is the same boolean table, lane for lane).
+        valid_all = win_valid_all.new_empty((n, _nb + int(w)))
+        valid_all[:, :_nb] = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
         keep_all = sel_valid
         if _dedup:
             _ddk_all = first_occurrence_mask(topk_l)
             keep_all = _ddk_all if keep_all is None else keep_all & _ddk_all
         if keep_all is not None:
-            sel_blk_all &= keep_all
-        valid_all = torch.cat([sel_blk_all, win_valid_all], dim=1)
+            valid_all[:, :_nb] &= keep_all
+        valid_all[:, _nb:] = win_valid_all
         # full-width forms of the per-chunk negation / any-reduction: the
         # elementwise and reduction values per row are identical to the
         # per-chunk forms.
         nvalid_all = ~valid_all[:, None, :]
         anyrow_all = valid_all.any(-1) if sink_logits is None else None
     else:
-        sel_blk_all = keep_all = valid_all = nvalid_all = anyrow_all = None
+        keep_all = valid_all = nvalid_all = anyrow_all = None
     # The chunk-invariant dispatch is computed once, above the row-chunk
     # loop: which mask/validity source each chunk reads and which of the two
     # attention forms runs are pure functions of the call-level arguments.
@@ -3203,9 +3249,9 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     _einsum = torch.einsum
     if _has_all:
         # Only the keep/nvalid/anyrow slices are consumed below; the whole-row
-        # sel_blk_all / valid_all tables are fully absorbed into them.
+        # valid_all table is fully absorbed into them.
         _plan = [(None if keep_all is None else keep_all[_s:_s + q_chunk], nvalid_all[_s:_s + q_chunk], None if anyrow_all is None else anyrow_all[_s:_s + q_chunk]) for _s in range(0, n, q_chunk)]
-        del sel_blk_all, valid_all
+        del valid_all
     else:
         _plan = None
     _win_off_tab = _window_block_offset(n, w, _nblk_rows, dev) if _win_off else None
@@ -3278,14 +3324,30 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         else:
             kb = _tk2(k_blk, _sel_rows)
             kw = _tk2(k_sw, _win_local)
-        blk_logits = _einsum('qhd,qmhd->qhm', qseg, kb)
-        if scale != 1.0:
-            blk_logits.mul_(scale)
-        win_logits = _einsum('qhd,qmhd->qhm', qseg, kw)
-        if scale != 1.0:
-            win_logits.mul_(scale)
-        logits = torch.cat([blk_logits, win_logits], -1)
-        del kb, kw, blk_logits, win_logits
+        if _soft_live:
+            # The live-soft path keeps the cat form: its clone is fed to the
+            # straight-through branch, and a slice-assigned CopySlices table
+            # does not reproduce that graph's gradients exactly.
+            blk_logits = _einsum('qhd,qmhd->qhm', qseg, kb)
+            if scale != 1.0:
+                blk_logits.mul_(scale)
+            win_logits = _einsum('qhd,qmhd->qhm', qseg, kw)
+            if scale != 1.0:
+                win_logits.mul_(scale)
+            logits = torch.cat([blk_logits, win_logits], -1)
+            del blk_logits, win_logits
+        else:
+            # Write the two independent logits halves into one preallocated
+            # [q, h, nb + w] table instead of materialising both halves and a
+            # concatenated copy (the old peak held 2x the final logits).  The
+            # slice assignment feeds the same einsum values to the same lanes.
+            _w0 = int(_win_local.shape[1])
+            logits = qseg.new_empty((qseg.shape[0], qseg.shape[1], _nb + _w0))
+            logits[:, :, :_nb] = _einsum('qhd,qmhd->qhm', qseg, kb)
+            logits[:, :, _nb:] = _einsum('qhd,qmhd->qhm', qseg, kw)
+            if scale != 1.0:
+                logits.mul_(scale)
+        del kb, kw
         if _soft_live:
             soft_g = soft[s:e]
             if keep is not None:
@@ -5453,7 +5515,12 @@ class _DocDeduplicator:
     def is_duplicate(self, text, fp=None):
         if fp is None:
             fp = _doc_exact_fp(text)
-        if fp in self.exact:
+        # The content hash is a 128-bit value; storing it as a Python int
+        # keeps exactly the same identity while using ~36 bytes/document
+        # instead of the ~81-byte hex string.  At corpus scale (millions of
+        # documents) this is the dominant resident cost of the filter.
+        fp_key = int(fp, 16) if isinstance(fp, (str, bytes)) else int(fp)
+        if fp_key in self.exact:
             self.n_exact_skipped += 1
             return True, 'exact'
         h = _doc_simhash(text)
@@ -5462,7 +5529,7 @@ class _DocDeduplicator:
                 if _hamming64(h, other) <= self.near_threshold:
                     self.n_near_skipped += 1
                     return True, 'near'
-        self.exact.add(fp)
+        self.exact.add(fp_key)
         self.n_seen += 1
         for key in self._bucket_keys(h):
             self.buckets.setdefault(key, []).append(h)
@@ -11049,7 +11116,7 @@ def _eval_adaptive_chunk(model, val_batch, device, chunk, _free_frac=0.5, _bytes
     return max(1, min(chunk, rows))
 
 
-def _det_segment_sum(n_rows, indices, values, dtype=None):
+def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
     """Deterministic scatter-add by stable sort + segmented prefix sums.
 
     CUDA's ``index_add_``/``index_put_(accumulate=True)`` use atomics, so the
@@ -11057,7 +11124,14 @@ def _det_segment_sum(n_rows, indices, values, dtype=None):
     Sorting by (index, original position) fixes the order; segment sums are
     then formed with a cumsum and written through ``index_copy_`` (unique
     destinations, no atomics).  Mirrors ``csa_kernels._det_scatter_add`` but
-    keeps the caller's dtype (the per-document NLL accumulator is float64)."""
+    keeps the caller's dtype (the per-document NLL accumulator is float64).
+
+    ``sorted_indices=True`` promises the flattened indices are already
+    non-decreasing (the sampled-eval path maps a sorted global-row table, so
+    its per-chunk rows are sorted by construction).  The stable sort is then
+    an identity permutation and is skipped; every element keeps the same
+    position the sort would have given it, so the segmented sums are
+    bit-identical while the sort's time and workspace disappear."""
     idx = indices.reshape(-1).to(torch.int64)
     vals = values.reshape(-1)
     out_dtype = dtype if dtype is not None else vals.dtype
@@ -11070,9 +11144,13 @@ def _det_segment_sum(n_rows, indices, values, dtype=None):
         vals = vals[valid]
         if idx.numel() == 0:
             return out
-    order = torch.argsort(idx, stable=True)
-    idx_s = idx.index_select(0, order)
-    val_s = vals.index_select(0, order).to(out_dtype)
+    if sorted_indices:
+        idx_s = idx
+        val_s = vals.to(out_dtype)
+    else:
+        order = torch.argsort(idx, stable=True)
+        idx_s = idx.index_select(0, order)
+        val_s = vals.index_select(0, order).to(out_dtype)
     end = torch.ones_like(idx_s, dtype=torch.bool)
     if idx_s.numel() > 1:
         end[:-1] = idx_s[1:] != idx_s[:-1]
@@ -11194,8 +11272,11 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                     # Deterministic segmented sum (no CUDA atomics): the
                     # per-document NLL feeding the document bootstrap must be
                     # reproducible on the same machine.
-                    _row_nll += _det_segment_sum(_row_nll.numel(), _src_rows, _ce, dtype=torch.float64)
-                    _row_ntok += _det_segment_sum(_row_ntok.numel(), _src_rows, torch.ones_like(_src_rows), dtype=torch.long)
+                    # `_src_rows` is non-decreasing: it is derived from the
+                    # sorted global selection table, so the stable sort in the
+                    # accumulator would be an identity.
+                    _row_nll += _det_segment_sum(_row_nll.numel(), _src_rows, _ce, dtype=torch.float64, sorted_indices=True)
+                    _row_ntok += _det_segment_sum(_row_ntok.numel(), _src_rows, torch.ones_like(_src_rows), dtype=torch.long, sorted_indices=True)
                 ntok += int(_tgts.numel())
                 del _rows, _tgts, _ce, _src_rows
             else:
