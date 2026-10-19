@@ -128,6 +128,60 @@ def t_tost_student_t_and_boundary():
         assert b['equivalent'] is False and abs(b['p_tost'] - 0.5) < 1e-12, b
 
 
+def t_safe_exp_and_doc_ci():
+    # exp(705) is finite on IEEE doubles; a fixed 700 cutoff used to turn a
+    # measurable (if divergent) run into an unmeasured ``inf`` record.
+    assert math.isfinite(L._safe_exp_ppl(705.0))
+    assert L._safe_exp_ppl(1000.0) == float('inf')
+    assert L._safe_exp_ppl(float('nan')) != L._safe_exp_ppl(float('nan'))  # NaN stays NaN
+    # Token-pooled CE and its interval must target the same estimand even when
+    # document lengths differ (the old unweighted per-doc SEM did not).
+    nll = [10.0, 1.0, 4.0]
+    ntok = [100, 10, 20]
+    ci = L._nll_doc_ci(nll, ntok)
+    ce = sum(nll) / sum(ntok)
+    assert abs(math.log(ci['ppl']) - ce) < 1e-12, ci
+    assert ci['ppl_ci95_low'] <= ci['ppl'] <= ci['ppl_ci95_high'], ci
+    assert ci['ci_method'].startswith('cluster-robust'), ci
+    assert ci['n_docs'] == 3
+
+
+def t_bootstrap_mean_ci():
+    vals = [0.5, 1.0, 1.5, 2.0, 2.5]
+    a = L.bootstrap_mean_ci(vals, n_boot=500, seed=7)
+    b = L.bootstrap_mean_ci(vals, n_boot=500, seed=7)
+    assert a == b and a['n'] == 5 and a['ci_low'] <= a['mean'] <= a['ci_high'], a
+    assert L.bootstrap_mean_ci([1.0]) is None
+    assert L.bootstrap_mean_ci([1.0, float('nan'), float('inf')]) is None
+
+
+def t_v7_rope_gather_rotation_order():
+    # The per-chunk RoPE refactor rotates the gathered window rows.  The
+    # gathered tensor is [queries, lanes, heads, head_dim], so the position
+    # table needs a singleton HEAD axis; inserting a singleton LANE axis only
+    # broadcasts when lanes == heads.
+    torch.manual_seed(0)
+    T, nh, hd, q, m = 13, 3, 8, 7, 5
+    k = torch.randn(T, nh, hd)
+    idx = torch.randint(0, T, (q, m))
+    dev = torch.device('cpu')
+    cos, sin = V7.rope_cos_sin(hd, hd, L._arange_cache(T, dev), dev)
+    old = L._take_2d(V7.apply_rope(k, cos[:, None, :], sin[:, None, :], hd), idx)
+    new = V7.apply_rope(L._take_2d(k, idx),
+                        cos[idx][:, :, None, :], sin[idx][:, :, None, :], hd)
+    assert torch.equal(old, new), (old - new).abs().max()
+    # End-to-end: the frozen csa_fixed_rope arm must run with lanes != heads.
+    cfg = V7.make_layer_cfgs_v7(1, 'csa_fixed_rope')[0]
+    model = V7.SmallGPTRoPE(64, 32, 1, 2, 16, 16, [cfg])
+    x = torch.randint(0, 64, (1, 16))
+    y = torch.randint(0, 64, (1, 16))
+    loss = model.ce_loss(x, y, 64)
+    assert math.isfinite(float(loss.detach())), loss
+    loss.backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads and all(bool(torch.isfinite(g).all()) for g in grads), 'RoPE backward produced non-finite gradients'
+
+
 def t_scale_input_guards():
     try:
         L.meta_analyze_effects([{'label': 'A', 'scale': 1.0, 'effects': [1.0, 2.0], 'seeds': [0, 0]},
@@ -2265,6 +2319,8 @@ def main():
     _check('A6c meta-analysis input guards', t_scale_input_guards)
     _check('A5b exact sign-flip at scale (MITM)', t_exact_signflip_at_scale)
     _check('A4b TOST Student-t CI + margin boundary', t_tost_student_t_and_boundary)
+    _check('A4c safe exp + token-pooled document CI', t_safe_exp_and_doc_ci)
+    _check('A4d deterministic document bootstrap CI', t_bootstrap_mean_ci)
     _check('B1 legacy modes bit-exact', t_legacy_modes_bitexact)
     _check('B2 determinism + target-zone safety', t_corruption_deterministic_and_paired)
     _check('B3 new modes span/doc/topical', t_new_modes_do_something)
@@ -2334,6 +2390,7 @@ def main():
     _check('F5 atomic checkpoint save', t_atomic_torch_save)
     _check('G1 long-window chunked mask', t_long_window_chunked_mask)
     _check('G2 v7 long-window chunked mask', t_v7_long_window_chunked_mask)
+    _check('G2a v7 RoPE gather/rotation order', t_v7_rope_gather_rotation_order)
     _check('G3 empty-sequence indexer', t_indexer_empty_sequence)
     _check('G4 underpowered is never verified', t_underpowered_never_verified)
     _check('H1 hypothesis direction conflict', t_hypothesis_direction_conflict)

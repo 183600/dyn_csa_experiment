@@ -338,11 +338,13 @@ def _safe_exp_ppl(x):
         return None
     if math.isnan(x):
         return float('nan')
-    if x >= 700.0:
+    # exp is finite up to ~709.78; a fixed 700 cutoff would turn finite PPLs
+    # (e.g. CE 705) into a false ``inf`` and silently drop the record.  Let
+    # the FP overflow exception define the boundary for this machine.
+    try:
+        return math.exp(x)
+    except OverflowError:
         return float('inf')
-    if x <= -700.0:
-        return 0.0
-    return math.exp(x)
 
 
 def _nll_doc_ci(nll_per_row, n_tokens_per_row):
@@ -373,10 +375,36 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     var = sum((x - mean) ** 2 for x in doc_ce) / (len(doc_ce) - 1)
     sem = math.sqrt(max(var, 0.0) / len(doc_ce))
     ce = total_nll / total_tok
+    # The point estimate is token-pooled, so the interval must be for that
+    # same estimand.  Resampling/weighting per-document CEs as if the pooled
+    # CE were their unweighted mean mixes two different estimators and is
+    # wrong as soon as document lengths differ.  Use the cluster-robust
+    # (documents = clusters) delta-method variance of the ratio of totals:
+    #   Var(CE) ~= N/(N-1) * sum_i (nll_i - CE*n_tok_i)^2 / (sum_i n_tok_i)^2.
+    # A t critical value (df=N-1), not 1.96, keeps small document panels from
+    # claiming a normal-theory interval.
+    _resid = []
+    for nll, ntok in zip(nll_per_row or [], n_tokens_per_row or []):
+        try:
+            nll = float(nll)
+            ntok = int(ntok)
+        except (TypeError, ValueError):
+            continue
+        if ntok <= 0 or not math.isfinite(nll):
+            continue
+        _resid.append(nll - ce * ntok)
+    n_docs = len(_resid)
+    _var = (n_docs / (n_docs - 1.0)) * sum(r * r for r in _resid) / (total_tok * total_tok)
+    _sem_ce = math.sqrt(max(_var, 0.0))
+    _tc = _t_critical(0.95, n_docs - 1)
+    if not math.isfinite(_tc):
+        _tc = 1.959963984540054
     return {'ppl': _safe_exp_ppl(ce), 'doc_ce_mean': mean, 'doc_ce_sem': sem,
-            'ppl_ci95_low': _safe_exp_ppl(max(ce - 1.96 * sem, -700.0)),
-            'ppl_ci95_high': _safe_exp_ppl(min(ce + 1.96 * sem, 700.0)),
-            'n_docs': len(doc_ce)}
+            'ce_sem_cluster_robust': _sem_ce,
+            'ci_method': 'cluster-robust documents (t, df=n_docs-1)',
+            'ppl_ci95_low': _safe_exp_ppl(ce - _tc * _sem_ce),
+            'ppl_ci95_high': _safe_exp_ppl(ce + _tc * _sem_ce),
+            'n_docs': n_docs}
 
 
 # ---- G0 gate ---------------------------------------------------------------
@@ -6919,6 +6947,44 @@ def _percentile_ci(vals, lo=2.5, hi=97.5):
         j = min(i + 1, len(v) - 1)
         return v[i] + (v[j] - v[i]) * (pos - i)
     return [_pct(lo), _pct(hi)]
+
+def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
+    """Percentile bootstrap CI for the mean of i.i.d. units (e.g. documents).
+
+    Units must be the independent sampling unit.  For LM evaluation a document
+    row is the unit (tokens within a document are correlated), and this helper
+    is used to report **document-sampling** uncertainty, not seed-level
+    training uncertainty.  Resampling is chunked so a large document panel
+    costs O(n_boot) memory rather than O(n_boot * n_units).  The RNG is seeded,
+    so repeated report builds return the same interval.
+    """
+    v = np.asarray([float(x) for x in values
+                    if isinstance(x, (int, float)) and not isinstance(x, bool)
+                    and math.isfinite(float(x))], dtype=float)
+    n = int(v.size)
+    if n < 2:
+        return None
+    try:
+        nb = int(n_boot)
+        c = float(conf)
+    except (TypeError, ValueError):
+        return None
+    if nb < 20 or not (0.0 < c < 1.0):
+        return None
+    rng = np.random.default_rng(int(seed))
+    means = np.empty(nb, dtype=float)
+    _chunk = 256
+    for _off in range(0, nb, _chunk):
+        _nb = min(_chunk, nb - _off)
+        _idx = rng.integers(0, n, size=(_nb, n))
+        means[_off:_off + _nb] = v[_idx].mean(axis=1)
+    lo_q = 100.0 * (1.0 - c) / 2.0
+    hi_q = 100.0 - lo_q
+    lo, hi = np.percentile(means, [lo_q, hi_q])
+    return {'n': n, 'n_boot': nb, 'seed': int(seed), 'mean': float(v.mean()),
+            'ci_low': float(lo), 'ci_high': float(hi), 'conf': c,
+            'method': 'percentile bootstrap over independent units (chunked, deterministic)'}
+
 
 def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)

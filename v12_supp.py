@@ -978,17 +978,62 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     per_seq_b = [r.get('ppl_per_seq') for r in rows_b]
     if not all(isinstance(x, list) and x for x in per_seq_a + per_seq_b):
         return None
-    n_docs = min(min(len(x) for x in per_seq_a), min(len(x) for x in per_seq_b))
+    # Pair row i across arms only when every record evaluated the SAME number
+    # of documents.  Silently taking the minimum would pair a truncated panel
+    # with a full one and claim a larger document sample than either scored.
+    _lens = {len(x) for x in per_seq_a + per_seq_b}
+    if len(_lens) != 1:
+        return {'n_docs': int(min(_lens)), 'n_seeds': len(common), 'comparable': False,
+                'reason': 'per-document row counts differ across arm/seed records; document-paired deltas are not defined',
+                'row_counts': sorted(_lens), 'note': 'refused rather than silently truncating to the shortest record'}
+    n_docs = min(_lens)
     if n_docs < 2:
         return None
     doc_deltas = []
+    doc_log_ratios = []
     within = []
+    incomplete = 0
     for i in range(n_docs):
-        cell = [per_seq_a[k][i] - per_seq_b[k][i] for k in range(len(common))]
+        cell = []
+        logs = []
+        for k in range(len(common)):
+            a, b = per_seq_a[k][i], per_seq_b[k][i]
+            try:
+                fa, fb = float(a), float(b)
+            except (TypeError, ValueError):
+                fa = fb = float('nan')
+            if (not math.isfinite(fa)) or (not math.isfinite(fb)) or fa <= 0.0 or fb <= 0.0:
+                incomplete += 1
+                continue
+            cell.append(fa - fb)
+            logs.append(math.log(fa) - math.log(fb))
+        if not cell:
+            continue
         doc_deltas.append(float(np.mean(cell)))
+        doc_log_ratios.append(float(np.mean(logs)))
         within.append(float(np.std(cell, ddof=1)) if len(cell) > 1 else 0.0)
+    if len(doc_deltas) < 2:
+        return None
     arr = np.asarray(doc_deltas, dtype=float)
-    return {'n_docs': int(n_docs), 'n_seeds': len(common), 'per_doc_delta_mean': float(arr.mean()), 'between_doc_sd': float(arr.std(ddof=1)) if n_docs > 1 else 0.0, 'mean_within_doc_seed_sd': float(np.mean(within)), 'note': 'between_doc_sd reflects DOCUMENT-sampling uncertainty; n_seqs<64 does not cover the language-population distribution — enlarge the row panel for population-level claims (design_notes §20)'}
+    lr = np.asarray(doc_log_ratios, dtype=float)
+    # Seed-level sign-flip remains the confirmatory test.  These intervals
+    # condition on the trained seeds and quantify only DOCUMENT sampling:
+    # with n_seqs=16 they are a property of the frozen slice, not of the
+    # language population.  Resampling documents (not tokens) preserves the
+    # within-document correlation.
+    _ci_ppl = L.bootstrap_mean_ci(arr, seed=20261018)
+    _ci_log = L.bootstrap_mean_ci(lr, seed=20261018)
+    return {'n_docs': int(len(doc_deltas)), 'n_seeds': len(common),
+            'per_doc_delta_mean': float(arr.mean()),
+            'per_doc_log_ratio_mean': float(lr.mean()),
+            'between_doc_sd': float(arr.std(ddof=1)) if len(doc_deltas) > 1 else 0.0,
+            'between_doc_log_ratio_sd': float(lr.std(ddof=1)) if len(doc_log_ratios) > 1 else 0.0,
+            'mean_within_doc_seed_sd': float(np.mean(within)),
+            'per_doc_delta_ppl_ci95': ([_ci_ppl['ci_low'], _ci_ppl['ci_high']] if _ci_ppl else None),
+            'per_doc_log_ratio_ci95': ([_ci_log['ci_low'], _ci_log['ci_high']] if _ci_log else None),
+            'incomplete_doc_seed_cells': int(incomplete),
+            'ci_method': 'percentile bootstrap over documents (chunked, deterministic); conditions on the trained seeds',
+            'note': 'document-sampling uncertainty only; seed-level exact sign-flip remains the confirmatory test, and n_seqs<64 does not cover the language-population distribution — enlarge the row panel for population-level claims (design_notes section 20)'}
 
 
 def _test_probe_stats(probe_path, manifest, slice_fp):

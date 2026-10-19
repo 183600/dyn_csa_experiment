@@ -439,7 +439,11 @@ class HybridAttentionRoPE(L.HybridAttention):
             _Kb = L._take_2d(k_blk_r, ib)
             if _has_sw:
                 _Kw = L._take_2d(k_sw, _iw)
-                _Kw = apply_rope(_Kw, cos[_iw][:, None, :], sin[_iw][:, None, :], rope_dim)
+                # `_Kw` is [q, m, nh, hd]; the position table must gain a
+                # singleton HEAD axis (`[:, :, None, :]`), not a singleton
+                # COLUMN axis.  The latter only broadcasts when the number of
+                # gathered lanes happens to equal the head count.
+                _Kw = apply_rope(_Kw, cos[_iw][:, :, None, :], sin[_iw][:, :, None, :], rope_dim)
                 Kset = torch.cat([_Kb, _Kw], 1)
                 del _Kb, _Kw
             else:

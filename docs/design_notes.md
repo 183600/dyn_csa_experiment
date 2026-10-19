@@ -771,6 +771,12 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
   评测文档抽样不确定性。`eval_subset` 只控制训练过程中的曲线评估；最终
   PPL 仍用完整固定验证批（历史口径），该区别在记录中由 `eval_rows` /
   `eval_fp` 显式化。
+- 文档级区间必须针对**同一个估计量**：token-pooled PPL 的区间不能用
+  「逐文档 CE 的未加权标准误」近似（文档长度不同时两者不是同一个量）。
+  `_nll_doc_ci` 因此改用 documents-as-clusters 的稳健方差与 t 临界值；
+  v12 的逐文档配对分析另给 `bootstrap_mean_ci` 的文档重采样区间（对逐
+  文档 PPL 差与 log 比分别报告）。这些区间**以已训练的种子为条件**，
+  只量化文档抽样不确定性，不能替代 seed-level 精确符号翻转检验。
 
 ### 22.2 符号翻转检验的假设与敏感性
 
