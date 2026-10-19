@@ -22,8 +22,13 @@ python archive_release.py verify archive/release_v13.tar.gz
 ```
 
 `archive_release.py` packs `DECISION_LOG.md`, `confirmation_frozen.json`,
-`requirements.txt`, `requirements.lock` (if present), the freeze lock and a
-per-file SHA-256 manifest; `verify` recomputes every hash independently.
+`RELEASES.md`, `pyproject.toml`, `requirements.txt`, `requirements.lock` (if
+present), cache/tokenizer metadata, every `run_*.log` at the repo root (if
+present), the freeze lock and a per-file SHA-256 manifest; `verify` recomputes
+every hash independently.
 
 A release without a verifier URL or without the `verify` output should be
 treated as **not auditable**, regardless of the numbers in its report.
+`python audit_gates.py release` parses this table: with no complete row the
+repository is reported as `no_release` (source-only), and every generated
+report number is explicitly not independently auditable.

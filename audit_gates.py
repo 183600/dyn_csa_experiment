@@ -839,6 +839,7 @@ def audit_attribution(outdirs=None):
     收集的块 id bincount，design_notes §14 同口径）是否在场。"""
     out = {'status': 'ok', 'panels': {}}
     L = _import_exp_lib()
+    import numpy as np
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
@@ -849,12 +850,46 @@ def audit_attribution(outdirs=None):
             if not (isinstance(r, dict) and r.get('variant')):
                 continue
             v = r['variant']
-            ent = panel.setdefault(v, {'n_records': 0, 'with_block_stats': 0, 'params': r.get('params')})
+            ent = panel.setdefault(v, {'n_records': 0, 'with_block_stats': 0, 'params': r.get('params'),
+                                       'blocks_mean': [], 'block_len_mean': [], 'block_len_p95': []})
             ent['n_records'] += 1
-            if r.get('block_stats') or r.get('by_len_block_stats') or (isinstance(r.get('mech'), dict) and r['mech'].get('cuts')):
+            _layers = r.get('stats') if isinstance(r.get('stats'), dict) else {}
+            _found = False
+            for _lk, _lv in _layers.items():
+                if not isinstance(_lv, dict) or 'blocks' not in _lv:
+                    continue
+                _found = True
+                for _src, _dst in (('blocks', 'blocks_mean'), ('len_mean', 'block_len_mean'), ('len_p95', 'block_len_p95')):
+                    _x = _lv.get(_src)
+                    if isinstance(_x, (int, float)) and math.isfinite(float(_x)):
+                        ent[_dst].append(float(_x))
+            if _found or r.get('block_stats') or r.get('by_len_block_stats') or (isinstance(r.get('mech'), dict) and r['mech'].get('cuts')):
                 ent['with_block_stats'] += 1
         if panel:
             missing = {v: e for v, e in panel.items() if e['with_block_stats'] == 0}
+            # Turn the presence check into a block-count / block-length table
+            # (review issue 11): a fixed-vs-dynamic contrast that also changes
+            # the block count or mean block length is not a clean blocking
+            # contrast, and must be reported as such.
+            for v, e in panel.items():
+                for _src, _dst in (('blocks_mean', 'blocks_mean'), ('block_len_mean', 'block_len_mean'), ('block_len_p95', 'block_len_p95')):
+                    _vals = e.pop(_src, [])
+                    e[_dst] = (float(np.mean(_vals)) if _vals else None)
+            _pairs = {'csa_fixed': 'csa_dynamic', 'hybrid_fixed': 'hybrid_dynamic'}
+            for a, b in _pairs.items():
+                if a in panel and b in panel:
+                    _ba, _bb = panel[a].get('blocks_mean'), panel[b].get('blocks_mean')
+                    _la, _lb = panel[a].get('block_len_mean'), panel[b].get('block_len_mean')
+                    rec = {'a': a, 'b': b, 'blocks_a': _ba, 'blocks_b': _bb, 'block_len_a': _la, 'block_len_b': _lb}
+                    if _ba and _bb:
+                        _r = max(_ba, _bb) / min(_ba, _bb)
+                        rec['block_count_ratio'] = float(_r)
+                        rec['block_count_matched'] = bool(_r <= 1.10)
+                    else:
+                        rec['block_count_matched'] = None
+                    if _la and _lb:
+                        rec['block_len_ratio'] = float(max(_la, _lb) / min(_la, _lb))
+                    out.setdefault('blocking_contrasts', {})[f'{a} vs {b}'] = rec
             out['panels'][d] = panel
             if missing:
                 out['panels'][d]['note'] = f'no block-stat fields found for {sorted(missing)} — run evals with exp_lib.enable_block_stats(model, True) (or the kernel twin, same collection) before this audit can compare block counts/compression across arms'
@@ -943,7 +978,9 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 e['n_seq'].add(len(c['ppl_per_seq']))
             elif c.get('n_seq') is not None:
                 e['n_seq'].add(c.get('n_seq'))
-            if c.get('truncated'):
+            if 'truncated' not in c:
+                problems.append(f'{key}: L{Ln} cell has NO `truncated` flag — a missing truncation marker is treated as unverifiable, not as a full-length measurement')
+            elif c.get('truncated'):
                 problems.append(f'{key}: L{Ln} cell is marked truncated — it must not enter cross-length means')
     out = {'status': 'ok', 'by_length': {}}
     for Ln, e in sorted(by_len.items()):
@@ -1375,8 +1412,236 @@ def audit_efficiency_demo():
 # report：汇总本地可执行的审计
 # ---------------------------------------------------------------------------
 
+def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
+    """Zero-GPU audit of MEASURED prefill time between arms.
+
+    The review's efficiency point is not "is there a timing field" but "is a
+    speed/cheapness claim supported".  This audit pairs records only when both
+    arms have `efficiency.status == 'ok'` at the SAME token count, on the same
+    device and torch version, with the same KV-cache semantics; it reports the
+    p50 ratio and refuses the words "faster/cheaper" unless the ratio is
+    outside `tolerance` in the claimed direction.  It never converts analytic
+    FLOPs into a latency claim.
+
+    `pairs` may be a list of (arm_a, arm_b); by default every arm pair sharing
+    a panel is reported (descriptive)."""
+    import numpy as np
+    dirs = outdirs or list(_iter_result_dirs())
+    out = {'status': 'ok', 'panels': {}, 'claims_allowed': [], 'refused': [],
+           'tolerance': float(tolerance),
+           'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
+    for d in dirs:
+        summ = _load(os.path.join(d, 'summary.json'))
+        if not summ:
+            continue
+        eff = {}
+        for key, r in summ.items():
+            if not isinstance(r, dict):
+                continue
+            v = r.get('variant') or str(key).split('::')[0]
+            e = r.get('efficiency')
+            if isinstance(e, dict) and e.get('status') == 'ok':
+                eff.setdefault(v, []).append(e)
+        if not eff:
+            continue
+        panel = {}
+        _pairs = pairs if pairs else [(a, b) for i, a in enumerate(sorted(eff)) for b in sorted(eff)[i + 1:]]
+        for a, b in _pairs:
+            if a not in eff or b not in eff:
+                continue
+            def _med(rows, key):
+                _v = [float(r[key]) for r in rows if isinstance(r.get(key), (int, float)) and math.isfinite(float(r[key]))]
+                return (float(np.median(_v)) if _v else None)
+            ra, rb = eff[a][0], eff[b][0]
+            same_env = (ra.get('device') == rb.get('device') and ra.get('torch') == rb.get('torch'))
+            same_kv = bool(ra.get('decode_has_kv_cache')) == bool(rb.get('decode_has_kv_cache'))
+            # Median over seeds, not the first record: a single slow seed must
+            # not decide a "faster" claim.
+            _ta, _tb = _med(eff[a], 'prefill_ms_p50'), _med(eff[b], 'prefill_ms_p50')
+            _na = sorted({int(r['n_tokens']) for r in eff[a] if isinstance(r.get('n_tokens'), int)})
+            _nb = sorted({int(r['n_tokens']) for r in eff[b] if isinstance(r.get('n_tokens'), int)})
+            rec = {'a': a, 'b': b, 'same_device_torch': same_env, 'same_kv_semantics': same_kv,
+                   'a_ms_p50': _ta, 'b_ms_p50': _tb, 'a_tokens': _na, 'b_tokens': _nb,
+                   'ratio_b_over_a': None, 'speed_claim_allowed': False, 'faster_arm': None, 'reason': None}
+            if not (isinstance(_ta, (int, float)) and isinstance(_tb, (int, float)) and _ta > 0 and _tb > 0):
+                rec['reason'] = 'missing or non-positive measured prefill time'
+            elif _na != _nb or len(_na) != 1 or len(_nb) != 1:
+                rec['reason'] = f'different or ambiguous measured token counts ({_na} vs {_nb}); a latency ratio across shapes is not a speed comparison'
+            elif not same_env:
+                rec['reason'] = 'different device or torch version recorded'
+            elif not same_kv:
+                rec['reason'] = 'different KV-cache semantics recorded'
+            else:
+                ratio = float(_tb) / float(_ta)
+                rec['ratio_b_over_a'] = ratio
+                rec['faster_arm'] = (b if ratio < 1.0 - tolerance else (a if ratio > 1.0 + tolerance else None))
+                rec['speed_claim_allowed'] = rec['faster_arm'] is not None
+                if not rec['speed_claim_allowed']:
+                    rec['reason'] = f'ratio {ratio:.3f} is within +/-{tolerance:.0%} of 1: no measured speed difference'
+            panel[f'{a} vs {b}'] = rec
+            (out['claims_allowed'] if rec['speed_claim_allowed'] else out['refused']).append(f'{d}: {a} vs {b}')
+        if panel:
+            out['panels'][d] = panel
+    if not out['panels']:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = ('no records carry a measured `efficiency` block with status ok — the efficiency panel needs '
+                       'checkpoints measured with exp_lib.measure_efficiency / measure_efficiency_sweep; analytic FLOPs do not qualify')
+    print(json.dumps({k: v for k, v in out.items() if k != 'panels'}, ensure_ascii=False, indent=2)[:4000])
+    return out
+
+
+def audit_release_readiness(path='RELEASES.md'):
+    """Zero-GPU check that a numeric claim has an auditable evidence release.
+
+    The review's point 17: "reproducible code" is not "auditable results".
+    This audit parses the tracked release index and refuses to call the
+    repository auditable unless at least one row names a commit, an archive
+    URL, both SHA-256 digests and a verifier.  It also reports whether the
+    CURRENT commit is covered.  It cannot verify a remote archive without
+    downloading it; `archive_release.py verify` does that locally.
+    """
+    import re
+    import subprocess
+    out = {'status': 'no_release', 'rows': 0, 'complete_rows': 0,
+           'current_commit': None, 'current_commit_released': False,
+           'problems': [], 'path': path,
+           'note': ('a repository with no evidence release is source-only: its generated reports are not '
+                    'independently auditable. Publish release_<tag>.tar.gz plus a manifest and record it here.')}
+    try:
+        head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=REPO, capture_output=True, text=True, timeout=20).stdout.strip()
+        out['current_commit'] = head or None
+    except Exception:
+        pass
+    p = os.path.join(REPO, path)
+    if not os.path.exists(p):
+        out['problems'].append(f'{path} is missing')
+        return out
+    rows = []
+    for line in open(p, encoding='utf-8'):
+        line = line.strip()
+        if not line.startswith('|'):
+            continue
+        cells = [c.strip() for c in line.strip('|').split('|')]
+        if len(cells) < 7:
+            continue
+        if cells[0].lower() in ('tag', '---') or set(cells[0]) <= {'-', ':'}:
+            continue
+        if cells[0].startswith('_none'):
+            continue
+        rows.append(cells)
+    out['rows'] = len(rows)
+    for cells in rows:
+        tag, _date, commit, url, asha, msha, verifier = cells[:7]
+        missing = []
+        if not re.fullmatch(r'[0-9a-fA-F]{7,40}', commit or ''):
+            missing.append('commit')
+        if not re.match(r'https?://', url or ''):
+            missing.append('archive URL')
+        if not re.fullmatch(r'[0-9a-fA-F]{64}', asha or ''):
+            missing.append('archive SHA-256')
+        if not re.fullmatch(r'[0-9a-fA-F]{64}', msha or ''):
+            missing.append('manifest SHA-256')
+        if not verifier or verifier in ('—', '-', 'n/a', 'none'):
+            missing.append('verifier')
+        if missing:
+            out['problems'].append(f'{tag}: missing {missing}')
+            continue
+        out['complete_rows'] += 1
+        if out['current_commit'] and out['current_commit'].startswith(commit):
+            out['current_commit_released'] = True
+    if out['complete_rows'] == 0:
+        out['status'] = 'no_release' if not rows else 'incomplete'
+        out['note'] = ('no complete evidence release row: every numeric claim in any generated report remains '
+                       'source-side only and is NOT independently auditable')
+    else:
+        out['status'] = 'ok'
+    print(json.dumps({k: v for k, v in out.items() if k != 'rows'}, ensure_ascii=False, indent=2))
+    return out
+
+
+def audit_selection(path='analysis_mechanism/selection_attribution.json'):
+    """Gate for the DIRECT mechanism evidence the review asks for (issue 20).
+
+    A claim that "the learned selector finds the relevant blocks" needs an
+    artifact comparing the selected blocks with a dependency oracle, per
+    query.  This audit defines the contract and validates one when it exists:
+
+        { "cells": [ { "arm": ..., "eval_len": 4096, "k": 32, "n_blocks": 1024,
+                       "n_queries": ..., "recall_at_k": ..., "mass_covered": ...,
+                       "random_baseline": ...,
+                       "per_seed": {"0": {...}, "1": {...}} } ] }
+
+    `recall_at_k` is the fraction of the oracle's top-mass blocks captured by
+    the learned top-k; `mass_covered` is the fraction of the oracle attention
+    mass inside the selected blocks; `random_baseline` is k/n_blocks (or the
+    matched-length random-cut baseline).  Without this artifact the repository
+    has NO selection-level mechanism evidence, and wording such as "the
+    selector found the relevant information" is unsupported.
+    """
+    out = {'status': 'not_verifiable_locally', 'path': path,
+           'required_schema': ['arm', 'eval_len', 'k', 'n_blocks', 'n_queries',
+                               'recall_at_k', 'mass_covered', 'random_baseline', 'per_seed'],
+           'cells': [], 'problems': [],
+           'note': ('no selection-attribution artifact: selection recall/precision versus a dependency oracle '
+                    'has NOT been measured, so "the learned selector retrieves the relevant blocks" is an '
+                    'unsupported mechanism claim. Run the mechanism probe, then re-run this audit.')}
+    p = os.path.join(REPO, path)
+    if not os.path.exists(p):
+        print(json.dumps({k: v for k, v in out.items() if k != 'cells'}, ensure_ascii=False, indent=2))
+        return out
+    raw = _load(p)
+    cells = raw.get('cells') if isinstance(raw, dict) else None
+    if not isinstance(cells, list) or not cells:
+        out.update({'status': 'fail', 'problems': ['artifact has no cells list']})
+        return out
+    for i, c in enumerate(cells):
+        if not isinstance(c, dict):
+            out['problems'].append(f'cell {i}: not an object')
+            continue
+        _miss = [k for k in ('arm', 'eval_len', 'k', 'n_blocks', 'n_queries', 'recall_at_k', 'mass_covered', 'random_baseline') if c.get(k) is None]
+        if _miss:
+            out['problems'].append(f'cell {i} ({c.get("arm")}): missing {_miss}')
+            continue
+        try:
+            k, B = int(c['k']), int(c['n_blocks'])
+            rec, mass, base = (float(c['recall_at_k']), float(c['mass_covered']), float(c['random_baseline']))
+            nq = int(c['n_queries'])
+        except (TypeError, ValueError):
+            out['problems'].append(f'cell {i}: non-numeric fields')
+            continue
+        if not (0.0 <= rec <= 1.0 and 0.0 <= mass <= 1.0 and 0.0 <= base <= 1.0):
+            out['problems'].append(f'cell {i}: recall/mass/baseline outside [0,1]')
+        if k <= 0 or B <= 0 or k > B:
+            out['problems'].append(f'cell {i}: require 0 < k <= n_blocks (got k={k}, B={B})')
+        if nq <= 0:
+            out['problems'].append(f'cell {i}: n_queries must be positive')
+        _seeds = c.get('per_seed')
+        _n_seeds = len(_seeds) if isinstance(_seeds, dict) else 0
+        _st = None
+        if isinstance(_seeds, dict) and _n_seeds >= 2:
+            try:
+                L = _import_exp_lib()
+                _d = [float(v.get('mass_covered')) - float(v.get('random_baseline')) for v in _seeds.values() if isinstance(v, dict) and v.get('mass_covered') is not None]
+                if len(_d) >= 2:
+                    _r = L.exact_signflip_p(_d)
+                    _st = {'p_exact_signflip': float(_r.get('p')), 'n': len(_d), 'method': _r.get('method')}
+            except Exception as e:
+                out['problems'].append(f'cell {i}: could not run the seed test ({type(e).__name__}: {e})')
+        out['cells'].append({'arm': c.get('arm'), 'eval_len': c.get('eval_len'), 'k': k, 'n_blocks': B,
+                             'recall_at_k': rec, 'mass_covered': mass, 'random_baseline': base,
+                             'mass_excess': mass - base, 'recall_excess': rec - base,
+                             'n_queries': nq, 'n_seeds': _n_seeds,
+                             'seed_test': _st,
+                             'claim_allowed': bool(mass > base and rec > base and nq > 0 and _st is not None and _st.get('p_exact_signflip', 1.0) < 0.05 and _n_seeds >= 6)})
+    out['status'] = 'fail' if out['problems'] else 'ok'
+    out['note'] = ('cells pass the structural contract; `claim_allowed` additionally requires mass/recall above the '
+                   'random baseline and a seed-level exact sign-flip p<0.05 with n>=6')
+    print(json.dumps({k: v for k, v in out.items() if k != 'cells'}, ensure_ascii=False, indent=2)[:4000])
+    return out
+
+
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -1396,7 +1661,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

@@ -4,11 +4,13 @@
 
 在小型从零训练语言模型（BPE-8k，WikiText-103）中，对**压缩块稀疏注意力**
 （CSA / HCA，固定分块与动态分块）与稠密注意力进行受控对比研究。本仓库包含
-实验代码以及在自己机器上复现结果所需的全部内容。
+实验代码以及在自己机器上**重跑实验**所需的协议。仓库**不包含数值结果**：没有随仓库发布证据归档（见 `RELEASES.md`），因此仅凭 Git 树无法独立复核任何报告中的 PPL 数值。
 
 > **证据等级**：v6–v11 为探索性（在同一 validation split 上选择后观察）；只有 v12 冻结的固定分块比较是确认性。详见 `DECISION_LOG.md` 与 `docs/design_notes.md` §17/§20。
 >
 > **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结清单绑定的库测量语义戳，两者故意不同号。冻结清单当前为 `manifest_version: 3`（见其 `revision.history`）；continuous-loop CI 已被有意停用，直到签署后的提交固定且 P5T 完成。
+
+> **证据状态（引用数字前必读）**：`results_*/`、`analysis_*/`、`REPORT*.md` 有意不入库，且**没有随仓库发布证据归档**（`RELEASES.md` 尚无记录）。报告可由你自己产生的产物重建，但任何你没有重建过的报告数值都无法独立复核。只有当 `release_<tag>.tar.gz` 与清单发布到只读位置并通过 `archive_release.py verify` 时，相应主张才可审计。
 
 ## 仓库结构
 
@@ -16,12 +18,12 @@
 零 GPU 分析目录（`analysis_*/`）、逐版报告（`REPORT*.md`）与运行状态文件
 都**不入库**——它们由驱动脚本在跑实验的机器上重新生成，需要时本地复现即可
 （见下文命令）。`.gitignore` 已把这几类路径挡在仓库外（`docs/` 只保留
-`design_notes.md` 与 `compute_plan.md`）。
+`design_notes.md`；原 `compute_plan.md` 已退役）。
 
 | 路径 | 说明 |
 |---|---|
 | `exp_lib.py` | **核心库，也是唯一的代码来源**：模型、CSA/HCA 注意力、池化、indexer、分段器、训练循环、聚合与统计 |
-| `csa_kernels.py` | **三算子融合内核路径**（docs/compute_plan.md §3 的 M0 工作包）：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文「Triton 内核路径（M0/G0）」 |
+| `csa_kernels.py` | **三算子融合内核路径**（已退役算力规划的 M0 工作包）：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文「Triton 内核路径（M0/G0）」 |
 | `run_gapfill.py` | **v6 驱动**：最小可发表补充实验，支持断点续跑，受运行时上限约束，每阶段完成后自动 push，结束后自动关机 |
 | `par.py` | **任务级并行执行器（可选）**：每个独立实验占一张 GPU 卡——见下文「任务级并行」 |
 | `v7_supp.py` | **v7 驱动**：回应 reviewer 的补充实验套件——P0R RoPE+QK-norm、P0W 稠密预热、P0E 40k 步长跑、P2S 规模重播种、P1L 长度外推、P1T topk 扫描 |
@@ -36,11 +38,10 @@
 | `DECISION_LOG.md` | **决策日志**（入库；因快照只有一个压缩提交，2026-10-18 依据 README/设计说明/清单重建）：每个版本为什么跑/不跑什么、看到什么、据此决定了什么——探索/确认分离的书面轨迹；正式版本的逐种子证据另由 `archive_release.py` 归档 |
 | `audit_gates.py` | **评审二轮的可执行审计入口**（零实验）：数据泄漏（分词器来源/词表一致性/文档重叠）、纯 CPU 因果性单元审计（前缀不变性/标签移位/解码一致性）、分块归因/边界 vs 随机基线/长度口径/基线公平/失败集中度/预算对账与 prefill-decode-内存测量工具 |
 | `archive_release.py` | **不可变证据归档器**：把每个正式版本的产物（结果/分析/报告/冻结锁/决策日志/环境/权重哈希）打包为带逐文件 sha256 清单的 tar.gz，附独立 verify 子命令——Git 主仓仍只承载源码（design_notes §8），归档发布到只读位置 |
-| `m0_supp.py` | **M0/S1 驱动（已选定 B 档）**：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力吞吐基准）、`full`（S1 主面板）；见下文“B 档 M0/S1”与 `docs/compute_plan.md` |
+| `m0_supp.py` | **M0/S1 驱动（已选定 B 档）**：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力吞吐基准）、`full`（S1 主面板）；见下文“B 档 M0/S1” |
 | `build_report.py` | 零 GPU 报告构建器：从 `results_*/` + `analysis_*/` 产物重建 v7 报告（所有数字现算，绝不硬编码） |
 | `fuse_analysis.py` | 零 GPU fuse 对比驱动：从 `results_*/summary.json` 重算逐层边界对齐（tol=1）、块长统计与 PPL 曲线 |
 | `docs/design_notes.md` | **设计与实现笔记**：块读门为何必须严格、且五处位置必须同步；动态分段器的前缀不变性要求；配对/可测量规则；报告约定；保证注意力按行分块与不分批形式等价的契约 |
-| `docs/compute_plan.md` | **算力规划**：扩规模路线图（0.14B–1.3B 阶梯、FineWeb-Edu、Triton 内核前提）、按 H800 卡时折算的预算口径与 M0–M4 里程碑判据；原申请表草稿不再入库 |
 
 > **`exp_lib.py` 是唯一的代码来源，直接改它。**
 
@@ -148,7 +149,7 @@ CSA_PAR=2 CSA_PAR_GPUS=0,3 python v10_supp.py phase P3SL
 
 ### B 档 M0 / S1（扩规模入口，已选定 B 档）
 
-B 档（docs/compute_plan.md §4–§6）在 WikiText-103 机制层之上新增第二条语料路径与
+B 档规模计划（入口 `m0_supp.py`；原 `docs/compute_plan.md` 已退役）在 WikiText-103 机制层之上新增第二条语料路径与
 S1–S4 规模阶梯，代码入口为 `m0_supp.py`：
 
 ```bash
@@ -171,7 +172,7 @@ M0_PANEL=S2 python m0_supp.py full   # S2 主面板（5 臂 × 3 seeds × 12B；
 
 ### Triton 内核路径（M0/G0）
 
-`csa_kernels.py` 把 compute_plan §3 的三个核心算子实现为融合内核——块压缩
+`csa_kernels.py` 把规模计划的三个核心算子实现为融合内核——块压缩
 池化（[A 泳道 | overlap 泳道] 拼接后的逐通道掩码 softmax + 位置嵌入）、
 索引打分 + top-k 选择（逐轮首达最大值提取，与 torch 稳定降序排序严格同
 序，tie 取最早下标）、稀疏注意力（[top-k 块 | 滑窗] 泳道上的 flash 式在线
@@ -319,3 +320,26 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
 > 量值一律以 `build_report.py` / `fuse_analysis.py` 与各 `v*_supp.py report`
 > 构建器从 `results_*/`、`analysis_*/` 落盘产物现算出的表格为准，仓库正文
 > 不写死任何量值。
+
+## 评审四硬化（本轮）
+
+逐条核对见 `REVIEW_4_RESPONSE.md`。核心变化是把原先的软约束变成机器闸门：
+
+- 报告措辞统一走 `exp_lib.reportable_claim`（n≥6、原始 p、Holm p、
+  `mean>std`、族级最小可达 p）；`attach_holm` 输出族级分辨率上限，
+  v10 的 NIAH 对照并入同一 Holm 族。
+- 交叉点标度改用 `crossover_scaling_fit`：≥4 个去重宽度、任一点删失即
+  拒绝、训练量差 >25% 拒绝、斜率带 95% CI；否则不报告斜率。
+- 每条训练记录新增 `init_core_fp`，`pair_reason` 拒绝共享 trunk 初始化
+  不同的配对；`_compute_control_detail` 报告实测计算量比及方向，偏袒
+  赢家的混杂结果标为 `system_level_only` 而非 `verified`。
+- 陈旧记录 fail-closed：无当前代码戳的按长度臂整臂排除，不列表、不算
+  ratio；缺失 `truncated` 标记按不可验证处理。
+- P2 表显示文档 bootstrap CI；v12 主比较表新增文档 Δ CI，文档数 <64 时
+  禁止总体主张。
+- 长度阶段记录实测效率；新增 `measure_efficiency_sweep` 与
+  `audit_gates.py efficiency_pairs`，只有同形状/同设备/同 KV 语义且
+  比值超出 ±5% 才允许说「更快」。
+- 新增 `audit_gates.py selection`：选择召回工件缺失时明确「学习选择器
+  找到相关信息」为未支持主张；`release` 在 `RELEASES.md` 无完整行时
+  声明仓库 source-only、数值不可独立复核。

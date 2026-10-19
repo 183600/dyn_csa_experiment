@@ -2507,7 +2507,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                 raise
             if _diag_eval_every and _diag_val is not None:
                 print(f'[p1l] {v} s{seed}: diagnostic validation slice {_diag_val.shape}, eval_every={_diag_eval_every} (health monitoring only; not used for selection)')
-            _tr = L.train_variant(v, train_ids, _diag_val, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=batch_size, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=_diag_eval_every, eval_subset=(int(_diag_val.shape[0]) if _diag_val is not None else 0), mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=_deadline, return_model=True, amp_dtype=_amp_mode, eager_batch=_eager_mode)
+            _tr = L.train_variant(v, train_ids, _diag_val, vocab, seed=seed, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=train_len, batch_size=batch_size, steps=steps, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=_diag_eval_every, eval_subset=(int(_diag_val.shape[0]) if _diag_val is not None else 0), mlp_ratio=mr, device=DEVICE, log_every=500, deadline_ts=_deadline, return_model=True, measure_eff=True, amp_dtype=_amp_mode, eager_batch=_eager_mode)
         except Exception:
             # A raised train_variant leaves no record_run behind, so the
             # pre-booked estimate would stay reserved forever (serial mode:

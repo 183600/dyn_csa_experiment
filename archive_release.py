@@ -45,7 +45,12 @@ for _stream in (sys.stdout, sys.stderr):
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DIRS = ['results_lm_test', 'analysis_v12']
-ENV_FILES = ['confirmation_frozen.json', 'DECISION_LOG.md', 'RELEASES.md', 'requirements.txt', 'requirements.lock']
+ENV_FILES = ['confirmation_frozen.json', 'DECISION_LOG.md', 'RELEASES.md', 'requirements.txt',
+            'requirements.lock', 'pyproject.toml',
+            # data/cache provenance: a tokenizer or cache that changes the ids
+            # must be visible in the archive, not only in a local directory.
+            'wt103_cache/test_meta.json', 'wt103_cache/train_meta.json',
+            'wt103_cache/meta.json', 'wt103_cache/val_meta.json']
 
 
 def _sha256(path, chunk=1 << 20):
@@ -114,6 +119,15 @@ def _collect(dirs, include_ckpt=False):
         p = os.path.join(REPO, f)
         if os.path.exists(p):
             files.append(p)
+    # Training logs (gitignored, so they only exist on the experiment machine).
+    # The review asks for per-seed logs in the evidence release; pack every
+    # run_*.log at the repo root rather than trusting a hand-written list.
+    try:
+        for n in sorted(os.listdir(REPO)):
+            if n.startswith('run_') and n.endswith('.log'):
+                files.append(os.path.join(REPO, n))
+    except OSError:
+        pass
     # The freeze lock can already be reached by the directory walk above;
     # duplicate tar members with the same name are ambiguous on extraction,
     # so keep the first occurrence only.

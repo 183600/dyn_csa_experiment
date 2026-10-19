@@ -260,7 +260,7 @@ RNG 流、不改返回内容，因此不触碰 §3.1 的可比性（`CODE_SEMANT
 ## 8. 仓库边界
 
 仓库只承载**源码、驱动脚本与设计文档**：实验结果目录、分析目录、逐版
-报告、运行状态文件都不入库（`.gitignore` 白名单保证，`docs/` 仅留 `design_notes.md` 与 `compute_plan.md`）。
+报告、运行状态文件都不入库（`.gitignore` 白名单保证，`docs/` 仅留 `design_notes.md`；原 `compute_plan.md` 已退役并从仓库删除）。
 实测数字一律由零 GPU 的报告构建器从落盘产物现算，不写死在任何仓库
 文件中——写死的数字在仓库内没有可复核的来源，代码一改就会与报告静默
 矛盾。
@@ -662,14 +662,14 @@ z（n=6 时 90% t 区间比 z 区间宽约 20%，用 z 会把「未判等价」�
   与文档×种子的分层分析；在此之前，主张范围限于「该冻结 test 切片」。
 - **小种子面板一律描述性（意见九 c）**：双侧精确符号翻转的 p 下限 =
   2/2^n：n=4 → 0.125，n=3 → 0.25，n=2 → 0.5。S1×4 / S2×3 / hero×2
-  （compute_plan §5 阶梯）**全部不可能达到 0.05 显著性**，无论效应多大
+  （已退役算力规划的 S1/S2 阶梯）**全部不可能达到 0.05 显著性**，无论效应多大
   ——这些面板只能作为描述性证据与方向性读数；确认性结论必须等到种子数
   与族大小满足功效门槛（`exp_lib.holm_min_attainable_p` /
   `signflip_power`，冻结清单 v2 的 12 种子口径）。小规模补种子不能替代
   大规模结论自身的不确定性声明。
 - **外部有效性边界（意见十一）**：全部机制结论出自 WikiText-103 小模型
   （BPE-8k，d≤512）。跨语料、跨规模、跨任务的推广是**主张外的**——
-  compute_plan 的 B 档规模面板（FineWeb-Edu、0.14B+）是为此设计的独立
+  B 档规模面板（`m0_supp.py`；FineWeb-Edu、0.14B+）是为此设计的独立
   验证路径，其判据见 §16 的口径约束；在此之前，标题与摘要不得把机制
   结论写成通用规律。
 - **九领域审计入口（意见十一）**：`audit_gates.py` 把数据泄漏（分词器
@@ -1101,3 +1101,99 @@ blocks: the main result measures "is a prefix useful under a fixed K", not
   one comparison.
 - All formal arms train from scratch; a checkpoint from a closed run switched
   to an open mode is a diagnostic, not a substitute for training adaptation.
+
+## 25. 评审四（review 4）后的证据门槛：把「有字段」变成「有闸门」
+
+本轮不再新增实验面板，而是把四个评审反复指出的「软约束」改成机器可检的
+闸门，并明确仍然无法由本仓库回答的部分。
+
+### 25.1 统一的显著性措辞闸门
+
+`exp_lib.reportable_claim` 是报告正文「significant / confirmed」的唯一
+判据：n≥6、原始 p<α、Holm p<α、|mean|>std、族级最小可达 Holm p≤α 全部
+满足才返回 `allowed=True`；否则返回 `underpowered` /
+`resolution_limited` / `not_significant` 与逐条原因。v10/v11 的
+「强版本成立」判定、`build_report._sig_gate` 与 v12 的确认规则都走同一
+口径。`attach_holm` 现在同时输出 `family_min_attainable_p_holm` 与
+`family_resolution_limited`：当 m 个比较 × n 个种子的最小可达 Holm p
+已经 >α 时，p_holm=1.0 是分辨率上限，不是零结果，报告必须这样写。
+v10 的 NIAH-natural 对照此前在 Holm 之后才构造，已改为并入同一族重新
+校正，不再出现「标题写 Holm、表里是原始 p」的路径。
+
+### 25.2 交叉点标度拟合的拒绝规则
+
+`exp_lib.crossover_scaling_fit` 取代了各驱动里的 `np.linalg.lstsq`：
+
+- 重构件（`synthesized`）不进入拟合；
+- 任一点删失（窗口内未交叉）即拒绝拟合，而不是丢掉删失点后只拟合
+  更快交叉的子集；
+- 需要 ≥4 个**去重后**的宽度点；同一 d 出现多个面板时保留训练 token
+  最多的（token-matched）臂并列出被丢弃者；
+- 训练量最大/最小 >1.25 时拒绝，报告 `training_volume_confounded`；
+- 通过时斜率、95% CI、p、R²、留一斜率范围全部来自
+  `loglog_regression`，并固定 `claim_level='descriptive'`。
+
+因此 n=2 的恒等式、删失偏倚、d=512 三个 4000/8000/flop 面板互相冒充
+独立点这三条路径都被堵住。剩余边界：没有实现 Tobit/生存回归；点数
+仍少，结论只能是描述性趋势。
+
+### 25.3 初始化的可核对性与计算预算
+
+`init_core_fingerprint` 对每臂共享的 trunk 参数（tok/pos/head/norm）
+取哈希，作为训练记录字段 `init_core_fp`；`pair_reason` 要求成对记录
+两边都有且相等，否则判 unverifiable/different。这样「按 seed 配对」
+不再只是声明：至少共享部分的初始化被机器核对了。架构差异导致的
+RNG 流差异仍属于「臂」的一部分，因此 `rng_fp` 仍只报告不强制。
+
+`_param_control_detail` 在总参数量之外报告 non-embedding 与 active
+参数量差（random-indexer 的死参数、dense 的 MLP 重分配因此在表里可见）。
+`_compute_control_detail` 用实测 `train_time_s/tokens_seen`（无计时时
+退回 6ND 代理）给出 compute 比与「哪一臂更贵」；当更贵的一臂恰好是
+声称的赢家且比值 >1.5 时，`mechanism_claim_allowed=False`，
+`_classify_group_status` 返回 `system_level_only` 而不是 `verified`。
+v12 冻结统计另外拒绝缺少 `compute_budget_disclosure` 的非描述性清单。
+
+### 25.3b 训练 token 记账
+
+`tokens_seen` 是**窗口抽取数**，不是唯一 token 数：训练窗口独立均匀采样、
+彼此重叠，8M token 缓存上 3000 步 × 12 × 512 并不等于消费了 18.4M 个不同
+token。记录现在同时写 `tokens_seen_unique_estimate`、
+`tokens_seen_unique_frac_estimate` 与 `token_accounting_note`——按独立均匀
+窗口抽样的覆盖率估计 `1-(1-seq/N)^draws`，是估计而不是测量；任何「等 token
+训练」的主张应同时给出抽取数与覆盖率估计。
+
+### 25.4 陈旧记录与长度截断的 fail-closed
+
+- `build_report.sec_p1l` 与 v10 的按长度表：没有任何记录携带当前代码
+  语义戳的臂**整臂排除**，不列表、不算 ratio、不进入外推结论；表下
+  明示被排除的臂。此前「没有新记录就引用旧值并加 ⚠」的路径已删除。
+- `_agg_entry`：多配置组且无当前戳时返回 None（拒绝引用），单条显式
+  `run_cfg` 非当前戳时同样拒绝。
+- 长度 cell 缺少 `truncated` 字段时按「不可验证」处理（不进入 ratio），
+  `audit_gates.length` 也把缺失标记记为 problem；`truncated=False` 才是
+  全长测量。
+
+### 25.5 文档抽样、效率与选择归因
+
+- `ppl_ci95_doc_bootstrap` 进入 P2 表；v12 主比较表新增「文档 Δ 95% CI」
+  列。`MIN_DOCS_FOR_POPULATION_CLAIM=64`，低于它时
+  `population_claim_allowed=False`，主张只针对冻结的评测切片。
+- v7 长度阶段现在记录 `measure_efficiency`；新增
+  `measure_efficiency_sweep`（batch × length、CUDA event 计时、设备/
+  torch/triton/TF32 元数据）与 `audit_gates.efficiency_pairs`：只有同
+  token 数、同设备/torch、同 KV 语义、且比值超出 ±5% 才允许说
+  「更快」。解析 FLOPs 的措辞已改为「结构性估计，不是实测加速」。
+- `audit_gates.selection` 定义了选择归因工件的契约（recall@k、
+  mass_covered、随机基线、per-seed 检验）。没有该工件时审计返回
+  `not_verifiable_locally`，并明确「学习选择器找到了相关信息」是
+  **未支持的机制主张**。这不能替代真正的 oracle/recall 实验，但它把
+  「没有直接机制证据」变成了可执行、不可静默跳过的状态。
+
+### 25.6 证据归档
+
+`audit_gates.release` 解析 `RELEASES.md`：没有任何同时给出 commit、
+归档 URL、两个 SHA-256 与 verifier 的行时，状态为 `no_release`，
+并声明所有报告数值不可独立复核。`archive_release.py` 现在额外打包
+`pyproject.toml`、cache/tokenizer 元数据与 `run_*.log`（存在时）。
+本快照仍是 source-only：仓库**没有**随附证据归档，这一点在 README、
+README_zh 与 `RELEASES.md` 中均已明示。

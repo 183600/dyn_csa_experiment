@@ -501,7 +501,7 @@ def paired_row(a_records, b_records):
 def sec_header():
     return ('# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n'
             f'> 生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")}\n'
-            '> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）\n'
+            '> 参考论文：arXiv:2606.19348。**范围声明**：本仓库是小规模、从头训练、WikiText-103、固定训练预算下的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到该模型的规模、语料、长上下文训练或生产系统。\n'
             '> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n'
             '> **证据等级：探索性（exploratory）**。本报告的面板/种子/比较是在同一 validation split 上选择后观察的；'
             'Holm 校正只限制过度宣称，不能把这些结果变成预注册确认。确认性证据见 `confirmation_frozen.json` / v12。\n'
@@ -844,7 +844,14 @@ def sec_p0e():
             else:
                 _gap_calib = 'seed 平均'
             lines += ['', f'**差距轨迹分析（尾段 {tail[0]:g}–{steps[-1]:g} 步，跨度 {_tail_span_k:g}k，{_gap_calib}）**：', '', f'- 20k 步差距：{_g20} PPL；{_lastk:g}k 步差距：**{g_last:+.1f}** PPL。', f'- 尾段差距斜率：**{slope:+.2f} PPL / 1k steps**（csa {_dir_word(r_csa)} {abs(r_csa):.2f}、dense {_dir_word(r_full)} {abs(r_full):.2f} PPL/1k）。']
-            if _unpaired_gap:
+            _n_paired_seeds = len(_paired)
+            if _n_paired_seeds and _n_paired_seeds < 6:
+                verdict = (f'**结论（描述性，n={_n_paired_seeds}）：本轮不对「渐近线是否反演/坐实」作判定。** '
+                           f'通过配对门禁的公共 seed 只有 {_n_paired_seeds} 个（精确符号翻转在 n<6 时的最小可达 p 已 >0.05），'
+                           f'且 40k 步的 cosine LR 已衰减到底、没有学习率续训或独立复现；'
+                           f'因此只能报告「{_lastk:g}k 步窗口内终点差距 {g_last:+.1f} PPL、尾段斜率 {slope:+.2f} PPL/1k」，'
+                           '不能写成「渐近线更差」或「渐近线反转」。')
+            elif _unpaired_gap:
                 verdict = f'**结论（受限）：本轮不对「渐近线是否反演」作判定。** 两臂在尾段评测步上没有任何通过配置/训练量配对门禁的公共 seed，上方尾段斜率（{slope:+.2f} PPL/1k）与终点差距（{g_last:+.1f} PPL）是**非配对逐步均值差**——每个评测步由各自测得的 seed 平均，seed 组成随步变化，组成变化本身即可伪造或掩盖交叉。需补齐两臂共享 seed 的长跑记录后再按同一判据重算。'
             elif n_ < 2:
                 verdict = f'**结论：尾段差距统计量不可用**（两臂只在 {n_} 个公共评测步上有测量，尾段回归需要至少 2 个点），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。需补跑或加密尾段评测网格。'
@@ -859,9 +866,9 @@ def sec_p0e():
                     _g20c = f'由 20k 的 **{_g20v:+.1f}** ' if isinstance(_g20v, (int, float)) and math.isfinite(_g20v) else ''
                     verdict = f'- 按尾段斜率线性外推，差距将在 ~{x0 / 1000:.0f}k 步附近归零（外推仅供参考：学习率已 cosine 衰减到底，后期斜率通常进一步放缓）。\n\n**结论**：{_lastk:g}k 步内未发生反演，但差距仍在缓慢收窄。**保守表述**：「等 token 量下 CSA 收敛更慢，终点差距 {_g20c}收窄到 {_lastk:g}k 的 {g_last:+.1f}，未见交叉」。是否最终追平属外推，不属证据。'
                 else:
-                    verdict = f'- 线性外推的交叉点在 ~{x0 / 1000:.0f}k 步，超出可信外推范围。\n\n**结论**：{_lastk:g}k 步（~{_tok_m} tokens）仍未追平——终点差距 **{g_last:+.1f} PPL**。差距收窄速度在尾段为 {abs(slope):.2f} PPL/1k，即每多训 10k 步约收窄 {abs(slope) * 10:.0f} PPL。**「渐近线更差」在实验可达范围内成立**，更精确的措辞是「等训练量下收敛更慢且差距长期存在」。'
+                    verdict = f'- 线性外推的交叉点在 ~{x0 / 1000:.0f}k 步，超出可信外推范围。\n\n**结论**：{_lastk:g}k 步（~{_tok_m} tokens）仍未追平——终点差距 **{g_last:+.1f} PPL**。差距收窄速度在尾段为 {abs(slope):.2f} PPL/1k，即每多训 10k 步约收窄 {abs(slope) * 10:.0f} PPL。**在本轮 {_lastk:g}k 步窗口内差距没有消失**；这支持「等训练量下收敛更慢」，不足以判定收敛后的渐近线（缺学习率续训与独立复现）。'
             else:
-                verdict = f'**结论**：尾段差距已不再收窄（斜率 {slope:+.2f} PPL/1k），**「渐近线更差」在 {_lastk:g}k 步坐实**。'
+                verdict = f'**结论**：尾段差距已不再收窄（斜率 {slope:+.2f} PPL/1k），**在本轮 {_lastk:g}k 步窗口内差距已不再收窄**——这是窗口内读数，不是收敛后的渐近线结论。'
             lines += ['', verdict, '']
     return '\n'.join(lines) + '\n'
 
@@ -1026,9 +1033,9 @@ def sec_p1t():
         else:
             _dir3 = '（无通过门禁的三方公共 seed，逐 seed 方向不可核验）'
         if m1m > t8m and m1m > t32m:
-            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最差的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩并没有拯救 sparse 臂——在 seq 2048 / 1500 步的受控训练量下，**压缩不是瓶颈**，评审「缺 m=1 对照」的质疑得到直接回答（方向与整体负结果一致）。')
+            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最差的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩并没有拯救 sparse 臂——在 seq 2048 / 1500 步的受控训练量下，m=1 的三点均值最差；但这是未配对、未做族校正的 3 点排序，只能支持「本轮压缩正则不是唯一瓶颈」的**方向性**表述，不能写成「压缩不是瓶颈」的机制结论。')
         elif m1m < t8m and m1m < t32m:
-            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最好的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩反而占优——在 seq 2048 / 1500 步的受控训练量下，**压缩是当前的瓶颈之一**，评审「缺 m=1 对照」的质疑得到直接回答。')
+            lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最好的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩反而占优——在 seq 2048 / 1500 步的受控训练量下，这是支持「压缩是瓶颈之一」的方向性证据，但三点均值未做配对/族校正，不能单独支撑机制结论。')
         else:
             lines.append(f'1. m=1（{fm(m1m)}）介于 topk8（{fm(t8m)}）与 topk32（{fm(t32m)}）之间，三点排序非单调{_dir3}；评审「缺 m=1 对照」的质疑得到直接回答，但压缩是否瓶颈需结合显著性判断，此处只作方向性表述。')
     elif _m1_ok:
@@ -1075,11 +1082,19 @@ def sec_p1l():
                 print(f'[report] sec_p1l: {_v}: {len(_rv) - len(_cur)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur)} current one(s)')
             recs.extend(_cur)
         else:
-            print(f'[report] sec_p1l: {_v}: NONE of the {len(_rv)} by-length record(s) carries the current code-semantics stamp {_CUR_CS!r} — quoting STALE values for lack of a current one; re-run the length panel to refresh')
+            # Fail closed (review issue 16): a panel whose every record predates
+            # the current code/recipe stamp is excluded from the table, the
+            # ratio and every conclusion.  It is listed as stale below instead
+            # of being quoted with a warning marker.
+            print(f'[report] sec_p1l: {_v}: NONE of the {len(_rv)} by-length record(s) carries the current code-semantics stamp {_CUR_CS!r} — EXCLUDED from the table and conclusions; re-run the length panel to refresh')
             _stale_vars.add(_v)
-            recs.extend(_rv)
     if not recs:
-        return '## P1 长上下文长度外推 — （无结果）\n\n'
+        _msg = '## P1 长上下文长度外推 — （无可验证结果）\n\n'
+        if _stale_vars:
+            _msg += ('> **陈旧记录已排除**：' + '、'.join(f'`{v}`' for v in sorted(_stale_vars)) +
+                     f' 的全部按长度记录都早于当前代码语义戳 `{_CUR_CS}`。按「旧代码/旧配方不得进入主要结论」的规则，'
+                     '本节不引用这些数值、不计算 ratio，也不给出外推结论。重跑长度面板后再纳入。\n\n')
+        return _msg
     def _len_key(Ln):
         try:
             return int(Ln)
@@ -1089,7 +1104,7 @@ def sec_p1l():
     variants = sorted({r.get('variant') for r in recs if r.get('variant') is not None})
     _seed_key = lambda x: (0, float(x), '') if isinstance(x, (int, float)) and (not isinstance(x, bool)) else (1, 0.0, str(x))
     _seeds_by_v = {v: sorted({r.get('seed') for r in recs if r.get('variant') == v and r.get('seed') is not None}, key=_seed_key) for v in variants}
-    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
+    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；`?` = 该格缺少 `truncated` 标记，按不可验证处理（不参与 ratio）；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
     per_v = {}
     trunc_v = {}
     # Group by variant (preserving order).
@@ -1113,16 +1128,21 @@ def sec_p1l():
                         continue
                     _seen_sd.add(_sd)
                     recs_l.append((_sd, _c))
-            ok = [x for _sd, x in recs_l if not x.get('truncated')]
-            is_tr = bool(recs_l) and len(ok) < len(recs_l)
-            vals = [float(x['ppl']) for x in (ok if ok else [x for _sd, x in recs_l])]
+            # Fail closed on a missing truncation flag: a cell that does not
+            # say whether it was truncated is unverifiable, not full-length.
+            _unknown = [_sd for _sd, x in recs_l if 'truncated' not in x]
+            if _unknown:
+                print(f'[report] sec_p1l: {v} L{Ln}: {len(_unknown)} cell(s) lack the `truncated` flag {sorted(_unknown)} — the column is marked unverifiable and never enters a ratio')
+            ok = [x for _sd, x in recs_l if ('truncated' in x and not x.get('truncated'))]
+            is_tr = bool(recs_l) and (len(ok) < len(recs_l))
+            vals = [float(x['ppl']) for x in ok]
             trunc_flags.append(is_tr)
             mean = sum(vals) / len(vals) if vals else None
             if mean is None:
-                cells.append('—')
+                cells.append('—' if not recs_l else '?')
             else:
                 cells.append(f'~{mean:.1f}' if is_tr else f'{mean:.1f}')
-            if recs_l and not is_tr:
+            if ok and not is_tr:
                 _tgt = base_map if Ln == lens[0] else last_map if Ln == lens[-1] else None
                 if _tgt is not None:
                     for _sd, x in recs_l:
@@ -1135,7 +1155,7 @@ def sec_p1l():
         _vmark = '，⚠ 陈旧' if v in _stale_vars else ''
         lines.append(f'| `{v}`（n={len(_seeds_by_v.get(v, []))}{_vmark}） | ' + ' | '.join(cells) + f' | {rt_txt} |')
     if _stale_vars:
-        lines += ['', '> **⚠ 陈旧数据**：' + '、'.join((f'`{v}`' for v in sorted(_stale_vars))) + f' 的按长度记录全部早于当前代码语义戳 `{_CUR_CS}`——这些数值由旧版代码测得，仅因缺少当前测量而列出，重跑长度面板后才会刷新；涉及它们的结论须按陈旧数据处理。', '']
+        lines += ['', '> **⚠ 陈旧记录已排除**：' + '、'.join((f'`{v}`' for v in sorted(_stale_vars))) + f' 没有任何按长度记录携带当前代码语义戳 `{_CUR_CS}`，因此**未进入上表、未参与 ratio 或外推结论**（旧代码/旧配方不得进入主要结论）。重跑长度面板后再纳入。', '']
     _any_trunc = any((any(f) for f in trunc_v.values()))
     if _any_trunc:
         lines += ['', '**位置受限（截断）臂**：' + '、'.join((f'`{v}`' for v, f in sorted(trunc_v.items()) if any(f))) + ' —— 其 span > max_pos 的格全部只覆盖最后 `max_pos` 个 token，与真正的长上下文分数不可比；比较外推能力时须以 RoPE 臂（无位置上限）为准。', '']
@@ -1195,7 +1215,15 @@ def _agg_entry(d, v):
 
 def _agg_entry_scan(d, v):
     if v in d:
-        return d[v]
+        e = d[v]
+        # Review issue 16: a single entry that *does* carry a run_cfg must be
+        # stamped with the current code semantics; quoting it otherwise would
+        # put a stale number in a main table without any visible marker.
+        rc = e.get('run_cfg') if isinstance(e, dict) else None
+        if isinstance(rc, str) and bool(_CUR_CS) and not rc.endswith(f'_cs{_CUR_CS}'):
+            print(f'[report] _agg_entry: `{v}` carries run_cfg `{rc[-24:]}` which does not end in the current code stamp `_cs{_CUR_CS}` — REFUSED (stale aggregate; re-run the panel)')
+            return None
+        return e
     cands = [(k, e) for k, e in d.items() if isinstance(e, dict) and (k.startswith(f'{v}@cfg') or k.startswith(f'{v}#'))]
     if not cands:
         return None
@@ -1207,8 +1235,11 @@ def _agg_entry_scan(d, v):
         cands.sort(key=lambda kv: (not _is_cur(kv[1]), -(_int_or(kv[1].get('n_seeds'), 0))))
         _why = 'the one stamped with the current code semantics'
     else:
-        cands.sort(key=lambda kv: -(_int_or(kv[1].get('n_seeds'), 0)))
-        _why = 'the largest-n one (no group carries a current-code run_cfg stamp — re-run `aggregate` to stamp them)'
+        # Fail closed: with several incompatible config groups and no current
+        # stamp, picking "the largest n" is exactly the stale-admission path
+        # the review flagged.  Report the refusal instead.
+        print(f'[report] _agg_entry: `{v}` spans {len(cands)} cfg/protocol groups ({sorted((k for k, _e in cands))}) and NONE carries the current code stamp `_cs{_CUR_CS}` — REFUSED (unverifiable/stale aggregate; re-run the panel)')
+        return None
     if len(cands) > 1:
         print(f'[report] _agg_entry: `{v}` spans {len(cands)} cfg/protocol groups ({sorted((k for k, _e in cands))}) — quoting {_why} ({cands[0][0]}, n_seeds={cands[0][1].get('n_seeds')})')
     return cands[0][1]
@@ -1223,10 +1254,16 @@ def sec_p2s():
     d = agg('results_lm_v5_scale')
     if not d:
         return ''
-    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**评审论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (pooled/mean; ±seed sd) | n | params |', '|---|---|---|---|']
-    for v in sorted(d):
-        r = d[v]
-        lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
+    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**评审论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (pooled/mean; ±seed sd) | 文档 bootstrap 95% CI | n | params |', '|---|---|---|---|---|']
+    _variants = sorted({r.get('variant') for r in d.values() if isinstance(r, dict) and r.get('variant') is not None})
+    for v in _variants:
+        r = _agg_entry(d, v)
+        if r is None:
+            continue
+        _dci = r.get('ppl_ci95_doc_bootstrap')
+        _dcitxt = f'[{_dci[0]:.2f}, {_dci[1]:.2f}]' if isinstance(_dci, (list, tuple)) and len(_dci) == 2 else '—（缺逐文档 NLL）'
+        lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {_dcitxt} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
+    lines += ['', '> 注：`±seed sd` 是**种子层**训练随机性；`文档 bootstrap 95% CI` 重采样固定的评测文档，只量化**文档抽样**不确定性，二者不是同一个估计量。评测文档少于 64 条时该 CI 不覆盖语言数据总体（design_notes §20）。', '']
     ps = per_seed_records('results_lm_v5_scale')
     pairs = [('csa_fixed', 'full'), ('csa_fixed', 'full_sw128_matched'), ('csa_fixed', 'full_matched'), ('csa_dynamic', 'full'), ('hybrid_dynamic', 'full')]
     _agg = d
@@ -1254,7 +1291,7 @@ def sec_p2s():
             _which = '`csa_fixed − full_matched`（参数对齐）' if _mt else '`csa_fixed − full`（未做容量匹配）'
             _tag = unmatched_tag(_agg_entry(_agg, _ba), _agg_entry(_agg, _bb)) if _mt else unmatched_tag(_agg_entry(_agg, 'csa_fixed'), _agg_entry(_agg, 'full'))
             if st['mean'] > 0:
-                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：短训练下的 sparse 早期优势在 d=384 / 8 层 / seq 1024 的规模上**已经消失并反转为劣势**——规模越大，dense 的容量红利显现越早，与 20k/40k 长跑的「渐近线反转」同一方向。{_tag or '✓'}'
+                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + ('该差距通过 n≥6 + Holm + 效应>噪声门槛，方向为 sparse 更差。' if _sig_gate(st) else '该差距**未通过** n≥6 + Holm + 效应>噪声门槛，只能作方向性读数，不能写成「已经反转」。') + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。' + (f'{_tag}' if _tag else '✓')
             else:
                 concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：该规模下 sparse 仍领先，早期优势未随规模消失。{_tag or '✓'}'
             lines += ['', f'**结论**：{concl}', '']
@@ -1291,7 +1328,7 @@ def sec_flops():
         _ratios = [r['csa_over_dense'] for r in _clean]
         _mono = all((_ratios[i] >= _ratios[i + 1] - 1e-12 for i in range(len(_ratios) - 1)))
         _trend = f'比值单调降到 {min(_ratios):.3f}' if _mono else f'比值总体下行到 {min(_ratios):.3f}（非严格单调，逐点见 flops_analytic.csv）'
-        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。优势随序列变长继续放大（{_trend}）。稀疏的收益是随长度增长的，并非在任意长度上都成立。', '']
+        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。**按该解析口径**（仅注意力项，不是实测延迟/吞吐/显存），CSA/dense 比随长度下降（{_trend}）；这不等于真实 GPU 加速，实际收益须由 checkpoint 上的测量确认。', '']
     return '\n'.join(lines) + '\n'
 
 def _sig_gate(st, alpha=0.05, min_n=6):
@@ -1438,7 +1475,7 @@ def sec_stats():
     d = load(os.path.join(REPO, 'analysis_v7', 'stats.json'))
     if not d:
         return ''
-    lines = ['## 配对符号翻转检验（sign-flip permutation）', '', 'n≤4 时 bootstrap 无意义，改用符号翻转：n≤20 枚举全部 2^n 种符号组合得精确双侧 p 值；n>20 为固定种子的 Monte-Carlo 符号翻转（B=200000，p 分辨率下限 1/200001）。n 很小时 p 的分辨率有限是统计事实，报告 Δ 与方向同向性。', '', '> **证据等级：探索性（v7 面板）**。Holm 列在本报告展示的对比族内做 step-down 校正，防止把多格 p<0.05 读成多个发现；它不是预注册确认，也不能把 v7–v11 已看过的数据变成确认性证据（见 docs/design_notes.md §17）。', '', '| 比较 | Δ(mean) | p | p_Holm |', '|---|---|---|---|']
+    lines = ['## 配对符号翻转检验（sign-flip permutation）', '', '符号翻转检验：n≤20 枚举全部 2^n 种符号组合得精确双侧 p 值；20<n≤40 用 meet-in-the-middle 精确计数；n>40 用确定性的 Lugannani-Rice 鞍点尾近似（不是随机 Monte-Carlo）。n 很小时 p 的分辨率下限为 2/2^n，报告 Δ、方向同向性与该下限。', '', '> **证据等级：探索性（v7 面板）**。Holm 列在本报告展示的对比族内做 step-down 校正，防止把多格 p<0.05 读成多个发现；它不是预注册确认，也不能把 v7–v11 已看过的数据变成确认性证据（见 docs/design_notes.md §17）。', '', '| 比较 | Δ(mean) | p | p_Holm |', '|---|---|---|---|']
     items = d.get('comparisons', {}) if isinstance(d, dict) else {}
     if not items and isinstance(d, dict):
         items = {k: v for k, v in d.items() if isinstance(v, dict) and (v.get('mean') is not None or v.get('delta') is not None)}

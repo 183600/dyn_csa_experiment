@@ -55,11 +55,20 @@ except Exception as _e:  # pragma: no cover
 _results = []
 
 
+class _SkipTest(Exception):
+    """A check whose precondition this environment cannot provide (e.g. the
+    sandbox forbids POSIX semaphores for DataLoader workers).  Reported as
+    SKIP rather than silently passing or failing."""
+
+
 def _check(name, fn):
     try:
         fn()
         _results.append((name, 'PASS', ''))
         print(f'[test] PASS  {name}')
+    except _SkipTest as e:
+        _results.append((name, 'SKIP', str(e)))
+        print(f'[test] SKIP  {name}: {e}')
     except AssertionError as e:
         _results.append((name, 'FAIL', str(e)))
         print(f'[test] FAIL  {name}: {e}')
@@ -1784,8 +1793,12 @@ def t_dataloader_seeding_helpers():
     def worker_order(seed):
         dl = L.deterministic_dataloader(_DrawDS(), batch_size=8, shuffle=True, seed=seed, num_workers=2)
         return [tuple(int(x) for x in row) for b in dl for row in b]
-    assert worker_order(4) == worker_order(4), 'spawned DataLoader workers must reproduce their Python/NumPy draws'
-    assert worker_order(4) != worker_order(5), 'a different DataLoader seed must change the worker draws'
+    try:
+        _w4a, _w4b, _w5 = worker_order(4), worker_order(4), worker_order(5)
+    except (PermissionError, OSError) as e:
+        raise _SkipTest(f'DataLoader worker processes need POSIX semaphores, which this sandbox forbids ({type(e).__name__}: {e})') from e
+    assert _w4a == _w4b, 'spawned DataLoader workers must reproduce their Python/NumPy draws'
+    assert _w4a != _w5, 'a different DataLoader seed must change the worker draws'
 
 
 def t_train_variant_reproducible():
@@ -1793,6 +1806,11 @@ def t_train_variant_reproducible():
     val = (np.arange(64, dtype=np.int64) % 997).reshape(2, 32)
     kw = dict(d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2, steps=4, lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0, eval_every=0, mlp_ratio=4.0, device=torch.device('cpu'), log_every=0)
     a = L.train_variant('full', ids, val, 997, seed=3, **kw)
+    # Token accounting: draws are not unique tokens; the estimate must be
+    # present, bounded, and strictly below the draw count on an undersized cache.
+    assert a['tokens_seen'] == 4 * 2 * 32, a['tokens_seen']
+    assert a.get('tokens_seen_unique_frac_estimate') is not None and 0.0 < a['tokens_seen_unique_frac_estimate'] <= 1.0, a
+    assert a['tokens_seen_unique_estimate'] <= len(ids), a
     b = L.train_variant('full', ids, val, 997, seed=3, **kw)
     c = L.train_variant('full', ids, val, 997, seed=4, **kw)
     assert a['losses'] == b['losses'], 'same seed must reproduce the whole training loss curve'
@@ -3019,6 +3037,244 @@ def t_simple_baseline_audit_malformed_records():
     assert any('n_tokens is not an integer' in p for p in out['problems']), out
 
 
+
+# ---------------------------------------------------------------------------
+# L. Review-4 hardening: claim gate, Holm family floor, crossover fit,
+#    matched init, compute control, stale refusal, efficiency pairs.
+# ---------------------------------------------------------------------------
+
+def t_reportable_claim_gate():
+    base = {'n': 6, 'mean': -1.0, 'std': 0.2, 'p_exact_signflip': 0.01, 'p_holm': 0.02}
+    r = L.reportable_claim(base)
+    assert r['allowed'] is True and r['level'] == 'exploratory_significant', r
+    # n<6 is underpowered even with a tiny raw p.
+    r = L.reportable_claim(dict(base, n=3, p_holm=0.02))
+    assert r['allowed'] is False and r['level'] == 'underpowered', r
+    # Missing Holm is uncorrected -> not reportable.
+    r = L.reportable_claim({k: v for k, v in base.items() if k != 'p_holm'})
+    assert r['allowed'] is False and any('Holm' in x for x in r['reasons']), r
+    # Effect inside seed noise is not reportable.
+    r = L.reportable_claim(dict(base, mean=-0.1, std=0.2))
+    assert r['allowed'] is False and any('seed noise' in x for x in r['reasons']), r
+    # A family too large for n=6 cannot reach significance at all.
+    r = L.reportable_claim(base, family_size=100)
+    assert r['allowed'] is False and r['min_attainable_p_holm_family'] > 0.05, r
+    # Confirmatory is only honoured when the caller says so.
+    r = L.reportable_claim(base, evidence_level='confirmatory')
+    assert r['level'] == 'confirmatory', r
+
+
+def t_holm_family_resolution_ceiling():
+    comps = {f'c{i}': {'n': 3, 'mean': -1.0, 'std': 0.2, 'p_exact_signflip': 0.25} for i in range(100)}
+    fam = L.attach_holm(comps, family='100 exploratory contrasts')
+    assert fam['family_resolution_limited'] is True, fam
+    assert fam['family_min_attainable_p_holm'] > 0.05, fam
+    assert fam['n_effective_min'] == 3 and fam['n_effective_max'] == 3, fam
+    # A small, powered family is not flagged.
+    comps2 = {f'c{i}': {'n': 12, 'mean': -1.0, 'std': 0.2, 'p_exact_signflip': 0.001} for i in range(4)}
+    fam2 = L.attach_holm(comps2, family='4 confirmatory contrasts', exploratory=False)
+    assert fam2['family_resolution_limited'] is False, fam2
+    assert fam2['evidence_level'] == 'confirmatory', fam2
+
+
+def t_crossover_scaling_refusals():
+    def pts(n, d=(128, 256, 384, 512), tok=(50e6,), censored=False, vol=(50e6,)):
+        return [{'label': f'd{dd}', 'd': dd, 'crossover_tokens': tok[0], 'train_tokens': vol[i % len(vol)],
+                 'censored': censored, 'reconstructed': False} for i, dd in enumerate(d[:n])]
+    # <4 distinct widths -> refused.
+    f = L.crossover_scaling_fit(pts(3))
+    assert f['status'] == 'insufficient_points', f
+    # Any censored point refuses the fit (informative censoring).
+    f = L.crossover_scaling_fit(pts(4, censored=True))
+    assert f['status'] == 'censored' and f['reasons'], f
+    # Training-volume spread > 25% refuses the d slope.
+    f = L.crossover_scaling_fit(pts(4, vol=(25e6, 50e6)))
+    assert f['status'] == 'training_volume_confounded', f
+    # Duplicate widths keep the token-matched panel and are named.
+    dup = pts(4) + [{'label': 'd512_half', 'd': 512, 'crossover_tokens': 40e6, 'train_tokens': 25e6}]
+    f = L.crossover_scaling_fit(dup)
+    assert f['status'] == 'ok' and 'd512_half' in (f.get('deduped_by_d') or []), f
+    # A clean 4-point fit carries a slope CI and is labelled descriptive.
+    f = L.crossover_scaling_fit(pts(4))
+    assert f['status'] == 'ok' and f.get('slope') is not None and f.get('ci') is not None, f
+    assert f['claim_level'] == 'descriptive', f
+    assert f['volume_ratio'] <= 1.25, f
+
+
+def t_init_core_fingerprint_and_pair_gate():
+    dev = torch.device('cpu')
+    L.set_seed(3)
+    m1 = L.SmallGPT(64, 32, 1, 2, 16, 32, L.make_layer_cfgs(1, 'full')).to(dev)
+    L.set_seed(3)
+    m2 = L.SmallGPT(64, 32, 1, 2, 16, 32, L.make_layer_cfgs(1, 'csa_fixed')).to(dev)
+    L.set_seed(4)
+    m3 = L.SmallGPT(64, 32, 1, 2, 16, 32, L.make_layer_cfgs(1, 'full')).to(dev)
+    fa, fb, fc = (L.init_core_fingerprint(m) for m in (m1, m2, m3))
+    assert fa == fb, 'same seed + shared trunk must hash identically across variants'
+    assert fa != fc, 'a different seed must produce a different init digest'
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    common = dict(run_cfg=fp, steps=1, tokens_seen=1, train_knobs=L.training_knobs(),
+                  data_fp='d', val_fp='v', eval_fp='e')
+    a = dict(common, variant='a', seed=0, ppl=10.0, init_core_fp=fa)
+    b = dict(common, variant='b', seed=0, ppl=11.0, init_core_fp=fa)
+    assert L.pair_reason(a, b) is None, L.pair_reason(a, b)
+    why = L.pair_reason(a, dict(b, init_core_fp=fc))
+    assert why is not None and 'init_core_fp' in why, why
+    why = L.pair_reason(a, {k: v for k, v in b.items() if k != 'init_core_fp'})
+    assert why is not None and 'unverifiable init_core_fp' in why, why
+
+
+def t_param_and_compute_control_detail():
+    bd = {'total': 1000, 'non_embedding': 800, 'active': 700, 'embedding': 200}
+    recs = {('a', 'p', 0): {'params': 1000, 'param_breakdown': bd, 'train_time_s': 10.0, 'tokens_seen': 100.0},
+            ('b', 'p', 0): {'params': 1000, 'param_breakdown': {'total': 1000, 'non_embedding': 800, 'active': 600, 'embedding': 200},
+                            'train_time_s': 20.0, 'tokens_seen': 100.0}}
+    _rel, ok = L._param_control(recs, 'a', 'b')
+    assert ok is True, 'total parameters are matched'
+    d = L._param_control_detail(recs, 'a', 'b')
+    assert d['total_controlled'] is True and d['active_controlled'] is False, d
+    assert d['active_rel_diff'] > 0.01, d
+    c = L._compute_control_detail(recs, 'a', 'b')
+    assert c['compute_matched'] is False and c['more_compute_arm'] == 'b', c
+    assert abs(c['time_ratio_a_over_b'] - 0.5) < 1e-12, c
+    # A significant contrast whose extra compute favours the winner is
+    # system-level, not a verified mechanism.
+    entry = {'controlled': True, 'param_controlled': True, 'n': 6, 'significant_global': True,
+             'predicted_sign': -1, 'direction_consistent': True, 'within_seed_noise': False,
+             'mechanism_claim_allowed': False}
+    assert L._classify_group_status([entry], min_n=6, alpha=0.05, m_family=1) == 'system_level_only'
+    # End-to-end: b wins while consuming 2x the measured compute -> the
+    # contrast lands in system_level_only, never in verified_components.
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    kn = L.training_knobs()
+    s = {}
+    for i in range(6):
+        s[f'a::s{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1, tokens_seen=100, ppl=50.0, params=1000,
+                             train_knobs=kn, train_time_s=10.0, data_fp='d', val_fp='v', eval_fp='e')
+        s[f'b::s{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1, tokens_seen=100, ppl=49.0, params=1000,
+                             train_knobs=kn, train_time_s=20.0, data_fp='d', val_fp='v', eval_fp='e')
+    r = L.methodology_audit(s, design={'c': [('a', 'b', 'x')]}, baselines={}, verbose=False)
+    assert 'c' in r['system_level_only_components'] and 'c' not in r['verified_components'], r
+    assert r['components']['c'][0]['compute_confound_direction'] == 'favors_claimed_winner', r['components']['c'][0]
+
+
+def t_stale_aggregate_refused():
+    cur = BR._CUR_CS
+    d = {'a@cfg1': {'variant': 'a', 'run_cfg': f'steps1_d8_L1_csOLD1', 'n_seeds': 4, 'ppl_mean': 10.0},
+         'a@cfg2': {'variant': 'a', 'run_cfg': f'steps1_d8_L1_csOLD2', 'n_seeds': 2, 'ppl_mean': 11.0}}
+    assert BR._agg_entry_scan(d, 'a') is None, 'no current stamp among multiple groups must be refused'
+    d['a@cfg3'] = {'variant': 'a', 'run_cfg': f'steps1_d8_L1_cs{cur}', 'n_seeds': 1, 'ppl_mean': 12.0}
+    assert BR._agg_entry_scan(d, 'a') is d['a@cfg3'], 'the current-stamped group must be selected'
+    single = {'a': {'variant': 'a', 'run_cfg': 'steps1_d8_L1_csOLD', 'n_seeds': 4, 'ppl_mean': 10.0}}
+    assert BR._agg_entry_scan(single, 'a') is None, 'a single explicit stale run_cfg must be refused'
+
+
+def t_sec_p1l_excludes_stale_records():
+    stale = {'v::s0': {'variant': 'v', 'seed': 0, '_code': 'v0.0', 'by_len': {'512': {'ppl': 10.0}, '4096': {'ppl': 40.0}}}}
+    BR._LOADED[('summary', 'results_len')] = stale
+    try:
+        txt = BR.sec_p1l()
+    finally:
+        BR._LOADED.pop(('summary', 'results_len'), None)
+    assert '陈旧记录已排除' in txt, txt[:400]
+    assert '10.0' not in txt and '40.0' not in txt, 'stale PPL must not be quoted in the section'
+    assert 'ratio' not in txt or '不计算 ratio' in txt, txt[:400]
+
+
+def t_efficiency_pairs_audit_and_sweep():
+    td = tempfile.mkdtemp(prefix='eff_', dir=REPO)
+    try:
+        eff_a = {'status': 'ok', 'device': 'cuda:0', 'torch': '2.8.0', 'n_tokens': 512,
+                 'prefill_ms_p50': 10.0, 'decode_has_kv_cache': False}
+        eff_b = dict(eff_a, prefill_ms_p50=20.0)
+        summ = {'a::s0': {'variant': 'a', 'efficiency': eff_a}, 'b::s0': {'variant': 'b', 'efficiency': eff_b}}
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(summ, f)
+        r = A.audit_efficiency_pairs(outdirs=[td])
+        rec = r['panels'][td]['a vs b']
+        assert rec['speed_claim_allowed'] is True and rec['faster_arm'] == 'a', rec
+        assert abs(rec['ratio_b_over_a'] - 2.0) < 1e-12, rec
+        # A different token count is not a speed comparison.
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'efficiency': eff_a},
+                       'b::s0': {'variant': 'b', 'efficiency': dict(eff_b, n_tokens=4096)}}, f)
+        r2 = A.audit_efficiency_pairs(outdirs=[td])
+        rec2 = r2['panels'][td]['a vs b']
+        assert rec2['speed_claim_allowed'] is False and 'token counts' in rec2['reason'], rec2
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    L.set_seed(0)
+    model = L.SmallGPT(64, 32, 1, 2, 16, 16, L.make_layer_cfgs(1, 'full')).eval()
+    ids = torch.randint(0, 64, (1, 20), dtype=torch.long)
+    sw = L.measure_efficiency_sweep(model, ids, torch.device('cpu'), lengths=(8, 16), batches=(1, 2), warmup=0, iters=1)
+    assert sw['status'] == 'ok' and len(sw['rows']) == 4, sw
+    assert sw['decode_has_kv_cache'] is False and sw['measurement'] == 'cpu perf_counter', sw
+
+
+def t_release_readiness_audit():
+    td = tempfile.mkdtemp(prefix='rel_', dir=REPO)
+    old_repo = A.REPO
+    try:
+        A.REPO = td
+        with open(os.path.join(td, 'RELEASES.md'), 'w', encoding='utf-8') as f:
+            f.write('| tag | date | Git commit | archive URL | archive SHA-256 | manifest SHA-256 | verifier |\n|---|---|---|---|---|---|---|\n| _none yet_ | — | — | — | — | — | — |\n')
+        r = A.audit_release_readiness()
+        assert r['status'] == 'no_release' and r['complete_rows'] == 0, r
+        with open(os.path.join(td, 'RELEASES.md'), 'w', encoding='utf-8') as f:
+            f.write('| tag | date | Git commit | archive URL | archive SHA-256 | manifest SHA-256 | verifier |\n|---|---|---|---|---|---|---|\n'
+                    '| v13 | 2026-10-20 | abcdef1 | https://example.org/release_v13.tar.gz | ' + 'a' * 64 + ' | ' + 'b' * 64 + ' | https://example.org/verify.txt |\n')
+        r2 = A.audit_release_readiness()
+        assert r2['status'] == 'ok' and r2['complete_rows'] == 1 and not r2['problems'], r2
+        with open(os.path.join(td, 'RELEASES.md'), 'w', encoding='utf-8') as f:
+            f.write('| tag | date | Git commit | archive URL | archive SHA-256 | manifest SHA-256 | verifier |\n|---|---|---|---|---|---|---|\n'
+                    '| v13 | 2026-10-20 | — | — | — | — | — |\n')
+        r3 = A.audit_release_readiness()
+        assert r3['status'] == 'incomplete' and r3['problems'], r3
+    finally:
+        A.REPO = old_repo
+        shutil.rmtree(td, ignore_errors=True)
+
+
+
+def t_selection_attribution_contract():
+    td = tempfile.mkdtemp(prefix='sel_', dir=REPO)
+    old_repo = A.REPO
+    try:
+        A.REPO = td
+        r = A.audit_selection()
+        assert r['status'] == 'not_verifiable_locally', r
+        os.makedirs(os.path.join(td, 'analysis_mechanism'))
+        cell = {'arm': 'csa_fixed', 'eval_len': 4096, 'k': 32, 'n_blocks': 1024, 'n_queries': 64,
+                'recall_at_k': 0.6, 'mass_covered': 0.8, 'random_baseline': 0.03125,
+                'per_seed': {str(i): {'mass_covered': 0.8 - 0.01 * i, 'random_baseline': 0.03125} for i in range(6)}}
+        with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+            json.dump({'cells': [cell]}, f)
+        r2 = A.audit_selection()
+        assert r2['status'] == 'ok' and r2['cells'][0]['mass_excess'] > 0, r2
+        assert r2['cells'][0]['claim_allowed'] is True, r2['cells'][0]
+        bad = dict(cell)
+        bad.pop('recall_at_k')
+        with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+            json.dump({'cells': [bad]}, f)
+        r3 = A.audit_selection()
+        assert r3['status'] == 'fail' and r3['problems'], r3
+    finally:
+        A.REPO = old_repo
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def t_audit_length_missing_truncated_flag():
+    td = tempfile.mkdtemp(prefix='len_', dir=REPO)
+    try:
+        p = os.path.join(td, 'bylen.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095, 'eval_span': 4095}}}}, f)
+        r = A.audit_length(p)
+        assert r['status'] == 'fail' and any('truncated' in x for x in r['problems']), r
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -3170,8 +3426,22 @@ def main():
             _check(_name, _fn)
     except Exception as _obe:
         _check('K0 open-block suite import', lambda: (_ for _ in ()).throw(_obe))
-    fails = [r for r in _results if r[1] != 'PASS']
-    print(f'\n[test] {len(_results) - len(fails)}/{len(_results)} passed')
+    _check('L1 review-4 reportable claim gate', t_reportable_claim_gate)
+    _check('L2 Holm family resolution ceiling', t_holm_family_resolution_ceiling)
+    _check('L3 crossover fit refusal rules + slope CI', t_crossover_scaling_refusals)
+    _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
+    _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
+    _check('L6 stale aggregate refused', t_stale_aggregate_refused)
+    _check('L7 stale length panel excluded from report', t_sec_p1l_excludes_stale_records)
+    _check('L8 efficiency-pair audit + shape sweep', t_efficiency_pairs_audit_and_sweep)
+    _check('L9 evidence-release readiness audit', t_release_readiness_audit)
+    _check('L10 selection-attribution contract', t_selection_attribution_contract)
+    _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
+    fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
+    skips = [r for r in _results if r[1] == 'SKIP']
+    print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
+    if skips:
+        print('[test] SKIPPED (environment preconditions): ' + '; '.join(f'{n} — {why}' for n, _s, why in skips))
     return 1 if fails else 0
 
 

@@ -5,8 +5,12 @@
 
 Controlled study of compressed-block sparse attention (CSA / HCA, fixed and
 dynamic blocking) vs dense attention in a small from-scratch LM (BPE-8k,
-WikiText-103). This repository contains the experiment code and everything
-needed to reproduce the results on a machine of your own.
+WikiText-103). This repository contains the experiment code and the
+protocols needed to RE-RUN the experiments on a machine of your own. It does
+**not** contain the numeric results: no evidence release is bundled (see
+`RELEASES.md`), so no PPL number in the generated reports is independently
+auditable from this Git tree alone. Claims are limited to the frozen
+scope in `confirmation_frozen.json`; everything else is exploratory.
 
 > **Version naming.** `v12` is the driver/study generation; `CODE_SEMANTICS =`
 > `v11.128` is the library measurement-semantics stamp that the frozen plan
@@ -19,6 +23,14 @@ needed to reproduce the results on a machine of your own.
 split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
 `DECISION_LOG.md` and `docs/design_notes.md` §17/§20.
 
+> **Evidence status (read this before quoting a number).** `results_*/`,
+> `analysis_*/` and `REPORT*.md` are intentionally not tracked, and **no
+> formal evidence release is bundled** (`RELEASES.md` has no row yet). The
+> generated reports are reproducible from artifacts you produce yourself, but
+> the numbers in any report you have not regenerated are not independently
+> auditable. A claim becomes auditable only when its `release_<tag>.tar.gz`
+> plus manifest is published and `archive_release.py verify` passes.
+
 ## Repository layout
 
 The repository keeps only **source code, driver scripts and design
@@ -28,12 +40,12 @@ run-state files are **not tracked** — the driver scripts below regenerate them
 on whatever machine runs the experiments, so you can simply reproduce them
 locally whenever needed (see the commands in the next section). `.gitignore`
 already keeps those path families out of the repository (`docs/` retains only
-`design_notes.md` and `compute_plan.md`).
+`design_notes.md`; the former `compute_plan.md` was retired).
 
 | path | what |
 |---|---|
 | `exp_lib.py` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer, segmenters, training loop, aggregation and statistics |
-| `csa_kernels.py` | **the fused-kernel path for the three core operators** (docs/compute_plan.md §3, the M0 work package): block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see "Triton kernel path (M0/G0)" below |
+| `csa_kernels.py` | **the fused-kernel path for the three core operators** (the retired compute-plan M0 work package): block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see "Triton kernel path (M0/G0)" below |
 | `run_gapfill.py` | **the v6 driver**: the minimum-publishable supplementary runs, resumable, guarded by a run-time cap, pushes after every phase, auto-shuts the instance down |
 | `par.py` | **task-level parallel executor (opt-in)**: one GPU card per independent run — see "Task-level parallelism" below |
 | `v7_supp.py` | **the v7 driver**: reviewer-response supplementary suite — P0R RoPE+QK-norm, P0W dense-warmup, P0E 40k-step long run, P2S scale re-seeding, P1L length extrapolation, P1T topk sweep |
@@ -48,13 +60,13 @@ already keeps those path families out of the repository (`docs/` retains only
 | `RELEASES.md` | **evidence release index**: where each immutable `release_<tag>.tar.gz` + SHA-256 manifest is published; the Git repo itself stays source-only |
 | `pyproject.toml` / `requirements.txt` | Python ≥3.12 and dependency declarations; install explicitly (no import-time pip install) |
 | `DECISION_LOG.md` | **decision log** (tracked; reconstructed 2026-10-18 from the README/design notes/manifest because the snapshot has one squashed commit): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail; formal releases additionally archive per-seed results via `archive_release.py` |
-| `audit_gates.py` | **review-2 verification entry points** (zero-experiment): data-leakage audits (tokenizer provenance, vocab identity, train/test overlap), CPU causality unit checks (prefix invariance, label shift, decode consistency), block-attribution / boundary-vs-random / length-consistency / baseline-fairness / failure-concentration / budget-reconciliation audits and prefill-decode-kv-growth measurement utilities |
+| `REVIEW_4_RESPONSE.md` | **review-4 per-issue audit** (tracked): the 21 methodological issues, what this repository already enforced, what this revision changed, and what still cannot be answered without new experiments/artifacts |
+| `audit_gates.py` | **review-2/4 verification entry points** (zero-experiment): data-leakage audits (tokenizer provenance, vocab identity, train/test overlap), CPU causality unit checks (prefix invariance, label shift, decode consistency), block-attribution / boundary-vs-random / length-consistency / baseline-fairness / failure-concentration / budget-reconciliation audits and prefill-decode-kv-growth measurement utilities |
 | `archive_release.py` | **immutable evidence archiver**: packs per-release artifacts (results, analyses, reports, freeze lock, decision log, environment, checkpoint hashes) into a tar.gz with a per-file SHA-256 manifest and an independent `verify` subcommand — the git repo stays source-only (design_notes §8) while every formal release gets an auditable fixed archive |
-| `m0_supp.py` | **the M0/S1 driver (adopted B tier)**: entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below and `docs/compute_plan.md` |
+| `m0_supp.py` | **the M0/S1 driver (adopted B tier)**: entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below |
 | `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk; protocol constants and analytic FLOPs assumptions are explicit inputs, not measurements) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
 | `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
-| `docs/compute_plan.md` | **compute plan**: the scale-up roadmap (0.14B–1.3B ladder, FineWeb-Edu, Triton-kernel prerequisite), H800-hour budget tiers and gated milestones M0–M4; the former application draft is no longer kept in the repo |
 
 > **`exp_lib.py` is the single source of truth — edit it directly.**
 
@@ -176,7 +188,8 @@ Smoke modes always run serially regardless of `CSA_PAR`.
 
 ### B-tier M0 / S1 (scale-up entry point, adopted tier B)
 
-The adopted compute-plan tier (docs/compute_plan.md §4–§6) adds a second
+The adopted B-tier scale-up plan (entry point `m0_supp.py`; the former
+`docs/compute_plan.md` is retired) adds a second
 corpus path and the S1–S4 scale ladder on top of the WikiText-103 mechanism
 layer; `m0_supp.py` is the entry point:
 
@@ -199,11 +212,11 @@ M0_PANEL=S2 python m0_supp.py full   # the S2 panel (5 arms × 3 seeds × 12B; M
 - `full` is gated by `M0_CAP` (state file `run_time_state_m0.json`,
   `M0_CAP_HOURS` overrides): before the Triton kernels pass the G0 gate the
   eager throughput projections are refused — that is the plan's own
-  precondition (compute_plan §3), not a defect.
+  precondition of that plan, not a defect.
 
 ### Triton kernel path (M0/G0)
 
-`csa_kernels.py` implements the three core operators of compute_plan §3 as
+`csa_kernels.py` implements the three core operators of the scale-up plan as
 fused kernels — block-compression pooling (per-channel masked softmax over
 [A-lanes | overlap lanes] with position embeddings), indexer scoring + top-k
 selection (first-max extraction per round, which is exactly the order of
@@ -325,6 +338,9 @@ freeze and need their own pre-registration.
 python audit_gates.py causality   # CPU unit audit: prefix invariance / label shift / decode consistency
 python audit_gates.py leakage     # tokenizer provenance, vocab identity, train/test overlap
 python audit_gates.py report      # run every locally-verifiable audit -> audit_report.json
+python audit_gates.py selection   # selection-recall contract (refuses unsupported mechanism claims when absent)
+python audit_gates.py efficiency_pairs  # measured latency claims: same shape/device/KV required
+python audit_gates.py release     # evidence-release readiness (no complete row => source-only)
 python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # dry-run an evidence archive
 ```
 
@@ -375,6 +391,44 @@ script pushes and shuts the instance down (cancel with
 > `fuse_analysis.py` and the per-version `v*_supp.py report` builders compute
 > on the fly from the on-disk `results_*/` and `analysis_*/` artifacts; no
 > quantity is ever hard-coded in the repository prose.
+
+## Review-4 hardening (what changed)
+
+See `REVIEW_4_RESPONSE.md` for the item-by-item table.  The main additions are
+machine gates rather than new prose:
+
+- **Claim wording** now goes through `exp_lib.reportable_claim` (n>=6, raw p,
+  Holm p, |mean|>std, family resolution floor).  `attach_holm` reports
+  `family_min_attainable_p_holm`, so `p_holm=1.0` from an oversized family is
+  printed as a resolution ceiling, not as a null result.  v10's NIAH contrasts
+  are now inside the Holm family.
+- **Crossover scaling** uses `exp_lib.crossover_scaling_fit`: >=4 de-duplicated
+  widths, no censored subset, training volume within 25%, slope CI/p/R²/LOO,
+  claim level fixed to descriptive.  Otherwise it refuses and says why.
+- **Matched initialization and compute**: every training record carries
+  `init_core_fp` (tok/pos/head/norm) and `pair_reason` refuses a pair whose
+  digests differ.  `_compute_control_detail` reports measured time/token (or
+  the 6ND proxy) and its direction; a significant contrast whose extra compute
+  favours the claimed winner becomes `system_level_only`, not `verified`.
+- **Stale records fail closed**: `build_report.sec_p1l` and v10 exclude any arm
+  with no current code stamp (no table cell, no ratio, no conclusion);
+  `_agg_entry` refuses a multi-group aggregate with no current stamp.  Missing
+  `truncated` flags are treated as unverifiable, not full-length.
+- **Doc-level uncertainty**: `ppl_ci95_doc_bootstrap` is displayed; v12 adds a
+  per-comparison document Δ 95% CI and refuses population-level claims below
+  64 documents.
+- **Efficiency**: the length phase records `measure_efficiency`; the new
+  `measure_efficiency_sweep` covers batch x length, and
+  `audit_gates.efficiency_pairs` only permits a "faster" claim when token
+  count, device, torch version, KV semantics match and the ratio exceeds ±5%.
+  Analytic FLOPs are labelled structural, never as measured speed.
+- **Mechanism**: `audit_gates.selection` defines the selection-recall artifact
+  contract and reports `not_verifiable_locally` (with an explicit "unsupported
+  mechanism claim" note) until that artifact exists.  Boundary alignment,
+  block/read diagnostics and NIAH remain the available direct readouts.
+- **Evidence**: `audit_gates.release` parses `RELEASES.md`; with no complete
+  row the repository is declared source-only/not auditable.  `archive_release.py`
+  now also packs `pyproject.toml`, cache/tokenizer metadata and `run_*.log`.
 
 ## Review-3 hardening (what changed)
 

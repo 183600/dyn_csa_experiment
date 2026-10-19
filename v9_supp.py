@@ -232,7 +232,7 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     A('')
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
-    A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
+    A('> 参考论文：arXiv:2606.19348。**范围声明**：小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到其规模、语料、长上下文训练或生产系统。')
     A('> 说明：本报告全部数字由 `v9_supp.py report` 从 `results_*/`、`analysis_v9/` 的落盘产物计算得到，无手填数值。')
     A('')
     _r_n = sorted({p['n'] for p in rope.values()}) if rope else []

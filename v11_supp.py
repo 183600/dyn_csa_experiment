@@ -171,40 +171,26 @@ def v11_analysis(out='analysis_v11/stats.json'):
             lowered = sorted((k for k, v in contrasts.items() if v['n'] < _n_cell_max))
             print(f'[v11 stats] NOTE: the fullest probe cell reaches n={_n_cell_max} but the WEAKEST contrast pairs only {_n_pair_min} seeds — the arms are not seed-complete with each other, so every p value below is computed at its own PAIRED count, i.e. the worst floor for this panel is {2.0 / 2 ** _n_pair_min:.3f}, not {2.0 / 2 ** _n_cell_max:.3f}. {len(lowered)}/{len(contrasts)} contrast(s) are limited by this: {lowered[:3]}')
     xo = V10._scale_crossovers()
-    pts, _no_tok, _recon = ([], [], [])
-    for _lab, v in xo.items():
-        if v.get('status') != 'ok' or not v.get('mean_crossed'):
+
+    def _is_recon_v11(v):
+        flags = v.get('per_seed_synth', {})
+        return any((flags.get(str(s)) for s in v.get('seeds', [])))
+    _fit_entries = {}
+    for _lab, _v in xo.items():
+        if not isinstance(_v, dict):
             continue
-        _fl = v.get('per_seed_synth', {})
-        if any((_fl.get(str(s)) for s in v.get('seeds', []))):
-            _recon.append(_lab)
-            continue
-        if 'mean_crossover_tokens' in v:
-            pts.append((v['d'], v['mean_crossover_tokens']))
-        else:
-            _no_tok.append(_lab)
-    fit = {}
-    for _lab in _no_tok:
-        print(f'[v11 stats] crossover fit: dropped {_lab!r} — its panel publishes no tokens/step rate, so its token axis is unknown')
-    for _lab in _recon:
-        print(f'[v11 stats] crossover fit: dropped {_lab!r} — its trajectory is a RECONSTRUCTION, so the point is not an independent run')
-    if len(pts) >= 3:
-        xs = np.log10([p[0] for p in pts])
-        ys = np.log10([max(p[1], 1.0) for p in pts])
-        A = np.vstack([xs, np.ones_like(xs)]).T
-        slope, intercept = np.linalg.lstsq(A, ys, rcond=None)[0]
-        # n=2 时两点必共线：R² 恒为 1，不具统计意义——只在 n>=3 时报告拟合优度。
-        fit = {'n_points': len(pts), 'slope': float(slope), 'intercept': float(intercept), 'note': 'log10(crossover_tokens) ~ log10(d_model), untruncated crossovers only', 'excluded_no_rate': sorted(_no_tok), 'excluded_reconstructed': sorted(_recon)}
-        if len(pts) >= 3:
-            pred = A @ np.array([slope, intercept])
-            ss_res = float(((ys - pred) ** 2).sum())
-            ss_tot = float(((ys - ys.mean()) ** 2).sum())
-            fit['r2'] = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
-        else:
-            fit['note'] += '; WARNING: n=2 — R² 恒为 1（恒等式），斜率不具显著性，仅供参考'
-    else:
-        fit = {'n_points': len(pts), 'status': 'insufficient_points',
-               'note': 'fewer than 3 independent, training-volume-comparable crossover points: no log-log slope or power-law claim is computed'}
+        _fit_entries[_lab] = {'label': _lab, 'd': _v.get('d'),
+                              'crossover_tokens': _v.get('mean_crossover_tokens'),
+                              'train_tokens': _v.get('train_tokens'),
+                              'censored': bool(_v.get('censored') or _v.get('mean_crossed') is False),
+                              'reconstructed': bool(_is_recon_v11(_v))}
+    # Same refusal rules as v10 (review issue 12): one point per width,
+    # uncensored, comparable training volume, >=4 widths, slope with CI.
+    fit = L.crossover_scaling_fit(_fit_entries, min_points=4)
+    for _why in (fit.get('reasons') or []):
+        print(f'[v11 stats] crossover fit refused: {_why}')
+    if fit.get('deduped_by_d'):
+        print(f'[v11 stats] crossover fit: duplicate widths dropped (token-matched panel kept): {fit["deduped_by_d"]}')
     scale384 = V10._ppl_by_seed('results_lm_v5_scale', full=True)
     panel = V8._panel_block
     comparisons = {}
@@ -332,7 +318,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     A('')
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
-    A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
+    A('> 参考论文：arXiv:2606.19348。**范围声明**：小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到其规模、语料、长上下文训练或生产系统。')
     A('> 说明：本报告全部数字由 `v11_supp.py report` 从 `results_*/`、`analysis_v11/` 的落盘产物计算得到，无手填数值。')
     A('')
     if probe_ok:
@@ -488,12 +474,12 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
         _vs = [(k, v) for k, v in contr.items() if tag in k]
         if not _vs:
             return False
-        return all((v['mean'] > 0 and v.get('p_holm') is not None and v.get('p_holm', 1.0) < alpha and v.get('n', 0) >= 6 for _k, v in _vs))
+        return all((v.get('mean', 0) > 0 and L.reportable_claim(v, family_size=len(contr), alpha=alpha, min_n=6, require_holm=True)['allowed'] for _k, v in _vs))
     dn, ab, ri = (_rng('dense'), _rng('allblocks'), _rng('randidx'))
     ri_sig = _all_sig('randidx')
     ri_all_pos = bool(ri) and ri[0] > 0.0
     if ri_sig:
-        _ri_txt = 'randidx 全线更差且各对照格均达 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。'
+        _ri_txt = 'randidx 全线更差且各对照格均达 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立：n≥6、原始 p、Holm、|mean|>std 全部通过）。'
     elif ri_all_pos:
         _ri_txt = 'randidx 全线更差但并非各对照格都达 p<0.05：方向一致地支持「学习检索有独立贡献」，按当前分辨率只作方向性表述；「抗噪性主要来自稀疏归纳偏置本身」的较弱读法仍然成立。'
     else:
@@ -549,13 +535,18 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
         A('**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步与 seed 均值轨迹同为有效读数。')
     A('')
     if fit:
-        if 'slope' not in fit:
-            A(f'**趋势拟合**：不足 3 个独立、训练量可比的交叉点（n={fit.get("n_points", 0)}）；按 `insufficient_points` 处理，不报告斜率或幂律。')
+        if fit.get('status') != 'ok' or 'slope' not in fit:
+            _why = '; '.join(fit.get('reasons') or [fit.get('note', 'no slope')])
+            A(f'**趋势拟合：被拒绝**（status={fit.get("status")}）。{_why}。因此本版**不报告** log-log 斜率或幂律。')
             A('')
         else:
-            _r2s = f'（R²={fit["r2"]:.2f}）' if 'r2' in fit else '（仅 2 点，R² 恒为 1，不报告拟合优度）'
-            A(f'**趋势拟合（仅供参考）**：{fit['n_points']} 个已观测交叉点，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}{_r2s}。方向性证据，不作精确幂律主张。')
-        A('')
+            _ci = fit.get('ci')
+            _citxt = f'，95% CI [{_ci[0]:.2f}, {_ci[1]:.2f}]' if isinstance(_ci, (list, tuple)) and len(_ci) == 2 else ''
+            _ptxt = f'，p={fit["p"]:.3f}' if isinstance(fit.get('p'), (int, float)) else ''
+            _vol = fit.get('volume_ratio')
+            A(f'**趋势拟合（描述性，非幂律主张）**：{fit.get("n_points")} 个去重后的规模点，'
+              f'log10(交叉 token) ~ log10(d) 斜率 {fit["slope"]:.2f}{_citxt}{_ptxt}；训练量比 {_vol:.2f}（要求 ≤1.25）。')
+            A('')
     if scale384:
         A(f'**d=384 面板（P4F 后，实际 {_n384_txt}）：**')
         A('')

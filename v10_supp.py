@@ -437,7 +437,7 @@ def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, 
     远端出现过的配对 value——正确预测必须依赖远端信息。`distract` 条件在
     腐坏网格（与 uniform 模式同一播种）上把远端自然 token 换成另一行的
     自然 token（自然语言干扰），但**绝不腐坏耦合位置**——针保持干净，
-    干扰只加在草料上。所有随机性由 (seed, 行号) 决定，臂间逐字节一致。
+    干扰只加在草料上（realistic-token 替换，不是主题/语义干扰）。所有随机性由 (seed, 行号) 决定，臂间逐字节一致。
     Returns (ids[n_seq, eval_len+1], q_cols, q_vals, stats)：q_cols 为
     **目标尾区内相对的 logits 列号**（预测 answer 的那一列），q_vals 为正确
     答案 token。"""
@@ -1132,7 +1132,13 @@ def _scale_crossovers():
         steps = sorted(set.intersection(*[set(das[s]) for s in common], *[set(dbs[s]) for s in common]))
         gap_mean = [float(np.mean([das[s][t] for s in common]) - np.mean([dbs[s][t] for s in common])) for t in steps]
         xo_m, crossed_m = _crossover_step(steps, gap_mean)
-        entry = {'status': 'ok', **p, 'seeds': common, 'excluded_reconstructed': _synth_seeds, 'tokens_per_step': tps, 'per_seed': per_seed, 'per_seed_synth': {str(s): bool(getattr(ha, 'per_seed_synth', {}).get(s) or getattr(hb, 'per_seed_synth', {}).get(s)) for s in common}, 'mean_crossover_step': xo_m, 'mean_crossed': crossed_m, 'mean_traj': {'steps': steps, 'gap': gap_mean}}
+        entry = {'status': 'ok', **p, 'seeds': common, 'excluded_reconstructed': _synth_seeds, 'tokens_per_step': tps, 'per_seed': per_seed, 'per_seed_synth': {str(s): bool(getattr(ha, 'per_seed_synth', {}).get(s) or getattr(hb, 'per_seed_synth', {}).get(s)) for s in common}, 'mean_crossover_step': xo_m, 'mean_crossed': crossed_m, 'mean_traj': {'steps': steps, 'gap': gap_mean},
+                 # Training-volume comparability: the scale fit needs the
+                 # panel's actual training length, not just its width.  The
+                 # last common eval step is the measured training horizon.
+                 'last_step': (steps[-1] if steps else None),
+                 'censored': bool(not crossed_m),
+                 'train_tokens': ((steps[-1] * tps) if (steps and tps is not None) else None)}
         if tps is not None and crossed_m and math.isfinite(xo_m):
             entry['mean_crossover_tokens'] = xo_m * tps
         elif tps is None:
@@ -1532,36 +1538,46 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             res['seeds'] = common
                             niah_contrasts[f'NIAH-nat L{Ln} {cond}: {tag} - learned (answer NLL)'] = res
             probe['niah_natural'] = {'cells': niah_cells, 'contrasts': niah_contrasts}
+            # NIAH contrasts are built AFTER the corruption family was
+            # corrected.  Leaving them out of the Holm family would report
+            # uncorrected p-values under a "Holm" heading, so re-run the
+            # correction over the union and overwrite both.
+            _comb = dict(contrasts)
+            _comb.update(niah_contrasts)
+            if _comb:
+                _h2 = L.holm_adjust([(k, v.get('p_exact_signflip')) for k, v in _comb.items()
+                                     if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))])
+                for _k, _v in _comb.items():
+                    if isinstance(_v, dict):
+                        _e2 = _h2.get(_k)
+                        _v['p_holm'] = (_e2.get('p_holm') if isinstance(_e2, dict) else None)
+                holm = _h2
+                probe['holm_exploratory'] = _h2
+                probe['holm_family_note'] = ('Holm over the union of the corruption and NIAH contrast families; '
+                                             'NIAH was previously attached after the correction and is now included')
+                print(f'[v10 stats] Holm re-attached over the combined {len(_comb)}-contrast family (corruption + NIAH)')
     xo = _scale_crossovers()
 
     def _is_recon(v):
         flags = v.get('per_seed_synth', {})
         return any((flags.get(str(s)) for s in v.get('seeds', [])))
-    pts = [(v['d'], v['mean_crossover_tokens']) for v in xo.values() if v.get('status') == 'ok' and v.get('mean_crossed') and ('mean_crossover_tokens' in v) and (not _is_recon(v))]
-    dropped = [k for k, v in xo.items() if v.get('status') == 'ok' and v.get('mean_crossed') and ('mean_crossover_tokens' not in v)]
-    if dropped:
-        print(f'[stats] crossover fit: {sorted(dropped)} crossed but carry no token rate — excluded from the log-log fit')
-    recon = sorted((k for k, v in xo.items() if v.get('status') == 'ok' and v.get('mean_crossed') and ('mean_crossover_tokens' in v) and _is_recon(v)))
-    if recon:
-        print(f'[stats] crossover fit: {recon} carry a token rate but their trajectory is a RECONSTRUCTION, not a measurement — excluded from the log-log fit (the points count independent runs)')
-    fit = {}
-    if len(pts) >= 3:
-        xs = np.log10([p[0] for p in pts])
-        ys = np.log10([max(p[1], 1.0) for p in pts])
-        A = np.vstack([xs, np.ones_like(xs)]).T
-        slope, intercept = np.linalg.lstsq(A, ys, rcond=None)[0]
-        # n=2 时两点必共线：R² 恒为 1，不具统计意义——只在 n>=3 时报告拟合优度。
-        fit = {'n_points': len(pts), 'slope': float(slope), 'intercept': float(intercept), 'note': 'log10(crossover_tokens) ~ log10(d_model), untruncated crossovers only', 'excluded_no_rate': sorted(dropped), 'excluded_reconstructed': recon}
-        if len(pts) >= 3:
-            pred = A @ np.array([slope, intercept])
-            ss_res = float(((ys - pred) ** 2).sum())
-            ss_tot = float(((ys - ys.mean()) ** 2).sum())
-            fit['r2'] = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
-        else:
-            fit['note'] += '; WARNING: n=2 — R² 恒为 1（恒等式），斜率不具显著性，仅供参考'
-    else:
-        fit = {'n_points': len(pts), 'status': 'insufficient_points',
-               'note': 'fewer than 3 independent, training-volume-comparable crossover points: no log-log slope or power-law claim is computed'}
+    fit_entries = {}
+    for _lab, _v in xo.items():
+        if not isinstance(_v, dict):
+            continue
+        fit_entries[_lab] = {'label': _lab, 'd': _v.get('d'),
+                             'crossover_tokens': _v.get('mean_crossover_tokens'),
+                             'train_tokens': _v.get('train_tokens'),
+                             'censored': bool(_v.get('censored') or _v.get('mean_crossed') is False),
+                             'reconstructed': bool(_is_recon(_v))}
+    # Reviewer issue 12: one point per width, no censored subset, comparable
+    # training volume, at least 4 widths, and a slope WITH CI.  The helper
+    # refuses instead of fitting whenever those conditions fail.
+    fit = L.crossover_scaling_fit(fit_entries, min_points=4)
+    for _why in (fit.get('reasons') or []):
+        print(f'[stats] crossover fit refused: {_why}')
+    if fit.get('deduped_by_d'):
+        print(f'[stats] crossover fit: duplicate widths dropped (token-matched panel kept): {fit["deduped_by_d"]}')
     seq2k = _ppl_by_seed('results_lm_v9_seq2k', full=True)
     comparisons = {}
 
@@ -1622,12 +1638,12 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
-    A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
+    A('> 参考论文：arXiv:2606.19348。**范围声明**：本报告是小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现，也不支持对其规模、语料或生产系统做外推。')
     A('> 说明：本报告全部数字由 `v10_supp.py report` 从 `results_*/`、`analysis_v10/` 的落盘产物计算得到，无手填数值。')
     A('')
     A('v10 落实 v9 收官后评审的三项升级：(1) 把 v7 P1L 的长度外推观察升级为机制性检验——远距干扰注入实验直接检验「稀疏掩码滤除远距噪声」假设；(2) 新增 d=128/4L 与 d=512/10L 两个规模，与既有 d=256/d=384 面板组成 4 点反转交叉点标度读数（预注册交叉判据）；(3) 把 v9 仍处 p 值分辨率下限的面板（seq-2048 topk 扫描）从 n=2 补到 n=4。')
     A('')
-    A('**本版修订（评审 5 点）**：(a) P3MTC 补同计算量从头训练的选择器对照（randidx / allblocks）并补逐项对齐的 dense 对照；(b) 干扰注入扩展为 uniform / natural / mask / delete 四种腐坏模式并按 ΔNLL 口径报告，另增 NIAH-natural 远端必要信息任务；(c) P3SL2/P3SL3 补等训练 token 与等计算量的大模型臂，统计新增等 token 切片与收敛（平台期）诊断；(d) 全部配对比较报告逐种子 Δ、效应量 d_z、p 值分辨率下限与 Holm 校正，明确探索性/确认性证据边界（确认性评估见 `v12_supp.py` 与冻结清单 `confirmation_frozen.json`）。')
+    A('**本版修订（评审 5 点）**：(a) P3MTC 补同配方、同 token 预算从头训练的选择器对照（randidx / allblocks；allblocks 在每个位置读取全部块，**不是**等计算量或等读取预算的对照）并补逐项对齐的压缩块全读参照；(b) 干扰注入扩展为 uniform / natural / mask / delete 四种腐坏模式并按 ΔNLL 口径报告，另增 NIAH-natural 远端必要信息任务；(c) P3SL2/P3SL3 补等训练 token 与等计算量的大模型臂，统计新增等 token 切片与收敛（平台期）诊断；(d) 全部配对比较报告逐种子 Δ、效应量 d_z、p 值分辨率下限与 Holm 校正，明确探索性/确认性证据边界（确认性评估见 `v12_supp.py` 与冻结清单 `confirmation_frozen.json`）。')
     A('')
     A('---')
     A('')
@@ -1637,6 +1653,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     if mech_sum:
         _rows_by_v = {}
+        _stale_vars = set()
         for v in list(P3MT_PAYLOAD['variants']) + SCRATCH_CONTROLS:
             _rv = [r for r in mech_sum.values() if isinstance(r, dict) and r.get('variant') == v and (r.get('seed') is not None) and ('by_len' in r)]
             _cur = [r for r in _rv if r.get('_code') == L.code_stamp()]
@@ -1645,7 +1662,12 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                     print(f'[v10 report] {v}: {len(_rv) - len(_cur)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur)} current one(s)')
                 _rv = _cur
             elif _rv:
-                print(f'[v10 report] {v}: no by-length record carries the current code semantics ({L.code_stamp()}) — quoting all {len(_rv)} (they predate it; re-run the training phase to refresh)')
+                # Fail closed (review issue 16): a panel with no record under
+                # the current code/recipe stamp is excluded from the table and
+                # from every conclusion, not quoted with a warning marker.
+                print(f'[v10 report] {v}: no by-length record carries the current code semantics ({L.code_stamp()}) — EXCLUDED from the table and conclusions ({len(_rv)} stale record(s) left on disk)')
+                _stale_vars.add(v)
+                _rv = []
             _rows_by_v[v] = _rv
         n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
         if len(n_by_v) > 1:
@@ -1707,6 +1729,11 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         A('')
         A('> 后缀 `~` 表示该列**只有位置受限（abs-PE）的截断 cell**：它是在比列名更短的 span 上评出来的分数，**不是**长上下文测量值。任何 `~` 行不可用于「外推是否稳健」的结论。')
         A('')
+        if _stale_vars:
+            A('> **⚠ 陈旧记录已排除**：' + '、'.join(f'`{x}`' for x in sorted(_stale_vars)) +
+              f' 没有任何按长度记录携带当前代码语义戳 `{L.code_stamp()}`；按「旧代码/旧配方/旧数据指纹不得进入主要结论」的规则，'
+              '本表不引用这些数值，也不据此计算 ratio 或外推结论。重跑对应训练阶段后再纳入。')
+            A('')
     A(f'**P3MP 干扰注入设计**：eval 长度 2048/4096；把**远距上下文**（目标区之前的全部输入位置，即除最后 {PROBE['target']} 个干净目标 token 及其紧邻前置位置以外的位置）中比例为 ρ ∈ {{0, 1/8, 1/4, 1/2}} 的 token 替换为均匀随机 token——同一 (序列, ρ) 的腐坏对所有臂逐字节相同（按 (eval_len, 序列号, ρ) 播种，与臂/模型种子无关），臂间严格配对。只在干净目标区计 PPL。四个臂：')
     A('')
     A('- `full_rope`（dense，必须直面远距噪声）')
@@ -1761,7 +1788,13 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             vs = [(k, v) for k, v in _legacy.items() if tag in k]
             if not vs:
                 return False
-            return all((v['mean'] > 0 and v.get('p_exact_signflip', 1.0) < alpha for _k, v in vs))
+            # Direction, raw p, Holm p, n floor and |mean|>std must ALL hold:
+            # the raw-p version could call a resolution-limited or noise-level
+            # contrast "strong evidence" while the table printed p_holm=1.0.
+            return all((v.get('mean', 0) > 0 and
+                        L.reportable_claim(v, family_size=len(_legacy), alpha=alpha,
+                                           min_n=6, require_holm=True)['allowed'])
+                       for _k, v in vs)
         dn, ab, ri = (_rng('dense'), _rng('allblocks'), _rng('randidx'))
         ri_sig = _all_sig('randidx')
         _n_by_c = [(k, v.get('n', 0)) for k, v in _legacy.items() if 'omitted' not in v]
@@ -1793,7 +1826,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     if dnll:
         A('### P3M-3 污染增量 ΔNLL（按 NLL 口径，含干净条件基线）')
         A('')
-        A('**口径（评审点 3）**：ΔNLL = NLL_污染 − NLL_干净（nats/目标 token，逐种子配对）。腐坏模式：`uniform`（均匀随机 token，既有协议）、`natural`（其他真实序列同位置 token）、`mask`（远端整体屏蔽为 `<pad>`）、`delete`（远端整体删除，仅剩目标区）。`mask`/`delete` 回答「干净远端上下文到底带来多少收益」；`natural` 与 `uniform` 之差回答「更自然的干扰是否更难过滤」。')
+        A('**口径（评审点 3）**：ΔNLL = NLL_污染 − NLL_干净（nats/目标 token，逐种子配对）。腐坏模式：`uniform`（均匀随机 token，既有协议）、`natural`（其他真实序列同位置 token）、`mask`（远端整体屏蔽为 `<pad>`）、`delete`（远端整体删除，仅剩目标区）。`mask`/`delete` 回答「干净远端上下文到底带来多少收益」；`natural` 与 `uniform` 之差只回答「真实语料同位置 token 替换是否比均匀随机替换更难过滤」；它不是主题干扰、语义相近干扰、重复文本或对抗干扰，不能据此声称普遍抗噪性。')
         A('')
         A('| 臂 | L | 模式 | ρ | ΔNLL mean±std | n | 干净 NLL |')
         A('|---|---|---|---|---|---|---|')
@@ -1820,7 +1853,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     if niah.get('cells'):
         A('### P3M-4 远端必要信息任务（NIAH-natural，自然文本 + 自然干扰）')
         A('')
-        A('**设计（评审点 3）**：序列 = 远端自然文本（内嵌 8 个 key→value 耦合）+ 目标区（自然文本收尾 + 8 个查询 key）。查询 key 的下一个 token 的正确答案只在远端出现——正确预测**必须**利用远距信息；`distract` 条件把 ρ=0.5 的远端草料换成其他真实序列的 token（自然语言干扰），但**绝不腐坏耦合位置**。报告 answer top-1 准确率与 answer NLL（已按各臂 clean/distract 成对）。')
+        A('**设计（评审点 3）**：序列 = 远端自然文本（内嵌 8 个 key→value 耦合）+ 目标区（自然文本收尾 + 8 个查询 key）。查询 key 的下一个 token 的正确答案只在远端出现——正确预测**必须**利用远距信息；`distract` 条件把 ρ=0.5 的远端草料换成其他真实序列的 token（realistic-token 替换；不是主题/语义干扰），但**绝不腐坏耦合位置**。报告 answer top-1 准确率与 answer NLL（已按各臂 clean/distract 成对）。')
         A('')
         A('| 臂 | L | 条件 | acc | answer NLL | n |')
         A('|---|---|---|---|---|---|')
@@ -1891,18 +1924,24 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         A(f'**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步（{_xo256_txt} 附近）与 seed 均值轨迹同为有效读数。')
     A('')
     if fit:
-        _excl = []
-        if fit.get('excluded_reconstructed'):
-            _excl.append(f'{len(fit['excluded_reconstructed'])} 个规模（{', '.join(fit['excluded_reconstructed'])}）的轨迹是重构件而非测量')
-        if fit.get('excluded_no_rate'):
-            _excl.append(f'{len(fit['excluded_no_rate'])} 个规模无 token 速率')
-        if 'slope' not in fit:
-            A(f'**趋势拟合**：不足 3 个独立、训练量可比的交叉点（n={fit.get("n_points", 0)}）；按 `insufficient_points` 处理，不报告斜率或幂律。')
+        if fit.get('status') != 'ok' or 'slope' not in fit:
+            _why = '; '.join(fit.get('reasons') or [fit.get('note', 'no slope')])
+            A(f'**趋势拟合：被拒绝**（status={fit.get("status")}）。{_why}。因此本版**不报告** log-log 斜率或幂律。')
             A('')
         else:
-            _r2s = f'（R²={fit["r2"]:.2f}）' if 'r2' in fit else '（仅 2 点，R² 恒为 1，不报告拟合优度）'
-            A(f'**趋势拟合（仅供参考）**：在 {fit['n_points']} 个已观测交叉点上，log10(交叉token) ~ log10(d) 斜率 {fit['slope']:.2f}{_r2s}——负斜率 = 规模越大交叉越早。' + (f'点数已扣除{'、'.join(_excl)}；' if _excl else '') + '点数少且部分格子删失，只作方向性证据，不作精确幂律主张。')
-        A('')
+            _ci = fit.get('ci')
+            _citxt = f'，95% CI [{_ci[0]:.2f}, {_ci[1]:.2f}]' if isinstance(_ci, (list, tuple)) and len(_ci) == 2 else ''
+            _ptxt = f'，p={fit["p"]:.3f}' if isinstance(fit.get('p'), (int, float)) else ''
+            _r2txt = f'，R²={fit["r2"]:.2f}' if isinstance(fit.get('r2'), (int, float)) else ''
+            _lootxt = ''
+            _loo = fit.get('leave_one_out_slope_range')
+            if isinstance(_loo, (list, tuple)) and len(_loo) == 2:
+                _lootxt = f'；留一斜率范围 [{_loo[0]:.2f}, {_loo[1]:.2f}]'
+            _vol = fit.get('volume_ratio')
+            A(f'**趋势拟合（描述性，非幂律主张）**：{fit.get("n_points")} 个去重后的规模点，'
+              f'log10(交叉 token) ~ log10(d) 斜率 {fit["slope"]:.2f}{_citxt}{_ptxt}{_r2txt}{_lootxt}；'
+              f'训练量比 {_vol:.2f}（要求 ≤1.25）。这是观测性回归，规模面板未随机化，不能写成 scaling law。')
+            A('')
     sc = st.get('scale_confounds') or {}
     if sc:
         A('### P3S-2 规模混杂控制（评审点 1 + 评审二轮·意见七修订：等训练 token / 6ND 代理规模 / 规模内平台期）')
@@ -1940,7 +1979,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             for k, v in sorted(_slices.items()):
                 A(f'| {k} | {v.get('n', 0)} | {v.get('mean', float('nan')):+.2f} ± {v.get('std', 0):.2f} | {v.get('cohens_dz', float('nan')):+.2f} | {v.get('p_exact_signflip', float('nan')):.3f} |')
             A('')
-            A('> `P3SL_FLOP` 的步数 = 8000 × N_small/N_large（参数量按面板两臂平均，CPU 上确定性计数；下限 250），即**大模型与小模型的总计算量代理对齐**——该臂的 gap 是「同计算量下规模效应」的直接读数。')
+            A('> `P3SL_FLOP` 的步数 = 8000 × N_small/N_large（参数量按面板两臂平均，CPU 上确定性计数；下限 250），即**参数量与步数的 6ND 代理对齐**——它不是实测 FLOPs、GPU 时间或能耗；该臂的 gap 只能读作「该代理近似相等时」的规模效应。')
             A('')
     A('---')
     A('')

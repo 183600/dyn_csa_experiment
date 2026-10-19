@@ -8013,6 +8013,18 @@ def pair_reason(ra, rb):
             return f'unverifiable {_k} (only one record carries the corpus / evaluation-slice fingerprint)'
         if _ha and str(_pa) != str(_pb):
             return f'different {_k} ({str(_pa)[:12]}… vs {str(_pb)[:12]}…)'
+    # Matched initialization: same seed is not enough (architectures consume
+    # different amounts of RNG), so compare the shared-trunk init digest.
+    # Both-present equality is required; one-sided is unverifiable (legacy
+    # records predate the field).  RNG-state equality is deliberately NOT
+    # required: architecture-induced RNG consumption is part of the arm.
+    _ia, _ib = ra.get('init_core_fp'), rb.get('init_core_fp')
+    _ha = _ia is not None and str(_ia) != ''
+    _hb = _ib is not None and str(_ib) != ''
+    if _ha != _hb:
+        return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
+    if _ha and str(_ia) != str(_ib):
+        return f'different init_core_fp ({str(_ia)[:12]}… vs {str(_ib)[:12]}…): the two arms did not start from the same shared-trunk initialization despite the paired seed'
     bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
     if bad:
         absent = [k for k in bad if ra.get(k) is None and rb.get(k) is None]
@@ -8176,17 +8188,135 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     for k, v in (comparisons or {}).items():
         if isinstance(v, dict):
             v['p_holm'] = (h.get(str(k)) or {}).get('p_holm')
+    # Family-level resolution ceiling: with m declared slots and n seeds the
+    # smallest attainable Holm p is m * 2 / 2^n.  When that exceeds alpha the
+    # whole family is incapable of rejecting anything, no matter how large the
+    # effects are -- a diagnostic that must be printed next to p_holm=1.0
+    # instead of leaving the reader to infer that the effect is null.
+    _ns = []
+    for v in (comparisons or {}).values():
+        if not isinstance(v, dict):
+            continue
+        try:
+            _n = int(v.get('n'))
+        except (TypeError, ValueError):
+            continue
+        if _n > 0:
+            _ns.append(_n)
+    _m = int(len(comparisons or {}))
+    _fam_floor = holm_min_attainable_p(min(_ns), _m, alpha) if _ns else None
+    _fam_limited = bool(_fam_floor is not None and math.isfinite(_fam_floor) and _fam_floor > alpha)
+    if _fam_limited:
+        print(f'[stats] WARNING: family {family!r} has m={_m} declared comparisons and n_min={min(_ns)} seeds — '
+              f'the smallest attainable Holm p is {_fam_floor:.4g} > alpha={alpha}; NO comparison in this family can be significant. '
+              'That is a resolution ceiling, not a null result; report it as such and add seeds before interpreting p_holm=1.0')
     return {
         'name': family,
-        'declared_slots': int(len(comparisons or {})),
+        'declared_slots': _m,
         'tested': int(tested),
         'omitted': omitted,
         'alpha': float(alpha),
         'correction': 'holm step-down',
         'evidence_level': 'exploratory' if exploratory else 'confirmatory',
+        'n_effective_min': (min(_ns) if _ns else None),
+        'n_effective_max': (max(_ns) if _ns else None),
+        'family_min_attainable_p_holm': _fam_floor,
+        'family_resolution_limited': _fam_limited,
         'note': ('Holm over the displayed family; the panels were selected on the validation split, '
                  'so corrected p-values still are not confirmation') if exploratory else 'pre-registered family',
     }
+
+# Minimum number of evaluation documents below which a claim about the
+# language population (rather than about the frozen evaluation slice) is
+# refused.  The confirmatory panel scores n_seqs=16; that is enough for a
+# fixed-slice mechanism claim and not enough for a population claim.
+MIN_DOCS_FOR_POPULATION_CLAIM = 64
+
+def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
+                     require_holm=True, evidence_level=None):
+    """One machine-checkable answer to: may this contrast be called significant?
+
+    This is the shared gate behind report prose.  A contrast is reportable only
+    when ALL of the following hold:
+
+      * n >= min_n            (otherwise the exact sign-flip p floor is > alpha)
+      * p_floor <= alpha      (resolution ceiling)
+      * p_raw < alpha
+      * p_holm < alpha        (when `require_holm`; an uncorrected p is exploratory)
+      * |mean| > std          (effect larger than seed noise)
+      * family_size is None or the family's minimum attainable Holm p <= alpha
+
+    `evidence_level='confirmatory'` is only honoured when the caller passes it
+    explicitly (a pre-registered family); otherwise a passing contrast is
+    labelled `exploratory_significant`.  The function never turns a failure
+    into a prohibition on *reporting* the number -- it only forbids the words
+    "significant"/"confirmed" and records exactly why.
+    """
+    out = {'allowed': False, 'level': 'unverifiable', 'reasons': [],
+           'n': None, 'p_raw': None, 'p_holm': None, 'p_floor': None,
+           'min_attainable_p_holm_family': None, 'min_n': int(min_n),
+           'alpha': float(alpha)}
+    if not isinstance(stats, dict):
+        out['reasons'].append('not a statistics dict')
+        return out
+    try:
+        n = int(stats.get('n') or 0)
+    except (TypeError, ValueError):
+        n = 0
+    p = stats.get('p_exact_signflip')
+    if p is None:
+        p = stats.get('p')
+    ph = stats.get('p_holm')
+    mean, std = stats.get('mean'), stats.get('std')
+    out['n'] = n
+    try:
+        out['p_raw'] = float(p) if p is not None else None
+    except (TypeError, ValueError):
+        out['p_raw'] = None
+    try:
+        out['p_holm'] = float(ph) if ph is not None else None
+    except (TypeError, ValueError):
+        out['p_holm'] = None
+    out['p_floor'] = signflip_p_floor(n) if n > 0 else None
+    if n < int(min_n):
+        out['reasons'].append(f'n={n} < min_n={int(min_n)}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={int(min_n)}')
+    elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > alpha:
+        out['reasons'].append(f'p floor {out["p_floor"]:.3g} > alpha={alpha}: resolution ceiling, not a null result')
+    try:
+        if out['p_raw'] is None or not (out['p_raw'] < alpha):
+            out['reasons'].append(f'raw p {out["p_raw"]!r} is not < alpha={alpha}')
+    except TypeError:
+        out['reasons'].append('raw p is not comparable')
+    if require_holm:
+        if out['p_holm'] is None:
+            out['reasons'].append('no Holm-corrected p (family correction not attached)')
+        elif not (out['p_holm'] < alpha):
+            out['reasons'].append(f'Holm p {out["p_holm"]:.3g} is not < alpha={alpha}')
+    try:
+        if mean is None or std is None or not (abs(float(mean)) > float(std)):
+            out['reasons'].append('|mean| <= std: effect is within seed noise')
+    except (TypeError, ValueError):
+        out['reasons'].append('mean/std are not numeric')
+    if family_size is not None:
+        try:
+            _fl = holm_min_attainable_p(n, int(family_size), alpha)
+        except Exception:
+            _fl = None
+        out['min_attainable_p_holm_family'] = _fl
+        if _fl is not None and math.isfinite(_fl) and _fl > alpha:
+            out['reasons'].append(f'family of m={int(family_size)} at n={n} has minimum attainable Holm p {_fl:.4g} > alpha')
+    out['allowed'] = not out['reasons']
+    if out['allowed']:
+        out['level'] = 'confirmatory' if str(evidence_level).lower() == 'confirmatory' else 'exploratory_significant'
+    elif n < int(min_n):
+        # Underpowered is the actionable label; the resolution ceiling is the
+        # reason (both are recorded in `reasons`).
+        out['level'] = 'underpowered'
+    elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > alpha:
+        out['level'] = 'resolution_limited'
+    else:
+        out['level'] = 'not_significant'
+    return out
 
 def signflip_p_floor(n):
     """双侧精确符号翻转检验在 n 个种子下的最小可达 p 值（2/2^n）；
@@ -9411,6 +9541,129 @@ def loglog_regression(points, *, alpha=0.05):
     else:
         out.update({'r2': None, 'ci': None, 'p': None,
                     'note': out['note'] + '; k=2 gives an exact line with no residual degrees of freedom, so no CI/R2/p is reported'})
+    return out
+
+
+def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
+                          d_spread_min=1.2):
+    """Fit log10(crossover tokens) ~ log10(d_model) only when the points can
+    support it.  This is the reviewer-requested replacement for fitting a line
+    through whatever panels happen to exist.
+
+    `entries` is an iterable of dicts (or a dict label -> dict) with keys:
+      d                 model width (required)
+      crossover_tokens  observed crossover position in tokens, or None
+      censored          True when no crossover was observed in the window
+      train_tokens      total training tokens of that panel (required)
+      reconstructed     True for a synthesized trajectory
+      label             display name (defaults to the dict key/index)
+
+    Refusal rules (each returns `status` + `reasons`, never a slope):
+      * reconstructed trajectories are excluded outright;
+      * any censored point refuses the fit (dropping it estimates the slope on
+        a selected, faster-crossing subset -- informative censoring);
+      * fewer than `min_points` distinct widths after de-duplication;
+      * widths span less than `d_spread_min` (a degenerate x axis);
+      * training volume is not comparable: max/min > 1 + volume_tol.  Scale
+        panels with 4k vs 8k steps are not points on one d-axis;
+      * duplicate widths: keep the panel with the most training tokens (the
+        token-matched arm) and report the dropped duplicates.
+
+    When it does fit, the slope/CI/p/R^2/leave-one-out all come from
+    `loglog_regression`; the claim level is fixed to `descriptive` because the
+    scale panels are observational, not randomized.
+    """
+    rows = []
+    if isinstance(entries, dict):
+        entries = [(k, v) for k, v in entries.items()]
+    else:
+        entries = list(entries or [])
+    for i, item in enumerate(entries):
+        if isinstance(item, dict):
+            label, e = item.get('label', str(i)), item
+        elif isinstance(item, (tuple, list)) and len(item) == 2 and isinstance(item[1], dict):
+            label, e = str(item[0]), item[1]
+        else:
+            continue
+        if not isinstance(e, dict):
+            continue
+        if e.get('reconstructed') or e.get('synthesized'):
+            continue
+        dur = e.get('d')
+        tok = e.get('crossover_tokens')
+        tr = e.get('train_tokens')
+        try:
+            fd = float(dur)
+            ftok = float(tok) if tok is not None else None
+            ftr = float(tr) if tr is not None else None
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(fd) and fd > 0.0):
+            continue
+        rows.append({'label': str(label), 'd': fd,
+                     'crossover_tokens': (ftok if ftok is not None and math.isfinite(ftok) and ftok > 0.0 else None),
+                     'train_tokens': (ftr if ftr is not None and math.isfinite(ftr) and ftr > 0.0 else None),
+                     'censored': bool(e.get('censored') or e.get('mean_crossed') is False)})
+    out = {'status': 'insufficient_points', 'n_input': len(rows),
+           'claim_level': 'descriptive', 'min_points': int(min_points),
+           'volume_tolerance': float(volume_tol), 'points': [], 'excluded': [],
+           'note': 'observational scale fit; the panels are not randomized, so a slope is a descriptive trend, not a scaling law'}
+    if not rows:
+        out['reasons'] = ['no usable crossover panels']
+        return out
+    censored = [r['label'] for r in rows if r['censored']]
+    missing = [r['label'] for r in rows if r['crossover_tokens'] is None or r['train_tokens'] is None]
+    usable = [r for r in rows if not r['censored'] and r['crossover_tokens'] is not None and r['train_tokens'] is not None]
+    out['censored_panels'] = censored
+    out['incomplete_panels'] = missing
+    if censored:
+        out.update({'status': 'censored',
+                    'reasons': [f'{len(censored)} panel(s) never crossed inside their training window ({censored}); dropping them would fit the slope on the faster-crossing subset only. Report the censored positions as lower bounds or run longer, then refit.']})
+        return out
+    if missing:
+        out.update({'status': 'incomplete',
+                    'reasons': [f'panel(s) lack a crossover position or a training-token count ({missing})']})
+        return out
+    # One point per width: the token-matched arm wins.
+    by_d = {}
+    for r in usable:
+        by_d.setdefault(r['d'], []).append(r)
+    dedup = {}
+    dropped = []
+    for d, rs in by_d.items():
+        rs = sorted(rs, key=lambda r: (-r['train_tokens'], r['label']))
+        dedup[d] = rs[0]
+        dropped.extend(x['label'] for x in rs[1:])
+    if dropped:
+        out['deduped_by_d'] = sorted(dropped)
+    pts = [dedup[d] for d in sorted(dedup)]
+    out['points'] = [{k: p[k] for k in ('label', 'd', 'crossover_tokens', 'train_tokens')} for p in pts]
+    out['excluded'] = sorted(set(censored) | set(missing) | set(dropped))
+    if len(pts) < int(min_points):
+        out.update({'status': 'insufficient_points',
+                    'reasons': [f'{len(pts)} distinct width(s) after de-duplication; at least {int(min_points)} are required for a log-log fit (n=2 is a tautology, n=3 has 1 residual df)']})
+        return out
+    dmin, dmax = min(p['d'] for p in pts), max(p['d'] for p in pts)
+    if dmax / dmin < float(d_spread_min):
+        out.update({'status': 'degenerate_x',
+                    'reasons': [f'width span {dmin:g}..{dmax:g} is only x{dmax / dmin:.2f}; a slope over less than x{float(d_spread_min):.2f} is not identified']})
+        return out
+    tmin = min(p['train_tokens'] for p in pts)
+    tmax = max(p['train_tokens'] for p in pts)
+    if tmax > tmin * (1.0 + float(volume_tol)):
+        out.update({'status': 'training_volume_confounded',
+                    'reasons': [f'training volume ranges {tmin:.3g}..{tmax:.3g} tokens (x{tmax / tmin:.2f}); the d-axis is confounded with training length. '
+                                'Add token-matched arms or model log(tokens) as a covariate before reporting a d slope.'],
+                    'volume_ratio': float(tmax / tmin)})
+        return out
+    fit = loglog_regression([{'x': p['d'], 'y': p['crossover_tokens'], 'label': p['label']} for p in pts])
+    out.update(fit)
+    out['status'] = fit.get('status', 'ok')
+    out['volume_ratio'] = float(tmax / tmin)
+    out['slope_per_doubling'] = (float(fit['slope']) * math.log10(2.0)) if isinstance(fit.get('slope'), (int, float)) else None
+    out['claim_level'] = 'descriptive'
+    out['note'] = ('observational log-log fit over uncensored, token-comparable panels; '
+                   'report the CI and the leave-one-out range, and do not call it a scaling law')
     return out
 
 
@@ -10879,12 +11132,122 @@ def _params_of_arm(recs, arm):
 def _param_control(recs, a, b):
     """Relative parameter-count difference between two arms, and whether it is
     small enough to call them parameter-controlled (<=1%).  None means one or
-    both records do not expose `params` (unverifiable, not a mismatch)."""
+    both records do not expose `params` (unverifiable, not a mismatch).
+
+    This is only the TOTAL count.  `_param_control_detail` additionally
+    compares the recorded `param_breakdown` (non-embedding / active), because
+    two arms can match in total while one carries dead or reallocated capacity
+    (the random-indexer control has ~2e5 dead projection parameters, and the
+    parameter-matched dense arm reallocates MLP width).  The detail is
+    reported, never used to silently pass a total mismatch.
+    """
     pa, pb = _params_of_arm(recs, a), _params_of_arm(recs, b)
     if pa is None or pb is None:
         return (None, None)
     rel = abs(pa - pb) / float(max(pa, pb, 1))
     return (float(rel), bool(rel <= 0.01))
+
+def _param_breakdown_of_arm(recs, arm):
+    for (v, _t, _s), r in recs.items():
+        if v != arm:
+            continue
+        pb = r.get('param_breakdown')
+        if isinstance(pb, dict) and pb:
+            return pb
+    return None
+
+def _param_control_detail(recs, a, b):
+    """Capacity breakdown for a pair: total as well as non-embedding and
+    active parameters.  Returns `{}` when neither record exposes the detail,
+    so legacy records are not silently labelled controlled."""
+    out = {'total_rel_diff': None, 'total_controlled': None,
+           'non_embedding_rel_diff': None, 'non_embedding_controlled': None,
+           'active_rel_diff': None, 'active_controlled': None,
+           'unavailable': True}
+    pa, pb = _params_of_arm(recs, a), _params_of_arm(recs, b)
+    if pa is not None and pb is not None:
+        rel = abs(pa - pb) / float(max(pa, pb, 1))
+        out.update({'total_rel_diff': float(rel), 'total_controlled': bool(rel <= 0.01), 'unavailable': False})
+    ba, bb = _param_breakdown_of_arm(recs, a), _param_breakdown_of_arm(recs, b)
+    if not (isinstance(ba, dict) and isinstance(bb, dict)):
+        return out
+
+    def _num(d, key):
+        v = d.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)):
+            return float(v)
+        return None
+    for key, label in (('non_embedding', 'non_embedding'), ('active', 'active')):
+        va, vb = _num(ba, key), _num(bb, key)
+        if va is None or vb is None:
+            continue
+        rel = abs(va - vb) / max(va, vb, 1.0)
+        out[f'{label}_rel_diff'] = float(rel)
+        out[f'{label}_controlled'] = bool(rel <= 0.01)
+    out['unavailable'] = False
+    return out
+
+def _compute_control_detail(recs, a, b, *, tolerance=0.25):
+    """Measured compute budget of a pair, not just its step count.
+
+    Equal `steps`/`tokens_seen` is enforced by `pair_reason`, but that is not
+    equal compute: the parameter-matched dense arm widens its MLP (+69%) and
+    reads every token, while a sparse arm reads a fraction of the blocks.  The
+    review's fairness requirement needs the mismatch *shown*, and its
+    DIRECTION matters: if the arm with more measured compute also wins, the
+    comparison is confounded in favour of the claim; if it loses, the claim is
+    conservative.
+
+    Sources, in order of preference:
+      * measured wall-clock per token (`train_time_s / tokens_seen`), median
+        over the arm's seeds;
+      * the 6ND proxy (`params * tokens_seen`) when no timing is recorded.
+    Returns `{}`-shaped fields with None when neither record can support the
+    comparison; never guesses.
+    """
+    def _series(arm):
+        tpt, prox, par = [], [], []
+        for (v, _t, _s), r in recs.items():
+            if v != arm or not isinstance(r, dict):
+                continue
+            tt, tok = r.get('train_time_s'), r.get('tokens_seen')
+            if isinstance(tt, (int, float)) and isinstance(tok, (int, float)) and tt > 0 and tok > 0:
+                tpt.append(float(tt) / float(tok))
+            p = r.get('params')
+            if isinstance(p, (int, float)) and p > 0:
+                par.append(float(p))
+                if isinstance(tok, (int, float)) and tok > 0:
+                    prox.append(float(p) * float(tok))
+        med = (lambda xs: float(np.median(xs)) if xs else None)
+        return med(tpt), med(par), med(prox)
+
+    ta, pa, xa = _series(a)
+    tb, pb, xb = _series(b)
+    out = {'arm_a': a, 'arm_b': b, 'tolerance': float(tolerance),
+           'time_per_token_s': {a: ta, b: tb},
+           'params': {a: pa, b: pb},
+           'flops_proxy_6nd': {a: xa, b: xb},
+           'time_ratio_a_over_b': None, 'proxy_ratio_a_over_b': None,
+           'compute_matched': None, 'compute_matched_source': None,
+           'more_compute_arm': None, 'note': None}
+    ratio = None
+    if ta and tb and ta > 0 and tb > 0:
+        ratio = ta / tb
+        out['time_ratio_a_over_b'] = float(ratio)
+        out['compute_matched_source'] = 'measured wall-clock per token'
+    elif xa and xb and xa > 0 and xb > 0:
+        ratio = xa / xb
+        out['proxy_ratio_a_over_b'] = float(ratio)
+        out['compute_matched_source'] = '6ND proxy (params x tokens); not a measurement'
+    if ratio is None:
+        out['note'] = 'no timing or 6ND inputs on the records: compute matching is unverifiable for this pair'
+        return out
+    out['compute_matched'] = bool(abs(ratio - 1.0) <= float(tolerance))
+    out['more_compute_arm'] = (a if ratio > 1.0 else b)
+    if not out['compute_matched']:
+        out['note'] = (f'{out["more_compute_arm"]} consumed about {max(ratio, 1.0 / ratio):.2f}x the compute of the other arm '
+                       f'({out["compute_matched_source"]}); this is NOT an equal-compute comparison')
+    return out
 
 def _holm_assign(entries, m_family, alpha, out_key):
     """Attach a Holm step-down adjusted p to each entry over the declared
@@ -10932,6 +11295,12 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
     direction_unspecified — significant, but the hypothesis explicitly declared
                           predicted_sign=0; it cannot support a directional
                           advantage claim;
+    system_level_only   — significant after correction, but every significant
+                          contrast is confounded by a different training
+                          objective or by a compute budget that favours the
+                          claimed winner (`mechanism_claim_allowed=False`).
+                          This is a real performance difference, not evidence
+                          for the isolated mechanism;
     measured            — a controlled contrast exists with n >= min_n, but no
                           corrected significance;
     resolution_limited  — a controlled, non-noise contrast exists whose
@@ -10956,6 +11325,12 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
             return 'direction_conflict'
         if any(e.get('predicted_sign') == 0 for e in sig):
             return 'direction_unspecified'
+        # A significant contrast whose objective/compute confound favours the
+        # claimed winner is a system-level difference.  `verified` is reserved
+        # for contrasts that pass `mechanism_claim_allowed`, so the flag the
+        # audit already computes finally has a consumer.
+        if all(e.get('mechanism_claim_allowed') is False for e in sig):
+            return 'system_level_only'
         return 'verified'
     noise_free = [e for e in powered if not e.get('within_seed_noise')]
     if not noise_free:
@@ -11181,11 +11556,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
               'significant_components': [], 'nominally_significant_components': [],
               'resolution_limited_components': [], 'underpowered_components': [],
               'noise_level_components': [], 'unverified_components': [],
+              'system_level_only_components': [],
               'direction_conflict_components': [], 'hypotheses_missing': [],
               'verified_baselines': [], 'measured_baselines': [],
               'significant_baselines': [], 'nominally_significant_baselines': [],
               'resolution_limited_baselines': [], 'underpowered_baselines': [],
               'noise_level_baselines': [], 'unverified_baselines': [],
+              'system_level_only_baselines': [],
               'direction_conflict_baselines': [], 'tuned_verified_baselines': [],
               'untuned_verified_baselines': [],
               'direction_unspecified_components': [], 'direction_unspecified_baselines': [],
@@ -11226,6 +11603,25 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         report.setdefault('objective_confounded', []).append(
                             '%s vs %s: %s — same run_cfg but different actual loss/optimizer objective; '
                             'the contrast is a system-level comparison, not an isolated mechanism' % (a, b, '; '.join(_obj_bad)))
+                    # Compute-budget control (review issue 2c).  Equal tokens is
+                    # not equal compute.  Report the measured mismatch and its
+                    # direction; only a mismatch that FAVOURS the claimed winner
+                    # downgrades the contrast, because the reverse is conservative.
+                    _cc = _compute_control_detail(recs, a, b)
+                    st['compute_control'] = _cc
+                    st['compute_matched'] = _cc.get('compute_matched')
+                    if _cc.get('compute_matched') is False and isinstance(st.get('mean'), (int, float)) and math.isfinite(float(st['mean'])):
+                        _better = a if float(st['mean']) < 0 else b
+                        _more = _cc.get('more_compute_arm')
+                        _bias = ('favors_claimed_winner' if _more == _better else 'conservative_against_claimed_winner')
+                        st['compute_confound_direction'] = _bias
+                        st['compute_ratio'] = max(_cc.get('time_ratio_a_over_b') or 1.0, 1.0 / (_cc.get('time_ratio_a_over_b') or 1.0)) if _cc.get('time_ratio_a_over_b') else max(_cc.get('proxy_ratio_a_over_b') or 1.0, 1.0 / (_cc.get('proxy_ratio_a_over_b') or 1.0))
+                        if _bias == 'favors_claimed_winner' and float(st['compute_ratio']) > 1.5:
+                            st['mechanism_claim_allowed'] = False
+                            report.setdefault('compute_confounded', []).append(
+                                '%s vs %s: the arm that wins by %.2f PPL also consumed about %.2fx the compute (%s); '
+                                'the performance difference is not separable from the compute difference'
+                                % (a, b, abs(float(st['mean'])), float(st['compute_ratio']), _cc.get('compute_matched_source')))
                     if _a_vals and _b_vals:
                         _a_mean = float(np.mean(_a_vals))
                         _b_mean = float(np.mean(_b_vals))
@@ -11412,7 +11808,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     }
 
     def _publish(group_name, design_group, entries_by_comp, meta, kind, require_param_match):
-        status_names = ('verified', 'direction_conflict', 'direction_unspecified', 'measured',
+        status_names = ('verified', 'system_level_only', 'direction_conflict', 'direction_unspecified', 'measured',
                         'significant', 'nominally_significant', 'resolution_limited',
                         'underpowered', 'noise_level', 'unverified')
         lists = {s: [] for s in status_names}
@@ -11663,6 +12059,8 @@ def _print_methodology_audit(report):
         print('  direction-unspecified (significant, but the hypothesis declared predicted_sign=0): ' + ', '.join(report['direction_unspecified_components']))
     if report.get('resolution_limited_components'):
         print('  resolution-limited (non-noise effect, but the family-corrected p floor > alpha at this n; need n>=%s — add seeds, do NOT read as a null): ' % str((_fam.get('min_seeds_for_family_significance') or '?')) + ', '.join(report['resolution_limited_components']))
+    if report.get('system_level_only_components'):
+        print('  SYSTEM-LEVEL ONLY (significant but the objective/compute budget favours the claimed winner): ' + ', '.join(report['system_level_only_components']))
     if report.get('noise_level_components'):
         print('  noise-level (effect within seed noise across all contrasts): ' + ', '.join(report['noise_level_components']))
     if report.get('underpowered_components'):
@@ -11837,6 +12235,34 @@ def rng_fingerprint():
             # a broken CUDA context is reported elsewhere; the CPU part of
             # the fingerprint is still a useful diagnostic
             pass
+    return h.hexdigest()[:16]
+
+def init_core_fingerprint(model):
+    """Hash the initialization of the parameter tensors every arm shares.
+
+    A paired-seed design only blocks the *seed*, not the initialization:
+    different architectures consume different amounts of RNG, so "seed=3" does
+    not by itself prove that the two arms started from the same embedding /
+    position / LM-head / final-norm tensors.  This digest covers exactly the
+    trunk pieces whose names, shapes and construction order do not depend on
+    the attention variant (they are built before the blocks), so equality is a
+    real matched-initialization check rather than a tautology.
+
+    It is recorded per training record and `pair_reason` refuses a pair whose
+    two records carry different digests.  Records from before this field
+    existed carry no digest; a one-sided digest is unverifiable, exactly like
+    the other provenance gates.
+    """
+    h = hashlib.sha256()
+    sd = model.state_dict() if hasattr(model, 'state_dict') else {}
+    for name in ('tok.weight', 'pos.weight', 'head.weight', 'norm.weight'):
+        t = sd.get(name)
+        if t is None:
+            continue
+        arr = t.detach().to('cpu').float().contiguous().numpy()
+        h.update(name.encode('ascii', 'replace'))
+        h.update(repr(tuple(arr.shape)).encode('ascii', 'replace'))
+        h.update(arr.tobytes())
     return h.hexdigest()[:16]
 
 def capture_rng_state():
@@ -14340,6 +14766,7 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
                 torch.cuda.synchronize(device)
             dec.append((time.perf_counter() - t0) * 1000.0)
         out = {'status': 'ok', 'n_tokens': int(ids.shape[1]), 'batch': int(ids.shape[0]),
+               'device': str(device), 'torch': torch.__version__,
                'prefill_ms_p50': _percentile(pre, 0.50), 'prefill_ms_p95': _percentile(pre, 0.95),
                'prefix_prefill_ms_p50': _percentile(dec, 0.50),
                'prefix_prefill_ms_p95': _percentile(dec, 0.95),
@@ -14352,6 +14779,84 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
         return out
     finally:
         model.train(was)
+
+
+@torch.inference_mode()
+def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches=(1,),
+                             warmup=1, iters=3):
+    """Batch x sequence-length latency/throughput sweep on ONE checkpoint.
+
+    `measure_efficiency` answers "how fast is this one input"; a claim that an
+    architecture is cheaper needs the shape dependence too (batch 1 vs 8,
+    short vs long).  CUDA timings use events (so kernel launch is included but
+    host-side jitter is not); CPU timings use perf_counter.  The output records
+    the device, torch/triton versions and TF32 state so two rows are only
+    compared when they were measured under the same conditions.
+
+    There is still no KV cache in this model: the sweep measures full-prefix
+    prefill, and `decode_has_kv_cache=False` is recorded rather than pretending
+    this is incremental decoding.
+    """
+    was = model.training
+    model.eval()
+    arr = torch.as_tensor(ids)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    arr = arr.to(device)
+    max_len = int(min(arr.shape[1], max(int(x) for x in lengths)))
+    out = {'status': 'ok', 'device': str(device), 'torch': torch.__version__,
+           'triton': None, 'tf32': None, 'rows': [],
+           'decode_has_kv_cache': False,
+           'decode_metric': 'prefix_prefill (no KV cache)',
+           'measurement': ('cuda events' if device.type == 'cuda' else 'cpu perf_counter')}
+    try:
+        import triton  # noqa: F401
+        out['triton'] = getattr(triton, '__version__', None)
+    except Exception:
+        out['triton'] = None
+    try:
+        out['tf32'] = bool(torch.backends.cuda.matmul.allow_tf32) if device.type == 'cuda' else None
+    except Exception:
+        pass
+    try:
+        for bs in [int(b) for b in batches if int(b) >= 1]:
+            for L in [int(x) for x in lengths if 0 < int(x) <= max_len]:
+                base = arr[:, :L]
+                if base.shape[0] < bs:
+                    reps = (bs + base.shape[0] - 1) // base.shape[0]
+                    batch = base.repeat(reps, 1)[:bs]
+                else:
+                    batch = base[:bs]
+                for _ in range(max(0, int(warmup))):
+                    model(batch)
+                times = []
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                    torch.cuda.reset_peak_memory_stats(device)
+                for _ in range(max(1, int(iters))):
+                    if device.type == 'cuda':
+                        _s = torch.cuda.Event(enable_timing=True)
+                        _e = torch.cuda.Event(enable_timing=True)
+                        _s.record()
+                        model(batch)
+                        _e.record()
+                        torch.cuda.synchronize(device)
+                        times.append(float(_s.elapsed_time(_e)))
+                    else:
+                        _t0 = time.perf_counter()
+                        model(batch)
+                        times.append((time.perf_counter() - _t0) * 1000.0)
+                p50 = _percentile(times, 0.50)
+                row = {'batch': bs, 'seq_len': L,
+                       'prefill_ms_p50': p50, 'prefill_ms_p95': _percentile(times, 0.95),
+                       'tokens_per_s': (1000.0 * bs * L / p50) if p50 else None}
+                if device.type == 'cuda':
+                    row['peak_mem_allocated_mb'] = torch.cuda.max_memory_allocated(device) / (1 << 20)
+                    row['peak_mem_reserved_mb'] = torch.cuda.max_memory_reserved(device) / (1 << 20)
+                out['rows'].append(row)
+    finally:
+        model.train(was)
+    return out
 
 
 def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False, save_ckpt=None, ckpt_dir=None, diag_every=None, measure_eff=False, amp_dtype='auto', eager_batch='auto'):
@@ -14390,6 +14895,11 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     _eager_batch_used = _uses_batched_eager(cfgs, device, batch_size)
     model = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
     _inner_model = model
+    # Matched-initialization evidence for paired seeds: the shared trunk is
+    # built before the variant-specific blocks, so two arms at the same seed
+    # must hash identically.  This is what turns "paired by seed" into an
+    # actual check rather than an assumption.
+    _init_core_fp = init_core_fingerprint(_inner_model)
     if _dist and _world > 1:
         _dev_ids = [device] if device.type == 'cuda' else None
         model = torch.nn.parallel.DistributedDataParallel(
@@ -14883,7 +15393,21 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         except Exception as _ee:
             print(f'[efficiency] WARNING: measurement failed ({type(_ee).__name__}: {_ee})')
             _efficiency = {'status': 'error', 'error': f'{type(_ee).__name__}: {_ee}'}
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world, 'train_time_s': wall, 'train_tokens_per_s': ((steps * batch_size * seq_len * _world) / wall if wall and wall > 0 else None), 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'data_fp': _ids_fp(train_ids),
+    # `tokens_seen` counts DRAWS, not unique tokens: training windows are
+    # sampled with replacement and overlap heavily, so a 3000-step run over an
+    # 8M-token cache does not consume 18.4M distinct tokens.  Record an
+    # explicit coverage estimate instead of letting readers infer uniqueness.
+    _draws = int(steps) * int(batch_size) * int(_world)
+    _n_train = int(len(train_ids)) if hasattr(train_ids, '__len__') else 0
+    _uniq_frac = None
+    if _n_train > 0:
+        _p = min(float(seq_len) / float(_n_train), 1.0)
+        _uniq_frac = (1.0 if _p >= 1.0 else float(1.0 - math.exp(_draws * math.log1p(-_p))))
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world,
+              'tokens_seen_unique_estimate': (int(round(_n_train * _uniq_frac)) if _uniq_frac is not None else None),
+              'tokens_seen_unique_frac_estimate': _uniq_frac,
+              'token_accounting_note': 'tokens_seen counts window draws; unique-token coverage is an estimate under independent uniform window draws, not a measurement',
+              'train_time_s': wall, 'train_tokens_per_s': ((steps * batch_size * seq_len * _world) / wall if wall and wall > 0 else None), 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'init_core_fp': _init_core_fp, 'data_fp': _ids_fp(train_ids),
               # Review 3: the token-level evidence behind the reported PPL.
               # `nll_sum / n_tokens` is the pooled-NLL estimator; the per-row
               # rows let a report bootstrap DOCUMENT uncertainty instead of

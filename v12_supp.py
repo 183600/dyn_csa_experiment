@@ -1334,12 +1334,27 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # and batch order are not independently re-derivable from a record; report
     # them instead of silently assuming them.
     _rngs = sorted({str(r.get('rng_fp')) for r in admitted.values() if r.get('rng_fp')})
+    _inits = sorted({str(r.get('init_core_fp')) for r in admitted.values() if r.get('init_core_fp')})
     stats['validity'] = {
         'rng_fp_values': _rngs,
         'same_rng_fp': len(_rngs) <= 1,
+        'init_core_fp_values': _inits,
+        'same_init_core_fp': len(_inits) <= 1,
+        'init_core_fp_recorded': bool(_inits),
         'n_seq_values': sorted({int(r.get('n_seq')) for r in admitted.values() if r.get('n_seq') is not None}),
-        'note': 'exact sign-flip requires within-seed exchangeability (same data order / eval rows / corruption grid). data_fp, train_fp, n_seq and recipe are machine-checked; rng_fp is reported here but NOT enforced, so the exchangeability claim remains a declared assumption rather than a proved one.',
+        'note': 'exact sign-flip requires within-seed exchangeability (same data order / eval rows / corruption grid). data_fp, train_fp, n_seq and recipe are machine-checked; the shared-trunk initialization digest (init_core_fp) is reported and compared (`same_init_core_fp`); rng_fp is reported but NOT enforced (architecture-induced RNG consumption is part of the arm), so the exchangeability claim remains a declared, machine-instrumented assumption.',
     }
+    # Review issue 2: the frozen comparison is parameter-matched, not
+    # compute-matched.  Refuse a non-descriptive plan that does not disclose
+    # both facts, so the caveat cannot be silently dropped from the report.
+    _cbd = manifest.get('compute_budget_disclosure')
+    _descriptive = bool((manifest.get('statistics') or {}).get('descriptive_only'))
+    if not _descriptive:
+        _missing = [k for k in ('parameter_matching', 'flops', 'read_fraction')
+                    if not (isinstance(_cbd, dict) and _cbd.get(k))]
+        if _missing:
+            raise SystemExit(f'[p5t stats] REFUSE: the frozen plan lacks compute-budget disclosure {_missing}. Parameter matching is not compute matching; the report must state the FLOPs/read-budget mismatch next to every primary comparison (review issue 2).')
+    stats['compute_budget_disclosure'] = _cbd
     for v in manifest['arms']:
         rows = [r for (rv, s), r in admitted.items() if rv == v]
         _lens = sorted({int(k) for r in rows for k in (r.get('by_len') or {})})
@@ -1433,6 +1448,17 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         else:
             res['param_matched'] = None
             res['param_rel_diff'] = None
+        _iv = sorted({str(recs_a[s].get('init_core_fp')) for s in usable if recs_a[s].get('init_core_fp')} |
+                     {str(recs_b[s].get('init_core_fp')) for s in usable if recs_b[s].get('init_core_fp')})
+        res['same_init_core_fp'] = (len(_iv) <= 1)
+        res['init_core_fp_recorded'] = bool(_iv)
+        _act = []
+        for _recs in (recs_a, recs_b):
+            for s in usable:
+                _pb = _recs[s].get('param_breakdown')
+                if isinstance(_pb, dict) and isinstance(_pb.get('active'), (int, float)):
+                    _act.append(float(_pb['active']))
+        res['active_params_mean'] = (float(np.mean(_act)) if _act else None)
         res['data_fp'] = unified_fp
         res['manifest_sha256'] = manifest.get('manifest_sha256')
         res['delta_definition'] = f'{a} - {b} (paired per seed, test split)'
@@ -1489,8 +1515,12 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     if unified_fp is not None and admitted:
         _any_doc = [r.get('by_len', {}).get(4096, r.get('by_len', {}).get('4096', {})) for r in admitted.values()]
         _n_doc = next((len(c.get('ppl_per_seq') or []) for c in _any_doc if isinstance(c, dict) and c.get('ppl_per_seq')), 0)
-        if _n_doc and _n_doc < 64:
-            stats['doc_sampling_note'] = f'per-document rows recorded (n_docs={_n_doc}); between-doc variance is reported per comparison in doc_sampling — n_docs<64 does not cover the language-population distribution, population-level claims need a larger row panel'
+        if _n_doc:
+            stats['population_claim_allowed'] = bool(_n_doc >= L.MIN_DOCS_FOR_POPULATION_CLAIM)
+            if _n_doc < L.MIN_DOCS_FOR_POPULATION_CLAIM:
+                stats['doc_sampling_note'] = (f'per-document rows recorded (n_docs={_n_doc}); between-doc variance is reported per comparison in doc_sampling — '
+                                              f'n_docs<{L.MIN_DOCS_FOR_POPULATION_CLAIM} does not cover the language-population distribution, so population-level claims are refused; '
+                                              'the confirmed claims are about the frozen evaluation slice (design_notes section 20)')
     print(f'[p5t stats] admitted {len(admitted)}/{len(manifest["arms"]) * _n} frozen (arm, seed) cells on slice {str(unified_fp)[:12]}…; {len(_fam)} frozen primary comparison(s); {len(_rej)} survive Holm; {len(_conf)} also match the pre-registered direction')
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     stats = L.stamped_analysis('finaltest_stats', stats, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
@@ -1525,7 +1555,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     A('# CSA / HCA 受控机制研究 — v12 确认报告（冻结清单 + 独立 test split）')
     A('')
     A(f'> 生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")}')
-    A('> 参考论文：arXiv:2606.19348（DeepSeek-V4 稀疏注意力的受控复现与机制剖析）')
+    A('> 参考论文：arXiv:2606.19348。**范围声明**：小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到其规模、语料、长上下文训练或生产系统。')
     A('> 说明：本报告全部数字由 `v12_supp.py report` 从 `results_lm_test/`、`results_v10_mech/`、`analysis_v12/` 的落盘产物计算得到，无手填数值。')
     A('')
     A('本驱动落实评审点 4/5 的确认性协议：v7→v11 的全部面板与 v10/v12 的机制扩展属于**探索性**证据；本报告只报告**冻结后**在 held-out test split（wiki.test.raw，其它 phase 不读）上的一次性确认评估。')
@@ -1598,19 +1628,22 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('')
     comps = ft.get('comparisons') or {}
     if comps:
-        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | Δ mean±std | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
-        A('|---|---|---|---|---|---|---|---|---|---|---|')
+        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | Δ mean±std | 文档 Δ 95% CI | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
+        A('|---|---|---|---|---|---|---|---|---|---|---|---|')
         holm = ft.get('holm') or {}
         for k, v in comps.items():
             if 'omitted' in v:
-                A(f'| {k} | 0 | — | — | —（{v["omitted"]}） | — | — | — | — | — | — |')
+                A(f'| {k} | 0 | — | — | —（{v["omitted"]}） | — | — | — | — | — | — | — |')
                 continue
             _h = holm.get(k) or {}
             _hp = f'{_h.get("p_holm", float("nan")):.3f}' if _h.get('p_holm') is not None else '—'
             _hr = '✔' if (_h.get('p_holm') is not None and float(_h['p_holm']) < 0.05) else '✘'
             _dir = v.get('direction_ok')
             _ds = '—（非方向性）' if _dir is None else ('✔' if _dir else '✘')
-            A(f'| {k} | {v["n"]} | {v.get("coverage_ok")} | {v.get("param_matched")} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
+            _dsm = v.get('doc_sampling') or {}
+            _dci = _dsm.get('per_doc_delta_ppl_ci95')
+            _dcitxt = f'[{_dci[0]:+.2f}, {_dci[1]:+.2f}]' if isinstance(_dci, (list, tuple)) and len(_dci) == 2 else '—'
+            A(f'| {k} | {v["n"]} | {v.get("coverage_ok")} | {v.get("param_matched")} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {_dcitxt} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
         A('')
         _conf = ft.get('confirmed')
         if _conf is None:
