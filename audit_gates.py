@@ -709,7 +709,7 @@ def audit_causality():
     L = _import_exp_lib()
     import v7_supp as _V7  # noqa: F401 — importing installs the *_rope variant patches (make_layer_cfgs_v7 + SmallGPTRoPE factory)
     import copy as _copy
-    torch.manual_seed(0)
+    L.set_seed(0)
     dev = torch.device('cpu')
     V, T, vocab = 6, 128, 256
     variants = ['full_rope', 'csa_fixed_rope', 'csa_fixed_rope_randidx', 'csa_fixed_rope_allblocks']
@@ -1291,7 +1291,7 @@ def audit_efficiency_demo():
     L = _import_exp_lib()
     import v7_supp as _V7  # noqa: F401 — installs the rope-variant patches
     import copy as _copy
-    torch.manual_seed(0)
+    L.set_seed(0)
     dev = torch.device('cpu')
     cfgs = L.make_layer_cfgs(2, 'full_rope')
     model = L.SmallGPT(256, 64, 2, 4, 16, 128, cfgs).to(dev)

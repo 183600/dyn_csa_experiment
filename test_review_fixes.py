@@ -1425,6 +1425,63 @@ def t_seed_reproducible():
     assert d != a[:3], 'a different seed must change the RNG stream'
 
 
+def t_seed_axis_normalization():
+    assert L.normalize_seed_list([0, 1, 1, 2, '3']) == [0, 1, 2, 3]
+    assert L.normalize_seed_list([]) == [0]
+    assert L.normalize_seed_list(None) == [0]
+    assert L.normalize_seed_list('0, 2 2') == [0, 2]
+    assert L.normalize_variant_list(['full', 'csa_fixed', 'full']) == ['full', 'csa_fixed']
+    for bad in (True, 1.5, 'x'):
+        try:
+            L.normalize_seed_list([bad])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'normalize_seed_list must reject {bad!r}')
+    d = tempfile.mkdtemp()
+    _saved_load = L.load_run_corpus
+    _old_skip_overfit = os.environ.get('CSA_SKIP_OVERFIT')
+    _old_skip_repro = os.environ.get('CSA_SKIP_REPRO')
+    try:
+        ids = np.arange(2048, dtype=np.int64) % 997
+        val = (np.arange(64, dtype=np.int64) % 997).reshape(2, 32)
+        L.load_run_corpus = lambda cfg: (ids, val, 997, None, None)
+        os.environ['CSA_SKIP_OVERFIT'] = '1'
+        os.environ['CSA_SKIP_REPRO'] = '1'
+        cfg = dict(outdir=d, seq_len=32, batch_size=2, n_train_tokens=2048, steps=2,
+                   lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0,
+                   delta_lr_mult=10.0, eval_every=0, eval_subset=2, d=64,
+                   n_layers=2, n_heads=4, d_head=16, dataset='unit', seeds=[0, 0],
+                   variants=['full'])
+        L.run(cfg, label='dedupe-unit')
+        m = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
+        entry = next(iter(m['panels'].values()))
+        assert entry['n_planned'] == 1 and entry['n_completed'] == 1, entry
+        assert entry['tracking_integrity']['seeds_unique'] is True, entry['tracking_integrity']
+        lines = [json.loads(x) for x in open(os.path.join(d, 'experiments.jsonl'), encoding='utf-8').read().strip().splitlines()]
+        assert sum(1 for x in lines if x.get('kind') == 'cell') == 1, lines
+    finally:
+        L.load_run_corpus = _saved_load
+        for k, old in (('CSA_SKIP_OVERFIT', _old_skip_overfit), ('CSA_SKIP_REPRO', _old_skip_repro)):
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def t_seed_contract_check():
+    L.set_seed(4242)
+    fp0 = L.rng_fingerprint()
+    r = L.seed_contract_check(seed=3)
+    assert r['passed'] is True, r
+    assert r['checks']['same_seed_reproducible'] is True
+    assert r['checks']['different_seed_changes_streams'] is True
+    assert r['checks']['worker_seed_reproducible'] is True
+    assert r['checks']['cuda_seeded'] is (True if torch.cuda.is_available() else None)
+    assert L.rng_fingerprint() == fp0, 'the seed contract probe must not advance the process RNG streams'
+
+
 def t_batch_iter_reproducible():
     ids = np.arange(5000, dtype=np.int64) % 997
     b1 = next(L.batch_iter(ids, 32, 4, torch.device('cpu'), seed=7))
@@ -1521,6 +1578,10 @@ def t_overfit_sanity():
     assert r['final_accuracy'] >= r['target_accuracy'], f"final accuracy {r['final_accuracy']} did not reach {r['target_accuracy']}"
     assert r['grad_all_finite'] and r['params_changed'], 'gradients must be finite and applied'
     assert r['regularization']['weight_decay'] == 0.0 and r['regularization']['comp_lambda'] == 0.0
+    assert r['label_shift_required'] is True
+    assert r['pass_criteria']['labels_are_next_token_shift'] is True, r['pass_criteria']
+    assert r['pass_criteria']['initial_loss_near_log_vocab'] is True, r['pass_criteria']
+    assert r['failed_criteria'] == [], r['failed_criteria']
     # the check must also work when the batch is sampled from a real token stream
     ids = np.asarray(np.random.default_rng(3).integers(0, 256, size=1024), dtype=np.int64)
     r2 = L.overfit_sanity_check('csa_dynamic', seed=0, steps=200, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=24, batch_size=2, vocab=256, train_ids=ids)
@@ -1647,6 +1708,17 @@ def t_dataloader_seeding_helpers():
     torch.manual_seed(11)
     L.seed_worker(0)
     assert torch.backends.cudnn.deterministic is True and torch.backends.cudnn.benchmark is False, 'a spawned worker must re-pin deterministic kernels'
+    # The worker hook must also make real worker PROCESSES reproducible.
+    class _DrawDS(torch.utils.data.Dataset):
+        def __len__(self):
+            return 64
+        def __getitem__(self, i):
+            return torch.tensor([i, int(random.random() * 1e9), int(np.random.random() * 1e9)])
+    def worker_order(seed):
+        dl = L.deterministic_dataloader(_DrawDS(), batch_size=8, shuffle=True, seed=seed, num_workers=2)
+        return [tuple(int(x) for x in row) for b in dl for row in b]
+    assert worker_order(4) == worker_order(4), 'spawned DataLoader workers must reproduce their Python/NumPy draws'
+    assert worker_order(4) != worker_order(5), 'a different DataLoader seed must change the worker draws'
 
 
 def t_train_variant_reproducible():
@@ -1702,6 +1774,7 @@ def t_experiment_ledger():
         assert entry.get('status') == 'complete' and entry.get('n_completed') == 1
         integ = entry.get('tracking_integrity') or {}
         assert integ.get('n_cells') == 1 and integ.get('with_curve') == 1 and integ.get('with_rng_fp') == 1 and integ.get('with_data_contract') == 1, integ
+        assert integ.get('with_seed_metadata') == 1 and integ.get('seed_metadata_mismatch') == [], integ
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -1915,9 +1988,13 @@ def t_overfit_guard_config_aware():
 def t_environment_snapshot_identity():
     env = L.environment_snapshot()
     for k in ('gpu_identity', 'cuda_visible_devices', 'float32_matmul_precision',
-              'cublas_workspace_config'):
+              'cublas_workspace_config', 'dependencies'):
         assert k in env, f'environment snapshot missing {k}'
     assert isinstance(env['gpu_identity'], list)
+    dep = env['dependencies']
+    assert 'requirements.txt' in dep['files'] and 'requirements.lock' in dep['files'], dep
+    assert dep['files']['requirements.txt'] is None or dep['files']['requirements.txt']['sha256'], dep
+    assert 'torch' in dep['packages'], dep
 
 
 
@@ -2881,6 +2958,8 @@ def main():
     _check('J4 review-3 task-boundary arm + objective descriptor', t_review3_boundary_arm_and_objective)
     _check('J5 review-3 span clean-baseline key', t_review3_span_clean_key)
     _check('E1 seed reproducibility', t_seed_reproducible)
+    _check('E1a seed/variant axis normalisation', t_seed_axis_normalization)
+    _check('E1b explicit RNG seed contract', t_seed_contract_check)
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
     _check('E2b batch_iter uint16 transport', t_batch_iter_uint16)
     _check('E2c real batch-iterator contract check', t_batch_contract_check)

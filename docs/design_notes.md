@@ -238,9 +238,19 @@ RNG 流、不改返回内容，因此不触碰 §3.1 的可比性（`CODE_SEMANT
   版本、provenance、超参、RNG 指纹、训练曲线与最终评估结果都在自动记录里，
   不需要手工誊写。`run_manifest.json` 额外给出 `tracking_integrity` 计数，
   让缺失 provenance / 超参 / RNG 指纹 / 曲线的单元一眼可见。
+- 面板轴（seeds / variants）在任何探针、指纹或 manifest 之前先校验并去重：
+  重复 seed 不会再把同一个 `variant::seed` 训练两次，缺省/空 seed 列表也不会
+  出现「训练了 fallback seed、manifest 却计划 0 个单元」的错位。
+- 每个面板在训练前运行显式的 `seed_contract_check`：同一种子必须复现
+  Python/NumPy/Torch CPU/每张 CUDA/TF（若已导入）/DataLoader generator 与
+  worker hook 的抽样，换种子必须逐流改变；报告写入 `seed_contract.json`
+  并进入 manifest 的 `evidence`。它比 3 步损失复现更快，且能点名是哪一路
+  RNG 没有播种。
 - 环境快照记录 Python/NumPy/Torch/TF 版本、cuDNN 确定性开关、TF32 与
   float32 matmul 精度、线程数、`CUDA_VISIBLE_DEVICES` 以及每张可见 GPU 的
-  UUID/显存/计算能力；跨硬件漂移不能被消除，但可以被解释和追溯。
+  UUID/显存/计算能力；另附 `requirements*.txt` / `pyproject.toml` 的内容
+  摘要与已安装包版本，避免同一 commit 下换 wheel 的运行被误认成同一环境。
+  跨硬件漂移不能被消除，但可以被解释和追溯。
 - `run()` 在加载语料前先按面板第一个种子固定数据构造路径（分词器拟合、
   缓存重建、未来 DataLoader 的随机源）；每个训练单元随后在 `train_variant`
   内重新按自己的种子定界，因此面板级播种不会改变任何记录。
