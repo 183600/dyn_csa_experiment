@@ -175,7 +175,16 @@ M0 校准 → S1 主面板 → 视余量续 S2 主面板的独立战役口径。
 - G0 吞吐判据（≥150 TFLOPS）按 §6 口径以 H800 系为参照；非 H800
   机型上以「实测单元成本 × 单元数 ≤ 面板卡时上限」为等效替代门，
   数值一致性判据（算子级容差 + 训练级 TOST 等价，§3 四层口径）在任何
-  机型上都不可豁免。
+  机型上都不可豁免。`m0_supp.py kernel` 在数值、吞吐、训练级 TOST 三层
+  都通过时写出 `results_m0_g0/g0_certificate.json`（绑定代码语义、内核戳
+  与 git 树）；`m0_supp.py full` 启动前用 `require_g0` 硬校验该证书，
+  没有证书时只能显式设置 `CSA_ALLOW_UNVERIFIED_EAGER=1` 做调试运行。
+- 零 GPU 收尾：`python m0_supp.py analysis` 读取 `results_b_s1/`（及可选
+  `results_b_s2/`）的 `summary.json`，输出逐臂池化 PPL、配对符号翻转 +
+  Holm、受控变量审计、S1→S2 的 log-PPL 效应/交互到
+  `analysis_m0/scale_analysis.json`。S1×4 / S2×3 的精确检验下限分别为
+  0.125 / 0.25，因此该文件一律标注 `descriptive_only=true`；不得把其中的
+  方向性读数写成确认性结论。
 - NSA / MoBA 外部基线臂不在本仓代码面内，本战役的 S1/S2 面板均为
   B_ARMS 五臂口径；外部基线臂留待 8×H800 额度到位后的 M1/M2 全量执行。
 

@@ -519,7 +519,14 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   里点名。`training_knobs()` 的摘要还进入 `_run_fp` 的 `_tk` 字段：改变
   优化器 / betas / eps / 调度 / 裁剪 / 增强常量会像改变 lr 一样使旧
   `run_cfg` 失效并按正常 resume 规则重训，而不是留下旧优化器记录冒充新
-  协议。面板级 `controlled_variables_report` 检查**该臂的全部种子记录**
+  协议。`run_cfg` 相等也**不**证明语料与评测切片相同（它只记录 token 数、
+  序列长度与形状）。因此 `pair_reason` 还要求 `data_fp` / `val_fp` /
+  `eval_fp` 两条都带且逐项相等；只有一条带指纹判为 unverifiable。扩展规模
+  时同一 outdir 可能先后落入不同 cap 的缓存，这一步防止把两个不同验证切片
+  的 PPL 当成同一切片配对。`aggregate` 在 (variant, protocol) 组内也做同一
+  检查：组内出现多个 `data_fp`/`val_fp` 直接拒绝，而不是把不可比的 PPL
+  池化成一个 `ppl_pooled`。历史面板只有新旧记录都不带指纹时走兼容路径。
+  面板级 `controlled_variables_report` 检查**该臂的全部种子记录**
   （不是只看第一条）的 `run_cfg`、`train_knobs` 与结构化 `hyperparams`
   关键字段，并点名「同一条臂内不同种子用了不同协议」的混合情况。
   模块消融的**逐种子配对**还额外过 `_hyperparam_reason`：`run_cfg` 不
@@ -608,9 +615,13 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
 `exact_signflip_p` 对 n≤20 穷举 2ⁿ 符号翻转（确定性、与各驱动套件同一
 检验）；20<n≤40 用 meet-in-the-middle 精确计数（两半各 2^(n/2) 个带符号和，
 两次二分查找统计 |sum|≥观测值的符号指派），补种子面板扩大到几十个种子时
-仍是**精确** p，不再退化为正态近似；n>40 才回落到确定性正态近似，并由
-返回值的 `method` 明确标注（零 GPU 报告构建器 `build_report.py` 的同名
-函数走同一条 MITM 路径，报告与统计审计不再一个精确、一个蒙特卡洛）。
+仍是**精确** p。n>40 使用确定性的 Lugannani-Rice **鞍点尾近似**：零假设下
+`S=Σ s_i d_i` 的矩母函数为 `Π cosh(t d_i)`，求解 `K'(t)=|S|` 后按鞍点公式
+取尾概率；其方差是符号翻转零假设的 `Σ d_i²`，**不是**以观测均值为中心的
+`n·s²`（后者会随效应增大而缩小分母，给出反保守的 p）。鞍点 p 另被钳制在
+精确检验下限 `2/2ⁿ` 之上，并由返回值的 `method` 明确标注。零 GPU 报告
+构建器 `build_report.py` 走**同一确定性公式**（n≤40 MITM，n>40 鞍点），
+不再使用随机 Monte-Carlo，报告与统计审计不再出现两套 p 值。
 `signflip_p_floor` 给出单比较的分辨率下限，
 `holm_min_attainable_p` / `signflip_min_n_for_holm` 给出族级下限，使
 「未显著」能区分是分辨率上限还是数据结论。

@@ -340,7 +340,7 @@ def _job_watchdog_seconds(job, ctx):
             est = guard.estimate_seconds(
                 cfg["steps"], d=cfg.get("d", 256),
                 n_layers=cfg.get("n_layers", 6), seq_len=cfg["seq_len"],
-                batch_size=cfg["batch_size"],
+                batch_size=cfg["batch_size"], variant=job.get("v"),
             )
         elif kind == "lenphase":
             p = job.get("payload") or {}
@@ -376,7 +376,7 @@ def _note_watchdog_kill(job, elapsed_seconds):
                 elapsed_seconds, cfg.get("steps"),
                 d=cfg.get("d", 256), n_layers=cfg.get("n_layers", 6),
                 seq_len=cfg.get("seq_len", 512),
-                batch_size=cfg.get("batch_size", 12),
+                batch_size=cfg.get("batch_size", 12), variant=job.get("v"),
             )
         elif kind == "lenphase":
             p = job.get("payload") or {}

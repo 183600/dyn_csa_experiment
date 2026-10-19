@@ -6872,6 +6872,20 @@ def pair_reason(ra, rb):
             return f'unverifiable {_k} (only one record carries the precision / implementation mode)'
         if _pa and ra.get(_k) != rb.get(_k):
             return f'different {_k} ({ra.get(_k)!r} vs {rb.get(_k)!r})'
+    # Content identities: same run_cfg (steps / tokens / vocab / ...) does NOT
+    # prove the same corpus or the same validation rows.  Scaling panels rebuild
+    # caches at larger token caps, so pairing a new run with an old one on a
+    # different val slice would silently compare two different evaluation sets.
+    # Both-present equality is required; a one-sided fingerprint is
+    # unverifiable, exactly like the optimizer-descriptor gate above.
+    for _k in ('data_fp', 'val_fp', 'eval_fp'):
+        _pa, _pb = ra.get(_k), rb.get(_k)
+        _ha = _pa is not None and str(_pa) != ''
+        _hb = _pb is not None and str(_pb) != ''
+        if _ha != _hb:
+            return f'unverifiable {_k} (only one record carries the corpus / evaluation-slice fingerprint)'
+        if _ha and str(_pa) != str(_pb):
+            return f'different {_k} ({str(_pa)[:12]}… vs {str(_pb)[:12]}…)'
     bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
     if bad:
         absent = [k for k in bad if ra.get(k) is None and rb.get(k) is None]
@@ -6940,6 +6954,12 @@ def ppl_is_usable(v):
 
 def by_len_cells(rows, Ln, variant=None):
     keys = (Ln, int(Ln), str(int(Ln)))
+    # Length-panel rows must all come from one validation slice: PPL@L is only
+    # comparable when the underlying corpus is the same.  Records without a
+    # fingerprint keep the historical permissive path; a mixed fingerprint set
+    # raises instead of silently averaging two slices.
+    assert_shared_validation_fp([r for r in rows if isinstance(r, dict)],
+                                context=f'by_len_cells(L={Ln})')
     out = []
     for r in rows:
         if not isinstance(r, dict):
@@ -7102,18 +7122,98 @@ def _signflip_mitm_count(d):
     return int(lo.sum() + (right.size - hi).sum())
 
 
+def _signflip_saddlepoint_p(values):
+    """Deterministic Lugannani-Rice saddlepoint tail for n > 40.
+
+    Under H0 each paired difference d_i gets an independent random sign, so
+    the null distribution of ``S = sum(s_i * d_i)`` has cumulant generating
+    function ``K(t) = sum(log cosh(t*d_i))``.  The exact variance of S is
+    ``sum(d_i**2)`` (not ``n * sample_var``, which is centered on the observed
+    mean and therefore shrinks as the effect grows).  Solving ``K'(t) = |S|``
+    and applying the Lugannani-Rice formula gives a much more accurate tail
+    than a normal approximation while staying deterministic.
+
+    Returns ``(p, method)``.  Zeros are removed because they multiply the
+    number of sign assignments without changing the null distribution; the
+    resulting floor ``2 / 2**m`` is the same exact-test floor.
+    """
+    vals = [float(x) for x in values if float(x) != 0.0]
+    m = len(vals)
+    if m == 0:
+        return 1.0, 'saddlepoint'
+    T = abs(math.fsum(vals))
+    sabs = math.fsum(abs(x) for x in vals)
+    floor = min(1.0, math.ldexp(2.0, -m))
+    if T <= 0.0:
+        return 1.0, 'saddlepoint'
+    # |S| can only equal the maximum sum when every sign is the same.
+    if T >= sabs * (1.0 - 1e-13):
+        return floor, 'saddlepoint'
+    amax = max(abs(x) for x in vals)
+    inv = 1.0 / amax
+
+    def _kp(t):
+        return math.fsum(x * math.tanh(t * x) for x in vals)
+
+    def _k(t):
+        # log cosh(z) = |z| + log1p(exp(-2|z|)) - log(2), stable for large |z|.
+        return math.fsum(abs(t * x) + math.log1p(math.exp(-2.0 * abs(t * x))) - math.log(2.0)
+                         for x in vals)
+
+    def _kpp(t):
+        # sech^2(z) = 1 - tanh^2(z) avoids a cosh overflow in the extreme
+        # near-maximum-sum tail while staying algebraically identical.
+        return math.fsum(x * x * (1.0 - math.tanh(t * x) ** 2) for x in vals)
+
+    hi = inv
+    for _ in range(60):
+        if _kp(hi) >= T:
+            break
+        hi *= 2.0
+    else:
+        # Pathological near-maximum sum: the normal tail with the CORRECT
+        # uncentered variance is the safe deterministic fallback.
+        sd = math.sqrt(math.fsum(x * x for x in vals))
+        p = math.erfc(T / (sd * math.sqrt(2.0))) if sd > 0 else floor
+        return float(min(1.0, max(floor, p))), 'saddlepoint-normal-fallback'
+    lo = 0.0
+    for _ in range(160):
+        mid = 0.5 * (lo + hi)
+        if _kp(mid) < T:
+            lo = mid
+        else:
+            hi = mid
+    t = 0.5 * (lo + hi)
+    Kt = _k(t)
+    K2 = _kpp(t)
+    w = math.sqrt(max(0.0, 2.0 * (t * T - Kt)))
+    u = t * math.sqrt(K2) if K2 > 0.0 else 0.0
+    if w < 1e-8 or u <= 0.0:
+        sd = math.sqrt(math.fsum(x * x for x in vals))
+        p = math.erfc(T / (sd * math.sqrt(2.0))) if sd > 0 else floor
+    else:
+        phi = math.exp(-0.5 * w * w) / math.sqrt(2.0 * math.pi)
+        tail = 0.5 * math.erfc(w / math.sqrt(2.0)) + phi * (1.0 / u - 1.0 / w)
+        p = 2.0 * tail
+    # A sign-flip p-value cannot be smaller than the two all-same-sign
+    # assignments (the same floor the exact branch obeys).
+    return float(min(1.0, max(floor, p))), 'saddlepoint'
+
+
 def exact_signflip_p(deltas):
     """Two-sided exact sign-flip test over paired per-seed deltas.
 
     H0: the per-seed difference is symmetric about 0.  For n <= 20 every one
     of the 2**n sign assignments is enumerated; for 20 < n <= 40 the same
     count is obtained exactly by meet-in-the-middle (2**(n/2) tables), which
-    matters as seed-completion panels grow.  Only n > 40 falls back to a
-    deterministic normal approximation (reported as such via `method`), so a
-    report never depends on a random draw.  Non-finite deltas are dropped
-    (the count is returned).  Pure function over its input — used by the
-    aggregate audit so the core panel reports the same p the per-phase suites
-    do, rather than a bare mean±std a reviewer could mistake for evidence.
+    matters as seed-completion panels grow.  For n > 40 the deterministic
+    Lugannani-Rice saddlepoint of the sign-flip null is used (reported via
+    `method`); it uses the null variance ``sum(d_i**2)`` and is therefore
+    neither a Monte-Carlo draw nor the anti-conservative centered-SD normal
+    approximation.  Non-finite deltas are dropped (the count is returned).
+    Pure function over its input — used by the aggregate audit so the core
+    panel reports the same p the per-phase suites do, rather than a bare
+    mean±std a reviewer could mistake for evidence.
 
     有效性假设（评审二轮·意见九，必须在预注册文档同步声明）：精确符号翻转
     检验的 p 值正确性依赖「配对内交换性」——每个种子下的两臂共享除臂本身
@@ -7147,13 +7247,8 @@ def exact_signflip_p(deltas):
     if n <= _SIGNFLIP_MITM_MAX_N:
         cnt = _signflip_mitm_count(d)
         return {'n': n, 'p': float(cnt / float(1 << n)), 'n_dropped': n_dropped, 'method': 'exact-mitm'}
-    sd = float(d.std(ddof=1)) if n > 1 else 0.0
-    if sd <= 1e-300:
-        p = 0.0 if obs > 0 else 1.0
-    else:
-        z = obs * math.sqrt(n) / sd
-        p = math.erfc(z / math.sqrt(2.0))
-    return {'n': n, 'p': float(min(1.0, p)), 'n_dropped': n_dropped, 'method': 'normal-approx'}
+    p, method = _signflip_saddlepoint_p(d.tolist())
+    return {'n': n, 'p': float(p), 'n_dropped': n_dropped, 'method': method}
 
 def _percentile_ci(vals, lo=2.5, hi=97.5):
     v = [float(x) for x in vals if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))]
@@ -7209,9 +7304,17 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)
     if d.size < 2:
         return None
+    # Chunked draws keep memory at O(chunk * n) instead of O(n_boot * n): the
+    # seed-completion path can grow a panel to hundreds/thousands of seeds and
+    # paired_effect_stats calls this for every displayed contrast.
     rng = np.random.default_rng(int(seed))
-    idx = rng.integers(0, d.size, size=(int(n_boot), d.size))
-    means = d[idx].mean(axis=1)
+    nb = int(n_boot)
+    means = np.empty(max(0, nb), dtype=float)
+    chunk = 256
+    for off in range(0, nb, chunk):
+        m = min(chunk, nb - off)
+        idx = rng.integers(0, d.size, size=(m, d.size))
+        means[off:off + m] = d[idx].mean(axis=1)
     return _percentile_ci(means.tolist())
 
 def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=20261018):
@@ -7220,16 +7323,30 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
     if a.size < 2 or b.size < 2:
         return None
     rng = np.random.default_rng(int(seed))
-    ai = rng.integers(0, a.size, size=(int(n_boot), a.size))
-    bi = rng.integers(0, b.size, size=(int(n_boot), b.size))
-    diff = a[ai].mean(axis=1) - b[bi].mean(axis=1)
+    nb = int(n_boot)
+    diff = np.empty(max(0, nb), dtype=float)
+    chunk = 256
+    for off in range(0, nb, chunk):
+        m = min(chunk, nb - off)
+        ai = rng.integers(0, a.size, size=(m, a.size))
+        bi = rng.integers(0, b.size, size=(m, b.size))
+        diff[off:off + m] = a[ai].mean(axis=1) - b[bi].mean(axis=1)
     return _percentile_ci(diff.tolist())
 
+_WILCOXON_EXACT_MAX_N = 200
+
+
 def wilcoxon_signed_rank_p(deltas):
-    """Two-sided exact Wilcoxon signed-rank p for n<=16 (normal approximation
-    above that).  Reported as a SENSITIVITY check, not as a replacement for
-    the sign-flip test: it assumes symmetric paired differences, which the
-    review correctly says is not guaranteed by sharing a seed number."""
+    """Two-sided Wilcoxon signed-rank p, exact over the integer rank-sum
+    distribution for n<=200 and normal above that.  Reported as a SENSITIVITY
+    check, not as a replacement for the sign-flip test: it assumes symmetric
+    paired differences, which the review correctly says is not guaranteed by
+    sharing a seed number.
+
+    Ranks are doubled so average ranks from ties stay integral; a 0/1 subset-
+    sum DP then counts every sign assignment exactly.  This replaces the old
+    n<=16 enumeration (2^n) with O(n * sum_ranks), which is what keeps the
+    sensitivity check exact when seed completion grows the panels."""
     d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)
     d = d[np.abs(d) > 1e-15]
     n = int(d.size)
@@ -7248,17 +7365,24 @@ def wilcoxon_signed_rank_p(deltas):
     w_plus = float(ranks[d > 0].sum())
     total = float(ranks.sum())
     w = min(w_plus, total - w_plus)
-    if n <= 16:
-        cnt = 0
-        for mask in range(1 << n):
-            s = 0.0
-            for k in range(n):
-                if mask & (1 << k):
-                    s += ranks[k]
-            if s <= w + 1e-12 or s >= total - w - 1e-12:
-                cnt += 1
+    if n <= _WILCOXON_EXACT_MAX_N:
+        r2 = [int(round(float(r) * 2.0)) for r in ranks]
+        total2 = int(sum(r2))
+        w2 = int(round(w * 2.0))
+        if 2 * w2 >= total2:
+            # w is the smaller tail; equality means both tails meet, i.e. every
+            # sign assignment qualifies (p = 1).
+            return {'p': 1.0, 'method': 'exact-dp', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w}
+        counts = [0] * (total2 + 1)
+        counts[0] = 1
+        for r in r2:
+            for sm in range(total2, r - 1, -1):
+                c = counts[sm - r]
+                if c:
+                    counts[sm] += c
+        cnt = sum(counts[:w2 + 1]) + sum(counts[total2 - w2:])
         p = min(1.0, cnt / float(1 << n))
-        return {'p': float(p), 'method': 'exact', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w}
+        return {'p': float(p), 'method': 'exact-dp', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w}
     mu = total / 2.0
     var = float((ranks ** 2).sum()) / 4.0
     if var <= 0:
@@ -7266,7 +7390,7 @@ def wilcoxon_signed_rank_p(deltas):
     z = (abs(w_plus - mu) - 0.5) / math.sqrt(var)
     p = math.erfc(max(0.0, z) / math.sqrt(2.0))
     return {'p': float(p), 'method': 'normal', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w,
-            'note': 'normal approximation; exact enumeration is only used for n<=16'}
+            'note': f'normal approximation; exact DP is used for n<={_WILCOXON_EXACT_MAX_N}'}
 
 def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_values=None):
     """Paired contrast summary with an explicit effect-vs-seed-noise verdict.
@@ -14252,6 +14376,18 @@ class TimeGuard:
         to rebuild an equivalent TimeGuard against the same shared state file."""
         return dict(total_hours=self.total_hours, margin=self.margin, already_hours=self.already, state_path=self.state_path)
 
+    @staticmethod
+    def _class_key(d, n_layers, seq_len, batch_size, variant=None):
+        """Calibration key for one (geometry, variant) class.
+
+        Geometry alone is too coarse on the B-tier ladder: a dense full-attention
+        arm and a sparse CSA arm with the same shapes can differ by a large
+        factor, so one shared rate would systematically under- or over-book
+        cells.  `variant=None` keeps the historical geometry-only key used by
+        the v7-v12 drivers, so existing state files stay valid."""
+        base = str((int(d), int(n_layers), int(seq_len), int(batch_size)))
+        return base if variant is None else f'{base}|{variant}'
+
     def book(self, seconds, token=None):
         """Reserve (seconds > 0) or refund (seconds < 0) projected run time
         against the shared state WITHOUT touching the run counter or the
@@ -14379,7 +14515,7 @@ class TimeGuard:
     def cap_hours(self):
         return self.total_hours * self.margin
 
-    def record_run(self, seconds, steps_done, d, n_layers, seq_len, batch_size, calib_seconds=None):
+    def record_run(self, seconds, steps_done, d, n_layers, seq_len, batch_size, calib_seconds=None, variant=None):
         try:
             import fcntl
         except ImportError:
@@ -14409,7 +14545,7 @@ class TimeGuard:
                 prev = self.state.get('norm_sps')
                 self.state['norm_sps'] = norm if prev is None else 0.7 * prev + 0.3 * norm
                 by_class = self.state.setdefault('sps_by_class', {})
-                key = str((int(d), int(n_layers), int(seq_len), int(batch_size)))
+                key = self._class_key(d, n_layers, seq_len, batch_size, variant)
                 cprev = by_class.get(key)
                 by_class[key] = sps if cprev is None else 0.7 * cprev + 0.3 * sps
             self._save()
@@ -14438,9 +14574,12 @@ class TimeGuard:
         df = cls._depth_factor(n_layers)
         return f / df * df ** cls._calib_exponent()
 
-    def estimate_seconds(self, steps, d=256, n_layers=6, seq_len=512, batch_size=12):
-        key = str((int(d), int(n_layers), int(seq_len), int(batch_size)))
-        exact = (self.state.get('sps_by_class') or {}).get(key)
+    def estimate_seconds(self, steps, d=256, n_layers=6, seq_len=512, batch_size=12, variant=None):
+        by_class = self.state.get('sps_by_class') or {}
+        key = self._class_key(d, n_layers, seq_len, batch_size, variant)
+        exact = by_class.get(key)
+        if exact is None and variant is not None:
+            exact = by_class.get(self._class_key(d, n_layers, seq_len, batch_size, None))
         if exact is not None:
             return steps * exact * 1.15
         norm = self.state.get('norm_sps')
@@ -14449,7 +14588,7 @@ class TimeGuard:
         f = self._wallclock_factor(d, n_layers, seq_len, batch_size)
         return steps * norm * f * 1.15
 
-    def note_watchdog_kill(self, elapsed_seconds, steps, d=256, n_layers=6, seq_len=512, batch_size=12):
+    def note_watchdog_kill(self, elapsed_seconds, steps, d=256, n_layers=6, seq_len=512, batch_size=12, variant=None):
         """Lift the calibrated per-step floor after a dispatcher-watchdog kill
         (par.py).  A cell killed at `elapsed_seconds` demonstrably needs MORE
         than that for `steps` steps, so its true sps exceeds
@@ -14475,7 +14614,7 @@ class TimeGuard:
         try:
             self.state = self._load_state()
             by_class = self.state.setdefault('sps_by_class', {})
-            key = str((int(d), int(n_layers), int(seq_len), int(batch_size)))
+            key = self._class_key(d, n_layers, seq_len, batch_size, variant)
             prev = by_class.get(key)
             if prev is None or floor > float(prev):
                 by_class[key] = floor
@@ -14714,6 +14853,22 @@ def aggregate(summary):
             _dups[k] = bad
     if _dups:
         raise ValueError('aggregate: these (variant, protocol) groups hold more than one record for the same seed, so their PPL is ambiguous: ' + '; '.join((f'{v}/{t or '-'}->seeds {s}' for (v, t), s in sorted(_dups.items()))) + '. Remove the stale duplicates (or give the records distinct `protocol` tags) before aggregating.  A record whose value was never MEASURED (an `error` record, or a `synthesized` reconstruction) can carry no PPL and is IGNORED here — drop it from the summary instead of re-labelling it, because a protocol tag only silences this guard, it does not make the number real.')
+    # A single (variant, protocol) group must be scored on ONE corpus and ONE
+    # validation slice.  A mixed group would make ppl_pooled/dPPL meaningless;
+    # refuse it here rather than letting a report average two different
+    # evaluation sets that happen to share a run_cfg.
+    _fp_conflicts = {}
+    for (v, tag), recs in per_variant.items():
+        for _k in ('data_fp', 'val_fp'):
+            _vals = sorted({str(r.get(_k)) for r in recs
+                            if r.get(_k) is not None and str(r.get(_k)) != ''})
+            if len(_vals) > 1:
+                _fp_conflicts.setdefault((v, tag), {})[_k] = _vals
+    if _fp_conflicts:
+        raise ValueError('aggregate: these (variant, protocol) groups mix different corpus/evaluation fingerprints, so their PPL values are not comparable: '
+                         + '; '.join(f'{v}/{t or '-'}: ' + ', '.join(f'{k}={[x[:12] + "…" for x in vals]}' for k, vals in sorted(d.items()))
+                                     for (v, t), d in sorted(_fp_conflicts.items()))
+                         + '. Report the fingerprint classes separately (they are different data/slices), do not pool them.')
     _multi = {}
     for (v, tag), recs in per_variant.items():
         _multi.setdefault(v, []).append(tag)
@@ -15348,7 +15503,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
     booked = 0.0
     _book_tok = f'run|{key}|pid{os.getpid()}'
     if guard is not None:
-        est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'])
+        est = guard.estimate_seconds(cfg['steps'], d=d, n_layers=n_layers, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], variant=v)
         if prebook and est:
             guard.book(est, token=_book_tok)
             booked = est
@@ -15464,7 +15619,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             elif isinstance(rec, dict) and 'ppl' in rec:
                 steps_done = int(cfg['steps'])
                 calib_s = rec.get('train_time_s')
-            guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'], calib_seconds=calib_s)
+            guard.record_run(time.time() - t_run, steps_done, d, n_layers, cfg['seq_len'], cfg['batch_size'], calib_seconds=calib_s, variant=v)
             if booked:
                 guard.book(-booked, token=_book_tok)
     gc.collect()

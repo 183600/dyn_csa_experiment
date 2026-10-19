@@ -112,6 +112,71 @@ def _signflip_mitm_count(deltas):
     return int(lo.sum() + (right.size - hi).sum())
 
 
+def _signflip_saddlepoint_p(values):
+    """Mirror of `exp_lib._signflip_saddlepoint_p` (no torch import here).
+
+    Deterministic Lugannani-Rice tail for the sign-flip null at n > 40.
+    Keeping the two implementations arithmetically identical is what makes
+    the zero-GPU report agree with the audit instead of drawing a random
+    Monte-Carlo p-value.
+    """
+    vals = [float(x) for x in values if float(x) != 0.0]
+    m = len(vals)
+    if m == 0:
+        return 1.0, 'saddlepoint'
+    T = abs(math.fsum(vals))
+    sabs = math.fsum(abs(x) for x in vals)
+    floor = min(1.0, math.ldexp(2.0, -m))
+    if T <= 0.0:
+        return 1.0, 'saddlepoint'
+    if T >= sabs * (1.0 - 1e-13):
+        return floor, 'saddlepoint'
+    amax = max(abs(x) for x in vals)
+    inv = 1.0 / amax
+
+    def _kp(t):
+        return math.fsum(x * math.tanh(t * x) for x in vals)
+
+    def _k(t):
+        return math.fsum(abs(t * x) + math.log1p(math.exp(-2.0 * abs(t * x))) - math.log(2.0)
+                         for x in vals)
+
+    def _kpp(t):
+        # sech^2(z) = 1 - tanh^2(z) avoids a cosh overflow in the extreme
+        # near-maximum-sum tail while staying algebraically identical.
+        return math.fsum(x * x * (1.0 - math.tanh(t * x) ** 2) for x in vals)
+
+    hi = inv
+    for _ in range(60):
+        if _kp(hi) >= T:
+            break
+        hi *= 2.0
+    else:
+        sd = math.sqrt(math.fsum(x * x for x in vals))
+        p = math.erfc(T / (sd * math.sqrt(2.0))) if sd > 0 else floor
+        return float(min(1.0, max(floor, p))), 'saddlepoint-normal-fallback'
+    lo = 0.0
+    for _ in range(160):
+        mid = 0.5 * (lo + hi)
+        if _kp(mid) < T:
+            lo = mid
+        else:
+            hi = mid
+    t = 0.5 * (lo + hi)
+    Kt = _k(t)
+    K2 = _kpp(t)
+    w = math.sqrt(max(0.0, 2.0 * (t * T - Kt)))
+    u = t * math.sqrt(K2) if K2 > 0.0 else 0.0
+    if w < 1e-8 or u <= 0.0:
+        sd = math.sqrt(math.fsum(x * x for x in vals))
+        p = math.erfc(T / (sd * math.sqrt(2.0))) if sd > 0 else floor
+    else:
+        phi = math.exp(-0.5 * w * w) / math.sqrt(2.0 * math.pi)
+        tail = 0.5 * math.erfc(w / math.sqrt(2.0)) + phi * (1.0 / u - 1.0 / w)
+        p = 2.0 * tail
+    return float(min(1.0, max(floor, p))), 'saddlepoint'
+
+
 def exact_signflip(deltas):
     deltas = [float(d) for d in deltas if isinstance(d, (int, float)) and (not isinstance(d, bool)) and math.isfinite(d)]
     n = len(deltas)
@@ -126,32 +191,11 @@ def exact_signflip(deltas):
             return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _cnt / (1 << n), 'method': 'exact-mitm'}
         except ImportError:
             pass
-    if n > 20:
-        B = 200000
-        try:
-            import numpy as _np
-        except ImportError:
-            _np = None
-        if _np is not None:
-            _rng = _np.random.default_rng(0)
-            cnt = 1
-            _darr = _np.asarray(deltas)[None, :]
-            _step = max(1, min(B, (1 << 24) // max(n, 1)))
-            for _off in range(0, B, _step):
-                _bs = min(_step, B - _off)
-                _signs = _np.where(_rng.random((_bs, n)) < 0.5, 1.0, -1.0)
-                _sums = _np.abs((_signs * _darr).sum(1))
-                cnt += int((_sums >= obs - 1e-12 * n).sum())
-        else:
-            rng = random.Random(0)
-            cnt = 1
-            for _ in range(B):
-                s = 0.0
-                for d in deltas:
-                    s += d if rng.random() < 0.5 else -d
-                if abs(s) >= obs - 1e-12 * n:
-                    cnt += 1
-        return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': cnt / (B + 1), 'method': 'mc'}
+    if n > 40:
+        # Same deterministic tail as exp_lib: no random MC draw, and the
+        # variance is the sign-flip null variance sum(d_i**2).
+        _p, _method = _signflip_saddlepoint_p(deltas)
+        return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _p, 'method': _method}
     try:
         import numpy as _np
     except ImportError:
@@ -404,6 +448,17 @@ def _pair_reason(ra, rb):
             return f'unverifiable {_k} (only one record carries the precision / implementation mode)'
         if _pa and ra.get(_k) != rb.get(_k):
             return f'different {_k} ({ra.get(_k)!r} vs {rb.get(_k)!r})'
+    # Same corpus / evaluation slice, not just the same geometry and token
+    # count.  Mirrors exp_lib.pair_reason (a mixed-cap cache rebuild must never
+    # be averaged into one paired delta).
+    for _k in ('data_fp', 'val_fp', 'eval_fp'):
+        _pa, _pb = ra.get(_k), rb.get(_k)
+        _ha = _pa is not None and str(_pa) != ''
+        _hb = _pb is not None and str(_pb) != ''
+        if _ha != _hb:
+            return f'unverifiable {_k} (only one record carries the corpus / evaluation-slice fingerprint)'
+        if _ha and str(_pa) != str(_pb):
+            return f'different {_k} ({str(_pa)[:12]}… vs {str(_pb)[:12]}…)'
     bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
     if not bad:
         return None
@@ -1189,7 +1244,7 @@ def sec_p2s():
     if rows:
         lines += ['', '**配对检验（同 seed 配对，符号翻转）**：', '', '| 比较 | n (配对 seeds) | Δ (a−b) mean±std | p | params |', '|---|---|---|---|---|']
         for a, b, common, st in rows:
-            _pl = f'{st["p_exact_signflip"]:.3f}' + (' (MC)' if st.get('method') == 'mc' else ' (exact)')
+            _pl = f'{st["p_exact_signflip"]:.3f}' + (' (saddlepoint)' if str(st.get('method', '')).startswith('saddlepoint') else ' (exact)')
             lines.append(f'| `{a}` − `{b}` | {len(common)} | {st['mean']:+.2f} ± {st['std']:.2f} | {_pl} | {unmatched_tag(_agg_entry(_agg, a), _agg_entry(_agg, b)) or '✓'} |')
         main = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full'), None)
         _mt = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full_matched'), None) if _agg_entry(_agg, 'full_matched') is not None else None
@@ -1409,8 +1464,8 @@ def sec_stats():
         _dv = v.get('mean') if v.get('mean') is not None else v.get('delta')
         _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
         _ph = _holm.get(k)
-        _mc = v.get('method') == 'mc' or (v.get('method') is None and isinstance(v.get('n'), (int, float)) and v['n'] > 20)
-        _pt = fm(_pv, 4) + (' (MC)' if _mc else '')
+        _method = str(v.get('method') or '')
+        _pt = fm(_pv, 4) + (' (saddlepoint)' if _method.startswith('saddlepoint') else (' (MITM)' if _method == 'exact-mitm' else ''))
         lines.append('| %s | %s | %s | %s |' % (k, fm(_dv), _pt, fm(_ph, 4)))
     lines += ['', '> 若未校正 p<0.05 而 p_Holm≥0.05，只能写「名义上显著、族内未校正通过」，不能写成显著效应。', '']
     return '\n'.join(lines) + '\n'

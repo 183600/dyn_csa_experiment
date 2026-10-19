@@ -1591,16 +1591,21 @@ def exact_sign_permutation(deltas):
             res['cohens_dz'] = 0.0
         else:
             res['cohens_dz'] = float('inf') if _mu > 0 else float('-inf')
-        res['test'] = ('exact two-sided sign-flip over paired per-seed deltas'
-                       if str(res.get('method', 'exact')).startswith('exact')
-                       else 'deterministic two-sided sign-flip normal approximation over paired per-seed deltas')
+        _m = str(res.get('method', 'exact'))
+        if _m.startswith('exact'):
+            res['test'] = 'exact two-sided sign-flip over paired per-seed deltas'
+        elif _m.startswith('saddlepoint'):
+            res['test'] = ('deterministic two-sided sign-flip saddlepoint tail (Lugannani-Rice, '
+                           'null variance sum(d_i**2)); exact enumeration/MITM only for n<=40')
+        else:
+            res['test'] = 'deterministic two-sided sign-flip approximation over paired per-seed deltas'
         return res
     if n == 0:
         return _extras({'n': 0, 'mean': float('nan'), 'std': float('nan'), 'p_exact_signflip': float('nan'), 'n_flips': 0, 'n_dropped': n_dropped}, d, n)
     obs = abs(d.mean())
     if n > 20:
         # exp_lib keeps the test exact via meet-in-the-middle through n=40
-        # (and uses a deterministic normal approximation, never a random
+        # (and uses a deterministic saddlepoint tail, never a random
         # Monte-Carlo draw, beyond that).  Do not label a sampled p-value as
         # an exact sign-flip p.
         _r = L.exact_signflip_p(d)

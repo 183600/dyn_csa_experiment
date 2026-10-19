@@ -46,6 +46,7 @@ try:
     import audit_gates as A
     import baseline_tune as BT
     import build_report as BR
+    import m0_supp as M0
     _HAVE_TORCH = True
 except Exception as _e:  # pragma: no cover
     print(f'[test] SKIPPED: cannot import the repo modules here ({type(_e).__name__}: {_e}); run on a box with CPU torch')
@@ -153,6 +154,16 @@ def t_bootstrap_mean_ci():
     assert a == b and a['n'] == 5 and a['ci_low'] <= a['mean'] <= a['ci_high'], a
     assert L.bootstrap_mean_ci([1.0]) is None
     assert L.bootstrap_mean_ci([1.0, float('nan'), float('inf')]) is None
+    # Paired/unpaired helpers are chunked for seed panels that can reach
+    # hundreds of seeds; the result stays deterministic and well-formed.
+    rng = np.random.default_rng(3)
+    d = rng.normal(0.5, 1.0, size=400)
+    p1 = L.paired_bootstrap_ci(d, n_boot=600, seed=11)
+    p2 = L.paired_bootstrap_ci(d, n_boot=600, seed=11)
+    assert p1 == p2 and p1[0] < float(d.mean()) < p1[1], (p1, d.mean())
+    u1 = L.unpaired_bootstrap_ci(d + 1.0, d, n_boot=600, seed=11)
+    u2 = L.unpaired_bootstrap_ci(d + 1.0, d, n_boot=600, seed=11)
+    assert u1 == u2 and u1[0] < 1.0 < u1[1], u1
 
 
 def t_training_health_classifier():
@@ -303,6 +314,130 @@ def t_exact_signflip_at_scale():
     # exp_lib; a 1e-12 sum threshold can disagree near the decision boundary.
     assert abs(BR.exact_signflip(d)['p_exact_signflip'] - got) < 1e-15, (
         BR.exact_signflip(d)['p_exact_signflip'], got)
+
+
+def t_signflip_saddlepoint_large_n():
+    # n>40 must not use the centered-SD normal approximation (whose variance
+    # shrinks with the effect) and must not be a random Monte-Carlo draw.
+    rng = np.random.default_rng(17)
+    for n, shift in ((45, 0.1), (45, 0.3), (60, 0.2), (100, 0.15)):
+        d = rng.normal(shift, 1.0, size=n)
+        d = d - d.mean() + shift
+        a = L.exact_signflip_p(d)
+        b = L.exact_signflip_p(d)
+        assert a['method'].startswith('saddlepoint'), a
+        assert a['p'] == b['p'], 'saddlepoint fallback must be deterministic'
+        # Fixed-seed Monte-Carlo reference (200k draws) — the saddlepoint tail
+        # must be close, while the old centered-SD normal was off by orders of
+        # magnitude for the larger shifts.
+        draws = 200000
+        obs = abs(d.mean())
+        signs = rng.choice([-1.0, 1.0], size=(draws, n))
+        mc = float((np.abs((signs * d).mean(1)) >= obs - 1e-12).mean())
+        tol = max(0.003, 5.0 * math.sqrt(max(mc * (1.0 - mc), 1e-9) / draws))
+        assert abs(a['p'] - mc) <= tol, f'n={n} shift={shift}: saddlepoint {a["p"]} vs MC {mc}'
+        # Never below the exact two-sided resolution floor 2/2^n.
+        assert a['p'] >= L.signflip_p_floor(n) - 1e-18, (a, n)
+        # The report builder must return the same deterministic number.
+        br = BR.exact_signflip(list(d))
+        assert br['method'].startswith('saddlepoint'), br
+        assert abs(br['p_exact_signflip'] - a['p']) < 1e-12, (br, a)
+    # All deltas equal: only the two all-same-sign assignments reach the
+    # observed sum, so the p is exactly the floor (checked at n=41, > 40).
+    eq = L.exact_signflip_p([0.7] * 41)
+    assert eq['method'] == 'saddlepoint' and abs(eq['p'] - 2.0 / (1 << 41)) < 1e-30, eq
+    assert abs(BR.exact_signflip([0.7] * 41)['p_exact_signflip'] - 2.0 / (1 << 41)) < 1e-30
+    # Near-maximum observed sum: the saddlepoint root sits at a large t, so
+    # the implementation must stay finite (no cosh overflow) and above floor.
+    near = [1.0] * 50
+    near[0] = -0.998
+    nr = L.exact_signflip_p(near)
+    assert nr['method'].startswith('saddlepoint') and 0.0 < nr['p'] < 1.0, nr
+    brn = BR.exact_signflip(near)
+    assert abs(brn['p_exact_signflip'] - nr['p']) < 1e-12, (brn, nr)
+    # The confirmation driver delegates to exp_lib, so it inherits the fix.
+    v = V7.exact_sign_permutation(list(rng.normal(0.2, 1.0, size=50)))
+    assert v['method'].startswith('saddlepoint'), v
+    assert 'saddlepoint' in v['test'], v
+
+
+def t_wilcoxon_exact_dp():
+    def brute_wilcoxon(d):
+        d = np.asarray([float(x) for x in d if math.isfinite(float(x))], dtype=float)
+        d = d[np.abs(d) > 1e-15]
+        n = len(d)
+        if n == 0:
+            return float('nan')
+        order = np.argsort(np.abs(d))
+        ranks = np.empty(n, dtype=float)
+        a = np.abs(d)[order]
+        i = 0
+        while i < n:
+            j = i + 1
+            while j < n and abs(a[j] - a[i]) <= 1e-15:
+                j += 1
+            ranks[order[i:j]] = (i + j + 1) / 2.0
+            i = j
+        wp = float(ranks[d > 0].sum())
+        total = float(ranks.sum())
+        w = min(wp, total - wp)
+        cnt = 0
+        for mask in range(1 << n):
+            sm = sum(ranks[k] for k in range(n) if mask >> k & 1)
+            if sm <= w + 1e-12 or sm >= total - w - 1e-12:
+                cnt += 1
+        return cnt / float(1 << n)
+    rng = np.random.default_rng(5)
+    for n in range(1, 13):
+        for variant in range(3):
+            d = rng.normal(size=n)
+            if variant == 1:
+                d = np.round(d, 0)          # ties + zeros
+            elif variant == 2:
+                d = np.round(np.abs(d), 1)  # many ties, all positive
+            got = L.wilcoxon_signed_rank_p(d)
+            if not np.any(np.abs(d) > 1e-15):
+                continue
+            assert got['method'] == 'exact-dp', got
+            assert abs(got['p'] - brute_wilcoxon(d)) < 1e-12, (n, variant, got, brute_wilcoxon(d))
+    # The old implementation went normal at n=17; the DP stays exact well
+    # beyond the seed counts the scale ladder may top up to.
+    d = rng.normal(0.2, 1.0, size=100)
+    a = L.wilcoxon_signed_rank_p(d)
+    b = L.wilcoxon_signed_rank_p(d)
+    assert a['method'] == 'exact-dp' and a['p'] == b['p'], a
+    assert 0.0 <= a['p'] <= 1.0
+    # A perfectly balanced zero-effect panel has p=1 (both tails meet).
+    assert L.wilcoxon_signed_rank_p([1.0, -1.0, 1.0, -1.0])['p'] == 1.0
+
+
+def t_timeguard_variant_calibration():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, 'state.json')
+        g = L.TimeGuard(dict(total_hours=10, margin=0.9, state_path=path))
+        key_a = g._class_key(64, 2, 256, 4, 'csa_fixed')
+        key_b = g._class_key(64, 2, 256, 4, 'full_matched')
+        assert key_a != key_b and key_a.endswith('|csa_fixed'), (key_a, key_b)
+        # A 10 s / 10 step calibration for variant a must price variant a from
+        # its exact class, not from the shared geometry rate.
+        g.record_run(10.0, 10, 64, 2, 256, 4, calib_seconds=10.0, variant='csa_fixed')
+        a = g.estimate_seconds(100, d=64, n_layers=2, seq_len=256, batch_size=4, variant='csa_fixed')
+        assert abs(a - 100 * 1.0 * 1.15) < 1e-9, a
+        # Variant b must not borrow a's exact rate; it uses the normalised
+        # fallback (which may be the same by coincidence only if the factors
+        # match, so check the code path via a deliberately different rate).
+        g.record_run(20.0, 10, 64, 2, 256, 4, calib_seconds=20.0, variant='full_matched')
+        b = g.estimate_seconds(100, d=64, n_layers=2, seq_len=256, batch_size=4, variant='full_matched')
+        assert abs(b - 100 * 2.0 * 1.15) < 1e-9, b
+        # A geometry-only calibration remains the fallback for a variant with
+        # no per-variant entry (backwards compatible with v7-v12 state files).
+        g2 = L.TimeGuard(dict(total_hours=10, margin=0.9, state_path=os.path.join(tmp, 's2.json')))
+        g2.record_run(5.0, 10, 128, 2, 256, 4, calib_seconds=5.0)
+        c = g2.estimate_seconds(100, d=128, n_layers=2, seq_len=256, batch_size=4, variant='whatever')
+        assert abs(c - 100 * 0.5 * 1.15) < 1e-9, c
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def t_paired_effect_resolution():
@@ -656,6 +791,76 @@ def t_pair_reason_train_knobs_mixed():
     assert r is not None and 'unverifiable train_knobs' in r, f'one-sided train_knobs presence must be refused, got {r!r}'
     r2 = L.pair_reason({k: v for k, v in a.items() if k != 'train_knobs'}, b)
     assert r2 is None, 'both records missing the descriptor is the legacy path and may still pair'
+
+
+def t_pair_reason_fingerprint_gate():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    base = dict(variant='a', seed=0, run_cfg=fp, steps=1, tokens_seen=1, ppl=10.0,
+                data_fp='train-a', val_fp='val-a', eval_fp='eval-a')
+    b = dict(base, variant='b')
+    assert L.pair_reason(base, b) is None
+    # Same run_cfg but a different corpus / validation slice is NOT a
+    # controlled contrast, even though every numeric knob is identical.
+    assert 'data_fp' in L.pair_reason(base, dict(b, data_fp='train-b'))
+    assert 'val_fp' in L.pair_reason(base, dict(b, val_fp='val-b'))
+    assert 'eval_fp' in L.pair_reason(base, dict(b, eval_fp='eval-b'))
+    # The zero-GPU report builder has a local pair gate; it must mirror this.
+    assert 'data_fp' in BR._pair_reason(base, dict(b, data_fp='train-b'))
+    assert 'unverifiable val_fp' in BR._pair_reason(base, {k: v for k, v in b.items() if k != 'val_fp'})
+    # One-sided presence is unverifiable, not silently compatible.
+    c = dict(b)
+    c.pop('val_fp')
+    assert 'unverifiable val_fp' in L.pair_reason(base, c)
+    # Legacy records (both without fingerprints) keep the compatibility path.
+    leg = {k: v for k, v in base.items() if k not in ('data_fp', 'val_fp', 'eval_fp')}
+    assert L.pair_reason(leg, dict(leg, variant='b')) is None
+    # aggregate must refuse to pool one group across two evaluation slices.
+    summary = {
+        'a::seed0': dict(base, variant='a'),
+        'a::seed1': dict(base, variant='a', seed=1, ppl=10.5, val_fp='val-b'),
+        'b::seed0': dict(b),
+        'b::seed1': dict(b, seed=1, ppl=11.0),
+    }
+    try:
+        L.aggregate(summary)
+    except ValueError as e:
+        assert 'different corpus/evaluation fingerprints' in str(e), e
+    else:
+        raise AssertionError('aggregate must reject a group pooled across validation slices')
+    rows = [dict(base, by_len={8: {'ppl': 10.0}}),
+            dict(base, variant='b', val_fp='val-b', by_len={8: {'ppl': 11.0}})]
+    try:
+        L.by_len_cells(rows, 8)
+    except ValueError as e:
+        assert 'different validation slices' in str(e), e
+    else:
+        raise AssertionError('by_len_cells must reject rows from different validation slices')
+
+
+def t_m0_scale_analysis_descriptive():
+    fp = 'steps10_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    summary = {}
+    for v, base in (('csa_dynamic', 10.0), ('csa_fixed', 10.5),
+                    ('hybrid_dynamic', 10.2), ('full_matched', 11.0),
+                    ('full_sw128_matched', 10.8)):
+        for seed in range(4):
+            summary[f'{v}::seed{seed}'] = dict(
+                variant=v, seed=seed, run_cfg=fp, steps=10, tokens_seen=10,
+                ppl=base + 0.1 * seed, params=100, train_knobs=knobs,
+                data_fp='d', val_fp='v')
+    tmp = tempfile.mkdtemp()
+    try:
+        r = M0.scale_analysis({'S1': summary}, outdir=tmp)
+        p = r['panels']['S1']
+        assert p['n_seeds'] == 4 and p['descriptive_only'] is True, p
+        names = {(c['name'], c['with'], c['without']) for c in p['contrasts']}
+        assert ('dynamic_blocking', 'csa_dynamic', 'csa_fixed') in names, names
+        assert ('hybrid_hierarchy', 'hybrid_dynamic', 'csa_dynamic') in names, names
+        assert all(c['resolution_limited'] for c in p['contrasts'] if c['n_paired']), p['contrasts']
+        assert os.path.exists(os.path.join(tmp, 'scale_analysis.json'))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def t_seed_plan():
@@ -2455,6 +2660,9 @@ def main():
     _check('A6b2 scaling_trend primary direction + floors', t_scaling_trend_primary_direction_and_floor)
     _check('A6c meta-analysis input guards', t_scale_input_guards)
     _check('A5b exact sign-flip at scale (MITM)', t_exact_signflip_at_scale)
+    _check('A5c deterministic saddlepoint sign-flip for n>40', t_signflip_saddlepoint_large_n)
+    _check('A5d exact Wilcoxon DP beyond n=16', t_wilcoxon_exact_dp)
+    _check('A5e TimeGuard per-variant panel calibration', t_timeguard_variant_calibration)
     _check('A4b TOST Student-t CI + margin boundary', t_tost_student_t_and_boundary)
     _check('A4c safe exp + token-pooled document CI', t_safe_exp_and_doc_ci)
     _check('A4d deterministic document bootstrap CI', t_bootstrap_mean_ci)
@@ -2472,6 +2680,8 @@ def main():
     _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)
     _check('C10 audit resolution classification', t_audit_resolution_classification)
     _check('C11 controlled-variable gate: mixed train_knobs', t_pair_reason_train_knobs_mixed)
+    _check('C11b corpus/validation-slice fingerprint gate', t_pair_reason_fingerprint_gate)
+    _check('C21 M0 scale analysis stays descriptive at n=4', t_m0_scale_analysis_descriptive)
     _check('C12 seed plan', t_seed_plan)
     _check('C13 family Holm + verified baseline + param control', t_audit_family_holm_and_verified)
     _check('C14 compression-regularizer loss ablation', t_ablation_design_loss_term)

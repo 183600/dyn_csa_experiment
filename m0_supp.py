@@ -24,6 +24,9 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
             hybrid_dynamic），以及 CUDA 机器上的稀疏注意力基准
             （判据口径见 docs/compute_plan.md §6）。任意设备可跑——
            CPU / 无 triton 时验证 torch 参考后端（数值语义层）。
+  analysis 零 GPU：读取 results_b_s1/（及可选的 results_b_s2/）的 summary.json，
+           输出描述性配对统计、Holm、分辨率上限与跨规模 log-PPL 效应
+           （analysis_m0/scale_analysis.json）。S1×4 / S2×3 一律标为描述性。
   full     S1 主面板（5 臂 × 4 seeds × 5B token，results_b_s1/）。
            CSA_PAR=auto 一卡一实验（par.py 零改动，§7 排班口径）。
            M0_PANEL=S2 切换到 S2 主面板（RUN_S2：同 B_ARMS、同
@@ -34,12 +37,15 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
 运行时上限：按面板取 M0_CAP / M2_CAP（可用 M0_CAP_HOURS /
 M2_CAP_HOURS 覆盖），状态文件 run_time_state_m0.json /
 run_time_state_m2.json（内核模式 .k 后缀，两面板互不混账）；超限单元
-拒绝启动、中途到达上限则硬截断且不留半条测量。注意（compute_plan
-§3 的前提判断，不是缺陷）：Triton 内核（G0 判据）就绪之前，eager
-路径会被 TimeGuard 直接拒绝启动面板单元——此时应先完成
-内核与 kernel/eager 数值对照。
+拒绝启动、中途到达上限则硬截断且不留半条测量。`full` 启动前先用
+`require_g0` 校验 `results_m0_g0/g0_certificate.json`（内核数值、吞吐与
+训练级 TOST 三层都由 `kernel` 子命令写出并绑定代码/内核戳/git 树）；
+没有有效证书时拒绝启动，只能用 CSA_ALLOW_UNVERIFIED_EAGER=1 做显式调试。
+`full` 还会在真实面板几何上做短校准，把各臂的实测 s/step 记入 TimeGuard；
+未校准的解析外推在 S1 尺度上会高估到使全部单元被 cap 跳过的程度。
 """
 import gc, json, os, shutil, subprocess, sys, time, traceback
+import numpy as np
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -270,6 +276,97 @@ def run_smoke():
     shutil.rmtree('results_overfit_sanity_m0', ignore_errors=True)
     print(f'\n[smoke] PASSED — fineweb 数据路径与 seq-{seq} 的稠密/固定/动态三条注意力路径端到端可用；smoke 输出已删除，未触碰任何实验目录。')
 
+G0_TOST_REL_MARGIN = 0.01
+
+
+def _training_tost_check(ck, *, seeds=(0, 1, 2, 3, 4, 5), steps=40,
+                         variants=('csa_fixed', 'csa_dynamic')):
+    """Training-level kernel/eager equivalence (G0 layer 3).
+
+    Operator and model checks certify one forward/backward; they do not prove
+    that the two implementations follow the same optimisation trajectory.  Run
+    the same tiny model on the same fixed tokens with the torch reference and
+    the Triton backend, then apply the pre-registered paired TOST: the mean PPL
+    difference must lie inside a +/-1% relative margin at 90% confidence.  The
+    `tost_paired` helper uses a Student-t interval (df=n-1), not a z interval.
+    """
+    vocab, d, nl, nh, dh, seq, bs = 256, 64, 2, 4, 16, 256, 4
+    rng = np.random.default_rng(20261019)
+    train_ids = rng.integers(0, vocab, size=vocab * 4000, dtype=np.int64)
+    val_batch = rng.integers(0, vocab, size=(8, seq), dtype=np.int64)
+    out = {'margin_relative': float(G0_TOST_REL_MARGIN), 'steps': int(steps),
+           'seeds': [int(x) for x in seeds], 'geometry': {
+               'vocab': vocab, 'd': d, 'n_layers': nl, 'n_heads': nh,
+               'd_head': dh, 'seq_len': seq, 'batch_size': bs},
+           'variants': {}, 'passed': True}
+    for variant in variants:
+        ref, tri = [], []
+        try:
+            for seed in seeds:
+                with ck.kernel_env('ref'):
+                    r = L.train_variant(variant, train_ids, val_batch, vocab, seed=int(seed),
+                                        d=d, n_layers=nl, n_heads=nh, d_head=dh,
+                                        seq_len=seq, batch_size=bs, steps=int(steps),
+                                        eval_every=0, eval_subset=8, log_every=0,
+                                        save_ckpt='none', measure_eff=False)
+                with ck.kernel_env('triton'):
+                    t = L.train_variant(variant, train_ids, val_batch, vocab, seed=int(seed),
+                                        d=d, n_layers=nl, n_heads=nh, d_head=dh,
+                                        seq_len=seq, batch_size=bs, steps=int(steps),
+                                        eval_every=0, eval_subset=8, log_every=0,
+                                        save_ckpt='none', measure_eff=False)
+                ref.append(float(r['ppl']))
+                tri.append(float(t['ppl']))
+            deltas = [a - b for a, b in zip(ref, tri)]
+            margin = abs(float(np.mean(ref))) * G0_TOST_REL_MARGIN
+            st = L.tost_paired(deltas, margin, conf=0.90)
+            st['ref_ppl'] = ref
+            st['triton_ppl'] = tri
+            st['deltas'] = deltas
+            st['passed'] = bool(st.get('equivalent') is True)
+        except Exception as e:
+            st = {'passed': False, 'error': f'{type(e).__name__}: {e}'}
+        out['variants'][variant] = st
+        out['passed'] = bool(out['passed'] and st.get('passed'))
+        print(f"[kernel] 训练级 TOST {variant:<14}: {'PASS' if st.get('passed') else 'FAIL'}"
+              + (f"  ({st.get('error')})" if st.get('error') else
+                 f"  mean Δ={st.get('mean', float('nan')):+.4f} margin=±{st.get('margin', float('nan')):.4f} "
+                 f"p={st.get('p_tost', float('nan')):.3g}"))
+    return out
+
+
+def _write_g0_certificate(ck, *, numeric_pass, benchmark_pass, best_tflops,
+                          training_tost):
+    """Write the machine-checkable G0 certificate consumed by `require_g0`.
+
+    The helper previously existed with no producer, so the documented gate
+    could never be satisfied.  Every field is an observed value; the file is
+    stamped with the same code semantics / kernel stamp / git tree that
+    `_g0_mismatch` re-checks at panel start.
+    """
+    prov = L._git_provenance()
+    cert = {
+        'status': 'pass' if (numeric_pass and benchmark_pass and training_tost.get('passed')) else 'fail',
+        'numeric_pass': bool(numeric_pass),
+        'benchmark_pass': bool(benchmark_pass),
+        'training_tost_pass': bool(training_tost.get('passed')),
+        'code_semantics': L.CODE_SEMANTICS,
+        'kernel_stamp': L._kernel_stamp(),
+        'git_commit': prov.get('git_commit'),
+        'git_diff_sha256': prov.get('git_diff_sha256'),
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'device': str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else 'cpu',
+        'triton_version': getattr(__import__('triton'), '__version__', None) if ck.triton_importable() else None,
+        'benchmark_best_tflops': float(best_tflops) if best_tflops else None,
+        'training_tost': training_tost,
+    }
+    path = L.g0_certificate_path()
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+    L.atomic_write_json(path, cert)
+    print(f'[kernel] G0 certificate {"WRITTEN" if cert["status"] == "pass" else "written as FAIL"} -> {path}')
+    return cert
+
+
 def run_kernel():
     """G0 验证套件（docs/compute_plan.md §3/§6）。
 
@@ -327,8 +424,8 @@ def run_kernel():
             tflops[str(dt)] = ck.bench_attention(dev, impl='triton', dtype=dt,
                                                  iters=int(os.environ.get('M0_KERNEL_ITERS') or 20))
     print()
+    best = max(tflops.values()) if tflops else None
     if tflops:
-        best = max(tflops.values())
         print(f'[kernel] G0 基准判据：{"PASS" if best >= 150.0 else "NOT YET"}（门限口径见 docs/compute_plan.md §6）')
     else:
         print('[kernel] 基准需要 CUDA + triton（本机跳过；G0 基准判据未测量，不算通过）')
@@ -336,6 +433,282 @@ def run_kernel():
     print('[kernel] 说明：内核路径是独立变体（CSA_KERNEL 开启后 run_cfg 指纹追加 -tk1:<backend>）；S1 主面板在 G0 双判据通过前仍被 TimeGuard 拒绝启动')
     if fail:
         sys.exit(1)
+    # The training-level layer is the one that can certify a whole panel; run
+    # it only on a machine that actually has the Triton backend, and never
+    # advertise a pass when the benchmark itself did not reach the gate.
+    benchmark_pass = bool(best is not None and best >= 150.0)
+    if 'triton' in backends:
+        print('[kernel] G0 layer 3: training-level kernel/eager TOST')
+        _tost = _training_tost_check(ck)
+    else:
+        _tost = {'passed': False, 'error': 'CUDA+triton not available; training-level TOST not measured'}
+    if benchmark_pass and _tost.get('passed') and not fail:
+        _write_g0_certificate(ck, numeric_pass=True, benchmark_pass=True,
+                              best_tflops=best, training_tost=_tost)
+    else:
+        print('[kernel] G0 certificate NOT written/overwritten: ' +
+              ('numeric checks failed; ' if fail else '') +
+              ('benchmark below threshold; ' if not benchmark_pass else '') +
+              ('training-level TOST did not pass' if not _tost.get('passed') else ''))
+
+
+def _calibrate_panel(run_cfg, guard, panel):
+    """Measure the real per-step cost at the panel geometry before planning.
+
+    TimeGuard's uncalibrated default is a base-geometry rate extrapolated with
+    an analytic factor; on the S1/S2 ladder that extrapolation is many orders
+    of magnitude too pessimistic (seq 512 -> 8192 and d 256 -> 768/1024 are far
+    outside the fitted range), so a fresh state file would mark every cell
+    `skipped_cap` without ever training.  A short real run at the EXACT panel
+    geometry gives the guard an exact `sps_by_class` entry per variant, and the
+    per-variant key keeps a dense arm from being priced as a sparse one.
+
+    Calibration seconds are booked to the same cap (they are real GPU time).
+    `M0_CALIB_STEPS` (default 20) controls the probe length; set it to 0 to
+    skip when a prior state file already holds every variant's calibration.
+    """
+    try:
+        calib_steps = int(os.environ.get('M0_CALIB_STEPS', '20'))
+    except ValueError:
+        print(f"[m0-calib] M0_CALIB_STEPS={os.environ.get('M0_CALIB_STEPS')!r} is not an integer; using 20")
+        calib_steps = 20
+    variants = list(run_cfg['variants'])
+    state = guard._load_state()
+    by_class = state.get('sps_by_class') or {}
+    missing = [v for v in variants
+               if guard._class_key(run_cfg['d'], run_cfg['n_layers'], run_cfg['seq_len'],
+                                   run_cfg['batch_size'], v) not in by_class]
+    if calib_steps <= 0:
+        print(f'[m0-calib] skipped (M0_CALIB_STEPS<=0); {len(missing)}/{len(variants)} variant(s) still uncalibrated: {missing or "none"}')
+        return
+    if not missing:
+        print(f'[m0-calib] all {len(variants)} variant(s) already have an exact panel-geometry calibration')
+        return
+    print(f'[m0-calib] {len(missing)}/{len(variants)} variant(s) uncalibrated at the panel geometry; '
+          f'running {calib_steps} real steps each (booked to the cap) to replace the analytic extrapolation')
+    t_data = time.time()
+    train_ids, val_batch, vocab, _tok, val_bnd = L.load_run_corpus(run_cfg)
+    guard.record_run(time.time() - t_data, 0, 0, 0, 0, 0)
+    ok = 0
+    for v in missing:
+        try:
+            ratio = L.variant_mlp_ratio(v, int(vocab), d=int(run_cfg['d']),
+                                        n_layers=int(run_cfg['n_layers']),
+                                        n_heads=int(run_cfg['n_heads']),
+                                        d_head=int(run_cfg['d_head']),
+                                        seq_len=int(run_cfg['seq_len']),
+                                        matched=run_cfg.get('matched'),
+                                        ref_variant=run_cfg.get('mlp_match_ref', 'csa_dynamic'))
+            t0 = time.time()
+            rec = L.train_variant(v, train_ids, val_batch, vocab, seed=0,
+                                  d=int(run_cfg['d']), n_layers=int(run_cfg['n_layers']),
+                                  n_heads=int(run_cfg['n_heads']), d_head=int(run_cfg['d_head']),
+                                  seq_len=int(run_cfg['seq_len']),
+                                  batch_size=int(run_cfg['batch_size']),
+                                  steps=calib_steps, lr=run_cfg['lr'],
+                                  weight_decay=run_cfg['weight_decay'],
+                                  warmup=run_cfg['warmup'],
+                                  comp_lambda=run_cfg['comp_lambda'],
+                                  delta_lr_mult=run_cfg.get('delta_lr_mult', 10.0),
+                                  eval_every=0, eval_subset=1, log_every=0,
+                                  val_bnd=val_bnd, mlp_ratio=ratio,
+                                  save_ckpt='none', measure_eff=False,
+                                  amp_dtype=run_cfg.get('amp_dtype', 'auto'),
+                                  eager_batch=run_cfg.get('eager_batch', 'auto'))
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dt = time.time() - t0
+            guard.record_run(dt, calib_steps, int(run_cfg['d']), int(run_cfg['n_layers']),
+                             int(run_cfg['seq_len']), int(run_cfg['batch_size']),
+                             calib_seconds=rec.get('train_time_s'), variant=v)
+            print(f'[m0-calib] {v:<20} {dt / calib_steps:.3f} s/step  ({dt:.1f}s for {calib_steps} steps)')
+            ok += 1
+        except Exception as e:
+            print(f'[m0-calib] {v}: calibration FAILED ({type(e).__name__}: {e}) — the panel will still run it, '
+                  'but its projection falls back to the geometry/generic rate')
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    state = guard._load_state()
+    by_class = state.get('sps_by_class') or {}
+    total = 0.0
+    print(f'[m0-calib] projected {panel} cost at the measured rates (includes the 1.15 safety factor):')
+    for v in variants:
+        sps = by_class.get(guard._class_key(run_cfg['d'], run_cfg['n_layers'],
+                                            run_cfg['seq_len'], run_cfg['batch_size'], v))
+        est = guard.estimate_seconds(run_cfg['steps'], d=run_cfg['d'], n_layers=run_cfg['n_layers'],
+                                     seq_len=run_cfg['seq_len'], batch_size=run_cfg['batch_size'], variant=v)
+        cell_h = est / 3600.0
+        total += cell_h * len(run_cfg['seeds'])
+        print(f'  {v:<20} {("calibrated" if sps is not None else "FALLBACK"):<10} {cell_h:8.2f} h/run  x {len(run_cfg["seeds"])} seeds = {cell_h * len(run_cfg["seeds"]):8.2f} h')
+    cap_h = guard.cap_hours()
+    print(f'[m0-calib] panel total projection {total:.1f} h vs usable cap {cap_h:.1f} h '
+          f'(booked so far {state.get("booked_seconds", 0.0) / 3600:.2f} h)')
+    if total + state.get('booked_seconds', 0.0) / 3600.0 > cap_h:
+        print('[m0-calib] WARNING: the measured projection exceeds the usable cap. The TimeGuard will skip or hard-truncate '
+              'cells that no longer fit (a truncated cell leaves no partial measurement). Raise the cap, reduce the seed/arm '
+              'list, or use a faster kernel — do not read the resulting incomplete panel as a full-panel result.')
+
+
+B_SCALE_DESIGN = {
+    'dynamic_blocking': [
+        ('csa_dynamic', 'csa_fixed', 'B-tier dynamic vs fixed blocking (CSA)'),
+    ],
+    'hybrid_hierarchy': [
+        ('hybrid_dynamic', 'csa_dynamic', 'B-tier CSA+HCA hybrid vs CSA-only'),
+    ],
+}
+
+
+def _ppl_by_seed(summary, variant):
+    out = {}
+    for rec in summary.values():
+        if not isinstance(rec, dict) or rec.get('variant') != variant:
+            continue
+        if not L.ppl_is_usable(rec.get('ppl')):
+            continue
+        try:
+            seed = int(rec.get('seed'))
+        except (TypeError, ValueError):
+            continue
+        if seed in out:
+            # aggregate would reject this; keep the analysis explicit too.
+            raise ValueError(f'{variant}: duplicate measurable seed {seed}')
+        out[seed] = float(rec['ppl'])
+    return out
+
+
+def _flatten_contrasts(audit):
+    rows = []
+    for family in ('components', 'baselines'):
+        for name, entries in (audit.get(family) or {}).items():
+            for e in entries:
+                rows.append({
+                    'family': family, 'name': name,
+                    'with': e.get('with'), 'without': e.get('without'),
+                    'n_paired': e.get('n_paired'), 'mean': e.get('mean'),
+                    'std': e.get('std'), 'relative_effect_pct': e.get('relative_effect_pct'),
+                    'p_exact_signflip': e.get('p_exact_signflip'),
+                    'p_holm': e.get('p_holm_global', e.get('p_holm_component')),
+                    'effect_vs_noise': e.get('effect_vs_noise'),
+                    'resolution_limited': e.get('resolution_limited'),
+                    'underpowered': e.get('underpowered'),
+                    'controlled': e.get('controlled'),
+                    'run_cfg_equal': e.get('run_cfg_equal'),
+                    'param_controlled': e.get('param_controlled'),
+                })
+    return rows
+
+
+def scale_analysis(summaries=None, outdir='analysis_m0'):
+    """Zero-GPU descriptive analysis for the B-tier S1/S2 panels.
+
+    The scale ladder uses 4 seeds (S1) and 3 seeds (S2), so the exact sign-flip
+    floor is 0.125 / 0.25: NO comparison can reach alpha=0.05 regardless of
+    effect size.  This entry point therefore reports paired effects, family
+    correction and resolution limits explicitly, and never promotes a
+    descriptive readout to a confirmatory claim.  When both panels are present
+    it also reports the per-scale log-PPL effects and the S1->S2 interaction.
+    """
+    if summaries is None:
+        summaries = {}
+        for label, cfg in (('S1', L.RUN_S1), ('S2', L.RUN_S2)):
+            path = os.path.join(cfg['outdir'], 'summary.json')
+            if os.path.exists(path):
+                try:
+                    summaries[label] = json.load(open(path, encoding='utf-8'))
+                except Exception as e:
+                    print(f'[m0-analysis] WARNING: {path} unreadable ({type(e).__name__}: {e}); panel skipped')
+    summaries = {k: v for k, v in (summaries or {}).items() if isinstance(v, dict) and v}
+    report = {'kind': 'm0_scale_analysis', 'panels': {}, 'cross_scale': {},
+              'notes': [
+                  'B-tier S1 (4 seeds) / S2 (3 seeds) panels are DESCRIPTIVE: the exact two-sided sign-flip floor is 2/2^n = 0.125 / 0.25 > 0.05.',
+                  'Cross-scale effects are paired log PPL ratios; they are scale-free, but a two-point ladder is not a scaling law.',
+              ]}
+    for label, summary in sorted(summaries.items()):
+        try:
+            agg = L.aggregate(summary)
+        except ValueError as e:
+            print(f'[m0-analysis] {label}: aggregate REFUSED the panel ({e})')
+            report['panels'][label] = {'error': str(e)}
+            continue
+        n_seeds = max((e.get('n_seeds') or 0) for e in agg.values()) if agg else 0
+        variants = sorted({e.get('variant') for e in agg.values() if e.get('variant')})
+        audit = L.methodology_audit(summary, design=B_SCALE_DESIGN,
+                                    baselines=L.BASELINE_DESIGN,
+                                    verbose=False, write=False)
+        seed_plan = L.methodology_seed_plan(n_seeds, variants=variants) if variants else {}
+        contrasts = _flatten_contrasts(audit)
+        measured = [c for c in contrasts if c.get('n_paired')]
+        report['panels'][label] = {
+            'n_seeds': int(n_seeds),
+            'variants': variants,
+            'arms': {v: {k: e.get(k) for k in
+                         ('n_seeds', 'ppl_primary', 'ppl_pooled', 'ppl_mean',
+                          'ppl_std', 'params', 'tokens_seen')}
+                     for v, e in agg.items()},
+            'contrasts': contrasts,
+            'descriptive_only': bool(measured and all(
+                c.get('resolution_limited') or c.get('underpowered') for c in measured)),
+            'verified_components': audit.get('verified_components'),
+            'resolution_limited_components': audit.get('resolution_limited_components'),
+            'underpowered_components': audit.get('underpowered_components'),
+            'incomplete_components': audit.get('incomplete_components'),
+            'seed_plan': {k: seed_plan.get(k) for k in
+                          ('n_seeds', 'declared_contrasts',
+                           'min_seeds_for_family_significance',
+                           'sufficient_for_family_rejection')},
+            'warnings': audit.get('warnings'),
+        }
+        print(f'[m0-analysis] {label}: {len(measured)} contrast(s), '
+              f'n={n_seeds}, descriptive_only={report["panels"][label]["descriptive_only"]}')
+    # Cross-scale readout over the contrasts the panels share.
+    pairs = [('csa_dynamic', 'csa_fixed', 'dynamic_vs_fixed'),
+             ('hybrid_dynamic', 'csa_dynamic', 'hybrid_vs_csa'),
+             ('csa_dynamic', 'full_matched', 'dynamic_vs_dense')]
+    for a, b, name in pairs:
+        points = []
+        raw = {}
+        for label, summary in sorted(summaries.items()):
+            try:
+                pa, pb = _ppl_by_seed(summary, a), _ppl_by_seed(summary, b)
+            except ValueError as e:
+                print(f'[m0-analysis] {name}/{label}: {e}')
+                continue
+            common = sorted(set(pa) & set(pb))
+            if len(common) < 2:
+                continue
+            lr = L.paired_log_ratio([pa[s] for s in common], [pb[s] for s in common], seeds=common)
+            raw[label] = lr
+            _e = (report['panels'].get(label) or {}).get('arms', {}).get(a) or {}
+            points.append({'label': label, 'scale': _e.get('params'),
+                           'effects': lr['effects'], 'seeds': lr['seeds']})
+        if len(points) < 2:
+            if points:
+                report['cross_scale'][name] = {'status': 'single_scale_only', 'per_scale': raw}
+            continue
+        meta = L.meta_analyze_effects(points, min_seeds=3)
+        entry = {'per_scale': raw, 'meta': meta}
+        # Paired S1->S2 interaction on the seeds present in BOTH panels.
+        low_lbl, high_lbl = sorted(raw)[0], sorted(raw)[-1]
+        lo = dict(zip(raw[low_lbl]['seeds'], raw[low_lbl]['effects']))
+        hi = dict(zip(raw[high_lbl]['seeds'], raw[high_lbl]['effects']))
+        common = sorted(set(lo) & set(hi))
+        if len(common) >= 2:
+            entry['interaction'] = L.scale_interaction(
+                [lo[s] for s in common], [hi[s] for s in common],
+                low_label=low_lbl, high_label=high_lbl, seeds=common, min_n=3)
+        else:
+            entry['interaction'] = {'status': 'insufficient_common_seeds',
+                                    'low': low_lbl, 'high': high_lbl,
+                                    'n_common': len(common)}
+        report['cross_scale'][name] = entry
+        print(f'[m0-analysis] cross-scale {name}: {meta.get("status")} '
+              f'(poolable={meta.get("poolable")}, points={meta.get("n_points")})')
+    os.makedirs(outdir, exist_ok=True)
+    L.stamped_analysis('m0_scale_analysis', report, outdir=outdir, name='scale_analysis.json')
+    print(f'[m0-analysis] wrote {outdir}/scale_analysis.json')
+    return report
 
 
 def run_full():
@@ -344,6 +717,11 @@ def run_full():
         print(f"[m0] unknown M0_PANEL {panel!r}; expected 'S1' or 'S2'.  Nothing was started.")
         raise SystemExit(2)
     run_cfg, cap, cap_env = (L.RUN_S1, L.M0_CAP, 'M0_CAP_HOURS') if panel == 'S1' else (L.RUN_S2, L.M2_CAP, 'M2_CAP_HOURS')
+    # The compute plan makes G0 a hard precondition for the scale panels.  The
+    # helper existed but was never called, so a typo/missing cert silently ran
+    # the eager path the plan says is infeasible at this scale.  Check before
+    # the (non-trivial) pre-flight so a missing certificate costs seconds.
+    L.require_g0(f'M0/{panel} 主面板')
     _full_ratios = {}
     for _v in run_cfg['variants']:
         try:
@@ -364,7 +742,8 @@ def run_full():
     guard = L.TimeGuard(cap)
     guard.report()
     _what = f'{panel} 主面板（B 档，{len(run_cfg["variants"])} 臂 × {len(run_cfg["seeds"])} seeds × {run_cfg["n_train_tokens"] / 1e9:g}B token）'
-    print(f'[m0] 提示（compute_plan §3）：内核（G0）就绪前 eager 路径会被 TimeGuard 拒绝启动——先完成三算子 Triton 化与 kernel/eager 数值对照，再回到这里跑 {_what}。')
+    _calibrate_panel(run_cfg, guard, panel)
+    guard.report()
     push_ok = git_push(f'm0: {_what}启动（产出目录 {run_cfg["outdir"]}/）')
     L.run(run_cfg, guard=guard, label=f'M0/{_what}')
     push_ok &= git_push(f'm0: {_what}完成一轮（{run_cfg["outdir"]} 为本地实验产物，不入库；量值以 summary.json 现算为准）')
@@ -379,8 +758,8 @@ if __name__ == '__main__':
     if mode in ('-h', '--help'):
         print(__doc__ or '')
         raise SystemExit(0)
-    if mode not in ('params', 'data', 'smoke', 'kernel', 'full'):
-        print(f"[m0] unknown or missing mode {mode!r}; expected one of 'params' / 'data' / 'smoke' / 'kernel' / 'full' (all phases are explicit — nothing starts by default).  Nothing was started.")
+    if mode not in ('params', 'data', 'smoke', 'kernel', 'full', 'analysis'):
+        print(f"[m0] unknown or missing mode {mode!r}; expected one of 'params' / 'data' / 'smoke' / 'kernel' / 'full' / 'analysis' (all phases are explicit — nothing starts by default).  Nothing was started.")
         raise SystemExit(2)
     try:
         _gpu = torch.cuda.get_device_name(0)
@@ -398,6 +777,8 @@ if __name__ == '__main__':
             run_kernel()
         elif mode == 'full':
             run_full()
+        elif mode == 'analysis':
+            scale_analysis()
     except Exception:
         traceback.print_exc()
         if mode == 'full':
