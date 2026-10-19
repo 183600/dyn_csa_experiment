@@ -1222,7 +1222,68 @@ def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=Fals
     cut_list = (sim < tau).cpu().numpy()
     return blocks_from_cuts(n, cut_list, min_block, max_block, dev, return_count=return_count)
 
-def _causal_quantile_exact(x, cols, target_block_tokens):
+def _causal_quantile_rank(x, lo, frac, use_hi, first_row, q, n):
+    """Exact causal quantile via cumulative comparison counts (full column range).
+
+    `x[j]` is the k-th smallest value of the prefix `[0, c]` exactly when
+    `#{i <= c : (x_i, i) < (x_j, j)} == k` under the strict order (value,
+    then index), so the per-column sort-and-gather reduces to prefix sums of
+    a comparison matrix — the same values with no `[rows, cols, n]` sort
+    workspace.  A `j`-chunk `[j0, j1)` can only influence columns `c >= j0`,
+    which halves the touched (c, j) pairs.  Falls back to nothing: the
+    caller routes non-finite inputs and sampled column grids to the sort
+    path, whose semantics this reproduces bit-for-bit for finite inputs
+    (ties give equal values regardless of order, and the arithmetic is the
+    same expression evaluated in the same dtype).
+    """
+    rows = int(x.shape[0])
+    dev = x.device
+    idx = _arange_cache(n, dev)
+    out_lo = x.new_empty((rows, n))
+    need_hi = q < 1.0
+    out_hi = x.new_empty((rows, n)) if need_hi else out_lo
+    _budget = 48 << 20
+    _per_elem = 12
+    # Small chunks keep the [rows, n, jc] comparison block cache-resident,
+    # which beats larger blocks despite the extra loop iterations.
+    jc = max(1, min(16, _budget // max(1, n * _per_elem)))
+    rb = max(1, min(16, _budget // max(1, n * jc * _per_elem)))
+    for r0 in range(0, rows, rb):
+        r1 = min(r0 + rb, rows)
+        xr = x[r0:r1]
+        out_lo_r = out_lo[r0:r1]
+        out_hi_r = out_hi[r0:r1]
+        for j0 in range(0, n, jc):
+            j1 = min(j0 + jc, n)
+            xj = xr[:, j0:j1]
+            jb = j1 - j0
+            lt = xr.unsqueeze(-1) < xj.unsqueeze(1)
+            eq = xr.unsqueeze(-1) == xj.unsqueeze(1)
+            ilt = idx.unsqueeze(-1) < idx[j0:j1].unsqueeze(0)
+            A = lt | (eq & ilt)
+            S = A.cumsum(1, dtype=torch.int32)[:, j0:]
+            # Only the boundary columns c in [j0, j1) can see a j > c.
+            jle = idx[j0:j1].unsqueeze(0) <= idx[j0:j1].unsqueeze(1)
+            m_lo = S == lo[j0:].unsqueeze(0).unsqueeze(-1)
+            m_lo[:, :jb] &= jle
+            hit_lo = m_lo.any(-1)
+            v_lo = xj.gather(1, m_lo.to(torch.uint8).argmax(-1).long())
+            out_lo_r[:, j0:] = torch.where(hit_lo, v_lo, out_lo_r[:, j0:])
+            if need_hi:
+                m_hi = S == (lo[j0:] + 1).unsqueeze(0).unsqueeze(-1)
+                m_hi[:, :jb] &= jle
+                hit_hi = m_hi.any(-1)
+                v_hi = xj.gather(1, m_hi.to(torch.uint8).argmax(-1).long())
+                out_hi_r[:, j0:] = torch.where(hit_hi, v_hi, out_hi_r[:, j0:])
+    if need_hi:
+        interp = out_lo * (1.0 - frac) + out_hi * frac
+        oc = torch.where(use_hi, interp, out_lo)
+    else:
+        oc = out_lo
+    return torch.where(first_row, torch.full_like(oc, float('-inf')), oc)
+
+
+def _causal_quantile_exact(x, cols, target_block_tokens, _full_range=False):
     """Closed-form causal quantile at the requested columns.
 
     `x` is the [rows, n] work-precision similarity matrix and `cols` the
@@ -1241,9 +1302,14 @@ def _causal_quantile_exact(x, cols, target_block_tokens):
     hi_c = (lo + 1).clamp(max=n - 1)
     use_hi = (frac > 0.0) & (lo + 1 <= cols)
     first_row = cols == 0
+    nc = max(1, int(cols.numel()))
+    if (_full_range and n > 0 and cols.numel() == n
+            and bool(torch.isfinite(x).all())):
+        # `lo`/`lo + 1` never exceed `n - 1` on the full range (q <= 1), so
+        # the clamped gathers reduce to the plain rank targets.
+        return _causal_quantile_rank(x, lo, frac, use_hi, first_row, q, n)
     _pair_bytes = 16
     _budget = 128 << 20
-    nc = max(1, int(cols.numel()))
     # Bound BOTH dimensions by the byte ceiling.  Limiting only the row count
     # would leave a single [1, col_chunk, n] sort block unbounded.
     col_chunk = max(1, min(nc, 64, _budget // max(1, n * _pair_bytes)))
@@ -1312,7 +1378,8 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     squeeze = sim.dim() == 1
     x = (sim.unsqueeze(0) if squeeze else sim).detach().float()
     if n <= _exact_len:
-        out = _causal_quantile_exact(x, _arange_cache(n, sim.device), target_block_tokens)
+        out = _causal_quantile_exact(x, _arange_cache(n, sim.device), target_block_tokens,
+                                     _full_range=True)
     else:
         # Long-context path.  Two invariants make it prefix-consistent:
         #   1) columns < _exact_len are computed by the SAME closed form the
@@ -1325,7 +1392,8 @@ def causal_adaptive_threshold(sim, target_block_tokens):
         # The sampled grid never mixes a future sample into a past column.
         exact_n = min(n, int(_exact_len))
         pre_cols = torch.arange(exact_n, device=sim.device, dtype=torch.long)
-        pre_vals = _causal_quantile_exact(x[:, :exact_n], pre_cols, target_block_tokens)
+        pre_vals = _causal_quantile_exact(x[:, :exact_n], pre_cols, target_block_tokens,
+                                          _full_range=True)
         warm_end = max(exact_n, 256, _exact_len // 8)
         n_samp = 1024
         step = max(1, (_max_len - warm_end + n_samp - 1) // n_samp)
