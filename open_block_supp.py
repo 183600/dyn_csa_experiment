@@ -374,16 +374,19 @@ def _controlled_reason(a, b):
     if not isinstance(a, dict) or not isinstance(b, dict):
         return 'missing record'
     ha, hb = a.get('hyperparams') or {}, b.get('hyperparams') or {}
-    keys = ('steps', 'tokens_seen', 'seq_len', 'batch_size', 'lr', 'weight_decay',
-            'warmup', 'comp_lambda', 'delta_lr_mult', 'd', 'n_layers', 'n_heads',
-            'd_head', 'vocab_size', 'dataset', 'data_version', 'code', 'amp_dtype',
-            'eager_batch')
+    keys = ('steps', 'tokens_seen', 'n_train_tokens', 'seq_len', 'batch_size',
+            'lr', 'weight_decay', 'warmup', 'comp_lambda', 'delta_lr_mult',
+            'd', 'n_layers', 'n_heads', 'd_head', 'mlp_ratio', 'vocab_size',
+            'dataset', 'data_version', 'val_seqs', 'eval_every', 'eval_subset',
+            'code', 'amp_dtype', 'eager_batch')
     for k in keys:
         va, vb = ha.get(k), hb.get(k)
         if va is not None and vb is not None and va != vb:
             return f'{k} differs ({va!r} != {vb!r})'
     if a.get('code') != b.get('code'):
         return f"code stamp differs ({a.get('code')!r} != {b.get('code')!r})"
+    if a.get('params') is not None and b.get('params') is not None and a.get('params') != b.get('params'):
+        return f"parameter count differs ({a.get('params')!r} != {b.get('params')!r})"
     if a.get('run_fingerprint') != b.get('run_fingerprint'):
         return 'run_fingerprint differs (recipe/backend/matrix changed)'
     for k in ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp', 'rng_fp'):
