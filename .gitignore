@@ -50,10 +50,11 @@ REPORT*.md
 run_time_state*.json
 autodl_budget*.json
 
-# docs/ 白名单：design_notes.md 与 compute_plan.md
+# docs/ 白名单：只保留 design_notes.md
+# （docs/compute_plan.md 已废弃并从仓库删除，不允许再入库/被 CI 恢复）
 docs/*
 !docs/design_notes.md
-!docs/compute_plan.md
+docs/compute_plan.md
 /build_report_debug.json
 
 # 任务级并行执行器的临时任务目录（作业/日志/结果，可本地再生）
