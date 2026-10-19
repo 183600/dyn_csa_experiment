@@ -921,6 +921,93 @@ def _h2d_async(host_src, dtype, device):
             pass
         return t.to(device, non_blocking=t.is_pinned())
 
+_D2H_POOL = {}
+_D2H_POOL_BYTES = [0]
+try:
+    _D2H_POOL_CAP = max(16, int(os.environ.get('CSA_D2H_POOL_MB', '64'))) << 20
+except (TypeError, ValueError):
+    _D2H_POOL_CAP = 64 << 20
+_D2H_POOL_SLOTS = 4
+_D2H_POOL_MAX_ENTRIES = 64
+_D2H_BUSY = object()
+_D2H_POOL_LOCK = threading.RLock()
+
+def _d2h_pool_evict_locked(need=0):
+    # Same release discipline as the H2D pool: an entry leaves the pool only
+    # once every recorded download has completed.
+    while _D2H_POOL and (_D2H_POOL_BYTES[0] + int(need) > _D2H_POOL_CAP
+                         or len(_D2H_POOL) >= _D2H_POOL_MAX_ENTRIES):
+        victim = None
+        for _k, _e in list(_D2H_POOL.items()):
+            free = True
+            for _, _ev in _e['slots']:
+                if _ev is _D2H_BUSY or (_ev is not None and not _ev.query()):
+                    free = False
+                    break
+            if free:
+                victim = _k
+                break
+        if victim is None:
+            break
+        _e = _D2H_POOL.pop(victim)
+        _D2H_POOL_BYTES[0] -= int(_e.get('bytes', 0))
+
+def _d2h_stage(shape, dtype, device):
+    """Pinned-staging pool for device->host downloads — transport only.
+
+    The caller enqueues `buf.copy_(dev_t, non_blocking=True)` on the current
+    stream and later calls the returned `sync()`, which records one event
+    after the copy and waits for it — the only host wait — before the buffer
+    is read.  Every downloaded byte is identical to a plain `.cpu()` copy;
+    only the transport changes (pinned ring + non-blocking enqueue), which
+    lets the caller enqueue further device work (or run host code) that
+    overlaps the in-flight download.  A slot is never rewritten while one of
+    its downloads may still be pending; when the pool cannot serve the
+    caller falls back to a direct `.cpu()` copy with identical values.
+    """
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        return (None, None)
+    shape = tuple(int(_s) for _s in shape)
+    if not shape or 0 in shape:
+        return (None, None)
+    key = (_dev_str(device), dtype, shape)
+    with _D2H_POOL_LOCK:
+        ent = _D2H_POOL.get(key)
+        if ent is None:
+            per_slot = int(np.prod(shape, dtype=np.int64)) * torch.empty((), dtype=dtype).element_size()
+            n_slots = max(1, min(int(_D2H_POOL_SLOTS), int((_D2H_POOL_CAP // 2) // max(1, per_slot))))
+            est = per_slot * n_slots
+            _d2h_pool_evict_locked(est)
+            if _D2H_POOL_BYTES[0] + est > _D2H_POOL_CAP:
+                return (None, None)
+            try:
+                with torch.inference_mode(False):
+                    slots = [[torch.empty(shape, dtype=dtype).pin_memory(), None] for _ in range(n_slots)]
+            except (RuntimeError, TypeError):
+                return (None, None)
+            _D2H_POOL_BYTES[0] += est
+            ent = {'slots': slots, 'rr': 0, 'bytes': est}
+            _D2H_POOL[key] = ent
+        slots = ent['slots']
+        n = len(slots)
+        for _ in range(n):
+            i = ent['rr'] % n
+            ent['rr'] += 1
+            buf, ev = slots[i]
+            if ev is None or (ev is not _D2H_BUSY and ev.query()):
+                slots[i][1] = _D2H_BUSY
+
+                def sync(_buf=buf, _slot=slots[i], _device=device):
+                    with torch.inference_mode(False), torch.cuda.device(_device):
+                        ev2 = torch.cuda.Event()
+                        ev2.record()
+                        ev2.synchronize()
+                    with _D2H_POOL_LOCK:
+                        _slot[1] = ev2
+                    return _buf
+                return (buf, sync)
+        return (None, None)
+
 def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_count=False, return_honoured=False):
     if n == 0:
         base, cnt, hon = (torch.empty(0, dtype=torch.long, device=device), 0, {})
@@ -1088,24 +1175,47 @@ def _device_blocks_from_cuts(T, cuts, min_block, max_block, device, want_honoure
     bid, counts, hon_slot = _device_segment_geometry(int(T), cuts, min_block, max_block, device)
     B = int(bid.shape[0])
     n_blocks = (counts > 0).sum(1)
-    # One tiny transfer: the per-row counts are needed by the host geometry
-    # caches / diagnostics, but the token-length block-id table stays on device.
-    packed = torch.cat([counts, n_blocks[:, None]], 1).cpu().tolist()
+    # One transfer per layer: the per-row counts are needed by the host
+    # geometry caches / diagnostics, but the token-length block-id table
+    # stays on device.  The download is staged through a pinned buffer and
+    # enqueued non-blocking BEFORE the honoured-mask build below, so the two
+    # overlap in-stream and the single event sync is the only host wait in
+    # this forward.  Host rows are materialised as numpy int64 copies at C
+    # speed — no per-element Python conversion — and every integer is
+    # identical to the previous `.cpu().tolist()` transport (transport only).
+    packed = torch.cat([counts, n_blocks[:, None]], 1)
+    staged = sync = None
+    if packed.numel():
+        staged, sync = _d2h_stage(tuple(packed.shape), torch.long, device)
+        if staged is not None:
+            staged.copy_(packed, non_blocking=True)
     hon_stack = None
     if want_honoured and T > 1:
         hon_stack = torch.zeros((B, T - 1), dtype=hon_dtype, device=device)
         _rows = torch.arange(B, device=device)[:, None].expand_as(hon_slot)
         _ok = hon_slot >= 0
-        if bool(_ok.any()):
-            hon_stack[_rows[_ok], hon_slot[_ok]] = 1.0
+        # No host guard: the advanced-index put with an all-false (empty)
+        # mask selects no rows and writes nothing, so skipping the
+        # `bool(_ok.any())` check removes a blocking D2H sync per layer
+        # while leaving every written value identical.
+        hon_stack[_rows[_ok], hon_slot[_ok]] = 1.0
+    if staged is not None:
+        host = sync().numpy()
+    else:
+        host = packed.cpu().numpy()
     out = []
+    host_nb = host[:, -1]
     for b in range(B):
         row = bid[b]
-        cnt = packed[b][:int(packed[b][-1])]
-        _mx = max(cnt) if cnt else 0
-        row._pool_cpu = (cnt, _mx, max(cnt[:-1]) if len(cnt) > 1 else 0)
-        row._pool_nblocks = len(cnt)
-        out.append((row, len(cnt), None if hon_stack is None else hon_stack[b]))
+        nb = int(host_nb[b])
+        cnt = np.array(host[b, :nb])
+        _mx = int(cnt.max()) if nb else 0
+        # numpy rows carry the same immutable-by-convention counts integers;
+        # every consumer (len/max/min/sum/np.asarray/accumulate) reads them
+        # identically to the previous Python lists.
+        row._pool_cpu = (cnt, _mx, int(cnt[:-1].max()) if nb > 1 else 0)
+        row._pool_nblocks = nb
+        out.append((row, nb, None if hon_stack is None else hon_stack[b]))
     return out
 
 
@@ -1911,8 +2021,11 @@ def _pool_counts_clean(bid, B):
     if hit is not None and hit[0] == B:
         return hit[1]
     _cpu = getattr(bid, '_pool_cpu', None)
+    # `len(...) > 0` instead of bare truthiness: `_pool_cpu[0]` rows are
+    # numpy arrays on the device-segmenter path, where a bare `and` test
+    # would raise; the emptiness semantics are identical.
     ok = bool(B > 0 and _cpu is not None and len(_cpu[0]) == B
-              and _cpu[0] and min(_cpu[0]) > 0)
+              and len(_cpu[0]) > 0 and min(_cpu[0]) > 0)
     try:
         bid._pool_clean = (B, ok)
     except (AttributeError, RuntimeError):

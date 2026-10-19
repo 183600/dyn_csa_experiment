@@ -615,13 +615,14 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     starts_l = _i64['starts']
     ov_start_l = _i64['ov_start']
     nblk_l = _i64['n_blocks'][:, None]
-    # A fixed flat buffer holds every B-lane key/value exactly once in the
-    # same concatenation order, without retaining per-chunk tensors or a
-    # second full copy.
-    _bpb_total = int(R) * int(Bm) * int(W) if (need_bpb and has_b) else 0
-    gBpb_keys = torch.empty(_bpb_total, device=dev, dtype=torch.long) if _bpb_total else None
-    gBpb_vals = torch.empty((_bpb_total, c), device=dev, dtype=torch.float32) if _bpb_total else None
-    _bpb_off = 0
+    # B_pos_b 梯度按 chunk 直接做固定顺序段和，累加进 [行数, C] 的 fp32
+    # 累加器（chunk 升序、chunk 内 (r,b,j) 行主序的稳定排序——每 chunk
+    # 的求和顺序与逐 chunk 调 _det_scatter_add 完全相同，跨 chunk 的
+    # 累加顺序固定），不再物化 [R·Bm·W, C] 的完整键/值大表：该表随
+    # R·Bm·W·C 线性增长，长序列/大 batch 下是池化反向的显存峰值，
+    # 而段和的目标只有 [B_pos_b.shape[0], C]。
+    _bpb_rows = int(B_pos_b.shape[0]) if need_bpb else 0
+    gBpb32 = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32) if need_bpb else None
     ch = _pool_chunk_b(R, L + (W if has_b else 0), c, temps=8)
     # 单 chunk（ch >= Bm）时 in_ch / b2 的 chunk 范围条件恒真（geom 与 bid
     # 同源——Bm 由同一分段表的 counts 给出，bid 值恒 < Bm）：where(全真,
@@ -695,22 +696,17 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
         if need_bpb and has_b:
             _k = b_off[:, b0:b1].reshape(-1)
             _v = glogit_b.reshape(-1, c)
-            _n = int(_k.numel())
-            gBpb_keys[_bpb_off:_bpb_off + _n] = _k
-            gBpb_vals[_bpb_off:_bpb_off + _n] = _v
-            _bpb_off += _n
+            _seg = _seg_structure(_k, _bpb_rows)
+            _tmp = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32)
+            _seg_apply(_seg, _v, _tmp)
+            gBpb32 += _tmp
     gBpb = None
     if need_bpb:
-        # 同 gXb/gZb：W_b == 0 时 keys/vals 为空，段和返回全零——与 eager
+        # 同 gXb/gZb：W_b == 0 时无任何键，段和为全零——与 eager
         # 空泳道图的零梯度一致（HCA 把同一 B_pos 作 a/b 两参传入，零项
-        # 不改变 autograd 对同一张量的梯度求和）。
-        if _bpb_total:
-            keys = gBpb_keys[:_bpb_off]
-            vals = gBpb_vals[:_bpb_off]
-        else:
-            keys = torch.zeros(0, device=dev, dtype=torch.long)
-            vals = torch.zeros(0, c, device=dev, dtype=torch.float32)
-        gBpb = _det_scatter_add(B_pos_b.shape[0], keys, vals, dev, B_pos_b.dtype)
+        # 不改变 autograd 对同一张量的梯度求和）。fp32 累加器按上述
+        # 固定顺序求和，末尾一次 cast——与 _det_scatter_add 同口径。
+        gBpb = gBpb32.to(B_pos_b.dtype)
     return gXa, gXb, gZa, gZb, gBpa, gBpb
 
 
