@@ -4216,6 +4216,16 @@ def t_audit_boundary_rejects_invalid_readings():
             assert r['status'] == 'fail' and r['problems'], r
 
 
+def t_audit_malformed_arm_id_does_not_crash():
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'k': {'variant': {'bad': 1}, 'seed': 0, 'ppl': 10.0,
+                             'stats': {}, 'efficiency': {'status': 'ok'}}}, f)
+        for fn in (A.audit_attribution, A.audit_failures, A.audit_efficiency_pairs):
+            out = fn([d])
+            assert isinstance(out, dict) and out['status'] != 'fail', (fn.__name__, out)
+
+
 def t_audit_split_empty_cache_is_not_ok():
     with tempfile.TemporaryDirectory() as d:
         out = A.audit_split_discipline(cache_dirs=[d])
@@ -6052,6 +6062,7 @@ def main():
     _check('I15 length audit refuses a missing eval span', t_audit_length_requires_eval_span)
     _check('I16 fairness audit ignores a NaN seed instead of crashing', t_audit_fairness_nan_seed_does_not_crash)
     _check('I16b boundary audit rejects non-numeric alignment readings', t_audit_boundary_rejects_invalid_readings)
+    _check('I16c malformed arm ids do not crash the panel audits', t_audit_malformed_arm_id_does_not_crash)
     _check('I17 an empty split cache is not reported as verified', t_audit_split_empty_cache_is_not_ok)
     _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)
     _check('I19 simple-baseline audit reports malformed records instead of crashing', t_simple_baseline_audit_malformed_records)

@@ -948,9 +948,13 @@ def audit_attribution(outdirs=None):
             continue
         panel = {}
         for key, r in summ.items():
-            if not (isinstance(r, dict) and r.get('variant')):
+            if not isinstance(r, dict):
                 continue
-            v = r['variant']
+            v = r.get('variant')
+            if not isinstance(v, str) or not v:
+                # The arm id is a dict key; a malformed/non-string id is not
+                # an arm and must be excluded instead of crashing the audit.
+                continue
             ent = panel.setdefault(v, {'n_records': 0, 'with_block_stats': 0, 'params': r.get('params'),
                                        'blocks_mean': [], 'block_len_mean': [], 'block_len_p95': []})
             ent['n_records'] += 1
@@ -1348,9 +1352,11 @@ def audit_failures(outdirs=None):
         by_arm = {}
         n_ok = {}
         for key, r in summ.items():
-            if not (isinstance(r, dict) and r.get('variant')):
+            if not isinstance(r, dict):
                 continue
-            v = r['variant']
+            v = r.get('variant')
+            if not isinstance(v, str) or not v:
+                continue
             if 'error' in r or r.get('status') in ('error', 'failed'):
                 by_arm.setdefault(v, []).append(str(r.get('error') or r.get('status'))[:80])
             elif L.ppl_is_usable(r.get('ppl')) and not r.get('synthesized'):
@@ -1687,7 +1693,12 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
         for key, r in summ.items():
             if not isinstance(r, dict):
                 continue
-            v = r.get('variant') or str(key).split('::')[0]
+            v = r.get('variant')
+            if v is None:
+                v = str(key).split('::')[0]
+            elif not isinstance(v, str) or not v:
+                # A non-string arm id is not a usable comparison key.
+                continue
             e = r.get('efficiency')
             if isinstance(e, dict) and e.get('status') == 'ok':
                 eff.setdefault(v, []).append(e)
