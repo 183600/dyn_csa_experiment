@@ -429,6 +429,18 @@ def t_scale_input_guards():
     assert si['n'] == 3 and si['n_input'] == 4 and si['n_dropped'] == 1, si
     assert si['complete_pairs'] is False and si['dropped_seeds'] == [11], si
     assert si['seeds'] == [10, 12, 13], si
+    # A caller-declared minimum-n floor is part of the claim, not just a label
+    # on the text.  n=6 reaches p=0.03125 but an explicit min_n=8 must keep
+    # the interaction-level `significant` flag false (the raw test flag stays
+    # visible for transparency).
+    und = L.scale_interaction([0.0] * 6, [1.0] * 6, seeds=list(range(6)),
+                              min_n=8)
+    assert und['n'] == 6 and abs(und['p_exact_signflip'] - 0.03125) < 1e-12, und
+    assert und['underpowered'] is True, und
+    assert und['significant_raw'] is True and und['significant'] is False, und
+    powered = L.scale_interaction([0.0] * 6, [1.0] * 6, seeds=list(range(6)),
+                                  min_n=6)
+    assert powered['significant'] is True and powered['significant_raw'] is True, powered
 
 
 def t_exact_signflip_baseline():

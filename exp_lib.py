@@ -10581,6 +10581,15 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
         else:
             diff.append(float('nan'))
     st = paired_effect_stats(diff, alpha=alpha, min_n=min_n, seeds=ss)
+    # `significant` on the underlying paired test only speaks about alpha and
+    # seed noise; it does not know this caller's declared minimum-n floor.  A
+    # n=6 interaction with min_n=8 can have p<0.05 and still be underpowered
+    # for the claim.  Keep the raw test flag for transparency, but make the
+    # interaction-level `significant` respect the same floor as claim_level.
+    _raw_sig = bool(st.get('significant'))
+    st['significant_raw'] = _raw_sig
+    st['significant'] = bool(_raw_sig and not st.get('underpowered')
+                             and not st.get('resolution_limited'))
     st.update({'low_label': str(low_label), 'high_label': str(high_label), 'seeds': kept,
                'seed_pairing': ('declared' if _seeds_declared else 'positional'),
                'convention': 'delta = effect_high - effect_low; positive = effect is larger at the higher scale',

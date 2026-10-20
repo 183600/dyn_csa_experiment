@@ -1517,3 +1517,12 @@ M0 的跨规模配对同时改为读取记录的**主估计量**：嵌套调参�
 符号翻转检验。它是依赖感知的敏感性读数，不替代异质性检验，也不改变
 DL 合并值的定义。这样「大模型上效应更大/更小」的合并区间不会被误读为
 独立重复实验的精度。
+
+### 29.7 交互检验的 `significant` 必须接受调用方的最低 n 门槛
+
+`scale_interaction` 的底层 `paired_effect_stats.significant` 只回答
+「p<alpha 且效应大于种子噪声」，不知道调用方声明的 `min_n`。因此 n=6、
+`min_n=8` 时它会返回 `significant=True`，与同一对象的
+`underpowered=True` 及 `claim_level` 文本矛盾。现在保留原始检验旗标
+`significant_raw`，但交互层 `significant` 同时要求未 underpowered 且未
+resolution-limited；调用方给出的最低 n 门槛不能再只停留在说明文字里。
