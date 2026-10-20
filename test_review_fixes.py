@@ -2859,6 +2859,11 @@ def t_metric_policy_checks_record_values():
     _rows_only.pop('nll_sum_holdout')
     _rows_only.pop('n_tokens_holdout')
     assert abs(L._pooled_ppl_from_records([_rows_only])[0] - math.exp(2.0)) < 1e-12
+    # The metric-policy audit must use those same holdout rows; falling back
+    # to the full-validation arrays would compare the holdout PPL against a
+    # different sample and flag a correct nested record.
+    assert L.metric_policy_audit({'v::seed0': _rows_only})['status'] == 'ok', \
+        L.metric_policy_audit({'v::seed0': _rows_only})
     # Missing holdout row arrays must not silently bootstrap full-validation rows.
     _miss_rows = dict(_nr)
     _miss_rows.pop('nll_per_row_holdout')

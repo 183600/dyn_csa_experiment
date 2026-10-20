@@ -13340,14 +13340,23 @@ def metric_policy_audit(summary=None, policy=None):
         _lm_bad = []
         _lm_checked = 0
         for _r in lm:
-            _nested_acc = (_r.get('ppl_estimation_rows') == 'nested_validation_holdout'
-                           and _r.get('nll_sum_holdout') is not None
-                           and _r.get('n_tokens_holdout') is not None)
-            _nll = _finite_scalar(_r.get('nll_sum_holdout') if _nested_acc else _r.get('nll_sum'))
-            _ntok = _exact_count(_r.get('n_tokens_holdout') if _nested_acc else _r.get('n_tokens'), minimum=1)
+            _nested = (_r.get('ppl_estimation_rows') == 'nested_validation_holdout')
+            # Never mix the full-validation totals with a holdout primary
+            # estimate.  If a nested record lacks either holdout total, use
+            # its holdout per-row arrays; only a record with no holdout
+            # accounting at all is treated as unverifiable here.
+            if _nested:
+                _nll = _finite_scalar(_r.get('nll_sum_holdout'))
+                _ntok = _exact_count(_r.get('n_tokens_holdout'), minimum=1)
+                if _nll is None or _ntok is None:
+                    _nll = _ntok = None
+            else:
+                _nll = _finite_scalar(_r.get('nll_sum'))
+                _ntok = _exact_count(_r.get('n_tokens'), minimum=1)
             if _nll is None or _ntok is None:
-                _rn = _r.get('nll_per_row')
-                _rt = _r.get('n_tokens_per_row')
+                _arrays = _primary_row_arrays(_r)
+                _rn, _rt = (_arrays if isinstance(_arrays, tuple)
+                            and len(_arrays) == 2 else (None, None))
                 if isinstance(_rn, (list, tuple)) and isinstance(_rt, (list, tuple)) and _rn and len(_rn) == len(_rt):
                     _vals = [_finite_scalar(x) for x in _rn]
                     _toks = [_exact_count(x, minimum=0) for x in _rt]
