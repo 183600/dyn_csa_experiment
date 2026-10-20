@@ -8640,6 +8640,24 @@ def by_len_cells(rows, Ln, variant=None):
             out.append(cell)
     return out
 
+def _validated_alpha(alpha, *, context='alpha'):
+    """A probability threshold must be a real number strictly inside (0, 1).
+
+    Booleans are flags, not thresholds; ``alpha=1.5`` would make every p-value
+    "significant" and ``alpha=0`` would make none reachable.  The claim and
+    multiplicity helpers all share this check so an invalid threshold cannot
+    silently change the wording of a result.
+    """
+    if isinstance(alpha, (bool, np.bool_)):
+        raise ValueError(f'{context} must be a real number in (0,1), got {alpha!r}')
+    try:
+        a = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'{context} must be a real number in (0,1), got {alpha!r}') from None
+    if not (0.0 < a < 1.0):
+        raise ValueError(f'{context} must be in (0,1), got {alpha!r}')
+    return a
+
 def holm_adjust(named_pvals, alpha=0.05):
     """Holm-Bonferroni step-down adjustment over a family of comparisons.
 
@@ -8649,6 +8667,7 @@ def holm_adjust(named_pvals, alpha=0.05):
     family 的定义必须由调用方预先声明（预注册的族用冻结清单，探索性的族
     明示「未预注册」），本函数只做数学，不做族的选择——族的选择正是
     多重比较问题的来源（design_notes §4/§17）。"""
+    alpha = _validated_alpha(alpha)
     fam = []
     invalid = {}
     _seen_names = set()
@@ -8695,6 +8714,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     over-claiming but cannot turn validation-selected v7-v11 panels into
     pre-registered confirmation (design_notes §17).
     """
+    alpha = _validated_alpha(alpha)
     pairs, omitted, tested = [], [], 0
     _tested_ns = []
     for k, v in (comparisons or {}).items():
@@ -8792,10 +8812,11 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     into a prohibition on *reporting* the number -- it only forbids the words
     "significant"/"confirmed" and records exactly why.
     """
+    alpha = _validated_alpha(alpha)
     out = {'allowed': False, 'level': 'unverifiable', 'reasons': [],
            'n': None, 'p_raw': None, 'p_holm': None, 'p_floor': None,
            'min_attainable_p_holm_family': None, 'min_n': int(min_n),
-           'alpha': float(alpha)}
+           'alpha': alpha}
     if not isinstance(stats, dict):
         out['reasons'].append('not a statistics dict')
         return out
@@ -8845,6 +8866,13 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             out['reasons'].append('no Holm-corrected p (family correction not attached)')
         elif not (out['p_holm'] < alpha):
             out['reasons'].append(f'Holm p {out["p_holm"]:.3g} is not < alpha={alpha}')
+        if (out['p_holm'] is not None and out['p_raw'] is not None
+                and math.isfinite(out['p_holm']) and math.isfinite(out['p_raw'])
+                and out['p_holm'] < out['p_raw'] - 1e-12):
+            out['reasons'].append(
+                'Holm p is smaller than the raw p; a step-down correction '
+                'cannot increase significance (mis-attached or fabricated '
+                'family correction)')
     try:
         if mean is None or std is None or not (abs(float(mean)) > float(std)):
             out['reasons'].append('|mean| <= std: effect is within seed noise')
@@ -9257,6 +9285,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     p-value can never dress up a sub-noise effect as a real improvement, while
     `resolution_limited` stops a small-n panel from being read as a negative
     result when only the test's granularity, not the data, bound the p."""
+    alpha = _validated_alpha(alpha)
     raw = list(deltas if deltas is not None else [])
     n_input = len(raw)
     d_vals, kept_pos, dropped_pos = [], [], []
