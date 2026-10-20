@@ -3477,6 +3477,18 @@ def t_nested_tuning_artifact_audit():
     bad3['arms']['a']['trials'][0]['selection_row_fp'] = 'OTHER'
     rb3 = L.baseline_tuning_audit(bad3, protocol=protocol)
     assert rb3['tuning_verified'] is False and any('selected on different rows' in p for p in rb3['problems']), rb3
+    # The trial must also record the SAME held-out fold the artifact will use
+    # for the final comparison.
+    bad_eval = json.loads(json.dumps(art))
+    bad_eval['arms']['a']['trials'][0]['evaluation_row_fp'] = 'OTHER'
+    rbe = L.baseline_tuning_audit(bad_eval, protocol=protocol)
+    assert rbe['tuning_verified'] is False and any('different evaluation fold' in p for p in rbe['problems']), rbe
+    # Extra final records outside the declared final-seed plan must not enlarge
+    # the effective n.
+    extra = json.loads(json.dumps(art))
+    extra['final_records']['a::seed99'] = dict(extra['final_records']['a::seed0'], seed=99)
+    rxe = L.baseline_tuning_audit(extra, protocol=protocol)
+    assert rxe['tuning_verified'] is False and any('undeclared seed' in p for p in rxe['problems']), rxe
 
     # More than two folds intentionally leaves unused blocks, so
     # `covers_all_rows=False` is correct and must not fail the nested gate.

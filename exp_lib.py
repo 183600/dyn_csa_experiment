@@ -13478,6 +13478,15 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                     if _t.get('selection_row_fp') != _expected_sel_fp:
                         problems.append(f'{_arm}: a tuning trial selected on different rows than the artifact declares')
                         break
+                    if _t.get('evaluation_row_fp') != _expected_eval_fp:
+                        # The trial's held-out fold must be the SAME fold the
+                        # final records are scored on; otherwise the artifact
+                        # can pair a selection fold with a different final
+                        # evaluation fold under one declared split.
+                        problems.append(
+                            f'{_arm}: a tuning trial declares a different evaluation '
+                            'fold than the artifact selection_row_split')
+                        break
         else:
             _row_split_applied = False
             _why = _split_info.get('reason') or 'the artifact did not apply the row split'
@@ -13863,6 +13872,15 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 _miss = sorted(_final_set - set(_seeds))
                 if _miss:
                     problems.append(f'{arm}: final records miss declared seeds {_miss}')
+                # The declared partition is the plan: a record for an
+                # UNDECLARED seed silently enlarges n and can make an
+                # underpowered contrast look resolvable.  Refuse it instead of
+                # treating extra records as if the plan had included them.
+                _extra = sorted(set(_seeds) - _final_set)
+                if _extra:
+                    problems.append(
+                        f'{arm}: final records include undeclared seed(s) {_extra}; '
+                        'the final partition is not the declared plan')
             for _k, r in hits:
                 hp = r.get('hyperparams') or {}
                 for _kn in ('lr', 'weight_decay', 'warmup'):
