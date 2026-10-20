@@ -11497,12 +11497,27 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             steps = _as_int(cfg['steps'], 'steps')
             batch = _as_int(cfg['batch_size'], 'batch_size')
             seq = _as_int(cfg['seq_len'], 'seq_len')
-            declared_tokens = _as_int(cfg.get('n_train_tokens') or 0, 'n_train_tokens')
+            # `or 0` would turn False/'' into a legal zero count, hiding a
+            # flag where an exact integer budget is required.
+            _tok_raw = cfg.get('n_train_tokens')
+            declared_tokens = _as_int(_tok_raw if _tok_raw is not None else 0,
+                                      'n_train_tokens')
             # Booleans are flags, not learning rates: float(True) == 1.0
             # would silently certify a shared LR transfer.
             lr = _finite_scalar(cfg.get('lr'))
-            warmup = _as_int(cfg.get('warmup') or 0, 'warmup')
-            seeds = [_as_int(s, 'seed') for s in (cfg.get('seeds') or [])]
+            _warm_raw = cfg.get('warmup')
+            warmup = _as_int(_warm_raw if _warm_raw is not None else 0, 'warmup')
+            _seeds_raw = cfg.get('seeds')
+            if _seeds_raw is None:
+                _seed_iter = []
+            elif isinstance(_seeds_raw, (str, bytes, dict)):
+                raise ValueError('seeds must be an iterable of integers')
+            else:
+                try:
+                    _seed_iter = list(_seeds_raw)
+                except TypeError:
+                    raise ValueError('seeds must be an iterable of integers') from None
+            seeds = [_as_int(s, 'seed') for s in _seed_iter]
         except (KeyError, TypeError, ValueError, OverflowError) as e:
             problems.append(f'{name}: incomplete scale cfg ({type(e).__name__}: {e})')
             continue

@@ -6634,6 +6634,14 @@ def t_scale_ladder_budget_and_transfer_audit():
     vc = tier('S2', 2000, 2000); vc['cfg']['vocab'] = True
     out6 = L.scale_ladder_audit([va, vc])
     assert out6['status'] == 'fail', out6
+    # A boolean budget/seed plan is a flag, not an integer; `or 0`/`or []`
+    # must not turn it into a valid zero.
+    for _field, _val in (('warmup', False), ('n_train_tokens', False),
+                         ('seeds', False), ('seeds', '0,1')):
+        _bt = tier('S1', 1000, 1000); _bt['cfg'][_field] = _val
+        _bo = L.scale_ladder_audit([_bt, b])
+        assert _bo['status'] == 'fail', (_bo, _field, _val)
+        assert any(_field in p for p in _bo['problems']), (_bo, _field, _val)
     # Boolean/non-finite learning rates must not be coerced to 1.0/NaN.
     for _bad_lr in (True, False, float('nan'), float('inf')):
         _bad = tier('S1', 1000, 1000); _bad['cfg']['lr'] = _bad_lr
