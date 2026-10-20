@@ -1404,18 +1404,24 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
     else:
         _note_comparison(label, st.get('p_exact_signflip'), family,
                          st.get('p_holm'), st.get('n'), st.get('mean'))
-    n = st.get('n') or 0
-    p = st.get('p_exact_signflip')
-    ph = st.get('p_holm')
-    mean, std = st.get('mean'), st.get('std')
+    n = _int_or(st.get('n'), 0)
+    p = _as_finite(st.get('p_exact_signflip'))
+    ph = _as_finite(st.get('p_holm'))
+    mean, std = _as_finite(st.get('mean')), _as_finite(st.get('std'))
     try:
-        if int(n) < int(min_n):
+        if n < int(min_n):
             return False
-        if p is None or not (float(p) < alpha):
+        # Booleans/non-finite values are not p-values, and a negative p must
+        # not pass every "< alpha" comparison.
+        if p is None or not (0.0 <= p < alpha):
             return False
-        if ph is None or not (float(ph) < alpha):
+        if ph is None or not (0.0 <= ph < alpha):
             return False
-        if mean is None or std is None or abs(float(mean)) <= float(std):
+        # Holm is a step-down correction: it can never make a raw p more
+        # significant.  Mirror exp_lib.reportable_claim's hard refusal.
+        if ph < p - 1e-12:
+            return False
+        if mean is None or std is None or abs(mean) <= std:
             return False
     except (TypeError, ValueError, OverflowError):
         return False

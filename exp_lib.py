@@ -8842,6 +8842,12 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     except (TypeError, ValueError, OverflowError):
         out['p_holm'] = None
     out['p_floor'] = signflip_p_floor(n) if n > 0 else None
+    # A p-value is a probability.  p=-0.1 would satisfy every strict "< alpha"
+    # comparison and could support a claim that no valid test produced.
+    if out['p_raw'] is not None and not (0.0 <= out['p_raw'] <= 1.0):
+        out['reasons'].append(f'raw p {out["p_raw"]!r} is outside [0,1]')
+    if out['p_holm'] is not None and not (0.0 <= out['p_holm'] <= 1.0):
+        out['reasons'].append(f'Holm p {out["p_holm"]!r} is outside [0,1]')
     # Complete-case significance is not the same as a complete paired panel.
     # If the caller's statistics record non-finite/missing pairs, the reported
     # n is the number that SURVIVED filtering; a claim over that subset can be

@@ -4126,6 +4126,16 @@ def t_reportable_claim_gate():
     assert fam['tested'] == 0, fam
 
 
+    # Probabilities outside [0,1] cannot support a claim, even when every
+    # strict "< alpha" comparison would accept a negative value.
+    bad_neg = dict(base, p_exact_signflip=-0.1, p_holm=-0.05)
+    assert L.reportable_claim(bad_neg)['allowed'] is False, L.reportable_claim(bad_neg)
+    assert BR._sig_gate(bad_neg, label='negative p demo') is False
+    # A Holm p below its raw p is a mis-attached family correction.
+    bad_holm = dict(base, p_exact_signflip=0.04, p_holm=0.02)
+    assert L.reportable_claim(bad_holm)['allowed'] is False, L.reportable_claim(bad_holm)
+    assert BR._sig_gate(bad_holm, label='holm order demo') is False
+
 def t_holm_family_resolution_ceiling():
     comps = {f'c{i}': {'n': 3, 'mean': -1.0, 'std': 0.2, 'p_exact_signflip': 0.25} for i in range(100)}
     fam = L.attach_holm(comps, family='100 exploratory contrasts')
