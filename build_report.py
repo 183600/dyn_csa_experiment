@@ -492,6 +492,19 @@ def _pair_reason(ra, rb):
             return f'unverifiable {_k} (only one record carries the corpus / evaluation-slice fingerprint)'
         if _ha and str(_pa) != str(_pb):
             return f'different {_k} ({str(_pa)[:12]}… vs {str(_pb)[:12]}…)'
+    # Matched initialization: same seed does not mean the two architectures
+    # consumed the same RNG before the shared trunk.  Mirror exp_lib.pair_reason
+    # so the report cannot pair a mismatched-init contrast that the statistics
+    # layer refuses.
+    _ia, _ib = ra.get('init_core_fp'), rb.get('init_core_fp')
+    _ha = _ia is not None and str(_ia) != ''
+    _hb = _ib is not None and str(_ib) != ''
+    if _ha != _hb:
+        return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
+    if _ha and str(_ia) != str(_ib):
+        return (f'different init_core_fp ({str(_ia)[:12]}… vs {str(_ib)[:12]}…): '
+                'the two arms did not start from the same shared-trunk initialization '
+                'despite the paired seed')
     bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
     if not bad:
         return None

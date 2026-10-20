@@ -4225,6 +4225,13 @@ def t_init_core_fingerprint_and_pair_gate():
     assert why is not None and 'init_core_fp' in why, why
     why = L.pair_reason(a, {k: v for k, v in b.items() if k != 'init_core_fp'})
     assert why is not None and 'unverifiable init_core_fp' in why, why
+    # The zero-GPU report builder's local pairing gate must mirror this field
+    # too; otherwise it can print a contrast the statistics layer refuses.
+    assert BR._pair_reason(a, b) is None, BR._pair_reason(a, b)
+    why = BR._pair_reason(a, dict(b, init_core_fp=fc))
+    assert why is not None and 'init_core_fp' in why, why
+    why = BR._pair_reason(a, {k: v for k, v in b.items() if k != 'init_core_fp'})
+    assert why is not None and 'unverifiable init_core_fp' in why, why
 
 
 def t_param_and_compute_control_detail():
