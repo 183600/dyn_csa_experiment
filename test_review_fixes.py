@@ -5574,6 +5574,114 @@ def t_par_watchdog_override_validation():
     assert par._norm(np.array([[1, 2]], dtype=np.int64)) == [[1, 2]]
 
 
+def t_methodology_gate_fail_closed_edges():
+    # The report's local Holm twin must use the same scalar contract as the
+    # library: a boolean is not a probability, and an invalid alpha is not a
+    # threshold.
+    for _p in (False, True, np.bool_(False), np.bool_(True), -0.1, 1.5, 'x'):
+        assert BR.holm_adjust([('a', _p), ('b', 0.02)])['a'] == 1.0, _p
+    for _bad in (True, np.bool_(True), 0, 1, -0.1, 1.5, float('nan')):
+        for _fn in (lambda a: BR.holm_adjust([('a', 0.01)], alpha=a),
+                    lambda a: BR.global_multiplicity_adjust([('a', 0.01)], alpha=a)):
+            try:
+                _fn(_bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'invalid alpha {_bad!r} accepted by a report twin')
+
+    # A descriptor present on only SOME seeds of an arm is not equality: the
+    # arm is unverifiable, and the fairness audit must fail instead of
+    # trusting the populated subset.
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    s = {}
+    for i in range(3):
+        s[f'a::seed{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1,
+                                tokens_seen=1, ppl=49.0, params=100,
+                                train_knobs=(dict(knobs) if i else None))
+        s[f'b::seed{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1,
+                                tokens_seen=1, ppl=50.0, params=100,
+                                train_knobs=knobs)
+    r = L.methodology_audit(s, design={'c': [('a', 'b', 'x')]}, baselines={},
+                            verbose=False)
+    cv = r['controlled_variables']['c']
+    assert cv['train_knobs_equal'] is False, cv
+    assert cv['partially_recorded'] == ['a'] and cv['controlled'] is False, cv
+    assert any('only on SOME seed records' in w for w in r['warnings']), r['warnings']
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'summary.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(s, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            fair = A.audit_fairness(path, arms=['a', 'b'])
+    assert fair['status'] == 'fail', fair
+    assert any('omit train_knobs' in p for p in fair['problems']), fair['problems']
+
+    # Full-factorial completeness fails closed on malformed or duplicated
+    # cells instead of dropping them and reporting a complete table.
+    base = {(): 'none', ('A',): 'A', ('B',): 'B', ('C',): 'C',
+            ('A', 'B'): 'AB', ('A', 'C'): 'AC', ('B', 'C'): 'BC',
+            ('A', 'B', 'C'): 'ABC'}
+    assert L.ablation_completeness_audit(arms_by_combo=base)['complete'] is True
+    dup = dict(base, **{'A+B': 'dup'})
+    r = L.ablation_completeness_audit(arms_by_combo=dup)
+    assert r['complete'] is False and r['duplicate_combos'], r
+    bad = dict(base)
+    bad[1] = 'x'
+    r = L.ablation_completeness_audit(arms_by_combo=bad)
+    assert r['complete'] is False and r['structural_errors'], r
+    bad = dict(base)
+    bad[('A', 'B', 'C')] = None
+    r = L.ablation_completeness_audit(arms_by_combo=bad)
+    assert r['complete'] is False and r['structural_errors'], r
+
+    # Wrapper gate parameters are validated even with no panels to audit.
+    for _bad in (True, 0, 1.5, float('nan')):
+        try:
+            A.audit_methodology(outdirs=[], alpha=_bad, write=False)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'audit_methodology accepted alpha={_bad!r}')
+    for _bad in (True, 3.5, -1, float('nan')):
+        try:
+            A.audit_methodology(outdirs=[], min_n=_bad, write=False)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'audit_methodology accepted min_n={_bad!r}')
+
+    # Scale pre-flight gates are not coerced either.
+    def _tier(name, steps, params):
+        cfg = {'steps': steps, 'batch_size': 2, 'seq_len': 8,
+               'n_train_tokens': steps * 16, 'lr': 3e-4, 'warmup': 10,
+               'seeds': [0, 1, 2, 3]}
+        return {'name': name, 'cfg': cfg, 'params': params}
+    for _bad in (True, -1.0, float('nan'), 'x'):
+        try:
+            L.scale_ladder_audit([_tier('a', 1000, 1000)], tolerance=_bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'scale_ladder_audit accepted tolerance={_bad!r}')
+    out = L.scale_ladder_audit(
+        [_tier('a', 1000, 1000), _tier('b', 2000, 2000)],
+        policy=dict(L.SCALE_TRANSFER_POLICY, family_m=True))
+    assert out['status'] == 'fail' and any('family_m' in p for p in out['problems']), out
+    pts = [{'label': f'd{d}', 'd': d, 'crossover_tokens': 1e6,
+            'train_tokens': 5e7} for d in (128, 256, 384, 512)]
+    for _kw in ({'min_points': True}, {'min_points': 1}, {'min_points': 3.5},
+                {'volume_tol': -0.1}, {'volume_tol': float('nan')},
+                {'d_spread_min': 1.0}, {'d_spread_min': True}):
+        try:
+            L.crossover_scaling_fit(pts, **_kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'crossover_scaling_fit accepted {_kw!r}')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -5787,6 +5895,7 @@ def main():
     _check('L21 attention backward partial head group', t_attention_backward_partial_head_group)
     _check('L22 parallel watchdog override validation', t_par_watchdog_override_validation)
     _check('L22b build report exact seed/parameter contracts', t_build_report_exact_seed_and_params)
+    _check('L23 methodology/scale gates fail closed on malformed inputs', t_methodology_gate_fail_closed_edges)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
