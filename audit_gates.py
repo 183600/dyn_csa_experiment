@@ -1072,6 +1072,16 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             return None
         return int(f) if math.isfinite(f) and f == math.floor(f) else None
 
+    def _hashable(value):
+        # Artifact cells are JSON, but a direct caller can supply a list/dict
+        # where a count/flag belongs.  Such a value is unverifiable and must
+        # become a recorded problem, not a TypeError from a set insert.
+        try:
+            hash(value)
+        except TypeError:
+            return ('__unhashable__', type(value).__name__, repr(value))
+        return value
+
     by_len = {}
     problems = []
     for key, r in raw.items():
@@ -1090,9 +1100,9 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 problems.append(f'{key}: L{Ln} cell is not a JSON object')
                 continue
             e = by_len.setdefault(Ln, {'n_tok': set(), 'eval_span': set(), 'truncated': set(), 'n_seq': set()})
-            e['n_tok'].add(c.get('n_tok'))
-            e['eval_span'].add(c.get('eval_span'))
-            e['truncated'].add(c.get('truncated'))
+            e['n_tok'].add(_exact_int(c.get('n_tok')))
+            e['eval_span'].add(_exact_int(c.get('eval_span')))
+            e['truncated'].add(_hashable(c.get('truncated')))
             for _field in ('n_tok', 'eval_span'):
                 if _exact_int(c.get(_field)) is None:
                     problems.append(

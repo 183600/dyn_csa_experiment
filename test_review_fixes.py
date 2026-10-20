@@ -4443,6 +4443,17 @@ def t_audit_length_rejects_unverifiable_counts():
                 'truncated': False, 'n_seq': True}}}}, f)
         r2 = A.audit_length(p)
         assert r2['status'] == 'fail', r2
+        # Non-hashable malformed cells must be a recorded failure, not an
+        # uncaught TypeError from inserting them into a comparison set.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'ppl': 30.0, 'n_tok': [1, 2], 'eval_span': {'bad': 1},
+                'truncated': [False], 'n_seq': 1}}}}, f)
+        r3 = A.audit_length(p)
+        assert r3['status'] == 'fail', r3
+        assert any('n_tok' in x for x in r3['problems']), r3
+        assert any('eval_span' in x for x in r3['problems']), r3
+        assert any('truncated' in x for x in r3['problems']), r3
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
