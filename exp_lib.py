@@ -11044,7 +11044,7 @@ HYPOTHESIS_DESIGN = {
         'mechanism': 'The loss term discourages degenerate block boundaries and keeps compression from collapsing to fixed chunks.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
-        'requires_param_match': False,
+        'requires_param_match': True,
         'falsifier': 'Zeroing the regularizer does not increase PPL beyond seed noise, or improves it.',
     },
     'task_learned_boundary': {
@@ -11079,7 +11079,7 @@ BASELINE_HYPOTHESIS_DESIGN = {
         'mechanism': 'Sparse compressed reads can preserve long-range access while the parameter-matched MLP keeps capacity equal.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
-        'requires_param_match': False,
+        'requires_param_match': True,
         'falsifier': 'A matched dense baseline matches or beats CSA after Holm correction, or the parameter matching fails.',
     },
 }

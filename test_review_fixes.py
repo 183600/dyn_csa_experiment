@@ -3281,6 +3281,10 @@ def t_hypothesis_audit_completeness_and_metric_alignment():
     good = L.hypothesis_audit(L.HYPOTHESIS_DESIGN, 'component')
     assert good['status'] == 'ok' and not good['invalid'], good
     assert 'dynamic_blocking' in good['hypotheses'], good
+    # Claims that promise matched capacity must say so; the loss-term
+    # ablation and the matched-dense baseline both do.
+    assert L.HYPOTHESIS_DESIGN['compression_regularizer']['requires_param_match'] is True
+    assert L.BASELINE_HYPOTHESIS_DESIGN['compression_vs_matched_dense']['requires_param_match'] is True
     bad_table = {
         'h0': {'statement': 'x', 'mechanism': 'y', 'predicted_sign': 0,
                'primary_metric': 'ndcg', 'falsifier': 'z'},
