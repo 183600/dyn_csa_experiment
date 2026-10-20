@@ -1904,15 +1904,19 @@ def sec_nan_diagnostics():
             d = rec.get('instability_diagnosis')
             if not isinstance(d, dict):
                 o = rec.get('opt_diag_summary')
-                if not isinstance(o, dict):
+                h = rec.get('curve_health') if isinstance(rec.get('curve_health'), dict) else {}
+                _hbad = str(h.get('status') or '') == 'nonfinite'
+                if not isinstance(o, dict) and not _hbad:
                     continue
-                n_loss = o.get('nonfinite_loss_steps') or 0
-                n_grad = o.get('nonfinite_grad_steps') or 0
-                guard = o.get('nan_guard') if isinstance(o.get('nan_guard'), dict) else {}
-                if not (n_loss or n_grad or guard.get('elements_cleaned')):
+                n_loss = (o or {}).get('nonfinite_loss_steps') or 0
+                n_grad = (o or {}).get('nonfinite_grad_steps') or 0
+                guard = (o or {}).get('nan_guard') if isinstance((o or {}).get('nan_guard'), dict) else {}
+                if not (n_loss or n_grad or guard.get('elements_cleaned') or _hbad):
                     continue
-                d = {'status': 'undiagnosed', 'primary_suspect': 'unknown',
-                     'summary': 'non-finite events are present but this record predates the triage path'}
+                d = {'status': 'undiagnosed',
+                     'primary_suspect': ('validation_curve_numerics' if _hbad else 'unknown'),
+                     'summary': ('validation curve is non-finite but this record predates the triage path'
+                                 if _hbad else 'non-finite events are present but this record predates the triage path')}
             elif d.get('status') == 'clean':
                 continue
             o = rec.get('opt_diag_summary') if isinstance(rec.get('opt_diag_summary'), dict) else {}

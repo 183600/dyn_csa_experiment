@@ -521,6 +521,8 @@ def diagnose_training_instability(record, *, data_checked=None):
     overflows = int(diag.get('amp_scaler_overflows') or 0)
     scale_min = diag.get('amp_scaler_scale_min')
     knobs = rec.get('train_knobs') if isinstance(rec.get('train_knobs'), dict) else {}
+    health = rec.get('curve_health') if isinstance(rec.get('curve_health'), dict) else {}
+    health_nonfinite = str(health.get('status') or '') == 'nonfinite'
     amp = rec.get('amp_dtype') or knobs.get('amp_dtype')
     grad_max = diag.get('grad_norm_max')
     try:
@@ -589,7 +591,15 @@ def diagnose_training_instability(record, *, data_checked=None):
         add('gradient_explosion_lr', 'not_observed',
             f'non-finite grad steps={n_grad}, max pre-clip grad={grad_max}', 'no action')
 
-    if not (n_loss or n_grad or guard_cleaned or bad_loss or bad_grad):
+    if health_nonfinite:
+        add('validation_curve_numerics', 'observed',
+            f'curve_health is nonfinite ({health.get("reason") or "no reason recorded"})',
+            'inspect the first non-finite validation point; a training-side loss can be finite while eval_ppl/its log or the per-document rows overflow')
+    else:
+        add('validation_curve_numerics', 'not_observed',
+            'no non-finite validation-curve point was recorded', 'no action')
+
+    if not (n_loss or n_grad or guard_cleaned or bad_loss or bad_grad or health_nonfinite):
         status = 'clean'
         primary = None
         summary = 'no non-finite loss/gradient or guarded attention value was recorded'
@@ -601,8 +611,8 @@ def diagnose_training_instability(record, *, data_checked=None):
     return {'status': status, 'summary': summary, 'primary_suspect': primary,
             'first_bad_step': first_bad, 'checks': checks,
             'recommended_order': ['data_nan_inf', 'forward_loss_numerics',
-                                  'attention_pool_nan_to_num', 'fp16_overflow',
-                                  'gradient_explosion_lr']}
+                                  'attention_pool_nan_to_num', 'validation_curve_numerics',
+                                  'fp16_overflow', 'gradient_explosion_lr']}
 
 
 def _safe_exp_ppl(x):
