@@ -403,7 +403,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
                         if (best_step is not None and last_step is not None) else None)
     actions = []
     if status == 'overfitting':
-        actions.append('add or strengthen regularization (weight decay / dropout) and/or increase unique training data')
+        actions.append('add or strengthen a wired regularizer (weight decay; the model has no dropout layer) and/or increase unique training data')
         actions.append('use the best-validation checkpoint or stop at best_step instead of reporting only the final step')
     elif status == 'underfitting_or_stalled':
         actions.append('verify the data pipeline (target shift, tokenizer/vocab mapping) before changing the model')

@@ -312,7 +312,7 @@ def t_training_health_actions_and_gap():
     h = L.classify_training_health(hist)
     assert h['status'] == 'overfitting', h
     assert h.get('actions'), h
-    assert any('regularization' in a for a in h['actions']), h
+    assert any('regularizer' in a for a in h['actions']), h
     assert h['gap_slope_per_step'] is not None and h['gap_slope_per_step'] > 0.0, h
     assert h['steps_since_best'] is not None and h['steps_since_best'] > 0, h
     assert any('best-validation' in a for a in h['actions']), h
