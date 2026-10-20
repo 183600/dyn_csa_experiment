@@ -362,6 +362,12 @@ def t_early_stop_decision():
             pass
         else:
             raise AssertionError(f'min_delta={bad_d!r} must be refused')
+    # A fractional/boolean step is not an evaluation identity: truncating it
+    # would merge two different eval points into one step.
+    fractional = L.early_stop_decision(
+        [{'step': 100, 'val_ppl': 50.0}, {'step': 100.5, 'val_ppl': 40.0}],
+        patience=1)
+    assert fractional['n_points'] == 1 and fractional['best_step'] == 100, fractional
 
 
 def t_nan_diagnosis_path():
@@ -412,6 +418,16 @@ def t_nan_diagnosis_path():
                              'events': []}})
     assert hbad['status'] == 'instability_observed', hbad
     assert hbad['primary_suspect'] == 'validation_curve_numerics', hbad
+    # A malformed/corrupt count field must neither crash the triage nor be
+    # silently read as a zero-event (clean) record.
+    malformed = L.diagnose_training_instability({
+        'opt_diag_summary': {'nonfinite_loss_steps': 1.5,
+                             'nonfinite_grad_steps': {'bad': 1},
+                             'amp_scaler_overflows': float('nan'),
+                             'nan_guard': {'elements_cleaned': 'many'}}})
+    assert malformed['status'] == 'unverifiable', malformed
+    assert malformed['primary_suspect'] == 'record_integrity', malformed
+    assert any(c['check'] == 'record_integrity' for c in malformed['checks']), malformed
 
 
 def t_token_error_cause_taxonomy():
@@ -6992,6 +7008,18 @@ def t_audit_training_health_records():
             json.dump({'d::s0': legacy}, f)
         r3 = A.audit_training_health(outdirs=[td])
         assert r3['status'] == 'warnings' and any('without triage' in x for x in r3['warnings']), r3
+        # A malformed event count is unknown, not zero: treating it as zero
+        # would let a corrupt record pass as clean.
+        malformed = {'curve_health': {'status': 'healthy'},
+                     'opt_diag_summary': {'nonfinite_loss_steps': 1.5,
+                                          'nonfinite_grad_steps': 0,
+                                          'nan_guard': {'elements_cleaned': 0}},
+                     'instability_diagnosis': {'status': 'clean'}}
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'m::s0': malformed}, f)
+        r4 = A.audit_training_health(outdirs=[td])
+        assert r4['status'] == 'fail' and any('unverifiable, not zero' in x
+                                              for x in r4['errors']), r4
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
@@ -9306,6 +9334,31 @@ def t_pool_kernel_empty_sequence_matches_eager():
     assert y2.shape == (1, 0, 3) and last2.shape == (1, 0) and Bm2 == 0, (y2.shape, last2.shape, Bm2)
 
 
+def t_pool_variable_blocks_accepts_no_overlap():
+    # `overlap=None` is the no-overlap/HCA contract.  `_pool_parts` then
+    # returns a four-tuple while `_pool_ordered` unpacks eight, so this public
+    # entry point used to raise a bare ValueError; it must return the exact
+    # single-lane pooling instead.
+    bid = torch.tensor([0, 0, 0, 1, 1, 2], dtype=torch.long)
+    n, F, cap = 6, 3, 8
+    Xa, Za = torch.randn(n, F), torch.randn(n, F)
+    Xb, Zb = torch.randn(n, F), torch.randn(n, F)
+    Bpa, Bpb = torch.randn(cap, F), torch.randn(cap, F)
+    got = L.pool_variable_blocks(Xa, Xb, Za, Zb, bid, Bpa, Bpb, None, n_blocks=3)
+    ref = L.pool_blocks_single(Xa, Za, Bpa, bid, n_blocks=3)
+    assert torch.allclose(got[0], ref[0]) and torch.equal(got[1], ref[1]) and got[2] == ref[2], got
+
+
+def t_efficiency_median_uses_both_middle_seeds():
+    # Four seeds: the median of 10, 20, 30, 100 is (20+30)/2, not the upper
+    # middle value 30.
+    rows = [{'variant': 'a', 'ppl': 10.0, 'prefill_ms_p50': l,
+             'params': p, 'tokens_seen': 100}
+            for l, p in ((10.0, 1000), (20.0, 2000), (30.0, 3000), (100.0, 4000))]
+    s = BR.efficiency_accuracy_summary(rows)[0]
+    assert s['latency_median'] == 25.0 and s['params_median'] == 2500.0, s
+    assert s['tokens_seen_median'] == 100.0, s
+
 
 def t_eager_batch_rejects_typos_and_nonfinite():
     assert L._normalise_eager_batch(None) is None
@@ -9722,6 +9775,8 @@ def main():
     _check('L40 archive refuses links and repo escape', t_archive_refuses_links_and_repo_escape)
     _check('L41 warmup table uses the primary estimand', t_build_report_warmup_uses_primary_estimand)
     _check('L42 empty-sequence pool kernel matches eager', t_pool_kernel_empty_sequence_matches_eager)
+    _check('L42b no-overlap pool accepts overlap=None', t_pool_variable_blocks_accepts_no_overlap)
+    _check('L42c efficiency medians average both middle seeds', t_efficiency_median_uses_both_middle_seeds)
     _check('L43 eager_batch rejects typos/non-finite values', t_eager_batch_rejects_typos_and_nonfinite)
     _check('L44 gapfill merge refreshes/invalidates seed-derived fields', t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields)
     _check('L45 open-block resume binds data fingerprints', t_open_block_resume_binds_data_fingerprints)

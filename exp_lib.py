@@ -341,12 +341,11 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         train_tol = val_tol = float(slope_tol)
     val_ppl_points = []
     for h in entries:
-        try:
-            st = int(h.get('step'))
-            vp = float(h.get('val_ppl'))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(vp) and vp > 0:
+        # An exact integer step: int(1.5)/int(True) would merge two different
+        # evaluations into one step and make best/last/steps-since-best lie.
+        st = _as_seed_int(h.get('step'))
+        vp = _finite_scalar(h.get('val_ppl'))
+        if st is not None and vp is not None and vp > 0:
             val_ppl_points.append((st, vp, h))
     best = min(val_ppl_points, key=lambda t: t[1]) if val_ppl_points else None
     last = val_ppl_points[-1] if val_ppl_points else None
@@ -476,12 +475,11 @@ def early_stop_decision(history, *, patience, min_delta=0.0):
     for p in (history if history is not None else []):
         if not isinstance(p, dict):
             continue
-        try:
-            step = int(p.get('step'))
-            ppl = float(p.get('val_ppl'))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(ppl) and ppl > 0.0:
+        # Steps are exact integers and Boolean/NaN PPLs are flags, not
+        # measurements; truncating 1.5 to step 1 would merge two eval points.
+        step = _as_seed_int(p.get('step'))
+        ppl = _finite_scalar(p.get('val_ppl'))
+        if step is not None and ppl is not None and ppl > 0.0:
             pts.append((step, ppl))
     best = None
     best_step = None
@@ -516,20 +514,54 @@ def diagnose_training_instability(record, *, data_checked=None):
     if not isinstance(diag, dict):
         diag = rec
     events = [e for e in (diag.get('events') or []) if isinstance(e, dict)]
-    n_loss = int(diag.get('nonfinite_loss_steps') or 0)
-    n_grad = int(diag.get('nonfinite_grad_steps') or 0)
+    malformed = []
+
+    def _count_field(source, key):
+        """Exact non-negative integer count, or flag a malformed field.
+
+        Training-record fields come from JSON/checkpoints and may be edited or
+        corrupted.  ``int("x")``/``int(nan)`` would crash the whole report; an
+        invalid value must also never be silently read as zero, which would
+        present a broken record as clean.
+        """
+        raw = source.get(key) if isinstance(source, dict) else None
+        if raw is None:
+            return 0
+        if isinstance(raw, (bool, np.bool_)):
+            malformed.append(f'{key}={raw!r}')
+            return 0
+        try:
+            f = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            malformed.append(f'{key}={raw!r}')
+            return 0
+        if not (math.isfinite(f) and f >= 0.0 and f == math.floor(f)):
+            malformed.append(f'{key}={raw!r}')
+            return 0
+        return int(f)
+
+    n_loss = _count_field(diag, 'nonfinite_loss_steps')
+    n_grad = _count_field(diag, 'nonfinite_grad_steps')
     first_bad = diag.get('first_bad_step')
-    guard = diag.get('nan_guard') if isinstance(diag.get('nan_guard'), dict) else {}
-    guard_cleaned = int(guard.get('elements_cleaned') or 0)
+    _guard_raw = diag.get('nan_guard')
+    if _guard_raw is not None and not isinstance(_guard_raw, dict):
+        malformed.append(f'nan_guard={_guard_raw!r}')
+    guard = _guard_raw if isinstance(_guard_raw, dict) else {}
+    guard_cleaned = _count_field(guard, 'elements_cleaned')
     guard_first = guard.get('first') if isinstance(guard.get('first'), dict) else None
-    overflows = int(diag.get('amp_scaler_overflows') or 0)
-    scale_min = diag.get('amp_scaler_scale_min')
+    overflows = _count_field(diag, 'amp_scaler_overflows')
+    _scale_raw = diag.get('amp_scaler_scale_min')
+    scale_min = _finite_scalar(_scale_raw)
+    if _scale_raw is not None and scale_min is None:
+        malformed.append(f'amp_scaler_scale_min={_scale_raw!r}')
     knobs = rec.get('train_knobs') if isinstance(rec.get('train_knobs'), dict) else {}
     health = rec.get('curve_health') if isinstance(rec.get('curve_health'), dict) else {}
     health_nonfinite = str(health.get('status') or '') == 'nonfinite'
     amp = rec.get('amp_dtype') or knobs.get('amp_dtype')
     grad_max = diag.get('grad_norm_max')
     try:
+        if isinstance(grad_max, (bool, np.bool_)):
+            raise TypeError
         grad_max = float(grad_max)
     except (TypeError, ValueError, OverflowError):
         grad_max = None
@@ -603,10 +635,25 @@ def diagnose_training_instability(record, *, data_checked=None):
         add('validation_curve_numerics', 'not_observed',
             'no non-finite validation-curve point was recorded', 'no action')
 
-    if not (n_loss or n_grad or guard_cleaned or bad_loss or bad_grad or health_nonfinite):
+    if malformed:
+        add('record_integrity', 'observed',
+            'malformed/ambiguous training-diagnostic field(s): ' + ', '.join(malformed[:8]),
+            'repair the record before treating its zero counts or health as evidence; '
+            'an invalid count is unknown, not zero')
+
+    _has_event = bool(n_loss or n_grad or guard_cleaned or bad_loss or bad_grad
+                      or health_nonfinite)
+    if not _has_event and not malformed:
         status = 'clean'
         primary = None
         summary = 'no non-finite loss/gradient or guarded attention value was recorded'
+    elif not _has_event:
+        # A malformed count field could hide an event.  Report the record as
+        # unverifiable (not clean) instead of reading the bad value as zero.
+        status = 'unverifiable'
+        primary = 'record_integrity'
+        summary = ('training-diagnostic record is malformed; its event counts '
+                   'cannot be read as zero')
     else:
         status = 'instability_observed'
         observed = [c for c in checks if c['status'] == 'observed']
@@ -2340,6 +2387,13 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
         # Empty sequence: no blocks to pool.  Keep the same return contract as
         # the non-empty path.
         return (Xa[:0], torch.empty(0, dtype=torch.long, device=dev), 0)
+    if overlap is None:
+        # No previous-block overlap (the HCA/no-overlap contract).  Delegate to
+        # the single-lane pooling rather than handing `_pool_parts` a key that
+        # returns only four parts while `_pool_ordered` unconditionally
+        # unpacks eight.  Xb/Zb and B_pos_b are not read on this path.
+        return pool_blocks_single(Xa, Za, B_pos_a, block_ids,
+                                  n_blocks=n_blocks, monotonic=monotonic)
     B = int(n_blocks) if n_blocks is not None else _n_blocks_cached(block_ids)
     order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
     if _ident:

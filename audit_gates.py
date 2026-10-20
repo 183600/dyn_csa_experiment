@@ -2001,8 +2001,14 @@ def audit_training_health(outdirs=None):
             elif status in ('overfitting', 'underfitting_or_stalled',
                             'validation_degrading', 'nonfinite'):
                 w.append(f'curve_health={status}')
-            diag = r.get('opt_diag_summary') if isinstance(r.get('opt_diag_summary'), dict) else {}
-            guard = diag.get('nan_guard') if isinstance(diag.get('nan_guard'), dict) else {}
+            _diag_raw = r.get('opt_diag_summary')
+            if _diag_raw is not None and not isinstance(_diag_raw, dict):
+                e.append(f'opt_diag_summary is not an object ({type(_diag_raw).__name__})')
+            diag = _diag_raw if isinstance(_diag_raw, dict) else {}
+            _guard_raw = diag.get('nan_guard')
+            if _guard_raw is not None and not isinstance(_guard_raw, dict):
+                e.append(f'nan_guard is not an object ({type(_guard_raw).__name__})')
+            guard = _guard_raw if isinstance(_guard_raw, dict) else {}
             def _nonneg(v):
                 if isinstance(v, (bool, np.bool_)):
                     return None
@@ -2013,9 +2019,22 @@ def audit_training_health(outdirs=None):
                 if not (math.isfinite(f) and f >= 0.0 and f == math.floor(f)):
                     return None
                 return int(f)
-            n_loss = _nonneg(diag.get('nonfinite_loss_steps')) or 0
-            n_grad = _nonneg(diag.get('nonfinite_grad_steps')) or 0
-            n_guard = _nonneg(guard.get('elements_cleaned')) or 0
+            def _count_field(source, key):
+                # Missing means zero events; a PRESENT but malformed count is
+                # unknown evidence and must fail closed rather than silently
+                # becoming zero (which would let a corrupt record look clean).
+                raw = source.get(key) if isinstance(source, dict) else None
+                if raw is None:
+                    return 0
+                value = _nonneg(raw)
+                if value is None:
+                    e.append(f'{key} is not a non-negative integer ({raw!r}); '
+                             'the non-finite event count is unverifiable, not zero')
+                    return 0
+                return value
+            n_loss = _count_field(diag, 'nonfinite_loss_steps')
+            n_grad = _count_field(diag, 'nonfinite_grad_steps')
+            n_guard = _count_field(guard, 'elements_cleaned')
             has_events = bool(n_loss or n_grad or n_guard)
             triage = r.get('instability_diagnosis')
             if isinstance(triage, dict):
@@ -2024,15 +2043,30 @@ def audit_training_health(outdirs=None):
                     e.append('instability_diagnosis says clean but non-finite events are recorded')
                 if status == 'nonfinite' and tstat == 'clean':
                     e.append('validation curve is non-finite but instability_diagnosis says clean')
+                if tstat == 'unverifiable':
+                    w.append('instability_diagnosis is unverifiable (malformed diagnostic record); '
+                             'non-finite counts/health cannot be treated as clean')
             elif has_events:
                 w.append('non-finite events without instability_diagnosis (legacy/unverified)')
             if status == 'nonfinite' and not isinstance(triage, dict):
                 w.append('non-finite validation curve without triage (legacy/unverified)')
             es = r.get('early_stop')
-            planned = r.get('steps')
-            done = r.get('steps_completed')
-            if isinstance(es, dict) and es.get('stopped'):
-                if isinstance(done, (int, float)) and isinstance(planned, (int, float)) and done >= planned:
+            if isinstance(es, dict) and bool(es.get('stopped')):
+                _budget = {}
+                for _key in ('steps_completed', 'steps'):
+                    _raw = r.get(_key)
+                    if _raw is None:
+                        continue
+                    _val = _nonneg(_raw)
+                    if _val is None:
+                        e.append(f'{_key} is not a non-negative integer ({_raw!r}); '
+                                 'the early-stop budget is unverifiable')
+                    else:
+                        _budget[_key] = _val
+                if len(_budget) < 2:
+                    w.append('early_stop.stopped without both steps_completed and '
+                             'planned steps; the completed budget is unverifiable')
+                elif _budget['steps_completed'] >= _budget['steps']:
                     w.append('early_stop.stopped is true but steps_completed >= planned steps')
             if w or e:
                 cells[key] = {'health': status, 'warnings': w, 'errors': e}

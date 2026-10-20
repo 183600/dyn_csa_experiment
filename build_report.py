@@ -1850,11 +1850,14 @@ def efficiency_accuracy_summary(items):
         toks = sorted({x['tok'] for x in vals if x['tok'] is not None})
         rows.append({'variant': v, 'n': n, 'ppl_mean': mean, 'ppl_std': std,
                      'ppl_sem': sem, 'ppl_min': min(pp),
-                     'latency_median': lats[len(lats) // 2],
-                     'params_median': (sorted(params)[len(params) // 2] if params else None),
+                     # np.median averages the two middle values for an even
+                     # number of seeds; indexing the sorted list's middle
+                     # element silently reported the upper median instead.
+                     'latency_median': float(np.median(lats)),
+                     'params_median': (float(np.median(params)) if params else None),
                      'peak_mem_max': (max(mems) if mems else None),
                      'tokens_seen_values': toks,
-                     'tokens_seen_median': (toks[len(toks) // 2] if toks else None)})
+                     'tokens_seen_median': (float(np.median(toks)) if toks else None)})
     if not rows:
         return []
     rows.sort(key=lambda r: (r['ppl_mean'], r['variant']))
