@@ -27,6 +27,7 @@ SHA-256 清单的固定归档**，可发布到任何只读位置（release 附�
 verify 独立于 make：任何拿到归档的人都能校验完整性。
 """
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -73,6 +74,34 @@ def _release_tag(tag):
             'letters, digits, dot, underscore or hyphen (max 64 chars, '
             'starting with a letter/digit)')
     return s
+
+
+_CACHE_PROVENANCE_PATTERNS = (
+    'meta*.json',          # legacy meta.json / train_meta.json
+    'test_meta*.json',     # tag-paired test metadata (test_meta_v2_*.json)
+    'tok*.json',           # persisted train tokenizer (tok_v5_*.json)
+    'test_tok*.json',      # persisted test tokenizer
+    '*.idsfp.json',        # id-cache content fingerprints
+)
+
+
+def _cache_provenance_files(cache_dir=None):
+    """Metadata/tokenizer files that make a corpus cache auditable.
+
+    The loaders write TAG-PAIRED names (``meta_v5_*.json``,
+    ``test_meta_v2_*.json``, ``tok_v5_*.json``).  The old fixed filename list
+    in ENV_FILES matched none of them, so a release could claim to pack cache
+    provenance while silently omitting every real metadata file.  Token-id
+    arrays are deliberately NOT packed here (they are large); their
+    fingerprints and the tokenizer identities are.
+    """
+    d = cache_dir or os.path.join(REPO, 'wt103_cache')
+    if not os.path.isdir(d):
+        return []
+    out = set()
+    for pat in _CACHE_PROVENANCE_PATTERNS:
+        out.update(glob.glob(os.path.join(d, pat)))
+    return sorted(p for p in out if os.path.isfile(p))
 
 
 def _sha256(path, chunk=1 << 20):
@@ -137,6 +166,7 @@ def _collect(dirs, include_ckpt=False):
         p = os.path.join(REPO, f)
         if os.path.exists(p):
             files.append(p)
+    files.extend(_cache_provenance_files())
     for f in ('results_lm_test/.freeze_lock.json',):
         p = os.path.join(REPO, f)
         if os.path.exists(p):

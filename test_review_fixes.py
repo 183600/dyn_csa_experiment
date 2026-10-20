@@ -7372,6 +7372,33 @@ def t_v12_binds_current_train_cache_to_frozen_stream():
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+
+def t_release_archive_packs_tagged_cache_provenance():
+    # The loaders write meta_v5_*.json / test_meta_v2_*.json / tok_v5_*.json;
+    # a fixed set of legacy filenames packed none of them.
+    import archive_release as AR
+    d = tempfile.mkdtemp(prefix='release_cache_meta_')
+    try:
+        for name in ('meta_v5_sl512_cap8000000_v8192_vs512.json',
+                     'test_meta_v2_sl4097_v8192_ns16.json',
+                     'tok_v5_sl512_cap8000000_v8192_vs512.json',
+                     'test_tok_v2_sl4097_v8192_ns16.json',
+                     'train_ids_v5_x.npy.idsfp.json',
+                     'train_ids_v5_x.npy', 'test_ids_v2_x.npy',
+                     'unrelated.txt'):
+            with open(os.path.join(d, name), 'w', encoding='utf-8') as f:
+                f.write('x')
+        got = {os.path.basename(p) for p in AR._cache_provenance_files(d)}
+        assert any(n.startswith('meta_v5_') for n in got), got
+        assert any(n.startswith('test_meta_v2_') for n in got), got
+        assert any(n.startswith('tok_v5_') for n in got), got
+        assert any(n.startswith('test_tok_v2_') for n in got), got
+        assert any(n.endswith('.idsfp.json') for n in got), got
+        assert not any(n.endswith('.npy') for n in got), got
+        assert 'unrelated.txt' not in got, got
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -7614,6 +7641,7 @@ def main():
     _check('L29 release tags cannot escape the archive directory', t_release_tag_cannot_escape_output_dir)
     _check('L30 missing id cache/sidecars is not a clean leakage audit', t_audit_leakage_missing_id_cache_is_not_ok)
     _check('L31 v12 binds the local train cache to the frozen train stream', t_v12_binds_current_train_cache_to_frozen_stream)
+    _check('L32 release archive packs tagged cache provenance', t_release_archive_packs_tagged_cache_provenance)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
