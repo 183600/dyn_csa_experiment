@@ -10503,7 +10503,9 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             batch = _as_int(cfg['batch_size'], 'batch_size')
             seq = _as_int(cfg['seq_len'], 'seq_len')
             declared_tokens = _as_int(cfg.get('n_train_tokens') or 0, 'n_train_tokens')
-            lr = float(cfg.get('lr'))
+            # Booleans are flags, not learning rates: float(True) == 1.0
+            # would silently certify a shared LR transfer.
+            lr = _finite_scalar(cfg.get('lr'))
             warmup = _as_int(cfg.get('warmup') or 0, 'warmup')
             seeds = [_as_int(s, 'seed') for s in (cfg.get('seeds') or [])]
         except (KeyError, TypeError, ValueError, OverflowError) as e:
@@ -10516,8 +10518,8 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             problems.append(f'{name}: n_train_tokens={declared_tokens} must be non-negative')
         if warmup < 0:
             problems.append(f'{name}: warmup={warmup} must be non-negative')
-        if not (math.isfinite(lr) and lr > 0):
-            problems.append(f'{name}: lr={lr!r} is not a positive finite number')
+        if lr is None or not (math.isfinite(lr) and lr > 0):
+            problems.append(f'{name}: lr={cfg.get("lr")!r} is not a positive finite number')
         effective_tokens = steps * batch * seq
         if declared_tokens > 0 and abs(effective_tokens - declared_tokens) > 0.01 * declared_tokens:
             problems.append(

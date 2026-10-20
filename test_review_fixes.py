@@ -4393,6 +4393,12 @@ def t_scale_ladder_budget_and_transfer_audit():
     vc = tier('S2', 2000, 2000); vc['cfg']['vocab'] = True
     out6 = L.scale_ladder_audit([va, vc])
     assert out6['status'] == 'fail', out6
+    # Boolean/non-finite learning rates must not be coerced to 1.0/NaN.
+    for _bad_lr in (True, False, float('nan'), float('inf')):
+        _bad = tier('S1', 1000, 1000); _bad['cfg']['lr'] = _bad_lr
+        _o = L.scale_ladder_audit([_bad, b])
+        assert _o['status'] == 'fail', (_o, _bad_lr)
+        assert any('lr=' in p for p in _o['problems']), _o
     out7 = L.scale_ladder_audit([va, tier('S2', 2000, 2000) | {'vocab': 32768}])
     assert out7['corpus_binding'].get('vocab') == 'shared', out7
 
