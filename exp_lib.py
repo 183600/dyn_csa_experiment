@@ -5560,6 +5560,9 @@ def _read_raw_rows(path):
 
 _IDS_FP_MEMO = {}
 _IDS_FP_MEMO_CAP = 4
+# Bump when the canonical hashing form changes so an old on-disk sidecar is
+# not trusted for a digest produced by a different algorithm.
+_IDS_FP_ALGO = 'int64-canonical-v2'
 
 def _array_file_path(arr):
     """Resolve the on-disk file backing a memmap (or a whole-file view of one).
@@ -5649,9 +5652,10 @@ def _ids_fp(train_ids):
     # Pure function of the token values, memoised on (data pointer, layout)
     # with a weak reference to the array: a dead entry can never alias a
     # recycled pointer, and large corpora are not retained by the cache.
-    # Same tokens in -> same digest out, always.  Sub-int32 storage (the
-    # uint16 FineWeb cache) is hashed through its canonical int32 form, so a
-    # corpus keeps the same fingerprint regardless of storage width.
+    # Same tokens in -> same digest out, always.  Every integer width up to
+    # 64 bit other than uint64 is hashed through its canonical int64 form, so
+    # a corpus keeps the same fingerprint regardless of storage width (the
+    # uint16 FineWeb cache, int32 views and int64 arrays all agree).
     import weakref as _weakref
     try:
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
@@ -5682,6 +5686,7 @@ def _ids_fp(train_ids):
             if ((int(_rec.get('size', -1)), int(_rec.get('mtime_ns', -1)),
                  int(_rec.get('ctime_ns', -1)), int(_rec.get('inode', -1))) == _stat
                     and isinstance(_rec.get('fp'), str)
+                    and _rec.get('algo') == _IDS_FP_ALGO
                     and _rec.get('dtype') == _tdtype
                     and tuple(_rec.get('shape') or ()) == _tshape):
                 _fp = _rec['fp']
@@ -5698,13 +5703,17 @@ def _ids_fp(train_ids):
             pass
     _h = hashlib.sha256()
     _arr = np.asarray(train_ids)
-    _widen = _arr.dtype in (np.dtype(np.uint8), np.dtype(np.uint16))
+    _kind = _arr.dtype.kind
+    # uint64 keeps its own width (values above int64_max have no canonical
+    # int64 representation); every other integer width is widened to int64.
+    _canon = (np.dtype(np.uint64) if (_kind == 'u' and _arr.dtype.itemsize == 8)
+              else np.dtype(np.int64) if _kind in 'iu' else None)
     _cs = 1 << 24
     for _off in range(0, len(_arr), _cs):
         _part = _arr[_off:_off + _cs]
-        if _widen:
-            _part = _part.astype(np.int32, copy=False)
-        elif not _part.flags.c_contiguous:
+        if _canon is not None:
+            _part = _part.astype(_canon, copy=False)
+        if not _part.flags.c_contiguous:
             _part = np.ascontiguousarray(_part)
         _h.update(memoryview(_part).cast('B'))
     _fp = _h.hexdigest()[:16]
@@ -5720,6 +5729,7 @@ def _ids_fp(train_ids):
         try:
             _rec_out = {'size': _stat[0], 'mtime_ns': _stat[1],
                         'ctime_ns': _stat[2], 'inode': _stat[3], 'fp': _fp,
+                        'algo': _IDS_FP_ALGO,
                         'dtype': np.dtype(np.asarray(train_ids).dtype).str,
                         'shape': [int(_x) for _x in np.shape(train_ids)]}
             atomic_write_json(_side, _rec_out)
@@ -9833,6 +9843,9 @@ def paired_log_ratio(with_values, without_values, seeds=None):
         raise ValueError('paired_log_ratio got duplicate seeds %r' % (ss,))
     effects, kept, dropped = [], [], []
     for s, a, b in zip(ss, wa, wb):
+        if isinstance(a, (bool, np.bool_)) or isinstance(b, (bool, np.bool_)):
+            dropped.append(s)
+            continue
         try:
             fa, fb = float(a), float(b)
         except (TypeError, ValueError, OverflowError):
@@ -9899,10 +9912,13 @@ def _scale_points(points):
             # and shrink every within-scale SE in meta_analyze_effects; this
             # must be a hard error, not silently "n looks larger".
             raise ValueError('scale point %r: duplicate seeds %r' % (label, seeds_kept))
-        try:
-            sc = float(scale)
-        except (TypeError, ValueError, OverflowError):
+        if isinstance(scale, (bool, np.bool_)):
             sc = float('nan')
+        else:
+            try:
+                sc = float(scale)
+            except (TypeError, ValueError, OverflowError):
+                sc = float('nan')
         # Vocab size is an exact count: reject non-integral numeric objects
         # instead of truncating them into a different tokenisation.
         vb = None if vocab is None else _as_seed_int(vocab)
@@ -10065,6 +10081,8 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
         raise ValueError('scale_interaction got duplicate seeds %r' % (ss,))
     diff, kept = [], []
     for s, x, y in zip(ss, a, b):
+        if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
+            continue
         try:
             fx, fy = float(x), float(y)
         except (TypeError, ValueError, OverflowError):
@@ -10461,6 +10479,8 @@ def loglog_regression(points, *, alpha=0.05):
             x, y, label = p[0], p[1], i
         else:
             continue
+        if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
+            continue
         try:
             fx, fy = float(x), float(y)
         except (TypeError, ValueError, OverflowError):
@@ -10578,6 +10598,8 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
         dur = e.get('d')
         tok = e.get('crossover_tokens')
         tr = e.get('train_tokens')
+        if any(isinstance(v, (bool, np.bool_)) for v in (dur, tok, tr)):
+            continue
         try:
             fd = float(dur)
             ftok = float(tok) if tok is not None else None

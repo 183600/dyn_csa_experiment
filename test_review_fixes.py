@@ -4603,6 +4603,18 @@ def t_exact_numeric_contracts_and_fingerprint():
                                      dtype=object)).tolist() == [False, True]
     assert L.duplicate_mask(np.array([[Fraction(1, 3)], [1 / 3]],
                                      dtype=object)).tolist() == [False, False]
+    # A corpus fingerprint is a function of token values, not storage width.
+    _toks = np.array([0, 1, 2, 250, 255], dtype=np.int64)
+    _fps = {L._ids_fp(_toks.astype(_dt)) for _dt in
+            (np.uint8, np.uint16, np.int32, np.int64)}
+    assert len(_fps) == 1, _fps
+    # Booleans are flags, not measurements, in the scale helpers too.
+    assert L.paired_log_ratio([True, 2.0], [2.0, 1.0])['n'] == 1
+    assert L.loglog_regression([(True, 2), (2, 4), (4, 8)])['n_points'] == 2
+    assert L.crossover_scaling_fit([{'d': True, 'crossover_tokens': 1,
+                                     'train_tokens': 1}])['status'] == 'insufficient_points'
+    assert math.isnan(L._scale_points([{'scale': True, 'effects': [1],
+                                        'seeds': [0]}])[0]['scale'])
 
 
 def t_batch_iter_minimal_corpus():
