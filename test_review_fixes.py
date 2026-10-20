@@ -897,6 +897,10 @@ def t_aggregate_seed_normalization():
         raise AssertionError('seed 0 and "0" are the same seed and must trip the ambiguous-duplicate guard, not be counted as n=2')
     except ValueError:
         pass
+    # Fractional/boolean seeds are not extra draws: exclude them rather than
+    # inflating n or emitting a non-integer seed in the panel summary.
+    assert L.aggregate({'x::seedbad': dict(base, seed=1.5)}) == {}
+    assert L.aggregate({'x::seedbad': dict(base, seed=True)}) == {}
 
 
 def t_audit_resolution_classification():

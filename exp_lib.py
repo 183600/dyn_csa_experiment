@@ -19416,6 +19416,11 @@ def aggregate(summary):
             continue
         if not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
             continue
+        # A non-integer seed has no draw identity.  Counting it as an extra
+        # seed would fabricate n (and pair it with no other reader).
+        if _as_seed_int(rec.get('seed')) is None:
+            print(f'[aggregate] WARNING: record {key!r} carries a non-integer seed ({rec.get("seed")!r}) — excluded from aggregation')
+            continue
         v = rec.get('variant')
         if v is None:
             v = str(key).split('::', 1)[0]
