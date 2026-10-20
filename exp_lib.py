@@ -13030,16 +13030,27 @@ def controlled_variables_report(recs, arms):
     }
 
 def _params_of_arm(recs, arm):
+    """The arm's parameter count, or None when it is not a single verified value.
+
+    Every measurable record of the arm must expose the SAME exact positive
+    count.  Returning the first record that happens to carry a matching value
+    would let one consistent seed hide a corrupted/different record elsewhere
+    in the same arm (the same fail-open shape as a one-sided breakdown).
+    """
+    vals = []
     for (v, _t, _s), r in recs.items():
         if v != arm:
             continue
         # Parameter counts are exact integers.  int(1.5) would silently turn a
         # corrupted count into a different, apparently valid one, and bool is
         # not a count.
-        p = _as_seed_int(r.get('params'))
-        if p is not None and p > 0:
-            return p
-    return None
+        p = _as_seed_int(r.get('params')) if isinstance(r, dict) else None
+        if p is None or p <= 0:
+            return None
+        vals.append(p)
+    if not vals or len(set(vals)) != 1:
+        return None
+    return vals[0]
 
 def _param_control(recs, a, b):
     """Relative parameter-count difference between two arms, and whether it is
@@ -13097,13 +13108,26 @@ def param_pair_reason(ra, rb, *, tolerance=0.01, require_breakdown=False):
     return None
 
 def _param_breakdown_of_arm(recs, arm):
+    """One arm-level breakdown, or None if the arm's records disagree / omit it.
+
+    A missing breakdown on any measurable record makes the capacity claim
+    unverifiable; selecting the first non-empty dict would silently ignore the
+    rest of the arm.
+    """
+    vals = []
     for (v, _t, _s), r in recs.items():
         if v != arm:
             continue
-        pb = r.get('param_breakdown')
-        if isinstance(pb, dict) and pb:
-            return pb
-    return None
+        pb = r.get('param_breakdown') if isinstance(r, dict) else None
+        if not isinstance(pb, dict) or not pb:
+            return None
+        vals.append(pb)
+    if not vals:
+        return None
+    first = vals[0]
+    if any(pb != first for pb in vals[1:]):
+        return None
+    return first
 
 def _param_control_detail(recs, a, b):
     """Capacity breakdown for a pair: total as well as non-embedding and

@@ -4412,6 +4412,27 @@ def t_param_and_compute_control_detail():
     od = L._param_control_detail(one, 'a', 'b')
     assert od['breakdown_one_sided'] is True and L._param_capacity_controlled(od) is None, od
     assert 'one record carries it' in L.param_pair_reason(one[('a', 'p', 0)], one[('b', 'p', 0)]), 'one-sided breakdown must fail closed'
+    # A single consistent seed must not hide a different/corrupted record of
+    # the same arm: the arm-level capacity verdict is unverifiable, not the
+    # first record's pass.
+    mixed = {('a', 'p', 0): {'params': 1000, 'param_breakdown': bd},
+             ('a', 'p', 1): {'params': 1200, 'param_breakdown': bd},
+             ('b', 'p', 0): {'params': 1000, 'param_breakdown': bd}}
+    assert L._params_of_arm(mixed, 'a') is None
+    assert L._param_control(mixed, 'a', 'b') == (None, None)
+    md = L._param_control_detail(mixed, 'a', 'b')
+    assert md['total_controlled'] is None, md
+    assert L._param_capacity_controlled(md) is None, md
+    mixed_bd = {('a', 'p', 0): {'params': 1000, 'param_breakdown': bd},
+                ('a', 'p', 1): {'params': 1000, 'param_breakdown': dict(bd, active=650)},
+                ('b', 'p', 0): {'params': 1000, 'param_breakdown': bd}}
+    assert L._param_breakdown_of_arm(mixed_bd, 'a') is None
+    assert L._param_capacity_controlled(L._param_control_detail(mixed_bd, 'a', 'b')) is None
+    partial = {('a', 'p', 0): {'params': 1000, 'param_breakdown': bd},
+               ('a', 'p', 1): {'params': 1000},
+               ('b', 'p', 0): {'params': 1000, 'param_breakdown': bd}}
+    assert L._param_breakdown_of_arm(partial, 'a') is None
+    assert L._param_capacity_controlled(L._param_control_detail(partial, 'a', 'b')) is None
     c = L._compute_control_detail(recs, 'a', 'b')
     assert c['compute_matched'] is False and c['more_compute_arm'] == 'b', c
     assert abs(c['time_ratio_a_over_b'] - 0.5) < 1e-12, c
