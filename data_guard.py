@@ -17,6 +17,11 @@ The rules encoded here are:
 * **Tests are sealed.**  Helpers here never inspect test labels to choose a
   split, imputation value, clip bound or scale factor.  Test data is only
   transformed with training statistics.
+* **Time windows can be purged.**  An optional ``purge``/embargo gap keeps
+  overlapping lookback windows from straddling a split boundary.
+* **Split first, then prepare.**  ``split_and_prepare`` performs the split
+  before fitting imputation/clipping/scaling, and the fitted preprocessor is
+  applied to the holdouts with ``transform`` only.
 
 The module also provides data-quality diagnostics for the failure modes that
 commonly invalidate a split: NaN/Inf, exact duplicates (within and across
@@ -33,20 +38,21 @@ import numpy as np
 
 __all__ = [
     'SPLIT_NAMES',
-    'chronological_split',
-    'chronological_split_indices',
-    'grouped_chronological_split',
-    'grouped_chronological_split_indices',
-    'split_indices',
-    'train_val_test_split',
-    'assert_no_split_leakage',
     'LeakageSafePreprocessor',
     'SafeScaler',
-    'prepare_features',
-    'fit_preprocessor',
-    'data_quality_report',
+    'assert_no_split_leakage',
     'categorical_shift_report',
+    'chronological_split',
+    'chronological_split_indices',
+    'data_quality_report',
     'duplicate_mask',
+    'fit_preprocessor',
+    'grouped_chronological_split',
+    'grouped_chronological_split_indices',
+    'prepare_features',
+    'split_and_prepare',
+    'split_indices',
+    'train_val_test_split',
 ]
 
 SPLIT_NAMES = ('train', 'val', 'test')
@@ -233,28 +239,73 @@ def _take(data, idx):
         return np.asarray(data)[idx]
 
 
+def _check_purge(purge):
+    """Validate a purge/embargo size (rows dropped before a holdout split)."""
+    if isinstance(purge, (bool, np.bool_)):
+        raise ValueError(f'purge must be a non-negative integer, got {purge!r}')
+    try:
+        purge = int(purge)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f'purge must be a non-negative integer, got {purge!r}') from None
+    if purge < 0:
+        raise ValueError(f'purge must be a non-negative integer, got {purge}')
+    return purge
+
+
+def _purge_tail(idx, purge):
+    """Drop ``purge`` trailing rows from train/val, leaving a real embargo gap.
+
+    The dropped rows belong to neither side.  Removing them from the *end* of
+    the earlier split keeps the held-out test slice intact, while the
+    remaining timestamps are still strictly ordered (train < val < test), so a
+    lookback window cannot overlap a row that is used for fitting.
+    """
+    if not purge:
+        return idx
+    out = {name: np.asarray(idx[name], dtype=np.int64) for name in SPLIT_NAMES}
+    for name in ('train', 'val'):
+        if out[name].size == 0:
+            continue
+        if out[name].size <= purge:
+            raise ValueError(
+                f'purge={purge} would leave the {name} split empty '
+                f'(only {out[name].size} rows); reduce purge or the split size')
+        out[name] = out[name][:-purge].copy()
+    return out
+
+
 def chronological_split_indices(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
-                                *, train_size=None, val_size=None, test_size=None):
+                                *, train_size=None, val_size=None, test_size=None,
+                                purge=0):
     """Contiguous, order-preserving train/val/test index arrays.
 
     Rows ``[0, n_train)`` train, the next block validates and the final block
     tests.  No shuffle and no resampling is performed, so the split is valid
     for time-series data (and is the safe default for generic data too).
+
+    ``purge`` drops that many trailing rows from train and validation, leaving
+    an embargo gap between the splits.  The dropped rows are returned in no
+    split; the test rows are untouched.  This prevents a feature window that
+    reaches across a boundary from seeing a row from the other split.
     """
+    purge = _check_purge(purge)
     n_train, n_val, n_test = _resolve_sizes(
         n, train_frac, val_frac, test_frac,
         train_size, val_size, test_size)
     train_end = n_train
     val_end = n_train + n_val
-    return {
+    idx = {
         'train': np.arange(0, train_end, dtype=np.int64),
         'val': np.arange(train_end, val_end, dtype=np.int64),
         'test': np.arange(val_end, val_end + n_test, dtype=np.int64),
     }
+    return _purge_tail(idx, purge)
 
 
 def chronological_split(data, train_frac=0.8, val_frac=0.1, test_frac=0.1,
-                        *, train_size=None, val_size=None, test_size=None):
+                        *, train_size=None, val_size=None, test_size=None,
+                        purge=0):
     """Split an array/sequence chronologically and return the three parts.
 
     ``data`` may be any object that supports integer indexing (NumPy array,
@@ -264,7 +315,8 @@ def chronological_split(data, train_frac=0.8, val_frac=0.1, test_frac=0.1,
     """
     idx = chronological_split_indices(
         len(data), train_frac, val_frac, test_frac,
-        train_size=train_size, val_size=val_size, test_size=test_size)
+        train_size=train_size, val_size=val_size, test_size=test_size,
+        purge=purge)
     return {name: _take(data, idx[name]) for name in SPLIT_NAMES}
 
 
@@ -397,14 +449,23 @@ def _group_order(groups, order=None):
 def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
                                         test_frac=0.1, *, order=None,
                                         train_size=None, val_size=None,
-                                        test_size=None):
+                                        test_size=None, purge=0):
     """Chronological split that assigns every group to exactly one side.
 
     Group order is the order of first appearance (or the minimum ``order``
     value, e.g. a timestamp).  Whole groups are consumed until the requested
     train size is reached, then whole groups fill validation, and the remainder
     goes to test.  A group is therefore never split across train/val/test.
+    ``purge`` is rejected here: dropping individual rows would break whole-
+    group assignment.  Remove/merge whole groups explicitly when an embargo is
+    required.
     """
+    purge = _check_purge(purge)
+    if purge:
+        raise ValueError(
+            'purge is not supported with grouped splits: it would drop rows '
+            'from a group and break whole-group assignment; remove whole '
+            'groups instead')
     n = int(n)
     groups = _as_1d(groups, 'groups', n)
     if groups.shape[0] != n:
@@ -413,9 +474,9 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
                              train_size, val_size, test_size)
     fast = _group_index_fast(groups, order)
     if fast is not None:
-        order_groups, first, members = fast
+        order_groups, _first, members = fast
     else:
-        order_groups, first = _group_order(groups, order)
+        order_groups, _first = _group_order(groups, order)
         members = {}
         for i, g in enumerate(groups.tolist()):
             members.setdefault(_group_key(g), []).append(i)
@@ -427,6 +488,15 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
             current += 1
         out[SPLIT_NAMES[current]].extend(int(i) for i in members[g])
     res = {name: np.asarray(sorted(v), dtype=np.int64) for name, v in out.items()}
+    # A requested non-empty split must not silently be empty.  An empty
+    # validation set is not a harmless corner case: selection/early stopping
+    # then has no legal data and callers are tempted to fall back to test.
+    for _name, _target in zip(SPLIT_NAMES, targets):
+        if _target > 0 and res[_name].size == 0:
+            raise ValueError(
+                f'grouped split has no rows for the requested {_name} split '
+                f'(target={_target}); the group sizes cannot satisfy the '
+                'requested fractions — change the split targets or merge groups')
     # Groups must be pairwise disjoint even if the caller supplied a target
     # that forced a large group to one side.
     _assert_index_and_group_disjoint(res, groups)
@@ -442,16 +512,19 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
 
 def grouped_chronological_split(data, groups, train_frac=0.8, val_frac=0.1,
                                 test_frac=0.1, *, order=None,
-                                train_size=None, val_size=None, test_size=None):
+                                train_size=None, val_size=None, test_size=None,
+                                purge=0):
     """Array-returning wrapper around :func:`grouped_chronological_split_indices`."""
     idx = grouped_chronological_split_indices(
         len(data), groups, train_frac, val_frac, test_frac, order=order,
-        train_size=train_size, val_size=val_size, test_size=test_size)
+        train_size=train_size, val_size=val_size, test_size=test_size,
+        purge=purge)
     return {name: _take(data, idx[name]) for name in SPLIT_NAMES}
 
 
 def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
-                  test_frac=0.1, train_size=None, val_size=None, test_size=None):
+                  test_frac=0.1, train_size=None, val_size=None, test_size=None,
+                  purge=0):
     """Unified leakage-safe split entry point.
 
     * ``groups`` given: whole-group chronological split (ordered by ``time``
@@ -460,12 +533,19 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
       contiguous split, so the returned arrays are the original row indices in
       chronological order.
     * neither: contiguous split in the input order (no shuffle).
+
+    ``purge`` is an optional embargo (in rows) that removes the tail of train
+    and validation from the returned indices, so overlapping windows cannot
+    straddle a split boundary.  It is refused for grouped data because rows of
+    a group must stay together.
     """
     n = int(n)
+    purge = _check_purge(purge)
     if groups is not None:
         return grouped_chronological_split_indices(
             n, groups, train_frac, val_frac, test_frac, order=time,
-            train_size=train_size, val_size=val_size, test_size=test_size)
+            train_size=train_size, val_size=val_size, test_size=test_size,
+            purge=purge)
     if time is not None:
         time = _as_1d(time, 'time', n)
         _assert_order_finite(time, name='time')
@@ -522,10 +602,11 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
             # [7, 6]) instead of time order.
             blocks.append(order[start:end].copy())
             start = end
-        return dict(zip(SPLIT_NAMES, blocks))
+        return _purge_tail(dict(zip(SPLIT_NAMES, blocks)), purge)
     return chronological_split_indices(
         n, train_frac, val_frac, test_frac,
-        train_size=train_size, val_size=val_size, test_size=test_size)
+        train_size=train_size, val_size=val_size, test_size=test_size,
+        purge=purge)
 
 
 def _group_key(value):
@@ -888,6 +969,63 @@ def prepare_features(X_train, X_val=None, X_test=None, **kwargs):
     return out
 
 
+def split_and_prepare(X, y=None, *, time=None, groups=None,
+                      train_frac=0.8, val_frac=0.1, test_frac=0.1,
+                      train_size=None, val_size=None, test_size=None,
+                      purge=0, preprocess=True, quality_report=False,
+                      quality_kwargs=None, **preprocessor_kwargs):
+    """Split first, then fit every preprocessing statistic on train only.
+
+    This is the fail-closed convenience entry point for the whole data path::
+
+        out = split_and_prepare(X, y, time=t, groups=g, purge=2)
+        Xtr, Xva, Xte = out['X']['train'], out['X']['val'], out['X']['test']
+
+    The train/val/test indices are produced before any imputation, clipping or
+    scaling.  ``LeakageSafePreprocessor`` is fitted on the training rows and
+    only ``transform`` is applied to validation/test, so no holdout mean,
+    variance, quantile or missing indicator can enter the fitted statistics.
+    Passing ``quality_report=True`` additionally runs
+    :func:`data_quality_report` on the raw table with the same split indices
+    (still train-only statistics for the outlier/shift reference).
+
+    Returns a dict with ``indices``, per-split ``X`` (and ``y``), the fitted
+    ``preprocessor`` (or ``None`` when ``preprocess=False``), and optionally
+    the ``quality`` report.
+    """
+    Xarr = _as_numeric_2d(X)
+    n = int(Xarr.shape[0])
+    yarr = None
+    if y is not None:
+        yarr = np.asarray(y)
+        if yarr.ndim == 0 or yarr.shape[0] != n:
+            raise ValueError(f'y has length {yarr.shape[0] if yarr.ndim else 1}, '
+                             f'expected {n}')
+    idx = split_indices(n, time=time, groups=groups,
+                        train_frac=train_frac, val_frac=val_frac,
+                        test_frac=test_frac, train_size=train_size,
+                        val_size=val_size, test_size=test_size, purge=purge)
+    raw_X = {name: _take(Xarr, idx[name]) for name in SPLIT_NAMES}
+    out = {'indices': idx, 'X': dict(raw_X)}
+    if yarr is not None:
+        out['y'] = {name: _take(yarr, idx[name]) for name in SPLIT_NAMES}
+    prep = None
+    if preprocess:
+        # fit_transform is used for the TRAIN rows only; holdouts are never
+        # passed to fit.
+        prep = LeakageSafePreprocessor(**preprocessor_kwargs).fit(raw_X['train'])
+        out['X'] = {name: prep.transform(raw_X[name]) for name in SPLIT_NAMES}
+        out['preprocessor'] = prep
+    else:
+        out['preprocessor'] = None
+    if quality_report:
+        kw = dict(quality_kwargs or {})
+        out['quality'] = data_quality_report(
+            Xarr, y=yarr, train_idx=idx['train'], val_idx=idx['val'],
+            test_idx=idx['test'], groups=groups, **kw)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Data-quality diagnostics
 # ---------------------------------------------------------------------------
@@ -997,6 +1135,8 @@ def _label_key(v):
 def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=None,
                         groups=None, clip_z=3.0, shift_threshold=0.5,
                         fail_on_nan_inf=True, fail_on_label_conflict=True,
+                        fail_on_nonfinite_labels=False,
+                        fail_on_label_shift=False,
                         fail_on_duplicate_rows=False, fail_on_outliers=False,
                         fail_on_shift=False):
     """Report the common data-cleaning failure modes before any fit.
@@ -1013,6 +1153,13 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     default).  Outliers, distribution shift and within-split duplicates are
     warnings unless the corresponding ``fail_on_*`` flag is enabled; callers
     that consciously accept them must record the waiver in their run metadata.
+
+    Label diagnostics include per-split missing/non-finite counts, exact-
+    duplicate label conflicts, a per-split label histogram, and the
+    train→validation/test categorical label shift (Jensen-Shannon).  Non-finite
+    labels and label shift are warnings by default; ``fail_on_nonfinite_labels``
+    and ``fail_on_label_shift`` turn them into hard failures.  The training
+    labels are the only reference distribution.
     """
     # A NaN/negative threshold silently disables the corresponding gate
     # (NaN compares False against everything), which is worse than an error.
@@ -1145,7 +1292,10 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                     'stay in one split')
         checks['group_overlap'] = group_cross
 
-    # Label noise on exact duplicate feature rows.
+    # Label noise / corruption.  A target is only valid if it is finite; a
+    # missing (None/NaN) target is reported separately from an Inf target,
+    # and the counts are broken down by split so a corrupted holdout cannot
+    # hide behind a clean overall total.
     if y is not None:
         y = np.asarray(y).reshape(-1)
         if y.shape[0] != n:
@@ -1157,12 +1307,23 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         nonfinite_labels = missing_labels - absent_labels
         checks['missing_labels'] = absent_labels
         checks['nonfinite_labels'] = nonfinite_labels
+        checks['missing_labels_by_split'] = {}
+        checks['nonfinite_labels_by_split'] = {}
+        for name, rows in split_rows.items():
+            _rows = np.asarray(rows, dtype=np.int64).reshape(-1).tolist()
+            checks['missing_labels_by_split'][name] = int(
+                sum(labels[i] is None and raw_labels[i] is None for i in _rows))
+            checks['nonfinite_labels_by_split'][name] = int(
+                sum(labels[i] is None and raw_labels[i] is not None for i in _rows))
         if absent_labels:
             warnings.append(f'{absent_labels} missing labels')
         if nonfinite_labels:
-            warnings.append(
-                f'{nonfinite_labels} non-finite labels (NaN/Inf); impute or '
-                'remove them before fitting')
+            _msg = (f'{nonfinite_labels} non-finite labels (NaN/Inf); impute '
+                    'or remove them before fitting')
+            if fail_on_nonfinite_labels:
+                hard_failures.append(_msg)
+            else:
+                warnings.append(_msg)
         by_row = {}
         for i, (k, lab) in enumerate(zip(keys, labels)):
             if lab is not None:
@@ -1176,11 +1337,46 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 hard_failures.append(_msg)
             else:
                 warnings.append(_msg)
-        vals, counts = np.unique(
-            [v for v in labels if v is not None], return_counts=True)
-        checks['label_distribution'] = {
-            str(v): int(c) for v, c in zip(vals.tolist(), counts.tolist())
+        # Stringify before counting so mixed/object label types cannot make
+        # np.unique raise (and so a numpy scalar and its Python twin count as
+        # one category).  This is an audit histogram, not a model input.
+        def _label_hist(values):
+            hist = {}
+            for v in values:
+                if v is not None:
+                    hist[str(v)] = hist.get(str(v), 0) + 1
+            return {k: hist[k] for k in sorted(hist)}
+        checks['label_distribution'] = _label_hist(labels)
+        checks['label_distribution_by_split'] = {
+            name: _label_hist([labels[i] for i in
+                               np.asarray(rows, dtype=np.int64).reshape(-1).tolist()])
+            for name, rows in split_rows.items()
         }
+        # Train -> holdout label shift.  The training labels define the
+        # reference distribution; validation/test labels are never pooled
+        # into it.  String identities keep the report well-defined for mixed
+        # categorical labels.
+        label_shift = {}
+        _train_lab = [str(labels[i]) for i in
+                      np.asarray(ref, dtype=np.int64).reshape(-1).tolist()
+                      if labels[i] is not None]
+        for name in ('val', 'test'):
+            _rows = np.asarray(split_rows[name], dtype=np.int64).reshape(-1).tolist()
+            if not _rows:
+                continue
+            _hold_lab = [str(labels[i]) for i in _rows if labels[i] is not None]
+            if not _train_lab or not _hold_lab:
+                continue
+            _sh = categorical_shift_report(_train_lab, _hold_lab)
+            label_shift[name] = _sh
+            if _sh['js_divergence'] > shift_threshold:
+                _msg = (f'{name} label shift: JS divergence '
+                        f"{_sh['js_divergence']:.3f} > {shift_threshold}")
+                if fail_on_label_shift:
+                    hard_failures.append(_msg)
+                else:
+                    warnings.append(_msg)
+        checks['label_distribution_shift_vs_train'] = label_shift
 
     # Outliers, using training quantiles/IQR only.
     Xt = X[ref]

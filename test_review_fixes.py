@@ -2812,6 +2812,121 @@ def t_public_exports_resolve():
         assert name in ns, f'{name} was not exported by a star-import'
 
 
+def t_split_and_prepare_fits_train_only():
+    # Holdout rows are extreme; if they influenced imputation or scaling the
+    # training centre/factor would move by >100x.  The one-call helper must
+    # split first and fit on train only.
+    X = np.array([[0.0, 1.0], [2.0, 1.0], [np.nan, 1.0],
+                  [1000.0, 1.0], [2000.0, 1.0], [3000.0, 1.0]])
+    out = L.split_and_prepare(X, train_frac=0.5, val_frac=0.25, test_frac=0.25,
+                              quality_report=True)
+    idx = out['indices']
+    assert [len(idx[k]) for k in ('train', 'val', 'test')] == [3, 1, 2], idx
+    prep = out['preprocessor']
+    st = prep.get_stats()
+    assert abs(st['features'][0]['center'] - 1.0) < 1e-12, st
+    # Every returned split is finite and equals an explicit transform of the
+    # raw split (no hidden global statistics).
+    for name in ('train', 'val', 'test'):
+        raw = X[idx[name]]
+        assert np.all(np.isfinite(out['X'][name])), (name, out['X'][name])
+        assert np.allclose(out['X'][name], prep.transform(raw)), name
+    assert prep.get_stats() == st, 'transform must not update fitted statistics'
+    assert out['quality']['n_train_reference'] == 3, out['quality']
+    # Preprocess=False still returns the raw chronological parts, and the
+    # optional quality report uses the same train reference.
+    raw = L.split_and_prepare(X, time=[5, 4, 3, 2, 1, 0], preprocess=False,
+                              train_frac=0.5, val_frac=0.25, test_frac=0.25)
+    assert raw['preprocessor'] is None
+    assert [len(raw['indices'][k]) for k in ('train', 'val', 'test')] == [3, 1, 2], raw['indices']
+    assert L.assert_no_split_leakage(raw['indices']['train'], raw['indices']['val'],
+                                     raw['indices']['test'],
+                                     time=np.array([5, 4, 3, 2, 1, 0])) is True
+
+
+def t_split_purge_embargo():
+    # Purge drops the tail of train and validation; the test slice is intact
+    # and no returned row straddles a boundary.
+    idx = L.chronological_split_indices(100, 0.7, 0.2, 0.1, purge=3)
+    assert [len(idx[k]) for k in ('train', 'val', 'test')] == [67, 17, 10], idx
+    assert idx['train'][-1] == 66 and idx['val'][0] == 70 and idx['val'][-1] == 86
+    assert idx['test'][0] == 90
+    L.assert_no_split_leakage(idx['train'], idx['val'], idx['test'],
+                              time=np.arange(100))
+    t = np.arange(100)[::-1]
+    ti = L.split_indices(100, time=t, train_frac=0.7, val_frac=0.2,
+                         test_frac=0.1, purge=2)
+    assert [len(ti[k]) for k in ('train', 'val', 'test')] == [68, 18, 10], ti
+    assert np.max(t[ti['train']]) < np.min(t[ti['val']])
+    assert np.max(t[ti['val']]) < np.min(t[ti['test']])
+    L.assert_no_split_leakage(ti['train'], ti['val'], ti['test'], time=t)
+    # Purging more rows than a split contains is a hard error, not an empty
+    # split that would silently make validation unusable.
+    for bad in (-1, 1.5, True, '2'):
+        try:
+            L.chronological_split_indices(10, purge=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'purge={bad!r} must be rejected')
+    try:
+        L.chronological_split_indices(10, purge=5)
+    except ValueError as e:
+        assert 'empty' in str(e), e
+    else:
+        raise AssertionError('an over-large purge must not empty a split')
+    # A grouped split cannot drop individual rows without breaking groups.
+    try:
+        L.split_indices(10, groups=np.arange(10), purge=1)
+    except ValueError as e:
+        assert 'grouped' in str(e), e
+    else:
+        raise AssertionError('purge with groups must be refused')
+
+
+def t_group_split_refuses_empty_requested_side():
+    # One huge group consumes the whole table; a requested validation split
+    # would be empty.  Fail instead of returning it and inviting test tuning.
+    try:
+        L.grouped_chronological_split_indices(10, np.zeros(10, dtype=int),
+                                              0.8, 0.1, 0.1)
+    except ValueError as e:
+        assert 'no rows for the requested val split' in str(e), e
+    else:
+        raise AssertionError('an empty requested validation split must fail')
+    # Explicit zero targets are allowed to be empty.
+    idx = L.grouped_chronological_split_indices(10, np.zeros(10, dtype=int),
+                                                1.0, 0.0, 0.0)
+    assert len(idx['train']) == 10 and len(idx['val']) == len(idx['test']) == 0
+
+
+def t_label_shift_and_split_counts():
+    X = np.arange(12, dtype=float).reshape(6, 2)
+    # Non-finite labels are counted per split; fail_on_nonfinite_labels turns
+    # a corrupted target into a hard failure (off by default for legacy use).
+    y = [0, 0, 1, 1, np.inf, 2]
+    rep = L.data_quality_report(X, y=y, train_idx=[0, 1], val_idx=[2, 3],
+                                test_idx=[4, 5])
+    assert rep['checks']['nonfinite_labels'] == 1, rep
+    assert rep['checks']['nonfinite_labels_by_split']['test'] == 1, rep
+    assert rep['checks']['nonfinite_labels_by_split']['train'] == 0, rep
+    assert rep['status'] == 'warnings', rep
+    rep_fail = L.data_quality_report(X, y=y, train_idx=[0, 1], val_idx=[2, 3],
+                                     test_idx=[4, 5],
+                                     fail_on_nonfinite_labels=True)
+    assert rep_fail['status'] == 'fail', rep_fail
+    # A complete label-distribution reversal is reported against the training
+    # reference and can be made a hard gate.
+    X2 = np.arange(12, dtype=float).reshape(6, 2)
+    y2 = [0, 0, 0, 1, 1, 1]
+    rep2 = L.data_quality_report(X2, y=y2, train_idx=[0, 1, 2],
+                                 val_idx=[3, 4, 5], fail_on_label_shift=True)
+    shift = rep2['checks']['label_distribution_shift_vs_train']['val']
+    assert shift['js_divergence'] > 0.5, rep2
+    assert rep2['status'] == 'fail', rep2
+    assert rep2['checks']['label_distribution_by_split']['train'] == {'0': 3}, rep2
+
+
 def t_sample_tokens_uniform_rejection():
     # Force the scale-safe rejection path even on tiny arrays.  The sample must
     # remain a uniform without-replacement draw; taking the smallest CAP of a
@@ -3425,6 +3540,10 @@ def main():
     _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)
     _check('I19 simple-baseline audit reports malformed records instead of crashing', t_simple_baseline_audit_malformed_records)
     _check('I20 index aliasing, non-finite labels, signed-zero duplicates, undefined SMD, NaT groups', t_data_guard_index_label_and_shift_edges)
+    _check('I21 split-and-prepare fits preprocessing on train only', t_split_and_prepare_fits_train_only)
+    _check('I22 purge/embargo keeps window boundaries sealed', t_split_purge_embargo)
+    _check('I23 grouped split refuses an empty requested side', t_group_split_refuses_empty_requested_side)
+    _check('I24 label shift and per-split label corruption counts', t_label_shift_and_split_counts)
     # Open-block reading rule: the substantive gates (causality, reference
     # pooling, masks, edge cases, closed regression) live in test_open_block.py
     # so they can also be run on their own.

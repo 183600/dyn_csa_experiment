@@ -57,9 +57,10 @@ import numpy as np
 from data_guard import (
     chronological_split, chronological_split_indices,
     grouped_chronological_split, grouped_chronological_split_indices,
-    split_indices, train_val_test_split, assert_no_split_leakage,
-    LeakageSafePreprocessor, SafeScaler, prepare_features, fit_preprocessor,
-    data_quality_report, categorical_shift_report, duplicate_mask,
+    split_indices, split_and_prepare, train_val_test_split,
+    assert_no_split_leakage, LeakageSafePreprocessor, SafeScaler,
+    prepare_features, fit_preprocessor, data_quality_report,
+    categorical_shift_report, duplicate_mask,
 )
 import torch
 import torch.nn as nn
@@ -5770,8 +5771,26 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                                            ranges_trusted=_fast)
         if meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget':
             _problems.append('cache does not attest the frozen train-prefix tokenizer fit')
-        if not isinstance(meta.get('dedup'), dict):
+        _dd_meta = meta.get('dedup')
+        if not isinstance(_dd_meta, dict):
             _problems.append('cache does not attest whole-document exact/near duplicate filtering')
+        else:
+            # Validation is used for every model-selection decision, so it is
+            # not enough that the *documents* are disjoint: exact/near copies
+            # of a training document must also have been removed from
+            # validation at build time.  A cache that does not record this
+            # cannot prove the selection split is uncontaminated.
+            _vc = _dd_meta.get('validation_cleanup')
+            if (not isinstance(_vc, dict)
+                    or _vc.get('policy') != 'validation_docs_deduped_against_fit_and_train'):
+                _problems.append(
+                    'cache does not attest exact/near-duplicate cleanup of the '
+                    'validation split against the tokenizer-fit and training documents')
+            _vs = (_dd_meta.get('splits') or {}).get('validation')
+            if not isinstance(_vs, dict) or not {'exact', 'near'} <= set(_vs):
+                _problems.append(
+                    'cache does not record validation duplicate-removal counts '
+                    '(exact/near)')
         # Document ids are the group identity.  When the cache carries them,
         # prove the groups are disjoint instead of trusting the build-time
         # deduplicator; a sidecar pair that disagrees with the metadata is a
@@ -5990,7 +6009,17 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             'disjoint': True,
             'policy': 'whole_document_exact_and_near_duplicate_filtered',
         },
-        'dedup': {'fit': _fit_dedup, 'splits': _dedup_by_split},
+        'dedup': {
+            'fit': _fit_dedup,
+            'splits': _dedup_by_split,
+            'policy': 'exact_and_near_duplicate_documents_filtered_across_fit_train_validation',
+            'near_hamming_threshold': int(_dedup.near_threshold),
+            'validation_cleanup': {
+                'policy': 'validation_docs_deduped_against_fit_and_train',
+                'exact_removed': int(_dedup_by_split.get('validation', {}).get('exact', 0)),
+                'near_removed': int(_dedup_by_split.get('validation', {}).get('near', 0)),
+            },
+        },
         'group_isolation': 'whole_documents_exact_and_near_duplicate_filtered',
         'train_tokens': int(len(train_ids)),
         'val_sequences': int(val_batch.shape[0]),
@@ -6804,6 +6833,13 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             if (meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget'
                     or meta.get('tokenizer_fit_docs_in_train_prefix') is not True):
                 _problems.append('cache does not attest a tokenizer fit inside the training prefix')
+            _dd_meta = meta.get('dedup')
+            _vc = _dd_meta.get('validation_cleanup') if isinstance(_dd_meta, dict) else None
+            if (not isinstance(_vc, dict)
+                    or _vc.get('policy') != 'validation_docs_deduped_against_fit_and_train'):
+                _problems.append(
+                    'cache does not attest exact/near-duplicate cleanup of the '
+                    'validation split against the tokenizer-fit and training documents')
             if _problems:
                 _cache_warning('FineWeb train/validation split', _problems)
             else:
@@ -7036,6 +7072,11 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 'fit': dict(_skipped['fit']),
                 'train': dict(_skipped['train']),
                 'validation': dict(_skipped['validation']),
+                'validation_cleanup': {
+                    'policy': 'validation_docs_deduped_against_fit_and_train',
+                    'exact_removed': int(_skipped['validation'].get('exact', 0)),
+                    'near_removed': int(_skipped['validation'].get('near', 0)),
+                },
                 **{'simhash_'+k: v for k, v in _dedup.stats().items() if k.startswith('near_') or k == 'policy'},
             },
             'local_source_sig': _local_sig,
