@@ -281,9 +281,7 @@ def _rec_by_cell(summary, run_fingerprint=None):
             continue
         if run_fingerprint is not None and rec.get('run_fingerprint') != run_fingerprint:
             continue
-        if (isinstance(rec.get('ppl'), bool)
-                or not isinstance(rec.get('ppl'), (int, float))
-                or not math.isfinite(float(rec['ppl'])) or float(rec['ppl']) <= 0.0):
+        if not L.ppl_is_usable(rec.get('ppl')):
             continue
         v, _, s = key.partition('::seed')
         try:
@@ -416,8 +414,7 @@ def _controlled_reason(a, b):
 def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     summary = _load_summary(outdir)
     _fps = {rec.get('run_fingerprint') for rec in summary.values()
-            if isinstance(rec, dict) and isinstance(rec.get('ppl'), (int, float))
-            and math.isfinite(float(rec.get('ppl')) or float('nan'))}
+            if isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl'))}
     _fps.discard(None)
     if len(_fps) > 1:
         raise SystemExit(

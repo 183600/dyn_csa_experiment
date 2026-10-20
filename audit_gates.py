@@ -1051,12 +1051,16 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
         print(json.dumps(out, ensure_ascii=False))
         return out
     L = _import_exp_lib()
+    import numpy as np
     by_len = {}
     problems = []
     for key, r in raw.items():
         if not isinstance(r, dict):
             continue
         for k, c in (r.get('by_len') or {}).items():
+            if isinstance(k, (bool, np.bool_)):
+                problems.append(f'{key}: by_len key {k!r} is not an integer length')
+                continue
             try:
                 Ln = int(k)
             except (TypeError, ValueError, OverflowError):
@@ -1095,6 +1099,10 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                         problems.append(f'{key}: L{Ln} n_tok={_nt} != n_seq*(L-1)={_ns * (Ln - 1)} — the cell did not score one next-token target per row')
             if 'truncated' not in c:
                 problems.append(f'{key}: L{Ln} cell has NO `truncated` flag — a missing truncation marker is treated as unverifiable, not as a full-length measurement')
+            elif not isinstance(c.get('truncated'), (bool, np.bool_)):
+                # An explicit null/string is just as unverifiable as a missing
+                # flag; only a real boolean False certifies a full-length cell.
+                problems.append(f'{key}: L{Ln} cell has a non-boolean `truncated` value {c.get("truncated")!r} — unverifiable, not a full-length measurement')
             elif c.get('truncated'):
                 problems.append(f'{key}: L{Ln} cell is marked truncated — it must not enter cross-length means')
     out = {'status': 'ok', 'by_length': {}}

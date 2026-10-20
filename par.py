@@ -27,6 +27,8 @@ import tempfile
 import time
 import traceback
 
+import numpy as np
+
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(REPO, "par_jobs")
@@ -193,6 +195,14 @@ def _norm(obj):
                 value, sort_keys=True, default=str
             ),
         )
+    # NumPy scalars are not instances of the builtin int/float classes, but
+    # they are ordinary JSON numbers; converting them to str would silently
+    # turn a seed/count into a string in the child job file.  The same applies
+    # to a 0-d array (and to small arrays used as job payloads).
+    if isinstance(obj, np.generic):
+        return _norm(obj.item())
+    if isinstance(obj, np.ndarray):
+        return _norm(obj.tolist())
     if isinstance(obj, (str, int, float, bool)) or obj is None:
         return obj
     return str(obj)

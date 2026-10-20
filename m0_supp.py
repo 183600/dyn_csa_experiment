@@ -577,9 +577,8 @@ def _ppl_by_seed(summary, variant):
             continue
         if not L.ppl_is_usable(rec.get('ppl')):
             continue
-        try:
-            seed = int(rec.get('seed'))
-        except (TypeError, ValueError, OverflowError):
+        seed = L._as_seed_int(rec.get('seed'))
+        if seed is None:
             continue
         if seed in out:
             # aggregate would reject this; keep the analysis explicit too.

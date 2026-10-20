@@ -1065,6 +1065,15 @@ def _by_len_shape_reason(rec, n_seq):
             _ntok_f = float('nan')
         if not math.isfinite(_ntok_f) or _ntok_f != math.floor(_ntok_f) or int(_ntok_f) != _want:
             return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {n_seq} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
+        # A cell that does not explicitly certify full length is unverifiable.
+        # Matching n_tok alone cannot distinguish a full cell from a record
+        # whose truncation marker was lost when it was serialised.
+        if 'truncated' not in _c:
+            return f'by_len[{_ln_i}] has no `truncated` flag — an unverifiable cell is not admissible'
+        if not isinstance(_c.get('truncated'), (bool, np.bool_)):
+            return f'by_len[{_ln_i}].truncated={_c.get("truncated")!r} is not a boolean — an unverifiable cell is not admissible'
+        if bool(_c.get('truncated')):
+            return f'by_len[{_ln_i}] is marked truncated — a partial cell is not admissible'
     return None
 
 
@@ -1435,7 +1444,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             for r in rows:
                 bl = r.get('by_len') or {}
                 c = bl.get(Ln, bl.get(str(Ln)))
-                if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')):
+                if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')):
                     _by_seed[r.get('seed')] = float(c['ppl'])
                     _nll_f = L._finite_scalar(c.get('nll_sum'))
                     _nt_i = _record_int(c.get('n_tok'))
@@ -1474,7 +1483,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         def _cell_ppl(rec):
             bl = rec.get('by_len') or {}
             c = bl.get(Ln, bl.get(str(Ln)))
-            return float(c['ppl']) if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')) else None
+            return float(c['ppl']) if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')) else None
         dl = []
         usable = []
         dropped = []
@@ -1973,7 +1982,8 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
             _records[f'{arm}::s{s}'] = {
                 'variant': arm, 'seed': int(s), 'split': 'test',
                 'by_len': {str(Ln): {'ppl': 100.0, 'n_tok': int(_nseq) * int(Ln - 1),
-                                     'n_seq': int(_nseq), 'ppl_per_seq': [100.0] * int(_nseq)}
+                                     'n_seq': int(_nseq), 'ppl_per_seq': [100.0] * int(_nseq),
+                                     'truncated': False}
                            for Ln in _lens},
                 'data_fp': 'plan-test-slice-fp', 'train_fp': 'plan-train-fp',
                 '_code': L.code_stamp(), 'manifest_sha256': m.get('manifest_sha256'),

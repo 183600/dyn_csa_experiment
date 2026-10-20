@@ -499,12 +499,17 @@ def _group_order(groups, order=None):
         raise ValueError('order must be a 1-D array with one value per row')
     _assert_order_finite(order)
     key = {}
-    for i, g in enumerate(groups.tolist()):
-        g = _group_key(g)
-        v = order[i]
-        if g not in key or v < key[g]:
-            key[g] = v
-    return sorted(first, key=lambda g: (key[g], first[g])), first
+    try:
+        for i, g in enumerate(groups.tolist()):
+            g = _group_key(g)
+            v = order[i]
+            if g not in key or v < key[g]:
+                key[g] = v
+        return sorted(first, key=lambda g: (key[g], first[g])), first
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            'order values are not mutually orderable; cannot order groups '
+            'chronologically') from None
 
 
 def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
@@ -610,7 +615,12 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
     if time is not None:
         time = _as_1d(time, 'time', n)
         _assert_order_finite(time, name='time')
-        order = np.argsort(time, kind='stable')
+        try:
+            order = np.argsort(time, kind='stable')
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                'time values are not mutually orderable; cannot build a '
+                'chronological split') from None
         sorted_time = time[order]
         sizes = _resolve_sizes(n, train_frac, val_frac, test_frac,
                                train_size, val_size, test_size)
@@ -683,6 +693,13 @@ def _group_key(value):
             return ('__nan__',)
     if isinstance(value, np.datetime64) and np.isnat(value):
         return ('__nat__',)
+    try:
+        hash(value)
+    except TypeError:
+        # Group ids are normally hashable scalars, but an object column of
+        # lists/arrays should still be groupable by a stable identity rather
+        # than crashing inside a set/dict downstream.
+        return ('__unhashable__', type(value).__name__, repr(value))
     return value
 
 
@@ -760,9 +777,18 @@ def assert_no_split_leakage(train_idx, val_idx, test_idx, *, groups=None,
             # future/past into the other split even though the row indices are
             # disjoint.  Callers must pass groups (or split at a timestamp
             # boundary) when timestamps repeat.
-            earlier_max = _order_extreme(time[ia], maximum=True)
-            later_min = _order_extreme(time[ib], maximum=False)
-            if earlier_max >= later_min:
+            try:
+                earlier_max = _order_extreme(time[ia], maximum=True)
+                later_min = _order_extreme(time[ib], maximum=False)
+                leaked = bool(earlier_max >= later_min)
+            except (TypeError, ValueError, OverflowError):
+                # Mixed/unorderable object timestamps cannot prove a monotone
+                # partition; fail closed rather than letting a TypeError
+                # escape from what is supposed to be a verification helper.
+                raise ValueError(
+                    f'temporal leakage cannot be verified for {a}/{b}: '
+                    'time values are not mutually orderable') from None
+            if leaked:
                 raise ValueError(
                     f'temporal leakage: max {a} time '
                     f'{earlier_max!r} >= min {b} time {later_min!r} '
@@ -1195,7 +1221,10 @@ class LeakageSafeCategoricalEncoder:
             'n_features_in': self.n_features_in_,
             'n_train': self.n_train_,
             'train_fp': self.train_fp_,
-            'features': [dict(s) for s in self.feature_stats_],
+            # Copy the category lists too: a caller mutating the returned
+            # snapshot must not change the fitted encoder (and vice versa).
+            'features': [dict(s, categories=list(s.get('categories') or []))
+                         for s in self.feature_stats_],
         }
 
     @classmethod
@@ -1203,7 +1232,8 @@ class LeakageSafeCategoricalEncoder:
         """Rebuild a fitted encoder from :meth:`get_stats` output."""
         obj = cls(encoding=stats['encoding'],
                   handle_unknown=stats.get('handle_unknown', 'unknown'))
-        obj.feature_stats_ = [dict(s) for s in stats['features']]
+        obj.feature_stats_ = [dict(s, categories=list(s.get('categories') or []))
+                              for s in stats['features']]
         obj.n_features_in_ = int(stats['n_features_in'])
         obj.n_train_ = int(stats.get('n_train', 0))
         obj.train_fp_ = stats.get('train_fp')
@@ -1466,6 +1496,11 @@ def _matrix_fingerprint(X):
 def _row_keys(X):
     """Stable per-row keys for exact-duplicate detection (NaN-safe)."""
     src = np.asarray(X)
+    if src.ndim == 0:
+        raise ValueError('duplicate detection needs a 1-D or 2-D table, got a scalar')
+    if src.ndim > 2:
+        raise ValueError(
+            f'duplicate detection needs a 1-D or 2-D table, got shape {src.shape}')
     if src.ndim == 1:
         src = src.reshape(-1, 1)
     keys = []
@@ -1508,11 +1543,17 @@ def _row_keys(X):
             h.update(np.ascontiguousarray(row[ok]).tobytes())
             h.update(b'|')
             h.update(np.packbits(~ok).tobytes())
-            _code = np.zeros(row.shape, dtype=np.uint8)
-            _code[np.isnan(row)] = 1
-            _code[np.isposinf(row)] = 2
-            _code[np.isneginf(row)] = 3
-            h.update(_code.tobytes())
+            # Only a row that actually contains a non-finite value gets the
+            # extra value-code tail.  Appending an all-zero tail to finite rows
+            # in a mixed block would make the same finite row hash differently
+            # depending on which block it landed in (and therefore hide a
+            # duplicate whenever the two copies straddle a block boundary).
+            if not ok.all():
+                _code = np.zeros(row.shape, dtype=np.uint8)
+                _code[np.isnan(row)] = 1
+                _code[np.isposinf(row)] = 2
+                _code[np.isneginf(row)] = 3
+                h.update(_code.tobytes())
             keys.append(h.digest())
     return keys
 
@@ -1612,12 +1653,18 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     """
     # A NaN/negative threshold silently disables the corresponding gate
     # (NaN compares False against everything), which is worse than an error.
+    if isinstance(clip_z, (bool, np.bool_)):
+        raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}')
     try:
         clip_z = float(clip_z)
     except (TypeError, ValueError, OverflowError):
         raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}') from None
     if not math.isfinite(clip_z) or clip_z <= 0.0:
         raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}')
+    if isinstance(shift_threshold, (bool, np.bool_)):
+        raise ValueError(
+            f'shift_threshold must be a finite non-negative number, got '
+            f'{shift_threshold!r}')
     try:
         shift_threshold = float(shift_threshold)
     except (TypeError, ValueError, OverflowError):
@@ -2043,13 +2090,15 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
     used to define the vocabulary or the reference frequencies.  Returns
     ``{'js_divergence', 'total_variation', 'n_reference', 'n_holdout',
     'unseen_rate'}``.
+
+    Categories are compared by their hashable identity rather than by a NumPy
+    sort.  A mixed object column (e.g. a short string code and an integer code)
+    has no single natural ordering in NumPy 2, but it still has well-defined
+    category frequencies; sorting the identity keys on ``(type, repr)`` keeps
+    the report computable and deterministic without conflating distinct values.
     """
-    ref = np.asarray(reference).reshape(-1)
-    hold = np.asarray(holdout).reshape(-1)
-    if hold.size == 0:
-        return {'js_divergence': 0.0, 'total_variation': 0.0,
-                'n_reference': int(ref.size), 'n_holdout': 0,
-                'unseen_rate': 0.0}
+    ref = np.asarray(reference, dtype=object).reshape(-1)
+    hold = np.asarray(holdout, dtype=object).reshape(-1)
     if max_categories is not None:
         max_categories = _check_count('max_categories', max_categories, positive=True)
         if max_categories < 2:
@@ -2057,30 +2106,50 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
                 'max_categories must be at least 2: a single bin would collapse '
                 'the reference distribution and report zero divergence while '
                 'every holdout category is unseen')
-        cat = np.unique(ref)
-        if cat.size > max_categories:
+    if hold.size == 0:
+        return {'js_divergence': 0.0, 'total_variation': 0.0,
+                'n_reference': int(ref.size), 'n_holdout': 0,
+                'unseen_rate': 0.0}
+
+    def _key(value):
+        return ('__missing__',) if _category_is_missing(value) else _hashable_label(value)
+
+    def _sort_key(value):
+        return (type(value).__name__, repr(value))
+
+    ref_keys = [_key(v) for v in ref.tolist()]
+    hold_keys = [_key(v) for v in hold.tolist()]
+    counts = {}
+    for key in ref_keys:
+        counts[key] = counts.get(key, 0) + 1
+    if max_categories is not None:
+        if len(counts) > max_categories:
             # Keep the most frequent reference categories plus an "other" bin.
-            vals, counts = np.unique(ref, return_counts=True)
-            keep = np.sort(vals[np.argsort(-counts)[:max_categories - 1]])
+            # Count ties are broken by the stable identity key, not by NumPy's
+            # unstable argsort of object values.
+            ranked = sorted(counts, key=lambda k: (-counts[k], _sort_key(k)))
+            keep = sorted(ranked[:max_categories - 1], key=_sort_key)
         else:
-            keep = cat
+            keep = sorted(counts, key=_sort_key)
     else:
-        keep = np.unique(ref)
+        keep = sorted(counts, key=_sort_key)
+    keep_index = {key: i for i, key in enumerate(keep)}
 
-    def _hist(a):
-        h = np.zeros(keep.size + 1, dtype=np.float64)
-        if keep.size:
-            pos = np.searchsorted(keep, a)
-            inb = (pos < keep.size)
-            inb[inb] = keep[pos[inb]] == a[inb]
-            h[:keep.size] = np.bincount(pos[inb], minlength=keep.size)
-            h[-1] = np.sum(~inb)
+    def _hist(keys):
+        h = np.zeros(len(keep) + 1, dtype=np.float64)
+        if keep:
+            for key in keys:
+                pos = keep_index.get(key)
+                if pos is None:
+                    h[-1] += 1.0
+                else:
+                    h[pos] += 1.0
         else:
-            h[-1] = a.size
-        return h / max(a.size, 1)
+            h[-1] = len(keys)
+        return h / max(len(keys), 1)
 
-    p = _hist(ref)
-    q = _hist(hold)
+    p = _hist(ref_keys)
+    q = _hist(hold_keys)
     m = 0.5 * (p + q)
 
     def _kl(a, b):
@@ -2089,12 +2158,12 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
 
     tv = 0.5 * float(np.sum(np.abs(p - q)))
     js = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
-    if keep.size:
-        unseen = float(np.mean(~np.isin(hold, keep)))
+    if keep:
+        unseen = float(np.mean([key not in keep_index for key in hold_keys]))
     else:
         # No reference category exists (e.g. an empty training side): every
         # holdout token is unseen, not zero.
-        unseen = 1.0 if hold.size else 0.0
+        unseen = 1.0 if hold_keys else 0.0
     return {
         'js_divergence': js,
         'total_variation': tv,

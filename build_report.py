@@ -4,6 +4,8 @@ import json
 import math
 import numbers
 import os
+
+import numpy as np
 import random
 import re
 import sys
@@ -263,12 +265,13 @@ def _finite_or_none(v):
     return _as_finite(v)
 
 def _int_or(v, default):
-    if v is None or isinstance(v, bool):
+    if v is None or isinstance(v, (bool, np.bool_)):
         return default
-    if isinstance(v, int):
+    if isinstance(v, numbers.Integral):
         return int(v)
-    if isinstance(v, float):
-        return int(v) if math.isfinite(v) and float(v).is_integer() else default
+    if isinstance(v, numbers.Real):
+        f = float(v)
+        return int(f) if math.isfinite(f) and f.is_integer() else default
     try:
         return int(v)
     except (TypeError, ValueError, OverflowError):
@@ -425,11 +428,12 @@ def per_seed_records(outdir):
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
             _sv = r['seed']
-            if isinstance(_sv, bool):
+            if isinstance(_sv, (bool, np.bool_)):
                 print(f"[report] record {_k!r} in {outdir} carries a boolean seed — skipped for pairing")
                 continue
-            if isinstance(_sv, float):
-                _sd = int(_sv) if math.isfinite(_sv) and _sv.is_integer() else None
+            if isinstance(_sv, numbers.Real):
+                _sf = float(_sv)
+                _sd = int(_sf) if math.isfinite(_sf) and _sf.is_integer() else None
             else:
                 try:
                     _sd = int(_sv)
@@ -1153,10 +1157,14 @@ def sec_p1l():
                     recs_l.append((_sd, _c))
             # Fail closed on a missing truncation flag: a cell that does not
             # say whether it was truncated is unverifiable, not full-length.
-            _unknown = [_sd for _sd, x in recs_l if 'truncated' not in x]
+            _unknown = [_sd for _sd, x in recs_l
+                        if 'truncated' not in x
+                        or not isinstance(x.get('truncated'), (bool, np.bool_))]
             if _unknown:
-                print(f'[report] sec_p1l: {v} L{Ln}: {len(_unknown)} cell(s) lack the `truncated` flag {sorted(_unknown)} — the column is marked unverifiable and never enters a ratio')
-            ok = [x for _sd, x in recs_l if ('truncated' in x and not x.get('truncated'))]
+                print(f'[report] sec_p1l: {v} L{Ln}: {len(_unknown)} cell(s) lack a boolean `truncated` flag {sorted(_unknown)} — the column is marked unverifiable and never enters a ratio')
+            ok = [x for _sd, x in recs_l
+                  if isinstance(x.get('truncated'), (bool, np.bool_))
+                  and not bool(x.get('truncated'))]
             is_tr = bool(recs_l) and (len(ok) < len(recs_l))
             vals = [float(x['ppl']) for x in ok]
             trunc_flags.append(is_tr)

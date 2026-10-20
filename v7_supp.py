@@ -2754,7 +2754,7 @@ def _lenplot(summary, eval_lens, outdir):
         per, trunc_flags = ([], [])
         for Ln in eval_lens:
             recs = L.by_len_cells(list(summary.values()), Ln, variant=v)
-            ok = [x for x in recs if not x.get('truncated')]
+            ok = [x for x in recs if isinstance(x.get('truncated'), (bool, np.bool_)) and not bool(x.get('truncated'))]
             use, is_tr = (ok, False) if ok else (recs, bool(recs))
             vals = [x['ppl'] for x in use]
             per.append(float(np.mean(vals)) if vals else np.nan)

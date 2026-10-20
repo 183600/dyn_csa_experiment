@@ -465,17 +465,40 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     # residual pass below (silently reporting n_docs=0).
     _nll = list(nll_per_row) if nll_per_row is not None else []
     _ntok = list(n_tokens_per_row) if n_tokens_per_row is not None else []
+
+    def _parse_pair(nll, ntok):
+        if isinstance(nll, (bool, np.bool_)) or isinstance(ntok, (bool, np.bool_)):
+            return None
+        try:
+            nll = float(nll)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        # Token counts are exact integers.  A fractional count would silently
+        # change the pooled denominator if int() truncated it.
+        try:
+            if isinstance(ntok, numbers.Integral):
+                ntok = int(ntok)
+            elif isinstance(ntok, numbers.Real):
+                nf = float(ntok)
+                if not math.isfinite(nf) or nf != math.floor(nf):
+                    return None
+                ntok = int(nf)
+            else:
+                ntok = int(ntok)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if ntok <= 0 or not math.isfinite(nll):
+            return None
+        return nll, ntok
+
     doc_ce = []
     total_nll = 0.0
     total_tok = 0
     for nll, ntok in zip(_nll, _ntok):
-        try:
-            nll = float(nll)
-            ntok = int(ntok)
-        except (TypeError, ValueError, OverflowError):
+        pair = _parse_pair(nll, ntok)
+        if pair is None:
             continue
-        if ntok <= 0 or not math.isfinite(nll):
-            continue
+        nll, ntok = pair
         total_nll += nll
         total_tok += ntok
         doc_ce.append(nll / ntok)
@@ -497,13 +520,10 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     # claiming a normal-theory interval.
     _resid = []
     for nll, ntok in zip(_nll, _ntok):
-        try:
-            nll = float(nll)
-            ntok = int(ntok)
-        except (TypeError, ValueError, OverflowError):
+        pair = _parse_pair(nll, ntok)
+        if pair is None:
             continue
-        if ntok <= 0 or not math.isfinite(nll):
-            continue
+        nll, ntok = pair
         _resid.append(nll - ce * ntok)
     n_docs = len(_resid)
     _var = (n_docs / (n_docs - 1.0)) * sum(r * r for r in _resid) / (total_tok * total_tok)
@@ -8798,6 +8818,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
 def signflip_p_floor(n):
     """双侧精确符号翻转检验在 n 个种子下的最小可达 p 值（2/2^n）；
     n<=0 返回 NaN。用于报告「未显著是分辨率上限还是数据结论」。"""
+    if isinstance(n, (bool, np.bool_)):
+        return float('nan')
     try:
         n = int(n)
     except (TypeError, ValueError, OverflowError):
@@ -9013,13 +9035,16 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     if n < 2:
         return None
     try:
-        nb = int(n_boot)
         c = float(conf)
     except (TypeError, ValueError, OverflowError):
         return None
+    nb = _as_seed_int(n_boot)
+    sd = _as_seed_int(seed)
+    if nb is None or sd is None or isinstance(conf, (bool, np.bool_)):
+        return None
     if nb < 20 or not (0.0 < c < 1.0):
         return None
-    rng = np.random.default_rng(int(seed))
+    rng = np.random.default_rng(sd)
     means = np.empty(nb, dtype=float)
     _chunk = 256
     for _off in range(0, nb, _chunk):
@@ -9043,9 +9068,12 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     # correspondingly large index table: the seed-completion path can grow a
     # panel to hundreds/thousands of seeds and paired_effect_stats calls this
     # for every displayed contrast.
-    rng = np.random.default_rng(int(seed))
-    nb = int(n_boot)
-    means = np.empty(max(0, nb), dtype=float)
+    nb = _as_seed_int(n_boot)
+    sd = _as_seed_int(seed)
+    if nb is None or sd is None or nb < 2:
+        return None
+    rng = np.random.default_rng(sd)
+    means = np.empty(nb, dtype=float)
     chunk = 256
     for off in range(0, nb, chunk):
         m = min(chunk, nb - off)
@@ -9060,9 +9088,12 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
                     if f is not None], dtype=float)
     if a.size < 2 or b.size < 2:
         return None
-    rng = np.random.default_rng(int(seed))
-    nb = int(n_boot)
-    diff = np.empty(max(0, nb), dtype=float)
+    nb = _as_seed_int(n_boot)
+    sd = _as_seed_int(seed)
+    if nb is None or sd is None or nb < 2:
+        return None
+    rng = np.random.default_rng(sd)
+    diff = np.empty(nb, dtype=float)
     chunk = 256
     for off in range(0, nb, chunk):
         m = min(chunk, nb - off)
@@ -9243,6 +9274,9 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     最小可达 p_holm = min(1, m * 2/2^n)。若该值 > alpha，则该方案在构造上
     无法确认任何比较——这是分辨率上限，不是「保守的选择」，应当在读到
     任何测试数据之前修订（加种子 / 缩族 / 改检验），而不是事后再解释。"""
+    if (isinstance(n_seeds, (bool, np.bool_))
+            or isinstance(m_comparisons, (bool, np.bool_))):
+        return float('nan')
     try:
         n = int(n_seeds)
         m = int(m_comparisons)
@@ -9265,14 +9299,17 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     returned n is descriptive only (the exact-test floor, not the data, bounds
     the p value), so the audit labels it resolution-limited instead of reading
     it as a null result."""
+    if isinstance(m_comparisons, (bool, np.bool_)) or isinstance(n_max, (bool, np.bool_)):
+        return None
     try:
         m = int(m_comparisons)
         a = float(alpha)
+        n_max = int(n_max)
     except (TypeError, ValueError, OverflowError):
         return None
     if m <= 0 or not (0.0 < a < 1.0):
         return None
-    for n in range(1, int(n_max) + 1):
+    for n in range(1, n_max + 1):
         if holm_min_attainable_p(n, m, a) <= a + 1e-15:
             return n
     return None
@@ -9318,6 +9355,9 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     下界，真实数据可能仍需更多同向种子。返回使 m·p(k) < alpha 的最小
     k；若全部 n 个同向仍不够，返回 None（方案不可能确认）。二项尾概率
     在 log 空间计算，因此大 n（规模扩展后的补种子计划）也不会整数溢出。"""
+    if (isinstance(n_seeds, (bool, np.bool_))
+            or isinstance(m_comparisons, (bool, np.bool_))):
+        return None
     try:
         n = int(n_seeds)
         m = int(m_comparisons)
@@ -9349,6 +9389,8 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
     kmin = signflip_min_consistency(n_seeds, m_comparisons, alpha)
     if kmin is None or kmin <= 0:
         return 0.0 if kmin is None else 1.0
+    if isinstance(q, (bool, np.bool_)):
+        return 0.0
     try:
         n = int(n_seeds)
         q = float(q)
@@ -9385,10 +9427,20 @@ def tost_paired(deltas, margin, conf=0.90):
     d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
                     if f is not None], dtype=float)
     n = int(d.size)
-    out = {'n': n, 'margin': float(margin), 'conf': float(conf), 'equivalent': None,
+    _bad_option = (isinstance(margin, (bool, np.bool_))
+                   or isinstance(conf, (bool, np.bool_)))
+    try:
+        margin = float(margin)
+        conf = float(conf)
+    except (TypeError, ValueError, OverflowError):
+        margin, conf = float('nan'), float('nan')
+        _bad_option = True
+    out = {'n': n, 'margin': margin, 'conf': conf, 'equivalent': None,
            'method': 'paired-t (Student t, df=n-1; pre-registered margin required)'}
-    if n < 2 or not (margin > 0):
-        out['note'] = 'not decidable (n<2 or non-positive margin)'
+    if (_bad_option or n < 2 or not math.isfinite(margin) or margin <= 0
+            or not math.isfinite(conf) or not (0.0 < conf < 1.0)):
+        out['note'] = ('not decidable (n<2, non-positive/non-finite margin, '
+                       'or conf outside (0,1))')
         return out
     mean = float(d.mean())
     sd = float(d.std(ddof=1))
@@ -10991,7 +11043,7 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
         for key in _HYPOTHESIS_REQUIRED:
             val = spec.get(key)
             if key == 'predicted_sign':
-                if isinstance(val, bool) or val not in (-1, 0, 1):
+                if isinstance(val, (bool, np.bool_)) or val not in (-1, 0, 1):
                     issues.append(f'predicted_sign={val!r} (must be -1, 0 or 1)')
             elif not isinstance(val, str) or not val.strip():
                 issues.append(f'{key} is empty or not a string')
@@ -11081,8 +11133,35 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             if y_pred is not None:
                 labels = np.unique(np.concatenate([labels, np.asarray(y_pred).ravel()]))
     labels = np.asarray(labels)
+    if labels.ndim != 1:
+        raise ValueError(f'labels must be a flat 1-D sequence, got shape {labels.shape}')
     if labels.size == 0:
         raise ValueError('classification_metrics needs at least one label')
+    def _label_identity(value):
+        try:
+            hash(value)
+        except TypeError:
+            return ('__unhashable__', type(value).__name__, repr(value))
+        return value
+    if len({_label_identity(v) for v in labels.tolist()}) != int(labels.size):
+        raise ValueError(f'labels contains duplicate class identifiers: {labels.tolist()}')
+    if y_score is not None:
+        try:
+            y_score = np.asarray(y_score, dtype=float)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('y_score must be numeric (scores/probabilities)') from None
+        if not np.all(np.isfinite(y_score)):
+            # Ranking with a NaN/Inf score is not defined; treating it as an
+            # ordinary rank silently manufactures an AUC/AP from a failed
+            # prediction.  Refuse instead of reporting a corrupted metric.
+            raise ValueError('y_score contains NaN/Inf; ranking metrics require finite scores')
+        if y_score.ndim == 2:
+            _ncols = int(y_score.shape[1])
+            if _ncols != int(labels.size):
+                raise ValueError(
+                    f'y_score has {_ncols} score column(s) but labels has '
+                    f'{int(labels.size)} identit(ies); a column-per-label score '
+                    'matrix must name exactly one label per column')
     pos = None
     if labels.size == 2:
         if positive_label is None:
@@ -11928,11 +12007,12 @@ def _params_of_arm(recs, arm):
     for (v, _t, _s), r in recs.items():
         if v != arm:
             continue
-        p = r.get('params')
-        try:
-            return int(p)
-        except (TypeError, ValueError, OverflowError):
-            continue
+        # Parameter counts are exact integers.  int(1.5) would silently turn a
+        # corrupted count into a different, apparently valid one, and bool is
+        # not a count.
+        p = _as_seed_int(r.get('params'))
+        if p is not None and p > 0:
+            return p
     return None
 
 def _param_control(recs, a, b):
@@ -12989,8 +13069,12 @@ def normalize_seed_list(seeds, *, default=(0,)):
     """
     if seeds is None:
         seeds = list(default)
-    elif isinstance(seeds, (int, np.integer)) and not isinstance(seeds, bool):
+    elif isinstance(seeds, (bool, np.bool_)):
+        raise ValueError(f'seed must be an integer, got boolean {seeds!r}')
+    elif isinstance(seeds, numbers.Real):
         seeds = [seeds]
+    elif isinstance(seeds, np.ndarray) and seeds.ndim == 0:
+        seeds = [seeds.item()]
     elif isinstance(seeds, (str, bytes)):
         seeds = seeds.decode().split() if isinstance(seeds, bytes) else seeds.replace(',', ' ').split()
     out = []

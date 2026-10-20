@@ -380,7 +380,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
 
             def _at(Ln, rows=rows):
                 cells = L.by_len_cells(rows, Ln)
-                ok = [c for c in cells if not c.get('truncated')]
+                ok = [c for c in cells if isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated'))]
                 if (ok if ok else cells) and len(ok if ok else cells) < len(rows):
                     print(f'[v11 report] {v} L{Ln}: the column mean covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed mean')
                 if ok:
@@ -395,7 +395,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                         continue
                     for Ln, mp in ((512, m512), (4096, m4096)):
                         c = bl.get(Ln, bl.get(str(Ln)))
-                        if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')):
+                        if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')):
                             mp[r.get('seed')] = float(c['ppl'])
                 both = sorted(set(m512) & set(m4096))
                 if both and len(both) < len(rows):
