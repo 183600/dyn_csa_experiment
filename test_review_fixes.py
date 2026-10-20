@@ -6533,6 +6533,13 @@ def t_scale_ladder_budget_and_transfer_audit():
     mal2 = L.scale_ladder_audit([123, b])
     assert mal2['status'] == 'fail' and any('not a dict' in p
                                            for p in mal2['problems']), mal2
+    for _bad_policy in (123, 'x', [1], True):
+        try:
+            L.scale_ladder_audit([a, b], policy=_bad_policy)
+        except ValueError as e:
+            assert 'policy' in str(e), e
+        else:
+            raise AssertionError(f'policy={_bad_policy!r} must be refused')
 
 
 def t_init_core_fingerprint_and_pair_gate():

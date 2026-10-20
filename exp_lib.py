@@ -11369,7 +11369,14 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
     unverifiable).  A budget mismatch is a disclosure warning (a scale study
     may deliberately change budget), never a silent "matched" claim.
     """
-    policy = dict(SCALE_TRANSFER_POLICY if policy is None else policy)
+    if policy is None:
+        policy = dict(SCALE_TRANSFER_POLICY)
+    elif not isinstance(policy, dict):
+        # `dict(123)`/`dict(True)` raised an unrelated TypeError deep in the
+        # audit; a policy is a declared mapping, not an iterable of pairs.
+        raise ValueError(f'policy must be a mapping or None, got {type(policy).__name__}')
+    else:
+        policy = dict(policy)
     _tol_raw = (policy.get('tokens_per_param_tolerance', 0.25)
                 if tolerance is None else tolerance)
     if isinstance(_tol_raw, (bool, np.bool_)):
