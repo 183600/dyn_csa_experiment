@@ -536,6 +536,24 @@ def t_open_analysis_control_gate():
     assert len(rejected) == 1 and rejected[0]['seed'] == 1, rejected
     assert 'lr differs' in rejected[0]['reason'], rejected
 
+def t_open_block_hypotheses():
+    # Each declared primary contrast must state mechanism, sign, metric and
+    # falsifier; an unregistered primary comparison is a design defect.
+    aud = L.hypothesis_audit(L.OPEN_BLOCK_HYPOTHESIS_DESIGN, 'open_block')
+    assert aud['status'] == 'ok' and not aud['invalid'], aud
+    assert not aud['metric_unknown'] and not aud['direction_unspecified'], aud
+    names = ['summary - closed @128', 'singletons - summary @128',
+             'interaction: summary effect (none - 128)']
+    assert set(names) <= set(L.OPEN_BLOCK_HYPOTHESIS_DESIGN), L.OPEN_BLOCK_HYPOTHESIS_DESIGN
+    for n in names:
+        h = L.OPEN_BLOCK_HYPOTHESIS_DESIGN[n]
+        assert h['predicted_sign'] == -1 and h['primary_metric'] == 'ppl', h
+        assert h['mechanism'] and h['falsifier'], h
+    # A missing table entry is reported, not silently defaulted.
+    miss = L.hypothesis_audit(L.OPEN_BLOCK_HYPOTHESIS_DESIGN, 'open_block',
+                              names=names + ['not declared'])
+    assert 'not declared' in miss['invalid'] and miss['status'] == 'warn', miss
+
 
 CHECKS = [
     ('K1 open-block config/segmenter', t_config_and_segmenter),
@@ -550,6 +568,7 @@ CHECKS = [
     ('K10 forced-vs-natural cuts', t_forced_vs_natural_cuts),
     ('K11 open candidate edge cases', t_open_candidate_edge_cases),
     ('K12 analysis control gate drops uncontrolled seeds', t_open_analysis_control_gate),
+    ('K13 open-block primary hypotheses declared', t_open_block_hypotheses),
 ]
 
 

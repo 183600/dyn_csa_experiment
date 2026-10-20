@@ -11163,6 +11163,37 @@ BASELINE_HYPOTHESIS_DESIGN = {
     },
 }
 
+# Open-block panel hypotheses (driver: open_block_supp.py).  These are the
+# declared primary contrasts; the remaining maximum-block x reading-rule cells
+# are descriptive.  Delta convention is a - b on token NLL, so predicted_sign
+# -1 means the first arm is expected to have lower NLL.
+OPEN_BLOCK_HYPOTHESIS_DESIGN = {
+    'summary - closed @128': {
+        'statement': 'Reading the still-open block as a causal prefix summary lowers held-out token NLL versus ignoring the open block, at a fixed top-k budget.',
+        'mechanism': 'The open block contains recent content that is otherwise invisible until the block closes; a pooled summary makes part of it addressable without spending a full block slot.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'requires_param_match': False,
+        'falsifier': 'The summary arm is not lower-NLL than closed after Holm correction, or the gap is within seed noise.',
+    },
+    'singletons - summary @128': {
+        'statement': 'Representing the open prefix as length-1 singleton blocks preserves token identity better than one pooled summary and lowers held-out token NLL at the same top-k budget.',
+        'mechanism': 'A pooled summary collapses distinct recent tokens; singletons keep their identity through the same pooling/projection parameters and let the indexer select among them.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'requires_param_match': False,
+        'falsifier': 'Singletons match or lose to the pooled summary after Holm correction, or the difference is within seed noise.',
+    },
+    'interaction: summary effect (none - 128)': {
+        'statement': 'The NLL benefit of reading the open block is larger when no maximum block cap is imposed than under a 128-token cap.',
+        'mechanism': 'Without a cap, the open block can grow, so the amount of otherwise-unread context that a prefix representation can recover increases.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'requires_param_match': False,
+        'falsifier': 'The no-cap summary benefit is not larger than the capped benefit after Holm correction, or the interaction is within seed noise.',
+    },
+}
+
 def _splitmix64_u64(x):
     """Deterministic 64-bit mixing (SplitMix64) used for row folds.
 

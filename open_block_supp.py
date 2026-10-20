@@ -530,6 +530,13 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
 
     # Holm within the declared primary family.
     prim_names = [n for n, r in results.items() if r.get('family') == 'primary']
+    # Pre-registration: every primary contrast must state its mechanism,
+    # predicted sign, metric and falsifier BEFORE the numbers are read.  The
+    # audit also checks that the declared metric is defined in METRIC_POLICY.
+    _hyp = L.hypothesis_audit(L.OPEN_BLOCK_HYPOTHESIS_DESIGN, 'open_block',
+                              names=prim_names)
+    for _n in prim_names:
+        results[_n]['hypothesis'] = (_hyp.get('hypotheses') or {}).get(_n)
     # The Holm family is the DECLARED primary family, not only the comparisons
     # that happened to produce a finite p.  A declared-but-unmeasurable
     # contrast keeps a p=1 slot; dropping it would shrink m and make the
@@ -572,6 +579,8 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         'primary_holm_floor': _holm_floor,
         'primary_holm_min_seeds': _holm_min_n,
         'comparisons': results,
+        'hypothesis_audit': _hyp,
+        'hypotheses': {n: (_hyp.get('hypotheses') or {}).get(n) for n in prim_names},
         'diagnostics': diagnostics,
         'efficiency': efficiency,
         'notes': [
@@ -580,7 +589,7 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
             'A failure to reach p<0.05 at n=4 is a resolution limit, not evidence of no effect.',
             'The 4-seed panel is descriptive for the primary family; Holm-adjusted p-values are reported with their floors.',
             'Interaction I = (summary - closed | no cap) - (summary - closed | 128); negative means the summary benefit grows when the cap is removed.',
-        ],
+        ] + [f'hypothesis audit: {w}' for w in (_hyp.get('warnings') or [])],
     }
     _atomic_json(os.path.join(analysis_dir, 'stats.json'), stats)
     md = _render_markdown(stats)
@@ -612,6 +621,21 @@ def _render_markdown(stats):
             _fmt(r.get('std')), _fmt(r.get('cohens_dz')),
             _fmt(r.get('p_exact_signflip')), _fmt(r.get('p_holm')),
             _fmt(r.get('min_reachable_p')), ci_s, ctrl))
+    if stats.get('hypotheses'):
+        lines += ['', '## Pre-registered primary hypotheses', '',
+                  '| comparison | predicted sign | mechanism | falsifier |',
+                  '|---|---|---|---|']
+        for _n, _h in stats['hypotheses'].items():
+            if not isinstance(_h, dict):
+                lines.append(f'| {_n} | MISSING | — | — |')
+                continue
+            lines.append('| {} | {} | {} | {} |'.format(
+                _n, _h.get('predicted_sign'), _h.get('mechanism') or '—',
+                _h.get('falsifier') or '—'))
+        if (stats.get('hypothesis_audit') or {}).get('status') != 'ok':
+            lines.append('')
+            lines.append('Hypothesis audit is not clean: '
+                         + '; '.join((stats.get('hypothesis_audit') or {}).get('warnings') or []))
     if stats.get('diagnostics'):
         lines += ['', '## Diagnostics (per-cell means over layers; seed-level in stats.json)', '',
                   '| cell | len_mean | len_p50 | len_p95 | len_max | frac_at_max | forced_only | natural_only | both | prefix_age_mean | outside_nonzero | prefix_sel_rate | history_displaced | pos_trunc_frac |',

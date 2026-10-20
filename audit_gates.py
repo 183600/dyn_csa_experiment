@@ -1447,8 +1447,9 @@ def audit_hypotheses():
     L = _import_exp_lib()
     out = {'status': 'ok',
            'component': L.hypothesis_audit(L.HYPOTHESIS_DESIGN, 'component'),
-           'baseline': L.hypothesis_audit(L.BASELINE_HYPOTHESIS_DESIGN, 'baseline')}
-    if out['component']['status'] != 'ok' or out['baseline']['status'] != 'ok':
+           'baseline': L.hypothesis_audit(L.BASELINE_HYPOTHESIS_DESIGN, 'baseline'),
+           'open_block': L.hypothesis_audit(L.OPEN_BLOCK_HYPOTHESIS_DESIGN, 'open_block')}
+    if any(out[k]['status'] != 'ok' for k in ('component', 'baseline', 'open_block')):
         out['status'] = 'warn'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
