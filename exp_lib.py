@@ -15159,8 +15159,9 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                             'resolution_limited': _fst.get('resolution_limited'),
                             'significant': _fst.get('significant'),
                             'verdict': _verdict,
-                            'note': ('delta = panel seed PPL - deterministic floor PPL; negative means the panel beats the floor. '
-                                     'The floor is a fixed count model, so its uncertainty is the across-seed spread of the neural arm.'),
+                            'note': ('delta = panel seed PPL - floor PPL; negative means the panel beats the floor. '
+                                     'The seed-level test treats the floor as fixed; the paired row bootstrap (when '
+                                     'per-row floor accounting exists) also covers evaluation-row uncertainty.'),
                         }
                         if _verdict == 'beats_floor_pointwise_not_significant':
                             report['warnings'].append(
@@ -15278,6 +15279,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                             _c['method_status'] = 'not_confirmed'
                     _statuses = [(_floor_by_arm.get(_v) or {}).get('method_status')
                                  for _v in _method_arm_names]
+                    if (_floor_cmp is not None
+                            and _ref.get('variant') in _floor_by_arm):
+                        _floor_cmp['paired_row_bootstrap_delta'] = (
+                            _floor_by_arm[_ref.get('variant')].get('paired_row_bootstrap_delta'))
                     if not _method_arm_names or any(s is None for s in _statuses):
                         _method_floor_status = 'unverified'
                     elif any(s == 'does_not_beat_floor' for s in _statuses):
@@ -15404,6 +15409,11 @@ def _print_methodology_audit(report):
                     _lo, _hi, '; SEED-DRIVEN (dropping one seed flips the sign)' if e.get('seed_driven') else ''))
             elif e.get('seed_driven'):
                 print('        SEED-DRIVEN: dropping one seed flips the sign of the mean')
+            _rb = e.get('paired_row_bootstrap_delta') or {}
+            if _rb.get('status') == 'ok' and _rb.get('ci95_delta_ppl'):
+                print('        evaluation-row bootstrap 95%% CI for Δ: [%+.4f, %+.4f] (%d rows; row uncertainty only)' % (
+                    float(_rb['ci95_delta_ppl'][0]), float(_rb['ci95_delta_ppl'][1]),
+                    int(_rb.get('n_rows') or 0)))
             if e.get('capacity_confounded'):
                 _pb = e.get('param_breakdown') or {}
                 _extra = []
@@ -15461,6 +15471,10 @@ def _print_methodology_audit(report):
                 print('    panel reference %s PPL=%.4f; comparable=%s; beats simple floor=%s' % (
                     _sb.get('panel_reference_arm'), float(_sb.get('panel_reference_ppl') or float('nan')),
                     _sb.get('comparable_to_panel'), _sb.get('panel_beats_simple_floor')))
+            if _sb.get('method_arm_floor_status'):
+                print('    declared method-arm floor gate: %s (arms: %s)' % (
+                    _sb.get('method_arm_floor_status'),
+                    ', '.join(sorted((_sb.get('method_arm_floor_contrasts') or {}))) or 'none'))
         if report.get('verified_baselines'):
             print('  statistically verified baseline claims (NOT yet evidence against a tuned baseline): ' + ', '.join(report['verified_baselines']))
         if report.get('tuned_verified_baselines'):
