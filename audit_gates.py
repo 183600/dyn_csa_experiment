@@ -1724,12 +1724,27 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             # Environment/KV identity must hold for EVERY seed in both arms,
             # not only for the first record: a mixed arm would otherwise have
             # its median compared across different hardware/semantics.
-            _env_a = {(r.get('device'), r.get('torch')) for r in eff[a]}
-            _env_b = {(r.get('device'), r.get('torch')) for r in eff[b]}
-            _kv_a = {bool(r.get('decode_has_kv_cache')) for r in eff[a]}
-            _kv_b = {bool(r.get('decode_has_kv_cache')) for r in eff[b]}
-            same_env = bool(len(_env_a) == 1 and len(_env_b) == 1 and _env_a == _env_b)
-            same_kv = bool(len(_kv_a) == 1 and len(_kv_b) == 1 and _kv_a == _kv_b)
+            def _env_of(r):
+                _dev, _tor = r.get('device'), r.get('torch')
+                if (isinstance(_dev, str) and _dev.strip()
+                        and isinstance(_tor, str) and _tor.strip()):
+                    return (_dev, _tor)
+                # Missing/blank provenance is not a match: two records that
+                # both omit the device must not permit a speed claim.
+                return None
+            _env_a = {_env_of(r) for r in eff[a]}
+            _env_b = {_env_of(r) for r in eff[b]}
+            _kv_a = {r.get('decode_has_kv_cache') for r in eff[a]
+                     if isinstance(r.get('decode_has_kv_cache'), (bool, np.bool_))}
+            _kv_b = {r.get('decode_has_kv_cache') for r in eff[b]
+                     if isinstance(r.get('decode_has_kv_cache'), (bool, np.bool_))}
+            _kv_complete = (all(isinstance(r.get('decode_has_kv_cache'), (bool, np.bool_))
+                                for r in eff[a] + eff[b]))
+            same_env = bool(None not in _env_a and None not in _env_b
+                            and len(_env_a) == 1 and len(_env_b) == 1
+                            and _env_a == _env_b)
+            same_kv = bool(_kv_complete and len(_kv_a) == 1 and len(_kv_b) == 1
+                           and _kv_a == _kv_b)
             # Median over seeds, not the first record: a single slow seed must
             # not decide a "faster" claim.
             _ta, _tb = _med(eff[a], 'prefill_ms_p50'), _med(eff[b], 'prefill_ms_p50')

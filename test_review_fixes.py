@@ -5450,6 +5450,20 @@ def t_efficiency_pairs_audit_and_sweep():
         r4 = A.audit_efficiency_pairs(outdirs=[td])
         rec4 = r4['panels'][td]['a vs b']
         assert rec4['speed_claim_allowed'] is False, rec4
+        # Missing device/torch or KV provenance is unverifiable, not equal.
+        _bare = {'status': 'ok', 'n_tokens': 512, 'prefill_ms_p50': 10.0}
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'efficiency': dict(_bare)},
+                       'b::s0': {'variant': 'b', 'efficiency': dict(_bare, prefill_ms_p50=20.0)}}, f)
+        _rm = A.audit_efficiency_pairs(outdirs=[td])['panels'][td]['a vs b']
+        assert _rm['same_device_torch'] is False and _rm['speed_claim_allowed'] is False, _rm
+        _no_kv = dict(eff_a)
+        _no_kv.pop('decode_has_kv_cache')
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'efficiency': _no_kv},
+                       'b::s0': {'variant': 'b', 'efficiency': dict(_no_kv, prefill_ms_p50=20.0)}}, f)
+        _rk = A.audit_efficiency_pairs(outdirs=[td])['panels'][td]['a vs b']
+        assert _rk['same_kv_semantics'] is False and _rk['speed_claim_allowed'] is False, _rk
         # An invalid tolerance cannot widen (negative) or disable the speed gate.
         for _bad_tol in (True, -0.05, float('nan'), float('inf'), 1.0, 'x'):
             try:
