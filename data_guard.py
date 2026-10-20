@@ -1580,8 +1580,19 @@ def _matrix_fingerprint(X):
                     if not (math.isfinite(f) and f.is_integer()
                             and int(f) == int(v)):
                         exact = False
-                elif isinstance(v, (float, np.floating)):
+                elif isinstance(v, float):
                     pass
+                elif isinstance(v, np.floating):
+                    if v.dtype.itemsize > 8:
+                        # A wider float is exact in this block only if its
+                        # float64 image round-trips to the same value.
+                        try:
+                            _same = (math.isfinite(f)
+                                     and np.longdouble(f) == v)
+                        except (TypeError, ValueError, OverflowError):
+                            _same = False
+                        if not _same:
+                            exact = False
                 else:
                     try:
                         n, d = v.as_integer_ratio()
@@ -1632,6 +1643,13 @@ def _matrix_fingerprint(X):
             block_f = block_f.copy()
             block_f[block_f == 0.0] = 0.0
         h.update(np.ascontiguousarray(block_f).tobytes())
+        if arr.dtype.kind == 'f' and arr.dtype.itemsize > 8:
+            # Distinct longdouble values can share one float64 image; append
+            # the exact per-row keys so the fingerprint cannot collide.
+            for key in _row_keys(block):
+                h.update(b'|')
+                h.update(key)
+            continue
         if not _is_int:
             continue
         # Which cells survive the float64 round-trip exactly?  Only inexact
@@ -1661,6 +1679,22 @@ def _matrix_fingerprint(X):
                 h.update(key)
     return h.hexdigest()[:16]
 
+def _wide_float_key(v):
+    """Exact canonical key for a float wider than float64 (longdouble)."""
+    if np.isnan(v):
+        return b'Fnan'
+    if np.isposinf(v):
+        return b'F+inf'
+    if np.isneginf(v):
+        return b'F-inf'
+    if v == 0:
+        return b'I0'
+    n, d = v.as_integer_ratio()
+    n, d = int(n), int(d)
+    return (b'I' + str(n).encode('ascii') if d == 1
+            else b'R' + str(n).encode('ascii') + b'/' + str(d).encode('ascii'))
+
+
 def _row_keys(X):
     """Stable per-row keys for exact-duplicate detection (NaN-safe)."""
     src = np.asarray(X)
@@ -1675,6 +1709,19 @@ def _row_keys(X):
             'to float64 would silently discard the imaginary part')
     if src.ndim == 1:
         src = src.reshape(-1, 1)
+    if src.dtype.kind == 'f' and src.dtype.itemsize > 8:
+        # float128/longdouble cannot round-trip through float64 without
+        # collapsing distinct values.  Hash an exact rational per cell.
+        _step = _hash_row_block(int(src.shape[1]), 1 << 16)
+        keys = []
+        for start in range(0, src.shape[0], _step):
+            for row in src[start:start + _step].tolist():
+                h = hashlib.blake2b(digest_size=8)
+                for v in row:
+                    h.update(_wide_float_key(v))
+                    h.update(b'|')
+                keys.append(h.digest())
+        return keys
     if src.dtype.kind in 'SUV':
         # Native unicode/bytes/structured columns are not float-castable.
         # Canonical object keys keep their type-qualified identity (so b'a',
@@ -1703,6 +1750,8 @@ def _row_keys(X):
                 return b'I' + str(int(v)).encode('ascii')
             if isinstance(v, numbers.Integral):
                 return b'I' + str(int(v)).encode('ascii')
+            if isinstance(v, np.floating) and v.dtype.itemsize > 8:
+                return _wide_float_key(v)
             if isinstance(v, (str, bytes)):
                 # Numeric strings are categorical labels, not numbers: '1'
                 # and 1 are different row values.

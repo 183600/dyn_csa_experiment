@@ -6056,6 +6056,18 @@ def t_exact_numeric_contracts_and_fingerprint():
     obj_big = np.array([[2 ** 53], [2 ** 53 + 1]], dtype=object)
     assert DG._matrix_fingerprint(obj_big[:1]) != DG._matrix_fingerprint(obj_big[1:])
     assert DG._matrix_fingerprint(obj_big) == DG._matrix_fingerprint(obj_big.copy())
+    # Floats wider than float64 must not collide after the historical
+    # float64 hash; distinct longdouble values get distinct exact keys.
+    if np.finfo(np.longdouble).eps < np.finfo(np.float64).eps:
+        _ld1 = np.longdouble('1.0000000000000000001')
+        _ld2 = np.longdouble('1.0000000000000000002')
+        _ld = np.array([[_ld1], [_ld2]], dtype=np.longdouble)
+        assert _ld1 != _ld2
+        assert DG.duplicate_mask(_ld).tolist() == [False, False]
+        assert DG._matrix_fingerprint(_ld[:1]) != DG._matrix_fingerprint(_ld[1:])
+        _same = np.array([[_ld1], [_ld1]], dtype=np.longdouble)
+        assert DG.duplicate_mask(_same).tolist() == [False, True]
+        assert DG._matrix_fingerprint(_same[:1]) == DG._matrix_fingerprint(_same[1:])
     # Exact rationals (Decimal/Fraction) are not numbers.Real; they must not be
     # rounded through float64 into false duplicates or false uniqueness.
     from fractions import Fraction
