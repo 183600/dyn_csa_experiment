@@ -148,12 +148,19 @@ def _save_summary(outdir, summary):
     _atomic_json(os.path.join(outdir, 'summary.json'), summary)
 
 
-def _is_current(rec, fp):
+def _is_current(rec, fp, *, data_fp=None, eval_fp=None):
     if not isinstance(rec, dict):
         return False
     if rec.get('run_fingerprint') != fp:
         return False
     if rec.get('code') != L.code_stamp():
+        return False
+    # The recipe fingerprint identifies the settings, not the bytes those
+    # settings were run on.  A rebuilt cache with the same dataset/config would
+    # otherwise be silently skipped and its old PPL reused.
+    if data_fp is not None and rec.get('data_fp') != data_fp:
+        return False
+    if eval_fp is not None and rec.get('eval_fp') != eval_fp:
         return False
     ppl = rec.get('ppl')
     return isinstance(ppl, (int, float)) and not isinstance(ppl, bool) and math.isfinite(float(ppl)) and float(ppl) > 0
@@ -177,7 +184,9 @@ def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
              outdir, fp, device, max_hours=None):
     key = f'{variant}::seed{int(seed)}'
     summary = _load_summary(outdir)
-    if _is_current(summary.get(key), fp):
+    _data_fp = L._ids_fp(train_ids) if train_ids is not None else None
+    _eval_fp = L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1)) if val_batch is not None else None
+    if _is_current(summary.get(key), fp, data_fp=_data_fp, eval_fp=_eval_fp):
         print(f'[open-block] skip {key} (current record)')
         return summary[key]
     if max_hours is not None and max_hours <= 0:

@@ -8189,6 +8189,25 @@ def t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields():
         G._fold_backup_into_aggregate(d)
 
 
+
+def t_open_block_resume_binds_data_fingerprints():
+    import open_block_supp as OB
+    tr = np.arange(16, dtype=np.int64)
+    va = np.arange(8, dtype=np.int64).reshape(1, 8)
+    rec = {'run_fingerprint': 'fp', 'code': L.code_stamp(), 'ppl': 10.0,
+           'data_fp': L._ids_fp(tr), 'eval_fp': L._ids_fp(va.reshape(-1))}
+    assert OB._is_current(rec, 'fp', data_fp=L._ids_fp(tr),
+                          eval_fp=L._ids_fp(va.reshape(-1))) is True
+    assert OB._is_current(rec, 'fp', data_fp=L._ids_fp(tr + 1),
+                          eval_fp=L._ids_fp(va.reshape(-1))) is False
+    assert OB._is_current(rec, 'fp', data_fp=L._ids_fp(tr),
+                          eval_fp=L._ids_fp(va.reshape(-1) + 1)) is False
+    # A legacy record without the fingerprints cannot be certified current.
+    legacy = {k: v for k, v in rec.items() if k not in ('data_fp', 'eval_fp')}
+    assert OB._is_current(legacy, 'fp', data_fp=L._ids_fp(tr),
+                          eval_fp=L._ids_fp(va.reshape(-1))) is False
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8449,6 +8468,7 @@ def main():
     _check('L42 empty-sequence pool kernel matches eager', t_pool_kernel_empty_sequence_matches_eager)
     _check('L43 eager_batch rejects typos/non-finite values', t_eager_batch_rejects_typos_and_nonfinite)
     _check('L44 gapfill merge refreshes/invalidates seed-derived fields', t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields)
+    _check('L45 open-block resume binds data fingerprints', t_open_block_resume_binds_data_fingerprints)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
