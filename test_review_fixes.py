@@ -2581,6 +2581,13 @@ def t_batch_iter_reproducible():
     assert torch.equal(b1[0], b2[0]) and torch.equal(b1[1], b2[1]), 'batch_iter must be seeded by the run seed'
     b3 = next(L.batch_iter(ids, 32, 4, torch.device('cpu'), seed=8))
     assert not torch.equal(b1[0], b3[0]), 'a different data seed must change the batch order'
+    for _bad in (-1, L.MAX_SEED + 1, True, 1.5):
+        try:
+            next(L.batch_iter(ids, 32, 4, torch.device('cpu'), seed=_bad))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'batch_iter must reject seed {_bad!r}')
 
 
 def t_batch_iter_uint16():
@@ -2797,6 +2804,11 @@ def t_dataloader_seeding_helpers():
         return [int(v) for b in dl for v in b[0]]
     assert order(7) == order(7), 'same DataLoader seed must reproduce the shuffled order'
     assert order(7) != order(8), 'a different DataLoader seed must change the shuffled order'
+    # Explicit None means "not supplied": it must not disable the seeded
+    # generator/worker hook and fall back to OS entropy.
+    _dl_none = L.deterministic_dataloader(ds, batch_size=8, shuffle=True, seed=7,
+                                          generator=None, worker_init_fn=None)
+    assert [int(v) for b in _dl_none for v in b[0]] == order(7)
     # worker RNGs are derived from torch.initial_seed(), not OS entropy
     def worker_draw():
         torch.manual_seed(11)

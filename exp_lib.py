@@ -8544,7 +8544,7 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     if _bs is None:
         raise ValueError(f'batch_iter needs a positive integer batch_size, got {batch_size!r}')
     seq_len, batch_size = int(_seq), int(_bs)
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(_seed_value(seed))
     # A corpus of exactly seq_len+1 tokens still contains one causal window
     # (start=0), so only a shortfall is invalid.
     n = len(train_ids) - seq_len - 1
@@ -18058,8 +18058,11 @@ def deterministic_dataloader(dataset, *, seed=0, **kwargs):
 
     Existing caller-supplied `generator` / `worker_init_fn` are respected."""
     from torch.utils.data import DataLoader
-    kwargs.setdefault('generator', dataloader_generator(seed))
-    kwargs.setdefault('worker_init_fn', seed_worker)
+    # An explicit None means "not supplied", not "please use OS entropy".
+    if kwargs.get('generator') is None:
+        kwargs['generator'] = dataloader_generator(seed)
+    if kwargs.get('worker_init_fn') is None:
+        kwargs['worker_init_fn'] = seed_worker
     return DataLoader(dataset, **kwargs)
 
 def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
