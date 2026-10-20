@@ -12085,6 +12085,38 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 problems.append('selection_row_split lacks the selection/evaluation row fingerprints')
             elif _split_info.get('selection_row_fp') == _split_info.get('evaluation_row_fp'):
                 problems.append('selection and evaluation row fingerprints are identical — the folds are not disjoint')
+            # A nested split only prevents selection bias if the final rows
+            # come after the selection rows in stream order.  A seeded random
+            # row permutation (the legacy policy) is disjoint but interleaves
+            # future chunks into selection; an artifact that declares it must
+            # not pass the nested-validation gate.
+            _policy = _split_info.get('policy')
+            if _policy is not None and _policy != 'chronological_contiguous_row_folds':
+                problems.append(
+                    f'selection_row_split policy is {_policy!r}, not '
+                    "'chronological_contiguous_row_folds' — a shuffled row "
+                    'split puts future validation chunks into selection')
+            elif _policy is None:
+                warnings.append('selection_row_split does not declare a fold policy; '
+                                'chronological ordering cannot be independently verified')
+            if _split_info.get('chronological') is False:
+                problems.append('selection_row_split explicitly declares a non-chronological split')
+            if _split_info.get('selection_precedes_evaluation') is False:
+                problems.append('selection_row_split evaluates earlier rows than it selects on '
+                                '(reverse-time nested validation)')
+            _sr = _split_info.get('selection_row_range')
+            _er = _split_info.get('evaluation_row_range')
+            if isinstance(_sr, (list, tuple)) and isinstance(_er, (list, tuple)):
+                try:
+                    _ok_range = (len(_sr) == 2 and len(_er) == 2
+                                 and int(_sr[0]) <= int(_sr[1])
+                                 and int(_er[0]) <= int(_er[1])
+                                 and int(_sr[1]) < int(_er[0]))
+                except (TypeError, ValueError, OverflowError):
+                    _ok_range = False
+                if not _ok_range:
+                    problems.append('selection_row_split row ranges are not ordered '
+                                    'selection-before-evaluation')
             _expected_sel_fp = _split_info.get('selection_row_fp')
             _expected_eval_fp = _split_info.get('evaluation_row_fp')
             for _arm, _entry in arms.items():

@@ -2730,6 +2730,11 @@ def t_nested_tuning_artifact_audit():
            'final_seeds': protocol['final_seeds'],
            'selection_row_split': {'applied': True, 'disjoint': True,
                                    'covers_all_rows': True,
+                                   'policy': 'chronological_contiguous_row_folds',
+                                   'chronological': True,
+                                   'selection_precedes_evaluation': True,
+                                   'selection_row_range': [0, 7],
+                                   'evaluation_row_range': [8, 15],
                                    'selection_row_fp': 'SELFP',
                                    'evaluation_row_fp': 'EVALFP',
                                    'n_selection_rows': 8, 'n_evaluation_rows': 8},
@@ -2756,6 +2761,20 @@ def t_nested_tuning_artifact_audit():
     bad2['final_records']['a::seed0']['holdout_row_fp'] = 'OTHER'
     rb2 = L.baseline_tuning_audit(bad2, protocol=protocol)
     assert rb2['tuning_verified'] is False and any('different held-out' in p for p in rb2['problems']), rb2
+    # A legacy/seeded random row permutation is disjoint but interleaves future
+    # chunks into selection, so it cannot pass the nested-validation gate.
+    bad_policy = json.loads(json.dumps(art))
+    bad_policy['selection_row_split']['policy'] = 'seeded_splitmix64_row_folds'
+    rp = L.baseline_tuning_audit(bad_policy, protocol=protocol)
+    assert rp['tuning_verified'] is False, rp
+    assert any('chronological_contiguous_row_folds' in p for p in rp['problems']), rp
+    # Reverse-time ranges are refused as well.
+    bad_range = json.loads(json.dumps(art))
+    bad_range['selection_row_split']['selection_row_range'] = [8, 15]
+    bad_range['selection_row_split']['evaluation_row_range'] = [0, 7]
+    rr = L.baseline_tuning_audit(bad_range, protocol=protocol)
+    assert rr['tuning_verified'] is False, rr
+    assert any('selection-before-evaluation' in p for p in rr['problems']), rr
     # A search trial selected on different rows than declared is refused.
     bad3 = json.loads(json.dumps(art))
     bad3['arms']['a']['trials'][0]['selection_row_fp'] = 'OTHER'
