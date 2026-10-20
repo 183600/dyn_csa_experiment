@@ -3408,6 +3408,45 @@ def t_audit_split_warning_status():
         assert out['caches'][os.path.abspath(d)]['status'] == 'warnings', out['caches']
 
 
+def t_audit_split_test_metadata_discipline():
+    with tempfile.TemporaryDirectory() as d:
+        tag = 'tiny'
+        ttag = 'tiny_test'
+        tr = np.arange(40, dtype=np.int64)
+        va = (np.arange(16, dtype=np.int64) + 40).reshape(2, 8)
+        te = (np.arange(16, dtype=np.int64) + 56).reshape(2, 8)
+        np.save(os.path.join(d, f'train_ids_{tag}.npy'), tr)
+        np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
+        np.save(os.path.join(d, f'test_ids_{ttag}.npy'), te)
+        with open(os.path.join(d, f'meta_{tag}.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 80, 'seq_len': 8, 'split_strategy': 'ordered',
+                       'shuffle_at_split': False,
+                       'tokenizer_fit_split': 'train'}, f)
+        good_test = {'vocab': 80, 'seq_len': 8, 'split_strategy': 'official_test',
+                     'shuffle_at_split': False,
+                     'tokenizer_fit_split': 'train',
+                     'near_duplicate_cleanup': {
+                         'policy': 'test_documents_deduplicated_against_train_and_validation'}}
+        with open(os.path.join(d, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
+            json.dump(good_test, f)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec.get('test_shuffle_at_split') is False, rec
+        assert rec['status'] != 'fail', rec
+        bad_test = dict(good_test, shuffle_at_split=True,
+                        tokenizer_fit_split='test',
+                        near_duplicate_cleanup={'policy': 'none'})
+        with open(os.path.join(d, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
+            json.dump(bad_test, f)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] == 'fail', rec
+        assert rec.get('test_shuffle_at_split') is True, rec
+        assert any('test metadata declares a shuffled split' in w for w in out['warnings']), out
+        assert any('test tokenizer was fitted on' in w for w in out['warnings']), out
+        assert any('duplicate cleanup' in w for w in out['warnings']), out
+
+
 def t_corpus_audit_overlap_is_unique_across_windows():
     # The same validation row repeated in two disjoint training windows is ONE
     # overlapping validation row, not two.
@@ -3900,6 +3939,159 @@ def t_locked_json_and_csv_generator():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def t_data_guard_preprocessor_option_guards():
+    for bad in ({'missing': True}, {'missing': np.bool_(False)},
+                {'eps': -1.0}, {'eps': float('nan')}, {'eps': float('inf')},
+                {'eps': True}, {'clip_z': True}, {'clip_z': float('nan')},
+                {'clip_quantiles': (True, 1.0)},
+                {'clip_quantiles': (0.0, np.bool_(True))}):
+        try:
+            L.LeakageSafePreprocessor(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'preprocessor accepted invalid options {bad!r}')
+    prep = L.LeakageSafePreprocessor(scale='standard', clip_quantiles=None,
+                                     eps=0.0).fit(np.array([[1.0], [1.0]]))
+    out = prep.transform(np.array([[1.0], [2.0]]))
+    assert np.all(np.isfinite(out)), out
+    assert prep.get_stats()['eps'] == 0.0
+    assert L.LeakageSafePreprocessor(missing=np.float32(0.0)).missing == 0.0
+
+
+def t_categorical_shift_requires_two_bins():
+    for bad in (0, -1, 1, True):
+        try:
+            L.categorical_shift_report([1, 2], [1, 2], max_categories=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'max_categories={bad!r} must be rejected')
+    r = L.categorical_shift_report([1, 1, 2], [1, 2], max_categories=2)
+    assert r['n_reference'] == 3 and r['n_holdout'] == 2, r
+
+
+def t_data_quality_unhashable_labels():
+    X = np.array([[0.0], [0.0], [1.0], [2.0]])
+    y = np.empty(4, dtype=object)
+    y[0], y[1], y[2], y[3] = ['a'], ['b'], ['c'], ['d']
+    rep = L.data_quality_report(X, y=y, train_idx=[0, 2], val_idx=[1],
+                                test_idx=[3])
+    assert rep['checks']['label_conflicts_on_duplicate_rows'] == 1, rep
+    assert rep['status'] == 'fail', rep
+
+
+def t_categorical_encoder_train_only():
+    train = np.array([['a', 'x'], ['b', None], ['a', np.nan]], dtype=object)
+    holdout = np.array([['z', 'x'], ['a', 'y'], [None, 'z']], dtype=object)
+    enc = L.LeakageSafeCategoricalEncoder()
+    x_train = enc.fit_transform(train)
+    stats = enc.get_stats()
+    x_hold = enc.transform(holdout)
+    assert np.array_equal(enc.transform(holdout), x_hold)
+    assert enc.get_stats() == stats, 'transform must not add holdout categories'
+    assert stats['features'][0]['categories'] == ['a', 'b'], stats
+    assert stats['features'][1]['categories'] == ['x'], stats
+    assert x_train[:, 0].tolist() == [0.0, 1.0, 0.0], x_train
+    assert x_hold[:, 0].tolist() == [2.0, 0.0, 3.0], x_hold
+    assert x_hold[:, 1].tolist() == [0.0, 1.0, 1.0], x_hold
+    restored = L.LeakageSafeCategoricalEncoder.from_stats(stats)
+    assert np.array_equal(restored.transform(holdout), x_hold)
+    bundle = L.prepare_categorical_features(train, holdout)
+    assert np.array_equal(bundle['train'], x_train), bundle
+    assert np.array_equal(bundle['val'], x_hold), bundle
+    assert bundle['encoder'].get_stats() == stats, bundle
+    onehot = L.LeakageSafeCategoricalEncoder(encoding='onehot').fit(train)
+    oh_hold = onehot.transform(holdout)
+    assert oh_hold.shape == (3, 4 + 3), oh_hold.shape
+    assert np.allclose(oh_hold[:, :4].sum(axis=1), 1.0), oh_hold
+    assert np.allclose(oh_hold[:, 4:].sum(axis=1), 1.0), oh_hold
+    assert len(onehot.get_feature_names()) == oh_hold.shape[1]
+    strict = L.LeakageSafeCategoricalEncoder(handle_unknown='error').fit(train)
+    try:
+        strict.transform(holdout)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('handle_unknown="error" must reject a new level')
+    try:
+        L.LeakageSafeCategoricalEncoder().transform(train)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('transform before fit must fail')
+    try:
+        enc.transform(np.zeros((1, 3), dtype=object))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('feature-width mismatch must fail')
+
+
+def t_clean_training_rows_and_split():
+    X = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 1.0],
+                  [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
+    y = np.array([0, 1, 2, 2, 3, 4])
+    clean = L.clean_training_rows(X, y, train_idx=[0, 1, 2, 3])
+    assert clean['train_idx'].tolist() == [2], clean
+    assert sorted(clean['dropped_idx'].tolist()) == [0, 1, 3], clean
+    assert clean['n_label_conflict_clusters'] == 1, clean
+    assert clean['n_duplicate_rows_dropped'] == 1, clean
+    assert clean['n_label_conflict_rows_dropped'] == 2, clean
+    keep = L.clean_training_rows(X, y, train_idx=[0, 1, 2, 3],
+                                 label_conflicts='keep')
+    assert keep['train_idx'].tolist() == [0, 1, 2], keep
+    nodrop = L.clean_training_rows(X, y, train_idx=[0, 1, 2, 3],
+                                   drop_duplicates=False,
+                                   label_conflicts='drop')
+    assert nodrop['train_idx'].tolist() == [2, 3], nodrop
+    try:
+        L.clean_training_rows(X, y, train_idx=[0, 1, 2, 3],
+                              label_conflicts='raise')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('label_conflicts="raise" must refuse ambiguity')
+
+    Xs = np.array([[0.0, 1.0], [2.0, 1.0], [np.nan, 1.0],
+                   [0.0, 1.0], [1000.0, 1.0], [2000.0, 1.0], [3000.0, 1.0]])
+    ys = np.array([0, 1, 1, 0, 1, 0, 1])
+    out = L.split_and_prepare(Xs, ys, train_frac=4 / 7, val_frac=1 / 7,
+                              test_frac=2 / 7, clean_train=True,
+                              quality_report=True)
+    idx = out['indices']
+    assert idx['train'].tolist() == [0, 1, 2], idx
+    assert out['cleaning']['dropped_idx'].tolist() == [3], out['cleaning']
+    assert idx['val'].tolist() == [4] and idx['test'].tolist() == [5, 6], idx
+    assert abs(out['preprocessor'].get_stats()['features'][0]['center'] - 1.0) < 1e-12
+    assert out['quality']['n_train_reference'] == 3, out['quality']
+
+
+def t_known_labels_audit():
+    X = np.arange(8, dtype=float).reshape(4, 2)
+    y = [0, 1, 2, 9]
+    rep = L.data_quality_report(X, y=y, train_idx=[0, 1], val_idx=[2],
+                                test_idx=[3], known_labels=[0, 1, 2])
+    assert rep['checks']['unknown_labels_by_split']['test'] == {'9': 1}, rep
+    assert rep['status'] == 'warnings', rep
+    hard = L.data_quality_report(
+        X, y=y, train_idx=[0, 1], val_idx=[2], test_idx=[3],
+        known_labels=[0, 1, 2], fail_on_unknown_labels=True)
+    assert hard['status'] == 'fail', hard
+    try:
+        L.data_quality_report(X, y=y, train_idx=[0, 1], known_labels='012')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a single string must not be read as a label set')
+    try:
+        L.data_quality_report(X, train_idx=[0, 1], known_labels=[0, 1])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('known_labels without y must fail closed')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -4043,6 +4235,7 @@ def main():
     _check('I11 failure audit does not count NaN PPL as a success', t_audit_failures_ignores_unmeasured_ppl)
     _check('I12 object-time NaN + zero-feature data guards', t_object_time_and_zero_feature_guards)
     _check('I13 split audit marks per-cache warnings', t_audit_split_warning_status)
+    _check('I13b split audit checks test metadata discipline', t_audit_split_test_metadata_discipline)
     _check('I14 corpus audit counts overlapping validation rows once', t_corpus_audit_overlap_is_unique_across_windows)
     _check('I15 length audit refuses a missing eval span', t_audit_length_requires_eval_span)
     _check('I16 fairness audit ignores a NaN seed instead of crashing', t_audit_fairness_nan_seed_does_not_crash)
@@ -4057,6 +4250,12 @@ def main():
     _check('I23 grouped split refuses an empty requested side', t_group_split_refuses_empty_requested_side)
     _check('I24 label shift and per-split label corruption counts', t_label_shift_and_split_counts)
     _check('I25 numeric-looking string labels stay categorical', t_label_key_keeps_numeric_strings)
+    _check('I26 preprocessor rejects boolean/negative-eps options', t_data_guard_preprocessor_option_guards)
+    _check('I27 categorical shift requires a meaningful bin count', t_categorical_shift_requires_two_bins)
+    _check('I28 label-noise audit handles unhashable labels', t_data_quality_unhashable_labels)
+    _check('I29 categorical encoding is fitted on train only', t_categorical_encoder_train_only)
+    _check('I30 train-only cleaning before preprocessing', t_clean_training_rows_and_split)
+    _check('I31 declared label set catches unseen/holdout labels', t_known_labels_audit)
     # Open-block reading rule: the substantive gates (causality, reference
     # pooling, masks, edge cases, closed regression) live in test_open_block.py
     # so they can also be run on their own.

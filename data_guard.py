@@ -38,15 +38,19 @@ import numpy as np
 
 __all__ = [
     'SPLIT_NAMES',
+    'LeakageSafeCategoricalEncoder',
     'LeakageSafePreprocessor',
     'SafeScaler',
     'assert_no_split_leakage',
     'categorical_shift_report',
     'chronological_split',
     'chronological_split_indices',
+    'clean_training_rows',
     'data_quality_report',
     'duplicate_mask',
+    'fit_categorical_encoder',
     'fit_preprocessor',
+    'prepare_categorical_features',
     'grouped_chronological_split',
     'grouped_chronological_split_indices',
     'prepare_features',
@@ -840,6 +844,10 @@ class LeakageSafePreprocessor:
                  clip_quantiles=(0.001, 0.999), clip_z=None, eps=_EPS):
         if scale not in ('standard', 'robust', 'minmax', 'none'):
             raise ValueError(f'unknown scale={scale!r}')
+        if isinstance(missing, (bool, np.bool_)):
+            raise ValueError(
+                f'missing must be a finite constant or one of '
+                f"'median'/'mean'/'zero', got {missing!r}")
         if isinstance(missing, (numbers.Real, np.integer, np.floating)):
             missing = float(missing)
             if not math.isfinite(missing):
@@ -851,17 +859,28 @@ class LeakageSafePreprocessor:
             raise ValueError(f'unknown missing={missing!r}')
         if clip_quantiles is not None:
             lo, hi = clip_quantiles
+            if any(isinstance(v, (bool, np.bool_)) for v in (lo, hi)):
+                raise ValueError('clip_quantiles must be numeric, not booleans')
             lo, hi = float(lo), float(hi)
             if not (0.0 <= lo < hi <= 1.0):
                 raise ValueError('clip_quantiles must satisfy 0 <= lo < hi <= 1')
             clip_quantiles = (lo, hi)
-        if clip_z is not None and not (float(clip_z) > 0.0):
-            raise ValueError('clip_z must be positive or None')
+        if isinstance(clip_z, (bool, np.bool_)):
+            raise ValueError('clip_z must be positive or None, not a boolean')
+        if clip_z is not None:
+            clip_z = float(clip_z)
+            if not (math.isfinite(clip_z) and clip_z > 0.0):
+                raise ValueError('clip_z must be a finite positive number or None')
+        if isinstance(eps, (bool, np.bool_)):
+            raise ValueError('eps must be a finite non-negative number, not a boolean')
+        eps = float(eps)
+        if not (math.isfinite(eps) and eps >= 0.0):
+            raise ValueError(f'eps must be a finite non-negative number, got {eps!r}')
         self.scale = scale
         self.missing = missing
         self.clip_quantiles = clip_quantiles
         self.clip_z = None if clip_z is None else float(clip_z)
-        self.eps = float(eps)
+        self.eps = eps
         self.fitted_ = False
 
     # -- fitting ----------------------------------------------------------
@@ -1017,6 +1036,197 @@ class LeakageSafePreprocessor:
         return obj
 
 
+def _as_categorical_2d(X, *, name='X'):
+    arr = np.asarray(X, dtype=object)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2:
+        raise ValueError(f'{name} must be 1-D or 2-D, got shape {arr.shape}')
+    return arr
+
+
+def _category_is_missing(value):
+    if value is None:
+        return True
+    if isinstance(value, (float, np.floating)):
+        return bool(math.isnan(float(value)))
+    if isinstance(value, np.datetime64):
+        return bool(np.isnat(value))
+    return False
+
+
+def _sorted_categories(values):
+    unique = {}
+    for value in values:
+        if _category_is_missing(value):
+            continue
+        unique.setdefault(_hashable_label(value), value)
+    return sorted(unique.values(),
+                  key=lambda v: (type(v).__name__, repr(v)))
+
+
+def _categorical_fingerprint(X):
+    h = hashlib.sha256()
+    arr = np.asarray(X, dtype=object)
+    h.update(str(arr.shape).encode('ascii'))
+    for row in arr.tolist():
+        h.update(repr(row).encode('utf-8', errors='replace'))
+        h.update(b'\x1f')
+    return h.hexdigest()[:16]
+
+
+class LeakageSafeCategoricalEncoder:
+    """Ordinal/one-hot encode categories learned from training rows only.
+
+    ``fit`` records the category set of each column from the training split.
+    ``transform`` maps validation/test values into that fixed space and never
+    adds a level, so an unseen holdout category cannot widen the feature matrix
+    or shift the encoding of a training row.  Missing values and unknown
+    categories always have their own reserved level.
+    """
+
+    def __init__(self, *, encoding='ordinal', handle_unknown='unknown'):
+        if encoding not in ('ordinal', 'onehot'):
+            raise ValueError(f"encoding must be 'ordinal' or 'onehot', got {encoding!r}")
+        if handle_unknown not in ('unknown', 'error'):
+            raise ValueError(
+                f"handle_unknown must be 'unknown' or 'error', got {handle_unknown!r}")
+        self.encoding = encoding
+        self.handle_unknown = handle_unknown
+        self.fitted_ = False
+
+    def fit(self, X, y=None):
+        Xarr = _as_categorical_2d(X)
+        n, p = Xarr.shape
+        if n == 0:
+            raise ValueError('cannot fit a categorical encoder on zero training rows')
+        stats = []
+        for j in range(p):
+            categories = _sorted_categories(Xarr[:, j].tolist())
+            stats.append({
+                'categories': categories,
+                'n_categories': int(len(categories)),
+                'unknown_index': int(len(categories)),
+                'missing_index': int(len(categories) + 1),
+            })
+        self.feature_stats_ = stats
+        self.n_features_in_ = int(p)
+        self.n_train_ = int(n)
+        self.train_fp_ = _categorical_fingerprint(Xarr)
+        self.fitted_ = True
+        return self
+
+    def _check_transform_input(self, X):
+        if not self.fitted_:
+            raise RuntimeError(
+                'LeakageSafeCategoricalEncoder.transform called before fit')
+        Xarr = _as_categorical_2d(X)
+        if Xarr.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f'X has {Xarr.shape[1]} features, but the encoder was fitted '
+                f'on {self.n_features_in_}')
+        return Xarr
+
+    def transform(self, X):
+        Xarr = self._check_transform_input(X)
+        n = int(Xarr.shape[0])
+        if self.encoding == 'ordinal':
+            out = np.empty((n, self.n_features_in_), dtype=np.float64)
+            for j, st in enumerate(self.feature_stats_):
+                lookup = {_hashable_label(c): i
+                          for i, c in enumerate(st['categories'])}
+                for i, value in enumerate(Xarr[:, j].tolist()):
+                    if _category_is_missing(value):
+                        out[i, j] = st['missing_index']
+                        continue
+                    code = lookup.get(_hashable_label(value))
+                    if code is None:
+                        if self.handle_unknown == 'error':
+                            raise ValueError(
+                                f'unseen category {value!r} in column {j}; '
+                                'the encoder was fitted on training rows only')
+                        code = st['unknown_index']
+                    out[i, j] = code
+            return out
+        width = sum(s['n_categories'] + 2 for s in self.feature_stats_)
+        out = np.zeros((n, width), dtype=np.float64)
+        offset = 0
+        for j, st in enumerate(self.feature_stats_):
+            lookup = {_hashable_label(c): i
+                      for i, c in enumerate(st['categories'])}
+            span = st['n_categories'] + 2
+            for i, value in enumerate(Xarr[:, j].tolist()):
+                if _category_is_missing(value):
+                    out[i, offset + st['missing_index']] = 1.0
+                    continue
+                code = lookup.get(_hashable_label(value))
+                if code is None:
+                    if self.handle_unknown == 'error':
+                        raise ValueError(
+                            f'unseen category {value!r} in column {j}; '
+                            'the encoder was fitted on training rows only')
+                    code = st['unknown_index']
+                out[i, offset + code] = 1.0
+            offset += span
+        return out
+
+    def fit_transform(self, X, y=None):
+        """Fit on **training** categories and transform them (never test)."""
+        return self.fit(X, y).transform(X)
+
+    def get_feature_names(self):
+        if not self.fitted_:
+            raise RuntimeError('encoder has not been fitted')
+        if self.encoding == 'ordinal':
+            return [f'x{j}' for j in range(self.n_features_in_)]
+        names = []
+        for j, st in enumerate(self.feature_stats_):
+            names.extend(f'x{j}={c!r}' for c in st['categories'])
+            names.append(f'x{j}=__unknown__')
+            names.append(f'x{j}=__missing__')
+        return names
+
+    def get_stats(self):
+        if not self.fitted_:
+            raise RuntimeError('encoder has not been fitted')
+        return {
+            'encoding': self.encoding,
+            'handle_unknown': self.handle_unknown,
+            'n_features_in': self.n_features_in_,
+            'n_train': self.n_train_,
+            'train_fp': self.train_fp_,
+            'features': [dict(s) for s in self.feature_stats_],
+        }
+
+    @classmethod
+    def from_stats(cls, stats):
+        """Rebuild a fitted encoder from :meth:`get_stats` output."""
+        obj = cls(encoding=stats['encoding'],
+                  handle_unknown=stats.get('handle_unknown', 'unknown'))
+        obj.feature_stats_ = [dict(s) for s in stats['features']]
+        obj.n_features_in_ = int(stats['n_features_in'])
+        obj.n_train_ = int(stats.get('n_train', 0))
+        obj.train_fp_ = stats.get('train_fp')
+        obj.fitted_ = True
+        return obj
+
+
+def fit_categorical_encoder(X_train, **kwargs):
+    """Fit a categorical encoder on training rows only."""
+    return LeakageSafeCategoricalEncoder(**kwargs).fit(X_train)
+
+
+def prepare_categorical_features(X_train, X_val=None, X_test=None, **kwargs):
+    """Encode train categories first, then transform the holdouts."""
+    encoder = LeakageSafeCategoricalEncoder(**kwargs).fit(X_train)
+    out = {'train': encoder.transform(X_train), 'encoder': encoder}
+    if X_val is not None:
+        out['val'] = encoder.transform(X_val)
+    if X_test is not None:
+        out['test'] = encoder.transform(X_test)
+    return out
+
+
 # Conventional short alias.
 SafeScaler = LeakageSafePreprocessor
 
@@ -1041,10 +1251,116 @@ def prepare_features(X_train, X_val=None, X_test=None, **kwargs):
     return out
 
 
+def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
+                        label_conflicts='drop'):
+    """Remove duplicate/ambiguous rows from the training split only.
+
+    The holdout indices are not accepted by this function, so no validation or
+    test row can be dropped, imputed or used to decide which duplicate to keep.
+    Rows are grouped by their exact feature key; the first occurrence in the
+    supplied training order is retained.  When duplicate rows carry different
+    non-missing labels, ``label_conflicts='drop'`` removes the whole ambiguous
+    cluster (the safe choice before fitting), ``'keep'`` retains it and
+    ``'raise'`` refuses to continue.
+
+    Returns ``train_idx`` (the cleaned index array), the dropped rows and
+    counts suitable for a run manifest.
+    """
+    Xarr = _as_float_2d(X)
+    n = int(Xarr.shape[0])
+    train_rows = _validated_index(train_idx, name='train_idx')
+    if train_rows.size == 0:
+        raise ValueError('clean_training_rows: the training split is empty')
+    if int(train_rows.max()) >= n:
+        raise ValueError(
+            f'clean_training_rows: train_idx reaches {int(train_rows.max())} '
+            f'but X has {n} rows')
+    if label_conflicts not in ('drop', 'keep', 'raise'):
+        raise ValueError(
+            f"label_conflicts must be 'drop', 'keep' or 'raise', "
+            f"got {label_conflicts!r}")
+    labels = None
+    if y is not None:
+        yarr = np.asarray(y)
+        if yarr.ndim == 0 or yarr.shape[0] != n:
+            raise ValueError(
+                f'clean_training_rows: y has '
+                f'{yarr.shape[0] if yarr.ndim else 1} rows, expected {n}')
+        train_rows_needed = np.unique(train_rows).tolist()
+        if yarr.ndim == 1:
+            labels = {int(i): _label_key(yarr[i])
+                      for i in train_rows_needed}
+        else:
+            rows = yarr.reshape(n, -1)
+            labels = {int(i): tuple(_label_key(v) for v in rows[i].tolist())
+                      for i in train_rows_needed}
+
+    def _missing(lab):
+        return lab is None or (isinstance(lab, tuple)
+                               and all(v is None for v in lab))
+
+    keys = _row_keys(Xarr)
+    clusters = {}
+    for pos, row in enumerate(train_rows.tolist()):
+        clusters.setdefault(keys[row], []).append(pos)
+    drop = np.zeros(train_rows.size, dtype=bool)
+    n_duplicate_rows = 0
+    n_conflict_rows = 0
+    n_conflict_clusters = 0
+    for positions in clusters.values():
+        if len(positions) < 2:
+            continue
+        valid = set()
+        if labels is not None:
+            valid = {_hashable_label(labels[int(train_rows[p])])
+                     for p in positions
+                     if not _missing(labels[int(train_rows[p])])}
+        if labels is not None and len(valid) > 1:
+            n_conflict_clusters += 1
+            if label_conflicts == 'raise':
+                raise ValueError(
+                    f'clean_training_rows: {len(positions)} duplicate training '
+                    f'rows carry {len(valid)} different labels; resolve them '
+                    'or use label_conflicts="drop"')
+            if label_conflicts == 'drop':
+                drop[positions] = True
+                n_conflict_rows += len(positions)
+                continue
+            continue
+        if drop_duplicates:
+            keep = positions[0]
+            if labels is not None:
+                for p in positions:
+                    if not _missing(labels[int(train_rows[p])]):
+                        keep = p
+                        break
+            for p in positions:
+                if p != keep:
+                    drop[p] = True
+                    n_duplicate_rows += 1
+    out_idx = train_rows[~drop].copy()
+    if out_idx.size == 0:
+        raise ValueError(
+            'clean_training_rows: every training row was dropped; refusing to '
+            'fit on an empty split')
+    return {
+        'train_idx': out_idx,
+        'dropped_idx': train_rows[drop].copy(),
+        'n_train_rows_in': int(train_rows.size),
+        'n_train_rows_out': int(out_idx.size),
+        'n_duplicate_rows_dropped': int(n_duplicate_rows),
+        'n_label_conflict_rows_dropped': int(n_conflict_rows),
+        'n_label_conflict_clusters': int(n_conflict_clusters),
+        'drop_duplicates': bool(drop_duplicates),
+        'label_conflicts': label_conflicts,
+    }
+
+
 def split_and_prepare(X, y=None, *, time=None, groups=None,
                       train_frac=0.8, val_frac=0.1, test_frac=0.1,
                       train_size=None, val_size=None, test_size=None,
                       purge=0, preprocess=True, quality_report=False,
+                      clean_train=False, label_conflicts='drop',
                       quality_kwargs=None, **preprocessor_kwargs):
     """Split first, then fit every preprocessing statistic on train only.
 
@@ -1060,10 +1376,15 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     Passing ``quality_report=True`` additionally runs
     :func:`data_quality_report` on the raw table with the same split indices
     (still train-only statistics for the outlier/shift reference).
+    ``clean_train=True`` first removes exact duplicate training rows and, by
+    default, ambiguous duplicate-label clusters via
+    :func:`clean_training_rows`; validation/test rows are never dropped or
+    inspected.  The returned ``indices['train']`` is the cleaned index, so the
+    preprocessor and every downstream step see exactly the same rows.
 
     Returns a dict with ``indices``, per-split ``X`` (and ``y``), the fitted
-    ``preprocessor`` (or ``None`` when ``preprocess=False``), and optionally
-    the ``quality`` report.
+    ``preprocessor`` (or ``None`` when ``preprocess=False``), an optional
+    ``cleaning`` record and optionally the ``quality`` report.
     """
     Xarr = _as_numeric_2d(X)
     n = int(Xarr.shape[0])
@@ -1077,8 +1398,18 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
                         train_frac=train_frac, val_frac=val_frac,
                         test_frac=test_frac, train_size=train_size,
                         val_size=val_size, test_size=test_size, purge=purge)
+    cleaning = None
+    if clean_train:
+        cleaning = clean_training_rows(
+            Xarr, y=yarr, train_idx=idx['train'],
+            label_conflicts=label_conflicts)
+        idx['train'] = cleaning['train_idx']
+        assert_no_split_leakage(idx['train'], idx['val'], idx['test'],
+                                groups=groups, time=time)
     raw_X = {name: _take(Xarr, idx[name]) for name in SPLIT_NAMES}
     out = {'indices': idx, 'X': dict(raw_X)}
+    if cleaning is not None:
+        out['cleaning'] = cleaning
     if yarr is not None:
         out['y'] = {name: _take(yarr, idx[name]) for name in SPLIT_NAMES}
     prep = None
@@ -1205,6 +1536,14 @@ def _split_array(X, idx):
     return X[np.asarray(idx, dtype=np.int64).reshape(-1)]
 
 
+def _hashable_label(value):
+    try:
+        hash(value)
+    except TypeError:
+        return ('__unhashable__', type(value).__name__, repr(value))
+    return value
+
+
 def _label_key(v):
     if v is None:
         return None
@@ -1229,9 +1568,11 @@ def _label_key(v):
 
 def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=None,
                         groups=None, time=None, clip_z=3.0, shift_threshold=0.5,
+                        known_labels=None,
                         fail_on_nan_inf=True, fail_on_label_conflict=True,
                         fail_on_nonfinite_labels=False,
                         fail_on_label_shift=False,
+                        fail_on_unknown_labels=False,
                         fail_on_duplicate_rows=False, fail_on_outliers=False,
                         fail_on_shift=False):
     """Report the common data-cleaning failure modes before any fit.
@@ -1264,6 +1605,10 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     labels and label shift are warnings by default; ``fail_on_nonfinite_labels``
     and ``fail_on_label_shift`` turn them into hard failures.  The training
     labels are the only reference distribution.
+
+    ``known_labels`` optionally declares the admissible label set (a typo or a
+    label seen only in a holdout is then reported per split).
+    ``fail_on_unknown_labels`` turns that into a hard failure.
     """
     # A NaN/negative threshold silently disables the corresponding gate
     # (NaN compares False against everything), which is worse than an error.
@@ -1285,6 +1630,21 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             f'{shift_threshold!r}')
     X = _as_float_2d(X)
     n = X.shape[0]
+    known = None
+    if known_labels is not None:
+        if isinstance(known_labels, (str, bytes)):
+            raise ValueError(
+                'known_labels must be an iterable of labels, not a single string')
+        try:
+            values = (known_labels.reshape(-1).tolist()
+                      if isinstance(known_labels, np.ndarray)
+                      else list(known_labels))
+        except TypeError:
+            raise ValueError('known_labels must be a flat iterable of labels') from None
+        known = {_hashable_label(_label_key(v)) for v in values}
+        known.discard(None)
+        if y is None:
+            raise ValueError('known_labels requires y so the labels can be audited')
     idx = {'train': train_idx, 'val': val_idx, 'test': test_idx}
     for name, v in idx.items():
         if v is not None:
@@ -1472,7 +1832,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         by_row = {}
         for i, (k, lab) in enumerate(zip(keys, labels)):
             if lab is not None:
-                by_row.setdefault(k, set()).add(lab)
+                by_row.setdefault(k, set()).add(_hashable_label(lab))
         conflicts = [k for k, labs in by_row.items() if len(labs) > 1]
         checks['label_conflicts_on_duplicate_rows'] = len(conflicts)
         if conflicts:
@@ -1482,6 +1842,28 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 hard_failures.append(_msg)
             else:
                 warnings.append(_msg)
+        if known is not None:
+            unknown_by_split = {}
+            for name, rows in split_rows.items():
+                counts = {}
+                for i in np.asarray(rows, dtype=np.int64).reshape(-1).tolist():
+                    lab = labels[i]
+                    if lab is None:
+                        continue
+                    key = _hashable_label(lab)
+                    if key not in known:
+                        text = str(lab)
+                        counts[text] = counts.get(text, 0) + 1
+                unknown_by_split[name] = counts
+            checks['unknown_labels_by_split'] = unknown_by_split
+            _n_unknown = sum(sum(v.values()) for v in unknown_by_split.values())
+            if _n_unknown:
+                _msg = (f'{_n_unknown} labels are outside the declared '
+                        f'known_labels set: {unknown_by_split}')
+                if fail_on_unknown_labels:
+                    hard_failures.append(_msg)
+                else:
+                    warnings.append(_msg)
         # Stringify before counting so mixed/object label types cannot make
         # np.unique raise (and so a numpy scalar and its Python twin count as
         # one category).  This is an audit histogram, not a model input.
@@ -1670,6 +2052,11 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
                 'unseen_rate': 0.0}
     if max_categories is not None:
         max_categories = _check_count('max_categories', max_categories, positive=True)
+        if max_categories < 2:
+            raise ValueError(
+                'max_categories must be at least 2: a single bin would collapse '
+                'the reference distribution and report zero divergence while '
+                'every holdout category is unseen')
         cat = np.unique(ref)
         if cat.size > max_categories:
             # Keep the most frequent reference categories plus an "other" bin.

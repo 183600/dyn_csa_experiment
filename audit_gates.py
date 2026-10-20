@@ -700,10 +700,26 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     continue
                 if meta.get('fit_fp') and _tm.get('fit_fp') and meta['fit_fp'] != _tm['fit_fp']:
                     continue
-                _cands.append((_tfp, _ttag))
+                _cands.append((_tfp, _ttag, _tm))
             te = None
             if len(_cands) == 1:
-                _tfp, _ttag = _cands[0]
+                _tfp, _ttag, _tmeta = _cands[0]
+                rec['test_split_strategy'] = _tmeta.get('split_strategy') or 'legacy_unrecorded'
+                rec['test_shuffle_at_split'] = _tmeta.get('shuffle_at_split')
+                rec['test_tokenizer_fit_split'] = _tmeta.get('tokenizer_fit_split')
+                if _tmeta.get('shuffle_at_split') is True:
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test metadata declares a shuffled split')
+                if _tmeta.get('tokenizer_fit_split') not in (None, 'train'):
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test tokenizer was fitted on {_tmeta.get("tokenizer_fit_split")!r}, not train')
+                if _tmeta.get('split_strategy') is None:
+                    _warn(f'{cd}/{tag}: legacy test cache has no split_strategy/tokenizer provenance metadata')
+                _tndc = _tmeta.get('near_duplicate_cleanup')
+                if isinstance(_tndc, dict):
+                    if _tndc.get('policy') != 'test_documents_deduplicated_against_train_and_validation':
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: test metadata does not attest duplicate cleanup against both train and validation')
                 try:
                     te = np.load(_tfp, mmap_mode='r')
                     rec['test_file'] = os.path.basename(_tfp)
@@ -712,7 +728,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     te = None
             elif len(_cands) > 1:
                 rec['test_pairing'] = 'ambiguous'
-                rec['test_candidates'] = sorted(os.path.basename(p) for p, _ in _cands)
+                rec['test_candidates'] = sorted(os.path.basename(p) for p, _, _ in _cands)
                 _warn(f'{cd}/{tag}: {len(_cands)} test caches match the same protocol; refusing to guess which test split to audit')
             else:
                 rec['test_pairing'] = 'not_found'
