@@ -6451,6 +6451,15 @@ def t_reportable_claim_gate():
                                 dropped_seeds=[6]))
     assert r['allowed'] is False and any('complete-case' in x for x in r['reasons']), r
     assert r['n_input'] == 7 and r['n_dropped'] == 1, r
+    # Negative or internally inconsistent dropout accounting is not a clean
+    # complete panel; it must not bypass the complete-case refusal.
+    for _bad in (dict(base, n_input=-1, n_dropped=0),
+                 dict(base, n_input=6, n_dropped=-1),
+                 dict(base, n_input=3, n_dropped=6)):
+        _rb = L.reportable_claim(_bad)
+        assert _rb['allowed'] is False, (_bad, _rb)
+        assert any('n_input' in x or 'n_dropped' in x or 'panel accounting' in x
+                   for x in _rb['reasons']), (_bad, _rb)
     # A threshold outside (0,1) must be rejected, not used to relabel every
     # p-value as significant (alpha=1.5) or unreachable (alpha=0).
     _alpha_pts = [{'label': f'S{i}', 'scale': i + 1,

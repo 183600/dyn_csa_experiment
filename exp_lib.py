@@ -9351,7 +9351,16 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     _n_dropped = _as_seed_int(stats.get('n_dropped'))
     out['n_input'] = _n_input
     out['n_dropped'] = _n_dropped
-    if _n_dropped is not None and _n_dropped > 0:
+    if _n_input is not None and _n_input < 0:
+        out['reasons'].append(f'n_input={_n_input} is negative; the paired panel size is unverifiable')
+    if _n_dropped is not None and _n_dropped < 0:
+        out['reasons'].append(f'n_dropped={_n_dropped} is negative; the paired panel size is unverifiable')
+    elif (_n_dropped is not None and _n_input is not None
+          and _n_dropped > _n_input):
+        out['reasons'].append(
+            f'n_dropped={_n_dropped} exceeds n_input={_n_input}; the paired '
+            'panel accounting is inconsistent')
+    elif _n_dropped is not None and _n_dropped > 0:
         out['reasons'].append(
             f'{_n_dropped} paired observation(s) were dropped as non-finite '
             f'(n_input={_n_input}); complete-case significance is not a '
