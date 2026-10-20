@@ -6962,6 +6962,38 @@ def t_report_nan_section_uses_triage():
         BR._result_summaries = orig
 
 
+def t_audit_training_health_records():
+    td = tempfile.mkdtemp(prefix='health_', dir=REPO)
+    try:
+        clean = {'curve_health': {'status': 'healthy'},
+                 'opt_diag_summary': {'nonfinite_loss_steps': 0,
+                                      'nonfinite_grad_steps': 0,
+                                      'nan_guard': {'elements_cleaned': 0}},
+                 'instability_diagnosis': {'status': 'clean'}}
+        over = {'curve_health': {'status': 'overfitting', 'reason': 'val rising'}}
+        contra = {'curve_health': {'status': 'healthy'},
+                  'opt_diag_summary': {'nonfinite_loss_steps': 1,
+                                       'nonfinite_grad_steps': 0,
+                                       'nan_guard': {'elements_cleaned': 0}},
+                  'instability_diagnosis': {'status': 'clean'}}
+        legacy = {'curve_health': {'status': 'nonfinite'}}
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': clean, 'b::s0': over}, f)
+        r = A.audit_training_health(outdirs=[td])
+        assert r['status'] == 'warnings' and 'b::s0' in str(r['warnings']), r
+        assert 'a::s0' not in str(r['warnings']), r
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': clean, 'c::s0': contra}, f)
+        r2 = A.audit_training_health(outdirs=[td])
+        assert r2['status'] == 'fail' and any('clean but non-finite' in x for x in r2['errors']), r2
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'d::s0': legacy}, f)
+        r3 = A.audit_training_health(outdirs=[td])
+        assert r3['status'] == 'warnings' and any('without triage' in x for x in r3['warnings']), r3
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def t_release_readiness_audit():
     td = tempfile.mkdtemp(prefix='rel_', dir=REPO)
     old_repo = A.REPO
@@ -9632,6 +9664,7 @@ def main():
     _check('L8f training-health section shows actions and steps since best', t_report_training_health_actions)
     _check('L8g report surfaces completed vs planned training budget', t_report_early_stop_section)
     _check('L8h efficiency report keeps measurement groups separate', t_report_efficiency_groups_are_separate)
+    _check('L8i training-health/triage record audit fails closed', t_audit_training_health_records)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)

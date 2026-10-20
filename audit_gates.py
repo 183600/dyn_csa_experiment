@@ -1972,6 +1972,79 @@ def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
     return res
 
 
+def audit_training_health(outdirs=None):
+    """Zero-GPU audit of recorded training-curve health and NaN triage.
+
+    A run that overfit, stalled, or recorded a non-finite event may still have a
+    PPL number.  This audit makes that diagnostic history explicit and refuses
+    a record whose own triage contradicts its events.  It does not select
+    models and does not change any panel.
+    """
+    dirs = outdirs or list(_iter_result_dirs())
+    out = {'status': 'ok', 'panels': {}, 'warnings': [], 'errors': [],
+           'note': 'diagnostic only: a healthy record is not thereby a valid treatment claim, and an unhealthy record is not silently deleted'}
+    for d in dirs:
+        summ = _load(os.path.join(d, 'summary.json'))
+        if not isinstance(summ, dict) or not summ:
+            continue
+        cells = {}
+        for key, r in summ.items():
+            if not isinstance(r, dict):
+                continue
+            w = []
+            e = []
+            h = r.get('curve_health')
+            status = str(h.get('status') or 'unknown') if isinstance(h, dict) else 'missing'
+            if not isinstance(h, dict):
+                w.append('no curve_health record')
+            elif status in ('overfitting', 'underfitting_or_stalled',
+                            'validation_degrading', 'nonfinite'):
+                w.append(f'curve_health={status}')
+            diag = r.get('opt_diag_summary') if isinstance(r.get('opt_diag_summary'), dict) else {}
+            guard = diag.get('nan_guard') if isinstance(diag.get('nan_guard'), dict) else {}
+            def _nonneg(v):
+                if isinstance(v, (bool, np.bool_)):
+                    return None
+                try:
+                    f = float(v)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                return int(f) if math.isfinite(f) and f >= 0 else None
+            n_loss = _nonneg(diag.get('nonfinite_loss_steps')) or 0
+            n_grad = _nonneg(diag.get('nonfinite_grad_steps')) or 0
+            n_guard = _nonneg(guard.get('elements_cleaned')) or 0
+            has_events = bool(n_loss or n_grad or n_guard)
+            triage = r.get('instability_diagnosis')
+            if isinstance(triage, dict):
+                tstat = str(triage.get('status') or 'unknown')
+                if has_events and tstat == 'clean':
+                    e.append('instability_diagnosis says clean but non-finite events are recorded')
+                if status == 'nonfinite' and tstat == 'clean':
+                    e.append('validation curve is non-finite but instability_diagnosis says clean')
+            elif has_events:
+                w.append('non-finite events without instability_diagnosis (legacy/unverified)')
+            if status == 'nonfinite' and not isinstance(triage, dict):
+                w.append('non-finite validation curve without triage (legacy/unverified)')
+            es = r.get('early_stop')
+            planned = r.get('steps')
+            done = r.get('steps_completed')
+            if isinstance(es, dict) and es.get('stopped'):
+                if isinstance(done, (int, float)) and isinstance(planned, (int, float)) and done >= planned:
+                    w.append('early_stop.stopped is true but steps_completed >= planned steps')
+            if w or e:
+                cells[key] = {'health': status, 'warnings': w, 'errors': e}
+        if cells:
+            out['panels'][d] = cells
+            for key, c in cells.items():
+                out['errors'] += [f'{d}/{key}: {x}' for x in c['errors']]
+                out['warnings'] += [f'{d}/{key}: {x}' for x in c['warnings']]
+    if out['errors']:
+        out['status'] = 'fail'
+    elif out['warnings']:
+        out['status'] = 'warnings'
+    return out
+
+
 def audit_efficiency_demo():
     """CPU 微型自检：证明测量代码可运行（不是实验，秒级）。"""
     try:
@@ -2355,7 +2428,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -2375,7 +2448,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
