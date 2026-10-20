@@ -11012,6 +11012,7 @@ HYPOTHESIS_DESIGN = {
         'mechanism': 'Learned cosine boundaries place cuts at low-similarity token transitions, so fewer cross-boundary tokens are compressed together.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
+        'requires_param_match': True,
         'falsifier': 'No family-Holm-corrected PPL reduction, a reduction within seed noise, or a reduction that reverses when fixed/dynamic blocking is swapped.',
     },
     'learned_selection': {
@@ -11019,6 +11020,7 @@ HYPOTHESIS_DESIGN = {
         'mechanism': 'Query-conditioned indexer scores retrieve blocks that carry token-relevant content instead of an arbitrary subset.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
+        'requires_param_match': False,
         'falsifier': 'Random selection matches or beats learned selection after Holm correction, or the gap is within seed noise.',
     },
     'content_pooling': {
@@ -11026,6 +11028,7 @@ HYPOTHESIS_DESIGN = {
         'mechanism': 'Compressed content retains token identity so the indexer and attention see informative block keys/values.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
+        'requires_param_match': False,
         'falsifier': 'Zeroing block content does not increase PPL beyond seed noise.',
     },
     'attention_sink': {
@@ -11033,6 +11036,7 @@ HYPOTHESIS_DESIGN = {
         'mechanism': 'The sink absorbs attention that would otherwise be forced onto unrelated blocks, reducing normalization pressure.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
+        'requires_param_match': False,
         'falsifier': 'Removing the sink does not increase PPL beyond seed noise, or improves it.',
     },
     'compression_regularizer': {
@@ -11040,6 +11044,7 @@ HYPOTHESIS_DESIGN = {
         'mechanism': 'The loss term discourages degenerate block boundaries and keeps compression from collapsing to fixed chunks.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
+        'requires_param_match': False,
         'falsifier': 'Zeroing the regularizer does not increase PPL beyond seed noise, or improves it.',
     },
     'task_learned_boundary': {
@@ -11047,6 +11052,7 @@ HYPOTHESIS_DESIGN = {
         'mechanism': 'The LM objective can trade compression against language-modelling loss directly instead of optimizing only a compression-rate surrogate.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
+        'requires_param_match': False,
         'falsifier': 'The task-trained policy matches or loses to the threshold gate after Holm correction, or its variance makes the panel unusable.',
     },
     'local_fusion': {
@@ -11054,6 +11060,7 @@ HYPOTHESIS_DESIGN = {
         'mechanism': 'The fusion convolution reshapes the cosine segmentation signal; it does NOT gate the local window, so this is a boundary-signal smoothing contrast, not a learned sparse/local trade-off.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
+        'requires_param_match': False,
         'falsifier': 'The learned fusion convolution matches or loses to the identity rule after Holm correction.',
     },
     'hybrid_hierarchy': {
@@ -11061,6 +11068,7 @@ HYPOTHESIS_DESIGN = {
         'mechanism': 'Alternating local HCA layers and sparse CSA layers cover complementary short- and long-range structure.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
+        'requires_param_match': True,
         'falsifier': 'The hybrid matches or loses to CSA-only after Holm correction.',
     },
 }
@@ -11071,6 +11079,7 @@ BASELINE_HYPOTHESIS_DESIGN = {
         'mechanism': 'Sparse compressed reads can preserve long-range access while the parameter-matched MLP keeps capacity equal.',
         'predicted_sign': -1,
         'primary_metric': 'ppl',
+        'requires_param_match': False,
         'falsifier': 'A matched dense baseline matches or beats CSA after Holm correction, or the parameter matching fails.',
     },
 }
@@ -11781,7 +11790,8 @@ METRIC_POLICY = {
     },
 }
 
-_HYPOTHESIS_REQUIRED = ('statement', 'mechanism', 'predicted_sign', 'primary_metric', 'falsifier')
+_HYPOTHESIS_REQUIRED = ('statement', 'mechanism', 'predicted_sign', 'primary_metric',
+                        'requires_param_match', 'falsifier')
 
 def hypothesis_audit(table=None, kind='component', names=None, policy=None):
     """Pre-registration completeness / metric-alignment audit.
@@ -11825,6 +11835,11 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
             if key == 'predicted_sign':
                 if isinstance(val, (bool, np.bool_)) or val not in (-1, 0, 1):
                     issues.append(f'predicted_sign={val!r} (must be -1, 0 or 1)')
+            elif key == 'requires_param_match':
+                # The claim must say up front whether equal capacity is part of
+                # what it tests.  A Python int is not a declaration.
+                if not isinstance(val, bool):
+                    issues.append(f'requires_param_match={val!r} (must be True or False)')
             elif not isinstance(val, str) or not val.strip():
                 issues.append(f'{key} is empty or not a string')
         pm = spec.get('primary_metric')
@@ -11832,6 +11847,7 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
         pred = spec.get('predicted_sign')
         row = {'statement': spec.get('statement'), 'mechanism': spec.get('mechanism'),
                'predicted_sign': pred, 'primary_metric': pm,
+               'requires_param_match': spec.get('requires_param_match'),
                'falsifier': spec.get('falsifier'),
                'direction_specified': (pred in (-1, 1)),
                'metric_declared_in_policy': metric_known,
@@ -13192,10 +13208,12 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
                           advantage claim;
     system_level_only   — significant after correction, but every significant
                           contrast is confounded by a different training
-                          objective or by a compute budget that favours the
-                          claimed winner (`mechanism_claim_allowed=False`).
-                          This is a real performance difference, not evidence
-                          for the isolated mechanism;
+                          objective, by a compute budget that favours the
+                          claimed winner, or by a capacity mismatch against a
+                          hypothesis that declared matched capacity
+                          (`mechanism_claim_allowed=False`).  This is a real
+                          performance difference, not evidence for the
+                          isolated mechanism;
     measured            — a controlled contrast exists with n >= min_n, but no
                           corrected significance;
     resolution_limited  — a controlled, non-noise contrast exists whose
@@ -13580,9 +13598,17 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                'hypothesis_mechanism': (_hyp or {}).get('mechanism'),
                                'hypothesis_falsifier': (_hyp or {}).get('falsifier'),
                                'primary_metric': (_hyp or {}).get('primary_metric'),
+                               'requires_param_match': bool((_hyp or {}).get('requires_param_match') is True),
                                'predicted_sign': _pred, 'observed_sign': _obs,
                                'direction_consistent': (None if (_pred is None or _obs is None)
                                                         else (_pred == 0 or _pred == _obs))})
+                    if st['requires_param_match'] and _param_capacity_ok is not True:
+                        st['param_match_unmet'] = True
+                        st['mechanism_claim_allowed'] = False
+                        if deltas:
+                            report['warnings'].append(
+                                '%s: the pre-registered hypothesis requires matched capacity, but `%s` vs `%s` does not clear the parameter/breakdown control (%s); the contrast may measure capacity rather than the declared mechanism'
+                                % (comp, a, b, 'unverifiable' if _param_capacity_ok is None else 'capacity differs'))
                     entries.append(st)
                     if deltas:
                         _contrast_measured = True

@@ -4329,6 +4329,45 @@ def t_capacity_breakdown_gates_baseline_claim():
     assert any('match on TOTAL parameters' in w for w in r['warnings']), r['warnings']
 
 
+def t_hypothesis_param_match_requirement_is_enforced():
+    # Every hypothesis must declare whether equal capacity is part of the
+    # claim; an omitted field is a design defect, not a silent default.
+    hp = {'statement': 'x', 'mechanism': 'y', 'predicted_sign': -1,
+          'primary_metric': 'ppl', 'falsifier': 'z'}
+    a = L.hypothesis_audit({'h': hp}, 'component')
+    assert 'h' in a['invalid'] and any('requires_param_match' in w for w in a['warnings']), a
+    hp2 = dict(hp, requires_param_match=True)
+    assert L.hypothesis_audit({'h': hp2}, 'component')['status'] == 'ok'
+    # A significant contrast whose hypothesis promises matched parameters is
+    # system-level (capacity-confounded), never 'verified'.
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    kn = L.training_knobs()
+    s = {}
+    for i in range(6):
+        s[f'a::s{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1, tokens_seen=10,
+                             ppl=49.0, params=1200, train_knobs=kn)
+        s[f'b::s{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1, tokens_seen=10,
+                             ppl=50.0, params=1000, train_knobs=kn)
+    spec = {'statement': 'a beats b at matched capacity', 'mechanism': 'm',
+            'predicted_sign': -1, 'primary_metric': 'ppl',
+            'requires_param_match': True, 'falsifier': 'f'}
+    saved = L.HYPOTHESIS_DESIGN.get('custom_capacity')
+    L.HYPOTHESIS_DESIGN['custom_capacity'] = spec
+    try:
+        r = L.methodology_audit(s, design={'custom_capacity': [('a', 'b', 'x')]},
+                                baselines={}, verbose=False)
+    finally:
+        if saved is None:
+            L.HYPOTHESIS_DESIGN.pop('custom_capacity', None)
+        else:
+            L.HYPOTHESIS_DESIGN['custom_capacity'] = saved
+    e = r['components']['custom_capacity'][0]
+    assert e['requires_param_match'] is True and e['param_match_unmet'] is True, e
+    assert e['mechanism_claim_allowed'] is False, e
+    assert 'custom_capacity' in r['system_level_only_components'], r
+    assert 'custom_capacity' not in r['verified_components'], r
+
+
 def t_stale_aggregate_refused():
     cur = BR._CUR_CS
     d = {'a@cfg1': {'variant': 'a', 'run_cfg': f'steps1_d8_L1_csOLD1', 'n_seeds': 4, 'ppl_mean': 10.0},
@@ -5464,6 +5503,7 @@ def main():
     _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
     _check('L5b capacity breakdown gates the baseline claim', t_capacity_breakdown_gates_baseline_claim)
+    _check('L5c hypothesis matched-capacity declaration is enforced', t_hypothesis_param_match_requirement_is_enforced)
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)
     _check('L7 stale length panel excluded from report', t_sec_p1l_excludes_stale_records)
     _check('L8 efficiency-pair audit + shape sweep', t_efficiency_pairs_audit_and_sweep)
