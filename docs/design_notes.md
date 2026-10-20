@@ -1289,3 +1289,53 @@ statement / mechanism / predicted_sign / primary_metric / falsifier：
 `open_block_supp.py report` 调用 `hypothesis_audit`，把审计与逐条假设写入
 `stats.json` 和 Markdown；`audit_gates.hypotheses` 也覆盖这张表。描述性
 单元（其它块长 × 读取规则）仍不进入 Holm 家族，也不得被写成方向性结论。
+
+## 27. 地板门槛、选择不确定性与评估行重采样（本轮硬化）
+
+本轮不新增 GPU 面板，只修正「击败简单基线」与「调参赢家」这两类容易
+被事后选择放大的读数。
+
+### 27.1 方法臂自己必须过地板门槛
+
+`methodology_audit` 原先按 token-pooled PPL 选一个**最好的面板臂**与计数
+模型地板比较。这是一个事后选择：如果提出的方法输给稠密基线，而另一个
+臂赢了地板，整块面板仍会显示「击败地板」。现在预先取
+`BASELINE_DESIGN` 左侧的所有方法臂，逐臂与同一地板做 seed 级对比，并
+对这一方法臂族做 Holm 校正。只有每个声明方法臂都达到
+`beats_floor_holm`，`method_arms_beat_floor` 才为真；任一声明方法臂低于
+地板即 `method_arm_does_not_beat_floor`，并给出独立 warning。原
+`panel_reference_arm` / `panel_beats_simple_floor` 保留为逐点显示，但不再
+单独承担方法主张。
+
+### 27.2 地板不是常数：共享行重采样
+
+`simple_baseline_fit` 现在为选中配置记录 `reported_nll_per_row` /
+`reported_n_tokens_per_row`（与报告 PPL 同一评估行），审计核验其 token
+总和与 NLL 总和。`methodology_audit` 和 `baseline_tune._run_final` 使用
+`paired_row_bootstrap_delta`：对两条臂和所有共享 seed 重采样**同一批
+行**，得到 `mean_s(PPL_a - PPL_b)` 的评估行 95% CI。该区间只覆盖评估行
+抽样不确定性，不替代 seed 级精确符号翻转检验，也不伪装成总不确定性。
+当记录缺少 per-row 记账时返回 `unverifiable`，绝不从别的样本造一个窄区间。
+
+### 27.3 调参赢家的选择不确定性
+
+`baseline_tune` 仍按最小 multi-seed 均值选配置，但记录
+`selection_margin`、`selection_margin_se`、`selection_margin_in_se`、
+`selection_decisive` 与 `runner_up`。审计从 trials 重新计算该 margin；
+若赢家与亚军的差距小于一个标准误，给出 tie/uncertain warning。记录值与
+重算值不一致是 problem（失败关闭），防止手改 artifact 把平局写成确定
+最优。
+
+### 27.4 因子覆盖与交互
+
+`baseline_tuning_audit` 新增 `grid_factorial`：每个臂实际搜索的组合数、
+完整笛卡尔积大小、覆盖率，以及每一对超参数的 `full_pairwise` / 缺失
+组合。默认网格是 one-factor-at-a-time，因此审计会明确写出
+`grid_interaction_untested`（如 `a:lr|weight_decay`），提示 OFAT 赢家
+不等于联合最优；要么把搜索声明为 marginal/OFAT，要么补齐交互单元。
+
+### 27.5 空 final seed 分区
+
+`run_tuning(final=True)` / `_run_final` 现在拒绝空的 `final_seeds`。此前
+空列表会落到 `L.run(..., seeds=[])` 的默认 seed 0，可能重新使用调参
+draw，而 artifact 不记录这一替换；现在直接报错。
