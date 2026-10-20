@@ -13465,13 +13465,45 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
                     'reused_arms': {}, 'missing_arms': [], 'arms': {}})
         combos = {}
         components = set()
+        _empty = ('none', 'empty', 'baseline', '0')
         for key, arm in arms_by_combo.items():
-            if isinstance(key, str):
-                _raw = [x.strip() for x in re.split(r'[+,|]', key) if x.strip()]
-                combo = tuple(sorted(x for x in _raw if x.lower() not in ('none', 'empty', 'baseline', '0')))
-            else:
-                combo = tuple(sorted(str(x) for x in (key or ())))
-            combos.setdefault(combo, []).append(arm)
+            # Normalise the combination key.  A malformed key/arm must fail
+            # closed (complete=False) instead of crashing or being silently
+            # dropped, because a dropped cell would make a 7-of-8 panel look
+            # complete.
+            try:
+                if isinstance(key, str):
+                    _raw = [x.strip() for x in re.split(r'[+,|]', key) if x.strip()]
+                elif isinstance(key, (tuple, list, set, frozenset)):
+                    _raw = [str(x).strip() for x in key if str(x).strip()]
+                elif key is None:
+                    _raw = []
+                else:
+                    raise TypeError(f'unsupported combination key {key!r}')
+                combo = tuple(sorted(x for x in _raw if x.lower() not in _empty))
+            except (TypeError, ValueError) as e:
+                out['structural_errors'].append(f'malformed combination key {key!r}: {e}')
+                continue
+            # One cell = one arm id.  An iterable is accepted only as a list
+            # of ids; every id must be a non-empty string.  Two ids for one
+            # cell (or the same id twice) is ambiguous, not a full factorial.
+            _arms_raw = (list(arm) if isinstance(arm, (tuple, list, set, frozenset))
+                         else [arm])
+            if not _arms_raw:
+                out['structural_errors'].append(
+                    f'combination {combo or "(none)"} maps to no arm id')
+                continue
+            _ok_arms = True
+            for _a in _arms_raw:
+                if not isinstance(_a, str) or not _a.strip():
+                    out['structural_errors'].append(
+                        f'combination {combo or "(none)"} has an invalid arm id {_a!r}')
+                    _ok_arms = False
+                    break
+                combos.setdefault(combo, []).append(_a.strip())
+            if not _ok_arms:
+                combos.pop(combo, None)
+                continue
             components.update(combo)
         components = sorted(components)
         required = []
@@ -13481,7 +13513,7 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
         mapped_set = set(combos)
         missing = sorted(required_set - mapped_set)
         extra = sorted(mapped_set - required_set)
-        duplicate = sorted(c for c, arms in combos.items() if len(set(arms)) > 1)
+        duplicate = sorted(c for c, arms in combos.items() if len(arms) > 1)
         absent = []
         # In a full factorial every combination must be its OWN arm.  Reusing
         # one arm id for two combinations (e.g. mapping A and B to the same
@@ -13508,7 +13540,8 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
             'arms': {('+'.join(c) if c else 'none'): sorted(set(a)) for c, a in combos.items()},
         })
         out['complete'] = bool(len(components) >= 1 and not missing and not extra
-                               and not duplicate and not absent and not reused)
+                               and not duplicate and not absent and not reused
+                               and not out['structural_errors'])
         if verbose:
             print('[ablation] full-factorial components=%s mapped=%d/%d missing=%s%s'
                   % (components, len(combos), len(required),
