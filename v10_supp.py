@@ -1797,7 +1797,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         n_min = min((n for _k, n in _n_by_c), default=0)
         _bind = [k for k, n in _n_by_c if n == n_min]
         n_min_ri = min((n for k, n in _n_by_c if 'randidx' in k), default=0)
-        p_floor = 2.0 / 2 ** n_min if n_min else float('nan')
+        p_floor = L.signflip_p_floor(n_min) if n_min else float('nan')
         learned_helps = ri_sig
         _dpos = bool(dn) and dn[0] > 0 and bool(ab) and ab[0] > 0
         _dtxt = '正值表示「看得见远距噪声就会受害」，支持限制远距注意力暴露带来抗噪性' if _dpos else '区间并非全正，「远距暴露致害」的方向在本轮产物上不成立，以配对数字为准'

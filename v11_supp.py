@@ -169,7 +169,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
         probe['n_seeds'] = {'cell_max': _n_cell_max, 'contrast_paired_max': _n_pair_max, 'contrast_paired_min': _n_pair_min}
         if _n_pair_cells and _n_pair_min < _n_cell_max:
             lowered = sorted((k for k, v in contrasts.items() if v['n'] < _n_cell_max))
-            print(f'[v11 stats] NOTE: the fullest probe cell reaches n={_n_cell_max} but the WEAKEST contrast pairs only {_n_pair_min} seeds — the arms are not seed-complete with each other, so every p value below is computed at its own PAIRED count, i.e. the worst floor for this panel is {2.0 / 2 ** _n_pair_min:.3f}, not {2.0 / 2 ** _n_cell_max:.3f}. {len(lowered)}/{len(contrasts)} contrast(s) are limited by this: {lowered[:3]}')
+            print(f'[v11 stats] NOTE: the fullest probe cell reaches n={_n_cell_max} but the WEAKEST contrast pairs only {_n_pair_min} seeds — the arms are not seed-complete with each other, so every p value below is computed at its own PAIRED count, i.e. the worst floor for this panel is {L.signflip_p_floor(_n_pair_min):.3f}, not {L.signflip_p_floor(_n_cell_max):.3f}. {len(lowered)}/{len(contrasts)} contrast(s) are limited by this: {lowered[:3]}')
     xo = V10._scale_crossovers()
 
     def _is_recon_v11(v):
@@ -264,8 +264,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     n384_ok = _n384_full is not None and _n384_arms.get('csa_fixed') == _n384_full and (len(_n384_set) == 1)
     _xo_hit = sum((1 for n in _xo_real.values() if n == n_xo))
     n_tree_min = n_pair_min
-    floor_p = 2.0 / 2 ** n_contr_max if n_contr_max else float('nan')
-    floor_p_tree = 2.0 / 2 ** n_tree_min if n_tree_min else float('nan')
+    floor_p = L.signflip_p_floor(n_contr_max) if n_contr_max else float('nan')
+    floor_p_tree = L.signflip_p_floor(n_tree_min) if n_tree_min else float('nan')
     probe_ok = n_contr_max >= 6
     probe_tag = f'@ n={n_contr_max}' if n_contr_max else '@ n/a'
     _floor_fmt = lambda _p: f'{_p:.3f}' if isinstance(_p, float) and math.isfinite(_p) else 'n/a'
@@ -335,7 +335,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
             A(f'> **⚠ 实际落盘状态（本报告从 disk 实时计算）**：探针对比的最大种子数为 **n={n_contr_max}**（精确符号翻转 p 值下限 {_floor_txt}，**未**跨过 0.05），最小配对 n={n_pair_min}；交叉面板 {_xo_txt}；d=384 面板 {_n384_txt}。**P4MT/P4MP 的新种子尚未全部产出**（已产出的 cell 覆盖 seeds {_cell_seeds_txt}），**「n=6」的统计升级未发生**；相关结论须待补跑后方可作显著性主张。')
     if _pair_ragged:
         A('')
-        A(f'> **⚠ 探针各臂的种子数不一致**：最全的 cell 达 n={n_cells_max}，但最强的对比也只配上 n={n_contr_max} 对，最弱的只有 n={n_tree_min} 对——`full_rope` 与 `csa_fixed_rope` 是分别续训的，任一臂未补满，跨臂对比就只能用两臂的交集。因此表中每个 p 值的实际下限是 {_floor_txt}，**不是**按 cell 数算出的 {2.0 / 2 ** n_cells_max:.3f}；未配满的对比在下面按「未配满」标注，其 Δ 仅作方向性表述。')
+        A(f'> **⚠ 探针各臂的种子数不一致**：最全的 cell 达 n={n_cells_max}，但最强的对比也只配上 n={n_contr_max} 对，最弱的只有 n={n_tree_min} 对——`full_rope` 与 `csa_fixed_rope` 是分别续训的，任一臂未补满，跨臂对比就只能用两臂的交集。因此表中每个 p 值的实际下限是 {_floor_txt}，**不是**按 cell 数算出的 {L.signflip_p_floor(n_cells_max):.3f}；未配满的对比在下面按「未配满」标注，其 Δ 仅作方向性表述。')
     A('')
     A('---')
     A('')
@@ -455,7 +455,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                 _tree_txt = f'本面板最弱的对比仍有 n={n_tree_min}，其下限为 {floor_p_tree:.3f}，跨不过 0.05——因此本报告的一切显著性主张只对上面的 n>={_weakest} 行成立，凡引用最弱对比（n={n_tree_min}）的段落一律按效应量 + 方向同向性表述。'
             else:
                 _tree_txt = f'本面板最弱的对比也有 n={n_tree_min}，其下限为 {floor_p_tree:.3f}，已可跨过 0.05——显著性主张按各对比自身的配对 n 成立。'
-            A(f'**统计读法**：n>={_weakest} 的格子共 {len(n6)} 个，其中 p<0.05 的 {len(sig)} 个（精确符号翻转在 n={_weakest} 的下限为 {2.0 / 2 ** _weakest:.3f}）——注意这是**这些格子自己**的分辨率，不是整个面板的：{_tree_txt}p≥0.05 的格子同样不作显著性主张。')
+            A(f'**统计读法**：n>={_weakest} 的格子共 {len(n6)} 个，其中 p<0.05 的 {len(sig)} 个（精确符号翻转在 n={_weakest} 的下限为 {L.signflip_p_floor(_weakest):.3f}）——注意这是**这些格子自己**的分辨率，不是整个面板的：{_tree_txt}p≥0.05 的格子同样不作显著性主张。')
             A('')
         else:
             A(f'**统计读法**：本面板实际最大 n={n_contr_max}，精确符号翻转的 p 值下限为 {_floor_txt}，**无法**在该种子数下跨过 0.05。因此下文所有 Δ 一律按效应量 + 方向同向性表述，不作显著性主张；p 值仅作分辨率下限的记录。')
