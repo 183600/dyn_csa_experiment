@@ -4884,6 +4884,42 @@ def t_corpus_audit_overlap_is_unique_across_windows():
     assert rep['sampled_val_rows'] == 1, rep
 
 
+def t_corpus_audit_memo_and_thresholds():
+    tr = np.arange(40, dtype=np.int64)
+    va = (np.arange(8, dtype=np.int64) + 100).reshape(2, 4)
+    # The memo key must include the split attestation: a clean read for one
+    # meta must not answer for a different (failing) one.
+    clean = L.audit_corpus_split(tr, va, 200, dataset='fineweb',
+                                 max_scan_tokens=64, sample_rows=1, strict=False)
+    assert clean['status'] == 'warnings', clean
+    bad_meta = {'doc_ids': {'disjoint': False, 'overlap': 1,
+                            'train_count': 1, 'validation_count': 1}}
+    bad = L.audit_corpus_split(tr, va, 200, dataset='fineweb', meta=bad_meta,
+                               max_scan_tokens=64, sample_rows=1, strict=False)
+    assert bad['status'] == 'fail', bad
+    assert any('document-disjoint' in p for p in bad['hard_failures']), bad
+    # A non-strict read that cached a failing report must never satisfy a
+    # later strict call.
+    try:
+        L.audit_corpus_split(tr, va, 200, dataset='fineweb', meta=bad_meta,
+                             max_scan_tokens=64, sample_rows=1, strict=True)
+    except RuntimeError as e:
+        assert 'DATA GATE REFUSED' in str(e), e
+    else:
+        raise AssertionError('strict=True must refuse a cached failing split')
+    # NaN/negative gates silently disable comparisons; refuse them.
+    for kw in ({'shift_warn': float('nan')}, {'shift_fail': float('nan')},
+               {'shift_warn': -0.1}, {'shift_fail': -1.0},
+               {'shift_warn': 0.3, 'shift_fail': 0.2},
+               {'sample_rows': 0}, {'max_scan_tokens': True}):
+        try:
+            L.audit_corpus_split(tr, va, 200, dataset='fineweb', strict=False, **kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'audit_corpus_split accepted {kw!r}')
+
+
 def t_audit_length_requires_eval_span():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, 'bylen.json')
@@ -6911,6 +6947,7 @@ def main():
     _check('H7 simple-baseline driver uses the panel corpus', t_simple_baseline_driver_serves_the_panel_corpus)
     _check('H7a floor contrast is seed-level and significance-aware', t_simple_floor_contrast_is_significance_aware)
     _check('H8 leakage audit handles a flat 1-D train cache', t_audit_leakage_handles_flat_train_cache)
+    _check('H8b corpus audit memo covers meta/thresholds and strict', t_corpus_audit_memo_and_thresholds)
     _check('H9 fuse sample_std accepts negative axes', t_fuse_sample_std_negative_axis)
     _check('I1 chronological split contract', t_leakage_safe_split_contract)
     _check('I2 whole-group split contract', t_group_split_contract)

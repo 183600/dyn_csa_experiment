@@ -7594,6 +7594,34 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
     by the two content fingerprints, so resume phases do not rescan.
     """
     import data_guard as _DG
+
+    def _gate_float(name, value):
+        # NaN compares False against every threshold, silently disabling the
+        # gate (and a negative threshold is not a meaningful probability).
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError(f'{name} must be a finite non-negative number, got {value!r}')
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'{name} must be a finite non-negative number, got {value!r}') from None
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f'{name} must be a finite non-negative number, got {value!r}')
+        return value
+
+    def _gate_int(name, value):
+        parsed = _as_seed_int(value)
+        if parsed is None or parsed < 1:
+            raise ValueError(f'{name} must be a positive integer, got {value!r}')
+        return parsed
+
+    shift_warn = _gate_float('shift_warn', shift_warn)
+    shift_fail = _gate_float('shift_fail', shift_fail)
+    if shift_warn > shift_fail:
+        raise ValueError(
+            f'shift_warn ({shift_warn}) must not exceed shift_fail ({shift_fail})')
+    sample_rows = _gate_int('sample_rows', sample_rows)
+    max_scan_tokens = _gate_int('max_scan_tokens', max_scan_tokens)
     tr = np.asarray(train_ids).reshape(-1)
     va = np.asarray(val_batch)
     report = {
@@ -7605,8 +7633,18 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         'warnings': [],
         'meta_split_strategy': (meta or {}).get('split_strategy'),
     }
+    # The cached verdict depends on the split attestation and on every gate
+    # parameter, not only on the two token arrays.  Omitting `meta` let a
+    # clean report for one document-isolation attestation be served for a
+    # different (or missing) one; omitting `strict`/thresholds let a lenient
+    # call satisfy a later strict one.
+    _meta_fp = (hashlib.sha256(
+        json.dumps(meta, sort_keys=True, default=str).encode('utf-8')).hexdigest()[:16]
+        if isinstance(meta, dict) else None)
     key = (dataset, int(vocab), _ids_fp(tr),
-           _ids_fp(np.ascontiguousarray(va).reshape(-1)) if va.size else None)
+           _ids_fp(np.ascontiguousarray(va).reshape(-1)) if va.size else None,
+           _meta_fp, float(shift_warn), float(shift_fail),
+           int(sample_rows), int(max_scan_tokens), bool(strict))
     _hit = _CORPUS_AUDIT_MEMO.get(key)
     if _hit is not None:
         return _hit
