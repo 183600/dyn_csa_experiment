@@ -121,6 +121,11 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     # required to match: the training cache is 512-token and the held-out cache
     # is 4097-token by construction, and the old equality check made every real
     # train/test pair "not_verifiable_locally".
+    def _as_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
     _pairs = []
     for _tp in _tm:
         _tmeta = _load(_tp)
@@ -131,8 +136,8 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             _mmeta = _load(_mp)
             if not isinstance(_mmeta, dict):
                 continue
-            if (_tmeta.get('vocab') is not None and _mmeta.get('vocab') is not None
-                    and int(_tmeta['vocab']) != int(_mmeta['vocab'])):
+            _tv, _mv = _as_int(_tmeta.get('vocab')), _as_int(_mmeta.get('vocab'))
+            if _tv is not None and _mv is not None and _tv != _mv:
                 continue
             if (_tmeta.get('fit_fp') and _mmeta.get('fit_fp')
                     and _tmeta['fit_fp'] != _mmeta['fit_fp']):
@@ -164,7 +169,10 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     out['checks']['test_fit_fp'] = test_meta.get('fit_fp')
     out['checks']['train_src_fp'] = train_meta.get('src_fp') or train_meta.get('train_fp')
     out['checks']['test_src_fp'] = test_meta.get('src_fp')
-    out['checks']['vocab_agree'] = int(test_meta.get('vocab', -1)) == int(train_meta.get('vocab', -2))
+    _test_vocab_int = _as_int(test_meta.get('vocab'))
+    _train_vocab_int = _as_int(train_meta.get('vocab'))
+    out['checks']['vocab_agree'] = bool(_test_vocab_int is not None and _train_vocab_int is not None
+                                        and _test_vocab_int == _train_vocab_int)
     _tok_problems = []
     if not out['checks']['vocab_agree']:
         _tok_problems.append('test/train cache vocabs disagree')

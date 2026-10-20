@@ -2459,6 +2459,14 @@ def t_audit_leakage_handles_flat_train_cache():
         overlap = out['checks'].get('doc_overlap')
         assert isinstance(overlap, dict), overlap
         assert overlap['shared_shingles'] > 0, overlap
+        # A legacy/malformed meta without a numeric vocab must fail closed, not
+        # crash with int(None) before the audit can report anything.
+        with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'src_fp': 'train'}, f)
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'src_fp': 'test'}, f)
+        bad = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        assert bad['status'] == 'fail' and bad['checks'].get('vocab_agree') is False, bad
     finally:
         shutil.rmtree(cache, ignore_errors=True)
 
@@ -3425,7 +3433,7 @@ def main():
         for _name, _fn in _OB.CHECKS:
             _check(_name, _fn)
     except Exception as _obe:
-        _check('K0 open-block suite import', lambda: (_ for _ in ()).throw(_obe))
+        _check('K0 open-block suite import', lambda _e=_obe: (_ for _ in ()).throw(_e))
     _check('L1 review-4 reportable claim gate', t_reportable_claim_gate)
     _check('L2 Holm family resolution ceiling', t_holm_family_resolution_ceiling)
     _check('L3 crossover fit refusal rules + slope CI', t_crossover_scaling_refusals)

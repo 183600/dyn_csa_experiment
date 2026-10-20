@@ -1158,18 +1158,13 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
         bid_stack = _h2d_async(torch.stack(bids_cpu), torch.long, device)
     hon_stack = None
     if want_honoured and T > 1:
-        arr = None
-        staged_h, commit_h = _h2d_stage((len(gate_lists), T - 1), hon_dtype, device)
-        if staged_h is not None:
-            try:
-                arr = staged_h.numpy()
-                arr[:] = 0.0
-            except TypeError:
-                # a numpy-less dtype (e.g. bfloat16) — fall back to a host array
-                arr = None
-                staged_h = commit_h = None
-        if arr is None:
-            arr = np.zeros((len(gate_lists), T - 1), dtype=np.float32)
+        # Build the honoured table on the host as float32 and let _h2d_async
+        # perform the cast+staging.  A direct H2D-pool borrow cannot expose a
+        # NumPy view for dtypes such as bfloat16 (used under AMP), and an
+        # abandoned borrow leaves its pinned slot reserved.  The mask is only
+        # B x (T-1) exact 0.0/1.0 values, so the extra copy is negligible next
+        # to the hidden states.
+        arr = np.zeros((len(gate_lists), T - 1), dtype=np.float32)
         for _i, _hon in enumerate(hons):
             if _hon:
                 # iterating the honoured dict yields its (integer) slot keys
@@ -1177,7 +1172,7 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
                 _sl = _sl[(0 <= _sl) & (_sl < T - 1)]
                 arr[_i, _sl] = 1.0
         # the honoured mask is exact 0.0/1.0, identical in any float dtype
-        hon_stack = commit_h() if commit_h is not None else _h2d_async(arr, hon_dtype, device)
+        hon_stack = _h2d_async(arr, hon_dtype, device)
     out = []
     for b in range(len(bids_cpu)):
         row = bid_stack[b]
@@ -3051,70 +3046,71 @@ def causal_prefix_pool(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
     if _want_ov:
         _ov_vals = _prefix_overlap_values(geo, Xb, Zb, B_pos_b, overlap)
 
-    # Stable prefix aggregation with detached per-block shifts.  Each
-    # feature column is an independent scalar softmax, and a common shift
-    # cancels exactly in num/den: choosing the largest A-lane (and overlap)
-    # logit of the block keeps every exponent <= 0, so large logits cannot
-    # overflow.  The shift is detached, so gradients still flow through
-    # exp(z - shift); because it is only a scale factor, no future token can
-    # change the normalized summary.  The prefix sums are segmented by block
-    # id (reset at the block start) rather than a global cumsum minus a base,
-    # which avoids catastrophic cancellation across blocks.
+    # Stable, causal segmented softmax prefix scan.  Each feature column is
+    # an independent scalar softmax over the block prefix [s_b, t].  A
+    # per-token (max, sum, weighted-sum) monoid is combined in log-space:
+    # the shift is the maximum over the *prefix* itself, so no future token
+    # can change any row and exp() never overflows.  Using a prefix-wide (not
+    # block-wide) maximum also keeps an early prefix from underflowing when a
+    # later token in the same block has a much larger logit.  The shifts are
+    # detached constants, so the gradients are exactly those of the
+    # normalized softmax.
     _acc = torch.float64
     _bt = geo['block_of_token']
-    _z_a_acc = z_a.detach().to(_acc)
-    _block_shift = torch.full((int(geo['n_blocks']), Fd), float('-inf'),
-                              dtype=_acc, device=Xa.device)
-    with torch.no_grad():
-        _rows = _bt[:, None].expand(T, Fd)
-        _block_shift.scatter_reduce_(0, _rows, _z_a_acc,
-                                     reduce='amax', include_self=True)
+    _m = z_a.detach().to(_acc)
+    _e = torch.exp(z_a.to(_acc) - _m)
+    _s = _e
+    _n = _e * Xa.to(_acc)
+    # Overlap lanes are constant for every prefix inside a block, so fold
+    # them into that block's first token before the scan.  They are previous
+    # block tokens (strictly past) and use the same monoid.
     if _want_ov and _ov_vals is not None:
-        _, _z_ov, _ov_mask, _ = _ov_vals
-        with torch.no_grad():
-            _z_eff = _z_ov.detach().to(_acc).masked_fill(
-                ~_ov_mask[:, :, None], float('-inf'))
-            _ov_max_b = _z_eff.amax(1)
-            _brows = _arange_cache(int(_ov_max_b.shape[0]), Xa.device)[:, None].expand(
-                int(_ov_max_b.shape[0]), Fd)
-            _block_shift.scatter_reduce_(0, _brows, _ov_max_b,
-                                         reduce='amax', include_self=True)
-    # Every real block has at least one token; -inf only comes from an
-    # oversized n_blocks argument.
-    _block_shift = torch.nan_to_num(_block_shift, neginf=0.0)
-    if _want_ov and _ov_vals is not None:
-        # Same per-block shift as the A lanes: the two aggregates add
-        # directly.  Padded lanes are masked before exp (see the helper).
-        _ov_den_b, _ov_num_b, _ = _prefix_overlap_terms(
-            geo, Xb, Zb, B_pos_b, overlap, _block_shift, True, values=_ov_vals)
-    else:
-        _ov_den_b = _ov_num_b = None
-    _e = torch.exp(z_a.to(_acc) - _block_shift[_bt])
-    d = _e
-    n = _e * Xa.to(_acc)
+        _x_ov, _z_ov, _ov_mask, _ = _ov_vals
+        _z_ov64 = _z_ov.to(_acc)
+        _z_ov_eff = _z_ov64.detach().masked_fill(~_ov_mask[:, :, None], float('-inf'))
+        _m_ov = _z_ov_eff.amax(1)
+        _has_ov = torch.isfinite(_m_ov).any(1)
+        _m_ov_safe = torch.where(torch.isfinite(_m_ov), _m_ov, torch.zeros_like(_m_ov))
+        _e_ov = torch.exp(_z_ov64.masked_fill(~_ov_mask[:, :, None], float('-inf'))
+                          - _m_ov_safe[:, None, :])
+        _s_ov = _e_ov.sum(1)
+        _n_ov = (_e_ov * _x_ov.to(_acc)).sum(1)
+        _is_start = torch.zeros(T, dtype=torch.bool, device=Xa.device)
+        _is_start[geo['starts']] = True
+        _use_ov = _is_start & _has_ov[_bt]
+        _m_ov_t = _m_ov_safe[_bt]
+        _new_m = torch.maximum(_m, _m_ov_t)
+        _l = torch.exp(_m - _new_m)
+        _r = torch.exp(_m_ov_t - _new_m)
+        _s = torch.where(_use_ov[:, None], _s * _l + _s_ov[_bt] * _r, _s)
+        _n = torch.where(_use_ov[:, None], _n * _l + _n_ov[_bt] * _r, _n)
+        _m = torch.where(_use_ov[:, None], _new_m, _m)
+    # Hillis-Steele doubling scan, reset at every block boundary.  The monoid
+    # is commutative, so combining the earlier and later half in either order
+    # gives the same prefix statistics.
     _off = 1
     while _off < T:
         _same = (_bt[_off:] == _bt[:-_off])[:, None]
-        _d_new = d[_off:] + d[:-_off]
-        _n_new = n[_off:] + n[:-_off]
-        d = torch.cat([d[:_off], torch.where(_same, _d_new, d[_off:])], 0)
-        n = torch.cat([n[:_off], torch.where(_same, _n_new, n[_off:])], 0)
+        _mL, _mR = _m[:-_off], _m[_off:]
+        _new_m = torch.maximum(_mL, _mR)
+        _l = torch.exp(_mL - _new_m)
+        _r = torch.exp(_mR - _new_m)
+        _new_s = _s[:-_off] * _l + _s[_off:] * _r
+        _new_n = _n[:-_off] * _l + _n[_off:] * _r
+        _m = torch.cat([_m[:_off], torch.where(_same, _new_m, _m[_off:])], 0)
+        _s = torch.cat([_s[:_off], torch.where(_same, _new_s, _s[_off:])], 0)
+        _n = torch.cat([_n[:_off], torch.where(_same, _new_n, _n[_off:])], 0)
         _off <<= 1
 
     # Each scope ends at a different token (t for full_prefix, immediately
     # before W_t for outside_window); read that row of the scanned prefix.
     end_idx = (pg['u_start'] + pg['plen'] - 1).clamp(0, T - 1)
-    d_end = d.index_select(0, end_idx)
-    n_end = n.index_select(0, end_idx)
-    if _ov_den_b is not None:
-        # Overlap lanes are constant for every prefix inside the block and
-        # already use the same per-block shift, so they are a plain addition.
-        d_end = d_end + _ov_den_b[_bt]
-        n_end = n_end + _ov_num_b[_bt]
+    s_end = _s.index_select(0, end_idx)
+    n_end = _n.index_select(0, end_idx)
     # A prefix can be empty only in the outside_window scope; those rows are
     # invalid candidates and their value is never read by the attention path.
     comp = torch.where((pg['plen'] > 0)[:, None],
-                       n_end / d_end.clamp_min(1e-300),
+                       n_end / s_end.clamp_min(1e-300),
                        torch.zeros((), dtype=n_end.dtype, device=n_end.device))
     return comp.to(Xa.dtype)
 

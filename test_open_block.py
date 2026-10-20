@@ -155,6 +155,19 @@ def t_prefix_pool_reference():
         for a, b in zip(go, gr):
             assert torch.allclose(a, b, atol=2e-3, rtol=2e-3), (
                 scope, window, float((a - b).detach().abs().max()))
+    # A future token in the SAME block must not change an earlier prefix,
+    # even when its logit is far outside the past range.  A block-wide shift
+    # (rather than a prefix-wide one) would underflow the earlier rows to
+    # zero and make them numerically depend on the future.
+    for scope, window in (('full_prefix', 6), ('outside_window', 3)):
+        _Za = torch.zeros_like(Za)
+        _Za[-1] = 1e6
+        _out = L.causal_prefix_pool(Xa, Xb, _Za, Zb, bid, Ba, Bb, 3,
+                                    n_blocks=nb, scope=scope, window=window)
+        _ref = L.causal_prefix_pool_reference(Xa, Xb, _Za, Zb, bid, Ba, Bb, 3,
+                                              n_blocks=nb, scope=scope, window=window)
+        assert torch.allclose(_out, _ref, atol=1e-4, rtol=1e-4), (
+            scope, window, 'large-future-logit', float((_out - _ref).abs().max()))
     # At each block's end the full-prefix summary is the closed block pooling.
     comp, last_tok, B = L.pool_variable_blocks(Xa, Xb, Za, Zb, bid, Ba, Bb, 3,
                                                n_blocks=nb)

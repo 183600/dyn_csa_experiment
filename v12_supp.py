@@ -826,6 +826,10 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     model = L.SmallGPT(int(d.get('vocab', 8192)), *_arch, d.get('train_len', 512), [copy.deepcopy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
     model.load_state_dict(d.pop('sd'))
     model.eval()
+    # Keep the checkpoint's provenance fields on a separate binding so the
+    # record writer never depends on a variable that this function deletes.
+    _ck_prov = {k: d.get(k) for k in ('train_knobs', 'params', 'train_objective',
+                                      'param_breakdown', 'rng_fp')}
     # score EVERY loaded row: test_ids is the frozen slice already sliced to
     # the manifest's n_seqs_clean, and data_fp is computed over all of them.
     # eval_length_gen's default (n_seq=8) would measure only the
@@ -843,13 +847,13 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         # `train_knobs` the frozen implementation binding excluded ALL 48
         # records (admitted=0) after the one-shot test access had already been
         # burned.
-        _tk = _tr.get('train_knobs') or (d.get('train_knobs') if isinstance(d, dict) else None)
-        summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params') or (d.get('params') if isinstance(d, dict) else None), 'by_len': r, 'split': split, 'data_fp': _dfp, 'train_fp': _tr_train_fp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ensure_ck_sha(), 'ckpt_sig': (list(_ck_sig) if _ck_sig is not None else None),
+        _tk = _tr.get('train_knobs') or _ck_prov.get('train_knobs')
+        summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params') or _ck_prov.get('params'), 'by_len': r, 'split': split, 'data_fp': _dfp, 'train_fp': _tr_train_fp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ensure_ck_sha(), 'ckpt_sig': (list(_ck_sig) if _ck_sig is not None else None),
                                     'n_seq': int(test_ids.shape[0]),
                                     'train_knobs': _tk,
-                                    'train_objective': _tr.get('train_objective') or (d.get('train_objective') if isinstance(d, dict) else None),
-                                    'param_breakdown': _tr.get('param_breakdown') or (d.get('param_breakdown') if isinstance(d, dict) else None),
-                                    'rng_fp': _tr.get('rng_fp') or (d.get('rng_fp') if isinstance(d, dict) else None),
+                                    'train_objective': _tr.get('train_objective') or _ck_prov.get('train_objective'),
+                                    'param_breakdown': _tr.get('param_breakdown') or _ck_prov.get('param_breakdown'),
+                                    'rng_fp': _tr.get('rng_fp') or _ck_prov.get('rng_fp'),
                                     'amp_dtype': (_tk or {}).get('amp_dtype') if isinstance(_tk, dict) else None,
                                     'amp_grad_scaler': (_tk or {}).get('amp_grad_scaler') if isinstance(_tk, dict) else None,
                                     'eager_batch': (_tk or {}).get('eager_batch') if isinstance(_tk, dict) else None}
@@ -1513,8 +1517,12 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             # the belt-and-braces diagnostic in case a plan bypasses the gate.
             print(f'[p5t stats] WARNING: with n={_n} seeds and a Holm family of m={_m}, the smallest attainable Holm p is {_min_holm:.4g} > alpha={_alpha} — NO comparison can be confirmed regardless of the data. The load-time power gate should have refused this manifest; re-check which manifest/records produced this state.')
     if unified_fp is not None and admitted:
-        _any_doc = [r.get('by_len', {}).get(4096, r.get('by_len', {}).get('4096', {})) for r in admitted.values()]
-        _n_doc = next((len(c.get('ppl_per_seq') or []) for c in _any_doc if isinstance(c, dict) and c.get('ppl_per_seq')), 0)
+        # Read the recorded document rows from whichever frozen endpoint
+        # carries them; smoking/alternate manifests need not contain L=4096.
+        _n_doc = next((len(c.get('ppl_per_seq') or [])
+                       for r in admitted.values()
+                       for c in (r.get('by_len') or {}).values()
+                       if isinstance(c, dict) and c.get('ppl_per_seq')), 0)
         if _n_doc:
             stats['population_claim_allowed'] = bool(_n_doc >= L.MIN_DOCS_FOR_POPULATION_CLAIM)
             if _n_doc < L.MIN_DOCS_FOR_POPULATION_CLAIM:
