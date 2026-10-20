@@ -1252,7 +1252,19 @@ README_zh 与 `RELEASES.md` 中均已明示。
 选中值不在声明层上则是 problem，不是「调过参」。注意 warning 不会被
 误读成 pass：它明确要求扩展网格并重跑等宽搜索。
 
-### 26.4 开放块面板的预注册假设
+### 26.4 指标口径从「声明」变成「按记录核验」
+
+`metric_policy_audit` 现在不仅检查策略表字段，还核对落盘记录：
+- 语言模型记录的 `ppl` 必须等于 `exp(nll_sum/n_tokens)`（或由
+  `nll_per_row`/`n_tokens_per_row` 求和得到），否则说明报的不是声明的
+  token-weighted PPL；没有 NLL 记账的旧记录只跳过核验，不伪造通过。
+- 边界对齐的 `bnd_f1` 必须落在 [0,1] 且等于 `bnd_prec`/`bnd_rec` 的
+  调和平均；随机基线也必须在 [0,1]。这样「F1 用了别的分母/口径」会被
+  点名。
+- NIAH 的 `acc` 必须在 [0,1]，`nll` 有限，且 query 数是正整数；缺失
+  query 数的记录视为不可用。
+
+### 26.5 开放块面板的预注册假设
 
 `OPEN_BLOCK_HYPOTHESIS_DESIGN` 为主家族的三个对比登记了
 statement / mechanism / predicted_sign / primary_metric / falsifier：

@@ -2534,6 +2534,37 @@ def t_metric_policy_and_classification_metrics():
     assert ma['status'] == 'warn' and any('boundary' in w for w in ma['warnings']), ma
 
 
+def t_metric_policy_checks_record_values():
+    # The declared token-weighted PPL must match the record's own NLL
+    # accounting; a per-sequence arithmetic mean is a different estimand.
+    _tok = 100
+    good = {'v::seed0': {'variant': 'v', 'ppl': 10.0, 'nll_sum': math.log(10.0) * _tok,
+                         'n_tokens': _tok}}
+    assert L.metric_policy_audit(good)['status'] == 'ok'
+    bad = {'v::seed0': {'variant': 'v', 'ppl': 10.0, 'nll_sum': math.log(20.0) * _tok,
+                        'n_tokens': _tok}}
+    ma = L.metric_policy_audit(bad)
+    assert ma['status'] == 'warn' and any('not exp(nll_sum/n_tokens)' in w for w in ma['warnings']), ma
+    # Per-row accounting is accepted as the same token-weighted estimate.
+    row = {'v::seed0': {'variant': 'v', 'ppl': 10.0,
+                        'nll_per_row': [math.log(10.0) * 60, math.log(10.0) * 40],
+                        'n_tokens_per_row': [60, 40]}}
+    assert L.metric_policy_audit(row)['status'] == 'ok', L.metric_policy_audit(row)
+    # Boundary F1 must be the harmonic mean of the reported precision/recall.
+    b = {'b::seed0': {'variant': 'b', 'ppl': 10.0,
+                      'stats': {'L0': {'bnd_f1': 0.9, 'bnd_prec': 0.2,
+                                       'bnd_rec': 0.2, 'bnd_rand': 0.1}}}}
+    mb = L.metric_policy_audit(b)
+    assert mb['status'] == 'warn' and any('non-harmonic' in w for w in mb['warnings']), mb
+    # Retrieval accuracy outside [0,1] is not a usable endpoint.
+    n = {'n::seed0': {'variant': 'n', 'task': 'niah_natural', 'acc': 1.5,
+                      'nll': 1.0, 'n_queries': 10}}
+    mn = L.metric_policy_audit(n)
+    assert mn['status'] == 'warn' and any('invalid accuracy' in w for w in mn['warnings']), mn
+    # An empty retrieval record is incomplete, not a pass.
+    me = L.metric_policy_audit({'x::seed0': {'variant': 'x', 'task': 'niah_natural'}})
+    assert me['status'] == 'warn', me
+
 def t_baseline_tuning_audit():
     trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
     def _arm(ppls):
@@ -6203,6 +6234,7 @@ def main():
     _check('G4 underpowered is never verified', t_underpowered_never_verified)
     _check('H1 hypothesis direction conflict', t_hypothesis_direction_conflict)
     _check('H2 metric policy + macro/micro/weighted F1 + PR/ROC-AUC', t_metric_policy_and_classification_metrics)
+    _check('H2a metric audit checks record aggregation/ranges', t_metric_policy_checks_record_values)
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
     _check('H3a tuning grid boundary/coverage adequacy', t_tuning_grid_boundary_adequacy)
     _check('H3a multi-seed selection + equal search-seed audit', t_baseline_multi_seed_selection_audit)

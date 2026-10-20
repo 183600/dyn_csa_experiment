@@ -12479,8 +12479,42 @@ def metric_policy_audit(summary=None, policy=None):
     if summary:
         recs = [r for r in summary.values() if isinstance(r, dict)]
         lm = [r for r in recs if ppl_is_usable(r.get('ppl'))]
+        # Token-weighted PPL is the declared estimand.  When a record exposes
+        # the NLL accounting, verify that its PPL really is exp(sum NLL / sum
+        # tokens) rather than an arithmetic mean of per-sequence PPLs.
+        _lm_bad = []
+        _lm_checked = 0
+        for _r in lm:
+            _nll = _finite_scalar(_r.get('nll_sum'))
+            _ntok = _exact_count(_r.get('n_tokens'), minimum=1)
+            if _nll is None or _ntok is None:
+                _rn = _r.get('nll_per_row')
+                _rt = _r.get('n_tokens_per_row')
+                if isinstance(_rn, (list, tuple)) and isinstance(_rt, (list, tuple)) and _rn and len(_rn) == len(_rt):
+                    _vals = [_finite_scalar(x) for x in _rn]
+                    _toks = [_exact_count(x, minimum=0) for x in _rt]
+                    if all(v is not None for v in _vals) and all(t is not None for t in _toks) and sum(_toks) > 0:
+                        _nll, _ntok = float(sum(_vals)), int(sum(_toks))
+            if _nll is None or _ntok is None:
+                continue
+            _lm_checked += 1
+            _want = _safe_exp_ppl(_nll / _ntok)
+            if not math.isfinite(float(_want)):
+                _lm_bad.append(_r.get('variant') or _r.get('name') or '?')
+                continue
+            _got = float(_r['ppl'])
+            if abs(_got - float(_want)) > 1e-6 * max(1.0, abs(float(_want))):
+                _lm_bad.append(_r.get('variant') or _r.get('name') or '?')
         out['checks'].append({'metric': 'ppl', 'policy': 'lm_perplexity', 'records': len(lm),
-                              'ok': bool(lm) and all(math.isfinite(float(r['ppl'])) for r in lm)})
+                              'aggregation': 'token_weighted',
+                              'records_with_nll_accounting': _lm_checked,
+                              'aggregation_mismatch': sorted(set(map(str, _lm_bad)))[:8],
+                              'ok': bool(lm) and not _lm_bad})
+        if _lm_bad:
+            out['warnings'].append(
+                'LM record(s) ' + ', '.join(sorted(set(map(str, _lm_bad)))[:5])
+                + ' report PPL that is not exp(nll_sum/n_tokens) — the declared token-weighted '
+                'PPL estimand is not what the record measured')
         bnd = []
         niah = []
         for r in recs:
@@ -12491,17 +12525,51 @@ def metric_policy_audit(summary=None, policy=None):
                     bnd.append(layer)
         if bnd:
             missing = [k for k in ('bnd_prec', 'bnd_rec', 'bnd_rand') if not all(k in b for b in bnd)]
+            _bad_bnd = []
+            for _b in bnd:
+                _p, _r, _f = (_finite_scalar(_b.get(k)) for k in ('bnd_prec', 'bnd_rec', 'bnd_f1'))
+                _vals = [_p, _r, _f]
+                if any(v is None or not (0.0 <= v <= 1.0) for v in _vals if v is not None):
+                    _bad_bnd.append('out-of-range')
+                    continue
+                if _p is not None and _r is not None and _f is not None:
+                    _want = 2 * _p * _r / max(_p + _r, 1e-09)
+                    if abs(_f - _want) > 1e-6:
+                        _bad_bnd.append('f1-not-harmonic')
+                _rb = _finite_scalar(_b.get('bnd_rand'))
+                if _rb is not None and not (0.0 <= _rb <= 1.0):
+                    _bad_bnd.append('random-out-of-range')
             out['checks'].append({'metric': 'boundary_alignment', 'policy': 'boundary_alignment',
-                                  'records': len(bnd), 'ok': not missing, 'missing': missing,
+                                  'records': len(bnd), 'ok': not missing and not _bad_bnd,
+                                  'missing': missing, 'invalid': sorted(set(_bad_bnd)),
                                   'f1_average': 'macro_over_sequences'})
             if missing:
                 out['warnings'].append(f'boundary metrics report F1 without {missing}; F1 alone cannot be interpreted against the random-cut baseline')
+            if _bad_bnd:
+                out['warnings'].append('boundary metrics contain invalid/out-of-range or non-harmonic '
+                                       f'F1 values ({sorted(set(_bad_bnd))}); the reported F1 is not the '
+                                       'declared macro precision/recall endpoint')
         if niah:
             missing = [k for k in ('acc', 'nll') if not all(k in b for b in niah)]
+            _bad_niah = []
+            for _b in niah:
+                _a = _finite_scalar(_b.get('acc'))
+                _nl = _finite_scalar(_b.get('nll'))
+                _nq = _exact_count(_b.get('n_queries', _b.get('n')), minimum=1)
+                if _a is None or not (0.0 <= _a <= 1.0):
+                    _bad_niah.append('acc-out-of-range')
+                if _nl is None:
+                    _bad_niah.append('nll-not-finite')
+                if _nq is None:
+                    _bad_niah.append('query-count-missing')
             out['checks'].append({'metric': 'niah_retrieval', 'policy': 'niah_retrieval',
-                                  'records': len(niah), 'ok': not missing, 'missing': missing})
+                                  'records': len(niah), 'ok': not missing and not _bad_niah,
+                                  'missing': missing, 'invalid': sorted(set(_bad_niah))})
             if missing:
                 out['warnings'].append(f'NIAH reports top-1 without {missing}; answer NLL is required alongside retrieval accuracy')
+            if _bad_niah:
+                out['warnings'].append('NIAH records contain invalid accuracy/NLL/query counts '
+                                       f'({sorted(set(_bad_niah))}); the retrieval endpoint is not usable')
         classify_tasks = ('classification', 'binary_classification', 'multiclass_classification')
         for r in recs:
             task = r.get('task')
