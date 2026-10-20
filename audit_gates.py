@@ -780,6 +780,38 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             rec['shuffle_at_split'] = meta.get('shuffle_at_split')
             rec['tokenizer_fit_split'] = meta.get('tokenizer_fit_split')
             rec['val_fingerprint_recorded'] = bool(meta.get('val_fp'))
+            # The cache files must still BE the stream the metadata names.
+            # Checking only "val_fp is present" (or only the runtime loader's
+            # check) lets a replaced/edited .npy be certified by this offline
+            # audit.  Recompute both recorded fingerprints from the actual
+            # bytes; a missing fingerprint stays a legacy warning.
+            _src_recorded = meta.get('src_fp') or meta.get('train_fp')
+            _val_recorded = meta.get('val_fp')
+            if _src_recorded is not None or _val_recorded is not None:
+                try:
+                    _Lfp = _import_exp_lib()
+                    if _src_recorded is not None:
+                        _src_actual = _Lfp._ids_fp(tr)
+                        rec['train_fingerprint_verified'] = bool(
+                            str(_src_actual) == str(_src_recorded))
+                        if not rec['train_fingerprint_verified']:
+                            rec['status'] = 'fail'
+                            _fail(f'{cd}/{tag}: train id-cache fingerprint does not '
+                                  'match metadata src_fp (the cache was edited or '
+                                  'replaced)')
+                    if _val_recorded is not None:
+                        _val_actual = _Lfp._ids_fp(np.asarray(va).reshape(-1))
+                        rec['val_fingerprint_verified'] = bool(
+                            str(_val_actual) == str(_val_recorded))
+                        if not rec['val_fingerprint_verified']:
+                            rec['status'] = 'fail'
+                            _fail(f'{cd}/{tag}: validation id-cache fingerprint does '
+                                  'not match metadata val_fp (a stale/mixed '
+                                  'validation file cannot be certified)')
+                except Exception as _fpe:
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: id-cache fingerprint audit failed '
+                          f'({type(_fpe).__name__}: {_fpe})')
             if meta.get('shuffle_at_split') is True:
                 rec['status'] = 'fail'
                 _fail(f'{cd}/{tag}: metadata declares a shuffled split')
@@ -815,8 +847,14 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             # straddles train/validation instead of trusting the build flag.
             _trd_path = os.path.join(cd, f'train_doc_ids_{tag}.npy')
             _vad_path = os.path.join(cd, f'val_doc_ids_{tag}.npy')
+            _trd_exists = os.path.exists(_trd_path)
+            _vad_exists = os.path.exists(_vad_path)
             _mdoc = meta.get('doc_ids') or {}
-            if os.path.exists(_trd_path) and os.path.exists(_vad_path):
+            if _trd_exists != _vad_exists:
+                rec['status'] = 'fail'
+                _fail(f'{cd}/{tag}: only one train/validation document-id '
+                      'sidecar exists; group isolation is half-attested')
+            if _trd_exists and _vad_exists:
                 try:
                     _trd = np.load(_trd_path)
                     _vad = np.load(_vad_path)
@@ -931,10 +969,19 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     _fail(f'{cd}/{tag}: {shared_val_test} test rows exactly duplicate a validation row')
                 _ted_path = os.path.join(cd, f'test_doc_ids_{_ttag}.npy')
                 if os.path.exists(_ted_path):
+                    if not (os.path.exists(_trd_path) and os.path.exists(_vad_path)):
+                        # The old code substituted empty arrays for the
+                        # missing train/val sidecars, which reported zero
+                        # overlap and certified a test group split that was
+                        # never checked.
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: test document-id sidecar is present '
+                              'but the train/validation doc-id sidecars are '
+                              'missing; test group isolation cannot be verified')
                     try:
                         _ted = np.load(_ted_path)
-                        _trd = np.load(_trd_path) if os.path.exists(_trd_path) else np.empty(0, dtype=np.uint64)
-                        _vad = np.load(_vad_path) if os.path.exists(_vad_path) else np.empty(0, dtype=np.uint64)
+                        _trd = np.load(_trd_path)
+                        _vad = np.load(_vad_path)
                         _dtrain = int(np.intersect1d(_trd, _ted).size)
                         _dval = int(np.intersect1d(_vad, _ted).size)
                         rec['test_documents'] = int(_ted.size)

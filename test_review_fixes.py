@@ -7977,6 +7977,48 @@ def t_small_n_split_remainder_and_string_order():
     assert sorted(sum((list(idx[k]) for k in ('train', 'val', 'test')), [])) == [0, 1, 2], idx
 
 
+
+def t_split_discipline_recomputes_fingerprints_and_doc_sidecars():
+    with tempfile.TemporaryDirectory() as d:
+        tag, ttag = 'tiny', 'tiny_test'
+        tr = np.arange(40, dtype=np.int64)
+        va = (np.arange(16, dtype=np.int64) + 100).reshape(2, 8)
+        te = (np.arange(16, dtype=np.int64) + 200).reshape(2, 8)
+        np.save(os.path.join(d, f'train_ids_{tag}.npy'), tr)
+        np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
+        np.save(os.path.join(d, f'test_ids_{ttag}.npy'), te)
+        meta = {'vocab': 256, 'seq_len': 8, 'split_strategy': 'ordered',
+                'shuffle_at_split': False, 'tokenizer_fit_split': 'train',
+                'src_fp': L._ids_fp(tr),
+                'val_fp': L._ids_fp(np.ascontiguousarray(va).reshape(-1))}
+        with open(os.path.join(d, f'meta_{tag}.json'), 'w', encoding='utf-8') as f:
+            json.dump(meta, f)
+        with open(os.path.join(d, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 256, 'seq_len': 8, 'split_strategy': 'official_test',
+                       'shuffle_at_split': False, 'tokenizer_fit_split': 'train'}, f)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec.get('train_fingerprint_verified') is True, rec
+        assert rec.get('val_fingerprint_verified') is True, rec
+        assert rec['status'] != 'fail', rec
+        # A replaced validation file with stale metadata must fail closed.
+        np.save(os.path.join(d, f'val_batch_{tag}.npy'), va + 1)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] == 'fail', rec
+        assert any('validation id-cache fingerprint' in w for w in out['warnings']), out
+        # Restore and add a test doc sidecar without the train/val sidecars:
+        # substituting empty arrays would have reported a clean zero overlap.
+        np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
+        np.save(os.path.join(d, f'test_doc_ids_{ttag}.npy'),
+                np.array([9, 10], dtype=np.int64))
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] == 'fail', rec
+        assert any('train/validation doc-id sidecars are missing' in w
+                   for w in out['warnings']), out
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8231,6 +8273,7 @@ def main():
     _check('L37c tuning margin does not invent precision', t_tuning_margin_does_not_invent_precision)
     _check('L37d ladder missing seed plan is not common', t_scale_ladder_missing_seed_plan_is_not_common)
     _check('L38 small-n split remainder + string order keys', t_small_n_split_remainder_and_string_order)
+    _check('L39 split audit recomputes fingerprints and doc sidecars', t_split_discipline_recomputes_fingerprints_and_doc_sidecars)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
