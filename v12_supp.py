@@ -276,6 +276,18 @@ def _load_manifest(path):
     if not isinstance(_ts, dict):
         raise SystemExit(f'[v12] REFUSE: binding.test_slice must be an object ({_ts!r})')
     _eval = m.get('eval') or {}
+    if _eval:
+        # The endpoint grid is part of the pre-registered plan.  int(4096.5)
+        # would silently score a different sequence length, and a boolean is
+        # a flag rather than an endpoint.
+        _bl = _eval.get('by_length_ppl')
+        if _bl is not None:
+            if not isinstance(_bl, list):
+                raise SystemExit(f'[v12] REFUSE: eval.by_length_ppl must be a list ({_bl!r})')
+            for _i, _x in enumerate(_bl):
+                _v = _int_field(_x, f'eval.by_length_ppl[{_i}]')
+                if _v <= 0:
+                    raise SystemExit(f'[v12] REFUSE: eval.by_length_ppl[{_i}]={_x!r} must be a positive length')
     if _ts and _eval:
         _ts_n = _ts.get('n_seqs')
         _ev_n = _eval.get('n_seqs_clean')

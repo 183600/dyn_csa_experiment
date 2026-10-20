@@ -1108,6 +1108,19 @@ def t_power_gate():
         m12 = _write_manifest(p12, list(range(12)))
         m = V12._load_manifest(p12)
         assert m['seeds'] == list(range(12)) and len(m['manifest_sha256']) == 64
+        # The frozen endpoint grid is exact: a fractional/bool/non-list
+        # sequence length would score a different pre-registered endpoint.
+        for _bad_lens in ([4096.5], [True], 4096):
+            _bad = _write_manifest(os.path.join(td, 'bad_lens.json'), list(range(12)))
+            _bad['eval'] = {'by_length_ppl': _bad_lens}
+            with open(os.path.join(td, 'bad_lens.json'), 'w', encoding='utf-8') as f:
+                json.dump(_bad, f)
+            try:
+                V12._load_manifest(os.path.join(td, 'bad_lens.json'))
+            except SystemExit as e:
+                assert 'by_length_ppl' in str(e), e
+            else:
+                raise AssertionError(f'eval.by_length_ppl={_bad_lens!r} was accepted')
         psm = os.path.join(td, 'smoke.json')
         _write_manifest(psm, [0], extra_stat={'descriptive_only': True})
         V12._load_manifest(psm)  # descriptive smoke manifests opt out
