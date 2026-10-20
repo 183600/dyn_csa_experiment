@@ -8528,6 +8528,16 @@ def _ids_narrow(train_ids):
     return train_ids
 
 def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
+    # A zero/negative window or batch is not a smaller training stream: it
+    # yields empty input/target tensors (or crashes inside NumPy allocation).
+    # Refuse it explicitly instead of feeding a silently empty batch.
+    _seq = _exact_count(seq_len, minimum=1)
+    _bs = _exact_count(batch_size, minimum=1)
+    if _seq is None:
+        raise ValueError(f'batch_iter needs a positive integer seq_len, got {seq_len!r}')
+    if _bs is None:
+        raise ValueError(f'batch_iter needs a positive integer batch_size, got {batch_size!r}')
+    seq_len, batch_size = int(_seq), int(_bs)
     rng = np.random.default_rng(seed)
     # A corpus of exactly seq_len+1 tokens still contains one causal window
     # (start=0), so only a shortfall is invalid.

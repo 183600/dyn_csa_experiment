@@ -7755,6 +7755,14 @@ def t_batch_iter_minimal_corpus():
         pass
     else:
         raise AssertionError('a corpus shorter than seq_len+1 must be rejected')
+    for _seq_len, _batch in ((0, 1), (1, 0), (1, -1), (1.5, 1), (True, 1)):
+        try:
+            next(L.batch_iter(np.arange(10, dtype=np.int64), _seq_len, _batch,
+                              _torch.device('cpu')))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'seq_len={_seq_len!r}, batch_size={_batch!r} must be refused')
 
 
 def t_indexer_invalid_soft_lanes_are_zero():
