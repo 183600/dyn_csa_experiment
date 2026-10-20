@@ -85,6 +85,28 @@ _CACHE_PROVENANCE_PATTERNS = (
 )
 
 
+def _safe_outdir(outdir):
+    """Resolve a release output directory under the repository.
+
+    The tag and every packed directory are already confined; `--out` was not,
+    so `--out ../x` (or an absolute path) could write the archive outside the
+    repository.  Keep the same containment rule as `_collect`.
+    """
+    if not isinstance(outdir, str) or not outdir.strip():
+        raise ValueError(f'archive output directory must be a non-empty path, got {outdir!r}')
+    _repo_real = os.path.realpath(REPO)
+    _out = os.path.realpath(os.path.join(REPO, outdir))
+    try:
+        _inside = os.path.commonpath([_repo_real, _out]) == _repo_real
+    except ValueError:
+        _inside = False
+    if not _inside:
+        raise ValueError(
+            f'archive output directory {outdir!r} resolves outside the repository '
+            f'({_out!r}); write releases under {REPO!r}')
+    return _out
+
+
 def _cache_provenance_files(cache_dir=None):
     """Metadata/tokenizer files that make a corpus cache auditable.
 
@@ -273,10 +295,10 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     if not files:
         print('[archive] REFUSE: nothing to archive — the named result dirs do not exist here; run this on the machine holding the artifacts')
         return 1
-    os.makedirs(os.path.join(REPO, outdir), exist_ok=True)
-    stamp = time.strftime('%Y%m%dT%H%M%S')
+    _outdir = _safe_outdir(outdir)
+    os.makedirs(_outdir, exist_ok=True)
     base_name = f'release_{tag}'
-    tar_path = os.path.join(REPO, outdir, f'{base_name}.tar.gz')
+    tar_path = os.path.join(_outdir, f'{base_name}.tar.gz')
     man = {'release': base_name, 'tag': tag, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'created_by': 'archive_release.py', 'git': _git_state(), 'environment': _env_snapshot(), 'dirs': list(dirs), 'include_ckpt_bodies': bool(include_ckpt), 'files': {}, 'checkpoint_hashes': _ckpt_hash_table(dirs)}
     # Build the archive beside its final name; an interrupted or failed make
     # must not leave a truncated `release_<tag>.tar.gz` (or destroy a previous
@@ -304,16 +326,16 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
             pass
         raise
     # external copy of the manifest + the archive's own hash
-    man_ext = os.path.join(REPO, outdir, man_path_rel)
+    man_ext = os.path.join(_outdir, man_path_rel)
     _atomic_write_bytes(man_ext, man_bytes)
-    _atomic_write_bytes(os.path.join(REPO, outdir, f'{base_name}.tar.gz.sha256'),
+    _atomic_write_bytes(os.path.join(_outdir, f'{base_name}.tar.gz.sha256'),
                         f'{tar_sha}  {os.path.basename(tar_path)}\n'.encode('utf-8'))
     print(f'[archive] wrote {os.path.relpath(tar_path, REPO)} ({os.path.getsize(tar_path):,d} B)')
     print(f'[archive] wrote {man_path_rel} ({len(man["files"])} files, {len(man["checkpoint_hashes"])} ckpt hashes)')
     print(f'[archive] archive sha256: {tar_sha}')
     print('[archive] publish the tar.gz + MANIFEST + .sha256 to a read-only location (release attachment / object store); the git repo itself stays source-only (design_notes §8)')
     _atomic_write_bytes(
-        os.path.join(REPO, outdir, f'{base_name}.release_record.json'),
+        os.path.join(_outdir, f'{base_name}.release_record.json'),
         json.dumps({'release': base_name, 'tag': tag, 'created_at': man['created_at'],
                     'tar_sha256': tar_sha, 'n_files': len(man['files']),
                     'n_ckpt_hashes': len(man['checkpoint_hashes']),

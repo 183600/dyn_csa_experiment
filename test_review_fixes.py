@@ -8716,6 +8716,17 @@ def t_archive_refuses_links_and_repo_escape():
                 raise AssertionError('a parent-relative directory was packed')
         finally:
             shutil.rmtree(outside, ignore_errors=True)
+        # The release output directory is confined just like the tag and the
+        # packed inputs: --out must not write outside the repository.
+        for _bad_out in ('../escape', outside, os.path.join(outside, 'nested')):
+            try:
+                AR._safe_outdir(_bad_out)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'outdir {_bad_out!r} escaped the repository')
+        assert AR._safe_outdir('archive') == os.path.join(
+            os.path.realpath(AR.REPO), 'archive')
         # A symlink member with the expected name must not satisfy the
         # manifest; it was never hashed as a regular file.
         path = os.path.join(d, 'release_x.tar.gz')
