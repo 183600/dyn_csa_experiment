@@ -10303,6 +10303,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     else:
         _seed_pairing = 'positional_only'
     _incomplete = [r['label'] for r in per if r.get('complete_pairs') is False]
+    _empty_points = [r['label'] for r in per if r['n'] == 0]
     _attrition = {r['label']: {'n_dropped': r.get('n_dropped'),
                                'n_missing': r.get('n_missing'),
                                'n_unexpected': r.get('n_unexpected')}
@@ -10310,6 +10311,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'per_point': per,
            'n_points': len(per), 'n_usable': len(usable),
            'incomplete_points': _incomplete,
+           'empty_points': _empty_points,
            'attrition': _attrition,
            'zero_variance_points': _zero_variance,
            'corpus_binding': _scale_corpus_binding(pts),
@@ -10369,7 +10371,8 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                 'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0
                                  and (not math.isfinite(p_q) or p_q >= alpha)
                                  and not _underpowered_points
-                                 and not _incomplete and not _zero_variance),
+                                 and not _incomplete and not _zero_variance
+                                 and not _empty_points),
                 'note': ('poolable requires >=3 scales, every included scale at n>=min_seeds '
                          'with a complete paired panel (no dropped/absent seeds) and non-zero '
                          'within-scale variance, '
@@ -10382,7 +10385,10 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                          + (('; zero within-scale variance at: ' + ', '.join(map(str, _zero_variance))
                              + ' (1/se^2 is undefined; the point is reported but not silently '
                                'dropped from the pooled claim)')
-                            if _zero_variance else ''))})
+                            if _zero_variance else '')
+                         + (('; scale point(s) with no measured effect: ' + ', '.join(map(str, _empty_points))
+                             + ' (the tier is declared but contributes no estimable effect)')
+                            if _empty_points else ''))})
     out['status'] = 'ok'
     return out
 
@@ -10465,7 +10471,9 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         raise ValueError(f'min_points must be a positive integer, got {min_points!r}')
     min_seeds, min_points = _min_seeds, _min_points
     pts = _scale_points(points)
-    pts = [p for p in pts if math.isfinite(p['scale']) and p['scale'] > 0.0 and p['effects']]
+    # Keep declared-but-empty scale points for binding/attrition, but exclude
+    # them from the regression itself (an empty y vector has no mean).
+    pts = [p for p in pts if math.isfinite(p['scale']) and p['scale'] > 0.0]
     pts.sort(key=lambda p: p['scale'])
     labels = [p['label'] for p in pts]
     if len(set(labels)) != len(labels):
@@ -10473,17 +10481,23 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     for p in pts:
         if len(set(p['seeds'])) != len(p['seeds']):
             raise ValueError('scale point %r has duplicate seeds %r' % (p['label'], p['seeds']))
+    _empty_points = [p['label'] for p in pts if not p['effects']]
     _incomplete_points = [p['label'] for p in pts if p.get('complete_pairs') is False]
     _attrition = {p['label']: {'n_dropped': p.get('n_dropped'),
                                'n_missing': p.get('n_missing'),
                                'n_unexpected': p.get('n_unexpected')}
                   for p in pts if p.get('complete_pairs') is False}
+    _pts_binding = pts
+    pts = [p for p in pts if p['effects']]
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'min_points': int(min_points),
-           'n_points': len(pts), 'labels': labels,
+           'n_points': len(pts), 'labels': [p['label'] for p in pts],
            'scales': [p['scale'] for p in pts],
+           'declared_labels': labels,
+           'declared_scales': [p['scale'] for p in _pts_binding],
            'incomplete_points': _incomplete_points,
+           'empty_points': _empty_points,
            'attrition': _attrition,
-           'corpus_binding': _scale_corpus_binding(pts),
+           'corpus_binding': _scale_corpus_binding(_pts_binding),
            'min_seeds_for_significance': signflip_min_n_for_holm(1, alpha),
            'convention': 'effects must be scale-free (e.g. paired log PPL ratio); positive = with arm worse'}
     if len(pts) < 2:
@@ -10639,7 +10653,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
                                 if len(p['effects']) < int(min_seeds)]
         underpowered = bool(_underpowered_points)
     too_few_scales = k < int(min_points)
-    _incomplete = bool(_incomplete_points)
+    _incomplete = bool(_incomplete_points or _empty_points)
     sig = bool(p_primary is not None and math.isfinite(float(p_primary)) and float(p_primary) < alpha
                and not resolution_limited and not underpowered and not too_few_scales
                and not _incomplete)
@@ -10676,11 +10690,16 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out['benefit_grows_with_scale'] = (bool(sig and direction_slope < 0) if not heterogeneous else None)
     if too_few_scales:
         out['note'] = 'fewer than min_points=%d scales: slope is descriptive even if the exact test rejects' % int(min_points)
-    if _incomplete:
+    if _incomplete_points:
         out['note'] = ((out.get('note') + '; ') if out.get('note') else '') + (
             'incomplete paired panel at %s — the slope/verdict is descriptive even if a '
             'complete-case test rejects (which seeds failed can bias the surviving subset)'
             % ', '.join(map(str, _incomplete_points)))
+    if _empty_points:
+        out['note'] = ((out.get('note') + '; ') if out.get('note') else '') + (
+            'declared scale point(s) with no measured effect at %s — the tier is in the '
+            'family but contributes no slope; the trend is descriptive'
+            % ', '.join(map(str, _empty_points)))
     if underpowered and _underpowered_points:
         _u = ('paired complete-seed n<%d' % int(min_seeds) if paired_primary
               else 'scale point(s) with n<%d: ' % int(min_seeds)

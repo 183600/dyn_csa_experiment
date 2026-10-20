@@ -7540,6 +7540,18 @@ def t_scale_meta_refuses_visible_attrition():
     assert mz['n_usable'] == 3, 'the consistent point is not part of the DL weights'
     assert mz['poolable'] is False and 'zero within-scale variance' in mz['note'], mz
     assert len(mz['per_point']) == 4, 'the row stays visible'
+    # A scale point whose every effect is non-finite is not deleted from the
+    # family: it is named as empty and blocks both pooling and a trend.
+    empty = [{'label': 'S%d' % i, 'scale': 10.0 ** i,
+              'effects': [float(i) + 0.1 * j for j in range(6)],
+              'seeds': list(range(6))} for i in range(3)]
+    empty[1] = {'label': 'S1', 'scale': 10.0,
+                'effects': [float('nan')], 'seeds': [0], 'n_planned': 6}
+    me = L.meta_analyze_effects(empty)
+    assert me['empty_points'] == ['S1'] and me['poolable'] is False, me
+    re = L.scaling_trend(empty, min_points=2)
+    assert re['empty_points'] == ['S1'] and re['significant'] is False, re
+    assert re['verdict'] == 'incomplete_scale_point', re
     # Invalid plan metadata fails closed instead of being silently truncated.
     for bad in (True, 3.5, -1, 'six'):
         try:
