@@ -188,7 +188,7 @@ def _wikitext_data(cfg):
 
 
 def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
-             outdir, fp, device, max_hours=None):
+             outdir, fp, device, max_hours=None, prov=None):
     key = f'{variant}::seed{int(seed)}'
     summary = _load_summary(outdir)
     _data_fp = L._ids_fp(train_ids) if train_ids is not None else None
@@ -224,16 +224,44 @@ def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
     rec['code'] = L.code_stamp()
     rec['semantics'] = L.CODE_SEMANTICS
     rec['elapsed_s'] = time.time() - t0
+    if prov is None:
+        prov = L.experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
+    rec['provenance'] = prov
+    rec['data_version'] = (prov.get('data') or {}).get('data_version')
+    rec['corpus_fp'] = (prov.get('data') or {}).get('corpus_fp')
     rec['hyperparams'] = L.run_hyperparameters(
         cfg, seed=int(seed), d=int(cfg['d']), n_layers=int(cfg['n_layers']),
         n_heads=int(cfg['n_heads']), d_head=int(cfg['d_head']),
         vocab=int(vocab), mlp_ratio=4.0,
         amp_dtype=rec.get('amp_dtype', 'auto'),
-        eager_batch=rec.get('eager_batch', False))
+        eager_batch=rec.get('eager_batch', False),
+        data_version=rec.get('data_version'))
     rec['hyperparams']['open_block_config'] = rec.get('open_block_config')
     summary[key] = rec
     _save_summary(outdir, summary)
     _nll_tok = _nll_per_token(rec)
+    _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
+    L.log_experiment_event(outdir, {
+        'kind': 'cell', 'tracking_schema': 2, 'status': 'ok', 'key': key,
+        'variant': variant, 'seed': int(seed), 'run_cfg': fp,
+        'code': rec.get('code'), 'provenance': prov,
+        'hyperparams': rec.get('hyperparams'), 'data_fp': rec.get('data_fp'),
+        'val_fp': rec.get('eval_fp'), 'data_version': rec.get('data_version'),
+        'corpus_fp': rec.get('corpus_fp'), 'rng_fp': rec.get('rng_fp'),
+        'started_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'elapsed_s': rec.get('elapsed_s'),
+        'metrics': {'ppl': rec.get('ppl'), 'nll_per_token': _nll_tok,
+                    'params': rec.get('params'), 'steps': rec.get('steps'),
+                    'tokens_seen': rec.get('tokens_seen'),
+                    'train_time_s': rec.get('train_time_s'),
+                    'final_loss_smoothed': rec.get('final_loss_smoothed')},
+        'curve_summary': {'n_points': len(_losses),
+                          'first': _losses[0] if _losses else None,
+                          'last': _losses[-1] if _losses else None,
+                          'best': min(_losses) if _losses else None},
+        'losses': _losses, 'ppl_history': rec.get('ppl_history'),
+    })
     print(f'[open-block] {key}: NLL/token='
           f'{(f"{_nll_tok:.6f}" if _nll_tok is not None else "n/a")} PPL={rec["ppl"]:.4f}')
     return rec
@@ -243,22 +271,107 @@ def run_panel(cfg, matrix, *, device, synthetic=False, max_hours=None, label='ma
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
     fp = _run_fingerprint(cfg, matrix=matrix, outdir=outdir)
+    cfg = dict(cfg)
+    cfg['seeds'] = L.normalize_seed_list(cfg.get('seeds'))
     if synthetic:
         train, val, vocab = _synthetic_data(cfg)
         val_bnd = None
     else:
         train, val, vocab, val_bnd = _wikitext_data(cfg)
+    variants = list(dict.fromkeys(_variant(mb, m, sc) for mb, m, sc in matrix))
+    planned = [f'{v}::seed{s}' for s in cfg['seeds'] for v in variants]
+    first_seed = int(cfg['seeds'][0])
+    _prov_cfg = dict(cfg)
+    if synthetic:
+        _prov_cfg['dataset'] = 'synthetic'
+    _prov_cfg['data_extra'] = {'open_block_matrix': [list(x) for x in matrix],
+                               'synthetic': bool(synthetic)}
+    prov = L.experiment_provenance(_prov_cfg, train_ids=train, val_batch=val, vocab=vocab)
+    _data = prov.get('data') or {}
     manifest = {
-        'kind': 'open_block_panel', 'label': label,
+        'kind': 'open_block_panel', 'label': label, 'tracking_schema': 2,
+        'status': 'preflight',
         'code': L.code_stamp(), 'semantics': L.CODE_SEMANTICS,
         'recipe': _recipe(cfg, matrix=matrix, outdir=outdir),
         'run_fingerprint': fp,
+        'provenance': prov,
         'data': {'train_len': int(len(train)), 'val_shape': list(np.asarray(val).shape),
-                 'vocab': int(vocab), 'synthetic': bool(synthetic)},
+                 'vocab': int(vocab), 'synthetic': bool(synthetic),
+                 'train_fp': _data.get('train_fp'), 'val_fp': _data.get('val_fp'),
+                 'corpus_fp': _data.get('corpus_fp'),
+                 'data_version': _data.get('data_version')},
         'started_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'cells': [f'{_variant(mb, m, sc)}::seed{s}' for s in cfg['seeds'] for mb, m, sc in matrix],
+        'cells': planned, 'n_planned': len(planned),
     }
-    _atomic_json(os.path.join(outdir, 'run_manifest.json'), manifest)
+
+    def _save_manifest(**updates):
+        manifest.update(updates)
+        _atomic_json(os.path.join(outdir, 'run_manifest.json'), manifest)
+
+    _save_manifest()
+    # The same pre-flight contract as exp_lib.run(): every RNG source pinned,
+    # the actual loader's label/vocab/repeat contract checked, and the real
+    # architecture overfitted on one fixed batch before any panel cell is
+    # trained.  Failed evidence is persisted and refuses the panel.
+    try:
+        L.set_seed(first_seed)
+        seed_contract = L.seed_contract_check(seed=first_seed)
+        seed_contract.update({'run_fingerprint': fp, 'provenance': prov})
+        _atomic_json(os.path.join(outdir, 'seed_contract.json'), seed_contract)
+        if not seed_contract.get('passed'):
+            _save_manifest(status='failed', stage='rng_seed_contract',
+                           error=str(seed_contract.get('diagnosis')))
+            raise RuntimeError('open-block seed contract check FAILED: '
+                               + str(seed_contract.get('diagnosis')))
+        data_contract = L.batch_contract_check(
+            train, cfg['seq_len'], cfg['batch_size'], device,
+            seed=first_seed, vocab=vocab)
+        data_contract.update({'run_fingerprint': fp, 'provenance': prov})
+        _atomic_json(os.path.join(outdir, 'data_contract.json'), data_contract)
+        if not data_contract.get('passed'):
+            _save_manifest(status='failed', stage='batch_iterator_contract',
+                           error=str(data_contract.get('diagnosis')))
+            raise RuntimeError('open-block batch iterator contract check FAILED: '
+                               + str(data_contract.get('diagnosis')))
+        _probe_seq = L.probe_seq_len(cfg['seq_len'])
+        sanity = list(L.overfit_guard(
+            variants, seed=first_seed, steps=200, seq_len=_probe_seq,
+            batch_size=2, vocab=vocab, train_ids=train,
+            arch={'d': int(cfg['d']), 'n_layers': int(cfg['n_layers']),
+                  'n_heads': int(cfg['n_heads']), 'd_head': int(cfg['d_head'])},
+            mlp_ratio=4.0))
+        if not sanity:
+            sanity = list(L.overfit_reports_for(
+                variants, source='data', data_fp=_data.get('train_fp')))
+    except RuntimeError as _fe:
+        sanity_doc = {
+            'kind': 'small_batch_overfit_sanity_panel',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'run_fingerprint': fp, 'provenance': prov, 'passed': False,
+            'error': f'{_fe}', 'reports': list(L.overfit_reports().values()),
+        }
+        _atomic_json(os.path.join(outdir, 'overfit_sanity.json'), sanity_doc)
+        _save_manifest(status='failed', stage='preflight', error=f'{_fe}')
+        raise
+    sanity_doc = {
+        'kind': 'small_batch_overfit_sanity_panel',
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'run_fingerprint': fp, 'provenance': prov,
+        'passed': bool(sanity) and all(bool(r.get('passed')) for r in sanity),
+        'reports': sanity,
+    }
+    _atomic_json(os.path.join(outdir, 'overfit_sanity.json'), sanity_doc)
+    _save_manifest(status='running', seed_contract=seed_contract,
+                   data_contract=data_contract, sanity=sanity_doc)
+    L.log_experiment_event(outdir, {
+        'kind': 'panel_start', 'tracking_schema': 2, 'label': label,
+        'run_cfg': fp, 'code': L.code_stamp(), 'seeds': list(cfg['seeds']),
+        'variants': variants, 'n_cells_planned': len(planned),
+        'provenance': prov, 'data_version': _data.get('data_version'),
+        'seed_contract': {'passed': bool(seed_contract.get('passed'))},
+        'data_contract': {'passed': bool(data_contract.get('passed'))},
+        'sanity': {'passed': sanity_doc['passed'], 'n_reports': len(sanity)},
+    })
     deadline = None if max_hours is None else time.time() + float(max_hours) * 3600.0
     done = 0
     for seed in cfg['seeds']:
@@ -267,13 +380,28 @@ def run_panel(cfg, matrix, *, device, synthetic=False, max_hours=None, label='ma
             remain = None if deadline is None else (deadline - time.time()) / 3600.0
             rec = _run_one(cfg, variant=variant, seed=seed, train_ids=train,
                            val_batch=val, vocab=vocab, val_bnd=val_bnd,
-                           outdir=outdir, fp=fp, device=device, max_hours=remain)
+                           outdir=outdir, fp=fp, device=device, max_hours=remain,
+                           prov=prov)
             if rec is not None:
                 done += 1
-    manifest['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
-    manifest['completed_cells'] = done
-    _atomic_json(os.path.join(outdir, 'run_manifest.json'), manifest)
-    print(f'\n[open-block] panel {label}: {done} cell(s) processed; summary={os.path.join(outdir, "summary.json")}')
+    summary = _load_summary(outdir)
+    present = {k for k in planned if isinstance(summary.get(k), dict)
+               and L.ppl_is_usable((summary.get(k) or {}).get('ppl'))}
+    missing = [k for k in planned if k not in present]
+    status = 'complete' if not missing else 'incomplete'
+    _save_manifest(status=status, finished_at=time.strftime('%Y-%m-%dT%H:%M:%S'),
+                   completed_cells=done, n_measured=len(present),
+                   missing_cells=missing)
+    L.log_experiment_event(outdir, {
+        'kind': 'panel_finish', 'tracking_schema': 2, 'label': label,
+        'status': status, 'run_cfg': fp, 'code': L.code_stamp(),
+        'n_cells_planned': len(planned), 'n_cells_measured': len(present),
+        'n_cells_missing': len(missing), 'missing_cells': missing[:20],
+        'data_version': _data.get('data_version'),
+    })
+    print(f'\n[open-block] panel {label}: {done} cell(s) processed, '
+          f'{len(present)}/{len(planned)} measured, status={status}; '
+          f'summary={os.path.join(outdir, "summary.json")}')
     return outdir
 
 
