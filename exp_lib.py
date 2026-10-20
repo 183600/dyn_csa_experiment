@@ -12061,6 +12061,8 @@ ABLATION_DESIGN = {
     'dynamic_blocking': [
         ('csa_dynamic', 'csa_fixed', 'dynamic vs fixed blocking (CSA)'),
         ('hybrid_dynamic', 'hybrid_fixed', 'dynamic vs fixed blocking (CSA+HCA hybrid)'),
+        ('hybrid_csa_dyn', 'hybrid_fixed', 'dynamic vs fixed CSA blocking inside the hybrid (HCA fixed)'),
+        ('hybrid_hca_dyn', 'hybrid_fixed', 'dynamic vs fixed HCA blocking inside the hybrid (CSA fixed)'),
     ],
     'learned_selection': [
         ('csa_fixed', 'csa_fix_randidx', 'learned top-k vs random selection (fixed blocking)'),

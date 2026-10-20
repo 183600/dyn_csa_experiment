@@ -1488,6 +1488,16 @@ def t_ablation_design_loss_term():
     missing = declared - set(L.RUN_ABL['variants'])
     assert not missing, f'declared ablation arms not scheduled by RUN_ABL: {sorted(missing)}'
     assert L.ablation_completeness_audit(L.ABLATION_DESIGN, L.RUN_ABL['variants'])['complete'] is True
+    # Dynamic blocking must be decomposed by layer kind, not only measured as
+    # "all-dynamic vs all-fixed".  Otherwise hybrid_hca_dyn is scheduled but
+    # never contributes to any declared contrast, and the HCA boundary effect
+    # cannot be separated from the CSA boundary effect.
+    _dyn = {(a, b) for a, b, _n in L.ABLATION_DESIGN['dynamic_blocking']}
+    assert ('hybrid_csa_dyn', 'hybrid_fixed') in _dyn, _dyn
+    assert ('hybrid_hca_dyn', 'hybrid_fixed') in _dyn, _dyn
+    assert any('hybrid_hca_dyn' in (a, b)
+               for cs in L.ABLATION_DESIGN.values() for a, b, _n in cs), \
+        'hybrid_hca_dyn is scheduled but belongs to no declared contrast'
 
 
 def t_training_knobs_in_resume_fingerprint():
