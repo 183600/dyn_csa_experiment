@@ -83,6 +83,25 @@ test-split record was ever written.
   without removing it. Validation is also the split that was reused for all
   v6-v11 selection, so it cannot support confirmatory claims.
 
+## 2026-10-20 — scale-comparability hardening (no new runs, frozen plan untouched)
+
+Changed only zero-GPU analysis/reporting paths; no panel, frozen manifest or
+test split was touched. (1) Added a budget-independent `corpus_fp` (corpus
+source + vocabulary + tokenizer-fit prefix) so a 5B and a 12B tier over the
+same corpus no longer look "mixed"; `data_version` still identifies the exact
+served bytes, and mixed provenance generations are refused. M0 now uses the
+stable fingerprint and refuses legacy/new mixing. (2) Exact sign-flip
+resolution now accounts for zero deltas: the attainable floor is
+`2/2**(#nonzero)`, not `2/2**n`, in `exp_lib` and the report twin. (3) Scale
+points carry declared-plan coverage (`n_planned`/`planned_seeds`,
+`n_input`/`n_dropped`/`n_missing`); `meta_analyze_effects` refuses a pooled
+"common effect" and `scaling_trend` refuses a confirmable trend when a point
+is visible as an incomplete complete-case subset. Zero-within-variance scale
+points are named instead of silently dropped from the DL weights. (4) M0
+cross-tier per-seed pairs now pass `pair_reason`, and extreme-scale interactions
+order by declared scale rather than label text. The temporary issue list was
+removed after the fixes.
+
 ## 2026-10-20 — data-path hardening (no new experiment panels)
 
 Four data-processing defects were fixed without reading any held-out test

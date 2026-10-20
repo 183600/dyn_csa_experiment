@@ -1424,3 +1424,54 @@ warning 而不是把两套 seed 集合当成同一族。
 - `audit_failures` 新增 `unmeasured_by_arm` / `unmeasured_samples`：
   NaN/缺失 PPL 的记录既不是成功也不是 error，必须作为「缺失测量」进入
   生存偏差读数，不能从两侧同时消失。
+
+## 29. 规模证据的可比性：语料身份、数据缺失与对照配对（本轮硬化）
+
+本节不新增 GPU 面板，也不修改冻结清单或 test split；它修正的是「规模
+分析把两个不可比的东西放在一起」的数据流。
+
+### 29.1 语料/分词器身份与训练预算分离
+
+`data_version` 是**实际服务字节**的身份（含 `requested_train_tokens`、
+`train_tokens`、`train_fp`、split 长度），因此 S1（5B）与 S2（12B）
+在同一语料、同一分词器上也会不同。过去 M0 把它当作跨规模
+`corpus_fp`，于是合法的 token/参数规模阶梯被判为 `mixed` 而拒绝。
+
+现在每条记录另存预算无关的 `corpus_fp`：语料来源 + 词表宽度 +
+**分词器拟合前缀**（前 `TOKENIZER_FIT_TOKENS` 个 train id，即 BPE 实际
+拟合的文本）的指纹。训练 cap 增大时该前缀不变，所以共享语料/分词器的
+不同预算 tier 得到相同 `corpus_fp`；换语料、换分词器或改变拟合前缀仍然
+得到不同指纹。`data_version` 语义保持不变（精确服务字节）；旧记录没有
+`corpus_fp` 时 M0 回退到 `data_version`，同一面板混用两代 provenance 则
+拒绝，而不是让新子集代表整个面板。
+
+### 29.2 零差值降低符号翻转的分辨率
+
+精确符号翻转检验中，`d_i = 0` 的符号不改变统计量，因此双侧 p 的分辨率
+下限是 `2 / 2**(#nonzero)`，不是 `2 / 2**n`。p 值原本就是正确的；错的
+是 `paired_effect_stats` 报告的 `p_floor` 与 `resolution_limited` 标签。
+现在 `exact_signflip_p` 返回 `n_nonzero` 与可达下限，paired 统计和
+`build_report` 的本地孪生实现都使用它；全零向量报 `p_floor=1`。
+
+### 29.3 规模点的可见缺失与零方差
+
+规模点过去只汇报过滤后的 `n`。`_scale_points` 现在接受
+`n_planned` / `planned_seeds`，并记录 `n_input`、`n_dropped`、
+`n_missing`、`n_unexpected`、`complete_pairs`。`meta_analyze_effects`
+在任一规模点不完整时禁止 `poolable=True`；`scaling_trend` 返回
+`incomplete_scale_point` 且不标 `significant`。没有声明计划的旧调用保持
+原行为（`complete_pairs=True`）。
+
+同一规模内逐种子效应完全相同的点（within-scale variance = 0）无法形成
+`1/se^2` 权重。它不是缺失点，也不应被静默丢弃；现在它保留在
+`per_point`，列入 `zero_variance_points`，并阻止合并声明，直到有方差
+模型或更多种子。
+
+### 29.4 跨规模逐种子配对必须过受控变量门
+
+M0 的跨规模 log-PPL 效应过去只按 `(variant, seed)` 取 PPL。种子编号相同
+不代表两次训练共享优化器、步数、数据或初始化。现在每个 seed 先过
+`exp_lib.pair_reason`（run_cfg / train_knobs / 精度模式 / 数据与评测
+指纹 / `init_core_fp` / steps/tokens）；被拒的 seed 会打印并排除，不计入
+规模点。极端规模交互按声明的 `scale` 排序，不再按标签字符串排序
+（否则 `S10` 会排在 `S2` 之前）。

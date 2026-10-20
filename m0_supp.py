@@ -587,6 +587,15 @@ def _records_by_seed(summary, variant):
     return out
 
 
+def _ppl_by_seed(summary, variant):
+    """Backward-compatible name: raw per-seed PPL for one arm.
+
+    Cross-scale code must use `_paired_ppl_by_seed`; this helper is kept for
+    callers that only need the arm's own values and is not a pairing gate.
+    """
+    return {s: float(rec['ppl']) for s, rec in _records_by_seed(summary, variant).items()}
+
+
 def _paired_ppl_by_seed(summary, variant_a, variant_b):
     """Per-seed paired PPLs that pass the SAME control gate as the audit.
 
