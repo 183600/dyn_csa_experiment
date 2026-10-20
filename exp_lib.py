@@ -676,6 +676,17 @@ RUN_SCALE = dict(RUN, d=384, n_layers=8, n_heads=12, d_head=32, seq_len=1024, ba
 # m0_supp.py params，S4 按规划的解析外推口径）。
 B_VOCAB = 32768
 SCALE_LADDER = {'S1': dict(d=768, n_layers=12, n_heads=12, d_head=64), 'S2': dict(d=1024, n_layers=16, n_heads=16, d_head=64), 'S3': dict(d=1536, n_layers=20, n_heads=24, d_head=64), 'S4': dict(d=2048, n_layers=24, n_heads=32, d_head=64)}
+# Declared transfer assumptions for the S1→S4 ladder.  They are deliberately
+# explicit: a scale comparison that changes width/depth also changes the
+# optimal optimizer settings, so a constant LR is a DISCLOSED assumption, not
+# a matched control.  `scale_ladder_audit` checks the token budget and makes
+# the assumption visible before the panel spends GPU time.
+SCALE_TRANSFER_POLICY = {
+    'tokens_per_param_tolerance': 0.25,
+    'lr_transfer': 'constant_declared_not_validated',
+    'family_m': 4,
+    'note': 'S1-S4 hold lr/wd/warmup fraction fixed across widths. No muP or LR-transfer calibration has been run; scale contrasts therefore carry an optimisation-transfer confound and the ladder is descriptive until a transfer check exists.',
+}
 B_ARMS = ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic']
 RUN_S1 = dict(RUN, dataset='fineweb', vocab_size=B_VOCAB, d=768, n_layers=12, n_heads=12, d_head=64, seq_len=8192, batch_size=8, n_train_tokens=5000000000, steps=76294, warmup=2000, eval_every=4000, eval_subset=32, val_seqs=512, seeds=[0, 1, 2, 3], outdir='results_b_s1', variants=B_ARMS)
 M0_CAP = dict(total_hours=700.0, margin=0.93, already_hours=0.0, state_path='run_time_state_m0.json')
@@ -8392,6 +8403,12 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             out['reasons'].append('|mean| <= std: effect is within seed noise')
     except (TypeError, ValueError):
         out['reasons'].append('mean/std are not numeric')
+    # Leave-one-seed-out instability is a direct contradiction of a stable
+    # directional effect: dropping one seed must not flip the sign.  Only
+    # enforced when the caller supplied the diagnostic (old stats dicts do not
+    # carry it); the verdict is never silently assumed robust.
+    if stats.get('seed_driven') is True:
+        out['reasons'].append('leave-one-seed-out stability fails: dropping one seed flips the mean sign')
     if family_size is not None:
         try:
             _fl = holm_min_attainable_p(n, int(family_size), alpha)
@@ -9561,6 +9578,119 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     return out
 
 
+def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
+    """Pre-flight audit of the scale ladder's budget and transfer assumptions.
+
+    A width/depth comparison is not controlled if the larger model also saw a
+    different tokens-per-parameter budget or silently inherited an untested
+    learning-rate transfer.  This audit does not choose those values; it makes
+    them machine-checkable and persistent before a panel consumes GPU time.
+
+    `tiers` is a list of {name, cfg, params}: `cfg` carries steps / batch_size
+    / seq_len / n_train_tokens / lr / warmup / seeds, `params` is the measured
+    parameter count (optional; without it the budget per parameter is
+    unverifiable).  A budget mismatch is a disclosure warning (a scale study
+    may deliberately change budget), never a silent "matched" claim.
+    """
+    policy = dict(SCALE_TRANSFER_POLICY if policy is None else policy)
+    tol = float(policy.get('tokens_per_param_tolerance', 0.25) if tolerance is None else tolerance)
+    problems, warnings, rows = [], [], []
+    for i, tier in enumerate(tiers or []):
+        if not isinstance(tier, dict):
+            problems.append(f'tier #{i} is not a dict')
+            continue
+        name = str(tier.get('name') or f'T{i}')
+        cfg = tier.get('cfg') or {}
+        row = {'name': name}
+        try:
+            steps = int(cfg['steps'])
+            batch = int(cfg['batch_size'])
+            seq = int(cfg['seq_len'])
+            declared_tokens = int(cfg.get('n_train_tokens') or 0)
+            lr = float(cfg.get('lr'))
+            warmup = int(cfg.get('warmup') or 0)
+            seeds = [int(s) for s in (cfg.get('seeds') or [])]
+        except (KeyError, TypeError, ValueError) as e:
+            problems.append(f'{name}: incomplete scale cfg ({type(e).__name__}: {e})')
+            continue
+        if min(steps, batch, seq) <= 0:
+            problems.append(f'{name}: steps/batch_size/seq_len must be positive')
+            continue
+        if not (math.isfinite(lr) and lr > 0):
+            problems.append(f'{name}: lr={lr!r} is not a positive finite number')
+        effective_tokens = steps * batch * seq
+        if declared_tokens > 0 and abs(effective_tokens - declared_tokens) > 0.01 * declared_tokens:
+            problems.append(
+                f'{name}: declared n_train_tokens={declared_tokens:,} differs from '
+                f'steps*batch_size*seq_len={effective_tokens:,} by more than 1%')
+        params = tier.get('params')
+        try:
+            params = int(params) if params is not None else None
+        except (TypeError, ValueError):
+            problems.append(f'{name}: params={params!r} is not an integer')
+            params = None
+        if params is not None and params <= 0:
+            problems.append(f'{name}: params must be positive')
+            params = None
+        row.update({
+            'steps': steps, 'batch_size': batch, 'seq_len': seq,
+            'declared_tokens': (declared_tokens or None),
+            'effective_tokens': int(effective_tokens),
+            'tokens_per_param': (effective_tokens / params if params else None),
+            'params': params, 'lr': lr, 'warmup': warmup,
+            'warmup_fraction': (warmup / steps if steps else None),
+            'n_seeds': len(set(seeds)),
+            'p_floor': signflip_p_floor(len(set(seeds))),
+            'min_seeds_for_family_significance': signflip_min_n_for_holm(int(policy.get('family_m', 4)), 0.05),
+        })
+        if params is None:
+            warnings.append(f'{name}: params missing — tokens-per-parameter and budget matching are unverifiable')
+        rows.append(row)
+    if len(rows) >= 2:
+        tpp = [r['tokens_per_param'] for r in rows if r.get('tokens_per_param')]
+        budget_matched = None
+        tpp_ratio = None
+        if len(tpp) == len(rows):
+            tpp_ratio = max(tpp) / min(tpp) if min(tpp) > 0 else float('inf')
+            budget_matched = bool(tpp_ratio <= 1.0 + tol)
+            if not budget_matched:
+                warnings.append(
+                    'tokens-per-parameter is not matched across the ladder '
+                    f'(max/min={tpp_ratio:.2f} > {1.0 + tol:.2f}); a cross-scale '
+                    'effect is confounded with a different exposure budget')
+        lrs = {r['lr'] for r in rows if r.get('lr') is not None}
+        lr_constant = (len(lrs) == 1) if lrs else None
+        _transfer = str(policy.get('lr_transfer') or '')
+        if lr_constant and _transfer in ('', 'constant_declared_not_validated', 'constant_lr_not_validated'):
+            warnings.append(
+                'learning rate is held constant across widths without a validated '
+                'transfer rule (policy=%r); scale contrasts carry an optimisation-'
+                'transfer confound, not a matched optimizer control' % _transfer)
+        warm = [r['warmup_fraction'] for r in rows if r.get('warmup_fraction') is not None]
+        warm_ratio = (max(warm) / min(warm)) if len(warm) == len(rows) and min(warm) > 0 else None
+        if warm_ratio is not None and warm_ratio > 2.0:
+            warnings.append(f'warmup fraction varies {warm_ratio:.2f}x across scales')
+        feas = [r['min_seeds_for_family_significance'] for r in rows if r.get('min_seeds_for_family_significance')]
+        for r in rows:
+            if r.get('n_seeds') and r.get('p_floor') is not None:
+                r['descriptive_only'] = bool(r['p_floor'] > 0.05)
+                r['seeds_sufficient_for_family'] = (
+                    None if not feas else bool(r['n_seeds'] >= min(feas)))
+        out = {'status': ('fail' if problems else ('warn' if warnings else 'ok')),
+               'budget_matched': (budget_matched if len(rows) >= 2 else None),
+               'tokens_per_param_ratio': tpp_ratio,
+               'tokens_per_param_tolerance': tol,
+               'lr_constant': (lr_constant if len(rows) >= 2 else None),
+               'lr_transfer_policy': policy.get('lr_transfer'),
+               'tiers': rows, 'policy': policy,
+               'problems': problems, 'warnings': warnings}
+    else:
+        warnings.append('fewer than two complete tiers — no cross-scale comparison can be checked')
+        out = {'status': 'warn', 'budget_matched': None, 'tiers': rows,
+               'policy': policy, 'problems': problems, 'warnings': warnings}
+    return out
+
+
 def loglog_regression(points, *, alpha=0.05):
     """log10(y) ~ log10(x) 回归，带斜率 CI / p / R² / 留一稳定性。
 
@@ -10026,12 +10156,17 @@ BASELINE_TUNING_PROTOCOL = {
     'selection_metric': 'ppl',
     'selection_split': 'validation',
     'direction': 'lower_is_better',
-    'search_seed': 0,
+    'search_seed': 100,
     # Selection is on the MEAN validation PPL over this declared seed set, not
     # on one seed's draw.  A single-seed selection can pick a config because
-    # of seed noise; every arm and every trial uses the same set.
-    'search_seeds': [0, 1, 2],
-    'final_seeds': [0, 1, 2],
+    # of seed noise; every arm and every trial uses the same set.  The search
+    # partition is deliberately DISJOINT from `final_seeds`: evaluating the
+    # selected config on the same draws that selected it is selection-biased.
+    # The final partition has 8 seeds because the tuned family has m=4
+    # declared contrasts, whose smallest attainable Holm p first drops below
+    # alpha at n=8 (with 3 seeds the final panel can never confirm anything).
+    'search_seeds': [100, 101, 102],
+    'final_seeds': [0, 1, 2, 3, 4, 5, 6, 7],
     'arms': ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic',
              'csa_fixed_rope', 'full_rope'],
     # The v6 arms and the frozen v12 confirmatory arms have DIFFERENT
@@ -10059,7 +10194,7 @@ BASELINE_TUNING_PROTOCOL = {
         {'lr': 0.0003, 'weight_decay': 0.05, 'warmup': 50},
         {'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 100},
     ],
-    'note': 'Every arm gets the same declared trials, the same search-seed set and the same selection split. Selection uses mean validation PPL across search_seeds (std recorded); a single-seed draw can win on noise. Final seeds re-use only the validation-selected config and are reported as mean±std. A tuning trial may never read the held-out test split; test is used once after selection. The rope group covers the frozen v12 confirmatory arms: without equal-search evidence for csa_fixed_rope/full_rope, the confirmatory comparison cannot be quoted as "beats a tuned baseline" — it is only a comparison at the frozen default hyperparameters.',
+    'note': 'Every arm gets the same declared trials, the same search-seed set and the same selection split. Selection uses mean validation PPL across search_seeds (std recorded); a single-seed draw can win on noise. The search and final seed partitions are disjoint (search 100-102, final 0-7) so the final records are not measured on the draws that selected the config; 8 final seeds are the smallest n whose minimum attainable Holm p for the m=4 tuned family is below alpha. Final records re-use only the validation-selected config and are reported as mean±std. A tuning trial may never read the held-out test split; test is used once after selection. Contrasts are declared per parameter-matching group (each group\'s method_arm vs the other arms in that group), and unmeasurable declared pairs stay in the Holm family with p=1 instead of shrinking it. The rope group covers the frozen v12 confirmatory arms: without equal-search evidence for csa_fixed_rope/full_rope, the confirmatory comparison cannot be quoted as "beats a tuned baseline" — it is only a comparison at the frozen default hyperparameters.',
 }
 
 # 最简单基线协议（先立地板，再谈复杂模型）：语言模型的 trivial floor 是
@@ -10733,6 +10868,55 @@ def metric_policy_audit(summary=None, policy=None):
     out['status'] = 'warn' if out['warnings'] else 'ok'
     return out
 
+def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'):
+    """Leave-one-search-seed-out stability of the selected tuning config.
+
+    Selecting the minimum of a mean over three seeds can still be decided by
+    one seed.  Re-running the selection with every seed dropped in turn makes
+    that visible: if the winner changes, the "tuned" configuration is a
+    noise draw, not a stable choice.  Requires trial rows that expose their
+    per-seed values; returns status `unavailable` otherwise (never a pass).
+    """
+    rows = [t for t in (trials or []) if isinstance(t, dict)]
+    if not rows:
+        return {'status': 'unavailable', 'reason': 'no trial records'}
+    seed_maps = []
+    for t in rows:
+        ppls = t.get('seed_ppls')
+        if not isinstance(ppls, dict):
+            return {'status': 'unavailable', 'reason': 'trial records do not expose seed_ppls'}
+        try:
+            seed_maps.append({int(k): float(v) for k, v in ppls.items()})
+        except (TypeError, ValueError):
+            return {'status': 'unavailable', 'reason': 'seed_ppls contains non-numeric seeds/values'}
+    common = set(seed_maps[0])
+    for m in seed_maps[1:]:
+        common &= set(m)
+    if len(common) < 3:
+        return {'status': 'insufficient_seeds',
+                'reason': 'leave-one-out selection needs at least 3 common seeds',
+                'common_seeds': sorted(common)}
+    sigs = [json.dumps(t.get('config') or {}, sort_keys=True, default=str) for t in rows]
+    choices = []
+    for drop in sorted(common):
+        vals = []
+        for m, sig in zip(seed_maps, sigs):
+            xs = [v for s, v in m.items() if s != drop and math.isfinite(v)]
+            if not xs:
+                return {'status': 'unavailable', 'reason': f'trial has no finite values after dropping seed {drop}'}
+            vals.append((sig, float(np.mean(xs))))
+        best = (min(vals, key=lambda kv: kv[1]) if direction == 'lower_is_better'
+                else max(vals, key=lambda kv: kv[1]))
+        choices.append({'dropped_seed': drop, 'config': json.loads(best[0]),
+                        'metric': best[1]})
+    distinct = {json.dumps(c['config'], sort_keys=True, default=str) for c in choices}
+    return {'status': 'ok', 'stable': (len(distinct) == 1),
+            'n_distinct_configs': len(distinct), 'n_common_seeds': len(common),
+            'common_seeds': sorted(common), 'choices': choices,
+            'metric': metric, 'direction': direction,
+            'note': 'drop one search seed -> re-select; a changed winner means the selected config is seed-driven'}
+
+
 def baseline_tuning_audit(selected=None, path=None, protocol=None):
     """Audit the equal-search baseline-tuning evidence.
 
@@ -10788,6 +10972,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     n_trials = {}
     budgets = {}
     search_seed_sets = {}
+    selection_stabilities = {}
     for arm, entry in arms.items():
         trials = entry.get('trials') if isinstance(entry, dict) else None
         if not isinstance(trials, list) or not trials:
@@ -10873,6 +11058,20 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             continue
         chosen_trial = next(t for t in trials if isinstance(t, dict)
                             and json.dumps(t.get('config') or {}, sort_keys=True, default=str) == chosen_sig)
+        _stab = tuning_selection_stability(trials, metric=metric, direction=direction)
+        selection_stabilities[arm] = _stab
+        if _stab.get('status') == 'ok':
+            _recorded = entry.get('selection_stability')
+            if isinstance(_recorded, dict) and isinstance(_recorded.get('stable'), bool):
+                if bool(_recorded['stable']) != bool(_stab.get('stable')):
+                    problems.append(f'{arm}: recorded selection_stability={_recorded.get("stable")} '
+                                    f'but leave-one-seed-out re-selection gives {_stab.get("stable")}')
+            if not _stab.get('stable'):
+                warnings.append(f'{arm}: the selected config is not leave-one-search-seed-out stable '
+                                f'({_stab.get("n_distinct_configs")} distinct winners) — the tuned '
+                                'pick may be a single-seed draw')
+        elif _stab.get('status') == 'insufficient_seeds':
+            warnings.append(f'{arm}: selections stability is unverifiable — {_stab.get("reason")}')
         vals = []
         for t in trials:
             v = t.get(metric) if isinstance(t, dict) else None
@@ -10940,6 +11139,33 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         warnings.append('the search grid was truncated (search_complete=False); it is equal across arms, but describe it as a bounded search, not the full declared grid')
     final_records = selected.get('final_records') or {}
     final_seeds = selected.get('final_seeds') or protocol.get('final_seeds') or []
+    # Selection/evaluation partition: the final tuned records must not be
+    # measured on the same seed draws that chose the hyper-parameters.
+    _declared_search = selected.get('search_seeds') or protocol.get('search_seeds')
+    _search_set = set()
+    if _declared_search is not None:
+        try:
+            _search_set = {int(s) for s in _declared_search}
+        except (TypeError, ValueError):
+            problems.append(f'search_seeds are not integers ({_declared_search!r})')
+    _final_set = set()
+    for _s in final_seeds or []:
+        _si = _as_seed_int(_s)
+        if _si is not None:
+            _final_set.add(_si)
+    _seed_overlap = sorted(_search_set & _final_set)
+    if _seed_overlap:
+        _msg = (f'search_seeds and final_seeds overlap on {_seed_overlap} — the '
+                'final tuned records would be measured on the draws that selected '
+                'the config (selection-biased); declare a disjoint final partition')
+        if final_records:
+            problems.append(_msg)
+        else:
+            warnings.append(_msg)
+    # After the per-arm loop below, record final-record seeds that overlap the
+    # declared search set too (a record can carry a different seed from the
+    # declared list only when the artifact is inconsistent, which is already
+    # checked; this makes the overlap visible either way).
     final_seed_coverage = {}
     if final_records:
         for arm, entry in arms.items():
@@ -10979,6 +11205,11 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                             break
                 if r.get('variant') is not None and r.get('variant') != arm:
                     problems.append(f'{arm}: final record key {_k} carries variant={r.get("variant")!r}')
+    _measured_final_seeds = sorted({s for _v in final_seed_coverage.values() for s in _v})
+    _record_overlap = sorted(_search_set & set(_measured_final_seeds))
+    if _record_overlap and final_records and not _seed_overlap:
+        problems.append(f'final records use search seeds {_record_overlap} — the '
+                        'final estimate is measured on the selection draws')
     final_seed_coverage_equal = None
     final_min_seed_count = None
     _final_family_floor = None
@@ -10993,9 +11224,19 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             warnings.append(f'only {final_min_seed_count} final seed(s) per arm — the reporting floor for a key experiment is 3; treat the tuned contrast as descriptive')
         elif _final_family_floor is not None and final_min_seed_count < _final_family_floor:
             warnings.append(f'{final_min_seed_count} final seeds per arm cannot reach a Holm-corrected p<0.05 for {max(1, len(arms) - 1)} tuned contrast(s) (needs n>={_final_family_floor}); the tuned contrast is resolution-limited, not a null')
+    # Coverage: an arm is covered either by its own tuned record or by the arm
+    # whose recipe it inherits (budget-matched intervention controls).
+    _inherits = protocol.get('inherits_tuning') or {}
+    coverage = {a: a for a in arms}
+    for _arm, _ref in _inherits.items():
+        if _ref in arms:
+            coverage[str(_arm)] = str(_ref)
+        elif _arm in (protocol.get('arms') or []) or _arm in _inherits:
+            warnings.append(f'{_arm}: inherits tuning from {_ref!r}, but no tuned record exists for {_ref!r}')
     required = set(protocol.get('arms') or [])
-    if required and not required.issubset(set(arms)):
-        problems.append(f'missing tuning evidence for arms {sorted(required - set(arms))}')
+    uncovered = sorted(a for a in required if a not in coverage)
+    if uncovered:
+        problems.append(f'missing tuning evidence for arms {uncovered}')
     _grid_complete = None
     if signatures and declared:
         _grid_complete = all(set(sig) == declared for sig in signatures.values())
@@ -11004,13 +11245,22 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
            'n_trials': n_trials, 'same_search_space': (len(set(signatures.values())) <= 1) if signatures else None,
            'search_seeds': search_seeds_seen if search_seeds_seen is not None else (_declared_ss and list(_declared_ss)),
            'search_seed_balanced': search_seed_balanced,
+           'search_final_seed_overlap': _seed_overlap,
+           'search_final_seed_disjoint': (not _seed_overlap) if (_search_set or _final_set) else None,
            'final_seed_coverage': final_seed_coverage,
            'final_seed_coverage_equal': final_seed_coverage_equal,
            'final_min_seed_count': final_min_seed_count,
+           'coverage': coverage, 'uncovered_arms': uncovered,
+           'inherits_tuning': {str(k): str(v) for k, v in _inherits.items()},
+           'selection_stability': selection_stabilities,
+           'selection_stable_all': (all(s.get('stable') for s in selection_stabilities.values())
+                                    if selection_stabilities else None),
            'min_final_seeds_for_family_significance': _final_family_floor,
            'search_complete': selected.get('search_complete') if selected.get('search_complete') is not None else _grid_complete,
            'grid_complete': _grid_complete,
-           'arms': sorted(arms), 'problems': problems, 'warnings': warnings}
+           'arms': sorted(arms), 'problems': problems, 'warnings': warnings,
+           'selected_configs': {a: (e.get('selected') or e.get('selected_config'))
+                                for a, e in arms.items() if isinstance(e, dict)}}
     if warnings and not problems:
         out['status'] = 'warn'
     return out
@@ -12014,13 +12264,69 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         _tune_path = os.path.join('results_baseline_tuning', 'baseline_tuning.json')
     report['baseline_tuning'] = baseline_tuning_audit(path=_tune_path)
     if _scoped_baselines:
-        _tv = bool(report['baseline_tuning'].get('tuning_verified'))
-        report['tuned_verified_baselines'] = list(report.get('verified_baselines') or []) if _tv else []
-        report['untuned_verified_baselines'] = [] if _tv else list(report.get('verified_baselines') or [])
-        if not _tv:
+        _panel_arms = set()
+        for _cs in _scoped_baselines.values():
+            for _a, _b, _n in _cs:
+                _panel_arms.update((_a, _b))
+        _cov = report['baseline_tuning'].get('coverage') or {}
+        _sel_cfg = report['baseline_tuning'].get('selected_configs') or {}
+        _uncovered = sorted(a for a in _panel_arms if a not in _cov)
+        # A tuning artifact proves equal-search only for the config it
+        # SELECTED.  A panel trained at the frozen defaults is not a tuned
+        # baseline merely because a tuning file sits next to it; compare the
+        # recorded run hyperparameters with the selected config arm by arm.
+        _panel_cfg_ok = {}
+        for _arm in _panel_arms:
+            _ref = _cov.get(_arm, _arm)
+            _sel = _sel_cfg.get(_ref) or _sel_cfg.get(_arm)
+            _hps = [r.get('hyperparams') for (v, _t, _s), r in recs.items()
+                    if v == _arm and isinstance(r, dict) and isinstance(r.get('hyperparams'), dict)]
+            if not isinstance(_sel, dict) or not _hps:
+                _panel_cfg_ok[_arm] = False
+                continue
+            _ok = True
+            for _kn in ('lr', 'weight_decay', 'warmup'):
+                if _sel.get(_kn) is None:
+                    continue
+                _vals = [h.get(_kn) for h in _hps]
+                if any(v is None for v in _vals):
+                    _ok = False
+                    break
+                try:
+                    if any(float(v) != float(_sel[_kn]) for v in _vals):
+                        _ok = False
+                        break
+                except (TypeError, ValueError):
+                    _ok = False
+                    break
+            _panel_cfg_ok[_arm] = _ok
+        _mismatched = sorted(a for a in _panel_arms if not _panel_cfg_ok.get(a))
+        report['baseline_tuning']['panel_baseline_arms'] = sorted(_panel_arms)
+        report['baseline_tuning']['panel_uncovered_arms'] = _uncovered
+        report['baseline_tuning']['panel_arm_hyperparams_match'] = _panel_cfg_ok
+        _tuned_comps = set()
+        for _comp, _contrasts in _scoped_baselines.items():
+            _arms = {a for _a, _b, _n in _contrasts for a in (_a, _b)}
+            if _arms and all(_panel_cfg_ok.get(a) for a in _arms):
+                _tuned_comps.add(_comp)
+        _verified = list(report.get('verified_baselines') or [])
+        report['tuned_verified_baselines'] = [c for c in _verified if c in _tuned_comps]
+        report['untuned_verified_baselines'] = [c for c in _verified if c not in _tuned_comps]
+        if not report['baseline_tuning'].get('tuning_verified'):
             report['warnings'].append(
                 'baseline claims have no verified equal-search tuning artifact (%s) — a win over an untuned baseline is not evidence that the method beats a well-tuned baseline; run baseline_tune.py and put baseline_tuning.json next to this panel'
                 % (report['baseline_tuning'].get('status') or 'missing'))
+        elif _uncovered:
+            report['warnings'].append(
+                'the tuning artifact does not cover panel arm(s) %s — equal-search evidence for another arm '
+                'does not transfer automatically; tune these arms (or declare an explicit inherits_tuning parent) '
+                'before claiming a tuned-baseline win for them' % ', '.join(_uncovered))
+        elif _mismatched:
+            report['warnings'].append(
+                'panel arm(s) %s were not trained at the tuned config (recorded hyperparameters differ '
+                'from baseline_tuning.selected_configs) — their significant contrasts stay UNTUNED-baseline '
+                'evidence; run the final tuned configs before claiming a win over a tuned baseline'
+                % ', '.join(_mismatched))
     # Trivial-floor evidence: a tuned count model must be beaten before the
     # neural mechanism is compared with the tuned dense baselines.  The
     # comparison is only made when the artifact and the panel share a

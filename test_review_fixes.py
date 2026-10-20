@@ -1126,6 +1126,14 @@ def t_tuned_pairing_keeps_optimizer_gate():
     b3.pop('train_knobs')
     why2 = BT._relaxed_pair_reason(a, b3, {'a': 3, 'b': 3})
     assert why2 and 'unverifiable train_knobs' in why2, why2
+    # A paired seed does not imply a matched shared-trunk initialization.
+    a4 = dict(a, init_core_fp='aaaa')
+    b4 = dict(b, init_core_fp='bbbb')
+    why3 = BT._relaxed_pair_reason(a4, b4, {'a': 3, 'b': 3})
+    assert why3 and 'init_core_fp' in why3, why3
+    b5 = dict(b)
+    why4 = BT._relaxed_pair_reason(a4, b5, {'a': 3, 'b': 3})
+    assert why4 and 'unverifiable init_core_fp' in why4, why4
 
 
 def t_arm_mean_std_and_relative_effect():
@@ -2347,6 +2355,197 @@ def t_audit_incomplete_components_alias():
     assert r['missing_ablation_arms']['A'] == ['full-A2'], r['missing_ablation_arms']
 
 
+def t_baseline_seed_partition_and_coverage_audit():
+    trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
+
+    def _row(cfg, ppl):
+        return {'config': dict(cfg), 'ppl': float(ppl), 'steps': 10,
+                'tokens_seen': 100, 'seeds': [0, 1, 2],
+                'seed_ppls': {'0': float(ppl), '1': float(ppl) + 0.1,
+                              '2': float(ppl) - 0.1}}
+
+    def _arm(ppls):
+        rows = [_row(c, p) for c, p in zip(trials, ppls)]
+        best = min(rows, key=lambda r: r['ppl'])
+        return {'trials': rows, 'selected': dict(best['config']),
+                'selected_metric_value': best['ppl']}
+
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['full_matched', 'csa_dynamic'],
+                    search_seeds=[0, 1, 2], final_seeds=[0, 1, 2])
+    chosen = {'full_matched': dict(trials[0]), 'csa_dynamic': dict(trials[0])}
+    art = {
+        'selection_metric': 'ppl', 'selection_split': 'validation',
+        'direction': 'lower_is_better', 'search_seeds': [0, 1, 2],
+        'final_seeds': [0, 1, 2],
+        'arms': {'full_matched': _arm([10.0, 11.0]),
+                 'csa_dynamic': _arm([9.0, 9.5])},
+        'final_records': {
+            f'{a}::seed{s}': {'seed': s, 'variant': a, 'ppl': 9.0 + s / 10.0,
+                              'params': 100, 'train_knobs': L.training_knobs(),
+                              'hyperparams': dict(chosen[a])}
+            for a in chosen for s in (0, 1, 2)},
+    }
+    # The final records were measured on the selection seeds: refuse.
+    bad = L.baseline_tuning_audit(dict(art, protocol=protocol), protocol=protocol)
+    assert bad['tuning_verified'] is False, bad
+    assert bad['search_final_seed_overlap'] == [0, 1, 2], bad
+    assert any('overlap' in p for p in bad['problems']), bad
+
+    # A disjoint partition is accepted (the 3-seed final floor is a warning,
+    # because the tuned family itself is resolution-limited).
+    good_protocol = dict(protocol, search_seeds=[100, 101, 102])
+    good = L.baseline_tuning_audit(dict(art, protocol=good_protocol,
+                                        search_seeds=[100, 101, 102]),
+                                   protocol=good_protocol)
+    assert good['tuning_verified'] is True, good
+    assert good['search_final_seed_disjoint'] is True, good
+    assert good['search_final_seed_overlap'] == [], good
+
+    # Intervention controls inherit their parent's equal-search evidence, but
+    # an unknown parent is reported instead of silently covering the arm.
+    cov_protocol = dict(protocol, arms=['csa_fixed_rope'],
+                        inherits_tuning={'csa_fixed_rope_randidx': 'csa_fixed_rope'})
+    cov = L.baseline_tuning_audit(
+        dict(art, protocol=cov_protocol,
+             arms={'csa_fixed_rope': _arm([10.0, 11.0])},
+             final_records={}),
+        protocol=cov_protocol)
+    assert cov['coverage'].get('csa_fixed_rope_randidx') == 'csa_fixed_rope', cov
+    miss_protocol = dict(protocol, arms=['csa_fixed_rope'],
+                         inherits_tuning={'csa_fixed_rope_randidx': 'absent_parent'})
+    miss = L.baseline_tuning_audit(
+        dict(art, protocol=miss_protocol,
+             arms={'csa_fixed_rope': _arm([10.0, 11.0])},
+             final_records={}),
+        protocol=miss_protocol)
+    assert any('absent_parent' in w for w in miss['warnings']), miss
+
+
+def t_tuning_selection_stability_audit():
+    def row(cfg, ppls):
+        return {'config': dict(cfg), 'ppl': float(np.mean(list(ppls.values()))),
+                'ppl_std': float(np.std(list(ppls.values()), ddof=1)),
+                'seeds': sorted(ppls), 'seed_ppls': {str(k): float(v) for k, v in ppls.items()},
+                'steps': 10, 'tokens_seen': 100}
+    declared = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
+    stable = [row(declared[0], {0: 10, 1: 10, 2: 10}),
+              row(declared[1], {0: 11, 1: 11, 2: 11})]
+    s = L.tuning_selection_stability(stable)
+    assert s['status'] == 'ok' and s['stable'] is True, s
+    unstable = [row(declared[0], {0: 9, 1: 9, 2: 12}),
+                row(declared[1], {0: 11, 1: 11, 2: 9})]
+    u = L.tuning_selection_stability(unstable)
+    assert u['status'] == 'ok' and u['stable'] is False, u
+    assert u['n_distinct_configs'] == 2, u
+    # The audit verifies a recorded stability claim instead of trusting it.
+    trials = unstable
+    best = min(trials, key=lambda t: t['ppl'])
+    art = {'selection_metric': 'ppl', 'selection_split': 'validation',
+           'direction': 'lower_is_better', 'search_seeds': [0, 1, 2],
+           'arms': {'a': {'trials': trials, 'selected': dict(best['config']),
+                          'selected_metric_value': best['ppl'],
+                          'selection_stability': {'stable': True}}}}
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['a'], trials=declared,
+                    inherits_tuning={}, search_seeds=[0, 1, 2],
+                    final_seeds=[3, 4, 5])
+    out = L.baseline_tuning_audit(art, protocol=protocol)
+    assert out['tuning_verified'] is False, out
+    assert any('selection_stability' in p for p in out['problems']), out
+    # Without the false record the same artifact is merely warning-level: the
+    # unstable pick is disclosed, not silently accepted.
+    del art['arms']['a']['selection_stability']
+    out2 = L.baseline_tuning_audit(art, protocol=protocol)
+    assert out2['tuning_verified'] is True, out2
+    assert out2['selection_stable_all'] is False, out2
+    assert any('not leave-one-search-seed-out stable' in w for w in out2['warnings']), out2
+    # Legacy rows without per-seed values can never report stability as a pass.
+    no_seed = L.tuning_selection_stability([{'config': {'lr': 1e-4}, 'ppl': 1.0}])
+    assert no_seed['status'] == 'unavailable', no_seed
+
+
+def t_methodology_audit_requires_panel_to_use_tuned_config():
+    with tempfile.TemporaryDirectory() as d:
+        trials = [{'lr': 3e-4, 'weight_decay': 0.1, 'warmup': 1},
+                  {'lr': 1e-4, 'weight_decay': 0.1, 'warmup': 1}]
+        protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['a', 'b'], trials=trials,
+                        inherits_tuning={}, search_seeds=[100, 101, 102],
+                        final_seeds=[0, 1, 2])
+        art = {'protocol': protocol, 'selection_metric': 'ppl',
+               'selection_split': 'validation', 'direction': 'lower_is_better',
+               'search_seeds': [100, 101, 102], 'final_seeds': [0, 1, 2],
+               'arms': {
+                   'a': {'selected': dict(trials[0]), 'selected_metric_value': 2.0,
+                         'trials': [{'config': c, 'ppl': p}
+                                    for c, p in zip(trials, (2.0, 3.0))]},
+                   'b': {'selected': dict(trials[0]), 'selected_metric_value': 2.1,
+                         'trials': [{'config': c, 'ppl': p}
+                                    for c, p in zip(trials, (2.1, 3.1))]},
+               }}
+        L.atomic_write_json(os.path.join(d, 'baseline_tuning.json'), art)
+        knobs = L.training_knobs()
+
+        def _summary(b_lr=3e-4):
+            out = {}
+            for i in range(8):
+                out[f'a::seed{i}'] = dict(variant='a', seed=i, run_cfg='same_cfg',
+                                          steps=1, tokens_seen=10, ppl=50.0, params=100,
+                                          train_knobs=knobs,
+                                          hyperparams={'lr': 3e-4, 'weight_decay': 0.1,
+                                                       'warmup': 1, 'mlp_ratio': 4.0})
+                out[f'b::seed{i}'] = dict(variant='b', seed=i, run_cfg='same_cfg',
+                                          steps=1, tokens_seen=10, ppl=51.0 + i * 0.0,
+                                          params=100, train_knobs=knobs,
+                                          hyperparams={'lr': b_lr, 'weight_decay': 0.1,
+                                                       'warmup': 1, 'mlp_ratio': 4.0})
+            return out
+
+        design = {'comp': [('a', 'b', 'x')]}
+        r = L.methodology_audit(_summary(), baselines=design, outdir=d, verbose=False)
+        assert r['baseline_tuning']['tuning_verified'] is True, r['baseline_tuning']
+        assert r['baseline_tuning']['panel_arm_hyperparams_match'] == {'a': True, 'b': True}, r
+        assert 'comp' in r['tuned_verified_baselines'], r.get('tuned_verified_baselines')
+        # The panel ran b at a config that was NOT selected: the artifact may
+        # exist, but the contrast is not tuned-baseline evidence.
+        r2 = L.methodology_audit(_summary(b_lr=1e-4), baselines=design, outdir=d, verbose=False)
+        assert r2['baseline_tuning']['panel_arm_hyperparams_match']['b'] is False, r2['baseline_tuning']
+        assert 'comp' in r2['untuned_verified_baselines'], r2.get('untuned_verified_baselines')
+        assert any('not trained at the tuned config' in w for w in r2['warnings']), r2['warnings']
+
+
+def t_baseline_contrast_plan_is_group_aware():
+    arms = list(L.BASELINE_TUNING_PROTOCOL['arms'])
+    groups = BT._protocol_arm_groups(L.BASELINE_TUNING_PROTOCOL, L.RUN, arms)
+    plan = BT._contrast_plan(L.BASELINE_TUNING_PROTOCOL, groups, arms)
+    assert ('csa_dynamic', 'full_matched') in plan and ('csa_dynamic', 'csa_fixed') in plan, plan
+    assert ('csa_fixed_rope', 'full_rope') in plan, plan
+    # Cross-group contrasts would also change the parameter-matching reference.
+    assert not any(a == 'csa_fixed_rope' and b in ('full_matched', 'csa_dynamic')
+                   for a, b in plan), plan
+    assert not any(a == 'csa_dynamic' and b in ('full_rope', 'csa_fixed_rope')
+                   for a, b in plan), plan
+    legacy = BT._contrast_plan({'method_arm': 'csa_dynamic'}, groups, arms)
+    assert ('csa_dynamic', 'full_matched') in legacy and ('csa_dynamic', 'full_rope') in legacy, legacy
+    # The default protocol must be able to confirm its own declared family and
+    # must not evaluate the final records on the selection draws.
+    proto = L.BASELINE_TUNING_PROTOCOL
+    need = L.signflip_min_n_for_holm(len(plan), 0.05)
+    assert need is not None and len(proto['final_seeds']) >= need, (need, proto['final_seeds'])
+    assert not (set(proto['search_seeds']) & set(proto['final_seeds'])), proto
+
+
+def t_baseline_driver_refuses_overlapping_final_seeds():
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['csa_fixed', 'csa_dynamic'],
+                    search_seeds=[0], final_seeds=[0])
+    try:
+        BT.run_tuning(dict(L.RUN, outdir=tempfile.mkdtemp(prefix='tune_overlap_')),
+                      outdir=tempfile.mkdtemp(prefix='tune_overlap_out_'),
+                      protocol=protocol, final=True)
+    except ValueError as e:
+        assert 'overlap' in str(e), e
+    else:
+        raise AssertionError('overlapping search/final seeds were not refused')
+
+
 def t_baseline_tuning_driver_multiseed_selection():
     out = tempfile.mkdtemp(prefix='tune_multiseed_')
     trials = [{'lr': 1e-4, 'weight_decay': 0.1, 'warmup': 2},
@@ -3239,6 +3438,10 @@ def t_reportable_claim_gate():
     # Confirmatory is only honoured when the caller says so.
     r = L.reportable_claim(base, evidence_level='confirmatory')
     assert r['level'] == 'confirmatory', r
+    # A mean whose sign flips when one seed is dropped is not a stable
+    # directional claim, even if the aggregate p happens to clear Holm.
+    r = L.reportable_claim(dict(base, seed_driven=True))
+    assert r['allowed'] is False and any('leave-one-seed-out' in x for x in r['reasons']), r
 
 
 def t_holm_family_resolution_ceiling():
@@ -3282,6 +3485,40 @@ def t_crossover_scaling_refusals():
     lr = L.loglog_regression(perfect)
     assert lr['status'] == 'ok' and abs(lr['slope'] - 1.5) < 1e-12, lr
     assert math.isfinite(lr['p']) and lr['p'] < 1e-12, lr
+
+
+def t_scale_ladder_budget_and_transfer_audit():
+    def tier(name, steps, params, seq=8, batch=2, tokens=None, lr=3e-4):
+        cfg = {'steps': steps, 'batch_size': batch, 'seq_len': seq,
+               'n_train_tokens': tokens if tokens is not None else steps * batch * seq,
+               'lr': lr, 'warmup': max(1, steps // 10), 'seeds': [0, 1, 2, 3]}
+        return {'name': name, 'cfg': cfg, 'params': params}
+    a = tier('S1', 1000, 1000)
+    b = tier('S2', 2000, 2000)  # same tokens/param, same lr
+    out = L.scale_ladder_audit([a, b])
+    assert out['budget_matched'] is True, out
+    assert out['lr_constant'] is True, out
+    # A constant LR is disclosed as an unvalidated transfer assumption.
+    assert any('transfer' in w for w in out['warnings']), out
+    # A different tokens-per-parameter budget is a visible confound.
+    b2 = tier('S2', 3000, 2000)
+    out2 = L.scale_ladder_audit([a, b2])
+    assert out2['budget_matched'] is False, out2
+    assert any('tokens-per-parameter' in w for w in out2['warnings']), out2
+    # A declared token budget that disagrees with steps*batch*seq is a hard
+    # fail, not a warning.
+    bad = tier('S1', 1000, 1000, tokens=999999)
+    out3 = L.scale_ladder_audit([bad, b])
+    assert out3['status'] == 'fail', out3
+    assert any('n_train_tokens' in p for p in out3['problems']), out3
+    # Missing parameter counts keep the budget claim unverifiable.
+    out4 = L.scale_ladder_audit([tier('S1', 1000, None), b])
+    assert out4['budget_matched'] is None, out4
+    assert any('params missing' in w for w in out4['warnings']), out4
+    # The deployed plan must carry an explicit transfer policy and expose the
+    # S1/S2 budget ratio rather than silently calling it matched.
+    pol = L.SCALE_TRANSFER_POLICY
+    assert pol.get('lr_transfer') and pol.get('tokens_per_param_tolerance') is not None, pol
 
 
 def t_init_core_fingerprint_and_pair_gate():
@@ -3694,6 +3931,11 @@ def main():
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
     _check('H3a multi-seed selection + equal search-seed audit', t_baseline_multi_seed_selection_audit)
     _check('H3b tuning driver selects on the multi-seed mean', t_baseline_tuning_driver_multiseed_selection)
+    _check('H3c search/final seed partition + inherited tuning coverage', t_baseline_seed_partition_and_coverage_audit)
+    _check('H3d tuned contrasts are declared per parameter-matching group', t_baseline_contrast_plan_is_group_aware)
+    _check('H3f leave-one-seed-out tuning-selection stability', t_tuning_selection_stability_audit)
+    _check('H3g tuned claim requires the panel to run the selected config', t_methodology_audit_requires_panel_to_use_tuned_config)
+    _check('H3e tuning driver refuses overlapping search/final seeds', t_baseline_driver_refuses_overlapping_final_seeds)
     _check('H4 tuned count-model floor + audit', t_simple_baseline_ngram_and_audit)
     _check('H5 positive-label / rare-positive PR-AUC / macro-F1 averaging', t_classification_positive_label_and_rare_floor)
     _check('H6 hypothesis completeness + metric alignment + direction=0', t_hypothesis_audit_completeness_and_metric_alignment)
@@ -3742,6 +3984,7 @@ def main():
     _check('L1 review-4 reportable claim gate', t_reportable_claim_gate)
     _check('L2 Holm family resolution ceiling', t_holm_family_resolution_ceiling)
     _check('L3 crossover fit refusal rules + slope CI', t_crossover_scaling_refusals)
+    _check('L3b scale-ladder budget + transfer audit', t_scale_ladder_budget_and_transfer_audit)
     _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)

@@ -149,6 +149,16 @@ def run_params(outdir='results_m0_params'):
         cfg_txt = f"d={sc['d']}/{sc['n_layers']}L/{sc['n_heads']}H/dh={sc['d_head']}"
         print(f"{name:<4}{cfg_txt:<28}{n:>16,}{_PLAN_PARAMS[name] / 1e9:>12.2f}B{n / _PLAN_PARAMS[name]:>8.2f}")
         tiers.append({'tier': name, 'config': {'d': sc['d'], 'n_layers': sc['n_layers'], 'n_heads': sc['n_heads'], 'd_head': sc['d_head']}, 'params': int(n), 'plan_params': _PLAN_PARAMS[name], 'ratio_to_plan': n / _PLAN_PARAMS[name]})
+    _budget_tiers = []
+    for _name, _run in (('S1', L.RUN_S1), ('S2', L.RUN_S2)):
+        _p = next((t['params'] for t in tiers if t['tier'] == _name), None)
+        _budget_tiers.append({'name': _name, 'cfg': _run, 'params': _p})
+    _budget = L.scale_ladder_audit(_budget_tiers)
+    print(f"\n[params] scale-transfer audit: {_budget['status']}  "
+          f"budget_matched={_budget.get('budget_matched')}  "
+          f"tokens/param ratio={_budget.get('tokens_per_param_ratio')}")
+    for _w in _budget.get('warnings') or []:
+        print(f'[params] WARNING: {_w}')
     print('\n[params] 规划值来自 docs/compute_plan.md §5（约 0.14B / 0.26B / 0.62B / 1.3B）；差异超过两成即需要回改阶梯配置或修订规划。')
     os.makedirs(outdir, exist_ok=True)
     L.stamped_analysis('m0_params_audit', {
@@ -156,6 +166,7 @@ def run_params(outdir='results_m0_params'):
         'method': 'SmallGPT instantiation count; S1 verified against a full instantiation, S2-S4 by uniform-layer composition (S4 = the planned analytic extrapolation)',
         'self_check': {'s1_full_instantiation': int(n_full), 's1_uniform_layer_composition': int(n_s1), 'passed': bool(n_s1 == n_full)},
         'plan_source': 'docs/compute_plan.md §5', 'tiers': tiers,
+        'scale_ladder_audit': _budget,
     }, outdir=outdir, name='params_audit.json')
     print(f'[params] wrote {outdir}/params_audit.json (stamped: code + git provenance + environment)')
 
@@ -165,7 +176,7 @@ def run_data():
     train_ids, val_batch, vocab, _tok, val_bnd = L.load_fineweb_edu(L.RUN_S1['seq_len'], tokens, vocab_size=L.B_VOCAB, val_seqs=L.RUN_S1.get('val_seqs', 512))
     dt = time.time() - t0
     print(f'\n[m0-data] cache READY: train tokens = {len(train_ids):,}  vocab = {vocab}  val sequences = {val_batch.shape[0]}  (built/verified in {dt / 60:.1f} min)')
-    print(f'[m0-data] 供 full / smoke 直接复用；离线重建用 FWEDU_LOCAL_JSONL，换 cap 用 M0_TOKENS（新 cap = 新缓存文件，旧面板指纹不受影响）')
+    print('[m0-data] 供 full / smoke 直接复用；离线重建用 FWEDU_LOCAL_JSONL，换 cap 用 M0_TOKENS（新 cap = 新缓存文件，旧面板指纹不受影响）')
 
 def run_overfit_check(variants=None, steps=250, arch=None, seq_len=None, vocab=256, mlp_ratio=None, cfg=None):
     """Pre-flight small-batch overfit check on synthetic ids (independent of
@@ -705,6 +716,16 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
         report['cross_scale'][name] = entry
         print(f'[m0-analysis] cross-scale {name}: {meta.get("status")} '
               f'(poolable={meta.get("poolable")}, points={meta.get("n_points")})')
+    _budget_tiers = []
+    for _label, _cfg in (('S1', L.RUN_S1), ('S2', L.RUN_S2)):
+        _pan = report['panels'].get(_label) or {}
+        _arms = _pan.get('arms') or {}
+        _pick = _arms.get('csa_dynamic') or (next(iter(_arms.values())) if _arms else {})
+        _params = _pick.get('params')
+        _budget_tiers.append({'name': _label, 'cfg': _cfg, 'params': _params})
+    report['scale_ladder_audit'] = L.scale_ladder_audit(_budget_tiers)
+    for _w in report['scale_ladder_audit'].get('warnings') or []:
+        print(f'[m0-analysis] WARNING: {_w}')
     os.makedirs(outdir, exist_ok=True)
     L.stamped_analysis('m0_scale_analysis', report, outdir=outdir, name='scale_analysis.json')
     print(f'[m0-analysis] wrote {outdir}/scale_analysis.json')

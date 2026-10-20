@@ -124,6 +124,64 @@ def _group_overrides(base, group):
     return cfg_over
 
 
+def _search_final_seeds(protocol):
+    """Return (search_seeds, final_seeds, overlap).
+
+    The final records are the evidence for a tuned comparison.  If the same
+    seeds were also used to select the hyper-parameters, the selected config
+    has already seen those exact draws and the "final" mean is optimistically
+    selected, not an independent estimate.  Keep the two partitions explicit
+    and refuse the run when they overlap.
+    """
+    raw_search = protocol.get('search_seeds')
+    if raw_search is None:
+        raw_search = [protocol.get('search_seed', 0)]
+    try:
+        search = sorted({int(s) for s in raw_search})
+        final = sorted({int(s) for s in (protocol.get('final_seeds') or [])})
+    except (TypeError, ValueError):
+        raise ValueError(f'search/final seeds must be integers, got {raw_search!r} / {protocol.get("final_seeds")!r}')
+    if not search:
+        raise ValueError('search_seeds must contain at least one seed')
+    return search, final, sorted(set(search) & set(final))
+
+
+def _contrast_plan(protocol, groups, selected):
+    """Declared tuned comparisons: each group's method arm vs the other arms
+    in the SAME parameter-matching group.
+
+    The v6 and frozen-v12 arms are matched against different references, so a
+    cross-group contrast would change the parameter-matching reference as well
+    as the mechanism.  Legacy protocols without `arm_groups` keep the old
+    single-method rule.
+    """
+    selected = set(selected)
+    plan = []
+    seen = set()
+
+    def _add(method, baseline):
+        if method == baseline or method not in selected or baseline not in selected:
+            return
+        key = (method, baseline)
+        if key not in seen:
+            seen.add(key)
+            plan.append(key)
+
+    raw_groups = protocol.get('arm_groups')
+    if raw_groups:
+        for group in groups:
+            method = group.get('method_arm')
+            if method not in selected:
+                continue
+            for baseline in group.get('arms') or []:
+                _add(method, baseline)
+    else:
+        method = protocol.get('method_arm') or 'csa_dynamic'
+        for baseline in selected:
+            _add(method, baseline)
+    return plan
+
+
 def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                trial_limit=None, search_steps=None, final=True):
     """Run the declared grid, select per arm on validation PPL, then optionally
@@ -146,15 +204,19 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     # every trial, and selection uses the mean validation PPL (with the
     # across-seed std recorded).  Legacy protocols that only declare
     # `search_seed` keep the single-seed path.
-    _raw_search_seeds = protocol.get('search_seeds')
-    if _raw_search_seeds is None:
-        _raw_search_seeds = [search_seed]
-    try:
-        search_seeds = sorted({int(s) for s in _raw_search_seeds})
-    except (TypeError, ValueError):
-        raise ValueError(f'search_seeds must be integers, got {_raw_search_seeds!r}')
-    if not search_seeds:
-        raise ValueError('search_seeds must contain at least one seed')
+    search_seeds, final_seeds_declared, overlap = _search_final_seeds(protocol)
+    if final and final_seeds_declared and overlap:
+        raise ValueError(
+            'search_seeds and final_seeds overlap on %s — the final evaluation '
+            'would re-use the draws that selected the hyper-parameters; declare '
+            'a disjoint final seed partition' % overlap)
+    if final and final_seeds_declared:
+        _planned = _contrast_plan(protocol, groups, arms)
+        _need = L.signflip_min_n_for_holm(len(_planned), 0.05)
+        if _need is not None and len(final_seeds_declared) < _need:
+            print(f'[tune] WARNING: {len(final_seeds_declared)} final seeds cannot reach '
+                  f'Holm significance for the {len(_planned)}-contrast tuned family '
+                  f'(needs n>={_need}); the final panel will be descriptive only')
     os.makedirs(outdir, exist_ok=True)
     print(f'[tune] equal-search grid: {len(arms)} arms ({len(groups)} group(s)) x {len(trials)} trials x {search_steps} steps x {len(search_seeds)} seed(s), selection={protocol["selection_metric"]} on {protocol["selection_split"]}')
     _arch = {'d': int(base.get('d', 256)), 'n_layers': int(base.get('n_layers', 6)),
@@ -218,12 +280,25 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         if not hits:
             raise RuntimeError(f'[tune] {arm}: no usable trial PPL — cannot select a config')
         best = min(hits, key=lambda t: float(t['ppl']))
+        _stability = L.tuning_selection_stability(
+            per_arm[arm], metric=protocol['selection_metric'],
+            direction=protocol['direction'])
+        _best_sig = json.dumps(best['config'], sort_keys=True, default=str)
+        _chosen_sig = json.dumps(_stability.get('choices', [{}])[0].get('config') or {}, sort_keys=True,
+                                 default=str) if _stability.get('choices') else None
         selected[arm] = {'selected': dict(best['config']),
                          'selected_metric_value': float(best['ppl']),
                          'params': best.get('params'), 'run_cfg': best.get('run_cfg'),
+                         'selection_stability': _stability,
+                         'selected_is_loo_stable': bool(
+                             _stability.get('stable') and _chosen_sig == _best_sig),
                          'trials': per_arm[arm]}
         print(f'[tune] {arm:22s} best mean PPL {best["ppl"]:.4f} +/- {best["ppl_std"]:.4f} '
-              f'(n={best.get("n_seeds")}) at {best["config"]}')
+              f'(n={best.get("n_seeds")}) at {best["config"]}  '
+              f'LOO-stable={selected[arm]["selected_is_loo_stable"]}')
+        if _stability.get('status') == 'ok' and not _stability.get('stable'):
+            print(f'[tune] WARNING: {arm}: the selected config changes when one search seed is dropped '
+                  f'({_stability.get("n_distinct_configs")} distinct winners) — the "tuned" pick is seed-driven')
     artifact_protocol = dict(protocol)
     artifact_protocol['arms'] = list(arms)
     artifact_protocol['trials'] = [dict(t) for t in trials]
@@ -238,6 +313,8 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         'direction': protocol['direction'],
         'search_seed': search_seed,
         'search_seeds': list(search_seeds),
+        'search_final_seed_overlap': list(overlap),
+        'search_final_seed_disjoint': (not overlap),
         'search_steps': search_steps,
         'declared_trials': len(declared_trials),
         'trials_run': len(trials),
@@ -287,6 +364,14 @@ def _relaxed_pair_reason(a, b, tuned_arms):
         return 'unverifiable train_knobs (only one record carries the optimizer/schedule/augmentation descriptor)'
     if ka is not None and ka != kb:
         return 'different train_knobs (optimizer / LR-schedule / grad-clip / augmentation)'
+    # Seed equality does not imply initialization equality: different
+    # architectures consume different amounts of RNG.  The shared-trunk digest
+    # is the machine check that the paired seeded arms actually started equal.
+    ia, ib = a.get('init_core_fp'), b.get('init_core_fp')
+    if (ia is None) != (ib is None):
+        return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
+    if ia is not None and ib is not None and ia != ib:
+        return f'different init_core_fp ({str(ia)[:12]}… vs {str(ib)[:12]}…)'
     try:
         pa, pb = int(a.get('params')), int(b.get('params'))
         if abs(pa - pb) / float(max(pa, pb, 1)) > 0.01:
@@ -300,6 +385,12 @@ def _relaxed_pair_reason(a, b, tuned_arms):
 
 def _run_final(base, outdir, protocol, selected):
     final_seeds = [int(s) for s in protocol.get('final_seeds', [])]
+    search_seeds, _, overlap = _search_final_seeds(protocol)
+    if final_seeds and overlap:
+        raise ValueError(
+            'search_seeds and final_seeds overlap on %s — final tuned records '
+            'must not be measured on the seeds that selected the config; '
+            'declare a disjoint final partition' % overlap)
     _groups = _protocol_arm_groups(protocol, base, list(selected))
     _arm_group = {}
     for _grp in _groups:
@@ -358,64 +449,71 @@ def _run_final(base, outdir, protocol, selected):
             'selected': dict(entry.get('selected') or {}),
         }
     tuned_arms = {a: len(entry['trials']) for a, entry in selected.items()}
+    plan = _contrast_plan(protocol, _groups, list(selected))
     comparison = {'pairing_rule': 'tuned_equal_budget',
                   'note': 'Each arm used its own validation-selected hyperparameters; data/val fingerprints, steps, tokens and parameters are matched. This is NOT the strict same-run_cfg architectural contrast and must be reported separately.',
                   'final_seeds': list(final_seeds),
+                  'search_seeds': list(search_seeds),
+                  'search_final_seed_disjoint': (not overlap),
+                  'declared_contrasts': [f'{a} - {b}' for a, b in plan],
                   'arm_summary': arm_summary,
                   'contrasts': {}}
-    for method in ('csa_dynamic',):
-        if method not in selected:
-            continue
-        for baseline in selected:
-            if baseline == method:
+    for method, baseline in plan:
+        deltas, seeds, skipped = [], [], []
+        _common = sorted({int(r['seed']) for r in merged.values() if r.get('variant') == method} &
+                         {int(r['seed']) for r in merged.values() if r.get('variant') == baseline})
+        for seed in _common:
+            ra = merged.get(f'{method}::seed{seed}')
+            rb = merged.get(f'{baseline}::seed{seed}')
+            if not isinstance(ra, dict) or not isinstance(rb, dict):
                 continue
-            deltas, seeds, skipped = [], [], []
-            _common = sorted({int(r['seed']) for r in merged.values() if r.get('variant') == method} &
-                             {int(r['seed']) for r in merged.values() if r.get('variant') == baseline})
-            for seed in _common:
-                ra = merged.get(f'{method}::seed{seed}')
-                rb = merged.get(f'{baseline}::seed{seed}')
-                if not isinstance(ra, dict) or not isinstance(rb, dict):
-                    continue
-                why = _relaxed_pair_reason(ra, rb, tuned_arms)
-                if why:
-                    skipped.append({'seed': seed, 'reason': why})
-                    continue
-                deltas.append(float(ra['ppl']) - float(rb['ppl']))
-                seeds.append(seed)
-            st = L.paired_effect_stats(deltas)
-            _base_mean = (arm_summary.get(baseline) or {}).get('ppl_mean')
-            _rel = (100.0 * float(st['mean']) / _base_mean
-                    if isinstance(_base_mean, (int, float)) and _base_mean > 0 else float('nan'))
-            st.update({'with': method, 'without': baseline, 'seeds': seeds,
-                       'n_shared': len(_common), 'n_skipped': len(skipped),
-                       'skipped': skipped, 'pairing_rule': 'tuned_equal_budget',
-                       'with_mean': (arm_summary.get(method) or {}).get('ppl_mean'),
-                       'without_mean': _base_mean,
-                       'relative_effect_pct': _rel,
-                       'mean_pm_std': (f'{st["mean"]:+.4f} +/- {st["std"]:.4f}' if st.get('n') else 'n/a')})
-            comparison['contrasts'][f'{method} - {baseline}'] = st
-    # The tuned contrasts form their own family: each baseline is a separate
-    # claim, so raw p values must not be read as if only one comparison was
-    # run.  Apply the same Holm step-down used everywhere else and record the
-    # exact-test resolution floor instead of leaving "not significant" to be
-    # mistaken for a null when n is too small.
-    _named = [(name, st.get('p_exact_signflip')) for name, st in comparison['contrasts'].items()]
+            why = _relaxed_pair_reason(ra, rb, tuned_arms)
+            if why:
+                skipped.append({'seed': seed, 'reason': why})
+                continue
+            deltas.append(float(ra['ppl']) - float(rb['ppl']))
+            seeds.append(seed)
+        st = L.paired_effect_stats(deltas)
+        _base_mean = (arm_summary.get(baseline) or {}).get('ppl_mean')
+        _rel = (100.0 * float(st['mean']) / _base_mean
+                if isinstance(_base_mean, (int, float)) and _base_mean > 0 else float('nan'))
+        st.update({'with': method, 'without': baseline, 'seeds': seeds,
+                   'n_shared': len(_common), 'n_skipped': len(skipped),
+                   'skipped': skipped, 'pairing_rule': 'tuned_equal_budget',
+                   'with_mean': (arm_summary.get(method) or {}).get('ppl_mean'),
+                   'without_mean': _base_mean,
+                   'relative_effect_pct': _rel,
+                   'mean_pm_std': (f'{st["mean"]:+.4f} +/- {st["std"]:.4f}' if st.get('n') else 'n/a')})
+        comparison['contrasts'][f'{method} - {baseline}'] = st
+    # The tuned contrasts form their own DECLARED family.  A contrast that is
+    # declared but unmeasurable keeps a p=1 slot; dropping it from the family
+    # would make the remaining tests look better than the study design allows.
+    _named = []
+    for name, st in comparison['contrasts'].items():
+        _p = st.get('p_exact_signflip')
+        try:
+            _p = float(_p)
+        except (TypeError, ValueError):
+            _p = float('nan')
+        _named.append((name, _p if np.isfinite(_p) else 1.0))
     _holm = L.holm_adjust(_named, alpha=0.05) if _named else {}
-    _m = len(_named)
+    _m = len(plan)
     for name, st in comparison['contrasts'].items():
         _h = _holm.get(name) or {}
         st['p_holm'] = _h.get('p_holm')
+        st['declared_family_m'] = _m
         st['significant_holm'] = bool(_h.get('reject') and (not st.get('within_seed_noise'))
                                       and st.get('controlled', True))
     _final_counts = {a: int(v.get('n_seeds') or 0) for a, v in arm_summary.items()}
     comparison['family'] = {
         'name': 'tuned_equal_budget_baselines',
-        'm': _m, 'alpha': 0.05, 'correction': 'holm step-down',
+        'm': _m, 'declared_m': _m, 'measured_contrasts': len(_named),
+        'alpha': 0.05, 'correction': 'holm step-down',
+        'method_arms': sorted({a for a, _b in plan}),
         'final_seed_count_by_arm': _final_counts,
         'final_seed_coverage_equal': (len(set(_final_counts.values())) == 1) if _final_counts else None,
         'min_seeds_for_family_significance': L.signflip_min_n_for_holm(_m, 0.05) if _m else None,
-        'note': 'per-arm validation-selected hyperparameters; a tuned win is NOT a strict same-run_cfg architectural contrast',
+        'note': 'per-arm validation-selected hyperparameters; a tuned win is NOT a strict same-run_cfg architectural contrast. Contrasts are declared per parameter-matching group; unmeasurable declared pairs stay in the Holm family with p=1.',
     }
     if _final_counts:
         _min_final = min(_final_counts.values())
@@ -479,7 +577,7 @@ def run_smoke():
     protocol = dict(L.BASELINE_TUNING_PROTOCOL,
                     arms=['full', 'csa_fixed', 'csa_dynamic'],
                     trials=L.BASELINE_TUNING_PROTOCOL['trials'][:2],
-                    final_seeds=[0])
+                    search_seeds=[7], final_seeds=[0])
     os.environ.setdefault('CSA_SKIP_OVERFIT', '1')
     run_tuning(base, outdir='results_smoke_baseline_tune', protocol=protocol,
                trial_limit=2, search_steps=2, final=True)
