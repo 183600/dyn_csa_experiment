@@ -317,10 +317,11 @@ def main(argv=None):
             _n_same = int(((d_f1 != 0) & ((d_f1 > 0) == (_d_f1m > 0))).sum())
             lines.append(f'- 层均边界 F1：Δ = {_d_f1m:+.4f} ± {sample_std(d_f1):.4f}，{_n_same}/{_n_f1} 同向，p({_rf1["method"]}) = {p_f1:.3f}')
             _n_ppl = len(d_ppl)
-            _ppl_floor0 = (2.0 / (1 << _n_ppl) if _n_ppl <= 20
-                           else (1.0 / (1 << _n_ppl) if _n_ppl <= 40 else 0.0))
-            _floor_txt = (f'（n={_n_ppl} 时 p 分辨率下限 {_ppl_floor0:.3f}）'
-                          if _ppl_floor0 > 0 else f'（n={_n_ppl} 使用确定性正态近似，无离散分辨率下限）')
+            # Two-sided floor is 2/2**n for exact, MITM and saddlepoint alike.
+            _ppl_floor0 = L.signflip_p_floor(_n_ppl)
+            _floor_txt = (f'（n={_n_ppl} 时 p 分辨率下限 {_ppl_floor0:.3g}）'
+                          if math.isfinite(_ppl_floor0)
+                          else f'（n={_n_ppl} 的 p 分辨率不可计算）')
             lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p({_rppl["method"]}) = {p_ppl:.3f}{_floor_txt}\n')
         elif not _ok_seeds:
             p_f1 = p_ppl = None
