@@ -13085,13 +13085,16 @@ def _param_control_detail(recs, a, b):
     out = {'total_rel_diff': None, 'total_controlled': None,
            'non_embedding_rel_diff': None, 'non_embedding_controlled': None,
            'active_rel_diff': None, 'active_controlled': None,
-           'unavailable': True}
+           'breakdown_one_sided': False, 'unavailable': True}
     pa, pb = _params_of_arm(recs, a), _params_of_arm(recs, b)
     if pa is not None and pb is not None:
         rel = abs(pa - pb) / float(max(pa, pb, 1))
         out.update({'total_rel_diff': float(rel), 'total_controlled': bool(rel <= 0.01), 'unavailable': False})
     ba, bb = _param_breakdown_of_arm(recs, a), _param_breakdown_of_arm(recs, b)
-    if not (isinstance(ba, dict) and isinstance(bb, dict)):
+    _ba = isinstance(ba, dict) and bool(ba)
+    _bb = isinstance(bb, dict) and bool(bb)
+    out['breakdown_one_sided'] = (_ba != _bb)
+    if not (_ba and _bb):
         return out
 
     def _num(d, key):
@@ -13118,6 +13121,11 @@ def _param_capacity_controlled(detail):
     total is unverifiable (None), never a silent pass.
     """
     if not isinstance(detail, dict):
+        return None
+    if detail.get('breakdown_one_sided') is True:
+        # One arm records the breakdown and the other does not: the capacity
+        # match cannot be verified, so this is unverifiable (None), never a
+        # pass that silently trusts the total count.
         return None
     total = detail.get('total_controlled')
     if total is None:

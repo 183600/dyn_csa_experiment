@@ -4347,6 +4347,11 @@ def t_param_and_compute_control_detail():
     assert d['active_rel_diff'] > 0.01, d
     assert L._param_capacity_controlled(d) is False, d
     assert 'breakdown' in L.param_pair_reason(recs[('a', 'p', 0)], recs[('b', 'p', 0)]), 'breakdown must fail closed'
+    # One-sided breakdown is unverifiable, not a total-only pass.
+    one = {('a', 'p', 0): {'params': 1000, 'param_breakdown': bd},
+           ('b', 'p', 0): {'params': 1000}}
+    od = L._param_control_detail(one, 'a', 'b')
+    assert od['breakdown_one_sided'] is True and L._param_capacity_controlled(od) is None, od
     c = L._compute_control_detail(recs, 'a', 'b')
     assert c['compute_matched'] is False and c['more_compute_arm'] == 'b', c
     assert abs(c['time_ratio_a_over_b'] - 0.5) < 1e-12, c
