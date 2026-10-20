@@ -6525,6 +6525,14 @@ def t_scale_ladder_budget_and_transfer_audit():
     assert fam_ok['family_min_seeds'] == 7, fam_ok
     assert fam_ok['common_seeds_sufficient_for_family'] is True, fam_ok
     assert all(t['descriptive_only'] is False for t in fam_ok['tiers']), fam_ok
+    # Malformed declarations fail closed instead of crashing the pre-flight
+    # audit (a truthy scalar `cfg` used to reach `.get`).
+    mal = L.scale_ladder_audit([dict(a, cfg='not-a-recipe'), b])
+    assert mal['status'] == 'fail' and any('cfg is not an object' in p
+                                          for p in mal['problems']), mal
+    mal2 = L.scale_ladder_audit([123, b])
+    assert mal2['status'] == 'fail' and any('not a dict' in p
+                                           for p in mal2['problems']), mal2
 
 
 def t_init_core_fingerprint_and_pair_gate():

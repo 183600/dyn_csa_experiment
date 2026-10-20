@@ -11408,7 +11408,14 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             problems.append(f'tier #{i} is not a dict')
             continue
         name = str(tier.get('name') or f'T{i}')
-        cfg = tier.get('cfg') or {}
+        _cfg_raw = tier.get('cfg')
+        if _cfg_raw is not None and not isinstance(_cfg_raw, dict):
+            # A truthy scalar/list here used to reach `cfg.get(...)` and crash
+            # the whole pre-flight audit; it is a malformed declaration, not a
+            # usable scale recipe.
+            problems.append(f'{name}: cfg is not an object ({type(_cfg_raw).__name__})')
+            continue
+        cfg = _cfg_raw or {}
         row = {'name': name}
         # Optional corpus/tokenizer provenance: the ladder's cross-tier
         # contrasts (paired log PPL ratios, tokens-per-param) are only defined
