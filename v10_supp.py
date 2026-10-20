@@ -430,7 +430,7 @@ def _niah_fingerprint(cfg, condition=None):
     return fp
 
 def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, condition, rho=0.5):
-    """Far-necessary-information task on NATURAL text (review point 3).
+    """Far-necessary-information task on NATURAL text.
 
     每条序列 = [远端自然文本（内嵌 n_pairs 个 key→value 耦合）] + [目标区：
     自然文本收尾 + n_pairs 个查询 key]。查询 key 之后紧跟的正确 token 是
@@ -1209,7 +1209,7 @@ def _panel_convergence(hists):
     return out
 
 def _equal_token_slices():
-    """Review point 1 — the scale panels' endpoints confound model size with
+    """The scale panels' endpoints confound model size with
     cumulative training tokens.  This analysis re-reads the SAME curves at
     matched token counts (and, when the matched arms exist, at matched total
     compute), so a cross-scale endpoint difference can no longer be silently
@@ -1374,7 +1374,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     if not _pairable(learned, other, Ln, rho, tag):
                         continue
                     _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other)
-        # ---- from-scratch selector controls (review point 2) ----
+        # ---- from-scratch selector controls ----
         for Ln in PROBE['eval_lens']:
             for rho in PROBE['rhos']:
                 learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho, 'uniform')
@@ -1400,13 +1400,13 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     if not tt or not sc or not _pairable(tt, sc, Ln, rho, tag):
                         continue
                     _add_contrast(f'L{Ln} r{rho}: {tag}', sc, tt)
-                # architecture-aligned dense (review point 5): full_rope minus
+                # architecture-aligned dense: full_rope minus
                 # the all-blocks CSA twin (same projections/norm/RoPE/sink)
                 dense = cell_mean('full_rope', 'dense', Ln, rho, 'uniform')
                 allt = cell_mean('csa_fixed_rope_allblocks', 'learned', Ln, rho, 'uniform')
                 if dense and allt and _pairable(dense, allt, Ln, rho, 'arch-aligned'):
                     _add_contrast(f'L{Ln} r{rho}: arch-aligned: full_rope - csa_alltrain', allt, dense)
-        # ---- delta-NLL on the corruption modes (review point 3) ----
+        # ---- delta-NLL on the corruption modes ----
         delta_nll = {}
 
         def _nll_tok(rec):
@@ -1454,7 +1454,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if len(per_seed) >= 1:
                 means = {s: per_seed[s] for s in sorted(per_seed)}
                 _dl = list(means.values())
-                entry = {'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'n': len(_dl), 'mean': float(np.mean(_dl)), 'std': float(np.std(_dl, ddof=1)) if len(_dl) > 1 else 0.0, 'per_seed': means, 'clean_nll_by_seed': {s: _nll_tok(r) for s, r in clean_grp.items() if math.isfinite(_nll_tok(r))}, 'note': 'delta = NLL_corrupted - NLL_clean, nats per target token (review point 3)'}
+                entry = {'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'n': len(_dl), 'mean': float(np.mean(_dl)), 'std': float(np.std(_dl, ddof=1)) if len(_dl) > 1 else 0.0, 'per_seed': means, 'clean_nll_by_seed': {s: _nll_tok(r) for s, r in clean_grp.items() if math.isfinite(_nll_tok(r))}, 'note': 'delta = NLL_corrupted - NLL_clean, nats per target token'}
                 delta_nll[f'{v}::{arm}::L{Ln}::{mode}::r{rho}'] = entry
         # paired delta-NLL contrasts between arms at the same (L, mode, rho)
         for Ln in PROBE['eval_lens']:
@@ -1473,7 +1473,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             res = V.exact_sign_permutation(dl)
                             res['seeds'] = common
                             contrasts[f'ΔNLL L{Ln} {mode} r{rho}: {arm} - csa+learned'] = res
-        # ---- Holm correction over the whole contrast family (review point 4) ----
+        # ---- Holm correction over the whole contrast family ----
         holm = {}
         _fam = [(k, v.get('p_exact_signflip')) for k, v in contrasts.items() if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))]
         if _fam:
@@ -1484,7 +1484,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             _rej = [k for k, v in holm.items() if v.get('reject')]
             print(f'[v10 stats] Holm step-down over the {len(_fam)}-contrast family (EXPLORATORY — not pre-registered): {len(_rej)} survive at alpha=0.05' + (f': {sorted(_rej)[:4]}' if _rej else ''))
         probe = {'cells': probe_cells, 'contrasts': contrasts, 'delta_nll': delta_nll, 'holm_exploratory': holm}
-        # ---- NIAH-natural (review point 3, far-necessity task) ----
+        # ---- NIAH-natural (far-necessity task) ----
         _nsp = (PROBE.get('niah') or {}).get('summary')
         if _nsp and os.path.exists(_nsp):
             try:
@@ -1569,7 +1569,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                              'train_tokens': _v.get('train_tokens'),
                              'censored': bool(_v.get('censored') or _v.get('mean_crossed') is False),
                              'reconstructed': bool(_is_recon(_v))}
-    # Reviewer issue 12: one point per width, no censored subset, comparable
+    # One point per width, no censored subset, comparable
     # training volume, at least 4 widths, and a slope WITH CI.  The helper
     # refuses instead of fitting whenever those conditions fail.
     fit = L.crossover_scaling_fit(fit_entries, min_points=4)
@@ -1640,10 +1640,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('> 参考论文：arXiv:2606.19348。**范围声明**：本报告是小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现，也不支持对其规模、语料或生产系统做外推。')
     A('> 说明：本报告全部数字由 `v10_supp.py report` 从 `results_*/`、`analysis_v10/` 的落盘产物计算得到，无手填数值。')
     A('')
-    A('v10 落实 v9 收官后评审的三项升级：(1) 把 v7 P1L 的长度外推观察升级为机制性检验——远距干扰注入实验直接检验「稀疏掩码滤除远距噪声」假设；(2) 新增 d=128/4L 与 d=512/10L 两个规模，与既有 d=256/d=384 面板组成 4 点反转交叉点标度读数（预注册交叉判据）；(3) 把 v9 仍处 p 值分辨率下限的面板（seq-2048 topk 扫描）从 n=2 补到 n=4。')
-    A('')
-    A('**本版修订（评审 5 点）**：(a) P3MTC 补同配方、同 token 预算从头训练的选择器对照（randidx / allblocks；allblocks 在每个位置读取全部块，**不是**等计算量或等读取预算的对照）并补逐项对齐的压缩块全读参照；(b) 干扰注入扩展为 uniform / natural / mask / delete 四种腐坏模式并按 ΔNLL 口径报告，另增 NIAH-natural 远端必要信息任务；(c) P3SL2/P3SL3 补等训练 token 与等计算量的大模型臂，统计新增等 token 切片与收敛（平台期）诊断；(d) 全部配对比较报告逐种子 Δ、效应量 d_z、p 值分辨率下限与 Holm 校正，明确探索性/确认性证据边界（确认性评估见 `v12_supp.py` 与冻结清单 `confirmation_frozen.json`）。')
-    A('')
+
     A('---')
     A('')
     A('## P3M 长度外推优势的机制验证（远距干扰注入）')

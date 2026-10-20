@@ -2393,7 +2393,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     need = max(eval_lens) + 1
     if val_ids is None:
         val_ids = L.load_wikitext(max(train_len, need), 8000000)[1]
-    # v11.128: the p1l recipe must describe the implementation that ACTUALLY
+    # The p1l recipe must describe the implementation that ACTUALLY
     # runs and the training corpus it actually reads.  Both are derived
     # explicitly before training and carried into the checkpoint/record.
     train_ids = L.load_wikitext(train_len, 8000000)[0]
@@ -2624,7 +2624,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             _rec['data_version'] = _prov['data'].get('data_version')
         except Exception as _pe:
             print(f'[p1l] WARNING: could not attach provenance to {key} ({type(_pe).__name__}: {_pe})')
-        # v11.128: never fabricate a train_knobs descriptor on resume.  The
+        # Never fabricate a train_knobs descriptor on resume.  The
         # weights may have been trained under a different numeric path, which
         # would make the frozen implementation binding certify a false
         # descriptor.

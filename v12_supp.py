@@ -326,7 +326,7 @@ def _load_manifest(path):
         raise SystemExit(f'[v12] REFUSE: the frozen plan cannot confirm ANYTHING by construction — with n={_n} seeds, a two-sided exact sign-flip and a Holm family of m={_m_family}, the smallest attainable Holm p is {_min_holm:.4g} > alpha={_alpha} (all {_n} seeds one-sided still gives {_kmin is None and "insufficient" or f"k_min={_kmin} needed"}). This is a resolution ceiling, NOT a conservative design. Revise the plan BEFORE any test-split evaluation (add seeds / shrink the family / change the test) and record the revision in the manifest history. ({_stat.get("descriptive_only")!r})')
     if not isinstance(m.get('seeds'), list) or not all(isinstance(s, int) and (not isinstance(s, bool)) for s in m['seeds']) or len(set(m['seeds'])) != len(m['seeds']):
         raise SystemExit(f'[v12] REFUSE: seeds must be a list of unique integers ({m.get("seeds")!r}) — seed identity is the pairing unit of the whole protocol')
-    # v11.128: the declared n-floor is part of the decision rule.  Refuse a
+    # The declared n-floor is part of the decision rule.  Refuse a
     # floor that is below 2, above the frozen seed count, or mathematically
     # unable to reach Holm significance.
     _n_min = _stat.get('min_seeds_for_confirmation')
@@ -408,7 +408,7 @@ def _recipe_signature(manifest, arm=None):
     键名 `training_recipe_signature`（v2 清单）；旧名 `training_recipe`
     仍被接受（smoke 清单与兼容路径）。
 
-    v11.128 / manifest v3: an arm-specific signature
+    An arm-specific signature
     (``binding.per_arm_recipe_signature[<arm>]``) is merged on top of the
     shared signature.  This is how the parameter-matching knob ``mr`` is
     pinned without pretending the four arms share one value: ``full_rope`` is
@@ -437,8 +437,8 @@ def _train_fp_required(manifest):
     A manifest that DECLARES ``binding.training_data_fingerprint`` is binding
     even while its ``canonical_train_fp`` is still null: the run must derive
     one value from the checkpoints before the first test read and lock it.
-    The historical ``bool(want) or bool(ckpt) or bool(record)`` rule was
-    fail-open (all three empty -> no check at all), which the review flagged.
+    A ``bool(want) or bool(ckpt) or bool(record)`` rule would be fail-open
+    (all three empty -> no check at all), so it is not used.
     """
     _bind = manifest.get('binding') or {}
     if not isinstance(_bind, dict):
@@ -476,7 +476,7 @@ def _frozen_implementation(manifest):
     row-loop vs batched twin and the AMP dtype are machine/runtime choices.
     Newer manifests can pin them with ``eager_batch_expected`` /
     ``amp_dtype_expected`` (top level, or the same names without the suffix).
-    Absent fields leave the historical permissive path unchanged, but when a
+    Absent fields leave the permissive path unchanged, but when a
     field IS declared every admitted record must prove it ran that way through
     its own `train_knobs` (never by re-deriving the current box's CUDA state).
     """
@@ -580,7 +580,7 @@ def _frozen_seeds():
     """Seeds for the frozen-arm training phases (P5C/P5MP) — single source of
     truth is the manifest; hard-coded phase lists must not disagree with it.
 
-    v11.128: run the FULL `_load_manifest` validation here, not just a JSON
+    Run the FULL `_load_manifest` validation here, not just a JSON
     seed parse.  Training refuses before the first GPU-second if the manifest
     would be rejected at P5T load time (stamp mismatch, unresolvable power
     gate, binding inconsistency).
@@ -771,7 +771,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     # the frozen canonical value when the manifest supplies one.
     _tr_train_fp = _tr.get('data_fp')
     _ck_train_fp = d.get('train_fp') or d.get('data_fp')
-    # v11.128: the caller passes the value derived BEFORE the first test read
+    # The caller passes the value derived BEFORE the first test read
     # and written into the freeze lock.  Recomputing it here from a null
     # manifest field would reintroduce the fail-open path and could accept a
     # record from a different corpus.
@@ -832,7 +832,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         if rec.get('train_fp') != _tr_train_fp:
             return True
         # A record measured on a different row count is a different estimand.
-        # v11.128 stores n_seq explicitly and treats a mismatch as stale.
+        # n_seq is stored explicitly and a mismatch is treated as stale.
         if int(rec.get('n_seq') or -1) != int(test_ids.shape[0]):
             return True
         if _msha is not None and rec.get('manifest_sha256') != _msha:
@@ -874,9 +874,9 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     gc.collect()
 
     def _merge(summary):
-        # by_len now also carries ppl_per_seq (per-document rows,
-        # issue 9b) straight from eval_length_gen; pooled ppl is unchanged.
-        # v11.128: the P5T record carries the SAME provenance descriptor as its
+        # by_len also carries ppl_per_seq (per-document rows)
+        # straight from eval_length_gen; pooled ppl is unchanged.
+        # The P5T record carries the SAME provenance descriptor as its
         # training record (`train_knobs` / `train_objective` /
         # `param_breakdown` / `rng_fp`) plus the evaluated row count.  Without
         # `train_knobs` the frozen implementation binding excluded ALL 48
@@ -948,7 +948,7 @@ def run_finaltest(cfg=None, guard=None):
         _want_train_fp = next(iter(_cand_train_fps))
     elif _want_train_fp is None and len(_cand_train_fps) > 1:
         raise SystemExit(f'[v12] REFUSE: the frozen training records span {len(_cand_train_fps)} different train_fp values {sorted(_cand_train_fps)}; refusing to define a canonical training set after the fact')
-    # v11.128: a manifest that DECLARES training_data_fingerprint may not fall
+    # A manifest that DECLARES training_data_fingerprint may not fall
     # through to a null canonical value.  Deriving it from the frozen training
     # records is the only legal path; if that is impossible, refuse BEFORE the
     # one-shot test read rather than discovering it per-cell afterwards.
@@ -979,7 +979,7 @@ def run_finaltest(cfg=None, guard=None):
     if int(test_ids.shape[0]) != _nseq_clean or int(test_ids.shape[1]) != need:
         raise SystemExit(f'[v12] REFUSE: loaded test slice shape {tuple(test_ids.shape)} != the frozen ({_nseq_clean}, {need}) — the row count and sequence length are part of the pre-registration; re-freeze explicitly instead of shrinking the panel')
     if not _smoke:
-        # v11.128: run the leakage gate BEFORE the `accessed` lock is written
+        # Run the leakage gate BEFORE the `accessed` lock is written
         # and before any evaluation.  A gate that can never fire (a
         # Jaccard<=0.05 on a 4M-vs-65k shingle pair) is not a gate, and a
         # `not_verifiable_locally` result must not pass silently.  Both are
@@ -1115,7 +1115,7 @@ def _admit_confirmation_records(raw, manifest):
         why = None
         s_i = None
         if r.get('split') != 'test':
-            # v11.128: named exclusion, not a silent `continue`.  The
+            # Named exclusion, not a silent `continue`.  The
             # docstring promises "named, never silent"; a smoke/validation
             # record sitting in bylen.json must be visible in the audit trail.
             why = f"split {r.get('split')!r} is not 'test' (a non-test record cannot enter the confirmation)"
@@ -1162,7 +1162,7 @@ def _admit_confirmation_records(raw, manifest):
     if excluded:
         print('[p5t stats] EXCLUDED from the confirmation analysis (named, never silent):\n  - ' + '\n  - '.join(excluded[:20]) + ('' if len(excluded) <= 20 else f'\n  … {len(excluded) - 20} more'))
     if duplicates:
-        raise SystemExit('[p5t stats] REFUSE: ambiguous duplicate records for the same (variant, seed): ' + '; '.join(duplicates) + ' — the paired statistics would depend on which one wins; resolve the bylen file first (this is exactly the dict-overwrite ambiguity the review flagged)')
+        raise SystemExit('[p5t stats] REFUSE: ambiguous duplicate records for the same (variant, seed): ' + '; '.join(duplicates) + ' — the paired statistics would depend on which one wins; resolve the bylen file first')
     if len(fps) > 1:
         raise SystemExit(f'[p5t stats] REFUSE: admissible records span {len(fps)} different test-slice fingerprints ({sorted(fps)}) — the whole panel must be measured on ONE frozen test slice, not merely pairwise-equal fingerprints')
     if len(train_fps) > 1:
@@ -1412,8 +1412,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         'n_seq_values': sorted({n for n in (_record_int(r.get('n_seq')) for r in admitted.values()) if n is not None}),
         'note': 'exact sign-flip requires within-seed exchangeability (same data order / eval rows / corruption grid). data_fp, train_fp, n_seq and recipe are machine-checked; the shared-trunk initialization digest (init_core_fp) is reported and compared (`same_init_core_fp`); rng_fp is reported but NOT enforced (architecture-induced RNG consumption is part of the arm), so the exchangeability claim remains a declared, machine-instrumented assumption.',
     }
-    # Review issue 2: the frozen comparison is parameter-matched, not
-    # compute-matched.  Refuse a non-descriptive plan that does not disclose
+    # The frozen comparison is parameter-matched, not compute-matched.
+    # Refuse a non-descriptive plan that does not disclose
     # both facts, so the caveat cannot be silently dropped from the report.
     _cbd = manifest.get('compute_budget_disclosure')
     _descriptive = bool((manifest.get('statistics') or {}).get('descriptive_only'))
@@ -1466,9 +1466,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         # same frozen fingerprint, so pairing cannot mix slices (and a missing
         # fingerprint could never enter here — None==None is rejected).
         common = sorted(set(recs_a) & set(recs_b))
-        # v11.128: drop only the incomplete PAIR, not the whole comparison.
-        # The review's scenario — one L4096 cell fails -> `dl=None` -> the
-        # entire comparison is omitted — wasted 47 good cells.  Use every
+        # Drop only the incomplete PAIR, not the whole comparison: one failed
+        # L4096 cell would otherwise omit the entire comparison.  Use every
         # complete pair and report the dropped seeds.  Whether n<12 may still
         # confirm is a PRE-REGISTERED choice (statistics.min_seeds_for_confirmation,
         # manifest v3: 8, the mathematical minimum for Holm/4 with alpha=0.05).
@@ -1859,10 +1858,10 @@ def _plan_recipe(manifest, arm, mr):
 def plan_check(manifest_path=FREEZE_MANIFEST):
     """Zero-GPU pre-flight for the frozen confirmation plan.
 
-    The review's most dangerous finding was that the obvious fix (align the
-    code stamp) turns P5T from "fails fast" into "burns the one-shot test
-    access, then admits 0/48 records".  This check closes that hole WITHOUT
-    reading test data: it derives the implementation descriptor from the same
+    A stamp-only fix would turn P5T from "fails fast" into "burns the
+    one-shot test access, then admits 0/48 records".  This check closes that
+    hole WITHOUT reading test data: it derives the implementation descriptor
+    from the same
     `make_layer_cfgs` + `_uses_batched_eager` code the trainer uses, builds
     one synthetic record per (arm, seed) with the real recipe/admission
     schema, and runs `_admit_confirmation_records` + the power gate.
@@ -2037,10 +2036,10 @@ def run_plan(manifest_path=FREEZE_MANIFEST):
 def run_smoke():
     import copy
     import shutil
-    # v11.128: smoke must never write into the frozen wt103_cache.  It used a
-    # 1M/4M-token fit cap and could leave a differently-tokenised
-    # tok_v5_*.json that makes a later cold P5T build fail AFTER the test read.
-    # An isolated cache under the smoke outdir keeps the frozen cache clean.
+    # Smoke must never write into the frozen wt103_cache: a differently
+    # tokenised tok_v5_*.json could make a later cold P5T build fail AFTER the
+    # test read.  An isolated cache under the smoke outdir keeps the frozen
+    # cache clean.
     os.environ.setdefault('WT103_CACHE_DIR', os.path.join('results_smoke_v12', 'wt103_cache'))
     print('[smoke] 1) tiny frozen-confirmation roundtrip on a synthetic local test split')
     L.set_seed(0)

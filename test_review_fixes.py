@@ -1410,7 +1410,7 @@ def t_shipped_manifest_consistency():
     assert set(per) == set(v2['arms']), per
     assert abs(float(per['full_rope']['mr']) - 6.76348876953125) < 1e-9, per
     assert all(abs(float(per[a]['mr']) - 4.0) < 1e-12 for a in v2['arms'] if a != 'full_rope'), per
-    # scope block present (issue 4)
+    # scope block present
     assert v2.get('scope', {}).get('not_covered'), 'scope.not_covered must name the dynamic/HCA claims that are out of scope'
     # the compute-budget caveat must be explicit, not buried in prose
     assert v2.get('compute_budget_disclosure', {}).get('flops'), 'v3 must disclose the dense-arm MLP/FLOPs mismatch'
@@ -3537,7 +3537,7 @@ def t_simple_baseline_audit_malformed_records():
 
 
 # ---------------------------------------------------------------------------
-# L. Review-4 hardening: claim gate, Holm family floor, crossover fit,
+# L. Additional hardening: claim gate, Holm family floor, crossover fit,
 #    matched init, compute control, stale refusal, efficiency pairs.
 # ---------------------------------------------------------------------------
 
@@ -4163,11 +4163,11 @@ def main():
     _check('C7 frozen seeds single source', t_frozen_seeds)
     _check('C8 doc-level analysis', t_doc_level_analysis)
     _check('D1 eval per-seq ppl', t_eval_per_seq)
-    _check('J1 review-3 evidence metadata + significance gate', t_review3_evidence_metadata)
-    _check('J2 review-3 pooled aggregation', t_review3_pooled_aggregate)
-    _check('J3 review-3 Holm declared-family slots', t_review3_holm_family_size)
-    _check('J4 review-3 task-boundary arm + objective descriptor', t_review3_boundary_arm_and_objective)
-    _check('J5 review-3 span clean-baseline key', t_review3_span_clean_key)
+    _check('J1 evidence metadata + significance gate', t_review3_evidence_metadata)
+    _check('J2 pooled aggregation', t_review3_pooled_aggregate)
+    _check('J3 Holm declared-family slots', t_review3_holm_family_size)
+    _check('J4 task-boundary arm + objective descriptor', t_review3_boundary_arm_and_objective)
+    _check('J5 span clean-baseline key', t_review3_span_clean_key)
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E1a seed/variant axis normalisation', t_seed_axis_normalization)
     _check('E1b explicit RNG seed contract', t_seed_contract_check)
@@ -4265,7 +4265,7 @@ def main():
             _check(_name, _fn)
     except Exception as _obe:
         _check('K0 open-block suite import', lambda _e=_obe: (_ for _ in ()).throw(_e))
-    _check('L1 review-4 reportable claim gate', t_reportable_claim_gate)
+    _check('L1 reportable claim gate', t_reportable_claim_gate)
     _check('L2 Holm family resolution ceiling', t_holm_family_resolution_ceiling)
     _check('L3 crossover fit refusal rules + slope CI', t_crossover_scaling_refusals)
     _check('L3b scale-ladder budget + transfer audit', t_scale_ladder_budget_and_transfer_audit)

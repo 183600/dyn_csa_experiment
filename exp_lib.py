@@ -136,7 +136,7 @@ def _uses_batched_eager(cfgs, device=None, batch_size=None):
         return False
     return any(
         getattr(c, 'kind', None) in ('csa', 'hca')
-        # v11.128: RoPE CSA/HCA layers ALWAYS take the per-row
+        # RoPE CSA/HCA layers ALWAYS take the per-row
         # `HybridAttentionRoPE._single_rope` loop (v7_supp.py forward), and the
         # batched twin in csa_kernels has no RoPE/qk-norm implementation.  A
         # layer is batched only when it is NOT a rope layer.
@@ -188,7 +188,7 @@ def nan_guard_state(reset=False):
 def _safe_nan_to_num(x, *, where='attention', **kwargs):
     """`torch.nan_to_num` wrapper used by the attention paths.
 
-    Default behaviour is byte-identical to the historical call.  With
+    Default behaviour is byte-identical to the plain call.  With
     CSA_NAN_AUDIT=1 (or CSA_STRICT_NAN=1) the non-finite element count is
     measured; strict mode raises with the call site instead of silently
     changing attention semantics."""
@@ -240,8 +240,8 @@ def _curve_slope_stats(points, key, k=4):
 
     Returning the standard error is what makes the health thresholds
     noise-aware: with four equally spaced eval points and CE noise of order
-    0.01-0.03, the slope's standard error is ~5e-5 per step, five times the
-    historical fixed ``slope_tol=1e-5``.  A fixed tolerance therefore lets the
+    0.01-0.03, the slope's standard error is ~5e-5 per step, five times a
+    fixed ``slope_tol=1e-5``.  A fixed tolerance therefore lets the
     *sign of the noise* decide ``healthy`` vs ``overfitting``.  Callers that
     need a scale-free criterion compare the slope with a multiple of this SE.
     """
@@ -290,11 +290,11 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     rule: it says whether the run looks overfit / underfit / stalled / broken
     on the fixed evaluation grid.
 
-    ``slope_tol=None`` (the default since v11.128) makes the threshold
+    ``slope_tol=None`` (the default) makes the threshold
     noise-aware: each curve's tolerance is ``max(1e-5, 2 * SE(slope))``, where
     SE is the least-squares standard error of the fitted tail slope.  A slope
     must then exceed twice its own noise before it can flip a health status.
-    Pass a number to restore the historical fixed-threshold behaviour (tests
+    Pass a number to use the fixed-threshold behaviour (tests
     and callers that deliberately use a synthetic noise-free curve do this).
     """
     entries = [h for h in (history if history is not None else []) if isinstance(h, dict)]
@@ -5804,11 +5804,9 @@ _WT103_MEMO_CAP = 4
 def _wt_cache_dir(cache_dir=None):
     """Resolve the WikiText cache directory, honouring ``WT103_CACHE_DIR``.
 
-    Before v11.128 the loaders hard-coded ``./wt103_cache`` while the audit
-    and the confirmation driver looked at ``WT103_CACHE_DIR``.  That meant the
-    leakage gate could audit a different directory from the one the evaluation
-    actually used.  One resolver is now shared by both loaders so there is a
-    single cache identity.
+    The loaders and the audit/confirmation driver share this resolver, so the
+    leakage gate always inspects the same directory the evaluation reads and
+    there is a single cache identity.
     """
     if cache_dir not in (None, ''):
         return str(cache_dir)
@@ -6355,7 +6353,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 'rebuild it from the same train tokenizer')
         if meta.get('fit_fp') and not _train_fit_fps:
             print('[data] NOTE: no train-cache meta found; the cached TEST fit provenance cannot be cross-checked locally')
-        # v11.128: bind the actual test tokenizer bytes on EVERY cache hit.
+        # Bind the actual test tokenizer bytes on EVERY cache hit.
         # `fit_fp` hashes the fit TEXT, which two different BPE merge sets can
         # share; it is not a tokenizer identity.  A missing identity in a
         # legacy cache is a hard refusal for the frozen confirmation (delete
@@ -6652,7 +6650,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         _cap_test, 'test', tok, eos_id, lengths_out=_test_lengths)
     n_have = min(len(ids) // seq_len, n_seqs)
     if n_have < n_seqs:
-        # v11.128: hard failure.  The frozen plan declares n_seqs (16) as part
+        # Hard failure.  The frozen plan declares n_seqs (16) as part
         # of the slice; silently evaluating 14 rows would change the estimand
         # and could still pass every downstream admission check.
         raise RuntimeError(f'load_wikitest: the test split yields only {n_have} full rows but {n_seqs} are required by the frozen slice; refusing to shrink the held-out panel silently (investigate the near-duplicate cleanup / raw dump or re-freeze explicitly)')
@@ -6670,8 +6668,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     test_doc_ids = _doc_ids_for_capped_rows(
         [r for r in _trows if r.strip()], _test_lengths, _served_cap)
     # Prove group isolation against every train/val cache sidecar present.  The
-    # build-time dedup should already guarantee zero; this turns a silent
-    # dedup/index bug into a hard refusal before the cache is written.
+    # build-time dedup should already guarantee zero; this turns any silent
+    # dedup/index mismatch into a hard refusal before the cache is written.
     _shared_train_docs = 0
     _shared_val_docs = 0
     _doc_scan_errors = []
@@ -9080,8 +9078,7 @@ def wilcoxon_signed_rank_p(deltas):
     """Two-sided Wilcoxon signed-rank p, exact over the integer rank-sum
     distribution for n<=200 and normal above that.  Reported as a SENSITIVITY
     check, not as a replacement for the sign-flip test: it assumes symmetric
-    paired differences, which the review correctly says is not guaranteed by
-    sharing a seed number.
+    paired differences, which is not guaranteed by sharing a seed number.
 
     Ranks are doubled so average ranks from ties stay integral; a 0/1 subset-
     sum DP then counts every sign assignment exactly in O(n * sum_ranks),
@@ -11999,8 +11996,8 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
     Equal `steps`/`tokens_seen` is enforced by `pair_reason`, but that is not
     equal compute: the parameter-matched dense arm widens its MLP (+69%) and
     reads every token, while a sparse arm reads a fraction of the blocks.  The
-    review's fairness requirement needs the mismatch *shown*, and its
-    DIRECTION matters: if the arm with more measured compute also wins, the
+    mismatch must be *shown*, and its DIRECTION matters: if the arm with more
+    measured compute also wins, the
     comparison is confounded in favour of the claim; if it loses, the claim is
     conservative.
 
@@ -15383,7 +15380,7 @@ def _active_amp(device=None):
     if getattr(device, 'type', str(device)) != 'cuda':
         return None
     _amp = _amp_requested()
-    # v11.128: bf16 is requested unconditionally on CUDA, but pre-Ampere
+    # bf16 is requested unconditionally on CUDA, but pre-Ampere
     # GPUs (V100/T4) cannot run it.  Failing here with a clear message beats
     # training under a silently different numerical path and then having the
     # frozen confirmation binding reject or mis-certify every record.

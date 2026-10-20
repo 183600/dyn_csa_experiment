@@ -545,7 +545,7 @@ def sec_p0r():
     if not rope or not ab:
         return '## P0-3 位置编码对照 — （无结果）\n\n'
     pairs = [('full', 'full_rope'), ('csa_fixed', 'csa_fixed_rope'), ('csa_dynamic', 'csa_dynamic_rope'), ('hybrid_fixed', 'hybrid_fixed_rope')]
-    lines = ['## P0-3 位置编码错配是否为混淆项？（RoPE + QK-RMSNorm 对照）', '', '**评审论断**：论文用 partial RoPE（末 64 维）+ 输出侧反向 RoPE(pos=−i) + core attention 前 Q/KV RMSNorm；仓库用 `nn.Embedding(max_seq,d)` 学习式绝对位置编码、无 QK-norm。怀疑 PE 错配造成了 sparse 落后。', '', '**做法**：新增 `*_rope` 变体族，seed 0/1/2 × 1500 步 × seq 512，其余训练配置与 absPE 面板完全一致。', '', '| 变体 | absPE (v3_1500) | RoPE+QKnorm (v7) | Δ(RoPE−abs) | params(abs/rope) |', '|---|---|---|---|---|']
+    lines = ['## P0-3 位置编码错配是否为混淆项？（RoPE + QK-RMSNorm 对照）', '', '**待检验论断**：论文用 partial RoPE（末 64 维）+ 输出侧反向 RoPE(pos=−i) + core attention 前 Q/KV RMSNorm；仓库用 `nn.Embedding(max_seq,d)` 学习式绝对位置编码、无 QK-norm。怀疑 PE 错配造成了 sparse 落后。', '', '**做法**：新增 `*_rope` 变体族，seed 0/1/2 × 1500 步 × seq 512，其余训练配置与 absPE 面板完全一致。', '', '| 变体 | absPE (v3_1500) | RoPE+QKnorm (v7) | Δ(RoPE−abs) | params(abs/rope) |', '|---|---|---|---|---|']
     for a, b in pairs:
         ea, eb = (_agg_entry(ab, a), _agg_entry(rope, b))
         if ea is not None and eb is not None:
@@ -556,7 +556,7 @@ def sec_p0r():
             lines.append(f'| `{a}` | {fm(pa)} {sp(ea.get('ppl_std'))} | {fm(pb)} {sp(eb.get('ppl_std'))} | **{pb - pa:+.2f}** | {_params_m(ea)} / {_params_m(eb)} |')
         else:
             print(f'[report] sec_p0r: `{a}`/`{b}` not both present (config-split or absent) — row omitted')
-    lines += ['', '> 注：表中 Δ(RoPE−abs) 为两臂**各自 seed 集合的均值之差（非配对）**——且跨面板（absPE vs RoPE）本身没有同 seed 配对的意义；显著性主张一律以下文配对检验的口径为准。', '', '**组间差距（决定评审论点是否成立）**：', '']
+    lines += ['', '> 注：表中 Δ(RoPE−abs) 为两臂**各自 seed 集合的均值之差（非配对）**——且跨面板（absPE vs RoPE）本身没有同 seed 配对的意义；显著性主张一律以下文配对检验的口径为准。', '', '**组间差距（决定该论断是否成立）**：', '']
     _cf, _fu = (_agg_entry(ab, 'csa_fixed'), _agg_entry(ab, 'full'))
     _cf_r, _fu_r = (_agg_entry(rope, 'csa_fixed_rope'), _agg_entry(rope, 'full_rope'))
     _mt = _agg_entry(ab, 'full_matched')
@@ -667,7 +667,7 @@ def sec_p0w():
     for (v, w), _m in rec_by_s.items():
         for _sd, _r in sorted(_m.items()):
             grp[v, w].append((_r.get('ppl'), _r.get('ppl_at_switch'), _sd))
-    lines = ['## P0-1 dense→sparse warmup 是否能让 sparse 追平 dense？（评审「必做」项）', '', '**评审论断**：论文 §4.2.2 先训 1T token 的 dense 再在 seq 64K 切 sparse；仓库所有 sparse run 都是 from-scratch，故「渐近线更差」可能是没 warmup 的产物。不给这个实验，「渐近线反转」立不住。', '', '**做法**：`train_warmup` 用**相同全长度 cosine LR**，前 `warm_steps` 步走 dense 前向（复用各 csa/hca 层自己的 `W_kvhead` per-token KV 路径 + 同一 sink，不引入新参数），到点切换为 sparse 并记录切换瞬间 PPL。网格 `warm ∈ {0,5000,10000}`（每格 seed 数以下表 n 列为准），20k 步、seq 512。**两臂参数/步数/token 数/初始 PPL/LR 曲线完全相同**，唯一差异是切点。', '', '| variant | warm_steps | PPL (mean±std) | n | 切换时 PPL |', '|---|---|---|---|---|']
+    lines = ['## P0-1 dense→sparse warmup 是否能让 sparse 追平 dense？（待检验项）', '', '**待检验论断**：论文 §4.2.2 先训 1T token 的 dense 再在 seq 64K 切 sparse；仓库所有 sparse run 都是 from-scratch，故「渐近线更差」可能是没 warmup 的产物。不给这个实验，「渐近线反转」立不住。', '', '**做法**：`train_warmup` 用**相同全长度 cosine LR**，前 `warm_steps` 步走 dense 前向（复用各 csa/hca 层自己的 `W_kvhead` per-token KV 路径 + 同一 sink，不引入新参数），到点切换为 sparse 并记录切换瞬间 PPL。网格 `warm ∈ {0,5000,10000}`（每格 seed 数以下表 n 列为准），20k 步、seq 512。**两臂参数/步数/token 数/初始 PPL/LR 曲线完全相同**，唯一差异是切点。', '', '| variant | warm_steps | PPL (mean±std) | n | 切换时 PPL |', '|---|---|---|---|---|']
     for (v, w), vals in sorted(grp.items()):
         ppls = [p for p, _s, _sd in vals]
         mean = sum(ppls) / len(ppls)
@@ -772,7 +772,7 @@ def sec_p0e():
         if isinstance(_r, dict) and _measurable(_r) and isinstance(_r.get('tokens_seen'), (int, float)) and _r['tokens_seen'] > 0:
             _tok_hdr = f'~{_r['tokens_seen'] / 1e6:.0f}M tokens'
             break
-    lines = [f'## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / {_tok_hdr}）', '', '**评审论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (pooled/mean; ±seed sd) | n | params |', '|---|---|---|---|']
+    lines = [f'## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / {_tok_hdr}）', '', '**待检验论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (pooled/mean; ±seed sd) | n | params |', '|---|---|---|---|']
     for v in sorted(d):
         r = d[v]
         lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
@@ -881,7 +881,7 @@ def sec_p0e():
             elif not (math.isfinite(g_last) and math.isfinite(slope)):
                 verdict = f'**结论：尾段差距统计量不可用**（`g_last` 或 `slope` 非有限值：g_last={g_last!r}、slope={slope!r}），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。上表已剔除非有限的曲线点；若此处仍出现，说明该面板的尾段整体缺失，需补跑。'
             elif g_last <= 0:
-                verdict = f'**结论：渐近线在 {_lastk:g}k 内反演**——`csa_fixed` 追平并超过 dense，评审的 P0-2 质疑成立，此前「worse asymptote」的表述需撤回。'
+                verdict = f'**结论：渐近线在 {_lastk:g}k 内反演**——`csa_fixed` 追平并超过 dense，P0-2 的质疑成立，此前「worse asymptote」的表述需撤回。'
             elif slope < -1e-06:
                 x0 = steps[-1] - g_last * 1000.0 / slope
                 if steps[-1] < x0 <= steps[-1] * 10:
@@ -900,7 +900,7 @@ def sec_p1t():
     if not d:
         return '## P1 选择率错配 / m=1 对照（seq 2048 topk 扫描）— （无结果）\n\n'
     order = ['csa_fix_m1', 'csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fixed']
-    lines = ['## P1 选择率错配 与 m=1(纯 DSA) 对照（seq 2048, topk 扫描）', '', '**评审论断**：仓库 seq 512 时选择率 25%，论文在长序列约 0.2%。`topk` 是主控旋钮，需要扫描；且缺 m=1（纯 DSA，不压缩）对照。', '', '**做法**：seq 2048、1500 步（seed 数见下表），扫描 `topk ∈ {8,32,128,512}` 并加入 `csa_fix_m1`（block_size=1, overlap=0 → 逐 token 选择 = 纯 DSA）。', '', '| variant | PPL (mean±std) | n | 等效选择率 (topk / 实测块数) |', '|---|---|---|---|']
+    lines = ['## P1 选择率错配 与 m=1(纯 DSA) 对照（seq 2048, topk 扫描）', '', '**待检验论断**：仓库 seq 512 时选择率 25%，论文在长序列约 0.2%。`topk` 是主控旋钮，需要扫描；且缺 m=1（纯 DSA，不压缩）对照。', '', '**做法**：seq 2048、1500 步（seed 数见下表），扫描 `topk ∈ {8,32,128,512}` 并加入 `csa_fix_m1`（block_size=1, overlap=0 → 逐 token 选择 = 纯 DSA）。', '', '| variant | PPL (mean±std) | n | 等效选择率 (topk / 实测块数) |', '|---|---|---|---|']
     # Selection rates are computed from the *measured* per-sequence block
     # counts persisted in each run's `stats` (never assumed): for a fixed
     # block size m the panel has n_blocks = seq_len / m blocks, and the
@@ -1060,7 +1060,7 @@ def sec_p1t():
         elif m1m < t8m and m1m < t32m:
             lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最好的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩反而占优——在 seq 2048 / 1500 步的受控训练量下，这是支持「压缩是瓶颈之一」的方向性证据，但三点均值未做配对/族校正，不能单独支撑机制结论。')
         else:
-            lines.append(f'1. m=1（{fm(m1m)}）介于 topk8（{fm(t8m)}）与 topk32（{fm(t32m)}）之间，三点排序非单调{_dir3}；评审「缺 m=1 对照」的质疑得到直接回答，但压缩是否瓶颈需结合显著性判断，此处只作方向性表述。')
+            lines.append(f'1. m=1（{fm(m1m)}）介于 topk8（{fm(t8m)}）与 topk32（{fm(t32m)}）之间，三点排序非单调{_dir3}；「缺 m=1 对照」的质疑得到直接回答，但压缩是否瓶颈需结合显著性判断，此处只作方向性表述。')
     elif _m1_ok:
         lines.append(f'1. m=1 测得 {fm(m1m)}，但 topk8/topk32 至少其一缺失，三点排序不可比——本条只陈述事实，不作「压缩是否瓶颈」的读法。')
     else:
@@ -1127,7 +1127,7 @@ def sec_p1l():
     variants = sorted({r.get('variant') for r in recs if r.get('variant') is not None})
     _seed_key = lambda x: (0, float(x), '') if isinstance(x, (int, float)) and (not isinstance(x, bool)) else (1, 0.0, str(x))
     _seeds_by_v = {v: sorted({r.get('seed') for r in recs if r.get('variant') == v and r.get('seed') is not None}, key=_seed_key) for v in variants}
-    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；`?` = 该格缺少 `truncated` 标记，按不可验证处理（不参与 ratio）；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
+    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**待检验论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；`?` = 该格缺少 `truncated` 标记，按不可验证处理（不参与 ratio）；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
     per_v = {}
     trunc_v = {}
     # Group by variant (preserving order).
@@ -1277,7 +1277,7 @@ def sec_p2s():
     d = agg('results_lm_v5_scale')
     if not d:
         return ''
-    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**评审论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (pooled/mean; ±seed sd) | 文档 bootstrap 95% CI | n | params |', '|---|---|---|---|---|']
+    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**待检验论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (pooled/mean; ±seed sd) | 文档 bootstrap 95% CI | n | params |', '|---|---|---|---|---|']
     _variants = sorted({r.get('variant') for r in d.values() if isinstance(r, dict) and r.get('variant') is not None})
     for v in _variants:
         r = _agg_entry(d, v)

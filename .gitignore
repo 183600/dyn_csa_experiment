@@ -52,7 +52,6 @@ autodl_budget*.json
 算力申请.md
 
 # docs/ 白名单：只保留 design_notes.md
-# （docs/compute_plan.md 已废弃并从仓库删除，不允许再入库/被 CI 恢复）
 docs/*
 !docs/design_notes.md
 docs/compute_plan.md
@@ -106,6 +105,6 @@ fontlist*.json
 results_smoke/
 results_smoke_bench/
 
-# 评审二轮：审计报告与证据归档为本地产物（归档发布到只读位置，不入库）
+# 审计报告与证据归档为本地产物（归档发布到只读位置，不入库）
 audit_report.json
 archive/

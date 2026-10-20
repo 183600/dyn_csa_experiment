@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """audit_gates.py — 可执行审计入口（零实验）。
 
-评审指出九个「目前不能排除、必须进一步验证」的领域。本模块把其中能以
-**代码 + 现有落盘产物**核验的部分变成可运行的审计子命令；不能本地核验的
+本模块把「目前不能仅凭代码排除、必须进一步验证」的领域变成可运行的审计
+子命令，能用**代码 + 现有落盘产物**核验；不能本地核验的
 （需要 GPU 训练 / 需要 ckpt）提供入口与判据，等实验机器上运行。它**不启动
 任何训练**——每个子命令要么零 GPU 读产物，要么纯 CPU 单元测试。
 
@@ -336,7 +336,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             inter = int(np.intersect1d(tr_s, te_s, assume_unique=True).size)
             union = int(tr_s.size + te_s.size - inter)
             jac = (inter / union) if union else 0.0
-            # v11.128: Jaccard on a 4M-vs-65k shingle pair is bounded near
+            # Jaccard on a 4M-vs-65k shingle pair is bounded near
             # 1.6% even when EVERY test shingle occurs in train, so a
             # `jaccard > 0.05` threshold cannot fire.  Two reachable statistics
             # are used instead: the fraction of TEST shingles shared with train,
@@ -925,7 +925,7 @@ def audit_causality():
 def audit_attribution(outdirs=None):
     """动态分块归因审计（零 GPU，读 results_*/summary.json + ckpt 元数据）。
 
-    评审问题：固定块与动态块是否匹配实际块数、压缩率、可读摘要数量和
+    审计口径：固定块与动态块是否匹配实际块数、压缩率、可读摘要数量和
     计算量。本审计从落盘训练记录的 by_len / _stats / 参数量字段重算
     每臂的：参数量、（若启用块统计）块长分布与边界对齐读数，并输出
     「臂间块数是否对齐」的对照表。检查 `attn._stats`（enable_block_stats
@@ -1000,7 +1000,7 @@ def audit_attribution(outdirs=None):
 def audit_boundary(outdirs=None):
     """边界意义审计（零 GPU）：对齐读数必须超过「匹配块长分布的随机切割」。
 
-    评审问题：与标点/词边界的对齐是否超过匹配块长分布的随机基线——否则
+    审计口径：与标点/词边界的对齐是否超过匹配块长分布的随机基线——否则
     「语义边界」是块长分布的伪影。exp_lib 已实现该基线
     （`_random_cut_precision`，两种口径见 design_notes §10）；本审计把
     「对齐精度 − 随机基线」的差值与比值汇总成显式判读。"""
@@ -1237,7 +1237,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
 def audit_failures(outdirs=None):
     """失败集中度（零 GPU）：error/NaN/截断记录按臂分布的读数。
 
-    评审问题：崩溃/NaN/超时是否集中在某些臂；仅保留成功运行是否构成
+    审计口径：崩溃/NaN/超时是否集中在某些臂；仅保留成功运行是否构成
     选择偏差。本审计把 error 记录按 (臂, 错误类型) 计数，并给出描述性
     集中度（不主张显著性——小样本下显著性检验本身功效不足）。"""
     L = _import_exp_lib()
@@ -1273,7 +1273,7 @@ def audit_failures(outdirs=None):
 def audit_metrics(outdirs=None):
     """指标口径审计（零 GPU）：主指标/方向/聚合/不平衡声明 + 落盘记录核验。
 
-    评审要求：类别不平衡不能只看 accuracy；多分类 F1 必须注明 macro/
+    审计口径：类别不平衡不能只看 accuracy；多分类 F1 必须注明 macro/
     micro/weighted；极度不平衡优先 PR-AUC；指标必须对齐任务目标。本审计
     先检查 `exp_lib.METRIC_POLICY` 是否完整声明，再对本地面板检查边界
     指标是否同时给出 precision/recall/随机基线、NIAH 是否同时给出 answer
@@ -1533,7 +1533,7 @@ def audit_efficiency_demo():
 def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
     """Zero-GPU audit of MEASURED prefill time between arms.
 
-    The review's efficiency point is not "is there a timing field" but "is a
+    The efficiency question is not "is there a timing field" but "is a
     speed/cheapness claim supported".  This audit pairs records only when both
     arms have `efficiency.status == 'ok'` at the SAME token count, on the same
     device and torch version, with the same KV-cache semantics; it reports the
@@ -1611,7 +1611,7 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
 def audit_release_readiness(path='RELEASES.md'):
     """Zero-GPU check that a numeric claim has an auditable evidence release.
 
-    The review's point 17: "reproducible code" is not "auditable results".
+    "Reproducible code" is not "auditable results".
     This audit parses the tracked release index and refuses to call the
     repository auditable unless at least one row names a commit, an archive
     URL, both SHA-256 digests and a verifier.  It also reports whether the

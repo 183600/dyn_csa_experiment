@@ -47,8 +47,8 @@ def make_guard():
     return g
 
 def P4MT_CFG(seeds=(0, 1, 2, 3, 4, 5)):
-    # P3MT_PAYLOAD 变体列表已扩展（v10 评审响应：从头训练控制），但 P4MT 的语义
-    # 是「既有 RoPE 双臂的种子补齐」——显式钉死原始两臂，不受 v10 扩展影响。
+    # P4MT 的语义是「既有 RoPE 双臂的种子补齐」——显式钉死这两臂，
+    # 不受 P3MT_PAYLOAD 扩展的影响。
     return dict(V10.P3MT_PAYLOAD, seeds=list(seeds), variants=['csa_fixed_rope', 'full_rope'])
 
 def run_p4mt(payload=None, guard=None, label='v11 P4MT', par=None):
