@@ -1499,3 +1499,9 @@ M0 的跨规模 log-PPL 效应过去只按 `(variant, seed)` 取 PPL。种子编
 `common_seeds_sufficient_for_family`；共同种子不足以达到族下限时给出
 warning，并明确「某一层多跑的 seed 不能修补另一层缺的 seed」。这样在
 GPU 时间被消耗前就能看出阶梯是否具备可确认的配对证据。
+
+M0 的跨规模配对同时改为读取记录的**主估计量**：嵌套调参记录声明
+`ppl_estimation_rows='nested_validation_holdout'` 时，逐种子值取
+`ppl_holdout`（或 holdout NLL 记账），不再读仍包含选参行的全验证
+`ppl`；声明嵌套却缺 holdout 记账的记录按「未测量」处理，而不是静默回退
+到全验证值。这样规模效应与面板汇总/报告使用的是同一个样本。

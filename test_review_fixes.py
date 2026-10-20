@@ -7744,6 +7744,28 @@ def t_m0_cross_scale_pairs_are_control_gated():
     assert len(gated) == 1 and gated[0][0] == 1, gated
     assert 'run_cfg' in gated[0][1], gated
     assert paired[0] == (10.0, 11.0), paired
+    # Nested tuning records: cross-scale pairing must use the held-out primary
+    # estimand, not the full-validation `ppl` that still contains the rows
+    # which selected the hyper-parameters.  A nested record without holdout
+    # accounting is dropped (visible as gated), never silently replaced.
+    def _nested(v, seed, cfg, full, hold):
+        r = _rec(v, seed, cfg, full)
+        r.update({'ppl_estimation_rows': 'nested_validation_holdout',
+                  'ppl_holdout': hold})
+        return r
+    nested = {
+        'a::seed0': _nested('a', 0, fp, 99.0, 10.0),
+        'a::seed1': _nested('a', 1, fp, 99.0, 10.5),
+        'b::seed0': _nested('b', 0, fp, 1.0, 11.0),
+        'b::seed1': {k: v for k, v in _nested('b', 1, fp, 1.0, 11.5).items()
+                     if k not in ('ppl_holdout',)},
+    }
+    np_paired, np_gated = M0._paired_ppl_by_seed(nested, 'a', 'b')
+    assert np_paired == {0: (10.0, 11.0)}, (np_paired, np_gated)
+    # Seed 1's b record declares the nested estimand but has no holdout
+    # accounting, so it is not a measurable pair; the raw full-validation
+    # values (99 vs 1) must not re-enter the analysis.
+    assert np_gated == [], np_gated
     # Escalating tier labels must not make S10 look smaller than S2.
     pts = [{'label': 'S10', 'scale': 1000.0}, {'label': 'S2', 'scale': 10.0},
            {'label': 'S1', 'scale': 1.0}]

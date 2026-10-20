@@ -570,12 +570,22 @@ B_SCALE_DESIGN = {
 }
 
 
-def _records_by_seed(summary, variant):
+def _records_by_seed(summary, variant, *, primary=False):
+    """Measurable records for one arm, keyed by seed.
+
+    ``primary=True`` selects the record's PRIMARY estimand: a nested tuning
+    record's full-validation ``ppl`` contains the rows that selected its
+    hyper-parameters, so cross-scale pairing must use the holdout PPL (or its
+    held-out NLL accounting) exactly like the panel aggregate does.  A record
+    that declares the nested estimand but lacks holdout accounting is skipped,
+    never silently replaced by the leaky full-validation number.
+    """
     out = {}
     for rec in summary.values():
         if not isinstance(rec, dict) or rec.get('variant') != variant:
             continue
-        if not L.ppl_is_usable(rec.get('ppl')):
+        _value = L._record_primary_ppl(rec) if primary else rec.get('ppl')
+        if not L.ppl_is_usable(_value):
             continue
         seed = L._as_seed_int(rec.get('seed'))
         if seed is None:
@@ -606,14 +616,21 @@ def _paired_ppl_by_seed(summary, variant_a, variant_b):
     train_knobs, steps/tokens); any seed it refuses is dropped and reported,
     not silently averaged into a scale point.
     """
-    ra, rb = _records_by_seed(summary, variant_a), _records_by_seed(summary, variant_b)
+    ra = _records_by_seed(summary, variant_a, primary=True)
+    rb = _records_by_seed(summary, variant_b, primary=True)
     paired, gated = {}, []
     for seed in sorted(set(ra) & set(rb)):
         reason = L.pair_reason(ra[seed], rb[seed])
         if reason:
             gated.append((seed, reason))
             continue
-        paired[seed] = (float(ra[seed]['ppl']), float(rb[seed]['ppl']))
+        _a = L._record_primary_ppl(ra[seed])
+        _b = L._record_primary_ppl(rb[seed])
+        if not (L.ppl_is_usable(_a) and L.ppl_is_usable(_b)):
+            gated.append((seed, 'primary estimand missing (nested record '
+                                'without holdout PPL/NLL accounting)'))
+            continue
+        paired[seed] = (float(_a), float(_b))
     return paired, gated
 
 
