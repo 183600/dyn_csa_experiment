@@ -67,6 +67,51 @@ def _mean_std(values):
     return mean, std
 
 
+def _protocol_arm_groups(protocol, base, arms):
+    """Resolve the protocol's arm groups, falling back to one legacy group.
+
+    Groups exist because the v6 arms and the frozen v12 rope arms parameter-
+    match against DIFFERENT reference arms (csa_dynamic vs csa_fixed_rope),
+    so they cannot share a single panel config.  Within a group the matched
+    set / mlp_match_ref override the base config; across groups the declared
+    trials, search seeds and selection split stay identical, so the
+    equal-search contract covers the union of arms.
+    """
+    declared = list(arms)
+    raw = protocol.get('arm_groups')
+    groups = []
+    if raw:
+        for g in raw:
+            if not isinstance(g, dict) or not isinstance(g.get('arms'), (list, tuple)):
+                raise ValueError(f'arm group must be a dict with an arms list, got {g!r}')
+            groups.append(dict(g))
+    else:
+        groups = [{'arms': declared, 'matched': base.get('matched'),
+                   'mlp_match_ref': base.get('mlp_match_ref', 'csa_dynamic')}]
+    seen = []
+    for g in groups:
+        for a in g['arms']:
+            if a in seen:
+                raise ValueError(f'arm {a!r} appears in more than one tuning group')
+            seen.append(a)
+    if raw and sorted(seen) != sorted(declared):
+        raise ValueError(f'arm_groups cover {sorted(seen)} but the protocol declares {sorted(declared)}')
+    if not raw:
+        groups[0]['arms'] = declared
+    return groups
+
+
+def _group_overrides(base, group):
+    cfg_over = {}
+    matched = group.get('matched')
+    if matched is not None:
+        cfg_over['matched'] = {str(x) for x in matched}
+    ref = group.get('mlp_match_ref')
+    if ref:
+        cfg_over['mlp_match_ref'] = str(ref)
+    return cfg_over
+
+
 def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                trial_limit=None, search_steps=None, final=True):
     """Run the declared grid, select per arm on validation PPL, then optionally
@@ -75,6 +120,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     declared_trials = list(protocol['trials'])
     base = dict(L.RUN if base_cfg is None else base_cfg)
     arms = list(protocol['arms'])
+    groups = _protocol_arm_groups(protocol, base, arms)
     trials = list(protocol['trials'])
     if trial_limit is not None:
         trials = trials[:max(1, int(trial_limit))]
@@ -98,16 +144,18 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     if not search_seeds:
         raise ValueError('search_seeds must contain at least one seed')
     os.makedirs(outdir, exist_ok=True)
-    print(f'[tune] equal-search grid: {len(arms)} arms x {len(trials)} trials x {search_steps} steps x {len(search_seeds)} seed(s), selection={protocol["selection_metric"]} on {protocol["selection_split"]}')
+    print(f'[tune] equal-search grid: {len(arms)} arms ({len(groups)} group(s)) x {len(trials)} trials x {search_steps} steps x {len(search_seeds)} seed(s), selection={protocol["selection_metric"]} on {protocol["selection_split"]}')
     _arch = {'d': int(base.get('d', 256)), 'n_layers': int(base.get('n_layers', 6)),
              'n_heads': int(base.get('n_heads', 8)), 'd_head': int(base.get('d_head', 32))}
     _pre_vocab = int(base.get('vocab_size') or 1024)
     _pre_ratios = {}
-    for _a in arms:
-        try:
-            _pre_ratios[_a] = L.variant_mlp_ratio(_a, _pre_vocab, d=_arch['d'], n_layers=_arch['n_layers'], n_heads=_arch['n_heads'], d_head=_arch['d_head'], seq_len=int(base.get('seq_len', 512)), matched=base.get('matched'), ref_variant=base.get('mlp_match_ref', 'csa_dynamic'))
-        except Exception:
-            _pre_ratios[_a] = None
+    for _grp in groups:
+        _ov = _group_overrides(base, _grp)
+        for _a in _grp['arms']:
+            try:
+                _pre_ratios[_a] = L.variant_mlp_ratio(_a, _pre_vocab, d=_arch['d'], n_layers=_arch['n_layers'], n_heads=_arch['n_heads'], d_head=_arch['d_head'], seq_len=int(base.get('seq_len', 512)), matched=_ov.get('matched'), ref_variant=_ov.get('mlp_match_ref', 'csa_dynamic'))
+            except Exception:
+                _pre_ratios[_a] = None
     L.overfit_guard(arms, steps=200, vocab=_pre_vocab,
                     seq_len=L.probe_seq_len(base.get('seq_len', 512)),
                     arch=_arch, mlp_ratio=_pre_ratios)
@@ -115,39 +163,42 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     _prov_any = None
     _data_version_any = None
     for ti, knobs in enumerate(trials):
-        tdir = os.path.join(outdir, f'trial_{ti:02d}')
-        cfg = _trial_cfg(base, tdir, arms, search_seeds, search_steps, knobs)
-        L.run(cfg, seeds=search_seeds, guard=None, label=f'baseline tuning trial {ti + 1}/{len(trials)}')
-        summary = json.load(open(os.path.join(tdir, 'summary.json'), encoding='utf-8'))
-        for arm in arms:
-            records = {}
-            for seed in search_seeds:
-                rec = _one_seed_record(summary, arm, seed)
-                if rec is not None:
-                    records[seed] = rec
-            if not records:
-                print(f'[tune] WARNING: {arm} has no measurable PPL in trial {ti} ({tdir})')
-                continue
-            if len(records) < len(search_seeds):
-                print(f'[tune] WARNING: {arm} trial {ti} has only seeds {sorted(records)} of {search_seeds}; '
-                      'selection uses the observed seeds and the artifact records the gap')
-            if _prov_any is None:
-                _prov_any = records[sorted(records)[0]].get('provenance')
-                _data_version_any = records[sorted(records)[0]].get('data_version')
-            mean, std = _mean_std([records[s]['ppl'] for s in sorted(records)])
-            _steps = {int(records[s]['steps']) for s in records if records[s].get('steps') is not None}
-            _tokens = {int(records[s]['tokens_seen']) for s in records if records[s].get('tokens_seen') is not None}
-            per_arm[arm].append({
-                'config': dict(knobs), 'ppl': mean, 'ppl_std': std,
-                'n_seeds': len(records), 'seeds': sorted(records),
-                'seed_ppls': {str(s): float(records[s]['ppl']) for s in sorted(records)},
-                'params': records[sorted(records)[0]].get('params'),
-                'steps': (next(iter(_steps)) if len(_steps) == 1 else None),
-                'tokens_seen': (next(iter(_tokens)) if len(_tokens) == 1 else None),
-                'budget_by_seed': {str(s): [records[s].get('steps'), records[s].get('tokens_seen')]
-                                   for s in sorted(records)},
-                'run_cfg': records[sorted(records)[0]].get('run_cfg'), 'outdir': tdir,
-            })
+        for _grp in groups:
+            _ov = _group_overrides(base, _grp)
+            tdir = os.path.join(outdir, f'trial_{ti:02d}')
+            cfg = _trial_cfg(base, tdir, _grp['arms'], search_seeds, search_steps, knobs)
+            cfg.update(_ov)
+            L.run(cfg, seeds=search_seeds, guard=None, label=f'baseline tuning trial {ti + 1}/{len(trials)} ({"/".join(_grp["arms"])})')
+            summary = json.load(open(os.path.join(tdir, 'summary.json'), encoding='utf-8'))
+            for arm in _grp['arms']:
+                records = {}
+                for seed in search_seeds:
+                    rec = _one_seed_record(summary, arm, seed)
+                    if rec is not None:
+                        records[seed] = rec
+                if not records:
+                    print(f'[tune] WARNING: {arm} has no measurable PPL in trial {ti} ({tdir})')
+                    continue
+                if len(records) < len(search_seeds):
+                    print(f'[tune] WARNING: {arm} trial {ti} has only seeds {sorted(records)} of {search_seeds}; '
+                          'selection uses the observed seeds and the artifact records the gap')
+                if _prov_any is None:
+                    _prov_any = records[sorted(records)[0]].get('provenance')
+                    _data_version_any = records[sorted(records)[0]].get('data_version')
+                mean, std = _mean_std([records[s]['ppl'] for s in sorted(records)])
+                _steps = {int(records[s]['steps']) for s in records if records[s].get('steps') is not None}
+                _tokens = {int(records[s]['tokens_seen']) for s in records if records[s].get('tokens_seen') is not None}
+                per_arm[arm].append({
+                    'config': dict(knobs), 'ppl': mean, 'ppl_std': std,
+                    'n_seeds': len(records), 'seeds': sorted(records),
+                    'seed_ppls': {str(s): float(records[s]['ppl']) for s in sorted(records)},
+                    'params': records[sorted(records)[0]].get('params'),
+                    'steps': (next(iter(_steps)) if len(_steps) == 1 else None),
+                    'tokens_seen': (next(iter(_tokens)) if len(_tokens) == 1 else None),
+                    'budget_by_seed': {str(s): [records[s].get('steps'), records[s].get('tokens_seen')]
+                                       for s in sorted(records)},
+                    'run_cfg': records[sorted(records)[0]].get('run_cfg'), 'outdir': tdir,
+                })
     selected = {}
     for arm in arms:
         hits = [t for t in per_arm[arm] if L.ppl_is_usable(t.get('ppl'))]
@@ -233,12 +284,18 @@ def _relaxed_pair_reason(a, b, tuned_arms):
 
 def _run_final(base, outdir, protocol, selected):
     final_seeds = [int(s) for s in protocol.get('final_seeds', [])]
+    _groups = _protocol_arm_groups(protocol, base, list(selected))
+    _arm_group = {}
+    for _grp in _groups:
+        for _a in _grp['arms']:
+            _arm_group[_a] = _grp
     final_dir = os.path.join(outdir, 'final')
     os.makedirs(final_dir, exist_ok=True)
     merged = {}
     for arm, entry in selected.items():
         adir = os.path.join(final_dir, arm)
         cfg = dict(base, outdir=adir, variants=[arm], seeds=final_seeds)
+        cfg.update(_group_overrides(base, _arm_group.get(arm) or {}))
         cfg.update(lr=float(entry['selected']['lr']),
                    weight_decay=float(entry['selected']['weight_decay']),
                    warmup=int(entry['selected']['warmup']))

@@ -10019,14 +10019,34 @@ BASELINE_TUNING_PROTOCOL = {
     # of seed noise; every arm and every trial uses the same set.
     'search_seeds': [0, 1, 2],
     'final_seeds': [0, 1, 2],
-    'arms': ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic'],
+    'arms': ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic',
+             'csa_fixed_rope', 'full_rope'],
+    # The v6 arms and the frozen v12 confirmatory arms have DIFFERENT
+    # parameter-matching references (csa_dynamic vs csa_fixed_rope), so they
+    # cannot share one panel config.  `arm_groups` runs each group under its
+    # own matched/mlp_match_ref while keeping the SAME declared trials, the
+    # SAME search-seed set and the SAME selection split, so the equal-search
+    # contract holds across the union of arms.
+    'arm_groups': [
+        {'arms': ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic'],
+         'matched': ['full_matched', 'full_sw128_matched'], 'mlp_match_ref': 'csa_dynamic',
+         'method_arm': 'csa_dynamic'},
+        {'arms': ['csa_fixed_rope', 'full_rope'],
+         'matched': ['full_rope'], 'mlp_match_ref': 'csa_fixed_rope',
+         'method_arm': 'csa_fixed_rope'},
+    ],
+    # Budget-matched intervention controls share the csa_fixed_rope recipe and
+    # training budget, so their equal-search evidence is inherited from the arm
+    # they intervene on.  The audit resolves coverage through this map.
+    'inherits_tuning': {'csa_fixed_rope_randidx': 'csa_fixed_rope',
+                        'csa_fixed_rope_allblocks': 'csa_fixed_rope'},
     'trials': [
         {'lr': 0.0001, 'weight_decay': 0.1, 'warmup': 50},
         {'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 50},
         {'lr': 0.0003, 'weight_decay': 0.05, 'warmup': 50},
         {'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 100},
     ],
-    'note': 'Every arm gets the same declared trials, the same search-seed set and the same selection split. Selection uses mean validation PPL across search_seeds (std recorded); a single-seed draw can win on noise. Final seeds re-use only the validation-selected config and are reported as mean±std. A tuning trial may never read the held-out test split; test is used once after selection.',
+    'note': 'Every arm gets the same declared trials, the same search-seed set and the same selection split. Selection uses mean validation PPL across search_seeds (std recorded); a single-seed draw can win on noise. Final seeds re-use only the validation-selected config and are reported as mean±std. A tuning trial may never read the held-out test split; test is used once after selection. The rope group covers the frozen v12 confirmatory arms: without equal-search evidence for csa_fixed_rope/full_rope, the confirmatory comparison cannot be quoted as "beats a tuned baseline" — it is only a comparison at the frozen default hyperparameters.',
 }
 
 # 最简单基线协议（先立地板，再谈复杂模型）：语言模型的 trivial floor 是
