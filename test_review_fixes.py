@@ -5582,7 +5582,8 @@ def t_methodology_gate_fail_closed_edges():
         assert BR.holm_adjust([('a', _p), ('b', 0.02)])['a'] == 1.0, _p
     for _bad in (True, np.bool_(True), 0, 1, -0.1, 1.5, float('nan')):
         for _fn in (lambda a: BR.holm_adjust([('a', 0.01)], alpha=a),
-                    lambda a: BR.global_multiplicity_adjust([('a', 0.01)], alpha=a)):
+                    lambda a: BR.global_multiplicity_adjust([('a', 0.01)], alpha=a),
+                    lambda a: L.holm_min_attainable_p(6, 4, a)):
             try:
                 _fn(_bad)
             except ValueError:

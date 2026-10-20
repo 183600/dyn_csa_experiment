@@ -9430,6 +9430,10 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     最小可达 p_holm = min(1, m * 2/2^n)。若该值 > alpha，则该方案在构造上
     无法确认任何比较——这是分辨率上限，不是「保守的选择」，应当在读到
     任何测试数据之前修订（加种子 / 缩族 / 改检验），而不是事后再解释。"""
+    # The threshold is part of the public planning API even though the floor
+    # itself is alpha-independent; validate it so an invalid gate cannot be
+    # echoed next to a "sufficient plan" verdict.
+    _validated_alpha(alpha, context='holm_min_attainable_p alpha')
     n = _as_seed_int(n_seeds)
     m = _as_seed_int(m_comparisons)
     if n is None or m is None or n <= 0 or m <= 0:
