@@ -201,6 +201,18 @@ def _signflip_saddlepoint_p(values):
     return float(min(1.0, max(floor, p))), 'saddlepoint'
 
 
+def _signflip_floor(n):
+    """Two-sided sign-flip resolution floor 2/2**n (independent of the branch
+    used to compute p; exact, MITM and saddlepoint all obey it)."""
+    try:
+        ni = int(n)
+    except (TypeError, ValueError, OverflowError):
+        return float('nan')
+    if isinstance(n, (bool, np.bool_)) or ni <= 0 or ni != n:
+        return float('nan')
+    return math.ldexp(2.0, -ni)
+
+
 def exact_signflip(deltas):
     # Same scalar contract as exp_lib.exact_signflip_p: NumPy integers and
     # floats are measurements too, non-finite/boolean values are not.
@@ -757,7 +769,9 @@ def sec_p0w():
             if _st is None:
                 continue
             _d = _st['mean']
-            _floor = 2.0 / (1 << _st['n']) if _st['n'] and _st['n'] <= 20 else 1.0 / 200001.0
+            # The two-sided exact/saddlepoint floor is 2/2**n for EVERY n;
+            # the old >20 branch showed a Monte-Carlo-like 1/200001 instead.
+            _floor = _signflip_floor(_st.get('n'))
             _same_dir = all((x != 0 and (x > 0) == (_d > 0) for x in _dd))
             _gate_ok = _sig_gate(_st, label=f'P0W csa_fixed warm={w} vs warm=0', family='P0W')
             if not _gate_ok:

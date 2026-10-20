@@ -596,7 +596,9 @@ def main(argv=None):
     elif _f1_sig:
         _c1 = f'1. **同面板配对下 fuse 显著改变了边界 F1**：hybrid 栈按 seed 配对（n={_n_p}），ΔF1 = **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}** < 0.05——「F1 差不稳固」的读法在本轮产物上不成立。\n'
     else:
-        _f1_floor = (2.0 / (1 << _n_p) if _n_p <= 20 else 1.0 / 200001.0) if isinstance(_n_p, int) and _n_p > 0 else float('nan')
+        _f1_floor = (L.signflip_p_floor(_n_p)
+                     if isinstance(_n_p, int) and not isinstance(_n_p, bool) and _n_p > 0
+                     else float('nan'))
         _f1_floor_txt = f'p 值打在 n={_n_p} 的分辨率下限上，不能排除是噪声' if _f1_p is not None and math.isfinite(_f1_floor) and (abs(_f1_p - _f1_floor) < 1e-12) else f'p={_pv('p_f1', '{:.3f}')}，高于 n={_n_p or '?'} 的分辨率下限 {_f1_floor:.3f}，不能排除是噪声'
         _x_f1 = probe.get('x_d_f1')
         if _x_f1 is None or not np.isfinite(_x_f1):
@@ -609,7 +611,9 @@ def main(argv=None):
     elif _ppl_sig:
         _c3 = f'3. **PPL 存在可分辨的差异**：同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')} < 0.05），「PPL 不变」的读法在本轮产物上不成立。\n'
     else:
-        _ppl_floor = (2.0 / (1 << _n_pp) if _n_pp <= 20 else 1.0 / 200001.0) if isinstance(_n_pp, int) and _n_pp > 0 else float('nan')
+        _ppl_floor = (L.signflip_p_floor(_n_pp)
+                      if isinstance(_n_pp, int) and not isinstance(_n_pp, bool) and _n_pp > 0
+                      else float('nan'))
         _ppl_floor_txt = f'配对符号翻转 p 值打在 n={_n_pp} 的分辨率下限上，任何差异不能排除是种子噪声' if _ppl_p is not None and math.isfinite(_ppl_floor) and (abs(_ppl_p - _ppl_floor) < 1e-12) else f'配对符号翻转 p={_pv('p_ppl', '{:.3f}')}，高于 n={_n_pp or '?'} 的分辨率下限 {_ppl_floor:.3f}，任何差异不能排除是种子噪声'
         _x_ppl = probe.get('x_d_ppl_csa')
         _x_ppl_txt = f'，跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL' if _x_ppl is not None and np.isfinite(_x_ppl) else '，跨面板纯 CSA 对比未测量'
