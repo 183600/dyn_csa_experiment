@@ -4203,6 +4203,17 @@ def t_reportable_claim_gate():
     # Booleans are also not effect measurements.
     assert L.reportable_claim(dict(base, mean=True, std=0.2))['allowed'] is False
     assert L.reportable_claim(dict(base, mean=-1.0, std=False))['allowed'] is False
+    # The gate's own parameters must not be silently coerced.  int(5.9)->5
+    # would loosen the n floor, and int(True)->1 for family_size would turn a
+    # flag into a one-comparison family; both must fail closed.
+    for _bad_min in (5.9, True, float('nan'), 0):
+        r = L.reportable_claim(base, min_n=_bad_min)
+        assert r['allowed'] is False, (r, _bad_min)
+        assert any('min_n' in x for x in r['reasons']), r
+    for _bad_fam in (0, -3, True, 3.5, float('nan')):
+        r = L.reportable_claim(base, family_size=_bad_fam)
+        assert r['allowed'] is False, (r, _bad_fam)
+        assert any('family_size' in x for x in r['reasons']), r
 
 
     # Probabilities outside [0,1] cannot support a claim, even when every

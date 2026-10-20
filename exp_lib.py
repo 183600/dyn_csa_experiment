@@ -8815,10 +8815,18 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     "significant"/"confirmed" and records exactly why.
     """
     alpha = _validated_alpha(alpha)
+    # min_n and family_size are gate parameters, not measurements: silently
+    # truncating 5.9 to 5 (or accepting True as 1) would change which claims
+    # the gate allows.  Treat an invalid value as unverifiable and refuse the
+    # wording instead of coercing it.
+    _min_n = _as_seed_int(min_n)
     out = {'allowed': False, 'level': 'unverifiable', 'reasons': [],
            'n': None, 'p_raw': None, 'p_holm': None, 'p_floor': None,
-           'min_attainable_p_holm_family': None, 'min_n': int(min_n),
+           'min_attainable_p_holm_family': None, 'min_n': _min_n,
            'alpha': alpha}
+    if _min_n is None or _min_n < 1:
+        out['reasons'].append(
+            f'min_n={min_n!r} is not a positive integer; the n floor is unverifiable')
     if not isinstance(stats, dict):
         out['reasons'].append('not a statistics dict')
         return out
@@ -8862,8 +8870,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             f'{_n_dropped} paired observation(s) were dropped as non-finite '
             f'(n_input={_n_input}); complete-case significance is not a '
             'complete-panel result')
-    if n < int(min_n):
-        out['reasons'].append(f'n={n} < min_n={int(min_n)}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={int(min_n)}')
+    if _min_n is not None and _min_n >= 1 and n < _min_n:
+        out['reasons'].append(f'n={n} < min_n={_min_n}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={_min_n}')
     elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > alpha:
         out['reasons'].append(f'p floor {out["p_floor"]:.3g} > alpha={alpha}: resolution ceiling, not a null result')
     try:
@@ -8898,17 +8906,20 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     if isinstance(_seed_driven, (bool, np.bool_)) and bool(_seed_driven):
         out['reasons'].append('leave-one-seed-out stability fails: dropping one seed flips the mean sign')
     if family_size is not None:
-        try:
-            _fl = holm_min_attainable_p(n, int(family_size), alpha)
-        except Exception:
-            _fl = None
-        out['min_attainable_p_holm_family'] = _fl
-        if _fl is not None and math.isfinite(_fl) and _fl > alpha:
-            out['reasons'].append(f'family of m={int(family_size)} at n={n} has minimum attainable Holm p {_fl:.4g} > alpha')
+        _fam_n = _as_seed_int(family_size)
+        if _fam_n is None or _fam_n < 1:
+            out['reasons'].append(
+                f'family_size={family_size!r} is not a positive integer; '
+                'the family resolution ceiling is unverifiable')
+        else:
+            _fl = holm_min_attainable_p(n, _fam_n, alpha)
+            out['min_attainable_p_holm_family'] = _fl
+            if _fl is not None and math.isfinite(_fl) and _fl > alpha:
+                out['reasons'].append(f'family of m={_fam_n} at n={n} has minimum attainable Holm p {_fl:.4g} > alpha')
     out['allowed'] = not out['reasons']
     if out['allowed']:
         out['level'] = 'confirmatory' if str(evidence_level).lower() == 'confirmatory' else 'exploratory_significant'
-    elif n < int(min_n):
+    elif _min_n is not None and _min_n >= 1 and n < _min_n:
         # Underpowered is the actionable label; the resolution ceiling is the
         # reason (both are recorded in `reasons`).
         out['level'] = 'underpowered'
