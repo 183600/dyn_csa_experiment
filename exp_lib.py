@@ -13400,12 +13400,8 @@ def _binary_positive_vector(y_true, positive_label=None):
     return (y == pos).astype(np.int64), pos, uniq
 
 
-def _binary_threshold_metrics(y_bin, score, threshold):
-    pred = np.asarray(score) >= float(threshold)
-    tp = int(np.sum(pred & (y_bin == 1)))
-    fp = int(np.sum(pred & (y_bin == 0)))
-    fn = int(np.sum((~pred) & (y_bin == 1)))
-    tn = int(np.sum((~pred) & (y_bin == 0)))
+def _threshold_row_from_counts(tp, fp, fn, tn, threshold):
+    tp, fp, fn, tn = int(tp), int(fp), int(fn), int(tn)
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
@@ -13416,7 +13412,15 @@ def _binary_threshold_metrics(y_bin, score, threshold):
             'balanced_accuracy': 0.5 * (recall + specificity),
             'youden_j': recall + specificity - 1.0,
             'predicted_positive': int(tp + fp),
-            'predicted_positive_rate': float((tp + fp) / max(y_bin.size, 1))}
+            'predicted_positive_rate': float((tp + fp) / max(tp + fp + fn + tn, 1))}
+
+
+def _binary_threshold_metrics(y_bin, score, threshold):
+    pred = np.asarray(score) >= float(threshold)
+    return _threshold_row_from_counts(
+        np.sum(pred & (y_bin == 1)), np.sum(pred & (y_bin == 0)),
+        np.sum((~pred) & (y_bin == 1)), np.sum((~pred) & (y_bin == 0)),
+        threshold)
 
 
 def _binary_calibration(y_bin, score, n_bins=10):
@@ -13468,12 +13472,20 @@ def binary_threshold_curve(y_true, y_score, *, positive_label=None, thresholds=N
         raise ValueError(f'y_score {score.shape} and y_true {y_bin.shape} differ')
     if not np.all(np.isfinite(score)):
         raise ValueError('y_score contains NaN/Inf; a threshold cannot be selected from non-finite scores')
+    n_pos = int(y_bin.sum())
+    n_neg = int(y_bin.size - n_pos)
+    order = np.argsort(-score, kind='mergesort')
+    sorted_score = score[order]
+    tp_cum = np.cumsum(y_bin[order])
+    fp_cum = np.cumsum(1 - y_bin[order])
+    asc = sorted_score[::-1]
     if thresholds is None:
-        cand = np.unique(score)
+        last = np.r_[np.nonzero(np.diff(sorted_score))[0], sorted_score.size - 1]
+        cand = np.unique(sorted_score[last])
         truncated = False
         if cand.size > int(max_thresholds):
             keep = np.linspace(0, cand.size - 1, int(max_thresholds)).astype(np.int64)
-            cand = np.unique(cand[keep])
+            cand = cand[keep]
             truncated = True
     else:
         cand = np.asarray(list(thresholds), dtype=float).ravel()
@@ -13481,7 +13493,15 @@ def binary_threshold_curve(y_true, y_score, *, positive_label=None, thresholds=N
             raise ValueError('thresholds must be a non-empty finite sequence')
         cand = np.unique(cand)
         truncated = False
-    rows = [_binary_threshold_metrics(y_bin, score, t) for t in cand]
+    rows = []
+    for t in cand:
+        k = int(score.size - np.searchsorted(asc, float(t), side='left'))
+        if k <= 0:
+            tp = fp = 0
+        else:
+            tp, fp = int(tp_cum[k - 1]), int(fp_cum[k - 1])
+        rows.append(_threshold_row_from_counts(tp, fp, n_pos - tp, n_neg - fp, t))
+    rows.sort(key=lambda r: r['threshold'])
     default = _binary_threshold_metrics(y_bin, score, 0.5)
     if not rows:
         raise ValueError('no candidate threshold could be scored')

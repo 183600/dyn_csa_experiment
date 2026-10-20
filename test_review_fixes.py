@@ -4612,6 +4612,20 @@ def t_binary_threshold_and_calibration_contract():
     sel = L.select_binary_threshold(y, score, positive_label=1)
     assert sel['threshold'] == 0.4 and sel['value'] == 1.0, sel
     assert sel['chance_f1_at_default_rule'] == sel['prevalence'] == 0.1, sel
+    # The sweep is linear-time via cumulative counts; it must equal the
+    # brute-force confusion matrix at every candidate, including score ties.
+    _rng = np.random.default_rng(7)
+    for _ in range(5):
+        _yy = _rng.integers(0, 2, size=60)
+        _ss = np.round(_rng.random(60), 1)
+        if _yy.sum() in (0, 60):
+            continue
+        _c = L.binary_threshold_curve(_yy, _ss)
+        for _row in _c['thresholds']:
+            _b = L._binary_threshold_metrics(_yy, _ss, _row['threshold'])
+            assert (_row['tp'], _row['fp'], _row['tn'], _row['fn']) == (
+                _b['tp'], _b['fp'], _b['tn'], _b['fn']), (_row, _b)
+            assert abs(_row['f1'] - _b['f1']) < 1e-12, (_row, _b)
     # The default cut is recorded rather than silently assumed.
     m = L.classification_metrics(y, y_score=score, labels=[0, 1], threshold_sweep=True)
     assert m['decision_threshold'] == 0.5 and m['decision_threshold_source'] == 'default_0.5', m
