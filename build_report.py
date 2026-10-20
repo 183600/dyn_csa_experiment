@@ -2030,6 +2030,24 @@ def _render_error_analysis(d):
         for c, n in sorted(_counts, key=lambda kv: (-kv[1], kv[0])):
             lines.append('| %s | %d | %s |' % (c, n, str((guide or {}).get(c) or '').replace('|', '\\|')))
         lines.append('')
+    allc = d.get('cause_counts_all') or {}
+    if isinstance(allc, dict) and allc:
+        lines += ['**Whole-split cause tally (finite targets, heuristic):**', '',
+                  '| cause | n | share | mean CE |', '|---|---|---|---|']
+        _all = []
+        for c, v in allc.items():
+            if not isinstance(v, dict):
+                continue
+            try:
+                n = int(v.get('n') or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if n > 0:
+                _all.append((str(c), n, _as_finite(v.get('share')), _as_finite(v.get('mean_ce'))))
+        for c, n, share, mce in sorted(_all, key=lambda t: (-t[1], t[0])):
+            lines.append('| %s | %d | %s | %s |' % (
+                c, n, (f'{share * 100:.1f}%' if share is not None else 'n/a'), fm(mce, 3)))
+        lines.append('')
     tokens = d.get('worst_tokens') or []
     if tokens:
         lines += ['| # | row | pos | CE | target | predicted | cause |', '|---|---|---|---|---|---|---|']

@@ -21244,6 +21244,11 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     _nb = len(_bucket_names)
     _bsum = torch.zeros(_nb, dtype=torch.float64, device=device)
     _bcnt = torch.zeros(_nb, dtype=torch.long, device=device)
+    _cause_names_all = ['annotation_or_rare_target', 'ambiguous_context',
+                        'confident_model_blind_spot', 'target_outside_topk',
+                        'mixed_unclear']
+    _all_sum = torch.zeros(len(_cause_names_all), dtype=torch.float64, device=device)
+    _all_cnt = torch.zeros(len(_cause_names_all), dtype=torch.long, device=device)
     _freq_t = None
     if freq is not None:
         try:
@@ -21313,6 +21318,27 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             _sel_bnd = _bnd.reshape(-1) & _flat_fin
             _bsum[6] += _flat_ce[_sel_bnd].sum()
             _bcnt[6] += int(_sel_bnd.sum())
+            # Whole-split cause tally (not only the worst tokens).  The
+            # priority order matches classify_token_error so the worst-token
+            # inventory and the population shares use one definition.
+            _uniform = math.log(max(V, 2))
+            _flat_ent = ent.reshape(-1)
+            _flat_margin = margin.reshape(-1)
+            _flat_top = topi.reshape(-1, _kk)
+            _flat_tg = tg.reshape(-1)
+            _flat_in_topk = (_flat_top == _flat_tg[:, None]).any(dim=1)
+            _amb = ((_flat_ent >= 0.8 * _uniform) | (_flat_margin <= 0.5)) & _flat_fin
+            _blind = ((_flat_ent <= 0.5 * _uniform) & (_flat_margin >= 2.0)) & _flat_fin
+            _m_rare = _flat_rare & _flat_fin
+            _m_amb = (~_flat_rare) & _amb
+            _m_blind = (~_flat_rare) & (~_amb) & _blind
+            _m_out = (~_flat_rare) & (~_amb) & (~_blind) & (~_flat_in_topk) & _flat_fin
+            _m_mixed = (~_flat_rare) & (~_amb) & (~_blind) & _flat_in_topk & _flat_fin
+            for _ci, _mask in enumerate((_m_rare, _m_amb, _m_blind, _m_out, _m_mixed)):
+                _all_sum[_ci] += _flat_ce[_mask].sum()
+                _all_cnt[_ci] += int(_mask.sum())
+            del _flat_ent, _flat_margin, _flat_top, _flat_tg, _flat_in_topk
+            del _amb, _blind, _m_rare, _m_amb, _m_blind, _m_out, _m_mixed
             n_targets += int(_flat_fin.sum())
             # Only the chunk's top candidates enter the Python heap; the
             # per-token loop is bounded by top_tokens, not by B*T.
@@ -21390,6 +21416,14 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             'causes': _triage['causes'],
             'is_boundary_token': (bool(bnd_np[row, pos + 1]) if (bnd_np is not None and bnd_np.shape == vb.shape) else None),
         })
+    _all_sum_cpu = _all_sum.detach().cpu().tolist()
+    _all_cnt_cpu = _all_cnt.detach().cpu().tolist()
+    _all_total = sum(_all_cnt_cpu)
+    cause_counts_all = {}
+    for _name, _n, _sm in zip(_cause_names_all, _all_cnt_cpu, _all_sum_cpu):
+        cause_counts_all[_name] = {
+            'n': int(_n), 'share': (float(_n) / _all_total if _all_total else None),
+            'mean_ce': (float(_sm) / _n if _n else None)}
     out_buckets = {}
     for k, v in buckets.items():
         out_buckets[k] = {'n': int(v['n']),
@@ -21406,6 +21440,8 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             'worst_sequences': worst_seqs,
             'worst_tokens': worst_tokens,
             'cause_counts': dict(cause_counts),
+            'cause_counts_all': cause_counts_all,
+            'cause_counts_all_note': 'whole-split heuristic tally over finite targets; cause thresholds are triage heuristics, not labels',
             'cause_guide': {
                 'annotation_or_rare_target': 'check the target annotation and the training frequency; a rare token can be correct but under-trained',
                 'ambiguous_context': 'the distribution is near-uniform or the top-2 margin is tiny; inspect the context and decide whether the task is genuinely ambiguous',

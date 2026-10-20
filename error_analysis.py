@@ -174,6 +174,14 @@ def main(argv=None):
                   '| cause | worst-token count | what to check |', '|---|---|---|']
         for c, n in sorted(_counts.items(), key=lambda kv: (-kv[1], kv[0])):
             lines.append(f'| {c} | {n} | {(_guide.get(c) or "").replace("|", "\\|")} |')
+    _all = res.get('cause_counts_all') or {}
+    if _all:
+        lines += ['', '**Whole-split cause tally (finite targets, heuristic):**', '',
+                  '| cause | n | share | mean CE |', '|---|---|---|---|']
+        for c, v in sorted(_all.items(), key=lambda kv: (-(kv[1].get('n') or 0), kv[0])):
+            if not isinstance(v, dict) or not v.get('n'):
+                continue
+            lines.append(f'| {c} | {v.get("n")} | {(v.get("share") or 0) * 100:.1f}% | {v.get("mean_ce"):.3f} |')
     lines += ['', '## Worst tokens', '',
               '| # | row | pos | CE | target | predicted | entropy | rare | cause | boundary |', '|---|---|---|---|---|---|---|---|---|---|']
     for i, t in enumerate(res.get('worst_tokens') or []):

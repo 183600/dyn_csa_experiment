@@ -8599,6 +8599,11 @@ def t_error_analysis_excludes_nonfinite_targets():
     assert sum(b['n'] for b in r['buckets'].values() if b['n']) > 0, r['buckets']
     assert r['buckets']['position:first10%']['n'] == 1, r['buckets']
     assert all(seq['n_tokens'] in (2, 3) for seq in r['worst_sequences']), r['worst_sequences']
+    # The whole-split cause tally covers exactly the finite targets.
+    _all = r.get('cause_counts_all') or {}
+    assert sum(v['n'] for v in _all.values()) == 5, _all
+    assert _all['ambiguous_context']['n'] == 5, _all
+    assert abs(sum(v['share'] for v in _all.values()) - 1.0) < 1e-12, _all
 
 
 def t_gapfill_numeric_reader_rejects_booleans():
