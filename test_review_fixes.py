@@ -4637,6 +4637,23 @@ def t_binary_threshold_and_calibration_contract():
                                   threshold=0.4)
     assert mt['decision_threshold_source'] == 'caller_threshold'
     assert abs(mt['f1_primary'] - 1.0) < 1e-12, mt
+    # Gate parameters are exact integers: True/1.5 must not silently become a
+    # different bin/threshold budget.
+    for _bad_mt in (True, 0, -1, 1.5, 'x'):
+        try:
+            L.binary_threshold_curve(y, score, max_thresholds=_bad_mt)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'max_thresholds={_bad_mt!r} must be refused')
+    for _bad_nb in (True, 0, -1, 1.5, 'x'):
+        try:
+            L._binary_calibration(np.array([0, 1]), np.array([0.2, 0.8]),
+                                  n_bins=_bad_nb)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'n_bins={_bad_nb!r} must be refused')
     # A reversed score column is a labelling/orientation error, not a weak model.
     mi = L.classification_metrics(y, y_score=1.0 - score, labels=[0, 1])
     assert mi['roc_auc'] == 0.0 and mi['score_orientation_warning'], mi

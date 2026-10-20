@@ -13435,12 +13435,14 @@ def _binary_threshold_metrics(y_bin, score, threshold):
 
 def _binary_calibration(y_bin, score, n_bins=10):
     score = np.asarray(score, dtype=float).ravel()
+    _bins = _as_seed_int(n_bins)
+    if _bins is None or _bins < 1:
+        raise ValueError(f'n_bins must be a positive integer, got {n_bins!r}')
     if score.size and (np.any(score < 0.0) or np.any(score > 1.0)):
         return {'status': 'unavailable',
                 'reason': 'scores are outside [0, 1]; Brier/ECE require probabilities'}
     if score.size == 0:
         return {'status': 'unavailable', 'reason': 'no scores'}
-    _bins = max(1, int(n_bins))
     idx = np.clip((score * _bins).astype(np.int64), 0, _bins - 1)
     rows = []
     ece = 0.0
@@ -13476,6 +13478,10 @@ def binary_threshold_curve(y_true, y_score, *, positive_label=None, thresholds=N
     """
     if metric not in _BINARY_THRESHOLD_METRICS:
         raise ValueError(f'metric must be one of {_BINARY_THRESHOLD_METRICS}, got {metric!r}')
+    _mt = _as_seed_int(max_thresholds)
+    if _mt is None or _mt < 1:
+        raise ValueError(f'max_thresholds must be a positive integer, got {max_thresholds!r}')
+    max_thresholds = _mt
     y_bin, pos, uniq = _binary_positive_vector(y_true, positive_label)
     score = np.asarray(y_score, dtype=float).ravel()
     if score.size != y_bin.size:
