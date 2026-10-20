@@ -902,6 +902,20 @@ def t_power_gate():
         psm = os.path.join(td, 'smoke.json')
         _write_manifest(psm, [0], extra_stat={'descriptive_only': True})
         V12._load_manifest(psm)  # descriptive smoke manifests opt out
+        # A truthy surrogate is not a boolean opt-out: the 6-seed plan still
+        # cannot confirm anything and must be refused.
+        pstr = os.path.join(td, 'm6_string.json')
+        mstr = _write_manifest(pstr, list(range(6)),
+                               extra_stat={'descriptive_only': 'false'})
+        mstr['primary_comparisons'] = [dict(mstr['primary_comparisons'][0], name=f'c{i}') for i in range(4)]
+        with open(pstr, 'w', encoding='utf-8') as f:
+            json.dump(mstr, f)
+        try:
+            V12._load_manifest(pstr)
+        except SystemExit as e:
+            assert 'real boolean' in str(e), e
+        else:
+            raise AssertionError('a string descriptive_only opt-out was accepted')
 
 
 def _rec(variant, seed, fp, by_len=None, code=None, recipe='steps3000_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_v8192_wu50_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee250_es128_detcpu-eager_dfdeadbeef_cscURRENT', msha='CURRENT'):

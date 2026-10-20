@@ -318,10 +318,17 @@ def _load_manifest(path):
         raise SystemExit(f'[v12] REFUSE: statistics.alpha={_stat.get("alpha")!r} is not numeric')
     if not (math.isfinite(_alpha) and 0.0 < _alpha < 1.0):
         raise SystemExit(f'[v12] REFUSE: statistics.alpha={_alpha!r} must be in (0, 1)')
+    # `descriptive_only` is a pre-registration escape hatch.  A truthy string
+    # such as "false" must not open it; only a real JSON boolean True does.
+    _desc_flag = _stat.get('descriptive_only')
+    if _desc_flag is not None and not isinstance(_desc_flag, (bool, np.bool_)):
+        raise SystemExit(f'[v12] REFUSE: statistics.descriptive_only={_desc_flag!r} '
+                         'must be a real boolean, not a truthy/falsy surrogate')
+    _descriptive_only = _desc_flag is True
     _n = len(m['seeds'])
     _m_family = len(m['primary_comparisons'])
     _min_holm = L.holm_min_attainable_p(_n, _m_family, _alpha)
-    if math.isfinite(_min_holm) and _min_holm > _alpha and not _stat.get('descriptive_only'):
+    if math.isfinite(_min_holm) and _min_holm > _alpha and not _descriptive_only:
         _kmin = L.signflip_min_consistency(_n, _m_family, _alpha)
         raise SystemExit(f'[v12] REFUSE: the frozen plan cannot confirm ANYTHING by construction — with n={_n} seeds, a two-sided exact sign-flip and a Holm family of m={_m_family}, the smallest attainable Holm p is {_min_holm:.4g} > alpha={_alpha} (all {_n} seeds one-sided still gives {_kmin is None and "insufficient" or f"k_min={_kmin} needed"}). This is a resolution ceiling, NOT a conservative design. Revise the plan BEFORE any test-split evaluation (add seeds / shrink the family / change the test) and record the revision in the manifest history. ({_stat.get("descriptive_only")!r})')
     if not isinstance(m.get('seeds'), list) or not all(isinstance(s, int) and (not isinstance(s, bool)) for s in m['seeds']) or len(set(m['seeds'])) != len(m['seeds']):
@@ -335,7 +342,7 @@ def _load_manifest(path):
         if _n_min < 2 or _n_min > _n:
             raise SystemExit(f'[v12] REFUSE: statistics.min_seeds_for_confirmation={_n_min} is outside [2, {_n}] — the declared confirmation floor must be reachable with the frozen seed list')
         _min_holm_floor = L.holm_min_attainable_p(_n_min, _m_family, _alpha)
-        if math.isfinite(_min_holm_floor) and _min_holm_floor > _alpha and not _stat.get('descriptive_only'):
+        if math.isfinite(_min_holm_floor) and _min_holm_floor > _alpha and not _descriptive_only:
             raise SystemExit(f'[v12] REFUSE: the declared confirmation floor n={_n_min} cannot attain Holm significance (min p={_min_holm_floor:.4g} > alpha={_alpha}); raise the floor or add seeds BEFORE any test access')
     # ---- binding block.  Optional but validated when present;
     #     every record written under this manifest carries the manifest's sha256.
@@ -1479,7 +1486,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='accessed',
                                     train_fp=(next(iter(_adm_train_fps)) if len(_adm_train_fps) == 1 else None))
     _alpha = float((manifest.get('statistics') or {}).get('alpha', 0.05))
-    stats = {'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision')}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp, 'n_effective_seeds': len({int(s) for (_v, s) in admitted}), 'n_declared_seeds': len(manifest['seeds'])}, 'comparisons': {}, 'holm': {}, 'by_length': {}, 'probe': _test_probe_stats(probe_path, manifest, unified_fp)}
+    stats = {'alpha': float(_alpha), 'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision')}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp, 'n_effective_seeds': len({int(s) for (_v, s) in admitted}), 'n_declared_seeds': len(manifest['seeds'])}, 'comparisons': {}, 'holm': {}, 'by_length': {}, 'probe': _test_probe_stats(probe_path, manifest, unified_fp)}
     # The exact sign-flip p is valid only under within-seed exchangeability.
     # admission binds the corpus/slice/row count/recipe/code, but the RNG stream
     # and batch order are not independently re-derivable from a record; report
@@ -1499,7 +1506,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # Refuse a non-descriptive plan that does not disclose
     # both facts, so the caveat cannot be silently dropped from the report.
     _cbd = manifest.get('compute_budget_disclosure')
-    _descriptive = bool((manifest.get('statistics') or {}).get('descriptive_only'))
+    _descriptive = (manifest.get('statistics') or {}).get('descriptive_only') is True
     if not _descriptive:
         _missing = [k for k in ('parameter_matching', 'flops', 'read_fraction')
                     if not (isinstance(_cbd, dict) and _cbd.get(k))]
@@ -1766,6 +1773,12 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     A('')
     A('## P5T 独立最终测试（test split，冻结终点）')
     A('')
+    # The report must use the SAME frozen alpha as finaltest_stats, not a
+    # hard-coded 0.05 that can disagree with the decision rule.
+    try:
+        _report_alpha = float(ft.get('alpha', (m.get('statistics') or {}).get('alpha', 0.05)))
+    except (TypeError, ValueError, OverflowError):
+        _report_alpha = 0.05
     bl = ft.get('by_length') or {}
     if bl:
         _lens = sorted({int(k) for v in bl.values() for k in v})
@@ -1799,7 +1812,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                 continue
             _h = holm.get(k) or {}
             _hp = f'{_h.get("p_holm", float("nan")):.3f}' if _h.get('p_holm') is not None else '—'
-            _hr = '✔' if (_h.get('p_holm') is not None and float(_h['p_holm']) < 0.05) else '✘'
+            _hr = '✔' if (_h.get('p_holm') is not None and float(_h['p_holm']) < _report_alpha) else '✘'
             _dir = v.get('direction_ok')
             _ds = '—（非方向性）' if _dir is None else ('✔' if _dir else '✘')
             _dsm = v.get('doc_sampling') or {}
@@ -1813,14 +1826,14 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         if _conf:
             A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
         else:
-            A('**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < 0.05」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
+            A(f'**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < {_report_alpha:g}」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
         _nd = ft.get('significant_nondirectional') or []
         if _nd:
             A('')
-            A(f'**非方向性机制读数**：{sorted(_nd)} 在 Holm 校正后达到 p<0.05，但冻结清单未给方向（expected_sign=null），只能作为机制读数，不能计入「方向符合预注册」的确认集合。')
+            A(f'**非方向性机制读数**：{sorted(_nd)} 在 Holm 校正后达到 p<{_report_alpha:g}，但冻结清单未给方向（expected_sign=null），只能作为机制读数，不能计入「方向符合预注册」的确认集合。')
         if ft.get('min_attainable_p_holm') is not None:
             A('')
-            A(f"（诊断：n 个种子与 m 元 Holm 族下，最小可达 Holm p = {ft['min_attainable_p_holm']:.4f}。加载期功效门槛已拒绝「数学上不可能确认」的清单；若此处仍 > 0.05，说明有绕过门槛的旧状态，需回查清单与记录的来源。）")
+            A(f"（诊断：n 个种子与 m 元 Holm 族下，最小可达 Holm p = {ft['min_attainable_p_holm']:.4f}。加载期功效门槛已拒绝「数学上不可能确认」的清单；若此处仍 > {_report_alpha:g}，说明有绕过门槛的旧状态，需回查清单与记录的来源。）")
         _dsn = ft.get('doc_sampling_note')
         if _dsn:
             A('')
