@@ -625,20 +625,31 @@ def t_open_record_identity_and_arm_summary():
                      'nll_sum': 9.0, 'n_tokens': 10, 'run_fingerprint': 'r'},
         'v::seed4': {'seed': 4, 'variant': 'v', 'ppl': 10.0,
                      'nll_sum': 10.0, 'n_tokens': 10, 'run_fingerprint': 'other'},
+        # A fractional token count is not a denominator: truncating 10.5 to
+        # 10 would make a different evaluation budget look like the same one.
+        'v::seed5': {'seed': 5, 'variant': 'v', 'ppl': 10.0,
+                     'nll_sum': 10.0, 'n_tokens': 10.5, 'run_fingerprint': 'r'},
     }
     problems = []
     cells = OB._rec_by_cell(summary, run_fingerprint='r', problems=problems)
     assert set(cells) == {('v', 0), ('v', 1)}, cells
-    assert len(problems) == 2, problems
+    assert len(problems) == 3, problems
     reasons = ' '.join(p['reason'] for p in problems)
     assert 'record seed 3 != key seed 2' in reasons, problems
     assert 'record variant' in reasons, problems
+    assert 'nll/token' in reasons, problems
     arm = OB._arm_summary(cells)['v']
     assert arm['n_seeds'] == 2 and arm['seeds'] == [0, 1], arm
     assert abs(arm['ppl_mean'] - 11.0) < 1e-9, arm
     assert abs(arm['ppl_std'] - 2.0 ** 0.5) < 1e-9, arm
     assert abs(arm['nll_per_token_mean'] - 1.1) < 1e-9, arm
     assert arm['n_tokens_total'] == 20 and arm['ppl_pooled'] is not None, arm
+    # The arm summary independently parses exact token counts; a fractional
+    # cell cannot contribute a truncated pooled denominator.
+    _frac = {('v', 0): {'record': {'n_tokens': 10.5}, 'nll': 1.0, 'ppl': 10.0},
+             ('v', 1): {'record': {'n_tokens': 10}, 'nll': 1.0, 'ppl': 10.0}}
+    _fa = OB._arm_summary(_frac)['v']
+    assert _fa['n_tokens_total'] is None and _fa['ppl_pooled'] is None, _fa
     # The open-block primary family has three Holm comparisons.  A six-seed
     # panel can reach a RAW p=0.03125 but not a family-corrected claim; the
     # documented extension path must therefore be at least n=7.

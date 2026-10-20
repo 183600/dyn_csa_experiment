@@ -226,7 +226,9 @@ def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
     rec['hyperparams']['open_block_config'] = rec.get('open_block_config')
     summary[key] = rec
     _save_summary(outdir, summary)
-    print(f'[open-block] {key}: NLL/token={float(rec["nll_sum"]) / max(int(rec["n_tokens"]), 1):.6f} PPL={rec["ppl"]:.4f}')
+    _nll_tok = _nll_per_token(rec)
+    print(f'[open-block] {key}: NLL/token='
+          f'{(f"{_nll_tok:.6f}" if _nll_tok is not None else "n/a")} PPL={rec["ppl"]:.4f}')
     return rec
 
 
@@ -273,14 +275,16 @@ def run_panel(cfg, matrix, *, device, synthetic=False, max_hours=None, label='ma
 # ---------------------------------------------------------------------------
 
 def _nll_per_token(rec):
-    try:
-        n = float(rec['n_tokens'])
-        v = float(rec['nll_sum'])
-        if n > 0 and math.isfinite(v):
-            return v / n
-    except Exception:
-        pass
-    return None
+    # Token counts are exact integers.  float(1.5) would otherwise pass and
+    # int() in the arm summary would truncate it to a different denominator,
+    # making two different token budgets look like one pooled measurement.
+    if not isinstance(rec, dict):
+        return None
+    n = L._exact_count(rec.get('n_tokens'), minimum=1)
+    v = L._finite_scalar(rec.get('nll_sum'))
+    if n is None or v is None:
+        return None
+    return v / n
 
 
 def _rec_by_cell(summary, run_fingerprint=None, problems=None):
@@ -352,11 +356,8 @@ def _arm_summary(cells):
         n_tok = []
         for _s, c in rows:
             r = c.get('record') or {}
-            try:
-                n = int(r.get('n_tokens'))
-            except (TypeError, ValueError):
-                n = 0
-            n_tok.append(n if n > 0 else None)
+            n = L._exact_count(r.get('n_tokens'), minimum=1)
+            n_tok.append(n)
         pooled = None
         if all(n is not None for n in n_tok):
             _nll = math.fsum(nlls)
