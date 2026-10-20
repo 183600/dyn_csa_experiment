@@ -751,10 +751,28 @@ def run_simple(base_cfg=None, outdir='results_baseline_tuning', protocol=None):
     # per-eval-step history).
     rows = max(1, int(val_batch.shape[0]))
     eval_slice = val_batch[:rows]
-    artifact = L.simple_baseline_fit(train_ids, eval_slice, vocab, protocol=protocol)
+    # Use the same nested chronological row split as the neural panel so the
+    # floor's smoothing is selected on earlier rows and reported on disjoint
+    # later rows.  With fewer than two rows per fold the split is not
+    # meaningful, so fall back to the legacy full-validation path and say so.
+    _proto = protocol if protocol is not None else L.SIMPLE_BASELINE_POLICY
+    _row_spec = L.tuning_row_split_spec(_proto)
+    _sel_rows = _eval_rows = _row_meta = None
+    if _row_spec is not None and rows >= 4:
+        _sel_rows, _eval_rows, _row_meta = L.validation_row_split(
+            rows, seed=_row_spec['seed'], n_folds=_row_spec['n_folds'],
+            selection_fold=_row_spec['selection_fold'],
+            evaluation_fold=_row_spec['evaluation_fold'])
+    artifact = L.simple_baseline_fit(
+        train_ids, eval_slice, vocab, protocol=protocol,
+        selection_rows=_sel_rows, evaluation_rows=_eval_rows, row_split=_row_meta)
     artifact.setdefault('data', {})['cache_val_fp'] = L._ids_fp(np.ascontiguousarray(val_batch).reshape(-1))
-    artifact['data']['eval_rows'] = int(rows)
-    artifact['data']['eval_fp'] = L._ids_fp(np.ascontiguousarray(eval_slice).reshape(-1))
+    artifact['data']['eval_rows'] = int(len(_eval_rows) if _eval_rows is not None else rows)
+    if _sel_rows is None:
+        artifact['data']['nested_selection_unavailable_reason'] = (
+            'validation has fewer than 4 rows (two per chronological fold)' if rows < 4
+            else 'the simple-baseline protocol declares no nested row split')
+        artifact['data']['eval_fp'] = L._ids_fp(np.ascontiguousarray(eval_slice).reshape(-1))
     artifact['data_version'] = L._data_version(artifact['data'])
     if isinstance(artifact.get('provenance'), dict):
         artifact['provenance']['data'] = dict(artifact['data'])

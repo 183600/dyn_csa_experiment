@@ -3249,6 +3249,61 @@ def t_simple_baseline_ngram_and_audit():
             raise AssertionError(f'invalid grid hyperparameter accepted: {_bad_grid!r}')
 
 
+def t_simple_baseline_nested_rows_and_fingerprint():
+    rng = np.random.default_rng(19)
+    vocab = 24
+    train = rng.integers(0, vocab, size=500)
+    val = rng.integers(0, vocab, size=(8, 15))
+    proto = dict(L.SIMPLE_BASELINE_POLICY,
+                 arms={'unigram': {'order': 1}, 'bigram': {'order': 2}},
+                 grids={'unigram': {'alpha': [0.1, 1.0]},
+                        'bigram': {'alpha': [0.1, 1.0], 'interpolation': [0.5, 1.0]}})
+    sel, ev, meta = L.validation_row_split(8, seed=20261020, n_folds=2,
+                                           selection_fold=0, evaluation_fold=1)
+    art = L.simple_baseline_fit(train, val, vocab, protocol=proto,
+                                selection_rows=sel, evaluation_rows=ev,
+                                row_split=meta)
+    data = art['data']
+    assert data['nested_selection'] is True, data
+    assert data['n_eval_tokens'] == int(val[ev].size), data
+    assert data['selection_fp'] != data['eval_fp'], data
+    assert data['row_split']['evaluation_row_fp'] == meta['evaluation_row_fp'], data
+    assert art['best_ppl'] == art['baselines'][art['best_baseline']]['holdout_metric_value'], art
+    audit = L.simple_baseline_audit(art, protocol=proto)
+    assert audit['baseline_verified'] is True, audit
+    assert audit['nested_selection'] is True and audit['best_ppl_estimation_rows'] == 'nested_validation_holdout', audit
+    # A floor reported on the selection fold is selection-biased, even if it
+    # is the minimum selection value.
+    bad = json.loads(json.dumps(art))
+    bad['best_ppl'] = bad['baselines'][bad['best_baseline']]['selected_metric_value']
+    rbad = L.simple_baseline_audit(bad, protocol=proto)
+    assert rbad['baseline_verified'] is False and any('held-out' in p for p in rbad['problems']), rbad
+    # The held-out evaluation must be on disjoint rows.
+    try:
+        L.simple_baseline_fit(train, val, vocab, protocol=proto,
+                              selection_rows=sel, evaluation_rows=sel,
+                              row_split=meta)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('overlapping selection/evaluation rows were accepted')
+    # A row-split fingerprint that does not describe the supplied rows is a
+    # fabricated nested claim.
+    tampered = dict(meta, evaluation_row_fp='not-the-eval-rows')
+    try:
+        L.simple_baseline_fit(train, val, vocab, protocol=proto,
+                              selection_rows=sel, evaluation_rows=ev,
+                              row_split=tampered)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('mismatched evaluation_row_fp was accepted')
+    # The reported token denominator must be the held-out denominator.
+    bad_tok = json.loads(json.dumps(art))
+    bad_tok['data']['n_eval_tokens'] = int(val.size)
+    rtok = L.simple_baseline_audit(bad_tok, protocol=proto)
+    assert rtok['baseline_verified'] is False and any('held-out token' in p for p in rtok['problems']), rtok
+
 def t_simple_baseline_fit_budget_is_bounded_and_disclosed():
     rng = np.random.default_rng(11)
     vocab = 16
@@ -6034,6 +6089,7 @@ def main():
     _check('H3j final tuned contrast is measured on held-out rows', t_nested_final_uses_holdout_rows)
     _check('H4 tuned count-model floor + audit', t_simple_baseline_ngram_and_audit)
     _check('H4a count-model fit budget is bounded + disclosed', t_simple_baseline_fit_budget_is_bounded_and_disclosed)
+    _check('H4b count-model floor uses nested selection/holdout rows', t_simple_baseline_nested_rows_and_fingerprint)
     _check('H5 positive-label / rare-positive PR-AUC / macro-F1 averaging', t_classification_positive_label_and_rare_floor)
     _check('H6 hypothesis completeness + metric alignment + direction=0', t_hypothesis_audit_completeness_and_metric_alignment)
     _check('H7 simple-baseline driver uses the panel corpus', t_simple_baseline_driver_serves_the_panel_corpus)

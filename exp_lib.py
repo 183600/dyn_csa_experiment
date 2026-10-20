@@ -11445,6 +11445,12 @@ SIMPLE_BASELINE_POLICY = {
     'selection_metric': 'ppl',
     'selection_split': 'validation',
     'direction': 'lower_is_better',
+    # Mirror the neural panel's nested validation: select smoothing on an
+    # earlier chronological row fold and report the floor on a disjoint later
+    # fold.  Tuning and reporting on the same rows would let the count model
+    # see the panel's held-out rows and make the "beats floor" test unfair.
+    'selection_row_split': {'enabled': True, 'seed': 20261020, 'n_folds': 2,
+                            'selection_fold': 0, 'evaluation_fold': 1},
     'arms': {
         'unigram': {'order': 1, 'description': 'training-set unigram counts with add-alpha smoothing (a linear/count model)'},
         'bigram': {'order': 2, 'description': 'training-set bigram counts interpolated with the unigram model'},
@@ -11587,8 +11593,37 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     return {'order': 2, 'alpha': alpha, 'interpolation': lam,
             'n_tokens': n_tokens, 'nll': nll, 'ppl': float(_safe_exp_ppl(nll)) if math.isfinite(nll) else float('nan')}
 
-def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
-    """Run the declared count-model grid and select per baseline on validation."""
+def _simple_baseline_row_indices(rows, n_rows, label):
+    """Exact, unique, in-range row indices for the nested floor evaluation."""
+    if rows is None:
+        return None
+    try:
+        raw = list(rows)
+    except TypeError:
+        raise ValueError(f'simple baseline {label} rows must be an iterable, got {rows!r}') from None
+    parsed = [_as_seed_int(v) for v in raw]
+    if any(v is None for v in parsed):
+        raise ValueError(f'simple baseline {label} rows must be integers, got {raw!r}')
+    if any(v < 0 or v >= n_rows for v in parsed):
+        raise ValueError(f'simple baseline {label} rows outside [0, {n_rows})')
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f'simple baseline {label} rows contain duplicates')
+    return np.asarray(sorted(parsed), dtype=np.int64)
+
+def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None,
+                        selection_rows=None, evaluation_rows=None,
+                        row_split=None):
+    """Run the declared count-model grid and select per baseline on validation.
+
+    When ``selection_rows`` / ``evaluation_rows`` are supplied, the smoothing
+    constants are selected on the earlier chronological row fold and the
+    selected model is reported on the disjoint later fold.  This mirrors the
+    neural panel's nested validation split: selecting and reporting on the
+    same documents gives the count-model floor an unfair look at the
+    evaluation rows.  ``row_split`` may carry the reproducible fold metadata
+    (from ``validation_row_split``); its row fingerprints are checked against
+    the supplied indices.
+    """
     protocol = dict(SIMPLE_BASELINE_POLICY if protocol is None else protocol)
     arms = protocol.get('arms') or {}
     grids = protocol.get('grids') or {}
@@ -11619,6 +11654,66 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
         'n_source_tokens': int(_train_all.size),
         'fit_truncated': bool(_fit_ids.size < _train_all.size),
     }
+    eval_arr = np.asarray(eval_ids)
+    if eval_arr.ndim not in (1, 2):
+        raise ValueError('eval ids must be 1-D or 2-D (sequences x length)')
+    nested = selection_rows is not None or evaluation_rows is not None
+    if nested:
+        if eval_arr.ndim != 2:
+            raise ValueError('nested simple-baseline selection needs a 2-D evaluation tensor (rows x length)')
+        _n_rows = int(eval_arr.shape[0])
+        _sel_idx = _simple_baseline_row_indices(selection_rows, _n_rows, 'selection')
+        _eval_idx = _simple_baseline_row_indices(evaluation_rows, _n_rows, 'evaluation')
+        if _sel_idx.size == 0 or _eval_idx.size == 0:
+            raise ValueError('nested simple-baseline selection needs non-empty selection and evaluation folds')
+        _overlap = np.intersect1d(_sel_idx, _eval_idx)
+        if _overlap.size:
+            raise ValueError('simple-baseline selection and evaluation rows overlap')
+        if int(_sel_idx.max()) >= int(_eval_idx.min()):
+            # The neural path requires selection rows to precede evaluation
+            # rows; a floor selected on later documents would not match it.
+            raise ValueError('simple-baseline selection rows must precede the evaluation rows in stream order')
+        if not isinstance(row_split, dict):
+            row_split = {
+                'policy': 'chronological_contiguous_row_folds',
+                'n_rows': _n_rows,
+                'n_selection_rows': int(_sel_idx.size),
+                'n_evaluation_rows': int(_eval_idx.size),
+                'selection_row_range': [int(_sel_idx.min()), int(_sel_idx.max())],
+                'evaluation_row_range': [int(_eval_idx.min()), int(_eval_idx.max())],
+                'selection_row_fp': _ids_fp(_sel_idx),
+                'evaluation_row_fp': _ids_fp(_eval_idx),
+                'chronological': True,
+                'selection_precedes_evaluation': True,
+                'disjoint': True,
+            }
+        else:
+            row_split = dict(row_split)
+            _want_sel = row_split.get('selection_row_fp')
+            _want_eval = row_split.get('evaluation_row_fp')
+            if _want_sel is not None and _want_sel != _ids_fp(_sel_idx):
+                raise ValueError('row_split selection_row_fp does not describe the supplied selection rows')
+            if _want_eval is not None and _want_eval != _ids_fp(_eval_idx):
+                raise ValueError('row_split evaluation_row_fp does not describe the supplied evaluation rows')
+            if len(row_split.get('selection_row_range') or []) == 2:
+                _sr = row_split['selection_row_range']
+                if [int(_sel_idx.min()), int(_sel_idx.max())] != [int(_sr[0]), int(_sr[1])]:
+                    raise ValueError('row_split selection_row_range does not describe the supplied selection rows')
+            if len(row_split.get('evaluation_row_range') or []) == 2:
+                _er = row_split['evaluation_row_range']
+                if [int(_eval_idx.min()), int(_eval_idx.max())] != [int(_er[0]), int(_er[1])]:
+                    raise ValueError('row_split evaluation_row_range does not describe the supplied evaluation rows')
+            row_split.setdefault('policy', 'chronological_contiguous_row_folds')
+            row_split.setdefault('n_rows', _n_rows)
+            row_split.setdefault('n_selection_rows', int(_sel_idx.size))
+            row_split.setdefault('n_evaluation_rows', int(_eval_idx.size))
+            row_split.setdefault('selection_row_fp', _ids_fp(_sel_idx))
+            row_split.setdefault('evaluation_row_fp', _ids_fp(_eval_idx))
+        selection_eval = eval_arr[_sel_idx]
+        scoring_eval = eval_arr[_eval_idx]
+    else:
+        selection_eval = eval_arr
+        scoring_eval = eval_arr
     # Build the corpus count tables once for the whole grid (lazily, so an
     # empty evaluation set still short-circuits without touching the corpus):
     # every trial below consumes the identical arrays — the trial
@@ -11642,7 +11737,7 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
                 # Pass the declared grid values through unchanged so
                 # ngram_lm_score's boolean/non-finite validation runs BEFORE
                 # any float() coercion (float(True) == 1.0 used to bypass it).
-                sc = ngram_lm_score(_fit_ids, eval_ids, vocab_size, order=order,
+                sc = ngram_lm_score(_fit_ids, selection_eval, vocab_size, order=order,
                                     alpha=alpha, interpolation=lam,
                                     _counts=_shared_counts)
                 cfg = {'order': order, 'alpha': float(sc['alpha'])}
@@ -11653,19 +11748,48 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
         if not rows:
             raise RuntimeError(f'simple baseline {arm}: empty declared grid')
         best = min(rows, key=lambda r: float(r['ppl']))
-        trials_by_arm[arm] = {'selected': dict(best['config']),
-                              'selected_metric_value': float(best['ppl']),
-                              'trials': rows,
-                              'order': order}
+        entry = {'selected': dict(best['config']),
+                 'selected_metric_value': float(best['ppl']),
+                 'trials': rows,
+                 'order': order}
+        if nested:
+            # Score the SELECTED config once on the held-out rows.  The
+            # selection fold chose the smoothing; this fold is the estimate
+            # that may be compared with the neural panel's holdout PPL.
+            sc_hold = ngram_lm_score(_fit_ids, scoring_eval, vocab_size, order=order,
+                                     alpha=best['config']['alpha'],
+                                     interpolation=best['config'].get('interpolation', 1.0),
+                                     _counts=_shared_counts)
+            for _r in rows:
+                if _r is best:
+                    _r['holdout_ppl'] = sc_hold['ppl']
+                    _r['holdout_nll'] = sc_hold['nll']
+                    _r['holdout_n_tokens'] = sc_hold['n_tokens']
+                    break
+            entry['holdout_metric_value'] = float(sc_hold['ppl'])
+            entry['holdout_nll'] = float(sc_hold['nll'])
+            entry['holdout_n_tokens'] = int(sc_hold['n_tokens'])
+        trials_by_arm[arm] = entry
     best_arm = min(trials_by_arm, key=lambda a: float(trials_by_arm[a]['selected_metric_value']))
+    if nested:
+        best_ppl = float(trials_by_arm[best_arm]['holdout_metric_value'])
+    else:
+        best_ppl = float(trials_by_arm[best_arm]['selected_metric_value'])
     # `_ids_fp` hashes the canonical chunked form of any integer width and
     # accepts the training stream (possibly a memmap) directly.
-    eval_arr = np.asarray(eval_ids, dtype=np.int64)
     _data = {'train_fp': _ids_fp(_fit_ids),
              'source_train_fp': _ids_fp(_train_all),
              'val_fp': _ids_fp(np.ascontiguousarray(eval_arr).reshape(-1)),
+             'eval_fp': _ids_fp(np.ascontiguousarray(scoring_eval).reshape(-1)),
              'n_train_tokens': int(_train_all.size),
-             'n_eval_tokens': int(eval_arr.size)}
+             'n_eval_tokens': int(scoring_eval.size),
+             'nested_selection': bool(nested)}
+    if nested:
+        _data.update({'selection_fp': _ids_fp(np.ascontiguousarray(selection_eval).reshape(-1)),
+                      'n_selection_tokens': int(selection_eval.size),
+                      'selection_rows': int(_sel_idx.size),
+                      'eval_rows': int(_eval_idx.size),
+                      'row_split': row_split})
     _data.update(_fit_meta)
     _data['data_version'] = _data_version(_data)
     _prov = code_provenance()
@@ -11681,7 +11805,8 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
         'provenance': _prov,
         'baselines': trials_by_arm,
         'best_baseline': best_arm,
-        'best_ppl': float(trials_by_arm[best_arm]['selected_metric_value']),
+        'best_ppl': best_ppl,
+        'best_ppl_estimation_rows': ('nested_validation_holdout' if nested else 'full_validation'),
         'code': code_stamp(),
     }
 
@@ -11798,7 +11923,89 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
                 warnings.append(f'the count-model floor was fitted on a deterministic prefix of '
                                 f'{_nfit:,}/{_nsrc:,} training tokens (max_fit_tokens={data.get("max_fit_tokens")}); '
                                 'report the fit budget when quoting the floor')
+    # Nested floor evidence: selecting the smoothing AND reporting the floor
+    # on the same rows gives the count model a look at the neural panel's
+    # held-out rows.  When the artifact declares a nested split, verify that
+    # the fold description is chronological/disjoint and reproducible, that
+    # every arm reports a held-out value, and that `best_ppl` is the held-out
+    # (not selection-fold) value of the selected arm.
+    row_split = data.get('row_split') if isinstance(data, dict) else None
+    nested_claimed = bool(isinstance(data, dict) and data.get('nested_selection') is True)
+    nested_applied = None
+    if nested_claimed or isinstance(row_split, dict):
+        nested_applied = True
+        if not isinstance(row_split, dict):
+            problems.append('nested simple-baseline artifact lacks row_split metadata')
+            row_split = {}
+        if row_split.get('policy') not in (None, 'chronological_contiguous_row_folds'):
+            problems.append(f'nested simple-baseline row policy is {row_split.get("policy")!r}, '
+                            'not chronological_contiguous_row_folds')
+        if row_split.get('chronological') is False:
+            problems.append('nested simple-baseline split explicitly declares a non-chronological layout')
+        if row_split.get('selection_precedes_evaluation') is False:
+            problems.append('nested simple-baseline split evaluates earlier rows than it selects on')
+        if row_split.get('disjoint') is False:
+            problems.append('nested simple-baseline selection and evaluation folds overlap')
+        _fold_keys = ('n_rows', 'seed', 'n_folds', 'selection_fold', 'evaluation_fold')
+        if all(row_split.get(k) is not None for k in _fold_keys):
+            try:
+                _re_sel, _re_eval, _re_meta = validation_row_split(
+                    row_split.get('n_rows'), seed=row_split.get('seed'),
+                    n_folds=row_split.get('n_folds'),
+                    selection_fold=row_split.get('selection_fold'),
+                    evaluation_fold=row_split.get('evaluation_fold'))
+            except (TypeError, ValueError, OverflowError) as _rfe:
+                problems.append(f'nested simple-baseline row split cannot be reproduced: {_rfe}')
+            else:
+                _mismatch = [k for k in ('n_selection_rows', 'n_evaluation_rows',
+                                         'selection_row_range', 'evaluation_row_range',
+                                         'selection_row_fp', 'evaluation_row_fp',
+                                         'chronological', 'selection_precedes_evaluation',
+                                         'disjoint')
+                             if k in row_split and row_split.get(k) != _re_meta.get(k)]
+                if _mismatch:
+                    problems.append('nested simple-baseline row_split metadata does not match the '
+                                    f'deterministic split implied by n_rows/seed/folds (mismatch: {sorted(_mismatch)})')
+        else:
+            warnings.append('nested simple-baseline row_split omits part of the fold description '
+                            '(n_rows/seed/n_folds/selection_fold/evaluation_fold); the recorded '
+                            'ranges cannot be independently reproduced')
+        _sel_fp = data.get('selection_fp')
+        _eval_fp = data.get('eval_fp')
+        if not _sel_fp or not _eval_fp:
+            problems.append('nested simple-baseline artifact lacks selection/evaluation token fingerprints')
+        elif _sel_fp == _eval_fp:
+            problems.append('nested simple-baseline selection and evaluation token fingerprints are identical')
+        _hold_tok = set()
+        for arm, entry in baselines.items():
+            if not isinstance(entry, dict):
+                continue
+            _hv = _finite_scalar(entry.get('holdout_metric_value'))
+            _ht = _exact_count(entry.get('holdout_n_tokens'), minimum=1)
+            if _hv is None:
+                problems.append(f'{arm}: nested baseline has no finite held-out {metric}')
+                continue
+            if entry.get('selected_metric_value') is None:
+                problems.append(f'{arm}: nested baseline lacks its selection-fold metric')
+            _chosen = entry.get('selected') or {}
+            _sig = json.dumps(_chosen, sort_keys=True, default=str)
+            _ct = next((t for t in (entry.get('trials') or []) if isinstance(t, dict)
+                        and json.dumps(t.get('config') or {}, sort_keys=True, default=str) == _sig), None)
+            if _ct is None or _finite_scalar(_ct.get('holdout_ppl')) is None:
+                problems.append(f'{arm}: selected config has no held-out trial record')
+            elif abs(float(_ct['holdout_ppl']) - _hv) > 1e-12:
+                problems.append(f'{arm}: holdout_metric_value does not match the selected trial\'s held-out PPL')
+            if _ht is not None:
+                _hold_tok.add(_ht)
+        if len(_hold_tok) > 1:
+            problems.append(f'nested simple baselines evaluated different held-out token counts {sorted(_hold_tok)}')
+        _n_eval = _exact_count(data.get('n_eval_tokens'), minimum=1)
+        if _n_eval is not None and _hold_tok and _n_eval not in _hold_tok:
+            problems.append('nested simple-baseline n_eval_tokens does not match its held-out token count')
+    elif data:
+        nested_applied = False
     best_name = None
+    best_ppl_value = None
     if selected_values:
         best_name = min(selected_values, key=selected_values.get)
         reported = artifact.get('best_baseline') or artifact.get('best_arm')
@@ -11806,14 +12013,28 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         if reported is not None and reported != best_name:
             problems.append(f'best_baseline={reported!r} is not the minimum selected arm ({best_name!r})')
         _reported_f = _finite_scalar(reported_ppl)
-        if _reported_f is not None and abs(_reported_f - selected_values[best_name]) > 1e-12:
-            problems.append('best_ppl does not match the minimum selected arm')
+        if nested_applied is True:
+            _expected = _finite_scalar((baselines.get(best_name) or {}).get('holdout_metric_value'))
+            if _expected is None:
+                problems.append('nested artifact cannot derive the selected arm\'s held-out floor')
+            else:
+                best_ppl_value = _expected
+                if _reported_f is None or abs(_reported_f - _expected) > 1e-12:
+                    problems.append('nested best_ppl is not the held-out value of the minimum selection-fold arm')
+        else:
+            best_ppl_value = selected_values.get(best_name)
+            if _reported_f is not None and abs(_reported_f - selected_values[best_name]) > 1e-12:
+                problems.append('best_ppl does not match the minimum selected arm')
     out = {'status': 'ok' if not problems else 'fail',
            'baseline_verified': not problems,
            'selection_metric': metric, 'selection_split': split,
            'arms': sorted(baselines), 'selected_values': selected_values,
            'best_baseline': best_name,
-           'best_ppl': (selected_values.get(best_name) if best_name is not None else None),
+           'best_ppl': best_ppl_value,
+           'best_ppl_estimation_rows': ('nested_validation_holdout' if nested_applied
+                                        else ('full_validation' if nested_applied is False else None)),
+           'nested_selection': nested_applied,
+           'row_split': row_split,
            'n_eval_tokens': n_tokens_by_arm,
            'data': data, 'problems': problems, 'warnings': warnings}
     if warnings and not problems:
@@ -14334,6 +14555,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 _ref_key, _ref = min(_cands, key=lambda kv: float(kv[1]['ppl_mean']))
                 _panel_val_fps = {r.get('val_fp') for r in recs.values() if r.get('val_fp')}
                 _panel_eval_fps = {r.get('eval_fp') for r in recs.values() if r.get('eval_fp')}
+                _panel_holdout_fps = {r.get('holdout_row_fp') for r in recs.values()
+                                      if r.get('holdout_row_fp')}
                 _sb_data = _sb.get('data') or {}
                 # `cache_val_fp` is the full validation cache fingerprint (the
                 # one panel records carry); `val_fp`/`eval_fp` describe the
@@ -14343,24 +14566,113 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 # 128-row floor and a 512-row panel PPL are different samples.
                 _sb_val_fp = _sb_data.get('cache_val_fp') or _sb_data.get('val_fp')
                 _sb_eval_fp = _sb_data.get('eval_fp')
+                _sb_row_split = _sb_data.get('row_split') if isinstance(_sb_data.get('row_split'), dict) else {}
+                _sb_nested = bool(_sb_data.get('nested_selection') is True or _sb_row_split)
+                _sb_holdout_row_fp = _sb_row_split.get('evaluation_row_fp')
                 _comparable = None
                 if _sb_val_fp and _panel_val_fps:
                     _comparable = _sb_val_fp in _panel_val_fps
-                if _comparable is True and _sb_eval_fp and _panel_eval_fps:
-                    if _sb_eval_fp not in _panel_eval_fps:
-                        _comparable = False
+                if _comparable is True:
+                    if _sb_nested:
+                        # Nested floor: compare the ROW-INDEX fingerprint of
+                        # the held-out fold, not the token fingerprint (the
+                        # panel records holdout_row_fp, not holdout token fp).
+                        if _sb_holdout_row_fp and _panel_holdout_fps:
+                            if _sb_holdout_row_fp not in _panel_holdout_fps:
+                                _comparable = False
+                                report['warnings'].append(
+                                    'nested simple-baseline holdout row fingerprint differs from the panel holdout rows — the floor and the panel scored different validation documents; the beats-floor comparison is refused')
+                        else:
+                            report['warnings'].append(
+                                'nested simple-baseline holdout rows cannot be matched to the panel '
+                                '(missing evaluation_row_fp or panel holdout_row_fp); the beats-floor comparison is unverified')
+                    elif _sb_eval_fp and _panel_eval_fps:
+                        if _sb_eval_fp not in _panel_eval_fps:
+                            _comparable = False
+                            report['warnings'].append(
+                                'simple-baseline eval row fingerprint differs from the panel final-eval rows — the floor and the panel scored different validation documents; the beats-floor comparison is refused')
+                _panel_ppl = float(_ref.get('ppl_primary', _ref['ppl_mean']))
+                _floor_ppl = float(_sb.get('best_ppl')) if _sb.get('best_ppl') is not None else None
+                # Token denominator: the floor is one deterministic pass; the
+                # panel's pooled n_tokens covers every seed, so divide by n.
+                _panel_tokens_per_seed = None
+                _n_seed = _as_seed_int(_ref.get('n_seeds'))
+                _n_tok = _exact_count(_ref.get('n_tokens'), minimum=1)
+                if _n_seed and _n_tok and _n_tok % _n_seed == 0:
+                    _panel_tokens_per_seed = int(_n_tok // _n_seed)
+                _floor_tokens = _exact_count(_sb_data.get('n_eval_tokens'), minimum=1)
+                _token_match = None
+                if _panel_tokens_per_seed is not None and _floor_tokens is not None:
+                    _token_match = bool(_panel_tokens_per_seed == _floor_tokens)
+                    if not _token_match:
                         report['warnings'].append(
-                            'simple-baseline eval row fingerprint differs from the panel final-eval rows — the floor and the panel scored different validation documents; the beats-floor comparison is refused')
+                            'simple-baseline evaluated %s tokens but the panel\'s held-out estimate covers %s tokens per seed — the PPLs are not on the same sample; the beats-floor comparison is refused'
+                            % (f'{_floor_tokens:,}', f'{_panel_tokens_per_seed:,}'))
+                        if _comparable is True:
+                            _comparable = False
+                _floor_cmp = None
+                if _comparable is True and _floor_ppl is not None:
+                    _ref_variant = _ref.get('variant')
+                    _ref_protocol = _ref.get('protocol') or ''
+                    _seed_vals = [float(r['ppl']) for (v, t, _s), r in recs.items()
+                                  if v == _ref_variant and (t or '') == _ref_protocol
+                                  and ppl_is_usable(r.get('ppl'))]
+                    if _seed_vals:
+                        _deltas = [x - _floor_ppl for x in _seed_vals]
+                        _fst = paired_effect_stats(_deltas, alpha=0.05,
+                                                   min_n=int(report.get('min_n') or 3))
+                        _pt = float(np.mean(_deltas))
+                        if _pt < 0:
+                            if _fst.get('significant'):
+                                _verdict = 'beats_floor_significant'
+                            elif _fst.get('underpowered') or _fst.get('resolution_limited'):
+                                _verdict = 'beats_floor_pointwise_underpowered'
+                            else:
+                                _verdict = 'beats_floor_pointwise_not_significant'
+                        else:
+                            _verdict = 'does_not_beat_floor'
+                        _floor_cmp = {
+                            'n': int(_fst.get('n') or 0),
+                            'mean_delta': _pt,
+                            'std': _fst.get('std'),
+                            'sem': _fst.get('sem'),
+                            'p_exact_signflip': _fst.get('p_exact_signflip'),
+                            'p_floor': _fst.get('p_floor'),
+                            'ci95_low': _fst.get('ci95_low'),
+                            'ci95_high': _fst.get('ci95_high'),
+                            'within_seed_noise': _fst.get('within_seed_noise'),
+                            'underpowered': _fst.get('underpowered'),
+                            'resolution_limited': _fst.get('resolution_limited'),
+                            'significant': _fst.get('significant'),
+                            'verdict': _verdict,
+                            'note': ('delta = panel seed PPL - deterministic floor PPL; negative means the panel beats the floor. '
+                                     'The floor is a fixed count model, so its uncertainty is the across-seed spread of the neural arm.'),
+                        }
+                        if _verdict == 'beats_floor_pointwise_not_significant':
+                            report['warnings'].append(
+                                'the panel is pointwise below the tuned count-model floor (%.4f vs %.4f) but the seed-level floor contrast is NOT significant (p=%.3g, n=%d) — do not describe this as beating the floor'
+                                % (_panel_ppl, _floor_ppl, float(_fst.get('p_exact_signflip') or float('nan')), int(_fst.get('n') or 0)))
+                        elif _verdict == 'beats_floor_pointwise_underpowered':
+                            report['warnings'].append(
+                                'the panel is pointwise below the count-model floor but the floor contrast is resolution-limited at n=%d (p floor %.3g); add seeds before claiming a beats-floor win'
+                                % (int(_fst.get('n') or 0), float(_fst.get('p_floor') or float('nan'))))
                 report['simple_baseline'].update({
                     'panel_reference_arm': _ref_key,
-                    'panel_reference_ppl': float(_ref.get('ppl_primary', _ref['ppl_mean'])),
+                    'panel_reference_ppl': _panel_ppl,
                     'panel_reference_protocol': _ref.get('protocol'),
                     'panel_val_fp': (sorted(_panel_val_fps)[:3] or None),
                     'panel_eval_fp': (sorted(_panel_eval_fps)[:3] or None),
+                    'panel_holdout_fp': (sorted(_panel_holdout_fps)[:3] or None),
                     'simple_eval_fp': _sb_eval_fp,
+                    'simple_holdout_row_fp': _sb_holdout_row_fp,
+                    'simple_nested_selection': _sb_nested,
+                    'panel_tokens_per_seed': _panel_tokens_per_seed,
+                    'simple_eval_tokens': _floor_tokens,
+                    'token_denominator_match': _token_match,
                     'comparable_to_panel': _comparable,
-                    'panel_beats_simple_floor': (bool(float(_ref.get('ppl_primary', _ref['ppl_mean'])) < float(_sb.get('best_ppl')))
-                                                 if _comparable is True and _sb.get('best_ppl') is not None
+                    'floor_contrast': _floor_cmp,
+                    'panel_beats_simple_floor': (bool(_panel_ppl < _floor_ppl)
+                                                 if _comparable is True and _floor_ppl is not None
                                                  else None),
                 })
                 if _comparable is False:
@@ -14372,7 +14684,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 elif report['simple_baseline'].get('panel_beats_simple_floor') is False:
                     report['warnings'].append(
                         'the panel\'s best declared-arm PPL (%.4f, %s) does not beat the tuned count-model floor (%.4f, %s) — the mechanism claim lacks the most basic baseline'
-                        % (float(_ref.get('ppl_primary', _ref['ppl_mean'])), _ref_key, float(_sb.get('best_ppl')),
+                        % (_panel_ppl, _ref_key, _floor_ppl,
                            _sb.get('best_baseline') or 'count-model'))
     if report['hypotheses_missing']:
         report['warnings'].append('no pre-registered hypothesis for: ' + ', '.join(sorted(set(report['hypotheses_missing']))) + ' — direction cannot be checked, so a significant result is at most measured')
