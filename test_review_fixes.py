@@ -5453,6 +5453,21 @@ def t_scale_ladder_budget_and_transfer_audit():
         assert any('lr=' in p for p in _o['problems']), _o
     out7 = L.scale_ladder_audit([va, tier('S2', 2000, 2000) | {'vocab': 32768}])
     assert out7['corpus_binding'].get('vocab') == 'shared', out7
+    # Seed identities are the basis of a cross-tier paired contrast.  A plan
+    # with duplicate/negative seeds is malformed, and differing seed sets must
+    # be disclosed instead of treating each tier's extra seeds as replication.
+    shared = L.scale_ladder_audit([tier('S1', 1000, 1000), tier('S2', 2000, 2000)])
+    assert shared['seed_set_shared'] is True and shared['n_common_seeds'] == 4, shared
+    diff = tier('S2', 2000, 2000); diff['cfg']['seeds'] = [2, 3, 4, 5]
+    od = L.scale_ladder_audit([tier('S1', 1000, 1000), diff])
+    assert od['seed_set_shared'] is False and od['seed_set_intersection'] == [2, 3], od
+    assert any('seed set' in w for w in od['warnings']), od
+    dup = tier('S1', 1000, 1000); dup['cfg']['seeds'] = [0, 0, 1, 1]
+    odup = L.scale_ladder_audit([dup, b])
+    assert odup['status'] == 'fail' and any('duplicate seed' in p for p in odup['problems']), odup
+    neg = tier('S1', 1000, 1000); neg['cfg']['seeds'] = [-1, 0, 1, 2]
+    oneg = L.scale_ladder_audit([neg, b])
+    assert oneg['status'] == 'fail' and any('negative' in p for p in oneg['problems']), oneg
 
 
 def t_init_core_fingerprint_and_pair_gate():

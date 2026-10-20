@@ -10628,6 +10628,16 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         except (KeyError, TypeError, ValueError, OverflowError) as e:
             problems.append(f'{name}: incomplete scale cfg ({type(e).__name__}: {e})')
             continue
+        _neg_seeds = sorted({s for s in seeds if s < 0})
+        if _neg_seeds:
+            problems.append(f'{name}: seed(s) {_neg_seeds[:5]} are negative; a seed id '
+                            'is a non-negative draw identity')
+        _dup_seeds = sorted(s for s, c in collections.Counter(seeds).items() if c > 1)
+        if _dup_seeds:
+            problems.append(f'{name}: duplicate seed(s) {_dup_seeds[:5]} in the declared '
+                            'plan; each seed contributes one paired draw, so duplicates '
+                            'would silently shrink the realised n')
+        _seed_set = frozenset(seeds)
         if min(steps, batch, seq) <= 0:
             problems.append(f'{name}: steps/batch_size/seq_len must be positive')
             continue
@@ -10658,8 +10668,9 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             'tokens_per_param': (effective_tokens / params if params else None),
             'params': params, 'lr': lr, 'warmup': warmup,
             'warmup_fraction': (warmup / steps if steps else None),
-            'n_seeds': len(set(seeds)),
-            'p_floor': signflip_p_floor(len(set(seeds))),
+            'n_seeds': len(_seed_set),
+            'seeds': sorted(_seed_set),
+            'p_floor': signflip_p_floor(len(_seed_set)),
             'min_seeds_for_family_significance': (signflip_min_n_for_holm(family_m, 0.05)
                                                   if family_m is not None else None),
         })
@@ -10721,8 +10732,37 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                                 'the cross-tier corpus binding is unverifiable for the rest')
             else:
                 binding[_fpk] = 'unverifiable'
+        # Cross-tier paired contrasts need the SAME seed identities, not just
+        # the same count.  Ragged completion is allowed, but the shared set is
+        # the only paired evidence; a tier with extra seeds cannot enter the
+        # paired test for those seeds.
+        _declared_sets = [set(r.get('seeds') or []) for r in rows]
+        _sets_present = [s for s in _declared_sets if s]
+        if not _sets_present:
+            seed_set_shared = None
+            _seed_common = []
+            warnings.append('no tier declares seeds — the cross-tier paired '
+                            'contrast and its family-resolution floor are unverifiable')
+        elif len(_sets_present) != len(rows):
+            seed_set_shared = False
+            _seed_common = sorted(set.intersection(*_sets_present))
+            warnings.append('only %d/%d tiers declare seeds; cross-tier pairing is '
+                            'unverifiable for the rest' % (len(_sets_present), len(rows)))
+        else:
+            _seed_common = sorted(set.intersection(*_declared_sets))
+            seed_set_shared = len({frozenset(s) for s in _declared_sets}) == 1
+            if not seed_set_shared:
+                warnings.append(
+                    'tiers do not share one seed set (common seeds: %s; per-tier n: %s) — '
+                    'cross-tier paired contrasts can use only the common seeds, and extra '
+                    'seeds are not replication of the other tiers'
+                    % (_seed_common or 'none',
+                       ', '.join('%s=%d' % (r['name'], r['n_seeds']) for r in rows)))
         out = {'status': ('fail' if problems else ('warn' if warnings else 'ok')),
                'budget_matched': (budget_matched if len(rows) >= 2 else None),
+               'seed_set_shared': seed_set_shared,
+               'seed_set_intersection': _seed_common,
+               'n_common_seeds': len(_seed_common),
                'tokens_per_param_ratio': tpp_ratio,
                'tokens_per_param_tolerance': tol,
                'lr_constant': (lr_constant if len(rows) >= 2 else None),
