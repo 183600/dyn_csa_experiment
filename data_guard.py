@@ -1462,7 +1462,8 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
                       clean_train=False, label_conflicts='drop',
                       drop_invalid_labels=False,
                       check_cross_split_duplicates=True,
-                      quality_kwargs=None, **preprocessor_kwargs):
+                      quality_kwargs=None, fail_on_quality=False,
+                      **preprocessor_kwargs):
     """Split first, then fit every preprocessing statistic on train only.
 
     This is the fail-closed convenience entry point for the whole data path::
@@ -1477,6 +1478,10 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     Passing ``quality_report=True`` additionally runs
     :func:`data_quality_report` on the raw table with the same split indices
     (still train-only statistics for the outlier/shift reference).
+    ``fail_on_quality=True`` runs that report even when ``quality_report`` is
+    false and refuses to return data when its status is ``'fail'`` — a hard
+    data-quality failure (label noise, NaN/Inf, cross-split duplicates, ...)
+    must not be silently carried into a model fit.  Warnings remain warnings.
     ``clean_train=True`` first removes exact duplicate training rows and, by
     default, ambiguous duplicate-label clusters via
     :func:`clean_training_rows`; ``drop_invalid_labels=True`` additionally
@@ -1549,6 +1554,10 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
         out['preprocessor'] = prep
     else:
         out['preprocessor'] = None
+    if fail_on_quality:
+        # A strict caller asked for the gate, so the report must run even if
+        # quality_report was left at its default.
+        quality_report = True
     if quality_report:
         kw = dict(quality_kwargs or {})
         # Forward the same ordering/group keys that produced the split so the
@@ -1560,6 +1569,12 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
         out['quality'] = data_quality_report(
             Xarr, y=yarr, train_idx=idx['train'], val_idx=idx['val'],
             test_idx=idx['test'], **kw)
+        if fail_on_quality and out['quality'].get('status') == 'fail':
+            _hard = list(out['quality'].get('hard_failures') or [])
+            raise RuntimeError(
+                'split_and_prepare: the post-split data-quality gate failed; '
+                'refusing to fit preprocessing/model on this split: '
+                + ('; '.join(_hard) if _hard else 'see the quality report'))
     return out
 
 

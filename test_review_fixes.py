@@ -4849,6 +4849,28 @@ def t_split_and_prepare_fits_train_only():
         'train__val': 0, 'train__test': 0, 'val__test': 0}, ok
 
 
+def t_split_and_prepare_strict_quality_gate():
+    # A recorded 'fail' report must not be returned as failure-free data when
+    # the caller asked for a strict gate.  The holdout is never used to make
+    # the decision: the NaN is in the training split.
+    X = np.array([[0.0], [1.0], [np.nan], [2.0], [3.0], [4.0]])
+    rep = L.split_and_prepare(X, train_frac=0.5, val_frac=0.25, test_frac=0.25,
+                              quality_report=True)
+    assert rep['quality']['status'] == 'fail', rep['quality']
+    try:
+        L.split_and_prepare(X, train_frac=0.5, val_frac=0.25, test_frac=0.25,
+                            fail_on_quality=True)
+    except RuntimeError as e:
+        assert 'data-quality gate failed' in str(e), e
+    else:
+        raise AssertionError('fail_on_quality must refuse a failing quality report')
+    # Warnings alone do not abort; the split is returned with its report.
+    ok = L.split_and_prepare(np.arange(6.0).reshape(-1, 1),
+                             train_frac=0.5, val_frac=0.25, test_frac=0.25,
+                             fail_on_quality=True)
+    assert ok['quality']['status'] != 'fail', ok['quality']
+
+
 def t_data_quality_temporal_audit():
     # Indices built outside the split helpers must still be audited for time
     # leakage: row/group disjointness alone cannot catch a shuffled series.
@@ -8442,6 +8464,7 @@ def main():
     _check('I19 simple-baseline audit reports malformed records instead of crashing', t_simple_baseline_audit_malformed_records)
     _check('I20 index aliasing, non-finite labels, signed-zero duplicates, undefined SMD, NaT groups', t_data_guard_index_label_and_shift_edges)
     _check('I21 split-and-prepare fits preprocessing on train only', t_split_and_prepare_fits_train_only)
+    _check('I21d strict post-split quality gate', t_split_and_prepare_strict_quality_gate)
     _check('I21a data-quality temporal split audit', t_data_quality_temporal_audit)
     _check('I21b capped test document-id sidecar', t_capped_document_id_sidecar)
     _check('I21c near-duplicate document chains stay on one side', t_document_dedup_closes_near_duplicate_chains)
