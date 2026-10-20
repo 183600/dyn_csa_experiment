@@ -323,3 +323,13 @@ subtracting a subset best from a full-batch final. Early-stop records carry
 shows the completed/planned budget so unequal-budget arms cannot look
 equal-budget. The efficiency summary also treats zero within-seed variance as
 unverifiable rather than as evidence of a significant difference.
+
+Additional result-analysis hardening (no new runs): `analyze_errors` now tallies
+the heuristic causes over the whole evaluated split (not only the worst
+tokens) and records each cause's share/mean CE, while the worst-token
+inventory keeps the manual-review samples. `audit_gates.training_health`
+fails closed when a record's `instability_diagnosis` says clean while its own
+event counters or validation curve say non-finite, and warns on unhealthy or
+un-triaged legacy records. The efficiency summary also flags PPL comparisons
+made across different `tokens_seen` budgets and falls back to the recorded
+training peak memory when the timing record has none.
