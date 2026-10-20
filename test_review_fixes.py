@@ -303,6 +303,152 @@ def t_training_health_noise_aware_threshold():
     assert L.classify_training_health(hist_bad)['status'] == 'overfitting'
 
 
+def t_training_health_actions_and_gap():
+    # The classifier must not stop at a label: overfitting needs concrete
+    # next steps and the widening train-val gap must be measured, not implied.
+    hist = [{'step': i * 100, 'train_ce': 6.0 - 0.30 * i,
+             'val_ce': 4.0 + 0.05 * i, 'val_ppl': 55.0 + 0.5 * i,
+             'gap': (4.0 + 0.05 * i) - (6.0 - 0.30 * i)} for i in range(6)]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'overfitting', h
+    assert h.get('actions'), h
+    assert any('regularization' in a for a in h['actions']), h
+    assert h['gap_slope_per_step'] is not None and h['gap_slope_per_step'] > 0.0, h
+    assert h['steps_since_best'] is not None and h['steps_since_best'] > 0, h
+    assert any('best-validation' in a for a in h['actions']), h
+    stalled = [{'step': i * 100, 'train_ce': 4.0, 'val_ce': 4.0,
+                'val_ppl': 55.0, 'gap': 0.0} for i in range(6)]
+    hs = L.classify_training_health(stalled)
+    assert hs['status'] == 'underfitting_or_stalled', hs
+    assert any('data pipeline' in a for a in hs['actions']), hs
+    bad = [{'step': i * 100, 'train_ce': 4.0, 'val_ce': 4.0,
+            'val_ppl': float('nan')} for i in range(6)]
+    hn = L.classify_training_health(bad)
+    assert hn['status'] == 'nonfinite', hn
+    assert any('NaN triage' in a for a in hn['actions']), hn
+
+
+def t_early_stop_decision():
+    hist = [{'step': 100, 'val_ppl': 50.0}, {'step': 200, 'val_ppl': 48.0}]
+    assert L.early_stop_decision(hist, patience=2)['should_stop'] is False
+    hist += [{'step': 300, 'val_ppl': 48.0}, {'step': 400, 'val_ppl': 48.1}]
+    d = L.early_stop_decision(hist, patience=2)
+    assert d['should_stop'] is True and d['stale_evals'] == 2, d
+    assert d['best_step'] == 200 and d['best_val_ppl'] == 48.0, d
+    # A real improvement resets the patience counter; min_delta makes a tiny
+    # change explicitly insufficient.
+    hist2 = [{'step': 100, 'val_ppl': 50.0}, {'step': 200, 'val_ppl': 49.0},
+             {'step': 300, 'val_ppl': 48.9}, {'step': 400, 'val_ppl': 47.0}]
+    assert L.early_stop_decision(hist2, patience=2)['should_stop'] is False
+    tight = L.early_stop_decision(hist2[:3], patience=2, min_delta=2.0)
+    assert tight['should_stop'] is True, tight
+    assert L.early_stop_decision([], patience=1)['should_stop'] is False
+    for bad_p in (0, -1, True, 1.5, '2'):
+        try:
+            L.early_stop_decision(hist, patience=bad_p)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'patience={bad_p!r} must be refused')
+    for bad_d in (-1.0, float('nan'), float('inf'), True):
+        try:
+            L.early_stop_decision(hist, patience=1, min_delta=bad_d)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'min_delta={bad_d!r} must be refused')
+
+
+def t_nan_diagnosis_path():
+    clean = L.diagnose_training_instability(
+        {'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                              'amp_scaler_overflows': 0, 'events': []}},
+        data_checked='startup')
+    assert clean['status'] == 'clean' and clean['primary_suspect'] is None, clean
+    # fp16 scaler overflow is triaged before a generic gradient claim.
+    fp16 = L.diagnose_training_instability({
+        'amp_dtype': 'fp16',
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 1,
+                             'amp_scaler_overflows': 3, 'amp_scaler_scale_min': 0.25,
+                             'grad_norm_max': 1000.0,
+                             'events': [{'kind': 'grad', 'grad_norm': float('inf'), 'lr': 3e-4}]}})
+    assert fp16['status'] == 'instability_observed', fp16
+    assert fp16['primary_suspect'] == 'fp16_overflow', fp16
+    # A non-finite loss whose CE is finite points at the auxiliary term.
+    loss = L.diagnose_training_instability({
+        'amp_dtype': 'bf16',
+        'opt_diag_summary': {'nonfinite_loss_steps': 2, 'nonfinite_grad_steps': 0,
+                             'events': [{'kind': 'loss', 'loss': float('nan'),
+                                         'ce': 4.2, 'comp_reg': float('nan'),
+                                         'boundary_pg': 0.0, 'lr': 3e-4}]}})
+    assert loss['primary_suspect'] == 'forward_loss_numerics', loss
+    assert 'compression regularizer' in loss['checks'][1]['evidence'], loss
+    # A guarded attention value is evidence even when the loss never went bad.
+    guard = L.diagnose_training_instability({
+        'amp_dtype': None,
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                             'nan_guard': {'elements_cleaned': 12,
+                                           'first': {'where': 'indexer_softmax'}},
+                             'events': []}})
+    assert guard['primary_suspect'] == 'attention_pool_nan_to_num', guard
+    assert guard['checks'][0]['status'] == 'unknown', guard
+    # Plain gradient explosion with finite loss in bf16.
+    grad = L.diagnose_training_instability({
+        'amp_dtype': 'bf16',
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 1,
+                             'amp_scaler_overflows': 0, 'grad_norm_max': float('inf'),
+                             'events': [{'kind': 'grad', 'grad_norm': float('inf'), 'lr': 1e-2}]}})
+    assert grad['primary_suspect'] == 'gradient_explosion_lr', grad
+
+
+def t_token_error_cause_taxonomy():
+    # The bad-case file must say why a token is hard, not only how large its CE
+    # is.  These are deliberately heuristic labels with a manual-review caveat.
+    rare = L.classify_token_error(ce=8.0, entropy=1.0, margin=4.0, rare_target=True,
+                                  target_id=7, topk_ids=[7, 8], vocab=100)
+    assert rare['primary'] == 'annotation_or_rare_target', rare
+    amb = L.classify_token_error(ce=4.0, entropy=math.log(100) * 0.9, margin=0.1,
+                                 rare_target=False, target_id=7, topk_ids=[7, 8], vocab=100)
+    assert amb['primary'] == 'ambiguous_context' and 'ambiguous_context' in amb['causes'], amb
+    blind = L.classify_token_error(ce=8.0, entropy=1.0, margin=5.0, rare_target=False,
+                                   target_id=7, topk_ids=[3, 4], vocab=100)
+    assert blind['primary'] == 'confident_model_blind_spot', blind
+    assert blind['target_in_topk'] is False, blind
+    outside = L.classify_token_error(ce=4.0, entropy=2.0, margin=1.0, rare_target=False,
+                                     target_id=7, topk_ids=[3, 4], vocab=100)
+    assert outside['primary'] == 'target_outside_topk' and outside['target_in_topk'] is False, outside
+    unmeasured = L.classify_token_error(ce=float('nan'), entropy=1.0, margin=1.0,
+                                        rare_target=False, target_id=7,
+                                        topk_ids=[3, 4], vocab=100)
+    assert unmeasured['primary'] == 'unmeasured', unmeasured
+
+
+def t_train_variant_early_stop_record():
+    ids = np.arange(2048, dtype=np.int64) % 997
+    val = (np.arange(64, dtype=np.int64) % 997).reshape(4, 16)
+    kw = dict(d=32, n_layers=1, n_heads=2, d_head=16, seq_len=16, batch_size=2,
+              steps=4, lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0,
+              eval_every=1, eval_subset=2, mlp_ratio=4.0,
+              device=torch.device('cpu'), log_every=0)
+    r = L.train_variant('full', ids, val, 997, seed=0,
+                        early_stop_patience=1, early_stop_min_delta=1e9, **kw)
+    es = r.get('early_stop') or {}
+    assert es.get('stopped') is True and es.get('stopped_step') == 2, es
+    assert r['steps'] == 4 and r['steps_completed'] == 2, r
+    assert r['tokens_seen'] == 2 * 2 * 16, r['tokens_seen']
+    assert r['opt_diag_summary']['n_steps_completed'] == 2, r['opt_diag_summary']
+    r2 = L.train_variant('full', ids, val, 997, seed=0, **dict(kw, steps=2))
+    assert r2['steps_completed'] == 2 and r2.get('early_stop') is None, r2
+    assert r2['tokens_seen'] == 2 * 2 * 16, r2['tokens_seen']
+    try:
+        L.train_variant('full', ids, val, 997, seed=0,
+                        early_stop_patience=1, **dict(kw, eval_every=0))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('early stopping without a validation grid must be refused')
+
+
 def t_rope_arms_are_not_batched():
     # The implementation binding must report eager_batch=False for the rope csa
     # arms because `HybridAttentionRoPE.forward` unconditionally takes the
@@ -6585,6 +6731,51 @@ def t_efficiency_pairs_audit_and_sweep():
     assert sw['decode_has_kv_cache'] is False and sw['measurement'] == 'cpu perf_counter', sw
 
 
+def t_efficiency_pareto_is_grouped():
+    a = {'device': 'cuda:0', 'torch': '2.8.0', 'n_tokens': 512,
+         'decode_has_kv_cache': False, 'prefill_ms_p50': 10.0}
+    assert BR.efficiency_group_key(a) == ('cuda:0', '2.8.0', 512, False)
+    assert BR.efficiency_group_key(dict(a, n_tokens=4096)) != BR.efficiency_group_key(a)
+    assert BR.efficiency_group_key(dict(a, device='cuda:1')) != BR.efficiency_group_key(a)
+    assert BR.efficiency_group_key(dict(a, torch='2.9.0')) != BR.efficiency_group_key(a)
+    assert BR.efficiency_group_key(dict(a, decode_has_kv_cache=True)) != BR.efficiency_group_key(a)
+    for bad in (dict(a, device=''), dict(a, torch=None), dict(a, n_tokens=True),
+                dict(a, n_tokens=1.5), dict(a, n_tokens=0),
+                {k: v for k, v in a.items() if k != 'decode_has_kv_cache'}):
+        assert BR.efficiency_group_key(bad) is None, bad
+    # Lower latency at higher PPL is dominated; only the true staircase stays.
+    fr = BR.efficiency_pareto([(10.0, 100.0, 'a'), (20.0, 90.0, 'b'),
+                               (30.0, 95.0, 'c'), (5.0, 110.0, 'd')])
+    assert [x[2] for x in fr] == ['d', 'a', 'b'], fr
+    assert BR.efficiency_pareto([(float('nan'), 90.0, 'x'), (10.0, 100.0, 'a')]) == [(10.0, 100.0, 'a')]
+
+
+def t_report_nan_section_uses_triage():
+    rec = {'instability_diagnosis': {
+        'status': 'instability_observed', 'primary_suspect': 'fp16_overflow',
+        'checks': [{'check': 'fp16_overflow', 'status': 'observed',
+                    'evidence': 'overflows=2', 'action': 'switch to bf16'}]},
+        'opt_diag_summary': {'first_bad_step': 17, 'nonfinite_loss_steps': 0,
+                             'nonfinite_grad_steps': 2, 'amp_scaler_overflows': 2,
+                             'nan_guard': {'elements_cleaned': 0}}}
+    orig = BR._result_summaries
+    BR._result_summaries = lambda: {'results_unit': {'a::s0': rec}}
+    try:
+        txt = BR.sec_nan_diagnostics()
+    finally:
+        BR._result_summaries = orig
+    assert 'Non-finite' in txt and 'fp16_overflow' in txt, txt
+    assert 'switch to bf16' in txt and '17' in txt, txt
+    orig = BR._result_summaries
+    BR._result_summaries = lambda: {'results_unit': {'a::s0': {'opt_diag_summary': {
+        'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+        'nan_guard': {'elements_cleaned': 0}}}}}
+    try:
+        assert BR.sec_nan_diagnostics() == ''
+    finally:
+        BR._result_summaries = orig
+
+
 def t_release_readiness_audit():
     td = tempfile.mkdtemp(prefix='rel_', dir=REPO)
     old_repo = A.REPO
@@ -9049,6 +9240,11 @@ def main():
     _check('A4d deterministic document bootstrap CI', t_bootstrap_mean_ci)
     _check('A4e training-health classifier: measured vs unmonitored vs nonfinite', t_training_health_classifier)
     _check('A4f training-health threshold is slope-noise aware (2*SE)', t_training_health_noise_aware_threshold)
+    _check('A4g training-health actions + widening gap', t_training_health_actions_and_gap)
+    _check('A4h early-stop decision policy', t_early_stop_decision)
+    _check('A4i NaN triage path', t_nan_diagnosis_path)
+    _check('A4j bad-case cause taxonomy', t_token_error_cause_taxonomy)
+    _check('A4k early stop is recorded and token accounting follows completed steps', t_train_variant_early_stop_record)
     _check('A4g rope arms never claim the batched eager twin', t_rope_arms_are_not_batched)
     _check('A4g2 apply_rope preserves width (over-long/odd rope_dim)', t_apply_rope_preserves_width)
     _check('A4g3 numeric helpers accept NumPy scalars', t_stats_accept_numpy_scalars)
@@ -9242,6 +9438,8 @@ def main():
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)
     _check('L7 stale length panel excluded from report', t_sec_p1l_excludes_stale_records)
     _check('L8 efficiency-pair audit + shape sweep', t_efficiency_pairs_audit_and_sweep)
+    _check('L8b efficiency Pareto is grouped by comparable measurements', t_efficiency_pareto_is_grouped)
+    _check('L8c report NaN section reads the triage path', t_report_nan_section_uses_triage)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)

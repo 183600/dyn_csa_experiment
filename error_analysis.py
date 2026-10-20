@@ -2,9 +2,9 @@
 """Bad-case / error analysis for a saved CSA checkpoint.
 
 Zero training: load one checkpoint, score a fixed validation split, and write
-  analysis_errors/bad_cases.jsonl   worst tokens + worst sequences
-  analysis_errors/bad_cases.md      human-readable samples
-  analysis_errors/summary.json      bucket statistics and label checks
+  analysis_errors/bad_cases.jsonl   worst tokens + worst sequences (with cause triage)
+  analysis_errors/bad_cases.md      human-readable samples + a manual-review checklist
+  analysis_errors/summary.json      bucket statistics, label checks and heuristic cause counts
 
 The analysis is deliberately restricted to the validation split.  The frozen
 test split must only be touched through v12's one-shot freeze protocol; feeding
@@ -166,12 +166,20 @@ def main(argv=None):
         _mce = v.get('mean_ce')
         _ppl = v.get('perplexity')
         lines.append(f'| {k} | {v.get("n")} | {("n/a" if _mce is None else f"{_mce:.3f}")} | {("n/a" if _ppl is None else f"{_ppl:.2f}")} |')
+    _counts = res.get('cause_counts') or {}
+    _guide = res.get('cause_guide') or {}
+    if _counts:
+        lines += ['', '## Error-cause triage (heuristic, not a verdict)', '',
+                  '> These labels only direct the manual review. An "annotation_or_rare_target" case may be a correct but rare label; an "ambiguous_context" case may have no defensible single answer. Read the context and the label before changing the model.', '',
+                  '| cause | worst-token count | what to check |', '|---|---|---|']
+        for c, n in sorted(_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            lines.append(f'| {c} | {n} | {(_guide.get(c) or "").replace("|", "\\|")} |')
     lines += ['', '## Worst tokens', '',
-              '| # | row | pos | CE | target | predicted | entropy | rare | boundary |', '|---|---|---|---|---|---|---|---|---|']
+              '| # | row | pos | CE | target | predicted | entropy | rare | cause | boundary |', '|---|---|---|---|---|---|---|---|---|---|']
     for i, t in enumerate(res.get('worst_tokens') or []):
         tgt = (t.get('target_text') or '').replace('|', '\\|').replace('\n', '\\n')[:80]
         prd = (t.get('pred_text') or '').replace('|', '\\|').replace('\n', '\\n')[:80]
-        lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | {t["ce"]:.3f} | `{t.get("target_id")}` {tgt} | `{t.get("pred_id")}` {prd} | {t["entropy"]:.3f} | {t.get("rare_target")} | {t.get("is_boundary_token")} |')
+        lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | {t["ce"]:.3f} | `{t.get("target_id")}` {tgt} | `{t.get("pred_id")}` {prd} | {t["entropy"]:.3f} | {t.get("rare_target")} | {t.get("cause_primary")} | {t.get("is_boundary_token")} |')
     lines += ['', '## Worst sequences', '',
               '| # | row | mean CE | NLL | context (truncated) |', '|---|---|---|---|---|']
     for i, s in enumerate(res.get('worst_sequences') or []):
@@ -185,7 +193,7 @@ def main(argv=None):
         for i, t in enumerate(paired.get('worst_tokens_for_b') or []):
             tg = (t.get('target_text') or '').replace('|', '\\|').replace('\n', '\\n')[:60]
             lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | `{t["target_id"]}` {tg} | {t["ce_a"]:.3f} | {t["ce_b"]:.3f} | {t["delta_b_minus_a"]:+.3f} |')
-    lines += ['', '> This file is a diagnostic starting point, not a result table. Inspect the labelled target and context before declaring a model failure: annotation errors, near-duplicates, genuinely ambiguous text and rare tokens all look like "high CE".', '']
+    lines += ['', '> This file is a diagnostic starting point, not a result table. Inspect the labelled target and context before declaring a model failure: annotation errors, near-duplicates, genuinely ambiguous text and rare tokens all look like "high CE". The automatic cause label is a triage heuristic; only a manual read of the context and label can separate an annotation error from an ambiguous example from a model blind spot.', '']
     L.atomic_write_text(os.path.join(args.outdir, 'bad_cases.md'), '\n'.join(lines) + '\n')
     print(f'[errors] wrote {jsonl}, {os.path.join(args.outdir, "bad_cases.md")}, {os.path.join(args.outdir, "summary.json")}' + (' + paired comparison' if paired else ''))
     return res

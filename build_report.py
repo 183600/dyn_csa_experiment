@@ -1764,6 +1764,94 @@ def sec_training_health():
     return '\n'.join(lines) + '\n'
 
 
+def efficiency_group_key(eff):
+    """Comparability key for a measured efficiency record.
+
+    A latency/PPL frontier is only meaningful when token count, device, torch
+    build and KV semantics are identical.  Missing provenance yields None
+    (unverifiable), never a shared default bucket.
+    """
+    if not isinstance(eff, dict):
+        return None
+    dev = eff.get('device')
+    torch_v = eff.get('torch')
+    n_tok = eff.get('n_tokens')
+    kv = eff.get('decode_has_kv_cache')
+    if not isinstance(dev, str) or not dev:
+        return None
+    if not isinstance(torch_v, str) or not torch_v:
+        return None
+    if isinstance(n_tok, (bool, np.bool_)) or not isinstance(n_tok, (int, np.integer)) or int(n_tok) < 1:
+        return None
+    if not isinstance(kv, (bool, np.bool_)):
+        return None
+    return (dev, torch_v, int(n_tok), bool(kv))
+
+
+def efficiency_pareto(points):
+    """Non-dominated (latency, PPL) points within ONE comparable group."""
+    pts = []
+    for p in (points or []):
+        if not isinstance(p, (tuple, list)) or len(p) < 3:
+            continue
+        lat = _as_finite(p[0])
+        ppl = _as_finite(p[1])
+        if lat is None or ppl is None or lat < 0.0:
+            continue
+        pts.append((lat, ppl, p[2]))
+    pts.sort(key=lambda t: (t[0], t[1], str(t[2])))
+    frontier = []
+    best_ppl = float('inf')
+    for lat, ppl, label in pts:
+        if ppl < best_ppl:
+            best_ppl = ppl
+            frontier.append((lat, ppl, label))
+    return frontier
+
+
+def sec_nan_diagnostics():
+    rows = []
+    for name, s in _result_summaries().items():
+        for key, rec in s.items():
+            if not isinstance(rec, dict):
+                continue
+            d = rec.get('instability_diagnosis')
+            if not isinstance(d, dict):
+                o = rec.get('opt_diag_summary')
+                if not isinstance(o, dict):
+                    continue
+                n_loss = o.get('nonfinite_loss_steps') or 0
+                n_grad = o.get('nonfinite_grad_steps') or 0
+                guard = o.get('nan_guard') if isinstance(o.get('nan_guard'), dict) else {}
+                if not (n_loss or n_grad or guard.get('elements_cleaned')):
+                    continue
+                d = {'status': 'undiagnosed', 'primary_suspect': 'unknown',
+                     'summary': 'non-finite events are present but this record predates the triage path'}
+            elif d.get('status') == 'clean':
+                continue
+            o = rec.get('opt_diag_summary') if isinstance(rec.get('opt_diag_summary'), dict) else {}
+            rows.append((name, key, rec, d, o))
+    if not rows:
+        return ''
+    lines = ['## Non-finite (NaN/Inf) diagnostics', '',
+             '> Triage order: data NaN/Inf -> forward/loss and log(0)/div0/softmax -> fp16 gradient-scaler overflow -> gradient explosion or LR. A check that this record cannot answer is reported as unverifiable, not as clean.', '',
+             '| panel | cell | status | first suspect | first bad step | loss / grad steps | fp16 overflows | guarded attention values | action |', '|---|---|---|---|---|---|---|---|---|']
+    for name, key, rec, d, o in rows[:200]:
+        guard = o.get('nan_guard') if isinstance(o.get('nan_guard'), dict) else {}
+        action = ''
+        for c in (d.get('checks') or []):
+            if isinstance(c, dict) and c.get('check') == d.get('primary_suspect'):
+                action = c.get('action') or ''
+                break
+        lines.append('| %s | `%s` | %s | %s | %s | %s / %s | %s | %s | %s |' % (
+            name, key, d.get('status'), d.get('primary_suspect'),
+            fm(o.get('first_bad_step'), 0), fm(o.get('nonfinite_loss_steps'), 0),
+            fm(o.get('nonfinite_grad_steps'), 0), fm(o.get('amp_scaler_overflows'), 0),
+            fm(guard.get('elements_cleaned'), 0), str(action).replace('|', '\\|')))
+    lines += ['', '> This section is diagnostic only. A skipped optimizer update is not a fix: inspect the first bad step in `opt_diag.events`, reproduce with `CSA_STRICT_NAN=1` when the attention/pooling guard fired, and record the action in the decision log before comparing the run with others.', '']
+    return '\n'.join(lines) + '\n'
+
+
 def sec_efficiency():
     rows = []
     for name, s in _result_summaries().items():
@@ -1786,26 +1874,29 @@ def sec_efficiency():
             name, key, fm(pm), fm(eff.get('prefill_ms_p50'), 2), fm(eff.get('prefill_ms_p95'), 2),
             fm(eff.get('tokens_per_s_prefill'), 1), fm(eff.get('prefix_prefill_ms_p50'), 2),
             fm(eff.get('peak_mem_allocated_mb'), 1), fm(eff.get('peak_mem_reserved_mb'), 1)))
-    # Simple Pareto frontier over (PPL, prefill p50): keep points that are not
-    # dominated by another measured arm.
-    _pts = []
+    groups = collections.OrderedDict()
+    ungrouped = []
     for name, key, rec, eff in rows:
+        gk = efficiency_group_key(eff)
         ppl = rec.get('ppl')
         lat = eff.get('prefill_ms_p50')
-        if isinstance(ppl, (int, float)) and math.isfinite(ppl) and isinstance(lat, (int, float)) and math.isfinite(lat):
-            _pts.append((float(lat), float(ppl), name, key))
-    _pts.sort()
-    _frontier = []
-    _best_ppl = float('inf')
-    for lat, ppl, name, key in _pts:
-        if ppl < _best_ppl:
-            _best_ppl = ppl
-            _frontier.append((lat, ppl, name, key))
-    if _frontier:
-        lines += ['', '**Pareto frontier (lower PPL at no higher prefill latency)**:', '']
-        for lat, ppl, name, key in _frontier:
-            lines.append(f'- `{name}` / `{key}`: PPL {fm(ppl)}, prefill p50 {fm(lat, 2)} ms')
-    lines += ['', '> A PPL improvement should be read together with this table: a small gain accompanied by much higher latency or memory is not a deployable improvement.', '']
+        if gk is None:
+            ungrouped.append((name, key))
+            continue
+        groups.setdefault(gk, []).append((lat, ppl, f'{name} / `{key}`'))
+    if groups:
+        lines += ['', '**Pareto frontiers within comparable measurement groups**', '',
+                  '> A frontier is drawn only inside one (device, torch, token-count, KV-semantics) group. A PPL difference between groups is confounded by input shape or hardware and is not an architecture comparison.', '']
+        for gk, pts in groups.items():
+            frontier = efficiency_pareto(pts)
+            if not frontier:
+                continue
+            lines += [f'- device `{gk[0]}`, torch `{gk[1]}`, {gk[2]} tokens, KV={gk[3]}:', '']
+            for lat, ppl, label in frontier:
+                lines.append(f'  - {label}: PPL {fm(ppl)}, prefill p50 {fm(lat, 2)} ms')
+        if ungrouped:
+            lines += ['', f'> {len(ungrouped)} measured record(s) were excluded from every frontier because device/torch/token-count/KV provenance is missing (unverifiable, not assumed equal): ' + ', '.join(f'`{n}`/`{k}`' for n, k in ungrouped[:20]) + ('.' if len(ungrouped) <= 20 else ', ...'), '']
+    lines += ['', '> A PPL improvement should be read together with this table: a small gain accompanied by much higher latency or memory is not a deployable improvement. Compare only within a group; a latency measured at 512 tokens cannot be subtracted from one measured at 4096.', '']
     return '\n'.join(lines) + '\n'
 
 
@@ -1863,7 +1954,7 @@ def main(argv=None):
     parts = [sec_header(), '---\n']
     failed = []
     _reset_claim_registry()
-    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_efficiency, sec_stats, sec_global_multiplicity):
+    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_nan_diagnostics, sec_efficiency, sec_stats, sec_global_multiplicity):
         try:
             parts.append(sec())
         except Exception as e:

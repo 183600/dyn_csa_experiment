@@ -394,9 +394,35 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     else:
         status = 'validation_degrading'
         reason = 'validation CE is rising in the tail'
+    gap_s, gap_se = _curve_slope_stats(entries, 'gap', k=tail_k)
+    best_step = int(best[0]) if best is not None else None
+    last_step = int(last[0]) if last is not None else None
+    final_minus_best = (float(last[1] - best[1])
+                        if (best is not None and last is not None) else None)
+    steps_since_best = ((last_step - best_step)
+                        if (best_step is not None and last_step is not None) else None)
+    actions = []
+    if status == 'overfitting':
+        actions.append('add or strengthen regularization (weight decay / dropout) and/or increase unique training data')
+        actions.append('use the best-validation checkpoint or stop at best_step instead of reporting only the final step')
+    elif status == 'underfitting_or_stalled':
+        actions.append('verify the data pipeline (target shift, tokenizer/vocab mapping) before changing the model')
+        actions.append('check the learning-rate schedule and warmup; try a different LR before increasing capacity')
+        actions.append('if both curves are flat but low, train longer or increase capacity')
+    elif status == 'validation_degrading':
+        actions.append('inspect the first rising validation point and the accompanying train CE; if train CE is also flat, treat it as an optimization/data issue rather than overfitting')
+    elif status == 'nonfinite':
+        actions.append('follow the NaN triage path: data NaN/Inf -> log(0)/div0/softmax -> fp16 overflow -> gradient explosion/LR')
+    if (final_minus_best is not None and final_minus_best > 0.0
+            and steps_since_best is not None and steps_since_best > 0):
+        actions.append(f'final PPL is above the best observed PPL by {final_minus_best:.4g}; the curve, not just the final value, must be reported')
+    if (gap_s is not None and math.isfinite(gap_s) and gap_s > 0.0
+            and gap_se is not None and gap_s > 2.0 * gap_se):
+        actions.append('the train-validation gap is widening in the tail; this is direct overfitting evidence even if the validation slope is still small')
     return {
         'status': status,
         'reason': reason,
+        'actions': actions,
         'n_points': len(entries),
         'n_nonfinite': int(n_bad),
         'n_train_ce_measured': int(n_train_measured),
@@ -409,11 +435,174 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         'val_slope_tol': val_tol,
         'slope_tol_mode': ('adaptive_2se' if slope_tol is None else 'fixed'),
         'gap_last': last_gap,
-        'best_step': int(best[0]) if best is not None else None,
+        'gap_slope_per_step': gap_s,
+        'gap_slope_se': gap_se,
+        'best_step': best_step,
         'best_val_ppl': float(best[1]) if best is not None else None,
         'final_val_ppl': float(last[1]) if last is not None else None,
-        'final_minus_best': (float(last[1] - best[1]) if (best is not None and last is not None) else None),
+        'final_minus_best': final_minus_best,
+        'steps_since_best': steps_since_best,
     }
+
+
+def early_stop_decision(history, *, patience, min_delta=0.0):
+    """Return whether a validation curve has stopped improving.
+
+    ``patience`` is the number of consecutive finite validation points that may
+    fail to improve on the best PPL before stopping.  ``min_delta`` is an
+    absolute PPL margin: a point must be at least ``min_delta`` below the best
+    to count as an improvement.  This is a pure decision helper so the policy
+    can be tested without training; the caller decides whether unequal token
+    budgets are acceptable for its comparison.
+    """
+    if isinstance(patience, (bool, np.bool_)) or not isinstance(patience, (int, np.integer)):
+        raise ValueError(f'early-stop patience must be a positive integer, got {patience!r}')
+    patience = int(patience)
+    if patience < 1:
+        raise ValueError(f'early-stop patience must be >= 1, got {patience}')
+    if isinstance(min_delta, (bool, np.bool_)):
+        raise ValueError(f'early-stop min_delta must be a finite non-negative number, got {min_delta!r}')
+    try:
+        min_delta = float(min_delta)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'early-stop min_delta must be a finite non-negative number, got {min_delta!r}') from None
+    if not math.isfinite(min_delta) or min_delta < 0.0:
+        raise ValueError(f'early-stop min_delta must be a finite non-negative number, got {min_delta!r}')
+    pts = []
+    for p in (history if history is not None else []):
+        if not isinstance(p, dict):
+            continue
+        try:
+            step = int(p.get('step'))
+            ppl = float(p.get('val_ppl'))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(ppl) and ppl > 0.0:
+            pts.append((step, ppl))
+    best = None
+    best_step = None
+    stale = 0
+    for step, ppl in pts:
+        if best is None or ppl < best - min_delta:
+            best = ppl
+            best_step = step
+            stale = 0
+        else:
+            stale += 1
+    return {'should_stop': bool(pts and stale >= patience),
+            'patience': patience, 'min_delta': min_delta,
+            'n_points': len(pts), 'stale_evals': int(stale),
+            'best_val_ppl': (float(best) if best is not None else None),
+            'best_step': (int(best_step) if best_step is not None else None),
+            'last_step': (int(pts[-1][0]) if pts else None),
+            'last_val_ppl': (float(pts[-1][1]) if pts else None)}
+
+
+def diagnose_training_instability(record, *, data_checked=None):
+    """Triage a training record along the standard non-finite path.
+
+    Order matters: data first, then the forward/loss and attention-pooling
+    numerical guards, then fp16 gradient-scaler overflow, then gradient
+    explosion / learning-rate.  Every check is reported as ``observed``,
+    ``not_observed`` or ``unknown`` so an unmeasured cause is never presented
+    as exonerated.
+    """
+    rec = record if isinstance(record, dict) else {}
+    diag = rec.get('opt_diag_summary')
+    if not isinstance(diag, dict):
+        diag = rec
+    events = [e for e in (diag.get('events') or []) if isinstance(e, dict)]
+    n_loss = int(diag.get('nonfinite_loss_steps') or 0)
+    n_grad = int(diag.get('nonfinite_grad_steps') or 0)
+    first_bad = diag.get('first_bad_step')
+    guard = diag.get('nan_guard') if isinstance(diag.get('nan_guard'), dict) else {}
+    guard_cleaned = int(guard.get('elements_cleaned') or 0)
+    guard_first = guard.get('first') if isinstance(guard.get('first'), dict) else None
+    overflows = int(diag.get('amp_scaler_overflows') or 0)
+    scale_min = diag.get('amp_scaler_scale_min')
+    knobs = rec.get('train_knobs') if isinstance(rec.get('train_knobs'), dict) else {}
+    amp = rec.get('amp_dtype') or knobs.get('amp_dtype')
+    grad_max = diag.get('grad_norm_max')
+    try:
+        grad_max = float(grad_max)
+    except (TypeError, ValueError, OverflowError):
+        grad_max = None
+    lr = None
+    for e in reversed(events):
+        try:
+            lr = float(e.get('lr'))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        break
+    if lr is None:
+        lr = rec.get('lr')
+    checks = []
+
+    def add(name, status, evidence, action):
+        checks.append({'check': name, 'status': status, 'evidence': evidence, 'action': action})
+
+    if data_checked:
+        add('data_nan_inf', 'not_observed',
+            f'token batches validated at the configured cadence ({data_checked})',
+            'if a future run fails here, validate the token cache dtype/range and the label shift before touching the model')
+    else:
+        add('data_nan_inf', 'unknown', 'no data-check evidence in this record',
+            'validate token ids/float cache for NaN/Inf and the target shift')
+
+    bad_loss = [e for e in events if e.get('kind') == 'loss']
+    bad_grad = [e for e in events if e.get('kind') == 'grad']
+    if bad_loss:
+        ce_bad = any(isinstance(e.get('ce'), (int, float)) and not math.isfinite(float(e.get('ce'))) for e in bad_loss)
+        comp_bad = any(isinstance(e.get('comp_reg'), (int, float)) and not math.isfinite(float(e.get('comp_reg'))) for e in bad_loss)
+        pg_bad = any(isinstance(e.get('boundary_pg'), (int, float)) and not math.isfinite(float(e.get('boundary_pg'))) for e in bad_loss)
+        where = 'CE/logits path' if ce_bad else ('compression regularizer' if comp_bad else ('boundary policy term' if pg_bad else 'combined loss'))
+        add('forward_loss_numerics', 'observed',
+            f'{len(bad_loss)} non-finite loss step(s); first suspect: {where}',
+            'check log(0)/division, log_softmax/softmax overflows, and the indexer/block-pool denominators at the first bad step')
+    else:
+        add('forward_loss_numerics', 'not_observed' if not n_loss else 'unknown',
+            f'nonfinite_loss_steps={n_loss}', 'inspect the first non-finite loss step')
+
+    if guard_cleaned:
+        add('attention_pool_nan_to_num', 'observed',
+            f'{guard_cleaned} element(s) cleaned, first at {guard_first}',
+            'CSA_STRICT_NAN=1 reproduces the first non-finite attention/pooling site before it is silently replaced')
+    else:
+        add('attention_pool_nan_to_num', 'not_observed', 'no attention/pooling value was replaced', 'no action')
+
+    if str(amp).lower() == 'fp16' and (overflows > 0 or (scale_min is not None and scale_min < 1.0)):
+        add('fp16_overflow', 'observed',
+            f'grad-scaler overflows={overflows}, min scale={scale_min}',
+            'switch to bf16 or lower the LR/initial loss scale; confirm the first overflow step from opt_diag.events')
+    elif amp:
+        add('fp16_overflow', 'not_observed' if str(amp).lower() != 'fp16' else 'unknown',
+            f'amp_dtype={amp}, overflows={overflows}', 'prefer bf16 when fp16 overflows repeatedly')
+    else:
+        add('fp16_overflow', 'not_observed', 'no mixed-precision autocast in this run', 'no action')
+
+    huge_grad = (grad_max is not None and math.isfinite(grad_max) and grad_max > 10.0 * GRAD_CLIP_NORM)
+    if bad_grad or huge_grad:
+        add('gradient_explosion_lr', 'observed',
+            f'non-finite grad steps={n_grad}, max pre-clip grad={grad_max}, lr={lr}',
+            'lower the LR and/or strengthen warmup/clipping; verify the loss scale before blaming the data')
+    else:
+        add('gradient_explosion_lr', 'not_observed',
+            f'non-finite grad steps={n_grad}, max pre-clip grad={grad_max}', 'no action')
+
+    if not (n_loss or n_grad or guard_cleaned or bad_loss or bad_grad):
+        status = 'clean'
+        primary = None
+        summary = 'no non-finite loss/gradient or guarded attention value was recorded'
+    else:
+        status = 'instability_observed'
+        observed = [c for c in checks if c['status'] == 'observed']
+        primary = (observed[0]['check'] if observed else 'unclassified')
+        summary = ('first observed suspect: ' + primary) if observed else 'non-finite values were recorded but none of the standard causes was observed'
+    return {'status': status, 'summary': summary, 'primary_suspect': primary,
+            'first_bad_step': first_bad, 'checks': checks,
+            'recommended_order': ['data_nan_inf', 'forward_loss_numerics',
+                                  'attention_pool_nan_to_num', 'fp16_overflow',
+                                  'gradient_explosion_lr']}
 
 
 def _safe_exp_ppl(x):
@@ -20237,9 +20426,28 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
     return out
 
 
-def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False, save_ckpt=None, ckpt_dir=None, diag_every=None, measure_eff=False, amp_dtype='auto', eager_batch='auto'):
+def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False, save_ckpt=None, ckpt_dir=None, diag_every=None, measure_eff=False, amp_dtype='auto', eager_batch='auto', early_stop_patience=None, early_stop_min_delta=0.0):
     if steps < 1:
         raise ValueError(f'train_variant needs steps >= 1, got steps={steps}')
+    if early_stop_patience is None:
+        _es_patience = None
+        _es_min_delta = 0.0
+    else:
+        if (isinstance(early_stop_patience, (bool, np.bool_))
+                or not isinstance(early_stop_patience, (int, np.integer))
+                or int(early_stop_patience) < 1):
+            raise ValueError(f'early_stop_patience must be a positive integer or None, got {early_stop_patience!r}')
+        if isinstance(early_stop_min_delta, (bool, np.bool_)):
+            raise ValueError(f'early_stop_min_delta must be a finite non-negative number, got {early_stop_min_delta!r}')
+        try:
+            _es_min_delta = float(early_stop_min_delta)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'early_stop_min_delta must be a finite non-negative number, got {early_stop_min_delta!r}') from None
+        if not math.isfinite(_es_min_delta) or _es_min_delta < 0.0:
+            raise ValueError(f'early_stop_min_delta must be a finite non-negative number, got {early_stop_min_delta!r}')
+        if not (eval_every and int(eval_every) > 0):
+            raise ValueError('early_stop_patience needs eval_every > 0 so the validation curve is measured')
+        _es_patience = int(early_stop_patience)
     set_seed(seed)
     _rng_fp = rng_fingerprint()
     _attb_bump_epoch()
@@ -20341,6 +20549,11 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     _checkpoints = {}
     _health_history = []
     _last_train_ce = None
+    _early_stop = (None if _es_patience is None else
+                   {'patience': _es_patience, 'min_delta': _es_min_delta,
+                    'stopped': False, 'stopped_step': None,
+                    'planned_steps': int(steps), 'best_val_ppl': None,
+                    'best_step': None, 'reason': 'patience not reached'})
     if device.type == 'cuda':
         try:
             torch.cuda.reset_peak_memory_stats(device)
@@ -20648,6 +20861,19 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     _best_val_ppl = sub_ppl
                     _best_step = step + 1
                     _do_save('best', step + 1, sub_ppl, _last_train_ce)
+                if _early_stop is not None and val_batch is not None:
+                    _es = early_stop_decision(_health_history, patience=_es_patience,
+                                              min_delta=_es_min_delta)
+                    _early_stop.update({'best_val_ppl': _es.get('best_val_ppl'),
+                                        'best_step': _es.get('best_step'),
+                                        'stale_evals': _es.get('stale_evals')})
+                    if _es.get('should_stop'):
+                        _early_stop.update({'stopped': True, 'stopped_step': step + 1,
+                                            'reason': (f'validation PPL did not improve by >{_es_min_delta:g} '
+                                                       f'for {_es_patience} consecutive eval(s)')})
+                        print(f'  [early-stop] stopped at step {step + 1}/{steps}: {_early_stop["reason"]}; '
+                              f'best val PPL {_best_val_ppl} at step {_best_step}')
+                        break
             if log_every and (step % log_every == 0 or step == steps - 1):
                 if _lbuf:
                     _flush_loss_buffer()
@@ -20675,6 +20901,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         if _gc_relief:
             gc.enable()
     wall = time.time() - t0
+    _steps_completed = min(int(steps), int(step) + 1)
     if truncated:
         del model, opt, bpe
         gc.collect()
@@ -20687,15 +20914,16 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
-        return {'variant': variant, 'seed': seed, 'cap_truncated': True, 'steps_done': steps, 'train_time_s': wall}
+        return {'variant': variant, 'seed': seed, 'cap_truncated': True, 'steps_done': _steps_completed, 'train_time_s': wall}
     if _dist and _world > 1 and _rank != 0:
         # Non-zero ranks have no file-writing role; wait for rank 0's final
         # evaluation so the whole job exits together.
         torch.distributed.barrier()
         _res = {'variant': variant, 'seed': seed, 'ppl': float('nan'),
-                'params': n_param, 'steps': steps, 'train_time_s': wall,
+                'params': n_param, 'steps': steps, 'steps_completed': _steps_completed,
+                'train_time_s': wall,
                 'distributed_rank': _rank, 'distributed_world_size': _world,
-                'tokens_seen': steps * batch_size * seq_len * _world}
+                'tokens_seen': _steps_completed * batch_size * seq_len * _world}
         if _lbuf:
             _flush_loss_buffer()
         _res['losses'] = [float(v) for v in losses]
@@ -20737,13 +20965,14 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     _grad_vals = [float(v) for v in _diag.get('grad_norm_pre_clip', []) if _is_finite_number(v)]
     _upd_vals = [float(v) for v in _diag.get('update_norm', []) if _is_finite_number(v)]
     _opt_summary = {
-        'n_steps': int(steps), 'n_diag_points': len(_diag.get('step', [])),
+        'n_steps': int(steps), 'n_steps_completed': int(_steps_completed),
+        'n_diag_points': len(_diag.get('step', [])),
         'grad_norm_mean': (sum(_grad_vals) / len(_grad_vals)) if _grad_vals else None,
         'grad_norm_max': max(_grad_vals) if _grad_vals else None,
         'update_norm_mean': (sum(_upd_vals) / len(_upd_vals)) if _upd_vals else None,
         'update_norm_max': max(_upd_vals) if _upd_vals else None,
         'clip_steps': int(_clip_steps),
-        'clip_fraction': (float(_clip_steps) / max(1, int(steps))),
+        'clip_fraction': (float(_clip_steps) / max(1, int(_steps_completed))),
         'skipped_updates': int(_skipped_steps),
         'nonfinite_loss_steps': int(_nonfinite_loss_steps),
         'nonfinite_grad_steps': int(_nonfinite_grad_steps),
@@ -20754,6 +20983,11 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         'nan_guard': nan_guard_state(),
         'events': _nan_events[:20],
     }
+    _instability = diagnose_training_instability(
+        {'opt_diag_summary': _opt_summary, 'amp_dtype': _amp,
+         'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used),
+         'curve_health': _health, 'health_history': _health_history},
+        data_checked='token batches validated at startup and every ~1% of steps')
     _peak = {}
     if device.type == 'cuda':
         try:
@@ -20765,7 +20999,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         except Exception:
             _peak = {}
     if _save_mode and ckpt_dir:
-        _do_save('final', int(steps), float(ppl) if _is_finite_number(ppl) else None, _last_train_ce)
+        _do_save('final', int(_steps_completed), float(ppl) if _is_finite_number(ppl) else None, _last_train_ce)
     _efficiency = None
     if measure_eff:
         try:
@@ -20784,17 +21018,21 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # sampled with replacement and overlap heavily, so a 3000-step run over an
     # 8M-token cache does not consume 18.4M distinct tokens.  Record an
     # explicit coverage estimate instead of letting readers infer uniqueness.
-    _draws = int(steps) * int(batch_size) * int(_world)
+    if _early_stop is not None:
+        _early_stop['steps_completed'] = int(_steps_completed)
+        if not _early_stop.get('stopped'):
+            _early_stop['reason'] = 'patience not reached; ran to the planned step'
+    _draws = int(_steps_completed) * int(batch_size) * int(_world)
     _n_train = int(len(train_ids)) if hasattr(train_ids, '__len__') else 0
     _uniq_frac = None
     if _n_train > 0:
         _p = min(float(seq_len) / float(_n_train), 1.0)
         _uniq_frac = (1.0 if _p >= 1.0 else float(1.0 - math.exp(_draws * math.log1p(-_p))))
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len * _world,
+    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'steps_completed': int(_steps_completed), 'early_stop': _early_stop, 'tokens_seen': _steps_completed * batch_size * seq_len * _world,
               'tokens_seen_unique_estimate': (int(round(_n_train * _uniq_frac)) if _uniq_frac is not None else None),
               'tokens_seen_unique_frac_estimate': _uniq_frac,
               'token_accounting_note': 'tokens_seen counts window draws; unique-token coverage is an estimate under independent uniform window draws, not a measurement',
-              'train_time_s': wall, 'train_tokens_per_s': ((steps * batch_size * seq_len * _world) / wall if wall and wall > 0 else None), 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'init_core_fp': _init_core_fp, 'data_fp': _ids_fp(train_ids),
+              'train_time_s': wall, 'train_tokens_per_s': ((_steps_completed * batch_size * seq_len * _world) / wall if wall and wall > 0 else None), 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'init_core_fp': _init_core_fp, 'data_fp': _ids_fp(train_ids),
               # The token-level evidence behind the reported PPL.
               # `nll_sum / n_tokens` is the pooled-NLL estimator; the per-row
               # rows let a report bootstrap DOCUMENT uncertainty instead of
@@ -20816,6 +21054,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'best_step': _best_step, 'best_val_ppl': _best_val_ppl,
               'final_minus_best': (float(ppl - _best_val_ppl) if (_is_finite_number(ppl) and _best_val_ppl is not None) else None),
               'opt_diag': _diag, 'opt_diag_summary': _opt_summary,
+              'instability_diagnosis': _instability,
               'peak_memory': _peak, 'efficiency': _efficiency,
               'checkpoints': _checkpoints}
     if return_model:
@@ -20870,6 +21109,52 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
         model.train(was_training)
 
 @torch.inference_mode()
+def classify_token_error(*, ce, entropy, margin, rare_target, target_id, topk_ids, vocab):
+    """Heuristic triage for one bad case.
+
+    The labels are deliberately phrased as review prompts, not verdicts:
+    ``annotation_or_rare_target`` still needs a human to check the annotation,
+    ``ambiguous_context`` means the model distribution is close to uniform,
+    and ``confident_model_blind_spot`` means low-entropy, high-margin and high
+    CE (the model is wrong while sure).  ``target_outside_topk`` is a supporting
+    fact, not a cause by itself.
+    """
+    try:
+        ce = float(ce)
+        entropy = float(entropy)
+        margin = float(margin)
+        vocab = int(vocab)
+    except (TypeError, ValueError, OverflowError):
+        return {'primary': 'unmeasured', 'causes': [], 'target_in_topk': None}
+    if not math.isfinite(ce):
+        return {'primary': 'unmeasured', 'causes': [], 'target_in_topk': None}
+    tids = []
+    for t in (topk_ids or []):
+        try:
+            tids.append(int(t))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    in_topk = int(target_id) in tids if tids else None
+    uniform = math.log(vocab) if vocab > 1 else 0.0
+    causes = []
+    if bool(rare_target):
+        causes.append('annotation_or_rare_target')
+    if math.isfinite(entropy) and (entropy >= 0.8 * uniform
+                                   or (math.isfinite(margin) and margin <= 0.5)):
+        causes.append('ambiguous_context')
+    if (math.isfinite(entropy) and math.isfinite(margin)
+            and entropy <= 0.5 * uniform and margin >= 2.0):
+        causes.append('confident_model_blind_spot')
+    if in_topk is False:
+        causes.append('target_outside_topk')
+    if not causes:
+        causes.append('mixed_unclear')
+    priority = ('annotation_or_rare_target', 'ambiguous_context',
+                'confident_model_blind_spot', 'target_outside_topk', 'mixed_unclear')
+    primary = next((c for c in priority if c in causes), 'mixed_unclear')
+    return {'primary': primary, 'causes': causes, 'target_in_topk': in_topk}
+
+
 def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                    top_tokens=100, chunk=8, val_bnd=None, train_ids=None,
                    context_tokens=16, topk=5):
@@ -21059,12 +21344,17 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                            'context': _decode(vb[row].tolist()),
                            'ids': [int(x) for x in vb[row].tolist()]})
     worst_tokens = []
+    cause_counts = collections.Counter()
     for rec in sorted(tok_heap, key=lambda t: t[0], reverse=True)[:max(1, int(top_tokens))]:
         c, row, pos, tgt, pred, ent, margin, tids, rare = rec
         lo = max(0, pos - int(context_tokens))
         hi = min(span, pos + int(context_tokens) + 1)
         ctx_ids = [int(x) for x in vb[row, lo:hi + 1].tolist()]
         ctgt = int(vb[row, pos + 1])
+        _triage = classify_token_error(ce=c, entropy=ent, margin=margin,
+                                       rare_target=rare, target_id=tgt,
+                                       topk_ids=tids, vocab=V)
+        cause_counts[_triage['primary']] += 1
         worst_tokens.append({
             'row': int(row), 'position': int(pos), 'ce': c, 'target_id': tgt,
             'pred_id': pred, 'entropy': ent, 'margin': margin,
@@ -21074,6 +21364,9 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             'pred_text': _decode([pred]),
             'context_text': _decode(ctx_ids),
             'context_ids': ctx_ids,
+            'target_in_topk': _triage['target_in_topk'],
+            'cause_primary': _triage['primary'],
+            'causes': _triage['causes'],
             'is_boundary_token': (bool(bnd_np[row, pos + 1]) if (bnd_np is not None and bnd_np.shape == vb.shape) else None),
         })
     out_buckets = {}
@@ -21091,6 +21384,14 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             'buckets': out_buckets,
             'worst_sequences': worst_seqs,
             'worst_tokens': worst_tokens,
+            'cause_counts': dict(cause_counts),
+            'cause_guide': {
+                'annotation_or_rare_target': 'check the target annotation and the training frequency; a rare token can be correct but under-trained',
+                'ambiguous_context': 'the distribution is near-uniform or the top-2 margin is tiny; inspect the context and decide whether the task is genuinely ambiguous',
+                'confident_model_blind_spot': 'the model is confidently wrong; look for a systematic context feature it has not learned',
+                'target_outside_topk': 'the target is outside the sampled top-k; check whether this is a tokenization/label-shift issue or a real model miss',
+                'mixed_unclear': 'no single heuristic explains this case; read the full context before changing the model',
+            },
             'entropy': {'max': (max(ent_vals) if ent_vals else None),
                         'mean': (sum(ent_vals) / len(ent_vals) if ent_vals else None)},
             'tokenizer_available': tok is not None,
