@@ -10508,7 +10508,18 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     # is 2/2**n), and a two-point "trend" is a line even when the per-seed
     # exact test rejects.  Gate the README-level claim on the same thresholds
     # the rest of this function reports.
-    underpowered = bool(paired.get('underpowered')) if paired_primary else False
+    if paired_primary:
+        underpowered = bool(paired.get('underpowered'))
+        _underpowered_points = ([] if not underpowered
+                                else list(paired.get('seeds') or []))
+    else:
+        # Without a complete-seed paired slope the trend is a regression over
+        # point means.  A point whose mean rests on fewer than `min_seeds`
+        # draws is still underpowered, and pooling it into the trend must not
+        # bypass the pre-registered seed floor.
+        _underpowered_points = [p['label'] for p in pts
+                                if len(p['effects']) < int(min_seeds)]
+        underpowered = bool(_underpowered_points)
     too_few_scales = k < int(min_points)
     sig = bool(p_primary is not None and math.isfinite(float(p_primary)) and float(p_primary) < alpha
                and not resolution_limited and not underpowered and not too_few_scales)
@@ -10525,6 +10536,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out['significant'] = sig
     out['resolution_limited'] = resolution_limited
     out['underpowered'] = underpowered
+    out['underpowered_points'] = _underpowered_points
     out['direction_slope'] = direction_slope
     if heterogeneous:
         verdict = 'heterogeneous_trend'
@@ -10542,6 +10554,12 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out['benefit_grows_with_scale'] = (bool(sig and direction_slope < 0) if not heterogeneous else None)
     if too_few_scales:
         out['note'] = 'fewer than min_points=%d scales: slope is descriptive even if the exact test rejects' % int(min_points)
+    if underpowered and _underpowered_points:
+        _u = ('paired complete-seed n<%d' % int(min_seeds) if paired_primary
+              else 'scale point(s) with n<%d: ' % int(min_seeds)
+                   + ', '.join(map(str, _underpowered_points)))
+        out['note'] = ((out.get('note') + '; ') if out.get('note') else '') + (
+            'underpowered (%s) — the trend remains descriptive' % _u)
     return out
 
 

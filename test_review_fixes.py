@@ -687,6 +687,15 @@ def t_scale_missing_seed_identity_is_not_paired():
     rb = L.scaling_trend(both, min_seeds=3, min_points=2)
     assert rb['seed_pairing'] == 'declared' and rb['paired']['n_complete_seeds'] == 3, rb
     assert rb['interaction_extremes'].get('seed_pairing') == 'declared', rb['interaction_extremes']
+    # The unpaired WLS fallback must also honour min_seeds: a perfect line
+    # through two-draw points is not a confirmable trend.
+    low = [{'label': 'W%d' % i, 'scale': 10.0 ** i,
+            'effects': [float(i)] * 2} for i in range(3)]
+    rw = L.scaling_trend(low, min_seeds=3, min_points=3)
+    assert rw['primary_inference'].startswith('WLS'), rw['primary_inference']
+    assert rw['underpowered'] is True and rw['significant'] is False, rw
+    assert rw['verdict'] == 'underpowered', rw['verdict']
+    assert rw['underpowered_points'] == ['W0', 'W1', 'W2'], rw
 
 
 def t_scaling_trend_primary_direction_and_floor():
