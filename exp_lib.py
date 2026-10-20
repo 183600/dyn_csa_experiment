@@ -11734,6 +11734,14 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None,
             }
         else:
             row_split = dict(row_split)
+            _rn = _exact_count(row_split.get('n_rows'), minimum=1)
+            if _rn is not None and _rn != _n_rows:
+                raise ValueError('row_split n_rows does not match the evaluation tensor')
+            for _key, _want in (('n_selection_rows', int(_sel_idx.size)),
+                                ('n_evaluation_rows', int(_eval_idx.size))):
+                _got = _exact_count(row_split.get(_key), minimum=1)
+                if _got is not None and _got != _want:
+                    raise ValueError(f'row_split {_key} does not match the supplied rows')
             _want_sel = row_split.get('selection_row_fp')
             _want_eval = row_split.get('evaluation_row_fp')
             if _want_sel is not None and _want_sel != _ids_fp(_sel_idx):
