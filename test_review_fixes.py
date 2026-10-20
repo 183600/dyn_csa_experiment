@@ -4468,6 +4468,11 @@ def t_data_quality_exact_integer_and_complex_rows():
     assert L.duplicate_mask(obj_big).tolist() == [False, False]
     obj_rep = L.data_quality_report(obj_big, train_idx=[0], val_idx=[1])
     assert obj_rep['checks']['duplicate_rows_across_splits']['train__val'] == 0, obj_rep
+    # Mixed object int/float rows keep the integer's bits while still
+    # comparing an integral float equal to the same integer.
+    obj_mixed = np.array([[2 ** 53], [2 ** 53 + 2.0], [2 ** 53 + 2]], dtype=object)
+    assert L.duplicate_mask(obj_mixed).tolist() == [False, False, True], obj_mixed
+    assert L.duplicate_mask(np.array([[float('nan')], [None]], dtype=object)).tolist() == [False, True]
     # Complex rows were previously cast to float64 (dropping the imaginary
     # part); reject them instead of manufacturing duplicates.
     try:

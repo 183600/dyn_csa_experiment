@@ -1509,25 +1509,45 @@ def _row_keys(X):
     if src.ndim == 1:
         src = src.reshape(-1, 1)
     if src.dtype == object:
-        # An object column of Python integers is exact only if it is hashed as
-        # integers.  Casting it to float64 (the generic fallback below) would
-        # collapse distinct values above 2**53 into false duplicates, which
-        # can turn a clean split into a false leakage alarm and, in the other
-        # direction, make a genuine duplicate look unique after rounding.
-        # Require every scalar to be integral (bool values are accepted and
-        # hashed by their integer value, matching NumPy/float semantics).
+        # Object columns are common after pandas/None handling.  Casting a
+        # whole object row through float64 (the generic fallback below) would
+        # collapse distinct integers above 2**53 into false duplicates, which
+        # can turn a clean split into a false leakage alarm (or, after
+        # rounding, hide a genuine duplicate).  When every scalar is a real
+        # number, build an exact canonical token per value: integers keep all
+        # their bits, integral floats compare equal to the same integer
+        # (matching Python/NumPy equality), -0.0 is normalised, and NaN/Inf
+        # remain distinct except that all NaNs are one missing-like key.
         _flat = src.reshape(-1).tolist()
-        if all(isinstance(v, (bool, np.bool_)) or
-               (isinstance(v, numbers.Integral) and not isinstance(v, (bool, np.bool_)))
-               for v in _flat):
+
+        def _real_key(v):
+            if v is None:
+                # Match the generic float path: None is a missing value and
+                # compares equal to a NaN scalar in the same position.
+                return b'Fnan'
+            if isinstance(v, (bool, np.bool_)):
+                return b'I' + str(int(v)).encode('ascii')
+            if isinstance(v, numbers.Integral):
+                return b'I' + str(int(v)).encode('ascii')
+            f = float(v)
+            if math.isnan(f):
+                return b'Fnan'
+            if math.isinf(f):
+                return b'F+inf' if f > 0 else b'F-inf'
+            if f == 0.0:
+                return b'I0'
+            if f.is_integer():
+                return b'I' + str(int(f)).encode('ascii')
+            return b'F' + f.hex().encode('ascii')
+
+        if all(v is None or isinstance(v, numbers.Real) for v in _flat):
             _step = _hash_row_block(int(src.shape[1]), 1 << 16)
             keys = []
             for start in range(0, src.shape[0], _step):
                 for row in src[start:start + _step].tolist():
                     h = hashlib.blake2b(digest_size=8)
                     for v in row:
-                        h.update(b'I')
-                        h.update(str(int(v)).encode('ascii'))
+                        h.update(_real_key(v))
                         h.update(b'|')
                     keys.append(h.digest())
             return keys
