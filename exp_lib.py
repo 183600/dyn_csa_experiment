@@ -21234,6 +21234,7 @@ def classify_token_error(*, ce, entropy, margin, rare_target, target_id, topk_id
     return {'primary': primary, 'causes': causes, 'target_in_topk': in_topk}
 
 
+@torch.inference_mode()
 def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                    top_tokens=100, chunk=8, val_bnd=None, train_ids=None,
                    context_tokens=16, topk=5):

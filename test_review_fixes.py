@@ -8634,6 +8634,15 @@ def t_error_analysis_excludes_nonfinite_targets():
     assert sum(v['n'] for v in _all.values()) == 5, _all
     assert _all['ambiguous_context']['n'] == 5, _all
     assert abs(sum(v['share'] for v in _all.values()) - 1.0) < 1e-12, _all
+    # A real parameterised model (the only kind error_analysis.py loads) must
+    # not hit "can't call numpy() on a Tensor that requires grad"; analysis
+    # runs under inference mode and restores the model's training flag.
+    torch.manual_seed(0)
+    real = L.SmallGPT(17, 16, 1, 2, 8, 12, L.make_layer_cfgs(1, 'full')).train()
+    vb_real = np.random.default_rng(0).integers(0, 17, (3, 12))
+    r_real = L.analyze_errors(real, vb_real, 17, torch.device('cpu'),
+                              top_n=5, top_tokens=100, chunk=2, topk=5)
+    assert r_real['n_targets'] == 33 and real.training is True, r_real
 
 
 def t_gapfill_numeric_reader_rejects_booleans():
