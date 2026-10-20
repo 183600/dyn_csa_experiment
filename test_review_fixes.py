@@ -6705,6 +6705,15 @@ def t_validation_row_split_group_aware():
         assert 'groups has length' in str(e), e
     else:
         raise AssertionError('groups length mismatch must be refused')
+    # A boundary between adjacent group ids is not enough when the same group
+    # id reappears later in the stream: the two returned folds would still
+    # share a document.  Refuse the leaking split.
+    try:
+        L.validation_row_split(8, groups=[0, 1, 0, 1, 0, 1, 0, 1])
+    except ValueError as e:
+        assert 'contributes rows to both' in str(e), e
+    else:
+        raise AssertionError('a non-contiguous group spanning both folds must be refused')
     # Missing group ids collapse into one group (NaT is not a unique key).
     _nat = np.array([np.timedelta64('NaT', 'ns'), np.timedelta64('NaT', 'ns'),
                      np.timedelta64(1, 'ns'), np.timedelta64(1, 'ns')],

@@ -11392,6 +11392,24 @@ def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
     evaluation = list(range(_ev_lo, _ev_hi))
     _sel_arr = np.asarray(selection, dtype=np.int64)
     _ev_arr = np.asarray(evaluation, dtype=np.int64)
+    if _groups_aware:
+        # A legal FOLD BOUNDARY only proves that no group is cut between two
+        # adjacent rows.  It does not prove the two returned folds are
+        # group-disjoint: a non-contiguous group id can reappear later in the
+        # stream, putting the same document on both sides of the split.  The
+        # contract is fail-closed, so refuse that split instead of returning
+        # a leaking one.
+        _sel_groups = {_gk[i] for i in selection}
+        _ev_groups = {_gk[i] for i in evaluation}
+        _shared_groups = _sel_groups & _ev_groups
+        if _shared_groups:
+            raise ValueError(
+                'validation_row_split: a group/document contributes rows to '
+                'both the selection and evaluation folds although every fold '
+                'boundary is between group ids; group ids must be contiguous '
+                'in the validation stream. Refusing a leaking split '
+                f'({len(_shared_groups)} shared group(s), e.g. '
+                f'{sorted(map(repr, _shared_groups))[:3]})')
     meta = {
         'policy': 'chronological_contiguous_row_folds',
         'seed': int(seed),
