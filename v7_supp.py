@@ -1789,7 +1789,12 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                     mismatch_fields.add(reason)
                 skipped.append(s)
                 continue
-            dl.append(ra['ppl'] - rb['ppl'])
+            _pa, _pb = L._record_primary_ppl(ra), L._record_primary_ppl(rb)
+            if _pa is None or _pb is None:
+                mismatch_fields.add('primary estimand missing (nested record without holdout PPL/NLL accounting)')
+                skipped.append(s)
+                continue
+            dl.append(float(_pa) - float(_pb))
         if skipped:
             why = '; '.join(sorted(mismatch_fields)) if mismatch_fields else 'different run_cfg'
             print(f'[stats] {name}: {len(skipped)} seed(s) NOT paired — the two sides have {why}; excluded from the test')

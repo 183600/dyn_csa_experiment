@@ -80,7 +80,12 @@ def _add_paired(comparisons, name, panel, a, b, who='', outdir=None):
             why.add(reason)
             skipped.append(s)
             continue
-        dl.append(ra['ppl'] - rb['ppl'])
+        _pa, _pb = L._record_primary_ppl(ra), L._record_primary_ppl(rb)
+        if _pa is None or _pb is None:
+            why.add('primary estimand missing (nested record without holdout PPL/NLL accounting)')
+            skipped.append(s)
+            continue
+        dl.append(float(_pa) - float(_pb))
     if skipped:
         print(f'[stats] {who}{name}: {len(skipped)}/{len(common)} seed(s) NOT paired — {sorted(why)}; excluded from the test')
     if not dl:

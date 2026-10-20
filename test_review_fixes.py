@@ -1488,6 +1488,36 @@ def t_arm_mean_std_and_relative_effect():
     assert arm_n['ppl_primary_missing'] == 0, arm_n
 
 
+def t_v7_v8_v9_pairs_use_primary_estimand():
+    import v8_supp as V8
+    import v9_supp as V9
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+
+    def _rec(v, seed, full, hold):
+        r = {'variant': v, 'seed': seed, 'run_cfg': fp, 'steps': 1,
+             'tokens_seen': 1, 'ppl': full, 'params': 100,
+             'train_knobs': knobs,
+             'ppl_estimation_rows': 'nested_validation_holdout'}
+        if hold is not None:
+            r['ppl_holdout'] = hold
+        return r
+
+    panel = {}
+    for seed in (0, 1, 2):
+        panel.setdefault('a', {})[seed] = _rec('a', seed, 100.0 + seed, 10.0 + seed)
+        panel.setdefault('b', {})[seed] = _rec('b', seed, 1.0 + seed,
+                                              12.0 + seed if seed else None)
+    for fn in (V9.add_paired, V8._add_paired):
+        comp = {}
+        fn(comp, 'x', panel, 'a', 'b')
+        st = comp['x']
+        # Seed 0's b record has no holdout accounting, so it is excluded
+        # rather than paired on the full-validation PPL (which would give a
+        # huge positive delta from 100 vs 1).
+        assert st['n'] == 2 and abs(st['mean'] + 2.0) < 1e-12, st
+
+
 def t_paired_effect_seed_robustness():
     stable = L.paired_effect_stats([-1.0, -1.1, -0.9, -1.0])
     assert stable['seed_driven'] is False and stable['seed_robust'] is True, stable
@@ -8607,6 +8637,7 @@ def main():
     _check('C19a full-factorial rejects a reused arm id', t_full_factorial_rejects_reused_arm)
     _check('C19b project-level ablation coverage across panels', t_ablation_coverage_across_panels)
     _check('C17c paired effect CI + leave-one-seed robustness', t_paired_effect_seed_robustness)
+    _check('C17c2 v7/v8/v9 pairs use the primary estimand', t_v7_v8_v9_pairs_use_primary_estimand)
     _check('C17d capacity-confounding warning on module ablation', t_capacity_confound_warning)
     _check('C17e module ablation requires identical structured hyperparameters', t_component_pair_requires_same_mlp_ratio)
     _check('C20 panel ablation flag does not overclaim', t_panel_ablation_flag_does_not_overclaim)
