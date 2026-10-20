@@ -535,6 +535,29 @@ def t_open_analysis_control_gate():
     assert used == [0] and len(ds) == 1 and len(pds) == 1, (used, ds, rejected)
     assert len(rejected) == 1 and rejected[0]['seed'] == 1, rejected
     assert 'lr differs' in rejected[0]['reason'], rejected
+    # max_block and its max_block_tokens alias are the SAME declared factor;
+    # either spelling changing must remain a controlled contrast.
+    def _mb_rec(mode, mb):
+        r = _rec(mode)
+        r['open_block_config'] = {'layers': [
+            {'max_block': mb, 'max_block_tokens': mb,
+             'open_block_mode': mode, 'open_block_scope': 'full_prefix'}]}
+        return r
+    assert OB._controlled_reason(_mb_rec('summary', None), _mb_rec('summary', 128)) is None
+    # The interaction needs one common context across BOTH cap groups, not
+    # just control inside each pair.
+    a = _mb_rec('summary', None)
+    b = _mb_rec('closed', None)
+    c = _mb_rec('summary', 128)
+    d = _mb_rec('closed', 128)
+    assert OB._controlled_interaction(a, b, c, d) is None
+    c2 = dict(c, data_fp='d2')
+    d2 = dict(d, data_fp='d2')
+    assert 'data_fp differs' in OB._controlled_interaction(a, b, c2, d2)
+    # A mixed-n family's resolution floor is governed by its best-powered
+    # member (max n), matching attach_holm.
+    assert OB._family_holm_floor([8, 4, 1], 3) == L.holm_min_attainable_p(8, 3, 0.05)
+    assert OB._family_holm_floor([1, 1, 1], 3) > OB._family_holm_floor([8, 4, 1], 3)
 
 def t_open_block_hypotheses():
     # Each declared primary contrast must state mechanism, sign, metric and

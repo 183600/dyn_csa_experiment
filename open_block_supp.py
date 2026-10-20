@@ -425,7 +425,11 @@ def _controlled_reason(a, b):
     la, lb = oa.get('layers') or [], ob.get('layers') or []
     if len(la) != len(lb):
         return 'different layer counts'
-    allowed = {'max_block', 'open_block_mode', 'open_block_scope'}
+    # `open_block_config` carries both names for the same setting; the
+    # descriptor must not reject a legitimate max-block contrast just because
+    # the alias appears in the layer row.
+    allowed = {'max_block', 'max_block_tokens',
+               'open_block_mode', 'open_block_scope'}
     for i, (x, y) in enumerate(zip(la, lb)):
         for k in set(x) | set(y):
             if k in allowed:
@@ -433,6 +437,39 @@ def _controlled_reason(a, b):
             if x.get(k) != y.get(k):
                 return f'layer {i} differs in undeclared field {k}'
     return None
+
+
+def _controlled_interaction(a, b, c, d):
+    """Control gate for the 2x2 interaction (a-b at low, c-d at high).
+
+    Each within-cap pair and the two cap groups must share one controlled
+    context (data/validation/eval fingerprints, RNG context, budget, ...).
+    """
+    return (_controlled_reason(a, b)
+            or _controlled_reason(c, d)
+            or _controlled_reason(a, c)
+            or _controlled_reason(b, d))
+
+
+def _family_holm_floor(ns, m_comparisons):
+    """Holm resolution floor for a mixed-n family.
+
+    The first Holm gate is reachable through the BEST-POWERED member, so the
+    family floor uses max(n), not min(n).  A missing/zero-n comparison cannot
+    carry the family and is ignored (it still occupies its declared m slot).
+    """
+    used = [int(n) for n in (ns or []) if _as_positive_int(n) is not None]
+    m = _as_positive_int(m_comparisons)
+    if not used or m is None:
+        return None
+    return L.holm_min_attainable_p(max(used), m, 0.05)
+
+
+def _as_positive_int(v):
+    if isinstance(v, bool) or not isinstance(v, (int, np.integer)):
+        return None
+    v = int(v)
+    return v if v > 0 else None
 
 
 def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
@@ -493,8 +530,8 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
             continue
         # The interaction contrasts two controlled pairs.  A seed that fails
         # either pair's gate cannot contribute a controlled interaction.
-        _why = (_controlled_reason(a['record'], b['record'])
-                or _controlled_reason(c['record'], d['record']))
+        _why = _controlled_interaction(a['record'], b['record'],
+                                       c['record'], d['record'])
         if _why is not None:
             int_rejected.append({'seed': int(s), 'reason': _why})
             continue
@@ -565,8 +602,9 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
             efficiency[f'{v}::seed{s}'] = e
     _prim_n = [int(results[n].get('n') or 0) for n in prim_names if results[n].get('n')]
     _prim_n_min = min(_prim_n) if _prim_n else 0
-    _holm_floor = (L.holm_min_attainable_p(_prim_n_min, len(prim_names), 0.05)
-                   if _prim_n_min and prim_names else None)
+    _prim_n_max = max(_prim_n) if _prim_n else 0
+    _holm_floor = (_family_holm_floor(_prim_n, len(prim_names))
+                   if _prim_n and prim_names else None)
     _holm_min_n = (L.signflip_min_n_for_holm(len(prim_names), 0.05)
                    if prim_names else None)
     os.makedirs(analysis_dir, exist_ok=True)
@@ -577,6 +615,8 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         'primary_family': prim_names,
         'primary_family_size': len(prim_names),
         'primary_holm_floor': _holm_floor,
+        'primary_n_min': _prim_n_min,
+        'primary_n_max': _prim_n_max,
         'primary_holm_min_seeds': _holm_min_n,
         'comparisons': results,
         'hypothesis_audit': _hyp,
@@ -609,7 +649,9 @@ def _render_markdown(stats):
     lines = ['# Open-block panel: maximum block length × current-block reading', '']
     lines.append(f'Code: `{stats["code"]}`  |  cells: {len(stats["cells_available"])}  |  seeds: {stats["seeds_requested"]}')
     if stats.get('primary_holm_floor') is not None:
-        lines.append(f'Primary family Holm floor: `{_fmt(stats.get("primary_holm_floor"))}` at n={stats.get("seeds_requested")}; minimum seeds for a confirmatory claim: `{stats.get("primary_holm_min_seeds")}`.')
+        _n_txt = (str(stats.get('primary_n_min')) if stats.get('primary_n_min') == stats.get('primary_n_max')
+                  else f'{stats.get("primary_n_min")}..{stats.get("primary_n_max")}')
+        lines.append(f'Primary family Holm floor: `{_fmt(stats.get("primary_holm_floor"))}` at family n={_n_txt} (max n governs the floor); minimum seeds for a confirmatory claim: `{stats.get("primary_holm_min_seeds")}`.')
     lines += ['', 'Delta convention: `a - b` on token NLL; negative means `a` is better.', '']
     lines.append('| comparison | family | n | mean ΔNLL | SD | dz | exact p | Holm p | p floor | CI95 | controlled |')
     lines.append('|---|---|---|---|---|---|---|---|---|---|---|')
