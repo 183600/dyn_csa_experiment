@@ -528,7 +528,7 @@ def run_jobs(jobs, ctx, phase_label="phase"):
 
     _reconcile_guards(jobs)
 
-    pending = list(entries)
+    pending = collections.deque(entries)
     running = []
     results = [None] * len(entries)
     started = time.monotonic()
@@ -545,7 +545,7 @@ def run_jobs(jobs, ctx, phase_label="phase"):
             for worker in free_workers:
                 if not pending:
                     break
-                entry = pending.pop(0)
+                entry = pending.popleft()
                 entry["worker"] = worker
                 entry["t_start"] = time.monotonic()
                 entry["log_f"] = open(

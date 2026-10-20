@@ -8152,6 +8152,43 @@ def t_eager_batch_rejects_typos_and_nonfinite():
             raise AssertionError(f'eager_batch={bad!r} was silently coerced')
 
 
+
+def t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields():
+    import run_gapfill as G
+    with tempfile.TemporaryDirectory() as d:
+        snap = {'full': {'seeds': [0, 1], 'ppls': [10.0, 12.0], 'n_seeds': 2,
+                         'ppl_mean': 11.0, 'ppl_std': math.sqrt(2.0),
+                         'avg_dyn_block_len': 4.0,
+                         'ppl_curve': [[1, 10.0], [2, 11.0]]}}
+        fresh = {'full': {'seeds': [0, 1], 'ppls': [20.0, 22.0], 'n_seeds': 2,
+                          'ppl_mean': 21.0, 'ppl_std': math.sqrt(2.0),
+                          'avg_dyn_block_len': 8.0,
+                          'ppl_curve': [[1, 20.0], [2, 21.0]]}}
+        json.dump(fresh, open(os.path.join(d, 'aggregate.json'), 'w'))
+        G.merge_long_aggregate(d, snap)
+        out = json.load(open(os.path.join(d, 'aggregate.json')))['full']
+        # Re-measuring the same seeds must refresh the secondary values, not
+        # leave the snapshot's old ones next to the fresh PPLs.
+        assert out['ppls'] == [20.0, 22.0] and out['avg_dyn_block_len'] == 8.0, out
+        assert out['ppl_curve'] == [[1, 20.0], [2, 21.0]], out
+        # Recovering a lost seed must not leave fields computed on the old
+        # subset looking current.
+        json.dump({'full': {'seeds': [0, 1], 'ppls': [10.0, 20.0]}},
+                  open(os.path.join(d, 'aggregate.json.v6bak'), 'w'))
+        live = {'full': {'seeds': [0], 'ppls': [10.0], 'n_seeds': 1,
+                         'ppl_mean': 10.0, 'ppl_std': 0.0, 'ppl_primary': 10.0,
+                         'nll_sum': 10.0, 'n_tokens': 1, 'ppl_curve': [[1, 10.0]]}}
+        json.dump(live, open(os.path.join(d, 'aggregate.json'), 'w'))
+        G._fold_backup_into_aggregate(d)
+        out = json.load(open(os.path.join(d, 'aggregate.json')))['full']
+        assert out['seeds'] == [0, 1] and out['ppl_mean'] == 15.0, out
+        for _f in ('ppl_primary', 'nll_sum', 'n_tokens', 'ppl_curve'):
+            assert out[_f] is None, (out, _f)
+        # Valid JSON with the wrong top-level type is skipped, not crashed on.
+        json.dump([], open(os.path.join(d, 'aggregate.json.v6bak'), 'w'))
+        G._fold_backup_into_aggregate(d)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8411,6 +8448,7 @@ def main():
     _check('L41 warmup table uses the primary estimand', t_build_report_warmup_uses_primary_estimand)
     _check('L42 empty-sequence pool kernel matches eager', t_pool_kernel_empty_sequence_matches_eager)
     _check('L43 eager_batch rejects typos/non-finite values', t_eager_batch_rejects_typos_and_nonfinite)
+    _check('L44 gapfill merge refreshes/invalidates seed-derived fields', t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

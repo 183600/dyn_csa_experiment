@@ -107,7 +107,10 @@ def main(argv=None):
     train_ids, val_batch, vocab, tok, val_bnd = L.load_run_corpus(cfg)
     if args.dataset != 'wikitext':
         tok = None
-    n_rows = min(int(args.max_rows), int(val_batch.shape[0]))
+    n_rows = int(args.max_rows)
+    if n_rows < 1:
+        raise SystemExit(f'--max-rows must be a positive integer, got {n_rows}')
+    n_rows = min(n_rows, int(val_batch.shape[0]))
     val_batch = np.ascontiguousarray(val_batch[:n_rows, :seq_len])
     if val_bnd is not None:
         _vb = np.asarray(val_bnd)

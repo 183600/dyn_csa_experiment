@@ -89,6 +89,10 @@ def _fold_backup_into_aggregate(adir):
     except Exception as _e:
         print(f'[synth] NOTE: the pre-retrain snapshot {bak_path} cannot be parsed ({type(_e).__name__}: {_e}) — ignoring it')
         return
+    if not isinstance(bak, dict):
+        print(f'[synth] NOTE: the pre-retrain snapshot {bak_path} is valid JSON '
+              f'but not an object ({type(bak).__name__}) — ignoring it')
+        return
     live = {}
     if os.path.exists(agg_path):
         try:
@@ -120,6 +124,20 @@ def _fold_backup_into_aggregate(adir):
         lentry['n_seeds'] = len(vals)
         lentry['ppl_mean'] = sum(vals) / len(vals)
         lentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        # Every other aggregate was computed over the pre-recovery seed subset.
+        # It is not safe to keep those values next to a larger `seeds` list, so
+        # invalidate them explicitly instead of mixing a 1-seed mean with a
+        # 2-seed ppl_mean.
+        _derived = ('ppl_primary', 'nll_sum', 'n_tokens', 'ppl_curve',
+                    'ppl_ci95', 'ppl_ci95_low', 'ppl_ci95_high',
+                    'ppl_median', 'ppl_iqr', 'dPPL_vs_full',
+                    'dPPL_vs_csa_fixed', 'avg_dyn_block_len', 'avg_block_len',
+                    'boundary_f1_dyn', 'boundary_excess_dyn',
+                    'delta_logit_mean', 'tokens_per_step', 'nll_pooled',
+                    'ppl_pooled', 'ppl_pooled_std')
+        for _f in _derived:
+            lentry[_f] = None
+        lentry['seed_derived_fields_invalidated'] = list(_derived)
         recovered[key] = sorted(missing)
     if recovered:
         L.atomic_write_json(agg_path, merged, indent=2)
@@ -137,6 +155,10 @@ def synthesize_long_summary():
     except Exception as _e:
         print(f'[synth] SKIP: {agg_path} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to rebuild summary.json from a corrupt aggregate; re-derive the aggregate first.')
         return ({'skipped_unreadable_aggregate': agg_path}, None)
+    if not isinstance(agg, dict):
+        print(f'[synth] SKIP: {agg_path} is valid JSON but not an object '
+              f'({type(agg).__name__}) — refusing to rebuild summary.json from it.')
+        return ({'skipped_non_object_aggregate': agg_path}, None)
     spath = os.path.join(adir, 'summary.json')
     summary = {}
     if os.path.exists(spath):
@@ -293,10 +315,16 @@ def merge_long_aggregate(adir, snapshot_agg):
         if not isinstance(sentry, dict):
             merged[key] = fentry
             continue
-        sm = _seed_map(sentry, tag=str(key))
+        sm_old = _seed_map(sentry, tag=str(key))
         fm = _seed_map(fentry, tag=str(key))
-        _overlap = set(sm) & set(fm)
-        n_old_all, n_new_only = (len(sm), len(fm) - len(_overlap))
+        _overlap = set(sm_old) & set(fm)
+        # Fresh values replace the old value for an overlapping seed; old-only
+        # seeds keep their snapshot value.  Secondary means must therefore be
+        # weighted by old-ONLY vs fresh draws, never by all old draws (which
+        # would count an overlap seed twice).
+        n_old_only = len(set(sm_old) - set(fm))
+        n_fresh = len(fm)
+        sm = dict(sm_old)
         sm.update(fm)
         if not sm:
             continue
@@ -309,18 +337,18 @@ def merge_long_aggregate(adir, snapshot_agg):
         sentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
         n_folded += 1
         _folded_keys.add(key)
-        if n_new_only:
-            _fresh_covers = n_old_all == 0 or len(fm) == n_old_all + n_new_only
+        if n_fresh:
+            _fresh_covers = n_old_only == 0
             for _f in ('avg_dyn_block_len', 'avg_block_len', 'boundary_f1_dyn', 'boundary_excess_dyn', 'delta_logit_mean', 'tokens_per_step'):
                 _vo, _vn = (sentry.get(_f), fentry.get(_f))
                 _vn_ok = isinstance(_vn, (int, float)) and (not isinstance(_vn, bool)) and math.isfinite(_vn)
                 _vo_ok = isinstance(_vo, (int, float)) and (not isinstance(_vo, bool)) and math.isfinite(_vo)
                 if not _vn_ok:
                     continue
-                if _fresh_covers:
+                if _fresh_covers or not _vo_ok:
                     sentry[_f] = _vn
-                elif _vo_ok:
-                    w_old = n_old_all / (n_old_all + n_new_only)
+                else:
+                    w_old = n_old_only / (n_old_only + n_fresh)
                     sentry[_f] = _vo * w_old + _vn * (1.0 - w_old)
             _co, _cn = (sentry.get('ppl_curve'), fentry.get('ppl_curve'))
             if _fresh_covers:
@@ -330,7 +358,7 @@ def merge_long_aggregate(adir, snapshot_agg):
                 _cm = {}
                 for _pt in _co:
                     try:
-                        _cm[int(_pt[0])] = [float(_pt[1]) * n_old_all, n_old_all]
+                        _cm[int(_pt[0])] = [float(_pt[1]) * n_old_only, n_old_only]
                     except (TypeError, ValueError, IndexError):
                         continue
                 for _pt in _cn:
@@ -339,8 +367,8 @@ def merge_long_aggregate(adir, snapshot_agg):
                     except (TypeError, ValueError, IndexError):
                         continue
                     _acc = _cm.setdefault(_s, [0.0, 0])
-                    _acc[0] += _v * n_new_only
-                    _acc[1] += n_new_only
+                    _acc[0] += _v * n_fresh
+                    _acc[1] += n_fresh
                 sentry['ppl_curve'] = [[_s, _a / _w] for _s, (_a, _w) in sorted(_cm.items()) if _w]
     if _folded_keys:
         _base_full = _seed_map(merged.get('full'), tag='full')
@@ -390,8 +418,14 @@ def run_overfit(cfg=None, variants=None, steps=None):
     augmentation / feature-alignment / label-mapping problems can still survive.
     The probe uses the panel's real architecture/MLP and a block-length
     sequence, and failed evidence is persisted before the hard stop."""
-    cfg = dict(L.RUN if cfg is None else cfg)
-    cfg.setdefault('outdir', 'results_overfit_sanity')
+    if cfg is None:
+        # L.RUN already carries the main-panel outdir, so setdefault never
+        # fired and the sanity artifacts polluted the core panel directory.
+        cfg = dict(L.RUN)
+        cfg['outdir'] = 'results_overfit_sanity'
+    else:
+        cfg = dict(cfg)
+        cfg.setdefault('outdir', 'results_overfit_sanity')
     variants = list(variants or ['full', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic', 'hybrid_hca_dyn', 'csa_dyn_nocomp'])
     # Seed BEFORE the corpus is served — this entry point can be the first
     # thing a process runs (`run_gapfill.py overfit` / the first phase of
