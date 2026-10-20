@@ -1436,6 +1436,8 @@ def audit_failures(outdirs=None):
             continue
         by_arm = {}
         n_ok = {}
+        unmeasured = {}
+        unmeasured_samples = {}
         for key, r in summ.items():
             if not isinstance(r, dict):
                 continue
@@ -1446,8 +1448,26 @@ def audit_failures(outdirs=None):
                 by_arm.setdefault(v, []).append(str(r.get('error') or r.get('status'))[:80])
             elif L.ppl_is_usable(r.get('ppl')) and not r.get('synthesized'):
                 n_ok[v] = n_ok.get(v, 0) + 1
-        if by_arm:
-            out['panels'][d] = {'errors_by_arm': {v: len(e) for v, e in by_arm.items()}, 'ok_by_arm': n_ok, 'error_samples': {v: e[:2] for v, e in by_arm.items()}}
+            else:
+                # A record that neither errored nor produced a usable PPL is
+                # still a missing measurement.  Dropping it from both sides
+                # would make a panel with selectively failed seeds look like a
+                # clean survivorship sample; count it explicitly.
+                if r.get('synthesized'):
+                    _why = 'synthesized record (excluded by protocol)'
+                else:
+                    _why = f'ppl not usable ({r.get("ppl")!r})'
+                unmeasured.setdefault(v, []).append(_why)
+                unmeasured_samples.setdefault(v, []).append(_why)
+        if by_arm or unmeasured:
+            panel = {'errors_by_arm': {v: len(e) for v, e in by_arm.items()},
+                     'ok_by_arm': n_ok,
+                     'error_samples': {v: e[:2] for v, e in by_arm.items()}}
+            if unmeasured:
+                panel['unmeasured_by_arm'] = {v: len(e) for v, e in unmeasured.items()}
+                panel['unmeasured_samples'] = {v: e[:2] for v, e in unmeasured_samples.items()}
+                out['status'] = 'warn'
+            out['panels'][d] = panel
     if not out['panels']:
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no error records found in local results (or no results) — run after each phase on the experiment machine; failures are already written as error records by the drivers'

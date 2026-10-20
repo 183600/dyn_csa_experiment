@@ -4915,6 +4915,11 @@ def t_audit_failures_ignores_unmeasured_ppl():
         panel = out['panels'][d]
         assert panel['ok_by_arm'] == {'c': 1}, panel
         assert panel['errors_by_arm'] == {'a': 1}, panel
+        # A NaN-PPL record is neither a success nor an exception in the data;
+        # it is a missing measurement and must stay visible to the failure
+        # concentration audit (otherwise survivorship bias disappears).
+        assert panel['unmeasured_by_arm'] == {'b': 1}, panel
+        assert out['status'] == 'warn', out
 
 
 def t_object_time_and_zero_feature_guards():
