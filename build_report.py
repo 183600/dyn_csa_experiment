@@ -1471,7 +1471,7 @@ def global_multiplicity_adjust(named_pvals, alpha=0.05):
     Benjamini-Hochberg step-up q-values + Bonferroni over ALL displayed
     comparisons.  Invalid/missing p keeps a p=1 slot (fail-closed family size,
     same convention as holm_adjust).  Duplicate names are a hard error."""
-    if isinstance(alpha, bool):
+    if isinstance(alpha, (bool, np.bool_)):
         raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
     try:
         a = float(alpha)
@@ -1587,7 +1587,20 @@ def sec_global_multiplicity():
 def holm_adjust(named_pvals, alpha=0.05):
     """Holm step-down over the report's displayed family (local copy: this
     builder intentionally does not import torch/exp_lib).  Missing/invalid
-    p-values keep a dummy p=1 slot so the family size is not silently shrunk."""
+    p-values keep a dummy p=1 slot so the family size is not silently shrunk.
+
+    The scalar contract mirrors ``exp_lib.holm_adjust``: booleans are flags,
+    not probabilities (``False`` must never enter the family as p=0), and a
+    threshold outside (0,1) is rejected instead of silently changing which
+    comparisons count as significant."""
+    if isinstance(alpha, (bool, np.bool_)):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    try:
+        _alpha = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}') from None
+    if not (0.0 < _alpha < 1.0):
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
     items = []
     _seen = set()
     for k, v in (named_pvals if named_pvals is not None else []):
@@ -1595,10 +1608,13 @@ def holm_adjust(named_pvals, alpha=0.05):
         if name in _seen:
             raise ValueError(f'holm_adjust: duplicate comparison name {name!r}')
         _seen.add(name)
-        try:
-            pv = float(v)
-        except (TypeError, ValueError, OverflowError):
+        if isinstance(v, (bool, np.bool_)):
             pv = float('nan')
+        else:
+            try:
+                pv = float(v)
+            except (TypeError, ValueError, OverflowError):
+                pv = float('nan')
         if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
             pv = 1.0
         items.append((name, pv))
