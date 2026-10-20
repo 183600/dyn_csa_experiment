@@ -5662,6 +5662,14 @@ def t_methodology_gate_fail_closed_edges():
         else:
             raise AssertionError(f'audit_methodology accepted min_n={_bad!r}')
 
+    # The report's displayed resolution floor is 2/2**n for EVERY n, not a
+    # Monte-Carlo-like 1/200001 beyond n=20 (the sign-flip test is exact/MITM
+    # up to n=40 and deterministic saddlepoint above).
+    for _n in (6, 20, 21, 30, 40, 100):
+        assert abs(BR._signflip_floor(_n) - math.ldexp(2.0, -_n)) < 1e-300
+    for _bad in (0, -1, True, np.bool_(True), 'x'):
+        assert not math.isfinite(BR._signflip_floor(_bad)), _bad
+
     # Scale pre-flight gates are not coerced either.
     def _tier(name, steps, params):
         cfg = {'steps': steps, 'batch_size': 2, 'seq_len': 8,
