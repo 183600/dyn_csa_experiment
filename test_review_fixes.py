@@ -1621,6 +1621,29 @@ def t_fairness_cross_arm_controls():
         assert od['controlled_variables']['objective_equal'] is False, od['controlled_variables']
         assert any('training objectives differ' in w for w in od['warnings']), od['warnings']
         assert od['status'] == 'warn', od['status']
+        # A seed-level objective change INSIDE one arm is a mixed protocol,
+        # not merely a cross-arm disclosure: the arm mean pools two different
+        # objectives and must not be called controlled.
+        mixed_obj = {k: dict(v) for k, v in _panel().items()}
+        mixed_obj['a::seed1']['train_objective'] = dict(obj, boundary_policy=['reinforce'])
+        _mr, _ = L._variant_seed_map(mixed_obj)
+        cv = L.controlled_variables_report(_mr, ['a', 'b'])
+        assert cv['objective_equal'] is False, cv
+        assert 'a' in cv['within_arm_mixed'], cv
+        assert cv['controlled'] is False, cv
+        assert 'train_objective' in cv['differences'], cv
+        md = _run(mixed_obj)
+        assert md['status'] == 'fail', md
+        assert any('mix DIFFERENT' in p for p in md['problems']), md['problems']
+        # A partially recorded objective descriptor is unverifiable, not a
+        # pass; the arm must be named as partially recorded.
+        part_obj = {k: dict(v) for k, v in _panel().items()}
+        part_obj['b::seed1'].pop('train_objective')
+        _pr, _ = L._variant_seed_map(part_obj)
+        cv2 = L.controlled_variables_report(_pr, ['a', 'b'])
+        assert cv2['objective_equal'] is False, cv2
+        assert 'b' in cv2['partially_recorded'], cv2
+        assert cv2['controlled'] is False, cv2
         # A different optimizer/clip in ONE arm must fail even when every arm
         # is internally consistent.
         bad = _run(_panel(knob_override=('b', 1)))

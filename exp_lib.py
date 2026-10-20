@@ -15884,11 +15884,14 @@ def controlled_variables_report(recs, arms):
     else:
         hp_equal = True
     mixed = sorted(set(run_cfg['within_arm_mixed']) | set(train_knobs['within_arm_mixed'])
+                   | set(objective['within_arm_mixed'])
                    | {a for k in hp_checked for a in hyper[k]['within_arm_mixed']})
     partial = sorted(set(run_cfg['partially_recorded']) | set(train_knobs['partially_recorded'])
+                     | set(objective['partially_recorded'])
                      | {a for k in hp_checked for a in hyper[k]['partially_recorded']})
     diff_values = {}
-    for key, ctl in (('run_cfg', run_cfg), ('train_knobs', train_knobs)):
+    for key, ctl in (('run_cfg', run_cfg), ('train_knobs', train_knobs),
+                     ('train_objective', objective)):
         if ctl['equal'] is False:
             diff_values[key] = ctl['values']
     for key in hp_diffs:
@@ -15920,6 +15923,14 @@ def controlled_variables_report(recs, arms):
         controlled = False
     elif all(f is True for f in flags):
         controlled = True
+    # A cross-arm objective difference is a system-level disclosure, not
+    # necessarily an uncontrolled recipe (a declared loss-term ablation is the
+    # intervention).  But an arm whose OWN seeds mix different objectives, or
+    # carry the descriptor only on some seeds, cannot attest any single
+    # objective for its arm mean.
+    if (objective['equal'] is False
+            and (objective['within_arm_mixed'] or objective['partially_recorded'])):
+        controlled = False
     return {
         'arms': arms,
         'n_records': {a: sum(1 for (v, _t, _s) in recs if v == a) for a in arms},
