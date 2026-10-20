@@ -1012,9 +1012,19 @@ def audit_boundary(outdirs=None):
     「语义边界」是块长分布的伪影。exp_lib 已实现该基线
     （`_random_cut_precision`，两种口径见 design_notes §10）；本审计把
     「对齐精度 − 随机基线」的差值与比值汇总成显式判读。"""
-    out = {'status': 'ok', 'panels': {}}
+    import numpy as np
+    out = {'status': 'ok', 'panels': {}, 'problems': []}
     L = _import_exp_lib()
     dirs = outdirs or list(_iter_result_dirs())
+
+    def _num(value):
+        # Alignment readings are measurements: booleans, strings and
+        # non-finite values cannot support a "beats the random baseline" claim.
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+            return None
+        f = float(value)
+        return f if math.isfinite(f) else None
+
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
         if not summ:
@@ -1031,14 +1041,22 @@ def audit_boundary(outdirs=None):
         if found:
             agg = []
             for key, b in list(found.items())[:200]:
-                p = b.get('precision')
-                rp = b.get('random_precision')
-                if p is not None and rp is not None:
-                    agg.append({'key': key, 'precision': p, 'random_baseline': rp, 'excess': p - rp, 'ratio': (p / rp) if rp else None, 'verdict': 'exceeds random baseline' if p > rp else ('at baseline (block-length artifact)' if abs(p - rp) < 1e-9 else 'below baseline')})
+                p_raw, rp_raw = b.get('precision'), b.get('random_precision')
+                if p_raw is None and rp_raw is None:
+                    continue
+                p, rp = _num(p_raw), _num(rp_raw)
+                if p is None or rp is None:
+                    out['problems'].append(
+                        f'{d}/{key}: precision/random_precision must be finite real numbers '
+                        f'(got {p_raw!r} / {rp_raw!r}); the alignment reading is unverifiable')
+                    continue
+                agg.append({'key': key, 'precision': p, 'random_baseline': rp, 'excess': p - rp, 'ratio': (p / rp) if rp else None, 'verdict': 'exceeds random baseline' if p > rp else ('at baseline (block-length artifact)' if abs(p - rp) < 1e-9 else 'below baseline')})
             out['panels'][d] = agg
-    if not out['panels']:
-        out['status'] = 'not_verifiable_locally'
-        out['note'] = 'no boundary-alignment fields in the local results; fuse_analysis.py recomputes per-layer alignment (tol=1) from summary.json and exp_lib._random_cut_precision provides the matched-length random baseline — run them on the experiment machine'
+    if out['problems']:
+        out['status'] = 'fail'
+    if not out['panels'] or not any(v for v in out['panels'].values()):
+        out['status'] = 'fail' if out['problems'] else 'not_verifiable_locally'
+        out['note'] = 'no usable boundary-alignment fields in the local results; fuse_analysis.py recomputes per-layer alignment (tol=1) from summary.json and exp_lib._random_cut_precision provides the matched-length random baseline — run them on the experiment machine'
     print(json.dumps(out, ensure_ascii=False, indent=2)[:4000])
     return out
 

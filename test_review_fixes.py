@@ -4180,6 +4180,25 @@ def t_audit_fairness_nan_seed_does_not_crash():
             A.REPO = old_repo
 
 
+def t_audit_boundary_rejects_invalid_readings():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'summary.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'a': {'boundary_alignment': {'precision': 0.8,
+                                                     'random_precision': 0.2}}}, f)
+        ok = A.audit_boundary(outdirs=[d])
+        assert ok['status'] == 'ok' and ok['panels'][d][0]['excess'] == 0.8 - 0.2, ok
+        # Strings/booleans/non-finite readings cannot support a claim, and
+        # must not crash the audit either.
+        for bad in ({'precision': 'x', 'random_precision': 0.2},
+                    {'precision': True, 'random_precision': 0.2},
+                    {'precision': float('nan'), 'random_precision': 0.2}):
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({'a': {'boundary_alignment': bad}}, f)
+            r = A.audit_boundary(outdirs=[d])
+            assert r['status'] == 'fail' and r['problems'], r
+
+
 def t_audit_split_empty_cache_is_not_ok():
     with tempfile.TemporaryDirectory() as d:
         out = A.audit_split_discipline(cache_dirs=[d])
@@ -6014,6 +6033,7 @@ def main():
     _check('I14 corpus audit counts overlapping validation rows once', t_corpus_audit_overlap_is_unique_across_windows)
     _check('I15 length audit refuses a missing eval span', t_audit_length_requires_eval_span)
     _check('I16 fairness audit ignores a NaN seed instead of crashing', t_audit_fairness_nan_seed_does_not_crash)
+    _check('I16b boundary audit rejects non-numeric alignment readings', t_audit_boundary_rejects_invalid_readings)
     _check('I17 an empty split cache is not reported as verified', t_audit_split_empty_cache_is_not_ok)
     _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)
     _check('I19 simple-baseline audit reports malformed records instead of crashing', t_simple_baseline_audit_malformed_records)
