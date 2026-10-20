@@ -3033,6 +3033,18 @@ def t_baseline_driver_refuses_overlapping_final_seeds():
         assert 'overlap' in str(e), e
     else:
         raise AssertionError('overlapping search/final seeds were not refused')
+    # An empty final partition must not silently fall back to seed 0 (which
+    # could be a search draw).
+    empty = dict(L.BASELINE_TUNING_PROTOCOL, arms=['csa_fixed', 'csa_dynamic'],
+                 search_seeds=[0], final_seeds=[])
+    try:
+        BT.run_tuning(dict(L.RUN, outdir=tempfile.mkdtemp(prefix='tune_empty_')),
+                      outdir=tempfile.mkdtemp(prefix='tune_empty_out_'),
+                      protocol=empty, final=True)
+    except ValueError as e:
+        assert 'final_seeds' in str(e), e
+    else:
+        raise AssertionError('an empty final seed partition was not refused')
 
 
 def t_nested_validation_row_split_and_subset_ppl():

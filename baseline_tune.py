@@ -222,6 +222,15 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     # across-seed std recorded).  Legacy protocols that only declare
     # `search_seed` keep the single-seed path.
     search_seeds, final_seeds_declared, overlap = _search_final_seeds(protocol)
+    if final and not final_seeds_declared:
+        # An empty final partition used to fall through to L.run(..., seeds=[])
+        # whose default is seed 0.  That silently retrained the "final" panel
+        # on a seed that may also have selected the hyper-parameters, with no
+        # artifact field recording the substitution.  Refuse instead.
+        raise ValueError(
+            'final=True requires a non-empty declared final_seeds partition; '
+            'an empty list would silently fall back to the default seed 0 and '
+            'could re-use a search draw')
     if final and final_seeds_declared and overlap:
         raise ValueError(
             'search_seeds and final_seeds overlap on %s — the final evaluation '
@@ -570,6 +579,8 @@ def _relaxed_pair_reason(a, b, tuned_arms):
 
 def _run_final(base, outdir, protocol, selected):
     final_seeds = [int(s) for s in protocol.get('final_seeds', [])]
+    if not final_seeds:
+        raise ValueError('_run_final: final_seeds must be a non-empty declared partition')
     search_seeds, _, overlap = _search_final_seeds(protocol)
     if final_seeds and overlap:
         raise ValueError(
