@@ -5681,6 +5681,24 @@ def t_methodology_gate_fail_closed_edges():
         else:
             raise AssertionError(f'crossover_scaling_fit accepted {_kw!r}')
 
+    # Baseline tuning evidence uses the same exact-count / finite-spread
+    # contract.  abs(NaN - s) > tol was False, so a corrupted ppl_std used to
+    # PASS the per-seed std check; a boolean step budget compared equal to 1.
+    def _tune_art(trial):
+        return {'selection_metric': 'ppl', 'selection_split': 'validation',
+                'direction': 'lower_is_better', 'search_seeds': [2, 3],
+                'arms': {'a': {'trials': [trial],
+                               'selected': {'lr': 1e-3},
+                               'selected_metric_value': trial.get('ppl')}}}
+    _trial = {'config': {'lr': 1e-3}, 'ppl': 1.5, 'seeds': [0, 1],
+              'seed_ppls': {'0': 1.0, '1': 2.0}, 'ppl_std': float('nan'),
+              'steps': 10, 'tokens_seen': 100}
+    out = L.baseline_tuning_audit(_tune_art(_trial))
+    assert any('ppl_std' in p for p in out['problems']), out['problems']
+    _trial = dict(_trial, ppl_std=float(np.std([1.0, 2.0], ddof=1)), steps=True)
+    out = L.baseline_tuning_audit(_tune_art(_trial))
+    assert any('exact positive counts' in p for p in out['problems']), out['problems']
+
 
 def main():
     if not _HAVE_TORCH:
