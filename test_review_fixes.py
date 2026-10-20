@@ -3597,6 +3597,23 @@ def t_leakage_checks_validate_inputs():
     assert all(len(idx[k]) == 0 for k in ('train', 'val', 'test')), idx
 
 
+def t_probe_stats_rejects_malformed_arm_identities():
+    import v12_supp as V
+    manifest = {'arms': ['a', 'b'], 'seeds': [0, 1]}
+    td = tempfile.mkdtemp(prefix='probe_', dir=REPO)
+    try:
+        path = os.path.join(td, 'distractor.json')
+        base = {'seed': 0, 'val_fp': 'fp', 'arm': 'learned',
+                'eval_len': 8, 'rho': 0.5, 'ppl_mean': 1.0}
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'bad_variant': dict(base, variant={'x': 1}),
+                       'bad_arm': dict(base, variant='a', arm={'x': 1})}, f)
+        r = V._test_probe_stats(path, manifest, 'fp')
+        assert r['n_admitted'] == 0 and r['n_excluded'] == 2, r
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def t_categorical_shift_empty_reference():
     r = L.categorical_shift_report([], [1, 2, 3])
     assert r['n_reference'] == 0 and r['n_holdout'] == 3, r
@@ -5919,6 +5936,7 @@ def main():
     _check('C4 recipe signature', t_recipe_signature)
     _check('C4b P1L checkpoint recipe signature', t_p1l_recipe_signature)
     _check('C5 freeze lock', t_freeze_lock)
+    _check('C5b probe stats reject malformed arm identities', t_probe_stats_rejects_malformed_arm_identities)
     _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)
     _check('C10 audit resolution classification', t_audit_resolution_classification)
     _check('C11 controlled-variable gate: mixed train_knobs', t_pair_reason_train_knobs_mixed)

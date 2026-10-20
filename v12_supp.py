@@ -1290,8 +1290,9 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             continue
         why = None
         _seed_i = _record_int(r.get('seed'))
-        if r.get('variant') not in arms:
-            why = f"variant {r.get('variant')!r} is not one of the frozen arms"
+        _variant = r.get('variant')
+        if not isinstance(_variant, str) or _variant not in arms:
+            why = f"variant {_variant!r} is not one of the frozen arms"
         elif _seed_i is None or _seed_i not in seeds:
             why = f"seed {r.get('seed')!r} is outside the frozen whitelist"
         elif r.get('val_fp') != slice_fp:
@@ -1308,7 +1309,9 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = _implementation_reason(r, impl)
         elif not L.ppl_is_usable(r.get('ppl_mean')):
             why = 'ppl_mean is not a usable measurement'
-        elif r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:
+        elif not isinstance(r.get('arm'), str) or not r.get('arm'):
+            why = f"arm {r.get('arm')!r} is not a non-empty string"
+        elif r.get('eval_len') is None or r.get('rho') is None:
             why = 'missing arm/eval_len/rho'
         elif _record_int(r.get('eval_len')) is None:
             why = f"eval_len {r.get('eval_len')!r} is not an integer"
