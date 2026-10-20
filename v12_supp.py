@@ -1439,7 +1439,8 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
         mode = str(r.get('mode', 'uniform'))
         ident = (r['variant'], r['arm'], _record_int(r['eval_len']), float(r['rho']), mode,
                  json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True),
-                 str(r.get('recipe')), str(r.get('_code')))
+                 str(r.get('recipe')), str(r.get('_code')),
+                 str(V10._recipe_norm(r.get('recipe'))))
         grp = groups.setdefault(ident, {})
         if _seed_i in grp:
             excluded.append(f'{key}: duplicate (cell, seed) identity — the pooled mean would be ambiguous')
@@ -1487,14 +1488,16 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
                 continue
             _other_id, other = other_entries[0]
             # ident = (variant, arm, eval_len, rho, mode, probe_params,
-            #          recipe, code); compare the measurement identity.
+            #          recipe, code, normalised recipe); compare the
+            # measurement identity.  The normalised recipe ignores only the
+            # parameter-matching `mr` field, exactly like v10's probe pairs.
             if _learned_id[5] != _other_id[5]:
                 _contrast_exclusions.append(
                     f'contrast L{Ln} r{rho} [{mode}] {other_arm} - learned: '
                     'the two arms carry different probe_params — pairing them '
                     'would difference two different measurements')
                 continue
-            if _learned_id[6] != _other_id[6] or _learned_id[7] != _other_id[7]:
+            if _learned_id[7] != _other_id[7] or _learned_id[8] != _other_id[8]:
                 _contrast_exclusions.append(
                     f'contrast L{Ln} r{rho} [{mode}] {other_arm} - learned: '
                     'the two arms carry different recipe/code stamps — '

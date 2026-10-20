@@ -4711,6 +4711,19 @@ def t_probe_stats_rejects_synthesized_and_mismatched_probe_params():
         assert r['n_admitted'] == 4, r
         assert len(r['contrasts']) == 1, r
 
+        # The parameter-matching `_mr` field is part of the ARM, not the
+        # probe measurement: arms whose recipes differ only there are still
+        # a valid controlled contrast (v10 applies the same normalisation).
+        mr = dict(base)
+        mr['learned::0'] = dict(mr['learned::0'], recipe='x_mr4.0_dfabc')
+        mr['learned::1'] = dict(mr['learned::1'], recipe='x_mr4.0_dfabc')
+        mr['dense::0'] = dict(mr['dense::0'], recipe='x_mr6.7_dfabc')
+        mr['dense::1'] = dict(mr['dense::1'], recipe='x_mr6.7_dfabc')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(mr, f)
+        r = V._test_probe_stats(path, manifest, 'fp')
+        assert len(r['contrasts']) == 1, r
+
         # A synthesized probe trajectory is provenance, not a measurement.
         synth = dict(base)
         synth['learned::0'] = dict(synth['learned::0'], synthesized=True)
