@@ -29,6 +29,7 @@
   methodology  受控对比 / 消融完整性 / 统计可靠性：逐臂全种子设置一致性、
                每个创新点的留一对照是否完整、n 与 mean±std（零 GPU）
   failures     失败与缺失：error 记录按臂集中度（选择偏差读数，零 GPU）
+  training_health  训练曲线健康与 NaN 排查记录的自洽性（零 GPU）
   budget       规模核算：6ND 估算 + TimeGuard 记录对账（零 GPU）
   efficiency   prefill/decode/容量读数工具（需要模型；给出可复用函数
                与 CPU 微型演示——不是实验，是测量代码自检）
