@@ -2912,13 +2912,66 @@ def t_manifest_running_then_complete():
         e = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))['panels']['FP']
         assert e['status'] == 'running' and e['n_planned'] == 2 and e['n_completed'] == 0
         assert e['missing_cells'] == planned and e['created_at'] == 'T0'
+        assert e['completion']['status'] == 'running' and e['completion']['complete'] is False, e.get('completion')
         summary = {'full::seed0': {'ppl': 10.0, 'steps': 3, 'tokens_seen': 192, 'params': 100, 'train_time_s': 1.0, 'final_loss_smoothed': 2.3, 'rng_fp': 'abc', '_code': L.code_stamp(), 'losses': [3.0, 2.3], 'ppl_history': []}}
         L.write_run_manifest(d, cfg, 'FP', prov, summary, status='complete', planned_cells=planned, started_at='T0')
         e = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))['panels']['FP']
         assert e['status'] == 'complete' and e['n_completed'] == 1 and e['missing_cells'] == ['full::seed1']
+        # The explicit status argument is preserved for compatibility, but the
+        # completion verdict must still expose the missing cell and the
+        # untraced record instead of looking complete.
+        assert e['completion']['status'] == 'incomplete' and e['completion']['complete'] is False, e['completion']
+        assert e['completion']['missing_cells'] == ['full::seed1'], e['completion']
+        assert e['tracking_integrity']['complete'] is False
+        assert 'full::seed0' in e['tracking_integrity']['incomplete_cells'], e['tracking_integrity']
         assert e['created_at'] == 'T0', 'a final update must not reset the panel start time'
         assert e['data_version'] == prov['data']['data_version']
     finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def t_panel_finish_marks_missing_cells_incomplete():
+    d = tempfile.mkdtemp()
+    _saved_load = L.load_run_corpus
+    _saved_train = L.train_variant
+    _old_skip_overfit = os.environ.get('CSA_SKIP_OVERFIT')
+    _old_skip_repro = os.environ.get('CSA_SKIP_REPRO')
+    try:
+        ids = np.arange(4096, dtype=np.int64) % 997
+        val = (np.arange(64, dtype=np.int64) % 997).reshape(2, 32)
+        L.load_run_corpus = lambda cfg: (ids, val, 997, None, None)
+        os.environ['CSA_SKIP_OVERFIT'] = '1'
+        os.environ['CSA_SKIP_REPRO'] = '1'
+
+        def _flaky(variant, *a, **kw):
+            if variant == 'csa_fixed':
+                raise RuntimeError('unit: deliberate cell failure')
+            return _saved_train(variant, *a, **kw)
+        L.train_variant = _flaky
+        cfg = dict(outdir=d, seq_len=32, batch_size=2, n_train_tokens=4096, steps=1,
+                   lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0,
+                   delta_lr_mult=10.0, eval_every=0, eval_subset=2, d=64,
+                   n_layers=2, n_heads=4, d_head=16, dataset='unit', seeds=[0],
+                   variants=['full', 'csa_fixed'])
+        L.run(cfg, label='incomplete-unit')
+        m = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
+        e = next(iter(m['panels'].values()))
+        assert e['status'] == 'incomplete', e.get('status')
+        assert e['missing_cells'] == ['csa_fixed::seed0'], e.get('missing_cells')
+        assert e['completion']['status'] == 'incomplete' and e['completion']['n_missing'] == 1, e.get('completion')
+        lines = [json.loads(x) for x in open(os.path.join(d, 'experiments.jsonl'), encoding='utf-8').read().strip().splitlines()]
+        fin = next(x for x in lines if x.get('kind') == 'panel_finish')
+        assert fin['status'] == 'incomplete' and fin['missing_cells'] == ['csa_fixed::seed0'], fin
+        err = next(x for x in lines if x.get('kind') == 'cell' and x.get('status') == 'error')
+        assert err['variant'] == 'csa_fixed' and 'deliberate' in err['error'], err
+    finally:
+        L.load_run_corpus = _saved_load
+        L.train_variant = _saved_train
+        for k, old in (('CSA_SKIP_OVERFIT', _old_skip_overfit), ('CSA_SKIP_REPRO', _old_skip_repro)):
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
         shutil.rmtree(d, ignore_errors=True)
 
 
@@ -9910,6 +9963,7 @@ def main():
     _check('E8 append-only experiment ledger + manifest', t_experiment_ledger)
     _check('E9 data_version identity', t_data_version_identity)
     _check('E10 crash-safe manifest status/planned cells', t_manifest_running_then_complete)
+    _check('E10b panel finish marks missing cells incomplete', t_panel_finish_marks_missing_cells_incomplete)
     _check('E11 failed overfit guard is retried', t_failed_guard_is_retried)
     _check('E12 locked JSON nested path + CSV generator rows', t_locked_json_and_csv_generator)
     _check('F1 indexer column-narrowing exactness', t_indexer_column_narrowing_exact)

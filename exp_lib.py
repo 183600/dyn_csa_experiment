@@ -18720,6 +18720,41 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         'with_data_contract': int(bool(isinstance(data_contract, dict) and data_contract.get('passed'))),
         'with_seed_contract': int(bool(isinstance(seed_contract, dict) and seed_contract.get('passed'))),
     }
+    # Counts alone let a cell that is missing its code stamp / hyperparameters /
+    # data version / RNG fingerprint / curve still look like a normal member of
+    # a "complete" panel.  Name the incomplete cells and make panel completion
+    # a single machine-readable verdict, so an automated reader cannot mistake
+    # a partially traced panel for a fully reproducible one.
+    _missing_cells = [str(k) for k in planned_cells if k not in cells]
+    _incomplete_cells = []
+    for _k, _c in cells.items():
+        _hp2 = _c.get('hyperparams') if isinstance(_c.get('hyperparams'), dict) else {}
+        _curve_n = (_c.get('curve_summary') or {}).get('n_points')
+        if not (_c.get('code_stamp') and _hp2 and _c.get('data_version')
+                and _c.get('rng_fp') and _curve_n):
+            _incomplete_cells.append(str(_k))
+    _integrity['complete_cells'] = len(cells) - len(_incomplete_cells)
+    _integrity['incomplete_cells'] = _incomplete_cells[:20]
+    _integrity['missing_cells'] = _missing_cells[:20]
+    _integrity['complete'] = bool(not _incomplete_cells and not _missing_cells
+                                  and not _seed_mismatch)
+    _completion_status = ('running' if (status or 'complete') == 'running'
+                          else ('complete' if _integrity['complete'] else 'incomplete'))
+    _completion = {
+        'status': _completion_status,
+        'complete': bool(_integrity['complete']),
+        'n_planned': len(planned_cells),
+        'n_measured': len(cells),
+        'n_missing': len(_missing_cells),
+        'missing_cells': _missing_cells[:20],
+        'incomplete_cells': _incomplete_cells[:20],
+        'incomplete_reasons': ('missing measurement for every planned cell; '
+                               'each measured cell carries code/hyperparameters/'
+                               'data_version/rng_fp/curve and seed metadata'
+                               if _integrity['complete'] else
+                               'panel is not fully traced: see missing_cells / '
+                               'incomplete_cells / seed_metadata_mismatch'),
+    }
     _evidence = {
         'small_batch_overfit': (bool(sanity.get('passed')) if isinstance(sanity, dict) else None),
         'same_machine_reproducibility': (bool(reproducibility.get('passed')) if isinstance(reproducibility, dict) else None),
@@ -18745,7 +18780,8 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         'planned_cells': planned_cells,
         'n_planned': len(planned_cells),
         'n_completed': len(cells),
-        'missing_cells': [k for k in planned_cells if k not in cells],
+        'missing_cells': _missing_cells,
+        'completion': _completion,
         'tracking_integrity': _integrity,
         'cells': cells,
     }
@@ -24718,16 +24754,22 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             print(f'    {_k}')
         if len(_still) != len(stale_dropped):
             print(f'    ({len(stale_dropped) - len(_still)} of them succeeded and carry a fresh record.)')
-    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=_sanity_doc, reproducibility=_repro_doc, data_contract=_data_contract, seed_contract=_seed_contract, status='complete', planned_cells=_planned_keys, started_at=_panel_started)
-    _agg = _finish_panel(outdir, summary)
     _measured = {k for k in _planned_keys if isinstance(summary.get(k), dict) and ppl_is_usable((summary.get(k) or {}).get('ppl')) and not (summary.get(k) or {}).get('synthesized')}
+    _missing = [k for k in _planned_keys if k not in _measured]
+    # A finished process is not a finished panel.  Stamping a run with missing
+    # measurements as `complete` is exactly how a partially traced experiment
+    # gets quoted as if every planned cell existed.
+    _final_status = 'complete' if not _missing else 'incomplete'
+    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=_sanity_doc, reproducibility=_repro_doc, data_contract=_data_contract, seed_contract=_seed_contract, status=_final_status, planned_cells=_planned_keys, started_at=_panel_started)
+    _agg = _finish_panel(outdir, summary)
     log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
+        'status': _final_status,
         'run_cfg': fp, 'code': code_stamp(), 'started_at': _panel_started,
         'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'n_cells_planned': len(_planned_keys), 'n_cells_to_run': len(cells),
         'n_cells_measured': len(_measured),
-        'n_cells_missing': max(0, len(_planned_keys) - len(_measured)),
+        'n_cells_missing': len(_missing), 'missing_cells': _missing[:20],
         'n_truncated': len(dropped_truncations), 'n_stale_dropped': len(stale_dropped),
         'aggregate_ref': 'aggregate.json', 'summary_ref': 'summary.json',
         'aggregate': {str(v): {kk: e.get(kk) for kk in ('n', 'n_seeds', 'ppl_mean', 'ppl_std', 'params') if kk in e} for v, e in (_agg or {}).items() if isinstance(e, dict)},
