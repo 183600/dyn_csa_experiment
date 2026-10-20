@@ -7477,6 +7477,9 @@ def t_signflip_zero_ties_lower_resolution_floor():
     # The report twin must obey the same floor.
     z = BR.exact_signflip([1.0, 2.0, 0.0, 0.0, 0.0, 0.0])
     assert z['n_nonzero'] == 2 and abs(z['p_floor'] - 0.5) < 1e-15, z
+    # The shared v7-v12 helper used by the probe/final-test reports too.
+    v = V7.exact_sign_permutation([1.0, 2.0, 0.0, 0.0, 0.0, 0.0])
+    assert v['n_nonzero'] == 2 and abs(v['p_floor'] - 0.5) < 1e-15, v
 
 
 def t_scale_meta_refuses_visible_attrition():

@@ -1583,11 +1583,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         # Diagnostics must use the n that actually entered THIS comparison,
         # so p_floor / min_attainable_p_holm / power describe the test that
         # really ran.
-        _fl_eff = L.signflip_p_floor(_n_eff)
+        # Effective resolution uses the number of NON-ZERO paired deltas;
+        # exact ties cannot resolve anything.  This must describe the test
+        # that actually ran, not the theoretical all-nonzero floor.
+        _floor_n = int(res.get('n_nonzero', _n_eff))
+        _fl_eff = (1.0 if _floor_n == 0 else L.signflip_p_floor(_floor_n))
         if math.isfinite(_fl_eff):
             res['p_floor_effective'] = _fl_eff
-            res['min_attainable_p_holm_effective'] = L.holm_min_attainable_p(_n_eff, len(manifest['primary_comparisons']), _alpha)
-            res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_n_eff, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
+            res['min_attainable_p_holm_effective'] = L.holm_min_attainable_p(_floor_n, len(manifest['primary_comparisons']), _alpha)
+            res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_floor_n, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
         _pa = [p for p in (L._finite_scalar(recs_a[s].get('params')) for s in usable) if p is not None]
         _pb = [p for p in (L._finite_scalar(recs_b[s].get('params')) for s in usable) if p is not None]
         if _pa and _pb:

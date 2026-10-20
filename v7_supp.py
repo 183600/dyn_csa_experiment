@@ -1578,7 +1578,13 @@ def exact_sign_permutation(deltas):
         d_z（配对差均值/样本标准差），并把该 n 下的 p 值分辨率下限
         一并写出，避免把分辨率上限误读为数据结论。纯增量字段。"""
         res['per_seed'] = [float(x) for x in d.tolist()]
-        res['p_floor'] = math.ldexp(2.0, -int(n)) if n > 0 else float('nan')
+        # Zero deltas are sign-neutral: they do not change p, but they lower
+        # the attainable resolution from 2/2**n to 2/2**(#nonzero).
+        _n_nonzero = int(np.count_nonzero(d))
+        res['n_nonzero'] = _n_nonzero
+        res['p_floor'] = (float('nan') if n <= 0 else
+                          (1.0 if _n_nonzero == 0 else
+                           math.ldexp(2.0, -_n_nonzero)))
         _sd = res.get('std', 0.0)
         _mu = res.get('mean', float('nan'))
         if (not isinstance(_sd, (int, float))) or (not math.isfinite(_mu)):
