@@ -3331,6 +3331,16 @@ def t_simple_baseline_nested_rows_and_fingerprint():
         pass
     else:
         raise AssertionError('mismatched evaluation_row_fp was accepted')
+    # The floor must use the same declared fold layout as the panel: a
+    # reproducible but different split is still an unfair comparison.
+    sel2, ev2, meta2 = L.validation_row_split(8, seed=123, n_folds=2,
+                                              selection_fold=0, evaluation_fold=1)
+    art2 = L.simple_baseline_fit(train, val, vocab, protocol=proto,
+                                 selection_rows=sel2, evaluation_rows=ev2,
+                                 row_split=meta2)
+    rsplit = L.simple_baseline_audit(art2, protocol=proto)
+    assert rsplit['baseline_verified'] is False and any(
+        'different validation folds' in p for p in rsplit['problems']), rsplit
     # The reported token denominator must be the held-out denominator.
     bad_tok = json.loads(json.dumps(art))
     bad_tok['data']['n_eval_tokens'] = int(val.size)

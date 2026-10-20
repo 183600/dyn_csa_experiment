@@ -12011,6 +12011,27 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             warnings.append('nested simple-baseline row_split omits part of the fold description '
                             '(n_rows/seed/n_folds/selection_fold/evaluation_fold); the recorded '
                             'ranges cannot be independently reproduced')
+        # The floor must use the SAME declared fold layout as the neural
+        # panel.  A reproducible but different split would tune the count
+        # model on different (and possibly more favourable) selection rows.
+        try:
+            _declared_split = tuning_row_split_spec(protocol)
+        except ValueError as _dse:
+            problems.append(f'malformed simple-baseline selection_row_split: {_dse}')
+            _declared_split = None
+        if _declared_split is not None:
+            if nested_applied is not True:
+                warnings.append('the simple-baseline protocol declares a nested row split, but the '
+                                'artifact reports full-validation selection — the floor may have '
+                                'selected on the same documents the panel reports on')
+            else:
+                _diff = [k for k in ('seed', 'n_folds', 'selection_fold', 'evaluation_fold')
+                         if row_split.get(k) is not None
+                         and row_split.get(k) != _declared_split.get(k)]
+                if _diff:
+                    problems.append('nested simple-baseline row split differs from the declared '
+                                    f'selection_row_split on {_diff} — the floor and the panel were '
+                                    'tuned on different validation folds')
         _sel_fp = data.get('selection_fp')
         _eval_fp = data.get('eval_fp')
         if not _sel_fp or not _eval_fp:
