@@ -7891,6 +7891,69 @@ def t_m0_cross_scale_pairs_are_control_gated():
                                      {'label': 'S1', 'scale': 1.0}]) is None
 
 
+
+def t_scale_trend_degenerate_fit_and_empty_tiers():
+    # A perfectly flat WLS line has zero residual variance.  That is not a
+    # maximally significant increasing trend; it is no detectable trend.
+    pts = [{'label': f'S{i}', 'scale': 10 ** i, 'effects': [0.1, 0.2, 0.3]}
+           for i in range(3)]
+    r = L.scaling_trend(pts, min_seeds=3, min_points=3)
+    assert r['wls']['se'] == 0.0 and r['wls']['p'] == 1.0, r['wls']
+    assert r['significant'] is False and r['verdict'] == 'no_detectable_trend', r
+    # A declared-but-empty tier must not disable paired inference over the
+    # scales that DO carry measured effects.
+    pts = [{'label': 'A', 'scale': 1, 'effects': [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
+            'seeds': list(range(6))},
+           {'label': 'B', 'scale': 10, 'effects': [], 'seeds': []},
+           {'label': 'C', 'scale': 100, 'effects': [1.0, 1.1, 1.2, 1.3, 1.4, 1.5],
+            'seeds': list(range(6))}]
+    r = L.scaling_trend(pts, min_seeds=3, min_points=3)
+    assert r['paired']['labels'] == ['A', 'C'], r['paired']
+    assert r['paired']['n_complete_seeds'] == 6, r['paired']
+    assert 'B' in r['empty_points'] and r['significant'] is False, r
+
+
+def t_scale_non_estimable_variance_blocks_pooling():
+    big = 1e308
+    pts = [{'label': 'BIG', 'scale': 1, 'effects': [big, -big], 'seeds': [0, 1]},
+           {'label': 'S1', 'scale': 2, 'effects': [0.10, 0.11], 'seeds': [0, 1]},
+           {'label': 'S2', 'scale': 3, 'effects': [0.1005, 0.1105], 'seeds': [0, 1]},
+           {'label': 'S3', 'scale': 4, 'effects': [0.101, 0.111], 'seeds': [0, 1]}]
+    m = L.meta_analyze_effects(pts, min_seeds=2)
+    assert 'BIG' in m['non_estimable_points'], m
+    assert m['poolable'] is False and m['n_usable'] == 3, m
+    assert any('non-estimable' in m['note'] for _ in [0]), m['note']
+
+
+def t_tuning_margin_does_not_invent_precision():
+    # Missing marginal SD is unavailable uncertainty, not zero variance.
+    m = L.tuning_selection_margin({'ppl': 10.0}, {'ppl': 10.001})
+    assert m['se'] is None and m['decisive'] is None, m
+    assert m['method'] != 'independent_marginal_se', m
+    # When the paired path is used, the numerator must come from the SAME
+    # common seeds as the paired SE, not from the full trial means.
+    best = {'ppl': -333.3, 'ppl_std': 1.0, 'n_seeds': 3,
+            'seed_ppls': {'0': 0.0, '1': 0.0, '2': -1000.0}}
+    runner = {'ppl': 0.0, 'ppl_std': 1.0, 'n_seeds': 3,
+              'seed_ppls': {'0': 100.0, '1': -100.0, '3': 0.0}}
+    m = L.tuning_selection_margin(best, runner)
+    assert m['method'] == 'paired_search_seeds' and m['n_paired'] == 2, m
+    assert m['margin'] == 0.0 and m['decisive'] is False, m
+
+
+def t_scale_ladder_missing_seed_plan_is_not_common():
+    def tier(name, seeds):
+        return {'name': name, 'params': 1000,
+                'cfg': {'steps': 1000, 'batch_size': 2, 'seq_len': 8,
+                        'n_train_tokens': 16000, 'lr': 3e-4,
+                        'warmup': 100, 'seeds': seeds}}
+    out = L.scale_ladder_audit([tier('S1', list(range(8))), tier('S2', [])],
+                               policy=dict(L.SCALE_TRANSFER_POLICY, family_m=4))
+    assert out['n_common_seeds'] == 0, out
+    assert out['seed_set_intersection'] == [], out
+    assert out['common_seeds_sufficient_for_family'] is False, out
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8140,6 +8203,10 @@ def main():
     _check('L35 scale meta/trend refuses visible seed attrition', t_scale_meta_refuses_visible_attrition)
     _check('L36 M0 cross-scale pairs pass the control gate', t_m0_cross_scale_pairs_are_control_gated)
     _check('L36b M0 cross-scale uses declared seed plans', t_m0_cross_scale_uses_declared_seed_plans)
+    _check('L37 flat trend / empty-tier pairing', t_scale_trend_degenerate_fit_and_empty_tiers)
+    _check('L37b non-estimable variance blocks pooling', t_scale_non_estimable_variance_blocks_pooling)
+    _check('L37c tuning margin does not invent precision', t_tuning_margin_does_not_invent_precision)
+    _check('L37d ladder missing seed plan is not common', t_scale_ladder_missing_seed_plan_is_not_common)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

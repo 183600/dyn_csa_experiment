@@ -10357,7 +10357,26 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     # (or more seeds) is available.
     _zero_variance = [r['label'] for r in per
                       if r['n'] > 1 and r.get('se') == 0.0]
-    usable = [r for r in per if r['n'] > 1 and math.isfinite(r.get('se', float('nan'))) and r['se'] > 0.0]
+
+    def _weight_is_representable(r):
+        # A point whose within-scale SE is non-finite (e.g. the sample SD
+        # overflowed), or whose 1/se^2 is not a finite positive weight, cannot
+        # enter an inverse-variance pool.  It must stay visible and block the
+        # pooled claim instead of silently disappearing from `usable`.
+        if r['n'] <= 1:
+            return False
+        se = r.get('se')
+        if se is None or not math.isfinite(se) or se <= 0.0:
+            return False
+        se2 = se * se
+        return math.isfinite(se2) and se2 > 0.0 and math.isfinite(1.0 / se2)
+
+    _non_estimable = [r['label'] for r in per
+                      if r['n'] > 1
+                      and (not math.isfinite(r.get('mean', float('nan')))
+                           or not _weight_is_representable(r))
+                      and r.get('se') != 0.0]
+    usable = [r for r in per if _weight_is_representable(r)]
     _n_seed_declared = sum(1 for p in pts if p.get('seeds_declared'))
     if pts and _n_seed_declared == len(pts):
         _seed_pairing = 'declared'
@@ -10387,6 +10406,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
            'unattested_plan_points': _unattested_plan_points,
            'attrition': _attrition,
            'zero_variance_points': _zero_variance,
+           'non_estimable_points': _non_estimable,
            'corpus_binding': _scale_corpus_binding(pts),
            'seed_pairing': _seed_pairing,
            'n_points_with_declared_seeds': int(_n_seed_declared),
@@ -10518,6 +10538,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                                  and (not math.isfinite(p_q) or p_q >= alpha)
                                  and not _underpowered_points
                                  and not _incomplete and not _zero_variance
+                                 and not _non_estimable
                                  and not _empty_points and not _invalid_scale_points
                                  and not _unattested_plan_points),
                 'note': ('poolable requires >=3 scales, every included scale at n>=min_seeds '
@@ -10533,6 +10554,10 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                              + ' (1/se^2 is undefined; the point is reported but not silently '
                                'dropped from the pooled claim)')
                             if _zero_variance else '')
+                         + (('; non-estimable within-scale variance at: ' + ', '.join(map(str, _non_estimable))
+                             + ' (the mean/SE or its 1/se^2 weight is not finite; the point is '
+                               'reported but cannot enter an inverse-variance pool)')
+                            if _non_estimable else '')
                          + (('; scale point(s) with no measured effect: ' + ', '.join(map(str, _empty_points))
                              + ' (the tier is declared but contributes no estimable effect)')
                             if _empty_points else '')
@@ -10648,7 +10673,6 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     _invalid_scale_points = [p['label'] for p in _parsed_pts if not _valid_scale(p)]
     pts = [p for p in _parsed_pts if _valid_scale(p)]
     pts.sort(key=lambda p: p['scale'])
-    labels = [p['label'] for p in pts]
     _all_labels = [p['label'] for p in _parsed_pts]
     if len(set(_all_labels)) != len(_all_labels):
         raise ValueError('scaling_trend needs unique scale labels; got %r' % (_all_labels,))
@@ -10665,6 +10689,11 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     # view (corpus identity covers the whole declared family).
     _pts_binding = pts + [p for p in _parsed_pts if not _valid_scale(p)]
     pts = [p for p in pts if p['effects']]
+    # The paired path can only use scales that carry a measured effect: a
+    # declared-but-empty tier must not make every seed look "incomplete" at a
+    # label that has no observations, which would silently disable the preferred
+    # exact test on the remaining, fully measured ladder.
+    labels = [p['label'] for p in pts]
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'min_points': int(min_points),
            'n_points': len(pts), 'labels': [p['label'] for p in pts],
            'scales': [p['scale'] for p in pts],
@@ -10707,9 +10736,16 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         sigma2 = float((n * resid ** 2).sum() / (k - 2))
         se = float(math.sqrt(sigma2 / sxx))
         tc = _t_critical(1.0 - float(alpha), k - 2)
-        tstat = slope / se if se > 0 else float('inf')
+        # A zero-residual fit has no residual variance.  Its t statistic is
+        # infinite only when the slope is non-zero; an exactly flat line is a
+        # perfect fit with an undefined (not zero) p-value, so report p=1
+        # instead of turning "no trend" into a maximally significant one.
+        if se > 0.0:
+            _p = student_t_two_sided_p(slope / se, k - 2)
+        else:
+            _p = 1.0 if abs(slope) <= 1e-15 else 0.0
         wls.update({'se': se, 'ci': [slope - tc * se, slope + tc * se],
-                    'p': student_t_two_sided_p(tstat, k - 2), 'df': k - 2})
+                    'p': _p, 'df': k - 2})
     out['wls'] = wls
     # paired per-seed slopes: complete cases only (same seed at every scale).
     # When any point omitted its seed identities, the positional indices that
@@ -11116,7 +11152,11 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                             'contrast and its family-resolution floor are unverifiable')
         elif len(_sets_present) != len(rows):
             seed_set_shared = False
-            _seed_common = sorted(set.intersection(*_sets_present))
+            # A tier with no declared seed plan cannot contribute a paired
+            # draw.  Intersecting only the tiers that did declare seeds would
+            # fabricate a common set (e.g. S2 empty + S1 0..7 -> "8 common
+            # seeds") and could certify an unpaired ladder as sufficient.
+            _seed_common = []
             warnings.append('only %d/%d tiers declare seeds; cross-tier pairing is '
                             'unverifiable for the rest' % (len(_sets_present), len(rows)))
         else:
@@ -13386,9 +13426,17 @@ def tuning_selection_margin(best, runner, *, metric='ppl', direction='lower_is_b
                      else (bmap[s] - rmap[s]) for s in common]
             sd = float(np.std(np.asarray(diffs, dtype=float), ddof=1))
             se = sd / math.sqrt(len(diffs))
-            out.update({'se': float(se),
-                        'z': (float(margin / se) if se > 0 else None),
-                        'decisive': bool(margin > se),
+            # The paired SE is estimated on the COMMON seeds.  Comparing it
+            # with a margin taken from the two rows' full (possibly
+            # different-seed) means would put the numerator and denominator on
+            # different samples.  Use the paired mean difference instead, and
+            # keep the original row-level margin for transparency.
+            paired_margin = float(np.mean(np.asarray(diffs, dtype=float)))
+            out.update({'margin': paired_margin,
+                        'margin_unpaired': float(margin),
+                        'se': float(se),
+                        'z': (float(paired_margin / se) if se > 0 else None),
+                        'decisive': bool(paired_margin > se),
                         'method': 'paired_search_seeds',
                         'n_paired': len(common), 'common_seeds': common})
         else:
@@ -13398,20 +13446,32 @@ def tuning_selection_margin(best, runner, *, metric='ppl', direction='lower_is_b
     # Independent marginal-SE fallback, also reported for legacy-artifact
     # validation.  It is NOT the preferred estimate when paired values exist.
     try:
-        n1 = max(1, int(_exact_count(best.get('n_seeds'), minimum=1)
-                        or (len(bmap) if bmap else 1)))
-        n2 = max(1, int(_exact_count(runner.get('n_seeds'), minimum=1)
-                        or (len(rmap) if rmap else 1)))
-        s1 = abs(float(_finite_scalar(best.get('ppl_std')) or 0.0)) / math.sqrt(n1)
-        s2 = abs(float(_finite_scalar(runner.get('ppl_std')) or 0.0)) / math.sqrt(n2)
-        se_i = math.hypot(s1, s2)
-        out['se_independent'] = float(se_i)
-        out['decisive_independent'] = bool(margin > se_i)
-        if out['method'] != 'paired_search_seeds':
-            out.update({'se': float(se_i),
-                        'z': (float(margin / se_i) if se_i > 0 else None),
-                        'decisive': bool(margin > se_i),
-                        'method': 'independent_marginal_se'})
+        _std_b = _finite_scalar(best.get('ppl_std'))
+        _std_r = _finite_scalar(runner.get('ppl_std'))
+        if _std_b is not None and _std_r is not None:
+            n1 = max(1, int(_exact_count(best.get('n_seeds'), minimum=1)
+                            or (len(bmap) if bmap else 1)))
+            n2 = max(1, int(_exact_count(runner.get('n_seeds'), minimum=1)
+                            or (len(rmap) if rmap else 1)))
+            s1 = abs(float(_std_b)) / math.sqrt(n1)
+            s2 = abs(float(_std_r)) / math.sqrt(n2)
+            se_i = math.hypot(s1, s2)
+            out['se_independent'] = float(se_i)
+            out['decisive_independent'] = bool(margin > se_i)
+            if out['method'] != 'paired_search_seeds':
+                out.update({'se': float(se_i),
+                            'z': (float(margin / se_i) if se_i > 0 else None),
+                            'decisive': bool(margin > se_i),
+                            'method': 'independent_marginal_se'})
+        elif out['method'] != 'paired_search_seeds':
+            # Missing/non-finite marginal SD is not zero uncertainty.  Without
+            # per-seed evidence and without an SD the margin is unverifiable;
+            # never report a decisive pick from absent variance.
+            out['se'] = None
+            out['z'] = None
+            out['decisive'] = None
+            if out['method'] == 'unavailable':
+                out['method'] = 'seed_ppls_unavailable'
     except (TypeError, ValueError, OverflowError):
         pass
     return out
