@@ -283,3 +283,34 @@ manifest, test split, README, or CI configuration was touched.
   resolution-limited tuned contrast is not read as a null.
 - The simple count-model protocol declares a full-factorial smoothing grid and
   the audit enforces that every declared cell was actually run.
+
+## 2026-10-20 — result-analysis hardening (no new runs)
+
+This pass changed only training diagnostics, zero-GPU report/error-analysis
+paths and their tests; no panel, frozen manifest, test split, README or CI
+configuration was touched. (1) `classify_training_health` now reports the
+train-validation gap slope and `steps_since_best`, and attaches explicit
+next actions (regularization/data/early stop for overfitting; data-pipeline,
+LR and capacity checks for a stalled run; the NaN triage order for a
+non-finite curve). A widening gap is called out even when the tail validation
+slope is still small. (2) A systematic non-finite triage
+(`diagnose_training_instability`) checks data validation evidence, the
+forward/loss term (including the compression and boundary terms), the
+attention/pooling guard, fp16 scaler overflow, and gradient explosion/LR, in
+that order; unmeasured causes are `unknown`, never `clean`. Records and the
+v7 long-run checkpoints carry the diagnosis, and the v12 one-shot test gate
+now refuses a run with a recorded instability (overridable only through the
+existing logged `V12_ALLOW_UNHEALTHY` path). (3) Early stopping is available
+as an opt-in `train_variant` policy with a pure decision helper; the policy
+enters the cell fingerprint and hyperparameters, completed steps are what
+`tokens_seen`/timeguard accounting use, and planned versus completed steps are
+both recorded. (4) Bad-case analysis now triages why a token is hard
+(rare/annotation candidate, ambiguous context, confidently wrong blind spot,
+target outside top-k) and writes the cause inventory plus a manual-review
+guide into JSONL/Markdown; the report surfaces per-checkpoint error-analysis
+directories rather than assuming one root summary. (5) The efficiency report
+no longer draws a Pareto frontier across different token counts, devices,
+torch builds or KV semantics; within a comparable group it shows per-arm PPL
+mean ± SEM, latency/parameter/memory ratios, refuses significance claims from
+sub-noise or zero-variance PPL differences, and flags accuracy gains that cost
+≥1.5× latency.
