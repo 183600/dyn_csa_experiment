@@ -23,7 +23,6 @@ The held-out test split is NEVER read here.  Hyperparameters are selected on
 the validation split; the final comparison re-uses exactly those selections.
 """
 import json
-import math
 import os
 import sys
 import time
