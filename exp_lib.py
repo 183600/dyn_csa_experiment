@@ -13054,7 +13054,11 @@ def param_pair_reason(ra, rb, *, tolerance=0.01, require_breakdown=False):
     if rel > float(tolerance):
         return f'parameter mismatch ({pa} vs {pb}, {100.0 * rel:.2f}% > {100.0 * float(tolerance):.2f}%)'
     ba, bb = ra.get('param_breakdown'), rb.get('param_breakdown')
-    if isinstance(ba, dict) and isinstance(bb, dict):
+    _ba = isinstance(ba, dict) and bool(ba)
+    _bb = isinstance(bb, dict) and bool(bb)
+    if _ba != _bb:
+        return 'unverifiable param_breakdown (only one record carries it)'
+    if _ba and _bb:
         for key, label in (('non_embedding', 'non-embedding'), ('active', 'active')):
             va, vb = _finite_scalar(ba.get(key)), _finite_scalar(bb.get(key))
             if va is None or vb is None:

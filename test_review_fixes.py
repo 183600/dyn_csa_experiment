@@ -4352,6 +4352,7 @@ def t_param_and_compute_control_detail():
            ('b', 'p', 0): {'params': 1000}}
     od = L._param_control_detail(one, 'a', 'b')
     assert od['breakdown_one_sided'] is True and L._param_capacity_controlled(od) is None, od
+    assert 'one record carries it' in L.param_pair_reason(one[('a', 'p', 0)], one[('b', 'p', 0)]), 'one-sided breakdown must fail closed'
     c = L._compute_control_detail(recs, 'a', 'b')
     assert c['compute_matched'] is False and c['more_compute_arm'] == 'b', c
     assert abs(c['time_ratio_a_over_b'] - 0.5) < 1e-12, c
