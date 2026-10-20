@@ -1567,3 +1567,7 @@ seeds」。
 独立边际 SE），stability 返回 `status='unavailable'` 并说明重复 seed。
 缺失 `seed_ppls` 的旧 artifact 仍走带标签的独立 SE 回退；只有「有 per-seed
 证据但证据非法」才失败关闭。
+
+交互层 `significant` 同时要求 `complete_pairs is not False`：只要有一个 seed
+因非有限配对被丢弃，即使剩余非零对达到 p<alpha，也不能把 complete-case
+子集的结果当作完整面板的交互结论；原始检验旗标仍在 `significant_raw`。

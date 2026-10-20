@@ -441,6 +441,14 @@ def t_scale_input_guards():
     powered = L.scale_interaction([0.0] * 6, [1.0] * 6, seeds=list(range(6)),
                                   min_n=6)
     assert powered['significant'] is True and powered['significant_raw'] is True, powered
+    # One dropped seed makes this a complete-case subset; even though six
+    # non-zero pairs can reach p=0.031, the interaction-level claim is refused.
+    partial = L.scale_interaction([0.0] * 7, [1.0, float('nan'), 1.0, 1.0,
+                                              1.0, 1.0, 1.0],
+                                  seeds=list(range(7)), min_n=6)
+    assert partial['n'] == 6 and partial['complete_pairs'] is False, partial
+    assert partial['significant_raw'] is True, partial
+    assert partial['significant'] is False, partial
 
 
 def t_exact_signflip_baseline():

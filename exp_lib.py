@@ -10589,7 +10589,11 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     _raw_sig = bool(st.get('significant'))
     st['significant_raw'] = _raw_sig
     st['significant'] = bool(_raw_sig and not st.get('underpowered')
-                             and not st.get('resolution_limited'))
+                             and not st.get('resolution_limited')
+                             # A complete-case interaction can be biased by
+                             # which seeds were dropped; significance over the
+                             # surviving subset is not a complete-panel result.
+                             and st.get('complete_pairs') is not False)
     st.update({'low_label': str(low_label), 'high_label': str(high_label), 'seeds': kept,
                'seed_pairing': ('declared' if _seeds_declared else 'positional'),
                'convention': 'delta = effect_high - effect_low; positive = effect is larger at the higher scale',
