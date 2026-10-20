@@ -1197,3 +1197,67 @@ token。记录现在同时写 `tokens_seen_unique_estimate`、
 `pyproject.toml`、cache/tokenizer 元数据与 `run_*.log`（存在时）。
 本快照仍是 source-only：仓库**没有**随附证据归档，这一点在 README、
 README_zh 与 `RELEASES.md` 中均已明示。
+
+## 26. 基线地板、调参网格与开放块假设（本轮设计硬化）
+
+本轮不新增 GPU 面板，只修正「简单基线是否被公平对待」与「调参是否真的
+覆盖了最优区间」这两类设计缺陷。
+
+### 26.1 计数模型地板必须用嵌套验证
+
+`baseline_tune.py simple` 以前在整个验证切片上选择 unigram/bigram 的
+平滑与插值系数，并在同一批行上报告 PPL。这与神经面板的嵌套验证不一致：
+神经臂的最终估计使用靠后的 holdout 行，而计数模型已经用这些行调过参，
+地板因此获得了额外的选择优势。
+
+现在 `simple_baseline_fit` 接受 `selection_rows` / `evaluation_rows`：
+- 平滑/插值系数只在较早的时间连续行折上选择；
+- 被选中的配置只在不相交的较晚行折上报告 `holdout_ppl`；
+- `best_ppl` 是**选中臂的 holdout PPL**，不是选择折上的最小值；
+- 工件记录 `row_split`（policy、n_rows、folds、行范围、行指纹）、
+  `selection_fp`/`eval_fp`（token 指纹）与 `n_eval_tokens`。
+
+`simple_baseline_audit` 会拒绝以下情况：声称嵌套但缺少行折元数据；
+行折不可由 `(n_rows, seed, n_folds, selection_fold, evaluation_fold)`
+复现；选择行与评估行重叠或顺序颠倒；`best_ppl` 不是 holdout 值；
+嵌套报告使用了与协议声明不同的 fold 布局；holdout token 数不一致。
+`methodology_audit` 还要求地板的评估行指纹与面板的 `holdout_row_fp`
+一致，并且**每个 seed 的 token 分母**一致，否则拒绝比较。
+
+### 26.2 「击败地板」必须是 seed 级对比
+
+`panel_beats_simple_floor` 仍保留为逐点读数，但新增 `floor_contrast`：
+把每个神经 seed 的 PPL 减去确定性的地板 PPL，做精确符号翻转检验，
+报告均值、SD、p、p 下限与 95% CI，并给出
+`beats_floor_significant` / `beats_floor_pointwise_not_significant` /
+`beats_floor_pointwise_underpowered` / `does_not_beat_floor`。
+只有第一种可以写成「显著优于简单基线」；逐点领先但未过检验时只写
+「点估计更低，尚未证明」。
+
+参考臂按**主端点（token-pooled PPL）**选择，而不是按算术 seed 均值；
+两者在 token 数不同时可以给出不同排序。
+
+### 26.3 调参网格要有边界覆盖
+
+`BASELINE_TUNING_PROTOCOL.trials` 从 4 个试次扩展为 8 个，学习率覆盖
+`5e-5` 到 `6e-4`，weight decay 覆盖 `0.01` 到 `0.2`。原先前四个试次
+保持原顺序，历史工件仍可声明为完整网格的严格子集。
+
+`baseline_tuning_audit` 新增 `grid_levels` / `grid_coverage` /
+`grid_boundary_hits` / `grid_adequacy`：若选中的 lr 或 weight decay
+落在声明网格的最小/最大层（且该参数至少有 3 层），说明最优可能位于
+网格之外，审计给出 warning；若某个参数只有 1–2 层，也会提示网格过粗。
+选中值不在声明层上则是 problem，不是「调过参」。注意 warning 不会被
+误读成 pass：它明确要求扩展网格并重跑等宽搜索。
+
+### 26.4 开放块面板的预注册假设
+
+`OPEN_BLOCK_HYPOTHESIS_DESIGN` 为主家族的三个对比登记了
+statement / mechanism / predicted_sign / primary_metric / falsifier：
+1. 开放块的前缀 summary 优于完全忽略开放块；
+2. 在相同 top-k 预算下，singleton 表示优于 pooled summary；
+3. 取消最大块长后，summary 的收益应更大（交互项为负）。
+
+`open_block_supp.py report` 调用 `hypothesis_audit`，把审计与逐条假设写入
+`stats.json` 和 Markdown；`audit_gates.hypotheses` 也覆盖这张表。描述性
+单元（其它块长 × 读取规则）仍不进入 Holm 家族，也不得被写成方向性结论。
