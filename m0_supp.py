@@ -767,6 +767,7 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
         print(f'[m0-analysis] {label}: {len(measured)} contrast(s), '
               f'n={n_seeds}, descriptive_only={report["panels"][label]["descriptive_only"]}')
     # Cross-scale readout over the contrasts the panels share.
+    _declared_runs = {'S1': L.RUN_S1, 'S2': L.RUN_S2}
     pairs = [('csa_dynamic', 'csa_fixed', 'dynamic_vs_fixed'),
              ('hybrid_dynamic', 'csa_dynamic', 'hybrid_vs_csa'),
              ('csa_dynamic', 'full_matched', 'dynamic_vs_dense')]
@@ -795,7 +796,13 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
                 print(f'[m0-analysis] {name}/{label}: {e}')
                 continue
             _e = (report['panels'].get(label) or {}).get('arms', {}).get(a) or {}
-            _panel_n = (report['panels'].get(label) or {}).get('n_seeds')
+            # The planned seed count comes from the DECLARED run config for a
+            # known tier, not from however many records happened to survive.
+            # Using the observed max would silently certify a truncated panel
+            # as complete (the exact attrition bug the scale gates exist for).
+            _declared_n = len((_declared_runs.get(label) or {}).get('seeds') or [])
+            _observed_n = (report['panels'].get(label) or {}).get('n_seeds')
+            _panel_n = (_declared_n or _observed_n)
             points.append({'label': label, 'scale': _e.get('params'),
                            'effects': lr['effects'], 'seeds': lr['seeds'],
                            'n_planned': _panel_n,

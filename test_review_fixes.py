@@ -7640,6 +7640,36 @@ def t_scale_meta_refuses_visible_attrition():
     assert ru['significant'] is False and ru['verdict'] == 'incomplete_scale_point', ru
 
 
+def t_m0_cross_scale_uses_declared_seed_plans():
+    fp = 'steps10_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+
+    def _panel(seeds, base):
+        out = {}
+        for v in ('csa_dynamic', 'csa_fixed', 'hybrid_dynamic', 'full_matched'):
+            for seed in seeds:
+                out[f'{v}::seed{seed}'] = dict(
+                    variant=v, seed=seed, run_cfg=fp, steps=10, tokens_seen=10,
+                    ppl=base + 0.1 * seed + (0.5 if v == 'csa_fixed' else 0.0),
+                    params=100, train_knobs=knobs, data_fp='d', val_fp='v',
+                    corpus_fp='corpus')
+        return out
+
+    tmp = tempfile.mkdtemp()
+    try:
+        r = M0.scale_analysis({'S1': _panel([0, 1], 10.0),
+                               'S2': _panel([0, 1], 20.0)}, outdir=tmp)
+        meta = r['cross_scale']['dynamic_vs_fixed']['meta']
+        # S1 plans 4 seeds and S2 plans 3; the truncated panels must be visible
+        # as attrition, not certified complete from the two surviving records.
+        got = {p['label']: p['n_missing'] for p in meta['per_point']}
+        assert got == {'S1': 2, 'S2': 1}, got
+        assert meta['poolable'] is False, meta
+        assert set(meta['incomplete_points']) == {'S1', 'S2'}, meta
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def t_m0_cross_scale_pairs_are_control_gated():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     fp2 = fp.replace('_lr0.0003_', '_lr0.003_')
@@ -7917,6 +7947,7 @@ def main():
     _check('L34b zero-aware family resolution floor', t_zero_aware_family_resolution_floor)
     _check('L35 scale meta/trend refuses visible seed attrition', t_scale_meta_refuses_visible_attrition)
     _check('L36 M0 cross-scale pairs pass the control gate', t_m0_cross_scale_pairs_are_control_gated)
+    _check('L36b M0 cross-scale uses declared seed plans', t_m0_cross_scale_uses_declared_seed_plans)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
