@@ -4622,6 +4622,11 @@ def t_baseline_audit_malformed_seed_keys():
     art['final_records'] = 1.5
     out = L.baseline_tuning_audit(art)
     assert out['status'] == 'fail' and any('final_records must be a mapping' in p for p in out['problems']), out
+    # A non-scalar metric name must be reported, not used as a dict key.
+    art['final_records'] = {}
+    art['selection_metric'] = {'not': 'a metric'}
+    out = L.baseline_tuning_audit(art)
+    assert out['status'] == 'fail' and any('not a metric name' in p for p in out['problems']), out
 
 
 def t_simple_baseline_audit_malformed_records():

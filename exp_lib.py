@@ -12768,6 +12768,11 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     direction = selected.get('direction') or protocol.get('direction')
     problems = []
     warnings = []
+    if not isinstance(metric, str) or not metric.strip():
+        # Trial records are indexed by the metric name; a mapping/list would
+        # raise TypeError instead of reporting the malformed artifact.
+        problems.append(f'selection metric {metric!r} is not a metric name')
+        metric = None
     if split != 'validation':
         problems.append(f'selection split is {split!r}; hyperparameters must be selected on validation, never test')
     if metric != protocol.get('selection_metric'):
@@ -13177,6 +13182,10 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     final_seed_coverage = {}
     if final_records:
         for arm, entry in arms.items():
+            if not isinstance(entry, dict):
+                # The per-arm loop above already recorded the malformed arm;
+                # it has no selected config to line up with final records.
+                continue
             chosen = entry.get('selected') or entry.get('selected_config') or {}
             hits = [(k, r) for k, r in final_records.items()
                     if k.startswith(f'{arm}::') and isinstance(r, dict)]
