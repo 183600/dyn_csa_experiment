@@ -312,7 +312,12 @@ def _paired(cells, va, vb, seeds):
     schedule / evaluation-slice change masquerade as the block-reading effect.
     """
     ds, ppl_ds, used, rejected = [], [], [], []
+    _seen = set()
     for s in seeds:
+        # A repeated seed is one draw, not two independent observations.
+        if s in _seen:
+            continue
+        _seen.add(s)
         a, b = cells.get((va, s)), cells.get((vb, s))
         if a is None or b is None:
             continue
@@ -521,7 +526,12 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     if not cells:
         raise SystemExit(f'no usable records in {outdir}/summary.json')
     avail_seeds = sorted({s for (_, s) in cells})
-    seeds = [int(s) for s in (seeds or avail_seeds)]
+    _raw_seeds = avail_seeds if seeds is None else seeds
+    _parsed = [L._as_seed_int(s) for s in _raw_seeds]
+    if any(s is None for s in _parsed):
+        raise SystemExit(f'open-block seeds must be integers, got {_raw_seeds!r}')
+    # Repeating a seed must not fabricate extra paired observations.
+    seeds = list(dict.fromkeys(_parsed))
     results = {}
 
     def variant(mb, mode, scope='full_prefix'):
@@ -595,7 +605,9 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     for mb in (128, None):
         for mode in ('summary', 'singletons'):
             va, vb = variant(mb, mode, 'outside_window'), variant(mb, 'closed', 'outside_window')
-            if (va, seeds[0]) in cells and (vb, seeds[0]) in cells:
+            _sa = {s for (v, s) in cells if v == va}
+            _sb = {s for (v, s) in cells if v == vb}
+            if _sa & _sb:
                 add(f'{mode} - closed @{mb} (outside-window)',
                     va, vb, family='auxiliary_outside_window')
 
@@ -729,7 +741,9 @@ def _render_markdown(stats):
                 _fmt(d.get('outside_window_nonzero_frac')),
                 _fmt(d.get('prefix_selected_rate')),
                 _fmt(d.get('history_displaced_mean')),
-                _fmt(d.get('position_truncated_frac'))))
+                _fmt(d.get('position_truncated_frac')
+                     if d.get('position_truncated_frac') is not None
+                     else d.get('position_truncated_frac_of_block_tokens'))))
     if stats.get('efficiency'):
         lines += ['', '## Efficiency (from the measured harness; no KV cache)', '',
                   '| cell | train tokens/s | tokens/s prefill | prefill p50 ms | prefix-prefill p50 ms | peak alloc MB |',
@@ -745,7 +759,9 @@ def _render_markdown(stats):
               '- `singletons - summary @128`: representation granularity at a fixed top-k budget.',
               '- `interaction`: does removing the cap make the summary benefit larger? A negative value is consistent with a waiting bottleneck, but only alongside block-length, prefix-selection and window-coverage statistics.',
               '- Prefix candidates compete for the same K slots; an empty/rare prefix selection is a selection-path fact, not evidence that prefix information is useless.',
-              '- 4 seeds cannot reach p<0.05 (floor 0.125); report the effect and its uncertainty. '
+              '- The primary family measured n={}–{} pair(s); the exact-test floor at its weakest n is {}. Report the effect and its uncertainty, and do not read a non-significant result as a null result when the floor is above alpha. '.format(
+                  stats.get('primary_n_min'), stats.get('primary_n_max'),
+                  _fmt(L.signflip_p_floor(stats.get('primary_n_min') or 0)))
               + (f'With the {stats.get("primary_family_size")}-comparison Holm family the minimum seed count for any confirmatory claim is {stats.get("primary_holm_min_seeds")} (Holm floor {_fmt(stats.get("primary_holm_floor"))}).'
                  if stats.get('primary_holm_min_seeds') else 'Extend the key cells only if a significance claim is needed.')]
     return '\n'.join(lines) + '\n'

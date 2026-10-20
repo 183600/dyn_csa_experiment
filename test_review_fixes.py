@@ -8228,6 +8228,21 @@ def t_analysis_checkpoint_carries_model_geometry():
         assert meta.get('d') == 32 and meta.get('train_len') == 32, meta
 
 
+
+def t_v12_admission_rejects_synthesized_records():
+    m = _manifest_for_admission(seeds=(0, 1))
+    good = {}
+    for v in ('a_arm', 'b_arm'):
+        for sd in (0, 1):
+            good[f'{v}::s{sd}'] = _rec(v, sd, 'FP')
+    adm, _fp = V12._admit_confirmation_records(good, m)
+    assert len(adm) == 4, adm
+    synth = dict(good)
+    synth['a_arm::s0'] = dict(synth['a_arm::s0'], synthesized=True)
+    adm, _fp = V12._admit_confirmation_records(synth, m)
+    assert ('a_arm', 0) not in adm and len(adm) == 3, adm
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8490,6 +8505,7 @@ def main():
     _check('L44 gapfill merge refreshes/invalidates seed-derived fields', t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields)
     _check('L45 open-block resume binds data fingerprints', t_open_block_resume_binds_data_fingerprints)
     _check('L46 analysis checkpoint carries model geometry', t_analysis_checkpoint_carries_model_geometry)
+    _check('L47 v12 admission rejects synthesized records', t_v12_admission_rejects_synthesized_records)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -535,6 +535,13 @@ def t_open_analysis_control_gate():
     assert used == [0] and len(ds) == 1 and len(pds) == 1, (used, ds, rejected)
     assert len(rejected) == 1 and rejected[0]['seed'] == 1, rejected
     assert 'lr differs' in rejected[0]['reason'], rejected
+    # Requesting the same seed twice must not manufacture two observations.
+    cells_ok = {('a', 0): {'record': a, 'nll': 1.0, 'ppl': 2.0},
+                ('b', 0): {'record': b, 'nll': 1.1, 'ppl': 2.1},
+                ('a', 1): {'record': a, 'nll': 1.0, 'ppl': 2.0},
+                ('b', 1): {'record': b, 'nll': 1.1, 'ppl': 2.1}}
+    _ds, _pds, _used, _rej = OB._paired(cells_ok, 'a', 'b', [0, 0, 1])
+    assert _used == [0, 1] and len(_ds) == 2 and not _rej, (_used, _ds, _rej)
     # max_block and its max_block_tokens alias are the SAME declared factor;
     # either spelling changing must remain a controlled contrast.
     def _mb_rec(mode, mb):

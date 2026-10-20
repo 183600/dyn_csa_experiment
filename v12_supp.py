@@ -889,8 +889,14 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         if _msha is not None and rec.get('manifest_sha256') != _msha:
             return True  # the manifest changed after this record was written
         bl = rec.get('by_len') or {}
-        if not all((L.by_len_cells([rec], Ln) for Ln in eval_lens)):
-            return True
+        for Ln in eval_lens:
+            _cells = L.by_len_cells([rec], Ln)
+            # A usable PPL is not enough: a truncated cell is a different
+            # endpoint and admission will reject it, so resuming on it would
+            # skip the re-evaluation forever.
+            if not _cells or not all(isinstance(c, dict) and c.get('truncated') is False
+                                     for c in _cells):
+                return True
         # The record must belong to the SAME weights now on disk.  A metadata
         # (size, mtime_ns, ctime_ns, inode) signature recorded at write time
         # settles the unchanged case without reading the checkpoint; only a
@@ -1201,7 +1207,10 @@ def _admit_confirmation_records(raw, manifest):
             continue
         why = None
         s_i = None
-        if r.get('split') != 'test':
+        if r.get('synthesized'):
+            # A reconstructed aggregate is provenance, not an independent run.
+            why = 'synthesized reconstruction is not an independent measurement'
+        elif r.get('split') != 'test':
             # Named exclusion, not a silent `continue`.  The
             # docstring promises "named, never silent"; a smoke/validation
             # record sitting in bylen.json must be visible in the audit trail.

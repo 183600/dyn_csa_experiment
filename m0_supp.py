@@ -650,6 +650,7 @@ def _panel_corpus_fp(summary, variant=None):
     than letting the newer subset speak for the whole panel.
     """
     stable, legacy = set(), set()
+    missing_provenance = 0
     for rec in summary.values():
         if not isinstance(rec, dict):
             continue
@@ -667,6 +668,8 @@ def _panel_corpus_fp(summary, variant=None):
             dv = (prov_data or {}).get('data_version')
         if dv not in (None, ''):
             legacy.add(str(dv))
+        elif L.ppl_is_usable(rec.get('ppl')):
+            missing_provenance += 1
     if stable and legacy:
         raise ValueError(
             f'{variant or "panel"}: records mix corpus_fp-provenance and legacy '
@@ -676,6 +679,14 @@ def _panel_corpus_fp(summary, variant=None):
         raise ValueError(f'{variant or "panel"}: records carry {len(stable)} different corpus_fp fingerprints {sorted(stable)}')
     if len(legacy) > 1:
         raise ValueError(f'{variant or "panel"}: records carry {len(legacy)} different data_version fingerprints {sorted(legacy)}')
+    if missing_provenance:
+        # One fingerprinted record cannot attest the corpus identity of the
+        # others; the point stays unattested rather than borrowing a subset's
+        # fingerprint.
+        print(f'[m0-analysis] {variant or "panel"}: {missing_provenance} measured '
+              'record(s) carry neither corpus_fp nor data_version; the corpus '
+              'identity is not attested')
+        return None
     if stable:
         return sorted(stable)[0]
     return (sorted(legacy)[0] if legacy else None)
@@ -887,6 +898,15 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
             continue
         meta = L.meta_analyze_effects(points, min_seeds=3)
         entry = {'per_scale': raw, 'meta': meta}
+        if str(meta.get('status') or '').startswith('refused'):
+            # A log-PPL interaction across two tokenisations/corpora is a
+            # units error, exactly like the pooled effect the meta layer
+            # already refused.
+            entry['interaction'] = {'status': meta.get('status'),
+                                    'note': meta.get('note')}
+            report['cross_scale'][name] = entry
+            print(f'[m0-analysis] cross-scale {name}: interaction refused ({meta.get("status")})')
+            continue
         # Paired smallest->largest interaction on the seeds present in BOTH
         # panels.  Ordering is by scale, never by label string.
         _ext = _extreme_scale_labels(points)
