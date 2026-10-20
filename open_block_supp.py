@@ -621,6 +621,30 @@ def _family_holm_floor(ns, m_comparisons):
     return L.holm_min_attainable_p(max(used), m, 0.05)
 
 
+def _primary_effective_n(results, names):
+    """Smallest effective pair count among the measured primary contrasts.
+
+    Exact zero differences keep their n but add no sign resolution, so the
+    floor is governed by ``n_nonzero`` (0 maps to 1, p floor 1.0).  A missing
+    or out-of-range count falls back to the raw n rather than pretending the
+    contrast has more resolution.
+    """
+    used = []
+    for name in (names or []):
+        r = (results or {}).get(name)
+        if not isinstance(r, dict):
+            continue
+        n = _as_positive_int(r.get('n'))
+        if n is None:
+            continue
+        nn = L._as_seed_int(r.get('n_nonzero'))
+        if nn is not None and 0 <= nn <= n:
+            used.append(nn if nn > 0 else 1)
+        else:
+            used.append(n)
+    return min(used) if used else 0
+
+
 def _as_positive_int(v):
     if isinstance(v, bool) or not isinstance(v, (int, np.integer)):
         return None
@@ -775,6 +799,11 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
                    if _prim_entries and prim_names else None)
     _holm_min_n = (L.signflip_min_n_for_holm(len(prim_names), 0.05)
                    if prim_names else None)
+    # Exact ties do not contribute resolution.  Use each contrast's non-zero
+    # pair count (the same number that sets its p floor), not its raw n: an
+    # all-tied primary contrast at n=8 still has floor 1.0 and cannot reach a
+    # family-corrected claim.
+    _prim_eff_n_min = _primary_effective_n(results, prim_names)
     # Every primary contrast must clear the family-corrected seed floor for ANY
     # confirmatory claim.  The weakest measured contrast governs that gate, not
     # the best-powered one.  n=6 only suffices for a single RAW two-sided test
@@ -782,8 +811,8 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     # n=7 (3 * 2/2**7 = 0.0469).  Surfacing this prevents the old
     # "6-seed extension" wording from promising a significance claim it cannot
     # reach.
-    _seeds_sufficient = (bool(_holm_min_n is not None and _prim_n_min > 0
-                              and _prim_n_min >= _holm_min_n))
+    _seeds_sufficient = (bool(_holm_min_n is not None and _prim_eff_n_min > 0
+                              and _prim_eff_n_min >= _holm_min_n))
     os.makedirs(analysis_dir, exist_ok=True)
     stats = {
         'outdir': outdir, 'code': L.code_stamp(), 'semantics': L.CODE_SEMANTICS,
@@ -796,6 +825,7 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         'primary_holm_floor': _holm_floor,
         'primary_n_min': _prim_n_min,
         'primary_n_max': _prim_n_max,
+        'primary_effective_n_min': _prim_eff_n_min,
         'primary_holm_min_seeds': _holm_min_n,
         'primary_seeds_sufficient': _seeds_sufficient,
         'comparisons': results,
@@ -811,7 +841,7 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
             'Interaction I = (summary - closed | no cap) - (summary - closed | 128); negative means the summary benefit grows when the cap is removed.',
         ] + ([f'primary seed coverage is INSUFFICIENT for a family-corrected claim: '
               f'minimum n={_holm_min_n} for {len(prim_names)} Holm comparisons, '
-              f'weakest contrast has n={_prim_n_min}']
+              f'weakest contrast has effective n={_prim_eff_n_min} (raw n={_prim_n_min})']
              if _holm_min_n is not None and not _seeds_sufficient else [])
         + [f'hypothesis audit: {w}' for w in (_hyp.get('warnings') or [])]
         + [f'record integrity: {r["key"]} excluded ({r["reason"]})' for r in _integrity],
@@ -838,7 +868,7 @@ def _render_markdown(stats):
                   else f'{stats.get("primary_n_min")}..{stats.get("primary_n_max")}')
         lines.append(f'Primary family Holm floor: `{_fmt(stats.get("primary_holm_floor"))}` at family n={_n_txt} (max n governs the floor); minimum seeds for a confirmatory claim: `{stats.get("primary_holm_min_seeds")}`.')
     if stats.get('primary_seeds_sufficient') is False:
-        lines += ['', f'> **Resolution limit:** the weakest primary contrast has n={stats.get("primary_n_min")}, '
+        lines += ['', f'> **Resolution limit:** the weakest primary contrast has effective n={stats.get("primary_effective_n_min")} (raw n={stats.get("primary_n_min")}), '
                   f'but the {stats.get("primary_family_size")}-comparison Holm family needs n>='
                   f'`{stats.get("primary_holm_min_seeds")}` before any corrected claim is reachable. '
                   'This panel is descriptive; adding seeds (not re-reading the same p-values) is the only fix.']
@@ -917,9 +947,9 @@ def _render_markdown(stats):
               '- `singletons - summary @128`: representation granularity at a fixed top-k budget.',
               '- `interaction`: does removing the cap make the summary benefit larger? A negative value is consistent with a waiting bottleneck, but only alongside block-length, prefix-selection and window-coverage statistics.',
               '- Prefix candidates compete for the same K slots; an empty/rare prefix selection is a selection-path fact, not evidence that prefix information is useless.',
-              '- The primary family measured n={}–{} pair(s); the exact-test floor at its weakest n is {}. Report the effect and its uncertainty, and do not read a non-significant result as a null result when the floor is above alpha. '.format(
+              '- The primary family measured n={}–{} pair(s); the exact-test floor at its weakest effective n is {}. Report the effect and its uncertainty, and do not read a non-significant result as a null result when the floor is above alpha. '.format(
                   stats.get('primary_n_min'), stats.get('primary_n_max'),
-                  _fmt(L.signflip_p_floor(stats.get('primary_n_min') or 0)))
+                  _fmt(L.signflip_p_floor(stats.get('primary_effective_n_min') or 0)))
               + (f'With the {stats.get("primary_family_size")}-comparison Holm family the minimum seed count for any confirmatory claim is {stats.get("primary_holm_min_seeds")} (Holm floor {_fmt(stats.get("primary_holm_floor"))}). '
                  + ('The current panel does NOT meet that floor; extend it before making a significance claim.'
                     if stats.get('primary_seeds_sufficient') is False else

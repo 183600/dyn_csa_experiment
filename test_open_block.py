@@ -638,6 +638,15 @@ def t_open_record_identity_and_arm_summary():
     assert 'record seed 3 != key seed 2' in reasons, problems
     assert 'record variant' in reasons, problems
     assert 'nll/token' in reasons, problems
+    # Family seed sufficiency uses the effective (non-zero) pair count: an
+    # all-tied contrast at n=8 still has p floor 1.0.
+    assert OB._primary_effective_n(
+        {'a': {'n': 8, 'n_nonzero': 0}, 'b': {'n': 8, 'n_nonzero': 7}},
+        ['a', 'b']) == 1
+    assert OB._primary_effective_n(
+        {'a': {'n': 8, 'n_nonzero': 7}, 'b': {'n': 8, 'n_nonzero': 8}},
+        ['a', 'b']) == 7
+    assert OB._primary_effective_n({'a': {'n': 8, 'n_nonzero': 99}}, ['a']) == 8
     arm = OB._arm_summary(cells)['v']
     assert arm['n_seeds'] == 2 and arm['seeds'] == [0, 1], arm
     assert abs(arm['ppl_mean'] - 11.0) < 1e-9, arm
