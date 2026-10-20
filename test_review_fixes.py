@@ -4872,6 +4872,24 @@ def t_probe_stats_rejects_synthesized_and_mismatched_probe_params():
         r = V._test_probe_stats(path, manifest, 'fp')
         assert len(r['contrasts']) == 1, r
 
+        # The real mlp_match_ref values contain underscores (csa_dynamic,
+        # csa_fixed_rope).  The normaliser must remove the whole run_cfg `_mr`
+        # field, not stop at its first underscore: otherwise two arms that
+        # differ only in parameter matching can never be paired.
+        _rc_a = ('steps1_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_'
+                 'v8192_wu50_cl0.05_dlm10.0_mtfull_mrcsa_fixed_rope_ee0_es128_'
+                 'detcpu_dfabc-def_tk0_ampfp32_eb0_ae8192_csx')
+        _rc_b = _rc_a.replace('_mrcsa_fixed_rope_', '_mrfull_rope_')
+        assert V10._recipe_norm(_rc_a) == V10._recipe_norm(_rc_b), (
+            V10._recipe_norm(_rc_a), V10._recipe_norm(_rc_b))
+        assert V10._recipe_norm(_rc_a) != V10._recipe_norm(
+            _rc_a.replace('_ee0_', '_ee1_'))
+        _p1_a = 'p1l_steps1_mr4-csa_fixed_rope_ns4_dfabc'
+        _p1_b = _p1_a.replace('_mr4-', '_mr6.7-')
+        assert V10._recipe_norm(_p1_a) == V10._recipe_norm(_p1_b)
+        assert V10._recipe_norm(_p1_a) != V10._recipe_norm(
+            _p1_a.replace('_ns4_', '_ns8_'))
+
         # A synthesized probe trajectory is provenance, not a measurement.
         synth = dict(base)
         synth['learned::0'] = dict(synth['learned::0'], synthesized=True)

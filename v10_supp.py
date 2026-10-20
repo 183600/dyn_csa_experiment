@@ -377,9 +377,19 @@ def _fp_norm(p):
 def _recipe_norm(recipe):
     if not isinstance(recipe, str):
         return recipe
-    # recipe fields are '_' separated (see exp_lib run_cfg); wildcard only the
-    # mlp_match_ref field, not everything up to the '-' inside the df hashes.
-    return re.sub(r'_mr[^_]*', '_mr*', recipe)
+    # Normalise ONLY the per-arm parameter-matching ``mr`` field.  A run_cfg
+    # (exp_lib._run_fp) puts the mlp_match_ref value there, and those values
+    # contain underscores (``csa_dynamic``, ``csa_fixed_rope``), so the old
+    # ``[^_]*`` stopped at the first underscore and left the rest of the field
+    # in the key: two arms that differed only in mr then never paired.
+    if '_ee' in recipe:
+        # run_cfg layout: _mr<mlp_match_ref>_ee<eval_every>_...
+        return re.sub(r'_mr.*?(?=_ee)', '_mr*', recipe, count=1)
+    if recipe.startswith('p1l_'):
+        # P1L layout: _mr<numeric ratio>-<fixed match-ref suffix>_ns...
+        return re.sub(r'_mr[^-]*(?=-)', '_mr*', recipe, count=1)
+    # Legacy/standalone recipe: the value carries no underscore.
+    return re.sub(r'_mr[^_]*', '_mr*', recipe, count=1)
 
 def _clean_probe_params(pp):
     """probe_params used for the ρ=0 clean-baseline lookup.
