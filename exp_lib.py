@@ -13875,6 +13875,7 @@ def metric_policy_audit(summary=None, policy=None):
             missing = [k for k in ('bnd_prec', 'bnd_rec', 'bnd_f1', 'bnd_rand')
                        if not all(k in b and b.get(k) is not None for b in bnd)]
             _bad_bnd = []
+            _macro_unverifiable = []
             for _b in bnd:
                 _p, _r, _f = (_finite_scalar(_b.get(k)) for k in ('bnd_prec', 'bnd_rec', 'bnd_f1'))
                 _vals = [_p, _r, _f]
@@ -13884,22 +13885,60 @@ def metric_policy_audit(summary=None, policy=None):
                 if any(v is None or not (0.0 <= v <= 1.0) for v in _vals):
                     _bad_bnd.append('out-of-range')
                     continue
-                _want = 2 * _p * _r / max(_p + _r, 1e-09)
-                if abs(_f - _want) > 1e-6:
-                    _bad_bnd.append('f1-not-harmonic')
+                _avg = _b.get('bnd_f1_average')
+                if _avg is not None and _avg not in ('macro_over_sequences', 'macro', 'micro'):
+                    _bad_bnd.append('unknown-f1-averaging')
+                _have_micro = any(_b.get(k) is not None for k in
+                                  ('bnd_f1_micro', 'bnd_tp', 'bnd_fp', 'bnd_fn'))
+                if _have_micro:
+                    _pm = _finite_scalar(_b.get('bnd_prec_micro'))
+                    _rm = _finite_scalar(_b.get('bnd_rec_micro'))
+                    _fm = _finite_scalar(_b.get('bnd_f1_micro'))
+                    if _pm is None or _rm is None or _fm is None:
+                        _bad_bnd.append('incomplete-micro-counts')
+                    elif not (0.0 <= _pm <= 1.0 and 0.0 <= _rm <= 1.0 and 0.0 <= _fm <= 1.0):
+                        _bad_bnd.append('micro-out-of-range')
+                    elif abs(_fm - 2 * _pm * _rm / max(_pm + _rm, 1e-09)) > 1e-6:
+                        _bad_bnd.append('micro-f1-not-harmonic')
+                    _tp = _exact_count(_b.get('bnd_tp'), minimum=0)
+                    _fp = _exact_count(_b.get('bnd_fp'), minimum=0)
+                    _fn = _exact_count(_b.get('bnd_fn'), minimum=0)
+                    if None not in (_tp, _fp, _fn):
+                        _pm2 = _tp / (_tp + _fp) if (_tp + _fp) else 0.0
+                        _rm2 = _tp / (_tp + _fn) if (_tp + _fn) else 0.0
+                        if _pm is not None and abs(_pm - _pm2) > 1e-6:
+                            _bad_bnd.append('micro-precision-inconsistent')
+                        if _rm is not None and abs(_rm - _rm2) > 1e-6:
+                            _bad_bnd.append('micro-recall-inconsistent')
+                elif _avg in (None, 'macro_over_sequences', 'macro'):
+                    _want = 2 * _p * _r / max(_p + _r, 1e-09)
+                    if abs(_f - _want) > 1e-6 and _avg is None:
+                        _bad_bnd.append('f1-not-harmonic')
+                    if _avg is not None:
+                        _macro_unverifiable.append(
+                            'macro F1 is a mean of per-sequence F1s and cannot be reconstructed '
+                            'from mean precision/recall; record bnd_f1_micro or per-sequence values')
+                if _avg == 'micro' and abs(_f - 2 * _p * _r / max(_p + _r, 1e-09)) > 1e-6:
+                    _bad_bnd.append('micro-declared-f1-not-harmonic')
                 _rb = _finite_scalar(_b.get('bnd_rand'))
                 if _rb is None or not (0.0 <= _rb <= 1.0):
                     _bad_bnd.append('random-out-of-range')
             out['checks'].append({'metric': 'boundary_alignment', 'policy': 'boundary_alignment',
                                   'records': len(bnd), 'ok': not missing and not _bad_bnd,
                                   'missing': missing, 'invalid': sorted(set(_bad_bnd)),
-                                  'f1_average': 'macro_over_sequences'})
+                                  'f1_average': 'macro_over_sequences',
+                                  'macro_f1_reconstructible': not _macro_unverifiable})
             if missing:
                 out['warnings'].append(f'boundary metrics report F1 without {missing}; F1 alone cannot be interpreted against the random-cut baseline')
             if _bad_bnd:
                 out['warnings'].append('boundary metrics contain invalid/out-of-range or non-harmonic '
                                        f'F1 values ({sorted(set(_bad_bnd))}); the reported F1 is not the '
-                                       'declared macro precision/recall endpoint')
+                                       'declared micro precision/recall endpoint')
+            if _macro_unverifiable:
+                out['warnings'].append('boundary metrics declare macro-over-sequences F1 but expose no '
+                                       'micro counts; the harmonic relation with mean precision/recall '
+                                       'does not hold for macro averages, so F1 reproducibility is '
+                                       'unverifiable from this record')
         if niah:
             missing = [k for k in ('acc', 'nll') if not all(k in b for b in niah)]
             _bad_niah = []
@@ -18899,15 +18938,20 @@ def _restore_block_stats(snap):
             attn._prefix_stats.__dict__.clear()
             attn._prefix_stats.__dict__.update(pstate)
 
-def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None):
+def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None, detail=None):
     gt = np.nonzero(np.asarray(gt_mask_row)[:n - 1])[0] + 1
     pred = np.asarray(pred_cuts)
     P, G = (len(pred), len(gt))
     if P == 0 or G == 0:
         if provenance is not None:
             provenance.setdefault('bnd_rand_exact', True)
+        if detail is not None:
+            detail.update({'tp': 0, 'fp': P, 'fn': G, 'n_pred': P, 'n_gt': G})
         return (0.0, 0.0, 0.0, 0.0)
     hits, ghits = _greedy_match_counts(pred, gt, tol)
+    if detail is not None:
+        detail.update({'tp': int(hits), 'fp': int(P - hits), 'fn': int(G - ghits),
+                       'n_pred': int(P), 'n_gt': int(G)})
     prec, rec = (hits / P, ghits / G)
     f1 = 2 * prec * rec / max(prec + rec, 1e-09)
     n_pos = max(n - 1, 1)
@@ -19386,6 +19430,7 @@ def _compression_report_summary(model, seq_len, val_bnd=None, bnd_tol=1):
             if n_seq_ref < len(attn._cuts):
                 print(f'[compression_report] WARNING: {len(attn._cuts)} sequences of cuts but only {val_bnd.shape[0]} reference masks — scoring the first {n_seq_ref} only')
             ps, rs, fs, rps = ([], [], [], [])
+            _tp = _fp = _fn = _n_pred = _n_gt = 0
             _cuts = attn._cuts
             _prov = {}
             # The integers transferred are exactly the per-sequence values
@@ -19402,15 +19447,31 @@ def _compression_report_summary(model, seq_len, val_bnd=None, bnd_tol=1):
                 del _tflat
             for si in range(n_seq_ref):
                 c = _tcut_host.get(si) if si in _tcut_host else _cuts[si]
-                p, r_, f_, rp = boundary_alignment(c, val_bnd[si], seq_len, tol=bnd_tol, provenance=_prov)
+                _d = {}
+                p, r_, f_, rp = boundary_alignment(c, val_bnd[si], seq_len, tol=bnd_tol,
+                                                   provenance=_prov, detail=_d)
                 ps.append(p)
                 rs.append(r_)
                 fs.append(f_)
                 rps.append(rp)
+                _tp += int(_d.get('tp', 0))
+                _fp += int(_d.get('fp', 0))
+                _fn += int(_d.get('fn', 0))
+                _n_pred += int(_d.get('n_pred', 0))
+                _n_gt += int(_d.get('n_gt', 0))
             if n_seq_ref:
                 entry['bnd_prec'] = float(np.mean(np.asarray(ps)))
                 entry['bnd_rec'] = float(np.mean(np.asarray(rs)))
                 entry['bnd_f1'] = float(np.mean(np.asarray(fs)))
+                entry['bnd_f1_average'] = 'macro_over_sequences'
+                entry['bnd_prec_micro'] = float(_tp / _n_pred) if _n_pred else 0.0
+                entry['bnd_rec_micro'] = float(_tp / _n_gt) if _n_gt else 0.0
+                _pm, _rm = entry['bnd_prec_micro'], entry['bnd_rec_micro']
+                entry['bnd_f1_micro'] = (float(2 * _pm * _rm / (_pm + _rm))
+                                         if (_pm + _rm) else 0.0)
+                entry['bnd_tp'] = int(_tp)
+                entry['bnd_fp'] = int(_fp)
+                entry['bnd_fn'] = int(_fn)
                 entry['bnd_rand'] = float(np.mean(np.asarray(rps)))
                 entry['bnd_excess'] = entry['bnd_prec'] - entry['bnd_rand']
                 entry['bnd_rand_exact'] = bool(_prov.get('bnd_rand_exact', True))

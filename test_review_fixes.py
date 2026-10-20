@@ -4661,6 +4661,47 @@ def t_binary_threshold_and_calibration_contract():
     assert iv['status'] == 'warn' and any('below chance' in w for w in iv['warnings']), iv
 
 
+def t_boundary_macro_micro_f1_contract():
+    # Macro-over-sequences F1 is NOT the harmonic mean of the mean precision
+    # and mean recall.  A record must expose micro counts (or per-sequence
+    # values) before F1 can be reconstructed; the old audit asserted the wrong
+    # identity and would flag a correct macro record.
+    b = {'b::seed0': {'variant': 'b', 'ppl': 10.0,
+                      'stats': {'L0': {'bnd_prec': 0.55, 'bnd_rec': 0.55,
+                                       'bnd_f1': 0.1818181818,
+                                       'bnd_f1_average': 'macro_over_sequences',
+                                       'bnd_prec_micro': 0.55, 'bnd_rec_micro': 0.55,
+                                       'bnd_f1_micro': 0.55,
+                                       'bnd_tp': 55, 'bnd_fp': 45, 'bnd_fn': 45,
+                                       'bnd_rand': 0.1}}}}
+    a = L.metric_policy_audit(b)
+    chk = next(c for c in a['checks'] if c['metric'] == 'boundary_alignment')
+    assert chk['ok'] is True and chk['macro_f1_reconstructible'] is True, chk
+    # Without micro counts the macro F1 is still valid but unverifiable.
+    b2 = json.loads(json.dumps(b))
+    for k in ('bnd_prec_micro', 'bnd_rec_micro', 'bnd_f1_micro', 'bnd_tp', 'bnd_fp', 'bnd_fn'):
+        b2['b::seed0']['stats']['L0'].pop(k)
+    a2 = L.metric_policy_audit(b2)
+    chk2 = next(c for c in a2['checks'] if c['metric'] == 'boundary_alignment')
+    assert chk2['ok'] is True and chk2['macro_f1_reconstructible'] is False, chk2
+    assert any('macro' in w and 'unverifiable' in w for w in a2['warnings']), a2
+    # The per-sequence counter path must agree with the reported rates.
+    _gt = np.zeros(10, dtype=bool)
+    _gt[2] = True
+    _gt[6] = True
+    _d = {}
+    _p, _r, _f, _rp = L.boundary_alignment([3, 8], _gt, 10, tol=1, detail=_d)
+    assert _p == 1.0 and _r == 1.0 and _f == 1.0, (_p, _r, _f)
+    assert (_d['tp'], _d['fp'], _d['fn'], _d['n_pred'], _d['n_gt']) == (2, 0, 0, 2, 2), _d
+    # A declared micro F1 must be the harmonic mean of the micro precision
+    # and recall; a forged value fails.
+    b3 = json.loads(json.dumps(b))
+    b3['b::seed0']['stats']['L0']['bnd_f1_micro'] = 0.9
+    a3 = L.metric_policy_audit(b3)
+    chk3 = next(c for c in a3['checks'] if c['metric'] == 'boundary_alignment')
+    assert chk3['ok'] is False and 'micro-f1-not-harmonic' in chk3['invalid'], chk3
+
+
 def t_hypothesis_audit_completeness_and_metric_alignment():
     good = L.hypothesis_audit(L.HYPOTHESIS_DESIGN, 'component')
     assert good['status'] == 'ok' and not good['invalid'], good
@@ -8962,6 +9003,7 @@ def main():
     _check('H4b count-model floor uses nested selection/holdout rows', t_simple_baseline_nested_rows_and_fingerprint)
     _check('H5 positive-label / rare-positive PR-AUC / macro-F1 averaging', t_classification_positive_label_and_rare_floor)
     _check('H5a binary threshold selection + calibration + threshold audit', t_binary_threshold_and_calibration_contract)
+    _check('H5b boundary macro/micro F1 averaging contract', t_boundary_macro_micro_f1_contract)
     _check('H6 hypothesis completeness + metric alignment + direction=0', t_hypothesis_audit_completeness_and_metric_alignment)
     _check('H7 simple-baseline driver uses the panel corpus', t_simple_baseline_driver_serves_the_panel_corpus)
     _check('H7a floor contrast is seed-level and significance-aware', t_simple_floor_contrast_is_significance_aware)
