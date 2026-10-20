@@ -13057,6 +13057,29 @@ def _param_control_detail(recs, a, b):
     out['unavailable'] = False
     return out
 
+def _param_capacity_controlled(detail):
+    """Collapse `_param_control_detail` into one tri-state capacity verdict.
+
+    Total parameter equality is necessary but not sufficient: the
+    parameter-matched dense arm reallocates MLP width and the random-indexer
+    control keeps dead indexer projections, so the *active* or
+    *non-embedding* counts can differ while totals match.  A recorded
+    disagreement on either breakdown key is a capacity confound (False);
+    unrecorded breakdown keys fall back to the total verdict; no usable
+    total is unverifiable (None), never a silent pass.
+    """
+    if not isinstance(detail, dict):
+        return None
+    total = detail.get('total_controlled')
+    if total is None:
+        return None
+    if total is False:
+        return False
+    for key in ('non_embedding_controlled', 'active_controlled'):
+        if detail.get(key) is False:
+            return False
+    return True
+
 def _compute_control_detail(recs, a, b, *, tolerance=0.25):
     """Measured compute budget of a pair, not just its step count.
 
@@ -13155,8 +13178,9 @@ def _sign_of(x):
 def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_match=False):
     """One status per declared innovation / baseline claim.
 
-    verified            — a controlled, parameter-controlled (for baselines)
-                          contrast is significant after the family-wise Holm
+    verified            — a controlled, capacity-controlled (total plus the
+                          recorded non-embedding/active breakdown for
+                          baselines) contrast is significant after the family-wise Holm
                           correction, its effect exceeds seed noise, AND (when
                           a pre-registered hypothesis exists) the sign matches
                           the predicted direction;
@@ -13182,7 +13206,11 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
                           seed noise (|mean| <= std);
     unverified          — no controlled contrast (missing arm / config mismatch).
     """
-    usable = [e for e in entries if e.get('controlled') and (not require_param_match or e.get('param_controlled') is True)]
+    def _capacity_ok(e):
+        pc = e.get('param_capacity_controlled')
+        return pc if pc is not None else e.get('param_controlled')
+    usable = [e for e in entries if e.get('controlled')
+              and (not require_param_match or _capacity_ok(e) is True)]
     if not usable:
         return 'unverified'
     powered = [e for e in usable if int(e.get('n') or 0) >= int(min_n)]
@@ -13460,6 +13488,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 _cfg_a = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == a), None)
                 _cfg_b = next((r.get('run_cfg') for (v, _t, _s), r in recs.items() if v == b), None)
                 _rel, _param_ok = _param_control(recs, a, b)
+                _param_detail = _param_control_detail(recs, a, b)
+                _param_capacity_ok = _param_capacity_controlled(_param_detail)
                 _contrast_measured = False
                 for (ts, bs), (deltas, shared, skipped) in sorted(conds.items()):
                     _skipped_seeds = {s for s, _why in skipped}
@@ -13531,7 +13561,9 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b,
                                'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None,
                                'param_rel_diff': _rel, 'param_controlled': _param_ok,
-                               'capacity_confounded': (_param_ok is False),
+                               'param_breakdown': _param_detail,
+                               'param_capacity_controlled': _param_capacity_ok,
+                               'capacity_confounded': ((_param_ok is False) or (_param_capacity_ok is False)),
                                'with_mean': _a_mean, 'with_std': _a_std,
                                'without_mean': _b_mean, 'without_std': _b_std,
                                'relative_effect_pct': _rel_effect,
@@ -13580,6 +13612,12 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     report['warnings'].append('%s: `%s` vs `%s` carry no usable `params` — parameter control is UNVERIFIABLE, so this baseline claim is not counted as verified' % (comp, a, b))
                 elif kind == 'component' and _param_ok is False:
                     report['warnings'].append('%s: `%s` vs `%s` differ in parameter count by %.2f%% — part of this module effect may be a capacity (parameter-count) effect rather than the mechanism; report the parameter delta or add a parameter-matched control before claiming the mechanism is useful' % (comp, a, b, 100.0 * (_rel or 0.0)))
+                elif _param_ok is True and _param_capacity_ok is False:
+                    _bad_keys = [k for k in ('non_embedding_controlled', 'active_controlled')
+                                 if _param_detail.get(k) is False]
+                    report['warnings'].append(
+                        '%s: `%s` vs `%s` match on TOTAL parameters but the recorded breakdown differs (%s) — the totals hide reallocated or dead capacity (MLP width / indexer projections), so this is not a capacity-matched control'
+                        % (comp, a, b, ', '.join(k.replace('_controlled', '') for k in _bad_keys) or 'breakdown'))
             out[comp] = entries
             meta[comp] = {'arms': arms}
         return out, meta
@@ -13974,7 +14012,15 @@ def _print_methodology_audit(report):
             elif e.get('seed_driven'):
                 print('        SEED-DRIVEN: dropping one seed flips the sign of the mean')
             if e.get('capacity_confounded'):
-                print('        CAPACITY CONFOUND: parameter counts differ by %.2f%% — report the parameter delta or add a parameter-matched control' % (100.0 * float(e.get('param_rel_diff') or 0.0)))
+                _pb = e.get('param_breakdown') or {}
+                _extra = []
+                for _k, _label in (('non_embedding_rel_diff', 'non-embedding'),
+                                   ('active_rel_diff', 'active')):
+                    if isinstance(_pb.get(_k), (int, float)):
+                        _extra.append('%s %.2f%%' % (_label, 100.0 * float(_pb[_k])))
+                print('        CAPACITY CONFOUND: total parameter difference %.2f%%%s — report the parameter delta or add a parameter-matched control' % (
+                    100.0 * float(e.get('param_rel_diff') or 0.0),
+                    ('; ' + ', '.join(_extra)) if _extra else ''))
             print('        %s | %s' % (_c, e['effect_vs_noise']))
     if report['verified_components']:
         print('  verified innovations (controlled AND family-Holm p<alpha AND |Δ|>seed noise): ' + ', '.join(report['verified_components']))

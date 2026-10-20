@@ -4300,6 +4300,35 @@ def t_param_and_compute_control_detail():
     assert r['components']['c'][0]['compute_confound_direction'] == 'favors_claimed_winner', r['components']['c'][0]
 
 
+def t_capacity_breakdown_gates_baseline_claim():
+    # Equal TOTAL parameters but a reallocated active count (dense MLP width /
+    # dead indexer projections) is not a capacity-matched control.  The
+    # breakdown must reach the verdict, not only the console.
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    kn = L.training_knobs()
+    s = {}
+    for i in range(6):
+        s[f'a::s{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1, tokens_seen=10,
+                             ppl=49.0, params=1000,
+                             param_breakdown={'total': 1000, 'non_embedding': 800,
+                                              'active': 700, 'embedding': 200},
+                             train_knobs=kn)
+        s[f'b::s{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1, tokens_seen=10,
+                             ppl=50.0, params=1000,
+                             param_breakdown={'total': 1000, 'non_embedding': 800,
+                                              'active': 600, 'embedding': 200},
+                             train_knobs=kn)
+    r = L.methodology_audit(s, design={}, baselines={'comp': [('a', 'b', 'x')]},
+                            verbose=False)
+    e = r['baselines']['comp'][0]
+    assert e['param_controlled'] is True, e
+    assert e['param_capacity_controlled'] is False, e
+    assert e['capacity_confounded'] is True, e
+    assert 'comp' not in r['verified_baselines'], r['verified_baselines']
+    assert 'comp' in r['unverified_baselines'], r['unverified_baselines']
+    assert any('match on TOTAL parameters' in w for w in r['warnings']), r['warnings']
+
+
 def t_stale_aggregate_refused():
     cur = BR._CUR_CS
     d = {'a@cfg1': {'variant': 'a', 'run_cfg': f'steps1_d8_L1_csOLD1', 'n_seeds': 4, 'ppl_mean': 10.0},
@@ -5434,6 +5463,7 @@ def main():
     _check('L3b scale-ladder budget + transfer audit', t_scale_ladder_budget_and_transfer_audit)
     _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
+    _check('L5b capacity breakdown gates the baseline claim', t_capacity_breakdown_gates_baseline_claim)
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)
     _check('L7 stale length panel excluded from report', t_sec_p1l_excludes_stale_records)
     _check('L8 efficiency-pair audit + shape sweep', t_efficiency_pairs_audit_and_sweep)
