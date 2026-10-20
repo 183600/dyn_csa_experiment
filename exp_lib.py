@@ -11615,10 +11615,16 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     if prev.size:
         if lam > 0.0:
             keys = prev * vocab_size + nxt
-            idx = np.searchsorted(uniq, keys)
-            idx_clip = np.minimum(idx, max(uniq.size - 1, 0))
-            hit = (idx < uniq.size) & (uniq[idx_clip] == keys) if uniq.size else np.zeros(keys.shape, dtype=bool)
-            c_pair = np.where(hit, pair_counts[idx_clip], 0).astype(np.float64)
+            if uniq.size:
+                idx = np.searchsorted(uniq, keys)
+                idx_clip = np.minimum(idx, uniq.size - 1)
+                hit = (idx < uniq.size) & (uniq[idx_clip] == keys)
+                c_pair = np.where(hit, pair_counts[idx_clip], 0).astype(np.float64)
+            else:
+                # A training stream with fewer than two tokens has no bigram
+                # counts.  Indexing an empty pair_counts table (even through
+                # np.where) raises; every transition is unseen instead.
+                c_pair = np.zeros(keys.shape, dtype=np.float64)
             c_ctx = ctx[prev].astype(np.float64)
             # Add-alpha smoothing of the conditional is defined even when the
             # context was never seen: 0/0 becomes alpha/(alpha*V) = 1/V.  The

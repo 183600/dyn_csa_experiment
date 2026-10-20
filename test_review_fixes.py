@@ -3339,6 +3339,14 @@ def t_simple_baseline_ngram_and_audit():
         one_d = L.ngram_lm_score(train, flat, vocab, order=order, alpha=0.1, interpolation=lam)
         assert abs(two_d['nll'] - one_d['nll']) < 1e-12, (order, lam, two_d, one_d)
         assert abs(two_d['ppl'] - one_d['ppl']) < 1e-9, (order, lam, two_d, one_d)
+    # A training stream with fewer than two tokens has no bigram table at
+    # all.  Scoring order=2 through the empty table must fall back to the
+    # add-alpha unseen conditional instead of raising IndexError.
+    for _short in (np.empty(0, dtype=np.int64), np.array([0], dtype=np.int64)):
+        _short_score = L.ngram_lm_score(_short, np.array([0, 1, 2]), vocab,
+                                        order=2, alpha=0.1, interpolation=1.0)
+        assert math.isfinite(_short_score['ppl']) and _short_score['ppl'] > 0, _short_score
+
     # interpolation=0 must reduce to the unigram model.
     uni = L.ngram_lm_score(train, val, vocab, order=1, alpha=0.1)
     zero = L.ngram_lm_score(train, val, vocab, order=2, alpha=0.1, interpolation=0.0)
