@@ -11357,10 +11357,31 @@ SIMPLE_BASELINE_POLICY = {
     'note': 'Counts are fitted on the training token stream only (a deterministic prefix when max_fit_tokens is exceeded, with the truncation recorded); smoothing/interpolation is selected on validation PPL. The held-out test split is never read. This is a sanity floor, not a tuned neural baseline.',
 }
 
+def _ngram_token_ids(values, label):
+    """Exact integer token ids for the count baseline.
+
+    Casting a float/boolean/object array through int64 would silently score
+    different tokens (1.7 -> 1, True -> 1).  The count model is a data-path
+    baseline, so it must reject such input rather than manufacture a floor
+    from truncated ids.
+    """
+    arr = np.asarray(values)
+    if (arr.dtype == np.bool_ or arr.dtype == object
+            or not np.issubdtype(arr.dtype, np.integer)):
+        raise TypeError(f'ngram baseline: {label} ids must be integers, '
+                        f'got dtype {arr.dtype}')
+    return arr.reshape(-1)
+
+def _ngram_vocab_size(value):
+    v = _as_seed_int(value)
+    if v is None or v <= 0:
+        raise ValueError(f'ngram baseline: vocab_size must be a positive integer, got {value!r}')
+    return v
+
 def _ngram_train_counts(train_ids, vocab_size):
     """Return (unigram counts, bigram key counts, bigram context counts)."""
-    ids = np.asarray(train_ids, dtype=np.int64).ravel()
-    vocab_size = int(vocab_size)
+    ids = np.asarray(_ngram_token_ids(train_ids, 'train'), dtype=np.int64)
+    vocab_size = _ngram_vocab_size(vocab_size)
     if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= vocab_size):
         raise ValueError('ngram baseline: train ids outside [0, vocab_size)')
     uni = np.bincount(ids, minlength=vocab_size).astype(np.float64)
@@ -11373,7 +11394,11 @@ def _ngram_train_counts(train_ids, vocab_size):
     return uni, uniq, ctx, counts
 
 def _ngram_eval_parts(eval_ids):
-    arr = np.asarray(eval_ids, dtype=np.int64)
+    arr = np.asarray(eval_ids)
+    if (arr.dtype == np.bool_ or arr.dtype == object
+            or not np.issubdtype(arr.dtype, np.integer)):
+        raise TypeError(f'ngram baseline: eval ids must be integers, got dtype {arr.dtype}')
+    arr = np.asarray(arr, dtype=np.int64)
     if arr.ndim == 1:
         return arr, arr[:-1], arr[1:]
     if arr.ndim == 2:
@@ -11389,8 +11414,8 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     respected: the first token of every evaluation row is scored by the
     unigram model, never by the previous row's last token.  The effect size is
     token-weighted, matching the LM metric policy."""
-    ids = np.asarray(train_ids, dtype=np.int64).ravel()
-    vocab_size = int(vocab_size)
+    ids = np.asarray(_ngram_token_ids(train_ids, 'train'), dtype=np.int64)
+    vocab_size = _ngram_vocab_size(vocab_size)
     alpha = float(alpha)
     if alpha <= 0:
         raise ValueError('alpha must be positive')

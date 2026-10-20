@@ -3012,6 +3012,28 @@ def t_simple_baseline_ngram_and_audit():
     uni = L.ngram_lm_score(train, val, vocab, order=1, alpha=0.1)
     zero = L.ngram_lm_score(train, val, vocab, order=2, alpha=0.1, interpolation=0.0)
     assert abs(uni['nll'] - zero['nll']) < 1e-12 and abs(uni['ppl'] - zero['ppl']) < 1e-9, (uni, zero)
+    # The count-model floor must not be fitted/scored on truncated ids or a
+    # fractional vocabulary: those silently change the tokens being counted.
+    for _bad in ([1.0, 2.0, 3.0], [True, False, True], np.array([1.5, 2.5])):
+        try:
+            L.ngram_lm_score(_bad, val, vocab, order=2)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(f'float/bool train ids were accepted: {_bad!r}')
+        try:
+            L.ngram_lm_score(train, _bad, vocab, order=2)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(f'float/bool eval ids were accepted: {_bad!r}')
+    for _bad_vocab in (2.5, True, 0, -3):
+        try:
+            L.ngram_lm_score(train, val, _bad_vocab, order=1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid vocab_size {_bad_vocab!r} was accepted')
 
 
 def t_simple_baseline_fit_budget_is_bounded_and_disclosed():
