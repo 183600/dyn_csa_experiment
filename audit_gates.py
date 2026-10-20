@@ -1680,17 +1680,31 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
         for a, b in _pairs:
             if a not in eff or b not in eff:
                 continue
+            def _num(v):
+                # Timing/token fields are measurements: booleans and
+                # non-finite values are not numbers, whatever float() accepts.
+                if isinstance(v, (bool, np.bool_)) or not isinstance(v, (int, float, np.integer, np.floating)):
+                    return None
+                f = float(v)
+                return f if math.isfinite(f) else None
+
             def _med(rows, key):
-                _v = [float(r[key]) for r in rows if isinstance(r.get(key), (int, float)) and math.isfinite(float(r[key]))]
+                _v = [f for f in (_num(r.get(key)) for r in rows) if f is not None]
                 return (float(np.median(_v)) if _v else None)
-            ra, rb = eff[a][0], eff[b][0]
-            same_env = (ra.get('device') == rb.get('device') and ra.get('torch') == rb.get('torch'))
-            same_kv = bool(ra.get('decode_has_kv_cache')) == bool(rb.get('decode_has_kv_cache'))
+            # Environment/KV identity must hold for EVERY seed in both arms,
+            # not only for the first record: a mixed arm would otherwise have
+            # its median compared across different hardware/semantics.
+            _env_a = {(r.get('device'), r.get('torch')) for r in eff[a]}
+            _env_b = {(r.get('device'), r.get('torch')) for r in eff[b]}
+            _kv_a = {bool(r.get('decode_has_kv_cache')) for r in eff[a]}
+            _kv_b = {bool(r.get('decode_has_kv_cache')) for r in eff[b]}
+            same_env = bool(len(_env_a) == 1 and len(_env_b) == 1 and _env_a == _env_b)
+            same_kv = bool(len(_kv_a) == 1 and len(_kv_b) == 1 and _kv_a == _kv_b)
             # Median over seeds, not the first record: a single slow seed must
             # not decide a "faster" claim.
             _ta, _tb = _med(eff[a], 'prefill_ms_p50'), _med(eff[b], 'prefill_ms_p50')
-            _na = sorted({int(r['n_tokens']) for r in eff[a] if isinstance(r.get('n_tokens'), int)})
-            _nb = sorted({int(r['n_tokens']) for r in eff[b] if isinstance(r.get('n_tokens'), int)})
+            _na = sorted({int(x) for x in (_num(r.get('n_tokens')) for r in eff[a]) if x is not None})
+            _nb = sorted({int(x) for x in (_num(r.get('n_tokens')) for r in eff[b]) if x is not None})
             rec = {'a': a, 'b': b, 'same_device_torch': same_env, 'same_kv_semantics': same_kv,
                    'a_ms_p50': _ta, 'b_ms_p50': _tb, 'a_tokens': _na, 'b_tokens': _nb,
                    'ratio_b_over_a': None, 'speed_claim_allowed': False, 'faster_arm': None, 'reason': None}
@@ -1699,9 +1713,9 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             elif _na != _nb or len(_na) != 1 or len(_nb) != 1:
                 rec['reason'] = f'different or ambiguous measured token counts ({_na} vs {_nb}); a latency ratio across shapes is not a speed comparison'
             elif not same_env:
-                rec['reason'] = 'different device or torch version recorded'
+                rec['reason'] = 'different or inconsistent device/torch version recorded (within or across arms)'
             elif not same_kv:
-                rec['reason'] = 'different KV-cache semantics recorded'
+                rec['reason'] = 'different or inconsistent KV-cache semantics recorded (within or across arms)'
             else:
                 ratio = float(_tb) / float(_ta)
                 rec['ratio_b_over_a'] = ratio
