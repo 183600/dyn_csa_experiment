@@ -10938,21 +10938,30 @@ def _splitmix64_u64(x):
 
 def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
                          selection_fold=0, evaluation_fold=1):
-    """Deterministically partition validation ROWS into disjoint folds.
+    """Deterministically partition validation ROWS into disjoint chronological folds.
 
     Seeds make the training draws independent, but hyper-parameter selection
     and the final tuned comparison were historically measured on the same
     validation documents.  Disjoint seeds do not fix that: the selection is a
     function of the evaluation rows, so re-using them still yields an
     optimistically selected estimate.  This split makes the two stages use
-    disjoint documents without changing any training run.
+    disjoint rows without changing any training run.
 
-    Rows are ordered by a seeded SplitMix64 key (ties broken by row index), so
-    the partition is balanced, deterministic and independent of NumPy/OS
-    versions.  Both returned index lists are sorted; the union is exactly
-    ``range(n_rows)`` and they never intersect.  The metadata stores only
-    counts and fingerprints (not the full index lists) so it stays small when
-    the validation panel is scaled up."""
+    Validation rows are consecutive chunks of a token stream, so their order is
+    time order.  The folds are therefore **contiguous blocks of rows**, not a
+    random row permutation: selection uses an earlier block and evaluation a
+    later block (``selection_fold`` must precede ``evaluation_fold`` for a
+    forward-in-time estimate).  Randomly interleaving rows would let the
+    selection stage see chunks from later in the stream than the rows used to
+    estimate the final contrast, and could put the same document on both sides
+    of a row boundary many times over.
+
+    ``seed`` deterministically chooses among the balanced cut positions when
+    ``n_rows`` is not divisible by ``n_folds``; it never shuffles rows across
+    the cut.  Both returned index lists are sorted and contiguous; the union is
+    exactly ``range(n_rows)`` and they never intersect.  The metadata stores
+    only counts/ranges/fingerprints (not the full index lists) so it stays
+    small when the validation panel is scaled up."""
     try:
         n_rows = int(n_rows)
         seed = int(seed)
@@ -10970,16 +10979,28 @@ def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
     if not (0 <= selection_fold < n_folds and 0 <= evaluation_fold < n_folds):
         raise ValueError(f'validation_row_split: folds must be in [0, {n_folds}), got '
                          f'selection={selection_fold}, evaluation={evaluation_fold}')
-    order = sorted(range(n_rows), key=lambda i: (_splitmix64_u64(seed + i), i))
-    # Keep the selection fold as close to half as the requested folds allow;
-    # the evaluation fold is the remainder, so the two lists partition rows.
-    n_sel = max(1, min(n_rows - 1, int(round(n_rows / float(n_folds)))))
-    selection = sorted(order[:n_sel])
-    evaluation = sorted(order[n_sel:])
+    # Only the earliest block selects and the later block estimates.  A swapped
+    # request would estimate the past from a model tuned on the future; refuse
+    # it instead of returning a reverse-time nested split.
+    if selection_fold > evaluation_fold:
+        raise ValueError(
+            'validation_row_split: selection_fold must precede evaluation_fold; '
+            f'got selection={selection_fold}, evaluation={evaluation_fold}')
+    # Balanced contiguous cut: floor/ceil of n_rows/n_folds are the only legal
+    # sizes for the selection block under the requested fold count.  The seed
+    # chooses between them deterministically, so the split is reproducible yet
+    # not accidentally tied to one arithmetic rounding rule.
+    exact = n_rows / float(n_folds)
+    candidates = sorted({max(1, min(n_rows - 1, int(math.floor(exact)))),
+                         max(1, min(n_rows - 1, int(math.ceil(exact))))})
+    n_sel = min(candidates,
+                key=lambda c: (_splitmix64_u64(seed + c), c))
+    selection = list(range(n_sel))
+    evaluation = list(range(n_sel, n_rows))
     _sel_arr = np.asarray(selection, dtype=np.int64)
     _ev_arr = np.asarray(evaluation, dtype=np.int64)
     meta = {
-        'policy': 'seeded_splitmix64_row_folds',
+        'policy': 'chronological_contiguous_row_folds',
         'seed': int(seed),
         'n_folds': int(n_folds),
         'selection_fold': int(selection_fold),
@@ -10987,11 +11008,15 @@ def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
         'n_rows': int(n_rows),
         'n_selection_rows': int(_sel_arr.size),
         'n_evaluation_rows': int(_ev_arr.size),
+        'selection_row_range': [0, int(n_sel) - 1] if n_sel else None,
+        'evaluation_row_range': [int(n_sel), int(n_rows) - 1],
+        'chronological': True,
+        'selection_precedes_evaluation': True,
         'selection_row_fp': _ids_fp(_sel_arr),
         'evaluation_row_fp': _ids_fp(_ev_arr),
         'disjoint': bool(np.intersect1d(_sel_arr, _ev_arr).size == 0),
         'covers_all_rows': bool(_sel_arr.size + _ev_arr.size == n_rows),
-        'note': 'selection rows choose the hyper-parameters; evaluation rows are held out from that selection. Row fingerprints let the audit verify both stages used the declared folds.',
+        'note': 'selection rows choose the hyper-parameters; later evaluation rows are held out from that selection. Row fingerprints let the audit verify both stages used the declared folds.',
     }
     return selection, evaluation, meta
 

@@ -2654,6 +2654,22 @@ def t_nested_validation_row_split_and_subset_ppl():
     assert not (set(sel) & set(ev)), (sel, ev)
     assert meta['disjoint'] is True and meta['covers_all_rows'] is True, meta
     assert meta['n_selection_rows'] + meta['n_evaluation_rows'] == 17, meta
+    # Validation rows are consecutive stream chunks, so the folds must be
+    # contiguous in time order: selection is an earlier block and evaluation a
+    # later one.  A seeded row permutation would interleave future chunks into
+    # selection and split the same document across the two stages repeatedly.
+    assert sel == list(range(len(sel))) and ev == list(range(len(sel), 17)), (sel, ev)
+    assert max(sel) < min(ev)
+    assert meta['policy'] == 'chronological_contiguous_row_folds', meta
+    assert meta['chronological'] is True and meta['selection_precedes_evaluation'] is True, meta
+    assert meta['selection_row_range'] == [0, len(sel) - 1], meta
+    assert meta['evaluation_row_range'] == [len(sel), 16], meta
+    try:
+        L.validation_row_split(17, selection_fold=1, evaluation_fold=0)
+    except ValueError as e:
+        assert 'precede' in str(e), e
+    else:
+        raise AssertionError('a reverse-time nested split must be refused')
     # Deterministic across calls and independent of the row order in which
     # the same physical rows are presented (indices are the identity).
     sel2, ev2, meta2 = L.validation_row_split(17, seed=123)

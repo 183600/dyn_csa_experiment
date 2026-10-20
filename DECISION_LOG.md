@@ -145,13 +145,19 @@ table is `REVIEW_4_RESPONSE.md`, and the statistical conventions are in
 Seed-disjoint search/final partitions were not sufficient: hyper-parameters
 were selected and the final tuned contrast was still measured on the same
 validation documents. `baseline_tune.py` now tunes on a deterministic
-SplitMix64 row fold and reports the tuned comparison on the disjoint fold.
+**chronological contiguous** row fold and reports the tuned comparison on the
+later disjoint fold. Validation rows are consecutive chunks of the token
+stream, so a seeded row permutation (the earlier implementation) would put
+future chunks into selection, estimate the final contrast partly on earlier
+chunks, and repeatedly cross the same document boundary; contiguous blocks
+keep selection strictly before evaluation. The seed only chooses among the
+balanced cut positions when the row count is not divisible by the fold count.
 Selection uses token-pooled PPL on the selection fold (arithmetic seed mean is
 only a legacy fallback), and the final records keep full-validation PPL for
 context while `tuned_comparison.json` uses the held-out row fold
 (`estimation_rows=nested_validation_holdout`). The tuning artifact records row
-fingerprints/counts and `baseline_tuning_audit` refuses a claimed nested run
-whose final records lack held-out-row PPL or score a different fold.
+fingerprints/counts/ranges and `baseline_tuning_audit` refuses a claimed nested
+run whose final records lack held-out-row PPL or score a different fold.
 
 The count-model floor now fits on a declared deterministic token prefix
 (`SIMPLE_BASELINE_POLICY.max_fit_tokens`, 20M by default) and records
