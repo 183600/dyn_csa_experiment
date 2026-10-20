@@ -521,6 +521,25 @@ def t_timeguard_variant_calibration():
 def t_paired_effect_resolution():
     r = L.paired_effect_stats([1.0, 1.1, 0.9, 1.2], alpha=0.05)
     assert r['resolution_limited'] is True, 'n=4 can never reach 0.05 (floor 0.125) — descriptive tier'
+    # Missing/non-finite pairs must stay visible: the p-value is computed on
+    # the survivors, so a complete-case result cannot be presented as if the
+    # whole paired panel were measured.
+    r = L.paired_effect_stats([1.0, float('nan'), -0.5], seeds=[0, 1, 2])
+    assert r['n'] == 2 and r['n_input'] == 3 and r['n_dropped'] == 1, r
+    assert r['dropped_seeds'] == [1] and r['seeds'] == [0, 2], r
+    assert r['complete_pairs'] is False, r
+    try:
+        L.paired_effect_stats([1.0, 2.0], seeds=[0, 0])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('duplicate paired seeds must be rejected')
+    try:
+        L.paired_effect_stats([1.0, 2.0], seeds=[0])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a mismatched seed vector must be rejected')
 
 
 def t_scaling_trend_ragged_pairs():
@@ -3978,6 +3997,12 @@ def t_reportable_claim_gate():
     # directional claim, even if the aggregate p happens to clear Holm.
     r = L.reportable_claim(dict(base, seed_driven=True))
     assert r['allowed'] is False and any('leave-one-seed-out' in x for x in r['reasons']), r
+    # A complete-case p-value computed after dropping missing pairs is not a
+    # complete-panel significance claim.
+    r = L.reportable_claim(dict(base, n_input=7, n_dropped=1,
+                                dropped_seeds=[6]))
+    assert r['allowed'] is False and any('complete-case' in x for x in r['reasons']), r
+    assert r['n_input'] == 7 and r['n_dropped'] == 1, r
 
 
 def t_holm_family_resolution_ceiling():

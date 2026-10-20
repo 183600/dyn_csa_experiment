@@ -8817,6 +8817,20 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     except (TypeError, ValueError, OverflowError):
         out['p_holm'] = None
     out['p_floor'] = signflip_p_floor(n) if n > 0 else None
+    # Complete-case significance is not the same as a complete paired panel.
+    # If the caller's statistics record non-finite/missing pairs, the reported
+    # n is the number that SURVIVED filtering; a claim over that subset can be
+    # biased by which seeds/arms failed.  Keep the number reportable but refuse
+    # the significance wording unless the caller supplies the complete panel.
+    _n_input = _as_seed_int(stats.get('n_input'))
+    _n_dropped = _as_seed_int(stats.get('n_dropped'))
+    out['n_input'] = _n_input
+    out['n_dropped'] = _n_dropped
+    if _n_dropped is not None and _n_dropped > 0:
+        out['reasons'].append(
+            f'{_n_dropped} paired observation(s) were dropped as non-finite '
+            f'(n_input={_n_input}); complete-case significance is not a '
+            'complete-panel result')
     if n < int(min_n):
         out['reasons'].append(f'n={n} < min_n={int(min_n)}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={int(min_n)}')
     elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > alpha:
@@ -9210,7 +9224,8 @@ def wilcoxon_signed_rank_p(deltas):
     return {'p': float(p), 'method': 'normal', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w,
             'note': f'normal approximation; exact DP is used for n<={_WILCOXON_EXACT_MAX_N}'}
 
-def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_values=None):
+def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_values=None,
+                        seeds=None):
     """Paired contrast summary with an explicit effect-vs-seed-noise verdict.
 
     Reports n, mean, sample std (ddof=1), sem, Cohen's d_z, the exact
@@ -9242,11 +9257,44 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     p-value can never dress up a sub-noise effect as a real improvement, while
     `resolution_limited` stops a small-n panel from being read as a negative
     result when only the test's granularity, not the data, bound the p."""
-    d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
-                    if f is not None], dtype=float)
+    raw = list(deltas if deltas is not None else [])
+    n_input = len(raw)
+    d_vals, kept_pos, dropped_pos = [], [], []
+    for _i, _x in enumerate(raw):
+        _f = _finite_scalar(_x)
+        if _f is None:
+            dropped_pos.append(_i)
+        else:
+            d_vals.append(_f)
+            kept_pos.append(_i)
+    d = np.asarray(d_vals, dtype=float)
     n = int(d.size)
+    n_dropped = n_input - n
+    seed_labels = list(kept_pos)
+    dropped_seeds = list(dropped_pos)
+    if seeds is not None:
+        try:
+            _seed_in = list(seeds)
+        except TypeError:
+            raise ValueError('paired_effect_stats: seeds must be an iterable') from None
+        if len(_seed_in) != n_input:
+            raise ValueError(
+                'paired_effect_stats: seeds length %d does not match deltas length %d'
+                % (len(_seed_in), n_input))
+        _norm_seeds = [_as_seed_int(s) for s in _seed_in]
+        if any(s is None for s in _norm_seeds):
+            raise ValueError(f'paired_effect_stats: seeds are not integers ({_seed_in!r})')
+        if len(set(_norm_seeds)) != len(_norm_seeds):
+            raise ValueError(f'paired_effect_stats: duplicate seeds {_norm_seeds!r}')
+        seed_labels = [_norm_seeds[i] for i in kept_pos]
+        dropped_seeds = [_norm_seeds[i] for i in dropped_pos]
+    _pair_fields = {'n_input': n_input, 'n_dropped': n_dropped,
+                    'dropped_positions': dropped_pos,
+                    'dropped_seeds': dropped_seeds,
+                    'complete_pairs': bool(n_dropped == 0),
+                    'seeds': seed_labels}
     if n == 0:
-        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None}
+        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None, **_pair_fields}
     mean = float(d.mean())
     std = float(d.std(ddof=1)) if n > 1 else 0.0
     sem = float(std / math.sqrt(n)) if n > 1 else float('nan')
@@ -9309,7 +9357,8 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
             'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
             'p_wilcoxon': _wil.get('p'), 'p_wilcoxon_method': _wil.get('method'),
-            'ci95_paired_bootstrap': _paired_ci, 'ci95_unpaired_bootstrap': _unpaired_ci}
+            'ci95_paired_bootstrap': _paired_ci, 'ci95_unpaired_bootstrap': _unpaired_ci,
+            **_pair_fields}
 
 # ---- 预注册功效 / 分辨率工具 --------------------------------------------------
 # 动机：一个冻结方案如果「无论数据多强都不可能达到 p_holm < α」，它落在
