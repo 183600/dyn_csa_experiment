@@ -7954,6 +7954,25 @@ def t_scale_ladder_missing_seed_plan_is_not_common():
     assert out['common_seeds_sufficient_for_family'] is False, out
 
 
+
+def t_small_n_split_remainder_and_string_order():
+    # Guaranteeing one row for val/test must not then hand them the whole
+    # remainder: 80/10/10 at n=8 is (6,1,1), not (4,1,3).
+    for n, want in ((4, [2, 1, 1]), (5, [3, 1, 1]), (8, [6, 1, 1])):
+        idx = L.chronological_split_indices(n)
+        got = [len(idx[k]) for k in ('train', 'val', 'test')]
+        assert got == want, (n, got)
+    idx = L.chronological_split_indices(3, 0.5, 0.5, 0.0)
+    assert [len(idx[k]) for k in ('train', 'val', 'test')] == [2, 1, 0], idx
+    idx = L.chronological_split_indices(4, 0.1, 0.8, 0.1)
+    assert [len(idx[k]) for k in ('train', 'val', 'test')] == [1, 2, 1], idx
+    # Lexicographic string event ids remain valid ordering keys, even when
+    # the literal text is 'nan' or 'inf'.
+    idx = L.split_indices(3, time=np.array(['a', 'nan', 'b'], dtype=object),
+                          train_frac=1 / 3, val_frac=1 / 3, test_frac=1 / 3)
+    assert sorted(sum((list(idx[k]) for k in ('train', 'val', 'test')), [])) == [0, 1, 2], idx
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8207,6 +8226,7 @@ def main():
     _check('L37b non-estimable variance blocks pooling', t_scale_non_estimable_variance_blocks_pooling)
     _check('L37c tuning margin does not invent precision', t_tuning_margin_does_not_invent_precision)
     _check('L37d ladder missing seed plan is not common', t_scale_ladder_missing_seed_plan_is_not_common)
+    _check('L38 small-n split remainder + string order keys', t_small_n_split_remainder_and_string_order)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

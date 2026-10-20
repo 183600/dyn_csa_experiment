@@ -172,13 +172,22 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
                 if j != i and sizes[j] > 1:
                     sizes[j] -= 1
                     break
-    # The remainder goes to the LAST split the caller actually requested.  The
-    # old unconditional `sizes[2] = remainder` silently created test rows when
-    # test_frac was explicitly 0 (e.g. .5/.5/0 at n=3 -> (1,1,1)).
-    _last_requested = max(i for i, flag in enumerate(requested) if flag)
-    sizes[_last_requested] = n - sum(sizes[j] for j in range(3)
-                                     if j != _last_requested)
-    if any(v < 0 for v in sizes):
+    # Put the remainder where the declared fractions are still most under-
+    # filled.  Assigning it unconditionally to the last requested split made
+    # an 80/10/10 split at n=8 into (4,1,3): guaranteeing one validation/test
+    # row had already taken rows from train, and the last split then took the
+    # remainder as well.  Ties go to the earlier split, so the test set does
+    # not become the largest by accident.  Splits the caller declared empty
+    # stay empty.
+    _remainder = n - sum(sizes)
+    if _remainder < 0:
+        raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
+    if _remainder:
+        _targets = (train_frac, val_frac, test_frac)
+        _best = max((i for i, flag in enumerate(requested) if flag),
+                    key=lambda i: (_targets[i] * n - sizes[i], -i))
+        sizes[_best] += _remainder
+    if sum(sizes) != n or any(v < 0 for v in sizes):
         raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
     return tuple(int(v) for v in sizes)
 
@@ -399,6 +408,12 @@ def _assert_order_finite(order, *, name='order'):
                         raise ValueError(
                             f'{name} contains NaT; a temporal split needs a '
                             'well-defined order')
+                    continue
+                if isinstance(value, (str, bytes)):
+                    # Strings are ordering keys, not numbers.  Casting the
+                    # literal string 'nan'/'inf' through float() would reject
+                    # a perfectly orderable event id; leave the caller's
+                    # lexicographic order alone.
                     continue
                 try:
                     f = float(value)
