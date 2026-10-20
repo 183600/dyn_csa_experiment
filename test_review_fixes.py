@@ -366,6 +366,15 @@ def t_scale_input_guards():
             raise AssertionError(f'{fn.__name__} must reject duplicate seeds instead of double-counting them')
         except ValueError:
             pass
+    # A non-finite pair is dropped from the test but must stay visible as a
+    # dropped observation; otherwise the surviving subset is misreported as a
+    # complete paired panel.
+    si = L.scale_interaction([1.0, float('nan'), 2.0, 3.0],
+                             [1.1, float('nan'), 2.1, 3.1],
+                             seeds=[10, 11, 12, 13])
+    assert si['n'] == 3 and si['n_input'] == 4 and si['n_dropped'] == 1, si
+    assert si['complete_pairs'] is False and si['dropped_seeds'] == [11], si
+    assert si['seeds'] == [10, 12, 13], si
 
 
 def t_exact_signflip_baseline():

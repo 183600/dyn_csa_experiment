@@ -10229,15 +10229,21 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     diff, kept = [], []
     for s, x, y in zip(ss, a, b):
         if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
+            # Keep the position so paired_effect_stats can report the dropped
+            # seed instead of calling the surviving subset a complete panel.
+            diff.append(float('nan'))
             continue
         try:
             fx, fy = float(x), float(y)
         except (TypeError, ValueError, OverflowError):
+            diff.append(float('nan'))
             continue
         if math.isfinite(fx) and math.isfinite(fy):
             diff.append(fy - fx)
             kept.append(s)
-    st = paired_effect_stats(diff, alpha=alpha, min_n=min_n)
+        else:
+            diff.append(float('nan'))
+    st = paired_effect_stats(diff, alpha=alpha, min_n=min_n, seeds=ss)
     st.update({'low_label': str(low_label), 'high_label': str(high_label), 'seeds': kept,
                'convention': 'delta = effect_high - effect_low; positive = effect is larger at the higher scale',
                'claim_level': 'confirmatory only if n>=%d and p_floor<alpha' % int(min_n)})
