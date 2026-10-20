@@ -2846,6 +2846,78 @@ def t_tuning_selection_stability_audit():
     assert no_seed['status'] == 'unavailable', no_seed
 
 
+def t_paired_row_bootstrap_delta():
+    # Evaluation-row bootstrap for a paired token-weighted PPL difference:
+    # the SAME rows are resampled for both arms and every shared seed.
+    def _pair(sign=1.0, n_seeds=8, n_rows=16, ntok=50):
+        out = []
+        for s in range(n_seeds):
+            a_nll = [2.0 + 0.01 * j for j in range(n_rows)]
+            b_nll = [2.0 + 0.01 * j - sign * 0.2 for j in range(n_rows)]
+            out.append(({'variant': 'a', 'seed': s,
+                         'ppl': math.exp(sum(a_nll) / (n_rows * ntok)),
+                         'nll_per_row': a_nll,
+                         'n_tokens_per_row': [ntok] * n_rows},
+                        {'variant': 'b', 'seed': s,
+                         'ppl': math.exp(sum(b_nll) / (n_rows * ntok)),
+                         'nll_per_row': b_nll,
+                         'n_tokens_per_row': [ntok] * n_rows}))
+        return out
+    r = L.paired_row_bootstrap_delta(_pair(+1.0))
+    assert r['status'] == 'ok' and r['n_pairs'] == 8 and r['n_rows'] == 16, r
+    assert r['mean_delta'] > 0 and r['ci95_delta_ppl'][0] > 0, r
+    assert r['n_seeds_used'] == 8, r
+    # Deterministic draws for the same seed.
+    assert L.paired_row_bootstrap_delta(_pair(+1.0))['ci95_delta_ppl'] == r['ci95_delta_ppl']
+    rn = L.paired_row_bootstrap_delta(_pair(-1.0))
+    assert rn['status'] == 'ok' and rn['mean_delta'] < 0 and rn['ci95_delta_ppl'][1] < 0, rn
+    # A paired row bootstrap is not invented when either arm lacks per-row
+    # accounting, when row counts differ, or when nested holdout rows were
+    # reported without their per-row arrays.
+    bad = _pair(+1.0)
+    bad[0][0].pop('nll_per_row')
+    assert L.paired_row_bootstrap_delta(bad)['status'] == 'unverifiable'
+    bad2 = _pair(+1.0)
+    bad2[0][1]['nll_per_row'] = bad2[0][1]['nll_per_row'][:-1]
+    bad2[0][1]['n_tokens_per_row'] = bad2[0][1]['n_tokens_per_row'][:-1]
+    assert L.paired_row_bootstrap_delta(bad2)['status'] == 'unverifiable'
+    bad3 = _pair(+1.0)
+    for _a, _b in bad3:
+        _a['ppl_estimation_rows'] = 'nested_validation_holdout'
+        _b['ppl_estimation_rows'] = 'nested_validation_holdout'
+    assert L.paired_row_bootstrap_delta(bad3)['status'] == 'unverifiable'
+    for _a, _b in bad3:
+        _a['nll_per_row_holdout'] = list(_a['nll_per_row'])[:5]
+        _a['n_tokens_per_row_holdout'] = [50] * 5
+        _b['nll_per_row_holdout'] = list(_b['nll_per_row'])[:5]
+        _b['n_tokens_per_row_holdout'] = [50] * 5
+    rh = L.paired_row_bootstrap_delta(bad3)
+    assert rh['status'] == 'ok' and rh['n_rows'] == 5, rh
+    # The methodology audit attaches the interval to every controlled contrast
+    # (and reports unverifiable rather than inventing rows).
+    fp = ('steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_'
+          'dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX')
+    summary = {}
+    for s in range(6):
+        for arm, off in (('a', 0.0), ('b', -0.2)):
+            nll = [2.0 + off + 0.01 * j for j in range(8)]
+            ntok = [50] * 8
+            ppl = math.exp(sum(nll) / sum(ntok))
+            summary[f'{arm}::seed{s}'] = {
+                'variant': arm, 'seed': s, 'run_cfg': fp, 'steps': 1,
+                'tokens_seen': 400, 'params': 100, 'ppl': ppl,
+                'nll_sum': math.log(ppl) * sum(ntok), 'n_tokens': sum(ntok),
+                'nll_per_row': nll, 'n_tokens_per_row': ntok,
+                'train_knobs': L.training_knobs(),
+            }
+    ra = L.methodology_audit(summary, design={'c': [('a', 'b', 'x')]},
+                             baselines={}, verbose=False)
+    _ent = ra['components']['c'][0]
+    _boot = _ent.get('paired_row_bootstrap_delta') or {}
+    assert _boot.get('status') == 'ok' and _boot.get('n_rows') == 8, _boot
+    # b has the lower NLL, so delta = PPL_a - PPL_b is positive.
+    assert _boot.get('mean_delta') > 0 and _boot.get('ci95_delta_ppl')[0] > 0, _boot
+
 def t_methodology_audit_requires_panel_to_use_tuned_config():
     with tempfile.TemporaryDirectory() as d:
         trials = [{'lr': 3e-4, 'weight_decay': 0.1, 'warmup': 1},
@@ -6500,6 +6572,7 @@ def main():
     _check('L13c build_report twin matches exp_lib audit', t_global_multiplicity_twin_consistency)
     _check('L13d report registers every displayed comparison', t_build_report_global_multiplicity_section)
     _check('L14 combined seed x document uncertainty interval', t_combined_seed_doc_uncertainty)
+    _check('L14b paired evaluation-row bootstrap interval', t_paired_row_bootstrap_delta)
     _check('L15 cross-scale pooling refuses mixed corpus/tokenizer bindings', t_scale_corpus_binding_refuses_mixed_tokenizers)
     _check('L15b scale-point corpus provenance roundtrip', t_scale_point_provenance_roundtrip)
     _check('L16 Holm mixed-n floor + invalid family slot', t_holm_mixed_n_and_invalid_family_size)

@@ -602,6 +602,14 @@ def _run_final(base, outdir, protocol, selected):
                     r['n_tokens_holdout'] = st['n_tokens']
                     r['holdout_row_fp'] = _meta.get('evaluation_row_fp')
                     r['ppl_estimation_rows'] = 'nested_validation_holdout'
+                    # Keep the per-row accounting on the SAME held-out rows as
+                    # the reported PPL.  The full-validation arrays stay for
+                    # context, but a paired row bootstrap must not resample
+                    # rows that selected the hyperparameters.
+                    r['nll_per_row_holdout'] = [float(r['nll_per_row'][int(i)])
+                                                for i in _eval_idx]
+                    r['n_tokens_per_row_holdout'] = [int(r['n_tokens_per_row'][int(i)])
+                                                     for i in _eval_idx]
         else:
             _final_rows_meta['reason'] = ('final records expose different per-row NLL lengths '
                                           'or fewer than 2 rows')
@@ -680,7 +688,7 @@ def _run_final(base, outdir, protocol, selected):
                   'arm_summary': arm_summary,
                   'contrasts': {}}
     for method, baseline in plan:
-        deltas, seeds, skipped = [], [], []
+        deltas, seeds, skipped, pairs = [], [], [], []
         _common = sorted({int(r['seed']) for r in merged.values() if r.get('variant') == method} &
                          {int(r['seed']) for r in merged.values() if r.get('variant') == baseline})
         for seed in _common:
@@ -694,6 +702,7 @@ def _run_final(base, outdir, protocol, selected):
                 continue
             deltas.append(_eval_metric(ra) - _eval_metric(rb))
             seeds.append(seed)
+            pairs.append((ra, rb))
         st = L.paired_effect_stats(deltas)
         _base_mean = (arm_summary.get(baseline) or {}).get('ppl_mean')
         _rel = (100.0 * float(st['mean']) / _base_mean
@@ -704,7 +713,8 @@ def _run_final(base, outdir, protocol, selected):
                    'with_mean': (arm_summary.get(method) or {}).get('ppl_mean'),
                    'without_mean': _base_mean,
                    'relative_effect_pct': _rel,
-                   'mean_pm_std': (f'{st["mean"]:+.4f} +/- {st["std"]:.4f}' if st.get('n') else 'n/a')})
+                   'mean_pm_std': (f'{st["mean"]:+.4f} +/- {st["std"]:.4f}' if st.get('n') else 'n/a'),
+                   'paired_row_bootstrap_delta': L.paired_row_bootstrap_delta(pairs)})
         comparison['contrasts'][f'{method} - {baseline}'] = st
     # The tuned contrasts form their own DECLARED family.  A contrast that is
     # declared but unmeasurable keeps a p=1 slot; dropping it from the family

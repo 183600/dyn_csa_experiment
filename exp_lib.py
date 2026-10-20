@@ -14545,6 +14545,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                             report['warnings'].append(
                                 '%s: the pre-registered hypothesis requires matched capacity, but `%s` vs `%s` does not clear the parameter/breakdown control (%s); the contrast may measure capacity rather than the declared mechanism'
                                 % (comp, a, b, 'unverifiable' if _param_capacity_ok is None else 'capacity differs'))
+                    st['paired_row_bootstrap_delta'] = paired_row_bootstrap_delta(
+                        [(recs[(a, ts, s)], recs[(b, bs, s)]) for s in _passed])
                     entries.append(st)
                     if deltas:
                         _contrast_measured = True
@@ -20367,6 +20369,131 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         out['status'] = 'ok'
     else:
         out['status'] = 'ci_unavailable'
+    return out
+
+def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
+    """Evaluation-row bootstrap CI for a PAIRED token-weighted PPL difference.
+
+    Seed-level tests answer "is the sign stable across training draws"; they do
+    not quantify how much the fixed evaluation rows move the effect.  This
+    helper resamples the SAME rows for both arms and every shared seed (paired
+    by row), recomputes each arm's token-pooled PPL, and returns the percentile
+    CI of mean_s(PPL_a - PPL_b).  It is an evaluation-sample interval only: the
+    training-seed component is deliberately NOT bootstrapped here, so it must
+    not be quoted as a total uncertainty interval and does not replace the
+    exact sign-flip test.
+
+    ``pairs`` is [(record_a, record_b), ...] for shared seeds.  Every record
+    must expose per-row NLL and token counts for the SAME rows; nested holdout
+    records must carry the holdout row arrays.  Missing/mismatched accounting
+    returns an explicit ``unverifiable`` status rather than a narrow interval
+    computed from a different sample.
+    """
+    pairs = list(pairs or [])
+    out = {'status': 'unverifiable', 'n_pairs': len(pairs), 'n_rows': None,
+           'n_boot': int(n_boot), 'n_boot_valid': 0, 'mean_delta': None,
+           'ci95_delta_ppl': None, 'conf': float(conf),
+           'method': 'paired evaluation-row bootstrap of mean_s(PPL_a - PPL_b); '
+                     'row-level uncertainty only, not training-seed uncertainty'}
+
+    def _arrays(rec):
+        if not isinstance(rec, dict):
+            return None
+        nested = rec.get('ppl_estimation_rows') == 'nested_validation_holdout'
+        nll = rec.get('nll_per_row_holdout') if nested else rec.get('nll_per_row')
+        ntok = rec.get('n_tokens_per_row_holdout') if nested else rec.get('n_tokens_per_row')
+        if nested and (nll is None or ntok is None):
+            return None
+        if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
+            return None
+        _tok = [_exact_count(v) for v in ntok]
+        if any(v is None for v in _tok):
+            return None
+        try:
+            _nll = np.asarray(nll, dtype=float)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not np.isfinite(_nll).all():
+            return None
+        return _nll, np.asarray(_tok, dtype=np.int64)
+
+    if not pairs:
+        out['reason'] = 'no shared paired seeds'
+        return out
+    A, B = [], []
+    for a, b in pairs:
+        _a, _b = _arrays(a), _arrays(b)
+        if _a is None or _b is None:
+            out['reason'] = 'a paired record lacks per-row NLL/token accounting for the estimand'
+            return out
+        A.append(_a)
+        B.append(_b)
+    R = len(A[0][0])
+    if R < 2:
+        out['reason'] = f'only {R} evaluation row(s); a row bootstrap needs at least 2'
+        return out
+    if any(len(x[0]) != R or len(y[0]) != R for x, y in zip(A, B)):
+        out['reason'] = 'paired records score different row counts'
+        return out
+    nll_a = np.stack([x[0] for x in A], axis=0)       # [S, R]
+    tok_a = np.stack([x[1] for x in A], axis=0)
+    nll_b = np.stack([x[0] for x in B], axis=0)
+    tok_b = np.stack([x[1] for x in B], axis=0)
+    if (tok_a < 0).any() or (tok_b < 0).any():
+        out['reason'] = 'negative per-row token count'
+        return out
+    # Point estimate on the full rows, equal weight per seed (the same
+    # estimand the paired contrast uses).
+    def _seed_ppls(nll, tok):
+        _den = tok.sum(axis=1).astype(float)
+        _ok = _den > 0
+        _ppl = np.full(_den.shape, np.nan, dtype=float)
+        _ppl[_ok] = np.exp(nll.sum(axis=1)[_ok] / _den[_ok])
+        return _ppl
+    _pa, _pb = _seed_ppls(nll_a, tok_a), _seed_ppls(nll_b, tok_b)
+    _ok = np.isfinite(_pa) & np.isfinite(_pb)
+    if not _ok.any():
+        out['reason'] = 'no seed has a positive-token pooled PPL in both arms'
+        return out
+    out['n_rows'] = int(R)
+    out['n_seeds_used'] = int(_ok.sum())
+    out['mean_delta'] = float(np.mean(_pa[_ok] - _pb[_ok]))
+    rng = np.random.default_rng(_as_seed_int(seed) if _as_seed_int(seed) is not None else 0)
+    vals = np.full(int(n_boot), np.nan, dtype=float)
+    _chunk = 256
+    _b = 0
+    while _b < int(n_boot):
+        _nb = min(_chunk, int(n_boot) - _b)
+        counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb)
+        def _draw(nll, tok):
+            nt = counts @ tok.T.astype(float)          # [nb, S]
+            nn = counts @ nll.T                         # [nb, S]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ppl = np.exp(nn / np.where(nt > 0, nt, np.nan))
+            return np.where(np.isfinite(ppl), ppl, np.nan)
+        da = _draw(nll_a, tok_a)
+        db = _draw(nll_b, tok_b)
+        diff = da - db
+        _valid = np.isfinite(diff)
+        _cnt = _valid.sum(axis=1)
+        _sum = np.where(_valid, diff, 0.0).sum(axis=1)
+        vals[_b:_b + _nb] = np.where(_cnt > 0, _sum / np.maximum(_cnt, 1), np.nan)
+        _b += _nb
+    vals = vals[np.isfinite(vals)]
+    out['n_boot_valid'] = int(vals.size)
+    if vals.size < max(20, int(0.5 * int(n_boot))):
+        out['reason'] = 'too few finite bootstrap draws'
+        return out
+    try:
+        _a = _validated_alpha(conf, context='paired_row_bootstrap_delta conf')
+    except ValueError:
+        _a = 0.05
+    lo, hi = np.percentile(vals, [100.0 * _a / 2.0, 100.0 * (1.0 - _a / 2.0)])
+    out['ci95_delta_ppl'] = [float(lo), float(hi)]
+    out['status'] = 'ok'
+    out['note'] = ('paired rows keep the two arms on the same evaluation documents; '
+                   'the interval covers row-sampling uncertainty only.  It is not a '
+                   'substitute for the seed-level exact sign-flip p-value.')
     return out
 
 def aggregate(summary):
