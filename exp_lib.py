@@ -14679,7 +14679,12 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             if _base_cands:
                 _cands = _base_cands
             if _cands:
-                _ref_key, _ref = min(_cands, key=lambda kv: float(kv[1]['ppl_mean']))
+                # The primary endpoint is token-pooled PPL.  Choosing the
+                # reference arm by its arithmetic mean can select a different
+                # arm than the one with the best reported (pooled) endpoint;
+                # the floor comparison must use the declared estimand.
+                _ref_key, _ref = min(
+                    _cands, key=lambda kv: float(kv[1].get('ppl_primary', kv[1]['ppl_mean'])))
                 _panel_val_fps = {r.get('val_fp') for r in recs.values() if r.get('val_fp')}
                 _panel_eval_fps = {r.get('eval_fp') for r in recs.values() if r.get('eval_fp')}
                 _panel_holdout_fps = {r.get('holdout_row_fp') for r in recs.values()

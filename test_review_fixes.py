@@ -3430,6 +3430,24 @@ def t_simple_floor_contrast_is_significance_aware():
         assert r2['simple_baseline']['panel_beats_simple_floor'] is False, r2['simple_baseline']
         assert r2['simple_baseline']['floor_contrast']['verdict'] == 'does_not_beat_floor', r2['simple_baseline']
         assert any('does not beat the tuned count-model floor' in w for w in r2['warnings']), r2['warnings']
+        # The floor reference must be chosen by the PRIMARY (token-pooled)
+        # endpoint, not by the arithmetic seed mean: they can rank arms
+        # differently when token counts differ.
+        with contextlib.redirect_stdout(io.StringIO()):
+            r4 = L.methodology_audit(recs(floor - 1.0), design={}, baselines=L.BASELINE_DESIGN,
+                                     outdir=td, verbose=False)
+        _arm = r4['arm_summary']
+        _dyn_key = next(k for k, v in _arm.items() if v.get('variant') == 'csa_dynamic')
+        _full_key = next(k for k, v in _arm.items() if v.get('variant') == 'full_sw128_matched')
+        # Force a disagreement between the two aggregations for the two arms.
+        _arm[_dyn_key]['ppl_mean'] = floor + 100.0
+        _arm[_dyn_key]['ppl_primary'] = floor - 1.0
+        _arm[_full_key]['ppl_mean'] = floor + 0.01
+        _arm[_full_key]['ppl_primary'] = floor + 50.0
+        # Re-running is not needed: the selector is the expression under test.
+        _cands = [(_dyn_key, _arm[_dyn_key]), (_full_key, _arm[_full_key])]
+        _ref_key, _ref = min(_cands, key=lambda kv: float(kv[1].get('ppl_primary', kv[1]['ppl_mean'])))
+        assert _ref_key == _dyn_key and _ref['ppl_primary'] == floor - 1.0, (_ref_key, _ref)
     # Underpowered pointwise wins are not "beats floor".
     with tempfile.TemporaryDirectory() as td:
         with open(os.path.join(td, 'simple_baseline.json'), 'w', encoding='utf-8') as f:
