@@ -7341,6 +7341,37 @@ def t_audit_leakage_missing_id_cache_is_not_ok():
     finally:
         shutil.rmtree(cache, ignore_errors=True)
 
+
+def t_v12_binds_current_train_cache_to_frozen_stream():
+    # P5T must not pair a newly rebuilt train/test cache with checkpoints
+    # trained on a different token stream.
+    d = tempfile.mkdtemp(prefix='v12_cache_bind_')
+    try:
+        for name, fp in (('meta_v5_a.json', 'FROZEN'), ('meta_v5_b.json', 'OTHER'),
+                         ('meta_v5_c.json', None)):
+            with open(os.path.join(d, name), 'w', encoding='utf-8') as f:
+                json.dump({} if fp is None else {'src_fp': fp}, f)
+        assert V12._current_train_cache_fps(d) == {'FROZEN', 'OTHER'}
+        assert V12._require_current_train_cache_fp('FROZEN', d) is True
+        try:
+            V12._require_current_train_cache_fp('MISSING', d)
+        except SystemExit as e:
+            assert 'different token stream' in str(e), e
+        else:
+            raise AssertionError('a mismatched frozen train fingerprint was accepted')
+        empty = tempfile.mkdtemp(prefix='v12_cache_empty_')
+        try:
+            try:
+                V12._require_current_train_cache_fp('FROZEN', empty)
+            except SystemExit as e:
+                assert 'no train-cache meta' in str(e), e
+            else:
+                raise AssertionError('a missing train cache was accepted')
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -7582,6 +7613,7 @@ def main():
     _check('L28 gapfill numeric reader rejects booleans', t_gapfill_numeric_reader_rejects_booleans)
     _check('L29 release tags cannot escape the archive directory', t_release_tag_cannot_escape_output_dir)
     _check('L30 missing id cache/sidecars is not a clean leakage audit', t_audit_leakage_missing_id_cache_is_not_ok)
+    _check('L31 v12 binds the local train cache to the frozen train stream', t_v12_binds_current_train_cache_to_frozen_stream)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

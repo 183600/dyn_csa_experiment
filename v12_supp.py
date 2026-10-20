@@ -469,6 +469,47 @@ def _frozen_train_fp(manifest):
     return None
 
 
+def _current_train_cache_fps(cache_dir=None):
+    """Training-stream fingerprints declared by the LOCAL train caches.
+
+    ``load_wikitest`` binds the test ids to whatever train cache is present,
+    but the frozen plan binds them to the corpus the checkpoints actually saw
+    (``data_fp`` / ``train_fp``).  Without joining the two, a rebuilt train
+    cache with a different id stream could pair a fresh test split with
+    checkpoints trained on the old corpus.
+    """
+    import glob as _glob
+    d = L._wt_cache_dir(cache_dir)
+    fps = set()
+    for mp in _glob.glob(os.path.join(d, 'meta_v5_*.json')):
+        try:
+            m = json.load(open(mp, encoding='utf-8'))
+        except Exception:
+            continue
+        if not isinstance(m, dict):
+            continue
+        fp = m.get('src_fp') or m.get('train_fp')
+        if isinstance(fp, str) and fp:
+            fps.add(fp)
+    return fps
+
+
+def _require_current_train_cache_fp(want, cache_dir=None):
+    """Refuse when the current train cache is not the frozen training stream."""
+    fps = _current_train_cache_fps(cache_dir)
+    if not fps:
+        raise SystemExit(
+            'REFUSE: no train-cache meta with a source fingerprint is present '
+            '— the test split cannot be bound to the frozen training corpus')
+    if str(want) not in fps:
+        raise SystemExit(
+            f'REFUSE: the current train cache source fingerprint(s) {sorted(fps)} '
+            f'do not include the frozen training fingerprint {want} — the test '
+            'split would be paired with checkpoints trained on a different '
+            'token stream; rebuild/restore the frozen cache before P5T')
+    return True
+
+
 def _frozen_implementation(manifest):
     """Implementation-mode bindings declared by the frozen plan, if any.
 
@@ -963,6 +1004,11 @@ def run_finaltest(cfg=None, guard=None):
     # one-shot test read rather than discovering it per-cell afterwards.
     if not _smoke and _train_fp_required(manifest) and _want_train_fp is None:
         raise SystemExit('[v12] REFUSE: the frozen manifest declares a training-corpus binding but no training_fp can be derived from the frozen records — run P5C/P3MT/P4MT first and keep their summary.json; refusing to read the held-out split under an unpinned corpus')
+    # Bind the LOCAL train/test cache pair to the training stream the frozen
+    # checkpoints actually saw.  load_wikitest proves test==current train
+    # tokenizer; this proves current train==frozen training corpus.
+    if not _smoke and _want_train_fp is not None:
+        _require_current_train_cache_fp(_want_train_fp)
     _lock_path = _freeze_lock_path(outdir)
     if os.path.exists(os.path.join(outdir, 'bylen.json')) and not os.path.exists(_lock_path):
         raise SystemExit(f'[v12] REFUSE: {outdir}/bylen.json exists but there is no pre-access freeze lock — the only honest interpretation is that a test-split measurement predates the lock; investigate before reusing it')
