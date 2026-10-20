@@ -834,7 +834,8 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
   `OBJECTIVE_INTERVENTION_KEYS` 中 `compression_regularizer` 的
   comp-reg 项与 `task_learned_boundary` 的 boundary-policy 项是干预本身，
   记录为 `objective_expected_differences`；任何未声明的目标差异仍然
-  判为 system-level。
+  判为 system-level。`audit_fairness` 也在面板级报告跨臂
+  `objective_equal`，目标不一致作为警告而不是静默通过。
 - 参数量匹配容差统一为 1%（`_param_control` 与报告共用）；冻结确认的
   准入还检查 params 相对差与完整 seed 覆盖。
 

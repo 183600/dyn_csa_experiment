@@ -15866,6 +15866,7 @@ def controlled_variables_report(recs, arms):
 
     run_cfg = _control(lambda r: _canon_setting(r.get('run_cfg')))
     train_knobs = _control(lambda r: _canon_setting(r.get('train_knobs')))
+    objective = _control(lambda r: _canon_setting(r.get('train_objective')))
     hyper = {}
     for key in _CONTROL_HYPER_KEYS:
         hyper[key] = _control(
@@ -15924,6 +15925,8 @@ def controlled_variables_report(recs, arms):
         'n_records': {a: sum(1 for (v, _t, _s) in recs if v == a) for a in arms},
         'run_cfg_equal': run_cfg['equal'],
         'train_knobs_equal': train_knobs['equal'],
+        'objective_equal': objective['equal'],
+        'objective_values': objective['values'],
         'hyperparams_equal': hp_equal,
         'controlled': controlled,
         'within_arm_mixed': mixed,
@@ -15931,6 +15934,7 @@ def controlled_variables_report(recs, arms):
         'setting_coverage': {
             'run_cfg': {'n_records': run_cfg['n_records'], 'n_missing': run_cfg['n_missing']},
             'train_knobs': {'n_records': train_knobs['n_records'], 'n_missing': train_knobs['n_missing']},
+            'objective': {'n_records': objective['n_records'], 'n_missing': objective['n_missing']},
             'hyperparams': {k: {'n_records': hyper[k]['n_records'], 'n_missing': hyper[k]['n_missing']}
                             for k in hp_checked},
         },

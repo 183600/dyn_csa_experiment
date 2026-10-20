@@ -1555,6 +1555,13 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
                 problems.append('train_knobs differ across arms (optimizer / betas / eps / lr-schedule / grad-clip / augmentation) — a gain from a different optimizer is not a gain from the method')
             if cv.get('hyperparams_equal') is False:
                 problems.append('structured hyperparameters differ across arms: ' + ', '.join(cv.get('hyperparam_differences') or []) + ' — the comparison is not fully controlled')
+            _obj_vals = cv.get('objective_values') or {}
+            if cv.get('objective_equal') is False:
+                warnings.append('training objectives differ across arms (' + ', '.join(
+                    '%s=%d value(s)' % (a, len(v)) for a, v in sorted(_obj_vals.items())) +
+                    ') — this is a system-level comparison unless the objective change is the declared intervention; do not describe it as an isolated mechanism')
+            elif cv.get('objective_equal') is None and any(_obj_vals.values()):
+                warnings.append('training-objective equality across arms is UNVERIFIABLE (some records omit the descriptor) — mechanism attribution needs the objective descriptor on every seed')
             for _arm in cv.get('within_arm_mixed') or []:
                 problems.append(f'{_arm}: seeds mix DIFFERENT run_cfg/train_knobs/hyperparameter values inside one arm')
             for _key in ('run_cfg', 'train_knobs', 'hyperparams'):

@@ -232,6 +232,10 @@ touched.
   `system_level_only` confound.
 - **Run-time seed plan:** `run_gapfill.run_full` prints every phase's
   family-corrected minimum seed count before spending GPU time.
+- **Fairness audit:** `audit_fairness` now surfaces cross-arm
+  `train_objective` disagreement as a warning (system-level comparison unless
+  the objective change is the declared intervention), alongside the existing
+  run_cfg / train_knobs / hyperparameter checks.
 
 ## 2026-10-20 — nested validation for tuned baselines (no new runs)
 

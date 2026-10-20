@@ -1582,8 +1582,11 @@ def t_seed_coverage_warning():
 def t_fairness_cross_arm_controls():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     knobs = L.training_knobs()
+    obj = {'comp_reg_applies': True, 'comp_lambda_effective': 0.05,
+           'delta_lr_effective': 10.0, 'boundary_policy': ['threshold'],
+           'loss_terms': ['ce', 'comp_reg']}
 
-    def _panel(*, knob_override=None, drop_seed=None):
+    def _panel(*, knob_override=None, drop_seed=None, obj_override_arm=None):
         s = {}
         for i in range(3):
             for arm, ppl in (('a', 10.0), ('b', 11.0)):
@@ -1592,9 +1595,12 @@ def t_fairness_cross_arm_controls():
                 kk = dict(knobs)
                 if knob_override == (arm, i):
                     kk['grad_clip_norm'] = 2.0
+                oo = dict(obj)
+                if obj_override_arm == arm:
+                    oo['boundary_policy'] = ['reinforce']
                 s[f'{arm}::seed{i}'] = dict(
                     variant=arm, seed=i, run_cfg=fp, steps=1, tokens_seen=1,
-                    ppl=ppl, params=100, train_knobs=kk)
+                    ppl=ppl, params=100, train_knobs=kk, train_objective=oo)
         return s
 
     with tempfile.TemporaryDirectory() as td:
@@ -1607,7 +1613,14 @@ def t_fairness_cross_arm_controls():
 
         ok = _run(_panel())
         assert ok['controlled_variables']['train_knobs_equal'] is True, ok['controlled_variables']
+        assert ok['controlled_variables']['objective_equal'] is True, ok['controlled_variables']
         assert not any('train_knobs differ' in p for p in ok['problems']), ok['problems']
+        # A different objective in one arm is a system-level confound; surface
+        # it as a warning instead of silently calling the pair controlled.
+        od = _run(_panel(obj_override_arm='b'))
+        assert od['controlled_variables']['objective_equal'] is False, od['controlled_variables']
+        assert any('training objectives differ' in w for w in od['warnings']), od['warnings']
+        assert od['status'] == 'warn', od['status']
         # A different optimizer/clip in ONE arm must fail even when every arm
         # is internally consistent.
         bad = _run(_panel(knob_override=('b', 1)))
