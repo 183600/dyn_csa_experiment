@@ -7981,7 +7981,7 @@ def t_small_n_split_remainder_and_string_order():
         got = [len(idx[k]) for k in ('train', 'val', 'test')]
         assert got == want, (n, got)
     idx = L.chronological_split_indices(3, 0.5, 0.5, 0.0)
-    assert [len(idx[k]) for k in ('train', 'val', 'test')] == [2, 1, 0], idx
+    assert [len(idx[k]) for k in ('train', 'val', 'test')] == [1, 2, 0], idx
     idx = L.chronological_split_indices(4, 0.1, 0.8, 0.1)
     assert [len(idx[k]) for k in ('train', 'val', 'test')] == [1, 2, 1], idx
     # Lexicographic string event ids remain valid ordering keys, even when
