@@ -3142,6 +3142,19 @@ def t_nested_tuning_artifact_audit():
     ok = L.baseline_tuning_audit(art, protocol=protocol)
     assert ok['tuning_verified'] is True, ok
     assert ok['selection_row_split_applied'] is True and ok['nested_final_evaluation'] is True, ok
+    # A winner inside one standard error of the runner-up is a tie, not a
+    # uniquely tuned optimum.  The audit recomputes the margin, warns, and
+    # refuses a self-reported margin that does not match the trials.
+    tie = json.loads(json.dumps(art))
+    tie['arms']['a']['trials'][1] = _row(trials[1], [100, 101, 99])
+    rt = L.baseline_tuning_audit(tie, protocol=protocol)
+    assert rt['tuning_verified'] is True, rt
+    assert any('inside one standard error' in w for w in rt['warnings']), rt['warnings']
+    fake = json.loads(json.dumps(art))
+    fake['arms']['a']['selection_margin'] = 123.0
+    rf = L.baseline_tuning_audit(fake, protocol=protocol)
+    assert rf['tuning_verified'] is False, rf
+    assert any('selection_margin' in p for p in rf['problems']), rf
     # A claimed nested run without held-out final rows is refused: the tuned
     # contrast would otherwise fall back to the selection documents.
     bad = json.loads(json.dumps(art))
@@ -3364,6 +3377,12 @@ def t_baseline_tuning_driver_multiseed_selection():
             assert row['n_seeds'] == 3 and len(row['seed_ppls']) == 3, row
             assert abs(row['ppl'] - float(np.mean(list(row['seed_ppls'].values())))) < 1e-12, row
         assert entry['selected']['lr'] == 3e-4, (arm, entry['selected'])
+        # Selection uncertainty is recorded, not hidden: the winning config is
+        # compared with the runner-up in standard-error units.
+        assert entry['selection_margin'] is not None and entry['selection_margin'] > 0, entry
+        assert entry['selection_margin_in_se'] is not None, entry
+        assert entry['selection_decisive'] is True, entry
+        assert entry['runner_up'] is not None and entry['runner_up']['config'] != entry['selected'], entry
 
 
 def t_simple_baseline_ngram_and_audit():

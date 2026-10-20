@@ -13057,6 +13057,55 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                                 'pick may be a single-seed draw')
         elif _stab.get('status') == 'insufficient_seeds':
             warnings.append(f'{arm}: selections stability is unverifiable — {_stab.get("reason")}')
+        # Selection uncertainty: the raw argmin may beat the runner-up by less
+        # than one standard error, in which case the "winner" is not
+        # distinguishable from the next config.  Recompute the margin from the
+        # trial records (do not trust a self-reported value) and warn.
+        _ranked = sorted([t for t in trials if isinstance(t, dict)
+                          and _finite_scalar(t.get(metric)) is not None],
+                         key=lambda t: _finite_scalar(t.get(metric)),
+                         reverse=(direction == 'higher_is_better'))
+        _distinct = []
+        _seen_sig = set()
+        for _t in _ranked:
+            _sig = json.dumps(_t.get('config') or {}, sort_keys=True, default=str)
+            if _sig in _seen_sig:
+                continue
+            _seen_sig.add(_sig)
+            _distinct.append(_t)
+        _margin = _margin_se = _margin_z = None
+        _decisive = None
+        if len(_distinct) >= 2:
+            try:
+                _v1 = float(_finite_scalar(_distinct[0].get(metric)))
+                _v2 = float(_finite_scalar(_distinct[1].get(metric)))
+                _margin = (_v2 - _v1) if direction == 'lower_is_better' else (_v1 - _v2)
+                _n1 = max(1, int(_exact_count(_distinct[0].get('n_seeds'), minimum=1) or 1))
+                _n2 = max(1, int(_exact_count(_distinct[1].get('n_seeds'), minimum=1) or 1))
+                _s1 = abs(float(_finite_scalar(_distinct[0].get('ppl_std')) or 0.0)) / math.sqrt(_n1)
+                _s2 = abs(float(_finite_scalar(_distinct[1].get('ppl_std')) or 0.0)) / math.sqrt(_n2)
+                _margin_se = math.hypot(_s1, _s2)
+                _margin_z = (_margin / _margin_se) if _margin_se > 0 else None
+                _decisive = bool(_margin > _margin_se)
+            except (TypeError, ValueError, OverflowError):
+                _margin = _margin_se = _margin_z = None
+                _decisive = None
+        if _decisive is False:
+            warnings.append(
+                f'{arm}: the selected config beats the runner-up by only {_margin:.4g} '
+                f'{metric} (SE {_margin_se:.4g}) — the pick is inside one standard error; '
+                'report it as a tie/uncertain choice, not as the uniquely tuned optimum')
+        _rec_margin = _finite_scalar(entry.get('selection_margin'))
+        if _rec_margin is not None and _margin is not None and abs(_rec_margin - _margin) > 1e-9:
+            problems.append(
+                f'{arm}: recorded selection_margin={_rec_margin} does not match the '
+                f'margin between the selected and runner-up trials ({_margin})')
+        _rec_decisive = entry.get('selection_decisive')
+        if isinstance(_rec_decisive, (bool, np.bool_)) and _decisive is not None:
+            if bool(_rec_decisive) != _decisive:
+                problems.append(
+                    f'{arm}: recorded selection_decisive={bool(_rec_decisive)} but '
+                    f'recomputed margin/SE gives {_decisive}')
         vals = [f for f in (_finite_scalar(t.get(metric)) for t in trials
                              if isinstance(t, dict)) if f is not None]
         chosen_value = entry.get('selected_metric_value')

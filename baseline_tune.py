@@ -23,6 +23,7 @@ The held-out test split is NEVER read here.  Hyperparameters are selected on
 the validation split; the final comparison re-uses exactly those selections.
 """
 import json
+import math
 import os
 import sys
 import time
@@ -369,6 +370,29 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         if not hits:
             raise RuntimeError(f'[tune] {arm}: no usable trial PPL — cannot select a config')
         best = min(hits, key=lambda t: float(t['ppl']))
+        # A raw argmin over noisy trial means can crown a config that is
+        # statistically indistinguishable from the runner-up.  Record the
+        # margin in units of its standard error so the audit can warn that
+        # "selected" is not "uniquely best".  This does NOT change selection;
+        # it makes the uncertainty of the selection itself visible.
+        _ranked = sorted(hits, key=lambda t: float(t['ppl']))
+        _runner = _ranked[1] if len(_ranked) > 1 else None
+        _sel_margin = _sel_margin_se = _sel_margin_z = None
+        _sel_decisive = None
+        if _runner is not None:
+            try:
+                _sel_margin = float(_runner['ppl']) - float(best['ppl'])
+                _nb = max(1, int(best.get('n_seeds') or 1))
+                _nr = max(1, int(_runner.get('n_seeds') or 1))
+                _sb = float(best.get('ppl_std') or 0.0) / math.sqrt(_nb)
+                _sr = float(_runner.get('ppl_std') or 0.0) / math.sqrt(_nr)
+                _sel_margin_se = math.hypot(_sb, _sr)
+                _sel_margin_z = (_sel_margin / _sel_margin_se
+                                 if _sel_margin_se > 0 else None)
+                _sel_decisive = bool(_sel_margin > _sel_margin_se)
+            except (TypeError, ValueError, OverflowError):
+                _sel_margin = _sel_margin_se = _sel_margin_z = None
+                _sel_decisive = None
         _stability = L.tuning_selection_stability(
             per_arm[arm], metric=protocol['selection_metric'],
             direction=protocol['direction'])
@@ -377,6 +401,13 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                                  default=str) if _stability.get('choices') else None
         selected[arm] = {'selected': dict(best['config']),
                          'selected_metric_value': float(best['ppl']),
+                         'selection_margin': _sel_margin,
+                         'selection_margin_se': _sel_margin_se,
+                         'selection_margin_in_se': _sel_margin_z,
+                         'selection_decisive': _sel_decisive,
+                         'runner_up': ({'config': dict(_runner['config']),
+                                        'ppl': float(_runner['ppl'])}
+                                       if _runner is not None else None),
                          'params': best.get('params'), 'run_cfg': best.get('run_cfg'),
                          'selection_stability': _stability,
                          'selected_is_loo_stable': bool(
@@ -388,6 +419,10 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         if _stability.get('status') == 'ok' and not _stability.get('stable'):
             print(f'[tune] WARNING: {arm}: the selected config changes when one search seed is dropped '
                   f'({_stability.get("n_distinct_configs")} distinct winners) — the "tuned" pick is seed-driven')
+        if _sel_decisive is False:
+            print(f'[tune] WARNING: {arm}: the selected config is only {_sel_margin:.4g} PPL better '
+                  f'than the runner-up (SE {_sel_margin_se:.4g}) — the winner is inside one standard '
+                  'error; do not describe it as the uniquely best setting')
     artifact_protocol = dict(protocol)
     artifact_protocol['arms'] = list(arms)
     artifact_protocol['trials'] = [dict(t) for t in trials]
