@@ -275,6 +275,38 @@ def _ppl_ok(v):
     f = _as_finite(v)
     return f is not None and f > 0.0
 
+def _primary_ppl(rec):
+    """Per-seed PPL on the record's PRIMARY estimand.
+
+    A nested tuning record keeps the full-validation value in ``ppl`` and the
+    held-out-row estimate in ``ppl_holdout`` (or its holdout NLL accounting).
+    A paired delta that reads ``ppl`` would silently use the rows that selected
+    the hyper-parameters.  A record that declares the nested estimand but has
+    no holdout accounting is unverifiable and returns None.
+    """
+    if not isinstance(rec, dict):
+        return None
+    if rec.get('ppl_estimation_rows') == 'nested_validation_holdout':
+        v = _as_finite(rec.get('ppl_holdout'))
+        if v is not None and v > 0.0:
+            return v
+        nll = _as_finite(rec.get('nll_sum_holdout'))
+        ntok = _int_or(rec.get('n_tokens_holdout'), None)
+        if nll is not None and ntok is not None and ntok > 0:
+            return math.exp(nll / ntok)
+        _nll = rec.get('nll_per_row_holdout')
+        _ntok = rec.get('n_tokens_per_row_holdout')
+        if isinstance(_nll, list) and isinstance(_ntok, list) and _nll and len(_nll) == len(_ntok):
+            _v = [_as_finite(x) for x in _nll]
+            _t = [_int_or(x, None) for x in _ntok]
+            if all(x is not None for x in _v) and all(x is not None and x > 0 for x in _t):
+                _tot = sum(_t)
+                if _tot > 0:
+                    return math.exp(sum(_v) / _tot)
+        return None
+    v = _as_finite(rec.get('ppl'))
+    return v if v is not None and v > 0.0 else None
+
 def _finite_or_none(v):
     return _as_finite(v)
 
@@ -558,7 +590,11 @@ def paired_row(a_records, b_records):
         if reason:
             skipped.append(s)
             continue
-        dl.append(a_records[s]['ppl'] - b_records[s]['ppl'])
+        _da, _db = _primary_ppl(a_records[s]), _primary_ppl(b_records[s])
+        if _da is None or _db is None:
+            skipped.append(s)
+            continue
+        dl.append(_da - _db)
         kept.append(s)
     if skipped:
         print(f'[report] {len(skipped)}/{len(common)} seed(s) NOT paired ({skipped}); excluded from the sign-flip test')
@@ -770,7 +806,11 @@ def sec_p0w():
                 if reason:
                     _gated += 1
                     continue
-                _dd.append(_wm[sd]['ppl'] - _bm[sd]['ppl'])
+                _da, _db = _primary_ppl(_wm[sd]), _primary_ppl(_bm[sd])
+                if _da is None or _db is None:
+                    _gated += 1
+                    continue
+                _dd.append(_da - _db)
             if _gated:
                 print(f'[report] sec_p0w `{v}` warm={w}: {_gated}/{len(_shared)} seed(s) NOT paired (run_cfg/steps gate); excluded from the sign-flip test')
             _st = exact_signflip(_dd) if _dd else None

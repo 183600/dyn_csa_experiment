@@ -6841,6 +6841,36 @@ def t_validation_row_split_group_aware():
     assert not ({str(_nat[i]) for i in _s} & {str(_nat[i]) for i in _e}), (_s, _e)
 
 
+def t_build_report_primary_estimand():
+    # The zero-GPU report must pair on the same held-out rows as the nested
+    # primary PPL; reading the full-validation `ppl` restores selection rows.
+    def _rec(full, hold, seed=0):
+        return {'variant': 'a', 'seed': seed, 'ppl': full, 'ppl_holdout': hold,
+                'ppl_estimation_rows': 'nested_validation_holdout',
+                'nll_sum_holdout': math.log(hold) * 40, 'n_tokens_holdout': 40,
+                'run_cfg': 'cfg', 'steps': 1, 'tokens_seen': 40,
+                'data_fp': 'd', 'val_fp': 'v', 'eval_fp': 'e'}
+    a = _rec(10.0, 9.0)
+    b = _rec(10.5, 10.5)
+    assert BR._primary_ppl(a) == 9.0 and BR._primary_ppl(b) == 10.5
+    got = BR.paired_row({('', 0): a}, {('', 0): b})
+    assert got is not None and got[1] == [9.0 - 10.5], got
+    # Holdout per-row accounting is an alternative to ppl_holdout.
+    rows = dict(a)
+    for _k in ('ppl_holdout', 'nll_sum_holdout', 'n_tokens_holdout'):
+        rows.pop(_k)
+    rows['nll_per_row_holdout'] = [math.log(9.0) * 40]
+    rows['n_tokens_per_row_holdout'] = [40]
+    assert abs(BR._primary_ppl(rows) - 9.0) < 1e-12, rows
+    # A declared-nested record without any holdout accounting is unverifiable,
+    # and the pair is omitted rather than quoting the full-validation value.
+    bad = dict(a)
+    for _k in ('ppl_holdout', 'nll_sum_holdout', 'n_tokens_holdout'):
+        bad.pop(_k)
+    assert BR._primary_ppl(bad) is None
+    assert BR.paired_row({('', 0): bad}, {('', 0): b}) is None
+
+
 def t_build_report_exact_seed_and_params():
     # The zero-GPU report reader must share exp_lib's exact-integer contract:
     # int(Decimal('1.5')) would silently pair the wrong run, and a fractional
@@ -7338,6 +7368,7 @@ def main():
     _check('L21a checkpoint stamp names the actual backend', t_checkpoint_stamp_matches_the_actual_backend)
     _check('L21b indexer chunked path uses only the filled rows', t_indexer_chunked_final_tile_uses_active_rows)
     _check('L22 parallel watchdog override validation', t_par_watchdog_override_validation)
+    _check('L24 build report pairs on the primary holdout estimand', t_build_report_primary_estimand)
     _check('L22b build report exact seed/parameter contracts', t_build_report_exact_seed_and_params)
     _check('L23 methodology/scale gates fail closed on malformed inputs', t_methodology_gate_fail_closed_edges)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
