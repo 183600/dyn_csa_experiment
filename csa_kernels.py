@@ -2374,8 +2374,12 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
                                   K=k_out, BB=BB2, HAS_SOFT=bool(need_soft),
                                   num_warps=8 if BB2 >= 1024 else 4)
         else:
+            # The final chunk may be shorter than the allocated tile.  Pass
+            # only the rows idx_score actually filled; otherwise the helper
+            # returns [R, T_c, k] and the assignment below fails (and stale
+            # rows are treated as queries beyond T).
             _i, _v, _s = _indexer_topk_chunked(
-                scores, last_tok, t0, T, Bm, k_out, bool(need_soft), qI.dtype)
+                scores[:, :tc], last_tok, t0, T, Bm, k_out, bool(need_soft), qI.dtype)
             idx[:, t0:t0 + tc] = _i
             valid_i8[:, t0:t0 + tc] = _v.to(torch.int8)
             if soft is not None:

@@ -6076,6 +6076,47 @@ def t_attention_backward_partial_head_group():
             os.environ['CSA_ATTN_GRAD_SLAB_MB'] = old
 
 
+def t_indexer_chunked_final_tile_uses_active_rows():
+    # The Bm>8192 fallback allocates a [R, T_c, Bm] score tile but the last
+    # chunk may fill only tc < T_c rows.  The caller must pass the active rows
+    # to the chunked top-k helper, or the [R,T_c,k] result cannot be assigned
+    # into idx[:, t0:t0+tc] (and stale rows become fake queries).
+    import types
+    import csa_kernels as C
+    R, T, nIH, hd, Bm, k = 1, 3, 1, 2, 8193, 2
+
+    class _Launch:
+        def __getitem__(self, _grid):
+            return self
+        def __call__(self, *args, **kwargs):
+            return None
+
+    fake = types.SimpleNamespace(
+        triton=types.SimpleNamespace(cdiv=lambda a, b: (a + b - 1) // b),
+        idx_score=_Launch())
+    seen = []
+
+    def _helper(scores, last_tok, t0, T_, Bm_, k_out, need_soft, out_dtype):
+        seen.append((int(scores.shape[1]), int(t0)))
+        _r, _tc = int(scores.shape[0]), int(scores.shape[1])
+        return (torch.zeros((_r, _tc, k_out), dtype=torch.int32),
+                torch.zeros((_r, _tc, k_out), dtype=torch.bool), None)
+
+    _old = (C._kernels, C._IDX_SCORES_CAP_BYTES, C._indexer_topk_chunked)
+    try:
+        C._kernels = lambda: fake
+        C._IDX_SCORES_CAP_BYTES = 2 * R * Bm * 4  # T_c = 2 for T = 3
+        C._indexer_topk_chunked = _helper
+        idx, valid, soft = C._indexer_fwd_triton(
+            torch.randn(R, T, nIH, hd), torch.randn(R, Bm, nIH, hd),
+            torch.randn(nIH, hd), torch.zeros(R, Bm, dtype=torch.long),
+            k, need_soft=False)
+    finally:
+        C._kernels, C._IDX_SCORES_CAP_BYTES, C._indexer_topk_chunked = _old
+    assert seen == [(2, 0), (1, 2)], seen
+    assert idx.shape == (R, T, k) and valid.shape == (R, T, k), (idx.shape, valid.shape)
+
+
 def t_stats_accept_numpy_scalars():
     # Public numeric helpers are routinely fed NumPy arrays/scalars.  An:
     # isinstance(int, float) filter would drop every np.int64 / np.float32
@@ -6794,6 +6835,7 @@ def main():
     _check('L19 batch_iter minimal corpus', t_batch_iter_minimal_corpus)
     _check('L20 indexer invalid soft lanes are zero', t_indexer_invalid_soft_lanes_are_zero)
     _check('L21 attention backward partial head group', t_attention_backward_partial_head_group)
+    _check('L21b indexer chunked path uses only the filled rows', t_indexer_chunked_final_tile_uses_active_rows)
     _check('L22 parallel watchdog override validation', t_par_watchdog_override_validation)
     _check('L22b build report exact seed/parameter contracts', t_build_report_exact_seed_and_params)
     _check('L23 methodology/scale gates fail closed on malformed inputs', t_methodology_gate_fail_closed_edges)
