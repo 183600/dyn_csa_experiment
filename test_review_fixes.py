@@ -2903,6 +2903,13 @@ def t_paired_row_bootstrap_delta():
     assert r['n_seeds_used'] == 8, r
     # Deterministic draws for the same seed.
     assert L.paired_row_bootstrap_delta(_pair(+1.0))['ci95_delta_ppl'] == r['ci95_delta_ppl']
+    # `conf` is coverage, not a tail probability: a 95% interval must be at
+    # least as wide as a 50% interval on the same draws.  (Using conf as
+    # alpha silently produced a 5% interval here.)
+    _lo50 = L.paired_row_bootstrap_delta(_pair(+1.0), conf=0.50)
+    _w95 = r['ci95_delta_ppl'][1] - r['ci95_delta_ppl'][0]
+    _w50 = _lo50['ci95_delta_ppl'][1] - _lo50['ci95_delta_ppl'][0]
+    assert _w95 > _w50, (r['ci95_delta_ppl'], _lo50['ci95_delta_ppl'])
     rn = L.paired_row_bootstrap_delta(_pair(-1.0))
     assert rn['status'] == 'ok' and rn['mean_delta'] < 0 and rn['ci95_delta_ppl'][1] < 0, rn
     # A paired row bootstrap is not invented when either arm lacks per-row

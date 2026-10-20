@@ -20716,7 +20716,11 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
         out['reason'] = 'too few finite bootstrap draws'
         return out
     try:
-        _a = _validated_alpha(conf, context='paired_row_bootstrap_delta conf')
+        # `conf` is a coverage probability (e.g. 0.95), not a tail
+        # probability.  Using it directly as alpha made the nominal 95%
+        # interval a 5% interval (narrower than the 50% one).
+        _conf = _validated_alpha(conf, context='paired_row_bootstrap_delta conf')
+        _a = 1.0 - _conf
     except ValueError:
         _a = 0.05
     lo, hi = np.percentile(vals, [100.0 * _a / 2.0, 100.0 * (1.0 - _a / 2.0)])
