@@ -3,7 +3,7 @@ name: Continuous Loop
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/15 * * * *'
 
 concurrency:
   group: continuous-loop
@@ -199,11 +199,14 @@ jobs:
           PROMPT_APPLY='确保 docs/design_notes.md 存在且没有被误删或清空；若发现算力申请.md 再次出现则删除它（已废弃）。docs/compute_plan.md 已废弃并从仓库删除，绝对不要重新创建。不要修改 docs/design_notes.md 的内容。不要删除或移动 README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README）；.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
 
           # 每阶段单次调用的最大时长（秒）
-          PERF_TIMEOUT=$((60*60))     # 1h（性能与显存优化）
-          BUG_TIMEOUT=$((60*60))      # 1h
-          SCI_TIMEOUT=$((60*60))      # 1h（改进科研方法，随机选一个提示词）
-          CLEAN_TIMEOUT=$((30*60))    # 30m
-          APPLY_TIMEOUT=$((60*60))    # 1h（算力申请.md 检查）
+          # 预算按实测收紧：DeepSeek 家族单个阶段的实测中位数为 7.6 分钟，
+          # 95 分位约 30 分钟；把上限设在 30 分钟即可覆盖绝大多数有效阶段，
+          # 同时把 provider 卡死时的最大损失从 60 分钟压到 30 分钟。
+          PERF_TIMEOUT=$((35*60))     # 35m（性能与显存优化；当前该阶段已停用）
+          BUG_TIMEOUT=$((30*60))      # 30m
+          SCI_TIMEOUT=$((30*60))      # 30m（改进科研方法，随机选一个提示词）
+          CLEAN_TIMEOUT=$((8*60))     # 8m（当前该阶段已从主循环移除）
+          APPLY_TIMEOUT=$((4*60))     # 4m（算力申请.md 检查）
 
           # ================= provider 策略：独立双家族（失效只在家族内级联，不跨家族） =================
           # NVIDIA 家族（20%）：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
@@ -215,7 +218,10 @@ jobs:
           #             → big-pickle；全链不可用时保持本家族重试，绝不切换到 NVIDIA 家族。
           # 家族由 run_phase 在每个阶段开始时掷骰确定（NVIDIA_PROB%），阶段内固定。
           # harness 永远是 opencode：所有 provider 一律通过 `opencode run -m ...` 调用。
-          NVIDIA_PROB=20
+          # 实测（2026-10-19/20 的 4 个 run，共 14 次 NVIDIA 阶段）：14/14 全部被
+          # 阶段预算杀掉，一次都没在预算内返回；单个工具调用延迟约 121s，5 分钟只
+          # 走 2~3 步。历史提交里 NVIDIA 只占 8/183（4%）。默认关闭，需要时再打开。
+          NVIDIA_PROB=0
           FREE_MODEL="opencode/deepseek-v4.1-flash-free"
           # DeepSeek 家族内兜底：官方与免费 deepseek 均不可用时，切换同为 Zen 网关
           #           免费的 big-pickle（Big Pickle）。
@@ -611,6 +617,8 @@ jobs:
           run_phase() {
             local phase="$1" prompt="$2" budget="$3"
             local attempt=0
+            # 整个阶段（含所有重试）共用的硬上限：重试不得让总时长超过 budget
+            local phase_end=$(( $(date +%s) + budget ))
             FAIL_COUNT=0
             RATE_COUNT=0
             PROVIDER_BROKEN=""
@@ -627,8 +635,9 @@ jobs:
                 return 1
               fi
               local REMAIN=$(( DEADLINE - NOW ))
-              [ "$budget" -gt "$REMAIN" ] && budget="$REMAIN"
-              if [ "$budget" -le 60 ]; then
+              local budget_now=$(( phase_end - NOW ))
+              [ "$budget_now" -gt "$REMAIN" ] && budget_now="$REMAIN"
+              if [ "$budget_now" -le 60 ]; then
                 echo "[info] phase=$phase 剩余时间不足，跳过"
                 return 1
               fi
@@ -655,27 +664,27 @@ jobs:
               case "$CURRENT_PROVIDER" in
                 deepseek)
                   record_model "deepseek/$DEEPSEEK_MODEL"
-                  timeout --kill-after=180 "$budget" opencode run -m "deepseek/$DEEPSEEK_MODEL" "$prompt" 2>&1 | tee "$OUT"
+                  timeout --kill-after=180 "$budget_now" opencode run -m "deepseek/$DEEPSEEK_MODEL" "$prompt" 2>&1 | tee "$OUT"
                   ;;
                 nvidia)
                   record_model "nvidia/$NVIDIA_MODEL"
-                  timeout --kill-after=180 "$budget" opencode run -m "nvidia/$NVIDIA_MODEL" "$prompt" 2>&1 | tee "$OUT"
+                  timeout --kill-after=180 "$budget_now" opencode run -m "nvidia/$NVIDIA_MODEL" "$prompt" 2>&1 | tee "$OUT"
                   ;;
                 nvidia_flash)
                   record_model "nvidia/$NVIDIA_FLASH_MODEL"
-                  timeout --kill-after=180 "$budget" opencode run -m "nvidia/$NVIDIA_FLASH_MODEL" "$prompt" 2>&1 | tee "$OUT"
+                  timeout --kill-after=180 "$budget_now" opencode run -m "nvidia/$NVIDIA_FLASH_MODEL" "$prompt" 2>&1 | tee "$OUT"
                   ;;
                 pickle)
                   # big-pickle 无 reasoning effort 档位，不传 --variant
                   record_model "$PICKLE_MODEL"
-                  timeout --kill-after=180 "$budget" opencode run -m "$PICKLE_MODEL" "$prompt" 2>&1 | tee "$OUT"
+                  timeout --kill-after=180 "$budget_now" opencode run -m "$PICKLE_MODEL" "$prompt" 2>&1 | tee "$OUT"
                   ;;
                 free)
                   record_model "$FREE_MODEL"
                   if [ -n "$VARIANT" ]; then
-                    timeout --kill-after=180 "$budget" opencode run -m "$FREE_MODEL" --variant "$VARIANT" "$prompt" 2>&1 | tee "$OUT"
+                    timeout --kill-after=180 "$budget_now" opencode run -m "$FREE_MODEL" --variant "$VARIANT" "$prompt" 2>&1 | tee "$OUT"
                   else
-                    timeout --kill-after=180 "$budget" opencode run -m "$FREE_MODEL" "$prompt" 2>&1 | tee "$OUT"
+                    timeout --kill-after=180 "$budget_now" opencode run -m "$FREE_MODEL" "$prompt" 2>&1 | tee "$OUT"
                   fi
                   ;;
               esac
@@ -719,9 +728,9 @@ jobs:
           ISSUES_FILE=".opencode_issues.md"
           fast_prompt() {
             case "$1" in
-              perf) printf '先用不超过 5-8 分钟快速扫描性能热点（可写入 `%s`，该临时清单不是报告），然后持续优化；在本阶段预算内尽可能多完成高价值、可验证的优化，不要只做 1-2 个就停，也不要为了赶时间提前结束。每个改动后运行自检；修复完成后删除该临时清单。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
-              bug)  printf '先快速定位 bug（可把要点写入 `%s`，该临时清单不是报告），然后持续修复；在本阶段预算内尽可能多修复高价值、可验证的 bug，不要只修一个就停，也不要为了赶时间提前结束。每个修复后运行自检；修完删除该临时清单。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
-              sci)  printf '先用不超过 5-8 分钟选出高价值实验方法问题（可写入 `%s`，该临时清单不是报告），然后持续改进；在本阶段预算内尽可能多完成实质性改进，不要只做 1-2 个就停，也不要为了赶时间提前结束。每个改动后运行自检；修复完成后删除该临时清单。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
+              perf) printf '先用不超过 5-8 分钟快速扫描性能热点（可写入 `%s`，该临时清单不是报告），然后持续优化；在本阶段预算内尽可能多完成高价值、可验证的优化，不要只做 1-2 个就停，也不要为了赶时间提前结束。每个改动后运行自检；修复完成后删除该临时清单。每完成一个可验证的改动就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
+              bug)  printf '先快速定位 bug（可把要点写入 `%s`，该临时清单不是报告），然后持续修复；在本阶段预算内尽可能多修复高价值、可验证的 bug，不要只修一个就停，也不要为了赶时间提前结束。每个修复后运行自检；修完删除该临时清单。每完成一个可验证的修复就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
+              sci)  printf '先用不超过 5-8 分钟选出高价值实验方法问题（可写入 `%s`，该临时清单不是报告），然后持续改进；在本阶段预算内尽可能多完成实质性改进，不要只做 1-2 个就停，也不要为了赶时间提前结束。每个改动后运行自检；修复完成后删除该临时清单。每完成一个可验证的改动就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
             esac
           }
 
@@ -731,12 +740,9 @@ jobs:
           # 跑不通 → 调用 opencode 修复 → 修复结果按本仓库既有提交路径落到 main/master。
           maybe_run_tests() {
             local iter="$1"
-            local TG_ROLL=$(( (RANDOM % 100) + 1 ))
-            if [ "$TG_ROLL" -gt 20 ]; then
-              echo "[test-gate] iter #$iter 骰子 ${TG_ROLL}/100 > 20，本轮不跑测试（80%）"
-              return 0
-            fi
-            echo "[test-gate] iter #$iter 骰子 ${TG_ROLL}/100 ≤ 20，本轮执行测试（20%）"
+            # 实测端到端只要 ~18s（165/165 passed；依赖已就绪时），成本可忽略：
+            # 每次提交后都跑，不再按 20% 抽样（原先 80% 的提交从未被验证过）。
+            echo "[test-gate] iter #$iter 执行全量测试"
             local TG_REMAIN=$(( DEADLINE - $(date +%s) ))
             if [ "$TG_REMAIN" -lt 1200 ]; then
               echo "[test-gate] 剩余时间不足 20 分钟，放弃本次测试"
@@ -822,9 +828,9 @@ jobs:
               break
             fi
 
-            # ----- 阶段：perf 已停用（perf 的 opencode 调用已注释掉）→ bug -> sci -> clean -> apply -----
+            # ----- 阶段：perf 与 clean 已停用 → bug -> sci -> apply（clean 的清理工作交给收尾的 shell 步骤）-----
             # for phase in perf bug sci clean apply; do
-            for phase in bug sci clean apply; do
+            for phase in bug sci apply; do
               case "$phase" in
                 perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
                 bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
@@ -863,10 +869,10 @@ jobs:
               # 无论成功失败，先把已完成的改动提交上去
               commit_and_push "$i-$phase"
 
-              # ⭐ 概率测试门（新增）：bug 阶段提交后 20% 概率跑测试，详见 maybe_run_tests
-              if [ "$phase" = "bug" ]; then
-                maybe_run_tests "$i"
-              fi
+              # ⭐ 测试门：bug / sci 阶段提交后都跑一遍全量测试，详见 maybe_run_tests
+              case "$phase" in
+                bug|sci) maybe_run_tests "$i" ;;
+              esac
 
               sleep 5
             done
