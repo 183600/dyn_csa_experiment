@@ -8102,6 +8102,21 @@ def t_m0_cross_scale_uses_declared_seed_plans():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_m0_records_exclude_synthesized_reconstructions():
+    base = {'variant': 'csa_dynamic', 'seed': 0, 'ppl': 10.0,
+            'run_cfg': 'fp', 'steps': 1, 'tokens_seen': 1,
+            'corpus_fp': 'corpus'}
+    summary = {
+        'real': dict(base),
+        'synth': dict(base, seed=1, synthesized=True, ppl=9.0),
+    }
+    recs = M0._records_by_seed(summary, 'csa_dynamic')
+    assert set(recs) == {0}, recs
+    assert M0._panel_corpus_fp(summary) == 'corpus'
+    assert M0._panel_corpus_fp({'synth': dict(base, synthesized=True,
+                                             corpus_fp='other')}) is None
+
+
 def t_m0_cross_scale_pairs_are_control_gated():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     fp2 = fp.replace('_lr0.0003_', '_lr0.003_')
@@ -8559,6 +8574,7 @@ def main():
     _check('C11 controlled-variable gate: mixed train_knobs', t_pair_reason_train_knobs_mixed)
     _check('C11b corpus/validation-slice fingerprint gate', t_pair_reason_fingerprint_gate)
     _check('C21 M0 scale analysis stays descriptive at n=4', t_m0_scale_analysis_descriptive)
+    _check('C21a M0 records exclude synthesized reconstructions', t_m0_records_exclude_synthesized_reconstructions)
     _check('C12 seed plan', t_seed_plan)
     _check('C13 family Holm + verified baseline + param control', t_audit_family_holm_and_verified)
     _check('C14 compression-regularizer loss ablation', t_ablation_design_loss_term)

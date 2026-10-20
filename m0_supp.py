@@ -584,6 +584,10 @@ def _records_by_seed(summary, variant, *, primary=False):
     for rec in summary.values():
         if not isinstance(rec, dict) or rec.get('variant') != variant:
             continue
+        if rec.get('synthesized'):
+            # A reconstructed aggregate is provenance, not an independent
+            # training draw; pairing it across scales would fabricate a seed.
+            continue
         _value = L._record_primary_ppl(rec) if primary else rec.get('ppl')
         if not L.ppl_is_usable(_value):
             continue
@@ -652,7 +656,9 @@ def _panel_corpus_fp(summary, variant=None):
     stable, legacy = set(), set()
     missing_provenance = 0
     for rec in summary.values():
-        if not isinstance(rec, dict):
+        if not isinstance(rec, dict) or rec.get('synthesized'):
+            # The corpus identity must be attested by real measurements; a
+            # reconstructed record's copied fingerprint cannot vouch for it.
             continue
         if variant is not None and rec.get('variant') != variant:
             continue
