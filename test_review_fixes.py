@@ -4461,6 +4461,13 @@ def t_data_quality_exact_integer_and_complex_rows():
     assert rep['checks']['duplicate_rows_across_splits']['train__val'] == 0, rep
     cleaned = L.clean_training_rows(big, train_idx=[0, 1])
     assert cleaned['n_duplicate_rows_dropped'] == 0 and cleaned['n_train_rows_out'] == 2, cleaned
+    # The same precision requirement applies to object columns of Python
+    # integers (a common dtype after pandas/None handling): they must not be
+    # rounded through float64 before duplicate detection.
+    obj_big = np.array([[2 ** 53], [2 ** 53 + 1]], dtype=object)
+    assert L.duplicate_mask(obj_big).tolist() == [False, False]
+    obj_rep = L.data_quality_report(obj_big, train_idx=[0], val_idx=[1])
+    assert obj_rep['checks']['duplicate_rows_across_splits']['train__val'] == 0, obj_rep
     # Complex rows were previously cast to float64 (dropping the imaginary
     # part); reject them instead of manufacturing duplicates.
     try:

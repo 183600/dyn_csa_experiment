@@ -1508,6 +1508,29 @@ def _row_keys(X):
             'to float64 would silently discard the imaginary part')
     if src.ndim == 1:
         src = src.reshape(-1, 1)
+    if src.dtype == object:
+        # An object column of Python integers is exact only if it is hashed as
+        # integers.  Casting it to float64 (the generic fallback below) would
+        # collapse distinct values above 2**53 into false duplicates, which
+        # can turn a clean split into a false leakage alarm and, in the other
+        # direction, make a genuine duplicate look unique after rounding.
+        # Require every scalar to be integral (bool values are accepted and
+        # hashed by their integer value, matching NumPy/float semantics).
+        _flat = src.reshape(-1).tolist()
+        if all(isinstance(v, (bool, np.bool_)) or
+               (isinstance(v, numbers.Integral) and not isinstance(v, (bool, np.bool_)))
+               for v in _flat):
+            _step = _hash_row_block(int(src.shape[1]), 1 << 16)
+            keys = []
+            for start in range(0, src.shape[0], _step):
+                for row in src[start:start + _step].tolist():
+                    h = hashlib.blake2b(digest_size=8)
+                    for v in row:
+                        h.update(b'I')
+                        h.update(str(int(v)).encode('ascii'))
+                        h.update(b'|')
+                    keys.append(h.digest())
+            return keys
     # Integer/bool/datetime/timedelta rows are hashed in their own dtype.
     # Converting them to float64 first collapses distinct int64 values above
     # 2**53 (and nanosecond timestamps) into false duplicates.
