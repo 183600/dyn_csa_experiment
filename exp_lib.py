@@ -13604,13 +13604,37 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
 
     if design is None:
         design = ABLATION_DESIGN
+    if not isinstance(design, dict):
+        out['structural_errors'].append(f'design must be a mapping, got {type(design).__name__}')
+        design = {}
     for comp, contrasts in design.items():
         rows, missing = [], set()
+        if not isinstance(contrasts, (tuple, list)):
+            out['structural_errors'].append(
+                '%s: contrasts must be a list of (with, without, note) tuples, got %r'
+                % (comp, contrasts))
+            out['components'][comp] = {'declared': 0, 'complete': False,
+                                       'contrasts': [], 'missing_arms': []}
+            out['incomplete_components'].append(comp)
+            continue
         for item in contrasts:
             if not isinstance(item, (tuple, list)) or len(item) < 2:
                 out['structural_errors'].append('%s: malformed contrast %r' % (comp, item))
                 continue
             a, b = item[0], item[1]
+            # Arm ids are non-empty strings; a contrast of an arm with itself
+            # cannot measure the module, and an unhashable/empty id would make
+            # the presence check meaningless (or crash).
+            _bad_arm = [x for x in (a, b)
+                        if not isinstance(x, str) or not x.strip()]
+            if _bad_arm:
+                out['structural_errors'].append(
+                    '%s: invalid arm id in contrast %r' % (comp, item))
+                continue
+            if a == b:
+                out['structural_errors'].append(
+                    '%s: contrast %r compares an arm with itself' % (comp, item))
+                continue
             ap = present_set is None or a in present_set
             bp = present_set is None or b in present_set
             rows.append({'with': a, 'without': b,
