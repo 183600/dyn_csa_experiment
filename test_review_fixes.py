@@ -3004,6 +3004,18 @@ def t_tuning_grid_boundary_adequacy():
     assert rc['grid_adequacy'] == 'warn', rc
     assert rc['grid_coverage']['a']['lr']['n_searched_levels'] == 2, rc['grid_coverage']
     assert any('searched level' in w for w in rc['warnings']), rc
+    # An artifact cannot label a strict-subset search as complete: that would
+    # let the tuned-baseline gate accept a truncated grid.
+    forged_complete = json.loads(json.dumps(capped))
+    forged_complete['search_complete'] = True
+    rfc = L.baseline_tuning_audit(forged_complete, protocol=protocol)
+    assert rfc['tuning_verified'] is False and rfc['search_complete'] is False, rfc
+    assert any('claims search_complete=True' in p for p in rfc['problems']), rfc
+    non_bool = json.loads(json.dumps(capped))
+    non_bool['search_complete'] = 'yes'
+    rnb = L.baseline_tuning_audit(non_bool, protocol=protocol)
+    assert rnb['tuning_verified'] is False and any(
+        'search_complete must be a boolean' in p for p in rnb['problems']), rnb
     # Trials selected on different evaluation token counts are not comparable.
     _diff_tok = _art(1, [10.0, 8.0, 9.0])
     for _i, _t in enumerate(_diff_tok['arms']['a']['trials']):

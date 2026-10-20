@@ -14719,6 +14719,27 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     _grid_complete = None
     if signatures and declared:
         _grid_complete = all(set(sig) == declared for sig in signatures.values())
+    # `search_complete` is an attestation, not a free-form note.  A bounded
+    # smoke/subset run may legitimately say False, but claiming True while the
+    # recorded trials are a strict subset of the declared grid is a
+    # contradiction: downstream gates would then promote a truncated search to
+    # a "fully tuned" baseline.
+    _artifact_search_complete = selected.get('search_complete')
+    if (_artifact_search_complete is not None
+            and not isinstance(_artifact_search_complete, (bool, np.bool_))):
+        problems.append(
+            f'search_complete must be a boolean, got '
+            f'{_artifact_search_complete!r}')
+        _artifact_search_complete = None
+    _effective_search_complete = _grid_complete
+    if _artifact_search_complete is not None:
+        _effective_search_complete = bool(_artifact_search_complete)
+        if _artifact_search_complete is True and _grid_complete is False:
+            problems.append(
+                'the artifact claims search_complete=True, but the recorded '
+                'trials are a strict subset of the declared grid; the search '
+                'was truncated and cannot attest a complete grid')
+            _effective_search_complete = False
     # Grid-coverage adequacy: an equal search can still be an inadequate one.
     # If the selected learning rate / weight decay sits on the minimum or
     # maximum declared level, the optimum may lie outside the searched range;
@@ -14926,7 +14947,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
            'selection_stable_all': (all(s.get('stable') for s in selection_stabilities.values())
                                     if selection_stabilities else None),
            'min_final_seeds_for_family_significance': _final_family_floor,
-           'search_complete': selected.get('search_complete') if selected.get('search_complete') is not None else _grid_complete,
+           'search_complete': _effective_search_complete,
            'grid_complete': _grid_complete,
            'arms': sorted(arms), 'problems': problems, 'warnings': warnings,
            'selected_configs': {a: (e.get('selected') or e.get('selected_config'))
