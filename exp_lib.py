@@ -21494,10 +21494,29 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
     """
     pairs = list(pairs or [])
     out = {'status': 'unverifiable', 'n_pairs': len(pairs), 'n_rows': None,
-           'n_boot': int(n_boot), 'n_boot_valid': 0, 'mean_delta': None,
-           'ci95_delta_ppl': None, 'conf': float(conf),
+           'n_boot': None, 'n_boot_valid': 0, 'mean_delta': None,
+           'ci95_delta_ppl': None, 'conf': None,
            'method': 'paired evaluation-row bootstrap of mean_s(PPL_a - PPL_b); '
                      'row-level uncertainty only, not training-seed uncertainty'}
+    # The interval's coverage and draw count are part of the measurement.
+    # Silently substituting 95% when conf=True/1.5 was passed (while echoing
+    # conf=1.0 in the output) would describe an interval that was never built.
+    try:
+        _conf = _validated_alpha(conf, context='paired_row_bootstrap_delta conf')
+    except ValueError as e:
+        out['reason'] = str(e)
+        return out
+    _nb = _as_seed_int(n_boot)
+    if _nb is None or _nb < 20:
+        out['reason'] = (f'n_boot={n_boot!r} must be an integer >= 20 for a '
+                         'percentile bootstrap')
+        return out
+    _seed = _as_seed_int(seed)
+    if _seed is None:
+        out['reason'] = f'seed={seed!r} is not an integer; draws are not reproducible'
+        return out
+    out['n_boot'] = int(_nb)
+    out['conf'] = float(_conf)
 
     def _arrays(rec):
         if not isinstance(rec, dict):
@@ -21561,13 +21580,13 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
     out['n_rows'] = int(R)
     out['n_seeds_used'] = int(_ok.sum())
     out['mean_delta'] = float(np.mean(_pa[_ok] - _pb[_ok]))
-    rng = np.random.default_rng(_as_seed_int(seed) if _as_seed_int(seed) is not None else 0)
-    vals = np.full(int(n_boot), np.nan, dtype=float)
+    rng = np.random.default_rng(_seed)
+    vals = np.full(int(_nb), np.nan, dtype=float)
     _chunk = _bootstrap_draw_chunk(R)
     _b = 0
-    while _b < int(n_boot):
-        _nb = min(_chunk, int(n_boot) - _b)
-        counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb)
+    while _b < int(_nb):
+        _nb_draw = min(_chunk, int(_nb) - _b)
+        counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb_draw)
         def _draw(nll, tok):
             nt = counts @ tok.T.astype(float)          # [nb, S]
             nn = counts @ nll.T                         # [nb, S]
@@ -21580,21 +21599,14 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
         _valid = np.isfinite(diff)
         _cnt = _valid.sum(axis=1)
         _sum = np.where(_valid, diff, 0.0).sum(axis=1)
-        vals[_b:_b + _nb] = np.where(_cnt > 0, _sum / np.maximum(_cnt, 1), np.nan)
-        _b += _nb
+        vals[_b:_b + _nb_draw] = np.where(_cnt > 0, _sum / np.maximum(_cnt, 1), np.nan)
+        _b += _nb_draw
     vals = vals[np.isfinite(vals)]
     out['n_boot_valid'] = int(vals.size)
-    if vals.size < max(20, int(0.5 * int(n_boot))):
+    if vals.size < max(20, int(0.5 * int(_nb))):
         out['reason'] = 'too few finite bootstrap draws'
         return out
-    try:
-        # `conf` is a coverage probability (e.g. 0.95), not a tail
-        # probability.  Using it directly as alpha made the nominal 95%
-        # interval a 5% interval (narrower than the 50% one).
-        _conf = _validated_alpha(conf, context='paired_row_bootstrap_delta conf')
-        _a = 1.0 - _conf
-    except ValueError:
-        _a = 0.05
+    _a = 1.0 - _conf
     lo, hi = np.percentile(vals, [100.0 * _a / 2.0, 100.0 * (1.0 - _a / 2.0)])
     out['ci95_delta_ppl'] = [float(lo), float(hi)]
     out['status'] = 'ok'

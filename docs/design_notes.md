@@ -1548,3 +1548,12 @@ tier 的计数降级，后者让 `_scale_points` 能区分「计划中的 seed �
 「计划外的多余 seed」。计划 seed 先去重再计数，重复声明不会伪造更大的 n。
 分析输出的 notes 也按实际 tier/n 生成，不再写死「S1 4 seeds / S2 3
 seeds」。
+
+## 31. 行重采样 bootstrap 的覆盖率/抽数/种子不可静默替换（本轮硬化）
+
+`paired_row_bootstrap_delta` 过去把 `conf` 原样写进输出，却在内部校验失败
+时回退到 95% 计算；传入 `conf=1.0` 时会得到一个 95% 区间却标成 `conf=1.0`。
+现在 `conf` 必须是 (0,1) 内的实数，`n_boot` 必须是 >=20 的整数，`seed`
+必须是整数；任一非法就返回 `status='unverifiable'` 并给出 `reason`，不再
+生成区间。覆盖率、抽数和 RNG 种子都是区间身份的一部分，不能为了「有输出」
+而替换成另一个区间。

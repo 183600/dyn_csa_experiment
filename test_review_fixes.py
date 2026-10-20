@@ -3179,6 +3179,18 @@ def t_paired_row_bootstrap_delta():
     assert _w95 > _w50, (r['ci95_delta_ppl'], _lo50['ci95_delta_ppl'])
     rn = L.paired_row_bootstrap_delta(_pair(-1.0))
     assert rn['status'] == 'ok' and rn['mean_delta'] < 0 and rn['ci95_delta_ppl'][1] < 0, rn
+    # Invalid coverage/draw-count/seed are part of the measurement identity:
+    # never silently build a 95% interval while echoing conf=1.0 or 0.5.
+    for _bad in (True, 0, 1, 1.5, -0.1, float('nan'), 'x'):
+        _r = L.paired_row_bootstrap_delta(_pair(+1.0), conf=_bad)
+        assert _r['status'] == 'unverifiable' and _r.get('reason'), (_bad, _r)
+        assert _r['conf'] is None and _r['ci95_delta_ppl'] is None, (_bad, _r)
+    for _bad in (True, 0, 19, 1.5, 'x', None, float('nan')):
+        _r = L.paired_row_bootstrap_delta(_pair(+1.0), n_boot=_bad)
+        assert _r['status'] == 'unverifiable' and _r.get('reason'), (_bad, _r)
+    for _bad in (True, 1.5, 'x', None, float('nan')):
+        _r = L.paired_row_bootstrap_delta(_pair(+1.0), seed=_bad)
+        assert _r['status'] == 'unverifiable' and 'seed' in _r.get('reason', ''), (_bad, _r)
     # A paired row bootstrap is not invented when either arm lacks per-row
     # accounting, when row counts differ, or when nested holdout rows were
     # reported without their per-row arrays.
