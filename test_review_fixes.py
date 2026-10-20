@@ -3336,6 +3336,67 @@ def t_simple_baseline_fit_budget_is_bounded_and_disclosed():
     assert rbad['baseline_verified'] is False, rbad
 
 
+def t_simple_floor_contrast_is_significance_aware():
+    # The "beats the trivial floor" claim must be a seed-level contrast, not a
+    # pointwise < on two PPLs.  Build a panel whose holdout rows match the
+    # floor's holdout rows and whose tokens match per seed.
+    rng = np.random.default_rng(23)
+    vocab = 24
+    train = rng.integers(0, vocab, size=600)
+    val = rng.integers(0, vocab, size=(8, 13))
+    proto = dict(L.SIMPLE_BASELINE_POLICY,
+                 arms={'unigram': {'order': 1}, 'bigram': {'order': 2}},
+                 grids={'unigram': {'alpha': [0.1]},
+                        'bigram': {'alpha': [0.1], 'interpolation': [0.5]}})
+    sel, ev, meta = L.validation_row_split(8, seed=20261020, n_folds=2,
+                                           selection_fold=0, evaluation_fold=1)
+    sb = L.simple_baseline_fit(train, val, vocab, protocol=proto,
+                               selection_rows=sel, evaluation_rows=ev,
+                               row_split=meta)
+    sb['data']['cache_val_fp'] = 'v'
+    floor = float(sb['best_ppl'])
+    n_tok = int(sb['data']['n_eval_tokens'])
+    rc = ('steps1_sl13_bs1_nt104_lr0.0003_wd0.1_d8_L1_H1_Dh8_v24_wu1_'
+          'cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX')
+    def recs(base_ppl):
+        out = {}
+        for arm in ('csa_dynamic', 'full_sw128_matched'):
+            for seed in range(8):
+                ppl = base_ppl if arm == 'csa_dynamic' else floor + 2.0
+                out[f'{arm}::seed{seed}'] = {
+                    'variant': arm, 'seed': seed, 'ppl': ppl, 'params': 100,
+                    'run_cfg': rc, 'steps': 1, 'tokens_seen': n_tok,
+                    'data_fp': 'd', 'val_fp': 'v', 'eval_fp': 'e',
+                    'nll_sum': math.log(ppl) * n_tok, 'n_tokens': n_tok,
+                    'holdout_row_fp': meta['evaluation_row_fp'],
+                    'ppl_estimation_rows': 'nested_validation_holdout',
+                }
+        return out
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, 'simple_baseline.json'), 'w', encoding='utf-8') as f:
+            json.dump(sb, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = L.methodology_audit(recs(floor - 1.0), design={}, baselines=L.BASELINE_DESIGN, outdir=td, verbose=False)
+        fl = r['simple_baseline']
+        assert fl['comparable_to_panel'] is True, fl
+        assert fl['token_denominator_match'] is True, fl
+        assert fl['floor_contrast']['verdict'] == 'beats_floor_significant', fl['floor_contrast']
+        assert fl['floor_contrast']['p_exact_signflip'] < 0.05, fl['floor_contrast']
+        with contextlib.redirect_stdout(io.StringIO()):
+            r2 = L.methodology_audit(recs(floor + 0.5), design={}, baselines=L.BASELINE_DESIGN, outdir=td, verbose=False)
+        assert r2['simple_baseline']['panel_beats_simple_floor'] is False, r2['simple_baseline']
+        assert r2['simple_baseline']['floor_contrast']['verdict'] == 'does_not_beat_floor', r2['simple_baseline']
+        assert any('does not beat the tuned count-model floor' in w for w in r2['warnings']), r2['warnings']
+    # Underpowered pointwise wins are not "beats floor".
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, 'simple_baseline.json'), 'w', encoding='utf-8') as f:
+            json.dump(sb, f)
+        small = {k: v for k, v in recs(floor - 1.0).items() if k.endswith('seed0') or k.endswith('seed1')}
+        with contextlib.redirect_stdout(io.StringIO()):
+            r3 = L.methodology_audit(small, design={}, baselines=L.BASELINE_DESIGN, outdir=td, min_n=3, verbose=False)
+        fc = r3['simple_baseline'].get('floor_contrast') or {}
+        assert fc.get('verdict') == 'beats_floor_pointwise_underpowered', fc
+
 def t_simple_baseline_driver_serves_the_panel_corpus():
     # `run_simple` must go through load_run_corpus (the panel's dataset) and
     # fingerprint the validation slice.
@@ -6093,6 +6154,7 @@ def main():
     _check('H5 positive-label / rare-positive PR-AUC / macro-F1 averaging', t_classification_positive_label_and_rare_floor)
     _check('H6 hypothesis completeness + metric alignment + direction=0', t_hypothesis_audit_completeness_and_metric_alignment)
     _check('H7 simple-baseline driver uses the panel corpus', t_simple_baseline_driver_serves_the_panel_corpus)
+    _check('H7a floor contrast is seed-level and significance-aware', t_simple_floor_contrast_is_significance_aware)
     _check('H8 leakage audit handles a flat 1-D train cache', t_audit_leakage_handles_flat_train_cache)
     _check('H9 fuse sample_std accepts negative axes', t_fuse_sample_std_negative_axis)
     _check('I1 chronological split contract', t_leakage_safe_split_contract)
