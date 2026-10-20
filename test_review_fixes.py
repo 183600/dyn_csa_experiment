@@ -9682,9 +9682,18 @@ def t_open_block_resume_binds_data_fingerprints():
     tr = np.arange(16, dtype=np.int64)
     va = np.arange(8, dtype=np.int64).reshape(1, 8)
     rec = {'run_fingerprint': 'fp', 'code': L.code_stamp(), 'ppl': 10.0,
+           'nll_sum': 10.0, 'n_tokens': 10,
            'data_fp': L._ids_fp(tr), 'eval_fp': L._ids_fp(va.reshape(-1))}
     assert OB._is_current(rec, 'fp', data_fp=L._ids_fp(tr),
                           eval_fp=L._ids_fp(va.reshape(-1))) is True
+    # A record without exact token accounting is not usable by `analyse`, so
+    # it must not be skipped as a current cell on resume.
+    no_acc = {k: v for k, v in rec.items() if k not in ('nll_sum', 'n_tokens')}
+    assert OB._is_current(no_acc, 'fp', data_fp=L._ids_fp(tr),
+                          eval_fp=L._ids_fp(va.reshape(-1))) is False
+    frac = dict(rec, n_tokens=10.5)
+    assert OB._is_current(frac, 'fp', data_fp=L._ids_fp(tr),
+                          eval_fp=L._ids_fp(va.reshape(-1))) is False
     assert OB._is_current(rec, 'fp', data_fp=L._ids_fp(tr + 1),
                           eval_fp=L._ids_fp(va.reshape(-1))) is False
     assert OB._is_current(rec, 'fp', data_fp=L._ids_fp(tr),

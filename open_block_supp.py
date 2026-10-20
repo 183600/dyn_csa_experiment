@@ -163,7 +163,14 @@ def _is_current(rec, fp, *, data_fp=None, eval_fp=None):
     if eval_fp is not None and rec.get('eval_fp') != eval_fp:
         return False
     ppl = rec.get('ppl')
-    return isinstance(ppl, (int, float)) and not isinstance(ppl, bool) and math.isfinite(float(ppl)) and float(ppl) > 0
+    if not (isinstance(ppl, (int, float)) and not isinstance(ppl, bool)
+            and math.isfinite(float(ppl)) and float(ppl) > 0):
+        return False
+    # The analysis consumes token-pooled NLL, not only PPL.  Skipping a record
+    # that has no exact n_tokens/nll_sum would make it look "current" forever
+    # while `analyse` excludes it as unusable (a resume that can never repair
+    # the cell).  A fractional token count is not a denominator either.
+    return _nll_per_token(rec) is not None
 
 
 def _synthetic_data(cfg, vocab=97, n_train=40000, val_rows=8):
