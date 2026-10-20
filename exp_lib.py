@@ -10753,9 +10753,23 @@ def _as_seed_int(v):
         f = float(v)
         return int(f) if math.isfinite(f) and f.is_integer() else None
     try:
-        return int(v)
+        i = int(v)
     except (TypeError, ValueError, OverflowError):
         return None
+    if isinstance(v, (str, bytes)):
+        # Numeric strings such as "3" are accepted by the legacy readers;
+        # int("3.0") already fails above, so no truncation can slip through.
+        return i
+    # Objects outside numbers.Real (notably Decimal and 0-d NumPy arrays)
+    # can still define __int__ and would be silently truncated by int(v).
+    # Check the numeric value itself before accepting the integer.
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return i
+    if not math.isfinite(f) or f != float(i):
+        return None
+    return i
 
 def read_panel(outdir):
     sp = os.path.join(outdir, 'summary.json')
@@ -13707,12 +13721,12 @@ def normalize_seed_list(seeds, *, default=(0,)):
     for raw in seeds:
         if isinstance(raw, (bool, np.bool_)):
             raise ValueError(f'seed must be an integer, got boolean {raw!r}')
-        if isinstance(raw, (float, np.floating)) and not float(raw).is_integer():
-            raise ValueError(f'seed must be an integer, got non-integral {raw!r}')
-        try:
-            s = int(raw)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f'seed must be an integer, got {raw!r}') from None
+        # Use the shared scalar reader: it handles NumPy scalars and rejects
+        # non-integral numeric objects (e.g. Decimal('1.5')) instead of
+        # silently truncating them with int().
+        s = _as_seed_int(raw)
+        if s is None:
+            raise ValueError(f'seed must be an integer, got {raw!r}')
         if s in seen:
             print(f'[seeds] WARNING: duplicate seed {s} removed from the panel plan (it would otherwise be trained twice under the same key)')
             continue

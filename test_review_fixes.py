@@ -1658,6 +1658,25 @@ def t_seed_axis_normalization():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def t_seed_scalar_rejects_silent_truncation():
+    from decimal import Decimal
+    # Objects outside numbers.Real can still define __int__; int() would
+    # truncate Decimal('1.5') / np.array(1.5) to a different valid seed.
+    assert L._as_seed_int(Decimal('1.5')) is None
+    assert L._as_seed_int(np.array(1.5)) is None
+    assert L._as_seed_int(Decimal('2')) == 2
+    assert L._as_seed_int(np.array(2)) == 2
+    assert L._as_seed_int('0') == 0
+    for bad in (Decimal('1.5'), np.array(1.5)):
+        try:
+            L.normalize_seed_list([bad])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'normalize_seed_list must reject {bad!r}, not truncate it')
+    assert L.normalize_seed_list([Decimal('2'), np.array(3)]) == [2, 3]
+
+
 def t_seed_contract_check():
     L.set_seed(4242)
     fp0 = L.rng_fingerprint()
@@ -4789,6 +4808,7 @@ def main():
     _check('J5 span clean-baseline key', t_review3_span_clean_key)
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E1a seed/variant axis normalisation', t_seed_axis_normalization)
+    _check('E1a2 seed scalars never truncate silently', t_seed_scalar_rejects_silent_truncation)
     _check('E1b explicit RNG seed contract', t_seed_contract_check)
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
     _check('E2b batch_iter uint16 transport', t_batch_iter_uint16)
