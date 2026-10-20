@@ -390,6 +390,10 @@ def _assert_order_finite(order, *, name='order'):
             # cannot sort to an arbitrary position and silently define the
             # split.  Non-numeric/string keys are left to the caller's order.
             for value in arr.tolist():
+                if value is None:
+                    raise ValueError(
+                        f'{name} contains a missing value; a temporal split '
+                        'needs a well-defined order')
                 if isinstance(value, (np.datetime64, np.timedelta64)):
                     if np.isnat(value):
                         raise ValueError(

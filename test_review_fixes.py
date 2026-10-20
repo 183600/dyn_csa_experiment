@@ -6623,6 +6623,19 @@ def t_data_guard_nat_and_label_identity():
             assert 'NaT' in str(e), e
         else:
             raise AssertionError('an object-dtype NaT timedelta must be rejected')
+    # A None ordering key is missing too; an all-None object column must not
+    # silently become a valid chronology.
+    _none_time = np.array([None, None, None], dtype=object)
+    for call in (lambda: L.split_indices(3, time=_none_time, train_frac=1 / 3,
+                                         val_frac=1 / 3, test_frac=1 / 3),
+                 lambda: L.assert_no_split_leakage([0], [1], [2],
+                                                  time=_none_time)):
+        try:
+            call()
+        except ValueError as e:
+            assert 'missing' in str(e), e
+        else:
+            raise AssertionError('a None ordering key must be rejected')
     # Categorical encoding: NaT is a missing value, not a category level.
     _cat = np.empty((3, 1), dtype=object)
     _cat[:, 0] = [np.timedelta64('NaT', 'ns'), np.timedelta64(1, 'ns'),
