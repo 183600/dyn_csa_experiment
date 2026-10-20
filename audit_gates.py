@@ -1810,7 +1810,16 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         # not inflate the reported seed count or the claim gate: the exact test
         # is run on the valid deltas and its own n is what the n>=6 floor uses.
         _d, _bad_seed = [], []
+        _seen_seed_keys = set()
         for _sk, v in _seeds.items():
+            # A seed key is an exact run identity.  "not-a-seed" (or two keys
+            # that normalise to the same seed) must not inflate n and unlock
+            # the n>=6 claim gate.
+            _seed_id = _exact_int(_sk)
+            if _seed_id is None or _seed_id in _seen_seed_keys:
+                _bad_seed.append(str(_sk))
+                continue
+            _seen_seed_keys.add(_seed_id)
             if not isinstance(v, dict) or v.get('mass_covered') is None or v.get('random_baseline') is None:
                 _bad_seed.append(str(_sk))
                 continue
@@ -1819,7 +1828,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             except (TypeError, ValueError, OverflowError):
                 _bad_seed.append(str(_sk))
         if _bad_seed:
-            out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows lack mass_covered/random_baseline: {_bad_seed[:5]}')
+            out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows have an invalid/duplicate seed key or lack mass_covered/random_baseline: {_bad_seed[:5]}')
         _n_valid = len(_d)
         if _n_valid >= 2:
             try:

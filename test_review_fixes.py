@@ -4384,6 +4384,16 @@ def t_selection_attribution_contract():
             json.dump({'cells': [bad3]}, f)
         r5 = A.audit_selection()
         assert r5['cells'][0]['claim_allowed'] is False and r5['cells'][0]['n_seeds_valid'] == 2, r5
+        # Non-integer and duplicate-normalised seed keys must not count as
+        # independent seeds for the n>=6 claim gate.
+        bad4 = dict(cell)
+        good = {'mass_covered': 0.8, 'random_baseline': 0.03}
+        bad4['per_seed'] = {'0': good, 'bad': good, '00': good}
+        with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+            json.dump({'cells': [bad4]}, f)
+        r6 = A.audit_selection()
+        assert r6['cells'][0]['n_seeds_valid'] == 1, r6
+        assert any('per_seed' in x for x in r6['problems']), r6
     finally:
         A.REPO = old_repo
         shutil.rmtree(td, ignore_errors=True)
