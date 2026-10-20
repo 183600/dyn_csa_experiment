@@ -10286,6 +10286,14 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         else:
             row.update({'mean': float('nan'), 'std': float('nan'), 'se': float('nan'), 'underpowered': True})
         per.append(row)
+    # A scale point with identical effects across seeds has zero within-scale
+    # variance.  It is NOT the same as a missing/underpowered point, but the
+    # DerSimonian-Laird weights cannot be formed (1/0), and silently dropping
+    # it would make a perfectly consistent scale disappear from the family.
+    # Keep the row, name it, and block the pooled claim until a variance model
+    # (or more seeds) is available.
+    _zero_variance = [r['label'] for r in per
+                      if r['n'] > 1 and r.get('se') == 0.0]
     usable = [r for r in per if r['n'] > 1 and math.isfinite(r.get('se', float('nan'))) and r['se'] > 0.0]
     _n_seed_declared = sum(1 for p in pts if p.get('seeds_declared'))
     if pts and _n_seed_declared == len(pts):
@@ -10303,6 +10311,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
            'n_points': len(per), 'n_usable': len(usable),
            'incomplete_points': _incomplete,
            'attrition': _attrition,
+           'zero_variance_points': _zero_variance,
            'corpus_binding': _scale_corpus_binding(pts),
            'seed_pairing': _seed_pairing,
            'n_points_with_declared_seeds': int(_n_seed_declared),
@@ -10360,15 +10369,20 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                 'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0
                                  and (not math.isfinite(p_q) or p_q >= alpha)
                                  and not _underpowered_points
-                                 and not _incomplete),
+                                 and not _incomplete and not _zero_variance),
                 'note': ('poolable requires >=3 scales, every included scale at n>=min_seeds '
-                         'with a complete paired panel (no dropped/absent seeds), '
+                         'with a complete paired panel (no dropped/absent seeds) and non-zero '
+                         'within-scale variance, '
                          'I2<=50% and a non-significant Q; otherwise report per-scale effects only'
                          + (('; underpowered scale point(s): ' + ', '.join(map(str, _underpowered_points)))
                             if _underpowered_points else '')
                          + (('; incomplete paired panel at: ' + ', '.join(map(str, _incomplete))
                              + ' (a complete-case subset can be biased by which seeds failed)')
-                            if _incomplete else ''))})
+                            if _incomplete else '')
+                         + (('; zero within-scale variance at: ' + ', '.join(map(str, _zero_variance))
+                             + ' (1/se^2 is undefined; the point is reported but not silently '
+                               'dropped from the pooled claim)')
+                            if _zero_variance else ''))})
     out['status'] = 'ok'
     return out
 

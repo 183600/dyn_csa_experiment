@@ -7527,6 +7527,19 @@ def t_scale_meta_refuses_visible_attrition():
     r2 = L.scaling_trend(_trend(planned=7))
     assert r2['significant'] is False and r2['verdict'] == 'incomplete_scale_point', r2
     assert 'incomplete paired panel' in r2['note'], r2
+    # A perfectly consistent scale (zero within-scale variance) is reported,
+    # not silently dropped from the family.  It blocks the pooled claim
+    # because 1/se^2 is undefined without a variance model.
+    zero = [{'label': 'S%d' % i, 'scale': 10.0 ** i,
+             'effects': [0.9, 1.0, 1.1, 1.0], 'seeds': [0, 1, 2, 3]}
+            for i in range(4)]
+    zero[2] = {'label': 'S2', 'scale': 100.0,
+               'effects': [1.0, 1.0, 1.0, 1.0], 'seeds': [0, 1, 2, 3]}
+    mz = L.meta_analyze_effects(zero)
+    assert mz['zero_variance_points'] == ['S2'], mz
+    assert mz['n_usable'] == 3, 'the consistent point is not part of the DL weights'
+    assert mz['poolable'] is False and 'zero within-scale variance' in mz['note'], mz
+    assert len(mz['per_point']) == 4, 'the row stays visible'
     # Invalid plan metadata fails closed instead of being silently truncated.
     for bad in (True, 3.5, -1, 'six'):
         try:
