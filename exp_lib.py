@@ -21155,7 +21155,11 @@ def classify_token_error(*, ce, entropy, margin, rare_target, target_id, topk_id
             tids.append(int(t))
         except (TypeError, ValueError, OverflowError):
             continue
-    in_topk = int(target_id) in tids if tids else None
+    try:
+        target_id = int(target_id)
+    except (TypeError, ValueError, OverflowError):
+        target_id = None
+    in_topk = (target_id in tids) if (tids and target_id is not None) else None
     uniform = math.log(vocab) if vocab > 1 else 0.0
     causes = []
     if bool(rare_target):

@@ -2010,7 +2010,9 @@ def audit_training_health(outdirs=None):
                     f = float(v)
                 except (TypeError, ValueError, OverflowError):
                     return None
-                return int(f) if math.isfinite(f) and f >= 0 else None
+                if not (math.isfinite(f) and f >= 0.0 and f == math.floor(f)):
+                    return None
+                return int(f)
             n_loss = _nonneg(diag.get('nonfinite_loss_steps')) or 0
             n_grad = _nonneg(diag.get('nonfinite_grad_steps')) or 0
             n_guard = _nonneg(guard.get('elements_cleaned')) or 0
