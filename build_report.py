@@ -1916,9 +1916,11 @@ def sec_early_stop():
             es = rec.get('early_stop')
             planned = rec.get('steps')
             done = rec.get('steps_completed')
-            if not isinstance(es, dict) and done is None:
-                continue
-            if isinstance(es, dict) and not es.get('stopped') and done == planned:
+            _stopped = isinstance(es, dict) and bool(es.get('stopped'))
+            # Only show an actual early stop (or a completed/planned mismatch).
+            # A normal new record carries steps_completed == steps and must not
+            # flood this section.
+            if not _stopped and (done is None or done == planned):
                 continue
             rows.append((name, key, rec, es, planned, done))
     if not rows:
