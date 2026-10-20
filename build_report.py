@@ -1809,6 +1809,84 @@ def efficiency_pareto(points):
     return frontier
 
 
+def efficiency_accuracy_summary(items):
+    """Per-arm PPL uncertainty and measured cost within one comparable group.
+
+    ``items`` are dicts with ``variant``, ``ppl``, ``prefill_ms_p50`` and
+    optionally ``params`` / ``peak_mem_allocated_mb``.  This is descriptive:
+    seeds are treated as independent draws, so ``distinguishable`` is not a
+    paired test.  It exists to stop a sub-noise PPL change from being presented
+    as a win and to make the latency/memory multiplier visible next to it.
+    """
+    by_arm = collections.OrderedDict()
+    for it in (items or []):
+        if not isinstance(it, dict):
+            continue
+        v = it.get('variant')
+        if not isinstance(v, str) or not v:
+            continue
+        ppl = _as_finite(it.get('ppl'))
+        lat = _as_finite(it.get('prefill_ms_p50'))
+        if ppl is None or lat is None or ppl <= 0.0 or lat < 0.0:
+            continue
+        by_arm.setdefault(v, []).append({
+            'ppl': ppl, 'lat': lat,
+            'params': _as_finite(it.get('params')),
+            'mem': _as_finite(it.get('peak_mem_allocated_mb'))})
+    rows = []
+    for v, vals in by_arm.items():
+        pp = [x['ppl'] for x in vals]
+        lats = sorted(x['lat'] for x in vals)
+        n = len(pp)
+        mean = sum(pp) / n
+        std = sample_std(pp) if n > 1 else None
+        sem = (std / math.sqrt(n)) if (std is not None and n > 1) else None
+        params = [x['params'] for x in vals if x['params'] is not None]
+        mems = [x['mem'] for x in vals if x['mem'] is not None]
+        rows.append({'variant': v, 'n': n, 'ppl_mean': mean, 'ppl_std': std,
+                     'ppl_sem': sem, 'ppl_min': min(pp),
+                     'latency_median': lats[len(lats) // 2],
+                     'params_median': (sorted(params)[len(params) // 2] if params else None),
+                     'peak_mem_max': (max(mems) if mems else None)})
+    if not rows:
+        return []
+    rows.sort(key=lambda r: (r['ppl_mean'], r['variant']))
+    ref = rows[0]
+    for r in rows:
+        r['ppl_delta_pct_vs_best'] = ((r['ppl_mean'] - ref['ppl_mean']) / ref['ppl_mean'] * 100.0)
+        r['latency_ratio_vs_best'] = (r['latency_median'] / ref['latency_median']
+                                      if ref['latency_median'] > 0 else None)
+        r['params_ratio_vs_best'] = ((r['params_median'] / ref['params_median'])
+                                     if (r['params_median'] is not None and ref['params_median']) else None)
+        r['memory_ratio_vs_best'] = ((r['peak_mem_max'] / ref['peak_mem_max'])
+                                     if (r['peak_mem_max'] is not None and ref['peak_mem_max']) else None)
+        if r is ref:
+            r['distinguishable'] = None
+            r['flags'] = []
+            continue
+        if r['ppl_sem'] is not None and ref['ppl_sem'] is not None:
+            r['noise_2se'] = 2.0 * math.sqrt(r['ppl_sem'] ** 2 + ref['ppl_sem'] ** 2)
+            r['distinguishable'] = abs(r['ppl_mean'] - ref['ppl_mean']) > r['noise_2se']
+        else:
+            r['noise_2se'] = None
+            r['distinguishable'] = None
+        flags = []
+        if abs(r['ppl_delta_pct_vs_best']) < 0.5:
+            flags.append('ppl_gain_below_0.5pct')
+        if r['distinguishable'] is False:
+            flags.append('ppl_gain_within_seed_noise')
+        if r['distinguishable'] is None:
+            flags.append('ppl_uncertainty_unverifiable')
+        if r['latency_ratio_vs_best'] is not None and r['latency_ratio_vs_best'] >= 2.0:
+            flags.append('latency_2x_or_more')
+        if r['params_ratio_vs_best'] is not None and r['params_ratio_vs_best'] >= 2.0:
+            flags.append('params_2x_or_more')
+        if r['memory_ratio_vs_best'] is not None and r['memory_ratio_vs_best'] >= 2.0:
+            flags.append('memory_2x_or_more')
+        r['flags'] = flags
+    return rows
+
+
 def sec_nan_diagnostics():
     rows = []
     for name, s in _result_summaries().items():
@@ -1852,6 +1930,55 @@ def sec_nan_diagnostics():
     return '\n'.join(lines) + '\n'
 
 
+def sec_error_analysis():
+    d = load(os.path.join(REPO, 'analysis_errors', 'summary.json'))
+    if not isinstance(d, dict) or not d:
+        return ''
+    lines = ['## Bad-case analysis (human review required)', '',
+             '> This section is an error-analysis aid, not a result table. The cause labels are heuristics: only reading the context and the target can distinguish an annotation error from a genuinely ambiguous example from a model blind spot.', '']
+    ckpt = d.get('checkpoint')
+    if ckpt:
+        lines += [f'- checkpoint: `{os.path.basename(str(ckpt))}`', f'- split: **{d.get("split") or "unknown"}**', f'- pooled CE/PPL: {fm(d.get("mean_ce"), 4)} / {fm(d.get("pooled_ppl"), 2)}', '']
+    buckets = d.get('buckets') or {}
+    if isinstance(buckets, dict) and buckets:
+        lines += ['| bucket | n | mean CE | PPL |', '|---|---|---|---|']
+        for k, v in sorted(buckets.items()):
+            if not isinstance(v, dict):
+                continue
+            lines.append('| %s | %s | %s | %s |' % (k, fm(v.get('n'), 0), fm(v.get('mean_ce'), 3), fm(v.get('perplexity'), 2)))
+        lines.append('')
+    counts = d.get('cause_counts') or {}
+    guide = d.get('cause_guide') or {}
+    if isinstance(counts, dict) and counts:
+        lines += ['**Heuristic cause inventory (worst tokens)**', '', '| cause | n | review action |', '|---|---|---|']
+        _counts = []
+        for c, n in counts.items():
+            try:
+                n = int(n)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if n > 0:
+                _counts.append((str(c), n))
+        for c, n in sorted(_counts, key=lambda kv: (-kv[1], kv[0])):
+            lines.append('| %s | %d | %s |' % (c, n, str((guide or {}).get(c) or '').replace('|', '\\|')))
+        lines.append('')
+    tokens = d.get('worst_tokens') or []
+    if tokens:
+        lines += ['| # | row | pos | CE | target | predicted | cause |', '|---|---|---|---|---|---|---|']
+        for i, t in enumerate(tokens[:12]):
+            if not isinstance(t, dict):
+                continue
+            tgt = str(t.get('target_text') or t.get('target_id') or '').replace('|', '\\|').replace('\n', '\\n')[:60]
+            prd = str(t.get('pred_text') or t.get('pred_id') or '').replace('|', '\\|').replace('\n', '\\n')[:60]
+            lines.append('| %d | %s | %s | %s | %s | %s | %s |' % (
+                i + 1, fm(t.get('row'), 0), fm(t.get('position'), 0), fm(t.get('ce'), 3),
+                tgt, prd, t.get('cause_primary') or 'n/a'))
+        lines.append('')
+    if d.get('warning'):
+        lines += [f'> {d.get("warning")}', '']
+    return '\n'.join(lines) + '\n'
+
+
 def sec_efficiency():
     rows = []
     for name, s in _result_summaries().items():
@@ -1878,22 +2005,45 @@ def sec_efficiency():
     ungrouped = []
     for name, key, rec, eff in rows:
         gk = efficiency_group_key(eff)
-        ppl = rec.get('ppl')
-        lat = eff.get('prefill_ms_p50')
         if gk is None:
             ungrouped.append((name, key))
             continue
-        groups.setdefault(gk, []).append((lat, ppl, f'{name} / `{key}`'))
+        groups.setdefault(gk, []).append((name, key, rec, eff))
     if groups:
         lines += ['', '**Pareto frontiers within comparable measurement groups**', '',
                   '> A frontier is drawn only inside one (device, torch, token-count, KV-semantics) group. A PPL difference between groups is confounded by input shape or hardware and is not an architecture comparison.', '']
-        for gk, pts in groups.items():
+        for gk, grp in groups.items():
+            pts = [(eff.get('prefill_ms_p50'), rec.get('ppl'), f'{name} / `{key}`')
+                   for name, key, rec, eff in grp]
             frontier = efficiency_pareto(pts)
             if not frontier:
                 continue
             lines += [f'- device `{gk[0]}`, torch `{gk[1]}`, {gk[2]} tokens, KV={gk[3]}:', '']
             for lat, ppl, label in frontier:
                 lines.append(f'  - {label}: PPL {fm(ppl)}, prefill p50 {fm(lat, 2)} ms')
+            summary = efficiency_accuracy_summary([
+                {'variant': rec.get('variant') or str(key).split('::')[0],
+                 'ppl': rec.get('ppl'), 'prefill_ms_p50': eff.get('prefill_ms_p50'),
+                 'params': rec.get('params'),
+                 'peak_mem_allocated_mb': eff.get('peak_mem_allocated_mb')}
+                for name, key, rec, eff in grp])
+            if len(summary) >= 2 and summary[0].get('latency_ratio_vs_best') is not None:
+                lines += ['', '  Cost of the best-PPL arm in this group (seed spread, not a paired test):', '',
+                          '  | arm | n | PPL mean ± SEM | Δ vs best | latency × best | flags |', '  |---|---|---|---|---|---|']
+                for r in summary:
+                    flags = ', '.join(r.get('flags') or []) or '—'
+                    lines.append('  | %s | %d | %s ± %s | %s%% | %s | %s |' % (
+                        r['variant'], r['n'], fm(r['ppl_mean'], 3), fm(r['ppl_sem'], 3),
+                        fm(r.get('ppl_delta_pct_vs_best'), 2),
+                        fm(r.get('latency_ratio_vs_best'), 2), flags))
+                ref = summary[0]
+                for r in summary[1:]:
+                    gain = r.get('ppl_delta_pct_vs_best', 0.0)
+                    _lr = r.get('latency_ratio_vs_best')
+                    lat_ratio = (1.0 / _lr) if (_lr and _lr > 0) else 0.0
+                    if (r.get('distinguishable') is True and gain >= 0.5 and lat_ratio >= 1.5):
+                        lines += ['', f'  > `{ref["variant"]}` gains {gain:.2f}% PPL over `{r["variant"]}` but is {lat_ratio:.1f}× slower; the accuracy/cost tradeoff must be justified explicitly.']
+                lines.append('')
         if ungrouped:
             lines += ['', f'> {len(ungrouped)} measured record(s) were excluded from every frontier because device/torch/token-count/KV provenance is missing (unverifiable, not assumed equal): ' + ', '.join(f'`{n}`/`{k}`' for n, k in ungrouped[:20]) + ('.' if len(ungrouped) <= 20 else ', ...'), '']
     lines += ['', '> A PPL improvement should be read together with this table: a small gain accompanied by much higher latency or memory is not a deployable improvement. Compare only within a group; a latency measured at 512 tokens cannot be subtracted from one measured at 4096.', '']
@@ -1954,7 +2104,7 @@ def main(argv=None):
     parts = [sec_header(), '---\n']
     failed = []
     _reset_claim_registry()
-    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_nan_diagnostics, sec_efficiency, sec_stats, sec_global_multiplicity):
+    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_nan_diagnostics, sec_error_analysis, sec_efficiency, sec_stats, sec_global_multiplicity):
         try:
             parts.append(sec())
         except Exception as e:

@@ -1061,6 +1061,11 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     }
     if _health.get('status') != 'healthy' and _health.get('status') != 'unmonitored':
         print(f'[health] WARNING: {variant} seed={seed} curve_health={_health.get("status")} ({_health.get("reason")})')
+    _instability = L.diagnose_training_instability(
+        {'opt_diag_summary': _opt_summary, 'amp_dtype': None,
+         'train_knobs': _v7_knobs(device, batch_size),
+         'curve_health': _health, 'health_history': _health_history},
+        data_checked='token batches validated at startup and every ~1% of steps')
     _checkpoints = {}
     if _save_mode and ckpt_dir:
         try:
@@ -1075,6 +1080,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
                                 'curve_health': _health,
                                 'health_history': _health_history,
                                 'opt_diag_summary': _opt_summary,
+                                'instability_diagnosis': _instability,
                                 'best_step': _best_step, 'best_val_ppl': _best_val_ppl,
                                 'train_ce_fixed_final': _last_train_ce,
                                 'warm_steps': int(warm_steps), 'params': int(n_param),
@@ -1105,6 +1111,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
            'train_objective': L.train_objective(model, comp_lambda=comp_lambda, delta_lr_mult=delta_lr_mult),
            'curve_health': _health, 'health_history': _health_history,
            'opt_diag_summary': _opt_summary,
+           'instability_diagnosis': _instability,
            'best_step': _best_step, 'best_val_ppl': _best_val_ppl,
            'final_minus_best': (float(ppl) - float(_best_val_ppl)) if (L._is_finite_number(ppl) and L._is_finite_number(_best_val_ppl)) else None,
            'train_ce_fixed_final': _last_train_ce,

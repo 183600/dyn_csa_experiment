@@ -6750,6 +6750,57 @@ def t_efficiency_pareto_is_grouped():
     assert BR.efficiency_pareto([(float('nan'), 90.0, 'x'), (10.0, 100.0, 'a')]) == [(10.0, 100.0, 'a')]
 
 
+def t_efficiency_accuracy_tradeoff_summary():
+    rows = [{'variant': 'best', 'ppl': p, 'prefill_ms_p50': 20.0,
+             'params': 2000, 'peak_mem_allocated_mb': 200.0}
+            for p in (48.0, 48.1, 47.9)]
+    rows += [{'variant': 'cheap', 'ppl': p, 'prefill_ms_p50': 10.0,
+              'params': 1000, 'peak_mem_allocated_mb': 100.0}
+             for p in (50.0, 50.1, 49.9)]
+    rows += [{'variant': 'tiny', 'ppl': p, 'prefill_ms_p50': 21.0,
+              'params': 2000, 'peak_mem_allocated_mb': 200.0}
+             for p in (48.05, 48.05, 48.05)]
+    s = BR.efficiency_accuracy_summary(rows)
+    assert [r['variant'] for r in s] == ['best', 'tiny', 'cheap'], s
+    assert s[0]['ppl_sem'] is not None and s[0]['latency_ratio_vs_best'] == 1.0, s[0]
+    cheap = [r for r in s if r['variant'] == 'cheap'][0]
+    assert cheap['distinguishable'] is True, cheap
+    assert cheap['ppl_delta_pct_vs_best'] > 3.0, cheap
+    assert 'latency_2x_or_more' not in cheap['flags'], cheap
+    assert cheap['params_ratio_vs_best'] == 0.5, cheap
+    tiny = [r for r in s if r['variant'] == 'tiny'][0]
+    assert 'ppl_gain_below_0.5pct' in tiny['flags'], tiny
+    assert 'ppl_gain_within_seed_noise' in tiny['flags'], tiny
+    # Unverifiable uncertainty is named instead of being treated as significant.
+    unk = BR.efficiency_accuracy_summary([
+        {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0},
+        {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0},
+        {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0}])
+    b = [r for r in unk if r['variant'] == 'b'][0]
+    assert b['distinguishable'] is None and 'ppl_uncertainty_unverifiable' in b['flags'], b
+
+
+def t_report_error_analysis_section():
+    rec = {'checkpoint': '/tmp/x/ckpt.pt', 'split': 'validation',
+           'mean_ce': 4.2, 'pooled_ppl': 66.7,
+           'buckets': {'position:last10%': {'n': 3, 'mean_ce': 5.0, 'perplexity': 148.4}},
+           'cause_counts': {'ambiguous_context': 2, 'annotation_or_rare_target': 1},
+           'cause_guide': {'ambiguous_context': 'read the context'},
+           'worst_tokens': [{'row': 0, 'position': 3, 'ce': 9.5,
+                             'target_text': 'x', 'pred_text': 'y',
+                             'cause_primary': 'ambiguous_context'}],
+           'warning': 'validation only'}
+    orig = BR.load
+    BR.load = lambda path, default=None: rec if path.endswith(os.path.join('analysis_errors', 'summary.json')) else default
+    try:
+        txt = BR.sec_error_analysis()
+    finally:
+        BR.load = orig
+    assert 'Bad-case analysis' in txt and 'ambiguous_context' in txt, txt
+    assert 'ckpt.pt' in txt and 'validation only' in txt, txt
+    assert 'read the context' in txt, txt
+
+
 def t_report_nan_section_uses_triage():
     rec = {'instability_diagnosis': {
         'status': 'instability_observed', 'primary_suspect': 'fp16_overflow',
@@ -9440,6 +9491,8 @@ def main():
     _check('L8 efficiency-pair audit + shape sweep', t_efficiency_pairs_audit_and_sweep)
     _check('L8b efficiency Pareto is grouped by comparable measurements', t_efficiency_pareto_is_grouped)
     _check('L8c report NaN section reads the triage path', t_report_nan_section_uses_triage)
+    _check('L8d efficiency/accuracy cost summary is seed-noise aware', t_efficiency_accuracy_tradeoff_summary)
+    _check('L8e report surfaces the bad-case cause inventory', t_report_error_analysis_section)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
