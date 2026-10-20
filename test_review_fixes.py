@@ -4124,6 +4124,9 @@ def t_reportable_claim_gate():
         assert r['allowed'] is False, r
     fam = L.attach_holm({'x': {'n': 6, 'p_exact_signflip': False}})
     assert fam['tested'] == 0, fam
+    # Booleans are also not effect measurements.
+    assert L.reportable_claim(dict(base, mean=True, std=0.2))['allowed'] is False
+    assert L.reportable_claim(dict(base, mean=-1.0, std=False))['allowed'] is False
 
 
     # Probabilities outside [0,1] cannot support a claim, even when every

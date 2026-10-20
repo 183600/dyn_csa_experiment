@@ -8883,11 +8883,13 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
                 'Holm p is smaller than the raw p; a step-down correction '
                 'cannot increase significance (mis-attached or fabricated '
                 'family correction)')
-    try:
-        if mean is None or std is None or not (abs(float(mean)) > float(std)):
-            out['reasons'].append('|mean| <= std: effect is within seed noise')
-    except (TypeError, ValueError, OverflowError):
-        out['reasons'].append('mean/std are not numeric')
+    _mean, _std = _finite_scalar(mean), _finite_scalar(std)
+    if _mean is None or _std is None:
+        # Booleans and non-finite values are flags/corruption, not effect
+        # measurements (same scalar contract as the p-value parsing above).
+        out['reasons'].append('mean/std are not finite real measurements')
+    elif abs(_mean) <= _std:
+        out['reasons'].append('|mean| <= std: effect is within seed noise')
     # Leave-one-seed-out instability is a direct contradiction of a stable
     # directional effect: dropping one seed must not flip the sign.  Only
     # enforced when the caller supplied the diagnostic (old stats dicts do not
