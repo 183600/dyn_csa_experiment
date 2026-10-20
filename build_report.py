@@ -293,7 +293,11 @@ def _primary_ppl(rec):
         nll = _as_finite(rec.get('nll_sum_holdout'))
         ntok = _int_or(rec.get('n_tokens_holdout'), None)
         if nll is not None and ntok is not None and ntok > 0:
-            return math.exp(nll / ntok)
+            try:
+                _v = math.exp(nll / ntok)
+            except OverflowError:
+                return None
+            return _v if math.isfinite(_v) and _v > 0.0 else None
         _nll = rec.get('nll_per_row_holdout')
         _ntok = rec.get('n_tokens_per_row_holdout')
         if isinstance(_nll, list) and isinstance(_ntok, list) and _nll and len(_nll) == len(_ntok):
@@ -302,7 +306,11 @@ def _primary_ppl(rec):
             if all(x is not None for x in _v) and all(x is not None and x > 0 for x in _t):
                 _tot = sum(_t)
                 if _tot > 0:
-                    return math.exp(sum(_v) / _tot)
+                    try:
+                        _v2 = math.exp(sum(_v) / _tot)
+                    except OverflowError:
+                        return None
+                    return _v2 if math.isfinite(_v2) and _v2 > 0.0 else None
         return None
     v = _as_finite(rec.get('ppl'))
     return v if v is not None and v > 0.0 else None

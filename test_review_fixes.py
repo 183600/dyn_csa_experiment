@@ -6938,6 +6938,11 @@ def t_build_report_primary_estimand():
         bad.pop(_k)
     assert BR._primary_ppl(bad) is None
     assert BR.paired_row({('', 0): bad}, {('', 0): b}) is None
+    # A holdout CE beyond the float exponent range is a non-measurement, not a
+    # crash in the report builder.
+    huge = dict(bad, ppl_estimation_rows='nested_validation_holdout',
+                nll_sum_holdout=1e6, n_tokens_holdout=1)
+    assert BR._primary_ppl(huge) is None
 
 
 def t_build_report_exact_seed_and_params():
