@@ -13547,16 +13547,83 @@ def metric_policy_audit(summary=None, policy=None):
                 out['warnings'].append('NIAH records contain invalid accuracy/NLL/query counts '
                                        f'({sorted(set(_bad_niah))}); the retrieval endpoint is not usable')
         classify_tasks = ('classification', 'binary_classification', 'multiclass_classification')
+        _class_recs, _class_issues = [], []
+        _allowed_f1_averages = ('macro', 'micro', 'weighted', 'binary_positive_class',
+                                'binary_positive')
         for r in recs:
             task = r.get('task')
+            if task not in classify_tasks:
+                continue
+            _class_recs.append(r)
+            _label = r.get('variant') or r.get('name') or '?'
             # Generic guard: a record that exposes a bare `accuracy` for a
             # classification-style task but no F1 must be treated as incomplete.
-            if task in classify_tasks and 'accuracy' in r and 'f1_macro' not in r:
-                out['warnings'].append(f"{r.get('variant', '?')} reports accuracy without F1/averaging for a classification task")
+            if 'accuracy' in r and 'f1_macro' not in r:
+                out['warnings'].append(f"{_label} reports accuracy without F1/averaging for a classification task")
             # F1 without a stated averaging rule is not a reproducible metric.
             f1_keys = [k for k in ('f1', 'f1_macro', 'f1_micro', 'f1_weighted', 'f1_positive') if k in r]
-            if task in classify_tasks and f1_keys and not (r.get('f1_averaging') or r.get('f1_primary_average')):
-                out['warnings'].append(f"{r.get('variant', '?')} reports {f1_keys} without naming macro/micro/weighted/binary averaging")
+            _f1_avg = r.get('f1_primary_average') or r.get('f1_average')
+            if f1_keys and not (r.get('f1_averaging') or _f1_avg):
+                out['warnings'].append(f"{_label} reports {f1_keys} without naming macro/micro/weighted/binary averaging")
+            if _f1_avg is not None and _f1_avg not in _allowed_f1_averages:
+                _class_issues.append(f'{_label}: f1_primary_average={_f1_avg!r} is not one of {_allowed_f1_averages}')
+            if task == 'multiclass_classification':
+                _missing_f1 = [k for k in ('f1_macro', 'f1_micro', 'f1_weighted')
+                               if _finite_scalar(r.get(k)) is None]
+                if _missing_f1:
+                    _class_issues.append(
+                        f'{_label}: multiclass record is missing {_missing_f1}; '
+                        'macro, micro and weighted F1 can disagree under class imbalance')
+            # f1_primary must be the field its declared averaging names.
+            if 'f1_primary' in r:
+                _f1p = _finite_scalar(r.get('f1_primary'))
+                _source = None
+                if _f1_avg == 'binary_positive_class' or _f1_avg == 'binary_positive':
+                    _source = 'f1_positive'
+                elif _f1_avg in ('macro', 'micro', 'weighted'):
+                    _source = f'f1_{_f1_avg}'
+                elif _f1_avg is None:
+                    _source = ('f1_positive' if task == 'binary_classification'
+                               else ('f1_macro' if task == 'multiclass_classification' else None))
+                if _f1p is None:
+                    _class_issues.append(f'{_label}: f1_primary is not a finite scalar')
+                elif _source is not None and _finite_scalar(r.get(_source)) is not None:
+                    if abs(_f1p - float(_finite_scalar(r.get(_source)))) > 1e-9:
+                        _class_issues.append(
+                            f'{_label}: f1_primary={_f1p} does not equal {_source}='
+                            f'{_finite_scalar(r.get(_source))} under averaging {_f1_avg!r}')
+            # When per-class evidence is present, the aggregate F1s must be
+            # reproducible from it rather than asserted.
+            _pc = r.get('per_class')
+            if isinstance(_pc, dict) and _pc:
+                _f1s, _sup = [], []
+                _pc_bad = False
+                for _k, _v in _pc.items():
+                    if not isinstance(_v, dict):
+                        _pc_bad = True
+                        break
+                    _f = _finite_scalar(_v.get('f1'))
+                    _s = _exact_count(_v.get('support'), minimum=0)
+                    if _f is None or not (0.0 <= _f <= 1.0) or _s is None:
+                        _pc_bad = True
+                        break
+                    _f1s.append(float(_f))
+                    _sup.append(int(_s))
+                if _pc_bad:
+                    _class_issues.append(f'{_label}: per_class contains an invalid F1/support entry')
+                elif _f1s:
+                    _macro = float(np.mean(_f1s))
+                    _rep_macro = _finite_scalar(r.get('f1_macro'))
+                    if _rep_macro is not None and abs(_rep_macro - _macro) > 1e-9:
+                        _class_issues.append(
+                            f'{_label}: f1_macro={_rep_macro} is not the mean of its per-class F1 values ({_macro})')
+                    if sum(_sup) > 0:
+                        _weighted = float(np.average(_f1s, weights=_sup))
+                        _rep_weighted = _finite_scalar(r.get('f1_weighted'))
+                        if _rep_weighted is not None and abs(_rep_weighted - _weighted) > 1e-9:
+                            _class_issues.append(
+                                f'{_label}: f1_weighted={_rep_weighted} is not the support-weighted '
+                                f'mean of its per-class F1 values ({_weighted})')
             # A rare-positive panel that reports only ROC-AUC is exactly the
             # optimistic-score failure mode this policy exists to prevent.
             prevalence = None
@@ -13574,11 +13641,47 @@ def metric_policy_audit(summary=None, policy=None):
                 if _prev_f is not None and 0.0 <= _prev_f <= 1.0:
                     prevalence = min(_prev_f, 1.0 - _prev_f)
                     break
-            if task in classify_tasks and prevalence is not None and prevalence < 1e-3:
+            _declared_primary = r.get('primary_metric') or r.get('metric_primary')
+            if _declared_primary is not None:
+                _pol = METRIC_POLICY.get(task) if task in METRIC_POLICY else None
+                _allowed_primary = set()
+                if _pol:
+                    for _k in ('primary', 'primary_when_extreme_imbalance'):
+                        _pv = _pol.get(_k)
+                        if isinstance(_pv, str):
+                            _allowed_primary.add(_pv)
+                        elif isinstance(_pv, (list, tuple)):
+                            _allowed_primary.update(str(x) for x in _pv)
+                if _allowed_primary and _declared_primary not in _allowed_primary:
+                    _class_issues.append(
+                        f'{_label}: declares primary_metric={_declared_primary!r} for task '
+                        f'{task!r}; the policy primary is {sorted(_allowed_primary)}')
+            if prevalence is not None and prevalence < 1e-3:
+                _cond = (METRIC_POLICY.get(task) or {}).get(
+                    'primary_when_extreme_imbalance', 'pr_auc')
                 if r.get('roc_auc') is not None and r.get('pr_auc') is None:
-                    out['warnings'].append(f"{r.get('variant', '?')} reports ROC-AUC but no PR-AUC at prevalence {prevalence:.2e} (<1:1000); PR-AUC is the primary ranking metric here")
+                    out['warnings'].append(f"{_label} reports ROC-AUC but no PR-AUC at prevalence {prevalence:.2e} (<1:1000); PR-AUC is the primary ranking metric here")
                 if r.get('pr_auc') is not None and r.get('pr_auc_prevalence') is None:
-                    out['warnings'].append(f"{r.get('variant', '?')} reports a rare-positive PR-AUC without its prevalence floor; PR-AUC must be read against chance prevalence")
+                    out['warnings'].append(f"{_label} reports a rare-positive PR-AUC without its prevalence floor; PR-AUC must be read against chance prevalence")
+                if _declared_primary is not None and _declared_primary != _cond:
+                    _class_issues.append(
+                        f'{_label}: declares primary_metric={_declared_primary!r} at '
+                        f'prevalence {prevalence:.2e} (<1:1000); the conditional '
+                        f'policy primary is {_cond!r}')
+                if r.get('pr_auc') is None and (r.get('f1_primary') is not None
+                                                or r.get('f1') is not None):
+                    _class_issues.append(
+                        f'{_label}: reports F1 without PR-AUC at prevalence '
+                        f'{prevalence:.2e} (<1:1000); F1 is threshold-dependent and '
+                        'cannot be the primary endpoint here')
+        if _class_recs:
+            out['checks'].append({'metric': 'classification', 'records': len(_class_recs),
+                                  'ok': not _class_issues,
+                                  'issues': sorted(set(_class_issues))[:12],
+                                  'f1_averaging_required': list(_allowed_f1_averages),
+                                  'extreme_imbalance_primary': 'pr_auc'})
+            for _ci in sorted(set(_class_issues)):
+                out['warnings'].append('classification metric contract: ' + _ci)
     out['status'] = 'warn' if out['warnings'] else 'ok'
     return out
 

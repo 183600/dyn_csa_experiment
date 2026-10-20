@@ -2805,6 +2805,8 @@ def t_metric_policy_and_classification_metrics():
     pol = L.metric_policy_audit()
     assert pol['status'] == 'ok', pol
     assert pol['policies']['multiclass_classification']['aggregation'] == 'macro'
+    assert L.METRIC_POLICY['binary_classification']['primary_when_extreme_imbalance'] == 'pr_auc'
+    assert L.METRIC_POLICY['binary_classification']['extreme_imbalance_threshold'] == 1e-3
     y = [0] * 990 + [1] * 10
     pred_all_majority = [0] * 1000
     m = L.classification_metrics(y, y_pred=pred_all_majority, labels=[0, 1])
@@ -4468,6 +4470,29 @@ def t_classification_positive_label_and_rare_floor():
     assert ma['status'] == 'warn', ma
     assert any('averaging' in w for w in ma['warnings']), ma
     assert any('PR-AUC' in w for w in ma['warnings']), ma
+    # A record must not label an arbitrary F1 as its primary metric.
+    _cm = L.classification_metrics([0] * 950 + [1] * 50, y_pred=[0] * 1000,
+                                   labels=[0, 1])
+    _good = dict(_cm, variant='g', task='binary_classification',
+                 prevalence={'0': 0.95, '1': 0.05})
+    assert L.metric_policy_audit({'g': _good})['status'] == 'ok',         L.metric_policy_audit({'g': _good})
+    _bad_primary = dict(_good, f1_primary=0.9)
+    _bp = L.metric_policy_audit({'g': _bad_primary})
+    assert _bp['status'] == 'warn' and any(
+        'does not equal' in w for w in _bp['warnings']), _bp
+    # At 1:1000 the conditional primary is PR-AUC; ROC-AUC/F1 as primary is flagged.
+    _rare = dict(_good, prevalence={'0': 0.9995, '1': 0.0005},
+                 roc_auc=0.99, primary_metric='roc_auc')
+    _rp = L.metric_policy_audit({'g': _rare})
+    assert _rp['status'] == 'warn' and any(
+        'conditional policy primary' in w for w in _rp['warnings']), _rp
+    # Multiclass F1 must expose macro/micro/weighted, not only one average.
+    _mc = {'variant': 'm', 'task': 'multiclass_classification',
+           'f1_macro': 0.4, 'f1_primary': 0.4,
+           'f1_primary_average': 'macro'}
+    _mca = L.metric_policy_audit({'m': _mc})
+    assert _mca['status'] == 'warn' and any(
+        'missing' in w and 'f1_micro' in w for w in _mca['warnings']), _mca
 
 
 def t_hypothesis_audit_completeness_and_metric_alignment():
