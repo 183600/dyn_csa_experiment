@@ -1412,3 +1412,15 @@ warning 而不是把两套 seed 集合当成同一族。
   任一点 `n < min_seeds` 即 `underpowered=True`，即使三点恰好落在一条
   直线上、WLS 的 p 为 0，也不得标为 `significant`。paired 路径沿用
   完整 seed 数的 `paired_effect_stats.underpowered`。
+
+### 28.7 审计侧：指纹、行数字段与缺失测量的可见性
+
+- `audit_leakage` 新增 c) 的真实实现：从 `train_ids_*.npy` /
+  `test_ids_*.npy` 重新计算 `_ids_fp`，与 meta 的 `src_fp` 比较；并核对
+  test meta 的 `fit_fp` 与 train meta 一致。缺任一侧的 fit 指纹按
+  不可验证失败关闭，不再只比较 vocab。
+- `audit_length` 要求同一 cell 的 `n_seq` 与 `len(ppl_per_seq)` 一致；
+  显式 `n_seq` 非法时即使 per-document 向量给出合理长度也记为 problem。
+- `audit_failures` 新增 `unmeasured_by_arm` / `unmeasured_samples`：
+  NaN/缺失 PPL 的记录既不是成功也不是 error，必须作为「缺失测量」进入
+  生存偏差读数，不能从两侧同时消失。
