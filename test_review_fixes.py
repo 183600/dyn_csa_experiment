@@ -6630,6 +6630,24 @@ def t_audit_length_missing_truncated_flag():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def t_audit_length_rejects_zero_target_cells():
+    td = tempfile.mkdtemp(prefix='len_', dir=REPO)
+    try:
+        p = os.path.join(td, 'bylen.json')
+        for _cell in ({'ppl': 30.0, 'n_tok': 0, 'eval_span': 4096,
+                       'truncated': False, 'n_seq': 0},
+                      {'ppl': 30.0, 'n_tok': 0, 'eval_span': 0,
+                       'truncated': True, 'n_seq': 16}):
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump({'a::s0': {'by_len': {'4096': _cell}}}, f)
+            r = A.audit_length(p)
+            assert r['status'] == 'fail', r
+            assert any(('n_tok' in x and 'positive' in x)
+                       or ('n_seq' in x and 'positive' in x) for x in r['problems']), r
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def t_audit_length_missing_n_seq_flag():
     # Same fail-closed rule as a missing truncation marker: without n_seq the
     # audit cannot prove the arms scored the same document rows.

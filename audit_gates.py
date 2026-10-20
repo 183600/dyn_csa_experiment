@@ -1424,10 +1424,17 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                     and _ns is not None and _nt is not None):
                 if Ln >= 2 and _nt != _ns * (Ln - 1):
                     problems.append(f'{key}: L{Ln} n_tok={_nt} != n_seq*(L-1)={_ns * (Ln - 1)} — the cell did not score one next-token target per row')
-            if _nt is not None and _nt < 0:
-                problems.append(f'{key}: L{Ln} n_tok={_nt} is negative')
-            if _ns is not None and _ns < 0:
-                problems.append(f'{key}: L{Ln} n_seq={_ns} is negative')
+            if _nt is not None and _nt <= 0:
+                problems.append(f'{key}: L{Ln} n_tok={_nt} is not positive — '
+                                'a cell that scored no target tokens is not a '
+                                'measurement')
+            if _ns is not None and _ns <= 0:
+                problems.append(f'{key}: L{Ln} n_seq={_ns} is not positive — '
+                                'a cell with no document rows is not a '
+                                'measurement')
+            _es = _exact_int(c.get('eval_span'))
+            if _es is not None and _es <= 0:
+                problems.append(f'{key}: L{Ln} eval_span={_es} is not positive')
             if 'truncated' not in c:
                 problems.append(f'{key}: L{Ln} cell has NO `truncated` flag — a missing truncation marker is treated as unverifiable, not as a full-length measurement')
             elif not isinstance(c.get('truncated'), (bool, np.bool_)):
