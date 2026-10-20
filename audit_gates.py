@@ -1417,6 +1417,14 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
     没有 `results_*/summary.json` 时返回 not_verifiable_locally，而不是
     伪造一个通过。"""
     L = _import_exp_lib()
+    # These are gate parameters, not measurements.  Validate them even when
+    # there are no panels to audit: float(True)=1.0 / int(3.5)=3 would
+    # otherwise be echoed as if the audit had run under a valid threshold.
+    alpha = L._validated_alpha(alpha, context='audit_methodology alpha')
+    _min_n = L._as_seed_int(min_n)
+    if _min_n is None or _min_n < 0:
+        raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
+    min_n = _min_n
     dirs = list(outdirs) if outdirs is not None else list(_iter_result_dirs())
     out = {'status': 'ok', 'alpha': float(alpha), 'min_n': int(min_n), 'panels': {},
            'ablation_coverage': {}}
