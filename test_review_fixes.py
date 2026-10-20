@@ -8089,6 +8089,31 @@ def t_archive_refuses_links_and_repo_escape():
         assert AR.cmd_verify(path2) == 0
 
 
+
+def t_build_report_warmup_uses_primary_estimand():
+    def rec(full, hold, warm, seed=0):
+        return {'variant': 'csa_fixed', 'seed': seed, 'warm_steps': warm,
+                'ppl': full, 'ppl_holdout': hold,
+                'ppl_estimation_rows': 'nested_validation_holdout',
+                'nll_sum_holdout': math.log(hold) * 40, 'n_tokens_holdout': 40,
+                'run_cfg': 'cfg', 'steps': 1, 'tokens_seen': 40,
+                'data_fp': 'd', 'val_fp': 'v', 'eval_fp': 'e'}
+    s = {'a::w0::seed0': rec(99.0, 10.0, 0),
+         'a::w5000::seed0': rec(1.0, 20.0, 5000)}
+    old_s, old_l = BR.summary, BR._legacy_warm_tags_cached
+    BR.summary = lambda *a, **k: s
+    BR._legacy_warm_tags_cached = lambda *a, **k: True
+    try:
+        out = BR.sec_p0w()
+    finally:
+        BR.summary, BR._legacy_warm_tags_cached = old_s, old_l
+    # The table and the paired conclusion must both use the held-out PPL.
+    assert '| `csa_fixed` | 0 | 10.00 ' in out, out
+    assert '| `csa_fixed` | 5000 | 20.00 ' in out, out
+    assert '99.00' not in out, out
+    assert '+10.00 vs 基线' in out, out
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8345,6 +8370,7 @@ def main():
     _check('L38 small-n split remainder + string order keys', t_small_n_split_remainder_and_string_order)
     _check('L39 split audit recomputes fingerprints and doc sidecars', t_split_discipline_recomputes_fingerprints_and_doc_sidecars)
     _check('L40 archive refuses links and repo escape', t_archive_refuses_links_and_repo_escape)
+    _check('L41 warmup table uses the primary estimand', t_build_report_warmup_uses_primary_estimand)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

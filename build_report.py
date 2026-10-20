@@ -739,7 +739,11 @@ def sec_p0w():
         if _w < 0 and _measurable({'ppl': r.get('ppl'), 'synthesized': r.get('synthesized', False)}):
             print(f"[report] sec_p0w: record {k!r} carries no parseable warmup tag — it is skipped, not counted")
             continue
-        rows.append((r.get('variant', '?'), _w, _sd, r.get('ppl'), r.get('ppl_at_switch'), r.get('synthesized', False), k))
+        # The table must show the same primary estimand as the paired test
+        # below: a nested warmup record's full-validation `ppl` still contains
+        # the rows that selected its hyper-parameters.
+        rows.append((r.get('variant', '?'), _w, _sd, _primary_ppl(r),
+                     r.get('ppl_at_switch'), r.get('synthesized', False), k))
     rows.sort(key=lambda x: (x[0], x[1], x[2]))
     rows = [row for row in rows if _measurable({'ppl': row[3], 'synthesized': row[5]})]
     rows = _prefer_one_cfg(rows, lambda row: ((row[0], row[1]), (s.get(row[-1]) or {}).get('run_cfg')), who='sec_p0w')
@@ -765,7 +769,7 @@ def sec_p0w():
     grp = collections.defaultdict(list)
     for (v, w), _m in rec_by_s.items():
         for _sd, _r in sorted(_m.items()):
-            grp[v, w].append((_r.get('ppl'), _r.get('ppl_at_switch'), _sd))
+            grp[v, w].append((_primary_ppl(_r), _r.get('ppl_at_switch'), _sd))
     lines = ['## P0-1 dense→sparse warmup 是否能让 sparse 追平 dense？（待检验项）', '', '**待检验论断**：论文 §4.2.2 先训 1T token 的 dense 再在 seq 64K 切 sparse；仓库所有 sparse run 都是 from-scratch，故「渐近线更差」可能是没 warmup 的产物。不给这个实验，「渐近线反转」立不住。', '', '**做法**：`train_warmup` 用**相同全长度 cosine LR**，前 `warm_steps` 步走 dense 前向（复用各 csa/hca 层自己的 `W_kvhead` per-token KV 路径 + 同一 sink，不引入新参数），到点切换为 sparse 并记录切换瞬间 PPL。网格 `warm ∈ {0,5000,10000}`（每格 seed 数以下表 n 列为准），20k 步、seq 512。**两臂参数/步数/token 数/初始 PPL/LR 曲线完全相同**，唯一差异是切点。', '', '| variant | warm_steps | PPL (mean±std) | n | 切换时 PPL |', '|---|---|---|---|---|']
     for (v, w), vals in sorted(grp.items()):
         ppls = [p for p, _s, _sd in vals]
@@ -1146,16 +1150,22 @@ def sec_p1t():
         _m1_r, _t8_r, _t32_r = (_recs3.get('csa_fix_m1', {}), _recs3.get('csa_fixed_topk8', {}), _recs3.get('csa_fixed_topk32', {}))
         _c3 = []
         _rej3 = 0
+        _vals3 = {}
         for sk in sorted(set(_m1_r) & set(_t8_r) & set(_t32_r)):
             if _pair_reason(_m1_r[sk], _t8_r[sk]) is not None or _pair_reason(_m1_r[sk], _t32_r[sk]) is not None:
                 _rej3 += 1
                 continue
+            _va, _vb, _vc = _primary_ppl(_m1_r[sk]), _primary_ppl(_t8_r[sk]), _primary_ppl(_t32_r[sk])
+            if _va is None or _vb is None or _vc is None:
+                _rej3 += 1
+                continue
             _c3.append(sk)
+            _vals3[sk] = (_va, _vb, _vc)
         if _rej3:
-            print(f'[report] sec_p1t: {_rej3} three-way shared seed(s) rejected by the run_cfg/steps gate — excluded from the per-seed direction count')
-        _m1_s = {sk: float(_m1_r[sk]['ppl']) for sk in _c3}
-        _t8_s = {sk: float(_t8_r[sk]['ppl']) for sk in _c3}
-        _t32_s = {sk: float(_t32_r[sk]['ppl']) for sk in _c3}
+            print(f'[report] sec_p1t: {_rej3} three-way shared seed(s) rejected by the run_cfg/steps/primary-estimand gate — excluded from the per-seed direction count')
+        _m1_s = {sk: float(_vals3[sk][0]) for sk in _c3}
+        _t8_s = {sk: float(_vals3[sk][1]) for sk in _c3}
+        _t32_s = {sk: float(_vals3[sk][2]) for sk in _c3}
         if _c3:
             _nw = sum((1 for sk in _c3 if _m1_s[sk] > _t8_s[sk] and (_m1_s[sk] > _t32_s[sk])))
             _nb = sum((1 for sk in _c3 if _m1_s[sk] < _t8_s[sk] and (_m1_s[sk] < _t32_s[sk])))
