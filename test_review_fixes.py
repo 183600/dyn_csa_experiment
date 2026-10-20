@@ -6912,6 +6912,30 @@ def t_report_early_stop_section():
         BR._result_summaries = orig
 
 
+def t_report_efficiency_groups_are_separate():
+    def _eff(n, lat):
+        return {'status': 'ok', 'device': 'cuda:0', 'torch': '2.8.0', 'n_tokens': n,
+                'decode_has_kv_cache': False, 'prefill_ms_p50': lat,
+                'peak_mem_allocated_mb': 10.0}
+    summ = {'results_unit': {
+        'a::s0': {'variant': 'a', 'ppl': 50.0, 'params': 1000, 'tokens_seen': 100,
+                  'efficiency': _eff(512, 10.0)},
+        'b::s0': {'variant': 'b', 'ppl': 40.0, 'params': 1000, 'tokens_seen': 100,
+                  'efficiency': _eff(4096, 5.0)},
+        'c::s0': {'variant': 'c', 'ppl': 45.0, 'params': 1000, 'tokens_seen': 100,
+                  'efficiency': {'status': 'ok', 'prefill_ms_p50': 1.0}}}}
+    orig = BR._result_summaries
+    BR._result_summaries = lambda: summ
+    try:
+        txt = BR.sec_efficiency()
+    finally:
+        BR._result_summaries = orig
+    assert '512 tokens' in txt and '4096 tokens' in txt, txt
+    assert 'excluded from every frontier' in txt and '`c::s0`' in txt, txt
+    # The two token counts are separate group headings, not one merged frontier.
+    assert txt.count('device `cuda:0`') == 2, txt
+
+
 def t_report_nan_section_uses_triage():
     rec = {'instability_diagnosis': {
         'status': 'instability_observed', 'primary_suspect': 'fp16_overflow',
@@ -9607,6 +9631,7 @@ def main():
     _check('L8e report surfaces the bad-case cause inventory', t_report_error_analysis_section)
     _check('L8f training-health section shows actions and steps since best', t_report_training_health_actions)
     _check('L8g report surfaces completed vs planned training budget', t_report_early_stop_section)
+    _check('L8h efficiency report keeps measurement groups separate', t_report_efficiency_groups_are_separate)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
