@@ -1680,6 +1680,12 @@ def t_combined_seed_doc_uncertainty():
     assert rf['status'] == 'ok' and rf['se_doc_logppl'] is not None and rf['se_doc_logppl'] < 1e-12, rf
     assert abs(rf['se_combined_logppl'] - rf['se_seed_logppl']) < 1e-12, rf
     assert rf['component_ratio_seed_over_doc'] is None, rf
+    # Fractional per-document token counts are not a pooled denominator.
+    _bad = _recs([0.0, 0.2, 0.4])
+    _bad[0]['n_tokens_per_row'] = list(_bad[0]['n_tokens_per_row'])
+    _bad[0]['n_tokens_per_row'][0] = 50.5
+    assert L._combined_seed_doc_ci(_bad)['status'] == 'unverifiable'
+    assert L._doc_bootstrap_ppl_ci(_bad) is None
     # One seed: the seed component is explicitly unverifiable, never zero.
     r1 = L._combined_seed_doc_ci(_recs([0.0]))
     assert r1['status'] == 'seed_component_unverifiable' and r1['se_seed_logppl'] is None and r1['se_doc_logppl'] is not None, r1
@@ -2834,6 +2840,22 @@ def t_nested_validation_row_split_and_subset_ppl():
     assert L.record_subset_ppl(rec, [1, 1]) is None
     from decimal import Decimal as _Decimal
     assert L.record_subset_ppl(rec, [_Decimal('1')])['n_tokens'] == 10
+    # Token counts are exact integer denominators.  A fractional count must
+    # not be used as a pooled denominator (and a boolean is not a count).
+    for _bad_ntok in ([10, 10, 10, 10.5], [10, 10, 10, True],
+                      [10, 10, 10, float('nan')]):
+        assert L.record_subset_ppl({'nll_per_row': [1.0, 2.0, 3.0, 4.0],
+                                    'n_tokens_per_row': _bad_ntok}, [1, 3]) is None, _bad_ntok
+    assert L._pooled_ppl_from_records([{'nll_sum': 1.0, 'n_tokens': 10.5}]) == (None, None, None)
+    assert L._group_params([{'params': 12.5}, {'params': True}]) is None
+    assert L._group_params([{'params': 12.0}]) == 12
+    for _bad_alpha in (True, 0, 1.0, float('nan')):
+        try:
+            L._seed_t_ci([1.0, 2.0, 3.0], alpha=_bad_alpha)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'_seed_t_ci accepted alpha={_bad_alpha!r}')
     try:
         L.validation_row_split(1)
     except ValueError:

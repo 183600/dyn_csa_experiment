@@ -10932,6 +10932,17 @@ def _as_seed_int(v):
         return None
     return i
 
+def _exact_count(v, *, minimum=0):
+    """Exact non-negative integer count (token/document counts, not seeds).
+
+    Fractional/boolean values must not be truncated into a different pooled
+    denominator, and a negative count is not a count at all.
+    """
+    i = _as_seed_int(v)
+    if i is None or i < int(minimum):
+        return None
+    return i
+
 def read_panel(outdir):
     sp = os.path.join(outdir, 'summary.json')
     if not os.path.exists(sp):
@@ -11292,10 +11303,13 @@ def record_subset_ppl(rec, rows):
         return None
     try:
         _nll = np.asarray([nll[int(i)] for i in idx], dtype=float)
-        _ntok = np.asarray([ntok[int(i)] for i in idx], dtype=float)
     except (TypeError, ValueError, OverflowError, IndexError):
         return None
-    if not np.isfinite(_nll).all() or not np.isfinite(_ntok).all() or (_ntok < 0).any():
+    _parsed_tok = [_exact_count(ntok[int(i)]) for i in idx]
+    if any(v is None for v in _parsed_tok):
+        return None
+    _ntok = np.asarray(_parsed_tok, dtype=np.int64)
+    if not np.isfinite(_nll).all():
         return None
     total_tok = float(_ntok.sum())
     if total_tok <= 0:
@@ -19110,12 +19124,9 @@ def record_tag(rec, key, legacy_ok):
 
 def _group_params(recs):
     for r in recs:
-        v = r.get('params')
-        if v is not None:
-            try:
-                return int(v)
-            except (TypeError, ValueError, OverflowError):
-                continue
+        v = _as_seed_int(r.get('params'))
+        if v is not None and v > 0:
+            return v
     return None
 
 def _pooled_ppl_from_records(recs):
@@ -19127,8 +19138,8 @@ def _pooled_ppl_from_records(recs):
     `nll_sum`/`n_tokens` cannot be pooled and fall back explicitly."""
     nlls, nts = [], []
     for r in recs:
-        nll, nt = _finite_scalar(r.get('nll_sum')), _finite_scalar(r.get('n_tokens'))
-        if nll is None or nt is None or nt <= 0:
+        nll, nt = _finite_scalar(r.get('nll_sum')), _exact_count(r.get('n_tokens'), minimum=1)
+        if nll is None or nt is None:
             return None, None, None
         nlls.append(nll)
         nts.append(nt)
@@ -19138,6 +19149,7 @@ def _pooled_ppl_from_records(recs):
     return _safe_exp_ppl(total_n / total_t), total_n, int(total_t)
 
 def _seed_t_ci(ppls, alpha=0.05):
+    alpha = _validated_alpha(alpha, context='_seed_t_ci alpha')
     n = len(ppls)
     if n < 2:
         return None
@@ -19165,7 +19177,13 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
         ntok = r.get('n_tokens_per_row')
         if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
             return None
-        rows.append((np.asarray(nll, dtype=float), np.asarray(ntok, dtype=float)))
+        _tok = [_exact_count(v) for v in ntok]
+        if any(v is None for v in _tok):
+            return None
+        _nll = np.asarray(nll, dtype=float)
+        if not np.isfinite(_nll).all():
+            return None
+        rows.append((_nll, np.asarray(_tok, dtype=np.int64)))
     if len({len(a) for a, _ in rows}) != 1:
         return None
     R = len(rows[0][0])
@@ -19228,7 +19246,12 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
             rows = None
             break
-        rows.append((np.asarray(nll, dtype=float), np.asarray(ntok, dtype=float)))
+        _tok = [_exact_count(v) for v in ntok]
+        _nll = np.asarray(nll, dtype=float)
+        if any(v is None for v in _tok) or not np.isfinite(_nll).all():
+            rows = None
+            break
+        rows.append((_nll, np.asarray(_tok, dtype=np.int64)))
     if isinstance(rows, list):
         if len({len(a) for a, _ in rows}) != 1:
             rows = None
