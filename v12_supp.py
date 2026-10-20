@@ -744,6 +744,14 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
             print(f'[p5t] WARNING: {msg}; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
             return None
         return msg + ' — refusing to use the one-shot test access (set V12_ALLOW_UNHEALTHY=1 only with a written justification)'
+    triage = (ckpt_meta or {}).get('instability_diagnosis') or (train_rec or {}).get('instability_diagnosis')
+    if isinstance(triage, dict) and triage.get('status') == 'instability_observed':
+        msg = (f'{v} s{seed}: non-finite training event recorded '
+               f'(primary suspect {triage.get("primary_suspect")!r}: {triage.get("summary")})')
+        if allow:
+            print(f'[p5t] WARNING: {msg}; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
+            return None
+        return msg + ' — refusing to use the one-shot test access; diagnose the first bad step first'
     status = str(health.get('status') or 'unknown')
     if status == 'healthy':
         return None

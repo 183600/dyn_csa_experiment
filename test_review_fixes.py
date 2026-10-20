@@ -449,6 +449,30 @@ def t_train_variant_early_stop_record():
         raise AssertionError('early stopping without a validation grid must be refused')
 
 
+def t_v12_health_gate_refuses_unstable_training():
+    cfg = {'smoke': False}
+    healthy = {'curve_health': {'status': 'healthy', 'reason': 'ok'}}
+    assert V12._training_health_gate(cfg, 'a', 0, healthy, healthy) is None
+    bad = {'curve_health': {'status': 'overfitting', 'reason': 'val rising'}}
+    msg = V12._training_health_gate(cfg, 'a', 0, bad, bad)
+    assert msg and 'overfitting' in msg, msg
+    triage = {'curve_health': {'status': 'healthy', 'reason': 'ok'},
+              'instability_diagnosis': {'status': 'instability_observed',
+                                        'primary_suspect': 'fp16_overflow',
+                                        'summary': 'scaler overflow'}}
+    msg2 = V12._training_health_gate(cfg, 'a', 0, triage, {})
+    assert msg2 and 'fp16_overflow' in msg2, msg2
+    _old = os.environ.get('V12_ALLOW_UNHEALTHY')
+    os.environ['V12_ALLOW_UNHEALTHY'] = '1'
+    try:
+        assert V12._training_health_gate(cfg, 'a', 0, triage, {}) is None
+    finally:
+        if _old is None:
+            os.environ.pop('V12_ALLOW_UNHEALTHY', None)
+        else:
+            os.environ['V12_ALLOW_UNHEALTHY'] = _old
+
+
 def t_rope_arms_are_not_batched():
     # The implementation binding must report eager_batch=False for the rope csa
     # arms because `HybridAttentionRoPE.forward` unconditionally takes the
@@ -9323,6 +9347,7 @@ def main():
     _check('A4i NaN triage path', t_nan_diagnosis_path)
     _check('A4j bad-case cause taxonomy', t_token_error_cause_taxonomy)
     _check('A4k early stop is recorded and token accounting follows completed steps', t_train_variant_early_stop_record)
+    _check('A4l v12 health gate refuses a recorded non-finite event', t_v12_health_gate_refuses_unstable_training)
     _check('A4g rope arms never claim the batched eager twin', t_rope_arms_are_not_batched)
     _check('A4g2 apply_rope preserves width (over-long/odd rope_dim)', t_apply_rope_preserves_width)
     _check('A4g3 numeric helpers accept NumPy scalars', t_stats_accept_numpy_scalars)
