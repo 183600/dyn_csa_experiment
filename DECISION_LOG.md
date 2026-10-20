@@ -186,3 +186,26 @@ The count-model floor now fits on a declared deterministic token prefix
 project moves to a multi-billion-token B-tier corpus. The WikiText-103 budget
 is below the cap, so its floor is unchanged. No frozen manifest, test split,
 or README was modified.
+
+## 2026-10-20 — nested-validation / statistics fail-closed pass (no new runs)
+
+This pass changed only zero-GPU gates and helpers; no panel, frozen manifest,
+or test split was touched. (1) `baseline_tuning_audit` no longer rejects a
+valid `n_folds>2` chronological split merely because `covers_all_rows=False`
+(only the selected blocks are used), and it now re-derives the declared fold
+ranges/fingerprints from `(n_rows, seed, n_folds, selection_fold,
+evaluation_fold)` so an edited metadata range cannot attest a different split.
+(2) `record_subset_ppl` requires exact, unique, in-range row indices; a
+fractional index is no longer truncated to a different row and a repeated row
+cannot inflate the held-out token denominator. (3) `paired_effect_stats`
+records `n_input`/`n_dropped`/`dropped_seeds`, and `reportable_claim` refuses
+significance wording for a complete-case result whose missing pairs are
+visible. (4) A partial vocab declaration across scale points is now
+`unverifiable`, not `shared`, because the undeclared widths could be a
+different tokenisation. (5) `alpha` is validated in the Holm/claim helpers,
+Holm p-values below their raw p are refused, and boolean p-values can no longer
+enter a family as `False = 0`. (6) Scale seed identity is an exact integer in
+`_scale_points`/`paired_log_ratio`/`scale_interaction`, so `1.5` or `True`
+cannot masquerade as a paired seed. (7) The count-model floor rejects
+float/boolean token ids and fractional vocabularies instead of truncating them.
+No frozen manifest, test split, README, or CI configuration was modified.
