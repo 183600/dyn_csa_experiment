@@ -1283,6 +1283,13 @@ def audit_boundary(outdirs=None):
                         f'{d}/{key}: precision/random_precision must be finite real numbers '
                         f'(got {p_raw!r} / {rp_raw!r}); the alignment reading is unverifiable')
                     continue
+                if not (0.0 <= p <= 1.0 and 0.0 <= rp <= 1.0):
+                    # Precision and its matched random baseline are fractions;
+                    # p=1.4 must not be reported as "exceeds the baseline".
+                    out['problems'].append(
+                        f'{d}/{key}: precision/random_precision outside [0,1] '
+                        f'(got {p!r} / {rp!r}); the alignment reading is invalid')
+                    continue
                 agg.append({'key': key, 'precision': p, 'random_baseline': rp, 'excess': p - rp, 'ratio': (p / rp) if rp else None, 'verdict': 'exceeds random baseline' if p > rp else ('at baseline (block-length artifact)' if abs(p - rp) < 1e-9 else 'below baseline')})
             out['panels'][d] = agg
     if out['problems']:

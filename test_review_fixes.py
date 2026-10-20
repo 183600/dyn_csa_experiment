@@ -5885,7 +5885,9 @@ def t_audit_boundary_rejects_invalid_readings():
         # must not crash the audit either.
         for bad in ({'precision': 'x', 'random_precision': 0.2},
                     {'precision': True, 'random_precision': 0.2},
-                    {'precision': float('nan'), 'random_precision': 0.2}):
+                    {'precision': float('nan'), 'random_precision': 0.2},
+                    {'precision': 1.4, 'random_precision': 0.2},
+                    {'precision': 0.8, 'random_precision': -0.1}):
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump({'a': {'boundary_alignment': bad}}, f)
             r = A.audit_boundary(outdirs=[d])
