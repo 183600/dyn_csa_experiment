@@ -1301,6 +1301,11 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
     out['status'] = ('fail' if problems else
                      'warn' if out['warnings'] else
                      ('not_verifiable_locally' if _unverifiable else 'ok'))
+    if not arms_present:
+        # An existing summary with none of the requested arms cannot verify a
+        # controlled comparison, even if the tuning artifact looks healthy.
+        out['status'] = 'fail' if problems else 'not_verifiable_locally'
+        out.setdefault('note', 'none of the requested arms is present in the summary — cross-arm fairness cannot be verified')
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -1368,6 +1373,11 @@ def audit_metrics(outdirs=None):
         out['status'] = 'warn'
     if not out['panels']:
         out['note'] = 'no local summaries — policy declarations were checked; record-level checks run on the experiment machine'
+        # A file that exists but holds no panels proves nothing about the
+        # records.  Do not leave the top-level verdict at 'ok' (the same
+        # fail-closed rule as an empty split cache).
+        if out['status'] == 'ok':
+            out['status'] = 'not_verifiable_locally'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 

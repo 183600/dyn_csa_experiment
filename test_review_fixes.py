@@ -4161,6 +4161,23 @@ def t_audit_fairness_nan_seed_does_not_crash():
                                     'ppl': 10.0, 'run_cfg': 'x'}}, f)
         out = A.audit_fairness(path, arms=['a'])
         assert out['arms']['a']['seeds'] == [], out
+        # A summary that does not contain any requested arm is not auditable.
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+        out_empty = A.audit_fairness(path, arms=['a'])
+        assert out_empty['status'] == 'not_verifiable_locally', out_empty
+        # The metric audit must not report 'ok' when there is no panel to
+        # check; policy declarations alone are not record-level verification.
+        old_repo = A.REPO
+        try:
+            A.REPO = d
+            os.makedirs(os.path.join(d, 'results_empty'), exist_ok=True)
+            with open(os.path.join(d, 'results_empty', 'summary.json'), 'w', encoding='utf-8') as f:
+                json.dump({}, f)
+            m = A.audit_metrics()
+            assert m['status'] != 'ok', m
+        finally:
+            A.REPO = old_repo
 
 
 def t_audit_split_empty_cache_is_not_ok():
