@@ -23,6 +23,7 @@ The held-out test split is NEVER read here.  Hyperparameters are selected on
 the validation split; the final comparison re-uses exactly those selections.
 """
 import json
+import math
 import os
 import sys
 import time
@@ -828,6 +829,15 @@ def _run_final(base, outdir, protocol, selected):
         st['significant_holm'] = bool(_h.get('reject') and (not st.get('within_seed_noise'))
                                       and st.get('controlled', True))
     _final_counts = {a: int(v.get('n_seeds') or 0) for a, v in arm_summary.items()}
+    # Resolution is a property of the per-contrast exact-test floors, not only
+    # of the seed count: ties (zero deltas) reduce the attainable p.  Report
+    # the zero-aware family floor so a resolution-limited tuned comparison is
+    # never read as a confirmed null.
+    _contrast_floors = []
+    for _a, _b in plan:
+        _st = comparison['contrasts'].get(f'{_a} - {_b}') or {}
+        _contrast_floors.append(_st.get('p_floor'))
+    _family_floor = L.holm_min_attainable_p_floors(_contrast_floors, 0.05)
     comparison['family'] = {
         'name': 'tuned_equal_budget_baselines',
         'm': _m, 'declared_m': _m, 'measured_contrasts': len(_named),
@@ -836,13 +846,23 @@ def _run_final(base, outdir, protocol, selected):
         'final_seed_count_by_arm': _final_counts,
         'final_seed_coverage_equal': (len(set(_final_counts.values())) == 1) if _final_counts else None,
         'min_seeds_for_family_significance': L.signflip_min_n_for_holm(_m, 0.05) if _m else None,
-        'note': 'per-arm validation-selected hyperparameters; a tuned win is NOT a strict same-run_cfg architectural contrast. Contrasts are declared per parameter-matching group; unmeasurable declared pairs stay in the Holm family with p=1.',
+        'contrast_p_floors': _contrast_floors,
+        'family_min_attainable_p_holm': _family_floor,
+        'family_resolution_limited': (bool(_family_floor > 0.05)
+                                      if isinstance(_family_floor, (int, float))
+                                      and math.isfinite(float(_family_floor)) else None),
+        'note': 'per-arm validation-selected hyperparameters; a tuned win is NOT a strict same-run_cfg architectural contrast. Contrasts are declared per parameter-matching group; unmeasurable declared pairs stay in the Holm family with p=1. The family floor is zero-aware: ties lower each contrast\'s attainable exact p.',
     }
     if _final_counts:
         _min_final = min(_final_counts.values())
         _need = comparison['family']['min_seeds_for_family_significance']
         if _min_final < 3:
             comparison['family']['warning'] = 'fewer than 3 final seeds per arm — descriptive only'
+        elif comparison['family']['family_resolution_limited'] is True:
+            comparison['family']['warning'] = (
+                f'the zero-aware minimum attainable Holm p for m={_m} is '
+                f'{_family_floor:.4g} > 0.05; the tuned contrast is resolution-limited '
+                '(add seeds or reduce ties/family), not a null')
         elif _need is not None and _min_final < _need:
             comparison['family']['warning'] = (
                 f'{_min_final} final seeds cannot reach Holm-corrected significance for m={_m} '

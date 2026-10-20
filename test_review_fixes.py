@@ -8042,6 +8042,15 @@ def t_zero_aware_family_resolution_floor():
     bad = L.reportable_claim(dict(st, n_nonzero=9), family_size=1)
     assert bad['allowed'] is False and any('n_nonzero=9 exceeds n=8' in r
                                            for r in bad['reasons']), bad
+    # Per-contrast floors: the family floor is m * min(floor), so a single
+    # tie-heavy contrast blocks the whole tuned family.
+    assert abs(L.holm_min_attainable_p_floors([0.03125, 0.5]) - 0.0625) < 1e-15
+    assert L.holm_min_attainable_p_floors([1.0, 0.5]) == 1.0
+    assert math.isnan(L.holm_min_attainable_p_floors([]))
+    # Malformed floors are treated as 1 (the least resolvable value), so they
+    # cannot shrink the family floor below the valid comparisons' minimum.
+    assert abs(L.holm_min_attainable_p_floors([0.03125, None, 'x']) - 0.09375) < 1e-15
+    assert L.holm_min_attainable_p_floors([None, 'x']) == 1.0
 
 
 def t_scale_meta_refuses_visible_attrition():

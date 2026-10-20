@@ -9650,6 +9650,32 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     return min(1.0, m * signflip_p_floor(n))
 
 
+def holm_min_attainable_p_floors(p_floors, alpha=0.05):
+    """Minimum attainable Holm p from per-comparison exact-test floors.
+
+    ``holm_min_attainable_p`` assumes every comparison has the same all-nonzero
+    floor ``2/2**n``.  In practice ties reduce a comparison's effective n, so
+    its exact p cannot go below ``2/2**(#nonzero)``.  Given each comparison's
+    own floor, the smallest attainable family-adjusted p is ``m * min(floor)``
+    (Holm's first step).  Missing/invalid floors are treated as 1.0 so a
+    malformed comparison cannot make the family look more resolvable.
+    """
+    _validated_alpha(alpha, context='holm_min_attainable_p_floors alpha')
+    try:
+        vals = list(p_floors)
+    except TypeError:
+        return float('nan')
+    if not vals:
+        return float('nan')
+    floors = []
+    for v in vals:
+        f = _finite_scalar(v)
+        if f is None or not (0.0 <= f <= 1.0):
+            f = 1.0
+        floors.append(float(f))
+    return min(1.0, len(floors) * min(floors))
+
+
 def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     """Smallest seed count n for which a Holm-corrected exact sign-flip test
     can reach p_holm <= alpha EVEN IF every seed moves in the predicted
