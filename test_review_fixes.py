@@ -8268,6 +8268,16 @@ def t_tuning_margin_does_not_invent_precision():
     m = L.tuning_selection_margin(best, runner)
     assert m['method'] == 'paired_search_seeds' and m['n_paired'] == 2, m
     assert m['margin'] == 0.0 and m['decisive'] is False, m
+    # Both rows expose per-seed evidence but share fewer than two draws: the
+    # independent marginal SE is a different (unpaired) sample and must not
+    # rescue a decisive verdict here.
+    _lonely_b = {'ppl': 10.0, 'ppl_std': 0.1, 'n_seeds': 2,
+                 'seed_ppls': {'0': 10.0, '1': 10.0}}
+    _lonely_r = {'ppl': 9.0, 'ppl_std': 0.1, 'n_seeds': 2,
+                 'seed_ppls': {'2': 9.0, '3': 9.0}}
+    _lm = L.tuning_selection_margin(_lonely_b, _lonely_r)
+    assert _lm['method'] == 'insufficient_common_seeds', _lm
+    assert _lm['decisive'] is None and _lm['se'] is None, _lm
 
 
 def t_scale_ladder_missing_seed_plan_is_not_common():

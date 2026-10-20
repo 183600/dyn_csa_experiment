@@ -13528,6 +13528,7 @@ def tuning_selection_margin(best, runner, *, metric='ppl', direction='lower_is_b
 
     bmap, bprob = _seed_map(best)
     rmap, rprob = _seed_map(runner)
+    _paired_insufficient = False
     if bprob or rprob:
         # Malformed per-seed evidence is not the same as legacy evidence that
         # omits it: do NOT fall back to the independent-SE approximation.
@@ -13556,7 +13557,14 @@ def tuning_selection_margin(best, runner, *, metric='ppl', direction='lower_is_b
                         'method': 'paired_search_seeds',
                         'n_paired': len(common), 'common_seeds': common})
         else:
+            # Both rows DO expose per-seed evidence, but they do not share
+            # enough draws for a paired margin.  Falling back to the
+            # independent marginal SE would silently change the sample (and
+            # could call a decisive pick from the full row means), so leave
+            # the margin unverifiable instead.
             out['method'] = 'insufficient_common_seeds'
+            out['decisive'] = None
+            _paired_insufficient = True
     else:
         out['method'] = 'seed_ppls_unavailable'
     # Independent marginal-SE fallback, also reported for legacy-artifact
@@ -13574,7 +13582,7 @@ def tuning_selection_margin(best, runner, *, metric='ppl', direction='lower_is_b
             se_i = math.hypot(s1, s2)
             out['se_independent'] = float(se_i)
             out['decisive_independent'] = bool(margin > se_i)
-            if out['method'] != 'paired_search_seeds':
+            if out['method'] != 'paired_search_seeds' and not _paired_insufficient:
                 out.update({'se': float(se_i),
                             'z': (float(margin / se_i) if se_i > 0 else None),
                             'decisive': bool(margin > se_i),
