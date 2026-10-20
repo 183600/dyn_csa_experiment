@@ -257,7 +257,22 @@ def main(argv=None):
             report[tag] = False
             continue
         layers = layers_of(a, SEEDS)
-        _reasons = {s: L.pair_reason(rec(a, s), rec(b, s)) for s in SEEDS}
+
+        def _context_reason(ra, rb):
+            # `_variant_records` keeps one protocol group PER VARIANT, so the
+            # two arms can still come from different groups (e.g. clean vs
+            # warm).  `pair_reason` compares run_cfg/knobs/data, but protocol
+            # and warmup are not part of that fingerprint; require them here.
+            for _k in ('protocol', 'warm_steps'):
+                _va, _vb = ra.get(_k), rb.get(_k)
+                if (_va is None) != (_vb is None):
+                    return f'{_k} is unverifiable (only one arm carries it)'
+                if _va is not None and _va != _vb:
+                    return f'{_k} differs ({_va!r} != {_vb!r})'
+            return None
+
+        _reasons = {s: (L.pair_reason(rec(a, s), rec(b, s))
+                        or _context_reason(rec(a, s), rec(b, s))) for s in SEEDS}
         _why = sorted({r for r in _reasons.values() if r})
         _ok_seeds = [s for s in SEEDS if _reasons[s] is None]
         _gate_ok = not _why

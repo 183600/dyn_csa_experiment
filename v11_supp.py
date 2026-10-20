@@ -109,7 +109,16 @@ def v11_analysis(out='analysis_v11/stats.json'):
             if r.get('probe_params') is None:
                 _bad_cells.append((_k, 'no probe_params'))
                 continue
-            pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), str(r.get('mode', 'uniform')), json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
+            if r.get('synthesized'):
+                _bad_cells.append((_k, 'synthesized reconstruction is not an independent measurement'))
+                continue
+            if r.get('_code') != L.code_stamp():
+                _bad_cells.append((_k, 'stale code stamp'))
+                continue
+            if r.get('val_fp') in (None, ''):
+                _bad_cells.append((_k, 'no validation fingerprint'))
+                continue
+            pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), str(r.get('mode', 'uniform')), json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')), str(r.get('val_fp')))
             grp = cells.setdefault(pk, {})
             if r['seed'] in grp:
                 _dup_cells.append((_k, pk[:4], r['seed']))
@@ -120,10 +129,10 @@ def v11_analysis(out='analysis_v11/stats.json'):
         if _dup_cells:
             print(f'[v11 stats] {len(_dup_cells)} probe record(s) share a (cell, probe_params, seed) identity — their PPL is ambiguous and they are dropped from the pooling: ' + ', '.join((f'{k}' for k, _c, _s in _dup_cells[:4])))
         probe_cells = []
-        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
+        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
             assert means, (v, arm, Ln, rho, mode)
-            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': json.loads(_pp), '_code': _cd, 'recipe': _recipe, 'mean': float(np.mean(list(means.values()))), 'std': float(np.std(list(means.values()), ddof=1)) if len(means) > 1 else 0.0, 'n': len(means)})
+            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': json.loads(_pp), '_code': _cd, 'recipe': _recipe, 'val_fp': _vfp, 'mean': float(np.mean(list(means.values()))), 'std': float(np.std(list(means.values()), ddof=1)) if len(means) > 1 else 0.0, 'n': len(means)})
         contrasts = {}
 
         # The grouped lists are exactly what a scan of probe_cells would have
@@ -192,6 +201,15 @@ def v11_analysis(out='analysis_v11/stats.json'):
     if fit.get('deduped_by_d'):
         print(f'[v11 stats] crossover fit: duplicate widths dropped (token-matched panel kept): {fit["deduped_by_d"]}')
     scale384 = V10._ppl_by_seed('results_lm_v5_scale', full=True)
+    # `_panel_block` marks a stale configuration, but the paired contrasts
+    # below must not admit those records merely because both arms share the
+    # same OLD run_cfg.  Keep only the current code-semantics group.
+    _cur_sfx = f'_cs{L.code_stamp()}'
+    for _v in list(scale384):
+        scale384[_v] = {s: r for s, r in (scale384[_v] or {}).items()
+                        if isinstance(r, dict)
+                        and isinstance(r.get('run_cfg'), str)
+                        and r['run_cfg'].endswith(_cur_sfx)}
     panel = V8._panel_block
     comparisons = {}
 
@@ -264,8 +282,18 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     n384_ok = _n384_full is not None and _n384_arms.get('csa_fixed') == _n384_full and (len(_n384_set) == 1)
     _xo_hit = sum((1 for n in _xo_real.values() if n == n_xo))
     n_tree_min = n_pair_min
-    floor_p = L.signflip_p_floor(n_contr_max) if n_contr_max else float('nan')
-    floor_p_tree = L.signflip_p_floor(n_tree_min) if n_tree_min else float('nan')
+    # Zero paired deltas lower the attainable resolution.  Use the effective
+    # floor reported by each exact test instead of the theoretical all-nonzero
+    # 2/2**n (which would overstate what a tied contrast can establish).
+    _floors_all = [float(v['p_floor']) for v in contr_.values()
+                   if v.get('p_floor') is not None and math.isfinite(float(v['p_floor']))]
+    _floors_top = [float(v['p_floor']) for v in contr_.values()
+                   if v.get('n') == n_contr_max and v.get('p_floor') is not None
+                   and math.isfinite(float(v['p_floor']))]
+    floor_p = (min(_floors_top) if _floors_top
+               else (L.signflip_p_floor(n_contr_max) if n_contr_max else float('nan')))
+    floor_p_tree = (min(_floors_all) if _floors_all
+                    else (L.signflip_p_floor(n_tree_min) if n_tree_min else float('nan')))
     probe_ok = n_contr_max >= 6
     probe_tag = f'@ n={n_contr_max}' if n_contr_max else '@ n/a'
     _floor_fmt = lambda _p: f'{_p:.3f}' if isinstance(_p, float) and math.isfinite(_p) else 'n/a'
@@ -455,7 +483,11 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                 _tree_txt = f'本面板最弱的对比仍有 n={n_tree_min}，其下限为 {floor_p_tree:.3f}，跨不过 0.05——因此本报告的一切显著性主张只对上面的 n>={_weakest} 行成立，凡引用最弱对比（n={n_tree_min}）的段落一律按效应量 + 方向同向性表述。'
             else:
                 _tree_txt = f'本面板最弱的对比也有 n={n_tree_min}，其下限为 {floor_p_tree:.3f}，已可跨过 0.05——显著性主张按各对比自身的配对 n 成立。'
-            A(f'**统计读法**：n>={_weakest} 的格子共 {len(n6)} 个，其中 p<0.05 的 {len(sig)} 个（精确符号翻转在 n={_weakest} 的下限为 {L.signflip_p_floor(_weakest):.3f}）——注意这是**这些格子自己**的分辨率，不是整个面板的：{_tree_txt}p≥0.05 的格子同样不作显著性主张。')
+            _n6_floor = min((float(v['p_floor']) for v in n6
+                             if v.get('p_floor') is not None
+                             and math.isfinite(float(v['p_floor']))),
+                            default=L.signflip_p_floor(_weakest))
+            A(f'**统计读法**：n>={_weakest} 的格子共 {len(n6)} 个，其中 p<0.05 的 {len(sig)} 个（这些格子自己最细的可达下限为 {_n6_floor:.3f}，不是按 n={_weakest} 的理论值 {L.signflip_p_floor(_weakest):.3f}）——注意这是**这些格子自己**的分辨率，不是整个面板的：{_tree_txt}p≥0.05 的格子同样不作显著性主张。')
             A('')
         else:
             A(f'**统计读法**：本面板实际最大 n={n_contr_max}，精确符号翻转的 p 值下限为 {_floor_txt}，**无法**在该种子数下跨过 0.05。因此下文所有 Δ 一律按效应量 + 方向同向性表述，不作显著性主张；p 值仅作分辨率下限的记录。')

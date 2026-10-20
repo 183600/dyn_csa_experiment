@@ -1231,6 +1231,26 @@ def _equal_token_slices():
         for _h in (ha, hb):
             for s in _stale:
                 _h.pop(s, None)
+        # Same admission rules as `_scale_crossovers`: a synthesized
+        # reconstruction is not an independent scale point, and a seed may not
+        # pair two curves measured under different run_cfg values.
+        _synth = sorted(s for s in (set(ha) & set(hb))
+                        if getattr(ha, 'per_seed_synth', {}).get(s)
+                        or getattr(hb, 'per_seed_synth', {}).get(s))
+        if _synth:
+            print(f'[stats] {name}: seed(s) {_synth} carry a SYNTHESIZED reconstruction — excluded from equal-token slices')
+            for _h in (ha, hb):
+                for s in _synth:
+                    _h.pop(s, None)
+        _cfg_a = getattr(ha, 'per_seed_cfg', {})
+        _cfg_b = getattr(hb, 'per_seed_cfg', {})
+        _cfg_bad = [s for s in (set(ha) & set(hb))
+                    if _cfg_a.get(s) != _cfg_b.get(s)]
+        if _cfg_bad:
+            print(f'[stats] {name}: seed(s) {_cfg_bad} pair curves measured under a DIFFERENT run_cfg — excluded from equal-token slices')
+            for _h in (ha, hb):
+                for s in _cfg_bad:
+                    _h.pop(s, None)
         _panel_hists[name] = {'csa_fixed': ha, 'full': hb}
         hists = _panel_hists[name]
         tps = _tokens_per_step(spec['outdir'], fallback=spec['batch'] * spec['seq'], raw=_raw)
@@ -1241,7 +1261,9 @@ def _equal_token_slices():
         if _ep is not None:
             entry['endpoint'] = _ep
         else:
-            entry['status'] = 'missing'
+            entry['status'] = 'reconstruction_only' if _synth else 'missing'
+        if _synth:
+            entry['excluded_reconstructed'] = _synth
         conf[name] = entry
 
     def _gap_at(name, step):
@@ -1312,11 +1334,22 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if r.get('probe_params') is None:
                 _bad_cells.append((k, 'no probe_params'))
                 continue
+            if r.get('synthesized'):
+                _bad_cells.append((k, 'synthesized reconstruction is not an independent measurement'))
+                continue
+            if r.get('_code') != L.code_stamp():
+                _bad_cells.append((k, 'stale code stamp'))
+                continue
+            if r.get('val_fp') in (None, ''):
+                _bad_cells.append((k, 'no validation fingerprint'))
+                continue
             _mode = str(r.get('mode', 'uniform'))
             # the grouping key carries the mode EXPLICITLY (probe_params' mode
             # field is normalised out by _fp_norm): uniform and natural cells
-            # at the same rho must never merge into one pooled cell.
-            key = (r['variant'], r['arm'], r['eval_len'], r['rho'], _mode, json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
+            # at the same rho must never merge into one pooled cell.  val_fp is
+            # part of the identity: different evaluation corpora are not one
+            # cell.
+            key = (r['variant'], r['arm'], r['eval_len'], r['rho'], _mode, json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')), str(r.get('val_fp')))
             grp = cells.setdefault(key, {})
             if r['seed'] in grp:
                 _dup_cells.append((k, key[:5], r['seed']))
@@ -1328,10 +1361,10 @@ def v10_analysis(out='analysis_v10/stats.json'):
         if _new_bad:
             print(f'[v10 stats] {len(_new_bad)} record(s) in {sp} lack `probe_params` and are dropped from every mean/paired statistic: ' + ', '.join((f'{k}({why})' for k, why in _new_bad[:4])))
         probe_cells = []
-        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
+        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
             assert means, (v, arm, Ln, rho, mode)
-            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
+            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'val_fp': _vfp, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
         contrasts = {}
 
         # The grouped lists are exactly what a scan of probe_cells would have
@@ -1421,7 +1454,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             v = math.fsum(ns) / tot
             return v if math.isfinite(v) else float('nan')
 
-        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe), by_seed in sorted(cells.items()):
+        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp), by_seed in sorted(cells.items()):
             if mode == 'uniform' and abs(float(rho)) < 1e-12:
                 continue
             # the clean baseline is the SAME arm's rho=0 uniform cell under the
@@ -1439,7 +1472,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     _pp_obj = None
                 if isinstance(_pp_obj, dict):
                     _pp_clean = json.dumps(_clean_probe_params(_pp_obj), sort_keys=True)
-            clean_key = (v, arm, Ln, 0.0, 'uniform', _pp_clean, _cd, _recipe)
+            clean_key = (v, arm, Ln, 0.0, 'uniform', _pp_clean, _cd, _recipe, _vfp)
             clean_grp = cells.get(clean_key) or {}
             if not clean_grp:
                 continue
