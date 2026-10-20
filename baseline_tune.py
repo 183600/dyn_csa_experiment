@@ -781,11 +781,14 @@ def run_simple(base_cfg=None, outdir='results_baseline_tuning', protocol=None):
     path = os.path.join(outdir, 'simple_baseline.json')
     L.atomic_write_json(path, artifact)
     audit = L.simple_baseline_audit(path=path)
-    print('[simple] best count-model floor: %s PPL=%.4f  audit=%s' % (
-        artifact.get('best_baseline'), float(artifact.get('best_ppl') or float('nan')), audit.get('status')))
+    print('[simple] best count-model floor: %s PPL=%.4f (%s)  audit=%s' % (
+        artifact.get('best_baseline'), float(artifact.get('best_ppl') or float('nan')),
+        artifact.get('best_ppl_estimation_rows') or 'full_validation', audit.get('status')))
     for arm, entry in sorted((artifact.get('baselines') or {}).items()):
-        print('  %-8s selected %s  validation PPL=%.4f' % (
-            arm, entry.get('selected'), float(entry.get('selected_metric_value') or float('nan'))))
+        _hold = entry.get('holdout_metric_value')
+        print('  %-8s selected %s  selection PPL=%.4f%s' % (
+            arm, entry.get('selected'), float(entry.get('selected_metric_value') or float('nan')),
+            (f'  holdout PPL={float(_hold):.4f}' if _hold is not None else '')))
     if not audit.get('baseline_verified'):
         raise RuntimeError(f'[simple] count-model artifact failed its audit: {audit.get("problems")}')
     return artifact
