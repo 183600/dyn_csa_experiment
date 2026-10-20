@@ -296,15 +296,25 @@ def _rec_by_cell(summary, run_fingerprint=None):
 
 
 def _paired(cells, va, vb, seeds):
-    ds, ppl_ds, used = [], [], []
+    """Paired per-seed deltas that ALSO clear the controlled-comparator gate.
+
+    A seed whose records differ in an undeclared setting is excluded from the
+    delta list (and named in `rejected`); including it would let an optimizer /
+    schedule / evaluation-slice change masquerade as the block-reading effect.
+    """
+    ds, ppl_ds, used, rejected = [], [], [], []
     for s in seeds:
         a, b = cells.get((va, s)), cells.get((vb, s))
         if a is None or b is None:
             continue
+        reason = _controlled_reason(a['record'], b['record'])
+        if reason is not None:
+            rejected.append({'seed': int(s), 'reason': reason})
+            continue
         ds.append(float(a['nll'] - b['nll']))
         ppl_ds.append(float(a['ppl'] - b['ppl']))
         used.append(int(s))
-    return ds, ppl_ds, used
+    return ds, ppl_ds, used, rejected
 
 
 def _cell_diagnostics(rec):
@@ -381,17 +391,31 @@ def _controlled_reason(a, b):
             'code', 'amp_dtype', 'eager_batch')
     for k in keys:
         va, vb = ha.get(k), hb.get(k)
-        if va is not None and vb is not None and va != vb:
+        if va is None and vb is None:
+            # Legacy/legacy is the only permissive path: both records omit the
+            # setting, so it cannot be shown to differ (and cannot be shown to
+            # match either).  A ONE-SIDED value is unverifiable, not a pass.
+            continue
+        if (va is None) != (vb is None):
+            return f'{k} is unverifiable (only one record carries it)'
+        if va != vb:
             return f'{k} differs ({va!r} != {vb!r})'
     if a.get('code') != b.get('code'):
         return f"code stamp differs ({a.get('code')!r} != {b.get('code')!r})"
-    if a.get('params') is not None and b.get('params') is not None and a.get('params') != b.get('params'):
-        return f"parameter count differs ({a.get('params')!r} != {b.get('params')!r})"
+    pa, pb = a.get('params'), b.get('params')
+    if (pa is None) != (pb is None):
+        return 'parameter count is unverifiable (only one record carries it)'
+    if pa is not None and pa != pb:
+        return f"parameter count differs ({pa!r} != {pb!r})"
     if a.get('run_fingerprint') != b.get('run_fingerprint'):
         return 'run_fingerprint differs (recipe/backend/matrix changed)'
     for k in ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp', 'rng_fp'):
         va, vb = a.get(k), b.get(k)
-        if va is not None and vb is not None and va != vb:
+        _ha = va is not None and str(va) != ''
+        _hb = vb is not None and str(vb) != ''
+        if _ha != _hb:
+            return f'{k} is unverifiable (only one record carries it)'
+        if _ha and str(va) != str(vb):
             return f'{k} differs ({va!r} != {vb!r})'
     oa = a.get('open_block_config') or {}
     ob = b.get('open_block_config') or {}
@@ -435,13 +459,8 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     def add(name, va, vb, *, family):
         if name in results:
             return results[name]
-        ds, ppl_ds, used = _paired(cells, va, vb, seeds)
-        # Controlled-comparator check on the first paired seed.
-        reasons = []
-        for s in used:
-            r = _controlled_reason(cells[(va, s)]['record'], cells[(vb, s)]['record'])
-            if r:
-                reasons.append(f'seed{s}: {r}')
+        ds, ppl_ds, used, rejected = _paired(cells, va, vb, seeds)
+        reasons = [f"seed{r['seed']}: {r['reason']}" for r in rejected]
         st = L.paired_effect_stats(ds, alpha=0.05, min_n=3) if ds else {'n': 0}
         st = dict(st)
         st.update({
@@ -449,6 +468,8 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
             'seeds': used, 'per_seed_delta_nll': ds, 'per_seed_delta_ppl': ppl_ds,
             'delta_convention': 'a - b; negative NLL delta means a is better',
             'controlled_violations': reasons,
+            'n_control_rejected': len(rejected),
+            'control_rejected_seeds': [r['seed'] for r in rejected],
             'p_holm': None,
         })
         results[name] = st
@@ -462,13 +483,20 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
                        variant(128, 'singletons'), variant(128, 'summary'), family='primary'))
     # Interaction: (summary - closed at None) - (summary - closed at 128),
     # computed seed-wise as Δ_none - Δ_128.
-    d_int, p_int, used_int = [], [], []
+    d_int, p_int, used_int, int_rejected = [], [], [], []
     for s in seeds:
         a = cells.get((variant(None, 'summary'), s))
         b = cells.get((variant(None, 'closed'), s))
         c = cells.get((variant(128, 'summary'), s))
         d = cells.get((variant(128, 'closed'), s))
         if None in (a, b, c, d):
+            continue
+        # The interaction contrasts two controlled pairs.  A seed that fails
+        # either pair's gate cannot contribute a controlled interaction.
+        _why = (_controlled_reason(a['record'], b['record'])
+                or _controlled_reason(c['record'], d['record']))
+        if _why is not None:
+            int_rejected.append({'seed': int(s), 'reason': _why})
             continue
         d_int.append(float((a['nll'] - b['nll']) - (c['nll'] - d['nll'])))
         p_int.append(float((a['ppl'] - b['ppl']) - (c['ppl'] - d['ppl'])))
@@ -479,7 +507,10 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
                'b': 'summary-128 - closed-128', 'seeds': used_int,
                'per_seed_delta_nll': d_int, 'per_seed_delta_ppl': p_int,
                'delta_convention': 'negative = prefix summary gains more when no cap',
-               'controlled_violations': [], 'p_holm': None})
+               'controlled_violations': [f"seed{r['seed']}: {r['reason']}" for r in int_rejected],
+               'n_control_rejected': len(int_rejected),
+               'control_rejected_seeds': [r['seed'] for r in int_rejected],
+               'p_holm': None})
     results[st['name']] = st
 
     # Secondary descriptive cells.
