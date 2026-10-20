@@ -4638,6 +4638,8 @@ def t_build_report_global_multiplicity_section():
         assert ok is True, st
         st2 = {'n': 3, 'mean': -1.0, 'std': 0.2, 'p_exact_signflip': 0.25, 'p_holm': 0.5}
         assert BR._sig_gate(st2, label='P0Y demo underpowered contrast', family='P0Y') is False
+        for _bad_alpha in (True, 0, 1, -0.1, 1.5, float('nan'), 'x'):
+            assert BR._sig_gate(st, alpha=_bad_alpha) is False, _bad_alpha
         # An unlabeled gate decision is counted and flagged, never lost.
         assert BR._sig_gate(st) is True
         assert BR._UNREGISTERED_GATES == 1, BR._UNREGISTERED_GATES

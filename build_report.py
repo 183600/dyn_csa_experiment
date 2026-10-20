@@ -1397,6 +1397,15 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
     report displays.  An unlabeled call is counted and flagged, never lost."""
     if not isinstance(st, dict):
         return False
+    # A threshold outside (0,1) would make every p "significant" (alpha>1) or
+    # none reachable (alpha<=0).  Fail closed instead of reporting under it.
+    _alpha = _as_finite(alpha)
+    if _alpha is None or not (0.0 < _alpha < 1.0):
+        return False
+    alpha = _alpha
+    _min_n = _int_or(min_n, 6)
+    if _min_n < 1:
+        _min_n = 6
     global _GATE_CALLS, _UNREGISTERED_GATES
     _GATE_CALLS += 1
     if label is None:
@@ -1409,7 +1418,7 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
     ph = _as_finite(st.get('p_holm'))
     mean, std = _as_finite(st.get('mean')), _as_finite(st.get('std'))
     try:
-        if n < int(min_n):
+        if n < _min_n:
             return False
         # Booleans/non-finite values are not p-values, and a negative p must
         # not pass every "< alpha" comparison.
