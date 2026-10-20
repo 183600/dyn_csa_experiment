@@ -4682,6 +4682,79 @@ def t_probe_stats_rejects_malformed_arm_identities():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def t_probe_stats_rejects_synthesized_and_mismatched_probe_params():
+    import v12_supp as V
+    manifest = {'arms': ['a'], 'seeds': [0, 1]}
+    td = tempfile.mkdtemp(prefix='probe_', dir=REPO)
+    try:
+        path = os.path.join(td, 'distractor.json')
+        code = L.code_stamp()
+
+        def _rec(arm, seed, pp):
+            return {'variant': 'a', 'seed': seed, 'val_fp': 'fp', 'arm': arm,
+                    'eval_len': 8, 'rho': 0.5, 'mode': 'uniform',
+                    'ppl_mean': 2.0 + 0.1 * seed + (0.05 if arm == 'dense' else 0.0),
+                    '_code': code, 'probe_params': dict(pp)}
+
+        base = {f'learned::{s}': _rec('learned', s, {'n_seq': 16})
+                for s in (0, 1)}
+        base.update({f'dense::{s}': _rec('dense', s, {'n_seq': 16})
+                     for s in (0, 1)})
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(base, f)
+        r = V._test_probe_stats(path, manifest, 'fp')
+        assert r['n_admitted'] == 4, r
+        assert len(r['contrasts']) == 1, r
+
+        # A synthesized probe trajectory is provenance, not a measurement.
+        synth = dict(base)
+        synth['learned::0'] = dict(synth['learned::0'], synthesized=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(synth, f)
+        r = V._test_probe_stats(path, manifest, 'fp')
+        assert r['n_admitted'] == 3, r
+        assert not r['cells'] or all(c['arm'] != 'learned' or c['n'] != 2
+                                     for c in r['cells']), r
+
+        # Two arms measured under different probe geometries must not be
+        # differenced as if they were one controlled contrast.
+        mixed = dict(base)
+        for s in (0, 1):
+            mixed[f'dense::{s}'] = _rec('dense', s, {'n_seq': 8})
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(mixed, f)
+        r = V._test_probe_stats(path, manifest, 'fp')
+        assert r['n_admitted'] == 4, r
+        assert not r['contrasts'], r
+        assert any('different probe_params' in x for x in r.get('contrast_exclusions', [])), r
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def t_audit_selection_rejects_boolean_measurements():
+    A = __import__('audit_gates')
+    td = tempfile.mkdtemp(prefix='selection_', dir=REPO)
+    try:
+        path = os.path.join(td, 'selection.json')
+        cell = {'arm': 'a', 'eval_len': 1024, 'k': 32, 'n_blocks': 256,
+                'n_queries': 100, 'recall_at_k': 0.5, 'mass_covered': 0.6,
+                'random_baseline': 0.125,
+                'per_seed': {str(s): {'mass_covered': 0.6,
+                                      'random_baseline': 0.125}
+                             for s in range(6)}}
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'cells': [dict(cell, mass_covered=True)]}, f)
+        r = A.audit_selection(path=path)
+        assert r['status'] == 'fail', r
+        assert any('booleans' in p for p in r['problems']), r
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'cells': [cell]}, f)
+        r = A.audit_selection(path=path)
+        assert r['status'] == 'ok', r
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def t_categorical_shift_empty_reference():
     r = L.categorical_shift_report([], [1, 2, 3])
     assert r['n_reference'] == 0 and r['n_holdout'] == 3, r
@@ -8479,6 +8552,8 @@ def main():
     _check('C5b by-length per-document row count', t_by_len_requires_one_ppl_per_row)
     _check('C5c plan endpoint and P5T preflight gate', t_plan_check_rejects_bad_endpoint_and_finaltest_is_gated)
     _check('C5b probe stats reject malformed arm identities', t_probe_stats_rejects_malformed_arm_identities)
+    _check('C5c probe stats reject synthesized/mismatched probe identities', t_probe_stats_rejects_synthesized_and_mismatched_probe_params)
+    _check('C5d selection audit rejects boolean measurements', t_audit_selection_rejects_boolean_measurements)
     _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)
     _check('C10 audit resolution classification', t_audit_resolution_classification)
     _check('C11 controlled-variable gate: mixed train_knobs', t_pair_reason_train_knobs_mixed)

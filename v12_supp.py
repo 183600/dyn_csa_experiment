@@ -1396,7 +1396,13 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
         why = None
         _seed_i = _record_int(r.get('seed'))
         _variant = r.get('variant')
-        if not isinstance(_variant, str) or _variant not in arms:
+        if r.get('synthesized'):
+            # A reconstructed probe trajectory is provenance, not an
+            # independent measurement.  The primary admission gate and the
+            # v10 probe analysis already reject it; the test-probe path must
+            # not become a back door into a descriptive contrast.
+            why = 'synthesized reconstruction is not an independent measurement'
+        elif not isinstance(_variant, str) or _variant not in arms:
             why = f"variant {_variant!r} is not one of the frozen arms"
         elif _seed_i is None or _seed_i not in seeds:
             why = f"seed {r.get('seed')!r} is outside the frozen whitelist"
@@ -1462,15 +1468,37 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
                              'mean': float(np.mean(list(by_seed.values()))),
                              'ppl_by_seed': {str(sd): p for sd, p in sorted(by_seed.items())}})
     # Descriptive paired contrasts against the learned arm on the same slice.
+    # A visible cell key deliberately omits probe_params/recipe/code so the
+    # display can show one row per cell; a CONTRAST must not do the same.
+    # Keep every full identity for a visible key: if it is ambiguous, or if
+    # the two arms were probed under different parameters/recipes/code, their
+    # difference would compare two different measurements.
     _idx = {}
-    for c in out['cells']:
-        if not c.get('ambiguous_cell'):
-            _idx[(c['variant'], c['arm'], c['eval_len'], c['rho'], c['mode'])] = c['ppl_by_seed']
-    for (v, arm, Ln, rho, mode), learned in sorted(_idx.items()):
-        if arm != 'learned':
+    _contrast_exclusions = []
+    for ident, by_seed in groups.items():
+        _idx.setdefault(ident[:5], []).append((ident, by_seed))
+    for (v, arm, Ln, rho, mode), learned_entries in sorted(_idx.items()):
+        if arm != 'learned' or len(learned_entries) != 1:
             continue
-        for (_v, other_arm, _Ln, _rho, _mode), other in sorted(_idx.items()):
-            if _v != v or _Ln != Ln or _rho != rho or _mode != mode or other_arm == 'learned':
+        _learned_id, learned = learned_entries[0]
+        for (_v, other_arm, _Ln, _rho, _mode), other_entries in sorted(_idx.items()):
+            if (_v != v or _Ln != Ln or _rho != rho or _mode != mode
+                    or other_arm == 'learned' or len(other_entries) != 1):
+                continue
+            _other_id, other = other_entries[0]
+            # ident = (variant, arm, eval_len, rho, mode, probe_params,
+            #          recipe, code); compare the measurement identity.
+            if _learned_id[5] != _other_id[5]:
+                _contrast_exclusions.append(
+                    f'contrast L{Ln} r{rho} [{mode}] {other_arm} - learned: '
+                    'the two arms carry different probe_params — pairing them '
+                    'would difference two different measurements')
+                continue
+            if _learned_id[6] != _other_id[6] or _learned_id[7] != _other_id[7]:
+                _contrast_exclusions.append(
+                    f'contrast L{Ln} r{rho} [{mode}] {other_arm} - learned: '
+                    'the two arms carry different recipe/code stamps — '
+                    'pairing them would mix two measurement semantics')
                 continue
             common = sorted(set(learned) & set(other), key=float)
             if len(common) < 2:
@@ -1480,8 +1508,11 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             res['seeds'] = [int(s) for s in common]
             res['delta_definition'] = f'{other_arm} - learned (paired per seed, test split, descriptive)'
             out['contrasts'][f'L{Ln} r{rho} [{mode}] {other_arm} - learned'] = res
+    out['contrast_exclusions'] = _contrast_exclusions
     if excluded:
         print('[p5t probe] EXCLUDED test-probe records (named, never silent):\n  - ' + '\n  - '.join(excluded[:20]) + ('' if len(excluded) <= 20 else f'\n  … {len(excluded) - 20} more'))
+    if _contrast_exclusions:
+        print('[p5t probe] EXCLUDED descriptive contrasts (named, never silent):\n  - ' + '\n  - '.join(_contrast_exclusions[:20]))
     return out
 
 

@@ -2169,6 +2169,14 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         if not isinstance(c.get('per_seed'), dict):
             out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed must be a seed -> measurement object')
             continue
+        # A Boolean is a flag, not a measurement: float(True) == 1.0 would
+        # silently certify a perfect recall/mass cell from a placeholder.
+        if any(isinstance(c.get(_k), (bool, np.bool_))
+               for _k in ('recall_at_k', 'mass_covered', 'random_baseline')):
+            out['problems'].append(
+                f'cell {i}: recall/mass/baseline must be numeric measurements, '
+                'not booleans')
+            continue
         try:
             k, B = _exact_int(c['k']), _exact_int(c['n_blocks'])
             el, nq = _exact_int(c['eval_len']), _exact_int(c['n_queries'])
