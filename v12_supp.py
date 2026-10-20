@@ -1071,6 +1071,23 @@ def run_finaltest(cfg=None, guard=None):
             raise SystemExit(f'[v12] REFUSE: the leakage audit did not produce a document-overlap result ({_doc!r}) — the npy caches are missing or unreadable, so train/test isolation cannot be verified before the one-shot test access')
         if _doc.get('policy_violation'):
             raise SystemExit(f'[v12] REFUSE: train/test document overlap (test-shingle overlap {_doc.get("test_shingle_overlap")}, max row overlap {_doc.get("max_row_overlap")}) exceeds the frozen policy — confirmation claims are UNAVAILABLE until the near-duplicate evaluation documents are cleaned (rebuild the test cache with exp_lib.load_wikitest, which filters them)')
+        # The leakage audit proves *provenance/overlap*; it does not re-check
+        # the split contract itself.  Require the split-discipline gate too,
+        # so exact train/test row overlap, document-group leakage, duplicate
+        # holdout rows and a material train->test distribution shift are all
+        # refused BEFORE the one-shot test access.  Warnings (e.g. a modest
+        # natural domain shift, or a legacy metadata field) remain visible in
+        # the audit output but do not by themselves invalidate the frozen
+        # panel; a hard failure or an unverifiable cache does.
+        try:
+            _sd = _AG.audit_split_discipline(cache_dirs=[_cache_dir])
+        except Exception as _sde:
+            raise SystemExit(f'[v12] REFUSE: the split-discipline audit could not run ({type(_sde).__name__}: {_sde}) — a confirmation claim requires a verifiable split audit, not an untested one')
+        if _sd.get('status') == 'not_verifiable_locally':
+            raise SystemExit(f'[v12] REFUSE: the split-discipline audit found no auditable cache under {_cache_dir} — build the frozen train/validation/test caches before using the one-shot test access')
+        if _sd.get('status') == 'fail':
+            _why = list(_sd.get('warnings') or [])
+            raise SystemExit(f'[v12] REFUSE: the split-discipline audit reports a hard failure ({"; ".join(_why[:4]) if _why else "see audit_gates.py split"}) — the held-out test split is not clean enough for a frozen confirmation')
     # first-test-access lock — the plan may not change after
     # the test split has been read, and the slice itself is part of the freeze.
     _check_or_write_freeze_lock(outdir, manifest, _dfp, stage='accessed',
