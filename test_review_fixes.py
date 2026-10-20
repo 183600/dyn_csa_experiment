@@ -4611,7 +4611,7 @@ def t_binary_threshold_and_calibration_contract():
     assert curve['threshold_sensitivity'] > 0.3, curve
     sel = L.select_binary_threshold(y, score, positive_label=1)
     assert sel['threshold'] == 0.4 and sel['value'] == 1.0, sel
-    assert sel['chance_f1_at_default_rule'] == sel['prevalence'] == 0.1, sel
+    assert sel['prevalence'] == 0.1 and sel['n_positive'] == 10, sel
     # The sweep is linear-time via cumulative counts; it must equal the
     # brute-force confusion matrix at every candidate, including score ties.
     _rng = np.random.default_rng(7)

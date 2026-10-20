@@ -13538,7 +13538,6 @@ def select_binary_threshold(y_true, y_score, *, positive_label=None, metric='f1'
             'default_0.5': curve['at_default_0.5'],
             'threshold_sensitivity': curve['threshold_sensitivity'],
             'prevalence': curve['prevalence'],
-            'chance_f1_at_default_rule': curve['prevalence'],
             'n': curve['n'], 'n_positive': curve['n_positive'],
             'threshold_grid_truncated': curve['threshold_grid_truncated']}
 
