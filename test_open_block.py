@@ -645,6 +645,29 @@ def t_open_record_identity_and_arm_summary():
     assert L.signflip_min_n_for_holm(3, 0.05) == 7, L.signflip_min_n_for_holm(3, 0.05)
     assert L.signflip_p_floor(6) > 0.05 / 3, L.signflip_p_floor(6)
 
+def t_open_seed_plan_preflight():
+    import contextlib
+    import io
+    import open_block_supp as OB
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        short = OB._announce_seed_plan(dict(OB.BASE_CFG), 'main')
+    assert short['n_seeds'] == 4 and short['primary_family_size'] == 3, short
+    assert short['primary_holm_min_seeds'] == 7, short
+    assert short['seeds_sufficient'] is False, short
+    assert 'WARNING' in buf.getvalue() and 'n>=7' in buf.getvalue(), buf.getvalue()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        enough = OB._announce_seed_plan(dict(OB.BASE_CFG, seeds=list(range(7))), 'main')
+    assert enough['seeds_sufficient'] is True, enough
+    assert 'WARNING' not in buf.getvalue(), buf.getvalue()
+    # Duplicate seed spellings are one draw, not extra power.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        dup = OB._announce_seed_plan(dict(OB.BASE_CFG, seeds=[0, 0, 1, 1, 2, 2, 3]), 'main')
+    assert dup['n_seeds'] == 4 and dup['seeds_sufficient'] is False, dup
+
+
 def t_open_block_hypotheses():
     # Each declared primary contrast must state mechanism, sign, metric and
     # falsifier; an unregistered primary comparison is a design defect.
@@ -679,6 +702,7 @@ CHECKS = [
     ('K12 analysis control gate drops uncontrolled seeds', t_open_analysis_control_gate),
     ('K13 open-block primary hypotheses declared', t_open_block_hypotheses),
     ('K14 record identity + arm Mean/SD + family seed floor', t_open_record_identity_and_arm_summary),
+    ('K15 seed-plan preflight before training', t_open_seed_plan_preflight),
 ]
 
 

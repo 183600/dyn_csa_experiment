@@ -952,6 +952,34 @@ def _parse_seeds(s):
     return [int(x) for x in str(s).split(',') if str(x).strip()]
 
 
+def _announce_seed_plan(cfg, label='main'):
+    """State the family-corrected seed requirement before a panel is trained.
+
+    The primary family has three declared Holm comparisons, so n=4 (and even
+    n=6) cannot reach a corrected claim.  Printing the floor here avoids
+    spending GPU time on a panel whose planned seed count already rules out the
+    claim it is meant to test.
+    """
+    _seeds = []
+    for s in (cfg.get('seeds') or []):
+        _s = L._as_seed_int(s)
+        if _s is not None and _s not in _seeds:
+            _seeds.append(_s)
+    need = L.signflip_min_n_for_holm(len(L.OPEN_BLOCK_HYPOTHESIS_DESIGN), 0.05)
+    sufficient = bool(need is not None and len(_seeds) >= need)
+    out = {'label': label, 'n_seeds': len(_seeds),
+           'primary_family_size': len(L.OPEN_BLOCK_HYPOTHESIS_DESIGN),
+           'primary_holm_min_seeds': need, 'seeds_sufficient': sufficient}
+    print(f'[open-block seed-plan] {label}: n={len(_seeds)}, primary family='
+          f'{out["primary_family_size"]}, family-corrected minimum n={need}, '
+          f'sufficient={sufficient}')
+    if not sufficient:
+        print(f'[open-block seed-plan] WARNING: {label} at n={len(_seeds)} is '
+              f'descriptive only; a family-corrected claim needs n>={need}. '
+              'Extend the key cells with more seeds before reading a p-value as significant.')
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('command', choices=['smoke', 'pilot', 'main', 'aux', 'extended', 'report'])
@@ -992,6 +1020,8 @@ def main():
         cfg['outdir'] = 'results_open_block_extended'
     if args.outdir is not None:
         cfg['outdir'] = args.outdir
+    if args.command in ('main', 'aux', 'extended'):
+        _announce_seed_plan(cfg, label=args.command)
     run_panel(cfg, matrix, device=L.DEVICE, synthetic=False,
               max_hours=args.max_hours,
               label='pilot' if args.command == 'pilot' else args.command)
