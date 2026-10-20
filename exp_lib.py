@@ -7363,13 +7363,20 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
 
     try:
         buf = []
+        # Documents already deduplicated for the TRAIN batch but left after the
+        # token cap is reached.  They are not emitted by train and must seed
+        # the validation stream instead of vanishing with the batch (which
+        # could make a small source "run dry" even though unique docs remain).
+        carry_pairs = []
         print(f'[data] tokenising fineweb train (cap {n_train_tokens} tokens, source {source}) ...')
         with open(raw_train, 'wb') as fh:
             def _write_train_pairs(pairs):
-                nonlocal buf, n_train_total, _marks
+                nonlocal buf, n_train_total, _marks, carry_pairs
+                carry_pairs = []
                 if not pairs:
                     return False
-                for (doc_id, _), enc in zip(pairs, tok.encode_batch([d for _, d in pairs])):
+                for _i, ((doc_id, _), enc) in enumerate(
+                        zip(pairs, tok.encode_batch([d for _, d in pairs]))):
                     buf.extend(enc.ids)
                     buf.append(eos_id)
                     train_doc_ids.append(int(_doc_id_u64(doc_id)))
@@ -7381,6 +7388,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                             _marks = n_train_total >> 26
                             print(f'    [train] {n_train_total} tokens')
                     if n_train_total + len(buf) >= cap_train:
+                        carry_pairs = list(pairs[_i + 1:])
                         return True
                 return n_train_total + len(buf) >= cap_train
 
@@ -7432,16 +7440,22 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
 
             stop = False
             while not stop:
-                docs = list(itertools.islice(rows, 4096))
-                if not docs:
-                    break
-                pairs = []
-                for doc_id, doc in docs:
-                    _dup, _kind = _dedup.is_duplicate(doc, fp=doc_id)
-                    if _dup:
-                        _skipped['validation'][_kind] += 1
-                    else:
-                        pairs.append((doc_id, doc))
+                if carry_pairs:
+                    # Already vetted by the train dedup pass; re-running the
+                    # deduper would classify them as duplicates and skip them.
+                    pairs = carry_pairs
+                    carry_pairs = []
+                else:
+                    docs = list(itertools.islice(rows, 4096))
+                    if not docs:
+                        break
+                    pairs = []
+                    for doc_id, doc in docs:
+                        _dup, _kind = _dedup.is_duplicate(doc, fp=doc_id)
+                        if _dup:
+                            _skipped['validation'][_kind] += 1
+                        else:
+                            pairs.append((doc_id, doc))
                 stop = _write_val_pairs(pairs)
             if buf:
                 _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
@@ -8046,6 +8060,21 @@ def _gpu_corpus_cache_fits(nbytes, device):
         return True
 
 _NARROW_MEMO = {}
+_NARROW_MEMO_CAP = 4
+
+
+def _narrow_memo_put(key, ref, arr):
+    """Store one narrowed corpus with a bounded, dead-entry-pruned cache.
+
+    Keying on ``id(train_ids)`` without eviction retained every corpus for the
+    process lifetime, which is a real leak when a scale sweep loads successive
+    multi-million-token arrays.
+    """
+    for _k in [k for k, (r, _v) in _NARROW_MEMO.items() if r() is None]:
+        _NARROW_MEMO.pop(_k, None)
+    if key not in _NARROW_MEMO and len(_NARROW_MEMO) >= _NARROW_MEMO_CAP:
+        _NARROW_MEMO.pop(next(iter(_NARROW_MEMO)))
+    _NARROW_MEMO[key] = (ref, arr)
 
 
 def _cache_id_upper_bound(path):
@@ -8122,7 +8151,7 @@ def _ids_narrow(train_ids):
                 if (int(_n.size) == int(train_ids.size)
                         and tuple(_n.shape) == tuple(train_ids.shape)
                         and np.dtype(_n.dtype) == np.dtype(np.int32)):
-                    _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+                    _narrow_memo_put(_key, _weakref.ref(train_ids), _n)
                     return _n
             _mx = _cache_id_upper_bound(_path)
             if _mx is None:
@@ -8149,7 +8178,7 @@ def _ids_narrow(train_ids):
                         pass
                     raise
                 _n = np.load(_side, mmap_mode='r')
-                _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+                _narrow_memo_put(_key, _weakref.ref(train_ids), _n)
                 return _n
         except (OSError, ValueError, TypeError):
             pass
@@ -8158,7 +8187,7 @@ def _ids_narrow(train_ids):
         _mx = int(train_ids.max()) if train_ids.size else -1
     if train_ids.size and _mx < 2 ** 31:
         _n = train_ids.astype(np.int32)
-        _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+        _narrow_memo_put(_key, _weakref.ref(train_ids), _n)
         return _n
     return train_ids
 
@@ -18833,6 +18862,10 @@ def _normalise_amp_mode(v):
 
 
 def _normalise_eager_batch(v):
+    if v is None:
+        return None
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
     if isinstance(v, str):
         s = v.strip().lower()
         if s in ('', 'auto'):
@@ -18841,7 +18874,17 @@ def _normalise_eager_batch(v):
             return True
         if s in ('0', 'false', 'no', 'off'):
             return False
-    return bool(v)
+        raise ValueError(f"unknown eager_batch {v!r} (use true/false or auto)")
+    if isinstance(v, numbers.Integral):
+        if int(v) in (0, 1):
+            return bool(int(v))
+    elif isinstance(v, numbers.Real):
+        f = float(v)
+        if math.isfinite(f) and f in (0.0, 1.0):
+            return bool(int(f))
+    # A typo such as 'flase', NaN or 1.5 must not silently select the batched
+    # backend; make the caller state the mode explicitly.
+    raise ValueError(f"unknown eager_batch {v!r} (use true/false or auto)")
 
 
 def _resolve_impl_modes(cfg=None, *, device=None):
@@ -19501,7 +19544,10 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             opt.zero_grad(set_to_none=True)
             _ce_d = ce.detach()
             _lbuf.append(_ce_d)
-            _tail.append(_ce_d)
+            # Keep a Python float here: `_is_finite_number` rejects tensors
+            # (they are not numbers.Number), so appending the tensor made
+            # `final_loss_smoothed` permanently None.
+            _tail.append(float(_ce_item) if _ce_item is not None else float('nan'))
             # Drop this step's graph/scalar references before the next forward.
             del loss, ce
             _inner_model.comp_reg = None
@@ -22424,7 +22470,19 @@ def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch, devi
     # stable, but a non-default ceiling must invalidate resumed cells.
     _am = _adaptive_max_limit()
     _am_tok = '' if _am == (1 << 20) else f'_am{_am}'
-    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_tk{_tk}_amp{_amp}_eb{int(_eb)}_ae{_ae}{_am_tok}_cs{code_stamp()}'
+    # The task/synthetic recipe (`data_extra`) is part of the data identity.
+    # Keep the token absent when it is unset so legacy default fingerprints
+    # stay stable, but a recipe change must invalidate resume.
+    _de = cfg.get('data_extra')
+    _de_tok = ''
+    if _de:
+        try:
+            _de_tok = '_de' + hashlib.sha256(
+                json.dumps(_de, sort_keys=True, default=str).encode('utf-8')
+            ).hexdigest()[:16]
+        except (TypeError, ValueError):
+            _de_tok = '_de' + str(_de)[:64]
+    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}{_de_tok}_tk{_tk}_amp{_amp}_eb{int(_eb)}_ae{_ae}{_am_tok}_cs{code_stamp()}'
 
 
 def _plan_run(cfg, summary_path, fp):

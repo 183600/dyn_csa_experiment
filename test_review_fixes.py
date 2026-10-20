@@ -1310,6 +1310,11 @@ def t_training_knobs_in_resume_fingerprint():
         else:
             os.environ['CSA_ADAPTIVE_MAX_TOKENS'] = _old_am
     assert fp4 != fp1 and '_am2048' in fp4, (fp1, fp4)
+    # The task/synthetic recipe is part of the data identity.
+    _de1 = L._run_fp(dict(cfg, data_extra={'n_pairs': 4}), 8, 1, 1, 8, 16, tr, va)
+    _de2 = L._run_fp(dict(cfg, data_extra={'n_pairs': 8}), 8, 1, 1, 8, 16, tr, va)
+    assert _de1 != _de2 and '_de' in _de1, (_de1, _de2)
+    assert L._run_fp(dict(cfg), 8, 1, 1, 8, 16, tr, va) == fp1, 'unset data_extra must keep legacy fingerprints stable'
 
 
 def t_controlled_variables_all_seed_records():
@@ -2380,6 +2385,9 @@ def t_train_variant_reproducible():
     # Token accounting: draws are not unique tokens; the estimate must be
     # present, bounded, and strictly below the draw count on an undersized cache.
     assert a['tokens_seen'] == 4 * 2 * 32, a['tokens_seen']
+    # The smoothed tail is stored as numbers, not tensors; a tensor tail was
+    # silently filtered to None for every run.
+    assert a['final_loss_smoothed'] is not None, a.get('final_loss_smoothed')
     assert a.get('tokens_seen_unique_frac_estimate') is not None and 0.0 < a['tokens_seen_unique_frac_estimate'] <= 1.0, a
     assert a['tokens_seen_unique_estimate'] <= len(ids), a
     b = L.train_variant('full', ids, val, 997, seed=3, **kw)
@@ -8128,6 +8136,22 @@ def t_pool_kernel_empty_sequence_matches_eager():
     assert y2.shape == (1, 0, 3) and last2.shape == (1, 0) and Bm2 == 0, (y2.shape, last2.shape, Bm2)
 
 
+
+def t_eager_batch_rejects_typos_and_nonfinite():
+    assert L._normalise_eager_batch(None) is None
+    assert L._normalise_eager_batch(True) is True
+    assert L._normalise_eager_batch('auto') is None
+    assert L._normalise_eager_batch('false') is False
+    assert L._normalise_eager_batch(0) is False and L._normalise_eager_batch(1.0) is True
+    for bad in ('flase', 'maybe', float('nan'), 1.5, -1, 2):
+        try:
+            L._normalise_eager_batch(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'eager_batch={bad!r} was silently coerced')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8386,6 +8410,7 @@ def main():
     _check('L40 archive refuses links and repo escape', t_archive_refuses_links_and_repo_escape)
     _check('L41 warmup table uses the primary estimand', t_build_report_warmup_uses_primary_estimand)
     _check('L42 empty-sequence pool kernel matches eager', t_pool_kernel_empty_sequence_matches_eager)
+    _check('L43 eager_batch rejects typos/non-finite values', t_eager_batch_rejects_typos_and_nonfinite)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
