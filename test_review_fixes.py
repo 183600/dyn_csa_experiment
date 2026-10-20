@@ -5420,6 +5420,15 @@ def t_capped_document_id_sidecar():
 
 
 def t_document_dedup_closes_near_duplicate_chains():
+    for _kw in ({'near_threshold': -1}, {'near_threshold': 1.5},
+                {'near_threshold': True}, {'bands': 2.5}, {'bands': True},
+                {'bands': 0}, {'bands': 9}, {'near_threshold': 65}):
+        try:
+            L._DocDeduplicator(**_kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'_DocDeduplicator({_kw!r}) must be refused')
     # A~T is skipped as a near duplicate of train T.  B is within the near
     # threshold of A but just outside it for T, so a stateless bucket index
     # would admit B into validation even though it belongs to the same

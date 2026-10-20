@@ -7032,10 +7032,17 @@ class _DocDeduplicator:
     """
 
     def __init__(self, *, near_threshold=3, bands=4):
-        if bands < 1 or bands > 8:
-            raise ValueError('bands must be in [1, 8]')
-        self.near_threshold = int(near_threshold)
-        self.bands = int(bands)
+        # Both controls define the LSH geometry.  int(2.5) would silently run
+        # a different band layout, and a negative threshold disables near
+        # duplicate detection while looking like a validated setting.
+        _near = _as_seed_int(near_threshold)
+        if _near is None or not (0 <= _near <= 64):
+            raise ValueError(f'near_threshold must be an integer in [0, 64], got {near_threshold!r}')
+        _bands = _as_seed_int(bands)
+        if _bands is None or not (1 <= _bands <= 8):
+            raise ValueError(f'bands must be an integer in [1, 8], got {bands!r}')
+        self.near_threshold = _near
+        self.bands = _bands
         self.bits = 64 // self.bands
         self.mask = (1 << self.bits) - 1
         self.exact = set()
