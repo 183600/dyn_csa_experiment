@@ -457,8 +457,33 @@ def _family_holm_floor(ns, m_comparisons):
     The first Holm gate is reachable through the BEST-POWERED member, so the
     family floor uses max(n), not min(n).  A missing/zero-n comparison cannot
     carry the family and is ignored (it still occupies its declared m slot).
+
+    Items may be plain seed counts (legacy callers) or result dicts carrying
+    ``n`` and ``n_nonzero``.  Exact zero paired differences do not change the
+    sign-flip p value but DO lower its attainable resolution, so the
+    dict form uses the non-zero pair count (mapping all-zero to 1, floor 1)
+    exactly like ``exp_lib.paired_effect_stats``.  Reading only ``n`` here
+    would overstate the family's power whenever a contrast has ties.
     """
-    used = [int(n) for n in (ns or []) if _as_positive_int(n) is not None]
+    used = []
+    for item in (ns or []):
+        if isinstance(item, dict):
+            _n = _as_positive_int(item.get('n'))
+            if _n is None:
+                continue
+            _nn_raw = item.get('n_nonzero')
+            # n_nonzero=0 is a REAL measurement (all ties), not a missing
+            # value: use the non-negative parser so it maps to floor 1.
+            _nn = (L._as_seed_int(_nn_raw)
+                   if _nn_raw is not None else None)
+            if _nn is None or _nn < 0 or _nn > _n:
+                used.append(_n)
+            else:
+                used.append(_nn if _nn > 0 else 1)
+            continue
+        _n = _as_positive_int(item)
+        if _n is not None:
+            used.append(_n)
     m = _as_positive_int(m_comparisons)
     if not used or m is None:
         return None
@@ -603,8 +628,11 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     _prim_n = [int(results[n].get('n') or 0) for n in prim_names if results[n].get('n')]
     _prim_n_min = min(_prim_n) if _prim_n else 0
     _prim_n_max = max(_prim_n) if _prim_n else 0
-    _holm_floor = (_family_holm_floor(_prim_n, len(prim_names))
-                   if _prim_n and prim_names else None)
+    # Carry n_nonzero through the family floor: reading only the pair count
+    # would claim a resolution the tied contrasts cannot reach.
+    _prim_entries = [results[n] for n in prim_names if results[n].get('n')]
+    _holm_floor = (_family_holm_floor(_prim_entries, len(prim_names))
+                   if _prim_entries and prim_names else None)
     _holm_min_n = (L.signflip_min_n_for_holm(len(prim_names), 0.05)
                    if prim_names else None)
     os.makedirs(analysis_dir, exist_ok=True)

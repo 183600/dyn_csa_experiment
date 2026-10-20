@@ -558,6 +558,11 @@ def t_open_analysis_control_gate():
     # member (max n), matching attach_holm.
     assert OB._family_holm_floor([8, 4, 1], 3) == L.holm_min_attainable_p(8, 3, 0.05)
     assert OB._family_holm_floor([1, 1, 1], 3) > OB._family_holm_floor([8, 4, 1], 3)
+    # Result dicts carry zero ties: n=8 with 4 zero deltas has only 4
+    # non-zero signs, so its attainable floor is that of n=4, not n=8.
+    assert OB._family_holm_floor([{'n': 8, 'n_nonzero': 4}], 3) == \
+        L.holm_min_attainable_p(4, 3, 0.05)
+    assert OB._family_holm_floor([{'n': 8, 'n_nonzero': 0}], 3) == 1.0
 
 def t_open_block_hypotheses():
     # Each declared primary contrast must state mechanism, sign, metric and

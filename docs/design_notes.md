@@ -1526,3 +1526,11 @@ DL 合并值的定义。这样「大模型上效应更大/更小」的合并区�
 `underpowered=True` 及 `claim_level` 文本矛盾。现在保留原始检验旗标
 `significant_raw`，但交互层 `significant` 同时要求未 underpowered 且未
 resolution-limited；调用方给出的最低 n 门槛不能再只停留在说明文字里。
+
+### 29.8 开放块主族的族下限也必须使用非零差值计数
+
+`open_block_supp._family_holm_floor` 过去只接收各主对比的配对 `n`。零差值
+不改变符号翻转 p，却降低可达分辨率；当某主对比有大量 ties 时，按 `n`
+计算会把族下限说得比实际更细。现在 helper 同时接受旧式整数与结果字典：
+字典形式优先使用 `n_nonzero`（全零映射为 1，下限 1），越界/缺失才回退
+`n`。`analyse` 改为传入完整主对比结果，而不是只传 `n` 列表。
