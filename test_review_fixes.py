@@ -6778,6 +6778,14 @@ def t_efficiency_accuracy_tradeoff_summary():
         {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0}])
     b = [r for r in unk if r['variant'] == 'b'][0]
     assert b['distinguishable'] is None and 'ppl_uncertainty_unverifiable' in b['flags'], b
+    zero = BR.efficiency_accuracy_summary([
+        {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0},
+        {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0},
+        {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0},
+        {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0}])
+    zb = [r for r in zero if r['variant'] == 'b'][0]
+    assert zb['distinguishable'] is None, zb
+    assert 'zero_within_seed_variance_unverifiable' in zb['flags'], zb
 
 
 def t_report_error_analysis_section():

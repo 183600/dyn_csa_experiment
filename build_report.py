@@ -1869,7 +1869,10 @@ def efficiency_accuracy_summary(items):
             continue
         if r['ppl_sem'] is not None and ref['ppl_sem'] is not None:
             r['noise_2se'] = 2.0 * math.sqrt(r['ppl_sem'] ** 2 + ref['ppl_sem'] ** 2)
-            r['distinguishable'] = abs(r['ppl_mean'] - ref['ppl_mean']) > r['noise_2se']
+            # Zero sample variance from a tiny seed set is not evidence of
+            # zero noise; it is an unverifiable uncertainty estimate.
+            r['distinguishable'] = (None if r['noise_2se'] == 0.0
+                                    else abs(r['ppl_mean'] - ref['ppl_mean']) > r['noise_2se'])
         else:
             r['noise_2se'] = None
             r['distinguishable'] = None
@@ -1880,6 +1883,8 @@ def efficiency_accuracy_summary(items):
             flags.append('ppl_gain_within_seed_noise')
         if r['distinguishable'] is None:
             flags.append('ppl_uncertainty_unverifiable')
+        if r['noise_2se'] == 0.0:
+            flags.append('zero_within_seed_variance_unverifiable')
         if r['latency_ratio_vs_best'] is not None and r['latency_ratio_vs_best'] >= 2.0:
             flags.append('latency_2x_or_more')
         if r['params_ratio_vs_best'] is not None and r['params_ratio_vs_best'] >= 2.0:
