@@ -11001,6 +11001,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         underpowered = bool(paired.get('underpowered'))
         _underpowered_points = ([] if not underpowered
                                 else list(paired.get('seeds') or []))
+        _within_seed_noise = bool(paired.get('within_seed_noise'))
     else:
         # Without a complete-seed paired slope the trend is a regression over
         # point means.  A point whose mean rests on fewer than `min_seeds`
@@ -11009,11 +11010,15 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         _underpowered_points = [p['label'] for p in pts
                                 if len(p['effects']) < int(min_seeds)]
         underpowered = bool(_underpowered_points)
+        _within_seed_noise = False
     too_few_scales = k < int(min_points)
     _incomplete = bool(_incomplete_points or _empty_points or _invalid_scale_points)
+    # Same claim contract as paired_effect_stats/reportable_claim: an exact
+    # test can reject while the per-seed slopes are still within their own
+    # spread.  Such a trend is not a usable scaling signal.
     sig = bool(p_primary is not None and math.isfinite(float(p_primary)) and float(p_primary) < alpha
                and not resolution_limited and not underpowered and not too_few_scales
-               and not _incomplete)
+               and not _incomplete and not _within_seed_noise)
     het = het_for_verdict
     heterogeneous = bool(float(het.get('I2_percent') or 0.0) > 75.0 or (isinstance(het.get('p'), float) and math.isfinite(het['p']) and het['p'] < alpha))
     # Direction must come from the same slope that carries the inference.  The
@@ -11028,6 +11033,9 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out['resolution_limited'] = resolution_limited
     out['underpowered'] = underpowered
     out['underpowered_points'] = _underpowered_points
+    out['within_seed_noise'] = _within_seed_noise
+    out['effect_vs_noise'] = ('within_seed_noise' if _within_seed_noise
+                              else 'exceeds_seed_noise')
     out['direction_slope'] = direction_slope
     if heterogeneous:
         verdict = 'heterogeneous_trend'
@@ -11041,6 +11049,8 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         verdict = 'insufficient_points'
     elif resolution_limited:
         verdict = 'resolution_limited'
+    elif _within_seed_noise:
+        verdict = 'noise_level'
     else:
         verdict = 'no_detectable_trend'
     out['verdict'] = verdict

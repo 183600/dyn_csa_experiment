@@ -8558,6 +8558,15 @@ def t_scale_trend_degenerate_fit_and_empty_tiers():
     assert r['paired']['labels'] == ['A', 'C'], r['paired']
     assert r['paired']['n_complete_seeds'] == 6, r['paired']
     assert 'B' in r['empty_points'] and r['significant'] is False, r
+    # Six same-sign per-seed slopes can reject the exact test while still
+    # being within their own seed spread; that is not a usable trend claim.
+    pts = [{'label': 'A', 'scale': 1, 'effects': [0.0] * 6, 'seeds': list(range(6))},
+           {'label': 'B', 'scale': 10, 'effects': [0.01] * 3 + [2.0] * 3, 'seeds': list(range(6))},
+           {'label': 'C', 'scale': 100, 'effects': [0.02] * 3 + [4.0] * 3, 'seeds': list(range(6))}]
+    rn = L.scaling_trend(pts, min_seeds=3, min_points=3)
+    assert rn['p_primary'] < 0.05, rn
+    assert rn['paired']['within_seed_noise'] is True, rn['paired']
+    assert rn['significant'] is False and rn['verdict'] == 'noise_level', rn
 
 
 def t_scale_non_estimable_variance_blocks_pooling():
