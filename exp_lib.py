@@ -21004,7 +21004,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         {'opt_diag_summary': _opt_summary, 'amp_dtype': _amp,
          'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used),
          'curve_health': _health, 'health_history': _health_history},
-        data_checked='token batches validated at startup and every ~1% of steps')
+        data_checked='sampled: token batches validated at startup and every ~1% of steps')
     _peak = {}
     if device.type == 'cuda':
         try:

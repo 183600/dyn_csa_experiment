@@ -808,6 +808,7 @@ PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
 def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None, save_ckpt=None, ckpt_dir=None, measure_eff=True, diag_every=None):
     L.set_seed(seed)
+    L.nan_guard_state(reset=True)
     _rng_fp = L.rng_fingerprint()
     L._attb_bump_epoch()
     if variant in set(L.PARAM_MATCHED) | set(PARAM_MATCHED_V7) and float(mlp_ratio) == 4.0:
@@ -1060,6 +1061,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         'nonfinite_grad_steps': int(_nonfinite_grad_steps),
         'first_bad_step': _first_bad_step,
         'diag_stride': int(_diag_stride),
+        'nan_guard': L.nan_guard_state(),
         'events': _nan_events[:20],
     }
     if _health.get('status') != 'healthy' and _health.get('status') != 'unmonitored':
@@ -1068,7 +1070,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         {'opt_diag_summary': _opt_summary, 'amp_dtype': None,
          'train_knobs': _v7_knobs(device, batch_size),
          'curve_health': _health, 'health_history': _health_history},
-        data_checked='token batches validated at startup and every ~1% of steps')
+        data_checked='sampled: token batches validated at startup and every ~1% of steps')
     _checkpoints = {}
     if _save_mode and ckpt_dir:
         try:
