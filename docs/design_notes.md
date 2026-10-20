@@ -1402,3 +1402,13 @@ warning 而不是把两套 seed 集合当成同一族。
 `holm_min_attainable_p` 一致的 `<= alpha`（含 1e-15 浮点容差）。因此
 「最小可达 p 恰好等于 alpha」的计划不再被错误地判为不可能确认、也不再
 报零功效。
+
+### 28.6 低功效规模点不得进入「共同效应」与趋势确认
+
+- `meta_analyze_effects` 仍逐点报告随机效应，但只要任一参与合并的规模点
+  `n < min_seeds`，`poolable=False`，并在 `underpowered_points` 与
+  `note` 中逐点点名；pooled 数字只能作为描述性摘要。
+- `scaling_trend` 的无配对（WLS point-mean）路径同样执行 `min_seeds`：
+  任一点 `n < min_seeds` 即 `underpowered=True`，即使三点恰好落在一条
+  直线上、WLS 的 p 为 0，也不得标为 `significant`。paired 路径沿用
+  完整 seed 数的 `paired_effect_stats.underpowered`。
