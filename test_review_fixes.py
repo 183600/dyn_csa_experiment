@@ -2530,6 +2530,37 @@ def t_seed_scalar_rejects_silent_truncation():
     assert L.normalize_seed_list([Decimal('2'), np.array(3)]) == [2, 3]
 
 
+def t_seed_domain_guard():
+    # NumPy's legacy seeder only accepts [0, 2**32 - 1]; accepting another
+    # value in normalize_seed_list would defer the failure into training (or
+    # silently remap it).  The same domain must be used by every entry point.
+    for bad in (-1, L.MAX_SEED + 1, 2 ** 63, True, 1.5, 'x', None):
+        for fn in (lambda b=bad: L.normalize_seed_list([b]),
+                   lambda b=bad: L.set_seed(b),
+                   lambda b=bad: L.dataloader_generator(b)):
+            try:
+                fn()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'{bad!r} must be rejected by every seed entry point')
+    assert L.normalize_seed_list([L.MAX_SEED, 0]) == [L.MAX_SEED, 0]
+    assert L._other_seed(L.MAX_SEED) == 0 and L._other_seed(0) == 1
+    # A maximum seed must not make the contract probe try MAX_SEED+1.
+    L.set_seed(4242)
+    _fp = L.rng_fingerprint()
+    r = L.seed_contract_check(seed=L.MAX_SEED)
+    assert r['passed'] is True and r['checks']['different_seed_changes_streams'] is True, r
+    assert L.rng_fingerprint() == _fp, 'the seed contract probe must still preserve the process RNG'
+    for bad in (-1, L.MAX_SEED + 1):
+        try:
+            L.reproducibility_guard(['full'], seeds=[bad])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'reproducibility_guard must reject seed {bad!r}')
+
+
 def t_seed_contract_check():
     L.set_seed(4242)
     fp0 = L.rng_fingerprint()
@@ -9861,6 +9892,7 @@ def main():
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E1a seed/variant axis normalisation', t_seed_axis_normalization)
     _check('E1a2 seed scalars never truncate silently', t_seed_scalar_rejects_silent_truncation)
+    _check('E1a3 seed domain validation', t_seed_domain_guard)
     _check('E1b explicit RNG seed contract', t_seed_contract_check)
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
     _check('E2b batch_iter uint16 transport', t_batch_iter_uint16)

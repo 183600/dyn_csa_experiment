@@ -74,6 +74,12 @@ QUICK = False
 RUN_CAP = dict(total_hours=58.333333333333336, margin=0.93, already_hours=0.0, state_path='run_time_state.json')
 CODE_SEMANTICS = 'v11.128'
 CKPT_CODE = CODE_SEMANTICS
+# NumPy's legacy global seeding API accepts only [0, 2**32 - 1]; a seed
+# outside that range either crashes there (negative/too large) or must be
+# silently remapped, which would make two different declared seeds share a
+# stream.  Every entry point uses this one domain so Python/NumPy/Torch/CUDA/
+# DataLoader seeding cannot disagree about what a valid seed is.
+MAX_SEED = 2 ** 32 - 1
 # ---- 三算子内核路径（M0 工作包；实现与数值契约
 # 见 csa_kernels.py）。CSA_KERNEL 未设置时本模块的执行路径与指纹逐字节不变。
 try:
@@ -12068,6 +12074,31 @@ def _as_seed_int(v):
         return None
     return i
 
+def _seed_value(v, *, where='seed'):
+    """Validate one seed against the domain every RNG backend can accept.
+
+    ``_as_seed_int`` is the generic integer reader used for counts and
+    parameter totals (which can legitimately exceed 2**32).  Seeds are
+    different: NumPy's global seeder rejects values outside [0, MAX_SEED], so
+    allowing one here would only fail later (or, worse, be remapped by one
+    backend but not another).  Booleans and non-integral floats are rejected
+    for the same reason as in ``normalize_seed_list``.
+    """
+    s = _as_seed_int(v)
+    if s is None:
+        raise ValueError(f'{where} must be an integer, got {v!r}')
+    if s < 0 or s > MAX_SEED:
+        raise ValueError(
+            f'{where} must be in [0, {MAX_SEED}] (the NumPy/PyTorch/DataLoader '
+            f'common seed domain), got {s}')
+    return s
+
+
+def _other_seed(seed):
+    """A deterministic seed that differs from ``seed`` without leaving range."""
+    return (int(seed) + 1) % (MAX_SEED + 1)
+
+
 def _exact_count(v, *, minimum=0):
     """Exact non-negative integer count (token/document counts, not seeds).
 
@@ -17786,10 +17817,11 @@ def normalize_seed_list(seeds, *, default=(0,)):
             raise ValueError(f'seed must be an integer, got boolean {raw!r}')
         # Use the shared scalar reader: it handles NumPy scalars and rejects
         # non-integral numeric objects (e.g. Decimal('1.5')) instead of
-        # silently truncating them with int().
-        s = _as_seed_int(raw)
-        if s is None:
-            raise ValueError(f'seed must be an integer, got {raw!r}')
+        # silently truncating them with int(), and enforces the RNG domain.
+        try:
+            s = _seed_value(raw)
+        except ValueError as _se:
+            raise ValueError(f'seed must be an integer in [0, {MAX_SEED}], got {raw!r}') from _se
         if s in seen:
             print(f'[seeds] WARNING: duplicate seed {s} removed from the panel plan (it would otherwise be trained twice under the same key)')
             continue
@@ -17805,9 +17837,10 @@ def normalize_seed_list(seeds, *, default=(0,)):
         for raw in _fallback:
             if isinstance(raw, (bool, np.bool_)):
                 raise ValueError(f'default seed must be an integer, got boolean {raw!r}')
-            s = _as_seed_int(raw)
-            if s is None:
-                raise ValueError(f'default seed must be an integer, got {raw!r}')
+            try:
+                s = _seed_value(raw)
+            except ValueError as _se:
+                raise ValueError(f'default seed must be an integer in [0, {MAX_SEED}], got {raw!r}') from _se
             if s not in seen:
                 seen.add(s)
                 out.append(s)
@@ -17839,7 +17872,7 @@ def set_seed(seed):
     seed so callers can record exactly what was used.  torch's deterministic
     algorithm / cuDNN switches are pinned at the same time, so two runs with
     the same seed on the same machine follow the same kernels."""
-    seed = int(seed)
+    seed = _seed_value(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -17992,7 +18025,7 @@ def dataloader_generator(seed):
     ``worker_init_fn=L.seed_worker`` so worker RNGs are derived from the same
     seed instead of the OS entropy pool."""
     g = torch.Generator()
-    g.manual_seed(int(seed))
+    g.manual_seed(_seed_value(seed))
     return g
 
 def seed_worker(worker_id):
@@ -18046,7 +18079,8 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
     two fresh interpreters with the same seed/PYTHONHASHSEED, which catches a
     child-process seeding mismatch that an in-process check cannot see.
     """
-    seed = int(seed)
+    seed = _seed_value(seed)
+    _alt_seed = _other_seed(seed)
     keys = ['python', 'numpy', 'torch', 'dataloader_generator']
     if torch.cuda.is_available():
         keys.append('cuda')
@@ -18091,7 +18125,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
         try:
             a = _draws(seed)
             b = _draws(seed)
-            c = _draws(seed + 1)
+            c = _draws(_alt_seed)
             checks['same_seed_reproducible'] = bool(a == b)
             changed = {}
             for k in keys:
@@ -18111,7 +18145,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
         try:
             w1 = _worker_draws(seed)
             w2 = _worker_draws(seed)
-            w3 = _worker_draws(seed + 1)
+            w3 = _worker_draws(_alt_seed)
             checks['worker_seed_reproducible'] = bool(w1 == w2)
             checks['worker_different_seed_changes'] = bool(w1 != w3)
         except Exception as e:
@@ -22289,7 +22323,7 @@ def _repro_batch(seed, *, batch_size, seq_len, vocab, train_ids=None):
     With ``train_ids`` the batch is a deterministic slice of the REAL token
     stream (the same corpus the panel trains on); otherwise it is synthetic.
     The generator is separate from the model's PyTorch RNG stream."""
-    _rng = np.random.default_rng(int(seed) + 7919)
+    _rng = np.random.default_rng((_seed_value(seed) + 7919) % (MAX_SEED + 1))
     if train_ids is not None:
         arr = np.asarray(train_ids).reshape(-1)
         need = int(seq_len) + 1
@@ -22371,6 +22405,7 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
     assumption.  The check never changes the RNG state of the following
     training cell."""
     device = DEVICE if device is None else device
+    seed = _seed_value(seed)
     _arch = _repro_probe_arch(arch)
     if vocab is None:
         vocab = (int(np.max(train_ids)) + 1) if train_ids is not None else 64
@@ -22383,7 +22418,7 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
     with _preserve_rng_state():
         a = _repro_tiny_losses(variant, seed, **_kw)
         b = _repro_tiny_losses(variant, seed, **_kw)
-        c = _repro_tiny_losses(variant, int(seed) + 1, **_kw)
+        c = _repro_tiny_losses(variant, _other_seed(seed), **_kw)
     _fp_after = rng_fingerprint()
     _n = min(len(a), len(b))
     max_diff = max((abs(a[i] - b[i]) for i in range(_n)), default=float('inf'))
@@ -22465,9 +22500,12 @@ def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False, 
     if seq_len is None:
         seq_len = 16
     _raw_seeds = list(seeds if seeds is not None else [seed])
-    _parsed_seeds = [_as_seed_int(s) for s in _raw_seeds]
-    if any(s is None for s in _parsed_seeds):
-        raise ValueError(f'reproducibility_guard seeds must be integers, got {_raw_seeds!r}')
+    _parsed_seeds = []
+    for _raw in _raw_seeds:
+        try:
+            _parsed_seeds.append(_seed_value(_raw))
+        except ValueError as _se:
+            raise ValueError(f'reproducibility_guard seeds must be integers in [0, {MAX_SEED}], got {_raw_seeds!r}') from _se
     _seed_list = list(dict.fromkeys(_parsed_seeds))
     _full_data_fp = None
     if train_ids is not None:
