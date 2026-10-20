@@ -13618,6 +13618,11 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
         out['complete'] = bool(len(components) >= 1 and not missing and not extra
                                and not duplicate and not absent and not reused
                                and not out['structural_errors'])
+        # Project-level coverage reads the same component lists in both modes.
+        # A factorial is only a usable ablation as a whole: one missing cell
+        # means no component's effect is separately identified.
+        out['complete_components'] = list(components) if out['complete'] else []
+        out['incomplete_components'] = [] if out['complete'] else list(components)
         if verbose:
             print('[ablation] full-factorial components=%s mapped=%d/%d missing=%s%s'
                   % (components, len(combos), len(required),
@@ -13722,7 +13727,24 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
             abl = rep.get('ablation_completeness') or {}
             if comp in (abl.get('components') or {}):
                 row['declared_in'].append(name)
-                _miss = (abl.get('missing_arms') or {}).get(comp)
+                _miss_all = abl.get('missing_arms') or {}
+                _miss = None
+                if isinstance(_miss_all, dict):
+                    _miss = _miss_all.get(comp)
+                elif isinstance(_miss_all, list):
+                    # Full-factorial reports name the missing CELLS, not a
+                    # per-component arm list.  Attribute each missing cell to
+                    # every component it contains.
+                    _miss = [f"{'+'.join(_m.get('combo') or []) or 'none'}:"
+                             f"{_m.get('arm')!r}"
+                             for _m in _miss_all if isinstance(_m, dict)
+                             and comp in (_m.get('combo') or [])]
+                if not _miss:
+                    # A mapped-but-absent cell is not the only failure: an
+                    # unmapped combination is reported in `missing_combos`.
+                    _miss = [f"missing combination {'+'.join(_c) or 'none'}"
+                             for _c in (abl.get('missing_combos') or [])
+                             if isinstance(_c, (list, tuple)) and comp in _c]
                 if _miss:
                     row['missing_arms'][name] = sorted(_miss)
             if comp in (abl.get('complete_components') or []):

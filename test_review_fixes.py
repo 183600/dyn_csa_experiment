@@ -5643,6 +5643,31 @@ def t_methodology_gate_fail_closed_edges():
     bad[('A', 'B', 'C')] = None
     r = L.ablation_completeness_audit(arms_by_combo=bad)
     assert r['complete'] is False and r['structural_errors'], r
+    # Project-level coverage must understand full-factorial reports too: they
+    # name missing CELLS (a list), not a per-component arm mapping.
+    _fa = {(): 'none', ('A',): 'A', ('B',): 'B', ('A', 'B'): 'AB'}
+    _fr = L.ablation_completeness_audit(arms_by_combo=_fa)
+    assert _fr['complete'] is True, _fr
+    assert set(_fr['complete_components']) == {'A', 'B'}, _fr
+    _cov = L.ablation_coverage_across_panels(
+        {'p': {'ablation_completeness': _fr,
+               'measured_components': ['A', 'B'],
+               'verified_components': ['A', 'B'],
+               'unverified_components': []}},
+        design={'A': [('A', 'none', '')], 'B': [('B', 'none', '')]})
+    assert set(_cov['complete_anywhere']) == {'A', 'B'}, _cov
+    assert set(_cov['usable_anywhere']) == {'A', 'B'}, _cov
+    _fb = dict(_fa)
+    _fb.pop(('A', 'B'))
+    _fr2 = L.ablation_completeness_audit(arms_by_combo=_fb)
+    _cov2 = L.ablation_coverage_across_panels(
+        {'p': {'ablation_completeness': _fr2,
+               'measured_components': [], 'verified_components': [],
+               'unverified_components': ['A', 'B']}},
+        design={'A': [('A', 'none', '')], 'B': [('B', 'none', '')]})
+    assert _cov2['complete_anywhere'] == [], _cov2
+    assert _cov2['components']['A']['missing_arms'].get('p'), _cov2
+
     # Leave-one-out mode must also reject a self-contrast, malformed arm ids
     # and a non-mapping design instead of treating them as a complete ablation.
     for _design in ({'A': [('full', 'full', '')]},
