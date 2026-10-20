@@ -8409,6 +8409,15 @@ def t_methodology_gate_fail_closed_edges():
     assert fair['status'] == 'fail', fair
     assert any('omit train_knobs' in p for p in fair['problems']), fair['problems']
 
+    # A malformed (unhashable) params field must not crash the fairness audit.
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'summary.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'x': dict(s['a::seed0'], params={'bad': 1})}, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r_bad = A.audit_fairness(path, arms=['a'])
+    assert r_bad['arms']['a']['n_records'] == 1, r_bad
+
     # Full-factorial completeness fails closed on malformed or duplicated
     # cells instead of dropping them and reporting a complete table.
     base = {(): 'none', ('A',): 'A', ('B',): 'B', ('C',): 'C',

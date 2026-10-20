@@ -1519,7 +1519,9 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
             'n_distinct_run_cfg': len(cfgs),
             'n_distinct_train_knobs': len(knob_vals),
             'n_missing_train_knobs': n_missing_knobs,
-            'params': sorted({r.get('params') for r in recs},
+            # A malformed JSON value (dict/list) is unhashable; canonicalise it
+            # for the set instead of aborting the whole fairness audit.
+            'params': sorted({_setting_key(r.get('params')) for r in recs},
                              key=lambda x: (
                                  x is None,
                                  0 if isinstance(x, numbers.Real)
