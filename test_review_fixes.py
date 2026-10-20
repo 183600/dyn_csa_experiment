@@ -2744,6 +2744,27 @@ def t_baseline_multi_seed_selection_audit():
         t['ppl_std'] = float(np.std(list(t['seed_ppls'].values()), ddof=1))
     rb2 = L.baseline_tuning_audit(bad2, protocol=protocol)
     assert rb2['tuning_verified'] is False and any('same search-seed set' in p for p in rb2['problems']), rb2
+    # Every trial WITHIN an arm must use one search-seed set too.  Merely
+    # having the same collection of per-trial sets in every arm is not an
+    # equal search: config A and config B would be selected on different
+    # draws.
+    bad3 = json.loads(json.dumps(art))
+    for _arm_name, _entry in bad3['arms'].items():
+        _rows = _entry['trials']
+        for _row, _keys in zip(_rows, (('0', '1'), ('1', '2'))):
+            _row['seeds'] = [int(k) for k in _keys]
+            _row['seed_ppls'] = {k: _row['seed_ppls'][k] for k in _keys}
+            _row['n_seeds'] = len(_keys)
+            _vals = list(_row['seed_ppls'].values())
+            _row['ppl'] = float(np.mean(_vals))
+            _row['ppl_std'] = float(np.std(_vals, ddof=1))
+        _best = min(_rows, key=lambda r: r['ppl'])
+        _entry['selected'] = dict(_best['config'])
+        _entry['selected_metric_value'] = _best['ppl']
+    rb3 = L.baseline_tuning_audit(bad3, protocol=protocol)
+    assert rb3['tuning_verified'] is False, rb3
+    assert rb3['search_seed_balanced'] is False, rb3
+    assert any('more than one search-seed set' in p for p in rb3['problems']), rb3
 
 
 def t_partial_skipped_seed_keeps_controlled_contrast():

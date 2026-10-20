@@ -13248,8 +13248,19 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         _no_seed_info = sorted(set(arms) - set(search_seed_sets))
         if _no_seed_info:
             warnings.append(f'arms {_no_seed_info} do not expose their search seeds — equal search seeds cannot be verified for them')
-        if len(search_seed_sets) >= 2:
-            search_seed_balanced = len({frozenset(v) for v in search_seed_sets.values()}) == 1
+        # Each trial of an arm must use the SAME search-seed set.  Comparing
+        # only the collection of sets across arms let an arm (or every arm)
+        # search trial 0 on seeds {0,1} and trial 1 on seeds {2,3}; that is a
+        # different selection draw per config, not an equal search.
+        _multi_seed_arms = sorted(a for a, v in search_seed_sets.items() if len(v) > 1)
+        if _multi_seed_arms:
+            search_seed_balanced = False
+            problems.append(
+                'arm(s) %s used more than one search-seed set across trials — '
+                'each config would be selected on different draws; equal-search '
+                'tuning is not verified' % ', '.join(_multi_seed_arms))
+        elif len(search_seed_sets) >= 2:
+            search_seed_balanced = len({next(iter(v)) for v in search_seed_sets.values()}) == 1
             if not search_seed_balanced:
                 problems.append('arms did not select on the same search-seed set — equal-search tuning is not verified')
         search_seeds_seen = sorted({s for v in search_seed_sets.values() for ss in v for s in ss})
