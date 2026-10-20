@@ -447,6 +447,14 @@ def per_seed_records(outdir):
     out = collections.defaultdict(dict)
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
+            # An arm id is a dict/set key below and a grouping label in every
+            # table; a non-string or empty id is a malformed record, not an
+            # arm.  Exclude it explicitly instead of crashing on an
+            # unhashable value (same contract as exp_lib.aggregate).
+            _variant = r.get('variant')
+            if not isinstance(_variant, str) or not _variant:
+                print(f"[report] record {_k!r} in {outdir} carries a non-string/empty arm id ({_variant!r}) — skipped for pairing")
+                continue
             _sv = r['seed']
             if isinstance(_sv, (bool, np.bool_)):
                 print(f"[report] record {_k!r} in {outdir} carries a boolean seed — skipped for pairing")
@@ -464,10 +472,10 @@ def per_seed_records(outdir):
             if _sd is None:
                 print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
                 continue
-            _slot = out[r['variant']]
+            _slot = out[_variant]
             _tk = (_tag_of(r, _k, _legacy_ok), _sd)
             if _tk in _slot:
-                print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
+                print(f'[report] ambiguous (variant, protocol, seed) = ({_variant!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
                 continue
             _slot[_tk] = r
     out = dict(out)

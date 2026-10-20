@@ -6746,6 +6746,14 @@ def t_build_report_exact_seed_and_params():
                                                'ppl': 2.0, 'run_cfg': 'r',
                                                'steps': 1, 'tokens_seen': 1}}
         assert BR.per_seed_records('/nonexistent-panel') == {}
+        # Malformed/non-string arm ids are excluded, not used as (unhashable)
+        # dict keys or silently pooled under a coerced spelling.
+        for _bad_variant in ({'x': 1}, ['x'], '', None, 3):
+            BR._LOADED.clear()
+            BR.summary = lambda _outdir, _v=_bad_variant: {
+                'd::x': {'variant': _v, 'seed': 0, 'ppl': 2.0, 'run_cfg': 'r',
+                         'steps': 1, 'tokens_seen': 1}}
+            assert BR.per_seed_records('/nonexistent-panel') == {}, _bad_variant
     finally:
         BR.summary = _orig_summary
         BR._LOADED.clear()
