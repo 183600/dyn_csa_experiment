@@ -1511,6 +1511,10 @@ def _matrix_fingerprint(X):
         raise TypeError(
             'matrix fingerprint needs real-valued rows; casting complex rows '
             'to float64 would silently discard the imaginary part')
+    if arr.dtype.kind in 'SU':
+        # Native unicode/bytes categorical tables have no float cast.  Route
+        # them through the same canonical object-row keys as object columns.
+        arr = arr.astype(object)
     if arr.dtype == object:
         # Numeric object tables go through the same float64 block form as a
         # native table (so an int/float/Decimal with the same exactly
@@ -1535,17 +1539,15 @@ def _matrix_fingerprint(X):
                     f = float(v)
                 except (TypeError, ValueError, OverflowError):
                     # A huge exact rational (Fraction/Decimal) has no finite
-                    # float64 image, but it is still a numeric row: use a
-                    # placeholder here and let the exact canonical tail below
-                    # carry the value instead of rejecting the table.
-                    if (isinstance(v, numbers.Number)
-                            or hasattr(v, 'as_integer_ratio')):
-                        vals.append(float('nan'))
-                        exact = False
-                        continue
-                    raise TypeError(
-                        'matrix fingerprint needs numeric object rows; '
-                        f'got {type(v).__name__}') from None
+                    # float64 image, and a categorical string has no numeric
+                    # image at all.  Use a placeholder here and let the exact
+                    # canonical tail below carry the value; rejecting the
+                    # table would make categorical object/unicode columns
+                    # un-fingerprintable even though their rows are well
+                    # defined.
+                    vals.append(float('nan'))
+                    exact = False
+                    continue
                 vals.append(f)
                 if isinstance(v, (bool, np.bool_)):
                     if not (math.isfinite(f) and f.is_integer()
@@ -1644,6 +1646,11 @@ def _row_keys(X):
             'to float64 would silently discard the imaginary part')
     if src.ndim == 1:
         src = src.reshape(-1, 1)
+    if src.dtype.kind in 'SU':
+        # Native unicode/bytes categorical columns are not float-castable.
+        # Canonical object keys keep their type-qualified identity (so b'a',
+        # 'a' and 1 remain distinct) instead of crashing duplicate detection.
+        src = src.astype(object)
     if src.dtype == object:
         # Object columns are common after pandas/None handling.  Casting a
         # whole object row through float64 (the generic fallback below) would

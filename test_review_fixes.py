@@ -5068,6 +5068,12 @@ def t_data_quality_exact_integer_and_complex_rows():
     mixed = np.array([[1], ['1'], [1.0]], dtype=object)
     assert L.duplicate_mask(mixed).tolist() == [False, False, True], mixed
     assert L.duplicate_mask(np.array([['1'], ['1.0']], dtype=object)).tolist() == [False, False]
+    # Native unicode/bytes categorical dtypes (pandas factor columns, not
+    # only dtype=object) must also be hashable, and remain type-distinct.
+    assert L.duplicate_mask(np.array(['a', 'b', 'a'])).tolist() == [False, False, True]
+    assert L.duplicate_mask(np.array([['a'], ['b'], ['a']])).tolist() == [False, False, True]
+    assert L.duplicate_mask(np.array([b'a', b'b', b'a'])).tolist() == [False, False, True]
+    assert L.duplicate_mask(np.array(['1', 1], dtype=object)).tolist() == [False, False]
 
 
 def t_exact_numeric_contracts_and_fingerprint():
@@ -5137,6 +5143,14 @@ def t_exact_numeric_contracts_and_fingerprint():
     # exact tail.
     assert DG._matrix_fingerprint(np.array([[2 ** 53 + 1]], dtype=np.int64)) == \
         DG._matrix_fingerprint(np.array([[2 ** 53 + 1]], dtype=object))
+    # Native unicode/bytes categorical tables now use the same canonical
+    # object-row keys (previously the float64 cast raised).
+    _cats_u = np.array([['a'], ['b']])
+    _cats_o = _cats_u.astype(object)
+    assert DG._matrix_fingerprint(_cats_u) == DG._matrix_fingerprint(_cats_o)
+    assert DG._matrix_fingerprint(_cats_u[:1]) != DG._matrix_fingerprint(_cats_u[1:])
+    assert DG._matrix_fingerprint(np.array([[b'a'], [b'b']])) != \
+        DG._matrix_fingerprint(np.array([['a'], ['b']]))
     assert DG._matrix_fingerprint(np.array([[1.5]])) == \
         DG._matrix_fingerprint(np.array([[Decimal('1.5')]], dtype=object))
     assert DG._matrix_fingerprint(np.array([[2 ** 53 + 1]], dtype=np.int64)) != \
