@@ -4812,6 +4812,16 @@ def t_audit_length_rejects_unverifiable_counts():
         assert any('n_tok' in x for x in r3['problems']), r3
         assert any('eval_span' in x for x in r3['problems']), r3
         assert any('truncated' in x for x in r3['problems']), r3
+        # An existing-but-empty artifact must not pass the audit, and a
+        # malformed by_len container must fail closed instead of raising.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+        r4 = A.audit_length(p)
+        assert r4['status'] == 'not_verifiable_locally', r4
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': []}}, f)
+        r5 = A.audit_length(p)
+        assert r5['status'] == 'fail' and any('by_len' in x for x in r5['problems']), r5
     finally:
         shutil.rmtree(td, ignore_errors=True)
 

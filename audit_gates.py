@@ -1058,6 +1058,16 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
         out = {'status': 'not_verifiable_locally', 'note': f'{bylen_path} absent — P5T has not run; the same checks apply to results_v10_mech/summary.json by_len panels'}
         print(json.dumps(out, ensure_ascii=False))
         return out
+    if not isinstance(raw, dict):
+        out = {'status': 'fail', 'problems': [f'{bylen_path}: top-level JSON is {type(raw).__name__}, not an object — the by-length panel is unverifiable']}
+        print(json.dumps(out, ensure_ascii=False))
+        return out
+    if not raw:
+        # An existing but EMPTY artifact proves nothing; an empty dict must
+        # not be reported as a passed length audit.
+        out = {'status': 'not_verifiable_locally', 'note': f'{bylen_path} exists but contains no records — the length/target-set contract was not verified'}
+        print(json.dumps(out, ensure_ascii=False))
+        return out
     L = _import_exp_lib()
     import numpy as np
 
@@ -1088,7 +1098,17 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
         if not isinstance(r, dict):
             problems.append(f'{key}: record is not a JSON object')
             continue
-        for k, c in (r.get('by_len') or {}).items():
+        _by_len = r.get('by_len')
+        if _by_len is None:
+            problems.append(f'{key}: record has no `by_len` panel — the target set is unverifiable')
+            continue
+        if not isinstance(_by_len, dict):
+            problems.append(f'{key}: by_len is {type(_by_len).__name__}, not a JSON object')
+            continue
+        if not _by_len:
+            problems.append(f'{key}: by_len is empty — no length cell can be verified')
+            continue
+        for k, c in _by_len.items():
             if isinstance(k, (bool, np.bool_)):
                 problems.append(f'{key}: by_len key {k!r} is not an integer length')
                 continue
@@ -1145,6 +1165,8 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             elif c.get('truncated'):
                 problems.append(f'{key}: L{Ln} cell is marked truncated — it must not enter cross-length means')
     out = {'status': 'ok', 'by_length': {}}
+    if not by_len and not problems:
+        problems.append('no length cells found in the artifact — the by-length panel is unverifiable')
     for Ln, e in sorted(by_len.items()):
         ok = (len(e['n_tok']) == 1 and None not in e['n_tok']
               and len(e['eval_span']) == 1 and None not in e['eval_span'])
