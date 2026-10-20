@@ -1244,6 +1244,12 @@ README_zh 与 `RELEASES.md` 中均已明示。
 参考臂按**主端点（token-pooled PPL）**选择，而不是按算术 seed 均值；
 两者在 token 数不同时可以给出不同排序。
 
+嵌套记录把 `ppl` 换成 holdout 值时，必须同时把 `nll_sum`/`n_tokens`
+换成 `nll_sum_holdout`/`n_tokens_holdout`。否则 pooled 聚合与指标核验会
+拿 holdout 的 PPL 去对全验证集的 NLL 记账，二者描述不同样本；`_pooled_
+ppl_from_records` 与 `metric_policy_audit` 也识别
+`ppl_estimation_rows='nested_validation_holdout'` 并优先使用 holdout 记账。
+
 ### 26.3 调参网格要有边界覆盖
 
 `BASELINE_TUNING_PROTOCOL.trials` 从 4 个试次扩展为 8 个，学习率覆盖

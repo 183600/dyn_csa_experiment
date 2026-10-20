@@ -448,6 +448,14 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
             _rr = dict(_r)
             if L.ppl_is_usable(_rr.get('ppl_holdout')):
                 _rr['ppl'] = float(_rr['ppl_holdout'])
+                # Keep the NLL accounting on the SAME sample as the reported
+                # PPL.  Leaving full-validation nll_sum/n_tokens in place made
+                # the token-weighted aggregate and the metric-aggregation
+                # check describe a different sample than `ppl`.
+                if _rr.get('nll_sum_holdout') is not None:
+                    _rr['nll_sum'] = _rr['nll_sum_holdout']
+                if _rr.get('n_tokens_holdout') is not None:
+                    _rr['n_tokens'] = _rr['n_tokens_holdout']
                 _rr['ppl_estimation_rows'] = 'nested_validation_holdout'
             else:
                 _rr['ppl_estimation_rows'] = 'full_validation'

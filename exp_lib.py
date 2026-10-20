@@ -12493,8 +12493,11 @@ def metric_policy_audit(summary=None, policy=None):
         _lm_bad = []
         _lm_checked = 0
         for _r in lm:
-            _nll = _finite_scalar(_r.get('nll_sum'))
-            _ntok = _exact_count(_r.get('n_tokens'), minimum=1)
+            _nested_acc = (_r.get('ppl_estimation_rows') == 'nested_validation_holdout'
+                           and _r.get('nll_sum_holdout') is not None
+                           and _r.get('n_tokens_holdout') is not None)
+            _nll = _finite_scalar(_r.get('nll_sum_holdout') if _nested_acc else _r.get('nll_sum'))
+            _ntok = _exact_count(_r.get('n_tokens_holdout') if _nested_acc else _r.get('n_tokens'), minimum=1)
             if _nll is None or _ntok is None:
                 _rn = _r.get('nll_per_row')
                 _rt = _r.get('n_tokens_per_row')
@@ -19984,7 +19987,15 @@ def _pooled_ppl_from_records(recs):
     `nll_sum`/`n_tokens` cannot be pooled and fall back explicitly."""
     nlls, nts = [], []
     for r in recs:
-        nll, nt = _finite_scalar(r.get('nll_sum')), _exact_count(r.get('n_tokens'), minimum=1)
+        # When the primary estimate is the nested holdout, the matching
+        # accounting is nll_sum_holdout/n_tokens_holdout.  Mixing the full
+        # nll_sum with a holdout PPL would pool a different sample than the
+        # one the record reports.
+        _nested = (r.get('ppl_estimation_rows') == 'nested_validation_holdout'
+                   and r.get('nll_sum_holdout') is not None
+                   and r.get('n_tokens_holdout') is not None)
+        nll = _finite_scalar(r.get('nll_sum_holdout') if _nested else r.get('nll_sum'))
+        nt = _exact_count(r.get('n_tokens_holdout') if _nested else r.get('n_tokens'), minimum=1)
         if nll is None or nt is None:
             return None, None, None
         nlls.append(nll)
