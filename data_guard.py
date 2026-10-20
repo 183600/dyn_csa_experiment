@@ -2435,8 +2435,13 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
 
     tv = 0.5 * float(np.sum(np.abs(p - q)))
     js = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
-    if keep:
-        unseen = float(np.mean([key not in keep_index for key in hold_keys]))
+    if counts:
+        # Seen means present ANYWHERE in the reference, not merely retained in
+        # the truncated top-`max_categories` histogram bins.  Comparing against
+        # keep_index counted a genuine reference category as unseen whenever
+        # max_categories folded it into the "other" bin.
+        _unseen_n = sum(1 for key in hold_keys if key not in counts)
+        unseen = float(_unseen_n / len(hold_keys)) if hold_keys else 0.0
     else:
         # No reference category exists (e.g. an empty training side): every
         # holdout token is unseen, not zero.

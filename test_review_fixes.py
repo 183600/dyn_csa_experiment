@@ -6190,6 +6190,10 @@ def t_categorical_shift_requires_two_bins():
             raise AssertionError(f'max_categories={bad!r} must be rejected')
     r = L.categorical_shift_report([1, 1, 2], [1, 2], max_categories=2)
     assert r['n_reference'] == 3 and r['n_holdout'] == 2, r
+    # Truncating the histogram to top categories must not make a category that
+    # WAS in the reference look unseen.
+    rt = L.categorical_shift_report([1, 1, 1, 2, 3], [2], max_categories=2)
+    assert rt['unseen_rate'] == 0.0, rt
 
 
 def t_data_quality_unhashable_labels():
