@@ -1419,7 +1419,9 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             # full-length measurement.
             _nt = _exact_int(c.get('n_tok'))
             _ns = _exact_int(_nseq_cell)
-            if c.get('truncated') is False and _ns is not None and _nt is not None:
+            _trunc = c.get('truncated')
+            if (isinstance(_trunc, (bool, np.bool_)) and not bool(_trunc)
+                    and _ns is not None and _nt is not None):
                 if Ln >= 2 and _nt != _ns * (Ln - 1):
                     problems.append(f'{key}: L{Ln} n_tok={_nt} != n_seq*(L-1)={_ns * (Ln - 1)} — the cell did not score one next-token target per row')
             if _nt is not None and _nt < 0:

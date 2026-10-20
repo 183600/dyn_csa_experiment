@@ -6615,6 +6615,17 @@ def t_audit_length_missing_truncated_flag():
             json.dump({'a::s0': {'by_len': {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095, 'eval_span': 4095}}}}, f)
         r = A.audit_length(p)
         assert r['status'] == 'fail' and any('truncated' in x for x in r['problems']), r
+        # A direct caller may pass np.bool_(False); the identity check used to
+        # skip the n_tok == n_seq*(L-1) contract for that valid spelling.
+        _old_load = A._load
+        try:
+            A._load = lambda _p: {'a::s0': {'by_len': {'4096': {
+                'ppl': 30.0, 'n_tok': 17, 'eval_span': 4095,
+                'truncated': np.bool_(False), 'n_seq': 16}}}}
+            rb = A.audit_length(p)
+        finally:
+            A._load = _old_load
+        assert rb['status'] == 'fail' and any('n_seq*(L-1)' in x for x in rb['problems']), rb
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
