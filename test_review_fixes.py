@@ -7008,6 +7008,43 @@ def t_clean_training_invalid_labels():
     assert out['cleaning']['n_invalid_label_rows_dropped'] == 1, out['cleaning']
 
 
+def t_clean_training_nonfinite_and_outliers():
+    # Non-finite features and train-only outliers can be removed before any
+    # preprocessing statistic is fitted.  Holdout rows are not passed to the
+    # cleaner, so a large holdout value cannot change which train rows survive.
+    X = np.array([[0.0], [1.0], [2.0], [1000.0],
+                  [3.0], [4.0], [np.nan], [5.0]])
+    clean = L.clean_training_rows(X, train_idx=[0, 1, 2, 3],
+                                  drop_nonfinite_features=True,
+                                  outlier_iqr=1.5)
+    assert clean['train_idx'].tolist() == [0, 1, 2], clean
+    assert clean['n_nonfinite_feature_rows_dropped'] == 0, clean
+    assert clean['n_outlier_rows_dropped'] == 1, clean
+    assert clean['dropped_idx'].tolist() == [3], clean
+    # A heldout extreme does not enter the fence: only train row 4 is used as
+    # the upper reference.  Row 6 (NaN) is in train and is dropped explicitly.
+    clean2 = L.clean_training_rows(X, train_idx=[0, 1, 2, 4, 6],
+                                   drop_nonfinite_features=True,
+                                   outlier_iqr=1.5)
+    assert 6 not in clean2['train_idx'].tolist(), clean2
+    assert clean2['n_nonfinite_feature_rows_dropped'] == 1, clean2
+    out = L.split_and_prepare(X, train_frac=0.5, val_frac=0.25,
+                              test_frac=0.25, clean_train=True,
+                              drop_nonfinite_features=True, outlier_iqr=1.5)
+    assert out['cleaning']['n_outlier_rows_dropped'] == 1, out['cleaning']
+    assert out['cleaning']['train_idx'].tolist() == [0, 1, 2], out['cleaning']
+    # The NaN row is in the untouched test split, not in train, so it is not
+    # counted as a dropped training row.
+    assert out['cleaning']['n_nonfinite_feature_rows_dropped'] == 0, out['cleaning']
+    for bad in (0, -1, float('nan'), float('inf'), True):
+        try:
+            L.clean_training_rows(X, train_idx=[0, 1], outlier_iqr=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'outlier_iqr={bad!r} must be refused')
+
+
 def t_known_labels_audit():
     X = np.arange(8, dtype=float).reshape(4, 2)
     y = [0, 1, 2, 9]
@@ -8478,6 +8515,7 @@ def main():
     _check('I29 categorical encoding is fitted on train only', t_categorical_encoder_train_only)
     _check('I30 train-only cleaning before preprocessing', t_clean_training_rows_and_split)
     _check('I30b invalid training labels are droppable before fitting', t_clean_training_invalid_labels)
+    _check('I30c non-finite/outlier training rows are cleanable', t_clean_training_nonfinite_and_outliers)
     _check('I31 declared label set catches unseen/holdout labels', t_known_labels_audit)
     _check('I31b NaT keys and type-qualified label shift', t_data_guard_nat_and_label_identity)
     # Open-block reading rule: the substantive gates (causality, reference

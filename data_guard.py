@@ -1336,7 +1336,8 @@ def prepare_features(X_train, X_val=None, X_test=None, **kwargs):
 
 
 def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
-                        label_conflicts='drop', drop_invalid_labels=False):
+                        label_conflicts='drop', drop_invalid_labels=False,
+                        drop_nonfinite_features=False, outlier_iqr=None):
     """Remove duplicate/ambiguous rows from the training split only.
 
     The holdout indices are not accepted by this function, so no validation or
@@ -1348,6 +1349,15 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
     ``'raise'`` refuses to continue.  ``drop_invalid_labels=True`` also removes
     training rows whose target is missing or non-finite (a NaN/Inf target
     cannot supervise a fit); the decision uses training labels only.
+
+    ``drop_nonfinite_features=True`` removes training rows with a NaN/Inf in
+    any feature instead of relying on imputation, and ``outlier_iqr`` (a
+    positive multiplier, e.g. ``3.0``) removes training rows whose finite
+    values fall outside ``Q1 - k*IQR`` / ``Q3 + k*IQR`` for any feature.  Both
+    bounds are computed from the training rows of this call only.  These are
+    cleaning decisions, so they are applied before any preprocessor fit; a
+    holdout row is never inspected and can never decide which training row to
+    drop.
 
     Returns ``train_idx`` (the cleaned index array), the dropped rows and
     counts suitable for a run manifest.
@@ -1366,6 +1376,21 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         raise ValueError(
             f"label_conflicts must be 'drop', 'keep' or 'raise', "
             f"got {label_conflicts!r}")
+    if outlier_iqr is not None:
+        if isinstance(outlier_iqr, (bool, np.bool_)):
+            raise ValueError(
+                f'outlier_iqr must be a positive finite number or None, '
+                f'got {outlier_iqr!r}')
+        try:
+            outlier_iqr = float(outlier_iqr)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'outlier_iqr must be a positive finite number or None, '
+                f'got {outlier_iqr!r}') from None
+        if not (math.isfinite(outlier_iqr) and outlier_iqr > 0.0):
+            raise ValueError(
+                f'outlier_iqr must be a positive finite number or None, '
+                f'got {outlier_iqr!r}')
     labels = None
     if y is not None:
         yarr = _label_array(y)
@@ -1395,6 +1420,33 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
                                and any(v is None for v in lab)):
                 drop[pos] = True
                 n_invalid_label_rows += 1
+    n_nonfinite_feature_rows = 0
+    if drop_nonfinite_features:
+        _finite = np.isfinite(Xarr[train_rows]).all(axis=1)
+        _bad = ~_finite
+        n_nonfinite_feature_rows = int((_bad & ~drop).sum())
+        drop |= _bad
+    n_outlier_rows = 0
+    if outlier_iqr is not None:
+        Xt = Xarr[train_rows]
+        _bad_cells = np.zeros(Xt.shape, dtype=bool)
+        for j in range(Xt.shape[1]):
+            col = Xt[:, j]
+            finite = np.isfinite(col)
+            vals = col[finite]
+            if vals.size == 0:
+                continue
+            q1, q3 = np.quantile(vals, (0.25, 0.75))
+            iqr = float(q3 - q1)
+            if iqr <= _EPS:
+                lo, hi = float(np.min(vals)), float(np.max(vals))
+            else:
+                lo = float(q1 - outlier_iqr * iqr)
+                hi = float(q3 + outlier_iqr * iqr)
+            _bad_cells[:, j] = finite & ((col < lo) | (col > hi))
+        _row_bad = _bad_cells.any(axis=1)
+        n_outlier_rows = int((_row_bad & ~drop).sum())
+        drop |= _row_bad
     keys = _row_keys(_raw_X)
     clusters = {}
     for pos, row in enumerate(train_rows.tolist()):
@@ -1449,9 +1501,13 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         'n_label_conflict_rows_dropped': int(n_conflict_rows),
         'n_label_conflict_clusters': int(n_conflict_clusters),
         'n_invalid_label_rows_dropped': int(n_invalid_label_rows),
+        'n_nonfinite_feature_rows_dropped': int(n_nonfinite_feature_rows),
+        'n_outlier_rows_dropped': int(n_outlier_rows),
         'drop_duplicates': bool(drop_duplicates),
         'label_conflicts': label_conflicts,
         'drop_invalid_labels': bool(drop_invalid_labels),
+        'drop_nonfinite_features': bool(drop_nonfinite_features),
+        'outlier_iqr': (None if outlier_iqr is None else float(outlier_iqr)),
     }
 
 
@@ -1461,6 +1517,7 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
                       purge=0, preprocess=True, quality_report=False,
                       clean_train=False, label_conflicts='drop',
                       drop_invalid_labels=False,
+                      drop_nonfinite_features=False, outlier_iqr=None,
                       check_cross_split_duplicates=True,
                       quality_kwargs=None, fail_on_quality=False,
                       **preprocessor_kwargs):
@@ -1485,10 +1542,13 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     ``clean_train=True`` first removes exact duplicate training rows and, by
     default, ambiguous duplicate-label clusters via
     :func:`clean_training_rows`; ``drop_invalid_labels=True`` additionally
-    removes rows with missing/non-finite training targets.  Validation/test
-    rows are never dropped or inspected.  The returned ``indices['train']`` is
-    the cleaned index, so the preprocessor and every downstream step see
-    exactly the same rows.  Unless ``check_cross_split_duplicates=False``,
+    removes rows with missing/non-finite training targets, and
+    ``drop_nonfinite_features=True`` / ``outlier_iqr=k`` remove training rows
+    with non-finite features or values outside the training IQR fence.
+    Validation/test rows are never dropped or inspected.  The returned
+    ``indices['train']`` is the cleaned index, so the preprocessor and every
+    downstream step see exactly the same rows.  Unless
+    ``check_cross_split_duplicates=False``,
     exact duplicate feature rows spanning two splits are a hard error: a row
     that appears in both train and a holdout leaks the target/identity across
     the split and cannot be repaired by train-only scaling.
@@ -1514,7 +1574,9 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
         cleaning = clean_training_rows(
             Xarr, y=yarr, train_idx=idx['train'],
             label_conflicts=label_conflicts,
-            drop_invalid_labels=drop_invalid_labels)
+            drop_invalid_labels=drop_invalid_labels,
+            drop_nonfinite_features=drop_nonfinite_features,
+            outlier_iqr=outlier_iqr)
         idx['train'] = cleaning['train_idx']
         assert_no_split_leakage(idx['train'], idx['val'], idx['test'],
                                 groups=groups, time=time)
