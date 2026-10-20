@@ -11898,6 +11898,11 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
     metric = artifact.get('selection_metric') or protocol.get('selection_metric')
     split = artifact.get('selection_split') or protocol.get('selection_split')
     direction = artifact.get('direction') or protocol.get('direction')
+    if not isinstance(metric, str) or not metric.strip():
+        # A mapping/list is not a metric name; `trial.get(metric)` would raise
+        # on the unhashable value instead of reporting the malformed artifact.
+        problems.append(f'selection metric {metric!r} is not a metric name')
+        metric = None
     if split != 'validation':
         problems.append(f'selection split is {split!r}; count-model smoothing must be selected on validation, never test')
     if metric != protocol.get('selection_metric'):
@@ -13116,7 +13121,17 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             break
     if selected.get('search_complete') is False:
         warnings.append('the search grid was truncated (search_complete=False); it is equal across arms, but describe it as a bounded search, not the full declared grid')
-    final_records = selected.get('final_records') or {}
+    _final_records_raw = selected.get('final_records')
+    if _final_records_raw is None:
+        final_records = {}
+    elif isinstance(_final_records_raw, dict):
+        final_records = _final_records_raw
+    else:
+        # A scalar/list cannot describe record -> measurement rows; treating
+        # it as an empty map would silently skip the final-seed coverage and
+        # holdout checks instead of failing the artifact.
+        problems.append(f'final_records must be a mapping, got {type(_final_records_raw).__name__}')
+        final_records = {}
     final_seeds = selected.get('final_seeds') or protocol.get('final_seeds') or []
     # Selection/evaluation partition: the final tuned records must not be
     # measured on the same seed draws that chose the hyper-parameters.

@@ -4616,6 +4616,12 @@ def t_baseline_audit_malformed_seed_keys():
     art['protocol']['final_seeds'] = 3
     out = L.baseline_tuning_audit(art)
     assert out['status'] == 'fail' and any('final_seeds' in p for p in out['problems']), out
+    # final_records must be a mapping; a scalar must not reach `.items()` or
+    # be silently treated as "no final records".
+    art['protocol']['final_seeds'] = [0]
+    art['final_records'] = 1.5
+    out = L.baseline_tuning_audit(art)
+    assert out['status'] == 'fail' and any('final_records must be a mapping' in p for p in out['problems']), out
 
 
 def t_simple_baseline_audit_malformed_records():
@@ -4641,6 +4647,12 @@ def t_simple_baseline_audit_malformed_records():
     out2 = L.simple_baseline_audit(art2)
     assert out2['status'] == 'fail', out2
     assert any('n_tokens is not an integer' in p for p in out2['problems']), out2
+    # A mapping/list is not a metric name.  The audit must report it instead
+    # of passing it to dict.get() as an unhashable key.
+    art3 = json.loads(json.dumps(art))
+    art3['selection_metric'] = {'not': 'a metric'}
+    out3 = L.simple_baseline_audit(art3)
+    assert out3['status'] == 'fail' and any('not a metric name' in p for p in out3['problems']), out3
 
 
 
