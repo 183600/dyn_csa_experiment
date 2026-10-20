@@ -10424,6 +10424,75 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         if math.isfinite(_tc_pi):
             _half = _tc_pi * math.sqrt(tau2 + se_re ** 2)
             _pi = [mu_re - _half, mu_re + _half]
+    # The DL pooled CI treats each scale point as an independent study.  When
+    # the tiers were run on the SAME training seeds, their effects are paired
+    # draws, not independent ones; the pooled interval can then be too narrow.
+    # Report a dependence-respecting per-seed common-effect estimate/test as a
+    # sensitivity readout, and disclose which assumption the pooled CI uses.
+    _measured_pts = [p for p in pts
+                     if p['effects'] and math.isfinite(p.get('scale', float('nan')))
+                     and p.get('scale') > 0.0]
+    _all_seed_declared = bool(_measured_pts) and all(
+        p.get('seeds_declared') for p in _measured_pts)
+    _paired_common = None
+    if len(_measured_pts) >= 2:
+        if not _all_seed_declared:
+            _paired_common = {
+                'status': 'unattested_seed_identity',
+                'note': ('at least one measured scale point omitted its seed '
+                         'identities; a per-seed common effect across scales is '
+                         'not defined')}
+        else:
+            _by_seed_all = {}
+            for _p in _measured_pts:
+                for _s, _e in zip(_p['seeds'], _p['effects']):
+                    _by_seed_all.setdefault(_s, []).append(float(_e))
+            _complete_seeds = sorted(
+                _s for _s, _vals in _by_seed_all.items()
+                if len(_vals) == len(_measured_pts))
+            if len(_complete_seeds) < 2:
+                _paired_common = {
+                    'status': 'insufficient_complete_seeds',
+                    'n_complete_seeds': len(_complete_seeds),
+                    'n_scales': len(_measured_pts),
+                    'note': ('fewer than two seeds were measured at EVERY scale '
+                             'point; the paired common effect is unavailable')}
+            else:
+                _per_seed = [float(np.mean(_by_seed_all[_s]))
+                             for _s in _complete_seeds]
+                _pst = paired_effect_stats(_per_seed, alpha=alpha,
+                                           min_n=min_seeds,
+                                           seeds=_complete_seeds)
+                _pst.update({
+                    'status': 'ok',
+                    'n_scales': len(_measured_pts),
+                    'scale_labels': [p['label'] for p in _measured_pts],
+                    'estimand': ('per-seed equal-weight mean across the '
+                                 'measured scales'),
+                    'weights': 'equal per scale (sensitivity readout; the DL '
+                               'pooled estimate uses inverse-variance weights)',
+                    'note': ('computed on the seeds observed at EVERY measured '
+                             'scale; this is the dependence-respecting companion '
+                             'to the inverse-variance pooled CI, not a '
+                             'replacement for the heterogeneity test')})
+                _paired_common = _pst
+    out['paired_common_effect'] = _paired_common
+    if _all_seed_declared and _paired_common and _paired_common.get('status') == 'ok':
+        out['seed_dependence'] = 'shared_seeds_paired'
+        _dependence_note = ('the inverse-variance pooled CI assumes the scale '
+                            'points are independent studies, but they share '
+                            'training seeds; use paired_common_effect for the '
+                            'dependence-respecting readout')
+    elif _all_seed_declared:
+        out['seed_dependence'] = 'shared_seeds_unpaired'
+        _dependence_note = ('scale points share seed identities but no complete '
+                            'common seed set exists; the pooled CI is descriptive '
+                            'and its independence assumption is unmet')
+    else:
+        out['seed_dependence'] = 'unattested'
+        _dependence_note = ('seed identities are not declared for every measured '
+                            'scale point, so neither independence nor paired '
+                            'dependence can be attested')
     # Every declared scale point below the seed floor blocks the pooled claim,
     # INCLUDING points that could not enter the random-effects weights at all
     # (n=1 has no se).  Reading this list only from `usable` silently dropped
@@ -10465,6 +10534,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                              'identities at: ' + ', '.join(map(str, _unattested_plan_points))
                              + ' (equal counts do not prove the planned draws were measured)')
                             if _unattested_plan_points else ''))})
+    out['note'] = ((out.get('note') + '; ') if out.get('note') else '') + _dependence_note
     out['status'] = 'ok'
     return out
 

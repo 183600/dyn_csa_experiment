@@ -1505,3 +1505,15 @@ M0 的跨规模配对同时改为读取记录的**主估计量**：嵌套调参�
 `ppl_holdout`（或 holdout NLL 记账），不再读仍包含选参行的全验证
 `ppl`；声明嵌套却缺 holdout 记账的记录按「未测量」处理，而不是静默回退
 到全验证值。这样规模效应与面板汇总/报告使用的是同一个样本。
+
+### 29.6 共享种子的跨规模合并不能假装各点是独立研究
+
+`meta_analyze_effects` 的 DerSimonian-Laird 合并 CI 把每个规模点当作独立
+研究。当各 tier 使用同一组训练 seed 时，逐点效应是配对抽样而非独立抽样，
+这个 CI 可能偏窄。现在输出 `seed_dependence`（`shared_seeds_paired` /
+`shared_seeds_unpaired` / `unattested`）并在 note 中点明独立性假设；当所有
+点都声明 seed 身份且存在跨全部点的共同 seed 时，额外给出
+`paired_common_effect`：对每个共同 seed 取跨规模效应的等权平均，再做精确
+符号翻转检验。它是依赖感知的敏感性读数，不替代异质性检验，也不改变
+DL 合并值的定义。这样「大模型上效应更大/更小」的合并区间不会被误读为
+独立重复实验的精度。

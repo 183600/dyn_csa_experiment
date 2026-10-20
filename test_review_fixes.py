@@ -6202,6 +6202,21 @@ def t_scale_corpus_binding_refuses_mixed_tokenizers():
     m = L.meta_analyze_effects(pts)
     assert m['status'] == 'ok', m
     assert m['corpus_binding']['corpus_binding'] == 'shared', m
+    # The scale points share seed identities, so the DL pooled CI's
+    # independence assumption is disclosed and a paired per-seed common
+    # effect is reported as the dependence-respecting sensitivity readout.
+    assert m['seed_dependence'] == 'shared_seeds_paired', m
+    pce = m['paired_common_effect']
+    assert pce['status'] == 'ok' and pce['n_scales'] == 2, pce
+    assert abs(pce['mean'] - 0.225) < 1e-12, pce
+    assert pce['n'] == 3 and pce['seeds'] == [0, 1, 2], pce
+    assert 'independen' in m['note'].lower(), m['note']
+    # Undeclared seed identities cannot be treated as independent OR paired.
+    mu = L.meta_analyze_effects([
+        {'label': 'S1', 'scale': 1, 'effects': [0.1, 0.2, 0.3]},
+        {'label': 'S2', 'scale': 2, 'effects': [0.15, 0.25, 0.35]}])
+    assert mu['seed_dependence'] == 'unattested', mu
+    assert mu['paired_common_effect']['status'] == 'unattested_seed_identity', mu
     t = L.scaling_trend(pts)
     assert t.get('status') != 'refused_corpus_mismatch', t
     # Same ladder, second tier measured on a different tokenisation.
