@@ -10160,6 +10160,7 @@ def _scale_points(points):
         # never existed.  Callers may declare the plan as `n_planned` or as
         # the exact `planned_seeds` list.
         _planned_set = None
+        _seed_plan_attested = None
         if planned_seeds is not None:
             _ps = [_as_seed_int(v) for v in planned_seeds]
             if any(v is None for v in _ps):
@@ -10174,6 +10175,11 @@ def _scale_points(points):
                                  'planned_seeds length %d'
                                  % (label, n_planned, len(_planned_set)))
             n_planned = len(_planned_set)
+            # An exact planned seed list can only be checked against actual
+            # seed identities.  Without them, equal COUNTS do not prove the
+            # planned draws were measured; leave the plan unattested instead
+            # of certifying a different seed set.
+            _seed_plan_attested = bool(_seeds_declared)
         _planned_n = None
         if n_planned is not None:
             _planned_n = _as_seed_int(n_planned)
@@ -10192,7 +10198,9 @@ def _scale_points(points):
         else:
             _n_missing = max(0, _n_declared - _n_input)
             _n_unexpected = max(0, _n_input - _n_declared)
-        _complete = bool(_n_dropped == 0 and _n_missing == 0 and _n_unexpected == 0)
+        _complete = bool(_n_dropped == 0 and _n_missing == 0
+                         and _n_unexpected == 0
+                         and _seed_plan_attested is not False)
         if isinstance(scale, (bool, np.bool_)):
             sc = float('nan')
         else:
@@ -10211,6 +10219,7 @@ def _scale_points(points):
                     'n_dropped': int(_n_dropped), 'n_missing': int(_n_missing),
                     'n_unexpected': int(_n_unexpected),
                     'complete_pairs': _complete,
+                    'seed_plan_attested': _seed_plan_attested,
                     'corpus_fp': (str(corpus_fp) if corpus_fp not in (None, '') else None),
                     'vocab': vb})
     return out
@@ -10300,7 +10309,8 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                'n_input': p.get('n_input'), 'n_declared': p.get('n_declared'),
                'n_dropped': p.get('n_dropped'), 'n_missing': p.get('n_missing'),
                'n_unexpected': p.get('n_unexpected'),
-               'complete_pairs': p.get('complete_pairs')}
+               'complete_pairs': p.get('complete_pairs'),
+               'seed_plan_attested': p.get('seed_plan_attested')}
         if p.get('corpus_fp'):
             row['corpus_fp'] = p['corpus_fp']
         if p.get('vocab') is not None:
@@ -10340,6 +10350,8 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     _invalid_scale_points = [r['label'] for r in per
                              if not (math.isfinite(r.get('scale', float('nan')))
                                      and r.get('scale') > 0.0)]
+    _unattested_plan_points = [r['label'] for r in per
+                               if r.get('seed_plan_attested') is False]
     _attrition = {r['label']: {'n_dropped': r.get('n_dropped'),
                                'n_missing': r.get('n_missing'),
                                'n_unexpected': r.get('n_unexpected')}
@@ -10349,6 +10361,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
            'incomplete_points': _incomplete,
            'empty_points': _empty_points,
            'invalid_scale_points': _invalid_scale_points,
+           'unattested_plan_points': _unattested_plan_points,
            'attrition': _attrition,
            'zero_variance_points': _zero_variance,
            'corpus_binding': _scale_corpus_binding(pts),
@@ -10413,7 +10426,8 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                                  and (not math.isfinite(p_q) or p_q >= alpha)
                                  and not _underpowered_points
                                  and not _incomplete and not _zero_variance
-                                 and not _empty_points and not _invalid_scale_points),
+                                 and not _empty_points and not _invalid_scale_points
+                                 and not _unattested_plan_points),
                 'note': ('poolable requires >=3 scales, every included scale at n>=min_seeds '
                          'with a complete paired panel (no dropped/absent seeds) and non-zero '
                          'within-scale variance, '
@@ -10433,7 +10447,11 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                          + (('; scale point(s) with an invalid/non-positive scale: '
                              + ', '.join(map(str, _invalid_scale_points))
                              + ' (the tier cannot be placed on the scale axis)')
-                            if _invalid_scale_points else ''))})
+                            if _invalid_scale_points else '')
+                         + (('; exact planned seed list not matched to declared seed '
+                             'identities at: ' + ', '.join(map(str, _unattested_plan_points))
+                             + ' (equal counts do not prove the planned draws were measured)')
+                            if _unattested_plan_points else ''))})
     out['status'] = 'ok'
     return out
 

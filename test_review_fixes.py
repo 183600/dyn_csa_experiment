@@ -7623,6 +7623,21 @@ def t_scale_meta_refuses_visible_attrition():
     assert ri['significant'] is False and ri['verdict'] == 'incomplete_scale_point', ri
     assert 'Sbad' in ri['declared_labels'], ri
     assert 'invalid/non-positive scale' in ri['note'], ri
+    # An exact planned seed list is not attestation by itself: without declared
+    # seed identities, equal counts could be a different set of draws.
+    unattested = [{'label': p['label'], 'scale': p['scale'],
+                   'effects': list(p['effects']),
+                   'planned_seeds': list(range(len(p['effects'])))}
+                  for p in complete]
+    raw = L._scale_points(unattested)
+    assert all(r['complete_pairs'] is False
+               and r['seed_plan_attested'] is False for r in raw), raw
+    mu = L.meta_analyze_effects(unattested)
+    assert mu['unattested_plan_points'] == ['S0', 'S1', 'S2'], mu
+    assert mu['poolable'] is False, mu
+    assert 'exact planned seed list' in mu['note'], mu
+    ru = L.scaling_trend(unattested)
+    assert ru['significant'] is False and ru['verdict'] == 'incomplete_scale_point', ru
 
 
 def t_m0_cross_scale_pairs_are_control_gated():
