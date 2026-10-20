@@ -2555,6 +2555,12 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         torch.cuda.empty_cache()
     key = f'{v}::seed{seed}'
     _cur = L.locked_json_read(spath).get(key)
+    if isinstance(_cur, dict) and _cur.get('synthesized'):
+        # A reconstructed aggregate is not an independent measurement.  The
+        # warmup path already drops it; this path must not let it satisfy
+        # resume and mark the length panel complete.
+        print(f'[resume] {key}: existing by_len record is a SYNTHESIZED reconstruction — re-evaluating it from the checkpoint')
+        _cur = None
     _need_lens = list(eval_lens)
     if L.result_is_current(_cur, CKPT_CODE, 'by_len') and _cur.get('recipe') == _recipe:
         _need_lens = [Ln for Ln in eval_lens if not L.by_len_cells([_cur], Ln)]

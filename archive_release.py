@@ -115,6 +115,23 @@ def _sha256(path, chunk=1 << 20):
     return h.hexdigest()
 
 
+def _atomic_write_bytes(path, data):
+    """Write a complete file and only then replace the previous artifact."""
+    tmp = path + f'.tmp{os.getpid()}'
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _git_state():
     def _run(*args):
         try:
@@ -261,31 +278,47 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     base_name = f'release_{tag}'
     tar_path = os.path.join(REPO, outdir, f'{base_name}.tar.gz')
     man = {'release': base_name, 'tag': tag, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'created_by': 'archive_release.py', 'git': _git_state(), 'environment': _env_snapshot(), 'dirs': list(dirs), 'include_ckpt_bodies': bool(include_ckpt), 'files': {}, 'checkpoint_hashes': _ckpt_hash_table(dirs)}
-    with tarfile.open(tar_path, 'w:gz') as tf:
-        for p in files:
-            rel = os.path.relpath(p, REPO)
-            man['files'][rel] = {'sha256': _sha256(p), 'bytes': os.path.getsize(p)}
-            tf.add(p, arcname=rel)
-        man_path_rel = f'{base_name}.MANIFEST.sha256'
-        man_bytes = json.dumps(man, ensure_ascii=False, indent=2).encode('utf-8')
-        import io
-        ti = tarfile.TarInfo(man_path_rel)
-        ti.size = len(man_bytes)
-        ti.mtime = int(time.time())
-        tf.addfile(ti, io.BytesIO(man_bytes))
+    # Build the archive beside its final name; an interrupted or failed make
+    # must not leave a truncated `release_<tag>.tar.gz` (or destroy a previous
+    # good release with the same tag).
+    tmp_tar = tar_path + f'.tmp{os.getpid()}'
+    try:
+        with tarfile.open(tmp_tar, 'w:gz') as tf:
+            for p in files:
+                rel = os.path.relpath(p, REPO)
+                man['files'][rel] = {'sha256': _sha256(p), 'bytes': os.path.getsize(p)}
+                tf.add(p, arcname=rel)
+            man_path_rel = f'{base_name}.MANIFEST.sha256'
+            man_bytes = json.dumps(man, ensure_ascii=False, indent=2).encode('utf-8')
+            import io
+            ti = tarfile.TarInfo(man_path_rel)
+            ti.size = len(man_bytes)
+            ti.mtime = int(time.time())
+            tf.addfile(ti, io.BytesIO(man_bytes))
+        tar_sha = _sha256(tmp_tar)
+        os.replace(tmp_tar, tar_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_tar)
+        except OSError:
+            pass
+        raise
     # external copy of the manifest + the archive's own hash
     man_ext = os.path.join(REPO, outdir, man_path_rel)
-    with open(man_ext, 'wb') as f:
-        f.write(man_bytes)
-    tar_sha = _sha256(tar_path)
-    with open(os.path.join(REPO, outdir, f'{base_name}.tar.gz.sha256'), 'w', encoding='utf-8') as f:
-        f.write(f'{tar_sha}  {os.path.basename(tar_path)}\n')
+    _atomic_write_bytes(man_ext, man_bytes)
+    _atomic_write_bytes(os.path.join(REPO, outdir, f'{base_name}.tar.gz.sha256'),
+                        f'{tar_sha}  {os.path.basename(tar_path)}\n'.encode('utf-8'))
     print(f'[archive] wrote {os.path.relpath(tar_path, REPO)} ({os.path.getsize(tar_path):,d} B)')
     print(f'[archive] wrote {man_path_rel} ({len(man["files"])} files, {len(man["checkpoint_hashes"])} ckpt hashes)')
     print(f'[archive] archive sha256: {tar_sha}')
     print('[archive] publish the tar.gz + MANIFEST + .sha256 to a read-only location (release attachment / object store); the git repo itself stays source-only (design_notes §8)')
-    with open(os.path.join(REPO, outdir, f'{base_name}.release_record.json'), 'w', encoding='utf-8') as f:
-        json.dump({'release': base_name, 'tag': tag, 'created_at': man['created_at'], 'tar_sha256': tar_sha, 'n_files': len(man['files']), 'n_ckpt_hashes': len(man['checkpoint_hashes']), 'git_head': (man['git'] or {}).get('git_head')}, f, ensure_ascii=False, indent=2)
+    _atomic_write_bytes(
+        os.path.join(REPO, outdir, f'{base_name}.release_record.json'),
+        json.dumps({'release': base_name, 'tag': tag, 'created_at': man['created_at'],
+                    'tar_sha256': tar_sha, 'n_files': len(man['files']),
+                    'n_ckpt_hashes': len(man['checkpoint_hashes']),
+                    'git_head': (man['git'] or {}).get('git_head')},
+                   ensure_ascii=False, indent=2).encode('utf-8'))
     return 0
 
 
