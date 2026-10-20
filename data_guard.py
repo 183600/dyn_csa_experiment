@@ -1446,6 +1446,7 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
                       purge=0, preprocess=True, quality_report=False,
                       clean_train=False, label_conflicts='drop',
                       drop_invalid_labels=False,
+                      check_cross_split_duplicates=True,
                       quality_kwargs=None, **preprocessor_kwargs):
     """Split first, then fit every preprocessing statistic on train only.
 
@@ -1467,7 +1468,10 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     removes rows with missing/non-finite training targets.  Validation/test
     rows are never dropped or inspected.  The returned ``indices['train']`` is
     the cleaned index, so the preprocessor and every downstream step see
-    exactly the same rows.
+    exactly the same rows.  Unless ``check_cross_split_duplicates=False``,
+    exact duplicate feature rows spanning two splits are a hard error: a row
+    that appears in both train and a holdout leaks the target/identity across
+    the split and cannot be repaired by train-only scaling.
 
     Returns a dict with ``indices``, per-split ``X`` (and ``y``), the fitted
     ``preprocessor`` (or ``None`` when ``preprocess=False``), an optional
@@ -1494,8 +1498,29 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
         idx['train'] = cleaning['train_idx']
         assert_no_split_leakage(idx['train'], idx['val'], idx['test'],
                                 groups=groups, time=time)
+    _dup_check = None
+    if check_cross_split_duplicates:
+        # Exact-duplicate rows across splits are leakage even when the row
+        # indices, groups and timestamps are disjoint.  This is a cheap
+        # content check (no statistics are learned from holdout values).
+        _keys = _row_keys(Xarr)
+        _sets = {name: {_keys[i] for i in idx[name].tolist()}
+                 for name in SPLIT_NAMES}
+        _dup_check = {}
+        for _i, _a in enumerate(SPLIT_NAMES):
+            for _b in SPLIT_NAMES[_i + 1:]:
+                _dup_check[f'{_a}__{_b}'] = len(_sets[_a] & _sets[_b])
+        _leaked = {k: v for k, v in _dup_check.items() if v}
+        if _leaked:
+            raise ValueError(
+                f'split_and_prepare: exact duplicate feature rows cross split '
+                f'boundaries {_leaked}; clean the source rows before splitting '
+                'or pass check_cross_split_duplicates=False only for an '
+                'explicitly reported sensitivity run')
     raw_X = {name: _take(Xarr, idx[name]) for name in SPLIT_NAMES}
     out = {'indices': idx, 'X': dict(raw_X)}
+    if _dup_check is not None:
+        out['cross_split_duplicates'] = _dup_check
     if cleaning is not None:
         out['cleaning'] = cleaning
     if yarr is not None:

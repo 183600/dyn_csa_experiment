@@ -4546,6 +4546,22 @@ def t_split_and_prepare_fits_train_only():
     assert L.assert_no_split_leakage(raw['indices']['train'], raw['indices']['val'],
                                      raw['indices']['test'],
                                      time=np.array([5, 4, 3, 2, 1, 0])) is True
+    # Exact duplicate rows across a split boundary are leakage even when the
+    # row indices/timestamps are disjoint; the one-call helper must refuse.
+    Xdup = np.array([[0.0], [1.0], [0.0], [3.0]])
+    try:
+        L.split_and_prepare(Xdup, preprocess=False)
+    except ValueError as e:
+        assert 'duplicate feature rows cross split' in str(e), e
+    else:
+        raise AssertionError('cross-split duplicate rows must be refused')
+    waived = L.split_and_prepare(Xdup, preprocess=False,
+                                 check_cross_split_duplicates=False)
+    assert 'cross_split_duplicates' not in waived, waived
+    ok = L.split_and_prepare(np.array([[0.0], [1.0], [2.0], [3.0]]),
+                             preprocess=False)
+    assert ok['cross_split_duplicates'] == {
+        'train__val': 0, 'train__test': 0, 'val__test': 0}, ok
 
 
 def t_data_quality_temporal_audit():
