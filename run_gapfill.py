@@ -522,7 +522,7 @@ def run_topup():
     _default = plan.get('min_seeds_for_family_significance') or 6
     try:
         target = int(os.environ.get('ABL_SEED_TARGET') or _default)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise SystemExit(f"ABL_SEED_TARGET must be an integer, got {os.environ.get('ABL_SEED_TARGET')!r}")
     if target < 1:
         raise SystemExit('ABL_SEED_TARGET must be >= 1')
@@ -536,7 +536,7 @@ def run_topup():
     if _core_raw:
         try:
             _core_target = int(_core_raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise SystemExit(f'CORE_SEED_TARGET must be an integer, got {_core_raw!r}')
         if _core_target < 1:
             raise SystemExit('CORE_SEED_TARGET must be >= 1')

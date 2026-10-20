@@ -970,7 +970,7 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
         for k, c in (r.get('by_len') or {}).items():
             try:
                 Ln = int(k)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if not isinstance(c, dict):
                 continue
@@ -978,14 +978,32 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             e['n_tok'].add(c.get('n_tok'))
             e['eval_span'].add(c.get('eval_span'))
             e['truncated'].add(c.get('truncated'))
+            _nseq_cell = None
             if isinstance(c.get('ppl_per_seq'), list):
-                e['n_seq'].add(len(c['ppl_per_seq']))
+                _nseq_cell = len(c['ppl_per_seq'])
+                e['n_seq'].add(_nseq_cell)
             elif c.get('n_seq') is not None:
-                e['n_seq'].add(c.get('n_seq'))
+                _nseq_cell = c.get('n_seq')
+                e['n_seq'].add(_nseq_cell)
             else:
                 # Keep the absence in the same set as the observed counts so
                 # one record with n_seq cannot mask another record without it.
                 e['n_seq'].add(None)
+            # The complete-cell identity is n_tok == n_seq * (Ln - 1).  Equal
+            # (but equally wrong) counts across arms are not a valid target
+            # set, so verify the formula whenever the cell claims to be a
+            # full-length measurement.
+            if c.get('truncated') is False and _nseq_cell is not None:
+                try:
+                    _nt = int(c.get('n_tok'))
+                    _ns = int(_nseq_cell)
+                except (TypeError, ValueError, OverflowError):
+                    # The set-based agreement check below already fails on a
+                    # missing/non-numeric value.
+                    pass
+                else:
+                    if Ln >= 2 and _nt != _ns * (Ln - 1):
+                        problems.append(f'{key}: L{Ln} n_tok={_nt} != n_seq*(L-1)={_ns * (Ln - 1)} — the cell did not score one next-token target per row')
             if 'truncated' not in c:
                 problems.append(f'{key}: L{Ln} cell has NO `truncated` flag — a missing truncation marker is treated as unverifiable, not as a full-length measurement')
             elif c.get('truncated'):
@@ -1620,7 +1638,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             k, B = int(c['k']), int(c['n_blocks'])
             rec, mass, base = (float(c['recall_at_k']), float(c['mass_covered']), float(c['random_baseline']))
             nq = int(c['n_queries'])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             out['problems'].append(f'cell {i}: non-numeric fields')
             continue
         if not (0.0 <= rec <= 1.0 and 0.0 <= mass <= 1.0 and 0.0 <= base <= 1.0):
@@ -1642,7 +1660,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                 continue
             try:
                 _d.append(float(v.get('mass_covered')) - float(v.get('random_baseline')))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 _bad_seed.append(str(_sk))
         if _bad_seed:
             out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows lack mass_covered/random_baseline: {_bad_seed[:5]}')

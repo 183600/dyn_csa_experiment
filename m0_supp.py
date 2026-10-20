@@ -579,7 +579,7 @@ def _ppl_by_seed(summary, variant):
             continue
         try:
             seed = int(rec.get('seed'))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if seed in out:
             # aggregate would reject this; keep the analysis explicit too.

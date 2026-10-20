@@ -50,6 +50,7 @@ import gc
 import hashlib
 import json
 import math
+import numbers
 import os
 import re
 import subprocess
@@ -144,12 +145,13 @@ def run_training_health(cfg=None):
                 rows[key] = {'status': 'unreadable_checkpoint', 'error': f'{type(e).__name__}: {e}', 'path': ck}
                 unhealthy.append(key)
                 continue
-            h = d.get('curve_health') if isinstance(d, dict) else None
+            d = d if isinstance(d, dict) else {}
+            h = d.get('curve_health') if isinstance(d.get('curve_health'), dict) else None
             status = (h or {}).get('status', 'unmonitored')
             rows[key] = {'status': status, 'health': h,
-                         'best_step': (d or {}).get('best_step'),
-                         'best_val_ppl': (d or {}).get('best_val_ppl'),
-                         'final_ppl': (d or {}).get('final_ppl'),
+                         'best_step': d.get('best_step'),
+                         'best_val_ppl': d.get('best_val_ppl'),
+                         'final_ppl': d.get('final_ppl'),
                          'path': ck}
             if status != 'healthy':
                 unhealthy.append(key)
@@ -222,9 +224,38 @@ def _load_manifest(path):
         m = json.load(open(path, encoding='utf-8'))
     except Exception as e:
         raise SystemExit(f'[v12] REFUSE: freeze manifest {path} cannot be parsed ({type(e).__name__}: {e})')
+    if not isinstance(m, dict):
+        raise SystemExit(f'[v12] REFUSE: freeze manifest {path} is not a JSON object ({type(m).__name__})')
     for field in ('arms', 'seeds', 'primary_comparisons', 'statistics'):
         if field not in m:
             raise SystemExit(f'[v12] REFUSE: freeze manifest {path} lacks the required field {field!r} — refusing to guess the pre-registration')
+    if not isinstance(m['arms'], list) or not m['arms'] or not all(isinstance(a, str) and a for a in m['arms']):
+        raise SystemExit(f'[v12] REFUSE: arms must be a non-empty list of arm names ({m.get("arms")!r})')
+    if len(set(m['arms'])) != len(m['arms']):
+        raise SystemExit(f'[v12] REFUSE: duplicate arm names would collapse the frozen panel ({m.get("arms")!r})')
+    if not isinstance(m['seeds'], list) or not m['seeds']:
+        raise SystemExit(f'[v12] REFUSE: seeds must be a non-empty list ({m.get("seeds")!r})')
+    if not isinstance(m['primary_comparisons'], list) or not m['primary_comparisons']:
+        raise SystemExit(f'[v12] REFUSE: primary_comparisons must be a non-empty list ({m.get("primary_comparisons")!r})')
+    if not isinstance(m['statistics'], dict):
+        raise SystemExit(f'[v12] REFUSE: statistics must be an object ({m.get("statistics")!r})')
+    for _fld, _val in (('binding', m.get('binding')), ('eval', m.get('eval'))):
+        if _val is not None and not isinstance(_val, dict):
+            raise SystemExit(f'[v12] REFUSE: {_fld} must be an object ({_val!r})')
+
+    def _int_field(value, label):
+        if isinstance(value, (bool, np.bool_)):
+            raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
+        if isinstance(value, numbers.Integral):
+            return int(value)
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
+        if not math.isfinite(f) or f != math.floor(f):
+            raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
+        return int(f)
+
     _exp = m.get('code_semantics_expected')
     if L._kernel_stamp():
         # The frozen plan was pre-registered for the eager measurement
@@ -239,17 +270,20 @@ def _load_manifest(path):
     # rather than silently computed and mislabelled in the report.
     _stat = m.get('statistics') or {}
     _ns = _stat.get('n_seeds')
-    if _ns is not None and int(_ns) != len(m['seeds']):
+    if _ns is not None and _int_field(_ns, 'statistics.n_seeds') != len(m['seeds']):
         raise SystemExit(f'[v12] REFUSE: freeze manifest declares n_seeds={_ns} but lists {len(m["seeds"])} seeds — the pre-registered resolution and the seed list disagree')
     _bind = m.get('binding') or {}
     _ts = (_bind.get('test_slice') or {}) if isinstance(_bind, dict) else {}
+    if not isinstance(_ts, dict):
+        raise SystemExit(f'[v12] REFUSE: binding.test_slice must be an object ({_ts!r})')
     _eval = m.get('eval') or {}
     if _ts and _eval:
         _ts_n = _ts.get('n_seqs')
         _ev_n = _eval.get('n_seqs_clean')
-        if _ts_n is not None and _ev_n is not None and int(_ts_n) != int(_ev_n):
+        if (_ts_n is not None and _ev_n is not None
+                and _int_field(_ts_n, 'binding.test_slice.n_seqs') != _int_field(_ev_n, 'eval.n_seqs_clean')):
             raise SystemExit(f'[v12] REFUSE: binding.test_slice.n_seqs={_ts_n} disagrees with eval.n_seqs_clean={_ev_n} — the machine-checkable binding block and the evaluation plan must describe the same slice')
-    if _eval and int(_eval.get('n_seqs_clean') or 0) <= 0:
+    if _eval and _int_field(_eval.get('n_seqs_clean') or 0, 'eval.n_seqs_clean') <= 0:
         raise SystemExit('[v12] REFUSE: eval.n_seqs_clean is missing/zero — the frozen row count is part of the held-out slice, not a runtime default')
     _tokb = (_bind.get('tokenizer') or {}) if isinstance(_bind, dict) else {}
     if _tokb and str(_tokb.get('fit', '')).lower() and 'train' not in str(_tokb.get('fit', '')).lower():
@@ -267,6 +301,10 @@ def _load_manifest(path):
         _es = comp.get('expected_sign')
         if _es is not None and str(_es).lower() not in ('positive', 'negative'):
             raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} has expected_sign={_es!r} (expected "positive", "negative", or null)')
+        if comp.get('a') not in m['arms'] or comp.get('b') not in m['arms']:
+            raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} names arms {comp.get("a")!r}/{comp.get("b")!r} outside the frozen arms {m["arms"]}')
+        if comp.get('a') == comp.get('b'):
+            raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} pairs an arm with itself ({comp.get("a")!r}) — a self-contrast is identically zero')
     _names = [str(_c.get('name')) for _c in m['primary_comparisons']]
     if len(set(_names)) != len(_names):
         raise SystemExit('[v12] REFUSE: duplicate primary-comparison names would collapse the Holm family — every declared contrast needs a unique name')
@@ -275,7 +313,12 @@ def _load_manifest(path):
     # m * 2/2^n = 0.125 > 0.05: confirmation probability is ZERO BY CONSTRUCTION,
     # which is a resolution limit, not "conservatism".  Descriptive-only
     # manifests (smoke) may opt out explicitly.
-    _alpha = float(_stat.get('alpha', 0.05))
+    try:
+        _alpha = float(_stat.get('alpha', 0.05))
+    except (TypeError, ValueError, OverflowError):
+        raise SystemExit(f'[v12] REFUSE: statistics.alpha={_stat.get("alpha")!r} is not numeric')
+    if not (math.isfinite(_alpha) and 0.0 < _alpha < 1.0):
+        raise SystemExit(f'[v12] REFUSE: statistics.alpha={_alpha!r} must be in (0, 1)')
     _n = len(m['seeds'])
     _m_family = len(m['primary_comparisons'])
     _min_holm = L.holm_min_attainable_p(_n, _m_family, _alpha)
@@ -289,10 +332,7 @@ def _load_manifest(path):
     # unable to reach Holm significance.
     _n_min = _stat.get('min_seeds_for_confirmation')
     if _n_min is not None:
-        try:
-            _n_min = int(_n_min)
-        except (TypeError, ValueError):
-            raise SystemExit(f'[v12] REFUSE: statistics.min_seeds_for_confirmation={_n_min!r} is not an integer')
+        _n_min = _int_field(_n_min, 'statistics.min_seeds_for_confirmation')
         if _n_min < 2 or _n_min > _n:
             raise SystemExit(f'[v12] REFUSE: statistics.min_seeds_for_confirmation={_n_min} is outside [2, {_n}] — the declared confirmation floor must be reachable with the frozen seed list')
         _min_holm_floor = L.holm_min_attainable_p(_n_min, _m_family, _alpha)
@@ -317,7 +357,7 @@ def _load_manifest(path):
                 if 'mr' in _asig:
                     try:
                         _mr = float(_asig['mr'])
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         raise SystemExit(f'[v12] REFUSE: per-arm mr for {_arm!r} is not numeric ({_asig["mr"]!r})')
                     if not math.isfinite(_mr) or _mr <= 1.0:
                         raise SystemExit(f'[v12] REFUSE: per-arm mr for {_arm!r} must be finite and > 1 ({_mr!r})')
@@ -531,7 +571,7 @@ def _recipe_matches_signature(recipe, sig):
             # protocol difference but wider than the formatting round-trip.
             if not math.isclose(float(got), float(want), rel_tol=1e-6, abs_tol=1e-9):
                 return False
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             if str(got) != str(want):
                 return False
     return True
@@ -1004,15 +1044,44 @@ def _by_len_shape_reason(rec, n_seq):
     for _ln, _c in bl.items():
         if not isinstance(_c, dict):
             return f'by_len[{_ln!r}] is not a cell object'
-        try:
-            _ln_i = int(_ln)
-        except (TypeError, ValueError):
+        if isinstance(_ln, (bool, np.bool_)):
             return f'by_len key {_ln!r} is not an integer length'
+        try:
+            _ln_f = float(_ln)
+            if not math.isfinite(_ln_f) or _ln_f != math.floor(_ln_f):
+                raise ValueError
+            _ln_i = int(_ln_f)
+        except (TypeError, ValueError, OverflowError):
+            return f'by_len key {_ln!r} is not an integer length'
+        if _ln_i < 2:
+            return f'by_len length {_ln_i} has no next-token prediction (needs Ln>=2); an empty cell is not admissible'
         _ntok = _c.get('n_tok')
-        _want = int(n_seq) * max(1, _ln_i - 1)
-        if not isinstance(_ntok, (int, float)) or isinstance(_ntok, bool) or int(_ntok) != _want:
+        _want = int(n_seq) * (_ln_i - 1)
+        if (isinstance(_ntok, (bool, np.bool_))
+                or not isinstance(_ntok, (int, float, np.integer, np.floating))):
+            return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {n_seq} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
+        try:
+            _ntok_f = float(_ntok)
+        except (TypeError, ValueError, OverflowError):
+            _ntok_f = float('nan')
+        if not math.isfinite(_ntok_f) or _ntok_f != math.floor(_ntok_f) or int(_ntok_f) != _want:
             return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {n_seq} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
     return None
+
+
+def _record_int(value):
+    """Exact integer view of a recorded count, or None for anything else."""
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(f) or f != math.floor(f):
+        return None
+    return int(f)
 
 
 def _admit_confirmation_records(raw, manifest):
@@ -1054,19 +1123,7 @@ def _admit_confirmation_records(raw, manifest):
         elif r.get('variant') not in arms:
             why = f"variant {r.get('variant')!r} is not one of the frozen arms"
         else:
-            s = r.get('seed')
-            s_i = None
-            if isinstance(s, bool):
-                s_i = None
-            elif isinstance(s, int):
-                s_i = s
-            elif isinstance(s, float) and math.isfinite(s) and s.is_integer():
-                s_i = int(s)
-            elif isinstance(s, str):
-                try:
-                    s_i = int(s)
-                except (TypeError, ValueError):
-                    s_i = None
+            s_i = _record_int(r.get('seed'))
             if s_i is None or s_i not in seed_whitelist:
                 why = f"seed {r.get('seed')!r} is outside the frozen whitelist {sorted(seed_whitelist)} (the frozen sample size is part of the pre-registration)"
             elif exp_code is not None and r.get('_code') != exp_code:
@@ -1079,7 +1136,7 @@ def _admit_confirmation_records(raw, manifest):
                 why = 'missing training-corpus fingerprint (train_fp) — the weights cannot be tied to a training set'
             elif want_train_fp is not None and r.get('train_fp') != want_train_fp:
                 why = f"train_fp {r.get('train_fp')} does not match the frozen canonical training fingerprint {want_train_fp}"
-            elif _want_nseq and int(r.get('n_seq') or -1) != _want_nseq:
+            elif _want_nseq and _record_int(r.get('n_seq')) != _want_nseq:
                 why = f"n_seq {r.get('n_seq')!r} != the frozen {_want_nseq} — a different row count is a different estimand"
             elif _want_nseq and _by_len_shape_reason(r, _want_nseq) is not None:
                 why = _by_len_shape_reason(r, _want_nseq)
@@ -1094,7 +1151,10 @@ def _admit_confirmation_records(raw, manifest):
                 if (v, s_i) in admitted:
                     duplicates.append(f'{v}::s{s_i} appears twice ({admitted[(v, s_i)].get("key", "?")} and {key})')
                 else:
-                    admitted[(v, s_i)] = dict(r, key=key)
+                    # Canonicalise the seed in the admitted record: string
+                    # '0' and integer 0 passed the whitelist, but downstream
+                    # pairing must not treat them as two different seeds.
+                    admitted[(v, s_i)] = dict(r, key=key, seed=s_i)
                     fps.add(r['data_fp'])
                     if r.get('train_fp'):
                         train_fps.add(r['train_fp'])
@@ -1146,7 +1206,7 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
             a, b = per_seq_a[k][i], per_seq_b[k][i]
             try:
                 fa, fb = float(a), float(b)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 fa = fb = float('nan')
             if (not math.isfinite(fa)) or (not math.isfinite(fb)) or fa <= 0.0 or fb <= 0.0:
                 incomplete += 1
@@ -1221,9 +1281,10 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             excluded.append(f'{key}: not a dict')
             continue
         why = None
+        _seed_i = _record_int(r.get('seed'))
         if r.get('variant') not in arms:
             why = f"variant {r.get('variant')!r} is not one of the frozen arms"
-        elif r.get('seed') not in seeds:
+        elif _seed_i is None or _seed_i not in seeds:
             why = f"seed {r.get('seed')!r} is outside the frozen whitelist"
         elif r.get('val_fp') != slice_fp:
             why = f"val_fp {str(r.get('val_fp'))[:12]}… does not match the frozen test slice {str(slice_fp)[:12]}…"
@@ -1241,18 +1302,27 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = 'ppl_mean is not a usable measurement'
         elif r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:
             why = 'missing arm/eval_len/rho'
+        elif _record_int(r.get('eval_len')) is None:
+            why = f"eval_len {r.get('eval_len')!r} is not an integer"
+        else:
+            try:
+                _rho_i = float(r.get('rho'))
+            except (TypeError, ValueError, OverflowError):
+                _rho_i = float('nan')
+            if not math.isfinite(_rho_i):
+                why = f"rho {r.get('rho')!r} is not numeric"
         if why:
             excluded.append(f'{key}: {why}')
             continue
         mode = str(r.get('mode', 'uniform'))
-        ident = (r['variant'], r['arm'], int(r['eval_len']), float(r['rho']), mode,
+        ident = (r['variant'], r['arm'], _record_int(r['eval_len']), float(r['rho']), mode,
                  json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True),
                  str(r.get('recipe')), str(r.get('_code')))
         grp = groups.setdefault(ident, {})
-        if r['seed'] in grp:
+        if _seed_i in grp:
             excluded.append(f'{key}: duplicate (cell, seed) identity — the pooled mean would be ambiguous')
             continue
-        grp[r['seed']] = float(r['ppl_mean'])
+        grp[_seed_i] = float(r['ppl_mean'])
     out['n_excluded'] = len(excluded)
     out['n_admitted'] = sum(len(g) for g in groups.values())
     by_visible = {}
@@ -1340,7 +1410,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         'init_core_fp_values': _inits,
         'same_init_core_fp': len(_inits) <= 1,
         'init_core_fp_recorded': bool(_inits),
-        'n_seq_values': sorted({int(r.get('n_seq')) for r in admitted.values() if r.get('n_seq') is not None}),
+        'n_seq_values': sorted({n for n in (_record_int(r.get('n_seq')) for r in admitted.values()) if n is not None}),
         'note': 'exact sign-flip requires within-seed exchangeability (same data order / eval rows / corruption grid). data_fp, train_fp, n_seq and recipe are machine-checked; the shared-trunk initialization digest (init_core_fp) is reported and compared (`same_init_core_fp`); rng_fp is reported but NOT enforced (architecture-induced RNG consumption is part of the arm), so the exchangeability claim remains a declared, machine-instrumented assumption.',
     }
     # Review issue 2: the frozen comparison is parameter-matched, not
@@ -1356,7 +1426,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     stats['compute_budget_disclosure'] = _cbd
     for v in manifest['arms']:
         rows = [r for (rv, s), r in admitted.items() if rv == v]
-        _lens = sorted({int(k) for r in rows for k in (r.get('by_len') or {})})
+        _lens = sorted({n for n in (_record_int(k) for r in rows for k in (r.get('by_len') or {}))
+                        if n is not None})
         for Ln in _lens:
             _by_seed = {}
             _nll_sum = 0.0
@@ -1367,10 +1438,11 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                 c = bl.get(Ln, bl.get(str(Ln)))
                 if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')):
                     _by_seed[r.get('seed')] = float(c['ppl'])
-                    _nll, _nt = c.get('nll_sum'), c.get('n_tok')
-                    if isinstance(_nll, (int, float)) and isinstance(_nt, (int, float)) and _nt > 0 and math.isfinite(float(_nll)):
-                        _nll_sum += float(_nll)
-                        _n_tok += int(_nt)
+                    _nll_f = L._finite_scalar(c.get('nll_sum'))
+                    _nt_i = _record_int(c.get('n_tok'))
+                    if _nll_f is not None and _nt_i is not None and _nt_i > 0:
+                        _nll_sum += _nll_f
+                        _n_tok += _nt_i
                     else:
                         _pool_ok = False
             if _by_seed:
@@ -1435,8 +1507,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             res['p_floor_effective'] = _fl_eff
             res['min_attainable_p_holm_effective'] = L.holm_min_attainable_p(_n_eff, len(manifest['primary_comparisons']), _alpha)
             res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_n_eff, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
-        _pa = [recs_a[s].get('params') for s in usable if isinstance(recs_a[s].get('params'), (int, float))]
-        _pb = [recs_b[s].get('params') for s in usable if isinstance(recs_b[s].get('params'), (int, float))]
+        _pa = [p for p in (L._finite_scalar(recs_a[s].get('params')) for s in usable) if p is not None]
+        _pb = [p for p in (L._finite_scalar(recs_b[s].get('params')) for s in usable) if p is not None]
         if _pa and _pb:
             _am, _bm = float(np.mean(_pa)), float(np.mean(_pb))
             _rel = abs(_am - _bm) / max(_am, _bm, 1.0)
@@ -1454,9 +1526,11 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _act = []
         for _recs in (recs_a, recs_b):
             for s in usable:
-                _pb = _recs[s].get('param_breakdown')
-                if isinstance(_pb, dict) and isinstance(_pb.get('active'), (int, float)):
-                    _act.append(float(_pb['active']))
+                _pbd = _recs[s].get('param_breakdown')
+                if isinstance(_pbd, dict):
+                    _act_f = L._finite_scalar(_pbd.get('active'))
+                    if _act_f is not None:
+                        _act.append(_act_f)
         res['active_params_mean'] = (float(np.mean(_act)) if _act else None)
         res['data_fp'] = unified_fp
         res['manifest_sha256'] = manifest.get('manifest_sha256')
@@ -1920,7 +1994,7 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         _a, _b = comp.get('a'), comp.get('b')
         try:
             _Ln = int(str(comp.get('endpoint', 'by_len.ppl@4096')).rsplit('@', 1)[-1])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _Ln = None
         _missing = [x for x in (_a, _b) if x not in arms]
         if _missing:

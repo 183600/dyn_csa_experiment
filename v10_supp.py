@@ -916,7 +916,7 @@ def _hist_by_seed(outdir, variant, raw=None):
             continue
         try:
             fp = tuple(((int(t), type(v).__name__, round(float(v), 9)) for t, v in r['ppl_history'] if isinstance(v, (int, float)) and (not isinstance(v, bool)) and (v == v)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             fp = None
         if fp is None:
             print(f'[v10 stats] {_k} has an unreadable ppl_history entry; its curve fingerprint cannot be de-duplicated reliably')
@@ -1413,7 +1413,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             try:
                 ns = [float(x) for x in (rec.get('nll_sum') or [])]
                 nt = [int(x) for x in (rec.get('n_tok') or [])]
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return float('nan')
             tot = sum(nt)
             if not nt or tot <= 0:
@@ -1435,7 +1435,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if isinstance(_pp, str):
                 try:
                     _pp_obj = json.loads(_pp)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     _pp_obj = None
                 if isinstance(_pp_obj, dict):
                     _pp_clean = json.dumps(_clean_probe_params(_pp_obj), sort_keys=True)

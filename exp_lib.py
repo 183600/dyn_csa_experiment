@@ -216,7 +216,7 @@ def _finite_curve(values):
     for i, v in enumerate(vals):
         try:
             fv = float(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             fv = None
         if fv is not None and math.isfinite(fv):
             finite.append(fv)
@@ -250,7 +250,7 @@ def _curve_slope_stats(points, key, k=4):
         try:
             x = float(p.get('step'))
             y = float(p.get(key))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(x) and math.isfinite(y):
             pts.append((x, y))
@@ -310,7 +310,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
                 continue
             try:
                 v = float(v)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 n_bad += 1
                 continue
             if not math.isfinite(v):
@@ -325,7 +325,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
             try:
                 _st = float(_p.get('step'))
                 _vp = float(_p.get('val_ppl'))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if math.isfinite(_st) and math.isfinite(_vp) and _vp > 0.0:
                 _val_from_ppl.append({'step': _st, 'val_ce': math.log(_vp)})
@@ -342,7 +342,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         try:
             st = int(h.get('step'))
             vp = float(h.get('val_ppl'))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(vp) and vp > 0:
             val_ppl_points.append((st, vp, h))
@@ -352,7 +352,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     for h in reversed(entries):
         try:
             g = float(h.get('gap'))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(g):
             last_gap = g
@@ -423,7 +423,7 @@ def _safe_exp_ppl(x):
     ``eval_ppl`` overflow behaviour while making the CI bounds consistent."""
     try:
         x = float(x)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if math.isnan(x):
         return float('nan')
@@ -470,7 +470,7 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         try:
             nll = float(nll)
             ntok = int(ntok)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if ntok <= 0 or not math.isfinite(nll):
             continue
@@ -498,7 +498,7 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         try:
             nll = float(nll)
             ntok = int(ntok)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if ntok <= 0 or not math.isfinite(nll):
             continue
@@ -928,7 +928,7 @@ _H2D_POOL = {}
 _H2D_POOL_BYTES = [0]
 try:
     _H2D_POOL_CAP = max(96, int(os.environ.get('CSA_H2D_POOL_MB', '512'))) << 20
-except (TypeError, ValueError):
+except (TypeError, ValueError, OverflowError):
     _H2D_POOL_CAP = 512 << 20
 _H2D_POOL_SLOTS = 8
 _H2D_POOL_MAX_ENTRIES = 512
@@ -1035,7 +1035,7 @@ _D2H_POOL = {}
 _D2H_POOL_BYTES = [0]
 try:
     _D2H_POOL_CAP = max(16, int(os.environ.get('CSA_D2H_POOL_MB', '64'))) << 20
-except (TypeError, ValueError):
+except (TypeError, ValueError, OverflowError):
     _D2H_POOL_CAP = 64 << 20
 _D2H_POOL_SLOTS = 4
 _D2H_POOL_MAX_ENTRIES = 64
@@ -1801,7 +1801,7 @@ def _dense_mask_fits(T, elem_bytes=1):
 _DENSE_ROW_MASK_CACHE = {}
 try:
     _DENSE_ROW_MASK_BUDGET_BYTES = max(16, int(os.environ.get('CSA_DENSE_ROW_MASK_MB', '128'))) << 20
-except (TypeError, ValueError):
+except (TypeError, ValueError, OverflowError):
     _DENSE_ROW_MASK_BUDGET_BYTES = 128 << 20
 
 
@@ -2186,7 +2186,7 @@ def _pool_counts_clean(bid, B):
     # (the same per-object cache convention as _pool_parts/_pool_geom).
     try:
         B = int(B)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
     hit = getattr(bid, '_pool_clean', None)
     if hit is not None and hit[0] == B:
@@ -3109,7 +3109,12 @@ def causal_prefix_pool(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
         _s_ov = _e_ov.sum(1)
         _n_ov = (_e_ov * _x_ov.to(_acc)).sum(1)
         _is_start = torch.zeros(T, dtype=torch.bool, device=Xa.device)
-        _is_start[geo['starts']] = True
+        # An oversized n_blocks argument leaves trailing EMPTY blocks whose
+        # start is n (one past the last token).  Those rows own no token, so
+        # only real starts may be scattered into the [T] row table; indexing
+        # with n would raise instead of ignoring the padding.
+        _real_starts = geo['starts'][geo['starts'] < T]
+        _is_start[_real_starts] = True
         _use_ov = _is_start & _has_ov[_bt]
         _m_ov_t = _m_ov_safe[_bt]
         _new_m = torch.maximum(_m, _m_ov_t)
@@ -3351,7 +3356,7 @@ def _pool_ends_host(bid):
                 ends = np.cumsum(_cnt, dtype=np.int64).tolist()
             else:
                 ends = [int(v) for v in itertools.accumulate(_cnt)]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         try:
             bid._pool_ends_host = ends
@@ -4241,6 +4246,27 @@ class AttnCfg:
             raise ValueError(f'unknown pool_position_policy {self.pool_position_policy!r}; expected one of {POOL_POSITION_POLICIES}')
         if int(self.pool_position_capacity) < 1:
             raise ValueError(f'pool_position_capacity must be >= 1, got {self.pool_position_capacity!r}')
+        # Non-negative/positive structural bounds.  A negative window or
+        # overlap is not a meaningful configuration; passing it through used to
+        # fail only later inside torch.arange/index maths.
+        if int(self.min_block) < 1:
+            raise ValueError(f'min_block must be >= 1, got {self.min_block!r}')
+        if int(self.block_size) < 1:
+            raise ValueError(f'block_size must be >= 1, got {self.block_size!r}')
+        if int(self.target_block_tokens) < 1:
+            raise ValueError(f'target_block_tokens must be >= 1, got {self.target_block_tokens!r}')
+        if int(self.overlap) < 0:
+            raise ValueError(f'overlap must be >= 0, got {self.overlap!r}')
+        if int(self.sliding_window) < 0:
+            raise ValueError(f'sliding_window must be >= 0, got {self.sliding_window!r}')
+        if int(self.window) < 0:
+            raise ValueError(f'window must be >= 0, got {self.window!r}')
+        if int(self.index_topk) < 0:
+            raise ValueError(f'index_topk must be >= 0, got {self.index_topk!r}')
+        if int(self.c_kv) < 0 or int(self.c_index) < 0:
+            raise ValueError(f'c_kv/c_index must be >= 0, got {self.c_kv!r}/{self.c_index!r}')
+        if int(self.n_index_heads) < 1:
+            raise ValueError(f'n_index_heads must be >= 1, got {self.n_index_heads!r}')
         if self.max_block is not None:
             if int(self.max_block) < 1:
                 raise ValueError(f'max_block must be None or >= 1, got {self.max_block!r}')
@@ -5694,7 +5720,7 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
     problems = []
     try:
         vocab = int(vocab)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return ['metadata has no usable vocab size']
     if not fingerprints_trusted and meta.get('src_fp') != _ids_fp(train_ids):
         problems.append('train id fingerprint does not match the meta file')
@@ -5718,7 +5744,7 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
         for _arr, _label in ((train_ids, 'cached train_ids'), (vb, 'cached val_batch')):
             try:
                 _validate_token_ids(_arr, vocab, _label)
-            except (TypeError, ValueError) as _e:
+            except (TypeError, ValueError, OverflowError) as _e:
                 problems.append(str(_e))
     return problems
 
@@ -7198,7 +7224,7 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
     try:
         _validate_token_ids(tr, vocab, f'{dataset} train_ids')
         _validate_token_ids(va, vocab, f'{dataset} val_batch')
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError, OverflowError) as e:
         report['hard_failures'].append(str(e))
     if va.ndim != 2 or va.shape[0] == 0 or va.size == 0:
         report['hard_failures'].append(f'validation split is empty or not 2-D (shape {va.shape})')
@@ -7625,7 +7651,7 @@ def _cache_id_upper_bound(path):
         vocab = int(meta.get('vocab'))
         if 0 < vocab <= 2 ** 31:
             return vocab - 1
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         pass
     return None
 
@@ -8224,7 +8250,7 @@ def holm_adjust(named_pvals, alpha=0.05):
     fam = []
     invalid = {}
     _seen_names = set()
-    for name, p in named_pvals:
+    for name, p in (named_pvals if named_pvals is not None else []):
         sname = str(name)
         if sname in _seen_names:
             # A dict keyed by comparison name cannot represent two family
@@ -8234,7 +8260,7 @@ def holm_adjust(named_pvals, alpha=0.05):
         _seen_names.add(sname)
         try:
             pv = float(p)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pv = float('nan')
         if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
             invalid[sname] = {'p_raw': p, 'p_holm': None, 'rank': None, 'reject': False, 'reason': 'p not in [0,1] or not finite'}
@@ -8279,7 +8305,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
             p = v.get('p')
         try:
             p = float(p)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             p = float('nan')
         if math.isfinite(p) and 0.0 <= p <= 1.0:
             pairs.append((str(k), p))
@@ -8301,7 +8327,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
             continue
         try:
             _n = int(v.get('n'))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if _n > 0:
             _ns.append(_n)
@@ -8363,7 +8389,7 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         return out
     try:
         n = int(stats.get('n') or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         n = 0
     p = stats.get('p_exact_signflip')
     if p is None:
@@ -8373,11 +8399,11 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     out['n'] = n
     try:
         out['p_raw'] = float(p) if p is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         out['p_raw'] = None
     try:
         out['p_holm'] = float(ph) if ph is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         out['p_holm'] = None
     out['p_floor'] = signflip_p_floor(n) if n > 0 else None
     if n < int(min_n):
@@ -8397,13 +8423,14 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     try:
         if mean is None or std is None or not (abs(float(mean)) > float(std)):
             out['reasons'].append('|mean| <= std: effect is within seed noise')
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         out['reasons'].append('mean/std are not numeric')
     # Leave-one-seed-out instability is a direct contradiction of a stable
     # directional effect: dropping one seed must not flip the sign.  Only
     # enforced when the caller supplied the diagnostic (old stats dicts do not
     # carry it); the verdict is never silently assumed robust.
-    if stats.get('seed_driven') is True:
+    _seed_driven = stats.get('seed_driven')
+    if isinstance(_seed_driven, (bool, np.bool_)) and bool(_seed_driven):
         out['reasons'].append('leave-one-seed-out stability fails: dropping one seed flips the mean sign')
     if family_size is not None:
         try:
@@ -8431,7 +8458,7 @@ def signflip_p_floor(n):
     n<=0 返回 NaN。用于报告「未显著是分辨率上限还是数据结论」。"""
     try:
         n = int(n)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return float('nan')
     if n <= 0:
         return float('nan')
@@ -8440,7 +8467,7 @@ def signflip_p_floor(n):
 
 def finite_range(named_values):
     vals, dropped = ([], [])
-    for label, m in named_values:
+    for label, m in (named_values if named_values is not None else []):
         f = _finite_scalar(m)
         if f is not None:
             vals.append(f)
@@ -8588,10 +8615,10 @@ def exact_signflip_p(deltas):
     相同本身不提供该保证；design_notes §20 记录了本仓库逐因素的控制方式
     与残余风险（训练随机性进入种间方差、文档抽样进入 doc 层方差）。"""
     d_in = []
-    for _x in deltas:
+    for _x in (deltas if deltas is not None else []):
         try:
             d_in.append(float(_x))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             d_in.append(float('nan'))
     d = np.asarray([x for x in d_in if math.isfinite(x)], dtype=float)
     n = int(d.size)
@@ -8638,7 +8665,7 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     grow with n_boot.  The RNG is seeded, so repeated report builds return the
     same interval.
     """
-    v = np.asarray([f for f in (_finite_scalar(x) for x in values)
+    v = np.asarray([f for f in (_finite_scalar(x) for x in (values if values is not None else []))
                     if f is not None], dtype=float)
     n = int(v.size)
     if n < 2:
@@ -8646,7 +8673,7 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     try:
         nb = int(n_boot)
         c = float(conf)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if nb < 20 or not (0.0 < c < 1.0):
         return None
@@ -8666,7 +8693,8 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
 
 
 def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
-    d = np.asarray([f for f in (_finite_scalar(x) for x in deltas) if f is not None], dtype=float)
+    d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
+                    if f is not None], dtype=float)
     if d.size < 2:
         return None
     # Draws are generated in chunks, so the panel size does not require a
@@ -8684,8 +8712,10 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     return _percentile_ci(means.tolist())
 
 def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=20261018):
-    a = np.asarray([f for f in (_finite_scalar(x) for x in with_values) if f is not None], dtype=float)
-    b = np.asarray([f for f in (_finite_scalar(x) for x in without_values) if f is not None], dtype=float)
+    a = np.asarray([f for f in (_finite_scalar(x) for x in (with_values if with_values is not None else []))
+                    if f is not None], dtype=float)
+    b = np.asarray([f for f in (_finite_scalar(x) for x in (without_values if without_values is not None else []))
+                    if f is not None], dtype=float)
     if a.size < 2 or b.size < 2:
         return None
     rng = np.random.default_rng(int(seed))
@@ -8713,7 +8743,8 @@ def wilcoxon_signed_rank_p(deltas):
     sum DP then counts every sign assignment exactly in O(n * sum_ranks),
     which keeps the sensitivity check exact when seed completion grows the
     panels."""
-    d = np.asarray([f for f in (_finite_scalar(x) for x in deltas) if f is not None], dtype=float)
+    d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
+                    if f is not None], dtype=float)
     d = d[np.abs(d) > 1e-15]
     n = int(d.size)
     if n == 0:
@@ -8790,7 +8821,8 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     p-value can never dress up a sub-noise effect as a real improvement, while
     `resolution_limited` stops a small-n panel from being read as a negative
     result when only the test's granularity, not the data, bound the p."""
-    d = np.asarray([f for f in (_finite_scalar(x) for x in deltas) if f is not None], dtype=float)
+    d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
+                    if f is not None], dtype=float)
     n = int(d.size)
     if n == 0:
         return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None}
@@ -8873,7 +8905,7 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     try:
         n = int(n_seeds)
         m = int(m_comparisons)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return float('nan')
     if n <= 0 or m <= 0:
         return float('nan')
@@ -8895,7 +8927,7 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     try:
         m = int(m_comparisons)
         a = float(alpha)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if m <= 0 or not (0.0 < a < 1.0):
         return None
@@ -8948,7 +8980,7 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     try:
         n = int(n_seeds)
         m = int(m_comparisons)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if n <= 0 or m <= 0:
         return None
@@ -8979,7 +9011,7 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
     try:
         n = int(n_seeds)
         q = float(q)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
     if not (0.0 <= q <= 1.0) or n <= 0:
         return 0.0
@@ -9009,7 +9041,8 @@ def tost_paired(deltas, margin, conf=0.90):
     单边 p、conf 水平 CI 与 `equivalent` 判定。margin 必须由计划预先注册
     （如 kernel/eager 面板平均 PPL 相对差 <1%）；本函数不替调用方选择
     margin。n<2 或 margin<=0 时不判定。"""
-    d = np.asarray([f for f in (_finite_scalar(x) for x in deltas) if f is not None], dtype=float)
+    d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
+                    if f is not None], dtype=float)
     n = int(d.size)
     out = {'n': n, 'margin': float(margin), 'conf': float(conf), 'equivalent': None,
            'method': 'paired-t (Student t, df=n-1; pre-registered margin required)'}
@@ -9232,7 +9265,7 @@ def paired_log_ratio(with_values, without_values, seeds=None):
     for s, a, b in zip(ss, wa, wb):
         try:
             fa, fb = float(a), float(b)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             dropped.append(s)
             continue
         if not (math.isfinite(fa) and math.isfinite(fb) and fa > 0.0 and fb > 0.0):
@@ -9285,7 +9318,7 @@ def _scale_points(points):
             raise ValueError('scale point %r: duplicate seeds %r' % (label, seeds_kept))
         try:
             sc = float(scale)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             sc = float('nan')
         out.append({'label': str(label), 'scale': sc, 'effects': effects, 'seeds': seeds_kept})
     return out
@@ -9382,7 +9415,7 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     for s, x, y in zip(ss, a, b):
         try:
             fx, fy = float(x), float(y)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(fx) and math.isfinite(fy):
             diff.append(fy - fx)
@@ -9590,6 +9623,21 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
     """
     policy = dict(SCALE_TRANSFER_POLICY if policy is None else policy)
     tol = float(policy.get('tokens_per_param_tolerance', 0.25) if tolerance is None else tolerance)
+
+    def _as_int(value, label, *, allow_none=False):
+        if value is None and allow_none:
+            return None
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError(f'{label} must be an integer, got {value!r}')
+        if isinstance(value, numbers.Integral):
+            return int(value)
+        if isinstance(value, numbers.Real):
+            as_float = float(value)
+            if not math.isfinite(as_float) or as_float != math.floor(as_float):
+                raise ValueError(f'{label} must be an integer, got {value!r}')
+            return int(as_float)
+        raise ValueError(f'{label} must be an integer, got {value!r}')
+
     problems, warnings, rows = [], [], []
     for i, tier in enumerate(tiers or []):
         if not isinstance(tier, dict):
@@ -9599,19 +9647,23 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         cfg = tier.get('cfg') or {}
         row = {'name': name}
         try:
-            steps = int(cfg['steps'])
-            batch = int(cfg['batch_size'])
-            seq = int(cfg['seq_len'])
-            declared_tokens = int(cfg.get('n_train_tokens') or 0)
+            steps = _as_int(cfg['steps'], 'steps')
+            batch = _as_int(cfg['batch_size'], 'batch_size')
+            seq = _as_int(cfg['seq_len'], 'seq_len')
+            declared_tokens = _as_int(cfg.get('n_train_tokens') or 0, 'n_train_tokens')
             lr = float(cfg.get('lr'))
-            warmup = int(cfg.get('warmup') or 0)
-            seeds = [int(s) for s in (cfg.get('seeds') or [])]
-        except (KeyError, TypeError, ValueError) as e:
+            warmup = _as_int(cfg.get('warmup') or 0, 'warmup')
+            seeds = [_as_int(s, 'seed') for s in (cfg.get('seeds') or [])]
+        except (KeyError, TypeError, ValueError, OverflowError) as e:
             problems.append(f'{name}: incomplete scale cfg ({type(e).__name__}: {e})')
             continue
         if min(steps, batch, seq) <= 0:
             problems.append(f'{name}: steps/batch_size/seq_len must be positive')
             continue
+        if declared_tokens < 0:
+            problems.append(f'{name}: n_train_tokens={declared_tokens} must be non-negative')
+        if warmup < 0:
+            problems.append(f'{name}: warmup={warmup} must be non-negative')
         if not (math.isfinite(lr) and lr > 0):
             problems.append(f'{name}: lr={lr!r} is not a positive finite number')
         effective_tokens = steps * batch * seq
@@ -9621,8 +9673,8 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                 f'steps*batch_size*seq_len={effective_tokens:,} by more than 1%')
         params = tier.get('params')
         try:
-            params = int(params) if params is not None else None
-        except (TypeError, ValueError):
+            params = _as_int(params, 'params', allow_none=True)
+        except (TypeError, ValueError, OverflowError):
             problems.append(f'{name}: params={params!r} is not an integer')
             params = None
         if params is not None and params <= 0:
@@ -9682,8 +9734,9 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                'problems': problems, 'warnings': warnings}
     else:
         warnings.append('fewer than two complete tiers — no cross-scale comparison can be checked')
-        out = {'status': 'warn', 'budget_matched': None, 'tiers': rows,
-               'policy': policy, 'problems': problems, 'warnings': warnings}
+        out = {'status': ('fail' if problems else 'warn'), 'budget_matched': None,
+               'tiers': rows, 'policy': policy, 'problems': problems,
+               'warnings': warnings}
     return out
 
 
@@ -9705,7 +9758,7 @@ def loglog_regression(points, *, alpha=0.05):
             continue
         try:
             fx, fy = float(x), float(y)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(fx) and math.isfinite(fy) and fx > 0.0 and fy > 0.0:
             rows.append((str(label), fx, fy))
@@ -9824,7 +9877,7 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
             fd = float(dur)
             ftok = float(tok) if tok is not None else None
             ftr = float(tr) if tr is not None else None
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if not (math.isfinite(fd) and fd > 0.0):
             continue
@@ -9983,10 +10036,16 @@ def _record_identity(rec, key, legacy_ok):
     return (str(var), record_tag(rec, key, legacy_ok), seed)
 
 def _as_seed_int(v):
-    if v is None or isinstance(v, bool):
+    if v is None or isinstance(v, (bool, np.bool_)):
         return None
-    if isinstance(v, float):
-        return int(v) if math.isfinite(v) and v.is_integer() else None
+    if isinstance(v, numbers.Integral):
+        return int(v)
+    if isinstance(v, numbers.Real):
+        # np.float32/np.float64 are Real but not all are Python ``float``;
+        # int() would silently truncate 1.5 to 1, turning an invalid seed
+        # into a different valid one.
+        f = float(v)
+        return int(f) if math.isfinite(f) and f.is_integer() else None
     try:
         return int(v)
     except (TypeError, ValueError, OverflowError):
@@ -10431,33 +10490,35 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             continue
         chosen_trial = next(t for t in trials if isinstance(t, dict)
                             and json.dumps(t.get('config') or {}, sort_keys=True, default=str) == chosen_sig)
-        vals = [float(t[metric]) for t in trials
-                if isinstance(t, dict) and isinstance(t.get(metric), (int, float))
-                and not isinstance(t.get(metric), bool) and math.isfinite(float(t[metric]))]
+        vals = [f for f in (_finite_scalar(t.get(metric)) for t in trials
+                             if isinstance(t, dict)) if f is not None]
         if not vals:
             problems.append(f'{arm}: no finite {metric} in its trials')
             continue
         chosen_value = entry.get('selected_metric_value')
         if chosen_value is None:
             chosen_value = chosen_trial.get(metric)
-        if not isinstance(chosen_value, (int, float)) or isinstance(chosen_value, bool) or not math.isfinite(float(chosen_value)):
+        chosen_f = _finite_scalar(chosen_value)
+        if chosen_f is None:
             problems.append(f'{arm}: no finite selected {metric} value')
             continue
-        selected_values[arm] = float(chosen_value)
-        _chosen_metric = chosen_trial.get(metric)
-        if not isinstance(_chosen_metric, (int, float)) or isinstance(_chosen_metric, bool) or not math.isfinite(float(_chosen_metric)):
+        selected_values[arm] = chosen_f
+        _chosen_f = _finite_scalar(chosen_trial.get(metric))
+        if _chosen_f is None:
             problems.append(f'{arm}: selected trial has no finite {metric}')
-        elif abs(float(chosen_value) - float(_chosen_metric)) > 1e-12:
+        elif abs(chosen_f - _chosen_f) > 1e-12:
             problems.append(f'{arm}: selected_metric_value does not match the selected trial')
-        if float(chosen_value) > min(vals) + 1e-12:
+        if chosen_f > min(vals) + 1e-12:
             problems.append(f'{arm}: selected trial is not the minimum-{metric} trial')
         nt = set()
         for t in trials:
             if not isinstance(t, dict) or t.get('n_tokens') is None:
                 continue
             try:
+                if isinstance(t.get('n_tokens'), (bool, np.bool_)):
+                    raise ValueError
                 nt.add(int(t.get('n_tokens')))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 problems.append(f'{arm}: trial n_tokens is not an integer ({t.get("n_tokens")!r})')
                 break
         if len(nt) > 1:
@@ -10477,7 +10538,8 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         reported_ppl = artifact.get('best_ppl')
         if reported is not None and reported != best_name:
             problems.append(f'best_baseline={reported!r} is not the minimum selected arm ({best_name!r})')
-        if isinstance(reported_ppl, (int, float)) and abs(float(reported_ppl) - selected_values[best_name]) > 1e-12:
+        _reported_f = _finite_scalar(reported_ppl)
+        if _reported_f is not None and abs(_reported_f - selected_values[best_name]) > 1e-12:
             problems.append('best_ppl does not match the minimum selected arm')
     out = {'status': 'ok' if not problems else 'fail',
            'baseline_verified': not problems,
@@ -10853,8 +10915,9 @@ def metric_policy_audit(summary=None, policy=None):
                 if isinstance(val, dict) and len(val) == 2:
                     prevalence = min(float(x) for x in val.values())
                     break
-                if isinstance(val, (int, float)) and not isinstance(val, bool):
-                    prevalence = min(float(val), 1.0 - float(val))
+                _prev_f = _finite_scalar(val)
+                if _prev_f is not None:
+                    prevalence = min(_prev_f, 1.0 - _prev_f)
                     break
             if task in classify_tasks and prevalence is not None and prevalence < 1e-3:
                 if r.get('roc_auc') is not None and r.get('pr_auc') is None:
@@ -10881,10 +10944,20 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
         ppls = t.get('seed_ppls')
         if not isinstance(ppls, dict):
             return {'status': 'unavailable', 'reason': 'trial records do not expose seed_ppls'}
-        try:
-            seed_maps.append({int(k): float(v) for k, v in ppls.items()})
-        except (TypeError, ValueError):
-            return {'status': 'unavailable', 'reason': 'seed_ppls contains non-numeric seeds/values'}
+        m = {}
+        for k, v in ppls.items():
+            seed = _as_seed_int(k)
+            if seed is None:
+                return {'status': 'unavailable', 'reason': 'seed_ppls contains non-numeric seeds/values'}
+            if isinstance(v, (bool, np.bool_)) or not isinstance(v, numbers.Real):
+                return {'status': 'unavailable', 'reason': 'seed_ppls contains non-numeric seeds/values'}
+            f = _finite_scalar(v)
+            # A non-finite draw is not a measurement.  Leaving that seed out
+            # of the comparison set keeps every trial's mean over the SAME
+            # draws instead of silently averaging different panels.
+            if f is not None:
+                m[seed] = f
+        seed_maps.append(m)
     common = set(seed_maps[0])
     for m in seed_maps[1:]:
         common &= set(m)
@@ -10897,7 +10970,10 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
     for drop in sorted(common):
         vals = []
         for m, sig in zip(seed_maps, sigs):
-            xs = [v for s, v in m.items() if s != drop and math.isfinite(v)]
+            # Use exactly the COMMON seeds for every trial.  A trial with extra
+            # non-common draws must not change a configuration's mean (and
+            # therefore the winner) when a common seed is dropped.
+            xs = [m[s] for s in common if s != drop]
             if not xs:
                 return {'status': 'unavailable', 'reason': f'trial has no finite values after dropping seed {drop}'}
             vals.append((sig, float(np.mean(xs))))
@@ -10991,32 +11067,38 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 continue
             if _seeds is not None:
                 try:
-                    _ss = tuple(sorted({int(s) for s in _seeds}))
-                except (TypeError, ValueError):
+                    _raw_seeds = list(_seeds)
+                except TypeError:
+                    problems.append(f'{arm}: trial seeds are not an iterable ({_seeds!r})')
+                    continue
+                _norm_seeds = [_as_seed_int(s) for s in _raw_seeds]
+                if any(s is None for s in _norm_seeds):
                     problems.append(f'{arm}: trial seeds are not integers ({_seeds!r})')
                     continue
-                if len(_ss) != len(set(_seeds)):
+                _ss = tuple(sorted(set(_norm_seeds)))
+                if len(_ss) != len(_raw_seeds):
                     problems.append(f'{arm}: trial lists duplicate seeds')
                 if _ppls is not None and set(str(s) for s in _ss) != set(_ppls):
                     problems.append(f'{arm}: trial seeds and seed_ppls keys disagree')
                 _set.add(_ss)
             elif _ppls is not None:
-                try:
-                    _set.add(tuple(sorted(int(k) for k in _ppls)))
-                except (TypeError, ValueError):
+                _norm_keys = [_as_seed_int(k) for k in _ppls]
+                if any(k is None for k in _norm_keys):
                     problems.append(f'{arm}: seed_ppls keys are not integer seeds ({list(_ppls)[:3]!r})')
                     continue
-            if isinstance(_ppls, dict) and isinstance(t.get('ppl'), (int, float)) and not isinstance(t.get('ppl'), bool):
-                _vals = [float(v) for v in _ppls.values()
-                         if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))]
+                _set.add(tuple(sorted(set(_norm_keys))))
+            _trial_ppl = _finite_scalar(t.get('ppl'))
+            if isinstance(_ppls, dict) and _trial_ppl is not None:
+                _vals = [f for f in (_finite_scalar(v) for v in _ppls.values())
+                         if f is not None]
                 if _vals:
                     _m = float(np.mean(_vals))
-                    if abs(_m - float(t['ppl'])) > 1e-9 * max(1.0, abs(_m)):
+                    if abs(_m - _trial_ppl) > 1e-9 * max(1.0, abs(_m)):
                         problems.append(f'{arm}: trial ppl is not the mean of its per-seed values')
                     if t.get('ppl_std') is not None and len(_vals) > 1:
                         try:
                             _reported_sd = float(t['ppl_std'])
-                        except (TypeError, ValueError):
+                        except (TypeError, ValueError, OverflowError):
                             problems.append(f'{arm}: trial ppl_std is not numeric ({t.get("ppl_std")!r})')
                         else:
                             _s = float(np.std(_vals, ddof=1))
@@ -11068,29 +11150,27 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                                 'pick may be a single-seed draw')
         elif _stab.get('status') == 'insufficient_seeds':
             warnings.append(f'{arm}: selections stability is unverifiable — {_stab.get("reason")}')
-        vals = []
-        for t in trials:
-            v = t.get(metric) if isinstance(t, dict) else None
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)):
-                vals.append(float(v))
+        vals = [f for f in (_finite_scalar(t.get(metric)) for t in trials
+                             if isinstance(t, dict)) if f is not None]
         chosen_value = entry.get('selected_metric_value')
         if chosen_value is None:
             chosen_value = chosen_trial.get(metric)
+        chosen_f = _finite_scalar(chosen_value)
         if not vals:
             problems.append(f'{arm}: no finite {metric} in its trials')
-        elif not isinstance(chosen_value, (int, float)) or isinstance(chosen_value, bool) or not math.isfinite(float(chosen_value)):
+        elif chosen_f is None:
             problems.append(f'{arm}: no finite selected {metric} value')
         else:
-            _ctv = chosen_trial.get(metric)
-            if not isinstance(_ctv, (int, float)) or isinstance(_ctv, bool) or not math.isfinite(float(_ctv)):
+            _ctv = _finite_scalar(chosen_trial.get(metric))
+            if _ctv is None:
                 problems.append(f'{arm}: selected trial has no finite {metric}')
-            elif abs(float(_ctv) - float(chosen_value)) > 1e-12:
-                problems.append(f'{arm}: selected_metric_value={chosen_value} is not the value of the selected config ({_ctv})')
+            elif abs(_ctv - chosen_f) > 1e-12:
+                problems.append(f'{arm}: selected_metric_value={chosen_value} is not the value of the selected config ({chosen_trial.get(metric)})')
             if direction == 'lower_is_better':
-                if float(chosen_value) > min(vals) + 1e-12:
+                if chosen_f > min(vals) + 1e-12:
                     problems.append(f'{arm}: selected trial is not the minimum-{metric} trial')
             else:
-                if float(chosen_value) < max(vals) - 1e-12:
+                if chosen_f < max(vals) - 1e-12:
                     problems.append(f'{arm}: selected trial is not the maximum-{metric} trial')
     if signatures:
         if len(set(signatures.values())) != 1:
@@ -11106,8 +11186,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     _declared_ss = protocol.get('search_seeds')
     if _declared_ss is not None:
         try:
-            _declared_ss = tuple(sorted({int(s) for s in _declared_ss}))
-        except (TypeError, ValueError):
+            _raw_declared = list(_declared_ss)
+            _norm_declared = [_as_seed_int(s) for s in _raw_declared]
+            if any(s is None for s in _norm_declared):
+                raise ValueError
+            _declared_ss = tuple(sorted(set(_norm_declared)))
+        except (TypeError, ValueError, OverflowError):
             problems.append(f'declared search_seeds are not integers ({_declared_ss!r})')
             _declared_ss = None
     if search_seed_sets:
@@ -11141,8 +11225,11 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     _search_set = set()
     if _declared_search is not None:
         try:
-            _search_set = {int(s) for s in _declared_search}
-        except (TypeError, ValueError):
+            _norm_search = [_as_seed_int(s) for s in _declared_search]
+            if any(s is None for s in _norm_search):
+                raise ValueError
+            _search_set = set(_norm_search)
+        except (TypeError, ValueError, OverflowError):
             problems.append(f'search_seeds are not integers ({_declared_search!r})')
     _final_set = set()
     for _s in final_seeds or []:
@@ -11191,7 +11278,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                         try:
                             _hpv = float(hp[_kn])
                             _selv = float(chosen[_kn])
-                        except (TypeError, ValueError):
+                        except (TypeError, ValueError, OverflowError):
                             problems.append(
                                 f'{arm}: final record {_kn}={hp[_kn]!r} or the '
                                 f'selected value {chosen[_kn]!r} is not numeric')
@@ -11493,7 +11580,7 @@ def _params_of_arm(recs, arm):
         p = r.get('params')
         try:
             return int(p)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
     return None
 
@@ -11867,7 +11954,7 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
     req = signflip_min_n_for_holm(m, alpha)
     try:
         n = int(n_seeds)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         n = 0
     return {'n_seeds': n, 'declared_contrasts': int(m), 'alpha': float(alpha),
             'min_seeds_for_family_significance': req,
@@ -12292,7 +12379,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     if any(float(v) != float(_sel[_kn]) for v in _vals):
                         _ok = False
                         break
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     _ok = False
                     break
             _panel_cfg_ok[_arm] = _ok
@@ -12558,13 +12645,13 @@ def normalize_seed_list(seeds, *, default=(0,)):
     out = []
     seen = set()
     for raw in seeds:
-        if isinstance(raw, bool):
+        if isinstance(raw, (bool, np.bool_)):
             raise ValueError(f'seed must be an integer, got boolean {raw!r}')
         if isinstance(raw, (float, np.floating)) and not float(raw).is_integer():
             raise ValueError(f'seed must be an integer, got non-integral {raw!r}')
         try:
             s = int(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(f'seed must be an integer, got {raw!r}') from None
         if s in seen:
             print(f'[seeds] WARNING: duplicate seed {s} removed from the panel plan (it would otherwise be trained twice under the same key)')
@@ -13376,7 +13463,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                                                 'data', 'dataloader_generator') if _rng.get(k) is not None)
             _ok = (bool(_c.get('seed') is not None) and int(_c.get('seed')) == _expected
                    and all(v == _expected for v in _vals))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _ok = False
         if _ok:
             _seed_ok += 1
@@ -13384,7 +13471,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
             _seed_mismatch.append(_key)
     try:
         _declared_seeds = [int(x) for x in (cfg.get('seeds') or [])]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         _declared_seeds = []
     _integrity = {
         'n_cells': len(cells),
@@ -15136,7 +15223,7 @@ def _percentile(vals, q):
     for v in vals:
         try:
             fv = float(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(fv):
             xs.append(fv)
@@ -15477,7 +15564,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             if step == 0 or step % _token_check_every == 0 or _first_bad_step is not None:
                 try:
                     _check_token_batch(x, y, vocab, step=step + 1)
-                except (TypeError, ValueError) as _be:
+                except (TypeError, ValueError, OverflowError) as _be:
                     raise RuntimeError(f'[data] bad training batch at step {step + 1}: {_be}') from _be
             _comp_item = float('nan')
             _pg_item = 0.0
@@ -17391,7 +17478,7 @@ def _group_params(recs):
         if v is not None:
             try:
                 return int(v)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
     return None
 
@@ -17535,7 +17622,7 @@ def aggregate(summary):
         _p = rec.get('params')
         try:
             _p = int(_p) if _p is not None and (not isinstance(_p, bool)) else None
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _p = None
         return json.dumps([rec.get('run_cfg'), _p, [rec.get(k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
 
@@ -17733,7 +17820,12 @@ def aggregate(summary):
         entry['source'] = key
         if recs:
             entry['_group_records'] = recs
-        rates = [r['tokens_seen'] / r['steps'] for r in recs if r.get('tokens_seen') and r.get('steps')]
+        rates = []
+        for r in recs:
+            _ts = _finite_scalar(r.get('tokens_seen'))
+            _st = _finite_scalar(r.get('steps'))
+            if _ts is not None and _st is not None and _st > 0.0:
+                rates.append(_ts / _st)
         if rates:
             entry['tokens_per_step'] = float(np.mean(rates))
     _full_groups = {(tag, fp_idx): recs for (v, tag, fp_idx), recs in _split_groups if v == 'full'}
@@ -17852,7 +17944,7 @@ def _print_table(agg):
         bfs = _fmt_pair(bf, e.get('boundary_f1_dyn_std', 0.0), _TW['bnd'], '6.3f', '5.3f', never_wider='.3f')
         try:
             _ns = _fmt_cell(int(_n), _TW['seeds'], 'd')
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _ns = _fmt_cell(None, _TW['seeds'], 'd')
         _cells = [(v, _TW['variant']), (ppl, _TW['ppl']), (dd, _TW['d']), (dd2, _TW['d2']), (pms, _TW['params']), (_ns, _TW['seeds']), (bls, _TW['blklen']), (bfs, _TW['bnd'])]
         print(' '.join((f'{s:>{w}s}' for s, w in _cells)))
@@ -18349,7 +18441,7 @@ def _is_confirmatory_cfg(cfg):
     try:
         _d = int(cfg.get('d', 256))
         _nseeds = len(cfg.get('seeds') or [])
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
     return bool(_d >= 512 and _nseeds >= 2)
 

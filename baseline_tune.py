@@ -133,14 +133,30 @@ def _search_final_seeds(protocol):
     selected, not an independent estimate.  Keep the two partitions explicit
     and refuse the run when they overlap.
     """
+    def _seeds(raw):
+        if raw is None:
+            return []
+        if isinstance(raw, (str, bytes)):
+            raw = L.normalize_seed_list(raw, default=())
+        elif isinstance(raw, (int, np.integer)) and not isinstance(raw, (bool, np.bool_)):
+            raw = [raw]
+        try:
+            vals = list(raw)
+        except TypeError:
+            raise ValueError(f'seed list must be iterable, got {raw!r}') from None
+        out = []
+        for raw_seed in vals:
+            seed = L._as_seed_int(raw_seed)
+            if seed is None:
+                raise ValueError(f'seeds must be integers, got {raw_seed!r}')
+            out.append(seed)
+        return sorted(set(out))
+
     raw_search = protocol.get('search_seeds')
     if raw_search is None:
         raw_search = [protocol.get('search_seed', 0)]
-    try:
-        search = sorted({int(s) for s in raw_search})
-        final = sorted({int(s) for s in (protocol.get('final_seeds') or [])})
-    except (TypeError, ValueError):
-        raise ValueError(f'search/final seeds must be integers, got {raw_search!r} / {protocol.get("final_seeds")!r}')
+    search = _seeds(raw_search)
+    final = _seeds(protocol.get('final_seeds') or [])
     if not search:
         raise ValueError('search_seeds must contain at least one seed')
     return search, final, sorted(set(search) & set(final))
@@ -376,7 +392,7 @@ def _relaxed_pair_reason(a, b, tuned_arms):
         pa, pb = int(a.get('params')), int(b.get('params'))
         if abs(pa - pb) / float(max(pa, pb, 1)) > 0.01:
             return f'parameter mismatch ({pa} vs {pb})'
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         pass
     if tuned_arms.get(a.get('variant')) != tuned_arms.get(b.get('variant')):
         return 'arms did not receive the same declared tuning range'
@@ -493,7 +509,7 @@ def _run_final(base, outdir, protocol, selected):
         _p = st.get('p_exact_signflip')
         try:
             _p = float(_p)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _p = float('nan')
         _named.append((name, _p if np.isfinite(_p) else 1.0))
     _holm = L.holm_adjust(_named, alpha=0.05) if _named else {}

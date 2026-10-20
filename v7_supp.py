@@ -917,7 +917,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             if step == 0 or step % _token_check_every == 0 or _first_bad_step is not None:
                 try:
                     L._check_token_batch(x, y, vocab, step=step + 1)
-                except (TypeError, ValueError) as _be:
+                except (TypeError, ValueError, OverflowError) as _be:
                     raise RuntimeError(f'[data] bad training batch at step {step + 1}: {_be}') from _be
             logits = None
             ce = model.ce_loss(x, y, vocab)
@@ -1799,14 +1799,27 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
     # (review 3 issue 3).  This is a guard against multiple-comparison
     # over-reading; the panel remains EXPLORATORY because its comparisons and
     # seeds were chosen after seeing validation results (design_notes §17).
-    _pairs = [(k, float(v.get('p_exact_signflip'))) for k, v in out_d['comparisons'].items()
-              if isinstance(v, dict) and isinstance(v.get('p_exact_signflip'), (int, float))
-              and math.isfinite(float(v['p_exact_signflip']))]
+    # A declared-but-unmeasurable comparison keeps a p=1 slot: dropping it
+    # from the family would make the remaining p-values look better than the
+    # pre-listed family allows (the same rule attach_holm enforces).
+    _pairs = []
+    _tested = 0
+    for k, v in out_d['comparisons'].items():
+        pv = v.get('p_exact_signflip') if isinstance(v, dict) and 'omitted' not in v else None
+        try:
+            pv = float(pv)
+        except (TypeError, ValueError, OverflowError):
+            pv = float('nan')
+        if math.isfinite(pv) and 0.0 <= pv <= 1.0:
+            _pairs.append((k, pv))
+            _tested += 1
+        else:
+            _pairs.append((k, 1.0))
     _h = L.holm_adjust(_pairs) if _pairs else {}
     for _k, _v in out_d['comparisons'].items():
         if isinstance(_v, dict):
             _v['p_holm'] = (_h.get(_k) or {}).get('p_holm') if _k in _h else None
-    out_d['family'] = {'declared': len(out_d['comparisons']), 'tested': len(_pairs), 'alpha': 0.05,
+    out_d['family'] = {'declared': len(out_d['comparisons']), 'tested': _tested, 'alpha': 0.05,
                        'correction': 'holm step-down', 'evidence_level': 'exploratory',
                        'note': 'v7 panels were selected on the validation split; Holm limits over-reading but does not make them confirmatory'}
     out_d = L.stamped_analysis('v7_bootstrap_stats', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
@@ -2564,7 +2577,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         for _bk, _bc in (((_cur_now or {}).get('by_len') or {}).items() if _need_lens != list(eval_lens) else []):
             try:
                 _merged[int(_bk)] = _bc
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
         _merged.update(r)
         _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE, 'recipe': _recipe, 'run_cfg': _run_cfg, 'eval_n_seq': n_seq, 'n_seq': n_seq}

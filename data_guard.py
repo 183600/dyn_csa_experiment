@@ -66,7 +66,7 @@ _EPS = 1e-12
 def _check_fraction(name, value):
     try:
         value = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(f'{name} must be a number in [0, 1], got {value!r}') from None
     if not (0.0 <= value <= 1.0) or not math.isfinite(value):
         raise ValueError(f'{name} must be a finite number in [0, 1], got {value!r}')
@@ -596,7 +596,7 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
             for i in range(1, n):
                 try:
                     changed = bool(sorted_time[i] != sorted_time[i - 1])
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     changed = True
                 if changed:
                     cuts.append(i)
@@ -754,7 +754,7 @@ def _as_float_2d(X, *, name='X'):
     arr = _as_numeric_2d(X, name=name)
     try:
         arr = arr.astype(np.float64, copy=False)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise TypeError(
             f'{name} must be numeric; encode categorical features before '
             'calling the leakage-safe preprocessor') from None
@@ -764,7 +764,7 @@ def _as_float_2d(X, *, name='X'):
 def _col_float64(arr, j, name='X'):
     try:
         return np.asarray(arr[:, j], dtype=np.float64)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise TypeError(
             f'{name} must be numeric; encode categorical features before '
             'calling the leakage-safe preprocessor') from None
@@ -1212,13 +1212,13 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     # (NaN compares False against everything), which is worse than an error.
     try:
         clip_z = float(clip_z)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}') from None
     if not math.isfinite(clip_z) or clip_z <= 0.0:
         raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}')
     try:
         shift_threshold = float(shift_threshold)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(
             f'shift_threshold must be a finite non-negative number, got '
             f'{shift_threshold!r}') from None

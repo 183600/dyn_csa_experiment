@@ -89,7 +89,7 @@ def _hist_points(r):
         try:
             _st, _pv = _pt
             _st = int(_st)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         yield (_st, _pv)
 
@@ -1121,7 +1121,7 @@ def sec_p1l():
     def _len_key(Ln):
         try:
             return int(Ln)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
     lens = sorted({_k for _k in (_len_key(Ln) for r in recs for Ln in r['by_len']) if _k is not None})
     variants = sorted({r.get('variant') for r in recs if r.get('variant') is not None})
@@ -1387,14 +1387,19 @@ def holm_adjust(named_pvals, alpha=0.05):
     builder intentionally does not import torch/exp_lib).  Missing/invalid
     p-values keep a dummy p=1 slot so the family size is not silently shrunk."""
     items = []
-    for k, v in named_pvals:
+    _seen = set()
+    for k, v in (named_pvals if named_pvals is not None else []):
+        name = str(k)
+        if name in _seen:
+            raise ValueError(f'holm_adjust: duplicate comparison name {name!r}')
+        _seen.add(name)
         try:
             pv = float(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pv = float('nan')
         if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
             pv = 1.0
-        items.append((str(k), pv))
+        items.append((name, pv))
     m = len(items)
     order = sorted(range(m), key=lambda i: items[i][1])
     out = {}
@@ -1509,7 +1514,7 @@ def sec_stats():
             _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
             try:
                 _pv = float(_pv)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 _pv = None
         # Omitted/invalid comparisons keep a dummy p=1 slot so a report cannot
         # shrink its own correction family by dropping a failed comparison.

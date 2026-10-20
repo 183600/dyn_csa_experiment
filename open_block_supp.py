@@ -281,7 +281,9 @@ def _rec_by_cell(summary, run_fingerprint=None):
             continue
         if run_fingerprint is not None and rec.get('run_fingerprint') != run_fingerprint:
             continue
-        if not (isinstance(rec.get('ppl'), (int, float)) and math.isfinite(float(rec['ppl']))):
+        if (isinstance(rec.get('ppl'), bool)
+                or not isinstance(rec.get('ppl'), (int, float))
+                or not math.isfinite(float(rec['ppl'])) or float(rec['ppl']) <= 0.0):
             continue
         v, _, s = key.partition('::seed')
         try:
@@ -395,7 +397,7 @@ def _controlled_reason(a, b):
             return f'{k} differs ({va!r} != {vb!r})'
     oa = a.get('open_block_config') or {}
     ob = b.get('open_block_config') or {}
-    if oa.get('fingerprint') == ob.get('fingerprint'):
+    if oa.get('fingerprint') is not None and oa.get('fingerprint') == ob.get('fingerprint'):
         return None
     # The only allowed layer-level differences are max_block/open mode/scope.
     la, lb = oa.get('layers') or [], ob.get('layers') or []
@@ -500,10 +502,20 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
 
     # Holm within the declared primary family.
     prim_names = [n for n, r in results.items() if r.get('family') == 'primary']
-    pvals = {n: results[n].get('p_exact_signflip') for n in prim_names}
-    valid = {n: float(p) for n, p in pvals.items() if isinstance(p, (int, float)) and math.isfinite(float(p))}
-    if valid:
-        adj = L.holm_adjust(list(valid.items()))
+    # The Holm family is the DECLARED primary family, not only the comparisons
+    # that happened to produce a finite p.  A declared-but-unmeasurable
+    # contrast keeps a p=1 slot; dropping it would shrink m and make the
+    # remaining tests look better than the study design allows.
+    fam = []
+    for n in prim_names:
+        p = results[n].get('p_exact_signflip')
+        try:
+            p = float(p)
+        except (TypeError, ValueError, OverflowError):
+            p = float('nan')
+        fam.append((n, p if math.isfinite(p) and 0.0 <= p <= 1.0 else 1.0))
+    if fam:
+        adj = L.holm_adjust(fam)
         for n, d in adj.items():
             results[n]['p_holm'] = d.get('p_holm')
 
