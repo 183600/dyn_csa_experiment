@@ -3044,6 +3044,23 @@ def t_tuning_grid_boundary_adequacy():
     assert rfull['tuning_verified'] is True, rfull
     assert rfull['grid_interaction_untested'] == [], rfull
     assert rfull['grid_factorial']['a']['full_factorial'] is True, rfull['grid_coverage']
+    # The search design is a declared design choice, not an implicit pile of
+    # trials: a declared full factorial must actually be complete, while a
+    # declared marginal/OFAT search is allowed but must not claim a joint optimum.
+    declared_full = dict(ofat_proto, search_design='full_factorial')
+    rbad = L.baseline_tuning_audit(_ofat_art([10.0, 9.0, 8.0]), protocol=declared_full)
+    assert rbad['tuning_verified'] is False and any(
+        'declares a full_factorial' in p for p in rbad['problems']), rbad
+    declared_ofat = dict(ofat_proto, search_design='one_factor_at_a_time')
+    rofat = L.baseline_tuning_audit(_ofat_art([10.0, 9.0, 8.0]), protocol=declared_ofat)
+    assert rofat['tuning_verified'] is True and rofat['search_design'] == 'one_factor_at_a_time', rofat
+    assert any('marginal/OFAT' in w for w in rofat['warnings']), rofat
+    bad_design = dict(ofat_proto, search_design='whatever')
+    rbd = L.baseline_tuning_audit(_ofat_art([10.0, 9.0, 8.0]), protocol=bad_design)
+    assert rbd['tuning_verified'] is False and any('search_design' in p for p in rbd['problems']), rbd
+    empty_note = dict(ofat_proto, search_design='hand_designed_grid', search_design_note='')
+    ren = L.baseline_tuning_audit(_ofat_art([10.0, 9.0, 8.0]), protocol=empty_note)
+    assert ren['tuning_verified'] is False and any('search_design_note' in p for p in ren['problems']), ren
 
 def t_baseline_multi_seed_selection_audit():
     trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]

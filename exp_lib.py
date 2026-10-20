@@ -12193,6 +12193,15 @@ BASELINE_TUNING_PROTOCOL = {
     'selection_row_split': {'enabled': True, 'seed': 20261020, 'n_folds': 2,
                             'selection_fold': 0, 'evaluation_fold': 1},
     'search_seed': 100,
+    # Hyper-parameter search is a controlled design choice, not an implicit
+    # pile of trials.  Declare the design so the audit can distinguish an
+    # intentionally marginal/OFAT search from an accidentally incomplete
+    # factorial one.  This grid is hand-designed (bracketing lr on both
+    # sides and varying wd/warmup), NOT a full cartesian product.
+    'search_design': 'hand_designed_grid',
+    'search_design_note': ('8 hand-designed trials bracket lr (5e-5..6e-4), weight decay '
+                           '(0.01..0.2) and warmup (50/100); interaction cells are not '
+                           'exhaustive, so a marginal winner is not a jointly tuned optimum.'),
     # Selection is on the MEAN validation PPL over this declared seed set, not
     # on one seed's draw.  A single-seed selection can pick a config because
     # of seed noise; every arm and every trial uses the same set.  The search
@@ -14728,12 +14737,20 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                             for _p, _pw in _cv.get('pairwise', {}).items()
                             if _pw.get('full_pairwise') is False})
     if _factor_pairs:
-        warnings.append(
-            'the tuning grid does not cover every pairwise interaction (' +
-            ', '.join(_factor_pairs) + ') — a one-factor-at-a-time winner is '
-            'not evidence of a jointly tuned optimum; either declare the search '
-            'as marginal/OFAT or add the missing interaction cells before '
-            'calling the baseline fully tuned')
+        _declared_design = protocol.get('search_design')
+        if _declared_design in ('one_factor_at_a_time', 'marginal'):
+            warnings.append(
+                'the declared marginal/OFAT search does not cover every pairwise '
+                'interaction (' + ', '.join(_factor_pairs) + ') — its winner is '
+                'a marginal optimum, not evidence of a jointly tuned optimum; '
+                'add the missing interaction cells to support the stronger claim')
+        else:
+            warnings.append(
+                'the tuning grid does not cover every pairwise interaction (' +
+                ', '.join(_factor_pairs) + ') — a one-factor-at-a-time winner is '
+                'not evidence of a jointly tuned optimum; either declare the search '
+                'as marginal/OFAT or add the missing interaction cells before '
+                'calling the baseline fully tuned')
     if _boundary_hits:
         warnings.append('selected hyperparameter(s) sit on the boundary of the declared search grid ('
                         + ', '.join(_boundary_hits) + ') — the optimum may lie outside the searched range; '
@@ -14747,7 +14764,37 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     if not _grid_levels:
         _grid_adequacy = 'incomplete'
         warnings.append('the tuning protocol declares no numeric trial levels, so grid adequacy is unverifiable')
+    # The search design must be declared, because "OFAT" and "incomplete
+    # factorial" look identical in the trial list but support different
+    # claims.  A declared full factorial must actually be complete.
+    _valid_search_designs = {'one_factor_at_a_time', 'marginal', 'full_factorial',
+                             'seeded_random', 'hand_designed_grid'}
+    _search_design = protocol.get('search_design')
+    _search_design_note = protocol.get('search_design_note')
+    if _search_design is None:
+        warnings.append('the tuning protocol does not declare a search_design '
+                        '(OFAT/full_factorial/seeded_random/hand_designed_grid); '
+                        'interaction coverage cannot be interpreted as intended')
+    elif not isinstance(_search_design, str) or _search_design not in _valid_search_designs:
+        problems.append(f'search_design={_search_design!r} is not one of '
+                        f'{sorted(_valid_search_designs)}')
+    elif _search_design == 'full_factorial':
+        _incomplete_factorial = sorted(
+            a for a, g in grid_factorial.items()
+            if not g.get('full_factorial'))
+        if _incomplete_factorial or _factor_pairs:
+            problems.append(
+                'the protocol declares a full_factorial search, but arm(s) '
+                f'{_incomplete_factorial or "?"} do not cover the complete '
+                'cartesian grid (missing pairwise cells: '
+                f'{_factor_pairs[:6]})')
+    if _search_design_note is not None and (not isinstance(_search_design_note, str)
+                                            or not _search_design_note.strip()):
+        problems.append('search_design_note must be a non-empty string when present')
     out = {'status': 'ok' if not problems else 'fail', 'tuning_verified': not problems,
+           'search_design': _search_design,
+           'search_design_declared': _search_design is not None,
+           'search_design_note': _search_design_note,
            'grid_levels': _grid_levels, 'grid_coverage': grid_coverage,
            'grid_factorial': grid_factorial,
            'grid_boundary_hits': _boundary_hits, 'grid_adequacy': _grid_adequacy,
