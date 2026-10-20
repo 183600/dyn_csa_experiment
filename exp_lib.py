@@ -16307,6 +16307,27 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         report['warnings'].extend(report['metric_audit']['warnings'])
     _tune_path = _baseline_artifact_path('baseline_tuning.json', outdir)
     report['baseline_tuning'] = baseline_tuning_audit(path=_tune_path)
+    _bt = report['baseline_tuning']
+    # Equal search is not enough: a tuned config that sits on a grid boundary,
+    # comes from a coarse/short search, or is not leave-one-seed-out stable
+    # cannot support "beats a well-tuned baseline".  Propagate the tuning
+    # artifact's own warnings (they were previously invisible in the panel
+    # report) and gate the tuned-baseline label on tuning adequacy.
+    _bt_claim_reasons = []
+    if not _bt.get('tuning_verified'):
+        _bt_claim_reasons.append('equal-search tuning artifact not verified')
+    if _bt.get('grid_adequacy') not in (None, 'ok'):
+        _bt_claim_reasons.append('grid_adequacy=%r' % (_bt.get('grid_adequacy'),))
+    if _bt.get('search_complete') is False:
+        _bt_claim_reasons.append('search grid was truncated')
+    _bt_stability = _bt.get('selection_stability') or {}
+    if any(isinstance(v, dict) and v.get('status') == 'ok' and v.get('stable') is False
+           for v in _bt_stability.values()):
+        _bt_claim_reasons.append('selected config is not leave-one-search-seed-out stable')
+    _bt['tuned_claim_allowed'] = bool(_bt.get('tuning_verified') and not _bt_claim_reasons)
+    _bt['tuned_claim_reasons'] = _bt_claim_reasons
+    for _bt_w in (_bt.get('warnings') or []):
+        report['warnings'].append('baseline tuning: ' + str(_bt_w))
     if _scoped_baselines:
         _panel_arms = set()
         for _cs in _scoped_baselines.values():
@@ -16362,11 +16383,18 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         _tuned_comps = set()
         for _comp, _contrasts in _scoped_baselines.items():
             _arms = {a for _a, _b, _n in _contrasts for a in (_a, _b)}
-            if _arms and all(_panel_cfg_ok.get(a) for a in _arms):
+            if (_arms and _bt.get('tuned_claim_allowed')
+                    and all(_panel_cfg_ok.get(a) for a in _arms)):
                 _tuned_comps.add(_comp)
         _verified = list(report.get('verified_baselines') or [])
         report['tuned_verified_baselines'] = [c for c in _verified if c in _tuned_comps]
         report['untuned_verified_baselines'] = [c for c in _verified if c not in _tuned_comps]
+        if _bt.get('tuning_verified') and not _bt.get('tuned_claim_allowed') and _verified:
+            report['warnings'].append(
+                'baseline tuning is verified as an equal-search grid but does not '
+                'support a "well-tuned baseline" claim (%s); the verified baseline '
+                'contrasts stay in untuned_verified_baselines until the search is '
+                'adequate' % '; '.join(_bt_claim_reasons))
         if not report['baseline_tuning'].get('tuning_verified'):
             report['warnings'].append(
                 'baseline claims have no verified equal-search tuning artifact (%s) — a win over an untuned baseline is not evidence that the method beats a well-tuned baseline; run baseline_tune.py and put baseline_tuning.json next to this panel'
@@ -16389,6 +16417,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     # result is explicitly marked unverified rather than assumed comparable).
     _sb_path = _baseline_artifact_path('simple_baseline.json', outdir)
     report['simple_baseline'] = simple_baseline_audit(path=_sb_path)
+    for _sb_w in (report['simple_baseline'].get('warnings') or []):
+        report['warnings'].append('simple baseline: ' + str(_sb_w))
     if _scoped_baselines:
         _sb = report['simple_baseline']
         if not _sb.get('baseline_verified'):

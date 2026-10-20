@@ -3368,7 +3368,8 @@ def t_paired_row_bootstrap_delta():
 def t_methodology_audit_requires_panel_to_use_tuned_config():
     with tempfile.TemporaryDirectory() as d:
         trials = [{'lr': 3e-4, 'weight_decay': 0.1, 'warmup': 1},
-                  {'lr': 1e-4, 'weight_decay': 0.1, 'warmup': 1}]
+                  {'lr': 1e-4, 'weight_decay': 0.1, 'warmup': 1},
+                  {'lr': 1e-3, 'weight_decay': 0.1, 'warmup': 1}]
         protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['a', 'b'], trials=trials,
                         inherits_tuning={}, search_seeds=[100, 101, 102],
                         final_seeds=[0, 1, 2])
@@ -3378,10 +3379,10 @@ def t_methodology_audit_requires_panel_to_use_tuned_config():
                'arms': {
                    'a': {'selected': dict(trials[0]), 'selected_metric_value': 2.0,
                          'trials': [{'config': c, 'ppl': p}
-                                    for c, p in zip(trials, (2.0, 3.0))]},
+                                    for c, p in zip(trials, (2.0, 3.0, 4.0))]},
                    'b': {'selected': dict(trials[0]), 'selected_metric_value': 2.1,
                          'trials': [{'config': c, 'ppl': p}
-                                    for c, p in zip(trials, (2.1, 3.1))]},
+                                    for c, p in zip(trials, (2.1, 3.1, 4.1))]},
                }}
         L.atomic_write_json(os.path.join(d, 'baseline_tuning.json'), art)
         knobs = L.training_knobs()
@@ -3412,6 +3413,32 @@ def t_methodology_audit_requires_panel_to_use_tuned_config():
         assert r2['baseline_tuning']['panel_arm_hyperparams_match']['b'] is False, r2['baseline_tuning']
         assert 'comp' in r2['untuned_verified_baselines'], r2.get('untuned_verified_baselines')
         assert any('not trained at the tuned config' in w for w in r2['warnings']), r2['warnings']
+        # Equal search over a coarse two-level lr grid is not a "well-tuned"
+        # baseline: the panel report must keep the contrast in the untuned
+        # bucket and expose the tuning caveat, not silently promote it.
+        _trials2 = trials[:2]
+        _proto2 = dict(protocol, trials=_trials2)
+        _art2 = {'protocol': _proto2, 'selection_metric': 'ppl',
+                 'selection_split': 'validation', 'direction': 'lower_is_better',
+                 'search_seeds': [100, 101, 102], 'final_seeds': [0, 1, 2],
+                 'arms': {
+                     'a': {'selected': dict(_trials2[0]), 'selected_metric_value': 2.0,
+                           'trials': [{'config': c, 'ppl': p}
+                                      for c, p in zip(_trials2, (2.0, 3.0))]},
+                     'b': {'selected': dict(_trials2[0]), 'selected_metric_value': 2.1,
+                           'trials': [{'config': c, 'ppl': p}
+                                      for c, p in zip(_trials2, (2.1, 3.1))]},
+                 }}
+        L.atomic_write_json(os.path.join(d, 'baseline_tuning.json'), _art2)
+        r3 = L.methodology_audit(_summary(), baselines=design, outdir=d, verbose=False)
+        assert r3['baseline_tuning']['tuning_verified'] is True, r3['baseline_tuning']
+        assert r3['baseline_tuning']['tuned_claim_allowed'] is False, r3['baseline_tuning']
+        assert 'comp' not in r3['tuned_verified_baselines'], r3.get('tuned_verified_baselines')
+        assert 'comp' in r3['untuned_verified_baselines'], r3.get('untuned_verified_baselines')
+        assert any('does not support a "well-tuned baseline" claim' in w
+                   for w in r3['warnings']), r3['warnings']
+        assert any('baseline tuning:' in w and 'coarse' in w
+                   for w in r3['warnings']), r3['warnings']
 
 
 def t_baseline_contrast_plan_is_group_aware():
