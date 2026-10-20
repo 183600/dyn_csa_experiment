@@ -7555,6 +7555,13 @@ def t_scale_meta_refuses_visible_attrition():
                 'effects': [float('nan')], 'seeds': [0], 'n_planned': 6}
     me = L.meta_analyze_effects(empty)
     assert me['empty_points'] == ['S1'] and me['poolable'] is False, me
+    # An n=1 tier has no within-scale SE and cannot enter the DL weights; it
+    # must still block the pooled claim instead of silently disappearing.
+    one_seed = [dict(p, n_planned=6) for p in complete]
+    one_seed.append({'label': 'S3', 'scale': 1000.0, 'effects': [0.1],
+                     'seeds': [0], 'n_planned': 6})
+    mo = L.meta_analyze_effects(one_seed)
+    assert mo['poolable'] is False and mo['underpowered_points'] == ['S3'], mo
     re = L.scaling_trend(empty, min_points=2)
     assert re['empty_points'] == ['S1'] and re['significant'] is False, re
     assert re['verdict'] == 'incomplete_scale_point', re

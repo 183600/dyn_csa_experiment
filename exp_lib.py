@@ -10370,7 +10370,11 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         if math.isfinite(_tc_pi):
             _half = _tc_pi * math.sqrt(tau2 + se_re ** 2)
             _pi = [mu_re - _half, mu_re + _half]
-    _underpowered_points = [r['label'] for r in usable if r.get('underpowered')]
+    # Every declared scale point below the seed floor blocks the pooled claim,
+    # INCLUDING points that could not enter the random-effects weights at all
+    # (n=1 has no se).  Reading this list only from `usable` silently dropped
+    # exactly those points.
+    _underpowered_points = [r['label'] for r in per if r.get('underpowered')]
     out.update({'fixed_effect': {'mean': mu_fe, 'se': float(math.sqrt(1.0 / sw)), 'ci': [mu_fe - _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw), mu_fe + _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw)]},
                 'random_effects': {'mean': mu_re, 'se': se_re, 'ci': [mu_re - tc * se_re, mu_re + tc * se_re]},
                 'heterogeneity': {'Q': q, 'df': int(df), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
