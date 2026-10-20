@@ -1317,7 +1317,7 @@ def prepare_features(X_train, X_val=None, X_test=None, **kwargs):
 
 
 def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
-                        label_conflicts='drop'):
+                        label_conflicts='drop', drop_invalid_labels=False):
     """Remove duplicate/ambiguous rows from the training split only.
 
     The holdout indices are not accepted by this function, so no validation or
@@ -1326,7 +1326,9 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
     supplied training order is retained.  When duplicate rows carry different
     non-missing labels, ``label_conflicts='drop'`` removes the whole ambiguous
     cluster (the safe choice before fitting), ``'keep'`` retains it and
-    ``'raise'`` refuses to continue.
+    ``'raise'`` refuses to continue.  ``drop_invalid_labels=True`` also removes
+    training rows whose target is missing or non-finite (a NaN/Inf target
+    cannot supervise a fit); the decision uses training labels only.
 
     Returns ``train_idx`` (the cleaned index array), the dropped rows and
     counts suitable for a run manifest.
@@ -1365,11 +1367,21 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         return lab is None or (isinstance(lab, tuple)
                                and all(v is None for v in lab))
 
+    drop = np.zeros(train_rows.size, dtype=bool)
+    n_invalid_label_rows = 0
+    if drop_invalid_labels and labels is not None:
+        for pos, row in enumerate(train_rows.tolist()):
+            lab = labels[int(row)]
+            if lab is None or (isinstance(lab, tuple)
+                               and any(v is None for v in lab)):
+                drop[pos] = True
+                n_invalid_label_rows += 1
     keys = _row_keys(_raw_X)
     clusters = {}
     for pos, row in enumerate(train_rows.tolist()):
+        if drop[pos]:
+            continue
         clusters.setdefault(keys[row], []).append(pos)
-    drop = np.zeros(train_rows.size, dtype=bool)
     n_duplicate_rows = 0
     n_conflict_rows = 0
     n_conflict_clusters = 0
@@ -1417,8 +1429,10 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         'n_duplicate_rows_dropped': int(n_duplicate_rows),
         'n_label_conflict_rows_dropped': int(n_conflict_rows),
         'n_label_conflict_clusters': int(n_conflict_clusters),
+        'n_invalid_label_rows_dropped': int(n_invalid_label_rows),
         'drop_duplicates': bool(drop_duplicates),
         'label_conflicts': label_conflicts,
+        'drop_invalid_labels': bool(drop_invalid_labels),
     }
 
 
@@ -1427,6 +1441,7 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
                       train_size=None, val_size=None, test_size=None,
                       purge=0, preprocess=True, quality_report=False,
                       clean_train=False, label_conflicts='drop',
+                      drop_invalid_labels=False,
                       quality_kwargs=None, **preprocessor_kwargs):
     """Split first, then fit every preprocessing statistic on train only.
 
@@ -1444,9 +1459,11 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     (still train-only statistics for the outlier/shift reference).
     ``clean_train=True`` first removes exact duplicate training rows and, by
     default, ambiguous duplicate-label clusters via
-    :func:`clean_training_rows`; validation/test rows are never dropped or
-    inspected.  The returned ``indices['train']`` is the cleaned index, so the
-    preprocessor and every downstream step see exactly the same rows.
+    :func:`clean_training_rows`; ``drop_invalid_labels=True`` additionally
+    removes rows with missing/non-finite training targets.  Validation/test
+    rows are never dropped or inspected.  The returned ``indices['train']`` is
+    the cleaned index, so the preprocessor and every downstream step see
+    exactly the same rows.
 
     Returns a dict with ``indices``, per-split ``X`` (and ``y``), the fitted
     ``preprocessor`` (or ``None`` when ``preprocess=False``), an optional
@@ -1468,7 +1485,8 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     if clean_train:
         cleaning = clean_training_rows(
             Xarr, y=yarr, train_idx=idx['train'],
-            label_conflicts=label_conflicts)
+            label_conflicts=label_conflicts,
+            drop_invalid_labels=drop_invalid_labels)
         idx['train'] = cleaning['train_idx']
         assert_no_split_leakage(idx['train'], idx['val'], idx['test'],
                                 groups=groups, time=time)

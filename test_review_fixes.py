@@ -6558,6 +6558,29 @@ def t_clean_training_rows_and_split():
     assert out['quality']['n_train_reference'] == 3, out['quality']
 
 
+def t_clean_training_invalid_labels():
+    X = np.arange(8, dtype=float).reshape(4, 2)
+    y = [0.0, np.nan, 2.0, np.inf]
+    kept = L.clean_training_rows(X, y, train_idx=[0, 1, 2, 3])
+    assert kept['train_idx'].tolist() == [0, 1, 2, 3], kept
+    clean = L.clean_training_rows(X, y, train_idx=[0, 1, 2, 3],
+                                  drop_invalid_labels=True)
+    assert clean['train_idx'].tolist() == [0, 2], clean
+    assert np.array_equal(np.sort(clean['dropped_idx']), [1, 3]), clean
+    assert clean['n_invalid_label_rows_dropped'] == 2, clean
+    # The one-call split helper must clean the same training rows and still
+    # leave validation/test untouched.
+    Xs = np.arange(12, dtype=float).reshape(6, 2)
+    ys = [0.0, np.nan, 1.0, 1.0, 2.0, 3.0]
+    out = L.split_and_prepare(Xs, ys, train_frac=3 / 6, val_frac=1 / 6,
+                              test_frac=2 / 6, clean_train=True,
+                              drop_invalid_labels=True)
+    assert out['indices']['train'].tolist() == [0, 2], out['indices']
+    assert out['indices']['val'].tolist() == [3], out['indices']
+    assert out['indices']['test'].tolist() == [4, 5], out['indices']
+    assert out['cleaning']['n_invalid_label_rows_dropped'] == 1, out['cleaning']
+
+
 def t_known_labels_audit():
     X = np.arange(8, dtype=float).reshape(4, 2)
     y = [0, 1, 2, 9]
@@ -7096,6 +7119,7 @@ def main():
     _check('I28 label-noise audit handles unhashable labels', t_data_quality_unhashable_labels)
     _check('I29 categorical encoding is fitted on train only', t_categorical_encoder_train_only)
     _check('I30 train-only cleaning before preprocessing', t_clean_training_rows_and_split)
+    _check('I30b invalid training labels are droppable before fitting', t_clean_training_invalid_labels)
     _check('I31 declared label set catches unseen/holdout labels', t_known_labels_audit)
     _check('I31b NaT keys and type-qualified label shift', t_data_guard_nat_and_label_identity)
     # Open-block reading rule: the substantive gates (causality, reference
