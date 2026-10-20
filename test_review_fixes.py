@@ -2693,6 +2693,21 @@ def t_nested_validation_row_split_and_subset_ppl():
         pass
     else:
         raise AssertionError('a one-row validation slice cannot be split')
+    # Fold indices must select their actual contiguous blocks, not silently
+    # fall back to "first block vs all remaining rows".
+    sel4, ev4, m4 = L.validation_row_split(17, seed=123, n_folds=4,
+                                           selection_fold=1, evaluation_fold=3)
+    folds = m4['fold_ranges']
+    assert sel4 == list(range(folds[1][0], folds[1][1] + 1)), (sel4, m4)
+    assert ev4 == list(range(folds[3][0], folds[3][1] + 1)), (ev4, m4)
+    assert m4['fold_sizes'] == [5, 4, 4, 4], m4
+    assert m4['covers_all_rows'] is False and m4['disjoint'] is True, m4
+    try:
+        L.validation_row_split(17, n_folds=18)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('more folds than rows must be refused')
 
 
 def t_nested_tuning_artifact_audit():

@@ -10979,12 +10979,15 @@ def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
     estimate the final contrast, and could put the same document on both sides
     of a row boundary many times over.
 
-    ``seed`` deterministically chooses among the balanced cut positions when
-    ``n_rows`` is not divisible by ``n_folds``; it never shuffles rows across
-    the cut.  Both returned index lists are sorted and contiguous; the union is
-    exactly ``range(n_rows)`` and they never intersect.  The metadata stores
-    only counts/ranges/fingerprints (not the full index lists) so it stays
-    small when the validation panel is scaled up."""
+    ``seed`` deterministically chooses which end receives the remainder rows
+    when ``n_rows`` is not divisible by ``n_folds``; it never shuffles rows
+    across a fold boundary.  Both returned index lists are sorted and
+    contiguous and never intersect.  For the default two-fold split the union
+    is exactly ``range(n_rows)``; with more folds only the two selected fold
+    blocks are returned (the unselected blocks are neither selection nor
+    evaluation rows).  The metadata stores only counts/ranges/fingerprints
+    (not the full index lists) so it stays small when the validation panel is
+    scaled up."""
     _parsed = {name: _as_seed_int(value) for name, value in (
         ('n_rows', n_rows), ('seed', seed), ('n_folds', n_folds),
         ('selection_fold', selection_fold), ('evaluation_fold', evaluation_fold))}
@@ -11017,17 +11020,31 @@ def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
         raise ValueError(
             'validation_row_split: selection_fold must precede evaluation_fold; '
             f'got selection={selection_fold}, evaluation={evaluation_fold}')
-    # Balanced contiguous cut: floor/ceil of n_rows/n_folds are the only legal
-    # sizes for the selection block under the requested fold count.  The seed
-    # chooses between them deterministically, so the split is reproducible yet
-    # not accidentally tied to one arithmetic rounding rule.
-    exact = n_rows / float(n_folds)
-    candidates = sorted({max(1, min(n_rows - 1, int(math.floor(exact)))),
-                         max(1, min(n_rows - 1, int(math.ceil(exact))))})
-    n_sel = min(candidates,
-                key=lambda c: (_splitmix64_u64(seed + c), c))
-    selection = list(range(n_sel))
-    evaluation = list(range(n_sel, n_rows))
+    if n_folds > n_rows:
+        raise ValueError(
+            f'validation_row_split: n_folds={n_folds} exceeds n_rows={n_rows}; '
+            'every fold must contain at least one row')
+    # Balanced contiguous folds.  The remainder rows go to the beginning or
+    # the end (chosen deterministically by the seed), never interleaved, so
+    # each fold stays a contiguous chronological block.
+    _base, _rem = divmod(n_rows, n_folds)
+    _sizes = [_base] * n_folds
+    if _rem:
+        _hi_first = bool(_splitmix64_u64(seed + n_rows) & 1)
+        _indices = range(_rem) if _hi_first else range(n_folds - 1, n_folds - 1 - _rem, -1)
+        for i in _indices:
+            _sizes[i] += 1
+    _bounds = [0]
+    for _size in _sizes:
+        _bounds.append(_bounds[-1] + _size)
+    _sel_lo, _sel_hi = _bounds[selection_fold], _bounds[selection_fold + 1]
+    _ev_lo, _ev_hi = _bounds[evaluation_fold], _bounds[evaluation_fold + 1]
+    if _sel_hi <= _sel_lo or _ev_hi <= _ev_lo:
+        raise ValueError(
+            'validation_row_split: a selected fold is empty; choose folds '
+            f'with at least one row (sizes={_sizes})')
+    selection = list(range(_sel_lo, _sel_hi))
+    evaluation = list(range(_ev_lo, _ev_hi))
     _sel_arr = np.asarray(selection, dtype=np.int64)
     _ev_arr = np.asarray(evaluation, dtype=np.int64)
     meta = {
@@ -11039,8 +11056,11 @@ def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
         'n_rows': int(n_rows),
         'n_selection_rows': int(_sel_arr.size),
         'n_evaluation_rows': int(_ev_arr.size),
-        'selection_row_range': [0, int(n_sel) - 1] if n_sel else None,
-        'evaluation_row_range': [int(n_sel), int(n_rows) - 1],
+        'selection_row_range': [int(_sel_lo), int(_sel_hi) - 1],
+        'evaluation_row_range': [int(_ev_lo), int(_ev_hi) - 1],
+        'fold_sizes': [int(x) for x in _sizes],
+        'fold_ranges': [[int(_bounds[i]), int(_bounds[i + 1]) - 1]
+                        for i in range(n_folds)],
         'chronological': True,
         'selection_precedes_evaluation': True,
         'selection_row_fp': _ids_fp(_sel_arr),
