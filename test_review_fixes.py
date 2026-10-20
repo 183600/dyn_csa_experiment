@@ -3451,6 +3451,18 @@ def t_simple_baseline_ngram_and_audit():
     bad['baselines'][arm]['selected_metric_value'] = float(bad['baselines'][arm]['selected_metric_value']) + 1.0
     rbad = L.simple_baseline_audit(bad, protocol=proto)
     assert rbad['baseline_verified'] is False and any('does not match' in p for p in rbad['problems']), rbad
+    # Per-row accounting must describe the reported floor, not a different
+    # sample; otherwise the row bootstrap would resample unscored rows.
+    bad_rows = json.loads(json.dumps(art))
+    _be = bad_rows['baselines'][bad_rows['best_baseline']]
+    if _be.get('reported_nll_per_row'):
+        _be['reported_nll_per_row'][0] += 1.0
+        rbr = L.simple_baseline_audit(bad_rows, protocol=proto)
+        assert rbr['baseline_verified'] is False and any('per-row NLL sum' in p for p in rbr['problems']), rbr
+        bad_rows2 = json.loads(json.dumps(art))
+        bad_rows2['baselines'][bad_rows2['best_baseline']]['reported_n_tokens_per_row'][0] += 1
+        rbr2 = L.simple_baseline_audit(bad_rows2, protocol=proto)
+        assert rbr2['baseline_verified'] is False and any('per-row token counts' in p for p in rbr2['problems']), rbr2
     # Missing an arm is not evidence that the floor was tuned.
     bad2 = json.loads(json.dumps(art))
     bad2['baselines'].pop('unigram')
@@ -3672,6 +3684,7 @@ def t_simple_floor_contrast_is_significance_aware():
         for arm in ('csa_dynamic', 'full_sw128_matched'):
             for seed in range(8):
                 ppl = base_ppl if arm == 'csa_dynamic' else floor + 2.0
+                _r = n_tok // 4
                 out[f'{arm}::seed{seed}'] = {
                     'variant': arm, 'seed': seed, 'ppl': ppl, 'params': 100,
                     'run_cfg': rc, 'steps': 1, 'tokens_seen': n_tok,
@@ -3679,6 +3692,8 @@ def t_simple_floor_contrast_is_significance_aware():
                     'nll_sum': math.log(ppl) * n_tok, 'n_tokens': n_tok,
                     'holdout_row_fp': meta['evaluation_row_fp'],
                     'ppl_estimation_rows': 'nested_validation_holdout',
+                    'nll_per_row_holdout': [math.log(ppl) * _r] * 4,
+                    'n_tokens_per_row_holdout': [_r] * 4,
                 }
         return out
     with tempfile.TemporaryDirectory() as td:
@@ -3714,6 +3729,11 @@ def t_simple_floor_contrast_is_significance_aware():
         assert fl['method_arms_beat_floor'] is True, fl.get('method_arm_floor_status')
         assert fl['method_arm_floor_status'] == 'all_method_arms_beat_floor', fl.get('method_arm_floor_status')
         assert fl['method_arm_floor_contrasts']['csa_dynamic']['method_status'] == 'beats_floor_holm', fl['method_arm_floor_contrasts']
+        # The floor is an estimate on the same rows, so the contrast also
+        # carries a paired row bootstrap instead of treating it as a constant.
+        _fb = fl['method_arm_floor_contrasts']['csa_dynamic'].get('paired_row_bootstrap_delta') or {}
+        assert _fb.get('status') == 'ok' and _fb.get('n_rows') == 4, _fb
+        assert _fb.get('mean_delta') < 0, _fb
         assert r2['simple_baseline']['method_arms_beat_floor'] is False, r2['simple_baseline']
         assert any('declared method arm' in w for w in r2['warnings']), r2['warnings']
         # A different arm beating the floor must not rescue the method gate.

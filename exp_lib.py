@@ -11644,6 +11644,32 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     return {'order': 2, 'alpha': alpha, 'interpolation': lam,
             'n_tokens': n_tokens, 'nll': nll, 'ppl': float(_safe_exp_ppl(nll)) if math.isfinite(nll) else float('nan')}
 
+def _ngram_row_stats(train_ids, eval_ids, vocab_size, *, order=1, alpha=0.1,
+                     interpolation=1.0, _counts=None):
+    """Per-row NLL/token accounting for the selected count model.
+
+    A floor contrast that treats the count model as a fixed number ignores the
+    evaluation-row sampling uncertainty of that number.  These arrays let the
+    paired row bootstrap compare the neural arm and the floor on the SAME
+    rows.  Each row is scored separately with its own boundary (the first
+    token is never conditioned on the previous row)."""
+    arr = np.asarray(eval_ids)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.ndim != 2:
+        raise ValueError('ngram row stats need a 1-D or 2-D evaluation array')
+    nll_rows, tok_rows = [], []
+    for i in range(arr.shape[0]):
+        sc = ngram_lm_score(train_ids, arr[i:i + 1], vocab_size, order=order,
+                            alpha=alpha, interpolation=interpolation,
+                            _counts=_counts)
+        _nt = int(sc['n_tokens'])
+        _nll = sc['nll']
+        tok_rows.append(_nt)
+        nll_rows.append(float(_nll) * _nt if _nt and math.isfinite(float(_nll))
+                        else float('nan'))
+    return nll_rows, tok_rows
+
 def _simple_baseline_row_indices(rows, n_rows, label):
     """Exact, unique, in-range row indices for the nested floor evaluation."""
     if rows is None:
@@ -11828,6 +11854,22 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None,
             entry['holdout_metric_value'] = float(sc_hold['ppl'])
             entry['holdout_nll'] = float(sc_hold['nll'])
             entry['holdout_n_tokens'] = int(sc_hold['n_tokens'])
+        # Per-row accounting for the reported sample.  It is optional evidence
+        # (legacy artifacts lack it), but when present the audit and the
+        # floor contrast no longer have to treat the floor as a fixed number.
+        try:
+            _row_nll, _row_tok = _ngram_row_stats(
+                _fit_ids, scoring_eval, vocab_size, order=order,
+                alpha=best['config']['alpha'],
+                interpolation=best['config'].get('interpolation', 1.0),
+                _counts=_shared_counts)
+        except (TypeError, ValueError, OverflowError):
+            _row_nll = _row_tok = None
+        if _row_nll is not None:
+            entry['reported_nll_per_row'] = _row_nll
+            entry['reported_n_tokens_per_row'] = _row_tok
+            entry['reported_estimation_rows'] = ('nested_validation_holdout'
+                                                 if nested else 'full_validation')
         trials_by_arm[arm] = entry
     best_arm = min(trials_by_arm, key=lambda a: float(trials_by_arm[a]['selected_metric_value']))
     if nested:
@@ -11968,6 +12010,40 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         if len(nt) > 1:
             problems.append(f'{arm}: trials evaluated different token counts {sorted(nt)} — PPLs are not comparable')
         n_tokens_by_arm[arm] = sorted(nt)
+        # Optional per-row accounting: when present it must describe the same
+        # sample as the reported floor.  A mismatch means the floor contrast
+        # would resample rows that were not scored.
+        _rr_nll = entry.get('reported_nll_per_row')
+        _rr_tok = entry.get('reported_n_tokens_per_row')
+        if (_rr_nll is None) != (_rr_tok is None):
+            problems.append(f'{arm}: only one of reported_nll_per_row/reported_n_tokens_per_row is present')
+        elif _rr_nll is not None:
+            if (not isinstance(_rr_nll, list) or not isinstance(_rr_tok, list)
+                    or not _rr_nll or len(_rr_nll) != len(_rr_tok)):
+                problems.append(f'{arm}: reported per-row accounting is malformed')
+            else:
+                _vals_nll = [_finite_scalar(v) for v in _rr_nll]
+                _vals_tok = [_exact_count(v, minimum=0) for v in _rr_tok]
+                if any(v is None for v in _vals_nll) or any(v is None for v in _vals_tok):
+                    problems.append(f'{arm}: reported per-row NLL/token values are not finite exact numbers')
+                else:
+                    _marker = entry.get('reported_estimation_rows')
+                    if _marker == 'nested_validation_holdout':
+                        _want_tok = _exact_count(entry.get('holdout_n_tokens'), minimum=1)
+                        _want_nll = _finite_scalar(entry.get('holdout_nll'))
+                        # holdout_nll is the mean NLL per token, not a sum.
+                        if _want_nll is not None and _want_tok is not None:
+                            _want_nll = _want_nll * _want_tok
+                    else:
+                        _want_tok = _exact_count(chosen_trial.get('n_tokens'), minimum=1)
+                        _tnll = _finite_scalar(chosen_trial.get('nll'))
+                        _want_nll = (_tnll * _want_tok
+                                     if _tnll is not None and _want_tok is not None else None)
+                    if _want_tok is not None and int(sum(_vals_tok)) != _want_tok:
+                        problems.append(f'{arm}: reported per-row token counts sum to '
+                                        f'{int(sum(_vals_tok))}, not the reported {_want_tok}')
+                    if _want_nll is not None and abs(float(sum(_vals_nll)) - float(_want_nll)) > 1e-9 * max(1.0, abs(float(_want_nll))):
+                        problems.append(f'{arm}: reported per-row NLL sum does not match the reported floor NLL')
     if len({tuple(v) for v in n_tokens_by_arm.values()}) > 1:
         problems.append('simple baselines evaluated different token counts; report a common token-weighted floor')
     data = artifact.get('data')
@@ -12110,12 +12186,24 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             best_ppl_value = selected_values.get(best_name)
             if _reported_f is not None and abs(_reported_f - selected_values[best_name]) > 1e-12:
                 problems.append('best_ppl does not match the minimum selected arm')
+    _reported_nll = _reported_tok = None
+    _reported_rows = None
+    if best_name and isinstance(baselines.get(best_name), dict):
+        _best_entry = baselines[best_name]
+        _rn = _best_entry.get('reported_nll_per_row')
+        _rt = _best_entry.get('reported_n_tokens_per_row')
+        if isinstance(_rn, list) and isinstance(_rt, list) and len(_rn) == len(_rt):
+            _reported_nll, _reported_tok = _rn, _rt
+            _reported_rows = _best_entry.get('reported_estimation_rows')
     out = {'status': 'ok' if not problems else 'fail',
            'baseline_verified': not problems,
            'selection_metric': metric, 'selection_split': split,
            'arms': sorted(baselines), 'selected_values': selected_values,
            'best_baseline': best_name,
            'best_ppl': best_ppl_value,
+           'reported_nll_per_row': _reported_nll,
+           'reported_n_tokens_per_row': _reported_tok,
+           'reported_estimation_rows': _reported_rows,
            'best_ppl_estimation_rows': ('nested_validation_holdout' if nested_applied
                                         else ('full_validation' if nested_applied is False else None)),
            'nested_selection': nested_applied,
@@ -15103,9 +15191,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         _vk, _vs = min(_vent, key=lambda kv: float(
                             kv[1].get('ppl_primary', kv[1].get('ppl_mean', float('inf')))))
                         _vp = _vs.get('protocol') or ''
-                        _vals = [float(_ppl) for (vv, tt, _s), r in recs.items()
-                                 if vv == _v and (tt or '') == _vp
-                                 and (_ppl := _record_primary_ppl(r)) is not None]
+                        _arm_recs = [r for (vv, tt, _s), r in recs.items()
+                                     if vv == _v and (tt or '') == _vp
+                                     and _record_primary_ppl(r) is not None]
+                        _vals = [float(_record_primary_ppl(r)) for r in _arm_recs]
                         if not _vals:
                             continue
                         _deltas = [x - _floor_ppl for x in _vals]
@@ -15135,6 +15224,30 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                             'resolution_limited': _fst.get('resolution_limited'),
                             'verdict': _av,
                         }
+                        # The count floor is an ESTIMATE on the same rows, not
+                        # a known constant.  When the floor artifact exposes
+                        # per-row accounting, resample those rows jointly with
+                        # each neural seed so the floor contrast carries the
+                        # evaluation-row uncertainty it actually has.
+                        _rep_nll = _sb.get('reported_nll_per_row')
+                        _rep_tok = _sb.get('reported_n_tokens_per_row')
+                        if (isinstance(_rep_nll, list) and isinstance(_rep_tok, list)
+                                and _rep_nll and len(_rep_nll) == len(_rep_tok)):
+                            def _floor_record_for(rec):
+                                if rec.get('ppl_estimation_rows') == 'nested_validation_holdout':
+                                    return {'ppl_estimation_rows': 'nested_validation_holdout',
+                                            'nll_per_row_holdout': _rep_nll,
+                                            'n_tokens_per_row_holdout': _rep_tok}
+                                return {'nll_per_row': _rep_nll,
+                                        'n_tokens_per_row': _rep_tok}
+                            _floor_by_arm[_v]['paired_row_bootstrap_delta'] = (
+                                paired_row_bootstrap_delta(
+                                    [(r, _floor_record_for(r)) for r in _arm_recs]))
+                        else:
+                            _floor_by_arm[_v]['paired_row_bootstrap_delta'] = {
+                                'status': 'unverifiable',
+                                'reason': 'floor artifact lacks per-row accounting; '
+                                          'the floor was treated as a fixed number'}
                     _floor_named = []
                     for _v in _method_arm_names:
                         _p = (_floor_by_arm.get(_v) or {}).get('p_exact_signflip')
