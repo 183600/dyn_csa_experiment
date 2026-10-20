@@ -366,6 +366,13 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             t0 = time.time()
             tr_s, tr_rows, tr_frac = _shingles(tr, shingle, max_rows_shingled)
             te_s, te_rows, te_frac = _shingles(te, shingle, max_rows_shingled)
+            if te_s.size == 0 or tr_s.size == 0:
+                # A shingle wider than the cached rows produces no windows;
+                # reporting 0% overlap would falsely certify a clean split.
+                raise RuntimeError(
+                    f'no {shingle}-token shingle windows could be formed '
+                    f'(train windows={tr_s.size}, test windows={te_s.size}); '
+                    'the overlap gate cannot verify this split')
             inter = int(np.intersect1d(tr_s, te_s, assume_unique=True).size)
             union = int(tr_s.size + te_s.size - inter)
             jac = (inter / union) if union else 0.0

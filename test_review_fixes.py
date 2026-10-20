@@ -4079,6 +4079,12 @@ def t_audit_gate_parameters_fail_closed():
                                 max_rows_shingled=10,
                                 preferred_train_seq_len=512)
         assert _pref['status'] == 'not_verifiable_locally', _pref
+        # A shingle wider than the stored rows can form no window; that is an
+        # unverifiable split, not zero overlap.
+        _wide = A.audit_leakage(cache_dir=cache, shingle=1000,
+                                max_rows_shingled=10)
+        assert _wide['status'] == 'fail', _wide
+        assert 'shingle' in str(_wide['checks'].get('doc_overlap')), _wide
         _orig = A._window_hashes
         try:
             def _boom(*_a, **_k):
