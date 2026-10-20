@@ -99,8 +99,11 @@ points carry declared-plan coverage (`n_planned`/`planned_seeds`,
 is visible as an incomplete complete-case subset. Zero-within-variance scale
 points are named instead of silently dropped from the DL weights. (4) M0
 cross-tier per-seed pairs now pass `pair_reason`, and extreme-scale interactions
-order by declared scale rather than label text. The temporary issue list was
-removed after the fixes.
+order by declared scale rather than label text. (5) The zero-aware floor is
+also carried by `reportable_claim`, the shared v7/v12 exact helper and P5T's
+effective-power fields; declared tiers with n=1, no measured effect, or zero
+within-scale variance stay visible and block pooling. The temporary issue list
+was removed after the fixes.
 
 ## 2026-10-20 — data-path hardening (no new experiment panels)
 

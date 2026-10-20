@@ -1450,8 +1450,11 @@ warning 而不是把两套 seed 集合当成同一族。
 精确符号翻转检验中，`d_i = 0` 的符号不改变统计量，因此双侧 p 的分辨率
 下限是 `2 / 2**(#nonzero)`，不是 `2 / 2**n`。p 值原本就是正确的；错的
 是 `paired_effect_stats` 报告的 `p_floor` 与 `resolution_limited` 标签。
-现在 `exact_signflip_p` 返回 `n_nonzero` 与可达下限，paired 统计和
-`build_report` 的本地孪生实现都使用它；全零向量报 `p_floor=1`。
+现在 `exact_signflip_p` 返回 `n_nonzero` 与可达下限，paired 统计、
+`reportable_claim`、`build_report` 的本地孪生实现以及 v7–v12 共用的
+`exact_sign_permutation` 都使用它；全零向量报 `p_floor=1`。P5T 的
+`p_floor_effective` / `min_attainable_p_holm_effective` 也按实际非零差
+计算，而不是按配对数计算。
 
 ### 29.3 规模点的可见缺失与零方差
 
@@ -1466,6 +1469,11 @@ warning 而不是把两套 seed 集合当成同一族。
 `1/se^2` 权重。它不是缺失点，也不应被静默丢弃；现在它保留在
 `per_point`，列入 `zero_variance_points`，并阻止合并声明，直到有方差
 模型或更多种子。
+
+`n=1` 或全部效应非有限的规模点无法进入合并权重，但也不能因此从族里
+消失：前者进入 `underpowered_points`（即使它不在 `usable` 里），后者
+进入 `empty_points`；两者都阻止 `poolable`。声明过的 tier 因此不会因为
+「算不出 SE」而被静默删除。
 
 ### 29.4 跨规模逐种子配对必须过受控变量门
 
