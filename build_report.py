@@ -2,6 +2,7 @@
 import collections
 import json
 import math
+import numbers
 import os
 import random
 import re
@@ -18,6 +19,22 @@ for _stream in (sys.stdout, sys.stderr):
 REPO = os.path.dirname(os.path.abspath(__file__))
 PAIR_STEP_KEYS = ('steps', 'tokens_seen')
 _LOADED = {}
+
+def _as_finite(v):
+    """Finite float for any real numeric scalar (NumPy scalars included).
+
+    Report helpers are also called directly on in-memory records, not only on
+    JSON-decoded ones.  ``isinstance(v, (int, float))`` silently dropped
+    ``np.int64``/``np.float32`` values, which could turn a non-empty panel into
+    "no data" or make the local exact test disagree with ``exp_lib``.
+    """
+    if isinstance(v, bool) or not isinstance(v, numbers.Real):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
 
 def load(path, default=None):
     try:
@@ -43,10 +60,12 @@ def summary(outdir):
     return _LOADED[key]
 
 def fm(x, nd=2):
-    return f'{x:.{nd}f}' if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(x) else 'n/a'
+    _f = _as_finite(x)
+    return f'{_f:.{nd}f}' if _f is not None else 'n/a'
 
 def sp(x, nd=2):
-    return f'±{x:.{nd}f}' if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(x) else ''
+    _f = _as_finite(x)
+    return f'±{_f:.{nd}f}' if _f is not None else ''
 
 def _ppl_value(entry):
     """Primary PPL aggregate: pooled token-level NLL when the records carry it,
@@ -55,8 +74,9 @@ def _ppl_value(entry):
         return None
     for k in ('ppl_primary', 'ppl_pooled', 'ppl_mean'):
         v = entry.get(k)
-        if isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v):
-            return float(v)
+        _f = _as_finite(v)
+        if _f is not None:
+            return _f
     return None
 
 def _ppl_tag(entry):
@@ -178,7 +198,9 @@ def _signflip_saddlepoint_p(values):
 
 
 def exact_signflip(deltas):
-    deltas = [float(d) for d in deltas if isinstance(d, (int, float)) and (not isinstance(d, bool)) and math.isfinite(d)]
+    # Same scalar contract as exp_lib.exact_signflip_p: NumPy integers and
+    # floats are measurements too, non-finite/boolean values are not.
+    deltas = [f for f in (_as_finite(d) for d in deltas) if f is not None]
     n = len(deltas)
     if n == 0:
         return None
@@ -234,10 +256,11 @@ def _measurable(r):
     return not r.get('synthesized') and _ppl_ok(v)
 
 def _ppl_ok(v):
-    return isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v) and (v > 0.0)
+    f = _as_finite(v)
+    return f is not None and f > 0.0
 
 def _finite_or_none(v):
-    return float(v) if isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v) else None
+    return _as_finite(v)
 
 def _int_or(v, default):
     if v is None or isinstance(v, bool):
@@ -288,7 +311,7 @@ def _finite_ppls(r):
     ppls = r.get('ppls') or r.get('ppl_list') or []
     if not isinstance(ppls, (list, tuple)):
         return []
-    return [x for x in ppls if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(x) and (x > 0)]
+    return [f for f in (_as_finite(x) for x in ppls) if f is not None and f > 0.0]
 
 _WARM_KEY_RE = re.compile('.*::w(\\d+)::seed\\d+$')
 
@@ -362,9 +385,9 @@ PARAM_MATCH_ARCH = 0.06
 def param_gap(a, b, tol=PARAM_MATCH_TOL):
     if not isinstance(a, dict) or not isinstance(b, dict):
         return None
-    pa = a.get('params')
-    pb = b.get('params')
-    if not (isinstance(pa, (int, float)) and isinstance(pb, (int, float))):
+    pa = _as_finite(a.get('params'))
+    pb = _as_finite(b.get('params'))
+    if pa is None or pb is None:
         return None
     if pa <= 0 or pb <= 0:
         return None
@@ -1245,8 +1268,8 @@ def _agg_entry_scan(d, v):
     return cands[0][1]
 
 def _params_m(r):
-    p = r.get('params') if isinstance(r, dict) else None
-    if not isinstance(p, (int, float)) or isinstance(p, bool) or (not p):
+    p = _as_finite(r.get('params')) if isinstance(r, dict) else None
+    if p is None or not p:
         return '—'
     return f'{p / 1000000.0:.3f}M'
 

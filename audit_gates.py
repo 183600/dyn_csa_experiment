@@ -986,6 +986,10 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 e['n_seq'].add(len(c['ppl_per_seq']))
             elif c.get('n_seq') is not None:
                 e['n_seq'].add(c.get('n_seq'))
+            else:
+                # Keep the absence in the same set as the observed counts so
+                # one record with n_seq cannot mask another record without it.
+                e['n_seq'].add(None)
             if 'truncated' not in c:
                 problems.append(f'{key}: L{Ln} cell has NO `truncated` flag — a missing truncation marker is treated as unverifiable, not as a full-length measurement')
             elif c.get('truncated'):
@@ -994,7 +998,10 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
     for Ln, e in sorted(by_len.items()):
         ok = (len(e['n_tok']) == 1 and None not in e['n_tok']
               and len(e['eval_span']) == 1 and None not in e['eval_span'])
-        nseq_ok = len(e['n_seq']) <= 1
+        # Missing n_seq is unverifiable, not "consistent": without the
+        # per-document row count we cannot show the arms scored the same
+        # documents.  Fail closed exactly like a missing `truncated` flag.
+        nseq_ok = len(e['n_seq']) == 1 and None not in e['n_seq']
         out['by_length'][str(Ln)] = {'n_tok_values': sorted((str(x) for x in e['n_tok'])), 'eval_span_values': sorted((str(x) for x in e['eval_span'])), 'n_seq_values': sorted((str(x) for x in e['n_seq'])), 'same_scored_targets_across_records': bool(ok), 'same_n_seq_across_records': bool(nseq_ok)}
         if not ok:
             problems.append(f'L{Ln}: records disagree on n_tok/eval_span — different target sets are being scored across arms; cross-arm comparison at this length is invalid')
@@ -1606,9 +1613,12 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         if not isinstance(c, dict):
             out['problems'].append(f'cell {i}: not an object')
             continue
-        _miss = [k for k in ('arm', 'eval_len', 'k', 'n_blocks', 'n_queries', 'recall_at_k', 'mass_covered', 'random_baseline') if c.get(k) is None]
+        _miss = [k for k in ('arm', 'eval_len', 'k', 'n_blocks', 'n_queries', 'recall_at_k', 'mass_covered', 'random_baseline', 'per_seed') if c.get(k) is None]
         if _miss:
             out['problems'].append(f'cell {i} ({c.get("arm")}): missing {_miss}')
+            continue
+        if not isinstance(c.get('per_seed'), dict):
+            out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed must be a seed -> measurement object')
             continue
         try:
             k, B = int(c['k']), int(c['n_blocks'])
@@ -1624,23 +1634,36 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         if nq <= 0:
             out['problems'].append(f'cell {i}: n_queries must be positive')
         _seeds = c.get('per_seed')
-        _n_seeds = len(_seeds) if isinstance(_seeds, dict) else 0
+        _n_seeds = len(_seeds)
         _st = None
-        if isinstance(_seeds, dict) and _n_seeds >= 2:
+        # Only complete seed rows enter the paired test.  A malformed row must
+        # not inflate the reported seed count or the claim gate: the exact test
+        # is run on the valid deltas and its own n is what the n>=6 floor uses.
+        _d, _bad_seed = [], []
+        for _sk, v in _seeds.items():
+            if not isinstance(v, dict) or v.get('mass_covered') is None or v.get('random_baseline') is None:
+                _bad_seed.append(str(_sk))
+                continue
+            try:
+                _d.append(float(v.get('mass_covered')) - float(v.get('random_baseline')))
+            except (TypeError, ValueError):
+                _bad_seed.append(str(_sk))
+        if _bad_seed:
+            out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows lack mass_covered/random_baseline: {_bad_seed[:5]}')
+        _n_valid = len(_d)
+        if _n_valid >= 2:
             try:
                 L = _import_exp_lib()
-                _d = [float(v.get('mass_covered')) - float(v.get('random_baseline')) for v in _seeds.values() if isinstance(v, dict) and v.get('mass_covered') is not None]
-                if len(_d) >= 2:
-                    _r = L.exact_signflip_p(_d)
-                    _st = {'p_exact_signflip': float(_r.get('p')), 'n': len(_d), 'method': _r.get('method')}
+                _r = L.exact_signflip_p(_d)
+                _st = {'p_exact_signflip': float(_r.get('p')), 'n': int(_r.get('n', _n_valid)), 'method': _r.get('method')}
             except Exception as e:
                 out['problems'].append(f'cell {i}: could not run the seed test ({type(e).__name__}: {e})')
         out['cells'].append({'arm': c.get('arm'), 'eval_len': c.get('eval_len'), 'k': k, 'n_blocks': B,
                              'recall_at_k': rec, 'mass_covered': mass, 'random_baseline': base,
                              'mass_excess': mass - base, 'recall_excess': rec - base,
-                             'n_queries': nq, 'n_seeds': _n_seeds,
+                             'n_queries': nq, 'n_seeds': _n_seeds, 'n_seeds_valid': _n_valid,
                              'seed_test': _st,
-                             'claim_allowed': bool(mass > base and rec > base and nq > 0 and _st is not None and _st.get('p_exact_signflip', 1.0) < 0.05 and _n_seeds >= 6)})
+                             'claim_allowed': bool(mass > base and rec > base and nq > 0 and _st is not None and _st.get('p_exact_signflip', 1.0) < 0.05 and int(_st.get('n', 0)) >= 6)})
     out['status'] = 'fail' if out['problems'] else 'ok'
     out['note'] = ('cells pass the structural contract; `claim_allowed` additionally requires mass/recall above the '
                    'random baseline and a seed-level exact sign-flip p<0.05 with n>=6')

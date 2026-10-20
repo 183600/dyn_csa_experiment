@@ -1119,11 +1119,21 @@ def _row_keys(X):
             continue
         for row, ok in zip(arr, finite):
             # NaN/Inf positions are represented explicitly so two rows are equal
-            # only when their finite values AND their non-finite patterns match.
+            # only when their finite values AND their non-finite values match.
+            # A mask alone would collapse NaN, +Inf and -Inf in the same
+            # positions into one key: those rows are not duplicates of each
+            # other, and treating them as such manufactures cross-split
+            # leakage (and false label conflicts) from corrupted values.  The
+            # byte code keeps NaN/NaN equal while separating the infinities.
             h = hashlib.blake2b(digest_size=8)
             h.update(np.ascontiguousarray(row[ok]).tobytes())
             h.update(b'|')
             h.update(np.packbits(~ok).tobytes())
+            _code = np.zeros(row.shape, dtype=np.uint8)
+            _code[np.isnan(row)] = 1
+            _code[np.isposinf(row)] = 2
+            _code[np.isneginf(row)] = 3
+            h.update(_code.tobytes())
             keys.append(h.digest())
     return keys
 

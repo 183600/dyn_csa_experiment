@@ -212,7 +212,7 @@ def _safe_nan_to_num(x, *, where='attention', **kwargs):
 
 def _finite_curve(values):
     """Finite subset + non-finite bookkeeping for a loss/PPL curve."""
-    vals = list(values or [])
+    vals = list(values) if values is not None else []
     finite = []
     first_bad = None
     last_bad = None
@@ -247,7 +247,7 @@ def _curve_slope_stats(points, key, k=4):
     need a scale-free criterion compare the slope with a multiple of this SE.
     """
     pts = []
-    for p in (points or []):
+    for p in (points if points is not None else []):
         if not isinstance(p, dict):
             continue
         try:
@@ -298,7 +298,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     Pass a number to restore the historical fixed-threshold behaviour (tests
     and callers that deliberately use a synthetic noise-free curve do this).
     """
-    entries = [h for h in (history or []) if isinstance(h, dict)]
+    entries = [h for h in (history if history is not None else []) if isinstance(h, dict)]
     n_bad = 0
     n_train_measured = 0
     for h in entries:
@@ -461,10 +461,15 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     Documents, not tokens, are the independent sampling unit; treating every
     token as independent would make the interval look far narrower than the
     actual evaluation-subset noise."""
+    # Materialise once: ``x or []`` raises for a multi-element NumPy array,
+    # and a one-shot generator would be exhausted before the cluster-robust
+    # residual pass below (silently reporting n_docs=0).
+    _nll = list(nll_per_row) if nll_per_row is not None else []
+    _ntok = list(n_tokens_per_row) if n_tokens_per_row is not None else []
     doc_ce = []
     total_nll = 0.0
     total_tok = 0
-    for nll, ntok in zip(nll_per_row or [], n_tokens_per_row or []):
+    for nll, ntok in zip(_nll, _ntok):
         try:
             nll = float(nll)
             ntok = int(ntok)
@@ -492,7 +497,7 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     # A t critical value (df=N-1), not 1.96, keeps small document panels from
     # claiming a normal-theory interval.
     _resid = []
-    for nll, ntok in zip(nll_per_row or [], n_tokens_per_row or []):
+    for nll, ntok in zip(_nll, _ntok):
         try:
             nll = float(nll)
             ntok = int(ntok)
@@ -9216,7 +9221,7 @@ def paired_log_ratio(with_values, without_values, seeds=None):
 def _scale_points(points):
     """Normalise [{label, scale, effects, seeds}] / [(scale, effects)] inputs."""
     out = []
-    for i, p in enumerate(points or []):
+    for i, p in enumerate(points if points is not None else []):
         if isinstance(p, dict):
             eff = p.get('effects')
             scale = p.get('scale')
@@ -9552,7 +9557,7 @@ def loglog_regression(points, *, alpha=0.05):
     自由度、无 R²」。x 本身的测量误差未计入（观测性拟合，不是因果估计）。
     """
     rows = []
-    for i, p in enumerate(points or []):
+    for i, p in enumerate(points if points is not None else []):
         if isinstance(p, dict):
             x, y, label = p.get('x'), p.get('y'), p.get('label', i)
         elif isinstance(p, (tuple, list)) and len(p) >= 2:
@@ -9594,8 +9599,15 @@ def loglog_regression(points, *, alpha=0.05):
         sigma2 = ss_res / (k - 2)
         se = float(math.sqrt(sigma2 / sxx))
         tc = _t_critical(1.0 - float(alpha), k - 2)
+        # A zero-residual fit has an infinite t statistic, not an undefined
+        # p-value: report p=0 for a non-zero slope (p=1 for an exactly flat
+        # line).  ``nan`` would hide a perfectly recovered power law.
+        if se > 0.0:
+            _p = student_t_two_sided_p(slope / se, k - 2)
+        else:
+            _p = 1.0 if abs(slope) <= 1e-15 else 0.0
         out.update({'se': se, 'ci': [slope - tc * se, slope + tc * se],
-                    'p': student_t_two_sided_p(slope / se, k - 2) if se > 0 else float('nan'),
+                    'p': _p,
                     'df': k - 2, 'r2': (1.0 - ss_res / ss_tot) if ss_tot > 0 else float('nan'),
                     'residual_sigma_log10': float(math.sqrt(sigma2))})
         loo = []
@@ -9654,7 +9666,7 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
     if isinstance(entries, dict):
         entries = [(k, v) for k, v in entries.items()]
     else:
-        entries = list(entries or [])
+        entries = list(entries) if entries is not None else []
     for i, item in enumerate(entries):
         if isinstance(item, dict):
             label, e = item.get('label', str(i)), item

@@ -162,6 +162,16 @@ def t_safe_exp_and_doc_ci():
     assert ci['ppl_ci95_low'] <= ci['ppl'] <= ci['ppl_ci95_high'], ci
     assert ci['ci_method'].startswith('cluster-robust'), ci
     assert ci['n_docs'] == 3
+    # NumPy arrays are the natural per-document inputs, and a one-shot
+    # iterator must not be exhausted before the residual pass.  Both used to
+    # raise (``array or []``) or silently report n_docs=0.
+    ci_np = L._nll_doc_ci(np.array(nll), np.array(ntok))
+    assert ci_np['n_docs'] == 3 and abs(ci_np['ppl'] - ci['ppl']) < 1e-12, ci_np
+    ci_gen = L._nll_doc_ci(iter(nll), iter(ntok))
+    assert ci_gen['n_docs'] == 3 and abs(ci_gen['ppl'] - ci['ppl']) < 1e-12, ci_gen
+    # The same iterable contract holds for the curve diagnostics.
+    assert L._finite_curve(np.array([1.0, np.inf, 2.0]))['n_finite'] == 2
+    assert L._finite_curve(iter([1.0, 2.0]))['n_finite'] == 2
 
 
 def t_bootstrap_mean_ci():
@@ -3060,6 +3070,14 @@ def t_data_guard_index_label_and_shift_edges():
     repz = L.data_quality_report(Xz, train_idx=[0], val_idx=[1], test_idx=[2, 3])
     assert repz['checks']['duplicate_rows_across_splits']['train__val'] == 1, repz
     assert repz['status'] == 'fail', repz
+    # Different non-finite values are not exact duplicate rows: NaN, +Inf and
+    # -Inf share a non-finite mask but are distinct corrupted values.  Only the
+    # repeated NaN row is a duplicate.
+    Xnf = np.array([[np.nan, 1.0], [np.inf, 1.0], [-np.inf, 1.0], [np.nan, 1.0]])
+    mask = L.duplicate_mask(Xnf)
+    assert mask.tolist() == [False, False, False, True], mask
+    repnf = L.data_quality_report(Xnf, train_idx=[0], val_idx=[1], test_idx=[2, 3])
+    assert repnf['checks']['duplicate_rows_across_splits']['train__val'] == 0, repnf
 
     # A zero-variance training feature with a different holdout mean is an
     # undefined SMD, not a zero shift.
@@ -3258,6 +3276,12 @@ def t_crossover_scaling_refusals():
     assert f['status'] == 'ok' and f.get('slope') is not None and f.get('ci') is not None, f
     assert f['claim_level'] == 'descriptive', f
     assert f['volume_ratio'] <= 1.25, f
+    # A perfectly recovered power law has zero residual variance: the slope's
+    # t statistic is infinite, so p must be 0, not NaN.
+    perfect = [{'x': d, 'y': 2.0 * d ** 1.5, 'label': f'd{d}'} for d in (16, 32, 64, 128)]
+    lr = L.loglog_regression(perfect)
+    assert lr['status'] == 'ok' and abs(lr['slope'] - 1.5) < 1e-12, lr
+    assert math.isfinite(lr['p']) and lr['p'] < 1e-12, lr
 
 
 def t_init_core_fingerprint_and_pair_gate():
@@ -3417,6 +3441,22 @@ def t_selection_attribution_contract():
             json.dump({'cells': [bad]}, f)
         r3 = A.audit_selection()
         assert r3['status'] == 'fail' and r3['problems'], r3
+        # per_seed is part of the declared schema: without it the seed-level
+        # claim cannot be checked and must be refused structurally.
+        bad2 = dict(cell)
+        bad2.pop('per_seed')
+        with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+            json.dump({'cells': [bad2]}, f)
+        r4 = A.audit_selection()
+        assert r4['status'] == 'fail' and any('per_seed' in x for x in r4['problems']), r4
+        # Malformed seed rows must not inflate the n>=6 claim gate.
+        bad3 = dict(cell)
+        bad3['per_seed'] = {str(i): ({'mass_covered': 0.8, 'random_baseline': 0.03} if i < 2 else {})
+                            for i in range(6)}
+        with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+            json.dump({'cells': [bad3]}, f)
+        r5 = A.audit_selection()
+        assert r5['cells'][0]['claim_allowed'] is False and r5['cells'][0]['n_seeds_valid'] == 2, r5
     finally:
         A.REPO = old_repo
         shutil.rmtree(td, ignore_errors=True)
@@ -3430,6 +3470,31 @@ def t_audit_length_missing_truncated_flag():
             json.dump({'a::s0': {'by_len': {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095, 'eval_span': 4095}}}}, f)
         r = A.audit_length(p)
         assert r['status'] == 'fail' and any('truncated' in x for x in r['problems']), r
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def t_audit_length_missing_n_seq_flag():
+    # Same fail-closed rule as a missing truncation marker: without n_seq the
+    # audit cannot prove the arms scored the same document rows.
+    td = tempfile.mkdtemp(prefix='len_', dir=REPO)
+    try:
+        p = os.path.join(td, 'bylen.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095,
+                                                    'eval_span': 4095, 'truncated': False}}}}, f)
+        r = A.audit_length(p)
+        assert r['status'] == 'fail' and any('n_seq' in x for x in r['problems']), r
+        assert r['by_length']['4096']['same_n_seq_across_records'] is False, r
+        # One record with n_seq must not mask another record that omits it.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095,
+                                                    'eval_span': 4095, 'truncated': False,
+                                                    'n_seq': 16}}},
+                       'b::s0': {'by_len': {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095,
+                                                    'eval_span': 4095, 'truncated': False}}}}, f)
+        r2 = A.audit_length(p)
+        assert r2['status'] == 'fail' and r2['by_length']['4096']['same_n_seq_across_records'] is False, r2
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
@@ -3457,6 +3522,13 @@ def t_stats_accept_numpy_scalars():
         {'label': 'B', 'scale': 2, 'effects': np.array([2, 3, 4], dtype=np.int64), 'seeds': [0, 1, 2]},
     ])
     assert meta['status'] == 'ok' and all(p['n'] == 3 for p in meta['per_point']), meta
+    # The zero-GPU report builder has its own exact test copy; it must use the
+    # same scalar contract instead of silently dropping NumPy values.
+    for _d in (np.array([1, 2, 3, 4], dtype=np.int64),
+               np.array([1, 2, 3, 4], dtype=np.float32),
+               [np.int64(1), np.int64(2), np.int64(3), np.int64(4)]):
+        _r = BR.exact_signflip(_d)
+        assert _r is not None and _r['n'] == 4 and math.isfinite(_r['p_exact_signflip']), _r
 
 
 def t_apply_rope_preserves_width():
@@ -3678,6 +3750,7 @@ def main():
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
+    _check('L12 length audit fails closed on missing n_seq', t_audit_length_missing_n_seq_flag)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
