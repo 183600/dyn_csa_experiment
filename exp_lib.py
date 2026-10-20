@@ -14087,6 +14087,12 @@ def metric_policy_audit(summary=None, policy=None):
             _thr_src = r.get('decision_threshold_source')
             _f1ish = any(k in r for k in ('f1', 'f1_positive', 'f1_primary',
                                           'precision_macro', 'recall_macro'))
+            if (task == 'binary_classification'
+                    and any(k in r for k in ('f1_positive', 'f1_primary'))
+                    and r.get('positive_label') is None):
+                out['warnings'].append(
+                    f'{_label} reports a positive-class F1 without positive_label; '
+                    'the reported class is not identifiable')
             if task == 'binary_classification' and _f1ish and _thr_src is None:
                 out['warnings'].append(
                     f'{_label} reports threshold-dependent F1/precision/recall without '

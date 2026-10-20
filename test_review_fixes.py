@@ -4674,6 +4674,10 @@ def t_binary_threshold_and_calibration_contract():
     _bad_pc['per_class']['0']['precision'] = 0.1
     _bp = L.metric_policy_audit({'c': _bad_pc})
     assert _bp['status'] == 'warn' and any('per_class counts' in w for w in _bp['warnings']), _bp
+    _no_pos = dict(_rec)
+    _no_pos.pop('positive_label')
+    _np_ = L.metric_policy_audit({'c': _no_pos})
+    assert _np_['status'] == 'warn' and any('positive_label' in w for w in _np_['warnings']), _np_
 
 
 def t_boundary_macro_micro_f1_contract():
