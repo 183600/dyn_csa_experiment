@@ -978,6 +978,20 @@ def t_pair_reason_fingerprint_gate():
         assert 'eval_fp' in str(e), e
     else:
         raise AssertionError('aggregate must reject a group pooled across evaluation slices')
+    # The fixed evaluation SUBSET is part of the same identity: two records
+    # scored on different subsets have different target denominators even when
+    # train/validation/eval fingerprints agree.
+    subset_mix = {
+        'a::seed0': dict(base, variant='a', eval_subset_fp='subset-a'),
+        'a::seed1': dict(base, variant='a', seed=1, ppl=10.5,
+                         eval_subset_fp='subset-b'),
+    }
+    try:
+        L.aggregate(subset_mix)
+    except ValueError as e:
+        assert 'eval_subset_fp' in str(e), e
+    else:
+        raise AssertionError('aggregate must reject a group pooled across evaluation subsets')
     rows = [dict(base, by_len={8: {'ppl': 10.0}}),
             dict(base, variant='b', val_fp='val-b', by_len={8: {'ppl': 11.0}})]
     try:

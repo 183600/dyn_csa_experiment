@@ -19650,7 +19650,7 @@ def aggregate(summary):
         # `eval_fp` is part of the paired identity too: same train/val but a
         # different fixed evaluation slice makes the pooled PPL a mixture of
         # two target sets (pair_reason already refuses such pairs).
-        for _k in ('data_fp', 'val_fp', 'eval_fp'):
+        for _k in ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp'):
             _vals = sorted({str(r.get(_k)) for r in recs
                             if r.get(_k) is not None and str(r.get(_k)) != ''})
             if len(_vals) > 1:
