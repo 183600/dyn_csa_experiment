@@ -2237,10 +2237,20 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             if not isinstance(v, dict) or v.get('mass_covered') is None or v.get('random_baseline') is None:
                 _bad_seed.append(str(_sk))
                 continue
-            try:
-                _d.append(float(v.get('mass_covered')) - float(v.get('random_baseline')))
-            except (TypeError, ValueError, OverflowError):
+            _mv, _bv = v.get('mass_covered'), v.get('random_baseline')
+            if (any(isinstance(x, (bool, np.bool_)) for x in (_mv, _bv))
+                    or not all(isinstance(x, numbers.Real) for x in (_mv, _bv))):
                 _bad_seed.append(str(_sk))
+                continue
+            _mf, _bf = float(_mv), float(_bv)
+            # A present-but-NaN/out-of-range pair would be silently dropped by
+            # the exact test, leaving `n_seeds` larger than the sample the p
+            # value was computed on.  Treat it as a malformed row.
+            if (not (math.isfinite(_mf) and math.isfinite(_bf))
+                    or not (0.0 <= _mf <= 1.0 and 0.0 <= _bf <= 1.0)):
+                _bad_seed.append(str(_sk))
+                continue
+            _d.append(_mf - _bf)
         if _bad_seed:
             out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows have an invalid/duplicate seed key or lack mass_covered/random_baseline: {_bad_seed[:5]}')
         _n_valid = len(_d)

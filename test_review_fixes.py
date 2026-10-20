@@ -6589,6 +6589,17 @@ def t_selection_attribution_contract():
         r6 = A.audit_selection()
         assert r6['cells'][0]['n_seeds_valid'] == 1, r6
         assert any('per_seed' in x for x in r6['problems']), r6
+        # A present-but-NaN/out-of-range per-seed reading is malformed, not a
+        # silent drop that leaves the reported n larger than the tested sample.
+        nan_cell = dict(cell)
+        nan_cell['per_seed'] = {str(i): {'mass_covered': 0.8, 'random_baseline': 0.03}
+                                for i in range(6)}
+        nan_cell['per_seed']['2'] = {'mass_covered': float('nan'), 'random_baseline': 0.03}
+        with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+            json.dump({'cells': [nan_cell]}, f)
+        r7 = A.audit_selection()
+        assert r7['status'] == 'fail' and any('per_seed' in x for x in r7['problems']), r7
+        assert r7['cells'][0]['n_seeds_valid'] == 5, r7['cells'][0]
     finally:
         A.REPO = old_repo
         shutil.rmtree(td, ignore_errors=True)
