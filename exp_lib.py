@@ -8525,7 +8525,7 @@ def pair_reason(ra, rb):
     # different val slice would silently compare two different evaluation sets.
     # Both-present equality is required; a one-sided fingerprint is
     # unverifiable, exactly like the optimizer-descriptor gate above.
-    for _k in ('data_fp', 'val_fp', 'eval_fp'):
+    for _k in ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp'):
         _pa, _pb = ra.get(_k), rb.get(_k)
         _ha = _pa is not None and str(_pa) != ''
         _hb = _pb is not None and str(_pb) != ''

@@ -5678,6 +5678,21 @@ def t_methodology_gate_fail_closed_edges():
             else:
                 raise AssertionError(f'invalid control tolerance {_bad!r} was accepted')
 
+    # The final PPL is measured on `eval_subset`; two runs can share the full
+    # val fingerprint yet score different subset rows.  Both pairing twins
+    # must compare its content fingerprint.
+    _kn = L.training_knobs()
+    _a = {'run_cfg': 'r', 'steps': 1, 'tokens_seen': 1, 'train_knobs': _kn,
+          'data_fp': 'd', 'val_fp': 'v', 'eval_fp': 'e', 'eval_subset_fp': 's'}
+    _b = dict(_a)
+    assert L.pair_reason(_a, _b) is None and BR._pair_reason(_a, _b) is None
+    _b['eval_subset_fp'] = 's2'
+    assert 'eval_subset_fp' in (L.pair_reason(_a, _b) or ''), L.pair_reason(_a, _b)
+    assert 'eval_subset_fp' in (BR._pair_reason(_a, _b) or ''), BR._pair_reason(_a, _b)
+    _b.pop('eval_subset_fp')
+    assert 'unverifiable eval_subset_fp' in (L.pair_reason(_a, _b) or '')
+    assert 'unverifiable eval_subset_fp' in (BR._pair_reason(_a, _b) or '')
+
     # The report's displayed resolution floor is 2/2**n for EVERY n, not a
     # Monte-Carlo-like 1/200001 beyond n=20 (the sign-flip test is exact/MITM
     # up to n=40 and deterministic saddlepoint above).

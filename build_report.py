@@ -500,7 +500,7 @@ def _pair_reason(ra, rb):
     # Same corpus / evaluation slice, not just the same geometry and token
     # count.  Mirrors exp_lib.pair_reason (a mixed-cap cache rebuild must never
     # be averaged into one paired delta).
-    for _k in ('data_fp', 'val_fp', 'eval_fp'):
+    for _k in ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp'):
         _pa, _pb = ra.get(_k), rb.get(_k)
         _ha = _pa is not None and str(_pa) != ''
         _hb = _pb is not None and str(_pb) != ''
