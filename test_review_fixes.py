@@ -7482,6 +7482,29 @@ def t_signflip_zero_ties_lower_resolution_floor():
     assert v['n_nonzero'] == 2 and abs(v['p_floor'] - 0.5) < 1e-15, v
 
 
+def t_zero_aware_family_resolution_floor():
+    # Exact ties reduce the attainable family floor too: with n=8 but only 6
+    # non-zero paired deltas, 4 * 2/2**6 = 0.125 > alpha, not 4 * 2/2**8.
+    comps = {c: {'p_exact_signflip': 1.0, 'n': 8, 'n_nonzero': 6}
+             for c in 'ABCD'}
+    fam = L.attach_holm(comps, family='zero ties')
+    assert abs(fam['family_min_attainable_p_holm'] - 0.125) < 1e-15, fam
+    assert fam['family_resolution_limited'] is True, fam
+    # Without the tie count the theoretical floor is still reported.
+    none = {c: {'p_exact_signflip': 1.0, 'n': 8} for c in 'ABCD'}
+    assert abs(L.attach_holm(none)['family_min_attainable_p_holm']
+               - 0.03125) < 1e-15
+    st = {'n': 8, 'n_nonzero': 6, 'p': 0.01, 'p_holm': 0.02,
+          'mean': 1.0, 'std': 0.1}
+    claim = L.reportable_claim(st, family_size=4)
+    assert claim['allowed'] is False, claim
+    assert abs(claim['min_attainable_p_holm_family'] - 0.125) < 1e-15, claim
+    # A fabricated non-zero count larger than the panel cannot buy resolution.
+    bad = L.reportable_claim(dict(st, n_nonzero=9), family_size=1)
+    assert bad['allowed'] is False and any('n_nonzero=9 exceeds n=8' in r
+                                           for r in bad['reasons']), bad
+
+
 def t_scale_meta_refuses_visible_attrition():
     # A common effect (same mean at every scale) pools only on complete panels.
     def _common(planned=None, n_seeds=6):
@@ -7850,6 +7873,7 @@ def main():
     _check('L32 release archive packs tagged cache provenance', t_release_archive_packs_tagged_cache_provenance)
     _check('L33 scale corpus identity is independent of training budget', t_scale_corpus_fp_is_budget_independent)
     _check('L34 exact sign-flip floor accounts for zero ties', t_signflip_zero_ties_lower_resolution_floor)
+    _check('L34b zero-aware family resolution floor', t_zero_aware_family_resolution_floor)
     _check('L35 scale meta/trend refuses visible seed attrition', t_scale_meta_refuses_visible_attrition)
     _check('L36 M0 cross-scale pairs pass the control gate', t_m0_cross_scale_pairs_are_control_gated)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]

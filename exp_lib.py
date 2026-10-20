@@ -8763,6 +8763,17 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     alpha = _validated_alpha(alpha)
     pairs, omitted, tested = [], [], 0
     _tested_ns = []
+
+    def _resolution_n(v):
+        # Exact ties do not contribute resolution.  When the comparison
+        # records its non-zero pair count, the family ceiling is m*2/2**nn,
+        # not the theoretical all-nonzero m*2/2**n.
+        _n = _as_seed_int(v.get('n'))
+        _nn = _as_seed_int(v.get('n_nonzero'))
+        if _nn is not None and _n is not None and 0 <= _nn <= _n:
+            return _nn if _nn > 0 else 1
+        return _n
+
     for k, v in (comparisons or {}).items():
         if not isinstance(v, dict):
             pairs.append((str(k), 1.0))
@@ -8785,7 +8796,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         if math.isfinite(p) and 0.0 <= p <= 1.0:
             pairs.append((str(k), p))
             tested += 1
-            _tn = _as_seed_int(v.get('n'))
+            _tn = _resolution_n(v)
             if _tn is not None and _tn > 0:
                 _tested_ns.append(_tn)
         else:
@@ -8803,7 +8814,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     for v in (comparisons or {}).values():
         if not isinstance(v, dict):
             continue
-        _n = _as_seed_int(v.get('n'))
+        _n = _resolution_n(v)
         if _n is not None and _n > 0:
             _ns.append(_n)
     _m = int(len(comparisons or {}))
@@ -8897,12 +8908,22 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     # non-zero count (paired_effect_stats/exact_signflip_p do) must not be
     # re-scored with the theoretical all-nonzero floor 2/2**n.
     _nn = _as_seed_int(stats.get('n_nonzero'))
+    _resolution_n = n
     if _nn is not None and _nn >= 0:
         out['n_nonzero'] = _nn
-        out['p_floor'] = (1.0 if _nn == 0 else signflip_p_floor(_nn))
+        if _nn > n:
+            # A non-zero count larger than the paired panel cannot describe
+            # this test; it must not be used to claim a finer resolution.
+            out['reasons'].append(
+                f'n_nonzero={_nn} exceeds n={n}; the effective resolution is unverifiable')
+        else:
+            _resolution_n = _nn
+        out['p_floor'] = (1.0 if _resolution_n == 0
+                          else signflip_p_floor(_resolution_n))
     else:
         out['n_nonzero'] = None
         out['p_floor'] = signflip_p_floor(n) if n > 0 else None
+    out['n_effective_resolution'] = _resolution_n
     # A p-value is a probability.  p=-0.1 would satisfy every strict "< alpha"
     # comparison and could support a claim that no valid test produced.
     if out['p_raw'] is not None and not (0.0 <= out['p_raw'] <= 1.0):
@@ -8965,7 +8986,7 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
                 f'family_size={family_size!r} is not a positive integer; '
                 'the family resolution ceiling is unverifiable')
         else:
-            _fl = holm_min_attainable_p(n, _fam_n, alpha)
+            _fl = holm_min_attainable_p(_resolution_n, _fam_n, alpha)
             out['min_attainable_p_holm_family'] = _fl
             if _fl is not None and math.isfinite(_fl) and _fl > alpha:
                 out['reasons'].append(f'family of m={_fam_n} at n={n} has minimum attainable Holm p {_fl:.4g} > alpha')
@@ -14700,7 +14721,13 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
     if not noise_free:
         return 'noise_level'
     for e in noise_free:
-        fl = holm_min_attainable_p(e.get('n') or 0, m_family, alpha)
+        # Exact ties reduce the attainable p resolution; use the non-zero
+        # pair count when the stats record carries it.
+        _en = _as_seed_int(e.get('n'))
+        _enn = _as_seed_int(e.get('n_nonzero'))
+        if _enn is not None and _en is not None and 0 <= _enn <= _en:
+            _en = _enn if _enn > 0 else 1
+        fl = holm_min_attainable_p(_en or 0, m_family, alpha)
         if math.isfinite(fl) and fl > alpha:
             return 'resolution_limited'
     return 'noise_level'
