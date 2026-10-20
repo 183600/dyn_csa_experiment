@@ -4147,6 +4147,19 @@ def t_scale_ladder_budget_and_transfer_audit():
     # S1/S2 budget ratio rather than silently calling it matched.
     pol = L.SCALE_TRANSFER_POLICY
     assert pol.get('lr_transfer') and pol.get('tokens_per_param_tolerance') is not None, pol
+    # A tokenizer width is an exact identity.  int() coercion would truncate a
+    # fractional/boolean value into a DIFFERENT vocab that looks shared.
+    va = tier('S1', 1000, 1000); va['cfg']['vocab'] = 32768
+    vb = tier('S2', 2000, 2000); vb['cfg']['vocab'] = 32768.5
+    out5 = L.scale_ladder_audit([va, vb])
+    assert out5['status'] == 'fail', out5
+    assert any('vocab' in p for p in out5['problems']), out5
+    assert out5['corpus_binding'].get('vocab') != 'shared', out5
+    vc = tier('S2', 2000, 2000); vc['cfg']['vocab'] = True
+    out6 = L.scale_ladder_audit([va, vc])
+    assert out6['status'] == 'fail', out6
+    out7 = L.scale_ladder_audit([va, tier('S2', 2000, 2000) | {'vocab': 32768}])
+    assert out7['corpus_binding'].get('vocab') == 'shared', out7
 
 
 def t_init_core_fingerprint_and_pair_gate():

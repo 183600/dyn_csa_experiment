@@ -10451,10 +10451,15 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             if _v is None:
                 continue
             if _fpk == 'vocab':
+                # Vocab width is an exact tokenizer identity: int(1.5) or
+                # int(True) would silently attest a different tokenisation.
                 try:
-                    _v = int(_v)
+                    _v = _as_int(_v, f'{name}.vocab')
                 except (TypeError, ValueError, OverflowError):
                     problems.append(f'{name}: vocab={_v!r} is not an integer')
+                    continue
+                if _v <= 0:
+                    problems.append(f'{name}: vocab={_v!r} must be positive')
                     continue
             row[_fpk] = _v
         try:
