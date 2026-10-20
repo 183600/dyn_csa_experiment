@@ -151,8 +151,19 @@ def _env_snapshot():
 def _collect(dirs, include_ckpt=False):
     """Files that would enter the archive, with sizes and hashes (lazily)."""
     files = []
+    _repo_real = os.path.realpath(REPO)
     for d in dirs:
-        base = os.path.join(REPO, d)
+        base = os.path.realpath(os.path.join(REPO, d))
+        try:
+            _inside = os.path.commonpath([_repo_real, base]) == _repo_real
+        except ValueError:
+            _inside = False
+        if not _inside:
+            # `--dirs /tmp/x` or `../..` would otherwise pack host files under
+            # `../../...` arcnames, producing an archive that escapes the
+            # repository on extraction.
+            raise ValueError(f'archive directory {d!r} resolves outside the repository '
+                             f'({base!r}); only paths under {REPO!r} may be packed')
         if not os.path.isdir(base):
             print(f'[archive] WARNING: {d} does not exist locally — skipped (run on the experiment machine)')
             continue
@@ -189,6 +200,14 @@ def _collect(dirs, include_ckpt=False):
         key = os.path.abspath(p)
         if key in seen:
             continue
+        _p_real = os.path.realpath(p)
+        try:
+            _inside = os.path.commonpath([_repo_real, _p_real]) == _repo_real
+        except ValueError:
+            _inside = False
+        if not _inside:
+            raise ValueError(f'archive file {p!r} resolves outside the repository '
+                             f'({_p_real!r}); refusing to pack it')
         seen.add(key)
         unique.append(p)
     return unique
@@ -291,10 +310,22 @@ def cmd_verify(tar_path):
         if man_name is None:
             print('[archive] REFUSE: no MANIFEST inside the archive')
             return 1
+        _man_member = tf.getmember(man_name)
+        if not _man_member.isfile():
+            print('[archive] REFUSE: the MANIFEST member is not a regular file')
+            return 1
         man = json.load(tf.extractfile(man_name))
         bad = []
         for member in tf.getmembers():
-            if member.name == man_name or not member.isfile():
+            if member.name == man_name:
+                continue
+            if not member.isfile():
+                # A symlink/hardlink/device member was previously skipped and
+                # then counted as "present" because its name was in
+                # tf.getnames(), so a manifest entry could be replaced by a
+                # link that was never hashed.
+                bad.append(f'{member.name}: member is not a regular file '
+                           f'(type {member.type!r})')
                 continue
             f = tf.extractfile(member)
             h = hashlib.sha256()

@@ -8019,6 +8019,62 @@ def t_split_discipline_recomputes_fingerprints_and_doc_sidecars():
                    for w in out['warnings']), out
 
 
+
+def t_archive_refuses_links_and_repo_escape():
+    import archive_release as AR
+    import io
+    import tarfile
+    with tempfile.TemporaryDirectory() as d:
+        outside = tempfile.mkdtemp(prefix='archive_outside_')
+        try:
+            with open(os.path.join(outside, 'secret.txt'), 'w', encoding='utf-8') as f:
+                f.write('secret')
+            try:
+                AR._collect([outside])
+            except ValueError as e:
+                assert 'outside the repository' in str(e), e
+            else:
+                raise AssertionError('an absolute directory outside the repo was packed')
+            try:
+                AR._collect(['../' + os.path.basename(outside)])
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('a parent-relative directory was packed')
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+        # A symlink member with the expected name must not satisfy the
+        # manifest; it was never hashed as a regular file.
+        path = os.path.join(d, 'release_x.tar.gz')
+        payload = b'hello'
+        man = {'tag': 'x', 'files': {'data.txt': {
+            'sha256': __import__('hashlib').sha256(payload).hexdigest(),
+            'bytes': len(payload)}}}
+        man_bytes = json.dumps(man).encode('utf-8')
+        with tarfile.open(path, 'w:gz') as tf:
+            ti = tarfile.TarInfo('data.txt')
+            ti.size = len(payload)
+            tf.addfile(ti, io.BytesIO(payload))
+            link = tarfile.TarInfo('link.txt')
+            link.type = tarfile.SYMTYPE
+            link.linkname = 'data.txt'
+            tf.addfile(link)
+            mt = tarfile.TarInfo('release_x.MANIFEST.sha256')
+            mt.size = len(man_bytes)
+            tf.addfile(mt, io.BytesIO(man_bytes))
+        assert AR.cmd_verify(path) == 1
+        # The same archive without the unhashed link still verifies.
+        path2 = os.path.join(d, 'release_y.tar.gz')
+        with tarfile.open(path2, 'w:gz') as tf:
+            ti = tarfile.TarInfo('data.txt')
+            ti.size = len(payload)
+            tf.addfile(ti, io.BytesIO(payload))
+            mt = tarfile.TarInfo('release_y.MANIFEST.sha256')
+            mt.size = len(man_bytes)
+            tf.addfile(mt, io.BytesIO(man_bytes))
+        assert AR.cmd_verify(path2) == 0
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8274,6 +8330,7 @@ def main():
     _check('L37d ladder missing seed plan is not common', t_scale_ladder_missing_seed_plan_is_not_common)
     _check('L38 small-n split remainder + string order keys', t_small_n_split_remainder_and_string_order)
     _check('L39 split audit recomputes fingerprints and doc sidecars', t_split_discipline_recomputes_fingerprints_and_doc_sidecars)
+    _check('L40 archive refuses links and repo escape', t_archive_refuses_links_and_repo_escape)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
