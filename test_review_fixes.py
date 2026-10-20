@@ -5530,6 +5530,11 @@ def t_build_report_exact_seed_and_params():
                                                'steps': 1, 'tokens_seen': 1}}
         got = BR.per_seed_records('/nonexistent-panel')
         assert list(got.get('x', {})) == [('', 2)], got
+        BR._LOADED.clear()
+        BR.summary = lambda _outdir: {'d::x': {'variant': 'x', 'seed': '1.0',
+                                               'ppl': 2.0, 'run_cfg': 'r',
+                                               'steps': 1, 'tokens_seen': 1}}
+        assert BR.per_seed_records('/nonexistent-panel') == {}
     finally:
         BR.summary = _orig_summary
         BR._LOADED.clear()

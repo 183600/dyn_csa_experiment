@@ -440,8 +440,15 @@ def per_seed_records(outdir):
                 print(f"[report] record {_k!r} in {outdir} carries a boolean seed — skipped for pairing")
                 continue
             # Exact integer parsing: int(Decimal('1.5')) would silently
-            # truncate to a different seed and pair the wrong run.
-            _sd = _int_or(_sv, None)
+            # truncate to a different seed and pair the wrong run.  Numeric
+            # strings keep the legacy integer spelling ("3", not "3.0").
+            if isinstance(_sv, (str, bytes)):
+                try:
+                    _sd = int(_sv)
+                except (TypeError, ValueError, OverflowError):
+                    _sd = None
+            else:
+                _sd = _int_or(_sv, None)
             if _sd is None:
                 print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
                 continue
