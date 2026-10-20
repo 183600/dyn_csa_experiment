@@ -12125,9 +12125,20 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                             'may share validation documents')
         elif _split_info.get('applied') is True:
             _row_split_applied = True
-            if _split_info.get('disjoint') is not True or _split_info.get('covers_all_rows') is not True:
-                problems.append('selection_row_split claims applied=True but does not attest disjoint, '
-                                'covering selection/evaluation folds')
+            # With more than two folds only the two selected blocks are used,
+            # so `covers_all_rows=False` is the correct metadata (the unused
+            # middle/later folds are neither selection nor evaluation rows).
+            # Requiring full coverage here would reject a valid n_folds>2
+            # chronological split.  Disjointness is required for every layout.
+            _meta_folds = _as_seed_int(_split_info.get('n_folds'))
+            _needs_full_coverage = _meta_folds is None or _meta_folds <= 2
+            if (_split_info.get('disjoint') is not True
+                    or (_needs_full_coverage
+                        and _split_info.get('covers_all_rows') is not True)):
+                problems.append('selection_row_split claims applied=True but does not attest '
+                                'disjoint selection/evaluation folds'
+                                + (' covering every validation row'
+                                   if _needs_full_coverage else ''))
             if not _split_info.get('selection_row_fp') or not _split_info.get('evaluation_row_fp'):
                 problems.append('selection_row_split lacks the selection/evaluation row fingerprints')
             elif _split_info.get('selection_row_fp') == _split_info.get('evaluation_row_fp'):
@@ -12164,6 +12175,46 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 if not _ok_range:
                     problems.append('selection_row_split row ranges are not ordered '
                                     'selection-before-evaluation')
+            # Reproduce the declared folds from (n_rows, seed, n_folds, fold
+            # indices).  The checks above only show that the metadata is
+            # internally consistent; they cannot detect an edited range or a
+            # fingerprint that describes a different split.  When the full
+            # fold description is present, recompute it deterministically and
+            # compare every recorded field.
+            _fold_keys = ('n_rows', 'seed', 'n_folds', 'selection_fold',
+                          'evaluation_fold')
+            _fold_present = [k for k in _fold_keys if _split_info.get(k) is not None]
+            if len(_fold_present) == len(_fold_keys):
+                try:
+                    _re_sel, _re_ev, _re_meta = validation_row_split(
+                        _split_info.get('n_rows'),
+                        seed=_split_info.get('seed'),
+                        n_folds=_split_info.get('n_folds'),
+                        selection_fold=_split_info.get('selection_fold'),
+                        evaluation_fold=_split_info.get('evaluation_fold'))
+                except (TypeError, ValueError, OverflowError) as _rfe:
+                    problems.append('selection_row_split metadata cannot be reproduced: '
+                                    f'{_rfe}')
+                else:
+                    _re_mismatch = []
+                    for _k in ('n_selection_rows', 'n_evaluation_rows',
+                               'selection_row_range', 'evaluation_row_range',
+                               'selection_row_fp', 'evaluation_row_fp',
+                               'covers_all_rows', 'disjoint', 'chronological',
+                               'selection_precedes_evaluation'):
+                        if _k in _split_info and _split_info.get(_k) != _re_meta.get(_k):
+                            _re_mismatch.append(_k)
+                    if _re_mismatch:
+                        problems.append(
+                            'selection_row_split metadata does not match the '
+                            'deterministic split implied by its declared '
+                            f'n_rows/seed/folds (mismatch: {sorted(_re_mismatch)}) '
+                            '— the recorded fold description is not reproducible')
+            elif _fold_present:
+                warnings.append('selection_row_split omits part of the fold '
+                                'description (n_rows/seed/n_folds/selection_fold/'
+                                'evaluation_fold); the recorded ranges cannot be '
+                                'independently reproduced')
             _expected_sel_fp = _split_info.get('selection_row_fp')
             _expected_eval_fp = _split_info.get('evaluation_row_fp')
             for _arm, _entry in arms.items():

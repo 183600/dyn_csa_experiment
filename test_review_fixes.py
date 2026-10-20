@@ -2796,6 +2796,33 @@ def t_nested_tuning_artifact_audit():
     rb3 = L.baseline_tuning_audit(bad3, protocol=protocol)
     assert rb3['tuning_verified'] is False and any('selected on different rows' in p for p in rb3['problems']), rb3
 
+    # More than two folds intentionally leaves unused blocks, so
+    # `covers_all_rows=False` is correct and must not fail the nested gate.
+    # The recorded fold description is also re-derived from
+    # (n_rows, seed, n_folds, selection_fold, evaluation_fold).
+    mf_protocol = dict(protocol, selection_row_split={
+        'enabled': True, 'seed': 123, 'n_folds': 4,
+        'selection_fold': 1, 'evaluation_fold': 3})
+    _sel, _ev, _mf_meta = L.validation_row_split(
+        17, seed=123, n_folds=4, selection_fold=1, evaluation_fold=3)
+    mf = json.loads(json.dumps(art))
+    mf['selection_row_split'] = dict(_mf_meta, applied=True)
+    for _t in mf['arms']['a']['trials']:
+        _t['selection_row_fp'] = _mf_meta['selection_row_fp']
+        _t['evaluation_row_fp'] = _mf_meta['evaluation_row_fp']
+    for _r in mf['final_records'].values():
+        _r['holdout_row_fp'] = _mf_meta['evaluation_row_fp']
+    rmf = L.baseline_tuning_audit(mf, protocol=mf_protocol)
+    assert rmf['tuning_verified'] is True, rmf
+    assert rmf['selection_row_split_applied'] is True, rmf
+    # A self-consistent but edited range/fingerprint must be refused because
+    # it cannot be reproduced from the declared fold parameters.
+    mf_bad = json.loads(json.dumps(mf))
+    mf_bad['selection_row_split']['evaluation_row_range'] = [0, 3]
+    rmb = L.baseline_tuning_audit(mf_bad, protocol=mf_protocol)
+    assert rmb['tuning_verified'] is False, rmb
+    assert any('not reproducible' in p for p in rmb['problems']), rmb
+
 
 def t_nested_final_uses_holdout_rows():
     base = dict(L.RUN, d=8, n_layers=1, n_heads=1, d_head=8, seq_len=8,
