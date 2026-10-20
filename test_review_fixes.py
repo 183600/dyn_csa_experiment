@@ -5635,6 +5635,15 @@ def t_methodology_gate_fail_closed_edges():
     bad[('A', 'B', 'C')] = None
     r = L.ablation_completeness_audit(arms_by_combo=bad)
     assert r['complete'] is False and r['structural_errors'], r
+    # Leave-one-out mode must also reject a self-contrast, malformed arm ids
+    # and a non-mapping design instead of treating them as a complete ablation.
+    for _design in ({'A': [('full', 'full', '')]},
+                    {'A': [('full', [])]},
+                    {'A': None}):
+        r = L.ablation_completeness_audit(_design, ['full'])
+        assert r['complete'] is False and r['structural_errors'], (_design, r)
+    r = L.ablation_completeness_audit([], ['full'])
+    assert r['complete'] is False and r['structural_errors'], r
 
     # Wrapper gate parameters are validated even with no panels to audit.
     for _bad in (True, 0, 1.5, float('nan')):
