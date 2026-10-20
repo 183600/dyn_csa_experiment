@@ -1752,10 +1752,18 @@ def sec_training_health():
              '> Diagnostic only. `best_val_ppl` / `best_step` are reported alongside the final number; they do not replace the pre-registered final-step endpoint.', '',
              '| panel | cell | status | best PPL @ step | final PPL | final−best | steps since best | tail train slope | tail val slope | gap slope | gap | curve rows | last curve 95% CI | action |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|']
     for name, key, rec, h in rows[:200]:
-        _hist = rec.get('health_history') or []
-        _last = _hist[-1] if _hist else {}
+        _hist_raw = rec.get('health_history')
+        _hist = _hist_raw if isinstance(_hist_raw, list) else []
+        _last = (_hist[-1] if _hist and isinstance(_hist[-1], dict) else {})
         _ci = ('[%s, %s]' % (fm(_last.get('val_ci95_low')), fm(_last.get('val_ci95_high')))) if _last else 'n/a'
-        _act = '; '.join(str(a) for a in (h.get('actions') or [])) or '—'
+        _acts_raw = h.get('actions')
+        if isinstance(_acts_raw, str):
+            _acts = [_acts_raw]
+        elif isinstance(_acts_raw, (list, tuple)):
+            _acts = list(_acts_raw)
+        else:
+            _acts = []
+        _act = '; '.join(str(a) for a in _acts) or '—'
         lines.append('| %s | `%s` | %s | %s @ %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
             name, key, h.get('status'), fm(h.get('best_val_ppl')), h.get('best_step'),
             fm(rec.get('ppl')), fm(h.get('final_minus_best')), fm(h.get('steps_since_best'), 0),
