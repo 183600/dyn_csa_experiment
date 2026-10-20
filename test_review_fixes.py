@@ -6185,6 +6185,16 @@ def t_meta_prediction_interval_df():
     # Two usable scales cannot estimate both variance components.
     m2 = L.meta_analyze_effects(pts[:2])
     assert m2['status'] == 'ok' and m2['prediction_interval'] is None, m2
+    # A scale point below the pre-registered seed floor is still reported, but
+    # it must block the pooled "common effect" claim: pooling would silently
+    # promote an underpowered scale to equal evidence.
+    under = [{'label': 'U%d' % i, 'scale': i + 1,
+              'effects': [0.1 + 0.01 * j for j in range(2)], 'seeds': [0, 1]}
+             for i in range(3)]
+    mu = L.meta_analyze_effects(under, min_seeds=3)
+    assert mu['status'] == 'ok' and mu['poolable'] is False, mu
+    assert mu['underpowered_points'] == ['U0', 'U1', 'U2'], mu
+    assert 'underpowered' in mu['note'], mu
 
 
 def t_tost_conf_controls_decision():

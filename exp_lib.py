@@ -10230,6 +10230,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         return out
     if not usable:
         out.update({'status': 'insufficient_within_scale_replication', 'poolable': False,
+                    'underpowered_points': [r['label'] for r in per if r.get('underpowered')],
                     'note': 'every scale point has n<2 or zero within-scale variance; no random-effects weights can be formed'})
         return out
     w = np.asarray([1.0 / (r['se'] ** 2) for r in usable], dtype=float)
@@ -10257,13 +10258,20 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         if math.isfinite(_tc_pi):
             _half = _tc_pi * math.sqrt(tau2 + se_re ** 2)
             _pi = [mu_re - _half, mu_re + _half]
+    _underpowered_points = [r['label'] for r in usable if r.get('underpowered')]
     out.update({'fixed_effect': {'mean': mu_fe, 'se': float(math.sqrt(1.0 / sw)), 'ci': [mu_fe - _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw), mu_fe + _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw)]},
                 'random_effects': {'mean': mu_re, 'se': se_re, 'ci': [mu_re - tc * se_re, mu_re + tc * se_re]},
                 'heterogeneity': {'Q': q, 'df': int(df), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
                                   'method': 'Cochran Q + DerSimonian-Laird tau^2'},
                 'prediction_interval': _pi,
-                'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0 and (not math.isfinite(p_q) or p_q >= alpha)),
-                'note': 'poolable requires >=3 scales, I2<=50% and a non-significant Q; otherwise report per-scale effects only'})
+                'underpowered_points': _underpowered_points,
+                'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0
+                                 and (not math.isfinite(p_q) or p_q >= alpha)
+                                 and not _underpowered_points),
+                'note': ('poolable requires >=3 scales, every included scale at n>=min_seeds, '
+                         'I2<=50% and a non-significant Q; otherwise report per-scale effects only'
+                         + (('; underpowered scale point(s): ' + ', '.join(map(str, _underpowered_points)))
+                            if _underpowered_points else ''))})
     out['status'] = 'ok'
     return out
 
