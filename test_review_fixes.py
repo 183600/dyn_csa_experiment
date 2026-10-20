@@ -5625,6 +5625,17 @@ def t_audit_budget_integer_runs():
                 pass
             else:
                 raise AssertionError(f'attn_overhead={_ov!r} must be refused')
+        # A malformed panel record must not be converted into a fake FLOPs
+        # estimate (bool params, NaN tokens, string steps).
+        panel = tempfile.mkdtemp(prefix='budget_', dir=REPO)
+        try:
+            with open(os.path.join(panel, 'summary.json'), 'w', encoding='utf-8') as f:
+                json.dump({'x::s0': {'variant': 'csa_fixed', 'params': True,
+                                     'steps': 'lots', 'tokens_seen': float('nan')}}, f)
+            bp = A.audit_budget(state_files=(), panels=((panel, 'csa_fixed', None),))
+            assert bp['panels'][panel] == 'no param records', bp
+        finally:
+            shutil.rmtree(panel, ignore_errors=True)
 
 
 def t_audit_failures_ignores_unmeasured_ppl():

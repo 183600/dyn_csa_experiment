@@ -1866,15 +1866,44 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         if summ is None:
             out['panels'][d] = 'not present locally'
             continue
-        recs = [r for r in summ.values() if isinstance(r, dict) and r.get('variant') == v and isinstance(r.get('params'), (int, float))]
+        def _positive_int(value):
+            if value is None or isinstance(value, (bool, np.bool_)):
+                return None
+            if isinstance(value, numbers.Integral):
+                return int(value) if int(value) > 0 else None
+            if isinstance(value, numbers.Real):
+                f = float(value)
+                return int(f) if math.isfinite(f) and f.is_integer() and f > 0 else None
+            return None
+
+        def _positive_real(value):
+            if value is None or isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+                return None
+            f = float(value)
+            return f if math.isfinite(f) and f > 0.0 else None
+
+        recs = []
+        for r in summ.values():
+            if not isinstance(r, dict) or r.get('variant') != v:
+                continue
+            _p = _positive_real(r.get('params'))
+            if _p is not None:
+                recs.append(r)
         if not recs:
             out['panels'][d] = 'no param records'
             continue
         r0 = recs[0]
-        _steps = steps or r0.get('steps')
-        tok = r0.get('tokens_seen') or (_steps * r0.get('batch_size', 12) * r0.get('seq_len', 512) if _steps else None)
-        est = train_flops_estimate(r0['params'], tok) if tok else None
-        out['panels'][d] = {'params': r0.get('params'), 'steps': _steps, 'tokens': tok, 'estimate': est}
+        _steps = _positive_int(steps) if steps is not None else _positive_int(r0.get('steps'))
+        tok = _positive_int(r0.get('tokens_seen'))
+        if tok is None and _steps is not None:
+            _batch = _positive_int(r0.get('batch_size', 12))
+            _seq = _positive_int(r0.get('seq_len', 512))
+            if _batch is not None and _seq is not None:
+                tok = _steps * _batch * _seq
+        est = (train_flops_estimate(_positive_real(r0.get('params')), tok)
+               if tok is not None else None)
+        out['panels'][d] = {'params': r0.get('params'), 'steps': _steps,
+                            'tokens': tok, 'estimate': est}
     for sf in state_files:
         st = _load(sf)
         if st is not None:
