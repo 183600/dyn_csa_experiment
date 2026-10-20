@@ -2652,6 +2652,14 @@ def t_panel_blocks_on_loader_contract_failure():
         dc = json.load(open(os.path.join(d, 'data_contract.json'), encoding='utf-8'))
         assert dc['passed'] is False and dc['checks']['labels_are_next_token_shift'] is False, dc
         assert not os.path.exists(os.path.join(d, 'summary.json')), 'no training cell may start after a failed loader contract'
+        mf = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
+        entry = next(iter(mf['panels'].values()))
+        assert entry['status'] == 'failed', entry.get('status')
+        assert entry['completion']['status'] == 'failed', entry.get('completion')
+        assert entry['planned_cells'] == ['full::seed0'], entry.get('planned_cells')
+        lines = [json.loads(x) for x in open(os.path.join(d, 'experiments.jsonl'), encoding='utf-8').read().strip().splitlines()]
+        fin = next(x for x in lines if x.get('kind') == 'panel_finish')
+        assert fin['status'] == 'failed' and fin['stage'] == 'batch_iterator_contract', fin
     finally:
         L.load_run_corpus = _saved_load
         L.batch_iter = _saved_iter

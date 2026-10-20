@@ -18745,8 +18745,11 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     _integrity['missing_cells'] = _missing_cells[:20]
     _integrity['complete'] = bool(not _incomplete_cells and not _missing_cells
                                   and not _seed_mismatch)
-    _completion_status = ('running' if (status or 'complete') == 'running'
-                          else ('complete' if _integrity['complete'] else 'incomplete'))
+    _declared_status = status or 'complete'
+    if _declared_status in ('running', 'failed', 'error'):
+        _completion_status = _declared_status
+    else:
+        _completion_status = 'complete' if _integrity['complete'] else 'incomplete'
     _completion = {
         'status': _completion_status,
         'complete': bool(_integrity['complete']),
@@ -24445,6 +24448,48 @@ def _is_confirmatory_cfg(cfg):
         return False
     return bool(_d >= 512 and _nseeds >= 2)
 
+def _record_failed_panel(outdir, cfg, run_cfg, prov, *, stage, error, planned_cells=None):
+    """Persist a failed pre-flight as a first-class panel record.
+
+    Evidence files (`overfit_sanity.json`, `seed_contract.json`, ...) and the
+    JSONL ledger are already written before a hard stop, but without a
+    manifest a failed attempt had no single file carrying the code version,
+    config, seed plan and failure stage.  Create that manifest entry only when
+    this run_cfg has none yet: a later failed pre-flight must never erase a
+    previously completed panel's cells.
+    """
+    try:
+        mpath = os.path.join(outdir, 'run_manifest.json')
+        if os.path.exists(mpath):
+            try:
+                with open(mpath, encoding='utf-8') as _mf:
+                    _existing = json.load(_mf)
+                if isinstance(_existing, dict) and run_cfg in (_existing.get('panels') or {}):
+                    log_experiment_event(outdir, {
+                        'kind': 'panel_finish', 'tracking_schema': 2,
+                        'status': 'failed', 'stage': str(stage), 'run_cfg': run_cfg,
+                        'code': code_stamp(), 'error': f'{error}',
+                        'planned_cells': list(planned_cells or []),
+                        'note': 'existing run_manifest entry preserved',
+                    })
+                    return mpath
+            except Exception:
+                pass
+        write_run_manifest(outdir, cfg, run_cfg, prov, {}, status='failed',
+                           planned_cells=planned_cells,
+                           started_at=time.strftime('%Y-%m-%dT%H:%M:%S'))
+        log_experiment_event(outdir, {
+            'kind': 'panel_finish', 'tracking_schema': 2,
+            'status': 'failed', 'stage': str(stage), 'run_cfg': run_cfg,
+            'code': code_stamp(), 'error': f'{error}',
+            'planned_cells': list(planned_cells or []),
+        })
+        return mpath
+    except Exception as _mfe:
+        print(f'[track] WARNING: could not persist the failed-panel manifest ({type(_mfe).__name__}: {_mfe})')
+        return None
+
+
 def run(cfg=None, seeds=None, guard=None, label='', par=None):
     cfg = dict(RUN) if cfg is None else dict(cfg)
     if seeds is not None:
@@ -24463,6 +24508,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     _variants = normalize_variant_list(cfg.get('variants'))
     cfg['seeds'] = list(_seeds)
     cfg['variants'] = list(_variants)
+    _planned_keys = [f'{v}::seed{seed}' for seed in _seeds for v in _variants]
     _first_seed, _last_seed = _seeds[0], _seeds[-1]
     _arch = {'d': int(d), 'n_layers': int(n_layers), 'n_heads': int(n_heads), 'd_head': int(d_head)}
     # Resolve the numerical implementation ONCE for this panel and persist the
@@ -24518,6 +24564,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         }
         atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), _doc0)
         log_experiment_event(outdir, {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'synthetic_overfit', 'run_cfg': _doc0['run_cfg'], 'code': code_stamp(), 'provenance': _prov0, 'error': f'{_fe}', 'sanity': {'passed': False, 'n_reports': len(_reports0)}})
+        _record_failed_panel(outdir, cfg, _doc0['run_cfg'], _prov0, stage='synthetic_overfit', error=_fe, planned_cells=_planned_keys)
         raise
     _attb_bump_epoch()
     t_data = time.time()
@@ -24586,6 +24633,8 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         'seed_contract': {k: _seed_contract.get(k) for k in ('passed', 'seed', 'checks', 'errors')},
     })
     if not _seed_contract.get('passed'):
+        _record_failed_panel(outdir, cfg, fp, prov, stage='rng_seed_contract',
+                             error=_seed_contract.get('diagnosis'), planned_cells=_planned_keys)
         raise RuntimeError(
             'RNG seed contract check FAILED '
             f"({_seed_contract.get('diagnosis')}) — do NOT start training; "
@@ -24606,6 +24655,8 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
                           ('passed', 'diagnosis', 'seq_len', 'batch_size', 'seed', 'n_batches')},
     })
     if not _data_contract.get('passed'):
+        _record_failed_panel(outdir, cfg, fp, prov, stage='batch_iterator_contract',
+                             error=_data_contract.get('diagnosis'), planned_cells=_planned_keys)
         raise RuntimeError(
             'batch iterator contract check FAILED '
             f"({_data_contract.get('diagnosis')}) — do NOT start a full run; "
@@ -24633,6 +24684,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         }
         atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), _doc)
         log_experiment_event(outdir, {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'data_overfit', 'run_cfg': fp, 'code': code_stamp(), 'provenance': prov, 'error': f'{_fe}', 'sanity': {'passed': False, 'n_reports': len(_reports)}})
+        _record_failed_panel(outdir, cfg, fp, prov, stage='data_overfit', error=_fe, planned_cells=_planned_keys)
         raise
     if not _data_rep:
         # The guard is process-cached (correctly, so repeated phases do not
@@ -24686,6 +24738,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         }
         atomic_write_json(os.path.join(outdir, 'reproducibility.json'), _doc)
         log_experiment_event(outdir, {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'reproducibility', 'run_cfg': fp, 'code': code_stamp(), 'provenance': prov, 'error': f'{_fe}', 'reproducibility': {'passed': False, 'n_reports': len(_reports)}})
+        _record_failed_panel(outdir, cfg, fp, prov, stage='reproducibility', error=_fe, planned_cells=_planned_keys)
         raise
     if not _repro:
         _bases = set()
@@ -24707,7 +24760,6 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         atomic_write_json(os.path.join(outdir, 'reproducibility.json'), _repro_doc)
     cells, stale_dropped = _plan_run(cfg, summary_path, fp)
     _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
-    _planned_keys = [f'{v}::seed{seed}' for seed in cfg.get('seeds') or [] for v in cfg.get('variants') or []]
     # Crash-safe tracking: publish the panel's identity (code/data versions,
     # hyperparameters, planned cells) BEFORE the first cell can be
     # killed.  The final write below flips the status to complete and lists
