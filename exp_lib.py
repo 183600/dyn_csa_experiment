@@ -10147,11 +10147,28 @@ def student_t_two_sided_p(t, df):
 
 
 def _t_critical(conf, df):
-    """双侧置信区间的 t 临界值；用二分求解，避免依赖 scipy。"""
+    """双侧置信区间的 t 临界值；用二分求解，避免依赖 scipy。
+
+    The upper bracket grows until it actually contains the tail target.  A
+    fixed 1000 cap silently returned 1000 for perfectly valid requests with
+    high confidence or small/fractional df (e.g. df=0.5, conf=0.99), which
+    made the reported CI too narrow and could flip a TOST equivalence or a
+    coverage decision.
+    """
     if not (0.0 < conf < 1.0) or not (df > 0.0):
         return float('nan')
     target = (1.0 - conf) / 2.0
-    lo, hi = 0.0, 1000.0
+    lo, hi = 0.0, 1.0
+    for _ in range(1100):
+        if _student_t_sf(hi, df) <= target:
+            break
+        lo = hi
+        hi *= 2.0
+        if not math.isfinite(hi):
+            return float('inf')
+    else:
+        # The tail never reached the target within a representable bracket.
+        return float('inf')
     for _ in range(200):
         mid = 0.5 * (lo + hi)
         if _student_t_sf(mid, df) > target:

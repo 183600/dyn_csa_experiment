@@ -171,6 +171,13 @@ def t_tost_student_t_and_boundary():
     for boundary in ([0.1] * 6, [-0.1] * 6):
         b = L.tost_paired(boundary, margin=0.1)
         assert b['equivalent'] is False and abs(b['p_tost'] - 0.5) < 1e-12, b
+    # The t critical value must invert the t tail for high confidence and
+    # small/fractional df too; a fixed 1000 cap used to return a too-narrow CI.
+    for _df, _conf in ((0.5, 0.99), (1.0, 0.9999), (10.0, 0.999)):
+        _tc = L._t_critical(_conf, _df)
+        assert math.isfinite(_tc), (_df, _conf, _tc)
+        assert abs(L._student_t_sf(_tc, _df) - (1.0 - _conf) / 2.0) <= 1e-10, (
+            _df, _conf, _tc)
 
 
 def t_safe_exp_and_doc_ci():
