@@ -2018,8 +2018,9 @@ def _render_error_analysis(d):
                 continue
             lines.append('| %s | %s | %s | %s |' % (k, fm(v.get('n'), 0), fm(v.get('mean_ce'), 3), fm(v.get('perplexity'), 2)))
         lines.append('')
-    counts = d.get('cause_counts') or {}
-    guide = d.get('cause_guide') or {}
+    counts = d.get('cause_counts') if isinstance(d.get('cause_counts'), dict) else {}
+    _guide_raw = d.get('cause_guide')
+    guide = _guide_raw if isinstance(_guide_raw, dict) else {}
     if isinstance(counts, dict) and counts:
         lines += ['**Heuristic cause inventory (worst tokens)**', '', '| cause | n | review action |', '|---|---|---|']
         _counts = []
@@ -2051,7 +2052,8 @@ def _render_error_analysis(d):
             lines.append('| %s | %d | %s | %s |' % (
                 c, n, (f'{share * 100:.1f}%' if share is not None else 'n/a'), fm(mce, 3)))
         lines.append('')
-    tokens = d.get('worst_tokens') or []
+    _tokens_raw = d.get('worst_tokens')
+    tokens = _tokens_raw if isinstance(_tokens_raw, list) else []
     if tokens:
         lines += ['| # | row | pos | CE | target | predicted | cause |', '|---|---|---|---|---|---|---|']
         for i, t in enumerate(tokens[:12]):

@@ -6886,6 +6886,16 @@ def t_report_error_analysis_section():
     finally:
         BR._error_analysis_paths = orig_paths
     assert 'ckpt.pt' in txt2 and 'ckpt2.pt' in txt2 and '###' in txt2, txt2
+    # A valid-JSON summary with malformed collection fields must not crash the
+    # report builder (the old code sliced/`.get`ed them unconditionally).
+    bad = dict(rec, worst_tokens={'not': 'a list'}, cause_guide=1,
+               cause_counts={'ambiguous_context': 2})
+    BR.load = lambda path, default=None: bad
+    try:
+        txt3 = BR.sec_error_analysis()
+    finally:
+        BR.load = orig
+    assert 'Bad-case analysis' in txt3 and 'ckpt.pt' in txt3, txt3
 
 
 def t_report_training_health_actions():

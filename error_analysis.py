@@ -166,25 +166,25 @@ def main(argv=None):
         _mce = v.get('mean_ce')
         _ppl = v.get('perplexity')
         lines.append(f'| {k} | {v.get("n")} | {("n/a" if _mce is None else f"{_mce:.3f}")} | {("n/a" if _ppl is None else f"{_ppl:.2f}")} |')
-    _counts = res.get('cause_counts') or {}
-    _guide = res.get('cause_guide') or {}
+    _counts = res.get('cause_counts') if isinstance(res.get('cause_counts'), dict) else {}
+    _guide = res.get('cause_guide') if isinstance(res.get('cause_guide'), dict) else {}
     if _counts:
         lines += ['', '## Error-cause triage (heuristic, not a verdict)', '',
                   '> These labels only direct the manual review. An "annotation_or_rare_target" case may be a correct but rare label; an "ambiguous_context" case may have no defensible single answer. Read the context and the label before changing the model.', '',
                   '| cause | worst-token count | what to check |', '|---|---|---|']
         for c, n in sorted(_counts.items(), key=lambda kv: (-kv[1], kv[0])):
             lines.append(f'| {c} | {n} | {(_guide.get(c) or "").replace("|", "\\|")} |')
-    _all = res.get('cause_counts_all') or {}
+    _all = res.get('cause_counts_all') if isinstance(res.get('cause_counts_all'), dict) else {}
     if _all:
         lines += ['', '**Whole-split cause tally (finite targets, heuristic):**', '',
                   '| cause | n | share | mean CE |', '|---|---|---|---|']
-        for c, v in sorted(_all.items(), key=lambda kv: (-(kv[1].get('n') or 0), kv[0])):
-            if not isinstance(v, dict) or not v.get('n'):
-                continue
+        _rows = [kv for kv in _all.items() if isinstance(kv[1], dict) and kv[1].get('n')]
+        for c, v in sorted(_rows, key=lambda kv: (-(kv[1].get('n') or 0), kv[0])):
             lines.append(f'| {c} | {v.get("n")} | {(v.get("share") or 0) * 100:.1f}% | {v.get("mean_ce"):.3f} |')
     lines += ['', '## Worst tokens', '',
               '| # | row | pos | CE | target | predicted | entropy | rare | cause | boundary |', '|---|---|---|---|---|---|---|---|---|---|']
-    for i, t in enumerate(res.get('worst_tokens') or []):
+    _tokens = res.get('worst_tokens') if isinstance(res.get('worst_tokens'), list) else []
+    for i, t in enumerate(_tokens):
         tgt = (t.get('target_text') or '').replace('|', '\\|').replace('\n', '\\n')[:80]
         prd = (t.get('pred_text') or '').replace('|', '\\|').replace('\n', '\\n')[:80]
         lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | {t["ce"]:.3f} | `{t.get("target_id")}` {tgt} | `{t.get("pred_id")}` {prd} | {t["entropy"]:.3f} | {t.get("rare_target")} | {t.get("cause_primary")} | {t.get("is_boundary_token")} |')
