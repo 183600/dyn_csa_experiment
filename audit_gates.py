@@ -1743,6 +1743,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
     has NO selection-level mechanism evidence, and wording such as "the
     selector found the relevant information" is unsupported.
     """
+    import numpy as np
     out = {'status': 'not_verifiable_locally', 'path': path,
            'required_schema': ['arm', 'eval_len', 'k', 'n_blocks', 'n_queries',
                                'recall_at_k', 'mass_covered', 'random_baseline', 'per_seed'],
@@ -1759,6 +1760,19 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
     if not isinstance(cells, list) or not cells:
         out.update({'status': 'fail', 'problems': ['artifact has no cells list']})
         return out
+    def _exact_int(value):
+        # Block/query counts are exact: int(1.5) would silently certify a
+        # different geometry (and a boolean is a flag, not a count).
+        if value is None or isinstance(value, (bool, np.bool_)):
+            return None
+        if isinstance(value, numbers.Integral):
+            return int(value)
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return int(f) if math.isfinite(f) and f == math.floor(f) else None
+
     for i, c in enumerate(cells):
         if not isinstance(c, dict):
             out['problems'].append(f'cell {i}: not an object')
@@ -1771,11 +1785,17 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed must be a seed -> measurement object')
             continue
         try:
-            k, B = int(c['k']), int(c['n_blocks'])
+            k, B = _exact_int(c['k']), _exact_int(c['n_blocks'])
+            el, nq = _exact_int(c['eval_len']), _exact_int(c['n_queries'])
             rec, mass, base = (float(c['recall_at_k']), float(c['mass_covered']), float(c['random_baseline']))
-            nq = int(c['n_queries'])
         except (TypeError, ValueError, OverflowError):
             out['problems'].append(f'cell {i}: non-numeric fields')
+            continue
+        if k is None or B is None or el is None or nq is None:
+            out['problems'].append(f'cell {i}: k/n_blocks/eval_len/n_queries must be exact integers')
+            continue
+        if not all(math.isfinite(x) for x in (rec, mass, base)):
+            out['problems'].append(f'cell {i}: recall/mass/baseline must be finite')
             continue
         if not (0.0 <= rec <= 1.0 and 0.0 <= mass <= 1.0 and 0.0 <= base <= 1.0):
             out['problems'].append(f'cell {i}: recall/mass/baseline outside [0,1]')
@@ -1808,7 +1828,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                 _st = {'p_exact_signflip': float(_r.get('p')), 'n': int(_r.get('n', _n_valid)), 'method': _r.get('method')}
             except Exception as e:
                 out['problems'].append(f'cell {i}: could not run the seed test ({type(e).__name__}: {e})')
-        out['cells'].append({'arm': c.get('arm'), 'eval_len': c.get('eval_len'), 'k': k, 'n_blocks': B,
+        out['cells'].append({'arm': c.get('arm'), 'eval_len': el, 'k': k, 'n_blocks': B,
                              'recall_at_k': rec, 'mass_covered': mass, 'random_baseline': base,
                              'mass_excess': mass - base, 'recall_excess': rec - base,
                              'n_queries': nq, 'n_seeds': _n_seeds, 'n_seeds_valid': _n_valid,

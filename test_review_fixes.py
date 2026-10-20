@@ -4361,6 +4361,13 @@ def t_selection_attribution_contract():
             json.dump({'cells': [bad]}, f)
         r3 = A.audit_selection()
         assert r3['status'] == 'fail' and r3['problems'], r3
+        # Block/query counts are exact geometry.  int(1.5) would silently
+        # certify a different k/n_blocks than the artifact declares.
+        frac = dict(cell, k=1.5)
+        with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+            json.dump({'cells': [frac]}, f)
+        rf = A.audit_selection()
+        assert rf['status'] == 'fail' and any('exact integers' in x for x in rf['problems']), rf
         # per_seed is part of the declared schema: without it the seed-level
         # claim cannot be checked and must be refused structurally.
         bad2 = dict(cell)
