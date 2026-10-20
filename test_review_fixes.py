@@ -6801,6 +6801,25 @@ def t_report_error_analysis_section():
     assert 'read the context' in txt, txt
 
 
+def t_report_training_health_actions():
+    rec = {'ppl': 51.0, 'eval_subset_rows': 16,
+           'curve_health': {'status': 'overfitting', 'best_val_ppl': 48.0,
+                            'best_step': 500, 'final_minus_best': 3.0,
+                            'steps_since_best': 500, 'train_ce_slope_per_step': -1e-4,
+                            'val_ce_slope_per_step': 2e-5, 'gap_last': 1.2,
+                            'gap_slope_per_step': 3e-5,
+                            'actions': ['add regularization', 'report the best checkpoint']},
+           'health_history': [{'val_ci95_low': 47.0, 'val_ci95_high': 49.0}]}
+    orig = BR._result_summaries
+    BR._result_summaries = lambda: {'results_unit': {'a::s0': rec}}
+    try:
+        txt = BR.sec_training_health()
+    finally:
+        BR._result_summaries = orig
+    assert 'steps since best' in txt and 'add regularization' in txt, txt
+    assert '500' in txt and 'gap slope' in txt, txt
+
+
 def t_report_nan_section_uses_triage():
     rec = {'instability_diagnosis': {
         'status': 'instability_observed', 'primary_suspect': 'fp16_overflow',
@@ -9493,6 +9512,7 @@ def main():
     _check('L8c report NaN section reads the triage path', t_report_nan_section_uses_triage)
     _check('L8d efficiency/accuracy cost summary is seed-noise aware', t_efficiency_accuracy_tradeoff_summary)
     _check('L8e report surfaces the bad-case cause inventory', t_report_error_analysis_section)
+    _check('L8f training-health section shows actions and steps since best', t_report_training_health_actions)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
