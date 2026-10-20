@@ -2100,6 +2100,15 @@ def t_seed_axis_normalization():
     assert L.normalize_seed_list([]) == [0]
     assert L.normalize_seed_list(None) == [0]
     assert L.normalize_seed_list('0, 2 2') == [0, 2]
+    # The fallback plan is validated like an explicit list; int(True)/int(1.5)
+    # must not silently manufacture a different seed identity.
+    for _bad_default in ((True,), (1.5,), ('x',), (None,)):
+        try:
+            L.normalize_seed_list([], default=_bad_default)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'default={_bad_default!r} must be refused')
     assert L.normalize_variant_list(['full', 'csa_fixed', 'full']) == ['full', 'csa_fixed']
     for bad in (True, 1.5, 'x'):
         try:

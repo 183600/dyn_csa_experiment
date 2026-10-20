@@ -17422,7 +17422,21 @@ def normalize_seed_list(seeds, *, default=(0,)):
         seen.add(s)
         out.append(s)
     if not out:
-        out = list(dict.fromkeys(int(x) for x in default))
+        # The fallback is still a declared seed plan, not a raw int() cast:
+        # default=(True,) or default=(1.5,) must not silently become seed 1.
+        try:
+            _fallback = list(default)
+        except TypeError:
+            _fallback = [default]
+        for raw in _fallback:
+            if isinstance(raw, (bool, np.bool_)):
+                raise ValueError(f'default seed must be an integer, got boolean {raw!r}')
+            s = _as_seed_int(raw)
+            if s is None:
+                raise ValueError(f'default seed must be an integer, got {raw!r}')
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
     return out
 
 
