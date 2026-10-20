@@ -13199,12 +13199,22 @@ def param_pair_reason(ra, rb, *, tolerance=0.01, require_breakdown=False):
     MLP width is reallocated or indexer projections are dead).  Returns None
     when the pair passes, else a human-readable reason.
     """
+    # A tolerance is a gate parameter: True -> 1.0 (100%) or a negative/NaN
+    # value would silently disable the capacity check.
+    if isinstance(tolerance, (bool, np.bool_)):
+        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}')
+    try:
+        tol = float(tolerance)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}') from None
+    if not math.isfinite(tol) or tol < 0.0:
+        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}')
     pa, pb = _as_seed_int(ra.get('params')), _as_seed_int(rb.get('params'))
     if pa is None or pb is None or pa <= 0 or pb <= 0:
         return 'unverifiable params (at least one record omits a usable parameter count)'
     rel = abs(pa - pb) / float(max(pa, pb, 1))
-    if rel > float(tolerance):
-        return f'parameter mismatch ({pa} vs {pb}, {100.0 * rel:.2f}% > {100.0 * float(tolerance):.2f}%)'
+    if rel > tol:
+        return f'parameter mismatch ({pa} vs {pb}, {100.0 * rel:.2f}% > {100.0 * tol:.2f}%)'
     ba, bb = ra.get('param_breakdown'), rb.get('param_breakdown')
     _ba = isinstance(ba, dict) and bool(ba)
     _bb = isinstance(bb, dict) and bool(bb)
@@ -13218,9 +13228,9 @@ def param_pair_reason(ra, rb, *, tolerance=0.01, require_breakdown=False):
                     return f'unverifiable param_breakdown.{key}'
                 continue
             _rel = abs(va - vb) / max(abs(va), abs(vb), 1.0)
-            if _rel > float(tolerance):
+            if _rel > tol:
                 return (f'parameter breakdown mismatch ({label}: {va:g} vs {vb:g}, '
-                        f'{100.0 * _rel:.2f}% > {100.0 * float(tolerance):.2f}%)')
+                        f'{100.0 * _rel:.2f}% > {100.0 * tol:.2f}%)')
     elif require_breakdown:
         return 'unverifiable param_breakdown (at least one record omits it)'
     return None
@@ -13341,6 +13351,15 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
         med = (lambda xs: float(np.median(xs)) if xs else None)
         return med(tpt), med(par), med(prox)
 
+    # Same gate-parameter contract as param_pair_reason.
+    if isinstance(tolerance, (bool, np.bool_)):
+        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}')
+    try:
+        tolerance = float(tolerance)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}') from None
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}')
     ta, pa, xa = _series(a)
     tb, pb, xb = _series(b)
     out = {'arm_a': a, 'arm_b': b, 'tolerance': float(tolerance),

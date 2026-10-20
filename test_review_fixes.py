@@ -5662,6 +5662,22 @@ def t_methodology_gate_fail_closed_edges():
         else:
             raise AssertionError(f'audit_methodology accepted min_n={_bad!r}')
 
+    # Capacity and compute tolerances are gate parameters: a bool/negative/
+    # non-finite value must not silently disable the control.
+    _ra = {'params': 1000}
+    _rb = {'params': 1000}
+    _recs = {('a', '', 0): {'params': 1000, 'train_time_s': 1.0, 'tokens_seen': 10},
+             ('b', '', 0): {'params': 1000, 'train_time_s': 1.0, 'tokens_seen': 10}}
+    for _bad in (True, -0.1, float('nan'), 'x'):
+        for _fn in (lambda t: L.param_pair_reason(_ra, _rb, tolerance=t),
+                    lambda t: L._compute_control_detail(_recs, 'a', 'b', tolerance=t)):
+            try:
+                _fn(_bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'invalid control tolerance {_bad!r} was accepted')
+
     # The report's displayed resolution floor is 2/2**n for EVERY n, not a
     # Monte-Carlo-like 1/200001 beyond n=20 (the sign-flip test is exact/MITM
     # up to n=40 and deterministic saddlepoint above).
