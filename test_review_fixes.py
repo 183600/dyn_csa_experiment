@@ -1198,6 +1198,10 @@ def t_tuned_pairing_keeps_optimizer_gate():
     assert why7 and 'eval_fp' in why7, why7
     assert BT._relaxed_pair_reason(dict(a, eval_fp='e1'), dict(b, eval_fp='e1'),
                                    {'a': 3, 'b': 3}) is None
+    # A held-out row fold must be the same fold on both arms.
+    why8 = BT._relaxed_pair_reason(dict(a, holdout_row_fp='h1'),
+                                   dict(b, holdout_row_fp='h2'), {'a': 3, 'b': 3})
+    assert why8 and 'holdout_row_fp' in why8, why8
 
 
 def t_arm_mean_std_and_relative_effect():

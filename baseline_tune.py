@@ -484,6 +484,16 @@ def _relaxed_pair_reason(a, b, tuned_arms):
         return 'unverifiable eval_fp (only one record carries the evaluation-slice fingerprint)'
     if _ha and str(_ea) != str(_eb):
         return f'eval_fp differs ({str(_ea)[:12]}… vs {str(_eb)[:12]}…)'
+    # The tuned estimate may be computed on a deterministic held-out row fold
+    # (`ppl_holdout`).  Different holdout fingerprints mean the two arms are
+    # not scored on the same rows even when the evaluation slice matches.
+    _ra, _rb = a.get('holdout_row_fp'), b.get('holdout_row_fp')
+    _hha = _ra is not None and str(_ra) != ''
+    _hhb = _rb is not None and str(_rb) != ''
+    if _hha != _hhb:
+        return 'unverifiable holdout_row_fp (only one record carries the held-out row fingerprint)'
+    if _hha and str(_ra) != str(_rb):
+        return f'holdout_row_fp differs ({str(_ra)[:12]}… vs {str(_rb)[:12]}…)'
     # Tuning may change lr/wd/warmup, but it must never silently change the
     # optimizer, betas/eps, LR-schedule shape, grad-clip or augmentation.  The
     # strict `pair_reason` already enforces this for architecture contrasts;
