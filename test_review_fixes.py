@@ -4501,6 +4501,14 @@ def t_scale_corpus_binding_refuses_mixed_tokenizers():
                                 {'label': 'S2', 'scale': 2, 'effects': [0.15, 0.25, 0.35], 'seeds': [0, 1, 2]}])
     assert m['corpus_binding']['corpus_binding'] == 'unverifiable', m
     assert m['status'] == 'ok', 'legacy points without fingerprints stay analysable, just unattested'
+    # A shared corpus fingerprint does not attest the tokenizer when only one
+    # point declares its vocab size; the missing width could be different.
+    partial_vocab = [dict(pts[0], vocab=32768), {k: v for k, v in pts[1].items()
+                                                if k != 'vocab'}]
+    m = L.meta_analyze_effects(partial_vocab)
+    assert m['corpus_binding']['corpus_binding'] == 'unverifiable', m
+    assert m['corpus_binding']['n_vocab_declared'] == 1, m
+    assert 'incomplete' in m['corpus_binding']['refusal_reason'], m
     # The ladder audit fails CLOSED on a corpus/tokenizer mismatch.
     def _tier(name, corpus_fp=None, vocab=None):
         cfg = {'steps': 100, 'batch_size': 4, 'seq_len': 512, 'n_train_tokens': 204800,

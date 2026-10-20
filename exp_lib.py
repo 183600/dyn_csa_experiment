@@ -9993,8 +9993,10 @@ def _scale_corpus_binding(pts):
                       MIGHT be mixed; absence of evidence is not attestation
     plus `corpus_fps`, `vocabs` and a refusal reason when mixed."""
     fps = [p.get('corpus_fp') for p in pts if p.get('corpus_fp')]
-    vbs = sorted({p.get('vocab') for p in pts if p.get('vocab') is not None})
-    out = {'corpus_fps': sorted(set(fps)), 'vocabs': vbs}
+    _vocab_pts = [p for p in pts if p.get('vocab') is not None]
+    vbs = sorted({p.get('vocab') for p in _vocab_pts})
+    out = {'corpus_fps': sorted(set(fps)), 'vocabs': vbs,
+           'n_points': len(pts), 'n_vocab_declared': len(_vocab_pts)}
     if len(fps) >= 2 and len(set(fps)) > 1:
         out['corpus_binding'] = 'mixed'
         out['refusal_reason'] = (
@@ -10017,6 +10019,18 @@ def _scale_corpus_binding(pts):
             f'the scale points declare {len(vbs)} different vocab sizes {vbs}; '
             'PPL/log-ratios across different tokenisations are not comparable '
             '(see design_notes §22)')
+    elif vbs and len(_vocab_pts) != len(pts):
+        # A partly declared tokenizer width is not attestation: the points
+        # without a vocab could still be on a different tokenisation.  This is
+        # the same fail-closed rule as a missing corpus fingerprint, and it
+        # must not be upgraded to 'shared' just because the declared subset
+        # happens to agree.
+        if out.get('corpus_binding') != 'mixed':
+            out['corpus_binding'] = 'unverifiable'
+        _why = (f'only {len(_vocab_pts)}/{len(pts)} scale points declare a vocab '
+                'size; the shared-tokenisation attestation is incomplete')
+        out['refusal_reason'] = ((out.get('refusal_reason') + '; ' + _why)
+                                 if out.get('refusal_reason') else _why)
     return out
 
 
