@@ -3145,6 +3145,11 @@ def t_tuning_selection_stability_audit():
     # Legacy rows without per-seed values can never report stability as a pass.
     no_seed = L.tuning_selection_stability([{'config': {'lr': 1e-4}, 'ppl': 1.0}])
     assert no_seed['status'] == 'unavailable', no_seed
+    # One seed under two JSON spellings is a repeated draw, not two draws.
+    dup = L.tuning_selection_stability([
+        {'config': {'lr': 1e-4}, 'seed_ppls': {'0': 10.0, 0: 10.1,
+                                                1: 10.2, 2: 10.3}}])
+    assert dup['status'] == 'unavailable' and 'repeats seed' in dup['reason'], dup
 
 
 def t_paired_row_bootstrap_delta():
@@ -3751,6 +3756,15 @@ def t_baseline_tuning_driver_multiseed_selection():
     _mf = L.tuning_selection_margin({'ppl': 10.0, 'ppl_std': 1.0, 'n_seeds': 3},
                                     {'ppl': 10.1, 'ppl_std': 1.0, 'n_seeds': 3})
     assert _mf['method'] == 'independent_marginal_se' and _mf['decisive'] is False, _mf
+    # A seed repeated under "0" and 0 must not be collapsed into one draw and
+    # used as if it were a valid paired set.
+    _dup = L.tuning_selection_margin(
+        {'ppl': 10.0, 'ppl_std': 1.0, 'n_seeds': 3,
+         'seed_ppls': {'0': 9.0, 0: 9.1, '1': 11.0, '2': 10.0}},
+        {'ppl': 10.1, 'ppl_std': 1.0, 'n_seeds': 3,
+         'seed_ppls': {'0': 9.1, '1': 11.1, '2': 10.1}})
+    assert _dup['method'] == 'invalid_seed_ppls' and _dup.get('reason'), _dup
+    assert _dup['se'] is None and _dup['decisive'] is None, _dup
 
 
 def t_simple_baseline_ngram_and_audit():

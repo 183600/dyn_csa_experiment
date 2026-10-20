@@ -13340,17 +13340,31 @@ def tuning_selection_margin(best, runner, *, metric='ppl', direction='lower_is_b
     def _seed_map(row):
         vals = row.get('seed_ppls')
         if not isinstance(vals, dict):
-            return None
+            return None, None
         out_map = {}
         for k, v in vals.items():
             seed = _as_seed_int(k)
             f = _finite_scalar(v)
             if seed is None or f is None:
-                return None
+                return None, 'seed_ppls contains non-numeric seeds/values'
+            if seed in out_map:
+                # Two JSON keys can denote one seed ("0" and 0).  Overwriting
+                # would silently turn a repeated draw into one observation and
+                # make the paired SE smaller than the evidence supports.
+                return None, (f'seed_ppls repeats seed {seed} under two JSON '
+                              'spellings; the repeated draw is not one observation')
             out_map[seed] = f
-        return out_map
+        return out_map, None
 
-    bmap, rmap = _seed_map(best), _seed_map(runner)
+    bmap, bprob = _seed_map(best)
+    rmap, rprob = _seed_map(runner)
+    if bprob or rprob:
+        # Malformed per-seed evidence is not the same as legacy evidence that
+        # omits it: do NOT fall back to the independent-SE approximation.
+        out.update({'method': 'invalid_seed_ppls',
+                    'reason': bprob or rprob,
+                    'se': None, 'z': None, 'decisive': None})
+        return out
     if bmap is not None and rmap is not None:
         common = sorted(set(bmap) & set(rmap))
         if len(common) >= 2:
@@ -13414,6 +13428,10 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
                 return {'status': 'unavailable', 'reason': 'seed_ppls contains non-numeric seeds/values'}
             if isinstance(v, (bool, np.bool_)) or not isinstance(v, numbers.Real):
                 return {'status': 'unavailable', 'reason': 'seed_ppls contains non-numeric seeds/values'}
+            if seed in m:
+                return {'status': 'unavailable',
+                        'reason': f'seed_ppls repeats seed {seed} under two JSON spellings; '
+                                  'the repeated draw would be silently collapsed'}
             f = _finite_scalar(v)
             # A non-finite draw is not a measurement.  Leaving that seed out
             # of the comparison set keeps every trial's mean over the SAME
@@ -13435,7 +13453,7 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
                     acc = None
                     break
                 nv, tv = _finite_scalar(v), _finite_scalar(_tok.get(k))
-                if nv is None or tv is None or tv <= 0:
+                if nv is None or tv is None or tv <= 0 or seed in acc:
                     acc = None
                     break
                 acc[seed] = (float(nv), float(tv))

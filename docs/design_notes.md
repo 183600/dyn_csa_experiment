@@ -1557,3 +1557,13 @@ seeds」。
 必须是整数；任一非法就返回 `status='unverifiable'` 并给出 `reason`，不再
 生成区间。覆盖率、抽数和 RNG 种子都是区间身份的一部分，不能为了「有输出」
 而替换成另一个区间。
+
+## 32. 调参选择不确定性的种子去重（本轮硬化）
+
+`tuning_selection_margin` / `tuning_selection_stability` 从 `seed_ppls` 取
+配对搜索种子。JSON 可以同时出现 `"0"` 与 `0`，旧实现后写覆盖前写，把一个
+重复抽样静默折叠成一个观测，进而低估配对 SE。现在若同一 seed 以两种写法
+出现，margin 返回 `method='invalid_seed_ppls'` 且不给 SE/判定（不回退到
+独立边际 SE），stability 返回 `status='unavailable'` 并说明重复 seed。
+缺失 `seed_ppls` 的旧 artifact 仍走带标签的独立 SE 回退；只有「有 per-seed
+证据但证据非法」才失败关闭。
