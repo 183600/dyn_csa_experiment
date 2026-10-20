@@ -13401,7 +13401,60 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 _boundary_hits.append(f'{arm}:{_kn}')
             if _kn == 'lr' and 0 < len(_searched) < 3:
                 _coarse.append(f'{arm}: lr has only {len(_searched)} searched level(s)')
+        # Factorial/interaction coverage: the default design is
+        # one-factor-at-a-time, so a marginal winner does not establish a
+        # joint optimum.  Record the searched Cartesian coverage (overall and
+        # per knob pair) instead of silently treating the OFAT winner as fully
+        # tuned.
+        _arm_trials = [t for t in (entry.get('trials') or []) if isinstance(t, dict)]
+        _knobs = sorted(_searched_by_knob)
+        _combos = set()
+        for _t in _arm_trials:
+            _cfg = _t.get('config') or {}
+            _vals = tuple(_finite_scalar(_cfg.get(_kn)) for _kn in _knobs)
+            if all(v is not None for v in _vals):
+                _combos.add(_vals)
+        _full_size = 1
+        for _kn in _knobs:
+            _full_size *= max(1, len(_searched_by_knob.get(_kn) or []))
+        _pairwise = {}
+        _untested_pairs = []
+        for _i, _k1 in enumerate(_knobs):
+            for _k2 in _knobs[_i + 1:]:
+                _obs = {(c[_knobs.index(_k1)], c[_knobs.index(_k2)]) for c in _combos}
+                _want = {(a, b) for a in (_searched_by_knob.get(_k1) or [])
+                         for b in (_searched_by_knob.get(_k2) or [])}
+                _missing = sorted(_want - _obs, key=str)
+                _pairwise[f'{_k1}|{_k2}'] = {
+                    'searched_combinations': len(_obs),
+                    'full_factorial_size': len(_want),
+                    'full_pairwise': bool(_want) and not _missing,
+                    'missing_combinations': [list(x) for x in _missing[:8]],
+                    'n_missing': len(_missing),
+                }
+                if _missing:
+                    _untested_pairs.append(f'{arm}:{_k1}|{_k2}')
+        per_knob['_factorial'] = {
+            'knobs': _knobs,
+            'searched_combinations': len(_combos),
+            'full_factorial_size': int(_full_size),
+            'coverage_fraction': (float(len(_combos)) / float(_full_size)
+                                  if _full_size else None),
+            'full_factorial': bool(_combos and len(_combos) == _full_size),
+            'pairwise': _pairwise,
+        }
         grid_coverage[arm] = per_knob
+    _factor_pairs = sorted({f'{_arm}:{_p}' for _arm, _cv in grid_coverage.items()
+                            if isinstance(_cv.get('_factorial'), dict)
+                            for _p, _pw in _cv['_factorial'].get('pairwise', {}).items()
+                            if _pw.get('full_pairwise') is False})
+    if _factor_pairs:
+        warnings.append(
+            'the tuning grid does not cover every pairwise interaction (' +
+            ', '.join(_factor_pairs) + ') — a one-factor-at-a-time winner is '
+            'not evidence of a jointly tuned optimum; either declare the search '
+            'as marginal/OFAT or add the missing interaction cells before '
+            'calling the baseline fully tuned')
     if _boundary_hits:
         warnings.append('selected hyperparameter(s) sit on the boundary of the declared search grid ('
                         + ', '.join(_boundary_hits) + ') — the optimum may lie outside the searched range; '
@@ -13418,6 +13471,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     out = {'status': 'ok' if not problems else 'fail', 'tuning_verified': not problems,
            'grid_levels': _grid_levels, 'grid_coverage': grid_coverage,
            'grid_boundary_hits': _boundary_hits, 'grid_adequacy': _grid_adequacy,
+           'grid_interaction_untested': _factor_pairs,
            'eval_n_tokens': eval_n_tokens,
            'selection_metric': metric, 'selection_split': split,
            'n_trials': n_trials, 'same_search_space': (len(set(signatures.values())) <= 1) if signatures else None,

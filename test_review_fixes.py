@@ -2659,6 +2659,40 @@ def t_tuning_grid_boundary_adequacy():
     outside['arms']['a']['selected_metric_value'] = 7.0
     ro = L.baseline_tuning_audit(outside, protocol=protocol)
     assert ro['tuning_verified'] is False and any('outside the declared trial levels' in p for p in ro['problems']), ro
+    # Equal marginal coverage is not full factorial coverage: an OFAT winner
+    # cannot be described as a jointly tuned optimum.
+    ofat_trials = [
+        {'lr': 0.0001, 'weight_decay': 0.1, 'warmup': 50},
+        {'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 50},
+        {'lr': 0.0003, 'weight_decay': 0.01, 'warmup': 50},
+    ]
+    ofat_proto = dict(protocol, trials=ofat_trials)
+    def _ofat_art(ppls):
+        rows = [{'config': dict(c), 'ppl': p} for c, p in zip(ofat_trials, ppls)]
+        best = min(rows, key=lambda r: r['ppl'])
+        return {'selection_metric': 'ppl', 'selection_split': 'validation',
+                'direction': 'lower_is_better',
+                'arms': {'a': {'trials': rows, 'selected': dict(best['config']),
+                               'selected_metric_value': best['ppl']}}}
+    rof = L.baseline_tuning_audit(_ofat_art([10.0, 9.0, 8.0]), protocol=ofat_proto)
+    assert rof['tuning_verified'] is True, rof
+    assert rof['grid_interaction_untested'] == ['a:lr|weight_decay'], rof
+    assert rof['grid_coverage']['a']['_factorial']['full_factorial'] is False, rof['grid_coverage']
+    assert rof['grid_coverage']['a']['_factorial']['pairwise']['lr|weight_decay']['n_missing'] == 1, rof
+    assert any('pairwise interaction' in w for w in rof['warnings']), rof['warnings']
+    full_trials = ofat_trials + [{'lr': 0.0001, 'weight_decay': 0.01, 'warmup': 50}]
+    full_proto = dict(protocol, trials=full_trials)
+    frows = [{'config': dict(c), 'ppl': 10.0 - i} for i, c in enumerate(full_trials)]
+    fbest = min(frows, key=lambda r: r['ppl'])
+    rfull = L.baseline_tuning_audit(
+        {'selection_metric': 'ppl', 'selection_split': 'validation',
+         'direction': 'lower_is_better',
+         'arms': {'a': {'trials': frows, 'selected': dict(fbest['config']),
+                        'selected_metric_value': fbest['ppl']}}},
+        protocol=full_proto)
+    assert rfull['tuning_verified'] is True, rfull
+    assert rfull['grid_interaction_untested'] == [], rfull
+    assert rfull['grid_coverage']['a']['_factorial']['full_factorial'] is True, rfull['grid_coverage']
 
 def t_baseline_multi_seed_selection_audit():
     trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
