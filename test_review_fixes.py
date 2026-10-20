@@ -1344,9 +1344,11 @@ def t_ablation_coverage_across_panels():
     }
     cov = L.ablation_coverage_across_panels(reports, design)
     assert cov['components']['A']['panels_complete'] == ['p1'], cov
+    assert cov['components']['A']['panels_usable'] == ['p1'], cov
     assert cov['components']['A']['panels_verified'] == ['p1'], cov
     assert cov['components']['A']['missing_arms'] == {'p2': ['full-A']}, cov
     assert cov['complete_anywhere'] == ['A'], cov
+    assert cov['usable_anywhere'] == ['A'], cov
     assert cov['verified_anywhere'] == ['A'], cov
     assert cov['missing_everywhere'] == ['B'], cov
     assert cov['status'] == 'warn' and any('B' in w for w in cov['warnings']), cov
@@ -1355,6 +1357,14 @@ def t_ablation_coverage_across_panels():
         {'p': _rep(complete=('A', 'B'), measured=('A', 'B'), unverified=())}, design)
     assert cov2['complete_but_unverified'] == ['A', 'B'], cov2
     assert cov2['status'] == 'ok', cov2
+    # All arms present but no controlled contrast shares enough seeds: this is
+    # NOT a usable ablation even though the presence-only check is complete.
+    cov3 = L.ablation_coverage_across_panels(
+        {'p': _rep(complete=('A',), measured=())}, design)
+    assert cov3['components']['A']['complete_anywhere'] is True, cov3
+    assert cov3['components']['A']['usable_anywhere'] is False, cov3
+    assert cov3['usable_anywhere'] == [], cov3
+    assert cov3['status'] == 'warn' and any('shared seeds' in w for w in cov3['warnings']), cov3
 
 
 def t_panel_ablation_flag_does_not_overclaim():

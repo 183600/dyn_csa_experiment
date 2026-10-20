@@ -13435,15 +13435,18 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
     looks internally consistent (because it is simply absent from each scoped
     family).  `reports` maps panel name -> `methodology_audit` report; the
     returned dict names, per declared component, the panels where it is
-    complete / measured / verified / unverified, its missing arms, and the
-    components with no complete panel anywhere.
+    complete / usable / measured / verified / unverified, its missing arms,
+    and the components with no complete panel anywhere.  "Usable" additionally
+    requires a controlled contrast with the required shared seeds (n>=min_n):
+    arms can all be present yet never pair on a common seed, which is not a
+    measured ablation even though the presence check passes.
 
     This is a reporting gate, not a new statistical test: it never promotes a
     component; it only prevents a panel-by-panel reading from hiding an
     omitted innovation."""
     design = ABLATION_DESIGN if design is None else design
     out = {'status': 'ok', 'components': {}, 'complete_anywhere': [],
-           'verified_anywhere': [], 'measured_anywhere': [],
+           'usable_anywhere': [], 'verified_anywhere': [], 'measured_anywhere': [],
            'missing_everywhere': [], 'complete_but_unverified': [],
            'warnings': []}
     if not isinstance(reports, dict):
@@ -13472,12 +13475,19 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
                 row['panels_verified'].append(name)
             if comp in (rep.get('unverified_components') or []):
                 row['panels_unverified'].append(name)
+        row['panels_usable'] = sorted(set(row['panels_complete']) & set(row['panels_measured']))
         row['complete_anywhere'] = bool(row['panels_complete'])
+        row['usable_anywhere'] = bool(row['panels_usable'])
         row['verified_anywhere'] = bool(row['panels_verified'])
         row['measured_anywhere'] = bool(row['panels_measured'])
         out['components'][comp] = row
         if row['complete_anywhere']:
             out['complete_anywhere'].append(comp)
+            if not row['usable_anywhere']:
+                out['warnings'].append(
+                    '%s: all declared arms are present in %s, but no panel has a controlled contrast with '
+                    'the required shared seeds (n>=min_n) — arm presence alone is not a usable ablation'
+                    % (comp, ', '.join(row['panels_complete'])))
         else:
             out['missing_everywhere'].append(comp)
             out['warnings'].append(
@@ -13489,6 +13499,8 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
             out['verified_anywhere'].append(comp)
         elif row['complete_anywhere']:
             out['complete_but_unverified'].append(comp)
+        if row['usable_anywhere']:
+            out['usable_anywhere'].append(comp)
         if row['measured_anywhere']:
             out['measured_anywhere'].append(comp)
     out['status'] = 'warn' if out['warnings'] else 'ok'
