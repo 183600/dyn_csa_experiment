@@ -2628,6 +2628,12 @@ def t_tuning_grid_boundary_adequacy():
     assert rc['grid_adequacy'] == 'warn', rc
     assert rc['grid_coverage']['a']['lr']['n_searched_levels'] == 2, rc['grid_coverage']
     assert any('searched level' in w for w in rc['warnings']), rc
+    # Trials selected on different evaluation token counts are not comparable.
+    _diff_tok = _art(1, [10.0, 8.0, 9.0])
+    for _i, _t in enumerate(_diff_tok['arms']['a']['trials']):
+        _t['n_tokens'] = 100 if _i < 2 else 50
+    rt = L.baseline_tuning_audit(_diff_tok, protocol=protocol)
+    assert rt['tuning_verified'] is False and any('different evaluation token counts' in p for p in rt['problems']), rt
     # A selected value outside the declared levels is not a tuned winner.
     outside = _art(1, [10.0, 8.0, 9.0])
     outside['arms']['a']['selected'] = {'lr': 0.002, 'weight_decay': 0.1, 'warmup': 50}

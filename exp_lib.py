@@ -12886,6 +12886,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     budgets = {}
     search_seed_sets = {}
     selection_stabilities = {}
+    eval_n_tokens = {}
     for arm, entry in arms.items():
         trials = entry.get('trials') if isinstance(entry, dict) else None
         if not isinstance(trials, list) or not trials:
@@ -12974,6 +12975,21 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             sig = json.dumps(t.get('config') or {}, sort_keys=True, default=str)
             by_cfg[sig] = (t.get('steps'), t.get('tokens_seen'))
         budgets[arm] = by_cfg
+        # Trial PPLs are comparable only on the same evaluation sample.  A
+        # trial evaluated on a different subset is a different measurement,
+        # even if it used the same training budget and hyperparameter grid.
+        _eval_tok = set()
+        for t in trials:
+            if not isinstance(t, dict) or t.get('n_tokens') is None:
+                continue
+            _nt = _exact_count(t.get('n_tokens'), minimum=1)
+            if _nt is None:
+                problems.append(f'{arm}: trial n_tokens is not an exact positive count ({t.get("n_tokens")!r})')
+                continue
+            _eval_tok.add(_nt)
+        if len(_eval_tok) > 1:
+            problems.append(f'{arm}: trials selected on different evaluation token counts {sorted(_eval_tok)} — their PPLs are not comparable')
+        eval_n_tokens[arm] = sorted(_eval_tok)
         # Step/token budgets are exact counts.  Raw equality would treat
         # True == 1 and let a boolean/truncated budget pose as a matched one.
         _steps, _toks, _bad_budget = set(), set(), []
@@ -13214,6 +13230,10 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     uncovered = sorted(a for a in required if a not in coverage)
     if uncovered:
         problems.append(f'missing tuning evidence for arms {uncovered}')
+    _nonempty_eval = [tuple(v) for v in eval_n_tokens.values() if v]
+    if len(set(_nonempty_eval)) > 1:
+        problems.append('arms selected on different evaluation token counts '
+                        f'{sorted(set(_nonempty_eval))} — the equal-search comparison is not on a common sample')
     _grid_complete = None
     if signatures and declared:
         _grid_complete = all(set(sig) == declared for sig in signatures.values())
@@ -13311,6 +13331,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     out = {'status': 'ok' if not problems else 'fail', 'tuning_verified': not problems,
            'grid_levels': _grid_levels, 'grid_coverage': grid_coverage,
            'grid_boundary_hits': _boundary_hits, 'grid_adequacy': _grid_adequacy,
+           'eval_n_tokens': eval_n_tokens,
            'selection_metric': metric, 'selection_split': split,
            'n_trials': n_trials, 'same_search_space': (len(set(signatures.values())) <= 1) if signatures else None,
            'search_seeds': search_seeds_seen if search_seeds_seen is not None else (_declared_ss and list(_declared_ss)),
