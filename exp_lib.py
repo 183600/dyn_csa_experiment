@@ -6677,32 +6677,14 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     # exactly or near-duplicates a TRAIN or VALIDATION document is excluded
     # before tokenisation.  Both indices are built from the earlier splits
     # only; test rows never decide what counts as a duplicate of train/val.
-    _test_dedup = _DocDeduplicator()
-    for _r in train_rows_source:
-        if isinstance(_r, str) and _r.strip():
-            _test_dedup.is_duplicate(_r)
-    _kept_test = []
-    _excluded = {'train_exact': 0, 'train_near': 0,
-                 'validation_exact': 0, 'validation_near': 0}
-    for _r in _trows:
-        if not isinstance(_r, str) or not _r.strip():
-            continue
-        _dup, _kind = _test_dedup.is_duplicate(_r)
-        if _dup:
-            _excluded[f'train_{_kind}'] += 1
-            continue
-        _dup, _kind = _val_only.is_duplicate(_r)
-        if _dup:
-            _excluded[f'validation_{_kind}'] += 1
-            continue
-        _kept_test.append(_r)
-    _removed_train = _excluded['train_exact'] + _excluded['train_near']
-    _removed_val = _excluded['validation_exact'] + _excluded['validation_near']
-    if _removed_train or _removed_val:
-        print(f'[data] test duplicate cleanup: excluded {_excluded["train_exact"]} exact '
-              f'and {_excluded["train_near"]} near-duplicate documents from train, '
-              f'{_excluded["validation_exact"]} exact and {_excluded["validation_near"]} '
-              f'near-duplicate documents from validation')
+    _kept_test, _excluded, _test_dedup = _filter_test_documents(
+        train_rows_source, _val_only, _trows, label='test')
+    _removed_test = _excluded['test_exact'] + _excluded['test_near']
+    if _removed_test:
+        # Test-to-test cleanup is not train/val leakage, but it changes the
+        # frozen slice composition and must be visible in its own record.
+        print(f'[data] NOTE: {_removed_test} additional test documents were '
+              'near/exact duplicates of earlier test documents')
     _trows = _kept_test
     _cap_test = n_seqs * seq_len + seq_len
     _test_lengths = []
@@ -6800,6 +6782,9 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             'policy': 'test_documents_deduplicated_against_train_and_validation',
             'train_exact_removed': int(_excluded['train_exact']),
             'train_near_removed': int(_excluded['train_near']),
+            'test_exact_removed': int(_excluded['test_exact']),
+            'test_near_removed': int(_excluded['test_near']),
+            'test_self_cleanup_policy': 'test_documents_deduplicated_among_themselves',
             'near_hamming_threshold': int(_test_dedup.near_threshold),
             'source_documents': int(len(test_rows)),
             'kept_documents': int(len(_trows)),
@@ -7063,7 +7048,11 @@ class _DocDeduplicator:
         return [(b, (int(h) >> (b * self.bits)) & self.mask)
                 for b in range(self.bands)]
 
-    def is_duplicate(self, text, fp=None):
+    def _match(self, text, fp):
+        """Return ``(duplicate, kind, fp_key, simhash)`` without mutating.
+
+        The SimHash is returned even when no match is found so callers can add
+        the document once, exactly like :meth:`is_duplicate` does."""
         if fp is None:
             fp = _doc_exact_fp(text)
         # The content hash is a 128-bit value; storing it as a Python int
@@ -7071,23 +7060,41 @@ class _DocDeduplicator:
         # each document with one integer.
         fp_key = int(fp, 16) if isinstance(fp, (str, bytes)) else int(fp)
         if fp_key in self.exact:
-            self.n_exact_skipped += 1
-            return True, 'exact'
+            return True, 'exact', fp_key, None
         h = _doc_simhash(text)
         for key in self._bucket_keys(h):
             for other in self.buckets.get(key, ()):
                 if _hamming64(h, other) <= self.near_threshold:
-                    self.n_near_skipped += 1
-                    # Keep the skipped member in the near-duplicate index too.
-                    # Otherwise a chain A~T (A skipped), B~A (B not close
-                    # enough to T to be found separately) would let B into a
-                    # later split: the same document cluster would cross the
-                    # boundary through the skipped copy.  Quarantining the
-                    # hash makes the group filter closed under the LSH matches
-                    # it has already made, without counting the copy as seen.
-                    for _key in self._bucket_keys(h):
-                        self.buckets.setdefault(_key, []).append(h)
-                    return True, 'near'
+                    return True, 'near', fp_key, h
+        return False, None, fp_key, h
+
+    def find(self, text, fp=None):
+        """Read-only duplicate lookup (never adds the document or counters).
+
+        Use this to test a document against an earlier split's index without
+        letting the document itself become part of that split's reference
+        set.  ``is_duplicate`` remains the mutating form used when building a
+        split."""
+        dup, kind, _fp_key, _h = self._match(text, fp)
+        return dup, kind
+
+    def is_duplicate(self, text, fp=None):
+        dup, kind, fp_key, h = self._match(text, fp)
+        if dup:
+            if kind == 'exact':
+                self.n_exact_skipped += 1
+            else:
+                self.n_near_skipped += 1
+                # Keep the skipped member in the near-duplicate index too.
+                # Otherwise a chain A~T (A skipped), B~A (B not close
+                # enough to T to be found separately) would let B into a
+                # later split: the same document cluster would cross the
+                # boundary through the skipped copy.  Quarantining the
+                # hash makes the group filter closed under the LSH matches
+                # it has already made, without counting the copy as seen.
+                for _key in self._bucket_keys(h):
+                    self.buckets.setdefault(_key, []).append(h)
+            return True, kind
         self.exact.add(fp_key)
         self.n_seen += 1
         for key in self._bucket_keys(h):
@@ -7101,6 +7108,61 @@ class _DocDeduplicator:
                 'added_documents': int(self.n_seen),
                 'exact_duplicates_skipped': int(self.n_exact_skipped),
                 'near_duplicates_skipped': int(self.n_near_skipped)}
+
+
+def _filter_test_documents(train_rows, val_index, test_rows, *, label='test'):
+    """Remove test documents that duplicate an earlier split or each other.
+
+    ``train_rows`` are the raw training documents and ``val_index`` is the
+    already-built validation index.  Both are consulted READ-ONLY: a test
+    document must not enter the training/validation reference set, otherwise a
+    later test document could be labelled as a train/val duplicate merely
+    because it resembles an earlier *test* document.  Test-to-test duplicates
+    are closed through a separate self index, which is also updated for test
+    documents that are excluded on an earlier-split match, so transitive
+    near-duplicate chains stay together.
+
+    Returns ``(kept_rows, excluded_counts, test_index)``.  ``excluded_counts``
+    keys are ``train_exact``, ``train_near``, ``validation_exact``,
+    ``validation_near``, ``test_exact`` and ``test_near``.  The set of kept
+    documents is the same as the historical mutating form; only the
+    attribution of a self/train/validation match is made honest.
+    """
+    train_index = _DocDeduplicator()
+    for _r in train_rows:
+        if isinstance(_r, str) and _r.strip():
+            train_index.is_duplicate(_r)
+    test_index = _DocDeduplicator()
+    kept = []
+    excluded = {'train_exact': 0, 'train_near': 0,
+                'validation_exact': 0, 'validation_near': 0,
+                'test_exact': 0, 'test_near': 0}
+    for _r in test_rows:
+        if not isinstance(_r, str) or not _r.strip():
+            continue
+        # Index every test document (even one excluded below) so a later
+        # near copy cannot slip through a transitive chain.
+        _self_dup, _self_kind = test_index.is_duplicate(_r)
+        _dup, _kind = train_index.find(_r)
+        if _dup:
+            excluded[f'train_{_kind}'] += 1
+            continue
+        _dup, _kind = val_index.find(_r)
+        if _dup:
+            excluded[f'validation_{_kind}'] += 1
+            continue
+        if _self_dup:
+            excluded[f'test_{_self_kind}'] += 1
+            continue
+        kept.append(_r)
+    print(f'[data] {label} duplicate cleanup: excluded '
+          f'{excluded["train_exact"]} exact and {excluded["train_near"]} '
+          f'near-duplicate documents from train, '
+          f'{excluded["validation_exact"]} exact and '
+          f'{excluded["validation_near"]} near-duplicate documents from '
+          f'validation, and {excluded["test_exact"]} exact / '
+          f'{excluded["test_near"]} near-duplicate {label} documents')
+    return kept, excluded, test_index
 
 
 TOKENIZER_FIT_TOKENS = 8_000_000

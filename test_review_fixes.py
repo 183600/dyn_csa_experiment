@@ -5010,6 +5010,41 @@ def t_document_dedup_closes_near_duplicate_chains():
         L._doc_simhash = orig
 
 
+def t_test_document_filter_uses_readonly_earlier_indices():
+    # A test document must not become part of the train/validation reference
+    # set.  Otherwise a later test doc resembling an earlier TEST doc is
+    # mislabelled as a train/val duplicate, and the audit no longer knows why
+    # the document was removed.
+    train = ['train one', 'train two']
+    val = ['val one']
+    val_index = L._DocDeduplicator()
+    for r in val:
+        val_index.is_duplicate(r)
+    before = val_index.stats()
+    test = ['unique test a', 'unique test a', 'unique test b',
+            'train one', 'val one']
+    kept, excluded, test_index = L._filter_test_documents(
+        train, val_index, test, label='test')
+    assert kept == ['unique test a', 'unique test b'], kept
+    assert excluded['train_exact'] == 1, excluded
+    assert excluded['validation_exact'] == 1, excluded
+    assert excluded['test_exact'] == 1, excluded
+    # The earlier-split index was consulted read-only.
+    assert val_index.stats() == before, (before, val_index.stats())
+    assert val_index.find('unique test a') == (False, None)
+    # The pure lookup form never mutates counters or membership.
+    d = L._DocDeduplicator()
+    assert d.find('a b c') == (False, None)
+    assert d.stats()['added_documents'] == 0
+    d.is_duplicate('a b c')
+    n_before = d.stats()['added_documents']
+    assert d.find('a b c') == (True, 'exact')
+    assert d.find('d e f') == (False, None)
+    assert d.stats()['added_documents'] == n_before, d.stats()
+    # The kept set is still closed under a test-to-test near-duplicate chain.
+    assert test_index.find('unique test a') == (True, 'exact')
+
+
 def t_split_purge_embargo():
     # Purge drops the tail of train and validation; the test slice is intact
     # and no returned row straddles a boundary.
@@ -8580,6 +8615,7 @@ def main():
     _check('I21a data-quality temporal split audit', t_data_quality_temporal_audit)
     _check('I21b capped test document-id sidecar', t_capped_document_id_sidecar)
     _check('I21c near-duplicate document chains stay on one side', t_document_dedup_closes_near_duplicate_chains)
+    _check('I21e test dedup uses read-only earlier-split indices', t_test_document_filter_uses_readonly_earlier_indices)
     _check('I22 purge/embargo keeps window boundaries sealed', t_split_purge_embargo)
     _check('I23 grouped split refuses an empty requested side', t_group_split_refuses_empty_requested_side)
     _check('I24 label shift and per-split label corruption counts', t_label_shift_and_split_counts)
