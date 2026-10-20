@@ -7316,6 +7316,31 @@ def t_release_tag_cannot_escape_output_dir():
         else:
             raise AssertionError(f'release tag {_bad!r} was accepted as a filename component')
 
+
+def t_audit_leakage_missing_id_cache_is_not_ok():
+    # Metas and persisted tokenizers can be present while the actual id
+    # caches/sidecars are missing.  That split is NOT independently verifiable;
+    # leaving the verdict at 'ok' would let a confirmation gate treat it as
+    # clean.
+    from tokenizers import Tokenizer, models
+    cache = tempfile.mkdtemp(prefix='leak_missing_ids_')
+    try:
+        tok = Tokenizer(models.WordLevel({'[UNK]': 0, 'a': 1, 'b': 2},
+                                         unk_token='[UNK]'))
+        tok.save(os.path.join(cache, 'tok_v5_x.json'))
+        tok.save(os.path.join(cache, 'test_tok_v2_x.json'))
+        common = {'vocab': 3, 'fit_fp': 'FITXYZ'}
+        with open(os.path.join(cache, 'meta_v5_x.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(common, src_fp='train'), f)
+        with open(os.path.join(cache, 'test_meta_v2_x.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(common, src_fp='test'), f)
+        out = A.audit_leakage(cache_dir=cache, shingle=1, max_rows_shingled=2)
+        assert out['status'] != 'ok', out
+        assert 'test id cache is absent' in out.get('note', ''), out
+        assert 'document-id sidecar is missing' in out.get('note', ''), out
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -7556,6 +7581,7 @@ def main():
     _check('L27 error analysis excludes non-finite targets', t_error_analysis_excludes_nonfinite_targets)
     _check('L28 gapfill numeric reader rejects booleans', t_gapfill_numeric_reader_rejects_booleans)
     _check('L29 release tags cannot escape the archive directory', t_release_tag_cannot_escape_output_dir)
+    _check('L30 missing id cache/sidecars is not a clean leakage audit', t_audit_leakage_missing_id_cache_is_not_ok)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

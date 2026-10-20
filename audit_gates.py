@@ -118,6 +118,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     if cache_dir in (None, ''):
         cache_dir = os.environ.get('WT103_CACHE_DIR') or './wt103_cache'
     out = {'status': 'ok', 'checks': {}}
+    _unverifiable = []
     test_meta = None
     train_meta = None
     test_tag = None
@@ -287,10 +288,16 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             if _path is None:
                 _fp_checks[_side] = {'status': 'unverifiable',
                                      'reason': 'id cache file absent or ambiguous'}
+                _unverifiable.append(
+                    f'{_side} id cache is absent/ambiguous; its token fingerprint '
+                    'cannot be recomputed')
                 continue
             if _recorded is None:
                 _fp_checks[_side] = {'status': 'unverifiable',
                                      'reason': 'metadata has no src_fp'}
+                _unverifiable.append(
+                    f'{_side} metadata has no src_fp; the id cache cannot be '
+                    'bound to the audited token stream')
                 continue
             try:
                 _arr = np.load(_path, mmap_mode='r')
@@ -371,6 +378,9 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             'status': 'not_verified',
             'note': 'legacy test cache without test_doc_ids; rebuild it to prove train/val/test document-group isolation',
         }
+        _unverifiable.append(
+            'test document-id sidecar is missing; train/val/test document-group '
+            'isolation cannot be verified')
     # d) document overlap via deterministic SLIDING shingles on the cached id
     # matrices.  A fixed polynomial rolling hash over every window, uniform
     # segments across the full train stream, and an explicit scanned fraction
@@ -516,6 +526,16 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
         out['note'] = (f'train/test overlap audit could not run '
                        f'({type(e).__name__}: {e}); no clean generalization '
                        'claim is available until it is rerun')
+    # Missing id caches or document-id sidecars mean the split cannot be
+    # independently verified.  Keeping 'ok' made the v12 one-shot gate treat
+    # an unverified isolation claim as clean; only a fully verifiable audit may
+    # leave this status at 'ok'.
+    if out['status'] == 'ok' and _unverifiable:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = ('; '.join(_unverifiable)
+                       + ' — the train/test split cannot be certified from the '
+                       'local cache; rebuild/copy the missing artifacts before '
+                       'using a confirmation claim')
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
