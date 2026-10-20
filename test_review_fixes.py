@@ -647,6 +647,15 @@ def t_scaling_trend_ragged_pairs():
     # Seed identity is an exact integer across every scale helper.  A
     # fractional value would quietly become a different paired draw, and
     # True would collide with seed 1 in the complete-case dict.
+    # Non-iterable seed/plan descriptors are malformed input, not a crash.
+    for _bad in ({'seeds': 3}, {'planned_seeds': 3}):
+        try:
+            L._scale_points([dict({'label': 'A', 'scale': 1,
+                                   'effects': [1.0]}, **_bad)])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'non-iterable {_bad!r} was accepted')
     for _bad_seed in (0.5, True, 'not-an-int'):
         for _call in (
             lambda: L._scale_points([{'label': 'A', 'scale': 1,

@@ -10138,7 +10138,11 @@ def _scale_points(points):
             seeds_kept = [j for j, _v in keep]
             effects = [f for _j, f in keep]
         else:
-            seeds = list(seeds)
+            try:
+                seeds = list(seeds)
+            except TypeError:
+                raise ValueError('scale point %r: seeds must be an iterable, got %r'
+                                 % (label, seeds)) from None
             if len(seeds) != len(vals):
                 raise ValueError('scale point %r: seeds length %d does not match effects length %d' % (label, len(seeds), len(vals)))
             # Seed identity is an exact integer.  A float such as 1.5 or a
@@ -10167,7 +10171,11 @@ def _scale_points(points):
         _planned_set = None
         _seed_plan_attested = None
         if planned_seeds is not None:
-            _ps = [_as_seed_int(v) for v in planned_seeds]
+            try:
+                _ps = [_as_seed_int(v) for v in planned_seeds]
+            except TypeError:
+                raise ValueError('scale point %r: planned_seeds must be an '
+                                 'iterable, got %r' % (label, planned_seeds)) from None
             if any(v is None for v in _ps):
                 raise ValueError('scale point %r: planned_seeds must be integers, got %r'
                                  % (label, planned_seeds))
