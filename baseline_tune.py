@@ -166,7 +166,9 @@ def _search_final_seeds(protocol):
     if raw_search is None:
         raw_search = [protocol.get('search_seed', 0)]
     search = _seeds(raw_search, 'search_seeds')
-    final = _seeds(protocol.get('final_seeds') or [], 'final_seeds')
+    # `or []` would turn the valid scalar seed 0 into an empty final plan.
+    _raw_final = protocol.get('final_seeds')
+    final = _seeds([] if _raw_final is None else _raw_final, 'final_seeds')
     if not search:
         raise ValueError('search_seeds must contain at least one seed')
     return search, final, sorted(set(search) & set(final))
@@ -382,6 +384,38 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                                        for s in sorted(records)},
                     'run_cfg': records[sorted(records)[0]].get('run_cfg'), 'outdir': tdir,
                 })
+    # Selection must compare every trial on the SAME rows.  If one trial in
+    # an arm could not use the declared nested selection fold while another
+    # could, comparing the surviving mixture (nested for some configs, full
+    # validation for others) is an invalid sample change.  Fall back to the
+    # full-validation means for the WHOLE arm so all trials share one sample,
+    # and leave the split flags false so downstream audits see that the nested
+    # contract was not met.
+    if _row_spec is not None:
+        for arm in arms:
+            rows = per_arm.get(arm) or []
+            flags = [bool(t.get('selection_row_split_applied')) for t in rows]
+            if any(flags) and not all(flags):
+                print(f'[tune] WARNING: {arm}: trials mix nested and full-validation '
+                      'selection samples; falling back to full validation for every '
+                      'trial in this arm so the selected config is not chosen across '
+                      'different row sets')
+                for t in rows:
+                    full = t.get('seed_ppls_full_validation') or {}
+                    _full_vals = [v for v in full.values() if L.ppl_is_usable(v)]
+                    _mu, _sd = _mean_std(_full_vals)
+                    t['ppl'] = _mu
+                    t['ppl_std'] = _sd
+                    if full:
+                        t['seed_ppls'] = {str(k): float(v) for k, v in full.items()}
+                    t['nll_sum'] = None
+                    t['n_tokens'] = None
+                    t['seed_nll_sum'] = None
+                    t['seed_n_tokens'] = None
+                    t['ppl_aggregation'] = 'arithmetic_seed_mean_fallback'
+                    t['selection_row_split_applied'] = False
+                    t['selection_row_fp'] = None
+                    t['evaluation_row_fp'] = None
     selected = {}
     for arm in arms:
         hits = [t for t in per_arm[arm] if L.ppl_is_usable(t.get('ppl'))]
@@ -639,7 +673,12 @@ def _run_final(base, outdir, protocol, selected):
             _pending, _bad = [], []
             for k, r in merged.items():
                 st = L.record_subset_ppl(r, _eval_idx)
-                if st is None:
+                # A finite row index is not enough: an overflowed/underflowed
+                # holdout PPL is unmeasured.  Treating it as applied would let
+                # `_eval_metric` silently fall back to full validation for
+                # THAT record while the artifact still claims every seed used
+                # the held-out fold.
+                if st is None or not L.ppl_is_usable(st.get('ppl')):
                     _bad.append(k)
                     continue
                 _pending.append((r, st))

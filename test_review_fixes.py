@@ -3378,6 +3378,10 @@ def t_baseline_driver_refuses_overlapping_final_seeds():
         assert 'final_seeds' in str(e), e
     else:
         raise AssertionError('an empty final seed partition was not refused')
+    # A scalar zero is a valid single final seed; `or []` used to erase it.
+    _search, _final, _shared = BT._search_final_seeds(
+        {'search_seeds': [1], 'final_seeds': 0})
+    assert (_search, _final, _shared) == ([1], [0], []), (_search, _final, _shared)
 
 
 def t_nested_validation_row_split_and_subset_ppl():
