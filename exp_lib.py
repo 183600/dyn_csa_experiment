@@ -10451,7 +10451,16 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
     may deliberately change budget), never a silent "matched" claim.
     """
     policy = dict(SCALE_TRANSFER_POLICY if policy is None else policy)
-    tol = float(policy.get('tokens_per_param_tolerance', 0.25) if tolerance is None else tolerance)
+    _tol_raw = (policy.get('tokens_per_param_tolerance', 0.25)
+                if tolerance is None else tolerance)
+    if isinstance(_tol_raw, (bool, np.bool_)):
+        raise ValueError(f'tokens_per_param_tolerance must be a non-negative real number, got {_tol_raw!r}')
+    try:
+        tol = float(_tol_raw)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'tokens_per_param_tolerance must be a non-negative real number, got {_tol_raw!r}') from None
+    if not math.isfinite(tol) or tol < 0.0:
+        raise ValueError(f'tokens_per_param_tolerance must be a finite non-negative number, got {_tol_raw!r}')
 
     def _as_int(value, label, *, allow_none=False):
         if value is None and allow_none:
@@ -10468,6 +10477,13 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         raise ValueError(f'{label} must be an integer, got {value!r}')
 
     problems, warnings, rows = [], [], []
+    try:
+        family_m = _as_int(policy.get('family_m', 4), 'family_m')
+        if family_m <= 0:
+            raise ValueError('family_m must be positive')
+    except (TypeError, ValueError, OverflowError) as e:
+        family_m = None
+        problems.append(f'policy.family_m is invalid ({e}); the family-resolution floor cannot be planned')
     for i, tier in enumerate(tiers or []):
         if not isinstance(tier, dict):
             problems.append(f'tier #{i} is not a dict')
@@ -10543,7 +10559,8 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             'warmup_fraction': (warmup / steps if steps else None),
             'n_seeds': len(set(seeds)),
             'p_floor': signflip_p_floor(len(set(seeds))),
-            'min_seeds_for_family_significance': signflip_min_n_for_holm(int(policy.get('family_m', 4)), 0.05),
+            'min_seeds_for_family_significance': (signflip_min_n_for_holm(family_m, 0.05)
+                                                  if family_m is not None else None),
         })
         if params is None:
             warnings.append(f'{name}: params missing — tokens-per-parameter and budget matching are unverifiable')
@@ -10738,6 +10755,25 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
     `loglog_regression`; the claim level is fixed to `descriptive` because the
     scale panels are observational, not randomized.
     """
+    # Gate parameters: a bool/fractional point-count or tolerance would
+    # silently change which fits are allowed.  Refuse instead of coercing.
+    _min_pts = _as_seed_int(min_points)
+    if _min_pts is None or _min_pts < 2:
+        raise ValueError(f'min_points must be an integer >= 2, got {min_points!r}')
+    min_points = _min_pts
+    for _name, _value, _check in (
+            ('volume_tol', volume_tol, lambda v: math.isfinite(v) and v >= 0.0),
+            ('d_spread_min', d_spread_min, lambda v: math.isfinite(v) and v > 1.0)):
+        if isinstance(_value, (bool, np.bool_)):
+            raise ValueError(f'{_name} must be a real number, got {_value!r}')
+        try:
+            _fv = float(_value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{_name} must be a real number, got {_value!r}') from None
+        if not _check(_fv):
+            raise ValueError(f'{_name} has an invalid value {_value!r}')
+    volume_tol = float(volume_tol)
+    d_spread_min = float(d_spread_min)
     rows = []
     if isinstance(entries, dict):
         entries = [(k, v) for k, v in entries.items()]
