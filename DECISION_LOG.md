@@ -204,6 +204,35 @@ and its power table were not changed; no test split was read.  The per-issue
 table is `REVIEW_4_RESPONSE.md`, and the statistical conventions are in
 `docs/design_notes.md` section 25.
 
+## 2026-10-20 — comparison/ablation audit hardening (no new runs)
+
+Zero-GPU methodology fixes; no panel, frozen manifest or test split was
+touched.
+
+- **Open-block control gate:** beyond `run_cfg` and the compact
+  hyperparameters, a pair now must also match the `train_knobs`
+  optimizer/betas/eps/schedule/clipping/augmentation/precision descriptor, the
+  derived `train_objective`, and the shared-trunk `init_core_fp`. A
+  `variant::seedN` key whose record carries a different seed or variant is
+  excluded and named instead of being paired under the wrong identity.
+- **Open-block reporting:** the report now includes per-arm n / Mean ± SD /
+  token-pooled PPL. Its three-comparison Holm family needs **n>=7**; the old
+  "6-seed extension" wording was wrong (n=6 only suffices for a single raw
+  comparison). The driver warns before training when the planned seed count
+  cannot reach the declared family floor.
+- **Dynamic blocking:** `hybrid_csa_dyn - hybrid_fixed` and
+  `hybrid_hca_dyn - hybrid_fixed` now decompose the boundary effect by layer
+  kind, so the scheduled `hybrid_hca_dyn` arm actually contributes to a
+  declared contrast instead of being an orphan run.
+- **Objective descriptors:** `train_objective` now accounts for per-layer
+  `comp_lambda_mult`, so `csa_dyn_nocomp` is correctly reported as not
+  applying comp_reg (previously it copied `comp_lambda=0.05`). Declared
+  objective interventions (`compression_regularizer`, `task_learned_boundary`)
+  are recorded as expected differences; any other objective change remains a
+  `system_level_only` confound.
+- **Run-time seed plan:** `run_gapfill.run_full` prints every phase's
+  family-corrected minimum seed count before spending GPU time.
+
 ## 2026-10-20 — nested validation for tuned baselines (no new runs)
 
 Seed-disjoint search/final partitions were not sufficient: hyper-parameters

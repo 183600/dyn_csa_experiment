@@ -820,14 +820,21 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
 
 ### 22.4 训练目标、参数与 KV 的公平性字段
 
-- 每条记录新增 `train_objective`（comp_reg 是否实际生效、delta_logit 的
-  LR 倍数是否实际生效、boundary policy）与 `param_breakdown`
+- 每条记录新增 `train_objective`（comp_reg 是否实际生效、每层
+  `comp_lambda_mult` 的实际权重、delta_logit 的 LR 倍数是否实际生效、
+  boundary policy）与 `param_breakdown`
   （total/attention/MLP/embedding/head/active）、
-  `kv_cache_elements_per_token`。
+  `kv_cache_elements_per_token`。`comp_reg_applies` 现在按**实际乘子**
+  计算：`csa_dyn_nocomp` 的乘子为 0，必须报告 comp_reg 未生效，而不是
+  照抄配置里的 `comp_lambda=0.05`。
 - `methodology_audit` 对同一 `run_cfg` 但目标不同的对照给出
   `objective_confounded` 警告与 `mechanism_claim_allowed=False`。这不会
   阻止配对（那会让所有 dense-vs-sparse 对比消失），但会阻止把它写成
-  「隔离机制」。
+  「隔离机制」。例外只限**声明的目标型创新点**：
+  `OBJECTIVE_INTERVENTION_KEYS` 中 `compression_regularizer` 的
+  comp-reg 项与 `task_learned_boundary` 的 boundary-policy 项是干预本身，
+  记录为 `objective_expected_differences`；任何未声明的目标差异仍然
+  判为 system-level。
 - 参数量匹配容差统一为 1%（`_param_control` 与报告共用）；冻结确认的
   准入还检查 params 相对差与完整 seed 覆盖。
 
