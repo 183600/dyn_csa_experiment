@@ -1195,6 +1195,9 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
 
     for h0 in range(0, nh, group):
         h1 = min(h0 + group, nh)
+        # The final block can be narrower than `group` (nh % group != 0);
+        # the slab always has `group` rows, so only the live prefix is viewed.
+        _g = h1 - h0
         for _slab in (dk_slab, dv_slab, dksw_slab, dvsw_slab):
             if _slab is not None:
                 _slab.zero_()
@@ -1313,13 +1316,13 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             del (src32, src64, lt_sel, sel_ok, src_win, win_ok, lane_ok, anyrow,
                  soft_c, seg_b_c, seg_w_c)
         if dk_blk is not None:
-            dk_blk[:, :, h0:h1, :] = dk_slab.view(group, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
+            dk_blk[:, :, h0:h1, :] = dk_slab[:_g].view(_g, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
         if dv_blk is not None:
-            dv_blk[:, :, h0:h1, :] = dv_slab.view(group, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
+            dv_blk[:, :, h0:h1, :] = dv_slab[:_g].view(_g, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
         if dk_sw is not None:
-            dk_sw[:, :, h0:h1, :] = dksw_slab.view(group, R, T, hd).permute(1, 2, 0, 3).to(dtype)
+            dk_sw[:, :, h0:h1, :] = dksw_slab[:_g].view(_g, R, T, hd).permute(1, 2, 0, 3).to(dtype)
         if dv_sw is not None:
-            dv_sw[:, :, h0:h1, :] = dvsw_slab.view(group, R, T, hd).permute(1, 2, 0, 3).to(dtype)
+            dv_sw[:, :, h0:h1, :] = dvsw_slab[:_g].view(_g, R, T, hd).permute(1, 2, 0, 3).to(dtype)
     return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)
 
 

@@ -1507,7 +1507,8 @@ def t_combined_seed_doc_uncertainty():
     per_seed_lp = []
     for off in (0.0, 0.2, 0.4):
         nll = [1.0 + off + 0.01 * j for j in range(32)]
-        per_seed_lp.append(math.log(sum(nll) / (32 * 50)))
+        # NLL/tokens is already log-PPL; the log must not be applied twice.
+        per_seed_lp.append(sum(nll) / (32 * 50))
     _se_seed = _np.std(per_seed_lp, ddof=1) / math.sqrt(3)
     assert abs(r['se_seed_logppl'] - float(_se_seed)) < 1e-12, (r, _se_seed)
     assert r['se_doc_logppl'] is not None and r['se_doc_logppl'] > 0, r
@@ -1516,6 +1517,10 @@ def t_combined_seed_doc_uncertainty():
     assert abs(r['component_ratio_seed_over_doc'] - r['se_seed_logppl'] / r['se_doc_logppl']) < 1e-12, r
     lo, hi = r['ci95_ppl']
     assert 0 < lo < hi, r
+    # Center must be the PPL scale, not exp(log(CE)).
+    _center = math.exp(float(_np.mean(per_seed_lp)))
+    assert lo < _center < hi, (r, _center)
+    assert lo > 1.0, ('a valid PPL interval cannot sit below 1.0', r)
     # The combined interval is never NARROWER than the seed-only t interval.
     tc = L._t_critical(0.95, 2)
     seed_only = (math.exp(_np.mean(per_seed_lp) - tc * _se_seed),
@@ -4145,6 +4150,131 @@ def t_scale_point_provenance_roundtrip():
     assert pts[2]['corpus_fp'] is None, pts
 
 
+def t_holm_mixed_n_and_invalid_family_size():
+    # A mixed-n family is capable of a significant result through its
+    # best-powered member; the family floor must use max(n), not min(n).
+    comps = {'A': {'p_exact_signflip': 0.02, 'n': 6},
+             'B': {'p_exact_signflip': 0.0005, 'n': 12}}
+    fam = L.attach_holm(comps, family='mixed n')
+    assert fam['family_resolution_limited'] is False, fam
+    assert abs(fam['family_min_attainable_p_holm'] - 0.0009765625) < 1e-15, fam
+    # An omitted high-n row cannot carry the family: only tested rows count.
+    om = {'A': {'p_exact_signflip': 0.02, 'n': 6},
+          'B': {'omitted': 'no measurement', 'n': 12}}
+    fam_om = L.attach_holm(om, family='omitted high n')
+    assert fam_om['family_resolution_limited'] is True, fam_om
+    # An unmeasurable p still occupies its declared family slot; dropping it
+    # would shrink m and make the remaining p anti-conservatively small.
+    h = L.holm_adjust([('a', 0.04), ('b', float('nan'))], alpha=0.05)
+    assert abs(h['a']['p_holm'] - 0.08) < 1e-15, h
+    assert h['a']['reject'] is False and h['a']['m_effective'] == 2, h
+    assert h['b']['p_holm'] is None and h['b']['m_effective'] == 2, h
+
+
+def t_meta_prediction_interval_df():
+    pts = [{'label': f'S{i}', 'scale': i + 1,
+            'effects': [0.1 + 0.02 * i, 0.2 + 0.02 * i, 0.3 + 0.02 * i],
+            'seeds': [0, 1, 2]} for i in range(3)]
+    m = L.meta_analyze_effects(pts)
+    assert m['status'] == 'ok' and m['prediction_interval'] is not None, m
+    lo, hi = m['prediction_interval']
+    clo, chi = m['random_effects']['ci']
+    # Prediction interval for a new scale is wider than the mean CI.
+    assert lo < clo and hi > chi, m
+    # Two usable scales cannot estimate both variance components.
+    m2 = L.meta_analyze_effects(pts[:2])
+    assert m2['status'] == 'ok' and m2['prediction_interval'] is None, m2
+
+
+def t_tost_conf_controls_decision():
+    d = [0.054382, 0.064971, 0.075123, 0.086877, 0.097029, 0.107618]
+    r90 = L.tost_paired(d, margin=0.1, conf=0.90)
+    assert r90['equivalent'] is True and r90['ci_within_margin'] is True, r90
+    r95 = L.tost_paired(d, margin=0.1, conf=0.95)
+    assert r95['equivalent'] is False, r95
+    assert r95['ci_within_margin'] is False, r95
+    assert abs(r95['alpha_one_sided'] - 0.025) < 1e-15, r95
+
+
+def t_data_quality_exact_integer_and_complex_rows():
+    # float64 has 53 bits of mantissa; distinct int64 rows above 2**53 must
+    # not be reported as exact duplicates.
+    big = np.array([[2 ** 53], [2 ** 53 + 1]], dtype=np.int64)
+    assert L.duplicate_mask(big).tolist() == [False, False]
+    rep = L.data_quality_report(big, train_idx=[0], val_idx=[1])
+    assert rep['checks']['duplicate_rows_across_splits']['train__val'] == 0, rep
+    cleaned = L.clean_training_rows(big, train_idx=[0, 1])
+    assert cleaned['n_duplicate_rows_dropped'] == 0 and cleaned['n_train_rows_out'] == 2, cleaned
+    # Complex rows were previously cast to float64 (dropping the imaginary
+    # part); reject them instead of manufacturing duplicates.
+    try:
+        L.duplicate_mask(np.array([1 + 2j, 1 + 3j]))
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('complex duplicate detection must be rejected')
+
+
+def t_batch_iter_minimal_corpus():
+    import torch as _torch
+    it = L.batch_iter(np.arange(8, dtype=np.int64), 7, 1, _torch.device('cpu'), seed=0)
+    x, y = next(it)
+    assert x.shape == (1, 7) and y.shape == (1, 7), (x.shape, y.shape)
+    assert x[0, 0].item() == 0 and y[0, -1].item() == 7, (x, y)
+    try:
+        next(L.batch_iter(np.arange(7, dtype=np.int64), 7, 1, _torch.device('cpu')))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a corpus shorter than seq_len+1 must be rejected')
+
+
+def t_indexer_invalid_soft_lanes_are_zero():
+    import torch as _torch
+    n, B, nIH, hd, d = 2, 2, 2, 2, 4
+    H = _torch.zeros(n, d)
+    comp = _torch.zeros(B, d)
+    W_DQ = _torch.zeros(d, nIH * hd)
+    W_DK = _torch.zeros(d, nIH * hd)
+    W_w = _torch.zeros(nIH, d)
+    last_tok = _torch.tensor([-1, 0], dtype=_torch.long)
+    box = []
+    _m, _idx, soft = L.lightning_indexer(
+        H, comp, last_tok, W_DQ, W_DK, W_w, nIH, 2,
+        return_mask=False, out_valid=box, need_soft=True)
+    valid = box[0]
+    assert valid[0].tolist() == [True, False], valid
+    assert float(soft[~valid].abs().max()) == 0.0, (soft, valid)
+
+
+def t_attention_backward_partial_head_group():
+    import torch as _torch
+    import csa_kernels as _C
+    old = os.environ.get('CSA_ATTN_GRAD_SLAB_MB')
+    os.environ['CSA_ATTN_GRAD_SLAB_MB'] = '1'
+    try:
+        R, T, nh, hd = 1, 4, 5, 64
+        Bm, nb, w = 1000, 2, 1
+        q = _torch.randn(R, T, nh, hd, requires_grad=True)
+        k_blk = _torch.randn(R, Bm, nh, hd, requires_grad=True)
+        v_blk = _torch.randn(R, Bm, nh, hd, requires_grad=True)
+        k_sw = _torch.randn(R, T, nh, hd, requires_grad=True)
+        v_sw = _torch.randn(R, T, nh, hd, requires_grad=True)
+        dO = _torch.randn(R, T, nh, hd)
+        topk_idx = _torch.tensor([[[0, 1], [0, 1], [0, 1], [0, 1]]], dtype=_torch.long)
+        last_tok = _torch.full((R, Bm), -1, dtype=_torch.long)
+        out = _C._attn_bwd_ref(
+            q, k_blk, v_blk, k_sw, v_sw, topk_idx, None, last_tok,
+            None, None, w, float(hd) ** -0.5, dO,
+            True, True, True, True, True, False, False)
+        assert len(out) == 7 and out[1].shape == (R, Bm, nh, hd), out
+    finally:
+        if old is None:
+            os.environ.pop('CSA_ATTN_GRAD_SLAB_MB', None)
+        else:
+            os.environ['CSA_ATTN_GRAD_SLAB_MB'] = old
+
+
 def t_stats_accept_numpy_scalars():
     # Public numeric helpers are routinely fed NumPy arrays/scalars.  An:
     # isinstance(int, float) filter would drop every np.int64 / np.float32
@@ -4572,6 +4702,13 @@ def main():
     _check('L14 combined seed x document uncertainty interval', t_combined_seed_doc_uncertainty)
     _check('L15 cross-scale pooling refuses mixed corpus/tokenizer bindings', t_scale_corpus_binding_refuses_mixed_tokenizers)
     _check('L15b scale-point corpus provenance roundtrip', t_scale_point_provenance_roundtrip)
+    _check('L16 Holm mixed-n floor + invalid family slot', t_holm_mixed_n_and_invalid_family_size)
+    _check('L16b meta-analysis prediction-interval df', t_meta_prediction_interval_df)
+    _check('L17 TOST decision follows conf', t_tost_conf_controls_decision)
+    _check('L18 exact duplicates keep int precision / reject complex', t_data_quality_exact_integer_and_complex_rows)
+    _check('L19 batch_iter minimal corpus', t_batch_iter_minimal_corpus)
+    _check('L20 indexer invalid soft lanes are zero', t_indexer_invalid_soft_lanes_are_zero)
+    _check('L21 attention backward partial head group', t_attention_backward_partial_head_group)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

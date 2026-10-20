@@ -3546,8 +3546,14 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         # same story (its backward saves the output, as the out-of-place form).
         # nan_to_num 必须出位：exp_ 的反向保存其输出张量，原地 nan_to_num_ 会
         # 改写该保存值、使 ExpBackward 的版本检查失败（反向报错）。
-        soft[s:e] = _safe_nan_to_num(c.gather(1, _ic.long()).sub_(_lse).exp_(), where='indexer_softmax')
-        del c, _lse, _ic, _ccausal, _nccausal
+        _soft_g = _safe_nan_to_num(c.gather(1, _ic.long()).sub_(_lse).exp_(), where='indexer_softmax')
+        # Padded/invalid selection lanes carry block id 0 as a transport pad,
+        # not as a selected block.  The kernel reference and the open-prefix
+        # twin already zero those lanes; leaving exp(score) there gives a
+        # non-zero prior to callers that consume soft without sel_valid.
+        _soft_g = torch.where(_box[0], _soft_g, torch.zeros((), dtype=_soft_g.dtype, device=_soft_g.device))
+        soft[s:e] = _soft_g
+        del c, _lse, _ic, _ccausal, _nccausal, _soft_g
     if _valid_parts is not None:
         out_valid[:] = [_valid_parts[0] if len(_valid_parts) == 1 else torch.cat(_valid_parts, 0)]
     m = None
@@ -7410,8 +7416,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         print(f'[data] val sequences = {n_val} (seq_len={seq_len}, contiguous holdout after the train region)')
         if n_val == 0:
             raise RuntimeError('load_fineweb_edu: the corpus ran dry before a single validation sequence was filled — raise n_train_tokens or provide a larger source')
-        if n_train <= seq_len + 1:
-            raise RuntimeError(f'load_fineweb_edu: only {n_train} train tokens available (need > seq_len+1 = {seq_len + 1}) — the source is too small for the requested cap')
+        if n_train < seq_len + 1:
+            raise RuntimeError(f'load_fineweb_edu: only {n_train} train tokens available (need >= seq_len+1 = {seq_len + 1}) — the source is too small for the requested cap')
 
         def _finalise_npy(raw_path, dst_path, count):
             # Write through a unique same-directory temp file, then replace
@@ -8083,9 +8089,11 @@ def _ids_narrow(train_ids):
 
 def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     rng = np.random.default_rng(seed)
+    # A corpus of exactly seq_len+1 tokens still contains one causal window
+    # (start=0), so only a shortfall is invalid.
     n = len(train_ids) - seq_len - 1
-    if n <= 0:
-        raise ValueError(f'batch_iter needs len(train_ids) > seq_len+1 to sample causal windows, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
+    if n < 0:
+        raise ValueError(f'batch_iter needs len(train_ids) >= seq_len+1 to sample causal windows, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
     train_ids = np.asarray(train_ids)
     _narrow = _ids_narrow(train_ids)
     _devkey = _dev_str(device)
@@ -8604,8 +8612,9 @@ def by_len_cells(rows, Ln, variant=None):
 def holm_adjust(named_pvals, alpha=0.05):
     """Holm-Bonferroni step-down adjustment over a family of comparisons.
 
-    输入 [(name, p), ...]（NaN/越界的 p 记为无法校正并原样透传，不进入排序），
-    输出 {name: {'p_raw', 'p_holm', 'rank', 'reject', 'm_effective'}}。
+    输入 [(name, p), ...]（NaN/越界的 p 记为无法校正并原样透传，不进入排序，
+    但仍占用声明族的一个槽位——等价于按 p=1 处理，绝不因缺失 p 而缩小
+    校正族），输出 {name: {'p_raw', 'p_holm', 'rank', 'reject', 'm_effective'}}。
     family 的定义必须由调用方预先声明（预注册的族用冻结清单，探索性的族
     明示「未预注册」），本函数只做数学，不做族的选择——族的选择正是
     多重比较问题的来源（design_notes §4/§17）。"""
@@ -8629,13 +8638,19 @@ def holm_adjust(named_pvals, alpha=0.05):
             continue
         fam.append((sname, pv))
     out = dict(invalid)
-    m = len(fam)
+    # Invalid p-values cannot be ranked, but they still occupy a slot in the
+    # DECLARED family.  Treating them as p=1 (the same fail-closed convention
+    # as `attach_holm`) keeps the multipliers conservative instead of silently
+    # shrinking m and over-claiming the remaining comparisons.
+    m = len(fam) + len(invalid)
     order = sorted(fam, key=lambda kv: kv[1])
     prev = 0.0
     for i, (name, p) in enumerate(order):
         adj = min(1.0, (m - i) * p)
         prev = max(prev, adj)
         out[name] = {'p_raw': p, 'p_holm': float(prev), 'rank': i + 1, 'reject': bool(prev <= alpha), 'm_effective': m}
+    for name, rec in invalid.items():
+        rec['m_effective'] = m
     return out
 
 def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', exploratory=True):
@@ -8650,6 +8665,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     pre-registered confirmation (design_notes §17).
     """
     pairs, omitted, tested = [], [], 0
+    _tested_ns = []
     for k, v in (comparisons or {}).items():
         if not isinstance(v, dict):
             pairs.append((str(k), 1.0))
@@ -8672,6 +8688,12 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         if math.isfinite(p) and 0.0 <= p <= 1.0:
             pairs.append((str(k), p))
             tested += 1
+            try:
+                _tn = int(v.get('n'))
+            except (TypeError, ValueError, OverflowError):
+                _tn = 0
+            if _tn > 0:
+                _tested_ns.append(_tn)
         else:
             pairs.append((str(k), 1.0))
     h = holm_adjust(pairs, alpha=alpha) if pairs else {}
@@ -8679,10 +8701,10 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         if isinstance(v, dict):
             v['p_holm'] = (h.get(str(k)) or {}).get('p_holm')
     # Family-level resolution ceiling: with m declared slots and n seeds the
-    # smallest attainable Holm p is m * 2 / 2^n.  When that exceeds alpha the
-    # whole family is incapable of rejecting anything, no matter how large the
-    # effects are -- a diagnostic that must be printed next to p_holm=1.0
-    # instead of leaving the reader to infer that the effect is null.
+    # smallest attainable Holm p is m * 2 / 2^n.  The best chance any member
+    # has is at the LARGEST n in the family (the first Holm gate only needs one
+    # comparison), so using min(n) would falsely declare a mixed-n family
+    # impossible even when its best-powered member can pass.
     _ns = []
     for v in (comparisons or {}).values():
         if not isinstance(v, dict):
@@ -8694,10 +8716,13 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         if _n > 0:
             _ns.append(_n)
     _m = int(len(comparisons or {}))
-    _fam_floor = holm_min_attainable_p(min(_ns), _m, alpha) if _ns else None
+    # Only a tested, measurable comparison can pass the first Holm gate; an
+    # omitted or invalid row must not make the family look better powered.
+    _floor_ns = _tested_ns if _tested_ns else _ns
+    _fam_floor = holm_min_attainable_p(max(_floor_ns), _m, alpha) if _floor_ns else None
     _fam_limited = bool(_fam_floor is not None and math.isfinite(_fam_floor) and _fam_floor > alpha)
     if _fam_limited:
-        print(f'[stats] WARNING: family {family!r} has m={_m} declared comparisons and n_min={min(_ns)} seeds — '
+        print(f'[stats] WARNING: family {family!r} has m={_m} declared comparisons and n_max={max(_floor_ns)} seeds — '
               f'the smallest attainable Holm p is {_fam_floor:.4g} > alpha={alpha}; NO comparison in this family can be significant. '
               'That is a resolution ceiling, not a null result; report it as such and add seeds before interpreting p_holm=1.0')
     return {
@@ -9626,7 +9651,12 @@ def tost_paired(deltas, margin, conf=0.90):
     out['p_hi'] = float(p_hi)
     out['p_lo'] = float(p_lo)
     out['p_tost'] = float(max(p_hi, p_lo))
-    out['equivalent'] = bool(p_hi < 0.05 and p_lo < 0.05)
+    # TOST is two one-sided tests at alpha = (1 - conf)/2.  At the default
+    # conf=0.90 this is the conventional 0.05; a caller asking for 95% must
+    # not get a decision inconsistent with the CI it displays.
+    _alpha_one = (1.0 - float(conf)) / 2.0
+    out['alpha_one_sided'] = float(_alpha_one)
+    out['equivalent'] = bool(p_hi < _alpha_one and p_lo < _alpha_one)
     out['ci_within_margin'] = bool(out['ci'][0] > -margin and out['ci'][1] < margin)
     return out
 
@@ -9994,11 +10024,21 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     mu_re = float((ws * y).sum() / sws)
     se_re = float(math.sqrt(1.0 / sws))
     tc = _t_critical(1.0 - float(alpha), max(1, df))
+    # A prediction interval for a NEW scale point needs k-2 degrees of
+    # freedom (the two estimated variance components); reusing the k-1
+    # random-effects CI critical value makes it too narrow.  With fewer than
+    # three usable scales it is not defined.
+    _pi = None
+    if len(usable) >= 3:
+        _tc_pi = _t_critical(1.0 - float(alpha), len(usable) - 2)
+        if math.isfinite(_tc_pi):
+            _half = _tc_pi * math.sqrt(tau2 + se_re ** 2)
+            _pi = [mu_re - _half, mu_re + _half]
     out.update({'fixed_effect': {'mean': mu_fe, 'se': float(math.sqrt(1.0 / sw)), 'ci': [mu_fe - _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw), mu_fe + _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw)]},
                 'random_effects': {'mean': mu_re, 'se': se_re, 'ci': [mu_re - tc * se_re, mu_re + tc * se_re]},
                 'heterogeneity': {'Q': q, 'df': int(df), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
                                   'method': 'Cochran Q + DerSimonian-Laird tau^2'},
-                'prediction_interval': [mu_re - tc * math.sqrt(tau2 + se_re ** 2), mu_re + tc * math.sqrt(tau2 + se_re ** 2)],
+                'prediction_interval': _pi,
                 'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0 and (not math.isfinite(p_q) or p_q >= alpha)),
                 'note': 'poolable requires >=3 scales, I2<=50% and a non-significant Q; otherwise report per-scale effects only'})
     out['status'] = 'ok'
@@ -18328,7 +18368,9 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         per_tok = nll_mat.sum(axis=1) / np.maximum(ntok_mat.sum(axis=1), 1e-30)
         ok = np.isfinite(per_tok) & (per_tok > 0)
         if ok.sum() == S and S >= 2:
-            lp = np.log(per_tok)
+            # nll/tokens is already cross-entropy = log(PPL); do not log it a
+            # second time or the reported interval is not a PPL interval.
+            lp = per_tok
             seed_logppl = lp
             out['se_seed_logppl'] = float(lp.std(ddof=1) / math.sqrt(S))
             out['n_docs'] = int(nll_mat.shape[1])
@@ -18353,8 +18395,9 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
             nt = counts @ ntok_col
             nn = counts @ nll_col
             with np.errstate(divide='ignore', invalid='ignore'):
-                lp_draw = np.where(nt > 0, nn / np.maximum(nt, 1e-30), np.nan)
-                lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw > 0), np.log(np.where(np.isfinite(lp_draw) & (lp_draw > 0), lp_draw, 1.0)), np.nan)
+                # nn/nt is already the pooled log-PPL (CE) of the resample.
+                lp_draw = np.where((nt > 0) & np.isfinite(nn), nn / np.maximum(nt, 1e-30), np.nan)
+                lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw > 0), lp_draw, np.nan)
             draws[_b:_b + _nb] = lp_draw
             _b += _nb
         draws = draws[np.isfinite(draws)]
@@ -18389,8 +18432,8 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         tc = None
     if tc is not None and math.isfinite(tc):
         m = float(seed_logppl.mean())
-        out['ci95_ppl'] = [float(math.exp(m - tc * out['se_combined_logppl'])),
-                           float(math.exp(m + tc * out['se_combined_logppl']))]
+        out['ci95_ppl'] = [float(_safe_exp_ppl(m - tc * out['se_combined_logppl'])),
+                           float(_safe_exp_ppl(m + tc * out['se_combined_logppl']))]
         out['status'] = 'ok'
     else:
         out['status'] = 'ci_unavailable'

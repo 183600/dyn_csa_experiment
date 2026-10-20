@@ -1296,6 +1296,7 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
     Returns ``train_idx`` (the cleaned index array), the dropped rows and
     counts suitable for a run manifest.
     """
+    _raw_X = np.asarray(X)
     Xarr = _as_float_2d(X)
     n = int(Xarr.shape[0])
     train_rows = _validated_index(train_idx, name='train_idx')
@@ -1329,7 +1330,7 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         return lab is None or (isinstance(lab, tuple)
                                and all(v is None for v in lab))
 
-    keys = _row_keys(Xarr)
+    keys = _row_keys(_raw_X)
     clusters = {}
     for pos, row in enumerate(train_rows.tolist()):
         clusters.setdefault(keys[row], []).append(pos)
@@ -1501,8 +1502,27 @@ def _row_keys(X):
     if src.ndim > 2:
         raise ValueError(
             f'duplicate detection needs a 1-D or 2-D table, got shape {src.shape}')
+    if np.iscomplexobj(src):
+        raise TypeError(
+            'duplicate detection needs real-valued rows; casting complex rows '
+            'to float64 would silently discard the imaginary part')
     if src.ndim == 1:
         src = src.reshape(-1, 1)
+    # Integer/bool/datetime/timedelta rows are hashed in their own dtype.
+    # Converting them to float64 first collapses distinct int64 values above
+    # 2**53 (and nanosecond timestamps) into false duplicates.
+    if (np.issubdtype(src.dtype, np.integer) or src.dtype == np.bool_
+            or np.issubdtype(src.dtype, np.datetime64)
+            or np.issubdtype(src.dtype, np.timedelta64)):
+        _step = _hash_row_block(int(src.shape[1]), 1 << 16)
+        keys = []
+        for start in range(0, src.shape[0], _step):
+            arr = np.ascontiguousarray(src[start:start + _step])
+            for row_view in arr.view(np.uint8).reshape(arr.shape[0], -1):
+                h = hashlib.blake2b(digest_size=8)
+                h.update(memoryview(row_view))
+                keys.append(h.digest())
+        return keys
     keys = []
     # Hash row blocks; each block is converted to float64 before hashing.
     _step = _hash_row_block(int(src.shape[1]), 1 << 16)
@@ -1675,6 +1695,9 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         raise ValueError(
             f'shift_threshold must be a finite non-negative number, got '
             f'{shift_threshold!r}')
+    # Keep the caller's dtype for duplicate keys: the float64 view used by the
+    # statistics below cannot distinguish int64 values above 2**53.
+    _raw_X = np.asarray(X)
     X = _as_float_2d(X)
     n = X.shape[0]
     known = None
@@ -1760,9 +1783,10 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         else:
             warnings.append(_msg)
 
-    # Exact duplicates within each split.
+    # Exact duplicates within each split (keyed on the original dtype so
+    # large integers are not rounded through float64).
     dup = {}
-    keys = _row_keys(X)
+    keys = _row_keys(_raw_X)
     for name, rows in split_rows.items():
         sub = [keys[i] for i in rows]
         dup[name] = int(len(sub) - len(set(sub)))
