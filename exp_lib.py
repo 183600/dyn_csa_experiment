@@ -10099,6 +10099,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     （I² 低、Q 的 p>=alpha）且点数足够时才把 pooled 当作「共同效应」；
     否则 `poolable=False`，pooled 只作描述性摘要，结论必须按规模分开报。
     """
+    alpha = _validated_alpha(alpha, context='meta_analyze_effects alpha')
     pts = _scale_points(points)
     labels = [p['label'] for p in pts]
     if len(set(labels)) != len(labels):
@@ -10236,6 +10237,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
          并明确标注 `paired=False`（点间独立、不能利用配对降噪）。
     同时报告两点交互（最小 vs 最大规模）和异质性；异质性高时不得用单一
     斜率概括整个阶梯。"""
+    alpha = _validated_alpha(alpha, context='scaling_trend alpha')
     pts = _scale_points(points)
     pts = [p for p in pts if math.isfinite(p['scale']) and p['scale'] > 0.0 and p['effects']]
     pts.sort(key=lambda p: p['scale'])
@@ -10599,6 +10601,7 @@ def loglog_regression(points, *, alpha=0.05):
     t 区间与双侧 p；k=2 时直线是恒等拟合，只报斜率并显式标注「无残差
     自由度、无 R²」。x 本身的测量误差未计入（观测性拟合，不是因果估计）。
     """
+    alpha = _validated_alpha(alpha, context='loglog_regression alpha')
     rows = []
     for i, p in enumerate(points if points is not None else []):
         if isinstance(p, dict):
@@ -13351,6 +13354,7 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
     moved in the predicted direction.  Drivers call this BEFORE training so a
     3-seed panel is labelled descriptive up front instead of being read after
     the fact as a failed confirmation.  Pure function; never blocks a run."""
+    alpha = _validated_alpha(alpha, context='methodology_seed_plan alpha')
     if design is None:
         design = ABLATION_DESIGN
         if baselines is None:
@@ -13401,6 +13405,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
 
     Returns the report dict and, when `outdir` is given, writes
     `methodology_audit.json`."""
+    alpha = _validated_alpha(alpha, context='methodology_audit alpha')
     default_design = design is None
     design = ABLATION_DESIGN if design is None else design
     recs, amb = _variant_seed_map(summary)

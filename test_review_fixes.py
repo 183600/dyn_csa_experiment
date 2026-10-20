@@ -4098,11 +4098,18 @@ def t_reportable_claim_gate():
     assert r['n_input'] == 7 and r['n_dropped'] == 1, r
     # A threshold outside (0,1) must be rejected, not used to relabel every
     # p-value as significant (alpha=1.5) or unreachable (alpha=0).
+    _alpha_pts = [{'label': f'S{i}', 'scale': i + 1,
+                   'effects': [0.1, 0.2, 0.3], 'seeds': [0, 1, 2]}
+                  for i in range(3)]
     for _bad in (True, 0, 1, -0.1, 1.5, float('nan'), 'not-a-number'):
         for _fn in (lambda a: L.reportable_claim(base, alpha=a),
                     lambda a: L.paired_effect_stats([-1.0, -1.1, -0.9], alpha=a),
                     lambda a: L.holm_adjust([('x', 0.01)], alpha=a),
-                    lambda a: L.attach_holm({'x': {'n': 6, 'p_exact_signflip': 0.01}}, alpha=a)):
+                    lambda a: L.attach_holm({'x': {'n': 6, 'p_exact_signflip': 0.01}}, alpha=a),
+                    lambda a: L.meta_analyze_effects(_alpha_pts, alpha=a),
+                    lambda a: L.scaling_trend(_alpha_pts, alpha=a),
+                    lambda a: L.loglog_regression([(1, 1), (2, 4), (3, 9)], alpha=a),
+                    lambda a: L.methodology_seed_plan(6, alpha=a)):
             try:
                 _fn(_bad)
             except ValueError:
