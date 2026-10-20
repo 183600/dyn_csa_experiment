@@ -4717,6 +4717,43 @@ def t_data_quality_report():
     assert rep4['status'] == 'fail'
 
 
+def t_data_quality_target_outliers():
+    # The target fence is learned from training labels only; a holdout target
+    # cannot widen it.  This catches label corruption that exact-duplicate
+    # checks cannot see.
+    X = np.arange(12, dtype=float).reshape(6, 2)
+    y = [0.0, 1.0, 2.0, 3.0, 100.0, 2.0]
+    rep = L.data_quality_report(X, y=y, train_idx=[0, 1, 2, 3],
+                                val_idx=[4], test_idx=[5],
+                                target_outlier_z=1.5)
+    assert rep['status'] == 'warnings', rep
+    assert rep['checks']['target_outliers_by_split']['val'] == 1, rep
+    assert rep['checks']['target_outliers_by_split']['train'] == 0, rep
+    hard = L.data_quality_report(X, y=y, train_idx=[0, 1, 2, 3],
+                                 val_idx=[4], test_idx=[5],
+                                 fail_on_target_outliers=True)
+    assert hard['status'] == 'fail', hard
+    # A training target outside its own train-only fence is also visible.
+    rep_tr = L.data_quality_report(X, y=[0.0, 1.0, 2.0, 100.0, 1.0, 2.0],
+                                   train_idx=[0, 1, 2, 3],
+                                   val_idx=[4], test_idx=[5],
+                                   target_outlier_z=1.5)
+    assert rep_tr['checks']['target_outliers_by_split']['train'] == 1, rep_tr
+    # Categorical labels are not coerced into a numeric target.
+    cat = L.data_quality_report(X, y=['a', 'b', 'c', 'd', 'a', 'b'],
+                                train_idx=[0, 1, 2, 3], val_idx=[4],
+                                test_idx=[5], target_outlier_z=1.5)
+    assert cat['checks']['target_outlier_fence'] is None, cat
+    for bad in (0, -1, float('nan'), float('inf'), True):
+        try:
+            L.data_quality_report(X, y=y, train_idx=[0, 1],
+                                  target_outlier_z=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'target_outlier_z={bad!r} must be refused')
+
+
 def t_split_sizes_explicit_never_negative():
     # Explicit sizes and fractional targets can overdraw the remaining rows; the
     # filler must clamp rather than emit a negative split.
@@ -8479,6 +8516,7 @@ def main():
     _check('I3b imputation fill is identical in fit and transform', t_preprocessor_fill_is_consistent)
     _check('I3c leakage checks validate time/group inputs', t_leakage_checks_validate_inputs)
     _check('I4 data-quality/leakage report', t_data_quality_report)
+    _check('I4c train-only regression-target outlier audit', t_data_quality_target_outliers)
     _check('I4b data-quality report checks split index disjointness', t_data_quality_report_index_disjointness)
     _check('I5a categorical shift handles an empty reference', t_categorical_shift_empty_reference)
     _check('I5 categorical shift + cache guards', t_categorical_and_cache_guards)

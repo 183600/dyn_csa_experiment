@@ -2094,7 +2094,8 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                         fail_on_label_shift=False,
                         fail_on_unknown_labels=False,
                         fail_on_duplicate_rows=False, fail_on_outliers=False,
-                        fail_on_shift=False):
+                        fail_on_shift=False, target_outlier_z=None,
+                        fail_on_target_outliers=False):
     """Report the common data-cleaning failure modes before any fit.
 
     ``train_idx`` identifies the training rows.  All outlier and shift
@@ -2124,7 +2125,10 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     train→validation/test categorical label shift (Jensen-Shannon).  Non-finite
     labels and label shift are warnings by default; ``fail_on_nonfinite_labels``
     and ``fail_on_label_shift`` turn them into hard failures.  The training
-    labels are the only reference distribution.
+    labels are the only reference distribution.  ``target_outlier_z`` enables a
+    regression-target outlier audit whose fence is also learned from the
+    training rows only (``fail_on_target_outliers`` enables the audit with
+    ``clip_z`` and makes any flagged target a hard failure).
 
     ``known_labels`` optionally declares the admissible label set (a typo or a
     label seen only in a holdout is then reported per split).
@@ -2154,6 +2158,23 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         raise ValueError(
             f'shift_threshold must be a finite non-negative number, got '
             f'{shift_threshold!r}')
+    if fail_on_target_outliers and target_outlier_z is None:
+        target_outlier_z = clip_z
+    if target_outlier_z is not None:
+        if isinstance(target_outlier_z, (bool, np.bool_)):
+            raise ValueError(
+                f'target_outlier_z must be a positive finite number or None, '
+                f'got {target_outlier_z!r}')
+        try:
+            target_outlier_z = float(target_outlier_z)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'target_outlier_z must be a positive finite number or None, '
+                f'got {target_outlier_z!r}') from None
+        if not (math.isfinite(target_outlier_z) and target_outlier_z > 0.0):
+            raise ValueError(
+                f'target_outlier_z must be a positive finite number or None, '
+                f'got {target_outlier_z!r}')
     # Keep the caller's dtype for duplicate keys: the float64 view used by the
     # statistics below cannot distinguish int64 values above 2**53.
     _raw_X = np.asarray(X)
@@ -2438,6 +2459,57 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 else:
                     warnings.append(_msg)
         checks['label_distribution_shift_vs_train'] = label_shift
+
+        if target_outlier_z is not None:
+            # Regression-target outliers, with the fence learned from the
+            # training labels only.  Non-numeric labels (class names) are not
+            # treated as numbers, so a categorical target is skipped rather
+            # than being coerced through float().
+            def _numeric_target(value):
+                if value is None or isinstance(value, (bool, np.bool_)):
+                    return None
+                if isinstance(value, (complex, np.complexfloating)):
+                    return None
+                if not isinstance(value, numbers.Number):
+                    return None
+                try:
+                    f = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                return f if math.isfinite(f) else None
+
+            _train_t = [_numeric_target(labels[i]) for i in
+                        np.asarray(ref, dtype=np.int64).reshape(-1).tolist()]
+            _train_t = [v for v in _train_t if v is not None]
+            target_outliers = {name: 0 for name in SPLIT_NAMES}
+            target_fence = None
+            if len(_train_t) >= 2:
+                q1, q3 = np.quantile(_train_t, (0.25, 0.75))
+                iqr = float(q3 - q1)
+                if iqr <= _EPS:
+                    lo, hi = float(min(_train_t)), float(max(_train_t))
+                else:
+                    lo = float(q1 - target_outlier_z * iqr)
+                    hi = float(q3 + target_outlier_z * iqr)
+                target_fence = {'lo': lo, 'hi': hi,
+                                'z': float(target_outlier_z),
+                                'n_train_reference': int(len(_train_t))}
+                for name, rows in split_rows.items():
+                    for i in np.asarray(rows, dtype=np.int64).reshape(-1).tolist():
+                        v = _numeric_target(labels[i])
+                        if v is not None and (v < lo or v > hi):
+                            target_outliers[name] += 1
+            checks['target_outliers_by_split'] = target_outliers
+            checks['target_outlier_fence'] = target_fence
+            _n_target_out = sum(target_outliers.values())
+            if _n_target_out:
+                _msg = (f'{_n_target_out} target value(s) fall outside the '
+                        f'train-only target fence {target_fence}: '
+                        f'{target_outliers}')
+                if fail_on_target_outliers:
+                    hard_failures.append(_msg)
+                else:
+                    warnings.append(_msg)
 
     # Outliers, using training quantiles/IQR only.
     Xt = X[ref]
