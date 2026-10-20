@@ -2628,6 +2628,159 @@ def t_baseline_driver_refuses_overlapping_final_seeds():
         raise AssertionError('overlapping search/final seeds were not refused')
 
 
+def t_nested_validation_row_split_and_subset_ppl():
+    sel, ev, meta = L.validation_row_split(17, seed=123, n_folds=2,
+                                           selection_fold=0, evaluation_fold=1)
+    assert sorted(sel + ev) == list(range(17)), (sel, ev)
+    assert not (set(sel) & set(ev)), (sel, ev)
+    assert meta['disjoint'] is True and meta['covers_all_rows'] is True, meta
+    assert meta['n_selection_rows'] + meta['n_evaluation_rows'] == 17, meta
+    # Deterministic across calls and independent of the row order in which
+    # the same physical rows are presented (indices are the identity).
+    sel2, ev2, meta2 = L.validation_row_split(17, seed=123)
+    assert (sel, ev, meta) == (sel2, ev2, meta2), 'row split must be deterministic'
+    # A different seed must actually move rows (not silently ignore the seed).
+    sel3, ev3, _ = L.validation_row_split(17, seed=124)
+    assert (sel3, ev3) != (sel, ev), 'row-split seed did not change the folds'
+    rec = {'nll_per_row': [1.0, 2.0, 3.0, 4.0],
+           'n_tokens_per_row': [10, 10, 10, 10]}
+    st = L.record_subset_ppl(rec, [1, 3])
+    assert st['n_tokens'] == 20 and abs(st['nll'] - 0.3) < 1e-12, st
+    assert abs(st['ppl'] - math.exp(0.3)) < 1e-12, st
+    # Missing accounting or out-of-range rows are unverifiable, not silently
+    # substituted with the full-validation number.
+    assert L.record_subset_ppl({'ppl': 9.0}, [0]) is None
+    assert L.record_subset_ppl(rec, [99]) is None
+    assert L.record_subset_ppl(rec, []) is None
+    try:
+        L.validation_row_split(1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a one-row validation slice cannot be split')
+
+
+def t_nested_tuning_artifact_audit():
+    trials = [{'lr': 1e-4, 'weight_decay': 0.1, 'warmup': 5},
+              {'lr': 3e-4, 'weight_decay': 0.1, 'warmup': 5}]
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['a'], trials=trials,
+                    search_seeds=[100, 101, 102],
+                    final_seeds=[0, 1, 2, 3, 4, 5, 6, 7],
+                    inherits_tuning={})
+    protocol.pop('arm_groups', None)
+
+    def _row(cfg, nlls):
+        seed_ppls = {str(s): math.exp(v / 100.0)
+                     for s, v in zip(protocol['search_seeds'], nlls)}
+        nll_sum = float(sum(nlls))
+        n_tok = 100 * len(nlls)
+        ppl = math.exp(nll_sum / n_tok)
+        return {'config': dict(cfg), 'ppl': ppl,
+                'ppl_std': float(np.std(list(seed_ppls.values()), ddof=1)),
+                'ppl_aggregation': 'pooled_token_nll',
+                'nll_sum': nll_sum, 'n_tokens': n_tok,
+                'seed_ppls': seed_ppls,
+                'seed_nll_sum': {str(s): float(v) for s, v in
+                                 zip(protocol['search_seeds'], nlls)},
+                'seed_n_tokens': {str(s): 100 for s in protocol['search_seeds']},
+                'seeds': list(protocol['search_seeds']),
+                'steps': 10, 'tokens_seen': 1000,
+                'selection_row_split_applied': True,
+                'selection_row_fp': 'SELFP', 'evaluation_row_fp': 'EVALFP'}
+
+    rows = [_row(trials[0], [100, 101, 99]), _row(trials[1], [110, 111, 109])]
+    best = min(rows, key=lambda r: r['ppl'])
+    art = {'selection_metric': 'ppl', 'selection_split': 'validation',
+           'direction': 'lower_is_better', 'search_seeds': [100, 101, 102],
+           'final_seeds': protocol['final_seeds'],
+           'selection_row_split': {'applied': True, 'disjoint': True,
+                                   'covers_all_rows': True,
+                                   'selection_row_fp': 'SELFP',
+                                   'evaluation_row_fp': 'EVALFP',
+                                   'n_selection_rows': 8, 'n_evaluation_rows': 8},
+           'arms': {'a': {'trials': rows, 'selected': dict(best['config']),
+                          'selected_metric_value': best['ppl']}},
+           'final_records': {
+               f'a::seed{s}': {'seed': s, 'variant': 'a', 'ppl': 5.0,
+                               'ppl_holdout': 5.1, 'holdout_row_fp': 'EVALFP',
+                               'params': 100, 'train_knobs': L.training_knobs(),
+                               'hyperparams': dict(best['config'])}
+               for s in protocol['final_seeds']}}
+    ok = L.baseline_tuning_audit(art, protocol=protocol)
+    assert ok['tuning_verified'] is True, ok
+    assert ok['selection_row_split_applied'] is True and ok['nested_final_evaluation'] is True, ok
+    # A claimed nested run without held-out final rows is refused: the tuned
+    # contrast would otherwise fall back to the selection documents.
+    bad = json.loads(json.dumps(art))
+    del bad['final_records']['a::seed0']['ppl_holdout']
+    rb = L.baseline_tuning_audit(bad, protocol=protocol)
+    assert rb['tuning_verified'] is False, rb
+    assert any('held-out-row PPL' in p for p in rb['problems']), rb
+    # A final record scored on the wrong row fold is refused too.
+    bad2 = json.loads(json.dumps(art))
+    bad2['final_records']['a::seed0']['holdout_row_fp'] = 'OTHER'
+    rb2 = L.baseline_tuning_audit(bad2, protocol=protocol)
+    assert rb2['tuning_verified'] is False and any('different held-out' in p for p in rb2['problems']), rb2
+    # A search trial selected on different rows than declared is refused.
+    bad3 = json.loads(json.dumps(art))
+    bad3['arms']['a']['trials'][0]['selection_row_fp'] = 'OTHER'
+    rb3 = L.baseline_tuning_audit(bad3, protocol=protocol)
+    assert rb3['tuning_verified'] is False and any('selected on different rows' in p for p in rb3['problems']), rb3
+
+
+def t_nested_final_uses_holdout_rows():
+    base = dict(L.RUN, d=8, n_layers=1, n_heads=1, d_head=8, seq_len=8,
+                batch_size=1, n_train_tokens=32, steps=3, warmup=1)
+    trials = [{'lr': 1e-4, 'weight_decay': 0.1, 'warmup': 1}]
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['a', 'b'], trials=trials,
+                    search_seeds=[100, 101, 102], final_seeds=[0, 1, 2, 3],
+                    inherits_tuning={}, method_arm='a')
+    protocol.pop('arm_groups', None)
+    out = tempfile.mkdtemp(prefix='nested_final_')
+    selected = {a: {'selected': dict(trials[0]), 'trials': [{}],
+                    'selected_metric_value': 1.0} for a in ('a', 'b')}
+    L.atomic_write_json(os.path.join(out, 'baseline_tuning.json'),
+                        {'arms': selected, 'protocol': protocol})
+    orig_run, orig_wm, orig_ev = L.run, L.write_run_manifest, L.log_experiment_event
+    _, ev, _ = L.validation_row_split(8)
+
+    def fake_run(cfg, seeds=None, guard=None, label=None, **kw):
+        os.makedirs(cfg['outdir'], exist_ok=True)
+        summary = {}
+        for v in cfg['variants']:
+            for sd in seeds:
+                base_nll = 1.0 if v == 'a' else 2.0
+                rows = [base_nll + (0.5 if i in ev else 0.0) for i in range(8)]
+                summary[f'{v}::seed{sd}'] = {
+                    'variant': v, 'seed': int(sd),
+                    'ppl': float(np.exp(np.mean(rows))),
+                    'nll_sum': float(sum(rows)), 'n_tokens': 8,
+                    'nll_per_row': rows, 'n_tokens_per_row': [1] * 8,
+                    'steps': cfg['steps'],
+                    'tokens_seen': cfg['steps'] * cfg['batch_size'] * cfg['seq_len'],
+                    'params': 100, 'run_cfg': 'same', 'data_fp': 'd', 'val_fp': 'v',
+                    'train_knobs': L.training_knobs(),
+                    'hyperparams': {'lr': cfg['lr'], 'weight_decay': cfg['weight_decay'],
+                                    'warmup': cfg['warmup']}}
+        with open(os.path.join(cfg['outdir'], 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(summary, f)
+
+    L.run, L.write_run_manifest, L.log_experiment_event = fake_run, (lambda *a, **k: None), (lambda *a, **k: None)
+    try:
+        BT._run_final(base, out, protocol, selected)
+    finally:
+        L.run, L.write_run_manifest, L.log_experiment_event = orig_run, orig_wm, orig_ev
+        comp_path = os.path.join(out, 'final', 'tuned_comparison.json')
+        comp = json.load(open(comp_path, encoding='utf-8'))
+        shutil.rmtree(out, ignore_errors=True)
+    assert comp['estimation_rows'] == 'nested_validation_holdout', comp
+    # Holdout rows all carry the +0.5 shift, so the expected held-out delta is
+    # exp(1.5)-exp(2.5), NOT the full-validation mean difference.
+    expect = math.exp(1.5) - math.exp(2.5)
+    assert abs(comp['contrasts']['a - b']['mean'] - expect) < 1e-12, comp['contrasts']
+    assert comp['final_evaluation_rows']['applied'] is True, comp['final_evaluation_rows']
+
+
 def t_baseline_tuning_driver_multiseed_selection():
     out = tempfile.mkdtemp(prefix='tune_multiseed_')
     trials = [{'lr': 1e-4, 'weight_decay': 0.1, 'warmup': 2},
@@ -2721,6 +2874,38 @@ def t_simple_baseline_ngram_and_audit():
     assert abs(uni['nll'] - zero['nll']) < 1e-12 and abs(uni['ppl'] - zero['ppl']) < 1e-9, (uni, zero)
 
 
+def t_simple_baseline_fit_budget_is_bounded_and_disclosed():
+    rng = np.random.default_rng(11)
+    vocab = 16
+    train = rng.integers(0, vocab, size=400)
+    val = rng.integers(0, vocab, size=(3, 12))
+    proto = dict(L.SIMPLE_BASELINE_POLICY,
+                 arms={'unigram': {'order': 1}, 'bigram': {'order': 2}},
+                 grids={'unigram': {'alpha': [0.1]},
+                        'bigram': {'alpha': [0.1], 'interpolation': [0.5]}},
+                 max_fit_tokens=100)
+    art = L.simple_baseline_fit(train, val, vocab, protocol=proto)
+    assert art['data']['n_fit_tokens'] == 100, art['data']
+    assert art['data']['n_source_tokens'] == train.size, art['data']
+    assert art['data']['fit_truncated'] is True, art['data']
+    assert art['data']['train_fp'] == L._ids_fp(np.asarray(train[:100])), art['data']
+    assert art['data']['source_train_fp'] == L._ids_fp(train), art['data']
+    audit = L.simple_baseline_audit(art, protocol=proto)
+    assert audit['baseline_verified'] is True, audit
+    assert any('deterministic prefix' in w for w in audit['warnings']), audit
+    # Tokens beyond the declared fit prefix must not change the floor.
+    train2 = train.copy()
+    train2[100:] = (train2[100:] + 1) % vocab
+    art2 = L.simple_baseline_fit(train2, val, vocab, protocol=proto)
+    assert abs(float(art2['best_ppl']) - float(art['best_ppl'])) < 1e-12, (art['best_ppl'], art2['best_ppl'])
+    assert art2['data']['source_train_fp'] != art['data']['source_train_fp'], art2['data']
+    # A truncated claim with contradictory counts is not accepted.
+    bad = json.loads(json.dumps(art))
+    bad['data']['n_fit_tokens'] = bad['data']['n_source_tokens']
+    rbad = L.simple_baseline_audit(bad, protocol=proto)
+    assert rbad['baseline_verified'] is False, rbad
+
+
 def t_simple_baseline_driver_serves_the_panel_corpus():
     # `run_simple` must go through load_run_corpus (the panel's dataset) and
     # fingerprint the validation slice.
@@ -2804,6 +2989,23 @@ def t_classification_positive_label_and_rare_floor():
     m3 = L.classification_metrics(y0, y_pred=pred, labels=[0, 1, 2])
     assert abs(m3['f1_macro'] - (2.0 / 3.0 / 3.0)) < 1e-12, m3
     assert m3['f1_primary_average'] == 'macro'
+    # A declared label set must cover observed classes.  Silently ignoring an
+    # undeclared predicted class would make micro/macro F1 describe a
+    # different label space than the caller declared.
+    try:
+        L.classification_metrics(np.array([0, 1, 1]),
+                                 y_pred=np.array([0, 1, 2]), labels=[0, 1])
+    except ValueError as e:
+        assert 'not in the declared labels' in str(e), e
+    else:
+        raise AssertionError('an undeclared predicted class was silently ignored')
+    try:
+        L.classification_metrics(np.array([0, 2]),
+                                 y_pred=np.array([0, 2]), labels=[0, 1])
+    except ValueError as e:
+        assert 'not in the declared labels' in str(e), e
+    else:
+        raise AssertionError('an undeclared true class was silently ignored')
     # Record-level policy: F1 without averaging, and rare ROC-AUC without
     # PR-AUC/prevalence, must warn.
     bad = {'r::seed0': {'variant': 'r', 'task': 'binary_classification', 'f1': 0.4,
@@ -4628,7 +4830,11 @@ def main():
     _check('H3f leave-one-seed-out tuning-selection stability', t_tuning_selection_stability_audit)
     _check('H3g tuned claim requires the panel to run the selected config', t_methodology_audit_requires_panel_to_use_tuned_config)
     _check('H3e tuning driver refuses overlapping search/final seeds', t_baseline_driver_refuses_overlapping_final_seeds)
+    _check('H3h nested validation row split + per-row pooled PPL', t_nested_validation_row_split_and_subset_ppl)
+    _check('H3i tuning audit verifies nested selection/holdout rows', t_nested_tuning_artifact_audit)
+    _check('H3j final tuned contrast is measured on held-out rows', t_nested_final_uses_holdout_rows)
     _check('H4 tuned count-model floor + audit', t_simple_baseline_ngram_and_audit)
+    _check('H4a count-model fit budget is bounded + disclosed', t_simple_baseline_fit_budget_is_bounded_and_disclosed)
     _check('H5 positive-label / rare-positive PR-AUC / macro-F1 averaging', t_classification_positive_label_and_rare_floor)
     _check('H6 hypothesis completeness + metric alignment + direction=0', t_hypothesis_audit_completeness_and_metric_alignment)
     _check('H7 simple-baseline driver uses the panel corpus', t_simple_baseline_driver_serves_the_panel_corpus)

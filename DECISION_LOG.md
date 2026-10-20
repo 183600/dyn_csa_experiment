@@ -139,3 +139,23 @@ The frozen confirmation manifest (`confirmation_frozen.json`, manifest v3)
 and its power table were not changed; no test split was read.  The per-issue
 table is `REVIEW_4_RESPONSE.md`, and the statistical conventions are in
 `docs/design_notes.md` section 25.
+
+## 2026-10-20 — nested validation for tuned baselines (no new runs)
+
+Seed-disjoint search/final partitions were not sufficient: hyper-parameters
+were selected and the final tuned contrast was still measured on the same
+validation documents. `baseline_tune.py` now tunes on a deterministic
+SplitMix64 row fold and reports the tuned comparison on the disjoint fold.
+Selection uses token-pooled PPL on the selection fold (arithmetic seed mean is
+only a legacy fallback), and the final records keep full-validation PPL for
+context while `tuned_comparison.json` uses the held-out row fold
+(`estimation_rows=nested_validation_holdout`). The tuning artifact records row
+fingerprints/counts and `baseline_tuning_audit` refuses a claimed nested run
+whose final records lack held-out-row PPL or score a different fold.
+
+The count-model floor now fits on a declared deterministic token prefix
+(`SIMPLE_BASELINE_POLICY.max_fit_tokens`, 20M by default) and records
+`n_fit_tokens`/`fit_truncated`, so the bigram table cannot explode when the
+project moves to a multi-billion-token B-tier corpus. The WikiText-103 budget
+is below the cap, so its floor is unchanged. No frozen manifest, test split,
+or README was modified.

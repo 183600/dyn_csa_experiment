@@ -252,6 +252,12 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     per_arm = {a: [] for a in arms}
     _prov_any = None
     _data_version_any = None
+    # Nested validation: tune on the selection rows, estimate the final
+    # contrast on the disjoint evaluation rows.  The fold indices depend only
+    # on (n_rows, seed, n_folds), so every arm/trial uses the same documents.
+    _row_spec = L.tuning_row_split_spec(protocol)
+    _row_state = {'n_rows': None, 'selection': None, 'evaluation': None,
+                  'meta': None}
     for ti, knobs in enumerate(trials):
         for _gi, _grp in enumerate(groups):
             _ov = _group_overrides(base, _grp)
@@ -276,13 +282,80 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                 if _prov_any is None:
                     _prov_any = records[sorted(records)[0]].get('provenance')
                     _data_version_any = records[sorted(records)[0]].get('data_version')
-                mean, std = _mean_std([records[s]['ppl'] for s in sorted(records)])
+                full_seed_ppls = {s: float(records[s]['ppl']) for s in sorted(records)}
+                selection_ppls = None
+                selection_stats = {}
+                _split_reason = None
+                if _row_spec is not None:
+                    _lens = {len(records[s].get('nll_per_row') or []) for s in records}
+                    if len(_lens) != 1:
+                        _split_reason = 'search records expose different per-row NLL lengths'
+                    else:
+                        _n_rows = next(iter(_lens))
+                        if _n_rows < 2:
+                            _split_reason = f'validation slice has only {_n_rows} row(s)'
+                        else:
+                            if _row_state['meta'] is None:
+                                _sel, _ev, _meta = L.validation_row_split(
+                                    _n_rows, seed=_row_spec['seed'],
+                                    n_folds=_row_spec['n_folds'],
+                                    selection_fold=_row_spec['selection_fold'],
+                                    evaluation_fold=_row_spec['evaluation_fold'])
+                                _row_state.update(n_rows=_n_rows, selection=_sel,
+                                                  evaluation=_ev, meta=_meta)
+                            if _n_rows != _row_state['n_rows']:
+                                _split_reason = ('validation row count changed between trials '
+                                                 f'({_n_rows} vs {_row_state["n_rows"]})')
+                            else:
+                                _tmp = {}
+                                for s in sorted(records):
+                                    _st = L.record_subset_ppl(records[s], _row_state['selection'])
+                                    if _st is None:
+                                        _split_reason = 'a search record lacks usable per-row NLL accounting'
+                                        _tmp = {}
+                                        break
+                                    _tmp[s] = _st
+                                if _tmp and len(_tmp) == len(records):
+                                    selection_stats = _tmp
+                                    selection_ppls = {s: float(_tmp[s]['ppl']) for s in sorted(_tmp)}
+                if selection_ppls is not None:
+                    # Token-pooled within each seed and across search seeds:
+                    # the same estimator as the panel's primary PPL.
+                    _nll_tot = float(sum(selection_stats[s]['nll_sum'] for s in selection_stats))
+                    _tok_tot = int(sum(selection_stats[s]['n_tokens'] for s in selection_stats))
+                    mean = float(L._safe_exp_ppl(_nll_tot / _tok_tot))
+                    std = _mean_std(list(selection_ppls.values()))[1]
+                    _metric_ppls = selection_ppls
+                    _seed_nll = {str(s): float(selection_stats[s]['nll_sum']) for s in sorted(selection_stats)}
+                    _seed_ntok = {str(s): int(selection_stats[s]['n_tokens']) for s in sorted(selection_stats)}
+                    _agg = 'pooled_token_nll'
+                else:
+                    mean, std = _mean_std(list(full_seed_ppls.values()))
+                    _metric_ppls = full_seed_ppls
+                    _seed_nll = None
+                    _seed_ntok = None
+                    _agg = 'arithmetic_seed_mean_fallback'
+                    if _row_spec is not None:
+                        print(f'[tune] WARNING: {arm} trial {ti}: nested selection rows unavailable ({_split_reason or "per-row NLL missing"}); falling back to full-validation means')
                 _steps = {int(records[s]['steps']) for s in records if records[s].get('steps') is not None}
                 _tokens = {int(records[s]['tokens_seen']) for s in records if records[s].get('tokens_seen') is not None}
                 per_arm[arm].append({
                     'config': dict(knobs), 'ppl': mean, 'ppl_std': std,
+                    'ppl_aggregation': _agg,
+                    'nll_sum': (float(sum(selection_stats[s]['nll_sum'] for s in selection_stats))
+                                if selection_ppls is not None else None),
+                    'n_tokens': (int(sum(selection_stats[s]['n_tokens'] for s in selection_stats))
+                                 if selection_ppls is not None else None),
+                    'seed_nll_sum': _seed_nll, 'seed_n_tokens': _seed_ntok,
                     'n_seeds': len(records), 'seeds': sorted(records),
-                    'seed_ppls': {str(s): float(records[s]['ppl']) for s in sorted(records)},
+                    'seed_ppls': {str(s): float(_metric_ppls[s]) for s in sorted(records)},
+                    'ppl_full_validation': _mean_std(list(full_seed_ppls.values()))[0],
+                    'seed_ppls_full_validation': {str(s): float(full_seed_ppls[s]) for s in sorted(records)},
+                    'selection_row_split_applied': bool(selection_ppls is not None),
+                    'selection_row_fp': ((_row_state['meta'] or {}).get('selection_row_fp')
+                                         if selection_ppls is not None else None),
+                    'evaluation_row_fp': ((_row_state['meta'] or {}).get('evaluation_row_fp')
+                                          if selection_ppls is not None else None),
                     'params': records[sorted(records)[0]].get('params'),
                     'steps': (next(iter(_steps)) if len(_steps) == 1 else None),
                     'tokens_seen': (next(iter(_tokens)) if len(_tokens) == 1 else None),
@@ -321,11 +394,26 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     artifact_protocol['search_seeds'] = list(search_seeds)
     if 'arm_groups' in protocol:
         artifact_protocol['arm_groups'] = [dict(g) for g in groups]
+    _row_applied = {a: bool(per_arm[a]) and all(bool(t.get('selection_row_split_applied'))
+                                                for t in per_arm[a]) for a in arms}
+    _row_meta = dict(_row_state['meta'] or {})
+    _row_meta.update({'applied': bool(_row_spec is not None and all(_row_applied.values())),
+                      'applied_by_arm': _row_applied,
+                      'declared': (_row_spec is not None)})
+    if _row_spec is not None and not _row_meta['applied']:
+        _row_meta['unavailable_arms'] = sorted(a for a, ok in _row_applied.items() if not ok)
+        _row_meta['reason'] = ('at least one arm/trial lacks usable per-row NLL accounting; '
+                               'its selection fell back to full-validation means')
+    if _row_meta.get('applied'):
+        print(f"[tune] nested row split applied: selection rows={_row_meta.get('n_selection_rows')} "
+              f"(fp {str(_row_meta.get('selection_row_fp'))[:12]}…), evaluation rows="
+              f"{_row_meta.get('n_evaluation_rows')} (fp {str(_row_meta.get('evaluation_row_fp'))[:12]}…)")
     artifact = {
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'protocol': artifact_protocol,
         'selection_metric': protocol['selection_metric'],
         'selection_split': protocol['selection_split'],
+        'selection_row_split': _row_meta,
         'direction': protocol['direction'],
         'search_seed': search_seed,
         'search_seeds': list(search_seeds),
@@ -349,8 +437,22 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         raise RuntimeError(f'[tune] tuning artifact failed its own audit: {audit.get("problems")}')
     if final:
         _run_final(base, outdir, protocol, selected)
-        L.methodology_audit(json.load(open(os.path.join(outdir, 'final', 'summary.json'), encoding='utf-8')),
-                            outdir=os.path.join(outdir, 'final'), verbose=True)
+        # The final summary keeps full-validation PPL for context, but the
+        # audit must not silently re-introduce the selection documents.  Feed
+        # it the held-out-row estimate whenever the nested split was applied.
+        _final_summary = json.load(open(os.path.join(outdir, 'final', 'summary.json'), encoding='utf-8'))
+        _audit_summary = {}
+        for _k, _r in _final_summary.items():
+            if not isinstance(_r, dict):
+                continue
+            _rr = dict(_r)
+            if L.ppl_is_usable(_rr.get('ppl_holdout')):
+                _rr['ppl'] = float(_rr['ppl_holdout'])
+                _rr['ppl_estimation_rows'] = 'nested_validation_holdout'
+            else:
+                _rr['ppl_estimation_rows'] = 'full_validation'
+            _audit_summary[_k] = _rr
+        L.methodology_audit(_audit_summary, outdir=os.path.join(outdir, 'final'), verbose=True)
     return artifact
 
 
@@ -426,8 +528,54 @@ def _run_final(base, outdir, protocol, selected):
         s = json.load(open(os.path.join(adir, 'summary.json'), encoding='utf-8'))
         for rec in s.values():
             if isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl')) and 'seed' in rec:
-                merged[f'{arm}::seed{int(rec["seed"])}'] = rec
+                merged[f'{arm}::seed{int(rec["seed"])}'] = dict(rec)
+    # Nested validation, evaluation half: recompute each final record's
+    # token-pooled PPL on the row fold that was NEVER used for selection.
+    # Full-validation PPL stays in the record for context; the tuned contrast
+    # below uses the held-out fold.
+    _row_spec = L.tuning_row_split_spec(protocol)
+    _final_rows_meta = {'declared': _row_spec is not None, 'applied': False}
+    _eval_idx = None
+    if _row_spec is not None:
+        _lens = {len(r.get('nll_per_row') or []) for r in merged.values()} if merged else set()
+        if len(_lens) == 1 and min(_lens) >= 2:
+            _n_rows = next(iter(_lens))
+            _sel, _eval_idx, _meta = L.validation_row_split(
+                _n_rows, seed=_row_spec['seed'], n_folds=_row_spec['n_folds'],
+                selection_fold=_row_spec['selection_fold'],
+                evaluation_fold=_row_spec['evaluation_fold'])
+            _final_rows_meta.update(_meta)
+            _bad = []
+            for k, r in merged.items():
+                st = L.record_subset_ppl(r, _eval_idx)
+                if st is None:
+                    _bad.append(k)
+                    continue
+                r['ppl_full_validation'] = r.get('ppl')
+                r['ppl_holdout'] = st['ppl']
+                r['nll_sum_holdout'] = st['nll_sum']
+                r['n_tokens_holdout'] = st['n_tokens']
+                r['holdout_row_fp'] = _meta.get('evaluation_row_fp')
+            _final_rows_meta['applied'] = not _bad
+            if _bad:
+                _final_rows_meta['reason'] = ('final records without usable per-row NLL '
+                                              f'accounting: {sorted(_bad)[:5]}')
+        else:
+            _final_rows_meta['reason'] = ('final records expose different per-row NLL lengths '
+                                          'or fewer than 2 rows')
+        if not _final_rows_meta['applied']:
+            print(f"[tune] WARNING: nested final holdout unavailable ({_final_rows_meta.get('reason')}); "
+                  'the tuned contrast falls back to full-validation PPL')
+        else:
+            print(f"[tune] final tuned contrast uses the held-out row fold: "
+                  f"{_final_rows_meta.get('n_evaluation_rows')} rows "
+                  f"(fp {str(_final_rows_meta.get('evaluation_row_fp'))[:12]}…)")
     L.atomic_write_json(os.path.join(final_dir, 'summary.json'), merged)
+    def _eval_metric(rec):
+        v = rec.get('ppl_holdout') if isinstance(rec, dict) else None
+        if L.ppl_is_usable(v):
+            return float(v)
+        return float(rec['ppl'])
     _live = [r for r in merged.values() if isinstance(r, dict)]
     _prov = next((r.get('provenance') for r in _live if r.get('provenance')), None) or L.code_provenance()
     _dv = next((r.get('data_version') for r in _live if r.get('data_version')), None)
@@ -444,9 +592,14 @@ def _run_final(base, outdir, protocol, selected):
     tuning = json.load(open(os.path.join(outdir, 'baseline_tuning.json'), encoding='utf-8'))
     tuning['final_outdir'] = final_dir
     tuning['final_records'] = {k: {'ppl': v.get('ppl'), 'seed': v.get('seed'),
+                                   'ppl_holdout': v.get('ppl_holdout'),
+                                   'nll_sum_holdout': v.get('nll_sum_holdout'),
+                                   'n_tokens_holdout': v.get('n_tokens_holdout'),
+                                   'holdout_row_fp': v.get('holdout_row_fp'),
                                    'params': v.get('params'), 'run_cfg': v.get('run_cfg'),
                                    'hyperparams': v.get('hyperparams')}
                                for k, v in merged.items()}
+    tuning['final_evaluation_rows'] = _final_rows_meta
     L.atomic_write_json(os.path.join(final_dir, 'baseline_tuning.json'), tuning)
     # Arm-level mean±std over the same final seed set, so the tuned table is
     # not a single aggregate number per arm.  The paired contrast below is
@@ -454,14 +607,20 @@ def _run_final(base, outdir, protocol, selected):
     # these two means.
     arm_summary = {}
     for arm, entry in selected.items():
-        _recs = {int(r['seed']): float(r['ppl']) for r in merged.values()
+        _recs = {int(r['seed']): _eval_metric(r) for r in merged.values()
                  if isinstance(r, dict) and r.get('variant') == arm
                  and r.get('seed') is not None and L.ppl_is_usable(r.get('ppl'))}
         _vals = [_recs[s] for s in sorted(_recs)]
+        _full = [float(r['ppl']) for r in merged.values()
+                 if isinstance(r, dict) and r.get('variant') == arm
+                 and r.get('seed') is not None and L.ppl_is_usable(r.get('ppl'))]
         arm_summary[arm] = {
             'n_seeds': len(_vals), 'seeds': sorted(_recs),
             'ppl_mean': float(np.mean(_vals)) if _vals else float('nan'),
             'ppl_std': float(np.std(_vals, ddof=1)) if len(_vals) > 1 else 0.0,
+            'ppl_full_validation_mean': float(np.mean(_full)) if _full else float('nan'),
+            'estimation_rows': ('nested_validation_holdout' if _final_rows_meta.get('applied')
+                                else 'full_validation'),
             'selected': dict(entry.get('selected') or {}),
         }
     tuned_arms = {a: len(entry['trials']) for a, entry in selected.items()}
@@ -471,6 +630,10 @@ def _run_final(base, outdir, protocol, selected):
                   'final_seeds': list(final_seeds),
                   'search_seeds': list(search_seeds),
                   'search_final_seed_disjoint': (not overlap),
+                  'estimation_rows': ('nested_validation_holdout' if _final_rows_meta.get('applied')
+                                      else 'full_validation'),
+                  'selection_row_split': (tuning.get('selection_row_split') or {}),
+                  'final_evaluation_rows': _final_rows_meta,
                   'declared_contrasts': [f'{a} - {b}' for a, b in plan],
                   'arm_summary': arm_summary,
                   'contrasts': {}}
@@ -487,7 +650,7 @@ def _run_final(base, outdir, protocol, selected):
             if why:
                 skipped.append({'seed': seed, 'reason': why})
                 continue
-            deltas.append(float(ra['ppl']) - float(rb['ppl']))
+            deltas.append(_eval_metric(ra) - _eval_metric(rb))
             seeds.append(seed)
         st = L.paired_effect_stats(deltas)
         _base_mean = (arm_summary.get(baseline) or {}).get('ppl_mean')

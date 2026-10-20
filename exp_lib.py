@@ -10909,6 +10909,152 @@ BASELINE_HYPOTHESIS_DESIGN = {
     },
 }
 
+def _splitmix64_u64(x):
+    """Deterministic 64-bit mixing (SplitMix64) used for row folds.
+
+    Fold assignment must not depend on NumPy's RNG implementation or on the
+    process/OS: a tuning artifact has to reproduce the exact same selection
+    rows on any machine.  SplitMix64 is a pure integer function, so the split
+    is stable across versions and platforms."""
+    mask = (1 << 64) - 1
+    z = (int(x) + 0x9E3779B97F4A7C15) & mask
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & mask
+    return (z ^ (z >> 31)) & mask
+
+def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
+                         selection_fold=0, evaluation_fold=1):
+    """Deterministically partition validation ROWS into disjoint folds.
+
+    Seeds make the training draws independent, but hyper-parameter selection
+    and the final tuned comparison were historically measured on the same
+    validation documents.  Disjoint seeds do not fix that: the selection is a
+    function of the evaluation rows, so re-using them still yields an
+    optimistically selected estimate.  This split makes the two stages use
+    disjoint documents without changing any training run.
+
+    Rows are ordered by a seeded SplitMix64 key (ties broken by row index), so
+    the partition is balanced, deterministic and independent of NumPy/OS
+    versions.  Both returned index lists are sorted; the union is exactly
+    ``range(n_rows)`` and they never intersect.  The metadata stores only
+    counts and fingerprints (not the full index lists) so it stays small when
+    the validation panel is scaled up."""
+    try:
+        n_rows = int(n_rows)
+        seed = int(seed)
+        n_folds = int(n_folds)
+        selection_fold = int(selection_fold)
+        evaluation_fold = int(evaluation_fold)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('validation_row_split: n_rows/seed/folds must be integers') from None
+    if n_rows < 2:
+        raise ValueError(f'validation_row_split: need >=2 rows for disjoint folds, got {n_rows}')
+    if n_folds < 2:
+        raise ValueError(f'validation_row_split: n_folds must be >=2, got {n_folds}')
+    if selection_fold == evaluation_fold:
+        raise ValueError('validation_row_split: selection and evaluation folds must differ')
+    if not (0 <= selection_fold < n_folds and 0 <= evaluation_fold < n_folds):
+        raise ValueError(f'validation_row_split: folds must be in [0, {n_folds}), got '
+                         f'selection={selection_fold}, evaluation={evaluation_fold}')
+    order = sorted(range(n_rows), key=lambda i: (_splitmix64_u64(seed + i), i))
+    # Keep the selection fold as close to half as the requested folds allow;
+    # the evaluation fold is the remainder, so the two lists partition rows.
+    n_sel = max(1, min(n_rows - 1, int(round(n_rows / float(n_folds)))))
+    selection = sorted(order[:n_sel])
+    evaluation = sorted(order[n_sel:])
+    _sel_arr = np.asarray(selection, dtype=np.int64)
+    _ev_arr = np.asarray(evaluation, dtype=np.int64)
+    meta = {
+        'policy': 'seeded_splitmix64_row_folds',
+        'seed': int(seed),
+        'n_folds': int(n_folds),
+        'selection_fold': int(selection_fold),
+        'evaluation_fold': int(evaluation_fold),
+        'n_rows': int(n_rows),
+        'n_selection_rows': int(_sel_arr.size),
+        'n_evaluation_rows': int(_ev_arr.size),
+        'selection_row_fp': _ids_fp(_sel_arr),
+        'evaluation_row_fp': _ids_fp(_ev_arr),
+        'disjoint': bool(np.intersect1d(_sel_arr, _ev_arr).size == 0),
+        'covers_all_rows': bool(_sel_arr.size + _ev_arr.size == n_rows),
+        'note': 'selection rows choose the hyper-parameters; evaluation rows are held out from that selection. Row fingerprints let the audit verify both stages used the declared folds.',
+    }
+    return selection, evaluation, meta
+
+def tuning_row_split_spec(protocol):
+    """Return the normalized row-split spec declared by a tuning protocol.
+
+    ``None`` means the legacy full-validation selection path.  Artifacts that
+    use the split record ``selection_row_split.applied=True`` so the audit can
+    distinguish an actually nested run from a protocol that merely mentioned
+    the idea."""
+    spec = (protocol or {}).get('selection_row_split')
+    if spec is None:
+        return None
+    if spec is False:
+        return None
+    if spec is True:
+        spec = {}
+    if not isinstance(spec, dict):
+        raise ValueError(f'selection_row_split must be a mapping or false, got {spec!r}')
+    if spec.get('enabled') is False:
+        return None
+    out = {
+        'enabled': True,
+        'seed': spec.get('seed', 20261020),
+        'n_folds': spec.get('n_folds', 2),
+        'selection_fold': spec.get('selection_fold', 0),
+        'evaluation_fold': spec.get('evaluation_fold', 1),
+    }
+    try:
+        out['seed'] = int(out['seed'])
+        out['n_folds'] = int(out['n_folds'])
+        out['selection_fold'] = int(out['selection_fold'])
+        out['evaluation_fold'] = int(out['evaluation_fold'])
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('selection_row_split fields must be integers') from None
+    return out
+
+def record_subset_ppl(rec, rows):
+    """Token-weighted pooled PPL of one record on a supplied subset of rows.
+
+    The LM primary endpoint is the token-pooled NLL/PPL, not the arithmetic
+    mean of per-seed PPLs.  Recomputing it on the held-out row fold is therefore
+    the same estimand as the panel-level aggregation.  Returns ``None`` when
+    the record lacks per-row accounting, the lengths disagree, or the row
+    indices are out of range — never a silently different sample."""
+    if not isinstance(rec, dict):
+        return None
+    nll = rec.get('nll_per_row')
+    ntok = rec.get('n_tokens_per_row')
+    if not isinstance(nll, (list, tuple)) or not isinstance(ntok, (list, tuple)):
+        return None
+    if len(nll) != len(ntok) or not nll:
+        return None
+    try:
+        idx = np.asarray(list(rows), dtype=np.int64)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if idx.ndim != 1 or idx.size == 0:
+        return None
+    if int(idx.min()) < 0 or int(idx.max()) >= len(nll):
+        return None
+    try:
+        _nll = np.asarray([nll[int(i)] for i in idx], dtype=float)
+        _ntok = np.asarray([ntok[int(i)] for i in idx], dtype=float)
+    except (TypeError, ValueError, OverflowError, IndexError):
+        return None
+    if not np.isfinite(_nll).all() or not np.isfinite(_ntok).all() or (_ntok < 0).any():
+        return None
+    total_tok = float(_ntok.sum())
+    if total_tok <= 0:
+        return None
+    nll_sum = float(_nll.sum())
+    nll_mean = nll_sum / total_tok
+    return {'ppl': _safe_exp_ppl(nll_mean), 'nll': nll_mean,
+            'nll_sum': nll_sum, 'n_tokens': int(total_tok),
+            'n_rows': int(idx.size)}
+
 # 基线调参协议：主方法与基线必须获得相同的搜索范围、在同一训练集上拟合、
 # 在验证集上按同一指标选择。`baseline_tune.py` 读取本表；审计读取落盘的
 # `baseline_tuning.json`，没有该产物时只报「不可核验」，不会把未调参的
@@ -10917,6 +11063,12 @@ BASELINE_TUNING_PROTOCOL = {
     'selection_metric': 'ppl',
     'selection_split': 'validation',
     'direction': 'lower_is_better',
+    # Seed-disjoint selection is not enough: hyper-parameters and the final
+    # estimate were still measured on the SAME validation documents.  Tune on
+    # one deterministic row fold and report the tuned contrast on the disjoint
+    # fold; the records keep the full-validation PPL for context only.
+    'selection_row_split': {'enabled': True, 'seed': 20261020, 'n_folds': 2,
+                            'selection_fold': 0, 'evaluation_fold': 1},
     'search_seed': 100,
     # Selection is on the MEAN validation PPL over this declared seed set, not
     # on one seed's draw.  A single-seed selection can pick a config because
@@ -10955,7 +11107,7 @@ BASELINE_TUNING_PROTOCOL = {
         {'lr': 0.0003, 'weight_decay': 0.05, 'warmup': 50},
         {'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 100},
     ],
-    'note': 'Every arm gets the same declared trials, the same search-seed set and the same selection split. Selection uses mean validation PPL across search_seeds (std recorded); a single-seed draw can win on noise. The search and final seed partitions are disjoint (search 100-102, final 0-7) so the final records are not measured on the draws that selected the config; 8 final seeds are the smallest n whose minimum attainable Holm p for the m=4 tuned family is below alpha. Final records re-use only the validation-selected config and are reported as mean±std. A tuning trial may never read the held-out test split; test is used once after selection. Contrasts are declared per parameter-matching group (each group\'s method_arm vs the other arms in that group), and unmeasurable declared pairs stay in the Holm family with p=1 instead of shrinking it. The rope group covers the frozen v12 confirmatory arms: without equal-search evidence for csa_fixed_rope/full_rope, the confirmatory comparison cannot be quoted as "beats a tuned baseline" — it is only a comparison at the frozen default hyperparameters.',
+    'note': 'Every arm gets the same declared trials, the same search-seed set and the same selection split. Selection uses TOKEN-POOLED validation PPL over a deterministic selection row fold, averaged across search_seeds (std recorded); a single-seed draw can win on noise. The final tuned contrast is measured on the DISJOINT evaluation row fold, so neither the hyper-parameters nor their reported estimate re-use the same validation documents. The search and final SEED partitions are also disjoint (search 100-102, final 0-7); 8 final seeds are the smallest n whose minimum attainable Holm p for the m=4 tuned family is below alpha. Final records keep the full-validation PPL for context but the contrast uses the held-out row fold. A tuning trial may never read the held-out test split; test is used once after selection. Contrasts are declared per parameter-matching group (each group\'s method_arm vs the other arms in that group), and unmeasurable declared pairs stay in the Holm family with p=1 instead of shrinking it. The rope group covers the frozen v12 confirmatory arms: without equal-search evidence for csa_fixed_rope/full_rope, the confirmatory comparison cannot be quoted as "beats a tuned baseline" — it is only a comparison at the frozen default hyperparameters.',
 }
 
 # 最简单基线协议（先立地板，再谈复杂模型）：语言模型的 trivial floor 是
@@ -10977,7 +11129,15 @@ SIMPLE_BASELINE_POLICY = {
         'unigram': {'alpha': [0.01, 0.1, 1.0]},
         'bigram': {'alpha': [0.01, 0.1, 1.0], 'interpolation': [0.5, 0.9, 1.0]},
     },
-    'note': 'Counts are fitted on the training token stream only; smoothing/interpolation is selected on validation PPL. The held-out test split is never read. This is a sanity floor, not a tuned neural baseline.',
+    # The bigram count table is O(unique pairs): materialising every pair of a
+    # multi-billion-token B-tier corpus would need tens of GB before the
+    # baseline even runs.  Fit on a deterministic PREFIX instead and disclose
+    # the truncation, so the floor stays feasible and comparable when the
+    # project scales.  The default WikiText-103 budget (8M tokens) is below
+    # this cap, so its behavior is unchanged.
+    'max_fit_tokens': 20_000_000,
+    'fit_token_policy': 'deterministic_prefix',
+    'note': 'Counts are fitted on the training token stream only (a deterministic prefix when max_fit_tokens is exceeded, with the truncation recorded); smoothing/interpolation is selected on validation PPL. The held-out test split is never read. This is a sanity floor, not a tuned neural baseline.',
 }
 
 def _ngram_train_counts(train_ids, vocab_size):
@@ -11074,6 +11234,32 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
     arms = protocol.get('arms') or {}
     grids = protocol.get('grids') or {}
     trials_by_arm = {}
+    # Fit on a deterministic training prefix when the declared cap is smaller
+    # than the corpus.  This bounds the bigram table (O(unique pairs)) so the
+    # floor remains runnable on a B-tier token budget; the truncation is
+    # recorded, never silent.
+    _train_raw = np.asarray(train_ids)
+    if not np.issubdtype(_train_raw.dtype, np.integer):
+        raise TypeError(f'ngram baseline: train ids must be integers, got dtype {_train_raw.dtype}')
+    _train_all = _train_raw.reshape(-1)
+    _cap = protocol.get('max_fit_tokens')
+    if _cap is None:
+        _fit_ids = _train_all
+    else:
+        try:
+            _cap = int(_cap)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'max_fit_tokens must be an integer or None, got {_cap!r}') from None
+        if _cap < 1:
+            raise ValueError(f'max_fit_tokens must be >= 1, got {_cap}')
+        _fit_ids = _train_all[:_cap]
+    _fit_meta = {
+        'fit_token_policy': protocol.get('fit_token_policy', 'deterministic_prefix'),
+        'max_fit_tokens': _cap,
+        'n_fit_tokens': int(_fit_ids.size),
+        'n_source_tokens': int(_train_all.size),
+        'fit_truncated': bool(_fit_ids.size < _train_all.size),
+    }
     # Build the corpus count tables once for the whole grid (lazily, so an
     # empty evaluation set still short-circuits without touching the corpus):
     # every trial below consumes the identical arrays — the trial
@@ -11091,8 +11277,8 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
                 if order == 2:
                     cfg['interpolation'] = float(lam)
                 if _shared_counts is None:
-                    _shared_counts = _ngram_train_counts(np.asarray(train_ids, dtype=np.int64).ravel(), vocab_size)
-                sc = ngram_lm_score(train_ids, eval_ids, vocab_size, order=order,
+                    _shared_counts = _ngram_train_counts(np.asarray(_fit_ids, dtype=np.int64), vocab_size)
+                sc = ngram_lm_score(_fit_ids, eval_ids, vocab_size, order=order,
                                     alpha=float(alpha), interpolation=float(lam),
                                     _counts=_shared_counts)
                 rows.append({'config': cfg, 'ppl': sc['ppl'], 'nll': sc['nll'],
@@ -11107,15 +11293,13 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
     best_arm = min(trials_by_arm, key=lambda a: float(trials_by_arm[a]['selected_metric_value']))
     # `_ids_fp` hashes the canonical chunked form of any integer width and
     # accepts the training stream (possibly a memmap) directly.
-    train_arr = np.asarray(train_ids)
-    if not np.issubdtype(train_arr.dtype, np.integer):
-        raise TypeError(f'ngram baseline: train ids must be integers, got dtype {train_arr.dtype}')
-    train_arr = train_arr.reshape(-1)
     eval_arr = np.asarray(eval_ids, dtype=np.int64)
-    _data = {'train_fp': _ids_fp(train_arr),
+    _data = {'train_fp': _ids_fp(_fit_ids),
+             'source_train_fp': _ids_fp(_train_all),
              'val_fp': _ids_fp(np.ascontiguousarray(eval_arr).reshape(-1)),
-             'n_train_tokens': int(train_arr.size),
+             'n_train_tokens': int(_train_all.size),
              'n_eval_tokens': int(eval_arr.size)}
+    _data.update(_fit_meta)
     _data['data_version'] = _data_version(_data)
     _prov = code_provenance()
     _prov['data'] = _data
@@ -11237,6 +11421,19 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         data = {}
     if not data.get('val_fp'):
         warnings.append('artifact has no validation fingerprint — the panel comparison cannot verify it used the same validation slice')
+    if data.get('fit_truncated') is True:
+        try:
+            _nfit = int(data.get('n_fit_tokens'))
+            _nsrc = int(data.get('n_source_tokens'))
+        except (TypeError, ValueError, OverflowError):
+            warnings.append('count-model artifact claims a truncated fit but lacks integer fit/source token counts')
+        else:
+            if not (0 < _nfit < _nsrc):
+                problems.append('count-model artifact claims fit_truncated=True but n_fit_tokens is not below n_source_tokens')
+            else:
+                warnings.append(f'the count-model floor was fitted on a deterministic prefix of '
+                                f'{_nfit:,}/{_nsrc:,} training tokens (max_fit_tokens={data.get("max_fit_tokens")}); '
+                                'report the fit budget when quoting the floor')
     best_name = None
     if selected_values:
         best_name = min(selected_values, key=selected_values.get)
@@ -11502,6 +11699,19 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
     y_pred = np.asarray(y_pred).ravel()
     if y_true.shape != y_pred.shape:
         raise ValueError(f'y_true {y_true.shape} and y_pred {y_pred.shape} differ')
+    # A declared label set must cover every OBSERVED label.  Silently ignoring
+    # an undeclared true/predicted class makes micro/macro F1 and balanced
+    # accuracy describe a different label space than the one the caller
+    # declared.  Requested labels with zero support are still allowed (they
+    # count as F1=0), so an explicit full class list remains valid.
+    _declared = {_label_identity(v) for v in labels.tolist()}
+    _observed = {_label_identity(v) for v in y_true.tolist()} | {
+        _label_identity(v) for v in y_pred.tolist()}
+    _unknown = [v for v in (_observed - _declared)]
+    if _unknown:
+        raise ValueError(
+            f'observed label(s) {sorted(map(str, _unknown))} are not in the declared '
+            f'labels {labels.tolist()}; include them or pass labels=None')
     per_class = {}
     supports = []
     f1s = []
@@ -11683,6 +11893,7 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
     if not rows:
         return {'status': 'unavailable', 'reason': 'no trial records'}
     seed_maps = []
+    acc_maps = []
     for t in rows:
         ppls = t.get('seed_ppls')
         if not isinstance(ppls, dict):
@@ -11701,6 +11912,25 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
             if f is not None:
                 m[seed] = f
         seed_maps.append(m)
+        # Token accounting lets the stability scan re-select with the same
+        # token-pooled estimand the driver uses.  It is optional so legacy
+        # artifacts with only per-seed PPLs still work via the arithmetic mean.
+        _nll = t.get('seed_nll_sum')
+        _tok = t.get('seed_n_tokens')
+        acc = None
+        if isinstance(_nll, dict) and isinstance(_tok, dict):
+            acc = {}
+            for k, v in _nll.items():
+                seed = _as_seed_int(k)
+                if seed is None:
+                    acc = None
+                    break
+                nv, tv = _finite_scalar(v), _finite_scalar(_tok.get(k))
+                if nv is None or tv is None or tv <= 0:
+                    acc = None
+                    break
+                acc[seed] = (float(nv), float(tv))
+        acc_maps.append(acc)
     common = set(seed_maps[0])
     for m in seed_maps[1:]:
         common &= set(m)
@@ -11708,18 +11938,26 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
         return {'status': 'insufficient_seeds',
                 'reason': 'leave-one-out selection needs at least 3 common seeds',
                 'common_seeds': sorted(common)}
+    _use_acc = all(a is not None for a in acc_maps) and all(
+        common <= set(a) for a in acc_maps if a is not None)
     sigs = [json.dumps(t.get('config') or {}, sort_keys=True, default=str) for t in rows]
     choices = []
     for drop in sorted(common):
         vals = []
-        for m, sig in zip(seed_maps, sigs):
+        for i, (m, sig) in enumerate(zip(seed_maps, sigs)):
             # Use exactly the COMMON seeds for every trial.  A trial with extra
             # non-common draws must not change a configuration's mean (and
             # therefore the winner) when a common seed is dropped.
-            xs = [m[s] for s in common if s != drop]
-            if not xs:
+            keep = [s for s in common if s != drop]
+            if not keep:
                 return {'status': 'unavailable', 'reason': f'trial has no finite values after dropping seed {drop}'}
-            vals.append((sig, float(np.mean(xs))))
+            if _use_acc:
+                _nll = sum(acc_maps[i][s][0] for s in keep)
+                _tok = sum(acc_maps[i][s][1] for s in keep)
+                value = float(_safe_exp_ppl(_nll / _tok))
+            else:
+                value = float(np.mean([m[s] for s in keep]))
+            vals.append((sig, value))
         best = (min(vals, key=lambda kv: kv[1]) if direction == 'lower_is_better'
                 else max(vals, key=lambda kv: kv[1]))
         choices.append({'dropped_seed': drop, 'config': json.loads(best[0]),
@@ -11729,6 +11967,7 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
             'n_distinct_configs': len(distinct), 'n_common_seeds': len(common),
             'common_seeds': sorted(common), 'choices': choices,
             'metric': metric, 'direction': direction,
+            'metric_aggregation': ('pooled_token_nll' if _use_acc else 'arithmetic_seed_mean'),
             'note': 'drop one search seed -> re-select; a changed winner means the selected config is seed-driven'}
 
 
@@ -11782,6 +12021,48 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         problems.append(f'selection metric {metric!r} differs from the declared {protocol.get("selection_metric")!r}')
     if direction not in ('lower_is_better', 'higher_is_better'):
         problems.append(f'unknown selection direction {direction!r}')
+    # Nested-validation evidence: seed-disjoint tuning is not enough if the
+    # final estimate is still measured on the documents that selected the
+    # config.  Verify the row-fold contract when the artifact claims it.
+    try:
+        _declared_rows = tuning_row_split_spec(protocol)
+    except ValueError as _rse:
+        problems.append(f'malformed selection_row_split: {_rse}')
+        _declared_rows = None
+    _split_info = selected.get('selection_row_split')
+    _row_split_applied = None
+    _nested_final = None
+    if _declared_rows is not None:
+        if not isinstance(_split_info, dict):
+            warnings.append('the tuning protocol declares a nested validation row split, but the '
+                            'artifact records no selection_row_split; selection and final evaluation '
+                            'may share validation documents')
+        elif _split_info.get('applied') is True:
+            _row_split_applied = True
+            if _split_info.get('disjoint') is not True or _split_info.get('covers_all_rows') is not True:
+                problems.append('selection_row_split claims applied=True but does not attest disjoint, '
+                                'covering selection/evaluation folds')
+            if not _split_info.get('selection_row_fp') or not _split_info.get('evaluation_row_fp'):
+                problems.append('selection_row_split lacks the selection/evaluation row fingerprints')
+            elif _split_info.get('selection_row_fp') == _split_info.get('evaluation_row_fp'):
+                problems.append('selection and evaluation row fingerprints are identical — the folds are not disjoint')
+            _expected_sel_fp = _split_info.get('selection_row_fp')
+            _expected_eval_fp = _split_info.get('evaluation_row_fp')
+            for _arm, _entry in arms.items():
+                if not isinstance(_entry, dict):
+                    continue
+                for _t in (_entry.get('trials') or []):
+                    if not isinstance(_t, dict) or not _t.get('selection_row_split_applied'):
+                        problems.append(f'{_arm}: a tuning trial did not use the declared nested selection rows')
+                        break
+                    if _t.get('selection_row_fp') != _expected_sel_fp:
+                        problems.append(f'{_arm}: a tuning trial selected on different rows than the artifact declares')
+                        break
+        else:
+            _row_split_applied = False
+            _why = _split_info.get('reason') or 'the artifact did not apply the row split'
+            warnings.append('the tuning protocol declares nested validation rows, but the artifact '
+                            f'reports applied=False ({_why}); the final estimate may be selection-biased')
     declared = {json.dumps(t, sort_keys=True, default=str) for t in (protocol.get('trials') or [])}
     signatures = {}
     n_trials = {}
@@ -11831,13 +12112,24 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                     continue
                 _set.add(tuple(sorted(set(_norm_keys))))
             _trial_ppl = _finite_scalar(t.get('ppl'))
+            _trial_nll = _finite_scalar(t.get('nll_sum'))
+            _trial_ntok = _finite_scalar(t.get('n_tokens'))
+            _agg = t.get('ppl_aggregation')
+            if _agg == 'pooled_token_nll' and (_trial_nll is None or _trial_ntok is None
+                                               or _trial_ntok <= 0):
+                problems.append(f'{arm}: trial claims pooled_token_nll but lacks a usable nll_sum/n_tokens')
             if isinstance(_ppls, dict) and _trial_ppl is not None:
                 _vals = [f for f in (_finite_scalar(v) for v in _ppls.values())
                          if f is not None]
                 if _vals:
-                    _m = float(np.mean(_vals))
-                    if abs(_m - _trial_ppl) > 1e-9 * max(1.0, abs(_m)):
-                        problems.append(f'{arm}: trial ppl is not the mean of its per-seed values')
+                    if _trial_nll is not None and _trial_ntok is not None and _trial_ntok > 0:
+                        _expected = float(_safe_exp_ppl(_trial_nll / _trial_ntok))
+                        if abs(_expected - _trial_ppl) > 1e-9 * max(1.0, abs(_expected)):
+                            problems.append(f'{arm}: trial ppl is not exp(nll_sum/n_tokens)')
+                    else:
+                        _expected = float(np.mean(_vals))
+                        if abs(_expected - _trial_ppl) > 1e-9 * max(1.0, abs(_expected)):
+                            problems.append(f'{arm}: trial ppl is not the mean of its per-seed values')
                     if t.get('ppl_std') is not None and len(_vals) > 1:
                         try:
                             _reported_sd = float(t['ppl_std'])
@@ -12031,6 +12323,22 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                             break
                 if r.get('variant') is not None and r.get('variant') != arm:
                     problems.append(f'{arm}: final record key {_k} carries variant={r.get("variant")!r}')
+                if _row_split_applied:
+                    _hold = _finite_scalar(r.get('ppl_holdout'))
+                    if _hold is None:
+                        problems.append(f'{arm}: nested selection was applied but final record {_k} '
+                                        'has no held-out-row PPL (ppl_holdout) — the reported tuned '
+                                        'contrast would fall back to the selection documents')
+                    elif r.get('holdout_row_fp') != (_split_info or {}).get('evaluation_row_fp'):
+                        problems.append(f'{arm}: final record {_k} was scored on different held-out '
+                                        'rows than the declared evaluation fold')
+                    else:
+                        _nested_final = True
+    if final_records and _row_split_applied and _nested_final is None:
+        problems.append('nested selection was applied but no final record carries a held-out-row PPL')
+    if final_records and _row_split_applied is False:
+        warnings.append('the tuning artifact did not apply the nested row split; the final tuned '
+                        'records may be measured on the rows that selected the config')
     _measured_final_seeds = sorted({s for _v in final_seed_coverage.values() for s in _v})
     _record_overlap = sorted(_search_set & set(_measured_final_seeds))
     if _record_overlap and final_records and not _seed_overlap:
@@ -12076,6 +12384,10 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
            'final_seed_coverage': final_seed_coverage,
            'final_seed_coverage_equal': final_seed_coverage_equal,
            'final_min_seed_count': final_min_seed_count,
+           'selection_row_split_applied': _row_split_applied,
+           'selection_rows_disjoint_from_evaluation': _row_split_applied,
+           'nested_final_evaluation': _nested_final,
+           'selection_row_split': (_split_info if isinstance(_split_info, dict) else None),
            'coverage': coverage, 'uncovered_arms': uncovered,
            'inherits_tuning': {str(k): str(v) for k, v in _inherits.items()},
            'selection_stability': selection_stabilities,
