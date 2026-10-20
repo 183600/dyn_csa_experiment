@@ -12563,7 +12563,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 _set.add(tuple(sorted(set(_norm_keys))))
             _trial_ppl = _finite_scalar(t.get('ppl'))
             _trial_nll = _finite_scalar(t.get('nll_sum'))
-            _trial_ntok = _finite_scalar(t.get('n_tokens'))
+            _trial_ntok = _exact_count(t.get('n_tokens'), minimum=1)
             _agg = t.get('ppl_aggregation')
             if _agg == 'pooled_token_nll' and (_trial_nll is None or _trial_ntok is None
                                                or _trial_ntok <= 0):
@@ -12581,10 +12581,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                         if abs(_expected - _trial_ppl) > 1e-9 * max(1.0, abs(_expected)):
                             problems.append(f'{arm}: trial ppl is not the mean of its per-seed values')
                     if t.get('ppl_std') is not None and len(_vals) > 1:
-                        try:
-                            _reported_sd = float(t['ppl_std'])
-                        except (TypeError, ValueError, OverflowError):
-                            problems.append(f'{arm}: trial ppl_std is not numeric ({t.get("ppl_std")!r})')
+                        # A non-finite/bool std is not a spread measurement;
+                        # abs(NaN - s) > tol is False, so the old direct float()
+                        # silently PASSED a corrupted ppl_std.
+                        _reported_sd = _finite_scalar(t['ppl_std'])
+                        if _reported_sd is None:
+                            problems.append(f'{arm}: trial ppl_std is not numeric or finite ({t.get("ppl_std")!r})')
                         else:
                             _s = float(np.std(_vals, ddof=1))
                             if abs(_s - _reported_sd) > 1e-9 * max(1.0, abs(_s)):
@@ -12605,8 +12607,21 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             sig = json.dumps(t.get('config') or {}, sort_keys=True, default=str)
             by_cfg[sig] = (t.get('steps'), t.get('tokens_seen'))
         budgets[arm] = by_cfg
-        _steps = {v[0] for v in by_cfg.values() if v[0] is not None}
-        _toks = {v[1] for v in by_cfg.values() if v[1] is not None}
+        # Step/token budgets are exact counts.  Raw equality would treat
+        # True == 1 and let a boolean/truncated budget pose as a matched one.
+        _steps, _toks, _bad_budget = set(), set(), []
+        for _b in by_cfg.values():
+            for _idx, _label, _target in ((0, 'steps', _steps),
+                                          (1, 'tokens_seen', _toks)):
+                if _b[_idx] is None:
+                    continue
+                _cnt = _exact_count(_b[_idx], minimum=1)
+                if _cnt is None:
+                    _bad_budget.append((_label, _b[_idx]))
+                else:
+                    _target.add(_cnt)
+        if _bad_budget:
+            problems.append(f'{arm}: trial budget values are not exact positive counts ({_bad_budget})')
         if len(_steps) > 1:
             problems.append(f'{arm}: trials used different step budgets {sorted(_steps)}')
         if len(_toks) > 1:
@@ -12695,10 +12710,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     _all_sigs = set().union(*(set(b) for b in budgets.values())) if budgets else set()
     for sig in sorted(_all_sigs):
         _vals = {arm: b[sig] for arm, b in budgets.items() if sig in b}
-        _st = {v[0] for v in _vals.values() if v[0] is not None}
-        _tk = {v[1] for v in _vals.values() if v[1] is not None}
-        if len(_st) > 1 or len(_tk) > 1:
-            problems.append(f'trial {sig[:48]} uses different steps/tokens across arms (steps={sorted(_st)}, tokens={sorted(_tk)})')
+        _st = {_exact_count(v[0], minimum=1) for v in _vals.values()
+               if v[0] is not None}
+        _tk = {_exact_count(v[1], minimum=1) for v in _vals.values()
+               if v[1] is not None}
+        if None in _st or None in _tk or len(_st) > 1 or len(_tk) > 1:
+            problems.append(f'trial {sig[:48]} uses different steps/tokens across arms (steps={sorted(_st, key=str)}, tokens={sorted(_tk, key=str)})')
             break
     if selected.get('search_complete') is False:
         warnings.append('the search grid was truncated (search_complete=False); it is equal across arms, but describe it as a bounded search, not the full declared grid')
