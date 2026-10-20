@@ -7559,6 +7559,12 @@ def t_m0_cross_scale_pairs_are_control_gated():
     assert len(gated) == 1 and gated[0][0] == 1, gated
     assert 'run_cfg' in gated[0][1], gated
     assert paired[0] == (10.0, 11.0), paired
+    # Escalating tier labels must not make S10 look smaller than S2.
+    pts = [{'label': 'S10', 'scale': 1000.0}, {'label': 'S2', 'scale': 10.0},
+           {'label': 'S1', 'scale': 1.0}]
+    assert M0._extreme_scale_labels(pts) == ('S1', 'S10')
+    assert M0._extreme_scale_labels([{'label': 'S9', 'scale': float('nan')},
+                                     {'label': 'S1', 'scale': 1.0}]) is None
 
 
 def main():

@@ -44,7 +44,7 @@ TOST 等检查都由 `kernel` 子命令写出并绑定代码/内核戳/git 树�
 `full` 还会在真实面板几何上做短校准，把各臂的实测 s/step 记入 TimeGuard；
 未校准的解析外推在 S1 尺度上会高估到使全部单元被 cap 跳过的程度。
 """
-import gc, json, os, shutil, subprocess, sys, time, traceback
+import gc, json, math, os, shutil, subprocess, sys, time, traceback
 import numpy as np
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
@@ -655,6 +655,24 @@ def _panel_corpus_fp(summary, variant=None):
     return (sorted(legacy)[0] if legacy else None)
 
 
+def _extreme_scale_labels(points):
+    """Labels of the smallest and largest scale in a cross-scale point set.
+
+    Choosing by label (`sorted(raw)[0], sorted(raw)[-1]`) breaks as soon as a
+    ladder has more than nine tiers: lexicographic order puts `S10` before
+    `S2`, so the "extreme" interaction would compare the wrong two scales.
+    Order by the declared scale (parameters) instead.
+    """
+    usable = [p for p in (points or []) if p.get('label') is not None
+              and isinstance(p.get('scale'), (int, float))
+              and not isinstance(p.get('scale'), bool)
+              and math.isfinite(float(p['scale']))]
+    if len(usable) < 2:
+        return None
+    order = sorted(usable, key=lambda p: (float(p['scale']), str(p['label'])))
+    return str(order[0]['label']), str(order[-1]['label'])
+
+
 def _flatten_contrasts(audit):
     rows = []
     for family in ('components', 'baselines'):
@@ -779,10 +797,12 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
             continue
         meta = L.meta_analyze_effects(points, min_seeds=3)
         entry = {'per_scale': raw, 'meta': meta}
-        # Paired S1->S2 interaction on the seeds present in BOTH panels.
-        low_lbl, high_lbl = sorted(raw)[0], sorted(raw)[-1]
-        lo = dict(zip(raw[low_lbl]['seeds'], raw[low_lbl]['effects']))
-        hi = dict(zip(raw[high_lbl]['seeds'], raw[high_lbl]['effects']))
+        # Paired smallest->largest interaction on the seeds present in BOTH
+        # panels.  Ordering is by scale, never by label string.
+        _ext = _extreme_scale_labels(points)
+        low_lbl, high_lbl = _ext if _ext is not None else (None, None)
+        lo = dict(zip(raw[low_lbl]['seeds'], raw[low_lbl]['effects'])) if low_lbl in raw else {}
+        hi = dict(zip(raw[high_lbl]['seeds'], raw[high_lbl]['effects'])) if high_lbl in raw else {}
         common = sorted(set(lo) & set(hi))
         if len(common) >= 2:
             entry['interaction'] = L.scale_interaction(
