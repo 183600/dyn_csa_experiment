@@ -6831,6 +6831,15 @@ def t_report_error_analysis_section():
     assert 'Bad-case analysis' in txt and 'ambiguous_context' in txt, txt
     assert 'ckpt.pt' in txt and 'validation only' in txt, txt
     assert 'read the context' in txt, txt
+    rec2 = dict(rec, checkpoint='/tmp/y/ckpt2.pt')
+    orig_paths = BR._error_analysis_paths
+    BR._error_analysis_paths = lambda: ['/a/summary.json', '/b/summary.json']
+    BR.load = lambda path, default=None: {'/a/summary.json': rec, '/b/summary.json': rec2}.get(path, default)
+    try:
+        txt2 = BR.sec_error_analysis()
+    finally:
+        BR._error_analysis_paths = orig_paths
+    assert 'ckpt.pt' in txt2 and 'ckpt2.pt' in txt2 and '###' in txt2, txt2
 
 
 def t_report_training_health_actions():

@@ -1938,12 +1938,21 @@ def sec_nan_diagnostics():
     return '\n'.join(lines) + '\n'
 
 
-def sec_error_analysis():
-    d = load(os.path.join(REPO, 'analysis_errors', 'summary.json'))
-    if not isinstance(d, dict) or not d:
-        return ''
-    lines = ['## Bad-case analysis (human review required)', '',
-             '> This section is an error-analysis aid, not a result table. The cause labels are heuristics: only reading the context and the target can distinguish an annotation error from a genuinely ambiguous example from a model blind spot.', '']
+def _error_analysis_paths():
+    base = os.path.join(REPO, 'analysis_errors')
+    paths = [os.path.join(base, 'summary.json')]
+    try:
+        for name in sorted(os.listdir(base)):
+            sub = os.path.join(base, name)
+            if os.path.isdir(sub):
+                paths.append(os.path.join(sub, 'summary.json'))
+    except OSError:
+        pass
+    return paths
+
+
+def _render_error_analysis(d):
+    lines = []
     ckpt = d.get('checkpoint')
     if ckpt:
         lines += [f'- checkpoint: `{os.path.basename(str(ckpt))}`', f'- split: **{d.get("split") or "unknown"}**', f'- pooled CE/PPL: {fm(d.get("mean_ce"), 4)} / {fm(d.get("pooled_ppl"), 2)}', '']
@@ -1984,6 +1993,29 @@ def sec_error_analysis():
         lines.append('')
     if d.get('warning'):
         lines += [f'> {d.get("warning")}', '']
+    return lines
+
+
+def sec_error_analysis():
+    docs = []
+    seen = set()
+    for path in _error_analysis_paths():
+        d = load(path)
+        if not isinstance(d, dict) or not d:
+            continue
+        ck = str(d.get('checkpoint') or path)
+        if ck in seen:
+            continue
+        seen.add(ck)
+        docs.append((path, d))
+    if not docs:
+        return ''
+    lines = ['## Bad-case analysis (human review required)', '',
+             '> This section is an error-analysis aid, not a result table. The cause labels are heuristics: only reading the context and the target can distinguish an annotation error from a genuinely ambiguous example from a model blind spot.', '']
+    for path, d in docs:
+        if len(docs) > 1:
+            lines += [f'### `{os.path.basename(os.path.dirname(path)) or "analysis_errors"}`', '']
+        lines += _render_error_analysis(d)
     return '\n'.join(lines) + '\n'
 
 
