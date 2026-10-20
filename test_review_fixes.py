@@ -4014,6 +4014,15 @@ def t_baseline_audit_malformed_seed_keys():
     assert any('ppl_std is not numeric' in p for p in out['problems']), out
     assert any('is not numeric' in p for p in out['problems']), out
 
+    # A declared final seed must be parsed exactly; silently dropping 1.5 (or
+    # iterating a scalar) would let the audit certify a different seed panel.
+    art['protocol']['final_seeds'] = [0, 1.5]
+    out = L.baseline_tuning_audit(art)
+    assert out['status'] == 'fail' and any('final seed' in p for p in out['problems']), out
+    art['protocol']['final_seeds'] = 3
+    out = L.baseline_tuning_audit(art)
+    assert out['status'] == 'fail' and any('final_seeds' in p for p in out['problems']), out
+
 
 def t_simple_baseline_audit_malformed_records():
     art = {

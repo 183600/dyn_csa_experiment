@@ -12609,10 +12609,21 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         except (TypeError, ValueError, OverflowError):
             problems.append(f'search_seeds are not integers ({_declared_search!r})')
     _final_set = set()
-    for _s in final_seeds or []:
+    try:
+        _raw_final = list(final_seeds or [])
+    except TypeError:
+        problems.append(f'declared final_seeds are not an iterable ({final_seeds!r})')
+        _raw_final = []
+    for _s in _raw_final:
         _si = _as_seed_int(_s)
-        if _si is not None:
-            _final_set.add(_si)
+        if _si is None:
+            # Dropping an unparseable seed would shrink the declared final
+            # panel and could make the remaining coverage look complete.
+            problems.append(f'declared final seed {_s!r} is not an integer')
+            continue
+        if _si in _final_set:
+            problems.append(f'declared final seed {_si} is duplicated')
+        _final_set.add(_si)
     _seed_overlap = sorted(_search_set & _final_set)
     if _seed_overlap:
         _msg = (f'search_seeds and final_seeds overlap on {_seed_overlap} — the '
@@ -12642,10 +12653,8 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             if len(_seeds) != len(set(_seeds)):
                 problems.append(f'{arm}: duplicate final records for the same seed')
             final_seed_coverage[arm] = sorted(set(_seeds))
-            if final_seeds:
-                _need = {s for s in (_as_seed_int(x) for x in final_seeds)
-                         if s is not None}
-                _miss = sorted(_need - set(_seeds))
+            if _final_set:
+                _miss = sorted(_final_set - set(_seeds))
                 if _miss:
                     problems.append(f'{arm}: final records miss declared seeds {_miss}')
             for _k, r in hits:
