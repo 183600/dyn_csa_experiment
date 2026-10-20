@@ -1479,20 +1479,72 @@ def _hash_row_block(width, cap):
 
 
 def _matrix_fingerprint(X):
+    """Content fingerprint of a 1-D/2-D table, preserving integer precision.
+
+    Casting every dtype through float64 would make two distinct int64 rows
+    above 2**53 hash identically (the same precision loss that duplicate
+    detection must avoid).  Rows are first hashed through the historical
+    float64 block form (so an int and a float with the same exactly
+    representable value still share a fingerprint); rows whose integer /
+    datetime value is NOT exactly representable as float64 additionally append
+    an exact per-row key.  Object rows use the canonical keys from
+    :func:`_row_keys`.  Signed zero is normalised in both paths.
+    """
     arr = np.asarray(X)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
     h = hashlib.sha256()
     h.update(str(arr.shape).encode('ascii'))
-    # Convert and hash in bounded row blocks: the whole matrix is never
-    # duplicated as float64 just to be hashed, and the block row count is
-    # sized from the actual width so a wide matrix cannot allocate a
-    # gigabyte-sized block from a fixed row count.
+    if np.iscomplexobj(arr):
+        raise TypeError(
+            'matrix fingerprint needs real-valued rows; casting complex rows '
+            'to float64 would silently discard the imaginary part')
+    if arr.dtype == object:
+        # Canonical per-row keys keep every integer bit and separate
+        # NaN/Inf; mixed non-numeric object tables are rejected by _row_keys
+        # exactly as the previous float64 cast would have rejected them.
+        for key in _row_keys(arr):
+            h.update(key)
+        return h.hexdigest()[:16]
     _w = int(arr.shape[1]) if arr.ndim > 1 else 1
     _step = _hash_row_block(_w, 1 << 20)
+    _is_int = (np.issubdtype(arr.dtype, np.integer) or arr.dtype == np.bool_
+               or np.issubdtype(arr.dtype, np.datetime64)
+               or np.issubdtype(arr.dtype, np.timedelta64))
     for start in range(0, arr.shape[0], _step):
-        block = np.asarray(arr[start:start + _step], dtype=np.float64)
-        h.update(np.ascontiguousarray(block).tobytes())
+        block = arr[start:start + _step]
+        with np.errstate(invalid='ignore', over='ignore'):
+            block_f = np.asarray(block, dtype=np.float64)
+        if np.any(block_f == 0.0):
+            block_f = block_f.copy()
+            block_f[block_f == 0.0] = 0.0
+        h.update(np.ascontiguousarray(block_f).tobytes())
+        if not _is_int:
+            continue
+        # Which cells survive the float64 round-trip exactly?  Only inexact
+        # rows need an exact tail, so the common (small-integer) case keeps
+        # the same digest as an equivalent float64 table.
+        _raw = block if not (np.issubdtype(arr.dtype, np.datetime64)
+                             or np.issubdtype(arr.dtype, np.timedelta64)) else block.view(np.int64)
+        _raw = np.asarray(_raw)
+        if np.issubdtype(_raw.dtype, np.unsignedinteger):
+            _safe = _raw <= np.iinfo(np.int64).max
+            _back = np.zeros(_raw.shape, dtype=np.int64)
+            if _safe.any():
+                _back[_safe] = block_f[_safe].astype(np.int64)
+            _exact = _safe & (_back == _raw)
+        else:
+            _back = block_f.astype(np.int64)
+            _exact = _back == _raw
+        _bad_rows = ~_exact.all(axis=-1) if _exact.ndim > 1 else ~_exact
+        if np.any(_bad_rows):
+            _bad = _raw[_bad_rows]
+            if _bad.ndim == 1:
+                _bad = _bad.reshape(-1, 1)
+            for key in _row_keys(_bad):
+                h.update(b'|')
+                h.update(key)
     return h.hexdigest()[:16]
-
 
 def _row_keys(X):
     """Stable per-row keys for exact-duplicate detection (NaN-safe)."""

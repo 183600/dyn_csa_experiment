@@ -38,6 +38,7 @@
 """
 import json
 import math
+import numbers
 import os
 import sys
 import time
@@ -119,10 +120,17 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     # required to match: the training cache is 512-token and the held-out cache
     # is 4097-token by construction.
     def _as_int(value):
-        try:
+        if value is None or isinstance(value, (bool, np.bool_)):
+            return None
+        if isinstance(value, numbers.Integral):
             return int(value)
+        try:
+            f = float(value)
         except (TypeError, ValueError, OverflowError):
             return None
+        if not math.isfinite(f) or f != math.floor(f):
+            return None
+        return int(f)
     _pairs = []
     for _tp in _tm:
         _tmeta = _load(_tp)

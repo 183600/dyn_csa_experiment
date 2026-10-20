@@ -4501,6 +4501,61 @@ def t_data_quality_exact_integer_and_complex_rows():
         raise AssertionError('complex duplicate detection must be rejected')
 
 
+def t_exact_numeric_contracts_and_fingerprint():
+    from decimal import Decimal
+    import data_guard as DG
+    # Fractional Decimal token counts must not be truncated into a different
+    # pooled denominator; integral ones are ordinary counts.
+    ok = L._nll_doc_ci([1.0, 2.0, 3.0],
+                       [Decimal('10'), Decimal('20'), Decimal('30')])
+    assert ok['n_docs'] == 3 and abs(ok['ppl'] - math.exp(0.1)) < 1e-12, ok
+    bad = L._nll_doc_ci([1.0, 2.0, 3.0],
+                        [Decimal('10'), Decimal('20.5'), Decimal('30')])
+    assert bad['n_docs'] == 2 and abs(bad['ppl'] - math.exp(0.1)) < 1e-12, bad
+    # Integer-only contracts accept Decimal('17') but reject Decimal('17.5')
+    # instead of silently training on a different row count.
+    sel, ev, meta = L.validation_row_split(Decimal('17'), seed=Decimal('3'))
+    assert len(sel) + len(ev) == 17 and meta['seed'] == 3, meta
+    try:
+        L.validation_row_split(Decimal('17.5'))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('fractional n_rows must be rejected')
+    try:
+        L.tuning_row_split_spec({'selection_row_split': {'n_folds': Decimal('2.5')}})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('fractional n_folds must be rejected')
+    assert L.tuning_row_split_spec({'selection_row_split': {'n_folds': Decimal('2')}})['n_folds'] == 2
+    # A fractional vocab is not a tokenisation width.
+    assert L._scale_points([{'scale': 1.0, 'effects': [0.1], 'seeds': [0],
+                             'vocab': Decimal('3.5')}])[0]['vocab'] is None
+    assert L._scale_points([{'scale': 1.0, 'effects': [0.1], 'seeds': [0],
+                             'vocab': Decimal('3')}])[0]['vocab'] == 3
+    try:
+        L.simple_baseline_fit([0, 1, 0, 1], [0, 1], 2,
+                              protocol=dict(L.SIMPLE_BASELINE_POLICY,
+                                            max_fit_tokens=Decimal('2.5')))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('fractional max_fit_tokens must be rejected')
+    # Matrix fingerprints keep exact integer bits above 2**53 while an
+    # exactly representable value keeps the same digest as its float twin.
+    big = np.array([[2 ** 53], [2 ** 53 + 1]], dtype=np.int64)
+    assert len({DG._matrix_fingerprint(np.array([[v]], dtype=np.int64))
+                for v in big.ravel().tolist()}) == 2
+    assert DG._matrix_fingerprint(np.array([[2 ** 53]], dtype=np.int64)) == \
+        DG._matrix_fingerprint(np.array([[float(2 ** 53)]]))
+    assert DG._matrix_fingerprint(np.array([[0.0]])) == \
+        DG._matrix_fingerprint(np.array([[-0.0]]))
+    obj_big = np.array([[2 ** 53], [2 ** 53 + 1]], dtype=object)
+    assert DG._matrix_fingerprint(obj_big[:1]) != DG._matrix_fingerprint(obj_big[1:])
+    assert DG._matrix_fingerprint(obj_big) == DG._matrix_fingerprint(obj_big.copy())
+
+
 def t_batch_iter_minimal_corpus():
     import torch as _torch
     it = L.batch_iter(np.arange(8, dtype=np.int64), 7, 1, _torch.device('cpu'), seed=0)
@@ -4998,6 +5053,7 @@ def main():
     _check('L16b meta-analysis prediction-interval df', t_meta_prediction_interval_df)
     _check('L17 TOST decision follows conf', t_tost_conf_controls_decision)
     _check('L18 exact duplicates keep int precision / reject complex', t_data_quality_exact_integer_and_complex_rows)
+    _check('L18b exact numeric contracts + integer-safe matrix fingerprint', t_exact_numeric_contracts_and_fingerprint)
     _check('L19 batch_iter minimal corpus', t_batch_iter_minimal_corpus)
     _check('L20 indexer invalid soft lanes are zero', t_indexer_invalid_soft_lanes_are_zero)
     _check('L21 attention backward partial head group', t_attention_backward_partial_head_group)

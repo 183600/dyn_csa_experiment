@@ -272,10 +272,14 @@ def _int_or(v, default):
     if isinstance(v, numbers.Real):
         f = float(v)
         return int(f) if math.isfinite(f) and f.is_integer() else default
+    # Objects outside numbers.Real (e.g. Decimal) can still define __int__.
+    # Check the numeric value before accepting it so a fractional value is
+    # reported as the default instead of silently truncated to another count.
     try:
-        return int(v)
+        f = float(v)
     except (TypeError, ValueError, OverflowError):
         return default
+    return int(f) if math.isfinite(f) and f.is_integer() else default
 
 def _code_semantics():
     try:

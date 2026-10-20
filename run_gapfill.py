@@ -21,9 +21,10 @@ def _num_or_none(v):
     if isinstance(v, float):
         return int(v) if math.isfinite(v) and v.is_integer() else None
     try:
-        return int(v)
+        f = float(v)
     except (TypeError, ValueError, OverflowError):
         return None
+    return int(f) if math.isfinite(f) and f.is_integer() else None
 
 def git_push(msg):
     if os.environ.get('V6_NO_PUSH'):

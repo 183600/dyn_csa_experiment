@@ -484,7 +484,14 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
                     return None
                 ntok = int(nf)
             else:
-                ntok = int(ntok)
+                # Objects outside numbers.Real (e.g. Decimal) can still
+                # define __int__; check the numeric value before accepting it
+                # so a fractional count cannot be silently truncated and
+                # change the pooled denominator.
+                nf = float(ntok)
+                if not math.isfinite(nf) or nf != math.floor(nf):
+                    return None
+                ntok = int(nf)
         except (TypeError, ValueError, OverflowError):
             return None
         if ntok <= 0 or not math.isfinite(nll):
@@ -9917,9 +9924,10 @@ def _scale_points(points):
             sc = float(scale)
         except (TypeError, ValueError, OverflowError):
             sc = float('nan')
-        try:
-            vb = int(vocab) if vocab is not None else None
-        except (TypeError, ValueError, OverflowError):
+        # Vocab size is an exact count: reject non-integral numeric objects
+        # instead of truncating them into a different tokenisation.
+        vb = None if vocab is None else _as_seed_int(vocab)
+        if vb is not None and vb <= 0:
             vb = None
         out.append({'label': str(label), 'scale': sc, 'effects': effects, 'seeds': seeds_kept,
                     'corpus_fp': (str(corpus_fp) if corpus_fp not in (None, '') else None),
@@ -10974,14 +10982,22 @@ def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
     exactly ``range(n_rows)`` and they never intersect.  The metadata stores
     only counts/ranges/fingerprints (not the full index lists) so it stays
     small when the validation panel is scaled up."""
-    try:
-        n_rows = int(n_rows)
-        seed = int(seed)
-        n_folds = int(n_folds)
-        selection_fold = int(selection_fold)
-        evaluation_fold = int(evaluation_fold)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError('validation_row_split: n_rows/seed/folds must be integers') from None
+    _parsed = {name: _as_seed_int(value) for name, value in (
+        ('n_rows', n_rows), ('seed', seed), ('n_folds', n_folds),
+        ('selection_fold', selection_fold), ('evaluation_fold', evaluation_fold))}
+    _bad = [name for name, value in _parsed.items() if value is None]
+    if _bad:
+        raise ValueError(
+            'validation_row_split: n_rows/seed/folds must be integers, got '
+            + ', '.join(f'{name}={value!r}' for name, value in (
+                ('n_rows', n_rows), ('seed', seed), ('n_folds', n_folds),
+                ('selection_fold', selection_fold),
+                ('evaluation_fold', evaluation_fold)) if name in _bad))
+    n_rows = _parsed['n_rows']
+    seed = _parsed['seed']
+    n_folds = _parsed['n_folds']
+    selection_fold = _parsed['selection_fold']
+    evaluation_fold = _parsed['evaluation_fold']
     if n_rows < 2:
         raise ValueError(f'validation_row_split: need >=2 rows for disjoint folds, got {n_rows}')
     if n_folds < 2:
@@ -11057,13 +11073,12 @@ def tuning_row_split_spec(protocol):
         'selection_fold': spec.get('selection_fold', 0),
         'evaluation_fold': spec.get('evaluation_fold', 1),
     }
-    try:
-        out['seed'] = int(out['seed'])
-        out['n_folds'] = int(out['n_folds'])
-        out['selection_fold'] = int(out['selection_fold'])
-        out['evaluation_fold'] = int(out['evaluation_fold'])
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError('selection_row_split fields must be integers') from None
+    for _key in ('seed', 'n_folds', 'selection_fold', 'evaluation_fold'):
+        _value = _as_seed_int(out[_key])
+        if _value is None:
+            raise ValueError(
+                f'selection_row_split.{_key} must be an integer, got {out[_key]!r}')
+        out[_key] = _value
     return out
 
 def record_subset_ppl(rec, rows):
@@ -11297,10 +11312,10 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
     if _cap is None:
         _fit_ids = _train_all
     else:
-        try:
-            _cap = int(_cap)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f'max_fit_tokens must be an integer or None, got {_cap!r}') from None
+        _cap_i = _as_seed_int(_cap)
+        if _cap_i is None:
+            raise ValueError(f'max_fit_tokens must be an integer or None, got {_cap!r}')
+        _cap = _cap_i
         if _cap < 1:
             raise ValueError(f'max_fit_tokens must be >= 1, got {_cap}')
         _fit_ids = _train_all[:_cap]
