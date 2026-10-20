@@ -6478,6 +6478,44 @@ def t_known_labels_audit():
         raise AssertionError('known_labels without y must fail closed')
 
 
+def t_data_guard_nat_and_label_identity():
+    # NaT timedelta in an object ordering column is still a missing timestamp:
+    # it cannot define a temporal split or a monotone partition.
+    _t = np.array([np.timedelta64(5, 'ns'), np.timedelta64('NaT', 'ns'),
+                   np.timedelta64(1, 'ns')], dtype=object)
+    for call in (lambda: L.split_indices(3, time=_t, train_frac=1 / 3,
+                                         val_frac=1 / 3, test_frac=1 / 3),
+                 lambda: L.assert_no_split_leakage([0], [1], [2], time=_t),
+                 lambda: L.data_quality_report(
+                     np.arange(6, dtype=float).reshape(3, 2), time=_t,
+                     train_idx=[0], val_idx=[1], test_idx=[2])):
+        try:
+            call()
+        except ValueError as e:
+            assert 'NaT' in str(e), e
+        else:
+            raise AssertionError('an object-dtype NaT timedelta must be rejected')
+    # Categorical encoding: NaT is a missing value, not a category level.
+    _cat = np.empty((3, 1), dtype=object)
+    _cat[:, 0] = [np.timedelta64('NaT', 'ns'), np.timedelta64(1, 'ns'),
+                  np.timedelta64(1, 'ns')]
+    _enc = L.LeakageSafeCategoricalEncoder().fit(_cat)
+    assert len(_enc.get_stats()['features'][0]['categories']) == 1, _enc.get_stats()
+    # Missing NaT labels are reported as non-finite label noise.
+    _rep = L.data_quality_report(
+        np.arange(8, dtype=float).reshape(4, 2),
+        y=np.array([0, 1, np.datetime64('NaT'), 2], dtype=object),
+        train_idx=[0, 1], val_idx=[2], test_idx=[3])
+    assert _rep['checks']['nonfinite_labels'] == 1, _rep
+    # Numeric and string labels that merely share a spelling are different
+    # classes; a complete shift between them must not be hidden by str().
+    _rep2 = L.data_quality_report(
+        np.arange(8, dtype=float).reshape(4, 2), y=[1, 1, '1', '1'],
+        train_idx=[0, 1], val_idx=[2, 3])
+    _shift = _rep2['checks']['label_distribution_shift_vs_train']['val']
+    assert _shift['js_divergence'] > 0.5, _rep2
+
+
 def t_build_report_exact_seed_and_params():
     # The zero-GPU report reader must share exp_lib's exact-integer contract:
     # int(Decimal('1.5')) would silently pair the wrong run, and a fractional
@@ -6916,6 +6954,7 @@ def main():
     _check('I29 categorical encoding is fitted on train only', t_categorical_encoder_train_only)
     _check('I30 train-only cleaning before preprocessing', t_clean_training_rows_and_split)
     _check('I31 declared label set catches unseen/holdout labels', t_known_labels_audit)
+    _check('I31b NaT keys and type-qualified label shift', t_data_guard_nat_and_label_identity)
     # Open-block reading rule: the substantive gates (causality, reference
     # pooling, masks, edge cases, closed regression) live in test_open_block.py
     # so they can also be run on their own.

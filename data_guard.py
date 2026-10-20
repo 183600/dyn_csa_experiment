@@ -390,7 +390,7 @@ def _assert_order_finite(order, *, name='order'):
             # cannot sort to an arbitrary position and silently define the
             # split.  Non-numeric/string keys are left to the caller's order.
             for value in arr.tolist():
-                if isinstance(value, np.datetime64):
+                if isinstance(value, (np.datetime64, np.timedelta64)):
                     if np.isnat(value):
                         raise ValueError(
                             f'{name} contains NaT; a temporal split needs a '
@@ -1102,7 +1102,7 @@ def _as_categorical_2d(X, *, name='X'):
 def _category_is_missing(value):
     if value is None:
         return True
-    if isinstance(value, np.datetime64):
+    if isinstance(value, (np.datetime64, np.timedelta64)):
         return bool(np.isnat(value))
     if (not isinstance(value, (bool, np.bool_))
             and not isinstance(value, (complex, np.complexfloating))
@@ -1347,7 +1347,7 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
             f"got {label_conflicts!r}")
     labels = None
     if y is not None:
-        yarr = np.asarray(y)
+        yarr = _label_array(y)
         if yarr.ndim == 0 or yarr.shape[0] != n:
             raise ValueError(
                 f'clean_training_rows: y has '
@@ -1456,7 +1456,7 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     n = int(Xarr.shape[0])
     yarr = None
     if y is not None:
-        yarr = np.asarray(y)
+        yarr = _label_array(y)
         if yarr.ndim == 0 or yarr.shape[0] != n:
             raise ValueError(f'y has length {yarr.shape[0] if yarr.ndim else 1}, '
                              f'expected {n}')
@@ -1904,9 +1904,27 @@ def _hashable_label(value):
     return value
 
 
+def _label_array(y):
+    """Keep heterogeneous labels heterogeneous.
+
+    ``np.asarray([1, '1'])`` silently coerces the integer to the string '1',
+    so the two classes become indistinguishable before the shift/conflict
+    audit sees them.  ndarray inputs keep their declared dtype; a Python
+    sequence is materialised as an object array so each element retains its
+    own type.
+    """
+    if isinstance(y, np.ndarray):
+        return y
+    return np.asarray(y, dtype=object)
+
+
 def _label_key(v):
     if v is None:
         return None
+    # NaT is a missing timestamp label, not a category: treating it as an
+    # ordinary value would hide it from the missing/non-finite label audit.
+    if isinstance(v, (np.datetime64, np.timedelta64)):
+        return None if np.isnat(v) else v
     # Only actual numeric scalars are checked for NaN/Inf.  Coercing every
     # value through float() turned legitimate categorical labels spelled
     # like "nan"/"inf" into missing targets and also conflated numeric
@@ -2175,7 +2193,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     # and the counts are broken down by split so a corrupted holdout cannot
     # hide behind a clean overall total.
     if y is not None:
-        y = np.asarray(y).reshape(-1)
+        y = _label_array(y).reshape(-1)
         if y.shape[0] != n:
             raise ValueError(f'y has length {y.shape[0]}, expected {n}')
         raw_labels = y.tolist()
@@ -2257,14 +2275,18 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         # into it.  String identities keep the report well-defined for mixed
         # categorical labels.
         label_shift = {}
-        _train_lab = [str(labels[i]) for i in
+        # Use the type-qualified label identity, not str(): integer 1 and the
+        # string '1' are different classes, and stringifying both would hide a
+        # real train->holdout label shift behind a shared spelling.
+        _train_lab = [_hashable_label(labels[i]) for i in
                       np.asarray(ref, dtype=np.int64).reshape(-1).tolist()
                       if labels[i] is not None]
         for name in ('val', 'test'):
             _rows = np.asarray(split_rows[name], dtype=np.int64).reshape(-1).tolist()
             if not _rows:
                 continue
-            _hold_lab = [str(labels[i]) for i in _rows if labels[i] is not None]
+            _hold_lab = [_hashable_label(labels[i]) for i in _rows
+                         if labels[i] is not None]
             if not _train_lab or not _hold_lab:
                 continue
             _sh = categorical_shift_report(_train_lab, _hold_lab)
