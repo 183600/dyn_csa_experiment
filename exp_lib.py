@@ -1504,13 +1504,8 @@ def _adaptive_exact_limit():
     return _ADAPTIVE_EXACT_DEFAULT
 
 
-def causal_adaptive_threshold(sim, target_block_tokens):
-    if sim.numel() == 0:
-        # Preserve the caller's shape: an empty batch [0, n] or a zero-width
-        # row must not turn into a flat length-0 tensor.
-        return torch.empty_like(sim)
-    n = int(sim.shape[-1])
-    # Hard safety ceiling only (the sampling path below is bounded).
+def _adaptive_max_limit():
+    """Effective CSA_ADAPTIVE_MAX_TOKENS ceiling (also part of run_cfg)."""
     _max_len = 1 << 20
     _env_max = os.environ.get('CSA_ADAPTIVE_MAX_TOKENS', '').strip()
     if _env_max:
@@ -1518,6 +1513,17 @@ def causal_adaptive_threshold(sim, target_block_tokens):
             _max_len = max(1, int(_env_max))
         except ValueError:
             print(f'[segmenter] CSA_ADAPTIVE_MAX_TOKENS={_env_max!r} is not an integer — using {_max_len}')
+    return _max_len
+
+
+def causal_adaptive_threshold(sim, target_block_tokens):
+    if sim.numel() == 0:
+        # Preserve the caller's shape: an empty batch [0, n] or a zero-width
+        # row must not turn into a flat length-0 tensor.
+        return torch.empty_like(sim)
+    n = int(sim.shape[-1])
+    # Hard safety ceiling only (the sampling path below is bounded).
+    _max_len = _adaptive_max_limit()
     if n > _max_len:
         raise RuntimeError(
             f'causal_adaptive_threshold 超出显式安全上限 {_max_len}（CSA_ADAPTIVE_MAX_TOKENS）: '
@@ -21426,7 +21432,12 @@ def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch, devi
         _tk = training_knobs_fingerprint(amp_dtype=_amp_mode, eager_batch=_eb)
     _amp = _amp_mode or 'fp32'
     _ae = _adaptive_exact_limit()
-    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_tk{_tk}_amp{_amp}_eb{int(_eb)}_ae{_ae}_cs{code_stamp()}'
+    # The sampled long-context segmenter's grid depends on this ceiling too.
+    # Keep the default token absent so existing default fingerprints stay
+    # stable, but a non-default ceiling must invalidate resumed cells.
+    _am = _adaptive_max_limit()
+    _am_tok = '' if _am == (1 << 20) else f'_am{_am}'
+    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_tk{_tk}_amp{_amp}_eb{int(_eb)}_ae{_ae}{_am_tok}_cs{code_stamp()}'
 
 
 def _plan_run(cfg, summary_path, fp):

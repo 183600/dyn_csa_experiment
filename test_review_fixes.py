@@ -1205,6 +1205,18 @@ def t_training_knobs_in_resume_fingerprint():
     finally:
         L.training_knobs = orig
     assert fp3 is not None and fp3 != fp1, 'changing optimizer/schedule/clip knobs must invalidate resume (no silent mixed panel)'
+    # The sampled long-context segmenter's ceiling changes the cut geometry, so
+    # it must invalidate a resumed cell even when the exact-limit stamp matches.
+    _old_am = os.environ.get('CSA_ADAPTIVE_MAX_TOKENS')
+    try:
+        os.environ['CSA_ADAPTIVE_MAX_TOKENS'] = '2048'
+        fp4 = L._run_fp(dict(cfg), 8, 1, 1, 8, 16, tr, va)
+    finally:
+        if _old_am is None:
+            os.environ.pop('CSA_ADAPTIVE_MAX_TOKENS', None)
+        else:
+            os.environ['CSA_ADAPTIVE_MAX_TOKENS'] = _old_am
+    assert fp4 != fp1 and '_am2048' in fp4, (fp1, fp4)
 
 
 def t_controlled_variables_all_seed_records():
