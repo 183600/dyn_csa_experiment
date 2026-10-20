@@ -3044,6 +3044,29 @@ def t_simple_baseline_ngram_and_audit():
             pass
         else:
             raise AssertionError(f'invalid vocab_size {_bad_vocab!r} was accepted')
+    # Discrete model order and smoothing constants are exact scalars too:
+    # True == 1 would silently run the unigram arm as a "bigram" trial.
+    for _bad_order in (True, 1.5, '1.5', 3):
+        try:
+            L.ngram_lm_score(train, val, vocab, order=_bad_order)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid order {_bad_order!r} was accepted')
+    for _bad_alpha in (True, float('nan'), float('inf'), 0, -1):
+        try:
+            L.ngram_lm_score(train, val, vocab, order=1, alpha=_bad_alpha)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid alpha {_bad_alpha!r} was accepted')
+    try:
+        L.simple_baseline_fit(train, val, vocab, protocol=dict(
+            proto, arms={'u': {'order': 1.5}}, grids={'u': {'alpha': [0.1]}}))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a fractional declared order must not be truncated')
 
 
 def t_simple_baseline_fit_budget_is_bounded_and_disclosed():

@@ -11421,10 +11421,12 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     token-weighted, matching the LM metric policy."""
     ids = np.asarray(_ngram_token_ids(train_ids, 'train'), dtype=np.int64)
     vocab_size = _ngram_vocab_size(vocab_size)
+    if isinstance(alpha, (bool, np.bool_)):
+        raise ValueError('alpha must be a positive finite number, got a boolean')
     alpha = float(alpha)
-    if alpha <= 0:
-        raise ValueError('alpha must be positive')
-    if order not in (1, 2):
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError('alpha must be a positive finite number')
+    if isinstance(order, (bool, np.bool_)) or order not in (1, 2):
         raise ValueError('order must be 1 (unigram) or 2 (bigram)')
     all_eval, prev, nxt = _ngram_eval_parts(eval_ids)
     if all_eval.size == 0:
@@ -11445,8 +11447,10 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
         return {'order': 1, 'alpha': alpha, 'interpolation': 0.0,
                 'n_tokens': int(all_eval.size), 'nll': nll, 'ppl': float(_safe_exp_ppl(nll))}
     _uni, uniq, ctx, pair_counts = counts
+    if isinstance(interpolation, (bool, np.bool_)):
+        raise ValueError('interpolation must be a finite number in [0, 1]')
     lam = float(interpolation)
-    if not (0.0 <= lam <= 1.0):
+    if not (math.isfinite(lam) and 0.0 <= lam <= 1.0):
         raise ValueError('interpolation must be in [0, 1]')
     # First token of each row: unigram only (no cross-row conditioning).  A
     # 1-D evaluation stream is ONE row, so only its first token is
@@ -11519,7 +11523,12 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
     # hyper-parameters only affect the smoothing on top of them.
     _shared_counts = None
     for arm, meta in arms.items():
-        order = int((meta or {}).get('order', 1))
+        # The model order is a discrete identity: int(1.9) or int(True) would
+        # silently run a different (unigram) baseline than the declared one.
+        order = _as_seed_int((meta or {}).get('order', 1))
+        if order is None:
+            raise ValueError(f'simple baseline {arm}: order must be an integer, '
+                             f'got {(meta or {}).get("order", 1)!r}')
         grid = grids.get(arm) or {}
         alphas = list(grid.get('alpha') or [0.1])
         interps = list(grid.get('interpolation') or [1.0]) if order == 2 else [0.0]
