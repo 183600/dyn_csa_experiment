@@ -490,12 +490,14 @@ def _relaxed_pair_reason(a, b, tuned_arms):
         return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
     if ia is not None and ib is not None and ia != ib:
         return f'different init_core_fp ({str(ia)[:12]}… vs {str(ib)[:12]}…)'
-    try:
-        pa, pb = int(a.get('params')), int(b.get('params'))
-        if abs(pa - pb) / float(max(pa, pb, 1)) > 0.01:
-            return f'parameter mismatch ({pa} vs {pb})'
-    except (TypeError, ValueError, OverflowError):
-        pass
+    # Capacity control must fail CLOSED.  The old try/except turned a missing
+    # `params` field (int(None) -> TypeError) into a silent pass, so a tuned
+    # contrast could be reported with no capacity check at all.  The shared
+    # helper also compares the recorded non-embedding/active breakdown, since
+    # equal totals can hide a reallocated MLP or dead indexer projections.
+    _param_why = L.param_pair_reason(a, b)
+    if _param_why:
+        return _param_why
     if tuned_arms.get(a.get('variant')) != tuned_arms.get(b.get('variant')):
         return 'arms did not receive the same declared tuning range'
     return None

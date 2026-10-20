@@ -1181,6 +1181,16 @@ def t_tuned_pairing_keeps_optimizer_gate():
     b5 = dict(b)
     why4 = BT._relaxed_pair_reason(a4, b5, {'a': 3, 'b': 3})
     assert why4 and 'unverifiable init_core_fp' in why4, why4
+    # Capacity must fail CLOSED: a missing params field used to slip through
+    # the old int(None) try/except as if the pair were matched.
+    b6 = dict(b)
+    b6.pop('params')
+    why5 = BT._relaxed_pair_reason(a, b6, {'a': 3, 'b': 3})
+    assert why5 and 'unverifiable params' in why5, why5
+    a7 = dict(a, param_breakdown={'total': 100, 'non_embedding': 80, 'active': 70})
+    b7 = dict(b, param_breakdown={'total': 100, 'non_embedding': 80, 'active': 50})
+    why6 = BT._relaxed_pair_reason(a7, b7, {'a': 3, 'b': 3})
+    assert why6 and 'parameter breakdown' in why6, why6
 
 
 def t_arm_mean_std_and_relative_effect():
@@ -4276,6 +4286,8 @@ def t_param_and_compute_control_detail():
     d = L._param_control_detail(recs, 'a', 'b')
     assert d['total_controlled'] is True and d['active_controlled'] is False, d
     assert d['active_rel_diff'] > 0.01, d
+    assert L._param_capacity_controlled(d) is False, d
+    assert 'breakdown' in L.param_pair_reason(recs[('a', 'p', 0)], recs[('b', 'p', 0)]), 'breakdown must fail closed'
     c = L._compute_control_detail(recs, 'a', 'b')
     assert c['compute_matched'] is False and c['more_compute_arm'] == 'b', c
     assert abs(c['time_ratio_a_over_b'] - 0.5) < 1e-12, c

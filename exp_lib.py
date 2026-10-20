@@ -13036,6 +13036,39 @@ def _param_control(recs, a, b):
     rel = abs(pa - pb) / float(max(pa, pb, 1))
     return (float(rel), bool(rel <= 0.01))
 
+def param_pair_reason(ra, rb, *, tolerance=0.01, require_breakdown=False):
+    """Fail-closed parameter control for a single arm pair.
+
+    A missing/zero parameter count is UNVERIFIABLE, not a pass: the historical
+    tuned-baseline rule caught `TypeError` from `int(None)` and silently
+    continued, so a tuned contrast could be quoted without any capacity check.
+    When both records carry `param_breakdown`, a >`tolerance` disagreement in
+    the non-embedding or active count is also a failure (totals can match while
+    MLP width is reallocated or indexer projections are dead).  Returns None
+    when the pair passes, else a human-readable reason.
+    """
+    pa, pb = _as_seed_int(ra.get('params')), _as_seed_int(rb.get('params'))
+    if pa is None or pb is None or pa <= 0 or pb <= 0:
+        return 'unverifiable params (at least one record omits a usable parameter count)'
+    rel = abs(pa - pb) / float(max(pa, pb, 1))
+    if rel > float(tolerance):
+        return f'parameter mismatch ({pa} vs {pb}, {100.0 * rel:.2f}% > {100.0 * float(tolerance):.2f}%)'
+    ba, bb = ra.get('param_breakdown'), rb.get('param_breakdown')
+    if isinstance(ba, dict) and isinstance(bb, dict):
+        for key, label in (('non_embedding', 'non-embedding'), ('active', 'active')):
+            va, vb = _finite_scalar(ba.get(key)), _finite_scalar(bb.get(key))
+            if va is None or vb is None:
+                if require_breakdown:
+                    return f'unverifiable param_breakdown.{key}'
+                continue
+            _rel = abs(va - vb) / max(abs(va), abs(vb), 1.0)
+            if _rel > float(tolerance):
+                return (f'parameter breakdown mismatch ({label}: {va:g} vs {vb:g}, '
+                        f'{100.0 * _rel:.2f}% > {100.0 * float(tolerance):.2f}%)')
+    elif require_breakdown:
+        return 'unverifiable param_breakdown (at least one record omits it)'
+    return None
+
 def _param_breakdown_of_arm(recs, arm):
     for (v, _t, _s), r in recs.items():
         if v != arm:
