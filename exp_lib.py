@@ -72,7 +72,7 @@ QUICK = False
 RUN_CAP = dict(total_hours=58.333333333333336, margin=0.93, already_hours=0.0, state_path='run_time_state.json')
 CODE_SEMANTICS = 'v11.128'
 CKPT_CODE = CODE_SEMANTICS
-# ---- 三算子内核路径（docs/compute_plan.md §3 的 M0 工作包；实现与数值契约
+# ---- 三算子内核路径（M0 工作包；实现与数值契约
 # 见 csa_kernels.py）。CSA_KERNEL 未设置时本模块的执行路径与指纹逐字节不变。
 try:
     import csa_kernels as _CK
@@ -667,10 +667,10 @@ ABL_REFS = ['full', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic'
 RUN_ABL = dict(RUN, outdir='results_lm_v4_abl', variants=ABL_REFS + ABL_VARIANTS, seeds=[0] if QUICK else [0, 1, 2, 3, 4])
 RUN_LONG = dict(RUN, n_train_tokens=2000000 if QUICK else 110000000, steps=500 if QUICK else 20000, warmup=200, eval_every=1000, seeds=[0] if QUICK else [0, 1, 2, 3], outdir='results_lm_v3_long', variants=['full', 'full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn'])
 RUN_SCALE = dict(RUN, d=384, n_layers=8, n_heads=12, d_head=32, seq_len=1024, batch_size=8, n_train_tokens=2000000 if QUICK else 40000000, steps=500 if QUICK else 4000, warmup=100, eval_every=500, seeds=[0] if QUICK else [0, 1, 2], outdir='results_lm_v5_scale', variants=['full', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic'])
-# ---- B 档规模阶梯（docs/compute_plan.md §4–§5；档位已选定 B 进取）----
-# 以下全部为规划值：步数 / 批大小 / 学习率等训练量与超参按
-# docs/compute_plan.md 的口径滚动修正；参数量以 SmallGPT 实例化统计（见
-# m0_supp.py params，S4 按规划的解析外推口径）。
+# ---- B 档规模阶梯（档位已选定 B 进取）----
+# 以下全部为规划值：步数 / 批大小 / 学习率等训练量与超参以此为准；
+# 实际参数量以 SmallGPT 实例化统计为准（见 m0_supp.py params，S4 按
+# 规划的解析外推口径）。
 B_VOCAB = 32768
 SCALE_LADDER = {'S1': dict(d=768, n_layers=12, n_heads=12, d_head=64), 'S2': dict(d=1024, n_layers=16, n_heads=16, d_head=64), 'S3': dict(d=1536, n_layers=20, n_heads=24, d_head=64), 'S4': dict(d=2048, n_layers=24, n_heads=32, d_head=64)}
 # Declared transfer assumptions for the S1→S4 ladder.  They are deliberately
@@ -4232,7 +4232,7 @@ class AttnCfg:
     # 'threshold' uses hard-cut decisions.  'reinforce'
     # samples the cut decisions and adds a score-function term for the LM loss,
     # so the task objective can actually learn the boundary policy instead of
-    # only the compression-rate regularizer (review 3 issue 6).
+    # only the compression-rate regularizer.
     boundary_policy: str = 'threshold'
 
     def __post_init__(self):
@@ -4247,8 +4247,8 @@ class AttnCfg:
         if int(self.pool_position_capacity) < 1:
             raise ValueError(f'pool_position_capacity must be >= 1, got {self.pool_position_capacity!r}')
         # Non-negative/positive structural bounds.  A negative window or
-        # overlap is not a meaningful configuration; passing it through used to
-        # fail only later inside torch.arange/index maths.
+        # overlap is not a meaningful configuration; reject it here rather
+        # than failing later inside torch.arange/index maths.
         if int(self.min_block) < 1:
             raise ValueError(f'min_block must be >= 1, got {self.min_block!r}')
         if int(self.block_size) < 1:
@@ -5430,7 +5430,7 @@ def make_layer_cfgs(n_layers, variant):
         elif variant == 'csa_dyn_nosink':
             cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, use_sink=False))
         elif variant == 'csa_dynamic_task':
-            # Opt-in end-to-end boundary arm (review 3 issue 6): identical to
+            # Opt-in end-to-end boundary arm: identical to
             # csa_dynamic except the hard cuts are sampled and trained by the
             # LM loss through a score-function term.  This is a NEW arm; the
             # csa_dynamic remains threshold/comp_reg-only and must
@@ -5895,7 +5895,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                         'cache metadata does not attest document-disjoint train/validation splits')
                 # Fingerprints make the sidecars part of the cache identity:
                 # a sidecar swapped in from another build can be disjoint by
-                # accident while no longer describing the token arrays.
+                # accident without describing these token arrays.
                 if _mdoc.get('train_fp') and _mdoc['train_fp'] != _ids_fp(_trd):
                     _problems.append(
                         'train document-id sidecar does not match the fingerprint in the cache metadata')
@@ -5928,12 +5928,9 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         last_err = None
         for repo in ('Salesforce/wikitext', 'wikitext'):
             try:
-                # v11.128: request train/validation EXPLICITLY.  The historical
-                # `load_dataset(repo, config, cache_dir=...)` without `split=`
-                # materialises all three splits, including wiki.test.raw, so
-                # the claim "the test split has never been read by any earlier
-                # phase" was false at the file level.  Test is now only ever
-                # requested by load_wikitest.
+                # Request train/validation EXPLICITLY.  Calling without
+                # `split=` materialises all three splits, including
+                # wiki.test.raw; test is only ever requested by load_wikitest.
                 ds = {
                     'train': load_dataset(repo, 'wikitext-103-raw-v1', split='train', cache_dir=cache_dir),
                     'validation': load_dataset(repo, 'wikitext-103-raw-v1', split='validation', cache_dir=cache_dir),
@@ -6391,10 +6388,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             _memo_put(_WT103_TEST_MEMO, _mkey, out, _WT103_TEST_MEMO_CAP)
             return out
     # cold build: resolve the train tokenizer FIRST, then touch the test rows.
-    # The historical order read wiki.test.raw before validating the tokenizer,
-    # so a tokenizer/fit mismatch failed only after the held-out split had
-    # already been read.  `test_rows` is populated after the validation block
-    # below, immediately before tokenisation.
+    # Resolve the tokenizer before touching the test rows, so a tokenizer/fit
+    # mismatch fails before the held-out split is read.  `test_rows` is
+    # populated after the validation block below, immediately before
+    # tokenisation.
     test_rows = None
     ds_test = None
     ds_train = None
@@ -7137,7 +7134,7 @@ def _fineweb_docs(source):
         yield _doc_exact_fp(txt), txt
 
 def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, cache_dir='./fineweb_cache', source='sample-10BT', fit_docs=20000):
-    """B-tier corpus (docs/compute_plan.md §5): FineWeb-Edu, self-trained BPE.
+    """B-tier corpus: FineWeb-Edu, self-trained BPE.
 
     Discipline mirrors load_wikitext exactly: npy cache keyed by the full
     protocol tag, atomic writes, sha256 content fingerprint in the meta file,
@@ -7686,7 +7683,7 @@ def load_run_corpus(cfg):
     the drivers have always passed — behaviour is bit-identical to the former
     hard-wired load_wikitext call, so no existing panel, fingerprint or record
     is touched.  'dataset': 'fineweb' selects the B-tier corpus
-    (docs/compute_plan.md §5) with its own cache directory, tokenizer width,
+    with its own cache directory, tokenizer width,
     source name and fit protocol."""
     name = cfg.get('dataset') or 'wikitext'
     if name == 'wikitext':
@@ -8258,7 +8255,7 @@ def count_params(m):
 def param_breakdown(m):
     """Parameter counts by functional group, for every record.
 
-    A headline comparison that only reports `params` invites the reviewer's
+    A headline comparison that only reports `params` invites a misleading
     question "which parameters, and is the comparison capacity-matched?".
     This is a deterministic structure-only count (no forward pass, no RNG):
     total / attention / attention projections / indexer / MLP / norms /
@@ -8366,7 +8363,7 @@ def open_block_config(m):
 def train_objective(m, *, comp_lambda=0.0, delta_lr_mult=1.0):
     """Describe the ACTUAL optimisation objective of an arm.
 
-    Review 3: dense and sparse arms do not share an objective — sparse arms
+    Dense and sparse arms do not share an objective — sparse arms
     add `comp_lambda * comp_reg` and give `delta_logit` a different LR.  A
     comparison is only mechanism-clean when these descriptors match.  The
     values are read from the built model (not from the variant name), so a
@@ -8930,9 +8927,9 @@ def exact_signflip_p(deltas):
     approximation.  Non-finite deltas are dropped (the count is returned).
     Pure function over its input — used by the aggregate audit so the core
     panel reports the same p the per-phase suites do, rather than a bare
-    mean±std a reviewer could mistake for evidence.
+    mean±std that could be mistaken for evidence.
 
-    有效性假设（评审二轮·意见九，必须在预注册文档同步声明）：精确符号翻转
+    有效性假设（必须在预注册文档同步声明）：精确符号翻转
     检验的 p 值正确性依赖「配对内交换性」——每个种子下的两臂共享除臂本身
     之外的一切随机因素（同数据顺序、同评测行、同腐坏网格；初始化 RNG 按
     种子播种，臂间参数量差异对 RNG 流的扰动属于「臂」的一部分）。种子编号
@@ -9195,7 +9192,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
         verdict = 'not significant at this n (p>=%.3g)' % alpha
     if seed_driven:
         verdict += ' | UNSTABLE: dropping one seed flips the mean sign'
-    # Robustness readouts the review asks for: the exact sign-flip test is a
+    # Robustness readouts: the exact sign-flip test is a
     # seed-level sign test, so report the sign split, a paired bootstrap CI, a
     # Wilcoxon sensitivity p, and — when the caller supplies both arms — an
     # UNPAIRED bootstrap that does not assume exchangeability.  None of these
@@ -9214,7 +9211,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
             'p_wilcoxon': _wil.get('p'), 'p_wilcoxon_method': _wil.get('method'),
             'ci95_paired_bootstrap': _paired_ci, 'ci95_unpaired_bootstrap': _unpaired_ci}
 
-# ---- 预注册功效 / 分辨率工具（评审二轮·意见一/九） ------------------------------
+# ---- 预注册功效 / 分辨率工具 --------------------------------------------------
 # 动机：一个冻结方案如果「无论数据多强都不可能达到 p_holm < α」，它落在
 # 分辨率上限而不是「保守」。下面的函数把这件事变成加载清单时就能机器判定
 # 的硬门槛，而不是统计阶段的一句「保守」警告。
@@ -9356,7 +9353,7 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
 
 
 def tost_paired(deltas, margin, conf=0.90):
-    """配对 TOST 等价性检验（G0 训练级等价门槛的统计件，评审二轮·意见八）。
+    """配对 TOST 等价性检验（G0 训练级等价门槛的统计件）。
 
     「未发现显著差异 ≠ 等价」：等价性必须预设 margin 并检验 |mean| 落在
     (−margin, +margin) 内。这里用真正的配对 t（df=n−1，`_student_t_sf` +
@@ -10152,7 +10149,7 @@ def loglog_regression(points, *, alpha=0.05):
 def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
                           d_spread_min=1.2):
     """Fit log10(crossover tokens) ~ log10(d_model) only when the points can
-    support it.  This is the reviewer-requested replacement for fitting a line
+    support it.  This replaces fitting a line
     through whatever panels happen to exist.
 
     `entries` is an iterable of dicts (or a dict label -> dict) with keys:
@@ -12304,7 +12301,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     component is `verified` only when a controlled contrast is significant
     AFTER that correction and its effect exceeds seed noise; merely having
     n>=min_n is reported as `measured` (descriptive), never as verification.
-    Per-component Holm results are also exported, because the reviewer-facing
+    Per-component Holm results are also exported, because the report-facing
     claim is usually per innovation, while the global correction is the
     conservative cross-component reading.
 
@@ -12380,7 +12377,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         report.setdefault('objective_confounded', []).append(
                             '%s vs %s: %s — same run_cfg but different actual loss/optimizer objective; '
                             'the contrast is a system-level comparison, not an isolated mechanism' % (a, b, '; '.join(_obj_bad)))
-                    # Compute-budget control (review issue 2c).  Equal tokens is
+                    # Compute-budget control.  Equal tokens is
                     # not equal compute.  Report the measured mismatch and its
                     # direction; only a mismatch that FAVOURS the claimed winner
                     # downgrades the contrast, because the reverse is conservative.
@@ -12592,7 +12589,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         for comp, contrasts in design_group.items():
             entries = entries_by_comp.get(comp, [])
             # Per-component Holm: the family is this innovation's own declared
-            # contrasts (the reviewer usually asks "is THIS module useful?").
+            # contrasts ("is THIS module useful?").
             m_comp = max(len(contrasts), len(entries))
             _holm_assign(entries, m_comp, alpha, 'p_holm_component')
             for e in entries:
@@ -13998,7 +13995,7 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
     need_reg_layers = [blk.attn for blk in model.blocks if hasattr(blk.attn, 'need_reg')]
     need_reg_prior = [_a.need_reg for _a in need_reg_layers]
     nll = torch.zeros((), dtype=torch.float64, device=device)
-    # Per-document NLL (review 3: eval-subset uncertainty must be visible, not
+    # Per-document NLL (eval-subset uncertainty must be visible, not
     # only the seed-to-seed spread).  Rows are the fixed evaluation documents;
     # with eval_rows sampling, a row with no sampled target gets 0 tokens and
     # is excluded by the bootstrap consumer.
@@ -16242,7 +16239,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'tokens_seen_unique_frac_estimate': _uniq_frac,
               'token_accounting_note': 'tokens_seen counts window draws; unique-token coverage is an estimate under independent uniform window draws, not a measurement',
               'train_time_s': wall, 'train_tokens_per_s': ((steps * batch_size * seq_len * _world) / wall if wall and wall > 0 else None), 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'init_core_fp': _init_core_fp, 'data_fp': _ids_fp(train_ids),
-              # Review 3: the token-level evidence behind the reported PPL.
+              # The token-level evidence behind the reported PPL.
               # `nll_sum / n_tokens` is the pooled-NLL estimator; the per-row
               # rows let a report bootstrap DOCUMENT uncertainty instead of
               # treating the seed as the only source of error.
@@ -17809,7 +17806,7 @@ def _group_params(recs):
 def _pooled_ppl_from_records(recs):
     """Token-pooled PPL: exp(sum NLL / sum N tokens) over all seeds.
 
-    This is the estimator the review asks for; the arithmetic mean of per-seed
+    This is the desired estimator; the arithmetic mean of per-seed
     PPLs is kept as `ppl_mean_arithmetic` for backward compatibility but is no
     longer the primary aggregate when token counts exist.  Records that predate
     `nll_sum`/`n_tokens` cannot be pooled and fall back explicitly."""

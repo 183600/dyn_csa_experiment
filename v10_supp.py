@@ -48,16 +48,16 @@ def make_guard():
                     print(f'[v10] WARNING: cannot read {src} ({type(e).__name__}: {e}) — this run starts UNCALIBRATED (the first admission uses the conservative default)')
     return g
 P3MT_PAYLOAD = dict(outdir='results_v10_mech', variants=['csa_fixed_rope', 'full_rope'], eval_lens=[512, 1024, 2048, 4096], steps=3000, train_len=512, vocab=8192)
-# 从头训练的选择器对照（评审点 2）：与 csa_fixed_rope / full_rope 完全同一配方
+# 从头训练的选择器对照：与 csa_fixed_rope / full_rope 完全同一配方
 # （3000 步、同数据、同种子）训练，唯一差异是选择方式本身。P3MT 的 variants
 # 扩入它们后，既有 ckpt 的 recipe 逐字节不变（recipe 只含 per-variant 的 mr 与
 # 语料指纹），resume 不会重训已完成的臂。
 SCRATCH_CONTROLS = ['csa_fixed_rope_randidx', 'csa_fixed_rope_allblocks']
 P3MT_PAYLOAD_CONTROLS = dict(P3MT_PAYLOAD, variants=SCRATCH_CONTROLS)
-# 干扰注入的腐坏模式（评审点 3）：
+# 干扰注入的腐坏模式：
 #   uniform —— 既有协议：远端 ρ 比例 token 替换为词表均匀随机 token（既有
 #              cell 键不带 mode 后缀，完全向后兼容）；
-#   natural —— 真实 token 同位置换（评审二轮·意见六概念更名）：保持
+#   natural —— 真实 token 同位置换：保持
 #              unigram/词频统计，但逐位置拼接破坏句法、语义与篇章结构——
 #              只支持「对真实语料 token 替换的鲁棒性」，不支持「对自然
 #              长文档干扰的鲁棒性」（报告标签 realistic-token，§15 修订）；
@@ -66,7 +66,7 @@ P3MT_PAYLOAD_CONTROLS = dict(P3MT_PAYLOAD, variants=SCRATCH_CONTROLS)
 #              只作互补探针、与 delete 成对解读（§15 修订）；
 #   delete  —— 远端整体删除（输入只剩目标区，RoPE 相对位置自洽）：同上
 #              问题的另一口径，同时改变长度与上下文结构；
-#   span    —— 连续句段替换（评审二轮·意见六新增）：远端 k 个 token 换成
+#   span    —— 连续句段替换：远端 k 个 token 换成
 #              供体行的连续片段（段长 PROBE_SPAN_LEN，默认 32）——段内保
 #              持局部句法，段间与跨位置连贯性被破坏；ρ 为名义值，实际
 #              替换量 = 段数 × 段长（可由同一确定性公式复算）；
@@ -199,7 +199,7 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     输入 val_ids 为 (n_rows, >=eval_len+1) 的 token 面板；返回长度
     eval_len+1 的 int64 行。四种既有模式（uniform/natural/mask/delete）与
     既有实现逐字节一致（同一 RNG 播种、同一调用顺序——见 _distractor_ppls
-    的行缓存键）。三种新模式（span/doc/topical，评审二轮·意见六）同样只
+    的行缓存键）。三种新模式（span/doc/topical）同样只
     依赖 (eval_len, jj, rho, mode, span_len)，保证臂间严格配对。"""
     n_far = eval_len - target
     if mode not in _CORRUPT_MODES:
@@ -1182,7 +1182,7 @@ def _panel_endpoint(hists, tps):
 
 def _panel_convergence(hists):
     """Plateau-in-training-window diagnostic per (variant, seed) — NOT a convergence
-    proof (review-2 issue 7 revision).
+    proof.
 
     相对 PPL 改进 < 1%（最后四分之一 eval 窗口）只能排除「仍在快速下降」
     的情形；学习率衰减、平台期、评测噪声或优化停滞都可能满足该条件。
@@ -1385,7 +1385,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     if not other or not _pairable(learned, other, Ln, rho, tag):
                         continue
                     _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other)
-                # intervention-vs-retrain gap (review-2 issue 5: NOT a causal
+                # intervention-vs-retrain gap (NOT a causal
                 # mismatch decomposition): test-time intervention minus the
                 # trained-with-that-selection control at the same (L, rho).
                 # For losses the positive direction means the intervention
@@ -1661,7 +1661,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                     print(f'[v10 report] {v}: {len(_rv) - len(_cur)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur)} current one(s)')
                 _rv = _cur
             elif _rv:
-                # Fail closed (review issue 16): a panel with no record under
+                # Fail closed: a panel with no record under
                 # the current code/recipe stamp is excluded from the table and
                 # from every conclusion, not quoted with a warning marker.
                 print(f'[v10 report] {v}: no by-length record carries the current code semantics ({L.code_stamp()}) — EXCLUDED from the table and conclusions ({len(_rv)} stale record(s) left on disk)')
@@ -1806,26 +1806,26 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         _dtxt = '正值表示「看得见远距噪声就会受害」，支持限制远距注意力暴露带来抗噪性' if _dpos else '区间并非全正，「远距暴露致害」的方向在本轮产物上不成立，以配对数字为准'
         A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——{_dtxt}；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，' + ('该种子数下无法达到 0.05 显著性' if not (p_floor <= 0.05) else '分辨率已足以达到 0.05，未显著是数据结论而非分辨率上限') + '），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
         A('')
-    # ---- P3M-2：从头训练的选择器对照（评审点 2）----
+    # ---- P3M-2：从头训练的选择器对照 ----
     _new_c = {k: v for k, v in contr.items() if k not in _legacy and not k.startswith('ΔNLL')}
     if _new_c:
         A('### P3M-2 从头训练的选择器对照（同规模）')
         A('')
-        A('**背景（评审点 2）**：测试时把已训练模型的选择器替换为随机/全块，只能回答「模型是否依赖原选择器」，不能回答「学习式选择是否优于训练充分的随机选择或全块读取」——后两者的测试时干预改变了模型训练时适应的输入分布，效果下降可能来自失配本身。P3MTC 按与 P3MT **完全相同的配方**（3000 步、同数据、同种子）从头训练两个对照：`csa_fixed_rope_randidx`（训练期选择即随机）与 `csa_fixed_rope_allblocks`（训练期就读全部块；与 `csa_fixed_rope` 逐项同构——同 c_kv 压缩、同 qk_norm、同 RoPE、同 sink/窗口，仅选择方式不同，因此它同时是**逐项对齐的 dense 对照**，评审点 5）。')
+        A('**背景**：测试时把已训练模型的选择器替换为随机/全块，只能回答「模型是否依赖原选择器」，不能回答「学习式选择是否优于训练充分的随机选择或全块读取」——后两者的测试时干预改变了模型训练时适应的输入分布，效果下降可能来自失配本身。P3MTC 按与 P3MT **完全相同的配方**（3000 步、同数据、同种子）从头训练两个对照：`csa_fixed_rope_randidx`（训练期选择即随机）与 `csa_fixed_rope_allblocks`（训练期就读全部块；与 `csa_fixed_rope` 逐项同构——同 c_kv 压缩、同 qk_norm、同 RoPE、同 sink/窗口，仅选择方式不同，因此它同时是**逐项对齐的 dense 对照**）。')
         A('')
         A('| 比较 | n | Δ mean±std | d_z | p (exact) | p 下限 |')
         A('|---|---|---|---|---|---|')
         for k, v in sorted(_new_c.items()):
             A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v.get('cohens_dz', float('nan')):+.2f} | {v['p_exact_signflip']:.3f} | {v.get('p_floor', float('nan')):.3f} |')
         A('')
-        A('> `retrain-gap(…)` 行 = 测试时干预 − 同规模从头训练对照（同 L、同 ρ）。评审二轮·意见五修订：对越低越好的损失，正值说明干预比重新训练**更差**，该差距本身**可能包含**训练—测试失配的代价，也混合了优化适应与参数差异——它是「干预与重新训练的效果差」，**不是**已完成的因果失配分解，不得把简单相减解释为「不能归因于失配的部分」。`arch-aligned` 行 = dense − 全块 CSA 孪生（两者仅剩 KV 压缩投影与分块读取方式之差）。')
+        A('> `retrain-gap(…)` 行 = 测试时干预 − 同规模从头训练对照（同 L、同 ρ）。对越低越好的损失，正值说明干预比重新训练**更差**，该差距本身**可能包含**训练—测试失配的代价，也混合了优化适应与参数差异——它是「干预与重新训练的效果差」，**不是**已完成的因果失配分解，不得把简单相减解释为「不能归因于失配的部分」。`arch-aligned` 行 = dense − 全块 CSA 孪生（两者仅剩 KV 压缩投影与分块读取方式之差）。')
         A('')
-    # ---- ΔNLL：污染增量（评审点 3）----
+    # ---- ΔNLL：污染增量 ----
     dnll = probe.get('delta_nll') or {}
     if dnll:
         A('### P3M-3 污染增量 ΔNLL（按 NLL 口径，含干净条件基线）')
         A('')
-        A('**口径（评审点 3）**：ΔNLL = NLL_污染 − NLL_干净（nats/目标 token，逐种子配对）。腐坏模式：`uniform`（均匀随机 token，既有协议）、`natural`（其他真实序列同位置 token）、`mask`（远端整体屏蔽为 `<pad>`）、`delete`（远端整体删除，仅剩目标区）。`mask`/`delete` 回答「干净远端上下文到底带来多少收益」；`natural` 与 `uniform` 之差只回答「真实语料同位置 token 替换是否比均匀随机替换更难过滤」；它不是主题干扰、语义相近干扰、重复文本或对抗干扰，不能据此声称普遍抗噪性。')
+        A('**口径**：ΔNLL = NLL_污染 − NLL_干净（nats/目标 token，逐种子配对）。腐坏模式：`uniform`（均匀随机 token，既有协议）、`natural`（其他真实序列同位置 token）、`mask`（远端整体屏蔽为 `<pad>`）、`delete`（远端整体删除，仅剩目标区）。`mask`/`delete` 回答「干净远端上下文到底带来多少收益」；`natural` 与 `uniform` 之差只回答「真实语料同位置 token 替换是否比均匀随机替换更难过滤」；它不是主题干扰、语义相近干扰、重复文本或对抗干扰，不能据此声称普遍抗噪性。')
         A('')
         A('| 臂 | L | 模式 | ρ | ΔNLL mean±std | n | 干净 NLL |')
         A('|---|---|---|---|---|---|---|')
@@ -1847,12 +1847,12 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             A('')
         A('> **替代解释提示**：某臂 ΔNLL 小也可能因为它本来就很少利用远端上下文（干净 NLL 更高）——读表时必须把 ΔNLL 与干净 NLL 列一起看；`mask`/`delete` 行给出干净远端的收益幅度作为参照系。')
         A('')
-    # ---- NIAH-natural：远端必要信息任务（评审点 3）----
+    # ---- NIAH-natural：远端必要信息任务 ----
     niah = probe.get('niah_natural') or {}
     if niah.get('cells'):
         A('### P3M-4 远端必要信息任务（NIAH-natural，自然文本 + 自然干扰）')
         A('')
-        A('**设计（评审点 3）**：序列 = 远端自然文本（内嵌 8 个 key→value 耦合）+ 目标区（自然文本收尾 + 8 个查询 key）。查询 key 的下一个 token 的正确答案只在远端出现——正确预测**必须**利用远距信息；`distract` 条件把 ρ=0.5 的远端草料换成其他真实序列的 token（realistic-token 替换；不是主题/语义干扰），但**绝不腐坏耦合位置**。报告 answer top-1 准确率与 answer NLL（已按各臂 clean/distract 成对）。')
+        A('**设计**：序列 = 远端自然文本（内嵌 8 个 key→value 耦合）+ 目标区（自然文本收尾 + 8 个查询 key）。查询 key 的下一个 token 的正确答案只在远端出现——正确预测**必须**利用远距信息；`distract` 条件把 ρ=0.5 的远端草料换成其他真实序列的 token（realistic-token 替换；不是主题/语义干扰），但**绝不腐坏耦合位置**。报告 answer top-1 准确率与 answer NLL（已按各臂 clean/distract 成对）。')
         A('')
         A('| 臂 | L | 条件 | acc | answer NLL | n |')
         A('|---|---|---|---|---|---|')
@@ -1867,7 +1867,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             A('')
         A('> 该任务直接检验「长距离信息**利用**能力」，与上面的干扰鲁棒性互补：鲁棒性高 + 检索利用不差，才支持「稀疏选择在滤噪的同时保留了有用远距信息」；若只有鲁棒性而检索差，则更符合「本来就少用远端」的替代解释。')
         A('')
-    A('### 统计口径（评审点 4）')
+    A('### 统计口径')
     A('')
     _n_all = sorted({v.get('n', 0) for v in contr.values() if isinstance(v, dict) and 'omitted' not in v})
     A(f'- 每个配对比较都给出逐种子 Δ、效应量 d_z 与该 n 下的双侧精确符号翻转 p 值下限 2/2^n（本表 n 集合 {_n_all}）。')
@@ -1943,7 +1943,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             A('')
     sc = st.get('scale_confounds') or {}
     if sc:
-        A('### P3S-2 规模混杂控制（评审点 1 + 评审二轮·意见七修订：等训练 token / 6ND 代理规模 / 规模内平台期）')
+        A('### P3S-2 规模混杂控制（等训练 token / 6ND 代理规模 / 规模内平台期）')
         A('')
         A('**背景**：P3SS（d=128/4L，8000 步 ≈ 49.15M token）与 P3SL（d=512/10L，4000 步 ≈ 24.58M token）的累计 token 相差一倍——跨规模终点差异不能单独归因于规模。本节把同一批曲线在**相同累计 token**处切片配对（gap_L − gap_S，逐种子），并给出等 token（`P3SL_TOK`，8000 步）与 6ND 参数量代理规模（`P3SL_FLOP`，按参数量比例缩步数——**代理规模，非实测等 FLOPs**）两个大模型臂，以及各面板的规模内平台期诊断（平台期 ≠ 收敛，只支持「规模内平台期后」读数）。')
         A('')
@@ -1967,7 +1967,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             if _conv_warn:
                 A(f'> **规模内平台期证据不足**：{_conv_warn} 面板在最后四分之一 eval 窗口的相对改进 ≥1%（未平台化）——「平台期后交叉」的主张在该面板上**不成立**，只有「窗口内交叉」的读数有效。')
                 A('')
-            A('> 评审二轮·意见七：即使全部种子平台化，也只允许「规模内平台期后交叉」的读数；「渐近优势反转」「收敛后更差」需要更长训练、学习率续训与重复验证，本面板不提供。')
+            A('> 即使全部种子平台化，也只允许「规模内平台期后交叉」的读数；「渐近优势反转」「收敛后更差」需要更长训练、学习率续训与重复验证，本面板不提供。')
             A('')
         _slices = sc.get('equal_token_slices') or {}
         if _slices:
@@ -2016,11 +2016,11 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A('| 路径 | 内容 |')
     A('|---|---|')
-    A('| `results_v10_mech/` | P3M：两臂重训权重（ckpt/，*.pt 不入库）+ by-length 复现表 + 干扰注入探针 `distractor.json`（uniform/natural/mask/delete + 评审二轮新增 span/doc/topical 模式；natural = realistic-token，§15 修订）+ NIAH-natural `niah_natural.json` |')
+    A('| `results_v10_mech/` | P3M：两臂重训权重（ckpt/，*.pt 不入库）+ by-length 复现表 + 干扰注入探针 `distractor.json`（uniform/natural/mask/delete + span/doc/topical 模式；natural = realistic-token，§15 修订）+ NIAH-natural `niah_natural.json` |')
     A('| `results_lm_v10_scale_s/` | P3S：d=128/4L 交叉定位面板（8000 步） |')
     A('| `results_lm_v10_scale_l/` | P3S：d=512/10L 交叉定位面板（4000 步） |')
-    A('| `results_lm_v10_scale_l8k/` | P3S-2：等 token 大模型臂（8000 步，评审点 1） |')
-    A('| `results_lm_v10_scale_lflop/` | P3S-2：6ND 参数量代理规模大模型臂（非实测等 FLOPs，评审点 1） |')
+    A('| `results_lm_v10_scale_l8k/` | P3S-2：等 token 大模型臂（8000 步） |')
+    A('| `results_lm_v10_scale_lflop/` | P3S-2：6ND 参数量代理规模大模型臂（非实测等 FLOPs） |')
     A('| `results_lm_v9_seq2k/` | P3T：topk 扫描追加 seeds 2/3 后的 4-seed 面板 |')
     A('| `analysis_v10/stats.json` | 探针对比（含 ΔNLL、Holm）、交叉定位、等 token 切片与配对符号翻转检验 |')
     A('| `v10_supp.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
@@ -2046,7 +2046,7 @@ def run_full():
     guard = make_guard()
     guard.report()
     print(f'[v10] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
-    git_push('v10: supplementary driver (P3M distractor-injection mechanism + P3S crossover scaling + P3T topk seeds 2/3 + reviewer-response: scratch selector controls, corruption modes/NIAH, token/compute-matched scale arms)')
+    git_push('v10: supplementary driver (P3M distractor-injection mechanism + P3S crossover scaling + P3T topk seeds 2/3 + scratch selector controls, corruption modes/NIAH, token/compute-matched scale arms)')
     import par
     _ctx = par.resolve_ctx(label='v10')
     all_ok = True

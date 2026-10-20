@@ -1105,7 +1105,7 @@ def sec_p1l():
                 print(f'[report] sec_p1l: {_v}: {len(_rv) - len(_cur)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur)} current one(s)')
             recs.extend(_cur)
         else:
-            # Fail closed (review issue 16): a panel whose every record predates
+            # Fail closed: a panel whose every record predates
             # the current code/recipe stamp is excluded from the table, the
             # ratio and every conclusion.  It is listed as stale below instead
             # of being quoted with a warning marker.
@@ -1239,7 +1239,7 @@ def _agg_entry(d, v):
 def _agg_entry_scan(d, v):
     if v in d:
         e = d[v]
-        # Review issue 16: a single entry that *does* carry a run_cfg must be
+        # A single entry that *does* carry a run_cfg must be
         # stamped with the current code semantics; quoting it otherwise would
         # put a stale number in a main table without any visible marker.
         rc = e.get('run_cfg') if isinstance(e, dict) else None
@@ -1260,7 +1260,7 @@ def _agg_entry_scan(d, v):
     else:
         # Fail closed: with several incompatible config groups and no current
         # stamp, picking "the largest n" is exactly the stale-admission path
-        # the review flagged.  Report the refusal instead.
+        # Report the refusal instead.
         print(f'[report] _agg_entry: `{v}` spans {len(cands)} cfg/protocol groups ({sorted((k for k, _e in cands))}) and NONE carries the current code stamp `_cs{_CUR_CS}` — REFUSED (unverifiable/stale aggregate; re-run the panel)')
         return None
     if len(cands) > 1:

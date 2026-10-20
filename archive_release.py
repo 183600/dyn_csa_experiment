@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""archive_release.py — 不可变证据归档（评审二轮·意见十）。
+"""archive_release.py — 不可变证据归档。
 
 问题：README/设计文档称决策日志与完整证据入库，但仓库只保留源码——
 复跑能力不等于可审计证据。源码仓库边界（design_notes §8：量值不入库）
@@ -120,7 +120,7 @@ def _collect(dirs, include_ckpt=False):
         if os.path.exists(p):
             files.append(p)
     # Training logs (gitignored, so they only exist on the experiment machine).
-    # The review asks for per-seed logs in the evidence release; pack every
+    # Pack every per-seed log in the evidence release; pack every
     # run_*.log at the repo root rather than trusting a hand-written list.
     try:
         for n in sorted(os.listdir(REPO)):

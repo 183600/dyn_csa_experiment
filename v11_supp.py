@@ -184,7 +184,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
                               'train_tokens': _v.get('train_tokens'),
                               'censored': bool(_v.get('censored') or _v.get('mean_crossed') is False),
                               'reconstructed': bool(_is_recon_v11(_v))}
-    # Same refusal rules as v10 (review issue 12): one point per width,
+    # Same refusal rules as v10: one point per width,
     # uncensored, comparable training volume, >=4 widths, slope with CI.
     fit = L.crossover_scaling_fit(_fit_entries, min_points=4)
     for _why in (fit.get('reasons') or []):

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""M0/S1 驱动 — B 档扩规模路线图（已选定）的代码入口，见 docs/compute_plan.md §4–§6。
+"""M0/S1 驱动 — B 档扩规模路线图（已选定）的代码入口。
 
 B 档落在两处代码支撑上（均在 exp_lib.py）：
   1. FineWeb-Edu 语料与 32k BPE 分词缓存（load_fineweb_edu：npy 缓存 +
      sha256 内容指纹 + 原子写，纪律与 load_wikitext 一致；离线机器可用
      FWEDU_LOCAL_JSONL 指向本地 jsonl/txt 语料）；
   2. S1–S4 规模阶梯与 S1 主面板配置（SCALE_LADDER / RUN_S1，全部为
-     规划值，按 docs/compute_plan.md 的口径滚动修正）。
+     规划值，由 SCALE_LADDER / RUN_S1 统一定义）。
 
 子命令：
   params   零 GPU：按 SmallGPT 实例化统计 S1–S4 的 csa_dynamic 参数量
-           （32k 词表；S4 按规划的解析外推口径），对照 §5 的规划值；
+           （32k 词表；S4 按规划的解析外推口径），对照规划值；
            写入 results_m0_params/params_audit.json（含代码/环境/git 溯源
            戳与 experiments.jsonl 记录），同时打印。
   data     构建 / 校验 FineWeb-Edu 缓存（默认 cap = S1 的 5B token；
@@ -18,11 +18,11 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
   smoke    端到端自检：微型模型 @ seq 8192 走完 fineweb 数据路径、
            稠密 / 固定稀疏 / 动态稀疏三条注意力路径与 8k 长度的
            掩码 / 分段 / 索引几何（M0_SMOKE_* 可调规模）。
-  kernel   G0 验证套件（docs/compute_plan.md §3/§6）：三算子（块压缩 /
+  kernel   G0 验证套件：三算子（块压缩 /
            索引 top-k / 稀疏注意力）的 kernel/eager 同种子数值对照（值 +
            全部梯度）、模型级前反向对照（csa_fixed / csa_dynamic /
             hybrid_dynamic），以及 CUDA 机器上的稀疏注意力基准
-            （判据口径见 docs/compute_plan.md §6）。任意设备可跑——
+            （判据见本模块的容差说明）。任意设备可跑——
            CPU / 无 triton 时验证 torch 参考后端（数值语义层）。
   analysis 零 GPU：读取 results_b_s1/（及可选的 results_b_s2/）的 summary.json，
            输出描述性配对统计、Holm、分辨率上限与跨规模 log-PPL 效应
@@ -31,7 +31,7 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
            CSA_PAR=auto 一卡一实验（par.py 零改动，§7 排班口径）。
            M0_PANEL=S2 切换到 S2 主面板（RUN_S2：同 B_ARMS、同
            seq8192/bs8 几何，5 臂 × 3 seeds × 12B token，results_b_s2/，
-           规划值口径同 §5/§6 的 M2 主面板份额）；面板选择只影响 run 配置
+           规划值口径同 S1 主面板）；面板选择只影响 run 配置
            与记账，data / smoke / kernel 与面板无关。
 
 运行时上限：按面板取 M0_CAP / M2_CAP（可用 M0_CAP_HOURS /
@@ -124,7 +124,7 @@ _PLAN_PARAMS = {'S1': 0.14e9, 'S2': 0.26e9, 'S3': 0.62e9, 'S4': 1.3e9}
 
 def run_params(outdir='results_m0_params'):
     """S1–S4 参数量审计：SmallGPT 实例化统计（S1 全量对拍，S2–S4 均匀层组合，
-    S4 即规划的解析外推口径），对照 docs/compute_plan.md §5 的规划值。
+    S4 即规划的解析外推口径），对照规划值。
 
     结果连同代码/环境/git 溯源戳写入 `outdir/params_audit.json` 并登记
     experiments.jsonl——参数量是可引用的数字，只打印不留痕
@@ -141,7 +141,7 @@ def run_params(outdir='results_m0_params'):
     if n_s1 != n_full:
         raise AssertionError(f'[params] 均匀层组合 {n_s1:,} != S1 全量实例化 {n_full:,} — 外推恒等式被破坏，停止输出（修 make_layer_cfgs / SmallGPT 的逐层同构性之后再算）')
     print(f'[params] self-check: S1 full instantiation = {n_full:,} == uniform-layer composition  OK\n')
-    print(f"{'档':<4}{'配置':<28}{'参数量':>16}{'规划值(§5)':>14}{'比值':>8}")
+    print(f"{'档':<4}{'配置':<28}{'参数量':>16}{'规划值':>14}{'比值':>8}")
     tiers = []
     for name in ('S1', 'S2', 'S3', 'S4'):
         sc = L.SCALE_LADDER[name]
@@ -159,13 +159,13 @@ def run_params(outdir='results_m0_params'):
           f"tokens/param ratio={_budget.get('tokens_per_param_ratio')}")
     for _w in _budget.get('warnings') or []:
         print(f'[params] WARNING: {_w}')
-    print('\n[params] 规划值来自 docs/compute_plan.md §5（约 0.14B / 0.26B / 0.62B / 1.3B）；差异超过两成即需要回改阶梯配置或修订规划。')
+    print('\n[params] 规划值约 0.14B / 0.26B / 0.62B / 1.3B；差异超过两成即需要回改阶梯配置或修订规划。')
     os.makedirs(outdir, exist_ok=True)
     L.stamped_analysis('m0_params_audit', {
         'vocab': int(L.B_VOCAB), 'seq_len': int(L.RUN_S1['seq_len']),
         'method': 'SmallGPT instantiation count; S1 verified against a full instantiation, S2-S4 by uniform-layer composition (S4 = the planned analytic extrapolation)',
         'self_check': {'s1_full_instantiation': int(n_full), 's1_uniform_layer_composition': int(n_s1), 'passed': bool(n_s1 == n_full)},
-        'plan_source': 'docs/compute_plan.md §5', 'tiers': tiers,
+        'plan_source': 'SCALE_LADDER planning values', 'tiers': tiers,
         'scale_ladder_audit': _budget,
     }, outdir=outdir, name='params_audit.json')
     print(f'[params] wrote {outdir}/params_audit.json (stamped: code + git provenance + environment)')
@@ -378,7 +378,7 @@ def _write_g0_certificate(ck, *, numeric_pass, benchmark_pass, best_tflops,
 
 
 def run_kernel():
-    """G0 验证套件（docs/compute_plan.md §3/§6）。
+    """G0 验证套件。
 
     判据：
     - 数值一致性：三算子 + 模型级的 kernel/eager 同种子对照（值与全部
@@ -388,11 +388,11 @@ def run_kernel():
       表达，fp32 1e-3 / bf16 1e-1；triton 为独立内核实现，fp32 1e-2 /
       bf16 3e-1，属归约分组不同的浮点噪声口径，见 design_notes §5 的
       同类漂移讨论）；
-    - 基准（仅 CUDA + triton）：判据口径见 docs/compute_plan.md §6。
+    - 基准（仅 CUDA + triton）：判据见下方的门限常量。
     """
     import csa_kernels as ck
     dev = L.DEVICE
-    print('[kernel] G0 验证套件 — 判据: 数值一致性（算子级+模型级）与基准判据（仅 CUDA，口径见 docs/compute_plan.md §6）')
+    print('[kernel] G0 验证套件 — 判据: 数值一致性（算子级+模型级）与基准判据（仅 CUDA）')
     print(f'[kernel] device = {dev}   triton 可导入 = {ck.triton_importable()}   CSA_KERNEL = {os.environ.get("CSA_KERNEL") or "(unset)"}')
     backends = ['ref']
     if dev.type == 'cuda' and ck.triton_importable():
@@ -436,7 +436,7 @@ def run_kernel():
     print()
     best = max(tflops.values()) if tflops else None
     if tflops:
-        print(f'[kernel] G0 基准判据：{"PASS" if best >= 150.0 else "NOT YET"}（门限口径见 docs/compute_plan.md §6）')
+        print(f'[kernel] G0 基准判据：{"PASS" if best >= 150.0 else "NOT YET"}（门限 150 TFLOPS）')
     else:
         print('[kernel] 基准需要 CUDA + triton（本机跳过；G0 基准判据未测量，不算通过）')
     print(f'[kernel] 数值判据：{"PASS" if not fail else "FAIL"}')

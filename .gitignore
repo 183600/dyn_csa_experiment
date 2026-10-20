@@ -49,6 +49,7 @@ analysis_*/
 REPORT*.md
 run_time_state*.json
 autodl_budget*.json
+算力申请.md
 
 # docs/ 白名单：只保留 design_notes.md
 # （docs/compute_plan.md 已废弃并从仓库删除，不允许再入库/被 CI 恢复）

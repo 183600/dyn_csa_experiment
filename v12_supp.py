@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""v12 confirmation suite — 探索/确认分离的确认性实验（评审点 4 + 5，
-评审二轮修订：意见一/二/三/四/九）。
+"""v12 confirmation suite — 探索/确认分离的确认性实验。
 
 前序版本（v7→v11）的全部面板都围绕同一个 validation split 展开，且多轮
 追加种子/比较属于**探索性**证据。本驱动把「确认」独立出来：
@@ -9,7 +8,7 @@
            选择器对照 csa_fixed_rope_randidx / csa_fixed_rope_allblocks；
            0-5 已由 P3MT/P4MT/P3MTC 覆盖，同 recipe 下 resume 自动跳过）；
   P5MP  —— 扩展探针在清单种子上重跑（uniform/natural/mask/delete +
-           评审二轮新增 span/doc/topical 腐坏 + NIAH-natural + 从头训练
+           span/doc/topical 腐坏 + NIAH-natural + 从头训练
            对照臂）；
   P5S2  —— 等训练 token 的大模型规模臂（P3SL_TOK，8000 步）；
   P5S3  —— 6ND 参数量代理规模的大模型规模臂（P3SL_FLOP，参数量比例缩步）；
@@ -18,7 +17,7 @@
            校正规则），在 WikiText-103 的 held-out test split（wiki.test.raw，
            其它 phase 不读）上一次性评估冻结臂，输出确认性统计。
 
-评审二轮新增的硬门槛（加载/运行/统计三层）：
+加载/运行/统计三层的硬门槛：
   1. 功效门槛（意见一）：加载清单即校验「该方案是否数学上可能确认」
      （min attainable Holm p = m·2/2^n < α）。6 种子 × 双侧 × Holm/4 的
      原设计在该门槛下会被拒绝——清单 v2 已在**未读任何 test 数据**的
@@ -98,7 +97,7 @@ def make_guard():
     return g
 
 # ---- 阶段配置 -------------------------------------------------------------
-# 评审二轮·意见一修订：冻结清单把种子数从 6 修订为 12（修订发生在任何
+# 冻结清单把种子数从 6 修订为 12（修订发生在任何
 # test-split 评估之前，见清单 revision 块）。P5C/P5MP 的
 # 种子列表**不再是这里的硬编码**，运行期由 `_frozen_seeds()` 从冻结清单
 # 读取（单一事实来源）；P5C 同时覆盖全部四个冻结臂（主臂 0-5 已由
@@ -308,7 +307,7 @@ def _load_manifest(path):
     _names = [str(_c.get('name')) for _c in m['primary_comparisons']]
     if len(set(_names)) != len(_names):
         raise SystemExit('[v12] REFUSE: duplicate primary-comparison names would collapse the Holm family — every declared contrast needs a unique name')
-    # ---- review-2 issue 1: a plan that CANNOT confirm is refused at load time.
+    # ---- a plan that CANNOT confirm is refused at load time.
     # 6 seeds x two-sided sign-flip x Holm/4 has a smallest attainable Holm p of
     # m * 2/2^n = 0.125 > 0.05: confirmation probability is ZERO BY CONSTRUCTION,
     # which is a resolution limit, not "conservatism".  Descriptive-only
@@ -338,7 +337,7 @@ def _load_manifest(path):
         _min_holm_floor = L.holm_min_attainable_p(_n_min, _m_family, _alpha)
         if math.isfinite(_min_holm_floor) and _min_holm_floor > _alpha and not _stat.get('descriptive_only'):
             raise SystemExit(f'[v12] REFUSE: the declared confirmation floor n={_n_min} cannot attain Holm significance (min p={_min_holm_floor:.4g} > alpha={_alpha}); raise the floor or add seeds BEFORE any test access')
-    # ---- review-2 issue 3: binding block.  Optional but validated when present;
+    # ---- binding block.  Optional but validated when present;
     #     every record written under this manifest carries the manifest's sha256.
     _bind = m.get('binding') or {}
     if _bind:
@@ -542,7 +541,7 @@ def _recipe_knobs(recipe):
 
 def _recipe_matches_signature(recipe, sig):
     """Check a run_cfg/recipe string against the frozen training-recipe
-    signature (review-2 issue 2: the stats entry must verify WHAT produced the
+    signature (the stats entry must verify WHAT produced the
     records, not just that a record exists).
 
     sig 只声明要钉死的字段（键名与 run_cfg_knobs 的解码一致：steps/sl/bs/
@@ -602,7 +601,7 @@ def _freeze_lock_path(outdir):
 
 def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
                                 train_fp=None):
-    """Persistent first-test-access lock (review-2 issue 3).
+    """Persistent first-test-access lock.
 
     首次测试访问后禁止修改计划：P5T 一旦在 outdir 落下首条记录（或本函数
     被调用），锁文件即记录 manifest sha256
@@ -711,7 +710,7 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
 def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_fp=None):
     """One (arm, seed) clean by-length evaluation on the TEST split.
 
-    评审二轮·意见二/三修订：记录现在额外携带 manifest_sha256 与
+    记录现在额外携带 manifest_sha256 与
     ckpt_sha256（绑定「哪份冻结计划、哪份权重」）；recipe 必须通过冻结
     清单的结构化配方签名（不再是自然语言说明）；resume 的 stale 判定
     把 manifest 哈希纳入——清单修订后，同一 outdir 的旧结果自动作废，
@@ -758,7 +757,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         del d
         return out
     _ck_recipe = d.get('recipe')
-    # structured recipe gate (review-2 issue 2): the frozen plan's training
+    # structured recipe gate: the frozen plan's training
     # recipe is machine-checkable, not prose — a checkpoint trained under any
     # other protocol is REFUSED before it can enter the confirmation panel.
     if _sig is not None and not _recipe_matches_signature(_ck_recipe, _sig):
@@ -875,7 +874,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     gc.collect()
 
     def _merge(summary):
-        # by_len now also carries ppl_per_seq (per-document rows, review-2
+        # by_len now also carries ppl_per_seq (per-document rows,
         # issue 9b) straight from eval_length_gen; pooled ppl is unchanged.
         # v11.128: the P5T record carries the SAME provenance descriptor as its
         # training record (`train_knobs` / `train_objective` /
@@ -909,7 +908,7 @@ def run_finaltest(cfg=None, guard=None):
     （uniform 腐坏探针）；确认性统计由 `v12_supp.py analysis` 从这些产物
     现算。
 
-    评审二轮·意见三修订：首次测试访问即写入冻结锁
+    首次测试访问即写入冻结锁
     `.freeze_lock.json`（manifest sha256 + test 切片指纹）；此后清单或
     test 数据变更都会被拒绝（V12_REFREEZE=1 显式改冻结并降级前轮）。"""
     cfg = dict(FINALTEST_CFG) if cfg is None else dict(cfg)
@@ -1004,7 +1003,7 @@ def run_finaltest(cfg=None, guard=None):
             raise SystemExit(f'[v12] REFUSE: the leakage audit did not produce a document-overlap result ({_doc!r}) — the npy caches are missing or unreadable, so train/test isolation cannot be verified before the one-shot test access')
         if _doc.get('policy_violation'):
             raise SystemExit(f'[v12] REFUSE: train/test document overlap (test-shingle overlap {_doc.get("test_shingle_overlap")}, max row overlap {_doc.get("max_row_overlap")}) exceeds the frozen policy — confirmation claims are UNAVAILABLE until the near-duplicate evaluation documents are cleaned (rebuild the test cache with exp_lib.load_wikitest, which filters them)')
-    # review-2 issue 3: first-test-access lock — the plan may not change after
+    # first-test-access lock — the plan may not change after
     # the test split has been read, and the slice itself is part of the freeze.
     _check_or_write_freeze_lock(outdir, manifest, _dfp, stage='accessed',
                                 train_fp=_want_train_fp)
@@ -1085,7 +1084,7 @@ def _record_int(value):
 
 
 def _admit_confirmation_records(raw, manifest):
-    """Strict admission gate for confirmation records (review-2 issue 2).
+    """Strict admission gate for confirmation records.
 
     一条 bylen 记录要进入确认统计，必须同时满足：
       split==test、variant 在冻结臂内、seed 在冻结白名单内、_code 等于冻结
@@ -1172,7 +1171,7 @@ def _admit_confirmation_records(raw, manifest):
 
 
 def _doc_level_analysis(recs_a, recs_b, common, Ln):
-    """Document-sampling readout for one comparison (review-2 issue 9b).
+    """Document-sampling readout for one comparison.
 
     逐文档配对差（对每个文档取「种子内臂差」的均值）与两层方差分解：
     between-doc（文档抽样不确定性）与 within-doc-across-seed（训练随机性）。
@@ -1372,7 +1371,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
 def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analysis_v12/test_stats.json'):
     """Zero-GPU: paired confirmation statistics under the frozen plan.
 
-    评审二轮·意见二修订：统计入口现在是**严格准入制**——种子白名单、唯一
+    统计入口现在是**严格准入制**——种子白名单、唯一
     记录、非空数据指纹、单一冻结 test 切片、_code/recipe 与冻结计划的机器
     校验、manifest 哈希绑定，缺一项即不入统计（点名剔除）或拒绝运行
     （歧义/混切片）。by_length 汇总同样只由可采纳记录构成。"""
@@ -1422,7 +1421,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _missing = [k for k in ('parameter_matching', 'flops', 'read_fraction')
                     if not (isinstance(_cbd, dict) and _cbd.get(k))]
         if _missing:
-            raise SystemExit(f'[p5t stats] REFUSE: the frozen plan lacks compute-budget disclosure {_missing}. Parameter matching is not compute matching; the report must state the FLOPs/read-budget mismatch next to every primary comparison (review issue 2).')
+            raise SystemExit(f'[p5t stats] REFUSE: the frozen plan lacks compute-budget disclosure {_missing}. Parameter matching is not compute matching; the report must state the FLOPs/read-budget mismatch next to every primary comparison .')
     stats['compute_budget_disclosure'] = _cbd
     for v in manifest['arms']:
         rows = [r for (rv, s), r in admitted.items() if rv == v]
@@ -1635,7 +1634,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     A('> 参考论文：arXiv:2606.19348。**范围声明**：小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到其规模、语料、长上下文训练或生产系统。')
     A('> 说明：本报告全部数字由 `v12_supp.py report` 从 `results_lm_test/`、`results_v10_mech/`、`analysis_v12/` 的落盘产物计算得到，无手填数值。')
     A('')
-    A('本驱动落实评审点 4/5 的确认性协议：v7→v11 的全部面板与 v10/v12 的机制扩展属于**探索性**证据；本报告只报告**冻结后**在 held-out test split（wiki.test.raw，其它 phase 不读）上的一次性确认评估。')
+    A('本驱动的确认性协议：v7→v11 的全部面板与 v10/v12 的机制扩展属于**探索性**证据；本报告只报告**冻结后**在 held-out test split（wiki.test.raw，其它 phase 不读）上的一次性确认评估。')
     A('')
     A('---')
     A('')

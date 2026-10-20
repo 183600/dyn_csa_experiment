@@ -713,13 +713,13 @@ def make_layer_cfgs_v7(n_layers, variant):
     if variant == 'csa_fixed_rope':
         return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_fixed_rope_randidx':
-        # 从头训练的随机选择对照（评审点 2）：与 csa_fixed_rope 逐字段一致，
+        # 从头训练的随机选择对照：与 csa_fixed_rope 逐字段一致，
         # 仅 indexer_mode='random'。它回答的是「训练充分的随机选择」而非
         # 「测试时把已训练模型的选择器换成随机」——后者（v10 P3MP 的
         # randidx 臂）测的是依赖性，本变体测的是选择方式本身的优劣。
         return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='random', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_fixed_rope_allblocks':
-        # 从头训练的全块读取对照（评审点 2 + 5）：与 csa_fixed_rope 同一
+        # 从头训练的全块读取对照：与 csa_fixed_rope 同一
         # c_kv 压缩 / qk_norm / RoPE / sink / 窗口投影，仅 index_topk 覆盖
         # 全部块（lightning_indexer 内部 k=min(topk, B)）。它同时是
         # 「逐项对齐的 dense」——与 full_rope 的差别只剩 KV 压缩投影与
@@ -1574,7 +1574,7 @@ def exact_sign_permutation(deltas):
     n_dropped = int(len(d_in) - n)
 
     def _extras(res, d, n):
-        """效应量与逐种子差值（评审点 4）：报告必须给出逐种子 Δ 与
+        """效应量与逐种子差值：报告必须给出逐种子 Δ 与
         d_z（配对差均值/样本标准差），并把该 n 下的 p 值分辨率下限
         一并写出，避免把分辨率上限误读为数据结论。纯增量字段。"""
         res['per_seed'] = [float(x) for x in d.tolist()]
@@ -1796,7 +1796,7 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         res['n_unstamped'] = unstamped
         out_d['comparisons'][name] = res
     # Family-wise correction over the report's five pre-listed comparisons
-    # (review 3 issue 3).  This is a guard against multiple-comparison
+    # This is a guard against multiple-comparison
     # over-reading; the panel remains EXPLORATORY because its comparisons and
     # seeds were chosen after seeing validation results (design_notes §17).
     # A declared-but-unmeasurable comparison keeps a p=1 slot: dropping it
@@ -2295,7 +2295,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                            'nll_sum': float(_t),
                            'nll_per_seq': [float(v) for v in _cum[:, Ln - 2].tolist()],
                            'n_seq': int(ids.shape[0])}
-                # per-document rows (review-2 issue 9b): the pooled ppl above is
+                # per-document rows: the pooled ppl above is
                 # UNCHANGED (same reduction); these extra rows only make the
                 # document-sampling uncertainty visible and stratifiable
                 # (doc-level deltas vs seed-level variance).  Rows are the

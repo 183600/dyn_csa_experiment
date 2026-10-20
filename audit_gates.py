@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""audit_gates.py — 评审二轮·意见十一的可执行审计入口（零实验）。
+"""audit_gates.py — 可执行审计入口（零实验）。
 
 评审指出九个「目前不能排除、必须进一步验证」的领域。本模块把其中能以
 **代码 + 现有落盘产物**核验的部分变成可运行的审计子命令；不能本地核验的
@@ -410,7 +410,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
 # ---------------------------------------------------------------------------
 
 # Above this many elements the length-n permutation behind
-# rng.choice(..., replace=False) is no longer worth its memory in an audit
+# rng.choice(..., replace=False) is not worth its memory in an audit
 # box (>= 2**28 * 8 B); _sample_tokens then draws the same uniform
 # without-replacement sample by rejection in O(cap) memory instead.
 _CHOICE_PERM_MAX_ELEMS = 1 << 28
@@ -427,7 +427,7 @@ def _sample_tokens(arr, cap=1000000, seed=0):
     # rng.choice(..., replace=False) materialises a length-n permutation
     # (O(n) work and memory).  That is fine for today's corpus sizes, but a
     # scale-up corpus makes it an allocation hazard, so above the threshold
-    # where the permutation no longer fits a sane audit box the same kind of
+    # where the permutation does not fit a sane audit box the same kind of
     # uniform without-replacement sample is drawn by rejection instead:
     # every K-subset remains equally likely and the draw stays
     # seed-deterministic, with O(cap) memory.
@@ -945,7 +945,7 @@ def audit_attribution(outdirs=None):
         if panel:
             missing = {v: e for v, e in panel.items() if e['with_block_stats'] == 0}
             # Turn the presence check into a block-count / block-length table
-            # (review issue 11): a fixed-vs-dynamic contrast that also changes
+            # a fixed-vs-dynamic contrast that also changes
             # the block count or mean block length is not a clean blocking
             # contrast, and must be reported as such.
             for v, e in panel.items():
@@ -1662,7 +1662,7 @@ def audit_release_readiness(path='RELEASES.md'):
 
 
 def audit_selection(path='analysis_mechanism/selection_attribution.json'):
-    """Gate for the DIRECT mechanism evidence the review asks for (issue 20).
+    """Gate for the DIRECT mechanism evidence.
 
     A claim that "the learned selector finds the relevant blocks" needs an
     artifact comparing the selected blocks with a dependency oracle, per

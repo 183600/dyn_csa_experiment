@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSA/HCA 三算子融合内核 —— docs/compute_plan.md §3 的 M0 内核工作包。
+"""CSA/HCA 三算子融合内核工作包。
 
 三个核心算子（与 exp_lib.py 的 eager 实现一一对应）：
 
@@ -18,8 +18,7 @@
 
 数值契约（docs/design_notes.md §5/§6 的内核侧对应物）：
 
-- 内核路径是**独立变体**，判据是四层等价口径（docs/compute_plan.md §3，
-  评审二轮·意见八修订）：算子级**数值容差**（m0_supp.run_kernel 的预声明
+- 内核路径是**独立变体**，判据是四层等价口径：算子级**数值容差**（m0_supp.run_kernel 的预声明
   阈值：前向 ce <1e-5、梯度范数相对误差 <1e-4、逐条目阈值按后端分级）
   加训练级**预注册 margin 的 TOST 等价检验**（exp_lib.tost_paired）。
   「统计不可区分」**不是**通过条件——未发现显著差异 ≠ 等价（小样本下
@@ -2852,7 +2851,7 @@ def selfcheck_model(variant='csa_dynamic', impl='ref', seed=0, device=None, T=64
 
 def bench_attention(device, impl='triton', R=8, T=8192, nh=12, hd=64, topk=32, win=128,
                     Bm=None, iters=20, dtype=torch.float32, verbose=True):
-    """稀疏注意力算子的微基准（判据口径见 docs/compute_plan.md §6）。
+    """稀疏注意力算子的微基准。
 
     计数口径：前向 = 4·R·T·(topk+win)·nh·hd（QK^T 与 PV 各 2·hd/泳道），
     反向按 2.5× 前向估计（统计重算 + dq + dk/dv 三遍）。有效速率 =
