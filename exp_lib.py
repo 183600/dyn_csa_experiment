@@ -11595,14 +11595,17 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
         rows = []
         for alpha in alphas:
             for lam in interps:
-                cfg = {'order': order, 'alpha': float(alpha)}
-                if order == 2:
-                    cfg['interpolation'] = float(lam)
                 if _shared_counts is None:
                     _shared_counts = _ngram_train_counts(np.asarray(_fit_ids, dtype=np.int64), vocab_size)
+                # Pass the declared grid values through unchanged so
+                # ngram_lm_score's boolean/non-finite validation runs BEFORE
+                # any float() coercion (float(True) == 1.0 used to bypass it).
                 sc = ngram_lm_score(_fit_ids, eval_ids, vocab_size, order=order,
-                                    alpha=float(alpha), interpolation=float(lam),
+                                    alpha=alpha, interpolation=lam,
                                     _counts=_shared_counts)
+                cfg = {'order': order, 'alpha': float(sc['alpha'])}
+                if order == 2:
+                    cfg['interpolation'] = float(sc['interpolation'])
                 rows.append({'config': cfg, 'ppl': sc['ppl'], 'nll': sc['nll'],
                              'n_tokens': sc['n_tokens'], 'steps': 0, 'tokens_seen': int(sc['n_tokens'])})
         if not rows:

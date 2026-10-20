@@ -3192,6 +3192,21 @@ def t_simple_baseline_ngram_and_audit():
         pass
     else:
         raise AssertionError('a fractional declared order must not be truncated')
+    # The grid path must not pre-coerce booleans/non-finite values before
+    # ngram_lm_score validates them (float(True) == 1.0 used to slip through).
+    for _bad_grid in (
+            {'arms': {'u': {'order': 1}}, 'grids': {'u': {'alpha': [True]}}},
+            {'arms': {'u': {'order': 1}}, 'grids': {'u': {'alpha': [float('nan')]}}},
+            {'arms': {'b': {'order': 2}},
+             'grids': {'b': {'alpha': [0.1], 'interpolation': [True]}}},
+            {'arms': {'b': {'order': 2}},
+             'grids': {'b': {'alpha': [0.1], 'interpolation': [float('inf')]}}}):
+        try:
+            L.simple_baseline_fit(train, val, vocab, protocol=_bad_grid)
+        except (ValueError, TypeError):
+            pass
+        else:
+            raise AssertionError(f'invalid grid hyperparameter accepted: {_bad_grid!r}')
 
 
 def t_simple_baseline_fit_budget_is_bounded_and_disclosed():
