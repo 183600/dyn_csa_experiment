@@ -1534,3 +1534,17 @@ resolution-limited；调用方给出的最低 n 门槛不能再只停留在说�
 计算会把族下限说得比实际更细。现在 helper 同时接受旧式整数与结果字典：
 字典形式优先使用 `n_nonzero`（全零映射为 1，下限 1），越界/缺失才回退
 `n`。`analyse` 改为传入完整主对比结果，而不是只传 `n` 列表。
+
+## 30. M0 规模分析由声明驱动，不再写死 S1/S2（本轮硬化）
+
+`m0_supp.scale_analysis` 过去在三个位置硬编码 S1/S2：默认 summary 发现、
+跨规模点的计划种子数、预算阶梯审计。以后增加 S3/S4 时，新 tier 会从
+「计划 vs 实际」检查中静默消失。现在从 `exp_lib.SCALE_LADDER` 的 tier
+名发现对应的 `RUN_<TIER>` 配置（不会误收 `RUN_SCALE` / `RUN_LONG` /
+`RUN_ABL` 这些早期探索面板），并允许调用方显式补充 tier。
+
+每个跨规模点同时带 `n_planned` 与 `planned_seeds`：前者用于旧记录/外部
+tier 的计数降级，后者让 `_scale_points` 能区分「计划中的 seed 缺失」与
+「计划外的多余 seed」。计划 seed 先去重再计数，重复声明不会伪造更大的 n。
+分析输出的 notes 也按实际 tier/n 生成，不再写死「S1 4 seeds / S2 3
+seeds」。

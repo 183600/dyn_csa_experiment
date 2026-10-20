@@ -44,7 +44,7 @@ TOST 等检查都由 `kernel` 子命令写出并绑定代码/内核戳/git 树�
 `full` 还会在真实面板几何上做短校准，把各臂的实测 s/step 记入 TimeGuard；
 未校准的解析外推在 S1 尺度上会高估到使全部单元被 cap 跳过的程度。
 """
-import gc, json, math, os, shutil, subprocess, sys, time, traceback
+import gc, json, math, os, re, shutil, subprocess, sys, time, traceback
 import numpy as np
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
@@ -726,6 +726,43 @@ def _flatten_contrasts(audit):
     return rows
 
 
+_RUN_CFG_ATTR = re.compile(r'^RUN_([A-Z][A-Z0-9_]*)$')
+
+def _tier_run_cfgs(extra=None):
+    """Discover the declared scale-tier run configs from exp_lib.
+
+    The analysis used to hard-code S1/S2 in three places (default summary
+    discovery, planned seed counts, and the budget ladder).  Adding S3/S4 then
+    silently left the new tiers out of the planned-vs-observed check.  Discover
+    every ``RUN_<TIER>`` dict that carries an ``outdir`` and ``seeds`` instead;
+    ``extra`` can supply test or notebook tiers explicitly.
+    """
+    out = {}
+    _ladder_names = set((getattr(L, 'SCALE_LADDER', {}) or {}).keys())
+    for _name in dir(L):
+        _m = _RUN_CFG_ATTR.match(_name)
+        if not _m or _m.group(1) not in _ladder_names:
+            # RUN_ABL / RUN_LONG / RUN_SCALE are earlier exploratory panels,
+            # not B-tier scale-ladder tiers; they must not enter this ladder.
+            continue
+        _cfg = getattr(L, _name)
+        if (isinstance(_cfg, dict) and _cfg.get('outdir')
+                and _cfg.get('seeds') is not None):
+            out[_m.group(1)] = dict(_cfg)
+    if extra:
+        out.update({str(k): dict(v) for k, v in dict(extra).items()})
+    return out
+
+def _declared_seed_list(cfg):
+    """Unique declared seeds in numeric order (invalid ids are ignored here;
+    the ladder audit reports them as problems)."""
+    vals = []
+    for _s in ((cfg or {}).get('seeds') or []):
+        _n = L._as_seed_int(_s)
+        if _n is not None and _n not in vals:
+            vals.append(_n)
+    return sorted(vals)
+
 def scale_analysis(summaries=None, outdir='analysis_m0'):
     """Zero-GPU descriptive analysis for the B-tier S1/S2 panels.
 
@@ -736,9 +773,10 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
     descriptive readout to a confirmatory claim.  When both panels are present
     it also reports the per-scale log-PPL effects and the S1->S2 interaction.
     """
+    _tier_cfgs = _tier_run_cfgs()
     if summaries is None:
         summaries = {}
-        for label, cfg in (('S1', L.RUN_S1), ('S2', L.RUN_S2)):
+        for label, cfg in sorted(_tier_cfgs.items()):
             path = os.path.join(cfg['outdir'], 'summary.json')
             if os.path.exists(path):
                 try:
@@ -747,8 +785,11 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
                     print(f'[m0-analysis] WARNING: {path} unreadable ({type(e).__name__}: {e}); panel skipped')
     summaries = {k: v for k, v in (summaries or {}).items() if isinstance(v, dict) and v}
     report = {'kind': 'm0_scale_analysis', 'panels': {}, 'cross_scale': {},
+              'tier_plan': {k: {'outdir': v.get('outdir'),
+                                'declared_seeds': _declared_seed_list(v)}
+                            for k, v in sorted(_tier_cfgs.items())},
               'notes': [
-                  'B-tier S1 (4 seeds) / S2 (3 seeds) panels are DESCRIPTIVE: the exact two-sided sign-flip floor is 2/2^n = 0.125 / 0.25 > 0.05.',
+                  'Every B-tier panel is DESCRIPTIVE unless its exact sign-flip floor reaches alpha: the floor is 2/2^n per tier and m*2/2^n for a Holm family of size m.',
                   'Cross-scale effects are paired log PPL ratios; they are scale-free, but a two-point ladder is not a scaling law.',
               ]}
     for label, summary in sorted(summaries.items()):
@@ -788,8 +829,14 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
         }
         print(f'[m0-analysis] {label}: {len(measured)} contrast(s), '
               f'n={n_seeds}, descriptive_only={report["panels"][label]["descriptive_only"]}')
+        report['notes'].append(
+            '%s: n=%d seed(s), descriptive_only=%s; the raw exact sign-flip '
+            'floor and the declared-family floor are both reported in its '
+            'seed_plan/contrast fields.'
+            % (label, int(n_seeds),
+               bool(report['panels'][label]['descriptive_only'])))
     # Cross-scale readout over the contrasts the panels share.
-    _declared_runs = {'S1': L.RUN_S1, 'S2': L.RUN_S2}
+    _declared_runs = _tier_cfgs
     pairs = [('csa_dynamic', 'csa_fixed', 'dynamic_vs_fixed'),
              ('hybrid_dynamic', 'csa_dynamic', 'hybrid_vs_csa'),
              ('csa_dynamic', 'full_matched', 'dynamic_vs_dense')]
@@ -822,13 +869,18 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
             # known tier, not from however many records happened to survive.
             # Using the observed max would silently certify a truncated panel
             # as complete (the exact attrition bug the scale gates exist for).
-            _declared_n = len((_declared_runs.get(label) or {}).get('seeds') or [])
+            _declared_seeds = _declared_seed_list(_declared_runs.get(label))
+            _declared_n = len(_declared_seeds)
             _observed_n = (report['panels'].get(label) or {}).get('n_seeds')
             _panel_n = (_declared_n or _observed_n)
-            points.append({'label': label, 'scale': _e.get('params'),
-                           'effects': lr['effects'], 'seeds': lr['seeds'],
-                           'n_planned': _panel_n,
-                           'corpus_fp': _cfp})
+            _point = {'label': label, 'scale': _e.get('params'),
+                      'effects': lr['effects'], 'seeds': lr['seeds'],
+                      'n_planned': _panel_n, 'corpus_fp': _cfp}
+            if _declared_seeds:
+                # An exact plan lets the scale gates distinguish a missing seed
+                # from an unexpected extra one; a bare count cannot.
+                _point['planned_seeds'] = _declared_seeds
+            points.append(_point)
         if len(points) < 2:
             if points:
                 report['cross_scale'][name] = {'status': 'single_scale_only', 'per_scale': raw}
@@ -854,7 +906,7 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
         print(f'[m0-analysis] cross-scale {name}: {meta.get("status")} '
               f'(poolable={meta.get("poolable")}, points={meta.get("n_points")})')
     _budget_tiers = []
-    for _label, _cfg in (('S1', L.RUN_S1), ('S2', L.RUN_S2)):
+    for _label, _cfg in sorted(_tier_cfgs.items()):
         _pan = report['panels'].get(_label) or {}
         _arms = _pan.get('arms') or {}
         _pick = _arms.get('csa_dynamic') or (next(iter(_arms.values())) if _arms else {})

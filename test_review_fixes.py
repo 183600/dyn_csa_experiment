@@ -1157,6 +1157,14 @@ def t_m0_scale_analysis_descriptive():
                 variant=v, seed=seed, run_cfg=fp, steps=10, tokens_seen=10,
                 ppl=base + 0.1 * seed, params=100, train_knobs=knobs,
                 data_fp='d', val_fp='v')
+    # Tier discovery is the B-tier ladder only, not the earlier RUN_SCALE /
+    # RUN_LONG / RUN_ABL exploratory panels; explicit extra tiers are allowed
+    # and duplicate declared seeds do not inflate the planned n.
+    assert set(M0._tier_run_cfgs()) == {'S1', 'S2'}, M0._tier_run_cfgs()
+    extra = M0._tier_run_cfgs({'S3': {'outdir': 'results_b_s3',
+                                      'seeds': [2, 0, 2, 1]}})
+    assert extra['S3']['outdir'] == 'results_b_s3', extra
+    assert M0._declared_seed_list(extra['S3']) == [0, 1, 2], extra
     tmp = tempfile.mkdtemp()
     try:
         r = M0.scale_analysis({'S1': summary}, outdir=tmp)
