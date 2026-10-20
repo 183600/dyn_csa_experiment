@@ -2836,6 +2836,10 @@ def t_metric_policy_checks_record_values():
     good = {'v::seed0': {'variant': 'v', 'ppl': 10.0, 'nll_sum': math.log(10.0) * _tok,
                          'n_tokens': _tok}}
     assert L.metric_policy_audit(good)['status'] == 'ok'
+    # A PPL with no NLL/token accounting is unverifiable, not silently accepted.
+    _legacy = L.metric_policy_audit({'v::seed0': {'variant': 'v', 'ppl': 10.0}})
+    assert _legacy['status'] == 'warn' and any(
+        'no NLL/token accounting' in w for w in _legacy['warnings']), _legacy
     bad = {'v::seed0': {'variant': 'v', 'ppl': 10.0, 'nll_sum': math.log(20.0) * _tok,
                         'n_tokens': _tok}}
     ma = L.metric_policy_audit(bad)

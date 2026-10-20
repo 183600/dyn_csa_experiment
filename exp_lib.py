@@ -13504,16 +13504,23 @@ def metric_policy_audit(summary=None, policy=None):
             _got = _record_primary_ppl(_r)
             if _got is None or abs(_got - float(_want)) > 1e-6 * max(1.0, abs(float(_want))):
                 _lm_bad.append(_r.get('variant') or _r.get('name') or '?')
+        _lm_missing = max(0, len(lm) - _lm_checked)
         out['checks'].append({'metric': 'ppl', 'policy': 'lm_perplexity', 'records': len(lm),
                               'aggregation': 'token_weighted',
                               'records_with_nll_accounting': _lm_checked,
+                              'records_without_nll_accounting': _lm_missing,
                               'aggregation_mismatch': sorted(set(map(str, _lm_bad)))[:8],
-                              'ok': bool(lm) and not _lm_bad})
+                              'ok': bool(lm) and not _lm_bad and _lm_missing == 0})
         if _lm_bad:
             out['warnings'].append(
                 'LM record(s) ' + ', '.join(sorted(set(map(str, _lm_bad)))[:5])
                 + ' report PPL that is not exp(nll_sum/n_tokens) — the declared token-weighted '
                 'PPL estimand is not what the record measured')
+        if _lm_missing:
+            out['warnings'].append(
+                f'{_lm_missing}/{len(lm)} LM record(s) expose no NLL/token accounting; '
+                'their PPL cannot be verified as the declared token-weighted estimand '
+                '(legacy records may be unverifiable rather than wrong)')
         bnd = []
         niah = []
         for r in recs:
