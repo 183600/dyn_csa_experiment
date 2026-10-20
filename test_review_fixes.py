@@ -2677,8 +2677,8 @@ def t_tuning_grid_boundary_adequacy():
     rof = L.baseline_tuning_audit(_ofat_art([10.0, 9.0, 8.0]), protocol=ofat_proto)
     assert rof['tuning_verified'] is True, rof
     assert rof['grid_interaction_untested'] == ['a:lr|weight_decay'], rof
-    assert rof['grid_coverage']['a']['_factorial']['full_factorial'] is False, rof['grid_coverage']
-    assert rof['grid_coverage']['a']['_factorial']['pairwise']['lr|weight_decay']['n_missing'] == 1, rof
+    assert rof['grid_factorial']['a']['full_factorial'] is False, rof['grid_coverage']
+    assert rof['grid_factorial']['a']['pairwise']['lr|weight_decay']['n_missing'] == 1, rof
     assert any('pairwise interaction' in w for w in rof['warnings']), rof['warnings']
     full_trials = ofat_trials + [{'lr': 0.0001, 'weight_decay': 0.01, 'warmup': 50}]
     full_proto = dict(protocol, trials=full_trials)
@@ -2692,7 +2692,7 @@ def t_tuning_grid_boundary_adequacy():
         protocol=full_proto)
     assert rfull['tuning_verified'] is True, rfull
     assert rfull['grid_interaction_untested'] == [], rfull
-    assert rfull['grid_coverage']['a']['_factorial']['full_factorial'] is True, rfull['grid_coverage']
+    assert rfull['grid_factorial']['a']['full_factorial'] is True, rfull['grid_coverage']
 
 def t_baseline_multi_seed_selection_audit():
     trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]

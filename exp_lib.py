@@ -13428,6 +13428,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         if _vals:
             _grid_levels[_kn] = sorted(_vals)
     grid_coverage = {}
+    grid_factorial = {}
     _boundary_hits = []
     _coarse = []
     for arm, entry in arms.items():
@@ -13522,7 +13523,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 }
                 if _missing:
                     _untested_pairs.append(f'{arm}:{_k1}|{_k2}')
-        per_knob['_factorial'] = {
+        grid_factorial[arm] = {
             'knobs': _knobs,
             'searched_combinations': len(_combos),
             'full_factorial_size': int(_full_size),
@@ -13532,9 +13533,8 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             'pairwise': _pairwise,
         }
         grid_coverage[arm] = per_knob
-    _factor_pairs = sorted({f'{_arm}:{_p}' for _arm, _cv in grid_coverage.items()
-                            if isinstance(_cv.get('_factorial'), dict)
-                            for _p, _pw in _cv['_factorial'].get('pairwise', {}).items()
+    _factor_pairs = sorted({f'{_arm}:{_p}' for _arm, _cv in grid_factorial.items()
+                            for _p, _pw in _cv.get('pairwise', {}).items()
                             if _pw.get('full_pairwise') is False})
     if _factor_pairs:
         warnings.append(
@@ -13558,6 +13558,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         warnings.append('the tuning protocol declares no numeric trial levels, so grid adequacy is unverifiable')
     out = {'status': 'ok' if not problems else 'fail', 'tuning_verified': not problems,
            'grid_levels': _grid_levels, 'grid_coverage': grid_coverage,
+           'grid_factorial': grid_factorial,
            'grid_boundary_hits': _boundary_hits, 'grid_adequacy': _grid_adequacy,
            'grid_interaction_untested': _factor_pairs,
            'eval_n_tokens': eval_n_tokens,
