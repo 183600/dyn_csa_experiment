@@ -397,7 +397,12 @@ def _controlled_reason(a, b):
     """Only the declared experimental factors may differ between two arms."""
     if not isinstance(a, dict) or not isinstance(b, dict):
         return 'missing record'
-    ha, hb = a.get('hyperparams') or {}, b.get('hyperparams') or {}
+    _ha_raw, _hb_raw = a.get('hyperparams'), b.get('hyperparams')
+    if _ha_raw is not None and not isinstance(_ha_raw, dict):
+        return 'hyperparams is malformed (not an object)'
+    if _hb_raw is not None and not isinstance(_hb_raw, dict):
+        return 'hyperparams is malformed (not an object)'
+    ha, hb = _ha_raw or {}, _hb_raw or {}
     keys = ('steps', 'tokens_seen', 'n_train_tokens', 'seq_len', 'batch_size',
             'lr', 'weight_decay', 'warmup', 'comp_lambda', 'delta_lr_mult',
             'd', 'n_layers', 'n_heads', 'd_head', 'mlp_ratio', 'vocab_size',
@@ -431,14 +436,22 @@ def _controlled_reason(a, b):
             return f'{k} is unverifiable (only one record carries it)'
         if _ha and str(va) != str(vb):
             return f'{k} differs ({va!r} != {vb!r})'
-    oa = a.get('open_block_config') or {}
-    ob = b.get('open_block_config') or {}
+    _oa_raw, _ob_raw = a.get('open_block_config'), b.get('open_block_config')
+    if _oa_raw is not None and not isinstance(_oa_raw, dict):
+        return 'open_block_config is malformed (not an object)'
+    if _ob_raw is not None and not isinstance(_ob_raw, dict):
+        return 'open_block_config is malformed (not an object)'
+    oa, ob = _oa_raw or {}, _ob_raw or {}
     if oa.get('fingerprint') is not None and oa.get('fingerprint') == ob.get('fingerprint'):
         return None
     # The only allowed layer-level differences are max_block/open mode/scope.
     la, lb = oa.get('layers') or [], ob.get('layers') or []
+    if not isinstance(la, list) or not isinstance(lb, list):
+        return 'open_block_config layers are malformed (not a list)'
     if len(la) != len(lb):
         return 'different layer counts'
+    if any(not isinstance(x, dict) for x in la + lb):
+        return 'open_block_config layer rows are malformed (not objects)'
     # `open_block_config` carries both names for the same setting; the
     # descriptor must not reject a legitimate max-block contrast just because
     # the alias appears in the layer row.

@@ -525,6 +525,13 @@ def t_open_analysis_control_gate():
     one = _rec('closed')
     one['hyperparams'] = {k: v for k, v in hp.items() if k != 'lr'}
     assert 'unverifiable' in OB._controlled_reason(a, one)
+    # Malformed descriptors are unverifiable, not a crash and not a pass.
+    assert 'malformed' in OB._controlled_reason(
+        a, _rec('closed', hyperparams='not-an-object'))
+    assert 'malformed' in OB._controlled_reason(
+        a, _rec('closed', open_block_config={'layers': 'not-a-list'}))
+    assert 'malformed' in OB._controlled_reason(
+        a, _rec('closed', open_block_config=['not-an-object']))
     # The paired contrast drops the uncontrolled seed instead of testing it.
     cells = {('a', 0): {'record': a, 'nll': 1.0, 'ppl': 2.0},
              ('b', 0): {'record': b, 'nll': 1.1, 'ppl': 2.1},
