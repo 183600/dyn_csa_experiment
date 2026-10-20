@@ -577,21 +577,31 @@ def _run_final(base, outdir, protocol, selected):
                 selection_fold=_row_spec['selection_fold'],
                 evaluation_fold=_row_spec['evaluation_fold'])
             _final_rows_meta.update(_meta)
-            _bad = []
+            # Compute every holdout estimate BEFORE mutating any record.  A
+            # partial assignment would leave some records on the later row
+            # fold and others on full validation, so the paired contrast would
+            # silently mix two samples even though the metadata says the
+            # nested split was not applied.  Either all records move to the
+            # held-out fold or none do.
+            _pending, _bad = [], []
             for k, r in merged.items():
                 st = L.record_subset_ppl(r, _eval_idx)
                 if st is None:
                     _bad.append(k)
                     continue
-                r['ppl_full_validation'] = r.get('ppl')
-                r['ppl_holdout'] = st['ppl']
-                r['nll_sum_holdout'] = st['nll_sum']
-                r['n_tokens_holdout'] = st['n_tokens']
-                r['holdout_row_fp'] = _meta.get('evaluation_row_fp')
+                _pending.append((r, st))
             _final_rows_meta['applied'] = not _bad
             if _bad:
                 _final_rows_meta['reason'] = ('final records without usable per-row NLL '
                                               f'accounting: {sorted(_bad)[:5]}')
+            else:
+                for r, st in _pending:
+                    r['ppl_full_validation'] = r.get('ppl')
+                    r['ppl_holdout'] = st['ppl']
+                    r['nll_sum_holdout'] = st['nll_sum']
+                    r['n_tokens_holdout'] = st['n_tokens']
+                    r['holdout_row_fp'] = _meta.get('evaluation_row_fp')
+                    r['ppl_estimation_rows'] = 'nested_validation_holdout'
         else:
             _final_rows_meta['reason'] = ('final records expose different per-row NLL lengths '
                                           'or fewer than 2 rows')

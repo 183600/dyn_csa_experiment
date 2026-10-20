@@ -3175,6 +3175,70 @@ def t_nested_final_uses_holdout_rows():
     assert comp['final_evaluation_rows']['applied'] is True, comp['final_evaluation_rows']
 
 
+def t_nested_final_partial_holdout_falls_back_wholly():
+    base = dict(L.RUN, d=8, n_layers=1, n_heads=1, d_head=8, seq_len=8,
+                batch_size=1, n_train_tokens=32, steps=3, warmup=1)
+    trials = [{'lr': 1e-4, 'weight_decay': 0.1, 'warmup': 1}]
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['a', 'b'], trials=trials,
+                    search_seeds=[100, 101, 102], final_seeds=[0, 1],
+                    inherits_tuning={}, method_arm='a')
+    protocol.pop('arm_groups', None)
+    out = tempfile.mkdtemp(prefix='nested_final_partial_')
+    selected = {a: {'selected': dict(trials[0]), 'trials': [{}],
+                    'selected_metric_value': 1.0} for a in ('a', 'b')}
+    L.atomic_write_json(os.path.join(out, 'baseline_tuning.json'),
+                        {'arms': selected, 'protocol': protocol})
+    orig_run, orig_wm, orig_ev = L.run, L.write_run_manifest, L.log_experiment_event
+    _, ev, _ = L.validation_row_split(8)
+
+    def fake_run(cfg, seeds=None, guard=None, label=None, **kw):
+        os.makedirs(cfg['outdir'], exist_ok=True)
+        summary = {}
+        for v in cfg['variants']:
+            for sd in seeds:
+                base_nll = 1.0 if v == 'a' else 2.0
+                rows = [base_nll + (0.5 if i in ev else 0.0) for i in range(8)]
+                toks = [1] * 8
+                # One record has a malformed per-row token count.  Its row
+                # length still matches the others, so the holdout layout is
+                # accepted and only record_subset_ppl() fails for this cell.
+                if v == 'b' and int(sd) == 0:
+                    toks[int(ev[0])] = None
+                summary[f'{v}::seed{sd}'] = {
+                    'variant': v, 'seed': int(sd),
+                    'ppl': float(np.exp(np.mean(rows))),
+                    'nll_sum': float(sum(rows)), 'n_tokens': 8,
+                    'nll_per_row': rows, 'n_tokens_per_row': toks,
+                    'steps': cfg['steps'],
+                    'tokens_seen': cfg['steps'] * cfg['batch_size'] * cfg['seq_len'],
+                    'params': 100, 'run_cfg': 'same', 'data_fp': 'd', 'val_fp': 'v',
+                    'train_knobs': L.training_knobs(),
+                    'hyperparams': {'lr': cfg['lr'], 'weight_decay': cfg['weight_decay'],
+                                    'warmup': cfg['warmup']}}
+        with open(os.path.join(cfg['outdir'], 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(summary, f)
+
+    L.run, L.write_run_manifest, L.log_experiment_event = fake_run, (lambda *a, **k: None), (lambda *a, **k: None)
+    try:
+        BT._run_final(base, out, protocol, selected)
+    finally:
+        L.run, L.write_run_manifest, L.log_experiment_event = orig_run, orig_wm, orig_ev
+        try:
+            comp = json.load(open(os.path.join(out, 'final', 'tuned_comparison.json'), encoding='utf-8'))
+            final = json.load(open(os.path.join(out, 'final', 'summary.json'), encoding='utf-8'))
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+    # No record may be switched to the holdout when ANY cell lacks the row
+    # accounting: a mixed fold/full-validation contrast is a different sample.
+    assert all('ppl_holdout' not in r for r in final.values()), final
+    assert comp['estimation_rows'] == 'full_validation', comp
+    assert comp['final_evaluation_rows']['applied'] is False, comp['final_evaluation_rows']
+    # The whole contrast is on the full-validation PPLs, not a mixture of
+    # one record's holdout PPL and another's full-validation PPL.
+    expect = final['a::seed0']['ppl'] - final['b::seed0']['ppl']
+    assert abs(comp['contrasts']['a - b']['mean'] - expect) < 1e-12, comp['contrasts']
+
+
 def t_baseline_tuning_driver_multiseed_selection():
     out = tempfile.mkdtemp(prefix='tune_multiseed_')
     trials = [{'lr': 1e-4, 'weight_decay': 0.1, 'warmup': 2},
@@ -6284,6 +6348,7 @@ def main():
     _check('H3h nested validation row split + per-row pooled PPL', t_nested_validation_row_split_and_subset_ppl)
     _check('H3i tuning audit verifies nested selection/holdout rows', t_nested_tuning_artifact_audit)
     _check('H3j final tuned contrast is measured on held-out rows', t_nested_final_uses_holdout_rows)
+    _check('H3k partial nested holdout falls back wholly to full validation', t_nested_final_partial_holdout_falls_back_wholly)
     _check('H4 tuned count-model floor + audit', t_simple_baseline_ngram_and_audit)
     _check('H4a count-model fit budget is bounded + disclosed', t_simple_baseline_fit_budget_is_bounded_and_disclosed)
     _check('H4b count-model floor uses nested selection/holdout rows', t_simple_baseline_nested_rows_and_fingerprint)
