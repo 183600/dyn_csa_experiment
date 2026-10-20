@@ -18121,6 +18121,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
 
     checks = {}
     errors = {}
+    _fp_before = rng_fingerprint()
     with _preserve_rng_state():
         try:
             a = _draws(seed)
@@ -18172,6 +18173,9 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
             except Exception as e:
                 errors['subprocess_seed'] = f'{type(e).__name__}: {e}'
                 checks['subprocess_seed_reproducible'] = False
+    _fp_after = rng_fingerprint()
+    _rng_preserved = bool(_fp_before == _fp_after)
+    checks['rng_state_preserved'] = _rng_preserved
     failed = [k for k, ok in checks.items() if ok is False]
     passed = not failed and not errors
     report = {
@@ -18189,6 +18193,9 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
         'worker_draws_b': w2,
         'worker_draws_other_seed': w3,
         'subprocess': sub,
+        'rng_fp_before': _fp_before,
+        'rng_fp_after': _fp_after,
+        'rng_state_preserved': _rng_preserved,
         'errors': errors,
         'passed': bool(passed),
         'diagnosis': ('ok' if passed else 'failed/errored RNG streams: ' + ', '.join(failed + sorted(errors))),
@@ -22126,6 +22133,14 @@ def overfit_sanity_check(variant='full', *, seed=0, steps=300, lr=3e-3, d=64, n_
     report['rng_fp_before'] = _fp_before
     report['rng_fp_after'] = _fp_after
     report['rng_state_preserved'] = bool(_fp_before == _fp_after)
+    report.setdefault('pass_criteria', {})['rng_state_preserved'] = bool(report['rng_state_preserved'])
+    if not report['rng_state_preserved']:
+        # A diagnostic that mutates the process RNG streams is itself a
+        # reproducibility fault: the training cell after it would see a
+        # different data order than the same run without the probe.
+        report['passed'] = False
+        report['failed_criteria'] = list(report.get('failed_criteria') or []) + ['rng_state_preserved']
+        report['diagnosis'] = 'the overfit probe did not restore the process RNG state'
     return report
 
 _OVERFIT_GUARD = {}
@@ -22456,12 +22471,14 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
         b = _repro_tiny_losses(variant, seed, **_kw)
         c = _repro_tiny_losses(variant, _other_seed(seed), **_kw)
     _fp_after = rng_fingerprint()
+    _rng_preserved = bool(_fp_before == _fp_after)
     _n = min(len(a), len(b))
     max_diff = max((abs(a[i] - b[i]) for i in range(_n)), default=float('inf'))
     different_seed_diff = max((abs(a[i] - c[i]) for i in range(min(len(a), len(c)))), default=0.0)
     finite = all(math.isfinite(v) for v in a + b + c)
     bitwise = bool(a == b)
-    passed = bool(finite and max_diff <= float(tol) and different_seed_diff > 0.0)
+    passed = bool(finite and max_diff <= float(tol) and different_seed_diff > 0.0
+                  and _rng_preserved)
     r = {
         'kind': 'duplicate_run_reproducibility',
         'variant': variant,
@@ -22486,7 +22503,7 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
         'all_finite': bool(finite),
         'rng_fp_before': _fp_before,
         'rng_fp_after': _fp_after,
-        'rng_state_preserved': bool(_fp_before == _fp_after),
+        'rng_state_preserved': _rng_preserved,
         'passed': passed,
     }
     if not passed:
@@ -22494,6 +22511,8 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
             r['diagnosis'] = 'non-finite loss in a tiny seeded run'
         elif max_diff > float(tol):
             r['diagnosis'] = 'same seed did not reproduce the short loss curve on this machine/stack'
+        elif not _rng_preserved:
+            r['diagnosis'] = 'the reproducibility probe did not restore the process RNG state'
         else:
             r['diagnosis'] = 'a different seed produced the identical loss curve (seed is not wired into the run)'
     else:

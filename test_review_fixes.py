@@ -2570,6 +2570,7 @@ def t_seed_contract_check():
     assert r['checks']['different_seed_changes_streams'] is True
     assert r['checks']['worker_seed_reproducible'] is True
     assert r['checks']['cuda_seeded'] is (True if torch.cuda.is_available() else None)
+    assert r['checks']['rng_state_preserved'] is True and r['rng_state_preserved'] is True, r
     assert L.rng_fingerprint() == fp0, 'the seed contract probe must not advance the process RNG streams'
 
 
