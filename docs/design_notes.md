@@ -1339,3 +1339,66 @@ statement / mechanism / predicted_sign / primary_metric / falsifier：
 `run_tuning(final=True)` / `_run_final` 现在拒绝空的 `final_seeds`。此前
 空列表会落到 `L.run(..., seeds=[])` 的默认 seed 0，可能重新使用调参
 draw，而 artifact 不记录这一替换；现在直接报错。
+
+## 28. 主估计量、配对选择不确定性与跨规模种子身份（本轮硬化）
+
+本节不新增 GPU 面板，只修正三处会让「配对」名不副实的数据流。
+
+### 28.1 嵌套 holdout 的逐种子统计必须用主估计量
+
+嵌套调参记录同时保存全验证集 `ppl` 与 held-out 行 `ppl_holdout`；
+`ppl_estimation_rows='nested_validation_holdout'` 时，报告的主估计量是
+后者。此前 `aggregate` 的 dPPL、`_print_pairs` 与
+`methodology_audit` 的 `_paired_seed_deltas` 仍读原始 `ppl`，等于把
+「用来选超参的行」重新放回配对差。现在统一走
+`_record_primary_ppl` / `_paired_primary_delta`：
+
+- 依次接受 `ppl_holdout`、`nll_sum_holdout/n_tokens_holdout`、
+  `nll_per_row_holdout/n_tokens_per_row_holdout`；
+- 声明了 nested 但三者全缺时返回 **None**（不可验证），绝不回退到
+  全验证 `ppl`；
+- `aggregate` 的 `ppl_mean/std/median/seed_t` 也改为按主估计量计算，并
+  记录 `ppl_primary_estimand` 与 `ppl_primary_missing`。若同组有记录缺少
+  holdout 记账，整组显式回退到全验证值并打印 warning，避免 `ppl_primary`
+  与误差条描述两个样本；
+- `build_report` 的 `paired_row`（P1T/P2S 等）与 P0W 逐种子差同样改用
+  主估计量。
+
+### 28.2 调参 margin 用配对差，不用两个边际 SE
+
+调参 trials 在**同一组 search seeds** 上评估，赢家与亚军的差是配对差。
+`tuning_selection_margin` 因此优先对共同 seed 的逐种子差取
+`SD/sqrt(n)`；每种子同向的稳定优势不会被两个边际 SD 的 `hypot` 误判成
+tie。只有 trial 缺 `seed_ppls` 时才回退到独立边际 SE，并把
+`selection_margin_method` 落盘；审计按该方法核验
+`selection_margin_se`，旧 artifact（无 method）可匹配任一实现，新
+artifact 必须匹配自己声明的方法。
+
+### 28.3 跨规模效应不能按位置配对
+
+`_scale_points` 过去在缺 `seeds` 时把位置 `0..n-1` 当成 seed id。
+`meta_analyze_effects` 只用点内重复，问题较小；但 `scaling_trend` 的
+complete-seed 斜率与 `interaction_extremes` 会把不同规模的「第 0 个
+effect」当成同一次训练随机抽样。现在每个点记录 `seeds_declared`：
+
+- 任一点缺 seed 身份时，`scaling_trend` 的 paired path 与 per-seed slope
+  全部撤回，`seed_pairing='unattested'`，只保留点级 WLS（并明确
+  `primary_inference`）；
+- 极端规模交互返回 `seed_identity_unattested`，不做位置配对；
+- `meta_analyze_effects` 仍可做点内随机效应汇总，但输出
+  `seed_pairing=declared|partial|positional_only`；
+- `scale_interaction` 对未声明 seed 的调用标记 `seed_pairing='positional'`。
+
+### 28.4 规模阶梯的种子计划核验
+
+`scale_ladder_audit` 现在拒绝重复/负数 seed，并输出
+`seed_set_shared`、`seed_set_intersection`、`n_common_seeds`。不同 tier
+的额外 seed 不算对其它 tier 的重复；跨规模配对只能用交集，审计给出
+warning 而不是把两套 seed 集合当成同一族。
+
+### 28.5 符号翻转规划与 Holm 的边界一致
+
+`signflip_min_consistency` 由 `< alpha` 改为与 `holm_adjust` /
+`holm_min_attainable_p` 一致的 `<= alpha`（含 1e-15 浮点容差）。因此
+「最小可达 p 恰好等于 alpha」的计划不再被错误地判为不可能确认、也不再
+报零功效。
