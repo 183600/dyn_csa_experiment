@@ -5569,6 +5569,12 @@ def t_split_sizes_explicit_never_negative():
     assert [len(idx[k]) for k in ('train', 'val', 'test')] == [6, 1, 3]
     idx_float = L.chronological_split_indices(10, train_size=6.0)
     assert [len(idx_float[k]) for k in ('train', 'val', 'test')] == [6, 1, 3]
+    # An explicitly sized split must not make the unfilled tail create rows in
+    # a split the caller declared empty (test_frac=0).
+    idx0 = L.chronological_split_indices(10, train_size=6, test_frac=0.0)
+    assert [len(idx0[k]) for k in ('train', 'val', 'test')] == [6, 4, 0], idx0
+    idx0b = L.chronological_split_indices(10, val_size=2, test_frac=0.0)
+    assert [len(idx0b[k]) for k in ('train', 'val', 'test')] == [8, 2, 0], idx0b
     # Explicit sizes are counts: non-integral/coerced values must be refused
     # rather than silently truncated (1.5 -> 1) or parsed ('2' -> 2).
     for bad in (1.5, '2', True):

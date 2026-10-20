@@ -142,7 +142,20 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
             sizes[i] = take
             remaining -= take
         if unspecified:
-            sizes[unspecified[-1]] = remaining
+            _last = unspecified[-1]
+            # A split the caller declared empty (frac=0) must stay empty even
+            # when it is the last unspecified slot.  Give the remainder to the
+            # last unspecified split that actually has a positive fraction;
+            # only fall back to the empty slot when no such target exists.
+            if fracs[_last] > 0.0 or not any(fracs[i] > 0.0 for i in unspecified):
+                sizes[_last] = remaining
+            else:
+                _targets = [i for i in unspecified if fracs[i] > 0.0]
+                sizes[_last] = 0
+                if _targets:
+                    sizes[_targets[-1]] += remaining
+                else:
+                    sizes[_last] = remaining
         if sum(sizes) != n or any(v < 0 for v in sizes):
             raise ValueError(f'could not reconcile split sizes {sizes} with n={n}')
         return tuple(int(v) for v in sizes)
