@@ -2583,6 +2583,15 @@ def t_metric_policy_checks_record_values():
                                        'bnd_rec': 0.2, 'bnd_rand': 0.1}}}}
     mb = L.metric_policy_audit(b)
     assert mb['status'] == 'warn' and any('non-harmonic' in w for w in mb['warnings']), mb
+    # Existence is not measurement: a boundary record with all keys present
+    # but None must fail, not pass through the range/filter checks.
+    bn = {'b::seed0': {'variant': 'b', 'ppl': 10.0,
+                       'stats': {'L0': {'bnd_f1': None, 'bnd_prec': None,
+                                        'bnd_rec': None, 'bnd_rand': None}}}}
+    mbn = L.metric_policy_audit(bn)
+    assert mbn['status'] == 'warn', mbn
+    _bc = next(c for c in mbn['checks'] if c['metric'] == 'boundary_alignment')
+    assert _bc['ok'] is False and _bc['missing'], _bc
     # Retrieval accuracy outside [0,1] is not a usable endpoint.
     n = {'n::seed0': {'variant': 'n', 'task': 'niah_natural', 'acc': 1.5,
                       'nll': 1.0, 'n_queries': 10}}

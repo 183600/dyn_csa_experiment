@@ -12645,20 +12645,23 @@ def metric_policy_audit(summary=None, policy=None):
                 if isinstance(layer, dict) and 'bnd_f1' in layer:
                     bnd.append(layer)
         if bnd:
-            missing = [k for k in ('bnd_prec', 'bnd_rec', 'bnd_rand') if not all(k in b for b in bnd)]
+            missing = [k for k in ('bnd_prec', 'bnd_rec', 'bnd_f1', 'bnd_rand')
+                       if not all(k in b and b.get(k) is not None for b in bnd)]
             _bad_bnd = []
             for _b in bnd:
                 _p, _r, _f = (_finite_scalar(_b.get(k)) for k in ('bnd_prec', 'bnd_rec', 'bnd_f1'))
                 _vals = [_p, _r, _f]
-                if any(v is None or not (0.0 <= v <= 1.0) for v in _vals if v is not None):
+                # A present-but-None key is not a measurement.  The old
+                # `if v is not None` filter removed exactly those values and
+                # let an all-None boundary record pass as `ok`.
+                if any(v is None or not (0.0 <= v <= 1.0) for v in _vals):
                     _bad_bnd.append('out-of-range')
                     continue
-                if _p is not None and _r is not None and _f is not None:
-                    _want = 2 * _p * _r / max(_p + _r, 1e-09)
-                    if abs(_f - _want) > 1e-6:
-                        _bad_bnd.append('f1-not-harmonic')
+                _want = 2 * _p * _r / max(_p + _r, 1e-09)
+                if abs(_f - _want) > 1e-6:
+                    _bad_bnd.append('f1-not-harmonic')
                 _rb = _finite_scalar(_b.get('bnd_rand'))
-                if _rb is not None and not (0.0 <= _rb <= 1.0):
+                if _rb is None or not (0.0 <= _rb <= 1.0):
                     _bad_bnd.append('random-out-of-range')
             out['checks'].append({'metric': 'boundary_alignment', 'policy': 'boundary_alignment',
                                   'records': len(bnd), 'ok': not missing and not _bad_bnd,
