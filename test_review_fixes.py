@@ -101,6 +101,12 @@ def t_min_consistency():
     assert L.signflip_min_consistency(6, 4, 0.05) is None, 'n=6, m=4: even 6/6 cannot clear the gate'
     assert L.signflip_min_consistency(8, 1, 0.05) == 8
     assert L.signflip_min_consistency(6, 1, 0.05) == 6
+    # Holm rejects at p_holm <= alpha.  The planning helper must use the same
+    # boundary: at n=3, m=1, alpha=0.25 the attainable floor IS 0.25.
+    assert L.signflip_min_consistency(3, 1, 0.25) == 3
+    assert L.signflip_power(3, 1, 1.0, 0.25) == 1.0
+    assert L.signflip_min_consistency(5, 1, 0.0625) == 5
+    assert L.signflip_min_consistency(3, 1, 0.25 - 1e-12) is None
     # Scale-up: the planning math must not overflow int->float at large n.
     big = L.signflip_min_consistency(2000, 10, 0.05)
     assert big is not None and 0 < big < 2000, big

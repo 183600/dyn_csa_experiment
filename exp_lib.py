@@ -9705,7 +9705,12 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     best = None
     for k in range(n, -1, -1):
         p = 2.0 * _binom_cdf_half(n, n - k)
-        if m * p < alpha:
+        # Use the SAME acceptance convention as `holm_adjust` and
+        # `holm_min_attainable_p`: p_holm <= alpha rejects.  A strict `<`
+        # here made an exactly-attainable plan (e.g. n=3, m=1, alpha=0.25,
+        # where the floor is exactly 0.25) look impossible and report zero
+        # power, contradicting the plan-power gate.
+        if m * p <= alpha + 1e-15:
             best = k  # keep descending: p(k) grows monotonically as k shrinks,
             # so the last k that still clears the gate is the MINIMUM k
         else:
