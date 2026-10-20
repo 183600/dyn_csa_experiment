@@ -8680,7 +8680,9 @@ def holm_adjust(named_pvals, alpha=0.05):
             raise ValueError(f'holm_adjust: duplicate comparison name {sname!r}')
         _seen_names.add(sname)
         try:
-            pv = float(p)
+            # A boolean is a flag, not a p-value: float(False) == 0 would
+            # otherwise enter the family as a maximally significant result.
+            pv = float('nan') if isinstance(p, (bool, np.bool_)) else float(p)
         except (TypeError, ValueError, OverflowError):
             pv = float('nan')
         if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
@@ -8733,7 +8735,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         if p is None:
             p = v.get('p')
         try:
-            p = float(p)
+            p = (float('nan') if isinstance(p, (bool, np.bool_)) else float(p))
         except (TypeError, ValueError, OverflowError):
             p = float('nan')
         if math.isfinite(p) and 0.0 <= p <= 1.0:
@@ -8830,11 +8832,13 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     mean, std = stats.get('mean'), stats.get('std')
     out['n'] = n
     try:
-        out['p_raw'] = float(p) if p is not None else None
+        out['p_raw'] = (None if p is None or isinstance(p, (bool, np.bool_))
+                        else float(p))
     except (TypeError, ValueError, OverflowError):
         out['p_raw'] = None
     try:
-        out['p_holm'] = float(ph) if ph is not None else None
+        out['p_holm'] = (None if ph is None or isinstance(ph, (bool, np.bool_))
+                         else float(ph))
     except (TypeError, ValueError, OverflowError):
         out['p_holm'] = None
     out['p_floor'] = signflip_p_floor(n) if n > 0 else None

@@ -4036,6 +4036,18 @@ def t_reportable_claim_gate():
     # Holm cannot be smaller than the raw p it adjusts.
     r = L.reportable_claim(dict(base, p_holm=0.001))
     assert r['allowed'] is False and any('smaller than the raw p' in x for x in r['reasons']), r
+    # Booleans are flags, not p-values.  In particular False must never enter
+    # the family as p=0 and become the most significant result.
+    for _p in (False, True):
+        h = L.holm_adjust([('x', _p)])
+        assert h['x']['p_holm'] is None, h
+        r = L.reportable_claim(dict(base, p_exact_signflip=_p,
+                                    p_holm=0.02))
+        assert r['allowed'] is False, r
+        r = L.reportable_claim(dict(base, p_holm=_p))
+        assert r['allowed'] is False, r
+    fam = L.attach_holm({'x': {'n': 6, 'p_exact_signflip': False}})
+    assert fam['tested'] == 0, fam
 
 
 def t_holm_family_resolution_ceiling():
