@@ -12513,8 +12513,13 @@ def metric_policy_audit(summary=None, policy=None):
             if not math.isfinite(float(_want)):
                 _lm_bad.append(_r.get('variant') or _r.get('name') or '?')
                 continue
-            _got = float(_r['ppl'])
-            if abs(_got - float(_want)) > 1e-6 * max(1.0, abs(float(_want))):
+            # Compare against the PPL on the SAME rows as the accounting
+            # used above.  A nested record's `ppl` is full validation while
+            # `nll_sum_holdout` describes the later row fold; validating one
+            # against the other would flag a correct record (or, worse, let a
+            # mismatched pair pass when the two errors happen to cancel).
+            _got = _record_primary_ppl(_r)
+            if _got is None or abs(_got - float(_want)) > 1e-6 * max(1.0, abs(float(_want))):
                 _lm_bad.append(_r.get('variant') or _r.get('name') or '?')
         out['checks'].append({'metric': 'ppl', 'policy': 'lm_perplexity', 'records': len(lm),
                               'aggregation': 'token_weighted',

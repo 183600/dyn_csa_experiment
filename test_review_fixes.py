@@ -2552,14 +2552,22 @@ def t_metric_policy_checks_record_values():
     assert L.metric_policy_audit(row)['status'] == 'ok', L.metric_policy_audit(row)
     # A nested record reports its holdout PPL and must be checked against
     # the holdout NLL accounting, not the full-validation accounting.
-    nested = {'v::seed0': {'variant': 'v', 'ppl': 5.0,
+    # `ppl` stays the full-validation value here (10.0) while the primary
+    # estimate is the holdout PPL (5.0); the check must not compare the
+    # holdout NLL against the full-validation PPL.
+    nested = {'v::seed0': {'variant': 'v', 'ppl': 10.0,
                            'nll_sum': math.log(10.0) * 100, 'n_tokens': 100,
+                           'ppl_holdout': 5.0,
                            'nll_sum_holdout': math.log(5.0) * 40,
                            'n_tokens_holdout': 40,
                            'ppl_estimation_rows': 'nested_validation_holdout'}}
     assert L.metric_policy_audit(nested)['status'] == 'ok', L.metric_policy_audit(nested)
     _pooled, _nl, _nt = L._pooled_ppl_from_records(list(nested.values()))
     assert abs(_pooled - 5.0) < 1e-12 and _nt == 40, (_pooled, _nl, _nt)
+    _bad_nested = json.loads(json.dumps(nested))
+    _bad_nested['v::seed0']['ppl_holdout'] = 7.0
+    _mn = L.metric_policy_audit(_bad_nested)
+    assert _mn['status'] == 'warn' and any('not exp(nll_sum/n_tokens)' in w for w in _mn['warnings']), _mn
     # Boundary F1 must be the harmonic mean of the reported precision/recall.
     b = {'b::seed0': {'variant': 'b', 'ppl': 10.0,
                       'stats': {'L0': {'bnd_f1': 0.9, 'bnd_prec': 0.2,
