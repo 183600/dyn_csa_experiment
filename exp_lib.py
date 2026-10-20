@@ -12289,6 +12289,12 @@ SIMPLE_BASELINE_POLICY = {
     # this cap, so its behavior is unchanged.
     'max_fit_tokens': 20_000_000,
     'fit_token_policy': 'deterministic_prefix',
+    # The count-model grid is small and cheap, so it is declared as a complete
+    # cartesian search rather than an OFAT shortcut.  The audit enforces this
+    # claim: every declared (alpha, interpolation) cell must be present.
+    'search_design': 'full_factorial',
+    'search_design_note': ('unigram: every alpha; bigram: every alpha x interpolation cell. '
+                           'The count tables are shared, so full coverage is cheap.'),
     'note': 'Counts are fitted on the training token stream only (a deterministic prefix when max_fit_tokens is exceeded, with the truncation recorded); smoothing/interpolation is selected on validation PPL. The held-out test split is never read. This is a sanity floor, not a tuned neural baseline.',
 }
 
@@ -12739,6 +12745,16 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         problems.append(f'missing simple-baseline evidence for arms {missing}')
     n_tokens_by_arm = {}
     selected_values = {}
+    _search_design = protocol.get('search_design')
+    _valid_search_designs = {'one_factor_at_a_time', 'marginal', 'full_factorial',
+                             'seeded_random', 'hand_designed_grid'}
+    if _search_design is None:
+        warnings.append('the count-model protocol does not declare search_design; '
+                        'grid completeness cannot be interpreted')
+    elif not isinstance(_search_design, str) or _search_design not in _valid_search_designs:
+        problems.append(f'search_design={_search_design!r} is not one of '
+                        f'{sorted(_valid_search_designs)}')
+    _grid_coverage = {}
     for arm, entry in baselines.items():
         if not isinstance(entry, dict):
             problems.append(f'{arm}: malformed baseline entry')
@@ -12778,6 +12794,38 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             problems.append(f'{arm}: selected_metric_value does not match the selected trial')
         if chosen_f > min(vals) + 1e-12:
             problems.append(f'{arm}: selected trial is not the minimum-{metric} trial')
+        # Declared search design: full factorial must actually be complete.
+        _meta = (_declared or {}).get(arm) if isinstance(_declared, dict) else {}
+        _order = _as_seed_int((_meta or {}).get('order', 1))
+        _grid = (protocol.get('grids') or {}).get(arm) or {}
+        _alphas = list(_grid.get('alpha') or [0.1])
+        _interps = (list(_grid.get('interpolation') or [1.0])
+                    if _order == 2 else [0.0])
+        _expected = set()
+        for _a in _alphas:
+            for _lam in _interps:
+                _cfg = {'order': _order, 'alpha': float(_a)}
+                if _order == 2:
+                    _cfg['interpolation'] = float(_lam)
+                _expected.add(json.dumps(_cfg, sort_keys=True, default=str))
+        _actual = set(cfgs)
+        _missing_cells = sorted(_expected - _actual)
+        _extra_cells = sorted(_actual - _expected)
+        _grid_coverage[arm] = {'expected_cells': len(_expected),
+                               'observed_cells': len(_actual),
+                               'missing_cells': _missing_cells,
+                               'extra_cells': _extra_cells,
+                               'complete': not _missing_cells and not _extra_cells}
+        if _search_design == 'full_factorial':
+            if _missing_cells:
+                problems.append(
+                    f'{arm}: declares a full_factorial count-model search but '
+                    f'{len(_missing_cells)} declared cell(s) were not run '
+                    f'({_missing_cells[:4]})')
+            if _extra_cells:
+                problems.append(
+                    f'{arm}: trials include {len(_extra_cells)} cell(s) outside '
+                    f'the declared full-factorial grid ({_extra_cells[:4]})')
         nt = set()
         for t in trials:
             if not isinstance(t, dict) or t.get('n_tokens') is None:
@@ -12980,6 +13028,10 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             _reported_rows = _best_entry.get('reported_estimation_rows')
     out = {'status': 'ok' if not problems else 'fail',
            'baseline_verified': not problems,
+           'search_design': _search_design,
+           'search_design_declared': _search_design is not None,
+           'search_design_note': protocol.get('search_design_note'),
+           'grid_coverage': _grid_coverage,
            'selection_metric': metric, 'selection_split': split,
            'arms': sorted(baselines), 'selected_values': selected_values,
            'best_baseline': best_name,

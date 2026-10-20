@@ -3928,6 +3928,21 @@ def t_simple_baseline_ngram_and_audit():
     assert art['data']['val_fp'] and art['data']['n_eval_tokens'] == val.size
     audit = L.simple_baseline_audit(art, protocol=proto)
     assert audit['baseline_verified'] is True, audit
+    assert audit['search_design'] == 'full_factorial', audit
+    assert all(v['complete'] for v in audit['grid_coverage'].values()), audit['grid_coverage']
+    # A declared full-factorial count search must actually contain every cell.
+    bad_cell = json.loads(json.dumps(art))
+    _bgram = [t for t in bad_cell['baselines']['bigram']['trials']
+              if (t.get('config') or {}).get('interpolation') == 0.5]
+    assert _bgram, bad_cell['baselines']['bigram']['trials']
+    bad_cell['baselines']['bigram']['trials'].remove(_bgram[0])
+    rbc = L.simple_baseline_audit(bad_cell, protocol=proto)
+    assert rbc['baseline_verified'] is False and any(
+        'full_factorial' in p and 'not run' in p for p in rbc['problems']), rbc
+    bad_design = dict(proto, search_design='whatever')
+    rbd = L.simple_baseline_audit(art, protocol=bad_design)
+    assert rbd['baseline_verified'] is False and any(
+        'search_design' in p for p in rbd['problems']), rbd
     # A selected value that is not the selected config's own trial value is a
     # fabricated result, even if it happens to equal the grid minimum.
     bad = json.loads(json.dumps(art))
