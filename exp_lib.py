@@ -17576,13 +17576,17 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
         if device.type == 'cuda':
             _vdev = _dev_str(device)
             _vc = _PINNED_HOST_CACHE.get('val')
+            # In-place mutation of the same tensor keeps its id/shape but
+            # changes `_version`; without it the pinned copy served stale rows.
+            _vver = getattr(val_batch, '_version', None)
             if (_vc is not None and _vc[0] is val_batch and _vc[1] == tuple(val_batch.shape)
-                    and _vc[3] == _vdev):
+                    and _vc[3] == _vdev and _vc[4] == _vver):
                 _vhost = _vc[2]
             else:
                 try:
                     _vhost = torch.as_tensor(val_batch).pin_memory()
-                    _PINNED_HOST_CACHE['val'] = (val_batch, tuple(val_batch.shape), _vhost, _vdev)
+                    _PINNED_HOST_CACHE['val'] = (val_batch, tuple(val_batch.shape), _vhost,
+                                                 _vdev, _vver)
                 except RuntimeError:
                     _vhost = torch.as_tensor(val_batch)
         else:
