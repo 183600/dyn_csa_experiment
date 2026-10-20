@@ -5889,6 +5889,16 @@ def t_audit_fairness_nan_seed_does_not_crash():
                                     'ppl': 10.0, 'run_cfg': 'x'}}, f)
         out = A.audit_fairness(path, arms=['a'])
         assert out['arms']['a']['seeds'] == [], out
+        # Malformed run_cfg/params values are reported, not a TypeError: a
+        # dict run_cfg is unhashable and mixed param types are unorderable.
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'a::seed0': {'variant': 'a', 'seed': 0, 'ppl': 10.0,
+                                    'run_cfg': {'bad': 1}, 'params': 10},
+                       'a::seed1': {'variant': 'a', 'seed': 1, 'ppl': 11.0,
+                                    'run_cfg': 'x', 'params': 'bad'}}, f)
+        out_bad = A.audit_fairness(path, arms=['a'])
+        assert isinstance(out_bad, dict) and out_bad['status'] == 'fail', out_bad
+        assert out_bad['arms']['a']['params'] == [10, 'bad'], out_bad['arms']['a']
         # A summary that does not contain any requested arm is not auditable.
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({}, f)

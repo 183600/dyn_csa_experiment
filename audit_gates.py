@@ -1492,8 +1492,20 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
     problems = []
     warnings = []
     arms_present = [a for a in arms if a in per_arm]
+
+    def _setting_key(value):
+        # Malformed JSON can carry a dict/list where a run_cfg string belongs;
+        # a raw set insert would raise TypeError instead of reporting the
+        # mixed protocol.  Keep hashable values unchanged and give unhashable
+        # ones a stable canonical spelling.
+        try:
+            hash(value)
+        except TypeError:
+            return ('__unhashable__', json.dumps(value, sort_keys=True, default=str))
+        return value
+
     for a, recs in per_arm.items():
-        cfgs = {r.get('run_cfg') for r in recs}
+        cfgs = {_setting_key(r.get('run_cfg')) for r in recs}
         knob_vals = {json.dumps(r.get('train_knobs'), sort_keys=True)
                      for r in recs if r.get('train_knobs') is not None}
         n_missing_knobs = sum(1 for r in recs if r.get('train_knobs') is None)
@@ -1507,7 +1519,12 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
             'n_distinct_train_knobs': len(knob_vals),
             'n_missing_train_knobs': n_missing_knobs,
             'params': sorted({r.get('params') for r in recs},
-                             key=lambda x: (x is None, x)),
+                             key=lambda x: (
+                                 x is None,
+                                 0 if isinstance(x, numbers.Real)
+                                 and not isinstance(x, (bool, np.bool_)) else 1,
+                                 float(x) if isinstance(x, numbers.Real)
+                                 and not isinstance(x, (bool, np.bool_)) else repr(x))),
         }
         if len(cfgs) > 1:
             problems.append(f'{a}: {len(cfgs)} distinct run_cfg values within one arm — mixed protocols inside an arm')
@@ -1542,7 +1559,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
                 if _eq is None:
                     warnings.append(f'{_key} equality across arms is UNVERIFIABLE (some records omit it / differ in coverage) — do not read the arm means as a controlled contrast')
         ref_arm = arms[0] if arms[0] in per_arm else next(iter(per_arm))
-        ref_cfg = {r.get('run_cfg') for r in per_arm[ref_arm]}
+        ref_cfg = {_setting_key(r.get('run_cfg')) for r in per_arm[ref_arm]}
         if not ref_cfg or None in ref_cfg:
             # Length-phase / checkpoint-backed records carry `by_len` and a
             # code stamp but no run_cfg fingerprint, so cross-arm recipe
@@ -1554,7 +1571,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
                 if a == ref_arm:
                     continue
                 for r in recs:
-                    if r.get('run_cfg') is None or r.get('run_cfg') not in ref_cfg:
+                    if r.get('run_cfg') is None or _setting_key(r.get('run_cfg')) not in ref_cfg:
                         problems.append(f'{a}: a record whose run_cfg does not equal the {ref_arm} reference (pair_reason would refuse this pairing)')
                         break
         # Seed coverage: arm means are only comparable if they average the
