@@ -1591,9 +1591,21 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
     `pairs` may be a list of (arm_a, arm_b); by default every arm pair sharing
     a panel is reported (descriptive)."""
     import numpy as np
+    # The band controls whether a speed claim is allowed at all.  A boolean,
+    # NaN, negative or >=1 tolerance would make the claimed direction
+    # meaningless (negative even labels every ratio as faster), so refuse it
+    # instead of silently changing the gate.
+    if isinstance(tolerance, (bool, np.bool_)):
+        raise ValueError(f'tolerance must be a finite fraction in [0,1), got {tolerance!r}')
+    try:
+        tolerance = float(tolerance)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'tolerance must be a finite fraction in [0,1), got {tolerance!r}') from None
+    if not (math.isfinite(tolerance) and 0.0 <= tolerance < 1.0):
+        raise ValueError(f'tolerance must be a finite fraction in [0,1), got {tolerance!r}')
     dirs = outdirs or list(_iter_result_dirs())
     out = {'status': 'ok', 'panels': {}, 'claims_allowed': [], 'refused': [],
-           'tolerance': float(tolerance),
+           'tolerance': tolerance,
            'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))

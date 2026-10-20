@@ -4311,6 +4311,14 @@ def t_efficiency_pairs_audit_and_sweep():
         r2 = A.audit_efficiency_pairs(outdirs=[td])
         rec2 = r2['panels'][td]['a vs b']
         assert rec2['speed_claim_allowed'] is False and 'token counts' in rec2['reason'], rec2
+        # An invalid tolerance cannot widen (negative) or disable the speed gate.
+        for _bad_tol in (True, -0.05, float('nan'), float('inf'), 1.0, 'x'):
+            try:
+                A.audit_efficiency_pairs(outdirs=[td], tolerance=_bad_tol)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'tolerance={_bad_tol!r} must be refused')
     finally:
         shutil.rmtree(td, ignore_errors=True)
     L.set_seed(0)
