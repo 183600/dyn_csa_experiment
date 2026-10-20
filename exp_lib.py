@@ -8893,7 +8893,16 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
                          else float(ph))
     except (TypeError, ValueError, OverflowError):
         out['p_holm'] = None
-    out['p_floor'] = signflip_p_floor(n) if n > 0 else None
+    # Exact ties do not contribute resolution.  A caller that supplies the
+    # non-zero count (paired_effect_stats/exact_signflip_p do) must not be
+    # re-scored with the theoretical all-nonzero floor 2/2**n.
+    _nn = _as_seed_int(stats.get('n_nonzero'))
+    if _nn is not None and _nn >= 0:
+        out['n_nonzero'] = _nn
+        out['p_floor'] = (1.0 if _nn == 0 else signflip_p_floor(_nn))
+    else:
+        out['n_nonzero'] = None
+        out['p_floor'] = signflip_p_floor(n) if n > 0 else None
     # A p-value is a probability.  p=-0.1 would satisfy every strict "< alpha"
     # comparison and could support a claim that no valid test produced.
     if out['p_raw'] is not None and not (0.0 <= out['p_raw'] <= 1.0):

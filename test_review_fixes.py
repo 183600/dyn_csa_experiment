@@ -7468,6 +7468,9 @@ def t_signflip_zero_ties_lower_resolution_floor():
     assert st['n'] == 6 and st['n_nonzero'] == 2, st
     assert abs(st['p_floor'] - 0.5) < 1e-15, st
     assert st['resolution_limited'] is True, st
+    claim = L.reportable_claim(st, family_size=1)
+    assert claim['p_floor'] == 0.5 and claim['n_nonzero'] == 2, claim
+    assert claim['level'] == 'resolution_limited', claim
     all_zero = L.exact_signflip_p([0.0, 0.0, 0.0])
     assert all_zero['p'] == 1.0 and all_zero['p_floor'] == 1.0, all_zero
     assert L.paired_effect_stats([0.0] * 6)['p_floor'] == 1.0
