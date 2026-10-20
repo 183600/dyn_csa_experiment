@@ -495,7 +495,12 @@ def _arm_summary(cells):
             n_tok.append(n)
         pooled = None
         if all(n is not None for n in n_tok):
-            _nll = math.fsum(nlls)
+            # `nlls` are already per-token values.  Pooling must recover each
+            # seed's NLL SUM (nll_per_token * n_tokens) before dividing by the
+            # combined token count; summing the per-token means and dividing by
+            # the total token count would make the pooled PPL shrink as more
+            # seeds (or more tokens) are added.
+            _nll = math.fsum(nll * int(n) for nll, n in zip(nlls, n_tok))
             _nt = int(sum(n_tok))
             if _nt > 0:
                 pooled = L._safe_exp_ppl(_nll / _nt)

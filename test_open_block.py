@@ -662,6 +662,9 @@ def t_open_record_identity_and_arm_summary():
     assert abs(arm['ppl_std'] - 2.0 ** 0.5) < 1e-9, arm
     assert abs(arm['nll_per_token_mean'] - 1.1) < 1e-9, arm
     assert arm['n_tokens_total'] == 20 and arm['ppl_pooled'] is not None, arm
+    # Pooling recovers the per-seed NLL sums: exp((10 + 12) / (10 + 10)),
+    # not exp((1.0 + 1.2) / 20), which would shrink with every added token.
+    assert abs(arm['ppl_pooled'] - math.exp(22.0 / 20.0)) < 1e-9, arm
     # The arm summary independently parses exact token counts; a fractional
     # cell cannot contribute a truncated pooled denominator.
     _frac = {('v', 0): {'record': {'n_tokens': 10.5}, 'nll': 1.0, 'ppl': 10.0},
