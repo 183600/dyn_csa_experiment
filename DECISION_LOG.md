@@ -83,6 +83,24 @@ test-split record was ever written.
   without removing it. Validation is also the split that was reused for all
   v6-v11 selection, so it cannot support confirmatory claims.
 
+## 2026-10-20 — binary metric / calibration / F1-averaging hardening (no new runs)
+
+Changed only zero-GPU metric and audit paths; no panel, frozen manifest, test
+split, README or CI configuration was touched. (1) Binary F1 was threshold-blind:
+`classification_metrics` now records the decision threshold and its source, and
+`binary_threshold_curve` / `select_binary_threshold` make validation-only
+operating-point selection explicit (with a scale-safe cumulative sweep). A
+threshold selected on the evaluation/test rows is rejected as leakage.
+(2) Scores in [0,1] now carry Brier score and ECE; a below-chance ROC-AUC is
+surfaced as a label-orientation warning. (3) `per_class` now carries TP/FP/FN,
+so macro, micro and weighted F1 and accuracy are reproducible from the record;
+forged aggregates fail the audit. (4) Boundary alignment now separates
+macro-over-sequences F1 from micro F1 and stores the pooled counts. The old
+audit asserted the micro harmonic identity against macro means, which is false
+for unequal per-sequence precision/recall; micro is now checked from counts and
+a macro record without counts is marked unverifiable instead of wrong.
+(5) The temporary issue list was removed after the fixes.
+
 ## 2026-10-20 — scale-comparability hardening (no new runs, frozen plan untouched)
 
 Changed only zero-GPU analysis/reporting paths; no panel, frozen manifest or

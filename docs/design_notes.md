@@ -1595,3 +1595,74 @@ seeds」。
 `conf` 必须是 (0,1) 实数、`n_boot` 是 >=20 的整数、`seed` 是整数；否则
 返回 `status='unverifiable'` 与 `reason`，不再构造一个标签与实际覆盖率
 不一致的区间。
+
+## 35. 二分类阈值、校准与 F1 聚合口径（本轮硬化）
+
+### 35.1 F1 不是无阈值指标
+
+`f1_positive` / `precision` / `recall` / `balanced_accuracy` 都依赖一个决策
+阈值。旧的 `classification_metrics` 在只有分数时隐式使用 0.5，却没有把这个
+约定写进记录：一个排序很好但正类分数整体低于 0.5 的模型会被读成弱模型；
+更危险的是，如果阈值是在评测行上调出来的，审计看不到任何痕迹。现在：
+
+- `classification_metrics(..., threshold=...)` 显式接收阈值，并输出
+  `decision_threshold` / `decision_threshold_source`（`default_0.5`、
+  `caller_threshold`、`caller_predictions`、`argmax` 或
+  `validation_selection`）。默认 0.5 仍是报告约定，但不再隐式。
+- `binary_threshold_curve` 给出每个候选切点的 TP/FP/FN/TN、precision、
+  recall、F1、specificity、balanced accuracy 与 Youden J；
+  `select_binary_threshold` 返回选定切点及其相对 0.5 的
+  `threshold_sensitivity`。两者都明确要求：切点只能在**与评测行不相交的
+  验证行**上选择。
+- 扫描按分数排序后用累积计数一次完成，复杂度 O(n log n + k)，并支持
+  `max_thresholds` 上限与 `threshold_grid_truncated` 标记，避免在
+  B-tier 规模上把每个候选阈值都重扫全样本。
+- `metric_policy_audit` 对二分类记录检查：阈值必须在 [0,1]；来源必须是
+  声明集合之一；`validation_selection` 必须同时声明
+  `threshold_selection_split="validation"` 与
+  `threshold_selection_metric`；评测/测试行上的阈值选择按泄漏拒绝。
+  报告正类 F1 却没有 `positive_label` 时也无法识别正类，记为不可复核。
+- 在 1:100 以上的不平衡（少数类 < 1e-2）仍使用 0.5 默认切点时给出
+  warning：这不是错误，但必须同时报告 PR-AUC，且不能把一个未调优的切点
+  当成模型上限。1:1000 以上仍按条件主指标切换为 PR-AUC。
+
+### 35.2 排序好不等于概率可用
+
+二分类分数若落在 [0,1]，`classification_metrics` 额外给出 Brier score 与
+等宽分箱 ECE（`calibration` 中带每个非空箱的 confidence/accuracy/gap）。
+它们进入 `binary_classification` 的 secondary 端点与记录级范围审计。这样
+「PR-AUC 提升」不会被误读成「概率可用于阈值决策」；分数若不在 [0,1]，
+校准返回 `status="unavailable"` 而不是硬算一个没有概率含义的 Brier。
+ROC-AUC 低于 0.5 会显式提示检查正类列方向，而不是直接把模型判为弱。
+
+### 35.3 macro / micro / weighted 必须由 per-class 计数复现
+
+`classification_metrics` 的 `per_class` 现在带 `tp`/`fp`/`fn`，并输出
+`precision_micro` / `recall_micro`。`metric_policy_audit` 在计数齐全时：
+
+- 由每个类的 TP/FP/FN 重算 precision/recall/F1，和记录值不一致即失败；
+- 由计数总和重算 micro precision/recall/F1，和 `f1_micro` 等字段不一致即
+  失败；
+- 由正确计数比例重算 accuracy；
+- 继续由 per-class F1 与 support 复现 macro / weighted F1。
+
+这使「多分类 F1 用的是 macro、micro 还是 weighted」不只是文字声明，而是
+可由记录本身验证的口径。
+
+### 35.4 边界 F1 的 macro 与 micro 是两件事
+
+边界对齐过去只落盘逐序列 precision/recall/F1 的均值（macro over
+sequences），审计却要求
+`bnd_f1 == 2*bnd_prec*bnd_rec/(bnd_prec+bnd_rec)`。该恒等式只对 micro
+（池化 TP/FP/FN）成立，对 macro 不成立：均值 F1 一般不等于均值
+precision/recall 的调和平均。现在 `boundary_alignment` 可选返回逐序列
+TP/FP/FN 计数，`compression_report` 同时落盘：
+
+- `bnd_prec` / `bnd_rec` / `bnd_f1`：逐序列 macro 口径，并声明
+  `bnd_f1_average="macro_over_sequences"`；
+- `bnd_prec_micro` / `bnd_rec_micro` / `bnd_f1_micro` 与池化
+  `bnd_tp`/`bnd_fp`/`bnd_fn`：可由计数直接复现的 micro 口径。
+
+审计只对 micro 声明强制调和关系；macro 记录若没有 micro 计数，会明确标为
+`macro_f1_reconstructible=False`，不再用一个错误的恒等式把正确读数判错，
+也不假装能离线复现它。

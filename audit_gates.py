@@ -22,7 +22,8 @@
   fairness     基线公平：冻结臂间 run_cfg/train_knobs/lr/warmup/调参机会
                一致性与 mlp_ratio 审计（零 GPU）
   metrics      指标口径：主指标/方向/聚合/不平衡声明与记录级伴随指标
-               （边界需 precision/recall/随机基线，NIAH 需 answer NLL）
+               （边界需 precision/recall/随机基线，NIAH 需 answer NLL；
+               二分类需决策阈值来源与校准，macro/micro/weighted F1 需可复现）
   tuning       基线调参：主方法与简单基线是否获得同一搜索网格与范围
                （读 results_baseline_tuning/baseline_tuning.json）
   methodology  受控对比 / 消融完整性 / 统计可靠性：逐臂全种子设置一致性、
@@ -1641,7 +1642,9 @@ def audit_metrics(outdirs=None):
     micro/weighted；极度不平衡优先 PR-AUC；指标必须对齐任务目标。本审计
     先检查 `exp_lib.METRIC_POLICY` 是否完整声明，再对本地面板检查边界
     指标是否同时给出 precision/recall/随机基线、NIAH 是否同时给出 answer
-    NLL。缺失只标 warn/不可核验，不伪造一个「通过」。"""
+    NLL、二分类是否声明决策阈值与来源、校准字段是否在合法范围，以及
+    macro/micro/weighted F1 是否能由 per-class 计数复现。缺失只标
+    warn/不可核验，不伪造一个「通过」。"""
     L = _import_exp_lib()
     out = {'status': 'ok', 'policy': L.metric_policy_audit(), 'panels': {}}
     dirs = outdirs or list(_iter_result_dirs())
