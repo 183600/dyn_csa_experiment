@@ -4834,6 +4834,17 @@ def t_audit_split_test_metadata_discipline():
         rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
         assert rec.get('test_shuffle_at_split') is False, rec
         assert rec['status'] != 'fail', rec
+        # P5T uses a longer test sequence than the training cache.  The test
+        # cache must still be paired for the leakage audit.
+        with open(os.path.join(d, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(good_test, seq_len=16), f)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec.get('test_pairing') != 'not_found', rec
+        assert rec.get('test_tag') == ttag and rec.get('test_shape') == [2, 8], rec
+        assert rec.get('exact_row_overlap_train_test') == 0, rec
+        with open(os.path.join(d, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
+            json.dump(good_test, f)
         bad_test = dict(good_test, shuffle_at_split=True,
                         tokenizer_fit_split='test',
                         near_duplicate_cleanup={'policy': 'none'})

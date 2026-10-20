@@ -689,10 +689,11 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 rec['status'] = 'fail'
                 _fail(f'{cd}/{tag}: {shared_val} validation rows exactly duplicate a training row')
             # The test cache filename carries its own seq_len/vocab/ns tag.
-            # Pair by the full protocol (test_meta vocab/seq_len/fit_fp), not
-            # by the first filename whose sequence length happens to match:
-            # a mis-paired test file makes both false positives and false
-            # negatives in the overlap audit.
+            # P5T deliberately loads test at a longer sequence length than the
+            # training cache, so seq_len is NOT part of the cache identity.
+            # Pair on vocab + tokenizer fit provenance (as audit_leakage
+            # does); a mis-paired test file would make both false positives
+            # and false negatives in the overlap audit.
             _cands = []
             for _tmp in sorted(glob.glob(os.path.join(cd, 'test_meta_*.json'))):
                 _tm = _load(_tmp)
@@ -701,8 +702,6 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 _ttag = os.path.basename(_tmp)[len('test_meta_'):-len('.json')]
                 _tfp = os.path.join(cd, f'test_ids_{_ttag}.npy')
                 if not os.path.exists(_tfp):
-                    continue
-                if meta.get('seq_len') is not None and _tm.get('seq_len') is not None and int(_tm['seq_len']) != int(meta['seq_len']):
                     continue
                 if meta.get('vocab') is not None and _tm.get('vocab') is not None and int(_tm['vocab']) != int(meta['vocab']):
                     continue
