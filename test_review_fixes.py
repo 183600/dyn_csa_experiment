@@ -5694,6 +5694,13 @@ def t_methodology_gate_fail_closed_edges():
         else:
             raise AssertionError(f'audit_methodology accepted min_n={_bad!r}')
 
+    # The report's own significance gate validates its minimum-n parameter.
+    _st = {'n': 6, 'p_exact_signflip': 0.01, 'p_holm': 0.02,
+           'mean': 1.0, 'std': 0.5}
+    assert BR._sig_gate(_st) is True
+    for _bad in (True, 3.5, 0, -1, float('nan')):
+        assert BR._sig_gate(_st, min_n=_bad) is False, _bad
+
     # Capacity and compute tolerances are gate parameters: a bool/negative/
     # non-finite value must not silently disable the control.
     _ra = {'params': 1000}

@@ -1421,9 +1421,11 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
     if _alpha is None or not (0.0 < _alpha < 1.0):
         return False
     alpha = _alpha
-    _min_n = _int_or(min_n, 6)
-    if _min_n < 1:
-        _min_n = 6
+    # A minimum-n floor is a gate parameter, not a measurement: a boolean or
+    # fractional value must fail closed instead of silently becoming 6.
+    _min_n = _int_or(min_n, None)
+    if _min_n is None or _min_n < 1:
+        return False
     global _GATE_CALLS, _UNREGISTERED_GATES
     _GATE_CALLS += 1
     if label is None:
