@@ -10962,12 +10962,29 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         warm_ratio = (max(warm) / min(warm)) if len(warm) == len(rows) and min(warm) > 0 else None
         if warm_ratio is not None and warm_ratio > 2.0:
             warnings.append(f'warmup fraction varies {warm_ratio:.2f}x across scales')
-        feas = [r['min_seeds_for_family_significance'] for r in rows if r.get('min_seeds_for_family_significance')]
+        _family_alpha = 0.05
+        _family_n = (signflip_min_n_for_holm(family_m, _family_alpha)
+                     if family_m is not None else None)
         for r in rows:
             if r.get('n_seeds') and r.get('p_floor') is not None:
-                r['descriptive_only'] = bool(r['p_floor'] > 0.05)
+                # Power is a property of the DECLARED family, not of the raw
+                # sign-flip test alone.  A tier with n=6 can reach the raw
+                # floor 0.031 but not a Holm floor of 0.094 for family_m=3;
+                # reporting descriptive_only=False there would promise a
+                # family-level claim the design cannot support.
+                _fam_floor = (holm_min_attainable_p(r['n_seeds'], family_m,
+                                                    _family_alpha)
+                              if family_m is not None else None)
+                r['p_floor_family_holm'] = _fam_floor
+                _basis_floor = (_fam_floor if _fam_floor is not None
+                                and math.isfinite(_fam_floor) else r['p_floor'])
+                r['descriptive_only'] = bool(_basis_floor > _family_alpha)
+                r['descriptive_only_basis'] = (
+                    'holm_family' if (_fam_floor is not None
+                                      and math.isfinite(_fam_floor))
+                    else 'raw_signflip')
                 r['seeds_sufficient_for_family'] = (
-                    None if not feas else bool(r['n_seeds'] >= min(feas)))
+                    None if _family_n is None else bool(r['n_seeds'] >= _family_n))
         # Corpus/tokenizer binding across the ladder: a MISMATCH is a hard
         # problem (the cross-tier log-ratios the ladder exists to compute are
         # not defined), while missing fingerprints stay a warning (the audit
@@ -11019,11 +11036,37 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                     'seeds are not replication of the other tiers'
                     % (_seed_common or 'none',
                        ', '.join('%s=%d' % (r['name'], r['n_seeds']) for r in rows)))
+        # A cross-tier paired contrast uses ONLY the seed-set intersection.
+        # Per-tier n therefore overstates the paired evidence when one tier
+        # added seeds the other never ran.  Make the paired design's own
+        # resolution floor explicit instead of borrowing a tier's raw n.
+        _n_common = len(_seed_common)
+        _common_floor = (signflip_p_floor(_n_common) if _n_common > 0 else float('nan'))
+        _common_fam_floor = (holm_min_attainable_p(_n_common, family_m,
+                                                   _family_alpha)
+                             if (_n_common > 0 and family_m is not None)
+                             else None)
+        _common_sufficient = (None if _family_n is None
+                              else bool(_n_common >= _family_n))
+        if _common_sufficient is False:
+            warnings.append(
+                'the cross-tier paired contrast has only %d common seed(s), '
+                'but the declared %d-comparison Holm family needs n>=%d for '
+                'its exact sign-flip floor to reach alpha=%g; per-tier extra '
+                'seeds cannot repair this — repeat the missing seeds in every '
+                'tier or shrink the family'
+                % (_n_common, int(family_m), int(_family_n), _family_alpha))
         out = {'status': ('fail' if problems else ('warn' if warnings else 'ok')),
                'budget_matched': (budget_matched if len(rows) >= 2 else None),
                'seed_set_shared': seed_set_shared,
                'seed_set_intersection': _seed_common,
-               'n_common_seeds': len(_seed_common),
+               'n_common_seeds': _n_common,
+               'family_m': family_m,
+               'family_alpha': _family_alpha,
+               'family_min_seeds': _family_n,
+               'common_seed_paired_p_floor': _common_floor,
+               'common_seed_min_attainable_p_holm': _common_fam_floor,
+               'common_seeds_sufficient_for_family': _common_sufficient,
                'tokens_per_param_ratio': tpp_ratio,
                'tokens_per_param_tolerance': tol,
                'lr_constant': (lr_constant if len(rows) >= 2 else None),

@@ -5555,6 +5555,37 @@ def t_scale_ladder_budget_and_transfer_audit():
     oneg = L.scale_ladder_audit([neg, b])
     assert oneg['status'] == 'fail' and any('negative' in p for p in oneg['problems']), oneg
 
+    # A tier's power is a property of the DECLARED Holm family, not of the raw
+    # sign-flip test.  n=6 can reach raw p=2/64=0.03125 but not Holm p for a
+    # 3-comparison family (3*2/64=0.09375), so it must stay descriptive.
+    def _with_seeds(name, seeds):
+        t = tier(name, 1000, 1000)
+        t['cfg']['seeds'] = list(seeds)
+        return t
+    fam = L.scale_ladder_audit(
+        [_with_seeds('S1', range(6)), _with_seeds('S2', range(4))],
+        policy=dict(L.SCALE_TRANSFER_POLICY, family_m=3))
+    _s1, _s2 = fam['tiers']
+    assert abs(_s1['p_floor'] - 2.0 / 64.0) < 1e-15, _s1
+    assert abs(_s1['p_floor_family_holm'] - 3.0 * 2.0 / 64.0) < 1e-15, _s1
+    assert _s1['descriptive_only'] is True, _s1
+    assert _s1['descriptive_only_basis'] == 'holm_family', _s1
+    assert _s2['descriptive_only'] is True, _s2
+    # The paired cross-tier contrast can use only the 4 common seeds, not the
+    # 6 seeds one tier happens to have.
+    assert fam['n_common_seeds'] == 4, fam
+    assert abs(fam['common_seed_paired_p_floor'] - 2.0 / 16.0) < 1e-15, fam
+    assert fam['common_seeds_sufficient_for_family'] is False, fam
+    assert any('common seed' in w for w in fam['warnings']), fam
+    # Seven common seeds clear a 3-comparison family at alpha=0.05
+    # (3*2/128=0.046875), so the same ladder becomes planned-sufficient.
+    fam_ok = L.scale_ladder_audit(
+        [_with_seeds('S1', range(7)), _with_seeds('S2', range(7))],
+        policy=dict(L.SCALE_TRANSFER_POLICY, family_m=3))
+    assert fam_ok['family_min_seeds'] == 7, fam_ok
+    assert fam_ok['common_seeds_sufficient_for_family'] is True, fam_ok
+    assert all(t['descriptive_only'] is False for t in fam_ok['tiers']), fam_ok
+
 
 def t_init_core_fingerprint_and_pair_gate():
     dev = torch.device('cpu')

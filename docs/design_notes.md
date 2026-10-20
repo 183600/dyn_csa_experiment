@@ -1483,3 +1483,19 @@ M0 的跨规模 log-PPL 效应过去只按 `(variant, seed)` 取 PPL。种子编
 指纹 / `init_core_fp` / steps/tokens）；被拒的 seed 会打印并排除，不计入
 规模点。极端规模交互按声明的 `scale` 排序，不再按标签字符串排序
 （否则 `S10` 会排在 `S2` 之前）。
+
+### 29.5 规模阶梯的功效是「声明族 + 共同种子」的属性
+
+`scale_ladder_audit` 过去用原始符号翻转下限 `2/2**n` 标记每个 tier 的
+`descriptive_only`，忽略了预注册族大小。n=6 的 tier 能到 0.031，但面对
+`family_m=3` 的 Holm 族最小可达 p 是 0.094，仍然无法确认任何比较。现在
+每个 tier 同时报告 `p_floor_family_holm` / `descriptive_only_basis`，并按
+族下限判定 `descriptive_only`；`family_min_seeds` 直接来自
+`signflip_min_n_for_holm(family_m)`。
+
+跨 tier 的配对对比只能用种子集合的交集，而不是任一层自己的 n。审计新增
+`n_common_seeds`、`common_seed_paired_p_floor`、
+`common_seed_min_attainable_p_holm` 与
+`common_seeds_sufficient_for_family`；共同种子不足以达到族下限时给出
+warning，并明确「某一层多跑的 seed 不能修补另一层缺的 seed」。这样在
+GPU 时间被消耗前就能看出阶梯是否具备可确认的配对证据。
