@@ -8707,11 +8707,8 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         if math.isfinite(p) and 0.0 <= p <= 1.0:
             pairs.append((str(k), p))
             tested += 1
-            try:
-                _tn = int(v.get('n'))
-            except (TypeError, ValueError, OverflowError):
-                _tn = 0
-            if _tn > 0:
+            _tn = _as_seed_int(v.get('n'))
+            if _tn is not None and _tn > 0:
                 _tested_ns.append(_tn)
         else:
             pairs.append((str(k), 1.0))
@@ -8728,11 +8725,8 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     for v in (comparisons or {}).values():
         if not isinstance(v, dict):
             continue
-        try:
-            _n = int(v.get('n'))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if _n > 0:
+        _n = _as_seed_int(v.get('n'))
+        if _n is not None and _n > 0:
             _ns.append(_n)
     _m = int(len(comparisons or {}))
     # Only a tested, measurable comparison can pass the first Holm gate; an
@@ -8793,9 +8787,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     if not isinstance(stats, dict):
         out['reasons'].append('not a statistics dict')
         return out
-    try:
-        n = int(stats.get('n') or 0)
-    except (TypeError, ValueError, OverflowError):
+    n = _as_seed_int(stats.get('n'))
+    if n is None or n < 0:
         n = 0
     p = stats.get('p_exact_signflip')
     if p is None:
@@ -8862,13 +8855,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
 def signflip_p_floor(n):
     """双侧精确符号翻转检验在 n 个种子下的最小可达 p 值（2/2^n）；
     n<=0 返回 NaN。用于报告「未显著是分辨率上限还是数据结论」。"""
-    if isinstance(n, (bool, np.bool_)):
-        return float('nan')
-    try:
-        n = int(n)
-    except (TypeError, ValueError, OverflowError):
-        return float('nan')
-    if n <= 0:
+    n = _as_seed_int(n)
+    if n is None or n <= 0:
         return float('nan')
     # same value as 2.0 / 2**n, evaluated in the float exponent range.
     return math.ldexp(2.0, -n)
@@ -9024,6 +9012,11 @@ def exact_signflip_p(deltas):
     与残余风险（训练随机性进入种间方差、文档抽样进入 doc 层方差）。"""
     d_in = []
     for _x in (deltas if deltas is not None else []):
+        if isinstance(_x, (bool, np.bool_)):
+            # Booleans are flags, not measurements (same scalar contract as
+            # _finite_scalar and build_report.exact_signflip).
+            d_in.append(float('nan'))
+            continue
         try:
             d_in.append(float(_x))
         except (TypeError, ValueError, OverflowError):
@@ -9318,15 +9311,9 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     最小可达 p_holm = min(1, m * 2/2^n)。若该值 > alpha，则该方案在构造上
     无法确认任何比较——这是分辨率上限，不是「保守的选择」，应当在读到
     任何测试数据之前修订（加种子 / 缩族 / 改检验），而不是事后再解释。"""
-    if (isinstance(n_seeds, (bool, np.bool_))
-            or isinstance(m_comparisons, (bool, np.bool_))):
-        return float('nan')
-    try:
-        n = int(n_seeds)
-        m = int(m_comparisons)
-    except (TypeError, ValueError, OverflowError):
-        return float('nan')
-    if n <= 0 or m <= 0:
+    n = _as_seed_int(n_seeds)
+    m = _as_seed_int(m_comparisons)
+    if n is None or m is None or n <= 0 or m <= 0:
         return float('nan')
     return min(1.0, m * signflip_p_floor(n))
 
@@ -9343,15 +9330,13 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     returned n is descriptive only (the exact-test floor, not the data, bounds
     the p value), so the audit labels it resolution-limited instead of reading
     it as a null result."""
-    if isinstance(m_comparisons, (bool, np.bool_)) or isinstance(n_max, (bool, np.bool_)):
-        return None
+    m = _as_seed_int(m_comparisons)
+    n_max = _as_seed_int(n_max)
     try:
-        m = int(m_comparisons)
         a = float(alpha)
-        n_max = int(n_max)
     except (TypeError, ValueError, OverflowError):
         return None
-    if m <= 0 or not (0.0 < a < 1.0):
+    if m is None or n_max is None or m <= 0 or not (0.0 < a < 1.0):
         return None
     for n in range(1, n_max + 1):
         if holm_min_attainable_p(n, m, a) <= a + 1e-15:
@@ -9548,15 +9533,9 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     下界，真实数据可能仍需更多同向种子。返回使 m·p(k) < alpha 的最小
     k；若全部 n 个同向仍不够，返回 None（方案不可能确认）。二项尾概率
     在 log 空间计算，因此大 n（规模扩展后的补种子计划）也不会整数溢出。"""
-    if (isinstance(n_seeds, (bool, np.bool_))
-            or isinstance(m_comparisons, (bool, np.bool_))):
-        return None
-    try:
-        n = int(n_seeds)
-        m = int(m_comparisons)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if n <= 0 or m <= 0:
+    n = _as_seed_int(n_seeds)
+    m = _as_seed_int(m_comparisons)
+    if n is None or m is None or n <= 0 or m <= 0:
         return None
     best = None
     for k in range(n, -1, -1):
@@ -9584,12 +9563,12 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
         return 0.0 if kmin is None else 1.0
     if isinstance(q, (bool, np.bool_)):
         return 0.0
+    n = _as_seed_int(n_seeds)
     try:
-        n = int(n_seeds)
         q = float(q)
     except (TypeError, ValueError, OverflowError):
         return 0.0
-    if not (0.0 <= q <= 1.0) or n <= 0:
+    if n is None or not (0.0 <= q <= 1.0) or n <= 0:
         return 0.0
     if q >= 1.0:
         return 1.0
@@ -11470,13 +11449,11 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         for t in trials:
             if not isinstance(t, dict) or t.get('n_tokens') is None:
                 continue
-            try:
-                if isinstance(t.get('n_tokens'), (bool, np.bool_)):
-                    raise ValueError
-                nt.add(int(t.get('n_tokens')))
-            except (TypeError, ValueError, OverflowError):
+            _nt = _as_seed_int(t.get('n_tokens'))
+            if _nt is None:
                 problems.append(f'{arm}: trial n_tokens is not an integer ({t.get("n_tokens")!r})')
                 break
+            nt.add(_nt)
         if len(nt) > 1:
             problems.append(f'{arm}: trials evaluated different token counts {sorted(nt)} — PPLs are not comparable')
         n_tokens_by_arm[arm] = sorted(nt)
@@ -11488,10 +11465,9 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
     if not data.get('val_fp'):
         warnings.append('artifact has no validation fingerprint — the panel comparison cannot verify it used the same validation slice')
     if data.get('fit_truncated') is True:
-        try:
-            _nfit = int(data.get('n_fit_tokens'))
-            _nsrc = int(data.get('n_source_tokens'))
-        except (TypeError, ValueError, OverflowError):
+        _nfit = _as_seed_int(data.get('n_fit_tokens'))
+        _nsrc = _as_seed_int(data.get('n_source_tokens'))
+        if _nfit is None or _nsrc is None:
             warnings.append('count-model artifact claims a truncated fit but lacks integer fit/source token counts')
         else:
             if not (0 < _nfit < _nsrc):

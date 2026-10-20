@@ -3890,6 +3890,13 @@ def t_simple_baseline_audit_malformed_records():
     out = L.simple_baseline_audit(art)
     assert out['status'] == 'fail', out
     assert any('n_tokens is not an integer' in p for p in out['problems']), out
+    # Fractional token counts must not be truncated to a different budget.
+    art2 = json.loads(json.dumps(art))
+    for _t in art2['baselines']['a']['trials']:
+        _t['n_tokens'] = 10.5
+    out2 = L.simple_baseline_audit(art2)
+    assert out2['status'] == 'fail', out2
+    assert any('n_tokens is not an integer' in p for p in out2['problems']), out2
 
 
 
@@ -4471,6 +4478,11 @@ def t_holm_mixed_n_and_invalid_family_size():
     assert abs(h['a']['p_holm'] - 0.08) < 1e-15, h
     assert h['a']['reject'] is False and h['a']['m_effective'] == 2, h
     assert h['b']['p_holm'] is None and h['b']['m_effective'] == 2, h
+    # Fractional seed counts are not silently truncated into a different
+    # resolution floor; they are unverifiable.
+    assert math.isnan(L.signflip_p_floor(6.5))
+    assert math.isnan(L.holm_min_attainable_p(6.5, 4))
+    assert math.isnan(L.signflip_p_floor(True))
 
 
 def t_meta_prediction_interval_df():
@@ -4672,6 +4684,8 @@ def t_stats_accept_numpy_scalars():
         ('nan', np.float64('nan')), ('bool', True), ('npbool', np.bool_(True))])
     assert (lo, hi, dropped) == (1.0, 2.5, ['nan', 'bool', 'npbool']), (lo, hi, dropped)
     assert BR.exact_signflip([np.bool_(True), np.bool_(False)]) is None
+    assert L.exact_signflip_p([True, False])['n'] == 0
+    assert BR.exact_signflip([True, False]) is None
     meta = L.meta_analyze_effects([
         {'label': 'A', 'scale': 1, 'effects': np.array([1, 2, 3], dtype=np.int64), 'seeds': [0, 1, 2]},
         {'label': 'B', 'scale': 2, 'effects': np.array([2, 3, 4], dtype=np.int64), 'seeds': [0, 1, 2]},
