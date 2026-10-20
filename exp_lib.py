@@ -13686,7 +13686,8 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         precision = tp / (tp + fp) if tp + fp else 0.0
         recall = tp / (tp + fn) if tp + fn else 0.0
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        per_class[str(lab)] = {'precision': precision, 'recall': recall, 'f1': f1, 'support': support}
+        per_class[str(lab)] = {'precision': precision, 'recall': recall, 'f1': f1,
+                               'support': support, 'tp': tp, 'fp': fp, 'fn': fn}
         all_f1s.append(f1)
         # Balanced accuracy / macro recall are also averages over the full
         # REQUESTED label set.  A label absent from y_true (but requested, or
@@ -13717,6 +13718,10 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         'f1_macro': macro_f1,
         'f1_micro': float(micro_f1),
         'f1_weighted': weighted_f1,
+        'precision_micro': (float(total_tp / (total_tp + total_fp))
+                            if (total_tp + total_fp) else 0.0),
+        'recall_micro': (float(total_tp / (total_tp + total_fn))
+                         if (total_tp + total_fn) else 0.0),
         'f1_positive': f1_positive,
         'f1_primary': (f1_positive if pos is not None else macro_f1),
         'f1_primary_average': ('binary_positive_class' if pos is not None else 'macro'),
@@ -14011,6 +14016,7 @@ def metric_policy_audit(summary=None, policy=None):
             _pc = r.get('per_class')
             if isinstance(_pc, dict) and _pc:
                 _f1s, _sup = [], []
+                _counts = []
                 _pc_bad = False
                 for _k, _v in _pc.items():
                     if not isinstance(_v, dict):
@@ -14023,6 +14029,10 @@ def metric_policy_audit(summary=None, policy=None):
                         break
                     _f1s.append(float(_f))
                     _sup.append(int(_s))
+                    _tp = _exact_count(_v.get('tp'), minimum=0)
+                    _fp = _exact_count(_v.get('fp'), minimum=0)
+                    _fn = _exact_count(_v.get('fn'), minimum=0)
+                    _counts.append(None if None in (_tp, _fp, _fn) else (int(_tp), int(_fp), int(_fn)))
                 if _pc_bad:
                     _class_issues.append(f'{_label}: per_class contains an invalid F1/support entry')
                 elif _f1s:
@@ -14038,6 +14048,39 @@ def metric_policy_audit(summary=None, policy=None):
                             _class_issues.append(
                                 f'{_label}: f1_weighted={_rep_weighted} is not the support-weighted '
                                 f'mean of its per-class F1 values ({_weighted})')
+                    if all(c is not None for c in _counts):
+                        _bad_cls = []
+                        for (_k, _v), (tp, fp, fn) in zip(_pc.items(), _counts):
+                            wp = tp / (tp + fp) if tp + fp else 0.0
+                            wr = tp / (tp + fn) if tp + fn else 0.0
+                            wf = 2 * wp * wr / (wp + wr) if wp + wr else 0.0
+                            for _key, _want in (('precision', wp), ('recall', wr), ('f1', wf)):
+                                _got = _finite_scalar(_v.get(_key))
+                                if _got is None or abs(_got - _want) > 1e-9:
+                                    _bad_cls.append(f'{_k}:{_key}')
+                        if _bad_cls:
+                            _class_issues.append(
+                                f'{_label}: per_class counts do not reproduce '
+                                f'{sorted(set(_bad_cls))[:8]}')
+                        _stp = sum(c[0] for c in _counts)
+                        _sfp = sum(c[1] for c in _counts)
+                        _sfn = sum(c[2] for c in _counts)
+                        _mp = _stp / (_stp + _sfp) if _stp + _sfp else 0.0
+                        _mr = _stp / (_stp + _sfn) if _stp + _sfn else 0.0
+                        _mf = 2 * _mp * _mr / (_mp + _mr) if _mp + _mr else 0.0
+                        for _key, _want in (('f1_micro', _mf), ('precision_micro', _mp),
+                                            ('recall_micro', _mr)):
+                            _got = _finite_scalar(r.get(_key))
+                            if _got is not None and abs(_got - _want) > 1e-9:
+                                _class_issues.append(
+                                    f'{_label}: {_key}={_got} is not the value reproduced '
+                                    f'from per_class counts ({_want})')
+                        _tot = sum(_sup)
+                        _acc = _finite_scalar(r.get('accuracy'))
+                        if _tot > 0 and _acc is not None and abs(_acc - _stp / _tot) > 1e-9:
+                            _class_issues.append(
+                                f'{_label}: accuracy={_acc} is not the correct-count fraction '
+                                f'from per_class ({_stp / _tot})')
             # Threshold-dependent endpoints are only reproducible with the cut
             # that produced them.  An untuned 0.5 cut is legal, but it must be
             # named; a cut selected on the evaluation rows is not.

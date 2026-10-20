@@ -4659,6 +4659,21 @@ def t_binary_threshold_and_calibration_contract():
     inv = dict(good, roc_auc=0.2)
     iv = L.metric_policy_audit({'g': inv})
     assert iv['status'] == 'warn' and any('below chance' in w for w in iv['warnings']), iv
+    # Macro/micro/weighted F1 must all be reproducible from the per-class
+    # counts; a hand-edited aggregate cannot pass.
+    _cm = L.classification_metrics(np.array([0] * 95 + [1] * 5),
+                                   y_pred=np.array([0] * 100), labels=[0, 1])
+    _rec = dict(_cm, variant='c', task='binary_classification',
+                prevalence={'0': 0.95, '1': 0.05})
+    assert L.metric_policy_audit({'c': _rec})['status'] == 'ok', L.metric_policy_audit({'c': _rec})
+    _bad_micro = dict(_rec, f1_micro=0.123)
+    _bm = L.metric_policy_audit({'c': _bad_micro})
+    assert _bm['status'] == 'warn' and any('f1_micro' in w and 'reproduced' in w
+                                           for w in _bm['warnings']), _bm
+    _bad_pc = json.loads(json.dumps(_rec))
+    _bad_pc['per_class']['0']['precision'] = 0.1
+    _bp = L.metric_policy_audit({'c': _bad_pc})
+    assert _bp['status'] == 'warn' and any('per_class counts' in w for w in _bp['warnings']), _bp
 
 
 def t_boundary_macro_micro_f1_contract():
