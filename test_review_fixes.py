@@ -3585,6 +3585,23 @@ def t_simple_floor_contrast_is_significance_aware():
         _cands = [(_dyn_key, _arm[_dyn_key]), (_full_key, _arm[_full_key])]
         _ref_key, _ref = min(_cands, key=lambda kv: float(kv[1].get('ppl_primary', kv[1]['ppl_mean'])))
         assert _ref_key == _dyn_key and _ref['ppl_primary'] == floor - 1.0, (_ref_key, _ref)
+    # A nested record's per-seed contrast must use the same holdout PPL as its
+    # pooled primary endpoint.  Full-validation `ppl` is deliberately worse
+    # than the floor here, so reading it would reverse the verdict.
+    nested = recs(floor + 10.0)
+    for _r in nested.values():
+        _r['ppl_holdout'] = float(floor - 1.0)
+        _r['nll_sum_holdout'] = math.log(float(floor - 1.0)) * n_tok
+        _r['n_tokens_holdout'] = n_tok
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, 'simple_baseline.json'), 'w', encoding='utf-8') as f:
+            json.dump(sb, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rn = L.methodology_audit(nested, design={}, baselines=L.BASELINE_DESIGN,
+                                     outdir=td, verbose=False)
+        fn = rn['simple_baseline']['floor_contrast']
+        assert fn['mean_delta'] < 0 and fn['verdict'] == 'beats_floor_significant', fn
+
     # Underpowered pointwise wins are not "beats floor".
     with tempfile.TemporaryDirectory() as td:
         with open(os.path.join(td, 'simple_baseline.json'), 'w', encoding='utf-8') as f:

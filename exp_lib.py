@@ -14899,9 +14899,9 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 if _comparable is True and _floor_ppl is not None:
                     _ref_variant = _ref.get('variant')
                     _ref_protocol = _ref.get('protocol') or ''
-                    _seed_vals = [float(r['ppl']) for (v, t, _s), r in recs.items()
+                    _seed_vals = [float(_ppl) for (v, t, _s), r in recs.items()
                                   if v == _ref_variant and (t or '') == _ref_protocol
-                                  and ppl_is_usable(r.get('ppl'))]
+                                  and (_ppl := _record_primary_ppl(r)) is not None]
                     if _seed_vals:
                         _deltas = [x - _floor_ppl for x in _seed_vals]
                         _fst = paired_effect_stats(_deltas, alpha=0.05,
@@ -20004,6 +20004,23 @@ def _pooled_ppl_from_records(recs):
     if total_t <= 0:
         return None, None, None
     return _safe_exp_ppl(total_n / total_t), total_n, int(total_t)
+
+def _record_primary_ppl(rec):
+    """The per-seed PPL on the same rows as the record's primary aggregate.
+
+    `_pooled_ppl_from_records` switches to the nested holdout accounting when
+    `ppl_estimation_rows` says the estimate is a held-out-row one.  Any
+    per-seed contrast must use the same number; reading `ppl` (full
+    validation) next to a pooled holdout aggregate would mix two samples.
+    Legacy records without a holdout marker keep `ppl`."""
+    if not isinstance(rec, dict):
+        return None
+    if rec.get('ppl_estimation_rows') == 'nested_validation_holdout':
+        _h = _finite_scalar(rec.get('ppl_holdout'))
+        if _h is not None:
+            return _h
+    return _finite_scalar(rec.get('ppl'))
+
 
 def _seed_t_ci(ppls, alpha=0.05):
     alpha = _validated_alpha(alpha, context='_seed_t_ci alpha')
