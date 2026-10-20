@@ -492,6 +492,51 @@ def t_open_candidate_edge_cases():
     assert mass.shape == (n,) and torch.isfinite(mass).all(), mass
 
 
+def t_open_analysis_control_gate():
+    import open_block_supp as OB
+    hp = {'steps': 10, 'tokens_seen': 100, 'n_train_tokens': 100,
+          'seq_len': 8, 'batch_size': 1, 'lr': 3e-4, 'weight_decay': 0.1,
+          'warmup': 1, 'comp_lambda': 0.0, 'delta_lr_mult': 10.0,
+          'd': 8, 'n_layers': 1, 'n_heads': 1, 'd_head': 8, 'mlp_ratio': 4,
+          'vocab_size': 32, 'dataset': 'unit', 'data_version': 'v',
+          'val_seqs': 2, 'eval_every': 0, 'eval_subset': 2,
+          'code': 'c', 'amp_dtype': None, 'eager_batch': False}
+
+    def _rec(mode, **kw):
+        r = {'hyperparams': dict(hp), 'code': 'c', 'params': 100,
+             'run_fingerprint': 'r', 'data_fp': 'd', 'val_fp': 'v',
+             'eval_fp': 'e', 'eval_subset_fp': 's', 'rng_fp': 'g',
+             'open_block_config': {'layers': [
+                 {'max_block': 128, 'open_block_mode': mode,
+                  'open_block_scope': 'full_prefix'}]}}
+        r.update(kw)
+        return r
+    a = _rec('summary')
+    b = _rec('closed')
+    assert OB._controlled_reason(a, b) is None
+    # Only the declared experimental factor may differ.
+    bad_hp = dict(hp, lr=1e-3)
+    assert 'lr differs' in OB._controlled_reason(
+        a, _rec('closed', hyperparams=bad_hp))
+    # A one-sided descriptor is unverifiable, not a pass.
+    one = _rec('closed')
+    one.pop('data_fp')
+    assert 'unverifiable' in OB._controlled_reason(a, one)
+    one = _rec('closed')
+    one['hyperparams'] = {k: v for k, v in hp.items() if k != 'lr'}
+    assert 'unverifiable' in OB._controlled_reason(a, one)
+    # The paired contrast drops the uncontrolled seed instead of testing it.
+    cells = {('a', 0): {'record': a, 'nll': 1.0, 'ppl': 2.0},
+             ('b', 0): {'record': b, 'nll': 1.1, 'ppl': 2.1},
+             ('a', 1): {'record': a, 'nll': 1.0, 'ppl': 2.0},
+             ('b', 1): {'record': _rec('closed', hyperparams=bad_hp),
+                        'nll': 1.1, 'ppl': 2.1}}
+    ds, pds, used, rejected = OB._paired(cells, 'a', 'b', [0, 1])
+    assert used == [0] and len(ds) == 1 and len(pds) == 1, (used, ds, rejected)
+    assert len(rejected) == 1 and rejected[0]['seed'] == 1, rejected
+    assert 'lr differs' in rejected[0]['reason'], rejected
+
+
 CHECKS = [
     ('K1 open-block config/segmenter', t_config_and_segmenter),
     ('K2 prefix pooling reference/grad', t_prefix_pool_reference),
@@ -504,6 +549,7 @@ CHECKS = [
     ('K9 HCA budget declaration', t_hca_budget_declaration),
     ('K10 forced-vs-natural cuts', t_forced_vs_natural_cuts),
     ('K11 open candidate edge cases', t_open_candidate_edge_cases),
+    ('K12 analysis control gate drops uncontrolled seeds', t_open_analysis_control_gate),
 ]
 
 
