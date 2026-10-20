@@ -619,8 +619,11 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
         _manifest_changed = lock.get('manifest_sha256') != _sha
         _test_changed = (test_ids_fp is not None
                          and lock.get('test_ids_fp') not in (None, test_ids_fp))
-        _train_changed = (train_fp is not None
-                          and lock.get('train_fp') not in (None, train_fp))
+        # Once the lock carries a training-corpus fingerprint, a later call
+        # with no fingerprint is a provenance downgrade, not a match.  The old
+        # condition made the mismatch disappear exactly when train_fp=None.
+        _train_changed = (lock.get('train_fp') is not None
+                          and train_fp != lock.get('train_fp'))
         _refreeze = os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on')
         if (_manifest_changed or _test_changed or _train_changed) and not _refreeze:
             if _manifest_changed:
@@ -919,6 +922,12 @@ def run_finaltest(cfg=None, guard=None):
     _nseq_clean = int((manifest.get('eval') or {}).get('n_seqs_clean') or cfg.get('n_seq', 16))
     test_ids = cfg.get('test_ids')
     _smoke = bool(cfg.get('smoke'))
+    if not _smoke:
+        # Direct `phase P5T` / finaltest must not bypass the same zero-test
+        # preflight that protects P5C/P5MP.  plan_check() never reads test
+        # data; it refuses an unconfirmable/misbound plan before the one-shot
+        # access can be burned.
+        plan_check(cfg.get('manifest') or FREEZE_MANIFEST)
     if test_ids is not None:
         # A caller-supplied slice is ONLY a plumbing smoke input.  In normal
         # mode the test split must come from load_wikitest, otherwise a
@@ -1074,6 +1083,22 @@ def _by_len_shape_reason(rec, n_seq):
             return f'by_len[{_ln_i}].truncated={_c.get("truncated")!r} is not a boolean — an unverifiable cell is not admissible'
         if bool(_c.get('truncated')):
             return f'by_len[{_ln_i}] is marked truncated — a partial cell is not admissible'
+        # A per-document vector must have one value per declared/frozen row.
+        # Otherwise population-claim gates can count 64 values for an n_seq=16
+        # evaluation and admit a wider document sample than was measured.
+        if 'ppl_per_seq' in _c:
+            _pps = _c.get('ppl_per_seq')
+            if not isinstance(_pps, list) or len(_pps) != int(n_seq):
+                return (f'by_len[{_ln_i}].ppl_per_seq has '
+                        f'{len(_pps) if isinstance(_pps, list) else type(_pps).__name__} '
+                        f'entries, not the frozen n_seq={int(n_seq)}')
+        if _c.get('n_seq') is not None:
+            _ns = _c.get('n_seq')
+            if (isinstance(_ns, (bool, np.bool_))
+                    or not isinstance(_ns, (int, float, np.integer, np.floating))
+                    or not math.isfinite(float(_ns))
+                    or float(_ns) != int(n_seq)):
+                return f'by_len[{_ln_i}].n_seq={_ns!r} != the frozen n_seq={int(n_seq)}'
     return None
 
 
@@ -2007,6 +2032,8 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
             _Ln = int(str(comp.get('endpoint', 'by_len.ppl@4096')).rsplit('@', 1)[-1])
         except (TypeError, ValueError, OverflowError):
             _Ln = None
+        if _Ln is None:
+            errs.append(f'comparison {comp.get("name")!r} has an unparseable endpoint {comp.get("endpoint")!r}; the frozen by-length endpoint must be `...@<integer>`')
         _missing = [x for x in (_a, _b) if x not in arms]
         if _missing:
             errs.append(f'comparison {comp.get("name")!r} names arms outside the frozen list: {_missing}')

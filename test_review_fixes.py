@@ -306,6 +306,54 @@ def t_rope_arms_are_not_batched():
     assert L._uses_batched_eager(L.make_layer_cfgs(6, 'csa_fixed_rope'), device=_Cuda(), batch_size=1) is False
 
 
+def t_by_len_requires_one_ppl_per_row():
+    cell = {'n_tok': 16 * 4095, 'truncated': False,
+            'ppl_per_seq': [1.0] * 64}
+    reason = V12._by_len_shape_reason({'by_len': {'4096': cell}}, 16)
+    assert reason is not None and 'ppl_per_seq' in reason, reason
+    cell['ppl_per_seq'] = [1.0] * 16
+    assert V12._by_len_shape_reason({'by_len': {'4096': cell}}, 16) is None
+
+
+def t_plan_check_rejects_bad_endpoint_and_finaltest_is_gated():
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+            man = json.load(f)
+        man['primary_comparisons'][0] = dict(man['primary_comparisons'][0],
+                                             endpoint='by_len.ppl@L4096')
+        bad = os.path.join(td, 'bad_endpoint.json')
+        with open(bad, 'w', encoding='utf-8') as f:
+            json.dump(man, f)
+        _buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(_buf):
+                V12.plan_check(bad)
+        except SystemExit:
+            assert 'endpoint' in _buf.getvalue(), _buf.getvalue()[:500]
+        else:
+            raise AssertionError('an unparseable endpoint must fail plan_check')
+        # run_finaltest must not skip the plan preflight for a direct P5T call.
+        _old = V12.plan_check
+        _seen = []
+        def _boom(path=None):
+            _seen.append(path)
+            raise SystemExit('plan refused in test')
+        try:
+            V12.plan_check = _boom
+            try:
+                _cfg = dict(V12.FINALTEST_CFG)
+                _cfg.update(manifest=os.path.join(REPO, 'confirmation_frozen.json'),
+                            outdir=os.path.join(td, 'testout'), smoke=False)
+                V12.run_finaltest(_cfg)
+            except SystemExit as e:
+                assert 'plan refused in test' in str(e), str(e)[:200]
+            else:
+                raise AssertionError('run_finaltest bypassed plan_check')
+        finally:
+            V12.plan_check = _old
+        assert _seen, 'plan_check was not called'
+
+
 def t_manifest_v3_admission_can_succeed():
     # The zero-GPU plan check is the end-to-end guard against a stamp-only
     # alignment that would admit no records.  Exercise it on the shipped
@@ -880,6 +928,14 @@ def t_freeze_lock():
             V12._check_or_write_freeze_lock(td, man2, 'FP')
         finally:
             del os.environ['V12_REFREEZE']
+        # Once a training fingerprint is locked, an analysis call without one
+        # is a provenance downgrade and must be refused.
+        V12._check_or_write_freeze_lock(td, man2, 'FP', train_fp='TRAIN')
+        try:
+            V12._check_or_write_freeze_lock(td, man2, 'FP', train_fp=None)
+            raise AssertionError('a missing train_fp after it was locked must be refused')
+        except SystemExit:
+            pass
 
 
 def t_p1l_recipe_signature():
@@ -6654,6 +6710,8 @@ def main():
     _check('C4 recipe signature', t_recipe_signature)
     _check('C4b P1L checkpoint recipe signature', t_p1l_recipe_signature)
     _check('C5 freeze lock', t_freeze_lock)
+    _check('C5b by-length per-document row count', t_by_len_requires_one_ppl_per_row)
+    _check('C5c plan endpoint and P5T preflight gate', t_plan_check_rejects_bad_endpoint_and_finaltest_is_gated)
     _check('C5b probe stats reject malformed arm identities', t_probe_stats_rejects_malformed_arm_identities)
     _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)
     _check('C10 audit resolution classification', t_audit_resolution_classification)
