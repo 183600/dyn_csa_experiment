@@ -4067,6 +4067,19 @@ def t_leakage_safe_split_contract():
     assert np.max(order[ti['train']]) <= np.min(order[ti['val']])
     assert np.max(order[ti['val']]) <= np.min(order[ti['test']])
     L.assert_no_split_leakage(ti['train'], ti['val'], ti['test'], time=order)
+    # Snapping a split boundary to the next timestamp block must not consume
+    # the terminal cut and make the following split impossible.  Blocks are
+    # 80 / 5 / 15 rows with targets 80 / 10 / 10; the legal split uses the
+    # 85 cut for validation and leaves the final 15 rows for test.
+    tied = np.r_[np.arange(80), np.full(5, 80), np.full(15, 85)]
+    tidx = L.split_indices(100, time=tied, train_frac=0.8, val_frac=0.1,
+                           test_frac=0.1)
+    assert [len(tidx[k]) for k in ('train', 'val', 'test')] == [80, 5, 15], tidx
+    L.assert_no_split_leakage(tidx['train'], tidx['val'], tidx['test'], time=tied)
+    # A fraction explicitly set to zero must not receive the flooring
+    # remainder.
+    zidx = L.split_indices(3, train_frac=0.5, val_frac=0.5, test_frac=0.0)
+    assert [len(zidx[k]) for k in ('train', 'val', 'test')] == [1, 2, 0], zidx
 
 
 def t_group_split_contract():

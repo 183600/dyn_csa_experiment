@@ -172,8 +172,13 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
                 if j != i and sizes[j] > 1:
                     sizes[j] -= 1
                     break
-    sizes[2] = n - sizes[0] - sizes[1]
-    if sizes[2] < 0 or sizes[0] < 0 or sizes[1] < 0:
+    # The remainder goes to the LAST split the caller actually requested.  The
+    # old unconditional `sizes[2] = remainder` silently created test rows when
+    # test_frac was explicitly 0 (e.g. .5/.5/0 at n=3 -> (1,1,1)).
+    _last_requested = max(i for i, flag in enumerate(requested) if flag)
+    sizes[_last_requested] = n - sum(sizes[j] for j in range(3)
+                                     if j != _last_requested)
+    if any(v < 0 for v in sizes):
         raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
     return tuple(int(v) for v in sizes)
 
@@ -653,26 +658,44 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
                 np.nonzero(changed)[0].astype(np.int64) + 1,
                 np.full(1, n, dtype=np.int64),
             ))
+        cuts = np.asarray(cuts, dtype=np.int64)
         blocks = []
         start = 0
+        start_idx = 0
         cumulative = 0
-        for size in sizes:
-            cumulative += int(size)
-            pos = int(np.searchsorted(np.asarray(cuts), cumulative, side='left'))
-            pos = min(max(pos, 0), len(cuts) - 1)
-            end = int(cuts[pos])
-            end = max(end, start)
-            if int(size) > 0 and end <= start:
+        for i, size in enumerate(sizes):
+            size = int(size)
+            cumulative += size
+            if size <= 0:
+                # A zero-sized split consumes no timestamp block.  Advancing
+                # here would steal rows from a later requested split.
+                blocks.append(order[start:start].copy())
+                continue
+            # Reserve at least one cut for every later positive split.  The
+            # last positive split must still be able to end at n.
+            rem_after = sum(1 for _s in sizes[i + 1:] if int(_s) > 0)
+            max_idx = len(cuts) - 1 - rem_after
+            pos = int(np.searchsorted(cuts, cumulative, side='left'))
+            pos = max(pos, start_idx + 1)
+            if pos > max_idx:
+                # The target snaps past the last legal cut (typically to n).
+                # Fall back to the latest cut that still leaves a block for
+                # every remaining positive split instead of consuming all
+                # rows and then failing the final split.
+                pos = max_idx
+            if pos <= start_idx or pos > max_idx or pos >= len(cuts):
                 raise ValueError(
                     'cannot form the requested non-empty chronological split '
                     'without cutting an equal-timestamp block; supply groups '
                     '(grouped_chronological_split_indices) or fewer split rows')
+            end = int(cuts[pos])
             # Preserve the chronological order: the caller indexes its data
             # with these arrays, so sorting the row indices would silently
             # return each split in original row order (e.g. val times
             # [7, 6]) instead of time order.
             blocks.append(order[start:end].copy())
             start = end
+            start_idx = pos
         return _purge_tail(dict(zip(SPLIT_NAMES, blocks)), purge)
     return chronological_split_indices(
         n, train_frac, val_frac, test_frac,
