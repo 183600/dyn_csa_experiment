@@ -14483,20 +14483,36 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                         f'{arm}: final records include undeclared seed(s) {_extra}; '
                         'the final partition is not the declared plan')
             for _k, r in hits:
-                hp = r.get('hyperparams') or {}
+                hp = r.get('hyperparams')
+                # A final record that does not expose the knobs it ran cannot
+                # attest that the selected configuration was actually
+                # evaluated.  Treat a missing descriptor as a failed check,
+                # not as "nothing to compare": otherwise an artifact can
+                # claim a tuned final result while the record is silent.
+                if not isinstance(hp, dict):
+                    problems.append(
+                        f'{arm}: final record {_k} has no structured hyperparams '
+                        'descriptor — it cannot attest that the selected config was run')
+                    hp = {}
                 for _kn in ('lr', 'weight_decay', 'warmup'):
-                    if _kn in chosen and hp.get(_kn) is not None:
-                        try:
-                            _hpv = float(hp[_kn])
-                            _selv = float(chosen[_kn])
-                        except (TypeError, ValueError, OverflowError):
-                            problems.append(
-                                f'{arm}: final record {_kn}={hp[_kn]!r} or the '
-                                f'selected value {chosen[_kn]!r} is not numeric')
-                            break
-                        if _hpv != _selv:
-                            problems.append(f'{arm}: final record {_kn}={hp[_kn]} does not match the selected {chosen[_kn]}')
-                            break
+                    if _kn not in chosen:
+                        continue
+                    if hp.get(_kn) is None:
+                        problems.append(
+                            f'{arm}: final record {_k} does not record {_kn}; '
+                            f'the selected {_kn}={chosen[_kn]!r} is unattested')
+                        continue
+                    try:
+                        _hpv = float(hp[_kn])
+                        _selv = float(chosen[_kn])
+                    except (TypeError, ValueError, OverflowError):
+                        problems.append(
+                            f'{arm}: final record {_kn}={hp[_kn]!r} or the '
+                            f'selected value {chosen[_kn]!r} is not numeric')
+                        break
+                    if _hpv != _selv:
+                        problems.append(f'{arm}: final record {_kn}={hp[_kn]} does not match the selected {chosen[_kn]}')
+                        break
                 if r.get('variant') is not None and r.get('variant') != arm:
                     problems.append(f'{arm}: final record key {_k} carries variant={r.get("variant")!r}')
                 if _row_split_applied:

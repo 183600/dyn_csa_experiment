@@ -3609,6 +3609,16 @@ def t_nested_tuning_artifact_audit():
     bad2['final_records']['a::seed0']['holdout_row_fp'] = 'OTHER'
     rb2 = L.baseline_tuning_audit(bad2, protocol=protocol)
     assert rb2['tuning_verified'] is False and any('different held-out' in p for p in rb2['problems']), rb2
+    # Final records must attest the selected knobs.  A missing descriptor or a
+    # missing knob is a failed verification, not "nothing to compare".
+    bad_hp = json.loads(json.dumps(art))
+    bad_hp['final_records']['a::seed0']['hyperparams'] = {}
+    rbh = L.baseline_tuning_audit(bad_hp, protocol=protocol)
+    assert rbh['tuning_verified'] is False and any('unattested' in p for p in rbh['problems']), rbh
+    bad_hp2 = json.loads(json.dumps(art))
+    del bad_hp2['final_records']['a::seed1']['hyperparams']
+    rbh2 = L.baseline_tuning_audit(bad_hp2, protocol=protocol)
+    assert rbh2['tuning_verified'] is False and any('no structured hyperparams' in p for p in rbh2['problems']), rbh2
     # A legacy/seeded random row permutation is disjoint but interleaves future
     # chunks into selection, so it cannot pass the nested-validation gate.
     bad_policy = json.loads(json.dumps(art))
