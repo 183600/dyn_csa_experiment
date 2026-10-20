@@ -7595,6 +7595,14 @@ def t_scale_meta_refuses_visible_attrition():
                 'effects': [float('nan')], 'seeds': [0], 'n_planned': 6}
     me = L.meta_analyze_effects(empty)
     assert me['empty_points'] == ['S1'] and me['poolable'] is False, me
+    # effects=None is also a declared empty tier, not a reason to delete it.
+    none_eff = [dict(p) for p in complete]
+    none_eff.append({'label': 'Snone', 'scale': 1000.0, 'effects': None,
+                     'seeds': [0, 1, 2, 3]})
+    mn = L.meta_analyze_effects(none_eff)
+    assert mn['empty_points'] == ['Snone'] and mn['poolable'] is False, mn
+    assert len(L._scale_points([{'label': 'Snone', 'scale': 1000.0,
+                                 'effects': None}])) == 1
     # An n=1 tier has no within-scale SE and cannot enter the DL weights; it
     # must still block the pooled claim instead of silently disappearing.
     one_seed = [dict(p, n_planned=6) for p in complete]

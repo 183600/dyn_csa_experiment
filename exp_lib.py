@@ -10121,11 +10121,16 @@ def _scale_points(points):
         else:
             continue
         if eff is None:
-            continue
-        try:
-            vals = list(eff)
-        except TypeError:
-            continue
+            # A declared tier with no effects vector is an EMPTY measurement,
+            # not a reason to delete the tier from the family: dropping it
+            # would let the surviving points look like a complete ladder.
+            vals = []
+            seeds = None
+        else:
+            try:
+                vals = list(eff)
+            except TypeError:
+                continue
         _seeds_declared = seeds is not None
         if seeds is None:
             keep = [(j, f) for j, f in ((j, _finite_scalar(v)) for j, v in enumerate(vals))
