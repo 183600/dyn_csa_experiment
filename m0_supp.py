@@ -588,25 +588,50 @@ def _ppl_by_seed(summary, variant):
 
 
 def _panel_corpus_fp(summary, variant=None):
-    """Corpus/tokenizer identity of one (panel, arm): the records' composite
-    `data_version` (dataset + tokenizer fit + train/val fingerprints + vocab).
-    Mixed values inside one panel are an error (aggregate refuses the same
-    panel for pooling); the cross-scale audit needs the fingerprint to refuse
-    log-ratio pooling across different tokenisations."""
-    fps = set()
+    """Budget-independent corpus/tokenizer identity of one (panel, arm).
+
+    New records carry `corpus_fp`: the tokenizer-fit prefix plus source and
+    vocabulary, deliberately excluding the training cap and served `train_fp`.
+    A 5B-token tier and a 12B-token tier over the same corpus therefore attest
+    the SAME corpus/tokenizer (the cross-scale contrast is defined) instead of
+    being refused as "mixed".  Genuinely different corpora/tokenisations still
+    produce different fingerprints.
+
+    Legacy records without `corpus_fp` fall back to `data_version` (which is
+    training-budget dependent), so their cross-scale binding stays
+    conservative.  A panel that mixes provenance generations is refused rather
+    than letting the newer subset speak for the whole panel.
+    """
+    stable, legacy = set(), set()
     for rec in summary.values():
         if not isinstance(rec, dict):
             continue
         if variant is not None and rec.get('variant') != variant:
             continue
-        fp = rec.get('data_version')
-        if fp is None and isinstance(rec.get('provenance'), dict):
-            fp = ((rec['provenance'].get('data') or {}).get('data_version'))
+        prov_data = (rec.get('provenance') or {}).get('data') if isinstance(rec.get('provenance'), dict) else {}
+        fp = rec.get('corpus_fp')
+        if fp is None:
+            fp = (prov_data or {}).get('corpus_fp')
         if fp not in (None, ''):
-            fps.add(str(fp))
-    if len(fps) > 1:
-        raise ValueError(f'{variant or "panel"}: records carry {len(fps)} different data_version fingerprints {sorted(fps)}')
-    return (sorted(fps)[0] if fps else None)
+            stable.add(str(fp))
+            continue
+        dv = rec.get('data_version')
+        if dv is None:
+            dv = (prov_data or {}).get('data_version')
+        if dv not in (None, ''):
+            legacy.add(str(dv))
+    if stable and legacy:
+        raise ValueError(
+            f'{variant or "panel"}: records mix corpus_fp-provenance and legacy '
+            'data_version records; the stable corpus identity cannot be attested '
+            'for the legacy subset (re-run or migrate them)')
+    if len(stable) > 1:
+        raise ValueError(f'{variant or "panel"}: records carry {len(stable)} different corpus_fp fingerprints {sorted(stable)}')
+    if len(legacy) > 1:
+        raise ValueError(f'{variant or "panel"}: records carry {len(legacy)} different data_version fingerprints {sorted(legacy)}')
+    if stable:
+        return sorted(stable)[0]
+    return (sorted(legacy)[0] if legacy else None)
 
 
 def _flatten_contrasts(audit):
@@ -717,8 +742,10 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
                 print(f'[m0-analysis] {name}/{label}: {e}')
                 continue
             _e = (report['panels'].get(label) or {}).get('arms', {}).get(a) or {}
+            _panel_n = (report['panels'].get(label) or {}).get('n_seeds')
             points.append({'label': label, 'scale': _e.get('params'),
                            'effects': lr['effects'], 'seeds': lr['seeds'],
+                           'n_planned': _panel_n,
                            'corpus_fp': _cfp})
         if len(points) < 2:
             if points:

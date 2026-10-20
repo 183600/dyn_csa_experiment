@@ -223,17 +223,24 @@ def exact_signflip(deltas):
     obs = abs(sum(deltas))
     mu = sum(deltas) / n
     std = (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0
+    # Exact ties do not change p (their signs are arbitrary) but they do lower
+    # the attainable resolution from 2/2**n to 2/2**(#nonzero).
+    _n_nonzero = sum(1 for d in deltas if d != 0.0)
+    _p_floor = (1.0 if _n_nonzero == 0
+                else min(1.0, math.ldexp(2.0, -_n_nonzero)))
     if 20 < n <= 40:
         try:
             _cnt = _signflip_mitm_count(deltas)
-            return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _cnt / (1 << n), 'method': 'exact-mitm'}
+            return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _cnt / (1 << n),
+                    'n_nonzero': _n_nonzero, 'p_floor': _p_floor, 'method': 'exact-mitm'}
         except ImportError:
             pass
     if n > 40:
         # Same deterministic tail as exp_lib: no random MC draw, and the
         # variance is the sign-flip null variance sum(d_i**2).
         _p, _method = _signflip_saddlepoint_p(deltas)
-        return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _p, 'method': _method}
+        return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _p,
+                'n_nonzero': _n_nonzero, 'p_floor': _p_floor, 'method': _method}
     try:
         import numpy as _np
     except ImportError:
@@ -263,7 +270,8 @@ def exact_signflip(deltas):
             if abs(s) >= obs - 1e-12 * n:
                 cnt += 1
     mu = sum(deltas) / n
-    return {'n': n, 'mean': mu, 'std': (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0, 'p_exact_signflip': cnt / (1 << n), 'method': 'exact'}
+    return {'n': n, 'mean': mu, 'std': (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0, 'p_exact_signflip': cnt / (1 << n),
+            'n_nonzero': _n_nonzero, 'p_floor': _p_floor, 'method': 'exact'}
 
 def _measurable(r):
     if not isinstance(r, dict):
@@ -827,7 +835,9 @@ def sec_p0w():
             _d = _st['mean']
             # The two-sided exact/saddlepoint floor is 2/2**n for EVERY n;
             # the old >20 branch showed a Monte-Carlo-like 1/200001 instead.
-            _floor = _signflip_floor(_st.get('n'))
+            _floor = _st.get('p_floor')
+            if _floor is None:
+                _floor = _signflip_floor(_st.get('n'))
             _same_dir = all((x != 0 and (x > 0) == (_d > 0) for x in _dd))
             _gate_ok = _sig_gate(_st, label=f'P0W csa_fixed warm={w} vs warm=0', family='P0W')
             if not _gate_ok:

@@ -7399,6 +7399,145 @@ def t_release_archive_packs_tagged_cache_provenance():
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+def t_scale_corpus_fp_is_budget_independent():
+    # The corpus/tokenizer identity must not change when a scale tier simply
+    # trains longer.  `train_fp`/`data_version` intentionally DO change (they
+    # identify the exact served bytes); `corpus_fp` must not.
+    tr = (np.arange(64, dtype=np.int64) * 7 + 3) % 97
+    cfg = {'dataset': 'unit', 'seq_len': 16, 'cache_dir': './unit_cache'}
+    _old_cap = L.TOKENIZER_FIT_TOKENS
+    try:
+        L.TOKENIZER_FIT_TOKENS = 8
+        a = L.experiment_provenance(dict(cfg, n_train_tokens=16),
+                                    train_ids=tr[:16], val_batch=tr[:16].reshape(1, 16),
+                                    vocab=97)['data']
+        b = L.experiment_provenance(dict(cfg, n_train_tokens=48),
+                                    train_ids=tr[:48], val_batch=tr[:16].reshape(1, 16),
+                                    vocab=97)['data']
+    finally:
+        L.TOKENIZER_FIT_TOKENS = _old_cap
+    assert a['corpus_fp'] == b['corpus_fp'], (a, b)
+    assert a['data_version'] != b['data_version'], 'the served bytes/budget still differ'
+    # A changed token inside the tokenizer-fit prefix is a different corpus.
+    tr2 = tr.copy()
+    tr2[0] = (int(tr2[0]) + 1) % 97
+    try:
+        L.TOKENIZER_FIT_TOKENS = 8
+        c = L.experiment_provenance(dict(cfg, n_train_tokens=16),
+                                    train_ids=tr2[:16], val_batch=tr[:16].reshape(1, 16),
+                                    vocab=97)['data']
+    finally:
+        L.TOKENIZER_FIT_TOKENS = _old_cap
+    assert c['corpus_fp'] != a['corpus_fp']
+    # M0 prefers the stable fingerprint; a mixed provenance generation is
+    # refused rather than letting the new subset speak for the whole panel.
+    def _rec(cfp, dv):
+        return {'variant': 'csa_dynamic', 'seed': 0, 'ppl': 10.0,
+                'corpus_fp': cfp, 'data_version': dv}
+    s1 = {'a': _rec(a['corpus_fp'], a['data_version'])}
+    s2 = {'a': _rec(b['corpus_fp'], b['data_version'])}
+    assert M0._panel_corpus_fp(s1) == a['corpus_fp']
+    assert M0._panel_corpus_fp(s1) == M0._panel_corpus_fp(s2)
+    legacy = {'a': {'variant': 'csa_dynamic', 'seed': 0, 'ppl': 10.0,
+                    'data_version': a['data_version']}}
+    assert M0._panel_corpus_fp(legacy) == a['data_version']
+    try:
+        M0._panel_corpus_fp({**s1, 'b': {'variant': 'full', 'seed': 0, 'ppl': 11.0,
+                                         'data_version': a['data_version']}})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('mixed corpus_fp/legacy provenance must be refused')
+    # The cross-scale consumers accept a shared stable fingerprint even when
+    # the training budgets (data_version) differ.
+    pts = [{'label': 'S1', 'scale': 1, 'effects': [0.1, 0.2], 'seeds': [0, 1],
+            'corpus_fp': a['corpus_fp'], 'vocab': 97},
+           {'label': 'S2', 'scale': 2, 'effects': [0.2, 0.3], 'seeds': [0, 1],
+            'corpus_fp': b['corpus_fp'], 'vocab': 97}]
+    assert L.meta_analyze_effects(pts)['status'] == 'ok', L.meta_analyze_effects(pts)
+
+
+def t_signflip_zero_ties_lower_resolution_floor():
+    # Zero deltas are sign-neutral: p is unchanged, but the attainable floor
+    # is 2/2**(#nonzero), not 2/2**n.
+    sf = L.exact_signflip_p([1.0, 2.0, 0.0, 0.0, 0.0, 0.0])
+    assert sf['n'] == 6 and sf['n_nonzero'] == 2, sf
+    assert abs(sf['p_floor'] - 0.5) < 1e-15, sf
+    assert abs(sf['p'] - 0.5) < 1e-15, sf
+    st = L.paired_effect_stats([1.0, 2.0, 0.0, 0.0, 0.0, 0.0], min_n=3)
+    assert st['n'] == 6 and st['n_nonzero'] == 2, st
+    assert abs(st['p_floor'] - 0.5) < 1e-15, st
+    assert st['resolution_limited'] is True, st
+    all_zero = L.exact_signflip_p([0.0, 0.0, 0.0])
+    assert all_zero['p'] == 1.0 and all_zero['p_floor'] == 1.0, all_zero
+    assert L.paired_effect_stats([0.0] * 6)['p_floor'] == 1.0
+    # The report twin must obey the same floor.
+    z = BR.exact_signflip([1.0, 2.0, 0.0, 0.0, 0.0, 0.0])
+    assert z['n_nonzero'] == 2 and abs(z['p_floor'] - 0.5) < 1e-15, z
+
+
+def t_scale_meta_refuses_visible_attrition():
+    # A common effect (same mean at every scale) pools only on complete panels.
+    def _common(planned=None, n_seeds=6):
+        out = []
+        for i in range(3):
+            pt = {'label': 'S%d' % i, 'scale': 10.0 ** i,
+                  'effects': [0.1 + 0.1 * j for j in range(n_seeds)],
+                  'seeds': list(range(n_seeds))}
+            if planned is not None:
+                pt['n_planned'] = planned
+            out.append(pt)
+        return out
+    complete = _common()
+    m = L.meta_analyze_effects(complete)
+    assert m['status'] == 'ok' and m['poolable'] is True, m
+    assert m['incomplete_points'] == [], m
+    # One planned seed absent from every point: the complete-case estimates
+    # are numerically identical, but the missing draw must block the pooled
+    # "common effect".
+    missing = _common(planned=7)
+    m2 = L.meta_analyze_effects(missing)
+    assert m2['status'] == 'ok' and m2['poolable'] is False, m2
+    assert m2['incomplete_points'] == ['S0', 'S1', 'S2'], m2
+    assert m2['attrition']['S0']['n_missing'] == 1, m2['attrition']
+    # A non-finite effect is a dropped pair too, not a smaller honest n.
+    dropped = [dict(p, effects=list(p['effects'])) for p in complete]
+    dropped[1]['effects'][0] = float('nan')
+    m3 = L.meta_analyze_effects(dropped)
+    assert m3['poolable'] is False and m3['incomplete_points'] == ['S1'], m3
+    assert m3['attrition']['S1']['n_dropped'] == 1, m3
+    # Declared exact seed plans also catch an absent seed.
+    planned = [dict(p, planned_seeds=list(range(7))) for p in complete]
+    m4 = L.meta_analyze_effects(planned)
+    assert m4['poolable'] is False and m4['attrition']['S0']['n_missing'] == 1, m4
+
+    # A perfectly linear ladder would normally be a significant trend.
+    def _trend(planned=None):
+        out = []
+        for i in range(3):
+            pt = {'label': 'S%d' % i, 'scale': 10.0 ** i,
+                  'effects': [float(i) + 0.1 * j for j in range(6)],
+                  'seeds': list(range(6))}
+            if planned is not None:
+                pt['n_planned'] = planned
+            out.append(pt)
+        return out
+    r = L.scaling_trend(_trend())
+    assert r['significant'] is True, r
+    r2 = L.scaling_trend(_trend(planned=7))
+    assert r2['significant'] is False and r2['verdict'] == 'incomplete_scale_point', r2
+    assert 'incomplete paired panel' in r2['note'], r2
+    # Invalid plan metadata fails closed instead of being silently truncated.
+    for bad in (True, 3.5, -1, 'six'):
+        try:
+            L._scale_points([{'label': 'S', 'scale': 1, 'effects': [0.1],
+                              'seeds': [0], 'n_planned': bad}])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'n_planned={bad!r} was accepted')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -7642,6 +7781,9 @@ def main():
     _check('L30 missing id cache/sidecars is not a clean leakage audit', t_audit_leakage_missing_id_cache_is_not_ok)
     _check('L31 v12 binds the local train cache to the frozen train stream', t_v12_binds_current_train_cache_to_frozen_stream)
     _check('L32 release archive packs tagged cache provenance', t_release_archive_packs_tagged_cache_provenance)
+    _check('L33 scale corpus identity is independent of training budget', t_scale_corpus_fp_is_budget_independent)
+    _check('L34 exact sign-flip floor accounts for zero ties', t_signflip_zero_ties_lower_resolution_floor)
+    _check('L35 scale meta/trend refuses visible seed attrition', t_scale_meta_refuses_visible_attrition)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

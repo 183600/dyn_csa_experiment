@@ -9146,7 +9146,16 @@ def exact_signflip_p(deltas):
     n = int(d.size)
     n_dropped = len(d_in) - n
     if n == 0:
-        return {'n': 0, 'p': float('nan'), 'n_dropped': n_dropped, 'method': 'none'}
+        return {'n': 0, 'p': float('nan'), 'n_dropped': n_dropped,
+                'n_nonzero': 0, 'p_floor': float('nan'), 'method': 'none'}
+    # Exact zero deltas do not change the sign-flip statistic: their signs are
+    # arbitrary, so each attainable count is multiplied by 2**(#zeros).  The
+    # p-value is unchanged, but the *resolution floor* is 2 / 2**(#nonzero),
+    # not 2 / 2**n.  Reporting the latter would claim a panel can resolve more
+    # than its non-zero paired differences actually can.
+    n_nonzero = int(np.count_nonzero(d))
+    p_floor = (1.0 if n_nonzero == 0
+               else min(1.0, math.ldexp(2.0, -n_nonzero)))
     obs = abs(float(d.mean()))
     if n <= _SIGNFLIP_ENUM_MAX_N:
         total = 1 << n
@@ -9158,12 +9167,15 @@ def exact_signflip_p(deltas):
             masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
             signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
             cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
-        return {'n': n, 'p': float(cnt / total), 'n_dropped': n_dropped, 'method': 'exact'}
+        return {'n': n, 'p': float(cnt / total), 'n_dropped': n_dropped,
+                'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': 'exact'}
     if n <= _SIGNFLIP_MITM_MAX_N:
         cnt = _signflip_mitm_count(d)
-        return {'n': n, 'p': float(cnt / float(1 << n)), 'n_dropped': n_dropped, 'method': 'exact-mitm'}
+        return {'n': n, 'p': float(cnt / float(1 << n)), 'n_dropped': n_dropped,
+                'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': 'exact-mitm'}
     p, method = _signflip_saddlepoint_p(d.tolist())
-    return {'n': n, 'p': float(p), 'n_dropped': n_dropped, 'method': method}
+    return {'n': n, 'p': float(p), 'n_dropped': n_dropped,
+            'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': method}
 
 def _percentile_ci(vals, lo=2.5, hi=97.5):
     v = [f for f in (_finite_scalar(x) for x in vals) if f is not None]
@@ -9417,14 +9429,18 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     mean = float(d.mean())
     std = float(d.std(ddof=1)) if n > 1 else 0.0
     sem = float(std / math.sqrt(n)) if n > 1 else float('nan')
-    p = exact_signflip_p(d)['p']
+    _sf = exact_signflip_p(d)
+    p = _sf['p']
+    n_nonzero = _sf.get('n_nonzero')
     if std > 1e-12:
         dz = float(mean / std)
     elif abs(mean) < 1e-300:
         dz = 0.0
     else:
         dz = float('inf') if mean > 0 else float('-inf')
-    p_floor = signflip_p_floor(n)
+    # Use the attainable floor of THIS vector (zeros reduce resolution), not
+    # the theoretical all-nonzero floor 2/2**n.
+    p_floor = _sf.get('p_floor', signflip_p_floor(n))
     underpowered = n < min_n
     resolution_limited = bool(math.isfinite(p_floor) and p_floor > alpha)
     within_seed_noise = abs(mean) <= std
@@ -9475,6 +9491,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
                    'differences are part of the arm. p is SEED-level, never token-level.')
     return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
             'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
+            'n_nonzero': n_nonzero,
             'p_wilcoxon': _wil.get('p'), 'p_wilcoxon_method': _wil.get('method'),
             'ci95_paired_bootstrap': _paired_ci, 'ci95_unpaired_bootstrap': _unpaired_ci,
             **_pair_fields}
@@ -10061,12 +10078,16 @@ def _scale_points(points):
             seeds = p.get('seeds')
             corpus_fp = p.get('corpus_fp')
             vocab = p.get('vocab')
+            n_planned = p.get('n_planned')
+            planned_seeds = p.get('planned_seeds')
         elif isinstance(p, (tuple, list)) and len(p) >= 2:
             scale, eff = p[0], p[1]
             label = i
             seeds = p[2] if len(p) > 2 else None
             corpus_fp = p[3] if len(p) > 3 else None
             vocab = None
+            n_planned = None
+            planned_seeds = None
         else:
             continue
         if eff is None:
@@ -10103,6 +10124,45 @@ def _scale_points(points):
             # and shrink every within-scale SE in meta_analyze_effects; this
             # must be a hard error, not silently "n looks larger".
             raise ValueError('scale point %r: duplicate seeds %r' % (label, seeds_kept))
+        # Attrition is part of the estimate's identity.  A point built from a
+        # complete-case subset must say so; otherwise the random-effects
+        # weights and the trend treat a selectively missing seed as if it
+        # never existed.  Callers may declare the plan as `n_planned` or as
+        # the exact `planned_seeds` list.
+        _planned_set = None
+        if planned_seeds is not None:
+            _ps = [_as_seed_int(v) for v in planned_seeds]
+            if any(v is None for v in _ps):
+                raise ValueError('scale point %r: planned_seeds must be integers, got %r'
+                                 % (label, planned_seeds))
+            _planned_set = set(_ps)
+            if len(_planned_set) != len(_ps):
+                raise ValueError('scale point %r: duplicate planned_seeds %r'
+                                 % (label, planned_seeds))
+            if n_planned is not None and _as_seed_int(n_planned) != len(_planned_set):
+                raise ValueError('scale point %r: n_planned=%r disagrees with '
+                                 'planned_seeds length %d'
+                                 % (label, n_planned, len(_planned_set)))
+            n_planned = len(_planned_set)
+        _planned_n = None
+        if n_planned is not None:
+            _planned_n = _as_seed_int(n_planned)
+            if _planned_n is None or _planned_n < 0:
+                raise ValueError('scale point %r: n_planned must be a non-negative '
+                                 'integer, got %r' % (label, n_planned))
+        _n_input = len(vals)
+        _n_dropped = _n_input - len(seeds_kept)
+        if _planned_n is not None:
+            _n_declared = int(_planned_n)
+        else:
+            _n_declared = _n_input
+        if _planned_set is not None and _seeds_declared:
+            _n_missing = len(_planned_set - set(seeds_kept))
+            _n_unexpected = len(set(seeds_kept) - _planned_set)
+        else:
+            _n_missing = max(0, _n_declared - _n_input)
+            _n_unexpected = max(0, _n_input - _n_declared)
+        _complete = bool(_n_dropped == 0 and _n_missing == 0 and _n_unexpected == 0)
         if isinstance(scale, (bool, np.bool_)):
             sc = float('nan')
         else:
@@ -10117,6 +10177,10 @@ def _scale_points(points):
             vb = None
         out.append({'label': str(label), 'scale': sc, 'effects': effects, 'seeds': seeds_kept,
                     'seeds_declared': bool(_seeds_declared),
+                    'n_input': int(_n_input), 'n_declared': int(_n_declared),
+                    'n_dropped': int(_n_dropped), 'n_missing': int(_n_missing),
+                    'n_unexpected': int(_n_unexpected),
+                    'complete_pairs': _complete,
                     'corpus_fp': (str(corpus_fp) if corpus_fp not in (None, '') else None),
                     'vocab': vb})
     return out
@@ -10202,7 +10266,11 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     for p in pts:
         d = np.asarray(p['effects'], dtype=float)
         n = int(d.size)
-        row = {'label': p['label'], 'scale': p['scale'], 'n': n}
+        row = {'label': p['label'], 'scale': p['scale'], 'n': n,
+               'n_input': p.get('n_input'), 'n_declared': p.get('n_declared'),
+               'n_dropped': p.get('n_dropped'), 'n_missing': p.get('n_missing'),
+               'n_unexpected': p.get('n_unexpected'),
+               'complete_pairs': p.get('complete_pairs')}
         if p.get('corpus_fp'):
             row['corpus_fp'] = p['corpus_fp']
         if p.get('vocab') is not None:
@@ -10226,8 +10294,15 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         _seed_pairing = 'partial'
     else:
         _seed_pairing = 'positional_only'
+    _incomplete = [r['label'] for r in per if r.get('complete_pairs') is False]
+    _attrition = {r['label']: {'n_dropped': r.get('n_dropped'),
+                               'n_missing': r.get('n_missing'),
+                               'n_unexpected': r.get('n_unexpected')}
+                  for r in per if r.get('complete_pairs') is False}
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'per_point': per,
            'n_points': len(per), 'n_usable': len(usable),
+           'incomplete_points': _incomplete,
+           'attrition': _attrition,
            'corpus_binding': _scale_corpus_binding(pts),
            'seed_pairing': _seed_pairing,
            'n_points_with_declared_seeds': int(_n_seed_declared),
@@ -10284,11 +10359,16 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                 'underpowered_points': _underpowered_points,
                 'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0
                                  and (not math.isfinite(p_q) or p_q >= alpha)
-                                 and not _underpowered_points),
-                'note': ('poolable requires >=3 scales, every included scale at n>=min_seeds, '
+                                 and not _underpowered_points
+                                 and not _incomplete),
+                'note': ('poolable requires >=3 scales, every included scale at n>=min_seeds '
+                         'with a complete paired panel (no dropped/absent seeds), '
                          'I2<=50% and a non-significant Q; otherwise report per-scale effects only'
                          + (('; underpowered scale point(s): ' + ', '.join(map(str, _underpowered_points)))
-                            if _underpowered_points else ''))})
+                            if _underpowered_points else '')
+                         + (('; incomplete paired panel at: ' + ', '.join(map(str, _incomplete))
+                             + ' (a complete-case subset can be biased by which seeds failed)')
+                            if _incomplete else ''))})
     out['status'] = 'ok'
     return out
 
@@ -10379,9 +10459,16 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     for p in pts:
         if len(set(p['seeds'])) != len(p['seeds']):
             raise ValueError('scale point %r has duplicate seeds %r' % (p['label'], p['seeds']))
+    _incomplete_points = [p['label'] for p in pts if p.get('complete_pairs') is False]
+    _attrition = {p['label']: {'n_dropped': p.get('n_dropped'),
+                               'n_missing': p.get('n_missing'),
+                               'n_unexpected': p.get('n_unexpected')}
+                  for p in pts if p.get('complete_pairs') is False}
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'min_points': int(min_points),
            'n_points': len(pts), 'labels': labels,
            'scales': [p['scale'] for p in pts],
+           'incomplete_points': _incomplete_points,
+           'attrition': _attrition,
            'corpus_binding': _scale_corpus_binding(pts),
            'min_seeds_for_significance': signflip_min_n_for_holm(1, alpha),
            'convention': 'effects must be scale-free (e.g. paired log PPL ratio); positive = with arm worse'}
@@ -10538,8 +10625,10 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
                                 if len(p['effects']) < int(min_seeds)]
         underpowered = bool(_underpowered_points)
     too_few_scales = k < int(min_points)
+    _incomplete = bool(_incomplete_points)
     sig = bool(p_primary is not None and math.isfinite(float(p_primary)) and float(p_primary) < alpha
-               and not resolution_limited and not underpowered and not too_few_scales)
+               and not resolution_limited and not underpowered and not too_few_scales
+               and not _incomplete)
     het = het_for_verdict
     heterogeneous = bool(float(het.get('I2_percent') or 0.0) > 75.0 or (isinstance(het.get('p'), float) and math.isfinite(het['p']) and het['p'] < alpha))
     # Direction must come from the same slope that carries the inference.  The
@@ -10559,6 +10648,8 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         verdict = 'heterogeneous_trend'
     elif sig:
         verdict = 'effect_decreases_with_scale' if direction_slope < 0 else 'effect_increases_with_scale'
+    elif _incomplete:
+        verdict = 'incomplete_scale_point'
     elif underpowered:
         verdict = 'underpowered'
     elif too_few_scales:
@@ -10571,6 +10662,11 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out['benefit_grows_with_scale'] = (bool(sig and direction_slope < 0) if not heterogeneous else None)
     if too_few_scales:
         out['note'] = 'fewer than min_points=%d scales: slope is descriptive even if the exact test rejects' % int(min_points)
+    if _incomplete:
+        out['note'] = ((out.get('note') + '; ') if out.get('note') else '') + (
+            'incomplete paired panel at %s — the slope/verdict is descriptive even if a '
+            'complete-case test rejects (which seeds failed can bias the surviving subset)'
+            % ', '.join(map(str, _incomplete_points)))
     if underpowered and _underpowered_points:
         _u = ('paired complete-seed n<%d' % int(min_seeds) if paired_primary
               else 'scale point(s) with n<%d: ' % int(min_seeds)
@@ -16463,6 +16559,46 @@ def environment_snapshot():
             env[_key] = None
     return env
 
+def _corpus_prefix_fp(train_ids, cap=None):
+    """Fingerprint of the tokenizer-fit prefix, independent of training budget.
+
+    `train_fp` hashes the *served* training stream, so a 5B-token tier and a
+    12B-token tier over the same corpus necessarily disagree even when they
+    share one tokenizer.  The first `TOKENIZER_FIT_TOKENS` ids are exactly the
+    prefix the tokenizer was fitted on, and extending the training cap leaves
+    that prefix unchanged.  Hash only that prefix so a scale ladder can attest
+    "same corpus/tokenizer" without also requiring "same training volume".
+    """
+    if train_ids is None:
+        return None
+    try:
+        arr = np.asarray(train_ids)
+    except (TypeError, ValueError):
+        return None
+    if arr.ndim != 1:
+        arr = arr.reshape(-1)
+    _cap = TOKENIZER_FIT_TOKENS if cap is None else int(cap)
+    if _cap <= 0 or arr.size == 0:
+        return None
+    return _ids_fp(np.ascontiguousarray(arr[:min(int(arr.size), _cap)]))
+
+def _corpus_fp_from_data(data):
+    """Budget-independent corpus/tokenizer identity.
+
+    Deliberately excludes `requested_train_tokens`, `train_tokens`, `train_fp`
+    and the split lengths: those change when a scale tier trains longer, but
+    they do not change the corpus or tokenizer.  The tokenizer-fit prefix
+    fingerprint covers the text actually used to fit the BPE (and therefore
+    distinguishes different tokenisations even at equal vocabulary width).
+    """
+    keys = ('dataset', 'source', 'fw_fit_docs', 'vocab_size',
+            'corpus_prefix_fp', 'data_extra')
+    payload = {k: data.get(k) for k in keys if data.get(k) is not None}
+    if not payload.get('corpus_prefix_fp'):
+        return None
+    blob = json.dumps(_jsonable(payload), sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
 def _data_version(data):
     """Stable content digest of the corpus identity recorded in a panel.
 
@@ -16470,8 +16606,10 @@ def _data_version(data):
     makes the *data version* a single field a reader can compare across runs
     (dataset/protocol, token counts, vocabulary and both split fingerprints)
     without knowing which individual fields the loader happened to expose.
+    `corpus_fp` (when present) is the budget-independent subset used by the
+    scale ladder; `data_version` still identifies the exact served bytes.
     """
-    keys = ('dataset', 'source', 'fw_fit_docs', 'requested_train_tokens', 'train_tokens', 'seq_len', 'vocab_size', 'val_sequences', 'train_fp', 'val_fp', 'eval_fp', 'cache_val_fp', 'data_extra')
+    keys = ('dataset', 'source', 'fw_fit_docs', 'requested_train_tokens', 'train_tokens', 'seq_len', 'vocab_size', 'val_sequences', 'train_fp', 'val_fp', 'eval_fp', 'cache_val_fp', 'corpus_fp', 'data_extra')
     payload = {k: data.get(k) for k in keys if data.get(k) is not None}
     blob = json.dumps(_jsonable(payload), sort_keys=True, separators=(',', ':'), ensure_ascii=True)
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
@@ -16496,12 +16634,16 @@ def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
     if train_ids is not None:
         data['train_tokens'] = int(len(train_ids))
         data['train_fp'] = _ids_fp(train_ids)
+        data['corpus_prefix_fp'] = _corpus_prefix_fp(train_ids)
     if val_batch is not None:
         _vb = np.ascontiguousarray(val_batch).reshape(-1)
         data['val_sequences'] = int(np.asarray(val_batch).shape[0])
         data['val_fp'] = _ids_fp(_vb)
     if vocab is not None:
         data['vocab_size'] = int(vocab)
+    _cfp = _corpus_fp_from_data(data)
+    if _cfp is not None:
+        data['corpus_fp'] = _cfp
     _extra = cfg.get('data_extra')
     if isinstance(_extra, dict):
         # Synthetic/task-specific generators (NIAH recipe, corruption modes)
@@ -16665,6 +16807,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                     'data_fp': rec.get('data_fp'),
                     'val_fp': rec.get('val_fp'),
                     'data_version': rec.get('data_version') or prov.get('data', {}).get('data_version'),
+                    'corpus_fp': rec.get('corpus_fp') or prov.get('data', {}).get('corpus_fp'),
                     'code_stamp': rec.get('_code'),
                     'hyperparams': rec.get('hyperparams'),
                     'curve_summary': {'n_points': (len(_losses) if _losses else int(rec.get('curve_n_points') or 0)),
@@ -16743,6 +16886,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         'config': _jsonable(cfg),
         'provenance': prov,
         'data_version': prov.get('data', {}).get('data_version'),
+        'corpus_fp': prov.get('data', {}).get('corpus_fp'),
         'sanity': sanity,
         'reproducibility': reproducibility,
         'seed_contract': seed_contract,
@@ -21978,6 +22122,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                     rec['data_fp'] = _prov['data'].get('train_fp')
                     rec['val_fp'] = _prov['data'].get('val_fp')
                     rec['data_version'] = _prov['data'].get('data_version')
+                    rec['corpus_fp'] = _prov['data'].get('corpus_fp')
                     rec['run_id'] = _run_id
                     rec['started_at'] = _started_at
                     rec['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
