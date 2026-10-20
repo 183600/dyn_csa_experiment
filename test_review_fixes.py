@@ -7303,6 +7303,19 @@ def t_gapfill_numeric_reader_rejects_booleans():
     assert RG._num_or_none(3.0) == 3 and RG._num_or_none('4') == 4
     assert RG._num_or_none(1.5) is None
 
+
+def t_release_tag_cannot_escape_output_dir():
+    import archive_release as AR
+    assert AR._release_tag('v13') == 'v13'
+    assert AR._release_tag('v13.2-rc_1') == 'v13.2-rc_1'
+    for _bad in ('../v13', 'a/b', '', '.', '..', 'a b', 'a\nb', '-v13', 'x' * 65, None):
+        try:
+            AR._release_tag(_bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'release tag {_bad!r} was accepted as a filename component')
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -7542,6 +7555,7 @@ def main():
     _check('L26 bootstrap chunk scaling + zero-CE measurements', t_bootstrap_and_zero_ce_scaling_contract)
     _check('L27 error analysis excludes non-finite targets', t_error_analysis_excludes_nonfinite_targets)
     _check('L28 gapfill numeric reader rejects booleans', t_gapfill_numeric_reader_rejects_booleans)
+    _check('L29 release tags cannot escape the archive directory', t_release_tag_cannot_escape_output_dir)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import tarfile
@@ -51,6 +52,27 @@ ENV_FILES = ['confirmation_frozen.json', 'DECISION_LOG.md', 'RELEASES.md', 'requ
             # must be visible in the archive, not only in a local directory.
             'wt103_cache/test_meta.json', 'wt103_cache/train_meta.json',
             'wt103_cache/meta.json', 'wt103_cache/val_meta.json']
+
+
+_RELEASE_TAG_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z')
+
+
+def _release_tag(tag):
+    """A tag is a filename component, not a path.
+
+    ``release_{tag}.tar.gz`` is written into the output directory; a tag such
+    as ``../x`` or ``a/b`` would escape that directory (or fail halfway
+    through), so only a plain identifier is accepted.
+    """
+    if not isinstance(tag, str):
+        raise ValueError(f'release tag must be a string, got {type(tag).__name__}')
+    s = tag
+    if not _RELEASE_TAG_RE.fullmatch(s):
+        raise ValueError(
+            f'release tag {tag!r} is not a safe filename component; use '
+            'letters, digits, dot, underscore or hyphen (max 64 chars, '
+            'starting with a letter/digit)')
+    return s
 
 
 def _sha256(path, chunk=1 << 20):
@@ -159,6 +181,7 @@ def _ckpt_hash_table(dirs):
 
 
 def cmd_plan(tag, dirs, include_ckpt=False):
+    tag = _release_tag(tag)
     files = _collect(dirs, include_ckpt)
     total = 0
     print(f'[archive] plan for release {tag!r} ({len(files)} files):')
@@ -174,6 +197,7 @@ def cmd_plan(tag, dirs, include_ckpt=False):
 
 
 def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
+    tag = _release_tag(tag)
     _required = ['DECISION_LOG.md', 'RELEASES.md', 'confirmation_frozen.json']
     _missing = [f for f in _required if not os.path.exists(os.path.join(REPO, f))]
     if _missing:
@@ -222,11 +246,15 @@ def cmd_verify(tar_path):
         return 1
     side = tar_path + '.sha256'
     if os.path.exists(side):
-        want = open(side, encoding='utf-8').read().split()[0]
-        got = _sha256(tar_path)
-        print(f'[archive] archive sha256: {got}  {"OK" if got == want else "MISMATCH (expected " + want + ")"}')
-        if got != want:
-            return 1
+        _side_fields = open(side, encoding='utf-8').read().split()
+        if not _side_fields:
+            print('[archive] NOTE: the .sha256 sidecar is empty; falling back to the manifest hashes inside the archive')
+        else:
+            want = _side_fields[0]
+            got = _sha256(tar_path)
+            print(f'[archive] archive sha256: {got}  {"OK" if got == want else "MISMATCH (expected " + want + ")"}')
+            if got != want:
+                return 1
     with tarfile.open(tar_path, 'r:gz') as tf:
         names = tf.getnames()
         man_name = next((n for n in names if n.endswith('.MANIFEST.sha256')), None)
