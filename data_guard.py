@@ -1500,11 +1500,72 @@ def _matrix_fingerprint(X):
             'matrix fingerprint needs real-valued rows; casting complex rows '
             'to float64 would silently discard the imaginary part')
     if arr.dtype == object:
-        # Canonical per-row keys keep every integer bit and separate
-        # NaN/Inf; mixed non-numeric object tables are rejected by _row_keys
-        # exactly as the previous float64 cast would have rejected them.
-        for key in _row_keys(arr):
-            h.update(key)
+        # Numeric object tables go through the same float64 block form as a
+        # native table (so an int/float/Decimal with the same exactly
+        # representable value keeps the same digest), and only rows whose
+        # value is NOT exactly representable append the canonical exact key.
+        _obj = arr.reshape(-1, 1) if arr.ndim == 1 else arr
+        _w = int(_obj.shape[1])
+        _step = _hash_row_block(_w, 1 << 20)
+
+        def _row_float_exact(row):
+            vals, exact = [], True
+            for v in row:
+                if v is None:
+                    vals.append(float('nan'))
+                    continue
+                if isinstance(v, (complex, np.complexfloating)):
+                    raise TypeError(
+                        'matrix fingerprint needs real-valued rows; casting '
+                        'complex rows to float64 would silently discard the '
+                        'imaginary part')
+                try:
+                    f = float(v)
+                except (TypeError, ValueError, OverflowError):
+                    raise TypeError(
+                        'matrix fingerprint needs numeric object rows; '
+                        f'got {type(v).__name__}') from None
+                vals.append(f)
+                if isinstance(v, (bool, np.bool_)):
+                    if not (math.isfinite(f) and f.is_integer()
+                            and int(f) == int(v)):
+                        exact = False
+                elif isinstance(v, numbers.Integral):
+                    if not (math.isfinite(f) and f.is_integer()
+                            and int(f) == int(v)):
+                        exact = False
+                elif isinstance(v, (float, np.floating)):
+                    pass
+                else:
+                    try:
+                        n, d = v.as_integer_ratio()
+                        nf, df = f.as_integer_ratio()
+                    except (AttributeError, TypeError, ValueError,
+                            OverflowError):
+                        try:
+                            exact = exact and bool(v == f)
+                        except Exception:
+                            exact = False
+                    else:
+                        if (not math.isfinite(f)
+                                or (int(n), int(d)) != (nf, df)):
+                            exact = False
+            return vals, exact
+
+        for start in range(0, _obj.shape[0], _step):
+            block = _obj[start:start + _step]
+            parsed = [_row_float_exact(row) for row in block.tolist()]
+            block_f = np.asarray([p[0] for p in parsed], dtype=np.float64)
+            if np.any(block_f == 0.0):
+                block_f = block_f.copy()
+                block_f[block_f == 0.0] = 0.0
+            h.update(np.ascontiguousarray(block_f).tobytes())
+            bad = [row for row, (_vals, ok) in zip(block.tolist(), parsed)
+                   if not ok]
+            if bad:
+                for key in _row_keys(np.asarray(bad, dtype=object)):
+                    h.update(b'|')
+                    h.update(key)
         return h.hexdigest()[:16]
     _w = int(arr.shape[1]) if arr.ndim > 1 else 1
     _step = _hash_row_block(_w, 1 << 20)
@@ -1541,7 +1602,9 @@ def _matrix_fingerprint(X):
             _bad = _raw[_bad_rows]
             if _bad.ndim == 1:
                 _bad = _bad.reshape(-1, 1)
-            for key in _row_keys(_bad):
+            # Canonical object keys (not raw dtype bytes) so a native int64
+            # row and the same Python-int object row share a digest.
+            for key in _row_keys(np.asarray(_bad, dtype=object)):
                 h.update(b'|')
                 h.update(key)
     return h.hexdigest()[:16]

@@ -4603,6 +4603,15 @@ def t_exact_numeric_contracts_and_fingerprint():
                                      dtype=object)).tolist() == [False, True]
     assert L.duplicate_mask(np.array([[Fraction(1, 3)], [1 / 3]],
                                      dtype=object)).tolist() == [False, False]
+    # An exactly representable object value keeps the native float digest
+    # (dtype-insensitive fingerprint), while an inexact integer still gets an
+    # exact tail.
+    assert DG._matrix_fingerprint(np.array([[2 ** 53 + 1]], dtype=np.int64)) == \
+        DG._matrix_fingerprint(np.array([[2 ** 53 + 1]], dtype=object))
+    assert DG._matrix_fingerprint(np.array([[1.5]])) == \
+        DG._matrix_fingerprint(np.array([[Decimal('1.5')]], dtype=object))
+    assert DG._matrix_fingerprint(np.array([[2 ** 53 + 1]], dtype=np.int64)) != \
+        DG._matrix_fingerprint(np.array([[2 ** 53]], dtype=np.int64))
     # A corpus fingerprint is a function of token values, not storage width.
     _toks = np.array([0, 1, 2, 250, 255], dtype=np.int64)
     _fps = {L._ids_fp(_toks.astype(_dt)) for _dt in
