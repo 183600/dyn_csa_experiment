@@ -891,12 +891,13 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         if rec.get('train_fp') != _tr_train_fp:
             return True
         # A record measured on a different row count is a different estimand.
-        # n_seq is stored explicitly and a mismatch is treated as stale.
-        if int(rec.get('n_seq') or -1) != int(test_ids.shape[0]):
+        # n_seq is stored explicitly and a mismatch is treated as stale.  An
+        # exact integer is required: int(16.5) == 16 would silently resume on
+        # a different row count, and int(True) would accept a boolean flag.
+        if L._exact_count(rec.get('n_seq'), minimum=0) != int(test_ids.shape[0]):
             return True
         if _msha is not None and rec.get('manifest_sha256') != _msha:
             return True  # the manifest changed after this record was written
-        bl = rec.get('by_len') or {}
         for Ln in eval_lens:
             _cells = L.by_len_cells([rec], Ln)
             # A usable PPL is not enough: a truncated cell is a different
