@@ -18104,7 +18104,10 @@ def _checkpoint_payload(model, *, variant, seed, step, val_ppl, train_ce, health
     sd = {k: v.detach() for k, v in model.state_dict().items()}
     payload = {'format': 'csa-analysis-ckpt-v1', 'variant': variant, 'seed': int(seed),
                'step': int(step), 'val_ppl': val_ppl, 'train_ce_fixed': train_ce,
-               'curve_health': health, 'code': CKPT_CODE, 'sd': sd}
+               # The checkpoint must name the implementation that wrote it.
+               # CKPT_CODE is the base semantics and omits the kernel suffix,
+               # so a kernel-mode checkpoint was labelled eager.
+               'curve_health': health, 'code': code_stamp(), 'sd': sd}
     if extra:
         payload.update(extra)
     return payload

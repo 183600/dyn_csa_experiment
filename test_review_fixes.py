@@ -6169,6 +6169,21 @@ def t_attention_backward_partial_head_group():
             os.environ['CSA_ATTN_GRAD_SLAB_MB'] = old
 
 
+def t_checkpoint_stamp_matches_the_actual_backend():
+    class _M:
+        def state_dict(self):
+            return {}
+    _old = L._kernel_stamp
+    try:
+        L._kernel_stamp = lambda: '-ktest'
+        _p = L._checkpoint_payload(_M(), variant='v', seed=0, step=0,
+                                   val_ppl=1.0, train_ce=1.0, health={})
+        assert _p['code'] == L.code_stamp() == L.CODE_SEMANTICS + '-ktest', _p.get('code')
+        assert _p['code'] != L.CKPT_CODE
+    finally:
+        L._kernel_stamp = _old
+
+
 def t_indexer_chunked_final_tile_uses_active_rows():
     # The Bm>8192 fallback allocates a [R, T_c, Bm] score tile but the last
     # chunk may fill only tc < T_c rows.  The caller must pass the active rows
@@ -6930,6 +6945,7 @@ def main():
     _check('L19 batch_iter minimal corpus', t_batch_iter_minimal_corpus)
     _check('L20 indexer invalid soft lanes are zero', t_indexer_invalid_soft_lanes_are_zero)
     _check('L21 attention backward partial head group', t_attention_backward_partial_head_group)
+    _check('L21a checkpoint stamp names the actual backend', t_checkpoint_stamp_matches_the_actual_backend)
     _check('L21b indexer chunked path uses only the filled rows', t_indexer_chunked_final_tile_uses_active_rows)
     _check('L22 parallel watchdog override validation', t_par_watchdog_override_validation)
     _check('L22b build report exact seed/parameter contracts', t_build_report_exact_seed_and_params)
