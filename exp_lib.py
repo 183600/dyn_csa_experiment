@@ -10053,6 +10053,7 @@ def _scale_points(points):
             vals = list(eff)
         except TypeError:
             continue
+        _seeds_declared = seeds is not None
         if seeds is None:
             keep = [(j, f) for j, f in ((j, _finite_scalar(v)) for j, v in enumerate(vals))
                     if f is not None]
@@ -10093,6 +10094,7 @@ def _scale_points(points):
         if vb is not None and vb <= 0:
             vb = None
         out.append({'label': str(label), 'scale': sc, 'effects': effects, 'seeds': seeds_kept,
+                    'seeds_declared': bool(_seeds_declared),
                     'corpus_fp': (str(corpus_fp) if corpus_fp not in (None, '') else None),
                     'vocab': vb})
     return out
@@ -10195,10 +10197,24 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
             row.update({'mean': float('nan'), 'std': float('nan'), 'se': float('nan'), 'underpowered': True})
         per.append(row)
     usable = [r for r in per if r['n'] > 1 and math.isfinite(r.get('se', float('nan'))) and r['se'] > 0.0]
+    _n_seed_declared = sum(1 for p in pts if p.get('seeds_declared'))
+    if pts and _n_seed_declared == len(pts):
+        _seed_pairing = 'declared'
+    elif _n_seed_declared:
+        _seed_pairing = 'partial'
+    else:
+        _seed_pairing = 'positional_only'
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'per_point': per,
            'n_points': len(per), 'n_usable': len(usable),
            'corpus_binding': _scale_corpus_binding(pts),
+           'seed_pairing': _seed_pairing,
+           'n_points_with_declared_seeds': int(_n_seed_declared),
            'convention': 'input effects are scale-free; positive = with arm worse (higher PPL)'}
+    if _seed_pairing != 'declared':
+        out['seed_pairing_note'] = (
+            'at least one scale point did not declare seed identities; within-scale '
+            'replication is still reportable, but cross-scale seed-level pairing is '
+            'unattested (positional indices must not be treated as the same seed)')
     if len(pts) >= 2 and out['corpus_binding']['corpus_binding'] == 'mixed':
         # Log PPL ratios are only defined within ONE tokenisation; pooling
         # across corpora/tokenizers is a units error, not a heterogeneity
@@ -10257,6 +10273,7 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     """
     a = list(low_effects)
     b = list(high_effects)
+    _seeds_declared = seeds is not None
     if len(a) != len(b):
         raise ValueError('scale_interaction needs equal-length effects (%d vs %d)' % (len(a), len(b)))
     ss = list(range(len(a))) if seeds is None else list(seeds)
@@ -10289,8 +10306,13 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
             diff.append(float('nan'))
     st = paired_effect_stats(diff, alpha=alpha, min_n=min_n, seeds=ss)
     st.update({'low_label': str(low_label), 'high_label': str(high_label), 'seeds': kept,
+               'seed_pairing': ('declared' if _seeds_declared else 'positional'),
                'convention': 'delta = effect_high - effect_low; positive = effect is larger at the higher scale',
                'claim_level': 'confirmatory only if n>=%d and p_floor<alpha' % int(min_n)})
+    if not _seeds_declared:
+        st['seed_pairing_note'] = ('no seed identities were supplied; positions are '
+                                   'paired mechanically and are not attested to be the '
+                                   'same training draw')
     return st
 
 
@@ -10367,14 +10389,25 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         wls.update({'se': se, 'ci': [slope - tc * se, slope + tc * se],
                     'p': student_t_two_sided_p(tstat, k - 2), 'df': k - 2})
     out['wls'] = wls
-    # paired per-seed slopes: complete cases only (same seed at every scale)
+    # paired per-seed slopes: complete cases only (same seed at every scale).
+    # When any point omitted its seed identities, the positional indices that
+    # `_scale_points` assigns are NOT evidence that the same seed was run at
+    # every scale.  In that case the paired path is withheld rather than
+    # fabricating a cross-scale pairing.
+    _seed_identity_attested = all(p.get('seeds_declared') for p in pts)
     by_seed = {}
     for p in pts:
         for s, e in zip(p['seeds'], p['effects']):
             by_seed.setdefault(s, {})[p['label']] = float(e)
-    complete = sorted([s for s, m in by_seed.items() if all(lb in m for lb in labels)], key=str)
-    paired = {'n_complete_seeds': len(complete), 'seeds': complete, 'labels': labels}
-    if len(complete) >= 2:
+    complete = (sorted([s for s, m in by_seed.items() if all(lb in m for lb in labels)], key=str)
+                if _seed_identity_attested else [])
+    paired = {'n_complete_seeds': len(complete), 'seeds': complete, 'labels': labels,
+              'seed_identity_attested': bool(_seed_identity_attested)}
+    if not _seed_identity_attested:
+        paired['note'] = ('at least one scale point omitted its seed identities; '
+                          'positional effect indices are not the same seed, so the '
+                          'paired exact test and per-seed slopes are withheld')
+    elif len(complete) >= 2:
         # A per-seed slope has exactly one observation per scale, so every
         # scale point carries equal weight here.  Using the point-mean weights
         # `n` (the number of seeds completed at each scale) would let a
@@ -10401,15 +10434,24 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     else:
         paired.update({'note': 'no complete seed across every scale point; the paired exact test is unavailable'})
     out['paired'] = paired
+    out['seed_pairing'] = ('declared' if _seed_identity_attested else 'unattested')
     paired_primary = len(complete) >= 2
     # extreme-scale interaction (smallest vs largest) on shared seeds
     lo, hi = pts[0], pts[-1]
     lo_map = dict(zip(lo['seeds'], lo['effects']))
     hi_map = dict(zip(hi['seeds'], hi['effects']))
     shared = sorted(set(lo_map) & set(hi_map), key=str)
-    inter = scale_interaction([lo_map[s] for s in shared], [hi_map[s] for s in shared],
-                              low_label=lo['label'], high_label=hi['label'], seeds=shared,
-                              alpha=alpha, min_n=min_seeds) if len(shared) >= 2 else {'n': len(shared), 'note': 'fewer than 2 shared seeds'}
+    if not _seed_identity_attested:
+        inter = {'status': 'seed_identity_unattested',
+                 'n': len(shared),
+                 'note': ('the extreme scale points did not both declare seed identities; '
+                          'a paired interaction over positional indices is not defined')}
+    elif len(shared) >= 2:
+        inter = scale_interaction([lo_map[s] for s in shared], [hi_map[s] for s in shared],
+                                  low_label=lo['label'], high_label=hi['label'], seeds=shared,
+                                  alpha=alpha, min_n=min_seeds)
+    else:
+        inter = {'n': len(shared), 'note': 'fewer than 2 shared seeds'}
     out['interaction_extremes'] = inter
     # Heterogeneity is the LACK OF FIT around the fitted slope, not the spread
     # of the point means around their grand mean: a clean monotone ladder has

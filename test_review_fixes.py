@@ -656,6 +656,33 @@ def t_scaling_trend_ragged_pairs():
                 raise AssertionError(f'non-integer seed {_bad_seed!r} was accepted')
 
 
+def t_scale_missing_seed_identity_is_not_paired():
+    # Positional effect indices are not training seeds.  Without declared seed
+    # identities the cross-scale paired slope/interaction must be withheld,
+    # even though the effect vectors happen to have equal length.
+    pts = [{'label': 'P1', 'scale': 1.0, 'effects': [0.0, 1.0, 2.0]},
+           {'label': 'P2', 'scale': 10.0, 'effects': [1.0, 2.0, 3.0]}]
+    r = L.scaling_trend(pts, min_seeds=3, min_points=2)
+    assert r['seed_pairing'] == 'unattested', r
+    assert r['paired']['n_complete_seeds'] == 0, r['paired']
+    assert r['paired']['seed_identity_attested'] is False, r['paired']
+    assert r['primary_inference'].startswith('WLS'), r['primary_inference']
+    assert r['interaction_extremes']['status'] == 'seed_identity_unattested', r['interaction_extremes']
+    m = L.meta_analyze_effects(pts)
+    assert m['seed_pairing'] == 'positional_only' and m['n_points_with_declared_seeds'] == 0, m
+    # A partly declared family is still not attested: one undeclared point
+    # could have run a different seed set.
+    mixed = [pts[0], dict(pts[1], seeds=[0, 1, 2])]
+    rm = L.scaling_trend(mixed, min_seeds=3, min_points=2)
+    assert rm['seed_pairing'] == 'unattested' and rm['paired']['n_complete_seeds'] == 0, rm
+    assert L.meta_analyze_effects(mixed)['seed_pairing'] == 'partial'
+    # Both declared: the paired path is available again.
+    both = [dict(pts[0], seeds=[0, 1, 2]), dict(pts[1], seeds=[0, 1, 2])]
+    rb = L.scaling_trend(both, min_seeds=3, min_points=2)
+    assert rb['seed_pairing'] == 'declared' and rb['paired']['n_complete_seeds'] == 3, rb
+    assert rb['interaction_extremes'].get('seed_pairing') == 'declared', rb['interaction_extremes']
+
+
 def t_scaling_trend_primary_direction_and_floor():
     # Ragged panel: the paired per-seed evidence is six positive slopes, while
     # the seed-weighted WLS point means (the extra A seeds have high effects)
@@ -7053,6 +7080,7 @@ def main():
     _check('A5 exact_signflip baseline', t_exact_signflip_baseline)
     _check('A6 paired_effect resolution_limited', t_paired_effect_resolution)
     _check('A6b scaling_trend ragged seed panels', t_scaling_trend_ragged_pairs)
+    _check('A6b1 missing scale seed identity is never paired positionally', t_scale_missing_seed_identity_is_not_paired)
     _check('A6b2 scaling_trend primary direction + floors', t_scaling_trend_primary_direction_and_floor)
     _check('A6c meta-analysis input guards', t_scale_input_guards)
     _check('A5b exact sign-flip at scale (MITM)', t_exact_signflip_at_scale)
