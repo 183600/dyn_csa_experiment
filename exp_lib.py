@@ -13425,6 +13425,79 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
                  '; '.join('%s=%s' % (c, ','.join(a)) for c, a in sorted(out['missing_arms'].items())) or 'none'))
     return out
 
+def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
+    """Project-level view of ablation completeness.
+
+    A single-panel audit answers "is this innovation complete HERE?".  The
+    claim "each proposed module is useful" is a project-level claim: a component
+    that is complete and verified in one panel is covered, while a component
+    that no panel ever measures is NOT covered even if every individual panel
+    looks internally consistent (because it is simply absent from each scoped
+    family).  `reports` maps panel name -> `methodology_audit` report; the
+    returned dict names, per declared component, the panels where it is
+    complete / measured / verified / unverified, its missing arms, and the
+    components with no complete panel anywhere.
+
+    This is a reporting gate, not a new statistical test: it never promotes a
+    component; it only prevents a panel-by-panel reading from hiding an
+    omitted innovation."""
+    design = ABLATION_DESIGN if design is None else design
+    out = {'status': 'ok', 'components': {}, 'complete_anywhere': [],
+           'verified_anywhere': [], 'measured_anywhere': [],
+           'missing_everywhere': [], 'complete_but_unverified': [],
+           'warnings': []}
+    if not isinstance(reports, dict):
+        out['status'] = 'warn'
+        out['warnings'].append('reports must be a {panel: methodology_audit} mapping')
+        return out
+    for comp in design:
+        row = {'panels_complete': [], 'panels_measured': [],
+               'panels_verified': [], 'panels_unverified': [],
+               'missing_arms': {}, 'declared_in': []}
+        for name in sorted(reports):
+            rep = reports.get(name)
+            if not isinstance(rep, dict):
+                continue
+            abl = rep.get('ablation_completeness') or {}
+            if comp in (abl.get('components') or {}):
+                row['declared_in'].append(name)
+                _miss = (abl.get('missing_arms') or {}).get(comp)
+                if _miss:
+                    row['missing_arms'][name] = sorted(_miss)
+            if comp in (abl.get('complete_components') or []):
+                row['panels_complete'].append(name)
+            if comp in (rep.get('measured_components') or []):
+                row['panels_measured'].append(name)
+            if comp in (rep.get('verified_components') or []):
+                row['panels_verified'].append(name)
+            if comp in (rep.get('unverified_components') or []):
+                row['panels_unverified'].append(name)
+        row['complete_anywhere'] = bool(row['panels_complete'])
+        row['verified_anywhere'] = bool(row['panels_verified'])
+        row['measured_anywhere'] = bool(row['panels_measured'])
+        out['components'][comp] = row
+        if row['complete_anywhere']:
+            out['complete_anywhere'].append(comp)
+        else:
+            out['missing_everywhere'].append(comp)
+            out['warnings'].append(
+                '%s: no reported panel contains every declared leave-one-out arm%s — '
+                'this innovation cannot support a "useful" claim at the project level'
+                % (comp, (' (declared in %s but incomplete there)' % ', '.join(sorted(row['declared_in']))
+                          if row['declared_in'] else ' (never declared in a measured panel)')))
+        if row['verified_anywhere']:
+            out['verified_anywhere'].append(comp)
+        elif row['complete_anywhere']:
+            out['complete_but_unverified'].append(comp)
+        if row['measured_anywhere']:
+            out['measured_anywhere'].append(comp)
+    out['status'] = 'warn' if out['warnings'] else 'ok'
+    if verbose:
+        print('[ablation-coverage] complete in >=1 panel: %s; missing everywhere: %s'
+              % (', '.join(out['complete_anywhere']) or 'none',
+                 ', '.join(out['missing_everywhere']) or 'none'))
+    return out
+
 def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, variants=None):
     """Prospective seed plan for a planned panel.
 

@@ -1323,6 +1323,40 @@ def t_full_factorial_rejects_reused_arm():
     assert L.ablation_completeness_audit(arms_by_combo=arms)['complete'] is True
 
 
+def t_ablation_coverage_across_panels():
+    design = {'A': [('full', 'full-A', '')], 'B': [('full', 'full-B', '')]}
+
+    def _rep(*, complete=(), incomplete=(), missing=None, measured=(), verified=(),
+             unverified=()):
+        return {'ablation_completeness': {
+                    'components': {c: {} for c in set(complete) | set(incomplete)},
+                    'complete_components': list(complete),
+                    'incomplete_components': list(incomplete),
+                    'missing_arms': dict(missing or {})},
+                'measured_components': list(measured),
+                'verified_components': list(verified),
+                'unverified_components': list(unverified)}
+
+    reports = {
+        'p1': _rep(complete=('A',), measured=('A',), verified=('A',)),
+        'p2': _rep(incomplete=('A',), measured=('A',), missing={'A': ['full-A']}),
+        'p3': _rep(unverified=('B',)),
+    }
+    cov = L.ablation_coverage_across_panels(reports, design)
+    assert cov['components']['A']['panels_complete'] == ['p1'], cov
+    assert cov['components']['A']['panels_verified'] == ['p1'], cov
+    assert cov['components']['A']['missing_arms'] == {'p2': ['full-A']}, cov
+    assert cov['complete_anywhere'] == ['A'], cov
+    assert cov['verified_anywhere'] == ['A'], cov
+    assert cov['missing_everywhere'] == ['B'], cov
+    assert cov['status'] == 'warn' and any('B' in w for w in cov['warnings']), cov
+    # A complete panel that never verified is reported separately, not hidden.
+    cov2 = L.ablation_coverage_across_panels(
+        {'p': _rep(complete=('A', 'B'), measured=('A', 'B'), unverified=())}, design)
+    assert cov2['complete_but_unverified'] == ['A', 'B'], cov2
+    assert cov2['status'] == 'ok', cov2
+
+
 def t_panel_ablation_flag_does_not_overclaim():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     knobs = L.training_knobs()
@@ -5385,6 +5419,7 @@ def main():
     _check('C18 leave-one-out ablation completeness', t_ablation_completeness_leave_one_out)
     _check('C19 full-factorial ablation completeness', t_ablation_completeness_full_factorial)
     _check('C19a full-factorial rejects a reused arm id', t_full_factorial_rejects_reused_arm)
+    _check('C19b project-level ablation coverage across panels', t_ablation_coverage_across_panels)
     _check('C17c paired effect CI + leave-one-seed robustness', t_paired_effect_seed_robustness)
     _check('C17d capacity-confounding warning on module ablation', t_capacity_confound_warning)
     _check('C17e module ablation requires identical structured hyperparameters', t_component_pair_requires_same_mlp_ratio)

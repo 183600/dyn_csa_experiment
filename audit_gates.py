@@ -1412,7 +1412,9 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
     伪造一个通过。"""
     L = _import_exp_lib()
     dirs = list(outdirs) if outdirs is not None else list(_iter_result_dirs())
-    out = {'status': 'ok', 'alpha': float(alpha), 'min_n': int(min_n), 'panels': {}}
+    out = {'status': 'ok', 'alpha': float(alpha), 'min_n': int(min_n), 'panels': {},
+           'ablation_coverage': {}}
+    _reports = {}
     for d in dirs:
         _dir = d if os.path.isabs(d) else os.path.join(REPO, d)
         summ = _load(os.path.join(_dir, 'summary.json'))
@@ -1420,6 +1422,7 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
             continue
         rep = L.methodology_audit(summ, design=design, alpha=alpha, min_n=min_n,
                                   outdir=_dir, write=write, verbose=False)
+        _reports[d] = rep
         _panel = {
             'ablation_complete': rep.get('ablation_complete'),
             'ablation_completeness': rep.get('ablation_completeness'),
@@ -1428,6 +1431,7 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
             'arms_below_min_seeds': rep.get('arms_below_min_seeds'),
             'verified_components': rep.get('verified_components'),
             'unverified_components': rep.get('unverified_components'),
+            'system_level_only_components': rep.get('system_level_only_components'),
             'incomplete_components': rep.get('incomplete_components'),
             # Seed robustness / capacity confounding are per-contrast reads;
             # surface them at panel level so a report reader does not have to
@@ -1446,6 +1450,10 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
     if not out['panels']:
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no results_*/summary.json found — run the experiment phases first; the audit is zero-GPU over saved records'
+    else:
+        out['ablation_coverage'] = L.ablation_coverage_across_panels(_reports, design=design)
+        if out['ablation_coverage'].get('status') != 'ok':
+            out['status'] = 'warn'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
