@@ -230,14 +230,13 @@ jobs:
           PROMPT_APPLY='确保 docs/design_notes.md 存在且没有被误删或清空；若发现算力申请.md 再次出现则删除它（已废弃）。docs/compute_plan.md 已废弃并从仓库删除，绝对不要重新创建。不要修改 docs/design_notes.md 的内容。不要删除或移动 README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README）；.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
 
           # 每阶段单次调用的最大时长（秒）
-          # 预算按实测收紧：DeepSeek 家族单个阶段的实测中位数为 7.6 分钟，
-          # 95 分位约 30 分钟；把上限设在 30 分钟即可覆盖绝大多数有效阶段，
-          # 同时把 provider 卡死时的最大损失从 60 分钟压到 30 分钟。
-          PERF_TIMEOUT=$((35*60))     # 35m（性能与显存优化；当前该阶段已停用）
-          BUG_TIMEOUT=$((30*60))      # 30m
-          SCI_TIMEOUT=$((30*60))      # 30m（改进科研方法，随机选一个提示词）
-          CLEAN_TIMEOUT=$((8*60))     # 8m（当前该阶段已从主循环移除）
-          APPLY_TIMEOUT=$((4*60))     # 4m（算力申请.md 检查）
+          # 所有 opencode 调用的超时统一为 3 小时（受全局剩余时间 DEADLINE 收窄）：
+          # 阶段正常结束会立即返回，上限只在模型卡住时生效。
+          PERF_TIMEOUT=$((3*3600))     # 3h（性能与显存优化；当前该阶段已停用）
+          BUG_TIMEOUT=$((3*3600))      # 3h
+          SCI_TIMEOUT=$((3*3600))      # 3h
+          CLEAN_TIMEOUT=$((3*3600))     # 3h（当前该阶段已从主循环移除）
+          APPLY_TIMEOUT=$((3*3600))     # 3h（算力申请.md 检查）
 
           # ================= provider 策略：独立双家族（失效只在家族内级联，不跨家族） =================
           # NVIDIA 家族（20%）：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
@@ -809,7 +808,7 @@ jobs:
               echo "[test-gate] 剩余时间不足以安排修复，仅记录失败"
               return 0
             fi
-            if [ "$TG_FIX_BUDGET" -gt 2700 ]; then TG_FIX_BUDGET=2700; fi
+            if [ "$TG_FIX_BUDGET" -gt 10800 ]; then TG_FIX_BUDGET=10800; fi
             {
               echo '本仓库的测试跑不通，请修复。复现方式：在仓库根目录运行 bash /tmp/tg_run.sh。'
               echo
