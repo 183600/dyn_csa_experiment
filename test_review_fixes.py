@@ -2687,6 +2687,14 @@ def t_nested_validation_row_split_and_subset_ppl():
     assert L.record_subset_ppl({'ppl': 9.0}, [0]) is None
     assert L.record_subset_ppl(rec, [99]) is None
     assert L.record_subset_ppl(rec, []) is None
+    # A fractional index must not be truncated to a different row, booleans
+    # are flags not row ids, and repeating a row must not double-count its
+    # tokens in the held-out pooled PPL.
+    assert L.record_subset_ppl(rec, [1.5]) is None
+    assert L.record_subset_ppl(rec, [True]) is None
+    assert L.record_subset_ppl(rec, [1, 1]) is None
+    from decimal import Decimal as _Decimal
+    assert L.record_subset_ppl(rec, [_Decimal('1')])['n_tokens'] == 10
     try:
         L.validation_row_split(1)
     except ValueError:

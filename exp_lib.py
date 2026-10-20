@@ -11121,12 +11121,27 @@ def record_subset_ppl(rec, rows):
     if len(nll) != len(ntok) or not nll:
         return None
     try:
-        idx = np.asarray(list(rows), dtype=np.int64)
+        raw_rows = list(rows)
+    except TypeError:
+        return None
+    if not raw_rows:
+        return None
+    # Row indices identify the scored documents.  int(1.5) would silently
+    # select row 1 (a different sample), a boolean is a flag rather than an
+    # index, and a repeated index would count the same document twice and
+    # inflate the token denominator.  Parse exactly and require uniqueness.
+    parsed = [_as_seed_int(v) for v in raw_rows]
+    if any(i is None for i in parsed):
+        return None
+    if any(i < 0 or i >= len(nll) for i in parsed):
+        return None
+    if len(set(parsed)) != len(parsed):
+        return None
+    try:
+        idx = np.asarray(parsed, dtype=np.int64)
     except (TypeError, ValueError, OverflowError):
         return None
     if idx.ndim != 1 or idx.size == 0:
-        return None
-    if int(idx.min()) < 0 or int(idx.max()) >= len(nll):
         return None
     try:
         _nll = np.asarray([nll[int(i)] for i in idx], dtype=float)
