@@ -15394,8 +15394,18 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 for (ts, bs), (deltas, shared, skipped) in sorted(conds.items()):
                     _skipped_seeds = {s for s, _why in skipped}
                     _passed = [s for s in shared if s not in _skipped_seeds]
-                    _a_vals = [float(recs[(a, ts, s)]['ppl']) for s in _passed]
-                    _b_vals = [float(recs[(b, bs, s)]['ppl']) for s in _passed]
+                    # The paired delta is already on the PRIMARY estimand
+                    # (`_paired_seed_deltas`); the arm means / relative effect /
+                    # unpaired sensitivity must use the same sample, not the
+                    # full-validation `ppl` that still contains selection rows.
+                    _a_vals, _b_vals = [], []
+                    for s in _passed:
+                        _av = _record_primary_ppl(recs[(a, ts, s)])
+                        _bv = _record_primary_ppl(recs[(b, bs, s)])
+                        if _av is None or _bv is None:
+                            continue
+                        _a_vals.append(float(_av))
+                        _b_vals.append(float(_bv))
                     st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n, with_values=_a_vals, without_values=_b_vals)
                     _obj = sorted({objective_reason(recs[(a, ts, s)], recs[(b, bs, s)]) for s in _passed})
                     _obj_bad = [x for x in _obj if x and x.startswith('objective differs')]
@@ -15594,9 +15604,28 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     for (v, t, s), r in recs.items():
         _arm_groups.setdefault((v, str(t or '')), {})[s] = r
     for (v, t), _by_seed in sorted(_arm_groups.items()):
-        _vals = [float(_by_seed[s]['ppl']) for s in sorted(_by_seed)]
+        _recs_sorted = [_by_seed[s] for s in sorted(_by_seed)]
+        _primary = [_record_primary_ppl(r) for r in _recs_sorted]
+        _miss = sum(v is None for v in _primary)
+        if _miss:
+            # Same fail-visible convention as aggregate: one sample for the
+            # whole arm, explicitly labelled, rather than mixing holdout and
+            # full-validation rows within one mean.
+            _vals = [float(r['ppl']) for r in _recs_sorted]
+            _estimand = 'full_validation_fallback'
+            report['warnings'].append(
+                '%s: %d/%d record(s) declare the nested estimand but lack '
+                'holdout accounting; arm summary falls back to full-validation '
+                'PPL for the whole arm' % (v if not t else f'{v}::{t}',
+                                           _miss, len(_recs_sorted)))
+        else:
+            _vals = [float(x) for x in _primary]
+            _estimand = ('nested_validation_holdout'
+                         if any(r.get('ppl_estimation_rows') == 'nested_validation_holdout'
+                                for r in _recs_sorted)
+                         else 'full_validation')
         _key = v if not t else '%s::%s' % (v, t)
-        _pooled, _nll_tot, _ntok_tot = _pooled_ppl_from_records([_by_seed[s] for s in sorted(_by_seed)])
+        _pooled, _nll_tot, _ntok_tot = _pooled_ppl_from_records(_recs_sorted)
         report['arm_summary'][_key] = {
             'variant': v, 'protocol': t, 'n_seeds': len(_vals),
             'seeds': sorted(_by_seed),
@@ -15604,6 +15633,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             'ppl_mean_arithmetic': float(np.mean(_vals)),
             'ppl_pooled': _pooled,
             'ppl_primary': (float(_pooled) if _pooled is not None else float(np.mean(_vals))),
+            'ppl_estimand': _estimand,
+            'ppl_primary_missing': int(_miss),
             'nll_sum': _nll_tot, 'n_tokens': _ntok_tot,
             'ppl_std': float(np.std(_vals, ddof=1)) if len(_vals) > 1 else 0.0,
             'meets_min_seeds': len(_vals) >= int(min_n),

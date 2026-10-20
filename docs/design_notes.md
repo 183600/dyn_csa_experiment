@@ -1571,3 +1571,14 @@ seeds」。
 交互层 `significant` 同时要求 `complete_pairs is not False`：只要有一个 seed
 因非有限配对被丢弃，即使剩余非零对达到 p<alpha，也不能把 complete-case
 子集的结果当作完整面板的交互结论；原始检验旗标仍在 `significant_raw`。
+
+## 33. 方法审计的臂均值/相对效应也必须用主估计量（本轮硬化）
+
+`methodology_audit` 的配对差已经走 `_paired_primary_delta`，但同一对比的
+`with_mean`/`without_mean`、`relative_effect_pct` 与 unpaired bootstrap 仍读
+原始 `ppl`。嵌套调参记录的全验证 `ppl` 仍包含选参行，因此会出现「配对 Δ
+用 holdout，分母却用全验证」的混合口径。现在这些量统一读
+`_record_primary_ppl`；`arm_summary` 也按主估计量计算 `ppl_mean`/`ppl_std`
+并记录 `ppl_estimand`、`ppl_primary_missing`。若同一臂中有记录声明嵌套却
+缺 holdout 记账，则整臂显式回退到全验证值并记 warning（与 aggregate 同一
+约定），绝不把两个样本混在一个均值里。

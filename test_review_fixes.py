@@ -1445,6 +1445,28 @@ def t_arm_mean_std_and_relative_effect():
     e = r['components']['c'][0]
     assert e['n_paired'] == 5 and e['without_mean'] == 10.0, e
     assert abs(e['relative_effect_pct'] - 100.0 * e['mean'] / e['without_mean']) < 1e-9, e
+    # Nested tuning records: the contrast's arm means, relative effect and
+    # bootstrap sensitivity must use the SAME holdout estimand as the paired
+    # delta, not the full-validation `ppl` that selected the hyper-parameters.
+    hold = [10.0, 10.2, 9.8, 10.1, 9.9]
+    nested = {}
+    for i, ppl in enumerate(hold):
+        nested[f'a::seed{i}'] = dict(s[f'a::seed{i}'], ppl=99.0 + i,
+                                     ppl_estimation_rows='nested_validation_holdout',
+                                     ppl_holdout=ppl)
+        nested[f'b::seed{i}'] = dict(s[f'b::seed{i}'], ppl=1.0 + i,
+                                     ppl_estimation_rows='nested_validation_holdout',
+                                     ppl_holdout=10.0)
+    rn = L.methodology_audit(nested, design={'c': [('a', 'b', 'x')]},
+                             baselines={}, verbose=False)
+    en = rn['components']['c'][0]
+    assert en['without_mean'] == 10.0, en
+    assert abs(en['with_mean'] - float(np.mean(hold))) < 1e-12, en
+    assert abs(en['relative_effect_pct'] - 100.0 * en['mean'] / en['without_mean']) < 1e-9, en
+    arm_n = rn['arm_summary']['a']
+    assert arm_n['ppl_estimand'] == 'nested_validation_holdout', arm_n
+    assert abs(arm_n['ppl_mean'] - float(np.mean(hold))) < 1e-12, arm_n
+    assert arm_n['ppl_primary_missing'] == 0, arm_n
 
 
 def t_paired_effect_seed_robustness():
