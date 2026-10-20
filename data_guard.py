@@ -64,6 +64,10 @@ _EPS = 1e-12
 # ---------------------------------------------------------------------------
 
 def _check_fraction(name, value):
+    # Booleans are not fractions: float(True) == 1.0 would silently turn a
+    # mistaken flag into a 100% split.  Same contract as _check_count.
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f'{name} must be a number in [0, 1], got {value!r}')
     try:
         value = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -777,6 +781,14 @@ def _as_numeric_2d(X, *, name='X'):
 
 def _as_float_2d(X, *, name='X'):
     arr = _as_numeric_2d(X, name=name)
+    if np.iscomplexobj(arr):
+        # NumPy would cast complex -> float64 with only a warning, silently
+        # discarding the imaginary part.  Two different complex rows could
+        # then collapse into the same "duplicate" and the fitted statistics
+        # would describe data the caller never supplied.
+        raise TypeError(
+            f'{name} must be real-valued; complex features are not supported '
+            'by the leakage-safe preprocessor')
     try:
         arr = arr.astype(np.float64, copy=False)
     except (TypeError, ValueError, OverflowError):
@@ -787,8 +799,13 @@ def _as_float_2d(X, *, name='X'):
 
 
 def _col_float64(arr, j, name='X'):
+    col = arr[:, j]
+    if np.iscomplexobj(col):
+        raise TypeError(
+            f'{name} must be real-valued; complex features are not supported '
+            'by the leakage-safe preprocessor')
     try:
-        return np.asarray(arr[:, j], dtype=np.float64)
+        return np.asarray(col, dtype=np.float64)
     except (TypeError, ValueError, OverflowError):
         raise TypeError(
             f'{name} must be numeric; encode categorical features before '

@@ -1410,6 +1410,11 @@ def _causal_quantile_exact(x, cols, target_block_tokens, _full_range=False):
     q = max(1.0 / max(int(target_block_tokens), 1), 0.001)
     idx = _arange_cache(n, dev)
     cols = cols.to(torch.long)
+    if cols.numel() == 0:
+        # No requested columns: return an empty [rows, 0] table.  The chunked
+        # loop below cannot write any column, and its `nc = max(1, ...)` guard
+        # would otherwise leave a [rows, 1] buffer of uninitialised values.
+        return x.new_empty((x.shape[0], 0))
     pos = q * cols.to(torch.float32)
     lo = pos.floor().long()
     frac = pos - lo
@@ -7962,18 +7967,34 @@ def _cache_id_upper_bound(path):
     except (OSError, ValueError, TypeError):
         return None
     for key in ('max_id', 'max_token_id', 'token_max'):
-        try:
-            v = int(meta[key])
-            if 0 <= v < 2 ** 31:
-                return v
-        except (KeyError, TypeError, ValueError):
-            pass
-    try:
-        vocab = int(meta.get('vocab'))
-        if 0 < vocab <= 2 ** 31:
-            return vocab - 1
-    except (TypeError, ValueError, OverflowError):
-        pass
+        raw = meta.get(key)
+        if isinstance(raw, (bool, np.bool_)):
+            continue
+        if isinstance(raw, numbers.Integral):
+            v = int(raw)
+        elif isinstance(raw, numbers.Real):
+            f = float(raw)
+            if not math.isfinite(f) or f != math.floor(f):
+                continue
+            v = int(f)
+        else:
+            continue
+        if 0 <= v < 2 ** 31:
+            return v
+    raw_vocab = meta.get('vocab')
+    if isinstance(raw_vocab, (bool, np.bool_)):
+        return None
+    if isinstance(raw_vocab, numbers.Integral):
+        vocab = int(raw_vocab)
+    elif isinstance(raw_vocab, numbers.Real):
+        f = float(raw_vocab)
+        if not math.isfinite(f) or f != math.floor(f):
+            return None
+        vocab = int(f)
+    else:
+        return None
+    if 0 < vocab <= 2 ** 31:
+        return vocab - 1
     return None
 
 
@@ -11106,13 +11127,18 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
         per_class[str(lab)] = {'precision': precision, 'recall': recall, 'f1': f1, 'support': support}
         all_f1s.append(f1)
+        # Balanced accuracy / macro recall are also averages over the full
+        # REQUESTED label set.  A label absent from y_true (but requested, or
+        # present only in y_pred) has recall 0, not "not applicable": dropping
+        # it made a constant predictor on a two-label endpoint score balanced
+        # accuracy 1.0 instead of 0.5.
+        rs.append(recall)
         total_tp += tp
         total_fp += fp
         total_fn += fn
         if support:
             supports.append(support)
             f1s.append(f1)
-            rs.append(recall)
     micro_f1 = 2 * total_tp / max(2 * total_tp + total_fp + total_fn, 1)
     # Macro averages over the requested label set (zero-support labels count
     # as 0, as in sklearn), so a rare class cannot be dropped from the macro
@@ -11234,10 +11260,15 @@ def metric_policy_audit(summary=None, policy=None):
             for key in ('prevalence', 'positive_prevalence'):
                 val = r.get(key)
                 if isinstance(val, dict) and len(val) == 2:
-                    prevalence = min(float(x) for x in val.values())
-                    break
+                    # A malformed prevalence entry is unverifiable, not a
+                    # reason to abort the whole audit.  Only finite values in
+                    # [0, 1] define a class prevalence.
+                    _pv = [_finite_scalar(x) for x in val.values()]
+                    if all(v is not None and 0.0 <= v <= 1.0 for v in _pv):
+                        prevalence = min(_pv)
+                        break
                 _prev_f = _finite_scalar(val)
-                if _prev_f is not None:
+                if _prev_f is not None and 0.0 <= _prev_f <= 1.0:
                     prevalence = min(_prev_f, 1.0 - _prev_f)
                     break
             if task in classify_tasks and prevalence is not None and prevalence < 1e-3:
