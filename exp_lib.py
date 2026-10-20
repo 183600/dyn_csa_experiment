@@ -21453,8 +21453,26 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
            'n_docs_dropped_zero_token': None,
            'se_seed_logppl': None, 'se_doc_logppl': None,
            'se_combined_logppl': None, 'ci95_ppl': None,
-           'component_ratio_seed_over_doc': None, 'conf': float(conf),
+           'component_ratio_seed_over_doc': None, 'conf': None,
            'method': 'two-source variance combination on log-PPL (seed training noise x evaluation-document bootstrap); approximation, not a fitted hierarchical model'}
+    # Coverage, draw count and RNG seed identify the interval.  Never build a
+    # 95% interval while echoing conf=True/1.0, and never let a fractional
+    # n_boot silently become a different draw count.
+    try:
+        _conf = _validated_alpha(conf, context='_combined_seed_doc_ci conf')
+    except ValueError as e:
+        out['reason'] = str(e)
+        return out
+    _nb = _as_seed_int(n_boot)
+    if _nb is None or _nb < 20:
+        out['reason'] = (f'n_boot={n_boot!r} must be an integer >= 20 for a '
+                         'percentile bootstrap')
+        return out
+    _seed = _as_seed_int(seed)
+    if _seed is None:
+        out['reason'] = f'seed={seed!r} is not an integer; draws are not reproducible'
+        return out
+    out['conf'] = float(_conf)
     S = len(recs)
     if S < 1:
         return out
@@ -21480,26 +21498,26 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     # (seed-pooled NLL/ntok columns, the same pooled estimator the doc CI
     # uses, taken on the log scale).
     if rows is not None and nll_mat.shape[1] >= 2:
-        rng = np.random.default_rng(int(seed))
+        rng = np.random.default_rng(_seed)
         nll_col = nll_mat.sum(axis=0)
         ntok_col = ntok_mat.sum(axis=0)
         R = int(nll_mat.shape[1])
-        draws = np.empty(int(n_boot), dtype=float)
+        draws = np.empty(int(_nb), dtype=float)
         _chunk = _bootstrap_draw_chunk(R)
         _b = 0
-        while _b < int(n_boot):
-            _nb = min(_chunk, int(n_boot) - _b)
-            counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb)
+        while _b < int(_nb):
+            _nb_draw = min(_chunk, int(_nb) - _b)
+            counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb_draw)
             nt = counts @ ntok_col
             nn = counts @ nll_col
             with np.errstate(divide='ignore', invalid='ignore'):
                 # nn/nt is already the pooled log-PPL (CE) of the resample.
                 lp_draw = np.where((nt > 0) & np.isfinite(nn), nn / np.maximum(nt, 1e-30), np.nan)
                 lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw >= 0), lp_draw, np.nan)
-            draws[_b:_b + _nb] = lp_draw
-            _b += _nb
+            draws[_b:_b + _nb_draw] = lp_draw
+            _b += _nb_draw
         draws = draws[np.isfinite(draws)]
-        if draws.size >= max(20, int(0.5 * n_boot)):
+        if draws.size >= max(20, int(0.5 * _nb)):
             sd = float(draws.std(ddof=1))
             if sd < 1e-12:
                 # Identical documents: the bootstrap SD is pure float noise.
@@ -21525,7 +21543,7 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     if se_d > 0:
         out['component_ratio_seed_over_doc'] = float(se_s / se_d)
     try:
-        tc = _t_critical(float(conf), S - 1)
+        tc = _t_critical(float(_conf), S - 1)
     except Exception:
         tc = None
     if tc is not None and math.isfinite(tc):

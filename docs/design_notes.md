@@ -1590,3 +1590,8 @@ seeds」。
 仍是「已声明的空测量」，但数字/布尔/字符串/bytes 等非法形式现在直接抛
 `ValueError`；调用方必须给出测量向量或显式 `None`。这样规模分析不会因为
 一个格式错误而偷偷改变族大小或「共同效应」的可见性。
+
+同一约定也应用到 `_combined_seed_doc_ci`（seed × document 两层区间）：
+`conf` 必须是 (0,1) 实数、`n_boot` 是 >=20 的整数、`seed` 是整数；否则
+返回 `status='unverifiable'` 与 `reason`，不再构造一个标签与实际覆盖率
+不一致的区间。

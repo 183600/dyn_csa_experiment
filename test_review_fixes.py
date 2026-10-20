@@ -1963,6 +1963,18 @@ def t_combined_seed_doc_uncertainty():
     r2 = L._combined_seed_doc_ci([{'variant': 'csa', 'seed': 0, 'ppl': 30.0},
                                   {'variant': 'csa', 'seed': 1, 'ppl': 31.0}])
     assert r2['status'] == 'unverifiable' and r2['ci95_ppl'] is None, r2
+    # Coverage/draw-count/RNG are part of the interval identity: never build
+    # a 95% interval while echoing an invalid option.
+    for _bad_conf in (True, 0, 1, 1.5, -0.1, float('nan'), 'x'):
+        _rr = L._combined_seed_doc_ci(recs, conf=_bad_conf)
+        assert _rr['status'] == 'unverifiable' and _rr.get('reason'), (_bad_conf, _rr)
+        assert _rr['conf'] is None and _rr['ci95_ppl'] is None, (_bad_conf, _rr)
+    for _bad_nb in (True, 0, 19, 1.5, 'x', None, float('nan')):
+        _rr = L._combined_seed_doc_ci(recs, n_boot=_bad_nb)
+        assert _rr['status'] == 'unverifiable' and _rr.get('reason'), (_bad_nb, _rr)
+    for _bad_seed in (True, 1.5, 'x', None, float('nan')):
+        _rr = L._combined_seed_doc_ci(recs, seed=_bad_seed)
+        assert _rr['status'] == 'unverifiable' and 'seed' in _rr.get('reason', ''), (_bad_seed, _rr)
     # A single scored document cannot carry a doc-resampling component.
     r3 = L._combined_seed_doc_ci(_recs([0.0, 0.2], n_docs=1, ntok=50))
     assert r3['status'] == 'doc_component_unverifiable' and r3['se_doc_logppl'] is None and r3['se_seed_logppl'] is not None, r3
