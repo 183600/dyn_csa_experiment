@@ -8114,6 +8114,20 @@ def t_build_report_warmup_uses_primary_estimand():
     assert '+10.00 vs 基线' in out, out
 
 
+
+def t_pool_kernel_empty_sequence_matches_eager():
+    import csa_kernels as C
+    g = C.PoolGeometry([[]], overlap=4, T=0, device=torch.device('cpu'), max_block=128)
+    X = torch.randn(1, 0, 3)
+    Z = torch.randn(1, 0, 3)
+    Bp = torch.randn(129, 3)
+    bid = torch.zeros(1, 0, dtype=torch.int32)
+    y, last, Bm = C.pool_variable_blocks_kernel(X, None, Z, None, bid, g, Bp, Bp)
+    assert y.shape == (1, 0, 3) and last.shape == (1, 0) and Bm == 0, (y.shape, last.shape, Bm)
+    y2, last2, Bm2 = C.pool_blocks_single_kernel(X, Z, bid, g, Bp)
+    assert y2.shape == (1, 0, 3) and last2.shape == (1, 0) and Bm2 == 0, (y2.shape, last2.shape, Bm2)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8371,6 +8385,7 @@ def main():
     _check('L39 split audit recomputes fingerprints and doc sidecars', t_split_discipline_recomputes_fingerprints_and_doc_sidecars)
     _check('L40 archive refuses links and repo escape', t_archive_refuses_links_and_repo_escape)
     _check('L41 warmup table uses the primary estimand', t_build_report_warmup_uses_primary_estimand)
+    _check('L42 empty-sequence pool kernel matches eager', t_pool_kernel_empty_sequence_matches_eager)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

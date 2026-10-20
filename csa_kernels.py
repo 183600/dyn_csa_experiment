@@ -724,6 +724,13 @@ class FusedPool(torch.autograd.Function):
 def pool_variable_blocks_kernel(Xa, Xb, Za, Zb, bid, geom, B_pos_a, B_pos_b, impl=None):
     """`exp_lib.pool_variable_blocks` 的内核路径（批量化：R 行一次过）。
     返回 (comp [R, Bm, c], last_tok [R, Bm] int32, Bm)。"""
+    if Xa.shape[0] == 0 or Xa.shape[1] == 0:
+        # Same empty-sequence contract as the eager path: no lanes to pool,
+        # hence zero blocks (do not run the gather geometry, whose clamp to
+        # T-1 would index an empty time dimension with -1).
+        return (Xa.new_empty((Xa.shape[0], 0, Xa.shape[-1])),
+                torch.empty((Xa.shape[0], 0), dtype=torch.int32, device=Xa.device),
+                0)
     impl = impl or _op_impl('POOL')
     comp = FusedPool.apply(impl, Xa, Xb, Za, Zb, bid, geom, B_pos_a, B_pos_b)
     return comp, geom.last_tok, geom.Bm
@@ -731,6 +738,10 @@ def pool_variable_blocks_kernel(Xa, Xb, Za, Zb, bid, geom, B_pos_a, B_pos_b, imp
 
 def pool_blocks_single_kernel(X, Z, bid, geom, B_pos, impl=None):
     """`exp_lib.pool_blocks_single` 的内核路径（HCA：仅 A 泳道）。"""
+    if X.shape[0] == 0 or X.shape[1] == 0:
+        return (X.new_empty((X.shape[0], 0, X.shape[-1])),
+                torch.empty((X.shape[0], 0), dtype=torch.int32, device=X.device),
+                0)
     impl = impl or _op_impl('POOL')
     comp = FusedPool.apply(impl, X, None, Z, None, bid, geom, B_pos, B_pos)
     return comp, geom.last_tok, geom.Bm
