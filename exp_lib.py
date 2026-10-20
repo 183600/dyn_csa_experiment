@@ -9917,6 +9917,10 @@ def paired_log_ratio(with_values, without_values, seeds=None):
     ss = list(range(len(wa))) if seeds is None else list(seeds)
     if len(ss) != len(wa):
         raise ValueError('paired_log_ratio seeds length %d does not match vectors length %d' % (len(ss), len(wa)))
+    _norm_ss = [_as_seed_int(s) for s in ss]
+    if any(s is None for s in _norm_ss):
+        raise ValueError('paired_log_ratio seeds must be integers, got %r' % (ss,))
+    ss = _norm_ss
     if len(set(ss)) != len(ss):
         # Two rows for one seed are not independent observations; downstream
         # means/SEs would silently double-count that seed.
@@ -9983,6 +9987,15 @@ def _scale_points(points):
             seeds = list(seeds)
             if len(seeds) != len(vals):
                 raise ValueError('scale point %r: seeds length %d does not match effects length %d' % (label, len(seeds), len(vals)))
+            # Seed identity is an exact integer.  A float such as 1.5 or a
+            # boolean would otherwise be treated as a distinct draw (and True
+            # collides with 1 in the complete-case dictionary), silently
+            # mis-pairing scale points.
+            _norm_seeds = [_as_seed_int(s) for s in seeds]
+            if any(s is None for s in _norm_seeds):
+                raise ValueError('scale point %r: seeds must be integers, got %r'
+                                 % (label, seeds))
+            seeds = _norm_seeds
             keep = [(s, f) for s, f in ((s, _finite_scalar(v)) for s, v in zip(seeds, vals))
                     if f is not None]
             seeds_kept = [s for s, _v in keep]
@@ -10169,6 +10182,10 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     ss = list(range(len(a))) if seeds is None else list(seeds)
     if len(ss) != len(a):
         raise ValueError('scale_interaction seeds length does not match effects')
+    _norm_ss = [_as_seed_int(s) for s in ss]
+    if any(s is None for s in _norm_ss):
+        raise ValueError('scale_interaction seeds must be integers, got %r' % (ss,))
+    ss = _norm_ss
     if len(set(ss)) != len(ss):
         # A repeated seed would enter paired_effect_stats as two independent
         # observations and shrink the interaction SE.

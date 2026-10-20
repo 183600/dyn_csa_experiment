@@ -556,9 +556,26 @@ def t_scaling_trend_ragged_pairs():
     ):
         try:
             L.scaling_trend(bad, min_points=2)
-            raise AssertionError('duplicate labels/seeds must be rejected instead of mis-paired')
         except ValueError:
             pass
+        else:
+            raise AssertionError('duplicate labels/seeds must be rejected instead of mis-paired')
+    # Seed identity is an exact integer across every scale helper.  A
+    # fractional value would quietly become a different paired draw, and
+    # True would collide with seed 1 in the complete-case dict.
+    for _bad_seed in (0.5, True, 'not-an-int'):
+        for _call in (
+            lambda: L._scale_points([{'label': 'A', 'scale': 1,
+                                      'effects': [1.0], 'seeds': [_bad_seed]}]),
+            lambda: L.paired_log_ratio([1.0], [2.0], seeds=[_bad_seed]),
+            lambda: L.scale_interaction([1.0], [2.0], seeds=[_bad_seed]),
+        ):
+            try:
+                _call()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'non-integer seed {_bad_seed!r} was accepted')
 
 
 def t_scaling_trend_primary_direction_and_floor():
