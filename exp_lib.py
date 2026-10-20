@@ -15133,7 +15133,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                   and (_ppl := _record_primary_ppl(r)) is not None]
                     if _seed_vals:
                         _deltas = [x - _floor_ppl for x in _seed_vals]
-                        _fst = paired_effect_stats(_deltas, alpha=0.05,
+                        _fst = paired_effect_stats(_deltas, alpha=alpha,
                                                    min_n=int(report.get('min_n') or 3))
                         _pt = float(np.mean(_deltas))
                         if _pt < 0:
@@ -15200,7 +15200,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         if not _vals:
                             continue
                         _deltas = [x - _floor_ppl for x in _vals]
-                        _fst = paired_effect_stats(_deltas, alpha=0.05,
+                        _fst = paired_effect_stats(_deltas, alpha=alpha,
                                                    min_n=int(report.get('min_n') or 3))
                         _pt = float(np.mean(_deltas))
                         if _pt < 0:
@@ -15258,7 +15258,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         except (TypeError, ValueError, OverflowError):
                             _p = float('nan')
                         _floor_named.append((_v, _p if math.isfinite(_p) else 1.0))
-                    _floor_holm = holm_adjust(_floor_named) if _floor_named else {}
+                    _floor_holm = holm_adjust(_floor_named, alpha=alpha) if _floor_named else {}
                     for _v in _method_arm_names:
                         _c = _floor_by_arm.get(_v)
                         if _c is None:

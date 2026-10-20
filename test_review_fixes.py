@@ -3737,6 +3737,17 @@ def t_simple_floor_contrast_is_significance_aware():
         assert fl['token_denominator_match'] is True, fl
         assert fl['floor_contrast']['verdict'] == 'beats_floor_significant', fl['floor_contrast']
         assert fl['floor_contrast']['p_exact_signflip'] < 0.05, fl['floor_contrast']
+        # The caller's alpha is the gate for the floor family too.  At n=6
+        # the exact p floor is 0.03125: significant at alpha=0.05 but not at
+        # alpha=0.01, and the floor gate must not keep hard-coding 0.05.
+        _lo = {k: v for k, v in recs(floor - 1.0).items()
+               if int(v['seed']) < 6}
+        with contextlib.redirect_stdout(io.StringIO()):
+            _rlo = L.methodology_audit(_lo, design={}, baselines=L.BASELINE_DESIGN,
+                                       outdir=td, alpha=0.01, verbose=False)
+        _flo = _rlo['simple_baseline']
+        assert _flo['floor_contrast']['verdict'] != 'beats_floor_significant', _flo['floor_contrast']
+        assert _flo['method_arm_floor_contrasts']['csa_dynamic']['method_status'] != 'beats_floor_holm', _flo['method_arm_floor_contrasts']['csa_dynamic']
         with contextlib.redirect_stdout(io.StringIO()):
             r2 = L.methodology_audit(recs(floor + 0.5), design={}, baselines=L.BASELINE_DESIGN, outdir=td, verbose=False)
         assert r2['simple_baseline']['panel_beats_simple_floor'] is False, r2['simple_baseline']
