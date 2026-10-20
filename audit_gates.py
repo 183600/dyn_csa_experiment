@@ -1060,31 +1060,54 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
         return out
     L = _import_exp_lib()
     import numpy as np
+
+    def _exact_int(value):
+        if value is None or isinstance(value, (bool, np.bool_)):
+            return None
+        if isinstance(value, numbers.Integral):
+            return int(value)
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return int(f) if math.isfinite(f) and f == math.floor(f) else None
+
     by_len = {}
     problems = []
     for key, r in raw.items():
         if not isinstance(r, dict):
+            problems.append(f'{key}: record is not a JSON object')
             continue
         for k, c in (r.get('by_len') or {}).items():
             if isinstance(k, (bool, np.bool_)):
                 problems.append(f'{key}: by_len key {k!r} is not an integer length')
                 continue
-            try:
-                Ln = int(k)
-            except (TypeError, ValueError, OverflowError):
+            Ln = _exact_int(k)
+            if Ln is None:
+                problems.append(f'{key}: by_len key {k!r} is not an integer length')
                 continue
             if not isinstance(c, dict):
+                problems.append(f'{key}: L{Ln} cell is not a JSON object')
                 continue
             e = by_len.setdefault(Ln, {'n_tok': set(), 'eval_span': set(), 'truncated': set(), 'n_seq': set()})
             e['n_tok'].add(c.get('n_tok'))
             e['eval_span'].add(c.get('eval_span'))
             e['truncated'].add(c.get('truncated'))
+            for _field in ('n_tok', 'eval_span'):
+                if _exact_int(c.get(_field)) is None:
+                    problems.append(
+                        f'{key}: L{Ln} cell has no exact integer `{_field}` '
+                        f'({c.get(_field)!r}) — the scored target set is unverifiable')
             _nseq_cell = None
             if isinstance(c.get('ppl_per_seq'), list):
                 _nseq_cell = len(c['ppl_per_seq'])
                 e['n_seq'].add(_nseq_cell)
             elif c.get('n_seq') is not None:
-                _nseq_cell = c.get('n_seq')
+                _nseq_cell = _exact_int(c.get('n_seq'))
+                if _nseq_cell is None:
+                    problems.append(
+                        f'{key}: L{Ln} cell has a non-integer `n_seq` '
+                        f'({c.get("n_seq")!r}) — the per-document row count is unverifiable')
                 e['n_seq'].add(_nseq_cell)
             else:
                 # Keep the absence in the same set as the observed counts so
@@ -1094,17 +1117,15 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             # (but equally wrong) counts across arms are not a valid target
             # set, so verify the formula whenever the cell claims to be a
             # full-length measurement.
-            if c.get('truncated') is False and _nseq_cell is not None:
-                try:
-                    _nt = int(c.get('n_tok'))
-                    _ns = int(_nseq_cell)
-                except (TypeError, ValueError, OverflowError):
-                    # The set-based agreement check below already fails on a
-                    # missing/non-numeric value.
-                    pass
-                else:
-                    if Ln >= 2 and _nt != _ns * (Ln - 1):
-                        problems.append(f'{key}: L{Ln} n_tok={_nt} != n_seq*(L-1)={_ns * (Ln - 1)} — the cell did not score one next-token target per row')
+            _nt = _exact_int(c.get('n_tok'))
+            _ns = _exact_int(_nseq_cell)
+            if c.get('truncated') is False and _ns is not None and _nt is not None:
+                if Ln >= 2 and _nt != _ns * (Ln - 1):
+                    problems.append(f'{key}: L{Ln} n_tok={_nt} != n_seq*(L-1)={_ns * (Ln - 1)} — the cell did not score one next-token target per row')
+            if _nt is not None and _nt < 0:
+                problems.append(f'{key}: L{Ln} n_tok={_nt} is negative')
+            if _ns is not None and _ns < 0:
+                problems.append(f'{key}: L{Ln} n_seq={_ns} is negative')
             if 'truncated' not in c:
                 problems.append(f'{key}: L{Ln} cell has NO `truncated` flag — a missing truncation marker is treated as unverifiable, not as a full-length measurement')
             elif not isinstance(c.get('truncated'), (bool, np.bool_)):

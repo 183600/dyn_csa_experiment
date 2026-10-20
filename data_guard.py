@@ -1581,6 +1581,20 @@ def _row_keys(X):
                 return b'I' + str(int(v)).encode('ascii')
             if isinstance(v, numbers.Integral):
                 return b'I' + str(int(v)).encode('ascii')
+            # Exact rationals (Fraction, Decimal, ...) keep numerator and
+            # denominator instead of being rounded through float64.  Decimal
+            # is not a numbers.Real subclass, so it would otherwise fall
+            # through to the lossy generic path below.
+            if not isinstance(v, (float, np.floating)):
+                try:
+                    n, d = v.as_integer_ratio()
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    pass
+                else:
+                    n, d = int(n), int(d)
+                    return (b'I' + str(n).encode('ascii') if d == 1
+                            else b'R' + str(n).encode('ascii') + b'/'
+                            + str(d).encode('ascii'))
             f = float(v)
             if math.isnan(f):
                 return b'Fnan'
@@ -1590,9 +1604,23 @@ def _row_keys(X):
                 return b'I0'
             if f.is_integer():
                 return b'I' + str(int(f)).encode('ascii')
-            return b'F' + f.hex().encode('ascii')
+            # Use the exact binary ratio so a Decimal/Fraction that equals
+            # this float exactly produces the same key (two different floats
+            # can never share a ratio).
+            n, d = f.as_integer_ratio()
+            return b'R' + str(n).encode('ascii') + b'/' + str(d).encode('ascii')
 
-        if all(v is None or isinstance(v, numbers.Real) for v in _flat):
+        if any(isinstance(v, (complex, np.complexfloating)) for v in _flat):
+            raise TypeError(
+                'duplicate detection needs real-valued rows; casting complex '
+                'rows to float64 would silently discard the imaginary part')
+
+        def _is_numeric_object(v):
+            if v is None or isinstance(v, (bool, np.bool_)):
+                return True
+            return isinstance(v, numbers.Number) or hasattr(v, 'as_integer_ratio')
+
+        if all(_is_numeric_object(v) for v in _flat):
             _step = _hash_row_block(int(src.shape[1]), 1 << 16)
             keys = []
             for start in range(0, src.shape[0], _step):

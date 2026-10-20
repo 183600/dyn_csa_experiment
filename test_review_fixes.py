@@ -4215,6 +4215,34 @@ def t_audit_length_missing_n_seq_flag():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def t_audit_length_rejects_unverifiable_counts():
+    td = tempfile.mkdtemp(prefix='len_', dir=REPO)
+    try:
+        p = os.path.join(td, 'bylen.json')
+        # A non-numeric n_tok/eval_span, a non-integer length key and a
+        # malformed cell must all fail closed instead of being skipped.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {
+                '4096': {'ppl': 30.0, 'n_tok': 'lots', 'eval_span': 4095,
+                         'truncated': False, 'n_seq': 16},
+                'oops': {'ppl': 1.0},
+                '512': 'not-a-cell'}}}, f)
+        r = A.audit_length(p)
+        assert r['status'] == 'fail', r
+        assert any('n_tok' in x for x in r['problems']), r
+        assert any('integer length' in x for x in r['problems']), r
+        assert any('not a JSON object' in x for x in r['problems']), r
+        # Booleans are not counts either.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'ppl': 30.0, 'n_tok': True, 'eval_span': 4095,
+                'truncated': False, 'n_seq': True}}}}, f)
+        r2 = A.audit_length(p)
+        assert r2['status'] == 'fail', r2
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def t_global_multiplicity_audit_basic():
     # Known BH case: p=[0.01, 0.02, 0.5] at m=3 -> q=[0.03, 0.03, 0.5].
     r = L.global_multiplicity_audit([('a', 0.01), ('b', 0.02), ('c', 0.5)])
@@ -4554,6 +4582,15 @@ def t_exact_numeric_contracts_and_fingerprint():
     obj_big = np.array([[2 ** 53], [2 ** 53 + 1]], dtype=object)
     assert DG._matrix_fingerprint(obj_big[:1]) != DG._matrix_fingerprint(obj_big[1:])
     assert DG._matrix_fingerprint(obj_big) == DG._matrix_fingerprint(obj_big.copy())
+    # Exact rationals (Decimal/Fraction) are not numbers.Real; they must not be
+    # rounded through float64 into false duplicates or false uniqueness.
+    from fractions import Fraction
+    assert L.duplicate_mask(np.array([[Decimal('1.5')], [1.5]],
+                                     dtype=object)).tolist() == [False, True]
+    assert L.duplicate_mask(np.array([[Decimal(2) ** 80], [2 ** 80]],
+                                     dtype=object)).tolist() == [False, True]
+    assert L.duplicate_mask(np.array([[Fraction(1, 3)], [1 / 3]],
+                                     dtype=object)).tolist() == [False, False]
 
 
 def t_batch_iter_minimal_corpus():
@@ -4632,8 +4669,9 @@ def t_stats_accept_numpy_scalars():
     assert L.unpaired_bootstrap_ci(np.arange(10), np.arange(1, 11)) is not None
     lo, hi, dropped = L.finite_range([
         ('int', np.int64(1)), ('f32', np.float32(2.5)),
-        ('nan', np.float64('nan')), ('bool', True)])
-    assert (lo, hi, dropped) == (1.0, 2.5, ['nan', 'bool']), (lo, hi, dropped)
+        ('nan', np.float64('nan')), ('bool', True), ('npbool', np.bool_(True))])
+    assert (lo, hi, dropped) == (1.0, 2.5, ['nan', 'bool', 'npbool']), (lo, hi, dropped)
+    assert BR.exact_signflip([np.bool_(True), np.bool_(False)]) is None
     meta = L.meta_analyze_effects([
         {'label': 'A', 'scale': 1, 'effects': np.array([1, 2, 3], dtype=np.int64), 'seeds': [0, 1, 2]},
         {'label': 'B', 'scale': 2, 'effects': np.array([2, 3, 4], dtype=np.int64), 'seeds': [0, 1, 2]},
@@ -5042,6 +5080,7 @@ def main():
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
     _check('L12 length audit fails closed on missing n_seq', t_audit_length_missing_n_seq_flag)
+    _check('L12b length audit rejects non-integer counts/keys/cells', t_audit_length_rejects_unverifiable_counts)
     _check('L13 global cross-panel multiplicity audit (exp_lib)', t_global_multiplicity_audit_basic)
     _check('L13b global audit fail-closed rules', t_global_multiplicity_audit_fail_closed)
     _check('L13c build_report twin matches exp_lib audit', t_global_multiplicity_twin_consistency)
