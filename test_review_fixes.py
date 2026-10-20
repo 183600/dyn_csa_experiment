@@ -2563,6 +2563,39 @@ def t_baseline_tuning_audit():
 
 
 
+def t_tuning_grid_boundary_adequacy():
+    # Equal search is not enough if the winner sits on the edge of the grid:
+    # the true optimum may be outside the searched range.
+    trials = [
+        {'lr': 0.0001, 'weight_decay': 0.1, 'warmup': 50},
+        {'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 50},
+        {'lr': 0.001, 'weight_decay': 0.1, 'warmup': 50},
+    ]
+    def _art(selected_i, ppls):
+        rows = [{'config': dict(c), 'ppl': p} for c, p in zip(trials, ppls)]
+        best = rows[selected_i]
+        return {'selection_metric': 'ppl', 'selection_split': 'validation',
+                'direction': 'lower_is_better',
+                'arms': {'a': {'trials': rows, 'selected': dict(best['config']),
+                               'selected_metric_value': best['ppl']}}}
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['a'], trials=trials,
+                    search_seeds=[], final_seeds=[])
+    edge = L.baseline_tuning_audit(_art(2, [10.0, 9.0, 8.0]), protocol=protocol)
+    assert edge['tuning_verified'] is True, edge
+    assert edge['grid_adequacy'] == 'warn', edge
+    assert edge['grid_boundary_hits'] == ['a:lr'], edge
+    assert edge['grid_coverage']['a']['lr']['position'] == 2, edge['grid_coverage']
+    assert any('boundary of the declared search grid' in w for w in edge['warnings']), edge
+    inside = L.baseline_tuning_audit(_art(1, [10.0, 8.0, 9.0]), protocol=protocol)
+    assert inside['grid_adequacy'] == 'ok' and not inside['grid_boundary_hits'], inside
+    # A selected value outside the declared levels is not a tuned winner.
+    outside = _art(1, [10.0, 8.0, 9.0])
+    outside['arms']['a']['selected'] = {'lr': 0.002, 'weight_decay': 0.1, 'warmup': 50}
+    outside['arms']['a']['trials'].append({'config': dict(outside['arms']['a']['selected']), 'ppl': 7.0})
+    outside['arms']['a']['selected_metric_value'] = 7.0
+    ro = L.baseline_tuning_audit(outside, protocol=protocol)
+    assert ro['tuning_verified'] is False and any('outside the declared trial levels' in p for p in ro['problems']), ro
+
 def t_baseline_multi_seed_selection_audit():
     trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
 
@@ -6138,6 +6171,7 @@ def main():
     _check('H1 hypothesis direction conflict', t_hypothesis_direction_conflict)
     _check('H2 metric policy + macro/micro/weighted F1 + PR/ROC-AUC', t_metric_policy_and_classification_metrics)
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
+    _check('H3a tuning grid boundary/coverage adequacy', t_tuning_grid_boundary_adequacy)
     _check('H3a multi-seed selection + equal search-seed audit', t_baseline_multi_seed_selection_audit)
     _check('H3b tuning driver selects on the multi-seed mean', t_baseline_tuning_driver_multiseed_selection)
     _check('H3c search/final seed partition + inherited tuning coverage', t_baseline_seed_partition_and_coverage_audit)

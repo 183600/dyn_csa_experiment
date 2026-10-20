@@ -11425,13 +11425,23 @@ BASELINE_TUNING_PROTOCOL = {
     # they intervene on.  The audit resolves coverage through this map.
     'inherits_tuning': {'csa_fixed_rope_randidx': 'csa_fixed_rope',
                         'csa_fixed_rope_allblocks': 'csa_fixed_rope'},
+    # A coarse one-factor-at-a-time grid can crown a config that only looks
+    # best because the true optimum lies outside the searched range.  Keep the
+    # original four trials in the same order (historical artifacts remain a
+    # declared subset) but bracket the learning rate on both sides and widen
+    # the weight-decay/warmup coverage.  The grid-coverage audit below warns
+    # when a selected value sits on the boundary.
     'trials': [
         {'lr': 0.0001, 'weight_decay': 0.1, 'warmup': 50},
         {'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 50},
         {'lr': 0.0003, 'weight_decay': 0.05, 'warmup': 50},
         {'lr': 0.0003, 'weight_decay': 0.1, 'warmup': 100},
+        {'lr': 0.00005, 'weight_decay': 0.1, 'warmup': 50},
+        {'lr': 0.0006, 'weight_decay': 0.05, 'warmup': 50},
+        {'lr': 0.0002, 'weight_decay': 0.2, 'warmup': 100},
+        {'lr': 0.0003, 'weight_decay': 0.01, 'warmup': 100},
     ],
-    'note': 'Every arm gets the same declared trials, the same search-seed set and the same selection split. Selection uses TOKEN-POOLED validation PPL over a deterministic selection row fold, averaged across search_seeds (std recorded); a single-seed draw can win on noise. The final tuned contrast is measured on the DISJOINT evaluation row fold, so neither the hyper-parameters nor their reported estimate re-use the same validation documents. The search and final SEED partitions are also disjoint (search 100-102, final 0-7); 8 final seeds are the smallest n whose minimum attainable Holm p for the m=4 tuned family is below alpha. Final records keep the full-validation PPL for context but the contrast uses the held-out row fold. A tuning trial may never read the held-out test split; test is used once after selection. Contrasts are declared per parameter-matching group (each group\'s method_arm vs the other arms in that group), and unmeasurable declared pairs stay in the Holm family with p=1 instead of shrinking it. The rope group covers the frozen v12 confirmatory arms: without equal-search evidence for csa_fixed_rope/full_rope, the confirmatory comparison cannot be quoted as "beats a tuned baseline" — it is only a comparison at the frozen default hyperparameters.',
+    'note': 'The declared grid brackets the learning rate on both sides of the historical best (5e-5 to 6e-4) and varies weight decay from 0.01 to 0.2; grid-coverage auditing flags a selected config that sits on a boundary, which means the search range is too narrow. Every arm gets the same declared trials, the same search-seed set and the same selection split. Selection uses TOKEN-POOLED validation PPL over a deterministic selection row fold, averaged across search_seeds (std recorded); a single-seed draw can win on noise. The final tuned contrast is measured on the DISJOINT evaluation row fold, so neither the hyper-parameters nor their reported estimate re-use the same validation documents. The search and final SEED partitions are also disjoint (search 100-102, final 0-7); 8 final seeds are the smallest n whose minimum attainable Holm p for the m=4 tuned family is below alpha. Final records keep the full-validation PPL for context but the contrast uses the held-out row fold. A tuning trial may never read the held-out test split; test is used once after selection. Contrasts are declared per parameter-matching group (each group\'s method_arm vs the other arms in that group), and unmeasurable declared pairs stay in the Holm family with p=1 instead of shrinking it. The rope group covers the frozen v12 confirmatory arms: without equal-search evidence for csa_fixed_rope/full_rope, the confirmatory comparison cannot be quoted as "beats a tuned baseline" — it is only a comparison at the frozen default hyperparameters.',
 }
 
 # 最简单基线协议（先立地板，再谈复杂模型）：语言模型的 trivial floor 是
@@ -13075,7 +13085,72 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     _grid_complete = None
     if signatures and declared:
         _grid_complete = all(set(sig) == declared for sig in signatures.values())
+    # Grid-coverage adequacy: an equal search can still be an inadequate one.
+    # If the selected learning rate / weight decay sits on the minimum or
+    # maximum declared level, the optimum may lie outside the searched range;
+    # a single level per knob cannot show that the optimum is bracketed.
+    _grid_levels = {}
+    for _kn in ('lr', 'weight_decay', 'warmup'):
+        _vals = []
+        for _t in (protocol.get('trials') or []):
+            if not isinstance(_t, dict):
+                continue
+            _f = _finite_scalar(_t.get(_kn))
+            if _f is not None and _f not in _vals:
+                _vals.append(_f)
+        if _vals:
+            _grid_levels[_kn] = sorted(_vals)
+    grid_coverage = {}
+    _boundary_hits = []
+    _coarse = []
+    for arm, entry in arms.items():
+        if not isinstance(entry, dict):
+            continue
+        chosen = entry.get('selected') or entry.get('selected_config')
+        if not isinstance(chosen, dict):
+            continue
+        per_knob = {}
+        for _kn, _levels in _grid_levels.items():
+            _sel = _finite_scalar(chosen.get(_kn))
+            if _sel is None:
+                continue
+            _pos = None
+            for _i, _v in enumerate(_levels):
+                if abs(float(_v) - _sel) <= 1e-12 * max(1.0, abs(_sel)):
+                    _pos = _i
+                    break
+            if _pos is None:
+                problems.append(f'{arm}: selected {_kn}={_sel} is outside the declared trial levels {_levels}')
+                per_knob[_kn] = {'selected': _sel, 'levels': _levels,
+                                 'n_levels': len(_levels), 'position': None,
+                                 'at_boundary': None, 'outside_grid': True}
+                continue
+            _at_boundary = bool(len(_levels) >= 3 and _pos in (0, len(_levels) - 1))
+            per_knob[_kn] = {'selected': _sel, 'levels': _levels,
+                             'n_levels': len(_levels), 'position': _pos,
+                             'at_boundary': _at_boundary, 'outside_grid': False}
+            if _at_boundary:
+                _boundary_hits.append(f'{arm}:{_kn}')
+        grid_coverage[arm] = per_knob
+    for _kn, _levels in _grid_levels.items():
+        if _kn == 'lr' and 0 < len(_levels) < 3:
+            _coarse.append(f'{_kn} has only {len(_levels)} level(s)')
+    if _boundary_hits:
+        warnings.append('selected hyperparameter(s) sit on the boundary of the declared search grid ('
+                        + ', '.join(_boundary_hits) + ') — the optimum may lie outside the searched range; '
+                        'extend the grid and re-run the equal search before calling this baseline tuned')
+    if _coarse:
+        warnings.append('the declared search grid is coarse: ' + '; '.join(_coarse)
+                        + ' — a single level cannot show that the optimum is bracketed')
+    _grid_adequacy = 'ok'
+    if _boundary_hits or _coarse:
+        _grid_adequacy = 'warn'
+    if not _grid_levels:
+        _grid_adequacy = 'incomplete'
+        warnings.append('the tuning protocol declares no numeric trial levels, so grid adequacy is unverifiable')
     out = {'status': 'ok' if not problems else 'fail', 'tuning_verified': not problems,
+           'grid_levels': _grid_levels, 'grid_coverage': grid_coverage,
+           'grid_boundary_hits': _boundary_hits, 'grid_adequacy': _grid_adequacy,
            'selection_metric': metric, 'selection_split': split,
            'n_trials': n_trials, 'same_search_space': (len(set(signatures.values())) <= 1) if signatures else None,
            'search_seeds': search_seeds_seen if search_seeds_seen is not None else (_declared_ss and list(_declared_ss)),
