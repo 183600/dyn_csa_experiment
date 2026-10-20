@@ -1492,6 +1492,12 @@ def t_training_knobs_in_resume_fingerprint():
     _de2 = L._run_fp(dict(cfg, data_extra={'n_pairs': 8}), 8, 1, 1, 8, 16, tr, va)
     assert _de1 != _de2 and '_de' in _de1, (_de1, _de2)
     assert L._run_fp(dict(cfg), 8, 1, 1, 8, 16, tr, va) == fp1, 'unset data_extra must keep legacy fingerprints stable'
+    # Early stopping changes the completed token budget, so the policy must
+    # invalidate a resumed cell (and be part of the record's recipe).
+    _es1 = L._run_fp(dict(cfg, early_stop_patience=2), 8, 1, 1, 8, 16, tr, va)
+    _es2 = L._run_fp(dict(cfg, early_stop_patience=3), 8, 1, 1, 8, 16, tr, va)
+    assert _es1 != _es2 and _es1 != fp1 and '_esp2' in _es1, (_es1, _es2, fp1)
+    assert L._run_fp(dict(cfg), 8, 1, 1, 8, 16, tr, va) == fp1, 'unset early stop must keep legacy fingerprints stable'
 
 
 def t_controlled_variables_all_seed_records():
