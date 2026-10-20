@@ -4435,6 +4435,15 @@ def t_param_and_compute_control_detail():
     assert L._param_capacity_controlled(L._param_control_detail(partial, 'a', 'b')) is None
     c = L._compute_control_detail(recs, 'a', 'b')
     assert c['compute_matched'] is False and c['more_compute_arm'] == 'b', c
+    # Compute control consumes exact token counts: a fractional/bool count is
+    # not a valid denominator, so the comparison is unverifiable rather than
+    # silently using 100.5 (or True->1) tokens.
+    for _bad_tok in (100.5, True, float('nan')):
+        frac = {('a', 'p', 0): {'params': 1000, 'train_time_s': 10.0, 'tokens_seen': _bad_tok},
+                ('b', 'p', 0): {'params': 1000, 'train_time_s': 20.0, 'tokens_seen': _bad_tok}}
+        _c = L._compute_control_detail(frac, 'a', 'b')
+        assert _c['compute_matched'] is None, (_c, _bad_tok)
+        assert _c['time_ratio_a_over_b'] is None and _c['proxy_ratio_a_over_b'] is None, _c
     assert abs(c['time_ratio_a_over_b'] - 0.5) < 1e-12, c
     # A significant contrast whose extra compute favours the winner is
     # system-level, not a verified mechanism.

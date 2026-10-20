@@ -13211,13 +13211,14 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
         for (v, _t, _s), r in recs.items():
             if v != arm or not isinstance(r, dict):
                 continue
-            tt, tok = r.get('train_time_s'), r.get('tokens_seen')
-            if isinstance(tt, (int, float)) and isinstance(tok, (int, float)) and tt > 0 and tok > 0:
-                tpt.append(float(tt) / float(tok))
-            p = r.get('params')
-            if isinstance(p, (int, float)) and p > 0:
+            tt = _finite_scalar(r.get('train_time_s'))
+            tok = _exact_count(r.get('tokens_seen'), minimum=1)
+            if tt is not None and tt > 0.0 and tok is not None:
+                tpt.append(tt / float(tok))
+            p = _as_seed_int(r.get('params'))
+            if p is not None and p > 0:
                 par.append(float(p))
-                if isinstance(tok, (int, float)) and tok > 0:
+                if tok is not None:
                     prox.append(float(p) * float(tok))
         med = (lambda xs: float(np.median(xs)) if xs else None)
         return med(tpt), med(par), med(prox)
@@ -19435,10 +19436,10 @@ def aggregate(summary):
         print('[aggregate] WARNING: these variants hold MULTIPLE protocol groups and are reported per-group, NOT pooled across groups (pooling would fake extra seeds): ' + ', '.join((f'{v}->{t}' for v, t in sorted(_multi.items()))))
 
     def _cfg_fp(rec):
-        _p = rec.get('params')
-        try:
-            _p = int(_p) if _p is not None and (not isinstance(_p, bool)) else None
-        except (TypeError, ValueError, OverflowError):
+        # Exact integer identity: int(1000.5) would collapse a different
+        # capacity into the 1000-parameter group and pool two models as seeds.
+        _p = _as_seed_int(rec.get('params'))
+        if _p is not None and _p <= 0:
             _p = None
         return json.dumps([rec.get('run_cfg'), _p, [rec.get(k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
 
