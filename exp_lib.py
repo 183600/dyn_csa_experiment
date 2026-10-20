@@ -9014,7 +9014,7 @@ def _hyperparam_reason(ra, rb):
             return f'different hyperparams.{k} ({va!r} vs {vb!r})'
     return None
 
-_OBJECTIVE_COMPARE_KEYS = ('comp_reg_applies', 'comp_lambda_effective',
+_OBJECTIVE_COMPARE_KEYS = ('comp_reg_applies', 'comp_lambda', 'comp_lambda_effective',
                            'delta_lr_effective', 'boundary_policy', 'loss_terms')
 
 # A component ablation may deliberately change an objective term.  For the
@@ -9023,7 +9023,7 @@ _OBJECTIVE_COMPARE_KEYS = ('comp_reg_applies', 'comp_lambda_effective',
 # declared components impossible to verify.  Every other objective difference
 # remains a system-level confound.
 OBJECTIVE_INTERVENTION_KEYS = {
-    'compression_regularizer': frozenset({'comp_reg_applies',
+    'compression_regularizer': frozenset({'comp_reg_applies', 'comp_lambda',
                                           'comp_lambda_effective',
                                           'loss_terms'}),
     'task_learned_boundary': frozenset({'boundary_policy', 'loss_terms'}),

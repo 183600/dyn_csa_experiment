@@ -2341,6 +2341,13 @@ def t_objective_ablation_is_declared_not_a_confound():
         {'train_objective': {'comp_reg_applies': True}},
         {'train_objective': {'comp_reg_applies': True}})
     assert _rp and _rp.startswith('unverifiable') and _kp == [], (_rp, _kp)
+    # Same effective weight but a different configured base lambda + per-layer
+    # multiplier is still a different objective.
+    _o_scaled = dict(o_full, comp_lambda=0.2, comp_lambda_effective=0.2,
+                     comp_lambda_mults=[1.0])
+    _rs, _ks = L._objective_diff({'train_objective': o_full},
+                                 {'train_objective': _o_scaled})
+    assert _rs and 'comp_lambda' in _ks, (_rs, _ks)
     # The objective difference is the declared intervention for this module,
     # not an undeclared confound: six same-direction seeds must verify it
     # rather than downgrade it to system_level_only.
