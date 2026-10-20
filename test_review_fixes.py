@@ -7538,6 +7538,29 @@ def t_scale_meta_refuses_visible_attrition():
             raise AssertionError(f'n_planned={bad!r} was accepted')
 
 
+def t_m0_cross_scale_pairs_are_control_gated():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    fp2 = fp.replace('_lr0.0003_', '_lr0.003_')
+    knobs = L.training_knobs()
+
+    def _rec(v, seed, cfg, ppl):
+        return {'variant': v, 'seed': seed, 'run_cfg': cfg, 'steps': 1,
+                'tokens_seen': 1, 'ppl': ppl, 'train_knobs': knobs}
+    summary = {
+        'a::seed0': _rec('a', 0, fp, 10.0),
+        'a::seed1': _rec('a', 1, fp, 10.5),
+        'a::seed2': _rec('a', 2, fp, 11.0),
+        'b::seed0': _rec('b', 0, fp, 11.0),
+        'b::seed1': _rec('b', 1, fp2, 11.5),
+        'b::seed2': _rec('b', 2, fp, 12.0),
+    }
+    paired, gated = M0._paired_ppl_by_seed(summary, 'a', 'b')
+    assert sorted(paired) == [0, 2], paired
+    assert len(gated) == 1 and gated[0][0] == 1, gated
+    assert 'run_cfg' in gated[0][1], gated
+    assert paired[0] == (10.0, 11.0), paired
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -7784,6 +7807,7 @@ def main():
     _check('L33 scale corpus identity is independent of training budget', t_scale_corpus_fp_is_budget_independent)
     _check('L34 exact sign-flip floor accounts for zero ties', t_signflip_zero_ties_lower_resolution_floor)
     _check('L35 scale meta/trend refuses visible seed attrition', t_scale_meta_refuses_visible_attrition)
+    _check('L36 M0 cross-scale pairs pass the control gate', t_m0_cross_scale_pairs_are_control_gated)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

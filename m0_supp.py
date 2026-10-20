@@ -570,7 +570,7 @@ B_SCALE_DESIGN = {
 }
 
 
-def _ppl_by_seed(summary, variant):
+def _records_by_seed(summary, variant):
     out = {}
     for rec in summary.values():
         if not isinstance(rec, dict) or rec.get('variant') != variant:
@@ -583,8 +583,29 @@ def _ppl_by_seed(summary, variant):
         if seed in out:
             # aggregate would reject this; keep the analysis explicit too.
             raise ValueError(f'{variant}: duplicate measurable seed {seed}')
-        out[seed] = float(rec['ppl'])
+        out[seed] = rec
     return out
+
+
+def _paired_ppl_by_seed(summary, variant_a, variant_b):
+    """Per-seed paired PPLs that pass the SAME control gate as the audit.
+
+    Cross-scale meta-analysis is only defined on controlled within-scale
+    contrasts.  Reading `ppl` by (variant, seed) alone can pair two runs with
+    different optimizers, steps or data merely because the seed number
+    matches.  `exp_lib.pair_reason` is the project-wide gate (run_cfg,
+    train_knobs, steps/tokens); any seed it refuses is dropped and reported,
+    not silently averaged into a scale point.
+    """
+    ra, rb = _records_by_seed(summary, variant_a), _records_by_seed(summary, variant_b)
+    paired, gated = {}, []
+    for seed in sorted(set(ra) & set(rb)):
+        reason = L.pair_reason(ra[seed], rb[seed])
+        if reason:
+            gated.append((seed, reason))
+            continue
+        paired[seed] = (float(ra[seed]['ppl']), float(rb[seed]['ppl']))
+    return paired, gated
 
 
 def _panel_corpus_fp(summary, variant=None):
@@ -727,14 +748,19 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
         raw = {}
         for label, summary in sorted(summaries.items()):
             try:
-                pa, pb = _ppl_by_seed(summary, a), _ppl_by_seed(summary, b)
+                paired, gated = _paired_ppl_by_seed(summary, a, b)
             except ValueError as e:
                 print(f'[m0-analysis] {name}/{label}: {e}')
                 continue
-            common = sorted(set(pa) & set(pb))
+            if gated:
+                print(f'[m0-analysis] {name}/{label}: {len(gated)} seed(s) refused by '
+                      'the control gate (run_cfg/train_knobs/steps differ); '
+                      'the scale point uses only controlled pairs')
+            common = sorted(paired)
             if len(common) < 2:
                 continue
-            lr = L.paired_log_ratio([pa[s] for s in common], [pb[s] for s in common], seeds=common)
+            lr = L.paired_log_ratio([paired[s][0] for s in common],
+                                    [paired[s][1] for s in common], seeds=common)
             raw[label] = lr
             try:
                 _cfp = _panel_corpus_fp(summary, a)
