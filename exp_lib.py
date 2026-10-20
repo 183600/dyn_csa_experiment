@@ -9177,6 +9177,21 @@ def _percentile_ci(vals, lo=2.5, hi=97.5):
         return v[i] + (v[j] - v[i]) * (pos - i)
     return [_pct(lo), _pct(hi)]
 
+# Bootstrap draws are generated in row-chunks.  A fixed chunk of 256 draws
+# needs 256 * n_units index/count elements; for a scale-up evaluation panel
+# with millions of documents that is many GB per chunk.  Keep the historical
+# chunk size for ordinary panels, and shrink it only when the per-draw unit
+# count would otherwise exceed this element budget.
+_BOOTSTRAP_CHUNK_DRAWS = 256
+_BOOTSTRAP_CHUNK_ELEMS = 1 << 20
+
+
+def _bootstrap_draw_chunk(n_units):
+    """Maximum draws that keep one chunk under the element budget."""
+    n = max(1, int(n_units))
+    return max(1, min(_BOOTSTRAP_CHUNK_DRAWS, _BOOTSTRAP_CHUNK_ELEMS // n))
+
+
 def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     """Percentile bootstrap CI for the mean of i.i.d. units (e.g. documents).
 
@@ -9204,7 +9219,7 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
         return None
     rng = np.random.default_rng(sd)
     means = np.empty(nb, dtype=float)
-    _chunk = 256
+    _chunk = _bootstrap_draw_chunk(n)
     for _off in range(0, nb, _chunk):
         _nb = min(_chunk, nb - _off)
         _idx = rng.integers(0, n, size=(_nb, n))
@@ -9232,7 +9247,7 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
         return None
     rng = np.random.default_rng(sd)
     means = np.empty(nb, dtype=float)
-    chunk = 256
+    chunk = _bootstrap_draw_chunk(d.size)
     for off in range(0, nb, chunk):
         m = min(chunk, nb - off)
         idx = rng.integers(0, d.size, size=(m, d.size))
@@ -9252,7 +9267,9 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
         return None
     rng = np.random.default_rng(sd)
     diff = np.empty(nb, dtype=float)
-    chunk = 256
+    # Each draw materialises one index table per arm, so size the chunk from
+    # their combined unit count.
+    chunk = _bootstrap_draw_chunk(a.size + b.size)
     for off in range(0, nb, chunk):
         m = min(chunk, nb - off)
         ai = rng.integers(0, a.size, size=(m, a.size))
@@ -19297,6 +19314,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
         ids = torch.as_tensor(np.ascontiguousarray(vb[r0:r1]), dtype=torch.long, device=device)
         h = model.trunk(ids)
         row_nll = np.zeros(r1 - r0, dtype=np.float64)
+        row_n = np.zeros(r1 - r0, dtype=np.int64)
         for s0 in range(0, span, 64):
             s1 = min(s0 + 64, span)
             lg = model.head(h[:, s0:s1, :])
@@ -19309,6 +19327,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                 n_nonfinite += int((~finite).sum())
             ce_safe = torch.where(finite, ce_f, torch.zeros_like(ce_f))
             row_nll += ce_safe.double().sum(dim=1).cpu().numpy()
+            row_n += finite.sum(dim=1).cpu().numpy()
             # Entropy from one log_softmax table (no separate softmax/log
             # copies); top-k works directly on the fp32 logits.
             lg_work = lg.float()
@@ -19336,16 +19355,23 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                 _bnd = torch.zeros((_b, _s), dtype=torch.bool, device=device)
             _flat_b = bidx.reshape(-1)
             _flat_ce = ce_safe.reshape(-1).double()
+            _flat_fin = finite.reshape(-1)
             _flat_rare = rare.reshape(-1)
-            _bsum[:4] += torch.bincount(_flat_b, weights=_flat_ce, minlength=4)
-            _bcnt[:4] += torch.bincount(_flat_b, minlength=4)
-            _bsum[4] += _flat_ce[_flat_rare].sum()
-            _bcnt[4] += int(_flat_rare.sum())
-            _bsum[5] += _flat_ce[~_flat_rare].sum()
-            _bcnt[5] += int((~_flat_rare).sum())
-            _bsum[6] += _flat_ce[_bnd.reshape(-1)].sum()
-            _bcnt[6] += int(_bnd.sum())
-            n_targets += _b * _s
+            # A non-finite token is an unmeasured target: exclude it from the
+            # bucket denominators instead of counting it as CE=0, which would
+            # make a diverged evaluation look artificially good.
+            _bsum[:4] += torch.bincount(_flat_b[_flat_fin], weights=_flat_ce[_flat_fin], minlength=4)
+            _bcnt[:4] += torch.bincount(_flat_b[_flat_fin], minlength=4)
+            _sel_rare = _flat_rare & _flat_fin
+            _bsum[4] += _flat_ce[_sel_rare].sum()
+            _bcnt[4] += int(_sel_rare.sum())
+            _sel_common = (~_flat_rare) & _flat_fin
+            _bsum[5] += _flat_ce[_sel_common].sum()
+            _bcnt[5] += int(_sel_common.sum())
+            _sel_bnd = _bnd.reshape(-1) & _flat_fin
+            _bsum[6] += _flat_ce[_sel_bnd].sum()
+            _bcnt[6] += int(_sel_bnd.sum())
+            n_targets += int(_flat_fin.sum())
             # Only the chunk's top candidates enter the Python heap; the
             # per-token loop is bounded by top_tokens, not by B*T.
             _sel_n = min(int(top_tokens), _b * _s)
@@ -19374,10 +19400,13 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                     elif rec[0] > tok_heap[0][0]:
                         _heapq.heapreplace(tok_heap, rec)
             del lg, tg, ce, ce_f, ce_safe, finite, pred, margin, topi, ent
-            del bidx, rare, _bnd, _flat_b, _flat_ce
-        row_n = span
+            del bidx, rare, _bnd, _flat_b, _flat_ce, _flat_fin
         for i in range(r1 - r0):
-            n = max(1, row_n)
+            n = int(row_n[i])
+            if n <= 0:
+                # Every target in this row was unmeasured; it contributes no
+                # mean and must not enter the worst-sequence ranking as 0.
+                continue
             ce_mean = float(row_nll[i] / n)
             seq_rows.append((ce_mean, r0 + i, float(row_nll[i]), n))
         del h, ids
@@ -20869,8 +20898,9 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     ntok_col = ntok_mat.sum(axis=0)
     vals = np.empty(int(n_boot), dtype=float)
     # Multinomial bootstrap counts: a single [chunk, R] count matrix is reused
-    # across draws.
-    _chunk = 256
+    # across draws.  Size the chunk so a very large document panel does not
+    # allocate 256 * R counts at once.
+    _chunk = _bootstrap_draw_chunk(R)
     _b = 0
     while _b < int(n_boot):
         _nb = min(_chunk, int(n_boot) - _b)
@@ -20953,7 +20983,9 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     seed_logppl = None
     if rows is not None:
         per_tok = nll_mat.sum(axis=1) / np.maximum(ntok_mat.sum(axis=1), 1e-30)
-        ok = np.isfinite(per_tok) & (per_tok > 0)
+        # Cross-entropy is zero for a perfectly predicted token, so a zero
+        # log-PPL is a valid measurement (PPL=1), not a missing component.
+        ok = np.isfinite(per_tok) & (per_tok >= 0)
         if ok.sum() == S and S >= 2:
             # nll/tokens is already cross-entropy = log(PPL); do not log it a
             # second time or the reported interval is not a PPL interval.
@@ -20974,7 +21006,7 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         ntok_col = ntok_mat.sum(axis=0)
         R = int(nll_mat.shape[1])
         draws = np.empty(int(n_boot), dtype=float)
-        _chunk = 256
+        _chunk = _bootstrap_draw_chunk(R)
         _b = 0
         while _b < int(n_boot):
             _nb = min(_chunk, int(n_boot) - _b)
@@ -20984,7 +21016,7 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
             with np.errstate(divide='ignore', invalid='ignore'):
                 # nn/nt is already the pooled log-PPL (CE) of the resample.
                 lp_draw = np.where((nt > 0) & np.isfinite(nn), nn / np.maximum(nt, 1e-30), np.nan)
-                lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw > 0), lp_draw, np.nan)
+                lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw >= 0), lp_draw, np.nan)
             draws[_b:_b + _nb] = lp_draw
             _b += _nb
         draws = draws[np.isfinite(draws)]
@@ -21115,7 +21147,7 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
     out['mean_delta'] = float(np.mean(_pa[_ok] - _pb[_ok]))
     rng = np.random.default_rng(_as_seed_int(seed) if _as_seed_int(seed) is not None else 0)
     vals = np.full(int(n_boot), np.nan, dtype=float)
-    _chunk = 256
+    _chunk = _bootstrap_draw_chunk(R)
     _b = 0
     while _b < int(n_boot):
         _nb = min(_chunk, int(n_boot) - _b)

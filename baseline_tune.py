@@ -133,7 +133,7 @@ def _search_final_seeds(protocol):
     selected, not an independent estimate.  Keep the two partitions explicit
     and refuse the run when they overlap.
     """
-    def _seeds(raw):
+    def _seeds(raw, label):
         if raw is None:
             return []
         if isinstance(raw, (str, bytes)):
@@ -145,18 +145,28 @@ def _search_final_seeds(protocol):
         except TypeError:
             raise ValueError(f'seed list must be iterable, got {raw!r}') from None
         out = []
+        seen = set()
         for raw_seed in vals:
             seed = L._as_seed_int(raw_seed)
             if seed is None:
                 raise ValueError(f'seeds must be integers, got {raw_seed!r}')
+            if seed in seen:
+                # Silently de-duplicating here made the declared seed count
+                # (used by the power floor) disagree with the records that
+                # actually ran.  A duplicated draw identity is a planning
+                # error, not an extra replicate.
+                raise ValueError(
+                    f'{label} contains duplicate seed {seed}; a seed identity '
+                    'contributes one paired draw and must be unique')
+            seen.add(seed)
             out.append(seed)
-        return sorted(set(out))
+        return sorted(out)
 
     raw_search = protocol.get('search_seeds')
     if raw_search is None:
         raw_search = [protocol.get('search_seed', 0)]
-    search = _seeds(raw_search)
-    final = _seeds(protocol.get('final_seeds') or [])
+    search = _seeds(raw_search, 'search_seeds')
+    final = _seeds(protocol.get('final_seeds') or [], 'final_seeds')
     if not search:
         raise ValueError('search_seeds must contain at least one seed')
     return search, final, sorted(set(search) & set(final))
@@ -462,7 +472,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         'declared_trials': len(declared_trials),
         'trials_run': len(trials),
         'search_complete': bool(len(trials) == len(declared_trials)),
-        'final_seeds': list(protocol.get('final_seeds') or []),
+        'final_seeds': list(final_seeds_declared),
         'arms': selected,
         'code': L.code_stamp(),
         'provenance': _prov_any or L.code_provenance(),
@@ -573,10 +583,12 @@ def _relaxed_pair_reason(a, b, tuned_arms):
 
 
 def _run_final(base, outdir, protocol, selected):
-    final_seeds = [int(s) for s in protocol.get('final_seeds', [])]
+    # Use the same normalised plan the tuning driver validated (integers,
+    # unique).  Reading the raw protocol here let a duplicate seed reach the
+    # runner, which would deduplicate it under the cover of the run key.
+    search_seeds, final_seeds, overlap = _search_final_seeds(protocol)
     if not final_seeds:
         raise ValueError('_run_final: final_seeds must be a non-empty declared partition')
-    search_seeds, _, overlap = _search_final_seeds(protocol)
     if final_seeds and overlap:
         raise ValueError(
             'search_seeds and final_seeds overlap on %s — final tuned records '

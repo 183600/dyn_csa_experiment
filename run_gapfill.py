@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json, math, os, shutil, statistics, subprocess, sys, time, traceback
 import copy
+import numpy as np
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -16,7 +17,9 @@ LONG_GAP_VARIANTS = ['hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn']
 _LONG_STEPS = L.RUN_LONG['steps']
 
 def _num_or_none(v):
-    if v is None or isinstance(v, bool):
+    # Booleans are flags, not counts/seed identities: float(True) == 1 would
+    # silently turn a flag into seed 1 (or a budget of one token).
+    if v is None or isinstance(v, (bool, np.bool_)):
         return None
     if isinstance(v, float):
         return int(v) if math.isfinite(v) and v.is_integer() else None

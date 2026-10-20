@@ -7210,6 +7210,99 @@ def t_methodology_gate_fail_closed_edges():
     assert any('exact positive counts' in p for p in out['problems']), out['problems']
 
 
+
+def t_baseline_seed_plan_rejects_duplicate_draws():
+    # A duplicated seed identity is a planning error, not an extra replicate.
+    # It used to be silently de-duplicated here, so the power floor could be
+    # checked against a larger n than the records that actually ran.
+    for kw in ({'search_seeds': [0, 0, 1], 'final_seeds': [2, 3]},
+               {'search_seeds': [0, 1], 'final_seeds': [2, 2]}):
+        proto = dict(L.BASELINE_TUNING_PROTOCOL, **kw)
+        try:
+            BT._search_final_seeds(proto)
+        except ValueError as e:
+            assert 'duplicate seed' in str(e), e
+        else:
+            raise AssertionError(f'duplicate declared seeds were accepted: {kw}')
+    # Unique identities are normalised once (integer strings accepted) so the
+    # driver and the audit consume the same plan.
+    search, final, overlap = BT._search_final_seeds(
+        {'search_seeds': [3, '1', 2], 'final_seeds': ['5', 4]})
+    assert search == [1, 2, 3] and final == [4, 5] and overlap == [], (search, final, overlap)
+
+
+def t_bootstrap_and_zero_ce_scaling_contract():
+    # Chunking must bound the per-chunk working set when the unit count grows;
+    # ordinary panels keep the historical 256-draw chunk exactly.
+    assert L._bootstrap_draw_chunk(100) == 256
+    assert L._bootstrap_draw_chunk(4096) == 256
+    assert L._bootstrap_draw_chunk(1 << 20) == 1
+    assert L._bootstrap_draw_chunk(1 << 30) == 1
+    # Zero cross-entropy is a valid measurement (PPL=1), not a missing
+    # component.  Filtering `> 0` made a perfectly predicted panel
+    # unverifiable and dropped the document bootstrap entirely.
+    recs = [{'variant': 'csa', 'seed': s, 'ppl': 1.0,
+             'nll_per_row': [0.0] * 4, 'n_tokens_per_row': [10] * 4}
+            for s in (0, 1, 2)]
+    r = L._combined_seed_doc_ci(recs)
+    assert r['status'] == 'ok', r
+    assert r['se_seed_logppl'] == 0.0 and r['se_doc_logppl'] == 0.0, r
+    assert r['se_combined_logppl'] == 0.0 and r['ci95_ppl'] == [1.0, 1.0], r
+
+
+def t_error_analysis_excludes_nonfinite_targets():
+    # A divergent token (non-finite CE) is an unmeasured target.  Counting it
+    # as CE=0 diluted every bucket and the pooled PPL, making a broken eval
+    # look better than a measured one.
+    vocab = 5
+
+    class _StubModel:
+        training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = bool(mode)
+            return self
+
+        def trunk(self, ids):
+            return torch.zeros((ids.shape[0], ids.shape[1], 2), dtype=torch.float32)
+
+        def head(self, h):
+            return torch.zeros((h.shape[0], h.shape[1], vocab), dtype=torch.float32)
+
+    vb = (np.arange(8, dtype=np.int64) % vocab).reshape(2, 4)
+    orig = L.F.cross_entropy
+
+    def _fake_ce(input, target, reduction='mean', **kw):
+        out = torch.ones(tuple(target.shape), dtype=torch.float32)
+        out[0, 0] = float('inf')
+        return out
+
+    L.F.cross_entropy = _fake_ce
+    try:
+        r = L.analyze_errors(_StubModel(), vb, vocab, torch.device('cpu'),
+                             top_n=2, top_tokens=2, chunk=2)
+    finally:
+        L.F.cross_entropy = orig
+    assert r['n_nonfinite_tokens'] == 1, r
+    assert r['n_targets'] == 5, r
+    assert abs(r['mean_ce'] - 1.0) < 1e-12, r
+    # Every bucket denominator excludes the unmeasured token.
+    assert sum(b['n'] for b in r['buckets'].values() if b['n']) > 0, r['buckets']
+    assert r['buckets']['position:first10%']['n'] == 1, r['buckets']
+    assert all(seq['n_tokens'] in (2, 3) for seq in r['worst_sequences']), r['worst_sequences']
+
+
+def t_gapfill_numeric_reader_rejects_booleans():
+    import run_gapfill as RG
+    for _bad in (True, False, np.bool_(True), np.bool_(False)):
+        assert RG._num_or_none(_bad) is None, _bad
+    assert RG._num_or_none(3.0) == 3 and RG._num_or_none('4') == 4
+    assert RG._num_or_none(1.5) is None
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -7445,6 +7538,10 @@ def main():
     _check('L24 build report pairs on the primary holdout estimand', t_build_report_primary_estimand)
     _check('L22b build report exact seed/parameter contracts', t_build_report_exact_seed_and_params)
     _check('L23 methodology/scale gates fail closed on malformed inputs', t_methodology_gate_fail_closed_edges)
+    _check('L25 baseline seed plans reject duplicate draws', t_baseline_seed_plan_rejects_duplicate_draws)
+    _check('L26 bootstrap chunk scaling + zero-CE measurements', t_bootstrap_and_zero_ce_scaling_contract)
+    _check('L27 error analysis excludes non-finite targets', t_error_analysis_excludes_nonfinite_targets)
+    _check('L28 gapfill numeric reader rejects booleans', t_gapfill_numeric_reader_rejects_booleans)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
