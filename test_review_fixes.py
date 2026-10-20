@@ -8208,6 +8208,26 @@ def t_open_block_resume_binds_data_fingerprints():
                           eval_fp=L._ids_fp(va.reshape(-1))) is False
 
 
+
+def t_analysis_checkpoint_carries_model_geometry():
+    import error_analysis as E
+    ids = np.arange(2048, dtype=np.int64) % 97
+    val = (np.arange(64, dtype=np.int64) % 97).reshape(2, 32)
+    with tempfile.TemporaryDirectory() as d:
+        r = L.train_variant('full', ids, val, 97, seed=0, d=32, n_layers=1,
+                            n_heads=2, d_head=16, seq_len=32, batch_size=1,
+                            steps=1, lr=1e-3, weight_decay=0.0, warmup=0,
+                            comp_lambda=0.0, eval_every=0, mlp_ratio=4.0,
+                            device=torch.device('cpu'), log_every=0,
+                            save_ckpt='final', ckpt_dir=d)
+        path = r['checkpoints']['final']['path']
+        # The standard analysis checkpoint must be loadable by error_analysis;
+        # it used to omit cfg/vocab/geometry entirely.
+        model, meta = E._load_model(path)
+        assert meta.get('cfg') is not None and meta.get('vocab') == 97, meta
+        assert meta.get('d') == 32 and meta.get('train_len') == 32, meta
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8469,6 +8489,7 @@ def main():
     _check('L43 eager_batch rejects typos/non-finite values', t_eager_batch_rejects_typos_and_nonfinite)
     _check('L44 gapfill merge refreshes/invalidates seed-derived fields', t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields)
     _check('L45 open-block resume binds data fingerprints', t_open_block_resume_binds_data_fingerprints)
+    _check('L46 analysis checkpoint carries model geometry', t_analysis_checkpoint_carries_model_geometry)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

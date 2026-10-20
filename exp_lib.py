@@ -19366,7 +19366,13 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 'extra': {'train_fp': _ids_fp(train_ids),
                           'eval_fp': _ids_fp(np.ascontiguousarray(np.asarray(val_batch)).reshape(-1)) if val_batch is not None else None,
                           'rng_fp': _rng_fp, 'params': int(n_param),
-                          'open_block_config': open_block_config(_inner_model)}})
+                          'open_block_config': open_block_config(_inner_model),
+                          # Enough geometry to rebuild the model for
+                          # post-hoc error analysis without guessing defaults.
+                          'cfg': cfgs, 'vocab': int(vocab), 'd': int(d),
+                          'n_layers': int(n_layers), 'n_heads': int(n_heads),
+                          'd_head': int(d_head), 'train_len': int(seq_len),
+                          'max_seq': int(seq_len), 'mlp_ratio': float(mlp_ratio)}})
             print(f'  [ckpt] saved {tag} checkpoint {path} (step={step_no}, val_ppl={val_ppl})')
         except Exception as _se:
             print(f'[ckpt] WARNING: could not save {tag} checkpoint ({type(_se).__name__}: {_se}); the run continues, but this weight is unavailable for post-hoc analysis')
