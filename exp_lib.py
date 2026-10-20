@@ -14710,9 +14710,11 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                 report['warnings'].append(
                                     'nested simple-baseline holdout row fingerprint differs from the panel holdout rows — the floor and the panel scored different validation documents; the beats-floor comparison is refused')
                         else:
+                            _comparable = False
                             report['warnings'].append(
                                 'nested simple-baseline holdout rows cannot be matched to the panel '
-                                '(missing evaluation_row_fp or panel holdout_row_fp); the beats-floor comparison is unverified')
+                                '(missing evaluation_row_fp or panel holdout_row_fp) — the floor and '
+                                'the panel may use different estimands; the beats-floor comparison is refused')
                     elif _sb_eval_fp and _panel_eval_fps:
                         if _sb_eval_fp not in _panel_eval_fps:
                             _comparable = False
