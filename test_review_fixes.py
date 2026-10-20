@@ -2333,6 +2333,14 @@ def t_objective_ablation_is_declared_not_a_confound():
     assert o_none['comp_reg_configured_layers'] == o_full['comp_reg_configured_layers'] == 2, (o_full, o_none)
     _r, _keys = L._objective_diff({'train_objective': o_full}, {'train_objective': o_none})
     assert _r and _keys == ['comp_reg_applies', 'comp_lambda_effective', 'loss_terms'], (_r, _keys)
+    # A descriptor that omits fields is unverifiable, not equal: comparing
+    # two `.get()` misses would make an empty object look matched.
+    _ru, _ku = L._objective_diff({'train_objective': {}}, {'train_objective': {}})
+    assert _ru and _ru.startswith('unverifiable') and _ku == [], (_ru, _ku)
+    _rp, _kp = L._objective_diff(
+        {'train_objective': {'comp_reg_applies': True}},
+        {'train_objective': {'comp_reg_applies': True}})
+    assert _rp and _rp.startswith('unverifiable') and _kp == [], (_rp, _kp)
     # The objective difference is the declared intervention for this module,
     # not an undeclared confound: six same-direction seeds must verify it
     # rather than downgrade it to system_level_only.

@@ -9038,6 +9038,15 @@ def _objective_diff(ra, rb):
         return 'unverifiable train_objective (only one record carries the objective descriptor)', []
     if not isinstance(oa, dict) or not isinstance(ob, dict):
         return 'unverifiable train_objective (malformed descriptor)', []
+    # An empty/partial descriptor cannot attest equality: a `.get()` on a
+    # missing key returns None on BOTH sides and would otherwise look like a
+    # matched objective.  Old descriptors that only carry a subset are
+    # unverifiable, not a pass.
+    _miss_a = [k for k in _OBJECTIVE_COMPARE_KEYS if k not in oa]
+    _miss_b = [k for k in _OBJECTIVE_COMPARE_KEYS if k not in ob]
+    if _miss_a or _miss_b:
+        _miss = sorted(set(_miss_a) | set(_miss_b))
+        return ('unverifiable train_objective (descriptor misses ' + ', '.join(_miss) + ')', [])
     diffs = [k for k in _OBJECTIVE_COMPARE_KEYS if oa.get(k) != ob.get(k)]
     return (('objective differs: ' + ', '.join(diffs)) if diffs else None), diffs
 
