@@ -1649,11 +1649,13 @@ def _row_keys(X):
         # whole object row through float64 (the generic fallback below) would
         # collapse distinct integers above 2**53 into false duplicates, which
         # can turn a clean split into a false leakage alarm (or, after
-        # rounding, hide a genuine duplicate).  When every scalar is a real
-        # number, build an exact canonical token per value: integers keep all
-        # their bits, integral floats compare equal to the same integer
-        # (matching Python/NumPy equality), -0.0 is normalised, and NaN/Inf
-        # remain distinct except that all NaNs are one missing-like key.
+        # rounding, hide a genuine duplicate).  Build an exact canonical token
+        # per value: integers keep all their bits, integral floats compare
+        # equal to the same integer (matching Python/NumPy equality), -0.0 is
+        # normalised, and NaN/Inf remain distinct except that all NaNs are one
+        # missing-like key.  Non-numeric objects (strings/categoricals) get a
+        # type-qualified representation key; they must not crash the generic
+        # float fallback or compare equal to their numeric spelling.
         _flat = src.reshape(-1).tolist()
 
         def _real_key(v):
@@ -1665,6 +1667,11 @@ def _row_keys(X):
                 return b'I' + str(int(v)).encode('ascii')
             if isinstance(v, numbers.Integral):
                 return b'I' + str(int(v)).encode('ascii')
+            if isinstance(v, (str, bytes)):
+                # Numeric strings are categorical labels, not numbers: '1'
+                # and 1 are different row values.
+                return (b'V' + type(v).__name__.encode('ascii')
+                        + b':' + repr(v).encode('utf-8', 'backslashreplace'))
             # Exact rationals (Fraction, Decimal, ...) keep numerator and
             # denominator instead of being rounded through float64.  Decimal
             # is not a numbers.Real subclass, so it would otherwise fall
@@ -1679,7 +1686,13 @@ def _row_keys(X):
                     return (b'I' + str(n).encode('ascii') if d == 1
                             else b'R' + str(n).encode('ascii') + b'/'
                             + str(d).encode('ascii'))
-            f = float(v)
+            try:
+                f = float(v)
+            except (TypeError, ValueError, OverflowError):
+                # A categorical/string value has no numeric identity.  Keep
+                # its type in the key so string '1' is not the integer 1.
+                return (b'V' + type(v).__name__.encode('utf-8', 'backslashreplace')
+                        + b':' + repr(v).encode('utf-8', 'backslashreplace'))
             if math.isnan(f):
                 return b'Fnan'
             if math.isinf(f):
@@ -1699,22 +1712,16 @@ def _row_keys(X):
                 'duplicate detection needs real-valued rows; casting complex '
                 'rows to float64 would silently discard the imaginary part')
 
-        def _is_numeric_object(v):
-            if v is None or isinstance(v, (bool, np.bool_)):
-                return True
-            return isinstance(v, numbers.Number) or hasattr(v, 'as_integer_ratio')
-
-        if all(_is_numeric_object(v) for v in _flat):
-            _step = _hash_row_block(int(src.shape[1]), 1 << 16)
-            keys = []
-            for start in range(0, src.shape[0], _step):
-                for row in src[start:start + _step].tolist():
-                    h = hashlib.blake2b(digest_size=8)
-                    for v in row:
-                        h.update(_real_key(v))
-                        h.update(b'|')
-                    keys.append(h.digest())
-            return keys
+        _step = _hash_row_block(int(src.shape[1]), 1 << 16)
+        keys = []
+        for start in range(0, src.shape[0], _step):
+            for row in src[start:start + _step].tolist():
+                h = hashlib.blake2b(digest_size=8)
+                for v in row:
+                    h.update(_real_key(v))
+                    h.update(b'|')
+                keys.append(h.digest())
+        return keys
     # Integer/bool/datetime/timedelta rows are hashed in their own dtype.
     # Converting them to float64 first collapses distinct int64 values above
     # 2**53 (and nanosecond timestamps) into false duplicates.

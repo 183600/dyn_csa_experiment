@@ -4772,6 +4772,13 @@ def t_data_quality_exact_integer_and_complex_rows():
         pass
     else:
         raise AssertionError('complex duplicate detection must be rejected')
+    # Object/categorical string rows must be hashable without the numeric
+    # fallback crashing, and a numeric spelling is not its numeric twin.
+    cats = np.array([['a'], ['b'], ['a']], dtype=object)
+    assert L.duplicate_mask(cats).tolist() == [False, False, True], cats
+    mixed = np.array([[1], ['1'], [1.0]], dtype=object)
+    assert L.duplicate_mask(mixed).tolist() == [False, False, True], mixed
+    assert L.duplicate_mask(np.array([['1'], ['1.0']], dtype=object)).tolist() == [False, False]
 
 
 def t_exact_numeric_contracts_and_fingerprint():
