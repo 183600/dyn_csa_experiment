@@ -3973,6 +3973,20 @@ def t_simple_baseline_ngram_and_audit():
     rbc = L.simple_baseline_audit(bad_cell, protocol=proto)
     assert rbc['baseline_verified'] is False and any(
         'full_factorial' in p and 'not run' in p for p in rbc['problems']), rbc
+    # A cell outside the declared search space is not equal-search under ANY
+    # design (hand-designed grids included), and the declared per-arm order
+    # must be the model that actually ran.
+    outside = json.loads(json.dumps(art))
+    outside['baselines']['unigram']['trials'][0]['config']['alpha'] = 99.0
+    rout = L.simple_baseline_audit(outside, protocol=dict(
+        proto, search_design='hand_designed_grid'))
+    assert rout['baseline_verified'] is False and any(
+        'outside the declared search grid' in p for p in rout['problems']), rout
+    wrong_order = json.loads(json.dumps(art))
+    wrong_order['baselines']['bigram']['order'] = 1
+    rord = L.simple_baseline_audit(wrong_order, protocol=proto)
+    assert rord['baseline_verified'] is False and any(
+        'differs from the declared order' in p for p in rord['problems']), rord
     bad_design = dict(proto, search_design='whatever')
     rbd = L.simple_baseline_audit(art, protocol=bad_design)
     assert rbd['baseline_verified'] is False and any(

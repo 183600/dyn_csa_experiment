@@ -12812,37 +12812,75 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         if chosen_f > min(vals) + 1e-12:
             problems.append(f'{arm}: selected trial is not the minimum-{metric} trial')
         # Declared search design: full factorial must actually be complete.
-        _meta = (_declared or {}).get(arm) if isinstance(_declared, dict) else {}
-        _order = _as_seed_int((_meta or {}).get('order', 1))
+        # A corpus whose protocol does not declare this arm's grid stays
+        # unverifiable (legacy artifacts), not silently "complete".
+        _declared_arm = isinstance(_declared, dict) and arm in _declared
+        _meta = _declared.get(arm) if _declared_arm else {}
+        _order = (_as_seed_int((_meta or {}).get('order', 1))
+                  if _declared_arm else None)
+        if _declared_arm and _order not in (1, 2):
+            problems.append(
+                f'{arm}: declared model order {(_meta or {}).get("order")!r} is '
+                'not an integer 1 or 2')
+        # The arm identity is a DISCRETE choice, not only part of a config
+        # string.  An artifact whose per-arm order (or selected config order)
+        # disagrees with the declared order ran a different count model.
+        if _declared_arm and _order in (1, 2):
+            _entry_order = _as_seed_int(entry.get('order'))
+            if entry.get('order') is not None and _entry_order != _order:
+                problems.append(
+                    f'{arm}: entry order {entry.get("order")!r} differs from the '
+                    f'declared order {_order}')
+            if 'order' in chosen:
+                _chosen_order = _as_seed_int(chosen.get('order'))
+                if _chosen_order != _order:
+                    problems.append(
+                        f'{arm}: selected config order {chosen.get("order")!r} '
+                        f'differs from the declared order {_order}')
         _grid = (protocol.get('grids') or {}).get(arm) or {}
+        _grid_declared = (isinstance(_grid, dict) and 'alpha' in _grid
+                          and _order in (1, 2))
         _alphas = list(_grid.get('alpha') or [0.1])
         _interps = (list(_grid.get('interpolation') or [1.0])
                     if _order == 2 else [0.0])
-        _expected = set()
-        for _a in _alphas:
-            for _lam in _interps:
-                _cfg = {'order': _order, 'alpha': float(_a)}
-                if _order == 2:
-                    _cfg['interpolation'] = float(_lam)
-                _expected.add(json.dumps(_cfg, sort_keys=True, default=str))
-        _actual = set(cfgs)
-        _missing_cells = sorted(_expected - _actual)
-        _extra_cells = sorted(_actual - _expected)
-        _grid_coverage[arm] = {'expected_cells': len(_expected),
-                               'observed_cells': len(_actual),
-                               'missing_cells': _missing_cells,
-                               'extra_cells': _extra_cells,
-                               'complete': not _missing_cells and not _extra_cells}
-        if _search_design == 'full_factorial':
-            if _missing_cells:
+        if _grid_declared:
+            _expected = set()
+            for _a in _alphas:
+                for _lam in _interps:
+                    _cfg = {'order': _order, 'alpha': float(_a)}
+                    if _order == 2:
+                        _cfg['interpolation'] = float(_lam)
+                    _expected.add(json.dumps(_cfg, sort_keys=True, default=str))
+            _actual = set(cfgs)
+            _missing_cells = sorted(_expected - _actual)
+            _extra_cells = sorted(_actual - _expected)
+            _grid_coverage[arm] = {'expected_cells': len(_expected),
+                                   'observed_cells': len(_actual),
+                                   'missing_cells': _missing_cells,
+                                   'extra_cells': _extra_cells,
+                                   'complete': not _missing_cells and not _extra_cells}
+            # A trial outside the declared search space is not an equal-search
+            # result under ANY design, not only a full-factorial claim.
+            if _extra_cells:
+                problems.append(
+                    f'{arm}: trials include {len(_extra_cells)} cell(s) outside '
+                    f'the declared search grid ({_extra_cells[:4]})')
+            if _search_design == 'full_factorial' and _missing_cells:
                 problems.append(
                     f'{arm}: declares a full_factorial count-model search but '
                     f'{len(_missing_cells)} declared cell(s) were not run '
                     f'({_missing_cells[:4]})')
-            if _extra_cells:
+        else:
+            _grid_coverage[arm] = {'expected_cells': None,
+                                   'observed_cells': len(set(cfgs)),
+                                   'missing_cells': None,
+                                   'extra_cells': None,
+                                   'complete': None,
+                                   'declared': False}
+            if _declared_arm and _search_design == 'full_factorial':
                 problems.append(
-                    f'{arm}: trials include {len(_extra_cells)} cell(s) outside '
-                    f'the declared full-factorial grid ({_extra_cells[:4]})')
+                    f'{arm}: declares a full_factorial count-model search but '
+                    'the protocol declares no alpha grid for this arm')
         nt = set()
         for t in trials:
             if not isinstance(t, dict) or t.get('n_tokens') is None:
