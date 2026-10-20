@@ -4601,6 +4601,52 @@ def t_classification_positive_label_and_rare_floor():
         'missing' in w and 'f1_micro' in w for w in _mca['warnings']), _mca
 
 
+def t_binary_threshold_and_calibration_contract():
+    y = np.array([0] * 90 + [1] * 10)
+    score = np.array([0.1] * 90 + [0.4] * 5 + [0.9] * 5)
+    curve = L.binary_threshold_curve(y, score, positive_label=1)
+    assert abs(curve['best_threshold'] - 0.4) < 1e-12, curve['best_threshold']
+    assert abs(curve['best_value'] - 1.0) < 1e-12, curve['best_value']
+    assert abs(curve['at_default_0.5']['f1'] - 2.0 / 3.0) < 1e-12, curve['at_default_0.5']
+    assert curve['threshold_sensitivity'] > 0.3, curve
+    sel = L.select_binary_threshold(y, score, positive_label=1)
+    assert sel['threshold'] == 0.4 and sel['value'] == 1.0, sel
+    assert sel['chance_f1_at_default_rule'] == sel['prevalence'] == 0.1, sel
+    # The default cut is recorded rather than silently assumed.
+    m = L.classification_metrics(y, y_score=score, labels=[0, 1], threshold_sweep=True)
+    assert m['decision_threshold'] == 0.5 and m['decision_threshold_source'] == 'default_0.5', m
+    assert abs(m['f1_primary'] - 2.0 / 3.0) < 1e-12, m
+    assert m['threshold_selection']['threshold'] == 0.4, m['threshold_selection']
+    assert 0.0 <= m['brier_score'] <= 1.0 and 0.0 <= m['ece'] <= 1.0, m
+    assert m['score_orientation_warning'] is None, m
+    mt = L.classification_metrics(y, y_score=score, labels=[0, 1],
+                                  threshold=0.4)
+    assert mt['decision_threshold_source'] == 'caller_threshold'
+    assert abs(mt['f1_primary'] - 1.0) < 1e-12, mt
+    # A reversed score column is a labelling/orientation error, not a weak model.
+    mi = L.classification_metrics(y, y_score=1.0 - score, labels=[0, 1])
+    assert mi['roc_auc'] == 0.0 and mi['score_orientation_warning'], mi
+    # Record-level contract: a tuned threshold must be validation-selected and
+    # named; an out-of-range cut or a misstated PR-AUC floor is invalid.
+    good = dict(m, variant='g', task='binary_classification',
+                prevalence={'0': 0.9, '1': 0.1})
+    assert L.metric_policy_audit({'g': good})['status'] == 'ok', L.metric_policy_audit({'g': good})
+    tuned = dict(good, decision_threshold=0.4, decision_threshold_source='validation_selection',
+                 threshold_selection_split='test', threshold_selection_metric='f1')
+    bad = L.metric_policy_audit({'g': tuned})
+    assert bad['status'] == 'warn' and any('leakage' in w for w in bad['warnings']), bad
+    bad_floor = dict(good, pr_auc_prevalence=0.5)
+    bf = L.metric_policy_audit({'g': bad_floor})
+    assert bf['status'] == 'warn' and any('floor is misstated' in w for w in bf['warnings']), bf
+    no_src = dict(good)
+    no_src.pop('decision_threshold_source')
+    ns = L.metric_policy_audit({'g': no_src})
+    assert ns['status'] == 'warn' and any('decision_threshold_source' in w for w in ns['warnings']), ns
+    inv = dict(good, roc_auc=0.2)
+    iv = L.metric_policy_audit({'g': inv})
+    assert iv['status'] == 'warn' and any('below chance' in w for w in iv['warnings']), iv
+
+
 def t_hypothesis_audit_completeness_and_metric_alignment():
     good = L.hypothesis_audit(L.HYPOTHESIS_DESIGN, 'component')
     assert good['status'] == 'ok' and not good['invalid'], good
@@ -8901,6 +8947,7 @@ def main():
     _check('H4a count-model fit budget is bounded + disclosed', t_simple_baseline_fit_budget_is_bounded_and_disclosed)
     _check('H4b count-model floor uses nested selection/holdout rows', t_simple_baseline_nested_rows_and_fingerprint)
     _check('H5 positive-label / rare-positive PR-AUC / macro-F1 averaging', t_classification_positive_label_and_rare_floor)
+    _check('H5a binary threshold selection + calibration + threshold audit', t_binary_threshold_and_calibration_contract)
     _check('H6 hypothesis completeness + metric alignment + direction=0', t_hypothesis_audit_completeness_and_metric_alignment)
     _check('H7 simple-baseline driver uses the panel corpus', t_simple_baseline_driver_serves_the_panel_corpus)
     _check('H7a floor contrast is seed-level and significance-aware', t_simple_floor_contrast_is_significance_aware)

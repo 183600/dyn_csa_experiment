@@ -13148,10 +13148,18 @@ METRIC_POLICY = {
         'primary_when_extreme_imbalance': 'pr_auc',
         'extreme_imbalance_threshold': 1e-3,
         'direction': 'higher_is_better',
-        'secondary': ['precision', 'recall', 'pr_auc', 'roc_auc', 'balanced_accuracy'],
+        'secondary': ['precision', 'recall', 'pr_auc', 'roc_auc', 'balanced_accuracy',
+                      'brier_score', 'ece'],
         'imbalance': 'report prevalence; when positives are rarer than 1:1000 the primary endpoint is PR-AUC, not F1 or ROC-AUC',
         'aggregation': 'binary',
-        'note': 'F1 must state the averaging rule; for binary tasks it is the positive-class F1. For prevalence < 1e-3, PR-AUC is the primary ranking endpoint.',
+        'decision_threshold': 0.5,
+        'decision_threshold_policy': ('Report the cut with every F1/precision/recall/balanced '
+                                      'accuracy. The default 0.5 is a reporting convention, not a '
+                                      'tuned optimum; a tuned cut must be selected on validation '
+                                      'rows disjoint from evaluation and recorded as '
+                                      'decision_threshold_source="validation_selection" with its '
+                                      'split and metric. PR-AUC/ROC-AUC/Brier/ECE are threshold-free.'),
+        'note': 'F1 must state the averaging rule; for binary tasks it is the positive-class F1. For prevalence < 1e-3, PR-AUC is the primary ranking endpoint. Calibration (Brier/ECE) is secondary: a good ranking must not be mistaken for usable probabilities.',
     },
     'multiclass_classification': {
         'task': 'multiclass_classification',
@@ -13372,7 +13380,151 @@ def _binary_average_precision(y, score):
     recall = tp / max(n_pos, 1)
     return float(np.sum(np.diff(np.r_[0.0, recall]) * precision))
 
-def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, positive_label=None):
+_BINARY_THRESHOLD_METRICS = ('f1', 'balanced_accuracy', 'youden_j')
+_BINARY_THRESHOLD_SOURCES = ('default_0.5', 'caller_threshold', 'caller_predictions',
+                             'argmax', 'validation_selection', 'unrecorded')
+
+
+def _binary_positive_vector(y_true, positive_label=None):
+    y = np.asarray(y_true).ravel()
+    uniq = np.unique(y)
+    if uniq.size != 2:
+        raise ValueError(f'binary threshold analysis needs exactly two observed classes, got {uniq.tolist()}')
+    if positive_label is None:
+        pos = uniq[-1]
+    else:
+        hits = np.where(uniq == positive_label)[0]
+        if hits.size == 0:
+            raise ValueError(f'positive_label={positive_label!r} is not in the observed labels {uniq.tolist()}')
+        pos = uniq[int(hits[0])]
+    return (y == pos).astype(np.int64), pos, uniq
+
+
+def _binary_threshold_metrics(y_bin, score, threshold):
+    pred = np.asarray(score) >= float(threshold)
+    tp = int(np.sum(pred & (y_bin == 1)))
+    fp = int(np.sum(pred & (y_bin == 0)))
+    fn = int(np.sum((~pred) & (y_bin == 1)))
+    tn = int(np.sum((~pred) & (y_bin == 0)))
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    specificity = tn / (tn + fp) if tn + fp else 0.0
+    return {'threshold': float(threshold), 'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
+            'precision': precision, 'recall': recall, 'f1': f1,
+            'specificity': specificity,
+            'balanced_accuracy': 0.5 * (recall + specificity),
+            'youden_j': recall + specificity - 1.0,
+            'predicted_positive': int(tp + fp),
+            'predicted_positive_rate': float((tp + fp) / max(y_bin.size, 1))}
+
+
+def _binary_calibration(y_bin, score, n_bins=10):
+    score = np.asarray(score, dtype=float).ravel()
+    if score.size and (np.any(score < 0.0) or np.any(score > 1.0)):
+        return {'status': 'unavailable',
+                'reason': 'scores are outside [0, 1]; Brier/ECE require probabilities'}
+    if score.size == 0:
+        return {'status': 'unavailable', 'reason': 'no scores'}
+    _bins = max(1, int(n_bins))
+    idx = np.clip((score * _bins).astype(np.int64), 0, _bins - 1)
+    rows = []
+    ece = 0.0
+    for b in range(_bins):
+        mask = idx == b
+        n_b = int(mask.sum())
+        if n_b == 0:
+            continue
+        confidence = float(score[mask].mean())
+        accuracy = float(y_bin[mask].mean())
+        weight = n_b / score.size
+        ece += weight * abs(accuracy - confidence)
+        rows.append({'bin': b, 'n': n_b, 'confidence': confidence,
+                     'accuracy': accuracy, 'gap': accuracy - confidence})
+    return {'status': 'ok', 'brier_score': float(np.mean((score - y_bin) ** 2)),
+            'ece': float(ece), 'n_bins': _bins, 'reliability': rows,
+            'note': 'ECE uses equal-width probability bins; fewer than n_bins non-empty bins are possible'}
+
+
+def binary_threshold_curve(y_true, y_score, *, positive_label=None, thresholds=None,
+                           metric='f1', max_thresholds=4096):
+    """Precision/recall/F1 at every candidate cut for a binary endpoint.
+
+    A binary F1 is only reproducible together with its decision threshold.  The
+    default 0.5 cut is a reporting convention, not a tuned optimum; under class
+    imbalance it can hide a good ranking behind a badly placed cut.  This helper
+    makes the cut explicit and returns the validation-friendly operating point
+    for a declared metric (`f1`, `balanced_accuracy` or `youden_j`).
+
+    Threshold selection is post-hoc fitting: callers must tune it on validation
+    rows that are disjoint from the evaluation rows and record the split.  The
+    returned `best_threshold` is a candidate, never a licence to select on test.
+    """
+    if metric not in _BINARY_THRESHOLD_METRICS:
+        raise ValueError(f'metric must be one of {_BINARY_THRESHOLD_METRICS}, got {metric!r}')
+    y_bin, pos, uniq = _binary_positive_vector(y_true, positive_label)
+    score = np.asarray(y_score, dtype=float).ravel()
+    if score.size != y_bin.size:
+        raise ValueError(f'y_score {score.shape} and y_true {y_bin.shape} differ')
+    if not np.all(np.isfinite(score)):
+        raise ValueError('y_score contains NaN/Inf; a threshold cannot be selected from non-finite scores')
+    if thresholds is None:
+        cand = np.unique(score)
+        truncated = False
+        if cand.size > int(max_thresholds):
+            keep = np.linspace(0, cand.size - 1, int(max_thresholds)).astype(np.int64)
+            cand = np.unique(cand[keep])
+            truncated = True
+    else:
+        cand = np.asarray(list(thresholds), dtype=float).ravel()
+        if cand.size == 0 or not np.all(np.isfinite(cand)):
+            raise ValueError('thresholds must be a non-empty finite sequence')
+        cand = np.unique(cand)
+        truncated = False
+    rows = [_binary_threshold_metrics(y_bin, score, t) for t in cand]
+    default = _binary_threshold_metrics(y_bin, score, 0.5)
+    if not rows:
+        raise ValueError('no candidate threshold could be scored')
+
+    def _key(row):
+        value = row[metric]
+        return (-value, abs(row['threshold'] - 0.5), row['threshold'])
+
+    best = min(rows, key=_key)
+    return {'positive_label': str(pos), 'labels': [str(x) for x in uniq],
+            'n': int(y_bin.size), 'n_positive': int(y_bin.sum()),
+            'prevalence': float(y_bin.mean()), 'metric': metric,
+            'best_threshold': best['threshold'], 'best_value': best[metric],
+            'best_metrics': best, 'at_default_0.5': default,
+            'threshold_sensitivity': float(best[metric] - default[metric]),
+            'n_candidates': int(len(rows)), 'threshold_grid_truncated': truncated,
+            'thresholds': rows,
+            'note': 'select on validation rows disjoint from evaluation; record the split and metric'}
+
+
+def select_binary_threshold(y_true, y_score, *, positive_label=None, metric='f1',
+                            thresholds=None, max_thresholds=4096):
+    """Return the best operating point and its validation diagnostics.
+
+    This is `binary_threshold_curve` reduced to the selected row plus the
+    chance floor (positive prevalence) so a caller can persist a compact,
+    auditable threshold-selection record.
+    """
+    curve = binary_threshold_curve(y_true, y_score, positive_label=positive_label,
+                                   thresholds=thresholds, metric=metric,
+                                   max_thresholds=max_thresholds)
+    return {'metric': metric, 'threshold': curve['best_threshold'],
+            'value': curve['best_value'], 'metrics': curve['best_metrics'],
+            'default_0.5': curve['at_default_0.5'],
+            'threshold_sensitivity': curve['threshold_sensitivity'],
+            'prevalence': curve['prevalence'],
+            'chance_f1_at_default_rule': curve['prevalence'],
+            'n': curve['n'], 'n_positive': curve['n_positive'],
+            'threshold_grid_truncated': curve['threshold_grid_truncated']}
+
+
+def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, positive_label=None,
+                           threshold=None, threshold_sweep=False):
     """Imbalance-aware classification summary without a sklearn dependency.
 
     Always returns accuracy, balanced accuracy and per-class precision/recall/
@@ -13389,7 +13541,25 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
     positive endpoint.  If omitted it defaults to ``labels[-1]`` (the sklearn
     convention for sorted binary labels), but callers with reversed or
     non-numeric labels should pass it explicitly rather than relying on order.
+
+    `threshold` is the cut used when predictions are derived from a 1-D score
+    column.  It defaults to 0.5, but the result records that convention in
+    `decision_threshold` / `decision_threshold_source`.  A threshold tuned on
+    validation must be passed explicitly with its selection metadata; use
+    `select_binary_threshold` (or `threshold_sweep=True`) to choose it without
+    touching the evaluation split.  `threshold_sweep=True` adds the full
+    operating-point curve.  Scores in [0, 1] also get Brier/ECE calibration,
+    which asks whether the probabilities are usable, not merely well ranked.
     """
+    if threshold is not None:
+        if isinstance(threshold, (bool, np.bool_)):
+            raise ValueError('threshold must be a finite number, not a boolean')
+        try:
+            threshold = float(threshold)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'threshold must be a finite number, got {threshold!r}') from None
+        if not math.isfinite(threshold):
+            raise ValueError(f'threshold must be finite, got {threshold!r}')
     y_true = np.asarray(y_true).ravel()
     if labels is None:
         if y_score is not None and np.asarray(y_score).ndim == 2:
@@ -13439,19 +13609,33 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             pos = labels[int(hits[0])]
     elif positive_label is not None:
         raise ValueError('positive_label is only meaningful for a binary endpoint')
+    _threshold_source = None
+    _threshold_used = threshold
     if y_pred is None:
         if y_score is None:
             raise ValueError('classification_metrics needs y_pred or y_score')
         score = np.asarray(y_score)
         if score.ndim == 2:
             y_pred = labels[np.argmax(score, axis=1)]
+            _threshold_source = 'argmax'
         elif labels.size == 2:
             if score.size != y_true.size:
                 raise ValueError(f'y_score {score.shape} and y_true {y_true.shape} differ')
+            if threshold is None:
+                threshold = 0.5
+                _threshold_source = 'default_0.5'
+            else:
+                _threshold_source = 'caller_threshold'
+            _threshold_used = threshold
             neg = labels[0] if pos == labels[-1] else labels[-1]
-            y_pred = np.where(score.ravel() >= 0.5, pos, neg)
+            y_pred = np.where(score.ravel() >= threshold, pos, neg)
         else:
             raise ValueError('a 1-D y_score is only interpretable for a binary endpoint')
+    else:
+        if threshold is not None:
+            _threshold_source = 'caller_threshold'
+        elif labels.size == 2:
+            _threshold_source = 'caller_predictions'
     y_pred = np.asarray(y_pred).ravel()
     if y_true.shape != y_pred.shape:
         raise ValueError(f'y_true {y_true.shape} and y_pred {y_pred.shape} differ')
@@ -13521,6 +13705,12 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         'per_class': per_class,
         'f1_averaging': 'macro, micro and weighted are all reported; the caller must name the primary one',
     }
+    if labels.size == 2:
+        out['decision_threshold'] = _threshold_used
+        out['decision_threshold_source'] = _threshold_source
+        out['threshold_dependent_metrics'] = ['accuracy', 'balanced_accuracy', 'precision_macro',
+                                              'recall_macro', 'f1_positive', 'f1_primary']
+        out['threshold_free_metrics'] = ['roc_auc', 'pr_auc', 'brier_score', 'ece']
     if y_score is not None and labels.size == 2:
         y_bin = (y_true == pos).astype(np.int64)
         # A 2-D score matrix is column-per-label: the binary endpoint uses the
@@ -13539,10 +13729,26 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         out['pr_auc_prevalence'] = prevalence
         if out['pr_auc'] is not None:
             out['pr_auc_lift_over_prevalence'] = float(out['pr_auc'] - prevalence)
+            if prevalence < 1.0:
+                out['pr_auc_normalized_skill'] = float(
+                    (out['pr_auc'] - prevalence) / (1.0 - prevalence))
+        out['calibration'] = _binary_calibration(y_bin, _bin_score)
+        if out['calibration'].get('status') == 'ok':
+            out['brier_score'] = out['calibration']['brier_score']
+            out['ece'] = out['calibration']['ece']
+        out['score_orientation_warning'] = None
+        if (out['roc_auc'] is not None and out['roc_auc'] < 0.5
+                and int(y_bin.sum()) >= 2 and int((1 - y_bin).sum()) >= 2):
+            out['score_orientation_warning'] = (
+                'ROC-AUC is below chance; check that the score column is the '
+                'positive-class probability and that positive_label is correct')
         if out['pr_auc'] is not None and out['roc_auc'] is not None:
             rare = min(prevalence, 1.0 - prevalence)
             out['imbalance_warning'] = ('positives rarer than 1:1000 — PR-AUC is the primary ranking metric; ROC-AUC can look optimistic'
                                         if rare < 1e-3 else None)
+        if threshold_sweep:
+            out['threshold_selection'] = select_binary_threshold(
+                y_true, _bin_score, positive_label=pos)
     elif labels.size == 2 and out.get('positive_label') is not None:
         prev = out['prevalence'].get(str(pos), 0.0)
         if min(prev, 1.0 - prev) < 1e-3:
@@ -13773,6 +13979,57 @@ def metric_policy_audit(summary=None, policy=None):
                             _class_issues.append(
                                 f'{_label}: f1_weighted={_rep_weighted} is not the support-weighted '
                                 f'mean of its per-class F1 values ({_weighted})')
+            # Threshold-dependent endpoints are only reproducible with the cut
+            # that produced them.  An untuned 0.5 cut is legal, but it must be
+            # named; a cut selected on the evaluation rows is not.
+            _thr = r.get('decision_threshold')
+            _thr_src = r.get('decision_threshold_source')
+            _f1ish = any(k in r for k in ('f1', 'f1_positive', 'f1_primary',
+                                          'precision_macro', 'recall_macro'))
+            if task == 'binary_classification' and _f1ish and _thr_src is None:
+                out['warnings'].append(
+                    f'{_label} reports threshold-dependent F1/precision/recall without '
+                    'decision_threshold_source; report the cut and how it was chosen')
+            if _thr is not None or _thr_src is not None:
+                _t = _finite_scalar(_thr)
+                if _thr is None and _thr_src not in ('caller_predictions', 'argmax'):
+                    _class_issues.append(
+                        f'{_label}: decision_threshold_source={_thr_src!r} is set but '
+                        'decision_threshold is missing')
+                elif _thr is not None and (_t is None or not (0.0 <= _t <= 1.0)):
+                    _class_issues.append(
+                        f'{_label}: decision_threshold={_thr!r} is not a finite value in [0, 1]')
+                if _thr_src is None:
+                    _class_issues.append(
+                        f'{_label}: decision_threshold is reported without decision_threshold_source')
+                elif _thr_src not in _BINARY_THRESHOLD_SOURCES:
+                    _class_issues.append(
+                        f'{_label}: decision_threshold_source={_thr_src!r} is not one of '
+                        f'{list(_BINARY_THRESHOLD_SOURCES)}')
+                if _thr_src == 'validation_selection':
+                    if r.get('threshold_selection_split') != 'validation':
+                        _class_issues.append(
+                            f'{_label}: the tuned threshold does not declare '
+                            'threshold_selection_split="validation"; selecting it on the '
+                            'evaluation/test rows is leakage')
+                    if not r.get('threshold_selection_metric'):
+                        _class_issues.append(
+                            f'{_label}: the tuned threshold does not name its '
+                            'threshold_selection_metric')
+                if _thr_src == 'default_0.5' and _t is not None and abs(_t - 0.5) > 1e-12:
+                    _class_issues.append(
+                        f'{_label}: source is default_0.5 but decision_threshold={_t}')
+            for _key in ('roc_auc', 'pr_auc', 'brier_score', 'ece'):
+                if _key in r and r.get(_key) is not None:
+                    _v = _finite_scalar(r.get(_key))
+                    if _v is None or not (0.0 <= _v <= 1.0):
+                        _class_issues.append(
+                            f'{_label}: {_key}={r.get(_key)!r} is not a finite value in [0, 1]')
+            _roc = _finite_scalar(r.get('roc_auc'))
+            if _roc is not None and _roc < 0.5:
+                out['warnings'].append(
+                    f'{_label}: ROC-AUC={_roc:.3f} is below chance; check the positive-class '
+                    'score orientation and positive_label before interpreting the model as weak')
             # A rare-positive panel that reports only ROC-AUC is exactly the
             # optimistic-score failure mode this policy exists to prevent.
             prevalence = None
@@ -13790,6 +14047,25 @@ def metric_policy_audit(summary=None, policy=None):
                 if _prev_f is not None and 0.0 <= _prev_f <= 1.0:
                     prevalence = min(_prev_f, 1.0 - _prev_f)
                     break
+            if task == 'binary_classification' and prevalence is not None:
+                _pr_p = _finite_scalar(r.get('pr_auc_prevalence'))
+                if _pr_p is not None and abs(_pr_p - prevalence) > 1e-6:
+                    _class_issues.append(
+                        f'{_label}: pr_auc_prevalence={_pr_p} differs from the recorded '
+                        f'minority prevalence {prevalence}; the PR-AUC floor is misstated')
+                _pr = _finite_scalar(r.get('pr_auc'))
+                _lift = _finite_scalar(r.get('pr_auc_lift_over_prevalence'))
+                if _pr is not None and _lift is not None and abs(_lift - (_pr - prevalence)) > 1e-6:
+                    _class_issues.append(
+                        f'{_label}: pr_auc_lift_over_prevalence={_lift} is not '
+                        f'pr_auc - prevalence ({_pr - prevalence})')
+                if (_thr_src == 'default_0.5' and prevalence < 1e-2
+                        and (_finite_scalar(r.get('f1_primary')) is not None
+                             or _finite_scalar(r.get('f1')) is not None)):
+                    out['warnings'].append(
+                        f'{_label}: F1 uses the default 0.5 cut at prevalence '
+                        f'{prevalence:.2e}; report PR-AUC and, if a tuned cut is claimed, '
+                        'select it on validation with select_binary_threshold and record the split')
             _declared_primary = r.get('primary_metric') or r.get('metric_primary')
             if _declared_primary is not None:
                 _pol = METRIC_POLICY.get(task) if task in METRIC_POLICY else None
@@ -13828,6 +14104,8 @@ def metric_policy_audit(summary=None, policy=None):
                                   'ok': not _class_issues,
                                   'issues': sorted(set(_class_issues))[:12],
                                   'f1_averaging_required': list(_allowed_f1_averages),
+                                  'threshold_sources': list(_BINARY_THRESHOLD_SOURCES),
+                                  'threshold_default': 0.5,
                                   'extreme_imbalance_primary': 'pr_auc'})
             for _ci in sorted(set(_class_issues)):
                 out['warnings'].append('classification metric contract: ' + _ci)
