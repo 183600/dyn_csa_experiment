@@ -4233,6 +4233,20 @@ def t_reportable_claim_gate():
                 pass
             else:
                 raise AssertionError(f'invalid alpha {_bad!r} was accepted')
+    # Minimum-n floors are gate parameters too: bool/fractional values must
+    # not be truncated into a weaker floor.
+    for _bad_min in (True, 3.5, float('nan'), -1):
+        for _fn in (lambda m: L.paired_effect_stats([-1.0, -1.1, -0.9], min_n=m),
+                    lambda m: L.meta_analyze_effects([], min_seeds=m),
+                    lambda m: L.scaling_trend([], min_seeds=m),
+                    lambda m: L.methodology_audit({}, design={}, baselines={},
+                                                  min_n=m, write=False, verbose=False)):
+            try:
+                _fn(_bad_min)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'invalid min_n={_bad_min!r} was accepted')
     # Holm cannot be smaller than the raw p it adjusts.
     r = L.reportable_claim(dict(base, p_holm=0.001))
     assert r['allowed'] is False and any('smaller than the raw p' in x for x in r['reasons']), r

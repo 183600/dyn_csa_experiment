@@ -9309,6 +9309,12 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     `resolution_limited` stops a small-n panel from being read as a negative
     result when only the test's granularity, not the data, bound the p."""
     alpha = _validated_alpha(alpha)
+    # A minimum-n floor is a gate parameter: int(True)=1 / int(5.9)=5 would
+    # silently change which panels are labelled underpowered.
+    _min_n = _as_seed_int(min_n)
+    if _min_n is None or _min_n < 0:
+        raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
+    min_n = _min_n
     raw = list(deltas if deltas is not None else [])
     n_input = len(raw)
     d_vals, kept_pos, dropped_pos = [], [], []
@@ -9358,7 +9364,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     else:
         dz = float('inf') if mean > 0 else float('-inf')
     p_floor = signflip_p_floor(n)
-    underpowered = n < int(min_n)
+    underpowered = n < min_n
     resolution_limited = bool(math.isfinite(p_floor) and p_floor > alpha)
     within_seed_noise = abs(mean) <= std
     significant = bool(math.isfinite(p) and p < alpha and (not within_seed_noise))
@@ -9381,7 +9387,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
             seed_driven = any((_m == 0.0) or ((_m > 0) != (_full_sign > 0)) for _m in loo_means)
     seed_robust = None if seed_driven is None else (not seed_driven)
     if underpowered:
-        verdict = 'underpowered (n<%d)' % int(min_n)
+        verdict = 'underpowered (n<%d)' % min_n
     elif within_seed_noise:
         verdict = 'effect within seed noise (|mean|<=std)'
     elif significant:
@@ -10109,6 +10115,10 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     否则 `poolable=False`，pooled 只作描述性摘要，结论必须按规模分开报。
     """
     alpha = _validated_alpha(alpha, context='meta_analyze_effects alpha')
+    _min_seeds = _as_seed_int(min_seeds)
+    if _min_seeds is None or _min_seeds < 0:
+        raise ValueError(f'min_seeds must be a non-negative integer, got {min_seeds!r}')
+    min_seeds = _min_seeds
     pts = _scale_points(points)
     labels = [p['label'] for p in pts]
     if len(set(labels)) != len(labels):
@@ -10247,6 +10257,13 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     同时报告两点交互（最小 vs 最大规模）和异质性；异质性高时不得用单一
     斜率概括整个阶梯。"""
     alpha = _validated_alpha(alpha, context='scaling_trend alpha')
+    _min_seeds = _as_seed_int(min_seeds)
+    _min_points = _as_seed_int(min_points)
+    if _min_seeds is None or _min_seeds < 0:
+        raise ValueError(f'min_seeds must be a non-negative integer, got {min_seeds!r}')
+    if _min_points is None or _min_points < 1:
+        raise ValueError(f'min_points must be a positive integer, got {min_points!r}')
+    min_seeds, min_points = _min_seeds, _min_points
     pts = _scale_points(points)
     pts = [p for p in pts if math.isfinite(p['scale']) and p['scale'] > 0.0 and p['effects']]
     pts.sort(key=lambda p: p['scale'])
@@ -13285,6 +13302,10 @@ def _sign_of(x):
     return 0
 
 def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_match=False):
+    _min_n = _as_seed_int(min_n)
+    if _min_n is None or _min_n < 0:
+        raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
+    min_n = _min_n
     """One status per declared innovation / baseline claim.
 
     verified            — a controlled, capacity-controlled (total plus the
@@ -13631,6 +13652,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     Returns the report dict and, when `outdir` is given, writes
     `methodology_audit.json`."""
     alpha = _validated_alpha(alpha, context='methodology_audit alpha')
+    _min_n = _as_seed_int(min_n)
+    if _min_n is None or _min_n < 0:
+        raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
+    min_n = _min_n
     default_design = design is None
     design = ABLATION_DESIGN if design is None else design
     recs, amb = _variant_seed_map(summary)
