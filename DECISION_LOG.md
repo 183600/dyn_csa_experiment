@@ -231,3 +231,37 @@ enter a family as `False = 0`. (6) Scale seed identity is an exact integer in
 cannot masquerade as a paired seed. (7) The count-model floor rejects
 float/boolean token ids and fractional vocabularies instead of truncating them.
 No frozen manifest, test split, README, or CI configuration was modified.
+
+## 2026-10-20 — baseline/metric design gates (no new runs)
+
+This pass changed only zero-GPU design/reporting gates; no panel, frozen
+manifest, test split, README, or CI configuration was touched.
+
+- `hypothesis_audit` now binds a hypothesis's `primary_metric` to its role in
+  `METRIC_POLICY`. A metric that is declared only as a **secondary** endpoint
+  (e.g. ROC-AUC under `binary_classification`) is rejected as the primary
+  endpoint unless the hypothesis explicitly labels it
+  `metric_role='secondary'` with a non-empty `metric_justification`. An
+  optional `metric_policy` key binds the hypothesis to one policy. The binary
+  policy now has a conditional primary, `pr_auc` at prevalence < 1e-3, rather
+  than only a prose preference for PR-AUC.
+- `metric_policy_audit` verifies classification records against the same
+  contract: `f1_primary` must equal the field named by its averaging rule,
+  macro/weighted F1 must be reproducible from `per_class`, multiclass records
+  must expose macro/micro/weighted F1, and a 1:1000 task may not name F1 or
+  ROC-AUC as its primary endpoint. A PPL record without NLL/token accounting
+  is now explicitly unverifiable instead of silently accepted.
+- `baseline_tuning_audit` fails closed when a final record omits the
+  hyperparameters it ran (it cannot attest the selected config). The protocol
+  declares its `search_design`; a declared `full_factorial` search must cover
+  every declared cell, while a marginal/OFAT design is labelled as such.
+- `methodology_audit` propagates tuning/floor warnings into the panel report
+  and only promotes a baseline contrast to `tuned_verified_baselines` when the
+  search is adequate: verified artifact, no grid-boundary/coarse warning, no
+  truncated search, and no leave-one-seed-out instability. A verified but
+  inadequate grid stays in `untuned_verified_baselines` with the reason.
+- Tuned comparisons report a zero-aware family resolution floor
+  (`holm_min_attainable_p_floors`): ties lower the attainable exact p, so a
+  resolution-limited tuned contrast is not read as a null.
+- The simple count-model protocol declares a full-factorial smoothing grid and
+  the audit enforces that every declared cell was actually run.
