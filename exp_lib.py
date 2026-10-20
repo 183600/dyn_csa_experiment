@@ -19785,7 +19785,10 @@ def aggregate(summary):
             return _finite_scalar(layer.get(k))
         for r in recs:
             r_f1, r_ex, r_dl = ([], [], [])
-            for lk, lv in r.get('stats', {}).items():
+            _stats = r.get('stats')
+            if not isinstance(_stats, dict):
+                _stats = {}
+            for lk, lv in _stats.items():
                 if not isinstance(lv, dict):
                     continue
                 lm = _cell(lv, 'len_mean')
@@ -19823,7 +19826,8 @@ def aggregate(summary):
             entry['boundary_f1_dyn_std'] = float(np.std(bf1, ddof=1)) if len(bf1) > 1 else 0.0
         if bex:
             entry['boundary_excess_dyn'] = float(np.mean(bex))
-        hists = [r['ppl_history'] for r in recs if r.get('ppl_history')]
+        hists = [r['ppl_history'] for r in recs
+                 if isinstance(r.get('ppl_history'), (list, tuple)) and r.get('ppl_history')]
         if hists:
             per_step = {}
             for _h in hists:
@@ -19831,7 +19835,7 @@ def aggregate(summary):
                     try:
                         _s = int(_pt[0])
                         _v = float(_pt[1])
-                    except (TypeError, ValueError, IndexError):
+                    except (TypeError, ValueError, IndexError, KeyError):
                         continue
                     per_step.setdefault(_s, []).append(_v)
             def _grid(_hist):
@@ -19839,7 +19843,7 @@ def aggregate(summary):
                 for _p in _hist:
                     try:
                         _out.append(int(_p[0]))
-                    except (TypeError, ValueError, IndexError):
+                    except (TypeError, ValueError, IndexError, KeyError):
                         continue
                 return _out
             _ref_steps = _grid(hists[0])
@@ -19858,11 +19862,14 @@ def aggregate(summary):
                 for _pt in _h:
                     try:
                         _own[int(_pt[0])] = float(_pt[1])
-                    except (TypeError, ValueError, IndexError):
+                    except (TypeError, ValueError, IndexError, KeyError):
                         continue
                 for _s, _v in _own.items():
                     mat[_i, cols[_s]] = _v
-            good = np.array([[ppl_is_usable(v) for v in row] for row in mat])
+            # dtype=bool is essential: an all-malformed history yields a
+            # zero-column matrix whose inferred dtype is float64, and ``~good``
+            # then raises instead of reporting an empty curve.
+            good = np.array([[ppl_is_usable(v) for v in row] for row in mat], dtype=bool)
             n_good = good.sum(axis=0)
             sums = np.where(good, mat, 0.0).sum(axis=0)
             mean_ppl = np.where(n_good > 0, sums / np.maximum(n_good, 1), np.nan)

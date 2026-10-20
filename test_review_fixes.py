@@ -905,6 +905,17 @@ def t_aggregate_seed_normalization():
     # whole panel aggregation.
     assert L.aggregate({'x::seed0': dict(base, seed=0, variant={'bad': 1})}) == {}
     assert L.aggregate({'x::seed0': dict(base, seed=0, variant='')}) == {}
+    # A record whose optional diagnostics are explicitly null must not crash
+    # the panel aggregate; it simply contributes no block-length readout.
+    _null_stats = L.aggregate({'x::seed0': dict(base, seed=0, stats=None)})
+    assert _null_stats['csa_dynamic']['n_seeds'] == 1, _null_stats
+    assert 'avg_block_len' not in _null_stats['csa_dynamic'], _null_stats
+    # A malformed history must yield an empty/omitted curve, not an exception
+    # from the boolean reduction over a zero-column matrix.
+    _bad_hist = L.aggregate({'x::seed0': dict(base, seed=0, ppl_history=[1])})
+    assert _bad_hist['csa_dynamic'].get('ppl_curve') in (None, []), _bad_hist
+    _bad_hist2 = L.aggregate({'x::seed0': dict(base, seed=0, ppl_history=[{}, 'x'])})
+    assert _bad_hist2['csa_dynamic'].get('ppl_curve') in (None, []), _bad_hist2
 
 
 def t_audit_resolution_classification():
