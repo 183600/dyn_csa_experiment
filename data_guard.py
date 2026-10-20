@@ -687,12 +687,17 @@ def _group_key(value):
     of the same missing group can be split across train/val/test and no
     group-overlap check will ever fire.
     """
-    if isinstance(value, (float, np.floating)):
-        f = float(value)
-        if math.isnan(f):
-            return ('__nan__',)
-    if isinstance(value, np.datetime64) and np.isnat(value):
-        return ('__nat__',)
+    if isinstance(value, np.datetime64):
+        if np.isnat(value):
+            return ('__nat__',)
+    elif (not isinstance(value, (bool, np.bool_))
+          and not isinstance(value, (complex, np.complexfloating))
+          and isinstance(value, numbers.Number)):
+        try:
+            if math.isnan(float(value)):
+                return ('__nan__',)
+        except (TypeError, ValueError, OverflowError):
+            pass
     try:
         hash(value)
     except TypeError:
@@ -1074,10 +1079,17 @@ def _as_categorical_2d(X, *, name='X'):
 def _category_is_missing(value):
     if value is None:
         return True
-    if isinstance(value, (float, np.floating)):
-        return bool(math.isnan(float(value)))
     if isinstance(value, np.datetime64):
         return bool(np.isnat(value))
+    if (not isinstance(value, (bool, np.bool_))
+            and not isinstance(value, (complex, np.complexfloating))
+            and isinstance(value, numbers.Number)):
+        # Decimal (and other exact numeric objects) can represent NaN too;
+        # treating it as an ordinary category would hide a missing value.
+        try:
+            return bool(math.isnan(float(value)))
+        except (TypeError, ValueError, OverflowError):
+            return False
     return False
 
 
@@ -1522,6 +1534,15 @@ def _matrix_fingerprint(X):
                 try:
                     f = float(v)
                 except (TypeError, ValueError, OverflowError):
+                    # A huge exact rational (Fraction/Decimal) has no finite
+                    # float64 image, but it is still a numeric row: use a
+                    # placeholder here and let the exact canonical tail below
+                    # carry the value instead of rejecting the table.
+                    if (isinstance(v, numbers.Number)
+                            or hasattr(v, 'as_integer_ratio')):
+                        vals.append(float('nan'))
+                        exact = False
+                        continue
                     raise TypeError(
                         'matrix fingerprint needs numeric object rows; '
                         f'got {type(v).__name__}') from None
@@ -1799,7 +1820,9 @@ def _label_key(v):
     # like "nan"/"inf" into missing targets and also conflated numeric
     # strings with their numeric twins.  Numbers.Real includes NumPy scalar
     # types but excludes complex/bool.
-    if not isinstance(v, numbers.Real) or isinstance(v, (bool, np.bool_)):
+    if (isinstance(v, (bool, np.bool_))
+            or isinstance(v, (complex, np.complexfloating))
+            or not isinstance(v, numbers.Number)):
         return v
     try:
         f = float(v)
@@ -1807,7 +1830,8 @@ def _label_key(v):
         return v
     # NaN and infinities are not valid class/regression targets.  Treating
     # +inf as an ordinary label would hide a corrupted target from the
-    # missing-label audit.
+    # missing-label audit.  Decimal/Fraction are Number but not Real, so the
+    # check uses the wider numeric base class.
     if not math.isfinite(f):
         return None
     return v
