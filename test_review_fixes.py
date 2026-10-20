@@ -1191,6 +1191,13 @@ def t_tuned_pairing_keeps_optimizer_gate():
     b7 = dict(b, param_breakdown={'total': 100, 'non_embedding': 80, 'active': 50})
     why6 = BT._relaxed_pair_reason(a7, b7, {'a': 3, 'b': 3})
     assert why6 and 'parameter breakdown' in why6, why6
+    # A tuned contrast must score the same evaluation slice.
+    a8 = dict(a, eval_fp='e1')
+    b8 = dict(b, eval_fp='e2')
+    why7 = BT._relaxed_pair_reason(a8, b8, {'a': 3, 'b': 3})
+    assert why7 and 'eval_fp' in why7, why7
+    assert BT._relaxed_pair_reason(dict(a, eval_fp='e1'), dict(b, eval_fp='e1'),
+                                   {'a': 3, 'b': 3}) is None
 
 
 def t_arm_mean_std_and_relative_effect():

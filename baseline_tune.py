@@ -473,6 +473,17 @@ def _relaxed_pair_reason(a, b, tuned_arms):
             return f'unverifiable {k} (at least one record omits it)'
         if _va != _vb:
             return f'{k} differs ({_va!r} vs {_vb!r})'
+    # The final tuned metric may be a held-out row fold; the strict
+    # `pair_reason` already refuses a mixed evaluation slice, and the relaxed
+    # tuned rule must not become a back door around it.  Legacy records with
+    # no eval fingerprint on either side keep the permissive path.
+    _ea, _eb = a.get('eval_fp'), b.get('eval_fp')
+    _ha = _ea is not None and str(_ea) != ''
+    _hb = _eb is not None and str(_eb) != ''
+    if _ha != _hb:
+        return 'unverifiable eval_fp (only one record carries the evaluation-slice fingerprint)'
+    if _ha and str(_ea) != str(_eb):
+        return f'eval_fp differs ({str(_ea)[:12]}… vs {str(_eb)[:12]}…)'
     # Tuning may change lr/wd/warmup, but it must never silently change the
     # optimizer, betas/eps, LR-schedule shape, grad-clip or augmentation.  The
     # strict `pair_reason` already enforces this for architecture contrasts;
