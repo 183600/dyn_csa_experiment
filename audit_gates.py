@@ -216,6 +216,57 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                        ' — the train/test id spaces cannot be shown to be paired; '
                        'rebuild both caches with the current loaders before using '
                        'the held-out split')
+    # c2) whole-document group isolation for the held-out split.  The loaders
+    # now persist test_doc_ids; when the sidecar is present, recompute the
+    # train/test and val/test document intersections instead of trusting the
+    # metadata flags.  A missing sidecar is reported as not independently
+    # verified (legacy cache), not silently treated as clean.
+    _trd_p = os.path.join(cache_dir, f'train_doc_ids_{train_tag}.npy')
+    _vad_p = os.path.join(cache_dir, f'val_doc_ids_{train_tag}.npy')
+    _ted_p = os.path.join(cache_dir, f'test_doc_ids_{test_tag}.npy')
+    if os.path.exists(_ted_p):
+        try:
+            import numpy as np
+            _ted = np.load(_ted_p)
+            _doc_checks = {'test_documents': int(_ted.size)}
+            _doc_leak = []
+            _tm_doc = (test_meta or {}).get('doc_ids') or {}
+            if _tm_doc:
+                if int(_tm_doc.get('test_count', -1)) != int(_ted.size):
+                    _doc_leak.append('test document-id sidecar count disagrees with the test metadata')
+            else:
+                _doc_checks['metadata'] = 'test meta has no doc_ids attestation'
+            if os.path.exists(_trd_p):
+                _n = int(np.intersect1d(np.load(_trd_p), _ted).size)
+                _doc_checks['test_train_overlap'] = _n
+                if _n:
+                    _doc_leak.append(f'{_n} test document ids also occur in train')
+            else:
+                _doc_checks['test_train_overlap'] = 'train sidecar missing'
+                _doc_leak.append('train document-id sidecar is missing; test/train group isolation cannot be verified')
+            if os.path.exists(_vad_p):
+                _n = int(np.intersect1d(np.load(_vad_p), _ted).size)
+                _doc_checks['test_validation_overlap'] = _n
+                if _n:
+                    _doc_leak.append(f'{_n} test document ids also occur in validation')
+            else:
+                _doc_checks['test_validation_overlap'] = 'validation sidecar missing'
+                _doc_leak.append('validation document-id sidecar is missing; test/validation group isolation cannot be verified')
+            out['checks']['document_isolation'] = _doc_checks
+            if _doc_leak:
+                out['status'] = 'fail'
+                out['note'] = ('held-out document-group leakage: ' + '; '.join(_doc_leak) +
+                               ' — rebuild the test cache with the current loader')
+        except Exception as _de:
+            out['checks']['document_isolation'] = f'failed ({type(_de).__name__}: {_de})'
+            out['status'] = 'fail'
+            out['note'] = (f'held-out document-id sidecar unreadable ({_de}); '
+                           'document-group isolation cannot be verified')
+    else:
+        out['checks']['document_isolation'] = {
+            'status': 'not_verified',
+            'note': 'legacy test cache without test_doc_ids; rebuild it to prove train/val/test document-group isolation',
+        }
     # d) document overlap via deterministic SLIDING shingles on the cached id
     # matrices.  A fixed polynomial rolling hash over every window, uniform
     # segments across the full train stream, and an explicit scanned fraction
@@ -690,6 +741,28 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 if shared_val_test:
                     rec['status'] = 'fail'
                     _fail(f'{cd}/{tag}: {shared_val_test} test rows exactly duplicate a validation row')
+                _ted_path = os.path.join(cd, f'test_doc_ids_{_ttag}.npy')
+                if os.path.exists(_ted_path):
+                    try:
+                        _ted = np.load(_ted_path)
+                        _trd = np.load(_trd_path) if os.path.exists(_trd_path) else np.empty(0, dtype=np.uint64)
+                        _vad = np.load(_vad_path) if os.path.exists(_vad_path) else np.empty(0, dtype=np.uint64)
+                        _dtrain = int(np.intersect1d(_trd, _ted).size)
+                        _dval = int(np.intersect1d(_vad, _ted).size)
+                        rec['test_documents'] = int(_ted.size)
+                        rec['test_train_document_overlap'] = _dtrain
+                        rec['test_validation_document_overlap'] = _dval
+                        if _dtrain:
+                            rec['status'] = 'fail'
+                            _fail(f'{cd}/{tag}: {_dtrain} test document ids also occur in train (group leakage)')
+                        if _dval:
+                            rec['status'] = 'fail'
+                            _fail(f'{cd}/{tag}: {_dval} test document ids also occur in validation (selection/test group leakage)')
+                    except Exception as _de:
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: test document-id sidecar unreadable ({type(_de).__name__}: {_de})')
+                else:
+                    rec['test_document_isolation'] = 'not_verified (no test_doc_ids sidecar)'
             else:
                 rec['test_file'] = None
 

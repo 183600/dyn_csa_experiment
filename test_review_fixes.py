@@ -3084,6 +3084,90 @@ def t_split_and_prepare_fits_train_only():
                                      time=np.array([5, 4, 3, 2, 1, 0])) is True
 
 
+def t_data_quality_temporal_audit():
+    # Indices built outside the split helpers must still be audited for time
+    # leakage: row/group disjointness alone cannot catch a shuffled series.
+    X = np.arange(12, dtype=float).reshape(6, 2)
+    time = np.array([5, 4, 3, 2, 1, 0])
+    idx = L.split_indices(6, time=time, train_frac=0.5, val_frac=0.25,
+                          test_frac=0.25)
+    rep = L.data_quality_report(X, train_idx=idx['train'], val_idx=idx['val'],
+                                test_idx=idx['test'], time=time)
+    assert all(not c['leak'] for c in rep['checks']['temporal_order'].values()), rep
+    shuffled = {'train': np.array([0, 1]), 'val': np.array([2]),
+                'test': np.array([3])}
+    bad = L.data_quality_report(X, train_idx=shuffled['train'],
+                                val_idx=shuffled['val'],
+                                test_idx=shuffled['test'], time=time)
+    assert bad['status'] == 'fail', bad
+    assert any('temporal leakage' in msg for msg in bad['hard_failures']), bad
+    assert bad['checks']['temporal_order']['train__val']['leak'] is True, bad
+    # An equal timestamp cannot straddle a boundary either.
+    tie = np.array([0, 0, 1, 1, 2, 2])
+    tie_rep = L.data_quality_report(
+        X, train_idx=[0], val_idx=[1], test_idx=[2, 3, 4, 5], time=tie)
+    assert tie_rep['status'] == 'fail', tie_rep
+    # The one-call helper forwards its time key, so the same gate runs there.
+    out = L.split_and_prepare(X, time=time, train_frac=0.5, val_frac=0.25,
+                              test_frac=0.25, quality_report=True)
+    assert out['quality']['status'] in ('ok', 'warnings'), out['quality']
+    assert all(not c['leak'] for c in
+               out['quality']['checks']['temporal_order'].values()), out['quality']
+    # A quality_kwargs override must not collide with the forwarded key.
+    out2 = L.split_and_prepare(X, time=time, train_frac=0.5, val_frac=0.25,
+                               test_frac=0.25, quality_report=True,
+                               quality_kwargs={'time': time})
+    assert out2['quality']['status'] in ('ok', 'warnings'), out2['quality']
+    # String event ids/timestamps are orderable in Python even though NumPy 2
+    # has no string maximum/minimum ufunc loop; grouped splits must not fall
+    # over (or silently disable the order check) for them.
+    sg = np.arange(6)
+    st = np.array(['f', 'e', 'd', 'c', 'b', 'a'])
+    sidx = L.grouped_chronological_split_indices(
+        6, sg, 0.5, 0.25, 0.25, order=st)
+    L.assert_no_split_leakage(sidx['train'], sidx['val'], sidx['test'],
+                              groups=sg, time=st)
+    srep = L.data_quality_report(
+        np.arange(12, dtype=float).reshape(6, 2),
+        train_idx=sidx['train'], val_idx=sidx['val'], test_idx=sidx['test'],
+        groups=sg, time=st)
+    assert all(not c['leak'] for c in srep['checks']['temporal_order'].values()), srep
+
+
+def t_capped_document_id_sidecar():
+    # The capped-id helper must record exactly the documents that contributed
+    # a served token, using the same row-length list as the tokenizer stream.
+    rows = ['alpha', 'beta', 'gamma']
+    lengths = [3, 3, 5]
+    expected = [L._doc_id_u64(L._doc_exact_fp(r)) for r in rows]
+    ids3 = L._doc_ids_for_capped_rows(rows, lengths, 3)
+    assert ids3.tolist() == expected[:1], (ids3, expected)
+    # A cut inside the second document still records the second document (it
+    # contributed one served token), but never the untouched third one.
+    ids4 = L._doc_ids_for_capped_rows(rows, lengths, 4)
+    assert ids4.tolist() == expected[:2], (ids4, expected)
+    ids0 = L._doc_ids_for_capped_rows(rows, lengths, 0)
+    assert ids0.size == 0, ids0
+
+    class _Enc:
+        def __init__(self, ids):
+            self.ids = ids
+
+    class _Tok:
+        def encode_batch(self, batch):
+            return [_Enc(list(range(len(text)))) for text in batch]
+
+    lengths_out = []
+    ids = L._tokenise_row_chunks([['aa', 'b']], 5, 'unit', _Tok(), 0,
+                                 lengths_out=lengths_out)
+    assert lengths_out == [3, 2], lengths_out
+    assert ids.tolist() == [0, 1, 0, 0, 0], ids
+    assert L._tokenise_row_chunks([['aa', 'b']], 5, 'unit', _Tok(), 0).tolist() == ids.tolist()
+    doc_ids = L._doc_ids_for_capped_rows(['aa', 'b'], lengths_out, 5)
+    assert doc_ids.tolist() == [L._doc_id_u64(L._doc_exact_fp('aa')),
+                                L._doc_id_u64(L._doc_exact_fp('b'))], doc_ids
+
+
 def t_split_purge_embargo():
     # Purge drops the tail of train and validation; the test slice is intact
     # and no returned row straddles a boundary.
@@ -3967,6 +4051,8 @@ def main():
     _check('I19 simple-baseline audit reports malformed records instead of crashing', t_simple_baseline_audit_malformed_records)
     _check('I20 index aliasing, non-finite labels, signed-zero duplicates, undefined SMD, NaT groups', t_data_guard_index_label_and_shift_edges)
     _check('I21 split-and-prepare fits preprocessing on train only', t_split_and_prepare_fits_train_only)
+    _check('I21a data-quality temporal split audit', t_data_quality_temporal_audit)
+    _check('I21b capped test document-id sidecar', t_capped_document_id_sidecar)
     _check('I22 purge/embargo keeps window boundaries sealed', t_split_purge_embargo)
     _check('I23 grouped split refuses an empty requested side', t_group_split_refuses_empty_requested_side)
     _check('I24 label shift and per-split label corruption counts', t_label_shift_and_split_counts)

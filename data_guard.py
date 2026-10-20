@@ -395,13 +395,32 @@ def _assert_order_finite(order, *, name='order'):
         pass
 
 
+def _order_extreme(values, *, maximum):
+    """max/min of an ordering key across dtypes.
+
+    NumPy has no ``maximum`` loop for some string dtypes (NumPy >= 2), even
+    though Python can compare those scalars.  Falling back to the object
+    comparison keeps string event ids / timestamps splittable instead of
+    silently marking every such split "not orderable".
+    """
+    arr = np.asarray(values)
+    try:
+        return np.max(arr) if maximum else np.min(arr)
+    except (TypeError, ValueError, OverflowError):
+        flat = arr.reshape(-1).tolist()
+        if not flat:
+            raise ValueError('cannot take an extreme of an empty ordering key')
+        return max(flat) if maximum else min(flat)
+
+
 def _group_index_fast(groups, order=None):
     """Vectorised (order_groups, first, members) for non-object group arrays.
 
-    Returns ``None`` for object dtypes, where the per-row dict form is the
+    Returns ``None`` for object dtypes, and for non-numeric/non-datetime
+    ordering keys (e.g. string event ids), where the per-row dict form is the
     only safe implementation (values may be unorderable or their elementwise
-    comparisons may raise).  Every returned value matches the per-row dict
-    loops exactly:
+    reductions may not have a NumPy loop).  Every returned value matches the
+    per-row dict loops exactly:
 
     * ``first[g]`` is the row index of ``g``'s first appearance —
       ``np.unique(..., return_index=True)`` reports each unique value's
@@ -424,6 +443,10 @@ def _group_index_fast(groups, order=None):
     if order is not None:
         order = np.asarray(order)
         if order.dtype == object:
+            return None
+        # String/bytes event ids are orderable in Python but have no
+        # maximum/minimum ufunc loop in NumPy 2; use the per-row fallback.
+        if order.dtype.kind not in 'iufmM':
             return None
         if order.ndim != 1 or order.shape[0] != groups.shape[0]:
             raise ValueError('order must be a 1-D array with one value per row')
@@ -729,10 +752,12 @@ def assert_no_split_leakage(train_idx, val_idx, test_idx, *, groups=None,
             # future/past into the other split even though the row indices are
             # disjoint.  Callers must pass groups (or split at a timestamp
             # boundary) when timestamps repeat.
-            if np.max(time[ia]) >= np.min(time[ib]):
+            earlier_max = _order_extreme(time[ia], maximum=True)
+            later_min = _order_extreme(time[ib], maximum=False)
+            if earlier_max >= later_min:
                 raise ValueError(
                     f'temporal leakage: max {a} time '
-                    f'{np.max(time[ia])!r} >= min {b} time {np.min(time[ib])!r} '
+                    f'{earlier_max!r} >= min {b} time {later_min!r} '
                     '(the same timestamp/event block must not span two splits)')
     return True
 
@@ -1050,9 +1075,15 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
         out['preprocessor'] = None
     if quality_report:
         kw = dict(quality_kwargs or {})
+        # Forward the same ordering/group keys that produced the split so the
+        # report can independently verify temporal and whole-group isolation.
+        # An explicit quality_kwargs override wins (callers may pass a longer
+        # external ordering array), but it must not be duplicated.
+        kw.setdefault('time', time)
+        kw.setdefault('groups', groups)
         out['quality'] = data_quality_report(
             Xarr, y=yarr, train_idx=idx['train'], val_idx=idx['val'],
-            test_idx=idx['test'], groups=groups, **kw)
+            test_idx=idx['test'], **kw)
     return out
 
 
@@ -1180,7 +1211,7 @@ def _label_key(v):
 
 
 def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=None,
-                        groups=None, clip_z=3.0, shift_threshold=0.5,
+                        groups=None, time=None, clip_z=3.0, shift_threshold=0.5,
                         fail_on_nan_inf=True, fail_on_label_conflict=True,
                         fail_on_nonfinite_labels=False,
                         fail_on_label_shift=False,
@@ -1195,11 +1226,20 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     statistics that are later applied back to them.
 
     Returns a JSON-friendly dict.  ``status`` is ``'fail'`` when exact duplicate
-    rows cross split boundaries (row-level leakage), groups cross splits, or a
-    hard data-quality policy fires (NaN/Inf and duplicate-row label conflicts by
-    default).  Outliers, distribution shift and within-split duplicates are
-    warnings unless the corresponding ``fail_on_*`` flag is enabled; callers
-    that consciously accept them must record the waiver in their run metadata.
+    rows cross split boundaries (row-level leakage), groups cross splits, time
+    runs backwards at a split boundary, or a hard data-quality policy fires
+    (NaN/Inf and duplicate-row label conflicts by default).  Outliers,
+    distribution shift and within-split duplicates are warnings unless the
+    corresponding ``fail_on_*`` flag is enabled; callers that consciously
+    accept them must record the waiver in their run metadata.
+
+    ``time`` is an optional per-row ordering key (timestamp, event id, ...).
+    When supplied, the report verifies the same monotone partition as
+    :func:`assert_no_split_leakage`: every earlier split must be strictly
+    older than the next split, so a caller that built indices elsewhere cannot
+    silently hand in a shuffled time series.  Equal timestamps may not straddle
+    a boundary (callers should put the whole event block in one split or pass
+    ``groups``).
 
     Label diagnostics include per-split missing/non-finite counts, exact-
     duplicate label conflicts, a per-split label histogram, and the
@@ -1338,6 +1378,47 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                     f'{len(shared)} group ids cross {a}/{b}; whole groups must '
                     'stay in one split')
         checks['group_overlap'] = group_cross
+
+    # Temporal ordering.  A caller may build its own split indices; checking
+    # only row/group overlap would accept a randomly shuffled time series.  The
+    # comparison is the same strict partition contract as
+    # assert_no_split_leakage (earlier max < later min), including equal
+    # timestamps straddling a boundary.
+    if time is not None:
+        time = _as_1d(time, 'time', n)
+        _assert_order_finite(time, name='time')
+        temporal = {}
+        for a, b in (('train', 'val'), ('train', 'test'), ('val', 'test')):
+            ia = np.asarray(split_rows[a], dtype=np.int64).reshape(-1)
+            ib = np.asarray(split_rows[b], dtype=np.int64).reshape(-1)
+            if ia.size == 0 or ib.size == 0:
+                temporal[f'{a}__{b}'] = {'checked': False}
+                continue
+            try:
+                earlier_max = _order_extreme(time[ia], maximum=True)
+                later_min = _order_extreme(time[ib], maximum=False)
+                leaked = bool(earlier_max >= later_min)
+            except (TypeError, ValueError, OverflowError):
+                hard_leak = True
+                temporal[f'{a}__{b}'] = {'checked': False,
+                                         'error': 'time values are not mutually orderable'}
+                hard_failures.append(
+                    f'{a}/{b}: time values are not mutually orderable; a '
+                    'temporal split cannot be verified')
+                continue
+            temporal[f'{a}__{b}'] = {
+                'checked': True,
+                'leak': leaked,
+                'earlier_max': repr(earlier_max),
+                'later_min': repr(later_min),
+            }
+            if leaked:
+                hard_leak = True
+                hard_failures.append(
+                    f'temporal leakage: max {a} time {earlier_max!r} >= min '
+                    f'{b} time {later_min!r}; the same event block must not '
+                    'span two splits')
+        checks['temporal_order'] = temporal
 
     # Label noise / corruption.  A target is only valid if it is finite; a
     # missing (None/NaN) target is reported separately from an Inf target,

@@ -5842,6 +5842,14 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                                            ranges_trusted=_fast)
         if meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget':
             _problems.append('cache does not attest the frozen train-prefix tokenizer fit')
+        if not meta.get('fit_fp'):
+            _problems.append(
+                'cache does not record the tokenizer fit-corpus fingerprint; '
+                'tokenizer provenance cannot be bound to the train split')
+        if not meta.get('val_fp'):
+            _problems.append(
+                'cache does not record a validation fingerprint; holdout '
+                'content cannot be bound to the split it was audited with')
         _dd_meta = meta.get('dedup')
         if not isinstance(_dd_meta, dict):
             _problems.append('cache does not attest whole-document exact/near duplicate filtering')
@@ -5877,14 +5885,34 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                     _problems.append(
                         f'{_shared_docs} document ids occur in both train and validation')
                 _mdoc = meta.get('doc_ids') or {}
+                if not _mdoc:
+                    _problems.append(
+                        'cache has document-id sidecars but no document-disjointness '
+                        'attestation in its metadata')
                 if _mdoc and (_mdoc.get('disjoint') is not True
                               or int(_mdoc.get('overlap', 0) or 0) != 0):
                     _problems.append(
                         'cache metadata does not attest document-disjoint train/validation splits')
+                # Fingerprints make the sidecars part of the cache identity:
+                # a sidecar swapped in from another build can be disjoint by
+                # accident while no longer describing the token arrays.
+                if _mdoc.get('train_fp') and _mdoc['train_fp'] != _ids_fp(_trd):
+                    _problems.append(
+                        'train document-id sidecar does not match the fingerprint in the cache metadata')
+                if _mdoc.get('validation_fp') and _mdoc['validation_fp'] != _ids_fp(_vad):
+                    _problems.append(
+                        'validation document-id sidecar does not match the fingerprint in the cache metadata')
             except Exception as _de:
                 _problems.append(f'document-id sidecars unreadable ({type(_de).__name__}: {_de})')
         elif _has_doc_meta:
             _problems.append('cache metadata records document ids but the sidecar files are missing')
+        else:
+            # A cache that predates document-id sidecars cannot prove whole-
+            # document group isolation.  Fail closed: rebuild it instead of
+            # silently serving a split whose groups may cross train/validation.
+            _problems.append(
+                'cache has no document-id sidecars; whole-document group '
+                'isolation cannot be verified — rebuild the corpus cache')
         if _problems:
             _cache_warning('WikiText train/validation split', _problems)
         else:
@@ -6120,10 +6148,18 @@ def _text_fp(rows):
         h.update(b'\n')
     return h.hexdigest()[:16]
 
-def _tokenise_row_chunks(row_chunks, cap_tokens, label, tok, eos_id):
+def _tokenise_row_chunks(row_chunks, cap_tokens, label, tok, eos_id,
+                         lengths_out=None):
     """Standalone twin of load_wikitext's nested stream_tokenise with the exact
     same chunking / eos / cap / flush behaviour (1<<22 chunks, row-chunk 10000,
-    [:cap_tokens] truncation) so the served ids obey the same discipline."""
+    [:cap_tokens] truncation) so the served ids obey the same discipline.
+
+    ``lengths_out`` optionally receives ``len(ids) + 1`` (the EOS) for every
+    encoded non-empty row, in row order.  The produced ids are byte-identical
+    with or without it; the lengths let the caller reconstruct which documents
+    actually contributed tokens to the capped slice (for a document-id
+    sidecar) without tokenising the corpus a second time.
+    """
     chunks = []
     cur = []
     n_flushed = 0
@@ -6139,6 +6175,8 @@ def _tokenise_row_chunks(row_chunks, cap_tokens, label, tok, eos_id):
         for enc in tok.encode_batch(rows):
             cur.extend(enc.ids)
             cur.append(eos_id)
+            if lengths_out is not None:
+                lengths_out.append(len(enc.ids) + 1)
         if len(cur) >= (1 << 22):
             _flush()
         n_have = n_flushed + len(cur)
@@ -6151,29 +6189,59 @@ def _tokenise_row_chunks(row_chunks, cap_tokens, label, tok, eos_id):
     ids = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
     return ids[:cap_tokens]
 
+
+def _doc_ids_for_capped_rows(rows, lengths, cap_tokens):
+    """Document ids of the rows that contributed to a capped token stream.
+
+    ``lengths`` is the per-row ``len(ids) + 1`` list produced by
+    :func:`_tokenise_row_chunks`; it is aligned with the non-empty ``rows``.
+    A row is recorded when at least one of its tokens (or its EOS) falls before
+    ``cap_tokens``, matching the truncated id array exactly.
+    """
+    acc = array.array('Q')
+    cursor = 0
+    cap_tokens = max(0, int(cap_tokens))
+    for row, length in zip(rows, lengths):
+        if cursor >= cap_tokens:
+            break
+        take = min(int(length), cap_tokens - cursor)
+        if take <= 0:
+            break
+        acc.append(int(_doc_id_u64(_doc_exact_fp(row))))
+        cursor += take
+    return (np.frombuffer(acc, dtype=np.uint64).copy()
+            if acc else np.empty(0, dtype=np.uint64))
+
 def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     """Load the WikiText-103 **test** split as (n_seqs, seq_len) int64 rows.
 
-    只读 wiki.test.raw（本地 dump 或 HF test split），绝不触碰 train/validation，
-    因此可作冻结后的独立最终评估数据（design_notes §17 的「未参与方法选择的
-    数据」）。与 load_wikitext 同一套纪律：npy 缓存 + sha256 内容指纹 + 原子写；
+    只读 wiki.test.raw（本地 dump 或 HF test split）作为最终评估数据
+    （design_notes §17 的「未参与方法选择的数据」）；train/validation 只用于
+    重建同一个冻结 tokenizer 和构建去重索引，绝不把 test 行用于拟合或选择。
+    与 load_wikitext 同一套纪律：npy 缓存 + sha256 内容指纹 + 原子写；
     分词器使用与主语料完全相同的冻结 train-prefix token 上限（上限记录在
     train cache meta 中）重建，并把拟合语料指纹存进 meta 以供审计。构建
-    test 缓存时，与 training documents 完全相同或近重复（SimHash）的 test
-    文档会在 tokenisation 前被剔除并记录数量，从而冻结一个去重后的评估
-    子集。缓存命中会校验内容指纹、tokenizer 拟合来源和去重元数据；train
-    语料被更换时应删除整个 wt103_cache/，否则 test 缓存不会跟随重建——
-    这是显式记录的边界，不是静默的失效路径。"""
+    test 缓存时，与 training **以及 validation（选择集）** 文档完全相同或
+    近重复（SimHash）的 test 文档会在 tokenisation 前被剔除并记录数量；
+    test 文档 id 会作为 sidecar 落盘，缓存命中时重新计算 train/test 与
+    val/test 的文档交集。这样既防止 test 文档穿越到训练集，也防止它穿越到
+    用于调参/早停的验证集。缓存命中会校验内容指纹、tokenizer 拟合来源和
+    去重元数据；train 语料被更换时应删除整个 wt103_cache/，否则 test 缓存
+    不会跟随重建——这是显式记录的边界，不是静默的失效路径。"""
     from datasets import load_dataset
     cache_dir = _wt_cache_dir(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
     tag = f'v2_sl{seq_len}_v{vocab_size}_ns{n_seqs}'
     te_path = os.path.join(cache_dir, f'test_ids_{tag}.npy')
     tb_path = os.path.join(cache_dir, f'test_bnd_{tag}.npy')
+    td_path = os.path.join(cache_dir, f'test_doc_ids_{tag}.npy')
     me_path = os.path.join(cache_dir, f'test_meta_{tag}.json')
     tk_path = os.path.join(cache_dir, f'test_tok_{tag}.json')
     if all((os.path.exists(p) for p in (te_path, tb_path, me_path))):
-        _sig = _memo_file_sig({'test': te_path, 'bnd': tb_path, 'meta': me_path})
+        _sig_paths = {'test': te_path, 'bnd': tb_path, 'meta': me_path}
+        if os.path.exists(td_path):
+            _sig_paths['test_doc_ids'] = td_path
+        _sig = _memo_file_sig(_sig_paths)
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_TEST_MEMO.get(_mkey)
         if _hit is not None:
@@ -6183,8 +6251,20 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         test_ids = np.load(te_path)
         meta = json.load(open(me_path, encoding='utf-8'))
         test_bnd = np.load(tb_path)
+        test_doc_ids = None
+        if os.path.exists(td_path):
+            try:
+                test_doc_ids = np.load(td_path)
+            except Exception as _de:
+                _problems_td = f'test document-id sidecar unreadable ({type(_de).__name__}: {_de})'
+            else:
+                _problems_td = None
+        else:
+            _problems_td = None
         _problems = []
-        _sigs = _cache_file_sigs({'test': te_path, 'bnd': tb_path})
+        if _problems_td:
+            _problems.append(_problems_td)
+        _sigs = _cache_file_sigs(_sig_paths)
         _fast = _cache_file_sigs_match(meta, _sigs)
         if meta.get('src_fp') != _ids_fp(test_ids):
             _problems.append('test id fingerprint does not match the test meta file')
@@ -6196,14 +6276,65 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             _problems.append(f"tokenizer was fitted on {meta.get('tokenizer_fit_split')!r}, not train")
         if meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget':
             _problems.append('test cache does not attest the frozen train-prefix tokenizer fit')
-        if not isinstance(meta.get('near_duplicate_cleanup'), dict):
-            _problems.append('test cache does not attest near-duplicate cleanup against train')
+        _ndc = meta.get('near_duplicate_cleanup')
+        if not isinstance(_ndc, dict):
+            _problems.append('test cache does not attest near-duplicate cleanup against train/validation')
+        else:
+            if _ndc.get('policy') != 'test_documents_deduplicated_against_train_and_validation':
+                _problems.append(
+                    'test cache does not attest duplicate cleanup against BOTH the '
+                    'train and validation (selection) splits; a test document may '
+                    'cross the val/test group boundary')
+            _vc = _ndc.get('validation_cleanup')
+            if (not isinstance(_vc, dict)
+                    or _vc.get('policy') != 'validation_documents_deduplicated_against_train'):
+                _problems.append(
+                    'test cache does not record validation-document cleanup provenance')
+        # Test document groups must not cross train or validation.  A metadata
+        # flag is not enough: recompute the intersections from the persisted
+        # sidecars on every hit, exactly like the train/val cache does.
+        import glob as _glob2
+        _mdoc = meta.get('doc_ids')
+        if _mdoc:
+            if test_doc_ids is None:
+                _problems.append('test cache metadata records document ids but the sidecar is missing')
+            else:
+                if int(np.asarray(test_doc_ids).size) != int(_mdoc.get('test_count', -1)):
+                    _problems.append(
+                        'test document-id sidecar count does not match the cache metadata')
+                if _mdoc.get('test_fp') and _mdoc['test_fp'] != _ids_fp(test_doc_ids):
+                    _problems.append(
+                        'test document-id sidecar does not match the fingerprint in the cache metadata')
+                if (_mdoc.get('disjoint') is not True
+                        or int(_mdoc.get('train_overlap', 0) or 0) != 0
+                        or int(_mdoc.get('validation_overlap', 0) or 0) != 0):
+                    _problems.append(
+                        'test cache metadata does not attest document-disjoint '
+                        'train/validation/test groups')
+                _shared = {'train': 0, 'validation': 0}
+                for _dp in _glob2.glob(os.path.join(cache_dir, 'train_doc_ids_v5_*.npy')):
+                    try:
+                        _shared['train'] += int(np.intersect1d(
+                            np.load(_dp), test_doc_ids, assume_unique=False).size)
+                    except Exception as _de:
+                        _problems.append(
+                            f'train document-id sidecar unreadable ({os.path.basename(_dp)}: {_de})')
+                for _dp in _glob2.glob(os.path.join(cache_dir, 'val_doc_ids_*.npy')):
+                    try:
+                        _shared['validation'] += int(np.intersect1d(
+                            np.load(_dp), test_doc_ids, assume_unique=False).size)
+                    except Exception as _de:
+                        _problems.append(
+                            f'validation document-id sidecar unreadable ({os.path.basename(_dp)}: {_de})')
+                if _shared['train'] or _shared['validation']:
+                    _problems.append(
+                        f'{_shared["train"]} train / {_shared["validation"]} validation '
+                        'document ids also occur in the test split (group leakage)')
         # A cached test set is only pairable if its tokenizer was fitted on the
         # SAME train prefix as the train/validation cache.  Verifying this on
         # the cold path is not enough: a swapped test cache could otherwise
         # serve a tokenizer that saw test text.
         _train_fit_fps = set()
-        import glob as _glob2
         for _mp in _glob2.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
             try:
                 _mt = json.load(open(_mp, encoding='utf-8'))
@@ -6280,11 +6411,14 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     _fit_cap = int(TOKENIZER_FIT_TOKENS)
     _fit_max_rows = 50000
     _train_meta_objs = []
+    _train_meta_paths = []
     for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
         try:
-            _train_meta_objs.append(json.load(open(_mp, encoding='utf-8')))
+            _mobj = json.load(open(_mp, encoding='utf-8'))
         except Exception:
             continue
+        _train_meta_objs.append(_mobj)
+        _train_meta_paths.append(_mp)
     _caps = {int(_m['tokenizer_fit_token_cap']) for _m in _train_meta_objs
              if _m.get('tokenizer_fit_token_cap') is not None}
     _maxrows = {int(_m['tokenizer_fit_max_rows']) for _m in _train_meta_objs
@@ -6320,6 +6454,26 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         train_rows_source, vocab_size, _fit_cap, max_rows=_fit_max_rows)
     if tok is None or not train_fit_rows:
         raise RuntimeError('load_wikitest: the train split has no non-empty text rows to fit the shared tokenizer')
+    # Bind the cold build to the EXISTING train cache before any test row is
+    # read.  On the cache-hit path this check already exists; without it here,
+    # a local dump / dataset revision that happens to fit the same vocab could
+    # produce a test cache whose dedup index came from a different train
+    # corpus, and the first (frozen) test evaluation would consume it.
+    _fit_fp_build = _text_fp(train_fit_rows)
+    _train_fit_fps_build = {_m['fit_fp'] for _m in _train_meta_objs
+                            if _m.get('fit_fp')}
+    if _train_fit_fps_build and _fit_fp_build not in _train_fit_fps_build:
+        raise RuntimeError(
+            'load_wikitest: the train source used for the test tokenizer has '
+            f'fit-corpus fingerprint {_fit_fp_build!r}, which is absent from '
+            'the train cache metas — the test split cannot be deduplicated '
+            'against the corpus that was actually trained on; point '
+            'WT103_RAW_TXT at the matching train dump or delete/rebuild both '
+            'caches from one source')
+    if _train_fit_fps_build:
+        print(f'[data] test tokenizer fit is bound to the train cache (fit_fp={_fit_fp_build})')
+    else:
+        print('[data] NOTE: the train cache has no fit fingerprint; the cold test build cannot independently bind its train source')
     vocab = tok.get_vocab_size()
     eos_id = tok.token_to_id('<eos>')
     # vocabulary consistency with any existing train-side cache: a mismatch means
@@ -6351,6 +6505,90 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             raise RuntimeError(f'load_wikitest: the freshly fitted tokenizer (vocab={vocab}) disagrees with the cached train corpus (vocab={_mv} in {_mp}) — the splits cannot be paired; delete wt103_cache/ and rebuild both')
     if not _train_meta_objs:
         raise RuntimeError('load_wikitest: no train/validation meta exists in the cache directory — build (or copy) the frozen train cache FIRST; the test tokenizer and the dedup index are functions of that train split, and touching test before it exists cannot be audited')
+    # Validation is the SELECTION split.  A test document that duplicates a
+    # validation document would leak selection data into the final evaluation,
+    # so the held-out subset must be cleaned against validation as well as
+    # train.  Read validation (already consumed by earlier phases, never test)
+    # before the held-out rows, so the dedup index is complete first.
+    val_rows_source = None
+    for cand in _cands:
+        _f = os.path.join(cand, 'wiki.valid.raw')
+        if os.path.exists(_f):
+            val_rows_source = _read_raw_rows(_f)
+            print(f'[data] local wikitext-103 VALIDATION split at {_f} ({len(val_rows_source)} rows)')
+            break
+    if val_rows_source is None:
+        for repo in ('Salesforce/wikitext', 'wikitext'):
+            try:
+                ds_val = load_dataset(repo, 'wikitext-103-raw-v1', split='validation', cache_dir=cache_dir)
+                val_rows_source = list(ds_val['text'])
+                break
+            except Exception as e:
+                last_err = e
+        if val_rows_source is None:
+            raise RuntimeError('load_wikitest: no validation-split source is available; the test subset cannot be proven disjoint from the selection split — provide wiki.valid.raw or the HF validation split')
+    val_rows_source = [r for r in val_rows_source
+                       if isinstance(r, str) and r.strip()]
+    # Screen the raw validation documents against train exactly as the
+    # validation split itself was screened, then index only the documents that
+    # could actually have been served for model selection.  Doing this BEFORE
+    # the test read means a validation/train source mismatch is caught before
+    # the held-out split is touched.
+    _val_screen = _DocDeduplicator()
+    for _r in train_rows_source:
+        if isinstance(_r, str) and _r.strip():
+            _val_screen.is_duplicate(_r)
+    _kept_val_docs = []
+    for _r in val_rows_source:
+        _dup, _kind = _val_screen.is_duplicate(_r)
+        if not _dup:
+            _kept_val_docs.append(_r)
+    # The test/train check above is conservative (it uses the whole raw train
+    # split), but the val/test index must contain EVERY raw validation document
+    # that could have been served by the selection split.  Indexing only the
+    # documents that survive our train screen could miss a validation document
+    # the real (capped) validation stream retained, so index all raw
+    # validation documents (de-duplicated among themselves) instead.
+    _val_only = _DocDeduplicator()
+    _val_indexed_docs = 0
+    for _r in val_rows_source:
+        _dup_v, _kind_v = _val_only.is_duplicate(_r)
+        if not _dup_v:
+            _val_indexed_docs += 1
+    # Bind the validation source to the cached validation documents.  The
+    # cached val_doc_ids sidecar for every train meta with the SAME fit corpus
+    # must be a subset of the documents this source yields; otherwise the
+    # val/test dedup would be built from a different validation split than the
+    # one used for model selection.
+    _raw_val_ids = set(
+        int(_doc_id_u64(_doc_exact_fp(_r))) for _r in val_rows_source)
+    for _mpath in _train_meta_paths:
+        try:
+            _mtag = os.path.basename(_mpath)[len('meta_'):-len('.json')]
+            _mobj = json.load(open(_mpath, encoding='utf-8'))
+        except Exception:
+            continue
+        if _mobj.get('fit_fp') and _mobj['fit_fp'] != _fit_fp_build:
+            continue
+        _vpath = os.path.join(cache_dir, f'val_doc_ids_{_mtag}.npy')
+        if not os.path.exists(_vpath):
+            continue
+        try:
+            _cached_val_ids = set(int(x) for x in np.load(_vpath).tolist())
+        except Exception as _ve:
+            raise RuntimeError(
+                f'load_wikitest: cached validation document-id sidecar {_vpath} '
+                f'is unreadable ({type(_ve).__name__}: {_ve}); cannot bind the '
+                'test dedup index to the selection split') from _ve
+        _missing_val = _cached_val_ids - _raw_val_ids
+        if _missing_val:
+            raise RuntimeError(
+                f'load_wikitest: the validation source yields {len(val_rows_source)} '
+                f'documents but does not contain {len(_missing_val)} document(s) '
+                f'from the cached validation split {_vpath} — the test dedup index '
+                'would be built from a different selection split; point '
+                'WT103_RAW_TXT / the HF source at the split used to build the '
+                'train cache, or delete/rebuild both caches from one source')
     # Tokenizer and fit-cap are now validated.  ONLY NOW read the held-out rows.
     for cand in _cands:
         _f = os.path.join(cand, 'wiki.test.raw')
@@ -6373,28 +6611,41 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     print(f'[data] tokenising TEST split (cap {n_seqs * seq_len + seq_len} tokens) ...')
     _trows = list(test_rows) if not isinstance(test_rows, list) else list(test_rows)
     # Freeze a near-duplicate-clean evaluation subset: any test document that
-    # exactly or near-duplicates a TRAIN document is excluded before
-    # tokenisation.  The index is built from the train split only; test rows
-    # are never used to decide what counts as a duplicate of train.
+    # exactly or near-duplicates a TRAIN or VALIDATION document is excluded
+    # before tokenisation.  Both indices are built from the earlier splits
+    # only; test rows never decide what counts as a duplicate of train/val.
     _test_dedup = _DocDeduplicator()
     for _r in train_rows_source:
         if isinstance(_r, str) and _r.strip():
             _test_dedup.is_duplicate(_r)
     _kept_test = []
-    _excluded = {'exact': 0, 'near': 0}
+    _excluded = {'train_exact': 0, 'train_near': 0,
+                 'validation_exact': 0, 'validation_near': 0}
     for _r in _trows:
         if not isinstance(_r, str) or not _r.strip():
             continue
         _dup, _kind = _test_dedup.is_duplicate(_r)
         if _dup:
-            _excluded[_kind] += 1
-        else:
-            _kept_test.append(_r)
-    if _excluded['exact'] or _excluded['near']:
-        print(f'[data] test near-duplicate cleanup: excluded {_excluded["exact"]} exact '
-              f'and {_excluded["near"]} near-duplicate documents that also occur in train')
+            _excluded[f'train_{_kind}'] += 1
+            continue
+        _dup, _kind = _val_only.is_duplicate(_r)
+        if _dup:
+            _excluded[f'validation_{_kind}'] += 1
+            continue
+        _kept_test.append(_r)
+    _removed_train = _excluded['train_exact'] + _excluded['train_near']
+    _removed_val = _excluded['validation_exact'] + _excluded['validation_near']
+    if _removed_train or _removed_val:
+        print(f'[data] test duplicate cleanup: excluded {_excluded["train_exact"]} exact '
+              f'and {_excluded["train_near"]} near-duplicate documents from train, '
+              f'{_excluded["validation_exact"]} exact and {_excluded["validation_near"]} '
+              f'near-duplicate documents from validation')
     _trows = _kept_test
-    ids = _tokenise_row_chunks([_trows[s:s + 10000] for s in range(0, len(_trows), 10000)], n_seqs * seq_len + seq_len, 'test', tok, eos_id)
+    _cap_test = n_seqs * seq_len + seq_len
+    _test_lengths = []
+    ids = _tokenise_row_chunks(
+        [_trows[s:s + 10000] for s in range(0, len(_trows), 10000)],
+        _cap_test, 'test', tok, eos_id, lengths_out=_test_lengths)
     n_have = min(len(ids) // seq_len, n_seqs)
     if n_have < n_seqs:
         # v11.128: hard failure.  The frozen plan declares n_seqs (16) as part
@@ -6406,7 +6657,42 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     print(f'[data] TEST rows = {n_have} (seq_len={seq_len}, vocab={vocab})')
     bnd_ids = sorted(boundary_token_ids(tok, eos_id))
     test_bnd = np.isin(test_batch, bnd_ids)
-    for _p, _a in ((te_path, test_batch), (tb_path, test_bnd)):
+    # Reconstruct the document-id sidecar from the same capped stream, but only
+    # up to the tokens actually scored (n_have full sequences).  A document is
+    # recorded exactly when it contributed at least one evaluated token; this
+    # is what makes test/train and test/val group disjointness independently
+    # checkable on a later cache hit.
+    _served_cap = int(n_have) * int(seq_len)
+    test_doc_ids = _doc_ids_for_capped_rows(
+        [r for r in _trows if r.strip()], _test_lengths, _served_cap)
+    # Prove group isolation against every train/val cache sidecar present.  The
+    # build-time dedup should already guarantee zero; this turns a silent
+    # dedup/index bug into a hard refusal before the cache is written.
+    _shared_train_docs = 0
+    _shared_val_docs = 0
+    _doc_scan_errors = []
+    import glob as _glob3
+    for _dp in _glob3.glob(os.path.join(cache_dir, 'train_doc_ids_v5_*.npy')):
+        try:
+            _shared_train_docs += int(np.intersect1d(np.load(_dp), test_doc_ids).size)
+        except Exception as _de:
+            _doc_scan_errors.append(f'{os.path.basename(_dp)}: {_de}')
+    for _dp in _glob3.glob(os.path.join(cache_dir, 'val_doc_ids_*.npy')):
+        try:
+            _shared_val_docs += int(np.intersect1d(np.load(_dp), test_doc_ids).size)
+        except Exception as _de:
+            _doc_scan_errors.append(f'{os.path.basename(_dp)}: {_de}')
+    if _doc_scan_errors:
+        raise RuntimeError(
+            'load_wikitest: cannot verify test/document group isolation because '
+            f'a train/validation document-id sidecar is unreadable ({_doc_scan_errors[:3]})')
+    if _shared_train_docs or _shared_val_docs:
+        raise RuntimeError(
+            f'load_wikitest: {_shared_train_docs} train and {_shared_val_docs} '
+            'validation document ids occur in the held-out test slice after '
+            'deduplication — refusing to write a group-leaking test cache')
+    for _p, _a in ((te_path, test_batch), (tb_path, test_bnd),
+                   (td_path, test_doc_ids)):
         _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(_p)), prefix=os.path.basename(_p) + '.', suffix='.tmp')
         try:
             with os.fdopen(_fd, 'wb') as _fh:
@@ -6418,7 +6704,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             except OSError:
                 pass
             raise
-    _file_sigs = _cache_file_sigs({'test': te_path, 'bnd': tb_path})
+    _file_sigs = _cache_file_sigs({'test': te_path, 'bnd': tb_path,
+                                   'test_doc_ids': td_path})
     # Persist the test tokenizer BEFORE writing the meta, so the meta can bind
     # its exact bytes.  The cache identity therefore includes the full-file
     # sha256 (not only a hash of the fit TEXT, which two different BPE merge
@@ -6447,12 +6734,38 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         'tokenizer_fit_max_rows': int(_fit_max_rows),
         'tokenizer_fit_tokens': int(n_fit_tokens),
         'near_duplicate_cleanup': {
-            'policy': 'test_documents_duplicating_train_documents_removed',
-            'exact_removed': int(_excluded['exact']),
-            'near_removed': int(_excluded['near']),
+            'policy': 'test_documents_deduplicated_against_train_and_validation',
+            'train_exact_removed': int(_excluded['train_exact']),
+            'train_near_removed': int(_excluded['train_near']),
             'near_hamming_threshold': int(_test_dedup.near_threshold),
             'source_documents': int(len(test_rows)),
             'kept_documents': int(len(_trows)),
+            'validation_cleanup': {
+                'policy': 'validation_documents_deduplicated_against_train',
+                'source_documents': int(len(val_rows_source)),
+                'kept_documents': int(len(_kept_val_docs)),
+                'indexed_documents': int(_val_indexed_docs),
+                'duplicate_documents_removed': int(
+                    len(val_rows_source) - len(_kept_val_docs)),
+                'exact_removed_from_test': int(_excluded['validation_exact']),
+                'near_removed_from_test': int(_excluded['validation_near']),
+            },
+        },
+        'doc_ids': {
+            'test_count': int(test_doc_ids.size),
+            'test_fp': _ids_fp(test_doc_ids),
+            'train_overlap': int(_shared_train_docs),
+            'validation_overlap': int(_shared_val_docs),
+            'disjoint': True,
+            'policy': 'test_whole_documents_disjoint_from_train_and_validation',
+            'paired_train_doc_fps': sorted(
+                {(_m.get('doc_ids') or {}).get('train_fp')
+                 for _m in _train_meta_objs
+                 if (_m.get('doc_ids') or {}).get('train_fp')}),
+            'paired_validation_doc_fps': sorted(
+                {(_m.get('doc_ids') or {}).get('validation_fp')
+                 for _m in _train_meta_objs
+                 if (_m.get('doc_ids') or {}).get('validation_fp')}),
         },
         'test_sequences': int(test_batch.shape[0]),
         'seq_len': int(seq_len),
@@ -6896,6 +7209,13 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                     _problems.append(f'{_shared_docs} document ids occur in both train and validation')
                 if meta.get('doc_ids', {}).get('disjoint') is not True:
                     _problems.append('cache metadata does not attest document-level disjointness')
+                _mdoc = meta.get('doc_ids') or {}
+                if _mdoc.get('train_fp') and _mdoc['train_fp'] != _ids_fp(_trd):
+                    _problems.append(
+                        'train document-id sidecar does not match the fingerprint in the cache metadata')
+                if _mdoc.get('validation_fp') and _mdoc['validation_fp'] != _ids_fp(_vad):
+                    _problems.append(
+                        'validation document-id sidecar does not match the fingerprint in the cache metadata')
             except Exception as _de:
                 _problems.append(f'document-id sidecars unreadable ({type(_de).__name__}: {_de})')
             if (meta.get('validation_region') or {}).get('policy') != 'per_cap_closed_no_cross_cap_reuse':
@@ -6903,6 +7223,10 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             if (meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget'
                     or meta.get('tokenizer_fit_docs_in_train_prefix') is not True):
                 _problems.append('cache does not attest a tokenizer fit inside the training prefix')
+            if not meta.get('val_fp'):
+                _problems.append(
+                    'cache does not record a validation fingerprint; holdout '
+                    'content cannot be bound to the split it was audited with')
             _dd_meta = meta.get('dedup')
             _vc = _dd_meta.get('validation_cleanup') if isinstance(_dd_meta, dict) else None
             if (not isinstance(_vc, dict)
