@@ -12999,11 +12999,17 @@ METRIC_POLICY = {
         'task': 'binary_classification',
         'primary': 'f1',
         'primary_average': 'binary_positive_class',
+        # Under extreme imbalance the declared primary SWITCHES to PR-AUC:
+        # ROC-AUC stays visually high because the negative base rate makes FPR
+        # grow slowly, and F1 is threshold-dependent.  This is a conditional
+        # primary, not merely a preference in prose.
+        'primary_when_extreme_imbalance': 'pr_auc',
+        'extreme_imbalance_threshold': 1e-3,
         'direction': 'higher_is_better',
         'secondary': ['precision', 'recall', 'pr_auc', 'roc_auc', 'balanced_accuracy'],
-        'imbalance': 'report prevalence; prefer PR-AUC when positives are rarer than 1:1000',
+        'imbalance': 'report prevalence; when positives are rarer than 1:1000 the primary endpoint is PR-AUC, not F1 or ROC-AUC',
         'aggregation': 'binary',
-        'note': 'F1 must state the averaging rule; for binary tasks it is the positive-class F1.',
+        'note': 'F1 must state the averaging rule; for binary tasks it is the positive-class F1. For prevalence < 1e-3, PR-AUC is the primary ranking endpoint.',
     },
     'multiclass_classification': {
         'task': 'multiclass_classification',
@@ -13020,6 +13026,30 @@ METRIC_POLICY = {
 _HYPOTHESIS_REQUIRED = ('statement', 'mechanism', 'predicted_sign', 'primary_metric',
                         'requires_param_match', 'falsifier')
 
+
+def _metric_policy_roles(metric, policy):
+    """Return (policies where `metric` is primary, policies where it is secondary)."""
+    primary, secondary = [], []
+    if not isinstance(metric, str):
+        return primary, secondary
+    for name, p in (policy or {}).items():
+        if not isinstance(p, dict):
+            continue
+        if p.get('primary') == metric:
+            primary.append(name)
+        _alt = p.get('primary_when_extreme_imbalance')
+        if isinstance(_alt, str) and _alt == metric:
+            primary.append(name)
+        elif isinstance(_alt, (list, tuple)) and metric in _alt:
+            primary.append(name)
+        sec = p.get('secondary')
+        if isinstance(sec, str):
+            sec = [sec]
+        if isinstance(sec, (list, tuple)) and metric in sec:
+            secondary.append(name)
+    return primary, secondary
+
+
 def hypothesis_audit(table=None, kind='component', names=None, policy=None):
     """Pre-registration completeness / metric-alignment audit.
 
@@ -13028,9 +13058,15 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
     falsifier.  This audit also checks that the declared primary metric is one
     the project's ``METRIC_POLICY`` actually defines, so a hypothesis cannot
     silently target an unmeasured quantity (e.g. accuracy for an imbalanced
-    endpoint, or ROC-AUC for a 1:1000 task).  `names` limits the audit to the
-    declared comparisons in the current panel; missing table entries are
-    reported by the caller as `hypotheses_missing`.
+    endpoint, or ROC-AUC for a 1:1000 task).  A metric that appears only in a
+    policy's **secondary** list (for example ROC-AUC under
+    ``binary_classification``) is rejected as the primary endpoint unless the
+    hypothesis explicitly labels it ``metric_role='secondary'`` and gives a
+    non-empty ``metric_justification``.  An optional ``metric_policy`` key
+    binds the hypothesis to one named policy and requires the metric to belong
+    to that policy.  `names` limits the audit to the declared comparisons in
+    the current panel; missing table entries are reported by the caller as
+    `hypotheses_missing`.
 
     Direction `predicted_sign=0` is legal for an exploratory "difference
     exists" hypothesis, but it can never support a directional superiority
@@ -13040,7 +13076,7 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
     policy = METRIC_POLICY if policy is None else policy
     allowed = set()
     for p in policy.values():
-        for key in ('primary', 'secondary'):
+        for key in ('primary', 'secondary', 'primary_when_extreme_imbalance'):
             val = p.get(key)
             if isinstance(val, str):
                 allowed.add(val)
@@ -13048,7 +13084,8 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
                 allowed.update(str(x) for x in val)
     wanted = set(names) if names is not None else set(table)
     out = {'status': 'ok', 'kind': kind, 'hypotheses': {},
-           'invalid': [], 'metric_unknown': [], 'direction_unspecified': [],
+           'invalid': [], 'metric_unknown': [], 'metric_misaligned': [],
+           'metric_secondary_justified': [], 'direction_unspecified': [],
            'warnings': []}
     for name in sorted(wanted):
         spec = table.get(name)
@@ -13071,14 +13108,62 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
                 issues.append(f'{key} is empty or not a string')
         pm = spec.get('primary_metric')
         metric_known = bool(isinstance(pm, str) and pm in allowed)
+        primary_policies, secondary_policies = _metric_policy_roles(pm, policy)
+        metric_role = spec.get('metric_role', 'primary')
+        metric_policy = spec.get('metric_policy')
+        metric_justification = spec.get('metric_justification')
+        role_issue = None
+        if not isinstance(metric_role, str) or metric_role not in ('primary', 'secondary'):
+            role_issue = f'metric_role={metric_role!r} must be "primary" or "secondary"'
+        if metric_policy is not None:
+            if not isinstance(metric_policy, str) or metric_policy not in policy:
+                role_issue = (f'metric_policy={metric_policy!r} is not a declared '
+                              'METRIC_POLICY entry')
+            elif metric_known:
+                _p = policy[metric_policy]
+                _sec = _p.get('secondary')
+                if isinstance(_sec, str):
+                    _sec = [_sec]
+                _alt = _p.get('primary_when_extreme_imbalance')
+                if isinstance(_alt, str):
+                    _alt = [_alt]
+                _in_primary = ((_p.get('primary') == pm)
+                               or (isinstance(_alt, (list, tuple)) and pm in _alt))
+                _in_secondary = (isinstance(_sec, (list, tuple)) and pm in _sec)
+                if not (_in_primary or _in_secondary):
+                    role_issue = (f'primary_metric={pm!r} is not part of the '
+                                  f'declared metric_policy {metric_policy!r}')
+                elif metric_role == 'primary' and not _in_primary:
+                    role_issue = (f'primary_metric={pm!r} is only a secondary '
+                                  f'endpoint of {metric_policy!r}; a hypothesis '
+                                  'must name the policy primary or declare '
+                                  'metric_role="secondary" with a justification')
+        if role_issue is None and metric_known:
+            if metric_role == 'primary' and not primary_policies:
+                role_issue = (f'primary_metric={pm!r} is only a SECONDARY endpoint '
+                              f'in policy {sorted(secondary_policies)}; use the '
+                              'declared primary metric, or declare '
+                              'metric_role="secondary" with a justification')
+            elif metric_role == 'secondary':
+                if not secondary_policies:
+                    role_issue = (f'metric_role="secondary" but {pm!r} is a primary '
+                                  'endpoint (or not defined) in METRIC_POLICY')
+                elif not isinstance(metric_justification, str) or not metric_justification.strip():
+                    role_issue = ('metric_role="secondary" requires a non-empty '
+                                  'metric_justification explaining why the policy '
+                                  'primary is not the hypothesis endpoint')
         pred = spec.get('predicted_sign')
         row = {'statement': spec.get('statement'), 'mechanism': spec.get('mechanism'),
                'predicted_sign': pred, 'primary_metric': pm,
+               'metric_role': metric_role, 'metric_policy': metric_policy,
+               'metric_primary_policies': sorted(primary_policies),
+               'metric_secondary_policies': sorted(secondary_policies),
+               'metric_justification': metric_justification,
                'requires_param_match': spec.get('requires_param_match'),
                'falsifier': spec.get('falsifier'),
                'direction_specified': (pred in (-1, 1)),
                'metric_declared_in_policy': metric_known,
-               'complete': not issues}
+               'complete': not issues and role_issue is None}
         out['hypotheses'][name] = row
         if issues:
             out['invalid'].append(name)
@@ -13086,6 +13171,22 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
         if not metric_known:
             out['metric_unknown'].append(name)
             out['warnings'].append(f'{kind} hypothesis `{name}` declares primary_metric={pm!r}, which METRIC_POLICY does not define')
+        if role_issue is not None:
+            if name not in out['invalid']:
+                out['invalid'].append(name)
+            out['metric_misaligned'].append(name)
+            out['warnings'].append(f'{kind} hypothesis `{name}` has a metric-role mismatch: {role_issue}')
+        elif metric_known and metric_role == 'secondary':
+            out['metric_secondary_justified'].append(name)
+            _policy_primaries = sorted({policy[p].get('primary') for p in secondary_policies})
+            if metric_policy:
+                _bound = policy.get(metric_policy) or {}
+                if _bound.get('primary'):
+                    _policy_primaries = [_bound.get('primary')]
+            out['warnings'].append(
+                f'{kind} hypothesis `{name}` uses secondary endpoint {pm!r} as its '
+                'test metric (justified); report it together with the policy primary '
+                f'{_policy_primaries}')
         if pred == 0:
             out['direction_unspecified'].append(name)
             out['warnings'].append(f'{kind} hypothesis `{name}` has predicted_sign=0 — it can test for a difference but cannot support a directional advantage claim')

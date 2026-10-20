@@ -4487,6 +4487,26 @@ def t_hypothesis_audit_completeness_and_metric_alignment():
     assert r['status'] == 'warn', r
     assert 'h0' in r['direction_unspecified'] and 'h0' in r['metric_unknown'], r
     assert 'h1' in r['invalid'] and any('incomplete' in w for w in r['warnings']), r
+    # A metric that is only a SECONDARY endpoint in the policy cannot be the
+    # hypothesis's primary endpoint without an explicit secondary declaration.
+    _base = {'statement': 'x', 'mechanism': 'y', 'predicted_sign': -1,
+             'requires_param_match': False, 'falsifier': 'z'}
+    _roc = dict(_base, primary_metric='roc_auc', metric_policy='binary_classification')
+    _rr = L.hypothesis_audit({'roc_primary': _roc}, 'component')
+    assert 'roc_primary' in _rr['invalid'] and 'roc_primary' in _rr['metric_misaligned'], _rr
+    assert 'roc_primary' not in _rr['hypotheses']['roc_primary']['metric_primary_policies'], _rr
+    # ... but the CONDITIONAL primary under extreme imbalance (PR-AUC) is a
+    # legitimate primary endpoint and must pass the role check.
+    _pr = dict(_base, primary_metric='pr_auc', metric_policy='binary_classification')
+    _prr = L.hypothesis_audit({'pr_primary': _pr}, 'component')
+    assert _prr['status'] == 'ok' and not _prr['invalid'], _prr
+    # Explicitly declaring a secondary endpoint is allowed only with a
+    # justification, and it stays visible as a warning.
+    _sec = dict(_base, primary_metric='roc_auc', metric_policy='binary_classification',
+                metric_role='secondary', metric_justification='ROC is the threshold-free sensitivity readout')
+    _sr = L.hypothesis_audit({'roc_secondary': _sec}, 'component')
+    assert not _sr['invalid'] and 'roc_secondary' in _sr['metric_secondary_justified'], _sr
+    assert any('secondary endpoint' in w for w in _sr['warnings']), _sr
     # A predicted_sign=0 result is significant but cannot be called verified.
     entries = [{'controlled': True, 'n': 7, 'significant_global': True,
                 'within_seed_noise': False, 'param_controlled': True,
