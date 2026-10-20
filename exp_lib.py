@@ -12416,6 +12416,9 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None,
         raise ValueError('eval ids must be 1-D or 2-D (sequences x length)')
     nested = selection_rows is not None or evaluation_rows is not None
     if nested:
+        if selection_rows is None or evaluation_rows is None:
+            raise ValueError('nested simple-baseline selection requires BOTH '
+                             'selection_rows and evaluation_rows')
         if eval_arr.ndim != 2:
             raise ValueError('nested simple-baseline selection needs a 2-D evaluation tensor (rows x length)')
         _n_rows = int(eval_arr.shape[0])
@@ -12689,6 +12692,9 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             nt.add(_nt)
         if len(nt) > 1:
             problems.append(f'{arm}: trials evaluated different token counts {sorted(nt)} — PPLs are not comparable')
+        if not nt:
+            problems.append(f'{arm}: no trial records its evaluation token count — '
+                            'the common denominator is unattested')
         n_tokens_by_arm[arm] = sorted(nt)
         # Optional per-row accounting: when present it must describe the same
         # sample as the reported floor.  A mismatch means the floor contrast
@@ -15709,10 +15715,20 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     # Arm-level mean±std: the seed reliability is visible even for arms that
     # are not part of a declared contrast.  Group by protocol so different
     # evaluation/warmup conditions never get pooled into a fake larger n.
+    def _slice_fp(r):
+        # Pooling two validation slices into one arm mean is the same units
+        # error aggregate() refuses; keep the slice in the identity.
+        return tuple(str(r.get(k) or '') for k in
+                     ('val_fp', 'eval_fp', 'holdout_row_fp'))
+
     _arm_groups = {}
     for (v, t, s), r in recs.items():
-        _arm_groups.setdefault((v, str(t or '')), {})[s] = r
-    for (v, t), _by_seed in sorted(_arm_groups.items()):
+        _arm_groups.setdefault((v, str(t or ''), _slice_fp(r)), {})[s] = r
+    _base_counts = {}
+    for (v, t, _fpk) in _arm_groups:
+        _base_counts[(v, t)] = _base_counts.get((v, t), 0) + 1
+    _base_seen = {}
+    for (v, t, _fpk), _by_seed in sorted(_arm_groups.items()):
         _recs_sorted = [_by_seed[s] for s in sorted(_by_seed)]
         _primary = [_record_primary_ppl(r) for r in _recs_sorted]
         _miss = sum(v is None for v in _primary)
@@ -15734,6 +15750,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                 for r in _recs_sorted)
                          else 'full_validation')
         _key = v if not t else '%s::%s' % (v, t)
+        if _base_counts.get((v, t), 0) > 1:
+            _idx = _base_seen.get((v, t), 0)
+            _base_seen[(v, t)] = _idx + 1
+            _key = '%s::slice%d' % (_key, _idx)
+            report['warnings'].append(
+                '%s: records span different validation slices; arm summary is '
+                'split by slice instead of pooling different documents' % _key)
         _pooled, _nll_tot, _ntok_tot = _pooled_ppl_from_records(_recs_sorted)
         report['arm_summary'][_key] = {
             'variant': v, 'protocol': t, 'n_seeds': len(_vals),
@@ -15869,10 +15892,21 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         for _arm in _panel_arms:
             _ref = _cov.get(_arm, _arm)
             _sel = _sel_cfg.get(_ref) or _sel_cfg.get(_arm)
-            _hps = [r.get('hyperparams') for (v, _t, _s), r in recs.items()
-                    if v == _arm and isinstance(r, dict) and isinstance(r.get('hyperparams'), dict)]
+            _arm_recs = [r for (v, _t, _s), r in recs.items()
+                         if v == _arm and isinstance(r, dict)]
+            _hps = [r.get('hyperparams') for r in _arm_recs
+                    if isinstance(r.get('hyperparams'), dict)]
             if not isinstance(_sel, dict) or not _hps:
                 _panel_cfg_ok[_arm] = False
+                continue
+            if len(_hps) != len(_arm_recs):
+                # One matching seed cannot certify an arm whose other seeds
+                # carry no structured hyperparameters.
+                _panel_cfg_ok[_arm] = False
+                report['warnings'].append(
+                    '%s: only %d/%d panel record(s) carry structured '
+                    'hyperparameters; the tuned-config claim is unverifiable '
+                    'for the rest' % (_arm, len(_hps), len(_arm_recs)))
                 continue
             _ok = True
             for _kn in ('lr', 'weight_decay', 'warmup'):
@@ -15966,9 +16000,22 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 _sb_row_split = _sb_data.get('row_split') if isinstance(_sb_data.get('row_split'), dict) else {}
                 _sb_nested = bool(_sb_data.get('nested_selection') is True or _sb_row_split)
                 _sb_holdout_row_fp = _sb_row_split.get('evaluation_row_fp')
+                _panel_nested = any(
+                    isinstance(r, dict)
+                    and r.get('ppl_estimation_rows') == 'nested_validation_holdout'
+                    for r in recs.values())
                 _comparable = None
                 if _sb_val_fp and _panel_val_fps:
                     _comparable = _sb_val_fp in _panel_val_fps
+                if _comparable is True and _panel_nested and not _sb_nested:
+                    # A full-validation floor includes the rows that selected
+                    # the panel's hyper-parameters; it is not the same sample
+                    # as the panel's held-out estimand.
+                    _comparable = False
+                    report['warnings'].append(
+                        'the panel uses the nested held-out estimand but the '
+                        'simple-baseline floor was scored on full validation; '
+                        'the beats-floor comparison is refused')
                 if _comparable is True:
                     if _sb_nested:
                         # Nested floor: compare the ROW-INDEX fingerprint of
@@ -19829,7 +19876,10 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
                     total += F.cross_entropy(lgf, tgf, reduction='sum').double()
                     correct += (lg.argmax(-1)[valid] == tg[valid]).sum()
                     n += int(valid.sum())
-        n = max(n, 1)
+        if n == 0:
+            # Every target was masked: the batch has no measurement, not a
+            # perfect zero loss.
+            return float('nan'), float('nan')
         return (float(total.item()) / n), (float(correct.item()) / n)
     finally:
         model.train(was_training)
@@ -20889,8 +20939,11 @@ def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False, 
         vocab = (int(np.max(train_ids)) + 1) if train_ids is not None else 64
     if seq_len is None:
         seq_len = 16
-    _seed_list = [int(s) for s in (seeds if seeds is not None else [seed])]
-    _seed_list = list(dict.fromkeys(_seed_list))
+    _raw_seeds = list(seeds if seeds is not None else [seed])
+    _parsed_seeds = [_as_seed_int(s) for s in _raw_seeds]
+    if any(s is None for s in _parsed_seeds):
+        raise ValueError(f'reproducibility_guard seeds must be integers, got {_raw_seeds!r}')
+    _seed_list = list(dict.fromkeys(_parsed_seeds))
     _full_data_fp = None
     if train_ids is not None:
         _arr = np.asarray(train_ids)

@@ -8243,6 +8243,32 @@ def t_v12_admission_rejects_synthesized_records():
     assert ('a_arm', 0) not in adm and len(adm) == 3, adm
 
 
+
+def t_seed_and_nested_input_guards():
+    # Reproduction probes must not truncate 0.2/0.8 to one seed or treat a
+    # boolean as a draw identity.
+    for bad in ([0.2, 0.8], [True, 1], ['1.5']):
+        try:
+            L.reproducibility_guard(['full'], seeds=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'reproducibility_guard accepted seeds={bad!r}')
+    # Both nested folds are required; a partial request must not crash on None.
+    rng = np.random.default_rng(3)
+    train = rng.integers(0, 16, size=200)
+    val = rng.integers(0, 16, size=(4, 8))
+    for kw in ({'selection_rows': [0]}, {'evaluation_rows': [1]}):
+        try:
+            L.simple_baseline_fit(train, val, 16, protocol=dict(
+                L.SIMPLE_BASELINE_POLICY,
+                arms={'u': {'order': 1}}, grids={'u': {'alpha': [0.1]}}), **kw)
+        except ValueError as e:
+            assert 'BOTH' in str(e), e
+        else:
+            raise AssertionError(f'partial nested folds {kw!r} were accepted')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8506,6 +8532,7 @@ def main():
     _check('L45 open-block resume binds data fingerprints', t_open_block_resume_binds_data_fingerprints)
     _check('L46 analysis checkpoint carries model geometry', t_analysis_checkpoint_carries_model_geometry)
     _check('L47 v12 admission rejects synthesized records', t_v12_admission_rejects_synthesized_records)
+    _check('L48 seed/nested input guards', t_seed_and_nested_input_guards)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
