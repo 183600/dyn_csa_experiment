@@ -1834,10 +1834,28 @@ def train_flops_estimate(params, tokens, attn_overhead=0.35):
 
     6·N·D 是前向+反向的常用近似；稀疏选择/池化/激活重算与长序列注意力
     不与参数量成比例，因此用一个**显式声明的**注意力项系数。"""
-    n = float(params)
-    d_tok = float(tokens)
+    def _positive(value, name):
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError(f'{name} must be a positive finite number, got {value!r}')
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{name} must be a positive finite number, got {value!r}') from None
+        if not (math.isfinite(f) and f > 0.0):
+            raise ValueError(f'{name} must be a positive finite number, got {value!r}')
+        return f
+    n = _positive(params, 'params')
+    d_tok = _positive(tokens, 'tokens')
+    if isinstance(attn_overhead, (bool, np.bool_)):
+        raise ValueError(f'attn_overhead must be a finite non-negative number, got {attn_overhead!r}')
+    try:
+        overhead = float(attn_overhead)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'attn_overhead must be a finite non-negative number, got {attn_overhead!r}') from None
+    if not (math.isfinite(overhead) and overhead >= 0.0):
+        raise ValueError(f'attn_overhead must be a finite non-negative number, got {attn_overhead!r}')
     base = 6.0 * n * d_tok
-    return {'flops_6nd': base, 'flops_with_attn_proxy': base * (1.0 + attn_overhead), 'attn_overhead_assumed': attn_overhead, 'note': 'analytic PROXY, not a measurement; report alongside TimeGuard seconds'}
+    return {'flops_6nd': base, 'flops_with_attn_proxy': base * (1.0 + overhead), 'attn_overhead_assumed': overhead, 'note': 'analytic PROXY, not a measurement; report alongside TimeGuard seconds'}
 
 
 def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.json'), panels=(('results_lm_v10_scale_s', 'csa_fixed', 8000), ('results_lm_v10_scale_l8k', 'csa_fixed', 8000), ('results_lm_v10_scale_lflop', 'csa_fixed', None))):

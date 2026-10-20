@@ -5607,6 +5607,24 @@ def t_audit_budget_integer_runs():
             json.dump({'booked_seconds': 1.0, 'runs': [1, 2]}, f)
         out = A.audit_budget(state_files=(state,), panels=())
         assert out['measured'][state]['run_count'] == 2, out
+        # A FLOPs proxy is only defined for positive finite params/tokens and
+        # a non-negative overhead; bool/NaN/negative values must not be
+        # silently converted into a plausible-looking budget.
+        for _args in ((0, 10), (True, 10), (10, True), (10, 0),
+                      (float('nan'), 10), (10, float('inf'))):
+            try:
+                A.train_flops_estimate(*_args)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'train_flops_estimate{_args!r} must be refused')
+        for _ov in (True, -0.1, float('nan'), float('inf'), 'x'):
+            try:
+                A.train_flops_estimate(10, 10, attn_overhead=_ov)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'attn_overhead={_ov!r} must be refused')
 
 
 def t_audit_failures_ignores_unmeasured_ppl():
