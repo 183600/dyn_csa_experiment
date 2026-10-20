@@ -5641,7 +5641,8 @@ def t_par_watchdog_override_validation():
     assert par._job_watchdog_seconds({'kind': 'x', 'watchdog_seconds': 42}, ctx) == 42.0
     assert par._job_watchdog_seconds({'kind': 'x'}, {'watchdog_seconds': 7}) == 7.0
     assert par._job_watchdog_seconds({'kind': 'x', 'watchdog_seconds': 0}, ctx) == 12.0 * 3600.0
-    for bad in (-1, 0.5 and -0.5, float('nan'), float('inf'), 'not-a-number'):
+    for bad in (-1, 0.5 and -0.5, float('nan'), float('inf'), 'not-a-number',
+                True, False):
         try:
             par._job_watchdog_seconds({'kind': 'x', 'watchdog_seconds': bad}, ctx)
         except ValueError:

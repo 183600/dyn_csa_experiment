@@ -343,6 +343,12 @@ def _job_watchdog_seconds(job, ctx):
     # A negative, NaN or non-numeric override cannot bound a live child and
     # must be rejected instead of silently disabling the watchdog (NaN) or
     # killing every cell immediately (negative).
+    if isinstance(v, (bool, np.bool_)):
+        # A boolean flag is not a duration: True would silently become a
+        # one-second watchdog that kills every healthy cell immediately.
+        raise ValueError(
+            f"watchdog_seconds must be a positive finite number, got {v!r}"
+        )
     if v is not None and v != 0:
         try:
             fv = float(v)
