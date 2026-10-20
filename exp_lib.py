@@ -21263,6 +21263,12 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     n_rows, seq = int(vb.shape[0]), int(vb.shape[1])
     span = seq - 1
     V = int(vocab)
+    # A negative token budget asks torch.topk for a negative k; zero is a
+    # valid "inventory only the whole-split tally" request.
+    _top_tokens = _exact_count(top_tokens, minimum=0)
+    if _top_tokens is None:
+        raise ValueError(f'analyze_errors needs a non-negative integer top_tokens, got {top_tokens!r}')
+    top_tokens = int(_top_tokens)
     freq = None
     if train_ids is not None:
         try:

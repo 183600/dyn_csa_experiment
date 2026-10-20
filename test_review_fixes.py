@@ -6915,6 +6915,14 @@ def t_report_training_health_actions():
         BR._result_summaries = orig
     assert 'steps since best' in txt and 'add regularization' in txt, txt
     assert '500' in txt and 'gap slope' in txt, txt
+    # Malformed history/actions collections must not crash the section.
+    bad = dict(rec, health_history=1, curve_health=dict(rec['curve_health'], actions='one action'))
+    BR._result_summaries = lambda: {'results_unit': {'b::s0': bad}}
+    try:
+        txt2 = BR.sec_training_health()
+    finally:
+        BR._result_summaries = orig
+    assert 'one action' in txt2 and 'n/a' in txt2, txt2
 
 
 def t_report_early_stop_section():
@@ -8661,6 +8669,14 @@ def t_error_analysis_excludes_nonfinite_targets():
     r_real = L.analyze_errors(real, vb_real, 17, torch.device('cpu'),
                               top_n=5, top_tokens=100, chunk=2, topk=5)
     assert r_real['n_targets'] == 33 and real.training is True, r_real
+    try:
+        L.analyze_errors(real, vb_real, 17, torch.device('cpu'), top_tokens=-1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a negative top_tokens budget must be refused')
+    r_zero = L.analyze_errors(real, vb_real, 17, torch.device('cpu'), top_tokens=0)
+    assert r_zero['worst_tokens'] == [], r_zero['worst_tokens']
 
 
 def t_gapfill_numeric_reader_rejects_booleans():
