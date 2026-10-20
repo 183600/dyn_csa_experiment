@@ -10127,10 +10127,20 @@ def _scale_points(points):
             vals = []
             seeds = None
         else:
+            if isinstance(eff, (str, bytes)):
+                raise ValueError('scale point %r: effects must be an iterable of '
+                                 'measurements, got a string %r'
+                                 % (label, eff))
             try:
                 vals = list(eff)
             except TypeError:
-                continue
+                # Silently `continue`-ing used to delete the declared tier from
+                # the family, so the surviving points looked like a complete
+                # ladder.  A malformed effects field is a plan/data error, not
+                # an empty measurement.
+                raise ValueError('scale point %r: effects must be an iterable '
+                                 'of measurements (or None for a declared empty '
+                                 'tier), got %r' % (label, eff)) from None
         _seeds_declared = seeds is not None
         if seeds is None:
             keep = [(j, f) for j, f in ((j, _finite_scalar(v)) for j, v in enumerate(vals))

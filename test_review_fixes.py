@@ -6342,6 +6342,16 @@ def t_scale_corpus_binding_refuses_mixed_tokenizers():
 def t_scale_point_provenance_roundtrip():
     # _scale_points carries the per-point corpus provenance through both
     # input forms; the m0 analysis path builds these from record data_version.
+    # A malformed effects field must not silently delete the declared tier;
+    # None remains the explicit declared-empty form.
+    for _bad_eff in (1.0, True, 'abc', b'ab'):
+        try:
+            L._scale_points([{'label': 'Sbad', 'scale': 1,
+                              'effects': _bad_eff, 'seeds': [0]}])
+        except ValueError as e:
+            assert 'effects must be an iterable' in str(e), (_bad_eff, e)
+        else:
+            raise AssertionError(f'malformed effects {_bad_eff!r} was not refused')
     pts = L._scale_points([
         {'label': 'S1', 'scale': 1, 'effects': [0.1, 0.2], 'seeds': [0, 1],
          'corpus_fp': 'fpA', 'vocab': 8000},

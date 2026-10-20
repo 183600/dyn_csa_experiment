@@ -1582,3 +1582,11 @@ seeds」。
 并记录 `ppl_estimand`、`ppl_primary_missing`。若同一臂中有记录声明嵌套却
 缺 holdout 记账，则整臂显式回退到全验证值并记 warning（与 aggregate 同一
 约定），绝不把两个样本混在一个均值里。
+
+## 34. 规模点 effects 字段非法时不得静默删除 tier（本轮硬化）
+
+`_scale_points` 过去对非可迭代的 `effects`（例如误传一个标量）执行
+`continue`，该 tier 就从族里消失，剩余点看起来像完整阶梯。`effects=None`
+仍是「已声明的空测量」，但数字/布尔/字符串/bytes 等非法形式现在直接抛
+`ValueError`；调用方必须给出测量向量或显式 `None`。这样规模分析不会因为
+一个格式错误而偷偷改变族大小或「共同效应」的可见性。
