@@ -2283,6 +2283,77 @@ def t_review3_span_clean_key():
     assert 'span_len' not in clean and clean['n_seq'] == 16, clean
     assert pp['span_len'] == 32, 'the measured cell must keep span_len'
 
+def t_objective_ablation_is_declared_not_a_confound():
+    # The loss-term arm zeroes the per-layer multiplier, so the descriptor must
+    # report that comp_reg does NOT apply (previously it copied the configured
+    # lambda and silently described the wrong objective).
+    m_full = L.SmallGPT(64, 32, 2, 2, 16, 16, L.make_layer_cfgs(2, 'csa_dynamic'))
+    m_none = L.SmallGPT(64, 32, 2, 2, 16, 16, L.make_layer_cfgs(2, 'csa_dyn_nocomp'))
+    o_full = L.train_objective(m_full, comp_lambda=0.05, delta_lr_mult=10.0)
+    o_none = L.train_objective(m_none, comp_lambda=0.05, delta_lr_mult=10.0)
+    assert o_full['comp_reg_applies'] is True and o_full['comp_lambda_effective'] > 0, o_full
+    assert o_none['comp_reg_applies'] is False and o_none['comp_lambda_effective'] == 0.0, o_none
+    assert 'comp_reg' not in o_none['loss_terms'], o_none
+    assert o_none['comp_reg_configured_layers'] == o_full['comp_reg_configured_layers'] == 2, (o_full, o_none)
+    _r, _keys = L._objective_diff({'train_objective': o_full}, {'train_objective': o_none})
+    assert _r and _keys == ['comp_reg_applies', 'comp_lambda_effective', 'loss_terms'], (_r, _keys)
+    # The objective difference is the declared intervention for this module,
+    # not an undeclared confound: six same-direction seeds must verify it
+    # rather than downgrade it to system_level_only.
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    s = {}
+    for i in range(6):
+        s[f'csa_dynamic::seed{i}'] = dict(
+            variant='csa_dynamic', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+            ppl=49.0, params=100, train_knobs=knobs, train_objective=o_full)
+        s[f'csa_dyn_nocomp::seed{i}'] = dict(
+            variant='csa_dyn_nocomp', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+            ppl=50.0, params=100, train_knobs=knobs, train_objective=o_none)
+    rep = L.methodology_audit(
+        s, design={'compression_regularizer': [
+            ('csa_dynamic', 'csa_dyn_nocomp', 'loss term')]},
+        baselines={}, verbose=False)
+    e = rep['components']['compression_regularizer'][0]
+    assert e['objective_expected_differences'] == sorted([
+        'comp_reg_applies', 'comp_lambda_effective', 'loss_terms']), e
+    assert e.get('mechanism_claim_allowed') is not False, e
+    assert 'compression_regularizer' in rep['verified_components'], rep
+    assert 'compression_regularizer' not in rep['system_level_only_components'], rep
+    # The task-learned boundary arm differs in its policy term, which is also
+    # the declared intervention.
+    o_task = dict(o_full, boundary_policy=['reinforce'],
+                  loss_terms=['ce', 'comp_reg', 'boundary_policy_gradient'])
+    s2 = {}
+    for i in range(6):
+        s2[f'csa_dynamic_task::seed{i}'] = dict(
+            variant='csa_dynamic_task', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+            ppl=49.0, params=100, train_knobs=knobs, train_objective=o_task)
+        s2[f'csa_dynamic::seed{i}'] = dict(
+            variant='csa_dynamic', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+            ppl=50.0, params=100, train_knobs=knobs, train_objective=o_full)
+    rep2 = L.methodology_audit(
+        s2, design={'task_learned_boundary': [
+            ('csa_dynamic_task', 'csa_dynamic', 'policy')]},
+        baselines={}, verbose=False)
+    e2 = rep2['components']['task_learned_boundary'][0]
+    assert e2['objective_expected_differences'] == sorted(
+        ['boundary_policy', 'loss_terms']), e2
+    assert 'task_learned_boundary' in rep2['verified_components'], rep2
+    # An UNDECLARED objective change is still a confound.
+    o_bad = dict(o_full, boundary_policy=['reinforce'])
+    s3 = {k: dict(v) for k, v in s.items()}
+    for i in range(6):
+        s3[f'csa_dyn_nocomp::seed{i}']['train_objective'] = o_bad
+    rep3 = L.methodology_audit(
+        s3, design={'compression_regularizer': [
+            ('csa_dynamic', 'csa_dyn_nocomp', 'loss term')]},
+        baselines={}, verbose=False)
+    e3 = rep3['components']['compression_regularizer'][0]
+    assert e3.get('mechanism_claim_allowed') is False, e3
+    assert 'compression_regularizer' in rep3['system_level_only_components'], rep3
+
+
 def t_review3_boundary_arm_and_objective():
     cfg = L.make_layer_cfgs(1, 'csa_dynamic_task')[0]
     assert getattr(cfg, 'boundary_policy', None) == 'reinforce', cfg
@@ -9680,6 +9751,7 @@ def main():
     _check('J2b nested records pair on the primary holdout estimand', t_nested_primary_paired_deltas)
     _check('J3 Holm declared-family slots', t_review3_holm_family_size)
     _check('J4 task-boundary arm + objective descriptor', t_review3_boundary_arm_and_objective)
+    _check('J4b declared objective ablations are not confounds', t_objective_ablation_is_declared_not_a_confound)
     _check('J5 span clean-baseline key', t_review3_span_clean_key)
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E1a seed/variant axis normalisation', t_seed_axis_normalization)

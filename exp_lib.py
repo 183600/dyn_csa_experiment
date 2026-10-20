@@ -8875,16 +8875,27 @@ def train_objective(m, *, comp_lambda=0.0, delta_lr_mult=1.0):
     # regularizer exists only for cosine_learnable gates, whose trunk computes
     # `last_gate_mean`; deriving this from `need_reg` falsely labels dense and
     # fixed-CSA arms as having a compression objective.
-    reg_layers = sum(1 for a in layers if str(getattr(a.cfg, 'chunking', '')) == 'cosine_learnable')
+    _reg_cfgs = [a.cfg for a in layers
+                 if str(getattr(a.cfg, 'chunking', '')) == 'cosine_learnable']
+    # `comp_lambda_mult` is a per-layer multiplier (HCA layers use 4x, and the
+    # loss-term ablation zeroes it).  Counting the layer as regularised just
+    # because its chunking is cosine_learnable mislabels `csa_dyn_nocomp` as
+    # having the same objective as `csa_dynamic`.
+    _mults = [float(getattr(c, 'comp_lambda_mult', 1.0)) for c in _reg_cfgs]
+    _active = [m for m in _mults if float(comp_lambda) != 0.0 and m != 0.0]
+    reg_layers = len(_active)
     _named = dict(m.named_parameters())
     delta_names = [n for n in _named if 'delta_logit' in n]
     delta_params = sum(int(_named[n].numel()) for n in delta_names)
     applies = bool(comp_lambda) and reg_layers > 0
+    _weights = [float(comp_lambda) * m for m in _active]
     return {
         'comp_lambda': float(comp_lambda),
         'comp_reg_layers': int(reg_layers),
+        'comp_reg_configured_layers': int(len(_reg_cfgs)),
+        'comp_lambda_mults': sorted(set(_mults)),
         'comp_reg_applies': bool(applies),
-        'comp_lambda_effective': float(comp_lambda) if applies else 0.0,
+        'comp_lambda_effective': (max(_weights) if _weights else 0.0),
         'delta_param_count': int(delta_params),
         'delta_lr_mult': float(delta_lr_mult),
         'delta_lr_effective': float(delta_lr_mult) if delta_params else 1.0,
@@ -9003,6 +9014,33 @@ def _hyperparam_reason(ra, rb):
             return f'different hyperparams.{k} ({va!r} vs {vb!r})'
     return None
 
+_OBJECTIVE_COMPARE_KEYS = ('comp_reg_applies', 'comp_lambda_effective',
+                           'delta_lr_effective', 'boundary_policy', 'loss_terms')
+
+# A component ablation may deliberately change an objective term.  For the
+# loss-term and boundary-policy innovations the objective difference IS the
+# intervention; treating it as an undeclared confound would make those
+# declared components impossible to verify.  Every other objective difference
+# remains a system-level confound.
+OBJECTIVE_INTERVENTION_KEYS = {
+    'compression_regularizer': frozenset({'comp_reg_applies',
+                                          'comp_lambda_effective',
+                                          'loss_terms'}),
+    'task_learned_boundary': frozenset({'boundary_policy', 'loss_terms'}),
+}
+
+def _objective_diff(ra, rb):
+    """Return (human reason or None, differing objective keys)."""
+    oa, ob = ra.get('train_objective'), rb.get('train_objective')
+    if oa is None and ob is None:
+        return 'unverifiable train_objective (legacy records carry no objective descriptor)', []
+    if (oa is None) != (ob is None):
+        return 'unverifiable train_objective (only one record carries the objective descriptor)', []
+    if not isinstance(oa, dict) or not isinstance(ob, dict):
+        return 'unverifiable train_objective (malformed descriptor)', []
+    diffs = [k for k in _OBJECTIVE_COMPARE_KEYS if oa.get(k) != ob.get(k)]
+    return (('objective differs: ' + ', '.join(diffs)) if diffs else None), diffs
+
 def objective_reason(ra, rb):
     """Compare the ACTUAL loss/optimizer objective of two arms.
 
@@ -9014,18 +9052,7 @@ def objective_reason(ra, rb):
     carry matching objective descriptors, a reason string otherwise, and
     'unverifiable ...' when the descriptors are absent/one-sided (legacy
     records keep the permissive path, but the state is reported)."""
-    oa, ob = ra.get('train_objective'), rb.get('train_objective')
-    if oa is None and ob is None:
-        return 'unverifiable train_objective (legacy records carry no objective descriptor)'
-    if (oa is None) != (ob is None):
-        return 'unverifiable train_objective (only one record carries the objective descriptor)'
-    if not isinstance(oa, dict) or not isinstance(ob, dict):
-        return 'unverifiable train_objective (malformed descriptor)'
-    diffs = []
-    for k in ('comp_reg_applies', 'delta_lr_effective', 'boundary_policy'):
-        if oa.get(k) != ob.get(k):
-            diffs.append(k)
-    return ('objective differs: ' + ', '.join(diffs)) if diffs else None
+    return _objective_diff(ra, rb)[0]
 
 def ppl_is_usable(v):
     f = _finite_scalar(v)
@@ -16720,10 +16747,25 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         _a_vals.append(float(_av))
                         _b_vals.append(float(_bv))
                     st = paired_effect_stats(deltas, alpha=alpha, min_n=min_n, with_values=_a_vals, without_values=_b_vals)
-                    _obj = sorted({objective_reason(recs[(a, ts, s)], recs[(b, bs, s)]) for s in _passed})
-                    _obj_bad = [x for x in _obj if x and x.startswith('objective differs')]
-                    st['objective_matched'] = (False if _obj_bad else (True if all(x is None for x in _obj) else None))
-                    st['objective_differences'] = _obj_bad or [x for x in _obj if x and x.startswith('unverifiable')]
+                    _obj_pairs = [_objective_diff(recs[(a, ts, s)], recs[(b, bs, s)])
+                                  for s in _passed]
+                    _obj = sorted({r for r, _ks in _obj_pairs if r})
+                    _obj_keys = sorted({k for _r, ks in _obj_pairs for k in ks})
+                    # Only an UNDECLARED objective difference is a confound.
+                    # For the loss-term and task-learned-boundary components
+                    # the objective change is the intervention itself.
+                    _expected_obj = (OBJECTIVE_INTERVENTION_KEYS.get(comp, frozenset())
+                                     if kind == 'component' else frozenset())
+                    _obj_unexpected = [k for k in _obj_keys if k not in _expected_obj]
+                    _obj_bad = (['objective differs: ' + ', '.join(_obj_unexpected)]
+                                if _obj_unexpected else [])
+                    st['objective_matched'] = (False if _obj_keys else (
+                        True if all(r is None for r, _ks in _obj_pairs) else None))
+                    st['objective_differences'] = _obj_bad or [
+                        x for x in _obj if x.startswith('unverifiable')]
+                    st['objective_expected_differences'] = sorted(
+                        set(_obj_keys) & set(_expected_obj))
+                    st['objective_differences_all'] = list(_obj_keys)
                     if _obj_bad:
                         st['mechanism_claim_allowed'] = False
                         report.setdefault('objective_confounded', []).append(
