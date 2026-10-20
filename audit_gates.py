@@ -111,10 +111,10 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             'preferred_train_seq_len', preferred_train_seq_len)
     _max_shingle_ov = _audit_nonneg_float(
         'CSA_MAX_TEST_SHINGLE_OVERLAP',
-        os.environ.get('CSA_MAX_TEST_SHINGLE_OVERLAP', 0.25))
+        os.environ.get('CSA_MAX_TEST_SHINGLE_OVERLAP') or '0.25')
     _max_row_ov = _audit_nonneg_float(
         'CSA_MAX_TEST_ROW_OVERLAP',
-        os.environ.get('CSA_MAX_TEST_ROW_OVERLAP', 0.50))
+        os.environ.get('CSA_MAX_TEST_ROW_OVERLAP') or '0.50')
     if cache_dir in (None, ''):
         cache_dir = os.environ.get('WT103_CACHE_DIR') or './wt103_cache'
     out = {'status': 'ok', 'checks': {}}
@@ -165,11 +165,20 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                 continue
             _pairs.append((_mp, _mmeta, _tp, _tmeta))
     if preferred_train_seq_len is not None:
-        _pref = [p for p in _pairs
-                 if p[1].get('seq_len') is not None
-                 and int(p[1]['seq_len']) == int(preferred_train_seq_len)]
-        if _pref:
-            _pairs = _pref
+        _pref = []
+        for _p in _pairs:
+            _sv = _as_int(_p[1].get('seq_len'))
+            if _sv is not None and _sv == int(preferred_train_seq_len):
+                _pref.append(_p)
+        if not _pref:
+            # The caller named the training sequence length; silently falling
+            # back to a different one would audit the wrong split.
+            out['status'] = 'not_verifiable_locally'
+            out['note'] = (f'no train cache with seq_len={preferred_train_seq_len} '
+                           'matches the test cache protocol; refusing to guess '
+                           'which train split is authoritative')
+            return out
+        _pairs = _pref
     if not _pairs:
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no train/test cache pair shares the same vocab/tokenizer-fit provenance; cannot audit tokenizer or split provenance without guessing'

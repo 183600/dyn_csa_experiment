@@ -4073,6 +4073,12 @@ def t_audit_gate_parameters_fail_closed():
             json.dump({'vocab': 1000, 'src_fp': 'a'}, f)
         with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
             json.dump({'vocab': 1000, 'src_fp': 'b'}, f)
+        # A requested train seq_len that no cache declares must refuse to
+        # guess, not audit a different split.
+        _pref = A.audit_leakage(cache_dir=cache, shingle=4,
+                                max_rows_shingled=10,
+                                preferred_train_seq_len=512)
+        assert _pref['status'] == 'not_verifiable_locally', _pref
         _orig = A._window_hashes
         try:
             def _boom(*_a, **_k):
