@@ -206,6 +206,24 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     _tok_problems = []
     if not out['checks']['vocab_agree']:
         _tok_problems.append('test/train cache vocabs disagree')
+    # a) tokenizer-fit provenance: the test meta must name the SAME fit corpus
+    # as the train meta.  A missing fingerprint is unverifiable and must not
+    # silently pass just because the id caches happen to share a vocab.
+    _train_fit = train_meta.get('fit_fp')
+    _test_fit = test_meta.get('fit_fp')
+    out['checks']['train_fit_fp'] = _train_fit
+    _fit_agree = None
+    if _train_fit is not None and _test_fit is not None:
+        _fit_agree = str(_train_fit) == str(_test_fit)
+        if not _fit_agree:
+            _tok_problems.append(
+                'test tokenizer fit_fp differs from the train cache fit_fp '
+                '(the test tokenizer was not fit on the same train prefix)')
+    else:
+        _tok_problems.append(
+            'tokenizer fit provenance is missing on the train and/or test meta; '
+            'the test tokenizer cannot be bound to the train rows')
+    out['checks']['fit_fp_agree'] = _fit_agree
     # b) persisted tokenizers, if both exist.  Use the tag-paired files, never
     # the first filename in the directory.
     import hashlib

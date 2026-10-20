@@ -4127,14 +4127,27 @@ def t_audit_leakage_handles_flat_train_cache():
         # Recompute the loader fingerprint from the id caches, not just trust
         # the metadata string.
         with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
-            json.dump({'vocab': 1000, 'src_fp': L._ids_fp(train)}, f)
+            json.dump({'vocab': 1000, 'src_fp': L._ids_fp(train), 'fit_fp': 'FITX'}, f)
         with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
-            json.dump({'vocab': 1000, 'src_fp': L._ids_fp(test)}, f)
+            json.dump({'vocab': 1000, 'src_fp': L._ids_fp(test), 'fit_fp': 'FITX'}, f)
         good = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
         fp = good['checks']['id_cache_fingerprints']
         assert fp['train']['status'] == 'ok' and fp['test']['status'] == 'ok', fp
+        assert good['checks']['fit_fp_agree'] is True, good['checks']
         with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
-            json.dump({'vocab': 1000, 'src_fp': 'stale'}, f)
+            json.dump({'vocab': 1000, 'src_fp': L._ids_fp(test), 'fit_fp': 'OTHER'}, f)
+        mism = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        assert mism['status'] == 'not_verifiable_locally', mism
+        assert 'no train/test cache pair' in mism.get('note', ''), mism
+        # A one-sided fit fingerprint cannot be assumed to match.
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': L._ids_fp(test)}, f)
+        missing = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        assert missing['status'] == 'fail', missing
+        assert any('fit provenance is missing' in x
+                   for x in missing['checks'].get('tokenizer_problems') or []), missing
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': 'stale', 'fit_fp': 'FITX'}, f)
         stale = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
         assert stale['status'] == 'fail', stale
         assert any('id-cache fingerprint' in x for x in stale['checks'].get('tokenizer_problems') or []), stale
