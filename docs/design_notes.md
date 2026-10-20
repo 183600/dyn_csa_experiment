@@ -1246,11 +1246,13 @@ README_zh 与 `RELEASES.md` 中均已明示。
 保持原顺序，历史工件仍可声明为完整网格的严格子集。
 
 `baseline_tuning_audit` 新增 `grid_levels` / `grid_coverage` /
-`grid_boundary_hits` / `grid_adequacy`：若选中的 lr 或 weight decay
-落在声明网格的最小/最大层（且该参数至少有 3 层），说明最优可能位于
-网格之外，审计给出 warning；若某个参数只有 1–2 层，也会提示网格过粗。
-选中值不在声明层上则是 problem，不是「调过参」。注意 warning 不会被
-误读成 pass：它明确要求扩展网格并重跑等宽搜索。
+`grid_boundary_hits` / `grid_adequacy`。边界判定使用**该臂实际搜索过的
+层**（`searched_levels`），而不只是声明的完整网格：一个被预算截断、
+只跑了前两层的臂，其最大值就是搜索边界。若选中的 lr 或 weight decay
+落在实际搜索的最小/最大层（且至少 3 层），说明最优可能位于网格之外；
+若 lr 只有 1–2 层，也会提示网格过粗。选中值不在声明/实际搜索层上则是
+problem，不是「调过参」。warning 明确要求扩展网格并重跑等宽搜索，不能
+被误读成 pass。
 
 ### 26.4 指标口径从「声明」变成「按记录核验」
 

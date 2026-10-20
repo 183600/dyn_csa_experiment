@@ -2619,6 +2619,15 @@ def t_tuning_grid_boundary_adequacy():
     assert any('boundary of the declared search grid' in w for w in edge['warnings']), edge
     inside = L.baseline_tuning_audit(_art(1, [10.0, 8.0, 9.0]), protocol=protocol)
     assert inside['grid_adequacy'] == 'ok' and not inside['grid_boundary_hits'], inside
+    # A capped search that stopped at the first two declared levels has a
+    # boundary at its own maximum even though more levels were declared.
+    capped = _art(1, [10.0, 8.0])
+    capped['arms']['a']['trials'] = capped['arms']['a']['trials'][:2]
+    capped['arms']['a']['selected'] = dict(trials[1])
+    rc = L.baseline_tuning_audit(capped, protocol=protocol)
+    assert rc['grid_adequacy'] == 'warn', rc
+    assert rc['grid_coverage']['a']['lr']['n_searched_levels'] == 2, rc['grid_coverage']
+    assert any('searched level' in w for w in rc['warnings']), rc
     # A selected value outside the declared levels is not a tuned winner.
     outside = _art(1, [10.0, 8.0, 9.0])
     outside['arms']['a']['selected'] = {'lr': 0.002, 'weight_decay': 0.1, 'warmup': 50}

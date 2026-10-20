@@ -13234,10 +13234,23 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         if not isinstance(chosen, dict):
             continue
         per_knob = {}
+        _searched_by_knob = {}
         for _kn, _levels in _grid_levels.items():
             _sel = _finite_scalar(chosen.get(_kn))
             if _sel is None:
                 continue
+            # Boundary adequacy is about the levels this arm ACTUALLY searched,
+            # not only the declared grid: a capped run that stopped at the
+            # first two trials has a boundary even if more levels were declared.
+            _searched = []
+            for _t in (entry.get('trials') or []):
+                if not isinstance(_t, dict):
+                    continue
+                _f = _finite_scalar((_t.get('config') or {}).get(_kn))
+                if _f is not None and _f not in _searched:
+                    _searched.append(_f)
+            _searched.sort()
+            _searched_by_knob[_kn] = _searched
             _pos = None
             for _i, _v in enumerate(_levels):
                 if abs(float(_v) - _sel) <= 1e-12 * max(1.0, abs(_sel)):
@@ -13246,19 +13259,34 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             if _pos is None:
                 problems.append(f'{arm}: selected {_kn}={_sel} is outside the declared trial levels {_levels}')
                 per_knob[_kn] = {'selected': _sel, 'levels': _levels,
+                                 'searched_levels': _searched,
                                  'n_levels': len(_levels), 'position': None,
                                  'at_boundary': None, 'outside_grid': True}
                 continue
-            _at_boundary = bool(len(_levels) >= 3 and _pos in (0, len(_levels) - 1))
+            _spos = None
+            for _i, _v in enumerate(_searched):
+                if abs(float(_v) - _sel) <= 1e-12 * max(1.0, abs(_sel)):
+                    _spos = _i
+                    break
+            if _spos is None:
+                problems.append(f'{arm}: selected {_kn}={_sel} is outside the searched levels {_searched}')
+                per_knob[_kn] = {'selected': _sel, 'levels': _levels,
+                                 'searched_levels': _searched,
+                                 'n_levels': len(_levels), 'position': _pos,
+                                 'at_boundary': None, 'outside_grid': True}
+                continue
+            _at_boundary = bool(len(_searched) >= 3 and _spos in (0, len(_searched) - 1))
             per_knob[_kn] = {'selected': _sel, 'levels': _levels,
-                             'n_levels': len(_levels), 'position': _pos,
+                             'searched_levels': _searched,
+                             'n_levels': len(_levels),
+                             'n_searched_levels': len(_searched),
+                             'position': _pos, 'searched_position': _spos,
                              'at_boundary': _at_boundary, 'outside_grid': False}
             if _at_boundary:
                 _boundary_hits.append(f'{arm}:{_kn}')
+            if _kn == 'lr' and 0 < len(_searched) < 3:
+                _coarse.append(f'{arm}: lr has only {len(_searched)} searched level(s)')
         grid_coverage[arm] = per_knob
-    for _kn, _levels in _grid_levels.items():
-        if _kn == 'lr' and 0 < len(_levels) < 3:
-            _coarse.append(f'{_kn} has only {len(_levels)} level(s)')
     if _boundary_hits:
         warnings.append('selected hyperparameter(s) sit on the boundary of the declared search grid ('
                         + ', '.join(_boundary_hits) + ') — the optimum may lie outside the searched range; '
