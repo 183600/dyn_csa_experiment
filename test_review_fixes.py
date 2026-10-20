@@ -5107,6 +5107,13 @@ def t_data_quality_exact_integer_and_complex_rows():
     assert L.duplicate_mask(np.array([['a'], ['b'], ['a']])).tolist() == [False, False, True]
     assert L.duplicate_mask(np.array([b'a', b'b', b'a'])).tolist() == [False, False, True]
     assert L.duplicate_mask(np.array(['1', 1], dtype=object)).tolist() == [False, False]
+    # Structured-array rows (common for grouped feature records) are also
+    # well-defined categorical identities, not a float-cast crash.
+    _rec = np.array([(1, 2), (1, 2), (3, 4)],
+                    dtype=[('a', '<i4'), ('b', '<i4')])
+    assert L.duplicate_mask(_rec).tolist() == [False, True, False]
+    import data_guard as _DG
+    assert _DG._matrix_fingerprint(_rec) == _DG._matrix_fingerprint(_rec.copy())
 
 
 def t_exact_numeric_contracts_and_fingerprint():

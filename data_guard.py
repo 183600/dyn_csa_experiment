@@ -1511,8 +1511,8 @@ def _matrix_fingerprint(X):
         raise TypeError(
             'matrix fingerprint needs real-valued rows; casting complex rows '
             'to float64 would silently discard the imaginary part')
-    if arr.dtype.kind in 'SU':
-        # Native unicode/bytes categorical tables have no float cast.  Route
+    if arr.dtype.kind in 'SUV':
+        # Native unicode/bytes/structured tables have no float cast.  Route
         # them through the same canonical object-row keys as object columns.
         arr = arr.astype(object)
     if arr.dtype == object:
@@ -1586,7 +1586,13 @@ def _matrix_fingerprint(X):
             bad = [row for row, (_vals, ok) in zip(block.tolist(), parsed)
                    if not ok]
             if bad:
-                for key in _row_keys(np.asarray(bad, dtype=object)):
+                # Build the object table explicitly: np.asarray(bad) would
+                # expand tuple-valued cells (structured/void rows) into an
+                # extra dimension instead of keeping one cell per column.
+                _bad_obj = np.empty((len(bad), int(_obj.shape[1])), dtype=object)
+                for _bi, _brow in enumerate(bad):
+                    _bad_obj[_bi, :] = _brow
+                for key in _row_keys(_bad_obj):
                     h.update(b'|')
                     h.update(key)
         return h.hexdigest()[:16]
@@ -1646,8 +1652,8 @@ def _row_keys(X):
             'to float64 would silently discard the imaginary part')
     if src.ndim == 1:
         src = src.reshape(-1, 1)
-    if src.dtype.kind in 'SU':
-        # Native unicode/bytes categorical columns are not float-castable.
+    if src.dtype.kind in 'SUV':
+        # Native unicode/bytes/structured columns are not float-castable.
         # Canonical object keys keep their type-qualified identity (so b'a',
         # 'a' and 1 remain distinct) instead of crashing duplicate detection.
         src = src.astype(object)
