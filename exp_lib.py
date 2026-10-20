@@ -14709,6 +14709,15 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         # Nested floor: compare the ROW-INDEX fingerprint of
                         # the held-out fold, not the token fingerprint (the
                         # panel records holdout_row_fp, not holdout token fp).
+                        _tune_split = (report.get('baseline_tuning') or {}).get('selection_row_split') or {}
+                        _sb_sel_row_fp = _sb_row_split.get('selection_row_fp')
+                        if (_tune_split.get('selection_row_fp') and _sb_sel_row_fp
+                                and _tune_split.get('selection_row_fp') != _sb_sel_row_fp):
+                            _comparable = False
+                            report['warnings'].append(
+                                'nested simple-baseline selection row fingerprint differs from the '
+                                'neural tuning selection rows — the floor and the panel were tuned on '
+                                'different documents; the beats-floor comparison is refused')
                         if _sb_holdout_row_fp and _panel_holdout_fps:
                             if _sb_holdout_row_fp not in _panel_holdout_fps:
                                 _comparable = False
