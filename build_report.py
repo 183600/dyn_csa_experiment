@@ -2134,7 +2134,10 @@ def sec_efficiency():
                 {'variant': rec.get('variant') or str(key).split('::')[0],
                  'ppl': rec.get('ppl'), 'prefill_ms_p50': eff.get('prefill_ms_p50'),
                  'params': rec.get('params'),
-                 'peak_mem_allocated_mb': eff.get('peak_mem_allocated_mb'),
+                 'peak_mem_allocated_mb': (eff.get('peak_mem_allocated_mb')
+                                           if eff.get('peak_mem_allocated_mb') is not None
+                                           else ((rec.get('peak_memory') or {}).get('max_memory_allocated_mb')
+                                                 if isinstance(rec.get('peak_memory'), dict) else None)),
                  'tokens_seen': rec.get('tokens_seen')}
                 for name, key, rec, eff in grp])
             if len(summary) >= 2 and summary[0].get('latency_ratio_vs_best') is not None:
