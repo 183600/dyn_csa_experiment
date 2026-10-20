@@ -249,6 +249,59 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                        ' — the train/test id spaces cannot be shown to be paired; '
                        'rebuild both caches with the current loaders before using '
                        'the held-out split')
+    # c) id-cache fingerprint self-consistency.  The tokenizer checks above
+    # prove the id SPACE, but a replaced/edited .npy with a stale metadata
+    # `src_fp` would still pass them.  Recompute the loader's own fingerprint
+    # from the cached ids and compare it with the recorded value.
+    _fp_checks = {}
+    try:
+        _L = _import_exp_lib()
+        for _side, _tag, _meta, _pattern, _expected in (
+                ('train', train_tag, train_meta, 'train_ids_*.npy',
+                 os.path.join(cache_dir, f'train_ids_{train_tag}.npy')),
+                ('test', test_tag, test_meta, 'test_ids_*.npy',
+                 os.path.join(cache_dir, f'test_ids_{test_tag}.npy'))):
+            _path = _expected if os.path.exists(_expected) else None
+            if _path is None:
+                _cands = sorted(glob.glob(os.path.join(cache_dir, _pattern)))
+                _path = _cands[0] if len(_cands) == 1 else None
+            _recorded = (_meta or {}).get('src_fp')
+            if _path is None:
+                _fp_checks[_side] = {'status': 'unverifiable',
+                                     'reason': 'id cache file absent or ambiguous'}
+                continue
+            if _recorded is None:
+                _fp_checks[_side] = {'status': 'unverifiable',
+                                     'reason': 'metadata has no src_fp'}
+                continue
+            try:
+                _arr = np.load(_path, mmap_mode='r')
+                _actual = _L._ids_fp(_arr)
+            except Exception as _fe:
+                _fp_checks[_side] = {'status': 'fail',
+                                     'reason': f'cannot fingerprint {os.path.basename(_path)}: {_fe}'}
+                _tok_problems.append(f'{_side} id cache unreadable/unhashable ({type(_fe).__name__}: {_fe})')
+                continue
+            _ok = str(_actual) == str(_recorded)
+            _fp_checks[_side] = {'status': ('ok' if _ok else 'fail'),
+                                 'file': os.path.basename(_path),
+                                 'recorded': str(_recorded)[:16],
+                                 'actual': str(_actual)[:16]}
+            if not _ok:
+                _tok_problems.append(
+                    f'{_side} id-cache fingerprint does not match metadata src_fp '
+                    '(the cache was edited/replaced, or the meta describes another file)')
+    except Exception as _fe:
+        _fp_checks['status'] = f'failed ({type(_fe).__name__}: {_fe})'
+        _tok_problems.append(f'id-cache fingerprint audit failed ({type(_fe).__name__}: {_fe})')
+    out['checks']['id_cache_fingerprints'] = _fp_checks
+    if _tok_problems:
+        out['checks']['tokenizer_problems'] = _tok_problems
+        out['status'] = 'fail'
+        out['note'] = ('tokenizer/split provenance audit failed: ' + '; '.join(_tok_problems) +
+                       ' — the train/test id spaces cannot be shown to be paired; '
+                       'rebuild both caches with the current loaders before using '
+                       'the held-out split')
     # c2) whole-document group isolation for the held-out split.  The loaders
     # now persist test_doc_ids; when the sidecar is present, recompute the
     # train/test and val/test document intersections instead of trusting the

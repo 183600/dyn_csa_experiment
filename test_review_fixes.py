@@ -4124,6 +4124,20 @@ def t_audit_leakage_handles_flat_train_cache():
         overlap = out['checks'].get('doc_overlap')
         assert isinstance(overlap, dict), overlap
         assert overlap['shared_shingles'] > 0, overlap
+        # Recompute the loader fingerprint from the id caches, not just trust
+        # the metadata string.
+        with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': L._ids_fp(train)}, f)
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': L._ids_fp(test)}, f)
+        good = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        fp = good['checks']['id_cache_fingerprints']
+        assert fp['train']['status'] == 'ok' and fp['test']['status'] == 'ok', fp
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': 'stale'}, f)
+        stale = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        assert stale['status'] == 'fail', stale
+        assert any('id-cache fingerprint' in x for x in stale['checks'].get('tokenizer_problems') or []), stale
         # A legacy/malformed meta without a numeric vocab must fail closed, not
         # crash with int(None) before the audit can report anything.
         with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
