@@ -388,20 +388,15 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         _runner = _ranked[1] if len(_ranked) > 1 else None
         _sel_margin = _sel_margin_se = _sel_margin_z = None
         _sel_decisive = None
+        _sel_margin_method = 'unavailable'
         if _runner is not None:
-            try:
-                _sel_margin = float(_runner['ppl']) - float(best['ppl'])
-                _nb = max(1, int(best.get('n_seeds') or 1))
-                _nr = max(1, int(_runner.get('n_seeds') or 1))
-                _sb = float(best.get('ppl_std') or 0.0) / math.sqrt(_nb)
-                _sr = float(_runner.get('ppl_std') or 0.0) / math.sqrt(_nr)
-                _sel_margin_se = math.hypot(_sb, _sr)
-                _sel_margin_z = (_sel_margin / _sel_margin_se
-                                 if _sel_margin_se > 0 else None)
-                _sel_decisive = bool(_sel_margin > _sel_margin_se)
-            except (TypeError, ValueError, OverflowError):
-                _sel_margin = _sel_margin_se = _sel_margin_z = None
-                _sel_decisive = None
+            _mu = L.tuning_selection_margin(best, _runner, metric='ppl',
+                                            direction='lower_is_better')
+            _sel_margin = _mu.get('margin')
+            _sel_margin_se = _mu.get('se')
+            _sel_margin_z = _mu.get('z')
+            _sel_decisive = _mu.get('decisive')
+            _sel_margin_method = _mu.get('method')
         _stability = L.tuning_selection_stability(
             per_arm[arm], metric=protocol['selection_metric'],
             direction=protocol['direction'])
@@ -413,6 +408,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                          'selection_margin': _sel_margin,
                          'selection_margin_se': _sel_margin_se,
                          'selection_margin_in_se': _sel_margin_z,
+                         'selection_margin_method': _sel_margin_method,
                          'selection_decisive': _sel_decisive,
                          'runner_up': ({'config': dict(_runner['config']),
                                         'ppl': float(_runner['ppl'])}

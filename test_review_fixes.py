@@ -3662,9 +3662,28 @@ def t_baseline_tuning_driver_multiseed_selection():
         # Selection uncertainty is recorded, not hidden: the winning config is
         # compared with the runner-up in standard-error units.
         assert entry['selection_margin'] is not None and entry['selection_margin'] > 0, entry
-        assert entry['selection_margin_in_se'] is not None, entry
+        # The trials were paired on the same search seeds; here every seed
+        # moves by exactly the same margin, so the paired SE is 0 and the
+        # z-score is undefined (decisive, not "not computable").
+        assert entry['selection_margin_method'] == 'paired_search_seeds', entry
+        assert entry['selection_margin_se'] == 0.0 and entry['selection_margin_in_se'] is None, entry
         assert entry['selection_decisive'] is True, entry
         assert entry['runner_up'] is not None and entry['runner_up']['config'] != entry['selected'], entry
+    # Pairing matters: a consistent per-seed gain can be decisive even when
+    # the marginal SDs make the independent-SE approximation look like a tie.
+    _b = {'ppl': 10.0, 'ppl_std': 1.0, 'n_seeds': 3,
+          'seed_ppls': {'0': 9.0, '1': 11.0, '2': 10.0}}
+    _r = {'ppl': 10.1, 'ppl_std': 1.0, 'n_seeds': 3,
+          'seed_ppls': {'0': 9.1, '1': 11.1, '2': 10.1}}
+    _m = L.tuning_selection_margin(_b, _r)
+    assert _m['method'] == 'paired_search_seeds' and _m['se'] == 0.0, _m
+    assert _m['decisive'] is True and _m['decisive_independent'] is False, _m
+    assert abs(_m['margin'] - 0.1) < 1e-12 and _m['n_paired'] == 3, _m
+    # Without per-seed values the legacy independent-SE fallback is used and
+    # labelled as such.
+    _mf = L.tuning_selection_margin({'ppl': 10.0, 'ppl_std': 1.0, 'n_seeds': 3},
+                                    {'ppl': 10.1, 'ppl_std': 1.0, 'n_seeds': 3})
+    assert _mf['method'] == 'independent_marginal_se' and _mf['decisive'] is False, _mf
 
 
 def t_simple_baseline_ngram_and_audit():

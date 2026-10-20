@@ -12928,6 +12928,84 @@ def metric_policy_audit(summary=None, policy=None):
     out['status'] = 'warn' if out['warnings'] else 'ok'
     return out
 
+def tuning_selection_margin(best, runner, *, metric='ppl', direction='lower_is_better'):
+    """Margin between the selected config and the runner-up, in standard errors.
+
+    The two trials were evaluated on the SAME search seeds, so their difference
+    is paired.  Using the two marginal standard errors (``hypot(s1, s2)``)
+    ignores that pairing: it can call a perfectly consistent per-seed gain a
+    tie, or (with negatively correlated draws) call a noisy pick decisive.
+    When both trial rows expose ``seed_ppls`` we therefore compute the
+    per-seed difference, its sample SD and ``SE = SD/sqrt(n_paired)``.  Only
+    legacy rows without per-seed values fall back to the independent-SE
+    approximation, and the chosen method is returned explicitly.
+    """
+    out = {'margin': None, 'se': None, 'z': None, 'decisive': None,
+           'method': 'unavailable', 'n_paired': 0, 'common_seeds': [],
+           'se_independent': None, 'decisive_independent': None}
+    if not isinstance(best, dict) or not isinstance(runner, dict):
+        return out
+    if direction not in ('lower_is_better', 'higher_is_better'):
+        return out
+    _b = _finite_scalar(best.get(metric))
+    _r = _finite_scalar(runner.get(metric))
+    if _b is None or _r is None:
+        return out
+    margin = (_r - _b) if direction == 'lower_is_better' else (_b - _r)
+    out['margin'] = float(margin)
+
+    def _seed_map(row):
+        vals = row.get('seed_ppls')
+        if not isinstance(vals, dict):
+            return None
+        out_map = {}
+        for k, v in vals.items():
+            seed = _as_seed_int(k)
+            f = _finite_scalar(v)
+            if seed is None or f is None:
+                return None
+            out_map[seed] = f
+        return out_map
+
+    bmap, rmap = _seed_map(best), _seed_map(runner)
+    if bmap is not None and rmap is not None:
+        common = sorted(set(bmap) & set(rmap))
+        if len(common) >= 2:
+            diffs = [(rmap[s] - bmap[s]) if direction == 'lower_is_better'
+                     else (bmap[s] - rmap[s]) for s in common]
+            sd = float(np.std(np.asarray(diffs, dtype=float), ddof=1))
+            se = sd / math.sqrt(len(diffs))
+            out.update({'se': float(se),
+                        'z': (float(margin / se) if se > 0 else None),
+                        'decisive': bool(margin > se),
+                        'method': 'paired_search_seeds',
+                        'n_paired': len(common), 'common_seeds': common})
+        else:
+            out['method'] = 'insufficient_common_seeds'
+    else:
+        out['method'] = 'seed_ppls_unavailable'
+    # Independent marginal-SE fallback, also reported for legacy-artifact
+    # validation.  It is NOT the preferred estimate when paired values exist.
+    try:
+        n1 = max(1, int(_exact_count(best.get('n_seeds'), minimum=1)
+                        or (len(bmap) if bmap else 1)))
+        n2 = max(1, int(_exact_count(runner.get('n_seeds'), minimum=1)
+                        or (len(rmap) if rmap else 1)))
+        s1 = abs(float(_finite_scalar(best.get('ppl_std')) or 0.0)) / math.sqrt(n1)
+        s2 = abs(float(_finite_scalar(runner.get('ppl_std')) or 0.0)) / math.sqrt(n2)
+        se_i = math.hypot(s1, s2)
+        out['se_independent'] = float(se_i)
+        out['decisive_independent'] = bool(margin > se_i)
+        if out['method'] != 'paired_search_seeds':
+            out.update({'se': float(se_i),
+                        'z': (float(margin / se_i) if se_i > 0 else None),
+                        'decisive': bool(margin > se_i),
+                        'method': 'independent_marginal_se'})
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return out
+
+
 def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'):
     """Leave-one-search-seed-out stability of the selected tuning config.
 
@@ -13370,37 +13448,58 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             _distinct.append(_t)
         _margin = _margin_se = _margin_z = None
         _decisive = None
+        _margin_method = 'unavailable'
+        _margin_independent = _decisive_independent = None
         if len(_distinct) >= 2:
-            try:
-                _v1 = float(_finite_scalar(_distinct[0].get(metric)))
-                _v2 = float(_finite_scalar(_distinct[1].get(metric)))
-                _margin = (_v2 - _v1) if direction == 'lower_is_better' else (_v1 - _v2)
-                _n1 = max(1, int(_exact_count(_distinct[0].get('n_seeds'), minimum=1) or 1))
-                _n2 = max(1, int(_exact_count(_distinct[1].get('n_seeds'), minimum=1) or 1))
-                _s1 = abs(float(_finite_scalar(_distinct[0].get('ppl_std')) or 0.0)) / math.sqrt(_n1)
-                _s2 = abs(float(_finite_scalar(_distinct[1].get('ppl_std')) or 0.0)) / math.sqrt(_n2)
-                _margin_se = math.hypot(_s1, _s2)
-                _margin_z = (_margin / _margin_se) if _margin_se > 0 else None
-                _decisive = bool(_margin > _margin_se)
-            except (TypeError, ValueError, OverflowError):
-                _margin = _margin_se = _margin_z = None
-                _decisive = None
+            _mu = tuning_selection_margin(_distinct[0], _distinct[1], metric=metric,
+                                          direction=direction)
+            _margin = _mu.get('margin')
+            _margin_se = _mu.get('se')
+            _margin_z = _mu.get('z')
+            _decisive = _mu.get('decisive')
+            _margin_method = _mu.get('method')
+            _margin_independent = _mu.get('se_independent')
+            _decisive_independent = _mu.get('decisive_independent')
         if _decisive is False:
             warnings.append(
                 f'{arm}: the selected config beats the runner-up by only {_margin:.4g} '
-                f'{metric} (SE {_margin_se:.4g}) — the pick is inside one standard error; '
-                'report it as a tie/uncertain choice, not as the uniquely tuned optimum')
+                f'{metric} (SE {_margin_se:.4g}, {_margin_method}) — the pick is inside '
+                'one standard error; report it as a tie/uncertain choice, not as the '
+                'uniquely tuned optimum')
         _rec_margin = _finite_scalar(entry.get('selection_margin'))
         if _rec_margin is not None and _margin is not None and abs(_rec_margin - _margin) > 1e-9:
             problems.append(
                 f'{arm}: recorded selection_margin={_rec_margin} does not match the '
                 f'margin between the selected and runner-up trials ({_margin})')
+        _rec_method = entry.get('selection_margin_method')
+        _rec_se = _finite_scalar(entry.get('selection_margin_se'))
+        if _rec_se is not None and _margin_se is not None:
+            _se_candidates = [x for x in (_margin_se, _margin_independent) if x is not None]
+            # A legacy artifact has no method tag and stored the independent
+            # marginal-SE value; accept either estimate there, but a tagged
+            # artifact must match its declared method.
+            _se_ok = any(abs(_rec_se - x) <= 1e-9 * max(1.0, abs(x)) for x in _se_candidates)
+            if isinstance(_rec_method, str) and _rec_method in ('paired_search_seeds', 'independent_marginal_se'):
+                _want = _margin_se if _rec_method == _margin_method else None
+                _se_ok = (_want is not None
+                          and abs(_rec_se - _want) <= 1e-9 * max(1.0, abs(_want)))
+            if not _se_ok:
+                problems.append(
+                    f'{arm}: recorded selection_margin_se={_rec_se} does not match the '
+                    f'recomputed {_margin_method} value ({_margin_se})')
         _rec_decisive = entry.get('selection_decisive')
         if isinstance(_rec_decisive, (bool, np.bool_)) and _decisive is not None:
-            if bool(_rec_decisive) != _decisive:
+            _ok_dec = bool(_rec_decisive) == _decisive
+            # Legacy artifacts have no method tag and recorded the independent
+            # marginal-SE decision.  Accept that value only when they did not
+            # declare a method; a tagged artifact must match its own method.
+            if not _ok_dec and not isinstance(_rec_method, str):
+                _ok_dec = (_decisive_independent is not None
+                           and bool(_rec_decisive) == bool(_decisive_independent))
+            if not _ok_dec:
                 problems.append(
                     f'{arm}: recorded selection_decisive={bool(_rec_decisive)} but '
-                    f'recomputed margin/SE gives {_decisive}')
+                    f'recomputed margin/SE gives {_decisive} ({_margin_method})')
         vals = [f for f in (_finite_scalar(t.get(metric)) for t in trials
                              if isinstance(t, dict)) if f is not None]
         chosen_value = entry.get('selected_metric_value')
