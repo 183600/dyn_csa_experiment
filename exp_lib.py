@@ -11258,7 +11258,7 @@ def _splitmix64_u64(x):
     return (z ^ (z >> 31)) & mask
 
 def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
-                         selection_fold=0, evaluation_fold=1):
+                         selection_fold=0, evaluation_fold=1, groups=None):
     """Deterministically partition validation ROWS into disjoint chronological folds.
 
     Seeds make the training draws independent, but hyper-parameter selection
@@ -11285,7 +11285,15 @@ def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
     blocks are returned (the unselected blocks are neither selection nor
     evaluation rows).  The metadata stores only counts/ranges/fingerprints
     (not the full index lists) so it stays small when the validation panel is
-    scaled up."""
+    scaled up.
+
+    ``groups`` (one group/document id per row) makes the fold boundary
+    group-aware: a balanced boundary that falls inside a group is snapped to
+    the nearest legal boundary between groups, so no document/group can
+    contribute rows to both the selection and evaluation fold.  When the
+    requested number of folds cannot be formed without cutting a group, the
+    split is refused instead of returning a leaking one.  Without ``groups``
+    the historical row-level split is unchanged."""
     _parsed = {name: _as_seed_int(value) for name, value in (
         ('n_rows', n_rows), ('seed', seed), ('n_folds', n_folds),
         ('selection_fold', selection_fold), ('evaluation_fold', evaluation_fold))}
@@ -11335,6 +11343,45 @@ def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
     _bounds = [0]
     for _size in _sizes:
         _bounds.append(_bounds[-1] + _size)
+    _groups_aware = groups is not None
+    _n_groups = None
+    if _groups_aware:
+        from data_guard import _group_key
+        _g = np.asarray(groups)
+        if _g.ndim != 1:
+            _g = _g.reshape(-1)
+        if _g.shape[0] != n_rows:
+            raise ValueError(
+                f'validation_row_split: groups has length {_g.shape[0]}, '
+                f'expected {n_rows} (one group/document id per row)')
+        _gk = [_group_key(v) for v in _g.tolist()]
+        _n_groups = len(set(_gk))
+        # A fold boundary is legal only where the group id changes.  Snap
+        # each balanced boundary to the nearest legal one; leaving room for
+        # every later fold keeps all folds non-empty.
+        _legal = [i for i in range(1, n_rows) if _gk[i] != _gk[i - 1]]
+        _desired = list(_bounds[1:-1])
+        if len(_legal) < len(_desired):
+            raise ValueError(
+                'validation_row_split: cannot form the requested folds '
+                'without cutting a group/document; the groups span too much '
+                'of the validation stream')
+        _chosen = []
+        _prev = -1
+        for _k, _target in enumerate(_desired):
+            _remain = len(_desired) - 1 - _k
+            _lo = _prev + 1
+            _hi = len(_legal) - _remain - 1
+            if _lo > _hi:
+                raise ValueError(
+                    'validation_row_split: cannot form the requested folds '
+                    'without cutting a group/document')
+            _seg = np.asarray(_legal[_lo:_hi + 1], dtype=np.int64)
+            _j = _lo + int(np.argmin(np.abs(_seg - int(_target))))
+            _chosen.append(int(_legal[_j]))
+            _prev = _j
+        _bounds = [0] + _chosen + [int(n_rows)]
+        _sizes = [_bounds[_i + 1] - _bounds[_i] for _i in range(n_folds)]
     _sel_lo, _sel_hi = _bounds[selection_fold], _bounds[selection_fold + 1]
     _ev_lo, _ev_hi = _bounds[evaluation_fold], _bounds[evaluation_fold + 1]
     if _sel_hi <= _sel_lo or _ev_hi <= _ev_lo:
@@ -11361,6 +11408,8 @@ def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
                         for i in range(n_folds)],
         'chronological': True,
         'selection_precedes_evaluation': True,
+        'groups_aware': bool(_groups_aware),
+        'n_groups': (int(_n_groups) if _n_groups is not None else None),
         'selection_row_fp': _ids_fp(_sel_arr),
         'evaluation_row_fp': _ids_fp(_ev_arr),
         'disjoint': bool(np.intersect1d(_sel_arr, _ev_arr).size == 0),

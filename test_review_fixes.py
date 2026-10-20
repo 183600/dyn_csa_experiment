@@ -6615,6 +6615,41 @@ def t_data_guard_nat_and_label_identity():
     assert _shift['js_divergence'] > 0.5, _rep2
 
 
+def t_validation_row_split_group_aware():
+    # The balanced row boundary (4) would cut the group spanning rows 3-4.
+    # A group-aware split must move it to a document boundary instead.
+    groups = np.array([0, 0, 0, 1, 1, 2, 2, 3])
+    sel, ev, meta = L.validation_row_split(8, groups=groups)
+    assert meta['groups_aware'] is True and meta['n_groups'] == 4, meta
+    assert sorted(sel + ev) == list(range(8)), (sel, ev)
+    assert not ({groups[i] for i in sel} & {groups[i] for i in ev}), (sel, ev)
+    assert 3 not in sel or 4 not in ev, (sel, ev)
+    # Without groups the historical balanced split is unchanged.
+    sel2, ev2, meta2 = L.validation_row_split(8)
+    assert (sel2, ev2) == (list(range(4)), list(range(4, 8))), (sel2, ev2)
+    assert meta2['groups_aware'] is False, meta2
+    # A group larger than a fold cannot be cut; refuse instead of leaking it.
+    try:
+        L.validation_row_split(6, n_folds=3, groups=[0, 0, 0, 1, 1, 1])
+    except ValueError as e:
+        assert 'without cutting a group' in str(e), e
+    else:
+        raise AssertionError('a fold boundary inside a group must be refused')
+    try:
+        L.validation_row_split(4, groups=[0, 0])
+    except ValueError as e:
+        assert 'groups has length' in str(e), e
+    else:
+        raise AssertionError('groups length mismatch must be refused')
+    # Missing group ids collapse into one group (NaT is not a unique key).
+    _nat = np.array([np.timedelta64('NaT', 'ns'), np.timedelta64('NaT', 'ns'),
+                     np.timedelta64(1, 'ns'), np.timedelta64(1, 'ns')],
+                    dtype=object)
+    _s, _e, _m = L.validation_row_split(4, groups=_nat)
+    assert _m['n_groups'] == 2, _m
+    assert not ({str(_nat[i]) for i in _s} & {str(_nat[i]) for i in _e}), (_s, _e)
+
+
 def t_build_report_exact_seed_and_params():
     # The zero-GPU report reader must share exp_lib's exact-integer contract:
     # int(Decimal('1.5')) would silently pair the wrong run, and a fractional
@@ -6999,6 +7034,7 @@ def main():
     _check('H3g tuned claim requires the panel to run the selected config', t_methodology_audit_requires_panel_to_use_tuned_config)
     _check('H3e tuning driver refuses overlapping search/final seeds', t_baseline_driver_refuses_overlapping_final_seeds)
     _check('H3h nested validation row split + per-row pooled PPL', t_nested_validation_row_split_and_subset_ppl)
+    _check('H3i validation row folds are group-aware', t_validation_row_split_group_aware)
     _check('H3i tuning audit verifies nested selection/holdout rows', t_nested_tuning_artifact_audit)
     _check('H3j final tuned contrast is measured on held-out rows', t_nested_final_uses_holdout_rows)
     _check('H3k partial nested holdout falls back wholly to full validation', t_nested_final_partial_holdout_falls_back_wholly)
