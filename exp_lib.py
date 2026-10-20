@@ -11463,7 +11463,13 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
             hit = (idx < uniq.size) & (uniq[idx_clip] == keys) if uniq.size else np.zeros(keys.shape, dtype=bool)
             c_pair = np.where(hit, pair_counts[idx_clip], 0).astype(np.float64)
             c_ctx = ctx[prev].astype(np.float64)
-            p_bg = np.where(c_ctx > 0.0, (c_pair + alpha) / (c_ctx + alpha * vocab_size), uni_prob[nxt])
+            # Add-alpha smoothing of the conditional is defined even when the
+            # context was never seen: 0/0 becomes alpha/(alpha*V) = 1/V.  The
+            # old fallback to the unigram probability silently skipped the
+            # interpolation term for those contexts, making the bigram floor
+            # score unseen transitions like a pure unigram model (and lower
+            # its PPL).  Interpolate the smoothed conditional in every case.
+            p_bg = (c_pair + alpha) / (c_ctx + alpha * vocab_size)
             p = lam * p_bg + (1.0 - lam) * uni_prob[nxt]
         else:
             # interpolation=0 is the pure unigram model: the conditional

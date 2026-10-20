@@ -3012,6 +3012,16 @@ def t_simple_baseline_ngram_and_audit():
     uni = L.ngram_lm_score(train, val, vocab, order=1, alpha=0.1)
     zero = L.ngram_lm_score(train, val, vocab, order=2, alpha=0.1, interpolation=0.0)
     assert abs(uni['nll'] - zero['nll']) < 1e-12 and abs(uni['ppl'] - zero['ppl']) < 1e-9, (uni, zero)
+    # An unseen context still gets the add-alpha conditional 1/V, then the
+    # declared interpolation.  Falling back to the unigram probability would
+    # silently drop the interpolation term for exactly those transitions.
+    _ut = np.array([0, 0, 0])
+    _ue = np.array([[1, 0]])
+    _a, _lam, _v = 0.1, 0.5, 2
+    _up = (np.bincount(_ut, minlength=_v) + _a) / (_ut.size + _a * _v)
+    _want = (-math.log(_up[1]) - math.log(_lam * (1.0 / _v) + (1.0 - _lam) * _up[0])) / 2
+    _got = L.ngram_lm_score(_ut, _ue, _v, order=2, alpha=_a, interpolation=_lam)
+    assert abs(_got['nll'] - _want) < 1e-12, (_got, _want)
     # The count-model floor must not be fitted/scored on truncated ids or a
     # fractional vocabulary: those silently change the tokens being counted.
     for _bad in ([1.0, 2.0, 3.0], [True, False, True], np.array([1.5, 2.5])):
