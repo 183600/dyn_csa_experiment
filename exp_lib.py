@@ -10334,6 +10334,12 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         _seed_pairing = 'positional_only'
     _incomplete = [r['label'] for r in per if r.get('complete_pairs') is False]
     _empty_points = [r['label'] for r in per if r['n'] == 0]
+    # A tier with no valid declared scale cannot be placed on the cross-scale
+    # axis.  It stays in the family (and blocks a pooled common effect) instead
+    # of silently disappearing from the meta-analysis.
+    _invalid_scale_points = [r['label'] for r in per
+                             if not (math.isfinite(r.get('scale', float('nan')))
+                                     and r.get('scale') > 0.0)]
     _attrition = {r['label']: {'n_dropped': r.get('n_dropped'),
                                'n_missing': r.get('n_missing'),
                                'n_unexpected': r.get('n_unexpected')}
@@ -10342,6 +10348,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
            'n_points': len(per), 'n_usable': len(usable),
            'incomplete_points': _incomplete,
            'empty_points': _empty_points,
+           'invalid_scale_points': _invalid_scale_points,
            'attrition': _attrition,
            'zero_variance_points': _zero_variance,
            'corpus_binding': _scale_corpus_binding(pts),
@@ -10406,7 +10413,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                                  and (not math.isfinite(p_q) or p_q >= alpha)
                                  and not _underpowered_points
                                  and not _incomplete and not _zero_variance
-                                 and not _empty_points),
+                                 and not _empty_points and not _invalid_scale_points),
                 'note': ('poolable requires >=3 scales, every included scale at n>=min_seeds '
                          'with a complete paired panel (no dropped/absent seeds) and non-zero '
                          'within-scale variance, '
@@ -10422,7 +10429,11 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                             if _zero_variance else '')
                          + (('; scale point(s) with no measured effect: ' + ', '.join(map(str, _empty_points))
                              + ' (the tier is declared but contributes no estimable effect)')
-                            if _empty_points else ''))})
+                            if _empty_points else '')
+                         + (('; scale point(s) with an invalid/non-positive scale: '
+                             + ', '.join(map(str, _invalid_scale_points))
+                             + ' (the tier cannot be placed on the scale axis)')
+                            if _invalid_scale_points else ''))})
     out['status'] = 'ok'
     return out
 
@@ -10504,14 +10515,19 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     if _min_points is None or _min_points < 1:
         raise ValueError(f'min_points must be a positive integer, got {min_points!r}')
     min_seeds, min_points = _min_seeds, _min_points
-    pts = _scale_points(points)
-    # Keep declared-but-empty scale points for binding/attrition, but exclude
-    # them from the regression itself (an empty y vector has no mean).
-    pts = [p for p in pts if math.isfinite(p['scale']) and p['scale'] > 0.0]
+    _parsed_pts = _scale_points(points)
+    # A declared tier with an invalid/non-positive scale cannot enter the
+    # regression, but it must remain VISIBLE in the declared family: silently
+    # dropping it would let the surviving tiers look like a complete ladder.
+    def _valid_scale(p):
+        return math.isfinite(p['scale']) and p['scale'] > 0.0
+    _invalid_scale_points = [p['label'] for p in _parsed_pts if not _valid_scale(p)]
+    pts = [p for p in _parsed_pts if _valid_scale(p)]
     pts.sort(key=lambda p: p['scale'])
     labels = [p['label'] for p in pts]
-    if len(set(labels)) != len(labels):
-        raise ValueError('scaling_trend needs unique scale labels; got %r' % (labels,))
+    _all_labels = [p['label'] for p in _parsed_pts]
+    if len(set(_all_labels)) != len(_all_labels):
+        raise ValueError('scaling_trend needs unique scale labels; got %r' % (_all_labels,))
     for p in pts:
         if len(set(p['seeds'])) != len(p['seeds']):
             raise ValueError('scale point %r has duplicate seeds %r' % (p['label'], p['seeds']))
@@ -10521,15 +10537,18 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
                                'n_missing': p.get('n_missing'),
                                'n_unexpected': p.get('n_unexpected')}
                   for p in pts if p.get('complete_pairs') is False}
-    _pts_binding = pts
+    # Declared-but-empty and invalid-scale tiers stay in the binding/attrition
+    # view (corpus identity covers the whole declared family).
+    _pts_binding = pts + [p for p in _parsed_pts if not _valid_scale(p)]
     pts = [p for p in pts if p['effects']]
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'min_points': int(min_points),
            'n_points': len(pts), 'labels': [p['label'] for p in pts],
            'scales': [p['scale'] for p in pts],
-           'declared_labels': labels,
+           'declared_labels': [p['label'] for p in _pts_binding],
            'declared_scales': [p['scale'] for p in _pts_binding],
            'incomplete_points': _incomplete_points,
            'empty_points': _empty_points,
+           'invalid_scale_points': _invalid_scale_points,
            'attrition': _attrition,
            'corpus_binding': _scale_corpus_binding(_pts_binding),
            'min_seeds_for_significance': signflip_min_n_for_holm(1, alpha),
@@ -10687,7 +10706,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
                                 if len(p['effects']) < int(min_seeds)]
         underpowered = bool(_underpowered_points)
     too_few_scales = k < int(min_points)
-    _incomplete = bool(_incomplete_points or _empty_points)
+    _incomplete = bool(_incomplete_points or _empty_points or _invalid_scale_points)
     sig = bool(p_primary is not None and math.isfinite(float(p_primary)) and float(p_primary) < alpha
                and not resolution_limited and not underpowered and not too_few_scales
                and not _incomplete)
@@ -10734,6 +10753,11 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
             'declared scale point(s) with no measured effect at %s — the tier is in the '
             'family but contributes no slope; the trend is descriptive'
             % ', '.join(map(str, _empty_points)))
+    if _invalid_scale_points:
+        out['note'] = ((out.get('note') + '; ') if out.get('note') else '') + (
+            'declared scale point(s) with an invalid/non-positive scale at %s — the tier '
+            'is in the family but cannot enter the scale axis; the trend is descriptive'
+            % ', '.join(map(str, _invalid_scale_points)))
     if underpowered and _underpowered_points:
         _u = ('paired complete-seed n<%d' % int(min_seeds) if paired_primary
               else 'scale point(s) with n<%d: ' % int(min_seeds)

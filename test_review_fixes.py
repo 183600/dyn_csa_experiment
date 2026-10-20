@@ -7609,6 +7609,20 @@ def t_scale_meta_refuses_visible_attrition():
             pass
         else:
             raise AssertionError(f'n_planned={bad!r} was accepted')
+    # A declared tier whose scale is missing/non-positive cannot enter the
+    # regression, but it must stay visible and block a confirmable trend
+    # instead of silently disappearing from the ladder.
+    ladder = [dict(p) for p in complete]
+    ladder.append({'label': 'Sbad', 'scale': float('nan'),
+                   'effects': [0.1] * 6, 'seeds': list(range(6))})
+    mi = L.meta_analyze_effects(ladder)
+    assert mi['invalid_scale_points'] == ['Sbad'] and mi['poolable'] is False, mi
+    assert 'invalid/non-positive scale' in mi['note'], mi
+    ri = L.scaling_trend(ladder)
+    assert ri['invalid_scale_points'] == ['Sbad'], ri
+    assert ri['significant'] is False and ri['verdict'] == 'incomplete_scale_point', ri
+    assert 'Sbad' in ri['declared_labels'], ri
+    assert 'invalid/non-positive scale' in ri['note'], ri
 
 
 def t_m0_cross_scale_pairs_are_control_gated():
