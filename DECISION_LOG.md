@@ -165,8 +165,11 @@ the truncation counts.
 
 The 8-cell × 4-seed panel is exploratory until its own pre-registration:
 4 seeds have an exact sign-flip p floor of 0.125, so a non-significant result
-must be reported as resolution-limited, not as no effect. A 6-seed extension
-of the key cells is the pre-declared path to a significance claim. The
+must be reported as resolution-limited, not as no effect. A **7-seed**
+extension of the key cells is the pre-declared path to a family-corrected
+significance claim: the primary family has three Holm comparisons, so the
+family floor is 3·2/2^n (n=6 gives 0.094 > 0.05; n=7 gives 0.047). Six seeds
+would only suffice for a single raw comparison, not the declared family. The
 outside-window panel is auxiliary and must not be pooled with the full-prefix
 results; the extra-read-slot panel is a separate protocol if it is needed.
 

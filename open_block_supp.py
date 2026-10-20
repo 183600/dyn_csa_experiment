@@ -283,7 +283,14 @@ def _nll_per_token(rec):
     return None
 
 
-def _rec_by_cell(summary, run_fingerprint=None):
+def _rec_by_cell(summary, run_fingerprint=None, problems=None):
+    """Index usable cells, refusing a key that disagrees with the record.
+
+    The summary key is ``<variant>::seed<n>``, but the record itself is the
+    authority.  A key/record seed mismatch (or a variant mismatch) would pair
+    one seed's arm with another seed's result while the statistics still look
+    like a clean paired design, so those cells are excluded and named.
+    """
     out = {}
     for key, rec in summary.items():
         if not isinstance(rec, dict):
@@ -292,15 +299,80 @@ def _rec_by_cell(summary, run_fingerprint=None):
             continue
         if not L.ppl_is_usable(rec.get('ppl')):
             continue
-        v, _, s = key.partition('::seed')
+        v, sep, s = key.partition('::seed')
         try:
             seed = int(s)
         except Exception:
+            if problems is not None:
+                problems.append({'key': str(key), 'reason': 'key carries no integer seed'})
+            continue
+        if not sep:
+            if problems is not None:
+                problems.append({'key': str(key), 'reason': 'key carries no ::seed suffix'})
+            continue
+        rec_seed = L._as_seed_int(rec.get('seed'))
+        if rec_seed is None:
+            if problems is not None:
+                problems.append({'key': str(key), 'reason': 'record carries no usable seed'})
+            continue
+        if rec_seed != seed:
+            if problems is not None:
+                problems.append({'key': str(key), 'reason': f'record seed {rec_seed} != key seed {seed}'})
+            continue
+        rec_var = rec.get('variant')
+        if rec_var is not None and str(rec_var) != str(v):
+            if problems is not None:
+                problems.append({'key': str(key), 'reason': f'record variant {rec_var!r} != key variant {v!r}'})
             continue
         nll = _nll_per_token(rec)
         if nll is None:
+            if problems is not None:
+                problems.append({'key': str(key), 'reason': 'nll/token is missing or non-finite'})
             continue
         out[(v, seed)] = {'record': rec, 'nll': nll, 'ppl': float(rec['ppl'])}
+    return out
+
+
+def _arm_summary(cells):
+    """Per-arm n, mean ± SD and token-pooled PPL over the measured seeds.
+
+    The paired contrast table answers "is a − b different?"; this table keeps
+    the raw arm level visible (n, seed spread, pooled estimate) so a small
+    paired delta is not quoted without the seed-level variability that bounds
+    it.
+    """
+    groups = {}
+    for (v, s), cell in cells.items():
+        groups.setdefault(v, []).append((int(s), cell))
+    out = {}
+    for v, rows in sorted(groups.items()):
+        rows.sort(key=lambda x: x[0])
+        ppls = [float(c['ppl']) for _s, c in rows]
+        nlls = [float(c['nll']) for _s, c in rows]
+        n_tok = []
+        for _s, c in rows:
+            r = c.get('record') or {}
+            try:
+                n = int(r.get('n_tokens'))
+            except (TypeError, ValueError):
+                n = 0
+            n_tok.append(n if n > 0 else None)
+        pooled = None
+        if all(n is not None for n in n_tok):
+            _nll = math.fsum(nlls)
+            _nt = int(sum(n_tok))
+            if _nt > 0:
+                pooled = L._safe_exp_ppl(_nll / _nt)
+        out[v] = {
+            'n_seeds': len(rows),
+            'seeds': [s for s, _c in rows],
+            'ppl_mean': float(np.mean(ppls)),
+            'ppl_std': float(np.std(ppls, ddof=1)) if len(ppls) > 1 else 0.0,
+            'nll_per_token_mean': float(np.mean(nlls)),
+            'nll_per_token_std': float(np.std(nlls, ddof=1)) if len(nlls) > 1 else 0.0,
+            'ppl_pooled': pooled,
+            'n_tokens_total': (int(sum(n_tok)) if all(n is not None for n in n_tok) else None),
+        }
     return out
 
 
@@ -419,6 +491,37 @@ def _controlled_reason(a, b):
             return f'{k} is unverifiable (only one record carries it)'
         if va != vb:
             return f'{k} differs ({va!r} != {vb!r})'
+    # The compact `hyperparams` copy pins lr/wd/schedule lengths but NOT the
+    # optimizer identity, betas/eps, clipping, LR-schedule shape, augmentation
+    # or precision mode.  Those live in the nested/top-level `train_knobs`
+    # descriptor.  Comparing it here is what prevents "same lr" from being
+    # mistaken for "same optimizer recipe" after a future backend/default
+    # change.  Both-absent is the legacy path; a one-sided descriptor is
+    # unverifiable, exactly like the hyperparameter keys above.
+    _ka = ha.get('train_knobs') if 'train_knobs' in ha else a.get('train_knobs')
+    _kb = hb.get('train_knobs') if 'train_knobs' in hb else b.get('train_knobs')
+    if (_ka is None) != (_kb is None):
+        return 'train_knobs is unverifiable (only one record carries it)'
+    if _ka is not None and _ka != _kb:
+        return 'train_knobs differs (optimizer / betas / schedule / clipping / augmentation / precision)'
+    # The actual loss composition is derived from the built model, not from
+    # the variant name.  Open-block cells must not differ here: only max_block
+    # and the reading rule are declared factors.
+    _oa, _ob = a.get('train_objective'), b.get('train_objective')
+    if (_oa is None) != (_ob is None):
+        return 'train_objective is unverifiable (only one record carries it)'
+    if _oa is not None and _oa != _ob:
+        return 'train_objective differs (the objective/regularizer/policy is not the same)'
+    # Same seed number is not the same starting point: architectures consume
+    # RNG differently.  The shared-trunk init digest is the matched-init gate
+    # used by the main panels; a one-sided digest is unverifiable.
+    _ia, _ib = a.get('init_core_fp'), b.get('init_core_fp')
+    _ha = _ia is not None and str(_ia) != ''
+    _hb = _ib is not None and str(_ib) != ''
+    if _ha != _hb:
+        return 'init_core_fp is unverifiable (only one record carries it)'
+    if _ha and str(_ia) != str(_ib):
+        return 'init_core_fp differs (the arms did not start from the same shared-trunk initialization)'
     if a.get('code') != b.get('code'):
         return f"code stamp differs ({a.get('code')!r} != {b.get('code')!r})"
     pa, pb = a.get('params'), b.get('params')
@@ -535,9 +638,11 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
             'pilot and a main panel); refusing to pool them. Use a separate '
             'outdir for the pilot or remove the stale records explicitly.')
     _fp = next(iter(_fps)) if len(_fps) == 1 else None
-    cells = _rec_by_cell(summary, run_fingerprint=_fp)
+    _integrity = []
+    cells = _rec_by_cell(summary, run_fingerprint=_fp, problems=_integrity)
     if not cells:
-        raise SystemExit(f'no usable records in {outdir}/summary.json')
+        raise SystemExit(f'no usable records in {outdir}/summary.json'
+                         + (f' (excluded: {_integrity})' if _integrity else ''))
     avail_seeds = sorted({s for (_, s) in cells})
     _raw_seeds = avail_seeds if seeds is None else seeds
     _parsed = [L._as_seed_int(s) for s in _raw_seeds]
@@ -669,17 +774,29 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
                    if _prim_entries and prim_names else None)
     _holm_min_n = (L.signflip_min_n_for_holm(len(prim_names), 0.05)
                    if prim_names else None)
+    # Every primary contrast must clear the family-corrected seed floor for ANY
+    # confirmatory claim.  The weakest measured contrast governs that gate, not
+    # the best-powered one.  n=6 only suffices for a single RAW two-sided test
+    # (floor 0.03125); with the three-comparison Holm family the minimum is
+    # n=7 (3 * 2/2**7 = 0.0469).  Surfacing this prevents the old
+    # "6-seed extension" wording from promising a significance claim it cannot
+    # reach.
+    _seeds_sufficient = (bool(_holm_min_n is not None and _prim_n_min > 0
+                              and _prim_n_min >= _holm_min_n))
     os.makedirs(analysis_dir, exist_ok=True)
     stats = {
         'outdir': outdir, 'code': L.code_stamp(), 'semantics': L.CODE_SEMANTICS,
         'seeds_requested': seeds,
         'cells_available': sorted(f'{v}::seed{s}' for (v, s) in cells),
+        'record_integrity': {'n_excluded': len(_integrity), 'excluded': _integrity},
+        'arm_summary': _arm_summary(cells),
         'primary_family': prim_names,
         'primary_family_size': len(prim_names),
         'primary_holm_floor': _holm_floor,
         'primary_n_min': _prim_n_min,
         'primary_n_max': _prim_n_max,
         'primary_holm_min_seeds': _holm_min_n,
+        'primary_seeds_sufficient': _seeds_sufficient,
         'comparisons': results,
         'hypothesis_audit': _hyp,
         'hypotheses': {n: (_hyp.get('hypotheses') or {}).get(n) for n in prim_names},
@@ -687,11 +804,16 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         'efficiency': efficiency,
         'notes': [
             'delta = a - b; a negative NLL delta means arm a is better.',
-            'p_exact_signflip is two-sided; with n=4 the minimum attainable p is 0.125, with n=6 it is 0.03125.',
+            'p_exact_signflip is two-sided; with n=4 the minimum attainable raw p is 0.125, with n=6 it is 0.03125. A family-corrected claim needs the Holm floor, not the raw floor.',
             'A failure to reach p<0.05 at n=4 is a resolution limit, not evidence of no effect.',
             'The 4-seed panel is descriptive for the primary family; Holm-adjusted p-values are reported with their floors.',
             'Interaction I = (summary - closed | no cap) - (summary - closed | 128); negative means the summary benefit grows when the cap is removed.',
-        ] + [f'hypothesis audit: {w}' for w in (_hyp.get('warnings') or [])],
+        ] + ([f'primary seed coverage is INSUFFICIENT for a family-corrected claim: '
+              f'minimum n={_holm_min_n} for {len(prim_names)} Holm comparisons, '
+              f'weakest contrast has n={_prim_n_min}']
+             if _holm_min_n is not None and not _seeds_sufficient else [])
+        + [f'hypothesis audit: {w}' for w in (_hyp.get('warnings') or [])]
+        + [f'record integrity: {r["key"]} excluded ({r["reason"]})' for r in _integrity],
     }
     _atomic_json(os.path.join(analysis_dir, 'stats.json'), stats)
     md = _render_markdown(stats)
@@ -714,7 +836,29 @@ def _render_markdown(stats):
         _n_txt = (str(stats.get('primary_n_min')) if stats.get('primary_n_min') == stats.get('primary_n_max')
                   else f'{stats.get("primary_n_min")}..{stats.get("primary_n_max")}')
         lines.append(f'Primary family Holm floor: `{_fmt(stats.get("primary_holm_floor"))}` at family n={_n_txt} (max n governs the floor); minimum seeds for a confirmatory claim: `{stats.get("primary_holm_min_seeds")}`.')
+    if stats.get('primary_seeds_sufficient') is False:
+        lines += ['', f'> **Resolution limit:** the weakest primary contrast has n={stats.get("primary_n_min")}, '
+                  f'but the {stats.get("primary_family_size")}-comparison Holm family needs n>='
+                  f'`{stats.get("primary_holm_min_seeds")}` before any corrected claim is reachable. '
+                  'This panel is descriptive; adding seeds (not re-reading the same p-values) is the only fix.']
+    if stats.get('record_integrity', {}).get('n_excluded'):
+        lines += ['', '> **Excluded records:** ' + '; '.join(
+            f'`{r.get("key")}` ({r.get("reason")})'
+            for r in stats['record_integrity']['excluded']) + '.']
     lines += ['', 'Delta convention: `a - b` on token NLL; negative means `a` is better.', '']
+    _arms = stats.get('arm_summary') or {}
+    if _arms:
+        lines += ['## Arm summary (Mean ± SD over seeds)', '',
+                  '| arm | n seeds | PPL mean ± SD | NLL/token mean ± SD | pooled PPL | seeds |',
+                  '|---|---|---|---|---|---|']
+        for _v, _a in sorted(_arms.items()):
+            lines.append('| {} | {} | {} ± {} | {} ± {} | {} | {} |'.format(
+                _v, _a.get('n_seeds'), _fmt(_a.get('ppl_mean'), 3),
+                _fmt(_a.get('ppl_std'), 3), _fmt(_a.get('nll_per_token_mean'), 6),
+                _fmt(_a.get('nll_per_token_std'), 6), _fmt(_a.get('ppl_pooled'), 3),
+                ','.join(str(x) for x in (_a.get('seeds') or []))))
+        lines += ['', '> `±` is the seed-level standard deviation (training randomness), '
+                  'not a document-sampling interval. `pooled PPL` re-pools token NLL within the arm.', '']
     lines.append('| comparison | family | n | mean ΔNLL | SD | dz | exact p | Holm p | p floor | CI95 | controlled |')
     lines.append('|---|---|---|---|---|---|---|---|---|---|---|')
     for name, r in stats['comparisons'].items():
@@ -775,7 +919,10 @@ def _render_markdown(stats):
               '- The primary family measured n={}–{} pair(s); the exact-test floor at its weakest n is {}. Report the effect and its uncertainty, and do not read a non-significant result as a null result when the floor is above alpha. '.format(
                   stats.get('primary_n_min'), stats.get('primary_n_max'),
                   _fmt(L.signflip_p_floor(stats.get('primary_n_min') or 0)))
-              + (f'With the {stats.get("primary_family_size")}-comparison Holm family the minimum seed count for any confirmatory claim is {stats.get("primary_holm_min_seeds")} (Holm floor {_fmt(stats.get("primary_holm_floor"))}).'
+              + (f'With the {stats.get("primary_family_size")}-comparison Holm family the minimum seed count for any confirmatory claim is {stats.get("primary_holm_min_seeds")} (Holm floor {_fmt(stats.get("primary_holm_floor"))}). '
+                 + ('The current panel does NOT meet that floor; extend it before making a significance claim.'
+                    if stats.get('primary_seeds_sufficient') is False else
+                    'The current panel meets that floor.')
                  if stats.get('primary_holm_min_seeds') else 'Extend the key cells only if a significance claim is needed.')]
     return '\n'.join(lines) + '\n'
 

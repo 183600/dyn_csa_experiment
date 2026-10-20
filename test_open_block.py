@@ -525,7 +525,36 @@ def t_open_analysis_control_gate():
     one = _rec('closed')
     one['hyperparams'] = {k: v for k, v in hp.items() if k != 'lr'}
     assert 'unverifiable' in OB._controlled_reason(a, one)
+    # The optimizer/schedule/clipping descriptor is not in the compact
+    # hyperparams copy, so it must be compared separately (a changed optimizer
+    # or schedule is not a max_block / reading-rule difference).
+    knobs = {'optimizer': 'AdamW', 'betas': [0.9, 0.95], 'eps': 1e-8,
+             'grad_clip_norm': 1.0, 'lr_schedule': 'linear_warmup_then_cosine',
+             'augmentation': 'none', 'amp_dtype': 'bf16', 'eager_batch': False}
+    a = _rec('summary', train_knobs=dict(knobs))
+    b = _rec('closed', train_knobs=dict(knobs))
+    assert OB._controlled_reason(a, b) is None
+    assert 'train_knobs differs' in OB._controlled_reason(
+        a, _rec('closed', train_knobs=dict(knobs, betas=[0.9, 0.99])))
+    assert 'unverifiable' in OB._controlled_reason(a, _rec('closed'))
+    # The actual objective (loss terms / regularizer / policy) must match too.
+    obj = {'comp_lambda_effective': 0.05, 'boundary_policy': ['threshold'],
+           'loss_terms': ['ce', 'comp_reg']}
+    a = _rec('summary', train_objective=dict(obj))
+    b = _rec('closed', train_objective=dict(obj))
+    assert OB._controlled_reason(a, b) is None
+    assert 'train_objective differs' in OB._controlled_reason(
+        a, _rec('closed', train_objective=dict(obj, comp_lambda_effective=0.0)))
+    assert 'unverifiable' in OB._controlled_reason(a, _rec('closed'))
+    # Same seed number is not a matched initialisation.
+    a = _rec('summary', init_core_fp='abc')
+    b = _rec('closed', init_core_fp='abc')
+    assert OB._controlled_reason(a, b) is None
+    assert 'init_core_fp differs' in OB._controlled_reason(
+        a, _rec('closed', init_core_fp='def'))
+    assert 'unverifiable' in OB._controlled_reason(a, _rec('closed'))
     # Malformed descriptors are unverifiable, not a crash and not a pass.
+    a = _rec('summary')
     assert 'malformed' in OB._controlled_reason(
         a, _rec('closed', hyperparams='not-an-object'))
     assert 'malformed' in OB._controlled_reason(
@@ -533,6 +562,8 @@ def t_open_analysis_control_gate():
     assert 'malformed' in OB._controlled_reason(
         a, _rec('closed', open_block_config=['not-an-object']))
     # The paired contrast drops the uncontrolled seed instead of testing it.
+    a = _rec('summary')
+    b = _rec('closed')
     cells = {('a', 0): {'record': a, 'nll': 1.0, 'ppl': 2.0},
              ('b', 0): {'record': b, 'nll': 1.1, 'ppl': 2.1},
              ('a', 1): {'record': a, 'nll': 1.0, 'ppl': 2.0},
@@ -578,6 +609,42 @@ def t_open_analysis_control_gate():
         L.holm_min_attainable_p(4, 3, 0.05)
     assert OB._family_holm_floor([{'n': 8, 'n_nonzero': 0}], 3) == 1.0
 
+def t_open_record_identity_and_arm_summary():
+    import open_block_supp as OB
+    summary = {
+        'v::seed0': {'seed': 0, 'variant': 'v', 'ppl': 10.0,
+                     'nll_sum': 10.0, 'n_tokens': 10, 'run_fingerprint': 'r'},
+        'v::seed1': {'seed': 1, 'variant': 'v', 'ppl': 12.0,
+                     'nll_sum': 12.0, 'n_tokens': 10, 'run_fingerprint': 'r'},
+        # Key says seed2, record says seed3: this is not the seed it claims to
+        # be, so it cannot enter a paired test under either label.
+        'v::seed2': {'seed': 3, 'variant': 'v', 'ppl': 11.0,
+                     'nll_sum': 11.0, 'n_tokens': 10, 'run_fingerprint': 'r'},
+        # Key variant and record variant disagree.
+        'w::seed0': {'seed': 0, 'variant': 'x', 'ppl': 9.0,
+                     'nll_sum': 9.0, 'n_tokens': 10, 'run_fingerprint': 'r'},
+        'v::seed4': {'seed': 4, 'variant': 'v', 'ppl': 10.0,
+                     'nll_sum': 10.0, 'n_tokens': 10, 'run_fingerprint': 'other'},
+    }
+    problems = []
+    cells = OB._rec_by_cell(summary, run_fingerprint='r', problems=problems)
+    assert set(cells) == {('v', 0), ('v', 1)}, cells
+    assert len(problems) == 2, problems
+    reasons = ' '.join(p['reason'] for p in problems)
+    assert 'record seed 3 != key seed 2' in reasons, problems
+    assert 'record variant' in reasons, problems
+    arm = OB._arm_summary(cells)['v']
+    assert arm['n_seeds'] == 2 and arm['seeds'] == [0, 1], arm
+    assert abs(arm['ppl_mean'] - 11.0) < 1e-9, arm
+    assert abs(arm['ppl_std'] - 2.0 ** 0.5) < 1e-9, arm
+    assert abs(arm['nll_per_token_mean'] - 1.1) < 1e-9, arm
+    assert arm['n_tokens_total'] == 20 and arm['ppl_pooled'] is not None, arm
+    # The open-block primary family has three Holm comparisons.  A six-seed
+    # panel can reach a RAW p=0.03125 but not a family-corrected claim; the
+    # documented extension path must therefore be at least n=7.
+    assert L.signflip_min_n_for_holm(3, 0.05) == 7, L.signflip_min_n_for_holm(3, 0.05)
+    assert L.signflip_p_floor(6) > 0.05 / 3, L.signflip_p_floor(6)
+
 def t_open_block_hypotheses():
     # Each declared primary contrast must state mechanism, sign, metric and
     # falsifier; an unregistered primary comparison is a design defect.
@@ -611,6 +678,7 @@ CHECKS = [
     ('K11 open candidate edge cases', t_open_candidate_edge_cases),
     ('K12 analysis control gate drops uncontrolled seeds', t_open_analysis_control_gate),
     ('K13 open-block primary hypotheses declared', t_open_block_hypotheses),
+    ('K14 record identity + arm Mean/SD + family seed floor', t_open_record_identity_and_arm_summary),
 ]
 
 

@@ -1048,7 +1048,7 @@ max_block: 32  → closed
 Commands:
 
 ```bash
-python test_open_block.py                 # K1-K9 causality/reference/mask gates
+python test_open_block.py                 # K1-K14 causality/reference/mask/analysis gates
 python open_block_supp.py smoke           # all 8 cells, synthetic, a few steps
 python open_block_supp.py pilot --seeds 0 --steps 100
 python open_block_supp.py main --seeds 0,1,2,3 --steps 1500
@@ -1060,12 +1060,20 @@ python open_block_supp.py extended        # contingency: 4 caps x 3 modes
 `main` is resumable and refuses a record whose code stamp / recipe
 fingerprint no longer matches.  `report` computes paired per-seed NLL deltas:
 `summary - closed @128`, `singletons - summary @128`, and the interaction
-`(summary - closed | None) - (summary - closed | 128)`; it reports mean,
-sample SD, `d_z`, exact sign-flip p, Holm-adjusted p within the declared
-primary family, and the attainable-p floor.  At 4 seeds the floor is 0.125;
-this is a resolution limit, not evidence of no effect.  A controlled
-comparator permits only the declared factors (`max_block`, `open_block_mode`,
-`open_block_scope`) to differ and rejects undeclared recipe/layer differences.
+`(summary - closed | None) - (summary - closed | 128)`; it reports per-arm
+`n`/mean/sample SD and token-pooled PPL, plus paired mean, sample SD, `d_z`,
+exact sign-flip p, Holm-adjusted p within the declared primary family, and the
+attainable-p floor.  At 4 seeds the raw floor is 0.125; this is a resolution
+limit, not evidence of no effect.  The primary family has three Holm
+comparisons, so the family-corrected seed floor is 7 (3·2/2^7 = 0.047); six
+seeds only suffice for one raw comparison and are not enough for a family
+claim.  A controlled comparator permits only the declared factors
+(`max_block`, `open_block_mode`, `open_block_scope`) to differ and rejects
+undeclared recipe/layer differences: the compact hyperparameters, the
+`train_knobs` optimizer/schedule/clipping/augmentation/precision descriptor,
+the derived training objective, and the matched-initialization digest must all
+agree.  A cell whose key seed/variant disagrees with the record is excluded
+and named rather than silently paired.
 
 ### 24.6 Recorded diagnostics
 
