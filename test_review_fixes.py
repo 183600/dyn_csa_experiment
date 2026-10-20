@@ -3583,6 +3583,26 @@ def t_simple_floor_contrast_is_significance_aware():
         assert r2['simple_baseline']['panel_beats_simple_floor'] is False, r2['simple_baseline']
         assert r2['simple_baseline']['floor_contrast']['verdict'] == 'does_not_beat_floor', r2['simple_baseline']
         assert any('does not beat the tuned count-model floor' in w for w in r2['warnings']), r2['warnings']
+        # The pre-declared method arm must clear the floor ITSELF.  Selecting
+        # the best panel arm post hoc could let a dense baseline rescue the
+        # gate while the proposed method is worse than the count model.
+        assert fl['method_arms_beat_floor'] is True, fl.get('method_arm_floor_status')
+        assert fl['method_arm_floor_status'] == 'all_method_arms_beat_floor', fl.get('method_arm_floor_status')
+        assert fl['method_arm_floor_contrasts']['csa_dynamic']['method_status'] == 'beats_floor_holm', fl['method_arm_floor_contrasts']
+        assert r2['simple_baseline']['method_arms_beat_floor'] is False, r2['simple_baseline']
+        assert any('declared method arm' in w for w in r2['warnings']), r2['warnings']
+        # A different arm beating the floor must not rescue the method gate.
+        rescued = recs(floor + 1.0)
+        for _k, _r in rescued.items():
+            if _r['variant'] == 'full_sw128_matched':
+                _r['ppl'] = floor - 1.0
+                _r['nll_sum'] = math.log(floor - 1.0) * n_tok
+        with contextlib.redirect_stdout(io.StringIO()):
+            r5 = L.methodology_audit(rescued, design={}, baselines=L.BASELINE_DESIGN,
+                                     outdir=td, verbose=False)
+        assert r5['simple_baseline']['panel_beats_simple_floor'] is True, r5['simple_baseline']
+        assert r5['simple_baseline']['method_arms_beat_floor'] is False, r5['simple_baseline']
+        assert r5['simple_baseline']['method_arm_floor_status'] == 'method_arm_does_not_beat_floor', r5['simple_baseline']
         # The floor reference must be chosen by the PRIMARY (token-pooled)
         # endpoint, not by the arithmetic seed mean: they can rank arms
         # differently when token counts differ.

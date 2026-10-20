@@ -14976,7 +14976,117 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                             report['warnings'].append(
                                 'the panel is pointwise below the count-model floor but the floor contrast is resolution-limited at n=%d (p floor %.3g); add seeds before claiming a beats-floor win'
                                 % (int(_fst.get('n') or 0), float(_fst.get('p_floor') or float('nan'))))
+                # The reference-arm comparison above answers "does the best
+                # panel arm beat the floor?".  That is a post-hoc selection:
+                # if the proposed method loses to a dense baseline, the best
+                # arm can still clear the gate and make the mechanism claim
+                # look floor-supported.  Declare the method arms (the left
+                # side of every baseline contrast) up front, test EACH of
+                # them against the same deterministic floor, and correct the
+                # family.  A method claim may only quote the floor gate when
+                # its own arm clears it.
+                _method_arm_names = sorted({_a for _cs in _scoped_baselines.values()
+                                            for _a, _b, _n in _cs})
+                _floor_by_arm = {}
+                _method_floor_status = 'unverified'
+                if _comparable is True and _floor_ppl is not None:
+                    _by_variant = {}
+                    for _k, _v in _cands:
+                        _by_variant.setdefault(_v.get('variant'), []).append((_k, _v))
+                    for _v, _vent in sorted(_by_variant.items(), key=lambda kv: str(kv[0])):
+                        _vent = [kv for kv in _vent if not kv[1].get('protocol')] or _vent
+                        _vk, _vs = min(_vent, key=lambda kv: float(
+                            kv[1].get('ppl_primary', kv[1].get('ppl_mean', float('inf')))))
+                        _vp = _vs.get('protocol') or ''
+                        _vals = [float(_ppl) for (vv, tt, _s), r in recs.items()
+                                 if vv == _v and (tt or '') == _vp
+                                 and (_ppl := _record_primary_ppl(r)) is not None]
+                        if not _vals:
+                            continue
+                        _deltas = [x - _floor_ppl for x in _vals]
+                        _fst = paired_effect_stats(_deltas, alpha=0.05,
+                                                   min_n=int(report.get('min_n') or 3))
+                        _pt = float(np.mean(_deltas))
+                        if _pt < 0:
+                            if _fst.get('significant'):
+                                _av = 'beats_floor_significant'
+                            elif _fst.get('underpowered') or _fst.get('resolution_limited'):
+                                _av = 'beats_floor_pointwise_underpowered'
+                            else:
+                                _av = 'beats_floor_pointwise_not_significant'
+                        else:
+                            _av = 'does_not_beat_floor'
+                        _floor_by_arm[_v] = {
+                            'n': int(_fst.get('n') or 0),
+                            'protocol': _vp,
+                            'mean_delta': _pt,
+                            'std': _fst.get('std'),
+                            'p_exact_signflip': _fst.get('p_exact_signflip'),
+                            'p_floor': _fst.get('p_floor'),
+                            'ci95_low': _fst.get('ci95_low'),
+                            'ci95_high': _fst.get('ci95_high'),
+                            'within_seed_noise': _fst.get('within_seed_noise'),
+                            'underpowered': _fst.get('underpowered'),
+                            'resolution_limited': _fst.get('resolution_limited'),
+                            'verdict': _av,
+                        }
+                    _floor_named = []
+                    for _v in _method_arm_names:
+                        _p = (_floor_by_arm.get(_v) or {}).get('p_exact_signflip')
+                        try:
+                            _p = float(_p)
+                        except (TypeError, ValueError, OverflowError):
+                            _p = float('nan')
+                        _floor_named.append((_v, _p if math.isfinite(_p) else 1.0))
+                    _floor_holm = holm_adjust(_floor_named) if _floor_named else {}
+                    for _v in _method_arm_names:
+                        _c = _floor_by_arm.get(_v)
+                        if _c is None:
+                            continue
+                        _h = _floor_holm.get(_v)
+                        _c['p_holm'] = (_h or {}).get('p_holm')
+                        _c['declared_family_m'] = len(_floor_named)
+                        _c['significant_holm'] = bool(
+                            (_h or {}).get('reject')
+                            and _c.get('verdict') == 'beats_floor_significant')
+                        if _c.get('verdict') == 'does_not_beat_floor':
+                            _c['method_status'] = 'does_not_beat_floor'
+                        elif _c.get('significant_holm'):
+                            _c['method_status'] = 'beats_floor_holm'
+                        elif _c.get('verdict') == 'beats_floor_significant':
+                            _c['method_status'] = 'family_correction_not_met'
+                        else:
+                            _c['method_status'] = 'not_confirmed'
+                    _statuses = [(_floor_by_arm.get(_v) or {}).get('method_status')
+                                 for _v in _method_arm_names]
+                    if not _method_arm_names or any(s is None for s in _statuses):
+                        _method_floor_status = 'unverified'
+                    elif any(s == 'does_not_beat_floor' for s in _statuses):
+                        _method_floor_status = 'method_arm_does_not_beat_floor'
+                    elif all(s == 'beats_floor_holm' for s in _statuses):
+                        _method_floor_status = 'all_method_arms_beat_floor'
+                    else:
+                        _method_floor_status = 'method_floor_contrast_unresolved'
+                _method_arms_beat_floor = (
+                    True if _method_floor_status == 'all_method_arms_beat_floor'
+                    else (False if _method_floor_status == 'method_arm_does_not_beat_floor'
+                          else None))
+                if _method_floor_status == 'method_arm_does_not_beat_floor':
+                    _failed = sorted(v for v, c in _floor_by_arm.items()
+                                     if c.get('verdict') == 'does_not_beat_floor')
+                    report['warnings'].append(
+                        'declared method arm(s) %s do NOT beat the tuned count-model floor '
+                        '(best_ppl=%.4f) — the mechanism claim lacks the most basic baseline, '
+                        'even if another panel arm clears it'
+                        % (', '.join(_failed), _floor_ppl))
+                elif _method_floor_status == 'method_floor_contrast_unresolved':
+                    report['warnings'].append(
+                        'the declared method arm(s) do not yet have a Holm-cleared beats-floor '
+                        'contrast — report the floor comparison as unconfirmed, not as a win')
                 report['simple_baseline'].update({
+                    'method_arm_floor_contrasts': _floor_by_arm,
+                    'method_arm_floor_status': _method_floor_status,
+                    'method_arms_beat_floor': _method_arms_beat_floor,
                     'panel_reference_arm': _ref_key,
                     'panel_reference_ppl': _panel_ppl,
                     'panel_reference_protocol': _ref.get('protocol'),
