@@ -5465,6 +5465,32 @@ def t_known_labels_audit():
         raise AssertionError('known_labels without y must fail closed')
 
 
+def t_build_report_exact_seed_and_params():
+    # The zero-GPU report reader must share exp_lib's exact-integer contract:
+    # int(Decimal('1.5')) would silently pair the wrong run, and a fractional
+    # parameter count is not a capacity measurement.
+    from decimal import Decimal
+    _orig_summary = BR.summary
+    try:
+        BR._LOADED.clear()
+        BR.summary = lambda _outdir: {'d::x': {'variant': 'x', 'seed': Decimal('1.5'),
+                                               'ppl': 2.0, 'run_cfg': 'r',
+                                               'steps': 1, 'tokens_seen': 1}}
+        assert BR.per_seed_records('/nonexistent-panel') == {}
+        BR._LOADED.clear()
+        BR.summary = lambda _outdir: {'d::x': {'variant': 'x', 'seed': Decimal('2'),
+                                               'ppl': 2.0, 'run_cfg': 'r',
+                                               'steps': 1, 'tokens_seen': 1}}
+        got = BR.per_seed_records('/nonexistent-panel')
+        assert list(got.get('x', {})) == [('', 2)], got
+    finally:
+        BR.summary = _orig_summary
+        BR._LOADED.clear()
+    assert BR.param_gap({'params': 1000}, {'params': 1000.5}) is None
+    assert BR.param_gap({'params': 1000}, {'params': True}) is None
+    assert BR.param_gap({'params': 1000}, {'params': 1010}) is not None
+
+
 def t_par_watchdog_override_validation():
     import par
     ctx = {'workers': 1, 'slots': [''], 'on_cuda': False}
@@ -5695,6 +5721,7 @@ def main():
     _check('L20 indexer invalid soft lanes are zero', t_indexer_invalid_soft_lanes_are_zero)
     _check('L21 attention backward partial head group', t_attention_backward_partial_head_group)
     _check('L22 parallel watchdog override validation', t_par_watchdog_override_validation)
+    _check('L22b build report exact seed/parameter contracts', t_build_report_exact_seed_and_params)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

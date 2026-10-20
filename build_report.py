@@ -394,8 +394,10 @@ PARAM_MATCH_ARCH = 0.06
 def param_gap(a, b, tol=PARAM_MATCH_TOL):
     if not isinstance(a, dict) or not isinstance(b, dict):
         return None
-    pa = _as_finite(a.get('params'))
-    pb = _as_finite(b.get('params'))
+    # Parameter counts are exact integers (same contract as exp_lib); a
+    # fractional/boolean value is not a capacity measurement.
+    pa = _int_or(a.get('params'), None)
+    pb = _int_or(b.get('params'), None)
     if pa is None or pb is None:
         return None
     if pa <= 0 or pb <= 0:
@@ -437,14 +439,9 @@ def per_seed_records(outdir):
             if isinstance(_sv, (bool, np.bool_)):
                 print(f"[report] record {_k!r} in {outdir} carries a boolean seed — skipped for pairing")
                 continue
-            if isinstance(_sv, numbers.Real):
-                _sf = float(_sv)
-                _sd = int(_sf) if math.isfinite(_sf) and _sf.is_integer() else None
-            else:
-                try:
-                    _sd = int(_sv)
-                except (TypeError, ValueError, OverflowError):
-                    _sd = None
+            # Exact integer parsing: int(Decimal('1.5')) would silently
+            # truncate to a different seed and pair the wrong run.
+            _sd = _int_or(_sv, None)
             if _sd is None:
                 print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
                 continue
