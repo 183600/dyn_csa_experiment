@@ -3483,6 +3483,11 @@ def t_nested_tuning_artifact_audit():
     bad_eval['arms']['a']['trials'][0]['evaluation_row_fp'] = 'OTHER'
     rbe = L.baseline_tuning_audit(bad_eval, protocol=protocol)
     assert rbe['tuning_verified'] is False and any('different evaluation fold' in p for p in rbe['problems']), rbe
+    # A truthy non-boolean split flag is not an applied nested split.
+    bad_flag = json.loads(json.dumps(art))
+    bad_flag['arms']['a']['trials'][0]['selection_row_split_applied'] = 'yes'
+    rbf = L.baseline_tuning_audit(bad_flag, protocol=protocol)
+    assert rbf['tuning_verified'] is False and any('did not use the declared nested' in p for p in rbf['problems']), rbf
     # Extra final records outside the declared final-seed plan must not enlarge
     # the effective n.
     extra = json.loads(json.dumps(art))

@@ -13514,7 +13514,11 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 if not isinstance(_entry, dict):
                     continue
                 for _t in (_entry.get('trials') or []):
-                    if not isinstance(_t, dict) or not _t.get('selection_row_split_applied'):
+                    # The flag must be the boolean True, not a truthy string or
+                    # number: only an actual applied split attests the nested
+                    # protocol.
+                    if (not isinstance(_t, dict)
+                            or _t.get('selection_row_split_applied') is not True):
                         problems.append(f'{_arm}: a tuning trial did not use the declared nested selection rows')
                         break
                     if _t.get('selection_row_fp') != _expected_sel_fp:
