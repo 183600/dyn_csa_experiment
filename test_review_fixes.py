@@ -86,6 +86,14 @@ def t_holm_min_attainable():
     assert abs(L.holm_min_attainable_p(12, 4, 0.05) - 0.001953125) < 1e-12
     assert abs(L.holm_min_attainable_p(8, 1, 0.05) - 0.0078125) < 1e-12
     assert L.holm_min_attainable_p(6, 4, 0.05) > 0.05 and L.holm_min_attainable_p(12, 4, 0.05) < 0.05
+    # Duplicate names cannot share one dict slot: rejecting is the only
+    # representation that does not shrink/corrupt the family.
+    try:
+        L.holm_adjust([('a', 0.01), ('a', 0.02)])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('duplicate comparison names must be rejected')
 
 
 def t_min_consistency():
@@ -1262,6 +1270,10 @@ def t_adaptive_threshold_guard():
     # Row chunking keeps a large batch feasible; an explicit safety ceiling is
     # still honoured.
     L.causal_adaptive_threshold(torch.randn(64, 4096), 16)
+    # Empty inputs keep their shape (batch x length), not a flat [0] tensor.
+    for shape in ((0,), (0, 5), (3, 0), (0, 0)):
+        got = L.causal_adaptive_threshold(torch.empty(shape), 16)
+        assert tuple(got.shape) == shape, (shape, got.shape)
     _old = os.environ.get('CSA_ADAPTIVE_MAX_TOKENS')
     try:
         os.environ['CSA_ADAPTIVE_MAX_TOKENS'] = '1024'
@@ -2760,6 +2772,26 @@ def t_split_sizes_explicit_never_negative():
     # The normal explicit-size reconciliation is unchanged.
     idx = L.chronological_split_indices(10, train_size=6)
     assert [len(idx[k]) for k in ('train', 'val', 'test')] == [6, 1, 3]
+    assert [len(idx[k]) for k in ('train', 'val', 'test')] == [6, 1, 3]
+    idx_float = L.chronological_split_indices(10, train_size=6.0)
+    assert [len(idx_float[k]) for k in ('train', 'val', 'test')] == [6, 1, 3]
+    # Explicit sizes are counts: non-integral/coerced values must be refused
+    # rather than silently truncated (1.5 -> 1) or parsed ('2' -> 2).
+    for bad in (1.5, '2', True):
+        try:
+            L.chronological_split_indices(100, train_size=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'train_size={bad!r} must be rejected')
+    for bad_n in (10.5, '10', True):
+        try:
+            L.chronological_split_indices(bad_n)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'n={bad_n!r} must be rejected')
+    assert len(L.chronological_split_indices(100.0)['train']) == 80
 
 
 def t_audit_split_sequence_overlap():
@@ -2863,12 +2895,16 @@ def t_split_purge_embargo():
     # Purging more rows than a split contains is a hard error, not an empty
     # split that would silently make validation unusable.
     for bad in (-1, 1.5, True, '2'):
+        # Use a large n so rejection cannot come accidentally from an
+        # over-large purge emptying a split: the validator itself must refuse
+        # non-integral/coerced values.
         try:
-            L.chronological_split_indices(10, purge=bad)
+            L.chronological_split_indices(100, purge=bad)
         except ValueError:
             pass
         else:
             raise AssertionError(f'purge={bad!r} must be rejected')
+    assert len(L.chronological_split_indices(100, purge=2.0)['train']) == 78
     try:
         L.chronological_split_indices(10, purge=5)
     except ValueError as e:
@@ -3398,6 +3434,80 @@ def t_audit_length_missing_truncated_flag():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def t_stats_accept_numpy_scalars():
+    # Public numeric helpers are routinely fed NumPy arrays/scalars.  The old
+    # isinstance(int, float) filters silently dropped every np.int64 /
+    # np.float32 value, turning a real panel into "no data".
+    d = np.array([1, 2, 3, 4], dtype=np.int64)
+    r = L.paired_effect_stats(d)
+    assert r['n'] == 4 and math.isfinite(r['mean']) and math.isfinite(r['p_exact_signflip']), r
+    w = L.wilcoxon_signed_rank_p(d)
+    assert w['n_nonzero'] == 4 and math.isfinite(w['p']), w
+    t = L.tost_paired(d, margin=10.0)
+    assert t['n'] == 4 and t['equivalent'] is True, t
+    assert L.bootstrap_mean_ci(np.arange(10)) is not None
+    assert L.paired_bootstrap_ci(np.arange(10)) is not None
+    assert L.unpaired_bootstrap_ci(np.arange(10), np.arange(1, 11)) is not None
+    lo, hi, dropped = L.finite_range([
+        ('int', np.int64(1)), ('f32', np.float32(2.5)),
+        ('nan', np.float64('nan')), ('bool', True)])
+    assert (lo, hi, dropped) == (1.0, 2.5, ['nan', 'bool']), (lo, hi, dropped)
+    meta = L.meta_analyze_effects([
+        {'label': 'A', 'scale': 1, 'effects': np.array([1, 2, 3], dtype=np.int64), 'seeds': [0, 1, 2]},
+        {'label': 'B', 'scale': 2, 'effects': np.array([2, 3, 4], dtype=np.int64), 'seeds': [0, 1, 2]},
+    ])
+    assert meta['status'] == 'ok' and all(p['n'] == 3 for p in meta['per_point']), meta
+
+
+def t_apply_rope_preserves_width():
+    # Over-long rope_dim must rotate only complete pairs that exist and must
+    # never widen the output (the old cat form returned a wider tensor).
+    for width in (0, 1, 2, 3, 4, 5, 8, 16):
+        for rope_dim in range(0, 2 * width + 4):
+            x = torch.randn(2, 3, width, dtype=torch.float64)
+            half = rope_dim // 2
+            cos = torch.randn(1, 3, half, dtype=torch.float64)
+            sin = torch.randn(1, 3, half, dtype=torch.float64)
+            xg = x.clone().requires_grad_(True)
+            y = V7.apply_rope(xg, cos, sin, rope_dim)
+            assert tuple(y.shape) == tuple(x.shape), (width, rope_dim, y.shape)
+            y.sum().backward()
+            assert torch.isfinite(xg.grad).all(), (width, rope_dim)
+
+
+def t_label_key_keeps_numeric_strings():
+    # Only real numeric scalars are checked for NaN/Inf.  A categorical label
+    # literally spelled "nan" or "inf" must remain a label, not disappear as a
+    # corrupted target (the old float(v) coercion did that).
+    X = np.arange(24, dtype=float).reshape(12, 2)
+    y = ['nan', 'inf', 'a', 'b', 'nan', 'a', 'b', 'a', 'b', 'a', 'b', 'nan']
+    rep = L.data_quality_report(X, y=y, train_idx=list(range(6)),
+                                val_idx=list(range(6, 9)), test_idx=list(range(9, 12)))
+    assert rep['checks']['missing_labels'] == 0 and rep['checks']['nonfinite_labels'] == 0, rep
+    assert rep['checks']['label_distribution'].get('nan') == 3, rep
+    # Actual NaN/Inf numeric targets are still non-finite.
+    ynum = [0, 1, np.nan, np.inf, 2, 3, 4, 5, 6, 7, 8, 9]
+    rep2 = L.data_quality_report(X, y=ynum, train_idx=list(range(6)),
+                                 val_idx=list(range(6, 9)), test_idx=list(range(9, 12)))
+    assert rep2['checks']['missing_labels'] == 0 and rep2['checks']['nonfinite_labels'] == 2, rep2
+
+
+def t_locked_json_and_csv_generator():
+    root = tempfile.mkdtemp(prefix='atomic_', dir=REPO)
+    try:
+        p = os.path.join(root, 'missing', 'sub', 'x.json')
+        assert L.locked_json_read(p) == {}
+        got = L.locked_json_update(p, lambda obj: (obj.update(k=1) or obj))
+        assert got == {'k': 1} and L.locked_json_read(p) == {'k': 1}, got
+        c = os.path.join(root, 'rows.csv')
+        L.atomic_write_csv(c, None, ({'a': i, 'b': i * 2} for i in range(3)))
+        with open(c, encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        assert lines == ['a,b', '0,0', '1,2', '2,4'], lines
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -3424,6 +3534,8 @@ def main():
     _check('A4e training-health classifier: measured vs unmonitored vs nonfinite', t_training_health_classifier)
     _check('A4f training-health threshold is slope-noise aware (2*SE)', t_training_health_noise_aware_threshold)
     _check('A4g rope arms never claim the batched eager twin', t_rope_arms_are_not_batched)
+    _check('A4g2 apply_rope preserves width (over-long/odd rope_dim)', t_apply_rope_preserves_width)
+    _check('A4g3 numeric helpers accept NumPy scalars', t_stats_accept_numpy_scalars)
     _check('A4h shipped manifest v3 admits 48/48 synthetic records end-to-end', t_manifest_v3_admission_can_succeed)
     _check('B1 legacy modes bit-exact', t_legacy_modes_bitexact)
     _check('B2 determinism + target-zone safety', t_corruption_deterministic_and_paired)
@@ -3492,6 +3604,7 @@ def main():
     _check('E9 data_version identity', t_data_version_identity)
     _check('E10 crash-safe manifest status/planned cells', t_manifest_running_then_complete)
     _check('E11 failed overfit guard is retried', t_failed_guard_is_retried)
+    _check('E12 locked JSON nested path + CSV generator rows', t_locked_json_and_csv_generator)
     _check('F1 indexer column-narrowing exactness', t_indexer_column_narrowing_exact)
     _check('F2 zero-block attention keeps window', t_attention_zero_blocks_keeps_window)
     _check('F3 overfit guard source key', t_overfit_guard_source_key)
@@ -3544,6 +3657,7 @@ def main():
     _check('I22 purge/embargo keeps window boundaries sealed', t_split_purge_embargo)
     _check('I23 grouped split refuses an empty requested side', t_group_split_refuses_empty_requested_side)
     _check('I24 label shift and per-split label corruption counts', t_label_shift_and_split_counts)
+    _check('I25 numeric-looking string labels stay categorical', t_label_key_keeps_numeric_strings)
     # Open-block reading rule: the substantive gates (causality, reference
     # pooling, masks, edge cases, closed regression) live in test_open_block.py
     # so they can also be run on their own.

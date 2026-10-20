@@ -73,27 +73,26 @@ def rope_cos_sin(head_dim, rope_dim, positions, device, base=10000.0):
     return out
 
 def apply_rope(x, cos, sin, rope_dim):
-    half = rope_dim // 2
-    if rope_dim > x.shape[-1]:
-        # Over-long rope_dim: rotate the available half of the row and keep
-        # an empty passthrough tail.  The slice-write path below cannot
-        # express that case (the second write would exceed the output width),
-        # so use the general cat form.
-        xr = x[..., :rope_dim]
-        xp = x[..., rope_dim:]
-        x1, x2 = (xr[..., :half], xr[..., half:])
-        rot = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1)
-        return torch.cat([rot, xp], -1)
+    # Only rotate complete pairs that actually exist in the row.  An
+    # over-long rope_dim must not widen the result (the old cat form could
+    # return a tensor wider than x), and an odd rope_dim must leave the
+    # unpaired middle lane untouched instead of broadcasting it into a
+    # different width.
+    width = int(x.shape[-1])
+    rot_dim = max(0, min(int(rope_dim), width))
+    half = rot_dim // 2
+    if half <= 0:
+        return x.clone()
+    cos_h = cos[..., :half] if cos.shape[-1] > half else cos
+    sin_h = sin[..., :half] if sin.shape[-1] > half else sin
     x1 = x[..., :half]
-    x2 = x[..., half:rope_dim]
-    # same elementwise expressions, written straight into one output buffer:
-    # the two cats only ever copied these values, so the result is
-    # bit-identical.
-    out = torch.empty_like(x)
-    out[..., :half] = x1 * cos - x2 * sin
-    out[..., half:rope_dim] = x1 * sin + x2 * cos
-    if rope_dim < x.shape[-1]:
-        out[..., rope_dim:] = x[..., rope_dim:]
+    x2 = x[..., half:2 * half]
+    # Same elementwise expressions as the previous slice-write path; the
+    # prefix is overwritten and every lane from 2*half onward (including the
+    # unpaired odd lane and any tail beyond rope_dim) passes through.
+    out = x.clone()
+    out[..., :half] = x1 * cos_h - x2 * sin_h
+    out[..., half:2 * half] = x1 * sin_h + x2 * cos_h
     return out
 
 @dataclasses.dataclass

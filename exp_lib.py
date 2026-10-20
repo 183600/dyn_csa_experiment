@@ -44,7 +44,7 @@ if _NEEDED:
         print(f"[setup] {_msg}")
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, copy, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading
+import gc, copy, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading, numbers
 import array
 from math import comb
 from dataclasses import dataclass
@@ -436,6 +436,23 @@ def _safe_exp_ppl(x):
         return math.exp(x)
     except OverflowError:
         return float('inf')
+
+
+def _finite_scalar(v):
+    """Finite float for a real numeric scalar, including NumPy scalars.
+
+    Numeric helpers are routinely called with ``np.int64``/``np.float32``
+    values from arrays; the old ``isinstance(v, (int, float))`` filters
+    silently dropped those and turned a valid panel into "no data".  Booleans
+    and complex/non-numeric objects are not measurements.
+    """
+    if isinstance(v, (bool, np.bool_)) or not isinstance(v, numbers.Real):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _nll_doc_ci(nll_per_row, n_tokens_per_row):
@@ -1440,7 +1457,9 @@ def _adaptive_exact_limit():
 
 def causal_adaptive_threshold(sim, target_block_tokens):
     if sim.numel() == 0:
-        return torch.empty(0, dtype=sim.dtype, device=sim.device)
+        # Preserve the caller's shape: an empty batch [0, n] or a zero-width
+        # row must not turn into a flat length-0 tensor.
+        return torch.empty_like(sim)
     n = int(sim.shape[-1])
     # Hard safety ceiling only (the sampling path below is bounded).
     _max_len = 1 << 20
@@ -7362,8 +7381,13 @@ def locked_json_read(path):
         fcntl = None
     lock_f = None
     if fcntl is not None:
-        lock_f = open(path + '.lock', 'a')
-        fcntl.flock(lock_f, fcntl.LOCK_SH)
+        try:
+            lock_f = open(path + '.lock', 'a')
+            fcntl.flock(lock_f, fcntl.LOCK_SH)
+        except OSError:
+            # A missing/unwritable parent directory means the file is absent
+            # (or unreadable); a read must return {} rather than crash.
+            lock_f = None
     try:
         if not os.path.exists(path):
             return {}
@@ -7396,6 +7420,9 @@ def locked_json_update(path, mutfn, indent=2):
     except ImportError:
         fcntl = None
     lock_f = None
+    # The lock file (and later the JSON) must be creatable for a nested path
+    # that does not exist yet.
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     if fcntl is not None:
         lock_f = open(path + '.lock', 'a')
         fcntl.flock(lock_f, fcntl.LOCK_EX)
@@ -7422,6 +7449,10 @@ def locked_json_update(path, mutfn, indent=2):
 
 def atomic_write_csv(path, header, rows):
     import io as _io
+    # A one-shot iterator cannot be scanned for header inference and then
+    # iterated again; materialise it once so no rows are silently dropped.
+    if not isinstance(rows, (list, tuple)):
+        rows = list(rows)
     if header is None:
         header = []
         seen = set()
@@ -8126,7 +8157,8 @@ def objective_reason(ra, rb):
     return ('objective differs: ' + ', '.join(diffs)) if diffs else None
 
 def ppl_is_usable(v):
-    return isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v) and (v > 0.0)
+    f = _finite_scalar(v)
+    return f is not None and f > 0.0
 
 def by_len_cells(rows, Ln, variant=None):
     keys = (Ln, int(Ln), str(int(Ln)))
@@ -8166,15 +8198,23 @@ def holm_adjust(named_pvals, alpha=0.05):
     多重比较问题的来源（design_notes §4/§17）。"""
     fam = []
     invalid = {}
+    _seen_names = set()
     for name, p in named_pvals:
+        sname = str(name)
+        if sname in _seen_names:
+            # A dict keyed by comparison name cannot represent two family
+            # slots with the same name; silently keeping one would shrink or
+            # corrupt the correction family.
+            raise ValueError(f'holm_adjust: duplicate comparison name {sname!r}')
+        _seen_names.add(sname)
         try:
             pv = float(p)
         except (TypeError, ValueError):
             pv = float('nan')
         if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
-            invalid[str(name)] = {'p_raw': p, 'p_holm': None, 'rank': None, 'reject': False, 'reason': 'p not in [0,1] or not finite'}
+            invalid[sname] = {'p_raw': p, 'p_holm': None, 'rank': None, 'reject': False, 'reason': 'p not in [0,1] or not finite'}
             continue
-        fam.append((str(name), pv))
+        fam.append((sname, pv))
     out = dict(invalid)
     m = len(fam)
     order = sorted(fam, key=lambda kv: kv[1])
@@ -8370,8 +8410,9 @@ def signflip_p_floor(n):
 def finite_range(named_values):
     vals, dropped = ([], [])
     for label, m in named_values:
-        if isinstance(m, (int, float)) and (not isinstance(m, bool)) and math.isfinite(m):
-            vals.append(float(m))
+        f = _finite_scalar(m)
+        if f is not None:
+            vals.append(f)
         else:
             dropped.append(label)
     if not vals:
@@ -8545,7 +8586,7 @@ def exact_signflip_p(deltas):
     return {'n': n, 'p': float(p), 'n_dropped': n_dropped, 'method': method}
 
 def _percentile_ci(vals, lo=2.5, hi=97.5):
-    v = [float(x) for x in vals if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))]
+    v = [f for f in (_finite_scalar(x) for x in vals) if f is not None]
     if len(v) < 2:
         return None
     v.sort()
@@ -8566,9 +8607,8 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     grow with n_boot.  The RNG is seeded, so repeated report builds return the
     same interval.
     """
-    v = np.asarray([float(x) for x in values
-                    if isinstance(x, (int, float)) and not isinstance(x, bool)
-                    and math.isfinite(float(x))], dtype=float)
+    v = np.asarray([f for f in (_finite_scalar(x) for x in values)
+                    if f is not None], dtype=float)
     n = int(v.size)
     if n < 2:
         return None
@@ -8595,7 +8635,7 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
 
 
 def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
-    d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)
+    d = np.asarray([f for f in (_finite_scalar(x) for x in deltas) if f is not None], dtype=float)
     if d.size < 2:
         return None
     # Draws are generated in chunks, so the panel size does not require a
@@ -8613,8 +8653,8 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     return _percentile_ci(means.tolist())
 
 def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=20261018):
-    a = np.asarray([float(x) for x in with_values if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)
-    b = np.asarray([float(x) for x in without_values if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)
+    a = np.asarray([f for f in (_finite_scalar(x) for x in with_values) if f is not None], dtype=float)
+    b = np.asarray([f for f in (_finite_scalar(x) for x in without_values) if f is not None], dtype=float)
     if a.size < 2 or b.size < 2:
         return None
     rng = np.random.default_rng(int(seed))
@@ -8642,7 +8682,7 @@ def wilcoxon_signed_rank_p(deltas):
     sum DP then counts every sign assignment exactly.  This replaces the old
     n<=16 enumeration (2^n) with O(n * sum_ranks), which is what keeps the
     sensitivity check exact when seed completion grows the panels."""
-    d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))], dtype=float)
+    d = np.asarray([f for f in (_finite_scalar(x) for x in deltas) if f is not None], dtype=float)
     d = d[np.abs(d) > 1e-15]
     n = int(d.size)
     if n == 0:
@@ -8719,7 +8759,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     p-value can never dress up a sub-noise effect as a real improvement, while
     `resolution_limited` stops a small-n panel from being read as a negative
     result when only the test's granularity, not the data, bound the p."""
-    d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(float(x))], dtype=float)
+    d = np.asarray([f for f in (_finite_scalar(x) for x in deltas) if f is not None], dtype=float)
     n = int(d.size)
     if n == 0:
         return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None}
@@ -8938,7 +8978,7 @@ def tost_paired(deltas, margin, conf=0.90):
     单边 p、conf 水平 CI 与 `equivalent` 判定。margin 必须由计划预先注册
     （如 kernel/eager 面板平均 PPL 相对差 <1%）；本函数不替调用方选择
     margin。n<2 或 margin<=0 时不判定。"""
-    d = np.asarray([float(x) for x in deltas if isinstance(x, (int, float)) and (not isinstance(x, bool)) and math.isfinite(float(x))], dtype=float)
+    d = np.asarray([f for f in (_finite_scalar(x) for x in deltas) if f is not None], dtype=float)
     n = int(d.size)
     out = {'n': n, 'margin': float(margin), 'conf': float(conf), 'equivalent': None,
            'method': 'paired-t (Student t, df=n-1; pre-registered margin required)'}
@@ -9195,18 +9235,18 @@ def _scale_points(points):
         except TypeError:
             continue
         if seeds is None:
-            keep = [(j, v) for j, v in enumerate(vals)
-                    if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))]
+            keep = [(j, f) for j, f in ((j, _finite_scalar(v)) for j, v in enumerate(vals))
+                    if f is not None]
             seeds_kept = [j for j, _v in keep]
-            effects = [float(v) for _j, v in keep]
+            effects = [f for _j, f in keep]
         else:
             seeds = list(seeds)
             if len(seeds) != len(vals):
                 raise ValueError('scale point %r: seeds length %d does not match effects length %d' % (label, len(seeds), len(vals)))
-            keep = [(s, v) for s, v in zip(seeds, vals)
-                    if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))]
+            keep = [(s, f) for s, f in ((s, _finite_scalar(v)) for s, v in zip(seeds, vals))
+                    if f is not None]
             seeds_kept = [s for s, _v in keep]
-            effects = [float(v) for _s, v in keep]
+            effects = [f for _s, f in keep]
         if len(set(seeds_kept)) != len(seeds_kept):
             # A repeated seed would be counted as two independent observations
             # and shrink every within-scale SE in meta_analyze_effects; this
@@ -11210,10 +11250,7 @@ def _param_control_detail(recs, a, b):
         return out
 
     def _num(d, key):
-        v = d.get(key)
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)):
-            return float(v)
-        return None
+        return _finite_scalar(d.get(key))
     for key, label in (('non_embedding', 'non_embedding'), ('active', 'active')):
         va, vb = _num(ba, key), _num(bb, key)
         if va is None or vb is None:
@@ -11310,11 +11347,12 @@ def _hypothesis_spec(comp, kind):
     return table.get(comp)
 
 def _sign_of(x):
-    if not isinstance(x, (int, float)) or isinstance(x, bool) or not math.isfinite(float(x)):
+    f = _finite_scalar(x)
+    if f is None:
         return None
-    if float(x) > 0:
+    if f > 0:
         return 1
-    if float(x) < 0:
+    if f < 0:
         return -1
     return 0
 
@@ -14627,7 +14665,7 @@ def _resolve_impl_modes(cfg=None, *, device=None):
 
 
 def _is_finite_number(v):
-    return isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v)
+    return _finite_scalar(v) is not None
 
 
 def _fixed_train_eval_batch(train_ids, seq_len, batch_size, device, seed):
@@ -17254,8 +17292,7 @@ def aggregate(summary):
         bf1, bex = ([], [])
 
         def _cell(layer, k):
-            v = layer.get(k)
-            return float(v) if isinstance(v, (int, float)) and (not isinstance(v, bool)) and math.isfinite(v) else None
+            return _finite_scalar(layer.get(k))
         for r in recs:
             r_f1, r_ex, r_dl = ([], [], [])
             for lk, lv in r.get('stats', {}).items():

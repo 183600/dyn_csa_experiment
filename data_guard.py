@@ -73,6 +73,31 @@ def _check_fraction(name, value):
     return value
 
 
+def _check_count(name, value, *, positive=False):
+    """Validate an integer count without silently coercing/truncating it."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f'{name} must be an integer, got {value!r}')
+    if isinstance(value, numbers.Integral):
+        value = int(value)
+    elif isinstance(value, numbers.Real):
+        f = float(value)
+        if not math.isfinite(f) or f != math.floor(f):
+            raise ValueError(f'{name} must be an integer, got {value!r}')
+        value = int(f)
+    else:
+        raise ValueError(f'{name} must be an integer, got {value!r}')
+    if value < 0:
+        raise ValueError(f'{name} must be non-negative, got {value}')
+    if positive and value == 0:
+        raise ValueError(f'{name} must be positive, got {value}')
+    return value
+
+
+def _explicit_count(name, value):
+    """Validate an explicit split size without silent int() coercion."""
+    return _check_count(f'{name}_size', value)
+
+
 def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
                    train_size=None, val_size=None, test_size=None):
     """Return deterministic (n_train, n_val, n_test) sizes summing to ``n``.
@@ -82,9 +107,7 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
     last unspecified split absorbs the remainder.  All sizes are non-negative
     and must sum to ``n``.
     """
-    n = int(n)
-    if n < 0:
-        raise ValueError(f'n must be non-negative, got {n}')
+    n = _check_count('n', n)
     train_frac = _check_fraction('train_frac', train_frac)
     val_frac = _check_fraction('val_frac', val_frac)
     test_frac = _check_fraction('test_frac', test_frac)
@@ -93,10 +116,7 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
         sizes = []
         for name, v in zip(SPLIT_NAMES, explicit):
             if v is not None:
-                v = int(v)
-                if v < 0:
-                    raise ValueError(f'{name}_size must be non-negative, got {v}')
-                sizes.append(v)
+                sizes.append(_explicit_count(name, v))
             else:
                 sizes.append(None)
         if sum(v for v in sizes if v is not None) > n:
@@ -240,14 +260,24 @@ def _take(data, idx):
 
 
 def _check_purge(purge):
-    """Validate a purge/embargo size (rows dropped before a holdout split)."""
+    """Validate a purge/embargo size (rows dropped before a holdout split).
+
+    Only an actual integer (or an integral float such as ``2.0``) is accepted.
+    ``int(1.5)``/``int('2')`` used to truncate/coerce silently, which changed
+    the embargo size while looking like a valid request; strings and
+    non-integral numbers are refused instead.
+    """
     if isinstance(purge, (bool, np.bool_)):
         raise ValueError(f'purge must be a non-negative integer, got {purge!r}')
-    try:
+    if isinstance(purge, numbers.Integral):
         purge = int(purge)
-    except (TypeError, ValueError):
-        raise ValueError(
-            f'purge must be a non-negative integer, got {purge!r}') from None
+    elif isinstance(purge, numbers.Real):
+        f = float(purge)
+        if not math.isfinite(f) or f != math.floor(f):
+            raise ValueError(f'purge must be a non-negative integer, got {purge!r}')
+        purge = int(f)
+    else:
+        raise ValueError(f'purge must be a non-negative integer, got {purge!r}')
     if purge < 0:
         raise ValueError(f'purge must be a non-negative integer, got {purge}')
     return purge
@@ -466,7 +496,7 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
             'purge is not supported with grouped splits: it would drop rows '
             'from a group and break whole-group assignment; remove whole '
             'groups instead')
-    n = int(n)
+    n = _check_count('n', n)
     groups = _as_1d(groups, 'groups', n)
     if groups.shape[0] != n:
         raise ValueError('groups must have one entry per row')
@@ -539,7 +569,7 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
     straddle a split boundary.  It is refused for grouped data because rows of
     a group must stay together.
     """
-    n = int(n)
+    n = _check_count('n', n)
     purge = _check_purge(purge)
     if groups is not None:
         return grouped_chronological_split_indices(
@@ -1120,9 +1150,16 @@ def _split_array(X, idx):
 def _label_key(v):
     if v is None:
         return None
+    # Only actual numeric scalars are checked for NaN/Inf.  Coercing every
+    # value through float() turned legitimate categorical labels spelled
+    # like "nan"/"inf" into missing targets and also conflated numeric
+    # strings with their numeric twins.  Numbers.Real includes NumPy scalar
+    # types but excludes complex/bool.
+    if not isinstance(v, numbers.Real) or isinstance(v, (bool, np.bool_)):
+        return v
     try:
         f = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return v
     # NaN and infinities are not valid class/regression targets.  Treating
     # +inf as an ordinary label would hide a corrupted target from the
@@ -1524,9 +1561,7 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
                 'n_reference': int(ref.size), 'n_holdout': 0,
                 'unseen_rate': 0.0}
     if max_categories is not None:
-        max_categories = int(max_categories)
-        if max_categories < 1:
-            raise ValueError('max_categories must be positive or None')
+        max_categories = _check_count('max_categories', max_categories, positive=True)
         cat = np.unique(ref)
         if cat.size > max_categories:
             # Keep the most frequent reference categories plus an "other" bin.
