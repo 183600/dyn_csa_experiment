@@ -413,6 +413,9 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         actions.append('inspect the first rising validation point and the accompanying train CE; if train CE is also flat, treat it as an optimization/data issue rather than overfitting')
     elif status == 'nonfinite':
         actions.append('follow the NaN triage path: data NaN/Inf -> log(0)/div0/softmax -> fp16 overflow -> gradient explosion/LR')
+    train_rising = bool(train_s is not None and math.isfinite(train_s) and train_s > train_tol)
+    if train_rising:
+        actions.append('training CE itself is rising in the tail; lower the LR and check the gradient/AMP diagnostics before treating this as underfitting')
     if (final_minus_best is not None and final_minus_best > 0.0
             and steps_since_best is not None and steps_since_best > 0):
         actions.append(f'final PPL is above the best observed PPL by {final_minus_best:.4g}; the curve, not just the final value, must be reported')
@@ -442,6 +445,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         'final_val_ppl': float(last[1]) if last is not None else None,
         'final_minus_best': final_minus_best,
         'steps_since_best': steps_since_best,
+        'train_ce_rising': train_rising,
     }
 
 

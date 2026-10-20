@@ -326,6 +326,11 @@ def t_training_health_actions_and_gap():
     hn = L.classify_training_health(bad)
     assert hn['status'] == 'nonfinite', hn
     assert any('NaN triage' in a for a in hn['actions']), hn
+    rising = [{'step': i * 100, 'train_ce': 4.0 + 0.02 * i,
+               'val_ce': 4.0 + 0.02 * i, 'val_ppl': 55.0 + 0.5 * i} for i in range(6)]
+    hr = L.classify_training_health(rising)
+    assert hr['train_ce_rising'] is True, hr
+    assert any('training CE itself is rising' in a for a in hr['actions']), hr
 
 
 def t_early_stop_decision():
