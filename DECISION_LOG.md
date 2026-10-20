@@ -314,3 +314,12 @@ torch builds or KV semantics; within a comparable group it shows per-arm PPL
 mean ± SEM, latency/parameter/memory ratios, refuses significance claims from
 sub-noise or zero-variance PPL differences, and flags accuracy gains that cost
 ≥1.5× latency.
+
+Follow-up to the same pass (no new runs): `best_val_ppl`, `final_minus_best`
+and the health classifier now use the SAME eval-subset rows, while
+`final_full_val_ppl` is recorded separately; the report no longer invites
+subtracting a subset best from a full-batch final. Early-stop records carry
+`steps_completed`, the planned step count and the stop reason, and the report
+shows the completed/planned budget so unequal-budget arms cannot look
+equal-budget. The efficiency summary also treats zero within-seed variance as
+unverifiable rather than as evidence of a significant difference.
