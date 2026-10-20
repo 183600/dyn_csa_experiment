@@ -19623,6 +19623,13 @@ def aggregate(summary):
         v = rec.get('variant')
         if v is None:
             v = str(key).split('::', 1)[0]
+        # A variant is the arm identity used as a dict key.  A malformed
+        # non-string arm id (e.g. a JSON object) is unhashable and would crash
+        # the whole aggregation; an invalid identity is no more usable than an
+        # invalid seed, so exclude it explicitly instead of coercing it.
+        if not isinstance(v, str) or not v:
+            print(f'[aggregate] WARNING: record {key!r} carries a non-string/empty variant ({v!r}) — excluded from aggregation')
+            continue
         per_variant.setdefault((v, _protocol_tag(rec, key)), []).append(rec)
     def _seed_key(s):
         # JSON round-trips can leave the same seed as 0 or "0"; the rest of the

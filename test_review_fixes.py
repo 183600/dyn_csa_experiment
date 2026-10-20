@@ -901,6 +901,10 @@ def t_aggregate_seed_normalization():
     # inflating n or emitting a non-integer seed in the panel summary.
     assert L.aggregate({'x::seedbad': dict(base, seed=1.5)}) == {}
     assert L.aggregate({'x::seedbad': dict(base, seed=True)}) == {}
+    # A malformed arm id is unhashable and must be excluded, not crash the
+    # whole panel aggregation.
+    assert L.aggregate({'x::seed0': dict(base, seed=0, variant={'bad': 1})}) == {}
+    assert L.aggregate({'x::seed0': dict(base, seed=0, variant='')}) == {}
 
 
 def t_audit_resolution_classification():
