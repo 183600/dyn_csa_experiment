@@ -385,8 +385,8 @@ def _clean_probe_params(pp):
     """probe_params used for the ρ=0 clean-baseline lookup.
 
     `span` carries an extra `span_len` (it changes corruption geometry); the
-    clean uniform ρ=0 cell does not.  Comparing the full dict silently dropped
-    EVERY span ΔNLL row, so the lookup strips only this mode-specific key."""
+    clean uniform ρ=0 cell does not.  The lookup therefore strips only this
+    mode-specific key."""
     if not isinstance(pp, dict):
         return pp
     out = dict(pp)
@@ -1553,8 +1553,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         _v['p_holm'] = (_e2.get('p_holm') if isinstance(_e2, dict) else None)
                 holm = _h2
                 probe['holm_exploratory'] = _h2
-                probe['holm_family_note'] = ('Holm over the union of the corruption and NIAH contrast families; '
-                                             'NIAH was previously attached after the correction and is now included')
+                probe['holm_family_note'] = ('Holm over the combined corruption + NIAH contrast families')
                 print(f'[v10 stats] Holm re-attached over the combined {len(_comb)}-contrast family (corruption + NIAH)')
     xo = _scale_crossovers()
 

@@ -83,9 +83,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     """数据泄漏审计（零 GPU，读 wt103_cache 落盘产物）。
 
     ``cache_dir=None`` resolves ``WT103_CACHE_DIR`` (falling back to
-    ``./wt103_cache``), the same resolver the loaders use.  The old fixed
-    default made the audit inspect a different directory from the one the
-    evaluation read.
+    ``./wt103_cache``), the same resolver the loaders use.
 
     ``preferred_train_seq_len`` disambiguates a cache directory that contains
     more than one train meta (e.g. the 512-token training cache and a
@@ -119,8 +117,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     # Pair a train meta with the test meta that describes the SAME corpus
     # protocol (vocab + tokenizer fit provenance).  seq_len is deliberately NOT
     # required to match: the training cache is 512-token and the held-out cache
-    # is 4097-token by construction, and the old equality check made every real
-    # train/test pair "not_verifiable_locally".
+    # is 4097-token by construction.
     def _as_int(value):
         try:
             return int(value)
@@ -212,8 +209,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
         out['checks']['tokenizer_files_present'] = False
         _tok_problems.append('a persisted train/test tokenizer file is missing; tokenizer identity cannot be verified')
     if _tok_problems:
-        # v11.128: these used to be informational fields that never touched
-        # `status`.  They are now hard audit failures.
+        # Tokenizer/split provenance problems are hard audit failures.
         out['checks']['tokenizer_problems'] = _tok_problems
         out['status'] = 'fail'
         out['note'] = ('tokenizer/split provenance audit failed: ' + '; '.join(_tok_problems) +
@@ -290,10 +286,10 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             union = int(tr_s.size + te_s.size - inter)
             jac = (inter / union) if union else 0.0
             # v11.128: Jaccard on a 4M-vs-65k shingle pair is bounded near
-            # 1.6% even when EVERY test shingle occurs in train, so the old
-            # `jaccard > 0.05` gate could never fire.  Two reachable statistics
-            # replace it: the fraction of TEST shingles shared with train, and
-            # the worst single test row's overlap fraction.
+            # 1.6% even when EVERY test shingle occurs in train, so a
+            # `jaccard > 0.05` threshold cannot fire.  Two reachable statistics
+            # are used instead: the fraction of TEST shingles shared with train,
+            # and the worst single test row's overlap fraction.
             test_overlap = (inter / te_s.size) if te_s.size else 0.0
             max_row_overlap = None
             row_overlaps = []

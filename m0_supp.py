@@ -350,10 +350,9 @@ def _write_g0_certificate(ck, *, numeric_pass, benchmark_pass, best_tflops,
                           training_tost):
     """Write the machine-checkable G0 certificate consumed by `require_g0`.
 
-    The helper previously existed with no producer, so the documented gate
-    could never be satisfied.  Every field is an observed value; the file is
-    stamped with the same code semantics / kernel stamp / git tree that
-    `_g0_mismatch` re-checks at panel start.
+    Every field is an observed value; the file is stamped with the same code
+    semantics / kernel stamp / git tree that `_g0_mismatch` re-checks at panel
+    start.
     """
     prov = L._git_provenance()
     cert = {

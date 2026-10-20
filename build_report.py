@@ -24,7 +24,7 @@ def _as_finite(v):
     """Finite float for any real numeric scalar (NumPy scalars included).
 
     Report helpers are also called directly on in-memory records, not only on
-    JSON-decoded ones.  ``isinstance(v, (int, float))`` silently dropped
+    JSON-decoded ones.  An ``isinstance(v, (int, float))`` filter would miss
     ``np.int64``/``np.float32`` values, which could turn a non-empty panel into
     "no data" or make the local exact test disagree with ``exp_lib``.
     """

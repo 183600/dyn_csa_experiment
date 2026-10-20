@@ -163,8 +163,8 @@ def t_safe_exp_and_doc_ci():
     assert ci['ci_method'].startswith('cluster-robust'), ci
     assert ci['n_docs'] == 3
     # NumPy arrays are the natural per-document inputs, and a one-shot
-    # iterator must not be exhausted before the residual pass.  Both used to
-    # raise (``array or []``) or silently report n_docs=0.
+    # iterator must not be exhausted before the residual pass.  Neither input
+    # may raise or report a zero document count.
     ci_np = L._nll_doc_ci(np.array(nll), np.array(ntok))
     assert ci_np['n_docs'] == 3 and abs(ci_np['ppl'] - ci['ppl']) < 1e-12, ci_np
     ci_gen = L._nll_doc_ci(iter(nll), iter(ntok))
@@ -246,9 +246,9 @@ def t_training_health_classifier():
 
 def t_training_health_noise_aware_threshold():
     # Four equally spaced eval points with realistic CE jitter: the tail slope
-    # is +3.2e-5, five times the old fixed 1e-5 tolerance, yet it is entirely
-    # within the slope's own noise (2*SE ~ 3.4e-5).  The fixed threshold called
-    # this "overfitting"; the adaptive threshold must call it healthy.
+    # is +3.2e-5, five times the fixed 1e-5 tolerance, yet it is entirely
+    # within the slope's own noise (2*SE ~ 3.4e-5).  The adaptive threshold
+    # must call it healthy.
     hist = [{'step': 0, 'train_ce': 5.0, 'val_ce': 4.00, 'val_ppl': 54.6},
             {'step': 250, 'train_ce': 4.5, 'val_ce': 4.02, 'val_ppl': 55.7},
             {'step': 500, 'train_ce': 4.0, 'val_ce': 4.01, 'val_ppl': 55.1},
@@ -270,12 +270,11 @@ def t_training_health_noise_aware_threshold():
 
 
 def t_rope_arms_are_not_batched():
-    # The review found the implementation binding certified eager_batch=True
-    # for the rope csa arms while `HybridAttentionRoPE.forward` unconditionally
-    # took the per-row `_single_rope` loop.  The predicate now recognises rope
-    # layers, so a CUDA-capable device still yields False for all four frozen
-    # arms; a non-rope csa config remains eligible (the check is not a blanket
-    # False).
+    # The implementation binding must report eager_batch=False for the rope csa
+    # arms because `HybridAttentionRoPE.forward` unconditionally takes the
+    # per-row `_single_rope` loop.  A CUDA-capable device still yields False for
+    # all four frozen arms; a non-rope csa config remains eligible (the check is
+    # not a blanket False).
     class _Cuda:
         type = 'cuda'
     for arm in ('csa_fixed_rope', 'full_rope', 'csa_fixed_rope_randidx',
@@ -287,9 +286,9 @@ def t_rope_arms_are_not_batched():
 
 
 def t_manifest_v3_admission_can_succeed():
-    # The zero-GPU plan check is the end-to-end guard for the "obvious fix"
-    # trap: align the stamp, then admit 0/48 because P5T records lack
-    # train_knobs.  Exercise it on the shipped manifest.
+    # The zero-GPU plan check is the end-to-end guard against a stamp-only
+    # alignment that would admit no records.  Exercise it on the shipped
+    # manifest.
     rep = V12.plan_check(os.path.join(REPO, 'confirmation_frozen.json'))
     assert rep['ok'] and rep['admitted'] == rep['n_arms'] * rep['n_seeds'], rep
     assert all(c['pairs_planned'] == rep['n_seeds'] for c in rep['comparisons'].values()), rep
@@ -3737,9 +3736,9 @@ def t_audit_length_missing_n_seq_flag():
 
 
 def t_stats_accept_numpy_scalars():
-    # Public numeric helpers are routinely fed NumPy arrays/scalars.  The old
-    # isinstance(int, float) filters silently dropped every np.int64 /
-    # np.float32 value, turning a real panel into "no data".
+    # Public numeric helpers are routinely fed NumPy arrays/scalars.  An
+    # isinstance(int, float) filter would drop every np.int64 / np.float32
+    # value, turning a real panel into "no data".
     d = np.array([1, 2, 3, 4], dtype=np.int64)
     r = L.paired_effect_stats(d)
     assert r['n'] == 4 and math.isfinite(r['mean']) and math.isfinite(r['p_exact_signflip']), r
@@ -3770,7 +3769,7 @@ def t_stats_accept_numpy_scalars():
 
 def t_apply_rope_preserves_width():
     # Over-long rope_dim must rotate only complete pairs that exist and must
-    # never widen the output (the old cat form returned a wider tensor).
+    # never widen the output.
     for width in (0, 1, 2, 3, 4, 5, 8, 16):
         for rope_dim in range(0, 2 * width + 4):
             x = torch.randn(2, 3, width, dtype=torch.float64)
@@ -3787,7 +3786,7 @@ def t_apply_rope_preserves_width():
 def t_label_key_keeps_numeric_strings():
     # Only real numeric scalars are checked for NaN/Inf.  A categorical label
     # literally spelled "nan" or "inf" must remain a label, not disappear as a
-    # corrupted target (the old float(v) coercion did that).
+    # corrupted target.
     X = np.arange(24, dtype=float).reshape(12, 2)
     y = ['nan', 'inf', 'a', 'b', 'nan', 'a', 'b', 'a', 'b', 'a', 'b', 'nan']
     rep = L.data_quality_report(X, y=y, train_idx=list(range(6)),

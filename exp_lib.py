@@ -136,11 +136,8 @@ def _uses_batched_eager(cfgs, device=None, batch_size=None):
         getattr(c, 'kind', None) in ('csa', 'hca')
         # v11.128: RoPE CSA/HCA layers ALWAYS take the per-row
         # `HybridAttentionRoPE._single_rope` loop (v7_supp.py forward), and the
-        # batched twin in csa_kernels has no RoPE/qk-norm implementation.  The
-        # old predicate ignored `rope`, so every frozen rope arm recorded
-        # eager_batch=True while actually running the row loop — a false
-        # implementation binding that the confirmation admission gate then
-        # certified.  A layer is batched only when it is NOT a rope layer.
+        # batched twin in csa_kernels has no RoPE/qk-norm implementation.  A
+        # layer is batched only when it is NOT a rope layer.
         and not bool(getattr(c, 'rope', False))
         and getattr(c, 'fuse_mode', 'none') == 'none'
         and getattr(c, 'indexer_mode', 'learned')
@@ -442,9 +439,9 @@ def _finite_scalar(v):
     """Finite float for a real numeric scalar, including NumPy scalars.
 
     Numeric helpers are routinely called with ``np.int64``/``np.float32``
-    values from arrays; the old ``isinstance(v, (int, float))`` filters
-    silently dropped those and turned a valid panel into "no data".  Booleans
-    and complex/non-numeric objects are not measurements.
+    values from arrays; an ``isinstance(v, (int, float))`` filter would drop
+    those and turn a valid panel into "no data".  Booleans and
+    complex/non-numeric objects are not measurements.
     """
     if isinstance(v, (bool, np.bool_)) or not isinstance(v, numbers.Real):
         return None
@@ -6281,8 +6278,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             try:
                 # TRAIN split only, for the frozen tokenizer fit.  Never reuse
                 # the test dataset here: fitting the tokenizer on test text
-                # would be leakage, and the old `ds` object happened to hide
-                # the distinction by holding all three splits.
+                # would be leakage.
                 ds_train = load_dataset(repo, 'wikitext-103-raw-v1', split='train', cache_dir=cache_dir)
                 break
             except Exception as e:
@@ -6398,10 +6394,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             raise
     _file_sigs = _cache_file_sigs({'test': te_path, 'bnd': tb_path})
     # Persist the test tokenizer BEFORE writing the meta, so the meta can bind
-    # its exact bytes.  The cache-hit path used to verify only `fit_fp` (a hash
-    # of the fit TEXT), which two different BPE merge sets can share; a swapped
-    # tokenizer could then serve an unpaired id space.  The full-file sha256 is
-    # now part of the cache identity and is checked on every hit.
+    # its exact bytes.  The cache identity therefore includes the full-file
+    # sha256 (not only a hash of the fit TEXT, which two different BPE merge
+    # sets can share), so a swapped tokenizer cannot serve an unpaired id
+    # space.
     _tok_sha = None
     try:
         tok.save(tk_path)
@@ -8714,9 +8710,9 @@ def wilcoxon_signed_rank_p(deltas):
     sharing a seed number.
 
     Ranks are doubled so average ranks from ties stay integral; a 0/1 subset-
-    sum DP then counts every sign assignment exactly.  This replaces the old
-    n<=16 enumeration (2^n) with O(n * sum_ranks), which is what keeps the
-    sensitivity check exact when seed completion grows the panels."""
+    sum DP then counts every sign assignment exactly in O(n * sum_ranks),
+    which keeps the sensitivity check exact when seed completion grows the
+    panels."""
     d = np.asarray([f for f in (_finite_scalar(x) for x in deltas) if f is not None], dtype=float)
     d = d[np.abs(d) > 1e-15]
     n = int(d.size)
@@ -12543,11 +12539,12 @@ def add_paired(*_a, **_kw):
 def normalize_seed_list(seeds, *, default=(0,)):
     """Validate and de-duplicate a panel's seed list, preserving order.
 
-    A duplicated seed used to enqueue the SAME ``variant::seed`` cell twice
-    (the second run silently overwrote the first record), and an explicitly
-    empty/absent list trained the fallback seed 0 while the manifest planned
-    no cells at all.  Both make the on-disk trace disagree with the work that
-    actually ran, so the axes are normalised once, before probing/tracking.
+    A duplicated seed would enqueue the SAME ``variant::seed`` cell twice
+    (the second run silently overwriting the first record), and an explicitly
+    empty/absent list would train the fallback seed 0 while the manifest
+    planned no cells at all.  Both make the on-disk trace disagree with the
+    work that actually ran, so the axes are normalised once, before
+    probing/tracking.
     Accepts a scalar, an iterable of integers, or a comma/space separated
     string; booleans and non-integral floats are rejected rather than silently
     truncated to a different seed.
@@ -12809,7 +12806,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
 
     ``check_subprocess=True`` additionally re-executes a tiny draw script in
     two fresh interpreters with the same seed/PYTHONHASHSEED, which catches a
-    child-process seeding regression that an in-process check cannot see.
+    child-process seeding mismatch that an in-process check cannot see.
     """
     seed = int(seed)
     keys = ['python', 'numpy', 'torch', 'dataloader_generator']
@@ -18089,11 +18086,11 @@ def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch, devi
 
 
 def _plan_run(cfg, summary_path, fp):
-    """Resume-check every (seed x variant) cell up front, exactly as the old
-    interleaved loop did, and return the cells that still need to run.
+    """Resume-check every (seed x variant) cell up front and return the cells
+    that still need to run.
 
     Stale / synthesized / non-measurable records are dropped (under the lock)
-    BEFORE any training starts, so a later failure can never leave an old
+    BEFORE any training starts, so a later failure can never leave a stale
     reading in place looking like this attempt's result.  With parallel
     dispatch this check runs once in the parent, before any child spawns."""
     summary = locked_json_read(summary_path)

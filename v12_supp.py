@@ -180,8 +180,8 @@ def run_training_health(cfg=None):
 def run_phase(name, guard, par=None):
     global _PLAN_DONE
     if name in ('P5C', 'P5MP') and not _PLAN_DONE:
-        # A direct `phase P5C` must not train 30+ GPU-hours under a plan that
-        # the P5T admission gate would reject.  `run_full` runs this once at
+        # A direct `phase P5C` must not start training under a plan that the
+        # P5T admission gate would reject.  `run_full` runs this once at
         # startup; the cache avoids repeating it for each phase.
         plan_check()
     import par as _par
@@ -539,14 +539,12 @@ def _recipe_matches_signature(recipe, sig):
 
 def _frozen_seeds():
     """Seeds for the frozen-arm training phases (P5C/P5MP) — single source of
-    truth is the manifest (review-2 issue 1: the seed list was revised 6->12
-    there; hard-coded phase lists must not disagree with it).
+    truth is the manifest; hard-coded phase lists must not disagree with it.
 
     v11.128: run the FULL `_load_manifest` validation here, not just a JSON
-    seed parse.  Previously P5C/P5MP could burn 30+ GPU-hours training arms
-    under a manifest that P5T would reject at load time (stamp mismatch,
-    unresolvable power gate, binding inconsistency).  Training now refuses
-    before the first GPU-second.
+    seed parse.  Training refuses before the first GPU-second if the manifest
+    would be rejected at P5T load time (stamp mismatch, unresolvable power
+    gate, binding inconsistency).
     """
     m = _load_manifest(FREEZE_MANIFEST)
     seeds = m.get('seeds')
@@ -736,8 +734,8 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     _ck_train_fp = d.get('train_fp') or d.get('data_fp')
     # v11.128: the caller passes the value derived BEFORE the first test read
     # and written into the freeze lock.  Recomputing it here from a null
-    # manifest field (as the old code did) silently reintroduced the
-    # fail-open path and could accept a record from a different corpus.
+    # manifest field would reintroduce the fail-open path and could accept a
+    # record from a different corpus.
     _want_train_fp = train_fp if train_fp is not None else _frozen_train_fp(manifest)
     # Manifests that DECLARE binding.training_data_fingerprint require the
     # binding unconditionally, even while canonical_train_fp is still null.
@@ -795,9 +793,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         if rec.get('train_fp') != _tr_train_fp:
             return True
         # A record measured on a different row count is a different estimand.
-        # v11.128 stores n_seq explicitly and treats a mismatch as stale (the
-        # old cache-reuse path could mix an 8-row and a 16-row record under
-        # the same key).
+        # v11.128 stores n_seq explicitly and treats a mismatch as stale.
         if int(rec.get('n_seq') or -1) != int(test_ids.shape[0]):
             return True
         if _msha is not None and rec.get('manifest_sha256') != _msha:
@@ -945,9 +941,9 @@ def run_finaltest(cfg=None, guard=None):
         raise SystemExit(f'[v12] REFUSE: loaded test slice shape {tuple(test_ids.shape)} != the frozen ({_nseq_clean}, {need}) — the row count and sequence length are part of the pre-registration; re-freeze explicitly instead of shrinking the panel')
     if not _smoke:
         # v11.128: run the leakage gate BEFORE the `accessed` lock is written
-        # and before any evaluation.  A gate that can never fire (the old
+        # and before any evaluation.  A gate that can never fire (a
         # Jaccard<=0.05 on a 4M-vs-65k shingle pair) is not a gate, and a
-        # `not_verifiable_locally` result used to pass silently.  Both are now
+        # `not_verifiable_locally` result must not pass silently.  Both are
         # hard refusals; only a verifiable, clean audit unlocks the panel.
         _cache_dir = L._wt_cache_dir()
         _tf = ((manifest.get('binding') or {}).get('training_data_fingerprint') or {})
@@ -999,9 +995,8 @@ def _by_len_shape_reason(rec, n_seq):
     """Why a record's by_len cells do not match the frozen (n_seq, seq_len) grid.
 
     ``eval_length_gen`` predicts ``Ln - 1`` tokens per row, so a complete cell
-    must carry ``n_tok == n_seq * (Ln - 1)``.  The review found that the old
-    admission path never checked this: an 8-row record could be mixed with a
-    16-row one, and an empty slice produced ``ppl=1.0`` from zero tokens.
+    must carry ``n_tok == n_seq * (Ln - 1)``; a row-count mismatch or an empty
+    slice is refused rather than admitted.
     """
     bl = rec.get('by_len') or {}
     if not isinstance(bl, dict) or not bl:
@@ -1432,9 +1427,9 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         res['missing_seeds'] = sorted(set(int(s) for s in manifest['seeds']) - set(int(s) for s in usable))
         res['dropped_pairs'] = dropped
         res['min_seeds_for_confirmation'] = _n_min
-        # Diagnostics must use the n that actually entered THIS comparison.
-        # The old code always used the manifest's 12, which made p_floor /
-        # min_attainable_p_holm / power look better than the test really was.
+        # Diagnostics must use the n that actually entered THIS comparison,
+        # so p_floor / min_attainable_p_holm / power describe the test that
+        # really ran.
         _fl_eff = L.signflip_p_floor(_n_eff)
         if math.isfinite(_fl_eff):
             res['p_floor_effective'] = _fl_eff

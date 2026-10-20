@@ -74,10 +74,9 @@ def rope_cos_sin(head_dim, rope_dim, positions, device, base=10000.0):
 
 def apply_rope(x, cos, sin, rope_dim):
     # Only rotate complete pairs that actually exist in the row.  An
-    # over-long rope_dim must not widen the result (the old cat form could
-    # return a tensor wider than x), and an odd rope_dim must leave the
-    # unpaired middle lane untouched instead of broadcasting it into a
-    # different width.
+    # over-long rope_dim must not widen the result, and an odd rope_dim must
+    # leave the unpaired middle lane untouched instead of broadcasting it into
+    # a different width.
     width = int(x.shape[-1])
     rot_dim = max(0, min(int(rope_dim), width))
     half = rot_dim // 2
@@ -2382,10 +2381,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     if val_ids is None:
         val_ids = L.load_wikitext(max(train_len, need), 8000000)[1]
     # v11.128: the p1l recipe must describe the implementation that ACTUALLY
-    # runs and the training corpus it actually reads.  The old recipe wrote
-    # `amp_dtype=None` (fp32) and the process-default eager flag while
-    # `train_variant` trained under bf16 on CUDA, and it bound the VALIDATION
-    # fingerprint as `df` (not the training corpus).  Both are now derived
+    # runs and the training corpus it actually reads.  Both are derived
     # explicitly before training and carried into the checkpoint/record.
     train_ids = L.load_wikitext(train_len, 8000000)[0]
     _train_fp = L._ids_fp(train_ids)
@@ -2574,8 +2570,8 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE, 'recipe': _recipe, 'run_cfg': _run_cfg, 'eval_n_seq': n_seq, 'n_seq': n_seq}
         _prev_resume = _cur_now if isinstance(_cur_now, dict) else {}
         # `pair_reason` requires steps/tokens_seen to be present and equal;
-        # the p1l record used to omit both, so even after run_cfg was fixed
-        # every frozen pair would have been "unverifiable steps/tokens_seen".
+        # both are recorded here so a frozen pair is not "unverifiable
+        # steps/tokens_seen".
         _rec['steps'] = int((_tr if isinstance(_tr, dict) else _prev_resume).get('steps', steps))
         _rec['tokens_seen'] = int((_tr if isinstance(_tr, dict) else _prev_resume).get(
             'tokens_seen', int(steps) * int(batch_size) * int(train_len)))
@@ -2616,9 +2612,9 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         except Exception as _pe:
             print(f'[p1l] WARNING: could not attach provenance to {key} ({type(_pe).__name__}: {_pe})')
         # v11.128: never fabricate a train_knobs descriptor on resume.  The
-        # old `setdefault(..., _v7_knobs(...))` wrote fp32/True even when the
-        # weights were trained under bf16 and a row-loop dispatch, which made
-        # the frozen implementation binding certify a false descriptor.
+        # weights may have been trained under a different numeric path, which
+        # would make the frozen implementation binding certify a false
+        # descriptor.
         if not isinstance(_rec.get('train_knobs'), dict):
             raise RuntimeError(f'[p1l] REFUSE resume {key}: the record/checkpoint carries no real train_knobs descriptor; retrain instead of fabricating an implementation claim')
         _rec.setdefault('train_objective', _prev_resume.get('train_objective'))

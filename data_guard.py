@@ -263,9 +263,9 @@ def _check_purge(purge):
     """Validate a purge/embargo size (rows dropped before a holdout split).
 
     Only an actual integer (or an integral float such as ``2.0``) is accepted.
-    ``int(1.5)``/``int('2')`` used to truncate/coerce silently, which changed
-    the embargo size while looking like a valid request; strings and
-    non-integral numbers are refused instead.
+    Strings and non-integral numbers are refused instead of being truncated or
+    coerced, which would silently change the embargo size while looking like a
+    valid request.
     """
     if isinstance(purge, (bool, np.bool_)):
         raise ValueError(f'purge must be a non-negative integer, got {purge!r}')
