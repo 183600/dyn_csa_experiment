@@ -3507,6 +3507,24 @@ def t_capped_document_id_sidecar():
                                 L._doc_id_u64(L._doc_exact_fp('b'))], doc_ids
 
 
+def t_document_dedup_closes_near_duplicate_chains():
+    # A~T is skipped as a near duplicate of train T.  B is within the near
+    # threshold of A but just outside it for T, so a stateless bucket index
+    # would admit B into validation even though it belongs to the same
+    # document cluster.  The skipped copy is quarantined so the chain stays on
+    # the train side.
+    hashes = {'train T': 0, 'val A': 0b111, 'val B': 0b11011}
+    orig = L._doc_simhash
+    try:
+        L._doc_simhash = lambda text: hashes[text]
+        d = L._DocDeduplicator(near_threshold=3, bands=4)
+        assert d.is_duplicate('train T') == (False, None)
+        assert d.is_duplicate('val A') == (True, 'near')
+        assert d.is_duplicate('val B') == (True, 'near'), 'chain member slipped through'
+    finally:
+        L._doc_simhash = orig
+
+
 def t_split_purge_embargo():
     # Purge drops the tail of train and validation; the test slice is intact
     # and no returned row straddles a boundary.
@@ -4936,6 +4954,7 @@ def main():
     _check('I21 split-and-prepare fits preprocessing on train only', t_split_and_prepare_fits_train_only)
     _check('I21a data-quality temporal split audit', t_data_quality_temporal_audit)
     _check('I21b capped test document-id sidecar', t_capped_document_id_sidecar)
+    _check('I21c near-duplicate document chains stay on one side', t_document_dedup_closes_near_duplicate_chains)
     _check('I22 purge/embargo keeps window boundaries sealed', t_split_purge_embargo)
     _check('I23 grouped split refuses an empty requested side', t_group_split_refuses_empty_requested_side)
     _check('I24 label shift and per-split label corruption counts', t_label_shift_and_split_counts)

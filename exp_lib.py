@@ -7004,8 +7004,11 @@ class _DocDeduplicator:
 
     A document is a group: once seen (tokenizer fit, train or validation) any
     exact copy or a near copy within ``near_threshold`` SimHash bits is skipped
-    on every later split.  This is what keeps a document (or a lightly edited
-    copy) from appearing on both sides of the split.
+    on every later split.  Skipped near copies are quarantined in the index as
+    well, so a chain A~T, B~A cannot slip B through when B is just outside the
+    threshold for T: membership is closed under the LSH matches already made.
+    This is what keeps a document (or a lightly edited copy) from appearing on
+    both sides of the split.
     """
 
     def __init__(self, *, near_threshold=3, bands=4):
@@ -7040,6 +7043,15 @@ class _DocDeduplicator:
             for other in self.buckets.get(key, ()):
                 if _hamming64(h, other) <= self.near_threshold:
                     self.n_near_skipped += 1
+                    # Keep the skipped member in the near-duplicate index too.
+                    # Otherwise a chain A~T (A skipped), B~A (B not close
+                    # enough to T to be found separately) would let B into a
+                    # later split: the same document cluster would cross the
+                    # boundary through the skipped copy.  Quarantining the
+                    # hash makes the group filter closed under the LSH matches
+                    # it has already made, without counting the copy as seen.
+                    for _key in self._bucket_keys(h):
+                        self.buckets.setdefault(_key, []).append(h)
                     return True, 'near'
         self.exact.add(fp_key)
         self.n_seen += 1

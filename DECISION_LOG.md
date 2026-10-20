@@ -83,6 +83,27 @@ test-split record was ever written.
   without removing it. Validation is also the split that was reused for all
   v6-v11 selection, so it cannot support confirmatory claims.
 
+## 2026-10-20 — data-path hardening (no new experiment panels)
+
+Four data-processing defects were fixed without reading any held-out test
+record. (1) The nested validation folds used by `baseline_tune.py` were a
+seeded row permutation, but validation rows are consecutive chunks of the token
+stream: the permutation let selection see future chunks, estimated the final
+contrast partly on earlier chunks, and repeatedly crossed the same document
+boundary. `validation_row_split` now returns contiguous chronological blocks
+(selection before evaluation); the seed only chooses between the balanced cut
+positions when the row count is not divisible by the fold count.
+`baseline_tuning_audit` refuses an artifact that declares a shuffled fold
+policy, reverse-time ranges, or a non-chronological split. (2) Exact-duplicate
+detection converted object columns through float64, so integers above 2**53
+could become false duplicates or hide a real one; numeric object rows now use
+canonical exact keys (integral floats still compare equal to the same integer,
+`-0.0` is normalised, NaN/Inf stay distinct). (3) Near-duplicate document
+filtering now quarantines skipped copies, closing transitive chains that could
+let a near copy of a near copy cross from train into validation. (4) The
+temporary issue list was removed after the fixes; the frozen manifest and test
+split were not touched.
+
 ## 2026-10-19 — open-block panel (maximum block length × current-prefix reading)
 
 The two open questions — does a maximum block length help, and does the
