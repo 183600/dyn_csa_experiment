@@ -20386,14 +20386,29 @@ def _pooled_ppl_from_records(recs):
     nlls, nts = [], []
     for r in recs:
         # When the primary estimate is the nested holdout, the matching
-        # accounting is nll_sum_holdout/n_tokens_holdout.  Mixing the full
-        # nll_sum with a holdout PPL would pool a different sample than the
-        # one the record reports.
-        _nested = (r.get('ppl_estimation_rows') == 'nested_validation_holdout'
-                   and r.get('nll_sum_holdout') is not None
-                   and r.get('n_tokens_holdout') is not None)
-        nll = _finite_scalar(r.get('nll_sum_holdout') if _nested else r.get('nll_sum'))
-        nt = _exact_count(r.get('n_tokens_holdout') if _nested else r.get('n_tokens'), minimum=1)
+        # accounting is nll_sum_holdout/n_tokens_holdout.  A missing halfword
+        # cannot fall back to the full-validation totals: the pooled value and
+        # the record's primary PPL would then describe different samples.
+        if r.get('ppl_estimation_rows') == 'nested_validation_holdout':
+            nll = _finite_scalar(r.get('nll_sum_holdout'))
+            nt = _exact_count(r.get('n_tokens_holdout'), minimum=1)
+            if nll is None or nt is None:
+                # Some writers persist only the holdout per-row arrays.  Their
+                # totals describe the same sample and can recover the missing
+                # accounting; the full-validation totals never can.
+                _rn = r.get('nll_per_row_holdout')
+                _rt = r.get('n_tokens_per_row_holdout')
+                if (isinstance(_rn, list) and isinstance(_rt, list)
+                        and _rn and len(_rn) == len(_rt)):
+                    _vals = [_finite_scalar(v) for v in _rn]
+                    _toks = [_exact_count(v, minimum=1) for v in _rt]
+                    if (all(v is not None for v in _vals)
+                            and all(v is not None for v in _toks)):
+                        nll = float(sum(_vals))
+                        nt = int(sum(_toks))
+        else:
+            nll = _finite_scalar(r.get('nll_sum'))
+            nt = _exact_count(r.get('n_tokens'), minimum=1)
         if nll is None or nt is None:
             return None, None, None
         nlls.append(nll)
@@ -20434,6 +20449,25 @@ def _seed_t_ci(ppls, alpha=0.05):
     half = tc * sd / math.sqrt(n)
     return [mu - half, mu + half]
 
+def _primary_row_arrays(rec):
+    """Per-row NLL/token arrays for the record's PRIMARY estimand.
+
+    A nested record's reported PPL is the held-out-row estimate, so its
+    intervals must bootstrap `nll_per_row_holdout`/`n_tokens_per_row_holdout`.
+    Returning None when those are absent keeps a missing holdout accounting
+    from silently falling back to the full-validation rows.
+    """
+    if not isinstance(rec, dict):
+        return None
+    if rec.get('ppl_estimation_rows') == 'nested_validation_holdout':
+        nll = rec.get('nll_per_row_holdout')
+        ntok = rec.get('n_tokens_per_row_holdout')
+        if nll is None or ntok is None:
+            return None
+        return nll, ntok
+    return rec.get('nll_per_row'), rec.get('n_tokens_per_row')
+
+
 def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     """Document-level bootstrap CI for the pooled PPL.
 
@@ -20445,8 +20479,10 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     """
     rows = []
     for r in recs:
-        nll = r.get('nll_per_row')
-        ntok = r.get('n_tokens_per_row')
+        _arrays = _primary_row_arrays(r)
+        if _arrays is None:
+            return None
+        nll, ntok = _arrays
         if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
             return None
         _tok = [_exact_count(v) for v in ntok]
@@ -20513,8 +20549,11 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     component is never silently treated as zero."""
     rows = []
     for r in recs:
-        nll = r.get('nll_per_row')
-        ntok = r.get('n_tokens_per_row')
+        _arrays = _primary_row_arrays(r)
+        if _arrays is None:
+            rows = None
+            break
+        nll, ntok = _arrays
         if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
             rows = None
             break

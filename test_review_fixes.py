@@ -2573,6 +2573,44 @@ def t_metric_policy_checks_record_values():
     assert L.metric_policy_audit(nested)['status'] == 'ok', L.metric_policy_audit(nested)
     _pooled, _nl, _nt = L._pooled_ppl_from_records(list(nested.values()))
     assert abs(_pooled - 5.0) < 1e-12 and _nt == 40, (_pooled, _nl, _nt)
+    # Intervals must use the same rows as the primary (holdout) PPL.  The
+    # full-validation arrays here are deliberately incompatible with the
+    # holdout estimate so a wrong-array fallback cannot look plausible.
+    _nr = {'variant': 'v', 'seed': 0, 'ppl': math.exp(10.0),
+           'nll_sum': 10.0 * 40, 'n_tokens': 40,
+           'ppl_estimation_rows': 'nested_validation_holdout',
+           'ppl_holdout': math.exp(2.0),
+           'nll_sum_holdout': 2.0 * 10, 'n_tokens_holdout': 10,
+           'nll_per_row': [100.0] * 4, 'n_tokens_per_row': [10] * 4,
+           'nll_per_row_holdout': [10.0] * 2, 'n_tokens_per_row_holdout': [5] * 2}
+    _nr2 = dict(_nr, seed=1)
+    _pd, _pn, _pt = L._pooled_ppl_from_records([_nr, _nr2])
+    assert abs(_pd - math.exp(2.0)) < 1e-12 and _pt == 20, (_pd, _pn, _pt)
+    _dci = L._doc_bootstrap_ppl_ci([_nr, _nr2])
+    assert _dci is not None and all(abs(x - math.exp(2.0)) < 1e-9 for x in _dci), _dci
+    _cci = L._combined_seed_doc_ci([_nr, _nr2])
+    assert _cci['status'] == 'ok' and _cci['n_docs'] == 2, _cci
+    assert all(abs(x - math.exp(2.0)) < 1e-9 for x in _cci['ci95_ppl']), _cci
+    # Missing holdout accounting must not silently pool the full-validation
+    # totals.  A complete holdout per-row array is still a valid source, so
+    # remove both forms to exercise the fail-closed path.
+    _miss = dict(_nr)
+    _miss.pop('nll_sum_holdout')
+    _miss.pop('n_tokens_holdout')
+    _miss.pop('nll_per_row_holdout')
+    _miss.pop('n_tokens_per_row_holdout')
+    assert L._pooled_ppl_from_records([_miss]) == (None, None, None)
+    # Per-row holdout arrays alone are enough to recover the same totals.
+    _rows_only = dict(_nr)
+    _rows_only.pop('nll_sum_holdout')
+    _rows_only.pop('n_tokens_holdout')
+    assert abs(L._pooled_ppl_from_records([_rows_only])[0] - math.exp(2.0)) < 1e-12
+    # Missing holdout row arrays must not silently bootstrap full-validation rows.
+    _miss_rows = dict(_nr)
+    _miss_rows.pop('nll_per_row_holdout')
+    _miss_rows.pop('n_tokens_per_row_holdout')
+    assert L._doc_bootstrap_ppl_ci([_miss_rows]) is None
+    assert L._combined_seed_doc_ci([_miss_rows, _miss_rows])['status'] == 'unverifiable'
     _bad_nested = json.loads(json.dumps(nested))
     _bad_nested['v::seed0']['ppl_holdout'] = 7.0
     _mn = L.metric_policy_audit(_bad_nested)
@@ -3811,6 +3849,9 @@ def t_simple_floor_contrast_is_significance_aware():
             if _r['variant'] == 'full_sw128_matched':
                 _r['ppl'] = floor - 1.0
                 _r['nll_sum'] = math.log(floor - 1.0) * n_tok
+                # The nested primary accounting uses the holdout rows, so a
+                # consistent fixture must move them too.
+                _r['nll_per_row_holdout'] = [math.log(floor - 1.0) * (n_tok // 4)] * 4
         with contextlib.redirect_stdout(io.StringIO()):
             r5 = L.methodology_audit(rescued, design={}, baselines=L.BASELINE_DESIGN,
                                      outdir=td, verbose=False)
