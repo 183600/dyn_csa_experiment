@@ -14238,6 +14238,24 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
                  ', '.join(out['missing_everywhere']) or 'none'))
     return out
 
+def _baseline_artifact_path(name, outdir=None):
+    """Locate a baseline artifact next to a panel or its parent.
+
+    A final panel usually lives in `<outdir>/final/`, while the tuning and
+    count-floor artifacts are written to `<outdir>/`.  Looking only inside the
+    final directory silently downgraded the equal-search and beats-floor gates
+    to `not_verifiable_locally`.  Search the panel directory first, then its
+    parent, then the conventional results_baseline_tuning location."""
+    paths = []
+    if outdir:
+        paths.append(os.path.join(outdir, name))
+        paths.append(os.path.join(os.path.dirname(os.path.abspath(outdir)), name))
+    paths.append(os.path.join('results_baseline_tuning', name))
+    for path in paths:
+        if os.path.exists(path):
+            return path
+    return paths[0]
+
 def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, variants=None):
     """Prospective seed plan for a planned panel.
 
@@ -14678,11 +14696,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     report['metric_audit'] = metric_policy_audit(summary)
     if report['metric_audit'].get('warnings'):
         report['warnings'].extend(report['metric_audit']['warnings'])
-    _tune_path = None
-    if outdir:
-        _tune_path = os.path.join(outdir, 'baseline_tuning.json')
-    elif os.path.isdir('results_baseline_tuning'):
-        _tune_path = os.path.join('results_baseline_tuning', 'baseline_tuning.json')
+    _tune_path = _baseline_artifact_path('baseline_tuning.json', outdir)
     report['baseline_tuning'] = baseline_tuning_audit(path=_tune_path)
     if _scoped_baselines:
         _panel_arms = set()
@@ -14753,11 +14767,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     # comparison is only made when the artifact and the panel share a
     # validation fingerprint (or the panel records none, in which case the
     # result is explicitly marked unverified rather than assumed comparable).
-    _sb_path = None
-    if outdir:
-        _sb_path = os.path.join(outdir, 'simple_baseline.json')
-    elif os.path.isdir('results_baseline_tuning'):
-        _sb_path = os.path.join('results_baseline_tuning', 'simple_baseline.json')
+    _sb_path = _baseline_artifact_path('simple_baseline.json', outdir)
     report['simple_baseline'] = simple_baseline_audit(path=_sb_path)
     if _scoped_baselines:
         _sb = report['simple_baseline']

@@ -1226,6 +1226,11 @@ README_zh 与 `RELEASES.md` 中均已明示。
 从 3×3 扩展为 6 个 alpha × 6 个插值系数（计数表共享，额外成本只是一次
 打分），避免「地板只是被测过的几个值里最不差的」。
 
+工件查找顺序是：面板目录 → 面板父目录 → `results_baseline_tuning/`。
+最终调参面板位于 `<outdir>/final/`，而 `baseline_tuning.json` /
+`simple_baseline.json` 写在 `<outdir>/`；此前只查 final 目录会把两个门都
+静默降级为 `not_verifiable_locally`。
+
 ### 26.2 「击败地板」必须是 seed 级对比
 
 `panel_beats_simple_floor` 仍保留为逐点读数，但新增 `floor_contrast`：

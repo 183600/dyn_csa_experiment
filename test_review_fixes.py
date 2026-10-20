@@ -3467,6 +3467,18 @@ def t_simple_floor_contrast_is_significance_aware():
             r = L.methodology_audit(recs(floor - 1.0), design={}, baselines=L.BASELINE_DESIGN, outdir=td, verbose=False)
         fl = r['simple_baseline']
         assert fl['comparable_to_panel'] is True, fl
+        # The final panel lives in <outdir>/final/; the artifacts live in the
+        # parent.  The audit must find them instead of silently returning
+        # not_verifiable_locally.
+        _final = os.path.join(td, 'final')
+        os.makedirs(_final)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r_final = L.methodology_audit(recs(floor - 1.0), design={},
+                                          baselines=L.BASELINE_DESIGN,
+                                          outdir=_final, verbose=False)
+        assert r_final['simple_baseline']['baseline_verified'] is True, r_final['simple_baseline']
+        assert r_final['simple_baseline']['comparable_to_panel'] is True, r_final['simple_baseline']
+        assert os.path.exists(os.path.join(_final, 'methodology_audit.json'))
         assert fl['token_denominator_match'] is True, fl
         assert fl['floor_contrast']['verdict'] == 'beats_floor_significant', fl['floor_contrast']
         assert fl['floor_contrast']['p_exact_signflip'] < 0.05, fl['floor_contrast']
