@@ -941,6 +941,18 @@ def t_pair_reason_fingerprint_gate():
         assert 'different corpus/evaluation fingerprints' in str(e), e
     else:
         raise AssertionError('aggregate must reject a group pooled across validation slices')
+    # Same train/validation but a different fixed evaluation slice is still a
+    # mixed target set for the pooled group aggregate.
+    eval_mix = {
+        'a::seed0': dict(base, variant='a', eval_fp='eval-a'),
+        'a::seed1': dict(base, variant='a', seed=1, ppl=10.5, eval_fp='eval-b'),
+    }
+    try:
+        L.aggregate(eval_mix)
+    except ValueError as e:
+        assert 'eval_fp' in str(e), e
+    else:
+        raise AssertionError('aggregate must reject a group pooled across evaluation slices')
     rows = [dict(base, by_len={8: {'ppl': 10.0}}),
             dict(base, variant='b', val_fp='val-b', by_len={8: {'ppl': 11.0}})]
     try:

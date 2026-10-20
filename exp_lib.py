@@ -19142,7 +19142,10 @@ def aggregate(summary):
     # evaluation sets that happen to share a run_cfg.
     _fp_conflicts = {}
     for (v, tag), recs in per_variant.items():
-        for _k in ('data_fp', 'val_fp'):
+        # `eval_fp` is part of the paired identity too: same train/val but a
+        # different fixed evaluation slice makes the pooled PPL a mixture of
+        # two target sets (pair_reason already refuses such pairs).
+        for _k in ('data_fp', 'val_fp', 'eval_fp'):
             _vals = sorted({str(r.get(_k)) for r in recs
                             if r.get(_k) is not None and str(r.get(_k)) != ''})
             if len(_vals) > 1:
