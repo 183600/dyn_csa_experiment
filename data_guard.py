@@ -710,7 +710,7 @@ def _group_key(value):
     of the same missing group can be split across train/val/test and no
     group-overlap check will ever fire.
     """
-    if isinstance(value, np.datetime64):
+    if isinstance(value, (np.datetime64, np.timedelta64)):
         if np.isnat(value):
             return ('__nat__',)
     elif (not isinstance(value, (bool, np.bool_))

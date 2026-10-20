@@ -4096,6 +4096,17 @@ def t_group_split_contract():
     idx2 = L.split_indices(60, groups=shuffled, train_frac=0.6, val_frac=0.2, test_frac=0.2)
     g2 = {k: {shuffled[i] for i in idx2[k]} for k in ('train', 'val', 'test')}
     assert not (g2['train'] & g2['val']) and not (g2['train'] & g2['test']) and not (g2['val'] & g2['test'])
+    # NaT timedelta group ids are one missing group, exactly like NaT
+    # datetime/NaN ids; they must not silently become per-row unique keys.
+    _nat = np.array([np.timedelta64('NaT', 'ns'), np.timedelta64('NaT', 'ns'),
+                     np.timedelta64(1, 'ns'), np.timedelta64(2, 'ns')],
+                    dtype='timedelta64[ns]')
+    try:
+        L.assert_no_split_leakage([0], [1], [2, 3], groups=_nat)
+    except ValueError as e:
+        assert 'share group ids' in str(e), e
+    else:
+        raise AssertionError('NaT timedelta group ids must collapse into one group')
 
 
 def t_group_split_respects_time_windows():
