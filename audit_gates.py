@@ -1224,15 +1224,27 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                         f'{key}: L{Ln} cell has no exact integer `{_field}` '
                         f'({c.get(_field)!r}) — the scored target set is unverifiable')
             _nseq_cell = None
-            if isinstance(c.get('ppl_per_seq'), list):
-                _nseq_cell = len(c['ppl_per_seq'])
-                e['n_seq'].add(_nseq_cell)
-            elif c.get('n_seq') is not None:
-                _nseq_cell = _exact_int(c.get('n_seq'))
-                if _nseq_cell is None:
+            _seq_explicit = None
+            if c.get('n_seq') is not None:
+                _seq_explicit = _exact_int(c.get('n_seq'))
+                if _seq_explicit is None:
                     problems.append(
                         f'{key}: L{Ln} cell has a non-integer `n_seq` '
                         f'({c.get("n_seq")!r}) — the per-document row count is unverifiable')
+            if isinstance(c.get('ppl_per_seq'), list):
+                _nseq_cell = len(c['ppl_per_seq'])
+                e['n_seq'].add(_nseq_cell)
+                if _seq_explicit is not None and _seq_explicit != _nseq_cell:
+                    # The two row-count fields must describe the same rows;
+                    # silently preferring the list length would hide an
+                    # edited/truncated per-document vector.
+                    problems.append(
+                        f'{key}: L{Ln} n_seq={_seq_explicit} disagrees with '
+                        f'len(ppl_per_seq)={_nseq_cell} — the per-document '
+                        'accounting is not the same row set')
+                    e['n_seq'].add(None)
+            elif c.get('n_seq') is not None:
+                _nseq_cell = _seq_explicit
                 e['n_seq'].add(_nseq_cell)
             else:
                 # Keep the absence in the same set as the observed counts so

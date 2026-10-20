@@ -5877,6 +5877,24 @@ def t_audit_length_missing_n_seq_flag():
                                                     'eval_span': 4095, 'truncated': False}}}}, f)
         r2 = A.audit_length(p)
         assert r2['status'] == 'fail' and r2['by_length']['4096']['same_n_seq_across_records'] is False, r2
+        # Two row-count fields (n_seq and len(ppl_per_seq)) must describe the
+        # same rows; silently preferring one would hide a truncated vector.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'ppl': 30.0, 'n_tok': 16 * 4095, 'eval_span': 4095,
+                'truncated': False, 'n_seq': 16,
+                'ppl_per_seq': [30.0] * 8}}}}, f)
+        r3 = A.audit_length(p)
+        assert r3['status'] == 'fail' and any('disagrees' in x for x in r3['problems']), r3
+        # An invalid explicit n_seq is a problem even when a per-document
+        # vector supplies a plausible length.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'ppl': 30.0, 'n_tok': 16 * 4095, 'eval_span': 4095,
+                'truncated': False, 'n_seq': True,
+                'ppl_per_seq': [30.0] * 16}}}}, f)
+        r4 = A.audit_length(p)
+        assert r4['status'] == 'fail' and any('non-integer' in x for x in r4['problems']), r4
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
