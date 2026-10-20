@@ -1835,7 +1835,8 @@ def efficiency_accuracy_summary(items):
         by_arm.setdefault(v, []).append({
             'ppl': ppl, 'lat': lat,
             'params': _as_finite(it.get('params')),
-            'mem': _as_finite(it.get('peak_mem_allocated_mb'))})
+            'mem': _as_finite(it.get('peak_mem_allocated_mb')),
+            'tok': _as_finite(it.get('tokens_seen'))})
     rows = []
     for v, vals in by_arm.items():
         pp = [x['ppl'] for x in vals]
@@ -1846,14 +1847,19 @@ def efficiency_accuracy_summary(items):
         sem = (std / math.sqrt(n)) if (std is not None and n > 1) else None
         params = [x['params'] for x in vals if x['params'] is not None]
         mems = [x['mem'] for x in vals if x['mem'] is not None]
+        toks = sorted({x['tok'] for x in vals if x['tok'] is not None})
         rows.append({'variant': v, 'n': n, 'ppl_mean': mean, 'ppl_std': std,
                      'ppl_sem': sem, 'ppl_min': min(pp),
                      'latency_median': lats[len(lats) // 2],
                      'params_median': (sorted(params)[len(params) // 2] if params else None),
-                     'peak_mem_max': (max(mems) if mems else None)})
+                     'peak_mem_max': (max(mems) if mems else None),
+                     'tokens_seen_values': toks,
+                     'tokens_seen_median': (toks[len(toks) // 2] if toks else None)})
     if not rows:
         return []
     rows.sort(key=lambda r: (r['ppl_mean'], r['variant']))
+    _budgets = {r['tokens_seen_median'] for r in rows if r['tokens_seen_median'] is not None}
+    _budget_matched = len(_budgets) <= 1
     ref = rows[0]
     for r in rows:
         r['ppl_delta_pct_vs_best'] = ((r['ppl_mean'] - ref['ppl_mean']) / ref['ppl_mean'] * 100.0)
@@ -1891,7 +1897,13 @@ def efficiency_accuracy_summary(items):
             flags.append('params_2x_or_more')
         if r['memory_ratio_vs_best'] is not None and r['memory_ratio_vs_best'] >= 2.0:
             flags.append('memory_2x_or_more')
+        if not _budget_matched:
+            flags.append('train_budget_differs')
         r['flags'] = flags
+        r['budget_matched'] = _budget_matched
+    ref['budget_matched'] = _budget_matched
+    if not _budget_matched:
+        ref['flags'] = list(ref.get('flags') or []) + ['train_budget_differs']
     return rows
 
 
@@ -2102,7 +2114,8 @@ def sec_efficiency():
                 {'variant': rec.get('variant') or str(key).split('::')[0],
                  'ppl': rec.get('ppl'), 'prefill_ms_p50': eff.get('prefill_ms_p50'),
                  'params': rec.get('params'),
-                 'peak_mem_allocated_mb': eff.get('peak_mem_allocated_mb')}
+                 'peak_mem_allocated_mb': eff.get('peak_mem_allocated_mb'),
+                 'tokens_seen': rec.get('tokens_seen')}
                 for name, key, rec, eff in grp])
             if len(summary) >= 2 and summary[0].get('latency_ratio_vs_best') is not None:
                 lines += ['', '  Cost of the best-PPL arm in this group (seed spread, not a paired test):', '',
@@ -2118,7 +2131,8 @@ def sec_efficiency():
                     gain = r.get('ppl_delta_pct_vs_best', 0.0)
                     _lr = r.get('latency_ratio_vs_best')
                     lat_ratio = (1.0 / _lr) if (_lr and _lr > 0) else 0.0
-                    if (r.get('distinguishable') is True and gain >= 0.5 and lat_ratio >= 1.5):
+                    if (r.get('budget_matched') is not False
+                            and r.get('distinguishable') is True and gain >= 0.5 and lat_ratio >= 1.5):
                         lines += ['', f'  > `{ref["variant"]}` gains {gain:.2f}% PPL over `{r["variant"]}` but is {lat_ratio:.1f}× slower; the accuracy/cost tradeoff must be justified explicitly.']
                 lines.append('')
         if ungrouped:

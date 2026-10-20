@@ -6834,6 +6834,10 @@ def t_efficiency_accuracy_tradeoff_summary():
     zb = [r for r in zero if r['variant'] == 'b'][0]
     assert zb['distinguishable'] is None, zb
     assert 'zero_within_seed_variance_unverifiable' in zb['flags'], zb
+    budget = BR.efficiency_accuracy_summary([
+        {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0, 'tokens_seen': 1000},
+        {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0, 'tokens_seen': 500}])
+    assert all('train_budget_differs' in r['flags'] for r in budget), budget
 
 
 def t_report_error_analysis_section():
