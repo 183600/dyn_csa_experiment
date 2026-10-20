@@ -6454,6 +6454,13 @@ def t_efficiency_pairs_audit_and_sweep():
         r2 = A.audit_efficiency_pairs(outdirs=[td])
         rec2 = r2['panels'][td]['a vs b']
         assert rec2['speed_claim_allowed'] is False and 'token counts' in rec2['reason'], rec2
+        # A fractional token count is not the same shape as its truncated int:
+        # int(1.5) == 1 must not certify a latency comparison.
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'efficiency': dict(eff_a, n_tokens=1.5)},
+                       'b::s0': {'variant': 'b', 'efficiency': dict(eff_b, n_tokens=1)}}, f)
+        _rf = A.audit_efficiency_pairs(outdirs=[td])['panels'][td]['a vs b']
+        assert _rf['speed_claim_allowed'] is False and 'token counts' in _rf['reason'], _rf
         # A mixed device/KV record inside one arm makes the medians
         # incomparable even when the first record of each arm matches.
         with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:

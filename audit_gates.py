@@ -2011,15 +2011,33 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             # Median over seeds, not the first record: a single slow seed must
             # not decide a "faster" claim.
             _ta, _tb = _med(eff[a], 'prefill_ms_p50'), _med(eff[b], 'prefill_ms_p50')
-            _na = sorted({int(x) for x in (_num(r.get('n_tokens')) for r in eff[a]) if x is not None})
-            _nb = sorted({int(x) for x in (_num(r.get('n_tokens')) for r in eff[b]) if x is not None})
+            def _token_count(value):
+                # Token counts are exact integers.  `int(1.5)` would turn a
+                # fractional/malformed shape into a different row count and
+                # let two runs be compared as if they used the same input.
+                if isinstance(value, (bool, np.bool_)):
+                    return None
+                if isinstance(value, numbers.Integral):
+                    return int(value)
+                if isinstance(value, numbers.Real):
+                    f = float(value)
+                    return int(f) if math.isfinite(f) and f == math.floor(f) else None
+                return None
+
+            _na = sorted({_token_count(r.get('n_tokens')) for r in eff[a]},
+                         key=lambda x: (x is None, -1 if x is None else x))
+            _nb = sorted({_token_count(r.get('n_tokens')) for r in eff[b]},
+                         key=lambda x: (x is None, -1 if x is None else x))
             rec = {'a': a, 'b': b, 'same_device_torch': same_env, 'same_kv_semantics': same_kv,
                    'a_ms_p50': _ta, 'b_ms_p50': _tb, 'a_tokens': _na, 'b_tokens': _nb,
                    'ratio_b_over_a': None, 'speed_claim_allowed': False, 'faster_arm': None, 'reason': None}
             if not (isinstance(_ta, (int, float)) and isinstance(_tb, (int, float)) and _ta > 0 and _tb > 0):
                 rec['reason'] = 'missing or non-positive measured prefill time'
-            elif _na != _nb or len(_na) != 1 or len(_nb) != 1:
-                rec['reason'] = f'different or ambiguous measured token counts ({_na} vs {_nb}); a latency ratio across shapes is not a speed comparison'
+            elif (None in _na or None in _nb or _na != _nb
+                  or len(_na) != 1 or len(_nb) != 1):
+                rec['reason'] = (f'different, ambiguous or non-integer measured '
+                                 f'token counts ({_na} vs {_nb}); a latency ratio '
+                                 'across shapes is not a speed comparison')
             elif not same_env:
                 rec['reason'] = 'different or inconsistent device/torch version recorded (within or across arms)'
             elif not same_kv:
