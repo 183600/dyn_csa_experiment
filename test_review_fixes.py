@@ -2646,6 +2646,8 @@ def t_experiment_ledger():
         for k in ('run_id', 'run_cfg', 'seed', 'provenance', 'hyperparams', 'data_fp', 'metrics', 'losses', 'ppl_history'):
             assert k in ev, f'experiment ledger entry missing {k}'
         assert ev['status'] == 'ok' and ev['run_id'] == out['run_id'] and len(ev['losses']) == 3
+        assert ev['metrics'].get('steps_completed') == 3, ev['metrics']
+        assert isinstance(ev.get('instability_diagnosis'), dict), ev
         san = {'kind': 'small_batch_overfit_sanity_panel', 'passed': True, 'reports': [], 'run_cfg': fp}
         dc = L.batch_contract_check(ids, cfg['seq_len'], cfg['batch_size'], torch.device('cpu'), seed=0, vocab=997)
         dc.update({'run_cfg': fp})
