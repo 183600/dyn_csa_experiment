@@ -477,13 +477,14 @@ def _relaxed_pair_reason(a, b, tuned_arms):
     # `pair_reason` already refuses a mixed evaluation slice, and the relaxed
     # tuned rule must not become a back door around it.  Legacy records with
     # no eval fingerprint on either side keep the permissive path.
-    _ea, _eb = a.get('eval_fp'), b.get('eval_fp')
-    _ha = _ea is not None and str(_ea) != ''
-    _hb = _eb is not None and str(_eb) != ''
-    if _ha != _hb:
-        return 'unverifiable eval_fp (only one record carries the evaluation-slice fingerprint)'
-    if _ha and str(_ea) != str(_eb):
-        return f'eval_fp differs ({str(_ea)[:12]}… vs {str(_eb)[:12]}…)'
+    for _key in ('eval_fp', 'eval_subset_fp'):
+        _ea, _eb = a.get(_key), b.get(_key)
+        _ha = _ea is not None and str(_ea) != ''
+        _hb = _eb is not None and str(_eb) != ''
+        if _ha != _hb:
+            return f'unverifiable {_key} (only one record carries the evaluation-slice fingerprint)'
+        if _ha and str(_ea) != str(_eb):
+            return f'{_key} differs ({str(_ea)[:12]}… vs {str(_eb)[:12]}…)'
     # The tuned estimate may be computed on a deterministic held-out row fold
     # (`ppl_holdout`).  Different holdout fingerprints mean the two arms are
     # not scored on the same rows even when the evaluation slice matches.

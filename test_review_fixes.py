@@ -1228,6 +1228,13 @@ def t_tuned_pairing_keeps_optimizer_gate():
     assert why7 and 'eval_fp' in why7, why7
     assert BT._relaxed_pair_reason(dict(a, eval_fp='e1'), dict(b, eval_fp='e1'),
                                    {'a': 3, 'b': 3}) is None
+    # The final PPL subset is part of the evaluation slice too.
+    assert BT._relaxed_pair_reason(dict(a, eval_subset_fp='s1'),
+                                   dict(b, eval_subset_fp='s2'),
+                                   {'a': 3, 'b': 3}) is not None
+    assert BT._relaxed_pair_reason(dict(a, eval_subset_fp='s1'),
+                                   dict(b, eval_subset_fp='s1'),
+                                   {'a': 3, 'b': 3}) is None
     # A held-out row fold must be the same fold on both arms.
     why8 = BT._relaxed_pair_reason(dict(a, holdout_row_fp='h1'),
                                    dict(b, holdout_row_fp='h2'), {'a': 3, 'b': 3})
