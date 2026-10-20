@@ -12937,36 +12937,63 @@ def _canon_setting(v):
                       ensure_ascii=True, default=str)
 
 def _setting_values(recs, arms, getter):
+    """Per-arm distinct values of one setting, plus how many records were
+    inspected and how many omitted the setting.
+
+    The counts are what let `_setting_control` distinguish a legacy arm (all
+    records omit the descriptor) from an arm whose seeds only PARTIALLY carry
+    it: the latter is a mixed protocol inside one arm, not an equality proof.
+    """
     vals = {a: set() for a in arms}
+    n_records = {a: 0 for a in arms}
+    n_missing = {a: 0 for a in arms}
     for (v, _t, _s), r in recs.items():
         if v not in vals:
             continue
+        n_records[v] += 1
         val = getter(r)
-        if val is not None:
+        if val is None:
+            n_missing[v] += 1
+        else:
             vals[v].add(val)
-    return vals
+    return vals, n_records, n_missing
 
-def _setting_control(vals_by_arm, *, check_within_arm=True):
+def _setting_control(vals_by_arm, *, check_within_arm=True, n_records=None,
+                     n_missing=None):
     """Aggregate one setting across arms.
 
     Returns `equal` (True/False/None), every arm's distinct values, the arms
-    whose own seeds disagree (mixed protocol inside one arm), and arms with
-    no value.  `equal=None` means unverifiable (legacy record), never a pass.
+    whose own seeds disagree (mixed protocol inside one arm), arms whose
+    records only partially carry the descriptor, and arms with no value.
+    `equal=None` means unverifiable (legacy record), never a pass.
+
+    A partially recorded arm (some seeds carry the setting, others omit it)
+    is a FAILURE, not "unverifiable": the panel cannot show that every seed
+    shared the setting, and silently trusting the records that do carry it is
+    exactly how a changed optimizer/schedule can hide in one seed.
     """
     arms = list(vals_by_arm)
     nonempty = {a: v for a, v in vals_by_arm.items() if v}
     mixed = sorted(a for a, v in nonempty.items() if len(v) > 1) if check_within_arm else []
+    _nr = n_records or {}
+    _nm = n_missing or {}
+    partial = sorted(a for a in arms
+                     if _nr.get(a, 0) > 0 and 0 < _nm.get(a, 0) < _nr.get(a, 0)
+                     ) if check_within_arm else []
     missing = sorted(a for a in arms if not vals_by_arm.get(a))
     if not nonempty:
         equal = None
-    elif mixed:
+    elif mixed or partial:
         equal = False
     elif len(nonempty) < len(arms):
         equal = None
     else:
         union = set().union(*nonempty.values())
         equal = bool(len(union) == 1)
-    return {'equal': equal, 'within_arm_mixed': mixed, 'missing_arms': missing,
+    return {'equal': equal, 'within_arm_mixed': mixed,
+            'partially_recorded': partial, 'missing_arms': missing,
+            'n_records': {a: int(_nr.get(a, 0)) for a in arms},
+            'n_missing': {a: int(_nm.get(a, 0)) for a in arms},
             'values': {a: sorted(v) for a, v in nonempty.items()}}
 
 def controlled_variables_report(recs, arms):
@@ -12980,14 +13007,17 @@ def controlled_variables_report(recs, arms):
     `run_cfg_equal` / `train_knobs_equal` keys and adds the detail.
     """
     arms = sorted(set(arms))
-    run_cfg = _setting_control(_setting_values(
-        recs, arms, lambda r: _canon_setting(r.get('run_cfg'))))
-    train_knobs = _setting_control(_setting_values(
-        recs, arms, lambda r: _canon_setting(r.get('train_knobs'))))
+
+    def _control(getter):
+        _vals, _nr, _nm = _setting_values(recs, arms, getter)
+        return _setting_control(_vals, n_records=_nr, n_missing=_nm)
+
+    run_cfg = _control(lambda r: _canon_setting(r.get('run_cfg')))
+    train_knobs = _control(lambda r: _canon_setting(r.get('train_knobs')))
     hyper = {}
     for key in _CONTROL_HYPER_KEYS:
-        hyper[key] = _setting_control(_setting_values(
-            recs, arms, lambda r, k=key: _canon_setting((r.get('hyperparams') or {}).get(k))))
+        hyper[key] = _control(
+            lambda r, k=key: _canon_setting((r.get('hyperparams') or {}).get(k)))
     hp_checked = [k for k, v in hyper.items()
                   if any(v['values'].get(a) for a in arms)]
     hp_diffs = [k for k in hp_checked if hyper[k]['equal'] is False]
@@ -13002,6 +13032,8 @@ def controlled_variables_report(recs, arms):
         hp_equal = True
     mixed = sorted(set(run_cfg['within_arm_mixed']) | set(train_knobs['within_arm_mixed'])
                    | {a for k in hp_checked for a in hyper[k]['within_arm_mixed']})
+    partial = sorted(set(run_cfg['partially_recorded']) | set(train_knobs['partially_recorded'])
+                     | {a for k in hp_checked for a in hyper[k]['partially_recorded']})
     diff_values = {}
     for key, ctl in (('run_cfg', run_cfg), ('train_knobs', train_knobs)):
         if ctl['equal'] is False:
@@ -13043,6 +13075,13 @@ def controlled_variables_report(recs, arms):
         'hyperparams_equal': hp_equal,
         'controlled': controlled,
         'within_arm_mixed': mixed,
+        'partially_recorded': partial,
+        'setting_coverage': {
+            'run_cfg': {'n_records': run_cfg['n_records'], 'n_missing': run_cfg['n_missing']},
+            'train_knobs': {'n_records': train_knobs['n_records'], 'n_missing': train_knobs['n_missing']},
+            'hyperparams': {k: {'n_records': hyper[k]['n_records'], 'n_missing': hyper[k]['n_missing']}
+                            for k in hp_checked},
+        },
         'differences': diff_values,
         'checked_hyperparam_keys': sorted(hp_checked),
         'hyperparam_differences': hp_diffs,
@@ -13994,6 +14033,9 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             if _cv.get('within_arm_mixed'):
                 report['warnings'].append('%s: arm(s) %s mix DIFFERENT protocols within one arm across seeds — a seed-averaged claim would pool incompatible runs'
                                           % (comp, ', '.join(_cv['within_arm_mixed'])))
+            if _cv.get('partially_recorded'):
+                report['warnings'].append('%s: arm(s) %s carry the run_cfg/train_knobs/hyperparameter descriptor only on SOME seed records — equality across arms cannot be verified; the seeds without the descriptor are already excluded from the paired n'
+                                          % (comp, ', '.join(_cv['partially_recorded'])))
             if _cv.get('hyperparam_differences'):
                 report['warnings'].append('%s: structured hyperparameters differ across arms (%s) even where run_cfg matches — the comparison is not fully controlled'
                                           % (comp, ', '.join(_cv['hyperparam_differences'])))

@@ -1212,6 +1212,12 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
             problems.append(f'{a}: {len(cfgs)} distinct run_cfg values within one arm — mixed protocols inside an arm')
         if len(knob_vals) > 1:
             problems.append(f'{a}: {len(knob_vals)} distinct train_knobs values within one arm — mixed optimizer/schedule settings inside an arm')
+        if 0 < n_missing_knobs < len(recs):
+            # Some seeds carry the optimizer/schedule descriptor and some do
+            # not.  The records that do carry it can agree while the arm as a
+            # whole is still unverified; trusting the populated subset would
+            # let one seed silently run under a different optimizer.
+            problems.append(f'{a}: {n_missing_knobs}/{len(recs)} records omit train_knobs — the optimizer/schedule descriptor covers only part of the arm')
     _unverifiable = False
     if len(per_arm) >= 2:
         # The cross-arm check must use the SAME gate as the statistics
