@@ -9315,6 +9315,155 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     return None
 
 
+def global_multiplicity_audit(named_pvals, *, alpha=0.05,
+                              families=None, family_holm=None):
+    """Cross-PANEL multiplicity view over every comparison a report displays.
+
+    `attach_holm` / `holm_adjust` control the error rate INSIDE one panel's
+    family, but a report or a paper quotes many families, and "it was
+    significant in v7, v10 and v11" is itself a selection over every contrast
+    the project has displayed.  This audit is the machine-computed global
+    view over that larger family:
+
+      * Benjamini-Hochberg step-up q-values (FDR-controlled across panels);
+      * Bonferroni p*m (family-wise, the conservative bound);
+      * a per-comparison `global_status` that report prose must respect:
+          - 'globally_controlled'  : raw p < alpha AND BH-rejected AND
+                                     Bonferroni < alpha
+          - 'fdr_only'             : BH-rejected but Bonferroni >= alpha
+                                     (quote as FDR-controlled, never as
+                                     family-wise certain)
+          - 'family_only'          : raw p < alpha but not BH-rejected —
+                                     prose may not say "significant"
+                                     without the "not globally corrected"
+                                     qualifier
+          - 'not_significant'      : raw p >= alpha
+          - 'untestable'           : no valid p (counted in m with a p=1
+                                     slot, so a report cannot shrink the
+                                     global family by dropping a failed
+                                     comparison — the same fail-closed
+                                     convention as `holm_adjust`)
+
+    `named_pvals` is [(name, p), ...] or [(name, p, family), ...]; `families`
+    may carry one family label per entry (same order) and `family_holm` the
+    within-family Holm p per entry (used only for the display column, never
+    for the global decision).  Duplicate names are a hard error: two rows for
+    one comparison would double-count it in m.
+
+    The audit never forbids REPORTING a number; it only separates the wordings
+    a cross-panel quote is allowed to use, exactly like `reportable_claim`."""
+    if isinstance(alpha, (bool, np.bool_)):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    try:
+        a = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    if not (0.0 < a < 1.0):
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
+    entries = []
+    seen = set()
+    for i, item in enumerate(named_pvals if named_pvals is not None else []):
+        if not isinstance(item, (tuple, list)) or not 2 <= len(item) <= 3:
+            raise ValueError(f'global_multiplicity_audit: entry #{i} must be (name, p) or (name, p, family), got {item!r}')
+        name = str(item[0])
+        if name in seen:
+            raise ValueError(f'global_multiplicity_audit: duplicate comparison name {name!r} — two rows for one contrast would double-count it in m')
+        seen.add(name)
+        fam = item[2] if len(item) == 3 else None
+        entries.append({'name': name, 'p': item[1], 'family': (str(fam) if fam is not None else None)})
+    if families is not None:
+        fams = list(families)
+        if len(fams) != len(entries):
+            raise ValueError(f'global_multiplicity_audit: families length {len(fams)} does not match {len(entries)} comparisons')
+        for e, f in zip(entries, fams):
+            if f is not None:
+                e['family'] = str(f)
+    if family_holm is not None:
+        fh = list(family_holm)
+        if len(fh) != len(entries):
+            raise ValueError(f'global_multiplicity_audit: family_holm length {len(fh)} does not match {len(entries)} comparisons')
+        for e, h in zip(entries, fh):
+            e['p_holm_in_family'] = h
+    m = len(entries)
+    out = {'m': m, 'alpha': a, 'entries': [], 'untestable': [],
+           'wording_rule': ('a comparison with global_status="family_only" may be '
+                            'quoted as within-family significant but must carry the '
+                            '"not globally corrected" qualifier; only '
+                            '"globally_controlled" supports cross-panel significance '
+                            'wording; "fdr_only" supports FDR-controlled wording, '
+                            'not family-wise certainty')}
+    if m == 0:
+        out['summary'] = {'n_raw_significant': 0, 'n_bh_rejected': 0,
+                          'n_bonferroni_significant': 0, 'n_family_only': 0,
+                          'n_globally_controlled': 0, 'n_untestable': 0}
+        return out
+    pvals = []
+    for e in entries:
+        p = e['p']
+        valid = False
+        if p is not None and not isinstance(p, (bool, np.bool_)):
+            try:
+                pf = float(p)
+                valid = math.isfinite(pf) and 0.0 <= pf <= 1.0
+            except (TypeError, ValueError, OverflowError):
+                valid = False
+        if valid:
+            e['p_raw'] = pf
+        else:
+            e['p_raw'] = None
+            out['untestable'].append(e['name'])
+        pvals.append(e['p_raw'] if e['p_raw'] is not None else 1.0)
+    parr = np.asarray(pvals, dtype=float)
+    # Benjamini-Hochberg step-up q-values with the monotone min from the
+    # largest rank down, so q is non-decreasing in p and q_i <= q_j for
+    # p_i <= p_j (the standard BH q definition).
+    order = np.argsort(parr, kind='stable')
+    ranked = parr[order]
+    q_ranked = ranked * m / np.arange(1, m + 1, dtype=float)
+    for i in range(m - 2, -1, -1):
+        if q_ranked[i] > q_ranked[i + 1]:
+            q_ranked[i] = q_ranked[i + 1]
+    np.minimum(q_ranked, 1.0, out=q_ranked)
+    q = np.empty(m, dtype=float)
+    q[order] = q_ranked
+    # BH rejection set == {i : q_i <= alpha} (the defining property of BH
+    # q-values; q_i >= p_i always, so tied p values can never receive
+    # different verdicts and a p=1 slot is never rejected).
+    bh_rejected = q <= a + 1e-15
+    bonf = np.minimum(parr * m, 1.0)
+    n_raw = n_bh = n_bonf = n_famonly = n_global = 0
+    for i, e in enumerate(entries):
+        p_raw = e['p_raw']
+        rej_bh = bool(bh_rejected[i])
+        qv = float(q[i])
+        bv = float(bonf[i])
+        if p_raw is None:
+            status = 'untestable'
+        elif p_raw >= a:
+            status = 'not_significant'
+        elif rej_bh and bv < a:
+            status = 'globally_controlled'
+        elif rej_bh:
+            status = 'fdr_only'
+        else:
+            status = 'family_only'
+        e.update({'q_bh': qv, 'p_bonferroni': bv, 'bh_rejected': rej_bh,
+                  'global_status': status})
+        if p_raw is not None:
+            n_raw += int(p_raw < a)
+        n_bh += int(rej_bh and p_raw is not None)
+        n_bonf += int(p_raw is not None and bv < a)
+        n_famonly += int(status == 'family_only')
+        n_global += int(status == 'globally_controlled')
+        out['entries'].append(e)
+    out['summary'] = {'n_raw_significant': n_raw, 'n_bh_rejected': n_bh,
+                      'n_bonferroni_significant': n_bonf,
+                      'n_family_only': n_famonly,
+                      'n_globally_controlled': n_global,
+                      'n_untestable': len(out['untestable'])}
+    return out
+
+
 def _binom_cdf_half(n, m):
     """P(Bin(n, 1/2) <= m), evaluated in log space.
 
@@ -9671,7 +9820,16 @@ def paired_log_ratio(with_values, without_values, seeds=None):
 
 
 def _scale_points(points):
-    """Normalise [{label, scale, effects, seeds}] / [(scale, effects)] inputs."""
+    """Normalise [{label, scale, effects, seeds, corpus_fp?, vocab?}] /
+    [(scale, effects)] inputs.
+
+    `corpus_fp` (the composite data identity, e.g. the record's
+    `data_version`: dataset + tokenizer fit + train/val fingerprints) and
+    `vocab` are optional per-point provenance for the scale family: a
+    cross-scale effect (paired log PPL ratio) is only defined when every
+    scale point measured the SAME corpus and tokenizer — a mixed family must
+    be refused by the consumers (meta_analyze_effects / scaling_trend), not
+    pooled into a trend."""
     out = []
     for i, p in enumerate(points if points is not None else []):
         if isinstance(p, dict):
@@ -9679,10 +9837,14 @@ def _scale_points(points):
             scale = p.get('scale')
             label = p.get('label', i)
             seeds = p.get('seeds')
+            corpus_fp = p.get('corpus_fp')
+            vocab = p.get('vocab')
         elif isinstance(p, (tuple, list)) and len(p) >= 2:
             scale, eff = p[0], p[1]
             label = i
             seeds = p[2] if len(p) > 2 else None
+            corpus_fp = p[3] if len(p) > 3 else None
+            vocab = None
         else:
             continue
         if eff is None:
@@ -9713,7 +9875,52 @@ def _scale_points(points):
             sc = float(scale)
         except (TypeError, ValueError, OverflowError):
             sc = float('nan')
-        out.append({'label': str(label), 'scale': sc, 'effects': effects, 'seeds': seeds_kept})
+        try:
+            vb = int(vocab) if vocab is not None else None
+        except (TypeError, ValueError, OverflowError):
+            vb = None
+        out.append({'label': str(label), 'scale': sc, 'effects': effects, 'seeds': seeds_kept,
+                    'corpus_fp': (str(corpus_fp) if corpus_fp not in (None, '') else None),
+                    'vocab': vb})
+    return out
+
+
+def _scale_corpus_binding(pts):
+    """Shared-corpus/tokenizer attestation across scale points.
+
+    Returns a dict with `corpus_binding` in
+      * 'shared'    — every point carries the same corpus fingerprint
+      * 'mixed'     — >=2 fingerprints differ: cross-scale effects are not
+                      defined (different corpora/tokenizers), pooling must be
+                      refused
+      * 'unverifiable' — fewer than two points carry a fingerprint: the family
+                      MIGHT be mixed; absence of evidence is not attestation
+    plus `corpus_fps`, `vocabs` and a refusal reason when mixed."""
+    fps = [p.get('corpus_fp') for p in pts if p.get('corpus_fp')]
+    vbs = sorted({p.get('vocab') for p in pts if p.get('vocab') is not None})
+    out = {'corpus_fps': sorted(set(fps)), 'vocabs': vbs}
+    if len(fps) >= 2 and len(set(fps)) > 1:
+        out['corpus_binding'] = 'mixed'
+        out['refusal_reason'] = (
+            'the scale points do not share one corpus/tokenizer fingerprint '
+            f'({len(set(fps))} distinct); a paired log PPL ratio is only '
+            'defined within one tokenisation, so cross-scale pooling is '
+            'refused (report the scales separately)')
+    elif len(fps) == len(pts) and len(pts) > 0 and len(set(fps)) == 1:
+        out['corpus_binding'] = 'shared'
+    else:
+        out['corpus_binding'] = 'unverifiable'
+        out['refusal_reason'] = (
+            'the scale points carry no corpus/tokenizer fingerprint; '
+            'cross-scale pooling cannot be bound to one tokenisation and '
+            'stays unattested (add corpus_fp per point, e.g. the record '
+            'data_version)')
+    if len(vbs) > 1:
+        out['corpus_binding'] = 'mixed'
+        out['refusal_reason'] = (
+            f'the scale points declare {len(vbs)} different vocab sizes {vbs}; '
+            'PPL/log-ratios across different tokenisations are not comparable '
+            '(see design_notes §22)')
     return out
 
 
@@ -9740,6 +9947,10 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         d = np.asarray(p['effects'], dtype=float)
         n = int(d.size)
         row = {'label': p['label'], 'scale': p['scale'], 'n': n}
+        if p.get('corpus_fp'):
+            row['corpus_fp'] = p['corpus_fp']
+        if p.get('vocab') is not None:
+            row['vocab'] = p['vocab']
         if n:
             m = float(d.mean())
             sd = float(d.std(ddof=1)) if n > 1 else float('nan')
@@ -9754,7 +9965,16 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     usable = [r for r in per if r['n'] > 1 and math.isfinite(r.get('se', float('nan'))) and r['se'] > 0.0]
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'per_point': per,
            'n_points': len(per), 'n_usable': len(usable),
+           'corpus_binding': _scale_corpus_binding(pts),
            'convention': 'input effects are scale-free; positive = with arm worse (higher PPL)'}
+    if len(pts) >= 2 and out['corpus_binding']['corpus_binding'] == 'mixed':
+        # Log PPL ratios are only defined within ONE tokenisation; pooling
+        # across corpora/tokenizers is a units error, not a heterogeneity
+        # finding.  Per-scale rows stay in the output; the pooled claims go.
+        out.update({'status': 'refused_corpus_mismatch', 'poolable': False,
+                    'note': out['corpus_binding']['refusal_reason']
+                            + ' — per-scale effects are reported; pooled estimates are withheld'})
+        return out
     if not usable:
         out.update({'status': 'insufficient_within_scale_replication', 'poolable': False,
                     'note': 'every scale point has n<2 or zero within-scale variance; no random-effects weights can be formed'})
@@ -9848,10 +10068,18 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'min_points': int(min_points),
            'n_points': len(pts), 'labels': labels,
            'scales': [p['scale'] for p in pts],
+           'corpus_binding': _scale_corpus_binding(pts),
            'min_seeds_for_significance': signflip_min_n_for_holm(1, alpha),
            'convention': 'effects must be scale-free (e.g. paired log PPL ratio); positive = with arm worse'}
     if len(pts) < 2:
         out.update({'status': 'insufficient_points', 'verdict': 'insufficient_points'})
+        return out
+    if out['corpus_binding']['corpus_binding'] == 'mixed':
+        # A trend across scales that did not share one corpus/tokenizer is a
+        # units artefact, not a scaling law: the per-scale numbers may be
+        # reported, the slope may not.
+        out.update({'status': 'refused_corpus_mismatch', 'verdict': 'refused_corpus_mismatch',
+                    'note': out['corpus_binding']['refusal_reason']})
         return out
     x = np.asarray([math.log10(p['scale']) if log_scale else p['scale'] for p in pts], dtype=float)
     y = np.asarray([float(np.mean(p['effects'])) for p in pts], dtype=float)
@@ -10039,6 +10267,24 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         name = str(tier.get('name') or f'T{i}')
         cfg = tier.get('cfg') or {}
         row = {'name': name}
+        # Optional corpus/tokenizer provenance: the ladder's cross-tier
+        # contrasts (paired log PPL ratios, tokens-per-param) are only defined
+        # when every tier measured the SAME corpus and tokenisation.  A tier
+        # that carries no fingerprint is disclosed as unverifiable, never
+        # assumed to match.
+        for _fpk in ('corpus_fp', 'fit_fp', 'vocab'):
+            _v = cfg.get(_fpk)
+            if _v is None:
+                _v = tier.get(_fpk)
+            if _v is None:
+                continue
+            if _fpk == 'vocab':
+                try:
+                    _v = int(_v)
+                except (TypeError, ValueError, OverflowError):
+                    problems.append(f'{name}: vocab={_v!r} is not an integer')
+                    continue
+            row[_fpk] = _v
         try:
             steps = _as_int(cfg['steps'], 'steps')
             batch = _as_int(cfg['batch_size'], 'batch_size')
@@ -10117,17 +10363,44 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                 r['descriptive_only'] = bool(r['p_floor'] > 0.05)
                 r['seeds_sufficient_for_family'] = (
                     None if not feas else bool(r['n_seeds'] >= min(feas)))
+        # Corpus/tokenizer binding across the ladder: a MISMATCH is a hard
+        # problem (the cross-tier log-ratios the ladder exists to compute are
+        # not defined), while missing fingerprints stay a warning (the audit
+        # cannot attest, but old panels predate the field).
+        binding = {}
+        for _fpk, _what in (('corpus_fp', 'corpus fingerprint'),
+                            ('fit_fp', 'tokenizer-fit fingerprint'),
+                            ('vocab', 'vocab size')):
+            _vals = [r.get(_fpk) for r in rows if r.get(_fpk) is not None]
+            if len(_vals) >= 2 and len(set(map(str, _vals))) > 1:
+                problems.append(
+                    f'tiers do not share one {_what}: '
+                    + ', '.join(f'{r["name"]}={r[_fpk]!r}' for r in rows if r.get(_fpk) is not None)
+                    + ' — cross-tier PPL/log-ratio contrasts are not defined across '
+                      'different tokenisations/corpora; run each tier on the same '
+                      'corpus/tokenizer or report the tiers separately')
+                binding[_fpk] = 'mixed'
+            elif len(_vals) == len(rows) and len(rows) >= 2:
+                binding[_fpk] = 'shared'
+            elif len(_vals) >= 1:
+                binding[_fpk] = 'partial'
+                warnings.append(f'only {len(_vals)}/{len(rows)} tiers carry a {_what}; '
+                                'the cross-tier corpus binding is unverifiable for the rest')
+            else:
+                binding[_fpk] = 'unverifiable'
         out = {'status': ('fail' if problems else ('warn' if warnings else 'ok')),
                'budget_matched': (budget_matched if len(rows) >= 2 else None),
                'tokens_per_param_ratio': tpp_ratio,
                'tokens_per_param_tolerance': tol,
                'lr_constant': (lr_constant if len(rows) >= 2 else None),
                'lr_transfer_policy': policy.get('lr_transfer'),
+               'corpus_binding': binding,
                'tiers': rows, 'policy': policy,
                'problems': problems, 'warnings': warnings}
     else:
         warnings.append('fewer than two complete tiers — no cross-scale comparison can be checked')
         out = {'status': ('fail' if problems else 'warn'), 'budget_matched': None,
+               'corpus_binding': {},
                'tiers': rows, 'policy': policy, 'problems': problems,
                'warnings': warnings}
     return out
@@ -17996,6 +18269,133 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     lo, hi = np.percentile(vals, [2.5, 97.5])
     return [float(lo), float(hi)]
 
+def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
+    """Two-level (seed x document) uncertainty disclosure for the pooled PPL.
+
+    The seed-level interval (`ppl_ci95_seed_t`) answers "how much does
+    TRAINING noise move the number"; the document bootstrap
+    (`ppl_ci95_doc_bootstrap`) answers "how much does the EVALUATION SUBSET
+    move it".  Neither alone bounds the reported pooled PPL, because both
+    sources act at once — a small seed CI next to a wide doc CI is not a
+    precise measurement.  This helper estimates both components on the
+    log-PPL scale (PPL is multiplicative; the interval is exponentiated back
+    at the end) and combines them as independent variance sources:
+
+      se_seed  = std_s(log pooled_ppl_s, ddof=1) / sqrt(S)
+      se_doc   = bootstrap SD of the log pooled PPL over document resamples
+      se_combined = sqrt(se_seed^2 + se_doc^2)
+      ci95     = exp(mean_s log pooled_ppl_s  +-  t_{S-1, conf} * se_combined)
+
+    The component ratio is reported too: it says whether precision is bought
+    by more seeds or by more evaluation documents, which is the actionable
+    question a small-n panel faces.  This is a disclosed two-source
+    approximation, not a fitted hierarchical random-effects model; when a
+    component is unmeasurable (S<2, records without per-row NLL, or fewer
+    than two scored documents) the status says so explicitly and the missing
+    component is never silently treated as zero."""
+    rows = []
+    for r in recs:
+        nll = r.get('nll_per_row')
+        ntok = r.get('n_tokens_per_row')
+        if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
+            rows = None
+            break
+        rows.append((np.asarray(nll, dtype=float), np.asarray(ntok, dtype=float)))
+    if isinstance(rows, list):
+        if len({len(a) for a, _ in rows}) != 1:
+            rows = None
+    if isinstance(rows, list):
+        nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
+        ntok_mat = np.stack([b for _, b in rows], axis=0)          # [S, R]
+        keep = ntok_mat.sum(axis=0) > 0
+        n_dropped = int((~keep).sum())
+        nll_mat = nll_mat[:, keep]
+        ntok_mat = ntok_mat[:, keep]
+        if not np.isfinite(nll_mat).all() or not np.isfinite(ntok_mat).all() or (ntok_mat < 0).any():
+            rows = None
+    out = {'status': 'unverifiable', 'n_seeds': len(recs), 'n_docs': None,
+           'n_docs_dropped_zero_token': None,
+           'se_seed_logppl': None, 'se_doc_logppl': None,
+           'se_combined_logppl': None, 'ci95_ppl': None,
+           'component_ratio_seed_over_doc': None, 'conf': float(conf),
+           'method': 'two-source variance combination on log-PPL (seed training noise x evaluation-document bootstrap); approximation, not a fitted hierarchical model'}
+    S = len(recs)
+    if S < 1:
+        return out
+    # Seed-level component: per-seed pooled PPL over the SAME doc set.
+    seed_logppl = None
+    if rows is not None:
+        per_tok = nll_mat.sum(axis=1) / np.maximum(ntok_mat.sum(axis=1), 1e-30)
+        ok = np.isfinite(per_tok) & (per_tok > 0)
+        if ok.sum() == S and S >= 2:
+            lp = np.log(per_tok)
+            seed_logppl = lp
+            out['se_seed_logppl'] = float(lp.std(ddof=1) / math.sqrt(S))
+            out['n_docs'] = int(nll_mat.shape[1])
+            out['n_docs_dropped_zero_token'] = n_dropped
+        elif ok.sum() == S:
+            out['n_docs'] = int(nll_mat.shape[1])
+            out['n_docs_dropped_zero_token'] = n_dropped
+    # Doc-level component: bootstrap SD of log pooled PPL over doc resamples
+    # (seed-pooled NLL/ntok columns, the same pooled estimator the doc CI
+    # uses, taken on the log scale).
+    if rows is not None and nll_mat.shape[1] >= 2:
+        rng = np.random.default_rng(int(seed))
+        nll_col = nll_mat.sum(axis=0)
+        ntok_col = ntok_mat.sum(axis=0)
+        R = int(nll_mat.shape[1])
+        draws = np.empty(int(n_boot), dtype=float)
+        _chunk = 256
+        _b = 0
+        while _b < int(n_boot):
+            _nb = min(_chunk, int(n_boot) - _b)
+            counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb)
+            nt = counts @ ntok_col
+            nn = counts @ nll_col
+            with np.errstate(divide='ignore', invalid='ignore'):
+                lp_draw = np.where(nt > 0, nn / np.maximum(nt, 1e-30), np.nan)
+                lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw > 0), np.log(np.where(np.isfinite(lp_draw) & (lp_draw > 0), lp_draw, 1.0)), np.nan)
+            draws[_b:_b + _nb] = lp_draw
+            _b += _nb
+        draws = draws[np.isfinite(draws)]
+        if draws.size >= max(20, int(0.5 * n_boot)):
+            sd = float(draws.std(ddof=1))
+            if sd < 1e-12:
+                # Identical documents: the bootstrap SD is pure float noise.
+                # Report the component as exactly zero so the ratio field is
+                # not a 1e16 number that reads like a measurement.
+                sd = 0.0
+            out['se_doc_logppl'] = sd
+            if out['n_docs'] is None:
+                out['n_docs'] = R
+                out['n_docs_dropped_zero_token'] = n_dropped
+    if out['se_seed_logppl'] is None and out['se_doc_logppl'] is None:
+        out['status'] = 'unverifiable'
+        return out
+    if out['se_seed_logppl'] is None:
+        out['status'] = 'seed_component_unverifiable'
+        return out
+    if out['se_doc_logppl'] is None:
+        out['status'] = 'doc_component_unverifiable'
+        return out
+    se_s = out['se_seed_logppl']
+    se_d = out['se_doc_logppl']
+    out['se_combined_logppl'] = float(math.sqrt(se_s * se_s + se_d * se_d))
+    if se_d > 0:
+        out['component_ratio_seed_over_doc'] = float(se_s / se_d)
+    try:
+        tc = _t_critical(float(conf), S - 1)
+    except Exception:
+        tc = None
+    if tc is not None and math.isfinite(tc):
+        m = float(seed_logppl.mean())
+        out['ci95_ppl'] = [float(math.exp(m - tc * out['se_combined_logppl'])),
+                           float(math.exp(m + tc * out['se_combined_logppl']))]
+        out['status'] = 'ok'
+    else:
+        out['status'] = 'ci_unavailable'
+    return out
+
 def aggregate(summary):
 
     def _protocol_tag(rec, key=None):
@@ -18139,6 +18539,7 @@ def aggregate(summary):
                  'nll_sum': _nll_total, 'n_tokens': _ntok_total,
                  'ppl_pooled': (_pooled if _pooled is not None else None),
                  'ppl_ci95_doc_bootstrap': _doc_bootstrap_ppl_ci(recs),
+                 'ppl_ci_seed_doc_combined': _combined_seed_doc_ci(recs),
                  'ppl_aggregation': ('pooled_token_nll' if _pooled is not None else 'arithmetic_seed_mean_fallback (records lack nll_sum/n_tokens)'),
                  'ppl_primary': (float(_pooled) if _pooled is not None else float(ppls.mean()))}
         _pb = next((r.get('param_breakdown') for r in recs if isinstance(r.get('param_breakdown'), dict)), None)

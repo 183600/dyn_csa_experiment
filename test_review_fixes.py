@@ -1486,6 +1486,84 @@ def t_review3_pooled_aggregate():
     assert e['ppl_primary'] == e['ppl_pooled']
     assert e['ppl_mean_arithmetic'] != e['ppl_pooled'] or True
 
+def t_combined_seed_doc_uncertainty():
+    # Two-level (seed x document) combined interval: the seed-level t CI and
+    # the doc-level bootstrap each see only ONE variance source; the
+    # combined interval must not silently drop the other one.
+    def _recs(seed_offsets, n_docs=32, ntok=50, zero_docs=0):
+        out = []
+        for s, off in enumerate(seed_offsets):
+            nll = [1.0 + off + 0.01 * j for j in range(n_docs)]
+            ntoks = [ntok] * (n_docs - zero_docs) + [0] * zero_docs
+            out.append({'variant': 'csa', 'seed': s,
+                        'ppl': math.exp(sum(nll) / (n_docs * ntok)),
+                        'nll_per_row': nll, 'n_tokens_per_row': ntoks})
+        return out
+    import numpy as _np
+    recs = _recs([0.0, 0.2, 0.4])
+    r = L._combined_seed_doc_ci(recs)
+    assert r['status'] == 'ok', r
+    assert r['n_seeds'] == 3 and r['n_docs'] == 32 and r['n_docs_dropped_zero_token'] == 0, r
+    per_seed_lp = []
+    for off in (0.0, 0.2, 0.4):
+        nll = [1.0 + off + 0.01 * j for j in range(32)]
+        per_seed_lp.append(math.log(sum(nll) / (32 * 50)))
+    _se_seed = _np.std(per_seed_lp, ddof=1) / math.sqrt(3)
+    assert abs(r['se_seed_logppl'] - float(_se_seed)) < 1e-12, (r, _se_seed)
+    assert r['se_doc_logppl'] is not None and r['se_doc_logppl'] > 0, r
+    _comb = math.sqrt(r['se_seed_logppl'] ** 2 + r['se_doc_logppl'] ** 2)
+    assert abs(r['se_combined_logppl'] - _comb) < 1e-12, r
+    assert abs(r['component_ratio_seed_over_doc'] - r['se_seed_logppl'] / r['se_doc_logppl']) < 1e-12, r
+    lo, hi = r['ci95_ppl']
+    assert 0 < lo < hi, r
+    # The combined interval is never NARROWER than the seed-only t interval.
+    tc = L._t_critical(0.95, 2)
+    seed_only = (math.exp(_np.mean(per_seed_lp) - tc * _se_seed),
+                 math.exp(_np.mean(per_seed_lp) + tc * _se_seed))
+    assert r['ci95_ppl'][0] <= seed_only[0] + 1e-9 and r['ci95_ppl'][1] >= seed_only[1] - 1e-9, (r, seed_only)
+    # Identical documents: the doc component collapses to ~0 and the
+    # combined interval reduces to the seed component.
+    r0 = L._combined_seed_doc_ci(_recs([0.0, 0.3, 0.6], n_docs=16, ntok=50)
+                                 )
+    def _flat(seed_offsets):
+        out = []
+        for s, off in enumerate(seed_offsets):
+            nll = [1.0 + off] * 16
+            out.append({'variant': 'csa', 'seed': s, 'ppl': math.exp(sum(nll) / (16 * 50)),
+                        'nll_per_row': nll, 'n_tokens_per_row': [50] * 16})
+        return out
+    rf = L._combined_seed_doc_ci(_flat([0.0, 0.3, 0.6]))
+    assert rf['status'] == 'ok' and rf['se_doc_logppl'] is not None and rf['se_doc_logppl'] < 1e-12, rf
+    assert abs(rf['se_combined_logppl'] - rf['se_seed_logppl']) < 1e-12, rf
+    assert rf['component_ratio_seed_over_doc'] is None, rf
+    # One seed: the seed component is explicitly unverifiable, never zero.
+    r1 = L._combined_seed_doc_ci(_recs([0.0]))
+    assert r1['status'] == 'seed_component_unverifiable' and r1['se_seed_logppl'] is None and r1['se_doc_logppl'] is not None, r1
+    assert r1['ci95_ppl'] is None, r1
+    # Records without per-row NLL cannot support EITHER component.
+    r2 = L._combined_seed_doc_ci([{'variant': 'csa', 'seed': 0, 'ppl': 30.0},
+                                  {'variant': 'csa', 'seed': 1, 'ppl': 31.0}])
+    assert r2['status'] == 'unverifiable' and r2['ci95_ppl'] is None, r2
+    # A single scored document cannot carry a doc-resampling component.
+    r3 = L._combined_seed_doc_ci(_recs([0.0, 0.2], n_docs=1, ntok=50))
+    assert r3['status'] == 'doc_component_unverifiable' and r3['se_doc_logppl'] is None and r3['se_seed_logppl'] is not None, r3
+    # Zero-token (never scored) rows are dropped, not pooled as free mass.
+    r4 = L._combined_seed_doc_ci(_recs([0.0, 0.2], n_docs=8, ntok=50, zero_docs=2))
+    assert r4['status'] == 'ok' and r4['n_docs'] == 6 and r4['n_docs_dropped_zero_token'] == 2, r4
+    # The aggregate entry exposes the combined interval next to the two
+    # single-level intervals.
+    summary = {}
+    for s, off in ((0, 0.0), (1, 0.2)):
+        nll = [1.0 + off + 0.01 * j for j in range(32)]
+        summary[f'csa::seed{s}'] = {'variant': 'csa', 'seed': s, 'ppl': math.exp(sum(nll) / (32 * 50)),
+                                    'nll_sum': sum(nll), 'n_tokens': 32 * 50, 'params': 10,
+                                    'steps': 1, 'tokens_seen': 100,
+                                    'nll_per_row': nll, 'n_tokens_per_row': [50] * 32,
+                                    'train_objective': {'comp_reg_applies': True, 'delta_lr_effective': 10.0, 'boundary_policy': ['threshold']}}
+    agg = L.aggregate(summary)
+    cc = agg['csa'].get('ppl_ci_seed_doc_combined')
+    assert isinstance(cc, dict) and cc['status'] == 'ok' and cc['ci95_ppl'] is not None, cc
+
 def t_review3_holm_family_size():
     comps = {'a': {'p_exact_signflip': 0.01}, 'b': {'omitted': 'missing arm'}, 'c': {'p_exact_signflip': 0.04}}
     fam = L.attach_holm(comps)
@@ -3858,8 +3936,217 @@ def t_audit_length_missing_n_seq_flag():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def t_global_multiplicity_audit_basic():
+    # Known BH case: p=[0.01, 0.02, 0.5] at m=3 -> q=[0.03, 0.03, 0.5].
+    r = L.global_multiplicity_audit([('a', 0.01), ('b', 0.02), ('c', 0.5)])
+    assert r['m'] == 3, r
+    ent = {e['name']: e for e in r['entries']}
+    assert abs(ent['a']['q_bh'] - 0.03) < 1e-12 and abs(ent['b']['q_bh'] - 0.03) < 1e-12, r
+    assert abs(ent['c']['q_bh'] - 0.5) < 1e-12, r
+    # 0.01: Bonferroni 0.03 < 0.05 -> globally controlled.
+    assert ent['a']['global_status'] == 'globally_controlled', r
+    # 0.02: BH-rejected but Bonferroni 0.06 >= 0.05 -> fdr_only.
+    assert ent['b']['global_status'] == 'fdr_only', r
+    # 0.5: raw >= alpha.
+    assert ent['c']['global_status'] == 'not_significant', r
+    assert r['summary']['n_raw_significant'] == 2 and r['summary']['n_bh_rejected'] == 2, r
+    # Ten nominal hits out of a large displayed family: BH still rejects them
+    # (q = 0.04) but Bonferroni (0.4) does not -> fdr_only, not family-wise.
+    r = L.global_multiplicity_audit([(f'c{i}', 0.04) for i in range(10)])
+    assert all(e['global_status'] == 'fdr_only' for e in r['entries']), r
+    assert r['summary']['n_raw_significant'] == 10 and r['summary']['n_bh_rejected'] == 10, r
+    assert r['summary']['n_bonferroni_significant'] == 0, r
+    assert abs(r['entries'][0]['q_bh'] - 0.04) < 1e-12, r
+    # A single nominal hit inside a large displayed family of nulls is
+    # family_only: raw p < alpha but the cross-panel FDR view does not reject.
+    r = L.global_multiplicity_audit([(f'c{i}', (0.04 if i == 0 else 0.9)) for i in range(100)])
+    ent = {e['name']: e for e in r['entries']}
+    assert ent['c0']['global_status'] == 'family_only', ent['c0']
+    assert ent['c0']['bh_rejected'] is False and ent['c0']['q_bh'] >= 0.05, ent['c0']
+    assert all(e['global_status'] == 'not_significant' for k, e in ent.items() if k != 'c0'), r
+    assert r['summary']['n_family_only'] == 1, r
+    # Family labels ride along for display and never change the decision.
+    r = L.global_multiplicity_audit([('a', 0.01, 'P0R'), ('b', 0.02, 'P1T')])
+    assert {e['family'] for e in r['entries']} == {'P0R', 'P1T'}, r
+    r = L.global_multiplicity_audit([('a', 0.01), ('b', 0.02)], families=['P0R', 'P1T'])
+    assert {e['family'] for e in r['entries']} == {'P0R', 'P1T'}, r
+
+
+def t_global_multiplicity_audit_fail_closed():
+    # Duplicate names double-count one comparison: hard error.
+    try:
+        L.global_multiplicity_audit([('a', 0.01), ('a', 0.02)])
+    except ValueError as e:
+        assert 'duplicate' in str(e).lower(), e
+    else:
+        raise AssertionError('duplicate comparison names must be refused')
+    # Invalid alpha is refused, not defaulted.
+    for bad in (0.0, 1.0, -0.1, True, None, 'x'):
+        try:
+            L.global_multiplicity_audit([('a', 0.01)], alpha=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'alpha={bad!r} must be refused')
+    # Empty family is a legal explicit state.
+    r = L.global_multiplicity_audit([])
+    assert r['m'] == 0 and r['summary']['n_raw_significant'] == 0 and r['entries'] == [], r
+    # Missing/bool/out-of-range p keeps the slot (fail-closed family size).
+    r = L.global_multiplicity_audit([('ok', 0.02), ('none', None), ('bool', True), ('neg', -0.1), ('big', 1.7), ('nan', float('nan'))])
+    assert r['m'] == 6, r
+    assert set(r['untestable']) == {'none', 'bool', 'neg', 'big', 'nan'}, r
+    ent = {e['name']: e for e in r['entries']}
+    assert all(ent[n]['global_status'] == 'untestable' for n in ('none', 'bool', 'neg', 'big', 'nan')), r
+    # The valid entry is audited over the FULL displayed family (m=6), not
+    # over a silently shrunk one.
+    assert abs(ent['ok']['p_bonferroni'] - 0.12) < 1e-12, r
+    assert r['summary']['n_untestable'] == 5, r
+    # q is monotone in p and capped at 1 on random panels.
+    import random as _rnd
+    _rnd.seed(20261020)
+    for _trial in range(30):
+        m = _rnd.randint(1, 24)
+        named = [(f'c{i}', _rnd.choice([None, _rnd.random()])) for i in range(m)]
+        ra = L.global_multiplicity_audit(named)
+        assert ra['m'] == m, (named, ra)
+        pairs = sorted((e['p_raw'], e['q_bh']) for e in ra['entries'] if e['p_raw'] is not None)
+        for (p1, q1), (p2, q2) in zip(pairs, pairs[1:]):
+            assert p2 >= p1 and q2 >= q1 - 1e-12 and q2 <= 1.0 + 1e-12, (named, pairs)
+
+
+def _global_multiplicity_random_cases():
+    import random as _rnd
+    _rnd.seed(20261021)
+    for _trial in range(40):
+        m = _rnd.randint(1, 24)
+        yield [(f'c{i}', _rnd.choice([None, _rnd.random()])) for i in range(m)]
+
+
+def t_global_multiplicity_twin_consistency():
+    # The report builder keeps a dependency-free local twin; the two must
+    # agree exactly so the printed global table cannot drift from the library
+    # the driver-side audits use.
+    for named in _global_multiplicity_random_cases():
+        a1 = L.global_multiplicity_audit(named, alpha=0.05)
+        a2 = BR.global_multiplicity_adjust([(n, p) for n, p in named], alpha=0.05)
+        assert a1['m'] == a2['m'], (named, a1, a2)
+        by2 = {r['name']: r for r in a2['rows']}
+        for e in a1['entries']:
+            o = by2[e['name']]
+            if e['p_raw'] is None:
+                assert o['p_raw'] is None and o['global_status'] == 'untestable', (named, e, o)
+            else:
+                assert abs(e['p_raw'] - o['p_raw']) < 1e-12, (named, e, o)
+                assert abs(e['q_bh'] - o['q_bh']) < 1e-9, (named, e, o)
+                assert abs(e['p_bonferroni'] - o['p_bonferroni']) < 1e-12, (named, e, o)
+                assert e['global_status'] == o['global_status'], (named, e, o)
+        assert a1['summary']['n_raw_significant'] == a2['n_raw_significant'], (named, a1, a2)
+        assert a1['summary']['n_bh_rejected'] == a2['n_bh_rejected'], (named, a1, a2)
+        assert a1['summary']['n_bonferroni_significant'] == a2['n_bonferroni_significant'], (named, a1, a2)
+
+
+def t_build_report_global_multiplicity_section():
+    BR._reset_claim_registry()
+    try:
+        st = {'n': 6, 'mean': -1.0, 'std': 0.2, 'p_exact_signflip': 0.01, 'p_holm': 0.02}
+        ok = BR._sig_gate(st, label='P0X demo labelled contrast', family='P0X')
+        assert ok is True, st
+        st2 = {'n': 3, 'mean': -1.0, 'std': 0.2, 'p_exact_signflip': 0.25, 'p_holm': 0.5}
+        assert BR._sig_gate(st2, label='P0Y demo underpowered contrast', family='P0Y') is False
+        # An unlabeled gate decision is counted and flagged, never lost.
+        assert BR._sig_gate(st) is True
+        assert BR._UNREGISTERED_GATES == 1, BR._UNREGISTERED_GATES
+        txt = BR.sec_global_multiplicity()
+        assert 'P0X demo labelled contrast' in txt and 'P0Y demo underpowered contrast' in txt, txt
+        assert 'q_BH' in txt and 'Benjamini-Hochberg' in txt or 'BH' in txt, txt
+        assert 'P0X demo labelled contrast' in txt, txt
+        # The globally-controlled wording rule is present so prose can cite it.
+        assert '全局' in txt, txt
+        # Flag line for the unregistered decision.
+        assert '未带 label 注册' in txt, txt
+        # Duplicate labels across sections must fail closed (family size
+        # would double-count).
+        try:
+            BR._note_comparison('dup', 0.01)
+            BR._note_comparison('dup', 0.02)
+            BR.sec_global_multiplicity()
+        except ValueError as e:
+            assert 'duplicate' in str(e).lower(), e
+        else:
+            raise AssertionError('duplicate labels must be refused')
+    finally:
+        BR._reset_claim_registry()
+    # No displayed comparisons -> explicit empty note, not a silent omission.
+    txt = BR.sec_global_multiplicity()
+    assert '没有显示任何带 p 值的比较' in txt, txt
+
+
+def t_scale_corpus_binding_refuses_mixed_tokenizers():
+    # Cross-scale effects (paired log PPL ratios) are only defined inside ONE
+    # tokenisation; pooling across corpora/tokenizers is a units error, not a
+    # heterogeneity finding.  The scale machinery must refuse it from the
+    # provenance, not from the numeric pattern.
+    pts = [{'label': 'S1', 'scale': 1, 'effects': [0.1, 0.2, 0.3], 'seeds': [0, 1, 2],
+            'corpus_fp': 'fpA', 'vocab': 32768},
+           {'label': 'S2', 'scale': 2, 'effects': [0.15, 0.25, 0.35], 'seeds': [0, 1, 2],
+            'corpus_fp': 'fpA', 'vocab': 32768}]
+    m = L.meta_analyze_effects(pts)
+    assert m['status'] == 'ok', m
+    assert m['corpus_binding']['corpus_binding'] == 'shared', m
+    t = L.scaling_trend(pts)
+    assert t.get('status') != 'refused_corpus_mismatch', t
+    # Same ladder, second tier measured on a different tokenisation.
+    pts_mixed = [pts[0], dict(pts[1], corpus_fp='fpB')]
+    m = L.meta_analyze_effects(pts_mixed)
+    assert m['status'] == 'refused_corpus_mismatch' and m['poolable'] is False, m
+    assert 'tokenisation' in m['note'], m
+    assert len(m['per_point']) == 2, 'per-scale rows stay; only pooling is refused'
+    t = L.scaling_trend(pts_mixed)
+    assert t['status'] == 'refused_corpus_mismatch' and 'slope' not in t, t
+    # A vocab difference alone is enough to refuse (PPL units differ).
+    m = L.meta_analyze_effects([dict(pts[0], corpus_fp='fpA', vocab=32768),
+                                dict(pts[1], corpus_fp='fpA', vocab=8000)])
+    assert m['status'] == 'refused_corpus_mismatch', m
+    # Missing fingerprints are disclosed as unverifiable, never as shared.
+    m = L.meta_analyze_effects([{'label': 'S1', 'scale': 1, 'effects': [0.1, 0.2, 0.3], 'seeds': [0, 1, 2]},
+                                {'label': 'S2', 'scale': 2, 'effects': [0.15, 0.25, 0.35], 'seeds': [0, 1, 2]}])
+    assert m['corpus_binding']['corpus_binding'] == 'unverifiable', m
+    assert m['status'] == 'ok', 'legacy points without fingerprints stay analysable, just unattested'
+    # The ladder audit fails CLOSED on a corpus/tokenizer mismatch.
+    def _tier(name, corpus_fp=None, vocab=None):
+        cfg = {'steps': 100, 'batch_size': 4, 'seq_len': 512, 'n_train_tokens': 204800,
+               'lr': 3e-4, 'warmup': 10, 'seeds': [0, 1]}
+        if corpus_fp is not None:
+            cfg['corpus_fp'] = corpus_fp
+        if vocab is not None:
+            cfg['vocab'] = vocab
+        return {'name': name, 'cfg': cfg, 'params': 1000}
+    a = L.scale_ladder_audit([_tier('S1', 'fpA', 8000), _tier('S2', 'fpA', 8000)])
+    assert a['status'] in ('ok', 'warn') and a['corpus_binding']['corpus_fp'] == 'shared', a
+    b = L.scale_ladder_audit([_tier('S1', 'fpA', 8000), _tier('S2', 'fpB', 8000)])
+    assert b['status'] == 'fail' and any('corpus fingerprint' in x for x in b['problems']), b
+    c = L.scale_ladder_audit([_tier('S1', 'fpA', 8000), _tier('S2', 'fpA', 32000)])
+    assert c['status'] == 'fail' and any('vocab size' in x for x in c['problems']), c
+    d = L.scale_ladder_audit([_tier('S1'), _tier('S2')])
+    assert d['status'] != 'fail' and d['corpus_binding']['corpus_fp'] == 'unverifiable', d
+
+
+def t_scale_point_provenance_roundtrip():
+    # _scale_points carries the per-point corpus provenance through both
+    # input forms; the m0 analysis path builds these from record data_version.
+    pts = L._scale_points([
+        {'label': 'S1', 'scale': 1, 'effects': [0.1, 0.2], 'seeds': [0, 1],
+         'corpus_fp': 'fpA', 'vocab': 8000},
+        (2, [0.3, 0.4], [0, 1], 'fpB'),
+        {'label': 'S3', 'scale': 3, 'effects': [0.5, 0.6], 'seeds': [0, 1]},
+    ])
+    assert pts[0]['corpus_fp'] == 'fpA' and pts[0]['vocab'] == 8000, pts
+    assert pts[1]['corpus_fp'] == 'fpB' and pts[1]['vocab'] is None, pts
+    assert pts[2]['corpus_fp'] is None, pts
+
+
 def t_stats_accept_numpy_scalars():
-    # Public numeric helpers are routinely fed NumPy arrays/scalars.  An
+    # Public numeric helpers are routinely fed NumPy arrays/scalars.  An:
     # isinstance(int, float) filter would drop every np.int64 / np.float32
     # value, turning a real panel into "no data".
     d = np.array([1, 2, 3, 4], dtype=np.int64)
@@ -4278,6 +4565,13 @@ def main():
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
     _check('L12 length audit fails closed on missing n_seq', t_audit_length_missing_n_seq_flag)
+    _check('L13 global cross-panel multiplicity audit (exp_lib)', t_global_multiplicity_audit_basic)
+    _check('L13b global audit fail-closed rules', t_global_multiplicity_audit_fail_closed)
+    _check('L13c build_report twin matches exp_lib audit', t_global_multiplicity_twin_consistency)
+    _check('L13d report registers every displayed comparison', t_build_report_global_multiplicity_section)
+    _check('L14 combined seed x document uncertainty interval', t_combined_seed_doc_uncertainty)
+    _check('L15 cross-scale pooling refuses mixed corpus/tokenizer bindings', t_scale_corpus_binding_refuses_mixed_tokenizers)
+    _check('L15b scale-point corpus provenance roundtrip', t_scale_point_provenance_roundtrip)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -606,7 +606,7 @@ def sec_p0r():
                 # `_sig_gate` still applies.
                 _st_mt['p_holm'] = _st_mt.get('p_exact_signflip')
                 _mt_stat = f'配对符号翻转 n={_st_mt['n']}、p={_st_mt['p_exact_signflip']:.3f}（Δ mean={_st_mt['mean']:+.2f}）'
-                _mt_sig = _sig_gate(_st_mt)
+                _mt_sig = _sig_gate(_st_mt, label='P0R csa_fixed vs full_matched (param-matched absPE)', family='P0R')
                 _mt_gap = _st_mt['mean']
             else:
                 _mt_stat = '本面板没有可通过配对门禁的同配置种子对，显著性无法检验'
@@ -736,7 +736,7 @@ def sec_p0w():
             _d = _st['mean']
             _floor = 2.0 / (1 << _st['n']) if _st['n'] and _st['n'] <= 20 else 1.0 / 200001.0
             _same_dir = all((x != 0 and (x > 0) == (_d > 0) for x in _dd))
-            _gate_ok = _sig_gate(_st)
+            _gate_ok = _sig_gate(_st, label=f'P0W csa_fixed warm={w} vs warm=0', family='P0W')
             if not _gate_ok:
                 _verdict = f'n={_st['n']} 时 p={_st['p_exact_signflip']:.4f}（检验下限 {_floor:.3f}），**不构成显著/未过族校正**，' + ('各 seed 方向一致，仅作方向性读数' if _same_dir else '方向不一致')
             else:
@@ -1079,7 +1079,7 @@ def sec_p1t():
         _pair = paired_row(_recs.get('csa_fixed_topk8', {}), _recs.get('csa_fixed_topk32', {}))
         if _pair is not None:
             _kept, _dl, _st = _pair
-            _sig_txt = '显示该差距**达到 p≤0.05 且通过族校正/噪声门槛**，按显著性读法处理。' if _sig_gate(_st) else '显示该差距未通过「n≥6 + 原始 p<0.05 + Holm + 效应大于 seed 噪声」门槛，**不构成显著性主张**，只作方向性参考。'
+            _sig_txt = '显示该差距**达到 p≤0.05 且通过族校正/噪声门槛**，按显著性读法处理。' if _sig_gate(_st, label='P1T csa_fixed_topk8 vs topk32 (seq2048)', family='P1T') else '显示该差距未通过「n≥6 + 原始 p<0.05 + Holm + 效应大于 seed 噪声」门槛，**不构成显著性主张**，只作方向性参考。'
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；配对的精确符号翻转检验（n={_st['n']}，p={_st['p_exact_signflip']:.3f}，Δ(topk8−topk32) mean={_st['mean']:+.2f} PPL）{_sig_txt}')
         else:
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；面板上没有可通过 pairing 门禁的同配置种子对，topk8 与 topk32 之差（{_gap:.2f} PPL）无法配对检验，只作方向性参考。')
@@ -1322,7 +1322,7 @@ def sec_p2s():
             _which = '`csa_fixed − full_matched`（参数对齐）' if _mt else '`csa_fixed − full`（未做容量匹配）'
             _tag = unmatched_tag(_agg_entry(_agg, _ba), _agg_entry(_agg, _bb)) if _mt else unmatched_tag(_agg_entry(_agg, 'csa_fixed'), _agg_entry(_agg, 'full'))
             if st['mean'] > 0:
-                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + ('该差距通过 n≥6 + Holm + 效应>噪声门槛，方向为 sparse 更差。' if _sig_gate(st) else '该差距**未通过** n≥6 + Holm + 效应>噪声门槛，只能作方向性读数，不能写成「已经反转」。') + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。' + (f'{_tag}' if _tag else '✓')
+                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + ('该差距通过 n≥6 + Holm + 效应>噪声门槛，方向为 sparse 更差。' if _sig_gate(st, label=f'P2S scale {_which}', family='P2S') else '该差距**未通过** n≥6 + Holm + 效应>噪声门槛，只能作方向性读数，不能写成「已经反转」。') + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。' + (f'{_tag}' if _tag else '✓')
             else:
                 concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：该规模下 sparse 仍领先，早期优势未随规模消失。{_tag or '✓'}'
             lines += ['', f'**结论**：{concl}', '']
@@ -1362,7 +1362,7 @@ def sec_flops():
         lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。**按该解析口径**（仅注意力项，不是实测延迟/吞吐/显存），CSA/dense 比随长度下降（{_trend}）；这不等于真实 GPU 加速，实际收益须由 checkpoint 上的测量确认。', '']
     return '\n'.join(lines) + '\n'
 
-def _sig_gate(st, alpha=0.05, min_n=6):
+def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
     """Conservative significance gate for report prose.
 
     Requires n>=6 (the exact sign-flip floor at n<6 is >alpha, so no n<6 panel
@@ -1370,9 +1370,21 @@ def _sig_gate(st, alpha=0.05, min_n=6):
     and |mean|>std (effect bigger than seed noise).  A missing Holm value is
     treated as NOT corrected — the report may say "nominal" but never
     "significant" until a family correction has actually been attached.
-    """
+
+    `label` (with optional `family`) registers the decision in the report's
+    cross-panel multiplicity audit (`sec_global_multiplicity`): every
+    significance decision the report makes must be counted there, because a
+    claim that survives its own family can still be one of many contrasts the
+    report displays.  An unlabeled call is counted and flagged, never lost."""
     if not isinstance(st, dict):
         return False
+    global _GATE_CALLS, _UNREGISTERED_GATES
+    _GATE_CALLS += 1
+    if label is None:
+        _UNREGISTERED_GATES += 1
+    else:
+        _note_comparison(label, st.get('p_exact_signflip'), family,
+                         st.get('p_holm'), st.get('n'), st.get('mean'))
     n = st.get('n') or 0
     p = st.get('p_exact_signflip')
     ph = st.get('p_holm')
@@ -1389,6 +1401,150 @@ def _sig_gate(st, alpha=0.05, min_n=6):
     except (TypeError, ValueError, OverflowError):
         return False
     return True
+
+# Every comparison whose p-value this report DISPLAYS, or whose significance
+# the prose asserts via `_sig_gate`, is registered here so the cross-panel
+# multiplicity audit (sec_global_multiplicity) counts it.  A report that shows
+# twenty contrasts and corrects inside each panel still selected on twenty —
+# the global view is what a cross-panel quote has to survive.
+_REPORTED_COMPARISONS = []
+_GATE_CALLS = 0
+_UNREGISTERED_GATES = 0
+
+
+def _reset_claim_registry():
+    global _REPORTED_COMPARISONS, _GATE_CALLS, _UNREGISTERED_GATES
+    _REPORTED_COMPARISONS = []
+    _GATE_CALLS = 0
+    _UNREGISTERED_GATES = 0
+
+
+def _note_comparison(label, p, family=None, p_holm=None, n=None, mean=None):
+    _REPORTED_COMPARISONS.append(
+        {'label': str(label), 'p': p, 'family': (str(family) if family else None),
+         'p_holm': p_holm, 'n': n, 'mean': mean})
+
+
+def global_multiplicity_adjust(named_pvals, alpha=0.05):
+    """Local twin of exp_lib.global_multiplicity_audit (this builder
+    intentionally does not import torch/exp_lib; test_review_fixes cross-checks
+    the two implementations against each other so they cannot drift).
+
+    Benjamini-Hochberg step-up q-values + Bonferroni over ALL displayed
+    comparisons.  Invalid/missing p keeps a p=1 slot (fail-closed family size,
+    same convention as holm_adjust).  Duplicate names are a hard error."""
+    if isinstance(alpha, bool):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    try:
+        a = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    if not (0.0 < a < 1.0):
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
+    seen = set()
+    rows = []
+    for i, item in enumerate(named_pvals if named_pvals is not None else []):
+        if not isinstance(item, (tuple, list)) or not 2 <= len(item) <= 3:
+            raise ValueError(f'global_multiplicity_adjust: entry #{i} must be (name, p) or (name, p, family), got {item!r}')
+        name = str(item[0])
+        if name in seen:
+            raise ValueError(f'global_multiplicity_adjust: duplicate comparison name {name!r}')
+        seen.add(name)
+        p = item[1]
+        valid = False
+        if p is not None and not isinstance(p, bool):
+            try:
+                pf = float(p)
+                valid = math.isfinite(pf) and 0.0 <= pf <= 1.0
+            except (TypeError, ValueError, OverflowError):
+                valid = False
+        fam = item[2] if len(item) == 3 else None
+        rows.append({'name': name, 'p_raw': (pf if valid else None),
+                     'p_slot': (pf if valid else 1.0),
+                     'family': (str(fam) if fam is not None else None)})
+    m = len(rows)
+    if m == 0:
+        return {'m': 0, 'alpha': a, 'rows': [],
+                'n_raw_significant': 0, 'n_bh_rejected': 0,
+                'n_bonferroni_significant': 0, 'n_untestable': 0}
+    ps = sorted(range(m), key=lambda i: rows[i]['p_slot'])
+    q_by_rank = []
+    prev = float('inf')
+    for rank in range(m, 0, -1):
+        qi = rows[ps[rank - 1]]['p_slot'] * m / rank
+        prev = min(prev, qi, 1.0)
+        q_by_rank.append(prev)
+    q_by_rank.reverse()
+    for idx_in_sorted, row_i in enumerate(ps):
+        rows[row_i]['q_bh'] = q_by_rank[idx_in_sorted]
+        rows[row_i]['p_bonferroni'] = min(1.0, rows[row_i]['p_slot'] * m)
+        p_slot = rows[row_i]['p_slot']
+        rows[row_i]['bh_rejected'] = bool(rows[row_i]['q_bh'] <= a + 1e-15 and rows[row_i]['p_raw'] is not None)
+    n_raw = n_bh = n_bonf = n_untest = 0
+    for r in rows:
+        if r['p_raw'] is None:
+            n_untest += 1
+            r['global_status'] = 'untestable'
+        elif r['p_raw'] >= a:
+            r['global_status'] = 'not_significant'
+        elif r['bh_rejected'] and r['p_bonferroni'] < a:
+            r['global_status'] = 'globally_controlled'
+        elif r['bh_rejected']:
+            r['global_status'] = 'fdr_only'
+        else:
+            r['global_status'] = 'family_only'
+        if r['p_raw'] is not None and r['p_raw'] < a:
+            n_raw += 1
+        if r['bh_rejected']:
+            n_bh += 1
+        if r['p_raw'] is not None and r['p_bonferroni'] < a:
+            n_bonf += 1
+    return {'m': m, 'alpha': a, 'rows': rows, 'n_raw_significant': n_raw,
+            'n_bh_rejected': n_bh, 'n_bonferroni_significant': n_bonf,
+            'n_untestable': n_untest}
+
+
+def sec_global_multiplicity():
+    """Cross-panel multiplicity section: what the report's displayed contrasts
+    look like AFTER all of them are counted (BH-FDR + Bonferroni).
+
+    Within-family Holm (sec_stats) corrects inside one panel.  A report that
+    displays contrasts from several panels and then quotes the significant ones
+    has selected over the union, so the union is what a cross-panel quote must
+    survive.  This section does not delete any number; it fixes the allowed
+    wording for each one."""
+    if not _REPORTED_COMPARISONS and _GATE_CALLS == 0:
+        return '## 跨面板多重性（全局 FDR / Bonferroni）\n\n> 本报告没有显示任何带 p 值的比较或做任何显著性判定，本节为空。\n\n'
+    lines = ['## 跨面板多重性（全局 FDR / Bonferroni）', '',
+             '族内 Holm 只控制**单个面板内**的错误率；本报告把多个面板的比较并排放示，跨面板引用（“在 v7 与 v10 都显著”）实际是对**展示并集**的选择。下表把本报告实际显示/判定的每一个对比放进全局视图：Benjamini-Hochberg FDR q 值与 Bonferroni p×m。它不删任何数字，只约束措辞：', '',
+             '| 比较 | 面板 | p | 族内 p_Holm | q_BH | p_Bonferroni | 全局判定 |', '|---|---|---|---|---|---|---|']
+    named = [(r['label'], r['p'], r['family']) for r in _REPORTED_COMPARISONS]
+    holm_by_label = {}
+    for r in _REPORTED_COMPARISONS:
+        if r.get('p_holm') is not None:
+            holm_by_label[r['label']] = r['p_holm']
+    aud = global_multiplicity_adjust(named, alpha=0.05)
+    by_name = {r['name']: r for r in aud['rows']}
+    for r in _REPORTED_COMPARISONS:
+        a = by_name.get(r['label']) or {}
+        _status_txt = {'globally_controlled': '全局可控（可跨面板引用）',
+                       'fdr_only': '仅 FDR 可控（不得写族-wise 确定）',
+                       'family_only': '仅族内（不得写“显著”而不加“未全局校正”）',
+                       'not_significant': '不显著',
+                       'untestable': '不可检验（无有效 p）'}.get(a.get('global_status'), a.get('global_status'))
+        lines.append('| %s | %s | %s | %s | %s | %s | %s |' % (
+            r['label'], (r['family'] or '—'), fm(r['p'], 4),
+            fm(holm_by_label.get(r['label']), 4), fm(a.get('q_bh'), 4),
+            fm(a.get('p_bonferroni'), 4), _status_txt))
+    lines += ['', f'共 {aud["m"]} 个展示比较：原始 p<0.05 的 {aud["n_raw_significant"]} 个；BH-FDR q<0.05 的 {aud["n_bh_rejected"]} 个；Bonferroni p<0.05 的 {aud["n_bonferroni_significant"]} 个；无有效 p 的 {aud["n_untestable"]} 个（计入族大小，p 槽位=1）。', '']
+    if aud['n_bh_rejected'] < aud['n_raw_significant']:
+        lines.append('> **读法限制**：存在原始 p<0.05 但全局 BH 不拒绝的比较——跨面板引用它们时必须写成「族内显著、未通过全局校正」，不得写成多个独立发现。')
+    if _UNREGISTERED_GATES:
+        lines.append(f'> ⚠ 有 {_UNREGISTERED_GATES} 个 `_sig_gate` 判定未带 label 注册（本节族大小可能偏小）——这是报告构建的缺陷，应修复，而不是忽略。')
+    lines.append('> 本节是**探索性展示的纪律层**，不是确认性证据：全局校正不把任何探索面板变成预注册结果（见 docs/design_notes.md §17/§20）。')
+    lines.append('')
+    return '\n'.join(lines) + '\n'
+
 
 def holm_adjust(named_pvals, alpha=0.05):
     """Holm step-down over the report's displayed family (local copy: this
@@ -1528,6 +1684,12 @@ def sec_stats():
         # shrink its own correction family by dropping a failed comparison.
         _pairs.append((k, _pv if (_pv is not None and math.isfinite(_pv) and 0.0 <= _pv <= 1.0) else 1.0))
     _holm = holm_adjust(_pairs, alpha=0.05) if _pairs else {}
+    # The displayed family is itself part of the report's global selection:
+    # register every displayed comparison (invalid/omitted ones included) so
+    # the cross-panel audit counts them with a p=1 slot, never drops them.
+    for _k, _pv in _pairs:
+        _note_comparison(f'STATS {_k}', _pv, family='v7 displayed comparisons',
+                         p_holm=_holm.get(_k))
     for k, v in items.items():
         if not isinstance(v, dict):
             continue
@@ -1554,7 +1716,8 @@ def main(argv=None):
         raise SystemExit(f'build_report: unknown argument {a!r} (this builder takes none; try -h)')
     parts = [sec_header(), '---\n']
     failed = []
-    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_efficiency, sec_stats):
+    _reset_claim_registry()
+    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_efficiency, sec_stats, sec_global_multiplicity):
         try:
             parts.append(sec())
         except Exception as e:

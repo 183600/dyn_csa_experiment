@@ -152,7 +152,7 @@ def run_params(outdir='results_m0_params'):
     _budget_tiers = []
     for _name, _run in (('S1', L.RUN_S1), ('S2', L.RUN_S2)):
         _p = next((t['params'] for t in tiers if t['tier'] == _name), None)
-        _budget_tiers.append({'name': _name, 'cfg': _run, 'params': _p})
+        _budget_tiers.append({'name': _name, 'cfg': dict(_run, vocab=_run.get('vocab_size')), 'params': _p})
     _budget = L.scale_ladder_audit(_budget_tiers)
     print(f"\n[params] scale-transfer audit: {_budget['status']}  "
           f"budget_matched={_budget.get('budget_matched')}  "
@@ -587,6 +587,28 @@ def _ppl_by_seed(summary, variant):
     return out
 
 
+def _panel_corpus_fp(summary, variant=None):
+    """Corpus/tokenizer identity of one (panel, arm): the records' composite
+    `data_version` (dataset + tokenizer fit + train/val fingerprints + vocab).
+    Mixed values inside one panel are an error (aggregate refuses the same
+    panel for pooling); the cross-scale audit needs the fingerprint to refuse
+    log-ratio pooling across different tokenisations."""
+    fps = set()
+    for rec in summary.values():
+        if not isinstance(rec, dict):
+            continue
+        if variant is not None and rec.get('variant') != variant:
+            continue
+        fp = rec.get('data_version')
+        if fp is None and isinstance(rec.get('provenance'), dict):
+            fp = ((rec['provenance'].get('data') or {}).get('data_version'))
+        if fp not in (None, ''):
+            fps.add(str(fp))
+    if len(fps) > 1:
+        raise ValueError(f'{variant or "panel"}: records carry {len(fps)} different data_version fingerprints {sorted(fps)}')
+    return (sorted(fps)[0] if fps else None)
+
+
 def _flatten_contrasts(audit):
     rows = []
     for family in ('components', 'baselines'):
@@ -689,9 +711,15 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
                 continue
             lr = L.paired_log_ratio([pa[s] for s in common], [pb[s] for s in common], seeds=common)
             raw[label] = lr
+            try:
+                _cfp = _panel_corpus_fp(summary, a)
+            except ValueError as e:
+                print(f'[m0-analysis] {name}/{label}: {e}')
+                continue
             _e = (report['panels'].get(label) or {}).get('arms', {}).get(a) or {}
             points.append({'label': label, 'scale': _e.get('params'),
-                           'effects': lr['effects'], 'seeds': lr['seeds']})
+                           'effects': lr['effects'], 'seeds': lr['seeds'],
+                           'corpus_fp': _cfp})
         if len(points) < 2:
             if points:
                 report['cross_scale'][name] = {'status': 'single_scale_only', 'per_scale': raw}
@@ -720,10 +748,21 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
         _arms = _pan.get('arms') or {}
         _pick = _arms.get('csa_dynamic') or (next(iter(_arms.values())) if _arms else {})
         _params = _pick.get('params')
-        _budget_tiers.append({'name': _label, 'cfg': _cfg, 'params': _params})
+        # Bind the tier to the corpus/tokenizer identity its records attest
+        # (data_version), so the ladder audit can refuse a cross-tier
+        # comparison that silently mixed tokenisations.
+        try:
+            _cfp = _panel_corpus_fp(summaries.get(_label) or {})
+        except ValueError as e:
+            print(f'[m0-analysis] {_label}: {e}')
+            _cfp = None
+        _budget_tiers.append({'name': _label, 'cfg': dict(_cfg, corpus_fp=_cfp),
+                              'params': _params})
     report['scale_ladder_audit'] = L.scale_ladder_audit(_budget_tiers)
     for _w in report['scale_ladder_audit'].get('warnings') or []:
         print(f'[m0-analysis] WARNING: {_w}')
+    for _p in report['scale_ladder_audit'].get('problems') or []:
+        print(f'[m0-analysis] PROBLEM: {_p}')
     os.makedirs(outdir, exist_ok=True)
     L.stamped_analysis('m0_scale_analysis', report, outdir=outdir, name='scale_analysis.json')
     print(f'[m0-analysis] wrote {outdir}/scale_analysis.json')
