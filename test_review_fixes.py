@@ -5255,6 +5255,42 @@ def t_audit_split_warning_status():
         assert out['caches'][os.path.abspath(d)]['status'] == 'warnings', out['caches']
 
 
+def t_audit_split_preferred_seq_len():
+    # A cache directory can hold several protocol variants.  Naming the train
+    # sequence length must restrict the audit to that stream instead of
+    # silently certifying/failing a probe cache the panel never used.
+    with tempfile.TemporaryDirectory() as d:
+        for tag, sl in (('s4', 4), ('s8', 8)):
+            np.save(os.path.join(d, f'train_ids_{tag}.npy'),
+                    np.arange(40, dtype=np.int64))
+            np.save(os.path.join(d, f'val_batch_{tag}.npy'),
+                    (np.arange(16, dtype=np.int64) + 40).reshape(2, 8))
+            with open(os.path.join(d, f'meta_{tag}.json'), 'w',
+                      encoding='utf-8') as f:
+                json.dump({'vocab': 80, 'seq_len': sl,
+                           'split_strategy': 'ordered',
+                           'shuffle_at_split': False,
+                           'tokenizer_fit_split': 'train'}, f)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1,
+                                       preferred_train_seq_len=8)
+        assert set(out['caches'][os.path.abspath(d)]['corpora']) == {'s8'}, out
+        out4 = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1,
+                                        preferred_train_seq_len=4)
+        assert set(out4['caches'][os.path.abspath(d)]['corpora']) == {'s4'}, out4
+        missing = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1,
+                                           preferred_train_seq_len=512)
+        assert missing['status'] == 'not_verifiable_locally', missing
+        for bad in (0, -1, True, '8'):
+            try:
+                A.audit_split_discipline(cache_dirs=[d],
+                                         preferred_train_seq_len=bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    f'preferred_train_seq_len={bad!r} must be refused')
+
+
 def t_audit_split_test_metadata_discipline():
     with tempfile.TemporaryDirectory() as d:
         tag = 'tiny'
@@ -8529,6 +8565,7 @@ def main():
     _check('I12 object-time NaN + zero-feature data guards', t_object_time_and_zero_feature_guards)
     _check('I13 split audit marks per-cache warnings', t_audit_split_warning_status)
     _check('I13b split audit checks test metadata discipline', t_audit_split_test_metadata_discipline)
+    _check('I13c split audit can target the panel train seq_len', t_audit_split_preferred_seq_len)
     _check('I14 corpus audit counts overlapping validation rows once', t_corpus_audit_overlap_is_unique_across_windows)
     _check('I15 length audit refuses a missing eval span', t_audit_length_requires_eval_span)
     _check('I16 fairness audit ignores a NaN seed instead of crashing', t_audit_fairness_nan_seed_does_not_crash)

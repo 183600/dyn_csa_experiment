@@ -1080,7 +1080,8 @@ def run_finaltest(cfg=None, guard=None):
         # the audit output but do not by themselves invalidate the frozen
         # panel; a hard failure or an unverifiable cache does.
         try:
-            _sd = _AG.audit_split_discipline(cache_dirs=[_cache_dir])
+            _sd = _AG.audit_split_discipline(cache_dirs=[_cache_dir],
+                                             preferred_train_seq_len=_pref_sl)
         except Exception as _sde:
             raise SystemExit(f'[v12] REFUSE: the split-discipline audit could not run ({type(_sde).__name__}: {_sde}) — a confirmation claim requires a verifiable split audit, not an untested one')
         if _sd.get('status') == 'not_verifiable_locally':

@@ -702,7 +702,8 @@ def _row_overlap_count(train, rows, chunk_tokens=1 << 20):
 
 
 def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
-                           js_fail=0.25, min_shift_tokens=5000):
+                           js_fail=0.25, min_shift_tokens=5000,
+                           preferred_train_seq_len=None):
     """Audit the *split contract* for every cached corpus on disk.
 
     Unlike ``audit_leakage`` (tokenizer provenance and document overlap), this
@@ -721,7 +722,16 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
      Exact duplicate rows across splits are a hard failure.  Distribution or
     legacy-metadata issues are warnings because they need a scientific
     judgement, not an automatic rebuild.
+
+    ``preferred_train_seq_len`` restricts the audit to the train cache that
+    actually served a panel when a directory holds several protocol variants
+    (e.g. a 512-token training cache and a 4097-token probe cache).  A caller
+    that names the training length must not be silently audited against a
+    different stream.
     """
+    if preferred_train_seq_len is not None:
+        preferred_train_seq_len = _audit_positive_int(
+            'preferred_train_seq_len', preferred_train_seq_len)
     js_warn = _audit_nonneg_float('js_warn', js_warn)
     js_fail = _audit_nonneg_float('js_fail', js_fail)
     if js_warn > js_fail:
@@ -759,6 +769,13 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             meta = _load(mp)
             if not isinstance(meta, dict):
                 continue
+            if preferred_train_seq_len is not None:
+                try:
+                    _meta_sl = int(meta.get('seq_len'))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if _meta_sl != int(preferred_train_seq_len):
+                    continue
             tag = os.path.basename(mp)[len('meta_'):-len('.json')]
             trp = os.path.join(cd, f'train_ids_{tag}.npy')
             vap = os.path.join(cd, f'val_batch_{tag}.npy')
