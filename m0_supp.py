@@ -670,16 +670,21 @@ def _extreme_scale_labels(points):
     Choosing by label (`sorted(raw)[0], sorted(raw)[-1]`) breaks as soon as a
     ladder has more than nine tiers: lexicographic order puts `S10` before
     `S2`, so the "extreme" interaction would compare the wrong two scales.
-    Order by the declared scale (parameters) instead.
+    Order by the declared scale (parameters) instead.  Numeric NumPy scalars
+    and integer JSON values are accepted; booleans/non-finite scales are not.
     """
-    usable = [p for p in (points or []) if p.get('label') is not None
-              and isinstance(p.get('scale'), (int, float))
-              and not isinstance(p.get('scale'), bool)
-              and math.isfinite(float(p['scale']))]
+    usable = []
+    for p in (points or []):
+        if p.get('label') is None:
+            continue
+        sc = L._finite_scalar(p.get('scale'))
+        if sc is None:
+            continue
+        usable.append((sc, p))
     if len(usable) < 2:
         return None
-    order = sorted(usable, key=lambda p: (float(p['scale']), str(p['label'])))
-    return str(order[0]['label']), str(order[-1]['label'])
+    order = sorted(usable, key=lambda item: (item[0], str(item[1]['label'])))
+    return str(order[0][1]['label']), str(order[-1][1]['label'])
 
 
 def _flatten_contrasts(audit):

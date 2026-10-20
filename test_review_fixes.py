@@ -7700,6 +7700,10 @@ def t_m0_cross_scale_pairs_are_control_gated():
     pts = [{'label': 'S10', 'scale': 1000.0}, {'label': 'S2', 'scale': 10.0},
            {'label': 'S1', 'scale': 1.0}]
     assert M0._extreme_scale_labels(pts) == ('S1', 'S10')
+    # NumPy numeric scalars are valid declared scales too.
+    assert M0._extreme_scale_labels([{'label': 'S10', 'scale': np.int64(1000)},
+                                     {'label': 'S2', 'scale': np.float32(10)},
+                                     {'label': 'S1', 'scale': 1}]) == ('S1', 'S10')
     assert M0._extreme_scale_labels([{'label': 'S9', 'scale': float('nan')},
                                      {'label': 'S1', 'scale': 1.0}]) is None
 
