@@ -4582,6 +4582,12 @@ def t_global_multiplicity_twin_consistency():
         assert a1['summary']['n_raw_significant'] == a2['n_raw_significant'], (named, a1, a2)
         assert a1['summary']['n_bh_rejected'] == a2['n_bh_rejected'], (named, a1, a2)
         assert a1['summary']['n_bonferroni_significant'] == a2['n_bonferroni_significant'], (named, a1, a2)
+    # NumPy booleans are flags too; the local twin must not turn them into 0/1.
+    for _p in (np.bool_(True), np.bool_(False)):
+        a1 = L.global_multiplicity_audit([('b', _p)])
+        a2 = BR.global_multiplicity_adjust([('b', _p)])
+        assert a1['entries'][0]['p_raw'] is None, a1
+        assert a2['rows'][0]['p_raw'] is None, a2
 
 
 def t_build_report_global_multiplicity_section():

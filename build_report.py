@@ -1458,7 +1458,7 @@ def global_multiplicity_adjust(named_pvals, alpha=0.05):
         seen.add(name)
         p = item[1]
         valid = False
-        if p is not None and not isinstance(p, bool):
+        if p is not None and not isinstance(p, (bool, np.bool_)):
             try:
                 pf = float(p)
                 valid = math.isfinite(pf) and 0.0 <= pf <= 1.0
