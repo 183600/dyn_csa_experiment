@@ -532,7 +532,8 @@ def _controlled_reason(a, b):
         return f"parameter count differs ({pa!r} != {pb!r})"
     if a.get('run_fingerprint') != b.get('run_fingerprint'):
         return 'run_fingerprint differs (recipe/backend/matrix changed)'
-    for k in ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp', 'rng_fp'):
+    for k in ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp', 'rng_fp',
+              'holdout_row_fp'):
         va, vb = a.get(k), b.get(k)
         _ha = va is not None and str(va) != ''
         _hb = vb is not None and str(vb) != ''

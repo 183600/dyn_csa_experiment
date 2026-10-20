@@ -546,6 +546,15 @@ def t_open_analysis_control_gate():
     assert 'train_objective differs' in OB._controlled_reason(
         a, _rec('closed', train_objective=dict(obj, comp_lambda_effective=0.0)))
     assert 'unverifiable' in OB._controlled_reason(a, _rec('closed'))
+    # A nested held-out row fold is part of the evaluation sample, not just
+    # the compact hyperparameter copy.
+    a = _rec('summary', holdout_row_fp='h1')
+    b = _rec('closed', holdout_row_fp='h1')
+    assert OB._controlled_reason(a, b) is None
+    assert 'holdout_row_fp differs' in OB._controlled_reason(
+        a, _rec('closed', holdout_row_fp='h2'))
+    assert 'holdout_row_fp is unverifiable' in OB._controlled_reason(
+        _rec('summary'), b)
     # Same seed number is not a matched initialisation.
     a = _rec('summary', init_core_fp='abc')
     b = _rec('closed', init_core_fp='abc')
