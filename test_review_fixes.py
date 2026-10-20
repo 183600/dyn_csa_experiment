@@ -4624,6 +4624,13 @@ def t_exact_numeric_contracts_and_fingerprint():
                                      'train_tokens': 1}])['status'] == 'insufficient_points'
     assert math.isnan(L._scale_points([{'scale': True, 'effects': [1],
                                         'seeds': [0]}])[0]['scale'])
+    # Decimal is a real numeric scalar even though it is not numbers.Real;
+    # NaN/Infinity and complex values are still not measurements.
+    assert L._finite_scalar(Decimal('1.5')) == 1.5
+    assert L._finite_scalar(Decimal('2')) == 2.0
+    assert L._finite_scalar(Decimal('NaN')) is None
+    assert L._finite_scalar(1 + 2j) is None
+    assert BR._as_finite(Decimal('2.5')) == 2.5
 
 
 def t_batch_iter_minimal_corpus():

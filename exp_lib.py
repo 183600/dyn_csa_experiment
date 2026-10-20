@@ -445,7 +445,9 @@ def _finite_scalar(v):
     those and turn a valid panel into "no data".  Booleans and
     complex/non-numeric objects are not measurements.
     """
-    if isinstance(v, (bool, np.bool_)) or not isinstance(v, numbers.Real):
+    if (isinstance(v, (bool, np.bool_))
+            or isinstance(v, (complex, np.complexfloating))
+            or not isinstance(v, numbers.Number)):
         return None
     try:
         f = float(v)

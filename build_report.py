@@ -30,7 +30,9 @@ def _as_finite(v):
     ``np.int64``/``np.float32`` values, which could turn a non-empty panel into
     "no data" or make the local exact test disagree with ``exp_lib``.
     """
-    if isinstance(v, (bool, np.bool_)) or not isinstance(v, numbers.Real):
+    if (isinstance(v, (bool, np.bool_))
+            or isinstance(v, (complex, np.complexfloating))
+            or not isinstance(v, numbers.Number)):
         return None
     try:
         f = float(v)
