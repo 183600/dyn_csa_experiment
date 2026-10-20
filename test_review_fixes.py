@@ -4914,6 +4914,24 @@ def t_known_labels_audit():
         raise AssertionError('known_labels without y must fail closed')
 
 
+def t_par_watchdog_override_validation():
+    import par
+    ctx = {'workers': 1, 'slots': [''], 'on_cuda': False}
+    assert par._job_watchdog_seconds({'kind': 'x', 'watchdog_seconds': 42}, ctx) == 42.0
+    assert par._job_watchdog_seconds({'kind': 'x'}, {'watchdog_seconds': 7}) == 7.0
+    assert par._job_watchdog_seconds({'kind': 'x', 'watchdog_seconds': 0}, ctx) == 12.0 * 3600.0
+    for bad in (-1, 0.5 and -0.5, float('nan'), float('inf'), 'not-a-number'):
+        try:
+            par._job_watchdog_seconds({'kind': 'x', 'watchdog_seconds': bad}, ctx)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'watchdog_seconds={bad!r} must be rejected')
+    # NumPy scalars are normal numeric payloads, not strings.
+    assert par._norm({'seed': np.int64(3)}) == {'seed': 3}
+    assert par._norm(np.array([[1, 2]], dtype=np.int64)) == [[1, 2]]
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -5122,6 +5140,7 @@ def main():
     _check('L19 batch_iter minimal corpus', t_batch_iter_minimal_corpus)
     _check('L20 indexer invalid soft lanes are zero', t_indexer_invalid_soft_lanes_are_zero)
     _check('L21 attention backward partial head group', t_attention_backward_partial_head_group)
+    _check('L22 parallel watchdog override validation', t_par_watchdog_override_validation)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

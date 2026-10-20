@@ -18,6 +18,7 @@ lifecycle, logs, and child result files.
 import collections
 import importlib
 import json
+import math
 import os
 import re
 import signal
@@ -335,9 +336,25 @@ def _job_watchdog_seconds(job, ctx):
     IO stall): without it one stuck child blocks the phase forever, until
     the driver's scheduled shutdown kills the whole instance mid-cell.
     """
-    v = job.get("watchdog_seconds") or ctx.get("watchdog_seconds")
-    if v:
-        return float(v)
+    v = job.get("watchdog_seconds")
+    if v is None:
+        v = ctx.get("watchdog_seconds")
+    # Zero/None means "derive from the estimate" (historical behaviour).
+    # A negative, NaN or non-numeric override cannot bound a live child and
+    # must be rejected instead of silently disabling the watchdog (NaN) or
+    # killing every cell immediately (negative).
+    if v is not None and v != 0:
+        try:
+            fv = float(v)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f"watchdog_seconds must be a positive finite number, got {v!r}"
+            ) from None
+        if not math.isfinite(fv) or fv <= 0.0:
+            raise ValueError(
+                f"watchdog_seconds must be a positive finite number, got {v!r}"
+            )
+        return fv
     try:
         import exp_lib as _L
         cap = job.get("guard_cap")
@@ -361,7 +378,8 @@ def _job_watchdog_seconds(job, ctx):
             )
         else:
             return 12.0 * 3600.0
-        return max(3.0 * float(est), float(est) + 3600.0)
+        _bound = max(3.0 * float(est), float(est) + 3600.0)
+        return _bound if math.isfinite(_bound) and _bound > 0.0 else 12.0 * 3600.0
     except Exception:
         return 12.0 * 3600.0
 
