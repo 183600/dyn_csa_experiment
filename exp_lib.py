@@ -3593,6 +3593,11 @@ def lightning_indexer_open(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
     idx = torch.empty((n, topk), dtype=torch.int32, device=dev)
     soft = None
     _valid_parts = []
+    if n == 0:
+        sel_valid = torch.zeros((0, topk), dtype=torch.bool, device=dev)
+        if need_soft:
+            soft = torch.zeros((0, topk), dtype=H.dtype, device=dev)
+        return idx, sel_valid, soft
     _pos = _arange_cache(n, dev)
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
@@ -3631,10 +3636,14 @@ def lightning_indexer_open(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
             if soft is None:
                 soft = torch.empty((n, topk), dtype=scores.dtype, device=dev)
             masked = torch.where(valid, scores, torch.full((), float('-inf'), dtype=scores.dtype, device=dev))
-            lse = torch.logsumexp(masked, dim=-1, keepdim=True)
-            g = masked.gather(1, _ic.long()).sub_(lse).exp_()
-            g = torch.where(_box[0], g, torch.zeros((), dtype=g.dtype, device=dev))
-            soft[s:e] = _safe_nan_to_num(g, where='indexer_softmax_open')
+            if scores.shape[1] > 0:
+                lse = torch.logsumexp(masked, dim=-1, keepdim=True)
+                g = masked.gather(1, _ic.long()).sub_(lse).exp_()
+                g = torch.where(_box[0], g, torch.zeros((), dtype=g.dtype, device=dev))
+                g = _safe_nan_to_num(g, where='indexer_softmax_open')
+            else:
+                g = torch.zeros_like(_ic, dtype=scores.dtype)
+            soft[s:e] = g
         del scores, valid, c, raw
     sel_valid = _valid_parts[0] if len(_valid_parts) == 1 else torch.cat(_valid_parts, 0)
     if topk <= 0:
@@ -4041,9 +4050,13 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
         ids = topk_idx[s:e].long()
         valid = sel_valid[s:e]
         is_pref = ids >= B
-        _safe_ids = ids.clamp(0, B - 1)
-        kb = k_blk[_safe_ids]
-        vb = v_blk[_safe_ids]
+        if B > 0:
+            _safe_ids = ids.clamp(0, B - 1)
+            kb = k_blk[_safe_ids]
+            vb = v_blk[_safe_ids]
+        else:
+            kb = q.new_zeros((e - s, K, nh, hd))
+            vb = q.new_zeros((e - s, K, nh, hd))
         if prefix_kind == 'summary':
             pk = prefix_k[s:e, None].expand(e - s, K, nh, hd)
             pv = prefix_v[s:e, None].expand(e - s, K, nh, hd)
@@ -17088,13 +17101,11 @@ def _pooled_ppl_from_records(recs):
     `nll_sum`/`n_tokens` cannot be pooled and fall back explicitly."""
     nlls, nts = [], []
     for r in recs:
-        nll, nt = r.get('nll_sum'), r.get('n_tokens')
-        if not isinstance(nll, (int, float)) or isinstance(nll, bool) or not math.isfinite(float(nll)):
+        nll, nt = _finite_scalar(r.get('nll_sum')), _finite_scalar(r.get('n_tokens'))
+        if nll is None or nt is None or nt <= 0:
             return None, None, None
-        if not isinstance(nt, (int, float)) or isinstance(nt, bool) or float(nt) <= 0:
-            return None, None, None
-        nlls.append(float(nll))
-        nts.append(float(nt))
+        nlls.append(nll)
+        nts.append(nt)
     total_n, total_t = float(sum(nlls)), float(sum(nts))
     if total_t <= 0:
         return None, None, None

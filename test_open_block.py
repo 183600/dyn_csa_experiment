@@ -452,6 +452,46 @@ def t_hca_budget_declaration():
     assert c.selection_budget == 'all_closed_plus_prefix'
 
 
+def t_open_candidate_edge_cases():
+    # Empty query sets and zero available candidates must return the same
+    # shapes the non-empty path promises, not crash inside a gather.
+    d, nIH = 8, 2
+    W_DQ, W_DK, W_w = torch.randn(d, d), torch.randn(d, d), torch.randn(nIH, d)
+    empty_bid = torch.empty(0, dtype=torch.long)
+    geo0 = L._open_prefix_geometry(empty_bid, n_blocks=0, scope='full_prefix',
+                                   candidate_table=False)
+    idx, valid, soft = L.lightning_indexer_open(
+        torch.empty(0, d), torch.empty(0, d), torch.empty(0, dtype=torch.long),
+        W_DQ, W_DK, W_w, nIH, 4, prefix_geo=geo0, prefix_kv=torch.empty(0, d))
+    assert idx.shape == valid.shape == soft.shape == (0, 4), (idx.shape, valid.shape, soft.shape)
+
+    n = 5
+    H = torch.randn(n, d)
+    bid = torch.tensor([0, 0, 0, 1, 1])
+    geo = L._open_prefix_geometry(bid, n_blocks=2, scope='outside_window',
+                                  window=100, candidate_table=True)
+    idx, valid, soft = L.lightning_indexer_open(
+        H, torch.empty(0, d), torch.empty(0, dtype=torch.long),
+        W_DQ, W_DK, W_w, nIH, 4, prefix_geo=geo,
+        prefix_token_kv=torch.randn(n, d), prefix_kind='singletons')
+    assert idx.shape == valid.shape == soft.shape == (n, 4)
+    assert not valid.any() and not soft.any(), 'no candidate may be read or receive soft mass'
+
+    h, hd, w, K = 2, 3, 2, 4
+    q = torch.randn(n, h, hd)
+    k_sw, v_sw = torch.randn(n, h, hd), torch.randn(n, h, hd)
+    topk = torch.zeros(n, K, dtype=torch.int32)
+    sel = torch.zeros(n, K, dtype=torch.bool)
+    out, mass = L.gathered_attention_open(
+        q, torch.empty(0, h, hd), torch.empty(0, h, hd), topk, sel,
+        torch.empty(0, dtype=torch.long), k_sw, v_sw, w, 0.5,
+        prefix_geo=geo, prefix_kind='singletons',
+        prefix_k=torch.empty(n, h, hd), prefix_v=torch.empty(n, h, hd),
+        return_prefix_mass=True)
+    assert out.shape == q.shape and torch.isfinite(out).all(), out.shape
+    assert mass.shape == (n,) and torch.isfinite(mass).all(), mass
+
+
 CHECKS = [
     ('K1 open-block config/segmenter', t_config_and_segmenter),
     ('K2 prefix pooling reference/grad', t_prefix_pool_reference),
@@ -463,6 +503,7 @@ CHECKS = [
     ('K8 singleton semantics', t_singleton_is_length_one_pooled),
     ('K9 HCA budget declaration', t_hca_budget_declaration),
     ('K10 forced-vs-natural cuts', t_forced_vs_natural_cuts),
+    ('K11 open candidate edge cases', t_open_candidate_edge_cases),
 ]
 
 

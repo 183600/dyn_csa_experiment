@@ -78,13 +78,21 @@ def _protocol_arm_groups(protocol, base, arms):
     equal-search contract covers the union of arms.
     """
     declared = list(arms)
+    declared_set = set(declared)
     raw = protocol.get('arm_groups')
     groups = []
     if raw:
         for g in raw:
             if not isinstance(g, dict) or not isinstance(g.get('arms'), (list, tuple)):
                 raise ValueError(f'arm group must be a dict with an arms list, got {g!r}')
-            groups.append(dict(g))
+            ga = [a for a in g['arms'] if a in declared_set]
+            if not ga:
+                continue
+            ng = dict(g)
+            ng['arms'] = ga
+            if isinstance(g.get('matched'), (list, tuple, set)):
+                ng['matched'] = [a for a in g['matched'] if a in declared_set]
+            groups.append(ng)
     else:
         groups = [{'arms': declared, 'matched': base.get('matched'),
                    'mlp_match_ref': base.get('mlp_match_ref', 'csa_dynamic')}]
@@ -94,10 +102,14 @@ def _protocol_arm_groups(protocol, base, arms):
             if a in seen:
                 raise ValueError(f'arm {a!r} appears in more than one tuning group')
             seen.append(a)
-    if raw and sorted(seen) != sorted(declared):
-        raise ValueError(f'arm_groups cover {sorted(seen)} but the protocol declares {sorted(declared)}')
     if not raw:
         groups[0]['arms'] = declared
+    else:
+        _missing = [a for a in declared if a not in seen]
+        if _missing:
+            groups.append({'arms': _missing, 'matched': base.get('matched'),
+                           'mlp_match_ref': base.get('mlp_match_ref', 'csa_dynamic')})
+            seen.extend(_missing)
     return groups
 
 
@@ -163,9 +175,10 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     _prov_any = None
     _data_version_any = None
     for ti, knobs in enumerate(trials):
-        for _grp in groups:
+        for _gi, _grp in enumerate(groups):
             _ov = _group_overrides(base, _grp)
-            tdir = os.path.join(outdir, f'trial_{ti:02d}')
+            _suffix = '' if len(groups) == 1 else f'_g{_gi}'
+            tdir = os.path.join(outdir, f'trial_{ti:02d}{_suffix}')
             cfg = _trial_cfg(base, tdir, _grp['arms'], search_seeds, search_steps, knobs)
             cfg.update(_ov)
             L.run(cfg, seeds=search_seeds, guard=None, label=f'baseline tuning trial {ti + 1}/{len(trials)} ({"/".join(_grp["arms"])})')
@@ -212,8 +225,11 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         print(f'[tune] {arm:22s} best mean PPL {best["ppl"]:.4f} +/- {best["ppl_std"]:.4f} '
               f'(n={best.get("n_seeds")}) at {best["config"]}')
     artifact_protocol = dict(protocol)
+    artifact_protocol['arms'] = list(arms)
     artifact_protocol['trials'] = [dict(t) for t in trials]
     artifact_protocol['search_seeds'] = list(search_seeds)
+    if 'arm_groups' in protocol:
+        artifact_protocol['arm_groups'] = [dict(g) for g in groups]
     artifact = {
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'protocol': artifact_protocol,
