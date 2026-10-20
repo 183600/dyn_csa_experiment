@@ -1222,7 +1222,9 @@ README_zh 与 `RELEASES.md` 中均已明示。
 复现；选择行与评估行重叠或顺序颠倒；`best_ppl` 不是 holdout 值；
 嵌套报告使用了与协议声明不同的 fold 布局；holdout token 数不一致。
 `methodology_audit` 还要求地板的评估行指纹与面板的 `holdout_row_fp`
-一致，并且**每个 seed 的 token 分母**一致，否则拒绝比较。
+一致，并且**每个 seed 的 token 分母**一致，否则拒绝比较。默认平滑网格
+从 3×3 扩展为 6 个 alpha × 6 个插值系数（计数表共享，额外成本只是一次
+打分），避免「地板只是被测过的几个值里最不差的」。
 
 ### 26.2 「击败地板」必须是 seed 级对比
 

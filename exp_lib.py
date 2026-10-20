@@ -11497,8 +11497,12 @@ SIMPLE_BASELINE_POLICY = {
         'bigram': {'order': 2, 'description': 'training-set bigram counts interpolated with the unigram model'},
     },
     'grids': {
-        'unigram': {'alpha': [0.01, 0.1, 1.0]},
-        'bigram': {'alpha': [0.01, 0.1, 1.0], 'interpolation': [0.5, 0.9, 1.0]},
+        # Wide but cheap: the count tables are shared across the whole grid,
+        # so extra smoothing levels cost only another scoring pass.  A narrow
+        # grid can crown a floor that is merely the least-bad tested value.
+        'unigram': {'alpha': [0.0001, 0.001, 0.01, 0.1, 1.0, 10.0]},
+        'bigram': {'alpha': [0.0001, 0.001, 0.01, 0.1, 1.0, 10.0],
+                   'interpolation': [0.0, 0.25, 0.5, 0.75, 0.9, 1.0]},
     },
     # The bigram count table is O(unique pairs): materialising every pair of a
     # multi-billion-token B-tier corpus would need tens of GB before the

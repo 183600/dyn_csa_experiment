@@ -3179,6 +3179,11 @@ def t_simple_baseline_ngram_and_audit():
     b = L.ngram_lm_score(train, val, vocab, order=2, alpha=0.1, interpolation=0.5)
     assert u['n_tokens'] == val.size and b['n_tokens'] == val.size, (u, b)
     assert math.isfinite(u['ppl']) and math.isfinite(b['ppl']) and u['ppl'] > 0 and b['ppl'] > 0
+    # The default floor grid must be wide enough to be called tuned, not just
+    # the least-bad of two arbitrary smoothing values.
+    assert len(L.SIMPLE_BASELINE_POLICY['grids']['unigram']['alpha']) >= 5
+    assert len(L.SIMPLE_BASELINE_POLICY['grids']['bigram']['alpha']) >= 5
+    assert len(L.SIMPLE_BASELINE_POLICY['grids']['bigram']['interpolation']) >= 5
     art = L.simple_baseline_fit(train, val, vocab, protocol=proto)
     assert art['best_baseline'] in ('unigram', 'bigram')
     best = min(e['selected_metric_value'] for e in art['baselines'].values())
