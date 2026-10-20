@@ -1742,6 +1742,57 @@ def t_review3_pooled_aggregate():
     assert e['ppl_primary'] == e['ppl_pooled']
     assert e['ppl_mean_arithmetic'] != e['ppl_pooled'] or True
 
+def t_nested_primary_paired_deltas():
+    # A nested record's `ppl` is the full-validation value; its PRIMARY
+    # estimate is the held-out-row PPL.  Every paired delta must use the
+    # primary estimand, otherwise the contrast silently reads the rows that
+    # selected the hyper-parameters.
+    def _rec(arm, seed, full_ppl, hold_ppl, cfg='same_cfg'):
+        return {
+            'variant': arm, 'seed': seed, 'run_cfg': cfg,
+            'ppl': float(full_ppl), 'nll_sum': math.log(full_ppl) * 100.0,
+            'n_tokens': 100, 'params': 10, 'steps': 1, 'tokens_seen': 400,
+            'data_fp': 'd', 'val_fp': 'v', 'eval_fp': 'e',
+            'ppl_estimation_rows': 'nested_validation_holdout',
+            'ppl_holdout': float(hold_ppl),
+            'nll_sum_holdout': math.log(hold_ppl) * 40.0, 'n_tokens_holdout': 40,
+            'holdout_row_fp': 'h',
+            'nll_per_row_holdout': [math.log(hold_ppl) * 40.0],
+            'n_tokens_per_row_holdout': [40],
+        }
+    summary = {}
+    for s in range(6):
+        # Full validation says the method is better, while the held-out rows
+        # say it is worse.  The primary endpoint is the held-out one.
+        summary[f'full::seed{s}'] = _rec('full', s, 10.0, 10.0)
+        summary[f'csa_dynamic::seed{s}'] = _rec('csa_dynamic', s, 9.0, 11.0)
+    agg = L.aggregate(summary)
+    entry = agg['csa_dynamic']
+    assert abs(entry['ppl_mean'] - 11.0) < 1e-12, entry
+    assert entry['ppl_primary_estimand'] == 'nested_validation_holdout', entry
+    assert abs(entry['dPPL_vs_full_mean'] - 1.0) < 1e-12, entry
+    recs, _amb = L._variant_seed_map(summary)
+    deltas = L._paired_seed_deltas(recs, 'csa_dynamic', 'full')
+    assert all(abs(d - 1.0) < 1e-12 for d in deltas[('', '')][0]), deltas
+    # Holdout accounting can be recovered from NLL totals or per-row arrays;
+    # a declared-nested record with none of them is unverifiable, never a
+    # silent fallback to the full-validation PPL.
+    total_only = _rec('csa_dynamic', 0, 9.0, 11.0)
+    total_only.pop('ppl_holdout')
+    assert abs(L._record_primary_ppl(total_only) - 11.0) < 1e-12, total_only
+    rows_only = _rec('csa_dynamic', 0, 9.0, 12.0)
+    rows_only.pop('ppl_holdout')
+    rows_only.pop('nll_sum_holdout')
+    rows_only.pop('n_tokens_holdout')
+    assert abs(L._record_primary_ppl(rows_only) - 12.0) < 1e-12, rows_only
+    missing = _rec('csa_dynamic', 0, 9.0, 11.0)
+    for _k in ('ppl_holdout', 'nll_sum_holdout', 'n_tokens_holdout',
+               'nll_per_row_holdout', 'n_tokens_per_row_holdout'):
+        missing.pop(_k)
+    assert L._record_primary_ppl(missing) is None, missing
+    assert L._paired_primary_delta(missing, _rec('full', 0, 10.0, 10.0)) is None
+
+
 def t_combined_seed_doc_uncertainty():
     # Two-level (seed x document) combined interval: the seed-level t CI and
     # the doc-level bootstrap each see only ONE variance source; the
@@ -7065,6 +7116,7 @@ def main():
     _check('D1 eval per-seq ppl', t_eval_per_seq)
     _check('J1 evidence metadata + significance gate', t_review3_evidence_metadata)
     _check('J2 pooled aggregation', t_review3_pooled_aggregate)
+    _check('J2b nested records pair on the primary holdout estimand', t_nested_primary_paired_deltas)
     _check('J3 Holm declared-family slots', t_review3_holm_family_size)
     _check('J4 task-boundary arm + objective descriptor', t_review3_boundary_arm_and_objective)
     _check('J5 span clean-baseline key', t_review3_span_clean_key)

@@ -13790,7 +13790,11 @@ def _paired_seed_deltas(recs, a, b, *, strict_hyper=False):
             if reason is not None:
                 skipped.append((s, reason))
                 continue
-            deltas.append(float(ra[ts, s]['ppl']) - float(rb[bs, s]['ppl']))
+            _delta = _paired_primary_delta(ra[ts, s], rb[bs, s])
+            if _delta is None:
+                skipped.append((s, 'primary estimand missing (nested record without holdout PPL/NLL accounting)'))
+                continue
+            deltas.append(_delta)
         out[(ts, bs)] = (deltas, seeds, skipped)
     return out
 
@@ -20539,14 +20543,49 @@ def _record_primary_ppl(rec):
     `ppl_estimation_rows` says the estimate is a held-out-row one.  Any
     per-seed contrast must use the same number; reading `ppl` (full
     validation) next to a pooled holdout aggregate would mix two samples.
-    Legacy records without a holdout marker keep `ppl`."""
+    Legacy records without a holdout marker keep `ppl`.
+
+    A record that DECLARES the nested estimand but lacks every holdout
+    accounting field is unverifiable and returns None.  Falling back to the
+    full-validation `ppl` here would silently restore the selection rows that
+    the nested split exists to remove.
+    """
     if not isinstance(rec, dict):
         return None
     if rec.get('ppl_estimation_rows') == 'nested_validation_holdout':
         _h = _finite_scalar(rec.get('ppl_holdout'))
         if _h is not None:
             return _h
+        _nll = _finite_scalar(rec.get('nll_sum_holdout'))
+        _nt = _exact_count(rec.get('n_tokens_holdout'), minimum=1)
+        if _nll is not None and _nt is not None:
+            return _safe_exp_ppl(_nll / _nt)
+        _rn = rec.get('nll_per_row_holdout')
+        _rt = rec.get('n_tokens_per_row_holdout')
+        if (isinstance(_rn, list) and isinstance(_rt, list)
+                and _rn and len(_rn) == len(_rt)):
+            _vals = [_finite_scalar(v) for v in _rn]
+            _toks = [_exact_count(v, minimum=1) for v in _rt]
+            if (all(v is not None for v in _vals)
+                    and all(v is not None for v in _toks)):
+                _tot_t = int(sum(_toks))
+                if _tot_t > 0:
+                    return _safe_exp_ppl(float(sum(_vals)) / _tot_t)
+        return None
     return _finite_scalar(rec.get('ppl'))
+
+
+def _paired_primary_delta(rec_a, rec_b):
+    """(a − b) on the PRIMARY estimand, or None when either side is unmeasured.
+
+    Every paired display/test in this module must use this helper rather than
+    raw ``ppl``: a nested record's ``ppl`` is the full-validation value, which
+    includes the rows that selected its hyper-parameters.
+    """
+    _a, _b = _record_primary_ppl(rec_a), _record_primary_ppl(rec_b)
+    if _a is None or _b is None:
+        return None
+    return float(_a) - float(_b)
 
 
 def _seed_t_ci(ppls, alpha=0.05):
@@ -21011,7 +21050,11 @@ def aggregate(summary):
             if reason is not None:
                 skipped.append((s, reason))
                 continue
-            out.append(r['ppl'] - b['ppl'])
+            _delta = _paired_primary_delta(r, b)
+            if _delta is None:
+                skipped.append((s, 'primary estimand missing (nested record without holdout PPL/NLL accounting)'))
+                continue
+            out.append(_delta)
         return (out, skipped)
     agg = {}
     _split_groups = []
@@ -21046,7 +21089,24 @@ def aggregate(summary):
             return (1, 0.0, str(s))
         _recs_sorted = sorted(recs, key=_seed_sort_key)
         recs = _recs_sorted
-        ppls = np.array([r['ppl'] for r in recs], dtype=float)
+        # Every per-seed statistic must target the record's PRIMARY estimand.
+        # For a nested record `ppl` is the full-validation value, which still
+        # contains the rows used to select its hyper-parameters; the seed
+        # mean/std/interval would then describe a different (leaky) sample
+        # than `ppl_primary` and the paired dPPL column.
+        _primary_vals = [_record_primary_ppl(r) for r in recs]
+        _n_primary_missing = sum(v is None for v in _primary_vals)
+        if _n_primary_missing:
+            print(f'[aggregate] WARNING: {key}: {_n_primary_missing}/{len(recs)} record(s) declare the nested estimand but lack holdout accounting — the whole group falls back to full-validation PPL so the numbers stay on one sample; nested claims are NOT supported for this group')
+            ppls = np.array([r['ppl'] for r in recs], dtype=float)
+            _primary_estimand = 'full_validation_fallback'
+        else:
+            ppls = np.array(_primary_vals, dtype=float)
+            _primary_estimand = (
+                'nested_validation_holdout'
+                if any(r.get('ppl_estimation_rows') == 'nested_validation_holdout'
+                       for r in recs)
+                else 'full_validation')
         _pooled, _nll_total, _ntok_total = _pooled_ppl_from_records(recs)
         _sorted = np.sort(ppls)
         _med = float(np.median(_sorted))
@@ -21056,6 +21116,8 @@ def aggregate(summary):
                  'ppl_mean_arithmetic': float(ppls.mean()),
                  'ppl_std': float(ppls.std(ddof=1)) if len(ppls) > 1 else 0.0,
                  'ppls': [float(p) for p in ppls], 'seeds': [r.get('seed') for r in recs],
+                 'ppl_primary_estimand': _primary_estimand,
+                 'ppl_primary_missing': int(_n_primary_missing),
                  'params': _group_params(recs), 'tokens_seen': recs[0].get('tokens_seen'),
                  'ppl_median': _med, 'ppl_iqr': [_q1, _q3],
                  'ppl_ci95_seed_t': _seed_t_ci(ppls),
@@ -21361,7 +21423,11 @@ def _print_pairs(summary):
             if _reason is not None:
                 _sk.append((s, _reason))
                 continue
-            _by_cond.setdefault((ts, bs), []).append(ra[ts, s]['ppl'] - rb[bs, s]['ppl'])
+            _delta = _paired_primary_delta(ra[ts, s], rb[bs, s])
+            if _delta is None:
+                _sk.append((s, 'primary estimand missing (nested record without holdout PPL/NLL accounting)'))
+                continue
+            _by_cond.setdefault((ts, bs), []).append(_delta)
         if _sk:
             _pair_skip.append((a, b, len(_sk), len(common), sorted({r for _s, r in _sk})))
         for (ts, bs), dl in sorted(_by_cond.items()):
