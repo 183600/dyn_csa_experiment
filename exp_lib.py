@@ -6347,32 +6347,42 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         # flag is not enough: recompute the intersections from the persisted
         # sidecars on every hit, exactly like the train/val cache does.
         import glob as _glob2
-        _mdoc = meta.get('doc_ids')
-        if _mdoc:
+        _mdoc = meta.get('doc_ids') or {}
+        if _mdoc or test_doc_ids is not None:
             if test_doc_ids is None:
                 _problems.append('test cache metadata records document ids but the sidecar is missing')
             else:
-                if int(np.asarray(test_doc_ids).size) != int(_mdoc.get('test_count', -1)):
+                if _mdoc and int(np.asarray(test_doc_ids).size) != int(_mdoc.get('test_count', -1)):
                     _problems.append(
                         'test document-id sidecar count does not match the cache metadata')
                 if _mdoc.get('test_fp') and _mdoc['test_fp'] != _ids_fp(test_doc_ids):
                     _problems.append(
                         'test document-id sidecar does not match the fingerprint in the cache metadata')
-                if (_mdoc.get('disjoint') is not True
+                if _mdoc and (_mdoc.get('disjoint') is not True
                         or int(_mdoc.get('train_overlap', 0) or 0) != 0
                         or int(_mdoc.get('validation_overlap', 0) or 0) != 0):
                     _problems.append(
                         'test cache metadata does not attest document-disjoint '
                         'train/validation/test groups')
                 _shared = {'train': 0, 'validation': 0}
-                for _dp in _glob2.glob(os.path.join(cache_dir, 'train_doc_ids_v5_*.npy')):
+                _tr_sidecars = _glob2.glob(os.path.join(cache_dir, 'train_doc_ids_v5_*.npy'))
+                _va_sidecars = _glob2.glob(os.path.join(cache_dir, 'val_doc_ids_*.npy'))
+                # A zero intersection computed from a missing sidecar is not
+                # evidence of isolation.
+                if not _tr_sidecars:
+                    _problems.append('train document-id sidecar is missing; '
+                                     'test/train group isolation cannot be verified')
+                if not _va_sidecars:
+                    _problems.append('validation document-id sidecar is missing; '
+                                     'test/validation group isolation cannot be verified')
+                for _dp in _tr_sidecars:
                     try:
                         _shared['train'] += int(np.intersect1d(
                             np.load(_dp), test_doc_ids, assume_unique=False).size)
                     except Exception as _de:
                         _problems.append(
                             f'train document-id sidecar unreadable ({os.path.basename(_dp)}: {_de})')
-                for _dp in _glob2.glob(os.path.join(cache_dir, 'val_doc_ids_*.npy')):
+                for _dp in _va_sidecars:
                     try:
                         _shared['validation'] += int(np.intersect1d(
                             np.load(_dp), test_doc_ids, assume_unique=False).size)
