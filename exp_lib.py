@@ -20560,6 +20560,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     _scaler_scale_min = None
     _best_val_ppl = None
     _best_step = None
+    _last_subset_ppl = None
     _checkpoints = {}
     _health_history = []
     _last_train_ce = None
@@ -20871,6 +20872,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                           'val_doc_ce_sem': _ci.get('doc_ce_sem'),
                           'val_n_docs': _ci.get('n_docs')}
                 _health_history.append(_entry)
+                if _is_finite_number(sub_ppl) and sub_ppl > 0:
+                    _last_subset_ppl = sub_ppl
                 if _is_finite_number(sub_ppl) and sub_ppl > 0 and (_best_val_ppl is None or sub_ppl < _best_val_ppl):
                     _best_val_ppl = sub_ppl
                     _best_step = step + 1
@@ -21066,7 +21069,11 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'train_ce_fixed_final': _last_train_ce,
               'train_val_gap_final': _health.get('gap_last'),
               'best_step': _best_step, 'best_val_ppl': _best_val_ppl,
-              'final_minus_best': (float(ppl - _best_val_ppl) if (_is_finite_number(ppl) and _best_val_ppl is not None) else None),
+              'best_val_ppl_subset': _best_val_ppl,
+              'final_subset_val_ppl': _last_subset_ppl,
+              'final_full_val_ppl': (float(ppl) if _is_finite_number(ppl) else None),
+              'final_minus_best': (float(_last_subset_ppl - _best_val_ppl)
+                                   if (_is_finite_number(_last_subset_ppl) and _best_val_ppl is not None) else None),
               'opt_diag': _diag, 'opt_diag_summary': _opt_summary,
               'instability_diagnosis': _instability,
               'peak_memory': _peak, 'efficiency': _efficiency,

@@ -868,6 +868,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     _health_history = []
     _best_val_ppl = None
     _best_step = None
+    _last_subset_ppl = None
     _last_train_ce = None
     _gn_hist = []
     warm_on = warm_steps > 0
@@ -1007,6 +1008,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
                     _health_history.append({'step': step + 1, 'val_ppl': _pv, 'val_ce': _val_ce,
                                             'train_ce': _train_ce,
                                             'gap': (_val_ce - _train_ce) if (math.isfinite(_val_ce) and L._is_finite_number(_train_ce)) else None})
+                    if L._is_finite_number(_pv) and _pv > 0:
+                        _last_subset_ppl = _pv
                     if L._is_finite_number(_pv) and _pv > 0 and (_best_val_ppl is None or _pv < _best_val_ppl):
                         _best_val_ppl = _pv
                         _best_step = step + 1
@@ -1113,7 +1116,10 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
            'opt_diag_summary': _opt_summary,
            'instability_diagnosis': _instability,
            'best_step': _best_step, 'best_val_ppl': _best_val_ppl,
-           'final_minus_best': (float(ppl) - float(_best_val_ppl)) if (L._is_finite_number(ppl) and L._is_finite_number(_best_val_ppl)) else None,
+           'best_val_ppl_subset': _best_val_ppl,
+           'final_subset_val_ppl': _last_subset_ppl,
+           'final_full_val_ppl': (float(ppl) if L._is_finite_number(ppl) else None),
+           'final_minus_best': (float(_last_subset_ppl) - float(_best_val_ppl)) if (L._is_finite_number(_last_subset_ppl) and L._is_finite_number(_best_val_ppl)) else None,
            'train_ce_fixed_final': _last_train_ce,
            'train_val_gap_final': _health.get('gap_last'),
            'eval_subset_rows': int(np.asarray(_eval_batch).shape[0]) if _eval_batch is not None else 0,

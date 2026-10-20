@@ -450,6 +450,9 @@ def t_train_variant_early_stop_record():
     assert r['steps'] == 4 and r['steps_completed'] == 2, r
     assert r['tokens_seen'] == 2 * 2 * 16, r['tokens_seen']
     assert r['opt_diag_summary']['n_steps_completed'] == 2, r['opt_diag_summary']
+    assert r['final_full_val_ppl'] == r['ppl'], r
+    assert r['final_subset_val_ppl'] is not None and r['best_val_ppl'] is not None, r
+    assert abs(r['final_minus_best'] - (r['final_subset_val_ppl'] - r['best_val_ppl'])) < 1e-12, r
     r2 = L.train_variant('full', ids, val, 997, seed=0, **dict(kw, steps=2))
     assert r2['steps_completed'] == 2 and r2.get('early_stop') is None, r2
     assert r2['tokens_seen'] == 2 * 2 * 16, r2['tokens_seen']
