@@ -6845,6 +6845,8 @@ def t_report_error_analysis_section():
            'mean_ce': 4.2, 'pooled_ppl': 66.7,
            'buckets': {'position:last10%': {'n': 3, 'mean_ce': 5.0, 'perplexity': 148.4}},
            'cause_counts': {'ambiguous_context': 2, 'annotation_or_rare_target': 1},
+           'cause_counts_all': {'ambiguous_context': {'n': 9, 'share': 0.9, 'mean_ce': 4.1},
+                                'annotation_or_rare_target': {'n': 1, 'share': 0.1, 'mean_ce': 6.0}},
            'cause_guide': {'ambiguous_context': 'read the context'},
            'worst_tokens': [{'row': 0, 'position': 3, 'ce': 9.5,
                              'target_text': 'x', 'pred_text': 'y',
@@ -6858,7 +6860,7 @@ def t_report_error_analysis_section():
         BR.load = orig
     assert 'Bad-case analysis' in txt and 'ambiguous_context' in txt, txt
     assert 'ckpt.pt' in txt and 'validation only' in txt, txt
-    assert 'read the context' in txt, txt
+    assert 'read the context' in txt and 'Whole-split' in txt, txt
     rec2 = dict(rec, checkpoint='/tmp/y/ckpt2.pt')
     orig_paths = BR._error_analysis_paths
     BR._error_analysis_paths = lambda: ['/a/summary.json', '/b/summary.json']
