@@ -4024,6 +4024,69 @@ def t_audit_leakage_handles_flat_train_cache():
         shutil.rmtree(cache, ignore_errors=True)
 
 
+def t_audit_gate_parameters_fail_closed():
+    # shingle<=0 would hash no windows and report zero overlap; NaN policy
+    # limits would also make every comparison pass.  Both must be refused.
+    for kw in ({'shingle': 0}, {'shingle': -3},
+               {'max_rows_shingled': 0},
+               {'preferred_train_seq_len': 0}):
+        try:
+            A.audit_leakage(cache_dir='/nonexistent', **kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'audit_leakage accepted {kw!r}')
+    for key in ('CSA_MAX_TEST_SHINGLE_OVERLAP', 'CSA_MAX_TEST_ROW_OVERLAP'):
+        old = os.environ.get(key)
+        try:
+            for bad in ('nan', 'inf', '-0.1', 'not-a-number'):
+                os.environ[key] = bad
+                try:
+                    A.audit_leakage(cache_dir='/nonexistent')
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f'{key}={bad!r} must be refused')
+        finally:
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+    for kw in ({'js_warn': float('nan')}, {'js_fail': float('nan')},
+               {'js_warn': -0.1}, {'min_shift_tokens': 0},
+               {'max_rows': 0}, {'js_warn': 0.3, 'js_fail': 0.2}):
+        try:
+            A.audit_split_discipline(cache_dirs=[], **kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'audit_split_discipline accepted {kw!r}')
+
+    # An exception inside the overlap computation must not leave the overall
+    # leakage verdict at 'ok'.
+    cache = tempfile.mkdtemp(prefix='leak_failclosed_')
+    try:
+        np.save(os.path.join(cache, 'train_ids_x.npy'), np.arange(60, dtype=np.int64))
+        np.save(os.path.join(cache, 'test_ids_x.npy'),
+                np.stack([np.arange(0, 30), np.arange(30, 60)]).astype(np.int64))
+        with open(os.path.join(cache, 'meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': 'a'}, f)
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': 'b'}, f)
+        _orig = A._window_hashes
+        try:
+            def _boom(*_a, **_k):
+                raise RuntimeError('simulated overlap failure')
+            A._window_hashes = _boom
+            out = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        finally:
+            A._window_hashes = _orig
+        assert out['status'] == 'fail', out
+        assert 'doc_overlap' in out['checks'], out
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
+
+
 def t_fuse_sample_std_negative_axis():
     import fuse_analysis as FA
     x = np.arange(24, dtype=float).reshape(2, 3, 4)
@@ -6948,6 +7011,7 @@ def main():
     _check('H7a floor contrast is seed-level and significance-aware', t_simple_floor_contrast_is_significance_aware)
     _check('H8 leakage audit handles a flat 1-D train cache', t_audit_leakage_handles_flat_train_cache)
     _check('H8b corpus audit memo covers meta/thresholds and strict', t_corpus_audit_memo_and_thresholds)
+    _check('H8c audit gate parameters fail closed', t_audit_gate_parameters_fail_closed)
     _check('H9 fuse sample_std accepts negative axes', t_fuse_sample_std_negative_axis)
     _check('I1 chronological split contract', t_leakage_safe_split_contract)
     _check('I2 whole-group split contract', t_group_split_contract)

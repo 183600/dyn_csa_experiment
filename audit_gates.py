@@ -43,6 +43,8 @@ import os
 import sys
 import time
 
+import numpy as np
+
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -99,6 +101,20 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
       c. train/test id 缓存的 src_fp 与文件内容指纹自洽；
       d. train/test 文档重叠：k-gram shingle 的 shared/test 比例与最差单行
          重叠比例（Jaccard 因 4M-vs-65k 的构造上限只作诊断记录）。"""
+    # A non-positive shingle width makes _window_hashes return no hashes, which
+    # would report 0% overlap and pass the leakage gate.  NaN policy limits
+    # make every comparison False for the same reason.
+    shingle = _audit_positive_int('shingle', shingle)
+    max_rows_shingled = _audit_positive_int('max_rows_shingled', max_rows_shingled)
+    if preferred_train_seq_len is not None:
+        preferred_train_seq_len = _audit_positive_int(
+            'preferred_train_seq_len', preferred_train_seq_len)
+    _max_shingle_ov = _audit_nonneg_float(
+        'CSA_MAX_TEST_SHINGLE_OVERLAP',
+        os.environ.get('CSA_MAX_TEST_SHINGLE_OVERLAP', 0.25))
+    _max_row_ov = _audit_nonneg_float(
+        'CSA_MAX_TEST_ROW_OVERLAP',
+        os.environ.get('CSA_MAX_TEST_ROW_OVERLAP', 0.50))
     if cache_dir in (None, ''):
         cache_dir = os.environ.get('WT103_CACHE_DIR') or './wt103_cache'
     out = {'status': 'ok', 'checks': {}}
@@ -361,8 +377,6 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                         row_overlaps.append(_row_frac)
                 if row_overlaps:
                     max_row_overlap = float(max(row_overlaps))
-            _max_shingle_ov = float(os.environ.get('CSA_MAX_TEST_SHINGLE_OVERLAP', 0.25))
-            _max_row_ov = float(os.environ.get('CSA_MAX_TEST_ROW_OVERLAP', 0.50))
             _viol = bool((test_overlap > _max_shingle_ov)
                          or (max_row_overlap is not None and max_row_overlap > _max_row_ov))
             out['checks']['doc_overlap'] = {
@@ -409,6 +423,12 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             out['checks']['doc_overlap'] = 'npy caches absent'
     except Exception as e:
         out['checks']['doc_overlap'] = f'failed ({type(e).__name__}: {e})'
+        # An audit that did not run cannot certify a clean split.  Leaving the
+        # top-level status at 'ok' here was a fail-open path.
+        out['status'] = 'fail'
+        out['note'] = (f'train/test overlap audit could not run '
+                       f'({type(e).__name__}: {e}); no clean generalization '
+                       'claim is available until it is rerun')
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -422,6 +442,38 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
 # box (>= 2**28 * 8 B); _sample_tokens then draws the same uniform
 # without-replacement sample by rejection in O(cap) memory instead.
 _CHOICE_PERM_MAX_ELEMS = 1 << 28
+
+
+def _audit_positive_int(name, value):
+    """Positive integer gate parameter; no silent truncation/coercion."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f'{name} must be a positive integer, got {value!r}')
+    if isinstance(value, numbers.Integral):
+        value = int(value)
+    elif isinstance(value, numbers.Real):
+        f = float(value)
+        if not math.isfinite(f) or f != math.floor(f):
+            raise ValueError(f'{name} must be a positive integer, got {value!r}')
+        value = int(f)
+    else:
+        raise ValueError(f'{name} must be a positive integer, got {value!r}')
+    if value < 1:
+        raise ValueError(f'{name} must be a positive integer, got {value!r}')
+    return value
+
+
+def _audit_nonneg_float(name, value):
+    """Finite non-negative threshold; NaN would silently disable a gate."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f'{name} must be a finite non-negative number, got {value!r}')
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f'{name} must be a finite non-negative number, got {value!r}') from None
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f'{name} must be a finite non-negative number, got {value!r}')
+    return value
 
 
 def _sample_tokens(arr, cap=1000000, seed=0):
@@ -559,10 +611,16 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
         divergence (a shift is reported explicitly rather than silently
         assumed away).
 
-    Exact duplicate rows across splits are a hard failure.  Distribution or
+     Exact duplicate rows across splits are a hard failure.  Distribution or
     legacy-metadata issues are warnings because they need a scientific
     judgement, not an automatic rebuild.
     """
+    js_warn = _audit_nonneg_float('js_warn', js_warn)
+    js_fail = _audit_nonneg_float('js_fail', js_fail)
+    if js_warn > js_fail:
+        raise ValueError(f'js_warn ({js_warn}) must not exceed js_fail ({js_fail})')
+    min_shift_tokens = _audit_positive_int('min_shift_tokens', min_shift_tokens)
+    max_rows = _audit_positive_int('max_rows', max_rows)
     import glob
     import numpy as np
     sys.path.insert(0, REPO)
