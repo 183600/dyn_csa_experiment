@@ -1895,6 +1895,39 @@ def efficiency_accuracy_summary(items):
     return rows
 
 
+def sec_early_stop():
+    rows = []
+    for name, summ in _result_summaries().items():
+        for key, rec in summ.items():
+            if not isinstance(rec, dict):
+                continue
+            es = rec.get('early_stop')
+            planned = rec.get('steps')
+            done = rec.get('steps_completed')
+            if not isinstance(es, dict) and done is None:
+                continue
+            if isinstance(es, dict) and not es.get('stopped') and done == planned:
+                continue
+            rows.append((name, key, rec, es, planned, done))
+    if not rows:
+        return ''
+    lines = ['## Early stop / completed training budget', '',
+             '> Early stopping is a diagnostic policy, not a free accuracy gain: records stopped before the planned step saw fewer tokens. Pairing already refuses equal-budget comparisons whose `tokens_seen` differ; this table makes the unequal budget visible instead of hiding it behind the planned step count.', '',
+             '| panel | cell | stopped | completed / planned steps | completion | best PPL @ step | reason |', '|---|---|---|---|---|---|---|']
+    for name, key, rec, es, planned, done in rows[:200]:
+        es = es if isinstance(es, dict) else {}
+        p = _as_finite(planned)
+        d = _as_finite(done)
+        frac = ((d / p) if (p and d is not None) else None)
+        lines.append('| %s | `%s` | %s | %s / %s | %s | %s @ %s | %s |' % (
+            name, key, bool(es.get('stopped')), fm(d, 0), fm(p, 0),
+            (f'{frac * 100:.1f}%' if frac is not None else 'n/a'),
+            fm(es.get('best_val_ppl')), fm(es.get('best_step'), 0),
+            str(es.get('reason') or 'completed the planned steps').replace('|', '\\|')))
+    lines += ['', '> `steps_completed` is what `tokens_seen` and the time-guard use. A curve that is still improving at the stop point means the patience/min-delta policy was too aggressive for this run.', '']
+    return '\n'.join(lines) + '\n'
+
+
 def sec_nan_diagnostics():
     rows = []
     for name, s in _result_summaries().items():
@@ -2148,7 +2181,7 @@ def main(argv=None):
     parts = [sec_header(), '---\n']
     failed = []
     _reset_claim_registry()
-    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_nan_diagnostics, sec_error_analysis, sec_efficiency, sec_stats, sec_global_multiplicity):
+    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_early_stop, sec_nan_diagnostics, sec_error_analysis, sec_efficiency, sec_stats, sec_global_multiplicity):
         try:
             parts.append(sec())
         except Exception as e:

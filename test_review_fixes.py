@@ -6885,6 +6885,29 @@ def t_report_training_health_actions():
     assert '500' in txt and 'gap slope' in txt, txt
 
 
+def t_report_early_stop_section():
+    rec = {'steps': 100, 'steps_completed': 40, 'tokens_seen': 400,
+           'early_stop': {'stopped': True, 'best_val_ppl': 48.0,
+                          'best_step': 30, 'reason': 'patience reached'}}
+    normal = {'steps': 100, 'steps_completed': 100,
+              'early_stop': {'stopped': False, 'reason': 'patience not reached'}}
+    orig = BR._result_summaries
+    BR._result_summaries = lambda: {'results_unit': {'a::s0': rec, 'b::s0': normal}}
+    try:
+        txt = BR.sec_early_stop()
+    finally:
+        BR._result_summaries = orig
+    assert 'Early stop' in txt and '40' in txt and '100' in txt, txt
+    assert 'patience reached' in txt and 'True' in txt, txt
+    assert 'b::s0' not in txt, txt
+    orig = BR._result_summaries
+    BR._result_summaries = lambda: {'results_unit': {'b::s0': normal}}
+    try:
+        assert BR.sec_early_stop() == ''
+    finally:
+        BR._result_summaries = orig
+
+
 def t_report_nan_section_uses_triage():
     rec = {'instability_diagnosis': {
         'status': 'instability_observed', 'primary_suspect': 'fp16_overflow',
@@ -9579,6 +9602,7 @@ def main():
     _check('L8d efficiency/accuracy cost summary is seed-noise aware', t_efficiency_accuracy_tradeoff_summary)
     _check('L8e report surfaces the bad-case cause inventory', t_report_error_analysis_section)
     _check('L8f training-health section shows actions and steps since best', t_report_training_health_actions)
+    _check('L8g report surfaces completed vs planned training budget', t_report_early_stop_section)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
