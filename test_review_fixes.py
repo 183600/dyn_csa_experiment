@@ -104,6 +104,27 @@ def t_min_consistency():
     # Scale-up: the planning math must not overflow int->float at large n.
     big = L.signflip_min_consistency(2000, 10, 0.05)
     assert big is not None and 0 < big < 2000, big
+    # The planning alpha is a probability threshold, not a coerced float:
+    # True->1.0 and a string could otherwise change the required seed count.
+    for _bad_alpha in (True, 0, 1.0, 1.5, float('nan'), 'not-a-number'):
+        try:
+            L.signflip_min_consistency(12, 4, _bad_alpha)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'signflip_min_consistency accepted alpha={_bad_alpha!r}')
+        try:
+            L.signflip_power(12, 4, 0.9, _bad_alpha)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'signflip_power accepted alpha={_bad_alpha!r}')
+        try:
+            L.signflip_min_n_for_holm(4, _bad_alpha)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'signflip_min_n_for_holm accepted alpha={_bad_alpha!r}')
 
 
 def t_power():
@@ -999,6 +1020,11 @@ def t_seed_plan():
     assert L.holm_min_attainable_p(req, p['declared_contrasts'], 0.05) <= 0.05
     assert L.holm_min_attainable_p(req - 1, p['declared_contrasts'], 0.05) > 0.05
     assert L.methodology_seed_plan(req)['sufficient_for_family_rejection'] is True
+    # A fractional/bool plan size must not be truncated into a different n.
+    for _bad_n in (req + 0.9, True, float('nan'), 'not-a-count'):
+        _p = L.methodology_seed_plan(_bad_n)
+        assert _p['n_seeds'] == 0, (_p, _bad_n)
+        assert _p['sufficient_for_family_rejection'] is False, (_p, _bad_n)
 
 
 def t_audit_family_holm_and_verified():

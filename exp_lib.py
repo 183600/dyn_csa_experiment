@@ -9445,11 +9445,8 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     it as a null result."""
     m = _as_seed_int(m_comparisons)
     n_max = _as_seed_int(n_max)
-    try:
-        a = float(alpha)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if m is None or n_max is None or m <= 0 or not (0.0 < a < 1.0):
+    a = _validated_alpha(alpha, context='signflip_min_n_for_holm alpha')
+    if m is None or n_max is None or m <= 0:
         return None
     for n in range(1, n_max + 1):
         if holm_min_attainable_p(n, m, a) <= a + 1e-15:
@@ -9646,6 +9643,7 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     下界，真实数据可能仍需更多同向种子。返回使 m·p(k) < alpha 的最小
     k；若全部 n 个同向仍不够，返回 None（方案不可能确认）。二项尾概率
     在 log 空间计算，因此大 n（规模扩展后的补种子计划）也不会整数溢出。"""
+    alpha = _validated_alpha(alpha, context='signflip_min_consistency alpha')
     n = _as_seed_int(n_seeds)
     m = _as_seed_int(m_comparisons)
     if n is None or m is None or n <= 0 or m <= 0:
@@ -13558,10 +13556,11 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
                   'missing_arms': {}})
     m = sum(len(v) for v in design.values()) + sum(len(v) for v in baselines.values())
     req = signflip_min_n_for_holm(m, alpha)
-    try:
-        n = int(n_seeds)
-    except (TypeError, ValueError, OverflowError):
-        n = 0
+    # A fractional/bool seed count is not a plan size; truncating 6.9 to 6
+    # could label an invalid plan sufficient.  Treat it as zero (fail closed)
+    # instead of silently coercing it.
+    _n = _as_seed_int(n_seeds)
+    n = _n if (_n is not None and _n >= 0) else 0
     return {'n_seeds': n, 'declared_contrasts': int(m), 'alpha': float(alpha),
             'min_seeds_for_family_significance': req,
             'sufficient_for_family_rejection': bool(req is not None and n >= req),
