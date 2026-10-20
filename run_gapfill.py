@@ -29,6 +29,26 @@ def _num_or_none(v):
         return None
     return int(f) if math.isfinite(f) and f.is_integer() else None
 
+def _announce_seed_plan(label, cfg, seeds):
+    """Print the prospective family-corrected seed requirement for a phase.
+
+    A panel launched at a seed count below `methodology_seed_plan`'s floor is
+    DESCRIPTIVE, however large the observed effect: the exact sign-flip test
+    cannot reach alpha under the declared Holm family.  Announce that before
+    spending GPU time (and name the top-up path) instead of discovering it when
+    the table is interpreted after the run.
+    """
+    plan = L.methodology_seed_plan(len(list(seeds)), variants=cfg.get('variants'))
+    _need = plan.get('min_seeds_for_family_significance')
+    print(f'[seed-plan] {label}: n={plan["n_seeds"]}, declared contrasts={plan["declared_contrasts"]}, '
+          f'family-corrected minimum n={_need}, sufficient={plan["sufficient_for_family_rejection"]}')
+    if not plan.get('sufficient_for_family_rejection'):
+        print(f'[seed-plan] WARNING: {label} at n={plan["n_seeds"]} is exploratory/descriptive only '
+              f'(need n>={_need} for any Holm-corrected claim). Add seeds with the seed-topup path before '
+              'reading a family-corrected p as significant.')
+    return plan
+
+
 def git_push(msg):
     if os.environ.get('V6_NO_PUSH'):
         print(f'[git] push skipped (V6_NO_PUSH): {msg}')
@@ -530,12 +550,16 @@ def run_full():
     # LAST.  The n>=3 core/ablation/scale tables are secured before the long
     # runs; on a box that already holds the panels every phase just resumes
     # and the order adds nothing.
+    _announce_seed_plan('P-CORE', L.RUN, [0, 1, 2])
     L.run(L.RUN, seeds=[0, 1, 2], guard=guard, label='P-CORE 1500-step core table (results_lm_v3_1500)')
     push_ok &= git_push('v6: results_lm_v3_1500 — 9-variant core table, 1500 steps x 3 seeds')
+    _announce_seed_plan('P-ABL', L.RUN_ABL, [0, 1, 2])
     L.run(L.RUN_ABL, seeds=[0, 1, 2], guard=guard, label='P-ABL leave-one-out ablation table (results_lm_v4_abl)')
     push_ok &= git_push('v6: results_lm_v4_abl — leave-one-out ablation table (in-panel references + abl arms), 1500 steps x 3 seeds')
+    _announce_seed_plan('P-SCALE', L.RUN_SCALE, [0, 1, 2])
     L.run(L.RUN_SCALE, seeds=[0, 1, 2], guard=guard, label='P-SCALE d=384/8L/seq1024 probe (results_lm_v5_scale)')
     push_ok &= git_push('v6: results_lm_v5_scale — model-scale probe (d=384, 8L, seq1024, 5 variants x 3 seeds)')
+    _announce_seed_plan('P-LONG', {**L.RUN_LONG, 'variants': LONG_GAP_VARIANTS}, [0, 1, 2])
     L.run({**L.RUN_LONG, 'variants': LONG_GAP_VARIANTS}, seeds=[0, 1, 2], guard=guard, label='P-LONG hybrid 3-seed long-run table (results_lm_v3_long)')
     merge_long_aggregate(os.path.join(REPO, 'results_lm_v3_long'), _long_snapshot)
     push_ok &= git_push('v6: results_lm_v3_long hybrid variants at seeds 0-2 — 3-seed long-run table complete')

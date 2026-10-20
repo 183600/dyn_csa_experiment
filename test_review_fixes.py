@@ -8711,6 +8711,26 @@ def t_gapfill_numeric_reader_rejects_booleans():
     assert RG._num_or_none(1.5) is None
 
 
+def t_gapfill_announces_family_seed_plan():
+    import run_gapfill as RG
+    assert set(RG.L.RUN_ABL['variants']) >= {'csa_dynamic', 'csa_dyn_nocomp'}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        short = RG._announce_seed_plan('P-ABL', RG.L.RUN_ABL, [0, 1, 2])
+    txt = buf.getvalue()
+    # Three seeds cannot carry a 14-contrast Holm family; the phase must say so
+    # before it runs rather than after its p-values are read.
+    assert short['n_seeds'] == 3 and short['declared_contrasts'] >= 10, short
+    assert short['sufficient_for_family_rejection'] is False, short
+    assert 'WARNING' in txt and 'exploratory/descriptive' in txt, txt
+    need = short['min_seeds_for_family_significance']
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        enough = RG._announce_seed_plan('P-ABL', RG.L.RUN_ABL, list(range(need)))
+    assert enough['sufficient_for_family_rejection'] is True, enough
+    assert 'WARNING' not in buf.getvalue(), buf.getvalue()
+
+
 def t_release_tag_cannot_escape_output_dir():
     import archive_release as AR
     assert AR._release_tag('v13') == 'v13'
@@ -9823,6 +9843,7 @@ def main():
     _check('L26 bootstrap chunk scaling + zero-CE measurements', t_bootstrap_and_zero_ce_scaling_contract)
     _check('L27 error analysis excludes non-finite targets', t_error_analysis_excludes_nonfinite_targets)
     _check('L28 gapfill numeric reader rejects booleans', t_gapfill_numeric_reader_rejects_booleans)
+    _check('L28b gapfill announces the family-corrected seed plan', t_gapfill_announces_family_seed_plan)
     _check('L29 release tags cannot escape the archive directory', t_release_tag_cannot_escape_output_dir)
     _check('L30 missing id cache/sidecars is not a clean leakage audit', t_audit_leakage_missing_id_cache_is_not_ok)
     _check('L31 v12 binds the local train cache to the frozen train stream', t_v12_binds_current_train_cache_to_frozen_stream)
