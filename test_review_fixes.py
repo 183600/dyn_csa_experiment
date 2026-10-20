@@ -1324,6 +1324,15 @@ def t_pair_reason_fingerprint_gate():
     c = dict(b)
     c.pop('val_fp')
     assert 'unverifiable val_fp' in L.pair_reason(base, c)
+    # Nested records can share the full-val/eval fingerprints yet score a
+    # different held-out row fold.  Both pairing twins must compare it.
+    h = dict(b, holdout_row_fp='h1')
+    assert L.pair_reason(h, dict(h, variant='a')) is None
+    assert BR._pair_reason(h, dict(h, variant='a')) is None
+    assert 'holdout_row_fp' in (L.pair_reason(h, dict(h, holdout_row_fp='h2')) or '')
+    assert 'holdout_row_fp' in (BR._pair_reason(h, dict(h, holdout_row_fp='h2')) or '')
+    assert 'unverifiable holdout_row_fp' in L.pair_reason(base, h)
+    assert 'unverifiable holdout_row_fp' in BR._pair_reason(base, h)
     # Legacy records (both without fingerprints) keep the compatibility path.
     leg = {k: v for k, v in base.items() if k not in ('data_fp', 'val_fp', 'eval_fp')}
     assert L.pair_reason(leg, dict(leg, variant='b')) is None
