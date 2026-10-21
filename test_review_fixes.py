@@ -11168,6 +11168,17 @@ def t_cached_validation_row_groups_merge_shared_documents():
     _sel1, _ev1, _m1, _why1 = BT._nested_row_split_checked(_base_one, 4, _spec)
     assert _sel1 is None and _ev1 is None and _why1, (_sel1, _ev1, _m1, _why1)
     assert _m1['groups_aware'] is False and 'unavailable' in _m1['reason'], _m1
+    # Cache metadata is untrusted input: a non-object/corrupt meta must send
+    # the loader to its rebuild path (or a hard refusal for the frozen test
+    # cache), never crash later on meta.get().
+    _bad_meta = os.path.join(tempfile.mkdtemp(prefix='badmeta_'), 'meta.json')
+    for _payload in ('[]', '{not json', 'null'):
+        with open(_bad_meta, 'w', encoding='utf-8') as fh:
+            fh.write(_payload)
+        assert L._read_cache_meta(_bad_meta, 'unit') is None, _payload
+    with open(_bad_meta, 'w', encoding='utf-8') as fh:
+        json.dump({'ok': 1}, fh)
+    assert L._read_cache_meta(_bad_meta, 'unit') == {'ok': 1}
 
 
 def t_build_report_primary_estimand():

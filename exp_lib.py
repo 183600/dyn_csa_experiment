@@ -5937,6 +5937,28 @@ def _cache_file_sigs_match(meta, sigs):
     return bool(sigs) and isinstance(rec, dict) and all(rec.get(_k) == _v for _k, _v in sigs.items())
 
 
+def _read_cache_meta(path, label):
+    """Parse cache metadata, returning ``None`` when it cannot be trusted.
+
+    Every cache-hit path verifies content fingerprints, so a malformed meta
+    must send the caller down the rebuild path rather than crash with an
+    AttributeError halfway through verification (which would also leave a
+    stale/incompletely verified cache in place).
+    """
+    try:
+        with open(path, encoding='utf-8') as fh:
+            obj = json.load(fh)
+    except Exception as e:
+        print(f'[data] WARNING: cached {label} metadata {path} cannot be parsed '
+              f'({type(e).__name__}: {e}) — the cache is not verifiable')
+        return None
+    if not isinstance(obj, dict):
+        print(f'[data] WARNING: cached {label} metadata {path} is a '
+              f'{type(obj).__name__}, not a JSON object — the cache is not verifiable')
+        return None
+    return obj
+
+
 def _memo_file_sig(paths):
     """In-process memo key component: includes ctime/inode, so replacing a file
     (even with preserved size/mtime) invalidates the memo entry."""
@@ -6186,7 +6208,12 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         # Serve the train ids as a read-only mapping so every process (and the
         # parallel workers' corpus cache) shares the OS page cache.
         train_ids = np.load(tr_path, mmap_mode='r')
-        meta = json.load(open(me_path, encoding='utf-8'))
+        meta = _read_cache_meta(me_path, 'WikiText train/validation')
+        if meta is None:
+            print('[data] WARNING: the WikiText train/validation metadata is '
+                  'unreadable — REBUILDING the cache so a mixed or stale split '
+                  'is never silently served')
+            meta = {}
         val_batch = np.load(va_path)
         val_bnd = np.load(vp_path)
         _sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path})
@@ -6619,7 +6646,15 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             return _hit
         print('[data] loading cached TEST token ids ...')
         test_ids = np.load(te_path)
-        meta = json.load(open(me_path, encoding='utf-8'))
+        meta = _read_cache_meta(me_path, 'WikiText TEST')
+        if meta is None:
+            # The test split is frozen and must never be silently rebuilt by a
+            # mere metadata read: fail closed and require an explicit rebuild.
+            raise RuntimeError(
+                'load_wikitest: the cached TEST metadata is unreadable; the '
+                'frozen test slice cannot be verified — delete the test cache '
+                'and rebuild it explicitly (V12_REFREEZE rules apply after '
+                'the first test access)')
         test_bnd = np.load(tb_path)
         test_doc_ids = None
         if os.path.exists(td_path):
@@ -7650,7 +7685,12 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             print('[data] serving fineweb token ids from the in-process memo (same cache files, already verified) ...')
             return _hit
         print('[data] loading cached fineweb token ids ...')
-        meta = json.load(open(me_path, encoding='utf-8'))
+        meta = _read_cache_meta(me_path, 'FineWeb train/validation')
+        if meta is None:
+            print('[data] WARNING: the FineWeb train/validation metadata is '
+                  'unreadable — REBUILDING the cache so a mixed or stale split '
+                  'is never silently served')
+            meta = {}
         train_ids = _npy_serve_int32(tr_path)
         _sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path,
                                   'train_doc_ids': trd_path, 'val_doc_ids': vad_path})
