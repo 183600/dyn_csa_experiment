@@ -17725,6 +17725,11 @@ def _variant_seed_map(summary):
     with an unambiguous seed, plus the set of (variant, protocol, seed) triples
     that hold more than one record (ambiguous → excluded, first key wins).
     This is the single reader `_print_pairs` and `methodology_audit` share."""
+    if not isinstance(summary, dict):
+        # Callers feed this reader directly from JSON artifacts.  A scalar or
+        # list has no record mapping; treat it as empty evidence rather than
+        # crashing on `.items()`.
+        return {}, set()
     _legacy_ok = legacy_warm_tags(summary)
     recs = {}
     amb = set()
@@ -18750,6 +18755,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     min_n = _min_n
     default_design = design is None
     design = ABLATION_DESIGN if design is None else design
+    _summary_type = None
+    if summary is not None and not isinstance(summary, dict):
+        _summary_type = type(summary).__name__
+        summary = {}
     recs, amb = _variant_seed_map(summary)
     present = sorted({v for (v, _t, _s) in recs})
     if baselines is None:
@@ -18788,6 +18797,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
               'hypotheses': {}, 'hypotheses_incomplete': [], 'hypothesis_audit': {},
               'metric_audit': {}, 'baseline_tuning': {}, 'simple_baseline': {},
               'family': {}, 'warnings': []}
+    if _summary_type is not None:
+        report['warnings'].append(
+            f'summary is a {_summary_type}, not an object; no record-level '
+            'contrast can be audited')
 
     def _collect(design_group, kind):
         out = {}
