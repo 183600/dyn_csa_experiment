@@ -16043,6 +16043,39 @@ def metric_policy_audit(summary=None, policy=None):
                             _bad_niah.append('conditional-primary-availability-invalid')
                         elif _rec_avail is False:
                             _bad_niah.append('conditional-primary-unavailable')
+                    # A deterministic lexical copy rule is the simplest
+                    # baseline that can solve a key->value retrieval task.  If
+                    # the model does not beat it, the learned indexer has not
+                    # demonstrated even the copy operation; surface that next
+                    # to the model score instead of letting the uniform floor
+                    # stand in for a real baseline.
+                    _cr = _b.get('copy_rule_baseline')
+                    if _cr is not None:
+                        if not isinstance(_cr, dict):
+                            _bad_niah.append('copy-rule-invalid')
+                        else:
+                            _ca = _finite_scalar(_cr.get('acc'))
+                            _cn = _exact_count(_cr.get('n'), minimum=1)
+                            _cnc = _exact_count(_cr.get('n_correct'), minimum=0)
+                            _cmc = _exact_count(_cr.get('n_missing_context'), minimum=0)
+                            if _ca is None or not (0.0 <= _ca <= 1.0):
+                                _bad_niah.append('copy-rule-acc-invalid')
+                            if _cn is None or _cnc is None or _cnc > (_cn or 0):
+                                _bad_niah.append('copy-rule-count-invalid')
+                            elif (_ca is not None
+                                  and abs(_ca - (_cnc / _cn)) > 1e-9):
+                                _bad_niah.append('copy-rule-acc-count-inconsistent')
+                            if _cmc is None or (_cn is not None and _cmc > _cn):
+                                _bad_niah.append('copy-rule-missing-context-invalid')
+                            if _cn is not None and _nq is not None and _cn != _nq:
+                                _bad_niah.append('copy-rule-sample-mismatch')
+                            if (_ca is not None and _a is not None and _a <= _ca
+                                    and _cn is not None and _cn >= 2):
+                                out['warnings'].append(
+                                    f'{_b.get("variant") or _b.get("name") or "?"}: NIAH '
+                                    f'top-1 accuracy {_a:.4f} does not beat the nearest-key '
+                                    f'copy rule ({_ca:.4f}) — the learned mechanism has not '
+                                    'shown a retrieval gain over an untrained lexical baseline')
                 else:
                     _legacy_niah.append(_b.get('variant') or _b.get('name') or '?')
             out['checks'].append({'metric': 'niah_retrieval', 'policy': 'niah_retrieval',

@@ -4264,6 +4264,21 @@ def t_retrieval_metrics_and_niah_trivial_floor():
     rec = dict(rm, task='niah_natural', nll=1.25, n_queries=rm['n'])
     good = {'n::seed0': rec}
     assert L.metric_policy_audit(good)['status'] == 'ok', L.metric_policy_audit(good)
+    # A persisted lexical copy-rule floor must be reproducible from its exact
+    # counts, and a model that does not beat it is called out (the rule is the
+    # simplest baseline that can solve this copy task).
+    with_rule = json.loads(json.dumps(good))
+    with_rule['n::seed0']['copy_rule_baseline'] = {
+        'n': 4, 'n_correct': 3, 'acc': 0.75, 'n_missing_context': 0,
+        'rule': 'nearest_previous_key_copy'}
+    ar = L.metric_policy_audit(with_rule)
+    assert ar['status'] == 'warn' and any('copy rule' in w for w in ar['warnings']), ar
+    bad_rule = json.loads(json.dumps(with_rule))
+    bad_rule['n::seed0']['copy_rule_baseline']['acc'] = 0.9
+    abr = L.metric_policy_audit(bad_rule)
+    assert abr['status'] == 'warn' and any(
+        'copy-rule-acc-count-inconsistent' in str(c.get('invalid'))
+        for c in abr['checks']), abr
     assert rm['recommended_primary_metric'] == 'top1_accuracy', rm
     # Extreme answer-class imbalance switches the conditional primary to
     # macro recall; a top-1 headline would otherwise be dominated by the
