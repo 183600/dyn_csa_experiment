@@ -1124,6 +1124,85 @@ def _finite_values(col):
     return col[np.isfinite(col)]
 
 
+def _scaled_maxabs(values):
+    """Values divided by their largest magnitude, plus that magnitude.
+
+    Scaling by the maximum absolute value keeps every intermediate <= 1, so a
+    sum/quantile cannot overflow even when the original finite values are near
+    float64's limit.  Returns ``(None, 0.0)`` for an empty/all-zero column.
+    """
+    if values.size == 0:
+        return None, 0.0
+    m = float(np.max(np.abs(values)))
+    if not math.isfinite(m) or m == 0.0:
+        return None, 0.0
+    return values / m, m
+
+
+def _safe_mean(values):
+    """Float64 mean that falls back to a max-scaled sum on overflow."""
+    if values.size == 0:
+        return 0.0
+    with np.errstate(over='ignore', invalid='ignore'):
+        value = float(np.mean(values))
+    if math.isfinite(value):
+        return value
+    scaled, m = _scaled_maxabs(values)
+    if scaled is None:
+        return 0.0
+    value = float(np.mean(scaled)) * m
+    return value if math.isfinite(value) else 0.0
+
+
+def _safe_std(values):
+    """Population std that falls back to a max-scaled computation."""
+    if values.size == 0:
+        return 0.0
+    with np.errstate(over='ignore', invalid='ignore'):
+        value = float(np.std(values, ddof=0))
+    if math.isfinite(value):
+        return value
+    scaled, m = _scaled_maxabs(values)
+    if scaled is None:
+        return 0.0
+    value = float(np.std(scaled, ddof=0)) * m
+    return value if math.isfinite(value) else 0.0
+
+
+def _safe_median(values):
+    """Median without the ``(a + b) / 2`` overflow of NumPy's even case."""
+    if values.size == 0:
+        return 0.0
+    with np.errstate(over='ignore', invalid='ignore'):
+        value = float(np.median(values))
+    if math.isfinite(value):
+        return value
+    scaled, m = _scaled_maxabs(values)
+    if scaled is None:
+        return 0.0
+    value = float(np.median(scaled)) * m
+    return value if math.isfinite(value) else 0.0
+
+
+def _safe_quantiles(values, qs):
+    """Quantiles that fall back to max-scaled values on overflow."""
+    if values.size == 0:
+        return (-math.inf, math.inf)
+    with np.errstate(over='ignore', invalid='ignore'):
+        out = np.quantile(values, qs)
+    out = tuple(float(v) for v in np.asarray(out).reshape(-1))
+    if all(math.isfinite(v) for v in out):
+        return out
+    scaled, m = _scaled_maxabs(values)
+    if scaled is None:
+        return (-math.inf, math.inf)
+    out = np.quantile(scaled, qs) * m
+    out = tuple(float(v) for v in np.asarray(out).reshape(-1))
+    if all(math.isfinite(v) for v in out):
+        return out
+    return (-math.inf, math.inf)
+
+
 def _persisted_features(stats, *, what):
     """Validate a persisted ``features`` table against ``n_features_in``.
 
@@ -1286,7 +1365,7 @@ class LeakageSafePreprocessor:
                 fill = 0.0
             if self.clip_quantiles is not None:
                 if finite.size:
-                    q_lo, q_hi = np.quantile(finite, self.clip_quantiles)
+                    q_lo, q_hi = _safe_quantiles(finite, self.clip_quantiles)
                 else:
                     q_lo, q_hi = -np.inf, np.inf
                 if not (np.isfinite(q_lo) and np.isfinite(q_hi)):
@@ -1306,35 +1385,51 @@ class LeakageSafePreprocessor:
             # never recomputed from validation/test data.
             center, factor = 0.0, 1.0
             if self.scale == 'standard':
-                center = float(np.mean(imputed))
-                sd = float(np.std(imputed, ddof=0))
+                center = _safe_mean(imputed)
+                sd = _safe_std(imputed)
                 factor = sd if sd > self.eps else 1.0
             elif self.scale == 'robust':
-                center = float(np.median(imputed))
-                q1, q3 = np.quantile(imputed, (0.25, 0.75))
-                iqr = float(q3 - q1)
-                if iqr > self.eps:
+                center = _safe_median(imputed)
+                q1, q3 = _safe_quantiles(imputed, (0.25, 0.75))
+                with np.errstate(over='ignore', invalid='ignore'):
+                    iqr = float(q3 - q1)
+                if math.isfinite(iqr) and iqr > self.eps:
                     factor = iqr
                 else:
-                    sd = float(np.std(imputed, ddof=0))
+                    sd = _safe_std(imputed)
                     factor = sd if sd > self.eps else 1.0
             elif self.scale == 'minmax':
                 center = float(np.min(imputed))
-                span = float(np.max(imputed) - center)
-                factor = span if span > self.eps else 1.0
+                with np.errstate(over='ignore', invalid='ignore'):
+                    span = float(np.max(imputed) - center)
+                if not math.isfinite(span):
+                    # The true training range exceeds float64 (e.g. -1e308
+                    # to +1e308).  Keep the fit representable and finite by
+                    # scaling with the largest magnitude; transform uses the
+                    # divided form below, so no intermediate subtraction can
+                    # overflow.
+                    scaled, m = _scaled_maxabs(imputed)
+                    if scaled is not None:
+                        center = float(np.min(scaled)) * m
+                        factor = m
+                factor = span if math.isfinite(span) and span > self.eps else factor
             if not np.isfinite(center):
                 center = 0.0
             if not np.isfinite(factor) or factor <= self.eps:
                 factor = 1.0
+            # Every persisted descriptive statistic must itself be finite:
+            # from_stats() refuses a non-finite mean/std/median, so an
+            # overflowed statistic used to make a successfully fitted
+            # preprocessor impossible to reload.
             stats.append({
                 'fill': float(fill),
                 'clip_lo': float(q_lo) if np.isfinite(q_lo) else None,
                 'clip_hi': float(q_hi) if np.isfinite(q_hi) else None,
                 'center': center,
                 'factor': factor,
-                'mean': float(np.mean(imputed)),
-                'std': float(np.std(imputed, ddof=0)),
-                'median': float(np.median(imputed)),
+                'mean': _safe_mean(imputed),
+                'std': _safe_std(imputed),
+                'median': _safe_median(imputed),
                 'min': float(np.min(imputed)),
                 'max': float(np.max(imputed)),
             })
@@ -1364,7 +1459,12 @@ class LeakageSafePreprocessor:
                 col = np.clip(col, lo, hi)
             col = np.where(np.isnan(col), st['fill'], col)
             if self.scale != 'none':
-                col = (col - st['center']) / st['factor']
+                # Divide before subtracting.  ``(x - center) / factor`` can
+                # overflow for finite x/center of opposite sign near the
+                # float64 limit even though the scaled result is small;
+                # x/factor - center/factor is mathematically identical and
+                # stays finite whenever the scaled value is representable.
+                col = col / st['factor'] - st['center'] / st['factor']
             if self.clip_z is not None and self.scale != 'none':
                 col = np.clip(col, -self.clip_z, self.clip_z)
             out[:, j] = col
