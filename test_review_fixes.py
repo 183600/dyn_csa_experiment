@@ -9439,6 +9439,16 @@ def t_exact_numeric_contracts_and_fingerprint():
         DG._matrix_fingerprint(np.array([[Decimal('1.5')]], dtype=object))
     assert DG._matrix_fingerprint(np.array([[2 ** 53 + 1]], dtype=np.int64)) != \
         DG._matrix_fingerprint(np.array([[2 ** 53]], dtype=np.int64))
+    # An exactly representable uint64 above int64's maximum must keep the same
+    # digest as its object/float twin; the unsigned round-trip used to mark
+    # every such value inexact merely because it did not fit int64.
+    _u_exact = np.array([[2 ** 63], [2 ** 63 + 2048]], dtype=np.uint64)
+    assert DG._matrix_fingerprint(_u_exact) == \
+        DG._matrix_fingerprint(_u_exact.astype(object))
+    assert DG._matrix_fingerprint(np.array([[2 ** 63]], dtype=np.uint64)) == \
+        DG._matrix_fingerprint(np.array([[float(2 ** 63)]]))
+    assert DG._matrix_fingerprint(np.array([[2 ** 63 + 1]], dtype=np.uint64)) != \
+        DG._matrix_fingerprint(np.array([[2 ** 63]], dtype=np.uint64))
     # A corpus fingerprint is a function of token values, not storage width.
     _toks = np.array([0, 1, 2, 250, 255], dtype=np.int64)
     _fps = {L._ids_fp(_toks.astype(_dt)) for _dt in

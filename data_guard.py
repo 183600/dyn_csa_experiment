@@ -3914,11 +3914,19 @@ def _matrix_fingerprint(X):
                              or np.issubdtype(arr.dtype, np.timedelta64)) else block.view(np.int64)
         _raw = np.asarray(_raw)
         if np.issubdtype(_raw.dtype, np.unsignedinteger):
-            _safe = _raw <= np.iinfo(np.int64).max
-            _back = np.zeros(_raw.shape, dtype=np.int64)
-            if _safe.any():
-                _back[_safe] = block_f[_safe].astype(np.int64)
-            _exact = _safe & (_back == _raw)
+            # Do not use int64 as the round-trip type: uint64 values above
+            # int64's maximum are still exactly representable in float64
+            # (e.g. 2**63, or every multiple of 2048 near 2**64).  Treating
+            # all of them as inexact appended a tail that the equivalent
+            # object/float row does not have, so the same value fingerprinted
+            # differently by dtype.  Round-trip through uint64 with an
+            # explicit representable-range guard instead.
+            _castable = (np.isfinite(block_f) & (block_f >= 0.0)
+                         & (block_f < 2.0 ** 64))
+            _back_u = np.zeros(_raw.shape, dtype=np.uint64)
+            if _castable.any():
+                _back_u[_castable] = block_f[_castable].astype(np.uint64)
+            _exact = _castable & (_back_u == _raw)
         else:
             _back = block_f.astype(np.int64)
             _exact = _back == _raw
