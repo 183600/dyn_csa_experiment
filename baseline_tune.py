@@ -198,6 +198,24 @@ def _nested_row_split(base, n_rows, spec):
     return _sel, _ev, _meta
 
 
+def _nested_row_split_checked(base, n_rows, spec):
+    """Group-aware nested split, or an explicit reason when it cannot exist.
+
+    A present document-id sidecar can legitimately make the requested folds
+    impossible (a tiny smoke slice where every row shares one document).  That
+    is not the same as a missing sidecar: silently falling back to row-only
+    folds would put one document on both sides of the selection cut.  Return
+    ``(None, None, meta, reason)`` so the caller can fall back to the full
+    validation sample and record that the nested contract was not met.
+    """
+    try:
+        _sel, _ev, _meta = _nested_row_split(base, n_rows, spec)
+        return _sel, _ev, _meta, None
+    except ValueError as _e:
+        return None, None, {'groups_aware': False,
+                            'reason': f'group-aware row split unavailable: {_e}'}, str(_e)
+
+
 def _contrast_plan(protocol, groups, selected):
     """Declared tuned comparisons: each group's method arm vs the other arms
     in the SAME parameter-matching group.
@@ -341,9 +359,13 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                             _split_reason = f'validation slice has only {_n_rows} row(s)'
                         else:
                             if _row_state['meta'] is None:
-                                _sel, _ev, _meta = _nested_row_split(base, _n_rows, _row_spec)
-                                _row_state.update(n_rows=_n_rows, selection=_sel,
-                                                  evaluation=_ev, meta=_meta)
+                                _sel, _ev, _meta, _why = _nested_row_split_checked(
+                                    base, _n_rows, _row_spec)
+                                if _why:
+                                    _split_reason = _why
+                                else:
+                                    _row_state.update(n_rows=_n_rows, selection=_sel,
+                                                      evaluation=_ev, meta=_meta)
                             if _n_rows != _row_state['n_rows']:
                                 _split_reason = ('validation row count changed between trials '
                                                  f'({_n_rows} vs {_row_state["n_rows"]})')
@@ -795,7 +817,8 @@ def _run_final(base, outdir, protocol, selected):
         _lens = {len(r.get('nll_per_row') or []) for r in merged.values()} if merged else set()
         if len(_lens) == 1 and min(_lens) >= 2:
             _n_rows = next(iter(_lens))
-            _sel, _eval_idx, _meta = _nested_row_split(base, _n_rows, _row_spec)
+            _sel, _eval_idx, _meta, _why = _nested_row_split_checked(
+                base, _n_rows, _row_spec)
             _final_rows_meta.update(_meta)
             # Compute every holdout estimate BEFORE mutating any record.  A
             # partial assignment would leave some records on the later row
@@ -804,21 +827,26 @@ def _run_final(base, outdir, protocol, selected):
             # nested split was not applied.  Either all records move to the
             # held-out fold or none do.
             _pending, _bad = [], []
-            for k, r in merged.items():
-                st = L.record_subset_ppl(r, _eval_idx)
-                # A finite row index is not enough: an overflowed/underflowed
-                # holdout PPL is unmeasured.  Treating it as applied would let
-                # `_eval_metric` silently fall back to full validation for
-                # THAT record while the artifact still claims every seed used
-                # the held-out fold.
-                if st is None or not L.ppl_is_usable(st.get('ppl')):
-                    _bad.append(k)
-                    continue
-                _pending.append((r, st))
+            if _why is None:
+                for k, r in merged.items():
+                    st = L.record_subset_ppl(r, _eval_idx)
+                    # A finite row index is not enough: an overflowed/underflowed
+                    # holdout PPL is unmeasured.  Treating it as applied would let
+                    # `_eval_metric` silently fall back to full validation for
+                    # THAT record while the artifact still claims every seed used
+                    # the held-out fold.
+                    if st is None or not L.ppl_is_usable(st.get('ppl')):
+                        _bad.append(k)
+                        continue
+                    _pending.append((r, st))
+            else:
+                _bad.append(_why)
             _final_rows_meta['applied'] = not _bad
             if _bad:
-                _final_rows_meta['reason'] = ('final records without usable per-row NLL '
-                                              f'accounting: {sorted(_bad)[:5]}')
+                _final_rows_meta['reason'] = (
+                    '; '.join(map(str, _bad)) if _why is not None else
+                    ('final records without usable per-row NLL '
+                     f'accounting: {sorted(_bad)[:5]}'))
             else:
                 for r, st in _pending:
                     r['ppl_full_validation'] = r.get('ppl')
@@ -1040,8 +1068,10 @@ def run_simple(base_cfg=None, outdir='results_baseline_tuning', protocol=None):
     _proto = protocol if protocol is not None else L.SIMPLE_BASELINE_POLICY
     _row_spec = L.tuning_row_split_spec(_proto)
     _sel_rows = _eval_rows = _row_meta = None
+    _row_unavailable = None
     if _row_spec is not None and rows >= 4:
-        _sel_rows, _eval_rows, _row_meta = _nested_row_split(base, rows, _row_spec)
+        _sel_rows, _eval_rows, _row_meta, _row_unavailable = (
+            _nested_row_split_checked(base, rows, _row_spec))
     artifact = L.simple_baseline_fit(
         train_ids, eval_slice, vocab, protocol=protocol,
         selection_rows=_sel_rows, evaluation_rows=_eval_rows, row_split=_row_meta)
@@ -1049,8 +1079,9 @@ def run_simple(base_cfg=None, outdir='results_baseline_tuning', protocol=None):
     artifact['data']['eval_rows'] = int(len(_eval_rows) if _eval_rows is not None else rows)
     if _sel_rows is None:
         artifact['data']['nested_selection_unavailable_reason'] = (
-            'validation has fewer than 4 rows (two per chronological fold)' if rows < 4
-            else 'the simple-baseline protocol declares no nested row split')
+            _row_unavailable if _row_unavailable is not None else
+            ('validation has fewer than 4 rows (two per chronological fold)' if rows < 4
+             else 'the simple-baseline protocol declares no nested row split'))
         artifact['data']['eval_fp'] = L._ids_fp(np.ascontiguousarray(eval_slice).reshape(-1))
     artifact['data_version'] = L._data_version(artifact['data'])
     if isinstance(artifact.get('provenance'), dict):

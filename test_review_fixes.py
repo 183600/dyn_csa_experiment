@@ -11015,7 +11015,7 @@ def t_validation_row_split_group_aware():
 
 
 def t_cached_validation_row_groups_merge_shared_documents():
-    # The cached validation stream stores a document id per token.  Fixed row
+    # The token-level sidecar stores a document id per token.  Fixed row
     # windows can straddle a document, so rows 1-3 must become one group; a
     # row-only split would otherwise be able to select on part of a document
     # and evaluate on another part.
@@ -11023,10 +11023,10 @@ def t_cached_validation_row_groups_merge_shared_documents():
     _sl, _ntr, _vb, _vs = 2, 1, 10, 4
     _tag = f'v5_sl{_sl}_cap{_ntr}_v{_vb}_vs{_vs}'
     _docs = np.array([1, 1, 2, 2, 2, 3, 3, 3], dtype=np.uint64)
-    np.save(os.path.join(_d, f'val_doc_ids_{_tag}.npy'), _docs)
+    np.save(os.path.join(_d, f'val_token_doc_ids_{_tag}.npy'), _docs)
     with open(os.path.join(_d, f'meta_{_tag}.json'), 'w', encoding='utf-8') as fh:
-        json.dump({'doc_ids': {'validation_count': int(_docs.size),
-                               'validation_fp': L._ids_fp(_docs)}}, fh)
+        json.dump({'doc_ids': {'validation_token_count': int(_docs.size),
+                               'validation_token_fp': L._ids_fp(_docs)}}, fh)
     _groups, _meta = L.cached_validation_row_groups(
         _sl, _ntr, vocab_size=_vb, val_seqs=_vs, n_rows=4, cache_dir=_d)
     assert _groups == [0, 1, 1, 1], (_groups, _meta)
@@ -11052,18 +11052,30 @@ def t_cached_validation_row_groups_merge_shared_documents():
     _g, _m = L.cached_validation_row_groups(
         _sl, _ntr, vocab_size=_vb, val_seqs=_vs, n_rows=4, cache_dir=tempfile.mkdtemp())
     assert _g is None and _m['groups_aware'] is False and 'absent' in _m['reason'], (_g, _m)
-    # A present but too-short sidecar must fail closed.
+    # A legacy document-level sidecar cannot be expanded to token groups; it
+    # is an explicit fallback (not a crash and not a fabricated split).
+    _d_legacy = tempfile.mkdtemp(prefix='valgroups_legacy_')
+    np.save(os.path.join(_d_legacy, f'val_doc_ids_{_tag}.npy'),
+            np.array([1, 2, 3], dtype=np.uint64))
+    _gl, _ml = L.cached_validation_row_groups(
+        _sl, _ntr, vocab_size=_vb, val_seqs=_vs, n_rows=4, cache_dir=_d_legacy)
+    assert _gl is None and _ml['groups_aware'] is False, (_gl, _ml)
+    assert 'legacy' in _ml['reason'], _ml
+    # A present but too-short TOKEN sidecar must fail closed.
     _d2 = tempfile.mkdtemp(prefix='valgroups_bad_')
     _tag2 = f'v5_sl{_sl}_cap{_ntr}_v{_vb}_vs{_vs}'
-    np.save(os.path.join(_d2, f'val_doc_ids_{_tag2}.npy'),
-            np.array([1, 1, 2, 2], dtype=np.uint64))
+    _docs_short = np.array([1, 1, 2, 2], dtype=np.uint64)
+    np.save(os.path.join(_d2, f'val_token_doc_ids_{_tag2}.npy'), _docs_short)
+    with open(os.path.join(_d2, f'meta_{_tag2}.json'), 'w', encoding='utf-8') as fh:
+        json.dump({'doc_ids': {'validation_token_count': int(_docs_short.size),
+                               'validation_token_fp': L._ids_fp(_docs_short)}}, fh)
     try:
         L.cached_validation_row_groups(_sl, _ntr, vocab_size=_vb, val_seqs=_vs,
                                        n_rows=4, cache_dir=_d2)
     except ValueError as e:
         assert 'need' in str(e), e
     else:
-        raise AssertionError('a short document-id sidecar must be refused')
+        raise AssertionError('a short token-level document-id sidecar must be refused')
 
 
 def t_build_report_primary_estimand():

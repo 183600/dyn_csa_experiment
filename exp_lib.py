@@ -6170,6 +6170,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
     trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
     vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
+    trd_tok_path = os.path.join(cache_dir, f'train_token_doc_ids_{tag}.npy')
+    vad_tok_path = os.path.join(cache_dir, f'val_token_doc_ids_{tag}.npy')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
         _sig = _memo_file_sig({'train': tr_path, 'val': va_path,
                                'bnd': vp_path, 'meta': me_path})
@@ -6338,6 +6340,13 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         arr = np.empty(cap_tokens, dtype=_dtype)
         cursor = 0
         _doc_ids = array.array('Q')
+        # Per-token document ids are the only representation that can map a
+        # fixed validation ROW back to the documents it overlaps.  The legacy
+        # sidecar stored one id per document, which cannot be expanded without
+        # per-document token lengths.  Emit both, so the leakage audit keeps
+        # its document-level identity and the fold helper gets token-level
+        # groups from the SAME stream.
+        _token_doc_ids = array.array('Q')
         _skipped = {'exact': 0, 'near': 0}
         _dedup_by_split[split] = _skipped
         _n_nonempty_seen = 0
@@ -6369,15 +6378,18 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                     ids = enc.ids
                     if _fp is None:
                         _fp = _doc_exact_fp(_row)
-                    _doc_ids.append(int(_doc_id_u64(_fp)))
+                    _doc_u = int(_doc_id_u64(_fp))
+                    _doc_ids.append(_doc_u)
                     take = min(len(ids), cap_tokens - cursor)
                     if take > 0:
                         arr[cursor:cursor + take] = ids[:take]
+                        _token_doc_ids.extend([_doc_u] * int(take))
                         cursor += take
                     if cursor >= cap_tokens:
                         _stop = True
                         break
                     arr[cursor] = _eos
+                    _token_doc_ids.append(_doc_u)
                     cursor += 1
                     if cursor >= cap_tokens:
                         _stop = True
@@ -6389,19 +6401,21 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                       f'{sum(_skipped.values())} duplicate docs skipped')
         _doc_arr = (np.frombuffer(_doc_ids, dtype=np.uint64).copy()
                     if _doc_ids else np.empty(0, dtype=np.uint64))
+        _tok_doc_arr = (np.frombuffer(_token_doc_ids, dtype=np.uint64).copy()
+                        if _token_doc_ids else np.empty(0, dtype=np.uint64))
         if cursor < arr.size:
             exact = arr[:cursor].copy()
             del arr
-            return exact, _doc_arr
-        return arr, _doc_arr
+            return exact, _doc_arr, _tok_doc_arr
+        return arr, _doc_arr, _tok_doc_arr
     print(f'[data] tokenising train (cap {n_train_tokens} tokens) ...')
-    train_ids, train_doc_ids = stream_tokenise(
+    train_ids, train_doc_ids, train_token_doc_ids = stream_tokenise(
         'train', n_train_tokens + seq_len, 'train', _dtype=np.int32)
     print(f'[data] train tokens = {len(train_ids)}  vocab = {vocab}')
     if len(train_ids) < n_train_tokens + seq_len:
         print(f'[data] WARNING: the train split ran dry at {len(train_ids)} tokens (< requested {n_train_tokens + seq_len}); runs configured for the advertised token target will train on fewer tokens than advertised')
     print('[data] tokenising validation ...')
-    val_ids, val_doc_ids = stream_tokenise(
+    val_ids, val_doc_ids, val_token_doc_ids = stream_tokenise(
         'validation', val_seqs * seq_len + seq_len, 'val', _dtype=np.int64)
     n_val = min(len(val_ids) // seq_len, val_seqs)
     val_batch = val_ids[:n_val * seq_len].reshape(n_val, seq_len)
@@ -6418,7 +6432,9 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     val_bnd = np.isin(val_batch, bnd_ids)
     print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
     for _p, _a in ((tr_path, train_ids), (va_path, val_batch), (vp_path, val_bnd),
-                   (trd_path, train_doc_ids), (vad_path, val_doc_ids)):
+                   (trd_path, train_doc_ids), (vad_path, val_doc_ids),
+                   (trd_tok_path, train_token_doc_ids),
+                   (vad_tok_path, val_token_doc_ids)):
         _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(_p)), prefix=os.path.basename(_p) + '.', suffix='.tmp')
         try:
             with os.fdopen(_fd, 'wb') as _fh:
@@ -6452,6 +6468,10 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             'validation_count': int(val_doc_ids.size),
             'train_fp': _ids_fp(train_doc_ids),
             'validation_fp': _ids_fp(val_doc_ids),
+            'train_token_count': int(train_token_doc_ids.size),
+            'validation_token_count': int(val_token_doc_ids.size),
+            'train_token_fp': _ids_fp(train_token_doc_ids),
+            'validation_token_fp': _ids_fp(val_token_doc_ids),
             'overlap': _shared_docs,
             'disjoint': True,
             'policy': 'whole_document_exact_and_near_duplicate_filtered',
@@ -7613,6 +7633,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
     trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
     vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
+    trd_tok_path = os.path.join(cache_dir, f'train_token_doc_ids_{tag}.npy')
+    vad_tok_path = os.path.join(cache_dir, f'val_token_doc_ids_{tag}.npy')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path,
                                         trd_path, vad_path))):
         _sig = _memo_file_sig({'train': tr_path, 'val': va_path, 'bnd': vp_path,
@@ -12810,10 +12832,14 @@ def cached_validation_row_groups(seq_len, n_train_tokens, vocab_size=8192,
     The tokenised validation stream is a concatenation of whole documents; a
     fixed row window can therefore straddle a document boundary.  A row-only
     chronological split can put two rows of the SAME document on opposite
-    sides of the selection/evaluation cut.  The cache already stores a
-    per-token document id (used by the leakage audit); this helper collapses
-    it to one group per row and merges rows connected by any shared document.
-    The result can be passed to :func:`validation_row_split` as ``groups``.
+    sides of the selection/evaluation cut.  The cache stores a per-token
+    document id (``val_token_doc_ids_*.npy``; the document-level sidecar is
+    kept for the leakage audit); this helper collapses it to one group per row
+    and merges rows connected by any shared document.  The result can be
+    passed to :func:`validation_row_split` as ``groups``.  A legacy cache with
+    only the document-level sidecar cannot be expanded to tokens, so it is an
+    explicit ``groups_aware=False`` fallback rather than a crash or a fake
+    split.
 
     Returns ``(groups, meta)``.  ``groups`` is ``None`` when the sidecar is
     absent or cannot describe this slice; the caller must then fall back
@@ -12827,8 +12853,10 @@ def cached_validation_row_groups(seq_len, n_train_tokens, vocab_size=8192,
     """
     cache_dir = _wt_cache_dir(cache_dir)
     tag = f'v5_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}'
-    path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
+    token_path = os.path.join(cache_dir, f'val_token_doc_ids_{tag}.npy')
+    legacy_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
     meta_path = os.path.join(cache_dir, f'meta_{tag}.json')
+    path = token_path if os.path.exists(token_path) else legacy_path
     if n_rows is None:
         n_rows = int(val_seqs)
     _nr = _as_seed_int(n_rows)
@@ -12838,7 +12866,17 @@ def cached_validation_row_groups(seq_len, n_train_tokens, vocab_size=8192,
         raise ValueError('cached_validation_row_groups: n_rows/seq_len/val_seqs must be positive integers')
     if not os.path.exists(path):
         return None, {'groups_aware': False,
-                      'reason': f'validation document-id sidecar {path} is absent'}
+                      'reason': f'validation token document-id sidecar {token_path} is absent'}
+    _legacy_sidecar = (path == legacy_path)
+    if _legacy_sidecar:
+        # The old file has one id per document.  Without per-document token
+        # lengths it cannot be mapped onto rows; accepting it would either
+        # crash (ids < tokens) or fabricate groups.
+        return None, {'groups_aware': False,
+                      'reason': ('the cache has only the legacy document-level '
+                                 'val_doc_ids sidecar, which cannot be expanded to '
+                                 'token-level row groups; rebuild the cache to get '
+                                 'val_token_doc_ids')}
     try:
         doc_ids = np.load(path)
     except Exception as e:
@@ -12861,13 +12899,21 @@ def cached_validation_row_groups(seq_len, n_train_tokens, vocab_size=8192,
             raise ValueError(f'cached_validation_row_groups: cannot parse {meta_path} '
                              f'({type(e).__name__}: {e})') from None
         _mdoc = (_meta or {}).get('doc_ids') or {}
-        _want_fp = _mdoc.get('validation_fp')
-        if _want_fp and _want_fp != _ids_fp(doc_ids):
-            raise ValueError('cached_validation_row_groups: validation document-id '
-                             'sidecar does not match the cache metadata fingerprint')
-        if int(_mdoc.get('validation_count', -1)) not in (-1, int(doc_ids.size)):
+        _want_fp = _mdoc.get('validation_token_fp')
+        if _want_fp is None:
+            # A new sidecar without a token-level fingerprint cannot be bound
+            # to the stream; do not fall back to the document-level fp (it
+            # describes a different array).
+            raise ValueError('cached_validation_row_groups: cache metadata has no '
+                             'validation_token_fp for the token-level sidecar')
+        if _want_fp != _ids_fp(doc_ids):
+            raise ValueError('cached_validation_row_groups: validation token '
+                             'document-id sidecar does not match the cache metadata '
+                             'fingerprint')
+        _want_n = _mdoc.get('validation_token_count')
+        if _want_n is None or int(_want_n) != int(doc_ids.size):
             raise ValueError('cached_validation_row_groups: sidecar length disagrees '
-                             'with the cache metadata document-id count')
+                             'with the cache metadata token-id count')
     # Union rows connected by any shared document.  A document can legitimately
     # span many rows; all of them become one group.  If a document id reappears
     # non-contiguously (a corrupt or misaligned sidecar), the merged group also
@@ -12901,7 +12947,7 @@ def cached_validation_row_groups(seq_len, n_train_tokens, vocab_size=8192,
     groups = [int(_find(r)) for r in range(int(_nr))]
     return groups, {
         'groups_aware': True,
-        'group_source': 'cached_validation_doc_ids',
+        'group_source': 'cached_validation_token_doc_ids',
         'group_policy': 'rows connected by any shared whole document are one group',
         'n_groups': int(len(set(groups))),
         'n_rows': int(_nr),
