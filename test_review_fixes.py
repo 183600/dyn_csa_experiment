@@ -649,6 +649,55 @@ def t_token_error_cause_taxonomy():
     assert unmeasured['primary'] == 'unmeasured', unmeasured
 
 
+def t_error_analysis_rare_basis_is_measured():
+    # An empty/malformed training sample is not a frequency table of zeros.
+    # The old path labelled every target "rare", manufacturing an
+    # annotation/rare-target cause with no evidence.
+    vocab = 8
+
+    class _Stub:
+        training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = bool(mode)
+            return self
+
+        def trunk(self, ids):
+            return torch.zeros((ids.shape[0], ids.shape[1], 2))
+
+        def head(self, h):
+            return torch.zeros((h.shape[0], h.shape[1], vocab))
+
+    vb = (np.arange(8, dtype=np.int64) % vocab).reshape(2, 4)
+    empty = L.analyze_errors(_Stub(), vb, vocab, torch.device('cpu'),
+                             top_n=2, top_tokens=8, train_ids=np.array([], dtype=np.int64))
+    assert empty['rare_target_basis'].startswith('unavailable'), empty
+    assert 'empty train_ids' in (empty['rare_target_problem'] or ''), empty
+    assert empty['cause_counts_all']['annotation_or_rare_target']['n'] == 0, empty
+    assert empty['cause_counts_all']['ambiguous_context']['n'] == empty['n_targets'], empty
+
+    # A valid table marks only tokens at/under the rare threshold.
+    tr = np.array([1] * 5 + [2] * 6 + [3] * 100, dtype=np.int64)
+    ok = L.analyze_errors(_Stub(), vb, vocab, torch.device('cpu'),
+                          top_n=2, top_tokens=8, train_ids=tr)
+    assert ok['rare_target_basis'] == 'train_frequency', ok
+    assert ok['rare_target_problem'] is None, ok
+    assert ok['cause_counts_all']['annotation_or_rare_target']['n'] > 0, ok
+
+    # Out-of-range / non-integer samples disable the flag instead of being
+    # silently truncated into a different vocabulary's frequencies.
+    for bad in (np.array([-1, 2]), np.array([vocab, 2]), np.array([1.5, 2.0])):
+        r = L.analyze_errors(_Stub(), vb, vocab, torch.device('cpu'),
+                             top_n=2, top_tokens=8, train_ids=bad)
+        assert r['rare_target_basis'].startswith('unavailable'), (bad, r)
+        assert r['rare_target_problem'], (bad, r)
+        assert r['cause_counts_all']['annotation_or_rare_target']['n'] == 0, (bad, r)
+
+
 def t_loss_curve_downsample_keeps_spikes_and_nan():
     # Long runs are downsampled before the curve is written.  A one-step
     # explosion/NaN must survive that reduction, or a diverged run looks clean.
@@ -13847,6 +13896,7 @@ def main():
     _check('L25b baseline tuning audit checks search-to-final horizon transfer', t_baseline_horizon_transfer_audit)
     _check('L26 bootstrap chunk scaling + zero-CE measurements', t_bootstrap_and_zero_ce_scaling_contract)
     _check('L27 error analysis excludes non-finite targets', t_error_analysis_excludes_nonfinite_targets)
+    _check('L27b rare-target triage needs a measured frequency basis', t_error_analysis_rare_basis_is_measured)
     _check('L28 gapfill numeric reader rejects booleans', t_gapfill_numeric_reader_rejects_booleans)
     _check('L28b gapfill announces the family-corrected seed plan', t_gapfill_announces_family_seed_plan)
     _check('L29 release tags cannot escape the archive directory', t_release_tag_cannot_escape_output_dir)

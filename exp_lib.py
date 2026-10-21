@@ -24629,12 +24629,41 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     if _top_tokens is None:
         raise ValueError(f'analyze_errors needs a non-negative integer top_tokens, got {top_tokens!r}')
     top_tokens = int(_top_tokens)
+    # "Rare target" is a claim about the TRAINING frequency.  An empty or
+    # malformed training sample is not a frequency table of all-zero counts:
+    # reading it that way would label every token `annotation_or_rare_target`
+    # and manufacture a cause that has no evidence behind it.
     freq = None
+    freq_problem = None
+    rare_basis = 'unavailable: no train_ids'
     if train_ids is not None:
         try:
-            freq = np.bincount(np.asarray(train_ids, dtype=np.int64).reshape(-1), minlength=V)[:V]
-        except Exception:
-            freq = None
+            _tr = np.asarray(train_ids)
+        except Exception as exc:
+            _tr = None
+            freq_problem = f'unreadable train_ids ({type(exc).__name__})'
+        if _tr is not None:
+            if _tr.size == 0:
+                freq_problem = 'empty train_ids: token frequencies are unmeasured'
+            elif not np.issubdtype(_tr.dtype, np.integer) or np.issubdtype(_tr.dtype, np.bool_):
+                freq_problem = f'train_ids dtype {_tr.dtype} is not an integer token type'
+            else:
+                _flat_tr = _tr.reshape(-1)
+                _lo, _hi = int(_flat_tr.min()), int(_flat_tr.max())
+                if _lo < 0 or _hi >= V:
+                    freq_problem = f'train_ids out of range [{_lo}, {_hi}] for vocab {V}'
+                else:
+                    freq = np.bincount(_flat_tr.astype(np.int64), minlength=V)
+                    if freq.shape[0] != V:
+                        freq_problem = f'frequency table has {freq.shape[0]} rows, expected {V}'
+                        freq = None
+        if freq is not None:
+            rare_basis = 'train_frequency'
+        elif freq_problem:
+            print(f'[analyze_errors] WARNING: rare-target flag disabled: {freq_problem}; '
+                  'targets will not be labelled rare/annotation candidates')
+    else:
+        freq_problem = None
     bnd_np = np.asarray(val_bnd) if val_bnd is not None else None
     if bnd_np is not None and bnd_np.shape != vb.shape:
         print(f'[analyze_errors] WARNING: boundary mask shape {bnd_np.shape} != val_batch shape {vb.shape} — boundary-token statistics are OMITTED rather than computed from a misaligned/truncated mask')
@@ -24887,6 +24916,8 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             'entropy': {'max': (max(ent_vals) if ent_vals else None),
                         'mean': (sum(ent_vals) / len(ent_vals) if ent_vals else None)},
             'tokenizer_available': tok is not None,
+            'rare_target_basis': rare_basis,
+            'rare_target_problem': freq_problem,
             'label_check': {'next_token_shift': 'target = ids[t+1]; checked range [0, vocab) before scoring',
                             'range_checked': True, 'min_id': _min_id, 'max_id': _max_id,
                             'n_targets': int(n_targets), 'n_out_of_range': 0}}
