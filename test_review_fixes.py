@@ -4959,6 +4959,24 @@ def t_methodology_audit_requires_panel_to_use_tuned_config():
                    for w in r3['warnings']), r3['warnings']
         assert any('baseline tuning:' in w and 'coarse' in w
                    for w in r3['warnings']), r3['warnings']
+        # A search horizon shorter than the final horizon is not a fully
+        # tuned baseline: the selected lr may be optimal for the cheap search
+        # budget, not for the budget that is reported.
+        _art4 = json.loads(json.dumps(_art2))
+        _art4['search_steps'] = 1
+        _art4['final_records'] = {}
+        for _arm in ('a', 'b'):
+            for _seed in (0, 1, 2):
+                _art4['final_records'][f'{_arm}::seed{_seed}'] = {
+                    'variant': _arm, 'seed': _seed, 'ppl': 50.0, 'steps': 2,
+                    'hyperparams': dict(_trials2[0], steps=2)}
+        L.atomic_write_json(os.path.join(d, 'baseline_tuning.json'), _art4)
+        r4 = L.methodology_audit(_summary(), baselines=design, outdir=d, verbose=False)
+        assert r4['baseline_tuning']['budget_transfer']['equal'] is False, r4['baseline_tuning']
+        assert r4['baseline_tuning']['tuned_claim_allowed'] is False, r4['baseline_tuning']
+        assert 'comp' not in r4['tuned_verified_baselines'], r4.get('tuned_verified_baselines')
+        assert 'comp' in r4['untuned_verified_baselines'], r4.get('untuned_verified_baselines')
+        assert any('different training horizon' in w for w in r4['warnings']), r4['warnings']
 
 
 def t_baseline_contrast_plan_is_group_aware():
