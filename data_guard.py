@@ -2469,14 +2469,14 @@ def _matrix_fingerprint(X):
 
         for start in range(0, _obj.shape[0], _step):
             block = _obj[start:start + _step]
-            parsed = [_row_float_exact(row) for row in block.tolist()]
+            _rows = block.tolist()
+            parsed = [_row_float_exact(row) for row in _rows]
             block_f = np.asarray([p[0] for p in parsed], dtype=np.float64)
             if np.any(block_f == 0.0):
                 block_f = block_f.copy()
                 block_f[block_f == 0.0] = 0.0
             h.update(np.ascontiguousarray(block_f).tobytes())
-            bad = [row for row, (_vals, ok) in zip(block.tolist(), parsed)
-                   if not ok]
+            bad = [row for row, (_vals, ok) in zip(_rows, parsed) if not ok]
             if bad:
                 # Build the object table explicitly: np.asarray(bad) would
                 # expand tuple-valued cells (structured/void rows) into an
@@ -2484,7 +2484,16 @@ def _matrix_fingerprint(X):
                 _bad_obj = np.empty((len(bad), int(_obj.shape[1])), dtype=object)
                 for _bi, _brow in enumerate(bad):
                     _bad_obj[_bi, :] = _brow
-                for key in _row_keys(_bad_obj):
+                # The block float image cannot distinguish these rows from an
+                # exact row with the same float64 image (e.g. a rounded int
+                # next to the exactly representable neighbour, or an
+                # uncoercible string next to None).  Attach the absolute row
+                # position so a permutation of those rows changes the digest.
+                _bad_pos = [start + i for i, (_vals, ok) in enumerate(parsed)
+                            if not ok]
+                for pos, key in zip(_bad_pos, _row_keys(_bad_obj)):
+                    h.update(b'|R')
+                    h.update(str(int(pos)).encode('ascii'))
                     h.update(b'|')
                     h.update(key)
         return h.hexdigest()[:16]
@@ -2531,8 +2540,16 @@ def _matrix_fingerprint(X):
             if _bad.ndim == 1:
                 _bad = _bad.reshape(-1, 1)
             # Canonical object keys (not raw dtype bytes) so a native int64
-            # row and the same Python-int object row share a digest.
-            for key in _row_keys(np.asarray(_bad, dtype=object)):
+            # row and the same Python-int object row share a digest.  Include
+            # the absolute row position for the same reason as the object
+            # path: two rows can share the rounded float64 image (an inexact
+            # large integer next to its exactly representable neighbour), so
+            # without a position a permutation would fingerprint identically.
+            _bad_pos = np.nonzero(np.reshape(_bad_rows, -1))[0] + start
+            for pos, key in zip(_bad_pos.tolist(),
+                                _row_keys(np.asarray(_bad, dtype=object))):
+                h.update(b'|R')
+                h.update(str(int(pos)).encode('ascii'))
                 h.update(b'|')
                 h.update(key)
     return h.hexdigest()[:16]

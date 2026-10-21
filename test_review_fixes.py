@@ -8000,6 +8000,17 @@ def t_exact_numeric_contracts_and_fingerprint():
     obj_big = np.array([[2 ** 53], [2 ** 53 + 1]], dtype=object)
     assert DG._matrix_fingerprint(obj_big[:1]) != DG._matrix_fingerprint(obj_big[1:])
     assert DG._matrix_fingerprint(obj_big) == DG._matrix_fingerprint(obj_big.copy())
+    # The rounded float64 image of an inexact row can equal an exact row's
+    # image (large int next to its 2**53 neighbour, or an uncoercible string
+    # next to a missing value).  Swapping such rows must still change the
+    # digest: the exact tail has to carry the row position, not just the key.
+    _exact = np.array([[2 ** 53], [2 ** 53 + 1]], dtype=np.int64)
+    _swapped = _exact[::-1].copy()
+    assert DG._matrix_fingerprint(_exact) != DG._matrix_fingerprint(_swapped)
+    _obj_exact = _exact.astype(object)
+    assert DG._matrix_fingerprint(_obj_exact) != DG._matrix_fingerprint(_obj_exact[::-1].copy())
+    _obj_mixed = np.array([['b'], [None]], dtype=object)
+    assert DG._matrix_fingerprint(_obj_mixed) != DG._matrix_fingerprint(_obj_mixed[::-1].copy())
     # Floats wider than float64 must not collide after the historical
     # float64 hash; distinct longdouble values get distinct exact keys.
     if np.finfo(np.longdouble).eps < np.finfo(np.float64).eps:
