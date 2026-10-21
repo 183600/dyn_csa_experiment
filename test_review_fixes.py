@@ -1604,6 +1604,22 @@ def t_pair_reason_fingerprint_gate():
         assert 'eval_subset_fp' in str(e), e
     else:
         raise AssertionError('aggregate must reject a group pooled across evaluation subsets')
+    # Nested records on different held-out row folds are also different
+    # samples, even when the full validation/eval fingerprints agree.
+    holdout_mix = {
+        'a::seed0': dict(base, variant='a',
+                         ppl_estimation_rows='nested_validation_holdout',
+                         ppl_holdout=10.0, holdout_row_fp='fold-a'),
+        'a::seed1': dict(base, variant='a', seed=1, ppl=10.5,
+                         ppl_estimation_rows='nested_validation_holdout',
+                         ppl_holdout=10.5, holdout_row_fp='fold-b'),
+    }
+    try:
+        L.aggregate(holdout_mix)
+    except ValueError as e:
+        assert 'holdout_row_fp' in str(e), e
+    else:
+        raise AssertionError('aggregate must reject a group pooled across held-out row folds')
     rows = [dict(base, by_len={8: {'ppl': 10.0}}),
             dict(base, variant='b', val_fp='val-b', by_len={8: {'ppl': 11.0}})]
     try:
