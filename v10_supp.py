@@ -563,6 +563,7 @@ def _niah_ppls(model, val_ids, eval_len, n_seq, cfg, condition, row_cache=None, 
     n_correct = 0
     n_q = 0
     nll_parts = []
+    _true_parts, _pred_parts = [], []
     i = 0
     while i < n_seq:
         j = min(i + n_ch, n_seq)
@@ -584,9 +585,12 @@ def _niah_ppls(model, val_ids, eval_len, n_seq, cfg, condition, row_cache=None, 
         _lv = L._h2d_async(q_vals[i:j], torch.int64, DEVICE)
         _lg = torch.gather(logits, 1, _lc.unsqueeze(-1).expand(-1, -1, logits.size(-1)))
         _nll = F.cross_entropy(_lg.reshape(-1, vocab), _lv.reshape(-1), reduction='none').view(j - i, n_pairs)
-        n_correct += int((_lg.argmax(-1) == _lv).sum())
+        _pred = _lg.argmax(-1)
+        n_correct += int((_pred == _lv).sum())
         n_q += int(_lv.numel())
         nll_parts.append(_nll)
+        _true_parts.append(_lv.reshape(-1).cpu().tolist())
+        _pred_parts.append(_pred.reshape(-1).cpu().tolist())
         del ids, logits, _lg, _lv, _nll
         if chunk_mem is not None:
             chunk_mem[(eval_len, 'niah')] = n_ch
@@ -594,7 +598,21 @@ def _niah_ppls(model, val_ids, eval_len, n_seq, cfg, condition, row_cache=None, 
     if not nll_parts:
         return {'acc': float('nan'), 'nll': float('nan'), 'n': 0, **stats}
     _nll_all = torch.cat(nll_parts)
-    return {'acc': float(n_correct) / max(n_q, 1), 'nll': float(_nll_all.mean()), 'n': int(n_q), **stats}
+    _y_true = [v for part in _true_parts for v in part]
+    _y_pred = [v for part in _pred_parts for v in part]
+    _rm = L.retrieval_metrics(_y_true, _y_pred)
+    # The count and the rate must describe the same observations.  The
+    # retrieval helper also supplies the uniform/majority floors and macro
+    # recall, so a top-1 accuracy cannot be read without its trivial baseline.
+    if int(_rm['n_correct']) != int(n_correct) or int(_rm['n']) != int(n_q):
+        raise RuntimeError(f'NIAH: retrieval accounting mismatch ({_rm["n_correct"]}/{_rm["n"]} vs {n_correct}/{n_q})')
+    _keys = ('n_correct', 'acc', 'top1_accuracy', 'balanced_accuracy', 'macro_recall',
+             'n_classes', 'answer_support', 'per_class_recall', 'per_class',
+             'chance_accuracy', 'majority_accuracy', 'majority_label',
+             'acc_lift_over_chance', 'acc_lift_over_majority',
+             'averaging', 'note')
+    return {'nll': float(_nll_all.mean()), 'n': int(n_q),
+            **{k: _rm[k] for k in _keys}, **stats}
 
 def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     """Run exactly ONE (variant, seed) probe cell: load the trained checkpoint
@@ -763,7 +781,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         for Ln, cond in _niah_cells:
             res = _niah_ppls(model, val_ids, Ln, _pcfg['n_seq'], _pcfg, cond, row_cache=_row_cache, chunk_mem=_chunk_mem)
             key = _niah_cell_key(v, seed, arm, Ln, cond)
-            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _niah_fp_of(cond), 'recipe': _ck_recipe}
+            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_correct': int(res['n_correct']), 'balanced_accuracy': res.get('balanced_accuracy'), 'macro_recall': res.get('macro_recall'), 'n_classes': int(res.get('n_classes') or 0), 'answer_support': res.get('answer_support'), 'per_class_recall': res.get('per_class_recall'), 'per_class': res.get('per_class'), 'chance_accuracy': res.get('chance_accuracy'), 'majority_accuracy': res.get('majority_accuracy'), 'majority_label': res.get('majority_label'), 'acc_lift_over_chance': res.get('acc_lift_over_chance'), 'acc_lift_over_majority': res.get('acc_lift_over_majority'), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _niah_fp_of(cond), 'recipe': _ck_recipe}
             L.locked_json_update(_nspath, (lambda s, _p=dict({key: rec}): (s.update(_p), s)[1]), indent=1)
             _log_metrics[key] = {'acc': float(rec['acc']), 'nll': float(rec['nll']), 'n_queries': int(rec['n_queries'])}
             print(f"  [niah] {key:48s} acc={rec['acc']:.3f} nll={rec['nll']:.3f}", flush=True)
@@ -1597,7 +1615,12 @@ def v10_analysis(out='analysis_v10/stats.json'):
             for (v, arm, Ln, cond, _pp, _cd, _recipe, _vfp), by_seed in sorted(ncells.items(), key=lambda kv: kv[0]):
                 accs = {s: r['acc'] for s, r in by_seed.items()}
                 nlls = {s: r['nll'] for s, r in by_seed.items()}
-                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'acc_mean': float(np.mean(list(accs.values()))), 'nll_mean': float(np.mean(list(nlls.values()))), 'n': len(accs), 'n_pairs': next(iter(by_seed.values())).get('n_pairs'), 'dist_mean': next(iter(by_seed.values())).get('dist_mean'), 'val_fp': _vfp})
+                bals = {s: r.get('balanced_accuracy') for s, r in by_seed.items()}
+                _first = next(iter(by_seed.values()))
+                _bal_vals = [float(x) for x in bals.values()
+                             if isinstance(x, (int, float)) and not isinstance(x, bool)
+                             and math.isfinite(float(x))]
+                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'balanced_by_seed': bals, 'acc_mean': float(np.mean(list(accs.values()))), 'balanced_mean': (float(np.mean(_bal_vals)) if _bal_vals else None), 'nll_mean': float(np.mean(list(nlls.values()))), 'chance_accuracy': _first.get('chance_accuracy'), 'majority_accuracy': _first.get('majority_accuracy'), 'n_classes': _first.get('n_classes'), 'n': len(accs), 'n_pairs': _first.get('n_pairs'), 'dist_mean': _first.get('dist_mean'), 'val_fp': _vfp})
             niah_contrasts = {}
             _nidx = {}
             for c in niah_cells:
@@ -1941,10 +1964,13 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         A('')
         A('**设计**：序列 = 远端自然文本（内嵌 8 个 key→value 耦合）+ 目标区（自然文本收尾 + 8 个查询 key）。查询 key 的下一个 token 的正确答案只在远端出现——正确预测**必须**利用远距信息；`distract` 条件把 ρ=0.5 的远端草料换成其他真实序列的 token（realistic-token 替换；不是主题/语义干扰），但**绝不腐坏耦合位置**。报告 answer top-1 准确率与 answer NLL（已按各臂 clean/distract 成对）。')
         A('')
-        A('| 臂 | L | 条件 | acc | answer NLL | n |')
-        A('|---|---|---|---|---|---|')
+        A('| 臂 | L | 条件 | acc (微) | macro-recall | 均匀 chance | 多数类 floor | answer NLL | n |')
+        A('|---|---|---|---|---|---|---|---|---|')
         for c in sorted(niah['cells'], key=lambda c: (c['eval_len'], c['condition'], c['variant'], c['arm'])):
-            A(f"| `{c['variant']}::{c['arm']}` | {c['eval_len']} | {c['condition']} | {c['acc_mean']:.3f} | {c['nll_mean']:.3f} | {c['n']} |")
+            _bal = (f"{c['balanced_mean']:.3f}" if c.get('balanced_mean') is not None else 'n/a')
+            _ch = (f"{c['chance_accuracy']:.3f}" if isinstance(c.get('chance_accuracy'), (int, float)) else 'n/a')
+            _mj = (f"{c['majority_accuracy']:.3f}" if isinstance(c.get('majority_accuracy'), (int, float)) else 'n/a')
+            A(f"| `{c['variant']}::{c['arm']}` | {c['eval_len']} | {c['condition']} | {c['acc_mean']:.3f} | {_bal} | {_ch} | {_mj} | {c['nll_mean']:.3f} | {c['n']} |")
         A('')
         if niah.get('contrasts'):
             A('| NIAH 配对比较（Δ = 对照臂 − 学习选择，answer NLL，>0 = 学习选择更好） | n | Δ mean±std | p (exact) |')
@@ -1953,6 +1979,8 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                 A(f'| {k} | {v['n']} | {v['mean']:+.3f} ± {v.get('std', 0):.3f} | {v['p_exact_signflip']:.3f} |')
             A('')
         A('> 该任务直接检验「长距离信息**利用**能力」，与上面的干扰鲁棒性互补：鲁棒性高 + 检索利用不差，才支持「稀疏选择在滤噪的同时保留了有用远距信息」；若只有鲁棒性而检索差，则更符合「本来就少用远端」的替代解释。')
+        A('')
+        A('> **平凡基线**：`均匀 chance` = 1 / 实际出现的答案类别数；`多数类 floor` = 总是预测出现最多的答案 token。`acc (微)` 会被高频答案主导，`macro-recall` 对每个答案类别等权；读检索收益时必须三列一起看。')
         A('')
     A('### 统计口径')
     A('')

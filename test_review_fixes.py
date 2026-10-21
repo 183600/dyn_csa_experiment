@@ -3996,6 +3996,38 @@ def t_metric_policy_checks_record_values():
     me = L.metric_policy_audit({'x::seed0': {'variant': 'x', 'task': 'niah_natural'}})
     assert me['status'] == 'warn', me
 
+def t_retrieval_metrics_and_niah_trivial_floor():
+    # A many-way retrieval endpoint must expose its trivial floors: micro
+    # accuracy alone can be high merely because one answer class dominates.
+    rm = L.retrieval_metrics([0, 0, 0, 1], [0, 0, 0, 0])
+    assert rm['n_correct'] == 3 and rm['n'] == 4, rm
+    assert abs(rm['acc'] - 0.75) < 1e-12 and abs(rm['balanced_accuracy'] - 0.5) < 1e-12, rm
+    assert abs(rm['chance_accuracy'] - 0.5) < 1e-12, rm
+    assert abs(rm['majority_accuracy'] - 0.75) < 1e-12, rm
+    assert abs(rm['acc_lift_over_chance'] - 0.25) < 1e-12, rm
+    assert abs(rm['acc_lift_over_majority']) < 1e-12, rm
+    # Mixed label identities must not be merged by NumPy dtype promotion.
+    rm2 = L.retrieval_metrics([1, '1'], [1, '1'])
+    assert rm2['n_classes'] == 2 and rm2['acc'] == 1.0, rm2
+    # A complete NIAH record is accepted and its floors are recomputed.
+    rec = dict(rm, task='niah_natural', nll=1.25, n_queries=rm['n'])
+    good = {'n::seed0': rec}
+    assert L.metric_policy_audit(good)['status'] == 'ok', L.metric_policy_audit(good)
+    # Forged accuracy / majority floor / macro recall are rejected.
+    for key, val in (('acc', 0.9), ('majority_accuracy', 0.1),
+                     ('balanced_accuracy', 0.99), ('chance_accuracy', 0.01)):
+        bad = json.loads(json.dumps(good))
+        bad['n::seed0'][key] = val
+        ma = L.metric_policy_audit(bad)
+        assert ma['status'] == 'warn', (key, ma)
+        assert any('retrieval endpoint is not usable' in w for w in ma['warnings']), (key, ma)
+    # A legacy rate without n_correct or a floor is unverifiable, not a pass.
+    legacy = {'n::seed0': {'variant': 'n', 'task': 'niah_natural', 'acc': 0.5,
+                           'nll': 1.0, 'n_queries': 10}}
+    ml = L.metric_policy_audit(legacy)
+    assert ml['status'] == 'warn' and any('trivial floor' in w for w in ml['warnings']), ml
+
+
 def t_baseline_tuning_audit():
     trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
     def _arm(ppls):
@@ -12580,6 +12612,7 @@ def main():
     _check('H2c hypothesis prevalence binds the conditional endpoint', t_hypothesis_prevalence_conditional_endpoint)
     _check('H2d degenerate binary threshold/score range is explicit', t_binary_degenerate_threshold_visibility)
     _check('H2a metric audit checks record aggregation/ranges', t_metric_policy_checks_record_values)
+    _check('H2a1 retrieval metrics carry trivial floors', t_retrieval_metrics_and_niah_trivial_floor)
     _check('H2b multiclass one-vs-rest ranking metrics + imbalance audit', t_multiclass_ranking_metrics_and_audit)
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
     _check('H3a tuning grid boundary/coverage adequacy', t_tuning_grid_boundary_adequacy)

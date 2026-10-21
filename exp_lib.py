@@ -14000,11 +14000,16 @@ METRIC_POLICY = {
         'task': 'multi_class_retrieval',
         'primary': 'top1_accuracy',
         'direction': 'higher_is_better',
-        'secondary': ['answer_nll'],
-        'chance': '1/vocab',
-        'imbalance': 'chance_accuracy_is_tiny_but_the_task_is_not_a_binary_imbalance_metric',
+        'secondary': ['answer_nll', 'balanced_accuracy', 'macro_recall',
+                      'chance_accuracy', 'majority_accuracy',
+                      'acc_lift_over_chance', 'acc_lift_over_majority'],
+        'chance': '1/n_observed_answer_classes (uniform); majority-answer floor also required',
+        'imbalance': ('top-1 micro accuracy is dominated by frequent answer classes; '
+                      'report macro recall and the uniform/majority floors alongside it'),
         'aggregation': 'query_unweighted',
-        'note': 'Top-1 accuracy is reported with answer NLL; PR-AUC/ROC-AUC are not substitutes for a 8192-way retrieval endpoint and must not be invented from top-1 labels.',
+        'note': ('Top-1 accuracy is reported with answer NLL, macro recall (balanced accuracy) '
+                 'and the trivial uniform/majority floors. PR-AUC/ROC-AUC are not substitutes '
+                 'for a many-way retrieval endpoint and must not be invented from top-1 labels.'),
     },
     'binary_classification': {
         'task': 'binary_classification',
@@ -14361,6 +14366,92 @@ def _display_label_names(labels):
     if len(set(names)) == len(names):
         return names
     return [f'{name}#{i}' for i, name in enumerate(names)]
+
+
+def retrieval_metrics(y_true, y_pred, labels=None, label_names=None):
+    """Top-1 retrieval metrics with explicit trivial floors and macro recall.
+
+    A many-way retrieval task (e.g. NIAH over an 8k vocabulary) is a
+    multiclass endpoint.  Top-1 micro accuracy is dominated by frequent answer
+    classes and is not interpretable without the score a trivial predictor
+    obtains.  This helper therefore reports, on the same observations:
+
+    * ``n_correct``/``acc`` — the raw top-1 count and rate;
+    * ``balanced_accuracy`` (macro recall) — every answer class counts equally,
+      so a rare-answer failure cannot hide behind frequent classes;
+    * ``chance_accuracy`` — uniform guessing over the OBSERVED answer classes
+      (``1/K``), which is the correct chance floor for this label space (not
+      ``1/vocab`` when only K classes actually occur);
+    * ``majority_accuracy`` — the always-most-frequent-answer predictor.
+
+    The lift over each floor is recorded so a report cannot present a
+    chance-level retrieval score as skill.  Per-class support/recall is kept
+    for the audit to recompute the aggregates.  Labels are compared by exact
+    identity (mixed Python types stay distinct), and an absent declared class
+    is listed with a null recall instead of being scored as zero.
+    """
+    y = _preserve_label_array(y_true)
+    p = _preserve_label_array(y_pred)
+    if y.size != p.size:
+        raise ValueError(f'retrieval_metrics: y_true has {y.size} entries but y_pred has {p.size}')
+    if labels is None:
+        labs = _unique_label_values(y) if y.size else np.asarray([], dtype=object)
+    else:
+        labs = _preserve_label_array(labels)
+    if label_names is None:
+        label_names = _display_label_names(labs)
+    label_names = list(label_names)
+    if len(label_names) != int(labs.size) or len(set(label_names)) != len(label_names):
+        raise ValueError('retrieval_metrics: label_names must provide one unique name per label')
+    true_keys = [_hashable_label(v) for v in y.tolist()]
+    pred_keys = [_hashable_label(v) for v in p.tolist()]
+    support = {}
+    correct = {}
+    for _t, _p in zip(true_keys, pred_keys):
+        support[_t] = support.get(_t, 0) + 1
+        if _t == _p:
+            correct[_t] = correct.get(_t, 0) + 1
+    n = int(y.size)
+    n_correct = int(sum(correct.values()))
+    acc = (n_correct / n) if n else None
+    per_class = {}
+    defined = 0
+    recall_sum = 0.0
+    majority_support = 0
+    majority_name = None
+    for _lab, _name in zip(labs.tolist(), label_names):
+        _key = _hashable_label(_lab)
+        _sup = int(support.get(_key, 0))
+        _rec = (correct.get(_key, 0) / _sup) if _sup else None
+        per_class[_name] = {'support': _sup, 'recall': _rec,
+                            'correct': int(correct.get(_key, 0))}
+        if _sup:
+            defined += 1
+            recall_sum += float(_rec)
+        if _sup > majority_support:
+            majority_support = _sup
+            majority_name = _name
+    chance = (1.0 / defined) if defined else None
+    majority = (majority_support / n) if n else None
+    balanced = (recall_sum / defined) if defined else None
+    return {
+        'n': n, 'n_correct': n_correct,
+        'acc': acc, 'top1_accuracy': acc,
+        'balanced_accuracy': balanced, 'macro_recall': balanced,
+        'n_classes': defined,
+        'answer_support': {name: row['support'] for name, row in per_class.items()},
+        'per_class_recall': {name: row['recall'] for name, row in per_class.items()},
+        'per_class': per_class,
+        'chance_accuracy': chance,
+        'majority_accuracy': majority,
+        'majority_label': majority_name,
+        'acc_lift_over_chance': (acc - chance if acc is not None and chance is not None else None),
+        'acc_lift_over_majority': (acc - majority if acc is not None and majority is not None else None),
+        'averaging': 'macro_recall_over_observed_answer_classes; top1 is micro over queries',
+        'note': ('chance_accuracy is uniform guessing over the observed answer classes; '
+                 'majority_accuracy is the always-most-frequent-answer floor. A top-1 '
+                 'score without these floors is not evidence of retrieval skill.'),
+    }
 
 
 def _multiclass_ranking_metrics(y_true, y_score, labels, label_names=None):
@@ -15260,6 +15351,7 @@ def metric_policy_audit(summary=None, policy=None):
         if niah:
             missing = [k for k in ('acc', 'nll') if not all(k in b for b in niah)]
             _bad_niah = []
+            _legacy_niah = []
             for _b in niah:
                 _a = _finite_scalar(_b.get('acc'))
                 _nl = _finite_scalar(_b.get('nll'))
@@ -15270,14 +15362,92 @@ def metric_policy_audit(summary=None, policy=None):
                     _bad_niah.append('nll-not-finite')
                 if _nq is None:
                     _bad_niah.append('query-count-missing')
+                # A top-1 count makes the rate reproducible; a rate alone is
+                # not evidence that the record scored n_correct queries.
+                _nc = _exact_count(_b.get('n_correct'), minimum=0)
+                _has_floor = any(k in _b for k in
+                                 ('n_correct', 'chance_accuracy', 'majority_accuracy',
+                                  'balanced_accuracy', 'answer_support'))
+                if _nc is not None and _nq is not None:
+                    if abs(float(_a) - (_nc / _nq)) > 1e-9:
+                        _bad_niah.append('acc-count-inconsistent')
+                elif _has_floor:
+                    _bad_niah.append('correct-count-missing')
+                # Recompute the trivial floors from the recorded answer support
+                # whenever possible.  A raw accuracy without the uniform and
+                # majority-answer floors cannot distinguish retrieval skill
+                # from class-frequency luck.
+                _supports = None
+                if isinstance(_b.get('answer_support'), dict):
+                    _raw_sup = list(_b['answer_support'].values())
+                elif isinstance(_b.get('answer_support'), (list, tuple)):
+                    _raw_sup = list(_b['answer_support'])
+                else:
+                    _raw_sup = None
+                if _raw_sup is not None:
+                    _parsed_sup = [_exact_count(v, minimum=0) for v in _raw_sup]
+                    if any(v is None for v in _parsed_sup):
+                        _bad_niah.append('answer-support-invalid')
+                    else:
+                        _supports = _parsed_sup
+                _n_classes = _exact_count(_b.get('n_classes'), minimum=1)
+                _observed_classes = (sum(1 for v in _supports if v > 0)
+                                     if _supports is not None else None)
+                if (_n_classes is not None and _observed_classes is not None
+                        and _n_classes != _observed_classes):
+                    _bad_niah.append('class-count-inconsistent')
+                if _has_floor:
+                    _ch = _finite_scalar(_b.get('chance_accuracy'))
+                    _mj = _finite_scalar(_b.get('majority_accuracy'))
+                    _ba = _finite_scalar(_b.get('balanced_accuracy'))
+                    if _ch is None or not (0.0 < _ch <= 1.0):
+                        _bad_niah.append('chance-floor-missing')
+                    else:
+                        _kc = _observed_classes if _observed_classes else _n_classes
+                        if _kc:
+                            if abs(_ch - 1.0 / _kc) > 1e-9:
+                                _bad_niah.append('chance-floor-not-uniform')
+                    if _mj is None or not (0.0 <= _mj <= 1.0):
+                        _bad_niah.append('majority-floor-missing')
+                    elif _supports is not None and _nq is not None:
+                        if abs(_mj - max(_supports) / _nq) > 1e-9:
+                            _bad_niah.append('majority-floor-inconsistent')
+                    if _ba is None or not (0.0 <= _ba <= 1.0):
+                        _bad_niah.append('macro-recall-missing')
+                    _pcr = _b.get('per_class_recall')
+                    if isinstance(_pcr, dict):
+                        _rec_vals = [_finite_scalar(v) for v in _pcr.values()
+                                     if v is not None]
+                        if any(v is None or not (0.0 <= v <= 1.0) for v in _rec_vals):
+                            _bad_niah.append('per-class-recall-invalid')
+                        elif _rec_vals and _ba is not None:
+                            if abs(_ba - float(np.mean(_rec_vals))) > 1e-9:
+                                _bad_niah.append('macro-recall-inconsistent')
+                    _lch = _finite_scalar(_b.get('acc_lift_over_chance'))
+                    if _lch is not None and _ch is not None and _a is not None:
+                        if abs(_lch - (_a - _ch)) > 1e-9:
+                            _bad_niah.append('chance-lift-inconsistent')
+                    _lmj = _finite_scalar(_b.get('acc_lift_over_majority'))
+                    if _lmj is not None and _mj is not None and _a is not None:
+                        if abs(_lmj - (_a - _mj)) > 1e-9:
+                            _bad_niah.append('majority-lift-inconsistent')
+                else:
+                    _legacy_niah.append(_b.get('variant') or _b.get('name') or '?')
             out['checks'].append({'metric': 'niah_retrieval', 'policy': 'niah_retrieval',
                                   'records': len(niah), 'ok': not missing and not _bad_niah,
-                                  'missing': missing, 'invalid': sorted(set(_bad_niah))})
+                                  'missing': missing, 'invalid': sorted(set(_bad_niah)),
+                                  'legacy_without_trivial_floor': len(_legacy_niah)})
             if missing:
                 out['warnings'].append(f'NIAH reports top-1 without {missing}; answer NLL is required alongside retrieval accuracy')
             if _bad_niah:
-                out['warnings'].append('NIAH records contain invalid accuracy/NLL/query counts '
+                out['warnings'].append('NIAH records contain invalid accuracy/NLL/query counts or '
+                                       'unverifiable trivial floors '
                                        f'({sorted(set(_bad_niah))}); the retrieval endpoint is not usable')
+            if _legacy_niah:
+                out['warnings'].append(
+                    f'{len(_legacy_niah)}/{len(niah)} NIAH record(s) carry no n_correct/trivial floor; '
+                    'their top-1 accuracy cannot be distinguished from uniform/majority guessing '
+                    '(legacy records are unverifiable, not a pass)')
         classify_tasks = ('classification', 'binary_classification', 'multiclass_classification')
         _class_recs, _class_issues = [], []
         _allowed_f1_averages = ('macro', 'micro', 'weighted', 'binary_positive_class',
