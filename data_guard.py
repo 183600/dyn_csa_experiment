@@ -1052,6 +1052,33 @@ def _finite_values(col):
     return col[np.isfinite(col)]
 
 
+def _persisted_features(stats, *, what):
+    """Validate a persisted ``features`` table against ``n_features_in``.
+
+    ``transform`` loops over the fitted feature stats and writes one output
+    column per entry.  A truncated/edited stats dict whose list is shorter
+    than ``n_features_in`` would leave output columns uninitialised (leaking
+    whatever memory NumPy returned), and a longer list would write past the
+    declared width.  A persisted artifact must fail closed instead.
+    """
+    if not isinstance(stats, dict):
+        raise ValueError(f'{what}.from_stats needs a mapping, got {type(stats).__name__}')
+    features = stats.get('features')
+    if not isinstance(features, list):
+        raise ValueError(f'{what}.from_stats needs a features list')
+    n_features = _check_count('n_features_in', stats.get('n_features_in'))
+    if len(features) != n_features:
+        raise ValueError(
+            f'{what}.from_stats: {len(features)} feature statistics do not '
+            f'match n_features_in={n_features}; the persisted stats are '
+            'truncated or describe a different table')
+    for j, st in enumerate(features):
+        if not isinstance(st, dict):
+            raise ValueError(
+                f'{what}.from_stats: feature {j} statistics are not a mapping')
+    return features, n_features
+
+
 class LeakageSafePreprocessor:
     """Impute, clip and scale features using training statistics only.
 
@@ -1256,12 +1283,30 @@ class LeakageSafePreprocessor:
     @classmethod
     def from_stats(cls, stats):
         """Rebuild a fitted preprocessor from :meth:`get_stats` output."""
+        features, n_features = _persisted_features(
+            stats, what='LeakageSafePreprocessor')
+        for j, st in enumerate(features):
+            for key in ('fill', 'center', 'factor'):
+                try:
+                    value = float(st[key])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    raise ValueError(
+                        f'LeakageSafePreprocessor.from_stats: feature {j} has '
+                        f'no usable {key!r} statistic') from None
+                if not math.isfinite(value):
+                    raise ValueError(
+                        f'LeakageSafePreprocessor.from_stats: feature {j} has '
+                        f'a non-finite {key!r} statistic')
+            if float(st['factor']) <= 0.0:
+                raise ValueError(
+                    f'LeakageSafePreprocessor.from_stats: feature {j} has a '
+                    'non-positive scale factor')
         obj = cls(scale=stats['scale'], missing=stats['missing'],
                   clip_quantiles=(tuple(stats['clip_quantiles'])
                                   if stats.get('clip_quantiles') else None),
                   clip_z=stats.get('clip_z'), eps=stats.get('eps', _EPS))
-        obj.feature_stats_ = [dict(s) for s in stats['features']]
-        obj.n_features_in_ = int(stats['n_features_in'])
+        obj.feature_stats_ = [dict(s) for s in features]
+        obj.n_features_in_ = int(n_features)
         obj.n_train_ = int(stats.get('n_train', 0))
         obj.train_fp_ = stats.get('train_fp')
         obj.fitted_ = True
@@ -1498,12 +1543,14 @@ class LeakageSafeCategoricalEncoder:
     @classmethod
     def from_stats(cls, stats):
         """Rebuild a fitted encoder from :meth:`get_stats` output."""
+        features, n_features = _persisted_features(
+            stats, what='LeakageSafeCategoricalEncoder')
         obj = cls(encoding=stats['encoding'],
                   handle_unknown=stats.get('handle_unknown', 'unknown'))
         obj.feature_stats_ = [dict(s, categories=list(s.get('categories') or []),
                                    keys=list(s.get('keys') or []))
-                              for s in stats['features']]
-        obj.n_features_in_ = int(stats['n_features_in'])
+                              for s in features]
+        obj.n_features_in_ = int(n_features)
         obj.n_train_ = int(stats.get('n_train', 0))
         obj.train_fp_ = stats.get('train_fp')
         obj.fitted_ = True
@@ -2026,6 +2073,8 @@ class LeakageSafeTargetEncoder:
     @classmethod
     def from_stats(cls, stats):
         """Rebuild a fitted target encoder from :meth:`get_stats` output."""
+        features, n_features = _persisted_features(
+            stats, what='LeakageSafeTargetEncoder')
         obj = cls(smoothing=stats.get('smoothing', 10.0),
                   n_folds=stats.get('n_folds', 5),
                   seed=stats.get('seed', 0))
@@ -2036,9 +2085,9 @@ class LeakageSafeTargetEncoder:
                 'n_reference_rows': int(st.get('n_reference_rows', 0)),
                 'n_reference_labels': int(st.get('n_reference_labels', 0)),
             }
-            for st in stats['features']
+            for st in features
         ]
-        obj.n_features_in_ = int(stats['n_features_in'])
+        obj.n_features_in_ = int(n_features)
         obj.n_train_ = int(stats.get('n_train', 0))
         obj.prior_ = float(stats.get('prior', 0.0))
         obj.train_fp_ = stats.get('train_fp')
@@ -2204,6 +2253,8 @@ class LeakageSafeFrequencyEncoder:
     @classmethod
     def from_stats(cls, stats):
         """Rebuild a fitted frequency encoder from :meth:`get_stats` output."""
+        features, n_features = _persisted_features(
+            stats, what='LeakageSafeFrequencyEncoder')
         obj = cls(normalize=stats.get('normalize', True),
                   handle_unknown=stats.get('handle_unknown', 'zero'))
         obj.feature_stats_ = [
@@ -2212,9 +2263,9 @@ class LeakageSafeFrequencyEncoder:
                 'n_observed': int(st.get('n_observed', 0)),
                 'n_missing': int(st.get('n_missing', 0)),
             }
-            for st in stats['features']
+            for st in features
         ]
-        obj.n_features_in_ = int(stats['n_features_in'])
+        obj.n_features_in_ = int(n_features)
         obj.n_train_ = int(stats.get('n_train', 0))
         obj.train_fp_ = stats.get('train_fp')
         obj.fitted_ = True

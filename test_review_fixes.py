@@ -9615,6 +9615,55 @@ def t_object_temporal_category_identity():
                           cat_restored.transform(cat_X)), cat_stats
 
 
+def t_persisted_stats_validate_feature_count():
+    # transform() writes one output column per persisted feature stat.  A
+    # truncated/corrupt artifact would otherwise leave columns uninitialised
+    # (or write past the declared width), silently changing the feature table.
+    import data_guard as DG
+    import json
+    X = np.arange(12.0).reshape(4, 3)
+    prep = DG.LeakageSafePreprocessor().fit(X)
+    valid = json.loads(json.dumps(prep.get_stats()))
+    assert np.allclose(DG.LeakageSafePreprocessor.from_stats(valid).transform(X),
+                       prep.transform(X))
+    for mutate in (
+            lambda s: s.update(features=[]),
+            lambda s: s.update(features=s['features'][:2], n_features_in=3),
+            lambda s: s.update(n_features_in=4),
+            lambda s: s.update(n_features_in=True),
+            lambda s: s['features'][0].update(factor=0.0),
+            lambda s: s['features'][0].update(fill=float('nan'))):
+        bad = json.loads(json.dumps(valid))
+        mutate(bad)
+        try:
+            DG.LeakageSafePreprocessor.from_stats(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'malformed preprocessor stats accepted: {bad}')
+    Xc = np.asarray([['a'], ['b']], dtype=object)
+    for cls, fit_args in (
+            (DG.LeakageSafeCategoricalEncoder, (Xc,)),
+            (DG.LeakageSafeFrequencyEncoder, (Xc,)),
+            (DG.LeakageSafeTargetEncoder, (Xc, np.asarray([1.0, 2.0])))):
+        fitted = cls().fit(*fit_args)
+        good = json.loads(json.dumps(fitted.get_stats()))
+        restored = cls.from_stats(good)
+        kw = {'allow_train': True} if cls is DG.LeakageSafeTargetEncoder else {}
+        assert np.array_equal(restored.transform(Xc, **kw),
+                              fitted.transform(Xc, **kw))
+        for bad_stats in (
+                dict(good, features=[]),
+                dict(good, features=good['features'] * 2)):
+            try:
+                cls.from_stats(bad_stats)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    f'{cls.__name__}.from_stats accepted a mismatched feature list')
+
+
 def t_validation_row_split_group_aware():
     # The balanced row boundary (4) would cut the group spanning rows 3-4.
     # A group-aware split must move it to a document boundary instead.
@@ -11600,6 +11649,7 @@ def main():
     _check('I31b NaT keys and type-qualified label shift', t_data_guard_nat_and_label_identity)
     _check('I31c object temporal duplicate identity', t_object_temporal_duplicate_identity)
     _check('I31d object temporal category identity', t_object_temporal_category_identity)
+    _check('I31e persisted stats must match n_features_in', t_persisted_stats_validate_feature_count)
     # Open-block reading rule: the substantive gates (causality, reference
     # pooling, masks, edge cases, closed regression) live in test_open_block.py
     # so they can also be run on their own.
