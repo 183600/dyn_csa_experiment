@@ -4502,8 +4502,18 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 missing_reference.append(j)
                 continue
             sd = float(np.std(tv, ddof=0))
+            mean_t = float(np.mean(tv))
+            mean_h = float(np.mean(hv))
+            if not (math.isfinite(sd) and math.isfinite(mean_t)
+                    and math.isfinite(mean_h)):
+                # Finite inputs can still overflow the variance/mean (values
+                # near the float64 limit).  An infinite/nan SMD is not a clean
+                # zero-shift result.
+                smd.append(None)
+                non_estimable.append(j)
+                continue
             if sd <= _EPS:
-                delta = abs(float(np.mean(hv)) - float(np.mean(tv)))
+                delta = abs(mean_h - mean_t)
                 if delta <= _EPS:
                     smd.append(0.0)
                 else:
@@ -4514,7 +4524,12 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                     smd.append(None)
                     non_estimable.append(j)
             else:
-                smd.append(float((np.mean(hv) - np.mean(tv)) / sd))
+                value = float((mean_h - mean_t) / sd)
+                if not math.isfinite(value):
+                    smd.append(None)
+                    non_estimable.append(j)
+                else:
+                    smd.append(value)
         miss_train = 1.0 - np.mean(np.isfinite(Xt), axis=0)
         miss_hold = 1.0 - np.mean(np.isfinite(Xh), axis=0)
         finite_smd = [abs(v) for v in smd if v is not None]

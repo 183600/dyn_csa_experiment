@@ -6744,6 +6744,15 @@ def t_data_guard_index_label_and_shift_edges():
     assert shift['non_estimable_shift_features'] == [0], repc
     assert repc['status'] == 'warnings', repc
 
+    # Finite inputs near the float64 limit can overflow the mean/variance.  An
+    # infinite SMD is not evidence of no shift; it is not estimable.
+    Xov = np.array([[1e308], [-1e308], [1e308], [1e308]])
+    with np.errstate(over='ignore', invalid='ignore'):
+        repov = L.data_quality_report(Xov, train_idx=[0, 1], val_idx=[2, 3])
+    _ov = repov['checks']['distribution_shift_vs_train']['val']
+    assert _ov['non_estimable_shift_features'] == [0], repov
+    assert any('not estimable' in w for w in repov['warnings']), repov
+
     # A NaN/negative threshold must be an error, not a silently disabled gate.
     for bad_kw in ({'clip_z': float('nan')}, {'clip_z': -1.0},
                    {'shift_threshold': float('nan')},
