@@ -13916,18 +13916,53 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         problems.append(
             f'count-model fit_token_policy={_fit_policy!r} is not the implemented '
             'deterministic_prefix policy; the recorded fit budget is not reproducible')
-    if data.get('fit_truncated') is True:
-        _nfit = _as_seed_int(data.get('n_fit_tokens'))
-        _nsrc = _as_seed_int(data.get('n_source_tokens'))
+    # The fit-budget disclosure is only trustworthy if the flag and the token
+    # counts agree.  A stale/forged `fit_truncated=False` would otherwise let a
+    # prefix-trained floor pass the truncation gate below.  Missing legacy
+    # counts stay unverifiable; present counts are checked exactly.
+    _fit_flag = data.get('fit_truncated')
+    _fit_truncated = _fit_flag is True
+    if _fit_flag is not None and not isinstance(_fit_flag, (bool, np.bool_)):
+        problems.append(f'fit_truncated={_fit_flag!r} must be a boolean')
+        _fit_flag = None
+    _nfit = _as_seed_int(data.get('n_fit_tokens'))
+    _nsrc = _as_seed_int(data.get('n_source_tokens'))
+    if _nfit is not None or _nsrc is not None:
         if _nfit is None or _nsrc is None:
-            warnings.append('count-model artifact claims a truncated fit but lacks integer fit/source token counts')
+            problems.append('count-model artifact records only one of n_fit_tokens/n_source_tokens; '
+                            'the fit budget cannot be verified')
+        elif _nfit <= 0 or _nsrc <= 0 or _nfit > _nsrc:
+            problems.append(f'count-model fit/source token counts are not ordered positive '
+                            f'counts (n_fit_tokens={_nfit!r}, n_source_tokens={_nsrc!r})')
         else:
-            if not (0 < _nfit < _nsrc):
-                problems.append('count-model artifact claims fit_truncated=True but n_fit_tokens is not below n_source_tokens')
-            else:
+            _counts_truncated = bool(_nfit < _nsrc)
+            _cap_raw = data.get('max_fit_tokens')
+            if _cap_raw is not None:
+                _cap_i = _as_seed_int(_cap_raw)
+                if _cap_i is None or _cap_i <= 0:
+                    problems.append(f'max_fit_tokens={_cap_raw!r} is not a positive integer')
+                else:
+                    _expected_fit = min(_nsrc, _cap_i)
+                    if _nfit != _expected_fit:
+                        problems.append(
+                            f'n_fit_tokens={_nfit} is not min(n_source_tokens={_nsrc}, '
+                            f'max_fit_tokens={_cap_i})={_expected_fit}; the recorded '
+                            'prefix does not describe a deterministic-prefix fit')
+            if isinstance(_fit_flag, (bool, np.bool_)):
+                if bool(_fit_flag) != _counts_truncated:
+                    problems.append(
+                        f'fit_truncated={bool(_fit_flag)} contradicts the token counts '
+                        f'({_nfit}/{_nsrc}); the fit-budget disclosure is not reproducible')
+            elif _counts_truncated:
+                warnings.append('the token counts show a truncated fit but fit_truncated '
+                                'is absent; treating the floor as prefix-trained')
+            _fit_truncated = bool(_counts_truncated or _fit_truncated)
+            if _fit_truncated:
                 warnings.append(f'the count-model floor was fitted on a deterministic prefix of '
                                 f'{_nfit:,}/{_nsrc:,} training tokens (max_fit_tokens={data.get("max_fit_tokens")}); '
                                 'report the fit budget when quoting the floor')
+    elif _fit_truncated:
+        warnings.append('count-model artifact claims a truncated fit but lacks integer fit/source token counts')
     # Nested floor evidence: selecting the smoothing AND reporting the floor
     # on the same rows gives the count model a look at the neural panel's
     # held-out rows.  When the artifact declares a nested split, verify that
@@ -14255,7 +14290,7 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
            'nested_selection': nested_applied,
            'row_split': row_split,
            'n_eval_tokens': n_tokens_by_arm,
-           'fit_truncated': data.get('fit_truncated') is True,
+           'fit_truncated': _fit_truncated,
            'fit_budget': {
                'fit_token_policy': data.get('fit_token_policy'),
                'max_fit_tokens': data.get('max_fit_tokens'),

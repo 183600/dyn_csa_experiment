@@ -5843,6 +5843,25 @@ def t_simple_baseline_fit_budget_is_bounded_and_disclosed():
     bad['data']['n_fit_tokens'] = bad['data']['n_source_tokens']
     rbad = L.simple_baseline_audit(bad, protocol=proto)
     assert rbad['baseline_verified'] is False, rbad
+    # The truncation flag cannot contradict the recorded token counts.
+    liar = json.loads(json.dumps(art))
+    liar['data']['fit_truncated'] = False
+    rliar = L.simple_baseline_audit(liar, protocol=proto)
+    assert rliar['baseline_verified'] is False, rliar
+    assert rliar['fit_truncated'] is True, rliar
+    assert any('contradicts the token counts' in p for p in rliar['problems']), rliar
+    # The recorded prefix must be exactly min(source, max_fit_tokens).
+    wrong_cap = json.loads(json.dumps(art))
+    wrong_cap['data']['max_fit_tokens'] = 200
+    rcap = L.simple_baseline_audit(wrong_cap, protocol=proto)
+    assert rcap['baseline_verified'] is False and any(
+        'deterministic-prefix fit' in p for p in rcap['problems']), rcap
+    # A non-boolean flag is malformed evidence, not a true/false label.
+    strflag = json.loads(json.dumps(art))
+    strflag['data']['fit_truncated'] = 'yes'
+    rflag = L.simple_baseline_audit(strflag, protocol=proto)
+    assert rflag['baseline_verified'] is False and any(
+        'must be a boolean' in p for p in rflag['problems']), rflag
 
 
 def t_simple_floor_contrast_is_significance_aware():
