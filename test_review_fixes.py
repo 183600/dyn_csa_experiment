@@ -10237,6 +10237,26 @@ def t_preprocessing_fit_audit_detects_full_table_leak():
     assert e['status'] in ('train_only_verified', 'unverifiable'), e
 
 
+def t_split_targets_use_exact_fraction_arithmetic():
+    import data_guard as DG
+    # The intended 4/7 split must survive the float representation of 4/7.
+    assert DG._floor_fraction_product(7, 4 / 7) == 4
+    assert DG._floor_fraction_product(7, 2 / 7) == 2
+    # At row counts beyond float64's exact integer range the target sizes must
+    # still sum to n and follow the exact rational fraction, not a rounded
+    # product.
+    n = 2 ** 53 + 1
+    sizes = DG._resolve_sizes(n, 0.8, 0.1, 0.1)
+    assert sum(sizes) == n, sizes
+    assert sizes == (7205759403792795, 900719925474099, 900719925474099), sizes
+    try:
+        DG._resolve_sizes(10, 0.8, 0.1, 0.1, train_size=11)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('oversized explicit split must still be refused')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10525,6 +10545,7 @@ def main():
     _check('L37c tuning margin does not invent precision', t_tuning_margin_does_not_invent_precision)
     _check('L37d ladder missing seed plan is not common', t_scale_ladder_missing_seed_plan_is_not_common)
     _check('L38 small-n split remainder + string order keys', t_small_n_split_remainder_and_string_order)
+    _check('L38c exact split fraction arithmetic at scale', t_split_targets_use_exact_fraction_arithmetic)
     _check('L38b empty split still validates fractions', t_empty_split_still_validates_fractions)
     _check('L39 split audit recomputes fingerprints and doc sidecars', t_split_discipline_recomputes_fingerprints_and_doc_sidecars)
     _check('L40 archive refuses links and repo escape', t_archive_refuses_links_and_repo_escape)

@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import math
 import numbers
+from fractions import Fraction
 
 import numpy as np
 
@@ -111,6 +112,31 @@ def _explicit_count(name, value):
     return _check_count(f'{name}_size', value)
 
 
+def _fraction_value(frac):
+    """Recover the intended simple fraction behind a declared float.
+
+    ``4/7`` is stored as a binary approximation whose exact product with 7 is
+    slightly below 4, so using ``Fraction(float(frac))`` would turn an
+    intended 4-row split into 3.  Recover the small rational the caller almost
+    certainly meant; fall back to the exact binary value when no simple
+    rational round-trips.
+    """
+    exact = Fraction(float(frac))
+    simple = exact.limit_denominator(10 ** 9)
+    return simple if abs(float(simple) - float(exact)) <= 1e-15 else exact
+
+
+def _floor_fraction_product(n, frac):
+    """Exact ``floor(n * frac)`` for a validated float fraction.
+
+    ``n * frac`` is evaluated in binary floating point, so at large row counts
+    the product can round across an integer boundary and move a row between
+    splits.  The product with the integer ``n`` is computed exactly before
+    flooring.
+    """
+    return int(math.floor(Fraction(int(n)) * _fraction_value(frac)))
+
+
 def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
                    train_size=None, val_size=None, test_size=None):
     """Return deterministic (n_train, n_val, n_test) sizes summing to ``n``.
@@ -143,7 +169,7 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
         unspecified = [i for i in range(3) if sizes[i] is None]
         remaining = n - sum(v for v in sizes if v is not None)
         for i in unspecified[:-1]:
-            take = min(int(math.floor(n * fracs[i])), remaining)
+            take = min(_floor_fraction_product(n, fracs[i]), remaining)
             sizes[i] = take
             remaining -= take
         if unspecified:
@@ -179,7 +205,8 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
         # An empty dataset splits into three empty (non-overlapping) parts;
         # requiring one row per non-empty split would be impossible.
         return (0, 0, 0)
-    sizes = [int(math.floor(n * f)) for f in (train_frac, val_frac, test_frac)]
+    sizes = [_floor_fraction_product(n, f)
+             for f in (train_frac, val_frac, test_frac)]
     # Small n: guarantee one row for every requested non-empty split.  Larger
     # splits are reduced first (from the end) so the chronological order is
     # never broken.
@@ -206,8 +233,12 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
         raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
     if _remainder:
         _targets = (train_frac, val_frac, test_frac)
+        # Rank by the exact fractional shortfall, not a rounded float
+        # product: at large n a 1-ulp difference can decide which split
+        # receives the remainder row.
         _best = max((i for i, flag in enumerate(requested) if flag),
-                    key=lambda i: (_targets[i] * n - sizes[i], i))
+                    key=lambda i: (_fraction_value(_targets[i]) * int(n)
+                                   - int(sizes[i]), i))
         sizes[_best] += _remainder
     if sum(sizes) != n or any(v < 0 for v in sizes):
         raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
@@ -1492,7 +1523,7 @@ class LeakageSafeTargetEncoder:
         for k in range(1, self.n_folds):
             lo = prev + 1
             hi = len(order) - (self.n_folds - k)
-            target = math.floor(k * n / self.n_folds)
+            target = (int(k) * int(n)) // int(self.n_folds)
             j = min(range(lo, hi + 1),
                     key=lambda pos: (abs(prefix[pos] - target), pos))
             bounds.append(j)
@@ -1559,7 +1590,7 @@ class LeakageSafeTargetEncoder:
         chosen = []
         prev_idx = 0
         for k in range(1, self.n_folds):
-            target = math.floor(k * n / self.n_folds)
+            target = (int(k) * int(n)) // int(self.n_folds)
             pos = int(np.searchsorted(cuts, target, side='left'))
             remaining = self.n_folds - k
             pos = max(pos, prev_idx + 1)
