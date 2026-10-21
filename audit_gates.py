@@ -1652,9 +1652,26 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
                 problems.append('arm seed/protocol coverage differs (%s) — arm means are over different seeds; pair only the shared seeds or restore the missing cells' % _detail)
     out['problems'] = problems
     out['tuning'] = L.baseline_tuning_audit(path=os.path.join(REPO, 'results_baseline_tuning', 'baseline_tuning.json'))
+    out['simple_baseline'] = L.simple_baseline_audit(path=os.path.join(REPO, 'results_baseline_tuning', 'simple_baseline.json'))
     out['warnings'] = warnings
     if not out['tuning'].get('tuning_verified'):
         out['warnings'].append('no equal-search baseline tuning artifact — a win over these baselines is not yet evidence against a well-tuned baseline; run baseline_tune.py')
+    elif out['tuning'].get('tuned_claim_allowed') is False:
+        out['warnings'].append(
+            'the equal-search tuning artifact is verified but does not support a '
+            '"well-tuned baseline" claim (%s) — fix the search grid/horizon before '
+            'calling the baseline tuned'
+            % '; '.join(out['tuning'].get('tuned_claim_reasons') or []))
+    if not out['simple_baseline'].get('baseline_verified'):
+        out['warnings'].append(
+            'no verified tuned count-model floor — a neural win has not yet been '
+            'shown to beat the simplest baseline; run baseline_tune.py simple')
+    elif out['simple_baseline'].get('tuned_floor_claim_allowed') is False:
+        out['warnings'].append(
+            'the count-model floor passed its structural audit but is not '
+            'adequately tuned (%s); extend the smoothing grid before quoting a '
+            'beats-floor claim'
+            % '; '.join(out['simple_baseline'].get('tuned_floor_claim_reasons') or []))
     out['status'] = ('fail' if problems else
                      'warn' if out['warnings'] else
                      ('not_verifiable_locally' if _unverifiable else 'ok'))

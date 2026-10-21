@@ -4462,6 +4462,10 @@ def t_baseline_family_declared_contrasts_and_undeclared_arms():
     assert out['final_family_size'] == 3, out
     assert out['final_family_basis'] == 'declared_arm_groups', out
     assert out['final_family_contrasts'] == [['a', 'b'], ['a', 'c'], ['d', 'e']], out
+    # A verified equal-search artifact is not automatically a tuned claim:
+    # this two-level grid is coarse, so the adequacy gate must refuse it.
+    assert out['tuning_verified'] is True and out['tuned_claim_allowed'] is False, out
+    assert out['tuned_claim_reasons'], out
     # An undeclared arm must not enlarge the family or buy coverage.
     extra = json.loads(json.dumps(art))
     extra['arms']['f'] = _arm([10.0, 11.0])

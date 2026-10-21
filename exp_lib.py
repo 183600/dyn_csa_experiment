@@ -14300,6 +14300,21 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
            'data': data, 'problems': problems, 'warnings': warnings}
     if warnings and not problems:
         out['status'] = 'warn'
+    # Structural verification is not adequacy: a boundary/tied smoothing pick
+    # or a prefix-truncated fit must not be quoted as a well-tuned floor.
+    _floor_reasons = []
+    if not out.get('baseline_verified'):
+        _floor_reasons.append('count-model artifact not verified')
+    if out.get('grid_adequacy') not in (None, 'ok'):
+        _floor_reasons.append('grid_adequacy=%r' % (out.get('grid_adequacy'),))
+    if out.get('grid_boundary_hits'):
+        _floor_reasons.append('selected smoothing is on a grid boundary')
+    if out.get('selection_tie_arms'):
+        _floor_reasons.append('selected smoothing ties the runner-up')
+    if out.get('fit_truncated') is True:
+        _floor_reasons.append('count model was fitted on a truncated prefix')
+    out['tuned_floor_claim_allowed'] = not _floor_reasons
+    out['tuned_floor_claim_reasons'] = _floor_reasons
     return out
 
 # 指标口径表：每个任务的主指标、方向、不平衡处理与聚合方式都显式写出。
@@ -18219,6 +18234,29 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                                 for a, e in arms.items() if isinstance(e, dict)}}
     if warnings and not problems:
         out['status'] = 'warn'
+    # A verified equal-search artifact is not yet a "well-tuned baseline"
+    # claim: the grid may be too narrow, the search may be truncated, the
+    # selected config may have been tuned at another horizon/exposure, or the
+    # pick may be seed-driven.  Expose the gate here so every caller (methods,
+    # gates, reports) gets the same verdict instead of recomputing it.
+    _claim_reasons = []
+    if not out.get('tuning_verified'):
+        _claim_reasons.append('equal-search tuning artifact not verified')
+    if out.get('grid_adequacy') not in (None, 'ok'):
+        _claim_reasons.append('grid_adequacy=%r' % (out.get('grid_adequacy'),))
+    if out.get('search_complete') is False:
+        _claim_reasons.append('search grid was truncated')
+    _transfer = out.get('budget_transfer') or {}
+    if isinstance(_transfer, dict) and _transfer.get('equal') is False:
+        _claim_reasons.append('search-to-final training horizon differs')
+    if isinstance(_transfer, dict) and _transfer.get('tokens_equal') is False:
+        _claim_reasons.append('search-to-final token exposure differs')
+    _stab = out.get('selection_stability') or {}
+    if any(isinstance(v, dict) and v.get('status') == 'ok'
+           and v.get('stable') is False for v in _stab.values()):
+        _claim_reasons.append('selected config is not leave-one-search-seed-out stable')
+    out['tuned_claim_allowed'] = not _claim_reasons
+    out['tuned_claim_reasons'] = _claim_reasons
     return out
 
 def _variant_seed_map(summary):
