@@ -8829,6 +8829,7 @@ def t_categorical_shift_requires_two_bins():
 
 
 def t_data_quality_unhashable_labels():
+    import data_guard as DG
     X = np.array([[0.0], [0.0], [1.0], [2.0]])
     y = np.empty(4, dtype=object)
     y[0], y[1], y[2], y[3] = ['a'], ['b'], ['c'], ['d']
@@ -8836,6 +8837,17 @@ def t_data_quality_unhashable_labels():
                                 test_idx=[3])
     assert rep['checks']['label_conflicts_on_duplicate_rows'] == 1, rep
     assert rep['status'] == 'fail', rep
+    # The unhashable-key sentinel must not collide with a real tuple label.
+    # A list label and a tuple with the old sentinel spelling are different
+    # classes; the duplicate-row conflict audit must still see the conflict.
+    _sentinel_tuple = ('__unhashable__', 'list', "['x']")
+    assert DG._hashable_label(['x']) != DG._hashable_label(_sentinel_tuple)
+    assert DG._group_key(['x']) != DG._group_key(_sentinel_tuple)
+    Xd = np.array([[0.0], [0.0]])
+    yd = np.empty(2, dtype=object)
+    yd[0], yd[1] = ['x'], _sentinel_tuple
+    rd = L.data_quality_report(Xd, y=yd, train_idx=[0, 1])
+    assert rd['checks']['label_conflicts_on_duplicate_rows'] == 1, rd
 
 
 def t_categorical_encoder_train_only():

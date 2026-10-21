@@ -70,6 +70,35 @@ SPLIT_NAMES = ('train', 'val', 'test')
 _EPS = 1e-12
 
 
+class _UnhashableKey:
+    """Opaque, deterministic identity for an unhashable category/group.
+
+    A plain tuple sentinel such as ``('__unhashable__', type, repr)`` can
+    collide with a real hashable tuple category using exactly those elements,
+    silently merging two different labels/groups.  An instance of this class
+    only compares equal to another instance with the same type name and repr,
+    so user values cannot impersonate the sentinel.  The repr is deterministic
+    (no object address), which keeps fold assignment and audit output stable
+    across processes.
+    """
+    __slots__ = ('type_name', 'repr')
+
+    def __init__(self, type_name, repr_text):
+        self.type_name = str(type_name)
+        self.repr = str(repr_text)
+
+    def __hash__(self):
+        return hash((type(self), self.type_name, self.repr))
+
+    def __eq__(self, other):
+        return (type(other) is type(self)
+                and self.type_name == other.type_name
+                and self.repr == other.repr)
+
+    def __repr__(self):
+        return f'<_UnhashableKey {self.type_name}:{self.repr}>'
+
+
 # ---------------------------------------------------------------------------
 # Split sizing / validation
 # ---------------------------------------------------------------------------
@@ -799,8 +828,9 @@ def _group_key(value):
     except TypeError:
         # Group ids are normally hashable scalars, but an object column of
         # lists/arrays should still be groupable by a stable identity rather
-        # than crashing inside a set/dict downstream.
-        return ('__unhashable__', type(value).__name__, repr(value))
+        # than crashing inside a set/dict downstream.  The opaque key cannot
+        # equal a real user tuple.
+        return _UnhashableKey(type(value).__name__, repr(value))
     return value
 
 
@@ -3115,7 +3145,9 @@ def _hashable_label(value):
     try:
         hash(value)
     except TypeError:
-        return ('__unhashable__', type(value).__name__, repr(value))
+        # Opaque identity: a real tuple category equal to the old tuple
+        # sentinel must not be conflated with a genuinely unhashable value.
+        return _UnhashableKey(type(value).__name__, repr(value))
     return value
 
 
