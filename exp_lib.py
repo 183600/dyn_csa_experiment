@@ -6996,6 +6996,14 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             _mobj = json.load(open(_mp, encoding='utf-8'))
         except Exception:
             continue
+        if not isinstance(_mobj, dict):
+            # A valid-JSON list/scalar is not train-cache metadata.  Keeping
+            # it in the list made the tokenizer-cap/fingerprint loops call
+            # .get() on a list and crash the test-cache build.
+            print(f'[data] WARNING: train-cache metadata {_mp} is a '
+                  f'{type(_mobj).__name__}, not an object — ignored for the '
+                  'test-cache binding')
+            continue
         _train_meta_objs.append(_mobj)
         _train_meta_paths.append(_mp)
     _caps = {int(_m['tokenizer_fit_token_cap']) for _m in _train_meta_objs
@@ -7146,6 +7154,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             _mtag = os.path.basename(_mpath)[len('meta_'):-len('.json')]
             _mobj = json.load(open(_mpath, encoding='utf-8'))
         except Exception:
+            continue
+        if not isinstance(_mobj, dict):
             continue
         if _mobj.get('fit_fp') and _mobj['fit_fp'] != _fit_fp_build:
             continue
