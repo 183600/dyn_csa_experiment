@@ -101,6 +101,12 @@ class _UnhashableKey:
         return f'<_UnhashableKey {self.type_name}:{self.repr}>'
 
 
+# One opaque identity for every representation of a missing group id (None,
+# NaN, NaT).  A real user tuple such as ``('__nan__',)`` must not be able to
+# impersonate it, and missing ids must never act as per-row unique groups.
+_MISSING_GROUP_KEY = _UnhashableKey('__missing_group__', '')
+
+
 # ---------------------------------------------------------------------------
 # Split sizing / validation
 # ---------------------------------------------------------------------------
@@ -908,7 +914,7 @@ def _temporal_group_key(value):
     """
     if isinstance(value, (np.datetime64, np.timedelta64)):
         if np.isnat(value):
-            return ('__nat__',)
+            return _MISSING_GROUP_KEY
     elif not isinstance(value, (_datetime.date, _datetime.datetime,
                                 _datetime.timedelta)):
         # pragma: no cover - guarded by the caller
@@ -925,12 +931,16 @@ def _temporal_group_key(value):
 
 
 def _group_key(value):
-    """Hashable group identity; NaN/NaT rows collapse into one missing group.
+    """Hashable group identity; all missing ids collapse into one group.
 
     A missing group id must not behave like "unique per row": otherwise rows
     of the same missing group can be split across train/val/test and no
-    group-overlap check will ever fire.
+    group-overlap check will ever fire.  ``None``, NaN and NaT are the same
+    missing identity; a real tuple id spelled like an old tuple sentinel is a
+    different value (the sentinel is opaque).
     """
+    if value is None:
+        return _MISSING_GROUP_KEY
     if isinstance(value, (np.datetime64, np.timedelta64,
                           _datetime.date, _datetime.datetime,
                           _datetime.timedelta)):
@@ -940,7 +950,7 @@ def _group_key(value):
           and isinstance(value, numbers.Number)):
         try:
             if math.isnan(float(value)):
-                return ('__nan__',)
+                return _MISSING_GROUP_KEY
         except (TypeError, ValueError, OverflowError):
             pass
     try:

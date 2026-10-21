@@ -11685,6 +11685,36 @@ def t_target_encoder_keeps_duplicate_rows_in_one_fold():
     assert np.array_equal(old_folds, new_folds)
 
 
+def t_missing_group_ids_are_one_opaque_group():
+    # None, NaN and NaT are three spellings of a missing group id.  Treating
+    # them as different groups lets the same missing group straddle splits, and
+    # a real tuple id spelled like the old tuple sentinel could impersonate it.
+    import data_guard as DG
+    missing = [None, float('nan'), np.float64('nan'),
+               np.datetime64('NaT', 'ns'), np.timedelta64('NaT', 'ns')]
+    keys = {DG._group_key(v) for v in missing}
+    assert len(keys) == 1, keys
+    for forged in (('__nan__',), ('__nat__',), ('__missing__',)):
+        assert DG._group_key(forged) not in keys, forged
+    g = np.asarray([None, np.float64('nan')], dtype=object)
+    try:
+        DG.assert_no_split_leakage([0], [1], np.array([], dtype=np.int64),
+                                   groups=g)
+    except ValueError as e:
+        assert 'share group ids' in str(e), e
+    else:
+        raise AssertionError('a missing group split across sides must fail')
+    # A single missing group cannot be silently cut into populated folds.
+    g4 = np.asarray([None, np.float64('nan'), np.datetime64('NaT', 'ns'),
+                     'x'], dtype=object)
+    try:
+        DG.grouped_chronological_split_indices(4, g4, 0.5, 0.25, 0.25)
+    except ValueError as e:
+        assert 'no rows for the requested' in str(e), e
+    else:
+        raise AssertionError('a missing group must not be cut across folds')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11891,6 +11921,7 @@ def main():
     _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)
     _check('I19 simple-baseline audit reports malformed records instead of crashing', t_simple_baseline_audit_malformed_records)
     _check('I20 index aliasing, non-finite labels, signed-zero duplicates, undefined SMD, NaT groups', t_data_guard_index_label_and_shift_edges)
+    _check('I20b all missing group ids share one opaque identity', t_missing_group_ids_are_one_opaque_group)
     _check('I21 split-and-prepare fits preprocessing on train only', t_split_and_prepare_fits_train_only)
     _check('I21d strict post-split quality gate', t_split_and_prepare_strict_quality_gate)
     _check('I21a data-quality temporal split audit', t_data_quality_temporal_audit)
