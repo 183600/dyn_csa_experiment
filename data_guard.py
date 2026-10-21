@@ -3082,6 +3082,27 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         raise ValueError(
             f"label_conflicts must be 'drop', 'keep' or 'raise', "
             f"got {label_conflicts!r}")
+    for _flag_name, _flag in (('drop_duplicates', drop_duplicates),
+                              ('drop_invalid_labels', drop_invalid_labels),
+                              ('drop_nonfinite_features', drop_nonfinite_features)):
+        if not isinstance(_flag, (bool, np.bool_)):
+            raise ValueError(
+                f'{_flag_name} must be a boolean, got {_flag!r}')
+    if y is None:
+        # These options can only inspect/remove labels.  Without y the
+        # requested cleaning step silently did nothing, so a caller could
+        # believe ambiguous/missing training targets were removed when the
+        # split was untouched.  Refuse the un-runnable request (the
+        # target-outlier fence below already fails closed for the same
+        # reason).
+        if drop_invalid_labels:
+            raise ValueError(
+                'clean_training_rows: drop_invalid_labels=True requires y so '
+                'missing/non-finite training labels can be identified')
+        if label_conflicts != 'drop':
+            raise ValueError(
+                f'clean_training_rows: label_conflicts={label_conflicts!r} '
+                'requires y so duplicate-row label conflicts can be detected')
     if outlier_iqr is not None:
         if isinstance(outlier_iqr, (bool, np.bool_)):
             raise ValueError(
