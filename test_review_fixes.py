@@ -9531,6 +9531,46 @@ def t_data_guard_nat_and_label_identity():
     assert _shift['js_divergence'] > 0.5, _rep2
 
 
+def t_object_temporal_duplicate_identity():
+    # Adjacent nanosecond timestamps have the same float64 image.  An object
+    # column must not collapse them into false duplicates (which would drop
+    # distinct training rows or manufacture a cross-split leakage alarm).
+    import data_guard as DG
+    stamps = [np.datetime64('2020-01-01T00:00:00.000000001'),
+              np.datetime64('2020-01-01T00:00:00.000000002'),
+              np.datetime64('2020-01-01T00:00:00.000000003')]
+    X = np.asarray(stamps, dtype=object).reshape(-1, 1)
+    assert not DG.duplicate_mask(X).any(), DG.duplicate_mask(X)
+    assert len({DG._matrix_fingerprint(X[i:i + 1]) for i in range(3)}) == 3
+    # A true duplicate is still detected, and NaT is not conflated with None.
+    dup = np.asarray([stamps[0], stamps[0], np.datetime64('NaT'),
+                      None], dtype=object).reshape(-1, 1)
+    assert DG.duplicate_mask(dup).tolist() == [False, True, False, False],         DG.duplicate_mask(dup)
+    # The same instant expressed in different units keeps one identity.
+    mixed = np.asarray([np.datetime64('2020-01-01T00:00:01', 's'),
+                        np.datetime64('2020-01-01T00:00:01.000000000', 'ns')],
+                       dtype=object).reshape(-1, 1)
+    assert DG.duplicate_mask(mixed).tolist() == [False, True],         DG.duplicate_mask(mixed)
+    # Timedelta values use their own exact identity (and do not collide with
+    # the integer with the same value).
+    deltas = np.asarray([np.timedelta64(1, 'ns'), np.timedelta64(2, 'ns'),
+                         np.timedelta64(1, 'ns'), 1], dtype=object).reshape(-1, 1)
+    assert DG.duplicate_mask(deltas).tolist() == [False, False, True, False],         DG.duplicate_mask(deltas)
+    # End-to-end: a clean chronological split of distinct timestamps must not
+    # be refused as a duplicate-feature leak, while cleaning must keep them.
+    clean_obj = np.empty((6, 1), dtype=object)
+    clean_obj[:, 0] = stamps + [np.datetime64('2020-01-01T00:00:00.000000004'),
+                                np.datetime64('2020-01-01T00:00:00.000000005'),
+                                np.datetime64('2020-01-01T00:00:00.000000006')]
+    out = DG.split_and_prepare(clean_obj, preprocess=False,
+                               train_frac=0.5, val_frac=0.25, test_frac=0.25)
+    assert out['cross_split_duplicates'] == {
+        'train__val': 0, 'train__test': 0, 'val__test': 0}, out
+    cleaned = DG.clean_training_rows(
+        clean_obj, train_idx=np.arange(4), drop_duplicates=True)
+    assert cleaned['n_duplicate_rows_dropped'] == 0, cleaned
+
+
 def t_validation_row_split_group_aware():
     # The balanced row boundary (4) would cut the group spanning rows 3-4.
     # A group-aware split must move it to a document boundary instead.
@@ -11514,6 +11554,7 @@ def main():
     _check('I30d target/label outliers are cleanable with a train-only fence', t_clean_training_target_outliers)
     _check('I31 declared label set catches unseen/holdout labels', t_known_labels_audit)
     _check('I31b NaT keys and type-qualified label shift', t_data_guard_nat_and_label_identity)
+    _check('I31c object temporal duplicate identity', t_object_temporal_duplicate_identity)
     # Open-block reading rule: the substantive gates (causality, reference
     # pooling, masks, edge cases, closed regression) live in test_open_block.py
     # so they can also be run on their own.

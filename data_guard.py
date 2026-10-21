@@ -3125,6 +3125,41 @@ def _wide_float_key(v):
             else b'R' + str(n).encode('ascii') + b'/' + str(d).encode('ascii'))
 
 
+def _temporal_key(v):
+    """Exact canonical key for an object-cell ``datetime64``/``timedelta64``.
+
+    The generic object path below used to call ``float(v)`` on these values,
+    which rounds a timestamp to the nearest float64.  Adjacent nanosecond
+    timestamps (or a timestamp and an integer with the same rounded value)
+    then hashed identically and were reported as exact duplicates, so a clean
+    split could be refused or distinct training rows dropped.  Native temporal
+    arrays were already hashed in their own dtype; object columns need the
+    same exactness.  Values are canonicalised to nanoseconds when that does
+    not overflow, so the same instant expressed in different units keeps one
+    identity, with a unit-qualified fallback outside the nanosecond range.
+    """
+    is_datetime = isinstance(v, np.datetime64)
+    prefix = b'D' if is_datetime else b'T'
+    if np.isnat(v):
+        return prefix + b'NaT'
+    target = 'datetime64[ns]' if is_datetime else 'timedelta64[ns]'
+    try:
+        canon = v.astype(target)
+    except (TypeError, ValueError, OverflowError):
+        canon = None
+    if canon is not None and not np.isnat(canon):
+        try:
+            return prefix + b'I' + str(int(canon.view('i8'))).encode('ascii')
+        except (TypeError, ValueError, OverflowError):
+            pass
+    try:
+        raw = int(v.view('i8'))
+    except (TypeError, ValueError, OverflowError):
+        return prefix + b'V:' + repr(v).encode('utf-8', 'backslashreplace')
+    return (prefix + str(v.dtype).encode('ascii') + b':'
+            + str(raw).encode('ascii'))
+
+
 def _row_keys(X):
     """Stable per-row keys for exact-duplicate detection (NaN-safe)."""
     src = np.asarray(X)
@@ -3176,6 +3211,12 @@ def _row_keys(X):
                 # Match the generic float path: None is a missing value and
                 # compares equal to a NaN scalar in the same position.
                 return b'Fnan'
+            if isinstance(v, (np.datetime64, np.timedelta64)):
+                # A timestamp is not a float or an integer: adjacent
+                # nanosecond values share one float64 image, and
+                # ``np.timedelta64`` even registers as numbers.Integral.
+                # Keep the exact temporal identity.
+                return _temporal_key(v)
             if isinstance(v, (bool, np.bool_)):
                 return b'I' + str(int(v)).encode('ascii')
             if isinstance(v, numbers.Integral):
