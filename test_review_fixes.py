@@ -1683,6 +1683,39 @@ def t_power_gate():
             raise AssertionError('a string descriptive_only opt-out was accepted')
 
 
+def t_v12_malformed_manifest_and_lock_fail_closed():
+    with tempfile.TemporaryDirectory() as td:
+        # A scalar/list comparison cannot be read with .get(); it must be
+        # named as malformed evidence instead of crashing the loader.
+        p = os.path.join(td, 'bad_comps.json')
+        m = _write_manifest(p, list(range(12)))
+        m['primary_comparisons'] = ['not-an-object']
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(m, f)
+        try:
+            V12._load_manifest(p)
+        except SystemExit as e:
+            assert 'primary_comparisons[0]' in str(e) and 'object' in str(e), e
+        else:
+            raise AssertionError('a scalar primary comparison was accepted')
+        # A valid-JSON but non-object freeze lock cannot attest anything;
+        # .get() on it used to raise AttributeError after test access.
+        outdir = os.path.join(td, 'freeze')
+        os.makedirs(outdir)
+        lp = os.path.join(outdir, V12._LOCK_NAME)
+        for _payload in ([], 'null', 3):
+            with open(lp, 'w', encoding='utf-8') as f:
+                json.dump(_payload, f)
+            try:
+                V12._check_or_write_freeze_lock(
+                    outdir, {'manifest_sha256': 'a' * 64, 'frozen_at': 'x'},
+                    'slice-fp', stage='precheck')
+            except SystemExit as e:
+                assert 'not a JSON object' in str(e), e
+            else:
+                raise AssertionError(f'freeze lock payload {_payload!r} was accepted')
+
+
 def _rec(variant, seed, fp, by_len=None, code=None, recipe='steps3000_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_v8192_wu50_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee250_es128_detcpu-eager_dfdeadbeef_cscURRENT', msha='CURRENT'):
     return {'variant': variant, 'seed': seed, 'split': 'test', 'data_fp': fp, 'by_len': by_len or {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095, 'truncated': False}}, '_code': code or L.code_stamp(), 'recipe': recipe, 'manifest_sha256': msha, 'key': f'{variant}::s{seed}'}
 
@@ -14224,6 +14257,7 @@ def main():
     _check('L51b count floor rejects undeclared arms/blank fields', t_simple_floor_rejects_undeclared_arms_and_blank_fields)
     _check('L51c recommended endpoint availability + exact floor support', t_metric_audit_recommended_availability_and_exact_floor_support)
     _check('L52 simple-baseline floor identity/rows bind their evidence', t_simple_baseline_bound_floor_identity_and_rows)
+    _check('L53 v12 malformed manifest/lock fail closed', t_v12_malformed_manifest_and_lock_fail_closed)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

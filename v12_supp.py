@@ -236,6 +236,14 @@ def _load_manifest(path):
         raise SystemExit(f'[v12] REFUSE: seeds must be a non-empty list ({m.get("seeds")!r})')
     if not isinstance(m['primary_comparisons'], list) or not m['primary_comparisons']:
         raise SystemExit(f'[v12] REFUSE: primary_comparisons must be a non-empty list ({m.get("primary_comparisons")!r})')
+    for _ci, _comp in enumerate(m['primary_comparisons']):
+        if not isinstance(_comp, dict):
+            # The rest of this loader (and admission) reads fields with
+            # .get(); a scalar/list entry would crash with AttributeError
+            # instead of refusing the malformed pre-registration.
+            raise SystemExit(
+                f'[v12] REFUSE: primary_comparisons[{_ci}] must be an object, '
+                f'got {type(_comp).__name__} ({_comp!r})')
     if not isinstance(m['statistics'], dict):
         raise SystemExit(f'[v12] REFUSE: statistics must be an object ({m.get("statistics")!r})')
     for _fld, _val in (('binding', m.get('binding')), ('eval', m.get('eval'))):
@@ -676,6 +684,15 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
             lock = json.load(open(lp, encoding='utf-8'))
         except Exception as e:
             raise SystemExit(f'[v12] REFUSE: freeze lock {lp} exists but cannot be parsed ({type(e).__name__}: {e}) — delete it only if you can prove no test-split record was ever written under it')
+        if not isinstance(lock, dict):
+            # A valid-JSON list/scalar has no lock fields.  Reading it with
+            # .get() used to raise AttributeError after the first test access,
+            # which is exactly when this integrity check must fail closed.
+            raise SystemExit(
+                f'[v12] REFUSE: freeze lock {lp} is a {type(lock).__name__}, '
+                'not a JSON object — it cannot attest the frozen plan/test '
+                'slice; delete it only if you can prove no test-split record '
+                'was ever written under it')
         _manifest_changed = lock.get('manifest_sha256') != _sha
         _test_changed = (test_ids_fp is not None
                          and lock.get('test_ids_fp') not in (None, test_ids_fp))
