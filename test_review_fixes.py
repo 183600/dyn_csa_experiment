@@ -10290,6 +10290,44 @@ def t_validation_row_split_group_aware():
     assert not ({str(_nat[i]) for i in _s} & {str(_nat[i]) for i in _e}), (_s, _e)
 
 
+def t_cached_validation_row_groups_merge_shared_documents():
+    # The cached validation stream stores a document id per token.  Fixed row
+    # windows can straddle a document, so rows 1-3 must become one group; a
+    # row-only split would otherwise be able to select on part of a document
+    # and evaluate on another part.
+    _d = tempfile.mkdtemp(prefix='valgroups_')
+    _sl, _ntr, _vb, _vs = 2, 1, 10, 4
+    _tag = f'v5_sl{_sl}_cap{_ntr}_v{_vb}_vs{_vs}'
+    _docs = np.array([1, 1, 2, 2, 2, 3, 3, 3], dtype=np.uint64)
+    np.save(os.path.join(_d, f'val_doc_ids_{_tag}.npy'), _docs)
+    with open(os.path.join(_d, f'meta_{_tag}.json'), 'w', encoding='utf-8') as fh:
+        json.dump({'doc_ids': {'validation_count': int(_docs.size),
+                               'validation_fp': L._ids_fp(_docs)}}, fh)
+    _groups, _meta = L.cached_validation_row_groups(
+        _sl, _ntr, vocab_size=_vb, val_seqs=_vs, n_rows=4, cache_dir=_d)
+    assert _groups == [0, 1, 1, 1], (_groups, _meta)
+    assert _meta['groups_aware'] is True and _meta['n_groups'] == 2, _meta
+    _s, _e, _m = L.validation_row_split(4, groups=_groups)
+    assert _m['groups_aware'] is True, _m
+    assert not ({_groups[i] for i in _s} & {_groups[i] for i in _e}), (_s, _e)
+    # A missing sidecar is an explicit fallback, not a silent claim.
+    _g, _m = L.cached_validation_row_groups(
+        _sl, _ntr, vocab_size=_vb, val_seqs=_vs, n_rows=4, cache_dir=tempfile.mkdtemp())
+    assert _g is None and _m['groups_aware'] is False and 'absent' in _m['reason'], (_g, _m)
+    # A present but too-short sidecar must fail closed.
+    _d2 = tempfile.mkdtemp(prefix='valgroups_bad_')
+    _tag2 = f'v5_sl{_sl}_cap{_ntr}_v{_vb}_vs{_vs}'
+    np.save(os.path.join(_d2, f'val_doc_ids_{_tag2}.npy'),
+            np.array([1, 1, 2, 2], dtype=np.uint64))
+    try:
+        L.cached_validation_row_groups(_sl, _ntr, vocab_size=_vb, val_seqs=_vs,
+                                       n_rows=4, cache_dir=_d2)
+    except ValueError as e:
+        assert 'need' in str(e), e
+    else:
+        raise AssertionError('a short document-id sidecar must be refused')
+
+
 def t_build_report_primary_estimand():
     # The zero-GPU report must pair on the same held-out rows as the nested
     # primary PPL; reading the full-validation `ppl` restores selection rows.
@@ -12625,6 +12663,7 @@ def main():
     _check('H3e tuning driver refuses overlapping search/final seeds', t_baseline_driver_refuses_overlapping_final_seeds)
     _check('H3h nested validation row split + per-row pooled PPL', t_nested_validation_row_split_and_subset_ppl)
     _check('H3i validation row folds are group-aware', t_validation_row_split_group_aware)
+    _check('H3i1 cached document ids merge rows crossing a document', t_cached_validation_row_groups_merge_shared_documents)
     _check('H3i tuning audit verifies nested selection/holdout rows', t_nested_tuning_artifact_audit)
     _check('H3j final tuned contrast is measured on held-out rows', t_nested_final_uses_holdout_rows)
     _check('H3k partial nested holdout falls back wholly to full validation', t_nested_final_partial_holdout_falls_back_wholly)

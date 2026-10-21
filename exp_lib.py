@@ -12673,6 +12673,127 @@ def validation_row_split(n_rows, *, seed=20261020, n_folds=2,
     }
     return selection, evaluation, meta
 
+def cached_validation_row_groups(seq_len, n_train_tokens, vocab_size=8192,
+                                val_seqs=512, n_rows=None, cache_dir=None):
+    """Per-row document groups from the cached validation document-id sidecar.
+
+    The tokenised validation stream is a concatenation of whole documents; a
+    fixed row window can therefore straddle a document boundary.  A row-only
+    chronological split can put two rows of the SAME document on opposite
+    sides of the selection/evaluation cut.  The cache already stores a
+    per-token document id (used by the leakage audit); this helper collapses
+    it to one group per row and merges rows connected by any shared document.
+    The result can be passed to :func:`validation_row_split` as ``groups``.
+
+    Returns ``(groups, meta)``.  ``groups`` is ``None`` when the sidecar is
+    absent or cannot describe this slice; the caller must then fall back
+    explicitly rather than silently claiming group-aware folds.  A present but
+    inconsistent sidecar is an error, not a fallback: its ids would otherwise
+    produce a leaking split.
+
+    This covers the WikiText path (the frozen study).  FineWeb has its own
+    cache layout and callers should pass an explicit group vector if they want
+    group-aware folds there.
+    """
+    cache_dir = _wt_cache_dir(cache_dir)
+    tag = f'v5_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}'
+    path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
+    meta_path = os.path.join(cache_dir, f'meta_{tag}.json')
+    if n_rows is None:
+        n_rows = int(val_seqs)
+    _nr = _as_seed_int(n_rows)
+    _sl = _as_seed_int(seq_len)
+    _vs = _as_seed_int(val_seqs)
+    if _nr is None or _nr < 1 or _sl is None or _sl < 1 or _vs is None or _vs < 1:
+        raise ValueError('cached_validation_row_groups: n_rows/seq_len/val_seqs must be positive integers')
+    if not os.path.exists(path):
+        return None, {'groups_aware': False,
+                      'reason': f'validation document-id sidecar {path} is absent'}
+    try:
+        doc_ids = np.load(path)
+    except Exception as e:
+        raise ValueError(f'cached_validation_row_groups: cannot read {path} '
+                         f'({type(e).__name__}: {e})') from None
+    doc_ids = np.asarray(doc_ids).reshape(-1)
+    need = int(_nr) * int(_sl)
+    if doc_ids.size < need:
+        raise ValueError(
+            f'cached_validation_row_groups: sidecar has {doc_ids.size} token ids, '
+            f'but {_nr} rows x {_sl} tokens need {need}')
+    # Bind the sidecar to the cache metadata when that metadata is available.
+    # A swapped sidecar can be internally plausible while describing a
+    # different token stream, which would make every fold guarantee false.
+    _meta = {}
+    if os.path.exists(meta_path):
+        try:
+            _meta = json.load(open(meta_path, encoding='utf-8'))
+        except Exception as e:
+            raise ValueError(f'cached_validation_row_groups: cannot parse {meta_path} '
+                             f'({type(e).__name__}: {e})') from None
+        _mdoc = (_meta or {}).get('doc_ids') or {}
+        _want_fp = _mdoc.get('validation_fp')
+        if _want_fp and _want_fp != _ids_fp(doc_ids):
+            raise ValueError('cached_validation_row_groups: validation document-id '
+                             'sidecar does not match the cache metadata fingerprint')
+        if int(_mdoc.get('validation_count', -1)) not in (-1, int(doc_ids.size)):
+            raise ValueError('cached_validation_row_groups: sidecar length disagrees '
+                             'with the cache metadata document-id count')
+    # Union rows connected by any shared document.  A document can legitimately
+    # span many rows; all of them become one group.  If a document id reappears
+    # non-contiguously (a corrupt or misaligned sidecar), the merged group also
+    # spans the intervening rows; validation_row_split's contiguity check then
+    # refuses the split instead of treating it as two independent groups.
+    parent = list(range(int(_nr)))
+
+    def _find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            if ra < rb:
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+    first_row = {}
+    for r in range(int(_nr)):
+        block = doc_ids[r * int(_sl):(r + 1) * int(_sl)]
+        for d in np.unique(block).tolist():
+            key = int(d)
+            if key in first_row:
+                _union(r, first_row[key])
+            else:
+                first_row[key] = r
+    groups = [int(_find(r)) for r in range(int(_nr))]
+    return groups, {
+        'groups_aware': True,
+        'group_source': 'cached_validation_doc_ids',
+        'group_policy': 'rows connected by any shared whole document are one group',
+        'n_groups': int(len(set(groups))),
+        'n_rows': int(_nr),
+        'seq_len': int(_sl),
+        'val_seqs': int(_vs),
+        'doc_ids_fp': _ids_fp(doc_ids[:need]),
+    }
+
+
+def run_corpus_row_groups(cfg, n_rows):
+    """Row groups for a run config, or ``(None, reason)`` when unavailable."""
+    name = cfg.get('dataset') or 'wikitext'
+    if name != 'wikitext':
+        return None, {'groups_aware': False,
+                      'reason': f'no cached document-id groups for dataset {name!r}'}
+    return cached_validation_row_groups(
+        cfg['seq_len'], cfg['n_train_tokens'],
+        vocab_size=cfg.get('vocab_size', 8192),
+        val_seqs=cfg.get('val_seqs', 512), n_rows=n_rows,
+        cache_dir=cfg.get('cache_dir', './wt103_cache'))
+
+
 def tuning_row_split_spec(protocol):
     """Return the normalized row-split spec declared by a tuning protocol.
 

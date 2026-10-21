@@ -175,6 +175,29 @@ def _search_final_seeds(protocol):
     return search, final, sorted(set(search) & set(final))
 
 
+def _nested_row_split(base, n_rows, spec):
+    """Chronological selection/evaluation rows, group-aware when possible.
+
+    Rows are fixed token windows, so a validation document can cross a row
+    boundary.  `validation_row_split(groups=...)` merges rows that share a
+    document; the cache already stores per-token document ids (verified by the
+    leakage audit).  When the sidecar is unavailable the row-only split is
+    returned with an explicit `groups_aware=False` reason, never silently
+    presented as document-disjoint.
+    """
+    _groups, _gmeta = L.run_corpus_row_groups(base, n_rows)
+    _kw = dict(seed=spec['seed'], n_folds=spec['n_folds'],
+               selection_fold=spec['selection_fold'],
+               evaluation_fold=spec['evaluation_fold'])
+    if _groups is not None:
+        _sel, _ev, _meta = L.validation_row_split(n_rows, groups=_groups, **_kw)
+    else:
+        _sel, _ev, _meta = L.validation_row_split(n_rows, **_kw)
+    _meta = dict(_meta)
+    _meta.update(_gmeta or {})
+    return _sel, _ev, _meta
+
+
 def _contrast_plan(protocol, groups, selected):
     """Declared tuned comparisons: each group's method arm vs the other arms
     in the SAME parameter-matching group.
@@ -318,11 +341,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                             _split_reason = f'validation slice has only {_n_rows} row(s)'
                         else:
                             if _row_state['meta'] is None:
-                                _sel, _ev, _meta = L.validation_row_split(
-                                    _n_rows, seed=_row_spec['seed'],
-                                    n_folds=_row_spec['n_folds'],
-                                    selection_fold=_row_spec['selection_fold'],
-                                    evaluation_fold=_row_spec['evaluation_fold'])
+                                _sel, _ev, _meta = _nested_row_split(base, _n_rows, _row_spec)
                                 _row_state.update(n_rows=_n_rows, selection=_sel,
                                                   evaluation=_ev, meta=_meta)
                             if _n_rows != _row_state['n_rows']:
@@ -660,10 +679,7 @@ def _run_final(base, outdir, protocol, selected):
         _lens = {len(r.get('nll_per_row') or []) for r in merged.values()} if merged else set()
         if len(_lens) == 1 and min(_lens) >= 2:
             _n_rows = next(iter(_lens))
-            _sel, _eval_idx, _meta = L.validation_row_split(
-                _n_rows, seed=_row_spec['seed'], n_folds=_row_spec['n_folds'],
-                selection_fold=_row_spec['selection_fold'],
-                evaluation_fold=_row_spec['evaluation_fold'])
+            _sel, _eval_idx, _meta = _nested_row_split(base, _n_rows, _row_spec)
             _final_rows_meta.update(_meta)
             # Compute every holdout estimate BEFORE mutating any record.  A
             # partial assignment would leave some records on the later row
@@ -899,10 +915,7 @@ def run_simple(base_cfg=None, outdir='results_baseline_tuning', protocol=None):
     _row_spec = L.tuning_row_split_spec(_proto)
     _sel_rows = _eval_rows = _row_meta = None
     if _row_spec is not None and rows >= 4:
-        _sel_rows, _eval_rows, _row_meta = L.validation_row_split(
-            rows, seed=_row_spec['seed'], n_folds=_row_spec['n_folds'],
-            selection_fold=_row_spec['selection_fold'],
-            evaluation_fold=_row_spec['evaluation_fold'])
+        _sel_rows, _eval_rows, _row_meta = _nested_row_split(base, rows, _row_spec)
     artifact = L.simple_baseline_fit(
         train_ids, eval_slice, vocab, protocol=protocol,
         selection_rows=_sel_rows, evaluation_rows=_eval_rows, row_split=_row_meta)
