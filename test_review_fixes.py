@@ -1891,6 +1891,20 @@ def t_fairness_cross_arm_controls():
         cov = _run(_panel(drop_seed=2))
         assert cov['status'] == 'fail', cov
         assert any('seed/protocol coverage differs' in p for p in cov['problems']), cov['problems']
+        # Same recipe but a larger arm is a capacity confound, even though the
+        # per-seed run_cfg/train_knobs gate is satisfied.
+        cap = _panel()
+        for _k in list(cap):
+            if cap[_k]['variant'] == 'b':
+                cap[_k]['params'] = 150
+        rcap = _run(cap)
+        assert rcap['status'] == 'fail', rcap
+        assert any('parameter counts differ' in p for p in rcap['problems']), rcap['problems']
+        miss = _panel()
+        miss['b::seed0'].pop('params')
+        rmiss = _run(miss)
+        assert rmiss['status'] == 'warn', rmiss
+        assert any('capacity matching cannot be verified' in w for w in rmiss['warnings']), rmiss
 
 
 def t_tuned_pairing_keeps_optimizer_gate():

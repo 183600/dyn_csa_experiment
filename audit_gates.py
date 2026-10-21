@@ -1563,6 +1563,33 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
             # whole is still unverified; trusting the populated subset would
             # let one seed silently run under a different optimizer.
             problems.append(f'{a}: {n_missing_knobs}/{len(recs)} records omit train_knobs — the optimizer/schedule descriptor covers only part of the arm')
+    # Parameter matching is part of a controlled baseline comparison, not
+    # only of the contrast-level pair gate.  If every arm exposes one exact
+    # positive parameter count, those totals must agree; otherwise a "gain"
+    # can be a capacity gain.  Missing/malformed totals are unverifiable and
+    # only warn (legacy panels), never a silent pass.
+    _params_by_arm = {}
+    for _a, _recs in per_arm.items():
+        _raw_p = [r.get('params') for r in _recs]
+        _parsed_p = [L._as_seed_int(v) for v in _raw_p]
+        if (all(v is not None and v > 0 for v in _parsed_p)
+                and len(set(_parsed_p)) == 1):
+            _params_by_arm[_a] = int(_parsed_p[0])
+    if len(per_arm) >= 2:
+        if len(_params_by_arm) == len(per_arm):
+            if len(set(_params_by_arm.values())) > 1:
+                problems.append(
+                    'parameter counts differ across arms (%s) — a gain from a '
+                    'larger model is a capacity effect, not a controlled '
+                    'baseline/method contrast'
+                    % ', '.join('%s=%s' % (a, _params_by_arm[a])
+                                for a in sorted(_params_by_arm)))
+        else:
+            _missing_params = sorted(set(per_arm) - set(_params_by_arm))
+            warnings.append(
+                'parameter counts are absent/non-unique for arm(s) %s — '
+                'capacity matching cannot be verified from this summary'
+                % _missing_params)
     _unverifiable = False
     if len(per_arm) >= 2:
         # The cross-arm check must use the SAME gate as the statistics
