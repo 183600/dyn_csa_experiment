@@ -7646,6 +7646,17 @@ def t_reportable_claim_gate():
                                 dropped_seeds=[6]))
     assert r['allowed'] is False and any('complete-case' in x for x in r['reasons']), r
     assert r['n_input'] == 7 and r['n_dropped'] == 1, r
+    # Seeds skipped by the same-recipe control gate are also an incomplete
+    # paired panel: the surviving subset was selected by that mismatch.
+    for _key in ('n_skipped_config_mismatch', 'n_skipped'):
+        _rs = L.reportable_claim(dict(base, **{_key: 1}))
+        assert _rs['allowed'] is False, (_key, _rs)
+        assert any('controlled-comparison' in x for x in _rs['reasons']), (_key, _rs)
+        assert _rs.get('n_skipped_config_mismatch') == 1, (_key, _rs)
+    _rsk = L.reportable_claim(dict(base, n_skipped_config_mismatch=0))
+    assert _rsk['allowed'] is True, _rsk
+    assert L.reportable_claim(dict(base, n_skipped_config_mismatch=-1))['allowed'] is False
+    assert L.reportable_claim(dict(base, n_skipped_config_mismatch=True))['allowed'] is False
     # Negative or internally inconsistent dropout accounting is not a clean
     # complete panel; it must not bypass the complete-case refusal.
     for _bad in (dict(base, n_input=-1, n_dropped=0),

@@ -9406,6 +9406,26 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             f'{_n_dropped} paired observation(s) were dropped as non-finite '
             f'(n_input={_n_input}); complete-case significance is not a '
             'complete-panel result')
+    # Seeds excluded because the two arms failed the same-recipe controlled
+    # comparison are ALSO an incomplete paired panel.  Keeping them out of the
+    # test is correct, but the surviving subset was selected by that mismatch
+    # and cannot support a significance claim.  Both field spellings are used
+    # by the v9/v10/v11 contrast builders.
+    _skipped = stats.get('n_skipped_config_mismatch')
+    if _skipped is None:
+        _skipped = stats.get('n_skipped')
+    if _skipped is not None:
+        _sk = _as_seed_int(_skipped)
+        out['n_skipped_config_mismatch'] = _sk
+        if _sk is None or _sk < 0:
+            out['reasons'].append(
+                f'n_skipped_config_mismatch={_skipped!r} is not a non-negative '
+                'integer; paired-panel accounting is unverifiable')
+        elif _sk > 0:
+            out['reasons'].append(
+                f'{_sk} seed(s) were excluded by the controlled-comparison '
+                'gate; complete-case significance is not a complete paired '
+                'panel result')
     if _min_n is not None and _min_n >= 1 and n < _min_n:
         out['reasons'].append(f'n={n} < min_n={_min_n}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={_min_n}')
     elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > alpha:
