@@ -4188,6 +4188,27 @@ def t_metric_policy_checks_record_values():
     me = L.metric_policy_audit({'x::seed0': {'variant': 'x', 'task': 'niah_natural'}})
     assert me['status'] == 'warn', me
 
+    # The audit's record checks must honour a caller-supplied policy, not the
+    # module default.  Here the custom policy declares ROC-AUC as primary and
+    # a 0.5 extreme-imbalance threshold (so a 10% positive rate is NOT rare).
+    _custom = json.loads(json.dumps(L.METRIC_POLICY))
+    _custom['binary_classification']['primary'] = 'roc_auc'
+    _custom['binary_classification']['extreme_imbalance_threshold'] = 0.5
+    _cust_rec = {'r': {'variant': 'r', 'task': 'binary_classification',
+                       'prevalence': 0.1, 'primary_metric': 'roc_auc',
+                       'roc_auc': 0.9, 'pr_auc': 0.8,
+                       'recommended_primary_metric': 'pr_auc',
+                       'recommended_primary_available': True}}
+    _ca = L.metric_policy_audit(_cust_rec, policy=_custom)
+    _cw = ' '.join(_ca['warnings'])
+    assert 'declares primary_metric' not in _cw, _ca
+    assert 'does not match the policy endpoint' not in _cw, _ca
+    assert 'is not defined for task' not in _cw, _ca
+    # A malformed caller policy entry is absent, not an exception.
+    _broken = {'binary_classification': ['not', 'a', 'mapping']}
+    _ba = L.metric_policy_audit(_cust_rec, policy=_broken)
+    assert _ba['status'] == 'warn', _ba
+
 def t_retrieval_metrics_and_niah_trivial_floor():
     # A many-way retrieval endpoint must expose its trivial floors: micro
     # accuracy alone can be high merely because one answer class dominates.

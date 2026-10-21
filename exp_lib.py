@@ -15527,6 +15527,22 @@ def metric_policy_audit(summary=None, policy=None):
                                  'complete': not missing}
         if missing:
             out['warnings'].append(f'metric policy `{name}` is missing {missing}')
+
+    def _policy_entry(task):
+        # Records carry the task name; a policy may be keyed by that name or
+        # by a role key (e.g. ``binary_classification`` vs ``niah_retrieval``)
+        # whose entry declares a different ``task``.  Use the CALLER's policy,
+        # not the module default, so a supplied contract actually governs the
+        # record checks.  Malformed entries are treated as absent (the top
+        # loop already warned about them).
+        _e = policy.get(task)
+        if isinstance(_e, dict):
+            return _e
+        for _v in policy.values():
+            if isinstance(_v, dict) and _v.get('task') == task:
+                return _v
+        return {}
+
     if summary:
         recs = [r for r in summary.values() if isinstance(r, dict)]
         lm = [r for r in recs if ppl_is_usable(r.get('ppl'))]
@@ -16287,7 +16303,7 @@ def metric_policy_audit(summary=None, policy=None):
                         'select it on validation with select_binary_threshold and record the split')
             _declared_primary = r.get('primary_metric') or r.get('metric_primary')
             if _declared_primary is not None:
-                _pol = METRIC_POLICY.get(task) if task in METRIC_POLICY else None
+                _pol = _policy_entry(task) or None
                 _allowed_primary = set()
                 if _pol:
                     for _k in ('primary', 'primary_when_extreme_imbalance'):
@@ -16305,7 +16321,7 @@ def metric_policy_audit(summary=None, policy=None):
             # against the declared policy instead of trusting the record.
             _rec_metric = r.get('recommended_primary_metric')
             if _rec_metric is not None:
-                _pol_rec = METRIC_POLICY.get(task) or {}
+                _pol_rec = _policy_entry(task)
                 _rec_allowed = set()
                 for _k in ('primary', 'primary_when_extreme_imbalance'):
                     _pv = _pol_rec.get(_k)
@@ -16372,7 +16388,7 @@ def metric_policy_audit(summary=None, policy=None):
                             f'{_label}: recommended_primary_available=False but the '
                             f'recommended endpoint {_rec_metric!r} is recorded')
             if prevalence is not None and prevalence < 1e-3:
-                _cond = (METRIC_POLICY.get(task) or {}).get(
+                _cond = _policy_entry(task).get(
                     'primary_when_extreme_imbalance',
                     'pr_auc_macro' if task == 'multiclass_classification' else 'pr_auc')
                 _is_mc = task == 'multiclass_classification'
