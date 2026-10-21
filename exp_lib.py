@@ -19708,6 +19708,13 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
     arms can all be present yet never pair on a common seed, which is not a
     measured ablation even though the presence check passes.
 
+    A component is project-level VERIFIED only when a panel both verifies the
+    contrast and contains the component's complete declared ablation.  A panel
+    that verified one contrast while another declared arm is missing can still
+    prove that particular contrast, but it cannot support "the whole innovation
+    is useful"; such panels are listed separately as
+    `panels_verified_incomplete` instead of being silently promoted.
+
     This is a reporting gate, not a new statistical test: it never promotes a
     component; it only prevents a panel-by-panel reading from hiding an
     omitted innovation."""
@@ -19715,14 +19722,15 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
     out = {'status': 'ok', 'components': {}, 'complete_anywhere': [],
            'usable_anywhere': [], 'verified_anywhere': [], 'measured_anywhere': [],
            'missing_everywhere': [], 'complete_but_unverified': [],
-           'warnings': []}
+           'verified_only_incomplete': [], 'warnings': []}
     if not isinstance(reports, dict):
         out['status'] = 'warn'
         out['warnings'].append('reports must be a {panel: methodology_audit} mapping')
         return out
     for comp in design:
         row = {'panels_complete': [], 'panels_measured': [],
-               'panels_verified': [], 'panels_unverified': [],
+               'panels_verified': [], 'panels_verified_raw': [],
+               'panels_verified_incomplete': [], 'panels_unverified': [],
                'missing_arms': {}, 'declared_in': []}
         for name in sorted(reports):
             rep = reports.get(name)
@@ -19756,7 +19764,13 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
             if comp in (rep.get('measured_components') or []):
                 row['panels_measured'].append(name)
             if comp in (rep.get('verified_components') or []):
-                row['panels_verified'].append(name)
+                row['panels_verified_raw'].append(name)
+                # A partial ablation can verify one contrast but cannot back
+                # the project-level "every proposed module is useful" claim.
+                if comp in (abl.get('complete_components') or []):
+                    row['panels_verified'].append(name)
+                else:
+                    row['panels_verified_incomplete'].append(name)
             if comp in (rep.get('unverified_components') or []):
                 row['panels_unverified'].append(name)
         row['panels_usable'] = sorted(set(row['panels_complete']) & set(row['panels_measured']))
@@ -19783,6 +19797,14 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
             out['verified_anywhere'].append(comp)
         elif row['complete_anywhere']:
             out['complete_but_unverified'].append(comp)
+        if row['panels_verified_incomplete']:
+            out['verified_only_incomplete'].append(comp)
+            out['warnings'].append(
+                '%s: verified in %s only while its declared ablation is '
+                'incomplete there — that is evidence for the measured '
+                'contrast(s), not for the whole innovation; complete the '
+                'missing arm(s) before calling this component verified'
+                % (comp, ', '.join(row['panels_verified_incomplete'])))
         if row['usable_anywhere']:
             out['usable_anywhere'].append(comp)
         if row['measured_anywhere']:

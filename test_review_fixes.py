@@ -2290,6 +2290,35 @@ def t_report_pairs_cover_the_declared_ablation_design():
                                             ('a', 'b', 'again')]}) == [('a', 'b')]
 
 
+def t_partial_ablation_cannot_verify_a_component():
+    design = {'A': [('full', 'full-A', ''), ('full', 'full-A2', '')]}
+    partial = {
+        'ablation_completeness': {
+            'components': {'A': {'complete': False}},
+            'complete_components': [], 'incomplete_components': ['A'],
+            'missing_arms': {'A': ['full-A2']}},
+        'measured_components': ['A'],
+        'verified_components': ['A'],
+        'unverified_components': []}
+    cov = L.ablation_coverage_across_panels({'p': partial}, design)
+    row = cov['components']['A']
+    assert row['panels_verified_raw'] == ['p'], row
+    assert row['panels_verified'] == [], row
+    assert row['panels_verified_incomplete'] == ['p'], row
+    assert cov['verified_anywhere'] == [], cov
+    assert cov['verified_only_incomplete'] == ['A'], cov
+    assert any('whole innovation' in w for w in cov['warnings']), cov
+    # Once the declared ablation is complete, the same verified panel counts.
+    complete = dict(partial)
+    complete['ablation_completeness'] = {
+        'components': {'A': {'complete': True}},
+        'complete_components': ['A'], 'incomplete_components': [],
+        'missing_arms': {}}
+    cov2 = L.ablation_coverage_across_panels({'p': complete}, design)
+    assert cov2['verified_anywhere'] == ['A'], cov2
+    assert cov2['verified_only_incomplete'] == [], cov2
+
+
 def t_seed_coverage_warning():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     knobs = L.training_knobs()
@@ -14478,6 +14507,7 @@ def main():
     _check('L55 controlled recipe requires a complete train_knobs descriptor', t_training_knobs_must_be_complete)
     _check('L56 underpowered contrast is never significant; std definability', t_underpowered_contrast_is_never_significant)
     _check('L57 report pairs cover the declared ablation design', t_report_pairs_cover_the_declared_ablation_design)
+    _check('L58 a partial ablation cannot verify the whole component', t_partial_ablation_cannot_verify_a_component)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
