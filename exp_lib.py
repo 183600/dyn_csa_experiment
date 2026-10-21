@@ -11310,6 +11310,45 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out['paired'] = paired
     out['seed_pairing'] = ('declared' if _seed_identity_attested else 'unattested')
     paired_primary = len(complete) >= 2
+    # The unpaired WLS fallback treats every scale point as an independent
+    # sample.  That is valid for disjoint seed sets, but a partially shared
+    # ladder has paired draws that the WLS standard error ignores.  Classify
+    # the actual overlap and block the trend claim when the scales are neither
+    # fully paired nor independent.
+    _seed_overlap = {'n_points': len(pts),
+                     'per_pair_common_seeds': {},
+                     'common_seeds_all_points': [],
+                     'n_common_seeds_all_points': 0}
+    _seed_dependence = 'unattested'
+    _any_pair_overlap = False
+    if _seed_identity_attested and len(pts) >= 2:
+        _seed_sets = [(p['label'], set(p['seeds'])) for p in pts]
+        _common_all = sorted(set.intersection(*(s for _l, s in _seed_sets)), key=str)
+        _pairs = {}
+        for _i in range(len(_seed_sets)):
+            for _j in range(_i + 1, len(_seed_sets)):
+                _li, _si = _seed_sets[_i]
+                _lj, _sj = _seed_sets[_j]
+                _n_ov = len(_si & _sj)
+                _pairs[f'{_li}|{_lj}'] = _n_ov
+                _any_pair_overlap = _any_pair_overlap or bool(_n_ov)
+        _seed_overlap.update({
+            'per_pair_common_seeds': _pairs,
+            'common_seeds_all_points': _common_all,
+            'n_common_seeds_all_points': len(_common_all),
+            'any_pair_overlap': bool(_any_pair_overlap)})
+        if paired_primary:
+            _seed_dependence = 'shared_seeds_paired'
+        elif _any_pair_overlap:
+            _seed_dependence = 'shared_seeds_unpaired'
+        else:
+            _seed_dependence = 'disjoint_seed_sets'
+    out['seed_dependence'] = _seed_dependence
+    out['seed_overlap'] = _seed_overlap
+    # A partially shared ladder cannot use the paired test (too few complete
+    # seeds) and also cannot use the independent WLS standard error: the
+    # dependence is unresolved, so the trend remains descriptive.
+    _seed_dependence_blocks_claim = (_seed_dependence == 'shared_seeds_unpaired')
     # extreme-scale interaction (smallest vs largest) on shared seeds
     lo, hi = pts[0], pts[-1]
     lo_map = dict(zip(lo['seeds'], lo['effects']))
@@ -11390,7 +11429,8 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     # spread.  Such a trend is not a usable scaling signal.
     sig = bool(p_primary is not None and math.isfinite(float(p_primary)) and float(p_primary) < alpha
                and not resolution_limited and not underpowered and not too_few_scales
-               and not _incomplete and not _within_seed_noise)
+               and not _incomplete and not _within_seed_noise
+               and not _seed_dependence_blocks_claim)
     het = het_for_verdict
     heterogeneous = bool(float(het.get('I2_percent') or 0.0) > 75.0 or (isinstance(het.get('p'), float) and math.isfinite(het['p']) and het['p'] < alpha))
     # Direction must come from the same slope that carries the inference.  The
@@ -11419,6 +11459,8 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         verdict = 'underpowered'
     elif too_few_scales:
         verdict = 'insufficient_points'
+    elif _seed_dependence_blocks_claim:
+        verdict = 'seed_dependence_unresolved'
     elif resolution_limited:
         verdict = 'resolution_limited'
     elif _within_seed_noise:
@@ -11444,6 +11486,14 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
             'declared scale point(s) with an invalid/non-positive scale at %s — the tier '
             'is in the family but cannot enter the scale axis; the trend is descriptive'
             % ', '.join(map(str, _invalid_scale_points)))
+    if _seed_dependence_blocks_claim:
+        out['note'] = ((out.get('note') + '; ') if out.get('note') else '') + (
+            'scale points share only a partial seed set (common across all: '
+            '%s; complete paired seeds: %d) — the WLS fallback treats the '
+            'paired draws as independent, so the trend is descriptive until '
+            'the full seed set is repeated at every scale'
+            % (out['seed_overlap'].get('common_seeds_all_points') or 'none',
+               int(paired.get('n_complete_seeds') or 0)))
     if underpowered and _underpowered_points:
         _u = ('paired complete-seed n<%d' % int(min_seeds) if paired_primary
               else 'scale point(s) with n<%d: ' % int(min_seeds)

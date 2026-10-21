@@ -10190,6 +10190,25 @@ def t_meta_seed_overlap_controls_pooling():
     unattested = [{k: v for k, v in p.items() if k != 'seeds'} for p in disjoint]
     mu = L.meta_analyze_effects(unattested)
     assert mu['seed_dependence'] == 'unattested' and mu['poolable'] is False, mu
+    # The WLS trend fallback uses the same independence assumption.  A
+    # partially overlapping ladder with fewer than two complete common seeds
+    # must not turn a significant unpaired slope into a confirmed trend.
+    trend = [_pt('S0', 1, [0, 1, 2, 3], [0.0, 0.1, 0.2, 0.3]),
+             _pt('S1', 10, [1, 3, 4, 5], [1.0, 1.1, 1.2, 1.3]),
+             _pt('S2', 100, [0, 2, 4, 5], [2.0, 2.1, 2.2, 2.3])]
+    rt = L.scaling_trend(trend, min_seeds=3, min_points=3)
+    assert rt['seed_dependence'] == 'shared_seeds_unpaired', rt
+    assert rt['seed_overlap']['n_common_seeds_all_points'] == 0, rt['seed_overlap']
+    assert rt['paired']['n_complete_seeds'] < 2, rt['paired']
+    assert rt['primary_inference'].startswith('WLS'), rt['primary_inference']
+    assert rt['significant'] is False and rt['verdict'] == 'seed_dependence_unresolved', rt
+    # Disjoint seed sets keep the unpaired slope valid.
+    trend_disjoint = [_pt('S0', 1, [0, 1, 2, 3], [0.0, 0.1, 0.2, 0.3]),
+                      _pt('S1', 10, [4, 5, 6, 7], [1.0, 1.1, 1.2, 1.3]),
+                      _pt('S2', 100, [8, 9, 10, 11], [2.0, 2.1, 2.2, 2.3])]
+    rd = L.scaling_trend(trend_disjoint, min_seeds=3, min_points=3)
+    assert rd['seed_dependence'] == 'disjoint_seed_sets', rd
+    assert rd['significant'] is True, rd
 
 
 def main():
