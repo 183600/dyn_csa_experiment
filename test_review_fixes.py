@@ -542,6 +542,17 @@ def t_nan_diagnosis_path():
                              'events': []}})
     assert both['status'] == 'unverifiable', both
     assert both['curve_health_source'] == 'derived_from_history', both
+    # A cached healthy status cannot mask a non-finite point in its own
+    # history: the curve wins and the contradiction is evidence.
+    conflict = L.diagnose_training_instability({
+        'curve_health': {'status': 'healthy', 'reason': 'ok'},
+        'health_history': [{'step': 0, 'train_ce': 5.0, 'val_ce': 4.0},
+                           {'step': 100, 'train_ce': 4.8, 'val_ce': float('nan')}],
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                             'events': []}})
+    assert conflict['status'] == 'instability_observed', conflict
+    assert conflict['primary_suspect'] == 'validation_curve_numerics', conflict
+    assert any(c['check'] == 'record_integrity' for c in conflict['checks']), conflict
 
     # A malformed/corrupt count field must neither crash the triage nor be
     # silently read as a zero-event (clean) record.

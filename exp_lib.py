@@ -707,6 +707,20 @@ def diagnose_training_instability(record, *, data_checked=None):
     if _hist_raw is not None and not isinstance(_hist_raw, list):
         malformed.append(f'health_history is not a list ({type(_hist_raw).__name__})')
     health_nonfinite = str(health.get('status') or '') == 'nonfinite'
+    # If both representations exist, the curve wins on a numerical failure:
+    # a cached `healthy` summary must not hide a non-finite point in its own
+    # history.
+    if (_health_source == 'record' and isinstance(_hist_raw, list) and _hist_raw
+            and not health_nonfinite):
+        try:
+            _hist_health = classify_training_health(_hist_raw)
+        except Exception as _hhe:
+            malformed.append(f'health_history could not be classified ({type(_hhe).__name__}: {_hhe})')
+        else:
+            if str(_hist_health.get('status') or '') == 'nonfinite':
+                malformed.append('curve_health claims a finite curve but health_history '
+                                 f'contains non-finite point(s) ({_hist_health.get("reason")})')
+                health_nonfinite = True
     amp = rec.get('amp_dtype') or knobs.get('amp_dtype')
     _grad_raw = diag.get('grad_norm_max')
     grad_max = _grad_raw
