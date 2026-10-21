@@ -1421,7 +1421,7 @@ class LeakageSafePreprocessor:
                   clip_z=stats.get('clip_z'), eps=stats.get('eps', _EPS))
         obj.feature_stats_ = [dict(s) for s in features]
         obj.n_features_in_ = int(n_features)
-        obj.n_train_ = int(stats.get('n_train', 0))
+        obj.n_train_ = _check_count('n_train', stats.get('n_train', 0))
         obj.train_fp_ = stats.get('train_fp')
         obj.fitted_ = True
         return obj
@@ -1689,7 +1689,13 @@ class LeakageSafeCategoricalEncoder:
         rebuilt = []
         for j, st in enumerate(features):
             categories = st.get('categories')
-            categories = [] if categories is None else list(categories)
+            if categories is None:
+                categories = []
+            elif not isinstance(categories, (list, tuple)):
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} categories are not a list')
+            else:
+                categories = list(categories)
             ncat = _check_count('n_categories', st.get('n_categories'))
             if ncat != len(categories):
                 raise ValueError(

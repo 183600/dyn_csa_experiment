@@ -11792,6 +11792,7 @@ def t_persisted_stats_reject_silently_degraded_transforms():
             lambda s: s['features'][0].update(clip_lo=float('nan')),
             lambda s: s['features'][0].update(clip_hi=None),
             lambda s: s['features'][0].pop('clip_lo'),
+            lambda s: s.update(n_train=True),
             lambda s: s.pop('scale')):
         bad = json.loads(json.dumps(base))
         mutate(bad)
@@ -11807,6 +11808,7 @@ def t_persisted_stats_reject_silently_degraded_transforms():
         DG.LeakageSafeCategoricalEncoder().fit(Xc).get_stats()))
     for mutate in (
             lambda s: s['features'][0].update(n_categories=99),
+            lambda s: s['features'][0].update(categories='ab'),
             lambda s: s['features'][0].update(keys=['only-one']),
             lambda s: s['features'][0].update(unknown_index=0)):
         bad = json.loads(json.dumps(cat))
