@@ -39,6 +39,7 @@ import numpy as np
 __all__ = [
     'SPLIT_NAMES',
     'LeakageSafeCategoricalEncoder',
+    'LeakageSafeFrequencyEncoder',
     'LeakageSafePreprocessor',
     'SafeScaler',
     'assert_no_split_leakage',
@@ -51,6 +52,7 @@ __all__ = [
     'fit_categorical_encoder',
     'fit_preprocessor',
     'prepare_categorical_features',
+    'prepare_frequency_features',
     'grouped_chronological_split',
     'grouped_chronological_split_indices',
     'prepare_features',
@@ -1310,6 +1312,158 @@ class LeakageSafeCategoricalEncoder:
         obj.train_fp_ = stats.get('train_fp')
         obj.fitted_ = True
         return obj
+
+
+class LeakageSafeFrequencyEncoder:
+    """Count/frequency encode categories using training rows only.
+
+    High-cardinality categorical features cannot be one-hot encoded without
+    exploding the feature width.  A frequency encoding is a compact
+    alternative that is also safe for holdouts: the category counts are
+    learned from ``X_train`` and ``transform`` only looks values up in that
+    fixed table.  An unseen or missing holdout category encodes as ``0``
+    (or raises under ``handle_unknown='error'``) and never widens or shifts
+    the training feature matrix.  No label is used, so this transform cannot
+    leak the target.
+    """
+
+    def __init__(self, *, normalize=True, handle_unknown='zero'):
+        if not isinstance(normalize, (bool, np.bool_)):
+            raise ValueError(f'normalize must be a boolean, got {normalize!r}')
+        if handle_unknown not in ('zero', 'error'):
+            raise ValueError(
+                f"handle_unknown must be 'zero' or 'error', got "
+                f'{handle_unknown!r}')
+        self.normalize = bool(normalize)
+        self.handle_unknown = handle_unknown
+        self.fitted_ = False
+
+    def fit(self, X, y=None):
+        Xarr = _as_categorical_2d(X)
+        n, p = Xarr.shape
+        if n == 0:
+            raise ValueError(
+                'cannot fit a frequency encoder on zero training rows')
+        stats = []
+        for j in range(p):
+            entries = {}
+            n_missing = 0
+            for value in Xarr[:, j].tolist():
+                if _category_is_missing(value):
+                    n_missing += 1
+                    continue
+                key = _hashable_label(value)
+                if key in entries:
+                    entries[key][1] += 1
+                else:
+                    entries[key] = [value, 1]
+            ordered = sorted(entries.values(),
+                             key=lambda v: (type(v[0]).__name__, repr(v[0])))
+            n_observed = int(sum(v[1] for v in ordered))
+            stats.append({
+                'entries': [{'value': v[0], 'count': int(v[1])}
+                            for v in ordered],
+                'n_observed': n_observed,
+                'n_missing': int(n_missing),
+            })
+        self.feature_stats_ = stats
+        self.n_features_in_ = int(p)
+        self.n_train_ = int(n)
+        self.train_fp_ = _categorical_fingerprint(Xarr)
+        self.fitted_ = True
+        return self
+
+    def _check_transform_input(self, X):
+        if not self.fitted_:
+            raise RuntimeError(
+                'LeakageSafeFrequencyEncoder.transform called before fit')
+        Xarr = _as_categorical_2d(X)
+        if Xarr.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f'X has {Xarr.shape[1]} features, but the encoder was fitted '
+                f'on {self.n_features_in_}')
+        return Xarr
+
+    def transform(self, X):
+        Xarr = self._check_transform_input(X)
+        n = int(Xarr.shape[0])
+        out = np.zeros((n, self.n_features_in_), dtype=np.float64)
+        for j, st in enumerate(self.feature_stats_):
+            lookup = {_hashable_label(e['value']): int(e['count'])
+                      for e in st['entries']}
+            denom = int(st['n_observed'])
+            for i, value in enumerate(Xarr[:, j].tolist()):
+                if _category_is_missing(value):
+                    continue
+                count = lookup.get(_hashable_label(value))
+                if count is None:
+                    if self.handle_unknown == 'error':
+                        raise ValueError(
+                            f'unseen category {value!r} in column {j}; the '
+                            'frequency table was fitted on training rows only')
+                    continue
+                out[i, j] = (float(count) / float(denom)
+                             if self.normalize and denom > 0
+                             else float(count))
+        return out
+
+    def fit_transform(self, X, y=None):
+        """Fit on **training** categories and transform them (never test)."""
+        return self.fit(X, y).transform(X)
+
+    def get_feature_names(self):
+        if not self.fitted_:
+            raise RuntimeError('frequency encoder has not been fitted')
+        return [f'x{j}_freq' for j in range(self.n_features_in_)]
+
+    def get_stats(self):
+        if not self.fitted_:
+            raise RuntimeError('frequency encoder has not been fitted')
+        return {
+            'normalize': bool(self.normalize),
+            'handle_unknown': self.handle_unknown,
+            'n_features_in': self.n_features_in_,
+            'n_train': self.n_train_,
+            'train_fp': self.train_fp_,
+            'features': [
+                {
+                    'entries': [dict(e) for e in st.get('entries') or []],
+                    'n_observed': int(st.get('n_observed', 0)),
+                    'n_missing': int(st.get('n_missing', 0)),
+                }
+                for st in self.feature_stats_
+            ],
+        }
+
+    @classmethod
+    def from_stats(cls, stats):
+        """Rebuild a fitted frequency encoder from :meth:`get_stats` output."""
+        obj = cls(normalize=stats.get('normalize', True),
+                  handle_unknown=stats.get('handle_unknown', 'zero'))
+        obj.feature_stats_ = [
+            {
+                'entries': [dict(e) for e in st.get('entries') or []],
+                'n_observed': int(st.get('n_observed', 0)),
+                'n_missing': int(st.get('n_missing', 0)),
+            }
+            for st in stats['features']
+        ]
+        obj.n_features_in_ = int(stats['n_features_in'])
+        obj.n_train_ = int(stats.get('n_train', 0))
+        obj.train_fp_ = stats.get('train_fp')
+        obj.fitted_ = True
+        return obj
+
+
+def prepare_frequency_features(X_train, X_val=None, X_test=None, **kwargs):
+    """Fit frequency tables on train, then transform the holdouts."""
+    encoder = LeakageSafeFrequencyEncoder(**kwargs).fit(X_train)
+    out = {'train': encoder.transform(X_train), 'encoder': encoder}
+    if X_val is not None:
+        out['val'] = encoder.transform(X_val)
+    if X_test is not None:
+        out['test'] = encoder.transform(X_test)
+    return out
 
 
 def fit_categorical_encoder(X_train, **kwargs):

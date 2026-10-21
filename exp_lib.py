@@ -59,8 +59,9 @@ from data_guard import (
     grouped_chronological_split, grouped_chronological_split_indices,
     split_indices, split_and_prepare, train_val_test_split,
     assert_no_split_leakage, LeakageSafePreprocessor, SafeScaler,
-    LeakageSafeCategoricalEncoder, clean_training_rows,
-    prepare_features, fit_preprocessor, data_quality_report,
+    LeakageSafeCategoricalEncoder, LeakageSafeFrequencyEncoder,
+    clean_training_rows, prepare_features, prepare_frequency_features,
+    fit_preprocessor, data_quality_report,
     prepare_categorical_features, fit_categorical_encoder,
     categorical_shift_report, duplicate_mask,
 )

@@ -8366,6 +8366,71 @@ def t_categorical_encoder_train_only():
         raise AssertionError('feature-width mismatch must fail')
 
 
+def t_frequency_encoder_train_only():
+    train = np.array([['a', 'x'], ['b', None], ['a', np.nan], ['c', 'x']],
+                     dtype=object)
+    holdout = np.array([['z', 'x'], ['a', 'y'], [None, 'z']], dtype=object)
+    enc = L.LeakageSafeFrequencyEncoder()
+    xtr = enc.fit_transform(train)
+    stats = enc.get_stats()
+    # Counts are learned from training rows only; missing values are not a
+    # category and do not inflate the denominator.
+    assert stats['features'][0]['n_observed'] == 4, stats
+    assert [e['count'] for e in stats['features'][0]['entries']] == [2, 1, 1], stats
+    assert stats['features'][1]['n_observed'] == 2, stats
+    assert stats['features'][1]['n_missing'] == 2, stats
+    assert xtr[:, 0].tolist() == [0.5, 0.25, 0.5, 0.25], xtr
+    assert xtr[:, 1].tolist() == [1.0, 0.0, 0.0, 1.0], xtr
+    # An unseen/missing holdout category maps to the reserved zero level and
+    # never changes the fitted frequency table.
+    xh = enc.transform(holdout)
+    assert xh.tolist() == [[0.0, 1.0], [0.5, 0.0], [0.0, 0.0]], xh
+    assert enc.get_stats() == stats, 'transform must not update frequencies'
+    # Raw counts are available when normalisation is disabled.
+    raw = L.LeakageSafeFrequencyEncoder(normalize=False).fit(train)
+    assert raw.transform(train)[:, 0].tolist() == [2.0, 1.0, 2.0, 1.0]
+    restored = L.LeakageSafeFrequencyEncoder.from_stats(stats)
+    assert np.array_equal(restored.transform(holdout), xh)
+    bundle = L.prepare_frequency_features(train, holdout)
+    assert np.array_equal(bundle['train'], xtr), bundle
+    assert np.array_equal(bundle['val'], xh), bundle
+    assert bundle['encoder'].get_stats() == stats, bundle
+    assert enc.get_feature_names() == ['x0_freq', 'x1_freq']
+    strict = L.LeakageSafeFrequencyEncoder(handle_unknown='error').fit(train)
+    try:
+        strict.transform(holdout)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('handle_unknown="error" must reject a new level')
+    try:
+        L.LeakageSafeFrequencyEncoder().transform(train)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('transform before fit must fail')
+    try:
+        enc.transform(np.zeros((1, 3), dtype=object))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('feature-width mismatch must fail')
+    try:
+        L.LeakageSafeFrequencyEncoder().fit(np.empty((0, 2), dtype=object))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('fitting on zero rows must fail')
+    for bad in ({'normalize': 'yes'}, {'normalize': 1},
+                {'handle_unknown': 'warn'}):
+        try:
+            L.LeakageSafeFrequencyEncoder(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'frequency encoder accepted {bad!r}')
+
+
 def t_clean_training_rows_and_split():
     X = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 1.0],
                   [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
@@ -10139,6 +10204,7 @@ def main():
     _check('I27 categorical shift requires a meaningful bin count', t_categorical_shift_requires_two_bins)
     _check('I28 label-noise audit handles unhashable labels', t_data_quality_unhashable_labels)
     _check('I29 categorical encoding is fitted on train only', t_categorical_encoder_train_only)
+    _check('I29b frequency encoding is fitted on train only', t_frequency_encoder_train_only)
     _check('I30 train-only cleaning before preprocessing', t_clean_training_rows_and_split)
     _check('I30b invalid training labels are droppable before fitting', t_clean_training_invalid_labels)
     _check('I30c non-finite/outlier training rows are cleanable', t_clean_training_nonfinite_and_outliers)
