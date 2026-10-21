@@ -359,6 +359,8 @@ def t_health_accepts_val_ce_only_and_orders_steps():
     assert abs(h['best_val_ppl'] - math.exp(4.0)) < 1e-9, h
     assert h['final_val_ppl'] is not None and h['final_minus_best'] > 0, h
     assert h['gap_source'] == 'derived' and h['gap_last'] is not None, h
+    assert h['gap_slope_source'] == 'derived', h
+    assert h['gap_slope_per_step'] is not None and h['gap_slope_per_step'] > 0, h
 
     # Out-of-order history and a repeated step are one evaluation grid, not a
     # different best step or a two-point noise fit.  The last write to a step
@@ -726,6 +728,62 @@ def t_error_analysis_rare_basis_is_measured():
         assert r['rare_target_basis'].startswith('unavailable'), (bad, r)
         assert r['rare_target_problem'], (bad, r)
         assert r['cause_counts_all']['annotation_or_rare_target']['n'] == 0, (bad, r)
+
+
+def t_error_analysis_zero_and_invalid_budgets():
+    # A zero inventory is not one row, and a malformed budget must be refused
+    # (negative top_n/-chunk used to be silently clamped to 1).
+    vocab = 8
+
+    class _Stub:
+        training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = bool(mode)
+            return self
+
+        def trunk(self, ids):
+            return torch.zeros((ids.shape[0], ids.shape[1], 2))
+
+        def head(self, h):
+            return torch.zeros((h.shape[0], h.shape[1], vocab))
+
+    vb = (np.arange(12, dtype=np.int64) % vocab).reshape(3, 4)
+    r = L.analyze_errors(_Stub(), vb, vocab, torch.device('cpu'),
+                         top_n=0, top_tokens=0)
+    assert r['worst_sequences'] == [] and r['worst_tokens'] == [], r
+    for kw in ({'top_n': -1}, {'top_tokens': -1}, {'top_n': 1.5},
+               {'chunk': 0}, {'context_tokens': -1},
+               {'top_n': True}):
+        try:
+            L.analyze_errors(_Stub(), vb, vocab, torch.device('cpu'), **kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'analyze_errors must refuse {kw!r}')
+    p = L.compare_token_errors(_Stub(), _Stub(), vb, vocab, torch.device('cpu'),
+                               top_n=0)
+    assert p['worst_tokens_for_b'] == [], p
+    assert p['n_paired_finite'] == 9, p
+    for bad in (-1, 1.5, True):
+        try:
+            L.compare_token_errors(_Stub(), _Stub(), vb, vocab,
+                                   torch.device('cpu'), top_n=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'compare_token_errors must refuse top_n={bad!r}')
+    try:
+        L.compare_token_errors(_Stub(), _Stub(), vb, vocab,
+                               torch.device('cpu'), chunk=0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('compare_token_errors must refuse chunk=0')
 
 
 def t_loss_curve_downsample_keeps_spikes_and_nan():
@@ -13982,6 +14040,7 @@ def main():
     _check('L26 bootstrap chunk scaling + zero-CE measurements', t_bootstrap_and_zero_ce_scaling_contract)
     _check('L27 error analysis excludes non-finite targets', t_error_analysis_excludes_nonfinite_targets)
     _check('L27b rare-target triage needs a measured frequency basis', t_error_analysis_rare_basis_is_measured)
+    _check('L27c error-analysis budgets are explicit, not clamped', t_error_analysis_zero_and_invalid_budgets)
     _check('L28 gapfill numeric reader rejects booleans', t_gapfill_numeric_reader_rejects_booleans)
     _check('L28b gapfill announces the family-corrected seed plan', t_gapfill_announces_family_seed_plan)
     _check('L29 release tags cannot escape the archive directory', t_release_tag_cannot_escape_output_dir)

@@ -453,7 +453,35 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     else:
         status = 'validation_degrading'
         reason = 'validation CE is rising in the tail'
-    gap_s, gap_se = _curve_slope_stats(entries, 'gap', k=tail_k)
+    # The gap curve is what turns "both curves move" into direct overfitting
+    # evidence.  Derive it from the two CE curves when a record predates the
+    # explicit `gap` field, instead of reporting no gap trend at all.
+    _gap_points = []
+    _n_gap_rec = _n_gap_der = 0
+    for h in entries:
+        _raw_g = h.get('gap')
+        _g = _finite_scalar(_raw_g) if _raw_g is not None else None
+        if _g is not None:
+            _gap_points.append({'step': h.get('step'), 'gap': _g})
+            _n_gap_rec += 1
+            continue
+        _tc = _finite_scalar(h.get('train_ce'))
+        _vc = _finite_scalar(h.get('val_ce'))
+        if _vc is None:
+            _vp, _src = _entry_val_ppl(h)
+            _vc = math.log(_vp) if (_vp is not None and _vp > 0.0) else None
+        if _tc is not None and _vc is not None:
+            _gap_points.append({'step': h.get('step'), 'gap': _vc - _tc})
+            _n_gap_der += 1
+    if _n_gap_rec and _n_gap_der:
+        _gap_slope_source = 'mixed'
+    elif _n_gap_rec:
+        _gap_slope_source = 'recorded'
+    elif _n_gap_der:
+        _gap_slope_source = 'derived'
+    else:
+        _gap_slope_source = None
+    gap_s, gap_se = _curve_slope_stats(_gap_points, 'gap', k=tail_k)
     best_step = int(best[0]) if best is not None else None
     last_step = int(last[0]) if last is not None else None
     final_minus_best = (float(last[1] - best[1])
@@ -506,6 +534,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         'gap_source': _gap_source,
         'gap_slope_per_step': gap_s,
         'gap_slope_se': gap_se,
+        'gap_slope_source': _gap_slope_source,
         'best_step': best_step,
         'best_val_ppl': float(best[1]) if best is not None else None,
         'final_val_ppl': float(last[1]) if last is not None else None,
@@ -24652,6 +24681,20 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     if _top_tokens is None:
         raise ValueError(f'analyze_errors needs a non-negative integer top_tokens, got {top_tokens!r}')
     top_tokens = int(_top_tokens)
+    # A zero budget is a valid "do not inventory sequences" request; the old
+    # max(1, int(top_n)) silently returned one row and accepted negatives.
+    _top_n = _exact_count(top_n, minimum=0)
+    if _top_n is None:
+        raise ValueError(f'analyze_errors needs a non-negative integer top_n, got {top_n!r}')
+    top_n = int(_top_n)
+    _chunk = _exact_count(chunk, minimum=1)
+    if _chunk is None:
+        raise ValueError(f'analyze_errors needs a positive integer chunk, got {chunk!r}')
+    chunk = int(_chunk)
+    _ctx_tokens = _exact_count(context_tokens, minimum=0)
+    if _ctx_tokens is None:
+        raise ValueError(f'analyze_errors needs a non-negative integer context_tokens, got {context_tokens!r}')
+    context_tokens = int(_ctx_tokens)
     # "Rare target" is a claim about the TRAINING frequency.  An empty or
     # malformed training sample is not a frequency table of all-zero counts:
     # reading it that way would label every token `annotation_or_rare_target`
@@ -24871,7 +24914,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
         buckets[_name] = {'n': int(_n), 'ce_sum': float(_sm)}
     seq_rows.sort(key=lambda t: t[0], reverse=True)
     worst_seqs = []
-    for ce_mean, row, nll, n in seq_rows[:max(1, int(top_n))]:
+    for ce_mean, row, nll, n in seq_rows[:top_n]:
         recs = [t for t in tok_heap if t[1] == row]
         worst_seqs.append({'row': int(row), 'mean_ce': ce_mean, 'nll': nll, 'n_tokens': int(n),
                            'top_worst_token_from_sample': (max(recs)[0] if recs else None),
@@ -24965,6 +25008,14 @@ def compare_token_errors(model_a, model_b, val_batch, vocab, device, *, tokenize
         raise ValueError(f'compare_token_errors token ids out of range [{_lo}, {_hi}] for vocab {_V}')
     n_rows, seq = int(vb.shape[0]), int(vb.shape[1])
     span = seq - 1
+    _top_n = _exact_count(top_n, minimum=0)
+    if _top_n is None:
+        raise ValueError(f'compare_token_errors needs a non-negative integer top_n, got {top_n!r}')
+    top_n = int(_top_n)
+    _chunk = _exact_count(chunk, minimum=1)
+    if _chunk is None:
+        raise ValueError(f'compare_token_errors needs a positive integer chunk, got {chunk!r}')
+    chunk = int(_chunk)
 
     def _matrix(model):
         was = model.training
@@ -25004,9 +25055,12 @@ def compare_token_errors(model_a, model_b, val_batch, vocab, device, *, tokenize
     mean_b_paired = float(np.mean(cb[paired])) if n_paired else None
     diff = cb - ca
     flat = np.where(paired, diff, -np.inf).reshape(-1)
-    k = min(max(1, int(top_n)), int(flat.size))
-    idx = np.argpartition(flat, -k)[-k:]
-    idx = idx[np.argsort(flat[idx])[::-1]]
+    k = min(top_n, int(flat.size))
+    if k <= 0:
+        idx = np.array([], dtype=np.int64)
+    else:
+        idx = np.argpartition(flat, -k)[-k:]
+        idx = idx[np.argsort(flat[idx])[::-1]]
     tok = tokenizer
     tok_warned = False
 
