@@ -14733,6 +14733,26 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         'per_class': per_class,
         'f1_averaging': 'macro, micro and weighted are all reported; the caller must name the primary one',
     }
+    if pos is not None:
+        # A threshold can collapse every prediction to one class.  That is a
+        # degenerate operating point, not evidence about ranking: report it
+        # explicitly so an F1/accuracy headline is not read as a learned
+        # decision rule.
+        _pos_entry = per_class.get(_pos_name) or {}
+        _pred_pos = int(_pos_entry.get('tp', 0)) + int(_pos_entry.get('fp', 0))
+        out['predicted_positive_count'] = _pred_pos
+        out['predicted_positive_rate'] = (float(_pred_pos) / float(y_true.size)
+                                          if y_true.size else None)
+        _true_pos = int(np.sum(y_true == pos))
+        if y_true.size and _true_pos and _true_pos < y_true.size and _pred_pos in (0, int(y_true.size)):
+            out['degenerate_predictions'] = True
+            out['prediction_warning'] = (
+                'all predictions collapse to one class at the recorded decision '
+                'threshold; F1/precision/recall describe that constant rule, not '
+                'the model ranking. Report a threshold-free metric (PR-AUC/ROC-AUC) '
+                'or a validation-selected threshold')
+        else:
+            out['degenerate_predictions'] = False
     if include_trivial_baseline:
         out['trivial_baseline'] = _majority_class_floor(labels, support_all,
                                                        label_names=_label_names)
@@ -14772,8 +14792,21 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             _bin_score = _score.ravel()
         if _bin_score.size != y_bin.size:
             raise ValueError(f'y_score {_score.shape} does not match y_true {y_true.shape}')
+        out['score_min'] = float(np.min(_bin_score)) if _bin_score.size else None
+        out['score_max'] = float(np.max(_bin_score)) if _bin_score.size else None
         out['roc_auc'] = _binary_roc_auc(y_bin, _bin_score)
         out['pr_auc'] = _binary_average_precision(y_bin, _bin_score)
+        if out['decision_threshold'] is not None and _bin_score.size:
+            _t = float(out['decision_threshold'])
+            out['threshold_within_score_range'] = bool(
+                out['score_min'] <= _t <= out['score_max'])
+            if not out['threshold_within_score_range'] and _true_pos and _true_pos < y_bin.size:
+                out['threshold_range_warning'] = (
+                    f'decision threshold {_t:g} lies outside the observed score range '
+                    f'[{out["score_min"]:.4g}, {out["score_max"]:.4g}]; the thresholded '
+                    'metrics are a constant predictor. Scores are not calibrated '
+                    'probabilities on the 0.5 scale — select a cut on validation or '
+                    'report a threshold-free endpoint')
         prevalence = float(np.mean(y_bin))
         out['pr_auc_prevalence'] = prevalence
         out['roc_auc_chance'] = 0.5
@@ -15355,6 +15388,38 @@ def metric_policy_audit(summary=None, policy=None):
                     if _v is None or not (0.0 <= _v <= 1.0):
                         _class_issues.append(
                             f'{_label}: {_key}={r.get(_key)!r} is not a finite value in [0, 1]')
+            # A recorded predicted-positive rate must be reproducible from
+            # the per-class counts, and a degenerate cut must be visible.
+            _ppr = _finite_scalar(r.get('predicted_positive_rate'))
+            if _ppr is not None:
+                if not (0.0 <= _ppr <= 1.0):
+                    _class_issues.append(
+                        f'{_label}: predicted_positive_rate={_ppr} is outside [0, 1]')
+                _pc_pp = r.get('per_class')
+                _pos_nm = r.get('positive_label')
+                if (isinstance(_pc_pp, dict) and _pos_nm is not None
+                        and isinstance(_pc_pp.get(str(_pos_nm)), dict)):
+                    _pe = _pc_pp[str(_pos_nm)]
+                    _tp = _exact_count(_pe.get('tp'), minimum=0)
+                    _fp = _exact_count(_pe.get('fp'), minimum=0)
+                    _n_pp = _exact_count(r.get('n'), minimum=1)
+                    if None not in (_tp, _fp, _n_pp) and _n_pp:
+                        _want_ppr = float(_tp + _fp) / float(_n_pp)
+                        if abs(_ppr - _want_ppr) > 1e-12:
+                            _class_issues.append(
+                                f'{_label}: predicted_positive_rate={_ppr} is not '
+                                f'(tp+fp)/n ({_want_ppr})')
+            if r.get('degenerate_predictions') is True:
+                # This is a property of the recorded operating point, not a
+                # malformed artifact: a majority-class baseline is legitimately
+                # degenerate.  Surface it without failing an otherwise
+                # reproducible record.
+                out.setdefault('degenerate_prediction_records', []).append(_label)
+            if r.get('threshold_within_score_range') is False:
+                _class_issues.append(
+                    f'{_label}: decision_threshold is outside the observed score range '
+                    '[score_min, score_max]; thresholded metrics describe a constant '
+                    'predictor, not the model ranking')
             _roc = _finite_scalar(r.get('roc_auc'))
             if _roc is not None and _roc < 0.5:
                 out['warnings'].append(
@@ -15475,6 +15540,8 @@ def metric_policy_audit(summary=None, policy=None):
             out['checks'].append({'metric': 'classification', 'records': len(_class_recs),
                                   'ok': not _class_issues,
                                   'issues': sorted(set(_class_issues))[:12],
+                                  'degenerate_prediction_records': sorted(set(
+                                      out.get('degenerate_prediction_records') or []))[:12],
                                   'f1_averaging_required': list(_allowed_f1_averages),
                                   'threshold_sources': list(_BINARY_THRESHOLD_SOURCES),
                                   'threshold_default': 0.5,

@@ -3808,6 +3808,34 @@ def t_hypothesis_prevalence_conditional_endpoint():
         r = L.hypothesis_audit({'h': _spec(prevalence=_bad)}, 'component')
         assert r['status'] == 'warn' and 'h' in r['metric_misaligned'], (_bad, r)
 
+def t_binary_degenerate_threshold_visibility():
+    # Logits/scores on a non-probability scale make the default 0.5 cut a
+    # constant predictor.  The record must expose that instead of letting an
+    # F1/accuracy headline look like learned decision quality.
+    y = [0, 0, 1, 1]
+    m = L.classification_metrics(y, y_score=[1.0, 2.0, 3.0, 4.0], labels=[0, 1])
+    assert m['predicted_positive_rate'] == 1.0, m
+    assert m['degenerate_predictions'] is True, m
+    assert m['threshold_within_score_range'] is False, m
+    assert 'outside the observed score range' in m['threshold_range_warning'], m
+    rec = dict(m, variant='b', task='binary_classification')
+    audit = L.metric_policy_audit({'b': rec})
+    assert audit['status'] == 'warn', audit
+    assert any('outside the observed score range' in w for w in audit['warnings']), audit
+    assert 'b' in audit['degenerate_prediction_records'], audit
+    # A forged predicted-positive rate cannot hide a degenerate cut.
+    forged = dict(rec, predicted_positive_rate=0.5)
+    fa = L.metric_policy_audit({'b': forged})
+    assert fa['status'] == 'warn' and any(
+        'predicted_positive_rate' in w for w in fa['warnings']), fa
+    # A normal probability score with a meaningful cut stays non-degenerate.
+    good = L.classification_metrics(y, y_score=[0.1, 0.2, 0.8, 0.9], labels=[0, 1])
+    assert good['degenerate_predictions'] is False, good
+    assert good['threshold_within_score_range'] is True, good
+    assert good['predicted_positive_rate'] == 0.5, good
+    assert L.metric_policy_audit({'b': dict(good, variant='b',
+                                           task='binary_classification')})['status'] == 'ok'
+
 def t_metric_policy_checks_record_values():
     # The declared token-weighted PPL must match the record's own NLL
     # accounting; a per-sequence arithmetic mean is a different estimand.
@@ -12154,6 +12182,7 @@ def main():
     _check('H2 metric policy + macro/micro/weighted F1 + PR/ROC-AUC', t_metric_policy_and_classification_metrics)
     _check('H2b prevalence-aware endpoint + per-class PR-AUC chance', t_metric_prevalence_recommendation_and_per_class_chance)
     _check('H2c hypothesis prevalence binds the conditional endpoint', t_hypothesis_prevalence_conditional_endpoint)
+    _check('H2d degenerate binary threshold/score range is explicit', t_binary_degenerate_threshold_visibility)
     _check('H2a metric audit checks record aggregation/ranges', t_metric_policy_checks_record_values)
     _check('H2b multiclass one-vs-rest ranking metrics + imbalance audit', t_multiclass_ranking_metrics_and_audit)
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
