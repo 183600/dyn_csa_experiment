@@ -13345,10 +13345,21 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         metric = None
     if split != 'validation':
         problems.append(f'selection split is {split!r}; count-model smoothing must be selected on validation, never test')
+    _declared_split = protocol.get('selection_split')
+    if isinstance(_declared_split, str) and split != _declared_split:
+        problems.append(
+            f'selection split {split!r} differs from the declared '
+            f'{_declared_split!r}; the count-model floor is not audited against '
+            'the pre-registered split')
     if metric != protocol.get('selection_metric'):
         problems.append(f'selection metric {metric!r} differs from the declared {protocol.get("selection_metric")!r}')
     if direction != 'lower_is_better':
         problems.append(f'count-model selection direction is {direction!r}; PPL is lower-is-better')
+    _declared_direction = protocol.get('direction')
+    if isinstance(_declared_direction, str) and direction != _declared_direction:
+        problems.append(
+            f'count-model selection direction {direction!r} differs from the '
+            f'declared {_declared_direction!r}')
     _declared = protocol.get('arms')
     if _declared is None:
         _declared = {}
@@ -16024,6 +16035,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         metric = None
     if split != 'validation':
         problems.append(f'selection split is {split!r}; hyperparameters must be selected on validation, never test')
+    _declared_split = protocol.get('selection_split')
+    if (isinstance(_declared_split, str) and split != _declared_split):
+        problems.append(
+            f'selection split {split!r} differs from the declared '
+            f'{_declared_split!r}; the audit is not checking the protocol that '
+            'was actually pre-registered')
     if metric != protocol.get('selection_metric'):
         problems.append(f'selection metric {metric!r} differs from the declared {protocol.get("selection_metric")!r}')
     if direction not in ('lower_is_better', 'higher_is_better'):

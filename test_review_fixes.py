@@ -12202,6 +12202,14 @@ def t_baseline_audit_direction_and_explicit_field_fallbacks():
     rp = L.baseline_tuning_audit(_art('lower_is_better'), protocol=['not', 'a', 'map'])
     assert rp['status'] == 'fail' and any(
         'protocol must be an object' in p for p in rp['problems']), rp
+    # The artifact must be audited against the split it was declared under.
+    # A protocol that declares test selection cannot certify a validation
+    # artifact just because the artifact itself says "validation".
+    rsplit = L.baseline_tuning_audit(
+        _art('lower_is_better'),
+        protocol=dict(protocol, selection_split='test'))
+    assert rsplit['tuning_verified'] is False and any(
+        'differs from the declared' in p for p in rsplit['problems']), rsplit
 
 
 def t_simple_floor_rejects_undeclared_arms_and_blank_fields():
@@ -12258,6 +12266,10 @@ def t_simple_floor_rejects_undeclared_arms_and_blank_fields():
     rbp = L.simple_baseline_audit(bad_policy, protocol=proto)
     assert rbp['baseline_verified'] is False and any(
         'fit_token_policy' in p for p in rbp['problems']), rbp
+    rsplit = L.simple_baseline_audit(
+        art, protocol=dict(proto, selection_split='test'))
+    assert rsplit['baseline_verified'] is False and any(
+        'differs from the declared' in p for p in rsplit['problems']), rsplit
 
 
 def t_metric_audit_recommended_availability_and_exact_floor_support():
