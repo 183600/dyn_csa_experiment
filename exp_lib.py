@@ -15513,7 +15513,8 @@ def metric_policy_audit(summary=None, policy=None):
                             _allowed_primary.add(_pv)
                         elif isinstance(_pv, (list, tuple)):
                             _allowed_primary.update(str(x) for x in _pv)
-                if _allowed_primary and _declared_primary not in _allowed_primary:
+                if _allowed_primary and (not isinstance(_declared_primary, str)
+                                         or _declared_primary not in _allowed_primary):
                     _class_issues.append(
                         f'{_label}: declares primary_metric={_declared_primary!r} for task '
                         f'{task!r}; the policy primary is {sorted(_allowed_primary)}')
@@ -15529,7 +15530,8 @@ def metric_policy_audit(summary=None, policy=None):
                         _rec_allowed.add(_pv)
                     elif isinstance(_pv, (list, tuple)):
                         _rec_allowed.update(str(x) for x in _pv)
-                if _rec_allowed and _rec_metric not in _rec_allowed:
+                if _rec_allowed and (not isinstance(_rec_metric, str)
+                                     or _rec_metric not in _rec_allowed):
                     _class_issues.append(
                         f'{_label}: recommended_primary_metric={_rec_metric!r} is not '
                         f'defined for task {task!r} (allowed {sorted(_rec_allowed)})')

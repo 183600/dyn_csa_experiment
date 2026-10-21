@@ -5766,6 +5766,17 @@ def t_binary_threshold_and_calibration_contract():
     inv = dict(good, roc_auc=0.2)
     iv = L.metric_policy_audit({'g': inv})
     assert iv['status'] == 'warn' and any('below chance' in w for w in iv['warnings']), iv
+    # A declared/recommended metric must be a metric NAME.  A list/dict is
+    # malformed evidence and must be reported as a problem, not crash the
+    # audit with an unhashable-type TypeError.
+    _cm0 = L.classification_metrics([0] * 90 + [1] * 10, y_pred=[0] * 100,
+                                    labels=[0, 1])
+    for _key in ('primary_metric', 'recommended_primary_metric'):
+        _mal = dict(_cm0, variant='m', task='binary_classification',
+                    **{_key: [1]})
+        _ma = L.metric_policy_audit({'m': _mal})
+        assert _ma['status'] == 'warn' and any(
+            _key in w for w in _ma['warnings']), (_key, _ma)
     # Macro/micro/weighted F1 must all be reproducible from the per-class
     # counts; a hand-edited aggregate cannot pass.
     _cm = L.classification_metrics(np.array([0] * 95 + [1] * 5),
