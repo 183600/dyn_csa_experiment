@@ -26310,6 +26310,7 @@ def _print_pairs(summary):
                 seeds = sorted({s for t, s in ra if t == ''} & {s for t, s in rb if t == ''})
                 common += [('', '', s) for s in seeds]
         _by_cond = {}
+        _est_by_cond = {}
         _sk = []
         for ts, bs, s in common:
             _reason = pair_reason(ra[ts, s], rb[bs, s])
@@ -26318,12 +26319,20 @@ def _print_pairs(summary):
                 continue
             _delta = _paired_primary_delta(ra[ts, s], rb[bs, s])
             if _delta is None:
-                _sk.append((s, 'primary estimand missing (nested record without holdout PPL/NLL accounting)'))
+                _sk.append((s, 'primary estimand missing/mismatched (nested vs '
+                               'full-validation rows, or no holdout accounting)'))
                 continue
             _by_cond.setdefault((ts, bs), []).append(_delta)
+            _est_by_cond.setdefault((ts, bs), set()).add(
+                ra[ts, s].get('ppl_estimation_rows') == 'nested_validation_holdout')
         if _sk:
             _pair_skip.append((a, b, len(_sk), len(common), sorted({r for _s, r in _sk})))
         for (ts, bs), dl in sorted(_by_cond.items()):
+            if len(_est_by_cond.get((ts, bs), ())) > 1:
+                _pair_skip.append((a, b, len(dl), len(dl),
+                                   ['mixed estimands across seeds (nested holdout '
+                                    'vs full validation)']))
+                continue
             st = paired_effect_stats(dl)
             _p = ('%.4f' % st['p_exact_signflip']) if math.isfinite(st['p_exact_signflip']) else 'n/a'
             _lab = '' if ts == bs == '' else f'   [{ts or '(untagged)'} vs {bs or '(untagged)'}]'
