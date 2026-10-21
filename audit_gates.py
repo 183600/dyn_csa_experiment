@@ -61,10 +61,18 @@ def _load(path):
     if not os.path.exists(path):
         return None
     try:
-        return json.load(open(path, encoding='utf-8'))
+        obj = json.load(open(path, encoding='utf-8'))
     except Exception as e:
         print(f'[audit] WARNING: {path} exists but cannot be parsed ({type(e).__name__}: {e})')
         return None
+    if not isinstance(obj, dict):
+        # Audit artifacts are keyed objects (panels, records, cells).  A
+        # parsed list/scalar used to reach `.items()`/`.get()` in the callers
+        # and crash the whole audit; treat it as unverifiable instead.
+        print(f'[audit] WARNING: {path} is a {type(obj).__name__}, not a JSON '
+              'object — this artifact is unverifiable')
+        return None
+    return obj
 
 
 def _iter_result_dirs():

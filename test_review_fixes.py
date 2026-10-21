@@ -13175,6 +13175,16 @@ def t_malformed_panel_summary_is_excluded():
             json.dump('not a panel', f)
         assert L.read_panel(td) == {}
         assert L.variant_presence(td) == {}
+        # Audit readers share the same object contract: a list/scalar is
+        # unverifiable, not something to call .items() on.
+        import audit_gates as A
+        assert A._load(sp) is None
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump([{'variant': 'a'}], f)
+        assert A._load(sp) is None
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump({'a::seed0': {'variant': 'a', 'seed': 0, 'ppl': 1.0}}, f)
+        assert isinstance(A._load(sp), dict)
         # A malformed arm id inside an otherwise valid panel record must not
         # crash the presence reader on an unhashable dict/list key.
         with open(sp, 'w', encoding='utf-8') as f:
