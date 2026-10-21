@@ -1400,11 +1400,29 @@ def _sorted_categories(values):
 
 
 def _categorical_fingerprint(X):
+    """Content fingerprint of a categorical table under encoder identity.
+
+    ``repr()`` split equal categories written as different temporal types
+    (``datetime.date`` vs ``np.datetime64``) even though the encoder maps them
+    to the same level.  The target encoder uses this fingerprint to refuse
+    transforming its own training rows, so a repr difference would silently
+    re-enable the full-table leak.  Hash the same canonical ``_target_key``
+    identity that ``transform`` uses instead.
+    """
     h = hashlib.sha256()
     arr = np.asarray(X, dtype=object)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
     h.update(str(arr.shape).encode('ascii'))
     for row in arr.tolist():
-        h.update(repr(row).encode('utf-8', errors='replace'))
+        for value in row:
+            key = _target_key(value)
+            h.update(str(len(key)).encode('ascii'))
+            h.update(b':')
+            h.update(key.encode('utf-8', errors='replace'))
+            h.update(b'|')
         h.update(b'\x1f')
     return h.hexdigest()[:16]
 

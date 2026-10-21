@@ -9816,6 +9816,25 @@ def t_python_temporal_row_and_category_identity():
         np.asarray([utc, west], dtype=object),
         y_pred=np.asarray([utc, west], dtype=object))
     assert len(_same['labels']) == 1, _same['labels']
+    # The categorical fingerprint drives the target encoder's training-row
+    # refusal.  Equal temporal categories written as different types must
+    # fingerprint identically, or transform() would re-enable the full-table
+    # leak on what is really the training matrix.
+    day2 = datetime.date(2020, 1, 2)
+    train_dates = np.asarray([[day], [day2]], dtype=object)
+    holdout_np = np.asarray([[npday],
+                             [np.datetime64('2020-01-02')]], dtype=object)
+    assert DG._categorical_fingerprint(train_dates) == \
+        DG._categorical_fingerprint(holdout_np)
+    leak_enc = DG.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(
+        train_dates, np.asarray([1.0, 2.0]))
+    try:
+        leak_enc.transform(holdout_np)
+    except ValueError as e:
+        assert 'training rows' in str(e), e
+    else:
+        raise AssertionError(
+            'an equal-temporal training matrix must be refused by transform')
 
 
 def t_validation_row_split_group_aware():
