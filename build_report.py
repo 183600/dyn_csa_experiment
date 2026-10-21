@@ -1866,12 +1866,24 @@ def efficiency_accuracy_summary(items):
                      'params_median': (float(np.median(params)) if params else None),
                      'peak_mem_max': (max(mems) if mems else None),
                      'tokens_seen_values': toks,
+                     'tokens_seen_missing': sum(1 for x in vals if x['tok'] is None),
                      'tokens_seen_median': (float(np.median(toks)) if toks else None)})
     if not rows:
         return []
     rows.sort(key=lambda r: (r['ppl_mean'], r['variant']))
-    _budgets = {r['tokens_seen_median'] for r in rows if r['tokens_seen_median'] is not None}
-    _budget_matched = len(_budgets) <= 1
+    # A cost/accuracy claim needs the SAME training budget.  Missing budget
+    # fields are unverifiable, and one arm mixing two budgets is inconsistent;
+    # neither may be silently treated as matched (the old median-of-unions
+    # also hid a mixed arm whose median happened to equal the other arm).
+    if any(r['tokens_seen_missing'] for r in rows):
+        _budget_status = 'unverifiable'
+    elif any(len(r['tokens_seen_values']) != 1 for r in rows):
+        _budget_status = 'inconsistent'
+    elif len({r['tokens_seen_median'] for r in rows}) > 1:
+        _budget_status = 'differs'
+    else:
+        _budget_status = 'matched'
+    _budget_matched = _budget_status == 'matched'
     ref = rows[0]
     for r in rows:
         r['ppl_delta_pct_vs_best'] = ((r['ppl_mean'] - ref['ppl_mean']) / ref['ppl_mean'] * 100.0)
@@ -1884,38 +1896,40 @@ def efficiency_accuracy_summary(items):
         if r is ref:
             r['distinguishable'] = None
             r['flags'] = []
-            continue
-        if r['ppl_sem'] is not None and ref['ppl_sem'] is not None:
-            r['noise_2se'] = 2.0 * math.sqrt(r['ppl_sem'] ** 2 + ref['ppl_sem'] ** 2)
-            # Zero sample variance from a tiny seed set is not evidence of
-            # zero noise; it is an unverifiable uncertainty estimate.
-            r['distinguishable'] = (None if r['noise_2se'] == 0.0
-                                    else abs(r['ppl_mean'] - ref['ppl_mean']) > r['noise_2se'])
         else:
-            r['noise_2se'] = None
-            r['distinguishable'] = None
-        flags = []
-        if abs(r['ppl_delta_pct_vs_best']) < 0.5:
-            flags.append('ppl_gain_below_0.5pct')
-        if r['distinguishable'] is False:
-            flags.append('ppl_gain_within_seed_noise')
-        if r['distinguishable'] is None:
-            flags.append('ppl_uncertainty_unverifiable')
-        if r['noise_2se'] == 0.0:
-            flags.append('zero_within_seed_variance_unverifiable')
-        if r['latency_ratio_vs_best'] is not None and r['latency_ratio_vs_best'] >= 2.0:
-            flags.append('latency_2x_or_more')
-        if r['params_ratio_vs_best'] is not None and r['params_ratio_vs_best'] >= 2.0:
-            flags.append('params_2x_or_more')
-        if r['memory_ratio_vs_best'] is not None and r['memory_ratio_vs_best'] >= 2.0:
-            flags.append('memory_2x_or_more')
-        if not _budget_matched:
-            flags.append('train_budget_differs')
-        r['flags'] = flags
+            if r['ppl_sem'] is not None and ref['ppl_sem'] is not None:
+                r['noise_2se'] = 2.0 * math.sqrt(r['ppl_sem'] ** 2 + ref['ppl_sem'] ** 2)
+                # Zero sample variance from a tiny seed set is not evidence of
+                # zero noise; it is an unverifiable uncertainty estimate.
+                r['distinguishable'] = (None if r['noise_2se'] == 0.0
+                                        else abs(r['ppl_mean'] - ref['ppl_mean']) > r['noise_2se'])
+            else:
+                r['noise_2se'] = None
+                r['distinguishable'] = None
+            flags = []
+            if abs(r['ppl_delta_pct_vs_best']) < 0.5:
+                flags.append('ppl_gain_below_0.5pct')
+            if r['distinguishable'] is False:
+                flags.append('ppl_gain_within_seed_noise')
+            if r['distinguishable'] is None:
+                flags.append('ppl_uncertainty_unverifiable')
+            if r['noise_2se'] == 0.0:
+                flags.append('zero_within_seed_variance_unverifiable')
+            if r['latency_ratio_vs_best'] is not None and r['latency_ratio_vs_best'] >= 2.0:
+                flags.append('latency_2x_or_more')
+            if r['params_ratio_vs_best'] is not None and r['params_ratio_vs_best'] >= 2.0:
+                flags.append('params_2x_or_more')
+            if r['memory_ratio_vs_best'] is not None and r['memory_ratio_vs_best'] >= 2.0:
+                flags.append('memory_2x_or_more')
+            r['flags'] = flags
+        if _budget_status == 'differs':
+            r['flags'] = list(r.get('flags') or []) + ['train_budget_differs']
+        elif _budget_status == 'inconsistent':
+            r['flags'] = list(r.get('flags') or []) + ['train_budget_inconsistent_within_arm']
+        elif _budget_status == 'unverifiable':
+            r['flags'] = list(r.get('flags') or []) + ['train_budget_unverifiable']
         r['budget_matched'] = _budget_matched
-    ref['budget_matched'] = _budget_matched
-    if not _budget_matched:
-        ref['flags'] = list(ref.get('flags') or []) + ['train_budget_differs']
+        r['train_budget_status'] = _budget_status
     return rows
 
 

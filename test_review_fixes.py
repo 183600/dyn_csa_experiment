@@ -7233,6 +7233,26 @@ def t_efficiency_accuracy_tradeoff_summary():
         {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0, 'tokens_seen': 1000},
         {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0, 'tokens_seen': 500}])
     assert all('train_budget_differs' in r['flags'] for r in budget), budget
+    assert all(r['budget_matched'] is False for r in budget), budget
+    # Missing budget is unverifiable, not equal to another missing budget.
+    missing = BR.efficiency_accuracy_summary([
+        {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0},
+        {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0}])
+    assert all(r['budget_matched'] is False for r in missing), missing
+    assert all('train_budget_unverifiable' in r['flags'] for r in missing), missing
+    # Two medians can agree while an arm mixes budgets; that is still not a
+    # controlled comparison.
+    mixed = BR.efficiency_accuracy_summary([
+        {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0, 'tokens_seen': 100},
+        {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0, 'tokens_seen': 300},
+        {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0, 'tokens_seen': 200},
+        {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0, 'tokens_seen': 200}])
+    assert all(r['budget_matched'] is False for r in mixed), mixed
+    assert all('train_budget_inconsistent_within_arm' in r['flags'] for r in mixed), mixed
+    matched = BR.efficiency_accuracy_summary([
+        {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0, 'tokens_seen': 1000},
+        {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0, 'tokens_seen': 1000}])
+    assert all(r['budget_matched'] is True for r in matched), matched
 
 
 def t_report_error_analysis_section():
