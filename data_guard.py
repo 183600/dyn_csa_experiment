@@ -31,6 +31,7 @@ distribution shift.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import numbers
 from fractions import Fraction
@@ -1313,6 +1314,36 @@ def _categorical_fingerprint(X):
     return h.hexdigest()[:16]
 
 
+def _json_safe_category(value):
+    """Represent a category value without changing its learned identity.
+
+    The persisted ``keys`` field is what ``transform`` uses, so the readable
+    ``value`` copy may be sanitized.  Without this, a bytes/datetime/custom
+    level makes ``json.dumps(get_stats())`` fail even though the encoder is
+    otherwise fully fitted.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, bytes):
+        return {'__bytes_hex__': value.hex()}
+    if isinstance(value, tuple):
+        return {'__tuple__': [_json_safe_category(v) for v in value]}
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        return {'__numpy_datetime__': str(value), '__dtype__': str(value.dtype)}
+    try:
+        json.dumps(value, allow_nan=True)
+    except (TypeError, ValueError, OverflowError):
+        return {'__repr__': repr(value),
+                '__type__': f'{type(value).__module__}.{type(value).__qualname__}'}
+    return value
+
+
 def _category_lookup(st):
     """Per-level lookup plus the key function that matches its stored keys.
 
@@ -1454,7 +1485,9 @@ class LeakageSafeCategoricalEncoder:
             'train_fp': self.train_fp_,
             # Copy the category lists too: a caller mutating the returned
             # snapshot must not change the fitted encoder (and vice versa).
-            'features': [dict(s, categories=list(s.get('categories') or []),
+            'features': [dict(s,
+                              categories=[_json_safe_category(c)
+                                          for c in (s.get('categories') or [])],
                               keys=list(s.get('keys') or []))
                          for s in self.feature_stats_],
         }
@@ -2150,7 +2183,8 @@ class LeakageSafeFrequencyEncoder:
             'train_fp': self.train_fp_,
             'features': [
                 {
-                    'entries': [dict(e) for e in st.get('entries') or []],
+                    'entries': [dict(e, value=_json_safe_category(e.get('value')))
+                                for e in st.get('entries') or []],
                     'n_observed': int(st.get('n_observed', 0)),
                     'n_missing': int(st.get('n_missing', 0)),
                 }

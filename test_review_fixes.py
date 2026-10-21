@@ -8989,6 +8989,16 @@ def t_categorical_encoder_train_only():
         _tcr = L.LeakageSafeCategoricalEncoder.from_stats(
             json.loads(json.dumps(_tce.get_stats())))
         assert np.array_equal(_tcr.transform(_tc_h), _tce.transform(_tc_h)), _enc_kw
+    # Non-JSON-native levels (bytes, datetime64) must not make get_stats
+    # unserializable; their canonical keys still drive transform after reload.
+    _tx = np.array([[b'a'], [b'a'], [np.datetime64('2020-01-01')],
+                    [np.datetime64('2020-01-01')]], dtype=object)
+    _tx_h = np.array([[b'a'], [np.datetime64('2020-01-01')]], dtype=object)
+    for _enc_kw in ({'encoding': 'ordinal'}, {'encoding': 'onehot'}):
+        _txe = L.LeakageSafeCategoricalEncoder(**_enc_kw).fit(_tx)
+        _txr = L.LeakageSafeCategoricalEncoder.from_stats(
+            json.loads(json.dumps(_txe.get_stats())))
+        assert np.array_equal(_txr.transform(_tx_h), _txe.transform(_tx_h)), _enc_kw
     onehot = L.LeakageSafeCategoricalEncoder(encoding='onehot').fit(train)
     oh_hold = onehot.transform(holdout)
     assert oh_hold.shape == (3, 4 + 3), oh_hold.shape
@@ -9049,6 +9059,12 @@ def t_frequency_encoder_train_only():
     _tfr = L.LeakageSafeFrequencyEncoder.from_stats(
         json.loads(json.dumps(_tfe.get_stats())))
     assert np.array_equal(_tfr.transform(_tf_h), _tfe.transform(_tf_h)), _tfe.get_stats()
+    _tfx = np.array([[b'a'], [b'a'], [np.datetime64('2020-01-01')]], dtype=object)
+    _tfx_h = np.array([[b'a'], [np.datetime64('2020-01-01')]], dtype=object)
+    _tfxe = L.LeakageSafeFrequencyEncoder().fit(_tfx)
+    _tfxr = L.LeakageSafeFrequencyEncoder.from_stats(
+        json.loads(json.dumps(_tfxe.get_stats())))
+    assert np.array_equal(_tfxr.transform(_tfx_h), _tfxe.transform(_tfx_h)), _tfxe.get_stats()
     bundle = L.prepare_frequency_features(train, holdout)
     assert np.array_equal(bundle['train'], xtr), bundle
     assert np.array_equal(bundle['val'], xh), bundle
