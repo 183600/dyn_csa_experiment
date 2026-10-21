@@ -3280,9 +3280,54 @@ def _temporal_canonical_key(v):
               + int(v.microseconds)) * 1000
         if -(1 << 63) <= ns < (1 << 63):
             return b'TI' + str(ns).encode('ascii')
-        return (b'T' + str(np.timedelta64(v).dtype).encode('ascii') + b':'
-                + str(ns).encode('ascii'))
+        # Outside the int64-nanosecond range use the same attosecond form as
+        # _temporal_key's fallback, so an equal np.timedelta64 keeps one key.
+        return b'TA' + str(ns * (10 ** 9)).encode('ascii')
     raise TypeError(f'not a temporal value: {type(v).__name__}')
+
+
+# Exact attoseconds per fixed-width datetime/timedelta unit.  Python ints are
+# unbounded, so the fallback below stays exact even when the nanosecond form
+# would overflow int64.  Calendar units (Y/M) are first converted to days.
+_TEMPORAL_AS_PER_UNIT = {
+    'W': 7 * 86400 * 10 ** 18,
+    'D': 86400 * 10 ** 18,
+    'h': 3600 * 10 ** 18,
+    'm': 60 * 10 ** 18,
+    's': 10 ** 18,
+    'ms': 10 ** 15,
+    'us': 10 ** 12,
+    'ns': 10 ** 9,
+    'ps': 10 ** 6,
+    'fs': 10 ** 3,
+    'as': 1,
+}
+
+
+def _temporal_attoseconds(v):
+    """Exact attoseconds since the epoch for a NumPy temporal scalar.
+
+    ``astype('...64[ns]')`` overflows outside ~1678-2262, so the historical
+    fallback keyed the raw unit count and dtype.  The same instant written in
+    two units then got two identities (e.g. year 2500 in days vs seconds).
+    Scaling a Python integer is exact for every unit, including sub-nanosecond
+    units, and preserves the instant across units.
+    """
+    unit, count = np.datetime_data(v.dtype)
+    if unit in ('Y', 'M'):
+        target = ('datetime64[D]' if isinstance(v, np.datetime64)
+                  else 'timedelta64[D]')
+        conv = v.astype(target)
+        if np.isnat(conv):
+            raise ValueError('temporal value is outside the day range')
+        raw = int(conv.view('i8'))
+        factor = _TEMPORAL_AS_PER_UNIT['D']
+    else:
+        raw = int(v.view('i8'))
+        factor = _TEMPORAL_AS_PER_UNIT.get(unit)
+        if factor is None:
+            raise ValueError(f'unsupported temporal unit {unit!r}')
+    return raw * int(count) * factor
 
 
 def _temporal_key(v):
@@ -3312,6 +3357,14 @@ def _temporal_key(v):
             return prefix + b'I' + str(int(canon.view('i8'))).encode('ascii')
         except (TypeError, ValueError, OverflowError):
             pass
+    try:
+        # Outside the nanosecond range, scale the exact unit count to
+        # attoseconds instead of keying the raw dtype/count: two units that
+        # denote the same instant must share one identity.
+        return (prefix + b'A'
+                + str(_temporal_attoseconds(v)).encode('ascii'))
+    except (TypeError, ValueError, OverflowError):
+        pass
     try:
         raw = int(v.view('i8'))
     except (TypeError, ValueError, OverflowError):

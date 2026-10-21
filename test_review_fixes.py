@@ -9561,6 +9561,19 @@ def t_object_temporal_duplicate_identity():
     deltas = np.asarray([np.timedelta64(1, 'ns'), np.timedelta64(2, 'ns'),
                          np.timedelta64(1, 'ns'), 1], dtype=object).reshape(-1, 1)
     assert DG.duplicate_mask(deltas).tolist() == [False, False, True, False],         DG.duplicate_mask(deltas)
+    # Outside the int64-nanosecond range the key used to include the raw unit
+    # and dtype, so the same instant written in two units looked distinct.
+    far = np.asarray([np.datetime64('2500-01-01', 'D'),
+                      np.datetime64('2500-01-01', 's'),
+                      np.datetime64('2500-01-02', 'D')],
+                     dtype=object).reshape(-1, 1)
+    assert DG.duplicate_mask(far).tolist() == [False, True, False], DG.duplicate_mask(far)
+    big = np.asarray([np.timedelta64(200000, 'D'),
+                      np.timedelta64(200000 * 86400, 's')],
+                     dtype=object).reshape(-1, 1)
+    assert DG.duplicate_mask(big).tolist() == [False, True], DG.duplicate_mask(big)
+    assert DG._target_key(np.datetime64('2500-01-01', 'D')) == \
+        DG._target_key(np.datetime64('2500-01-01', 's'))
     # End-to-end: a clean chronological split of distinct timestamps must not
     # be refused as a duplicate-feature leak, while cleaning must keep them.
     clean_obj = np.empty((6, 1), dtype=object)
