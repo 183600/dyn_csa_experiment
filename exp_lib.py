@@ -25228,20 +25228,34 @@ def _group_params(recs):
             return v
     return None
 
-def _pooled_ppl_from_records(recs):
+def _pooled_ppl_from_records(recs, *, estimand=None):
     """Token-pooled PPL: exp(sum NLL / sum N tokens) over all seeds.
 
     This is the desired estimator; the arithmetic mean of per-seed
     PPLs is kept as `ppl_mean_arithmetic` for backward compatibility but is no
     longer the primary aggregate when token counts exist.  Records that predate
-    `nll_sum`/`n_tokens` cannot be pooled and fall back explicitly."""
+    `nll_sum`/`n_tokens` cannot be pooled and fall back explicitly.
+
+    ``estimand`` defaults to each record's own declaration.  A group that mixes
+    nested-holdout and full-validation records has no single estimand: pooling
+    would sum NLLs from two different samples and then label the result as one
+    of them, so it returns ``(None, None, None)``.  A caller that deliberately
+    falls the whole group back to full validation passes ``estimand=False``.
+    """
+    recs = list(recs)
+    declared = {r.get('ppl_estimation_rows') == 'nested_validation_holdout'
+                for r in recs if isinstance(r, dict)}
+    if estimand is None:
+        if len(declared) > 1:
+            return None, None, None
+        estimand = next(iter(declared)) if declared else False
     nlls, nts = [], []
     for r in recs:
         # When the primary estimate is the nested holdout, the matching
         # accounting is nll_sum_holdout/n_tokens_holdout.  A missing halfword
         # cannot fall back to the full-validation totals: the pooled value and
         # the record's primary PPL would then describe different samples.
-        if r.get('ppl_estimation_rows') == 'nested_validation_holdout':
+        if bool(estimand) and r.get('ppl_estimation_rows') == 'nested_validation_holdout':
             nll = _finite_scalar(r.get('nll_sum_holdout'))
             nt = _exact_count(r.get('n_tokens_holdout'), minimum=1)
             if nll is None or nt is None:
@@ -25863,18 +25877,28 @@ def aggregate(summary):
         # than `ppl_primary` and the paired dPPL column.
         _primary_vals = [_record_primary_ppl(r) for r in recs]
         _n_primary_missing = sum(v is None for v in _primary_vals)
-        if _n_primary_missing:
-            print(f'[aggregate] WARNING: {key}: {_n_primary_missing}/{len(recs)} record(s) declare the nested estimand but lack holdout accounting — the whole group falls back to full-validation PPL so the numbers stay on one sample; nested claims are NOT supported for this group')
+        _nested_flags = {r.get('ppl_estimation_rows') == 'nested_validation_holdout'
+                         for r in recs}
+        _mixed_estimands = len(_nested_flags) > 1
+        if _mixed_estimands:
+            print(f'[aggregate] WARNING: {key}: the group mixes nested-holdout and '
+                  'full-validation records — per-seed values and pooled NLL would come '
+                  'from two different samples; the whole group falls back to '
+                  'full-validation PPL and nested claims are NOT supported for it')
+        if _n_primary_missing or _mixed_estimands:
+            if _n_primary_missing and not _mixed_estimands:
+                print(f'[aggregate] WARNING: {key}: {_n_primary_missing}/{len(recs)} record(s) declare the nested estimand but lack holdout accounting — the whole group falls back to full-validation PPL so the numbers stay on one sample; nested claims are NOT supported for this group')
             ppls = np.array([r['ppl'] for r in recs], dtype=float)
             _primary_estimand = 'full_validation_fallback'
+            _pooled, _nll_total, _ntok_total = _pooled_ppl_from_records(
+                recs, estimand=False)
         else:
             ppls = np.array(_primary_vals, dtype=float)
             _primary_estimand = (
                 'nested_validation_holdout'
-                if any(r.get('ppl_estimation_rows') == 'nested_validation_holdout'
-                       for r in recs)
+                if _nested_flags
                 else 'full_validation')
-        _pooled, _nll_total, _ntok_total = _pooled_ppl_from_records(recs)
+            _pooled, _nll_total, _ntok_total = _pooled_ppl_from_records(recs)
         _sorted = np.sort(ppls)
         _med = float(np.median(_sorted))
         _q1, _q3 = (float(np.percentile(_sorted, 25)), float(np.percentile(_sorted, 75))) if len(_sorted) >= 2 else (_med, _med)

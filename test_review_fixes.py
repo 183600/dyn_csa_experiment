@@ -2497,6 +2497,26 @@ def t_nested_primary_paired_deltas():
         missing.pop(_k)
     assert L._record_primary_ppl(missing) is None, missing
     assert L._paired_primary_delta(missing, _rec('full', 0, 10.0, 10.0)) is None
+    # A group that mixes the two estimands is not poolable: summing holdout
+    # NLLs with full-validation NLLs would invent a third sample, and labelling
+    # the result 'nested' would misdescribe it.  The whole group must fall back
+    # to full validation so every reported number is on one sample.
+    mixed_full = {'variant': 'mixed', 'seed': 0, 'ppl': 10.0,
+                  'nll_sum': 10.0, 'n_tokens': 1, 'params': 10,
+                  'steps': 1, 'tokens_seen': 100, 'run_cfg': 'same'}
+    mixed_nested = _rec('mixed', 1, 20.0, 30.0)
+    mixed_nested.update(run_cfg='same', steps=1, tokens_seen=100)
+    assert L._pooled_ppl_from_records([mixed_full, mixed_nested]) == (
+        None, None, None)
+    _pool, _nll, _nt = L._pooled_ppl_from_records(
+        [mixed_full, mixed_nested], estimand=False)
+    _want_pool = math.exp((math.log(20.0) * 100.0 + 10.0) / 101.0)
+    assert abs(_pool - _want_pool) < 1e-12, (_pool, _nll, _nt)
+    mixed_agg = L.aggregate({'mixed::seed0': mixed_full,
+                             'mixed::seed1': mixed_nested})['mixed']
+    assert mixed_agg['ppl_primary_estimand'] == 'full_validation_fallback', mixed_agg
+    assert abs(mixed_agg['ppl_mean'] - 15.0) < 1e-12, mixed_agg
+    assert abs(mixed_agg['ppl_pooled'] - _want_pool) < 1e-12, mixed_agg
 
 
 def t_combined_seed_doc_uncertainty():
