@@ -3713,6 +3713,12 @@ def t_multiclass_ranking_metrics_and_audit():
     _mx_audit = L.metric_policy_audit({'mx': dict(
         _mx, variant='mx', task='multiclass_classification')})
     assert _mx_audit['status'] == 'ok', _mx_audit
+    # Omitting labels must not let np.asarray coerce the integer 1 into the
+    # string '1' before the class identities are checked.
+    _mx_auto = L.classification_metrics([1, '1', 2, 1, '1', 2],
+                                        y_pred=[1, '1', 2, 1, '1', 2])
+    assert len(_mx_auto['labels']) == 3 and len(set(_mx_auto['labels'])) == 3, _mx_auto
+    assert len(_mx_auto['per_class']) == 3, _mx_auto
 
 
 def t_metric_policy_checks_record_values():

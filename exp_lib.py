@@ -14021,6 +14021,50 @@ def _binary_average_precision(y, score):
     return float(np.sum(np.diff(np.r_[0.0, recall]) * precision))
 
 
+def _preserve_label_array(values):
+    """Materialise labels without coercing mixed Python types.
+
+    ``np.asarray([1, '1'])`` silently turns the integer into the string '1',
+    merging two distinct classes before any audit can see them.  ndarray inputs
+    keep their declared dtype; plain sequences become object arrays.
+    """
+    if isinstance(values, np.ndarray):
+        return values.ravel()
+    try:
+        return np.asarray(values, dtype=object).ravel()
+    except (TypeError, ValueError, OverflowError):
+        return np.asarray(values).ravel()
+
+
+def _unique_label_values(values):
+    """Unique label identities, falling back when NumPy cannot sort them.
+
+    The common homogeneous path is unchanged (``np.unique``).  Mixed object
+    labels (e.g. ``1`` and ``'1'``) have no total NumPy order, but they are
+    still distinct classes; the fallback keeps each identity once in a stable
+    type/repr order.
+    """
+    arr = np.asarray(values)
+    try:
+        return np.unique(arr)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    seen = {}
+    for value in arr.reshape(-1).tolist():
+        try:
+            hash(value)
+        except TypeError:
+            key = ('__unhashable__', type(value).__name__, repr(value))
+        else:
+            key = value
+        seen.setdefault(key, value)
+    try:
+        ordered = sorted(seen.values(), key=lambda v: (type(v).__name__, repr(v)))
+    except (TypeError, ValueError, OverflowError):
+        ordered = list(seen.values())
+    return np.asarray(ordered, dtype=object)
+
+
 def _display_label_names(labels):
     """Unique human-readable names for a declared label set.
 
@@ -14409,14 +14453,16 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             raise ValueError(f'threshold must be a finite number, got {threshold!r}') from None
         if not math.isfinite(threshold):
             raise ValueError(f'threshold must be finite, got {threshold!r}')
-    y_true = np.asarray(y_true).ravel()
+    y_true = _preserve_label_array(y_true)
     if labels is None:
         if y_score is not None and np.asarray(y_score).ndim == 2:
             labels = np.arange(np.asarray(y_score).shape[1])
         else:
-            labels = np.unique(y_true)
+            labels = _unique_label_values(y_true)
             if y_pred is not None:
-                labels = np.unique(np.concatenate([labels, np.asarray(y_pred).ravel()]))
+                labels = _unique_label_values(np.concatenate([
+                    np.asarray(labels, dtype=object),
+                    _preserve_label_array(y_pred)]))
     labels = np.asarray(labels)
     if labels.ndim != 1:
         raise ValueError(f'labels must be a flat 1-D sequence, got shape {labels.shape}')
@@ -14486,7 +14532,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             _threshold_source = 'caller_threshold'
         elif labels.size == 2:
             _threshold_source = 'caller_predictions'
-    y_pred = np.asarray(y_pred).ravel()
+    y_pred = _preserve_label_array(y_pred)
     if y_true.shape != y_pred.shape:
         raise ValueError(f'y_true {y_true.shape} and y_pred {y_pred.shape} differ')
     # A declared label set must cover every OBSERVED label.  Silently ignoring
