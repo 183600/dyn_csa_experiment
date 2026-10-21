@@ -2911,6 +2911,11 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             raise ValueError(
                 f'target_outlier_z must be a positive finite number or None, '
                 f'got {target_outlier_z!r}')
+    if target_outlier_z is not None and y is None:
+        raise ValueError(
+            'data_quality_report: target_outlier_z/fail_on_target_outliers '
+            'requires y so the target fence can be learned and audited; '
+            'refusing to silently skip the requested target-outlier gate')
     # Keep the caller's dtype for duplicate keys: the float64 view used by the
     # statistics below cannot distinguish int64 values above 2**53.
     _raw_X = np.asarray(X)

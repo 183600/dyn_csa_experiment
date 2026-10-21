@@ -5649,6 +5649,15 @@ def t_data_quality_target_outliers():
                                 train_idx=[0, 1, 2, 3], val_idx=[4],
                                 test_idx=[5], target_outlier_z=1.5)
     assert cat['checks']['target_outlier_fence'] is None, cat
+    # Requesting the target-outlier audit without y must fail closed instead
+    # of silently omitting the gate.
+    for _kw in ({'target_outlier_z': 1.5}, {'fail_on_target_outliers': True}):
+        try:
+            L.data_quality_report(X, train_idx=[0, 1, 2, 3], **_kw)
+        except ValueError as e:
+            assert 'requires y' in str(e), e
+        else:
+            raise AssertionError(f'{_kw} without y must be refused')
     for bad in (0, -1, float('nan'), float('inf'), True):
         try:
             L.data_quality_report(X, y=y, train_idx=[0, 1],
