@@ -2075,12 +2075,22 @@ def audit_training_health(outdirs=None):
             e = []
             h = r.get('curve_health')
             status = str(h.get('status') or 'unknown') if isinstance(h, dict) else 'missing'
+            _known_health = {'healthy', 'overfitting', 'underfitting_or_stalled',
+                             'validation_degrading', 'validation_improving_train_flat',
+                             'nonfinite', 'insufficient_data', 'unmonitored'}
             if not isinstance(h, dict):
                 w.append('no curve_health record')
             elif status in ('overfitting', 'underfitting_or_stalled',
                             'validation_degrading', 'validation_improving_train_flat',
                             'nonfinite'):
                 w.append(f'curve_health={status}')
+            elif status not in _known_health:
+                w.append(f'unknown curve_health status {status!r}; '
+                         'the run is not verified healthy')
+            if (isinstance(h, dict) and status == 'healthy'
+                    and r.get('health_history') == []):
+                w.append('curve_health=healthy with an EMPTY health_history; '
+                         'the claim cannot be recomputed from the curve')
             _diag_raw = r.get('opt_diag_summary')
             if _diag_raw is not None and not isinstance(_diag_raw, dict):
                 e.append(f'opt_diag_summary is not an object ({type(_diag_raw).__name__})')

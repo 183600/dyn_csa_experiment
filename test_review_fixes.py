@@ -9240,6 +9240,17 @@ def t_audit_training_health_records():
         r6 = A.audit_training_health(outdirs=[td])
         assert r6['status'] == 'fail', r6
         assert any('contradicts the health_history' in x for x in r6['errors']), r6
+        # Unknown status names and a healthy claim with an explicitly empty
+        # curve are not verified health.
+        for label, rec2 in (('u::s0', {'curve_health': {'status': 'fine'},
+                                       'opt_diag_summary': {}}),
+                            ('e::s0', {'curve_health': {'status': 'healthy'},
+                                       'health_history': [],
+                                       'opt_diag_summary': {}})):
+            with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+                json.dump({label: rec2}, f)
+            rx = A.audit_training_health(outdirs=[td])
+            assert rx['status'] == 'warnings', (label, rx)
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
