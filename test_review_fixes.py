@@ -3729,6 +3729,52 @@ def t_multiclass_ranking_metrics_and_audit():
         assert len(_mx_explicit['per_class']) == 3, _mx_explicit
 
 
+def t_metric_prevalence_recommendation_and_per_class_chance():
+    # A rare class's raw PR-AUC must be readable against its own chance floor,
+    # not only the macro mean (which a frequent class can carry).
+    y = np.array([0] * 1990 + [1] * 9 + [2] * 1)
+    score = np.zeros((len(y), 3))
+    for i, c in enumerate([0, 1, 2]):
+        score[y == c, i] = 1.0
+    m = L.classification_metrics(y, y_score=score, labels=[0, 1, 2])
+    assert m['recommended_primary_metric'] == 'pr_auc_macro', m
+    assert m['recommended_primary_average'] == 'one_vs_rest_macro', m
+    assert m['recommended_primary_available'] is True, m
+    for c, sup in (('1', 9), ('2', 1)):
+        pc = m['per_class'][c]
+        assert abs(pc['pr_auc_chance'] - sup / len(y)) < 1e-15, pc
+        assert abs(pc['pr_auc_lift_over_chance'] - (pc['pr_auc'] - pc['pr_auc_chance'])) < 1e-12, pc
+        assert pc['roc_auc_chance'] == 0.5 and abs(
+            pc['roc_auc_lift_over_chance'] - (pc['roc_auc'] - 0.5)) < 1e-15, pc
+    good = dict(m, variant='mc', task='multiclass_classification')
+    assert L.metric_policy_audit({'mc': good})['status'] == 'ok', L.metric_policy_audit({'mc': good})
+    # Forged per-class chance/lift values are rejected from the stored record.
+    forged = json.loads(json.dumps(good))
+    forged['per_class']['2']['pr_auc_chance'] = 0.5
+    fr = L.metric_policy_audit({'mc': forged})
+    assert fr['status'] == 'warn' and any('per-class PR-AUC chance' in w
+                                         for w in fr['warnings']), fr
+    # The recommendation is a claim too: it must match the policy's
+    # conditional endpoint at the observed prevalence.
+    wrong_rec = dict(good, recommended_primary_metric='f1_macro')
+    wr = L.metric_policy_audit({'mc': wrong_rec})
+    assert wr['status'] == 'warn' and any('recommended_primary_metric' in w
+                                         for w in wr['warnings']), wr
+    # Extreme binary imbalance switches the recommendation to PR-AUC and
+    # exposes chance-relative ROC skill.
+    yb = np.array([0] * 9999 + [1])
+    sb = np.linspace(0.0, 1.0, len(yb))
+    mb = L.classification_metrics(yb, y_score=sb, labels=[0, 1])
+    assert mb['recommended_primary_metric'] == 'pr_auc', mb
+    assert abs(mb['roc_auc_chance'] - 0.5) < 1e-15
+    assert abs(mb['roc_auc_lift_over_chance'] - (mb['roc_auc'] - 0.5)) < 1e-15
+    assert abs(mb['roc_auc_normalized_skill'] - (mb['roc_auc'] - 0.5) / 0.5) < 1e-15
+    bad_rec = dict(mb, variant='b', task='binary_classification',
+                   recommended_primary_metric='f1')
+    br = L.metric_policy_audit({'b': bad_rec})
+    assert br['status'] == 'warn' and any('recommended_primary_metric' in w
+                                         for w in br['warnings']), br
+
 def t_metric_policy_checks_record_values():
     # The declared token-weighted PPL must match the record's own NLL
     # accounting; a per-sequence arithmetic mean is a different estimand.
@@ -12073,6 +12119,7 @@ def main():
     _check('G4 underpowered is never verified', t_underpowered_never_verified)
     _check('H1 hypothesis direction conflict', t_hypothesis_direction_conflict)
     _check('H2 metric policy + macro/micro/weighted F1 + PR/ROC-AUC', t_metric_policy_and_classification_metrics)
+    _check('H2b prevalence-aware endpoint + per-class PR-AUC chance', t_metric_prevalence_recommendation_and_per_class_chance)
     _check('H2a metric audit checks record aggregation/ranges', t_metric_policy_checks_record_values)
     _check('H2b multiclass one-vs-rest ranking metrics + imbalance audit', t_multiclass_ranking_metrics_and_audit)
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)

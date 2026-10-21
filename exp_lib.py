@@ -14202,7 +14202,21 @@ def _multiclass_ranking_metrics(y_true, y_score, labels, label_names=None):
         auc = _binary_roc_auc(y_bin, score[:, i]) if n_pos and n_neg else None
         ap = _binary_average_precision(y_bin, score[:, i]) if n_pos and n_neg else None
         _name = label_names[i]
-        per_class[_name] = {'roc_auc': auc, 'pr_auc': ap, 'support': n_pos}
+        _prev = float(n_pos) / max(int(y_bin.size), 1)
+        # A raw PR-AUC is not interpretable without its one-vs-rest chance
+        # floor (the class prevalence).  A frequent class can carry a high
+        # raw PR-AUC while a rare class is ranked at chance; per-class lift
+        # keeps that difference visible.
+        per_class[_name] = {
+            'roc_auc': auc, 'pr_auc': ap, 'support': n_pos,
+            'prevalence': _prev,
+            'pr_auc_chance': _prev,
+            'pr_auc_lift_over_chance': (float(ap - _prev)
+                                        if ap is not None else None),
+            'roc_auc_chance': 0.5,
+            'roc_auc_lift_over_chance': (float(auc - 0.5)
+                                         if auc is not None else None),
+        }
         if auc is not None and ap is not None:
             defined.append(_name)
             supports.append(n_pos)
@@ -14733,6 +14747,10 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         out['pr_auc'] = _binary_average_precision(y_bin, _bin_score)
         prevalence = float(np.mean(y_bin))
         out['pr_auc_prevalence'] = prevalence
+        out['roc_auc_chance'] = 0.5
+        if out['roc_auc'] is not None:
+            out['roc_auc_lift_over_chance'] = float(out['roc_auc'] - 0.5)
+            out['roc_auc_normalized_skill'] = float((out['roc_auc'] - 0.5) / 0.5)
         if out['pr_auc'] is not None:
             out['pr_auc_lift_over_prevalence'] = float(out['pr_auc'] - prevalence)
             if prevalence < 1.0:
@@ -14783,6 +14801,46 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             out['ranking_unavailable_reason'] = (
                 'multiclass ranking needs a column-per-label score matrix; '
                 'a 1-D score is only interpretable for a binary endpoint')
+    # Prevalence-aware endpoint recommendation.  This does not replace the
+    # caller's declared hypothesis; it makes the conditional METRIC_POLICY
+    # rule machine-readable at the observed base rate, so a rare-positive
+    # panel cannot silently keep an F1/ROC-only headline.
+    _thr = 1e-3
+    if pos is not None:
+        _prev = float(np.mean(np.asarray(y_true) == pos))
+        _rare = min(_prev, 1.0 - _prev)
+        if _rare < _thr:
+            out['recommended_primary_metric'] = 'pr_auc'
+            out['recommended_primary_average'] = 'binary_positive_class'
+            out['recommended_primary_reason'] = (
+                f'positive prevalence {_prev:.3e} is below 1:1000; '
+                'PR-AUC is the policy primary under extreme imbalance')
+        else:
+            out['recommended_primary_metric'] = 'f1'
+            out['recommended_primary_average'] = 'binary_positive_class'
+            out['recommended_primary_reason'] = (
+                f'positive prevalence {_prev:.3e} is not extreme; '
+                'positive-class F1 is the policy primary')
+        out['recommended_primary_available'] = bool(
+            out.get('pr_auc') is not None if _rare < _thr else True)
+    elif labels.size > 2:
+        _prev_all = [float(v) for v in out.get('prevalence', {}).values()]
+        if _prev_all:
+            _rare = min(_prev_all)
+            if _rare < _thr:
+                out['recommended_primary_metric'] = 'pr_auc_macro'
+                out['recommended_primary_average'] = 'one_vs_rest_macro'
+                out['recommended_primary_reason'] = (
+                    f'minority prevalence {_rare:.3e} is below 1:1000; '
+                    'one-vs-rest macro PR-AUC is the policy primary')
+            else:
+                out['recommended_primary_metric'] = 'f1_macro'
+                out['recommended_primary_average'] = 'macro'
+                out['recommended_primary_reason'] = (
+                    f'minority prevalence {_rare:.3e} is not extreme; '
+                    'macro F1 is the policy primary')
+            out['recommended_primary_available'] = bool(
+                out.get('pr_auc_macro') is not None if _rare < _thr else True)
     return out
 
 def metric_policy_audit(summary=None, policy=None):
@@ -15060,6 +15118,29 @@ def metric_policy_audit(summary=None, policy=None):
                         _ra.append(_au)
                         _rw.append(_sup)
                         _ww.append(_sup)
+                    _n_pc = _exact_count(r.get('n'), minimum=1)
+                    if _n_pc is None:
+                        _n_pc = sum(_rw) if _rw else None
+                    if _n_pc:
+                        for _k, _v in _pc_r.items():
+                            if not isinstance(_v, dict):
+                                continue
+                            _sup = _exact_count(_v.get('support'), minimum=0)
+                            _ap = _finite_scalar(_v.get('pr_auc'))
+                            if _sup is None:
+                                continue
+                            _chance = float(_sup) / float(_n_pc)
+                            _got_c = _finite_scalar(_v.get('pr_auc_chance'))
+                            if _got_c is not None and abs(_got_c - _chance) > 1e-12:
+                                _class_issues.append(
+                                    f'{_label}: per-class PR-AUC chance for {_k}={_got_c} '
+                                    f'is not its support prevalence ({_chance})')
+                            _got_l = _finite_scalar(_v.get('pr_auc_lift_over_chance'))
+                            if (_got_l is not None and _ap is not None
+                                    and abs(_got_l - (_ap - _chance)) > 1e-12):
+                                _class_issues.append(
+                                    f'{_label}: per-class PR-AUC lift for {_k}={_got_l} '
+                                    f'is not pr_auc - support prevalence ({_ap - _chance})')
                     _pm = _finite_scalar(r.get('pr_auc_macro'))
                     if _pa and _pm is not None and abs(_pm - float(np.mean(_pa))) > 1e-9:
                         _class_issues.append(
@@ -15306,6 +15387,34 @@ def metric_policy_audit(summary=None, policy=None):
                     _class_issues.append(
                         f'{_label}: declares primary_metric={_declared_primary!r} for task '
                         f'{task!r}; the policy primary is {sorted(_allowed_primary)}')
+            # The prevalence-aware recommendation is itself a claim; verify it
+            # against the declared policy instead of trusting the record.
+            _rec_metric = r.get('recommended_primary_metric')
+            if _rec_metric is not None:
+                _pol_rec = METRIC_POLICY.get(task) or {}
+                _rec_allowed = set()
+                for _k in ('primary', 'primary_when_extreme_imbalance'):
+                    _pv = _pol_rec.get(_k)
+                    if isinstance(_pv, str):
+                        _rec_allowed.add(_pv)
+                    elif isinstance(_pv, (list, tuple)):
+                        _rec_allowed.update(str(x) for x in _pv)
+                if _rec_allowed and _rec_metric not in _rec_allowed:
+                    _class_issues.append(
+                        f'{_label}: recommended_primary_metric={_rec_metric!r} is not '
+                        f'defined for task {task!r} (allowed {sorted(_rec_allowed)})')
+                if prevalence is not None:
+                    _thr_rec = float(_pol_rec.get('extreme_imbalance_threshold', 1e-3))
+                    _conditional = _pol_rec.get('primary_when_extreme_imbalance')
+                    if prevalence < _thr_rec and _conditional:
+                        _want_rec = _conditional
+                    else:
+                        _want_rec = _pol_rec.get('primary')
+                    if _rec_metric != _want_rec:
+                        _class_issues.append(
+                            f'{_label}: recommended_primary_metric={_rec_metric!r} does '
+                            f'not match the policy endpoint {_want_rec!r} at prevalence '
+                            f'{prevalence:.3e}')
             if prevalence is not None and prevalence < 1e-3:
                 _cond = (METRIC_POLICY.get(task) or {}).get(
                     'primary_when_extreme_imbalance',
