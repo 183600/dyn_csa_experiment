@@ -5773,6 +5773,10 @@ def t_simple_baseline_fit_budget_is_bounded_and_disclosed():
     assert art['data']['source_train_fp'] == L._ids_fp(train), art['data']
     audit = L.simple_baseline_audit(art, protocol=proto)
     assert audit['baseline_verified'] is True, audit
+    assert audit['fit_truncated'] is True, audit
+    assert audit['fit_budget']['n_fit_tokens'] == 100, audit['fit_budget']
+    assert audit['fit_budget']['n_source_tokens'] == train.size, audit['fit_budget']
+    assert audit['fit_budget']['max_fit_tokens'] == 100, audit['fit_budget']
     assert any('deterministic prefix' in w for w in audit['warnings']), audit
     # Tokens beyond the declared fit prefix must not change the floor.
     train2 = train.copy()
@@ -5847,6 +5851,25 @@ def t_simple_floor_contrast_is_significance_aware():
         assert os.path.exists(os.path.join(_final, 'methodology_audit.json'))
         assert fl['token_denominator_match'] is True, fl
         assert fl['floor_contrast']['verdict'] == 'beats_floor_significant', fl['floor_contrast']
+        # A floor fitted on a truncated prefix is not a floor trained on the
+        # panel's full corpus; it may still be verified arithmetically, but it
+        # must not be quoted as the adequately tuned floor.
+        _trunc = json.loads(json.dumps(sb))
+        _trunc['data'].update(fit_truncated=True, n_fit_tokens=100,
+                              n_source_tokens=600, max_fit_tokens=100)
+        with open(os.path.join(td, 'simple_baseline.json'), 'w', encoding='utf-8') as f:
+            json.dump(_trunc, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _rtr = L.methodology_audit(recs(floor - 1.0), design={},
+                                       baselines=L.BASELINE_DESIGN,
+                                       outdir=td, verbose=False)
+        _ftr = _rtr['simple_baseline']
+        assert _ftr['fit_truncated'] is True, _ftr
+        assert _ftr['tuned_floor_claim_allowed'] is False, _ftr
+        assert any('truncated prefix' in str(x)
+                   for x in (_ftr.get('tuned_floor_claim_reasons') or [])), _ftr
+        with open(os.path.join(td, 'simple_baseline.json'), 'w', encoding='utf-8') as f:
+            json.dump(sb, f)
         assert fl['floor_contrast']['p_exact_signflip'] < 0.05, fl['floor_contrast']
         # The caller's alpha is the gate for the floor family too.  At n=6
         # the exact p floor is 0.03125: significant at alpha=0.05 but not at

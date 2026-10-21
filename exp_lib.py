@@ -14255,6 +14255,13 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
            'nested_selection': nested_applied,
            'row_split': row_split,
            'n_eval_tokens': n_tokens_by_arm,
+           'fit_truncated': data.get('fit_truncated') is True,
+           'fit_budget': {
+               'fit_token_policy': data.get('fit_token_policy'),
+               'max_fit_tokens': data.get('max_fit_tokens'),
+               'n_fit_tokens': data.get('n_fit_tokens'),
+               'n_source_tokens': data.get('n_source_tokens'),
+           },
            'data': data, 'problems': problems, 'warnings': warnings}
     if warnings and not problems:
         out['status'] = 'warn'
@@ -19430,6 +19437,14 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             _sb_claim_reasons.append(
                 'selected smoothing tied with the runner-up for %s'
                 % ', '.join(map(str, _sb.get('selection_tie_arms') or [])))
+        if _sb.get('fit_truncated') is True:
+            _fb = _sb.get('fit_budget') or {}
+            _sb_claim_reasons.append(
+                'the count model was fitted on a truncated prefix '
+                '(%r/%r tokens, max_fit_tokens=%r), so it is not a floor '
+                'trained on the panel\'s full corpus'
+                % (_fb.get('n_fit_tokens'), _fb.get('n_source_tokens'),
+                   _fb.get('max_fit_tokens')))
         _sb['tuned_floor_claim_allowed'] = bool(
             _sb.get('baseline_verified') and not _sb_claim_reasons)
         _sb['tuned_floor_claim_reasons'] = _sb_claim_reasons
