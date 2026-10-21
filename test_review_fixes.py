@@ -4851,6 +4851,24 @@ def t_nested_tuning_artifact_audit():
     rmb = L.baseline_tuning_audit(mf_bad, protocol=mf_protocol)
     assert rmb['tuning_verified'] is False, rmb
     assert any('not reproducible' in p for p in rmb['problems']), rmb
+    # A document-group-aware selection split is valid even though a row-only
+    # replay would place the boundary at a different row.  The audit must not
+    # reject it merely because (n_rows, seed, folds) cannot reproduce it.
+    _grp_protocol = dict(protocol, selection_row_split={
+        'enabled': True, 'seed': 20261020, 'n_folds': 2,
+        'selection_fold': 0, 'evaluation_fold': 1})
+    _g_sel, _g_ev, _g_meta = L.validation_row_split(
+        4, seed=20261020, n_folds=2, selection_fold=0, evaluation_fold=1,
+        groups=[0, 1, 1, 1])
+    grp = json.loads(json.dumps(art))
+    grp['selection_row_split'] = dict(_g_meta, applied=True)
+    for _t in grp['arms']['a']['trials']:
+        _t['selection_row_fp'] = _g_meta['selection_row_fp']
+        _t['evaluation_row_fp'] = _g_meta['evaluation_row_fp']
+    for _r in grp['final_records'].values():
+        _r['holdout_row_fp'] = _g_meta['evaluation_row_fp']
+    rg = L.baseline_tuning_audit(grp, protocol=_grp_protocol)
+    assert rg['tuning_verified'] is True, rg
 
 
 def t_nested_final_uses_holdout_rows():
