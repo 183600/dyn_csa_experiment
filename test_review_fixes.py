@@ -528,6 +528,19 @@ def t_error_analysis_rejects_bad_token_tables():
         assert 'integer token ids' in str(e), e
     else:
         raise AssertionError('float token tables must be refused')
+    # The paired comparison has the same label contract.
+    try:
+        L.compare_token_errors(None, None, bad, 32, torch.device('cpu'))
+    except ValueError as e:
+        assert 'out of range' in str(e), e
+    else:
+        raise AssertionError('paired comparison must refuse out-of-vocabulary ids')
+    try:
+        L.compare_token_errors(None, None, frac, 32, torch.device('cpu'))
+    except TypeError as e:
+        assert 'integer token ids' in str(e), e
+    else:
+        raise AssertionError('paired comparison must refuse float token tables')
 
 
 def t_error_analysis_paired_none_is_renderable():

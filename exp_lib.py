@@ -21951,6 +21951,12 @@ def compare_token_errors(model_a, model_b, val_batch, vocab, device, *, tokenize
     vb = np.asarray(val_batch)
     if vb.ndim != 2 or vb.shape[1] < 2:
         raise ValueError(f'compare_token_errors needs a 2-D val_batch, got {vb.shape}')
+    if not np.issubdtype(vb.dtype, np.integer):
+        raise TypeError(f'compare_token_errors needs integer token ids, got dtype {vb.dtype}')
+    _V = int(vocab)
+    _lo, _hi = int(vb.min()), int(vb.max())
+    if _lo < 0 or _hi >= _V:
+        raise ValueError(f'compare_token_errors token ids out of range [{_lo}, {_hi}] for vocab {_V}')
     n_rows, seq = int(vb.shape[0]), int(vb.shape[1])
     span = seq - 1
 
