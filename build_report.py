@@ -577,6 +577,84 @@ def per_seed_records(outdir):
     _LOADED[_ck] = out
     return out
 
+_TRAINING_KNOB_REQUIRED_FIELDS = (
+    'optimizer', 'foreach', 'betas', 'eps', 'grad_clip_norm',
+    'lr_schedule', 'lr_floor_mult', 'lr_cosine_amp', 'augmentation',
+    'amp_dtype', 'amp_grad_scaler', 'eager_batch',
+)
+
+def _knob_number(value):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Number):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
+
+def _training_knobs_problem(knobs, *, label='train_knobs'):
+    """Report twin of exp_lib.training_knobs_problem (no exp_lib import)."""
+    if not isinstance(knobs, dict):
+        return f'{label} is not an object ({type(knobs).__name__})'
+    missing = [k for k in _TRAINING_KNOB_REQUIRED_FIELDS if k not in knobs]
+    if missing:
+        return (f'{label} omits controlled field(s) {missing} — the descriptor '
+                'does not cover the optimizer / schedule / augmentation recipe')
+    if not isinstance(knobs.get('optimizer'), str) or not knobs['optimizer'].strip():
+        return f'{label}.optimizer is missing/empty'
+    if not isinstance(knobs.get('foreach'), (bool, np.bool_)):
+        return f'{label}.foreach is not a boolean'
+    betas = knobs.get('betas')
+    if (not isinstance(betas, (list, tuple)) or len(betas) != 2
+            or any(_knob_number(b) is None for b in betas)):
+        return f'{label}.betas is not a pair of finite numbers'
+    if any(not (0.0 <= float(b) < 1.0) for b in betas):
+        return f'{label}.betas values must lie in [0,1)'
+    eps = _knob_number(knobs.get('eps'))
+    if eps is None or eps <= 0.0:
+        return f'{label}.eps is not a finite positive number'
+    clip = _knob_number(knobs.get('grad_clip_norm'))
+    if clip is None or clip < 0.0:
+        return f'{label}.grad_clip_norm is not a finite non-negative number'
+    if (not isinstance(knobs.get('lr_schedule'), str)
+            or not knobs['lr_schedule'].strip()):
+        return f'{label}.lr_schedule is missing/empty'
+    for key in ('lr_floor_mult', 'lr_cosine_amp'):
+        val = _knob_number(knobs.get(key))
+        if val is None or val < 0.0:
+            return f'{label}.{key} is not a finite non-negative number'
+    if (not isinstance(knobs.get('augmentation'), str)
+            or not knobs['augmentation'].strip()):
+        return f'{label}.augmentation is missing/empty'
+    if knobs.get('amp_dtype') is not None and not isinstance(knobs.get('amp_dtype'), str):
+        return f'{label}.amp_dtype is neither null nor a string'
+    if not isinstance(knobs.get('amp_grad_scaler'), (bool, np.bool_)):
+        return f'{label}.amp_grad_scaler is not a boolean'
+    if not isinstance(knobs.get('eager_batch'), (bool, np.bool_)):
+        return f'{label}.eager_batch is not a boolean'
+    if 'param_groups' in knobs and knobs.get('param_groups') is not None:
+        if (not isinstance(knobs['param_groups'], str)
+                or not knobs['param_groups'].strip()):
+            return f'{label}.param_groups is not a non-empty string'
+    return None
+
+def _training_knobs_reason(ka, kb):
+    if (ka is None) != (kb is None):
+        return ('unverifiable train_knobs (only one record carries the '
+                'optimizer / lr-schedule / augmentation descriptor)')
+    if ka is None:
+        return None
+    _pa = _training_knobs_problem(ka, label='train_knobs (arm a)')
+    if _pa is not None:
+        return _pa
+    _pb = _training_knobs_problem(kb, label='train_knobs (arm b)')
+    if _pb is not None:
+        return _pb
+    if ka != kb:
+        return ('different train_knobs (optimizer / lr schedule / grad-clip / '
+                'augmentation / precision)')
+    return None
+
 def _pair_reason(ra, rb):
     if not isinstance(ra, dict) or not isinstance(rb, dict):
         return 'a record is not a dict'
@@ -590,10 +668,9 @@ def _pair_reason(ra, rb):
     # Mirror exp_lib.pair_reason so a zero-GPU report cannot pair cells that
     # ran under different numerical or optimisation settings.
     _ka, _kb = (ra.get('train_knobs'), rb.get('train_knobs'))
-    if (_ka is None) != (_kb is None):
-        return 'unverifiable train_knobs (only one record carries the optimizer / lr-schedule / augmentation descriptor)'
-    if _ka is not None and _ka != _kb:
-        return 'different train_knobs (optimizer / lr schedule / grad-clip / augmentation / precision)'
+    _knob_reason = _training_knobs_reason(_ka, _kb)
+    if _knob_reason is not None:
+        return _knob_reason
     for _k in ('amp_dtype', 'amp_grad_scaler', 'eager_batch'):
         _pa, _pb = (_k in ra), (_k in rb)
         if _pa != _pb:

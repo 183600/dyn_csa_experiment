@@ -658,10 +658,9 @@ def _relaxed_pair_reason(a, b, tuned_arms):
     # strict `pair_reason` already enforces this for architecture contrasts;
     # the relaxed tuned rule must not become a back door around it.
     ka, kb = a.get('train_knobs'), b.get('train_knobs')
-    if (ka is None) != (kb is None):
-        return 'unverifiable train_knobs (only one record carries the optimizer/schedule/augmentation descriptor)'
-    if ka is not None and ka != kb:
-        return 'different train_knobs (optimizer / LR-schedule / grad-clip / augmentation)'
+    _knob_reason = L.training_knobs_reason(ka, kb)
+    if _knob_reason is not None:
+        return _knob_reason
     # Per-arm tuning legitimately changes the searched hyperparameters, but it
     # must not silently change any OTHER structured recipe field.  The compact
     # run_cfg string differs by lr/wd/warmup after tuning, so it cannot be

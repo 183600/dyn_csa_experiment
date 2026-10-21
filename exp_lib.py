@@ -9254,6 +9254,96 @@ def result_is_current(rec, code, *required_keys):
     return rec.get('_code') == code
 PAIR_STEP_KEYS = ('steps', 'tokens_seen')
 
+# A controlled comparison needs the FULL optimisation/schedule/augmentation
+# descriptor, not merely two records that happen to carry the same partial
+# dictionary.  Two legacy records that both omit the field remain the
+# documented permissive path, but a present descriptor missing (say) the
+# LR-schedule shape cannot prove that the schedule was shared and is refused.
+TRAINING_KNOB_REQUIRED_FIELDS = (
+    'optimizer', 'foreach', 'betas', 'eps', 'grad_clip_norm',
+    'lr_schedule', 'lr_floor_mult', 'lr_cosine_amp', 'augmentation',
+    'amp_dtype', 'amp_grad_scaler', 'eager_batch',
+)
+
+def _finite_knob(value):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Number):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
+
+def training_knobs_problem(knobs, *, label='train_knobs'):
+    """Why a present ``train_knobs`` descriptor cannot attest a controlled run.
+
+    Returns ``None`` when the descriptor is complete and well typed, else a
+    human-readable reason.  ``None``/absent descriptors are not checked here:
+    callers decide whether legacy-vs-legacy is permitted.  A descriptor is a
+    contract, so a partial one is a defect rather than "unverifiable".
+    """
+    if not isinstance(knobs, dict):
+        return f'{label} is not an object ({type(knobs).__name__})'
+    missing = [k for k in TRAINING_KNOB_REQUIRED_FIELDS if k not in knobs]
+    if missing:
+        return (f'{label} omits controlled field(s) {missing} — the descriptor '
+                'does not cover the optimizer / schedule / augmentation recipe')
+    if not isinstance(knobs.get('optimizer'), str) or not knobs['optimizer'].strip():
+        return f'{label}.optimizer is missing/empty'
+    if not isinstance(knobs.get('foreach'), (bool, np.bool_)):
+        return f'{label}.foreach is not a boolean'
+    betas = knobs.get('betas')
+    if (not isinstance(betas, (list, tuple)) or len(betas) != 2
+            or any(_finite_knob(b) is None for b in betas)):
+        return f'{label}.betas is not a pair of finite numbers'
+    if any(not (0.0 <= float(b) < 1.0) for b in betas):
+        return f'{label}.betas values must lie in [0,1)'
+    eps = _finite_knob(knobs.get('eps'))
+    if eps is None or eps <= 0.0:
+        return f'{label}.eps is not a finite positive number'
+    clip = _finite_knob(knobs.get('grad_clip_norm'))
+    if clip is None or clip < 0.0:
+        return f'{label}.grad_clip_norm is not a finite non-negative number'
+    if (not isinstance(knobs.get('lr_schedule'), str)
+            or not knobs['lr_schedule'].strip()):
+        return f'{label}.lr_schedule is missing/empty'
+    for key in ('lr_floor_mult', 'lr_cosine_amp'):
+        val = _finite_knob(knobs.get(key))
+        if val is None or val < 0.0:
+            return f'{label}.{key} is not a finite non-negative number'
+    if (not isinstance(knobs.get('augmentation'), str)
+            or not knobs['augmentation'].strip()):
+        return f'{label}.augmentation is missing/empty'
+    if knobs.get('amp_dtype') is not None and not isinstance(knobs.get('amp_dtype'), str):
+        return f'{label}.amp_dtype is neither null nor a string'
+    if not isinstance(knobs.get('amp_grad_scaler'), (bool, np.bool_)):
+        return f'{label}.amp_grad_scaler is not a boolean'
+    if not isinstance(knobs.get('eager_batch'), (bool, np.bool_)):
+        return f'{label}.eager_batch is not a boolean'
+    if 'param_groups' in knobs and knobs.get('param_groups') is not None:
+        if (not isinstance(knobs['param_groups'], str)
+                or not knobs['param_groups'].strip()):
+            return f'{label}.param_groups is not a non-empty string'
+    return None
+
+def training_knobs_reason(ka, kb):
+    """Controlled-variable gate for two records' training descriptors."""
+    if (ka is None) != (kb is None):
+        return ('unverifiable train_knobs (only one record carries the '
+                'optimizer / lr-schedule / augmentation descriptor)')
+    if ka is None:
+        return None
+    _problem_a = training_knobs_problem(ka, label='train_knobs (arm a)')
+    if _problem_a is not None:
+        return _problem_a
+    _problem_b = training_knobs_problem(kb, label='train_knobs (arm b)')
+    if _problem_b is not None:
+        return _problem_b
+    if ka != kb:
+        return ('different train_knobs (optimizer / lr schedule / grad-clip / '
+                'augmentation / precision)')
+    return None
+
 def pair_reason(ra, rb):
     if not isinstance(ra, dict) or not isinstance(rb, dict):
         return 'a record is not a dict'
@@ -9271,11 +9361,12 @@ def pair_reason(ra, rb):
     # descriptor and one that does not cannot be shown to share the optimizer /
     # schedule / clipping / augmentation settings, and pairing them is exactly
     # the uncontrolled comparison this gate exists to prevent.  Only
-    # legacy-vs-legacy (both absent) keeps the permissive path.
-    if (_ka is None) != (_kb is None):
-        return 'unverifiable train_knobs (only one record carries the optimizer / lr-schedule / augmentation descriptor)'
-    if _ka is not None and _ka != _kb:
-        return 'different train_knobs (optimizer / lr schedule / grad-clip / augmentation / precision)'
+    # legacy-vs-legacy (both absent) keeps the permissive path.  A PRESENT but
+    # partial descriptor is a defect, not a legacy record: equality of two
+    # incomplete dictionaries cannot attest the controlled recipe.
+    _knob_reason = training_knobs_reason(_ka, _kb)
+    if _knob_reason is not None:
+        return _knob_reason
     # Precision / implementation mode are also recorded at the top level on
     # newer records.  Compare them explicitly (the descriptor above already
     # covers records that carry it) so an fp32-vs-bf16 or row-loop-vs-batched
@@ -18897,6 +18988,22 @@ def controlled_variables_report(recs, arms):
 
     run_cfg = _control(lambda r: _canon_setting(r.get('run_cfg')))
     train_knobs = _control(lambda r: _canon_setting(r.get('train_knobs')))
+    # Equality of two partial descriptors is not controlled-recipe evidence.
+    # Collect every present-but-incomplete descriptor per arm so the panel
+    # report can fail closed instead of treating it as a legacy omission.
+    _knob_defects = {a: [] for a in arms}
+    for (v, t, s), r in recs.items():
+        if v not in _knob_defects or not isinstance(r, dict):
+            continue
+        _kn = r.get('train_knobs')
+        if _kn is None:
+            continue
+        _why = training_knobs_problem(_kn)
+        if _why is not None:
+            _knob_defects[v].append({'protocol': str(t or ''), 'seed': s,
+                                     'reason': _why})
+    _knob_defects = {a: sorted(v, key=lambda x: (x['protocol'], str(x['seed'])))
+                     for a, v in _knob_defects.items() if v}
     objective = _control(lambda r: _canon_setting(r.get('train_objective')))
     hyper = {}
     for key in _CONTROL_HYPER_KEYS:
@@ -18962,11 +19069,16 @@ def controlled_variables_report(recs, arms):
     if (objective['equal'] is False
             and (objective['within_arm_mixed'] or objective['partially_recorded'])):
         controlled = False
+    # A present-but-partial descriptor cannot attest any single recipe, even
+    # when every record carries the same incomplete dictionary.
+    if _knob_defects:
+        controlled = False
     return {
         'arms': arms,
         'n_records': {a: sum(1 for (v, _t, _s) in recs if v == a) for a in arms},
         'run_cfg_equal': run_cfg['equal'],
         'train_knobs_equal': train_knobs['equal'],
+        'train_knobs_defects': _knob_defects,
         'objective_equal': objective['equal'],
         'objective_values': objective['values'],
         'hyperparams_equal': hp_equal,
@@ -20140,6 +20252,16 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             if _cv.get('partially_recorded'):
                 report['warnings'].append('%s: arm(s) %s carry the run_cfg/train_knobs/hyperparameter descriptor only on SOME seed records — equality across arms cannot be verified; the seeds without the descriptor are already excluded from the paired n'
                                           % (comp, ', '.join(_cv['partially_recorded'])))
+            if _cv.get('train_knobs_defects'):
+                _detail = '; '.join(
+                    '%s: %s' % (a, ', '.join(sorted({d['reason'] for d in ds})))
+                    for a, ds in sorted(_cv['train_knobs_defects'].items()))
+                report['warnings'].append(
+                    '%s: present train_knobs descriptor(s) are incomplete or '
+                    'malformed (%s) — an incomplete descriptor cannot prove the '
+                    'optimizer/schedule/augmentation recipe was controlled, so '
+                    'the affected pairs are refused rather than treated as '
+                    'legacy metadata' % (comp, _detail))
             if _cv.get('hyperparam_differences'):
                 report['warnings'].append('%s: structured hyperparameters differ across arms (%s) even where run_cfg matches — the comparison is not fully controlled'
                                           % (comp, ', '.join(_cv['hyperparam_differences'])))

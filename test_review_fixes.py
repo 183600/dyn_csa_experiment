@@ -2202,6 +2202,59 @@ def t_controlled_variables_all_seed_records():
     assert r['components']['c'][0]['n_paired'] == 2, r['components']['c'][0]
 
 
+def t_training_knobs_must_be_complete():
+    # A controlled recipe is attested by the FULL descriptor.  Two records
+    # carrying the same partial dictionary cannot prove the missing
+    # optimizer/schedule/augmentation fields were shared.
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    base = dict(variant='a', seed=0, run_cfg=fp, steps=1, tokens_seen=1,
+                ppl=10.0, params=100, train_knobs=knobs)
+    assert L.pair_reason(base, dict(base, variant='b')) is None
+    # Both absent remains the documented legacy-vs-legacy path.
+    assert L.pair_reason(dict(base, train_knobs=None),
+                         dict(base, variant='b', train_knobs=None)) is None
+    partial = {k: v for k, v in knobs.items()
+               if k not in ('lr_schedule', 'augmentation')}
+    ra = dict(base, train_knobs=partial)
+    rb = dict(base, variant='b', train_knobs=dict(partial))
+    why = L.pair_reason(ra, rb)
+    assert why and 'omits controlled field' in why, why
+    # The zero-GPU report twin must refuse exactly the same pair.
+    rwhy = BR._pair_reason(ra, rb)
+    assert rwhy and 'omits controlled field' in rwhy, rwhy
+    # Malformed numeric fields are not a controlled recipe either.
+    for bad in (dict(knobs, betas=[0.9, float('nan')]),
+                dict(knobs, eps=0.0),
+                dict(knobs, augmentation='')):
+        assert L.pair_reason(dict(base, train_knobs=bad),
+                             dict(base, variant='b', train_knobs=dict(bad))), bad
+    # The tuned-baseline relaxed gate must not become a back door.
+    tuned = {'a': 0, 'b': 0}
+    # Give the relaxed rule its data fingerprints so it reaches the descriptor
+    # check instead of stopping at missing corpus evidence.
+    ra2 = dict(ra, data_fp='d', val_fp='v')
+    rb2 = dict(rb, data_fp='d', val_fp='v')
+    _relaxed = BT._relaxed_pair_reason(ra2, rb2, tuned)
+    assert _relaxed and 'omits controlled field' in _relaxed, _relaxed
+    # Panel-level report names the defect and refuses to call it controlled.
+    s = {}
+    for i in range(3):
+        s[f'a::seed{i}'] = dict(variant='a', seed=i, run_cfg=fp, steps=1,
+                                tokens_seen=1, ppl=49.0, params=100,
+                                train_knobs=dict(partial))
+        s[f'b::seed{i}'] = dict(variant='b', seed=i, run_cfg=fp, steps=1,
+                                tokens_seen=1, ppl=50.0, params=100,
+                                train_knobs=dict(partial))
+    rep = L.methodology_audit(s, design={'c': [('a', 'b', 'x')]},
+                              baselines={}, verbose=False)
+    cv = rep['controlled_variables']['c']
+    assert cv['controlled'] is False, cv
+    assert set(cv['train_knobs_defects']) == {'a', 'b'}, cv
+    assert any('train_knobs descriptor(s) are incomplete' in w
+               for w in rep['warnings']), rep['warnings']
+
+
 def t_seed_coverage_warning():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     knobs = L.training_knobs()
@@ -14387,6 +14440,7 @@ def main():
     _check('L52 simple-baseline floor identity/rows bind their evidence', t_simple_baseline_bound_floor_identity_and_rows)
     _check('L53 v12 malformed manifest/lock fail closed', t_v12_malformed_manifest_and_lock_fail_closed)
     _check('L54 build report excludes malformed panel objects', t_build_report_malformed_panel_is_excluded)
+    _check('L55 controlled recipe requires a complete train_knobs descriptor', t_training_knobs_must_be_complete)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

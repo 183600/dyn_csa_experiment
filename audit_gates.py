@@ -1623,6 +1623,12 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
                 warnings.append('training-objective equality across arms is UNVERIFIABLE (some records omit the descriptor) — mechanism attribution needs the objective descriptor on every seed')
             for _arm in cv.get('within_arm_mixed') or []:
                 problems.append(f'{_arm}: seeds mix DIFFERENT run_cfg/train_knobs/hyperparameter values inside one arm')
+            for _arm, _defects in (cv.get('train_knobs_defects') or {}).items():
+                _reasons = sorted({d.get('reason') for d in _defects if isinstance(d, dict)})
+                problems.append(f'{_arm}: train_knobs descriptor is incomplete/malformed '
+                                f'({"; ".join(_reasons) or "unknown"}) — the '
+                                'optimizer/schedule/augmentation recipe cannot be '
+                                'shown to be controlled')
             for _key in ('run_cfg', 'train_knobs', 'hyperparams'):
                 _eq = cv.get(_key + '_equal')
                 if _eq is None:
