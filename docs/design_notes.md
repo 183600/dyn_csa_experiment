@@ -1306,6 +1306,15 @@ statement / mechanism / predicted_sign / primary_metric / falsifier：
 `stats.json` 和 Markdown；`audit_gates.hypotheses` 也覆盖这张表。描述性
 单元（其它块长 × 读取规则）仍不进入 Holm 家族，也不得被写成方向性结论。
 
+### 26.6 零信息地板：uniform token
+
+计数模型至少要优于从词表均匀采样。`simple_baseline_fit` 现在把
+`uniform_ppl`（= 词表大小）、`best_ppl_vs_uniform` 和 `data.vocab_size`
+写入工件；`simple_baseline_audit` 校验三者一致，并在最佳计数模型 PPL
+高于 uniform 时给出 warning：这可能只是小样本/无信号样本的噪声，也可能
+是 smoothing/tokenizer/data 路径坏了，不能直接当地板使用。它不把
+「PPL 比 uniform 高一点」判成 hard failure，以免在随机小样本上误杀。
+
 ## 27. 地板门槛、选择不确定性与评估行重采样（本轮硬化）
 
 本轮不新增 GPU 面板，只修正「击败简单基线」与「调参赢家」这两类容易
@@ -1706,7 +1715,9 @@ PR-AUC/ROC-AUC 放进 `per_class`：
 `macro_micro_f1_gap`，让 macro 与 micro 的分歧显式可见。one-vs-rest PR-AUC
 还记录其非零 chance floor：`pr_auc_macro_chance`（有定义类的平均 prevalence）
 与 `pr_auc_weighted_chance`（support 加权），以及对应的 lift；在 1:1000
-数据上 PR-AUC=0.01 附近可能只是 chance，不能直接当作有技能。
+数据上 PR-AUC=0.01 附近可能只是 chance，不能直接当作有技能。若输入是
+行归一化的概率矩阵，还记录多分类 Brier（sum-of-squares）与 top-label ECE；
+logits 会返回 `calibration.status="unavailable"`，不会把 logit 当概率硬算。
 
 ### 35.6 分类指标必须带 trivial floor
 

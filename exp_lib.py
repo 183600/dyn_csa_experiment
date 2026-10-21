@@ -13062,6 +13062,7 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None,
     arms = protocol.get('arms') or {}
     grids = protocol.get('grids') or {}
     trials_by_arm = {}
+    _vocab_n = int(_ngram_vocab_size(vocab_size))
     # Fit on a deterministic training prefix when the declared cap is smaller
     # than the corpus.  This bounds the bigram table (O(unique pairs)) so the
     # floor remains runnable on a B-tier token budget; the truncation is
@@ -13236,9 +13237,16 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None,
         best_ppl = float(trials_by_arm[best_arm]['holdout_metric_value'])
     else:
         best_ppl = float(trials_by_arm[best_arm]['selected_metric_value'])
+    # A uniform-over-vocabulary model is the zero-information floor: the count
+    # model must at least be better than random tokens.  A floor worse than
+    # uniform points at a broken tokenizer/smoothing path, not a weak model.
+    uniform_ppl = float(_vocab_n)
+    best_vs_uniform = (best_ppl / uniform_ppl
+                       if ppl_is_usable(best_ppl) and uniform_ppl > 0 else None)
     # `_ids_fp` hashes the canonical chunked form of any integer width and
     # accepts the training stream (possibly a memmap) directly.
-    _data = {'train_fp': _ids_fp(_fit_ids),
+    _data = {'vocab_size': _vocab_n,
+             'train_fp': _ids_fp(_fit_ids),
              'source_train_fp': _ids_fp(_train_all),
              'val_fp': _ids_fp(np.ascontiguousarray(eval_arr).reshape(-1)),
              'eval_fp': _ids_fp(np.ascontiguousarray(scoring_eval).reshape(-1)),
@@ -13267,6 +13275,8 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None,
         'baselines': trials_by_arm,
         'best_baseline': best_arm,
         'best_ppl': best_ppl,
+        'uniform_ppl': uniform_ppl,
+        'best_ppl_vs_uniform': best_vs_uniform,
         'best_ppl_estimation_rows': ('nested_validation_holdout' if nested else 'full_validation'),
         'code': code_stamp(),
     }
@@ -13638,8 +13648,43 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         if isinstance(_rn, list) and isinstance(_rt, list) and len(_rn) == len(_rt):
             _reported_nll, _reported_tok = _rn, _rt
             _reported_rows = _best_entry.get('reported_estimation_rows')
+    # Zero-information sanity floor: a count model must be better than sampling
+    # tokens uniformly from the vocabulary.  If it is not, the tokenizer /
+    # smoothing path is broken (or the reported floor is not the count model),
+    # and calling it a baseline would understate every neural arm.
+    _uniform = _finite_scalar(artifact.get('uniform_ppl'))
+    _vocab_d = _exact_count(data.get('vocab_size'), minimum=1) if isinstance(data, dict) else None
+    if _uniform is not None:
+        if _uniform <= 0:
+            problems.append(f'uniform_ppl={_uniform!r} must be positive')
+        if _vocab_d is not None and abs(_uniform - _vocab_d) > 1e-9:
+            problems.append(
+                f'uniform_ppl={_uniform} is not the vocabulary size {_vocab_d}')
+        _best_f = _finite_scalar(best_ppl_value)
+        if (_best_f is not None and _uniform > 0
+                and _best_f > _uniform * (1.0 + 1e-9)):
+            # A tiny excess on a small/random evaluation sample can be noise,
+            # so this is a warning rather than a hard failure.  A count model
+            # on real text should be far below uniform; if it is not, check
+            # the tokenizer/smoothing/data path before using it as a floor.
+            warnings.append(
+                f'the count-model floor (PPL={_best_f:.4f}) is WORSE than the '
+                f'uniform-token floor (PPL={_uniform:.4f}); the floor is no better '
+                'than zero-information (check smoothing/tokenization, or it is a '
+                'signal-free sample)')
+        _reported_ratio = _finite_scalar(artifact.get('best_ppl_vs_uniform'))
+        if (_reported_ratio is not None and _best_f is not None
+                and _uniform > 0
+                and abs(_reported_ratio - _best_f / _uniform) > 1e-9):
+            problems.append(
+                f'best_ppl_vs_uniform={_reported_ratio} is not best_ppl/uniform_ppl '
+                f'({_best_f / _uniform})')
     out = {'status': 'ok' if not problems else 'fail',
            'baseline_verified': not problems,
+           'uniform_ppl': _uniform,
+           'best_ppl_vs_uniform': (float(best_ppl_value) / _uniform
+                                   if _uniform and _finite_scalar(best_ppl_value) is not None
+                                   else None),
            'search_design': _search_design,
            'search_design_declared': _search_design is not None,
            'search_design_note': protocol.get('search_design_note'),
@@ -13729,7 +13774,7 @@ METRIC_POLICY = {
                       'macro_micro_f1_gap', 'pr_auc_macro', 'pr_auc_micro',
                       'pr_auc_weighted', 'pr_auc_macro_chance',
                       'pr_auc_macro_lift_over_chance', 'roc_auc_macro',
-                      'roc_auc_micro', 'roc_auc_weighted'],
+                      'roc_auc_micro', 'roc_auc_weighted', 'brier_score', 'ece'],
         'imbalance': ('macro averaging is required when class frequencies differ; micro equals '
                       'accuracy for single-label tasks; when a class is rarer than 1:1000 the '
                       'primary ranking endpoint switches to one-vs-rest macro PR-AUC'),
@@ -13739,7 +13784,9 @@ METRIC_POLICY = {
                  'when macro and micro disagree. F1 is threshold-dependent, so a rare-class '
                  'panel must also report threshold-free one-vs-rest PR-AUC. Macro treats every '
                  'class equally, micro is dominated by frequent classes, and weighted follows '
-                 'the support: they can rank models differently.'),
+                 'the support: they can rank models differently. A row-normalized '
+                 'probability matrix is also scored for multiclass Brier and top-label ECE; '
+                 'logits stay uncalibrated rather than being treated as probabilities.'),
     },
 }
 
@@ -14131,6 +14178,40 @@ def _binary_calibration(y_bin, score, n_bins=10):
             'note': 'ECE uses equal-width probability bins; fewer than n_bins non-empty bins are possible'}
 
 
+def _multiclass_calibration(y_true, y_score, labels, n_bins=10):
+    """Brier score and top-label ECE for a multiclass probability matrix.
+
+    Calibration asks whether a predicted probability is usable, not merely
+    whether the ranking is good.  The input must be a row-normalized
+    probability matrix; logits return ``status="unavailable"`` instead of an
+    invented probability.  Brier is the multiclass sum-of-squares, while ECE
+    uses the top-1 confidence (the standard top-label reliability diagnostic).
+    """
+    y_true = np.asarray(y_true).ravel()
+    p = np.asarray(y_score, dtype=float)
+    labels = np.asarray(labels)
+    if p.ndim != 2 or p.shape[1] != labels.size or p.shape[0] != y_true.size:
+        return {'status': 'unavailable', 'reason': 'expected a rows x classes score matrix'}
+    if p.size and (np.any(p < 0.0) or np.any(p > 1.0)):
+        return {'status': 'unavailable', 'reason': 'scores are outside [0, 1]; Brier/ECE require probabilities'}
+    if p.size and not np.allclose(p.sum(axis=1), 1.0, atol=1e-6):
+        return {'status': 'unavailable', 'reason': 'rows do not sum to 1; Brier/ECE require a probability matrix'}
+    onehot = (y_true[:, None] == labels[None, :]).astype(float)
+    brier = float(np.mean(np.sum((p - onehot) ** 2, axis=1))) if p.size else None
+    if p.size == 0:
+        return {'status': 'unavailable', 'reason': 'no observations'}
+    top = np.argmax(p, axis=1)
+    confidence = p[np.arange(p.size // p.shape[1]), top]
+    correct = (labels[top] == y_true).astype(np.int64)
+    _e = _binary_calibration(correct, confidence, n_bins=n_bins)
+    return {'status': 'ok', 'brier_score': brier,
+            'ece': _e.get('ece'), 'n_bins': _e.get('n_bins'),
+            'reliability': _e.get('reliability'),
+            'top1_accuracy': float(np.mean(correct)) if correct.size else None,
+            'note': ('Brier is multiclass sum-of-squares; ECE uses top-1 confidence '
+                     '(top-label calibration) on a row-normalized probability matrix')}
+
+
 def binary_threshold_curve(y_true, y_score, *, positive_label=None, thresholds=None,
                            metric='f1', max_thresholds=4096):
     """Precision/recall/F1 at every candidate cut for a binary endpoint.
@@ -14498,8 +14579,13 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             out.update(_rank)
             out['threshold_free_metrics'] = [
                 'roc_auc_macro', 'roc_auc_micro', 'roc_auc_weighted',
-                'pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted']
+                'pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted',
+                'brier_score', 'ece']
             out['ranking_averaging'] = 'one-vs-rest'
+            out['calibration'] = _multiclass_calibration(y_true, _score, labels)
+            if out['calibration'].get('status') == 'ok':
+                out['brier_score'] = out['calibration']['brier_score']
+                out['ece'] = out['calibration']['ece']
         else:
             out['ranking_unavailable_reason'] = (
                 'multiclass ranking needs a column-per-label score matrix; '

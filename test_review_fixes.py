@@ -3581,6 +3581,16 @@ def t_multiclass_ranking_metrics_and_audit():
     assert abs(m['pr_auc_weighted_chance'] - 0.665) < 1e-12, m
     assert abs(m['pr_auc_macro_lift_over_chance'] - (1.0 - 1.0 / 3.0)) < 1e-12
     assert abs(m['pr_auc_weighted_lift_over_chance'] - 0.335) < 1e-12
+    # The one-hot probability matrix is perfectly calibrated and confident.
+    assert m['calibration']['status'] == 'ok' and m['calibration']['brier_score'] == 0.0
+    assert m['calibration']['ece'] == 0.0 and m['calibration']['top1_accuracy'] == 1.0
+    _uniform = L.classification_metrics(y, y_score=np.full((len(y), 3), 1.0 / 3.0),
+                                        labels=[0, 1, 2])
+    assert _uniform['calibration']['status'] == 'ok'
+    assert abs(_uniform['calibration']['brier_score'] - 2.0 / 3.0) < 1e-12
+    _logits = L.classification_metrics(y, y_score=np.ones((len(y), 3)), labels=[0, 1, 2])
+    assert _logits['calibration']['status'] == 'unavailable'
+    assert 'brier_score' not in _logits
     # A binary record gets the same floor; the majority predictor has zero
     # minority recall, so balanced accuracy is not fooled by its high accuracy.
     _bin_floor = L.classification_metrics([0] * 99 + [1], y_pred=[0] * 100, labels=[0, 1])
@@ -4782,8 +4792,13 @@ def t_simple_baseline_ngram_and_audit():
     best = min(e['selected_metric_value'] for e in art['baselines'].values())
     assert abs(float(art['best_ppl']) - float(best)) < 1e-12, art
     assert art['data']['val_fp'] and art['data']['n_eval_tokens'] == val.size
+    # The count floor must be better than uniform tokens; both values are
+    # recorded so the audit can reject a broken floor.
+    assert art['uniform_ppl'] == vocab and art['data']['vocab_size'] == vocab, art
+    assert art['best_ppl'] <= art['uniform_ppl'] * 1.05, art
     audit = L.simple_baseline_audit(art, protocol=proto)
     assert audit['baseline_verified'] is True, audit
+    assert audit['uniform_ppl'] == vocab and audit['best_ppl_vs_uniform'] <= 1.05, audit
     assert audit['search_design'] == 'full_factorial', audit
     assert all(v['complete'] for v in audit['grid_coverage'].values()), audit['grid_coverage']
     # A declared full-factorial count search must actually contain every cell.
@@ -4795,6 +4810,13 @@ def t_simple_baseline_ngram_and_audit():
     rbc = L.simple_baseline_audit(bad_cell, protocol=proto)
     assert rbc['baseline_verified'] is False and any(
         'full_factorial' in p and 'not run' in p for p in rbc['problems']), rbc
+    # A floor worse than uniform tokens is a data/smoothing bug, not a weak
+    # baseline; the audit refuses it.
+    bad_uniform = json.loads(json.dumps(art))
+    bad_uniform['uniform_ppl'] = 1.0
+    ru = L.simple_baseline_audit(bad_uniform, protocol=proto)
+    assert ru['baseline_verified'] is False and any(
+        'uniform-token floor' in x for x in (ru['problems'] + ru['warnings'])), ru
     # A cell outside the declared search space is not equal-search under ANY
     # design (hand-designed grids included), and the declared per-arm order
     # must be the model that actually ran.

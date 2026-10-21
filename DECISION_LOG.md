@@ -381,7 +381,9 @@ per-class PR-AUC/ROC-AUC, `undefined_classes`, `macro_micro_f1_gap`,
 chance floors/lifts (`pr_auc_macro_chance`, `pr_auc_weighted_chance`). The record must name
 `ranking_averaging="one-vs-rest"`, because macro (equal class weight), micro
 (pooled, frequency-dominated) and weighted (support) can disagree under
-imbalance. (2) `METRIC_POLICY['multiclass_classification']` now declares those
+imbalance. A row-normalized probability matrix additionally gets multiclass
+Brier and top-label ECE; logits are reported as uncalibrated rather than
+treated as probabilities. (2) `METRIC_POLICY['multiclass_classification']` now declares those
 endpoints and switches its conditional primary to `pr_auc_macro` when a class
 is rarer than 1:1000. (3) `metric_policy_audit` derives the minority prevalence
 from the full multiclass distribution (previously only two-class dicts were
@@ -401,4 +403,16 @@ accuracy/F1 to be read as model skill. `metric_policy_audit` recomputes the
 floor from per-class supports and rejects a record whose floor label or
 aggregates do not match. Tests cover binary and multiclass floors plus a forged
 easier-than-majority floor. No panel, frozen manifest, test split, README or CI
+configuration was touched.
+
+## 2026-10-21 — zero-information (uniform) floor sanity check (no new runs)
+
+`simple_baseline_fit` now records `uniform_ppl` (the vocabulary size),
+`best_ppl_vs_uniform` and `data.vocab_size`; `simple_baseline_audit` verifies
+these agree and warns when the selected count model is worse than uniform
+tokens. A count model that cannot beat zero-information sampling points at a
+smoothing/tokenizer/data-path defect (or a signal-free sample), so it must not
+be quoted as a baseline. The check is a warning rather than a hard failure
+because a small/random evaluation sample can put the finite-sample count model
+marginally above uniform. No panel, frozen manifest, test split, README or CI
 configuration was touched.
