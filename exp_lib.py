@@ -15099,7 +15099,11 @@ def metric_policy_audit(summary=None, policy=None):
             if task not in classify_tasks:
                 continue
             _class_recs.append(r)
-            _label = r.get('variant') or r.get('name') or '?'
+            _label_raw = r.get('variant') or r.get('name') or '?'
+            # A malformed record may carry a list/dict in the label slot.
+            # Normalize it so set(...)/sorted(...) cannot raise on unhashable
+            # metadata and abort the whole audit.
+            _label = _label_raw if isinstance(_label_raw, str) else str(_label_raw)
             # A recorded trivial floor must be the actual most-frequent
             # predictor of this label distribution, and its aggregates must be
             # reproducible.  Without this, a record can claim a straw-man floor

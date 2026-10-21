@@ -5777,6 +5777,12 @@ def t_binary_threshold_and_calibration_contract():
         _ma = L.metric_policy_audit({'m': _mal})
         assert _ma['status'] == 'warn' and any(
             _key in w for w in _ma['warnings']), (_key, _ma)
+    # Unhashable record-identity metadata (variant/name) must not crash the
+    # degenerate-record bookkeeping.
+    _dm = dict(_cm0, variant={'not': 'a-label'}, task='binary_classification',
+               predicted_positive_rate=1.0, degenerate_predictions=True)
+    _da = L.metric_policy_audit({'m': _dm})
+    assert _da['status'] == 'warn' and _da['checks'], _da
     # Macro/micro/weighted F1 must all be reproducible from the per-class
     # counts; a hand-edited aggregate cannot pass.
     _cm = L.classification_metrics(np.array([0] * 95 + [1] * 5),
