@@ -2552,10 +2552,10 @@ class LeakageSafeTargetEncoder:
                     f'{what}.from_stats: feature {j} has no lookup mapping')
             clean_lookup = {}
             for key, value in lookup.items():
-                if not isinstance(key, str):
+                if not isinstance(key, str) or not key:
                     raise ValueError(
                         f'{what}.from_stats: feature {j} has a non-string '
-                        'lookup key')
+                        'or empty lookup key')
                 try:
                     value = float(value)
                 except (TypeError, ValueError, OverflowError):
@@ -2814,10 +2814,10 @@ class LeakageSafeFrequencyEncoder:
                         f'{what}.from_stats: feature {j} entry {pos} has a '
                         'zero count')
                 key = entry.get('key')
-                if key is not None and not isinstance(key, str):
+                if key is not None and (not isinstance(key, str) or not key):
                     raise ValueError(
                         f'{what}.from_stats: feature {j} entry {pos} has a '
-                        'non-string key')
+                        'non-string or empty key')
                 if 'value' not in entry and key is None:
                     raise ValueError(
                         f'{what}.from_stats: feature {j} entry {pos} has '
