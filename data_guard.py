@@ -3822,7 +3822,13 @@ def _matrix_fingerprint(X):
         def _row_float_exact(row):
             vals, exact = [], True
             for v in row:
-                if v is None:
+                if v is None or (not isinstance(v, (np.datetime64, np.timedelta64))
+                                 and _numeric_is_nan(v)):
+                    # None and every numeric NaN spelling are one missing-like
+                    # value in _row_keys; the digest must not split a Decimal
+                    # NaN from None merely because Fraction(Decimal('NaN'))
+                    # cannot be formed.  Temporal NaT stays a distinct
+                    # temporal identity (matching _row_keys).
                     vals.append(float('nan'))
                     continue
                 if isinstance(v, (complex, np.complexfloating)):

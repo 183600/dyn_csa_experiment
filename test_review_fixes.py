@@ -10141,6 +10141,10 @@ def t_exact_numeric_contracts_and_fingerprint():
                     [Decimal('sNaN')]], dtype=object)
     assert L.duplicate_mask(_sn).tolist() == [False, True, True, True], \
         L.duplicate_mask(_sn)
+    # The matrix digest follows the same missing-like contract for object
+    # NaN spellings (None vs Decimal('NaN') must not be two content classes).
+    assert DG._matrix_fingerprint(np.array([[None]], dtype=object)) == \
+        DG._matrix_fingerprint(np.array([[Decimal('NaN')]], dtype=object))
     # An exactly representable object value keeps the native float digest
     # (dtype-insensitive fingerprint), while an inexact integer still gets an
     # exact tail.
