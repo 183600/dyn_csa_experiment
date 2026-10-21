@@ -1924,10 +1924,20 @@ class LeakageSafeCategoricalEncoder:
                     f'unknown/missing indices ({unknown}/{missing}) for '
                     f'{ncat} categories')
             keys = st.get('keys')
+            _keys_declared = keys is not None
             if keys is None:
                 # Legacy stats carried no key table; the fallback below uses
                 # the readable categories, which is only safe for values that
-                # survived JSON unchanged.
+                # survived JSON unchanged.  Non-native categories were already
+                # sanitised into dicts (tuple/bytes/datetime), so their
+                # original identity cannot be reconstructed: fail closed
+                # instead of silently treating every holdout value as unseen.
+                if any(not (c is None or isinstance(c, (bool, int, float, str)))
+                       for c in categories):
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} has non-native '
+                        'categories but no persisted key table; rebuild the '
+                        'encoder instead of degrading its identity')
                 keys = []
             else:
                 if not isinstance(keys, (list, tuple)):
@@ -2861,6 +2871,16 @@ class LeakageSafeFrequencyEncoder:
                     raise ValueError(
                         f'{what}.from_stats: feature {j} has duplicate '
                         'entry keys')
+            elif any(not (e.get('value') is None
+                          or isinstance(e.get('value'), (bool, int, float, str)))
+                     for e in clean_entries):
+                # Same legacy-identity rule as the categorical encoder: a
+                # sanitised non-native value cannot be matched to the caller's
+                # original tuple/bytes/datetime level.
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} has non-native entries '
+                    'but no persisted key table; rebuild the encoder instead '
+                    'of degrading its identity')
             rebuilt.append({'entries': clean_entries,
                             'n_observed': n_observed,
                             'n_missing': n_missing})
