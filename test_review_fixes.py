@@ -9222,9 +9222,12 @@ def t_target_encoder_prevents_self_and_group_leakage():
     else:
         raise AssertionError('one row cannot define an out-of-fold encoding')
     # fit (full-table transform for holdouts) is still valid with one row.
+    # Re-encoding that lone training row is an explicit in-sample diagnostic,
+    # so it must go through allow_train just like any other training matrix.
     _one = L.LeakageSafeTargetEncoder().fit(
         np.array([['a']], dtype=object), np.array([1.0]))
-    assert np.allclose(_one.transform(np.array([['a']], dtype=object)), 1.0)
+    assert np.allclose(
+        _one.transform(np.array([['a']], dtype=object), allow_train=True), 1.0)
 
 
 def t_clean_training_rows_and_split():
