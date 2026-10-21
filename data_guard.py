@@ -1525,6 +1525,12 @@ def _target_key(value):
     """
     if _category_is_missing(value):
         return '__missing__'
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        # ``np.timedelta64`` is a numbers.Integral, but int() either returns a
+        # unit-dependent raw count or raises for larger units.  That made
+        # timedelta(1 ns) collide with integer 1 and crashed on timedelta(1 D).
+        # Persist the exact temporal identity instead.
+        return 'p:' + _temporal_key(value).decode('ascii', 'backslashreplace')
     if isinstance(value, (bool, np.bool_)):
         return 'i:' + str(int(value))
     if isinstance(value, numbers.Integral):

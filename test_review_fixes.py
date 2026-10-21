@@ -9571,6 +9571,40 @@ def t_object_temporal_duplicate_identity():
     assert cleaned['n_duplicate_rows_dropped'] == 0, cleaned
 
 
+def t_object_temporal_category_identity():
+    # np.timedelta64 is a numbers.Integral, so the generic integral branch
+    # either collided with the integer of the same raw count or raised for a
+    # larger unit.  Target/category identity must use the exact temporal value.
+    import data_guard as DG
+    ns = np.timedelta64(1, 'ns')
+    one_day = np.timedelta64(1, 'D')
+    one_day_h = np.timedelta64(24, 'h')
+    assert DG._target_key(ns) != DG._target_key(1), DG._target_key(ns)
+    assert DG._target_key(one_day) == DG._target_key(one_day_h)
+    assert DG._target_key(one_day) != DG._target_key(np.timedelta64(1, 'ns'))
+    assert DG._target_key(np.datetime64('2020-01-01')) != \
+        DG._target_key(np.datetime64('2020-01-01T00:00:00.000000001'))
+    assert DG._target_key(np.timedelta64('NaT')) == '__missing__'
+    # End-to-end: a timedelta category and the integer with the same raw count
+    # are different levels and must not share one target mean.
+    X = np.asarray([[ns], [1], [ns], [1]], dtype=object)
+    y = np.asarray([10.0, 20.0, 10.0, 20.0])
+    enc = DG.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(X, y)
+    lookup = enc.get_stats()['features'][0]['lookup']
+    assert lookup[DG._target_key(ns)] == 10.0, lookup
+    assert lookup['i:1'] == 20.0, lookup
+    # The persisted keys round-trip through JSON and still separate them.
+    import json
+    restored = DG.LeakageSafeTargetEncoder.from_stats(
+        json.loads(json.dumps(enc.get_stats())))
+    hold = np.asarray([[ns], [1]], dtype=object)
+    assert np.allclose(restored.transform(hold), enc.transform(hold))
+    # The same identity rule is used by the frequency encoder.
+    freq = DG.LeakageSafeFrequencyEncoder().fit(X)
+    f = freq.get_stats()['features'][0]['entries']
+    assert len(f) == 2, f
+
+
 def t_validation_row_split_group_aware():
     # The balanced row boundary (4) would cut the group spanning rows 3-4.
     # A group-aware split must move it to a document boundary instead.
@@ -11555,6 +11589,7 @@ def main():
     _check('I31 declared label set catches unseen/holdout labels', t_known_labels_audit)
     _check('I31b NaT keys and type-qualified label shift', t_data_guard_nat_and_label_identity)
     _check('I31c object temporal duplicate identity', t_object_temporal_duplicate_identity)
+    _check('I31d object temporal category identity', t_object_temporal_category_identity)
     # Open-block reading rule: the substantive gates (causality, reference
     # pooling, masks, edge cases, closed regression) live in test_open_block.py
     # so they can also be run on their own.
