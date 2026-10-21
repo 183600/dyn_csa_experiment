@@ -9305,7 +9305,9 @@ def t_audit_training_health_records():
                       'val_ce': 4.0 + 0.05 * i, 'val_ppl': math.exp(4.0 + 0.05 * i)}
                      for i in range(5)]
         fake_clean = {'curve_health': {'status': 'healthy', 'best_step': 999,
-                                       'best_val_ppl': 1.0},
+                                       'best_val_ppl': 1.0,
+                                       'final_minus_best': -5.0,
+                                       'steps_since_best': 777},
                       'health_history': over_hist,
                       'opt_diag_summary': {'nonfinite_loss_steps': 0,
                                            'nonfinite_grad_steps': 0,
@@ -9318,6 +9320,8 @@ def t_audit_training_health_records():
         assert any('contradicts the health_history' in x for x in r5['warnings']), r5
         assert any('best_step=999' in x for x in r5['warnings']), r5
         assert any('best_val_ppl=1' in x for x in r5['warnings']), r5
+        assert any('final_minus_best=-5' in x for x in r5['warnings']), r5
+        assert any('steps_since_best=777' in x for x in r5['warnings']), r5
         nan_hist = [{'step': 0, 'train_ce': 5.0, 'val_ce': 4.0},
                     {'step': 100, 'train_ce': 4.8, 'val_ce': float('nan')}]
         masked_nan = dict(fake_clean, health_history=nan_hist)

@@ -2218,6 +2218,33 @@ def audit_training_health(outdirs=None):
                                   and abs(_bpv - float(_rbp)) > 1e-6 * max(1.0, abs(float(_rbp)))):
                                 w.append(f'curve_health.best_val_ppl={_bpv:g} does not match the '
                                          f'curve best {float(_rbp):g}')
+                        _fm = h.get('final_minus_best')
+                        if _fm is not None:
+                            _fmv = None
+                            if not isinstance(_fm, (bool, np.bool_)):
+                                try:
+                                    _f = float(_fm)
+                                    _fmv = _f if math.isfinite(_f) else None
+                                except (TypeError, ValueError, OverflowError):
+                                    _fmv = None
+                            _rfm = _rh.get('final_minus_best')
+                            if _fmv is None:
+                                w.append(f'curve_health.final_minus_best is not finite ({_fm!r})')
+                            elif (isinstance(_rfm, (int, float)) and not isinstance(_rfm, bool)
+                                  and math.isfinite(float(_rfm))
+                                  and abs(_fmv - float(_rfm)) > 1e-6 * max(1.0, abs(float(_rfm)))):
+                                w.append(f'curve_health.final_minus_best={_fmv:g} does not match '
+                                         f'the curve {float(_rfm):g}')
+                        _sb = h.get('steps_since_best')
+                        if _sb is not None:
+                            _sbv = _nonneg(_sb)
+                            _rsb = _rh.get('steps_since_best')
+                            if _sbv is None:
+                                w.append(f'curve_health.steps_since_best is not a non-negative '
+                                         f'integer ({_sb!r})')
+                            elif _rsb is not None and _sbv != int(_rsb):
+                                w.append(f'curve_health.steps_since_best={_sbv} does not match '
+                                         f'the curve {int(_rsb)}')
                     else:
                         w.append(f'no curve_health record; health_history recomputes to '
                                  f'{_rstat} ({_rh.get("reason")})')
