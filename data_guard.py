@@ -3287,6 +3287,11 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
             + ', '.join(sorted(preprocessor_kwargs))
             + ' were supplied while preprocess=False; refusing to ignore a '
             'requested train-only preprocessing step')
+    if quality_kwargs and not quality_report and not fail_on_quality:
+        raise ValueError(
+            'split_and_prepare: quality_kwargs were supplied while both '
+            'quality_report and fail_on_quality are false; refusing to ignore '
+            'the requested data-quality audit')
     Xarr = _as_numeric_2d(X)
     n = int(Xarr.shape[0])
     yarr = None
@@ -3334,6 +3339,9 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     out = {'indices': idx, 'X': dict(raw_X)}
     if _dup_check is not None:
         out['cross_split_duplicates'] = _dup_check
+    else:
+        # An explicit waiver is part of the record, not an invisible default.
+        out['cross_split_duplicates_waived'] = True
     if cleaning is not None:
         out['cleaning'] = cleaning
     if yarr is not None:

@@ -6334,6 +6334,7 @@ def t_split_and_prepare_fits_train_only():
     waived = L.split_and_prepare(Xdup, preprocess=False,
                                  check_cross_split_duplicates=False)
     assert 'cross_split_duplicates' not in waived, waived
+    assert waived.get('cross_split_duplicates_waived') is True, waived
     ok = L.split_and_prepare(np.array([[0.0], [1.0], [2.0], [3.0]]),
                              preprocess=False)
     assert ok['cross_split_duplicates'] == {
@@ -11781,6 +11782,12 @@ def t_split_and_prepare_refuses_ignored_options():
         assert 'preprocess=False' in str(e), e
     else:
         raise AssertionError('preprocess=False must not ignore preprocessor options')
+    try:
+        DG.split_and_prepare(X, quality_kwargs={'clip_z': 2.0})
+    except ValueError as e:
+        assert 'quality_kwargs' in str(e), e
+    else:
+        raise AssertionError('quality_kwargs without an audit must be refused')
     # The same options are accepted when their stage is actually enabled.
     out = DG.split_and_prepare(X, y, clean_train=True,
                                drop_invalid_labels=True)
