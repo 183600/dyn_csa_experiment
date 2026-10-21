@@ -213,7 +213,7 @@ def _signflip_floor(n):
     return math.ldexp(2.0, -ni)
 
 
-def exact_signflip(deltas):
+def exact_signflip(deltas, *, n_input=None):
     # Same scalar contract as exp_lib.exact_signflip_p: NumPy integers and
     # floats are measurements too, non-finite/boolean values are not.
     deltas = [f for f in (_as_finite(d) for d in deltas) if f is not None]
@@ -228,11 +228,36 @@ def exact_signflip(deltas):
     _n_nonzero = sum(1 for d in deltas if d != 0.0)
     _p_floor = (1.0 if _n_nonzero == 0
                 else min(1.0, math.ldexp(2.0, -_n_nonzero)))
+    # Panel attrition is part of the result: `deltas` may be the complete-case
+    # subset after unpaired/non-finite seeds were dropped.  The caller can pass
+    # the planned/paired count so the report gate can refuse a
+    # complete-case-only significance claim.
+    _n_in = _int_or(n_input, n)
+    if _n_in is None or _n_in < n:
+        _n_in = n
+    _attrition = {'n_input': int(_n_in), 'n_dropped': int(_n_in - n)}
+    # Leave-one-seed-out stability: a significant aggregate can still be owned
+    # by a single seed.  Mirror exp_lib.paired_effect_stats so the report and
+    # the methodology audit cannot disagree on this diagnostic.
+    _loo = []
+    _seed_driven = None
+    if n >= 3:
+        _total = float(sum(deltas))
+        _loo = [(_total - float(d)) / (n - 1) for d in deltas]
+        _seed_driven = False
+        if abs(mu) > 1e-300:
+            _sign = 1.0 if mu > 0 else -1.0
+            _seed_driven = any((m == 0.0) or ((m > 0) != (_sign > 0)) for m in _loo)
+    _diag = {'n_nonzero': _n_nonzero, 'p_floor': _p_floor,
+             'loo_means': _loo, 'seed_driven': _seed_driven,
+             'seed_robust': (None if _seed_driven is None else (not _seed_driven)),
+             **_attrition}
     if 20 < n <= 40:
         try:
             _cnt = _signflip_mitm_count(deltas)
-            return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _cnt / (1 << n),
-                    'n_nonzero': _n_nonzero, 'p_floor': _p_floor, 'method': 'exact-mitm'}
+            return {'n': n, 'mean': mu, 'std': std,
+                    'p_exact_signflip': _cnt / (1 << n),
+                    'method': 'exact-mitm', **_diag}
         except ImportError:
             pass
     if n > 40:
@@ -240,7 +265,7 @@ def exact_signflip(deltas):
         # variance is the sign-flip null variance sum(d_i**2).
         _p, _method = _signflip_saddlepoint_p(deltas)
         return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _p,
-                'n_nonzero': _n_nonzero, 'p_floor': _p_floor, 'method': _method}
+                'method': _method, **_diag}
     try:
         import numpy as _np
     except ImportError:
@@ -269,9 +294,8 @@ def exact_signflip(deltas):
             s = sum((d if mask >> i & 1 else -d for i, d in enumerate(deltas)))
             if abs(s) >= obs - 1e-12 * n:
                 cnt += 1
-    mu = sum(deltas) / n
-    return {'n': n, 'mean': mu, 'std': (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0, 'p_exact_signflip': cnt / (1 << n),
-            'n_nonzero': _n_nonzero, 'p_floor': _p_floor, 'method': 'exact'}
+    return {'n': n, 'mean': mu, 'std': std,
+            'p_exact_signflip': cnt / (1 << n), 'method': 'exact', **_diag}
 
 def _measurable(r):
     if not isinstance(r, dict):
@@ -634,7 +658,11 @@ def paired_row(a_records, b_records):
     if not dl:
         print('[report] no usable pair left after the run_cfg/steps checks — comparison omitted rather than quoting a cross-config delta')
         return None
-    st = exact_signflip(dl)
+    # `common` is the paired plan; `dl` is the complete-case subset after
+    # the run_cfg/estimand gate.  Passing the planned count makes a
+    # complete-case-only p-value visible (and refuses the significance wording
+    # in `_sig_gate`) instead of silently shrinking the panel.
+    st = exact_signflip(dl, n_input=len(common))
     return (kept, dl, st)
 
 def sec_header():
@@ -860,7 +888,7 @@ def sec_p0w():
                 continue
             if _gated:
                 print(f'[report] sec_p0w `{v}` warm={w}: {_gated}/{len(_shared)} seed(s) NOT paired (run_cfg/steps gate); excluded from the sign-flip test')
-            _st = exact_signflip(_dd) if _dd else None
+            _st = exact_signflip(_dd, n_input=len(_shared)) if _dd else None
             if _st is None:
                 continue
             _d = _st['mean']
@@ -1566,6 +1594,19 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
         if ph < p - 1e-12:
             return False
         if mean is None or std is None or abs(mean) <= std:
+            return False
+        # A complete-case subset is not a complete paired panel: if any
+        # planned/paired seed was dropped by the run_cfg/estimand gate, the
+        # surviving seeds were selected by that failure and cannot support a
+        # significance claim (mirror exp_lib.reportable_claim).  Missing
+        # fields keep the legacy permissive path.
+        _n_dropped = _int_or(st.get('n_dropped'), None)
+        if _n_dropped is not None and _n_dropped > 0:
+            return False
+        # Leave-one-seed-out instability: dropping any one seed flips the
+        # mean sign, so the direction is not stable across seeds even when the
+        # aggregate p is small.
+        if st.get('seed_driven') is True:
             return False
     except (TypeError, ValueError, OverflowError):
         return False

@@ -863,6 +863,27 @@ def t_exact_signflip_baseline():
     assert abs(p12 - 2.0 / 4096) < 1e-12
 
 
+def t_report_gate_refuses_attrition_and_seed_driven():
+    # The report builder must expose the same two reliability diagnostics as
+    # exp_lib.paired_effect_stats, not just n/raw p/Holm/|mean|>std.
+    robust = BR.exact_signflip([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], n_input=6)
+    assert robust['n'] == 6 and robust['n_dropped'] == 0, robust
+    assert robust['seed_driven'] is False and robust['seed_robust'] is True, robust
+    driven = BR.exact_signflip([10.0, 10.0, -10.0], n_input=4)
+    assert driven['n'] == 3 and driven['n_dropped'] == 1, driven
+    assert driven['seed_driven'] is True and driven['seed_robust'] is False, driven
+    assert len(driven['loo_means']) == 3, driven
+    # The gate must refuse both a complete-case-only panel and a sign that is
+    # owned by a single seed, even when every numeric threshold passes.
+    ok = {'n': 6, 'p_exact_signflip': 0.01, 'p_holm': 0.02,
+          'mean': 1.0, 'std': 0.5}
+    assert BR._sig_gate(ok) is True
+    assert BR._sig_gate(dict(ok, n_dropped=1)) is False
+    assert BR._sig_gate(dict(ok, seed_driven=True)) is False
+    # An explicit complete panel / robust sign stays admissible.
+    assert BR._sig_gate(dict(ok, n_dropped=0, seed_driven=False)) is True
+
+
 def _brute_signflip_p(d):
     """Reference chunked enumeration."""
     d = np.asarray(d, dtype=float)
@@ -12682,6 +12703,7 @@ def main():
     _check('A3 signflip_power', t_power)
     _check('A4 tost_paired directions', t_tost)
     _check('A5 exact_signflip baseline', t_exact_signflip_baseline)
+    _check('A5a report gate refuses panel attrition and seed-driven signs', t_report_gate_refuses_attrition_and_seed_driven)
     _check('A6 paired_effect resolution_limited', t_paired_effect_resolution)
     _check('A6b scaling_trend ragged seed panels', t_scaling_trend_ragged_pairs)
     _check('A6b1 missing scale seed identity is never paired positionally', t_scale_missing_seed_identity_is_not_paired)
