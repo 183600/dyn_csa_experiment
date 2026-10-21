@@ -904,7 +904,8 @@ def _temporal_group_key(value):
         canon = value
     elif isinstance(value, _datetime.datetime):
         if value.tzinfo is not None:
-            return ('__datetime_tz__', value.isoformat())
+            # No single instant without a zone; keep the zone-qualified text.
+            return _UnhashableKey('__datetime_tz__', value.isoformat())
         canon = np.datetime64(value)
     elif isinstance(value, _datetime.date):
         canon = np.datetime64(value)
@@ -913,9 +914,13 @@ def _temporal_group_key(value):
     else:  # pragma: no cover - guarded by the caller
         return value
     try:
-        return ('__temporal__', _temporal_key(canon))
+        # The opaque sentinel cannot be impersonated by a real tuple/list group
+        # id whose elements happen to spell the same components.
+        return _UnhashableKey(
+            '__temporal__', _temporal_key(canon).decode('ascii', 'backslashreplace'))
     except (TypeError, ValueError, OverflowError):
-        return ('__temporal_repr__', type(value).__name__, repr(value))
+        return _UnhashableKey(
+            '__temporal_repr__', f'{type(value).__name__}:{value!r}')
 
 
 def _group_key(value):

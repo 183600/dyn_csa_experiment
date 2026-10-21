@@ -9678,6 +9678,10 @@ def t_temporal_group_identity_matches_python_equality():
     import data_guard as DG
     same_day = [np.datetime64('2020-01-01'), datetime.date(2020, 1, 1)]
     assert DG._group_key(same_day[0]) == DG._group_key(same_day[1])
+    # The canonical key is an opaque sentinel, so a real tuple group id that
+    # spells the same components cannot impersonate it.
+    forged = ('__temporal__', b'DI1577836800000000000')
+    assert DG._group_key(same_day[0]) != forged
     try:
         DG.assert_no_split_leakage([0], [1], [], groups=np.asarray(same_day, dtype=object))
     except ValueError as e:
