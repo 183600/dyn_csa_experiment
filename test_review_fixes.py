@@ -2331,6 +2331,32 @@ def t_partial_ablation_cannot_verify_a_component():
                for r in cov3['all_components_useful_reasons']), cov3
 
 
+def t_ids_fp_ignores_malformed_sidecar():
+    # A valid-JSON list/scalar in the .idsfp.json sidecar is not a fingerprint
+    # record.  It must be ignored (and the array hashed) rather than crashing
+    # the whole cache load with AttributeError.
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'ids.npy')
+        arr = np.memmap(path, dtype=np.int64, mode='w+', shape=(8,))
+        arr[:] = np.arange(8)
+        arr.flush()
+        L._IDS_FP_MEMO.clear()
+        expected = L._ids_fp(arr)
+        side = path + '.idsfp.json'
+        for bad in ([1, 2, 3], 'not-a-record', 7):
+            with open(side, 'w', encoding='utf-8') as f:
+                json.dump(bad, f)
+            L._IDS_FP_MEMO.clear()
+            assert L._ids_fp(arr) == expected, bad
+        del arr
+        # Reopening the same file without a valid sidecar still yields the
+        # same content identity.
+        L._IDS_FP_MEMO.clear()
+        arr2 = np.memmap(path, dtype=np.int64, mode='r', shape=(8,))
+        assert L._ids_fp(arr2) == expected
+        del arr2
+
+
 def t_seed_coverage_warning():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     knobs = L.training_knobs()
@@ -14522,6 +14548,7 @@ def main():
     _check('L56 underpowered contrast is never significant; std definability', t_underpowered_contrast_is_never_significant)
     _check('L57 report pairs cover the declared ablation design', t_report_pairs_cover_the_declared_ablation_design)
     _check('L58 a partial ablation cannot verify the whole component', t_partial_ablation_cannot_verify_a_component)
+    _check('L59 id fingerprint ignores malformed sidecar', t_ids_fp_ignores_malformed_sidecar)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
