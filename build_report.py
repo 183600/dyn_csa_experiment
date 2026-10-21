@@ -1780,8 +1780,8 @@ def efficiency_group_key(eff):
     """Comparability key for a measured efficiency record.
 
     A latency/PPL frontier is only meaningful when token count, device, torch
-    build and KV semantics are identical.  Missing provenance yields None
-    (unverifiable), never a shared default bucket.
+    build, KV semantics and (when recorded) batch size are identical.  Missing
+    provenance yields None (unverifiable), never a shared default bucket.
     """
     if not isinstance(eff, dict):
         return None
@@ -1797,7 +1797,28 @@ def efficiency_group_key(eff):
         return None
     if not isinstance(kv, (bool, np.bool_)):
         return None
-    return (dev, torch_v, int(n_tok), bool(kv))
+    # The same token count at batch 1 vs batch 8 is a different execution
+    # shape.  A recorded batch must agree; an invalid recorded batch is
+    # unverifiable, never a shared default.  Legacy records without the field
+    # keep the historical 4-tuple (they remain comparable to each other, but
+    # never to a record that does record its batch).
+    batch = eff.get('batch')
+    if batch is None:
+        return (dev, torch_v, int(n_tok), bool(kv))
+    if isinstance(batch, (bool, np.bool_)):
+        return None
+    if isinstance(batch, (int, np.integer)):
+        batch = int(batch)
+    elif isinstance(batch, (float, np.floating)):
+        f = float(batch)
+        if not (math.isfinite(f) and f == math.floor(f)):
+            return None
+        batch = int(f)
+    else:
+        return None
+    if batch < 1:
+        return None
+    return (dev, torch_v, int(n_tok), bool(kv), batch)
 
 
 def efficiency_pareto(points):
@@ -2156,14 +2177,15 @@ def sec_efficiency():
         groups.setdefault(gk, []).append((name, key, rec, eff))
     if groups:
         lines += ['', '**Pareto frontiers within comparable measurement groups**', '',
-                  '> A frontier is drawn only inside one (device, torch, token-count, KV-semantics) group. A PPL difference between groups is confounded by input shape or hardware and is not an architecture comparison.', '']
+                  '> A frontier is drawn only inside one (device, torch, token-count, KV-semantics, recorded batch) group. A PPL difference between groups is confounded by input shape or hardware and is not an architecture comparison.', '']
         for gk, grp in groups.items():
             pts = [(eff.get('prefill_ms_p50'), rec.get('ppl'), f'{name} / `{key}`')
                    for name, key, rec, eff in grp]
             frontier = efficiency_pareto(pts)
             if not frontier:
                 continue
-            lines += [f'- device `{gk[0]}`, torch `{gk[1]}`, {gk[2]} tokens, KV={gk[3]}:', '']
+            _batch_txt = (f', batch {gk[4]}' if len(gk) > 4 else ', batch unrecorded')
+            lines += [f'- device `{gk[0]}`, torch `{gk[1]}`, {gk[2]} tokens, KV={gk[3]}{_batch_txt}:', '']
             for lat, ppl, label in frontier:
                 lines.append(f'  - {label}: PPL {fm(ppl)}, prefill p50 {fm(lat, 2)} ms')
             summary = efficiency_accuracy_summary([
