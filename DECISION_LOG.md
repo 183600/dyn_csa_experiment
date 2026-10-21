@@ -565,3 +565,25 @@ Signaling-NaN ordering keys are rejected before sorting, and persisted
 category/frequency tables refuse truncated/empty key tables or legacy
 non-native identities that can no longer be reconstructed. The temporary issue
 list was removed after the fixes.
+
+## 2026-10-21 — baseline budget transfer, floor truncation, NIAH imbalance endpoint (no new runs)
+
+Changed only the zero-GPU baseline/metric/audit and NIAH record paths; no panel,
+frozen manifest, test split, README or CI configuration was touched. (1) The
+baseline-tuning audit now records and checks `budget_transfer`: the declared
+`search_steps` must match the tuning trials and the final records' step budget.
+Equal search across arms did not catch a search run at a shorter horizon than
+the reported final evaluation; such a config is not the tuned optimum at the
+final budget. A mismatch is disclosed and gates the "well-tuned baseline"
+claim, while legacy artifacts without step evidence stay unverifiable rather
+than passing. (2) `simple_baseline_audit` now requires the recorded prefix to be
+exactly `min(n_source_tokens, max_fit_tokens)`, rejects a `fit_truncated` flag
+that contradicts the token counts, and propagates prefix-trained floors into
+`tuned_floor_claim_allowed`. At scale the count-model floor can see far fewer
+tokens than the neural panel; the arithmetic contrast stays valid, but it is no
+longer called a floor trained on the full corpus. (3) `niah_retrieval` now
+declares a conditional primary (`macro_recall`) below 1:1000 answer-class
+prevalence; `retrieval_metrics` emits the recommendation/reason/availability,
+the audit verifies it, and v10 NIAH records persist those fields. (4) Tests
+cover horizon mismatch, truncated-floor contradictions, and NIAH hypothesis /
+record alignment. The temporary issue list was removed after the fixes.
