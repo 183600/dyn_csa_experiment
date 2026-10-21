@@ -880,8 +880,16 @@ def t_report_gate_refuses_attrition_and_seed_driven():
     assert BR._sig_gate(ok) is True
     assert BR._sig_gate(dict(ok, n_dropped=1)) is False
     assert BR._sig_gate(dict(ok, seed_driven=True)) is False
+    # Seeds skipped by the controlled-comparison gate are an incomplete paired
+    # panel too; the report gate must mirror exp_lib.reportable_claim.
+    for _key in ('n_skipped_config_mismatch', 'n_skipped'):
+        assert BR._sig_gate(dict(ok, **{_key: 1})) is False, _key
+        assert BR._sig_gate(dict(ok, **{_key: -1})) is False, _key
+        assert BR._sig_gate(dict(ok, **{_key: True})) is False, _key
     # An explicit complete panel / robust sign stays admissible.
     assert BR._sig_gate(dict(ok, n_dropped=0, seed_driven=False)) is True
+    assert BR._sig_gate(dict(ok, n_skipped_config_mismatch=0)) is True
+    assert BR._sig_gate(dict(ok, n_skipped=0)) is True
 
 
 def _brute_signflip_p(d):

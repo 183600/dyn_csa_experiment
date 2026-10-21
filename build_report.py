@@ -1603,6 +1603,16 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
         _n_dropped = _int_or(st.get('n_dropped'), None)
         if _n_dropped is not None and _n_dropped > 0:
             return False
+        # Seeds rejected by the same-recipe controlled-comparison gate are
+        # also an incomplete paired panel (mirror exp_lib.reportable_claim).
+        # Both field spellings are used by the v9/v10/v11 contrast builders.
+        _n_skipped = st.get('n_skipped_config_mismatch')
+        if _n_skipped is None:
+            _n_skipped = st.get('n_skipped')
+        if _n_skipped is not None:
+            _sk = _int_or(_n_skipped, None)
+            if _sk is None or _sk < 0 or _sk > 0:
+                return False
         # Leave-one-seed-out instability: dropping any one seed flips the
         # mean sign, so the direction is not stable across seeds even when the
         # aggregate p is small.
