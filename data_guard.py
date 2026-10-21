@@ -920,10 +920,15 @@ def _assert_index_and_group_disjoint(split_idx, groups=None):
             if np.intersect1d(arrays[a], arrays[b], assume_unique=False).size:
                 raise ValueError(f'{a} and {b} indices overlap')
     if groups is not None:
-        sets = {name: set(arrays[name].tolist()) for name in SPLIT_NAMES}
         groups = np.asarray(groups)
-        gsets = {name: {_group_key(groups[i]) for i in sets[name]}
-                 for name in SPLIT_NAMES}
+        # Do not materialise a Python set of every row index just to map rows
+        # to group ids: on a large corpus that is one pointer object per row
+        # for each split.  Iterating the int64 index array directly keeps the
+        # same group sets at a fraction of the memory.
+        gsets = {
+            name: {_group_key(groups[int(i)]) for i in arrays[name]}
+            for name in SPLIT_NAMES
+        }
         for i, a in enumerate(SPLIT_NAMES):
             for b in SPLIT_NAMES[i + 1:]:
                 if gsets[a] & gsets[b]:
@@ -3676,12 +3681,16 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             warnings.append(_msg)
 
     # Exact duplicates within each split (keyed on the original dtype so
-    # large integers are not rounded through float64).
+    # large integers are not rounded through float64).  Build each split's key
+    # set once and reuse it for the cross-split check below instead of making
+    # a second copy of every row key.
     dup = {}
     keys = _row_keys(_raw_X)
+    split_key_sets = {}
     for name, rows in split_rows.items():
-        sub = [keys[i] for i in rows]
-        dup[name] = int(len(sub) - len(set(sub)))
+        _keys = {keys[int(i)] for i in rows}
+        split_key_sets[name] = _keys
+        dup[name] = int(np.asarray(rows).size - len(_keys))
     checks['duplicate_rows_within_split'] = dup
     if any(dup.values()):
         _msg = f'duplicate rows within splits: {dup}'
@@ -3694,8 +3703,8 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     cross = {}
     hard_leak = False
     for a, b in (('train', 'val'), ('train', 'test'), ('val', 'test')):
-        sa = {keys[i] for i in split_rows[a]}
-        sb = {keys[i] for i in split_rows[b]}
+        sa = split_key_sets[a]
+        sb = split_key_sets[b]
         shared = len(sa & sb)
         cross[f'{a}__{b}'] = shared
         hard_leak = hard_leak or shared > 0

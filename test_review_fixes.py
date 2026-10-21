@@ -5834,6 +5834,11 @@ def t_data_quality_report_index_disjointness():
     rep = L.data_quality_report(X, train_idx=[0, 1], val_idx=[1], test_idx=[2])
     assert rep['status'] == 'fail', rep
     assert rep['checks']['split_index_overlap']['train__val'] == 1, rep
+    # A repeated index inside one split is counted, and the shared key set used
+    # for the cross-split check does not change the within-split count.
+    rep_dup = L.data_quality_report(X, train_idx=[0, 0, 1], val_idx=[2],
+                                    test_idx=[3])
+    assert rep_dup['checks']['duplicate_rows_within_split']['train'] == 1, rep_dup
     try:
         L.data_quality_report(X, train_idx=[], val_idx=[1])
     except ValueError as e:
