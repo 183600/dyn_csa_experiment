@@ -10325,6 +10325,20 @@ def t_cached_validation_row_groups_merge_shared_documents():
     _s, _e, _m = L.validation_row_split(4, groups=_groups)
     assert _m['groups_aware'] is True, _m
     assert not ({_groups[i] for i in _s} & {_groups[i] for i in _e}), (_s, _e)
+    # A group-aware simple-baseline artifact must pass its own audit.  The
+    # audit cannot re-derive these folds from (n_rows, seed, folds) alone: a
+    # row-only replay gives different boundaries, so treating that replay as
+    # the expected split rejected every valid group-aware floor.
+    _rng = np.random.default_rng(7)
+    _proto = dict(L.SIMPLE_BASELINE_POLICY,
+                  arms={'unigram': {'order': 1}},
+                  grids={'unigram': {'alpha': [0.1, 1.0, 2.0]}})
+    _art = L.simple_baseline_fit(_rng.integers(0, _vb, size=200),
+                                 _rng.integers(0, _vb, size=(4, 5)), _vb,
+                                 protocol=_proto, selection_rows=_s,
+                                 evaluation_rows=_e, row_split=_m)
+    _aud = L.simple_baseline_audit(_art, protocol=_proto)
+    assert _aud['baseline_verified'] is True, _aud
     # A missing sidecar is an explicit fallback, not a silent claim.
     _g, _m = L.cached_validation_row_groups(
         _sl, _ntr, vocab_size=_vb, val_seqs=_vs, n_rows=4, cache_dir=tempfile.mkdtemp())

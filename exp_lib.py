@@ -13867,21 +13867,93 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         if row_split.get('disjoint') is False:
             problems.append('nested simple-baseline selection and evaluation folds overlap')
         _fold_keys = ('n_rows', 'seed', 'n_folds', 'selection_fold', 'evaluation_fold')
+        _meta_keys = ('n_selection_rows', 'n_evaluation_rows',
+                      'selection_row_range', 'evaluation_row_range',
+                      'selection_row_fp', 'evaluation_row_fp',
+                      'chronological', 'selection_precedes_evaluation',
+                      'disjoint')
         if all(row_split.get(k) is not None for k in _fold_keys):
-            try:
-                _re_sel, _re_eval, _re_meta = validation_row_split(
-                    row_split.get('n_rows'), seed=row_split.get('seed'),
-                    n_folds=row_split.get('n_folds'),
-                    selection_fold=row_split.get('selection_fold'),
-                    evaluation_fold=row_split.get('evaluation_fold'))
-            except (TypeError, ValueError, OverflowError) as _rfe:
-                problems.append(f'nested simple-baseline row split cannot be reproduced: {_rfe}')
-            else:
-                _mismatch = [k for k in ('n_selection_rows', 'n_evaluation_rows',
-                                         'selection_row_range', 'evaluation_row_range',
-                                         'selection_row_fp', 'evaluation_row_fp',
-                                         'chronological', 'selection_precedes_evaluation',
-                                         'disjoint')
+            _re_meta = None
+            _groups_rec = row_split.get('groups')
+            if row_split.get('groups_aware') is True:
+                # A document-group-aware split cannot be recomputed from
+                # (n_rows, seed, folds) alone: the cached document ids pick
+                # the legal boundaries.  Recompute exactly when the group
+                # vector was persisted; otherwise verify the recorded layout
+                # is internally consistent instead of pretending the row-only
+                # split describes it (that made every group-aware artifact
+                # fail its own audit).
+                _nrows_i = _as_seed_int(row_split.get('n_rows'))
+                if (isinstance(_groups_rec, (list, tuple))
+                        and _nrows_i is not None
+                        and len(_groups_rec) == _nrows_i):
+                    try:
+                        _re_sel, _re_eval, _re_meta = validation_row_split(
+                            _nrows_i, seed=row_split.get('seed'),
+                            n_folds=row_split.get('n_folds'),
+                            selection_fold=row_split.get('selection_fold'),
+                            evaluation_fold=row_split.get('evaluation_fold'),
+                            groups=_groups_rec)
+                    except (TypeError, ValueError, OverflowError) as _rfe:
+                        problems.append(f'nested simple-baseline row split cannot be reproduced: {_rfe}')
+                else:
+                    _n_folds_i = _as_seed_int(row_split.get('n_folds'))
+                    _sel_fold_i = _as_seed_int(row_split.get('selection_fold'))
+                    _ev_fold_i = _as_seed_int(row_split.get('evaluation_fold'))
+                    _fr = row_split.get('fold_ranges')
+                    _fr_ok = (isinstance(_fr, list) and _n_folds_i is not None
+                              and len(_fr) == _n_folds_i)
+                    if _fr_ok:
+                        for _r in _fr:
+                            if (not isinstance(_r, (list, tuple)) or len(_r) != 2
+                                    or _as_seed_int(_r[0]) is None
+                                    or _as_seed_int(_r[1]) is None):
+                                _fr_ok = False
+                                break
+                    if not _fr_ok:
+                        problems.append('group-aware simple-baseline row_split lacks usable '
+                                        'fold_ranges; the declared folds cannot be verified')
+                    elif _nrows_i is None or _nrows_i < 2:
+                        problems.append('group-aware simple-baseline row_split has an invalid n_rows')
+                    elif (_sel_fold_i is None or _ev_fold_i is None
+                          or not (0 <= _sel_fold_i < _n_folds_i)
+                          or not (0 <= _ev_fold_i < _n_folds_i)
+                          or _sel_fold_i >= _ev_fold_i):
+                        problems.append('group-aware simple-baseline row_split has invalid '
+                                        'fold indices (selection must precede evaluation)')
+                    else:
+                        _ranges = [(int(a), int(b)) for a, b in _fr]
+                        _ranges_ok = (_ranges[0][0] == 0
+                                      and _ranges[-1][1] == _nrows_i - 1
+                                      and all(_ranges[i][1] + 1 == _ranges[i + 1][0]
+                                              for i in range(len(_ranges) - 1))
+                                      and all(a <= b for a, b in _ranges))
+                        if not _ranges_ok:
+                            problems.append('group-aware simple-baseline fold_ranges do not '
+                                            'partition [0, n_rows) in order')
+                        else:
+                            _sel_r, _ev_r = _ranges[_sel_fold_i], _ranges[_ev_fold_i]
+                            _sel_idx = np.arange(_sel_r[0], _sel_r[1] + 1)
+                            _ev_idx = np.arange(_ev_r[0], _ev_r[1] + 1)
+                            _want = {
+                                'n_selection_rows': int(_sel_idx.size),
+                                'n_evaluation_rows': int(_ev_idx.size),
+                                'selection_row_range': [int(_sel_r[0]), int(_sel_r[1])],
+                                'evaluation_row_range': [int(_ev_r[0]), int(_ev_r[1])],
+                                'selection_row_fp': _ids_fp(_sel_idx),
+                                'evaluation_row_fp': _ids_fp(_ev_idx),
+                                'chronological': True,
+                                'selection_precedes_evaluation': True,
+                                'disjoint': True,
+                            }
+                            _mismatch = [k for k in _meta_keys
+                                         if k in row_split and row_split.get(k) != _want[k]]
+                            if _mismatch:
+                                problems.append('group-aware simple-baseline row_split metadata is '
+                                                'internally inconsistent (mismatch: '
+                                                f'{sorted(_mismatch)})')
+            if _re_meta is not None:
+                _mismatch = [k for k in _meta_keys
                              if k in row_split and row_split.get(k) != _re_meta.get(k)]
                 if _mismatch:
                     problems.append('nested simple-baseline row_split metadata does not match the '
