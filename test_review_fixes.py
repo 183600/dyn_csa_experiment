@@ -3591,6 +3591,18 @@ def t_multiclass_ranking_metrics_and_audit():
     _logits = L.classification_metrics(y, y_score=np.ones((len(y), 3)), labels=[0, 1, 2])
     assert _logits['calibration']['status'] == 'unavailable'
     assert 'brier_score' not in _logits
+    # The threshold-free metric list is a capability declaration: an
+    # unavailable calibration endpoint must not be advertised as measured.
+    assert 'brier_score' not in _logits['threshold_free_metrics']
+    assert 'ece' not in _logits['threshold_free_metrics']
+    _bin_logits = L.classification_metrics([0, 0, 1, 1], y_score=[-2.0, -1.0, 1.0, 2.0],
+                                           labels=[0, 1])
+    assert _bin_logits['calibration']['status'] == 'unavailable'
+    assert _bin_logits['threshold_free_metrics'] == ['roc_auc', 'pr_auc']
+    _bin_prob = L.classification_metrics([0, 0, 1, 1], y_score=[0.1, 0.2, 0.8, 0.9],
+                                         labels=[0, 1])
+    assert _bin_prob['threshold_free_metrics'] == ['roc_auc', 'pr_auc',
+                                                   'brier_score', 'ece']
     # A binary record gets the same floor; the majority predictor has zero
     # minority recall, so balanced accuracy is not fooled by its high accuracy.
     _bin_floor = L.classification_metrics([0] * 99 + [1], y_pred=[0] * 100, labels=[0, 1])

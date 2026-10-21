@@ -14525,7 +14525,11 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         out['decision_threshold_source'] = _threshold_source
         out['threshold_dependent_metrics'] = ['accuracy', 'balanced_accuracy', 'precision_macro',
                                               'recall_macro', 'f1_positive', 'f1_primary']
-        out['threshold_free_metrics'] = ['roc_auc', 'pr_auc', 'brier_score', 'ece']
+        # Calibration is only threshold-free when the score really is a
+        # probability.  Logits/scores outside [0, 1] leave it unavailable, so
+        # do not advertise Brier/ECE in the metric list as if they had been
+        # measured.
+        out['threshold_free_metrics'] = ['roc_auc', 'pr_auc']
     if y_score is not None and labels.size == 2:
         y_bin = (y_true == pos).astype(np.int64)
         # A 2-D score matrix is column-per-label: the binary endpoint uses the
@@ -14551,6 +14555,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         if out['calibration'].get('status') == 'ok':
             out['brier_score'] = out['calibration']['brier_score']
             out['ece'] = out['calibration']['ece']
+            out['threshold_free_metrics'].extend(['brier_score', 'ece'])
         out['score_orientation_warning'] = None
         if (out['roc_auc'] is not None and out['roc_auc'] < 0.5
                 and int(y_bin.sum()) >= 2 and int((1 - y_bin).sum()) >= 2):
@@ -14579,13 +14584,13 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             out.update(_rank)
             out['threshold_free_metrics'] = [
                 'roc_auc_macro', 'roc_auc_micro', 'roc_auc_weighted',
-                'pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted',
-                'brier_score', 'ece']
+                'pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted']
             out['ranking_averaging'] = 'one-vs-rest'
             out['calibration'] = _multiclass_calibration(y_true, _score, labels)
             if out['calibration'].get('status') == 'ok':
                 out['brier_score'] = out['calibration']['brier_score']
                 out['ece'] = out['calibration']['ece']
+                out['threshold_free_metrics'].extend(['brier_score', 'ece'])
         else:
             out['ranking_unavailable_reason'] = (
                 'multiclass ranking needs a column-per-label score matrix; '
