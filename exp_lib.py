@@ -16006,7 +16006,10 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             for _arm, _entry in arms.items():
                 if not isinstance(_entry, dict):
                     continue
-                for _t in (_entry.get('trials') or []):
+                _entry_trials = _entry.get('trials')
+                if not isinstance(_entry_trials, (list, tuple)):
+                    _entry_trials = []
+                for _t in _entry_trials:
                     # The flag must be the boolean True, not a truthy string or
                     # number: only an actual applied split attests the nested
                     # protocol.
@@ -16031,7 +16034,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             _why = _split_info.get('reason') or 'the artifact did not apply the row split'
             warnings.append('the tuning protocol declares nested validation rows, but the artifact '
                             f'reports applied=False ({_why}); the final estimate may be selection-biased')
-    declared = {json.dumps(t, sort_keys=True, default=str) for t in (protocol.get('trials') or [])}
+    _declared_trials = protocol.get('trials')
+    if _declared_trials is not None and not isinstance(_declared_trials, (list, tuple)):
+        problems.append(f'the tuning protocol trials field is not a list ({_declared_trials!r})')
+        _declared_trials = []
+    declared = {json.dumps(t, sort_keys=True, default=str)
+                for t in (_declared_trials or [])}
     signatures = {}
     n_trials = {}
     budgets = {}
@@ -16394,7 +16402,9 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 # The per-arm loop above already recorded the malformed arm;
                 # it has no selected config to line up with final records.
                 continue
-            chosen = entry.get('selected') or entry.get('selected_config') or {}
+            chosen = entry.get('selected') or entry.get('selected_config')
+            if not isinstance(chosen, dict):
+                chosen = {}
             hits = [(k, r) for k, r in final_records.items()
                     if k.startswith(f'{arm}::') and isinstance(r, dict)]
             if not hits:
@@ -16490,14 +16500,23 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             warnings.append(f'{final_min_seed_count} final seeds per arm cannot reach a Holm-corrected p<0.05 for {max(1, len(arms) - 1)} tuned contrast(s) (needs n>={_final_family_floor}); the tuned contrast is resolution-limited, not a null')
     # Coverage: an arm is covered either by its own tuned record or by the arm
     # whose recipe it inherits (budget-matched intervention controls).
-    _inherits = protocol.get('inherits_tuning') or {}
+    _inherits = protocol.get('inherits_tuning')
+    if _inherits is not None and not isinstance(_inherits, dict):
+        problems.append(f'the tuning protocol inherits_tuning field is not an object ({_inherits!r})')
+        _inherits = {}
+    _inherits = _inherits or {}
+    _declared_arms = protocol.get('arms')
+    if _declared_arms is not None and not isinstance(_declared_arms, (list, tuple, set)):
+        problems.append(f'the tuning protocol arms field is not a list ({_declared_arms!r})')
+        _declared_arms = []
+    _declared_arm_names = list(_declared_arms or [])
     coverage = {a: a for a in arms}
     for _arm, _ref in _inherits.items():
         if _ref in arms:
             coverage[str(_arm)] = str(_ref)
-        elif _arm in (protocol.get('arms') or []) or _arm in _inherits:
+        elif _arm in _declared_arm_names or _arm in _inherits:
             warnings.append(f'{_arm}: inherits tuning from {_ref!r}, but no tuned record exists for {_ref!r}')
-    required = set(protocol.get('arms') or [])
+    required = set(_declared_arm_names)
     uncovered = sorted(a for a in required if a not in coverage)
     if uncovered:
         problems.append(f'missing tuning evidence for arms {uncovered}')
@@ -16536,7 +16555,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     _grid_levels = {}
     for _kn in ('lr', 'weight_decay', 'warmup'):
         _vals = []
-        for _t in (protocol.get('trials') or []):
+        for _t in (_declared_trials or []):
             if not isinstance(_t, dict):
                 continue
             _f = _finite_scalar(_t.get(_kn))
@@ -16564,10 +16583,16 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             # not only the declared grid: a capped run that stopped at the
             # first two trials has a boundary even if more levels were declared.
             _searched = []
-            for _t in (entry.get('trials') or []):
+            _entry_trials = entry.get('trials')
+            if not isinstance(_entry_trials, (list, tuple)):
+                _entry_trials = []
+            for _t in _entry_trials:
                 if not isinstance(_t, dict):
                     continue
-                _f = _finite_scalar((_t.get('config') or {}).get(_kn))
+                _cfg_t = _t.get('config')
+                if not isinstance(_cfg_t, dict):
+                    _cfg_t = {}
+                _f = _finite_scalar(_cfg_t.get(_kn))
                 if _f is not None and _f not in _searched:
                     _searched.append(_f)
             _searched.sort()
@@ -16612,11 +16637,16 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         # joint optimum.  Record the searched Cartesian coverage (overall and
         # per knob pair) instead of silently treating the OFAT winner as fully
         # tuned.
-        _arm_trials = [t for t in (entry.get('trials') or []) if isinstance(t, dict)]
+        _entry_trials = entry.get('trials')
+        if not isinstance(_entry_trials, (list, tuple)):
+            _entry_trials = []
+        _arm_trials = [t for t in _entry_trials if isinstance(t, dict)]
         _knobs = sorted(_searched_by_knob)
         _combos = set()
         for _t in _arm_trials:
-            _cfg = _t.get('config') or {}
+            _cfg = _t.get('config')
+            if not isinstance(_cfg, dict):
+                _cfg = {}
             _vals = tuple(_finite_scalar(_cfg.get(_kn)) for _kn in _knobs)
             if all(v is not None for v in _vals):
                 _combos.add(_vals)

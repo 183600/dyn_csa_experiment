@@ -7258,6 +7258,25 @@ def t_baseline_audit_malformed_seed_keys():
     art['selection_metric'] = {'not': 'a metric'}
     out = L.baseline_tuning_audit(art)
     assert out['status'] == 'fail' and any('not a metric name' in p for p in out['problems']), out
+    # Scalar protocol/arm trial fields and non-object selected configs are
+    # malformed evidence: report them instead of raising TypeError.
+    _base = json.loads(json.dumps(art))
+    _base['selection_metric'] = 'ppl'
+    _base['protocol']['selection_metric'] = 'ppl'
+    _mutations = [
+        lambda a: a['protocol'].__setitem__('trials', 1.5),
+        lambda a: a['protocol'].__setitem__('arms', 1.5),
+        lambda a: a['protocol'].__setitem__('inherits_tuning', ['not-a-map']),
+        lambda a: a['arms']['a'].__setitem__('trials', True),
+        lambda a: a['arms']['a'].__setitem__('selected', 1.5),
+        lambda a: a['arms']['a']['trials'].__setitem__(
+            0, {'config': ['not-a-map'], 'ppl': 1.0}),
+    ]
+    for _mut in _mutations:
+        _bad = json.loads(json.dumps(_base))
+        _mut(_bad)
+        _out = L.baseline_tuning_audit(_bad)
+        assert _out['status'] == 'fail', (_out,)
 
 
 def t_simple_baseline_audit_malformed_records():
