@@ -13508,13 +13508,23 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None,
             }
         else:
             row_split = dict(row_split)
-            _rn = _exact_count(row_split.get('n_rows'), minimum=1)
-            if _rn is not None and _rn != _n_rows:
-                raise ValueError('row_split n_rows does not match the evaluation tensor')
+            # A PRESENT but malformed count/range is not an absent legacy
+            # field: ignoring it and then setdefault-ing a valid value would
+            # bless contradictory split evidence.
+            if 'n_rows' in row_split:
+                _rn = _exact_count(row_split.get('n_rows'), minimum=1)
+                if _rn is None:
+                    raise ValueError('row_split n_rows is not a positive integer')
+                if _rn != _n_rows:
+                    raise ValueError('row_split n_rows does not match the evaluation tensor')
             for _key, _want in (('n_selection_rows', int(_sel_idx.size)),
                                 ('n_evaluation_rows', int(_eval_idx.size))):
+                if _key not in row_split:
+                    continue
                 _got = _exact_count(row_split.get(_key), minimum=1)
-                if _got is not None and _got != _want:
+                if _got is None:
+                    raise ValueError(f'row_split {_key} is not a positive integer')
+                if _got != _want:
                     raise ValueError(f'row_split {_key} does not match the supplied rows')
             _want_sel = row_split.get('selection_row_fp')
             _want_eval = row_split.get('evaluation_row_fp')
@@ -13522,14 +13532,19 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None,
                 raise ValueError('row_split selection_row_fp does not describe the supplied selection rows')
             if _want_eval is not None and _want_eval != _ids_fp(_eval_idx):
                 raise ValueError('row_split evaluation_row_fp does not describe the supplied evaluation rows')
-            if len(row_split.get('selection_row_range') or []) == 2:
-                _sr = row_split['selection_row_range']
-                if [int(_sel_idx.min()), int(_sel_idx.max())] != [int(_sr[0]), int(_sr[1])]:
-                    raise ValueError('row_split selection_row_range does not describe the supplied selection rows')
-            if len(row_split.get('evaluation_row_range') or []) == 2:
-                _er = row_split['evaluation_row_range']
-                if [int(_eval_idx.min()), int(_eval_idx.max())] != [int(_er[0]), int(_er[1])]:
-                    raise ValueError('row_split evaluation_row_range does not describe the supplied evaluation rows')
+            for _key, _want_range in (
+                    ('selection_row_range', [int(_sel_idx.min()), int(_sel_idx.max())]),
+                    ('evaluation_row_range', [int(_eval_idx.min()), int(_eval_idx.max())])):
+                if _key not in row_split:
+                    continue
+                _rr = row_split.get(_key)
+                if (not isinstance(_rr, (list, tuple)) or len(_rr) != 2):
+                    raise ValueError(f'row_split {_key} must be a two-element range')
+                _vals = [_exact_count(v, minimum=0) for v in _rr]
+                if any(v is None for v in _vals):
+                    raise ValueError(f'row_split {_key} must contain exact row indices')
+                if [int(_vals[0]), int(_vals[1])] != _want_range:
+                    raise ValueError(f'row_split {_key} does not describe the supplied rows')
             row_split.setdefault('policy', 'chronological_contiguous_row_folds')
             row_split.setdefault('n_rows', _n_rows)
             row_split.setdefault('n_selection_rows', int(_sel_idx.size))

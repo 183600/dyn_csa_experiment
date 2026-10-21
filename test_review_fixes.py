@@ -13411,6 +13411,24 @@ def t_simple_baseline_bound_floor_identity_and_rows():
                                    selection_rows=sel, evaluation_rows=ev,
                                    row_split=meta)
     assert L.simple_baseline_audit(nested, protocol=proto)['baseline_verified'] is True
+    # Present-but-malformed row-split evidence must fail closed, not be
+    # ignored and replaced by a setdefault value.
+    for _field, _bad in (('n_rows', 0), ('n_rows', 1.5),
+                         ('n_selection_rows', 0),
+                         ('n_evaluation_rows', float('nan')),
+                         ('selection_row_range', [0]),
+                         ('selection_row_range', [-1, 1]),
+                         ('evaluation_row_range', 'bad')):
+        _m = json.loads(json.dumps(meta))
+        _m[_field] = _bad
+        try:
+            L.simple_baseline_fit(train, val8, vocab, protocol=proto,
+                                  selection_rows=sel, evaluation_rows=ev,
+                                  row_split=_m)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'simple_baseline_fit accepted row_split {_field}={_bad!r}')
     wrong_rows = json.loads(json.dumps(nested))
     wrong_rows['baselines'][_arm]['reported_estimation_rows'] = 'full_validation'
     rr = L.simple_baseline_audit(wrong_rows, protocol=proto)
