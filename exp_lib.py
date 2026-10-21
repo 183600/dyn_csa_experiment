@@ -25297,10 +25297,24 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             print(f'    ({len(stale_dropped) - len(_still)} of them succeeded and carry a fresh record.)')
     _measured = {k for k in _planned_keys if isinstance(summary.get(k), dict) and ppl_is_usable((summary.get(k) or {}).get('ppl')) and not (summary.get(k) or {}).get('synthesized')}
     _missing = [k for k in _planned_keys if k not in _measured]
+    _trace_bad = []
+    for _k in _measured:
+        _rec = summary.get(_k) or {}
+        if _rec.get('run_cfg') not in (None, fp):
+            _trace_bad.append(_k)
+            continue
+        for _ref_key in ('curve_ref', 'ppl_history_ref'):
+            _ref = _rec.get(_ref_key)
+            if _ref and '#' not in str(_ref) and not os.path.exists(os.path.join(outdir, str(_ref))):
+                _trace_bad.append(_k)
+                break
+    if _trace_bad:
+        print(f'\n[trace] {len(_trace_bad)} measured cell(s) reference a missing curve artifact or a foreign run_cfg: {_trace_bad[:10]} — the panel is marked incomplete.')
     # A finished process is not a finished panel.  Stamping a run with missing
-    # measurements as `complete` is exactly how a partially traced experiment
-    # gets quoted as if every planned cell existed.
-    _final_status = 'complete' if not _missing else 'incomplete'
+    # measurements (or a broken trace reference) as `complete` is exactly how
+    # a partially traced experiment gets quoted as if every planned cell
+    # existed.
+    _final_status = 'complete' if (not _missing and not _trace_bad) else 'incomplete'
     write_run_manifest(outdir, cfg, fp, prov, summary, sanity=_sanity_doc, reproducibility=_repro_doc, data_contract=_data_contract, seed_contract=_seed_contract, status=_final_status, planned_cells=_planned_keys, started_at=_panel_started)
     _agg = _finish_panel(outdir, summary)
     log_experiment_event(outdir, {
@@ -25311,6 +25325,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         'n_cells_planned': len(_planned_keys), 'n_cells_to_run': len(cells),
         'n_cells_measured': len(_measured),
         'n_cells_missing': len(_missing), 'missing_cells': _missing[:20],
+        'n_trace_bad': len(_trace_bad), 'trace_bad_cells': _trace_bad[:20],
         'n_truncated': len(dropped_truncations), 'n_stale_dropped': len(stale_dropped),
         'aggregate_ref': 'aggregate.json', 'summary_ref': 'summary.json',
         'aggregate': {str(v): {kk: e.get(kk) for kk in ('n', 'n_seeds', 'ppl_mean', 'ppl_std', 'params') if kk in e} for v, e in (_agg or {}).items() if isinstance(e, dict)},
