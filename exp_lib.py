@@ -21372,7 +21372,7 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
     ids = torch.as_tensor(ids)
     if ids.ndim == 1:
         ids = ids[None, :]
-    if ids.ndim != 2 or int(ids.shape[1]) < 1:
+    if ids.ndim != 2 or int(ids.shape[0]) < 1 or int(ids.shape[1]) < 1:
         raise ValueError(
             f'measure_efficiency needs a non-empty 1-D/2-D token table, got '
             f'shape {tuple(ids.shape)}')
@@ -21445,7 +21445,7 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
     arr = torch.as_tensor(ids)
     if arr.ndim == 1:
         arr = arr[None, :]
-    if arr.ndim != 2 or int(arr.shape[1]) < 1:
+    if arr.ndim != 2 or int(arr.shape[0]) < 1 or int(arr.shape[1]) < 1:
         raise ValueError(
             f'measure_efficiency_sweep needs a non-empty 1-D/2-D token table, '
             f'got shape {tuple(arr.shape)}')

@@ -7562,6 +7562,7 @@ def t_efficiency_pairs_audit_and_sweep():
         else:
             raise AssertionError(f'measure_efficiency accepted {_kw!r}')
     for _bad_ids in (torch.empty((1, 0), dtype=torch.long),
+                     torch.empty((0, 8), dtype=torch.long),
                      torch.empty((1, 1, 1), dtype=torch.long)):
         try:
             L.measure_efficiency(model, _bad_ids, torch.device('cpu'))
@@ -7569,6 +7570,14 @@ def t_efficiency_pairs_audit_and_sweep():
             pass
         else:
             raise AssertionError(f'measure_efficiency accepted ids shape {tuple(_bad_ids.shape)}')
+        try:
+            L.measure_efficiency_sweep(model, _bad_ids, torch.device('cpu'),
+                                       lengths=(1,), batches=(1,),
+                                       warmup=0, iters=1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'measure_efficiency_sweep accepted ids shape {tuple(_bad_ids.shape)}')
 
 
 def t_efficiency_pareto_is_grouped():
