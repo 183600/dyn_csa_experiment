@@ -13785,7 +13785,7 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
            'grid_adequacy_by_arm': _grid_adequacy_by_arm,
            'grid_boundary_hits': sorted(_grid_boundary_hits),
            'grid_adequacy': ('incomplete' if any(
-               (v or {}).get('complete') is None for v in _grid_coverage.values())
+               not (v or {}).get('complete') for v in _grid_coverage.values())
                else ('warn' if _grid_boundary_hits or _selection_tie_arms else 'ok')),
            'selection_margins': _selection_margins,
            'selection_tie_arms': sorted(_selection_tie_arms),
@@ -18177,6 +18177,32 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         report['warnings'].append('simple baseline: ' + str(_sb_w))
     if _scoped_baselines:
         _sb = report['simple_baseline']
+        # A verified artifact is not necessarily an ADEQUATELY tuned floor:
+        # the selected smoothing can sit on the edge of the tested grid, or be
+        # tied with the runner-up.  In that case "the panel beats the tuned
+        # floor" overstates the evidence, so say so next to the gate even
+        # though the arithmetic contrast remains valid.
+        _sb_claim_reasons = []
+        if _sb.get('grid_adequacy') not in (None, 'ok'):
+            _sb_claim_reasons.append(
+                'count-model grid adequacy=%r' % (_sb.get('grid_adequacy'),))
+        if _sb.get('grid_boundary_hits'):
+            _sb_claim_reasons.append(
+                'selected smoothing on a grid boundary (%s)'
+                % ', '.join(map(str, _sb.get('grid_boundary_hits') or [])))
+        if _sb.get('selection_tie_arms'):
+            _sb_claim_reasons.append(
+                'selected smoothing tied with the runner-up for %s'
+                % ', '.join(map(str, _sb.get('selection_tie_arms') or [])))
+        _sb['tuned_floor_claim_allowed'] = bool(
+            _sb.get('baseline_verified') and not _sb_claim_reasons)
+        _sb['tuned_floor_claim_reasons'] = _sb_claim_reasons
+        if _sb.get('baseline_verified') and _sb_claim_reasons:
+            report['warnings'].append(
+                'the count-model floor passed its structural audit but is not '
+                'adequately tuned (%s) — a beats-floor claim is against a weakly '
+                'tuned floor; extend the alpha grid and re-run before quoting it'
+                % '; '.join(_sb_claim_reasons))
         if not _sb.get('baseline_verified'):
             report['warnings'].append(
                 'no verified tuned count-model floor (%s) — run baseline_tune.py simple and place simple_baseline.json next to this panel; a neural model that has not been shown to beat the trivial floor should not be interpreted as evidence for the mechanism'
