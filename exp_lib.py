@@ -8507,10 +8507,19 @@ def locked_json_read(path):
             return {}
         try:
             with open(path, encoding='utf-8') as f:
-                return json.load(f)
+                obj = json.load(f)
         except Exception as _e:
             print(f'[resume] FATAL: {path} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to start with a silently RESET panel — move it aside to start fresh.')
             raise
+        if not isinstance(obj, dict):
+            # Every caller indexes the result by cell key.  Returning a parsed
+            # list/scalar here made the first .get() crash (or, worse, be
+            # treated as an empty panel); fail with the same contract as the
+            # update path instead.
+            raise ValueError(
+                f'{path} parsed as a {type(obj).__name__}, not a JSON object; '
+                'refusing to resume from it')
+        return obj
     finally:
         if lock_f is not None:
             try:

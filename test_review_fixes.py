@@ -10429,12 +10429,14 @@ def t_locked_json_and_csv_generator():
         bad = os.path.join(root, 'bad.json')
         with open(bad, 'w', encoding='utf-8') as f:
             f.write('[1, 2]')
-        try:
-            L.locked_json_update(bad, lambda obj: obj)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('a non-object locked JSON file must be refused')
+        for _fn in (L.locked_json_read,
+                    lambda _p: L.locked_json_update(_p, lambda obj: obj)):
+            try:
+                _fn(bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('a non-object locked JSON file must be refused')
         with open(bad, encoding='utf-8') as f:
             assert f.read().strip() == '[1, 2]'
         c = os.path.join(root, 'rows.csv')
