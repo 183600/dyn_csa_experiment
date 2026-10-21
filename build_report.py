@@ -1945,7 +1945,10 @@ def efficiency_pareto(points):
             continue
         lat = _as_finite(p[0])
         ppl = _as_finite(p[1])
-        if lat is None or ppl is None or lat < 0.0:
+        # A zero/negative latency is not a measured time (it makes every
+        # ratio meaningless and would occupy the frontier), and PPL must be
+        # strictly positive to be a valid model score.
+        if lat is None or ppl is None or lat <= 0.0 or ppl <= 0.0:
             continue
         pts.append((lat, ppl, p[2]))
     pts.sort(key=lambda t: (t[0], t[1], str(t[2])))
@@ -1976,13 +1979,15 @@ def efficiency_accuracy_summary(items):
             continue
         ppl = _as_finite(it.get('ppl'))
         lat = _as_finite(it.get('prefill_ms_p50'))
-        if ppl is None or lat is None or ppl <= 0.0 or lat < 0.0:
+        if ppl is None or lat is None or ppl <= 0.0 or lat <= 0.0:
             continue
+        _params = _as_finite(it.get('params'))
+        _mem = _as_finite(it.get('peak_mem_allocated_mb'))
         _tok = _as_finite(it.get('tokens_seen'))
         by_arm.setdefault(v, []).append({
             'ppl': ppl, 'lat': lat,
-            'params': _as_finite(it.get('params')),
-            'mem': _as_finite(it.get('peak_mem_allocated_mb')),
+            'params': (_params if (_params is not None and _params > 0.0) else None),
+            'mem': (_mem if (_mem is not None and _mem >= 0.0) else None),
             # A zero/negative token budget is not a trained arm; treat it as
             # missing so it cannot "match" another invalid record.
             'tok': (_tok if (_tok is not None and _tok > 0.0) else None)})

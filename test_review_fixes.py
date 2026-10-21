@@ -8939,6 +8939,10 @@ def t_efficiency_pareto_is_grouped():
                                (30.0, 95.0, 'c'), (5.0, 110.0, 'd')])
     assert [x[2] for x in fr] == ['d', 'a', 'b'], fr
     assert BR.efficiency_pareto([(float('nan'), 90.0, 'x'), (10.0, 100.0, 'a')]) == [(10.0, 100.0, 'a')]
+    # Zero time / non-positive PPL are not measurements and must not become a
+    # frontier point that dominates every real measurement.
+    assert BR.efficiency_pareto([(0.0, 50.0, 'z'), (-1.0, 40.0, 'n'),
+                                 (1.0, 0.0, 'p'), (10.0, 100.0, 'a')]) == [(10.0, 100.0, 'a')]
 
 
 def t_efficiency_accuracy_tradeoff_summary():
@@ -9007,6 +9011,16 @@ def t_efficiency_accuracy_tradeoff_summary():
         {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0, 'tokens_seen': 0}])
     assert all(r['budget_matched'] is False for r in zero_tok), zero_tok
     assert all('train_budget_unverifiable' in r['flags'] for r in zero_tok), zero_tok
+    # Invalid latency/parameter/memory readings are unverifiable, not numbers
+    # that can support a ratio.
+    invalid = BR.efficiency_accuracy_summary([
+        {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0},
+        {'variant': 'z', 'ppl': 40.0, 'prefill_ms_p50': 0.0},
+        {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0,
+         'params': 0, 'peak_mem_allocated_mb': -1.0}])
+    assert [r['variant'] for r in invalid] == ['a', 'b'], invalid
+    bb = [r for r in invalid if r['variant'] == 'b'][0]
+    assert bb['params_median'] is None and bb['peak_mem_max'] is None, bb
 
 
 def t_report_error_analysis_section():
