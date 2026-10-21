@@ -24656,6 +24656,34 @@ def classify_token_error(*, ce, entropy, margin, rare_target, target_id, topk_id
     return {'primary': primary, 'causes': causes, 'target_in_topk': in_topk}
 
 
+def _context_target_counts(vb, ctx_len):
+    """Map each observed prefix to the next-token counts seen in this split.
+
+    Used ONLY to flag that an apparently wrong target is not uniquely
+    determined by its prefix: the same prefix occurs with a different next
+    token elsewhere in the evaluated rows (label inconsistency or genuine
+    ambiguity).  It does not decide which label is correct.
+    """
+    n_rows, seq = int(vb.shape[0]), int(vb.shape[1])
+    span = seq - 1
+    if span < 1:
+        return {}, 0
+    ctx_len = max(1, min(int(ctx_len), span))
+    out = {}
+    for r in range(n_rows):
+        row = vb[r]
+        for pos in range(span):
+            start = max(0, pos + 1 - ctx_len)
+            key = row[start:pos + 1].tobytes()
+            tgt = int(row[pos + 1])
+            d = out.get(key)
+            if d is None:
+                out[key] = {tgt: 1}
+            else:
+                d[tgt] = d.get(tgt, 0) + 1
+    return out, ctx_len
+
+
 @torch.inference_mode()
 def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                    top_tokens=100, chunk=8, val_bnd=None, train_ids=None,
@@ -24707,6 +24735,12 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     if _ctx_tokens is None:
         raise ValueError(f'analyze_errors needs a non-negative integer context_tokens, got {context_tokens!r}')
     context_tokens = int(_ctx_tokens)
+    # Prefix -> next-token evidence for the bad-case review.  Only built when
+    # an inventory was requested, so a zero-budget call stays cheap.
+    _ctx_counts = None
+    _ctx_len_used = None
+    if top_tokens > 0:
+        _ctx_counts, _ctx_len_used = _context_target_counts(vb, min(16, max(1, span)))
     # "Rare target" is a claim about the TRAINING frequency.  An empty or
     # malformed training sample is not a frequency table of all-zero counts:
     # reading it that way would label every token `annotation_or_rare_target`
@@ -24934,6 +24968,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                            'ids': [int(x) for x in vb[row].tolist()]})
     worst_tokens = []
     cause_counts = collections.Counter()
+    n_ctx_ambiguous = 0
     for rec in sorted(tok_heap, key=lambda t: t[0], reverse=True)[:max(1, int(top_tokens))]:
         c, row, pos, tgt, pred, ent, margin, tids, rare = rec
         lo = max(0, pos - int(context_tokens))
@@ -24944,6 +24979,16 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                                        rare_target=rare, target_id=tgt,
                                        topk_ids=tids, vocab=V)
         cause_counts[_triage['primary']] += 1
+        _ctx_variants = None
+        _ctx_support = None
+        if _ctx_counts is not None:
+            _cs = max(0, pos + 1 - int(_ctx_len_used))
+            _cd = _ctx_counts.get(vb[row, _cs:pos + 1].tobytes())
+            if _cd:
+                _ctx_variants = len(_cd)
+                _ctx_support = int(sum(_cd.values()))
+        if _ctx_variants is not None and _ctx_variants > 1:
+            n_ctx_ambiguous += 1
         worst_tokens.append({
             'row': int(row), 'position': int(pos), 'ce': c, 'target_id': tgt,
             'pred_id': pred, 'entropy': ent, 'margin': margin,
@@ -24956,6 +25001,9 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             'target_in_topk': _triage['target_in_topk'],
             'cause_primary': _triage['primary'],
             'causes': _triage['causes'],
+            'same_context_target_variants': _ctx_variants,
+            'same_context_support': _ctx_support,
+            'same_context_ambiguous': (bool(_ctx_variants > 1) if _ctx_variants is not None else None),
             'is_boundary_token': (bool(bnd_np[row, pos + 1]) if (bnd_np is not None and bnd_np.shape == vb.shape) else None),
         })
     _all_sum_cpu = _all_sum.detach().cpu().tolist()
@@ -24993,6 +25041,16 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             },
             'entropy': {'max': (max(ent_vals) if ent_vals else None),
                         'mean': (sum(ent_vals) / len(ent_vals) if ent_vals else None)},
+            'context_ambiguity': {
+                'context_len': _ctx_len_used,
+                'n_worst_reviewed': len(worst_tokens),
+                'n_ambiguous_worst': int(n_ctx_ambiguous),
+                'n_contexts_with_multiple_targets': (sum(1 for _d in _ctx_counts.values() if len(_d) > 1)
+                                                     if _ctx_counts is not None else None),
+                'n_positions_with_ambiguous_context': (sum(sum(_d.values()) for _d in _ctx_counts.values() if len(_d) > 1)
+                                                       if _ctx_counts is not None else None),
+                'note': ('same prefix in the evaluated validation rows has more than one observed next token; '
+                         'this is label inconsistency or genuine ambiguity, not proof of an annotation error')},
             'tokenizer_available': tok is not None,
             'rare_target_basis': rare_basis,
             'rare_target_problem': freq_problem,

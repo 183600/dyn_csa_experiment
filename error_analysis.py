@@ -205,6 +205,14 @@ def main(argv=None):
                   '| cause | worst-token count | what to check |', '|---|---|---|']
         for c, n in sorted(_counts.items(), key=lambda kv: (-kv[1], kv[0])):
             lines.append(f'| {c} | {n} | {(_guide.get(c) or "").replace("|", "\\|")} |')
+    _ca = res.get('context_ambiguity') if isinstance(res.get('context_ambiguity'), dict) else {}
+    if _ca:
+        lines += ['', '**Prefix ambiguity (label inconsistency vs genuine ambiguity):**', '',
+                  f'- contexts with more than one observed next token: {_ca.get("n_contexts_with_multiple_targets")} '
+                  f'covering {_ca.get("n_positions_with_ambiguous_context")} scored position(s)',
+                  f'- reviewed worst tokens: {_ca.get("n_ambiguous_worst")} / {_ca.get("n_worst_reviewed")} '
+                  f'share their prefix with a different target',
+                  f'- {_ca.get("note")}']
     _all = res.get('cause_counts_all') if isinstance(res.get('cause_counts_all'), dict) else {}
     if _all:
         lines += ['', '**Whole-split cause tally (finite targets, heuristic):**', '',
@@ -214,13 +222,13 @@ def main(argv=None):
             lines.append(f'| {c} | {v.get("n")} | {(v.get("share") or 0) * 100:.1f}% | {v.get("mean_ce"):.3f} |')
     lines += ['', '## Worst tokens', '',
               '> Read the context before changing the model: a rare-but-correct target, a genuinely ambiguous continuation and a confident blind spot need different fixes.', '',
-              '| # | row | pos | CE | context (truncated) | target | predicted | entropy | rare | cause | boundary |', '|---|---|---|---|---|---|---|---|---|---|---|']
+              '| # | row | pos | CE | context (truncated) | target | predicted | entropy | rare | ctx variants | cause | boundary |', '|---|---|---|---|---|---|---|---|---|---|---|---|']
     _tokens = res.get('worst_tokens') if isinstance(res.get('worst_tokens'), list) else []
     for i, t in enumerate(_tokens):
         tgt = (t.get('target_text') or '').replace('|', '\\|').replace('\n', '\\n')[:80]
         prd = (t.get('pred_text') or '').replace('|', '\\|').replace('\n', '\\n')[:80]
         ctx = (t.get('context_text') or '').replace('|', '\\|').replace('\n', '\\n')[:180]
-        lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | {t["ce"]:.3f} | {ctx} | `{t.get("target_id")}` {tgt} | `{t.get("pred_id")}` {prd} | {t["entropy"]:.3f} | {t.get("rare_target")} | {t.get("cause_primary")} | {t.get("is_boundary_token")} |')
+        lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | {t["ce"]:.3f} | {ctx} | `{t.get("target_id")}` {tgt} | `{t.get("pred_id")}` {prd} | {t["entropy"]:.3f} | {t.get("rare_target")} | {t.get("same_context_target_variants")} | {t.get("cause_primary")} | {t.get("is_boundary_token")} |')
     lines += ['', '## Worst sequences', '',
               '| # | row | mean CE | NLL | context (truncated) |', '|---|---|---|---|---|']
     for i, s in enumerate(res.get('worst_sequences') or []):

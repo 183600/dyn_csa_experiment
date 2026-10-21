@@ -2190,6 +2190,11 @@ def _render_error_analysis(d):
                 continue
             lines.append('| %s | %s | %s | %s |' % (k, fm(v.get('n'), 0), fm(v.get('mean_ce'), 3), fm(v.get('perplexity'), 2)))
         lines.append('')
+    _ca = d.get('context_ambiguity') if isinstance(d.get('context_ambiguity'), dict) else {}
+    if _ca:
+        lines += [f'- prefix ambiguity: {_ca.get("n_ambiguous_worst")} / {_ca.get("n_worst_reviewed")} '
+                  f'reviewed worst tokens share their prefix with a different target '
+                  f'({_ca.get("n_contexts_with_multiple_targets")} ambiguous contexts in the evaluated rows)', '']
     counts = d.get('cause_counts') if isinstance(d.get('cause_counts'), dict) else {}
     _guide_raw = d.get('cause_guide')
     guide = _guide_raw if isinstance(_guide_raw, dict) else {}

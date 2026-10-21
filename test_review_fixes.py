@@ -809,6 +809,47 @@ def t_error_analysis_zero_and_invalid_budgets():
         raise AssertionError('compare_token_errors must refuse chunk=0')
 
 
+def t_error_analysis_flags_prefix_ambiguity():
+    # A high-CE token whose exact prefix occurs with a different next token
+    # elsewhere is not uniquely labelled: the review must see that, rather
+    # than being told only "ambiguous distribution".
+    vocab = 8
+
+    class _Stub:
+        training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = bool(mode)
+            return self
+
+        def trunk(self, ids):
+            return torch.zeros((ids.shape[0], ids.shape[1], 2))
+
+        def head(self, h):
+            return torch.zeros((h.shape[0], h.shape[1], vocab))
+
+    vb = np.array([[1, 2, 3, 4, 5], [1, 2, 3, 4, 6]], dtype=np.int64)
+    r = L.analyze_errors(_Stub(), vb, vocab, torch.device('cpu'),
+                         top_n=2, top_tokens=8)
+    ca = r['context_ambiguity']
+    assert ca['n_contexts_with_multiple_targets'] == 1, ca
+    assert ca['n_positions_with_ambiguous_context'] == 2, ca
+    assert ca['n_ambiguous_worst'] >= 2, ca
+    hit = [t for t in r['worst_tokens'] if t['same_context_ambiguous']]
+    assert hit, r['worst_tokens']
+    for t in hit:
+        assert t['same_context_target_variants'] == 2, t
+        assert t['same_context_support'] == 2, t
+    r0 = L.analyze_errors(_Stub(), vb, vocab, torch.device('cpu'),
+                          top_n=0, top_tokens=0)
+    assert r0['context_ambiguity']['n_worst_reviewed'] == 0, r0
+    assert r0['context_ambiguity']['context_len'] is None, r0
+
+
 def t_loss_curve_downsample_keeps_spikes_and_nan():
     # Long runs are downsampled before the curve is written.  A one-step
     # explosion/NaN must survive that reduction, or a diverged run looks clean.
@@ -14120,6 +14161,7 @@ def main():
     _check('L27b rare-target triage needs a measured frequency basis', t_error_analysis_rare_basis_is_measured)
     _check('L27c error-analysis budgets are explicit, not clamped', t_error_analysis_zero_and_invalid_budgets)
     _check('L27d paired error analysis requires one vocabulary', t_error_analysis_paired_vocab_guard)
+    _check('L27e bad cases expose prefix/label ambiguity', t_error_analysis_flags_prefix_ambiguity)
     _check('L28 gapfill numeric reader rejects booleans', t_gapfill_numeric_reader_rejects_booleans)
     _check('L28b gapfill announces the family-corrected seed plan', t_gapfill_announces_family_seed_plan)
     _check('L29 release tags cannot escape the archive directory', t_release_tag_cannot_escape_output_dir)
