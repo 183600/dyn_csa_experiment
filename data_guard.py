@@ -1732,12 +1732,15 @@ class LeakageSafeTargetEncoder:
     * :meth:`transform` uses the **full** training-level table and is intended
       for validation/test rows only.  Holdout labels are never read.
     * :meth:`fit_transform` returns **out-of-fold** encodings for the training
-      rows.  A row is encoded from rows in other folds only.  When ``groups``
-      is supplied, whole groups share a fold, so a document/user cannot leak
-      its label into another row of the same group.  When ``time`` is supplied,
-      folds are contiguous chronological blocks and encoding is expanding:
-      a row is encoded only from strictly earlier blocks (the first block uses
-      an uninformative prior of 0 because no past label exists).
+      rows.  A row is encoded from rows in other folds only.  Exact duplicate
+      feature rows share one fold (they are one observation, or one ambiguous
+      annotation), so a duplicate's label cannot leak into its twin's encoding.
+      When ``groups`` is supplied, whole groups share a fold, so a
+      document/user cannot leak its label into another row of the same group.
+      When ``time`` is supplied, folds are contiguous chronological blocks and
+      encoding is expanding: a row is encoded only from strictly earlier
+      blocks (the first block uses an uninformative prior of 0 because no past
+      label exists).
 
     Missing categories are their own training level; an unseen holdout level
     falls back to the training prior.  Non-finite/missing labels are ignored
@@ -1816,12 +1819,42 @@ class LeakageSafeTargetEncoder:
             folds[i] = fold_of[key]
         return folds
 
-    def _row_folds(self, n):
-        order = sorted(range(n), key=lambda i: (
+    def _row_folds(self, n, keys=None):
+        """Deterministic row folds; exact-duplicate rows stay together.
+
+        Without ``keys`` this is the historical per-row assignment.  With
+        duplicate-detection keys, all rows sharing a feature key are assigned
+        the same fold: otherwise one duplicate's label would be used to encode
+        its twin, which is exactly the self-target leak that out-of-fold
+        encoding is meant to prevent.  The representative (first occurrence)
+        keeps the historical order, so a table without duplicates is unchanged.
+        """
+        if keys is None:
+            reps = list(range(n))
+            rep_of = None
+        else:
+            if len(keys) != n:
+                raise ValueError(
+                    f'internal duplicate-key count {len(keys)} does not match '
+                    f'n={n}')
+            rep_of = {}
+            reps = []
+            for i, key in enumerate(keys):
+                if key not in rep_of:
+                    rep_of[key] = i
+                    reps.append(i)
+        order = sorted(reps, key=lambda i: (
             _mix64(int(i) ^ int(self.seed)), i))
-        folds = np.empty(n, dtype=np.int64)
+        rep_folds = {}
         for rank, i in enumerate(order):
-            folds[i] = rank % self.n_folds
+            rep_folds[i] = rank % self.n_folds
+        folds = np.empty(n, dtype=np.int64)
+        if rep_of is None:
+            for i in reps:
+                folds[i] = rep_folds[i]
+        else:
+            for i, key in enumerate(keys):
+                folds[i] = rep_folds[rep_of[key]]
         return folds
 
     def _group_time_folds(self, groups, time, n):
@@ -2098,7 +2131,7 @@ class LeakageSafeTargetEncoder:
             folds = self._group_folds(groups, n)
             policy = 'grouped_oof'
         else:
-            folds = self._row_folds(n)
+            folds = self._row_folds(n, keys=_row_keys(Xarr))
             policy = 'row_oof'
         out = np.zeros((n, Xarr.shape[1]), dtype=np.float64)
         for k in range(int(folds.max()) + 1):

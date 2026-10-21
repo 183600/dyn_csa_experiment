@@ -11660,6 +11660,31 @@ def t_determinism_label_cpu_strict():
             torch.use_deterministic_algorithms(False)
 
 
+def t_target_encoder_keeps_duplicate_rows_in_one_fold():
+    # Exact duplicate feature rows are one observation/annotation cluster.  If
+    # the row-OOF fold assignment splits them, changing one duplicate's label
+    # changes the encoding of its twin: the twin is encoded from its own
+    # duplicate label.  All duplicates must therefore share a fold.
+    import data_guard as DG
+    X = np.array([['a'], ['a'], ['b'], ['b']], dtype=object)
+    y = np.array([1.0, 1.0, 2.0, 2.0])
+    for seed, n_folds in ((0, 3), (0, 2), (5, 4)):
+        oof = DG.LeakageSafeTargetEncoder(
+            smoothing=0.0, n_folds=n_folds, seed=seed).fit_transform(X, y)
+        y2 = y.copy()
+        y2[0] += 1000.0
+        oof2 = DG.LeakageSafeTargetEncoder(
+            smoothing=0.0, n_folds=n_folds, seed=seed).fit_transform(X, y2)
+        assert np.allclose(oof2[1], oof[1]), (seed, n_folds, oof, oof2)
+        assert np.allclose(oof2[0], oof[0]), (seed, n_folds, oof, oof2)
+    # A table with no duplicates keeps the historical per-row fold assignment.
+    uniq = np.array([['a'], ['b'], ['c'], ['d']], dtype=object)
+    old = DG.LeakageSafeTargetEncoder(n_folds=2, seed=7)
+    old_folds = old._row_folds(4)
+    new_folds = old._row_folds(4, keys=DG._row_keys(uniq))
+    assert np.array_equal(old_folds, new_folds)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11882,6 +11907,7 @@ def main():
     _check('I29 categorical encoding is fitted on train only', t_categorical_encoder_train_only)
     _check('I29b frequency encoding is fitted on train only', t_frequency_encoder_train_only)
     _check('I29c target encoding is out-of-fold and group/time safe', t_target_encoder_prevents_self_and_group_leakage)
+    _check('I29d target encoding keeps duplicate rows in one fold', t_target_encoder_keeps_duplicate_rows_in_one_fold)
     _check('I30 train-only cleaning before preprocessing', t_clean_training_rows_and_split)
     _check('I30b invalid training labels are droppable before fitting', t_clean_training_invalid_labels)
     _check('I30c non-finite/outlier training rows are cleanable', t_clean_training_nonfinite_and_outliers)
