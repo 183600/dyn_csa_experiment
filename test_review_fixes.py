@@ -4371,6 +4371,52 @@ def t_baseline_tuning_audit():
 
 
 
+def t_baseline_horizon_transfer_audit():
+    # A config selected at a shorter search horizon is not the tuned optimum at
+    # the final horizon; equal search across arms does not catch this.
+    trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['a'], trials=trials,
+                    search_seeds=[100], final_seeds=[0])
+
+    def _art(search_steps, final_steps, trial_steps=None):
+        rows = []
+        for _i, _cfg in enumerate(trials):
+            _st = trial_steps if trial_steps is not None else search_steps
+            rows.append({'config': dict(_cfg), 'ppl': 10.0 + _i,
+                         'steps': _st, 'tokens_seen': _st * 8})
+        best = min(rows, key=lambda r: r['ppl'])
+        return {'selection_metric': 'ppl', 'selection_split': 'validation',
+                'direction': 'lower_is_better', 'search_steps': search_steps,
+                'search_seeds': [100], 'final_seeds': [0],
+                'arms': {'a': {'trials': rows, 'selected': dict(best['config']),
+                               'selected_metric_value': best['ppl']}},
+                'final_records': {
+                    'a::seed0': {'variant': 'a', 'seed': 0, 'ppl': 6.0,
+                                 'steps': final_steps,
+                                 'hyperparams': dict(best['config'], steps=final_steps)}}}
+
+    good = L.baseline_tuning_audit(_art(10, 10), protocol=protocol)
+    assert good['tuning_verified'] is True, good
+    assert good['budget_transfer']['equal'] is True, good['budget_transfer']
+    assert not any('different training horizon' in w for w in good['warnings']), good
+
+    mismatch = L.baseline_tuning_audit(_art(10, 20), protocol=protocol)
+    assert mismatch['tuning_verified'] is True, mismatch
+    assert mismatch['budget_transfer']['equal'] is False, mismatch['budget_transfer']
+    assert mismatch['budget_transfer']['mismatch_arms'] == ['a'], mismatch['budget_transfer']
+    assert any('NOT a fully tuned baseline at the final budget' in w
+               for w in mismatch['warnings']), mismatch['warnings']
+
+    malformed = L.baseline_tuning_audit(_art(0, 10), protocol=protocol)
+    assert malformed['tuning_verified'] is False, malformed
+    assert any('search_steps' in p for p in malformed['problems']), malformed
+
+    trial_mismatch = L.baseline_tuning_audit(_art(10, 10, trial_steps=5), protocol=protocol)
+    assert trial_mismatch['tuning_verified'] is False, trial_mismatch
+    assert any('does not describe the search budget' in p
+               for p in trial_mismatch['problems']), trial_mismatch
+
+
 def t_tuning_grid_boundary_adequacy():
     # Equal search is not enough if the winner sits on the edge of the grid:
     # the true optimum may be outside the searched range.
@@ -13376,6 +13422,7 @@ def main():
     _check('L22b build report exact seed/parameter contracts', t_build_report_exact_seed_and_params)
     _check('L23 methodology/scale gates fail closed on malformed inputs', t_methodology_gate_fail_closed_edges)
     _check('L25 baseline seed plans reject duplicate draws', t_baseline_seed_plan_rejects_duplicate_draws)
+    _check('L25b baseline tuning audit checks search-to-final horizon transfer', t_baseline_horizon_transfer_audit)
     _check('L26 bootstrap chunk scaling + zero-CE measurements', t_bootstrap_and_zero_ce_scaling_contract)
     _check('L27 error analysis excludes non-finite targets', t_error_analysis_excludes_nonfinite_targets)
     _check('L28 gapfill numeric reader rejects booleans', t_gapfill_numeric_reader_rejects_booleans)

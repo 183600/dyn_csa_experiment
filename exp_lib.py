@@ -17427,6 +17427,80 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     if final_records and _row_split_applied is False:
         warnings.append('the tuning artifact did not apply the nested row split; the final tuned '
                         'records may be measured on the rows that selected the config')
+    # Budget transfer: a config selected on a SHORTER search horizon and then
+    # evaluated at the final horizon is not the tuned optimum for the budget
+    # that is actually reported.  Equal search across arms does not catch this,
+    # because every arm could share the same too-short search.  The artifact
+    # declares `search_steps`; the final records carry their completed/planned
+    # steps.  A known mismatch is disclosed and gates the tuned claim (below),
+    # while legacy artifacts that omit the descriptor stay unverifiable.
+    _raw_search_steps = selected.get('search_steps')
+    _search_steps = None
+    _budget_transfer = {'search_steps': None, 'trial_steps_by_arm': {},
+                        'final_steps_by_arm': {}, 'equal': None,
+                        'checked': False, 'mismatch_arms': []}
+    if _raw_search_steps is not None:
+        _search_steps = _exact_count(_raw_search_steps, minimum=1)
+        if _search_steps is None:
+            problems.append(f'search_steps={_raw_search_steps!r} is not an exact positive step count')
+    _budget_transfer['search_steps'] = _search_steps
+    _trial_steps_by_arm = {}
+    for _arm, _by_cfg in budgets.items():
+        _trial_steps = {_exact_count(v[0], minimum=1) for v in _by_cfg.values()}
+        _trial_steps.discard(None)
+        if _trial_steps:
+            _trial_steps_by_arm[_arm] = sorted(_trial_steps)
+    _budget_transfer['trial_steps_by_arm'] = _trial_steps_by_arm
+    if _search_steps is not None and _trial_steps_by_arm:
+        for _arm, _ts in sorted(_trial_steps_by_arm.items()):
+            if len(_ts) != 1 or _ts[0] != _search_steps:
+                problems.append(
+                    f'{_arm}: declared search_steps={_search_steps} but its tuning '
+                    f'trials ran steps={_ts}; the artifact does not describe the '
+                    'search budget that produced the selected config')
+    if final_records:
+        _final_steps_by_arm = {}
+        for _arm in arms:
+            _hits = [(k, r) for k, r in final_records.items()
+                     if k.startswith(f'{_arm}::') and isinstance(r, dict)]
+            _steps = set()
+            _missing_step_records = []
+            for _k, r in _hits:
+                _st = _exact_count(r.get('steps'), minimum=1)
+                if _st is None:
+                    _hp = r.get('hyperparams')
+                    if isinstance(_hp, dict):
+                        _st = _exact_count(_hp.get('steps'), minimum=1)
+                if _st is None:
+                    _missing_step_records.append(_k)
+                else:
+                    _steps.add(_st)
+            if len(_steps) > 1:
+                problems.append(f'{_arm}: final records ran different step budgets '
+                                f'{sorted(_steps)} — the tuned contrast would mix horizons')
+            elif len(_steps) == 1:
+                _final_steps_by_arm[_arm] = next(iter(_steps))
+            if _missing_step_records:
+                warnings.append(f'{_arm}: {len(_missing_step_records)} final record(s) do not '
+                                'record steps; the search-to-final horizon transfer is unverifiable')
+        _budget_transfer['final_steps_by_arm'] = _final_steps_by_arm
+        if _search_steps is not None and _final_steps_by_arm:
+            _mismatch = sorted(a for a, s in _final_steps_by_arm.items()
+                               if s != _search_steps)
+            _budget_transfer['checked'] = True
+            _budget_transfer['equal'] = not _mismatch
+            _budget_transfer['mismatch_arms'] = _mismatch
+            if _mismatch:
+                warnings.append(
+                    'the tuning search ran at %d step(s) but the final tuned records for '
+                    '%s ran at %s — hyperparameters were selected on a different training '
+                    'horizon than the reported evaluation, so this is NOT a fully tuned '
+                    'baseline at the final budget'
+                    % (_search_steps, ', '.join(_mismatch),
+                       ', '.join('%s=%d' % (a, _final_steps_by_arm[a]) for a in _mismatch)))
+        elif _search_steps is None:
+            warnings.append('the artifact does not declare search_steps; the tuning search '
+                            'horizon cannot be compared with the final evaluation horizon')
     _measured_final_seeds = sorted({s for _v in final_seed_coverage.values() for s in _v})
     _record_overlap = sorted(_search_set & set(_measured_final_seeds))
     if _record_overlap and final_records and not _seed_overlap:
@@ -17715,6 +17789,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                                     if selection_stabilities else None),
            'min_final_seeds_for_family_significance': _final_family_floor,
            'search_complete': _effective_search_complete,
+           'budget_transfer': _budget_transfer,
            'grid_complete': _grid_complete,
            'arms': sorted(arms), 'problems': problems, 'warnings': warnings,
            'selected_configs': {a: (e.get('selected') or e.get('selected_config'))
@@ -19230,6 +19305,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         _bt_claim_reasons.append('grid_adequacy=%r' % (_bt.get('grid_adequacy'),))
     if _bt.get('search_complete') is False:
         _bt_claim_reasons.append('search grid was truncated')
+    _bt_transfer = _bt.get('budget_transfer') or {}
+    if isinstance(_bt_transfer, dict) and _bt_transfer.get('equal') is False:
+        _bt_claim_reasons.append(
+            'hyperparameters were selected at a different training horizon than '
+            'the final records (search_steps=%r, final=%r)'
+            % (_bt_transfer.get('search_steps'),
+               _bt_transfer.get('final_steps_by_arm')))
     _bt_stability = _bt.get('selection_stability') or {}
     if any(isinstance(v, dict) and v.get('status') == 'ok' and v.get('stable') is False
            for v in _bt_stability.values()):

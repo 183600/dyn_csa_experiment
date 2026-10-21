@@ -863,6 +863,8 @@ def _run_final(base, outdir, protocol, selected):
                                    'n_tokens_holdout': v.get('n_tokens_holdout'),
                                    'holdout_row_fp': v.get('holdout_row_fp'),
                                    'params': v.get('params'), 'run_cfg': v.get('run_cfg'),
+                                   'steps': v.get('steps'),
+                                   'tokens_seen': v.get('tokens_seen'),
                                    'hyperparams': v.get('hyperparams')}
                                for k, v in merged.items()}
     tuning['final_evaluation_rows'] = _final_rows_meta
