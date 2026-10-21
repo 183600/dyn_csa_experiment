@@ -20480,11 +20480,64 @@ def _curve_extend(dst, new):
         dst[:] = _reduce_curve_values(dst, _CURVE_MAX_POINTS)
 
 
+def _reduce_curve_points(points, max_points):
+    """Downsample ``[step, value]`` trace points without losing spikes/NaN.
+
+    ``_reduce_curve_values`` scores plain scalars; a per-layer delta trace stores
+    point pairs, so the spike test must look at the value column.  Bins keep
+    their first/last index, finite min/max and first non-finite index.
+    """
+    n = len(points)
+    max_points = int(max_points)
+    if n <= max_points:
+        return list(points)
+    nb = max(1, max_points // 7)
+
+    def _value(point):
+        if isinstance(point, (list, tuple)) and len(point) >= 2:
+            return point[1]
+        return point
+
+    first = [-1] * nb
+    last = [-1] * nb
+    mini = [-1] * nb
+    maxi = [-1] * nb
+    badi = [-1] * nb
+    minv = [0.0] * nb
+    maxv = [0.0] * nb
+    for i, point in enumerate(points):
+        b = min(nb - 1, (i * nb) // n)
+        if first[b] < 0:
+            first[b] = i
+        last[b] = i
+        try:
+            f = float(_value(point))
+        except (TypeError, ValueError, OverflowError):
+            f = None
+        if f is None or not math.isfinite(f):
+            if badi[b] < 0:
+                badi[b] = i
+            continue
+        if mini[b] < 0 or f < minv[b]:
+            mini[b] = i
+            minv[b] = f
+        if maxi[b] < 0 or f > maxv[b]:
+            maxi[b] = i
+            maxv[b] = f
+    keep = set()
+    for i in range(nb):
+        for _ix in (first[i], mini[i], maxi[i], badi[i], last[i]):
+            if _ix >= 0:
+                keep.add(int(_ix))
+    if n:
+        keep.add(n - 1)
+    return [points[i] for i in sorted(keep)]
+
+
 def _curve_append_point(dst, point):
     dst.append(point)
     if len(dst) > 2 * _CURVE_MAX_POINTS:
-        _idx = np.linspace(0, len(dst) - 1, num=_CURVE_MAX_POINTS).round().astype(np.int64)
-        dst[:] = [dst[int(_i)] for _i in _idx]
+        dst[:] = _reduce_curve_points(dst, _CURVE_MAX_POINTS)
 
 
 def distributed_info():
