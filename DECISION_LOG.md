@@ -571,12 +571,13 @@ list was removed after the fixes.
 Changed only the zero-GPU baseline/metric/audit and NIAH record paths; no panel,
 frozen manifest, test split, README or CI configuration was touched. (1) The
 baseline-tuning audit now records and checks `budget_transfer`: the declared
-`search_steps` must match the tuning trials and the final records' step budget.
-Equal search across arms did not catch a search run at a shorter horizon than
-the reported final evaluation; such a config is not the tuned optimum at the
-final budget. A mismatch is disclosed and gates the "well-tuned baseline"
-claim, while legacy artifacts without step evidence stay unverifiable rather
-than passing. (2) `simple_baseline_audit` now requires the recorded prefix to be
+`search_steps` must match the tuning trials and the final records' step budget,
+and the trial/final token exposure must agree as well (equal steps do not imply
+equal exposure if batch/sequence length changes). Equal search across arms did
+not catch a search run at a shorter horizon than the reported final evaluation;
+such a config is not the tuned optimum at the final budget. A mismatch is
+disclosed and gates the "well-tuned baseline" claim, while legacy artifacts
+without step/token evidence stay unverifiable rather than passing. (2) `simple_baseline_audit` now requires the recorded prefix to be
 exactly `min(n_source_tokens, max_fit_tokens)`, rejects a `fit_truncated` flag
 that contradicts the token counts, and propagates prefix-trained floors into
 `tuned_floor_claim_allowed`. At scale the count-model floor can see far fewer
