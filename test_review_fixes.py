@@ -8922,6 +8922,16 @@ def t_frequency_encoder_train_only():
         pass
     else:
         raise AssertionError('handle_unknown="error" must reject a new level')
+    # Missing values are not a learned level either; the strict contract must
+    # not silently encode them as zero (only the default contract does that).
+    _strict_missing = L.LeakageSafeFrequencyEncoder(handle_unknown='error').fit(
+        np.array([['a'], [None]], dtype=object))
+    try:
+        _strict_missing.transform(np.array([[None]], dtype=object))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('handle_unknown="error" must reject missing values')
     try:
         L.LeakageSafeFrequencyEncoder().transform(train)
     except RuntimeError:

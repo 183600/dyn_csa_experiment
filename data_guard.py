@@ -1951,6 +1951,15 @@ class LeakageSafeFrequencyEncoder:
             denom = int(st['n_observed'])
             for i, value in enumerate(Xarr[:, j].tolist()):
                 if _category_is_missing(value):
+                    # Missing is not a learned frequency level.  Under the
+                    # strict contract it is rejected just like any other value
+                    # that the training table cannot encode; the default
+                    # contract maps it to the reserved zero level.
+                    if self.handle_unknown == 'error':
+                        raise ValueError(
+                            f'missing value in column {j} under '
+                            "handle_unknown='error'; the frequency table "
+                            'was fitted on training rows only')
                     continue
                 count = lookup.get(_hashable_label(value))
                 if count is None:
