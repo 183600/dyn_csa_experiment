@@ -5236,6 +5236,31 @@ def t_simple_baseline_grid_adequacy():
     tie_audit = L.simple_baseline_audit(tie, protocol=proto)
     assert tie_audit['selection_tie_arms'] == ['uni'], tie_audit
     assert any('tie' in w for w in tie_audit['warnings']), tie_audit
+    # Interpolation is a second continuous knob: selecting the pure-bigram
+    # corner (1.0) means the optimum may lie outside the tested range.
+    proto_i = dict(L.SIMPLE_BASELINE_POLICY,
+                   arms={'bi': {'order': 2}},
+                   grids={'bi': {'alpha': [0.1, 1.0],
+                                 'interpolation': [0.25, 0.5, 0.75]}})
+    art_i = L.simple_baseline_fit(train, val, vocab, protocol=proto_i)
+    entry_i = art_i['baselines']['bi']
+    for _t in entry_i['trials']:
+        _lam = _t['config']['interpolation']
+        _t['ppl'] = {0.25: 3.0, 0.5: 2.0, 0.75: 1.0}[_lam]
+    _best_i = [t for t in entry_i['trials']
+               if t['config']['interpolation'] == 0.75][0]
+    entry_i['selected'] = dict(_best_i['config'])
+    entry_i['selected_metric_value'] = 1.0
+    art_i['best_ppl'] = 1.0
+    art_i['best_ppl_vs_uniform'] = 1.0 / float(vocab)
+    for _k in ('reported_nll_per_row', 'reported_n_tokens_per_row',
+               'reported_estimation_rows', 'holdout_ppl', 'holdout_nll',
+               'holdout_n_tokens', 'holdout_metric_value'):
+        entry_i.pop(_k, None)
+    ai = L.simple_baseline_audit(art_i, protocol=proto_i)
+    assert ai['baseline_verified'] is True, ai
+    assert 'bi:interpolation=0.75(max)' in ai['grid_boundary_hits'], ai
+    assert any('bigram/unigram mix optimum' in w for w in ai['warnings']), ai
 
 def t_simple_baseline_nested_rows_and_fingerprint():
     rng = np.random.default_rng(19)

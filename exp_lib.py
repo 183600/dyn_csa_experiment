@@ -13558,6 +13558,41 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
                                               'selected_alpha': None,
                                               'selected_position': None,
                                               'at_boundary': None}
+            # The bigram interpolation weight is a second continuous tuning
+            # knob.  Selecting 0 or 1 means the optimum may lie beyond the
+            # tested range (the pure-unigram/pure-bigram corners), so it must
+            # be visible just like an alpha boundary.
+            if _order == 2:
+                _interp_levels = sorted({float(f) for f in
+                                         (_finite_scalar(x) for x in _interps)
+                                         if f is not None})
+                _sel_interp = _finite_scalar(chosen.get('interpolation'))
+                _ipos = None
+                if _sel_interp is not None:
+                    for _i, _v in enumerate(_interp_levels):
+                        if abs(_v - _sel_interp) <= 1e-12 * max(1.0, abs(_sel_interp)):
+                            _ipos = _i
+                            break
+                    if len(_interp_levels) >= 3 and _ipos in (0, len(_interp_levels) - 1):
+                        _iboundary = ('min' if _ipos == 0 else 'max')
+                        _grid_boundary_hits.append(
+                            f'{arm}:interpolation={_sel_interp:g}({_iboundary})')
+                        warnings.append(
+                            f'{arm}: selected interpolation={_sel_interp:g} sits on the '
+                            f'{_iboundary} of the declared range {_interp_levels} — the '
+                            'bigram/unigram mix optimum may lie outside the searched grid; '
+                            'extend the grid before calling this count-model floor tuned')
+                _grid_adequacy_by_arm.setdefault(arm, {}).update({
+                    'interpolation_levels': _interp_levels,
+                    'selected_interpolation': _sel_interp,
+                    'interpolation_position': _ipos,
+                    'interpolation_at_boundary': (bool(_ipos in (0, len(_interp_levels) - 1))
+                                                  if _ipos is not None and len(_interp_levels) >= 3
+                                                  else None)})
+                if _sel_interp is not None and len(_interp_levels) < 3:
+                    warnings.append(
+                        f'{arm}: the interpolation grid has only {len(_interp_levels)} '
+                        'level(s); the bigram/unigram mix optimum is not bracketed')
             # A winner that is indistinguishable from the runner-up is not a
             # tuned optimum.  Record the relative gap so the artifact shows
             # whether the selection was decisive.
