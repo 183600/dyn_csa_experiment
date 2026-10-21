@@ -239,6 +239,17 @@ def _collect(dirs, include_ckpt=False):
         key = os.path.abspath(p)
         if key in seen:
             continue
+        if os.path.islink(p):
+            # tarfile stores the link itself, while the manifest hashes its
+            # target; verify() then (correctly) refuses the non-regular member.
+            # Fail at collect time instead of producing an unverifiable archive.
+            raise ValueError(
+                f'archive file {p!r} is a symbolic link; pack the target '
+                'explicitly (a link member cannot be hash-verified as a '
+                'regular file)')
+        if not os.path.isfile(p):
+            raise ValueError(
+                f'archive file {p!r} is not a regular file; refusing to pack it')
         _p_real = os.path.realpath(p)
         try:
             _inside = os.path.commonpath([_repo_real, _p_real]) == _repo_real

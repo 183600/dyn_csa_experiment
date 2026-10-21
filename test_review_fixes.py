@@ -10952,6 +10952,24 @@ def t_archive_refuses_links_and_repo_escape():
                 raise AssertionError('a parent-relative directory was packed')
         finally:
             shutil.rmtree(outside, ignore_errors=True)
+        # A symlink inside the repository is still a link member: make would
+        # hash its target but tar would store the link, so its own archive
+        # could never verify.  Refuse it at collect time.
+        _linkdir = tempfile.mkdtemp(dir=AR.REPO, prefix='archive_link_test_')
+        try:
+            with open(os.path.join(_linkdir, 'target.txt'), 'w',
+                      encoding='utf-8') as f:
+                f.write('target')
+            os.symlink(os.path.join(_linkdir, 'target.txt'),
+                       os.path.join(_linkdir, 'link.txt'))
+            try:
+                AR._collect([os.path.relpath(_linkdir, AR.REPO)])
+            except ValueError as e:
+                assert 'symbolic link' in str(e), e
+            else:
+                raise AssertionError('a symlink member was packed')
+        finally:
+            shutil.rmtree(_linkdir, ignore_errors=True)
         # The release output directory is confined just like the tag and the
         # packed inputs: --out must not write outside the repository.
         for _bad_out in ('../escape', outside, os.path.join(outside, 'nested')):
