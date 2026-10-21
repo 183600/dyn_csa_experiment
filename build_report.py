@@ -2329,7 +2329,10 @@ def sec_efficiency():
                     lat_ratio = (1.0 / _lr) if (_lr and _lr > 0) else 0.0
                     if (r.get('budget_matched') is not False
                             and r.get('distinguishable') is True and gain >= 0.5 and lat_ratio >= 1.5):
-                        lines += ['', f'  > `{ref["variant"]}` gains {gain:.2f}% PPL over `{r["variant"]}` but is {lat_ratio:.1f}× slower; the accuracy/cost tradeoff must be justified explicitly.']
+                        # `gain` is delta-vs-best (positive = r is worse), so
+                        # the best arm IMPROVES PPL by that magnitude.  The
+                        # old sentence printed the negative sign as a "gain".
+                        lines += ['', f'  > `{ref["variant"]}` improves PPL by {abs(float(gain)):.2f}% over `{r["variant"]}` but is {lat_ratio:.1f}× slower; the accuracy/cost tradeoff must be justified explicitly.']
                 lines.append('')
         if ungrouped:
             lines += ['', f'> {len(ungrouped)} measured record(s) were excluded from every frontier because device/torch/token-count/KV provenance is missing (unverifiable, not assumed equal): ' + ', '.join(f'`{n}`/`{k}`' for n, k in ungrouped[:20]) + ('.' if len(ungrouped) <= 20 else ', ...'), '']

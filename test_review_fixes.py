@@ -9062,6 +9062,32 @@ def t_report_efficiency_groups_are_separate():
     assert txt.count('device `cuda:0`') == 2, txt
 
 
+def t_report_efficiency_cost_sentence_uses_correct_direction():
+    def _eff(ms):
+        return {'status': 'ok', 'device': 'cuda:0', 'torch': '2.8.0', 'n_tokens': 512,
+                'decode_has_kv_cache': False, 'prefill_ms_p50': ms,
+                'peak_mem_allocated_mb': 10.0}
+    summ = {'results_unit': {}}
+    for i, (p, ms) in enumerate(((48.0, 30.0), (48.1, 30.0), (47.9, 30.0))):
+        summ['results_unit'][f'best::s{i}'] = {
+            'variant': 'best', 'ppl': p, 'params': 1000, 'tokens_seen': 100,
+            'efficiency': _eff(ms)}
+    for i, (p, ms) in enumerate(((50.0, 10.0), (50.1, 10.0), (49.9, 10.0))):
+        summ['results_unit'][f'cheap::s{i}'] = {
+            'variant': 'cheap', 'ppl': p, 'params': 1000, 'tokens_seen': 100,
+            'efficiency': _eff(ms)}
+    orig = BR._result_summaries
+    BR._result_summaries = lambda: summ
+    try:
+        txt = BR.sec_efficiency()
+    finally:
+        BR._result_summaries = orig
+    assert 'improves PPL by' in txt, txt
+    assert 'gains -' not in txt, txt
+    assert 'but is 3.0× slower' in txt, txt
+    assert '4.17%' in txt, txt
+
+
 def t_report_nan_section_uses_triage():
     rec = {'instability_diagnosis': {
         'status': 'instability_observed', 'primary_suspect': 'fp16_overflow',
@@ -13918,6 +13944,7 @@ def main():
     _check('L8f2 health/early-stop accept CE-only curves and order steps', t_health_accepts_val_ce_only_and_orders_steps)
     _check('L8g report surfaces completed vs planned training budget', t_report_early_stop_section)
     _check('L8h efficiency report keeps measurement groups separate', t_report_efficiency_groups_are_separate)
+    _check('L8h2 efficiency cost sentence reports the improvement direction', t_report_efficiency_cost_sentence_uses_correct_direction)
     _check('L8i training-health/triage record audit fails closed', t_audit_training_health_records)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
