@@ -1338,6 +1338,21 @@ def t_mode_validation():
         pass
     else:
         raise AssertionError('_corrupt_row silently used a panel shorter than eval_len')
+    # A one-token vocabulary has no alternative token to draw.  The historical
+    # rejection loop redrew the same value forever; the degenerate condition
+    # must return the unchanged row instead of hanging the probe.
+    _zeros = np.zeros((1, 65), dtype=np.int64)
+    _zc = V10._corrupt_row(_zeros, 64, 1.0, 'uniform', 0, 1, 32)
+    assert np.array_equal(_zc, _zeros[0]), _zc
+    # A non-integral/boolean/non-positive vocabulary is malformed, not a token
+    # space to truncate or index.
+    for _bad_vocab in (0, -1, True, 1.5):
+        try:
+            V10._corrupt_row(_PANEL, 128, 0.5, 'uniform', 0, _bad_vocab, 32)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'_corrupt_row accepted vocab={_bad_vocab!r}')
 
 
 # ---------------------------------------------------------------------------

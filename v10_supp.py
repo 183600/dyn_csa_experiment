@@ -216,6 +216,11 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
             f'_corrupt_row: eval_len={eval_len} is shorter than the scored '
             f'target zone ({target}); the far context would be negative and '
             'the corruption geometry is undefined')
+    if isinstance(vocab, (bool, np.bool_)) or not isinstance(vocab, (int, np.integer)):
+        raise ValueError(f'_corrupt_row: vocab must be a positive integer, got {vocab!r}')
+    vocab = int(vocab)
+    if vocab < 1:
+        raise ValueError(f'_corrupt_row: vocab must be positive, got {vocab}')
     if isinstance(rho, (bool, np.bool_)):
         raise ValueError(f'_corrupt_row: rho must be a finite number in [0,1], got {rho!r}')
     try:
@@ -256,6 +261,11 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     if k <= 0:
         return ids
     if mode == 'uniform':
+        # With a one-token vocabulary there is no other token to draw: the
+        # historical rejection loop would redraw the same value forever (the
+        # configuration is degenerate, not a corruption condition).
+        if int(vocab) <= 1:
+            return ids
         rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
         pos = rng.choice(n_far, size=k, replace=False)
         _draw = rng.integers(0, vocab, size=k)
@@ -312,7 +322,13 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
     PROBE_MODES 注释。所有模式的腐坏对同一 (行, ρ, mode) 在臂间逐字节相同
     （只依赖行号与配置，不依赖臂/模型种子），保持严格配对。"""
     target = cfg['target']
-    vocab = int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
+    _vraw = cfg.get('vocab') or P3MT_PAYLOAD['vocab']
+    if isinstance(_vraw, (bool, np.bool_)):
+        raise ValueError(f'_distractor_ppls: vocab must be a positive integer, got {_vraw!r}')
+    _v = L._as_seed_int(_vraw)
+    if _v is None or _v < 1:
+        raise ValueError(f'_distractor_ppls: vocab must be a positive integer, got {_vraw!r}')
+    vocab = int(_v)
     # corruptible context positions: input positions outside the scored
     # target zone; the first scored prediction reads input position
     # eval_len - target (it predicts ids[eval_len - target + 1]), so the
