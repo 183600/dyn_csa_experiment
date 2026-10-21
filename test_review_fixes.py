@@ -5734,6 +5734,39 @@ def t_group_split_contract():
         raise AssertionError('NaT timedelta group ids must collapse into one group')
 
 
+def t_group_split_complete_allocation_and_zero_targets():
+    # Whole groups keep their chronological order, but a feasible partition
+    # must not be rejected merely because the greedy "fill train first" rule
+    # put a large group on the wrong side.  Groups have 1, 1 and 2 rows;
+    # targets 2/1/1 can only be met by boundaries 1 and 2 (train=1, val=1,
+    # test=2).  The historical greedy split consumed groups 0+1 into train,
+    # then put the 2-row group in validation and left test empty.
+    groups = np.array([0, 1, 2, 2])
+    idx = L.grouped_chronological_split_indices(4, groups, 0.5, 0.25, 0.25)
+    assert idx['train'].tolist() == [0], idx
+    assert idx['val'].tolist() == [1], idx
+    assert idx['test'].tolist() == [2, 3], idx
+    L.assert_no_split_leakage(idx['train'], idx['val'], idx['test'],
+                              groups=groups)
+    # A split whose target is exactly zero stays empty; the remainder belongs
+    # to the last requested non-empty split, never to the zero-target side.
+    g0 = np.array([0, 1, 2, 3])
+    z = L.grouped_chronological_split_indices(
+        4, g0, train_frac=0.5, val_frac=0.5, test_frac=0.0)
+    assert z['test'].size == 0, z
+    assert sorted(np.concatenate([z['train'], z['val']]).tolist()) == [0, 1, 2, 3], z
+    z2 = L.grouped_chronological_split_indices(
+        4, g0, train_frac=0.0, val_frac=0.5, test_frac=0.5)
+    assert z2['train'].size == 0 and z2['val'].size and z2['test'].size, z2
+    # Explicit sizes work the same way and preserve whole groups.
+    e = L.grouped_chronological_split_indices(
+        6, np.array([0, 0, 1, 1, 2, 2]), train_size=2, val_size=2,
+        test_size=2)
+    assert [len(e[k]) for k in ('train', 'val', 'test')] == [2, 2, 2], e
+    L.assert_no_split_leakage(e['train'], e['val'], e['test'],
+                              groups=np.array([0, 0, 1, 1, 2, 2]))
+
+
 def t_group_split_respects_time_windows():
     # Whole groups on one side is necessary but not sufficient: two groups
     # whose time windows overlap must not be placed on opposite sides, or the
@@ -11296,6 +11329,7 @@ def main():
     _check('I1 chronological split contract', t_leakage_safe_split_contract)
     _check('I2 whole-group split contract', t_group_split_contract)
     _check('I2b grouped split keeps overlapping time windows together', t_group_split_respects_time_windows)
+    _check('I2c grouped split allocation is complete and zero targets stay empty', t_group_split_complete_allocation_and_zero_targets)
     _check('I3 preprocessing fitted on train only', t_preprocessor_train_only)
     _check('I3b imputation fill is identical in fit and transform', t_preprocessor_fill_is_consistent)
     _check('I3c leakage checks validate time/group inputs', t_leakage_checks_validate_inputs)

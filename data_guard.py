@@ -626,9 +626,18 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
     """Chronological split that assigns every group to exactly one side.
 
     Group order is the order of first appearance (or the minimum ``order``
-    value, e.g. a timestamp).  Whole groups are consumed until the requested
-    train size is reached, then whole groups fill validation, and the remainder
-    goes to test.  A group is therefore never split across train/val/test.
+    value, e.g. a timestamp).  The two split boundaries are placed as close as
+    possible to the requested row targets while keeping every whole group on
+    exactly one side.  Only whole groups are moved across a boundary, so a
+    large group may shift some rows between adjacent splits; it is never cut.
+    A split whose target is exactly zero stays empty (the remainder is absorbed
+    by the last requested non-empty split).
+
+    This boundary placement is what makes the helper complete: the historical
+    greedy "consume groups until this split is full, then move on" could put a
+    large group in validation, leave test empty and raise even though a
+    feasible whole-group partition existed (e.g. groups of 1,1,2 rows with
+    targets 2/1/1).  Whole-group isolation is still verified after allocation.
     ``purge`` is rejected here: dropping individual rows would break whole-
     group assignment.  Remove/merge whole groups explicitly when an embargo is
     required.
@@ -653,13 +662,78 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
         members = {}
         for i, g in enumerate(groups.tolist()):
             members.setdefault(_group_key(g), []).append(i)
+    n_groups = len(order_groups)
+    t_train, t_val, t_test = (int(v) for v in targets)
+    # Prefix row counts let us place a boundary at any group edge in O(log G)
+    # while preserving the chronological group order.  Every group has at
+    # least one row, so the prefix is strictly increasing.
+    sizes = [len(members[g]) for g in order_groups]
+    prefix = np.cumsum(np.asarray(sizes, dtype=np.int64))
+    prefix = np.concatenate((np.zeros(1, dtype=np.int64), prefix))
+
+    def _nearest(target, lo, hi):
+        """Group-edge index in [lo, hi] whose row count is closest to target."""
+        pos = int(np.searchsorted(prefix, int(target), side='left'))
+        cands = [p for p in (pos - 1, pos) if lo <= p <= hi]
+        if not cands:
+            return lo if int(target) <= int(prefix[lo]) else hi
+        # Ties go to the earlier (more conservative) boundary, matching the
+        # historical first-crossing behaviour for exact row targets.
+        return min(cands, key=lambda p: (abs(int(prefix[p]) - int(target)), p))
+
+    def _no_rows_error():
+        _positive = [name for name, target in zip(SPLIT_NAMES, targets)
+                     if int(target) > 0]
+        if n_groups < len(_positive):
+            _missing = _positive[n_groups]
+        else:
+            # No count shortfall: the requested boundaries themselves are
+            # impossible (e.g. a zero-sized side next to an oversized group).
+            _missing = _positive[-1] if _positive else SPLIT_NAMES[0]
+        return ValueError(
+            f'grouped split has no rows for the requested {_missing} split '
+            f'(targets={tuple(targets)}, groups={n_groups}, rows={n}); the '
+            'group sizes cannot satisfy the requested fractions — change the '
+            'split targets or merge groups')
+
+    if n_groups == 0:
+        if t_train or t_val or t_test:
+            raise _no_rows_error()
+        c1 = c2 = 0
+    else:
+        # First boundary.  A zero-target split must stay empty; positive splits
+        # must each retain at least one whole group for the following sides.
+        if t_train == 0:
+            c1 = 0
+        elif t_val == 0 and t_test == 0:
+            c1 = n_groups
+        else:
+            lo = 1
+            hi = n_groups - (1 if t_val > 0 else 0) - (1 if t_test > 0 else 0)
+            if lo > hi:
+                raise _no_rows_error()
+            c1 = _nearest(t_train, lo, hi)
+        # Second boundary.  c2 == c1 means an empty validation block; c2 ==
+        # n_groups means an empty test block.
+        if t_test == 0:
+            c2 = n_groups
+        elif t_val == 0:
+            c2 = c1
+        else:
+            lo = c1 + 1
+            hi = n_groups - 1
+            if lo > hi:
+                raise _no_rows_error()
+            c2 = _nearest(int(prefix[c1]) + t_val, lo, hi)
+        if not (0 <= c1 <= c2 <= n_groups):
+            raise ValueError(
+                f'grouped split had inconsistent boundaries {c1}/{c2} for '
+                f'{n_groups} groups')
     out = {name: [] for name in SPLIT_NAMES}
-    current = 0
-    for g in order_groups:
-        while (current < 2 and
-               len(out[SPLIT_NAMES[current]]) >= targets[current]):
-            current += 1
-        out[SPLIT_NAMES[current]].extend(int(i) for i in members[g])
+    bounds = (0, c1, c2, n_groups)
+    for k, name in enumerate(SPLIT_NAMES):
+        for g in order_groups[bounds[k]:bounds[k + 1]]:
+            out[name].extend(int(i) for i in members[g])
     res = {name: np.asarray(sorted(v), dtype=np.int64) for name, v in out.items()}
     # A requested non-empty split must not silently be empty.  An empty
     # validation set is not a harmless corner case: selection/early stopping
