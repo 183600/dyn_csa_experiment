@@ -672,6 +672,17 @@ def _tuned_significant(st, p_holm, alpha=0.05):
     weaker standard."""
     if not isinstance(st, dict):
         return False
+    # alpha is a gate parameter: an out-of-range threshold would make every
+    # p "significant" (alpha>1) or none reachable (alpha<=0).
+    if isinstance(alpha, (bool, np.bool_)):
+        return False
+    try:
+        _alpha = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not (math.isfinite(_alpha) and 0.0 < _alpha < 1.0):
+        return False
+    alpha = _alpha
     try:
         _ph = float(p_holm)
     except (TypeError, ValueError, OverflowError):
@@ -679,17 +690,44 @@ def _tuned_significant(st, p_holm, alpha=0.05):
     if not (math.isfinite(_ph) and _ph < alpha):
         return False
     _n = st.get('n')
-    if isinstance(_n, bool) or not isinstance(_n, int) or _n < 3:
+    if (isinstance(_n, (bool, np.bool_))
+            or not isinstance(_n, (int, np.integer)) or int(_n) < 3):
         return False
+    _n = int(_n)
     if st.get('underpowered') or st.get('within_seed_noise'):
         return False
     if st.get('seed_driven') is True:
         return False
     if st.get('complete_pairs') is False:
         return False
+    _n_input = st.get('n_input')
+    if _n_input is not None:
+        if isinstance(_n_input, bool) or not isinstance(_n_input, (int, np.integer)):
+            return False
+        if int(_n_input) < _n:
+            return False
     _dropped = st.get('n_dropped')
-    if isinstance(_dropped, int) and not isinstance(_dropped, bool) and _dropped > 0:
-        return False
+    if _dropped is not None:
+        if (isinstance(_dropped, bool)
+                or not isinstance(_dropped, (int, np.integer))):
+            return False
+        if int(_dropped) < 0:
+            return False
+        if _n_input is not None and int(_dropped) > int(_n_input):
+            return False
+        if int(_dropped) > 0:
+            return False
+    # Exact ties reduce the exact-test resolution below the n-seed floor.
+    _n_nonzero = st.get('n_nonzero')
+    if _n_nonzero is not None:
+        if (isinstance(_n_nonzero, bool)
+                or not isinstance(_n_nonzero, (int, np.integer))):
+            return False
+        if int(_n_nonzero) < 0 or int(_n_nonzero) > _n:
+            return False
+        _floor = 1.0 if int(_n_nonzero) == 0 else math.ldexp(2.0, -int(_n_nonzero))
+        if _floor > alpha:
+            return False
     # Seeds skipped by the controlled-comparison gate are ALSO an incomplete
     # paired panel (the surviving subset was selected by that failure), so a
     # small Holm p on the survivors cannot support the word "significant".

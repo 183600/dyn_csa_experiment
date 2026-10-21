@@ -894,6 +894,19 @@ def t_report_gate_refuses_attrition_and_seed_driven():
     assert BR._sig_gate(dict(ok, n_dropped=0, seed_driven=False)) is True
     assert BR._sig_gate(dict(ok, n_skipped_config_mismatch=0)) is True
     assert BR._sig_gate(dict(ok, n_skipped=0)) is True
+    # Corrupt panel accounting must fail closed exactly as in
+    # exp_lib.reportable_claim (negative drops, drops exceeding the input,
+    # an incomplete-panel flag, or tie-reduced resolution).
+    for _bad in (dict(ok, n_dropped=-1),
+                 dict(ok, n_input=-1, n_dropped=0),
+                 dict(ok, n_input=3, n_dropped=6),
+                 dict(ok, complete_pairs=False),
+                 dict(ok, n_nonzero=7),
+                 dict(ok, n_nonzero=-1),
+                 dict(ok, n_nonzero=2)):
+        assert BR._sig_gate(_bad) is False, _bad
+    assert BR._sig_gate(dict(ok, n_nonzero=6)) is True
+    assert BR._sig_gate(dict(ok, n_input=6, n_dropped=0)) is True
 
 
 def _brute_signflip_p(d):
@@ -2037,11 +2050,24 @@ def t_tuned_pairing_keeps_optimizer_gate():
                  dict(base_st, n_skipped=1),
                  dict(base_st, n_skipped_config_mismatch=1),
                  dict(base_st, n_skipped=-1),
-                 dict(base_st, n_skipped=True)):
+                 dict(base_st, n_skipped=True),
+                 dict(base_st, n_dropped=-1),
+                 dict(base_st, n_input=-1),
+                 dict(base_st, n_input=2),
+                 dict(base_st, n_input=3, n_dropped=4),
+                 dict(base_st, n_nonzero=4),
+                 dict(base_st, n_nonzero=-1),
+                 dict(base_st, n_nonzero=1)):
         assert BT._tuned_significant(_bad, 0.03) is False, _bad
     assert BT._tuned_significant(dict(base_st, n_skipped=0), 0.03) is True
+    assert BT._tuned_significant(dict(base_st, n_input=3, n_dropped=0), 0.03) is True
+    assert BT._tuned_significant(dict(base_st, n=6, n_nonzero=6), 0.03) is True
+    assert BT._tuned_significant(dict(base_st, n=6, n_nonzero=3), 0.03) is False
     assert BT._tuned_significant(base_st, None) is False
     assert BT._tuned_significant(base_st, 0.5) is False
+    # alpha is a gate parameter, not a free multiplier.
+    for _bad_alpha in (True, 0, -0.1, 1.5, float('nan'), 'x'):
+        assert BT._tuned_significant(base_st, 0.03, _bad_alpha) is False, _bad_alpha
 
 
 def t_arm_mean_std_and_relative_effect():

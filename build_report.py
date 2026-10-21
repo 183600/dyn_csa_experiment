@@ -1600,8 +1600,34 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
         # surviving seeds were selected by that failure and cannot support a
         # significance claim (mirror exp_lib.reportable_claim).  Missing
         # fields keep the legacy permissive path.
+        _n_input = _int_or(st.get('n_input'), None)
         _n_dropped = _int_or(st.get('n_dropped'), None)
-        if _n_dropped is not None and _n_dropped > 0:
+        if _n_input is not None and _n_input < 0:
+            return False
+        if _n_dropped is not None:
+            # A negative drop count is corrupt accounting, not an alternative
+            # spelling of "no attrition" (mirror exp_lib.reportable_claim).
+            if _n_dropped < 0:
+                return False
+            if _n_input is not None and _n_dropped > _n_input:
+                return False
+            if _n_dropped > 0:
+                return False
+        # `complete_pairs=False` says the paired panel is incomplete even when
+        # the caller did not also carry n_dropped.
+        if st.get('complete_pairs') is False:
+            return False
+        # Exact ties lower the sign-flip resolution.  A fabricated n_nonzero
+        # (or one bigger than the panel) must not make n seeds look finer than
+        # the test can actually resolve.
+        _n_nonzero = _int_or(st.get('n_nonzero'), None)
+        if _n_nonzero is not None:
+            if _n_nonzero < 0 or _n_nonzero > n:
+                return False
+            _floor = 1.0 if _n_nonzero == 0 else _signflip_floor(_n_nonzero)
+        else:
+            _floor = _signflip_floor(n)
+        if _floor is None or not math.isfinite(_floor) or _floor > alpha:
             return False
         # Seeds rejected by the same-recipe controlled-comparison gate are
         # also an incomplete paired panel (mirror exp_lib.reportable_claim).
