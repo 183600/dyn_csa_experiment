@@ -17548,8 +17548,10 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     _raw_search_steps = selected.get('search_steps')
     _search_steps = None
     _budget_transfer = {'search_steps': None, 'trial_steps_by_arm': {},
-                        'final_steps_by_arm': {}, 'equal': None,
-                        'checked': False, 'mismatch_arms': []}
+                        'final_steps_by_arm': {}, 'trial_tokens_by_arm': {},
+                        'final_tokens_by_arm': {}, 'equal': None,
+                        'tokens_equal': None, 'checked': False,
+                        'mismatch_arms': [], 'token_mismatch_arms': []}
     if _raw_search_steps is not None:
         _search_steps = _exact_count(_raw_search_steps, minimum=1)
         if _search_steps is None:
@@ -17561,7 +17563,14 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         _trial_steps.discard(None)
         if _trial_steps:
             _trial_steps_by_arm[_arm] = sorted(_trial_steps)
+    _trial_tokens_by_arm = {}
+    for _arm, _by_cfg in budgets.items():
+        _trial_tokens = {_exact_count(v[1], minimum=1) for v in _by_cfg.values()}
+        _trial_tokens.discard(None)
+        if _trial_tokens:
+            _trial_tokens_by_arm[_arm] = sorted(_trial_tokens)
     _budget_transfer['trial_steps_by_arm'] = _trial_steps_by_arm
+    _budget_transfer['trial_tokens_by_arm'] = _trial_tokens_by_arm
     if _search_steps is not None and _trial_steps_by_arm:
         for _arm, _ts in sorted(_trial_steps_by_arm.items()):
             if len(_ts) != 1 or _ts[0] != _search_steps:
@@ -17571,30 +17580,47 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                     'search budget that produced the selected config')
     if final_records:
         _final_steps_by_arm = {}
+        _final_tokens_by_arm = {}
         for _arm in arms:
             _hits = [(k, r) for k, r in final_records.items()
                      if k.startswith(f'{_arm}::') and isinstance(r, dict)]
-            _steps = set()
-            _missing_step_records = []
+            _steps, _tokens = set(), set()
+            _missing_step_records, _missing_token_records = [], []
             for _k, r in _hits:
                 _st = _exact_count(r.get('steps'), minimum=1)
-                if _st is None:
-                    _hp = r.get('hyperparams')
-                    if isinstance(_hp, dict):
+                _tk = _exact_count(r.get('tokens_seen'), minimum=1)
+                _hp = r.get('hyperparams')
+                if isinstance(_hp, dict):
+                    if _st is None:
                         _st = _exact_count(_hp.get('steps'), minimum=1)
+                    if _tk is None:
+                        _tk = _exact_count(_hp.get('tokens_seen'), minimum=1)
                 if _st is None:
                     _missing_step_records.append(_k)
                 else:
                     _steps.add(_st)
+                if _tk is None:
+                    _missing_token_records.append(_k)
+                else:
+                    _tokens.add(_tk)
             if len(_steps) > 1:
                 problems.append(f'{_arm}: final records ran different step budgets '
                                 f'{sorted(_steps)} — the tuned contrast would mix horizons')
             elif len(_steps) == 1:
                 _final_steps_by_arm[_arm] = next(iter(_steps))
+            if len(_tokens) > 1:
+                problems.append(f'{_arm}: final records saw different token budgets '
+                                f'{sorted(_tokens)} — the tuned contrast would mix exposures')
+            elif len(_tokens) == 1:
+                _final_tokens_by_arm[_arm] = next(iter(_tokens))
             if _missing_step_records:
                 warnings.append(f'{_arm}: {len(_missing_step_records)} final record(s) do not '
                                 'record steps; the search-to-final horizon transfer is unverifiable')
+            if _missing_token_records:
+                warnings.append(f'{_arm}: {len(_missing_token_records)} final record(s) do not '
+                                'record tokens_seen; the search-to-final exposure transfer is unverifiable')
         _budget_transfer['final_steps_by_arm'] = _final_steps_by_arm
+        _budget_transfer['final_tokens_by_arm'] = _final_tokens_by_arm
         if _search_steps is not None and _final_steps_by_arm:
             _mismatch = sorted(a for a, s in _final_steps_by_arm.items()
                                if s != _search_steps)
@@ -17612,6 +17638,23 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         elif _search_steps is None:
             warnings.append('the artifact does not declare search_steps; the tuning search '
                             'horizon cannot be compared with the final evaluation horizon')
+        if _trial_tokens_by_arm and _final_tokens_by_arm:
+            _tok_mismatch = []
+            for _arm, _final_tok in sorted(_final_tokens_by_arm.items()):
+                _trial_tok = _trial_tokens_by_arm.get(_arm)
+                if _trial_tok != [_final_tok]:
+                    _tok_mismatch.append(_arm)
+            _budget_transfer['tokens_equal'] = not _tok_mismatch
+            _budget_transfer['token_mismatch_arms'] = _tok_mismatch
+            if _tok_mismatch:
+                warnings.append(
+                    'the tuning trials and the final records for %s saw different '
+                    'token budgets (%s vs %s) — equal steps do not imply equal '
+                    'exposure, so the selected configuration was not tuned on the '
+                    'final training budget'
+                    % (', '.join(_tok_mismatch),
+                       {a: _trial_tokens_by_arm.get(a) for a in _tok_mismatch},
+                       {a: _final_tokens_by_arm.get(a) for a in _tok_mismatch}))
     _measured_final_seeds = sorted({s for _v in final_seed_coverage.values() for s in _v})
     _record_overlap = sorted(_search_set & set(_measured_final_seeds))
     if _record_overlap and final_records and not _seed_overlap:
@@ -19423,6 +19466,12 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             'the final records (search_steps=%r, final=%r)'
             % (_bt_transfer.get('search_steps'),
                _bt_transfer.get('final_steps_by_arm')))
+    if isinstance(_bt_transfer, dict) and _bt_transfer.get('tokens_equal') is False:
+        _bt_claim_reasons.append(
+            'hyperparameters were selected on a different token exposure than '
+            'the final records (trial=%r, final=%r)'
+            % (_bt_transfer.get('trial_tokens_by_arm'),
+               _bt_transfer.get('final_tokens_by_arm')))
     _bt_stability = _bt.get('selection_stability') or {}
     if any(isinstance(v, dict) and v.get('status') == 'ok' and v.get('stable') is False
            for v in _bt_stability.values()):

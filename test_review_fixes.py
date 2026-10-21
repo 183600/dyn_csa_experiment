@@ -4429,17 +4429,23 @@ def t_baseline_horizon_transfer_audit():
                 'final_records': {
                     'a::seed0': {'variant': 'a', 'seed': 0, 'ppl': 6.0,
                                  'steps': final_steps,
-                                 'hyperparams': dict(best['config'], steps=final_steps)}}}
+                                 'tokens_seen': final_steps * 8,
+                                 'hyperparams': dict(best['config'],
+                                                     steps=final_steps,
+                                                     tokens_seen=final_steps * 8)}}}
 
     good = L.baseline_tuning_audit(_art(10, 10), protocol=protocol)
     assert good['tuning_verified'] is True, good
     assert good['budget_transfer']['equal'] is True, good['budget_transfer']
+    assert good['budget_transfer']['tokens_equal'] is True, good['budget_transfer']
     assert not any('different training horizon' in w for w in good['warnings']), good
 
     mismatch = L.baseline_tuning_audit(_art(10, 20), protocol=protocol)
     assert mismatch['tuning_verified'] is True, mismatch
     assert mismatch['budget_transfer']['equal'] is False, mismatch['budget_transfer']
     assert mismatch['budget_transfer']['mismatch_arms'] == ['a'], mismatch['budget_transfer']
+    assert mismatch['budget_transfer']['tokens_equal'] is False, mismatch['budget_transfer']
+    assert mismatch['budget_transfer']['token_mismatch_arms'] == ['a'], mismatch['budget_transfer']
     assert any('NOT a fully tuned baseline at the final budget' in w
                for w in mismatch['warnings']), mismatch['warnings']
 
