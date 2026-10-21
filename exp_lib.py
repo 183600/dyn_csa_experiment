@@ -13722,11 +13722,23 @@ METRIC_POLICY = {
         'task': 'multiclass_classification',
         'primary': 'f1_macro',
         'primary_average': 'macro',
+        'primary_when_extreme_imbalance': 'pr_auc_macro',
+        'extreme_imbalance_threshold': 1e-3,
         'direction': 'higher_is_better',
-        'secondary': ['f1_micro', 'f1_weighted', 'balanced_accuracy', 'per_class_recall'],
-        'imbalance': 'macro averaging is required when class frequencies differ; micro equals accuracy for single-label tasks',
+        'secondary': ['f1_micro', 'f1_weighted', 'balanced_accuracy', 'per_class_recall',
+                      'macro_micro_f1_gap', 'pr_auc_macro', 'pr_auc_micro',
+                      'pr_auc_weighted', 'roc_auc_macro', 'roc_auc_micro',
+                      'roc_auc_weighted'],
+        'imbalance': ('macro averaging is required when class frequencies differ; micro equals '
+                      'accuracy for single-label tasks; when a class is rarer than 1:1000 the '
+                      'primary ranking endpoint switches to one-vs-rest macro PR-AUC'),
         'aggregation': 'macro',
-        'note': 'Every reported F1 must name macro, micro or weighted; report per-class recall when macro and micro disagree.',
+        'ranking': 'one-vs-rest macro/micro/weighted PR-AUC and ROC-AUC; the caller must name the averaging rule',
+        'note': ('Every reported F1 must name macro, micro or weighted; report per-class recall '
+                 'when macro and micro disagree. F1 is threshold-dependent, so a rare-class '
+                 'panel must also report threshold-free one-vs-rest PR-AUC. Macro treats every '
+                 'class equally, micro is dominated by frequent classes, and weighted follows '
+                 'the support: they can rank models differently.'),
     },
 }
 
@@ -13936,6 +13948,66 @@ def _binary_average_precision(y, score):
     precision = tp / np.maximum(tp + fp, 1)
     recall = tp / max(n_pos, 1)
     return float(np.sum(np.diff(np.r_[0.0, recall]) * precision))
+
+
+def _multiclass_ranking_metrics(y_true, y_score, labels):
+    """One-vs-rest PR-AUC/ROC-AUC for a 3+ class endpoint.
+
+    Each class is scored as a binary problem against its own score column.
+    ``macro`` is the unweighted mean over classes whose one-vs-rest endpoint is
+    defined (the class occurs and is not the entire sample); ``weighted`` uses
+    the class support; ``micro`` pools every one-vs-rest decision (the standard
+    flattened-label definition, which is dominated by frequent classes).  The
+    three can rank models differently under imbalance, so the caller must name
+    which one it reports.  Undefined classes are recorded explicitly instead of
+    being silently assigned 0 or 1.
+    """
+    y_true = np.asarray(y_true).ravel()
+    score = np.asarray(y_score, dtype=float)
+    labels = np.asarray(labels)
+    if score.ndim != 2 or score.shape[1] != labels.size:
+        raise ValueError(
+            f'multiclass ranking needs a column-per-label score matrix, got {score.shape} '
+            f'for {int(labels.size)} labels')
+    if score.shape[0] != y_true.size:
+        raise ValueError(f'y_score {score.shape} does not match y_true {y_true.shape}')
+    per_class, defined, supports, weights = {}, [], [], []
+    _y_onehot = np.zeros((y_true.size, labels.size), dtype=np.int64)
+    for i, lab in enumerate(labels):
+        y_bin = (y_true == lab).astype(np.int64)
+        _y_onehot[:, i] = y_bin
+        n_pos = int(y_bin.sum())
+        n_neg = int(y_bin.size - n_pos)
+        auc = _binary_roc_auc(y_bin, score[:, i]) if n_pos and n_neg else None
+        ap = _binary_average_precision(y_bin, score[:, i]) if n_pos and n_neg else None
+        per_class[str(lab)] = {'roc_auc': auc, 'pr_auc': ap, 'support': n_pos}
+        if auc is not None and ap is not None:
+            defined.append(str(lab))
+            supports.append(n_pos)
+            weights.append(float(n_pos))
+    out = {'per_class': per_class, 'defined_classes': defined,
+           'undefined_classes': [str(l) for l in labels if str(l) not in set(defined)],
+           'roc_auc_macro': None, 'roc_auc_weighted': None,
+           'pr_auc_macro': None, 'pr_auc_weighted': None,
+           'roc_auc_micro': None, 'pr_auc_micro': None,
+           'averaging': 'one-vs-rest; macro/weighted over defined classes, micro over pooled decisions',
+           'note': ('macro treats every class equally (sensitive to a rare class); micro is '
+                    'dominated by frequent classes; weighted follows the support. '
+                    'Undefined one-vs-rest classes are listed, not scored.')}
+    if defined:
+        out['roc_auc_macro'] = float(np.mean([per_class[c]['roc_auc'] for c in defined]))
+        out['pr_auc_macro'] = float(np.mean([per_class[c]['pr_auc'] for c in defined]))
+        if sum(weights) > 0:
+            out['roc_auc_weighted'] = float(np.average(
+                [per_class[c]['roc_auc'] for c in defined], weights=weights))
+            out['pr_auc_weighted'] = float(np.average(
+                [per_class[c]['pr_auc'] for c in defined], weights=weights))
+    _flat_y = _y_onehot.reshape(-1)
+    _flat_s = score.reshape(-1)
+    if _flat_y.size and _flat_y.min() == 0 and _flat_y.max() == 1:
+        out['roc_auc_micro'] = _binary_roc_auc(_flat_y, _flat_s)
+        out['pr_auc_micro'] = _binary_average_precision(_flat_y, _flat_s)
+    return out
 
 _BINARY_THRESHOLD_METRICS = ('f1', 'balanced_accuracy', 'youden_j')
 _BINARY_THRESHOLD_SOURCES = ('default_0.5', 'caller_threshold', 'caller_predictions',
@@ -14292,6 +14364,20 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         'per_class': per_class,
         'f1_averaging': 'macro, micro and weighted are all reported; the caller must name the primary one',
     }
+    if labels.size > 2:
+        # Macro and micro F1 answer different questions when classes are
+        # imbalanced.  Make the gap visible instead of letting one number stand
+        # in for the other.
+        out['macro_micro_f1_gap'] = float(macro_f1 - micro_f1)
+        _prev = [float(v) for v in out['prevalence'].values()]
+        out['minority_prevalence'] = min(_prev) if _prev else None
+        out['imbalance_ratio'] = (float((1.0 - min(_prev)) / min(_prev))
+                                  if _prev and min(_prev) > 0 else None)
+        if _prev and min(_prev) < 1e-3:
+            out['imbalance_warning'] = (
+                'a class is rarer than 1:1000 — report one-vs-rest macro PR-AUC '
+                '(pr_auc_macro) as the ranking endpoint; macro/micro/weighted F1 '
+                'answer different questions and ROC-AUC can look optimistic')
     if labels.size == 2:
         out['decision_threshold'] = _threshold_used
         out['decision_threshold_source'] = _threshold_source
@@ -14340,6 +14426,23 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         prev = out['prevalence'].get(str(pos), 0.0)
         if min(prev, 1.0 - prev) < 1e-3:
             out['imbalance_warning'] = ('positives rarer than 1:1000 — report PR-AUC with scores; F1 must name its averaging rule and recall should be reported per class')
+    if labels.size > 2 and y_score is not None:
+        _score = np.asarray(y_score, dtype=float)
+        if _score.ndim == 2:
+            _rank = _multiclass_ranking_metrics(y_true, _score, labels)
+            # Keep one per_class table: counts/F1 plus the one-vs-rest ranking
+            # values, so a class-level read does not need a second artifact.
+            for _lab, _vals in _rank.pop('per_class').items():
+                out['per_class'][_lab].update(_vals)
+            out.update(_rank)
+            out['threshold_free_metrics'] = [
+                'roc_auc_macro', 'roc_auc_micro', 'roc_auc_weighted',
+                'pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted']
+            out['ranking_averaging'] = 'one-vs-rest'
+        else:
+            out['ranking_unavailable_reason'] = (
+                'multiclass ranking needs a column-per-label score matrix; '
+                'a 1-D score is only interpretable for a binary endpoint')
     return out
 
 def metric_policy_audit(summary=None, policy=None):
@@ -14555,6 +14658,48 @@ def metric_policy_audit(summary=None, policy=None):
                     _class_issues.append(
                         f'{_label}: multiclass record is missing {_missing_f1}; '
                         'macro, micro and weighted F1 can disagree under class imbalance')
+                _rank_keys = ('pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted',
+                              'roc_auc_macro', 'roc_auc_micro', 'roc_auc_weighted')
+                _have_rank = [k for k in _rank_keys if _finite_scalar(r.get(k)) is not None]
+                if _have_rank and not (r.get('ranking_averaging')
+                                       or r.get('ranking_average')):
+                    out['warnings'].append(
+                        f'{_label} reports {_have_rank} without naming the one-vs-rest '
+                        'aggregation (macro/micro/weighted)')
+                # When per-class ranking values and supports are present, the
+                # reported macro/weighted aggregates must be reproducible.
+                _pc_r = r.get('per_class')
+                if isinstance(_pc_r, dict) and _pc_r:
+                    _pa, _ra, _rw, _ww = [], [], [], []
+                    for _k, _v in _pc_r.items():
+                        if not isinstance(_v, dict):
+                            continue
+                        _ap = _finite_scalar(_v.get('pr_auc'))
+                        _au = _finite_scalar(_v.get('roc_auc'))
+                        _sup = _exact_count(_v.get('support'), minimum=0)
+                        if _ap is None or _au is None or _sup is None:
+                            continue
+                        _pa.append(_ap)
+                        _ra.append(_au)
+                        _rw.append(_sup)
+                        _ww.append(_sup)
+                    _pm = _finite_scalar(r.get('pr_auc_macro'))
+                    if _pa and _pm is not None and abs(_pm - float(np.mean(_pa))) > 1e-9:
+                        _class_issues.append(
+                            f'{_label}: pr_auc_macro={_pm} is not the mean of its '
+                            f'per-class one-vs-rest PR-AUC values ({float(np.mean(_pa))})')
+                    _rm = _finite_scalar(r.get('roc_auc_macro'))
+                    if _ra and _rm is not None and abs(_rm - float(np.mean(_ra))) > 1e-9:
+                        _class_issues.append(
+                            f'{_label}: roc_auc_macro={_rm} is not the mean of its '
+                            f'per-class one-vs-rest ROC-AUC values ({float(np.mean(_ra))})')
+                    if _pa and sum(_rw) > 0:
+                        _pw = float(np.average(_pa, weights=_ww))
+                        _rpw = _finite_scalar(r.get('pr_auc_weighted'))
+                        if _rpw is not None and abs(_rpw - _pw) > 1e-9:
+                            _class_issues.append(
+                                f'{_label}: pr_auc_weighted={_rpw} is not the support-weighted '
+                                f'mean of its per-class PR-AUC values ({_pw})')
             # f1_primary must be the field its declared averaging names.
             if 'f1_primary' in r:
                 _f1p = _finite_scalar(r.get('f1_primary'))
@@ -14689,7 +14834,9 @@ def metric_policy_audit(summary=None, policy=None):
                 if _thr_src == 'default_0.5' and _t is not None and abs(_t - 0.5) > 1e-12:
                     _class_issues.append(
                         f'{_label}: source is default_0.5 but decision_threshold={_t}')
-            for _key in ('roc_auc', 'pr_auc', 'brier_score', 'ece'):
+            for _key in ('roc_auc', 'pr_auc', 'brier_score', 'ece',
+                         'roc_auc_macro', 'roc_auc_micro', 'roc_auc_weighted',
+                         'pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted'):
                 if _key in r and r.get(_key) is not None:
                     _v = _finite_scalar(r.get(_key))
                     if _v is None or not (0.0 <= _v <= 1.0):
@@ -14702,10 +14849,14 @@ def metric_policy_audit(summary=None, policy=None):
                     'score orientation and positive_label before interpreting the model as weak')
             # A rare-positive panel that reports only ROC-AUC is exactly the
             # optimistic-score failure mode this policy exists to prevent.
+            # For multiclass records the minority class prevalence is the
+            # minimum over the full class distribution, not a binary 2-entry
+            # dict: a 1:1000 third class must trigger the same warning.
             prevalence = None
             for key in ('prevalence', 'positive_prevalence'):
                 val = r.get(key)
-                if isinstance(val, dict) and len(val) == 2:
+                if isinstance(val, dict) and val and (task != 'binary_classification'
+                                                      or len(val) == 2):
                     # A malformed prevalence entry is unverifiable, not a
                     # reason to abort the whole audit.  Only finite values in
                     # [0, 1] define a class prevalence.
@@ -14715,7 +14866,8 @@ def metric_policy_audit(summary=None, policy=None):
                         break
                 _prev_f = _finite_scalar(val)
                 if _prev_f is not None and 0.0 <= _prev_f <= 1.0:
-                    prevalence = min(_prev_f, 1.0 - _prev_f)
+                    prevalence = (min(_prev_f, 1.0 - _prev_f)
+                                  if task == 'binary_classification' else _prev_f)
                     break
             if task == 'binary_classification' and prevalence is not None:
                 _pr_p = _finite_scalar(r.get('pr_auc_prevalence'))
@@ -14753,20 +14905,29 @@ def metric_policy_audit(summary=None, policy=None):
                         f'{task!r}; the policy primary is {sorted(_allowed_primary)}')
             if prevalence is not None and prevalence < 1e-3:
                 _cond = (METRIC_POLICY.get(task) or {}).get(
-                    'primary_when_extreme_imbalance', 'pr_auc')
-                if r.get('roc_auc') is not None and r.get('pr_auc') is None:
-                    out['warnings'].append(f"{_label} reports ROC-AUC but no PR-AUC at prevalence {prevalence:.2e} (<1:1000); PR-AUC is the primary ranking metric here")
-                if r.get('pr_auc') is not None and r.get('pr_auc_prevalence') is None:
+                    'primary_when_extreme_imbalance',
+                    'pr_auc_macro' if task == 'multiclass_classification' else 'pr_auc')
+                _is_mc = task == 'multiclass_classification'
+                _roc_key = 'roc_auc_macro' if _is_mc else 'roc_auc'
+                _pr_key = 'pr_auc_macro' if _is_mc else 'pr_auc'
+                if r.get(_roc_key) is not None and r.get(_pr_key) is None:
+                    out['warnings'].append(
+                        f"{_label} reports {_roc_key} but no {_pr_key} at prevalence "
+                        f"{prevalence:.2e} (<1:1000); PR-AUC ({_pr_key}) is the primary "
+                        'ranking metric here')
+                if (not _is_mc and r.get('pr_auc') is not None
+                        and r.get('pr_auc_prevalence') is None):
                     out['warnings'].append(f"{_label} reports a rare-positive PR-AUC without its prevalence floor; PR-AUC must be read against chance prevalence")
                 if _declared_primary is not None and _declared_primary != _cond:
                     _class_issues.append(
                         f'{_label}: declares primary_metric={_declared_primary!r} at '
                         f'prevalence {prevalence:.2e} (<1:1000); the conditional '
                         f'policy primary is {_cond!r}')
-                if r.get('pr_auc') is None and (r.get('f1_primary') is not None
-                                                or r.get('f1') is not None):
+                if r.get(_pr_key) is None and (r.get('f1_primary') is not None
+                                               or r.get('f1') is not None
+                                               or r.get('f1_macro') is not None):
                     _class_issues.append(
-                        f'{_label}: reports F1 without PR-AUC at prevalence '
+                        f'{_label}: reports F1 without {_pr_key} at prevalence '
                         f'{prevalence:.2e} (<1:1000); F1 is threshold-dependent and '
                         'cannot be the primary endpoint here')
         if _class_recs:

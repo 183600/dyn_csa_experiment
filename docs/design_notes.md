@@ -1682,3 +1682,25 @@ TP/FP/FN 计数，`compression_report` 同时落盘：
 审计只对 micro 声明强制调和关系；macro 记录若没有 micro 计数，会明确标为
 `macro_f1_reconstructible=False`，不再用一个错误的恒等式把正确读数判错，
 也不假装能离线复现它。
+
+### 35.5 多分类也要有 threshold-free 排序口径
+
+多分类记录过去只有 accuracy 与 macro/micro/weighted F1。F1 依赖决策规则；
+当某个类只占 1:1000 时，micro-F1 会被多数类主导，macro-F1 又无法说明排序
+质量。现在 `classification_metrics` 对 3 类以上的列式分数矩阵额外给出
+one-vs-rest 的 `pr_auc_macro` / `pr_auc_micro` / `pr_auc_weighted` 与
+`roc_auc_macro` / `roc_auc_micro` / `roc_auc_weighted`，并把每类的
+PR-AUC/ROC-AUC 放进 `per_class`：
+
+- **macro**：只在 one-vs-rest 端点有定义的类上等权平均（缺失类列入
+  `undefined_classes`，不伪造 0/1 分）；
+- **weighted**：按类 support 加权；
+- **micro**：把所有 one-vs-rest 决策展平后池化，会被多数类主导。
+
+`macro`、`micro`、`weighted` 在类别不平衡时可能给出不同排名，因此记录必须
+同时声明 `ranking_averaging="one-vs-rest"`。`metric_policy_audit` 现在也对
+多分类记录取最小类 prevalence；若低于 1:1000，条件主指标切换为
+`pr_auc_macro`，只报 F1 或只报 ROC-AUC 会被标为不可作为主结论。per-class
+值与 support 存在时，macro/weighted 聚合必须能被 per-class 值复现，手改
+聚合值会被审计拒绝。`METRIC_POLICY['multiclass_classification']` 同时记录
+`macro_micro_f1_gap`，让 macro 与 micro 的分歧显式可见。

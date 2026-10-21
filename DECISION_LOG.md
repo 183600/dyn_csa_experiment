@@ -369,3 +369,23 @@ event counters or validation curve say non-finite, and warns on unhealthy or
 un-triaged legacy records. The efficiency summary also flags PPL comparisons
 made across different `tokens_seen` budgets and falls back to the recorded
 training peak memory when the timing record has none.
+
+## 2026-10-21 — multiclass ranking metrics + imbalance audit (no new runs)
+
+Changed only zero-GPU metric and audit paths; no panel, frozen manifest, test
+split, README or CI configuration was touched. (1) `classification_metrics`
+now computes one-vs-rest `pr_auc_macro`/`pr_auc_micro`/`pr_auc_weighted` and
+`roc_auc_macro`/`roc_auc_micro`/`roc_auc_weighted` for 3+ class labels, plus
+per-class PR-AUC/ROC-AUC, `undefined_classes`, `macro_micro_f1_gap`,
+`minority_prevalence` and `imbalance_ratio`. The record must name
+`ranking_averaging="one-vs-rest"`, because macro (equal class weight), micro
+(pooled, frequency-dominated) and weighted (support) can disagree under
+imbalance. (2) `METRIC_POLICY['multiclass_classification']` now declares those
+endpoints and switches its conditional primary to `pr_auc_macro` when a class
+is rarer than 1:1000. (3) `metric_policy_audit` derives the minority prevalence
+from the full multiclass distribution (previously only two-class dicts were
+read), requires PR-AUC at extreme imbalance, checks the one-vs-rest averaging
+declaration and reproduces macro/weighted ranking aggregates from per-class
+values. (4) Tests cover perfect/imperfect/undefined rankings, impossible
+hand-edited aggregates and the extreme-imbalance warnings. The temporary issue
+list was removed after the fixes.

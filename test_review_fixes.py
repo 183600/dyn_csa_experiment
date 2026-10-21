@@ -3555,6 +3555,68 @@ def t_metric_policy_and_classification_metrics():
     assert ma['status'] == 'warn' and any('boundary' in w for w in ma['warnings']), ma
 
 
+def t_multiclass_ranking_metrics_and_audit():
+    # One-vs-rest ranking endpoints: a perfect ranking must be perfect under
+    # macro, micro and weighted averaging.
+    y = np.array([0] * 80 + [1] * 15 + [2] * 5)
+    score = np.zeros((len(y), 3))
+    for i, c in enumerate([0, 1, 2]):
+        score[y == c, i] = 1.0
+    m = L.classification_metrics(y, y_score=score, labels=[0, 1, 2])
+    assert m['ranking_averaging'] == 'one-vs-rest', m
+    for key in ('pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted',
+                'roc_auc_macro', 'roc_auc_micro', 'roc_auc_weighted'):
+        assert abs(m[key] - 1.0) < 1e-12, (key, m[key])
+    assert m['per_class']['2']['pr_auc'] == 1.0, m['per_class']
+    assert m['per_class']['2']['roc_auc'] == 1.0, m['per_class']
+    # Macro is equal-weight over classes, so it must not equal a support-
+    # weighted or pooled (micro) aggregate when the classes differ in size and
+    # the ranking is imperfect.  This is exactly why the averaging must be named.
+    rng = np.random.default_rng(3)
+    scores = np.stack([rng.random(len(y)) for _ in range(3)], axis=1)
+    mi = L.classification_metrics(y, y_score=scores, labels=[0, 1, 2])
+    assert mi['pr_auc_macro'] != mi['pr_auc_micro'] or mi['pr_auc_macro'] != mi['pr_auc_weighted'], mi
+    assert 0.0 <= mi['pr_auc_macro'] <= 1.0 and 0.0 <= mi['pr_auc_micro'] <= 1.0
+    assert abs(mi['macro_micro_f1_gap'] - (mi['f1_macro'] - mi['f1_micro'])) < 1e-12
+    # A requested class absent from the sample has an undefined one-vs-rest
+    # endpoint; it is listed rather than assigned a fake score, and the macro
+    # average covers only the defined classes.
+    m_undef = L.classification_metrics(np.array([0, 0, 1, 1]),
+                                       y_score=np.array([[0.9, 0.1, 0.0], [0.8, 0.2, 0.0],
+                                                         [0.1, 0.9, 0.0], [0.2, 0.8, 0.0]]),
+                                       labels=[0, 1, 2])
+    assert m_undef['per_class']['2']['pr_auc'] is None
+    assert m_undef['per_class']['2']['roc_auc'] is None
+    assert '2' in m_undef['undefined_classes']
+    assert abs(m_undef['pr_auc_macro'] - np.mean(
+        [m_undef['per_class'][c]['pr_auc'] for c in ('0', '1')])) < 1e-12
+    # Extreme multiclass imbalance must switch the conditional primary to
+    # macro PR-AUC and flag a record that reports only F1.
+    y2 = np.array([0] * 1990 + [1] * 9 + [2] * 1)
+    score2 = np.zeros((len(y2), 3))
+    for i, c in enumerate([0, 1, 2]):
+        score2[y2 == c, i] = 1.0
+    m2 = L.classification_metrics(y2, y_score=score2, labels=[0, 1, 2])
+    assert abs(m2['minority_prevalence'] - 1.0 / 2000.0) < 1e-15, m2['minority_prevalence']
+    assert 'pr_auc_macro' in m2['imbalance_warning'], m2
+    assert L.METRIC_POLICY['multiclass_classification']['primary_when_extreme_imbalance'] == 'pr_auc_macro'
+    good = dict(m2, variant='mc', task='multiclass_classification')
+    assert L.metric_policy_audit({'mc': good})['status'] == 'ok', L.metric_policy_audit({'mc': good})
+    no_rank = {k: v for k, v in good.items() if not k.startswith(('pr_auc_', 'roc_auc_'))}
+    nr = L.metric_policy_audit({'mc': no_rank})
+    assert nr['status'] == 'warn', nr
+    assert any('pr_auc_macro' in w for w in nr['warnings']), nr
+    # A hand-edited aggregate cannot pass when per-class values exist.
+    forged = dict(good, pr_auc_macro=0.5)
+    fr = L.metric_policy_audit({'mc': forged})
+    assert fr['status'] == 'warn' and any('pr_auc_macro' in w and 'mean' in w
+                                         for w in fr['warnings']), fr
+    # Declaring a binary ranking metric as the multiclass primary is rejected.
+    wrong = dict(good, primary_metric='roc_auc')
+    wr = L.metric_policy_audit({'mc': wrong})
+    assert wr['status'] == 'warn' and any('primary_metric' in w for w in wr['warnings']), wr
+
+
 def t_metric_policy_checks_record_values():
     # The declared token-weighted PPL must match the record's own NLL
     # accounting; a per-sequence arithmetic mean is a different estimand.
@@ -11038,6 +11100,7 @@ def main():
     _check('H1 hypothesis direction conflict', t_hypothesis_direction_conflict)
     _check('H2 metric policy + macro/micro/weighted F1 + PR/ROC-AUC', t_metric_policy_and_classification_metrics)
     _check('H2a metric audit checks record aggregation/ranges', t_metric_policy_checks_record_values)
+    _check('H2b multiclass one-vs-rest ranking metrics + imbalance audit', t_multiclass_ranking_metrics_and_audit)
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
     _check('H3a tuning grid boundary/coverage adequacy', t_tuning_grid_boundary_adequacy)
     _check('H3a multi-seed selection + equal search-seed audit', t_baseline_multi_seed_selection_audit)
