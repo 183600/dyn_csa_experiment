@@ -584,6 +584,20 @@ def t_token_error_cause_taxonomy():
     assert unmeasured['primary'] == 'unmeasured', unmeasured
 
 
+def t_loss_curve_downsample_keeps_spikes_and_nan():
+    # Long runs are downsampled before the curve is written.  A one-step
+    # explosion/NaN must survive that reduction, or a diverged run looks clean.
+    vals = [float(i) for i in range(5000)]
+    vals[1234] = float('nan')
+    vals[2345] = 999.0
+    out = L._reduce_curve_values(vals, 100)
+    assert len(out) <= 100, len(out)
+    assert out[0] == 0.0 and out[-1] == 4999.0, (out[0], out[-1])
+    assert any(isinstance(v, float) and math.isnan(v) for v in out), 'NaN spike was dropped'
+    assert 999.0 in out, 'loss spike was dropped'
+    assert L._reduce_curve_values([1.0, 2.0, 3.0], 100) == [1.0, 2.0, 3.0]
+
+
 def t_final_loss_smoothed_uses_last_steps():
     # `final_loss_smoothed` must describe the final 50 steps.  Reading a
     # scalar only on sparse diagnostic steps made the old value an average of

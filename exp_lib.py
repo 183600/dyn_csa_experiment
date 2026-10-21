@@ -20421,11 +20421,60 @@ def _cell_curve_data(outdir, rec):
         return {}
 
 
+def _reduce_curve_values(vals, max_points):
+    """Downsample a loss curve while preserving spikes and non-finite points.
+
+    A plain ``linspace`` stride can drop a one-step NaN/explosion between two
+    retained samples, making a diverged long run look clean in the artifact.
+    Each bin therefore keeps its first/last index, its finite min/max and the
+    first non-finite index.  The result is sorted and bounded by
+    ``max_points`` (7 slots per bin).
+    """
+    n = len(vals)
+    max_points = int(max_points)
+    if n <= max_points:
+        return list(vals)
+    nb = max(1, max_points // 7)
+    first = [-1] * nb
+    last = [-1] * nb
+    mini = [-1] * nb
+    maxi = [-1] * nb
+    badi = [-1] * nb
+    minv = [0.0] * nb
+    maxv = [0.0] * nb
+    for i, v in enumerate(vals):
+        b = min(nb - 1, (i * nb) // n)
+        if first[b] < 0:
+            first[b] = i
+        last[b] = i
+        try:
+            f = float(v)
+        except (TypeError, ValueError, OverflowError):
+            f = None
+        if f is None or not math.isfinite(f):
+            if badi[b] < 0:
+                badi[b] = i
+            continue
+        if mini[b] < 0 or f < minv[b]:
+            mini[b] = i
+            minv[b] = f
+        if maxi[b] < 0 or f > maxv[b]:
+            maxi[b] = i
+            maxv[b] = f
+    keep = set()
+    for i in range(nb):
+        for _ix in (first[i], mini[i], maxi[i], badi[i], last[i]):
+            if _ix >= 0:
+                keep.add(int(_ix))
+    if n:
+        keep.add(n - 1)
+    return [vals[i] for i in sorted(keep)]
+
+
 def _curve_extend(dst, new):
     dst.extend(new)
     if len(dst) > 2 * _CURVE_MAX_POINTS:
-        _idx = np.linspace(0, len(dst) - 1, num=_CURVE_MAX_POINTS).round().astype(np.int64)
-        dst[:] = [dst[int(_i)] for _i in _idx]
+        dst[:] = _reduce_curve_values(dst, _CURVE_MAX_POINTS)
 
 
 def _curve_append_point(dst, point):
