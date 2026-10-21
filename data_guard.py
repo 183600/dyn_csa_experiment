@@ -2244,6 +2244,7 @@ class LeakageSafeTargetEncoder:
         if not allow_train and self.train_fp_ is not None:
             _same_rows = _categorical_fingerprint(Xarr) == self.train_fp_
             if (not _same_rows and self.train_row_set_fp_ is not None
+                    and int(Xarr.shape[0]) == int(self.n_train_)
                     and _categorical_row_set_fingerprint(Xarr)
                     == self.train_row_set_fp_):
                 _same_rows = True
