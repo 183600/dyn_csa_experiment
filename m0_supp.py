@@ -32,7 +32,17 @@ B 档落在两处代码支撑上（均在 exp_lib.py）：
            M0_PANEL=S2 切换到 S2 主面板（RUN_S2：同 B_ARMS、同
            seq8192/bs8 几何，5 臂 × 3 seeds × 12B token，results_b_s2/，
            规划值口径同 S1 主面板）；面板选择只影响 run 配置
-           与记账，data / smoke / kernel 与面板无关。
+           与记账，data / smoke / kernel 与面板无关。M0_AUTO_CHAIN=S1,S2
+           可让 full 顺序串行多个面板（各自的 cap/状态文件，中间不关机）。
+  auto     无人值守入口（「G0 结果出来后人工决定 B 档是否继续」的自动化）：
+           kernel（G0 套件，fail-closed：数值失败即退出、基准/TOST 未达
+           门限不写证书）→ require_g0 证书复核（绑定当前 git 树/代码/内核
+           戳）→ 自动启动面板链。面板选择同 full（默认 S1；M0_AUTO_CHAIN=
+           S1,S2 串行；M0_PANEL 单选）。证书已对本树有效时跳过重验证直接
+           续跑；G0 通过后面板默认 CSA_KERNEL=1（调用方显式设置优先）。
+           任一门失败：不启动面板、不 push、留 40 分钟诊断窗口后关机——
+           「证书存在 = 双判据全过 = 继续」由机器执行，剩余人工点只有
+           平台侧的会话重启。
 
 运行时上限：按面板取 M0_CAP / M2_CAP（可用 M0_CAP_HOURS /
 M2_CAP_HOURS 覆盖），状态文件 run_time_state_m0.json /
@@ -960,11 +970,31 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
     return report
 
 
-def run_full():
-    panel = (os.environ.get('M0_PANEL') or 'S1').strip().upper()
-    if panel not in ('S1', 'S2'):
-        print(f"[m0] unknown M0_PANEL {panel!r}; expected 'S1' or 'S2'.  Nothing was started.")
+def _panel_chain_from_env():
+    """Resolve the panel chain: M0_AUTO_CHAIN (comma list) > M0_PANEL > S1.
+
+    `full` keeps its single-panel semantics unless M0_AUTO_CHAIN is set;
+    `auto` uses the same resolver so both entry points agree on panel choice.
+    Each panel keeps its own cap / state file; chaining only sequences them.
+    """
+    raw = (os.environ.get('M0_AUTO_CHAIN') or os.environ.get('M0_PANEL') or 'S1').strip()
+    panels = [p.strip().upper() for p in raw.split(',') if p.strip()]
+    bad = [p for p in panels if p not in ('S1', 'S2')]
+    if bad or not panels:
+        print(f"[m0] unknown panel(s) {bad or raw!r} in M0_AUTO_CHAIN/M0_PANEL={raw!r}; expected 'S1' or 'S2'.  Nothing was started.")
         raise SystemExit(2)
+    if len(panels) > 1:
+        print(f'[m0] panel chain: {" -> ".join(panels)} (sequential; each panel keeps its own cap/state file; no shutdown between panels)')
+    return panels
+
+
+def _run_panel(panel):
+    """One scale panel: G0 gate -> overfit guard -> calibration -> training.
+
+    No shutdown decision here: the caller (run_full / run_auto) owns the
+    end-of-run shutdown so a multi-panel chain never powers off mid-way.
+    Returns the final push status.
+    """
     run_cfg, cap, cap_env = (L.RUN_S1, L.M0_CAP, 'M0_CAP_HOURS') if panel == 'S1' else (L.RUN_S2, L.M2_CAP, 'M2_CAP_HOURS')
     # The compute plan makes G0 a hard precondition for the scale panels, so
     # check it before the pre-flight work starts.
@@ -995,18 +1025,85 @@ def run_full():
     L.run(run_cfg, guard=guard, label=f'M0/{_what}')
     push_ok &= git_push(f'm0: {_what}完成一轮（{run_cfg["outdir"]} 为本地实验产物，不入库；量值以 summary.json 现算为准）')
     guard.report()
+    print(f'\n[m0] {panel} panel round DONE.')
+    return push_ok
+
+
+def run_full():
+    panels = _panel_chain_from_env()
+    push_ok = True
+    for panel in panels:
+        push_ok &= _run_panel(panel)
     print('\n[m0] DONE.')
     schedule_shutdown(90 if push_ok else 2400)
     if not push_ok:
         print('[m0] WARNING: final push failed — instance stays up 40 min for a retry, then shuts down. Results are safe on the data disk either way.')
+
+
+def _g0_already_valid():
+    """True when a G0 certificate binding THIS tree/code/kernel stamp exists.
+
+    Mirrors the accept/reject logic of `L.require_g0` (load + mismatch)
+    without its SystemExit, so `auto` can use it as a fast-path probe: a
+    resume after an interrupted panel must not re-burn the kernel suite.
+    The explicit debug override env is deliberately NOT consulted here —
+    `auto` never treats an override as a green gate.
+    """
+    cert = L.load_g0_certificate(L.g0_certificate_path())
+    return cert is not None and L._g0_mismatch(cert) is None
+
+
+def run_auto():
+    """Unattended entry: G0 kernel gate -> certificate re-check -> panel chain.
+
+    Automates the old human decision point "once the G0 numbers are in,
+    decide whether the B-tier panels may start":
+      * `run_kernel()` is fail-closed — a numeric mismatch exits 1, and a
+        benchmark/TOST below the gate writes NO certificate;
+      * `L.require_g0('M0/auto')` then re-verifies the certificate binds this
+        tree, so a missing/stale certificate stops the chain BEFORE any panel
+        GPU time (the only bypass stays the explicit debug override, which
+        `auto` never sets on its own);
+      * a certificate already valid for this tree skips the (minutes-long)
+        re-verification — a resume goes straight back to the panel;
+      * after a green gate the panels default to kernel mode (CSA_KERNEL=1)
+        because that is the path G0 certifies as fast enough for the ladder;
+        an explicit CSA_KERNEL from the caller always wins.
+    A gate failure starts no panel, pushes nothing, leaves a 40-minute
+    diagnosis window, and exits non-zero.
+    """
+    if _g0_already_valid():
+        print('[m0-auto] a G0 certificate valid for this tree already exists — skipping the kernel re-verification (fast path)')
+    else:
+        print('[m0-auto] gate 1/2: running the G0 kernel/eager equivalence + benchmark suite (fail-closed)')
+        try:
+            run_kernel()
+            print('[m0-auto] gate 2/2: re-verifying the G0 certificate for this tree')
+            L.require_g0('M0/auto')
+        except SystemExit:
+            print('[m0-auto] G0 gate FAILED — the B-tier panel(s) are NOT started. This was the automated decision '
+                  'point: no certificate, no scale run. Instance stays up 40 min for diagnosis (cancel: pkill -f m0autoshutdown).')
+            schedule_shutdown(2400)
+            raise
+    if 'CSA_KERNEL' not in os.environ:
+        os.environ['CSA_KERNEL'] = '1'
+        print('[m0-auto] CSA_KERNEL=1 (kernel mode — G0 certified this path); set CSA_KERNEL explicitly to override')
+    panels = _panel_chain_from_env()
+    push_ok = True
+    for panel in panels:
+        push_ok &= _run_panel(panel)
+    print('\n[m0-auto] DONE.')
+    schedule_shutdown(90 if push_ok else 2400)
+    if not push_ok:
+        print('[m0-auto] WARNING: final push failed — instance stays up 40 min for a retry, then shuts down. Results are safe on the data disk either way.')
 
 if __name__ == '__main__':
     mode = sys.argv[1] if len(sys.argv) > 1 else ''
     if mode in ('-h', '--help'):
         print(__doc__ or '')
         raise SystemExit(0)
-    if mode not in ('params', 'data', 'smoke', 'kernel', 'full', 'analysis'):
-        print(f"[m0] unknown or missing mode {mode!r}; expected one of 'params' / 'data' / 'smoke' / 'kernel' / 'full' / 'analysis' (all phases are explicit — nothing starts by default).  Nothing was started.")
+    if mode not in ('params', 'data', 'smoke', 'kernel', 'full', 'auto', 'analysis'):
+        print(f"[m0] unknown or missing mode {mode!r}; expected one of 'params' / 'data' / 'smoke' / 'kernel' / 'full' / 'auto' / 'analysis' (all phases are explicit — nothing starts by default).  Nothing was started.")
         raise SystemExit(2)
     try:
         _gpu = torch.cuda.get_device_name(0)
@@ -1024,11 +1121,13 @@ if __name__ == '__main__':
             run_kernel()
         elif mode == 'full':
             run_full()
+        elif mode == 'auto':
+            run_auto()
         elif mode == 'analysis':
             scale_analysis()
     except Exception:
         traceback.print_exc()
-        if mode == 'full':
+        if mode in ('full', 'auto'):
             print('\n[m0] CRASHED — attempting a partial-results push, then the instance stays up 40 min for remote diagnosis before auto-shutdown (cancel with: pkill -f m0autoshutdown).')
             try:
                 git_push('m0: PARTIAL — run crashed, see run_m0.log (resume by re-running: completed runs are skipped)')

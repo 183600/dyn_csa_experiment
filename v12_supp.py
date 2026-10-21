@@ -34,9 +34,14 @@
 
 模式：
   python v12_supp.py smoke            # 端到端自检（微型 ckpt + 冻结清单副本）
-  python v12_supp.py plan             # 零 GPU 预检：戳/实现绑定/准入/功效，不读 test
+  python v12_supp.py plan             # 零 GPU 预检：戳/实现绑定/准入/功效，不读 test；
+                                      # 通过后自动把快照留档到 analysis_v12/plan_snapshot.json
   python v12_supp.py power            # 零 GPU：用 P5C validation 差值做精确条件功效（同样不读 test）
   python v12_supp.py full             # P5C -> P5H -> P5PW -> P5T -> P5MP -> P5S2/P5S3 -> report
+  python v12_supp.py auto             # 无人值守：与 full 同链，但把「plan 预检通过」的
+                                      # 全部机器可查证据（清单哈希/代码戳/git 树/四个人工
+                                      # 核对字段：arms/seeds/主比较/α）自动落盘为审计快照，
+                                      # 人工核对变为事后异步，不再阻塞链的启动
   python v12_supp.py phase P5C        # 单阶段（可断点续跑）
   python v12_supp.py phase P5PW       # 仅功效预检
   python v12_supp.py analysis         # 零 GPU：确认性统计 -> analysis_v12/
@@ -2420,6 +2425,57 @@ def _plan_recipe(manifest, arm, mr):
             f"_dfplan_gc1.0_b0.9,0.999_eps1e-08_tkplan_detplan_trfpplan")
 
 
+def _archive_plan_snapshot(report, manifest, manifest_path=FREEZE_MANIFEST, outdir='analysis_v12'):
+    """Persist what the plan gate approved, for post-hoc audit of an unattended run.
+
+    The old protocol had a human pause between `plan` and the confirmation
+    chain.  The automated gate replaces it with machine checks; this snapshot
+    is the durable record of exactly those checks at approval time — the four
+    fields a human would have eyeballed (arms / seeds / primary comparisons /
+    alpha), the manifest sha256, the code stamp and the git tree — so the
+    review can happen asynchronously (even after the one-shot P5T access)
+    instead of blocking the run.  Local artifact by design (analysis_*/ is
+    gitignored; the tamper-evident binding lives in the freeze lock and the
+    per-record manifest_sha256).  A write failure must not fail an otherwise
+    passed plan — the warning keeps the gap visible.
+    """
+    if os.path.abspath(str(manifest_path)) != os.path.abspath(FREEZE_MANIFEST):
+        # A smoke/test manifest is a plumbing roundtrip, not a pre-registration;
+        # only the real freeze gets the durable audit snapshot (otherwise a
+        # smoke plan_check would silently overwrite the confirmation record).
+        return
+    try:
+        _git = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True)
+        _head = _git.stdout.strip() if _git.returncode == 0 else None
+        _stat = (manifest.get('statistics') or {})
+        _comps = [{'name': c.get('name'), 'a': c.get('a'), 'b': c.get('b'), 'endpoint': c.get('endpoint')}
+                  for c in (manifest.get('primary_comparisons') or []) if isinstance(c, dict)]
+        snap = {
+            'archived_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+            'archived_at_epoch': time.time(),
+            'purpose': ('audit record of the automated plan gate: what the machine approved '
+                        'before P5C training and the one-shot P5T test access'),
+            'git_head': _head,
+            'code_semantics': L.CODE_SEMANTICS,
+            'manifest': manifest_path,
+            'manifest_sha256': report.get('manifest_sha256'),
+            'human_review': {
+                'arms': list(manifest.get('arms') or []),
+                'seeds': list(manifest.get('seeds') or []),
+                'primary_comparisons': _comps,
+                'alpha': _stat.get('alpha', 0.05),
+                'min_seeds_for_confirmation': _stat.get('min_seeds_for_confirmation'),
+                'decision_rule': _stat.get('decision_rule'),
+            },
+            'plan': report,
+        }
+        os.makedirs(outdir, exist_ok=True)
+        L.atomic_write_json(os.path.join(outdir, 'plan_snapshot.json'), snap, indent=2)
+        print(f'[v12 plan] snapshot archived -> {outdir}/plan_snapshot.json (unattended-run audit record; the human review is now asynchronous and non-blocking)')
+    except Exception as _e:
+        print(f'[v12 plan] WARNING: plan snapshot not archived ({type(_e).__name__}: {_e}) — the checks passed, but keep the console log as the audit record')
+
+
 def plan_check(manifest_path=FREEZE_MANIFEST):
     """Zero-GPU pre-flight for the frozen confirmation plan.
 
@@ -2593,6 +2649,7 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         print(f'  [plan] {_a:32s} eager_batch={_p["eager_batch"]} amp={_p["amp_dtype"]} mr={(_per_arm.get(_a) or {}).get("mr", 4.0)} params={_p.get("params")}')
     for _n in notes:
         print(f'  [plan][note] {_n}')
+    _archive_plan_snapshot(report, m, manifest_path)
     globals()['_PLAN_DONE'] = True
     return report
 
@@ -2648,7 +2705,7 @@ if __name__ == '__main__':
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
-    _MODES = ('full', 'smoke', 'plan', 'analysis', 'report', 'phase', 'finaltest', 'power')
+    _MODES = ('full', 'smoke', 'plan', 'analysis', 'report', 'phase', 'finaltest', 'power', 'auto')
     if mode in ('-h', '--help', 'help'):
         print(__doc__)
         raise SystemExit(0)
@@ -2677,6 +2734,11 @@ if __name__ == '__main__':
             git_push(f'v12: phase {sys.argv[2]} results')
         elif mode == 'finaltest':
             run_finaltest(dict(FINALTEST_CFG))
+        elif mode == 'auto':
+            # Unattended entry: run_full already runs the zero-GPU plan gate
+            # (fail-closed) before any GPU time and archives the approval
+            # snapshot; `auto` is the explicit no-human-pause name for it.
+            run_full()
         else:
             run_full()
     except Exception:
@@ -2685,6 +2747,6 @@ if __name__ == '__main__':
             git_push('v12: PARTIAL — crashed, see log (re-run resumes)')
         except Exception:
             traceback.print_exc()
-        if mode == 'full':
+        if mode in ('full', 'auto'):
             schedule_shutdown(2400)
         sys.exit(1)

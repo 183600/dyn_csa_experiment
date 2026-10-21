@@ -159,6 +159,10 @@ python m0_supp.py smoke    # 端到端自检：B 档数据路径 + 三条注意�
 python m0_supp.py kernel   # G0 套件：kernel/eager 数值对照 + 吞吐基准
 python m0_supp.py full     # S1 主面板（5 臂 × 4 seeds；CSA_PAR=auto 可用）
 M0_PANEL=S2 python m0_supp.py full   # S2 主面板（5 臂 × 3 seeds × 12B；M2_CAP_HOURS 可覆盖）
+python m0_supp.py auto     # 无人值守：G0 门（fail-closed）→ 证书复核 → 面板链自动启动；
+                           #   默认 S1，M0_AUTO_CHAIN=S1,S2 顺序串行（中间不关机）；
+                           #   G0 通过后默认 CSA_KERNEL=1（显式设置优先）；门失败则
+                           #   不启动面板、不 push、留 40 分钟诊断窗口后关机
 ```
 
 - 语料：FineWeb-Edu（默认 `sample-10BT` 配置），自训 32k BPE；npy 缓存 + sha256
@@ -191,6 +195,9 @@ autograd 图一一对应。
 python m0_supp.py kernel                 # 任意设备：ref 后端语义验证
 CSA_KERNEL=1 python m0_supp.py kernel    # CUDA + triton：完整 G0 套件
 CSA_KERNEL=1 python m0_supp.py full      # 内核模式 S1 主面板（G0 通过后）
+python m0_supp.py auto                   # 无人值守：G0 套件 → 证书 → 面板链
+                                         #   （「G0 之后 B 档是否继续」改由机器裁决：
+                                         #   证书存在 = 双判据全过 = 面板启动）
 ```
 
 - `CSA_KERNEL` 未设置 / `0`：全部 eager（默认，什么都不变）；`1`：强制
@@ -245,7 +252,12 @@ FLOPs，见 `docs/design_notes.md` §16）。成对污染协议、预注册交�
 
 ```bash
 python v12_supp.py smoke           # 端到端自检（微型 ckpt + 冻结清单副本）
-python v12_supp.py plan            # 零 GPU 预检：语义戳 + 实现绑定 + 准入 + 功效，不读 test
+python v12_supp.py plan            # 零 GPU 预检：语义戳 + 实现绑定 + 准入 + 功效，不读 test；
+                                   #   通过后自动留档审计快照 analysis_v12/plan_snapshot.json
+python v12_supp.py auto            # 无人值守：与 full 同链，但显式去掉了「P5T 前人工停顿」——
+                                   #   plan 门先跑（fail-closed），批准证据（清单哈希/
+                                   #   代码戳/git 树/arms/seeds/主比较/α）自动落盘，
+                                   #   人工核对变为事后异步，不再阻塞链的启动
 python v12_supp.py phase P5C       # 按清单种子训练全部四个冻结臂（可续跑；主臂 0-5 由 P3MT/P4MT 覆盖）
 python v12_supp.py phase P5MP      # 扩展探针（全部模式 + NIAH + 对照），种子取自清单
 python v12_supp.py phase P5S2      # 等 token 大规模臂（8000 步）

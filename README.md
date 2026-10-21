@@ -200,6 +200,11 @@ python m0_supp.py smoke    # end-to-end self-check on the B-tier data path
 python m0_supp.py kernel   # G0 suite: kernel/eager numerical comparison + throughput
 python m0_supp.py full     # the S1 panel (5 arms × 4 seeds; CSA_PAR=auto works)
 M0_PANEL=S2 python m0_supp.py full   # the S2 panel (5 arms × 3 seeds × 12B; M2_CAP_HOURS override)
+python m0_supp.py auto     # UNATTENDED: G0 gate (fail-closed) -> certificate re-check ->
+                           #   panel chain starts by itself; default panel S1,
+                           #   M0_AUTO_CHAIN=S1,S2 sequences both; CSA_KERNEL=1 after a
+                           #   green gate (explicit setting wins); a failed gate starts no
+                           #   panel and leaves a 40-min diagnosis window
 ```
 
 - Corpus: FineWeb-Edu (default `sample-10BT` config), self-trained 32k BPE;
@@ -241,6 +246,10 @@ Jacobian in the backward, matching the eager autograd graph.
 python m0_supp.py kernel                 # anywhere: ref-backend semantics check
 CSA_KERNEL=1 python m0_supp.py kernel    # CUDA + triton: full G0 suite
 CSA_KERNEL=1 python m0_supp.py full      # kernel-mode S1 panel (after G0)
+python m0_supp.py auto                   # unattended: G0 suite -> certificate -> panel chain
+                                         #   (the "after G0, may B-tier start?" decision is
+                                         #   now machine-made: certificate present = both
+                                         #   G0 criteria passed = the panel starts)
 ```
 
 - `CSA_KERNEL` unset / `0`: eager everywhere (default; nothing changes);
@@ -303,7 +312,13 @@ distinction (§18).
 
 ```bash
 python v12_supp.py smoke           # end-to-end self-check (tiny ckpts + a smoke freeze manifest)
-python v12_supp.py plan            # zero-GPU pre-flight: stamps + implementation binding + admission + power, NO test read
+python v12_supp.py plan            # zero-GPU pre-flight: stamps + implementation binding + admission + power, NO test read;
+                                   #   on pass, archives the audit snapshot analysis_v12/plan_snapshot.json
+python v12_supp.py auto            # UNATTENDED: the same chain as `full`, made explicitly pause-free —
+                                   #   the plan gate runs first (fail-closed) and its approval evidence
+                                   #   (manifest sha256 / code stamp / git tree / arms / seeds /
+                                   #   primary comparisons / alpha) is archived for ASYNCHRONOUS human
+                                   #   review instead of blocking the launch
 python v12_supp.py phase P5C       # train all four frozen arms at the manifest seed list (resumable; 0-5 main arms covered by P3MT/P4MT)
 python v12_supp.py phase P5MP      # extended probe (all modes + NIAH + controls) at the manifest seed list
 python v12_supp.py phase P5S2      # token-matched large scale arm (8000 steps)
