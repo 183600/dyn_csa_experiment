@@ -15680,6 +15680,11 @@ def metric_policy_audit(summary=None, policy=None):
                 else:
                     _raw_sup = None
                     _raw_sup_names = None
+                    if 'answer_support' in _b:
+                        # A present-but-malformed support table is not the same
+                        # as a legacy record that omits it: the record claims to
+                        # expose the floor evidence, so it must be parseable.
+                        _bad_niah.append('answer-support-invalid')
                 if _raw_sup is not None:
                     _parsed_sup = [_exact_count(v, minimum=0) for v in _raw_sup]
                     if any(v is None for v in _parsed_sup):
@@ -15720,6 +15725,8 @@ def metric_policy_audit(summary=None, policy=None):
                     if _ba is None or not (0.0 <= _ba <= 1.0):
                         _bad_niah.append('macro-recall-missing')
                     _pcr = _b.get('per_class_recall')
+                    if 'per_class_recall' in _b and not isinstance(_pcr, dict):
+                        _bad_niah.append('per-class-recall-invalid')
                     if isinstance(_pcr, dict):
                         _rec_vals = [_finite_scalar(v) for v in _pcr.values()
                                      if v is not None]
@@ -15735,10 +15742,19 @@ def metric_policy_audit(summary=None, policy=None):
                                 _correct_sum = 0.0
                                 _counts_ok = True
                                 for _name, _rv in _pcr.items():
+                                    _sp = _support_map.get(_name)
                                     if _rv is None:
+                                        if _sp is not None and _sp > 0:
+                                            # `retrieval_metrics` only leaves a
+                                            # recall null for an ABSENT class.
+                                            # Null for a class that was scored
+                                            # drops it from macro recall and the
+                                            # correct-count reconciliation.
+                                            _bad_niah.append('per-class-recall-missing')
+                                            _counts_ok = False
+                                            break
                                         continue
                                     _rf = _finite_scalar(_rv)
-                                    _sp = _support_map.get(_name)
                                     if _rf is None or _sp is None:
                                         _counts_ok = False
                                         break

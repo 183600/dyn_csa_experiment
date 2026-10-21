@@ -4191,6 +4191,27 @@ def t_retrieval_metrics_and_niah_trivial_floor():
     bad_pcr['n::seed0']['per_class_recall'][_rec_name] = 0.5
     mp = L.metric_policy_audit(bad_pcr)
     assert mp['status'] == 'warn', mp
+    # A null recall for a class with positive support drops that class from
+    # macro recall and from the correct-count reconciliation: that is missing
+    # evidence, not the documented "absent class" null.
+    bad_null = json.loads(json.dumps(good))
+    _pos_name = next(k for k, v in bad_null['n::seed0']['answer_support'].items()
+                     if v > 0)
+    bad_null['n::seed0']['per_class_recall'][_pos_name] = None
+    mn = L.metric_policy_audit(bad_null)
+    assert mn['status'] == 'warn', mn
+    assert any('per-class-recall-missing' in str(c.get('invalid'))
+               for c in mn['checks']), mn
+    # Present-but-malformed floor evidence must fail closed instead of being
+    # treated like a legacy record that omits the table entirely.
+    for _key, _val, _why in (
+            ('answer_support', 'not-a-table', 'answer-support-invalid'),
+            ('per_class_recall', ['not', 'a', 'table'], 'per-class-recall-invalid')):
+        bad_shape = json.loads(json.dumps(good))
+        bad_shape['n::seed0'][_key] = _val
+        msh = L.metric_policy_audit(bad_shape)
+        assert msh['status'] == 'warn', (msh, _key)
+        assert any(_why in str(c.get('invalid')) for c in msh['checks']), (msh, _key)
     # Forged accuracy / majority floor / macro recall are rejected.
     for key, val in (('acc', 0.9), ('majority_accuracy', 0.1),
                      ('balanced_accuracy', 0.99), ('chance_accuracy', 0.01)):
