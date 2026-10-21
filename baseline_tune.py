@@ -690,6 +690,18 @@ def _tuned_significant(st, p_holm, alpha=0.05):
     _dropped = st.get('n_dropped')
     if isinstance(_dropped, int) and not isinstance(_dropped, bool) and _dropped > 0:
         return False
+    # Seeds skipped by the controlled-comparison gate are ALSO an incomplete
+    # paired panel (the surviving subset was selected by that failure), so a
+    # small Holm p on the survivors cannot support the word "significant".
+    # Mirrors exp_lib.reportable_claim's n_skipped/n_skipped_config_mismatch.
+    _skipped = st.get('n_skipped_config_mismatch')
+    if _skipped is None:
+        _skipped = st.get('n_skipped')
+    if _skipped is not None:
+        if isinstance(_skipped, bool) or not isinstance(_skipped, (int, np.integer)):
+            return False
+        if int(_skipped) != 0:
+            return False
     return True
 
 

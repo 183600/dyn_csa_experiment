@@ -2029,8 +2029,13 @@ def t_tuned_pairing_keeps_optimizer_gate():
                  dict(base_st, within_seed_noise=True),
                  dict(base_st, seed_driven=True),
                  dict(base_st, complete_pairs=False),
-                 dict(base_st, n_dropped=1)):
+                 dict(base_st, n_dropped=1),
+                 dict(base_st, n_skipped=1),
+                 dict(base_st, n_skipped_config_mismatch=1),
+                 dict(base_st, n_skipped=-1),
+                 dict(base_st, n_skipped=True)):
         assert BT._tuned_significant(_bad, 0.03) is False, _bad
+    assert BT._tuned_significant(dict(base_st, n_skipped=0), 0.03) is True
     assert BT._tuned_significant(base_st, None) is False
     assert BT._tuned_significant(base_st, 0.5) is False
 
