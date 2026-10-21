@@ -641,3 +641,29 @@ and refuses paired per-token comparisons across different vocabularies.
 memory readings instead of letting them dominate a frontier or a ratio, and
 the accuracy/cost warning states the improvement direction without a negative
 "gain". The temporary issue list was removed after the fixes.
+
+## 2026-10-21 — comparison/ablation statistical hardening (no new runs)
+
+Changed only zero-GPU analysis/audit/report paths and tests; no panel result,
+frozen manifest, test split, README or CI configuration was touched. (1) A
+controlled pair now requires a COMPLETE `train_knobs` descriptor. Two records
+carrying the same partial dictionary used to pass `pair_reason` even though the
+missing optimizer/betas/eps/schedule/augmentation fields were never compared;
+a present-but-incomplete or malformed descriptor now fails in `exp_lib`,
+`build_report`, `baseline_tune._relaxed_pair_reason` and the fairness audit,
+while legacy-vs-legacy (both absent) stays the documented permissive path.
+`controlled_variables_report` names the defective descriptor instead of
+treating it as a controlled recipe. (2) `paired_effect_stats` no longer labels
+an underpowered or resolution-limited contrast "significant" when a loose
+alpha would otherwise let it through, and it exposes `std_defined` (a
+single-seed arm still reports the legacy numeric 0.0, now explicitly marked as
+not estimable; `arm_summary` adds `ppl_std_defined`). (3) The console paired
+table is derived from `ABLATION_DESIGN` instead of a drifted duplicate list, so
+every declared leave-one-out contrast (including the task-learned-boundary
+ablation) is displayed. (4) Project-level ablation coverage only counts a
+component as verified when a panel also contains its complete declared
+ablation; verification through a partial ablation is reported separately and
+does not open the "all components useful" claim. (5) `audit_methodology`
+surfaces that project-level claim gate. Tests cover partial/malformed
+descriptors, underpowered significance, the report/table parity, and partial
+ablation coverage. The temporary issue list was removed after the fixes.
