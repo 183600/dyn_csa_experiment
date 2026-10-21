@@ -2585,9 +2585,20 @@ def audit_encoder_fit(encoder, X_train, X_holdout=None):
         def _fingerprint(stats):
             feats = []
             for st in stats.get('features') or []:
+                categories = list(st.get('categories') or [])
+                keys = st.get('keys')
+                if (isinstance(keys, list) and len(keys) == len(categories)
+                        and all(isinstance(k, str) for k in keys)):
+                    # Persisted keys share the encoder's canonical identity,
+                    # so equal temporal spellings do not make the audit
+                    # "unverifiable" merely because their readable categories
+                    # were sanitized differently.
+                    cat_id = tuple(keys)
+                else:
+                    cat_id = tuple((type(v).__name__, repr(v))
+                                   for v in categories)
                 feats.append((
-                    tuple((type(v).__name__, repr(v))
-                          for v in (st.get('categories') or [])),
+                    cat_id,
                     int(st.get('n_categories', 0)),
                     int(st.get('unknown_index', 0)),
                     int(st.get('missing_index', 0))))
@@ -2601,10 +2612,14 @@ def audit_encoder_fit(encoder, X_train, X_holdout=None):
         def _fingerprint(stats):
             feats = []
             for st in stats.get('features') or []:
-                entries = tuple((type(e.get('value')).__name__, repr(e.get('value')),
-                                 int(e.get('count', 0)))
-                                for e in (st.get('entries') or []))
-                feats.append((entries, int(st.get('n_observed', 0)),
+                entries = []
+                for e in (st.get('entries') or []):
+                    key = e.get('key')
+                    ident = (key if isinstance(key, str)
+                             else (type(e.get('value')).__name__,
+                                   repr(e.get('value'))))
+                    entries.append((ident, int(e.get('count', 0))))
+                feats.append((tuple(entries), int(st.get('n_observed', 0)),
                               int(st.get('n_missing', 0))))
             return tuple(feats)
     else:

@@ -9844,6 +9844,14 @@ def t_python_temporal_row_and_category_identity():
                              [np.datetime64('2020-01-02')]], dtype=object)
     assert DG._categorical_fingerprint(train_dates) == \
         DG._categorical_fingerprint(holdout_np)
+    # The encoder-fit audit compares canonical persisted keys, not readable
+    # reprs: the same categories in NumPy spelling must still verify.
+    assert DG.audit_encoder_fit(
+        DG.LeakageSafeCategoricalEncoder().fit(train_dates),
+        holdout_np)['status'] == 'train_only_verified'
+    assert DG.audit_encoder_fit(
+        DG.LeakageSafeFrequencyEncoder().fit(train_dates),
+        holdout_np)['status'] == 'train_only_verified'
     leak_enc = DG.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(
         train_dates, np.asarray([1.0, 2.0]))
     try:
