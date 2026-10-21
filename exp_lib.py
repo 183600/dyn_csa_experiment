@@ -8718,6 +8718,7 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
     report = {
         'kind': 'batch_iterator_contract',
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'code': code_stamp(),
         'seq_len': seq_len,
         'batch_size': batch_size,
         'seed': int(seed),
@@ -18353,6 +18354,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
     report = {
         'kind': 'rng_seed_contract',
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'code': code_stamp(),
         'seed': seed,
         'device': str(DEVICE if device is None else device),
         'determinism': determinism_label(),
@@ -22462,6 +22464,9 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         'kind': 'small_batch_overfit_sanity',
         'variant': variant,
         'seed': int(seed),
+        'code': code_stamp(),
+        'determinism': determinism_label(),
+        'device': str(device),
         'steps': int(steps),
         'lr': float(lr),
         'batch_shape': [int(batch_size), int(seq_len)],
@@ -22946,6 +22951,7 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
         'kind': 'duplicate_run_reproducibility',
         'variant': variant,
         'seed': int(seed),
+        'code': code_stamp(),
         'steps': int(steps),
         'tol': float(tol),
         'lr': float(lr),

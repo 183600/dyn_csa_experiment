@@ -10568,6 +10568,7 @@ def t_overfit_loss_contract_and_ignore_index():
     assert r['loss_contract']['initial']['passed'] is True, r['loss_contract']
     assert r['loss_contract']['final']['passed'] is True, r['loss_contract']
     assert r['pass_criteria']['loss_reduction_matches_mean_ce'] is True, r['pass_criteria']
+    assert r['code'] == L.code_stamp() and r['device'] == 'cpu', r
     r2 = L.overfit_sanity_check('full', seed=0, steps=20, d=32, n_layers=1,
                                 n_heads=4, d_head=8, seq_len=16, batch_size=2,
                                 vocab=256, train_ids=ids, ignore_index=-100,
@@ -10615,6 +10616,7 @@ def t_repro_probe_config_binds_device_and_lr():
     assert r['passed'] is True and r['lr'] == 0.001 and r['device'] == 'cpu', r
     rs = L.reproducibility_check('full', seed=0, steps=2, device='cpu')
     assert rs['passed'] is True and rs['device'] == 'cpu', rs
+    assert rs['code'] == L.code_stamp(), rs
     for bad in (0, -1, True, 1.5):
         try:
             L.reproducibility_check('full', steps=bad)
@@ -10633,7 +10635,7 @@ def t_repro_probe_config_binds_device_and_lr():
 
 def t_seed_contract_cuda_device_inventory():
     r = L.seed_contract_check(seed=5)
-    assert r['passed'] is True, r
+    assert r['passed'] is True and r['code'] == L.code_stamp(), r
     if not torch.cuda.is_available():
         assert r['checks']['cuda_devices_seeded'] is None, r['checks']
     else:
@@ -10702,6 +10704,7 @@ def t_batch_contract_check_validation():
     ids = np.arange(5000, dtype=np.int64) % 997
     ok = L.batch_contract_check(ids, 32, 4, 'cpu', seed=7, vocab=997)
     assert ok['passed'] is True and ok['device'] == 'cpu', ok
+    assert ok['code'] == L.code_stamp(), ok
     for bad in (1.5, True, -1, L.MAX_SEED + 1):
         try:
             L.batch_contract_check(ids, 32, 4, 'cpu', seed=bad, vocab=997)
