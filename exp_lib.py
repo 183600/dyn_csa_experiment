@@ -15115,7 +15115,7 @@ def metric_policy_audit(summary=None, policy=None):
                 if isinstance(_pc_tb, dict) and isinstance(_labels_tb, (list, tuple)):
                     try:
                         _sup_tb = [int(_pc_tb[str(_l)]['support']) for _l in _labels_tb]
-                    except (KeyError, TypeError, ValueError):
+                    except (KeyError, TypeError, ValueError, OverflowError):
                         _sup_tb = None
                     if _sup_tb is not None:
                         _want_tb = _majority_class_floor(_labels_tb, _sup_tb)

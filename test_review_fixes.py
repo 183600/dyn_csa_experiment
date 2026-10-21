@@ -5777,6 +5777,13 @@ def t_binary_threshold_and_calibration_contract():
         _ma = L.metric_policy_audit({'m': _mal})
         assert _ma['status'] == 'warn' and any(
             _key in w for w in _ma['warnings']), (_key, _ma)
+    # A non-finite forged support must be refused, not crash int() with
+    # OverflowError while reconstructing the trivial floor.
+    _ov = json.loads(json.dumps(_cm0))
+    _ov.update(variant='m', task='binary_classification')
+    _ov['per_class']['0']['support'] = float('inf')
+    _ova = L.metric_policy_audit({'m': _ov})
+    assert _ova['status'] == 'warn', _ova
     # Unhashable record-identity metadata (variant/name) must not crash the
     # degenerate-record bookkeeping.
     _dm = dict(_cm0, variant={'not': 'a-label'}, task='binary_classification',
