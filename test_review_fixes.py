@@ -11120,6 +11120,20 @@ def t_cached_validation_row_groups_merge_shared_documents():
         assert 'JSON object' in str(e), e
     else:
         raise AssertionError('a non-object metadata file must be refused')
+    # A fractional token count must not be truncated to the real sidecar
+    # length (int(8.5) == 8) and blessed as a match.
+    _d6 = tempfile.mkdtemp(prefix='valgroups_count_')
+    np.save(os.path.join(_d6, f'val_token_doc_ids_{_tag3}.npy'), _docs)
+    with open(os.path.join(_d6, f'meta_{_tag3}.json'), 'w', encoding='utf-8') as fh:
+        json.dump({'doc_ids': {'validation_token_count': float(_docs.size) + 0.5,
+                               'validation_token_fp': L._ids_fp(_docs)}}, fh)
+    try:
+        L.cached_validation_row_groups(_sl, _ntr, vocab_size=_vb, val_seqs=_vs,
+                                       n_rows=4, cache_dir=_d6)
+    except ValueError as e:
+        assert 'length' in str(e), e
+    else:
+        raise AssertionError('a fractional token-id count must be refused')
 
 
 def t_build_report_primary_estimand():

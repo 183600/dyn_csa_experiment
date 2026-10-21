@@ -12934,8 +12934,8 @@ def cached_validation_row_groups(seq_len, n_train_tokens, vocab_size=8192,
             raise ValueError('cached_validation_row_groups: validation token '
                              'document-id sidecar does not match the cache metadata '
                              'fingerprint')
-        _want_n = _mdoc.get('validation_token_count')
-        if _want_n is None or int(_want_n) != int(doc_ids.size):
+        _want_n = _as_seed_int(_mdoc.get('validation_token_count'))
+        if _want_n is None or _want_n != int(doc_ids.size):
             raise ValueError('cached_validation_row_groups: sidecar length disagrees '
                              'with the cache metadata token-id count')
     # Union rows connected by any shared document.  A document can legitimately
