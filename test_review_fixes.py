@@ -6715,6 +6715,13 @@ def t_crossover_scaling_refusals():
     dup = pts(4) + [{'label': 'd512_half', 'd': 512, 'crossover_tokens': 40e6, 'train_tokens': 25e6}]
     f = L.crossover_scaling_fit(dup)
     assert f['status'] == 'ok' and 'd512_half' in (f.get('deduped_by_d') or []), f
+    # A crossover beyond the panel's own training budget is impossible and
+    # must not enter a scaling fit.
+    bad = pts(4)
+    bad[1] = dict(bad[1], crossover_tokens=60e6, train_tokens=50e6)
+    fb = L.crossover_scaling_fit(bad)
+    assert fb['status'] == 'inconsistent_points', fb
+    assert fb['inconsistent_panels'] == ['d256'], fb
     # A clean 4-point fit carries a slope CI and is labelled descriptive.
     f = L.crossover_scaling_fit(pts(4))
     assert f['status'] == 'ok' and f.get('slope') is not None and f.get('ci') is not None, f

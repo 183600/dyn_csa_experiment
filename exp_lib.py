@@ -12051,6 +12051,21 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
                                 'Add token-matched arms or model log(tokens) as a covariate before reporting a d slope.'],
                     'volume_ratio': float(tmax / tmin)})
         return out
+    # A crossover cannot happen after the training run ended.  A panel whose
+    # crossover position exceeds its own training budget is internally
+    # inconsistent (mis-copied artifact, wrong token unit, or a censored point
+    # mislabelled as observed); fitting it would fabricate a scaling slope.
+    impossible = [p['label'] for p in pts
+                  if p['crossover_tokens'] > p['train_tokens']]
+    if impossible:
+        out.update({
+            'status': 'inconsistent_points',
+            'inconsistent_panels': impossible,
+            'reasons': [f'panel(s) report a crossover at more tokens than they '
+                        f'trained on ({impossible}); an observed crossover must '
+                        'lie within [1, train_tokens] — correct the artifact or '
+                        'mark the panel censored']})
+        return out
     fit = loglog_regression([{'x': p['d'], 'y': p['crossover_tokens'], 'label': p['label']} for p in pts])
     out.update(fit)
     out['status'] = fit.get('status', 'ok')
