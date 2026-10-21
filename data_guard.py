@@ -2132,6 +2132,26 @@ class LeakageSafeTargetEncoder:
                     raise TypeError(
                         'LeakageSafeTargetEncoder requires a numeric target; '
                         f'got a {type(value).__name__} label at row {i}')
+                # A timedelta is a numeric duration.  float() on a NumPy
+                # timedelta is unit-dependent (it works for ns but raises for
+                # day/hour units), so the old fallback silently dropped most
+                # durations while keeping one raw unit count.  Canonicalise to
+                # exact nanoseconds (attoseconds / 1e9) instead.
+                try:
+                    f = _temporal_attoseconds(value) / 1e9
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(f):
+                    out[i] = f
+                continue
+            if isinstance(value, _datetime.timedelta):
+                # Same canonical nanosecond duration for the Python twin.
+                ns = ((int(value.days) * 86400 + int(value.seconds))
+                      * 1000000 + int(value.microseconds)) * 1000
+                f = float(ns)
+                if math.isfinite(f):
+                    out[i] = f
+                continue
             if isinstance(value, (complex, np.complexfloating)):
                 continue
             # Decimal is not a numbers.Number subclass, but it is an exact

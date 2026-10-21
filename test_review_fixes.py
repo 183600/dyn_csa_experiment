@@ -10464,6 +10464,24 @@ def t_object_temporal_category_identity():
     cat_restored = DG.LeakageSafeCategoricalEncoder.from_stats(cat_stats)
     assert np.array_equal(cat.transform(cat_X),
                           cat_restored.transform(cat_X)), cat_stats
+    # A timedelta is a numeric duration target, not a missing/unsupported
+    # label.  NumPy's float(timedelta) works only for ns-like units, so the
+    # raw fallback silently dropped day/hour labels; the encoding must use
+    # one canonical duration and keep equal instants in different units equal.
+    import datetime as _dt
+    _td_X = np.array([['a'], ['a'], ['a']], dtype=object)
+    _td_y = np.array([one_day, one_day_h, np.timedelta64(2, 'D')],
+                     dtype=object)
+    _td_enc = DG.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(
+        _td_X, _td_y)
+    _td_got = _td_enc.transform(np.array([['a']], dtype=object))[0, 0]
+    assert math.isclose(_td_got, (4.0 / 3.0) * 86400e9), _td_got
+    _py_y = np.array([_dt.timedelta(days=1), _dt.timedelta(days=2)],
+                     dtype=object)
+    _py_enc = DG.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(
+        np.array([['a'], ['a']], dtype=object), _py_y)
+    _py_got = _py_enc.transform(np.array([['a']], dtype=object))[0, 0]
+    assert math.isclose(_py_got, 1.5 * 86400e9), _py_got
 
 
 def t_persisted_stats_validate_feature_count():
