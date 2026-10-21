@@ -8944,6 +8944,19 @@ def t_data_guard_preprocessor_option_guards():
     assert np.all(np.isfinite(out)), out
     assert prep.get_stats()['eps'] == 0.0
     assert L.LeakageSafePreprocessor(missing=np.float32(0.0)).missing == 0.0
+    # clip_z was silently ignored outside standard/robust scaling.  It must
+    # apply to minmax (where a holdout can still leave [0, 1]) and must be
+    # refused for an unscaled feature space where "scaled units" do not exist.
+    Xcl = np.array([[0.0], [1.0], [2.0], [100.0]])
+    mm = L.LeakageSafePreprocessor(scale='minmax', clip_quantiles=None,
+                                   clip_z=1.0).fit(Xcl[:3])
+    assert mm.transform(np.array([[100.0]])).item() == 1.0
+    try:
+        L.LeakageSafePreprocessor(scale='none', clip_z=1.0)
+    except ValueError as e:
+        assert 'scaled feature space' in str(e), e
+    else:
+        raise AssertionError("clip_z with scale='none' must be refused")
 
 
 def t_categorical_shift_requires_two_bins():

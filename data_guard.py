@@ -1186,8 +1186,11 @@ class LeakageSafePreprocessor:
         from producing an unbounded transformed value without changing the
         learned scale.
     clip_z : float or None
-        Optional additional clipping in standardized units *after* scaling,
-        using only training statistics (e.g. 8.0).
+        Optional additional clipping in scaled units *after* scaling, using
+        only training statistics (e.g. 8.0).  It applies to the standard,
+        robust and minmax scales; ``scale='none'`` has no defined scaled unit,
+        so combining it with ``clip_z`` is refused instead of silently
+        ignoring the requested clip.
     """
 
     def __init__(self, *, scale='standard', missing='median',
@@ -1221,6 +1224,10 @@ class LeakageSafePreprocessor:
             clip_z = float(clip_z)
             if not (math.isfinite(clip_z) and clip_z > 0.0):
                 raise ValueError('clip_z must be a finite positive number or None')
+            if scale == 'none':
+                raise ValueError(
+                    "clip_z needs a scaled feature space; scale='none' "
+                    'has no standardized/minmax units to clip in')
         if isinstance(eps, (bool, np.bool_)):
             raise ValueError('eps must be a finite non-negative number, not a boolean')
         eps = float(eps)
@@ -1342,7 +1349,7 @@ class LeakageSafePreprocessor:
             col = np.where(np.isnan(col), st['fill'], col)
             if self.scale != 'none':
                 col = (col - st['center']) / st['factor']
-            if self.clip_z is not None and self.scale in ('standard', 'robust'):
+            if self.clip_z is not None and self.scale != 'none':
                 col = np.clip(col, -self.clip_z, self.clip_z)
             out[:, j] = col
         if not np.all(np.isfinite(out)):
