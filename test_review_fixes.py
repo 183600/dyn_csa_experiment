@@ -9467,6 +9467,28 @@ def t_exact_numeric_contracts_and_fingerprint():
     assert DG._label_key(Decimal('2')) == Decimal('2')
     assert DG._group_key(Decimal('NaN')) == ('__nan__',)
     assert DG._group_key(Decimal('sNaN')) == ('__nan__',)
+    # The digest is a content identity, not a function of the row-block size.
+    # Exact-row tails used to be appended immediately after their block, so
+    # changing the memory cap interleaved them differently and silently
+    # changed a fitted artifact's fingerprint.
+    _cap = DG._HASH_BLOCK_BYTES
+    _block_cases = [
+        (np.arange(40, dtype=np.uint64) + 2 ** 63).reshape(10, 4),
+        np.array([[2 ** 53 + i] for i in range(10)], dtype=np.int64),
+        np.array([['a'], ['b'], [None], [2 ** 53 + 1]] * 3, dtype=object),
+    ]
+    if np.finfo(np.longdouble).eps < np.finfo(np.float64).eps:
+        _block_cases.append(
+            (np.arange(12, dtype=np.longdouble) / 7).reshape(6, 2))
+    try:
+        for _case in _block_cases:
+            _fps = set()
+            for _cap_bytes in (1, 7, 64, 1 << 20):
+                DG._HASH_BLOCK_BYTES = _cap_bytes
+                _fps.add(DG._matrix_fingerprint(_case))
+            assert len(_fps) == 1, (_case.dtype, _fps)
+    finally:
+        DG._HASH_BLOCK_BYTES = _cap
 
 
 def t_batch_iter_minimal_corpus():

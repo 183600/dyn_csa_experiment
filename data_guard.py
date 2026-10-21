@@ -3844,6 +3844,12 @@ def _matrix_fingerprint(X):
                             exact = False
             return vals, exact
 
+        # Exact-row tails are buffered and appended after every block's float
+        # image.  Appending a tail immediately after its block made the digest
+        # depend on the arbitrary block size (the same rows hashed in one
+        # block vs several interleaved the tails differently), so a memory-cap
+        # change silently changed a fitted artifact's fingerprint.
+        _tail = bytearray()
         for start in range(0, _obj.shape[0], _step):
             block = _obj[start:start + _step]
             _rows = block.tolist()
@@ -3869,16 +3875,21 @@ def _matrix_fingerprint(X):
                 _bad_pos = [start + i for i, (_vals, ok) in enumerate(parsed)
                             if not ok]
                 for pos, key in zip(_bad_pos, _row_keys(_bad_obj)):
-                    h.update(b'|R')
-                    h.update(str(int(pos)).encode('ascii'))
-                    h.update(b'|')
-                    h.update(key)
+                    _tail.extend(b'|R')
+                    _tail.extend(str(int(pos)).encode('ascii'))
+                    _tail.extend(b'|')
+                    _tail.extend(key)
+        h.update(_tail)
         return h.hexdigest()[:16]
     _w = int(arr.shape[1]) if arr.ndim > 1 else 1
     _step = _hash_row_block(_w, 1 << 20)
     _is_int = (np.issubdtype(arr.dtype, np.integer) or arr.dtype == np.bool_
                or np.issubdtype(arr.dtype, np.datetime64)
                or np.issubdtype(arr.dtype, np.timedelta64))
+    # As in the object path, exact-row tails are buffered until all block
+    # float images have been hashed.  Otherwise the same table fingerprints
+    # differently when the memory cap changes how rows are blocked.
+    _tail = bytearray()
     for start in range(0, arr.shape[0], _step):
         block = arr[start:start + _step]
         with np.errstate(invalid='ignore', over='ignore'):
@@ -3891,8 +3902,8 @@ def _matrix_fingerprint(X):
             # Distinct longdouble values can share one float64 image; append
             # the exact per-row keys so the fingerprint cannot collide.
             for key in _row_keys(block):
-                h.update(b'|')
-                h.update(key)
+                _tail.extend(b'|')
+                _tail.extend(key)
             continue
         if not _is_int:
             continue
@@ -3925,10 +3936,11 @@ def _matrix_fingerprint(X):
             _bad_pos = np.nonzero(np.reshape(_bad_rows, -1))[0] + start
             for pos, key in zip(_bad_pos.tolist(),
                                 _row_keys(np.asarray(_bad, dtype=object))):
-                h.update(b'|R')
-                h.update(str(int(pos)).encode('ascii'))
-                h.update(b'|')
-                h.update(key)
+                _tail.extend(b'|R')
+                _tail.extend(str(int(pos)).encode('ascii'))
+                _tail.extend(b'|')
+                _tail.extend(key)
+    h.update(_tail)
     return h.hexdigest()[:16]
 
 def _wide_float_key(v):
