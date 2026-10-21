@@ -9404,6 +9404,9 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     out['n_dropped'] = _n_dropped
     if _n_input is not None and _n_input < 0:
         out['reasons'].append(f'n_input={_n_input} is negative; the paired panel size is unverifiable')
+    elif _n_input is not None and n > _n_input:
+        out['reasons'].append(
+            f'n={n} exceeds n_input={_n_input}; the paired panel accounting is inconsistent')
     if _n_dropped is not None and _n_dropped < 0:
         out['reasons'].append(f'n_dropped={_n_dropped} is negative; the paired panel size is unverifiable')
     elif (_n_dropped is not None and _n_input is not None

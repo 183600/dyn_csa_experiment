@@ -900,6 +900,7 @@ def t_report_gate_refuses_attrition_and_seed_driven():
     for _bad in (dict(ok, n_dropped=-1),
                  dict(ok, n_input=-1, n_dropped=0),
                  dict(ok, n_input=3, n_dropped=6),
+                 dict(ok, n_input=3, n_dropped=0),
                  dict(ok, complete_pairs=False),
                  dict(ok, n_nonzero=7),
                  dict(ok, n_nonzero=-1),
@@ -7833,7 +7834,8 @@ def t_reportable_claim_gate():
     # complete panel; it must not bypass the complete-case refusal.
     for _bad in (dict(base, n_input=-1, n_dropped=0),
                  dict(base, n_input=6, n_dropped=-1),
-                 dict(base, n_input=3, n_dropped=6)):
+                 dict(base, n_input=3, n_dropped=6),
+                 dict(base, n_input=3, n_dropped=0)):
         _rb = L.reportable_claim(_bad)
         assert _rb['allowed'] is False, (_bad, _rb)
         assert any('n_input' in x or 'n_dropped' in x or 'panel accounting' in x

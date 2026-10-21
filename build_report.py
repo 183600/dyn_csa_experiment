@@ -1602,7 +1602,7 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
         # fields keep the legacy permissive path.
         _n_input = _int_or(st.get('n_input'), None)
         _n_dropped = _int_or(st.get('n_dropped'), None)
-        if _n_input is not None and _n_input < 0:
+        if _n_input is not None and (_n_input < 0 or n > _n_input):
             return False
         if _n_dropped is not None:
             # A negative drop count is corrupt accounting, not an alternative
