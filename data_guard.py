@@ -3034,7 +3034,10 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
     The holdout indices are not accepted by this function, so no validation or
     test row can be dropped, imputed or used to decide which duplicate to keep.
     Rows are grouped by their exact feature key; the first occurrence in the
-    supplied training order is retained.  When duplicate rows carry different
+    supplied training order is retained.  Categorical/object feature tables
+    are supported for duplicate and label cleaning; the two numeric feature
+    options below (``drop_nonfinite_features`` / ``outlier_iqr``) require a
+    real-valued table.  When duplicate rows carry different
     non-missing labels, ``label_conflicts='drop'`` removes the whole ambiguous
     cluster (the safe choice before fitting), ``'keep'`` retains it and
     ``'raise'`` refuses to continue.  ``drop_invalid_labels=True`` also removes
@@ -3061,8 +3064,13 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
     counts suitable for a run manifest.
     """
     _raw_X = np.asarray(X)
-    Xarr = _as_float_2d(X)
-    n = int(Xarr.shape[0])
+    Xraw = _as_numeric_2d(X)
+    n = int(Xraw.shape[0])
+    # Duplicate/label cleaning needs only the exact row identity, which works
+    # for categorical/object tables too.  Convert to float64 only when a
+    # numeric feature audit was actually requested, so a categorical feature
+    # table is not rejected just because its duplicate labels need cleaning.
+    Xarr = None
     train_rows = _validated_index(train_idx, name='train_idx')
     if train_rows.size == 0:
         raise ValueError('clean_training_rows: the training split is empty')
@@ -3133,6 +3141,8 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
             raise ValueError(
                 f'target_outlier_iqr must be a positive finite number or None, '
                 f'got {target_outlier_iqr!r}')
+    if drop_nonfinite_features or outlier_iqr is not None:
+        Xarr = _as_float_2d(Xraw, name='X')
     labels = None
     if y is not None:
         yarr = _label_array(y)
