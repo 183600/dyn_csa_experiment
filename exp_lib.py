@@ -18437,10 +18437,10 @@ def _pin_cuda_determinism():
     return 'cudnn'
 
 def determinism_label():
-    if not torch.cuda.is_available():
-        return 'cpu'
     if torch.are_deterministic_algorithms_enabled():
         return 'strict' if not torch.is_deterministic_algorithms_warn_only_enabled() else 'warn'
+    if not torch.cuda.is_available():
+        return 'cpu'
     return 'cudnn' if torch.backends.cudnn.deterministic else 'off'
 
 def _jsonable(v):

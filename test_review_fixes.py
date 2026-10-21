@@ -10748,6 +10748,28 @@ def t_manifest_rejects_mismatched_cell_identity():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def t_determinism_label_cpu_strict():
+    old_env = os.environ.get('CSA_DETERMINISTIC')
+    old_cudnn = torch.backends.cudnn.deterministic
+    old_bench = torch.backends.cudnn.benchmark
+    old_strict = torch.are_deterministic_algorithms_enabled()
+    try:
+        os.environ['CSA_DETERMINISTIC'] = '1'
+        L._pin_cuda_determinism()
+        assert L.determinism_label() in ('strict', 'warn'), L.determinism_label()
+        if not torch.cuda.is_available():
+            assert L.determinism_label() == 'strict', L.determinism_label()
+    finally:
+        if old_env is None:
+            os.environ.pop('CSA_DETERMINISTIC', None)
+        else:
+            os.environ['CSA_DETERMINISTIC'] = old_env
+        torch.backends.cudnn.deterministic = old_cudnn
+        torch.backends.cudnn.benchmark = old_bench
+        if not old_strict:
+            torch.use_deterministic_algorithms(False)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10848,6 +10870,7 @@ def main():
     _check('J5 span clean-baseline key', t_review3_span_clean_key)
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E1c seed contract inventories every CUDA device', t_seed_contract_cuda_device_inventory)
+    _check('E1d CPU strict determinism is labelled', t_determinism_label_cpu_strict)
     _check('E1a seed/variant axis normalisation', t_seed_axis_normalization)
     _check('E1a2 seed scalars never truncate silently', t_seed_scalar_rejects_silent_truncation)
     _check('E1a3 seed domain validation', t_seed_domain_guard)
