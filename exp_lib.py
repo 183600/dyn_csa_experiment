@@ -8549,6 +8549,13 @@ def locked_json_update(path, mutfn, indent=2):
             except Exception as _e:
                 print(f'[resume] FATAL: {path} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with a fresh object — move it aside to start fresh.')
                 raise
+            if not isinstance(obj, dict):
+                # A valid-JSON list/scalar has no keys for the updater's
+                # mutfn.  The old path called it anyway (crashing inside .get)
+                # and could overwrite whatever the operator stored there.
+                raise ValueError(
+                    f'{path} parsed as a {type(obj).__name__}, not a JSON '
+                    'object; refusing to update/overwrite it')
         rep = mutfn(obj)
         obj = obj if rep is None else rep
         atomic_write_json(path, obj, indent=indent)

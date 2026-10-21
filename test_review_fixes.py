@@ -10423,6 +10423,20 @@ def t_locked_json_and_csv_generator():
         assert L.locked_json_read(p) == {}
         got = L.locked_json_update(p, lambda obj: (obj.update(k=1) or obj))
         assert got == {'k': 1} and L.locked_json_read(p) == {'k': 1}, got
+        # A parsed list is not a JSON object: an updater would crash on
+        # .get()/__setitem__, and overwriting it would destroy the operator's
+        # file.  Refuse and leave the bytes untouched.
+        bad = os.path.join(root, 'bad.json')
+        with open(bad, 'w', encoding='utf-8') as f:
+            f.write('[1, 2]')
+        try:
+            L.locked_json_update(bad, lambda obj: obj)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('a non-object locked JSON file must be refused')
+        with open(bad, encoding='utf-8') as f:
+            assert f.read().strip() == '[1, 2]'
         c = os.path.join(root, 'rows.csv')
         L.atomic_write_csv(c, None, ({'a': i, 'b': i * 2} for i in range(3)))
         with open(c, encoding='utf-8') as f:
