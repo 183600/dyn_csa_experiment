@@ -9707,10 +9707,77 @@ def t_temporal_group_identity_matches_python_equality():
         assert 'share group ids' in str(e), e
     else:
         raise AssertionError('NaT group ids must collapse into one group')
-    # A timezone-aware datetime has no single instant without a timezone; it
-    # must still be hashable (and is kept type-qualified rather than crashing).
+    # Timezone-aware datetimes have one instant even when written with
+    # different offsets.  They must share a group id (Python equality/hash do)
+    # while staying distinct from a naive datetime with the same wall clock.
     tz = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+    tz_west = datetime.datetime(
+        2019, 12, 31, 19,
+        tzinfo=datetime.timezone(datetime.timedelta(hours=-5)))
+    assert tz == tz_west
+    assert DG._group_key(tz) == DG._group_key(tz_west)
     assert DG._group_key(tz) != DG._group_key(datetime.datetime(2020, 1, 1))
+    try:
+        DG.assert_no_split_leakage(
+            [0], [1], [], groups=np.asarray([tz, tz_west], dtype=object))
+    except ValueError as e:
+        assert 'share group ids' in str(e), e
+    else:
+        raise AssertionError('the same aware instant must not cross splits')
+
+
+def t_python_temporal_row_and_category_identity():
+    # datetime.date/datetime/timedelta compare equal to their NumPy temporal
+    # counterparts but hash differently.  Duplicate detection, category keys
+    # and group keys must all use one canonical identity.
+    import datetime
+    import json
+    import data_guard as DG
+    day = datetime.date(2020, 1, 1)
+    midpoint = datetime.datetime(2020, 1, 1)
+    npday = np.datetime64('2020-01-01')
+    assert DG._group_key(day) == DG._group_key(midpoint) == DG._group_key(npday)
+    assert DG._target_key(day) == DG._target_key(midpoint) == DG._target_key(npday)
+    for pair in ((day, npday), (midpoint, npday),
+                 (datetime.timedelta(days=1), np.timedelta64(1, 'D'))):
+        rows = np.asarray(pair, dtype=object).reshape(-1, 1)
+        assert DG.duplicate_mask(rows).tolist() == [False, True], pair
+    # Python datetime only has microsecond resolution: adjacent values stay
+    # distinct instead of collapsing through a rounded float key.
+    micro = np.asarray([midpoint, midpoint + datetime.timedelta(microseconds=1),
+                        midpoint], dtype=object).reshape(-1, 1)
+    assert DG.duplicate_mask(micro).tolist() == [False, False, True]
+    # An aware value is not the same row as a naive one with the same clock,
+    # but the same instant in two zones is.
+    utc = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+    west = datetime.datetime(
+        2019, 12, 31, 19,
+        tzinfo=datetime.timezone(datetime.timedelta(hours=-5)))
+    aware_rows = np.asarray([utc, west, midpoint], dtype=object).reshape(-1, 1)
+    assert DG.duplicate_mask(aware_rows).tolist() == [False, True, False]
+    # Categorical/frequency encoding: equal spellings are one learned level,
+    # and the persisted key round-trips to the same codes.
+    X = np.asarray([[day], [npday], [datetime.date(2020, 1, 2)]],
+                   dtype=object)
+    cat = DG.LeakageSafeCategoricalEncoder().fit(X)
+    stats = cat.get_stats()['features'][0]
+    assert stats['n_categories'] == 2, stats
+    assert len(set(stats['keys'])) == 2, stats
+    codes = cat.transform(X).ravel()
+    assert codes[0] == codes[1] != codes[2], codes
+    cat2 = DG.LeakageSafeCategoricalEncoder.from_stats(
+        json.loads(json.dumps(cat.get_stats())))
+    assert np.array_equal(cat2.transform(X), cat.transform(X))
+    freq = DG.LeakageSafeFrequencyEncoder().fit(X)
+    entries = freq.get_stats()['features'][0]['entries']
+    assert len(entries) == 2, entries
+    assert entries[0]['count'] == 2, entries
+    f = freq.transform(X).ravel()
+    assert f[0] == f[1] > f[2], f
+    enc = DG.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(
+        X, np.asarray([10.0, 10.0, 20.0]))
+    lookup = enc.get_stats()['features'][0]['lookup']
+    assert lookup[DG._target_key(day)] == 10.0, lookup
 
 
 def t_validation_row_split_group_aware():
@@ -11700,6 +11767,7 @@ def main():
     _check('I31d object temporal category identity', t_object_temporal_category_identity)
     _check('I31e persisted stats must match n_features_in', t_persisted_stats_validate_feature_count)
     _check('I31f temporal group identity is hash-consistent', t_temporal_group_identity_matches_python_equality)
+    _check('I31g Python temporal row/category identity', t_python_temporal_row_and_category_identity)
     # Open-block reading rule: the substantive gates (causality, reference
     # pooling, masks, edge cases, closed regression) live in test_open_block.py
     # so they can also be run on their own.

@@ -897,27 +897,24 @@ def _temporal_group_key(value):
     back to a unit-qualified raw value when nanoseconds overflow) makes equal
     temporal ids hash equally.  Midnight values collapse with their date,
     which can only merge groups (a conservative, leak-avoiding direction).
+    Timezone-aware datetimes are canonicalised to UTC, so the same instant
+    written with different offsets is still one group; they stay distinct from
+    a naive datetime with the same wall-clock text (which Python also does not
+    compare equal to it).
     """
     if isinstance(value, (np.datetime64, np.timedelta64)):
         if np.isnat(value):
             return ('__nat__',)
-        canon = value
-    elif isinstance(value, _datetime.datetime):
-        if value.tzinfo is not None:
-            # No single instant without a zone; keep the zone-qualified text.
-            return _UnhashableKey('__datetime_tz__', value.isoformat())
-        canon = np.datetime64(value)
-    elif isinstance(value, _datetime.date):
-        canon = np.datetime64(value)
-    elif isinstance(value, _datetime.timedelta):
-        canon = np.timedelta64(value)
-    else:  # pragma: no cover - guarded by the caller
+    elif not isinstance(value, (_datetime.date, _datetime.datetime,
+                                _datetime.timedelta)):
+        # pragma: no cover - guarded by the caller
         return value
     try:
         # The opaque sentinel cannot be impersonated by a real tuple/list group
         # id whose elements happen to spell the same components.
         return _UnhashableKey(
-            '__temporal__', _temporal_key(canon).decode('ascii', 'backslashreplace'))
+            '__temporal__',
+            _temporal_canonical_key(value).decode('ascii', 'backslashreplace'))
     except (TypeError, ValueError, OverflowError):
         return _UnhashableKey(
             '__temporal_repr__', f'{type(value).__name__}:{value!r}')
@@ -1393,7 +1390,11 @@ def _sorted_categories(values):
     for value in values:
         if _category_is_missing(value):
             continue
-        unique.setdefault(_hashable_label(value), value)
+        # Key by the same canonical identity transform() uses.  Hashing the raw
+        # objects would keep, say, datetime.date(2020, 1, 1) and
+        # np.datetime64('2020-01-01') as two levels with one persisted key;
+        # the transform lookup then silently drops one of them.
+        unique.setdefault(_target_key(value), value)
     return sorted(unique.values(),
                   key=lambda v: (type(v).__name__, repr(v)))
 
@@ -1624,12 +1625,17 @@ def _target_key(value):
     """
     if _category_is_missing(value):
         return '__missing__'
-    if isinstance(value, (np.datetime64, np.timedelta64)):
+    if isinstance(value, (np.datetime64, np.timedelta64,
+                          _datetime.date, _datetime.datetime,
+                          _datetime.timedelta)):
         # ``np.timedelta64`` is a numbers.Integral, but int() either returns a
         # unit-dependent raw count or raises for larger units.  That made
         # timedelta(1 ns) collide with integer 1 and crashed on timedelta(1 D).
-        # Persist the exact temporal identity instead.
-        return 'p:' + _temporal_key(value).decode('ascii', 'backslashreplace')
+        # Persist the exact temporal identity instead.  Python datetime/date/
+        # timedelta values compare equal to their NumPy counterparts, so they
+        # must share that identity too.
+        return 'p:' + _temporal_canonical_key(value).decode(
+            'ascii', 'backslashreplace')
     if isinstance(value, (bool, np.bool_)):
         return 'i:' + str(int(value))
     if isinstance(value, numbers.Integral):
@@ -2198,12 +2204,16 @@ class LeakageSafeFrequencyEncoder:
                 if _category_is_missing(value):
                     n_missing += 1
                     continue
-                key = _hashable_label(value)
+                # Group by the persisted key, not the raw hash: equal
+                # temporal spellings (date vs np.datetime64, ...) share one
+                # level, and the transform lookup rebuilt from these keys
+                # cannot collapse two counts into one.
+                key = _target_key(value)
                 if key in entries:
                     entries[key]['count'] += 1
                 else:
                     entries[key] = {'value': value, 'count': 1,
-                                    'key': _target_key(value)}
+                                    'key': key}
             ordered = sorted(entries.values(),
                              key=lambda e: (type(e['value']).__name__,
                                             repr(e['value'])))
@@ -3234,6 +3244,47 @@ def _wide_float_key(v):
             else b'R' + str(n).encode('ascii') + b'/' + str(d).encode('ascii'))
 
 
+def _temporal_canonical_key(v):
+    """Exact canonical bytes for a temporal scalar of any Python/NumPy kind.
+
+    ``datetime.date``/``datetime.datetime`` compare equal to matching
+    ``np.datetime64`` values (and to each other at midnight), while
+    ``datetime.timedelta`` compares equal to some ``np.timedelta64`` values.
+    Hashing their raw objects would split one instant into several identities.
+    Timezone-aware datetimes share an identity by their UTC instant and carry
+    an ``A`` prefix so a naive datetime with the same wall-clock text stays
+    distinct (the two are not equal in Python).
+    """
+    if isinstance(v, np.datetime64):
+        return _temporal_key(v)
+    if isinstance(v, np.timedelta64):
+        return _temporal_key(v)
+    if isinstance(v, _datetime.datetime):
+        if v.tzinfo is not None:
+            try:
+                utc = v.astimezone(_datetime.timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return b'AV:' + repr(v).encode('utf-8', 'backslashreplace')
+            # Drop the zone only after converting: the canonical key carries
+            # the UTC instant plus the aware-only prefix.
+            return b'A' + _temporal_key(np.datetime64(utc.replace(tzinfo=None)))
+        return _temporal_key(np.datetime64(v))
+    if isinstance(v, _datetime.date):
+        return _temporal_key(np.datetime64(v))
+    if isinstance(v, _datetime.timedelta):
+        # np.timedelta64(timedelta) uses microseconds and can overflow for
+        # very large spans.  Build the exact nanosecond count directly (Python
+        # timedelta has microsecond resolution), matching _temporal_key's
+        # nanosecond canonical form for in-range values.
+        ns = ((int(v.days) * 86400 + int(v.seconds)) * 1000000
+              + int(v.microseconds)) * 1000
+        if -(1 << 63) <= ns < (1 << 63):
+            return b'TI' + str(ns).encode('ascii')
+        return (b'T' + str(np.timedelta64(v).dtype).encode('ascii') + b':'
+                + str(ns).encode('ascii'))
+    raise TypeError(f'not a temporal value: {type(v).__name__}')
+
+
 def _temporal_key(v):
     """Exact canonical key for an object-cell ``datetime64``/``timedelta64``.
 
@@ -3320,12 +3371,16 @@ def _row_keys(X):
                 # Match the generic float path: None is a missing value and
                 # compares equal to a NaN scalar in the same position.
                 return b'Fnan'
-            if isinstance(v, (np.datetime64, np.timedelta64)):
+            if isinstance(v, (np.datetime64, np.timedelta64,
+                              _datetime.date, _datetime.datetime,
+                              _datetime.timedelta)):
                 # A timestamp is not a float or an integer: adjacent
                 # nanosecond values share one float64 image, and
                 # ``np.timedelta64`` even registers as numbers.Integral.
-                # Keep the exact temporal identity.
-                return _temporal_key(v)
+                # Keep the exact temporal identity, including Python's
+                # date/datetime/timedelta values that compare equal to a NumPy
+                # temporal scalar.
+                return _temporal_canonical_key(v)
             if isinstance(v, (bool, np.bool_)):
                 return b'I' + str(int(v)).encode('ascii')
             if isinstance(v, numbers.Integral):
