@@ -580,6 +580,11 @@ def _niah_ppls(model, val_ids, eval_len, n_seq, cfg, condition, row_cache=None, 
     rho = float(_n.get('rho', 0.5)) if condition == 'distract' else 0.0
     _built = _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed=(eval_len * 7919 + 104729), condition=condition, rho=rho)
     ids_np, q_cols, q_vals, stats = _built
+    # Deterministic lexical floor: nearest-previous-key copy.  This is the
+    # simplest rule that can solve a key->value retrieval task, so a learned
+    # indexer must be read against it (and against the uniform/majority floors)
+    # rather than against chance alone.
+    _copy_rule = L.niah_copy_rule_baseline(ids_np, q_cols, q_vals, target=target)
     n_ch = max(1, int(cfg['chunk']))
     if chunk_mem is not None:
         n_ch = max(1, min(n_ch, int(chunk_mem.get((eval_len, 'niah'), n_ch))))
@@ -635,7 +640,8 @@ def _niah_ppls(model, val_ids, eval_len, n_seq, cfg, condition, row_cache=None, 
              'acc_lift_over_chance', 'acc_lift_over_majority',
              'averaging', 'note')
     return {'nll': float(_nll_all.mean()), 'n': int(n_q),
-            **{k: _rm[k] for k in _keys}, **stats}
+            **{k: _rm[k] for k in _keys}, 'copy_rule_baseline': _copy_rule,
+            **stats}
 
 def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     """Run exactly ONE (variant, seed) probe cell: load the trained checkpoint
@@ -804,7 +810,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         for Ln, cond in _niah_cells:
             res = _niah_ppls(model, val_ids, Ln, _pcfg['n_seq'], _pcfg, cond, row_cache=_row_cache, chunk_mem=_chunk_mem)
             key = _niah_cell_key(v, seed, arm, Ln, cond)
-            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_correct': int(res['n_correct']), 'balanced_accuracy': res.get('balanced_accuracy'), 'macro_recall': res.get('macro_recall'), 'n_classes': int(res.get('n_classes') or 0), 'answer_support': res.get('answer_support'), 'per_class_recall': res.get('per_class_recall'), 'per_class': res.get('per_class'), 'chance_accuracy': res.get('chance_accuracy'), 'majority_accuracy': res.get('majority_accuracy'), 'majority_label': res.get('majority_label'), 'acc_lift_over_chance': res.get('acc_lift_over_chance'), 'acc_lift_over_majority': res.get('acc_lift_over_majority'), 'minority_prevalence': res.get('minority_prevalence'), 'imbalance_ratio': res.get('imbalance_ratio'), 'imbalance_warning': res.get('imbalance_warning'), 'recommended_primary_metric': res.get('recommended_primary_metric'), 'recommended_primary_reason': res.get('recommended_primary_reason'), 'recommended_primary_available': res.get('recommended_primary_available'), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _niah_fp_of(cond), 'recipe': _ck_recipe}
+            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_correct': int(res['n_correct']), 'balanced_accuracy': res.get('balanced_accuracy'), 'macro_recall': res.get('macro_recall'), 'n_classes': int(res.get('n_classes') or 0), 'answer_support': res.get('answer_support'), 'per_class_recall': res.get('per_class_recall'), 'per_class': res.get('per_class'), 'chance_accuracy': res.get('chance_accuracy'), 'majority_accuracy': res.get('majority_accuracy'), 'majority_label': res.get('majority_label'), 'acc_lift_over_chance': res.get('acc_lift_over_chance'), 'acc_lift_over_majority': res.get('acc_lift_over_majority'), 'minority_prevalence': res.get('minority_prevalence'), 'imbalance_ratio': res.get('imbalance_ratio'), 'imbalance_warning': res.get('imbalance_warning'), 'recommended_primary_metric': res.get('recommended_primary_metric'), 'recommended_primary_reason': res.get('recommended_primary_reason'), 'recommended_primary_available': res.get('recommended_primary_available'), 'copy_rule_baseline': res.get('copy_rule_baseline'), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _niah_fp_of(cond), 'recipe': _ck_recipe}
             L.locked_json_update(_nspath, (lambda s, _p=dict({key: rec}): (s.update(_p), s)[1]), indent=1)
             _log_metrics[key] = {'acc': float(rec['acc']), 'nll': float(rec['nll']), 'n_queries': int(rec['n_queries'])}
             print(f"  [niah] {key:48s} acc={rec['acc']:.3f} nll={rec['nll']:.3f}", flush=True)
@@ -1643,7 +1649,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 _bal_vals = [float(x) for x in bals.values()
                              if isinstance(x, (int, float)) and not isinstance(x, bool)
                              and math.isfinite(float(x))]
-                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'balanced_by_seed': bals, 'acc_mean': float(np.mean(list(accs.values()))), 'balanced_mean': (float(np.mean(_bal_vals)) if _bal_vals else None), 'nll_mean': float(np.mean(list(nlls.values()))), 'recommended_primary_metric': _first.get('recommended_primary_metric'), 'minority_prevalence': _first.get('minority_prevalence'), 'chance_accuracy': _first.get('chance_accuracy'), 'majority_accuracy': _first.get('majority_accuracy'), 'n_classes': _first.get('n_classes'), 'n': len(accs), 'n_pairs': _first.get('n_pairs'), 'dist_mean': _first.get('dist_mean'), 'val_fp': _vfp})
+                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'balanced_by_seed': bals, 'acc_mean': float(np.mean(list(accs.values()))), 'balanced_mean': (float(np.mean(_bal_vals)) if _bal_vals else None), 'nll_mean': float(np.mean(list(nlls.values()))), 'recommended_primary_metric': _first.get('recommended_primary_metric'), 'copy_rule_acc': (_first.get('copy_rule_baseline') or {}).get('acc'), 'copy_rule_n_missing_context': (_first.get('copy_rule_baseline') or {}).get('n_missing_context'), 'minority_prevalence': _first.get('minority_prevalence'), 'chance_accuracy': _first.get('chance_accuracy'), 'majority_accuracy': _first.get('majority_accuracy'), 'n_classes': _first.get('n_classes'), 'n': len(accs), 'n_pairs': _first.get('n_pairs'), 'dist_mean': _first.get('dist_mean'), 'val_fp': _vfp})
             niah_contrasts = {}
             niah_acc_contrasts = {}
             _nidx = {}

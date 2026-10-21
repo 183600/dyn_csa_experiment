@@ -4230,6 +4230,18 @@ def t_retrieval_metrics_and_niah_trivial_floor():
     assert abs(rm['majority_accuracy'] - 0.75) < 1e-12, rm
     assert abs(rm['acc_lift_over_chance'] - 0.25) < 1e-12, rm
     assert abs(rm['acc_lift_over_majority']) < 1e-12, rm
+    # The NIAH copy rule is a deterministic lexical floor: it must recover a
+    # planted key->value pair by copying after the nearest earlier key, and
+    # count a query with no earlier key as missing context (not as a hit).
+    _ids = np.array([[1, 2, 3, 7, 9, 4, 5, 6, 1, 7, 9]])
+    _rule = L.niah_copy_rule_baseline(_ids, np.array([[3]]), np.array([[9]]),
+                                      target=4)
+    assert _rule['n_correct'] == 1 and _rule['acc'] == 1.0, _rule
+    assert _rule['n_missing_context'] == 0 and _rule['rule'] == 'nearest_previous_key_copy', _rule
+    _no_ctx = L.niah_copy_rule_baseline(
+        np.array([[1, 2, 3, 4, 7, 9]]), np.array([[1]]), np.array([[9]]),
+        target=4)
+    assert _no_ctx['acc'] == 0.0 and _no_ctx['n_missing_context'] == 1, _no_ctx
     # Mixed label identities must not be merged by NumPy dtype promotion.
     rm2 = L.retrieval_metrics([1, '1'], [1, '1'])
     assert rm2['n_classes'] == 2 and rm2['acc'] == 1.0, rm2

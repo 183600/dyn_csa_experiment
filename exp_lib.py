@@ -14725,6 +14725,76 @@ def _display_label_names(labels):
     return [f'{name}#{i}' for i, name in enumerate(names)]
 
 
+def niah_copy_rule_baseline(ids, query_cols, answer_ids, *, target):
+    """A deterministic copy-rule floor for the NIAH retrieval task.
+
+    The NIAH-natural task plants a ``key -> value`` couple in the far context
+    and repeats the key in the target zone; the correct next token is the
+    value.  A rule system that needs no training can therefore look up the
+    nearest PREVIOUS occurrence of the query key in the causal prefix and copy
+    the token that follows it.  This is the task's simplest lexical baseline:
+    if a learned indexer cannot match it, the mechanism is not even doing the
+    copy operation the task is built from.  Conversely, a model that only
+    barely beats this rule has not demonstrated a semantic retrieval gain.
+
+    ``ids`` has shape ``[sequences, eval_len + 1]`` (the final column is the
+    gold answer), ``query_cols`` gives the query-key column relative to the
+    last ``target`` input positions, and ``answer_ids`` holds the gold answer
+    tokens.  A query with no earlier occurrence of its key is counted wrong
+    and reported as ``n_missing_context``.  The returned top-1 metrics include
+    the same uniform/majority floors as ``retrieval_metrics``.
+    """
+    arr = np.asarray(ids)
+    qc = np.asarray(query_cols)
+    av = np.asarray(answer_ids)
+    if arr.ndim != 2:
+        raise ValueError('niah_copy_rule_baseline: ids must be 2-D (sequences x tokens)')
+    if qc.shape != av.shape or qc.ndim != 2:
+        raise ValueError('niah_copy_rule_baseline: query_cols and answer_ids must be '
+                         'matching 2-D arrays')
+    _target = _as_seed_int(target)
+    if _target is None or _target < 1:
+        raise ValueError('niah_copy_rule_baseline: target must be a positive integer')
+    n_seq, n_tokens = arr.shape
+    if qc.shape[0] != n_seq:
+        raise ValueError('niah_copy_rule_baseline: ids and query_cols disagree on sequence count')
+    eval_len = int(n_tokens) - 1
+    tail_start = eval_len - int(_target)
+    preds = []
+    missing = 0
+    for i in range(int(n_seq)):
+        row = arr[i]
+        for j in range(qc.shape[1]):
+            _col = _as_seed_int(qc[i, j])
+            if _col is None or _col < 0 or _col >= int(_target):
+                preds.append(-1)
+                missing += 1
+                continue
+            key_pos = tail_start + int(_col)
+            if key_pos <= 0 or key_pos >= eval_len:
+                preds.append(-1)
+                missing += 1
+                continue
+            key = row[key_pos]
+            prev = np.nonzero(row[:key_pos] == key)[0]
+            if prev.size == 0:
+                preds.append(-1)
+                missing += 1
+            else:
+                preds.append(int(row[int(prev[-1]) + 1]))
+    _n = int(av.size)
+    preds_arr = np.asarray(preds, dtype=np.int64)
+    _rm = retrieval_metrics(av.reshape(-1), preds_arr)
+    out = dict(_rm)
+    out.update({'rule': 'nearest_previous_key_copy',
+                'n': _n, 'n_missing_context': int(missing),
+                'target': int(_target),
+                'note': ('Untuned lexical floor: copy the token after the nearest earlier '
+                         'occurrence of the query key. Retrieval above this floor is the '
+                         'minimum evidence that a learned selection mechanism adds value.')})
+    return out
+
+
 def retrieval_metrics(y_true, y_pred, labels=None, label_names=None):
     """Top-1 retrieval metrics with explicit trivial floors and macro recall.
 
