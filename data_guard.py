@@ -1551,6 +1551,14 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         raise ValueError(
             f'clean_training_rows: train_idx reaches {int(train_rows.max())} '
             f'but X has {n} rows')
+    if np.unique(train_rows).size != train_rows.size:
+        # A repeated training index would let one row enter the drop mask and
+        # the duplicate counts more than once, so a manifest could not say how
+        # many physical rows survived.  Split helpers never emit duplicates;
+        # an external index that does is a caller bug, not a cleaning choice.
+        raise ValueError(
+            'clean_training_rows: train_idx contains duplicate row indices; '
+            'every training row must appear at most once')
     if label_conflicts not in ('drop', 'keep', 'raise'):
         raise ValueError(
             f"label_conflicts must be 'drop', 'keep' or 'raise', "

@@ -8577,6 +8577,14 @@ def t_clean_training_target_outliers():
             pass
         else:
             raise AssertionError(f'target_outlier_iqr={bad!r} must be refused')
+    # A repeated training index would double-count drops and let the same
+    # physical row appear twice in the cleaned split; refuse it.
+    try:
+        L.clean_training_rows(X, y, train_idx=[0, 1, 1])
+    except ValueError as e:
+        assert 'duplicate row indices' in str(e), e
+    else:
+        raise AssertionError('duplicate train_idx entries must be refused')
 
 
 def t_known_labels_audit():
