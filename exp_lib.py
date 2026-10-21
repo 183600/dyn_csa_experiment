@@ -10827,8 +10827,16 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     # it would make a perfectly consistent scale disappear from the family.
     # Keep the row, name it, and block the pooled claim until a variance model
     # (or more seeds) is available.
-    _zero_variance = [r['label'] for r in per
-                      if r['n'] > 1 and r.get('se') == 0.0]
+    # A within-scale SE that is zero to numerical precision is just as
+    # unusable as an exact zero: 1/se^2 becomes an unbounded weight and one
+    # scale would dominate the pooled mean.  Treat it by scale-relative
+    # tolerance, not just ``se == 0.0``.
+    def _variance_is_zero(r):
+        se = r.get('se')
+        if r['n'] <= 1 or se is None or not math.isfinite(se):
+            return False
+        return se <= 1e-12 * max(1.0, abs(float(r.get('mean') or 0.0)))
+    _zero_variance = [r['label'] for r in per if _variance_is_zero(r)]
 
     def _weight_is_representable(r):
         # A point whose within-scale SE is non-finite (e.g. the sample SD
@@ -10847,8 +10855,9 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                       if r['n'] > 1
                       and (not math.isfinite(r.get('mean', float('nan')))
                            or not _weight_is_representable(r))
-                      and r.get('se') != 0.0]
-    usable = [r for r in per if _weight_is_representable(r)]
+                      and not _variance_is_zero(r)]
+    usable = [r for r in per
+              if _weight_is_representable(r) and not _variance_is_zero(r)]
     _n_seed_declared = sum(1 for p in pts if p.get('seeds_declared'))
     if pts and _n_seed_declared == len(pts):
         _seed_pairing = 'declared'

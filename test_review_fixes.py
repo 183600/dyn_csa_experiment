@@ -10209,6 +10209,14 @@ def t_meta_seed_overlap_controls_pooling():
     rd = L.scaling_trend(trend_disjoint, min_seeds=3, min_points=3)
     assert rd['seed_dependence'] == 'disjoint_seed_sets', rd
     assert rd['significant'] is True, rd
+    # A within-scale SE that is only numerically zero also makes 1/se^2
+    # unbounded; it must be named and excluded from the inverse-variance pool.
+    nearzero = [_pt('S0', 1, [0, 1, 2, 3], [0.1, 0.1, 0.1, 0.1 + 1e-15]),
+                _pt('S1', 10, [4, 5, 6, 7], [0.2, 0.3, 0.4, 0.5]),
+                _pt('S2', 100, [8, 9, 10, 11], [0.3, 0.4, 0.5, 0.6])]
+    mn = L.meta_analyze_effects(nearzero)
+    assert 'S0' in mn['zero_variance_points'], mn
+    assert mn['n_usable'] == 2 and mn['poolable'] is False, mn
 
 
 def t_preprocessing_fit_audit_detects_full_table_leak():
