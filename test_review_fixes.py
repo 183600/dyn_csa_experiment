@@ -4406,6 +4406,42 @@ def t_baseline_tuning_audit():
     assert r3['tuning_verified'] is False and any('validation' in p for p in r3['problems']), r3
 
 
+def t_baseline_family_declared_contrasts_and_undeclared_arms():
+    # The tuned multiplicity family is the set of DECLARED method-vs-baseline
+    # contrasts, not `len(arms)-1`.  With two parameter-matching groups the
+    # two differ, and using the arm count inflates the planning floor.
+    trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
+
+    def _arm(ppls):
+        rows = [{'config': dict(c), 'ppl': p} for c, p in zip(trials, ppls)]
+        best = min(rows, key=lambda r: r['ppl'])
+        return {'trials': rows, 'selected': dict(best['config']),
+                'selected_metric_value': best['ppl']}
+
+    arms = ['a', 'b', 'c', 'd', 'e']
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=arms, trials=trials,
+                    search_seeds=[], final_seeds=[],
+                    arm_groups=[
+                        {'arms': ['a', 'b', 'c'], 'method_arm': 'a'},
+                        {'arms': ['d', 'e'], 'method_arm': 'd'},
+                    ])
+    plan, basis = L._tuning_declared_contrasts(protocol, arms)
+    assert plan == [('a', 'b'), ('a', 'c'), ('d', 'e')], (plan, basis)
+    assert basis == 'declared_arm_groups' and len(plan) != len(arms) - 1
+    art = {'selection_metric': 'ppl', 'selection_split': 'validation',
+           'direction': 'lower_is_better',
+           'arms': {a: _arm([10.0, 11.0]) for a in arms}}
+    out = L.baseline_tuning_audit(art, protocol=protocol)
+    assert out['final_family_size'] == 3, out
+    assert out['final_family_basis'] == 'declared_arm_groups', out
+    assert out['final_family_contrasts'] == [['a', 'b'], ['a', 'c'], ['d', 'e']], out
+    # An undeclared arm must not enlarge the family or buy coverage.
+    extra = json.loads(json.dumps(art))
+    extra['arms']['f'] = _arm([10.0, 11.0])
+    rex = L.baseline_tuning_audit(extra, protocol=protocol)
+    assert rex['tuning_verified'] is False, rex
+    assert any('undeclared arm' in p for p in rex['problems']), rex
+
 
 def t_baseline_horizon_transfer_audit():
     # A config selected at a shorter search horizon is not the tuned optimum at
@@ -13375,6 +13411,7 @@ def main():
     _check('H2a1 retrieval metrics carry trivial floors', t_retrieval_metrics_and_niah_trivial_floor)
     _check('H2b multiclass one-vs-rest ranking metrics + imbalance audit', t_multiclass_ranking_metrics_and_audit)
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
+    _check('H3a0 tuned family uses declared contrasts', t_baseline_family_declared_contrasts_and_undeclared_arms)
     _check('H3a tuning grid boundary/coverage adequacy', t_tuning_grid_boundary_adequacy)
     _check('H3a multi-seed selection + equal search-seed audit', t_baseline_multi_seed_selection_audit)
     _check('H3b tuning driver selects on the multi-seed mean', t_baseline_tuning_driver_multiseed_selection)

@@ -16783,6 +16783,58 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
             'note': 'drop one search seed -> re-select; a changed winner means the selected config is seed-driven'}
 
 
+def _tuning_declared_contrasts(protocol, arms):
+    """Declared tuned comparisons and the family they form.
+
+    The power floor must be computed from the comparisons the protocol
+    actually declares (each group's ``method_arm`` against the other arms in
+    that group), not from ``len(arms) - 1``.  The two differ whenever arms are
+    split into parameter-matching groups: the v6/v12 protocol declares four
+    tuned contrasts over six arms.  Using the arm count inflated the
+    multiplicity family and could make a panel look resolution-limited when
+    its declared family was resolvable.
+
+    Returns ``(plan, basis)`` where ``plan`` is a de-duplicated list of
+    ``(method, baseline)`` pairs.  A protocol with no usable group declaration
+    falls back to the historical all-arms rule so old artifacts without
+    groups keep their original planning semantics.
+    """
+    present = set(arms)
+    plan = []
+    seen = set()
+
+    def _add(method, baseline):
+        if method == baseline:
+            return
+        key = (method, baseline)
+        if key not in seen:
+            seen.add(key)
+            plan.append(key)
+
+    raw_groups = protocol.get('arm_groups')
+    if isinstance(raw_groups, (list, tuple)):
+        for group in raw_groups:
+            if not isinstance(group, dict):
+                continue
+            method = group.get('method_arm')
+            if method not in present:
+                continue
+            group_arms = group.get('arms')
+            if not isinstance(group_arms, (list, tuple, set)):
+                group_arms = ()
+            for baseline in group_arms:
+                if baseline in present:
+                    _add(method, baseline)
+    if plan:
+        return plan, 'declared_arm_groups'
+    method = protocol.get('method_arm') or 'csa_dynamic'
+    for baseline in present:
+        _add(method, baseline)
+    if plan:
+        return plan, 'legacy_all_arms'
+    return [], 'no_measurable_contrast'
+
+
 def baseline_tuning_audit(selected=None, path=None, protocol=None):
     """Audit the equal-search baseline-tuning evidence.
 
@@ -16837,6 +16889,19 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     direction = _declared_field('direction')
     problems = []
     warnings = []
+    # An undeclared arm is not extra evidence: it enlarges the arm set that
+    # the family-size arithmetic and coverage map see, and it can make a
+    # truncated tuning artifact look broader than the protocol that was
+    # pre-registered.  The artifact must describe exactly the declared arms.
+    _declared_arm_list = protocol.get('arms')
+    if isinstance(_declared_arm_list, (list, tuple, set)):
+        _declared_names = {str(a) for a in _declared_arm_list}
+        _extra_artifact_arms = sorted(set(arms) - _declared_names)
+        if _extra_artifact_arms:
+            problems.append(
+                f'artifact contains undeclared arm(s) {_extra_artifact_arms}; '
+                'the equal-search claim covers only the protocol\'s declared '
+                'arms, so an added arm is a different tuning design')
     if not isinstance(metric, str) or not metric.strip():
         # Trial records are indexed by the metric name; a mapping/list would
         # raise TypeError instead of reporting the malformed artifact.
@@ -17663,17 +17728,24 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     final_seed_coverage_equal = None
     final_min_seed_count = None
     _final_family_floor = None
+    # The tuned family is the set of comparisons the protocol DECLARES, not
+    # one contrast per pair of arms.  A grouped protocol can have six arms but
+    # only four method-vs-baseline contrasts; using `len(arms) - 1` inflates
+    # the Holm multiplicity and misstates the planning floor.
+    _final_plan, _final_family_basis = _tuning_declared_contrasts(
+        protocol, list(arms))
+    _final_family_m = (len(_final_plan) if _final_plan
+                       else max(1, len(arms) - 1))
     if final_seed_coverage:
         final_seed_coverage_equal = len({tuple(v) for v in final_seed_coverage.values()}) == 1
         final_min_seed_count = min(len(v) for v in final_seed_coverage.values())
         if not final_seed_coverage_equal:
             problems.append('final records do not cover the same seeds in every arm — the paired comparison would silently use different n per arm')
-        # The tuned comparison is its own family (method vs each other arm).
-        _final_family_floor = signflip_min_n_for_holm(max(1, len(arms) - 1), 0.05)
+        _final_family_floor = signflip_min_n_for_holm(_final_family_m, 0.05)
         if final_min_seed_count < 3:
             warnings.append(f'only {final_min_seed_count} final seed(s) per arm — the reporting floor for a key experiment is 3; treat the tuned contrast as descriptive')
         elif _final_family_floor is not None and final_min_seed_count < _final_family_floor:
-            warnings.append(f'{final_min_seed_count} final seeds per arm cannot reach a Holm-corrected p<0.05 for {max(1, len(arms) - 1)} tuned contrast(s) (needs n>={_final_family_floor}); the tuned contrast is resolution-limited, not a null')
+            warnings.append(f'{final_min_seed_count} final seeds per arm cannot reach a Holm-corrected p<0.05 for {_final_family_m} declared tuned contrast(s) (needs n>={_final_family_floor}); the tuned contrast is resolution-limited, not a null')
     # Coverage: an arm is covered either by its own tuned record or by the arm
     # whose recipe it inherits (budget-matched intervention controls).
     _inherits = protocol.get('inherits_tuning')
@@ -17942,6 +18014,9 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
            'selection_stable_all': (all(s.get('stable') for s in selection_stabilities.values())
                                     if selection_stabilities else None),
            'min_final_seeds_for_family_significance': _final_family_floor,
+           'final_family_size': int(_final_family_m),
+           'final_family_basis': _final_family_basis,
+           'final_family_contrasts': [[a, b] for a, b in _final_plan],
            'search_complete': _effective_search_complete,
            'budget_transfer': _budget_transfer,
            'grid_complete': _grid_complete,
