@@ -10979,22 +10979,60 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                              'replacement for the heterogeneity test')})
                 _paired_common = _pst
     out['paired_common_effect'] = _paired_common
-    if _all_seed_declared and _paired_common and _paired_common.get('status') == 'ok':
-        out['seed_dependence'] = 'shared_seeds_paired'
-        _dependence_note = ('the inverse-variance pooled CI assumes the scale '
-                            'points are independent studies, but they share '
-                            'training seeds; use paired_common_effect for the '
-                            'dependence-respecting readout')
-    elif _all_seed_declared:
-        out['seed_dependence'] = 'shared_seeds_unpaired'
-        _dependence_note = ('scale points share seed identities but no complete '
-                            'common seed set exists; the pooled CI is descriptive '
-                            'and its independence assumption is unmet')
+    # The random-effects model treats each scale point as an INDEPENDENT study.
+    # Declaring seed identities is not enough: disjoint seed sets are genuinely
+    # independent draws, a complete common set permits a paired sensitivity
+    # analysis, but a partially overlapping ladder is neither.  Classify the
+    # actual overlap so the pooled claim cannot silently treat shared draws as
+    # independent replications.
+    _seed_overlap = {'n_points': len(_measured_pts),
+                     'n_points_with_declared_seeds': int(sum(
+                         1 for p in _measured_pts if p.get('seeds_declared'))),
+                     'per_pair_common_seeds': {}, 'common_seeds_all_points': [],
+                     'n_common_seeds_all_points': 0}
+    if _all_seed_declared and len(_measured_pts) >= 2:
+        _seed_sets = [(p['label'], set(p['seeds'])) for p in _measured_pts]
+        _common_all = sorted(set.intersection(*(s for _l, s in _seed_sets)), key=str)
+        _pairs = {}
+        _any_pair_overlap = False
+        for _i in range(len(_seed_sets)):
+            for _j in range(_i + 1, len(_seed_sets)):
+                _li, _si = _seed_sets[_i]
+                _lj, _sj = _seed_sets[_j]
+                _n_ov = len(_si & _sj)
+                _pairs[f'{_li}|{_lj}'] = _n_ov
+                _any_pair_overlap = _any_pair_overlap or bool(_n_ov)
+        _seed_overlap.update({
+            'per_pair_common_seeds': _pairs,
+            'common_seeds_all_points': _common_all,
+            'n_common_seeds_all_points': len(_common_all),
+            'any_pair_overlap': bool(_any_pair_overlap)})
+        if _paired_common and _paired_common.get('status') == 'ok':
+            out['seed_dependence'] = 'shared_seeds_paired'
+            _dependence_note = ('the inverse-variance pooled CI assumes the scale '
+                                'points are independent studies, but they share '
+                                'training seeds; use paired_common_effect for the '
+                                'dependence-respecting readout')
+        elif _any_pair_overlap:
+            out['seed_dependence'] = 'shared_seeds_unpaired'
+            _dependence_note = ('some scale points share training seeds but no '
+                                'two complete common seeds exist across all of '
+                                'them; the pooled CI treats those paired draws '
+                                'as independent studies, so its independence '
+                                'assumption is unmet and it is not a valid '
+                                'common-effect estimate')
+        else:
+            out['seed_dependence'] = 'disjoint_seed_sets'
+            _dependence_note = ('the scale points used disjoint seed sets, so '
+                                'the independence assumption behind the pooled '
+                                'inverse-variance CI is consistent with the '
+                                'declared draws')
     else:
         out['seed_dependence'] = 'unattested'
         _dependence_note = ('seed identities are not declared for every measured '
                             'scale point, so neither independence nor paired '
                             'dependence can be attested')
+    out['seed_overlap'] = _seed_overlap
     # Every declared scale point below the seed floor blocks the pooled claim,
     # INCLUDING points that could not enter the random-effects weights at all
     # (n=1 has no se).  Reading this list only from `usable` silently dropped
@@ -11012,7 +11050,13 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                                  and not _incomplete and not _zero_variance
                                  and not _non_estimable
                                  and not _empty_points and not _invalid_scale_points
-                                 and not _unattested_plan_points),
+                                 and not _unattested_plan_points
+                                 # Independence of the DL "studies" must be
+                                 # attested: a partially shared ladder has
+                                 # paired draws, and undeclared seed identities
+                                 # cannot be assumed independent.
+                                 and out.get('seed_dependence') in
+                                     ('shared_seeds_paired', 'disjoint_seed_sets')),
                 'note': ('poolable requires >=3 scales, every included scale at n>=min_seeds '
                          'with a complete paired panel (no dropped/absent seeds) and non-zero '
                          'within-scale variance, '

@@ -10161,6 +10161,37 @@ def t_seed_and_nested_input_guards():
             raise AssertionError(f'partial nested folds {kw!r} were accepted')
 
 
+def t_meta_seed_overlap_controls_pooling():
+    # The DL pooled CI treats scale points as independent studies.  Declaring
+    # seed identities is not enough: disjoint sets are independent, a complete
+    # common set has a paired sensitivity analysis, but a partially overlapping
+    # ladder is neither and must not be pooled as a common effect.
+    def _pt(label, scale, seeds, effects):
+        return {'label': label, 'scale': scale, 'seeds': list(seeds),
+                'effects': list(effects), 'corpus_fp': 'fp', 'vocab': 8000}
+    eff = [0.10, 0.20, 0.30, 0.40]
+    partial = [_pt('S0', 1, [0, 1, 2, 3], eff),
+               _pt('S1', 10, [1, 3, 4, 5], eff),
+               _pt('S2', 100, [0, 2, 4, 5], eff)]
+    m = L.meta_analyze_effects(partial)
+    assert m['status'] == 'ok' and m['seed_dependence'] == 'shared_seeds_unpaired', m
+    assert m['seed_overlap']['n_common_seeds_all_points'] == 0, m['seed_overlap']
+    assert all(v > 0 for v in m['seed_overlap']['per_pair_common_seeds'].values()), m['seed_overlap']
+    assert m['poolable'] is False, m
+    assert 'independence' in m['note'], m['note']
+    # Disjoint draws are genuinely independent replications.
+    disjoint = [_pt('S0', 1, [0, 1, 2, 3], eff),
+                _pt('S1', 10, [4, 5, 6, 7], eff),
+                _pt('S2', 100, [8, 9, 10, 11], eff)]
+    md = L.meta_analyze_effects(disjoint)
+    assert md['seed_dependence'] == 'disjoint_seed_sets' and md['poolable'] is True, md
+    assert md['seed_overlap']['n_common_seeds_all_points'] == 0, md['seed_overlap']
+    # Undeclared seed identities cannot be assumed independent.
+    unattested = [{k: v for k, v in p.items() if k != 'seeds'} for p in disjoint]
+    mu = L.meta_analyze_effects(unattested)
+    assert mu['seed_dependence'] == 'unattested' and mu['poolable'] is False, mu
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10412,6 +10443,7 @@ def main():
     _check('L14 combined seed x document uncertainty interval', t_combined_seed_doc_uncertainty)
     _check('L14b paired evaluation-row bootstrap interval', t_paired_row_bootstrap_delta)
     _check('L15 cross-scale pooling refuses mixed corpus/tokenizer bindings', t_scale_corpus_binding_refuses_mixed_tokenizers)
+    _check('L15c meta-analysis seed overlap controls pooling', t_meta_seed_overlap_controls_pooling)
     _check('L15b scale-point corpus provenance roundtrip', t_scale_point_provenance_roundtrip)
     _check('L16 Holm mixed-n floor + invalid family slot', t_holm_mixed_n_and_invalid_family_size)
     _check('L16b meta-analysis prediction-interval df', t_meta_prediction_interval_df)
