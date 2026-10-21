@@ -9603,6 +9603,16 @@ def t_object_temporal_category_identity():
     freq = DG.LeakageSafeFrequencyEncoder().fit(X)
     f = freq.get_stats()['features'][0]['entries']
     assert len(f) == 2, f
+    # A timedelta category is persisted by the categorical encoder without
+    # int()-ing it (which raises for day-or-larger units) and still round-trips
+    # to the same ordinal codes.
+    cat_X = np.asarray([[one_day], [np.timedelta64(2, 'D')], [one_day],
+                        [np.timedelta64(2, 'D')]], dtype=object)
+    cat = DG.LeakageSafeCategoricalEncoder().fit(cat_X)
+    cat_stats = json.loads(json.dumps(cat.get_stats()))
+    cat_restored = DG.LeakageSafeCategoricalEncoder.from_stats(cat_stats)
+    assert np.array_equal(cat.transform(cat_X),
+                          cat_restored.transform(cat_X)), cat_stats
 
 
 def t_validation_row_split_group_aware():

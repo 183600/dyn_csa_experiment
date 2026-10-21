@@ -1324,6 +1324,11 @@ def _json_safe_category(value):
     """
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        # ``np.timedelta64`` is an ``np.integer``; int() raises for day-or-
+        # larger units and would silently shrink a nanosecond delta to its raw
+        # unit count.  Keep the readable value and dtype instead.
+        return {'__numpy_datetime__': str(value), '__dtype__': str(value.dtype)}
     if isinstance(value, np.bool_):
         return bool(value)
     if isinstance(value, np.integer):
@@ -1334,8 +1339,6 @@ def _json_safe_category(value):
         return {'__bytes_hex__': value.hex()}
     if isinstance(value, tuple):
         return {'__tuple__': [_json_safe_category(v) for v in value]}
-    if isinstance(value, (np.datetime64, np.timedelta64)):
-        return {'__numpy_datetime__': str(value), '__dtype__': str(value.dtype)}
     try:
         json.dumps(value, allow_nan=True)
     except (TypeError, ValueError, OverflowError):
