@@ -13314,6 +13314,10 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         protocol = artifact['protocol']
     else:
         protocol = SIMPLE_BASELINE_POLICY if protocol is None else protocol
+    if not isinstance(protocol, dict):
+        return {'status': 'fail', 'baseline_verified': False,
+                'problems': [f'simple-baseline protocol must be an object, got '
+                             f'{type(protocol).__name__}']}
     if not isinstance(artifact, dict) or not isinstance(artifact.get('baselines'), dict):
         return {'status': 'not_verifiable_locally', 'baseline_verified': False,
                 'problems': ['no simple_baseline artifact (expected {"baselines": {...}})']}
@@ -13337,8 +13341,17 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         problems.append(f'selection metric {metric!r} differs from the declared {protocol.get("selection_metric")!r}')
     if direction != 'lower_is_better':
         problems.append(f'count-model selection direction is {direction!r}; PPL is lower-is-better')
-    _declared = protocol.get('arms') or {}
-    declared_arms = set(_declared.keys()) if isinstance(_declared, dict) else set()
+    _declared = protocol.get('arms')
+    if _declared is None:
+        _declared = {}
+    elif not isinstance(_declared, dict):
+        # A list/scalar cannot declare per-arm orders/grids.  Treating it as
+        # an empty declaration silently skipped the missing/extra-arm gate.
+        problems.append(
+            f'simple-baseline protocol arms field is not an object '
+            f'({type(_declared).__name__}); the declared floor arms are unknown')
+        _declared = {}
+    declared_arms = set(_declared.keys())
     baselines = artifact['baselines']
     missing = sorted(declared_arms - set(baselines))
     if missing:
@@ -15939,6 +15952,10 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         protocol = selected['protocol']
     else:
         protocol = BASELINE_TUNING_PROTOCOL if protocol is None else protocol
+    if not isinstance(protocol, dict):
+        return {'status': 'fail', 'tuning_verified': False,
+                'problems': [f'tuning protocol must be an object, got '
+                             f'{type(protocol).__name__}']}
     if not isinstance(selected, dict) or not isinstance(selected.get('arms'), dict):
         return {'status': 'not_verifiable_locally', 'tuning_verified': False,
                 'problems': ['no baseline_tuning artifact (expected {"arms": {...}})']}

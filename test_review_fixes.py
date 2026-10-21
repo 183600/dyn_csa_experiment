@@ -12198,6 +12198,10 @@ def t_baseline_audit_direction_and_explicit_field_fallbacks():
     rs = L.baseline_tuning_audit(blank_split, protocol=protocol)
     assert rs['tuning_verified'] is False and any(
         'validation' in p for p in rs['problems']), rs
+    # A non-object protocol is malformed evidence, not an AttributeError.
+    rp = L.baseline_tuning_audit(_art('lower_is_better'), protocol=['not', 'a', 'map'])
+    assert rp['status'] == 'fail' and any(
+        'protocol must be an object' in p for p in rp['problems']), rp
 
 
 def t_simple_floor_rejects_undeclared_arms_and_blank_fields():
@@ -12233,6 +12237,13 @@ def t_simple_floor_rejects_undeclared_arms_and_blank_fields():
     rbd = L.simple_baseline_audit(blank_dir, protocol=proto)
     assert rbd['baseline_verified'] is False and any(
         'direction' in p for p in rbd['problems']), rbd
+    rp = L.simple_baseline_audit(art, protocol=['not', 'a', 'map'])
+    assert rp['status'] == 'fail' and any(
+        'protocol must be an object' in p for p in rp['problems']), rp
+    bad_arms = dict(proto, arms=['not-a-map'])
+    rba = L.simple_baseline_audit(art, protocol=bad_arms)
+    assert rba['baseline_verified'] is False and any(
+        'arms field is not an object' in p for p in rba['problems']), rba
 
 
 def t_metric_audit_recommended_availability_and_exact_floor_support():
