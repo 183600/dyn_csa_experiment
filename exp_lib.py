@@ -12477,6 +12477,13 @@ def variant_presence(outdir):
         v = r.get('variant')
         if v is None:
             v = _k.split('::')[0]
+        if not isinstance(v, str) or not v:
+            # An unhashable/non-string arm id cannot be a presence key; this
+            # is the same malformed-record contract as read_panel/report
+            # pairing.  Skip it instead of crashing inside a dict lookup.
+            print(f'[stats] WARNING: {sp}: record {_k!r} carries a '
+                  f'non-string/empty arm id ({v!r}) — ignored for presence')
+            continue
         if ppl_is_usable(r.get('ppl')) and (not r.get('synthesized')) and (_as_seed_int(r.get('seed')) is not None):
             kept[v] = kept.get(v, 0) + 1
         else:

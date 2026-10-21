@@ -13145,6 +13145,12 @@ def t_malformed_panel_summary_is_excluded():
             json.dump('not a panel', f)
         assert L.read_panel(td) == {}
         assert L.variant_presence(td) == {}
+        # A malformed arm id inside an otherwise valid panel record must not
+        # crash the presence reader on an unhashable dict/list key.
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump({'a::seed0': {'variant': ['not', 'a', 'string'],
+                                    'seed': 0, 'ppl': 1.0}}, f)
+        assert L.variant_presence(td) == {}
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
