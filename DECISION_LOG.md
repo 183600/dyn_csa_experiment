@@ -465,3 +465,35 @@ numeric NaN (missing-like) instead of treating its repr as a distinct
 category. Tests cover the binary positive-floor orientation, mixed-type
 predictions, malformed protocol/manifest shapes and signaling-NaN duplicates;
 the temporary issue list was removed after the fixes.
+
+## 2026-10-21 — baseline direction/budget provenance + micro PR-AUC chance floor (no new runs)
+
+Changed only zero-GPU baseline-audit, metric-audit and fairness-audit paths;
+no panel, frozen manifest, test split, README or CI configuration was touched.
+(1) `baseline_tuning_audit` no longer trusts an artifact's selection
+`direction` as free metadata: it must equal the pre-registered protocol
+direction, and PPL selection must be lower-is-better. A flipped artifact could
+otherwise crown the maximum-PPL trial as the tuned winner. Explicit blank
+values for `selection_metric` / `selection_split` / `direction` are now
+malformed evidence rather than silently falling through to the protocol
+default, and both baseline audits bind the recorded split to the declared
+protocol. Non-object protocols fail closed instead of raising.
+(2) The count-model floor audit now rejects undeclared arms (an extra arm
+could become the quoted `best_baseline` outside the equal-search design),
+rejects malformed `arms` declarations, enforces the one implemented
+`fit_token_policy` (`deterministic_prefix`), and checks that the reported floor
+estimand (`best_ppl_estimation_rows`) matches the nested evidence actually
+scored. Grid adequacy now also flags a selected interpolation weight at the
+0/1 bigram–unigram corners, not only the alpha boundary.
+(3) `classification_metrics` / `_multiclass_ranking_metrics` now record the
+micro one-vs-rest PR-AUC chance floor (`1/K`) and its lift; the percentile
+audit recomputes it from the class count and range-checks it. Trivial-floor
+reproduction now requires exact non-negative supports (fractional/boolean
+supports are rejected instead of truncated). The metric audit also verifies
+that a record claiming `recommended_primary_available=True` actually carries
+the recommended endpoint (and that `False` is not contradicted by a recorded
+value).
+(4) `audit_gates.audit_fairness` now checks cross-arm parameter totals:
+differing exact totals are a capacity confound; missing/non-unique totals are
+unverifiable, not a silent pass. Tests cover every new gate. The temporary
+issue list was removed after the fixes.
