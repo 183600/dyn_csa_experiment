@@ -4212,6 +4212,25 @@ def t_retrieval_metrics_and_niah_trivial_floor():
         msh = L.metric_policy_audit(bad_shape)
         assert msh['status'] == 'warn', (msh, _key)
         assert any(_why in str(c.get('invalid')) for c in msh['checks']), (msh, _key)
+    # A missing or non-numeric accuracy is an invalid record, not a reason to
+    # abort the whole audit with float(None)/max([]).
+    for _mut in ('missing', 'nonnumeric'):
+        _bad_acc = json.loads(json.dumps(good))
+        if _mut == 'missing':
+            del _bad_acc['n::seed0']['acc']
+        else:
+            _bad_acc['n::seed0']['acc'] = 'not-a-number'
+        _macc = L.metric_policy_audit(_bad_acc)
+        assert _macc['status'] == 'warn', (_mut, _macc)
+        assert any('retrieval endpoint is not usable' in w for w in _macc['warnings']), (_mut, _macc)
+    # An empty support table has no majority class; it must fail closed rather
+    # than raise from max() on an empty sequence.
+    _empty_sup = json.loads(json.dumps(good))
+    _empty_sup['n::seed0']['answer_support'] = {}
+    _mes = L.metric_policy_audit(_empty_sup)
+    assert _mes['status'] == 'warn', _mes
+    assert any('answer-support-sum-mismatch' in str(c.get('invalid'))
+               for c in _mes['checks']), _mes
     # Forged accuracy / majority floor / macro recall are rejected.
     for key, val in (('acc', 0.9), ('majority_accuracy', 0.1),
                      ('balanced_accuracy', 0.99), ('chance_accuracy', 0.01)):

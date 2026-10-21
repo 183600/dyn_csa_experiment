@@ -15660,10 +15660,13 @@ def metric_policy_audit(summary=None, policy=None):
                 _has_floor = any(k in _b for k in
                                  ('n_correct', 'chance_accuracy', 'majority_accuracy',
                                   'balanced_accuracy', 'answer_support'))
-                if _nc is not None and _nq is not None:
+                # A missing/non-numeric accuracy is already reported above.
+                # It must not be fed to float() here (which aborted the whole
+                # audit instead of marking the single record unusable).
+                if _a is not None and _nc is not None and _nq is not None:
                     if abs(float(_a) - (_nc / _nq)) > 1e-9:
                         _bad_niah.append('acc-count-inconsistent')
-                elif _has_floor:
+                elif _nc is None and _has_floor:
                     _bad_niah.append('correct-count-missing')
                 # Recompute the trivial floors from the recorded answer support
                 # whenever possible.  A raw accuracy without the uniform and
@@ -15719,7 +15722,10 @@ def metric_policy_audit(summary=None, policy=None):
                                 _bad_niah.append('chance-floor-not-uniform')
                     if _mj is None or not (0.0 <= _mj <= 1.0):
                         _bad_niah.append('majority-floor-missing')
-                    elif _supports is not None and _nq is not None:
+                    elif _supports and _nq is not None:
+                        # An empty support table has no majority class; it is
+                        # already flagged by the support-sum check and must not
+                        # crash max() here.
                         if abs(_mj - max(_supports) / _nq) > 1e-9:
                             _bad_niah.append('majority-floor-inconsistent')
                     if _ba is None or not (0.0 <= _ba <= 1.0):
