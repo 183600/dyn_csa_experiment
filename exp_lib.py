@@ -6170,7 +6170,9 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
     trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
     vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
-    trd_tok_path = os.path.join(cache_dir, f'train_token_doc_ids_{tag}.npy')
+    # Only validation needs token-level groups; a 5B-token TRAIN sidecar
+    # would be tens of GB and has no consumer.  Keep train document ids at the
+    # document level.
     vad_tok_path = os.path.join(cache_dir, f'val_token_doc_ids_{tag}.npy')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
         _sig = _memo_file_sig({'train': tr_path, 'val': va_path,
@@ -6335,7 +6337,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     _dedup_by_split = {}
 
     def stream_tokenise(split, cap_tokens, label, _ds=ds, _tok=tok, _eos=eos_id,
-                        _dtype=np.int32):
+                        _dtype=np.int32, want_token_doc_ids=False):
         cap_tokens = max(0, int(cap_tokens))
         arr = np.empty(cap_tokens, dtype=_dtype)
         cursor = 0
@@ -6346,7 +6348,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         # per-document token lengths.  Emit both, so the leakage audit keeps
         # its document-level identity and the fold helper gets token-level
         # groups from the SAME stream.
-        _token_doc_ids = array.array('Q')
+        _token_doc_ids = array.array('Q') if want_token_doc_ids else None
         _skipped = {'exact': 0, 'near': 0}
         _dedup_by_split[split] = _skipped
         _n_nonempty_seen = 0
@@ -6383,13 +6385,15 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                     take = min(len(ids), cap_tokens - cursor)
                     if take > 0:
                         arr[cursor:cursor + take] = ids[:take]
-                        _token_doc_ids.extend([_doc_u] * int(take))
+                        if _token_doc_ids is not None:
+                            _token_doc_ids.extend([_doc_u] * int(take))
                         cursor += take
                     if cursor >= cap_tokens:
                         _stop = True
                         break
                     arr[cursor] = _eos
-                    _token_doc_ids.append(_doc_u)
+                    if _token_doc_ids is not None:
+                        _token_doc_ids.append(_doc_u)
                     cursor += 1
                     if cursor >= cap_tokens:
                         _stop = True
@@ -6416,7 +6420,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         print(f'[data] WARNING: the train split ran dry at {len(train_ids)} tokens (< requested {n_train_tokens + seq_len}); runs configured for the advertised token target will train on fewer tokens than advertised')
     print('[data] tokenising validation ...')
     val_ids, val_doc_ids, val_token_doc_ids = stream_tokenise(
-        'validation', val_seqs * seq_len + seq_len, 'val', _dtype=np.int64)
+        'validation', val_seqs * seq_len + seq_len, 'val', _dtype=np.int64,
+        want_token_doc_ids=True)
     n_val = min(len(val_ids) // seq_len, val_seqs)
     val_batch = val_ids[:n_val * seq_len].reshape(n_val, seq_len)
     _validate_token_ids(train_ids, vocab, 'wikitext train_ids')
@@ -6433,7 +6438,6 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
     for _p, _a in ((tr_path, train_ids), (va_path, val_batch), (vp_path, val_bnd),
                    (trd_path, train_doc_ids), (vad_path, val_doc_ids),
-                   (trd_tok_path, train_token_doc_ids),
                    (vad_tok_path, val_token_doc_ids)):
         _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(_p)), prefix=os.path.basename(_p) + '.', suffix='.tmp')
         try:
@@ -6468,9 +6472,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             'validation_count': int(val_doc_ids.size),
             'train_fp': _ids_fp(train_doc_ids),
             'validation_fp': _ids_fp(val_doc_ids),
-            'train_token_count': int(train_token_doc_ids.size),
             'validation_token_count': int(val_token_doc_ids.size),
-            'train_token_fp': _ids_fp(train_token_doc_ids),
             'validation_token_fp': _ids_fp(val_token_doc_ids),
             'overlap': _shared_docs,
             'disjoint': True,
@@ -7633,7 +7635,9 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
     trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
     vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
-    trd_tok_path = os.path.join(cache_dir, f'train_token_doc_ids_{tag}.npy')
+    # Only validation needs token-level groups; a 5B-token TRAIN sidecar
+    # would be tens of GB and has no consumer.  Keep train document ids at the
+    # document level.
     vad_tok_path = os.path.join(cache_dir, f'val_token_doc_ids_{tag}.npy')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path,
                                         trd_path, vad_path))):
