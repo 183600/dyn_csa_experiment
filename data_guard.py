@@ -1194,18 +1194,30 @@ def _safe_median(values):
 
 
 def _safe_quantiles(values, qs):
-    """Quantiles that fall back to max-scaled values on overflow."""
+    """Quantiles that avoid float64 overflow in interpolation.
+
+    ``np.quantile`` computes interpolation as ``a + (b - a) * t``; for finite
+    values near the float64 limit that subtraction can overflow and silently
+    return a *wrong but finite* quantile.  When the magnitude is large enough
+    for that to happen, compute on max-scaled values instead.  Ordinary data
+    keeps the direct (bit-identical) path.
+    """
     if values.size == 0:
         return (-math.inf, math.inf)
+    _scaled, _m = _scaled_maxabs(values)
+    if _scaled is not None and _m > 1e150:
+        out = np.quantile(_scaled, qs) * _m
+        out = tuple(float(v) for v in np.asarray(out).reshape(-1))
+        if all(math.isfinite(v) for v in out):
+            return out
     with np.errstate(over='ignore', invalid='ignore'):
         out = np.quantile(values, qs)
     out = tuple(float(v) for v in np.asarray(out).reshape(-1))
     if all(math.isfinite(v) for v in out):
         return out
-    scaled, m = _scaled_maxabs(values)
-    if scaled is None:
+    if _scaled is None:
         return (-math.inf, math.inf)
-    out = np.quantile(scaled, qs) * m
+    out = np.quantile(_scaled, qs) * _m
     out = tuple(float(v) for v in np.asarray(out).reshape(-1))
     if all(math.isfinite(v) for v in out):
         return out
@@ -3325,13 +3337,25 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
             vals = col[finite]
             if vals.size == 0:
                 continue
-            q1, q3 = np.quantile(vals, (0.25, 0.75))
-            iqr = float(q3 - q1)
-            if iqr <= _EPS:
+            q1, q3 = _safe_quantiles(vals, (0.25, 0.75))
+            with np.errstate(over='ignore', invalid='ignore'):
+                iqr = float(q3 - q1)
+            if not math.isfinite(iqr) or iqr <= _EPS:
+                # A representable IQR is needed for a finite fence.  For an
+                # unrepresentable range fall back to the observed min/max,
+                # which cannot manufacture an outlier.
                 lo, hi = float(np.min(vals)), float(np.max(vals))
             else:
-                lo = float(q1 - outlier_iqr * iqr)
-                hi = float(q3 + outlier_iqr * iqr)
+                with np.errstate(over='ignore', invalid='ignore'):
+                    lo = float(q1 - outlier_iqr * iqr)
+                    hi = float(q3 + outlier_iqr * iqr)
+                # A fence beyond the float64 range is represented by the
+                # observed extreme: it drops nothing, rather than emitting a
+                # non-finite fence into the run manifest.
+                if not math.isfinite(lo):
+                    lo = float(np.min(vals))
+                if not math.isfinite(hi):
+                    hi = float(np.max(vals))
             _bad_cells[:, j] = finite & ((col < lo) | (col > hi))
         _row_bad = _bad_cells.any(axis=1)
         n_outlier_rows = int((_row_bad & ~drop).sum())
@@ -3364,13 +3388,20 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
                 if not drop[pos] and v is not None]
         n_target_reference_labels = int(len(_ref))
         if len(_ref) >= 2:
-            q1, q3 = np.quantile(_ref, (0.25, 0.75))
-            iqr = float(q3 - q1)
-            if iqr <= _EPS:
-                lo, hi = float(min(_ref)), float(max(_ref))
+            _ref_arr = np.asarray(_ref, dtype=np.float64)
+            q1, q3 = _safe_quantiles(_ref_arr, (0.25, 0.75))
+            with np.errstate(over='ignore', invalid='ignore'):
+                iqr = float(q3 - q1)
+            if not math.isfinite(iqr) or iqr <= _EPS:
+                lo, hi = float(np.min(_ref_arr)), float(np.max(_ref_arr))
             else:
-                lo = float(q1 - target_outlier_iqr * iqr)
-                hi = float(q3 + target_outlier_iqr * iqr)
+                with np.errstate(over='ignore', invalid='ignore'):
+                    lo = float(q1 - target_outlier_iqr * iqr)
+                    hi = float(q3 + target_outlier_iqr * iqr)
+                if not math.isfinite(lo):
+                    lo = float(np.min(_ref_arr))
+                if not math.isfinite(hi):
+                    hi = float(np.max(_ref_arr))
             target_outlier_fence = {
                 'lo': lo, 'hi': hi, 'k': float(target_outlier_iqr),
                 'n_train_reference': int(len(_ref)),
@@ -4695,13 +4726,20 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             target_outliers = {name: 0 for name in SPLIT_NAMES}
             target_fence = None
             if len(_train_t) >= 2:
-                q1, q3 = np.quantile(_train_t, (0.25, 0.75))
-                iqr = float(q3 - q1)
-                if iqr <= _EPS:
-                    lo, hi = float(min(_train_t)), float(max(_train_t))
+                _train_arr = np.asarray(_train_t, dtype=np.float64)
+                q1, q3 = _safe_quantiles(_train_arr, (0.25, 0.75))
+                with np.errstate(over='ignore', invalid='ignore'):
+                    iqr = float(q3 - q1)
+                if not math.isfinite(iqr) or iqr <= _EPS:
+                    lo, hi = float(np.min(_train_arr)), float(np.max(_train_arr))
                 else:
-                    lo = float(q1 - target_outlier_z * iqr)
-                    hi = float(q3 + target_outlier_z * iqr)
+                    with np.errstate(over='ignore', invalid='ignore'):
+                        lo = float(q1 - target_outlier_z * iqr)
+                        hi = float(q3 + target_outlier_z * iqr)
+                    if not math.isfinite(lo):
+                        lo = float(np.min(_train_arr))
+                    if not math.isfinite(hi):
+                        hi = float(np.max(_train_arr))
                 target_fence = {'lo': lo, 'hi': hi,
                                 'z': float(target_outlier_z),
                                 'n_train_reference': int(len(_train_t))}
@@ -4746,12 +4784,18 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         if vals.size == 0:
             q_lo[j], q_hi[j] = -np.inf, np.inf
             continue
-        q1, q3 = np.quantile(vals, (0.25, 0.75))
-        iqr = q3 - q1
-        if iqr <= _EPS:
+        q1, q3 = _safe_quantiles(vals, (0.25, 0.75))
+        with np.errstate(over='ignore', invalid='ignore'):
+            iqr = q3 - q1
+        if not math.isfinite(iqr) or iqr <= _EPS:
             q_lo[j], q_hi[j] = np.min(vals), np.max(vals)
         else:
-            q_lo[j], q_hi[j] = q1 - clip_z * iqr, q3 + clip_z * iqr
+            with np.errstate(over='ignore', invalid='ignore'):
+                q_lo[j], q_hi[j] = q1 - clip_z * iqr, q3 + clip_z * iqr
+            if not math.isfinite(q_lo[j]):
+                q_lo[j] = np.min(vals)
+            if not math.isfinite(q_hi[j]):
+                q_hi[j] = np.max(vals)
         for name, rows in split_rows.items():
             col = X[rows, j]
             good = np.isfinite(col)
