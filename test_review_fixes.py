@@ -2927,6 +2927,9 @@ def t_panel_tracking_events():
         assert st['n_cells_planned'] == 2 and st['n_cells_to_run'] == 2 and st['n_cells_resumed'] == 0, st
         fin = next(x for x in lines if x.get('kind') == 'panel_finish')
         assert fin['n_cells_planned'] == 2 and fin['n_cells_measured'] == 2 and fin['n_cells_missing'] == 0, fin
+        for k in ('provenance', 'config', 'seeds', 'variants', 'data_version'):
+            assert k in fin, f'panel_finish missing {k}'
+        assert fin['provenance']['code']['git_commit'] == st['provenance']['code']['git_commit'], fin
         m = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
         entry = m['panels'][L._run_fp(cfg, 64, 2, 4, 16, 997, ids, val)]
         assert entry.get('tracking_schema') == 2 and 'reproducibility' in entry

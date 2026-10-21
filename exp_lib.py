@@ -24938,7 +24938,7 @@ def _record_failed_panel(outdir, cfg, run_cfg, prov, *, stage, error, planned_ce
                     log_experiment_event(outdir, {
                         'kind': 'panel_finish', 'tracking_schema': 2,
                         'status': 'failed', 'stage': str(stage), 'run_cfg': run_cfg,
-                        'code': code_stamp(), 'error': f'{error}',
+                        'code': code_stamp(), 'provenance': prov, 'error': f'{error}',
                         'planned_cells': list(planned_cells or []),
                         'note': 'existing run_manifest entry preserved',
                     })
@@ -24951,7 +24951,7 @@ def _record_failed_panel(outdir, cfg, run_cfg, prov, *, stage, error, planned_ce
         log_experiment_event(outdir, {
             'kind': 'panel_finish', 'tracking_schema': 2,
             'status': 'failed', 'stage': str(stage), 'run_cfg': run_cfg,
-            'code': code_stamp(), 'error': f'{error}',
+            'code': code_stamp(), 'provenance': prov, 'error': f'{error}',
             'planned_cells': list(planned_cells or []),
         })
         return mpath
@@ -25322,6 +25322,10 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         'status': _final_status,
         'run_cfg': fp, 'code': code_stamp(), 'started_at': _panel_started,
         'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'provenance': prov, 'config': _jsonable(cfg),
+        'seeds': list(cfg.get('seeds') or []),
+        'variants': list(cfg.get('variants') or []),
+        'data_version': prov.get('data', {}).get('data_version'),
         'n_cells_planned': len(_planned_keys), 'n_cells_to_run': len(cells),
         'n_cells_measured': len(_measured),
         'n_cells_missing': len(_missing), 'missing_cells': _missing[:20],
