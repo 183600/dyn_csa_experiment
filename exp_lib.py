@@ -12926,7 +12926,11 @@ def cached_validation_row_groups(seq_len, n_train_tokens, vocab_size=8192,
     except Exception as e:
         raise ValueError(f'cached_validation_row_groups: cannot read {path} '
                          f'({type(e).__name__}: {e})') from None
-    doc_ids = np.asarray(doc_ids).reshape(-1)
+    doc_ids = np.asarray(doc_ids)
+    if doc_ids.ndim != 1:
+        raise ValueError(
+            'cached_validation_row_groups: token document-id sidecar must be '
+            f'one-dimensional, got shape {doc_ids.shape}')
     # Document ids are written as unsigned integers.  A float/object sidecar
     # cannot faithfully represent them (int(1.5) silently becomes 1, merging
     # two documents), and a negative signed id is not a document identity at

@@ -11158,6 +11158,17 @@ def t_cached_validation_row_groups_merge_shared_documents():
         assert 'length' in str(e), e
     else:
         raise AssertionError('a fractional token-id count must be refused')
+    # A multi-dimensional sidecar would be silently flattened into a different
+    # token->document mapping; require the documented one-dimensional layout.
+    _d8 = tempfile.mkdtemp(prefix='valgroups_2d_')
+    np.save(os.path.join(_d8, f'val_token_doc_ids_{_tag3}.npy'), _docs.reshape(2, 4))
+    try:
+        L.cached_validation_row_groups(_sl, _ntr, vocab_size=_vb, val_seqs=_vs,
+                                       n_rows=4, cache_dir=_d8)
+    except ValueError as e:
+        assert 'one-dimensional' in str(e), e
+    else:
+        raise AssertionError('a multi-dimensional document-id sidecar must be refused')
     # The tuning wrapper may fall back only when a VALID group table cannot
     # form the requested folds.  A corrupt sidecar must propagate: silently
     # treating it as "no split" would select on the final-estimate rows.
