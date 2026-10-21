@@ -20500,6 +20500,10 @@ def _reduce_curve_values(vals, max_points):
     """
     n = len(vals)
     max_points = int(max_points)
+    if max_points < 1:
+        # A zero-point budget cannot retain any sample.  Returning the
+        # historical fixed set would silently exceed the caller's bound.
+        return []
     if n <= max_points:
         return list(vals)
     nb = max(1, max_points // 7)
@@ -20536,7 +20540,40 @@ def _reduce_curve_values(vals, max_points):
                 keep.add(int(_ix))
     if n:
         keep.add(n - 1)
-    return [vals[i] for i in sorted(keep)]
+    _keep = sorted(keep)
+    if len(_keep) > max_points:
+        # The bin heuristic keeps up to five landmarks per bin, which is more
+        # than a very small budget allows.  Keep the last point and the first
+        # non-finite/extreme points when they fit, then fill chronologically.
+        _bad = _mini = _maxi = None
+        _minv = _maxv = None
+        for _i, _v in enumerate(vals):
+            try:
+                _f = float(_v)
+            except (TypeError, ValueError, OverflowError):
+                _f = None
+            if _f is None or not math.isfinite(_f):
+                if _bad is None:
+                    _bad = _i
+                continue
+            if _mini is None or _f < _minv:
+                _mini, _minv = _i, _f
+            if _maxi is None or _f > _maxv:
+                _maxi, _maxv = _i, _f
+        _sel = []
+        for _ix in (n - 1, _bad, _mini, _maxi, 0):
+            if _ix is not None and 0 <= _ix < n and _ix not in _sel:
+                _sel.append(int(_ix))
+                if len(_sel) >= max_points:
+                    break
+        if len(_sel) < max_points:
+            for _ix in _keep:
+                if _ix not in _sel:
+                    _sel.append(_ix)
+                    if len(_sel) >= max_points:
+                        break
+        _keep = sorted(_sel)
+    return [vals[i] for i in _keep]
 
 
 def _curve_extend(dst, new):
@@ -20554,6 +20591,8 @@ def _reduce_curve_points(points, max_points):
     """
     n = len(points)
     max_points = int(max_points)
+    if max_points < 1:
+        return []
     if n <= max_points:
         return list(points)
     nb = max(1, max_points // 7)
@@ -20596,7 +20635,37 @@ def _reduce_curve_points(points, max_points):
                 keep.add(int(_ix))
     if n:
         keep.add(n - 1)
-    return [points[i] for i in sorted(keep)]
+    _keep = sorted(keep)
+    if len(_keep) > max_points:
+        _bad = _mini = _maxi = None
+        _minv = _maxv = None
+        for _i, _point in enumerate(points):
+            try:
+                _f = float(_value(_point))
+            except (TypeError, ValueError, OverflowError):
+                _f = None
+            if _f is None or not math.isfinite(_f):
+                if _bad is None:
+                    _bad = _i
+                continue
+            if _mini is None or _f < _minv:
+                _mini, _minv = _i, _f
+            if _maxi is None or _f > _maxv:
+                _maxi, _maxv = _i, _f
+        _sel = []
+        for _ix in (n - 1, _bad, _mini, _maxi, 0):
+            if _ix is not None and 0 <= _ix < n and _ix not in _sel:
+                _sel.append(int(_ix))
+                if len(_sel) >= max_points:
+                    break
+        if len(_sel) < max_points:
+            for _ix in _keep:
+                if _ix not in _sel:
+                    _sel.append(_ix)
+                    if len(_sel) >= max_points:
+                        break
+        _keep = sorted(_sel)
+    return [points[i] for i in _keep]
 
 
 _LEDGER_CURVE_MAX_POINTS = 20000
