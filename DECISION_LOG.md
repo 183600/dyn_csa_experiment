@@ -83,6 +83,27 @@ test-split record was ever written.
   without removing it. Validation is also the split that was reused for all
   v6-v11 selection, so it cannot support confirmatory claims.
 
+## 2026-10-21 — NIAH trivial floors, primary-accuracy tests, document-group folds (no new runs)
+
+Changed only zero-GPU metric/statistics/tuning paths; no panel, frozen
+manifest, test split, README or CI configuration was touched. (1) NIAH-natural
+now records `n_correct`, per-answer support/recall, macro recall (balanced
+accuracy), the uniform chance floor over observed answer classes, the
+majority-answer floor and both lifts; the v10 report shows them side by side.
+`metric_policy_audit` recomputes the accuracy from counts and rejects forged
+chance/majority/macro values, while legacy records without a floor are named
+as unverifiable. (2) NIAH paired statistics now test top-1 accuracy (the
+declared primary endpoint) as well as answer NLL; accuracy contrasts join the
+same Holm family, so a significant secondary NLL cannot stand in for an
+untested retrieval gain. (3) Nested tuning/evaluation row folds are now
+document-group aware: the cached per-token validation document ids are folded
+into row groups (rows sharing a document are unioned), and the tuning, final
+and simple-baseline paths pass those groups to `validation_row_split`. A
+missing sidecar is an explicit `groups_aware=False` fallback; a present but
+inconsistent sidecar fails closed. Tests cover the retrieval floors, forged
+NIAH aggregates, and document-crossing rows. The temporary issue list was
+removed after the fixes.
+
 ## 2026-10-21 — baseline adequacy / conditional endpoints / degenerate cuts (no new runs)
 
 Changed only zero-GPU baseline-audit and metric-audit paths; no panel, frozen

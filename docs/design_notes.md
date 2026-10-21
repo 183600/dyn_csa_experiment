@@ -1729,3 +1729,47 @@ accuracy、balanced accuracy 与 macro/micro/weighted F1。它在同一 label
 空间上计算，不读取分数或预测结果，因此不能通过调阈值「变强」。审计在
 per-class support 存在时会重算该 floor；若记录把 floor 的 label 改成不是
 最多数的类，或聚合值无法由 support 复现，按不可复核处理。
+
+## 36. 检索端点的平凡基线、主端点检验与文档组行折（本轮硬化）
+
+本轮不新增 GPU 面板；改动都发生在零 GPU 的指标/统计/调参路径。
+
+### 36.1 NIAH 不能只报 top-1 accuracy
+
+NIAH-natural 是多分类检索端点（8k 词表中的答案 token）。只报 micro top-1
+accuracy 无法区分「真的检索到了远端信息」与「答案类别频率/运气」：
+高频答案会主导 micro 指标，稀有答案的错误被平均掉。`retrieval_metrics`
+现在对同一批 query 同时记录：
+
+- `n_correct` 与 `acc`（top-1，micro over queries）；
+- `balanced_accuracy` / `macro_recall`（每个实际出现的答案类别等权）；
+- `chance_accuracy = 1/n_observed_answer_classes`（均匀猜）；
+- `majority_accuracy`（总是猜出现最多的答案 token）与对应 lift；
+- `answer_support` / `per_class_recall`，供审计重算。
+
+`v10_supp.py` 的 NIAH cell 记录写入这些字段，报告表并列展示 micro acc、
+macro-recall、uniform chance 与 majority floor。`metric_policy_audit` 对
+新记录重算 `acc = n_correct/n_queries`、chance/majority floor 与 macro
+recall；手改 accuracy 或 floor 会失败。没有这些字段的旧记录被列为
+`legacy_without_trivial_floor` 并给 warning，不能当作「已经证明有技能」。
+
+### 36.2 检索的主端点必须真的被检验
+
+之前 NIAH 的配对统计只检验 answer NLL，但 `METRIC_POLICY` 声明的主端点是
+top-1 accuracy；这会出现「NLL 显著、accuracy 无差异」却被写成检索收益的
+错位。`v10_supp.py stats` 现在同时构造逐种子配对 accuracy 对比
+（`accuracy_contrasts`），并与 NLL 对比一起进入同一个 Holm 族；报告分别
+列出两种端点，避免用次级 NLL 代替主端点结论。
+
+### 36.3 嵌套验证行折必须是文档组感知的
+
+固定长度的验证行可以跨文档边界；只按行切分仍可能把同一篇文档的一部分
+放在 selection fold、另一部分放在 evaluation fold。缓存中已有逐 token 的
+`val_doc_ids` sidecar，`cached_validation_row_groups` 将其折叠为每行一个
+文档组，并把任何共享文档的行 union 成同一组；`baseline_tune` 的
+tuning/final/simple 三条路径都通过 `_nested_row_split` 把这个组向量传给
+`validation_row_split`。sidecar 缺失时显式记录 `groups_aware=False` 与
+原因，不冒充文档不相交；sidecar 存在但长度/指纹不一致时 fail closed。
+`row_split` 元数据会保留 `groups_aware`、`n_groups` 与来源，审计仍可复现
+行指纹。该实现覆盖 WikiText 主研究；FineWeb 若需要组感知切分，调用方应
+显式提供组向量。
