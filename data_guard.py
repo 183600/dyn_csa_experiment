@@ -1499,6 +1499,46 @@ def _categorical_fingerprint(X):
     return h.hexdigest()[:16]
 
 
+def _categorical_row_set_fingerprint(X):
+    """Order-insensitive identity of the rows in a categorical table.
+
+    ``_categorical_fingerprint`` is order-sensitive.  The target encoder uses
+    this companion digest to refuse the training rows even when the caller
+    presents the same rows in a different order: a reordered training matrix
+    still contains each row's own label, so allowing it through ``transform``
+    would restore the full-table leak.  Only a commutative 128-bit sum/xor of
+    per-row digests is retained, so large tables are not kept in memory.
+    """
+    arr = np.asarray(X, dtype=object)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    mask = (1 << 128) - 1
+    total = 0
+    xored = 0
+    for row in arr.tolist():
+        h = hashlib.blake2b(digest_size=16)
+        for value in row:
+            key = _target_key(value)
+            h.update(str(len(key)).encode('ascii'))
+            h.update(b':')
+            h.update(key.encode('utf-8', errors='replace'))
+            h.update(b'|')
+        digest = int.from_bytes(h.digest(), 'little')
+        total = (total + digest) & mask
+        xored ^= digest
+    h = hashlib.sha256()
+    h.update(str(tuple(arr.shape)).encode('ascii'))
+    h.update(b'|')
+    h.update(str(int(arr.shape[0])).encode('ascii'))
+    h.update(b'|')
+    h.update(str(total).encode('ascii'))
+    h.update(b'|')
+    h.update(str(xored).encode('ascii'))
+    return h.hexdigest()[:16]
+
+
 def _json_safe_category(value):
     """Represent a category value without changing its learned identity.
 
@@ -2159,6 +2199,7 @@ class LeakageSafeTargetEncoder:
         self.n_train_ = int(n)
         self.prior_ = float(np.mean(yarr[np.isfinite(yarr)]))
         self.train_fp_ = _categorical_fingerprint(Xarr)
+        self.train_row_set_fp_ = _categorical_row_set_fingerprint(Xarr)
         self.fitted_ = True
         return self
 
@@ -2200,14 +2241,20 @@ class LeakageSafeTargetEncoder:
         deliberate diagnostic may pass ``allow_train=True``.
         """
         Xarr = self._check_transform_input(X)
-        if (not allow_train and self.train_fp_ is not None
-                and _categorical_fingerprint(Xarr) == self.train_fp_):
-            raise ValueError(
-                'LeakageSafeTargetEncoder.transform was given the exact '
-                'training rows, but its full-table encoding contains their '
-                'own labels; use fit_transform for training rows (out-of-fold '
-                'encodings) and reserve transform for validation/test, or '
-                'pass allow_train=True for an explicit diagnostic')
+        if not allow_train and self.train_fp_ is not None:
+            _same_rows = _categorical_fingerprint(Xarr) == self.train_fp_
+            if (not _same_rows and self.train_row_set_fp_ is not None
+                    and _categorical_row_set_fingerprint(Xarr)
+                    == self.train_row_set_fp_):
+                _same_rows = True
+            if _same_rows:
+                raise ValueError(
+                    'LeakageSafeTargetEncoder.transform was given the exact '
+                    'training rows (possibly reordered), but its full-table '
+                    'encoding contains their own labels; use fit_transform for '
+                    'training rows (out-of-fold encodings) and reserve '
+                    'transform for validation/test, or pass allow_train=True '
+                    'for an explicit diagnostic')
         return self._apply(self.feature_stats_, Xarr)
 
     def fit_transform(self, X, y, *, groups=None, time=None):
@@ -2271,6 +2318,7 @@ class LeakageSafeTargetEncoder:
             'n_train': self.n_train_,
             'prior': float(self.prior_),
             'train_fp': self.train_fp_,
+            'train_row_set_fp': getattr(self, 'train_row_set_fp_', None),
             'oof_policy': getattr(self, 'oof_policy_', None),
             'oof_fold_fp': getattr(self, 'oof_fold_fp_', None),
             'features': [
@@ -2337,6 +2385,7 @@ class LeakageSafeTargetEncoder:
         obj.prior_ = _stat_float(stats, 'prior',
                                  what=what, index='top-level')
         obj.train_fp_ = stats.get('train_fp')
+        obj.train_row_set_fp_ = stats.get('train_row_set_fp')
         obj.oof_policy_ = stats.get('oof_policy')
         obj.oof_fold_fp_ = stats.get('oof_fold_fp')
         obj.fitted_ = True

@@ -9188,6 +9188,15 @@ def t_target_encoder_prevents_self_and_group_leakage():
             raise AssertionError('in-sample target encoding must be refused')
         assert np.allclose(_enc_obj.transform(X, allow_train=True),
                            _enc_obj.transform(X, allow_train=True))
+        # Reordering the same training rows must not bypass the refusal: the
+        # reordered matrix still contains every row's own label.
+        try:
+            _enc_obj.transform(X[::-1])
+        except ValueError as e:
+            assert 'possibly reordered' in str(e), e
+        else:
+            raise AssertionError(
+                'a reordered training matrix must still be refused')
     # Missing categories are a learned training level, not silently a prior.
     Xm = np.array([['a'], [None], ['a'], [None], ['b'], ['a']], dtype=object)
     em = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(Xm, y)
