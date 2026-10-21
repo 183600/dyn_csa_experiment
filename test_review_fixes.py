@@ -5678,6 +5678,16 @@ def t_data_quality_target_outliers():
             pass
         else:
             raise AssertionError(f'target_outlier_z={bad!r} must be refused')
+    # Explicit label gates without labels must fail closed, not be skipped.
+    for _kw in ({'fail_on_label_shift': True},
+                {'fail_on_nonfinite_labels': True},
+                {'fail_on_unknown_labels': True}):
+        try:
+            L.data_quality_report(X, train_idx=[0, 1, 2, 3], **_kw)
+        except ValueError as e:
+            assert 'requires y' in str(e), e
+        else:
+            raise AssertionError(f'{_kw} without y must be refused')
 
 
 def t_split_sizes_explicit_never_negative():

@@ -3188,6 +3188,19 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             'data_quality_report: target_outlier_z/fail_on_target_outliers '
             'requires y so the target fence can be learned and audited; '
             'refusing to silently skip the requested target-outlier gate')
+    # These flags are only meaningful with labels.  Without y the old path
+    # simply never entered the label block, so a caller that explicitly asked
+    # for a hard label gate got a silently disabled check.
+    _label_gates = {
+        'fail_on_label_shift': fail_on_label_shift,
+        'fail_on_nonfinite_labels': fail_on_nonfinite_labels,
+        'fail_on_unknown_labels': fail_on_unknown_labels,
+    }
+    _requested_label_gates = [k for k, v in _label_gates.items() if v]
+    if y is None and _requested_label_gates:
+        raise ValueError(
+            'data_quality_report: ' + '/'.join(_requested_label_gates)
+            + ' requires y so the requested label gate can actually run')
     # Keep the caller's dtype for duplicate keys: the float64 view used by the
     # statistics below cannot distinguish int64 values above 2**53.
     _raw_X = np.asarray(X)
