@@ -173,6 +173,18 @@ def _is_current(rec, fp, *, data_fp=None, eval_fp=None):
     return _nll_per_token(rec) is not None
 
 
+def _current_cells(summary, planned, fp, *, data_fp=None, eval_fp=None):
+    """Planned keys whose record is current for this run.
+
+    A cell with a usable PPL from an older recipe/data split is not a
+    measurement of the current panel.  Reusing it here would let a panel whose
+    cells could not be retrained report itself ``complete`` from stale files.
+    """
+    return {k for k in planned
+            if _is_current(summary.get(k), fp,
+                           data_fp=data_fp, eval_fp=eval_fp)}
+
+
 def _synthetic_data(cfg, vocab=97, n_train=40000, val_rows=8):
     rng = np.random.RandomState(cfg.get('seed', 0) if 'seed' in cfg else 0)
     train = rng.randint(0, vocab, size=int(n_train)).astype(np.int64)
@@ -385,8 +397,11 @@ def run_panel(cfg, matrix, *, device, synthetic=False, max_hours=None, label='ma
             if rec is not None:
                 done += 1
     summary = _load_summary(outdir)
-    present = {k for k in planned if isinstance(summary.get(k), dict)
-               and L.ppl_is_usable((summary.get(k) or {}).get('ppl'))}
+    _data_fp = L._ids_fp(train) if train is not None else None
+    _eval_fp = (L._ids_fp(np.ascontiguousarray(val).reshape(-1))
+                if val is not None else None)
+    present = _current_cells(summary, planned, fp,
+                             data_fp=_data_fp, eval_fp=_eval_fp)
     missing = [k for k in planned if k not in present]
     status = 'complete' if not missing else 'incomplete'
     _save_manifest(status=status, finished_at=time.strftime('%Y-%m-%dT%H:%M:%S'),

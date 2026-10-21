@@ -10082,6 +10082,22 @@ def t_open_block_resume_binds_data_fingerprints():
     legacy = {k: v for k, v in rec.items() if k not in ('data_fp', 'eval_fp')}
     assert OB._is_current(legacy, 'fp', data_fp=L._ids_fp(tr),
                           eval_fp=L._ids_fp(va.reshape(-1))) is False
+    # The panel manifest's "measured" set must use the same current-record
+    # contract: a stale run/data/eval fingerprint (or missing accounting) is
+    # not a completed cell for this panel.
+    planned = [f'{v}::seed0' for v in ('current', 'stale_fp', 'stale_data',
+                                       'no_acc', 'legacy')]
+    summary = {
+        'current::seed0': rec,
+        'stale_fp::seed0': dict(rec, run_fingerprint='other'),
+        'stale_data::seed0': dict(rec, data_fp=L._ids_fp(tr + 1)),
+        'no_acc::seed0': no_acc,
+        'legacy::seed0': legacy,
+    }
+    assert OB._current_cells(summary, planned, 'fp',
+                             data_fp=L._ids_fp(tr),
+                             eval_fp=L._ids_fp(va.reshape(-1))) == {
+                                 'current::seed0'}, summary
 
 
 
