@@ -3343,11 +3343,14 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         def _numeric_label(value):
             # Only scalar numeric labels define a regression target.  A
             # categorical string, a tuple (multi-output) or a missing/Inf
-            # target has no place on a single target fence.
+            # target has no place on a single target fence.  Decimal is an
+            # exact real numeric target even though it is not a
+            # numbers.Number subclass; its NaN spellings are missing.
             if (value is None
                     or isinstance(value, (bool, np.bool_))
                     or isinstance(value, (complex, np.complexfloating))
-                    or not isinstance(value, numbers.Number)):
+                    or _numeric_is_nan(value)
+                    or not isinstance(value, (numbers.Number, _decimal.Decimal))):
                 return None
             try:
                 f = float(value)
@@ -4676,7 +4679,9 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                     return None
                 if isinstance(value, (complex, np.complexfloating)):
                     return None
-                if not isinstance(value, numbers.Number):
+                if _numeric_is_nan(value):
+                    return None
+                if not isinstance(value, (numbers.Number, _decimal.Decimal)):
                     return None
                 try:
                     f = float(value)
