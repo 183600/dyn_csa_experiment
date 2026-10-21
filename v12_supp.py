@@ -4,7 +4,7 @@
 前序版本（v7→v11）的全部面板都围绕同一个 validation split 展开，且多轮
 追加种子/比较属于**探索性**证据。本驱动把「确认」独立出来：
 
-  P5C   —— 按冻结清单的种子列表训练全部四个冻结臂（主臂 + 从头训练的
+  P5C   —— 按冻结清单的种子列表训练全部六个冻结臂（主臂 + 从头训练的
            选择器对照 csa_fixed_rope_randidx / csa_fixed_rope_allblocks；
            0-5 已由 P3MT/P4MT/P3MTC 覆盖，同 recipe 下 resume 自动跳过）；
   P5MP  —— 扩展探针在清单种子上重跑（uniform/natural/mask/delete +
@@ -35,8 +35,10 @@
 模式：
   python v12_supp.py smoke            # 端到端自检（微型 ckpt + 冻结清单副本）
   python v12_supp.py plan             # 零 GPU 预检：戳/实现绑定/准入/功效，不读 test
-  python v12_supp.py full             # P5C -> P5MP -> P5S2 -> P5S3 -> P5T -> report
+  python v12_supp.py power            # 零 GPU：用 P5C validation 差值做精确条件功效（同样不读 test）
+  python v12_supp.py full             # P5C -> P5H -> P5PW -> P5T -> P5MP -> P5S2/P5S3 -> report
   python v12_supp.py phase P5C        # 单阶段（可断点续跑）
+  python v12_supp.py phase P5PW       # 仅功效预检
   python v12_supp.py analysis         # 零 GPU：确认性统计 -> analysis_v12/
   python v12_supp.py report           # 从落盘产物重建 REPORT_v12.md（零 GPU）
 
@@ -100,21 +102,55 @@ def make_guard():
 # 冻结清单把种子数从 6 修订为 12（修订发生在任何
 # test-split 评估之前，见清单 revision 块）。P5C/P5MP 的
 # 种子列表**不再是这里的硬编码**，运行期由 `_frozen_seeds()` 从冻结清单
-# 读取（单一事实来源）；P5C 同时覆盖全部四个冻结臂（主臂 0-5 已由
+# 读取（单一事实来源）；P5C 同时覆盖全部六个冻结臂（主臂 0-5 已由
 # P3MT/P4MT 训练，resume 自动跳过；主臂 6-11 与对照臂统一在此补齐），
 # 否则清单扩种子后没有任何驱动会训练主臂新种子。
-P5C_CFG = dict(V10.P3MT_PAYLOAD, seeds=[0, 1, 2, 3, 4, 5], variants=['csa_fixed_rope', 'full_rope'] + list(V10.SCRATCH_CONTROLS),
+P5C_CFG = dict(V10.P3MT_PAYLOAD, seeds=[0, 1, 2, 3, 4, 5],
+               variants=['csa_fixed_rope', 'full_rope', 'full_rope_sink',
+                         'csa_fixed_rope_nosink', 'csa_fixed_rope_randidx_seeded',
+                         'csa_fixed_rope_allblocks'],
                # Diagnostic-only validation monitoring: never used for model
                # selection, but P5T refuses the one-shot test access when a
-               # frozen arm trained through a non-finite/overfit tail.
+               # frozen arm trained through a non-finite/degrading tail (a
+               # flat/plateaued tail is recorded as non-blocking).
                diag_eval_every=250)
-P5MP_CFG = dict(V10.PROBE, seeds=[0, 1, 2, 3, 4, 5], variants=['csa_fixed_rope', 'full_rope'] + V10.SCRATCH_CONTROLS, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS})
+P5MP_CFG = dict(V10.PROBE, seeds=[0, 1, 2, 3, 4, 5],
+               variants=['csa_fixed_rope', 'full_rope', 'full_rope_sink',
+                         'csa_fixed_rope_nosink', 'csa_fixed_rope_randidx_seeded',
+                         'csa_fixed_rope_allblocks'],
+               arm_overrides={v: ['learned'] for v in ('csa_fixed_rope_randidx_seeded', 'csa_fixed_rope_allblocks')})
 P5S2_CFG = dict(V10.P3SL_TOK_CFG, seeds=[0, 1, 2])
 P5S3_CFG = dict(V10.P3SL_FLOP_CFG, seeds=[0, 1, 2])
 TEST_OUTDIR = 'results_lm_test'
 FREEZE_MANIFEST = 'confirmation_frozen.json'
-PHASES = [('P5C', 'lenphase', P5C_CFG, None), ('P5MP', 'probe', P5MP_CFG, None), ('P5S2', 'run', P5S2_CFG, None), ('P5S3', 'run', P5S3_CFG, None), ('P5H', 'health', None, None), ('P5T', 'finaltest', None, None)]
+# The confirmatory phases run FIRST.  The exploratory scale/probe panels used
+# to sit between P5C and P5T, so an exhausted run-time cap could stop the driver
+# after all training and before the single test-split evaluation.  Order is now
+# data-priority order: train -> health -> power preflight -> test -> exploratory.
+PHASES = [('P5C', 'lenphase', P5C_CFG, None), ('P5H', 'health', None, None),
+          ('P5PW', 'power', None, None), ('P5T', 'finaltest', None, None),
+          ('P5MP', 'probe', P5MP_CFG, None), ('P5S2', 'run', P5S2_CFG, None),
+          ('P5S3', 'run', P5S3_CFG, None)]
 _PLAN_DONE = False
+
+# Health-gate policy (review 5).  A fixed-budget run normally ends on a flat
+# cosine tail; that is a converged/plateaued curve, not evidence that the
+# weights are unusable.  Only a non-finite, actively overfitting/degrading or
+# entirely unmonitored curve may block the one-shot test access.  Non-blocking
+# statuses are still recorded and printed, never silently dropped.
+_HEALTH_BLOCKING = frozenset({
+    'nonfinite', 'overfitting', 'validation_degrading',
+    'insufficient_data', 'unmonitored', 'unknown',
+})
+_HEALTH_NONBLOCKING = frozenset({
+    'underfitting_or_stalled', 'validation_improving_train_flat',
+})
+
+
+def _health_blocks(status):
+    """True only for statuses that make the confirmation evaluation unsafe."""
+    s = str(status if status is not None else 'unknown')
+    return s != 'healthy' and s in _HEALTH_BLOCKING
 
 def run_training_health(cfg=None):
     """Pre-test health gate over the frozen arms/seeds.
@@ -129,6 +165,7 @@ def run_training_health(cfg=None):
     ckpt_dir = cfg.get('ckpt_dir') or FINALTEST_CFG['ckpt_dir']
     rows = {}
     unhealthy = []
+    nonblocking = []
     missing = []
     for v in manifest['arms']:
         for seed in manifest['seeds']:
@@ -152,8 +189,10 @@ def run_training_health(cfg=None):
                          'best_val_ppl': d.get('best_val_ppl'),
                          'final_ppl': d.get('final_ppl'),
                          'path': ck}
-            if status != 'healthy':
+            if _health_blocks(status):
                 unhealthy.append(key)
+            elif status != 'healthy':
+                nonblocking.append(key)
             del d
             try:
                 gc.collect()
@@ -163,16 +202,25 @@ def run_training_health(cfg=None):
               'manifest': cfg.get('manifest') or FREEZE_MANIFEST,
               'n_arms': len(manifest['arms']), 'n_seeds': len(manifest['seeds']),
               'n_cells': len(rows), 'n_missing': len(missing), 'n_unhealthy': len(unhealthy),
-              'missing': missing, 'unhealthy': unhealthy,
+              'n_nonblocking': len(nonblocking),
+              'missing': missing, 'unhealthy': unhealthy, 'nonblocking': nonblocking,
+              'blocking_statuses': sorted(_HEALTH_BLOCKING),
+              'nonblocking_statuses': sorted(_HEALTH_NONBLOCKING),
               'status': ('pass' if not missing and not unhealthy else 'fail'),
-              'note': 'diagnostic only: this gate never selects a checkpoint or changes the frozen plan',
+              'note': ('diagnostic only: this gate never selects a checkpoint or changes the frozen plan. '
+                       'A flat/plateaued tail (underfitting_or_stalled) is recorded as non-blocking; only '
+                       'nonfinite/overfitting/validation_degrading/insufficient_data/unmonitored block P5T.'),
               'cells': rows}
     out = cfg.get('out') or os.path.join(TEST_OUTDIR, 'training_health.json')
     L.atomic_write_json(out, report, indent=2)
-    print(f'[p5h] training health: {report["status"]} ({len(unhealthy)} unhealthy, {len(missing)} missing) -> {out}')
+    print(f'[p5h] training health: {report["status"]} ({len(unhealthy)} blocking, '
+          f'{len(nonblocking)} non-blocking, {len(missing)} missing) -> {out}')
+    if nonblocking:
+        print(f'[p5h] NOTE: {len(nonblocking)} cell(s) are plateaued/converged but non-blocking: {nonblocking[:6]}'
+              + (' …' if len(nonblocking) > 6 else ''))
     allow = os.environ.get('V12_ALLOW_UNHEALTHY', '').strip().lower() in ('1', 'true', 'yes', 'on')
     if report['status'] != 'pass' and not allow:
-        raise SystemExit(f'[p5h] REFUSE: frozen-arm training health is not clean ({len(unhealthy)} unhealthy, {len(missing)} missing); investigate before using the one-shot test access (V12_ALLOW_UNHEALTHY=1 is the explicit override)')
+        raise SystemExit(f'[p5h] REFUSE: frozen-arm training health is not clean ({len(unhealthy)} blocking, {len(missing)} missing); investigate before using the one-shot test access (V12_ALLOW_UNHEALTHY=1 is the explicit override)')
     if report['status'] != 'pass':
         print('[p5h] WARNING: V12_ALLOW_UNHEALTHY=1 — continuing despite unhealthy/missing training health')
     return report
@@ -200,6 +248,9 @@ def run_phase(name, guard, par=None):
             return V.run_lenphase(cfg, guard=guard, label=f'v12 {pname}', par=_ctx)
         if kind == 'probe':
             return V10.run_probe(cfg, guard=guard, label=f'v12 {pname}', par=_ctx)
+        if kind == 'power':
+            # Zero-GPU pre-test power calibration; never reads the test split.
+            return run_power(manifest_path=FREEZE_MANIFEST)
         if kind == 'health':
             return run_training_health({'manifest': FREEZE_MANIFEST, 'ckpt_dir': FINALTEST_CFG['ckpt_dir'], 'out': os.path.join(TEST_OUTDIR, 'training_health.json')})
         if kind == 'finaltest':
@@ -214,7 +265,7 @@ def run_phase(name, guard, par=None):
     raise SystemExit(f'unknown phase {name}')
 
 # ---- P5T：冻结后的独立最终测试 ----------------------------------------------
-FINALTEST_CFG = dict(manifest=FREEZE_MANIFEST, outdir=TEST_OUTDIR, ckpt_dir='results_v10_mech/ckpt', mech_summary='results_v10_mech/summary.json', bylen_summary=os.path.join(TEST_OUTDIR, 'bylen.json'), probe_summary=os.path.join(TEST_OUTDIR, 'distractor.json'), eval_lens=[512, 1024, 2048, 4096], n_seq=16, target=512, chunk=4)
+FINALTEST_CFG = dict(manifest=FREEZE_MANIFEST, outdir=TEST_OUTDIR, ckpt_dir='results_v10_mech/ckpt', mech_summary='results_v10_mech/summary.json', bylen_summary=os.path.join(TEST_OUTDIR, 'bylen.json'), probe_summary=os.path.join(TEST_OUTDIR, 'distractor.json'), eval_lens=[512, 1024, 2048, 4096], n_seq=48, target=512, chunk=4)
 
 def _load_manifest(path):
     if not os.path.exists(path):
@@ -225,6 +276,18 @@ def _load_manifest(path):
         raise SystemExit(f'[v12] REFUSE: freeze manifest {path} cannot be parsed ({type(e).__name__}: {e})')
     if not isinstance(m, dict):
         raise SystemExit(f'[v12] REFUSE: freeze manifest {path} is not a JSON object ({type(m).__name__})')
+    if str(m.get('status') or '').strip().lower() == 'draft':
+        # A draft is a design record, not a pre-registration.  It exists so the
+        # dynamic/HCA study cannot be silently squeezed into the fixed v5
+        # one-shot: it needs its own disjoint test source and freeze revision.
+        _draft_msg = (f'[v12] REFUSE: {path} is status=draft — a draft is not a runnable '
+                      'pre-registration. Reserve a disjoint test source (or a disjoint, '
+                      'never-read document split), freeze the plan and record its revision '
+                      'before using it. (V12_ALLOW_DRAFT=1 is only for inspecting the schema; '
+                      'it does not make the result confirmatory.)')
+        if os.environ.get('V12_ALLOW_DRAFT', '').strip().lower() not in ('1', 'true', 'yes', 'on'):
+            raise SystemExit(_draft_msg)
+        print(_draft_msg.replace('REFUSE:', 'WARNING (V12_ALLOW_DRAFT):'))
     for field in ('arms', 'seeds', 'primary_comparisons', 'statistics'):
         if field not in m:
             raise SystemExit(f'[v12] REFUSE: freeze manifest {path} lacks the required field {field!r} — refusing to guess the pre-registration')
@@ -785,10 +848,13 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
             return None
         return msg + ' — refusing to use the one-shot test access; diagnose the first bad step first'
     status = str(health.get('status') or 'unknown')
-    if status == 'healthy':
-        return None
-    if status == 'unmonitored' and allow:
-        print(f'[p5t] WARNING: {v} s{seed}: training health is unmonitored; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
+    if not _health_blocks(status):
+        # `healthy` and the declared non-blocking plateau statuses both clear
+        # the test gate.  A flat cosine tail is recorded, not treated as a
+        # broken run; the status still reaches the P5H report and the cell row.
+        if status != 'healthy':
+            print(f'[p5t] NOTE: {v} s{seed}: training health is {status!r} '
+                  f'({health.get("reason") or "no reason recorded"}) — plateau/converged, non-blocking')
         return None
     msg = f'{v} s{seed}: training health is {status!r} ({health.get("reason") or "no reason recorded"})'
     if allow:
@@ -966,7 +1032,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     # score EVERY loaded row: test_ids is the frozen slice already sliced to
     # the manifest's n_seqs_clean, and data_fp is computed over all of them.
     # eval_length_gen's default (n_seq=8) would measure only the
-    # first 8 rows while the lock/fingerprint claim the full 16-row slice.
+    # first 8 rows while the lock/fingerprint claim the full 48-row slice.
     r = V.eval_length_gen(model, test_ids, eval_lens, DEVICE, max_pos=None, n_seq=int(test_ids.shape[0]))
     del model
     gc.collect()
@@ -1014,7 +1080,7 @@ def run_finaltest(cfg=None, guard=None):
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
     need = max([int(x) for x in manifest.get('eval', {}).get('by_length_ppl', cfg['eval_lens'])]) + 1
-    _nseq_clean = int((manifest.get('eval') or {}).get('n_seqs_clean') or cfg.get('n_seq', 16))
+    _nseq_clean = int((manifest.get('eval') or {}).get('n_seqs_clean') or cfg.get('n_seq', 48))
     test_ids = cfg.get('test_ids')
     _smoke = bool(cfg.get('smoke'))
     if not _smoke:
@@ -1023,6 +1089,11 @@ def run_finaltest(cfg=None, guard=None):
         # data; it refuses an unconfirmable/misbound plan before the one-shot
         # access can be burned.
         plan_check(cfg.get('manifest') or FREEZE_MANIFEST)
+        # The pre-test power gate is part of the frozen plan (v4).  Enforce it
+        # on the direct `phase P5T` path too, not only in run_full's P5PW
+        # phase: run_power() reads only the validation summary and refuses
+        # before load_wikitest when the shipped plan is under-powered.
+        run_power(cfg.get('manifest') or FREEZE_MANIFEST)
     if test_ids is not None:
         # A caller-supplied slice is ONLY a plumbing smoke input.  In normal
         # mode the test split must come from load_wikitest, otherwise a
@@ -1147,7 +1218,7 @@ def run_finaltest(cfg=None, guard=None):
     # 2) frozen uniform-corruption probe on the SAME test rows (secondary,
     #    descriptive-only per the manifest)
     _probe_eval = manifest.get('eval', {}).get('distractor_probe') or {}
-    pcfg = dict(V10.PROBE, outdir=outdir, ckpt_dir=cfg['ckpt_dir'], summary=cfg['probe_summary'], variants=list(manifest['arms']), seeds=[int(s) for s in manifest['seeds']], eval_lens=[int(x) for x in (_probe_eval.get('eval_lens') or [2048, 4096])], rhos=[float(x) for x in (_probe_eval.get('rhos') or [0.0, 0.125, 0.25, 0.5])], modes={'uniform': [float(x) for x in (_probe_eval.get('rhos') or [0.0, 0.125, 0.25, 0.5])]}, niah=None, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS}, target=int(_probe_eval.get('target', cfg.get('target', 512))), n_seq=int(_probe_eval.get('n_seq', cfg.get('n_seq', 16))), chunk=int(cfg.get('chunk', 4)))
+    pcfg = dict(V10.PROBE, outdir=outdir, ckpt_dir=cfg['ckpt_dir'], summary=cfg['probe_summary'], variants=list(manifest['arms']), seeds=[int(s) for s in manifest['seeds']], eval_lens=[int(x) for x in (_probe_eval.get('eval_lens') or [2048, 4096])], rhos=[float(x) for x in (_probe_eval.get('rhos') or [0.0, 0.125, 0.25, 0.5])], modes={'uniform': [float(x) for x in (_probe_eval.get('rhos') or [0.0, 0.125, 0.25, 0.5])]}, niah=None, arm_overrides={v: ['learned'] for v in ('csa_fixed_rope_randidx_seeded', 'csa_fixed_rope_allblocks')}, target=int(_probe_eval.get('target', cfg.get('target', 512))), n_seq=int(_probe_eval.get('n_seq', cfg.get('n_seq', 48))), chunk=int(cfg.get('chunk', 4)))
     mech_summ = {}
     if os.path.exists(cfg['mech_summary']):
         mech_summ = json.load(open(cfg['mech_summary'], encoding='utf-8'))
@@ -1330,7 +1401,7 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
 
     逐文档配对差（对每个文档取「种子内臂差」的均值）与两层方差分解：
     between-doc（文档抽样不确定性）与 within-doc-across-seed（训练随机性）。
-    16 条评测行不足以充分覆盖文档分布——本读数的目的就是把这个不确定性
+    48 条评测行仍不足以充分覆盖文档分布——本读数的目的就是把这个不确定性
     显式化，而不是宣称已消除。"""
     rows_a = [recs_a[s]['by_len'].get(Ln, recs_a[s]['by_len'].get(str(Ln))) or {} for s in common]
     rows_b = [recs_b[s]['by_len'].get(Ln, recs_b[s]['by_len'].get(str(Ln))) or {} for s in common]
@@ -1378,7 +1449,7 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     lr = np.asarray(doc_log_ratios, dtype=float)
     # Seed-level sign-flip remains the confirmatory test.  These intervals
     # condition on the trained seeds and quantify only DOCUMENT sampling:
-    # with n_seqs=16 they are a property of the frozen slice, not of the
+    # with n_seqs=48 they are a property of the frozen slice, not of the
     # language population.  Resampling documents (not tokens) preserves the
     # within-document correlation.
     _ci_ppl = L.bootstrap_mean_ci(arr, seed=20261018)
@@ -1587,7 +1658,9 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _adm_train_fps = {r.get('train_fp') for r in admitted.values() if isinstance(r.get('train_fp'), str) and r.get('train_fp')}
         _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='accessed',
                                     train_fp=(next(iter(_adm_train_fps)) if len(_adm_train_fps) == 1 else None))
-    _alpha = float((manifest.get('statistics') or {}).get('alpha', 0.05))
+    _stat = manifest.get('statistics') or {}
+    _alpha = float(_stat.get('alpha', 0.05))
+    _require_cov = bool(_stat.get('require_complete_coverage'))
     stats = {'alpha': float(_alpha), 'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision')}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp, 'n_effective_seeds': len({int(s) for (_v, s) in admitted}), 'n_declared_seeds': len(manifest['seeds'])}, 'comparisons': {}, 'holm': {}, 'by_length': {}, 'probe': _test_probe_stats(probe_path, manifest, unified_fp)}
     # The exact sign-flip p is valid only under within-seed exchangeability.
     # admission binds the corpus/slice/row count/recipe/code, but the RNG stream
@@ -1730,6 +1803,29 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         res['manifest_sha256'] = manifest.get('manifest_sha256')
         res['delta_definition'] = f'{a} - {b} (paired per seed, test split)'
         res['expected_sign'] = exp_sign
+        res['mechanism_claim_allowed'] = comp.get('mechanism_claim_allowed')
+        res['claim_note'] = comp.get('claim_note')
+        res['confirmation_coverage_required'] = bool(_require_cov)
+        # The full by-length curve on the SAME admitted records.  Only the
+        # frozen endpoint enters the Holm family / the confirmation decision;
+        # the other lengths (notably L512, the training length) are
+        # descriptive and are reported so an in-distribution reversal cannot be
+        # hidden behind the L4096 extrapolation endpoint.
+        res['by_length_curve'] = {}
+        for _Ln2 in sorted({int(x) for x in ((manifest.get('eval') or {}).get('by_length_ppl') or [])}):
+            _dl2, _used2 = _paired_len_deltas(recs_a, recs_b, usable, _Ln2)
+            if len(_dl2) < 2:
+                continue
+            _o2 = L.exact_signflip_p(_dl2)
+            res['by_length_curve'][str(_Ln2)] = {
+                'n': len(_dl2), 'seeds': _used2, 'mean': float(np.mean(_dl2)),
+                'p_exact_signflip': float(_o2['p']),
+                'role': ('primary' if _Ln2 == Ln else 'descriptive'),
+                'descriptive_only': bool(_Ln2 != Ln),
+                'note': ('primary frozen endpoint' if _Ln2 == Ln else
+                         'same records, different length; not in the frozen Holm family and never confirmatory'),
+            }
+        res['in_distribution_L512'] = res['by_length_curve'].get('512')
         if exp_sign in ('positive', 'negative') and math.isfinite(res.get('mean', float('nan'))):
             res['direction_ok'] = bool((res['mean'] > 0) == (exp_sign == 'positive'))
         else:
@@ -1748,22 +1844,29 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     if _fam:
         stats['holm'] = L.holm_adjust(_fam, alpha=_alpha)
     _rej = [k for k, v in stats['holm'].items() if v.get('p_holm') is not None and float(v['p_holm']) < _alpha]
-    # the pre-registered decision rule requires BOTH p_holm < alpha AND the
-    # observed direction to match the validation-panel estimate (a null
-    # expected_sign marks a non-directional mechanism readout).  The strict `<`
-    # matches the manifest's `p_holm < 0.05` (the generic holm_adjust uses `<=`).
-    # The pre-registered decision rule (manifest v3) requires p_holm < alpha
-    # AND the observed direction AND parameter matching AND at least
-    # `min_seeds_for_confirmation` complete pairs.  `coverage_ok` (all 12
-    # seeds) is reported but is no longer an all-or-nothing veto: one failed
-    # L4096 cell may not annihilate an otherwise complete comparison.
+    # The pre-registered decision rule (manifest v4) requires p_holm < alpha
+    # AND the observed direction AND parameter matching AND, when
+    # statistics.require_complete_coverage is true, all frozen seeds.  A
+    # complete-case subset can be selected by wall-clock skips, missing
+    # checkpoints or the health gate; those are not random attrition, so the
+    # shipped plan refuses to call such a subset "confirmed".  The 8-pair floor
+    # remains the mathematical resolution floor and is still reported.
     _conf = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is True
              and stats['comparisons'].get(k, {}).get('param_matched') is not False
-             and int(stats['comparisons'].get(k, {}).get('n_effective') or 0) >= int(stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation') or len(manifest['seeds']))]
+             and int(stats['comparisons'].get(k, {}).get('n_effective') or 0) >= int(stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation') or len(manifest['seeds']))
+             and (not _require_cov or stats['comparisons'].get(k, {}).get('coverage_ok') is True)]
+    stats['coverage_requirement'] = {
+        'require_complete_coverage': bool(_require_cov),
+        'n_declared_seeds': len(manifest['seeds']),
+        'note': ('complete coverage (every frozen seed) is required for a CONFIRMED verdict'
+                 if _require_cov else
+                 'legacy manifest: a complete-case subset with n_effective >= the declared floor may be confirmed'),
+    }
     stats['confirmed'] = _conf
     stats['significant_nondirectional'] = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is None]
     stats['not_confirmed_reasons'] = {k: {'param_matched': stats['comparisons'].get(k, {}).get('param_matched'),
                                           'coverage_ok': stats['comparisons'].get(k, {}).get('coverage_ok'),
+                                          'coverage_required': bool(_require_cov),
                                           'n_effective': stats['comparisons'].get(k, {}).get('n_effective'),
                                           'min_seeds_for_confirmation': stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation'),
                                           'direction_ok': stats['comparisons'].get(k, {}).get('direction_ok')}
@@ -1797,6 +1900,207 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     stats = L.stamped_analysis('finaltest_stats', stats, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[p5t stats] wrote {out}')
     return stats
+
+def _ppl_at_len(rec, Ln):
+    """Usable, untruncated PPL for one (record, length), else None."""
+    bl = (rec or {}).get('by_len') or {}
+    c = bl.get(Ln, bl.get(str(Ln)))
+    if (isinstance(c, dict) and c.get('truncated') is False
+            and L.ppl_is_usable(c.get('ppl'))):
+        return float(c['ppl'])
+    return None
+
+
+def _paired_len_deltas(recs_a, recs_b, common, Ln):
+    dl, used = [], []
+    for s in common:
+        pa, pb = _ppl_at_len(recs_a.get(s), Ln), _ppl_at_len(recs_b.get(s), Ln)
+        if pa is None or pb is None:
+            continue
+        dl.append(pa - pb)
+        used.append(int(s))
+    return dl, used
+
+
+def _signflip_power_table(abs_d, m_family, alpha, qs, expected_sign):
+    """Exact conditional power of the sign-flip test for fixed |d_i|.
+
+    Enumerates all 2**n sign patterns of the observed validation deltas.  The
+    two-sided p of a candidate pattern is its rank in that same sign-flip null;
+    Holm is screened conservatively as min(1, m*p).  Power at q is the
+    q**k (1-q)**(n-k) mass of patterns that reject *and* point in the
+    pre-registered direction.  This is the simulation the manifest asks for
+    before the one-shot test; it is exact for n<=13 and refuses larger n.
+    """
+    abs_d = np.asarray([abs(float(x)) for x in abs_d], dtype=float)
+    n = int(abs_d.size)
+    if n < 2:
+        raise ValueError('power needs at least two paired deltas')
+    if n > 13:
+        raise ValueError(f'power enumeration is capped at n<=13 (got {n}); split the panel or add a Monte-Carlo path consciously')
+    total = 1 << n
+    masks = np.arange(total, dtype=np.int64)[:, None]
+    bits = (1 << np.arange(n, dtype=np.int64))[None, :]
+    signs = np.where((masks & bits) != 0, 1.0, -1.0)
+    sums = signs @ abs_d
+    abs_sums = np.abs(sums)
+    # p[j] = P_null(|sum| >= |sum_j|), the exact two-sided sign-flip p of the
+    # pattern whose observed signed sum is sums[j].
+    p = (abs_sums[None, :] >= abs_sums[:, None] - 1e-12).mean(axis=1)
+    p_holm = np.minimum(1.0, p * float(m_family))
+    k_plus = np.asarray([bin(i).count('1') for i in range(total)], dtype=int)
+    if expected_sign == 'negative':
+        sign_ok = sums < 0
+        k_expected = n - k_plus
+    elif expected_sign == 'positive':
+        sign_ok = sums > 0
+        k_expected = k_plus
+    else:
+        sign_ok = np.ones(total, dtype=bool)
+        k_expected = np.maximum(k_plus, n - k_plus)
+    power = {}
+    for q in qs:
+        q = float(q)
+        prob = (q ** k_expected) * ((1.0 - q) ** (n - k_expected))
+        power[f'q={q:.2f}'] = float((prob * ((p_holm < alpha) & sign_ok)).sum())
+    min_same = None
+    for s in range(n + 1):
+        sel = (k_expected == s) & sign_ok
+        if sel.any() and float(p_holm[sel].min()) < alpha:
+            min_same = int(s)
+            break
+    return {'n': n, 'enumerated': total, 'm_family': int(m_family),
+            'alpha': float(alpha), 'expected_sign': expected_sign,
+            'power': power, 'min_same_sign_for_alpha': min_same,
+            'min_attainable_p_holm': float(p_holm.min()),
+            'note': ('exact enumeration over the 2**n sign patterns of the observed |d_i|; '
+                     'Holm screened as min(1, m*p); power conditions on these magnitudes, '
+                     'not on an assumed effect size')}
+
+
+def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.json',
+              out='analysis_v12/power_validation.json'):
+    """Zero-GPU pre-test power calibration on the P5C validation deltas.
+
+    The manifest requires this BEFORE the one-shot test access: with the
+    observed per-seed |delta| vector, how much probability mass actually lies
+    in the reject region at the pre-registered direction probability q?  A
+    plan whose power at `statistics.power_q_for_test` is below
+    `statistics.min_power_for_test` must add seeds and record a revision
+    *before* P5T (V12_ALLOW_LOW_POWER=1 is the explicit override).  Reads only
+    the validation summary; never calls load_wikitest.
+    """
+    manifest = _load_manifest(manifest_path)
+    if not os.path.exists(summary):
+        raise SystemExit(f'[p5pw] REFUSE: {summary} does not exist — run P5C/P3MT first so the power '
+                         'preflight has validation deltas; the test split must not be read to size the panel')
+    raw = json.load(open(summary, encoding='utf-8'))
+    if not isinstance(raw, dict):
+        raise SystemExit(f'[p5pw] REFUSE: {summary} is not a JSON object')
+    stat = manifest.get('statistics') or {}
+    alpha = float(stat.get('alpha', 0.05))
+    comps = list(manifest['primary_comparisons'])
+    m_family = len(comps)
+    qs = [0.50, 0.60, 0.70, 0.80, 0.85, 0.90, 0.95]
+    power_q = float(stat.get('power_q_for_test', 0.90))
+    if f'q={power_q:.2f}' not in {f'q={q:.2f}' for q in qs}:
+        qs.append(power_q)
+    min_power = float(stat.get('min_power_for_test', 0.80))
+    require = bool(stat.get('require_power_gate'))
+    report = {'kind': 'power_validation', 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+              'manifest': manifest_path, 'manifest_sha256': manifest.get('manifest_sha256'),
+              'summary': summary, 'alpha': alpha, 'm_family': m_family,
+              'power_q_for_test': power_q, 'min_power_for_test': min_power,
+              'require_power_gate': require, 'comparisons': {}}
+    all_pass = True
+    for comp in comps:
+        name = comp.get('name')
+        a, b = comp.get('a'), comp.get('b')
+        Ln = int(str(comp.get('endpoint', 'by_len.ppl@4096')).rsplit('@', 1)[-1])
+        exp = comp.get('expected_sign')
+        exp = str(exp).lower() if exp is not None else None
+        recs_a, recs_b = {}, {}
+        skipped = 0
+        for key, rec in raw.items():
+            if not isinstance(rec, dict) or not isinstance(key, str) or '::' not in key:
+                continue
+            v, _sep, s = key.partition('::')
+            if v not in (a, b):
+                continue
+            if not L.result_is_current(rec, V.CKPT_CODE, 'by_len'):
+                skipped += 1
+                continue
+            try:
+                seed = int(str(s).replace('seed', '').replace('s', ''))
+            except (TypeError, ValueError):
+                skipped += 1
+                continue
+            (recs_a if v == a else recs_b)[seed] = rec
+        common = sorted(set(recs_a) & set(recs_b))
+        dl, used = _paired_len_deltas(recs_a, recs_b, common, Ln)
+        cell = {'endpoint': f'by_len.ppl@{Ln}', 'n': len(dl), 'seeds': used,
+                'skipped_stale_records': skipped}
+        if len(dl) >= 2 and exp in ('positive', 'negative'):
+            obs = L.exact_signflip_p(dl)
+            mean = float(np.mean(dl))
+            tab = _signflip_power_table(np.abs(dl), m_family, alpha, qs, exp)
+            sign_ok = (mean < 0) if exp == 'negative' else (mean > 0)
+            key = f'q={power_q:.2f}'
+            cell.update({'deltas': [float(x) for x in dl], 'mean': mean,
+                         'p_exact_signflip': float(obs['p']),
+                         'p_holm_screen': float(min(1.0, obs['p'] * m_family)),
+                         'observed_sign_ok': sign_ok, 'power': tab})
+            cell['power_ok'] = bool(cell['power']['power'].get(key, 0.0) >= min_power
+                                    and sign_ok)
+            all_pass &= cell['power_ok']
+        elif len(dl) >= 2:
+            # A non-directional mechanism readout has no "probability of the
+            # pre-registered direction"; it is reported descriptively and must
+            # not block the directional panel's power gate.
+            obs = L.exact_signflip_p(dl)
+            cell.update({'deltas': [float(x) for x in dl], 'mean': float(np.mean(dl)),
+                         'p_exact_signflip': float(obs['p']),
+                         'p_holm_screen': float(min(1.0, obs['p'] * m_family)),
+                         'observed_sign_ok': None, 'power': None, 'power_ok': True,
+                         'note': 'non-directional readout; excluded from the directional power gate'})
+        else:
+            cell['power_ok'] = False
+            cell['error'] = f'fewer than two complete validation pairs at L{Ln}'
+            all_pass = False
+        # In-distribution readout on the SAME validation records.  This is the
+        # 512-token contrast the frozen test never makes primary; it is
+        # descriptive (m=1) and makes a reversal visible before test.
+        dl512, used512 = _paired_len_deltas(recs_a, recs_b, common, 512)
+        if len(dl512) >= 2:
+            o512 = L.exact_signflip_p(dl512)
+            cell['in_distribution_L512'] = {
+                'n': len(dl512), 'seeds': used512, 'mean': float(np.mean(dl512)),
+                'p_exact_signflip': float(o512['p']),
+                'expected_sign_ok': (None if exp not in ('positive', 'negative')
+                                     else bool((np.mean(dl512) < 0) if exp == 'negative' else (np.mean(dl512) > 0))),
+                'descriptive_only': True, 'm_family': 1,
+                'note': 'validation, in-distribution descriptive readout; not part of the frozen test family'}
+        report['comparisons'][name] = cell
+    report['all_pass'] = bool(all_pass)
+    report['status'] = 'pass' if all_pass else 'fail'
+    os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
+    L.stamped_analysis('power_validation', report, outdir=(os.path.dirname(out) or '.'),
+                       name=os.path.basename(out))
+    print(f'[p5pw] power preflight: {report["status"]} (q={power_q:.2f}, min={min_power:.2f}) -> {out}')
+    for _k, _v in report['comparisons'].items():
+        _pw = ((_v.get('power') or {}).get('power') or {}).get(f'q={power_q:.2f}')
+        print(f'  [p5pw] {_k}: n={_v.get("n")} power={_pw if _pw is not None else "n/a"} '
+              f'ok={_v.get("power_ok")}')
+    allow = os.environ.get('V12_ALLOW_LOW_POWER', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    if require and not all_pass and not allow:
+        raise SystemExit(f'[p5pw] REFUSE: the pre-test power calibration is below {min_power:.2f} at q={power_q:.2f}; '
+                         'add seeds and record the revision in confirmation_frozen.json BEFORE touching test '
+                         '(V12_ALLOW_LOW_POWER=1 is the explicit override)')
+    if require and not all_pass:
+        print('[p5pw] WARNING: V12_ALLOW_LOW_POWER=1 — running an under-powered frozen panel; '
+              'the report must say so')
+    return report
+
 
 def v12_analysis(out='analysis_v12/stats.json'):
     """Zero-GPU aggregate: the shared v10 analysis over the extended probe +
@@ -1869,7 +2173,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             A('| （冻结清单不可读——见运行日志） |')
         A('')
     else:
-        A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python v12_supp.py phase P5C`（覆盖全部四个冻结臂、种子取自清单），再跑 `python v12_supp.py phase P5T`（首次评估会写入冻结锁 `.freeze_lock.json`，此后清单不可再改）。')
+        A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python v12_supp.py phase P5C`（覆盖全部六个冻结臂、种子取自清单），再跑 `python v12_supp.py phase P5T`（首次评估会写入冻结锁 `.freeze_lock.json`，此后清单不可再改）。')
         A('')
     A('---')
     A('')
@@ -1901,7 +2205,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             A('| `%s` | %s | %s | ' % (v, _p0 if _p0 is not None else '—', _n0 if _n0 is not None else '—') + ' | '.join(row) + ' |')
         A('')
     else:
-        A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python v12_supp.py phase P5C`（现覆盖全部四个冻结臂、种子数取自清单；主臂 0-5 已由 P3MT/P4MT 训练，resume 自动跳过），然后 `python v12_supp.py phase P5T`。冻结清单已入库（见上），随时可以执行；执行前请勿据任何 validation 读数调整冻结内容。')
+        A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python v12_supp.py phase P5C`（现覆盖全部六个冻结臂、种子数取自清单；主臂 0-5 已由 P3MT/P4MT 训练，resume 自动跳过），然后 `python v12_supp.py phase P5T`。冻结清单已入库（见上），随时可以执行；执行前请勿据任何 validation 读数调整冻结内容。')
         A('')
     comps = ft.get('comparisons') or {}
     if comps:
@@ -1928,7 +2232,18 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         if _conf:
             A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
         else:
-            A(f'**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < {_report_alpha:g}」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
+            _cov_req = bool((ft.get('coverage_requirement') or {}).get('require_complete_coverage'))
+            _sig = [k for k, _h in holm.items()
+                    if _h.get('p_holm') is not None and float(_h['p_holm']) < _report_alpha
+                    and comps.get(k, {}).get('direction_ok') is True
+                    and comps.get(k, {}).get('param_matched') is not False]
+            _cov_blocked = [k for k in _sig if comps.get(k, {}).get('coverage_ok') is False]
+            if _cov_req and _cov_blocked:
+                A(f'**确认结果**：{sorted(_cov_blocked)} 达到「Holm p < {_report_alpha:g}」且方向符合，'
+                  '但至少一个冻结种子没有进入该比较。按 v4 的 `require_complete_coverage`，缺失种子不是随机缺失，'
+                  '不确认；该面板只能按实际 n 报告为 descriptive/unconfirmed。')
+            else:
+                A(f'**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < {_report_alpha:g}」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
         _nd = ft.get('significant_nondirectional') or []
         if _nd:
             A('')
@@ -1941,6 +2256,44 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             A('')
             A(f"（文档抽样：{_dsn}）")
         A('')
+        # Full by-length curve on the same admitted records.  Only the frozen
+        # endpoint is confirmatory; L512 is the training length and makes an
+        # in-distribution reversal visible instead of hiding it behind L4096.
+        _lens_all = sorted({int(x) for _v in comps.values()
+                            for x in ((_v.get('by_length_curve') or {}).keys())})
+        if _lens_all:
+            A('### 全长度曲线（同一批 test 记录；只有冻结终点属于确认族）')
+            A('')
+            A('| 比较 | ' + ' | '.join(f'L{x}' for x in _lens_all) + ' |')
+            A('|---|' + '---|' * len(_lens_all))
+            for _k, _v in comps.items():
+                _curve = _v.get('by_length_curve') or {}
+                _row = []
+                for _x in _lens_all:
+                    _c = _curve.get(str(_x))
+                    if not _c:
+                        _row.append('—')
+                    else:
+                        _row.append(f'{_c["mean"]:+.2f} (p={_c["p_exact_signflip"]:.3f})')
+                A(f'| {_k} | ' + ' | '.join(_row) + ' |')
+            A('')
+            A('> L512 是训练长度，其余长度是外推；L512 与冻结终点方向相反时，冻结终点的“优势”只能读作长度外推鲁棒性，不能读作“CSA 更好”。')
+            A('')
+        _claim_no = [k for k, v in comps.items() if v.get('mechanism_claim_allowed') is False]
+        if _claim_no:
+            A('**主张边界（v4）**：以下比较不自动构成机制证据（`mechanism_claim_allowed=false`）：')
+            for _k in _claim_no:
+                A(f"- `{_k}`：{comps[_k].get('claim_note') or 'multi-factor / not budget-matched'}")
+            A('这些比较即使 Holm 显著，也只能作为 system-level 差异；不得写成“CSA 的 block selection 机制被证实”。')
+            A('')
+        _cov = ft.get('coverage_requirement') or {}
+        if _cov:
+            _cov_missing = [k for k, v in comps.items() if v.get('coverage_ok') is False]
+            A(f"**覆盖要求**：require_complete_coverage={_cov.get('require_complete_coverage')}；"
+              f"缺失完整种子的比较：{sorted(_cov_missing) if _cov_missing else '无'}。"
+              + ('覆盖不足的比较不进入 CONFIRMED 集合（缺失不是随机缺失，不能当作较小的 n 使用）。'
+                 if _cov.get('require_complete_coverage') else ''))
+            A('')
     _pr = ft.get('probe') or {}
     if _pr.get('available') and _pr.get('cells'):
         A('### P5T test split 干扰探针（描述性二次证据，不进入确认性检验）')
@@ -2003,14 +2356,16 @@ def run_full():
     guard = make_guard()
     guard.report()
     print(f'[v12] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state["booked_seconds"] / 3600:.2f} h)')
-    git_push('v12: confirmation driver (frozen-manifest v3: zero-GPU plan gate + strict record admission + freeze-lock binding; P5C covers all four frozen arms at manifest seeds)')
+    git_push('v12: confirmation driver (frozen-manifest v3/revision 4: plan gate + coverage + pre-test power gate + freeze-lock binding)')
     import par
     _ctx = par.resolve_ctx(label='v12')
     all_ok = True
+    completed = []
     for pname, _kind, _payload, _seeds in PHASES:
         rem = guard.remaining_hours()
         if rem < 0.4166666666666667:
-            print(f'[v12] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
+            print(f'[v12] INCOMPLETE: stopping before {pname}: headroom exhausted ({rem:.2f} h)')
+            all_ok = False
             break
         if not V.cuda_healthy():
             print(f'[v12] CUDA context poisoned before {pname} — aborting (re-run resumes).')
@@ -2027,7 +2382,10 @@ def run_full():
         except Exception:
             traceback.print_exc()
             all_ok = False
+            break
+        completed.append(pname)
         all_ok &= git_push(f'v12: phase {pname} results')
+    incomplete = [p[0] for p in PHASES if p[0] not in completed]
     try:
         build_report()
     except Exception:
@@ -2035,8 +2393,13 @@ def run_full():
         all_ok = False
     all_ok &= git_push('v12: stats + REPORT_v12.md (analysis_v12)')
     guard.report()
-    print('\n[v12] ALL PHASES DONE.')
-    schedule_shutdown(120 if all_ok else 2400)
+    if incomplete:
+        print(f'\n[v12] INCOMPLETE — phases not completed: {incomplete}.')
+        if 'P5T' in incomplete:
+            print('[v12] The confirmatory test-split result is NOT available; do not describe this run as complete.')
+    else:
+        print('\n[v12] ALL PHASES DONE.')
+    schedule_shutdown(120 if (all_ok and not incomplete) else 2400)
 
 def _plan_recipe(manifest, arm, mr):
     """Build a P1L-format recipe string carrying the frozen signature.
@@ -2139,7 +2502,7 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
                 _actual_mr = L.variant_mlp_ratio(arm, int(sig.get('v', 8192)), d=int(sig.get('d', 256)),
                                                  n_layers=_n_layers, n_heads=int(sig.get('H', 8)),
                                                  d_head=int(sig.get('Dh', 32)), seq_len=int(sig.get('sl', 512)),
-                                                 matched={arm}, ref_variant='csa_fixed_rope') if arm in ('full_rope', 'full_sw128_matched_rope') else 4.0
+                                                 matched={arm}, ref_variant='csa_fixed_rope') if arm in ('full_rope', 'full_sw128_matched_rope', 'full_rope_sink') else 4.0
             except Exception as _e:
                 errs.append(f'{arm}: variant_mlp_ratio failed ({type(_e).__name__}: {_e})')
                 _actual_mr = None
@@ -2285,7 +2648,7 @@ if __name__ == '__main__':
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
-    _MODES = ('full', 'smoke', 'plan', 'analysis', 'report', 'phase', 'finaltest')
+    _MODES = ('full', 'smoke', 'plan', 'analysis', 'report', 'phase', 'finaltest', 'power')
     if mode in ('-h', '--help', 'help'):
         print(__doc__)
         raise SystemExit(0)
@@ -2305,6 +2668,10 @@ if __name__ == '__main__':
             v12_analysis()
         elif mode == 'report':
             build_report()
+        elif mode == 'power':
+            # zero-GPU: exact conditional power on the P5C validation deltas,
+            # before the one-shot test access (never calls load_wikitest)
+            run_power(sys.argv[2] if len(sys.argv) > 2 else FREEZE_MANIFEST)
         elif mode == 'phase':
             run_phase(sys.argv[2], make_guard())
             git_push(f'v12: phase {sys.argv[2]} results')

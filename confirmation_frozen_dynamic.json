@@ -1,0 +1,154 @@
+{
+  "status": "draft",
+  "manifest_version": 3,
+  "frozen_at": null,
+  "purpose": "Separate pre-registration for DYNAMIC chunking and HCA. This is a design record, not a runnable confirmation: the fixed-chunk v5 study will consume the WikiText-103 test slice; a second study on the same rows is not independent. Freeze this plan only after a disjoint test corpus (or a disjoint, never-read document split) is reserved.",
+  "arms": [
+    "csa_fixed_rope",
+    "csa_dynamic_rope",
+    "csa_dynamic_task",
+    "hybrid_dynamic_rope",
+    "full_rope",
+    "full_rope_sink"
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "training_recipe": "Same 3000-step/512/12 recipe as v5, but the dynamic arms add the boundary policy knobs (target_block_tokens, temperature, comp_lambda, boundary_policy). Every arm must be tuned on validation with the same declared grid before the test read; the cosine threshold arm is not LM-trained (only comp_reg trains the scalar offset), so csa_dynamic_task is the task-learned policy arm and must be reported separately.",
+  "binding": {
+    "training_recipe_signature": {
+      "steps": 3000,
+      "sl": 512,
+      "bs": 12,
+      "nt": 8000000,
+      "lr": 0.0003,
+      "wd": 0.1,
+      "d": 256,
+      "L": 6,
+      "H": 8,
+      "Dh": 32,
+      "v": 8192,
+      "wu": 50,
+      "cl": 0.05,
+      "dlm": 10.0,
+      "ee": 250,
+      "es": 128
+    },
+    "test_slice": {
+      "loader": "a disjoint corpus or a row-offset slice never read by v5",
+      "seq_len_rule": "max(by_length_ppl)+1",
+      "n_seqs": 48,
+      "independent_of": "results_lm_test rows 0-47 (fixed v5)"
+    },
+    "per_arm_recipe_signature": {
+      "csa_fixed_rope": {
+        "mr": 4.0
+      },
+      "csa_dynamic_rope": {
+        "mr": 4.0
+      },
+      "csa_dynamic_task": {
+        "mr": 4.0
+      },
+      "hybrid_dynamic_rope": {
+        "mr": 4.0
+      },
+      "full_rope": {
+        "mr": 6.76348876953125
+      },
+      "full_rope_sink": {
+        "mr": 6.763427734375
+      }
+    }
+  },
+  "primary_comparisons": [
+    {
+      "name": "dynamic-vs-fixed: csa_dynamic_rope - csa_fixed_rope @ L4096",
+      "a": "csa_dynamic_rope",
+      "b": "csa_fixed_rope",
+      "endpoint": "by_len.ppl@4096",
+      "expected_sign": null,
+      "hypothesis_direction": "non-directional: does the cosine-boundary dynamic arm beat the fixed 4-token block arm at the same read budget?",
+      "mechanism_claim_allowed": false
+    },
+    {
+      "name": "task-vs-cosine: csa_dynamic_task - csa_dynamic_rope @ L4096",
+      "a": "csa_dynamic_task",
+      "b": "csa_dynamic_rope",
+      "endpoint": "by_len.ppl@4096",
+      "expected_sign": "negative",
+      "hypothesis_direction": "negative would show the LM-trained boundary policy beats the cosine heuristic",
+      "mechanism_claim_allowed": false
+    },
+    {
+      "name": "hca-vs-csa: hybrid_dynamic_rope - csa_dynamic_rope @ L4096",
+      "a": "hybrid_dynamic_rope",
+      "b": "csa_dynamic_rope",
+      "endpoint": "by_len.ppl@4096",
+      "expected_sign": null,
+      "hypothesis_direction": "non-directional HCA readout; HCA reads every closed block, so this is not read-budget matched",
+      "mechanism_claim_allowed": false
+    },
+    {
+      "name": "sink-matched dense vs dynamic: full_rope_sink - csa_dynamic_rope @ L4096",
+      "a": "full_rope_sink",
+      "b": "csa_dynamic_rope",
+      "endpoint": "by_len.ppl@4096",
+      "expected_sign": null,
+      "hypothesis_direction": "system-level dynamic-vs-dense readout with the sink matched",
+      "mechanism_claim_allowed": false
+    }
+  ],
+  "statistics": {
+    "test": "exact two-sided sign-flip over paired per-seed deltas",
+    "n_seeds": 16,
+    "p_floor": 3.0517578125e-05,
+    "alpha": 0.05,
+    "family": "primary_comparisons only (m=4)",
+    "correction": "holm step-down",
+    "min_attainable_p_holm": 0.0001220703125,
+    "min_seeds_for_confirmation": 10,
+    "decision_rule": "DRAFT: not active. Once frozen, CONFIRMED requires p_holm<0.05, direction match, parameter match, full coverage and the pre-test power gate on a disjoint test source."
+  },
+  "eval": {
+    "n_seqs_clean": 48,
+    "by_length_ppl": [
+      512,
+      1024,
+      2048,
+      4096
+    ],
+    "per_document": true,
+    "boundary_f1": {
+      "enabled": true,
+      "note": "secondary segmentation endpoint; needs the same boundary labels and tolerance as v10's boundary_alignment; never folded into the PPL Holm family"
+    }
+  },
+  "scope": {
+    "confirmatory_claims": "DYNAMIC chunking and HCA only",
+    "not_covered": "fixed-chunk selection/sink claims are covered by confirmation_frozen.json, not here",
+    "required_for": "a disjoint test source, a new freeze, a pre-test power simulation and the same strict admission/freeze-lock machinery"
+  },
+  "precondition": {
+    "runnable": false,
+    "test_source": "FineWeb-Edu (preferred) or a disjoint WikiText-103 document split",
+    "must_not_reuse": "results_lm_test rows 0-47 already reserved for the fixed v5 study",
+    "why": "a second confirmation on the same test rows is not independent; the first read fixes the slice and the freeze lock only protects that manifest"
+  },
+  "status_note": "DRAFT ONLY. `v12_supp.py` refuses status=draft unless V12_ALLOW_DRAFT=1, and even then this file is not a confirmation."
+}

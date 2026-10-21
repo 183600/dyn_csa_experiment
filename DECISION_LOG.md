@@ -667,3 +667,97 @@ does not open the "all components useful" claim. (5) `audit_methodology`
 surfaces that project-level claim gate. Tests cover partial/malformed
 descriptors, underpowered significance, the report/table parity, and partial
 ablation coverage. The temporary issue list was removed after the fixes.
+## 2026-10-21 — review-5: P1/P2 hardening before the one-shot test (no new runs)
+
+This revision changed only zero-GPU driver/statistics/manifest paths and CI
+configuration; no panel result, training recipe, arm, seed, endpoint or test
+split was touched.  It is recorded as `revision.history` v4 in
+`confirmation_frozen.json` and still predates any test-split access.
+
+**P1 (methodology).**
+(1) The frozen endpoint remains L4096, but every admitted comparison now
+carries the full by-length curve (L512/L1024/L2048/L4096) computed from the
+same records.  L512 is the training length; if its direction reverses, the
+report must read the L4096 result as length-extrapolation robustness, not as
+"CSA is better".
+(2) Each primary comparison now declares `mechanism_claim_allowed`: only the
+randidx-vs-learned contrast may be read as selection-mechanism evidence (and
+only versus a fixed pseudo-random pattern); the main/aligned-dense contrasts
+are system-level because MLP width/FLOPs, kernel, qk-norm/kv-norm width and
+the learned sink differ, and allblocks is not reading-budget matched.
+(3) The manifest's required pre-test power simulation is implemented as
+`python v12_supp.py power`: exact conditional power over the 2^12 sign
+patterns of the P5C validation deltas, a minimum same-sign count, and a
+refusal when power at q=0.95 is below 0.8 (the q=0.90 sensitivity is
+reported alongside; it is expected to be ~0.66 at n=12) (`V12_ALLOW_LOW_POWER=1` is the
+explicit override).  It reads only the validation summary, never
+`load_wikitest`.
+(4) A complete-case subset can no longer be confirmed: v4 requires all 12
+frozen seeds (`require_complete_coverage=true`), so cap skips, missing
+checkpoints or health-gate refusals are reported as unconfirmed rather than
+as a smaller-n confirmation.  The 8-pair mathematical floor is still
+reported for transparency.
+
+**P2 (engineering).**
+(1) `run_full` now runs P5C -> P5H -> P5PW -> P5T before the exploratory
+probe/scale panels.  A headroom stop sets `all_ok=False`, records the phase as
+incomplete, prints `INCOMPLETE` (never `ALL PHASES DONE`) and extends the
+shutdown delay so the log can be inspected.
+(2) The P5H/P5T health gate treats a flat cosine tail
+(`underfitting_or_stalled`) and `validation_improving_train_flat` as
+recorded, non-blocking statuses; only nonfinite / overfitting /
+validation_degrading / insufficient_data / unmonitored block the test.
+(3) The scheduled continuous-loop workflow is disabled (`workflow_dispatch`
+only) and the `fast_prompt()` wrapper that instructed the agent to scan for
+issues, keep editing and commit after every change was removed.  An
+unattended agent with push rights must not be able to mutate the frozen code
+or manifest while the confirmation awaits its single test access.
+(4) `python v12_supp.py power` and `phase P5PW` are the zero-GPU preflight;
+`phase P5T` re-runs it, so a direct P5T cannot bypass the gate.
+
+The temporary issue list was removed after the fixes.
+
+## 2026-10-21 — review-6: sink 2x2, seeded random control, 48 test docs (no new runs)
+
+Still before any test-split access; recorded as `revision.history` v5 in
+`confirmation_frozen.json`. No training was run for this revision.
+
+(1) **Sink 2x2.** Added `full_rope_sink` (same full-RoPE dense arm plus the
+learned per-head sink) and `csa_fixed_rope_nosink`. The sink-matched contrast
+`csa_fixed_rope - full_rope_sink` and the no-sink contrast
+`csa_fixed_rope_nosink - full_rope` are both in the frozen family; their
+difference is the sink-by-architecture interaction. `full_rope_sink` is
+parameter-matched with `mr=6.763427734375` (the sink adds 48 parameters).
+These comparisons are still multi-factor (kernel, qk-norm/kv-norm, read
+fraction) and therefore `mechanism_claim_allowed=false`; they test whether the
+v4 main result is a sink artifact, not whether the selection mechanism works.
+
+(2) **Seeded random control.** Replaced the frozen fixed-hash `randidx` arm with
+`csa_fixed_rope_randidx_seeded`: the pseudo-random block pattern is salted by
+`(seed, layer)` (`seed*1000003 + layer + 1`), so the control is a random
+variable across seeds rather than one arbitrary pattern shared by all seeds.
+The legacy arm remains in code at salt 0 (bit-identical path) but is retired
+from the frozen panel. The seeded arm is the only comparison eligible for a
+selection-mechanism claim, and only versus that seeded pattern.
+
+(3) **48 test documents.** `eval.n_seqs_clean` and `binding.test_slice.n_seqs`
+raised from 16 to 48. This is still below the 64-document population-claim
+floor and below the ~59-row L4096 ceiling on WikiText-103 (~245k test tokens /
+4097), so population claims stay refused; the document-sampling readout now has
+48 units instead of 16.
+
+(4) **Family size.** m=4 -> 6 (two sink contrasts added; the randidx replacement
+does not add a comparison). Minimum attainable Holm p 0.001953 -> 0.00293; the
+8-pair resolution floor is 0.046875 < 0.05 and remains reported. The pre-test
+power gate and complete-coverage rule are unchanged.
+
+(5) **Dynamic/HCA.** Not added to v5 and not runnable here. A separate draft
+manifest `confirmation_frozen_dynamic.json` records the design and its
+precondition: a disjoint test corpus (or a disjoint, never-read document split),
+a new freeze, a pre-test power simulation and the same admission/freeze-lock
+machinery. `v12_supp.py` refuses `status=draft` (V12_ALLOW_DRAFT only permits
+schema inspection, never a confirmation). Reusing the rows that the fixed v5
+study reads would make the second study non-independent; the freeze lock does
+not fix that.
+
+The temporary issue list was removed after the fixes.

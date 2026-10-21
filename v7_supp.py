@@ -317,7 +317,7 @@ class HybridAttentionRoPE(L.HybridAttention):
             # S path is dead without gradients, so its whole tail is skipped
             # (same contract as exp_lib._single).
             _need_soft = torch.is_grad_enabled()
-            _, topk_idx, soft = L._indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, cfg.index_topk, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, need_soft=_need_soft)
+            _, topk_idx, soft = L._indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, cfg.index_topk, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, need_soft=_need_soft, random_salt=getattr(cfg, 'random_salt', 0))
             sel_valid = _sel_valid_box[0]
         sink = self.sink if cfg.use_sink else None
         # Both branches hold distinct block ids per row: the HCA arm passes the
@@ -709,6 +709,13 @@ class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
         self.comp_reg = reg
         return self.norm(x)
 
+def _indexer_salt(layer):
+    # Per-(seed, layer) salt for the seeded-random control.  The legacy
+    # `csa_fixed_rope_randidx` keeps salt 0 and therefore its exact
+    # fixed-hash behaviour; only the new arm draws a different pattern.
+    seed = int(getattr(L, '_LAST_SEED', 0) or 0)
+    return seed * 1000003 + int(layer) + 1
+
 def make_layer_cfgs_v7(n_layers, variant):
     if variant == 'csa_fixed_rope':
         return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
@@ -718,6 +725,18 @@ def make_layer_cfgs_v7(n_layers, variant):
         # 「测试时把已训练模型的选择器换成随机」——后者（v10 P3MP 的
         # randidx 臂）测的是依赖性，本变体测的是选择方式本身的优劣。
         return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='random', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
+    if variant == 'csa_fixed_rope_randidx_seeded':
+        # Equal-read-budget random control: same architecture/top-k/params as
+        # csa_fixed_rope, but the selected blocks are a per-(seed, layer)
+        # pseudo-random draw instead of one fixed hash shared by all seeds.
+        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='random', random_salt=_indexer_salt(i), rope=True, rope_dim=16, qk_norm=True) for i in range(n_layers)]
+    if variant == 'full_rope_sink':
+        # Sink-matched dense reference: the only difference from full_rope is
+        # the learned per-head sink that the csa arms already have.
+        return [AttnCfgRope(kind='full', rope=True, rope_dim=16, qk_norm=True, full_sink=True) for _ in range(n_layers)]
+    if variant == 'csa_fixed_rope_nosink':
+        # Sink-ablated csa cell of the 2x2 (csa/dense x sink/no-sink).
+        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, rope=True, rope_dim=16, qk_norm=True, use_sink=False) for _ in range(n_layers)]
     if variant == 'csa_fixed_rope_allblocks':
         # 从头训练的全块读取对照：与 csa_fixed_rope 同一
         # c_kv 压缩 / qk_norm / RoPE / sink / 窗口投影，仅 index_topk 覆盖
@@ -804,7 +823,7 @@ def _v7_knobs_fp(device=None, batch_size=None):
 
 
 ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']
-PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
+PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope', 'full_rope_sink'}
 
 def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None, save_ckpt=None, ckpt_dir=None, measure_eff=True, diag_every=None):
     L.set_seed(seed)

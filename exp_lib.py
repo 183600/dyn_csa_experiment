@@ -3867,7 +3867,7 @@ def _pool_ends_host(bid):
             pass
     return ends
 
-def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_mask=True, query_chunk=2048, random_select=False, pre_qI=None, pre_w=None, out_valid=None, causal_ends_host=None, need_soft=True):
+def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_mask=True, query_chunk=2048, random_select=False, pre_qI=None, pre_w=None, out_valid=None, causal_ends_host=None, need_soft=True, random_salt=0):
     n = H.shape[0]
     B = comp_kv.shape[0]
     dev = H.device
@@ -3983,6 +3983,8 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
             # note x-floor(x) is NOT frac() for negatives), so the scores are
             # bit-identical.
             z = _ri[s:e] * 12.9898 + _jc
+            if random_salt:
+                z.add_(float(random_salt))
             z.sin_()
             z.mul_(43758.5453)
             z.sub_(torch.floor(z))
@@ -4176,7 +4178,8 @@ def lightning_indexer_open(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
 
 def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
                        random_select=False, pre_qI=None, pre_w=None,
-                       out_valid=None, causal_ends_host=None, need_soft=True):
+                       out_valid=None, causal_ends_host=None, need_soft=True,
+                       random_salt=0):
     """Training wrapper around `lightning_indexer` with activation recompute.
 
     The indexer builds `raw`/`c`/`soft` tables of shape [T, B_blocks, nIH]
@@ -4190,7 +4193,7 @@ def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
             _h, _ck, _lt, W_DQ, W_DK, W_w, nIH, topk, return_mask=False,
             random_select=random_select, pre_qI=pre_qI, pre_w=pre_w,
             out_valid=out_valid, causal_ends_host=causal_ends_host,
-            need_soft=need_soft)
+            need_soft=need_soft, random_salt=random_salt)
         return _m, _idx, _soft
     # If an outer block/MLP checkpoint already owns this forward, do not nest
     # a second checkpoint (the outer recompute covers the indexer too).
@@ -4743,6 +4746,12 @@ class AttnCfg:
     # so the task objective can actually learn the boundary policy instead of
     # only the compression-rate regularizer.
     boundary_policy: str = 'threshold'
+    # For indexer_mode='random': a per-(seed, layer) additive salt.  The
+    # legacy fixed hash corresponds to salt 0 (bit-identical path).  A
+    # non-zero salt makes the 'random' control a draw per seed/layer, so
+    # the paired sign-flip sees a random variable rather than one fixed
+    # arbitrary pattern shared by every seed.
+    random_salt: int = 0
 
     def __post_init__(self):
         if self.open_block_mode not in OPEN_BLOCK_MODES:
@@ -5432,7 +5441,7 @@ class HybridAttention(nn.Module):
                 # 并以 soft_form=True 固定走软分支的硬部分解——两者前向 bit 与
                 # 传入 soft 的形式完全一致。有梯度时条件为 False，走传入 soft
                 # 的完整图。
-                _, topk_idx, soft = _indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=None, need_soft=_need_soft)
+                _, topk_idx, soft = _indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=None, need_soft=_need_soft, random_salt=getattr(cfg, 'random_salt', 0))
                 # _indexer_selection 的 top-k 是无放回选择：有效槽位的块 id 逐行互不
                 # 相同（order 是列排列、kept 落在互异的 cumsum 秩列上），pad 槽位的
                 # 重复块 0 已被 sel_valid 置无效。故 gathered_attention 的
@@ -21105,6 +21114,9 @@ def normalize_variant_list(variants):
     return out
 
 
+_LAST_SEED = None
+
+
 def set_seed(seed):
     """Seed every RNG that can affect a run: Python ``random``, NumPy's
     legacy global RNG, PyTorch's CPU RNG and every CUDA device, plus the
@@ -21112,7 +21124,9 @@ def set_seed(seed):
     seed so callers can record exactly what was used.  torch's deterministic
     algorithm / cuDNN switches are pinned at the same time, so two runs with
     the same seed on the same machine follow the same kernels."""
+    global _LAST_SEED
     seed = _seed_value(seed)
+    _LAST_SEED = int(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
     np.random.seed(seed)

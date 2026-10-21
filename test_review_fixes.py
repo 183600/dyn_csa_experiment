@@ -2905,11 +2905,13 @@ def t_shipped_manifest_consistency():
     # the revision history must record the 6->12 change and its precondition
     hist = v2['revision']['history']
     assert any(h.get('version') == 1 for h in hist) and any(h.get('version') == 2 for h in hist) and any(h.get('version') == 3 for h in hist)
-    # v3 pins the per-arm parameter-matching knob
+    # v5 pins the per-arm parameter-matching knob (two sink-matched full arms)
     per = v2.get('binding', {}).get('per_arm_recipe_signature') or {}
     assert set(per) == set(v2['arms']), per
     assert abs(float(per['full_rope']['mr']) - 6.76348876953125) < 1e-9, per
-    assert all(abs(float(per[a]['mr']) - 4.0) < 1e-12 for a in v2['arms'] if a != 'full_rope'), per
+    assert abs(float(per['full_rope_sink']['mr']) - 6.763427734375) < 1e-9, per
+    assert all(abs(float(per[a]['mr']) - 4.0) < 1e-12
+               for a in v2['arms'] if a not in ('full_rope', 'full_rope_sink')), per
     # scope block present
     assert v2.get('scope', {}).get('not_covered'), 'scope.not_covered must name the dynamic/HCA claims that are out of scope'
     # the compute-budget caveat must be explicit, not buried in prose

@@ -88,7 +88,7 @@ def _arm_of(variant, arm, cfg=None):
     _ov = (cfg or {}).get('arm_overrides') or {}
     if variant in _ov:
         return arm in _ov[variant]
-    if variant == 'full_rope':
+    if variant in ('full_rope', 'full_rope_sink'):
         return arm == 'dense'
     return arm in ('learned', 'randidx', 'allblocks')
 

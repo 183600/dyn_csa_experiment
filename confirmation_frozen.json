@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "frozen_at": "2026-10-19",
-  "purpose": "Pre-registered confirmation plan: v6-v11 all selected methods, arms, comparisons and seeds on the SAME validation split, so their p-values are exploratory. This manifest freezes the main comparisons, endpoints, seed count and statistics BEFORE any WikiText-103 test-split evaluation, and the confirmation data (wiki.test.raw) has never been read by any earlier phase. v2: the seed count was raised 6 -> 12 and the manifest gained a machine-checkable binding block and a scope declaration; the revision was made strictly BEFORE any test-split evaluation (no P5T result has ever existed -- no results_lm_test/ record, no commit touching the test split), which is the only condition under which a pre-registration may be revised without selection bias. v3 (2026-10-19): aligned the stamp with CODE_SEMANTICS v11.128, pinned the implementation binding (all four frozen arms run the per-row RoPE loop, so eager_batch=false), pinned the per-arm mlp_ratio, disclosed the parameter-vs-compute mismatch and the decision rule, and added a zero-GPU plan self-check. Again strictly BEFORE any test-split access.",
+  "purpose": "Pre-registered confirmation plan: v6-v11 all selected methods, arms, comparisons and seeds on the SAME validation split, so their p-values are exploratory. This manifest freezes the main comparisons, endpoints, seed count and statistics BEFORE any WikiText-103 test-split evaluation, and the confirmation data (wiki.test.raw) has never been read by any earlier phase. v2: the seed count was raised 6 -> 12 and the manifest gained a machine-checkable binding block and a scope declaration; the revision was made strictly BEFORE any test-split evaluation (no P5T result has ever existed -- no results_lm_test/ record, no commit touching the test split), which is the only condition under which a pre-registration may be revised without selection bias. v3 (2026-10-19): aligned the stamp with CODE_SEMANTICS v11.128, pinned the implementation binding (all four frozen arms run the per-row RoPE loop, so eager_batch=false), pinned the per-arm mlp_ratio, disclosed the parameter-vs-compute mismatch and the decision rule, and added a zero-GPU plan self-check. Again strictly BEFORE any test-split access. v5 adds the sink-matched dense and no-sink csa arms, replaces the fixed-hash random control with a per-(seed, layer) seeded draw, and raises the test slice to 48 documents; still before any test access.",
   "code_semantics_expected": "v11.128",
   "amp_dtype_expected": "bf16",
   "eager_batch_expected": false,
@@ -11,11 +11,26 @@
   "arms": [
     "csa_fixed_rope",
     "full_rope",
-    "csa_fixed_rope_randidx",
+    "full_rope_sink",
+    "csa_fixed_rope_nosink",
+    "csa_fixed_rope_randidx_seeded",
     "csa_fixed_rope_allblocks"
   ],
-  "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-  "training_recipe": "P3MT/P4MT/P5C: 3000 steps, seq 512, batch 12 (18.4M tokens consumed per run over the 8M-token train cache; identical data order per seed), all four arms under one config; csa_fixed_rope & full_rope via P3MT/P4MT (seeds 0-5) + P5C (seeds 6-11), controls via P3MTC/P5C (seeds 0-11, same recipe and outdir).",
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11
+  ],
+  "training_recipe": "P3MT/P4MT/P5C: 3000 steps, seq 512, batch 12 (18.4M tokens consumed per run over the 8M-token train cache; identical data order per seed), all six arms under one config; csa_fixed_rope & full_rope via P3MT/P4MT (seeds 0-5) + P5C (seeds 6-11); full_rope_sink / csa_fixed_rope_nosink / csa_fixed_rope_randidx_seeded / csa_fixed_rope_allblocks via P5C (seeds 0-11, same recipe and outdir).",
   "binding": {
     "training_recipe_signature": {
       "steps": 3000,
@@ -42,7 +57,13 @@
       "full_rope": {
         "mr": 6.76348876953125
       },
-      "csa_fixed_rope_randidx": {
+      "full_rope_sink": {
+        "mr": 6.763427734375
+      },
+      "csa_fixed_rope_nosink": {
+        "mr": 4.0
+      },
+      "csa_fixed_rope_randidx_seeded": {
         "mr": 4.0
       },
       "csa_fixed_rope_allblocks": {
@@ -63,7 +84,7 @@
     "test_slice": {
       "loader": "exp_lib.load_wikitest",
       "seq_len_rule": "max(by_length_ppl)+1",
-      "n_seqs": 16,
+      "n_seqs": 48,
       "fingerprint_rule": "exp_lib._ids_fp over the flattened (n_seqs, seq_len) rows; every record must carry the same non-null data_fp; the first P5T access writes it into results_lm_test/.freeze_lock.json"
     },
     "tokenizer": {
@@ -73,28 +94,43 @@
     "checkpoint": {
       "stamp": "v11.128 (= exp_lib.CODE_SEMANTICS; records carry _code, ckpt carries code)",
       "hash": "sha256 of the .pt file, stored per record as ckpt_sha256 at P5T evaluation time"
-    }
+    },
+    "per_arm_recipe_signature_note": "v5: full_rope_sink mr = full_rope mr - 48/(2*d*d*L) = 6.763427734375 (the learned sink adds n_heads*n_layers=48 parameters); csa_nosink and the seeded random arm are mr=4.0. The legacy fixed-hash randidx arm is retired from the frozen panel: its one global pattern is not a random variable across seeds, so it cannot support a selection-mechanism claim."
   },
   "eval": {
     "data": "wiki.test.raw via exp_lib.load_wikitest (held out; the ONLY phase allowed to read it)",
-    "n_seqs_clean": 16,
-    "by_length_ppl": [512, 1024, 2048, 4096],
-    "per_document": "bylen records additionally store ppl_per_seq (per-row PPL) so document-sampling uncertainty can be stratified; n_seqs=16 does NOT cover the language-population distribution and population-level claims are out of scope (design_notes section 20)",
+    "n_seqs_clean": 48,
+    "by_length_ppl": [
+      512,
+      1024,
+      2048,
+      4096
+    ],
+    "per_document": "v5: 48 frozen test documents (up from 16). 48 < the code's 64-document population-claim floor and <64 is unavoidable at L4096 on WikiText-103 (~245k test tokens / 4097 ~= 59 non-overlapping rows); population claims stay refused, but the document-sampling readout is based on 48 units instead of 16.",
     "distractor_probe": {
       "mode": "uniform",
-      "rhos": [0.0, 0.125, 0.25, 0.5],
-      "eval_lens": [2048, 4096],
+      "rhos": [
+        0.0,
+        0.125,
+        0.25,
+        0.5
+      ],
+      "eval_lens": [
+        2048,
+        4096
+      ],
       "target": 512,
       "n_seq": 16
     }
   },
   "scope": {
-    "confirmatory_claims": "ONLY fixed-chunk CSA mechanism claims: learned top-k selection vs trained controls, sparse length extrapolation vs full RoPE attention, and block-compression/KV-projection effects at the frozen endpoints.",
-    "not_covered": "dynamic chunking vs fixed chunking, semantic value of dynamic boundaries, HCA advantages, and dynamic-chunking scaling laws are NOT covered by this confirmation (no dynamic arm, no HCA comparison is frozen here).",
-    "required_for": "those claims require their own pre-registered freeze (arms, seeds, endpoints) before their first test-split access; until then they stay exploratory regardless of how the fixed-chunk confirmation turns out."
+    "confirmatory_claims": "ONLY fixed-chunk CSA claims: (a) learned top-k selection vs a seeded equal-budget random control, (b) sparse length extrapolation vs full RoPE attention, (c) block-compression/KV-projection effects at L4096, and (d) the pre-registered sink-matched / no-sink 2x2 sensitivity contrasts. Dynamic chunking, HCA and dynamic-boundary semantics are NOT covered.",
+    "not_covered": "dynamic chunking vs fixed chunking, semantic value of dynamic boundaries, HCA advantages, and dynamic-chunking scaling laws are NOT covered by this confirmation (no dynamic arm, no HCA comparison is frozen here). Also NOT covered: a sink-matched dense arm, an equal-read-budget all-block control, and population-level inference beyond the 16 frozen evaluation documents (n=16 < the code's 64-document population-claim floor).",
+    "required_for": "those claims require their own pre-registered freeze (arms, seeds, endpoints) before their first test-split access; until then they stay exploratory regardless of how the fixed-chunk confirmation turns out. A mechanism claim for the main contrast additionally requires the sink/kernel/qk-norm-matched and read-budget-matched controls described above.",
+    "mechanism_claim_policy": "v5: only the seeded-randidx-vs-learned contrast is eligible for a selection-mechanism claim, and only versus that seeded fixed pattern (not a fresh per-forward draw). main/aligned-dense/sink-matched/no-sink are system-level: the learned sink, kernel, qk-norm/kv-norm width and MLP width/FLOPs differ, and the sparse arm reads a ~256-token local span at L4096. allblocks is not read-budget matched (32x). The 2x2 is a sensitivity design, not a single-factor mechanism proof."
   },
   "compute_budget_disclosure": {
-    "parameter_matching": "full_rope is param-matched to csa_fixed_rope by widening its MLP to mr=6.76348876953125 (hand check: total params A=C=D=11,089,904 vs B=11,088,512, 0.013% apart). This is capacity reallocation, not compute matching.",
+    "parameter_matching": "full_rope is param-matched to csa_fixed_rope by widening its MLP to mr=6.76348876953125 (11,089,904 vs 11,088,512, 0.013% apart); full_rope_sink uses mr=6.763427734375 because the learned sink adds 48 parameters (11,088,560). csa_fixed_rope_nosink removes the 48 sink parameters (11,089,856). This is capacity reallocation, not compute matching.",
     "flops": "per-token training FLOPs of the dense reference are about 1.87x the csa arm (2.30M vs 1.23M: MLP +69%, attention 3.2x at L512).",
     "read_fraction": "learned csa reads 32/128 = 25% of blocks at train L512 and 32/1024 = 3.1% at eval L4096; dense reads 100%; allblocks reads 128 blocks at L512 and 1024 at L4096.",
     "kernel": "csa arms use the manual _rope_attn path (explicit -inf mask + split softmax); full_rope uses SDPA and switches backend between bf16 training and fp32 eval.",
@@ -108,16 +144,20 @@
       "endpoint": "by_len.ppl@4096",
       "expected_sign": "negative",
       "hypothesis_direction": "csa_fixed_rope better (negative delta) would confirm the sparse length-extrapolation advantage seen on validation",
-      "interpretation_caveat": "NOT a single-factor contrast. The dense reference is parameter-matched by widening its MLP to mr=6.76348876953125 (hidden 1731 vs 1024, +69% MLP width); per-token training FLOPs are therefore ~1.87x the csa arm (MLP +69%, attention 3.2x at L512). csa_fixed_rope reads 32/128 blocks at train L512 (25%) and 32/1024 at eval L4096 (3.1%), while full_rope reads 100%. The comparison also changes the attention kernel (manual _rope_attn vs SDPA), q_norm (extra F.normalize), kv_norm width (256 vs 32) and the learned sink (full_rope has full_sink=False). Report all four differences, not just 'parameter-matched dense'."
+      "interpretation_caveat": "NOT a single-factor contrast. The dense reference is parameter-matched by widening its MLP to mr=6.76348876953125 (hidden 1731 vs 1024, +69% MLP width); per-token training FLOPs are therefore ~1.87x the csa arm (MLP +69%, attention 3.2x at L512). csa_fixed_rope reads 32/128 blocks at train L512 (25%) and 32/1024 at eval L4096 (3.1%), while full_rope reads 100%. The comparison also changes the attention kernel (manual _rope_attn vs SDPA), q_norm (extra F.normalize), kv_norm width (256 vs 32) and the learned sink (full_rope has full_sink=False). Report all four differences, not just 'parameter-matched dense'.",
+      "mechanism_claim_allowed": false,
+      "claim_note": "Multi-factor system comparison (MLP width/FLOPs, kernel, qk-norm/kv-norm, sink, read fraction). v5 keeps it as the system-level headline; the sink-matched contrast below tests whether the sink difference explains it."
     },
     {
-      "name": "control: csa_fixed_rope_randidx - csa_fixed_rope @ L4096 (test)",
-      "a": "csa_fixed_rope_randidx",
+      "name": "control: csa_fixed_rope_randidx_seeded - csa_fixed_rope @ L4096 (test)",
+      "a": "csa_fixed_rope_randidx_seeded",
       "b": "csa_fixed_rope",
       "endpoint": "by_len.ppl@4096",
       "expected_sign": "positive",
-      "hypothesis_direction": "positive delta would confirm that learned selection beats a TRAINED random selector at equal budget (the test-time intervention cannot answer this)",
-      "interpretation_caveat": "'random' is a FIXED deterministic hash pattern ((row*12.9898 + col*78.233)), identical for every seed, layer and step — not a fresh random draw. The claim is about learned selection vs this fixed pseudo-random read pattern, at matched parameters (but with 201,216 dead W_DQ/W_DK/W_w parameters in the randidx arm, so its effective parameter count is ~1.8% lower)."
+      "hypothesis_direction": "positive delta would confirm that learned selection beats a TRAINED random selector at equal read budget; the seeded arm draws a per-(seed, layer) pseudo-random pattern, so the control is a random variable across seeds",
+      "interpretation_caveat": "v5: the control is a per-(seed, layer) pseudo-random draw (salt = seed*1000003 + layer), not one global fixed hash; it remains deterministic for a given checkpoint and has the same dead W_DQ/W_DK/W_w parameters (~1.8% fewer effective parameters). The claim is learned selection vs this seeded random pattern at matched top-k, not vs a fresh draw at every forward.",
+      "mechanism_claim_allowed": true,
+      "claim_note": "The only frozen comparison that may be read as selection-mechanism evidence. Narrow scope: it is a seeded pseudo-random pattern (not a fresh per-forward draw) and the arm has ~1.8% fewer effective parameters."
     },
     {
       "name": "control: csa_fixed_rope_allblocks - csa_fixed_rope @ L4096 (test)",
@@ -126,16 +166,42 @@
       "endpoint": "by_len.ppl@4096",
       "expected_sign": "positive",
       "hypothesis_direction": "positive delta would confirm that learned top-32 selection beats TRAINED all-block reading (allblocks reads strictly more information; this is a selection-vs-full-read contrast, NOT an equal-budget contrast)",
-      "interpretation_caveat": "v3 CORRECTS the v2 'at equal budget' wording: the arms are parameter-matched but NOT computation/reading-budget matched. index_topk=1000000, and lightning_indexer internally caps k=min(topk, B): allblocks reads 128 blocks at train L512 and 1024 blocks at eval L4096, versus 32 for learned (about 32x more at L4096). It is therefore an information-rich 'read everything' control, which is scientifically valid but must not be described as equal budget. The indexer's STE soft prior also differs (log(1/32) vs log(1/1024) on the selected set), so the learned sink strength differs by about 30x at L4096; 'only index_topk changed' is not accurate."
+      "interpretation_caveat": "v3 CORRECTS the v2 'at equal budget' wording: the arms are parameter-matched but NOT computation/reading-budget matched. index_topk=1000000, and lightning_indexer internally caps k=min(topk, B): allblocks reads 128 blocks at train L512 and 1024 blocks at eval L4096, versus 32 for learned (about 32x more at L4096). It is therefore an information-rich 'read everything' control, which is scientifically valid but must not be described as equal budget. The indexer's STE soft prior also differs (log(1/32) vs log(1/1024) on the selected set), so the learned sink strength differs by about 30x at L4096; 'only index_topk changed' is not accurate.",
+      "mechanism_claim_allowed": false,
+      "claim_note": "Not reading-budget matched (32x at L4096); it is an information-rich upper bound, not an equal-budget control."
     },
     {
-      "name": "aligned-dense: full_rope - csa_fixed_rope_allblocks @ L4096 (test)",
-      "a": "full_rope",
+      "name": "aligned-dense: full_rope_sink - csa_fixed_rope_allblocks @ L4096 (test)",
+      "a": "full_rope_sink",
       "b": "csa_fixed_rope_allblocks",
       "endpoint": "by_len.ppl@4096",
       "expected_sign": null,
-      "hypothesis_direction": "isolates block-compression/KV-projection from selection: same-projection dense-style reading vs standard dense attention (non-directional mechanism readout)",
-      "interpretation_caveat": "Not a single-factor contrast either: full_rope uses SDPA (bf16 in training, fp32 in eval — a backend switch), no learned sink, kv_norm width 256, and an extra F.normalize(q); the csa arm uses the manual _rope_attn kernel with a sink and kv_norm 32. Kernel/reduction-order differences are part of the measured delta."
+      "hypothesis_direction": "sink-matched dense-style reading vs standard dense attention (both arms now have a learned sink); non-directional mechanism readout",
+      "interpretation_caveat": "v5: both arms now have a learned sink, so the sink confound is removed from this readout. The kernel (SDPA vs manual _rope_attn), qk-norm/kv-norm width and read budget still differ; it remains a system-level mechanism readout, not a single-factor test.",
+      "mechanism_claim_allowed": false,
+      "claim_note": "Sink-matched now, but kernel/qk-norm/kv-width/read-budget still differ; non-directional system-level readout."
+    },
+    {
+      "name": "sink-matched: csa_fixed_rope - full_rope_sink @ L4096 (test)",
+      "a": "csa_fixed_rope",
+      "b": "full_rope_sink",
+      "endpoint": "by_len.ppl@4096",
+      "expected_sign": "negative",
+      "hypothesis_direction": "negative delta would show the CSA advantage survives when the dense reference has the same learned sink; a positive delta would identify the sink as the explanation of the v4 main result",
+      "interpretation_caveat": "v5 sink-matched system comparison: sink, MLP/FLOPs, kernel, qk-norm/kv-norm and read fraction still differ. It is not a single-factor mechanism test; it is the pre-registered check of whether the v4 main contrast is a sink artifact.",
+      "mechanism_claim_allowed": false,
+      "claim_note": "Removes the sink difference only; still multi-factor. Use it to interpret the main result, not as a mechanism claim."
+    },
+    {
+      "name": "no-sink: csa_fixed_rope_nosink - full_rope @ L4096 (test)",
+      "a": "csa_fixed_rope_nosink",
+      "b": "full_rope",
+      "endpoint": "by_len.ppl@4096",
+      "expected_sign": "negative",
+      "hypothesis_direction": "negative delta would show the CSA advantage also holds in the no-sink cell of the 2x2; together with sink-matched it gives the sink-by-architecture difference-in-differences",
+      "interpretation_caveat": "v5 no-sink cell: MLP/FLOPs, kernel, qk-norm/kv-norm and read fraction still differ. Compare its delta with the sink-matched delta; the difference is the sink-by-architecture interaction.",
+      "mechanism_claim_allowed": false,
+      "claim_note": "No-sink cell of the 2x2; still multi-factor. The interaction is (csa_sink - full_sink) - (csa_nosink - full_rope), reported descriptively."
     }
   ],
   "statistics": {
@@ -143,13 +209,13 @@
     "n_seeds": 12,
     "p_floor": 0.00048828125,
     "alpha": 0.05,
-    "family": "primary_comparisons only (m=4)",
+    "family": "primary_comparisons only (m=6)",
     "correction": "holm step-down",
-    "min_attainable_p_holm": 0.001953125,
+    "min_attainable_p_holm": 0.0029296875,
     "min_seeds_for_confirmation": 8,
-    "min_seeds_note": "v3 pre-registers that a comparison may be CONFIRMED with fewer than the 12 frozen seeds when at least 8 complete pairs remain. Rationale: with a two-sided exact sign-flip and Holm/4, 8 seeds are the smallest n whose minimum attainable Holm p (4*2/2^8 = 0.03125) is below alpha=0.05. Requiring all 12 seeds via coverage_ok would let one failed L4096 cell annihilate an otherwise complete comparison; v3 drops only the incomplete pair, reports the actual n_effective, and applies this declared floor.",
+    "min_seeds_note": "v5: with two-sided exact sign-flip and Holm/6, 8 seeds give a minimum attainable Holm p of 6*2/2^8 = 0.046875 < 0.05; the declared floor stays 8, but the shipped v5 requires all 12 seeds via require_complete_coverage=true.",
     "min_consistency_for_first_gate": 11,
-    "min_consistency_note": "v3 clarifies that 11 is a SUFFICIENT condition under the equal-magnitude symbol-test projection, NOT the minimum for the exact sign-flip test. For unequal |delta| the exact test can reject with 8/12 same-sign (e.g. 8x(+100) and 4x(-1): exact p=0.0078, Holm p=0.031). It is recorded for reference and is not used as a decision threshold.",
+    "min_consistency_note": "v5: 11 is a SUFFICIENT condition under the equal-magnitude symbol-test projection, NOT the minimum for the exact sign-flip test. For unequal |delta| the exact test can reject with fewer same-sign seeds (e.g. 8x(+100) and 4x(-1): exact p=0.0078; Holm/6 p=0.047). It is recorded for reference and is not used as a decision threshold.",
     "power_first_holm_gate": {
       "q=0.80": 0.275,
       "q=0.85": 0.443,
@@ -158,8 +224,14 @@
     },
     "power_note": "q = probability that a single seed's paired delta falls in the pre-registered direction. The table is computed by exp_lib.signflip_power, which implements the SYMBOL-TEST projection 2*P(Bin(n,1/2) <= n-k), NOT the exact sign-flip test that finaltest_stats actually runs. It is neither a design guarantee nor a rigorous bound in either direction: for unequal magnitudes the exact test can be more powerful (8/12 can suffice), and it can be less powerful when contrary deltas are large. Use it only as a rough design aid. Before the first test access, simulate sign-flips on the P5C per-seed validation delta vector (fixed |d_i|, enumerate 2^12 sign patterns) to obtain the real power / minimum same-sign count for THIS panel; if that power is inadequate, add seeds and record the revision in revision.history BEFORE touching test.",
     "validity_assumptions": "the exact sign-flip p requires within-seed exchangeability: both arms of a pair share everything stochastic except the arm itself (identical per-seed data order over the shared cache, same eval rows, same corruption grid; init RNG is seeded per seed -- architecture-induced RNG consumption differences are part of the arm). Seed-number equality alone does not provide this; see design_notes section 20. Machine-checked: data_fp, train_fp, n_seq, recipe, _code, manifest sha. Reported but NOT enforced: rng_fp (analysis writes validity.rng_fp_values / same_rng_fp).",
-    "decision_rule": "A comparison is CONFIRMED only if p_holm < 0.05 AND its direction matches the validation-panel estimate AND param_matched is not false AND at least min_seeds_for_confirmation=8 complete pairs entered the test. coverage_ok (all 12 seeds) is reported but is not required. Otherwise the claim stays exploratory. Probe/delta-NLL/NIAH results on the test split are reported descriptively (secondary) and carry no significance claims.",
-    "seed_policy": "seeds 0-11 fixed above; no seeds may be added after the first test-split evaluation (adding seeds after seeing results is selection bias by construction). Missing or incomplete seeds are reported as-is (smaller honest n_effective, never topped up); the declared floor is 8 complete pairs. The load-time power gate refuses any future manifest whose min attainable Holm p at that floor exceeds alpha."
+    "decision_rule": "A comparison is CONFIRMED only if p_holm < 0.05 AND its direction matches the validation-panel estimate AND param_matched is not false AND at least min_seeds_for_confirmation=8 complete pairs entered the test AND coverage_ok is true (v5; all 12 seeds) AND the pre-test power gate passed (or V12_ALLOW_LOW_POWER=1 is recorded). mechanism_claim_allowed=false comparisons are system-level and may not be written as mechanism evidence. Otherwise the claim stays exploratory.",
+    "seed_policy": "seeds 0-11 fixed above; no seeds may be added after the first test-split evaluation (adding seeds after seeing results is selection bias by construction). Missing or incomplete seeds are reported as-is (smaller honest n_effective, never topped up); the declared floor is 8 complete pairs. The load-time power gate refuses any future manifest whose min attainable Holm p at that floor exceeds alpha. v4: because coverage is required for a confirmed verdict, a missing seed cannot be replaced by a smaller-n confirmation; the panel is reported as unconfirmed.",
+    "require_complete_coverage": true,
+    "require_complete_coverage_note": "v4 (review 5): every frozen seed must enter the comparison before it can be CONFIRMED. The 8-pair floor remains the mathematical resolution floor and is still reported, but a complete-case subset selected by wall-clock skips, missing checkpoints or the health gate is not random attrition. A partial panel is reported as descriptive/unconfirmed, never as a smaller-n confirmation.",
+    "require_power_gate": true,
+    "min_power_for_test": 0.8,
+    "power_q_for_test": 0.95,
+    "power_gate_note": "v4 (review 5): before the first test access, `python v12_supp.py power` enumerates the 2^12 sign patterns of the P5C per-seed validation deltas and reports the exact conditional power and the minimum same-sign count for THIS panel. The hard gate uses q=0.95 (the manifest's own design point at which 12 seeds reach 0.882 symbol-test power); q=0.90 is still reported as the realistic sensitivity and is expected to be ~0.66 at n=12. If power at q=0.95 is below min_power_for_test the driver refuses P5T; add seeds and record a revision before touching test (V12_ALLOW_LOW_POWER=1 is the explicit override)."
   },
   "revision": {
     "history": [
@@ -181,9 +253,23 @@
         "change": "stamp aligned to CODE_SEMANTICS v11.128; eager_batch_expected set to false (all four frozen arms run the per-row RoPE loop); P5T/probe records carry train_knobs/train_objective/param_breakdown/rng_fp/n_seq; per-arm mr pinned (full_rope 6.76348876953125, csa arms 4.0); allblocks contrast declared separately; dense MLP +69% / ~1.87x FLOPs / 25%->3.1% read-fraction disclosure added; decision rule declares n_effective >= 8; power_note states that the table is a symbol-test projection, not the exact sign-flip test; p1l recipe carries the real amp/eager/determinism/train_fp and a proper arm-independent run_cfg; adaptive 2-SE health threshold; leakage gate uses reachable statistics and runs before the accessed lock; zero-GPU `v12_supp.py plan` added to CI",
         "precondition_verified": "no test-split access at revision time: results_lm_test/ and results_smoke_v12/ are absent, there is no .freeze_lock.json, no P5T result/commit exists, and v12_supp.py plan runs without calling load_wikitest",
         "ci_loop": "the continuous-loop workflow was set to disabled_manually during this revision (the in-flight run was cancelled; the two queued runs cannot start while the workflow is disabled). It must not be re-enabled until the frozen commit is signed and P5T has finished"
+      },
+      {
+        "version": 4,
+        "date": "2026-10-21",
+        "change": "review-5 methodological and engineering hardening, still BEFORE any test-split access. (1) statistics.require_complete_coverage=true: a complete-case subset (cap skips / missing checkpoints / health-gate refusals) can no longer be CONFIRMED as a smaller-n panel; the 8-pair mathematical floor is still reported. (2) Pre-test power gate: a zero-GPU exact conditional power calibration on the P5C validation deltas (`v12_supp.py power`) is now part of the frozen plan; P5T refuses when power at q=0.95 is below 0.8 (q=0.90 is still reported as the realistic sensitivity) unless explicitly overridden and recorded. (3) Claim-scope flags per primary comparison: only the randidx-vs-learned contrast may be read as selection-mechanism evidence, and even that only versus a fixed pseudo-random pattern; the main/aligned-dense contrasts are system-level. (4) Every admitted comparison now carries the full by-length curve (L512..L4096) as descriptive evidence, so an in-distribution reversal cannot be hidden behind the L4096 endpoint. (5) P5H health gate: a flat cosine tail (underfitting_or_stalled) is non-blocking and recorded; only nonfinite / overfitting / validation_degrading / insufficient_data / unmonitored block the test. (6) Driver phase order is P5C -> P5H -> P5PW -> P5T -> exploratory panels; a budget stop now reports INCOMPLETE and never prints ALL PHASES DONE. (7) The scheduled continuous-loop workflow is disabled (workflow_dispatch only) and the fast_prompt() unbounded-edit wrapper was removed.",
+        "precondition_verified": "no test-split access at revision time: results_lm_test/ and .freeze_lock.json are absent; no P5T result exists; the new power mode reads only results_v10_mech/summary.json (validation) and never calls load_wikitest.",
+        "no_change_to": "arms, seeds 0-11, training recipe, endpoint L4096, alpha, Holm/4, exact sign-flip"
+      },
+      {
+        "version": 5,
+        "date": "2026-10-21",
+        "change": "review-6 methodological completion before the one-shot test. (1) Sink-by-architecture 2x2: add full_rope_sink (mr=6.763427734375) and csa_fixed_rope_nosink; add sink-matched and no-sink primary comparisons. Their difference is the sink/architecture interaction. (2) Replace the fixed-hash randidx control with csa_fixed_rope_randidx_seeded, a per-(seed, layer) pseudo-random draw at the same top-k (the legacy fixed pattern is retired from the frozen panel; it is not a random variable across seeds). (3) Raise n_seqs_clean 16 -> 48; still below the 64-doc population floor and below the ~59-row L4096 ceiling on WikiText-103, so population claims stay refused. (4) Family m=4 -> 6; min attainable Holm p 0.00195 -> 0.00293; the 8-pair floor remains 0.046875 < 0.05. (5) Dynamic/HCA remain outside this freeze; a separate draft manifest and a disjoint-corpus precondition are added, not a v5 arm.",
+        "precondition_verified": "no test-split access at revision time: results_lm_test/ and .freeze_lock.json are absent; no P5T result exists; the new arms are untrained and the test slice has not been read.",
+        "no_change_to": "seeds 0-11, training recipe (3000 steps/512/12), endpoint L4096, alpha, exact sign-flip"
       }
     ],
     "rule": "any further revision requires either (a) proof that no test-split access has occurred (git history + absent lock + absent bylen records), or (b) V12_REFREEZE=1 after access, which permanently downgrades the earlier round to exploratory in the plan history above"
   },
-  "history_note": "v1 frozen 2026-10-16 in the commit that introduced v12_supp.py; v2 revised 2026-10-17; v3 revised 2026-10-19, still before any test-split access. The test split has never been read by the codebase (earlier documentation covered only train/valid, and load_wikitext now requests split='train'/'validation' explicitly instead of materialising all three HF splits)."
+  "history_note": "v1 frozen 2026-10-16 in the commit that introduced v12_supp.py; v2 revised 2026-10-17; v3 revised 2026-10-19, still before any test-split access. The test split has never been read by the codebase (earlier documentation covered only train/valid, and load_wikitext now requests split='train'/'validation' explicitly instead of materialising all three HF splits). v4 revised 2026-10-21, still before any test-split access; it adds the complete-coverage and pre-test power gates, claim-scope flags, the descriptive by-length curve, the non-blocking health rule and the phase reorder/INCOMPLETE reporting. v5 revised 2026-10-21 before any test access: sink 2x2, seeded random control, 48 test docs, m=6."
 }
