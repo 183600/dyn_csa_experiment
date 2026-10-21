@@ -630,6 +630,21 @@ def t_error_analysis_rejects_bad_token_tables():
         raise AssertionError('paired comparison must refuse float token tables')
 
 
+def t_error_analysis_paired_vocab_guard():
+    EA._paired_vocab_guard({'vocab': 8192}, {'vocab': 8192})
+    EA._paired_vocab_guard({'vocab': 32.0}, {'vocab': 32})
+    EA._paired_vocab_guard({}, {})
+    for bad in ({'vocab': 8192}, {'vocab': 8193}), ({'vocab': True}, {'vocab': 1}), \
+               ({'vocab': 32}, {'vocab': -32}), ({'vocab': 32}, {'vocab': 32.5}), \
+               ({'vocab': 32}, {'vocab': 'x'}):
+        try:
+            EA._paired_vocab_guard(*bad)
+        except SystemExit as e:
+            assert 'REFUSE' in str(e), e
+        else:
+            raise AssertionError(f'paired vocab guard accepted {bad!r}')
+
+
 def t_error_analysis_paired_none_is_renderable():
     class _M:
         def to(self, device):
@@ -14104,6 +14119,7 @@ def main():
     _check('L27 error analysis excludes non-finite targets', t_error_analysis_excludes_nonfinite_targets)
     _check('L27b rare-target triage needs a measured frequency basis', t_error_analysis_rare_basis_is_measured)
     _check('L27c error-analysis budgets are explicit, not clamped', t_error_analysis_zero_and_invalid_budgets)
+    _check('L27d paired error analysis requires one vocabulary', t_error_analysis_paired_vocab_guard)
     _check('L28 gapfill numeric reader rejects booleans', t_gapfill_numeric_reader_rejects_booleans)
     _check('L28b gapfill announces the family-corrected seed plan', t_gapfill_announces_family_seed_plan)
     _check('L29 release tags cannot escape the archive directory', t_release_tag_cannot_escape_output_dir)

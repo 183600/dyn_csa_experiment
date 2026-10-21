@@ -79,6 +79,31 @@ def _load_model(path):
     return model, d
 
 
+def _paired_vocab_guard(meta_a, meta_b):
+    """Refuse a paired per-token comparison across different vocabularies.
+
+    The same integer id means a different token in two tokenizers, so a
+    position-wise delta would silently compare different labels.  This is a
+    validity check, not a preference: the corpus/vocabulary must be identical
+    before any paired error claim is made.
+    """
+    def _v(meta, label):
+        raw = (meta or {}).get('vocab', 8192)
+        if isinstance(raw, bool):
+            raise SystemExit(f'[errors] REFUSE: {label} checkpoint has a boolean vocab ({raw!r})')
+        try:
+            f = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            raise SystemExit(f'[errors] REFUSE: {label} checkpoint vocab is not an integer ({raw!r})') from None
+        if not math.isfinite(f) or f != math.floor(f) or f < 1:
+            raise SystemExit(f'[errors] REFUSE: {label} checkpoint vocab is not a positive integer ({raw!r})')
+        return int(f)
+    va = _v(meta_a, 'first')
+    vb = _v(meta_b, 'comparison')
+    if va != vb:
+        raise SystemExit(f'[errors] REFUSE: paired checkpoints use different vocabularies ({va} vs {vb}); per-token labels are not comparable')
+
+
 def _roundtrip(d):
     return json.loads(json.dumps(d, default=str))
 
@@ -134,6 +159,7 @@ def main(argv=None):
     paired = None
     if args.compare_ckpt:
         model_b, meta_b = _load_model(args.compare_ckpt)
+        _paired_vocab_guard(meta, meta_b)
         model_b.to(device)
         paired = L.compare_token_errors(model, model_b, val_batch, vocab, device,
                                         tokenizer=tok, top_n=args.top_tokens, chunk=args.chunk)
