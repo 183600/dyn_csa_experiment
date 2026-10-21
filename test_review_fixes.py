@@ -10675,6 +10675,24 @@ def t_environment_snapshot_runtime_identity():
     assert env.get('working_directory') == os.getcwd(), env
 
 
+def t_ledger_curve_is_bounded():
+    small = [1.0, 2.0, 3.0]
+    got, n, down = L._ledger_curve(small)
+    assert got == small and n == 3 and down is False, (got, n, down)
+    vals = [float(i % 17) for i in range(50000)]
+    vals[12345] = float('nan')
+    vals[23456] = 1e9
+    got, n, down = L._ledger_curve(vals, max_points=20000)
+    assert n == 50000 and down is True and len(got) <= 20000, (n, down, len(got))
+    assert any(isinstance(v, float) and math.isnan(v) for v in got), 'the ledger reduction dropped the NaN marker'
+    assert 1e9 in got, 'the ledger reduction dropped the spike'
+    pts = [[i, float(i)] for i in range(300)]
+    pts[201][1] = float('nan')
+    pg, pn, pd = L._ledger_curve_points(pts, max_points=100)
+    assert pn == 300 and pd is True and len(pg) <= 100, (pn, pd, len(pg))
+    assert any(int(a) == 201 and math.isnan(b) for a, b in pg), 'the point reduction dropped the NaN point'
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10798,6 +10816,7 @@ def main():
     _check('E6 end-to-end training reproducibility', t_train_variant_reproducible)
     _check('E7 overfit check detects broken optimizer', t_overfit_detects_broken_optimizer)
     _check('E8 append-only experiment ledger + manifest', t_experiment_ledger)
+    _check('E8a ledger curves stay bounded but keep spikes/NaN', t_ledger_curve_is_bounded)
     _check('E9 data_version identity', t_data_version_identity)
     _check('E10 crash-safe manifest status/planned cells', t_manifest_running_then_complete)
     _check('E10b panel finish marks missing cells incomplete', t_panel_finish_marks_missing_cells_incomplete)

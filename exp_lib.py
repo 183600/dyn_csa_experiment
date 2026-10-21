@@ -20558,6 +20558,32 @@ def _reduce_curve_points(points, max_points):
     return [points[i] for i in sorted(keep)]
 
 
+_LEDGER_CURVE_MAX_POINTS = 20000
+
+
+def _ledger_curve(values, max_points=_LEDGER_CURVE_MAX_POINTS):
+    """Bound the curves embedded in the append-only JSONL ledger.
+
+    The full curve is already in the per-cell sidecar / summary; a 200k-point
+    array in every ledger line grows the trace quadratically with panel size.
+    Small curves stay byte-identical for readers of old ledgers; a long curve
+    is spike-preserving downsampled and annotated with its true length.
+    """
+    vals = list(values) if isinstance(values, (list, tuple)) else []
+    n = len(vals)
+    if n <= int(max_points):
+        return vals, n, False
+    return _reduce_curve_values(vals, int(max_points)), n, True
+
+
+def _ledger_curve_points(points, max_points=_LEDGER_CURVE_MAX_POINTS):
+    pts = list(points) if isinstance(points, (list, tuple)) else []
+    n = len(pts)
+    if n <= int(max_points):
+        return pts, n, False
+    return _reduce_curve_points(pts, int(max_points)), n, True
+
+
 def _curve_append_point(dst, point):
     dst.append(point)
     if len(dst) > 2 * _CURVE_MAX_POINTS:
@@ -22283,18 +22309,23 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     _p_before = _param_change_sample(model).clone()
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, weight_decay=0.0, foreach=True)
 
+    _loss_path = 'forward' if _ign in (None, -100) else 'ce_loss'
+
     def _loss_consistency():
         with torch.no_grad():
-            _chunked = float(model.ce_loss(x, y, vocab, ignore_index=_ign).detach())
+            if _loss_path == 'forward':
+                _trained = float(model(x, targets=y, vocab=vocab).detach())
+            else:
+                _trained = float(model.ce_loss(x, y, vocab, ignore_index=_ign).detach())
             _measured = float(_lm_batch_metrics(model, x, y, vocab, ignore_index=_ign)[0])
-        if not (math.isfinite(_chunked) and math.isfinite(_measured)):
-            return {'chunked_ce': _chunked, 'measured_ce': _measured,
+        if not (math.isfinite(_trained) and math.isfinite(_measured)):
+            return {'trained_loss': _trained, 'measured_ce': _measured,
                     'abs_diff': None, 'rel_diff': None,
                     'tolerance': None, 'passed': False}
-        _abs = abs(_chunked - _measured)
+        _abs = abs(_trained - _measured)
         _rel = _abs / max(abs(_measured), 1e-12)
         _tol = max(1e-5, 1e-4 * abs(_measured))
-        return {'chunked_ce': _chunked, 'measured_ce': _measured,
+        return {'trained_loss': _trained, 'measured_ce': _measured,
                 'abs_diff': _abs, 'rel_diff': _rel,
                 'tolerance': _tol, 'passed': bool(_abs <= _tol)}
 
@@ -22312,7 +22343,10 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     _n_with_grad = 0
     model.train()
     for step in range(int(steps)):
-        ce = model.ce_loss(x, y, vocab, ignore_index=_ign)
+        if _loss_path == 'forward':
+            ce = model(x, targets=y, vocab=vocab)
+        else:
+            ce = model.ce_loss(x, y, vocab, ignore_index=_ign)
         opt.zero_grad(set_to_none=True)
         ce.backward()
         _gs = []
@@ -22408,6 +22442,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         },
         'data_source': _data_source,
         'loader_mode': _loader_mode,
+        'loss_path': _loss_path,
         'data_fp': _data_fp,
         'rng_fp': _rng_fp,
         'regularization': {'weight_decay': 0.0, 'comp_lambda': 0.0, 'dropout': 0.0, 'augmentation': 'none'},
@@ -24731,7 +24766,9 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             elif isinstance(rec, dict) and not rec.get('cap_truncated'):
                 _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
                 _cs = _finite_curve(_losses)
-                _ev = {'kind': 'cell', 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': rec.get('finished_at'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': rec.get('_code') or code_stamp(), 'provenance': rec.get('provenance'), 'hyperparams': rec.get('hyperparams'), 'data_fp': rec.get('data_fp'), 'val_fp': rec.get('val_fp'), 'data_version': rec.get('data_version'), 'rng_fp': rec.get('rng_fp'), 'metrics': {'ppl': rec.get('ppl'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'steps_completed': rec.get('steps_completed'), 'early_stop': rec.get('early_stop'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed'), 'best_val_ppl': rec.get('best_val_ppl'), 'final_minus_best': rec.get('final_minus_best')}, 'curve_summary': {'n_points': _cs['n_points'], 'n_nonfinite': _cs['n_nonfinite'], 'first': _losses[0] if _losses else None, 'last': _cs['last'], 'best': _cs['min']}, 'curve_health': rec.get('curve_health'), 'instability_diagnosis': rec.get('instability_diagnosis'), 'opt_diag_summary': rec.get('opt_diag_summary'), 'checkpoints': rec.get('checkpoints'), 'efficiency': rec.get('efficiency'), 'losses': _losses, 'ppl_history': rec.get('ppl_history'), 'sanity_ref': rec.get('sanity_ref')}
+                _ledger_losses, _losses_n, _losses_down = _ledger_curve(_losses)
+                _ledger_ph, _ph_n, _ph_down = _ledger_curve_points(rec.get('ppl_history'))
+                _ev = {'kind': 'cell', 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': rec.get('finished_at'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': rec.get('_code') or code_stamp(), 'provenance': rec.get('provenance'), 'hyperparams': rec.get('hyperparams'), 'data_fp': rec.get('data_fp'), 'val_fp': rec.get('val_fp'), 'data_version': rec.get('data_version'), 'rng_fp': rec.get('rng_fp'), 'metrics': {'ppl': rec.get('ppl'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'steps_completed': rec.get('steps_completed'), 'early_stop': rec.get('early_stop'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed'), 'best_val_ppl': rec.get('best_val_ppl'), 'final_minus_best': rec.get('final_minus_best')}, 'curve_summary': {'n_points': _cs['n_points'], 'n_nonfinite': _cs['n_nonfinite'], 'first': _losses[0] if _losses else None, 'last': _cs['last'], 'best': _cs['min']}, 'curve_health': rec.get('curve_health'), 'instability_diagnosis': rec.get('instability_diagnosis'), 'opt_diag_summary': rec.get('opt_diag_summary'), 'checkpoints': rec.get('checkpoints'), 'efficiency': rec.get('efficiency'), 'losses': _ledger_losses, 'losses_n_points': _losses_n, 'losses_downsampled': _losses_down, 'ppl_history': _ledger_ph, 'ppl_history_n_points': _ph_n, 'ppl_history_downsampled': _ph_down, 'curve_ref': _curve_ref or rec.get('curve_ref'), 'sanity_ref': rec.get('sanity_ref')}
                 log_experiment_event(outdir, _ev)
         except Exception as e:
             import traceback
