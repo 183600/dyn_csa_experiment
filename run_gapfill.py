@@ -359,19 +359,32 @@ def merge_long_aggregate(adir, snapshot_agg):
         _folded_keys.add(key)
         if n_fresh:
             _fresh_covers = n_old_only == 0
+            _overlap = bool(set(sm_old) & set(fm))
+            # Partial overlap is not algebraically mergeable from aggregate
+            # means: the snapshot mean covers all old seeds (including the
+            # overlapping ones), so it cannot be split into old-only and
+            # overlap components without per-seed values.  Weighting it by
+            # `n_old_only` silently assumes the overlap mean equals the old
+            # mean, which is exactly what a re-measurement may have changed.
+            _partial_overlap = bool(_overlap and not _fresh_covers)
             for _f in ('avg_dyn_block_len', 'avg_block_len', 'boundary_f1_dyn', 'boundary_excess_dyn', 'delta_logit_mean', 'tokens_per_step'):
                 _vo, _vn = (sentry.get(_f), fentry.get(_f))
                 _vn_ok = isinstance(_vn, (int, float)) and (not isinstance(_vn, bool)) and math.isfinite(_vn)
                 _vo_ok = isinstance(_vo, (int, float)) and (not isinstance(_vo, bool)) and math.isfinite(_vo)
                 if not _vn_ok:
                     continue
-                if _fresh_covers or not _vo_ok:
+                if _partial_overlap:
+                    # Do not present an unverifiable seed-average as current.
+                    sentry[_f] = None
+                elif _fresh_covers or not _vo_ok:
                     sentry[_f] = _vn
                 else:
                     w_old = n_old_only / (n_old_only + n_fresh)
                     sentry[_f] = _vo * w_old + _vn * (1.0 - w_old)
             _co, _cn = (sentry.get('ppl_curve'), fentry.get('ppl_curve'))
-            if _fresh_covers:
+            if _partial_overlap:
+                sentry['ppl_curve'] = None
+            elif _fresh_covers:
                 if _cn:
                     sentry['ppl_curve'] = _cn
             elif _co and _cn:
@@ -390,6 +403,13 @@ def merge_long_aggregate(adir, snapshot_agg):
                     _acc[0] += _v * n_fresh
                     _acc[1] += n_fresh
                 sentry['ppl_curve'] = [[_s, _a / _w] for _s, (_a, _w) in sorted(_cm.items()) if _w]
+            if _partial_overlap:
+                sentry['merge_stale_fields'] = 'partial_seed_overlap'
+                sentry['merge_note'] = ('snapshot and fresh measurements overlap on only some '
+                                        'seeds; per-seed PPLs are merged exactly, but the '
+                                        'seed-averaged secondary fields and ppl_curve cannot '
+                                        'be re-aggregated from aggregate means alone and were '
+                                        'set to null. Re-run the panel to rebuild them.')
     if _folded_keys:
         _base_full = _seed_map(merged.get('full'), tag='full')
         _base_sw = _seed_map(merged.get('full_sw128_matched'), tag='full_sw128_matched')

@@ -11647,6 +11647,25 @@ def t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields():
         # Valid JSON with the wrong top-level type is skipped, not crashed on.
         json.dump([], open(os.path.join(d, 'aggregate.json.v6bak'), 'w'))
         G._fold_backup_into_aggregate(d)
+    # Partial seed overlap cannot be merged from aggregate means: the old mean
+    # includes the overlapping seeds, so neither the old-only/fresh weights nor
+    # the old curve can be split without per-seed values.  The per-seed PPLs
+    # still merge exactly; the affected seed-averaged fields are invalidated.
+    with tempfile.TemporaryDirectory() as d:
+        snap = {'full': {'seeds': [0, 1, 2], 'ppls': [10.0, 12.0, 14.0],
+                         'n_seeds': 3, 'ppl_mean': 12.0, 'ppl_std': 2.0,
+                         'avg_dyn_block_len': 3.0,
+                         'ppl_curve': [[1, 10.0], [2, 12.0]]}}
+        fresh = {'full': {'seeds': [1, 2, 3], 'ppls': [20.0, 22.0, 24.0],
+                          'n_seeds': 3, 'avg_dyn_block_len': 9.0,
+                          'ppl_curve': [[1, 20.0], [2, 22.0]]}}
+        json.dump(fresh, open(os.path.join(d, 'aggregate.json'), 'w'))
+        G.merge_long_aggregate(d, snap)
+        out = json.load(open(os.path.join(d, 'aggregate.json')))['full']
+        assert out['seeds'] == [0, 1, 2, 3] and out['ppls'] == [10.0, 20.0, 22.0, 24.0], out
+        assert out['ppl_mean'] == 19.0, out
+        assert out['avg_dyn_block_len'] is None and out['ppl_curve'] is None, out
+        assert out['merge_stale_fields'] == 'partial_seed_overlap', out
 
 
 
