@@ -6409,7 +6409,9 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                 _problems.append(
                     'cache does not attest exact/near-duplicate cleanup of the '
                     'validation split against the tokenizer-fit and training documents')
-            _vs = (_dd_meta.get('splits') or {}).get('validation')
+            _splits = _dd_meta.get('splits')
+            _vs = (_splits.get('validation')
+                   if isinstance(_splits, dict) else None)
             if not isinstance(_vs, dict) or not {'exact', 'near'} <= set(_vs):
                 _problems.append(
                     'cache does not record validation duplicate-removal counts '
@@ -7885,7 +7887,9 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                         'validation document-id sidecar does not match the fingerprint in the cache metadata')
             except Exception as _de:
                 _problems.append(f'document-id sidecars unreadable ({type(_de).__name__}: {_de})')
-            if (meta.get('validation_region') or {}).get('policy') != 'per_cap_closed_no_cross_cap_reuse':
+            _vr = meta.get('validation_region')
+            if (not isinstance(_vr, dict)
+                    or _vr.get('policy') != 'per_cap_closed_no_cross_cap_reuse'):
                 _problems.append('cache does not declare a closed per-cap validation region')
             if (meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget'
                     or meta.get('tokenizer_fit_docs_in_train_prefix') is not True):
