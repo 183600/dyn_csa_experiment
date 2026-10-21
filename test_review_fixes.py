@@ -11826,6 +11826,28 @@ def t_archive_refuses_links_and_repo_escape():
             mt.size = len(malformed_bytes)
             tf.addfile(mt, io.BytesIO(malformed_bytes))
         assert AR.cmd_verify(malformed) == 1
+        # A present-but-malformed sha256/byte count, or a non-object
+        # checkpoint_hashes table, must be refused instead of crashing on
+        # slicing/len().
+        for _name, _bad_files, _bad_ck in (
+                ('badsha', {'data.txt': {'sha256': {'x': 1}, 'bytes': 3}}, None),
+                ('badbytes', {'data.txt': {'sha256': __import__('hashlib').sha256(payload).hexdigest(),
+                                           'bytes': True}}, None),
+                ('badck', {'data.txt': {'sha256': __import__('hashlib').sha256(payload).hexdigest(),
+                                        'bytes': len(payload)}}, True)):
+            _p = os.path.join(d, f'release_{_name}.tar.gz')
+            _man = {'tag': _name, 'files': _bad_files}
+            if _bad_ck is not None:
+                _man['checkpoint_hashes'] = _bad_ck
+            _mb = json.dumps(_man).encode('utf-8')
+            with tarfile.open(_p, 'w:gz') as tf:
+                ti = tarfile.TarInfo('data.txt')
+                ti.size = len(payload)
+                tf.addfile(ti, io.BytesIO(payload))
+                mt = tarfile.TarInfo(f'release_{_name}.MANIFEST.sha256')
+                mt.size = len(_mb)
+                tf.addfile(mt, io.BytesIO(_mb))
+            assert AR.cmd_verify(_p) == 1, _name
         # A corrupt/non-tar archive is a verification failure, not a crash.
         corrupt = os.path.join(d, 'release_corrupt.tar.gz')
         with open(corrupt, 'wb') as f:

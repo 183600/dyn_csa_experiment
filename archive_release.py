@@ -412,11 +412,26 @@ def cmd_verify(tar_path):
         if not isinstance(man, dict) or not isinstance(man.get('files'), dict):
             print('[archive] REFUSE: the MANIFEST has no files mapping')
             return 1
+        def _bad_file_entry(meta):
+            if not isinstance(meta, dict):
+                return True
+            sha = meta.get('sha256')
+            if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', sha):
+                return True
+            size = meta.get('bytes')
+            return (size is not None
+                    and (isinstance(size, bool) or not isinstance(size, int) or size < 0))
         _bad_entries = [n for n, meta in man['files'].items()
-                        if not isinstance(meta, dict)]
+                        if _bad_file_entry(meta)]
         if _bad_entries:
             print('[archive] REFUSE: the MANIFEST has malformed file entr(ies) '
-                  f'(expected objects with sha256/bytes): {_bad_entries[:5]}')
+                  f'(expected objects with a 64-hex sha256 and a non-negative '
+                  f'integer byte count): {_bad_entries[:5]}')
+            return 1
+        _ck_raw = man.get('checkpoint_hashes')
+        if _ck_raw is not None and not isinstance(_ck_raw, dict):
+            print('[archive] REFUSE: the MANIFEST checkpoint_hashes is malformed '
+                  f'(expected an object, got {type(_ck_raw).__name__})')
             return 1
         _bad_manifest_names = [n for n in man['files'] if _unsafe_member_name(n)]
         if _bad_manifest_names:
@@ -451,7 +466,13 @@ def cmd_verify(tar_path):
         missing = [n for n in man['files'] if n not in names]
         for n in missing:
             bad.append(f'{n}: in manifest but NOT in tar')
-        ck = man.get('checkpoint_hashes') or {}
+        ck = _ck_raw or {}
+        _bad_ck = [n for n, h in ck.items()
+                   if not isinstance(h, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', h)]
+        if _bad_ck:
+            print('[archive] REFUSE: the MANIFEST has malformed checkpoint hash '
+                  f'entr(ies): {_bad_ck[:5]}')
+            return 1
         print(f'[archive] verified {len(names)} members against the manifest; {len(ck)} checkpoint hashes recorded' + (' (bodies not packed — verify on the experiment machine by hash)' if ck else ''))
         if bad:
             print('[archive] FAIL:\n  - ' + '\n  - '.join(bad[:20]))
