@@ -834,6 +834,10 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
     n = _check_count('n', n)
     purge = _check_purge(purge)
     if groups is not None:
+        if time is not None:
+            # Accept a one-column time array exactly like the row-only path;
+            # the grouped helper itself requires a 1-D ordering key.
+            time = _as_1d(time, 'time', n)
         return grouped_chronological_split_indices(
             n, groups, train_frac, val_frac, test_frac, order=time,
             train_size=train_size, val_size=val_size, test_size=test_size,
