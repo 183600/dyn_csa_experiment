@@ -2711,6 +2711,22 @@ def t_review3_span_clean_key():
     assert 'span_len' not in clean and clean['n_seq'] == 16, clean
     assert pp['span_len'] == 32, 'the measured cell must keep span_len'
 
+def t_v10_holm_family_keeps_unmeasured_slots():
+    # A missing/non-finite p is a dummy p=1 slot, not a deleted comparison:
+    # dropping it would shrink m and overstate the remaining tests' power.
+    fam = V10._holm_family({
+        'a': {'p_exact_signflip': 0.01},
+        'b': {'p_exact_signflip': float('nan')},
+        'c': {},
+        'd': {'p_exact_signflip': True},
+        'e': {'p_exact_signflip': 1.5},
+    })
+    assert [k for k, _p in fam] == ['a', 'b', 'c', 'd', 'e'], fam
+    assert [p for _k, p in fam] == [0.01, 1.0, 1.0, 1.0, 1.0], fam
+    h = L.holm_adjust(fam)
+    assert abs(h['a']['p_holm'] - 5 * 0.01) < 1e-12, h
+    assert h['b']['p_holm'] == 1.0 and h['c']['p_holm'] == 1.0, h
+
 def t_objective_ablation_is_declared_not_a_confound():
     # The loss-term arm zeroes the per-layer multiplier, so the descriptor must
     # report that comp_reg does NOT apply (previously it copied the configured
@@ -12835,6 +12851,7 @@ def main():
     _check('J4 task-boundary arm + objective descriptor', t_review3_boundary_arm_and_objective)
     _check('J4b declared objective ablations are not confounds', t_objective_ablation_is_declared_not_a_confound)
     _check('J5 span clean-baseline key', t_review3_span_clean_key)
+    _check('J5a v10 Holm keeps declared unmeasured slots', t_v10_holm_family_keeps_unmeasured_slots)
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E1c seed contract inventories every CUDA device', t_seed_contract_cuda_device_inventory)
     _check('E1d CPU strict determinism is labelled', t_determinism_label_cpu_strict)

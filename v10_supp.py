@@ -459,6 +459,29 @@ def _probe_params_current(rec, fp, mode='uniform'):
         return False
     return _fp_norm(rec['probe_params']) == _fp_norm(fp)
 
+def _holm_family(mapping):
+    """Declared contrast family for Holm correction.
+
+    Every DECLARED key keeps one slot.  A missing/non-finite p is entered as a
+    dummy p=1, never filtered out: dropping the unmeasured cells would shrink
+    m and make the surviving contrasts look better powered than the study
+    design allows (same fail-closed rule as exp_lib.holm_adjust)."""
+    fam = []
+    if not isinstance(mapping, dict):
+        return fam
+    for _k, _v in mapping.items():
+        _p = _v.get('p_exact_signflip') if isinstance(_v, dict) else None
+        _valid = False
+        if _p is not None and not isinstance(_p, (bool, np.bool_)):
+            try:
+                _pf = float(_p)
+                _valid = math.isfinite(_pf) and 0.0 <= _pf <= 1.0
+            except (TypeError, ValueError, OverflowError):
+                _valid = False
+        fam.append((str(_k), _pf if _valid else 1.0))
+    return fam
+
+
 def _probe_defs(cfg):
     """The (eval_len, rho, mode) grid of a probe config.  Absent 'modes' means
     the legacy uniform-only protocol (cfg['rhos'])."""
@@ -1581,7 +1604,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             contrasts[f'ΔNLL L{Ln} {mode} r{rho}: {arm} - csa+learned'] = res
         # ---- Holm correction over the whole contrast family ----
         holm = {}
-        _fam = [(k, v.get('p_exact_signflip')) for k, v in contrasts.items() if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))]
+        _fam = _holm_family(contrasts)
         if _fam:
             holm = L.holm_adjust(_fam)
             for _k, _v in contrasts.items():
@@ -1672,8 +1695,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             _comb.update(niah_contrasts)
             _comb.update(niah_acc_contrasts)
             if _comb:
-                _h2 = L.holm_adjust([(k, v.get('p_exact_signflip')) for k, v in _comb.items()
-                                     if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))])
+                _h2 = L.holm_adjust(_holm_family(_comb))
                 for _k, _v in _comb.items():
                     if isinstance(_v, dict):
                         _e2 = _h2.get(_k)
