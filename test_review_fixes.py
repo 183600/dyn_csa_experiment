@@ -6119,6 +6119,18 @@ def t_categorical_and_cache_guards():
     assert same['js_divergence'] < 1e-12 and same['total_variation'] < 1e-12
     shifted = L.categorical_shift_report([1, 1, 1, 1], [9, 9, 9, 9])
     assert shifted['js_divergence'] > 0.5 and shifted['unseen_rate'] == 1.0
+    # A tuple category containing the delimiter must not collapse into a
+    # different tuple category.  Before the length-prefixed key these two
+    # reference levels shared one string key, so a holdout containing only one
+    # of them looked identical to the reference.
+    _tuple_shift = L.categorical_shift_report(
+        [('a', 'b'), ('a,s:b',)], [('a', 'b')])
+    assert _tuple_shift['js_divergence'] > 1e-12, _tuple_shift
+    # A real tuple category equal to the old missing-value sentinel is not a
+    # missing value; the two reference levels must stay distinct.
+    _missing_tuple = L.categorical_shift_report(
+        [None, ('__missing__',)], [('__missing__',)])
+    assert _missing_tuple['js_divergence'] > 1e-12, _missing_tuple
     # The cache-hit guard must reject a validation file whose content no
     # longer matches the recorded fingerprint.
     tr = np.arange(32, dtype=np.int64) % 11
@@ -8966,6 +8978,21 @@ def t_target_encoder_prevents_self_and_group_leakage():
     _et = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(_Xt, y[:4])
     _look = _et.get_stats()['features'][0]['lookup']
     assert '__missing__' not in _look, _look
+    # Tuple keys must be self-delimiting: ('a', 'b') and ('a,s:b',) are
+    # different categories even though the naive comma-join renders them the
+    # same.  A collision would share one target mean across both levels.
+    import data_guard as _DG
+    assert _DG._target_key(('a', 'b')) != _DG._target_key(('a,s:b',))
+    _Xtuple = np.array([[('a', 'b')], [('a,s:b',)], [('a', 'b')], [('a,s:b',)]],
+                       dtype=object)
+    _etuple = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(
+        _Xtuple, np.array([1.0, 100.0, 1.0, 100.0]))
+    _tlook = _etuple.get_stats()['features'][0]['lookup']
+    assert len(_tlook) == 2, _tlook
+    _trestored = L.LeakageSafeTargetEncoder.from_stats(
+        json.loads(json.dumps(_etuple.get_stats())))
+    _thold = np.array([[('a', 'b')], [('a,s:b',)]], dtype=object)
+    assert np.allclose(_trestored.transform(_thold), _etuple.transform(_thold))
     # Groups share a fold, so changing a whole group's label cannot move the
     # out-of-fold encoding of another row in that group.
     groups = np.array([0, 0, 1, 1, 2, 2])

@@ -1391,7 +1391,14 @@ def _target_key(value):
     if isinstance(value, bytes):
         return 'y:' + value.hex()
     if isinstance(value, tuple):
-        return 't:(' + ','.join(_target_key(v) for v in value) + ')'
+        # Length-prefix every element.  Joining the element keys with a bare
+        # comma is ambiguous: ('a', 'b') and ('a,s:b',) both render as
+        # ``t:(s:a,s:b)`` because a string category may itself contain the
+        # delimiter.  Appending the length of each element key makes the
+        # encoding self-delimiting at every nesting level.
+        parts = [_target_key(v) for v in value]
+        return ('t:' + str(len(parts)) + ':'
+                + ''.join(str(len(part)) + ':' + part for part in parts))
     if isinstance(value, numbers.Number):
         # Decimal/Fraction (not covered by float/Integral above) also compare
         # exactly against integers/rationals, so use the same canonical form.
@@ -3762,7 +3769,10 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
                 'unseen_rate': 0.0}
 
     def _key(value):
-        return ('__missing__',) if _category_is_missing(value) else _hashable_label(value)
+        # ``_target_key`` distinguishes a genuinely missing value from a real
+        # tuple/string category spelled like the old sentinel, and stays
+        # deterministic across processes (no address-bearing repr).
+        return _target_key(value)
 
     def _sort_key(value):
         return (type(value).__name__, repr(value))
