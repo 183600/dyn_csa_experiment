@@ -83,6 +83,30 @@ test-split record was ever written.
   without removing it. Validation is also the split that was reused for all
   v6-v11 selection, so it cannot support confirmatory claims.
 
+## 2026-10-21 — tuned-family accounting, data transfer, lexical NIAH floor, real token-level folds (no new runs)
+
+Zero-GPU experiment-design hardening; no panel, frozen manifest, test split,
+README or CI configuration was touched. (1) The tuned power floor is now
+computed from the protocol's **declared** method-vs-baseline contrasts rather
+than `len(arms)-1`; an undeclared arm is rejected, and the same
+`tuned_claim_allowed` verdict is exposed by the tuning and count-floor audits
+and surfaced in the fairness gate. (2) Tuning trials now persist
+`data_fp`/`val_fp`/`eval_fp`/`data_version`; the audit refuses a final estimate
+on a different corpus/validation source, complementing the existing
+horizon/exposure transfer checks. (3) `niah_copy_rule_baseline` adds an
+untrained nearest-previous-key copy floor to every NIAH cell; the metric audit
+recomputes it and warns when the learned model does not beat it. NIAH retrieval
+hypotheses are now pre-registered and audited alongside the other hypothesis
+families. (4) The document-group fold path was not actually runnable on a fresh
+WikiText cache: `load_wikitext` wrote only document-level ids while
+`cached_validation_row_groups` expected per-token ids. Validation now also
+writes `val_token_doc_ids_*.npy` (validation only, so a 5B-token train sidecar
+is not materialised); legacy caches are an explicit `groups_aware=False`
+fallback, and a group-aware split that cannot be formed without cutting a
+document falls back to full validation with the reason recorded rather than
+crashing or silently using row-only folds. The temporary issue list was not
+needed and no scratchpad remains.
+
 ## 2026-10-21 — NIAH trivial floors, primary-accuracy tests, document-group folds (no new runs)
 
 Changed only zero-GPU metric/statistics/tuning paths; no panel, frozen
