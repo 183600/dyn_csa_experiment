@@ -1139,6 +1139,37 @@ def _persisted_features(stats, *, what):
     return features, n_features
 
 
+def _stat_float(st, key, *, what, index, allow_none=False):
+    """Read one finite float statistic from a persisted feature entry.
+
+    A missing/NaN/Inf bound would silently disable clipping, or poison every
+    transformed value.  Persisted artifacts are untrusted input, so they fail
+    closed instead of changing the fitted transform.
+    """
+    if key not in st:
+        if allow_none:
+            return None
+        raise ValueError(
+            f'{what}.from_stats: feature {index} has no {key!r} statistic')
+    value = st[key]
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(
+            f'{what}.from_stats: feature {index} has a null {key!r} statistic')
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f'{what}.from_stats: feature {index} has a non-numeric {key!r} '
+            'statistic') from None
+    if not math.isfinite(value):
+        raise ValueError(
+            f'{what}.from_stats: feature {index} has a non-finite {key!r} '
+            'statistic')
+    return value
+
+
 class LeakageSafePreprocessor:
     """Impute, clip and scale features using training statistics only.
 
@@ -1345,25 +1376,41 @@ class LeakageSafePreprocessor:
         """Rebuild a fitted preprocessor from :meth:`get_stats` output."""
         features, n_features = _persisted_features(
             stats, what='LeakageSafePreprocessor')
+        what = 'LeakageSafePreprocessor'
         for j, st in enumerate(features):
             for key in ('fill', 'center', 'factor'):
-                try:
-                    value = float(st[key])
-                except (KeyError, TypeError, ValueError, OverflowError):
-                    raise ValueError(
-                        f'LeakageSafePreprocessor.from_stats: feature {j} has '
-                        f'no usable {key!r} statistic') from None
-                if not math.isfinite(value):
-                    raise ValueError(
-                        f'LeakageSafePreprocessor.from_stats: feature {j} has '
-                        f'a non-finite {key!r} statistic')
-            if float(st['factor']) <= 0.0:
+                _stat_float(st, key, what=what, index=j)
+            if _stat_float(st, 'factor', what=what, index=j) <= 0.0:
                 raise ValueError(
-                    f'LeakageSafePreprocessor.from_stats: feature {j} has a '
-                    'non-positive scale factor')
+                    f'{what}.from_stats: feature {j} has a non-positive '
+                    'scale factor')
+            lo = _stat_float(st, 'clip_lo', what=what, index=j,
+                             allow_none=True)
+            hi = _stat_float(st, 'clip_hi', what=what, index=j,
+                             allow_none=True)
+            if (lo is None) != (hi is None):
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} has only one clip bound; '
+                    'both bounds must be present or both absent')
+            if lo is not None and lo > hi:
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} has clip_lo={lo} > '
+                    f'clip_hi={hi}')
+            for key in ('mean', 'std', 'median', 'min', 'max'):
+                if key in st:
+                    _stat_float(st, key, what=what, index=j,
+                                allow_none=True)
+        if 'scale' not in stats or 'missing' not in stats:
+            raise ValueError(
+                f'{what}.from_stats: stats must declare scale and missing')
+        try:
+            clip_quantiles = (tuple(stats['clip_quantiles'])
+                              if stats.get('clip_quantiles') else None)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'{what}.from_stats: malformed clip_quantiles') from None
         obj = cls(scale=stats['scale'], missing=stats['missing'],
-                  clip_quantiles=(tuple(stats['clip_quantiles'])
-                                  if stats.get('clip_quantiles') else None),
+                  clip_quantiles=clip_quantiles,
                   clip_z=stats.get('clip_z'), eps=stats.get('eps', _EPS))
         obj.feature_stats_ = [dict(s) for s in features]
         obj.n_features_in_ = int(n_features)
@@ -1627,13 +1674,43 @@ class LeakageSafeCategoricalEncoder:
         """Rebuild a fitted encoder from :meth:`get_stats` output."""
         features, n_features = _persisted_features(
             stats, what='LeakageSafeCategoricalEncoder')
+        what = 'LeakageSafeCategoricalEncoder'
+        if 'encoding' not in stats:
+            raise ValueError(f'{what}.from_stats: stats must declare encoding')
         obj = cls(encoding=stats['encoding'],
                   handle_unknown=stats.get('handle_unknown', 'unknown'))
-        obj.feature_stats_ = [dict(s, categories=list(s.get('categories') or []),
-                                   keys=list(s.get('keys') or []))
-                              for s in features]
+        rebuilt = []
+        for j, st in enumerate(features):
+            categories = st.get('categories')
+            categories = [] if categories is None else list(categories)
+            ncat = _check_count('n_categories', st.get('n_categories'))
+            if ncat != len(categories):
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} declares {ncat} '
+                    f'categories but carries {len(categories)}')
+            unknown = _check_count('unknown_index', st.get('unknown_index'))
+            missing = _check_count('missing_index', st.get('missing_index'))
+            if unknown != ncat or missing != ncat + 1:
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} has inconsistent '
+                    f'unknown/missing indices ({unknown}/{missing}) for '
+                    f'{ncat} categories')
+            keys = st.get('keys')
+            if keys is None:
+                keys = []
+            else:
+                keys = list(keys)
+            if keys:
+                if (len(keys) != ncat
+                        or not all(isinstance(k, str) for k in keys)
+                        or len(set(keys)) != len(keys)):
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} has a malformed or '
+                        'duplicate category-key table')
+            rebuilt.append(dict(st, categories=categories, keys=keys))
+        obj.feature_stats_ = rebuilt
         obj.n_features_in_ = int(n_features)
-        obj.n_train_ = int(stats.get('n_train', 0))
+        obj.n_train_ = _check_count('n_train', stats.get('n_train', 0))
         obj.train_fp_ = stats.get('train_fp')
         obj.fitted_ = True
         return obj
@@ -2195,21 +2272,53 @@ class LeakageSafeTargetEncoder:
         """Rebuild a fitted target encoder from :meth:`get_stats` output."""
         features, n_features = _persisted_features(
             stats, what='LeakageSafeTargetEncoder')
+        what = 'LeakageSafeTargetEncoder'
+        rebuilt = []
+        for j, st in enumerate(features):
+            lookup = st.get('lookup')
+            if not isinstance(lookup, dict):
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} has no lookup mapping')
+            clean_lookup = {}
+            for key, value in lookup.items():
+                if not isinstance(key, str):
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} has a non-string '
+                        'lookup key')
+                try:
+                    value = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} has a non-numeric '
+                        'lookup value') from None
+                if not math.isfinite(value):
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} has a non-finite '
+                        'lookup value')
+                clean_lookup[key] = value
+            if 'prior' not in st:
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} has no prior')
+            prior = _stat_float(st, 'prior', what=what, index=j)
+            n_rows = _check_count('n_reference_rows',
+                                  st.get('n_reference_rows', 0))
+            n_labels = _check_count('n_reference_labels',
+                                    st.get('n_reference_labels', 0))
+            if n_labels > n_rows:
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} has more reference '
+                    'labels than reference rows')
+            rebuilt.append({'lookup': clean_lookup, 'prior': prior,
+                            'n_reference_rows': n_rows,
+                            'n_reference_labels': n_labels})
         obj = cls(smoothing=stats.get('smoothing', 10.0),
                   n_folds=stats.get('n_folds', 5),
                   seed=stats.get('seed', 0))
-        obj.feature_stats_ = [
-            {
-                'lookup': dict(st.get('lookup') or {}),
-                'prior': float(st.get('prior', 0.0)),
-                'n_reference_rows': int(st.get('n_reference_rows', 0)),
-                'n_reference_labels': int(st.get('n_reference_labels', 0)),
-            }
-            for st in features
-        ]
+        obj.feature_stats_ = rebuilt
         obj.n_features_in_ = int(n_features)
-        obj.n_train_ = int(stats.get('n_train', 0))
-        obj.prior_ = float(stats.get('prior', 0.0))
+        obj.n_train_ = _check_count('n_train', stats.get('n_train', 0))
+        obj.prior_ = _stat_float(stats, 'prior',
+                                 what=what, index='top-level')
         obj.train_fp_ = stats.get('train_fp')
         obj.oof_policy_ = stats.get('oof_policy')
         obj.oof_fold_fp_ = stats.get('oof_fold_fp')
@@ -2379,18 +2488,61 @@ class LeakageSafeFrequencyEncoder:
         """Rebuild a fitted frequency encoder from :meth:`get_stats` output."""
         features, n_features = _persisted_features(
             stats, what='LeakageSafeFrequencyEncoder')
+        what = 'LeakageSafeFrequencyEncoder'
         obj = cls(normalize=stats.get('normalize', True),
                   handle_unknown=stats.get('handle_unknown', 'zero'))
-        obj.feature_stats_ = [
-            {
-                'entries': [dict(e) for e in st.get('entries') or []],
-                'n_observed': int(st.get('n_observed', 0)),
-                'n_missing': int(st.get('n_missing', 0)),
-            }
-            for st in features
-        ]
+        rebuilt = []
+        for j, st in enumerate(features):
+            entries = st.get('entries')
+            if not isinstance(entries, list):
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} has no entry table')
+            clean_entries = []
+            n_observed = 0
+            for pos, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} entry {pos} is not '
+                        'a mapping')
+                count = _check_count(f'entries[{pos}].count',
+                                     entry.get('count'))
+                if count == 0:
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} entry {pos} has a '
+                        'zero count')
+                key = entry.get('key')
+                if key is not None and not isinstance(key, str):
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} entry {pos} has a '
+                        'non-string key')
+                if 'value' not in entry and key is None:
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} entry {pos} has '
+                        'neither a value nor a key')
+                clean_entries.append(dict(entry, count=count))
+                n_observed += count
+            declared = _check_count('n_observed', st.get('n_observed'))
+            if declared != n_observed:
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} declares n_observed='
+                    f'{declared} but its entries sum to {n_observed}')
+            n_missing = _check_count('n_missing', st.get('n_missing', 0))
+            keys = [e.get('key') for e in clean_entries]
+            if any(k is not None for k in keys):
+                if not all(isinstance(k, str) for k in keys):
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} mixes keyed and '
+                        'unkeyed entries')
+                if len(set(keys)) != len(keys):
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} has duplicate '
+                        'entry keys')
+            rebuilt.append({'entries': clean_entries,
+                            'n_observed': n_observed,
+                            'n_missing': n_missing})
+        obj.feature_stats_ = rebuilt
         obj.n_features_in_ = int(n_features)
-        obj.n_train_ = int(stats.get('n_train', 0))
+        obj.n_train_ = _check_count('n_train', stats.get('n_train', 0))
         obj.train_fp_ = stats.get('train_fp')
         obj.fitted_ = True
         return obj

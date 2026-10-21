@@ -11749,6 +11749,76 @@ def t_split_and_prepare_refuses_ignored_options():
     assert raw['preprocessor'] is None
 
 
+def t_persisted_stats_reject_silently_degraded_transforms():
+    # A persisted artifact is untrusted input.  Malformed clip bounds used to
+    # disable clipping, inconsistent categorical indices could write the wrong
+    # one-hot slot, and non-finite target/count tables produced invalid
+    # features instead of refusing to load.
+    import json
+    import data_guard as DG
+    X = np.arange(12.0).reshape(4, 3)
+    base = json.loads(json.dumps(DG.LeakageSafePreprocessor().fit(X).get_stats()))
+    for mutate in (
+            lambda s: s['features'][0].update(clip_lo=1.0, clip_hi=0.0),
+            lambda s: s['features'][0].update(clip_lo=float('nan')),
+            lambda s: s['features'][0].update(clip_hi=None),
+            lambda s: s['features'][0].pop('clip_lo'),
+            lambda s: s.pop('scale')):
+        bad = json.loads(json.dumps(base))
+        mutate(bad)
+        try:
+            DG.LeakageSafePreprocessor.from_stats(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'malformed preprocessor stats accepted: {bad}')
+    Xc = np.asarray([['a'], ['b'], [None]], dtype=object)
+    y = np.asarray([1.0, 2.0, 3.0])
+    cat = json.loads(json.dumps(
+        DG.LeakageSafeCategoricalEncoder().fit(Xc).get_stats()))
+    for mutate in (
+            lambda s: s['features'][0].update(n_categories=99),
+            lambda s: s['features'][0].update(keys=['only-one']),
+            lambda s: s['features'][0].update(unknown_index=0)):
+        bad = json.loads(json.dumps(cat))
+        mutate(bad)
+        try:
+            DG.LeakageSafeCategoricalEncoder.from_stats(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'malformed categorical stats accepted: {bad}')
+    freq = json.loads(json.dumps(
+        DG.LeakageSafeFrequencyEncoder().fit(Xc).get_stats()))
+    for mutate in (
+            lambda s: s['features'][0].update(n_observed=99),
+            lambda s: s['features'][0]['entries'][0].update(count=-1),
+            lambda s: s['features'][0]['entries'][0].update(count=0)):
+        bad = json.loads(json.dumps(freq))
+        mutate(bad)
+        try:
+            DG.LeakageSafeFrequencyEncoder.from_stats(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'malformed frequency stats accepted: {bad}')
+    target = json.loads(json.dumps(
+        DG.LeakageSafeTargetEncoder().fit(Xc, y).get_stats()))
+    for mutate in (
+            lambda s: s['features'][0]['lookup'].update({'x': float('nan')}),
+            lambda s: s['features'][0].update(prior=float('inf')),
+            lambda s: s['features'][0].update(n_reference_labels=99,
+                                              n_reference_rows=1)):
+        bad = json.loads(json.dumps(target))
+        mutate(bad)
+        try:
+            DG.LeakageSafeTargetEncoder.from_stats(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'malformed target stats accepted: {bad}')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11985,6 +12055,7 @@ def main():
     _check('I31e persisted stats must match n_features_in', t_persisted_stats_validate_feature_count)
     _check('I31f temporal group identity is hash-consistent', t_temporal_group_identity_matches_python_equality)
     _check('I31g Python temporal row/category identity', t_python_temporal_row_and_category_identity)
+    _check('I31h persisted stats reject silently degraded transforms', t_persisted_stats_reject_silently_degraded_transforms)
     # Open-block reading rule: the substantive gates (causality, reference
     # pooling, masks, edge cases, closed regression) live in test_open_block.py
     # so they can also be run on their own.
