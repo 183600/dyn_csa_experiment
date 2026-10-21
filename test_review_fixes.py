@@ -11076,6 +11076,50 @@ def t_cached_validation_row_groups_merge_shared_documents():
         assert 'need' in str(e), e
     else:
         raise AssertionError('a short token-level document-id sidecar must be refused')
+    # A float sidecar must not be silently truncated into document groups:
+    # int(1.5) == 1 would merge two distinct documents.
+    _d3 = tempfile.mkdtemp(prefix='valgroups_float_')
+    _tag3 = f'v5_sl{_sl}_cap{_ntr}_v{_vb}_vs{_vs}'
+    _docs_float = np.array([1.0, 1.5, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0])
+    np.save(os.path.join(_d3, f'val_token_doc_ids_{_tag3}.npy'), _docs_float)
+    with open(os.path.join(_d3, f'meta_{_tag3}.json'), 'w', encoding='utf-8') as fh:
+        json.dump({'doc_ids': {'validation_token_count': int(_docs_float.size),
+                               'validation_token_fp': L._ids_fp(_docs_float)}}, fh)
+    try:
+        L.cached_validation_row_groups(_sl, _ntr, vocab_size=_vb, val_seqs=_vs,
+                                       n_rows=4, cache_dir=_d3)
+    except ValueError as e:
+        assert 'integers' in str(e), e
+    else:
+        raise AssertionError('a non-integer document-id sidecar must be refused')
+    # Negative ids are not document identities, even when their fingerprint
+    # matches the metadata.
+    _d4 = tempfile.mkdtemp(prefix='valgroups_negative_')
+    _docs_neg = np.array([1, 1, -2, -2, 3, 3, 3, 3], dtype=np.int64)
+    np.save(os.path.join(_d4, f'val_token_doc_ids_{_tag3}.npy'), _docs_neg)
+    with open(os.path.join(_d4, f'meta_{_tag3}.json'), 'w', encoding='utf-8') as fh:
+        json.dump({'doc_ids': {'validation_token_count': int(_docs_neg.size),
+                               'validation_token_fp': L._ids_fp(_docs_neg)}}, fh)
+    try:
+        L.cached_validation_row_groups(_sl, _ntr, vocab_size=_vb, val_seqs=_vs,
+                                       n_rows=4, cache_dir=_d4)
+    except ValueError as e:
+        assert 'negative' in str(e), e
+    else:
+        raise AssertionError('a negative document-id sidecar must be refused')
+    # A malformed meta shape (list instead of object) is fail-closed evidence,
+    # not an AttributeError from a list.get call.
+    _d5 = tempfile.mkdtemp(prefix='valgroups_meta_')
+    np.save(os.path.join(_d5, f'val_token_doc_ids_{_tag3}.npy'), _docs)
+    with open(os.path.join(_d5, f'meta_{_tag3}.json'), 'w', encoding='utf-8') as fh:
+        json.dump([], fh)
+    try:
+        L.cached_validation_row_groups(_sl, _ntr, vocab_size=_vb, val_seqs=_vs,
+                                       n_rows=4, cache_dir=_d5)
+    except ValueError as e:
+        assert 'JSON object' in str(e), e
+    else:
+        raise AssertionError('a non-object metadata file must be refused')
 
 
 def t_build_report_primary_estimand():

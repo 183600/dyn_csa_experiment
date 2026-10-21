@@ -12887,6 +12887,18 @@ def cached_validation_row_groups(seq_len, n_train_tokens, vocab_size=8192,
         raise ValueError(f'cached_validation_row_groups: cannot read {path} '
                          f'({type(e).__name__}: {e})') from None
     doc_ids = np.asarray(doc_ids).reshape(-1)
+    # Document ids are written as unsigned integers.  A float/object sidecar
+    # cannot faithfully represent them (int(1.5) silently becomes 1, merging
+    # two documents), and a negative signed id is not a document identity at
+    # all.  Refuse both instead of manufacturing a group table.
+    if doc_ids.dtype.kind not in 'iu':
+        raise ValueError(
+            'cached_validation_row_groups: token document-id sidecar must '
+            f'contain integers, got dtype {doc_ids.dtype}')
+    if doc_ids.dtype.kind == 'i' and doc_ids.size and int(doc_ids.min()) < 0:
+        raise ValueError(
+            'cached_validation_row_groups: token document-id sidecar contains '
+            'negative ids; document ids must be non-negative')
     need = int(_nr) * int(_sl)
     if doc_ids.size < need:
         raise ValueError(
@@ -12902,7 +12914,15 @@ def cached_validation_row_groups(seq_len, n_train_tokens, vocab_size=8192,
         except Exception as e:
             raise ValueError(f'cached_validation_row_groups: cannot parse {meta_path} '
                              f'({type(e).__name__}: {e})') from None
-        _mdoc = (_meta or {}).get('doc_ids') or {}
+        if not isinstance(_meta, dict):
+            raise ValueError(
+                f'cached_validation_row_groups: {meta_path} must contain a JSON '
+                f'object, got {type(_meta).__name__}')
+        _mdoc = _meta.get('doc_ids') or {}
+        if not isinstance(_mdoc, dict):
+            raise ValueError(
+                f'cached_validation_row_groups: {meta_path} doc_ids must be a '
+                f'JSON object, got {type(_mdoc).__name__}')
         _want_fp = _mdoc.get('validation_token_fp')
         if _want_fp is None:
             # A new sidecar without a token-level fingerprint cannot be bound
