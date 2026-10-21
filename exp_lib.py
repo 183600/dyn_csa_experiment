@@ -19809,6 +19809,24 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
             out['usable_anywhere'].append(comp)
         if row['measured_anywhere']:
             out['measured_anywhere'].append(comp)
+    # One project-level answer to the claim the ablation exists to support:
+    # "every proposed innovation is useful".  A component is not counted if
+    # any panel measured it only through a partial ablation, and a component
+    # that was never verified anywhere keeps the claim closed.
+    _needed = set(design) if isinstance(design, dict) else set()
+    _unverified = sorted(c for c in _needed if c not in out['verified_anywhere'])
+    _reasons = []
+    if not _needed:
+        _reasons.append('the design declares no components')
+    if _unverified:
+        _reasons.append('component(s) not verified by a complete ablation: '
+                        + ', '.join(_unverified))
+    if out['verified_only_incomplete']:
+        _reasons.append('verified only through an incomplete ablation: '
+                        + ', '.join(sorted(set(out['verified_only_incomplete']))))
+    out['all_components_useful_allowed'] = bool(_needed) and not _reasons
+    out['all_components_useful_reasons'] = _reasons
+    out['unverified_components'] = _unverified
     out['status'] = 'warn' if out['warnings'] else 'ok'
     if verbose:
         print('[ablation-coverage] complete in >=1 panel: %s; missing everywhere: %s'

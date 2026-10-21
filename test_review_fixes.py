@@ -2317,6 +2317,18 @@ def t_partial_ablation_cannot_verify_a_component():
     cov2 = L.ablation_coverage_across_panels({'p': complete}, design)
     assert cov2['verified_anywhere'] == ['A'], cov2
     assert cov2['verified_only_incomplete'] == [], cov2
+    # A project-level "every innovation is useful" claim is only open when a
+    # complete ablation verified every declared component.
+    assert cov2['all_components_useful_allowed'] is True, cov2
+    assert cov['all_components_useful_allowed'] is False, cov
+    assert cov['unverified_components'] == ['A'], cov
+    assert any('not verified' in r for r in cov['all_components_useful_reasons']), cov
+    incomplete_only = dict(complete, verified_components=['A'],
+                           ablation_completeness=partial['ablation_completeness'])
+    cov3 = L.ablation_coverage_across_panels({'p': incomplete_only}, design)
+    assert cov3['all_components_useful_allowed'] is False, cov3
+    assert any('incomplete ablation' in r
+               for r in cov3['all_components_useful_reasons']), cov3
 
 
 def t_seed_coverage_warning():
