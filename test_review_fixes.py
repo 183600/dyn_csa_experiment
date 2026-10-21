@@ -8490,6 +8490,16 @@ def t_target_encoder_prevents_self_and_group_leakage():
     ct2 = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2)
     c_oof2 = ct2.fit_transform(X, yct, groups=groups, time=np.arange(len(y)))
     assert np.allclose(c_oof2[groups < 2], c_oof[groups < 2]), (c_oof, c_oof2)
+    # Overlapping group time windows cannot be ordered into expanding folds
+    # without leaking a later timestamp from an earlier group; refuse them.
+    try:
+        L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit_transform(
+            X, y, groups=np.array([0, 0, 1, 1, 2, 2]),
+            time=np.array([0, 10, 5, 6, 20, 21]))
+    except ValueError as e:
+        assert 'overlapping group time windows' in str(e), e
+    else:
+        raise AssertionError('overlapping group time windows must be refused')
     bundle = L.prepare_target_features(X, y, hold, groups=groups,
                                        smoothing=0.0, n_folds=2)
     assert np.array_equal(bundle['train'], g_oof), bundle

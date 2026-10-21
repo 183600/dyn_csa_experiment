@@ -1453,13 +1453,18 @@ class LeakageSafeTargetEncoder:
         first = {}
         members = {}
         minkey = {}
+        maxkey = {}
         try:
             for i, key in enumerate(keys):
                 if key not in first:
                     first[key] = i
                     minkey[key] = time[i]
-                elif time[i] < minkey[key]:
-                    minkey[key] = time[i]
+                    maxkey[key] = time[i]
+                else:
+                    if time[i] < minkey[key]:
+                        minkey[key] = time[i]
+                    if time[i] > maxkey[key]:
+                        maxkey[key] = time[i]
                 members.setdefault(key, []).append(i)
         except (TypeError, ValueError, OverflowError):
             raise ValueError(
@@ -1493,8 +1498,35 @@ class LeakageSafeTargetEncoder:
             prev = int(j)
         bounds.append(len(order))
         folds = np.empty(n, dtype=np.int64)
+        prefix_max = None
         for k in range(self.n_folds):
-            for key in order[bounds[k]:bounds[k + 1]]:
+            group_slice = order[bounds[k]:bounds[k + 1]]
+            try:
+                fold_min = min(minkey[key] for key in group_slice)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    'time values are not mutually orderable; cannot order '
+                    'groups chronologically') from None
+            if prefix_max is not None:
+                try:
+                    leaked = bool(prefix_max >= fold_min)
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(
+                        'time values are not mutually orderable; cannot '
+                        'order groups chronologically') from None
+                if leaked:
+                    raise ValueError(
+                        'grouped chronological target-encoding folds have '
+                        'overlapping group time windows across a fold '
+                        f'boundary (earlier max {prefix_max!r} >= later min '
+                        f'{fold_min!r}); future/past labels would leak across '
+                        'the fold — merge/remove the overlapping groups or '
+                        'use fewer folds')
+            for key in group_slice:
+                if prefix_max is None:
+                    prefix_max = maxkey[key]
+                elif maxkey[key] > prefix_max:
+                    prefix_max = maxkey[key]
                 folds[members[key]] = k
         return folds
 
