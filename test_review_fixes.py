@@ -11151,6 +11151,16 @@ def t_object_temporal_category_identity():
     assert DG._target_key(np.datetime64('2020-01-01')) != \
         DG._target_key(np.datetime64('2020-01-01T00:00:00.000000001'))
     assert DG._target_key(np.timedelta64('NaT')) == '__missing__'
+    # Outside the int64-nanosecond range NumPy WRAPS instead of returning
+    # NaT, so a raw ns cast is not proof of identity.  The same instant in
+    # D/Y/2Y units must share one exact key (and a 2Y unit must not be
+    # multiplied a second time when it is converted to days).
+    _far = [np.datetime64('3000-01-01'), np.datetime64('3000', 'Y'),
+            np.datetime64('3000', '2Y')]
+    assert len({DG._target_key(v) for v in _far}) == 1, _far
+    assert len({DG._group_key(v) for v in _far}) == 1, _far
+    assert DG._target_key(np.datetime64('3000', '2Y')) != \
+        DG._target_key(np.datetime64('3002', '2Y'))
     # End-to-end: a timedelta category and the integer with the same raw count
     # are different levels and must not share one target mean.
     X = np.asarray([[ns], [1], [ns], [1]], dtype=object)

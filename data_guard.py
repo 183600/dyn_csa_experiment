@@ -4096,6 +4096,11 @@ def _temporal_attoseconds(v):
             raise ValueError('temporal value is outside the day range')
         raw = int(conv.view('i8'))
         factor = _TEMPORAL_AS_PER_UNIT['D']
+        # `conv` is already an absolute day count, so the original unit
+        # multiple (e.g. datetime64[2Y]) must NOT be applied again.  The old
+        # `raw * count` turned year 3000 in a 2Y dtype into year 6000 and made
+        # the same instant disagree by a factor of two.
+        count = 1
     else:
         raw = int(v.view('i8'))
         factor = _TEMPORAL_AS_PER_UNIT.get(unit)
@@ -4127,10 +4132,21 @@ def _temporal_key(v):
     except (TypeError, ValueError, OverflowError):
         canon = None
     if canon is not None and not np.isnat(canon):
+        # NumPy can wrap (not NaT) when casting a far-future/far-past value to
+        # nanoseconds.  Only accept the nanosecond form when casting back to
+        # the original dtype reproduces the same instant; otherwise use the
+        # exact attosecond fallback, so the same instant in D/Y/2Y spellings
+        # keeps one identity instead of silently becoming 1830.
         try:
-            return prefix + b'I' + str(int(canon.view('i8'))).encode('ascii')
+            _back = canon.astype(v.dtype)
+            _roundtrips = (not np.isnat(_back)) and bool(_back == v)
         except (TypeError, ValueError, OverflowError):
-            pass
+            _roundtrips = False
+        if _roundtrips:
+            try:
+                return prefix + b'I' + str(int(canon.view('i8'))).encode('ascii')
+            except (TypeError, ValueError, OverflowError):
+                pass
     try:
         # Outside the nanosecond range, scale the exact unit count to
         # attoseconds instead of keying the raw dtype/count: two units that
