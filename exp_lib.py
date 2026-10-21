@@ -13814,6 +13814,18 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             problems.append('nested simple-baseline n_eval_tokens does not match its held-out token count')
     elif data:
         nested_applied = False
+    # `best_ppl_estimation_rows` is the reader-facing statement of which
+    # sample the quoted floor describes.  It must agree with the nested
+    # evidence the artifact actually carries, not merely be a free-form label.
+    _reported_rows = artifact.get('best_ppl_estimation_rows')
+    if _reported_rows is not None and nested_applied is not None:
+        _want_rows = ('nested_validation_holdout' if nested_applied is True
+                      else 'full_validation')
+        if _reported_rows != _want_rows:
+            problems.append(
+                f'best_ppl_estimation_rows={_reported_rows!r} does not match the '
+                f'artifact\'s nested evidence ({_want_rows!r}); the quoted floor '
+                'describes a different sample than the one that was scored')
     best_name = None
     best_ppl_value = None
     if selected_values:

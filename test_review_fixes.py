@@ -12309,6 +12309,16 @@ def t_simple_floor_rejects_undeclared_arms_and_blank_fields():
         art, protocol=dict(proto, selection_split='test'))
     assert rsplit['baseline_verified'] is False and any(
         'differs from the declared' in p for p in rsplit['problems']), rsplit
+    # The reader-facing estimand label cannot describe a different sample
+    # from the nested rows the artifact actually scored.
+    wrong_rows = json.loads(json.dumps(art))
+    wrong_rows['best_ppl_estimation_rows'] = (
+        'full_validation'
+        if art['best_ppl_estimation_rows'] == 'nested_validation_holdout'
+        else 'nested_validation_holdout')
+    rwr = L.simple_baseline_audit(wrong_rows, protocol=proto)
+    assert rwr['baseline_verified'] is False and any(
+        'best_ppl_estimation_rows' in p for p in rwr['problems']), rwr
 
 
 def t_metric_audit_recommended_availability_and_exact_floor_support():
