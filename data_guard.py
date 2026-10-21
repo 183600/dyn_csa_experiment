@@ -1157,6 +1157,10 @@ def _stat_float(st, key, *, what, index, allow_none=False):
             return None
         raise ValueError(
             f'{what}.from_stats: feature {index} has a null {key!r} statistic')
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(
+            f'{what}.from_stats: feature {index} has a boolean {key!r} '
+            'statistic')
     try:
         value = float(value)
     except (TypeError, ValueError, OverflowError):

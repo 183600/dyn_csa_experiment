@@ -11794,6 +11794,7 @@ def t_persisted_stats_reject_silently_degraded_transforms():
             lambda s: s['features'][0].update(clip_lo=float('nan')),
             lambda s: s['features'][0].update(clip_hi=None),
             lambda s: s['features'][0].pop('clip_lo'),
+            lambda s: s['features'][0].update(clip_hi=True),
             lambda s: s.update(n_train=True),
             lambda s: s.pop('scale')):
         bad = json.loads(json.dumps(base))
