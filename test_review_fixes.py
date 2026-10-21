@@ -9406,6 +9406,10 @@ def t_exact_numeric_contracts_and_fingerprint():
         _same = np.array([[_ld1], [_ld1]], dtype=np.longdouble)
         assert DG.duplicate_mask(_same).tolist() == [False, True]
         assert DG._matrix_fingerprint(_same[:1]) == DG._matrix_fingerprint(_same[1:])
+        # A native longdouble table must fingerprint like its object twin:
+        # exact rows need no tail, inexact/non-finite rows get the same
+        # position-qualified key as every other path.
+        assert DG._matrix_fingerprint(_ld) == DG._matrix_fingerprint(_ld.astype(object))
     # Exact rationals (Decimal/Fraction) are not numbers.Real; they must not be
     # rounded through float64 into false duplicates or false uniqueness.
     from fractions import Fraction

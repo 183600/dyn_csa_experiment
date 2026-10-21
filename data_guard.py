@@ -3903,11 +3903,28 @@ def _matrix_fingerprint(X):
             block_f[block_f == 0.0] = 0.0
         h.update(np.ascontiguousarray(block_f).tobytes())
         if arr.dtype.kind == 'f' and arr.dtype.itemsize > 8:
-            # Distinct longdouble values can share one float64 image; append
-            # the exact per-row keys so the fingerprint cannot collide.
-            for key in _row_keys(block):
-                _tail.update(b'|')
-                _tail.update(key)
+            # Distinct longdouble values can share one float64 image; only
+            # the rows that survive the float64 round-trip exactly can omit
+            # the exact tail.  Appending a key for every row made a native
+            # longdouble table fingerprint differently from the same values
+            # in an object column (which only tails inexact rows), and the
+            # old tail also lacked the row position used by the other paths.
+            _ld_exact = (np.isfinite(block_f)
+                         & (block_f.astype(np.longdouble) == block))
+            _bad_rows = (~_ld_exact.all(axis=-1) if _ld_exact.ndim > 1
+                         else ~_ld_exact)
+            if np.any(_bad_rows):
+                _bad = block[_bad_rows]
+                if _bad.ndim == 1:
+                    _bad = _bad.reshape(-1, 1)
+                _bad_pos = np.nonzero(np.reshape(_bad_rows, -1))[0] + start
+                for pos, key in zip(
+                        _bad_pos.tolist(),
+                        _row_keys(np.asarray(_bad, dtype=object))):
+                    _tail.update(b'|R')
+                    _tail.update(str(int(pos)).encode('ascii'))
+                    _tail.update(b'|')
+                    _tail.update(key)
             continue
         if not _is_int:
             continue
