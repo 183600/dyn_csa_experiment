@@ -6863,20 +6863,44 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         # flag is not enough: recompute the intersections from the persisted
         # sidecars on every hit, exactly like the train/val cache does.
         import glob as _glob2
-        _mdoc = meta.get('doc_ids') or {}
+        _mdoc_raw = meta.get('doc_ids')
+        if _mdoc_raw is not None and not isinstance(_mdoc_raw, dict):
+            _problems.append(
+                'test cache doc_ids metadata is a '
+                f'{type(_mdoc_raw).__name__}, not an object; group isolation '
+                'cannot be verified')
+        _mdoc = _mdoc_raw if isinstance(_mdoc_raw, dict) else {}
         if _mdoc or test_doc_ids is not None:
             if test_doc_ids is None:
                 _problems.append('test cache metadata records document ids but the sidecar is missing')
             else:
-                if _mdoc and int(np.asarray(test_doc_ids).size) != int(_mdoc.get('test_count', -1)):
+                _declared_count = None
+                if _mdoc:
+                    try:
+                        _declared_count = int(_mdoc.get('test_count', -1))
+                    except (TypeError, ValueError, OverflowError):
+                        _problems.append(
+                            'test cache metadata has a non-integer test_count; '
+                            'the document-id sidecar cannot be verified')
+                if _declared_count is not None and int(np.asarray(test_doc_ids).size) != _declared_count:
                     _problems.append(
                         'test document-id sidecar count does not match the cache metadata')
                 if _mdoc.get('test_fp') and _mdoc['test_fp'] != _ids_fp(test_doc_ids):
                     _problems.append(
                         'test document-id sidecar does not match the fingerprint in the cache metadata')
-                if _mdoc and (_mdoc.get('disjoint') is not True
-                        or int(_mdoc.get('train_overlap', 0) or 0) != 0
-                        or int(_mdoc.get('validation_overlap', 0) or 0) != 0):
+                _overlap_bad = None
+                if _mdoc:
+                    try:
+                        _tr_ov = int(_mdoc.get('train_overlap', 0) or 0)
+                        _va_ov = int(_mdoc.get('validation_overlap', 0) or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        _problems.append(
+                            'test cache metadata has non-integer train/validation '
+                            'overlap counts; group isolation cannot be verified')
+                    else:
+                        _overlap_bad = (_mdoc.get('disjoint') is not True
+                                        or _tr_ov != 0 or _va_ov != 0)
+                if _overlap_bad:
                     _problems.append(
                         'test cache metadata does not attest document-disjoint '
                         'train/validation/test groups')
@@ -6919,7 +6943,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 _mt = json.load(open(_mp, encoding='utf-8'))
             except Exception:
                 continue
-            if _mt.get('fit_fp'):
+            if isinstance(_mt, dict) and _mt.get('fit_fp'):
                 _train_fit_fps.add(_mt['fit_fp'])
         if _train_fit_fps and meta.get('fit_fp') not in _train_fit_fps:
             raise RuntimeError(
