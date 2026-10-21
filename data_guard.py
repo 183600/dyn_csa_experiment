@@ -1318,7 +1318,12 @@ class LeakageSafePreprocessor:
                 f'missing must be a finite constant or one of '
                 f"'median'/'mean'/'zero', got {missing!r}")
         if isinstance(missing, (numbers.Real, np.integer, np.floating)):
-            missing = float(missing)
+            try:
+                missing = float(missing)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    f'missing must be a finite constant or one of '
+                    f"'median'/'mean'/'zero', got {missing!r}") from None
             if not math.isfinite(missing):
                 raise ValueError(
                     f'missing must be a finite constant or one of '
@@ -1330,14 +1335,22 @@ class LeakageSafePreprocessor:
             lo, hi = clip_quantiles
             if any(isinstance(v, (bool, np.bool_)) for v in (lo, hi)):
                 raise ValueError('clip_quantiles must be numeric, not booleans')
-            lo, hi = float(lo), float(hi)
+            try:
+                lo, hi = float(lo), float(hi)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    'clip_quantiles must be two finite numbers in [0, 1]') from None
             if not (0.0 <= lo < hi <= 1.0):
                 raise ValueError('clip_quantiles must satisfy 0 <= lo < hi <= 1')
             clip_quantiles = (lo, hi)
         if isinstance(clip_z, (bool, np.bool_)):
             raise ValueError('clip_z must be positive or None, not a boolean')
         if clip_z is not None:
-            clip_z = float(clip_z)
+            try:
+                clip_z = float(clip_z)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    'clip_z must be a finite positive number or None') from None
             if not (math.isfinite(clip_z) and clip_z > 0.0):
                 raise ValueError('clip_z must be a finite positive number or None')
             if scale == 'none':
@@ -1346,7 +1359,11 @@ class LeakageSafePreprocessor:
                     'has no standardized/minmax units to clip in')
         if isinstance(eps, (bool, np.bool_)):
             raise ValueError('eps must be a finite non-negative number, not a boolean')
-        eps = float(eps)
+        try:
+            eps = float(eps)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'eps must be a finite non-negative number, got {eps!r}') from None
         if not (math.isfinite(eps) and eps >= 0.0):
             raise ValueError(f'eps must be a finite non-negative number, got {eps!r}')
         self.scale = scale
@@ -1363,9 +1380,9 @@ class LeakageSafePreprocessor:
         if values.size == 0:
             return 0.0
         if self.missing == 'mean':
-            return float(np.mean(values))
+            return _safe_mean(values)
         if self.missing == 'median':
-            return float(np.median(values))
+            return _safe_median(values)
         return 0.0
 
     def fit(self, X, y=None):
