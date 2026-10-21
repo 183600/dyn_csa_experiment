@@ -18719,6 +18719,16 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
         'mlp_ratio': float(mlp_ratio),
         'dataset': cfg.get('dataset') or 'wikitext',
         'train_knobs': training_knobs(amp_dtype=amp_dtype, eager_batch=eager_batch),
+        'determinism': {
+            'level': determinism_label(),
+            'cudnn_deterministic': bool(torch.backends.cudnn.deterministic),
+            'cudnn_benchmark': bool(torch.backends.cudnn.benchmark),
+            'deterministic_algorithms': bool(torch.are_deterministic_algorithms_enabled()),
+            'tf32_matmul': (bool(torch.backends.cuda.matmul.allow_tf32) if torch.cuda.is_available() else None),
+            'cublas_workspace_config': os.environ.get('CUBLAS_WORKSPACE_CONFIG'),
+            'cpu_threads': int(torch.get_num_threads()),
+            'pythonhashseed': os.environ.get('PYTHONHASHSEED'),
+        },
     })
     _knobs = hp['train_knobs']
     hp['amp_dtype'] = _knobs.get('amp_dtype')
@@ -18830,6 +18840,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                     'variant': v,
                     'seed': int(seed),
                     'run_id': rec.get('run_id'),
+                    'run_cfg': rec.get('run_cfg'),
                     'started_at': rec.get('started_at'),
                     'finished_at': rec.get('finished_at'),
                     'ppl': rec.get('ppl'),
@@ -18875,6 +18886,8 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     # as a third independent seed while actually duplicating the second.
     _seed_mismatch = []
     _seed_ok = 0
+    _run_cfg_mismatch = []
+    _data_version_mismatch = []
     for _key, _c in cells.items():
         try:
             _expected = int(str(_key).rsplit('::seed', 1)[1])
@@ -18897,6 +18910,12 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
             _seed_ok += 1
         else:
             _seed_mismatch.append(_key)
+        if _c.get('run_cfg') not in (None, run_cfg):
+            _run_cfg_mismatch.append(_key)
+        _cell_dv = _c.get('data_version')
+        _hp_dv = _hp.get('data_version')
+        if _cell_dv is not None and _hp_dv is not None and str(_cell_dv) != str(_hp_dv):
+            _data_version_mismatch.append(_key)
     try:
         _declared_seeds = [int(x) for x in (cfg.get('seeds') or [])]
     except (TypeError, ValueError, OverflowError):
@@ -18937,8 +18956,11 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     _integrity['incomplete_cells'] = _incomplete_cells[:20]
     _integrity['missing_cells'] = _missing_cells[:20]
     _integrity['missing_curve_refs'] = _missing_curve_refs[:20]
+    _integrity['run_cfg_mismatch'] = _run_cfg_mismatch[:20]
+    _integrity['data_version_mismatch'] = _data_version_mismatch[:20]
     _integrity['complete'] = bool(not _incomplete_cells and not _missing_cells
-                                  and not _seed_mismatch and not _missing_curve_refs)
+                                  and not _seed_mismatch and not _missing_curve_refs
+                                  and not _run_cfg_mismatch and not _data_version_mismatch)
     _declared_status = status or 'complete'
     if _declared_status in ('running', 'failed', 'error'):
         _completion_status = _declared_status
@@ -18958,7 +18980,8 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                                if _integrity['complete'] else
                                'panel is not fully traced: see missing_cells / '
                                'incomplete_cells / missing_curve_refs / '
-                               'seed_metadata_mismatch'),
+                               'seed_metadata_mismatch / run_cfg_mismatch / '
+                               'data_version_mismatch'),
     }
     _evidence = {
         'small_batch_overfit': (bool(sanity.get('passed')) if isinstance(sanity, dict) else None),

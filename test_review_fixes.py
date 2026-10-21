@@ -2961,6 +2961,8 @@ def t_provenance_and_manifest():
     assert hp['seed'] == 3 and hp['data_seed'] == 3 and hp['train_knobs']['optimizer'] == 'AdamW'
     assert hp['rng']['python'] == hp['rng']['numpy'] == hp['rng']['torch'] == hp['rng']['cuda'] == 3, hp['rng']
     assert hp['rng']['data'] == 3 and hp['rng']['dataloader_generator'] == 3, hp['rng']
+    assert hp['determinism']['level'] == L.determinism_label(), hp['determinism']
+    assert hp['determinism']['cpu_threads'] == int(torch.get_num_threads()), hp['determinism']
     d = tempfile.mkdtemp()
     try:
         summary = {'full::seed0': {'ppl': 10.0, 'steps': 10, 'tokens_seen': 320, 'params': 100, 'train_time_s': 1.0, 'final_loss_smoothed': 2.3, 'rng_fp': 'abc', '_code': L.code_stamp(), 'losses': [3.0, 2.3], 'ppl_history': [[10, 10.0]]}}
@@ -10719,6 +10721,33 @@ def t_batch_contract_check_validation():
             raise AssertionError(f'batch_contract_check accepted {kw!r}')
 
 
+def t_manifest_rejects_mismatched_cell_identity():
+    d = tempfile.mkdtemp()
+    try:
+        tr = np.arange(512, dtype=np.int64) % 97
+        va = np.arange(64, dtype=np.int64).reshape(2, 32) % 97
+        cfg = {'seeds': [0], 'variants': ['full'], 'outdir': d,
+               'n_train_tokens': 512, 'seq_len': 32}
+        prov = L.experiment_provenance(cfg, train_ids=tr, val_batch=va, vocab=97)
+        hp = L.run_hyperparameters(cfg, seed=0, d=64, n_layers=2, n_heads=4,
+                                   d_head=16, vocab=97, mlp_ratio=4.0,
+                                   data_version=prov['data']['data_version'])
+        cell = {'variant': 'full', 'seed': 0, 'ppl': 10.0,
+                'code_stamp': L.code_stamp(), 'hyperparams': hp,
+                'data_version': 'DIFFERENT-DATA', 'rng_fp': 'r',
+                'run_cfg': 'DIFFERENT-CFG',
+                'curve_summary': {'n_points': 2}}
+        L.write_run_manifest(d, cfg, 'FP', prov, {},
+                             cell_records={'full::seed0': cell})
+        e = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))['panels']['FP']
+        integ = e['tracking_integrity']
+        assert integ['run_cfg_mismatch'] == ['full::seed0'], integ
+        assert integ['data_version_mismatch'] == ['full::seed0'], integ
+        assert integ['complete'] is False, integ
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10836,6 +10865,7 @@ def main():
     _check('E3c duplicate-run reproducibility check', t_reproducibility_check)
     _check('E4 provenance + run manifest', t_provenance_and_manifest)
     _check('E4a manifest requires referenced curve artifacts', t_manifest_missing_curve_ref_is_incomplete)
+    _check('E4b manifest rejects mismatched run_cfg/data_version', t_manifest_rejects_mismatched_cell_identity)
     _check('E4c runtime host/process identity', t_environment_snapshot_runtime_identity)
     _check('E4b panel tracking events', t_panel_tracking_events)
     _check('E5 DataLoader/worker seeding', t_dataloader_seeding_helpers)
