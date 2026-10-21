@@ -1313,6 +1313,22 @@ def _categorical_fingerprint(X):
     return h.hexdigest()[:16]
 
 
+def _category_lookup(st):
+    """Per-level lookup plus the key function that matches its stored keys.
+
+    New stats persist canonical string keys so a JSON round-trip cannot change
+    a tuple category into a different (list) identity.  Legacy stats without
+    keys keep the historical ``_hashable_label`` behaviour.
+    """
+    categories = list(st.get('categories') or [])
+    keys = st.get('keys')
+    if (isinstance(keys, list) and len(keys) == len(categories)
+            and all(isinstance(k, str) for k in keys)):
+        return ({k: i for i, k in enumerate(keys)}, _target_key)
+    return ({_hashable_label(c): i for i, c in enumerate(categories)},
+            _hashable_label)
+
+
 class LeakageSafeCategoricalEncoder:
     """Ordinal/one-hot encode categories learned from training rows only.
 
@@ -1343,6 +1359,11 @@ class LeakageSafeCategoricalEncoder:
             categories = _sorted_categories(Xarr[:, j].tolist())
             stats.append({
                 'categories': categories,
+                # Persist a JSON-safe identity per level.  A tuple category is
+                # serialized as a list by JSON, so rebuilding the lookup from
+                # the round-tripped value would silently turn a training level
+                # into an unseen one.
+                'keys': [_target_key(c) for c in categories],
                 'n_categories': int(len(categories)),
                 'unknown_index': int(len(categories)),
                 'missing_index': int(len(categories) + 1),
@@ -1371,13 +1392,12 @@ class LeakageSafeCategoricalEncoder:
         if self.encoding == 'ordinal':
             out = np.empty((n, self.n_features_in_), dtype=np.float64)
             for j, st in enumerate(self.feature_stats_):
-                lookup = {_hashable_label(c): i
-                          for i, c in enumerate(st['categories'])}
+                lookup, keyfn = _category_lookup(st)
                 for i, value in enumerate(Xarr[:, j].tolist()):
                     if _category_is_missing(value):
                         out[i, j] = st['missing_index']
                         continue
-                    code = lookup.get(_hashable_label(value))
+                    code = lookup.get(keyfn(value))
                     if code is None:
                         if self.handle_unknown == 'error':
                             raise ValueError(
@@ -1390,14 +1410,13 @@ class LeakageSafeCategoricalEncoder:
         out = np.zeros((n, width), dtype=np.float64)
         offset = 0
         for j, st in enumerate(self.feature_stats_):
-            lookup = {_hashable_label(c): i
-                      for i, c in enumerate(st['categories'])}
+            lookup, keyfn = _category_lookup(st)
             span = st['n_categories'] + 2
             for i, value in enumerate(Xarr[:, j].tolist()):
                 if _category_is_missing(value):
                     out[i, offset + st['missing_index']] = 1.0
                     continue
-                code = lookup.get(_hashable_label(value))
+                code = lookup.get(keyfn(value))
                 if code is None:
                     if self.handle_unknown == 'error':
                         raise ValueError(
@@ -1435,7 +1454,8 @@ class LeakageSafeCategoricalEncoder:
             'train_fp': self.train_fp_,
             # Copy the category lists too: a caller mutating the returned
             # snapshot must not change the fitted encoder (and vice versa).
-            'features': [dict(s, categories=list(s.get('categories') or []))
+            'features': [dict(s, categories=list(s.get('categories') or []),
+                              keys=list(s.get('keys') or []))
                          for s in self.feature_stats_],
         }
 
@@ -1444,7 +1464,8 @@ class LeakageSafeCategoricalEncoder:
         """Rebuild a fitted encoder from :meth:`get_stats` output."""
         obj = cls(encoding=stats['encoding'],
                   handle_unknown=stats.get('handle_unknown', 'unknown'))
-        obj.feature_stats_ = [dict(s, categories=list(s.get('categories') or []))
+        obj.feature_stats_ = [dict(s, categories=list(s.get('categories') or []),
+                                   keys=list(s.get('keys') or []))
                               for s in stats['features']]
         obj.n_features_in_ = int(stats['n_features_in'])
         obj.n_train_ = int(stats.get('n_train', 0))
@@ -2039,15 +2060,17 @@ class LeakageSafeFrequencyEncoder:
                     continue
                 key = _hashable_label(value)
                 if key in entries:
-                    entries[key][1] += 1
+                    entries[key]['count'] += 1
                 else:
-                    entries[key] = [value, 1]
+                    entries[key] = {'value': value, 'count': 1,
+                                    'key': _target_key(value)}
             ordered = sorted(entries.values(),
-                             key=lambda v: (type(v[0]).__name__, repr(v[0])))
-            n_observed = int(sum(v[1] for v in ordered))
+                             key=lambda e: (type(e['value']).__name__,
+                                            repr(e['value'])))
+            n_observed = int(sum(e['count'] for e in ordered))
             stats.append({
-                'entries': [{'value': v[0], 'count': int(v[1])}
-                            for v in ordered],
+                'entries': [{'value': e['value'], 'count': int(e['count']),
+                             'key': e['key']} for e in ordered],
                 'n_observed': n_observed,
                 'n_missing': int(n_missing),
             })
@@ -2074,8 +2097,14 @@ class LeakageSafeFrequencyEncoder:
         n = int(Xarr.shape[0])
         out = np.zeros((n, self.n_features_in_), dtype=np.float64)
         for j, st in enumerate(self.feature_stats_):
-            lookup = {_hashable_label(e['value']): int(e['count'])
-                      for e in st['entries']}
+            _entries = list(st.get('entries') or [])
+            if _entries and all(isinstance(e.get('key'), str) for e in _entries):
+                lookup = {e['key']: int(e['count']) for e in _entries}
+                keyfn = _target_key
+            else:
+                lookup = {_hashable_label(e['value']): int(e['count'])
+                          for e in _entries}
+                keyfn = _hashable_label
             denom = int(st['n_observed'])
             for i, value in enumerate(Xarr[:, j].tolist()):
                 if _category_is_missing(value):
@@ -2089,7 +2118,7 @@ class LeakageSafeFrequencyEncoder:
                             "handle_unknown='error'; the frequency table "
                             'was fitted on training rows only')
                     continue
-                count = lookup.get(_hashable_label(value))
+                count = lookup.get(keyfn(value))
                 if count is None:
                     if self.handle_unknown == 'error':
                         raise ValueError(

@@ -8979,6 +8979,16 @@ def t_categorical_encoder_train_only():
     assert np.array_equal(bundle['train'], x_train), bundle
     assert np.array_equal(bundle['val'], x_hold), bundle
     assert bundle['encoder'].get_stats() == stats, bundle
+    # A tuple level must survive JSON persistence: json turns it into a list,
+    # so the catalog stores a canonical key rather than rebuilding identity
+    # from the round-tripped value (which would make the level unseen).
+    _tc = np.array([[('a', 'b')], [('a,s:b',)], [('a', 'b')]], dtype=object)
+    _tc_h = np.array([[('a', 'b')], [('a,s:b',)]], dtype=object)
+    for _enc_kw in ({'encoding': 'ordinal'}, {'encoding': 'onehot'}):
+        _tce = L.LeakageSafeCategoricalEncoder(**_enc_kw).fit(_tc)
+        _tcr = L.LeakageSafeCategoricalEncoder.from_stats(
+            json.loads(json.dumps(_tce.get_stats())))
+        assert np.array_equal(_tcr.transform(_tc_h), _tce.transform(_tc_h)), _enc_kw
     onehot = L.LeakageSafeCategoricalEncoder(encoding='onehot').fit(train)
     oh_hold = onehot.transform(holdout)
     assert oh_hold.shape == (3, 4 + 3), oh_hold.shape
@@ -9031,6 +9041,14 @@ def t_frequency_encoder_train_only():
     assert raw.transform(train)[:, 0].tolist() == [2.0, 1.0, 2.0, 1.0]
     restored = L.LeakageSafeFrequencyEncoder.from_stats(stats)
     assert np.array_equal(restored.transform(holdout), xh)
+    # Tuple categories are JSON-serialized as lists; the persisted canonical
+    # key must keep them as the SAME learned level after a round-trip.
+    _tf = np.array([[('a', 'b')], [('a,s:b',)], [('a', 'b')]], dtype=object)
+    _tf_h = np.array([[('a', 'b')], [('a,s:b',)], ['z']], dtype=object)
+    _tfe = L.LeakageSafeFrequencyEncoder().fit(_tf)
+    _tfr = L.LeakageSafeFrequencyEncoder.from_stats(
+        json.loads(json.dumps(_tfe.get_stats())))
+    assert np.array_equal(_tfr.transform(_tf_h), _tfe.transform(_tf_h)), _tfe.get_stats()
     bundle = L.prepare_frequency_features(train, holdout)
     assert np.array_equal(bundle['train'], xtr), bundle
     assert np.array_equal(bundle['val'], xh), bundle
