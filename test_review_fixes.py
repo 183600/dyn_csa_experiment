@@ -4853,6 +4853,18 @@ def t_simple_baseline_ngram_and_audit():
     ru = L.simple_baseline_audit(bad_uniform, protocol=proto)
     assert ru['baseline_verified'] is False and any(
         'uniform-token floor' in x for x in (ru['problems'] + ru['warnings'])), ru
+    # A present-but-malformed floor field is unverifiable, not an absent
+    # legacy field: do not silently ignore a bool/string/non-finite value.
+    for _key, _val in (('uniform_ppl', True), ('uniform_ppl', '32'),
+                       ('uniform_ppl', float('nan')),
+                       ('best_ppl_vs_uniform', True),
+                       ('best_ppl_vs_uniform', '0.9'),
+                       ('best_ppl_vs_uniform', float('inf'))):
+        _bad_floor = json.loads(json.dumps(art))
+        _bad_floor[_key] = _val
+        _rbf = L.simple_baseline_audit(_bad_floor, protocol=proto)
+        assert _rbf['baseline_verified'] is False and any(
+            _key in x for x in _rbf['problems']), (_key, _val, _rbf)
     # A cell outside the declared search space is not equal-search under ANY
     # design (hand-designed grids included), and the declared per-arm order
     # must be the model that actually ran.

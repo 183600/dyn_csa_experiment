@@ -13652,8 +13652,21 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
     # tokens uniformly from the vocabulary.  If it is not, the tokenizer /
     # smoothing path is broken (or the reported floor is not the count model),
     # and calling it a baseline would understate every neural arm.
-    _uniform = _finite_scalar(artifact.get('uniform_ppl'))
+    _uniform_raw = artifact.get('uniform_ppl')
+    _uniform = _finite_scalar(_uniform_raw)
     _vocab_d = _exact_count(data.get('vocab_size'), minimum=1) if isinstance(data, dict) else None
+    if 'uniform_ppl' in artifact and _uniform is None:
+        problems.append(
+            f'uniform_ppl={_uniform_raw!r} is present but not a finite number; '
+            'the zero-information floor cannot be verified')
+    _reported_ratio = None
+    if 'best_ppl_vs_uniform' in artifact:
+        _ratio_raw = artifact.get('best_ppl_vs_uniform')
+        _reported_ratio = _finite_scalar(_ratio_raw)
+        if _reported_ratio is None:
+            problems.append(
+                f'best_ppl_vs_uniform={_ratio_raw!r} is present but not a finite '
+                'number; the reported floor ratio cannot be verified')
     if _uniform is not None:
         if _uniform <= 0:
             problems.append(f'uniform_ppl={_uniform!r} must be positive')
@@ -13672,7 +13685,6 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
                 f'uniform-token floor (PPL={_uniform:.4f}); the floor is no better '
                 'than zero-information (check smoothing/tokenization, or it is a '
                 'signal-free sample)')
-        _reported_ratio = _finite_scalar(artifact.get('best_ppl_vs_uniform'))
         if (_reported_ratio is not None and _best_f is not None
                 and _uniform > 0
                 and abs(_reported_ratio - _best_f / _uniform) > 1e-9):
