@@ -9436,6 +9436,22 @@ def t_clean_training_target_outliers():
         train_idx=[0, 1, 2, 3, 4, 5, 6], target_outlier_iqr=1.5)
     assert cats['n_target_outlier_rows_dropped'] == 0, cats
     assert cats['target_outlier_fence'] is None, cats
+    # A requested fence that cannot be estimated (categorical/multi-output
+    # target, or too few finite labels) must be visible, not look like a
+    # successful cleanup that found no outliers.
+    assert cats['target_outlier_fence_estimated'] is False, cats
+    assert cats['n_target_reference_labels'] == 0, cats
+    multi = L.clean_training_rows(
+        X, [(1, 2)] * 8, train_idx=[0, 1, 2, 3, 4, 5, 6],
+        target_outlier_iqr=1.5)
+    assert multi['target_outlier_fence_estimated'] is False, multi
+    numeric = L.clean_training_rows(
+        X, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1000.0],
+        train_idx=[0, 1, 2, 3, 4, 5, 6], target_outlier_iqr=1.5)
+    assert numeric['target_outlier_fence_estimated'] is True, numeric
+    assert numeric['n_target_reference_labels'] == 7, numeric
+    no_request = L.clean_training_rows(X, train_idx=[0, 1, 2])
+    assert no_request['target_outlier_fence_estimated'] is None, no_request
     # The one-call split helper forwards the option and keeps holdouts intact.
     out = L.split_and_prepare(
         X, y, train_frac=5 / 8, val_frac=1 / 8, test_frac=2 / 8,

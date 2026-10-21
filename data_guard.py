@@ -3026,6 +3026,7 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         drop |= _row_bad
     n_target_outlier_rows = 0
     target_outlier_fence = None
+    n_target_reference_labels = 0
     if target_outlier_iqr is not None:
         def _numeric_label(value):
             # Only scalar numeric labels define a regression target.  A
@@ -3046,6 +3047,7 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
                        for row in train_rows.tolist()]
         _ref = [v for pos, v in enumerate(_row_target)
                 if not drop[pos] and v is not None]
+        n_target_reference_labels = int(len(_ref))
         if len(_ref) >= 2:
             q1, q3 = np.quantile(_ref, (0.25, 0.75))
             iqr = float(q3 - q1)
@@ -3124,6 +3126,14 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         'target_outlier_iqr': (None if target_outlier_iqr is None
                                else float(target_outlier_iqr)),
         'target_outlier_fence': target_outlier_fence,
+        # Distinguish "no numeric labels were outside the fence" from "the
+        # requested fence could not be estimated at all" (categorical or
+        # multi-output target, or fewer than two finite scalar labels).  A
+        # caller must not report a label-noise cleanup that never ran.
+        'target_outlier_fence_estimated': (
+            None if target_outlier_iqr is None
+            else bool(target_outlier_fence is not None)),
+        'n_target_reference_labels': int(n_target_reference_labels),
         'drop_duplicates': bool(drop_duplicates),
         'label_conflicts': label_conflicts,
         'drop_invalid_labels': bool(drop_invalid_labels),
