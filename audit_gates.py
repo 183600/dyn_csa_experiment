@@ -1912,6 +1912,16 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
         out['note'] = 'no results_*/summary.json found — run the experiment phases first; the audit is zero-GPU over saved records'
     else:
         out['ablation_coverage'] = L.ablation_coverage_across_panels(_reports, design=design)
+        # Project-level claim gate: "each proposed innovation is useful" needs
+        # a complete ablation AND corrected verification for every component.
+        out['all_components_useful_allowed'] = bool(
+            out['ablation_coverage'].get('all_components_useful_allowed'))
+        out['all_components_useful_reasons'] = list(
+            out['ablation_coverage'].get('all_components_useful_reasons') or [])
+        out['unverified_components'] = list(
+            out['ablation_coverage'].get('unverified_components') or [])
+        out['verified_only_incomplete'] = list(
+            out['ablation_coverage'].get('verified_only_incomplete') or [])
         if out['ablation_coverage'].get('status') != 'ok':
             out['status'] = 'warn'
     print(json.dumps(out, ensure_ascii=False, indent=2))
