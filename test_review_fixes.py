@@ -9791,6 +9791,18 @@ def t_python_temporal_row_and_category_identity():
         train_idx=[0, 1], val_idx=[2, 3])
     assert shift['checks']['label_distribution_shift_vs_train']['val'][
         'js_divergence'] == 0.0, shift
+    # Metric label inference uses the same identity: NumPy may fail to merge a
+    # Python datetime with the equal np.datetime64, which previously left two
+    # declared classes and rejected the observed label as unknown.
+    _y = np.asarray([day, npday, datetime.date(2020, 1, 2),
+                     npday, day, datetime.date(2020, 1, 2)], dtype=object)
+    _m = L.classification_metrics(_y, y_pred=_y)
+    assert len(_m['labels']) == 2, _m['labels']
+    assert _m['accuracy'] == 1.0, _m
+    _same = L.classification_metrics(
+        np.asarray([utc, west], dtype=object),
+        y_pred=np.asarray([utc, west], dtype=object))
+    assert len(_same['labels']) == 1, _same['labels']
 
 
 def t_validation_row_split_group_aware():

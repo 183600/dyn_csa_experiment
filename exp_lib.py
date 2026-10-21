@@ -55,6 +55,7 @@ import numpy as np
 #   assert_no_split_leakage, LeakageSafePreprocessor (SafeScaler),
 #   prepare_features, data_quality_report, categorical_shift_report.
 from data_guard import (
+    _hashable_label,
     chronological_split, chronological_split_indices,
     grouped_chronological_split, grouped_chronological_split_indices,
     split_indices, split_and_prepare, train_val_test_split,
@@ -14042,22 +14043,26 @@ def _unique_label_values(values):
     The common homogeneous path is unchanged (``np.unique``).  Mixed object
     labels (e.g. ``1`` and ``'1'``) have no total NumPy order, but they are
     still distinct classes; the fallback keeps each identity once in a stable
-    type/repr order.
+    type/repr order.  NumPy also compares some temporal pairs inconsistently
+    (a Python datetime can equal an ``np.datetime64`` without NumPy's unique
+    collapsing them), so the canonical label identity is applied after
+    ``np.unique`` as well.
     """
-    arr = np.asarray(values)
+    arr = values if isinstance(values, np.ndarray) else _preserve_label_array(values)
     try:
-        return np.unique(arr)
+        uniq = np.unique(arr)
     except (TypeError, ValueError, OverflowError):
-        pass
+        uniq = None
+    if uniq is not None:
+        seen = {}
+        for value in uniq:
+            seen.setdefault(_hashable_label(value), value)
+        if len(seen) == int(uniq.size):
+            return uniq
+        return np.asarray(list(seen.values()), dtype=object)
     seen = {}
     for value in arr.reshape(-1).tolist():
-        try:
-            hash(value)
-        except TypeError:
-            key = ('__unhashable__', type(value).__name__, repr(value))
-        else:
-            key = value
-        seen.setdefault(key, value)
+        seen.setdefault(_hashable_label(value), value)
     try:
         ordered = sorted(seen.values(), key=lambda v: (type(v).__name__, repr(v)))
     except (TypeError, ValueError, OverflowError):
@@ -14469,11 +14474,9 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
     if labels.size == 0:
         raise ValueError('classification_metrics needs at least one label')
     def _label_identity(value):
-        try:
-            hash(value)
-        except TypeError:
-            return ('__unhashable__', type(value).__name__, repr(value))
-        return value
+        # Canonical identity so equal temporal spellings (Python date vs
+        # np.datetime64, aware datetimes of the same instant) are one class.
+        return _hashable_label(value)
     if len({_label_identity(v) for v in labels.tolist()}) != int(labels.size):
         raise ValueError(f'labels contains duplicate class identifiers: {labels.tolist()}')
     _label_names = _display_label_names(labels)
