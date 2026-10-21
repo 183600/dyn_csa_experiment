@@ -44,6 +44,7 @@ __all__ = [
     'LeakageSafeTargetEncoder',
     'SafeScaler',
     'assert_no_split_leakage',
+    'audit_preprocessor_fit',
     'categorical_shift_report',
     'chronological_split',
     'chronological_split_indices',
@@ -1968,6 +1969,139 @@ def prepare_features(X_train, X_val=None, X_test=None, **kwargs):
         out['val'] = prep.transform(X_val)
     if X_test is not None:
         out['test'] = prep.transform(X_test)
+    return out
+
+
+def _stats_match_float(a, b, *, atol, rtol):
+    if a is None or b is None:
+        return a is None and b is None
+    try:
+        fa, fb = float(a), float(b)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if math.isnan(fa) or math.isnan(fb):
+        return math.isnan(fa) and math.isnan(fb)
+    return math.isclose(fa, fb, rel_tol=rtol, abs_tol=atol)
+
+
+def audit_preprocessor_fit(preprocessor, X_train, X_holdout=None, *,
+                           atol=1e-10, rtol=1e-8):
+    """Prove that a fitted preprocessor learned its statistics on TRAIN only.
+
+    The classic preprocessing leak is fitting a scaler/imputer on the full
+    table and then calling ``transform`` on each split.  Index-disjoint splits
+    do not catch this: every column's mean/std/quantiles already contains
+    holdout rows.  Given the training rows (and optionally the holdout rows),
+    this audit recomputes the preprocessor's statistics from scratch:
+
+    * ``train_only_verified`` — the persisted stats and ``train_fp`` equal a
+      fresh fit on ``X_train``;
+    * ``leak_detected`` — they do NOT match train, but DO match a fit on
+      ``train + holdout`` (the holdout rows were used to fit it);
+    * ``unverifiable`` — neither matches (the object was fitted on another
+      table, was manually edited, or ``X_holdout`` was not supplied).
+
+    Only a verified status is evidence that a reported preprocessing step was
+    fit on the training split.  The audit never inspects holdout labels and
+    never changes the fitted object.
+    """
+    if not getattr(preprocessor, 'fitted_', False):
+        raise ValueError('audit_preprocessor_fit needs a fitted preprocessor')
+    try:
+        stats = preprocessor.get_stats()
+    except Exception as e:
+        raise ValueError(
+            f'audit_preprocessor_fit: preprocessor.get_stats() failed '
+            f'({type(e).__name__}: {e})') from None
+    if not isinstance(stats, dict) or not isinstance(stats.get('features'), list):
+        raise ValueError('audit_preprocessor_fit: malformed preprocessor stats')
+    if isinstance(atol, (bool, np.bool_)) or isinstance(rtol, (bool, np.bool_)):
+        raise ValueError('audit_preprocessor_fit: tolerances must be numbers')
+    try:
+        atol, rtol = float(atol), float(rtol)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('audit_preprocessor_fit: tolerances must be finite numbers') from None
+    if not (math.isfinite(atol) and atol >= 0.0 and math.isfinite(rtol) and rtol >= 0.0):
+        raise ValueError('audit_preprocessor_fit: tolerances must be finite and non-negative')
+    Xtr = _as_float_2d(X_train, name='X_train')
+    if Xtr.shape[0] == 0:
+        raise ValueError('audit_preprocessor_fit: X_train is empty')
+
+    def _ref_stats(rows):
+        ref = LeakageSafePreprocessor(
+            scale=stats.get('scale', 'standard'),
+            missing=stats.get('missing', 'median'),
+            clip_quantiles=(tuple(stats['clip_quantiles'])
+                            if stats.get('clip_quantiles') else None),
+            clip_z=stats.get('clip_z'),
+            eps=stats.get('eps', _EPS))
+        return ref.fit(rows).get_stats()
+
+    def _compare(ref):
+        if int(ref.get('n_features_in', -1)) != int(stats.get('n_features_in', -2)):
+            return False, list(range(max(len(stats.get('features') or []),
+                                         len(ref.get('features') or []))))
+        if str(ref.get('train_fp')) != str(stats.get('train_fp')):
+            return False, list(range(len(stats.get('features') or [])))
+        bad = []
+        for j, (got, want) in enumerate(zip(stats.get('features') or [],
+                                            ref.get('features') or [])):
+            keys = ('fill', 'clip_lo', 'clip_hi', 'center', 'factor',
+                    'mean', 'std', 'median', 'min', 'max')
+            if not all(_stats_match_float(got.get(k), want.get(k),
+                                          atol=atol, rtol=rtol) for k in keys):
+                bad.append(j)
+        return (not bad), bad
+
+    train_ref = _ref_stats(Xtr)
+    train_ok, train_bad = _compare(train_ref)
+    out = {
+        'status': 'unverifiable',
+        'leak_detected': False,
+        'stats_match_train': bool(train_ok),
+        'stats_match_train_plus_holdout': None,
+        'train_fp_match': (str(stats.get('train_fp')) == str(train_ref.get('train_fp'))),
+        'n_train': int(Xtr.shape[0]),
+        'n_features': int(Xtr.shape[1]),
+        'n_holdout': None,
+        'mismatched_features_on_train': train_bad,
+        'note': ('stats and train_fp equal a fresh train-only fit; the '
+                 'preprocessing step is verified to have used training rows only'
+                 if train_ok else
+                 'stats do not equal a fresh fit on this X_train; pass the '
+                 'holdout rows to distinguish a different training table from '
+                 'the classic train+holdout leak'),
+    }
+    if train_ok:
+        out['status'] = 'train_only_verified'
+        return out
+    if X_holdout is None:
+        return out
+    parts = X_holdout if isinstance(X_holdout, (list, tuple)) else [X_holdout]
+    parts = [_as_float_2d(part, name='X_holdout') for part in parts]
+    parts = [p for p in parts if p.shape[0] > 0]
+    if not parts:
+        return out
+    if any(p.shape[1] != Xtr.shape[1] for p in parts):
+        raise ValueError(
+            'audit_preprocessor_fit: holdout features do not match X_train')
+    Xh = np.vstack(parts)
+    full_ref = _ref_stats(np.vstack([Xtr, Xh]))
+    full_ok, full_bad = _compare(full_ref)
+    out.update({'n_holdout': int(Xh.shape[0]),
+                'stats_match_train_plus_holdout': bool(full_ok),
+                'mismatched_features_on_train_plus_holdout': full_bad})
+    if full_ok:
+        out['status'] = 'leak_detected'
+        out['leak_detected'] = True
+        out['note'] = ('the fitted statistics match a fit on train + holdout, '
+                       'not a train-only fit: holdout rows participated in '
+                       'imputation/clipping/scaling statistics; refit on train '
+                       'and transform the holdouts')
+    else:
+        out['note'] = ('the fitted statistics match neither a train-only nor a '
+                       'train+holdout fit on the supplied rows; the fitting '
+                       'table is not verifiable from these arrays')
     return out
 
 
