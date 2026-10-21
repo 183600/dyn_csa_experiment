@@ -21896,9 +21896,22 @@ def compare_token_errors(model_a, model_b, val_batch, vocab, device, *, tokenize
 
     ca = _matrix(model_a)
     cb = _matrix(model_b)
+    # A paired comparison must use the SAME token positions in both arms.
+    # Independent nanmeans silently compare different supports (e.g. arm B
+    # looks better because its hardest tokens evaluated to NaN and were
+    # dropped).  Report the common finite support and compute the headline
+    # means/delta on it.
+    fa = np.isfinite(ca)
+    fb = np.isfinite(cb)
+    paired = fa & fb
+    n_finite_a = int(fa.sum())
+    n_finite_b = int(fb.sum())
+    n_paired = int(paired.sum())
+    n_total = int(ca.size)
+    mean_a_paired = float(np.mean(ca[paired])) if n_paired else None
+    mean_b_paired = float(np.mean(cb[paired])) if n_paired else None
     diff = cb - ca
-    finite = np.isfinite(diff)
-    flat = np.where(finite, diff, -np.inf).reshape(-1)
+    flat = np.where(paired, diff, -np.inf).reshape(-1)
     k = min(max(1, int(top_n)), int(flat.size))
     idx = np.argpartition(flat, -k)[-k:]
     idx = idx[np.argsort(flat[idx])[::-1]]
@@ -21920,7 +21933,7 @@ def compare_token_errors(model_a, model_b, val_batch, vocab, device, *, tokenize
     out = []
     for i in idx:
         row, pos = int(i // span), int(i % span)
-        if not math.isfinite(float(diff[row, pos])):
+        if not (math.isfinite(float(ca[row, pos])) and math.isfinite(float(cb[row, pos]))):
             continue
         lo, hi = max(0, pos - 16), min(span, pos + 17)
         out.append({'row': row, 'position': pos,
@@ -21930,13 +21943,21 @@ def compare_token_errors(model_a, model_b, val_batch, vocab, device, *, tokenize
                     'target_text': _decode([int(vb[row, pos + 1])]),
                     'context_text': _decode([int(x) for x in vb[row, lo:hi + 1]])})
     return {'kind': 'paired_token_error_comparison', 'rows': n_rows, 'seq_len': seq,
-            'n_tokens': int(n_rows * span),
-            'mean_ce_a': float(np.nanmean(ca)), 'mean_ce_b': float(np.nanmean(cb)),
-            'mean_delta_b_minus_a': float(np.nanmean(diff)),
-            'n_nonfinite_a': int(np.sum(~np.isfinite(ca))),
-            'n_nonfinite_b': int(np.sum(~np.isfinite(cb))),
-            'b_worse_at_n': int(np.sum(np.isfinite(diff) & (diff > 0))),
-            'a_worse_at_n': int(np.sum(np.isfinite(diff) & (diff < 0))),
+            'n_tokens': n_total,
+            'n_finite_a': n_finite_a, 'n_finite_b': n_finite_b,
+            'n_paired_finite': n_paired,
+            'paired_finite_frac': (float(n_paired) / n_total if n_total else None),
+            # Headline means use the common finite support; the per-arm
+            # all-finite means are kept separately for coverage inspection.
+            'mean_ce_a': mean_a_paired, 'mean_ce_b': mean_b_paired,
+            'mean_ce_a_all_finite': (float(np.mean(ca[fa])) if n_finite_a else None),
+            'mean_ce_b_all_finite': (float(np.mean(cb[fb])) if n_finite_b else None),
+            'mean_delta_b_minus_a': ((mean_b_paired - mean_a_paired)
+                                     if n_paired else None),
+            'n_nonfinite_a': int(n_total - n_finite_a),
+            'n_nonfinite_b': int(n_total - n_finite_b),
+            'b_worse_at_n': int(np.sum(paired & (diff > 0))),
+            'a_worse_at_n': int(np.sum(paired & (diff < 0))),
             'worst_tokens_for_b': out}
 
 

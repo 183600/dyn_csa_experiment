@@ -440,6 +440,52 @@ def t_nan_diagnosis_path():
     assert any(c['check'] == 'record_integrity' for c in malformed['checks']), malformed
 
 
+def t_paired_errors_use_common_finite_support():
+    # Two arms can each have non-finite CE at DIFFERENT tokens.  Comparing
+    # their independent finite means would use different supports; the paired
+    # delta must be computed only where both are finite.
+    class _Fake:
+        def __init__(self, vocab, bad_input):
+            self.vocab = int(vocab)
+            self.bad_input = int(bad_input)
+            self.training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = bool(mode)
+            return self
+
+        def trunk(self, ids):
+            return ids.unsqueeze(-1)
+
+        def head(self, h):
+            import torch.nn.functional as _F
+            ids = h[..., 0]
+            lg = _F.one_hot(((ids + 1) % self.vocab).long(), self.vocab).float() * 8.0
+            lg = lg.clone()
+            lg[ids == self.bad_input] = float('inf')
+            return lg
+
+    vb = np.array([[1, 2, 3, 4, 5], [5, 4, 2, 3, 1]], dtype=np.int64)
+    a = _Fake(16, bad_input=2)
+    b = _Fake(16, bad_input=3)
+    r = L.compare_token_errors(a, b, vb, 16, torch.device('cpu'), top_n=20)
+    assert r['n_tokens'] == 8, r
+    assert r['n_nonfinite_a'] > 0 and r['n_nonfinite_b'] > 0, r
+    assert r['n_paired_finite'] < r['n_tokens'], r
+    assert r['n_paired_finite'] == 4, r
+    assert abs(r['mean_delta_b_minus_a']
+               - (r['mean_ce_b'] - r['mean_ce_a'])) < 1e-12, r
+    assert r['mean_ce_a'] != r['mean_ce_a_all_finite'], r
+    assert r['mean_ce_b'] != r['mean_ce_b_all_finite'], r
+    for t in r['worst_tokens_for_b']:
+        assert math.isfinite(t['ce_a']) and math.isfinite(t['ce_b']), t
+    assert r['b_worse_at_n'] + r['a_worse_at_n'] <= r['n_paired_finite'], r
+
+
 def t_token_error_cause_taxonomy():
     # The bad-case file must say why a token is hard, not only how large its CE
     # is.  These are deliberately heuristic labels with a manual-review caveat.
