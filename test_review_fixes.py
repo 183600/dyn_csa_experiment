@@ -4231,6 +4231,21 @@ def t_retrieval_metrics_and_niah_trivial_floor():
     assert _mes['status'] == 'warn', _mes
     assert any('answer-support-sum-mismatch' in str(c.get('invalid'))
                for c in _mes['checks']), _mes
+    # A malformed POLICY (not just a malformed record) must fail closed
+    # instead of crashing on .get/.items of a scalar entry.
+    for _bad_policy in ([], {'x': None}, {'x': 1}):
+        _mpol = L.metric_policy_audit(good, policy=_bad_policy)
+        assert _mpol['status'] == 'warn', (_bad_policy, _mpol)
+    # A malformed threshold in an otherwise valid policy entry is reported but
+    # does not abort the record audit.
+    _bad_thr_policy = json.loads(json.dumps(L.METRIC_POLICY))
+    _bad_thr_policy['binary_classification']['extreme_imbalance_threshold'] = 'bad'
+    _mth = L.metric_policy_audit({'r': {'variant': 'r',
+                                        'task': 'binary_classification',
+                                        'prevalence': 1e-4,
+                                        'recommended_primary_metric': 'f1'}},
+                                 policy=_bad_thr_policy)
+    assert _mth['status'] == 'warn', _mth
     # Forged accuracy / majority floor / macro recall are rejected.
     for key, val in (('acc', 0.9), ('majority_accuracy', 0.1),
                      ('balanced_accuracy', 0.99), ('chance_accuracy', 0.01)):

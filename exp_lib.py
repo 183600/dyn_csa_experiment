@@ -15489,7 +15489,23 @@ def metric_policy_audit(summary=None, policy=None):
     positives)."""
     policy = METRIC_POLICY if policy is None else policy
     out = {'status': 'ok', 'policies': {}, 'checks': [], 'warnings': []}
+    if not isinstance(policy, dict):
+        # A policy is a declared mapping.  Iterating a scalar/list would crash
+        # .items() instead of reporting that the contract is unusable.
+        out['warnings'].append(
+            f'metric policy is a {type(policy).__name__}, not an object; '
+            'the metric contract cannot be audited')
+        policy = {}
     for name, p in policy.items():
+        if not isinstance(p, dict):
+            # One malformed entry must not abort the audit of the rest.
+            out['policies'][str(name)] = {
+                'primary': None, 'primary_average': None, 'direction': None,
+                'aggregation': None, 'imbalance': None, 'complete': False,
+                'invalid': f'policy entry is {type(p).__name__}, not an object'}
+            out['warnings'].append(
+                f'metric policy `{name}` is a {type(p).__name__}, not an object')
+            continue
         missing = [k for k in ('task', 'primary', 'direction', 'aggregation', 'imbalance') if not p.get(k)]
         primary = str(p.get('primary') or '')
         if primary.startswith('f1') and not p.get('primary_average'):
@@ -16285,7 +16301,17 @@ def metric_policy_audit(summary=None, policy=None):
                         f'{_label}: recommended_primary_metric={_rec_metric!r} is not '
                         f'defined for task {task!r} (allowed {sorted(_rec_allowed)})')
                 if prevalence is not None:
-                    _thr_rec = float(_pol_rec.get('extreme_imbalance_threshold', 1e-3))
+                    # A malformed policy threshold is a contract fault, not a
+                    # reason to abort the whole record audit; fall back to the
+                    # documented default and surface the invalidity.
+                    _thr_rec = _finite_scalar(
+                        _pol_rec.get('extreme_imbalance_threshold', 1e-3))
+                    if _thr_rec is None:
+                        out['warnings'].append(
+                            f'metric policy {task!r} has a non-finite '
+                            'extreme_imbalance_threshold; using the documented '
+                            '1e-3 default')
+                        _thr_rec = 1e-3
                     _conditional = _pol_rec.get('primary_when_extreme_imbalance')
                     if prevalence < _thr_rec and _conditional:
                         _want_rec = _conditional
