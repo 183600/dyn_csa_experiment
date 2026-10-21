@@ -344,13 +344,24 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     return 0
 
 
+def _unsafe_member_name(name):
+    """True when a tar member name could escape the extraction directory."""
+    if not isinstance(name, str) or not name or '\\' in name:
+        return True
+    if name.startswith('/'):
+        return True
+    parts = name.split('/')
+    return any(part in ('', '.', '..') for part in parts)
+
+
 def cmd_verify(tar_path):
     if not os.path.exists(tar_path):
         print(f'[archive] REFUSE: {tar_path} not found')
         return 1
     side = tar_path + '.sha256'
     if os.path.exists(side):
-        _side_fields = open(side, encoding='utf-8').read().split()
+        with open(side, encoding='utf-8') as _sf:
+            _side_fields = _sf.read().split()
         if not _side_fields:
             print('[archive] NOTE: the .sha256 sidecar is empty; falling back to the manifest hashes inside the archive')
         else:
@@ -361,6 +372,14 @@ def cmd_verify(tar_path):
                 return 1
     with tarfile.open(tar_path, 'r:gz') as tf:
         names = tf.getnames()
+        if len(names) != len(set(names)):
+            print('[archive] REFUSE: the archive contains duplicate member names')
+            return 1
+        _bad_names = [n for n in names if _unsafe_member_name(n)]
+        if _bad_names:
+            print('[archive] REFUSE: unsafe member name(s) would escape the '
+                  f'extraction directory: {_bad_names[:5]}')
+            return 1
         man_name = next((n for n in names if n.endswith('.MANIFEST.sha256')), None)
         if man_name is None:
             print('[archive] REFUSE: no MANIFEST inside the archive')
@@ -369,7 +388,19 @@ def cmd_verify(tar_path):
         if not _man_member.isfile():
             print('[archive] REFUSE: the MANIFEST member is not a regular file')
             return 1
-        man = json.load(tf.extractfile(man_name))
+        try:
+            man = json.load(tf.extractfile(man_name))
+        except (TypeError, ValueError, UnicodeDecodeError) as e:
+            print(f'[archive] REFUSE: the MANIFEST is not valid JSON ({type(e).__name__}: {e})')
+            return 1
+        if not isinstance(man, dict) or not isinstance(man.get('files'), dict):
+            print('[archive] REFUSE: the MANIFEST has no files mapping')
+            return 1
+        _bad_manifest_names = [n for n in man['files'] if _unsafe_member_name(n)]
+        if _bad_manifest_names:
+            print('[archive] REFUSE: unsafe manifest path(s): '
+                  f'{_bad_manifest_names[:5]}')
+            return 1
         bad = []
         for member in tf.getmembers():
             if member.name == man_name:

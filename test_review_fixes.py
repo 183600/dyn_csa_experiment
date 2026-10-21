@@ -10993,6 +10993,30 @@ def t_archive_refuses_links_and_repo_escape():
             mt.size = len(man_bytes)
             tf.addfile(mt, io.BytesIO(man_bytes))
         assert AR.cmd_verify(path2) == 0
+        # verify() must also refuse an archive whose member (or manifest path)
+        # would escape the extraction directory, even if every hash matches.
+        evil = os.path.join(d, 'release_z.tar.gz')
+        evil_man = {'tag': 'z', 'files': {'../evil.txt': {
+            'sha256': __import__('hashlib').sha256(payload).hexdigest(),
+            'bytes': len(payload)}}}
+        evil_bytes = json.dumps(evil_man).encode('utf-8')
+        with tarfile.open(evil, 'w:gz') as tf:
+            ti = tarfile.TarInfo('../evil.txt')
+            ti.size = len(payload)
+            tf.addfile(ti, io.BytesIO(payload))
+            mt = tarfile.TarInfo('release_z.MANIFEST.sha256')
+            mt.size = len(evil_bytes)
+            tf.addfile(mt, io.BytesIO(evil_bytes))
+        assert AR.cmd_verify(evil) == 1
+        # A manifest that is not a files mapping is refused instead of
+        # crashing the verifier with a KeyError.
+        broken = os.path.join(d, 'release_broken.tar.gz')
+        broken_bytes = b'[]'
+        with tarfile.open(broken, 'w:gz') as tf:
+            mt = tarfile.TarInfo('release_broken.MANIFEST.sha256')
+            mt.size = len(broken_bytes)
+            tf.addfile(mt, io.BytesIO(broken_bytes))
+        assert AR.cmd_verify(broken) == 1
 
 
 
