@@ -7808,6 +7808,34 @@ def t_scale_ladder_budget_and_transfer_audit():
         assert any('lr=' in p for p in _o['problems']), _o
     out7 = L.scale_ladder_audit([va, tier('S2', 2000, 2000) | {'vocab': 32768}])
     assert out7['corpus_binding'].get('vocab') == 'shared', out7
+    # The optimizer/schedule/augmentation descriptor must be shared across
+    # tiers.  A mismatch is a hard fail; missing/partial is unverifiable.
+    kn = L.training_knobs()
+    ka = tier('S1', 1000, 1000); ka['cfg']['train_knobs'] = kn
+    kb = tier('S2', 2000, 2000); kb['cfg']['train_knobs'] = kn
+    okn = L.scale_ladder_audit([ka, kb])
+    assert okn['train_knobs_binding'] == 'shared', okn
+    badk = tier('S2', 2000, 2000)
+    badk['cfg']['train_knobs'] = dict(kn, grad_clip_norm=2.0)
+    obk = L.scale_ladder_audit([ka, badk])
+    assert obk['status'] == 'fail', obk
+    assert any('training knobs differ' in p for p in obk['problems']), obk
+    opk = L.scale_ladder_audit([ka, b])
+    assert opk['train_knobs_binding'] == 'partial', opk
+    assert any('train_knobs descriptor' in w for w in opk['warnings']), opk
+    onk = L.scale_ladder_audit([tier('S1', 1000, 1000), tier('S2', 2000, 2000)])
+    assert onk['train_knobs_binding'] == 'unverifiable', onk
+    assert any('train_knobs descriptor' in w for w in onk['warnings']), onk
+    badtype = tier('S1', 1000, 1000); badtype['cfg']['train_knobs'] = 'adamw'
+    obt = L.scale_ladder_audit([badtype, kb])
+    assert obt['status'] == 'fail', obt
+    assert any('train_knobs is not an object' in p for p in obt['problems']), obt
+    # A non-constant LR is a declared transfer choice, never a matched
+    # optimizer control: it must produce a confound warning, not silence.
+    lrv = tier('S2', 2000, 2000, lr=1e-3)
+    olr = L.scale_ladder_audit([tier('S1', 1000, 1000), lrv])
+    assert olr['lr_constant'] is False and olr['lr_values'] == [0.0003, 0.001], olr
+    assert any('learning rate DIFFERS' in w for w in olr['warnings']), olr
     # Seed identities are the basis of a cross-tier paired contrast.  A plan
     # with duplicate/negative seeds is malformed, and differing seed sets must
     # be disclosed instead of treating each tier's extra seeds as replication.

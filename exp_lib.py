@@ -11664,6 +11664,18 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             lr = _finite_scalar(cfg.get('lr'))
             _warm_raw = cfg.get('warmup')
             warmup = _as_int(_warm_raw if _warm_raw is not None else 0, 'warmup')
+            # Optimizer identity / betas / eps / clipping / schedule shape /
+            # augmentation / precision are NOT captured by lr+warmup.  A scale
+            # ladder must either prove they are shared or disclose that the
+            # cross-scale effect is confounded with an optimizer change.
+            _kn_raw = cfg.get('train_knobs') if 'train_knobs' in cfg else tier.get('train_knobs')
+            train_knobs = None
+            if _kn_raw is not None:
+                if not isinstance(_kn_raw, dict):
+                    problems.append(f'{name}: train_knobs is not an object '
+                                    f'({type(_kn_raw).__name__})')
+                else:
+                    train_knobs = _canon_setting(_kn_raw)
             _seeds_raw = cfg.get('seeds')
             if _seeds_raw is None:
                 _seed_iter = []
@@ -11720,6 +11732,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             'warmup_fraction': (warmup / steps if steps else None),
             'n_seeds': len(_seed_set),
             'seeds': sorted(_seed_set),
+            'train_knobs': train_knobs,
             'p_floor': signflip_p_floor(len(_seed_set)),
             'min_seeds_for_family_significance': (signflip_min_n_for_holm(family_m, 0.05)
                                                   if family_m is not None else None),
@@ -11747,6 +11760,43 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                 'learning rate is held constant across widths without a validated '
                 'transfer rule (policy=%r); scale contrasts carry an optimisation-'
                 'transfer confound, not a matched optimizer control' % _transfer)
+        elif lr_constant is False:
+            # Non-constant LR is legitimate only as a DECLARED per-tier
+            # transfer; it is never an optimizer-matched control, so it must
+            # stay visible regardless of the policy label.
+            warnings.append(
+                'learning rate DIFFERS across tiers (%s; policy=%r) — the '
+                'cross-scale contrast is confounded with an LR-transfer effect, '
+                'not a matched optimizer control'
+                % (sorted(lrs), policy.get('lr_transfer')))
+        # Optimizer / betas / eps / clipping / schedule shape / augmentation /
+        # precision: compare the per-tier descriptor when declared.  A
+        # mismatch invalidates the "same optimizer" premise; a partial or
+        # absent descriptor is unverifiable and never a silent pass.
+        _kn_rows = [r for r in rows if r.get('train_knobs') is not None]
+        if not _kn_rows:
+            train_knobs_binding = 'unverifiable'
+            warnings.append(
+                'no tier carries a train_knobs descriptor: optimizer / betas / '
+                'eps / grad-clip / schedule shape / augmentation / precision '
+                'cannot be shown equal across the ladder')
+        elif len(_kn_rows) != len(rows):
+            train_knobs_binding = 'partial'
+            warnings.append(
+                'only %d/%d tiers carry a train_knobs descriptor; the shared '
+                'optimizer/augmentation recipe is unverifiable for the rest'
+                % (len(_kn_rows), len(rows)))
+        else:
+            _kn_vals = {r['train_knobs'] for r in _kn_rows}
+            if len(_kn_vals) > 1:
+                train_knobs_binding = 'mixed'
+                problems.append(
+                    'training knobs differ across tiers (optimizer / betas / '
+                    'eps / grad-clip / schedule shape / augmentation / '
+                    'precision) — the cross-scale effect is confounded with a '
+                    'different training recipe')
+            else:
+                train_knobs_binding = 'shared'
         warm = [r['warmup_fraction'] for r in rows if r.get('warmup_fraction') is not None]
         warm_ratio = (max(warm) / min(warm)) if len(warm) == len(rows) and min(warm) > 0 else None
         if warm_ratio is not None and warm_ratio > 2.0:
@@ -11863,7 +11913,9 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                'tokens_per_param_ratio': tpp_ratio,
                'tokens_per_param_tolerance': tol,
                'lr_constant': (lr_constant if len(rows) >= 2 else None),
+               'lr_values': sorted(lrs) if len(rows) >= 2 else None,
                'lr_transfer_policy': policy.get('lr_transfer'),
+               'train_knobs_binding': train_knobs_binding,
                'corpus_binding': binding,
                'tiers': rows, 'policy': policy,
                'problems': problems, 'warnings': warnings}
