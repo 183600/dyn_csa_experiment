@@ -15516,6 +15516,14 @@ def metric_policy_audit(summary=None, policy=None):
     positives)."""
     policy = METRIC_POLICY if policy is None else policy
     out = {'status': 'ok', 'policies': {}, 'checks': [], 'warnings': []}
+    if summary is not None and not isinstance(summary, dict):
+        # A panel summary is a mapping of record ids; a scalar/list cannot be
+        # audited record-by-record.  Keep the policy contract audit and warn
+        # instead of crashing on `.values()`.
+        out['warnings'].append(
+            f'summary is a {type(summary).__name__}, not an object; '
+            'the record-level metric contract cannot be audited')
+        summary = None
     if not isinstance(policy, dict):
         # A policy is a declared mapping.  Iterating a scalar/list would crash
         # .items() instead of reporting that the contract is unusable.

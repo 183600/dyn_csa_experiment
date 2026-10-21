@@ -4300,6 +4300,11 @@ def t_retrieval_metrics_and_niah_trivial_floor():
     for _bad_policy in ([], {'x': None}, {'x': 1}):
         _mpol = L.metric_policy_audit(good, policy=_bad_policy)
         assert _mpol['status'] == 'warn', (_bad_policy, _mpol)
+    # A malformed SUMMARY is not a mapping of records either: warn, do not
+    # abort on `.values()`.
+    for _bad_summary in (1, True, 'x', [None], [1]):
+        _msum = L.metric_policy_audit(_bad_summary)
+        assert _msum['status'] == 'warn' and _msum['warnings'], (_bad_summary, _msum)
     # A malformed threshold in an otherwise valid policy entry is reported but
     # does not abort the record audit.
     _bad_thr_policy = json.loads(json.dumps(L.METRIC_POLICY))
