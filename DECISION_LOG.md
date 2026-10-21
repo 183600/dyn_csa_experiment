@@ -518,3 +518,27 @@ value).
 differing exact totals are a capacity confound; missing/non-unique totals are
 unverifiable, not a silent pass. Tests cover every new gate. The temporary
 issue list was removed after the fixes.
+
+## 2026-10-21 — comparison controls, attrition-aware claims, scale seed floor (no new runs)
+
+Changed only zero-GPU analysis/audit/driver config paths; no panel result, frozen
+manifest, test split, README or CI configuration was touched. (1) `build_report`
+now exposes `n_dropped` and leave-one-seed-out sign stability in
+`exact_signflip`, and `_sig_gate` refuses "significant" when a paired seed was
+dropped by the controlled-comparison gate or when dropping one seed flips the
+mean sign. The paired row and P0W warmup paths pass their planned pair count, so
+a complete-case subset can no longer be quoted as a complete panel. (2) The
+tuned-vs-tuned gate (`baseline_tune._relaxed_pair_reason`) still allows per-arm
+lr/weight_decay/warmup, but now requires every other structured hyperparameter
+(seq_len, batch/eval subset, model shape, vocab, precision, ...) to agree; a
+one-sided descriptor is unverifiable. The tuned significance flag also requires
+a complete, non-seed-driven panel at n>=3. (3) `scale_ladder_audit` now compares
+the declared optimizer/betas/eps/clip/schedule-shape/augmentation/precision
+descriptor across tiers (mismatch = fail, missing/partial = warning) and warns
+whenever LR varies across tiers instead of silently accepting an LR-transfer
+confound. (4) v10 Holm correction keeps unmeasured declared contrasts as dummy
+p=1 slots instead of shrinking the family. (5) `reportable_claim` refuses
+significance when `n_skipped_config_mismatch`/`n_skipped` seeds were excluded by
+the control gate. (6) Prospective seed plans for the top-k sweep, length
+extrapolation and all cross-size scale phases were raised from 2 to 3 seeds.
+The temporary issue list was removed after the fixes.
