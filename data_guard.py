@@ -31,6 +31,7 @@ distribution shift.
 from __future__ import annotations
 
 import datetime as _datetime
+import decimal as _decimal
 import hashlib
 import json
 import math
@@ -1955,9 +1956,30 @@ class LeakageSafeTargetEncoder:
         for i, value in enumerate(arr.tolist()):
             if value is None or isinstance(value, (bool, np.bool_)):
                 continue
+            if isinstance(value, (np.datetime64, np.timedelta64)):
+                # NaT is a missing label, exactly like None/NaN.  Without this
+                # branch datetime64 NaT fell through to the type check and
+                # aborted the fit, while timedelta64 NaT happened to be
+                # skipped as a non-finite float: two spellings of the same
+                # missing target had different outcomes.  A real datetime is
+                # still not a regression target; a timedelta is a numeric
+                # duration and keeps the historical float conversion.
+                if np.isnat(value):
+                    continue
+                if isinstance(value, np.datetime64):
+                    raise TypeError(
+                        'LeakageSafeTargetEncoder requires a numeric target; '
+                        f'got a {type(value).__name__} label at row {i}')
             if isinstance(value, (complex, np.complexfloating)):
                 continue
-            if not isinstance(value, numbers.Number):
+            # Decimal is not a numbers.Number subclass, but it is an exact
+            # real numeric target (and its NaN/Inf spellings must be skipped,
+            # not rejected as categorical).  Handle it explicitly rather than
+            # silently refusing a numeric label type this module already
+            # canonicalises for row/category identity.
+            if _numeric_is_nan(value):
+                continue
+            if not isinstance(value, (numbers.Number, _decimal.Decimal)):
                 raise TypeError(
                     'LeakageSafeTargetEncoder requires a numeric target; '
                     f'got a {type(value).__name__} label at row {i}')
