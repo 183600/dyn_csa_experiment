@@ -14354,9 +14354,9 @@ _HYPOTHESIS_REQUIRED = ('statement', 'mechanism', 'predicted_sign', 'primary_met
 def _metric_policy_roles(metric, policy):
     """Return (policies where `metric` is primary, policies where it is secondary)."""
     primary, secondary = [], []
-    if not isinstance(metric, str):
+    if not isinstance(metric, str) or not isinstance(policy, dict):
         return primary, secondary
-    for name, p in (policy or {}).items():
+    for name, p in policy.items():
         if not isinstance(p, dict):
             continue
         if p.get('primary') == metric:
@@ -14398,19 +14398,30 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
     if table is None:
         table = HYPOTHESIS_DESIGN if kind == 'component' else BASELINE_HYPOTHESIS_DESIGN
     policy = METRIC_POLICY if policy is None else policy
+    wanted = set(names) if names is not None else set(table)
+    out = {'status': 'ok', 'kind': kind, 'hypotheses': {},
+           'invalid': [], 'metric_unknown': [], 'metric_misaligned': [],
+           'metric_secondary_justified': [], 'direction_unspecified': [],
+           'warnings': []}
+    if not isinstance(policy, dict):
+        # A policy is a declared mapping; a list/scalar cannot be audited.
+        out['warnings'].append(
+            f'metric policy is a {type(policy).__name__}, not an object; '
+            'the hypothesis metric contract cannot be checked')
+        policy = {}
     allowed = set()
-    for p in policy.values():
+    for _pname, p in policy.items():
+        if not isinstance(p, dict):
+            # One malformed entry must not abort the rest of the audit.
+            out['warnings'].append(
+                f'metric policy `{_pname}` is a {type(p).__name__}, not an object')
+            continue
         for key in ('primary', 'secondary', 'primary_when_extreme_imbalance'):
             val = p.get(key)
             if isinstance(val, str):
                 allowed.add(val)
             elif isinstance(val, (list, tuple)):
                 allowed.update(str(x) for x in val)
-    wanted = set(names) if names is not None else set(table)
-    out = {'status': 'ok', 'kind': kind, 'hypotheses': {},
-           'invalid': [], 'metric_unknown': [], 'metric_misaligned': [],
-           'metric_secondary_justified': [], 'direction_unspecified': [],
-           'warnings': []}
     for name in sorted(wanted):
         spec = table.get(name)
         if not isinstance(spec, dict):
@@ -14443,8 +14454,11 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
             if not isinstance(metric_policy, str) or metric_policy not in policy:
                 role_issue = (f'metric_policy={metric_policy!r} is not a declared '
                               'METRIC_POLICY entry')
+            elif not isinstance(policy.get(metric_policy), dict):
+                role_issue = (f'metric_policy={metric_policy!r} is not a '
+                              'metric-policy object')
             elif metric_known:
-                _p = policy[metric_policy]
+                _p = policy.get(metric_policy)
                 _sec = _p.get('secondary')
                 if isinstance(_sec, str):
                     _sec = [_sec]
@@ -14491,7 +14505,9 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
             else:
                 _bound = [metric_policy] if metric_policy else list(primary_policies)
                 for _pn in _bound:
-                    _pol = policy.get(_pn) or {}
+                    _pol = policy.get(_pn)
+                    if not isinstance(_pol, dict):
+                        continue
                     _cond = _pol.get('primary_when_extreme_imbalance')
                     _thr = _finite_scalar(_pol.get('extreme_imbalance_threshold'))
                     if (_cond and _thr is not None and _prev_value < _thr
@@ -14531,10 +14547,11 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
             out['warnings'].append(f'{kind} hypothesis `{name}` has a metric-role mismatch: {role_issue}')
         elif metric_known and metric_role == 'secondary':
             out['metric_secondary_justified'].append(name)
-            _policy_primaries = sorted({policy[p].get('primary') for p in secondary_policies})
+            _policy_primaries = sorted({policy[p].get('primary') for p in secondary_policies
+                                        if isinstance(policy.get(p), dict)})
             if metric_policy:
-                _bound = policy.get(metric_policy) or {}
-                if _bound.get('primary'):
+                _bound = policy.get(metric_policy)
+                if isinstance(_bound, dict) and _bound.get('primary'):
                     _policy_primaries = [_bound.get('primary')]
             out['warnings'].append(
                 f'{kind} hypothesis `{name}` uses secondary endpoint {pm!r} as its '

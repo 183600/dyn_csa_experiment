@@ -6337,6 +6337,22 @@ def t_hypothesis_audit_completeness_and_metric_alignment():
 # I. leakage-safe data splitting / preprocessing
 # ---------------------------------------------------------------------------
 
+    # A malformed caller-supplied policy must not crash the audit; each bad
+    # entry is surfaced as a warning and the remaining policy still applies.
+    for _bad_pol in ([], {'x': None}, {'x': 1}):
+        _ha = L.hypothesis_audit(table={}, names=[], policy=_bad_pol)
+        assert _ha['status'] == 'warn' and _ha['warnings'], (_bad_pol, _ha)
+    _mixed_pol = {'x': None, 'binary_classification': dict(L.METRIC_POLICY['binary_classification'])}
+    _ha = L.hypothesis_audit(table={}, names=[], policy=_mixed_pol)
+    assert _ha['status'] == 'warn' and any('`x`' in w for w in _ha['warnings']), _ha
+    # A hypothesis bound to a malformed policy entry fails closed instead of
+    # raising on `policy[name].get`.
+    _spec = dict(L.HYPOTHESIS_DESIGN['dynamic_blocking'])
+    _bad_bind = L.hypothesis_audit(
+        table={'h': {**_spec, 'metric_policy': 'x'}},
+        names=['h'], policy={'x': None})
+    assert _bad_bind['status'] == 'warn' and _bad_bind['invalid'] == ['h'], _bad_bind
+
 def t_leakage_safe_split_contract():
     idx = L.chronological_split_indices(100, 0.7, 0.2, 0.1)
     assert [len(idx[k]) for k in ('train', 'val', 'test')] == [70, 20, 10], idx
