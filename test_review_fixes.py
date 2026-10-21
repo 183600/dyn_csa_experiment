@@ -7414,6 +7414,24 @@ def t_efficiency_pairs_audit_and_sweep():
             pass
         else:
             raise AssertionError(f'measure_efficiency_sweep accepted {_kw!r}')
+    for _kw in ({'warmup': -1}, {'warmup': 1.5}, {'iters': 0},
+                {'iters': True}, {'decode_tokens': 0}):
+        _args = dict(warmup=0, iters=1, decode_tokens=1)
+        _args.update(_kw)
+        try:
+            L.measure_efficiency(model, ids, torch.device('cpu'), **_args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'measure_efficiency accepted {_kw!r}')
+    for _bad_ids in (torch.empty((1, 0), dtype=torch.long),
+                     torch.empty((1, 1, 1), dtype=torch.long)):
+        try:
+            L.measure_efficiency(model, _bad_ids, torch.device('cpu'))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'measure_efficiency accepted ids shape {tuple(_bad_ids.shape)}')
 
 
 def t_efficiency_pareto_is_grouped():

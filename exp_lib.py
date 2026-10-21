@@ -20996,6 +20996,20 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
     ids = torch.as_tensor(ids)
     if ids.ndim == 1:
         ids = ids[None, :]
+    if ids.ndim != 2 or int(ids.shape[1]) < 1:
+        raise ValueError(
+            f'measure_efficiency needs a non-empty 1-D/2-D token table, got '
+            f'shape {tuple(ids.shape)}')
+    _warm = _exact_count(warmup, minimum=0)
+    _iters = _exact_count(iters, minimum=1)
+    _dec = _exact_count(decode_tokens, minimum=1)
+    if _warm is None:
+        raise ValueError(f'warmup must be a non-negative integer, got {warmup!r}')
+    if _iters is None:
+        raise ValueError(f'iters must be a positive integer, got {iters!r}')
+    if _dec is None:
+        raise ValueError(f'decode_tokens must be a positive integer, got {decode_tokens!r}')
+    warmup, iters, decode_tokens = int(_warm), int(_iters), int(_dec)
     ids = ids.to(device)
     try:
         for _ in range(max(0, int(warmup))):
