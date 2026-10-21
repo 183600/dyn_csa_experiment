@@ -3364,9 +3364,15 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
         # Forward the same ordering/group keys that produced the split so the
         # report can independently verify temporal and whole-group isolation.
         # An explicit quality_kwargs override wins (callers may pass a longer
-        # external ordering array), but it must not be duplicated.
+        # external ordering array), but it must not be duplicated.  An
+        # explicit ``None`` must not silently disable the temporal/group audit
+        # that the split helper already knows how to perform.
         kw.setdefault('time', time)
         kw.setdefault('groups', groups)
+        if kw.get('time') is None and time is not None:
+            kw['time'] = time
+        if kw.get('groups') is None and groups is not None:
+            kw['groups'] = groups
         out['quality'] = data_quality_report(
             Xarr, y=yarr, train_idx=idx['train'], val_idx=idx['val'],
             test_idx=idx['test'], **kw)

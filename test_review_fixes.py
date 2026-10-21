@@ -6397,6 +6397,13 @@ def t_data_quality_temporal_audit():
                                test_frac=0.25, quality_report=True,
                                quality_kwargs={'time': time})
     assert out2['quality']['status'] in ('ok', 'warnings'), out2['quality']
+    # An explicit None override must not disable the temporal audit the split
+    # helper already knows how to run.
+    out3 = L.split_and_prepare(X, time=time, train_frac=0.5, val_frac=0.25,
+                               test_frac=0.25, quality_report=True,
+                               quality_kwargs={'time': None, 'groups': None})
+    _temporal3 = out3['quality']['checks']['temporal_order']
+    assert all(c.get('checked') for c in _temporal3.values()), out3['quality']
     # String event ids/timestamps are orderable in Python even though NumPy 2
     # has no string maximum/minimum ufunc loop; grouped splits must not fall
     # over (or silently disable the order check) for them.
