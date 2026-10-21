@@ -456,6 +456,11 @@ def t_nan_diagnosis_path():
     assert malformed['status'] == 'unverifiable', malformed
     assert malformed['primary_suspect'] == 'record_integrity', malformed
     assert any(c['check'] == 'record_integrity' for c in malformed['checks']), malformed
+    bad_grad_max = L.diagnose_training_instability({
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                             'grad_norm_max': 'not-a-number', 'events': []}})
+    assert bad_grad_max['status'] == 'unverifiable', bad_grad_max
+    assert bad_grad_max['primary_suspect'] == 'record_integrity', bad_grad_max
 
 
 def t_paired_errors_use_common_finite_support():

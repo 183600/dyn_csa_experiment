@@ -577,13 +577,16 @@ def diagnose_training_instability(record, *, data_checked=None):
     health = rec.get('curve_health') if isinstance(rec.get('curve_health'), dict) else {}
     health_nonfinite = str(health.get('status') or '') == 'nonfinite'
     amp = rec.get('amp_dtype') or knobs.get('amp_dtype')
-    grad_max = diag.get('grad_norm_max')
+    _grad_raw = diag.get('grad_norm_max')
+    grad_max = _grad_raw
     try:
         if isinstance(grad_max, (bool, np.bool_)):
             raise TypeError
         grad_max = float(grad_max)
     except (TypeError, ValueError, OverflowError):
         grad_max = None
+        if _grad_raw is not None:
+            malformed.append(f'grad_norm_max={_grad_raw!r}')
     lr = None
     for e in reversed(events):
         try:
