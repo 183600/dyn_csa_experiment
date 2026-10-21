@@ -942,7 +942,7 @@ def _flop_matched_steps(small_cfg, large_cfg, min_steps=250):
     print(f'[v10] 6ND-param-proxy-matched steps (a PROXY, not measured FLOPs): {"; ".join(deriv)}; ratio={_ratio:.6g} -> large_steps={steps}' + (f'  [NOTE: floored at {min_steps} (raw {_raw}) — the proxy target is deviated by the floor, report it as such]' if steps > _raw else ''))
     return steps
 
-PHASES = [('P3MT', 'lenphase', P3MT_PAYLOAD, [0, 1, 2]), ('P3MTC', 'lenphase', P3MT_PAYLOAD_CONTROLS, [0, 1, 2]), ('P3MP', 'probe', PROBE, None), ('P3T', 'run', V9.P2T_CFG, [2, 3]), ('P3SS', 'run', P3SS_CFG, [0, 1]), ('P3SL', 'run', P3SL_CFG, [0, 1]), ('P3SL2', 'run', P3SL_TOK_CFG, [0, 1]), ('P3SL3', 'run', P3SL_FLOP_CFG, [0, 1])]
+PHASES = [('P3MT', 'lenphase', P3MT_PAYLOAD, [0, 1, 2]), ('P3MTC', 'lenphase', P3MT_PAYLOAD_CONTROLS, [0, 1, 2]), ('P3MP', 'probe', PROBE, None), ('P3T', 'run', V9.P2T_CFG, [2, 3]), ('P3SS', 'run', P3SS_CFG, [0, 1, 2]), ('P3SL', 'run', P3SL_CFG, [0, 1, 2]), ('P3SL2', 'run', P3SL_TOK_CFG, [0, 1, 2]), ('P3SL3', 'run', P3SL_FLOP_CFG, [0, 1, 2])]
 
 def run_phase(name, guard, par=None):
     V9._install_ckpt_patch()

@@ -2735,6 +2735,16 @@ def t_key_exploratory_phases_declare_at_least_three_seeds():
         _payload = by_name[_name][2]
         _seeds = _payload.get('seeds') or (_payload.get('cfg') or {}).get('seeds')
         assert _seeds is not None and len(set(_seeds)) >= 3, (_name, _seeds)
+    # Scale panels are key cross-size comparisons too: a 2-seed plan cannot
+    # even report a seed-level mean±std.  The v10 scale phases and their v12
+    # token/compute-matched re-runs all declare >=3 seeds.
+    v10_phases = {p[0]: p for p in V10.PHASES}
+    for _name in ('P3SS', 'P3SL', 'P3SL2', 'P3SL3'):
+        _seeds = v10_phases[_name][3]
+        assert _seeds is not None and len(set(_seeds)) >= 3, (_name, _seeds)
+    for _name in ('P5S2_CFG', 'P5S3_CFG'):
+        _seeds = getattr(V12, _name).get('seeds')
+        assert _seeds is not None and len(set(_seeds)) >= 3, (_name, _seeds)
 
 
 def t_v10_holm_family_keeps_unmeasured_slots():

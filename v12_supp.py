@@ -109,8 +109,8 @@ P5C_CFG = dict(V10.P3MT_PAYLOAD, seeds=[0, 1, 2, 3, 4, 5], variants=['csa_fixed_
                # frozen arm trained through a non-finite/overfit tail.
                diag_eval_every=250)
 P5MP_CFG = dict(V10.PROBE, seeds=[0, 1, 2, 3, 4, 5], variants=['csa_fixed_rope', 'full_rope'] + V10.SCRATCH_CONTROLS, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS})
-P5S2_CFG = dict(V10.P3SL_TOK_CFG, seeds=[0, 1])
-P5S3_CFG = dict(V10.P3SL_FLOP_CFG, seeds=[0, 1])
+P5S2_CFG = dict(V10.P3SL_TOK_CFG, seeds=[0, 1, 2])
+P5S3_CFG = dict(V10.P3SL_FLOP_CFG, seeds=[0, 1, 2])
 TEST_OUTDIR = 'results_lm_test'
 FREEZE_MANIFEST = 'confirmation_frozen.json'
 PHASES = [('P5C', 'lenphase', P5C_CFG, None), ('P5MP', 'probe', P5MP_CFG, None), ('P5S2', 'run', P5S2_CFG, None), ('P5S3', 'run', P5S3_CFG, None), ('P5H', 'health', None, None), ('P5T', 'finaltest', None, None)]
