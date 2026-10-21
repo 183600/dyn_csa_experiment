@@ -13151,6 +13151,11 @@ def t_malformed_panel_summary_is_excluded():
             json.dump({'a::seed0': {'variant': ['not', 'a', 'string'],
                                     'seed': 0, 'ppl': 1.0}}, f)
         assert L.variant_presence(td) == {}
+        # A malformed nested provenance block is missing evidence, not an
+        # AttributeError in the shared-validation fingerprint check.
+        assert L.by_len_cells([{'provenance': ['bad'],
+                                'by_len': {4: {'ppl': 10.0}}}], 4) == [
+            {'ppl': 10.0}]
     finally:
         shutil.rmtree(td, ignore_errors=True)
 

@@ -8389,7 +8389,13 @@ def assert_shared_validation_fp(records, *, context='comparison'):
     fps = set()
     for r in records:
         if isinstance(r, dict):
-            _fp = r.get('val_fp') or (r.get('provenance') or {}).get('data', {}).get('val_fp')
+            # Provenance is untrusted: a list/string in the old nested field
+            # used to raise AttributeError on .get() and abort the comparison
+            # before the fingerprints could be checked.
+            _prov = r.get('provenance')
+            _data = _prov.get('data') if isinstance(_prov, dict) else None
+            _nested_fp = _data.get('val_fp') if isinstance(_data, dict) else None
+            _fp = r.get('val_fp') or _nested_fp
             if _fp:
                 fps.add(str(_fp))
     if len(fps) > 1:
