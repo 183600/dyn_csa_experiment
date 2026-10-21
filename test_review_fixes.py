@@ -7359,6 +7359,12 @@ def t_efficiency_accuracy_tradeoff_summary():
         {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0, 'tokens_seen': 1000},
         {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0, 'tokens_seen': 1000}])
     assert all(r['budget_matched'] is True for r in matched), matched
+    # Zero is not a trained budget, and two invalid records must not match.
+    zero_tok = BR.efficiency_accuracy_summary([
+        {'variant': 'a', 'ppl': 48.0, 'prefill_ms_p50': 10.0, 'tokens_seen': 0},
+        {'variant': 'b', 'ppl': 49.0, 'prefill_ms_p50': 20.0, 'tokens_seen': 0}])
+    assert all(r['budget_matched'] is False for r in zero_tok), zero_tok
+    assert all('train_budget_unverifiable' in r['flags'] for r in zero_tok), zero_tok
 
 
 def t_report_error_analysis_section():

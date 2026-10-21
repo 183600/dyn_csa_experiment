@@ -1841,11 +1841,14 @@ def efficiency_accuracy_summary(items):
         lat = _as_finite(it.get('prefill_ms_p50'))
         if ppl is None or lat is None or ppl <= 0.0 or lat < 0.0:
             continue
+        _tok = _as_finite(it.get('tokens_seen'))
         by_arm.setdefault(v, []).append({
             'ppl': ppl, 'lat': lat,
             'params': _as_finite(it.get('params')),
             'mem': _as_finite(it.get('peak_mem_allocated_mb')),
-            'tok': _as_finite(it.get('tokens_seen'))})
+            # A zero/negative token budget is not a trained arm; treat it as
+            # missing so it cannot "match" another invalid record.
+            'tok': (_tok if (_tok is not None and _tok > 0.0) else None)})
     rows = []
     for v, vals in by_arm.items():
         pp = [x['ppl'] for x in vals]
