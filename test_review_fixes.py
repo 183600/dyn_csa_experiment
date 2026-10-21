@@ -4259,6 +4259,17 @@ def t_retrieval_metrics_and_niah_trivial_floor():
                                         'recommended_primary_metric': 'f1'}},
                                  policy=_bad_thr_policy)
     assert _mth['status'] == 'warn', _mth
+    # A support count above the float range must fail the record closed, not
+    # abort the audit with an OverflowError when recall*support is formed.
+    _huge = 10 ** 400
+    _huge_rec = {'variant': 'h', 'task': 'niah_natural', 'acc': 0.5,
+                 'nll': 1.0, 'n_queries': _huge, 'n_correct': _huge // 2,
+                 'chance_accuracy': 0.5, 'majority_accuracy': 0.5,
+                 'balanced_accuracy': 0.5,
+                 'answer_support': {'a': _huge // 2, 'b': _huge - _huge // 2},
+                 'per_class_recall': {'a': 0.5, 'b': 0.5}}
+    _mh = L.metric_policy_audit({'h::seed0': _huge_rec})
+    assert _mh['status'] == 'warn', _mh
     # Forged accuracy / majority floor / macro recall are rejected.
     for key, val in (('acc', 0.9), ('majority_accuracy', 0.1),
                      ('balanced_accuracy', 0.99), ('chance_accuracy', 0.01)):

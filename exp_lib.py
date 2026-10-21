@@ -15780,7 +15780,15 @@ def metric_policy_audit(summary=None, policy=None):
                                     if _rf is None or _sp is None:
                                         _counts_ok = False
                                         break
-                                    _cf = _rf * _sp
+                                    try:
+                                        _cf = _rf * _sp
+                                    except OverflowError:
+                                        # A count above the float range is not
+                                        # representable, but it must fail the
+                                        # record closed instead of aborting
+                                        # the audit.
+                                        _counts_ok = False
+                                        break
                                     _cr = int(round(_cf))
                                     if (abs(_cf - _cr) > 1e-7
                                             or _cr < 0 or _cr > _sp):
