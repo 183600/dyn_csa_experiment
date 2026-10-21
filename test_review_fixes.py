@@ -9270,6 +9270,28 @@ def t_audit_training_health_records():
         r6 = A.audit_training_health(outdirs=[td])
         assert r6['status'] == 'fail', r6
         assert any('contradicts the health_history' in x for x in r6['errors']), r6
+        # Counter/log disagreement and a first_bad_step without any event
+        # are record-integrity failures, not clean runs.
+        for label, rec2 in (
+                ('v::s0', {'curve_health': {'status': 'healthy'},
+                           'opt_diag_summary': {
+                               'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                               'nan_guard': {'elements_cleaned': 0},
+                               'events': [{'kind': 'loss', 'loss': float('nan')}]}}),
+                ('w::s0', {'curve_health': {'status': 'healthy'},
+                           'opt_diag_summary': {
+                               'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                               'nan_guard': {'elements_cleaned': 0},
+                               'first_bad_step': 12}})):
+            with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+                json.dump({label: rec2}, f)
+            ry = A.audit_training_health(outdirs=[td])
+            if label == 'v::s0':
+                assert ry['status'] == 'fail' and any(
+                    'nonfinite_loss_steps=0' in x for x in ry['errors']), ry
+            else:
+                assert ry['status'] == 'warnings' and any(
+                    'first_bad_step=12' in x for x in ry['warnings']), ry
         # Unknown status names and a healthy claim with an explicitly empty
         # curve are not verified health.
         for label, rec2 in (('u::s0', {'curve_health': {'status': 'fine'},

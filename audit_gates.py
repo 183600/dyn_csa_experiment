@@ -2126,6 +2126,31 @@ def audit_training_health(outdirs=None):
             n_grad = _count_field(diag, 'nonfinite_grad_steps')
             n_guard = _count_field(guard, 'elements_cleaned')
             has_events = bool(n_loss or n_grad or n_guard)
+            # Event counters and their event log must not contradict each
+            # other: an event log with loss/grad entries while the matching
+            # counter is zero is a partially written record, not a clean run.
+            _ev_raw = diag.get('events')
+            if _ev_raw is not None and not isinstance(_ev_raw, list):
+                e.append(f'opt_diag_summary.events is not a list ({type(_ev_raw).__name__})')
+                _evs = []
+            else:
+                _evs = _ev_raw if isinstance(_ev_raw, list) else []
+            _ev_loss = sum(1 for _x in _evs if isinstance(_x, dict) and _x.get('kind') == 'loss')
+            _ev_grad = sum(1 for _x in _evs if isinstance(_x, dict) and _x.get('kind') == 'grad')
+            if _ev_loss > n_loss:
+                e.append(f'events contain {_ev_loss} non-finite loss step(s) but '
+                         f'nonfinite_loss_steps={n_loss}')
+            if _ev_grad > n_grad:
+                e.append(f'events contain {_ev_grad} non-finite gradient step(s) but '
+                         f'nonfinite_grad_steps={n_grad}')
+            _fbs = diag.get('first_bad_step')
+            if _fbs is not None:
+                _fbsv = _nonneg(_fbs)
+                if _fbsv is None or _fbsv < 1:
+                    e.append(f'first_bad_step is not a positive integer ({_fbs!r})')
+                elif not has_events and not _evs:
+                    w.append(f'first_bad_step={_fbsv} is recorded but every event '
+                             'counter/log is empty; the record is inconsistent')
             # The stored `curve_health` is a cache; the recorded curve is the
             # evidence.  Recompute it when present so a record cannot claim
             # `healthy` while its own history is overfitting/non-finite.
