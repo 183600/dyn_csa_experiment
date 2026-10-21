@@ -10483,6 +10483,19 @@ def t_build_report_primary_estimand():
     huge = dict(bad, ppl_estimation_rows='nested_validation_holdout',
                 nll_sum_holdout=1e6, n_tokens_holdout=1)
     assert BR._primary_ppl(huge) is None
+    # The two arms must declare the SAME estimand.  A full-validation record
+    # paired against a holdout record produces a difference on neither sample.
+    full = {'variant': 'b', 'seed': 0, 'ppl': 10.0, 'run_cfg': 'cfg',
+            'steps': 1, 'tokens_seen': 40, 'data_fp': 'd', 'val_fp': 'v',
+            'eval_fp': 'e'}
+    assert BR.paired_row({('', 0): a}, {('', 0): full}) is None
+    # Nor may different seeds contribute deltas from different estimands to
+    # one sign-flip test.
+    a1 = _rec(10.0, 9.0, seed=1)
+    b1 = _rec(10.5, 10.5, seed=1)
+    _mix = BR.paired_row({('', 0): full, ('', 1): a1},
+                         {('', 0): dict(full, ppl=11.0), ('', 1): b1})
+    assert _mix is None, _mix
 
 
 def t_build_report_exact_seed_and_params():

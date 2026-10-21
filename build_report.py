@@ -283,6 +283,11 @@ def _ppl_ok(v):
     f = _as_finite(v)
     return f is not None and f > 0.0
 
+def _nested_estimand(rec):
+    return (isinstance(rec, dict)
+            and rec.get('ppl_estimation_rows') == 'nested_validation_holdout')
+
+
 def _primary_ppl(rec):
     """Per-seed PPL on the record's PRIMARY estimand.
 
@@ -607,12 +612,23 @@ def paired_row(a_records, b_records):
         if reason:
             skipped.append(s)
             continue
+        if _nested_estimand(a_records[s]) != _nested_estimand(b_records[s]):
+            # The two arms' primary values would come from different row
+            # samples (holdout vs full validation); their difference is on
+            # neither estimand.
+            skipped.append(s)
+            continue
         _da, _db = _primary_ppl(a_records[s]), _primary_ppl(b_records[s])
         if _da is None or _db is None:
             skipped.append(s)
             continue
         dl.append(_da - _db)
         kept.append(s)
+    if kept and len({_nested_estimand(a_records[s]) for s in kept}) > 1:
+        print('[report] paired_row: the paired seeds mix nested-holdout and '
+              'full-validation estimands — their deltas are not one sample; '
+              'comparison omitted')
+        return None
     if skipped:
         print(f'[report] {len(skipped)}/{len(common)} seed(s) NOT paired ({skipped}); excluded from the sign-flip test')
     if not dl:
@@ -822,9 +838,13 @@ def sec_p0w():
             _shared = sorted(set(_wm) & set(_bm))
             _dd = []
             _gated = 0
+            _est = set()
             for sd in _shared:
                 reason = _pair_reason(_wm[sd], _bm[sd])
                 if reason:
+                    _gated += 1
+                    continue
+                if _nested_estimand(_wm[sd]) != _nested_estimand(_bm[sd]):
                     _gated += 1
                     continue
                 _da, _db = _primary_ppl(_wm[sd]), _primary_ppl(_bm[sd])
@@ -832,6 +852,12 @@ def sec_p0w():
                     _gated += 1
                     continue
                 _dd.append(_da - _db)
+                _est.add(_nested_estimand(_wm[sd]))
+            if len(_est) > 1:
+                print(f'[report] sec_p0w `{v}` warm={w}: seeds mix nested/full '
+                      'estimands — the sign-flip test is omitted rather than '
+                      'pooling two samples')
+                continue
             if _gated:
                 print(f'[report] sec_p0w `{v}` warm={w}: {_gated}/{len(_shared)} seed(s) NOT paired (run_cfg/steps gate); excluded from the sign-flip test')
             _st = exact_signflip(_dd) if _dd else None
@@ -1152,8 +1178,13 @@ def sec_p1t():
         _c3 = []
         _rej3 = 0
         _vals3 = {}
+        _est3 = set()
         for sk in sorted(set(_m1_r) & set(_t8_r) & set(_t32_r)):
             if _pair_reason(_m1_r[sk], _t8_r[sk]) is not None or _pair_reason(_m1_r[sk], _t32_r[sk]) is not None:
+                _rej3 += 1
+                continue
+            if len({_nested_estimand(_m1_r[sk]), _nested_estimand(_t8_r[sk]),
+                    _nested_estimand(_t32_r[sk])}) > 1:
                 _rej3 += 1
                 continue
             _va, _vb, _vc = _primary_ppl(_m1_r[sk]), _primary_ppl(_t8_r[sk]), _primary_ppl(_t32_r[sk])
@@ -1162,6 +1193,13 @@ def sec_p1t():
                 continue
             _c3.append(sk)
             _vals3[sk] = (_va, _vb, _vc)
+            _est3.add(_nested_estimand(_m1_r[sk]))
+        if len(_est3) > 1:
+            print('[report] sec_p1t: three-way seeds mix nested/full estimands — '
+                  'the per-seed direction count is omitted')
+            _c3 = []
+            _vals3 = {}
+            _rej3 += 1
         if _rej3:
             print(f'[report] sec_p1t: {_rej3} three-way shared seed(s) rejected by the run_cfg/steps/primary-estimand gate — excluded from the per-seed direction count')
         _m1_s = {sk: float(_vals3[sk][0]) for sk in _c3}
