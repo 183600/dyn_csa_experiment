@@ -11512,6 +11512,24 @@ def t_cached_validation_row_groups_merge_shared_documents():
         _sl, _ntr, vocab_size=_vb, val_seqs=_vs, n_rows=4, cache_dir=_d_legacy)
     assert _gl is None and _ml['groups_aware'] is False, (_gl, _ml)
     assert 'legacy' in _ml['reason'], _ml
+    # Metadata that declares the token-level sidecar but no longer has the
+    # file is corrupt evidence: falling back to the legacy document file (or
+    # to row-only folds) would silently change the group identity.
+    _d_missing = tempfile.mkdtemp(prefix='valgroups_missing_declared_')
+    np.save(os.path.join(_d_missing, f'val_doc_ids_{_tag}.npy'),
+            np.array([1, 2, 3], dtype=np.uint64))
+    with open(os.path.join(_d_missing, f'meta_{_tag}.json'), 'w',
+              encoding='utf-8') as fh:
+        json.dump({'doc_ids': {'validation_token_count': 8,
+                               'validation_token_fp': 'deadbeef'}}, fh)
+    try:
+        L.cached_validation_row_groups(
+            _sl, _ntr, vocab_size=_vb, val_seqs=_vs, n_rows=4,
+            cache_dir=_d_missing)
+    except ValueError as e:
+        assert 'is missing' in str(e), e
+    else:
+        raise AssertionError('a declared-but-missing token sidecar must be refused')
     # A present but too-short TOKEN sidecar must fail closed.
     _d2 = tempfile.mkdtemp(prefix='valgroups_bad_')
     _tag2 = f'v5_sl{_sl}_cap{_ntr}_v{_vb}_vs{_vs}'

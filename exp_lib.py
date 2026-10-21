@@ -13062,7 +13062,27 @@ def cached_validation_row_groups(seq_len, n_train_tokens, vocab_size=8192,
     token_path = os.path.join(cache_dir, f'val_token_doc_ids_{tag}.npy')
     legacy_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
     meta_path = os.path.join(cache_dir, f'meta_{tag}.json')
-    path = token_path if os.path.exists(token_path) else legacy_path
+    _token_exists = os.path.exists(token_path)
+    # Metadata that declares a token-level sidecar makes its absence corrupt
+    # evidence, not an invitation to fall back to the document-level file.
+    # The two files have different identities, so a missing token sidecar
+    # must not silently become a degraded (groups_aware=False) split.
+    if not _token_exists and os.path.exists(meta_path):
+        try:
+            _m0 = json.load(open(meta_path, encoding='utf-8'))
+        except Exception:
+            _m0 = None
+        if isinstance(_m0, dict):
+            _d0 = _m0.get('doc_ids')
+            if (isinstance(_d0, dict)
+                    and (_d0.get('validation_token_fp') is not None
+                         or _d0.get('validation_token_count') is not None)):
+                raise ValueError(
+                    'cached_validation_row_groups: cache metadata declares a '
+                    f'token-level document-id sidecar, but {token_path} is '
+                    'missing; restore/rebuild it instead of falling back to a '
+                    'different identity')
+    path = token_path if _token_exists else legacy_path
     if n_rows is None:
         n_rows = int(val_seqs)
     _nr = _as_seed_int(n_rows)
