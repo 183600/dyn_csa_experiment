@@ -2062,6 +2062,7 @@ def audit_training_health(outdirs=None):
     dirs = outdirs or list(_iter_result_dirs())
     out = {'status': 'ok', 'panels': {}, 'warnings': [], 'errors': [],
            'note': 'diagnostic only: a healthy record is not thereby a valid treatment claim, and an unhealthy record is not silently deleted'}
+    _Lmod = None
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
         if not isinstance(summ, dict) or not summ:
@@ -2115,6 +2116,76 @@ def audit_training_health(outdirs=None):
             n_grad = _count_field(diag, 'nonfinite_grad_steps')
             n_guard = _count_field(guard, 'elements_cleaned')
             has_events = bool(n_loss or n_grad or n_guard)
+            # The stored `curve_health` is a cache; the recorded curve is the
+            # evidence.  Recompute it when present so a record cannot claim
+            # `healthy` while its own history is overfitting/non-finite.
+            _hist = r.get('health_history')
+            if _hist is not None and not isinstance(_hist, list):
+                e.append(f'health_history is not a list ({type(_hist).__name__})')
+            elif isinstance(_hist, list) and _hist:
+                if _Lmod is None:
+                    try:
+                        _Lmod = _import_exp_lib()
+                    except Exception as _le:
+                        # No classifier in this environment: the curve health
+                        # stays unverified rather than being trusted blindly.
+                        _Lmod = False
+                        w.append(f'health_history present but the classifier is '
+                                 f'unavailable ({type(_le).__name__}: {_le}); '
+                                 'the recorded curve_health is unverified')
+                if _Lmod is False:
+                    pass
+                else:
+                    try:
+                        _rh = _Lmod.classify_training_health(_hist)
+                    except Exception as _he:
+                        e.append(f'health_history could not be classified '
+                                 f'({type(_he).__name__}: {_he}); the curve health is unverifiable')
+                        _rh = None
+                if _Lmod is not False and _rh is not None:
+                    _rstat = str(_rh.get('status') or 'unknown')
+                    if isinstance(h, dict):
+                        if status != _rstat:
+                            _msg = (f'recorded curve_health={status} contradicts the '
+                                    f'health_history recomputation ({_rstat}: '
+                                    f'{_rh.get("reason")})')
+                            # A missing non-finite curve is a masked numerical
+                            # failure; a trend-label difference is a (possibly
+                            # version-dependent) diagnostic mismatch.
+                            if status in ('healthy', 'unknown') and _rstat == 'nonfinite':
+                                e.append(_msg)
+                            else:
+                                w.append(_msg)
+                        _bs, _bp = h.get('best_step'), h.get('best_val_ppl')
+                        if _bs is not None:
+                            _bsv = _nonneg(_bs)
+                            if _bsv is None:
+                                w.append(f'curve_health.best_step is not a non-negative '
+                                         f'integer ({_bs!r}); cannot verify it against the curve')
+                            elif _rh.get('best_step') is not None and _bsv != int(_rh['best_step']):
+                                w.append(f'curve_health.best_step={_bsv} does not match the '
+                                         f'curve best step {int(_rh["best_step"])}')
+                        if _bp is not None:
+                            # PPL is a positive real, not an integer count.
+                            _bpv = None
+                            if not isinstance(_bp, (bool, np.bool_)):
+                                try:
+                                    _f = float(_bp)
+                                    _bpv = _f if (math.isfinite(_f) and _f > 0.0) else None
+                                except (TypeError, ValueError, OverflowError):
+                                    _bpv = None
+                            _rbp = _rh.get('best_val_ppl')
+                            if _bpv is None:
+                                w.append(f'curve_health.best_val_ppl is not a finite '
+                                         f'positive number ({_bp!r})')
+                            elif (isinstance(_rbp, (int, float)) and not isinstance(_rbp, bool)
+                                  and math.isfinite(float(_rbp))
+                                  and abs(_bpv - float(_rbp)) > 1e-6 * max(1.0, abs(float(_rbp)))):
+                                w.append(f'curve_health.best_val_ppl={_bpv:g} does not match the '
+                                         f'curve best {float(_rbp):g}')
+                    else:
+                        w.append(f'no curve_health record; health_history recomputes to '
+                                 f'{_rstat} ({_rh.get("reason")})')
             triage = r.get('instability_diagnosis')
             if isinstance(triage, dict):
                 tstat = str(triage.get('status') or 'unknown')

@@ -9128,6 +9128,34 @@ def t_audit_training_health_records():
         r4 = A.audit_training_health(outdirs=[td])
         assert r4['status'] == 'fail' and any('unverifiable, not zero' in x
                                               for x in r4['errors']), r4
+        # The cached status is not evidence on its own: a record claiming
+        # healthy while its own curve is overfitting must be surfaced, and a
+        # masked non-finite curve point must fail closed.
+        over_hist = [{'step': i * 100, 'train_ce': 6.0 - 0.3 * i,
+                      'val_ce': 4.0 + 0.05 * i, 'val_ppl': math.exp(4.0 + 0.05 * i)}
+                     for i in range(5)]
+        fake_clean = {'curve_health': {'status': 'healthy', 'best_step': 999,
+                                       'best_val_ppl': 1.0},
+                      'health_history': over_hist,
+                      'opt_diag_summary': {'nonfinite_loss_steps': 0,
+                                           'nonfinite_grad_steps': 0,
+                                           'nan_guard': {'elements_cleaned': 0}},
+                      'instability_diagnosis': {'status': 'clean'}}
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'h::s0': fake_clean}, f)
+        r5 = A.audit_training_health(outdirs=[td])
+        assert r5['status'] == 'warnings', r5
+        assert any('contradicts the health_history' in x for x in r5['warnings']), r5
+        assert any('best_step=999' in x for x in r5['warnings']), r5
+        assert any('best_val_ppl=1' in x for x in r5['warnings']), r5
+        nan_hist = [{'step': 0, 'train_ce': 5.0, 'val_ce': 4.0},
+                    {'step': 100, 'train_ce': 4.8, 'val_ce': float('nan')}]
+        masked_nan = dict(fake_clean, health_history=nan_hist)
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'n::s0': masked_nan}, f)
+        r6 = A.audit_training_health(outdirs=[td])
+        assert r6['status'] == 'fail', r6
+        assert any('contradicts the health_history' in x for x in r6['errors']), r6
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
