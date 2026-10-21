@@ -15481,6 +15481,13 @@ def metric_policy_audit(summary=None, policy=None):
                     prevalence = (min(_prev_f, 1.0 - _prev_f)
                                   if task == 'binary_classification' else _prev_f)
                     break
+            if task == 'binary_classification' and prevalence is None:
+                # A record can expose the PR-AUC chance floor without a
+                # separate `prevalence` field.  Ignoring that floor would let
+                # a rare-positive record evade the conditional PR-AUC check.
+                _pr_floor = _finite_scalar(r.get('pr_auc_prevalence'))
+                if _pr_floor is not None and 0.0 <= _pr_floor <= 1.0:
+                    prevalence = min(_pr_floor, 1.0 - _pr_floor)
             if task == 'binary_classification' and prevalence is not None:
                 # PR-AUC's chance floor is the POSITIVE-class prevalence, which
                 # need not be the minority class.  When the positive endpoint

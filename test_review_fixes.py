@@ -3856,6 +3856,16 @@ def t_binary_pr_floor_uses_positive_prevalence():
                   pr_auc_prevalence=0.0001)
     fa = L.metric_policy_audit({'b': forged})
     assert any('floor is misstated' in w for w in fa['warnings']), fa
+    # A record that exposes only the PR-AUC chance floor still declares its
+    # prevalence; a rare-positive record must not evade the PR-AUC endpoint
+    # check by omitting a separate `prevalence` field.
+    _rare_only = {'variant': 'r', 'task': 'binary_classification',
+                  'positive_label': '1', 'f1_primary': 0.9,
+                  'f1_primary_average': 'binary_positive_class',
+                  'roc_auc': 0.99, 'pr_auc_prevalence': 0.0005}
+    _ro = L.metric_policy_audit({'r': _rare_only})
+    assert _ro['status'] == 'warn' and any(
+        'PR-AUC' in w and '1:1000' in w for w in _ro['warnings']), _ro
 
 def t_metric_policy_checks_record_values():
     # The declared token-weighted PPL must match the record's own NLL
