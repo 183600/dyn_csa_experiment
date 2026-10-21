@@ -11268,6 +11268,20 @@ def t_archive_refuses_links_and_repo_escape():
             mt.size = len(broken_bytes)
             tf.addfile(mt, io.BytesIO(broken_bytes))
         assert AR.cmd_verify(broken) == 1
+        # A manifest whose per-file entries are not objects (e.g. a bare
+        # string instead of {"sha256": ...}) must be refused, not crash the
+        # verifier with an AttributeError.
+        malformed = os.path.join(d, 'release_malformed.tar.gz')
+        malformed_man = {'tag': 'm', 'files': {'data.txt': 'not-an-object'}}
+        malformed_bytes = json.dumps(malformed_man).encode('utf-8')
+        with tarfile.open(malformed, 'w:gz') as tf:
+            ti = tarfile.TarInfo('data.txt')
+            ti.size = len(payload)
+            tf.addfile(ti, io.BytesIO(payload))
+            mt = tarfile.TarInfo('release_malformed.MANIFEST.sha256')
+            mt.size = len(malformed_bytes)
+            tf.addfile(mt, io.BytesIO(malformed_bytes))
+        assert AR.cmd_verify(malformed) == 1
 
 
 

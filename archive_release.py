@@ -407,6 +407,12 @@ def cmd_verify(tar_path):
         if not isinstance(man, dict) or not isinstance(man.get('files'), dict):
             print('[archive] REFUSE: the MANIFEST has no files mapping')
             return 1
+        _bad_entries = [n for n, meta in man['files'].items()
+                        if not isinstance(meta, dict)]
+        if _bad_entries:
+            print('[archive] REFUSE: the MANIFEST has malformed file entr(ies) '
+                  f'(expected objects with sha256/bytes): {_bad_entries[:5]}')
+            return 1
         _bad_manifest_names = [n for n in man['files'] if _unsafe_member_name(n)]
         if _bad_manifest_names:
             print('[archive] REFUSE: unsafe manifest path(s): '
@@ -445,7 +451,9 @@ def cmd_verify(tar_path):
         if bad:
             print('[archive] FAIL:\n  - ' + '\n  - '.join(bad[:20]))
             return 1
-        print('[archive] VERIFY OK — release ' + str(man.get('tag')) + ' created ' + str(man.get('created_at')) + ' @ git ' + str((man.get('git') or {}).get('git_head')))
+        _git = man.get('git')
+        _git_head = _git.get('git_head') if isinstance(_git, dict) else None
+        print('[archive] VERIFY OK — release ' + str(man.get('tag')) + ' created ' + str(man.get('created_at')) + ' @ git ' + str(_git_head))
         return 0
 
 
