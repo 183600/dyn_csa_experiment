@@ -945,14 +945,8 @@ def _group_key(value):
                           _datetime.date, _datetime.datetime,
                           _datetime.timedelta)):
         return _temporal_group_key(value)
-    if (not isinstance(value, (bool, np.bool_))
-          and not isinstance(value, (complex, np.complexfloating))
-          and isinstance(value, numbers.Number)):
-        try:
-            if math.isnan(float(value)):
-                return _MISSING_GROUP_KEY
-        except (TypeError, ValueError, OverflowError):
-            pass
+    if _numeric_is_nan(value):
+        return _MISSING_GROUP_KEY
     try:
         hash(value)
     except TypeError:
@@ -1440,21 +1434,38 @@ def _as_categorical_2d(X, *, name='X'):
     return arr
 
 
+def _numeric_is_nan(value):
+    """True for a real numeric scalar that represents NaN in any encoding.
+
+    ``float(Decimal('sNaN'))`` raises instead of returning NaN, so relying on
+    ``math.isnan(float(value))`` silently turns a signaling NaN into an
+    ordinary category/group/label.  Exact numeric objects expose ``is_nan``;
+    fall back to the float image for types that do not.
+    """
+    if (isinstance(value, (bool, np.bool_))
+            or isinstance(value, (complex, np.complexfloating))
+            or not isinstance(value, numbers.Number)):
+        return False
+    is_nan = getattr(value, 'is_nan', None)
+    if callable(is_nan):
+        try:
+            return bool(is_nan())
+        except (ArithmeticError, TypeError, ValueError, OverflowError):
+            pass
+    try:
+        return bool(math.isnan(float(value)))
+    except (ArithmeticError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def _category_is_missing(value):
     if value is None:
         return True
     if isinstance(value, (np.datetime64, np.timedelta64)):
         return bool(np.isnat(value))
-    if (not isinstance(value, (bool, np.bool_))
-            and not isinstance(value, (complex, np.complexfloating))
-            and isinstance(value, numbers.Number)):
-        # Decimal (and other exact numeric objects) can represent NaN too;
-        # treating it as an ordinary category would hide a missing value.
-        try:
-            return bool(math.isnan(float(value)))
-        except (TypeError, ValueError, OverflowError):
-            return False
-    return False
+    # Decimal (and other exact numeric objects) can represent NaN too;
+    # treating it as an ordinary category would hide a missing value.
+    return _numeric_is_nan(value)
 
 
 def _sorted_categories(values):
@@ -3984,9 +3995,11 @@ def _label_key(v):
             or isinstance(v, (complex, np.complexfloating))
             or not isinstance(v, numbers.Number)):
         return v
+    if _numeric_is_nan(v):
+        return None
     try:
         f = float(v)
-    except (TypeError, ValueError, OverflowError):
+    except (ArithmeticError, TypeError, ValueError, OverflowError):
         return v
     # NaN and infinities are not valid class/regression targets.  Treating
     # +inf as an ordinary label would hide a corrupted target from the

@@ -8729,10 +8729,13 @@ def t_exact_numeric_contracts_and_fingerprint():
     assert BR._as_finite(Decimal('2.5')) == 2.5
     # Missing-value detection also covers exact numeric objects.
     assert DG._category_is_missing(Decimal('NaN')) is True
+    assert DG._category_is_missing(Decimal('sNaN')) is True
     assert DG._category_is_missing(Decimal('1.5')) is False
     assert DG._label_key(Decimal('NaN')) is None
+    assert DG._label_key(Decimal('sNaN')) is None
     assert DG._label_key(Decimal('2')) == Decimal('2')
     assert DG._group_key(Decimal('NaN')) == ('__nan__',)
+    assert DG._group_key(Decimal('sNaN')) == ('__nan__',)
 
 
 def t_batch_iter_minimal_corpus():
