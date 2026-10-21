@@ -615,6 +615,32 @@ def _relaxed_pair_reason(a, b, tuned_arms):
         return 'unverifiable train_knobs (only one record carries the optimizer/schedule/augmentation descriptor)'
     if ka is not None and ka != kb:
         return 'different train_knobs (optimizer / LR-schedule / grad-clip / augmentation)'
+    # Per-arm tuning legitimately changes the searched hyperparameters, but it
+    # must not silently change any OTHER structured recipe field.  The compact
+    # run_cfg string differs by lr/wd/warmup after tuning, so it cannot be
+    # compared whole; the structured `hyperparams` copy can.  Check every
+    # controlled key except the three tuned ones, and fail closed on a
+    # one-sided/malformed copy (legacy/legacy remains the permissive path).
+    ha, hb = a.get('hyperparams'), b.get('hyperparams')
+    if (ha is None) != (hb is None):
+        return 'unverifiable hyperparams (only one record carries the structured recipe)'
+    if ha is not None:
+        if not isinstance(ha, dict) or not isinstance(hb, dict):
+            return 'unverifiable hyperparams (structured recipe is not an object)'
+        _tuned = {'lr', 'weight_decay', 'warmup'}
+        _checked = tuple(L._CONTROL_HYPER_KEYS) + (
+            'eval_every', 'eval_subset', 'vocab_size')
+        for _k in _checked:
+            if _k in _tuned:
+                continue
+            _va, _vb = ha.get(_k), hb.get(_k)
+            if _va is None and _vb is None:
+                continue
+            if _va is None or _vb is None:
+                return f'unverifiable hyperparams.{_k} (only one record carries it)'
+            if L._canon_setting(_va) != L._canon_setting(_vb):
+                return (f'different hyperparams.{_k} ({_va!r} vs {_vb!r}) — '
+                        'tuned arms may differ only in lr/weight_decay/warmup')
     # Seed equality does not imply initialization equality: different
     # architectures consume different amounts of RNG.  The shared-trunk digest
     # is the machine check that the paired seeded arms actually started equal.

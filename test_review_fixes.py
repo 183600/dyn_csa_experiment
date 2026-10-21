@@ -1993,6 +1993,23 @@ def t_tuned_pairing_keeps_optimizer_gate():
     why8 = BT._relaxed_pair_reason(dict(a, holdout_row_fp='h1'),
                                    dict(b, holdout_row_fp='h2'), {'a': 3, 'b': 3})
     assert why8 and 'holdout_row_fp' in why8, why8
+    # Independent tuning may change lr/wd/warmup, but NOT the rest of the
+    # structured recipe.  A different seq_len/eval_subset/vocab or a one-sided
+    # descriptor is unverifiable, never a matched tuned pair.
+    hp = {'steps': 1, 'tokens_seen': 1, 'lr': 3e-4, 'weight_decay': 0.1,
+          'warmup': 1, 'batch_size': 2, 'seq_len': 8, 'd': 8,
+          'n_layers': 1, 'n_heads': 1, 'd_head': 8, 'mlp_ratio': 4.0,
+          'eval_every': 1, 'eval_subset': 4, 'vocab_size': 16}
+    a9 = dict(a, hyperparams=dict(hp))
+    b9 = dict(b, hyperparams=dict(hp, lr=1e-3, weight_decay=0.05, warmup=2))
+    assert BT._relaxed_pair_reason(a9, b9, {'a': 3, 'b': 3}) is None
+    for _k, _v in (('seq_len', 16), ('batch_size', 4), ('eval_subset', 8),
+                   ('vocab_size', 32), ('mlp_ratio', 8.0)):
+        _bad = dict(b, hyperparams={**hp, _k: _v})
+        _why = BT._relaxed_pair_reason(a9, _bad, {'a': 3, 'b': 3})
+        assert _why and ('hyperparams.' + _k) in _why, (_k, _why)
+    _why = BT._relaxed_pair_reason(a9, b, {'a': 3, 'b': 3})
+    assert _why and 'unverifiable hyperparams' in _why, _why
 
 
 def t_arm_mean_std_and_relative_effect():
