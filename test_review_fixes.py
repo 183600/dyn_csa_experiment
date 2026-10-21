@@ -3354,7 +3354,8 @@ def t_overfit_guard_config_aware():
 def t_environment_snapshot_identity():
     env = L.environment_snapshot()
     for k in ('gpu_identity', 'cuda_visible_devices', 'float32_matmul_precision',
-              'cublas_workspace_config', 'dependencies'):
+              'cublas_workspace_config', 'dependencies',
+              'fp16_reduced_precision_reduction', 'bf16_reduced_precision_reduction'):
         assert k in env, f'environment snapshot missing {k}'
     assert isinstance(env['gpu_identity'], list)
     dep = env['dependencies']
