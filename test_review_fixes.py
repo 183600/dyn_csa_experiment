@@ -5036,6 +5036,45 @@ def t_simple_baseline_ngram_and_audit():
             raise AssertionError(f'invalid grid hyperparameter accepted: {_bad_grid!r}')
 
 
+def t_simple_baseline_grid_adequacy():
+    rng = np.random.default_rng(23)
+    vocab = 24
+    train = rng.integers(0, vocab, size=400)
+    val = rng.integers(0, vocab, size=(4, 20))
+    proto = dict(L.SIMPLE_BASELINE_POLICY,
+                 arms={'uni': {'order': 1}},
+                 grids={'uni': {'alpha': [0.001, 0.01, 0.1]}})
+    art = L.simple_baseline_fit(train, val, vocab, protocol=proto)
+    entry = art['baselines']['uni']
+    # Force the artifact to select the largest tested smoothing level, with a
+    # clear (non-tie) margin over the runner-up.
+    by_alpha = {float(t['config']['alpha']): t for t in entry['trials']}
+    assert 0.1 in by_alpha, by_alpha
+    by_alpha[0.001]['ppl'] = 2.0
+    by_alpha[0.01]['ppl'] = 1.5
+    by_alpha[0.1]['ppl'] = 1.0
+    entry['selected'] = dict(by_alpha[0.1]['config'])
+    entry['selected_metric_value'] = 1.0
+    art['best_ppl'] = 1.0
+    art['best_ppl_vs_uniform'] = 1.0 / float(vocab)
+    for k in ('reported_nll_per_row', 'reported_n_tokens_per_row',
+              'reported_estimation_rows', 'holdout_ppl', 'holdout_nll',
+              'holdout_n_tokens', 'holdout_metric_value'):
+        entry.pop(k, None)
+    audit = L.simple_baseline_audit(art, protocol=proto)
+    assert audit['baseline_verified'] is True, audit
+    assert audit['grid_adequacy'] == 'warn', audit
+    assert any('max of the declared range' in w and '0.1' in w for w in audit['warnings']), audit
+    assert audit['grid_boundary_hits'] and 'uni:alpha' in audit['grid_boundary_hits'][0], audit
+    # Equal best/runner-up values are a tie, not a decisive tuned pick.
+    tie = json.loads(json.dumps(art))
+    for t in tie['baselines']['uni']['trials']:
+        t['ppl'] = 1.0
+    tie['best_ppl'] = 1.0
+    tie_audit = L.simple_baseline_audit(tie, protocol=proto)
+    assert tie_audit['selection_tie_arms'] == ['uni'], tie_audit
+    assert any('tie' in w for w in tie_audit['warnings']), tie_audit
+
 def t_simple_baseline_nested_rows_and_fingerprint():
     rng = np.random.default_rng(19)
     vocab = 24
@@ -12175,6 +12214,7 @@ def main():
     _check('L18 exact duplicates keep int precision / reject complex', t_data_quality_exact_integer_and_complex_rows)
     _check('L18b exact numeric contracts + integer-safe matrix fingerprint', t_exact_numeric_contracts_and_fingerprint)
     _check('L19 batch_iter minimal corpus', t_batch_iter_minimal_corpus)
+    _check('L19b simple-baseline grid adequacy is explicit', t_simple_baseline_grid_adequacy)
     _check('L20 indexer invalid soft lanes are zero', t_indexer_invalid_soft_lanes_are_zero)
     _check('L21 attention backward partial head group', t_attention_backward_partial_head_group)
     _check('L21a checkpoint stamp names the actual backend', t_checkpoint_stamp_matches_the_actual_backend)

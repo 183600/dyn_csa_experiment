@@ -13351,6 +13351,10 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         problems.append(f'search_design={_search_design!r} is not one of '
                         f'{sorted(_valid_search_designs)}')
     _grid_coverage = {}
+    _grid_adequacy_by_arm = {}
+    _grid_boundary_hits = []
+    _selection_margins = {}
+    _selection_tie_arms = []
     for arm, entry in baselines.items():
         if not isinstance(entry, dict):
             problems.append(f'{arm}: malformed baseline entry')
@@ -13438,6 +13442,71 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
                                    'missing_cells': _missing_cells,
                                    'extra_cells': _extra_cells,
                                    'complete': not _missing_cells and not _extra_cells}
+            # Completeness is not adequacy: a full grid can still select the
+            # smallest/largest smoothing level it tested, in which case the
+            # optimum may lie outside the searched range.  Mirror the neural
+            # grid-adequacy gate so a count-model floor selected on a boundary
+            # is not described as tuned.
+            _alpha_levels = sorted({float(f) for f in
+                                    (_finite_scalar(x) for x in _alphas)
+                                    if f is not None})
+            _sel_alpha = _finite_scalar(chosen.get('alpha'))
+            if _sel_alpha is not None and len(_alpha_levels) >= 3:
+                _pos = None
+                for _i, _v in enumerate(_alpha_levels):
+                    if abs(_v - _sel_alpha) <= 1e-12 * max(1.0, abs(_sel_alpha)):
+                        _pos = _i
+                        break
+                if _pos in (0, len(_alpha_levels) - 1):
+                    _boundary = ('min' if _pos == 0 else 'max')
+                    _grid_boundary_hits.append(f'{arm}:alpha={_sel_alpha:g}({_boundary})')
+                    warnings.append(
+                        f'{arm}: selected alpha={_sel_alpha:g} sits on the {_boundary} of '
+                        f'the declared range {_alpha_levels} — the smoothing optimum may '
+                        'lie outside the searched grid; extend the grid before calling '
+                        'this count-model floor tuned')
+                _grid_adequacy_by_arm[arm] = {'alpha_levels': _alpha_levels,
+                                              'selected_alpha': _sel_alpha,
+                                              'selected_position': _pos,
+                                              'at_boundary': _pos in (0, len(_alpha_levels) - 1)}
+            elif _sel_alpha is not None:
+                _grid_adequacy_by_arm[arm] = {
+                    'alpha_levels': _alpha_levels, 'selected_alpha': _sel_alpha,
+                    'selected_position': None, 'at_boundary': None,
+                    'reason': ('fewer than three alpha levels cannot show that the '
+                               'optimum is bracketed')}
+                warnings.append(f'{arm}: the alpha grid has only {len(_alpha_levels)} '
+                                'level(s); a single/two-point grid cannot show that the '
+                                'smoothing optimum is bracketed')
+            else:
+                _grid_adequacy_by_arm[arm] = {'alpha_levels': _alpha_levels,
+                                              'selected_alpha': None,
+                                              'selected_position': None,
+                                              'at_boundary': None}
+            # A winner that is indistinguishable from the runner-up is not a
+            # tuned optimum.  Record the relative gap so the artifact shows
+            # whether the selection was decisive.
+            # Keep duplicate values: two different configs with the same PPL
+            # are a tie even though the set of *values* has one element.
+            _ranked_vals = sorted(float(v) for v in vals)
+            if len(_ranked_vals) >= 2 and math.isfinite(_ranked_vals[0]) and _ranked_vals[0] > 0:
+                _gap = float(_ranked_vals[1] - _ranked_vals[0])
+                _rel = _gap / float(_ranked_vals[0])
+                _selection_margins[arm] = {
+                    'best': _ranked_vals[0], 'runner_up': _ranked_vals[1],
+                    'absolute': _gap, 'relative': _rel,
+                    'decisive_at_0.1pct': bool(_rel > 1e-3)}
+                if _rel <= 1e-3:
+                    _selection_tie_arms.append(arm)
+                    warnings.append(
+                        f'{arm}: the selected config beats the runner-up by only '
+                        f'{_gap:.3g} {metric} ({100.0 * _rel:.3g}%) — treat the pick '
+                        'as a tie, not as a uniquely tuned optimum')
+            else:
+                _selection_margins[arm] = {'best': (_ranked_vals[0]
+                                                    if _ranked_vals else None),
+                                           'runner_up': None, 'absolute': None,
+                                           'relative': None, 'decisive_at_0.1pct': None}
             # A trial outside the declared search space is not an equal-search
             # result under ANY design, not only a full-factorial claim.
             if _extra_cells:
@@ -13713,6 +13782,13 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
            'search_design_declared': _search_design is not None,
            'search_design_note': protocol.get('search_design_note'),
            'grid_coverage': _grid_coverage,
+           'grid_adequacy_by_arm': _grid_adequacy_by_arm,
+           'grid_boundary_hits': sorted(_grid_boundary_hits),
+           'grid_adequacy': ('incomplete' if any(
+               (v or {}).get('complete') is None for v in _grid_coverage.values())
+               else ('warn' if _grid_boundary_hits or _selection_tie_arms else 'ok')),
+           'selection_margins': _selection_margins,
+           'selection_tie_arms': sorted(_selection_tie_arms),
            'selection_metric': metric, 'selection_split': split,
            'arms': sorted(baselines), 'selected_values': selected_values,
            'best_baseline': best_name,
