@@ -3315,7 +3315,8 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
                       train_frac=0.8, val_frac=0.1, test_frac=0.1,
                       train_size=None, val_size=None, test_size=None,
                       purge=0, preprocess=True, quality_report=False,
-                      clean_train=False, label_conflicts='drop',
+                      clean_train=False, drop_duplicates=True,
+                      label_conflicts='drop',
                       drop_invalid_labels=False,
                       drop_nonfinite_features=False, outlier_iqr=None,
                       target_outlier_iqr=None,
@@ -3340,9 +3341,10 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     false and refuses to return data when its status is ``'fail'`` — a hard
     data-quality failure (label noise, NaN/Inf, cross-split duplicates, ...)
     must not be silently carried into a model fit.  Warnings remain warnings.
-    ``clean_train=True`` first removes exact duplicate training rows and, by
-    default, ambiguous duplicate-label clusters via
-    :func:`clean_training_rows`; ``drop_invalid_labels=True`` additionally
+    ``clean_train=True`` first removes exact duplicate training rows
+    (``drop_duplicates=True``; set it to ``False`` only when duplicates are the
+    intended observations) and, by default, ambiguous duplicate-label clusters
+    via :func:`clean_training_rows`; ``drop_invalid_labels=True`` additionally
     removes rows with missing/non-finite training targets, and
     ``drop_nonfinite_features=True`` / ``outlier_iqr=k`` remove training rows
     with non-finite features or values outside the training IQR fence, and
@@ -3377,6 +3379,8 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
             _ignored.append('outlier_iqr')
         if target_outlier_iqr is not None:
             _ignored.append('target_outlier_iqr')
+        if drop_duplicates is not True:
+            _ignored.append(f'drop_duplicates={drop_duplicates!r}')
         if _ignored:
             raise ValueError(
                 'split_and_prepare: cleaning option(s) '
@@ -3394,6 +3398,22 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
             'split_and_prepare: quality_kwargs were supplied while both '
             'quality_report and fail_on_quality are false; refusing to ignore '
             'the requested data-quality audit')
+    if quality_kwargs is not None and not isinstance(quality_kwargs, dict):
+        raise ValueError(
+            'split_and_prepare: quality_kwargs must be a mapping, got '
+            f'{type(quality_kwargs).__name__}')
+    # The audit must describe the exact split that is returned.  Letting a
+    # caller inject its own train/val/test indices (or labels) either raises a
+    # confusing duplicate-keyword TypeError or, for a differently shaped path,
+    # would audit statistics learned from a different reference than the model
+    # fit sees.  Those fields are owned by this helper.
+    _quality_reserved = {'train_idx', 'val_idx', 'test_idx', 'y'}
+    _quality_bad = sorted(set(quality_kwargs or {}) & _quality_reserved)
+    if _quality_bad:
+        raise ValueError(
+            'split_and_prepare: quality_kwargs must not override '
+            + ', '.join(_quality_bad)
+            + '; the quality audit is bound to the split returned by this call')
     Xarr = _as_numeric_2d(X)
     n = int(Xarr.shape[0])
     yarr = None
@@ -3410,6 +3430,7 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     if clean_train:
         cleaning = clean_training_rows(
             Xarr, y=yarr, train_idx=idx['train'],
+            drop_duplicates=drop_duplicates,
             label_conflicts=label_conflicts,
             drop_invalid_labels=drop_invalid_labels,
             drop_nonfinite_features=drop_nonfinite_features,
