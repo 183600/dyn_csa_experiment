@@ -13727,8 +13727,9 @@ METRIC_POLICY = {
         'direction': 'higher_is_better',
         'secondary': ['f1_micro', 'f1_weighted', 'balanced_accuracy', 'per_class_recall',
                       'macro_micro_f1_gap', 'pr_auc_macro', 'pr_auc_micro',
-                      'pr_auc_weighted', 'roc_auc_macro', 'roc_auc_micro',
-                      'roc_auc_weighted'],
+                      'pr_auc_weighted', 'pr_auc_macro_chance',
+                      'pr_auc_macro_lift_over_chance', 'roc_auc_macro',
+                      'roc_auc_micro', 'roc_auc_weighted'],
         'imbalance': ('macro averaging is required when class frequencies differ; micro equals '
                       'accuracy for single-label tasks; when a class is rarer than 1:1000 the '
                       'primary ranking endpoint switches to one-vs-rest macro PR-AUC'),
@@ -13990,24 +13991,73 @@ def _multiclass_ranking_metrics(y_true, y_score, labels):
            'roc_auc_macro': None, 'roc_auc_weighted': None,
            'pr_auc_macro': None, 'pr_auc_weighted': None,
            'roc_auc_micro': None, 'pr_auc_micro': None,
+           'roc_auc_chance': 0.5,
+           'pr_auc_macro_chance': None, 'pr_auc_macro_lift_over_chance': None,
+           'pr_auc_weighted_chance': None, 'pr_auc_weighted_lift_over_chance': None,
            'averaging': 'one-vs-rest; macro/weighted over defined classes, micro over pooled decisions',
            'note': ('macro treats every class equally (sensitive to a rare class); micro is '
                     'dominated by frequent classes; weighted follows the support. '
-                    'Undefined one-vs-rest classes are listed, not scored.')}
+                    'Undefined one-vs-rest classes are listed, not scored. PR-AUC chance '
+                    'is the one-vs-rest prevalence floor, not 0.')}
     if defined:
         out['roc_auc_macro'] = float(np.mean([per_class[c]['roc_auc'] for c in defined]))
         out['pr_auc_macro'] = float(np.mean([per_class[c]['pr_auc'] for c in defined]))
+        _prev_defined = [per_class[c]['support'] / max(int(y_true.size), 1) for c in defined]
+        out['pr_auc_macro_chance'] = float(np.mean(_prev_defined))
+        out['pr_auc_macro_lift_over_chance'] = float(
+            out['pr_auc_macro'] - out['pr_auc_macro_chance'])
         if sum(weights) > 0:
             out['roc_auc_weighted'] = float(np.average(
                 [per_class[c]['roc_auc'] for c in defined], weights=weights))
             out['pr_auc_weighted'] = float(np.average(
                 [per_class[c]['pr_auc'] for c in defined], weights=weights))
+            # Support-weighted mean of the per-class chance prevalences.
+            out['pr_auc_weighted_chance'] = float(
+                sum(w * p for w, p in zip(weights, _prev_defined)) / sum(weights))
+            out['pr_auc_weighted_lift_over_chance'] = float(
+                out['pr_auc_weighted'] - out['pr_auc_weighted_chance'])
     _flat_y = _y_onehot.reshape(-1)
     _flat_s = score.reshape(-1)
     if _flat_y.size and _flat_y.min() == 0 and _flat_y.max() == 1:
         out['roc_auc_micro'] = _binary_roc_auc(_flat_y, _flat_s)
         out['pr_auc_micro'] = _binary_average_precision(_flat_y, _flat_s)
     return out
+
+
+def _majority_class_floor(labels, supports):
+    """Metrics of the always-majority predictor (a trivial classification floor).
+
+    A classifier's F1/accuracy is not interpretable without the score its
+    labels alone can achieve.  Under imbalance that floor is often deceptively
+    high, so it is recorded next to every classification summary rather than
+    left implicit.  Ties are resolved by the caller's label order (the first
+    label with maximal support), which keeps the record deterministic.
+    """
+    supports = [int(s) for s in supports]
+    n = int(sum(supports))
+    labels = list(labels)
+    if n <= 0 or not labels:
+        return {'strategy': 'most_frequent', 'label': None, 'accuracy': None,
+                'balanced_accuracy': None, 'f1_macro': None, 'f1_micro': None,
+                'f1_weighted': None,
+                'note': 'no observations; the trivial floor is undefined'}
+    best_i = int(np.argmax(np.asarray(supports, dtype=np.int64)))
+    s = supports[best_i]
+    p = s / n
+    f1_major = 2.0 * p / (1.0 + p) if p > 0 else 0.0
+    return {
+        'strategy': 'most_frequent',
+        'label': str(labels[best_i]),
+        'support': s,
+        'accuracy': p,
+        'balanced_accuracy': 1.0 / len(labels),
+        'f1_macro': f1_major / len(labels),
+        'f1_micro': (2.0 * s / (n + s)) if n + s > 0 else 0.0,
+        'f1_weighted': f1_major * p,
+        'note': ('always predicts the most frequent class (label order breaks ties); '
+                 'a real model must beat this floor, and under imbalance this floor '
+                 'can have high accuracy with zero minority recall'),
+    }
 
 _BINARY_THRESHOLD_METRICS = ('f1', 'balanced_accuracy', 'youden_j')
 _BINARY_THRESHOLD_SOURCES = ('default_0.5', 'caller_threshold', 'caller_predictions',
@@ -14178,7 +14228,8 @@ def select_binary_threshold(y_true, y_score, *, positive_label=None, metric='f1'
 
 
 def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, positive_label=None,
-                           threshold=None, threshold_sweep=False):
+                           threshold=None, threshold_sweep=False,
+                           include_trivial_baseline=True):
     """Imbalance-aware classification summary without a sklearn dependency.
 
     Always returns accuracy, balanced accuracy and per-class precision/recall/
@@ -14187,9 +14238,15 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
     F1=0 for a label the predictions never recover).  For a binary endpoint
     with scores it also returns PR-AUC (average precision), ROC-AUC, the
     positive-class prevalence and the PR-AUC lift over that prevalence, so a
-    rare-positive PR-AUC can be read against its chance floor.  The caller must
-    still choose the endpoint that matches the research question; this helper
-    only makes the choice explicit and computable.
+    rare-positive PR-AUC can be read against its chance floor.  For 3+ classes
+    it returns one-vs-rest macro/micro/weighted PR-AUC and ROC-AUC.  The caller
+    must still choose the endpoint that matches the research question; this
+    helper only makes the choice explicit and computable.
+
+    `include_trivial_baseline=True` records the always-most-frequent-class
+    predictor's accuracy and macro/micro/weighted F1 under `trivial_baseline`.
+    A reported score without that floor is not interpretable: under 99:1
+    imbalance a constant majority classifier already has accuracy 0.99.
 
     `positive_label` names the class whose score/probability column is the
     positive endpoint.  If omitted it defaults to ``labels[-1]`` (the sklearn
@@ -14308,6 +14365,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             f'labels {labels.tolist()}; include them or pass labels=None')
     per_class = {}
     supports = []
+    support_all = []
     f1s = []
     rs = []
     all_f1s = []
@@ -14317,6 +14375,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         fp = int(np.sum((y_true != lab) & (y_pred == lab)))
         fn = int(np.sum((y_true == lab) & (y_pred != lab)))
         support = int(np.sum(y_true == lab))
+        support_all.append(support)
         precision = tp / (tp + fp) if tp + fp else 0.0
         recall = tp / (tp + fn) if tp + fn else 0.0
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
@@ -14364,6 +14423,8 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         'per_class': per_class,
         'f1_averaging': 'macro, micro and weighted are all reported; the caller must name the primary one',
     }
+    if include_trivial_baseline:
+        out['trivial_baseline'] = _majority_class_floor(labels, support_all)
     if labels.size > 2:
         # Macro and micro F1 answer different questions when classes are
         # imbalanced.  Make the gap visible instead of letting one number stand
@@ -14640,6 +14701,35 @@ def metric_policy_audit(summary=None, policy=None):
                 continue
             _class_recs.append(r)
             _label = r.get('variant') or r.get('name') or '?'
+            # A recorded trivial floor must be the actual most-frequent
+            # predictor of this label distribution, and its aggregates must be
+            # reproducible.  Without this, a record can claim a straw-man floor
+            # that is easier to beat than the majority class.
+            _tb = r.get('trivial_baseline')
+            if isinstance(_tb, dict):
+                _pc_tb = r.get('per_class')
+                _labels_tb = r.get('labels')
+                if isinstance(_pc_tb, dict) and isinstance(_labels_tb, (list, tuple)):
+                    try:
+                        _sup_tb = [int(_pc_tb[str(_l)]['support']) for _l in _labels_tb]
+                    except (KeyError, TypeError, ValueError):
+                        _sup_tb = None
+                    if _sup_tb is not None:
+                        _want_tb = _majority_class_floor(_labels_tb, _sup_tb)
+                        for _k in ('label', 'accuracy', 'f1_macro', 'f1_micro', 'f1_weighted'):
+                            _got_tb = _tb.get(_k)
+                            _exp_tb = _want_tb.get(_k)
+                            if _k == 'label':
+                                if str(_got_tb) != str(_exp_tb):
+                                    _class_issues.append(
+                                        f'{_label}: trivial_baseline label {_got_tb!r} is not '
+                                        f'the most frequent class {_exp_tb!r}')
+                            else:
+                                _g = _finite_scalar(_got_tb)
+                                if _g is None or _exp_tb is None or abs(_g - float(_exp_tb)) > 1e-9:
+                                    _class_issues.append(
+                                        f'{_label}: trivial_baseline {_k}={_got_tb!r} is not '
+                                        f'reproducible from per_class supports ({_exp_tb!r})')
             # Generic guard: a record that exposes a bare `accuracy` for a
             # classification-style task but no F1 must be treated as incomplete.
             if 'accuracy' in r and 'f1_macro' not in r:
@@ -14658,6 +14748,14 @@ def metric_policy_audit(summary=None, policy=None):
                     _class_issues.append(
                         f'{_label}: multiclass record is missing {_missing_f1}; '
                         'macro, micro and weighted F1 can disagree under class imbalance')
+                _gap = _finite_scalar(r.get('macro_micro_f1_gap'))
+                _fm = _finite_scalar(r.get('f1_macro'))
+                _fi = _finite_scalar(r.get('f1_micro'))
+                if (_gap is not None and _fm is not None and _fi is not None
+                        and abs(_gap - (_fm - _fi)) > 1e-9):
+                    _class_issues.append(
+                        f'{_label}: macro_micro_f1_gap={_gap} is not '
+                        f'f1_macro - f1_micro ({_fm - _fi})')
                 _rank_keys = ('pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted',
                               'roc_auc_macro', 'roc_auc_micro', 'roc_auc_weighted')
                 _have_rank = [k for k in _rank_keys if _finite_scalar(r.get(k)) is not None]
@@ -14700,6 +14798,31 @@ def metric_policy_audit(summary=None, policy=None):
                             _class_issues.append(
                                 f'{_label}: pr_auc_weighted={_rpw} is not the support-weighted '
                                 f'mean of its per-class PR-AUC values ({_pw})')
+                        _n_tb = _exact_count(r.get('n'), minimum=1)
+                        if _n_tb is None:
+                            _n_tb = sum(_rw)
+                        if _n_tb and _n_tb > 0:
+                            _chance_macro = float(np.mean([s / _n_tb for s in _rw]))
+                            _chance_weighted = float(
+                                sum(w * (s / _n_tb) for w, s in zip(_ww, _rw)) / sum(_ww))
+                            for _key, _want in (
+                                    ('pr_auc_macro_chance', _chance_macro),
+                                    ('pr_auc_weighted_chance', _chance_weighted)):
+                                _got_c = _finite_scalar(r.get(_key))
+                                if _got_c is not None and abs(_got_c - _want) > 1e-9:
+                                    _class_issues.append(
+                                        f'{_label}: {_key}={_got_c} is not the one-vs-rest '
+                                        f'prevalence floor ({_want})')
+                            for _key, _base_key, _chance in (
+                                    ('pr_auc_macro_lift_over_chance', 'pr_auc_macro', _chance_macro),
+                                    ('pr_auc_weighted_lift_over_chance', 'pr_auc_weighted', _chance_weighted)):
+                                _got_l = _finite_scalar(r.get(_key))
+                                _base = _finite_scalar(r.get(_base_key))
+                                if (_got_l is not None and _base is not None
+                                        and abs(_got_l - (_base - _chance)) > 1e-9):
+                                    _class_issues.append(
+                                        f'{_label}: {_key}={_got_l} is not '
+                                        f'{_base_key} - chance ({_base - _chance})')
             # f1_primary must be the field its declared averaging names.
             if 'f1_primary' in r:
                 _f1p = _finite_scalar(r.get('f1_primary'))
@@ -14836,7 +14959,8 @@ def metric_policy_audit(summary=None, policy=None):
                         f'{_label}: source is default_0.5 but decision_threshold={_t}')
             for _key in ('roc_auc', 'pr_auc', 'brier_score', 'ece',
                          'roc_auc_macro', 'roc_auc_micro', 'roc_auc_weighted',
-                         'pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted'):
+                         'pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted',
+                         'pr_auc_macro_chance', 'pr_auc_weighted_chance'):
                 if _key in r and r.get(_key) is not None:
                     _v = _finite_scalar(r.get(_key))
                     if _v is None or not (0.0 <= _v <= 1.0):

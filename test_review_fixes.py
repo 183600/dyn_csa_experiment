@@ -3569,6 +3569,24 @@ def t_multiclass_ranking_metrics_and_audit():
         assert abs(m[key] - 1.0) < 1e-12, (key, m[key])
     assert m['per_class']['2']['pr_auc'] == 1.0, m['per_class']
     assert m['per_class']['2']['roc_auc'] == 1.0, m['per_class']
+    # The trivial majority floor is recorded next to the model scores: with
+    # 80/15/5 labels the always-0 predictor already has accuracy 0.8.
+    assert m['trivial_baseline']['strategy'] == 'most_frequent'
+    assert m['trivial_baseline']['label'] == '0'
+    assert abs(m['trivial_baseline']['accuracy'] - 0.8) < 1e-12
+    assert abs(m['trivial_baseline']['f1_macro'] - (2.0 * 0.8 / 1.8) / 3.0) < 1e-12
+    # One-vs-rest PR-AUC also has a non-zero chance floor (mean prevalence);
+    # a raw PR-AUC of 0.5 at 1:1000 would not be skillful.
+    assert abs(m['pr_auc_macro_chance'] - 1.0 / 3.0) < 1e-12, m
+    assert abs(m['pr_auc_weighted_chance'] - 0.665) < 1e-12, m
+    assert abs(m['pr_auc_macro_lift_over_chance'] - (1.0 - 1.0 / 3.0)) < 1e-12
+    assert abs(m['pr_auc_weighted_lift_over_chance'] - 0.335) < 1e-12
+    # A binary record gets the same floor; the majority predictor has zero
+    # minority recall, so balanced accuracy is not fooled by its high accuracy.
+    _bin_floor = L.classification_metrics([0] * 99 + [1], y_pred=[0] * 100, labels=[0, 1])
+    assert _bin_floor['trivial_baseline']['label'] == '0'
+    assert abs(_bin_floor['trivial_baseline']['accuracy'] - 0.99) < 1e-12
+    assert abs(_bin_floor['trivial_baseline']['balanced_accuracy'] - 0.5) < 1e-12
     # Macro is equal-weight over classes, so it must not equal a support-
     # weighted or pooled (micro) aggregate when the classes differ in size and
     # the ranking is imperfect.  This is exactly why the averaging must be named.
@@ -3615,6 +3633,17 @@ def t_multiclass_ranking_metrics_and_audit():
     wrong = dict(good, primary_metric='roc_auc')
     wr = L.metric_policy_audit({'mc': wrong})
     assert wr['status'] == 'warn' and any('primary_metric' in w for w in wr['warnings']), wr
+    # A forged easier-than-majority floor is rejected.
+    forged_floor = dict(good, trivial_baseline=dict(good['trivial_baseline'], label='2'))
+    ff = L.metric_policy_audit({'mc': forged_floor})
+    assert ff['status'] == 'warn' and any('trivial_baseline' in w for w in ff['warnings']), ff
+    # The PR-AUC chance floor and the macro-micro F1 gap are reproducible too.
+    forged_chance = dict(good, pr_auc_macro_chance=0.001)
+    fc = L.metric_policy_audit({'mc': forged_chance})
+    assert fc['status'] == 'warn' and any('pr_auc_macro_chance' in w for w in fc['warnings']), fc
+    forged_gap = dict(good, macro_micro_f1_gap=0.5)
+    fg = L.metric_policy_audit({'mc': forged_gap})
+    assert fg['status'] == 'warn' and any('macro_micro_f1_gap' in w for w in fg['warnings']), fg
 
 
 def t_metric_policy_checks_record_values():

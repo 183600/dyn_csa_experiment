@@ -1703,4 +1703,18 @@ PR-AUC/ROC-AUC 放进 `per_class`：
 `pr_auc_macro`，只报 F1 或只报 ROC-AUC 会被标为不可作为主结论。per-class
 值与 support 存在时，macro/weighted 聚合必须能被 per-class 值复现，手改
 聚合值会被审计拒绝。`METRIC_POLICY['multiclass_classification']` 同时记录
-`macro_micro_f1_gap`，让 macro 与 micro 的分歧显式可见。
+`macro_micro_f1_gap`，让 macro 与 micro 的分歧显式可见。one-vs-rest PR-AUC
+还记录其非零 chance floor：`pr_auc_macro_chance`（有定义类的平均 prevalence）
+与 `pr_auc_weighted_chance`（support 加权），以及对应的 lift；在 1:1000
+数据上 PR-AUC=0.01 附近可能只是 chance，不能直接当作有技能。
+
+### 35.6 分类指标必须带 trivial floor
+
+只报 accuracy/F1 而不报「只猜多数类」的分数，无法判断模型是否真的学到了
+信号；1:99 不平衡时多数类分类器的 accuracy 已经是 0.99。现在
+`classification_metrics` 默认把 `trivial_baseline` 写入记录：
+`strategy="most_frequent"`（并列时按声明 label 顺序取第一个）、该类的
+accuracy、balanced accuracy 与 macro/micro/weighted F1。它在同一 label
+空间上计算，不读取分数或预测结果，因此不能通过调阈值「变强」。审计在
+per-class support 存在时会重算该 floor；若记录把 floor 的 label 改成不是
+最多数的类，或聚合值无法由 support 复现，按不可复核处理。

@@ -377,7 +377,8 @@ split, README or CI configuration was touched. (1) `classification_metrics`
 now computes one-vs-rest `pr_auc_macro`/`pr_auc_micro`/`pr_auc_weighted` and
 `roc_auc_macro`/`roc_auc_micro`/`roc_auc_weighted` for 3+ class labels, plus
 per-class PR-AUC/ROC-AUC, `undefined_classes`, `macro_micro_f1_gap`,
-`minority_prevalence` and `imbalance_ratio`. The record must name
+`minority_prevalence`, `imbalance_ratio`, and the non-zero one-vs-rest PR-AUC
+chance floors/lifts (`pr_auc_macro_chance`, `pr_auc_weighted_chance`). The record must name
 `ranking_averaging="one-vs-rest"`, because macro (equal class weight), micro
 (pooled, frequency-dominated) and weighted (support) can disagree under
 imbalance. (2) `METRIC_POLICY['multiclass_classification']` now declares those
@@ -387,5 +388,17 @@ from the full multiclass distribution (previously only two-class dicts were
 read), requires PR-AUC at extreme imbalance, checks the one-vs-rest averaging
 declaration and reproduces macro/weighted ranking aggregates from per-class
 values. (4) Tests cover perfect/imperfect/undefined rankings, impossible
-hand-edited aggregates and the extreme-imbalance warnings. The temporary issue
-list was removed after the fixes.
+hand-edited aggregates, the PR-AUC chance floor and the macro-micro F1 gap.
+The temporary issue list was removed after the fixes.
+
+## 2026-10-21 — trivial classification floor recorded with every metric summary (no new runs)
+
+`classification_metrics` now records `trivial_baseline`: the always-most-frequent
+predictor's accuracy, balanced accuracy and macro/micro/weighted F1 in the same
+label space. This makes the straw-man score explicit (at 99:1 imbalance a
+constant classifier already has accuracy 0.99) instead of leaving a bare
+accuracy/F1 to be read as model skill. `metric_policy_audit` recomputes the
+floor from per-class supports and rejects a record whose floor label or
+aggregates do not match. Tests cover binary and multiclass floors plus a forged
+easier-than-majority floor. No panel, frozen manifest, test split, README or CI
+configuration was touched.
