@@ -13929,7 +13929,8 @@ METRIC_POLICY = {
         'secondary': ['f1_micro', 'f1_weighted', 'balanced_accuracy', 'per_class_recall',
                       'macro_micro_f1_gap', 'pr_auc_macro', 'pr_auc_micro',
                       'pr_auc_weighted', 'pr_auc_macro_chance',
-                      'pr_auc_macro_lift_over_chance', 'roc_auc_macro',
+                      'pr_auc_macro_lift_over_chance', 'pr_auc_micro_chance',
+                      'pr_auc_micro_lift_over_chance', 'roc_auc_macro',
                       'roc_auc_micro', 'roc_auc_weighted', 'brier_score', 'ece'],
         'imbalance': ('macro averaging is required when class frequencies differ; micro equals '
                       'accuracy for single-label tasks; when a class is rarer than 1:1000 the '
@@ -14313,6 +14314,7 @@ def _multiclass_ranking_metrics(y_true, y_score, labels, label_names=None):
            'roc_auc_micro': None, 'pr_auc_micro': None,
            'roc_auc_chance': 0.5,
            'pr_auc_macro_chance': None, 'pr_auc_macro_lift_over_chance': None,
+           'pr_auc_micro_chance': None, 'pr_auc_micro_lift_over_chance': None,
            'pr_auc_weighted_chance': None, 'pr_auc_weighted_lift_over_chance': None,
            'averaging': 'one-vs-rest; macro/weighted over defined classes, micro over pooled decisions',
            'note': ('macro treats every class equally (sensitive to a rare class); micro is '
@@ -14341,6 +14343,15 @@ def _multiclass_ranking_metrics(y_true, y_score, labels, label_names=None):
     if _flat_y.size and _flat_y.min() == 0 and _flat_y.max() == 1:
         out['roc_auc_micro'] = _binary_roc_auc(_flat_y, _flat_s)
         out['pr_auc_micro'] = _binary_average_precision(_flat_y, _flat_s)
+        # The flattened one-vs-rest pool has exactly one positive per sample,
+        # over K*N decisions, so its PR-AUC chance floor is 1/K — not the
+        # per-class prevalence and not 0.  Without this floor a raw micro
+        # PR-AUC looks skilful merely because K is small.
+        _micro_chance = 1.0 / float(labels.size)
+        out['pr_auc_micro_chance'] = _micro_chance
+        if out['pr_auc_micro'] is not None:
+            out['pr_auc_micro_lift_over_chance'] = float(
+                out['pr_auc_micro'] - _micro_chance)
     return out
 
 
@@ -15278,6 +15289,27 @@ def metric_policy_audit(summary=None, policy=None):
                                 _class_issues.append(
                                     f'{_label}: per-class PR-AUC lift for {_k}={_got_l} '
                                     f'is not pr_auc - support prevalence ({_ap - _chance})')
+                        # Micro PR-AUC pools K one-vs-rest decisions per sample,
+                        # so its chance floor is 1/K rather than a class
+                        # prevalence.  A missing/wrong floor makes a raw micro
+                        # value look more skilful than it is.
+                        _labels_r = r.get('labels')
+                        _k_classes = (len(_labels_r) if isinstance(_labels_r, (list, tuple))
+                                      and _labels_r else len(_pc_r))
+                        if _k_classes > 0:
+                            _mc = _finite_scalar(r.get('pr_auc_micro_chance'))
+                            if (_mc is not None
+                                    and abs(_mc - 1.0 / float(_k_classes)) > 1e-12):
+                                _class_issues.append(
+                                    f'{_label}: pr_auc_micro_chance={_mc} is not '
+                                    f'1/{_k_classes} for the pooled one-vs-rest decisions')
+                            _ml = _finite_scalar(r.get('pr_auc_micro_lift_over_chance'))
+                            _pmic = _finite_scalar(r.get('pr_auc_micro'))
+                            if (_ml is not None and _pmic is not None
+                                    and abs(_ml - (_pmic - 1.0 / float(_k_classes))) > 1e-9):
+                                _class_issues.append(
+                                    f'{_label}: pr_auc_micro_lift_over_chance={_ml} is not '
+                                    f'pr_auc_micro - 1/{_k_classes}')
                     _pm = _finite_scalar(r.get('pr_auc_macro'))
                     if _pa and _pm is not None and abs(_pm - float(np.mean(_pa))) > 1e-9:
                         _class_issues.append(
@@ -15457,7 +15489,8 @@ def metric_policy_audit(summary=None, policy=None):
             for _key in ('roc_auc', 'pr_auc', 'brier_score', 'ece',
                          'roc_auc_macro', 'roc_auc_micro', 'roc_auc_weighted',
                          'pr_auc_macro', 'pr_auc_micro', 'pr_auc_weighted',
-                         'pr_auc_macro_chance', 'pr_auc_weighted_chance'):
+                         'pr_auc_macro_chance', 'pr_auc_micro_chance',
+                         'pr_auc_weighted_chance'):
                 if _key in r and r.get(_key) is not None:
                     _v = _finite_scalar(r.get(_key))
                     if _v is None or not (0.0 <= _v <= 1.0):

@@ -12270,6 +12270,22 @@ def t_metric_audit_recommended_availability_and_exact_floor_support():
     assert rs['status'] == 'warn' and any(
         'exact non-negative count' in w or 'trivial-baseline' in w
         for w in rs['warnings']), rs
+    # Micro one-vs-rest PR-AUC pools K decisions per sample: its chance floor
+    # is 1/K, not a class prevalence.  A missing/wrong floor must not pass.
+    ym = np.repeat([0, 1, 2], [90, 9, 1])
+    sm = np.random.default_rng(3).random((100, 3))
+    sm /= sm.sum(axis=1, keepdims=True)
+    mm = L.classification_metrics(ym, y_score=sm, labels=[0, 1, 2])
+    assert abs(mm['pr_auc_micro_chance'] - 1.0 / 3.0) < 1e-12, mm
+    assert abs(mm['pr_auc_micro_lift_over_chance']
+               - (mm['pr_auc_micro'] - 1.0 / 3.0)) < 1e-12, mm
+    mm.update(task='multiclass_classification', variant='mc')
+    assert L.metric_policy_audit({'mc': mm})['status'] == 'ok'
+    mm_bad = json.loads(json.dumps(mm))
+    mm_bad['pr_auc_micro_chance'] = 0.9
+    rm = L.metric_policy_audit({'mc': mm_bad})
+    assert rm['status'] == 'warn' and any(
+        'pr_auc_micro_chance' in w for w in rm['warnings']), rm
 
 
 def main():
