@@ -5629,12 +5629,8 @@ class SmallGPT(nn.Module):
         # When targets contain ignored positions, the mean must be taken over
         # the valid targets only (F.cross_entropy's own reduction), exactly as
         # the unchunked form did.  The default None means every target is valid.
-        if ignore_index is None:
-            _ign = -100
-            n_tok = int(targets.numel())
-        else:
-            _ign = int(ignore_index)
-            n_tok = int((targets != _ign).sum().item())
+        _ign = -100 if ignore_index is None else int(ignore_index)
+        n_tok = int((targets != _ign).sum().item())
         n_tok = max(n_tok, 1)
         ce = None
         _ck = torch.is_grad_enabled() and h.requires_grad
@@ -18242,7 +18238,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
     _alt_seed = _other_seed(seed)
     keys = ['python', 'numpy', 'torch', 'dataloader_generator']
     if torch.cuda.is_available():
-        keys.append('cuda')
+        keys.extend(['cuda', 'cuda_devices'])
     if sys.modules.get('tensorflow') is not None:
         keys.append('tensorflow')
 
@@ -18255,6 +18251,10 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
         }
         if torch.cuda.is_available():
             d['cuda'] = [float(x) for x in torch.rand(2, device='cuda')]
+            d['cuda_devices'] = {}
+            for _di in range(int(torch.cuda.device_count())):
+                with torch.cuda.device(_di):
+                    d['cuda_devices'][str(_di)] = [float(x) for x in torch.rand(2, device='cuda')]
         g = dataloader_generator(s)
         d['dataloader_generator'] = [int(x) for x in torch.randint(0, 2 ** 31 - 1, (4,), generator=g)]
         _tf = sys.modules.get('tensorflow')
@@ -18314,6 +18314,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
             checks['worker_seed_reproducible'] = False
             checks['worker_different_seed_changes'] = False
         checks['cuda_seeded'] = bool('cuda' in a) if torch.cuda.is_available() else None
+        checks['cuda_devices_seeded'] = (bool('cuda_devices' in a and len(a.get('cuda_devices') or {}) == int(torch.cuda.device_count())) if torch.cuda.is_available() else None)
         checks['tensorflow_seeded'] = bool('tensorflow' in a and 'tensorflow_error' not in a) if sys.modules.get('tensorflow') is not None else None
         sub = None
         if check_subprocess:
@@ -18534,8 +18535,16 @@ def _dependency_fingerprint():
 def environment_snapshot():
     """Compact software/hardware snapshot for experiment tracking."""
     import platform
+    import socket
+    try:
+        _hostname = socket.gethostname()
+    except Exception:
+        _hostname = None
     env = {
         'python': sys.version.split()[0],
+        'hostname': _hostname,
+        'process_id': os.getpid(),
+        'working_directory': os.getcwd(),
         'executable': sys.executable,
         'platform': platform.platform(),
         'machine': platform.machine(),
@@ -18836,6 +18845,15 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     if planned_cells is None:
         planned_cells = [f'{v}::seed{seed}' for seed in cfg.get('seeds') or [] for v in cfg.get('variants') or []]
     planned_cells = [str(_k) for _k in dict.fromkeys(planned_cells)]
+
+    def _curve_ref_ok(cell):
+        for _key in ('curve_ref', 'ppl_history_ref'):
+            _ref = cell.get(_key) if isinstance(cell, dict) else None
+            if not _ref or '#' in str(_ref):
+                continue
+            if not os.path.exists(os.path.join(outdir, str(_ref))):
+                return False
+        return True
     # Machine-checkable completeness of the per-cell trace.  A record without
     # provenance/hyperparameters/RNG fingerprint/curve is still a measurement,
     # but it must not silently look as traceable as a complete one.
@@ -18893,17 +18911,22 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     # a partially traced panel for a fully reproducible one.
     _missing_cells = [str(k) for k in planned_cells if k not in cells]
     _incomplete_cells = []
+    _missing_curve_refs = []
     for _k, _c in cells.items():
         _hp2 = _c.get('hyperparams') if isinstance(_c.get('hyperparams'), dict) else {}
         _curve_n = (_c.get('curve_summary') or {}).get('n_points')
+        _ref_ok = _curve_ref_ok(_c)
+        if not _ref_ok:
+            _missing_curve_refs.append(str(_k))
         if not (_c.get('code_stamp') and _hp2 and _c.get('data_version')
-                and _c.get('rng_fp') and _curve_n):
+                and _c.get('rng_fp') and _curve_n and _ref_ok):
             _incomplete_cells.append(str(_k))
     _integrity['complete_cells'] = len(cells) - len(_incomplete_cells)
     _integrity['incomplete_cells'] = _incomplete_cells[:20]
     _integrity['missing_cells'] = _missing_cells[:20]
+    _integrity['missing_curve_refs'] = _missing_curve_refs[:20]
     _integrity['complete'] = bool(not _incomplete_cells and not _missing_cells
-                                  and not _seed_mismatch)
+                                  and not _seed_mismatch and not _missing_curve_refs)
     _declared_status = status or 'complete'
     if _declared_status in ('running', 'failed', 'error'):
         _completion_status = _declared_status
@@ -18922,7 +18945,8 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                                'data_version/rng_fp/curve and seed metadata'
                                if _integrity['complete'] else
                                'panel is not fully traced: see missing_cells / '
-                               'incomplete_cells / seed_metadata_mismatch'),
+                               'incomplete_cells / missing_curve_refs / '
+                               'seed_metadata_mismatch'),
     }
     _evidence = {
         'small_batch_overfit': (bool(sanity.get('passed')) if isinstance(sanity, dict) else None),
@@ -22179,13 +22203,29 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         raise ValueError(f'overfit_sanity_check: d={d} must equal n_heads*d_head={n_heads}*{d_head}')
     if batch is not None and train_ids is not None:
         raise ValueError('overfit_sanity_check: pass either train_ids or batch, not both')
+    _steps = _exact_count(steps, minimum=1)
+    if _steps is None:
+        raise ValueError(f'overfit_sanity_check: steps must be a positive integer, got {steps!r}')
+    _seq = _exact_count(seq_len, minimum=1)
+    if _seq is None:
+        raise ValueError(f'overfit_sanity_check: seq_len must be a positive integer, got {seq_len!r}')
+    _bs = _exact_count(batch_size, minimum=1)
+    if _bs is None:
+        raise ValueError(f'overfit_sanity_check: batch_size must be a positive integer, got {batch_size!r}')
+    _vocab = _exact_count(vocab, minimum=1)
+    if _vocab is None:
+        raise ValueError(f'overfit_sanity_check: vocab must be a positive integer, got {vocab!r}')
+    steps, seq_len, batch_size, vocab = int(_steps), int(_seq), int(_bs), int(_vocab)
+    if ignore_index is not None and (isinstance(ignore_index, (bool, np.bool_))
+                                     or not isinstance(ignore_index, numbers.Integral)):
+        raise ValueError(f'overfit_sanity_check: ignore_index must be an integer or None, got {ignore_index!r}')
     device = DEVICE if device is None else device
     set_seed(seed)
     _rng_fp = rng_fingerprint()
     _label_shift_ok = None
     _batch_contract = None
     _loader_mode = None
-    _ign = None
+    _ign = None if ignore_index is None else int(ignore_index)
     ids_full = None
     if batch is not None:
         x_np, y_np = _batch_arrays(batch, vocab=vocab)
@@ -22195,7 +22235,8 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         x = torch.from_numpy(x_np).to(device)
         y = torch.from_numpy(y_np).to(device)
         _loader_mode = 'explicit_batch'
-        _ign = -100 if ignore_index is None else int(ignore_index)
+        if ignore_index is None:
+            _ign = -100
         _batch_contract = bool(x.shape[0] == y.shape[0] and y.shape[1] <= x.shape[1])
         # Explicit batches may be task-specific (NIAH/masked targets), so the
         # next-token shift is REPORTED but not required here.
@@ -22241,7 +22282,24 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     model = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
     _p_before = _param_change_sample(model).clone()
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, weight_decay=0.0, foreach=True)
+
+    def _loss_consistency():
+        with torch.no_grad():
+            _chunked = float(model.ce_loss(x, y, vocab, ignore_index=_ign).detach())
+            _measured = float(_lm_batch_metrics(model, x, y, vocab, ignore_index=_ign)[0])
+        if not (math.isfinite(_chunked) and math.isfinite(_measured)):
+            return {'chunked_ce': _chunked, 'measured_ce': _measured,
+                    'abs_diff': None, 'rel_diff': None,
+                    'tolerance': None, 'passed': False}
+        _abs = abs(_chunked - _measured)
+        _rel = _abs / max(abs(_measured), 1e-12)
+        _tol = max(1e-5, 1e-4 * abs(_measured))
+        return {'chunked_ce': _chunked, 'measured_ce': _measured,
+                'abs_diff': _abs, 'rel_diff': _rel,
+                'tolerance': _tol, 'passed': bool(_abs <= _tol)}
+
     initial_loss, initial_acc = _lm_batch_metrics(model, x, y, vocab, ignore_index=_ign)
+    _initial_loss_consistency = _loss_consistency()
     loss_curve = []
     acc_curve = []
     grad_norm_curve = []
@@ -22300,6 +22358,8 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
             _a = _lm_batch_metrics(model, x, y, vocab, ignore_index=_ign)[1]
             acc_curve.append([step + 1, _a])
     final_loss, final_acc = _lm_batch_metrics(model, x, y, vocab, ignore_index=_ign)
+    _final_loss_consistency = _loss_consistency()
+    _loss_consistency_ok = bool(_initial_loss_consistency['passed'] and _final_loss_consistency['passed'])
     _p_after = _param_change_sample(model)
     params_changed = not bool(torch.equal(_p_before, _p_after))
     _finite_losses = [v for v in loss_curve if math.isfinite(float(v))]
@@ -22323,7 +22383,8 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         and loss_decreased and _finite_curve and _nonfinite_step is None
         and _batch_contract is not False
         and (not _label_shift_required or bool(_label_shift_ok))
-        and (not _initial_chance_required or _initial_near_chance))
+        and (not _initial_chance_required or _initial_near_chance)
+        and _loss_consistency_ok)
     passed = _passed
     # Intermediate-result evidence kept alongside the pass/fail bit: a sanity
     # check that only reports "PASS" hides WHICH part of the pipeline was
@@ -22352,6 +22413,8 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         'regularization': {'weight_decay': 0.0, 'comp_lambda': 0.0, 'dropout': 0.0, 'augmentation': 'none'},
         'initial_loss': float(initial_loss),
         'initial_accuracy': float(initial_acc),
+        'loss_contract': {'initial': _initial_loss_consistency,
+                          'final': _final_loss_consistency},
         'final_loss': float(final_loss),
         'final_accuracy': float(final_acc),
         'best_loss': float(best_loss),
@@ -22385,6 +22448,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
             'batch_contract_not_failed': bool(_batch_contract is not False),
             'labels_are_next_token_shift': (bool(_label_shift_ok) if _label_shift_required else None),
             'initial_loss_near_log_vocab': (bool(_initial_near_chance) if _initial_chance_required else None),
+            'loss_reduction_matches_mean_ce': bool(_loss_consistency_ok),
         },
         'intermediate_checks': {
             'labels_are_next_token_shift': _label_shift_ok,
@@ -22395,6 +22459,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
             'params_changed': bool(params_changed),
             'loss_decreased': bool(loss_decreased),
             'grad_coverage': (float(_n_with_grad) / float(_n_trainable) if _n_trainable else 0.0),
+            'loss_reduction_matches_mean_ce': bool(_loss_consistency_ok),
         },
     }
     report['passed'] = passed
@@ -22409,6 +22474,8 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         report['diagnosis'] = 'labels are not the next-token shift of the inputs (label construction/order bug)'
     elif _initial_chance_required and not _initial_near_chance:
         report['diagnosis'] = 'initial loss is far from log(vocab) (wrong label map, vocabulary mismatch or broken initialisation)'
+    elif not _loss_consistency_ok:
+        report['diagnosis'] = 'the reported training loss does not match the mean cross-entropy over the scored targets (loss reduction/denominator bug)'
     elif _batch_contract is False:
         report['diagnosis'] = 'the explicit batch violates the shape/label contract'
     elif not (_finite_curve and _nonfinite_step is None):
@@ -22726,12 +22793,13 @@ def _repro_tiny_losses(variant, seed, *, steps=3, d=32, n_layers=1, n_heads=4, d
             torch.cuda.empty_cache()
     return losses
 
-def _repro_probe_config(*, seed, steps, tol, arch, seq_len, batch_size, vocab, mlp_ratio, data_fp, train_ids):
+def _repro_probe_config(*, seed, steps, tol, arch, seq_len, batch_size, vocab, mlp_ratio, data_fp, train_ids, lr=0.003, device=None):
     return {
-        'schema': 2,
+        'schema': 3,
         'seed': int(seed),
         'steps': int(steps),
         'tol': float(tol),
+        'lr': float(lr),
         'architecture': _repro_probe_arch(arch),
         'seq_len': int(seq_len),
         'batch_size': int(batch_size),
@@ -22739,7 +22807,7 @@ def _repro_probe_config(*, seed, steps, tol, arch, seq_len, batch_size, vocab, m
         'mlp_ratio': (None if mlp_ratio is None else float(mlp_ratio)),
         'data_source': ('train_ids' if train_ids is not None else 'synthetic'),
         'data_fp': (None if data_fp is None else str(data_fp)),
-        'device': str(DEVICE),
+        'device': str(DEVICE if device is None else device),
         'determinism': determinism_label(),
         'code': code_stamp(),
     }
@@ -22762,11 +22830,31 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
     training cell."""
     device = DEVICE if device is None else device
     seed = _seed_value(seed)
+    _steps = _exact_count(steps, minimum=1)
+    if _steps is None:
+        raise ValueError(f'reproducibility_check: steps must be a positive integer, got {steps!r}')
+    steps = int(_steps)
+    _bs = _exact_count(batch_size, minimum=1)
+    if _bs is None:
+        raise ValueError(f'reproducibility_check: batch_size must be a positive integer, got {batch_size!r}')
+    batch_size = int(_bs)
+    try:
+        _lr = float(lr)
+        _tol = float(tol)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'reproducibility_check: lr/tol must be finite numbers, got lr={lr!r} tol={tol!r}') from None
+    if not math.isfinite(_lr) or not math.isfinite(_tol) or _tol < 0:
+        raise ValueError(f'reproducibility_check: lr/tol must be finite (tol >= 0), got lr={lr!r} tol={tol!r}')
+    lr, tol = _lr, _tol
     _arch = _repro_probe_arch(arch)
     if vocab is None:
         vocab = (int(np.max(train_ids)) + 1) if train_ids is not None else 64
     if seq_len is None:
         seq_len = 16
+    _seq = _exact_count(seq_len, minimum=1)
+    if _seq is None:
+        raise ValueError(f'reproducibility_check: seq_len must be a positive integer, got {seq_len!r}')
+    seq_len = int(_seq)
     # Resolve the data identity once, using the SAME generator the losses use.
     _x, _y, _data_fp, _src = _repro_batch(seed, batch_size=batch_size, seq_len=seq_len, vocab=vocab, train_ids=train_ids)
     _fp_before = rng_fingerprint()
@@ -22790,6 +22878,7 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
         'seed': int(seed),
         'steps': int(steps),
         'tol': float(tol),
+        'lr': float(lr),
         'device': str(device),
         'determinism': determinism_label(),
         'architecture': _arch,
@@ -22824,7 +22913,7 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
         r['diagnosis'] = 'ok'
     return r
 
-def _repro_guard_base(*, seed=0, steps=3, tol=1e-06, arch=None, vocab=None, mlp_ratio=None, seq_len=None, batch_size=2, train_ids=None, data_fp=None):
+def _repro_guard_base(*, seed=0, steps=3, tol=1e-06, arch=None, vocab=None, mlp_ratio=None, seq_len=None, batch_size=2, train_ids=None, data_fp=None, lr=0.003, device=None):
     """Exact cache key shared by the guard and run()'s evidence recovery.
 
     Strictly a description of the probe that produced a PASS: changing the
@@ -22836,9 +22925,9 @@ def _repro_guard_base(*, seed=0, steps=3, tol=1e-06, arch=None, vocab=None, mlp_
     if _fp is None and train_ids is not None:
         _arr = np.asarray(train_ids)
         _fp = _ids_fp(_arr if _arr.ndim == 1 else np.ascontiguousarray(_arr).reshape(-1))
-    return _repro_probe_digest(_repro_probe_config(seed=seed, steps=steps, tol=tol, arch=arch, seq_len=(16 if seq_len is None else seq_len), batch_size=batch_size, vocab=(64 if vocab is None else vocab), mlp_ratio=mlp_ratio, data_fp=_fp, train_ids=train_ids))
+    return _repro_probe_digest(_repro_probe_config(seed=seed, steps=steps, tol=tol, arch=arch, seq_len=(16 if seq_len is None else seq_len), batch_size=batch_size, vocab=(64 if vocab is None else vocab), mlp_ratio=mlp_ratio, data_fp=_fp, train_ids=train_ids, lr=lr, device=device))
 
-def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False, arch=None, train_ids=None, vocab=None, mlp_ratio=None, seq_len=None, batch_size=2, seeds=None, strict=None):
+def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False, arch=None, train_ids=None, vocab=None, mlp_ratio=None, seq_len=None, batch_size=2, seeds=None, strict=None, lr=0.003, device=None):
     """Run ``reproducibility_check`` once per (variant, seed, probe config) per process.
 
     Mirrors ``overfit_guard``: results are cached as evidence, a skip env var
@@ -22854,6 +22943,7 @@ def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False, 
         print('[repro] guard SKIPPED (CSA_SKIP_REPRO is set) — this run has no same-machine seed check')
         return []
     _want_strict = (os.environ.get('CSA_REQUIRE_REPRO', '').strip().lower() in ('1', 'true', 'yes', 'on')) if strict is None else bool(strict)
+    _device = DEVICE if device is None else device
     _arch = _repro_probe_arch(arch)
     if vocab is None:
         vocab = (int(np.max(train_ids)) + 1) if train_ids is not None else 64
@@ -22876,7 +22966,7 @@ def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False, 
     def _base_for(v, sd):
         key = (v, sd)
         if key not in _base_cache:
-            _base_cache[key] = _repro_guard_base(seed=sd, steps=steps, tol=tol, arch=_arch, vocab=vocab, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), seq_len=seq_len, batch_size=batch_size, train_ids=train_ids, data_fp=_full_data_fp)
+            _base_cache[key] = _repro_guard_base(seed=sd, steps=steps, tol=tol, arch=_arch, vocab=vocab, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), seq_len=seq_len, batch_size=batch_size, train_ids=train_ids, data_fp=_full_data_fp, lr=lr, device=_device)
         return _base_cache[key]
 
     # As in overfit_guard, a cached FAILURE is not a certificate: retry it so a
@@ -22884,10 +22974,10 @@ def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False, 
     todo = [(v, sd) for v in variants for sd in _seed_list if force or _REPRO_GUARD.get((v, _base_for(v, sd))) is not True]
     reports = []
     for v, sd in todo:
-        r = reproducibility_check(v, seed=sd, steps=steps, tol=tol, arch=_arch, train_ids=train_ids, vocab=vocab, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), seq_len=seq_len, batch_size=batch_size)
+        r = reproducibility_check(v, seed=sd, steps=steps, tol=tol, arch=_arch, train_ids=train_ids, vocab=vocab, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), seq_len=seq_len, batch_size=batch_size, lr=lr, device=_device)
         _base = _base_for(v, sd)
         r['guard_probe_key'] = _base
-        r['guard_probe_config'] = _repro_probe_config(seed=sd, steps=steps, tol=tol, arch=_arch, seq_len=seq_len, batch_size=batch_size, vocab=vocab, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), data_fp=r.get('data_fp'), train_ids=train_ids)
+        r['guard_probe_config'] = _repro_probe_config(seed=sd, steps=steps, tol=tol, arch=_arch, seq_len=seq_len, batch_size=batch_size, vocab=vocab, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), data_fp=r.get('data_fp'), train_ids=train_ids, lr=lr, device=_device)
         key = (v, _base)
         _REPRO_GUARD[key] = bool(r['passed'])
         _REPRO_REPORTS[key] = r

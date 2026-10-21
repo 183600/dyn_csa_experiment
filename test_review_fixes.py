@@ -10557,6 +10557,124 @@ def t_encoder_fit_audit_detects_holdout_vocabulary():
         raise AssertionError('target encoder is not a single-table fit and must be refused')
 
 
+def t_overfit_loss_contract_and_ignore_index():
+    ids = np.arange(4096, dtype=np.int64) % 256
+    r = L.overfit_sanity_check('full', seed=0, steps=120, d=64, n_layers=2,
+                               n_heads=4, d_head=16, seq_len=32, batch_size=2,
+                               vocab=256)
+    assert r['passed'] is True, r
+    assert r['loss_contract']['initial']['passed'] is True, r['loss_contract']
+    assert r['loss_contract']['final']['passed'] is True, r['loss_contract']
+    assert r['pass_criteria']['loss_reduction_matches_mean_ce'] is True, r['pass_criteria']
+    r2 = L.overfit_sanity_check('full', seed=0, steps=20, d=32, n_layers=1,
+                                n_heads=4, d_head=8, seq_len=16, batch_size=2,
+                                vocab=256, train_ids=ids, ignore_index=-100)
+    assert r2['ignore_index'] == -100, r2
+    assert r2['label_contract']['ignore_index'] == -100, r2['label_contract']
+    assert r2['loss_contract']['initial']['passed'] is True, r2['loss_contract']
+    for bad in (0, -1, True, 1.5):
+        try:
+            L.overfit_sanity_check('full', steps=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'overfit_sanity_check accepted steps={bad!r}')
+    try:
+        L.overfit_sanity_check('full', ignore_index=1.5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('overfit_sanity_check accepted a non-integral ignore_index')
+
+
+def t_ce_loss_default_ignore_matches_pytorch_reduction():
+    ids = torch.arange(64, dtype=torch.long).reshape(2, 32) % 32
+    tg = torch.arange(1, 65, dtype=torch.long).reshape(2, 32) % 32
+    tg = tg.clone()
+    tg[0, :8] = -100
+    model = L.SmallGPT(32, 32, 1, 4, 8, 32, L.make_layer_cfgs(1, 'full'), mlp_ratio=2)
+    loss = float(model.ce_loss(ids, tg, 32).detach())
+    with torch.no_grad():
+        lg = model.head(model.trunk(ids))
+        ref = float(torch.nn.functional.cross_entropy(
+            lg.reshape(-1, 32), tg.reshape(-1), reduction='mean'))
+    assert math.isclose(loss, ref, rel_tol=1e-5, abs_tol=1e-6), (loss, ref)
+
+
+def t_repro_probe_config_binds_device_and_lr():
+    cpu = L._repro_guard_base(seed=0, lr=0.003, device=torch.device('cpu'))
+    cuda = L._repro_guard_base(seed=0, lr=0.003, device=torch.device('cuda'))
+    low_lr = L._repro_guard_base(seed=0, lr=0.001, device=torch.device('cpu'))
+    assert cpu != cuda, 'the reproducibility probe cache must bind the device'
+    assert cpu != low_lr, 'the reproducibility probe cache must bind the learning rate'
+    r = L.reproducibility_check('full', seed=0, steps=2, lr=0.001,
+                                device=torch.device('cpu'))
+    assert r['passed'] is True and r['lr'] == 0.001 and r['device'] == 'cpu', r
+    for bad in (0, -1, True, 1.5):
+        try:
+            L.reproducibility_check('full', steps=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'reproducibility_check accepted steps={bad!r}')
+    for bad_tol in (-1.0, float('nan')):
+        try:
+            L.reproducibility_check('full', tol=bad_tol)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'reproducibility_check accepted tol={bad_tol!r}')
+
+
+def t_seed_contract_cuda_device_inventory():
+    r = L.seed_contract_check(seed=5)
+    assert r['passed'] is True, r
+    if not torch.cuda.is_available():
+        assert r['checks']['cuda_devices_seeded'] is None, r['checks']
+    else:
+        assert r['checks']['cuda_devices_seeded'] is True, r['checks']
+
+
+def t_manifest_missing_curve_ref_is_incomplete():
+    d = tempfile.mkdtemp()
+    try:
+        tr = np.arange(512, dtype=np.int64) % 97
+        va = np.arange(64, dtype=np.int64).reshape(2, 32) % 97
+        cfg = {'seeds': [0], 'variants': ['full'], 'outdir': d,
+               'n_train_tokens': 512, 'seq_len': 32}
+        prov = L.experiment_provenance(cfg, train_ids=tr, val_batch=va, vocab=97)
+        hp = L.run_hyperparameters(cfg, seed=0, d=64, n_layers=2, n_heads=4,
+                                   d_head=16, vocab=97, mlp_ratio=4.0,
+                                   data_version=prov['data']['data_version'])
+        cell = {'variant': 'full', 'seed': 0, 'ppl': 10.0,
+                'code_stamp': L.code_stamp(), 'hyperparams': hp,
+                'data_version': prov['data']['data_version'], 'rng_fp': 'r',
+                'curve_summary': {'n_points': 2},
+                'curve_ref': 'curves/missing.json'}
+        L.write_run_manifest(d, cfg, 'FP', prov, {},
+                             cell_records={'full::seed0': cell})
+        e = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))['panels']['FP']
+        assert e['tracking_integrity']['missing_curve_refs'] == ['full::seed0'], e['tracking_integrity']
+        assert e['tracking_integrity']['complete'] is False, e['tracking_integrity']
+        os.makedirs(os.path.join(d, 'curves'), exist_ok=True)
+        with open(os.path.join(d, 'curves', 'missing.json'), 'w', encoding='utf-8') as fh:
+            json.dump({'losses': [3.0, 2.0]}, fh)
+        L.write_run_manifest(d, cfg, 'FP', prov, {},
+                             cell_records={'full::seed0': cell})
+        e = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))['panels']['FP']
+        assert e['tracking_integrity']['missing_curve_refs'] == [], e['tracking_integrity']
+        assert e['tracking_integrity']['complete'] is True, e['tracking_integrity']
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def t_environment_snapshot_runtime_identity():
+    env = L.environment_snapshot()
+    assert env.get('hostname'), env
+    assert env.get('process_id') == os.getpid(), env
+    assert env.get('working_directory') == os.getcwd(), env
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10656,6 +10774,7 @@ def main():
     _check('J4b declared objective ablations are not confounds', t_objective_ablation_is_declared_not_a_confound)
     _check('J5 span clean-baseline key', t_review3_span_clean_key)
     _check('E1 seed reproducibility', t_seed_reproducible)
+    _check('E1c seed contract inventories every CUDA device', t_seed_contract_cuda_device_inventory)
     _check('E1a seed/variant axis normalisation', t_seed_axis_normalization)
     _check('E1a2 seed scalars never truncate silently', t_seed_scalar_rejects_silent_truncation)
     _check('E1a3 seed domain validation', t_seed_domain_guard)
@@ -10666,11 +10785,16 @@ def main():
     _check('E2d failed loader contract blocks the panel', t_panel_blocks_on_loader_contract_failure)
     _check('E2e parallel child gets the seed hash', t_parallel_child_env_seed)
     _check('E3 small-batch overfit sanity', t_overfit_sanity)
+    _check('E3a overfit loss contract + ignore-index propagation', t_overfit_loss_contract_and_ignore_index)
+    _check('E3b training CE default ignore reduction', t_ce_loss_default_ignore_matches_pytorch_reduction)
     _check('E3b preflight RNG-state preservation', t_rng_state_preserved_by_preflight)
     _check('E3c duplicate-run reproducibility check', t_reproducibility_check)
     _check('E4 provenance + run manifest', t_provenance_and_manifest)
+    _check('E4a manifest requires referenced curve artifacts', t_manifest_missing_curve_ref_is_incomplete)
+    _check('E4c runtime host/process identity', t_environment_snapshot_runtime_identity)
     _check('E4b panel tracking events', t_panel_tracking_events)
     _check('E5 DataLoader/worker seeding', t_dataloader_seeding_helpers)
+    _check('E5b repro probe cache binds device and LR', t_repro_probe_config_binds_device_and_lr)
     _check('E6 end-to-end training reproducibility', t_train_variant_reproducible)
     _check('E7 overfit check detects broken optimizer', t_overfit_detects_broken_optimizer)
     _check('E8 append-only experiment ledger + manifest', t_experiment_ledger)

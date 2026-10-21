@@ -1115,7 +1115,7 @@ def _render_markdown(stats):
 
 
 def cmd_smoke(args):
-    torch.manual_seed(0)
+    L.set_seed(0)
     cfg = dict(BASE_CFG, d=64, n_layers=2, n_heads=4, d_head=16, seq_len=64,
                batch_size=4, n_train_tokens=8000, steps=3, warmup=1,
                eval_every=0, eval_subset=4, seeds=[0],
