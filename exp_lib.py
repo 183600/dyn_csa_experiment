@@ -13094,8 +13094,16 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None,
         if _cap < 1:
             raise ValueError(f'max_fit_tokens must be >= 1, got {_cap}')
         _fit_ids = _train_all[:_cap]
+    _fit_policy = protocol.get('fit_token_policy', 'deterministic_prefix')
+    if _fit_policy != 'deterministic_prefix':
+        # The implementation below always uses a deterministic prefix when the
+        # budget is exceeded.  Recording a different policy name would make
+        # the artifact describe a data path that never ran.
+        raise ValueError(
+            f'fit_token_policy={_fit_policy!r} is not implemented; the count '
+            'baseline only supports deterministic_prefix')
     _fit_meta = {
-        'fit_token_policy': protocol.get('fit_token_policy', 'deterministic_prefix'),
+        'fit_token_policy': _fit_policy,
         'max_fit_tokens': _cap,
         'n_fit_tokens': int(_fit_ids.size),
         'n_source_tokens': int(_train_all.size),
@@ -13641,6 +13649,11 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         data = {}
     if not data.get('val_fp'):
         warnings.append('artifact has no validation fingerprint — the panel comparison cannot verify it used the same validation slice')
+    _fit_policy = data.get('fit_token_policy')
+    if _fit_policy is not None and _fit_policy != 'deterministic_prefix':
+        problems.append(
+            f'count-model fit_token_policy={_fit_policy!r} is not the implemented '
+            'deterministic_prefix policy; the recorded fit budget is not reproducible')
     if data.get('fit_truncated') is True:
         _nfit = _as_seed_int(data.get('n_fit_tokens'))
         _nsrc = _as_seed_int(data.get('n_source_tokens'))

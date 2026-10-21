@@ -12244,6 +12244,20 @@ def t_simple_floor_rejects_undeclared_arms_and_blank_fields():
     rba = L.simple_baseline_audit(art, protocol=bad_arms)
     assert rba['baseline_verified'] is False and any(
         'arms field is not an object' in p for p in rba['problems']), rba
+    # The recorded fit policy must be the one the code actually implements;
+    # otherwise the artifact describes a data path that never ran.
+    try:
+        L.simple_baseline_fit(train, val, vocab,
+                              protocol=dict(proto, fit_token_policy='seeded_sample'))
+    except ValueError as _e:
+        assert 'deterministic_prefix' in str(_e), _e
+    else:
+        raise AssertionError('an unimplemented fit token policy must be refused')
+    bad_policy = json.loads(json.dumps(art))
+    bad_policy['data']['fit_token_policy'] = 'seeded_sample'
+    rbp = L.simple_baseline_audit(bad_policy, protocol=proto)
+    assert rbp['baseline_verified'] is False and any(
+        'fit_token_policy' in p for p in rbp['problems']), rbp
 
 
 def t_metric_audit_recommended_availability_and_exact_floor_support():
