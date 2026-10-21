@@ -542,3 +542,26 @@ significance when `n_skipped_config_mismatch`/`n_skipped` seeds were excluded by
 the control gate. (6) Prospective seed plans for the top-k sweep, length
 extrapolation and all cross-size scale phases were raised from 2 to 3 seeds.
 The temporary issue list was removed after the fixes.
+
+## 2026-10-21 — leakage-safe data path hardening (no new runs)
+
+Changed only the zero-GPU `data_guard.py` contract; no panel, frozen manifest,
+test split, README or CI configuration was touched. (1) Split indices are
+range-checked before the int64 cast, so unsigned/float indices above the int64
+range fail as out-of-range rather than wrapping into a misleading negative
+index. (2) Target encoding treats `NaT` as a missing label and accepts exact
+Decimal/numeric targets; persisted target tables must retain a non-empty
+`train_fp` and a consistent `n_train`, otherwise the in-sample full-table leak
+guard would silently disappear after a reload. (3) Cleaning now refuses
+`drop_invalid_labels`/non-default `label_conflicts` without labels, cleans
+duplicate/label-conflict rows in categorical tables, applies train-only
+Decimal target fences, and can keep duplicates explicitly
+(`drop_duplicates=False`). (4) `split_and_prepare` binds the quality audit to
+the split it actually returns: reserved `quality_kwargs` overrides are refused.
+(5) Numerically stable mean/std/median/quantile paths keep fitted
+preprocessing/target statistics finite and reloadable near the float64 limit,
+and a divided transform avoids overflow for opposite-signed extremes. (6)
+Signaling-NaN ordering keys are rejected before sorting, and persisted
+category/frequency tables refuse truncated/empty key tables or legacy
+non-native identities that can no longer be reconstructed. The temporary issue
+list was removed after the fixes.
