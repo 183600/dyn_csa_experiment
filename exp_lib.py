@@ -13319,9 +13319,13 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
                 'problems': ['no simple_baseline artifact (expected {"baselines": {...}})']}
     problems = []
     warnings = []
-    metric = artifact.get('selection_metric') or protocol.get('selection_metric')
-    split = artifact.get('selection_split') or protocol.get('selection_split')
-    direction = artifact.get('direction') or protocol.get('direction')
+    # Keep explicit values (including an empty string/false) as evidence; only
+    # an ABSENT key may inherit the declared protocol default.
+    def _declared_field(key):
+        return artifact[key] if key in artifact else protocol.get(key)
+    metric = _declared_field('selection_metric')
+    split = _declared_field('selection_split')
+    direction = _declared_field('direction')
     if not isinstance(metric, str) or not metric.strip():
         # A mapping/list is not a metric name; `trial.get(metric)` would raise
         # on the unhashable value instead of reporting the malformed artifact.
@@ -13339,6 +13343,15 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
     missing = sorted(declared_arms - set(baselines))
     if missing:
         problems.append(f'missing simple-baseline evidence for arms {missing}')
+    # An undeclared arm is not neutral: it can become `best_baseline` and be
+    # quoted as the tuned floor even though it was outside the declared
+    # equal-search design.  The artifact must describe exactly the arms the
+    # protocol tuned (a superset is a different search, not more evidence).
+    _extra_arms = sorted(set(baselines) - declared_arms) if declared_arms else []
+    if _extra_arms:
+        problems.append(
+            f'baselines contain undeclared arm(s) {_extra_arms}; the quoted '
+            'floor must come from the protocol\'s declared arms only')
     n_tokens_by_arm = {}
     selected_values = {}
     _search_design = protocol.get('search_design')
@@ -15154,10 +15167,11 @@ def metric_policy_audit(summary=None, policy=None):
                 _labels_tb = r.get('labels')
                 if isinstance(_pc_tb, dict) and isinstance(_labels_tb, (list, tuple)):
                     try:
-                        _sup_tb = [int(_pc_tb[str(_l)]['support']) for _l in _labels_tb]
+                        _sup_tb = [_exact_count(_pc_tb[str(_l)]['support'], minimum=0)
+                                   for _l in _labels_tb]
                     except (KeyError, TypeError, ValueError, OverflowError):
                         _sup_tb = None
-                    if _sup_tb is not None:
+                    if _sup_tb is not None and all(s is not None for s in _sup_tb):
                         _want_tb = _majority_class_floor(_labels_tb, _sup_tb)
                         for _k in ('label', 'accuracy', 'f1_macro', 'f1_micro', 'f1_weighted'):
                             _got_tb = _tb.get(_k)
@@ -15173,6 +15187,10 @@ def metric_policy_audit(summary=None, policy=None):
                                     _class_issues.append(
                                         f'{_label}: trivial_baseline {_k}={_got_tb!r} is not '
                                         f'reproducible from per_class supports ({_exp_tb!r})')
+                    elif _sup_tb is not None:
+                        _class_issues.append(
+                            f'{_label}: per_class support is not an exact non-negative '
+                            'count; the trivial-baseline floor cannot be reproduced')
             # Generic guard: a record that exposes a bare `accuracy` for a
             # classification-style task but no F1 must be treated as incomplete.
             if 'accuracy' in r and 'f1_macro' not in r:
@@ -15598,6 +15616,37 @@ def metric_policy_audit(summary=None, policy=None):
                             f'{_label}: recommended_primary_metric={_rec_metric!r} does '
                             f'not match the policy endpoint {_want_rec!r} at prevalence '
                             f'{prevalence:.3e}')
+            # `recommended_primary_available` is a claim that the recommended
+            # endpoint was actually measured.  A record can otherwise name the
+            # right metric and still omit its value (e.g. F1 without PR-AUC at
+            # 1:1000), which would make the recommendation unusable.
+            if 'recommended_primary_available' in r:
+                _avail = r.get('recommended_primary_available')
+                if not isinstance(_avail, (bool, np.bool_)):
+                    _class_issues.append(
+                        f'{_label}: recommended_primary_available={_avail!r} is not a boolean')
+                elif isinstance(_rec_metric, str):
+                    _fields = {
+                        'f1': ('f1_positive', 'f1_primary', 'f1'),
+                        'f1_macro': ('f1_macro',),
+                        'f1_micro': ('f1_micro',),
+                        'f1_weighted': ('f1_weighted',),
+                        'pr_auc': ('pr_auc',),
+                        'pr_auc_macro': ('pr_auc_macro',),
+                        'pr_auc_micro': ('pr_auc_micro',),
+                        'pr_auc_weighted': ('pr_auc_weighted',),
+                    }.get(_rec_metric, (_rec_metric,))
+                    _measured = any(_finite_scalar(r.get(k)) is not None
+                                    for k in _fields)
+                    if bool(_avail) and not _measured:
+                        _class_issues.append(
+                            f'{_label}: recommended_primary_available=True but the '
+                            f'recommended endpoint {_rec_metric!r} has no finite value '
+                            f'(looked for {list(_fields)})')
+                    elif not bool(_avail) and _measured:
+                        _class_issues.append(
+                            f'{_label}: recommended_primary_available=False but the '
+                            f'recommended endpoint {_rec_metric!r} is recorded')
             if prevalence is not None and prevalence < 1e-3:
                 _cond = (METRIC_POLICY.get(task) or {}).get(
                     'primary_when_extreme_imbalance',
@@ -15894,9 +15943,15 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         return {'status': 'not_verifiable_locally', 'tuning_verified': False,
                 'problems': ['no baseline_tuning artifact (expected {"arms": {...}})']}
     arms = selected['arms']
-    metric = selected.get('selection_metric') or protocol.get('selection_metric')
-    split = selected.get('selection_split') or protocol.get('selection_split')
-    direction = selected.get('direction') or protocol.get('direction')
+    # An explicit (even malformed) artifact field must not fall through to the
+    # protocol default: `artifact.get(k) or default` silently rewrote an empty
+    # metric/split/direction into the valid declared value, so the malformed
+    # artifact passed instead of being reported.
+    def _declared_field(key):
+        return selected[key] if key in selected else protocol.get(key)
+    metric = _declared_field('selection_metric')
+    split = _declared_field('selection_split')
+    direction = _declared_field('direction')
     problems = []
     warnings = []
     if not isinstance(metric, str) or not metric.strip():
@@ -15910,6 +15965,22 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         problems.append(f'selection metric {metric!r} differs from the declared {protocol.get("selection_metric")!r}')
     if direction not in ('lower_is_better', 'higher_is_better'):
         problems.append(f'unknown selection direction {direction!r}')
+    else:
+        # The artifact's direction is not free metadata: it decides whether
+        # the selected trial must be the argmin or the argmax.  Trusting an
+        # artifact that flips it makes a maximum-PPL trial look like the tuned
+        # winner even though the protocol declares lower-is-better.
+        _declared_direction = protocol.get('direction')
+        if (isinstance(_declared_direction, str)
+                and direction != _declared_direction):
+            problems.append(
+                f'selection direction {direction!r} differs from the declared '
+                f'{_declared_direction!r} — the artifact selected on a different '
+                'ordering than the pre-registered tuning protocol')
+        if metric == 'ppl' and direction != 'lower_is_better':
+            problems.append(
+                f'selection direction {direction!r} is incompatible with PPL '
+                '(lower_is_better); a maximum-PPL trial cannot be the tuned winner')
     # Nested-validation evidence: seed-disjoint tuning is not enough if the
     # final estimate is still measured on the documents that selected the
     # config.  Verify the row-fold contract when the artifact claims it.

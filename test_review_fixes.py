@@ -12161,6 +12161,106 @@ def t_persisted_stats_reject_silently_degraded_transforms():
             raise AssertionError(f'malformed target stats accepted: {bad}')
 
 
+def t_baseline_audit_direction_and_explicit_field_fallbacks():
+    trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
+
+    def _art(direction, select_max=False):
+        ppls = [10.0, 11.0]
+        rows = [{'config': dict(c), 'ppl': v} for c, v in zip(trials, ppls)]
+        best = max(rows, key=lambda r: r['ppl']) if select_max else min(
+            rows, key=lambda r: r['ppl'])
+        return {'selection_metric': 'ppl', 'selection_split': 'validation',
+                'direction': direction,
+                'arms': {'a': {'trials': rows, 'selected': dict(best['config']),
+                               'selected_metric_value': best['ppl']}}}
+
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL, arms=['a'], trials=trials,
+                    search_seeds=[], final_seeds=[])
+    good = L.baseline_tuning_audit(_art('lower_is_better'), protocol=protocol)
+    assert good['tuning_verified'] is True, good
+    # Flipping the artifact's direction makes a maximum-PPL trial look like
+    # the argmin.  The protocol declares lower-is-better, so that is not a
+    # tuned winner.
+    flipped = L.baseline_tuning_audit(_art('higher_is_better', select_max=True),
+                                      protocol=protocol)
+    assert flipped['tuning_verified'] is False, flipped
+    assert any('differs from the declared' in p or 'incompatible with PPL' in p
+               for p in flipped['problems']), flipped
+    # An explicitly empty/blank field is malformed evidence, not an absent key
+    # that may inherit the protocol default.
+    blank = _art('lower_is_better')
+    blank['selection_metric'] = ''
+    rb = L.baseline_tuning_audit(blank, protocol=protocol)
+    assert rb['tuning_verified'] is False and any(
+        'not a metric name' in p for p in rb['problems']), rb
+    blank_split = _art('lower_is_better')
+    blank_split['selection_split'] = ''
+    rs = L.baseline_tuning_audit(blank_split, protocol=protocol)
+    assert rs['tuning_verified'] is False and any(
+        'validation' in p for p in rs['problems']), rs
+
+
+def t_simple_floor_rejects_undeclared_arms_and_blank_fields():
+    rng = np.random.default_rng(11)
+    vocab = 24
+    train = rng.integers(0, vocab, size=400)
+    val = rng.integers(0, vocab, size=(4, 20))
+    proto = dict(L.SIMPLE_BASELINE_POLICY,
+                 arms={'unigram': {'order': 1}, 'bigram': {'order': 2}},
+                 grids={'unigram': {'alpha': [0.1, 1.0]},
+                        'bigram': {'alpha': [0.1, 1.0], 'interpolation': [0.5, 1.0]}})
+    art = L.simple_baseline_fit(train, val, vocab, protocol=proto)
+    assert L.simple_baseline_audit(art, protocol=proto)['baseline_verified'] is True
+    # A copied extra arm can otherwise be chosen as the best floor while being
+    # outside the declared equal-search design.
+    extra = json.loads(json.dumps(art))
+    extra['baselines']['extra'] = json.loads(json.dumps(extra['baselines']['unigram']))
+    extra['baselines']['extra']['selected_metric_value'] = 1e-9
+    for _t in extra['baselines']['extra']['trials']:
+        _t['ppl'] = 1e-9
+    extra['best_baseline'] = 'extra'
+    extra['best_ppl'] = 1e-9
+    rex = L.simple_baseline_audit(extra, protocol=proto)
+    assert rex['baseline_verified'] is False and any(
+        'undeclared arm' in p for p in rex['problems']), rex
+    blank = json.loads(json.dumps(art))
+    blank['selection_metric'] = ''
+    rbl = L.simple_baseline_audit(blank, protocol=proto)
+    assert rbl['baseline_verified'] is False and any(
+        'not a metric name' in p for p in rbl['problems']), rbl
+    blank_dir = json.loads(json.dumps(art))
+    blank_dir['direction'] = ''
+    rbd = L.simple_baseline_audit(blank_dir, protocol=proto)
+    assert rbd['baseline_verified'] is False and any(
+        'direction' in p for p in rbd['problems']), rbd
+
+
+def t_metric_audit_recommended_availability_and_exact_floor_support():
+    y = np.array([0] * 1000 + [1])
+    score = np.r_[np.linspace(0.0, 0.4, 1000), 0.9]
+    m = L.classification_metrics(y, y_score=score, labels=[0, 1],
+                                 positive_label=1)
+    m.update(task='binary_classification', variant='x')
+    ok = L.metric_policy_audit({'x': m})
+    assert not any('recommended_primary_available' in w for w in ok['warnings']), ok
+    m_bad = json.loads(json.dumps(m))
+    m_bad['pr_auc'] = None
+    m_bad['recommended_primary_available'] = True
+    rb = L.metric_policy_audit({'x': m_bad})
+    assert rb['status'] == 'warn' and any(
+        'recommended_primary_available=True' in w for w in rb['warnings']), rb
+    # A fractional/boolean support is not a count and cannot reproduce the
+    # majority-class floor.
+    m_sup = json.loads(json.dumps(m))
+    _k = next(k for k in m_sup['per_class']
+              if abs(float(m_sup['per_class'][k]['support']) - 1.0) < 1e-12)
+    m_sup['per_class'][_k]['support'] = 1.5
+    rs = L.metric_policy_audit({'x': m_sup})
+    assert rs['status'] == 'warn' and any(
+        'exact non-negative count' in w or 'trivial-baseline' in w
+        for w in rs['warnings']), rs
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -12496,6 +12596,9 @@ def main():
     _check('L48 seed/nested input guards', t_seed_and_nested_input_guards)
     _check('L49 malformed panel summary is excluded', t_malformed_panel_summary_is_excluded)
     _check('L50 binary PR-AUC floor follows the positive class', t_binary_pr_floor_uses_positive_prevalence)
+    _check('L51 baseline audit binds direction + rejects explicit blank fields', t_baseline_audit_direction_and_explicit_field_fallbacks)
+    _check('L51b count floor rejects undeclared arms/blank fields', t_simple_floor_rejects_undeclared_arms_and_blank_fields)
+    _check('L51c recommended endpoint availability + exact floor support', t_metric_audit_recommended_availability_and_exact_floor_support)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
