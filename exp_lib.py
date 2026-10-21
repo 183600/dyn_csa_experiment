@@ -746,9 +746,19 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     actual evaluation-subset noise."""
     # Materialise once: ``x or []`` raises for a multi-element NumPy array,
     # and a one-shot generator would be exhausted before the cluster-robust
-    # residual pass below (silently reporting n_docs=0).
-    _nll = list(nll_per_row) if nll_per_row is not None else []
-    _ntok = list(n_tokens_per_row) if n_tokens_per_row is not None else []
+    # residual pass below (silently reporting n_docs=0).  A bare scalar is a
+    # single row, not an iterable protocol violation; strings/bytes are not
+    # per-document measurements and are treated as empty rather than as
+    # character sequences.
+    def _rows(value):
+        if value is None or isinstance(value, (str, bytes, bytearray)):
+            return []
+        try:
+            return list(value)
+        except TypeError:
+            return [value]
+    _nll = _rows(nll_per_row)
+    _ntok = _rows(n_tokens_per_row)
 
     def _parse_pair(nll, ntok):
         if isinstance(nll, (bool, np.bool_)) or isinstance(ntok, (bool, np.bool_)):

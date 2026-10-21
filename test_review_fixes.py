@@ -204,6 +204,10 @@ def t_safe_exp_and_doc_ci():
     assert ci_np['n_docs'] == 3 and abs(ci_np['ppl'] - ci['ppl']) < 1e-12, ci_np
     ci_gen = L._nll_doc_ci(iter(nll), iter(ntok))
     assert ci_gen['n_docs'] == 3 and abs(ci_gen['ppl'] - ci['ppl']) < 1e-12, ci_gen
+    # A single scalar pair is one document, not an unhandled TypeError.
+    ci_scalar = L._nll_doc_ci(10.0, 100)
+    assert ci_scalar['n_docs'] == 1, ci_scalar
+    assert abs(math.log(ci_scalar['ppl']) - 0.1) < 1e-12, ci_scalar
     # The same iterable contract holds for the curve diagnostics.
     assert L._finite_curve(np.array([1.0, np.inf, 2.0]))['n_finite'] == 2
     assert L._finite_curve(iter([1.0, 2.0]))['n_finite'] == 2
