@@ -8700,16 +8700,28 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
     This check pulls a few real batches from ``batch_iter`` twice and reports
     the loader-level contract separately.  It consumes no global RNG state and
     is meant to run before a panel starts."""
-    seq_len = int(seq_len)
-    batch_size = int(batch_size)
-    n_batches = max(1, int(n_batches))
+    _seq = _exact_count(seq_len, minimum=1)
+    if _seq is None:
+        raise ValueError(f'batch_contract_check: seq_len must be a positive integer, got {seq_len!r}')
+    _bs = _exact_count(batch_size, minimum=1)
+    if _bs is None:
+        raise ValueError(f'batch_contract_check: batch_size must be a positive integer, got {batch_size!r}')
+    _nb = _exact_count(n_batches, minimum=1)
+    if _nb is None:
+        raise ValueError(f'batch_contract_check: n_batches must be a positive integer, got {n_batches!r}')
+    _vocab = None if vocab is None else _exact_count(vocab, minimum=1)
+    if vocab is not None and _vocab is None:
+        raise ValueError(f'batch_contract_check: vocab must be a positive integer or None, got {vocab!r}')
+    seq_len, batch_size, n_batches = int(_seq), int(_bs), int(_nb)
+    seed = _seed_value(seed)
+    device = device if isinstance(device, torch.device) else torch.device(device)
     report = {
         'kind': 'batch_iterator_contract',
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'seq_len': seq_len,
         'batch_size': batch_size,
         'seed': int(seed),
-        'vocab_size': (None if vocab is None else int(vocab)),
+        'vocab_size': (None if _vocab is None else int(_vocab)),
         'n_batches': n_batches,
         'device': str(device),
         'checks': {},
@@ -8725,8 +8737,8 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
         'nonempty': True,
     }
     try:
-        it_a = batch_iter(train_ids, seq_len, batch_size, device, seed=int(seed))
-        it_b = batch_iter(train_ids, seq_len, batch_size, device, seed=int(seed))
+        it_a = batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
+        it_b = batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
         for index in range(n_batches):
             xa, ya = next(it_a)
             xb, yb = next(it_b)
@@ -8748,8 +8760,8 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
             checks['same_seed_repeats_stream'] = bool(
                 checks['same_seed_repeats_stream']
                 and torch.equal(xa, xb) and torch.equal(ya, yb))
-            if vocab is not None and xa.numel() and ya.numel():
-                _v = int(vocab)
+            if _vocab is not None and xa.numel() and ya.numel():
+                _v = int(_vocab)
                 checks['ids_within_vocab'] = bool(
                     checks['ids_within_vocab']
                     and int(xa.min()) >= 0 and int(xa.max()) < _v
@@ -18192,7 +18204,7 @@ def seed_worker(worker_id):
     torch.manual_seed(_seed)
     _pin_cpu_threads()
     _pin_cuda_determinism()
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
         torch.cuda.manual_seed(_seed)
         torch.cuda.manual_seed_all(_seed)
 
@@ -22245,7 +22257,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     if ignore_index is not None and (isinstance(ignore_index, (bool, np.bool_))
                                      or not isinstance(ignore_index, numbers.Integral)):
         raise ValueError(f'overfit_sanity_check: ignore_index must be an integer or None, got {ignore_index!r}')
-    device = DEVICE if device is None else device
+    device = DEVICE if device is None else (device if isinstance(device, torch.device) else torch.device(device))
     set_seed(seed)
     _rng_fp = rng_fingerprint()
     _label_shift_ok = None
@@ -22802,7 +22814,7 @@ def _repro_tiny_losses(variant, seed, *, steps=3, d=32, n_layers=1, n_heads=4, d
     that is the property the pre-flight reproducibility guard checks.  The
     architecture/MLP/data are caller-selectable so a scale panel can repeat
     its REAL geometry instead of a tiny proxy."""
-    device = DEVICE if device is None else device
+    device = DEVICE if device is None else (device if isinstance(device, torch.device) else torch.device(device))
     set_seed(seed)
     x_np, y_np, _data_fp, _src = _repro_batch(seed, batch_size=batch_size, seq_len=seq_len, vocab=vocab, train_ids=train_ids)
     x = torch.from_numpy(np.ascontiguousarray(x_np)).to(device)
@@ -22863,7 +22875,7 @@ def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=
     the panel, so a reproducibility problem is visible instead of being an
     assumption.  The check never changes the RNG state of the following
     training cell."""
-    device = DEVICE if device is None else device
+    device = DEVICE if device is None else (device if isinstance(device, torch.device) else torch.device(device))
     seed = _seed_value(seed)
     _steps = _exact_count(steps, minimum=1)
     if _steps is None:

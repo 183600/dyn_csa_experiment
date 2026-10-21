@@ -10568,7 +10568,8 @@ def t_overfit_loss_contract_and_ignore_index():
     assert r['pass_criteria']['loss_reduction_matches_mean_ce'] is True, r['pass_criteria']
     r2 = L.overfit_sanity_check('full', seed=0, steps=20, d=32, n_layers=1,
                                 n_heads=4, d_head=8, seq_len=16, batch_size=2,
-                                vocab=256, train_ids=ids, ignore_index=-100)
+                                vocab=256, train_ids=ids, ignore_index=-100,
+                                device='cpu')
     assert r2['ignore_index'] == -100, r2
     assert r2['label_contract']['ignore_index'] == -100, r2['label_contract']
     assert r2['loss_contract']['initial']['passed'] is True, r2['loss_contract']
@@ -10610,6 +10611,8 @@ def t_repro_probe_config_binds_device_and_lr():
     r = L.reproducibility_check('full', seed=0, steps=2, lr=0.001,
                                 device=torch.device('cpu'))
     assert r['passed'] is True and r['lr'] == 0.001 and r['device'] == 'cpu', r
+    rs = L.reproducibility_check('full', seed=0, steps=2, device='cpu')
+    assert rs['passed'] is True and rs['device'] == 'cpu', rs
     for bad in (0, -1, True, 1.5):
         try:
             L.reproducibility_check('full', steps=bad)
@@ -10691,6 +10694,29 @@ def t_ledger_curve_is_bounded():
     pg, pn, pd = L._ledger_curve_points(pts, max_points=100)
     assert pn == 300 and pd is True and len(pg) <= 100, (pn, pd, len(pg))
     assert any(int(a) == 201 and math.isnan(b) for a, b in pg), 'the point reduction dropped the NaN point'
+
+
+def t_batch_contract_check_validation():
+    ids = np.arange(5000, dtype=np.int64) % 997
+    ok = L.batch_contract_check(ids, 32, 4, 'cpu', seed=7, vocab=997)
+    assert ok['passed'] is True and ok['device'] == 'cpu', ok
+    for bad in (1.5, True, -1, L.MAX_SEED + 1):
+        try:
+            L.batch_contract_check(ids, 32, 4, 'cpu', seed=bad, vocab=997)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'batch_contract_check accepted seed={bad!r}')
+    for kw in ({'n_batches': 0}, {'n_batches': 1.5}, {'vocab': 0},
+               {'seq_len': 0}, {'batch_size': True}):
+        args = dict(seq_len=32, batch_size=4, seed=7, vocab=997, device='cpu')
+        args.update(kw)
+        try:
+            L.batch_contract_check(ids, **args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'batch_contract_check accepted {kw!r}')
 
 
 def main():
@@ -10800,6 +10826,7 @@ def main():
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
     _check('E2b batch_iter uint16 transport', t_batch_iter_uint16)
     _check('E2c real batch-iterator contract check', t_batch_contract_check)
+    _check('E2c2 batch contract validates its own seed/counts', t_batch_contract_check_validation)
     _check('E2d failed loader contract blocks the panel', t_panel_blocks_on_loader_contract_failure)
     _check('E2e parallel child gets the seed hash', t_parallel_child_env_seed)
     _check('E3 small-batch overfit sanity', t_overfit_sanity)
