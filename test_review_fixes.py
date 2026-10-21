@@ -12572,6 +12572,11 @@ def t_m0_cross_scale_pairs_are_control_gated():
     assert len(gated) == 1 and gated[0][0] == 1, gated
     assert 'run_cfg' in gated[0][1], gated
     assert paired[0] == (10.0, 11.0), paired
+    # A malformed nested provenance block has no corpus identity; it must not
+    # crash the panel-fingerprint reader on a list .get().
+    _bad_prov = _rec('a', 0, fp, 10.0)
+    _bad_prov['provenance'] = {'data': ['not', 'a', 'mapping']}
+    assert M0._panel_corpus_fp({'a::seed0': _bad_prov}, 'a') is None
     # Nested tuning records: cross-scale pairing must use the held-out primary
     # estimand, not the full-validation `ppl` that still contains the rows
     # which selected the hyper-parameters.  A nested record without holdout

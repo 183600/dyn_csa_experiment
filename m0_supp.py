@@ -662,16 +662,18 @@ def _panel_corpus_fp(summary, variant=None):
             continue
         if variant is not None and rec.get('variant') != variant:
             continue
-        prov_data = (rec.get('provenance') or {}).get('data') if isinstance(rec.get('provenance'), dict) else {}
+        _prov = rec.get('provenance')
+        _pd = _prov.get('data') if isinstance(_prov, dict) else None
+        prov_data = _pd if isinstance(_pd, dict) else {}
         fp = rec.get('corpus_fp')
         if fp is None:
-            fp = (prov_data or {}).get('corpus_fp')
+            fp = prov_data.get('corpus_fp')
         if fp not in (None, ''):
             stable.add(str(fp))
             continue
         dv = rec.get('data_version')
         if dv is None:
-            dv = (prov_data or {}).get('data_version')
+            dv = prov_data.get('data_version')
         if dv not in (None, ''):
             legacy.add(str(dv))
         elif L.ppl_is_usable(rec.get('ppl')):
