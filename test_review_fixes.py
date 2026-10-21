@@ -4071,6 +4071,20 @@ def t_retrieval_metrics_and_niah_trivial_floor():
     rec = dict(rm, task='niah_natural', nll=1.25, n_queries=rm['n'])
     good = {'n::seed0': rec}
     assert L.metric_policy_audit(good)['status'] == 'ok', L.metric_policy_audit(good)
+    # A support table that does not sum to n_queries describes another sample.
+    bad_sup = json.loads(json.dumps(good))
+    _first_sup = next(iter(bad_sup['n::seed0']['answer_support']))
+    bad_sup['n::seed0']['answer_support'][_first_sup] += 1
+    ms = L.metric_policy_audit(bad_sup)
+    assert ms['status'] == 'warn', ms
+    assert any('answer-support-sum-mismatch' in str(c.get('invalid'))
+               for c in ms['checks']), ms
+    # Per-class recall must reproduce the recorded correct count/support.
+    bad_pcr = json.loads(json.dumps(good))
+    _rec_name = next(iter(bad_pcr['n::seed0']['per_class_recall']))
+    bad_pcr['n::seed0']['per_class_recall'][_rec_name] = 0.5
+    mp = L.metric_policy_audit(bad_pcr)
+    assert mp['status'] == 'warn', mp
     # Forged accuracy / majority floor / macro recall are rejected.
     for key, val in (('acc', 0.9), ('majority_accuracy', 0.1),
                      ('balanced_accuracy', 0.99), ('chance_accuracy', 0.01)):

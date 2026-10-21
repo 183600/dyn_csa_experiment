@@ -15598,18 +15598,31 @@ def metric_policy_audit(summary=None, policy=None):
                 # majority-answer floors cannot distinguish retrieval skill
                 # from class-frequency luck.
                 _supports = None
+                _support_map = None
                 if isinstance(_b.get('answer_support'), dict):
                     _raw_sup = list(_b['answer_support'].values())
+                    _raw_sup_names = list(_b['answer_support'].keys())
                 elif isinstance(_b.get('answer_support'), (list, tuple)):
                     _raw_sup = list(_b['answer_support'])
+                    _raw_sup_names = None
                 else:
                     _raw_sup = None
+                    _raw_sup_names = None
                 if _raw_sup is not None:
                     _parsed_sup = [_exact_count(v, minimum=0) for v in _raw_sup]
                     if any(v is None for v in _parsed_sup):
                         _bad_niah.append('answer-support-invalid')
                     else:
                         _supports = _parsed_sup
+                        if _raw_sup_names is not None:
+                            _support_map = dict(zip(_raw_sup_names, _parsed_sup))
+                if (_supports is not None and _nq is not None
+                        and int(sum(_supports)) != int(_nq)):
+                    # Per-class supports are the denominator of recall, the
+                    # chance floor and the majority floor.  A support table
+                    # that does not add up to the scored query count describes
+                    # a different sample than `n_queries`.
+                    _bad_niah.append('answer-support-sum-mismatch')
                 _n_classes = _exact_count(_b.get('n_classes'), minimum=1)
                 _observed_classes = (sum(1 for v in _supports if v > 0)
                                      if _supports is not None else None)
@@ -15643,6 +15656,32 @@ def metric_policy_audit(summary=None, policy=None):
                         elif _rec_vals and _ba is not None:
                             if abs(_ba - float(np.mean(_rec_vals))) > 1e-9:
                                 _bad_niah.append('macro-recall-inconsistent')
+                        if _support_map is not None:
+                            if set(_pcr) != set(_support_map):
+                                _bad_niah.append('per-class-keys-disagree')
+                            else:
+                                _correct_sum = 0.0
+                                _counts_ok = True
+                                for _name, _rv in _pcr.items():
+                                    if _rv is None:
+                                        continue
+                                    _rf = _finite_scalar(_rv)
+                                    _sp = _support_map.get(_name)
+                                    if _rf is None or _sp is None:
+                                        _counts_ok = False
+                                        break
+                                    _cf = _rf * _sp
+                                    _cr = int(round(_cf))
+                                    if (abs(_cf - _cr) > 1e-7
+                                            or _cr < 0 or _cr > _sp):
+                                        _counts_ok = False
+                                        break
+                                    _correct_sum += _cr
+                                if not _counts_ok:
+                                    _bad_niah.append('per-class-recall-count-mismatch')
+                                elif (_nc is not None
+                                      and int(round(_correct_sum)) != int(_nc)):
+                                    _bad_niah.append('per-class-correct-sum-mismatch')
                     _lch = _finite_scalar(_b.get('acc_lift_over_chance'))
                     if _lch is not None and _ch is not None and _a is not None:
                         if abs(_lch - (_a - _ch)) > 1e-9:
