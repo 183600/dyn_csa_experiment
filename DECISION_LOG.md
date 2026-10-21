@@ -83,6 +83,32 @@ test-split record was ever written.
   without removing it. Validation is also the split that was reused for all
   v6-v11 selection, so it cannot support confirmatory claims.
 
+## 2026-10-21 — baseline adequacy / conditional endpoints / degenerate cuts (no new runs)
+
+Changed only zero-GPU baseline-audit and metric-audit paths; no panel, frozen
+manifest, test split, README or CI configuration was touched. (1) The tuned
+count-model floor now has the same adequacy gate as the neural tuning: a full
+factorial grid is not enough if the selected alpha sits on the minimum/maximum
+tested level or ties the runner-up. `simple_baseline_audit` records
+`grid_adequacy`, `grid_boundary_hits`, `selection_margins` and
+`selection_tie_arms`; `methodology_audit` exposes
+`tuned_floor_claim_allowed` and refuses to describe a boundary/tied floor as a
+well-tuned one (the arithmetic floor contrast remains visible). (2)
+Multiclass one-vs-rest records now carry per-class `pr_auc_chance`,
+`pr_auc_lift_over_chance`, `roc_auc_chance` and `roc_auc_lift_over_chance`;
+the audit recomputes them from support/N and rejects forged lifts. Binary
+records expose chance-relative ROC skill. (3) `classification_metrics` now
+states a prevalence-aware `recommended_primary_metric`/`_average`; the audit
+checks that a recorded recommendation matches the policy's conditional endpoint
+(PR-AUC at <1:1000, F1 otherwise). (4) A hypothesis may declare `prevalence`;
+`hypothesis_audit` then rejects a normal F1 primary at an extreme base rate
+unless the conditional endpoint is named (or a justified secondary endpoint is
+declared). (5) Degenerate binary operating points are visible: records expose
+`predicted_positive_rate`, `degenerate_predictions`, score range and whether
+the threshold falls inside it. A threshold outside the observed score range is
+a metric-contract failure; an all-one-class cut is listed in
+`degenerate_prediction_records` rather than silently passing as model quality.
+
 ## 2026-10-20 — binary metric / calibration / F1-averaging hardening (no new runs)
 
 Changed only zero-GPU metric and audit paths; no panel, frozen manifest, test
