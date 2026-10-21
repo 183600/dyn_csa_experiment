@@ -9200,6 +9200,19 @@ def t_target_encoder_prevents_self_and_group_leakage():
         pass
     else:
         raise AssertionError('one group cannot define out-of-fold folds')
+    # A single training row has no out-of-fold reference at all; emitting an
+    # all-zero target feature would pretend the encoding was estimated.
+    try:
+        L.LeakageSafeTargetEncoder().fit_transform(
+            np.array([['a']], dtype=object), np.array([1.0]))
+    except ValueError as e:
+        assert 'at least 2 training rows' in str(e), e
+    else:
+        raise AssertionError('one row cannot define an out-of-fold encoding')
+    # fit (full-table transform for holdouts) is still valid with one row.
+    _one = L.LeakageSafeTargetEncoder().fit(
+        np.array([['a']], dtype=object), np.array([1.0]))
+    assert np.allclose(_one.transform(np.array([['a']], dtype=object)), 1.0)
 
 
 def t_clean_training_rows_and_split():

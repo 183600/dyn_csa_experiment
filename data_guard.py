@@ -1873,9 +1873,18 @@ class LeakageSafeTargetEncoder:
 
     def fit_transform(self, X, y, *, groups=None, time=None):
         """Return out-of-fold training encodings (safe for model fitting)."""
-        self.fit(X, y, groups=groups, time=time)
         Xarr = _as_categorical_2d(X)
         n = Xarr.shape[0]
+        if n < 2:
+            # Out-of-fold encoding needs at least one row outside the held
+            # fold.  With a single row the "encoding" would be an arbitrary
+            # prior with no reference labels, silently pretending the target
+            # feature was estimated.  Refuse instead of emitting that value.
+            raise ValueError(
+                'LeakageSafeTargetEncoder.fit_transform needs at least 2 '
+                'training rows so a held row has out-of-fold reference '
+                f'labels, got {n}')
+        self.fit(X, y, groups=groups, time=time)
         yarr = self._target_array(y, n)
         if time is not None and groups is not None:
             folds = self._group_time_folds(groups, time, n)
