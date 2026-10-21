@@ -3028,7 +3028,36 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     Returns a dict with ``indices``, per-split ``X`` (and ``y``), the fitted
     ``preprocessor`` (or ``None`` when ``preprocess=False``), an optional
     ``cleaning`` record and optionally the ``quality`` report.
+
+    Options that would otherwise be silently ignored are refused: any
+    cleaning choice requires ``clean_train=True`` and any preprocessor option
+    requires ``preprocess=True``.  A caller that asked for label-noise removal
+    or train-only scaling must not receive an unchanged, unfitted pipeline.
     """
+    if not clean_train:
+        _ignored = []
+        if label_conflicts != 'drop':
+            _ignored.append(f'label_conflicts={label_conflicts!r}')
+        if drop_invalid_labels:
+            _ignored.append('drop_invalid_labels=True')
+        if drop_nonfinite_features:
+            _ignored.append('drop_nonfinite_features=True')
+        if outlier_iqr is not None:
+            _ignored.append('outlier_iqr')
+        if target_outlier_iqr is not None:
+            _ignored.append('target_outlier_iqr')
+        if _ignored:
+            raise ValueError(
+                'split_and_prepare: cleaning option(s) '
+                + ', '.join(_ignored)
+                + ' require clean_train=True; refusing to ignore a requested '
+                'training-set cleaning step')
+    if not preprocess and preprocessor_kwargs:
+        raise ValueError(
+            'split_and_prepare: preprocessor options '
+            + ', '.join(sorted(preprocessor_kwargs))
+            + ' were supplied while preprocess=False; refusing to ignore a '
+            'requested train-only preprocessing step')
     Xarr = _as_numeric_2d(X)
     n = int(Xarr.shape[0])
     yarr = None

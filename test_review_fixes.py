@@ -11715,6 +11715,40 @@ def t_missing_group_ids_are_one_opaque_group():
         raise AssertionError('a missing group must not be cut across folds')
 
 
+def t_split_and_prepare_refuses_ignored_options():
+    # Cleaning options without clean_train=True were silently ignored, so a
+    # caller asking to drop invalid labels or outliers got an unfitted/unchanged
+    # training split.  Preprocessor options were likewise ignored when
+    # preprocess=False.  Both are now hard errors.
+    import data_guard as DG
+    X = np.arange(12, dtype=float).reshape(6, 2)
+    y = np.arange(6.0)
+    for bad in ({'drop_invalid_labels': True},
+                {'drop_nonfinite_features': True},
+                {'outlier_iqr': 1.5},
+                {'target_outlier_iqr': 1.5},
+                {'label_conflicts': 'keep'},
+                {'label_conflicts': 'raise'}):
+        try:
+            DG.split_and_prepare(X, y, **bad)
+        except ValueError as e:
+            assert 'require clean_train=True' in str(e), (bad, e)
+        else:
+            raise AssertionError(f'split_and_prepare silently ignored {bad!r}')
+    try:
+        DG.split_and_prepare(X, preprocess=False, scale='robust')
+    except ValueError as e:
+        assert 'preprocess=False' in str(e), e
+    else:
+        raise AssertionError('preprocess=False must not ignore preprocessor options')
+    # The same options are accepted when their stage is actually enabled.
+    out = DG.split_and_prepare(X, y, clean_train=True,
+                               drop_invalid_labels=True)
+    assert out['cleaning']['n_invalid_label_rows_dropped'] == 0, out['cleaning']
+    raw = DG.split_and_prepare(X, preprocess=False)
+    assert raw['preprocessor'] is None
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11924,6 +11958,7 @@ def main():
     _check('I20b all missing group ids share one opaque identity', t_missing_group_ids_are_one_opaque_group)
     _check('I21 split-and-prepare fits preprocessing on train only', t_split_and_prepare_fits_train_only)
     _check('I21d strict post-split quality gate', t_split_and_prepare_strict_quality_gate)
+    _check('I21f split-and-prepare refuses ignored cleaning/preprocessing options', t_split_and_prepare_refuses_ignored_options)
     _check('I21a data-quality temporal split audit', t_data_quality_temporal_audit)
     _check('I21b capped test document-id sidecar', t_capped_document_id_sidecar)
     _check('I21c near-duplicate document chains stay on one side', t_document_dedup_closes_near_duplicate_chains)
