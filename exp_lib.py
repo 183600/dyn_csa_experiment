@@ -14293,17 +14293,28 @@ METRIC_POLICY = {
     'niah_retrieval': {
         'task': 'multi_class_retrieval',
         'primary': 'top1_accuracy',
+        # When one answer class is rarer than 1:1000, top-1 accuracy is
+        # dominated by the frequent answers.  Macro recall (balanced accuracy)
+        # is the recall-aligned conditional endpoint; PR-AUC is deliberately
+        # NOT used because a many-way retrieval record may carry only top-1
+        # labels, and inventing one-vs-rest scores from them is not valid.
+        'primary_when_extreme_imbalance': 'macro_recall',
+        'extreme_imbalance_threshold': 1e-3,
         'direction': 'higher_is_better',
         'secondary': ['answer_nll', 'balanced_accuracy', 'macro_recall',
                       'chance_accuracy', 'majority_accuracy',
-                      'acc_lift_over_chance', 'acc_lift_over_majority'],
+                      'acc_lift_over_chance', 'acc_lift_over_majority',
+                      'minority_prevalence', 'imbalance_ratio'],
         'chance': '1/n_observed_answer_classes (uniform); majority-answer floor also required',
         'imbalance': ('top-1 micro accuracy is dominated by frequent answer classes; '
-                      'report macro recall and the uniform/majority floors alongside it'),
+                      'report macro recall and the uniform/majority floors alongside it. '
+                      'When a class is rarer than 1:1000 the primary endpoint switches '
+                      'to macro recall (balanced accuracy).'),
         'aggregation': 'query_unweighted',
         'note': ('Top-1 accuracy is reported with answer NLL, macro recall (balanced accuracy) '
                  'and the trivial uniform/majority floors. PR-AUC/ROC-AUC are not substitutes '
-                 'for a many-way retrieval endpoint and must not be invented from top-1 labels.'),
+                 'for a many-way retrieval endpoint and must not be invented from top-1 labels. '
+                 'Under extreme answer-class imbalance, macro recall is the conditional primary.'),
     },
     'binary_classification': {
         'task': 'binary_classification',
@@ -14763,8 +14774,33 @@ def retrieval_metrics(y_true, y_pred, labels=None, label_names=None):
     chance = (1.0 / defined) if defined else None
     majority = (majority_support / n) if n else None
     balanced = (recall_sum / defined) if defined else None
+    # Extreme answer-class imbalance: top-1 micro accuracy can be high while a
+    # rare answer class is never retrieved.  Macro recall is the recall-aligned
+    # conditional endpoint, not an invented PR-AUC from top-1 labels.
+    _observed_prev = [(int(row['support']) / n) for row in per_class.values()
+                      if int(row['support']) > 0 and n]
+    _minority_prev = min(_observed_prev) if _observed_prev else None
+    _imbalance_ratio = ((1.0 - _minority_prev) / _minority_prev
+                        if _minority_prev is not None and _minority_prev > 0 else None)
+    _rare = (_minority_prev is not None and _minority_prev < 1e-3)
+    _recommended = 'macro_recall' if _rare else 'top1_accuracy'
     return {
         'n': n, 'n_correct': n_correct,
+        'minority_prevalence': _minority_prev,
+        'imbalance_ratio': _imbalance_ratio,
+        'imbalance_warning': (
+            'an answer class is rarer than 1:1000 — report macro recall '
+            '(balanced accuracy) as the conditional primary; top-1 accuracy '
+            'is dominated by frequent answers' if _rare else None),
+        'recommended_primary_metric': _recommended,
+        'recommended_primary_reason': (
+            ('minority answer prevalence %.3e is below 1:1000; macro recall '
+             'counts every answer class equally' % _minority_prev) if _rare else
+            ('minority answer prevalence %s is not extreme; top-1 accuracy is '
+             'the policy primary' % ('n/a' if _minority_prev is None
+                                     else '%.3e' % _minority_prev))),
+        'recommended_primary_available': bool(
+            balanced is not None if _rare else acc is not None),
         'acc': acc, 'top1_accuracy': acc,
         'balanced_accuracy': balanced, 'macro_recall': balanced,
         'n_classes': defined,
@@ -15869,6 +15905,39 @@ def metric_policy_audit(summary=None, policy=None):
                     if _lmj is not None and _mj is not None and _a is not None:
                         if abs(_lmj - (_a - _mj)) > 1e-9:
                             _bad_niah.append('majority-lift-inconsistent')
+                    # Conditional endpoint: with an answer class rarer than
+                    # 1:1000, top-1 accuracy is dominated by the frequent
+                    # classes and macro recall becomes the policy primary.
+                    # Require the record to declare that switch (and to keep
+                    # top-1 when the imbalance is not extreme), instead of
+                    # letting a bare top-1 headline stand in for retrieval
+                    # skill on a rare answer class.
+                    if _supports and _nq:
+                        _positive = [v for v in _supports if v > 0]
+                        try:
+                            _minority = (min(_positive) / float(_nq)
+                                         if _positive else None)
+                        except (OverflowError, ValueError, TypeError):
+                            # An astronomically large support count is valid
+                            # exact evidence but not representable as a float
+                            # prevalence; the conditional endpoint stays
+                            # unverifiable instead of aborting the audit.
+                            _minority = None
+                        _extreme = (_minority is not None and _minority < 1e-3)
+                        _want_primary = ('macro_recall' if _extreme
+                                         else 'top1_accuracy')
+                        _declared_primary = _b.get('recommended_primary_metric')
+                        if _declared_primary is None:
+                            _bad_niah.append('conditional-primary-missing')
+                        elif _declared_primary != _want_primary:
+                            _bad_niah.append(
+                                'conditional-primary-mismatch')
+                        _rec_avail = _b.get('recommended_primary_available')
+                        if _rec_avail is not None and not isinstance(
+                                _rec_avail, (bool, np.bool_)):
+                            _bad_niah.append('conditional-primary-availability-invalid')
+                        elif _rec_avail is False:
+                            _bad_niah.append('conditional-primary-unavailable')
                 else:
                     _legacy_niah.append(_b.get('variant') or _b.get('name') or '?')
             out['checks'].append({'metric': 'niah_retrieval', 'policy': 'niah_retrieval',

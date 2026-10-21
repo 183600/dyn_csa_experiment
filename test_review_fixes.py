@@ -4242,6 +4242,32 @@ def t_retrieval_metrics_and_niah_trivial_floor():
     rec = dict(rm, task='niah_natural', nll=1.25, n_queries=rm['n'])
     good = {'n::seed0': rec}
     assert L.metric_policy_audit(good)['status'] == 'ok', L.metric_policy_audit(good)
+    assert rm['recommended_primary_metric'] == 'top1_accuracy', rm
+    # Extreme answer-class imbalance switches the conditional primary to
+    # macro recall; a top-1 headline would otherwise be dominated by the
+    # frequent answers.
+    _y_imb = [0] * 1000 + [1]
+    _p_imb = [0] * 1001
+    ri = L.retrieval_metrics(_y_imb, _p_imb)
+    assert ri['minority_prevalence'] < 1e-3, ri
+    assert ri['recommended_primary_metric'] == 'macro_recall', ri
+    assert ri['recommended_primary_available'] is True, ri
+    _ri_rec = dict(ri, task='niah_natural', nll=1.0, n_queries=ri['n'])
+    _ri_good = {'n::seed0': _ri_rec}
+    _ra = L.metric_policy_audit(_ri_good)
+    assert _ra['status'] == 'ok', _ra
+    _bad_pri = json.loads(json.dumps(_ri_good))
+    _bad_pri['n::seed0']['recommended_primary_metric'] = 'top1_accuracy'
+    _rbp = L.metric_policy_audit(_bad_pri)
+    assert _rbp['status'] == 'warn', _rbp
+    assert any('conditional-primary-mismatch' in str(c.get('invalid'))
+               for c in _rbp['checks']), _rbp
+    _miss_pri = json.loads(json.dumps(_ri_good))
+    _miss_pri['n::seed0'].pop('recommended_primary_metric')
+    _rmp = L.metric_policy_audit(_miss_pri)
+    assert _rmp['status'] == 'warn', _rmp
+    assert any('conditional-primary-missing' in str(c.get('invalid'))
+               for c in _rmp['checks']), _rmp
     # A support table that does not sum to n_queries describes another sample.
     bad_sup = json.loads(json.dumps(good))
     _first_sup = next(iter(bad_sup['n::seed0']['answer_support']))
