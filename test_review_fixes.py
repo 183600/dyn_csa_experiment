@@ -5699,6 +5699,23 @@ def t_split_sizes_explicit_never_negative():
     assert len(L.chronological_split_indices(100.0)['train']) == 80
 
 
+def t_empty_split_still_validates_fractions():
+    # An empty table must not bypass the fraction contract: the same
+    # contradictory arguments rejected for n>0 must be rejected for n=0, so a
+    # caller cannot build a split spec that only fails after rows are appended.
+    idx = L.chronological_split_indices(0)
+    assert all(len(idx[k]) == 0 for k in ('train', 'val', 'test')), idx
+    for bad in ({'train_frac': 0.5, 'val_frac': 0.5, 'test_frac': 0.5},
+                {'train_frac': -0.1, 'val_frac': 0.6, 'test_frac': 0.5},
+                {'train_frac': 0.0, 'val_frac': 0.0, 'test_frac': 0.0}):
+        try:
+            L.chronological_split_indices(0, **bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'n=0 accepted invalid fractions {bad!r}')
+
+
 def t_audit_split_sequence_overlap():
     # A 1-D token cache stores train as a stream: a validation row overlapping
     # at an arbitrary offset must still be detected (not only at aligned rows).
@@ -10203,6 +10220,7 @@ def main():
     _check('L37c tuning margin does not invent precision', t_tuning_margin_does_not_invent_precision)
     _check('L37d ladder missing seed plan is not common', t_scale_ladder_missing_seed_plan_is_not_common)
     _check('L38 small-n split remainder + string order keys', t_small_n_split_remainder_and_string_order)
+    _check('L38b empty split still validates fractions', t_empty_split_still_validates_fractions)
     _check('L39 split audit recomputes fingerprints and doc sidecars', t_split_discipline_recomputes_fingerprints_and_doc_sidecars)
     _check('L40 archive refuses links and repo escape', t_archive_refuses_links_and_repo_escape)
     _check('L41 warmup table uses the primary estimand', t_build_report_warmup_uses_primary_estimand)

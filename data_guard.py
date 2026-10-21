@@ -160,16 +160,20 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
             raise ValueError(f'could not reconcile split sizes {sizes} with n={n}')
         return tuple(int(v) for v in sizes)
 
-    if n == 0:
-        # An empty dataset splits into three empty (non-overlapping) parts;
-        # requiring one row per non-empty split would be impossible.
-        return (0, 0, 0)
+    # Validate the fraction contract even for an empty table.  Returning
+    # (0, 0, 0) before this check made n=0 accept contradictory arguments
+    # that the same call rejects for n>0; a caller that later appends rows
+    # would then be surprised by a different split.
     frac_sum = train_frac + val_frac + test_frac
     if frac_sum <= 0:
         raise ValueError('at least one split fraction must be positive')
     if abs(frac_sum - 1.0) > 1e-6:
         raise ValueError(
             f'train_frac + val_frac + test_frac must sum to 1, got {frac_sum}')
+    if n == 0:
+        # An empty dataset splits into three empty (non-overlapping) parts;
+        # requiring one row per non-empty split would be impossible.
+        return (0, 0, 0)
     sizes = [int(math.floor(n * f)) for f in (train_frac, val_frac, test_frac)]
     # Small n: guarantee one row for every requested non-empty split.  Larger
     # splits are reduced first (from the end) so the chronological order is
