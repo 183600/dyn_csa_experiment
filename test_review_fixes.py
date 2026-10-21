@@ -11362,6 +11362,11 @@ def t_archive_refuses_links_and_repo_escape():
             mt.size = len(malformed_bytes)
             tf.addfile(mt, io.BytesIO(malformed_bytes))
         assert AR.cmd_verify(malformed) == 1
+        # A corrupt/non-tar archive is a verification failure, not a crash.
+        corrupt = os.path.join(d, 'release_corrupt.tar.gz')
+        with open(corrupt, 'wb') as f:
+            f.write(b'not a tar archive')
+        assert AR.cmd_verify(corrupt) == 1
 
 
 

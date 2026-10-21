@@ -381,7 +381,12 @@ def cmd_verify(tar_path):
             print(f'[archive] archive sha256: {got}  {"OK" if got == want else "MISMATCH (expected " + want + ")"}')
             if got != want:
                 return 1
-    with tarfile.open(tar_path, 'r:gz') as tf:
+    try:
+        _tf = tarfile.open(tar_path, 'r:gz')
+    except (tarfile.TarError, OSError, EOFError) as e:
+        print(f'[archive] REFUSE: cannot read the archive ({type(e).__name__}: {e})')
+        return 1
+    with _tf as tf:
         names = tf.getnames()
         if len(names) != len(set(names)):
             print('[archive] REFUSE: the archive contains duplicate member names')
