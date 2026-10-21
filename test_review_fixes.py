@@ -9081,6 +9081,18 @@ def t_target_encoder_prevents_self_and_group_leakage():
     assert np.allclose(enc.transform(hold), xh)
     restored = L.LeakageSafeTargetEncoder.from_stats(before)
     assert np.allclose(restored.transform(hold), xh)
+    # Applying the full-table lookup to the training rows would encode each
+    # row with its own label; refuse unless the caller explicitly asks for a
+    # diagnostic in-sample transform.
+    for _enc_obj in (enc, restored):
+        try:
+            _enc_obj.transform(X)
+        except ValueError as e:
+            assert 'exact training rows' in str(e), e
+        else:
+            raise AssertionError('in-sample target encoding must be refused')
+        assert np.allclose(_enc_obj.transform(X, allow_train=True),
+                           _enc_obj.transform(X, allow_train=True))
     # Missing categories are a learned training level, not silently a prior.
     Xm = np.array([['a'], [None], ['a'], [None], ['b'], ['a']], dtype=object)
     em = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(Xm, y)

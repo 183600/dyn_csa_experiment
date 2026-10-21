@@ -1866,9 +1866,24 @@ class LeakageSafeTargetEncoder:
                 out[pos, j] = lookup.get(key, prior)
         return out
 
-    def transform(self, X):
-        """Encode holdout rows with the full training-level table."""
+    def transform(self, X, *, allow_train=False):
+        """Encode holdout rows with the full training-level table.
+
+        The full-table lookup includes every training label, so applying it to
+        the training rows themselves is the classic target-encoding leak.  The
+        training matrix is recognised by its fingerprint and refused; use
+        :meth:`fit_transform` for training rows (out-of-fold encodings).  A
+        deliberate diagnostic may pass ``allow_train=True``.
+        """
         Xarr = self._check_transform_input(X)
+        if (not allow_train and self.train_fp_ is not None
+                and _categorical_fingerprint(Xarr) == self.train_fp_):
+            raise ValueError(
+                'LeakageSafeTargetEncoder.transform was given the exact '
+                'training rows, but its full-table encoding contains their '
+                'own labels; use fit_transform for training rows (out-of-fold '
+                'encodings) and reserve transform for validation/test, or '
+                'pass allow_train=True for an explicit diagnostic')
         return self._apply(self.feature_stats_, Xarr)
 
     def fit_transform(self, X, y, *, groups=None, time=None):
