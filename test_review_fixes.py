@@ -7289,6 +7289,23 @@ def t_simple_baseline_audit_malformed_records():
     art3['selection_metric'] = {'not': 'a metric'}
     out3 = L.simple_baseline_audit(art3)
     assert out3['status'] == 'fail' and any('not a metric name' in p for p in out3['problems']), out3
+    # Malformed declared grids/arm metadata are evidence problems, not
+    # AttributeError/TypeError crashes in the audit.
+    for _bad_proto in (
+            {'arms': {'a': {'order': 1}}, 'grids': ['not-a-mapping']},
+            {'arms': {'a': ['not-a-mapping']},
+             'grids': {'a': {'alpha': [0.1]}}},
+            {'arms': {'a': {'order': 1}},
+             'grids': {'a': {'alpha': 0.1}}},
+            {'arms': {'a': {'order': 1}},
+             'grids': {'a': {'alpha': ['not-numeric']}}}):
+        _bad_art = json.loads(json.dumps(art3))
+        _bad_art['protocol'] = dict(_bad_proto,
+                                    selection_metric='ppl',
+                                    selection_split='validation',
+                                    direction='lower_is_better')
+        _bad_out = L.simple_baseline_audit(_bad_art)
+        assert _bad_out['status'] == 'fail', (_bad_proto, _bad_out)
 
 
 

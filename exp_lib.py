@@ -13399,6 +13399,9 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         # unverifiable (legacy artifacts), not silently "complete".
         _declared_arm = isinstance(_declared, dict) and arm in _declared
         _meta = _declared.get(arm) if _declared_arm else {}
+        if _meta is not None and not isinstance(_meta, dict):
+            problems.append(f'{arm}: declared arm metadata is not an object')
+            _meta = {}
         _order = (_as_seed_int((_meta or {}).get('order', 1))
                   if _declared_arm else None)
         if _declared_arm and _order not in (1, 2):
@@ -13420,20 +13423,47 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
                     problems.append(
                         f'{arm}: selected config order {chosen.get("order")!r} '
                         f'differs from the declared order {_order}')
-        _grid = (protocol.get('grids') or {}).get(arm) or {}
+        _grids = protocol.get('grids')
+        _grid = _grids.get(arm) if isinstance(_grids, dict) else None
+        if _grid is not None and not isinstance(_grid, dict):
+            problems.append(f'{arm}: declared grid is not an object')
+            _grid = {}
+        _grid = _grid or {}
         _grid_declared = (isinstance(_grid, dict) and 'alpha' in _grid
                           and _order in (1, 2))
-        _alphas = list(_grid.get('alpha') or [0.1])
-        _interps = (list(_grid.get('interpolation') or [1.0])
+
+        def _grid_levels(raw, default):
+            # A single declared level is legal; list/tuple values are the
+            # normal grid spelling.  Anything else scalar is one level, not an
+            # iterable (list(1) used to raise TypeError).
+            if raw is None:
+                return [default]
+            if isinstance(raw, (list, tuple)):
+                return list(raw)
+            return [raw]
+
+        _alphas = _grid_levels(_grid.get('alpha'), 0.1)
+        _interps = (_grid_levels(_grid.get('interpolation'), 1.0)
                     if _order == 2 else [0.0])
         if _grid_declared:
             _expected = set()
+            _bad_levels = []
             for _a in _alphas:
                 for _lam in _interps:
-                    _cfg = {'order': _order, 'alpha': float(_a)}
-                    if _order == 2:
-                        _cfg['interpolation'] = float(_lam)
+                    try:
+                        _a_f = float(_a)
+                        _lam_f = float(_lam)
+                        _cfg = {'order': _order, 'alpha': _a_f}
+                        if _order == 2:
+                            _cfg['interpolation'] = _lam_f
+                    except (TypeError, ValueError, OverflowError):
+                        _bad_levels.append((_a, _lam))
+                        continue
                     _expected.add(json.dumps(_cfg, sort_keys=True, default=str))
+            if _bad_levels:
+                problems.append(
+                    f'{arm}: declared grid contains non-numeric level(s) '
+                    f'{_bad_levels[:4]}')
             _actual = set(cfgs)
             _missing_cells = sorted(_expected - _actual)
             _extra_cells = sorted(_actual - _expected)
