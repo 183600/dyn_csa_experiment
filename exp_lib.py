@@ -14010,7 +14010,27 @@ def _binary_average_precision(y, score):
     return float(np.sum(np.diff(np.r_[0.0, recall]) * precision))
 
 
-def _multiclass_ranking_metrics(y_true, y_score, labels):
+def _display_label_names(labels):
+    """Unique human-readable names for a declared label set.
+
+    ``str()`` is the historical key, but distinct label identities can share a
+    spelling (the integer ``1`` and the string ``'1'``).  A report keyed by
+    ``str`` would then overwrite one class and double-count the other.  Keep
+    the historical spelling when it is unambiguous; otherwise fall back to
+    ``repr`` and, if even that collides, to positional suffixes so every
+    declared class keeps exactly one row.
+    """
+    values = labels.tolist() if isinstance(labels, np.ndarray) else list(labels)
+    names = [str(v) for v in values]
+    if len(set(names)) == len(names):
+        return names
+    names = [repr(v) for v in values]
+    if len(set(names)) == len(names):
+        return names
+    return [f'{name}#{i}' for i, name in enumerate(names)]
+
+
+def _multiclass_ranking_metrics(y_true, y_score, labels, label_names=None):
     """One-vs-rest PR-AUC/ROC-AUC for a 3+ class endpoint.
 
     Each class is scored as a binary problem against its own score column.
@@ -14025,6 +14045,11 @@ def _multiclass_ranking_metrics(y_true, y_score, labels):
     y_true = np.asarray(y_true).ravel()
     score = np.asarray(y_score, dtype=float)
     labels = np.asarray(labels)
+    if label_names is None:
+        label_names = _display_label_names(labels)
+    label_names = list(label_names)
+    if len(label_names) != int(labels.size) or len(set(label_names)) != len(label_names):
+        raise ValueError('label_names must provide one unique display name per label')
     if score.ndim != 2 or score.shape[1] != labels.size:
         raise ValueError(
             f'multiclass ranking needs a column-per-label score matrix, got {score.shape} '
@@ -14040,13 +14065,14 @@ def _multiclass_ranking_metrics(y_true, y_score, labels):
         n_neg = int(y_bin.size - n_pos)
         auc = _binary_roc_auc(y_bin, score[:, i]) if n_pos and n_neg else None
         ap = _binary_average_precision(y_bin, score[:, i]) if n_pos and n_neg else None
-        per_class[str(lab)] = {'roc_auc': auc, 'pr_auc': ap, 'support': n_pos}
+        _name = label_names[i]
+        per_class[_name] = {'roc_auc': auc, 'pr_auc': ap, 'support': n_pos}
         if auc is not None and ap is not None:
-            defined.append(str(lab))
+            defined.append(_name)
             supports.append(n_pos)
             weights.append(float(n_pos))
     out = {'per_class': per_class, 'defined_classes': defined,
-           'undefined_classes': [str(l) for l in labels if str(l) not in set(defined)],
+           'undefined_classes': [n for n in label_names if n not in set(defined)],
            'roc_auc_macro': None, 'roc_auc_weighted': None,
            'pr_auc_macro': None, 'pr_auc_weighted': None,
            'roc_auc_micro': None, 'pr_auc_micro': None,
@@ -14083,7 +14109,7 @@ def _multiclass_ranking_metrics(y_true, y_score, labels):
     return out
 
 
-def _majority_class_floor(labels, supports):
+def _majority_class_floor(labels, supports, label_names=None):
     """Metrics of the always-majority predictor (a trivial classification floor).
 
     A classifier's F1/accuracy is not interpretable without the score its
@@ -14095,6 +14121,11 @@ def _majority_class_floor(labels, supports):
     supports = [int(s) for s in supports]
     n = int(sum(supports))
     labels = list(labels)
+    if label_names is None:
+        label_names = [str(v) for v in labels]
+    label_names = list(label_names)
+    if len(label_names) != len(labels):
+        raise ValueError('label_names must provide one display name per label')
     if n <= 0 or not labels:
         return {'strategy': 'most_frequent', 'label': None, 'accuracy': None,
                 'balanced_accuracy': None, 'f1_macro': None, 'f1_micro': None,
@@ -14106,7 +14137,7 @@ def _majority_class_floor(labels, supports):
     f1_major = 2.0 * p / (1.0 + p) if p > 0 else 0.0
     return {
         'strategy': 'most_frequent',
-        'label': str(labels[best_i]),
+        'label': str(label_names[best_i]),
         'support': s,
         'accuracy': p,
         'balanced_accuracy': 1.0 / len(labels),
@@ -14388,6 +14419,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         return value
     if len({_label_identity(v) for v in labels.tolist()}) != int(labels.size):
         raise ValueError(f'labels contains duplicate class identifiers: {labels.tolist()}')
+    _label_names = _display_label_names(labels)
     if y_score is not None:
         try:
             y_score = np.asarray(y_score, dtype=float)
@@ -14466,7 +14498,8 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
     rs = []
     all_f1s = []
     total_tp = total_fp = total_fn = 0
-    for lab in labels:
+    for _li, lab in enumerate(labels):
+        _name = _label_names[_li]
         tp = int(np.sum((y_true == lab) & (y_pred == lab)))
         fp = int(np.sum((y_true != lab) & (y_pred == lab)))
         fn = int(np.sum((y_true == lab) & (y_pred != lab)))
@@ -14475,8 +14508,8 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         precision = tp / (tp + fp) if tp + fp else 0.0
         recall = tp / (tp + fn) if tp + fn else 0.0
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        per_class[str(lab)] = {'precision': precision, 'recall': recall, 'f1': f1,
-                               'support': support, 'tp': tp, 'fp': fp, 'fn': fn}
+        per_class[_name] = {'precision': precision, 'recall': recall, 'f1': f1,
+                            'support': support, 'tp': tp, 'fp': fp, 'fn': fn}
         all_f1s.append(f1)
         # Balanced accuracy / macro recall are also averages over the full
         # REQUESTED label set.  A label absent from y_true (but requested, or
@@ -14496,12 +14529,14 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
     # score merely because it happens to be absent from this sample.
     macro_f1 = float(np.mean(all_f1s)) if all_f1s else 0.0
     weighted_f1 = float(np.average(f1s, weights=supports)) if supports else 0.0
-    f1_positive = per_class[str(pos)]['f1'] if pos is not None else None
+    _pos_name = _label_names[int(np.where(labels == pos)[0][0])] if pos is not None else None
+    f1_positive = per_class[_pos_name]['f1'] if _pos_name is not None else None
     out = {
         'n': int(y_true.size),
-        'labels': [str(x) for x in labels],
-        'positive_label': (str(pos) if pos is not None else None),
-        'prevalence': {str(lab): float(np.mean(y_true == lab)) for lab in labels},
+        'labels': list(_label_names),
+        'positive_label': (_pos_name if pos is not None else None),
+        'prevalence': {_label_names[i]: float(np.mean(y_true == lab))
+                       for i, lab in enumerate(labels)},
         'accuracy': float(np.mean(y_true == y_pred)) if y_true.size else None,
         'balanced_accuracy': float(np.mean(rs)) if rs else None,
         'f1_macro': macro_f1,
@@ -14520,7 +14555,8 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         'f1_averaging': 'macro, micro and weighted are all reported; the caller must name the primary one',
     }
     if include_trivial_baseline:
-        out['trivial_baseline'] = _majority_class_floor(labels, support_all)
+        out['trivial_baseline'] = _majority_class_floor(labels, support_all,
+                                                       label_names=_label_names)
     if labels.size > 2:
         # Macro and micro F1 answer different questions when classes are
         # imbalanced.  Make the gap visible instead of letting one number stand
@@ -14585,13 +14621,14 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             out['threshold_selection'] = select_binary_threshold(
                 y_true, _bin_score, positive_label=pos)
     elif labels.size == 2 and out.get('positive_label') is not None:
-        prev = out['prevalence'].get(str(pos), 0.0)
+        prev = out['prevalence'].get(_pos_name, 0.0)
         if min(prev, 1.0 - prev) < 1e-3:
             out['imbalance_warning'] = ('positives rarer than 1:1000 — report PR-AUC with scores; F1 must name its averaging rule and recall should be reported per class')
     if labels.size > 2 and y_score is not None:
         _score = np.asarray(y_score, dtype=float)
         if _score.ndim == 2:
-            _rank = _multiclass_ranking_metrics(y_true, _score, labels)
+            _rank = _multiclass_ranking_metrics(y_true, _score, labels,
+                                                label_names=_label_names)
             # Keep one per_class table: counts/F1 plus the one-vs-rest ranking
             # values, so a class-level read does not need a second artifact.
             for _lab, _vals in _rank.pop('per_class').items():

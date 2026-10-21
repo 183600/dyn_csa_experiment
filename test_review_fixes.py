@@ -3693,6 +3693,26 @@ def t_multiclass_ranking_metrics_and_audit():
     forged_gap = dict(good, macro_micro_f1_gap=0.5)
     fg = L.metric_policy_audit({'mc': forged_gap})
     assert fg['status'] == 'warn' and any('macro_micro_f1_gap' in w for w in fg['warnings']), fg
+    # Different label identities that share a str() spelling (integer 1 and
+    # string '1') must not overwrite one another in the per-class table.  The
+    # report keeps the historical names when unambiguous and otherwise uses
+    # unique display keys, so every declared class retains its own row.
+    _mixed_labels = np.array([1, '1', 2], dtype=object)
+    _mixed_y = np.array([_mixed_labels[i % 3] for i in range(12)], dtype=object)
+    _mixed_score = np.zeros((len(_mixed_y), 3))
+    for _i, _lab in enumerate(_mixed_labels):
+        _mixed_score[[str(v) == str(_lab) and type(v) is type(_lab)
+                      for v in _mixed_y.tolist()], _i] = 1.0
+    _mx = L.classification_metrics(_mixed_y, y_score=_mixed_score,
+                                   labels=_mixed_labels)
+    assert len(_mx['labels']) == 3 and len(set(_mx['labels'])) == 3, _mx['labels']
+    assert len(_mx['per_class']) == 3, _mx['per_class']
+    assert all(_mx['per_class'][_n]['support'] == 4 for _n in _mx['labels']), _mx
+    assert _mx['trivial_baseline']['label'] in _mx['labels']
+    assert len(_mx['prevalence']) == 3, _mx['prevalence']
+    _mx_audit = L.metric_policy_audit({'mx': dict(
+        _mx, variant='mx', task='multiclass_classification')})
+    assert _mx_audit['status'] == 'ok', _mx_audit
 
 
 def t_metric_policy_checks_record_values():
