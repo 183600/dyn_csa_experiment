@@ -7483,7 +7483,7 @@ def t_report_efficiency_groups_are_separate():
                 'peak_mem_allocated_mb': 10.0}
     summ = {'results_unit': {
         'a::s0': {'variant': 'a', 'ppl': 50.0, 'params': 1000, 'tokens_seen': 100,
-                  'efficiency': _eff(512, 10.0)},
+                  'train_tokens_per_s': 123.4, 'efficiency': _eff(512, 10.0)},
         'b::s0': {'variant': 'b', 'ppl': 40.0, 'params': 1000, 'tokens_seen': 100,
                   'efficiency': _eff(4096, 5.0)},
         'c::s0': {'variant': 'c', 'ppl': 45.0, 'params': 1000, 'tokens_seen': 100,
@@ -7496,6 +7496,7 @@ def t_report_efficiency_groups_are_separate():
         BR._result_summaries = orig
     assert '512 tokens' in txt and '4096 tokens' in txt, txt
     assert 'excluded from every frontier' in txt and '`c::s0`' in txt, txt
+    assert '123.4' in txt, txt
     # The two token counts are separate group headings, not one merged frontier.
     assert txt.count('device `cuda:0`') == 2, txt
 
