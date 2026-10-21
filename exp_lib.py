@@ -14019,9 +14019,38 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
                     role_issue = ('metric_role="secondary" requires a non-empty '
                                   'metric_justification explaining why the policy '
                                   'primary is not the hypothesis endpoint')
+        # Optional observed prevalence lets the hypothesis declare the
+        # policy's CONDITIONAL endpoint up front.  A hypothesis written for
+        # F1 on a 1:1000 endpoint is not aligned with the metric contract,
+        # even though `f1` is the policy's normal primary.
+        _prevalence = spec.get('prevalence')
+        _prev_issue = None
+        _prev_value = None
+        if _prevalence is not None:
+            _prev_value = _finite_scalar(_prevalence)
+            if _prev_value is None or not (0.0 <= _prev_value <= 1.0):
+                _prev_issue = (f'prevalence={_prevalence!r} must be a finite '
+                               'number in [0, 1]')
+            else:
+                _bound = [metric_policy] if metric_policy else list(primary_policies)
+                for _pn in _bound:
+                    _pol = policy.get(_pn) or {}
+                    _cond = _pol.get('primary_when_extreme_imbalance')
+                    _thr = _finite_scalar(_pol.get('extreme_imbalance_threshold'))
+                    if (_cond and _thr is not None and _prev_value < _thr
+                            and metric_role == 'primary' and pm != _cond):
+                        _prev_issue = (
+                            f'prevalence={_prev_value:.3e} is below the '
+                            f'{_pn} extreme-imbalance threshold {_thr:g}; the '
+                            f'policy primary switches to {_cond!r}, not {pm!r} '
+                            '(or declare metric_role="secondary" with a justification)')
+                        break
+        if _prev_issue is not None and role_issue is None:
+            role_issue = _prev_issue
         pred = spec.get('predicted_sign')
         row = {'statement': spec.get('statement'), 'mechanism': spec.get('mechanism'),
                'predicted_sign': pred, 'primary_metric': pm,
+               'prevalence': _prev_value,
                'metric_role': metric_role, 'metric_policy': metric_policy,
                'metric_primary_policies': sorted(primary_policies),
                'metric_secondary_policies': sorted(secondary_policies),

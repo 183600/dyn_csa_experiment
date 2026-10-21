@@ -3775,6 +3775,39 @@ def t_metric_prevalence_recommendation_and_per_class_chance():
     assert br['status'] == 'warn' and any('recommended_primary_metric' in w
                                          for w in br['warnings']), br
 
+def t_hypothesis_prevalence_conditional_endpoint():
+    def _spec(**kw):
+        base = {'statement': 'rare-event detector improves recall',
+                'mechanism': 'the score ranks positives above negatives',
+                'predicted_sign': 1, 'primary_metric': 'f1',
+                'requires_param_match': False, 'falsifier': 'PR-AUC is at prevalence'}
+        base.update(kw)
+        return base
+    # At a 1:10000 base rate, a hypothesis written against F1 is misaligned
+    # with the policy's conditional PR-AUC endpoint even though f1 is the
+    # normal binary primary.
+    bad = L.hypothesis_audit({'h': _spec(prevalence=1e-4)}, 'component')
+    assert bad['status'] == 'warn' and 'h' in bad['metric_misaligned'], bad
+    assert any('extreme-imbalance threshold' in w for w in bad['warnings']), bad
+    # Declaring the conditional endpoint (or a justified secondary endpoint)
+    # is accepted.
+    good = L.hypothesis_audit({'h': _spec(prevalence=1e-4,
+                                         primary_metric='pr_auc')}, 'component')
+    assert good['status'] == 'ok' and not good['metric_misaligned'], good
+    sec = L.hypothesis_audit({'h': _spec(prevalence=1e-4,
+                                        primary_metric='roc_auc',
+                                        metric_role='secondary',
+                                        metric_justification='report ROC alongside PR')},
+                             'component')
+    assert sec['status'] in ('ok', 'warn') and not sec['metric_misaligned'], sec
+    # Above the threshold the normal F1 primary remains aligned.
+    normal = L.hypothesis_audit({'h': _spec(prevalence=0.2)}, 'component')
+    assert normal['status'] == 'ok' and not normal['metric_misaligned'], normal
+    # A malformed base rate fails closed instead of disabling the check.
+    for _bad in (True, '0.0001', float('nan'), float('inf'), -0.1, 1.2):
+        r = L.hypothesis_audit({'h': _spec(prevalence=_bad)}, 'component')
+        assert r['status'] == 'warn' and 'h' in r['metric_misaligned'], (_bad, r)
+
 def t_metric_policy_checks_record_values():
     # The declared token-weighted PPL must match the record's own NLL
     # accounting; a per-sequence arithmetic mean is a different estimand.
@@ -12120,6 +12153,7 @@ def main():
     _check('H1 hypothesis direction conflict', t_hypothesis_direction_conflict)
     _check('H2 metric policy + macro/micro/weighted F1 + PR/ROC-AUC', t_metric_policy_and_classification_metrics)
     _check('H2b prevalence-aware endpoint + per-class PR-AUC chance', t_metric_prevalence_recommendation_and_per_class_chance)
+    _check('H2c hypothesis prevalence binds the conditional endpoint', t_hypothesis_prevalence_conditional_endpoint)
     _check('H2a metric audit checks record aggregation/ranges', t_metric_policy_checks_record_values)
     _check('H2b multiclass one-vs-rest ranking metrics + imbalance audit', t_multiclass_ranking_metrics_and_audit)
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
