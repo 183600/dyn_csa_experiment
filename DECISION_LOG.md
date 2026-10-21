@@ -442,3 +442,26 @@ be quoted as a baseline. The check is a warning rather than a hard failure
 because a small/random evaluation sample can put the finite-sample count model
 marginally above uniform. No panel, frozen manifest, test split, README or CI
 configuration was touched.
+
+## 2026-10-21 — metadata/audit robustness and binary endpoint correctness (no new runs)
+
+Changed only zero-GPU metric, data-key and audit paths; no panel, frozen
+manifest, test split, README or CI configuration was touched. (1) Binary
+PR-AUC is scored against the POSITIVE class, so a correct record whose
+positive endpoint is the common label (rare negative event) is no longer
+reported as a misstated chance floor; when a record omits a separate
+`prevalence`, the recorded PR-AUC floor itself still triggers the rare-event
+endpoint check. Mixed-type binary labels (integer `1` vs string `"1"`) are now
+turned into predictions as an object array instead of relying on NumPy dtype
+promotion, which raises `DTypePromotionError` in NumPy 2. (2) The metric audit
+fails closed on non-object manifest/per-class metadata and non-string declared
+metric names instead of raising `TypeError`/`OverflowError` or aborting on
+unhashable labels. (3) The tuning and count-model audits report scalar/non-
+mapping protocol fields (trials, arms, grids, inherited tuning, selected
+config) as evidence problems rather than crashing; the archive verifier
+refuses malformed per-file manifest entries and unreadable/corrupt archives.
+(4) Exact-duplicate detection now keys `Decimal('sNaN')` like every other
+numeric NaN (missing-like) instead of treating its repr as a distinct
+category. Tests cover the binary positive-floor orientation, mixed-type
+predictions, malformed protocol/manifest shapes and signaling-NaN duplicates;
+the temporary issue list was removed after the fixes.
