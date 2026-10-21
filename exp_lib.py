@@ -14213,8 +14213,8 @@ _BINARY_THRESHOLD_SOURCES = ('default_0.5', 'caller_threshold', 'caller_predicti
 
 
 def _binary_positive_vector(y_true, positive_label=None):
-    y = np.asarray(y_true).ravel()
-    uniq = np.unique(y)
+    y = _preserve_label_array(y_true)
+    uniq = _unique_label_values(y)
     if uniq.size != 2:
         raise ValueError(f'binary threshold analysis needs exactly two observed classes, got {uniq.tolist()}')
     if positive_label is None:

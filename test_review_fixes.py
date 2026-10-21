@@ -5521,6 +5521,12 @@ def t_binary_threshold_and_calibration_contract():
     sel = L.select_binary_threshold(y, score, positive_label=1)
     assert sel['threshold'] == 0.4 and sel['value'] == 1.0, sel
     assert sel['prevalence'] == 0.1 and sel['n_positive'] == 10, sel
+    # Mixed-type binary labels must not be coerced together (int 1 vs '1');
+    # the positive endpoint is named explicitly.
+    _ym = np.array([0] * 6 + ['1'] * 4, dtype=object)
+    _sm = np.array([0.1] * 6 + [0.9] * 4)
+    _cm = L.binary_threshold_curve(_ym, _sm, positive_label='1')
+    assert _cm['n_positive'] == 4 and _cm['best_value'] == 1.0, _cm
     # The sweep is linear-time via cumulative counts; it must equal the
     # brute-force confusion matrix at every candidate, including score ties.
     _rng = np.random.default_rng(7)
