@@ -10270,7 +10270,10 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
       within_seed_noise  — |mean| <= std, i.e. the seed-to-seed spread alone is
                            at least as large as the reported effect (a +0.2%
                            mean with 0.5% std is NOT a usable gain);
-      significant        — p < alpha AND NOT within_seed_noise.
+      significant        — p < alpha AND NOT within_seed_noise AND a powered,
+                           resolvable panel (n >= min_n and p_floor <= alpha).
+                           A loose alpha must not turn an underpowered n into
+                           a positive verdict.
 
     It additionally reports a two-sided 95% CI for the mean effect and a
     leave-one-seed-out (LOO) stability read: with the 3-5 seeds the reporting
@@ -10329,10 +10332,14 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
                     'complete_pairs': bool(n_dropped == 0),
                     'seeds': seed_labels}
     if n == 0:
-        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None, **_pair_fields}
+        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'std_defined': False, 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None, **_pair_fields}
     mean = float(d.mean())
-    std = float(d.std(ddof=1)) if n > 1 else 0.0
-    sem = float(std / math.sqrt(n)) if n > 1 else float('nan')
+    # A single seed has no sample spread.  Keep the historical numeric 0.0 for
+    # backward-compatible consumers, but mark it explicitly so a report cannot
+    # quote it as a measured zero-variance result.
+    std_defined = bool(n > 1)
+    std = float(d.std(ddof=1)) if std_defined else 0.0
+    sem = float(std / math.sqrt(n)) if std_defined else float('nan')
     _sf = exact_signflip_p(d)
     p = _sf['p']
     n_nonzero = _sf.get('n_nonzero')
@@ -10348,7 +10355,13 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     underpowered = n < min_n
     resolution_limited = bool(math.isfinite(p_floor) and p_floor > alpha)
     within_seed_noise = abs(mean) <= std
-    significant = bool(math.isfinite(p) and p < alpha and (not within_seed_noise))
+    # The n floor and the exact-test resolution are preconditions, not
+    # side-notes: a loose alpha (or an unusually permissive caller) must not
+    # promote an underpowered/resolution-limited panel to "significant".
+    significant = bool(math.isfinite(p) and p < alpha
+                       and (not within_seed_noise)
+                       and (not underpowered)
+                       and (not resolution_limited))
     # Two-sided 95% CI on the paired mean (t interval; the normal approximation
     # is intentionally avoided at the 3-5 seed counts this repo reports).
     ci_lo = ci_hi = float('nan')
@@ -10393,7 +10406,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     _assumption = ('exact sign-flip is valid as a sign test under symmetric paired differences; '
                    'same seed does NOT randomise the arm, and architecture-induced RNG/optimisation '
                    'differences are part of the arm. p is SEED-level, never token-level.')
-    return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
+    return {'n': n, 'mean': mean, 'std': std, 'std_defined': std_defined, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
             'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
             'n_nonzero': n_nonzero,
             'p_wilcoxon': _wil.get('p'), 'p_wilcoxon_method': _wil.get('method'),
@@ -11604,7 +11617,15 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     # n=6 interaction with min_n=8 can have p<0.05 and still be underpowered
     # for the claim.  Keep the raw test flag for transparency, but make the
     # interaction-level `significant` respect the same floor as claim_level.
-    _raw_sig = bool(st.get('significant'))
+    # `paired_effect_stats.significant` now already enforces this caller's
+    # `min_n` floor, so derive the RAW test flag directly instead of reading a
+    # masked flag.  The raw flag stays visible for transparency while the
+    # interaction-level verdict below applies the floor and complete-panel
+    # requirements.
+    _raw_sig = bool(isinstance(st.get('p_exact_signflip'), (int, float))
+                    and math.isfinite(float(st['p_exact_signflip']))
+                    and float(st['p_exact_signflip']) < alpha
+                    and not st.get('within_seed_noise'))
     st['significant_raw'] = _raw_sig
     st['significant'] = bool(_raw_sig and not st.get('underpowered')
                              and not st.get('resolution_limited')
@@ -20186,6 +20207,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             'ppl_primary_missing': int(_miss),
             'nll_sum': _nll_tot, 'n_tokens': _ntok_tot,
             'ppl_std': float(np.std(_vals, ddof=1)) if len(_vals) > 1 else 0.0,
+            'ppl_std_defined': bool(len(_vals) > 1),
             'meets_min_seeds': len(_vals) >= int(min_n),
         }
         if len(_vals) < int(min_n):

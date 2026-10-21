@@ -2255,6 +2255,26 @@ def t_training_knobs_must_be_complete():
                for w in rep['warnings']), rep['warnings']
 
 
+def t_underpowered_contrast_is_never_significant():
+    # alpha=0.6 makes the raw exact p (0.5 at n=2) clear the threshold.  The
+    # three-seed floor must still prevent a positive verdict.
+    r = L.paired_effect_stats([-1.0, -1.2], alpha=0.6, min_n=3)
+    assert r['underpowered'] is True, r
+    assert r['significant'] is False, r
+    assert r['std_defined'] is True, r
+    # One seed has no estimable sample spread: keep the legacy 0.0 but say so.
+    one = L.paired_effect_stats([-1.0])
+    assert one['n'] == 1 and one['std'] == 0.0, one
+    assert one['std_defined'] is False and one['significant'] is False, one
+    zero = L.paired_effect_stats([])
+    assert zero['std_defined'] is False and zero['significant'] is False, zero
+    # A powered, resolvable, same-direction panel remains significant.
+    r2 = L.paired_effect_stats([-1.0, -1.2, -0.8, -1.1, -0.9, -1.0],
+                               alpha=0.05, min_n=3)
+    assert r2['underpowered'] is False and r2['significant'] is True, r2
+    assert r2['std_defined'] is True, r2
+
+
 def t_seed_coverage_warning():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     knobs = L.training_knobs()
@@ -14441,6 +14461,7 @@ def main():
     _check('L53 v12 malformed manifest/lock fail closed', t_v12_malformed_manifest_and_lock_fail_closed)
     _check('L54 build report excludes malformed panel objects', t_build_report_malformed_panel_is_excluded)
     _check('L55 controlled recipe requires a complete train_knobs descriptor', t_training_knobs_must_be_complete)
+    _check('L56 underpowered contrast is never significant; std definability', t_underpowered_contrast_is_never_significant)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
