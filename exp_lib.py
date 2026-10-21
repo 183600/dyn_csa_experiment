@@ -398,6 +398,14 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     elif train_s < -train_tol and val_s <= val_tol:
         status = 'healthy'
         reason = 'training CE is falling and validation CE is not rising'
+    elif val_s < -val_tol:
+        # Validation is IMPROVING while the fixed train-CE measurement is
+        # flat or rising.  Calling this `validation_degrading` (the old else
+        # branch) inverted the observed direction and sent the reader to the
+        # wrong action.
+        status = 'validation_improving_train_flat'
+        reason = ('validation CE is falling while training CE is flat or rising; '
+                  'audit the fixed train-eval batch/data order before interpreting this as a model effect')
     else:
         status = 'validation_degrading'
         reason = 'validation CE is rising in the tail'
@@ -418,6 +426,9 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         actions.append('if both curves are flat but low, train longer or increase capacity')
     elif status == 'validation_degrading':
         actions.append('inspect the first rising validation point and the accompanying train CE; if train CE is also flat, treat it as an optimization/data issue rather than overfitting')
+    elif status == 'validation_improving_train_flat':
+        actions.append('do not read this as overfitting: validation is improving; verify the fixed train-eval batch, label shift and data order before changing regularization')
+        actions.append('if the train curve is genuinely flat while validation falls, check whether train CE is measured under augmentation/noise or on a stale fixed batch')
     elif status == 'nonfinite':
         actions.append('follow the NaN triage path: data NaN/Inf -> log(0)/div0/softmax -> fp16 overflow -> gradient explosion/LR')
     train_rising = bool(train_s is not None and math.isfinite(train_s) and train_s > train_tol)

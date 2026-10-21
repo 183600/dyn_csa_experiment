@@ -272,6 +272,14 @@ def t_training_health_classifier():
              'val_ce': 4.0 - 0.02 * i, 'val_ppl': 55.0 - 0.5 * i} for i in range(6)]
     h = L.classify_training_health(hist)
     assert h['status'] == 'nonfinite' and h['n_nonfinite'] == 1, h
+    # Validation improving while training CE is flat must NOT be labelled
+    # "validation_degrading" (the old else branch inverted the direction).
+    hist = [{'step': i * 100, 'train_ce': 4.0, 'val_ce': 4.0 - 0.05 * i,
+             'val_ppl': 55.0 - 0.5 * i} for i in range(6)]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'validation_improving_train_flat', h
+    assert 'validation CE is falling' in h['reason'], h
+    assert any('not read this as overfitting' in a for a in h['actions']), h
     # Too few points stays insufficient regardless of which side is missing.
     h = L.classify_training_health([{'step': 100, 'train_ce': 5.0, 'val_ce': 4.0, 'val_ppl': 55.0}])
     assert h['status'] == 'insufficient_data', h

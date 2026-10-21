@@ -2008,7 +2008,8 @@ def audit_training_health(outdirs=None):
             if not isinstance(h, dict):
                 w.append('no curve_health record')
             elif status in ('overfitting', 'underfitting_or_stalled',
-                            'validation_degrading', 'nonfinite'):
+                            'validation_degrading', 'validation_improving_train_flat',
+                            'nonfinite'):
                 w.append(f'curve_health={status}')
             _diag_raw = r.get('opt_diag_summary')
             if _diag_raw is not None and not isinstance(_diag_raw, dict):
