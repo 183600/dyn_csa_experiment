@@ -2275,6 +2275,21 @@ def t_underpowered_contrast_is_never_significant():
     assert r2['std_defined'] is True, r2
 
 
+def t_report_pairs_cover_the_declared_ablation_design():
+    pairs = L.declared_ablation_pairs()
+    declared = {(a, b) for cs in L.ABLATION_DESIGN.values()
+                for a, b, *_ in cs}
+    assert set(pairs) == declared, (set(pairs) ^ declared)
+    assert len(pairs) == len(set(pairs)), 'declared pair list must be de-duplicated'
+    # The task-learned-boundary contrast is a declared innovation; the
+    # console pair table must not silently omit it (the historical drift bug).
+    assert ('csa_dynamic_task', 'csa_dynamic') in pairs, pairs
+    # A malformed design yields no crash and no fabricated pairs.
+    assert L.declared_ablation_pairs({'A': 'not-a-list'}) == []
+    assert L.declared_ablation_pairs({'A': [('a', 'b', 'x'),
+                                            ('a', 'b', 'again')]}) == [('a', 'b')]
+
+
 def t_seed_coverage_warning():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     knobs = L.training_knobs()
@@ -14462,6 +14477,7 @@ def main():
     _check('L54 build report excludes malformed panel objects', t_build_report_malformed_panel_is_excluded)
     _check('L55 controlled recipe requires a complete train_knobs descriptor', t_training_knobs_must_be_complete)
     _check('L56 underpowered contrast is never significant; std definability', t_underpowered_contrast_is_never_significant)
+    _check('L57 report pairs cover the declared ablation design', t_report_pairs_cover_the_declared_ablation_design)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

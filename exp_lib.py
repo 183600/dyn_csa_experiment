@@ -12857,6 +12857,30 @@ ABLATION_DESIGN = {
 # 优于同参数量、同优化器、同训练规模、同数据的稠密基线，而不是只回答「消融臂
 # 之间谁高谁低」。两条基线都来自 `variant_mlp_ratio` 的参数对齐（MLP 加宽
 # 到与 csa_dynamic 相同），因此 `param_controlled` 是这条对比的硬读数。
+def declared_ablation_pairs(design=None):
+    """Every declared leave-one-out pair, in design order, without duplicates.
+
+    Reports used to hard-code a second pair list, which drifted from
+    ``ABLATION_DESIGN`` (for example the task-learned-boundary contrast was
+    audited but never printed).  A report must display every contrast the
+    completeness audit reasons about, so both now read the same declaration.
+    """
+    design = ABLATION_DESIGN if design is None else design
+    out, seen = [], set()
+    if not isinstance(design, dict):
+        return out
+    for contrasts in design.values():
+        if not isinstance(contrasts, (list, tuple)):
+            continue
+        for item in contrasts:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            pair = (item[0], item[1])
+            if pair not in seen:
+                seen.add(pair)
+                out.append(pair)
+    return out
+
 BASELINE_DESIGN = {
     'compression_vs_matched_dense': [
         ('csa_dynamic', 'full_sw128_matched', 'dynamic CSA vs parameter-matched windowed dense'),
@@ -27720,7 +27744,17 @@ def _print_pairs(summary):
     recs, _amb = _variant_seed_map(summary)
     _pair_amb = sorted(_amb)
     _pair_skip = []
-    PAIRS = [('csa_dynamic', 'csa_fixed'), ('hybrid_dynamic', 'hybrid_fixed'), ('hybrid_csa_dyn', 'hybrid_fixed'), ('hybrid_hca_dyn', 'hybrid_fixed'), ('csa_dyn_fuse', 'csa_dynamic'), ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn'), ('csa_fix_randidx', 'csa_fixed'), ('csa_fix_zerocont', 'csa_fixed'), ('csa_fix_nosink', 'csa_fixed'), ('csa_fix_topk8', 'csa_fixed'), ('csa_fix_topk64', 'csa_fixed'), ('csa_dyn_randidx', 'csa_dynamic'), ('csa_dyn_zerocont', 'csa_dynamic'), ('csa_dyn_nosink', 'csa_dynamic'), ('csa_dyn_nocomp', 'csa_dynamic'), ('full_sink', 'full')]
+    # Read the declared leave-one-out design instead of maintaining a second
+    # hard-coded table that can silently omit a declared contrast.  The top-k
+    # budget sweep is descriptive (not an innovation), so its pairs are added
+    # explicitly after the declared ablations.
+    _declared = declared_ablation_pairs() + [
+        ('csa_fix_topk8', 'csa_fixed'), ('csa_fix_topk64', 'csa_fixed')]
+    PAIRS, _seen_pairs = [], set()
+    for _pair in _declared:
+        if _pair not in _seen_pairs:
+            _seen_pairs.add(_pair)
+            PAIRS.append(_pair)
     print('\n========== paired per-seed deltas (a − b, positive = a worse) ==========')
     print('  (p = exact two-sided sign-flip over the paired per-seed deltas; a noise-level Δ is flagged even if p is small)')
     if _pair_amb:
