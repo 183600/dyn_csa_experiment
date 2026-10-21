@@ -12414,6 +12414,11 @@ def t_split_targets_use_exact_fraction_arithmetic():
     sizes = DG._resolve_sizes(n, 0.8, 0.1, 0.1)
     assert sum(sizes) == n, sizes
     assert sizes == (7205759403792795, 900719925474099, 900719925474099), sizes
+    # A genuinely positive sub-1e-15 fraction must not collapse to exactly
+    # zero: at a large row count it still selects rows.
+    assert DG._fraction_value(1e-16) != 0
+    assert DG._floor_fraction_product(10 ** 18, 1e-16) > 0
+    assert DG._floor_fraction_product(10 ** 18, 1e-15) == 1000
     try:
         DG._resolve_sizes(10, 0.8, 0.1, 0.1, train_size=11)
     except ValueError:

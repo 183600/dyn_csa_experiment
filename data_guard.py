@@ -163,6 +163,15 @@ def _fraction_value(frac):
     """
     exact = Fraction(float(frac))
     simple = exact.limit_denominator(10 ** 9)
+    if simple == exact:
+        return exact
+    # Never round a positive fraction down to exactly zero: at a large row
+    # count a 1e-16 split still contains rows (1e18 * 1e-16 = 100), and
+    # ``limit_denominator`` cannot represent values below 1e-9 other than 0.
+    # The tolerance is only meant to recover simple rationals such as 4/7,
+    # not to erase a genuine positive target.
+    if simple == 0:
+        return exact
     return simple if abs(float(simple) - float(exact)) <= 1e-15 else exact
 
 
