@@ -612,3 +612,32 @@ prevalence; `retrieval_metrics` emits the recommendation/reason/availability,
 the audit verifies it, and v10 NIAH records persist those fields. (4) Tests
 cover horizon mismatch, truncated-floor contradictions, and NIAH hypothesis /
 record alignment. The temporary issue list was removed after the fixes.
+
+## 2026-10-21 — curve/NaN/bad-case/efficiency analysis hardening (no new runs)
+
+Changed only zero-GPU result-analysis paths, their report rendering and tests;
+no panel result, frozen manifest, test split, README or CI configuration was
+touched. (1) `classify_training_health` / `early_stop_decision` now accept the
+documented `val_ce`-only representation (deriving PPL only when the PPL field
+is absent; an explicitly non-finite PPL is never papered over), order the tail
+chronologically, collapse a repeated step to one evaluation, derive the
+train-validation gap and its slope when a legacy record omits them, and mark a
+two-point trend as low-resolution rather than presenting an interpolated slope
+as a mechanism result. (2) The report now separates the number of curve points
+from the number of documents per evaluation, which were previously both shown
+under "curve rows". (3) `diagnose_training_instability` derives curve health
+from `health_history` when the cached summary is missing, lets the curve
+override a contradictory `healthy` cache on a non-finite point, and reports an
+unmeasured curve as `unknown`. The health audit recomputes the curve and checks
+the recorded status, best step/PPL, `final_minus_best`, `steps_since_best`,
+event counters vs the event log, unknown health labels and empty
+`healthy` histories. (4) Bad-case analysis now requires a measured training
+frequency basis before labelling a target rare (empty/malformed `train_ids` no
+longer manufactures all-rare cases), exposes same-prefix/different-target
+ambiguity (label inconsistency vs genuine ambiguity) in JSONL/Markdown, makes
+zero/negative error-analysis budgets explicit instead of clamping them to one,
+and refuses paired per-token comparisons across different vocabularies.
+(5) Efficiency summaries reject zero/non-positive latency, PPL, parameter and
+memory readings instead of letting them dominate a frontier or a ratio, and
+the accuracy/cost warning states the improvement direction without a negative
+"gain". The temporary issue list was removed after the fixes.
