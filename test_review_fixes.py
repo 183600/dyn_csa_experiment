@@ -9669,6 +9669,46 @@ def t_persisted_stats_validate_feature_count():
                     f'{cls.__name__}.from_stats accepted a mismatched feature list')
 
 
+def t_temporal_group_identity_matches_python_equality():
+    # NumPy equality and hashing disagree for date-like ids (a datetime.date
+    # equals some np.datetime64 values but hashes differently).  Returning the
+    # raw objects as set keys let the same id land on both sides of a split
+    # without the group-overlap check firing.
+    import datetime
+    import data_guard as DG
+    same_day = [np.datetime64('2020-01-01'), datetime.date(2020, 1, 1)]
+    assert DG._group_key(same_day[0]) == DG._group_key(same_day[1])
+    try:
+        DG.assert_no_split_leakage([0], [1], [], groups=np.asarray(same_day, dtype=object))
+    except ValueError as e:
+        assert 'share group ids' in str(e), e
+    else:
+        raise AssertionError('equal temporal group ids must not cross splits')
+    same_delta = [np.timedelta64(1, 'D'), datetime.timedelta(days=1)]
+    assert DG._group_key(same_delta[0]) == DG._group_key(same_delta[1])
+    # Distinct nanosecond timestamps stay distinct, including in the fast
+    # native-dtype path (tolist() would turn them into bare integers).
+    g = np.asarray(['2020-01-01T00:00:00.000000001',
+                    '2020-01-01T00:00:00.000000002'], dtype='datetime64[ns]')
+    keys = DG._group_index_fast(g)[0]
+    assert keys[0] != keys[1], keys
+    idx = DG.grouped_chronological_split_indices(2, g, 0.5, 0.5, 0.0)
+    assert idx['train'].tolist() == [0] and idx['val'].tolist() == [1], idx
+    # NaT still collapses into one missing group for both temporal kinds.
+    nat = np.asarray([np.datetime64('NaT', 'ns'), np.datetime64('NaT', 'ns'),
+                      np.datetime64(1, 'ns')])
+    try:
+        DG.assert_no_split_leakage([0], [1], [2], groups=nat)
+    except ValueError as e:
+        assert 'share group ids' in str(e), e
+    else:
+        raise AssertionError('NaT group ids must collapse into one group')
+    # A timezone-aware datetime has no single instant without a timezone; it
+    # must still be hashable (and is kept type-qualified rather than crashing).
+    tz = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+    assert DG._group_key(tz) != DG._group_key(datetime.datetime(2020, 1, 1))
+
+
 def t_validation_row_split_group_aware():
     # The balanced row boundary (4) would cut the group spanning rows 3-4.
     # A group-aware split must move it to a document boundary instead.
@@ -11655,6 +11695,7 @@ def main():
     _check('I31c object temporal duplicate identity', t_object_temporal_duplicate_identity)
     _check('I31d object temporal category identity', t_object_temporal_category_identity)
     _check('I31e persisted stats must match n_features_in', t_persisted_stats_validate_feature_count)
+    _check('I31f temporal group identity is hash-consistent', t_temporal_group_identity_matches_python_equality)
     # Open-block reading rule: the substantive gates (causality, reference
     # pooling, masks, edge cases, closed regression) live in test_open_block.py
     # so they can also be run on their own.

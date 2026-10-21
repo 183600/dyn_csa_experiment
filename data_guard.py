@@ -30,6 +30,7 @@ distribution shift.
 """
 from __future__ import annotations
 
+import datetime as _datetime
 import hashlib
 import json
 import math
@@ -570,7 +571,12 @@ def _group_index_fast(groups, order=None):
     uniq, first_idx, inv = np.unique(groups, return_index=True, return_inverse=True)
     inv = np.asarray(inv).reshape(-1)
     first_idx = np.asarray(first_idx).reshape(-1)
-    keys = [_group_key(v) for v in uniq.tolist()]
+    # Iterate the native scalars for temporal dtypes: ``tolist()`` turns a
+    # datetime64[ns] into a bare nanosecond integer and would bypass the
+    # canonical temporal identity used by the per-row path.
+    keys = ([_group_key(v) for v in uniq]
+            if groups.dtype.kind in 'Mm'
+            else [_group_key(v) for v in uniq.tolist()])
     n_uniq = uniq.shape[0]
     first = {keys[j]: int(first_idx[j]) for j in range(n_uniq)}
     perm = np.argsort(inv, kind='stable')
@@ -596,7 +602,7 @@ def _group_order(groups, order=None):
     if fast is not None:
         return fast[0], fast[1]
     first = {}
-    for i, g in enumerate(groups.tolist()):
+    for i, g in enumerate(groups):
         g = _group_key(g)
         if g not in first:
             first[g] = i
@@ -608,7 +614,7 @@ def _group_order(groups, order=None):
     _assert_order_finite(order)
     key = {}
     try:
-        for i, g in enumerate(groups.tolist()):
+        for i, g in enumerate(groups):
             g = _group_key(g)
             v = order[i]
             if g not in key or v < key[g]:
@@ -880,6 +886,38 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
         purge=purge)
 
 
+def _temporal_group_key(value):
+    """Canonical, equality-consistent identity for a temporal group id.
+
+    NumPy and the stdlib do not agree on hashing: a ``datetime.date`` compares
+    equal to some ``np.datetime64`` values but hashes differently.  Returning
+    the raw objects as dict/set keys then let the same instant appear as two
+    groups, so a document/user id could cross a split without the overlap
+    check firing.  Canonicalising through the same nanosecond instant (falling
+    back to a unit-qualified raw value when nanoseconds overflow) makes equal
+    temporal ids hash equally.  Midnight values collapse with their date,
+    which can only merge groups (a conservative, leak-avoiding direction).
+    """
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        if np.isnat(value):
+            return ('__nat__',)
+        canon = value
+    elif isinstance(value, _datetime.datetime):
+        if value.tzinfo is not None:
+            return ('__datetime_tz__', value.isoformat())
+        canon = np.datetime64(value)
+    elif isinstance(value, _datetime.date):
+        canon = np.datetime64(value)
+    elif isinstance(value, _datetime.timedelta):
+        canon = np.timedelta64(value)
+    else:  # pragma: no cover - guarded by the caller
+        return value
+    try:
+        return ('__temporal__', _temporal_key(canon))
+    except (TypeError, ValueError, OverflowError):
+        return ('__temporal_repr__', type(value).__name__, repr(value))
+
+
 def _group_key(value):
     """Hashable group identity; NaN/NaT rows collapse into one missing group.
 
@@ -887,10 +925,11 @@ def _group_key(value):
     of the same missing group can be split across train/val/test and no
     group-overlap check will ever fire.
     """
-    if isinstance(value, (np.datetime64, np.timedelta64)):
-        if np.isnat(value):
-            return ('__nat__',)
-    elif (not isinstance(value, (bool, np.bool_))
+    if isinstance(value, (np.datetime64, np.timedelta64,
+                          _datetime.date, _datetime.datetime,
+                          _datetime.timedelta)):
+        return _temporal_group_key(value)
+    if (not isinstance(value, (bool, np.bool_))
           and not isinstance(value, (complex, np.complexfloating))
           and isinstance(value, numbers.Number)):
         try:
