@@ -462,6 +462,23 @@ def t_token_error_cause_taxonomy():
     assert unmeasured['primary'] == 'unmeasured', unmeasured
 
 
+def t_final_loss_smoothed_uses_last_steps():
+    # `final_loss_smoothed` must describe the final 50 steps.  Reading a
+    # scalar only on sparse diagnostic steps made the old value an average of
+    # points that could span a large part of the run.
+    ids = np.arange(4096, dtype=np.int64) % 997
+    val = (np.arange(64, dtype=np.int64) % 997).reshape(4, 16)
+    kw = dict(d=32, n_layers=1, n_heads=2, d_head=16, seq_len=16, batch_size=2,
+              steps=70, lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0,
+              eval_every=0, mlp_ratio=4.0, device=torch.device('cpu'), log_every=0)
+    r = L.train_variant('full', ids, val, 997, seed=0, **kw)
+    assert len(r['losses']) == 70, len(r['losses'])
+    tail = [v for v in r['losses'][-50:] if math.isfinite(v)]
+    assert r['final_loss_smoothed_n'] == len(tail) == 50, r.get('final_loss_smoothed_n')
+    assert abs(r['final_loss_smoothed'] - sum(tail) / len(tail)) < 1e-12, r['final_loss_smoothed']
+    assert r['final_loss_smoothed_window'] == 50, r
+
+
 def t_train_variant_early_stop_record():
     ids = np.arange(2048, dtype=np.int64) % 997
     val = (np.arange(64, dtype=np.int64) % 997).reshape(4, 16)

@@ -20969,8 +20969,6 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     t0 = time.time()
     losses = []
     _lbuf = []
-    # deque with a fixed capacity; the window contents are identical.
-    _tail = collections.deque(maxlen=50)
     _loss_stage = None
     _loss_ev = None
     if device.type == 'cuda':
@@ -21212,10 +21210,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             opt.zero_grad(set_to_none=True)
             _ce_d = ce.detach()
             _lbuf.append(_ce_d)
-            # Keep a Python float here: `_is_finite_number` rejects tensors
-            # (they are not numbers.Number), so appending the tensor made
-            # `final_loss_smoothed` permanently None.
-            _tail.append(float(_ce_item) if _ce_item is not None else float('nan'))
+            # The loss buffer stores the detached CE tensor; `final_loss_smoothed`
+            # is derived from the full recorded curve at the end (not from
+            # sparse scalar reads, which are NaN on most steps).
             # Drop this step's graph/scalar references before the next forward.
             del loss, ce
             _inner_model.comp_reg = None
@@ -21363,8 +21360,12 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         _flush_loss_buffer()
     losses = [float(v) for v in losses]
     _curve_summary = _finite_curve(losses)
-    _tail_list = [float(v) for v in _tail if _is_finite_number(v)]
-    _final_loss_smoothed = (sum(_tail_list) / len(_tail_list)) if _tail_list else None
+    # True final-window mean: the last 50 recorded training steps, not the
+    # last 50 diagnostic scalar reads.  The latter are NaN on most steps
+    # (reading CE every step would add a GPU sync), so the old value could be
+    # an average of points spread over a large fraction of the run.
+    _tail_losses = [v for v in losses[-50:] if math.isfinite(v)]
+    _final_loss_smoothed = (sum(_tail_losses) / len(_tail_losses)) if _tail_losses else None
     if _health_history:
         _health = classify_training_health(_health_history)
     else:
@@ -21441,7 +21442,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'tokens_seen_unique_estimate': (int(round(_n_train * _uniq_frac)) if _uniq_frac is not None else None),
               'tokens_seen_unique_frac_estimate': _uniq_frac,
               'token_accounting_note': 'tokens_seen counts window draws; unique-token coverage is an estimate under independent uniform window draws, not a measurement',
-              'train_time_s': wall, 'train_tokens_per_s': ((_steps_completed * batch_size * seq_len * _world) / wall if wall and wall > 0 else None), 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'init_core_fp': _init_core_fp, 'data_fp': _ids_fp(train_ids),
+              'train_time_s': wall, 'train_tokens_per_s': ((_steps_completed * batch_size * seq_len * _world) / wall if wall and wall > 0 else None), 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'final_loss_smoothed_window': 50, 'final_loss_smoothed_n': len(_tail_losses), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'init_core_fp': _init_core_fp, 'data_fp': _ids_fp(train_ids),
               # The token-level evidence behind the reported PPL.
               # `nll_sum / n_tokens` is the pooled-NLL estimator; the per-row
               # rows let a report bootstrap DOCUMENT uncertainty instead of
