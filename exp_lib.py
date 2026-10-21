@@ -14676,7 +14676,17 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
                 _threshold_source = 'caller_threshold'
             _threshold_used = threshold
             neg = labels[0] if pos == labels[-1] else labels[-1]
-            y_pred = np.where(score.ravel() >= threshold, pos, neg)
+            _mask = np.asarray(score).ravel() >= threshold
+            if labels.dtype == object or y_true.dtype == object:
+                # np.where tries to find a common dtype for the two labels;
+                # mixed identities (the integer 1 and the string "1") have
+                # none in NumPy 2, so build the object array explicitly
+                # instead of silently promoting or raising DTypePromotionError.
+                y_pred = np.empty(_mask.shape, dtype=object)
+                y_pred[_mask] = pos
+                y_pred[~_mask] = neg
+            else:
+                y_pred = np.where(_mask, pos, neg)
         else:
             raise ValueError('a 1-D y_score is only interpretable for a binary endpoint')
     else:

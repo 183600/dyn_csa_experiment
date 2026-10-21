@@ -3727,6 +3727,16 @@ def t_multiclass_ranking_metrics_and_audit():
             labels=_decl)
         assert len(_mx_explicit['labels']) == 3, _mx_explicit['labels']
         assert len(_mx_explicit['per_class']) == 3, _mx_explicit
+    # A BINARY mixed-type endpoint must not go through np.where with two
+    # un-promotable dtypes (NumPy 2 raises DTypePromotionError for int 1 vs
+    # the string '1'); the derived predictions keep both identities.
+    _mixed_y_bin = np.array([1, '1'] * 25, dtype=object)
+    _mixed_s_bin = np.array([0.8] * 25 + [0.2] * 25)
+    _mb = L.classification_metrics(
+        _mixed_y_bin, y_score=_mixed_s_bin,
+        labels=np.array([1, '1'], dtype=object), positive_label=1)
+    assert len(_mb['labels']) == 2 and _mb['n'] == 50, _mb
+    assert _mb['predicted_positive_rate'] == 0.5, _mb
 
 
 def t_metric_prevalence_recommendation_and_per_class_chance():
