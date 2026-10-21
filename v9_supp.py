@@ -78,6 +78,35 @@ P2T_CFG = dict(L.RUN, outdir='results_lm_v9_seq2k', seq_len=2048, batch_size=1, 
 P2S3_CFG = dict(V8.P2R_CFG)
 PHASES = [('P2T', P2T_CFG, [0, 1]), ('P2S3', P2S3_CFG, [2])]
 
+# P2T/P3T 扫描对照的因素声明（单因素契约的扫描版）。端点对照 topk8 - topk512
+# 只差 `index_topk`（单因素剂量响应）；两条 m1 对照同时改 block_size(4→1)、
+# overlap(128→0) 以及 index_topk 的语义（32 指逐 token）——那是「压缩块 vs 逐
+# token 读取」的**块几何束**，等 token 预算但多因素，只能读作 sweep 点之间的
+# 系统级比较，不能写成 topk 的剂量响应。`add_paired` 把声明写进 comparison
+# 记录（v9/v10 报表按 single_factor/factors 字段标注），与 ABLATION_DESIGN 的
+# 设计点审计（exp_lib.single_factor_design_audit）同一口径。
+SEQ2K_CONTRAST_FACTORS = {
+    'seq2k(bs1): topk8 - m1': {
+        'single_factor': False,
+        'factors': ['block_size', 'overlap', 'index_topk'],
+        'factors_note': ('multi-factor block-geometry bundle: compressed 4-token blocks vs '
+                         '1-token singleton reading at an equal 32-token budget — a sweep-point '
+                         'comparison, not a topk dose-response'),
+    },
+    'seq2k(bs1): topk512 - m1': {
+        'single_factor': False,
+        'factors': ['block_size', 'overlap', 'index_topk'],
+        'factors_note': ('multi-factor block-geometry bundle: compressed 4-token blocks vs '
+                         '1-token singleton reading at an equal 32-token budget — a sweep-point '
+                         'comparison, not a topk dose-response'),
+    },
+    'seq2k(bs1): topk8 - topk512': {
+        'single_factor': True,
+        'factors': ['index_topk'],
+        'factors_note': 'single-factor topk dose-response (index_topk only)',
+    },
+}
+
 def run_phase(name, guard, par=None):
     _install_ckpt_patch()
     import par as _par
@@ -111,11 +140,13 @@ def _seed_counts(panel, a, b, missing=()):
         return f'`{v}`: not in panel'
     return _one(a) + ' vs ' + _one(b)
 
-def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
+def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None, factors=None):
 
     def _omit(reason):
         print(f'[stats] {who}{name}: comparison OMITTED — {reason}')
         comparisons[name] = {'omitted': reason, 'n': 0}
+        if factors:
+            comparisons[name].update(factors)
         return None
     if not panel and outdir is None:
         return _omit('no measurable record in the panel — every record was unmeasured (error / no ppl) or a `synthesized` reconstruction, so none is an independent observation')
@@ -158,6 +189,8 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
     if not dl:
         return _omit(f'no seed survived the run_cfg/steps checks ({len(common)} shared, {len(skipped)} rejected: {sorted(why)})')
     res = V.exact_sign_permutation(dl)
+    if factors:
+        res.update(factors)
     res['seeds'] = [s for s in common if s not in set(skipped)]
     res['n_skipped_config_mismatch'] = len(skipped)
     res['n_unstamped'] = unstamped
@@ -173,7 +206,8 @@ def v9_analysis(out='analysis_v9/stats.json'):
     comparisons = {}
 
     def add(name, panel, a, b, outdir):
-        add_paired(comparisons, name, panel, a, b, who='v9 ', outdir=outdir)
+        add_paired(comparisons, name, panel, a, b, who='v9 ', outdir=outdir,
+                   factors=SEQ2K_CONTRAST_FACTORS.get(name))
     add('seq2k(bs1): topk8 - m1', seq2k, 'csa_fixed_topk8', 'csa_fix_m1', 'results_lm_v9_seq2k')
     add('seq2k(bs1): topk512 - m1', seq2k, 'csa_fixed_topk512', 'csa_fix_m1', 'results_lm_v9_seq2k')
     add('seq2k(bs1): topk8 - topk512', seq2k, 'csa_fixed_topk8', 'csa_fixed_topk512', 'results_lm_v9_seq2k')
@@ -288,14 +322,18 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
         A('')
     A('**配对检验（exact sign-flip）**：')
     A('')
-    A('| 比较 | n | Δ (a−b) mean±std | p (exact) | p_Holm |')
-    A('|---|---|---|---|---|')
+    A('因素列（单因素契约）：`topk 剂量响应` = 只差 `index_topk`；`块几何束（多因素）` = 同时改 block_size/overlap 与 topk 语义（m1 是逐 token 读取）——后两条是 sweep 点之间的系统级比较，不能读作 topk 的剂量响应。')
+    A('')
+    A('| 比较 | 因素 | n | Δ (a−b) mean±std | p (exact) | p_Holm |')
+    A('|---|---|---|---|---|---|')
     for k, v in comp.items():
         if k.startswith('seq2k'):
+            _fac = ('topk 剂量响应' if v.get('single_factor') else
+                    '块几何束（多因素）' if 'single_factor' in v else '—')
             if 'omitted' in v:
-                A(f'| {k} | 0 | —（{v['omitted']}） | — |')
+                A(f'| {k} | {_fac} | 0 | —（{v['omitted']}） | — |')
                 continue
-            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {_holm_txt(v)} |')
+            A(f'| {k} | {_fac} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {_holm_txt(v)} |')
     A('')
     A('**结论读法**：若完整扫描证实 m=1（纯 DSA）不差于压缩 CSA，则「压缩不是瓶颈」的方向性结论在完整扫描下成立（按表）；选择率甜点位置由 5 点全貌直接给出。')
     A('')

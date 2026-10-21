@@ -1757,7 +1757,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
     comparisons = {}
 
     def add(name, panel, a, b, outdir):
-        V9.add_paired(comparisons, name, panel, a, b, who='v10 ', outdir=outdir)
+        V9.add_paired(comparisons, name, panel, a, b, who='v10 ', outdir=outdir,
+                      factors=V9.SEQ2K_CONTRAST_FACTORS.get(name))
     add('seq2k(bs1): topk8 - m1', seq2k, 'csa_fixed_topk8', 'csa_fix_m1', 'results_lm_v9_seq2k')
     add('seq2k(bs1): topk512 - m1', seq2k, 'csa_fixed_topk512', 'csa_fix_m1', 'results_lm_v9_seq2k')
     add('seq2k(bs1): topk8 - topk512', seq2k, 'csa_fixed_topk8', 'csa_fixed_topk512', 'results_lm_v9_seq2k')
@@ -2187,14 +2188,18 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A(f'**完成 {_p3t_done}/5 点**。')
     A('')
-    A('| 比较 | n | Δ (a−b) mean±std | p (exact) |')
-    A('|---|---|---|---|')
+    A('| 比较 | 因素 | n | Δ (a−b) mean±std | p (exact) |')
+    A('|---|---|---|---|---|')
     for k, v in comp.items():
         if k.startswith('seq2k'):
+            _fac = ('topk 剂量响应' if v.get('single_factor') else
+                    '块几何束（多因素）' if 'single_factor' in v else '—')
             if 'omitted' in v:
-                A(f'| {k} | 0 | —（{v['omitted']}） | — |')
+                A(f'| {k} | {_fac} | 0 | —（{v['omitted']}） | — |')
                 continue
-            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
+            A(f'| {k} | {_fac} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
+    A('')
+    A('**因素列（单因素契约）**：`topk 剂量响应` = 只差 `index_topk`；`块几何束（多因素）` = m1 对照同时改 block_size(4→1)/overlap(128→0) 与 topk 语义（逐 token 读取），等 token 预算但多因素——只能读作 sweep 点之间的系统级比较（v9 `SEQ2K_CONTRAST_FACTORS` 同一声明）。')
     A('')
     A('**注**：n=4 时精确符号翻转的 p 值分辨率为 0.125——仍跨不过 0.05（需 n=6 才有 0.031）；此行补齐的是与 scale 面板同级的统计分辨率，显著性主张仍以效应量 + 方向同向性表述。')
     A('')

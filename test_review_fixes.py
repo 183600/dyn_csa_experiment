@@ -14190,6 +14190,144 @@ def t_build_report_malformed_panel_is_excluded():
         BR._LOADED = old_loaded
         shutil.rmtree(td, ignore_errors=True)
 
+def t_single_factor_design_gate_passes_and_fails_closed():
+    # The design-time single-factor gate must (1) verify the SHIPPED design
+    # and (2) refuse both drift directions when the arm configs drift away
+    # from the declared intervention key sets.
+    import dataclasses as _dc
+    rep = L.single_factor_design_audit(verbose=False)
+    assert rep['status'] == 'ok', rep['violations'] + rep['undeclared']
+    assert rep['checked_pairs'] == len(L.declared_ablation_pairs()) + sum(
+        len(c) for c in L.BASELINE_DESIGN.values()), rep['checked_pairs']
+    # the method-vs-matched-dense baselines and the hybrid_hierarchy swap are
+    # architecture-level (kind in the diff), never knob-level single factors
+    assert rep['architecture_level_pairs'], rep
+    for label in rep['architecture_level_pairs']:
+        assert 'kind' in rep['pairs'][label]['actual_keys'], label
+    # the seeded-random control family: salt counts INSIDE indexer_mode's family
+    assert L.cfg_keys_single_factor({'indexer_mode', 'random_salt'})
+    assert L.cfg_keys_single_factor({'index_topk'})
+    assert not L.cfg_keys_single_factor({'kind'})
+    assert not L.cfg_keys_single_factor({'indexer_mode', 'index_topk'})
+
+    # drift 1: a second factor smuggled into one arm -> extra key -> refuse
+    def _factory_extra(n_layers, variant):
+        cfgs = L.make_layer_cfgs(n_layers, variant)
+        if variant == 'csa_fix_nosink':
+            return [_dc.replace(c, index_topk=8) for c in cfgs]
+        return cfgs
+    rep1 = L.single_factor_design_audit(factory=_factory_extra, verbose=False)
+    assert rep1['status'] == 'fail', rep1['violations']
+    assert any('index_topk' in v and 'csa_fix_nosink' in v for v in rep1['violations']), rep1['violations']
+
+    # drift 2: the declared intervention disappears -> missing key -> refuse
+    def _factory_gone(n_layers, variant):
+        cfgs = L.make_layer_cfgs(n_layers, variant)
+        if variant == 'csa_fix_nosink':
+            return L.make_layer_cfgs(n_layers, 'csa_fixed')
+        return cfgs
+    rep2 = L.single_factor_design_audit(factory=_factory_gone, verbose=False)
+    assert rep2['status'] == 'fail', rep2['violations']
+    assert any('use_sink' in v and 'disappeared' in v for v in rep2['violations']), rep2['violations']
+
+    # drift 3: a new declared contrast without a key declaration -> fail-closed
+    _design = dict(L.ABLATION_DESIGN)
+    _design['new_component'] = [('csa_fixed', 'csa_fix_topk8', 'undeclared contrast')]
+    rep3 = L.single_factor_design_audit(design=_design, baseline_design={}, verbose=False)
+    assert rep3['status'] == 'fail' and rep3['undeclared'], rep3['undeclared']
+    assert any('csa_fix_topk8' in u for u in rep3['undeclared']), rep3['undeclared']
+
+    # the open-block matrix must vary only along its two declared axes
+    ob = L.open_block_matrix_audit(verbose=False)
+    assert ob['status'] == 'ok' and ob['pairs'], ob['violations']
+    for label, entry in ob['pairs'].items():
+        assert not entry['extra_keys'], (label, entry)
+
+
+def t_frozen_manifest_mechanism_flags_are_verified_single_factor():
+    # The plan preflight must DERIVE each frozen comparison's single-factor
+    # verdict and refuse a mechanism_claim_allowed=true that is not backed by
+    # the arm construction (cfg diff family + matching objectives + matched
+    # parameter totals).
+    rep = V12.plan_check(os.path.join(REPO, 'confirmation_frozen.json'))
+    assert rep['ok'], rep['errors']
+    _cmp = rep['comparisons']
+    _seeded = [c for k, c in _cmp.items() if 'randidx_seeded' in k]
+    assert _seeded and _seeded[0]['single_factor'] is True, _seeded
+    assert _seeded[0]['mechanism_claim_allowed'] is True and _seeded[0]['claim_flag_consistent'] is True
+    _main = [c for k, c in _cmp.items() if k.startswith('main:')]
+    assert _main and _main[0]['single_factor'] is False and 'kind' in _main[0]['cfg_diff_keys'], _main
+    assert all(c['claim_flag_consistent'] for c in _cmp.values()), _cmp
+    # every shipped arm carries the objective descriptor the verdict used
+    assert all(isinstance(p.get('train_objective'), dict) for p in rep['predicted'].values()), \
+        [a for a, p in rep['predicted'].items() if not isinstance(p.get('train_objective'), dict)]
+
+    # an inconsistent flag on the kind-swap main comparison must refuse
+    with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+        man = json.load(f)
+    _names = [c.get('name') for c in man['primary_comparisons']]
+    man['primary_comparisons'][_names.index('main: csa_fixed_rope - full_rope @ L4096 (test)')] = dict(
+        man['primary_comparisons'][_names.index('main: csa_fixed_rope - full_rope @ L4096 (test)')],
+        mechanism_claim_allowed=True)
+    with tempfile.TemporaryDirectory() as td:
+        bad = os.path.join(td, 'bad_flag.json')
+        with open(bad, 'w', encoding='utf-8') as f:
+            json.dump(man, f)
+        _buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(_buf):
+                V12.plan_check(bad)
+        except SystemExit:
+            out = _buf.getvalue()
+            assert 'NOT single-factor' in out and "mechanism_claim_allowed=true" in out, out[-600:]
+        else:
+            raise AssertionError('plan_check must refuse a mechanism flag the arms do not back')
+    # the audit-gates entry point reports the same consistency verdicts
+    _arep = A.audit_single_factor()
+    assert _arep['status'] == 'ok', _arep
+    _fm = _arep['frozen_manifest']
+    assert _fm['status'] == 'ok' and all(c['claim_flag_cfg_consistent'] for c in _fm['comparisons'].values()), _fm
+
+
+def t_seq2k_contrasts_carry_factor_declarations():
+    # The v9/v10 seq2k paired contrasts must declare their factor structure:
+    # the topk endpoint contrast is a single-factor dose response, the two m1
+    # contrasts are multi-factor block-geometry bundles (block_size/overlap/
+    # index_topk all change together), and add_paired writes the declaration
+    # into the comparison record (omitted or not).
+    import v9_supp as V9
+    decl = V9.SEQ2K_CONTRAST_FACTORS
+    assert decl['seq2k(bs1): topk8 - topk512']['single_factor'] is True, decl
+    assert decl['seq2k(bs1): topk8 - topk512']['factors'] == ['index_topk'], decl
+    for name in ('seq2k(bs1): topk8 - m1', 'seq2k(bs1): topk512 - m1'):
+        assert decl[name]['single_factor'] is False, name
+        assert set(decl[name]['factors']) == {'block_size', 'overlap', 'index_topk'}, name
+    # the declaration must cover exactly the contrasts v9/v10 quote
+    for name in ('seq2k(bs1): topk8 - m1', 'seq2k(bs1): topk512 - m1',
+                 'seq2k(bs1): topk8 - topk512'):
+        assert name in decl, name
+    # add_paired attaches the declaration to a real paired record
+    knobs = L.training_knobs(amp_dtype=None, eager_batch=False)
+    def _rec(ppl):
+        return {'run_cfg': 'steps1500_sl2048_bs1_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_v8192_wu50_cl0.05_dlm10_mt4_mr4_ee250_es128_det0_df0_cs0',
+                'train_knobs': knobs, 'steps': 1500, 'tokens_seen': 8000000, 'ppl': ppl}
+    panel = {'csa_fixed_topk8': {0: _rec(40.0), 1: _rec(41.0)},
+             'csa_fix_m1': {0: _rec(42.0), 1: _rec(43.0)}}
+    comps = {}
+    out = V9.add_paired(comps, 'seq2k(bs1): topk8 - m1', panel, 'csa_fixed_topk8', 'csa_fix_m1',
+                        factors=decl['seq2k(bs1): topk8 - m1'])
+    assert out is not None and 'omitted' not in out, out
+    assert out['single_factor'] is False and 'factors' in out and 'factors_note' in out, out
+    assert out['n'] == 2 and out['seeds'] == [0, 1], out
+    # and to an omitted record (missing arm) the declaration still attaches
+    comps2 = {}
+    V9.add_paired(comps2, 'seq2k(bs1): topk8 - topk512', {}, 'csa_fixed_topk8', 'csa_fixed_topk512',
+                  outdir='results_lm_v9_seq2k',
+                  factors=decl['seq2k(bs1): topk8 - topk512'])
+    rec = comps2['seq2k(bs1): topk8 - topk512']
+    assert 'omitted' in rec and rec.get('single_factor') is True and rec.get('factors') == ['index_topk'], rec
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -14549,6 +14687,9 @@ def main():
     _check('L57 report pairs cover the declared ablation design', t_report_pairs_cover_the_declared_ablation_design)
     _check('L58 a partial ablation cannot verify the whole component', t_partial_ablation_cannot_verify_a_component)
     _check('L59 id fingerprint ignores malformed sidecar', t_ids_fp_ignores_malformed_sidecar)
+    _check('L60 single-factor design gate verifies the shipped design and fails closed on drift', t_single_factor_design_gate_passes_and_fails_closed)
+    _check('L61 frozen-manifest mechanism flags are machine-verified single-factor verdicts', t_frozen_manifest_mechanism_flags_are_verified_single_factor)
+    _check('L62 seq2k sweep contrasts carry explicit factor declarations', t_seq2k_contrasts_carry_factor_declarations)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

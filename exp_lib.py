@@ -48,6 +48,7 @@ import gc, copy, math, os, re, time, json, random, csv, tempfile, itertools, has
 import array
 from math import comb
 from dataclasses import dataclass
+import dataclasses as _dc_mod
 import numpy as np
 # Leakage-safe split/preprocessing contract (dependency-free NumPy module).
 # Re-exported here so every driver can use the same implementation:
@@ -12834,9 +12835,9 @@ def ppl_by_seed_grouped(outdir):
 ABLATION_DESIGN = {
     'dynamic_blocking': [
         ('csa_dynamic', 'csa_fixed', 'dynamic vs fixed blocking (CSA)'),
-        ('hybrid_dynamic', 'hybrid_fixed', 'dynamic vs fixed blocking (CSA+HCA hybrid)'),
+        ('hybrid_dynamic', 'hybrid_fixed', 'dynamic vs fixed blocking (CSA+HCA hybrid); the dynamic HCA layers train their boundary gates with comp_lambda_mult=4 (comp_lambda_effective 0.05->0.2) — part of the declared dynamic-HCA recipe, kept visible in train_objective and by the single-factor design gate (design_notes: single-factor contract)'),
         ('hybrid_csa_dyn', 'hybrid_fixed', 'dynamic vs fixed CSA blocking inside the hybrid (HCA fixed)'),
-        ('hybrid_hca_dyn', 'hybrid_fixed', 'dynamic vs fixed HCA blocking inside the hybrid (CSA fixed)'),
+        ('hybrid_hca_dyn', 'hybrid_fixed', 'dynamic vs fixed HCA blocking inside the hybrid (CSA fixed); the dynamic HCA layers train their boundary gates with comp_lambda_mult=4 (comp_lambda_effective 0.05->0.2) — part of the declared dynamic-HCA recipe, kept visible in train_objective and by the single-factor design gate (design_notes: single-factor contract)'),
     ],
     'learned_selection': [
         ('csa_fixed', 'csa_fix_randidx', 'learned top-k vs random selection (fixed blocking)'),
@@ -12900,6 +12901,352 @@ BASELINE_DESIGN = {
         ('csa_dynamic', 'full_matched', 'dynamic CSA vs parameter-matched full dense'),
     ],
 }
+
+# ---- 单因素设计契约（design-time gate）------------------------------------
+# ABLATION_DESIGN / BASELINE_DESIGN 的每条对照都是「应该只有一个因素在变」的
+# 受控对比。run_cfg / train_knobs / hyperparams / objective / params 的配对门
+# 都在**落盘记录**上把关（`pair_reason` 一族），但没有任何门检查**臂定义本
+# 身**：一条对照的两个臂如果在 `make_layer_cfgs` 里多差了一个旋钮，所有记录
+# 级门都会照样放行——被多改的那个旋钮就是那条对照的「因素」，没有第二个门
+# 能看见它。这里把每条对照**允许**差的 AttnCfg 键集合预先声明出来，
+# `single_factor_design_audit` 在定义点逐层 diff 两个臂的实际配置：
+#   * 实际差集 != 声明键集（多一个或少一个）都算违例——多一个是把第二
+#     个因素悄悄带进「单因素」对照；少一个是干预被改没了（键还在声明里，
+#     臂已经不差它），两种漂移都要在跑 GPU 之前被抓住；
+#   * 键集相等的对照按声明内容分级：`kind` 在差集里 = 换注意力算子本身
+#     （另有 mlp 加宽的参数对齐在 cfg 之外），属于 architecture_level；
+#     其余是 knob 级单因素；
+#   * 带外因素（attention cfg 之外的 mlp_ratio 参数对齐）声明在
+#     `CONTRAST_OUTSIDE_CFG_FACTORS` 里，由记录级 `_param_control` 关口。
+# 键集必须显式枚举、缺声明即 fail-closed：以后往 ABLATION_DESIGN 里加对照
+# 时，忘记声明键集本身就是错误，而不是被默认放行。
+ABLATION_INTERVENTION_KEYS = {
+    'dynamic_blocking': {
+        # 「动态分块」因素束 = 边界门(learned gate) + 分块策略本身。
+        ('csa_dynamic', 'csa_fixed'): frozenset({'dynamic', 'chunking', 'target_block_tokens'}),
+        ('hybrid_csa_dyn', 'hybrid_fixed'): frozenset({'dynamic', 'chunking', 'target_block_tokens'}),
+        # HCA 动态层的两个额外键都要在契约里写明（见 CONTRAST_OUTSIDE_CFG_FACTORS）：
+        #   block_size —— 动态分段不读它（blocks_from_cuts 用 target_block_tokens/
+        #                min_block/max_block），是 inert 字段的显式差，防止将来被
+        #                当成「不一致的臂定义」误修；
+        #   comp_lambda_mult —— HCA 动态边界门以 4x 权重训练（comp_lambda_effective
+        #                0.05→0.2），这是动态 HCA 配方的一部分，不是隐藏因素；
+        #                它同时进 train_objective，记录级 objective 门会继续把
+        #                dynamic-vs-fixed 标为 system-level，本契约只负责不漏报。
+        ('hybrid_dynamic', 'hybrid_fixed'): frozenset({'dynamic', 'chunking', 'target_block_tokens',
+                                                      'block_size', 'comp_lambda_mult'}),
+        ('hybrid_hca_dyn', 'hybrid_fixed'): frozenset({'dynamic', 'chunking', 'target_block_tokens',
+                                                      'block_size', 'comp_lambda_mult'}),
+    },
+    'learned_selection': {
+        ('csa_fixed', 'csa_fix_randidx'): frozenset({'indexer_mode'}),
+        ('csa_dynamic', 'csa_dyn_randidx'): frozenset({'indexer_mode'}),
+    },
+    'content_pooling': {
+        ('csa_fixed', 'csa_fix_zerocont'): frozenset({'content_mode'}),
+        ('csa_dynamic', 'csa_dyn_zerocont'): frozenset({'content_mode'}),
+    },
+    'attention_sink': {
+        ('csa_fixed', 'csa_fix_nosink'): frozenset({'use_sink'}),
+        ('csa_dynamic', 'csa_dyn_nosink'): frozenset({'use_sink'}),
+        ('full_sink', 'full'): frozenset({'full_sink'}),
+    },
+    'compression_regularizer': {
+        ('csa_dynamic', 'csa_dyn_nocomp'): frozenset({'comp_lambda_mult'}),
+    },
+    'task_learned_boundary': {
+        ('csa_dynamic_task', 'csa_dynamic'): frozenset({'boundary_policy'}),
+    },
+    'local_fusion': {
+        ('csa_dyn_fuse', 'csa_dynamic'): frozenset({'fuse_mode'}),
+        ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn'): frozenset({'fuse_mode'}),
+    },
+    'hybrid_hierarchy': {
+        # kind 互换（部分层 csa→hca）= 换算子，architecture_level。
+        ('hybrid_csa_dyn', 'csa_dynamic'): frozenset({'kind', 'chunking', 'dynamic',
+                                                     'block_size', 'target_block_tokens'}),
+    },
+}
+BASELINE_INTERVENTION_KEYS = {
+    'compression_vs_matched_dense': {
+        # 方法 vs 参数对齐稠密基线：kind 互换 + 动态分块束 + （window 臂的）窗口；
+        # mlp 加宽在 attention cfg 之外，由 `_param_control` 在记录级把关。
+        ('csa_dynamic', 'full_sw128_matched'): frozenset({'kind', 'chunking', 'dynamic',
+                                                          'target_block_tokens', 'window'}),
+        ('csa_dynamic', 'full_matched'): frozenset({'kind', 'chunking', 'dynamic',
+                                                   'target_block_tokens'}),
+    },
+}
+# 显式带外因素（不在 AttnCfg diff 里，但有别的门）：报告用，键集审计不查它们。
+CONTRAST_OUTSIDE_CFG_FACTORS = {
+    ('hybrid_dynamic', 'hybrid_fixed'): 'HCA dynamic layers train the boundary gate with comp_lambda_mult=4 (comp_lambda_effective 0.05->0.2); block_size differs but is inert under dynamic segmentation; the objective difference is reported by the record-level objective gate.',
+    ('hybrid_hca_dyn', 'hybrid_fixed'): 'HCA dynamic layers train the boundary gate with comp_lambda_mult=4 (comp_lambda_effective 0.05->0.2); block_size differs but is inert under dynamic segmentation; the objective difference is reported by the record-level objective gate.',
+    ('csa_dynamic', 'full_sw128_matched'): 'the dense arm widens mlp_ratio to parameter-match csa_dynamic (verified at record time by _param_control / init_core_fp).',
+    ('csa_dynamic', 'full_matched'): 'the dense arm widens mlp_ratio to parameter-match csa_dynamic (verified at record time by _param_control / init_core_fp).',
+    ('hybrid_csa_dyn', 'csa_dynamic'): 'attention-kind swap (csa->hca on half the layers); capacity/objective readouts stay with the record-level gates.',
+}
+
+# Declared single-factor intervention families over the attention cfg: a diff
+# whose keys all sit inside ONE family isolates that knob (and nothing else).
+# `kind` is deliberately NOT a family — swapping the attention operator is an
+# architecture change (dense/sparse machinery, projections, sink semantics,
+# plus the mlp-ratio parameter matching), i.e. multi-factor by construction.
+# The seeded-random control's `random_salt` belongs to the `indexer_mode`
+# family: the salt is the DEFINITION of the per-(seed, layer) pseudo-random
+# draw, not a second intervention (design_notes: seeded random control).
+SINGLE_FACTOR_CFG_FAMILIES = (
+    frozenset(),  # identical attention cfgs — the factor lives outside (e.g. mlp_ratio)
+    frozenset({'indexer_mode', 'random_salt'}),
+    frozenset({'index_topk'}),
+    frozenset({'use_sink'}),
+    frozenset({'full_sink'}),
+    frozenset({'content_mode'}),
+    frozenset({'boundary_policy'}),
+    frozenset({'fuse_mode'}),
+    frozenset({'comp_lambda_mult'}),
+)
+
+def cfg_keys_single_factor(keys):
+    """True iff a config-diff key set isolates ONE declared intervention family.
+
+    Used by the frozen-plan preflight and the audit gates: a comparison may
+    carry a mechanism claim only when its attention-cfg diff is inside one
+    family (no `kind` swap), the two arms' actual training objectives match,
+    and the parameter totals are matched — the three places a "single factor"
+    can silently become two.
+    """
+    ks = frozenset(str(k) for k in keys)
+    return 'kind' not in ks and any(ks <= fam for fam in SINGLE_FACTOR_CFG_FAMILIES)
+
+def layer_cfg_diff(ca, cb):
+    """Field-by-field diff between two per-layer attention configs.
+
+    Returns `{key: (value_a, value_b)}` over the dataclass fields where the
+    two configs disagree.  `single_factor_design_audit` diffs EVERY declared
+    contrast through this helper, so the key set a contrast is allowed to
+    differ in is a verified property of `make_layer_cfgs` — not an
+    assumption in prose.  Mixed config types (a patched rope config vs a base
+    config) are still comparable: the fields of the union of both classes are
+    compared with getattr, so a field only one class carries can never hide.
+    """
+    keys = []
+    for klass in (type(ca), type(cb)):
+        for f in _dc_mod.fields(klass):
+            if f.name not in keys:
+                keys.append(f.name)
+    out = {}
+    for name in keys:
+        va, vb = getattr(ca, name, None), getattr(cb, name, None)
+        try:
+            differs = (va != vb)
+        except (TypeError, ValueError):
+            differs = True
+        if differs:
+            out[name] = (va, vb)
+    return out
+
+def _design_pair_cfg_keys(variant_a, variant_b, factory, n_layers):
+    """Union (over layers) of the config keys in which two arms differ.
+
+    Returns `(keys, per_layer)` where `per_layer` maps layer index -> diff
+    dict (layers with no diff are omitted).  A construction failure in either
+    arm is returned as the exception object so the caller can report it as a
+    violation instead of crashing the audit.
+    """
+    try:
+        cfgs_a = factory(n_layers, variant_a)
+        cfgs_b = factory(n_layers, variant_b)
+    except Exception as e:  # fail closed: an unbuildable arm is a design defect
+        return e, {}
+    if len(cfgs_a) != len(cfgs_b):
+        return ValueError(f'arms have different layer counts ({len(cfgs_a)} vs {len(cfgs_b)})'), {}
+    per_layer = {}
+    keys = set()
+    for i, (x, y) in enumerate(zip(cfgs_a, cfgs_b)):
+        d = layer_cfg_diff(x, y)
+        if d:
+            per_layer[i] = d
+            keys.update(d)
+    return sorted(keys), per_layer
+
+def single_factor_design_audit(design=None, *, baseline_design=None, factory=None,
+                               intervention_keys=None, baseline_intervention_keys=None,
+                               n_layers=6, extra_pairs=None, verbose=True):
+    """Zero-GPU design-time gate: every declared contrast must be single-factor
+    AT THE DEFINITION SITE, within its declared key set.
+
+    The record-level gates (`pair_reason` / `train_knobs` / `hyperparams` /
+    `objective` / `_param_control`) verify that two arms of a declared
+    contrast share the training recipe, the optimizer, the MLP width, the
+    objective and the parameter count.  None of them can see the *attention*
+    configs, because differing there is the whole point of a contrast: the
+    single-factor property lives in the DIFF.  This audit recomputes that
+    diff for every declared pair and checks it against the declared
+    intervention key set:
+
+      * an UNDECLARED extra key is a second factor smuggled into a
+        single-factor contrast (fail);
+      * a DECLARED key that no longer differs means the intervention
+        silently disappeared — the contrast now compares two identical arms
+        (fail);
+      * a declared pair with NO entry in the key declaration is refused:
+        adding a contrast without declaring its factor keys is the exact
+        drift this gate exists to catch (fail-closed, no default-allow);
+      * `kind` in the diff means the attention operator itself is swapped —
+        the contrast is reported as `architecture_level` (multi-factor by
+        declaration, together with the mlp-ratio parameter matching in
+        `CONTRAST_OUTSIDE_CFG_FACTORS`), never as a knob-level single factor.
+
+    Returns the report dict; `status` is 'ok' iff no violation was found.
+    Nothing is written to disk and no model is built — this is pure config
+    arithmetic, safe in the frozen-confirmation window.
+    """
+    design = ABLATION_DESIGN if design is None else design
+    if baseline_design is None:
+        baseline_design = BASELINE_DESIGN
+    intervention_keys = ABLATION_INTERVENTION_KEYS if intervention_keys is None else intervention_keys
+    baseline_intervention_keys = (BASELINE_INTERVENTION_KEYS
+                                  if baseline_intervention_keys is None else baseline_intervention_keys)
+    factory = make_layer_cfgs if factory is None else factory
+    _factory_name = getattr(factory, '__name__', repr(factory))
+    report = {'factory': _factory_name, 'n_layers': int(n_layers),
+              'pairs': {}, 'violations': [], 'undeclared': [], 'warnings': [],
+              'checked_pairs': 0, 'single_factor_pairs': [], 'architecture_level_pairs': []}
+
+    def _audit_one(comp, a, b, declared_map, kind):
+        label = f'{comp}: {a} vs {b}'
+        declared = declared_map.get(comp, {}).get((a, b)) if isinstance(declared_map, dict) else None
+        if declared is None:
+            # fail closed: an undeclared contrast has no verified key contract.
+            report['undeclared'].append(
+                f'{label}: no intervention-key declaration for this contrast — declare the '
+                f'exact AttnCfg keys it is allowed to differ in (ABLATION_INTERVENTION_KEYS) '
+                f'before it can count as single-factor')
+            return
+        actual, per_layer = _design_pair_cfg_keys(a, b, factory, n_layers)
+        if isinstance(actual, Exception):
+            report['violations'].append(f'{label}: arm construction failed ({type(actual).__name__}: {actual})')
+            return
+        declared_set = {str(k) for k in declared}
+        actual_set = set(actual)
+        extra = sorted(actual_set - declared_set)
+        missing = sorted(declared_set - actual_set)
+        level = ('architecture_level' if 'kind' in actual_set else 'single_factor')
+        entry = {'component': comp, 'a': a, 'b': b, 'kind': kind,
+                 'declared_keys': sorted(declared_set), 'actual_keys': sorted(actual_set),
+                 'extra_keys': extra, 'missing_keys': missing, 'level': level,
+                 'per_layer': {str(i): {k: [v0, v1] for k, (v0, v1) in d.items()}
+                               for i, d in per_layer.items()}}
+        if CONTRAST_OUTSIDE_CFG_FACTORS.get((a, b)):
+            entry['outside_cfg_factors'] = CONTRAST_OUTSIDE_CFG_FACTORS[(a, b)]
+        if extra:
+            report['violations'].append(
+                f'{label}: UNDECLARED factor key(s) {extra} in the config diff — a '
+                f'single-factor contrast may differ only in {sorted(declared_set)}')
+        if missing:
+            report['violations'].append(
+                f'{label}: declared key(s) {missing} no longer differ — the intervention '
+                f'disappeared; either the arm definition drifted or the declaration is stale')
+        if not extra and not missing:
+            if level == 'single_factor':
+                report['single_factor_pairs'].append(label)
+            else:
+                report['architecture_level_pairs'].append(label)
+        report['pairs'][label] = entry
+        report['checked_pairs'] += 1
+
+    if isinstance(design, dict):
+        for comp, contrasts in design.items():
+            if not isinstance(contrasts, (list, tuple)):
+                continue
+            for item in contrasts:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                _audit_one(str(comp), str(item[0]), str(item[1]), intervention_keys, 'component')
+    if isinstance(baseline_design, dict):
+        for comp, contrasts in baseline_design.items():
+            if not isinstance(contrasts, (list, tuple)):
+                continue
+            for item in contrasts:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                _audit_one(str(comp), str(item[0]), str(item[1]), baseline_intervention_keys, 'baseline')
+    # caller-supplied pairs (e.g. the frozen rope family checked through the
+    # v7 factory by audit_gates / v12 plan): same fail-closed contract, the
+    # declaration map is passed with them.
+    if extra_pairs:
+        for comp, a, b, declared in extra_pairs:
+            declared_map = {comp: {(a, b): frozenset(declared)}}
+            _audit_one(str(comp), str(a), str(b), declared_map, 'extra')
+    report['status'] = 'fail' if (report['violations'] or report['undeclared']) else 'ok'
+    if verbose:
+        if report['violations'] or report['undeclared']:
+            print('[single-factor] REFUSED — declared contrasts are not single-factor at the definition site:')
+            for _v in report['violations'] + report['undeclared']:
+                print(f'  - {_v}')
+        else:
+            print(f"[single-factor] OK: {report['checked_pairs']} declared contrast(s) verified; "
+                  f"{len(report['single_factor_pairs'])} knob-level single-factor, "
+                  f"{len(report['architecture_level_pairs'])} architecture-level (declared)")
+    return report
+
+def open_block_matrix_audit(factory=None, *, n_layers=6, verbose=True):
+    """Zero-GPU check of the open-block panel's declared 2-factor factorial.
+
+    The open-block panel is deliberately a max_block x reading-rule MATRIX
+    (design_notes §24), so its intra-panel contrasts are not one-factor
+    leave-one-out cells; what must still hold is that the two declared axes
+    are the ONLY config axes that vary: same-cap mode contrasts differ in
+    `open_block_mode` alone, same-mode cap contrasts differ in `max_block`
+    alone, and scope variants differ in `open_block_scope` alone.  Any other
+    key leaking into an intra-matrix diff would make the interaction
+    statistics read a third, undeclared factor.
+    """
+    factory = make_layer_cfgs if factory is None else factory
+    report = {'pairs': {}, 'violations': [], 'status': None}
+    mbs = list(OPEN_BLOCK_MAX_VALUES)
+    modes = list(OPEN_BLOCK_MODES_SHORT)
+    checks = []
+    for mb in mbs:
+        for mode in modes:
+            if mode != 'closed':
+                checks.append((('mode', mb, mode), ('mode', mb, 'closed'),
+                               {'open_block_mode'}))
+    for mb in mbs[1:]:
+        checks.append((('cap', mb, 'closed'), ('cap', mbs[0], 'closed'), {'max_block'}))
+    for mb in mbs:
+        # scope axis: the outside-window auxiliary arm differs from its
+        # full-prefix twin in `open_block_scope` alone
+        checks.append((('scope', mb, 'closed'), ('scope', mb, 'closed'), {'open_block_scope'}))
+    for tag_a, tag_b, allowed in checks:
+        # every axis check compares one cell against its axis twin; scope
+        # checks pair the outside_window variant with the full_prefix one
+        a = open_block_variant_name(tag_a[1], tag_a[2] if tag_a[0] == 'mode' else 'closed',
+                                    'outside_window' if tag_a[0] == 'scope' else 'full_prefix')
+        b = open_block_variant_name(tag_b[1], tag_b[2] if tag_b[0] == 'mode' else 'closed',
+                                    'full_prefix')
+        if a == b:
+            continue
+        keys, per_layer = _design_pair_cfg_keys(a, b, factory, n_layers)
+        if isinstance(keys, Exception):
+            report['violations'].append(f'open-block {a} vs {b}: construction failed ({keys})')
+            continue
+        extra = sorted(set(keys) - allowed)
+        label = f'{a} vs {b}'
+        report['pairs'][label] = {'actual_keys': keys, 'allowed_keys': sorted(allowed), 'extra_keys': extra}
+        if extra:
+            report['violations'].append(
+                f'open-block {label}: intra-matrix diff leaks factor key(s) {extra} '
+                f'outside the declared axis {sorted(allowed)}')
+    report['status'] = 'fail' if report['violations'] else 'ok'
+    if verbose:
+        if report['violations']:
+            print('[open-block-matrix] REFUSED:')
+            for _v in report['violations']:
+                print(f'  - {_v}')
+        else:
+            print(f"[open-block-matrix] OK: {len(report['pairs'])} intra-matrix contrast(s) vary only on the declared axes")
+    return report
 
 HYPOTHESIS_DESIGN = {
     'dynamic_blocking': {

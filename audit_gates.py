@@ -28,6 +28,10 @@
                （读 results_baseline_tuning/baseline_tuning.json）
   methodology  受控对比 / 消融完整性 / 统计可靠性：逐臂全种子设置一致性、
                每个创新点的留一对照是否完整、n 与 mean±std（零 GPU）
+  single_factor  单因素设计契约：每条声明对照的臂配置 diff 恰好等于声明的
+               干预键集（定义点审计，不读 results_*）；open-block 矩阵只沿
+               两根声明轴变化；冻结清单的 mechanism_claim_allowed 标志与实际
+               臂配置 diff 一致（零 GPU）
   failures     失败与缺失：error 记录按臂集中度（选择偏差读数，零 GPU）
   training_health  训练曲线健康与 NaN 排查记录的自洽性（零 GPU）
   budget       规模核算：6ND 估算 + TimeGuard 记录对账（零 GPU）
@@ -1929,6 +1933,98 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
 
 
 # ---------------------------------------------------------------------------
+# 7e) single-factor：单因素设计契约（定义点审计，不读任何 results_*）
+# ---------------------------------------------------------------------------
+
+def audit_single_factor(manifest_path=None):
+    """单因素设计审计（零 GPU、零落盘依赖）。
+
+    与 `methodology`（读 results_*/summary.json 的记录级门）互补，本审计在
+    **定义点**核验每条声明对照的臂配置 diff：
+      * ABLATION_DESIGN / BASELINE_DESIGN 的每条对照，其实际 AttnCfg diff
+        必须恰好等于声明的干预键集（`ABLATION_INTERVENTION_KEYS`）：多一个键
+        = 第二个因素混进「单因素」对照；少一个键 = 干预消失；缺声明 =
+        fail-closed，加对照不声明键集本身就是错误；
+      * open-block 2x2 矩阵：同一 cap 的 mode 对照只差 `open_block_mode`，
+        同一 mode 的 cap 对照只差 `max_block`，scope 对照只差
+        `open_block_scope`——交互统计只能读这两根轴；
+      * 冻结清单（confirmation_frozen.json）：每条 primary comparison 的
+        attention-cfg diff 是否单因素（`cfg_keys_single_factor` 的一族判据），
+        与 `mechanism_claim_allowed` 标志的一致性。`True` 标志但 cfg 非单因素
+        => fail（完整的含目标/参数量核验在 `v12_supp.py plan`，本审计给出
+        同一口径的 cfg 级读数）。
+    """
+    L = _import_exp_lib()
+    out = {'status': 'ok', 'design': {}, 'open_block_matrix': {}, 'frozen_manifest': {}}
+    design_rep = L.single_factor_design_audit(verbose=False)
+    out['design'] = design_rep
+    ob_rep = L.open_block_matrix_audit(verbose=False)
+    out['open_block_matrix'] = ob_rep
+    if design_rep.get('status') != 'ok' or ob_rep.get('status') != 'ok':
+        out['status'] = 'fail'
+    # The frozen family resolves through the v7 factory (rope arms); the base
+    # factory is its delegate for non-rope arms, so one factory covers both.
+    try:
+        import v7_supp as V7
+        _factory = V7.make_layer_cfgs_v7
+    except Exception as _e:  # pragma: no cover - import failure is an environment defect
+        out['frozen_manifest'] = {'status': 'not_verifiable_locally',
+                                   'note': f'cannot import the v7 arm factory ({type(_e).__name__}: {_e})'}
+        _factory = None
+    _mp = manifest_path or os.path.join(REPO, 'confirmation_frozen.json')
+    if _factory is not None:
+        if not os.path.exists(_mp):
+            out['frozen_manifest'] = {'status': 'not_verifiable_locally',
+                                       'note': f'no freeze manifest at {_mp}'}
+        else:
+            try:
+                with open(_mp, encoding='utf-8') as _f:
+                    man = json.load(_f)
+            except Exception as _e:
+                out['frozen_manifest'] = {'status': 'fail',
+                                          'note': f'manifest is not readable JSON ({type(_e).__name__}: {_e})'}
+                man = None
+            if isinstance(man, dict):
+                _arms = [str(a) for a in (man.get('arms') or [])]
+                _cmp = {}
+                _bad = []
+                for comp in (man.get('primary_comparisons') or []):
+                    if not isinstance(comp, dict):
+                        continue
+                    _name = str(comp.get('name'))
+                    _a, _b = str(comp.get('a')), str(comp.get('b'))
+                    _keys, _per_layer = L._design_pair_cfg_keys(_a, _b, _factory, 6)
+                    if isinstance(_keys, Exception):
+                        _bad.append(f'{_name}: arm construction failed ({_keys})')
+                        _cmp[_name] = {'a': _a, 'b': _b, 'cfg_diff_keys': None,
+                                       'cfg_single_factor': False,
+                                       'mechanism_claim_allowed': comp.get('mechanism_claim_allowed'),
+                                       'claim_flag_cfg_consistent': False}
+                        continue
+                    _sf_cfg = L.cfg_keys_single_factor(_keys)
+                    _flag = comp.get('mechanism_claim_allowed')
+                    _consistent = (_flag is not True) or _sf_cfg
+                    if not _consistent:
+                        _bad.append(f'{_name}: mechanism_claim_allowed=true but the cfg diff '
+                                    f'keys {sorted(_keys)} are not one declared single-factor family '
+                                    f'(kind swaps are architecture-level by definition)')
+                    _cmp[_name] = {'a': _a, 'b': _b, 'cfg_diff_keys': sorted(_keys),
+                                   'cfg_single_factor': _sf_cfg,
+                                   'mechanism_claim_allowed': _flag,
+                                   'claim_flag_cfg_consistent': _consistent,
+                                   'note': ('full verdict (objectives + parameter totals) is '
+                                            'enforced by `v12_supp.py plan` at preflight')}
+                out['frozen_manifest'] = {'status': ('fail' if _bad else 'ok'),
+                                          'manifest': _mp, 'comparisons': _cmp,
+                                          'violations': _bad,
+                                          'arms_checked': _arms}
+                if _bad:
+                    out['status'] = 'fail'
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 8) 规模核算：6ND 估算 + TimeGuard 记录对账
 # ---------------------------------------------------------------------------
 
@@ -2737,7 +2833,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -2757,7 +2853,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

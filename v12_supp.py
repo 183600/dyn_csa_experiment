@@ -2533,6 +2533,7 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         errs.append(f'binding.per_arm_recipe_signature must name exactly the frozen arms {sorted(arms)} (got {sorted(_per_arm)})')
     _records = {}
     _pred = {}
+    _arm_cfgs = {}
     for arm in arms:
         try:
             cfgs = L.make_layer_cfgs(_n_layers, arm)
@@ -2576,6 +2577,7 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         _pred[arm] = {'eager_batch': (bool(_eb) if _eb is not None else None),
                       'amp_dtype': _tk.get('amp_dtype'),
                       'train_knobs': _tk, 'recipe': _recipe}
+        _arm_cfgs[arm] = cfgs
         # Parameter matching is part of the frozen comparison contract: the
         # analysis refuses a pair whose totals differ by >1%, but discovering
         # that only after P5T would waste the access.  Build the real shapes
@@ -2586,6 +2588,13 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
                                       _n_layers, int(sig.get('H', 8)), int(sig.get('Dh', 32)),
                                       int(sig.get('sl', 512)), cfgs, mlp_ratio=_mr_for_shape)
             _pred[arm]['params'] = int(L.count_params(_shape_model))
+            # The ACTUAL optimisation objective of this arm (comp_reg / delta-LR
+            # / boundary policy, read off the built model, not the arm name) —
+            # the single-factor verdict below compares the two arms' objectives
+            # through the same descriptor the record-level gate uses.
+            _pred[arm]['train_objective'] = L.train_objective(
+                _shape_model, comp_lambda=float(sig.get('cl', 0.05)),
+                delta_lr_mult=float(sig.get('dlm', 10.0)))
             del _shape_model
         except Exception as _e:
             errs.append(f'{arm}: could not compute the parameter count for the frozen shape ({type(_e).__name__}: {_e})')
@@ -2633,7 +2642,44 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
             _rel = abs(_pa - _pb) / max(_pa, _pb, 1)
             if _rel > 0.01:
                 errs.append(f'comparison {comp.get("name")!r} is NOT parameter-matched at the frozen shapes ({_pa} vs {_pb}, rel diff {_rel:.4%} > 1%) — the analysis would refuse it after the test access')
-        _comp_report[comp.get('name')] = {'a': _a, 'b': _b, 'endpoint_L': _Ln, 'pairs_planned': len(seeds) - len(_low), 'params_a': _pa, 'params_b': _pb, 'param_rel_diff': _rel}
+        # ---- single-factor verdict vs the mechanism-claim flag (review-7) ----
+        # A frozen comparison may carry `mechanism_claim_allowed=true` only if
+        # it is verifiably single-factor: the attention-cfg diff isolates ONE
+        # declared intervention family (no `kind` swap), the two arms' ACTUAL
+        # objectives match, and the parameter totals are matched.  A True flag
+        # on a multi-factor contrast is a design defect and refuses the plan;
+        # a False flag on a config-single-factor contrast stays allowed (the
+        # caveat may rely on read-budget/interpretation constraints outside
+        # the attention cfg — conservative direction is never an error).
+        _diff_keys = None
+        if _a in _arm_cfgs and _b in _arm_cfgs:
+            _diff_keys = set()
+            for _ca, _cb in zip(_arm_cfgs[_a], _arm_cfgs[_b]):
+                _diff_keys.update(L.layer_cfg_diff(_ca, _cb).keys())
+        _obj_reason = L._objective_diff({'train_objective': (_pred.get(_a) or {}).get('train_objective')},
+                                        {'train_objective': (_pred.get(_b) or {}).get('train_objective')})[0] \
+            if ((_pred.get(_a) or {}).get('train_objective') is not None
+                and (_pred.get(_b) or {}).get('train_objective') is not None) else 'unverifiable train_objective (arm model not built)'
+        _sf = bool((_diff_keys is not None) and L.cfg_keys_single_factor(_diff_keys)
+                   and (_obj_reason is None)
+                   and (_rel is None or _rel <= 0.01))
+        _flag = comp.get('mechanism_claim_allowed')
+        if _flag is True and not _sf:
+            _why = (f'cfg diff keys {sorted(_diff_keys)}'
+                    if _diff_keys is not None else 'cfg diff not computable')
+            if _obj_reason is not None:
+                _why += f'; objective mismatch ({_obj_reason})'
+            if _rel is not None and _rel > 0.01:
+                _why += f'; parameter totals differ by {_rel:.4%}'
+            errs.append(f'comparison {comp.get("name")!r} declares mechanism_claim_allowed=true but is NOT single-factor ({_why}) — a mechanism claim requires the attention-cfg diff to isolate one declared intervention family, matching objectives and matched parameters; re-derive the flag or re-design the arms BEFORE any test access')
+        if _flag is not True and _sf:
+            notes.append(f'comparison {comp.get("name")!r} is config-single-factor ({sorted(_diff_keys)}) but carries a conservative mechanism_claim_allowed={_flag!r}; keeping the conservative flag (the caveat may rest on constraints outside the attention cfg, e.g. read budget or interpretation)')
+        _comp_report[comp.get('name')] = {'a': _a, 'b': _b, 'endpoint_L': _Ln, 'pairs_planned': len(seeds) - len(_low), 'params_a': _pa, 'params_b': _pb, 'param_rel_diff': _rel,
+                                         'cfg_diff_keys': (sorted(_diff_keys) if _diff_keys is not None else None),
+                                         'objective_matched': (_obj_reason is None),
+                                         'single_factor': _sf,
+                                         'mechanism_claim_allowed': _flag,
+                                         'claim_flag_consistent': (_flag is not True) or _sf}
     report = {'ok': not errs, 'manifest': manifest_path, 'manifest_sha256': m.get('manifest_sha256'),
               'code_semantics': L.CODE_SEMANTICS, 'n_arms': len(arms), 'n_seeds': len(seeds),
               'n_min_for_confirmation': _n_min, 'min_attainable_p_holm': _min_holm,

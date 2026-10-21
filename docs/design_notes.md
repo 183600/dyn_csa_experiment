@@ -1773,3 +1773,81 @@ tuning/final/simple 三条路径都通过 `_nested_row_split` 把这个组向量
 `row_split` 元数据会保留 `groups_aware`、`n_groups` 与来源，审计仍可复现
 行指纹。该实现覆盖 WikiText 主研究；FineWeb 若需要组感知切分，调用方应
 显式提供组向量。
+
+## 37. 单因素设计契约：在定义点核验每条对照的因素结构（本轮硬化）
+
+### 37.1 问题：记录级门看不见「因素」本身
+
+评审三/四给对照配对加了一系列**记录级**门：`pair_reason`（run_cfg 逐字节
+相等）、`train_knobs`（优化器/调度/裁剪/增广全描述符）、`hyperparams`
+（结构超参）、`init_core_fp`（匹配初始化）、`train_objective`（实际训练目
+标）、`_param_control`（参数量对齐）、`_compute_control_detail`（算力对
+齐）。这些门都核验「两个臂**共享**哪些东西」；而一条对照之所以是对照，
+恰恰因为它的两个臂**允许**差一个因素——那个差异（AttnCfg 的键）没有任何
+门在看。若某天一条消融对照的臂定义被多改了一个旋钮（例如顺手改了
+`index_topk` 或 `fuse_kernel`），所有记录级门都会照常放行：那个多出来的
+旋钮本身就成了对照的「因素」，报告却仍按原声明解读。反向漂移同样成立：
+声明的干预键若被改得不再差异（干预消失），对照变成两个同构臂，也无人报错。
+
+### 37.2 契约：每条对照声明它允许差的键集
+
+`exp_lib.ABLATION_INTERVENTION_KEYS` / `BASELINE_INTERVENTION_KEYS` 为
+`ABLATION_DESIGN` / `BASELINE_DESIGN` 的每条对照显式声明「允许差」的
+AttnCfg 键集（`CONTRAST_OUTSIDE_CFG_FACTORS` 另行声明 cfg 之外的带外因
+素，如稠密基线的 mlp 加宽参数对齐，仍由记录级 `_param_control` 把关）。
+`exp_lib.single_factor_design_audit` 逐层 diff 两个臂的实际配置并核验：
+
+- **实际差集必须恰好等于声明键集**：多一个键 = 第二个因素混进单因素对照
+  （refuse）；少一个键 = 干预消失（refuse）；两侧漂移都在跑 GPU 之前被抓。
+- **缺声明即 fail-closed**：往设计里加对照而不声明键集，本身就是错误——
+  没有默认放行。
+- **分级**：`kind` 出现在差集 = 换注意力算子（另有 mlp 加宽/投影/sink 语
+  义），标记 `architecture_level`，永远不冒充 knob 级单因素；其余为
+  `single_factor`。方法 vs 参数对齐稠密基线因此是 architecture_level 而
+  不是单因素，与 §22.4 的 objective 门结论一致。
+
+契约同时把两处此前**未声明**的 HCA 动态臂差异写进明面：动态 HCA 层的
+边界门以 `comp_lambda_mult=4` 训练（comp_lambda_effective 0.05→0.2），以及
+`block_size` 在动态分段下的 inert 差（`blocks_from_cuts` 不读它）。这两条
+差此前只在代码与 `train_objective` 读数里可见、未进对照声明；现在它们是
+声明键集的一部分，且 `ABLATION_DESIGN` 的对照注释与
+`CONTRAST_OUTSIDE_CFG_FACTORS` 都写明其语义。dynamic-vs-fixed 的对照因此
+继续保持 §22.4 的 system-level 读数——契约的职责是不漏报，不是放宽。
+
+### 37.3 冻结清单：`mechanism_claim_allowed` 从手写断言变成可核验属性
+
+v12 的清单为每条 primary comparison 手写 `mechanism_claim_allowed` 与
+`interpretation_caveat`；此前没有任何机器检查把标志与臂定义对账。现在
+`v12_supp.py plan`（零 GPU，读不到任何 test 数据）为每条比较计算：
+
+- attention-cfg diff 键集是否落在**一个**声明的干预族内
+  （`exp_lib.cfg_keys_single_factor`；`kind` 互换按定义不属于任何族）；
+- 两臂由已构建模型读出的**实际**训练目标是否一致（`train_objective`，
+  同一记录级口径）；
+- 参数总量是否在 1% 对齐内（既有检查）。
+
+三者同时成立才判 `single_factor=True`。**标志为 True 而判非单因素 =>
+plan 直接 refuse**（机制主张不允许挂在多因素比较上）；标志为 False 而判
+单因素 => 保持保守标志并记 note（caveat 可依赖 cfg 之外的约束，如
+allblocks 读严格更多信息、等读预算不成立——保守方向永远不是错误）。当前
+清单核验结果：`randidx_seeded`（唯一 True 标志）确为单因素
+（`indexer_mode` + 逐 (seed,layer) 抽取的 `random_salt`，后者是随机抽取的
+定义而非第二干预）；main/sink-matched/no-sink/aligned-dense 四条 kind 互换
+与 allblocks 的保守 False 全部一致。`audit_gates.py single_factor` 子命令
+给出同一口径的 cfg 级读数（不建模型，零依赖），并汇入 `report` 汇总审计。
+
+### 37.4 扫描对照与开放块矩阵
+
+- v9/v10 的 seq2k 扫描配对检验新增因素列（`v9.SEQ2K_CONTRAST_FACTORS`）：
+  `topk8 - topk512` 是单因素剂量响应（只差 `index_topk`）；两条 m1 对照同
+  时改 block_size(4→1)/overlap(128→0) 与 topk 语义（逐 token 读取）——等
+  token 预算但**多因素块几何束**，只能读作 sweep 点之间的系统级比较，报告
+  明示不得读作 topk 剂量响应。
+- `exp_lib.open_block_matrix_audit` 核验开放块 2x2 矩阵（§24 声明的
+  max_block × 读取规则）只沿两根声明轴变化：同 cap 的 mode 对照只差
+  `open_block_mode`、同 mode 的 cap 对照只差 `max_block`、scope 对照只差
+  `open_block_scope`；任何第三键泄漏进矩阵内 diff 都会让交互统计读到未声
+  明因素而 refuse。
+
+本节全部改动为零 GPU 的定义点/清单门与标注：不改任何臂的测量语义
+（`CODE_SEMANTICS` 不变）、不改冻结清单字节、不动任何 results_*。

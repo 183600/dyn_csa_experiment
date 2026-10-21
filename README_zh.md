@@ -36,7 +36,7 @@
 | `test_open_block.py` | **未结束块 CPU 门禁**：配置/分段器、优化前缀池化与逐查询参考的前向/梯度一致、前缀不变性、未来扰动/未来梯度、候选掩码、边界情形、closed 回归、单 token 语义与 HCA 预算声明 |
 | `confirmation_frozen.json` | **预注册冻结清单 v2**（入库）：冻结臂、种子 0-11（在任何 test-split 访问**之前**由 6 修订为 12，含功效表）、终点、精确符号翻转 + Holm、决策规则、机器可校验的绑定块与范围声明——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
 | `DECISION_LOG.md` | **决策日志**（入库；因快照只有一个压缩提交，2026-10-18 依据 README/设计说明/清单重建）：每个版本为什么跑/不跑什么、看到什么、据此决定了什么——探索/确认分离的书面轨迹；正式版本的逐种子证据另由 `archive_release.py` 归档 |
-| `audit_gates.py` | **评审二轮的可执行审计入口**（零实验）：数据泄漏（分词器来源/词表一致性/文档重叠）、纯 CPU 因果性单元审计（前缀不变性/标签移位/解码一致性）、分块归因/边界 vs 随机基线/长度口径/基线公平/失败集中度/预算对账与 prefill-decode-内存测量工具 |
+| `audit_gates.py` | **评审二/四/七轮的可执行审计入口**（零实验）：数据泄漏（分词器来源/词表一致性/文档重叠）、纯 CPU 因果性单元审计（前缀不变性/标签移位/解码一致性）、分块归因/边界 vs 随机基线/长度口径/基线公平/失败集中度/预算对账，评审七的单因素设计门（声明对照的臂配置 diff 对声明的干预键集；冻结清单 mechanism_claim_allowed 标志对账）与 prefill-decode-内存测量工具 |
 | `archive_release.py` | **不可变证据归档器**：把每个正式版本的产物（结果/分析/报告/冻结锁/决策日志/环境/权重哈希）打包为带逐文件 sha256 清单的 tar.gz，附独立 verify 子命令——Git 主仓仍只承载源码（design_notes §8），归档发布到只读位置 |
 | `m0_supp.py` | **M0/S1 驱动（已选定 B 档）**：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力吞吐基准）、`full`（S1 主面板）；见下文“B 档 M0/S1” |
 | `build_report.py` | 零 GPU 报告构建器：从 `results_*/` + `analysis_*/` 产物重建 v7 报告（所有数字现算，绝不硬编码） |
@@ -286,6 +286,7 @@ phase 只读 train/valid。首次 test split 评估之后禁止追加冻结比�
 ```bash
 python audit_gates.py causality   # 纯 CPU 单元审计：前缀不变性 / 标签移位 / 解码一致性
 python audit_gates.py leakage     # 分词器来源 / 词表一致性 / train-test 文档重叠
+python audit_gates.py single_factor  # 定义点单因素门：每条声明对照的臂配置 diff 恰等于声明的干预键集；开放块矩阵只沿声明轴变化；冻结清单的 mechanism_claim_allowed 标志与实际 cfg diff 对账
 python audit_gates.py report      # 运行本地可核验的全部审计 -> audit_report.json
 python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # 证据归档 dry-run
 ```
@@ -355,3 +356,13 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
 - 新增 `audit_gates.py selection`：选择召回工件缺失时明确「学习选择器
   找到相关信息」为未支持主张；`release` 在 `RELEASES.md` 无完整行时
   声明仓库 source-only、数值不可独立复核。
+- 新增 `audit_gates.py single_factor`（评审七·定义点单因素门）：
+  `exp_lib.ABLATION_INTERVENTION_KEYS` 为每条声明对照声明允许差的
+  AttnCfg 键集，`single_factor_design_audit` 逐层 diff 两个臂的实际配置
+  ——多一个键（第二个因素）、少一个键（干预消失）、缺声明都 refuse；
+  `kind` 在差集里标为 architecture_level，方法 vs 参数对齐稠密基线因此
+  是架构级对照。`v12_supp.py plan` 把冻结清单的 `mechanism_claim_allowed`
+  变成可核验属性：cfg diff 落在单一干预族、两臂实际训练目标一致、参数量
+  对齐同时成立才判单因素；True 标志挂上非单因素比较直接 refuse。HCA 动态
+  臂的 comp_lambda_mult=4 与 block_size（inert）差异首次写进对照声明
+  （详见 docs/design_notes.md §37）。

@@ -761,3 +761,74 @@ study reads would make the second study non-independent; the freeze lock does
 not fix that.
 
 The temporary issue list was removed after the fixes.
+
+## 2026-10-22 — review-7: single-factor design gate (no new runs)
+
+Still before any test-split access; no training was run for this revision.
+Zero-GPU driver/audit/manifest-preflight paths only: no panel result, no
+training recipe, no arm definition value, no seed, no endpoint, no test split
+was touched, `CODE_SEMANTICS` stays `v11.128`, and `confirmation_frozen.json`
+is byte-identical (its sha256 binding is unchanged).
+
+**Problem.** Every existing pairing gate (`pair_reason` / `train_knobs` /
+`hyperparams` / `init_core_fp` / `train_objective` / `_param_control` /
+`_compute_control_detail`) verifies what two arms of a declared contrast
+SHARE — none of them can see the attention-config DIFF, which is where a
+"single factor" silently becomes two. An ablation arm that accidentally gains
+a second knob, or whose declared intervention disappears, passes every
+record-level gate. The frozen manifest's per-comparison
+`mechanism_claim_allowed` flags were hand-written with no machine check
+against the actual arm construction.
+
+**Changes.**
+
+(1) **Declared key-set contract** (`exp_lib.ABLATION_INTERVENTION_KEYS` /
+`BASELINE_INTERVENTION_KEYS` / `CONTRAST_OUTSIDE_CFG_FACTORS`): every
+declared contrast now declares the EXACT AttnCfg keys it is allowed to
+differ in. `exp_lib.single_factor_design_audit` diffs both arms layer by
+layer and refuses (fail-closed) on extra keys (a second factor), missing
+keys (the intervention disappeared) or a missing declaration (a new contrast
+without a factor contract). `kind` in the diff marks the contrast
+architecture_level (operator swap + mlp-ratio parameter matching outside the
+cfg) — the method-vs-matched-dense baselines are architecture-level, never
+knob-level single factors.
+
+(2) **Disclosed the previously-undeclared HCA-dynamic differences**: the
+dynamic HCA layers train their boundary gates with `comp_lambda_mult=4`
+(comp_lambda_effective 0.05->0.2), and their `block_size` field differs
+inertly (dynamic segmentation never reads it). Both are now part of the
+declared contract and of the ABLATION_DESIGN contrast notes; dynamic-vs-fixed
+contrasts keep their §22.4 system-level reading.
+
+(3) **Frozen-manifest flag verification** (`v12_supp.py plan`): each primary
+comparison now gets a machine-derived `single_factor` verdict — cfg diff
+inside ONE declared intervention family (`exp_lib.cfg_keys_single_factor`,
+kind swaps excluded by definition) AND matching actual training objectives
+(read off the built models) AND parameter totals matched. A
+`mechanism_claim_allowed=true` on a non-single-factor comparison REFUSES the
+plan before any P5C/P5T access; the conservative direction (False flag on a
+config-single-factor contrast, e.g. allblocks' equal-read-budget caveat)
+stays allowed with a note. Current manifest: all six flags verify
+consistent; `randidx_seeded`'s `random_salt` is family-internal to
+`indexer_mode` (it is the definition of the per-(seed, layer) draw).
+
+(4) **Open-block matrix gate** (`exp_lib.open_block_matrix_audit`): the
+declared 2-factor factorial (§24) must vary only along `max_block` /
+`open_block_mode` / `open_block_scope` inside the matrix.
+
+(5) **Sweep-contrast labeling** (`v9.SEQ2K_CONTRAST_FACTORS`): the v9/v10
+seq2k paired tests now carry an explicit factor column — `topk8 - topk512`
+is a single-factor dose response; the two `-m1` contrasts are multi-factor
+block-geometry bundles (block_size 4->1, overlap 128->0, topk semantics)
+at an equal 32-token budget and must not be read as topk dose responses.
+
+(6) **Audit entry point**: `audit_gates.py single_factor` runs the design
+contract + matrix gate + frozen-manifest cfg-level flag check (zero deps on
+results_*), and is folded into `audit_gates.py report`.
+
+Verification: the shipped design passes with 15 knob-level single-factor
+and 3 architecture-level verified contrasts; the v12 preflight passes with
+one conservative note (allblocks); mutating the manifest to flag the main
+kind-swap comparison as mechanism evidence makes the preflight REFUSE. New
+CPU tests cover the pass case, both fail-closed drifts, the flag-consistency
+refusal and the sweep labeling.
