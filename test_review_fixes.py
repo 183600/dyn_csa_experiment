@@ -3719,6 +3719,14 @@ def t_multiclass_ranking_metrics_and_audit():
                                         y_pred=[1, '1', 2, 1, '1', 2])
     assert len(_mx_auto['labels']) == 3 and len(set(_mx_auto['labels'])) == 3, _mx_auto
     assert len(_mx_auto['per_class']) == 3, _mx_auto
+    # An explicitly declared label list must not be string-coerced either:
+    # np.asarray([1, '1']) merges the two classes before the duplicate check.
+    for _decl in ([1, '1', 2], np.array([1, '1', 2], dtype=object)):
+        _mx_explicit = L.classification_metrics(
+            [1, '1', 2, 1, '1', 2], y_pred=[1, '1', 2, 1, '1', 2],
+            labels=_decl)
+        assert len(_mx_explicit['labels']) == 3, _mx_explicit['labels']
+        assert len(_mx_explicit['per_class']) == 3, _mx_explicit
 
 
 def t_metric_policy_checks_record_values():

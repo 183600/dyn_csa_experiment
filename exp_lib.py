@@ -14102,9 +14102,9 @@ def _multiclass_ranking_metrics(y_true, y_score, labels, label_names=None):
     which one it reports.  Undefined classes are recorded explicitly instead of
     being silently assigned 0 or 1.
     """
-    y_true = np.asarray(y_true).ravel()
+    y_true = _preserve_label_array(y_true)
     score = np.asarray(y_score, dtype=float)
-    labels = np.asarray(labels)
+    labels = _preserve_label_array(labels)
     if label_names is None:
         label_names = _display_label_names(labels)
     label_names = list(label_names)
@@ -14293,9 +14293,9 @@ def _multiclass_calibration(y_true, y_score, labels, n_bins=10):
     invented probability.  Brier is the multiclass sum-of-squares, while ECE
     uses the top-1 confidence (the standard top-label reliability diagnostic).
     """
-    y_true = np.asarray(y_true).ravel()
+    y_true = _preserve_label_array(y_true)
     p = np.asarray(y_score, dtype=float)
-    labels = np.asarray(labels)
+    labels = _preserve_label_array(labels)
     if p.ndim != 2 or p.shape[1] != labels.size or p.shape[0] != y_true.size:
         return {'status': 'unavailable', 'reason': 'expected a rows x classes score matrix'}
     if p.size and (np.any(p < 0.0) or np.any(p > 1.0)):
@@ -14468,7 +14468,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
                 labels = _unique_label_values(np.concatenate([
                     np.asarray(labels, dtype=object),
                     _preserve_label_array(y_pred)]))
-    labels = np.asarray(labels)
+    labels = _preserve_label_array(labels)
     if labels.ndim != 1:
         raise ValueError(f'labels must be a flat 1-D sequence, got shape {labels.shape}')
     if labels.size == 0:
