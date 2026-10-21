@@ -429,6 +429,15 @@ def t_nan_diagnosis_path():
                              'events': []}})
     assert huge['status'] == 'instability_observed', huge
     assert huge['primary_suspect'] == 'gradient_explosion_lr', huge
+    # An explicitly recorded inf/NaN maximum is evidence too, even if the
+    # integer event counters are zero (e.g. a partially written record).
+    nonfinite_max = L.diagnose_training_instability({
+        'amp_dtype': 'bf16',
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                             'amp_scaler_overflows': 0,
+                             'grad_norm_max': float('nan'), 'events': []}})
+    assert nonfinite_max['status'] == 'instability_observed', nonfinite_max
+    assert nonfinite_max['primary_suspect'] == 'gradient_explosion_lr', nonfinite_max
     # A non-finite VALIDATION point can coexist with a finite training loss;
     # it must not be reported as clean.
     hbad = L.diagnose_training_instability({

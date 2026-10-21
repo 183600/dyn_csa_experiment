@@ -637,7 +637,11 @@ def diagnose_training_instability(record, *, data_checked=None):
     else:
         add('fp16_overflow', 'not_observed', 'no mixed-precision autocast in this run', 'no action')
 
-    huge_grad = (grad_max is not None and math.isfinite(grad_max) and grad_max > 10.0 * GRAD_CLIP_NORM)
+    # A non-finite recorded maximum is itself evidence; treating only finite
+    # values as "huge" could report `not_observed` next to an inf/NaN grad max.
+    huge_grad = (grad_max is not None
+                 and ((not math.isfinite(grad_max))
+                      or grad_max > 10.0 * GRAD_CLIP_NORM))
     if bad_grad or huge_grad:
         add('gradient_explosion_lr', 'observed',
             f'non-finite grad steps={n_grad}, max pre-clip grad={grad_max}, lr={lr}',
