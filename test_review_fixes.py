@@ -4024,6 +4024,16 @@ def t_hypothesis_prevalence_conditional_endpoint():
     for _bad in (True, '0.0001', float('nan'), float('inf'), -0.1, 1.2):
         r = L.hypothesis_audit({'h': _spec(prevalence=_bad)}, 'component')
         assert r['status'] == 'warn' and 'h' in r['metric_misaligned'], (_bad, r)
+    # The same conditional rule applies to NIAH retrieval: a hypothesis for a
+    # rare answer class must name macro recall, not top-1 accuracy.
+    _niah_bad = L.hypothesis_audit({'h': _spec(
+        primary_metric='top1_accuracy', metric_policy='niah_retrieval',
+        prevalence=1e-4)}, 'component')
+    assert _niah_bad['status'] == 'warn' and 'h' in _niah_bad['metric_misaligned'], _niah_bad
+    _niah_good = L.hypothesis_audit({'h': _spec(
+        primary_metric='macro_recall', metric_policy='niah_retrieval',
+        prevalence=1e-4)}, 'component')
+    assert _niah_good['status'] == 'ok' and not _niah_good['metric_misaligned'], _niah_good
 
 def t_binary_degenerate_threshold_visibility():
     # Logits/scores on a non-probability scale make the default 0.5 cut a
