@@ -3532,6 +3532,14 @@ def _split_array(X, idx):
 
 
 def _hashable_label(value):
+    if isinstance(value, (np.datetime64, np.timedelta64,
+                          _datetime.date, _datetime.datetime,
+                          _datetime.timedelta)):
+        # Python dates and NumPy temporal scalars can compare equal while
+        # hashing differently.  A label/level identity must follow equality,
+        # otherwise the same label is counted as two classes in a conflict or
+        # shift audit.
+        return _temporal_group_key(value)
     try:
         hash(value)
     except TypeError:

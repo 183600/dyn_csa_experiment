@@ -9778,6 +9778,19 @@ def t_python_temporal_row_and_category_identity():
         X, np.asarray([10.0, 10.0, 20.0]))
     lookup = enc.get_stats()['features'][0]['lookup']
     assert lookup[DG._target_key(day)] == 10.0, lookup
+    # Labels follow the same equality: equal temporal spellings are one class,
+    # so duplicated features are not a false label conflict and a train/val
+    # swap between the two spellings is not a fabricated 100% label shift.
+    pair_X = np.arange(8, dtype=float).reshape(4, 2)
+    conflict = DG.data_quality_report(
+        pair_X[:2], y=np.asarray([day, npday], dtype=object),
+        train_idx=[0, 1])
+    assert conflict['checks']['label_conflicts_on_duplicate_rows'] == 0, conflict
+    shift = DG.data_quality_report(
+        pair_X, y=np.asarray([day, npday, npday, day], dtype=object),
+        train_idx=[0, 1], val_idx=[2, 3])
+    assert shift['checks']['label_distribution_shift_vs_train']['val'][
+        'js_divergence'] == 0.0, shift
 
 
 def t_validation_row_split_group_aware():
