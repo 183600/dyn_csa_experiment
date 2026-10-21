@@ -8840,6 +8840,19 @@ def t_target_encoder_prevents_self_and_group_leakage():
     Xm = np.array([['a'], [None], ['a'], [None], ['b'], ['a']], dtype=object)
     em = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(Xm, y)
     assert 'x0_target' in em.get_feature_names()
+    # Persisted stats must be JSON-safe even when missing values are a learned
+    # level, and the round-trip must encode holdouts identically.  A tuple
+    # lookup key used to make json.dumps fail outright.
+    _h = np.array([[None], ['a'], ['z']], dtype=object)
+    _stats = em.get_stats()
+    _restored = L.LeakageSafeTargetEncoder.from_stats(json.loads(json.dumps(_stats)))
+    assert np.allclose(_restored.transform(_h), em.transform(_h))
+    # A real category equal to the old tuple sentinel is not a missing value.
+    _Xt = np.array([['a'], [('__missing__',)], [('__missing__',)], ['a']],
+                   dtype=object)
+    _et = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(_Xt, y[:4])
+    _look = _et.get_stats()['features'][0]['lookup']
+    assert '__missing__' not in _look, _look
     # Groups share a fold, so changing a whole group's label cannot move the
     # out-of-fold encoding of another row in that group.
     groups = np.array([0, 0, 1, 1, 2, 2])

@@ -1352,6 +1352,60 @@ class LeakageSafeCategoricalEncoder:
 _MIX64_MASK = (1 << 64) - 1
 
 
+def _target_key(value):
+    """JSON-safe canonical key for a target-encoding category.
+
+    ``get_stats`` has to round-trip through JSON so a fitted encoder can be
+    persisted with a run manifest.  The historical dict used the raw category
+    object as a key and a tuple sentinel for missing values; a tuple key is not
+    JSON-serialisable, and a user category equal to that sentinel collided with
+    a genuinely missing value.  Encode both into strings instead.
+
+    Numeric objects keep Python's equality grouping (``True == 1``,
+    ``1 == 1.0 == Fraction(1,1)``) by canonicalising integral/reals to an
+    integer or exact rational text form.
+    """
+    if _category_is_missing(value):
+        return '__missing__'
+    if isinstance(value, (bool, np.bool_)):
+        return 'i:' + str(int(value))
+    if isinstance(value, numbers.Integral):
+        return 'i:' + str(int(value))
+    if isinstance(value, (complex, np.complexfloating)):
+        c = complex(value)
+        if c.imag == 0.0:
+            return _target_key(c.real)
+        return 'c:' + repr(c)
+    if isinstance(value, (float, np.floating)):
+        f = float(value)
+        if math.isnan(f):
+            return '__missing__'
+        if math.isinf(f):
+            return 'f:+inf' if f > 0 else 'f:-inf'
+        if f.is_integer():
+            return 'i:' + str(int(f))
+        fr = Fraction(f)
+        return 'r:' + str(fr.numerator) + '/' + str(fr.denominator)
+    if isinstance(value, str):
+        return 's:' + value
+    if isinstance(value, bytes):
+        return 'y:' + value.hex()
+    if isinstance(value, tuple):
+        return 't:(' + ','.join(_target_key(v) for v in value) + ')'
+    if isinstance(value, numbers.Number):
+        # Decimal/Fraction (not covered by float/Integral above) also compare
+        # exactly against integers/rationals, so use the same canonical form.
+        try:
+            fr = Fraction(value)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if fr.denominator == 1:
+                return 'i:' + str(fr.numerator)
+            return 'r:' + str(fr.numerator) + '/' + str(fr.denominator)
+    return 'v:' + type(value).__module__ + '.' + type(value).__qualname__ + ':' + repr(value)
+
+
 def _mix64(value):
     """SplitMix64 integer mixing for deterministic, process-independent folds."""
     z = (int(value) + 0x9E3779B97F4A7C15) & _MIX64_MASK
@@ -1632,8 +1686,7 @@ class LeakageSafeTargetEncoder:
                 if not math.isfinite(float(y[i])):
                     continue
                 value = col[i]
-                key = (('__missing__',) if _category_is_missing(value)
-                       else _hashable_label(value))
+                key = _target_key(value)
                 if key in entries:
                     entries[key][1] += 1
                     entries[key][2] += float(y[i])
@@ -1698,8 +1751,7 @@ class LeakageSafeTargetEncoder:
             col = Xarr[:, j]
             for pos, i in enumerate(rows.tolist()):
                 value = col[i]
-                key = (('__missing__',) if _category_is_missing(value)
-                       else _hashable_label(value))
+                key = _target_key(value)
                 out[pos, j] = lookup.get(key, prior)
         return out
 
