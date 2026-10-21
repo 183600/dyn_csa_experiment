@@ -8431,6 +8431,112 @@ def t_frequency_encoder_train_only():
             raise AssertionError(f'frequency encoder accepted {bad!r}')
 
 
+def t_target_encoder_prevents_self_and_group_leakage():
+    X = np.array([['a'], ['b'], ['a'], ['b'], ['c'], ['a']], dtype=object)
+    y = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    enc = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2)
+    oof = enc.fit_transform(X, y)
+    stats = enc.get_stats()
+    assert stats['oof_policy'] == 'row_oof', stats
+    # A training row's own label must not enter its out-of-fold encoding.
+    for i in range(len(y)):
+        y2 = y.copy()
+        y2[i] += 1000.0
+        other = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2)
+        assert np.allclose(other.fit_transform(X, y2)[i], oof[i]), i
+    # Holdout transform never reads labels (there is no y argument) and unseen
+    # levels fall back to the training prior rather than becoming a new level.
+    hold = np.array([['a'], ['z'], [None]], dtype=object)
+    before = enc.get_stats()
+    xh = enc.transform(hold)
+    assert enc.get_stats() == before, 'transform must not update statistics'
+    assert np.allclose(xh[1], enc.prior_), (xh, enc.prior_)
+    assert np.allclose(enc.transform(hold), xh)
+    restored = L.LeakageSafeTargetEncoder.from_stats(before)
+    assert np.allclose(restored.transform(hold), xh)
+    # Missing categories are a learned training level, not silently a prior.
+    Xm = np.array([['a'], [None], ['a'], [None], ['b'], ['a']], dtype=object)
+    em = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2).fit(Xm, y)
+    assert 'x0_target' in em.get_feature_names()
+    # Groups share a fold, so changing a whole group's label cannot move the
+    # out-of-fold encoding of another row in that group.
+    groups = np.array([0, 0, 1, 1, 2, 2])
+    ge = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2)
+    g_oof = ge.fit_transform(X, y, groups=groups)
+    assert ge.get_stats()['oof_policy'] == 'grouped_oof', ge.get_stats()
+    yg = y.copy()
+    yg[groups == 0] += 1000.0
+    ge2 = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2)
+    g_oof2 = ge2.fit_transform(X, yg, groups=groups)
+    assert np.allclose(g_oof2[groups == 0], g_oof[groups == 0]), (g_oof, g_oof2)
+    # Time folds are expanding: changing a later label must not change an
+    # earlier row's encoding.
+    t = np.arange(len(y))
+    te = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2)
+    t_oof = te.fit_transform(X, y, time=t)
+    assert te.get_stats()['oof_policy'] == 'chronological_expanding_oof', te.get_stats()
+    yt = y.copy()
+    yt[4] += 1000.0
+    te2 = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2)
+    t_oof2 = te2.fit_transform(X, yt, time=t)
+    assert np.allclose(t_oof2[:3], t_oof[:3]), (t_oof, t_oof2)
+    # With both groups and time, folds stay whole-group AND expanding: changing
+    # a later group's label cannot change an earlier group's encoding.
+    ct = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2)
+    c_oof = ct.fit_transform(X, y, groups=groups, time=np.arange(len(y)))
+    assert ct.get_stats()['oof_policy'] == 'grouped_chronological_expanding_oof', ct.get_stats()
+    yct = y.copy()
+    yct[groups == 2] += 1000.0
+    ct2 = L.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2)
+    c_oof2 = ct2.fit_transform(X, yct, groups=groups, time=np.arange(len(y)))
+    assert np.allclose(c_oof2[groups < 2], c_oof[groups < 2]), (c_oof, c_oof2)
+    bundle = L.prepare_target_features(X, y, hold, groups=groups,
+                                       smoothing=0.0, n_folds=2)
+    assert np.array_equal(bundle['train'], g_oof), bundle
+    assert np.array_equal(bundle['val'], ge.transform(hold)), bundle
+    # Non-numeric targets, wrong shapes and malformed options fail closed.
+    try:
+        L.LeakageSafeTargetEncoder().fit_transform(X, ['a'] * len(X))
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('a categorical target must be refused')
+    try:
+        L.LeakageSafeTargetEncoder().fit_transform(X, y.reshape(-1, 1))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a 2-D target must be refused')
+    try:
+        L.LeakageSafeTargetEncoder().fit_transform(X[:-1], y)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a short target must be refused')
+    try:
+        L.LeakageSafeTargetEncoder().transform(X)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('transform before fit must fail')
+    for bad in ({'smoothing': -1}, {'smoothing': float('nan')},
+                {'smoothing': True}, {'n_folds': 1}, {'n_folds': 2.5},
+                {'n_folds': True}, {'seed': -1}):
+        try:
+            L.LeakageSafeTargetEncoder(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'target encoder accepted {bad!r}')
+    # With one group, out-of-fold encoding would have no reference rows.
+    try:
+        L.LeakageSafeTargetEncoder().fit_transform(X, y, groups=np.zeros(len(y)))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('one group cannot define out-of-fold folds')
+
+
 def t_clean_training_rows_and_split():
     X = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 1.0],
                   [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
@@ -10213,6 +10319,7 @@ def main():
     _check('I28 label-noise audit handles unhashable labels', t_data_quality_unhashable_labels)
     _check('I29 categorical encoding is fitted on train only', t_categorical_encoder_train_only)
     _check('I29b frequency encoding is fitted on train only', t_frequency_encoder_train_only)
+    _check('I29c target encoding is out-of-fold and group/time safe', t_target_encoder_prevents_self_and_group_leakage)
     _check('I30 train-only cleaning before preprocessing', t_clean_training_rows_and_split)
     _check('I30b invalid training labels are droppable before fitting', t_clean_training_invalid_labels)
     _check('I30c non-finite/outlier training rows are cleanable', t_clean_training_nonfinite_and_outliers)

@@ -41,6 +41,7 @@ __all__ = [
     'LeakageSafeCategoricalEncoder',
     'LeakageSafeFrequencyEncoder',
     'LeakageSafePreprocessor',
+    'LeakageSafeTargetEncoder',
     'SafeScaler',
     'assert_no_split_leakage',
     'categorical_shift_report',
@@ -53,6 +54,7 @@ __all__ = [
     'fit_preprocessor',
     'prepare_categorical_features',
     'prepare_frequency_features',
+    'prepare_target_features',
     'grouped_chronological_split',
     'grouped_chronological_split_indices',
     'prepare_features',
@@ -1312,6 +1314,437 @@ class LeakageSafeCategoricalEncoder:
         obj.train_fp_ = stats.get('train_fp')
         obj.fitted_ = True
         return obj
+
+
+_MIX64_MASK = (1 << 64) - 1
+
+
+def _mix64(value):
+    """SplitMix64 integer mixing for deterministic, process-independent folds."""
+    z = (int(value) + 0x9E3779B97F4A7C15) & _MIX64_MASK
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MIX64_MASK
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MIX64_MASK
+    return (z ^ (z >> 31)) & _MIX64_MASK
+
+
+def _stable_key_hash(key):
+    """Deterministic 64-bit hash of a group/category identity."""
+    return int.from_bytes(
+        hashlib.blake2b(repr(key).encode('utf-8', 'backslashreplace'),
+                        digest_size=8).digest(), 'little')
+
+
+class LeakageSafeTargetEncoder:
+    """Smoothed target encoding learned from training labels only.
+
+    Target encoding replaces a categorical level with the mean target observed
+    for that level.  It is a powerful feature-engineering step for
+    high-cardinality columns, but it is also a classic leakage source: encoding
+    a training row with a mean that includes that row's own label (or, for
+    grouped/temporal data, a related row's label) trains the model on the
+    target.  This implementation therefore has two distinct paths:
+
+    * :meth:`transform` uses the **full** training-level table and is intended
+      for validation/test rows only.  Holdout labels are never read.
+    * :meth:`fit_transform` returns **out-of-fold** encodings for the training
+      rows.  A row is encoded from rows in other folds only.  When ``groups``
+      is supplied, whole groups share a fold, so a document/user cannot leak
+      its label into another row of the same group.  When ``time`` is supplied,
+      folds are contiguous chronological blocks and encoding is expanding:
+      a row is encoded only from strictly earlier blocks (the first block uses
+      an uninformative prior of 0 because no past label exists).
+
+    Missing categories are their own training level; an unseen holdout level
+    falls back to the training prior.  Non-finite/missing labels are ignored
+    when estimating a level mean, and categorical (non-numeric) targets are
+    refused because a mean target would be undefined.
+    """
+
+    def __init__(self, *, smoothing=10.0, n_folds=5, seed=0):
+        if isinstance(smoothing, (bool, np.bool_)):
+            raise ValueError(
+                f'smoothing must be a finite non-negative number, got '
+                f'{smoothing!r}')
+        try:
+            smoothing = float(smoothing)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'smoothing must be a finite non-negative number, got '
+                f'{smoothing!r}') from None
+        if not (math.isfinite(smoothing) and smoothing >= 0.0):
+            raise ValueError(
+                f'smoothing must be a finite non-negative number, got '
+                f'{smoothing!r}')
+        n_folds = _check_count('n_folds', n_folds, positive=True)
+        if n_folds < 2:
+            raise ValueError(f'n_folds must be at least 2, got {n_folds}')
+        seed = _check_count('seed', seed)
+        self.smoothing = smoothing
+        self.n_folds = int(n_folds)
+        self.seed = int(seed)
+        self.fitted_ = False
+
+    def _target_array(self, y, n):
+        if y is None:
+            raise ValueError('LeakageSafeTargetEncoder requires y')
+        arr = np.asarray(y)
+        if arr.ndim != 1 or arr.shape[0] != n:
+            raise ValueError(
+                f'y must be 1-D with {n} rows, got shape {arr.shape}')
+        out = np.full(n, np.nan, dtype=np.float64)
+        for i, value in enumerate(arr.tolist()):
+            if value is None or isinstance(value, (bool, np.bool_)):
+                continue
+            if isinstance(value, (complex, np.complexfloating)):
+                continue
+            if not isinstance(value, numbers.Number):
+                raise TypeError(
+                    'LeakageSafeTargetEncoder requires a numeric target; '
+                    f'got a {type(value).__name__} label at row {i}')
+            try:
+                f = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(f):
+                out[i] = f
+        if not np.isfinite(out).any():
+            raise ValueError(
+                'LeakageSafeTargetEncoder found no finite numeric training '
+                'labels; a target mean cannot be estimated')
+        return out
+
+    def _group_folds(self, groups, n):
+        g = _as_1d(groups, 'groups', n)
+        keys = [_group_key(v) for v in g.tolist()]
+        unique = {}
+        for key in keys:
+            unique.setdefault(key, None)
+        if len(unique) < 2:
+            raise ValueError(
+                'LeakageSafeTargetEncoder needs at least 2 groups for '
+                'out-of-fold encoding')
+        items = sorted(unique, key=lambda key: (
+            _stable_key_hash(key) ^ int(self.seed), repr(key)))
+        folds = np.empty(n, dtype=np.int64)
+        fold_of = {key: i % self.n_folds for i, key in enumerate(items)}
+        for i, key in enumerate(keys):
+            folds[i] = fold_of[key]
+        return folds
+
+    def _row_folds(self, n):
+        order = sorted(range(n), key=lambda i: (
+            _mix64(int(i) ^ int(self.seed)), i))
+        folds = np.empty(n, dtype=np.int64)
+        for rank, i in enumerate(order):
+            folds[i] = rank % self.n_folds
+        return folds
+
+    def _group_time_folds(self, groups, time, n):
+        """Whole-group, expanding chronological folds.
+
+        Groups are ordered by their earliest timestamp (first appearance breaks
+        ties) and consumed as contiguous blocks, so no group is split and every
+        later fold contains only groups that start after the earlier folds.
+        """
+        time = _as_1d(time, 'time', n)
+        _assert_order_finite(time, name='time')
+        g = _as_1d(groups, 'groups', n)
+        keys = [_group_key(v) for v in g.tolist()]
+        first = {}
+        members = {}
+        minkey = {}
+        try:
+            for i, key in enumerate(keys):
+                if key not in first:
+                    first[key] = i
+                    minkey[key] = time[i]
+                elif time[i] < minkey[key]:
+                    minkey[key] = time[i]
+                members.setdefault(key, []).append(i)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                'time values are not mutually orderable; cannot order groups '
+                'chronologically') from None
+        if len(first) < self.n_folds:
+            raise ValueError(
+                f'cannot form {self.n_folds} non-empty group folds from '
+                f'{len(first)} groups')
+        try:
+            order = sorted(first, key=lambda key: (minkey[key], first[key]))
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                'time values are not mutually orderable; cannot order groups '
+                'chronologically') from None
+        sizes = [len(members[key]) for key in order]
+        prefix = [0]
+        for size in sizes:
+            prefix.append(prefix[-1] + size)
+        # Pick group boundaries near the balanced row targets, but reserve at
+        # least one group for every later fold so no fold can be empty.
+        bounds = [0]
+        prev = 0
+        for k in range(1, self.n_folds):
+            lo = prev + 1
+            hi = len(order) - (self.n_folds - k)
+            target = math.floor(k * n / self.n_folds)
+            j = min(range(lo, hi + 1),
+                    key=lambda pos: (abs(prefix[pos] - target), pos))
+            bounds.append(j)
+            prev = int(j)
+        bounds.append(len(order))
+        folds = np.empty(n, dtype=np.int64)
+        for k in range(self.n_folds):
+            for key in order[bounds[k]:bounds[k + 1]]:
+                folds[members[key]] = k
+        return folds
+
+    def _time_folds(self, time, n):
+        time = _as_1d(time, 'time', n)
+        _assert_order_finite(time, name='time')
+        try:
+            order = np.argsort(time, kind='stable')
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                'time values are not mutually orderable; cannot build '
+                'chronological target-encoding folds') from None
+        sorted_time = np.asarray(time)[order]
+        if n < self.n_folds:
+            raise ValueError(
+                f'cannot form {self.n_folds} non-empty chronological folds '
+                f'from {n} rows')
+        try:
+            changed = np.asarray(sorted_time[1:] != sorted_time[:-1]).reshape(-1)
+        except (TypeError, ValueError, OverflowError):
+            changed = np.asarray([True] * (n - 1))
+        cuts = np.concatenate((
+            np.zeros(1, dtype=np.int64),
+            np.nonzero(changed)[0].astype(np.int64) + 1,
+            np.full(1, n, dtype=np.int64),
+        ))
+        # Target boundaries at equal row counts, snapped forward to a legal
+        # timestamp-change cut so one event block never straddles two folds.
+        chosen = []
+        prev_idx = 0
+        for k in range(1, self.n_folds):
+            target = math.floor(k * n / self.n_folds)
+            pos = int(np.searchsorted(cuts, target, side='left'))
+            remaining = self.n_folds - k
+            pos = max(pos, prev_idx + 1)
+            pos = min(pos, len(cuts) - 1 - remaining)
+            if pos <= prev_idx or pos >= len(cuts) - 1:
+                raise ValueError(
+                    'cannot form the requested chronological target-encoding '
+                    'folds without splitting an equal-timestamp block; use '
+                    'fewer folds or pass groups')
+            chosen.append(pos)
+            prev_idx = pos
+        bounds = [0] + chosen + [len(cuts) - 1]
+        folds = np.empty(n, dtype=np.int64)
+        for k in range(self.n_folds):
+            start = int(cuts[bounds[k]])
+            end = int(cuts[bounds[k + 1]])
+            if start >= end:
+                raise ValueError(
+                    'a chronological target-encoding fold is empty; use '
+                    'fewer folds')
+            folds[order[start:end]] = k
+        return folds
+
+    def _fit_fold(self, Xarr, y, rows, cols=None):
+        """Build per-column level statistics from ``rows`` only."""
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        values = y[rows]
+        finite = np.isfinite(values)
+        if finite.any():
+            prior = float(np.mean(values[finite]))
+        else:
+            prior = 0.0
+        stats = []
+        for j in range(Xarr.shape[1]):
+            entries = {}
+            col = Xarr[:, j]
+            for i in rows.tolist():
+                if not math.isfinite(float(y[i])):
+                    continue
+                value = col[i]
+                key = (('__missing__',) if _category_is_missing(value)
+                       else _hashable_label(value))
+                if key in entries:
+                    entries[key][1] += 1
+                    entries[key][2] += float(y[i])
+                else:
+                    entries[key] = [value, 1, float(y[i])]
+            out = {}
+            for key, (value, count, total) in entries.items():
+                if self.smoothing > 0.0:
+                    encoded = ((total + self.smoothing * prior)
+                               / (count + self.smoothing))
+                else:
+                    encoded = total / count
+                out[key] = float(encoded)
+            stats.append({'lookup': out, 'prior': float(prior),
+                          'n_reference_rows': int(rows.size),
+                          'n_reference_labels': int(finite.sum())})
+        return stats
+
+    def fit(self, X, y, *, groups=None, time=None):
+        """Learn the full training-level target table (for holdout transform)."""
+        Xarr = _as_categorical_2d(X)
+        n, p = Xarr.shape
+        if n == 0:
+            raise ValueError(
+                'cannot fit a target encoder on zero training rows')
+        yarr = self._target_array(y, n)
+        if groups is not None:
+            _as_1d(groups, 'groups', n)
+        if time is not None:
+            _as_1d(time, 'time', n)
+            _assert_order_finite(time, name='time')
+        self.feature_stats_ = self._fit_fold(
+            Xarr, yarr, np.arange(n, dtype=np.int64))
+        self.n_features_in_ = int(p)
+        self.n_train_ = int(n)
+        self.prior_ = float(np.mean(yarr[np.isfinite(yarr)]))
+        self.train_fp_ = _categorical_fingerprint(Xarr)
+        self.fitted_ = True
+        return self
+
+    def _check_transform_input(self, X):
+        if not self.fitted_:
+            raise RuntimeError(
+                'LeakageSafeTargetEncoder.transform called before fit')
+        Xarr = _as_categorical_2d(X)
+        if Xarr.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f'X has {Xarr.shape[1]} features, but the encoder was fitted '
+                f'on {self.n_features_in_}')
+        return Xarr
+
+    @staticmethod
+    def _apply(stats, Xarr, rows=None):
+        n = Xarr.shape[0]
+        if rows is None:
+            rows = np.arange(n, dtype=np.int64)
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        out = np.empty((rows.size, len(stats)), dtype=np.float64)
+        for j, st in enumerate(stats):
+            lookup = st['lookup']
+            prior = float(st['prior'])
+            col = Xarr[:, j]
+            for pos, i in enumerate(rows.tolist()):
+                value = col[i]
+                key = (('__missing__',) if _category_is_missing(value)
+                       else _hashable_label(value))
+                out[pos, j] = lookup.get(key, prior)
+        return out
+
+    def transform(self, X):
+        """Encode holdout rows with the full training-level table."""
+        Xarr = self._check_transform_input(X)
+        return self._apply(self.feature_stats_, Xarr)
+
+    def fit_transform(self, X, y, *, groups=None, time=None):
+        """Return out-of-fold training encodings (safe for model fitting)."""
+        self.fit(X, y, groups=groups, time=time)
+        Xarr = _as_categorical_2d(X)
+        n = Xarr.shape[0]
+        yarr = self._target_array(y, n)
+        if time is not None and groups is not None:
+            folds = self._group_time_folds(groups, time, n)
+            policy = 'grouped_chronological_expanding_oof'
+        elif time is not None:
+            folds = self._time_folds(time, n)
+            policy = 'chronological_expanding_oof'
+        elif groups is not None:
+            folds = self._group_folds(groups, n)
+            policy = 'grouped_oof'
+        else:
+            folds = self._row_folds(n)
+            policy = 'row_oof'
+        out = np.zeros((n, Xarr.shape[1]), dtype=np.float64)
+        for k in range(int(folds.max()) + 1):
+            held = np.nonzero(folds == k)[0]
+            if held.size == 0:
+                continue
+            if policy in ('chronological_expanding_oof',
+                          'grouped_chronological_expanding_oof'):
+                # Only strictly earlier blocks may contribute a label.
+                ref = np.nonzero(folds < k)[0]
+            else:
+                ref = np.nonzero(folds != k)[0]
+            stats = self._fit_fold(Xarr, yarr, ref)
+            out[held] = self._apply(stats, Xarr, held)
+        self.oof_policy_ = policy
+        self.oof_fold_fp_ = hashlib.sha256(
+            np.ascontiguousarray(folds).tobytes()).hexdigest()[:16]
+        return out
+
+    def get_feature_names(self):
+        if not self.fitted_:
+            raise RuntimeError('target encoder has not been fitted')
+        return [f'x{j}_target' for j in range(self.n_features_in_)]
+
+    def get_stats(self):
+        if not self.fitted_:
+            raise RuntimeError('target encoder has not been fitted')
+        return {
+            'smoothing': float(self.smoothing),
+            'n_folds': int(self.n_folds),
+            'seed': int(self.seed),
+            'n_features_in': self.n_features_in_,
+            'n_train': self.n_train_,
+            'prior': float(self.prior_),
+            'train_fp': self.train_fp_,
+            'oof_policy': getattr(self, 'oof_policy_', None),
+            'oof_fold_fp': getattr(self, 'oof_fold_fp_', None),
+            'features': [
+                {
+                    'lookup': dict(st['lookup']),
+                    'prior': float(st['prior']),
+                    'n_reference_rows': int(st['n_reference_rows']),
+                    'n_reference_labels': int(st['n_reference_labels']),
+                }
+                for st in self.feature_stats_
+            ],
+        }
+
+    @classmethod
+    def from_stats(cls, stats):
+        """Rebuild a fitted target encoder from :meth:`get_stats` output."""
+        obj = cls(smoothing=stats.get('smoothing', 10.0),
+                  n_folds=stats.get('n_folds', 5),
+                  seed=stats.get('seed', 0))
+        obj.feature_stats_ = [
+            {
+                'lookup': dict(st.get('lookup') or {}),
+                'prior': float(st.get('prior', 0.0)),
+                'n_reference_rows': int(st.get('n_reference_rows', 0)),
+                'n_reference_labels': int(st.get('n_reference_labels', 0)),
+            }
+            for st in stats['features']
+        ]
+        obj.n_features_in_ = int(stats['n_features_in'])
+        obj.n_train_ = int(stats.get('n_train', 0))
+        obj.prior_ = float(stats.get('prior', 0.0))
+        obj.train_fp_ = stats.get('train_fp')
+        obj.oof_policy_ = stats.get('oof_policy')
+        obj.oof_fold_fp_ = stats.get('oof_fold_fp')
+        obj.fitted_ = True
+        return obj
+
+
+def prepare_target_features(X_train, y_train, X_val=None, X_test=None,
+                            *, groups=None, time=None, **kwargs):
+    """Out-of-fold target encoding for train, full-table transform for holdouts."""
+    encoder = LeakageSafeTargetEncoder(**kwargs)
+    out = {'train': encoder.fit_transform(
+               X_train, y_train, groups=groups, time=time),
+           'encoder': encoder}
+    if X_val is not None:
+        out['val'] = encoder.transform(X_val)
+    if X_test is not None:
+        out['test'] = encoder.transform(X_test)
+    return out
 
 
 class LeakageSafeFrequencyEncoder:
