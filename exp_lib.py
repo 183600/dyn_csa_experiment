@@ -909,6 +909,13 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
             return [value]
     _nll = _rows(nll_per_row)
     _ntok = _rows(n_tokens_per_row)
+    if len(_nll) != len(_ntok):
+        # zip() below would silently drop the unmatched tail of the longer
+        # list, reporting an interval for a different document sample than the
+        # caller supplied (and hiding the malformed per-row accounting).
+        raise ValueError(
+            f'_nll_doc_ci: {len(_nll)} per-document NLL value(s) but '
+            f'{len(_ntok)} token count(s); the accounting must be paired')
 
     def _parse_pair(nll, ntok):
         if isinstance(nll, (bool, np.bool_)) or isinstance(ntok, (bool, np.bool_)):
@@ -982,10 +989,15 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     _tc = _t_critical(0.95, n_docs - 1)
     if not math.isfinite(_tc):
         _tc = 1.959963984540054
+    # Cross-entropy cannot be negative, so the corresponding PPL cannot be
+    # below 1.  The symmetric t interval on CE can cross zero for a small,
+    # high-variance document sample; exponentiating that raw lower endpoint
+    # reported an impossible sub-1 perplexity confidence bound.
+    _ce_lo = max(0.0, ce - _tc * _sem_ce)
     return {'ppl': _safe_exp_ppl(ce), 'doc_ce_mean': mean, 'doc_ce_sem': sem,
             'ce_sem_cluster_robust': _sem_ce,
             'ci_method': 'cluster-robust documents (t, df=n_docs-1)',
-            'ppl_ci95_low': _safe_exp_ppl(ce - _tc * _sem_ce),
+            'ppl_ci95_low': _safe_exp_ppl(_ce_lo),
             'ppl_ci95_high': _safe_exp_ppl(ce + _tc * _sem_ce),
             'n_docs': n_docs}
 

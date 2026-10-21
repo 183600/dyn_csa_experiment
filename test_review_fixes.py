@@ -211,6 +211,19 @@ def t_safe_exp_and_doc_ci():
     # The same iterable contract holds for the curve diagnostics.
     assert L._finite_curve(np.array([1.0, np.inf, 2.0]))['n_finite'] == 2
     assert L._finite_curve(iter([1.0, 2.0]))['n_finite'] == 2
+    # PPL is >= 1 by definition: a symmetric CE interval that crosses zero
+    # must not be exponentiated into an impossible sub-1 lower bound.
+    _wide = L._nll_doc_ci([6.369616873214543, 2.697867137638703], [1, 1])
+    assert _wide['ppl_ci95_low'] >= 1.0, _wide
+    assert _wide['ppl_ci95_low'] <= _wide['ppl'] <= _wide['ppl_ci95_high'], _wide
+    # Mismatched per-document accounting is malformed evidence, not an
+    # invitation to silently zip to the shorter list.
+    try:
+        L._nll_doc_ci([1.0, 2.0], [10])
+    except ValueError as e:
+        assert 'paired' in str(e), e
+    else:
+        raise AssertionError('mismatched NLL/token lists must be refused')
 
 
 def t_bootstrap_mean_ci():
