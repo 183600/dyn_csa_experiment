@@ -2435,8 +2435,39 @@ class LeakageSafeTargetEncoder:
         obj.n_train_ = _check_count('n_train', stats.get('n_train', 0))
         obj.prior_ = _stat_float(stats, 'prior',
                                  what=what, index='top-level')
-        obj.train_fp_ = stats.get('train_fp')
-        obj.train_row_set_fp_ = stats.get('train_row_set_fp')
+        # The full-table lookup contains every training row's own label, so
+        # ``transform`` refuses an exact training matrix using this
+        # fingerprint.  A persisted artifact without it would silently lose
+        # that guard and expose the classic in-sample target-encoding leak;
+        # fail closed instead of accepting a degraded encoder.
+        _train_fp = stats.get('train_fp')
+        if obj.n_train_ > 0:
+            if not isinstance(_train_fp, str) or not _train_fp:
+                raise ValueError(
+                    f'{what}.from_stats: n_train={obj.n_train_} requires a '
+                    'non-empty train_fp so in-sample target encoding can be '
+                    'refused')
+        elif _train_fp is not None and not isinstance(_train_fp, str):
+            raise ValueError(
+                f'{what}.from_stats: train_fp must be a string or None')
+        # A forged n_train smaller than the reference table also disables the
+        # reordered-training-row check (it compares the input row count with
+        # n_train).  The full-table fit builds every feature's reference table
+        # from exactly the training rows, so an inconsistent count must fail
+        # rather than weaken the leak guard.
+        for j, st in enumerate(rebuilt):
+            if int(st['n_reference_rows']) != obj.n_train_:
+                raise ValueError(
+                    f'{what}.from_stats: feature {j} references '
+                    f"{st['n_reference_rows']} rows but n_train="
+                    f'{obj.n_train_}; the persisted table was not fit on the '
+                    'declared training rows')
+        _row_set_fp = stats.get('train_row_set_fp')
+        if _row_set_fp is not None and not isinstance(_row_set_fp, str):
+            raise ValueError(
+                f'{what}.from_stats: train_row_set_fp must be a string or None')
+        obj.train_fp_ = _train_fp
+        obj.train_row_set_fp_ = _row_set_fp
         obj.oof_policy_ = stats.get('oof_policy')
         obj.oof_fold_fp_ = stats.get('oof_fold_fp')
         obj.fitted_ = True
