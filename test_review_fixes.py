@@ -346,6 +346,49 @@ def t_training_health_actions_and_gap():
     assert any('training CE itself is rising' in a for a in hr['actions']), hr
 
 
+def t_health_accepts_val_ce_only_and_orders_steps():
+    # The API documents ``val_ce`` OR ``val_ppl``.  A CE-only curve must still
+    # produce the best/final checkpoint evidence the report uses, and the gap
+    # must be derived from the same two measurements.
+    hist = [{'step': i * 100, 'train_ce': 6.0 - 0.30 * i,
+             'val_ce': 4.0 + 0.05 * i} for i in range(5)]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'overfitting', h
+    assert h['val_ppl_source'] == 'val_ce_derived', h
+    assert h['best_step'] == 0 and h['best_val_ppl'] is not None, h
+    assert abs(h['best_val_ppl'] - math.exp(4.0)) < 1e-9, h
+    assert h['final_val_ppl'] is not None and h['final_minus_best'] > 0, h
+    assert h['gap_source'] == 'derived' and h['gap_last'] is not None, h
+
+    # Out-of-order history and a repeated step are one evaluation grid, not a
+    # different best step or a two-point noise fit.  The last write to a step
+    # wins (resume semantics), and the tail is chronological.
+    shuffled = [hist[2], hist[0], hist[4], hist[1], hist[3],
+                {'step': 100, 'train_ce': 6.0, 'val_ce': 3.5}]
+    hs = L.classify_training_health(shuffled)
+    assert hs['n_points'] == 6 and hs['n_eval_points'] == 5, hs
+    assert hs['best_step'] == 100, hs
+    assert abs(hs['best_val_ppl'] - math.exp(3.5)) < 1e-9, hs
+    assert hs['steps_since_best'] == 300, hs
+
+    # An explicitly recorded non-finite PPL is a measured failure: the finite
+    # CE twin must not paper over it by becoming the best PPL.
+    bad = [{'step': 0, 'train_ce': 5.0, 'val_ce': 4.0, 'val_ppl': 55.0},
+           {'step': 100, 'train_ce': 4.5, 'val_ce': 4.1, 'val_ppl': float('nan')},
+           {'step': 200, 'train_ce': 4.0, 'val_ce': 4.2, 'val_ppl': 60.0}]
+    hb = L.classify_training_health(bad)
+    assert hb['status'] == 'nonfinite', hb
+    assert hb['val_ppl_source'] == 'val_ppl', hb
+
+    # Early stopping accepts the same CE-only representation.
+    ce_only = [{'step': 0, 'val_ce': 4.0}, {'step': 100, 'val_ce': 4.1},
+               {'step': 200, 'val_ce': 4.2}]
+    d = L.early_stop_decision(ce_only, patience=2)
+    assert d['should_stop'] is True and d['best_step'] == 0, d
+    assert d['val_ppl_source'] == 'val_ce_derived', d
+    assert abs(d['best_val_ppl'] - math.exp(4.0)) < 1e-9, d
+
+
 def t_early_stop_decision():
     hist = [{'step': 100, 'val_ppl': 50.0}, {'step': 200, 'val_ppl': 48.0}]
     assert L.early_stop_decision(hist, patience=2)['should_stop'] is False
@@ -13765,6 +13808,7 @@ def main():
     _check('L8d efficiency/accuracy cost summary is seed-noise aware', t_efficiency_accuracy_tradeoff_summary)
     _check('L8e report surfaces the bad-case cause inventory', t_report_error_analysis_section)
     _check('L8f training-health section shows actions and steps since best', t_report_training_health_actions)
+    _check('L8f2 health/early-stop accept CE-only curves and order steps', t_health_accepts_val_ce_only_and_orders_steps)
     _check('L8g report surfaces completed vs planned training budget', t_report_early_stop_section)
     _check('L8h efficiency report keeps measurement groups separate', t_report_efficiency_groups_are_separate)
     _check('L8i training-health/triage record audit fails closed', t_audit_training_health_records)

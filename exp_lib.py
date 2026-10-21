@@ -254,7 +254,10 @@ def _curve_slope_stats(points, key, k=4):
     *sign of the noise* decide ``healthy`` vs ``overfitting``.  Callers that
     need a scale-free criterion compare the slope with a multiple of this SE.
     """
-    pts = []
+    # Key by step so the tail is chronological even if the record was written
+    # out of order, and so a repeated step (e.g. a resumed evaluation) is one
+    # evaluation point (the last written value wins) rather than two.
+    by_step = {}
     for p in (points if points is not None else []):
         if not isinstance(p, dict):
             continue
@@ -264,8 +267,8 @@ def _curve_slope_stats(points, key, k=4):
         except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(x) and math.isfinite(y):
-            pts.append((x, y))
-    pts = pts[-max(2, int(k)):]
+            by_step[x] = y
+    pts = sorted(by_step.items())[-max(2, int(k)):]
     if len(pts) < 2:
         return None, None
     n = len(pts)
@@ -348,25 +351,65 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         val_tol = max(1e-5, 2.0 * val_se) if val_se is not None else 1e-5
     else:
         train_tol = val_tol = float(slope_tol)
+    # The docstring promises ``val_ce`` OR ``val_ppl``.  Derive a PPL from CE
+    # only when the PPL field is absent/None: an explicitly recorded NaN/inf
+    # PPL is a measured failure and must not be papered over by the CE twin.
+    def _entry_val_ppl(h):
+        raw = h.get('val_ppl')
+        if raw is not None:
+            return _finite_scalar(raw), 'val_ppl'
+        ce = _finite_scalar(h.get('val_ce'))
+        if ce is None:
+            return None, None
+        ppl = _safe_exp_ppl(ce)
+        if ppl is None or not math.isfinite(ppl) or ppl <= 0.0:
+            return None, None
+        return ppl, 'val_ce_derived'
+
     val_ppl_points = []
+    _ppl_sources = set()
     for h in entries:
         # An exact integer step: int(1.5)/int(True) would merge two different
         # evaluations into one step and make best/last/steps-since-best lie.
         st = _as_seed_int(h.get('step'))
-        vp = _finite_scalar(h.get('val_ppl'))
+        vp, src = _entry_val_ppl(h)
         if st is not None and vp is not None and vp > 0:
             val_ppl_points.append((st, vp, h))
-    best = min(val_ppl_points, key=lambda t: t[1]) if val_ppl_points else None
+            _ppl_sources.add(src)
+    # Same evaluation identity as the slope fit: chronological, one point per
+    # step.  Without this, an out-of-order record made `last` (and therefore
+    # final_minus_best/steps_since_best) disagree with the fitted tail.
+    _by_step = {}
+    for st, vp, h in val_ppl_points:
+        _by_step[st] = (st, vp, h)
+    val_ppl_points = [ _by_step[k] for k in sorted(_by_step) ]
+    best = min(val_ppl_points, key=lambda t: (t[1], t[0])) if val_ppl_points else None
     last = val_ppl_points[-1] if val_ppl_points else None
     last_gap = None
+    _gap_source = None
     for h in reversed(entries):
         try:
             g = float(h.get('gap'))
         except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(g):
+            g = None
+        if g is not None and math.isfinite(g):
             last_gap = g
+            _gap_source = 'recorded'
             break
+    if last_gap is None:
+        # A legacy/synthetic record may carry both curves but no explicit gap.
+        # Derive it from the SAME validation quantity the rest of the
+        # classification uses instead of reporting no gap evidence.
+        for h in reversed(entries):
+            _tc = _finite_scalar(h.get('train_ce'))
+            _vc = _finite_scalar(h.get('val_ce'))
+            if _vc is None:
+                _vp, _src = _entry_val_ppl(h)
+                _vc = math.log(_vp) if (_vp is not None and _vp > 0.0) else None
+            if _tc is not None and _vc is not None:
+                last_gap = _vc - _tc
+                _gap_source = 'derived'
+                break
     if n_bad:
         status = 'nonfinite'
         reason = f'{n_bad} non-finite curve point(s); inspect the first bad step before using this run'
@@ -446,8 +489,11 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         'reason': reason,
         'actions': actions,
         'n_points': len(entries),
+        'n_eval_points': len(val_ppl_points),
         'n_nonfinite': int(n_bad),
         'n_train_ce_measured': int(n_train_measured),
+        'val_ppl_source': (sorted(_ppl_sources)[0] if len(_ppl_sources) == 1
+                           else ('mixed' if _ppl_sources else None)),
         'tail_k': int(tail_k),
         'train_ce_slope_per_step': train_s,
         'val_ce_slope_per_step': val_s,
@@ -457,6 +503,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         'val_slope_tol': val_tol,
         'slope_tol_mode': ('adaptive_2se' if slope_tol is None else 'fixed'),
         'gap_last': last_gap,
+        'gap_source': _gap_source,
         'gap_slope_per_step': gap_s,
         'gap_slope_se': gap_se,
         'best_step': best_step,
@@ -474,9 +521,11 @@ def early_stop_decision(history, *, patience, min_delta=0.0):
     ``patience`` is the number of consecutive finite validation points that may
     fail to improve on the best PPL before stopping.  ``min_delta`` is an
     absolute PPL margin: a point must be at least ``min_delta`` below the best
-    to count as an improvement.  This is a pure decision helper so the policy
-    can be tested without training; the caller decides whether unequal token
-    budgets are acceptable for its comparison.
+    to count as an improvement.  As in ``classify_training_health``, a history
+    may carry ``val_ce`` instead of ``val_ppl``; the PPL is then derived from
+    the finite CE.  This is a pure decision helper so the policy can be tested
+    without training; the caller decides whether unequal token budgets are
+    acceptable for its comparison.
     """
     if isinstance(patience, (bool, np.bool_)) or not isinstance(patience, (int, np.integer)):
         raise ValueError(f'early-stop patience must be a positive integer, got {patience!r}')
@@ -492,15 +541,32 @@ def early_stop_decision(history, *, patience, min_delta=0.0):
     if not math.isfinite(min_delta) or min_delta < 0.0:
         raise ValueError(f'early-stop min_delta must be a finite non-negative number, got {min_delta!r}')
     pts = []
+    _sources = set()
     for p in (history if history is not None else []):
         if not isinstance(p, dict):
             continue
         # Steps are exact integers and Boolean/NaN PPLs are flags, not
         # measurements; truncating 1.5 to step 1 would merge two eval points.
         step = _as_seed_int(p.get('step'))
-        ppl = _finite_scalar(p.get('val_ppl'))
+        raw = p.get('val_ppl')
+        if raw is not None:
+            ppl = _finite_scalar(raw)
+            src = 'val_ppl'
+        else:
+            ce = _finite_scalar(p.get('val_ce'))
+            ppl = _safe_exp_ppl(ce) if ce is not None else None
+            src = 'val_ce_derived'
+            if ppl is None or not math.isfinite(ppl):
+                ppl = None
         if step is not None and ppl is not None and ppl > 0.0:
             pts.append((step, ppl))
+            _sources.add(src)
+    # One point per evaluation step, ordered chronologically (a duplicate
+    # step from a resumed write is not two independent stale evaluations).
+    _by_step = {}
+    for step, ppl in pts:
+        _by_step[step] = (step, ppl)
+    pts = [_by_step[k] for k in sorted(_by_step)]
     best = None
     best_step = None
     stale = 0
@@ -517,7 +583,9 @@ def early_stop_decision(history, *, patience, min_delta=0.0):
             'best_val_ppl': (float(best) if best is not None else None),
             'best_step': (int(best_step) if best_step is not None else None),
             'last_step': (int(pts[-1][0]) if pts else None),
-            'last_val_ppl': (float(pts[-1][1]) if pts else None)}
+            'last_val_ppl': (float(pts[-1][1]) if pts else None),
+            'val_ppl_source': (sorted(_sources)[0] if len(_sources) == 1
+                               else ('mixed' if _sources else None))}
 
 
 def diagnose_training_instability(record, *, data_checked=None):
