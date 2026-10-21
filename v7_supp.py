@@ -2246,6 +2246,36 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
     was = model.training
     model.eval()
     out = {}
+    # Validate the requested geometry before any model work.  A fractional
+    # length used to be truncated by int() and a non-positive max_pos turned
+    # the last-token slice into a different (or even full) prefix, so the cell
+    # silently measured something other than the declared length.
+    try:
+        _raw_lens = list(eval_lens)
+    except TypeError:
+        raise ValueError(
+            f'eval_length_gen: eval_lens must be an iterable of lengths, got '
+            f'{eval_lens!r}') from None
+    eval_lens = []
+    for _raw_len in _raw_lens:
+        _n = L._exact_count(_raw_len, minimum=2)
+        if _n is None:
+            raise ValueError(
+                f'eval_length_gen: every eval length must be an integer >= 2 '
+                f'(one next-token target is the minimum), got {_raw_len!r}')
+        eval_lens.append(int(_n))
+    _n_seq = L._exact_count(n_seq, minimum=1)
+    if _n_seq is None:
+        raise ValueError(
+            f'eval_length_gen: n_seq must be a positive integer, got {n_seq!r}')
+    n_seq = int(_n_seq)
+    if max_pos is not None:
+        _mp = L._exact_count(max_pos, minimum=2)
+        if _mp is None:
+            raise ValueError(
+                f'eval_length_gen: max_pos must be an integer >= 2 or None, '
+                f'got {max_pos!r}')
+        max_pos = int(_mp)
     # An absolute-position model cannot score beyond its learned table.  When
     # the caller passes max_pos=None (the "full context" request) a longer
     # length must be an explicit error, never a silent last-max_pos slice.

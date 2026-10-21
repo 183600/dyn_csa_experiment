@@ -2373,6 +2373,30 @@ def t_eval_per_seq():
         assert cell['n_tok'] == 3 * 31, (Ln, cell['n_tok'])
         geo = math.exp(sum(math.log(p) for p in cell['ppl_per_seq']) / 3.0)
         assert abs(geo - cell['ppl']) / cell['ppl'] < 1e-6, (Ln, geo, cell['ppl'])
+    # Invalid/ambiguous length geometry must fail before any scoring: a
+    # fractional length is not the truncated integer, and max_pos=0/1 or a
+    # negative value turns the last-token slice into a different prefix.
+    for _bad_lens in ([1], [0], [-4], [1.5], [True], [None]):
+        try:
+            V7.eval_length_gen(model, ids, _bad_lens, dev, max_pos=None)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'eval_length_gen accepted eval_lens={_bad_lens!r}')
+    for _bad_max in (0, 1, -1, 1.5, True):
+        try:
+            V7.eval_length_gen(model, ids, [32], dev, max_pos=_bad_max)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'eval_length_gen accepted max_pos={_bad_max!r}')
+    for _bad_n in (0, -1, 1.5, True):
+        try:
+            V7.eval_length_gen(model, ids, [32], dev, n_seq=_bad_n)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'eval_length_gen accepted n_seq={_bad_n!r}')
     # The sampled path must credit per-document stats to the GLOBAL row, not
     # to a chunk-local row.  With chunk=1 and most targets sampled, a broken
     # offset would pile almost every token onto row 0.
