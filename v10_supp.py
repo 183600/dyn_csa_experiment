@@ -201,9 +201,36 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     既有实现逐字节一致（同一 RNG 播种、同一调用顺序——见 _distractor_ppls
     的行缓存键）。三种新模式（span/doc/topical）同样只
     依赖 (eval_len, jj, rho, mode, span_len)，保证臂间严格配对。"""
-    n_far = eval_len - target
     if mode not in _CORRUPT_MODES:
         raise ValueError(f'_corrupt_row: unknown corruption mode {mode!r} (expected one of {_CORRUPT_MODES})')
+    if isinstance(target, (bool, np.bool_)) or not isinstance(target, (int, np.integer)):
+        raise ValueError(f'_corrupt_row: target must be an integer, got {target!r}')
+    target = int(target)
+    if target < 1:
+        raise ValueError(f'_corrupt_row: target must be positive, got {target}')
+    if isinstance(eval_len, (bool, np.bool_)) or not isinstance(eval_len, (int, np.integer)):
+        raise ValueError(f'_corrupt_row: eval_len must be an integer, got {eval_len!r}')
+    eval_len = int(eval_len)
+    if eval_len < target:
+        raise ValueError(
+            f'_corrupt_row: eval_len={eval_len} is shorter than the scored '
+            f'target zone ({target}); the far context would be negative and '
+            'the corruption geometry is undefined')
+    if isinstance(rho, (bool, np.bool_)):
+        raise ValueError(f'_corrupt_row: rho must be a finite number in [0,1], got {rho!r}')
+    try:
+        rho = float(rho)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'_corrupt_row: rho must be a finite number in [0,1], got {rho!r}') from None
+    if not (math.isfinite(rho) and 0.0 <= rho <= 1.0):
+        raise ValueError(f'_corrupt_row: rho must be finite and in [0,1], got {rho!r}')
+    _panel = np.asarray(val_ids)
+    if (_panel.ndim != 2 or not (0 <= int(jj) < _panel.shape[0])
+            or _panel.shape[1] < eval_len + 1):
+        raise ValueError(
+            f'_corrupt_row: val_ids must be a 2-D panel with row {jj!r} and '
+            f'>= {eval_len + 1} tokens, got shape {_panel.shape}')
+    n_far = eval_len - target
     if mode in ('mask', 'delete', 'doc') and abs(float(rho) - 1.0) > 1e-9:
         raise ValueError(f"mode {mode!r} is an all-or-nothing condition and only admits rho=1.0 (got {rho!r}); partial masking is a different question and is not this probe")
     if mode == 'delete':
@@ -290,6 +317,24 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
     # target zone; the first scored prediction reads input position
     # eval_len - target (it predicts ids[eval_len - target + 1]), so the
     # clean context spans ids[0 : eval_len - target]
+    if isinstance(target, (bool, np.bool_)) or not isinstance(target, (int, np.integer)):
+        raise ValueError(f'_distractor_ppls: target must be an integer, got {target!r}')
+    target = int(target)
+    if target < 1:
+        raise ValueError(f'_distractor_ppls: target must be positive, got {target}')
+    if isinstance(eval_len, (bool, np.bool_)) or not isinstance(eval_len, (int, np.integer)):
+        raise ValueError(f'_distractor_ppls: eval_len must be an integer, got {eval_len!r}')
+    eval_len = int(eval_len)
+    if eval_len < target:
+        raise ValueError(
+            f'_distractor_ppls: eval_len={eval_len} is shorter than the scored '
+            f'target zone ({target}); the far context would be negative')
+    try:
+        rho = float(rho)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'_distractor_ppls: rho must be a finite number in [0,1], got {rho!r}') from None
+    if not (math.isfinite(rho) and 0.0 <= rho <= 1.0):
+        raise ValueError(f'_distractor_ppls: rho must be finite and in [0,1], got {rho!r}')
     n_far = eval_len - target
     nll_sum = []
     n_tok = []

@@ -614,6 +614,21 @@ def t_loss_curve_downsample_keeps_spikes_and_nan():
     assert any(isinstance(v, float) and math.isnan(v) for v in out), 'NaN spike was dropped'
     assert 999.0 in out, 'loss spike was dropped'
     assert L._reduce_curve_values([1.0, 2.0, 3.0], 100) == [1.0, 2.0, 3.0]
+    # A tiny point budget is still a bound: the five-landmarks-per-bin rule
+    # must not return six samples when the caller asked for at most one.
+    for _mp in range(1, 8):
+        _v = [float(i) for i in range(50)]
+        _v[20] = float('nan')
+        _got = L._reduce_curve_values(_v, _mp)
+        assert len(_got) <= _mp, (_mp, len(_got))
+        assert _got[-1] == 49.0, (_mp, _got)
+        _p = [[i, float(i)] for i in range(50)]
+        _p[20][1] = float('nan')
+        _gp = L._reduce_curve_points(_p, _mp)
+        assert len(_gp) <= _mp, (_mp, len(_gp))
+        assert _gp[-1][0] == 49, (_mp, _gp)
+    assert L._reduce_curve_values([1.0, 2.0], 0) == []
+    assert L._reduce_curve_points([[0, 1.0], [1, 2.0]], 0) == []
 
 
 def t_final_loss_smoothed_uses_last_steps():
@@ -1256,6 +1271,26 @@ def t_mode_validation():
             raise AssertionError(f'{mode} must only admit rho=1.0')
         except ValueError:
             pass
+    # An invalid corruption geometry must fail before the seeded RNG works:
+    # a negative far context or rho outside [0,1] silently produced an
+    # unchanged/partial row that still looked like a measured condition.
+    for _kw in ({'eval_len': 64, 'rho': -0.1, 'target': 32},
+                {'eval_len': 64, 'rho': 1.1, 'target': 32},
+                {'eval_len': 64, 'rho': float('nan'), 'target': 32},
+                {'eval_len': 32, 'rho': 0.5, 'target': 64},
+                {'eval_len': 64, 'rho': 0.5, 'target': 0}):
+        try:
+            V10._corrupt_row(_PANEL, _kw['eval_len'], _kw['rho'], 'uniform',
+                             0, _VOCAB, _kw['target'])
+            raise AssertionError(f'_corrupt_row accepted invalid geometry {_kw!r}')
+        except ValueError:
+            pass
+    try:
+        V10._corrupt_row(_PANEL[:1, :64], 128, 0.5, 'uniform', 0, _VOCAB, 32)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('_corrupt_row silently used a panel shorter than eval_len')
 
 
 # ---------------------------------------------------------------------------
