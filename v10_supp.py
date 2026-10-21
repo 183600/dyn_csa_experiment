@@ -1622,6 +1622,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                              and math.isfinite(float(x))]
                 niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'balanced_by_seed': bals, 'acc_mean': float(np.mean(list(accs.values()))), 'balanced_mean': (float(np.mean(_bal_vals)) if _bal_vals else None), 'nll_mean': float(np.mean(list(nlls.values()))), 'chance_accuracy': _first.get('chance_accuracy'), 'majority_accuracy': _first.get('majority_accuracy'), 'n_classes': _first.get('n_classes'), 'n': len(accs), 'n_pairs': _first.get('n_pairs'), 'dist_mean': _first.get('dist_mean'), 'val_fp': _vfp})
             niah_contrasts = {}
+            niah_acc_contrasts = {}
             _nidx = {}
             for c in niah_cells:
                 _nidx.setdefault((c['variant'], c['arm'], c['eval_len'], c['condition']), []).append(c)
@@ -1641,6 +1642,14 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             res = V.exact_sign_permutation([other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common])
                             res['seeds'] = common
                             niah_contrasts[f'NIAH-nat L{Ln} {cond}: {arm} - learned (answer NLL)'] = res
+                            # Accuracy is the declared primary endpoint for
+                            # retrieval.  Testing only the secondary NLL would
+                            # leave the stated goal untested and could report a
+                            # significant NLL difference while the top-1
+                            # accuracy is indistinguishable.
+                            _ra = V.exact_sign_permutation([other['acc_by_seed'][s] - learned['acc_by_seed'][s] for s in common])
+                            _ra['seeds'] = common
+                            niah_acc_contrasts[f'NIAH-nat L{Ln} {cond}: {arm} - learned (answer accuracy)'] = _ra
                     for tag, ov in (('csa_randtrain', 'csa_fixed_rope_randidx'), ('csa_alltrain', 'csa_fixed_rope_allblocks')):
                         other = _ncell(ov, 'learned', Ln, cond)
                         if not learned or not other:
@@ -1650,13 +1659,18 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             res = V.exact_sign_permutation([other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common])
                             res['seeds'] = common
                             niah_contrasts[f'NIAH-nat L{Ln} {cond}: {tag} - learned (answer NLL)'] = res
-            probe['niah_natural'] = {'cells': niah_cells, 'contrasts': niah_contrasts}
+                            _ra = V.exact_sign_permutation([other['acc_by_seed'][s] - learned['acc_by_seed'][s] for s in common])
+                            _ra['seeds'] = common
+                            niah_acc_contrasts[f'NIAH-nat L{Ln} {cond}: {tag} - learned (answer accuracy)'] = _ra
+            probe['niah_natural'] = {'cells': niah_cells, 'contrasts': niah_contrasts,
+                                     'accuracy_contrasts': niah_acc_contrasts}
             # NIAH contrasts are built AFTER the corruption family was
             # corrected.  Leaving them out of the Holm family would report
             # uncorrected p-values under a "Holm" heading, so re-run the
             # correction over the union and overwrite both.
             _comb = dict(contrasts)
             _comb.update(niah_contrasts)
+            _comb.update(niah_acc_contrasts)
             if _comb:
                 _h2 = L.holm_adjust([(k, v.get('p_exact_signflip')) for k, v in _comb.items()
                                      if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))])
@@ -1973,10 +1987,20 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             A(f"| `{c['variant']}::{c['arm']}` | {c['eval_len']} | {c['condition']} | {c['acc_mean']:.3f} | {_bal} | {_ch} | {_mj} | {c['nll_mean']:.3f} | {c['n']} |")
         A('')
         if niah.get('contrasts'):
-            A('| NIAH 配对比较（Δ = 对照臂 − 学习选择，answer NLL，>0 = 学习选择更好） | n | Δ mean±std | p (exact) |')
-            A('|---|---|---|---|')
+            A('| NIAH 配对比较（Δ = 对照臂 − 学习选择，answer NLL，>0 = 学习选择更好） | n | Δ mean±std | p (exact) | p (Holm) |')
+            A('|---|---|---|---|---|')
             for k, v in sorted(niah['contrasts'].items()):
-                A(f'| {k} | {v['n']} | {v['mean']:+.3f} ± {v.get('std', 0):.3f} | {v['p_exact_signflip']:.3f} |')
+                _ph = v.get('p_holm')
+                _phs = f'{_ph:.3f}' if isinstance(_ph, (int, float)) and math.isfinite(float(_ph)) else 'n/a'
+                A(f"| {k} | {v['n']} | {v['mean']:+.3f} ± {v.get('std', 0):.3f} | {v['p_exact_signflip']:.3f} | {_phs} |")
+            A('')
+        if niah.get('accuracy_contrasts'):
+            A('| NIAH 配对比较（Δ = 对照臂 − 学习选择，answer top-1 accuracy，>0 = 对照臂更好） | n | Δ mean±std | p (exact) | p (Holm) |')
+            A('|---|---|---|---|---|')
+            for k, v in sorted(niah['accuracy_contrasts'].items()):
+                _ph = v.get('p_holm')
+                _phs = f'{_ph:.3f}' if isinstance(_ph, (int, float)) and math.isfinite(float(_ph)) else 'n/a'
+                A(f"| {k} | {v['n']} | {v['mean']:+.3f} ± {v.get('std', 0):.3f} | {v['p_exact_signflip']:.3f} | {_phs} |")
             A('')
         A('> 该任务直接检验「长距离信息**利用**能力」，与上面的干扰鲁棒性互补：鲁棒性高 + 检索利用不差，才支持「稀疏选择在滤噪的同时保留了有用远距信息」；若只有鲁棒性而检索差，则更符合「本来就少用远端」的替代解释。')
         A('')
