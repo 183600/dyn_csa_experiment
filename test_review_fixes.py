@@ -4495,6 +4495,24 @@ def t_paired_row_bootstrap_delta():
         _b['n_tokens_per_row_holdout'] = [50] * 5
     rh = L.paired_row_bootstrap_delta(bad3)
     assert rh['status'] == 'ok' and rh['n_rows'] == 5, rh
+    # A pair whose two arms use different estimands is not a paired row
+    # comparison, even when both arrays happen to have the same length.
+    mixed_pair = _pair(+1.0)
+    mixed_pair[0][0]['ppl_estimation_rows'] = 'nested_validation_holdout'
+    mixed_pair[0][0]['nll_per_row_holdout'] = list(mixed_pair[0][0]['nll_per_row'])
+    mixed_pair[0][0]['n_tokens_per_row_holdout'] = list(mixed_pair[0][0]['n_tokens_per_row'])
+    rmix = L.paired_row_bootstrap_delta(mixed_pair)
+    assert rmix['status'] == 'unverifiable' and 'different estimands' in rmix['reason'], rmix
+    # Nor may different shared pairs contribute intervals from different
+    # estimands to one mean/CI.
+    mixed_group = _pair(+1.0)
+    for _a, _b in mixed_group[:1]:
+        for _r in (_a, _b):
+            _r['ppl_estimation_rows'] = 'nested_validation_holdout'
+            _r['nll_per_row_holdout'] = list(_r['nll_per_row'])
+            _r['n_tokens_per_row_holdout'] = list(_r['n_tokens_per_row'])
+    rmg = L.paired_row_bootstrap_delta(mixed_group)
+    assert rmg['status'] == 'unverifiable' and 'mix' in rmg['reason'], rmg
     # The methodology audit attaches the interval to every controlled contrast
     # (and reports unverifiable rather than inventing rows).
     fp = ('steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_'

@@ -25684,13 +25684,28 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
         out['reason'] = 'no shared paired seeds'
         return out
     A, B = [], []
+    _estimands = set()
     for a, b in pairs:
         _a, _b = _arrays(a), _arrays(b)
         if _a is None or _b is None:
             out['reason'] = 'a paired record lacks per-row NLL/token accounting for the estimand'
             return out
+        _a_nested = (isinstance(a, dict)
+                     and a.get('ppl_estimation_rows') == 'nested_validation_holdout')
+        _b_nested = (isinstance(b, dict)
+                     and b.get('ppl_estimation_rows') == 'nested_validation_holdout')
+        if _a_nested != _b_nested:
+            out['reason'] = ('the two arms of a pair declare different estimands '
+                             '(nested holdout vs full validation); their row '
+                             'intervals are not paired')
+            return out
+        _estimands.add(_a_nested)
         A.append(_a)
         B.append(_b)
+    if len(_estimands) > 1:
+        out['reason'] = ('the shared pairs mix nested-holdout and full-validation '
+                         'estimands; the interval would average two different samples')
+        return out
     R = len(A[0][0])
     if R < 2:
         out['reason'] = f'only {R} evaluation row(s); a row bootstrap needs at least 2'
