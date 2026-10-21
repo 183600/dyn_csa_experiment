@@ -8448,6 +8448,55 @@ def t_clean_training_nonfinite_and_outliers():
             raise AssertionError(f'outlier_iqr={bad!r} must be refused')
 
 
+def t_clean_training_target_outliers():
+    # A corrupted regression label in the training split can be removed with a
+    # fence learned from the training labels only.  The holdout's extreme label
+    # must not move that fence or decide which training row survives.
+    X = np.arange(16, dtype=float).reshape(8, 2)
+    y = np.array([0.0, 1.0, 2.0, 100.0, 3.0, 4.0, 5.0, 1000.0])
+    clean = L.clean_training_rows(X, y, train_idx=[0, 1, 2, 3, 4, 5, 6],
+                                  target_outlier_iqr=1.5)
+    assert clean['train_idx'].tolist() == [0, 1, 2, 4, 5, 6], clean
+    assert clean['dropped_idx'].tolist() == [3], clean
+    assert clean['n_target_outlier_rows_dropped'] == 1, clean
+    assert clean['target_outlier_fence']['lo'] < 100.0, clean
+    # The holdout label (row 7 = 1000) is outside the same fence but is never
+    # passed to the cleaner, so it cannot cause a training drop.
+    no_leak = L.clean_training_rows(
+        X, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1000.0],
+        train_idx=[0, 1, 2, 3, 4, 5, 6], target_outlier_iqr=1.5)
+    assert no_leak['n_target_outlier_rows_dropped'] == 0, no_leak
+    assert no_leak['train_idx'].tolist() == [0, 1, 2, 3, 4, 5, 6], no_leak
+    # Categorical labels have no numeric target fence and must not be coerced.
+    cats = L.clean_training_rows(
+        X, ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
+        train_idx=[0, 1, 2, 3, 4, 5, 6], target_outlier_iqr=1.5)
+    assert cats['n_target_outlier_rows_dropped'] == 0, cats
+    assert cats['target_outlier_fence'] is None, cats
+    # The one-call split helper forwards the option and keeps holdouts intact.
+    out = L.split_and_prepare(
+        X, y, train_frac=5 / 8, val_frac=1 / 8, test_frac=2 / 8,
+        clean_train=True, target_outlier_iqr=1.5)
+    assert out['indices']['train'].tolist() == [0, 1, 2, 4], out['indices']
+    assert out['indices']['val'].tolist() == [5], out['indices']
+    assert out['indices']['test'].tolist() == [6, 7], out['indices']
+    assert out['cleaning']['n_target_outlier_rows_dropped'] == 1, out['cleaning']
+    # The option requires labels, and malformed multipliers are refused.
+    try:
+        L.clean_training_rows(X, train_idx=[0, 1, 2], target_outlier_iqr=1.5)
+    except ValueError as e:
+        assert 'requires y' in str(e), e
+    else:
+        raise AssertionError('a target fence without y must fail closed')
+    for bad in (0, -1, float('nan'), float('inf'), True):
+        try:
+            L.clean_training_rows(X, y, train_idx=[0, 1], target_outlier_iqr=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'target_outlier_iqr={bad!r} must be refused')
+
+
 def t_known_labels_audit():
     X = np.arange(8, dtype=float).reshape(4, 2)
     y = [0, 1, 2, 9]
@@ -10076,6 +10125,7 @@ def main():
     _check('I30 train-only cleaning before preprocessing', t_clean_training_rows_and_split)
     _check('I30b invalid training labels are droppable before fitting', t_clean_training_invalid_labels)
     _check('I30c non-finite/outlier training rows are cleanable', t_clean_training_nonfinite_and_outliers)
+    _check('I30d target/label outliers are cleanable with a train-only fence', t_clean_training_target_outliers)
     _check('I31 declared label set catches unseen/holdout labels', t_known_labels_audit)
     _check('I31b NaT keys and type-qualified label shift', t_data_guard_nat_and_label_identity)
     # Open-block reading rule: the substantive gates (causality, reference

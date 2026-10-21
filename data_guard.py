@@ -1350,7 +1350,8 @@ def prepare_features(X_train, X_val=None, X_test=None, **kwargs):
 
 def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
                         label_conflicts='drop', drop_invalid_labels=False,
-                        drop_nonfinite_features=False, outlier_iqr=None):
+                        drop_nonfinite_features=False, outlier_iqr=None,
+                        target_outlier_iqr=None):
     """Remove duplicate/ambiguous rows from the training split only.
 
     The holdout indices are not accepted by this function, so no validation or
@@ -1371,6 +1372,13 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
     cleaning decisions, so they are applied before any preprocessor fit; a
     holdout row is never inspected and can never decide which training row to
     drop.
+
+    ``target_outlier_iqr`` applies the same train-only IQR fence to numeric
+    training labels (label-noise cleanup).  It requires ``y``; non-numeric
+    (categorical) labels are left untouched, and the fence is learned only
+    from the finite training labels that survived the earlier drop rules.
+    Holdout labels are never inspected, so a corrupted validation/test target
+    cannot widen or move the fence used for the training split.
 
     Returns ``train_idx`` (the cleaned index array), the dropped rows and
     counts suitable for a run manifest.
@@ -1404,6 +1412,21 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
             raise ValueError(
                 f'outlier_iqr must be a positive finite number or None, '
                 f'got {outlier_iqr!r}')
+    if target_outlier_iqr is not None:
+        if isinstance(target_outlier_iqr, (bool, np.bool_)):
+            raise ValueError(
+                f'target_outlier_iqr must be a positive finite number or None, '
+                f'got {target_outlier_iqr!r}')
+        try:
+            target_outlier_iqr = float(target_outlier_iqr)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'target_outlier_iqr must be a positive finite number or None, '
+                f'got {target_outlier_iqr!r}') from None
+        if not (math.isfinite(target_outlier_iqr) and target_outlier_iqr > 0.0):
+            raise ValueError(
+                f'target_outlier_iqr must be a positive finite number or None, '
+                f'got {target_outlier_iqr!r}')
     labels = None
     if y is not None:
         yarr = _label_array(y)
@@ -1419,6 +1442,10 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
             rows = yarr.reshape(n, -1)
             labels = {int(i): tuple(_label_key(v) for v in rows[i].tolist())
                       for i in train_rows_needed}
+    if target_outlier_iqr is not None and labels is None:
+        raise ValueError(
+            'clean_training_rows: target_outlier_iqr requires y so the '
+            'target fence can be learned from training labels only')
 
     def _missing(lab):
         return lab is None or (isinstance(lab, tuple)
@@ -1460,6 +1487,46 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         _row_bad = _bad_cells.any(axis=1)
         n_outlier_rows = int((_row_bad & ~drop).sum())
         drop |= _row_bad
+    n_target_outlier_rows = 0
+    target_outlier_fence = None
+    if target_outlier_iqr is not None:
+        def _numeric_label(value):
+            # Only scalar numeric labels define a regression target.  A
+            # categorical string, a tuple (multi-output) or a missing/Inf
+            # target has no place on a single target fence.
+            if (value is None
+                    or isinstance(value, (bool, np.bool_))
+                    or isinstance(value, (complex, np.complexfloating))
+                    or not isinstance(value, numbers.Number)):
+                return None
+            try:
+                f = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return f if math.isfinite(f) else None
+
+        _row_target = [_numeric_label(labels[int(row)])
+                       for row in train_rows.tolist()]
+        _ref = [v for pos, v in enumerate(_row_target)
+                if not drop[pos] and v is not None]
+        if len(_ref) >= 2:
+            q1, q3 = np.quantile(_ref, (0.25, 0.75))
+            iqr = float(q3 - q1)
+            if iqr <= _EPS:
+                lo, hi = float(min(_ref)), float(max(_ref))
+            else:
+                lo = float(q1 - target_outlier_iqr * iqr)
+                hi = float(q3 + target_outlier_iqr * iqr)
+            target_outlier_fence = {
+                'lo': lo, 'hi': hi, 'k': float(target_outlier_iqr),
+                'n_train_reference': int(len(_ref)),
+            }
+            for pos, value in enumerate(_row_target):
+                if drop[pos] or value is None:
+                    continue
+                if value < lo or value > hi:
+                    drop[pos] = True
+                    n_target_outlier_rows += 1
     keys = _row_keys(_raw_X)
     clusters = {}
     for pos, row in enumerate(train_rows.tolist()):
@@ -1516,6 +1583,10 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         'n_invalid_label_rows_dropped': int(n_invalid_label_rows),
         'n_nonfinite_feature_rows_dropped': int(n_nonfinite_feature_rows),
         'n_outlier_rows_dropped': int(n_outlier_rows),
+        'n_target_outlier_rows_dropped': int(n_target_outlier_rows),
+        'target_outlier_iqr': (None if target_outlier_iqr is None
+                               else float(target_outlier_iqr)),
+        'target_outlier_fence': target_outlier_fence,
         'drop_duplicates': bool(drop_duplicates),
         'label_conflicts': label_conflicts,
         'drop_invalid_labels': bool(drop_invalid_labels),
@@ -1531,6 +1602,7 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
                       clean_train=False, label_conflicts='drop',
                       drop_invalid_labels=False,
                       drop_nonfinite_features=False, outlier_iqr=None,
+                      target_outlier_iqr=None,
                       check_cross_split_duplicates=True,
                       quality_kwargs=None, fail_on_quality=False,
                       **preprocessor_kwargs):
@@ -1557,7 +1629,9 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     :func:`clean_training_rows`; ``drop_invalid_labels=True`` additionally
     removes rows with missing/non-finite training targets, and
     ``drop_nonfinite_features=True`` / ``outlier_iqr=k`` remove training rows
-    with non-finite features or values outside the training IQR fence.
+    with non-finite features or values outside the training IQR fence, and
+    ``target_outlier_iqr=k`` removes numeric training labels outside a
+    train-only target fence (label-noise cleanup).
     Validation/test rows are never dropped or inspected.  The returned
     ``indices['train']`` is the cleaned index, so the preprocessor and every
     downstream step see exactly the same rows.  Unless
@@ -1589,7 +1663,8 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
             label_conflicts=label_conflicts,
             drop_invalid_labels=drop_invalid_labels,
             drop_nonfinite_features=drop_nonfinite_features,
-            outlier_iqr=outlier_iqr)
+            outlier_iqr=outlier_iqr,
+            target_outlier_iqr=target_outlier_iqr)
         idx['train'] = cleaning['train_idx']
         assert_no_split_leakage(idx['train'], idx['val'], idx['test'],
                                 groups=groups, time=time)
