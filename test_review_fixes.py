@@ -3836,6 +3836,27 @@ def t_binary_degenerate_threshold_visibility():
     assert L.metric_policy_audit({'b': dict(good, variant='b',
                                            task='binary_classification')})['status'] == 'ok'
 
+def t_binary_pr_floor_uses_positive_prevalence():
+    # PR-AUC's chance floor follows the POSITIVE class, not the minority class.
+    # When the positive endpoint is the common label (rare negative event), a
+    # correct record must not be flagged as having a misstated floor.
+    y = ['pos'] * 9999 + ['neg']
+    score = [0.9] * 9999 + [0.1]
+    m = L.classification_metrics(y, y_score=score, labels=['neg', 'pos'],
+                                 positive_label='pos')
+    assert m['positive_label'] == 'pos'
+    assert abs(m['pr_auc_prevalence'] - 0.9999) < 1e-12, m
+    audit = L.metric_policy_audit({'b': dict(m, variant='b',
+                                             task='binary_classification')})
+    assert audit['status'] == 'warn'  # only the rare-minority F1-cut warning
+    assert not any('floor is misstated' in w for w in audit['warnings']), audit
+    assert not any('pr_auc_lift_over_prevalence' in w for w in audit['warnings']), audit
+    # A genuinely forged floor is still rejected when the positive class is common.
+    forged = dict(m, variant='b', task='binary_classification',
+                  pr_auc_prevalence=0.0001)
+    fa = L.metric_policy_audit({'b': forged})
+    assert any('floor is misstated' in w for w in fa['warnings']), fa
+
 def t_metric_policy_checks_record_values():
     # The declared token-weighted PPL must match the record's own NLL
     # accounting; a per-sequence arithmetic mean is a different estimand.
@@ -12368,6 +12389,7 @@ def main():
     _check('L47 v12 admission rejects synthesized records', t_v12_admission_rejects_synthesized_records)
     _check('L48 seed/nested input guards', t_seed_and_nested_input_guards)
     _check('L49 malformed panel summary is excluded', t_malformed_panel_summary_is_excluded)
+    _check('L50 binary PR-AUC floor follows the positive class', t_binary_pr_floor_uses_positive_prevalence)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

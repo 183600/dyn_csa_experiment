@@ -15448,17 +15448,53 @@ def metric_policy_audit(summary=None, policy=None):
                                   if task == 'binary_classification' else _prev_f)
                     break
             if task == 'binary_classification' and prevalence is not None:
+                # PR-AUC's chance floor is the POSITIVE-class prevalence, which
+                # need not be the minority class.  When the positive endpoint
+                # is the common label (a rare negative event), `prevalence`
+                # above is the minority rate and using it here would flag a
+                # correct record as a misstated floor.
+                _pos_prev = None
+                _pos_nm = r.get('positive_label')
+                _pp_raw = r.get('positive_prevalence')
+                _pp = _finite_scalar(_pp_raw)
+                if _pp is not None and 0.0 <= _pp <= 1.0:
+                    _pos_prev = _pp
+                elif _pos_nm is not None:
+                    _prev_map = r.get('prevalence')
+                    if isinstance(_prev_map, dict):
+                        _pp = _finite_scalar(_prev_map.get(str(_pos_nm)))
+                        if _pp is not None and 0.0 <= _pp <= 1.0:
+                            _pos_prev = _pp
+                    if _pos_prev is None:
+                        _pc_pos = r.get('per_class')
+                        if isinstance(_pc_pos, dict):
+                            _pe_pos = _pc_pos.get(str(_pos_nm))
+                            if isinstance(_pe_pos, dict):
+                                _sup_pos = _exact_count(_pe_pos.get('support'), minimum=0)
+                                _n_pos_rec = _exact_count(r.get('n'), minimum=1)
+                                if _sup_pos is not None and _n_pos_rec:
+                                    _pos_prev = float(_sup_pos) / float(_n_pos_rec)
+                _floor = _pos_prev if _pos_prev is not None else prevalence
                 _pr_p = _finite_scalar(r.get('pr_auc_prevalence'))
-                if _pr_p is not None and abs(_pr_p - prevalence) > 1e-6:
-                    _class_issues.append(
-                        f'{_label}: pr_auc_prevalence={_pr_p} differs from the recorded '
-                        f'minority prevalence {prevalence}; the PR-AUC floor is misstated')
+                if _pr_p is not None and abs(_pr_p - _floor) > 1e-6:
+                    # Legacy records may omit positive_label; in that case the
+                    # endpoint could be either class, so accept the mirror
+                    # orientation rather than inventing an error.
+                    _ok_mirror = (_pos_prev is None
+                                  and abs(_pr_p - (1.0 - prevalence)) <= 1e-6)
+                    if not _ok_mirror:
+                        _class_issues.append(
+                            f'{_label}: pr_auc_prevalence={_pr_p} differs from the recorded '
+                            f'positive prevalence {_floor}; the PR-AUC floor is misstated')
                 _pr = _finite_scalar(r.get('pr_auc'))
                 _lift = _finite_scalar(r.get('pr_auc_lift_over_prevalence'))
-                if _pr is not None and _lift is not None and abs(_lift - (_pr - prevalence)) > 1e-6:
-                    _class_issues.append(
-                        f'{_label}: pr_auc_lift_over_prevalence={_lift} is not '
-                        f'pr_auc - prevalence ({_pr - prevalence})')
+                if _pr is not None and _lift is not None and abs(_lift - (_pr - _floor)) > 1e-6:
+                    _mirror = (_pos_prev is None
+                               and abs(_lift - (_pr - (1.0 - prevalence))) <= 1e-6)
+                    if not _mirror:
+                        _class_issues.append(
+                            f'{_label}: pr_auc_lift_over_prevalence={_lift} is not '
+                            f'pr_auc - positive prevalence ({_pr - _floor})')
                 if (_thr_src == 'default_0.5' and prevalence < 1e-2
                         and (_finite_scalar(r.get('f1_primary')) is not None
                              or _finite_scalar(r.get('f1')) is not None)):
