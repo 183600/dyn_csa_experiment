@@ -4442,6 +4442,47 @@ def t_baseline_family_declared_contrasts_and_undeclared_arms():
     assert rex['tuning_verified'] is False, rex
     assert any('undeclared arm' in p for p in rex['problems']), rex
 
+    # Search-to-final DATA transfer: a config tuned on one corpus/validation
+    # slice is not tuned for a final estimate on another.  Steps and tokens
+    # matching does not make the data identity match.
+    def _row(cfg, ppl, dfp='DFP', vfp='VFP'):
+        return {'config': dict(cfg), 'ppl': float(ppl), 'steps': 10,
+                'tokens_seen': 100, 'seeds': [100],
+                'seed_ppls': {'100': float(ppl)},
+                'data_fp': dfp, 'val_fp': vfp, 'data_version': 'DV'}
+    dp = dict(L.BASELINE_TUNING_PROTOCOL, arms=['a', 'b'], trials=trials,
+              search_seeds=[100], final_seeds=[0], inherits_tuning={})
+    dp.pop('arm_groups', None)
+    rows = {'a': [_row(trials[0], 10.0), _row(trials[1], 11.0)],
+            'b': [_row(trials[0], 9.0), _row(trials[1], 9.5)]}
+    d_art = {'selection_metric': 'ppl', 'selection_split': 'validation',
+             'direction': 'lower_is_better', 'search_seeds': [100],
+             'final_seeds': [0],
+             'arms': {a: {'trials': rr,
+                          'selected': dict(min(rr, key=lambda x: x['ppl'])['config']),
+                          'selected_metric_value': min(x['ppl'] for x in rr)}
+                      for a, rr in rows.items()},
+             'final_records': {
+                 f'{a}::seed0': {'seed': 0, 'variant': a, 'ppl': 9.0,
+                                 'steps': 10, 'tokens_seen': 100,
+                                 'data_fp': 'DFP', 'val_fp': 'VFP',
+                                 'data_version': 'DV',
+                                 'hyperparams': dict(min(rows[a], key=lambda x: x['ppl'])['config'])}
+                 for a in ('a', 'b')}}
+    okd = L.baseline_tuning_audit(d_art, protocol=dp)
+    assert okd['tuning_verified'] is True, okd
+    assert okd['data_transfer']['trial_fingerprints']['data_fp']['a']['values'] == ['DFP']
+    bad_trial = json.loads(json.dumps(d_art))
+    bad_trial['arms']['b']['trials'][0]['data_fp'] = 'OTHER'
+    rbt = L.baseline_tuning_audit(bad_trial, protocol=dp)
+    assert rbt['tuning_verified'] is False, rbt
+    assert any('different data_fp' in p for p in rbt['problems']), rbt
+    bad_final = json.loads(json.dumps(d_art))
+    bad_final['final_records']['b::seed0']['data_fp'] = 'OTHER'
+    rbf = L.baseline_tuning_audit(bad_final, protocol=dp)
+    assert rbf['tuning_verified'] is False, rbf
+    assert any('tuning trials used' in p for p in rbf['problems']), rbf
+
 
 def t_baseline_horizon_transfer_audit():
     # A config selected at a shorter search horizon is not the tuned optimum at
@@ -13411,7 +13452,7 @@ def main():
     _check('H2a1 retrieval metrics carry trivial floors', t_retrieval_metrics_and_niah_trivial_floor)
     _check('H2b multiclass one-vs-rest ranking metrics + imbalance audit', t_multiclass_ranking_metrics_and_audit)
     _check('H3 equal-search baseline tuning audit', t_baseline_tuning_audit)
-    _check('H3a0 tuned family uses declared contrasts', t_baseline_family_declared_contrasts_and_undeclared_arms)
+    _check('H3a0 tuned family + search-to-final data transfer', t_baseline_family_declared_contrasts_and_undeclared_arms)
     _check('H3a tuning grid boundary/coverage adequacy', t_tuning_grid_boundary_adequacy)
     _check('H3a multi-seed selection + equal search-seed audit', t_baseline_multi_seed_selection_audit)
     _check('H3b tuning driver selects on the multi-seed mean', t_baseline_tuning_driver_multiseed_selection)

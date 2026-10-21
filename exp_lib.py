@@ -17170,6 +17170,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     search_seed_sets = {}
     selection_stabilities = {}
     eval_n_tokens = {}
+    # Search-to-final data transfer: the selected hyperparameters were tuned
+    # on a particular training corpus and validation slice.  A final estimate
+    # on a different corpus/validation source is not the tuned configuration,
+    # even if steps and token counts match.
+    fingerprints_by_arm = {k: {} for k in
+                           ('data_fp', 'val_fp', 'eval_fp', 'data_version')}
     for arm, entry in arms.items():
         trials = entry.get('trials') if isinstance(entry, dict) else None
         if not isinstance(trials, list) or not trials:
@@ -17273,6 +17279,32 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         if len(_eval_tok) > 1:
             problems.append(f'{arm}: trials selected on different evaluation token counts {sorted(_eval_tok)} — their PPLs are not comparable')
         eval_n_tokens[arm] = sorted(_eval_tok)
+        # Exact corpus/validation identities, when the artifact records them.
+        # One trial with a different fingerprint means the grid was not even
+        # searched on one sample; a partial descriptor is unverifiable.
+        for _fk in fingerprints_by_arm:
+            _vals_fp = set()
+            _missing_fp = 0
+            for t in trials:
+                if not isinstance(t, dict):
+                    continue
+                _v_fp = t.get(_fk)
+                if _v_fp is None or (isinstance(_v_fp, str) and not _v_fp.strip()):
+                    _missing_fp += 1
+                else:
+                    _vals_fp.add(str(_v_fp))
+            fingerprints_by_arm[_fk][arm] = {
+                'values': sorted(_vals_fp), 'n_missing': _missing_fp,
+                'n_trials': len([t for t in trials if isinstance(t, dict)])}
+            if len(_vals_fp) > 1:
+                problems.append(
+                    f'{arm}: trials selected on different {_fk} values '
+                    f'{sorted(_vals_fp)} — the tuning grid mixes corpora/'
+                    'validation samples')
+            elif _missing_fp:
+                warnings.append(
+                    f'{arm}: {_missing_fp} tuning trial(s) omit {_fk}; the '
+                    'search-to-final data transfer is unverifiable')
         # Step/token budgets are exact counts.  Raw equality would treat
         # True == 1 and let a boolean/truncated budget pose as a matched one.
         _steps, _toks, _bad_budget = set(), set(), []
@@ -17408,6 +17440,18 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             else:
                 if chosen_f < max(vals) - 1e-12:
                     problems.append(f'{arm}: selected trial is not the maximum-{metric} trial')
+    # Across arms, every COMPLETE per-arm fingerprint must agree.  Otherwise
+    # the arms were tuned on different data and their selected configs are not
+    # comparable.
+    for _fk, _by_arm in fingerprints_by_arm.items():
+        _complete = {a: row['values'][0] for a, row in _by_arm.items()
+                     if len(row['values']) == 1 and row['n_missing'] == 0}
+        if len(set(_complete.values())) > 1:
+            problems.append(
+                'arms were tuned on different %s values (%s) — equal search '
+                'budgets do not make the selected configs comparable across '
+                'different corpora/validation samples'
+                % (_fk, ', '.join('%s=%s' % (a, v) for a, v in sorted(_complete.items()))))
     if signatures:
         if len(set(signatures.values())) != 1:
             problems.append('arms did not search the same trial grid — tuning budgets are unequal')
@@ -17646,6 +17690,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     if final_records:
         _final_steps_by_arm = {}
         _final_tokens_by_arm = {}
+        _final_fps_by_arm = {k: {} for k in fingerprints_by_arm}
         for _arm in arms:
             _hits = [(k, r) for k, r in final_records.items()
                      if k.startswith(f'{_arm}::') and isinstance(r, dict)]
@@ -17684,6 +17729,46 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             if _missing_token_records:
                 warnings.append(f'{_arm}: {len(_missing_token_records)} final record(s) do not '
                                 'record tokens_seen; the search-to-final exposure transfer is unverifiable')
+            for _fk in fingerprints_by_arm:
+                _final_fp_vals = {str(r.get(_fk)) for _k, r in _hits
+                                  if r.get(_fk) is not None
+                                  and not (isinstance(r.get(_fk), str)
+                                           and not r.get(_fk).strip())}
+                _final_fps_by_arm[_fk][_arm] = _final_fp_vals
+                if len(_final_fp_vals) > 1:
+                    problems.append(
+                        f'{_arm}: final records carry different {_fk} values '
+                        f'{sorted(_final_fp_vals)} — a tuned contrast cannot mix '
+                        'corpora/validation samples')
+        # The final estimate must run on the same data identity as the tuning
+        # search.  Missing descriptors are unverifiable (legacy), not a pass.
+        for _fk, _by_arm in _final_fps_by_arm.items():
+            _complete_final = {a: next(iter(v)) for a, v in _by_arm.items()
+                               if len(v) == 1}
+            if len(set(_complete_final.values())) > 1:
+                problems.append(
+                    'final records for different arms were scored on different '
+                    '%s values' % _fk)
+            for _arm, _vals in sorted(_by_arm.items()):
+                if not _vals:
+                    warnings.append(
+                        f'{_arm}: final record(s) omit {_fk}; the search-to-final '
+                        'data transfer is unverifiable')
+                    continue
+                if len(_vals) != 1:
+                    continue
+                _trial_vals = (fingerprints_by_arm.get(_fk, {})
+                               .get(_arm, {}).get('values') or [])
+                if not _trial_vals:
+                    warnings.append(
+                        f'{_arm}: tuning trials omit {_fk}; the search-to-final '
+                        'data transfer is unverifiable')
+                elif _trial_vals != sorted(_vals):
+                    problems.append(
+                        f'{_arm}: final records use {_fk}={sorted(_vals)} but the '
+                        f'tuning trials used {_trial_vals} — the selected config '
+                        'was tuned on a different corpus/validation sample than the '
+                        'reported final estimate')
         _budget_transfer['final_steps_by_arm'] = _final_steps_by_arm
         _budget_transfer['final_tokens_by_arm'] = _final_tokens_by_arm
         if _search_steps is not None and _final_steps_by_arm:
@@ -18019,6 +18104,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
            'final_family_contrasts': [[a, b] for a, b in _final_plan],
            'search_complete': _effective_search_complete,
            'budget_transfer': _budget_transfer,
+           'data_transfer': {
+               'trial_fingerprints': fingerprints_by_arm,
+               'final_fingerprints': ({k: {a: sorted(v) for a, v in by.items()}
+                                       for k, by in _final_fps_by_arm.items()}
+                                      if final_records else {}),
+           },
            'grid_complete': _grid_complete,
            'arms': sorted(arms), 'problems': problems, 'warnings': warnings,
            'selected_configs': {a: (e.get('selected') or e.get('selected_config'))

@@ -403,6 +403,15 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                     'budget_by_seed': {str(s): [records[s].get('steps'), records[s].get('tokens_seen')]
                                        for s in sorted(records)},
                     'run_cfg': records[sorted(records)[0]].get('run_cfg'), 'outdir': tdir,
+                    # The selected hyperparameters are only tuned for the data
+                    # they were searched on.  Persist the corpus/validation
+                    # fingerprints so the audit can refuse a search-to-final
+                    # data transfer (the same way it now refuses a horizon or
+                    # token-exposure transfer).
+                    'data_fp': records[sorted(records)[0]].get('data_fp'),
+                    'val_fp': records[sorted(records)[0]].get('val_fp'),
+                    'eval_fp': records[sorted(records)[0]].get('eval_fp'),
+                    'data_version': records[sorted(records)[0]].get('data_version'),
                 })
     # Selection must compare every trial on the SAME rows.  If one trial in
     # an arm could not use the declared nested selection fold while another
@@ -865,6 +874,10 @@ def _run_final(base, outdir, protocol, selected):
                                    'params': v.get('params'), 'run_cfg': v.get('run_cfg'),
                                    'steps': v.get('steps'),
                                    'tokens_seen': v.get('tokens_seen'),
+                                   'data_fp': v.get('data_fp'),
+                                   'val_fp': v.get('val_fp'),
+                                   'eval_fp': v.get('eval_fp'),
+                                   'data_version': v.get('data_version'),
                                    'hyperparams': v.get('hyperparams')}
                                for k, v in merged.items()}
     tuning['final_evaluation_rows'] = _final_rows_meta
