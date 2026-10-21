@@ -14524,8 +14524,26 @@ def retrieval_metrics(y_true, y_pred, labels=None, label_names=None):
     label_names = list(label_names)
     if len(label_names) != int(labs.size) or len(set(label_names)) != len(label_names):
         raise ValueError('retrieval_metrics: label_names must provide one unique name per label')
+    _lab_keys = [_hashable_label(v) for v in labs.tolist()]
+    if len(set(_lab_keys)) != len(_lab_keys):
+        # A repeated declared label would be scored twice: every query would
+        # contribute to two per-class rows (inflating n_classes, the uniform
+        # chance floor and macro recall).  Labels are class identities, so a
+        # duplicate declaration is malformed evidence, not a second class.
+        raise ValueError(f'retrieval_metrics: labels contains duplicate class '
+                         f'identifiers: {labs.tolist()}')
     true_keys = [_hashable_label(v) for v in y.tolist()]
     pred_keys = [_hashable_label(v) for v in p.tolist()]
+    _undeclared = sorted(set(true_keys) - set(_lab_keys), key=repr)
+    if _undeclared:
+        # Accuracy counts every true answer, but per-class support, the
+        # observed-class count and the chance floor only cover the declared
+        # labels.  Silently omitting a true class makes macro recall and the
+        # floor describe a different label space than the accuracy.
+        raise ValueError(
+            f'retrieval_metrics: observed answer label(s) '
+            f'{[repr(v) for v in _undeclared]} are not in the declared labels '
+            f'{labs.tolist()}; include them or pass labels=None')
     support = {}
     correct = {}
     for _t, _p in zip(true_keys, pred_keys):

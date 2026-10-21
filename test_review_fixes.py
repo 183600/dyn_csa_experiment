@@ -4009,6 +4009,21 @@ def t_retrieval_metrics_and_niah_trivial_floor():
     # Mixed label identities must not be merged by NumPy dtype promotion.
     rm2 = L.retrieval_metrics([1, '1'], [1, '1'])
     assert rm2['n_classes'] == 2 and rm2['acc'] == 1.0, rm2
+    # A declared label set must cover every true answer: otherwise accuracy
+    # counts a class that the support/chance/macro-recall computation drops.
+    for _bad in (dict(labels=[0, 1]), dict(labels=[0, 1, 1])):
+        try:
+            L.retrieval_metrics([0, 1, 2], [0, 1, 2], **_bad)
+        except ValueError as e:
+            assert ('not in the declared labels' in str(e)
+                    or 'duplicate class' in str(e)), (e, _bad)
+        else:
+            raise AssertionError(f'malformed declared labels were accepted: {_bad}')
+    # Declared-but-absent labels stay listed with a null recall and do not
+    # change the observed-class chance floor.
+    rake = L.retrieval_metrics([0, 0, 1], [0, 0, 0], labels=[0, 1, 2])
+    assert rake['n_classes'] == 2 and abs(rake['chance_accuracy'] - 0.5) < 1e-12, rake
+    assert rake['per_class_recall']['2'] is None, rake
     # A complete NIAH record is accepted and its floors are recomputed.
     rec = dict(rm, task='niah_natural', nll=1.25, n_queries=rm['n'])
     good = {'n::seed0': rec}
