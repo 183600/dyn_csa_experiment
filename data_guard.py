@@ -525,9 +525,18 @@ def _assert_order_finite(order, *, name='order'):
                     # a perfectly orderable event id; leave the caller's
                     # lexicographic order alone.
                     continue
+                # Exact numeric NaNs (notably Decimal('sNaN')) raise inside
+                # float() instead of returning NaN.  The old ``continue``
+                # treated that as an ordinary orderable key, then the sort
+                # raised decimal.InvalidOperation outside the intended
+                # ValueError contract.  Detect the missing value first.
+                if _numeric_is_nan(value):
+                    raise ValueError(
+                        f'{name} contains NaN/Inf; a temporal split needs a '
+                        'well-defined order')
                 try:
                     f = float(value)
-                except (TypeError, ValueError, OverflowError):
+                except (TypeError, ValueError, ArithmeticError, OverflowError):
                     continue
                 if not math.isfinite(f):
                     raise ValueError(
