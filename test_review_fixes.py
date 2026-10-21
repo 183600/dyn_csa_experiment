@@ -8938,6 +8938,13 @@ def t_exact_numeric_contracts_and_fingerprint():
                                      dtype=object)).tolist() == [False, True]
     assert L.duplicate_mask(np.array([[Fraction(1, 3)], [1 / 3]],
                                      dtype=object)).tolist() == [False, False]
+    # A signaling NaN is still a numeric NaN, not a new categorical value:
+    # duplicate detection must group it with None/NaN rather than keying its
+    # repr as ordinary data.
+    _sn = np.array([[None], [float('nan')], [Decimal('NaN')],
+                    [Decimal('sNaN')]], dtype=object)
+    assert L.duplicate_mask(_sn).tolist() == [False, True, True, True], \
+        L.duplicate_mask(_sn)
     # An exactly representable object value keeps the native float digest
     # (dtype-insensitive fingerprint), while an inexact integer still gets an
     # exact tail.

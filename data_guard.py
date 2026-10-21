@@ -3797,6 +3797,11 @@ def _row_keys(X):
                 # date/datetime/timedelta values that compare equal to a NumPy
                 # temporal scalar.
                 return _temporal_canonical_key(v)
+            if _numeric_is_nan(v):
+                # Decimal('sNaN') raises in float(), so the generic path below
+                # would key it as an ordinary categorical string.  A numeric
+                # NaN of any encoding is the same missing-like value here.
+                return b'Fnan'
             if isinstance(v, (bool, np.bool_)):
                 return b'I' + str(int(v)).encode('ascii')
             if isinstance(v, numbers.Integral):
