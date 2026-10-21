@@ -46,6 +46,7 @@ try:
     import audit_gates as A
     import baseline_tune as BT
     import build_report as BR
+    import error_analysis as EA
     import m0_supp as M0
     _HAVE_TORCH = True
 except Exception as _e:  # pragma: no cover
@@ -484,6 +485,64 @@ def t_paired_errors_use_common_finite_support():
     for t in r['worst_tokens_for_b']:
         assert math.isfinite(t['ce_a']) and math.isfinite(t['ce_b']), t
     assert r['b_worse_at_n'] + r['a_worse_at_n'] <= r['n_paired_finite'], r
+
+
+def t_error_analysis_rejects_bad_token_tables():
+    # The summary says the next-token ids were range-checked; that claim must
+    # be true even when analyze_errors is called directly (not via the CLI).
+    L.set_seed(0)
+    model = L.SmallGPT(32, 16, 1, 2, 8, 8, L.make_layer_cfgs(1, 'full')).eval()
+    bad = np.array([[1, 2, 32, 4]], dtype=np.int64)
+    try:
+        L.analyze_errors(model, bad, 32, torch.device('cpu'), top_tokens=4)
+    except ValueError as e:
+        assert 'out of range' in str(e), e
+    else:
+        raise AssertionError('out-of-vocabulary ids must be refused')
+    frac = np.array([[1.5, 2, 3, 4]], dtype=np.float64)
+    try:
+        L.analyze_errors(model, frac, 32, torch.device('cpu'), top_tokens=4)
+    except TypeError as e:
+        assert 'integer token ids' in str(e), e
+    else:
+        raise AssertionError('float token tables must be refused')
+
+
+def t_error_analysis_paired_none_is_renderable():
+    class _M:
+        def to(self, device):
+            return self
+
+    class _Cfg:
+        pass
+
+    import tempfile as _tf
+    td = _tf.mkdtemp(prefix='err_', dir=REPO)
+    saved = (EA._load_model, EA._sha256, L.load_run_corpus,
+             L.analyze_errors, L.compare_token_errors)
+    try:
+        EA._load_model = lambda path: (_M(), {'vocab': 32, 'd': 16, 'n_layers': 1,
+                                              'n_heads': 2, 'd_head': 8, 'train_len': 8,
+                                              'cfg': [_Cfg()]})
+        EA._sha256 = lambda path: 'deadbeef'
+        vb = np.arange(32, dtype=np.int64).reshape(4, 8) % 32
+        L.load_run_corpus = lambda cfg: (np.arange(64, dtype=np.int64), vb, 32, None, None)
+        L.analyze_errors = lambda *a, **k: {
+            'mean_ce': 1.0, 'pooled_ppl': 2.7, 'buckets': {},
+            'worst_tokens': [], 'worst_sequences': [],
+            'cause_counts': {}, 'cause_counts_all': {}, 'cause_guide': {}}
+        L.compare_token_errors = lambda *a, **k: {
+            'checkpoint_a': 'a', 'checkpoint_b': 'b',
+            'mean_delta_b_minus_a': None, 'n_paired_finite': 0, 'n_tokens': 8,
+            'b_worse_at_n': 0, 'a_worse_at_n': 0, 'worst_tokens_for_b': []}
+        EA.main(['--ckpt', 'a.pt', '--compare-ckpt', 'b.pt', '--outdir', td,
+                 '--max-rows', '4'])
+        txt = open(os.path.join(td, 'bad_cases.md'), encoding='utf-8').read()
+        assert 'n/a' in txt and 'paired finite coverage' in txt, txt
+    finally:
+        (EA._load_model, EA._sha256, L.load_run_corpus,
+         L.analyze_errors, L.compare_token_errors) = saved
+        shutil.rmtree(td, ignore_errors=True)
 
 
 def t_token_error_cause_taxonomy():
@@ -2231,6 +2290,7 @@ def t_review3_evidence_metadata():
     assert 'requirements.txt' in open(os.path.join(REPO, 'archive_release.py'), encoding='utf-8').read(), 'archive must pack the dependency declaration'
     assert 'DECISION_LOG.md' in open(os.path.join(REPO, 'archive_release.py'), encoding='utf-8').read()
     import build_report as BR
+    import error_analysis as EA
     assert BR._sig_gate({'n': 6, 'p_exact_signflip': 0.01, 'p_holm': 0.02, 'mean': 1.0, 'std': 0.5}) is True
     assert BR._sig_gate({'n': 3, 'p_exact_signflip': 0.01, 'p_holm': 0.02, 'mean': 1.0, 'std': 0.5}) is False
     assert BR._sig_gate({'n': 6, 'p_exact_signflip': 0.01, 'p_holm': None, 'mean': 1.0, 'std': 0.5}) is False

@@ -21592,6 +21592,18 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     n_rows, seq = int(vb.shape[0]), int(vb.shape[1])
     span = seq - 1
     V = int(vocab)
+    # The artifact claims the next-token labels were range-checked.  Actually
+    # enforce it here: a float array or an out-of-vocabulary id would either
+    # crash cross_entropy half-way through a long scoring pass or, worse,
+    # produce a partial artifact that looks measured.
+    if not np.issubdtype(vb.dtype, np.integer):
+        raise TypeError(f'analyze_errors needs integer token ids, got dtype {vb.dtype}')
+    try:
+        _min_id, _max_id = int(vb.min()), int(vb.max())
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('analyze_errors could not read the token-id range') from None
+    if _min_id < 0 or _max_id >= V:
+        raise ValueError(f'analyze_errors token ids out of range [{_min_id}, {_max_id}] for vocab {V}')
     # A negative token budget asks torch.topk for a negative k; zero is a
     # valid "inventory only the whole-split tally" request.
     _top_tokens = _exact_count(top_tokens, minimum=0)
@@ -21857,6 +21869,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                         'mean': (sum(ent_vals) / len(ent_vals) if ent_vals else None)},
             'tokenizer_available': tok is not None,
             'label_check': {'next_token_shift': 'target = ids[t+1]; checked range [0, vocab) before scoring',
+                            'range_checked': True, 'min_id': _min_id, 'max_id': _max_id,
                             'n_targets': int(n_targets), 'n_out_of_range': 0}}
 
 

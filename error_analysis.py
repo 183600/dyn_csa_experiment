@@ -17,6 +17,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -194,9 +195,18 @@ def main(argv=None):
         ctx = (s.get('context') or '').replace('|', '\\|').replace('\n', ' ')[:240]
         lines.append(f'| {i + 1} | {s["row"]} | {s["mean_ce"]:.3f} | {s["nll"]:.2f} | {ctx} |')
     if paired:
+        _md = paired.get('mean_delta_b_minus_a')
+        _npf = paired.get('n_paired_finite')
+        _ntot = paired.get('n_tokens')
+        _cov = (f'{_npf}/{_ntot} positions ({100.0 * _npf / _ntot:.1f}%)'
+                if (isinstance(_npf, int) and isinstance(_ntot, int) and _ntot > 0) else 'n/a')
+        _md_txt = (f'**{_md:+.4f}**' if isinstance(_md, (int, float)) and math.isfinite(_md)
+                   else '**n/a — no position is finite in both arms**')
         lines += ['', '## Paired arm comparison', '',
-                  f'- B `{paired.get("checkpoint_b")}` minus A `{paired.get("checkpoint_a")}` mean CE: **{paired.get("mean_delta_b_minus_a"):+.4f}**',
+                  f'- paired finite coverage: {_cov}',
+                  f'- B `{paired.get("checkpoint_b")}` minus A `{paired.get("checkpoint_a")}` mean CE: {_md_txt}',
                   f'- B worse at {paired.get("b_worse_at_n")} token positions; A worse at {paired.get("a_worse_at_n")}.', '',
+                  '> Only positions finite in BOTH checkpoints enter the paired delta. Per-arm non-finite counts are in `paired_errors.json`; a low coverage means the delta describes a small common support, not the whole split.', '',
                   '| # | row | pos | target | CE A | CE B | delta (B−A) |', '|---|---|---|---|---|---|---|']
         for i, t in enumerate(paired.get('worst_tokens_for_b') or []):
             tg = (t.get('target_text') or '').replace('|', '\\|').replace('\n', '\\n')[:60]
