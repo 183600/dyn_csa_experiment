@@ -2004,6 +2004,14 @@ def _target_key(value):
             'ascii', 'backslashreplace')
     if isinstance(value, (bool, np.bool_)):
         return 'i:' + str(int(value))
+    if isinstance(value, _decimal.Decimal):
+        # Decimal is a numbers.Number but not a numbers.Real/float, and
+        # Fraction(Decimal('Infinity')) raises, so infinities used to fall
+        # through to a type-qualified repr.  Python considers
+        # Decimal('Infinity') == float('inf'), so both spellings must share
+        # the same level identity (same as the generic float path below).
+        if value.is_infinite():
+            return 'f:+inf' if value > 0 else 'f:-inf'
     if isinstance(value, numbers.Integral):
         return 'i:' + str(int(value))
     if isinstance(value, (complex, np.complexfloating)):

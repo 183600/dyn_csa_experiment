@@ -10196,6 +10196,10 @@ def t_exact_numeric_contracts_and_fingerprint():
     assert DG._label_key(Decimal('2')) == Decimal('2')
     assert DG._group_key(Decimal('NaN')) == ('__nan__',)
     assert DG._group_key(Decimal('sNaN')) == ('__nan__',)
+    # Decimal('Infinity') equals float('inf') in Python; both must be one
+    # category identity instead of falling through to a Decimal-specific repr.
+    assert DG._target_key(Decimal('Infinity')) == DG._target_key(float('inf'))
+    assert DG._target_key(Decimal('-Infinity')) == DG._target_key(float('-inf'))
     # The digest is a content identity, not a function of the row-block size.
     # Exact-row tails used to be appended immediately after their block, so
     # changing the memory cap interleaved them differently and silently
