@@ -12093,6 +12093,25 @@ def t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields():
         G.merge_long_aggregate(d, ['not', 'a', 'mapping'])
         out = json.load(open(os.path.join(d, 'aggregate.json')))
         assert out['full']['ppls'] == [2.0], out
+    # A malformed aggregate ENTRY (valid JSON, non-object value) must be
+    # skipped by the synthesizer instead of crashing on `.get`.
+    with tempfile.TemporaryDirectory() as d:
+        _old_repo = G.REPO
+        G.REPO = d
+        try:
+            _panel = os.path.join(d, 'results_lm_v3_long')
+            os.makedirs(_panel)
+            _tok = (G._LONG_STEPS * int(G.L.RUN_LONG['batch_size'])
+                    * int(G.L.RUN_LONG['seq_len']))
+            json.dump({'bad': [1, 2],
+                       'full': {'seeds': [0], 'ppls': [2.0],
+                                'tokens_seen': _tok}},
+                      open(os.path.join(_panel, 'aggregate.json'), 'w'))
+            _sum, _agg = G.synthesize_long_summary()
+            _out = json.load(open(os.path.join(_panel, 'summary.json')))
+            assert 'full::seed0' in _out and 'bad' not in ' '.join(_out), _out
+        finally:
+            G.REPO = _old_repo
 
 
 

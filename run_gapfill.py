@@ -191,6 +191,7 @@ def synthesize_long_summary():
     _unaligned = []
     _split = []
     _cfg_refused = []
+    _malformed = []
 
     def _canon(v, e):
         if '@' in str(v):
@@ -201,6 +202,12 @@ def synthesize_long_summary():
         _proto = e.get('protocol') if isinstance(e, dict) else None
         return (real_v, str(_proto) if _proto else None)
     for v, e in agg.items():
+        if not isinstance(e, dict):
+            _malformed.append(v)
+            print(f'[synth] REFUSING to synthesize `{v}`: the aggregate entry '
+                  f'is a {type(e).__name__}, not an object — re-run the panel '
+                  'to get a valid aggregate; only this key is skipped')
+            continue
         _ppls = e.get('ppls') or []
         _seeds = e.get('seeds')
         if not _ppls:
@@ -240,7 +247,8 @@ def synthesize_long_summary():
             print(f"[synth] REFUSING to synthesize `{_v}`: the aggregate holds {_n} PPL value(s) but carries no verified seed->ppl mapping (real per-seed records at seeds {_real}).  `enumerate` would attach the wrong seed's number to each key, replacing a genuine measurement with a copy.  Restore the per-seed records (or re-run the panel) — only this variant is skipped; the aligned variants are still rebuilt.")
     for _v in _split:
         print(f'[synth] REFUSING to synthesize `{_v}`: this aggregate key is a run_cfg-split group, so it cannot be mapped back to one canonical per-seed record — re-run the panel to get per-seed records; only this key is skipped')
-    _unaligned = {v for v, _n, _r in _unaligned} | set(_split) | set(_cfg_refused)
+    _unaligned = ({v for v, _n, _r in _unaligned} | set(_split)
+                  | set(_cfg_refused) | set(_malformed))
     # Group the real (non-synthesized, usable, full-steps) records by
     # (variant, protocol, seed) once, then each reconstructed value only walks
     # its own bucket with the identical match conditions.
