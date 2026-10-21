@@ -14889,6 +14889,11 @@ def niah_copy_rule_baseline(ids, query_cols, answer_ids, *, target):
     if qc.shape[0] != n_seq:
         raise ValueError('niah_copy_rule_baseline: ids and query_cols disagree on sequence count')
     eval_len = int(n_tokens) - 1
+    if int(_target) > eval_len:
+        raise ValueError(
+            f'niah_copy_rule_baseline: target={int(_target)} exceeds the '
+            f'{eval_len} scored input position(s); the query offset would be '
+            'outside the evaluated sequence')
     tail_start = eval_len - int(_target)
     preds = []
     missing = 0

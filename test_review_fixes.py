@@ -4242,6 +4242,15 @@ def t_retrieval_metrics_and_niah_trivial_floor():
         np.array([[1, 2, 3, 4, 7, 9]]), np.array([[1]]), np.array([[9]]),
         target=4)
     assert _no_ctx['acc'] == 0.0 and _no_ctx['n_missing_context'] == 1, _no_ctx
+    # A target zone wider than the scored inputs cannot define a query offset;
+    # it must fail closed instead of silently marking every query as missing.
+    try:
+        L.niah_copy_rule_baseline(_ids, np.array([[3]]), np.array([[9]]),
+                                  target=_ids.shape[1])
+    except ValueError as e:
+        assert 'exceeds' in str(e), e
+    else:
+        raise AssertionError('a copy-rule target beyond the sequence must be refused')
     # Mixed label identities must not be merged by NumPy dtype promotion.
     rm2 = L.retrieval_metrics([1, '1'], [1, '1'])
     assert rm2['n_classes'] == 2 and rm2['acc'] == 1.0, rm2
