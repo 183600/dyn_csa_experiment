@@ -261,13 +261,17 @@ def _curve_slope_stats(points, key, k=4):
     for p in (points if points is not None else []):
         if not isinstance(p, dict):
             continue
+        # Use the same evaluation identity as best-step/early-stop selection:
+        # Boolean and fractional steps are not two neighboring eval points.
+        step = _as_seed_int(p.get('step'))
+        if step is None:
+            continue
         try:
-            x = float(p.get('step'))
             y = float(p.get(key))
         except (TypeError, ValueError, OverflowError):
             continue
-        if math.isfinite(x) and math.isfinite(y):
-            by_step[x] = y
+        if math.isfinite(y):
+            by_step[float(step)] = y
     pts = sorted(by_step.items())[-max(2, int(k)):]
     if len(pts) < 2:
         return None, None

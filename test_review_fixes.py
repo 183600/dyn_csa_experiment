@@ -398,6 +398,16 @@ def t_health_accepts_val_ce_only_and_orders_steps():
     assert any('only 2 validation evaluation point' in a for a in short['actions']), short
     assert h['trend_reliable'] is True, h
 
+    # Fractional/Boolean steps are not evaluation identities: they must not
+    # enter the slope fit while best-step selection rejects them.
+    weird = [{'step': 0, 'train_ce': 5.0, 'val_ce': 4.0},
+             {'step': True, 'train_ce': 1.0, 'val_ce': 1.0},
+             {'step': 100.5, 'train_ce': 1.0, 'val_ce': 1.0},
+             {'step': 200, 'train_ce': 4.0, 'val_ce': 4.2}]
+    hw = L.classify_training_health(weird)
+    assert hw['n_eval_points'] == 2 and hw['best_step'] == 0, hw
+    assert hw['train_ce_slope_per_step'] == -0.005, hw
+
 
 def t_early_stop_decision():
     hist = [{'step': 100, 'val_ppl': 50.0}, {'step': 200, 'val_ppl': 48.0}]
