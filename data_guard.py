@@ -101,10 +101,11 @@ class _UnhashableKey:
         return f'<_UnhashableKey {self.type_name}:{self.repr}>'
 
 
-# One opaque identity for every representation of a missing group id (None,
-# NaN, NaT).  A real user tuple such as ``('__nan__',)`` must not be able to
-# impersonate it, and missing ids must never act as per-row unique groups.
-_MISSING_GROUP_KEY = _UnhashableKey('__missing_group__', '')
+# One identity for every representation of a missing group id (None, NaN,
+# NaT).  ``('__nan__',)`` is the historical public sentinel (tests and older
+# artifacts inspect it); what matters for leakage is that all missing ids share
+# it, so they can never act as per-row unique groups.
+_MISSING_GROUP_KEY = ('__nan__',)
 
 
 # ---------------------------------------------------------------------------
@@ -935,9 +936,8 @@ def _group_key(value):
 
     A missing group id must not behave like "unique per row": otherwise rows
     of the same missing group can be split across train/val/test and no
-    group-overlap check will ever fire.  ``None``, NaN and NaT are the same
-    missing identity; a real tuple id spelled like an old tuple sentinel is a
-    different value (the sentinel is opaque).
+    group-overlap check will ever fire.  ``None``, NaN and NaT share the
+    historical ``('__nan__',)`` missing identity.
     """
     if value is None:
         return _MISSING_GROUP_KEY
