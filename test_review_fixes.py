@@ -2726,6 +2726,17 @@ def t_review3_span_clean_key():
     assert 'span_len' not in clean and clean['n_seq'] == 16, clean
     assert pp['span_len'] == 32, 'the measured cell must keep span_len'
 
+def t_key_exploratory_phases_declare_at_least_three_seeds():
+    # Prospective seed plan: the top-k sweep and length-extrapolation panels
+    # are key exploratory comparisons, so a 2-seed plan is not enough even for
+    # a descriptive mean±std.  (Other phases inherit >=3 seeds from their cfg.)
+    by_name = {p[0]: p for p in V7.PHASES}
+    for _name in ('P1T', 'P0E'):
+        _payload = by_name[_name][2]
+        _seeds = _payload.get('seeds') or (_payload.get('cfg') or {}).get('seeds')
+        assert _seeds is not None and len(set(_seeds)) >= 3, (_name, _seeds)
+
+
 def t_v10_holm_family_keeps_unmeasured_slots():
     # A missing/non-finite p is a dummy p=1 slot, not a deleted comparison:
     # dropping it would shrink m and overstate the remaining tests' power.
@@ -12878,6 +12889,7 @@ def main():
     _check('J4b declared objective ablations are not confounds', t_objective_ablation_is_declared_not_a_confound)
     _check('J5 span clean-baseline key', t_review3_span_clean_key)
     _check('J5a v10 Holm keeps declared unmeasured slots', t_v10_holm_family_keeps_unmeasured_slots)
+    _check('J5b key exploratory phases declare >=3 seeds', t_key_exploratory_phases_declare_at_least_three_seeds)
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E1c seed contract inventories every CUDA device', t_seed_contract_cuda_device_inventory)
     _check('E1d CPU strict determinism is labelled', t_determinism_label_cpu_strict)
