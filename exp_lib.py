@@ -11047,6 +11047,15 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     # (n=1 has no se).  Reading this list only from `usable` silently dropped
     # exactly those points.
     _underpowered_points = [r['label'] for r in per if r.get('underpowered')]
+    # A fully shared ladder can have a paired common-effect estimate that is
+    # itself underpowered even when every individual scale has n>=min_seeds
+    # (only two seeds happen to be measured at EVERY scale).  The pairwise
+    # dependence then rests on a smaller paired sample than the per-scale n
+    # suggests, so the pooled claim must not be certified by the larger n.
+    _paired_common_underpowered = bool(
+        out.get('seed_dependence') == 'shared_seeds_paired'
+        and isinstance(_paired_common, dict)
+        and _paired_common.get('underpowered') is True)
     out.update({'fixed_effect': {'mean': mu_fe, 'se': float(math.sqrt(1.0 / sw)), 'ci': [mu_fe - _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw), mu_fe + _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw)]},
                 'random_effects': {'mean': mu_re, 'se': se_re, 'ci': [mu_re - tc * se_re, mu_re + tc * se_re]},
                 'heterogeneity': {'Q': q, 'df': int(df), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
@@ -11065,13 +11074,17 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                                  # paired draws, and undeclared seed identities
                                  # cannot be assumed independent.
                                  and out.get('seed_dependence') in
-                                     ('shared_seeds_paired', 'disjoint_seed_sets')),
+                                     ('shared_seeds_paired', 'disjoint_seed_sets')
+                                 and not _paired_common_underpowered),
                 'note': ('poolable requires >=3 scales, every included scale at n>=min_seeds '
                          'with a complete paired panel (no dropped/absent seeds) and non-zero '
                          'within-scale variance, '
                          'I2<=50% and a non-significant Q; otherwise report per-scale effects only'
                          + (('; underpowered scale point(s): ' + ', '.join(map(str, _underpowered_points)))
                             if _underpowered_points else '')
+                         + (('; the paired common-effect estimate has only '
+                             f'{_paired_common.get("n")} complete seed(s) < min_seeds={int(min_seeds)}')
+                            if _paired_common_underpowered else '')
                          + (('; incomplete paired panel at: ' + ', '.join(map(str, _incomplete))
                              + ' (a complete-case subset can be biased by which seeds failed)')
                             if _incomplete else '')

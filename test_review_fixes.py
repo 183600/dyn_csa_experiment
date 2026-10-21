@@ -10224,6 +10224,18 @@ def t_meta_seed_overlap_controls_pooling():
     mn = L.meta_analyze_effects(nearzero)
     assert 'S0' in mn['zero_variance_points'], mn
     assert mn['n_usable'] == 2 and mn['poolable'] is False, mn
+    # Every scale may have n>=min_seeds while only two seeds are measured at
+    # EVERY scale; the paired dependence then has less resolution than the
+    # per-scale n suggests and must block the pooled claim.
+    shared2 = [_pt('S0', 1, [0, 1, 2, 3, 4, 5], eff + [0.5, 0.6]),
+               _pt('S1', 10, [0, 1, 6, 7, 8, 9], eff + [0.5, 0.6]),
+               _pt('S2', 100, [0, 1, 10, 11, 12, 13], eff + [0.5, 0.6])]
+    ms = L.meta_analyze_effects(shared2, min_seeds=3)
+    assert ms['seed_dependence'] == 'shared_seeds_paired', ms
+    assert ms['paired_common_effect']['n'] == 2, ms['paired_common_effect']
+    assert ms['paired_common_effect']['underpowered'] is True, ms['paired_common_effect']
+    assert ms['poolable'] is False, ms
+    assert 'complete seed' in ms['note'], ms['note']
 
 
 def t_preprocessing_fit_audit_detects_full_table_leak():
