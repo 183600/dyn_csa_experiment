@@ -2300,7 +2300,10 @@ class LeakageSafeTargetEncoder:
         values = y[rows]
         finite = np.isfinite(values)
         if finite.any():
-            prior = float(np.mean(values[finite]))
+            # ``_safe_mean`` first tries the ordinary mean (so normal data is
+            # bit-identical) and only falls back to a max-scaled sum when the
+            # finite labels are near float64's limit.
+            prior = _safe_mean(values[finite])
         else:
             prior = 0.0
         stats = []
@@ -2324,6 +2327,27 @@ class LeakageSafeTargetEncoder:
                                / (count + self.smoothing))
                 else:
                     encoded = total / count
+                if not math.isfinite(encoded):
+                    # The running total overflowed even though every label is
+                    # finite.  Recompute this level's mean from its own values
+                    # in max-scaled space so the emitted target feature stays
+                    # finite and the persisted table can be reloaded.
+                    _vals = [float(y[i]) for i in rows.tolist()
+                             if math.isfinite(float(y[i]))
+                             and _target_key(col[i]) == key]
+                    _mean = _safe_mean(np.asarray(_vals, dtype=np.float64))
+                    if self.smoothing > 0.0:
+                        _scale = max(abs(_mean), abs(prior))
+                        if _scale > 0.0 and math.isfinite(_scale):
+                            encoded = (((count * (_mean / _scale))
+                                        + self.smoothing * (prior / _scale))
+                                       / (count + self.smoothing)) * _scale
+                        else:
+                            encoded = _mean
+                    else:
+                        encoded = _mean
+                    if not math.isfinite(encoded):
+                        encoded = _mean if math.isfinite(_mean) else 0.0
                 out[key] = float(encoded)
             stats.append({'lookup': out, 'prior': float(prior),
                           'n_reference_rows': int(rows.size),
@@ -2347,7 +2371,7 @@ class LeakageSafeTargetEncoder:
             Xarr, yarr, np.arange(n, dtype=np.int64))
         self.n_features_in_ = int(p)
         self.n_train_ = int(n)
-        self.prior_ = float(np.mean(yarr[np.isfinite(yarr)]))
+        self.prior_ = _safe_mean(yarr[np.isfinite(yarr)])
         self.train_fp_ = _categorical_fingerprint(Xarr)
         self.train_row_set_fp_ = _categorical_row_set_fingerprint(Xarr)
         self.fitted_ = True
