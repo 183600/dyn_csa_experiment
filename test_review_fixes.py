@@ -2320,6 +2320,24 @@ def t_eval_per_seq():
         assert 'ppl_per_seq' in cell and len(cell['ppl_per_seq']) == 3, 'per-document rows must be recorded'
         geo = math.exp(sum(math.log(p) for p in cell['ppl_per_seq']) / 3.0)
         assert abs(geo - cell['ppl']) / cell['ppl'] < 1e-6, f'pooled ppl must equal the geometric mean of per-seq ppl at L{Ln} (reduction-invariance)'
+        # eval_span is the SCORED target span (L-1), the same denominator the
+        # by-length audit and n_tok use.  Reporting the input width L here
+        # made the cell metadata contradict its own token count.
+        assert cell['eval_span'] == Ln - 1, (Ln, cell['eval_span'])
+        assert cell['n_tok'] == cell['n_seq'] * cell['eval_span'], cell
+    # Two over-long requests can truncate to the SAME token slice.  The cache
+    # reuse must carry the per-document accounting, not silently return a cell
+    # that is missing n_seq/ppl_per_seq just because another length populated
+    # the cache first.
+    trunc = V7.eval_length_gen(model, ids, [48, 64], dev, max_pos=32)
+    for Ln in (48, 64):
+        cell = trunc[Ln]
+        assert cell['truncated'] is True, (Ln, cell)
+        assert cell['eval_span'] == 31, (Ln, cell['eval_span'])
+        assert cell['n_seq'] == 3 and len(cell['ppl_per_seq']) == 3, (Ln, cell)
+        assert cell['n_tok'] == 3 * 31, (Ln, cell['n_tok'])
+        geo = math.exp(sum(math.log(p) for p in cell['ppl_per_seq']) / 3.0)
+        assert abs(geo - cell['ppl']) / cell['ppl'] < 1e-6, (Ln, geo, cell['ppl'])
     # The sampled path must credit per-document stats to the GLOBAL row, not
     # to a chunk-local row.  With chunk=1 and most targets sampled, a broken
     # offset would pile almost every token onto row 0.
@@ -7741,6 +7759,23 @@ def t_audit_length_missing_truncated_flag():
         finally:
             A._load = _old_load
         assert rb['status'] == 'fail' and any('n_seq*(L-1)' in x for x in rb['problems']), rb
+        # A full-length cell must report the SCORED span L-1, not the input
+        # width L: otherwise every arm can agree on an eval_span that its own
+        # token denominator contradicts.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'ppl': 30.0, 'n_tok': 16 * 4095, 'eval_span': 4096,
+                'truncated': False, 'n_seq': 16}}}}, f)
+        rs = A.audit_length(p)
+        assert rs['status'] == 'fail' and any('eval_span=4096' in x for x in rs['problems']), rs
+        # A truncated cell's token count is n_seq * its scored span, not
+        # n_seq * (L-1); a silently shortened slice must be named.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'ppl': 30.0, 'n_tok': 16 * 4095, 'eval_span': 2048,
+                'truncated': True, 'n_seq': 16}}}}, f)
+        rt = A.audit_length(p)
+        assert rt['status'] == 'fail' and any('n_seq*eval_span' in x for x in rt['problems']), rt
     finally:
         shutil.rmtree(td, ignore_errors=True)
 

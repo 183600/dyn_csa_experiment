@@ -1436,6 +1436,30 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             _es = _exact_int(c.get('eval_span'))
             if _es is not None and _es <= 0:
                 problems.append(f'{key}: L{Ln} eval_span={_es} is not positive')
+            # `eval_span` is the number of SCORED targets per row, so it must
+            # agree with both the requested length and the token denominator.
+            # Checking only cross-record consistency let every arm agree on a
+            # wrong span while the n_tok formula happened to use L-1.
+            if (isinstance(_trunc, (bool, np.bool_)) and not bool(_trunc)
+                    and _es is not None and Ln >= 2 and _es != Ln - 1):
+                problems.append(
+                    f'{key}: L{Ln} eval_span={_es} != L-1={Ln - 1} — a '
+                    'full-length cell must score one next-token target per '
+                    'input position after the first')
+            if (isinstance(_trunc, (bool, np.bool_)) and bool(_trunc)
+                    and _es is not None):
+                if _es > max(0, Ln - 1):
+                    problems.append(
+                        f'{key}: L{Ln} eval_span={_es} exceeds L-1={Ln - 1} — '
+                        'a truncated cell cannot have scored more targets than '
+                        'the requested length')
+                if _ns is not None and _nt is not None and _es > 0:
+                    _expected = _ns * _es
+                    if _nt != _expected:
+                        problems.append(
+                            f'{key}: L{Ln} n_tok={_nt} != n_seq*eval_span='
+                            f'{_expected} — the truncated cell did not score '
+                            'the declared number of targets per row')
             if 'truncated' not in c:
                 problems.append(f'{key}: L{Ln} cell has NO `truncated` flag — a missing truncation marker is treated as unverifiable, not as a full-length measurement')
             elif not isinstance(c.get('truncated'), (bool, np.bool_)):

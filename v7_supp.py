@@ -2317,7 +2317,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                 _t = float(_cum[:, Ln - 2].sum()) if Ln >= 2 else 0.0
                 _ntok = int(ids.shape[0]) * (Ln - 1)
                 ppl = L._safe_exp_ppl(_t / max(_ntok, 1))
-                out[Ln] = {'ppl': float(ppl), 'n_tok': _ntok, 'n_tokens': _ntok, 'truncated': False, 'eval_span': Ln,
+                out[Ln] = {'ppl': float(ppl), 'n_tok': _ntok, 'n_tokens': _ntok, 'truncated': False, 'eval_span': (Ln - 1),
                            'nll_sum': float(_t),
                            'nll_per_seq': [float(v) for v in _cum[:, Ln - 2].tolist()],
                            'n_seq': int(ids.shape[0])}
@@ -2347,7 +2347,13 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                 if 'error' in _cached:
                     out[Ln] = {'error': _cached['error']}
                 else:
-                    out[Ln] = {'ppl': _cached['ppl'], 'n_tok': _cached['n_tok'], 'truncated': trunc, 'eval_span': _cached['eval_span']}
+                    # Reuse the WHOLE cell: the per-document accounting and
+                    # n_seq describe the same (start, end) slice, so dropping
+                    # them here would make one length look measured but
+                    # unverifiable simply because another length hit the cache
+                    # first.
+                    out[Ln] = dict(_cached)
+                    out[Ln]['truncated'] = bool(trunc)
                 continue
             ids = np.asarray(val_ids[:n_seq, :Ln], dtype=np.int64)
             if trunc:
@@ -2355,6 +2361,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
             try:
                 x = L._h2d_async(ids, torch.int64, device)
                 nll, ntok = (torch.zeros((), dtype=torch.float64, device=device), 0)
+                _row_nll = []
                 _r, _chunk = (0, int(ids.shape[0]))
                 while _r < int(ids.shape[0]):
                     _sub = x[_r:_r + _chunk]
@@ -2373,13 +2380,25 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                     _nll_rows = _head_ce_none(_h, _sub[:, 1:], int(_sub.shape[0]), int(_sub.shape[1]) - 1)
                     nll += _nll_rows.sum().double()
                     ntok += int(_sub[:, 1:].numel())
+                    _row_nll.append(_nll_rows.sum(dim=1, dtype=torch.float64))
                     del _h, _nll_rows
                     _r += _chunk
                 ppl = L._safe_exp_ppl(float(nll) / max(ntok, 1))
-                _ev_span = int(x.shape[1])
-                out[Ln] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc, 'eval_span': _ev_span}
-                _trunc_cache[_key] = {'ppl': float(ppl), 'n_tok': ntok, 'eval_span': _ev_span}
-                del x
+                # `eval_span` is the number of SCORED next-token targets per
+                # row (input span - 1), matching n_tok and the by-length
+                # audit.  It is not the input width: that off-by-one made the
+                # cell metadata disagree with its own token denominator.
+                _ev_span = max(0, int(x.shape[1]) - 1)
+                _seq_nll = ([float(v) for v in torch.cat(_row_nll).tolist()]
+                            if _row_nll else [])
+                _seq_ppl = ([float(L._safe_exp_ppl(v / _ev_span)) for v in _seq_nll]
+                            if _ev_span > 0 else [])
+                out[Ln] = {'ppl': float(ppl), 'n_tok': ntok, 'truncated': trunc,
+                           'eval_span': _ev_span, 'nll_sum': float(nll),
+                           'nll_per_seq': _seq_nll, 'ppl_per_seq': _seq_ppl,
+                           'n_seq': int(x.shape[0])}
+                _trunc_cache[_key] = dict(out[Ln])
+                del x, _row_nll
             except Exception as e:
                 _err = f'{type(e).__name__}: {e}'
                 out[Ln] = {'error': _err}
