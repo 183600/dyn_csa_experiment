@@ -13964,6 +13964,27 @@ def t_metric_audit_recommended_availability_and_exact_floor_support():
         'pr_auc_micro_chance' in w for w in rm['warnings']), rm
 
 
+def t_build_report_malformed_panel_is_excluded():
+    import build_report as BR
+    td = tempfile.mkdtemp(prefix='br_shape_')
+    old_repo = BR.REPO
+    old_loaded = BR._LOADED
+    try:
+        BR.REPO = td
+        BR._LOADED = {}
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump([{'variant': 'a', 'seed': 0, 'ppl': 1.0}], f)
+        with open(os.path.join(td, 'aggregate.json'), 'w', encoding='utf-8') as f:
+            json.dump('not an aggregate', f)
+        assert BR.summary(td) == {}
+        assert BR.agg(td) == {}
+        assert BR.per_seed_records(td) == {}
+        assert BR._legacy_warm_tags_cached(td) == {}
+    finally:
+        BR.REPO = old_repo
+        BR._LOADED = old_loaded
+        shutil.rmtree(td, ignore_errors=True)
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -14317,6 +14338,7 @@ def main():
     _check('L51c recommended endpoint availability + exact floor support', t_metric_audit_recommended_availability_and_exact_floor_support)
     _check('L52 simple-baseline floor identity/rows bind their evidence', t_simple_baseline_bound_floor_identity_and_rows)
     _check('L53 v12 malformed manifest/lock fail closed', t_v12_malformed_manifest_and_lock_fail_closed)
+    _check('L54 build report excludes malformed panel objects', t_build_report_malformed_panel_is_excluded)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

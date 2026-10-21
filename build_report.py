@@ -51,16 +51,34 @@ def load(path, default=None):
         # 发布（进入 main 的 failed 列表），而不是伪装成「（无结果）」。
         raise RuntimeError(f'{path} exists but cannot be parsed ({type(_e).__name__}: {_e}); refusing to build a report over corrupt data — repair or remove the file') from _e
 
+def _panel_object(path, value, kind):
+    """A panel artifact must be a cell -> record object.
+
+    A valid-JSON list/string used to flow into ``.items()`` in later sections
+    (per_seed_records, curve readers) and abort the whole report.  Excluding
+    the malformed panel with a warning is the same contract as the exp_lib
+    readers.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        print(f'[report] WARNING: {path} is a {type(value).__name__}, not a '
+              f'JSON object — this {kind} is EXCLUDED')
+        return {}
+    return value
+
 def agg(outdir):
     key = ('agg', outdir)
     if key not in _LOADED:
-        _LOADED[key] = load(os.path.join(REPO, outdir, 'aggregate.json'), {}) or {}
+        path = os.path.join(REPO, outdir, 'aggregate.json')
+        _LOADED[key] = _panel_object(path, load(path, {}), 'aggregate')
     return _LOADED[key]
 
 def summary(outdir):
     key = ('summary', outdir)
     if key not in _LOADED:
-        _LOADED[key] = load(os.path.join(REPO, outdir, 'summary.json'), {}) or {}
+        path = os.path.join(REPO, outdir, 'summary.json')
+        _LOADED[key] = _panel_object(path, load(path, {}), 'panel')
     return _LOADED[key]
 
 def fm(x, nd=2):
