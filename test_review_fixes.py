@@ -2517,6 +2517,20 @@ def t_nested_primary_paired_deltas():
     assert mixed_agg['ppl_primary_estimand'] == 'full_validation_fallback', mixed_agg
     assert abs(mixed_agg['ppl_mean'] - 15.0) < 1e-12, mixed_agg
     assert abs(mixed_agg['ppl_pooled'] - _want_pool) < 1e-12, mixed_agg
+    # A pair itself must not subtract a full-validation PPL from a holdout PPL.
+    assert L._paired_primary_delta(mixed_full, mixed_nested) is None
+    # Nor may a contrast average deltas from different estimands across seeds.
+    mixed_summary = {
+        'a::seed0': dict(mixed_full, variant='a'),
+        'b::seed0': dict(mixed_full, variant='b', ppl=12.0),
+        'a::seed1': dict(mixed_nested, variant='a'),
+        'b::seed1': dict(mixed_nested, variant='b', ppl_holdout=31.0),
+    }
+    _recs, _amb = L._variant_seed_map(mixed_summary)
+    _md = L._paired_seed_deltas(_recs, 'a', 'b')
+    _deltas, _seeds, _skipped = _md[('', '')]
+    assert _deltas == [] and len(_skipped) == 2, _md
+    assert all('mixed estimands' in why for _s, why in _skipped), _md
 
 
 def t_combined_seed_doc_uncertainty():

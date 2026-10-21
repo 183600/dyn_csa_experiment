@@ -17564,6 +17564,7 @@ def _paired_seed_deltas(recs, a, b, *, strict_hyper=False):
     for ts, bs in conds:
         seeds = sorted({s for t, s in ra if t == ts} & {s for t, s in rb if t == bs})
         deltas, skipped = [], []
+        _estimands = set()
         for s in seeds:
             reason = pair_reason(ra[ts, s], rb[bs, s])
             if reason is None and strict_hyper:
@@ -17573,9 +17574,21 @@ def _paired_seed_deltas(recs, a, b, *, strict_hyper=False):
                 continue
             _delta = _paired_primary_delta(ra[ts, s], rb[bs, s])
             if _delta is None:
-                skipped.append((s, 'primary estimand missing (nested record without holdout PPL/NLL accounting)'))
+                skipped.append((s, 'primary estimand missing/mismatched (nested vs '
+                                      'full-validation rows, or no holdout accounting)'))
                 continue
+            _estimands.add(
+                ra[ts, s].get('ppl_estimation_rows') == 'nested_validation_holdout')
             deltas.append(_delta)
+        if len(_estimands) > 1:
+            # Each seed is internally paired, but the deltas come from two
+            # different samples (holdout vs full validation).  Their mean/p
+            # would describe neither estimand.
+            out[(ts, bs)] = ([], seeds,
+                             [(s, 'mixed estimands across seeds (some pairs are '
+                                  'nested-holdout, others full-validation)')
+                              for s in seeds])
+            continue
         out[(ts, bs)] = (deltas, seeds, skipped)
     return out
 
@@ -18815,23 +18828,35 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         _recs_sorted = [_by_seed[s] for s in sorted(_by_seed)]
         _primary = [_record_primary_ppl(r) for r in _recs_sorted]
         _miss = sum(v is None for v in _primary)
-        if _miss:
+        _nested_flags = {r.get('ppl_estimation_rows') == 'nested_validation_holdout'
+                         for r in _recs_sorted}
+        _mixed_estimands = len(_nested_flags) > 1
+        if _mixed_estimands:
+            report['warnings'].append(
+                '%s: records mix nested-holdout and full-validation estimands; '
+                'the arm summary falls back to full-validation PPL for the whole '
+                'arm instead of averaging two different samples'
+                % (v if not t else f'{v}::{t}'))
+        if _miss or _mixed_estimands:
             # Same fail-visible convention as aggregate: one sample for the
             # whole arm, explicitly labelled, rather than mixing holdout and
             # full-validation rows within one mean.
             _vals = [float(r['ppl']) for r in _recs_sorted]
             _estimand = 'full_validation_fallback'
-            report['warnings'].append(
-                '%s: %d/%d record(s) declare the nested estimand but lack '
-                'holdout accounting; arm summary falls back to full-validation '
-                'PPL for the whole arm' % (v if not t else f'{v}::{t}',
-                                           _miss, len(_recs_sorted)))
+            if _miss and not _mixed_estimands:
+                report['warnings'].append(
+                    '%s: %d/%d record(s) declare the nested estimand but lack '
+                    'holdout accounting; arm summary falls back to full-validation '
+                    'PPL for the whole arm' % (v if not t else f'{v}::{t}',
+                                               _miss, len(_recs_sorted)))
+            _pooled, _nll_tot, _ntok_tot = _pooled_ppl_from_records(
+                _recs_sorted, estimand=False)
         else:
             _vals = [float(x) for x in _primary]
             _estimand = ('nested_validation_holdout'
-                         if any(r.get('ppl_estimation_rows') == 'nested_validation_holdout'
-                                for r in _recs_sorted)
+                         if _nested_flags
                          else 'full_validation')
+            _pooled, _nll_tot, _ntok_tot = _pooled_ppl_from_records(_recs_sorted)
         _key = v if not t else '%s::%s' % (v, t)
         if _base_counts.get((v, t), 0) > 1:
             _idx = _base_seen.get((v, t), 0)
@@ -18840,7 +18865,6 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             report['warnings'].append(
                 '%s: records span different validation slices; arm summary is '
                 'split by slice instead of pooling different documents' % _key)
-        _pooled, _nll_tot, _ntok_tot = _pooled_ppl_from_records(_recs_sorted)
         report['arm_summary'][_key] = {
             'variant': v, 'protocol': t, 'n_seeds': len(_vals),
             'seeds': sorted(_by_seed),
@@ -25329,7 +25353,15 @@ def _paired_primary_delta(rec_a, rec_b):
     Every paired display/test in this module must use this helper rather than
     raw ``ppl``: a nested record's ``ppl`` is the full-validation value, which
     includes the rows that selected its hyper-parameters.
+
+    The two records must also declare the SAME estimand.  Subtracting a
+    full-validation PPL from a held-out-row PPL produces a number on neither
+    sample, even though both individual values are finite.
     """
+    _a_nested = rec_a.get('ppl_estimation_rows') == 'nested_validation_holdout'
+    _b_nested = rec_b.get('ppl_estimation_rows') == 'nested_validation_holdout'
+    if _a_nested != _b_nested:
+        return None
     _a, _b = _record_primary_ppl(rec_a), _record_primary_ppl(rec_b)
     if _a is None or _b is None:
         return None
