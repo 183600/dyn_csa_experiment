@@ -9711,6 +9711,16 @@ def t_temporal_group_identity_matches_python_equality():
     assert keys[0] != keys[1], keys
     idx = DG.grouped_chronological_split_indices(2, g, 0.5, 0.5, 0.0)
     assert idx['train'].tolist() == [0] and idx['val'].tolist() == [1], idx
+    # A string/object ``order`` forces the per-row fallback.  Its member map
+    # must use the same native-scalar temporal keys as the fast path; using
+    # tolist() turned datetime64[ns] into bare integers and raised KeyError.
+    g4 = np.asarray(['2020-01-01', '2020-01-02', '2020-01-01',
+                     '2020-01-03'], dtype='datetime64[ns]')
+    idx4 = DG.grouped_chronological_split_indices(
+        4, g4, train_size=2, val_size=1, test_size=1,
+        order=np.asarray(['a', 'b', 'a', 'c']))
+    assert idx4['train'].tolist() == [0, 2], idx4
+    assert idx4['val'].tolist() == [1] and idx4['test'].tolist() == [3], idx4
     # NaT still collapses into one missing group for both temporal kinds.
     nat = np.asarray([np.datetime64('NaT', 'ns'), np.datetime64('NaT', 'ns'),
                       np.datetime64(1, 'ns')])

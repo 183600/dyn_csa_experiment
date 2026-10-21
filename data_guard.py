@@ -667,7 +667,11 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
     else:
         order_groups, _first = _group_order(groups, order)
         members = {}
-        for i, g in enumerate(groups.tolist()):
+        # Iterate the native scalars, not ``tolist()``: a native
+        # datetime64[ns] group column becomes bare integers through
+        # ``tolist()``, which would not match the canonical temporal keys
+        # produced by ``_group_order`` (and would raise KeyError below).
+        for i, g in enumerate(groups):
             members.setdefault(_group_key(g), []).append(i)
     n_groups = len(order_groups)
     t_train, t_val, t_test = (int(v) for v in targets)
