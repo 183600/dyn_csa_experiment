@@ -493,6 +493,36 @@ def t_nan_diagnosis_path():
                              'events': []}})
     assert hbad['status'] == 'instability_observed', hbad
     assert hbad['primary_suspect'] == 'validation_curve_numerics', hbad
+    # A legacy/edited record may carry the curve but not the cached summary;
+    # an unsummarised non-finite point is still evidence, never `clean`.
+    hhist = L.diagnose_training_instability({
+        'health_history': [
+            {'step': 0, 'train_ce': 5.0, 'val_ce': 4.0},
+            {'step': 100, 'train_ce': 4.8, 'val_ce': float('nan')}],
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                             'events': []}})
+    assert hhist['status'] == 'instability_observed', hhist
+    assert hhist['primary_suspect'] == 'validation_curve_numerics', hhist
+    assert hhist['curve_health_source'] == 'derived_from_history', hhist
+    # No curve evidence at all means the validation-numerics check is unknown,
+    # not silently "not observed".
+    noc = L.diagnose_training_instability({
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                             'events': []}})
+    vc = [c for c in noc['checks'] if c['check'] == 'validation_curve_numerics'][0]
+    assert vc['status'] == 'unknown', noc
+    assert noc['curve_health_source'] == 'missing', noc
+    # A malformed summary is record-integrity evidence, but a usable history
+    # still supplies the validation verdict.
+    both = L.diagnose_training_instability({
+        'curve_health': ['healthy'],
+        'health_history': [{'step': 0, 'train_ce': 5.0, 'val_ce': 4.0},
+                           {'step': 100, 'train_ce': 4.8, 'val_ce': 4.2}],
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                             'events': []}})
+    assert both['status'] == 'unverifiable', both
+    assert both['curve_health_source'] == 'derived_from_history', both
+
     # A malformed/corrupt count field must neither crash the triage nor be
     # silently read as a zero-event (clean) record.
     malformed = L.diagnose_training_instability({

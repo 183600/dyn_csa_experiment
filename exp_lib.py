@@ -643,7 +643,24 @@ def diagnose_training_instability(record, *, data_checked=None):
     if _scale_raw is not None and scale_min is None:
         malformed.append(f'amp_scaler_scale_min={_scale_raw!r}')
     knobs = rec.get('train_knobs') if isinstance(rec.get('train_knobs'), dict) else {}
-    health = rec.get('curve_health') if isinstance(rec.get('curve_health'), dict) else {}
+    _health_raw = rec.get('curve_health')
+    _hist_raw = rec.get('health_history')
+    health = _health_raw if isinstance(_health_raw, dict) else {}
+    _health_source = 'record' if isinstance(_health_raw, dict) else 'missing'
+    if _health_raw is not None and not isinstance(_health_raw, dict):
+        malformed.append(f'curve_health={_health_raw!r}')
+    if not health and isinstance(_hist_raw, list) and _hist_raw:
+        # A legacy/edited record may carry the curve without the cached
+        # summary.  Recompute it: an unsummarised non-finite point is still
+        # evidence and must not be reported as a clean run.
+        try:
+            health = classify_training_health(_hist_raw)
+            _health_source = 'derived_from_history'
+        except Exception as _he:
+            malformed.append(f'health_history could not be classified ({type(_he).__name__}: {_he})')
+            health = {}
+    if _hist_raw is not None and not isinstance(_hist_raw, list):
+        malformed.append(f'health_history is not a list ({type(_hist_raw).__name__})')
     health_nonfinite = str(health.get('status') or '') == 'nonfinite'
     amp = rec.get('amp_dtype') or knobs.get('amp_dtype')
     _grad_raw = diag.get('grad_norm_max')
@@ -724,11 +741,16 @@ def diagnose_training_instability(record, *, data_checked=None):
 
     if health_nonfinite:
         add('validation_curve_numerics', 'observed',
-            f'curve_health is nonfinite ({health.get("reason") or "no reason recorded"})',
+            f'curve_health is nonfinite ({health.get("reason") or "no reason recorded"}; source={_health_source})',
             'inspect the first non-finite validation point; a training-side loss can be finite while eval_ppl/its log or the per-document rows overflow')
+    elif _health_source == 'missing':
+        add('validation_curve_numerics', 'unknown',
+            'no curve_health or health_history was recorded',
+            'record the validation curve (or at least its non-finite points) before treating this run as numerically clean')
     else:
         add('validation_curve_numerics', 'not_observed',
-            'no non-finite validation-curve point was recorded', 'no action')
+            f'no non-finite validation-curve point was recorded (source={_health_source})',
+            'no action')
 
     if malformed:
         add('record_integrity', 'observed',
@@ -760,7 +782,8 @@ def diagnose_training_instability(record, *, data_checked=None):
         primary = (observed[0]['check'] if observed else 'unclassified')
         summary = ('first observed suspect: ' + primary) if observed else 'non-finite values were recorded but none of the standard causes was observed'
     return {'status': status, 'summary': summary, 'primary_suspect': primary,
-            'first_bad_step': first_bad, 'checks': checks,
+            'first_bad_step': first_bad, 'curve_health_source': _health_source,
+            'checks': checks,
             'recommended_order': ['data_nan_inf', 'forward_loss_numerics',
                                   'attention_pool_nan_to_num', 'validation_curve_numerics',
                                   'fp16_overflow', 'gradient_explosion_lr']}
