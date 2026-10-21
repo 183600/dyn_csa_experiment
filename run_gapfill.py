@@ -312,7 +312,18 @@ def merge_long_aggregate(adir, snapshot_agg):
     except Exception as _e:
         print(f'[v6-merge] WARNING: cannot read the freshly written {agg_path} ({type(_e).__name__}: {_e}) — the snapshot is left unmerged; re-run `_finish_panel` on the panel to rebuild it')
         return
-    merged = copy.deepcopy(snapshot_agg)
+    if not isinstance(fresh, dict):
+        print(f'[v6-merge] WARNING: {agg_path} is valid JSON but not an object '
+              f'({type(fresh).__name__}) — the snapshot is left unmerged; re-run '
+              '`_finish_panel` on the panel to rebuild it')
+        return
+    if not isinstance(snapshot_agg, dict):
+        print(f'[v6-merge] WARNING: the snapshot aggregate is not an object '
+              f'({type(snapshot_agg).__name__}) — using the freshly written '
+              'aggregate instead')
+        merged = {}
+    else:
+        merged = copy.deepcopy(snapshot_agg)
 
     def _seed_map(entry, tag=''):
         out = {}

@@ -12080,6 +12080,17 @@ def t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields():
         assert out['ppl_mean'] == 19.0, out
         assert out['avg_dyn_block_len'] is None and out['ppl_curve'] is None, out
         assert out['merge_stale_fields'] == 'partial_seed_overlap', out
+    # A valid-JSON non-object fresh aggregate (or snapshot) must not crash the
+    # merge on `.items()` / `.get()`.
+    with tempfile.TemporaryDirectory() as d:
+        json.dump([], open(os.path.join(d, 'aggregate.json'), 'w'))
+        G.merge_long_aggregate(d, {'full': {'seeds': [0], 'ppls': [1.0]}})
+        assert json.load(open(os.path.join(d, 'aggregate.json'))) == []
+        json.dump({'full': {'seeds': [0], 'ppls': [2.0]}},
+                  open(os.path.join(d, 'aggregate.json'), 'w'))
+        G.merge_long_aggregate(d, ['not', 'a', 'mapping'])
+        out = json.load(open(os.path.join(d, 'aggregate.json')))
+        assert out['full']['ppls'] == [2.0], out
 
 
 
