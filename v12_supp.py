@@ -305,6 +305,9 @@ def _load_manifest(path):
     if _eval and _int_field(_eval.get('n_seqs_clean') or 0, 'eval.n_seqs_clean') <= 0:
         raise SystemExit('[v12] REFUSE: eval.n_seqs_clean is missing/zero — the frozen row count is part of the held-out slice, not a runtime default')
     _tokb = (_bind.get('tokenizer') or {}) if isinstance(_bind, dict) else {}
+    if not isinstance(_tokb, dict):
+        raise SystemExit(
+            f'[v12] REFUSE: binding.tokenizer must be an object ({_tokb!r})')
     if _tokb and str(_tokb.get('fit', '')).lower() and 'train' not in str(_tokb.get('fit', '')).lower():
         raise SystemExit(f'[v12] REFUSE: binding.tokenizer.fit={_tokb.get("fit")!r} is not the train-only fit required by the freeze')
     _test = str(_stat.get('test', 'exact two-sided sign-flip over paired per-seed deltas')).lower()

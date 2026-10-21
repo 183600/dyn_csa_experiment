@@ -1711,6 +1711,19 @@ def t_v12_malformed_manifest_and_lock_fail_closed():
             assert 'primary_comparisons[0]' in str(e) and 'object' in str(e), e
         else:
             raise AssertionError('a scalar primary comparison was accepted')
+        # Nested binding blocks are read with .get(); a list cannot be a
+        # tokenizer descriptor and must be named as malformed.
+        p2 = os.path.join(td, 'bad_binding.json')
+        m2 = _write_manifest(p2, list(range(12)))
+        m2['binding'] = {'tokenizer': ['not', 'an', 'object']}
+        with open(p2, 'w', encoding='utf-8') as f:
+            json.dump(m2, f)
+        try:
+            V12._load_manifest(p2)
+        except SystemExit as e:
+            assert 'binding.tokenizer' in str(e), e
+        else:
+            raise AssertionError('a non-object tokenizer binding was accepted')
         # A valid-JSON but non-object freeze lock cannot attest anything;
         # .get() on it used to raise AttributeError after test access.
         outdir = os.path.join(td, 'freeze')
