@@ -2594,6 +2594,15 @@ def t_combined_seed_doc_uncertainty():
     _bad[0]['n_tokens_per_row'][0] = 50.5
     assert L._combined_seed_doc_ci(_bad)['status'] == 'unverifiable'
     assert L._doc_bootstrap_ppl_ci(_bad) is None
+    # Mixed estimands are two different document samples, not one bootstrap
+    # panel, even if both expose per-row arrays of the same length.
+    _mix = _recs([0.0, 0.2, 0.4])
+    _mix[0]['ppl_estimation_rows'] = 'nested_validation_holdout'
+    _mix[0]['nll_per_row_holdout'] = list(_mix[0]['nll_per_row'])
+    _mix[0]['n_tokens_per_row_holdout'] = list(_mix[0]['n_tokens_per_row'])
+    _rmix = L._combined_seed_doc_ci(_mix)
+    assert _rmix['status'] == 'unverifiable' and 'mix' in _rmix.get('reason', ''), _rmix
+    assert L._doc_bootstrap_ppl_ci(_mix) is None
     # One seed: the seed component is explicitly unverifiable, never zero.
     r1 = L._combined_seed_doc_ci(_recs([0.0]))
     assert r1['status'] == 'seed_component_unverifiable' and r1['se_seed_logppl'] is None and r1['se_doc_logppl'] is not None, r1

@@ -25410,6 +25410,13 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     missing-evidence state rather than a narrow interval computed from the
     wrong unit.
     """
+    recs = list(recs)
+    _nested_flags = {r.get('ppl_estimation_rows') == 'nested_validation_holdout'
+                     for r in recs if isinstance(r, dict)}
+    if len(_nested_flags) > 1:
+        # Bootstrap rows from two different evaluation samples are not one
+        # document panel, even when their lengths happen to match.
+        return None
     rows = []
     for r in recs:
         _arrays = _primary_row_arrays(r)
@@ -25481,7 +25488,11 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     component is unmeasurable (S<2, records without per-row NLL, or fewer
     than two scored documents) the status says so explicitly and the missing
     component is never silently treated as zero."""
+    recs = list(recs)
+    _nested_flags = {r.get('ppl_estimation_rows') == 'nested_validation_holdout'
+                     for r in recs if isinstance(r, dict)}
     rows = []
+    _mixed_estimands = len(_nested_flags) > 1
     for r in recs:
         _arrays = _primary_row_arrays(r)
         if _arrays is None:
@@ -25515,6 +25526,11 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
            'se_combined_logppl': None, 'ci95_ppl': None,
            'component_ratio_seed_over_doc': None, 'conf': None,
            'method': 'two-source variance combination on log-PPL (seed training noise x evaluation-document bootstrap); approximation, not a fitted hierarchical model'}
+    if _mixed_estimands:
+        out['reason'] = ('records mix nested-holdout and full-validation row '
+                         'samples; the seed and document components would come '
+                         'from two different evaluation sets')
+        return out
     # Coverage, draw count and RNG seed identify the interval.  Never build a
     # 95% interval while echoing conf=True/1.0, and never let a fractional
     # n_boot silently become a different draw count.
