@@ -7298,6 +7298,21 @@ def t_efficiency_pairs_audit_and_sweep():
                        'b::s0': {'variant': 'b', 'efficiency': dict(_no_kv, prefill_ms_p50=20.0)}}, f)
         _rk = A.audit_efficiency_pairs(outdirs=[td])['panels'][td]['a vs b']
         assert _rk['same_kv_semantics'] is False and _rk['speed_claim_allowed'] is False, _rk
+        # The same token count at a different batch size is a different
+        # execution shape, so it cannot support a speed claim.
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'efficiency': dict(eff_a, batch=1)},
+                       'b::s0': {'variant': 'b', 'efficiency': dict(eff_b, batch=8)}}, f)
+        _rb = A.audit_efficiency_pairs(outdirs=[td])['panels'][td]['a vs b']
+        assert _rb['same_batch'] is False and _rb['speed_claim_allowed'] is False, _rb
+        assert 'batch' in _rb['reason'], _rb
+        # Missing batch is legacy-compatible but explicitly not recorded.
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'efficiency': eff_a},
+                       'b::s0': {'variant': 'b', 'efficiency': eff_b}}, f)
+        _rleg = A.audit_efficiency_pairs(outdirs=[td])['panels'][td]['a vs b']
+        assert _rleg['same_batch'] is True and _rleg['batch_status'] == 'unrecorded', _rleg
+        assert _rleg['speed_claim_allowed'] is True, _rleg
         # An invalid tolerance cannot widen (negative) or disable the speed gate.
         for _bad_tol in (True, -0.05, float('nan'), float('inf'), 1.0, 'x'):
             try:

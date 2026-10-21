@@ -2208,6 +2208,36 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                             and _env_a == _env_b)
             same_kv = bool(_kv_complete and len(_kv_a) == 1 and len(_kv_b) == 1
                            and _kv_a == _kv_b)
+            # New measurement records carry the batch size.  The same token
+            # count at batch 1 vs batch 8 is a different execution shape; if
+            # either arm recorded batch sizes, they must agree.  Legacy
+            # records without the field stay comparable (but `batch_status`
+            # says the shape was not recorded).
+            def _batch_of(value):
+                if isinstance(value, (bool, np.bool_)) or value is None:
+                    return None
+                if isinstance(value, numbers.Integral):
+                    return int(value) if int(value) >= 1 else None
+                if isinstance(value, numbers.Real):
+                    f = float(value)
+                    return int(f) if (math.isfinite(f) and f == math.floor(f)
+                                      and f >= 1.0) else None
+                return None
+            _batch_a = {_batch_of(r.get('batch')) for r in eff[a]
+                        if r.get('batch') is not None}
+            _batch_b = {_batch_of(r.get('batch')) for r in eff[b]
+                        if r.get('batch') is not None}
+            if not (_batch_a or _batch_b):
+                same_batch = True
+                batch_status = 'unrecorded'
+            elif (None in _batch_a or None in _batch_b
+                  or len(_batch_a) != 1 or len(_batch_b) != 1
+                  or _batch_a != _batch_b):
+                same_batch = False
+                batch_status = 'different_or_incomplete'
+            else:
+                same_batch = True
+                batch_status = 'same'
             # Median over seeds, not the first record: a single slow seed must
             # not decide a "faster" claim.
             _ta, _tb = _med(eff[a], 'prefill_ms_p50'), _med(eff[b], 'prefill_ms_p50')
@@ -2229,6 +2259,9 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             _nb = sorted({_token_count(r.get('n_tokens')) for r in eff[b]},
                          key=lambda x: (x is None, -1 if x is None else x))
             rec = {'a': a, 'b': b, 'same_device_torch': same_env, 'same_kv_semantics': same_kv,
+                   'same_batch': same_batch, 'batch_status': batch_status,
+                   'a_batch': sorted(_batch_a, key=lambda x: (x is None, -1 if x is None else x)),
+                   'b_batch': sorted(_batch_b, key=lambda x: (x is None, -1 if x is None else x)),
                    'a_ms_p50': _ta, 'b_ms_p50': _tb, 'a_tokens': _na, 'b_tokens': _nb,
                    'ratio_b_over_a': None, 'speed_claim_allowed': False, 'faster_arm': None, 'reason': None}
             if not (isinstance(_ta, (int, float)) and isinstance(_tb, (int, float)) and _ta > 0 and _tb > 0):
@@ -2242,6 +2275,8 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                 rec['reason'] = 'different or inconsistent device/torch version recorded (within or across arms)'
             elif not same_kv:
                 rec['reason'] = 'different or inconsistent KV-cache semantics recorded (within or across arms)'
+            elif not same_batch:
+                rec['reason'] = 'different, ambiguous or incomplete batch sizes recorded (within or across arms)'
             else:
                 ratio = float(_tb) / float(_ta)
                 rec['ratio_b_over_a'] = ratio
