@@ -2272,10 +2272,11 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                 if isinstance(value, (bool, np.bool_)):
                     return None
                 if isinstance(value, numbers.Integral):
-                    return int(value)
+                    return int(value) if int(value) > 0 else None
                 if isinstance(value, numbers.Real):
                     f = float(value)
-                    return int(f) if math.isfinite(f) and f == math.floor(f) else None
+                    return (int(f) if (math.isfinite(f) and f == math.floor(f)
+                                      and f > 0) else None)
                 return None
 
             _na = sorted({_token_count(r.get('n_tokens')) for r in eff[a]},

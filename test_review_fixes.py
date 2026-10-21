@@ -7513,6 +7513,14 @@ def t_efficiency_pairs_audit_and_sweep():
                        'b::s0': {'variant': 'b', 'efficiency': dict(eff_b, n_tokens=1)}}, f)
         _rf = A.audit_efficiency_pairs(outdirs=[td])['panels'][td]['a vs b']
         assert _rf['speed_claim_allowed'] is False and 'token counts' in _rf['reason'], _rf
+        # A zero/negative token count is not a measured shape either, even
+        # when both arms happen to agree on it.
+        for _bad_n in (0, -1):
+            with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+                json.dump({'a::s0': {'variant': 'a', 'efficiency': dict(eff_a, n_tokens=_bad_n)},
+                           'b::s0': {'variant': 'b', 'efficiency': dict(eff_b, n_tokens=_bad_n)}}, f)
+            _rn = A.audit_efficiency_pairs(outdirs=[td])['panels'][td]['a vs b']
+            assert _rn['speed_claim_allowed'] is False and 'token counts' in _rn['reason'], _rn
         # A mixed device/KV record inside one arm makes the medians
         # incomparable even when the first record of each arm matches.
         with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
