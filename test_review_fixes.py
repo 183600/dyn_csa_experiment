@@ -11143,6 +11143,31 @@ def t_cached_validation_row_groups_merge_shared_documents():
         assert 'length' in str(e), e
     else:
         raise AssertionError('a fractional token-id count must be refused')
+    # The tuning wrapper may fall back only when a VALID group table cannot
+    # form the requested folds.  A corrupt sidecar must propagate: silently
+    # treating it as "no split" would select on the final-estimate rows.
+    _base = {'dataset': 'wikitext', 'seq_len': _sl, 'n_train_tokens': _ntr,
+             'vocab_size': _vb, 'val_seqs': _vs, 'cache_dir': _d3}
+    _spec = {'seed': 20261020, 'n_folds': 2,
+             'selection_fold': 0, 'evaluation_fold': 1}
+    try:
+        BT._nested_row_split_checked(_base, 4, _spec)
+    except ValueError as e:
+        assert 'integers' in str(e), e
+    else:
+        raise AssertionError('a corrupt group sidecar must not become a full-validation fallback')
+    # A valid table whose single document spans every row cannot be cut into
+    # folds; that is an explicit fallback with a reason, not a crash.
+    _d7 = tempfile.mkdtemp(prefix='valgroups_one_')
+    _docs_one = np.ones(8, dtype=np.uint64)
+    np.save(os.path.join(_d7, f'val_token_doc_ids_{_tag3}.npy'), _docs_one)
+    with open(os.path.join(_d7, f'meta_{_tag3}.json'), 'w', encoding='utf-8') as fh:
+        json.dump({'doc_ids': {'validation_token_count': int(_docs_one.size),
+                               'validation_token_fp': L._ids_fp(_docs_one)}}, fh)
+    _base_one = dict(_base, cache_dir=_d7)
+    _sel1, _ev1, _m1, _why1 = BT._nested_row_split_checked(_base_one, 4, _spec)
+    assert _sel1 is None and _ev1 is None and _why1, (_sel1, _ev1, _m1, _why1)
+    assert _m1['groups_aware'] is False and 'unavailable' in _m1['reason'], _m1
 
 
 def t_build_report_primary_estimand():

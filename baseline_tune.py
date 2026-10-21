@@ -208,12 +208,28 @@ def _nested_row_split_checked(base, n_rows, spec):
     ``(None, None, meta, reason)`` so the caller can fall back to the full
     validation sample and record that the nested contract was not met.
     """
+    # Only an impossible (but valid) group split falls back to the full
+    # validation sample.  A corrupt/inconsistent sidecar or malformed metadata
+    # is an evidence error: swallowing it here would silently drop the nested
+    # contract and select on the rows used for the final estimate.
+    _groups, _gmeta = L.run_corpus_row_groups(base, n_rows)
+    _kw = dict(seed=spec['seed'], n_folds=spec['n_folds'],
+               selection_fold=spec['selection_fold'],
+               evaluation_fold=spec['evaluation_fold'])
     try:
-        _sel, _ev, _meta = _nested_row_split(base, n_rows, spec)
-        return _sel, _ev, _meta, None
+        if _groups is not None:
+            _sel, _ev, _meta = L.validation_row_split(
+                n_rows, groups=_groups, **_kw)
+        else:
+            _sel, _ev, _meta = L.validation_row_split(n_rows, **_kw)
     except ValueError as _e:
-        return None, None, {'groups_aware': False,
-                            'reason': f'group-aware row split unavailable: {_e}'}, str(_e)
+        _meta = dict(_gmeta or {})
+        _meta.update({'groups_aware': False,
+                      'reason': f'group-aware row split unavailable: {_e}'})
+        return None, None, _meta, str(_e)
+    _meta = dict(_meta)
+    _meta.update(_gmeta or {})
+    return _sel, _ev, _meta, None
 
 
 def _contrast_plan(protocol, groups, selected):
