@@ -5649,6 +5649,18 @@ def t_data_quality_target_outliers():
                                 train_idx=[0, 1, 2, 3], val_idx=[4],
                                 test_idx=[5], target_outlier_z=1.5)
     assert cat['checks']['target_outlier_fence'] is None, cat
+    assert cat['checks']['target_outlier_fence_estimated'] is False, cat
+    assert any('not estimable' in w for w in cat['warnings']), cat
+    # Asking the gate to FAIL on target outliers when no numeric fence exists
+    # must fail closed, not silently report zero outliers.
+    cat_fail = L.data_quality_report(
+        X, y=['a', 'b', 'c', 'd', 'a', 'b'], train_idx=[0, 1, 2, 3],
+        val_idx=[4], test_idx=[5], fail_on_target_outliers=True)
+    assert cat_fail['status'] == 'fail', cat_fail
+    one_label = L.data_quality_report(
+        X, y=[0.0, None, None, None, 1.0, 2.0], train_idx=[0, 1, 2, 3],
+        val_idx=[4], test_idx=[5], target_outlier_z=1.5)
+    assert one_label['checks']['target_outlier_fence_estimated'] is False, one_label
     # Requesting the target-outlier audit without y must fail closed instead
     # of silently omitting the gate.
     for _kw in ({'target_outlier_z': 1.5}, {'fail_on_target_outliers': True}):

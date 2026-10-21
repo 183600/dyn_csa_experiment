@@ -3514,6 +3514,19 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                             target_outliers[name] += 1
             checks['target_outliers_by_split'] = target_outliers
             checks['target_outlier_fence'] = target_fence
+            checks['target_outlier_fence_estimated'] = bool(target_fence is not None)
+            if target_fence is None:
+                # The caller explicitly requested the target-outlier audit,
+                # but no numeric training fence can be formed (fewer than two
+                # finite numeric labels, or a categorical target).  Silently
+                # reporting zero outliers would certify a gate that never ran.
+                _msg = (f'the requested target-outlier audit is not estimable: '
+                        f'only {len(_train_t)} finite numeric training label(s); '
+                        'a fence needs at least 2')
+                if fail_on_target_outliers:
+                    hard_failures.append(_msg)
+                else:
+                    warnings.append(_msg)
             _n_target_out = sum(target_outliers.values())
             if _n_target_out:
                 _msg = (f'{_n_target_out} target value(s) fall outside the '
