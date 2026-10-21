@@ -7321,6 +7321,9 @@ def t_categorical_shift_empty_reference():
     r = L.categorical_shift_report([], [1, 2, 3])
     assert r['n_reference'] == 0 and r['n_holdout'] == 3, r
     assert r['unseen_rate'] == 1.0 and r['total_variation'] > 0.0, r
+    # No reference distribution means JS is undefined, not a fixed log(2)/2
+    # score that looks like a measured divergence.
+    assert r['js_divergence'] is None and r['js_defined'] is False, r
     try:
         L.categorical_shift_report([1, 2], [1, 2], max_categories=0)
     except ValueError:

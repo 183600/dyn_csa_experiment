@@ -5074,6 +5074,19 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
         return {'js_divergence': 0.0, 'total_variation': 0.0,
                 'n_reference': int(ref.size), 'n_holdout': 0,
                 'unseen_rate': 0.0}
+    if ref.size == 0:
+        # With no reference sample there is no reference distribution, so the
+        # JS divergence is undefined (the old path silently scored it as if
+        # the reference were a degenerate one-bin histogram, returning log(2)/2
+        # regardless of the holdout).  Every holdout category is unseen, and
+        # the total variation from an empty reference is the fixed maximum
+        # half-mass; keep that separately for callers that only gate on
+        # unseen_rate.
+        return {'js_divergence': None, 'total_variation': 0.5,
+                'n_reference': 0, 'n_holdout': int(hold.size),
+                'unseen_rate': 1.0, 'js_defined': False,
+                'note': ('no reference observations; JS divergence is '
+                         'undefined and must not be read as a measured shift')}
 
     def _key(value):
         # ``_target_key`` distinguishes a genuinely missing value from a real
