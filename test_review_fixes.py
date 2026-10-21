@@ -9062,7 +9062,8 @@ def t_report_training_health_actions():
                             'best_step': 500, 'final_minus_best': 3.0,
                             'steps_since_best': 500, 'train_ce_slope_per_step': -1e-4,
                             'val_ce_slope_per_step': 2e-5, 'gap_last': 1.2,
-                            'gap_slope_per_step': 3e-5,
+                            'gap_slope_per_step': 3e-5, 'n_eval_points': 7,
+                            'trend_reliable': True,
                             'actions': ['add regularization', 'report the best checkpoint']},
            'health_history': [{'val_ci95_low': 47.0, 'val_ci95_high': 49.0}]}
     orig = BR._result_summaries
@@ -9073,6 +9074,10 @@ def t_report_training_health_actions():
         BR._result_summaries = orig
     assert 'steps since best' in txt and 'add regularization' in txt, txt
     assert '500' in txt and 'gap slope' in txt, txt
+    # The number of curve points is distinct from the number of documents per
+    # eval; a 16-doc subset at 7 eval points must not be reported as "16 rows".
+    assert 'eval points' in txt and 'eval docs' in txt, txt
+    assert '| 7 | 16 | True |' in txt, txt
     # Malformed history/actions collections must not crash the section.
     bad = dict(rec, health_history=1, curve_health=dict(rec['curve_health'], actions='one action'))
     BR._result_summaries = lambda: {'results_unit': {'b::s0': bad}}

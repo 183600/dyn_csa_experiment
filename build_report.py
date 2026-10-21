@@ -1866,7 +1866,7 @@ def sec_training_health():
         return ''
     lines = ['## Training-curve health (train/validation gap, over/under-fitting)', '',
              '> Diagnostic only. `best_val_ppl` / `best_step` are reported alongside the final number; they do not replace the pre-registered final-step endpoint.', '',
-             '| panel | cell | status | best PPL @ step | final PPL | final−best | steps since best | tail train slope | tail val slope | gap slope | gap | curve rows | last curve 95% CI | action |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|']
+             '| panel | cell | status | best PPL @ step | final PPL | final−best | steps since best | tail train slope | tail val slope | gap slope | gap | eval points | eval docs | trend reliable | last curve 95% CI | action |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|']
     for name, key, rec, h in rows[:200]:
         _hist_raw = rec.get('health_history')
         _hist = _hist_raw if isinstance(_hist_raw, list) else []
@@ -1880,12 +1880,13 @@ def sec_training_health():
         else:
             _acts = []
         _act = '; '.join(str(a) for a in _acts) or '—'
-        lines.append('| %s | `%s` | %s | %s @ %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
+        lines.append('| %s | `%s` | %s | %s @ %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
             name, key, h.get('status'), fm(h.get('best_val_ppl')), h.get('best_step'),
             fm(rec.get('ppl')), fm(h.get('final_minus_best')), fm(h.get('steps_since_best'), 0),
             fm(h.get('train_ce_slope_per_step'), 6), fm(h.get('val_ce_slope_per_step'), 6),
             fm(h.get('gap_slope_per_step'), 6),
-            fm(h.get('gap_last'), 4), rec.get('eval_subset_rows'), _ci,
+            fm(h.get('gap_last'), 4), fm(h.get('n_eval_points'), 0),
+            fm(rec.get('eval_subset_rows'), 0), h.get('trend_reliable'), _ci,
             _act.replace('|', '\\|')))
     lines += ['', '> `overfitting` = train CE falling while val CE rises; `underfitting_or_stalled` = neither falls; `nonfinite` = a NaN/Inf point was recorded (see the NaN diagnostics in the same record). A substantially positive `gap slope` is direct overfitting evidence even when the validation slope is still small. `steps since best` > 0 means the final step is not the best validation point; report both, and do not silently select the best step after looking at the validation split. Curve points use `eval_subset_rows` fixed documents while the final PPL uses the full fixed validation batch. `best PPL @ step` and `final−best` are subset-vs-subset (like-for-like); the full-batch final PPL is shown separately and must not be subtracted from the subset best. The 95% CI is a document-level interval for the curve estimate, so small differences inside the interval are evaluation noise, not a mechanism effect.', '']
     return '\n'.join(lines) + '\n'
