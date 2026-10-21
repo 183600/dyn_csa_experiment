@@ -1904,10 +1904,20 @@ class LeakageSafeCategoricalEncoder:
                     f'{ncat} categories')
             keys = st.get('keys')
             if keys is None:
+                # Legacy stats carried no key table; the fallback below uses
+                # the readable categories, which is only safe for values that
+                # survived JSON unchanged.
                 keys = []
             else:
+                if not isinstance(keys, (list, tuple)):
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} has a non-list '
+                        'category-key table')
                 keys = list(keys)
-            if keys:
+                # An explicitly declared table must describe every category.
+                # Treating an empty/truncated list as "legacy" silently fell
+                # back to the JSON-sanitised readable values and changed the
+                # identity of non-native categories (e.g. tuples).
                 if (len(keys) != ncat
                         or not all(isinstance(k, str) for k in keys)
                         or len(set(keys)) != len(keys)):
