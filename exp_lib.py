@@ -12150,6 +12150,11 @@ def variant_presence(outdir):
     except Exception as e:
         print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — variant presence cannot be established')
         return out
+    if not isinstance(raw, dict):
+        # A valid JSON list/string is not a panel summary.  Calling .items()
+        # on it used to crash the whole report instead of excluding one panel.
+        print(f'[stats] WARNING: {sp} is a {type(raw).__name__}, not an object — variant presence cannot be established')
+        return out
     kept = {}
     refused = {}
     for _k, r in raw.items():
@@ -12283,6 +12288,12 @@ def read_panel(outdir):
         raw = json.load(open(sp, encoding='utf-8'))
     except Exception as e:
         print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — this panel is EXCLUDED')
+        return {}
+    if not isinstance(raw, dict):
+        # Parsing is not enough: the summary contract is a key -> record map.
+        # A list/string would otherwise fail later inside .items() and take
+        # down every consumer (ppl_by_seed, aggregate, report building).
+        print(f'[stats] WARNING: {sp} is a {type(raw).__name__}, not an object — this panel is EXCLUDED')
         return {}
     _legacy_ok = legacy_warm_tags(raw)
     _by_id = {}
@@ -25139,6 +25150,13 @@ def _read_summary_json(path):
         except Exception as _e:
             print(f'[resume] FATAL: {path} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
+        if not isinstance(summary, dict):
+            # Resume/update paths index the summary by cell key.  A parsed but
+            # non-object file cannot carry any cell records, and overwriting it
+            # would silently discard whatever the operator put there.
+            raise ValueError(
+                f'{path} parsed as a {type(summary).__name__}, not a cell -> '
+                'record object; refusing to resume from/overwrite it')
     return summary
 
 

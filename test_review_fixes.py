@@ -10847,6 +10847,32 @@ def t_seed_and_nested_input_guards():
             raise AssertionError(f'partial nested folds {kw!r} were accepted')
 
 
+def t_malformed_panel_summary_is_excluded():
+    # A JSON file that parses but is not a cell -> record object is not a
+    # panel.  Readers must exclude it instead of crashing inside .items(), and
+    # the resume writer must refuse to overwrite it with an empty summary.
+    td = tempfile.mkdtemp(prefix='panel_shape_')
+    try:
+        sp = os.path.join(td, 'summary.json')
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump([{'variant': 'a', 'seed': 0, 'ppl': 1.0}], f)
+        assert L.read_panel(td) == {}
+        assert L.ppl_by_seed(td) == {}
+        assert L.variant_presence(td) == {}
+        try:
+            L._read_summary_json(sp)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('a non-object summary must not be resumed from')
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump('not a panel', f)
+        assert L.read_panel(td) == {}
+        assert L.variant_presence(td) == {}
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def t_meta_seed_overlap_controls_pooling():
     # The DL pooled CI treats scale points as independent studies.  Declaring
     # seed identities is not enough: disjoint sets are independent, a complete
@@ -11522,6 +11548,7 @@ def main():
     _check('L46 analysis checkpoint carries model geometry', t_analysis_checkpoint_carries_model_geometry)
     _check('L47 v12 admission rejects synthesized records', t_v12_admission_rejects_synthesized_records)
     _check('L48 seed/nested input guards', t_seed_and_nested_input_guards)
+    _check('L49 malformed panel summary is excluded', t_malformed_panel_summary_is_excluded)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
