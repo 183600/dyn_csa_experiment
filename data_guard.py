@@ -2275,6 +2275,30 @@ def _stats_match_float(a, b, *, atol, rtol):
     return math.isclose(fa, fb, rel_tol=rtol, abs_tol=atol)
 
 
+def _holdout_parts(values, *, name='X_holdout'):
+    """Distinguish one list-of-rows table from several holdout tables.
+
+    A Python list is ambiguous: ``[[1, 2], [3, 4]]`` is a 2-row table, while
+    ``[val_matrix, test_matrix]`` is two tables.  Shape settles it: ndim<=2 is
+    one table, ndim==3 (or a ragged list that NumPy cannot stack) is a list of
+    parts.  Treating every list as parts silently transposed a list-of-rows
+    holdout into a column vector.
+    """
+    if not isinstance(values, (list, tuple)):
+        return [values]
+    try:
+        arr = np.asarray(values)
+    except (TypeError, ValueError, OverflowError):
+        return list(values)
+    if arr.ndim <= 2:
+        return [values]
+    if arr.ndim == 3:
+        return list(values)
+    # Higher-rank input is not a valid table or a list of 2-D tables; let the
+    # per-part ``_as_*_2d`` validator produce the precise error.
+    return list(values)
+
+
 def audit_preprocessor_fit(preprocessor, X_train, X_holdout=None, *,
                            atol=1e-10, rtol=1e-8):
     """Prove that a fitted preprocessor learned its statistics on TRAIN only.
@@ -2368,7 +2392,7 @@ def audit_preprocessor_fit(preprocessor, X_train, X_holdout=None, *,
         return out
     if X_holdout is None:
         return out
-    parts = X_holdout if isinstance(X_holdout, (list, tuple)) else [X_holdout]
+    parts = _holdout_parts(X_holdout)
     parts = [_as_float_2d(part, name='X_holdout') for part in parts]
     parts = [p for p in parts if p.shape[0] > 0]
     if not parts:
@@ -2477,7 +2501,7 @@ def audit_encoder_fit(encoder, X_train, X_holdout=None):
         return out
     if X_holdout is None:
         return out
-    parts = X_holdout if isinstance(X_holdout, (list, tuple)) else [X_holdout]
+    parts = _holdout_parts(X_holdout)
     parts = [_as_categorical_2d(part, name='X_holdout') for part in parts]
     parts = [p for p in parts if p.shape[0] > 0]
     if not parts:

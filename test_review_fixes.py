@@ -11013,6 +11013,13 @@ def t_preprocessing_fit_audit_detects_full_table_leak():
     e = DG.audit_preprocessor_fit(out['preprocessor'], Xtr,
                                   [out['X']['val'], out['X']['test']])
     assert e['status'] in ('train_only_verified', 'unverifiable'), e
+    # A plain list-of-rows holdout is ONE table, not one part per row.  The
+    # old list-is-parts rule transposed it into a (n_rows*n_features, 1)
+    # column and rejected the audit on a shape mismatch.
+    _ll = [[float(v) for v in row] for row in Xho.tolist()]
+    f = DG.audit_preprocessor_fit(full_fit, [[float(v) for v in row]
+                                             for row in Xtr.tolist()], _ll)
+    assert f['status'] == 'leak_detected' and f['n_holdout'] == len(_ll), f
 
 
 def t_split_targets_use_exact_fraction_arithmetic():
@@ -11051,6 +11058,11 @@ def t_encoder_fit_audit_detects_holdout_vocabulary():
     freq_leak = DG.LeakageSafeFrequencyEncoder().fit(np.vstack([Xtr, Xho]))
     d = DG.audit_encoder_fit(freq_leak, Xtr, Xho)
     assert d['status'] == 'leak_detected' and d['leak_detected'] is True, d
+    # A list-of-rows holdout must be one table here too.
+    _cat_ll = DG.LeakageSafeCategoricalEncoder().fit(
+        np.vstack([Xtr, Xho]))
+    _ll_audit = DG.audit_encoder_fit(_cat_ll, Xtr.tolist(), Xho.tolist())
+    assert _ll_audit['leak_detected'] is True and _ll_audit['n_holdout'] == len(Xho), _ll_audit
     try:
         DG.audit_encoder_fit(DG.LeakageSafeTargetEncoder().fit(
             Xtr, np.array([0.0, 1.0, 0.0, 1.0])), Xtr)
