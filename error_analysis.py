@@ -161,6 +161,10 @@ def main(argv=None):
              f'- split: **validation only** ({n_rows} rows x {seq_len} tokens)',
              f'- pooled CE: {res.get("mean_ce"):.4f}; pooled PPL: {res.get("pooled_ppl"):.3f}' if res.get('mean_ce') is not None else '- pooled CE: n/a',
              f'- checkpoint health: `{(meta.get("curve_health") or {}).get("status", "unknown")}`', '']
+    if res.get('rare_target_basis'):
+        _rb = str(res.get('rare_target_basis'))
+        _rp = res.get('rare_target_problem')
+        lines += [f'- rare-target basis: `{_rb}`' + (f' — {_rp}' if _rp else ''), '']
     lines += ['## Position / target buckets', '',
               '| bucket | n | mean CE | PPL |', '|---|---|---|---|']
     for k, v in sorted((res.get('buckets') or {}).items()):

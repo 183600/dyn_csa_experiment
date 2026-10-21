@@ -503,6 +503,17 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         actions.append('if the train curve is genuinely flat while validation falls, check whether train CE is measured under augmentation/noise or on a stale fixed batch')
     elif status == 'nonfinite':
         actions.append('follow the NaN triage path: data NaN/Inf -> log(0)/div0/softmax -> fp16 overflow -> gradient explosion/LR')
+    # A two-point curve has no residual degrees of freedom: the slope is an
+    # interpolation and its SE is undefined.  Keep the label (it is what the
+    # recorded curve shows) but make the resolution explicit so a two-eval
+    # smoke run is not read as a mechanism-level overfitting result.
+    _trend_statuses = {'overfitting', 'underfitting_or_stalled',
+                       'validation_degrading', 'validation_improving_train_flat'}
+    trend_reliable = len(val_ppl_points) >= 3
+    if status in _trend_statuses and not trend_reliable:
+        actions.append(f'only {len(val_ppl_points)} validation evaluation point(s) support this trend; '
+                       'the tail slope is interpolated and cannot separate a trend from noise — '
+                       'add evaluation points before changing the model or the data budget')
     train_rising = bool(train_s is not None and math.isfinite(train_s) and train_s > train_tol)
     if train_rising:
         actions.append('training CE itself is rising in the tail; lower the LR and check the gradient/AMP diagnostics before treating this as underfitting')
@@ -522,6 +533,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         'n_train_ce_measured': int(n_train_measured),
         'val_ppl_source': (sorted(_ppl_sources)[0] if len(_ppl_sources) == 1
                            else ('mixed' if _ppl_sources else None)),
+        'trend_reliable': bool(trend_reliable),
         'tail_k': int(tail_k),
         'train_ce_slope_per_step': train_s,
         'val_ce_slope_per_step': val_s,

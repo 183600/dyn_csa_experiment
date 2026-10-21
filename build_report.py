@@ -2172,6 +2172,10 @@ def _render_error_analysis(d):
     ckpt = d.get('checkpoint')
     if ckpt:
         lines += [f'- checkpoint: `{os.path.basename(str(ckpt))}`', f'- split: **{d.get("split") or "unknown"}**', f'- pooled CE/PPL: {fm(d.get("mean_ce"), 4)} / {fm(d.get("pooled_ppl"), 2)}', '']
+    if d.get('rare_target_basis'):
+        _rb = str(d.get('rare_target_basis'))
+        _rp = d.get('rare_target_problem')
+        lines += [f'- rare-target basis: `{_rb}`' + (f' — {_rp}' if _rp else ''), '']
     buckets = d.get('buckets') or {}
     if isinstance(buckets, dict) and buckets:
         lines += ['| bucket | n | mean CE | PPL |', '|---|---|---|---|']

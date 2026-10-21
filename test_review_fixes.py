@@ -389,6 +389,14 @@ def t_health_accepts_val_ce_only_and_orders_steps():
     assert d['should_stop'] is True and d['best_step'] == 0, d
     assert d['val_ppl_source'] == 'val_ce_derived', d
     assert abs(d['best_val_ppl'] - math.exp(4.0)) < 1e-9, d
+    # Two evaluation points cannot establish a trend; the label is kept but
+    # explicitly marked as interpolated/provisional.
+    short = L.classify_training_health([
+        {'step': 0, 'train_ce': 6.0, 'val_ce': 4.0},
+        {'step': 100, 'train_ce': 5.0, 'val_ce': 4.1}])
+    assert short['trend_reliable'] is False and short['n_eval_points'] == 2, short
+    assert any('only 2 validation evaluation point' in a for a in short['actions']), short
+    assert h['trend_reliable'] is True, h
 
 
 def t_early_stop_decision():
@@ -9004,6 +9012,8 @@ def t_efficiency_accuracy_tradeoff_summary():
 def t_report_error_analysis_section():
     rec = {'checkpoint': '/tmp/x/ckpt.pt', 'split': 'validation',
            'mean_ce': 4.2, 'pooled_ppl': 66.7,
+           'rare_target_basis': 'unavailable: no train_ids',
+           'rare_target_problem': 'empty train_ids: token frequencies are unmeasured',
            'buckets': {'position:last10%': {'n': 3, 'mean_ce': 5.0, 'perplexity': 148.4}},
            'cause_counts': {'ambiguous_context': 2, 'annotation_or_rare_target': 1},
            'cause_counts_all': {'ambiguous_context': {'n': 9, 'share': 0.9, 'mean_ce': 4.1},
@@ -9021,6 +9031,7 @@ def t_report_error_analysis_section():
     finally:
         BR.load = orig
     assert 'Bad-case analysis' in txt and 'ambiguous_context' in txt, txt
+    assert 'rare-target basis' in txt and 'empty train_ids' in txt, txt
     assert 'ckpt.pt' in txt and 'validation only' in txt, txt
     assert 'read the context' in txt and 'Whole-split' in txt, txt
     assert 'the surrounding words' in txt, txt
