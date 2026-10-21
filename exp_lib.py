@@ -12566,6 +12566,51 @@ OPEN_BLOCK_HYPOTHESIS_DESIGN = {
     },
 }
 
+NIAH_HYPOTHESIS_DESIGN = {
+    'niah_learned_vs_dense_accuracy': {
+        'statement': ('On the far-necessity NIAH task, learned block selection retrieves '
+                      'planted answers more often than the parameter-matched dense baseline '
+                      'at the same training budget. The reported contrast is control minus '
+                      'learned top-1 accuracy, so a negative sign means learned is better.'),
+        'mechanism': ('Query-conditioned block selection retrieves the far key/value block '
+                      'instead of diluting it over the full dense context.'),
+        'predicted_sign': -1,
+        'primary_metric': 'top1_accuracy',
+        'metric_policy': 'niah_retrieval',
+        'requires_param_match': True,
+        'falsifier': ('Dense matches or beats learned selection accuracy after Holm '
+                      'correction, or the difference is within seed noise.'),
+    },
+    'niah_learned_vs_randidx_accuracy': {
+        'statement': ('Learned block selection retrieves planted NIAH answers more often '
+                      'than a trained random indexer with the same number of attended '
+                      'blocks. The reported contrast is control minus learned accuracy, so '
+                      'a negative sign means learned is better.'),
+        'mechanism': ('The retrieval gain comes from the learned relevance score, not from '
+                      'the extra trained parameters or the block budget itself.'),
+        'predicted_sign': -1,
+        'primary_metric': 'top1_accuracy',
+        'metric_policy': 'niah_retrieval',
+        'requires_param_match': True,
+        'falsifier': ('The random indexer matches or beats learned selection accuracy after '
+                      'Holm correction, or the difference is within seed noise.'),
+    },
+    'niah_learned_vs_allblocks_accuracy': {
+        'statement': ('Under the same top-k block budget, learned selection retrieves '
+                      'planted NIAH answers more often than the trained all-block control. '
+                      'The reported contrast is control minus learned accuracy, so a '
+                      'negative sign means learned is better.'),
+        'mechanism': ('Selecting the relevant blocks is better than spreading the same '
+                      'budget over all blocks, which dilutes attention to the far key.'),
+        'predicted_sign': -1,
+        'primary_metric': 'top1_accuracy',
+        'metric_policy': 'niah_retrieval',
+        'requires_param_match': True,
+        'falsifier': ('The all-block control matches or beats learned selection accuracy '
+                      'after Holm correction, or the difference is within seed noise.'),
+    },
+}
+
 def _splitmix64_u64(x):
     """Deterministic 64-bit mixing (SplitMix64) used for row folds.
 

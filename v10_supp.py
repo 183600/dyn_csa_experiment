@@ -1692,7 +1692,12 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             _ra['seeds'] = common
                             niah_acc_contrasts[f'NIAH-nat L{Ln} {cond}: {tag} - learned (answer accuracy)'] = _ra
             probe['niah_natural'] = {'cells': niah_cells, 'contrasts': niah_contrasts,
-                                     'accuracy_contrasts': niah_acc_contrasts}
+                                     'accuracy_contrasts': niah_acc_contrasts,
+                                     'hypothesis_audit': L.hypothesis_audit(
+                                         L.NIAH_HYPOTHESIS_DESIGN, 'niah')}
+            if probe['niah_natural']['hypothesis_audit'].get('status') != 'ok':
+                print('[stats] WARNING: NIAH hypotheses are incomplete or metric-misaligned: '
+                      + '; '.join((probe['niah_natural']['hypothesis_audit'].get('warnings') or [])[:3]))
             # NIAH contrasts are built AFTER the corruption family was
             # corrected.  Leaving them out of the Holm family would report
             # uncorrected p-values under a "Holm" heading, so re-run the

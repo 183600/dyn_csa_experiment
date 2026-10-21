@@ -6557,6 +6557,14 @@ def t_hypothesis_audit_completeness_and_metric_alignment():
     # ablation and the matched-dense baseline both do.
     assert L.HYPOTHESIS_DESIGN['compression_regularizer']['requires_param_match'] is True
     assert L.BASELINE_HYPOTHESIS_DESIGN['compression_vs_matched_dense']['requires_param_match'] is True
+    # The NIAH accuracy contrasts now have an explicit pre-registered
+    # hypothesis family too, including the reported sign convention.
+    _niah_ha = L.hypothesis_audit(L.NIAH_HYPOTHESIS_DESIGN, 'niah')
+    assert _niah_ha['status'] == 'ok' and not _niah_ha['invalid'], _niah_ha
+    for _name, _spec in L.NIAH_HYPOTHESIS_DESIGN.items():
+        assert _spec['primary_metric'] == 'top1_accuracy', _name
+        assert _spec['metric_policy'] == 'niah_retrieval', _name
+        assert _spec['predicted_sign'] == -1, _name
     bad_table = {
         'h0': {'statement': 'x', 'mechanism': 'y', 'predicted_sign': 0,
                'primary_metric': 'ndcg', 'falsifier': 'z'},

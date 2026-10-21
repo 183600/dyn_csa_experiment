@@ -1822,8 +1822,9 @@ def audit_hypotheses():
     out = {'status': 'ok',
            'component': L.hypothesis_audit(L.HYPOTHESIS_DESIGN, 'component'),
            'baseline': L.hypothesis_audit(L.BASELINE_HYPOTHESIS_DESIGN, 'baseline'),
-           'open_block': L.hypothesis_audit(L.OPEN_BLOCK_HYPOTHESIS_DESIGN, 'open_block')}
-    if any(out[k]['status'] != 'ok' for k in ('component', 'baseline', 'open_block')):
+           'open_block': L.hypothesis_audit(L.OPEN_BLOCK_HYPOTHESIS_DESIGN, 'open_block'),
+           'niah': L.hypothesis_audit(L.NIAH_HYPOTHESIS_DESIGN, 'niah')}
+    if any(out[k]['status'] != 'ok' for k in ('component', 'baseline', 'open_block', 'niah')):
         out['status'] = 'warn'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
