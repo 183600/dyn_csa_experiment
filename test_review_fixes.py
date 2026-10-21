@@ -10257,6 +10257,31 @@ def t_split_targets_use_exact_fraction_arithmetic():
         raise AssertionError('oversized explicit split must still be refused')
 
 
+def t_encoder_fit_audit_detects_holdout_vocabulary():
+    import data_guard as DG
+    Xtr = np.array([['a'], ['b'], ['a'], ['b']], dtype=object)
+    Xho = np.array([['c'], ['a']], dtype=object)
+    cat = DG.LeakageSafeCategoricalEncoder().fit(Xtr)
+    a = DG.audit_encoder_fit(cat, Xtr, Xho)
+    assert a['status'] == 'train_only_verified' and a['leak_detected'] is False, a
+    cat_leak = DG.LeakageSafeCategoricalEncoder().fit(np.vstack([Xtr, Xho]))
+    b = DG.audit_encoder_fit(cat_leak, Xtr, Xho)
+    assert b['status'] == 'leak_detected' and b['leak_detected'] is True, b
+    freq = DG.LeakageSafeFrequencyEncoder().fit(Xtr)
+    c = DG.audit_encoder_fit(freq, Xtr, Xho)
+    assert c['status'] == 'train_only_verified', c
+    freq_leak = DG.LeakageSafeFrequencyEncoder().fit(np.vstack([Xtr, Xho]))
+    d = DG.audit_encoder_fit(freq_leak, Xtr, Xho)
+    assert d['status'] == 'leak_detected' and d['leak_detected'] is True, d
+    try:
+        DG.audit_encoder_fit(DG.LeakageSafeTargetEncoder().fit(
+            Xtr, np.array([0.0, 1.0, 0.0, 1.0])), Xtr)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('target encoder is not a single-table fit and must be refused')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10510,6 +10535,7 @@ def main():
     _check('L15 cross-scale pooling refuses mixed corpus/tokenizer bindings', t_scale_corpus_binding_refuses_mixed_tokenizers)
     _check('L15c meta-analysis seed overlap controls pooling', t_meta_seed_overlap_controls_pooling)
     _check('L15d preprocessing fit audit detects full-table leakage', t_preprocessing_fit_audit_detects_full_table_leak)
+    _check('L15e encoder fit audit detects holdout vocabulary', t_encoder_fit_audit_detects_holdout_vocabulary)
     _check('L15b scale-point corpus provenance roundtrip', t_scale_point_provenance_roundtrip)
     _check('L16 Holm mixed-n floor + invalid family slot', t_holm_mixed_n_and_invalid_family_size)
     _check('L16b meta-analysis prediction-interval df', t_meta_prediction_interval_df)

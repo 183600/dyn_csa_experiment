@@ -45,6 +45,7 @@ __all__ = [
     'LeakageSafeTargetEncoder',
     'SafeScaler',
     'assert_no_split_leakage',
+    'audit_encoder_fit',
     'audit_preprocessor_fit',
     'categorical_shift_report',
     'chronological_split',
@@ -2131,6 +2132,112 @@ def audit_preprocessor_fit(preprocessor, X_train, X_holdout=None, *,
                        'and transform the holdouts')
     else:
         out['note'] = ('the fitted statistics match neither a train-only nor a '
+                       'train+holdout fit on the supplied rows; the fitting '
+                       'table is not verifiable from these arrays')
+    return out
+
+
+def audit_encoder_fit(encoder, X_train, X_holdout=None):
+    """Prove that a categorical/frequency encoder was fit on TRAIN only.
+
+    The analogue of :func:`audit_preprocessor_fit` for encoders whose fitted
+    state is a category set or a count table.  A holdout category silently
+    added to the training vocabulary is leakage even when the encoded values
+    happen to be in range: the feature space was defined with holdout data.
+
+    Supports :class:`LeakageSafeCategoricalEncoder` and
+    :class:`LeakageSafeFrequencyEncoder`.  Returns ``train_only_verified``,
+    ``leak_detected`` (fitted state equals a train+holdout fit) or
+    ``unverifiable``.  The target encoder is intentionally excluded: its
+    training features are out-of-fold by construction, so comparing a single
+    fitted table would not describe the encodings actually used.
+    """
+    if isinstance(encoder, LeakageSafeCategoricalEncoder):
+        kind = 'categorical'
+        def _make(stats):
+            return LeakageSafeCategoricalEncoder(
+                encoding=stats.get('encoding', 'ordinal'),
+                handle_unknown=stats.get('handle_unknown', 'unknown'))
+        def _fingerprint(stats):
+            feats = []
+            for st in stats.get('features') or []:
+                feats.append((
+                    tuple((type(v).__name__, repr(v))
+                          for v in (st.get('categories') or [])),
+                    int(st.get('n_categories', 0)),
+                    int(st.get('unknown_index', 0)),
+                    int(st.get('missing_index', 0))))
+            return tuple(feats)
+    elif isinstance(encoder, LeakageSafeFrequencyEncoder):
+        kind = 'frequency'
+        def _make(stats):
+            return LeakageSafeFrequencyEncoder(
+                normalize=stats.get('normalize', True),
+                handle_unknown=stats.get('handle_unknown', 'zero'))
+        def _fingerprint(stats):
+            feats = []
+            for st in stats.get('features') or []:
+                entries = tuple((type(e.get('value')).__name__, repr(e.get('value')),
+                                 int(e.get('count', 0)))
+                                for e in (st.get('entries') or []))
+                feats.append((entries, int(st.get('n_observed', 0)),
+                              int(st.get('n_missing', 0))))
+            return tuple(feats)
+    else:
+        raise TypeError(
+            'audit_encoder_fit supports LeakageSafeCategoricalEncoder and '
+            f'LeakageSafeFrequencyEncoder, got {type(encoder).__name__}')
+    if not getattr(encoder, 'fitted_', False):
+        raise ValueError('audit_encoder_fit needs a fitted encoder')
+    stats = encoder.get_stats()
+    Xtr = _as_categorical_2d(X_train, name='X_train')
+    if Xtr.shape[0] == 0:
+        raise ValueError('audit_encoder_fit: X_train is empty')
+
+    def _ref(rows):
+        return _make(stats).fit(rows).get_stats()
+
+    def _ok(ref):
+        return (int(ref.get('n_features_in', -1)) == int(stats.get('n_features_in', -2))
+                and str(ref.get('train_fp')) == str(stats.get('train_fp'))
+                and _fingerprint(ref) == _fingerprint(stats))
+
+    train_ref = _ref(Xtr)
+    out = {'kind': kind, 'status': 'unverifiable', 'leak_detected': False,
+           'stats_match_train': bool(_ok(train_ref)),
+           'stats_match_train_plus_holdout': None,
+           'n_train': int(Xtr.shape[0]), 'n_features': int(Xtr.shape[1]),
+           'n_holdout': None,
+           'note': ('the fitted categories/counts equal a fresh train-only fit'
+                    if _ok(train_ref) else
+                    'the fitted state does not equal a fresh fit on this '
+                    'X_train; pass the holdout rows to distinguish a different '
+                    'training table from a holdout-widened vocabulary')}
+    if out['stats_match_train']:
+        out['status'] = 'train_only_verified'
+        return out
+    if X_holdout is None:
+        return out
+    parts = X_holdout if isinstance(X_holdout, (list, tuple)) else [X_holdout]
+    parts = [_as_categorical_2d(part, name='X_holdout') for part in parts]
+    parts = [p for p in parts if p.shape[0] > 0]
+    if not parts:
+        return out
+    if any(p.shape[1] != Xtr.shape[1] for p in parts):
+        raise ValueError('audit_encoder_fit: holdout features do not match X_train')
+    Xh = np.vstack(parts)
+    full_ok = _ok(_ref(np.vstack([Xtr, Xh])))
+    out.update({'n_holdout': int(Xh.shape[0]),
+                'stats_match_train_plus_holdout': bool(full_ok)})
+    if full_ok:
+        out['status'] = 'leak_detected'
+        out['leak_detected'] = True
+        out['note'] = ('the encoder state matches a fit on train + holdout, not '
+                       'a train-only fit: holdout categories/counts widened '
+                       'the feature space; refit on train and transform the '
+                       'holdouts')
+    else:
+        out['note'] = ('the fitted state matches neither a train-only nor a '
                        'train+holdout fit on the supplied rows; the fitting '
                        'table is not verifiable from these arrays')
     return out
