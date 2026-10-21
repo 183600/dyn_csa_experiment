@@ -183,12 +183,14 @@ def main(argv=None):
         for c, v in sorted(_rows, key=lambda kv: (-(kv[1].get('n') or 0), kv[0])):
             lines.append(f'| {c} | {v.get("n")} | {(v.get("share") or 0) * 100:.1f}% | {v.get("mean_ce"):.3f} |')
     lines += ['', '## Worst tokens', '',
-              '| # | row | pos | CE | target | predicted | entropy | rare | cause | boundary |', '|---|---|---|---|---|---|---|---|---|---|']
+              '> Read the context before changing the model: a rare-but-correct target, a genuinely ambiguous continuation and a confident blind spot need different fixes.', '',
+              '| # | row | pos | CE | context (truncated) | target | predicted | entropy | rare | cause | boundary |', '|---|---|---|---|---|---|---|---|---|---|---|']
     _tokens = res.get('worst_tokens') if isinstance(res.get('worst_tokens'), list) else []
     for i, t in enumerate(_tokens):
         tgt = (t.get('target_text') or '').replace('|', '\\|').replace('\n', '\\n')[:80]
         prd = (t.get('pred_text') or '').replace('|', '\\|').replace('\n', '\\n')[:80]
-        lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | {t["ce"]:.3f} | `{t.get("target_id")}` {tgt} | `{t.get("pred_id")}` {prd} | {t["entropy"]:.3f} | {t.get("rare_target")} | {t.get("cause_primary")} | {t.get("is_boundary_token")} |')
+        ctx = (t.get('context_text') or '').replace('|', '\\|').replace('\n', '\\n')[:180]
+        lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | {t["ce"]:.3f} | {ctx} | `{t.get("target_id")}` {tgt} | `{t.get("pred_id")}` {prd} | {t["entropy"]:.3f} | {t.get("rare_target")} | {t.get("cause_primary")} | {t.get("is_boundary_token")} |')
     lines += ['', '## Worst sequences', '',
               '| # | row | mean CE | NLL | context (truncated) |', '|---|---|---|---|---|']
     for i, s in enumerate(res.get('worst_sequences') or []):

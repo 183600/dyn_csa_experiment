@@ -7413,6 +7413,7 @@ def t_report_error_analysis_section():
            'cause_guide': {'ambiguous_context': 'read the context'},
            'worst_tokens': [{'row': 0, 'position': 3, 'ce': 9.5,
                              'target_text': 'x', 'pred_text': 'y',
+                             'context_text': 'the surrounding words',
                              'cause_primary': 'ambiguous_context'}],
            'warning': 'validation only'}
     orig = BR.load
@@ -7424,6 +7425,7 @@ def t_report_error_analysis_section():
     assert 'Bad-case analysis' in txt and 'ambiguous_context' in txt, txt
     assert 'ckpt.pt' in txt and 'validation only' in txt, txt
     assert 'read the context' in txt and 'Whole-split' in txt, txt
+    assert 'the surrounding words' in txt, txt
     rec2 = dict(rec, checkpoint='/tmp/y/ckpt2.pt')
     orig_paths = BR._error_analysis_paths
     BR._error_analysis_paths = lambda: ['/a/summary.json', '/b/summary.json']

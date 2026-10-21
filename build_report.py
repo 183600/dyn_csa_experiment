@@ -2081,15 +2081,16 @@ def _render_error_analysis(d):
     _tokens_raw = d.get('worst_tokens')
     tokens = _tokens_raw if isinstance(_tokens_raw, list) else []
     if tokens:
-        lines += ['| # | row | pos | CE | target | predicted | cause |', '|---|---|---|---|---|---|---|']
+        lines += ['| # | row | pos | CE | context (truncated) | target | predicted | cause |', '|---|---|---|---|---|---|---|---|']
         for i, t in enumerate(tokens[:12]):
             if not isinstance(t, dict):
                 continue
             tgt = str(t.get('target_text') or t.get('target_id') or '').replace('|', '\\|').replace('\n', '\\n')[:60]
             prd = str(t.get('pred_text') or t.get('pred_id') or '').replace('|', '\\|').replace('\n', '\\n')[:60]
-            lines.append('| %d | %s | %s | %s | %s | %s | %s |' % (
+            ctx = str(t.get('context_text') or '').replace('|', '\\|').replace('\n', '\\n')[:120]
+            lines.append('| %d | %s | %s | %s | %s | %s | %s | %s |' % (
                 i + 1, fm(t.get('row'), 0), fm(t.get('position'), 0), fm(t.get('ce'), 3),
-                tgt, prd, t.get('cause_primary') or 'n/a'))
+                ctx, tgt, prd, t.get('cause_primary') or 'n/a'))
         lines.append('')
     if d.get('warning'):
         lines += [f'> {d.get("warning")}', '']
