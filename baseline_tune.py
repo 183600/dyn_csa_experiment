@@ -662,6 +662,37 @@ def _relaxed_pair_reason(a, b, tuned_arms):
     return None
 
 
+def _tuned_significant(st, p_holm, alpha=0.05):
+    """Significance gate for a tuned-vs-tuned contrast.
+
+    Holm reject plus effect-vs-noise is not enough: a complete-case subset
+    (skipped seeds), a seed-driven sign, or an n below the three-seed floor
+    cannot support the word "significant".  This mirrors
+    exp_lib.reportable_claim instead of letting the tuned artifact invent a
+    weaker standard."""
+    if not isinstance(st, dict):
+        return False
+    try:
+        _ph = float(p_holm)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not (math.isfinite(_ph) and _ph < alpha):
+        return False
+    _n = st.get('n')
+    if isinstance(_n, bool) or not isinstance(_n, int) or _n < 3:
+        return False
+    if st.get('underpowered') or st.get('within_seed_noise'):
+        return False
+    if st.get('seed_driven') is True:
+        return False
+    if st.get('complete_pairs') is False:
+        return False
+    _dropped = st.get('n_dropped')
+    if isinstance(_dropped, int) and not isinstance(_dropped, bool) and _dropped > 0:
+        return False
+    return True
+
+
 def _run_final(base, outdir, protocol, selected):
     # Use the same normalised plan the tuning driver validated (integers,
     # unique).  Reading the raw protocol here let a duplicate seed reach the
@@ -868,8 +899,12 @@ def _run_final(base, outdir, protocol, selected):
         _h = _holm.get(name) or {}
         st['p_holm'] = _h.get('p_holm')
         st['declared_family_m'] = _m
-        st['significant_holm'] = bool(_h.get('reject') and (not st.get('within_seed_noise'))
-                                      and st.get('controlled', True))
+        st['significant_holm'] = bool(_h.get('reject')
+                                      and _tuned_significant(st, st.get('p_holm')))
+        if st.get('seed_driven'):
+            comparison.setdefault('unstable_contrasts', []).append(name)
+        if st.get('complete_pairs') is False:
+            comparison.setdefault('incomplete_contrasts', []).append(name)
     _final_counts = {a: int(v.get('n_seeds') or 0) for a, v in arm_summary.items()}
     # Resolution is a property of the per-contrast exact-test floors, not only
     # of the seed count: ties (zero deltas) reduce the attainable p.  Report

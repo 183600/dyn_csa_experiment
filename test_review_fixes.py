@@ -2010,6 +2010,21 @@ def t_tuned_pairing_keeps_optimizer_gate():
         assert _why and ('hyperparams.' + _k) in _why, (_k, _why)
     _why = BT._relaxed_pair_reason(a9, b, {'a': 3, 'b': 3})
     assert _why and 'unverifiable hyperparams' in _why, _why
+    # A tuned contrast may not call a complete-case / seed-driven / n<3 panel
+    # significant just because its Holm p is small.
+    base_st = {'n': 3, 'p_exact_signflip': 0.02, 'p_holm': 0.03,
+               'mean': 1.0, 'std': 0.2, 'underpowered': False,
+               'within_seed_noise': False, 'seed_driven': False,
+               'complete_pairs': True, 'n_dropped': 0}
+    assert BT._tuned_significant(base_st, 0.03) is True
+    for _bad in (dict(base_st, n=2, underpowered=True),
+                 dict(base_st, within_seed_noise=True),
+                 dict(base_st, seed_driven=True),
+                 dict(base_st, complete_pairs=False),
+                 dict(base_st, n_dropped=1)):
+        assert BT._tuned_significant(_bad, 0.03) is False, _bad
+    assert BT._tuned_significant(base_st, None) is False
+    assert BT._tuned_significant(base_st, 0.5) is False
 
 
 def t_arm_mean_std_and_relative_effect():
