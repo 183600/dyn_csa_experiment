@@ -3599,6 +3599,9 @@ def t_multiclass_ranking_metrics_and_audit():
     assert m['trivial_baseline']['label'] == '0'
     assert abs(m['trivial_baseline']['accuracy'] - 0.8) < 1e-12
     assert abs(m['trivial_baseline']['f1_macro'] - (2.0 * 0.8 / 1.8) / 3.0) < 1e-12
+    # Micro F1 pools decisions across classes, so the constant-majority floor
+    # must equal its accuracy (not the majority class's binary F1).
+    assert abs(m['trivial_baseline']['f1_micro'] - 0.8) < 1e-12, m
     # One-vs-rest PR-AUC also has a non-zero chance floor (mean prevalence);
     # a raw PR-AUC of 0.5 at 1:1000 would not be skillful.
     assert abs(m['pr_auc_macro_chance'] - 1.0 / 3.0) < 1e-12, m

@@ -14111,7 +14111,10 @@ def _majority_class_floor(labels, supports):
         'accuracy': p,
         'balanced_accuracy': 1.0 / len(labels),
         'f1_macro': f1_major / len(labels),
-        'f1_micro': (2.0 * s / (n + s)) if n + s > 0 else 0.0,
+        # Micro F1 pools TP/FP/FN over all classes and therefore equals
+        # accuracy for a single-label multiclass problem; the majority
+        # class's own binary F1 is f1_major, not the micro average.
+        'f1_micro': p,
         'f1_weighted': f1_major * p,
         'note': ('always predicts the most frequent class (label order breaks ties); '
                  'a real model must beat this floor, and under imbalance this floor '
