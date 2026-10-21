@@ -649,8 +649,13 @@ def diagnose_training_instability(record, *, data_checked=None):
             'repair the record before treating its zero counts or health as evidence; '
             'an invalid count is unknown, not zero')
 
+    # A finite but far-above-clip gradient is an observed instability even
+    # when no step ever produced NaN/Inf.  Omitting it here let the function
+    # report the run as `clean` while its own gradient_explosion_lr check said
+    # `observed` — exactly the contradictory record the triage exists to
+    # prevent.
     _has_event = bool(n_loss or n_grad or guard_cleaned or bad_loss or bad_grad
-                      or health_nonfinite)
+                      or huge_grad or health_nonfinite)
     if not _has_event and not malformed:
         status = 'clean'
         primary = None

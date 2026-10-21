@@ -410,6 +410,16 @@ def t_nan_diagnosis_path():
                              'amp_scaler_overflows': 0, 'grad_norm_max': float('inf'),
                              'events': [{'kind': 'grad', 'grad_norm': float('inf'), 'lr': 1e-2}]}})
     assert grad['primary_suspect'] == 'gradient_explosion_lr', grad
+    # A FINITE but far-above-clip gradient is still an observed instability.
+    # It must not be reported as clean just because no NaN/Inf step occurred
+    # (the gradient_explosion_lr check itself is `observed`).
+    huge = L.diagnose_training_instability({
+        'amp_dtype': 'bf16',
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                             'amp_scaler_overflows': 0, 'grad_norm_max': 100.0,
+                             'events': []}})
+    assert huge['status'] == 'instability_observed', huge
+    assert huge['primary_suspect'] == 'gradient_explosion_lr', huge
     # A non-finite VALIDATION point can coexist with a finite training loss;
     # it must not be reported as clean.
     hbad = L.diagnose_training_instability({
