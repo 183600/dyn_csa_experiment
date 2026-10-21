@@ -12321,6 +12321,73 @@ def t_simple_floor_rejects_undeclared_arms_and_blank_fields():
         'best_ppl_estimation_rows' in p for p in rwr['problems']), rwr
 
 
+def t_simple_baseline_bound_floor_identity_and_rows():
+    rng = np.random.default_rng(23)
+    vocab = 24
+    train = rng.integers(0, vocab, size=400)
+    val = rng.integers(0, vocab, size=(4, 20))
+    proto = dict(L.SIMPLE_BASELINE_POLICY,
+                 arms={'unigram': {'order': 1}, 'bigram': {'order': 2}},
+                 grids={'unigram': {'alpha': [0.1, 1.0]},
+                        'bigram': {'alpha': [0.1, 1.0], 'interpolation': [0.5, 1.0]}})
+    art = L.simple_baseline_fit(train, val, vocab, protocol=proto)
+    assert L.simple_baseline_audit(art, protocol=proto)['baseline_verified'] is True
+    # The reader-facing floor identity must not fall back to the legacy alias
+    # when `best_baseline` is explicitly blank/null.
+    for _bad_name in ('', None):
+        bad = json.loads(json.dumps(art))
+        bad['best_baseline'] = _bad_name
+        r = L.simple_baseline_audit(bad, protocol=proto)
+        assert r['baseline_verified'] is False and any(
+            'best_baseline' in p for p in r['problems']), (_bad_name, r)
+    # A present-but-non-finite floor value is malformed evidence, not an
+    # absent legacy field.
+    bad_ppl = json.loads(json.dumps(art))
+    bad_ppl['best_ppl'] = float('nan')
+    rp = L.simple_baseline_audit(bad_ppl, protocol=proto)
+    assert rp['baseline_verified'] is False and any(
+        'best_ppl' in p for p in rp['problems']), rp
+    # Explicit nulls in the per-arm selection cannot silently fall back to a
+    # different field.
+    _arm = art['best_baseline']
+    bad_sel = json.loads(json.dumps(art))
+    bad_sel['baselines'][_arm]['selected'] = None
+    rs = L.simple_baseline_audit(bad_sel, protocol=proto)
+    assert rs['baseline_verified'] is False and any(
+        'selected config' in p for p in rs['problems']), rs
+    bad_val = json.loads(json.dumps(art))
+    bad_val['baselines'][_arm]['selected_metric_value'] = None
+    rv = L.simple_baseline_audit(bad_val, protocol=proto)
+    assert rv['baseline_verified'] is False and any(
+        'selected ppl' in p for p in rv['problems']), rv
+    # The estimation-rows label needs actual nested evidence; without it the
+    # claim is unverifiable rather than true.
+    no_data = json.loads(json.dumps(art))
+    no_data.pop('data', None)
+    rd = L.simple_baseline_audit(no_data, protocol=proto)
+    assert rd['baseline_verified'] is False and any(
+        'cannot be verified' in p for p in rd['problems']), rd
+    # Per-arm per-row accounting in a nested artifact must describe the held
+    # out fold, and an unknown marker is not a sample identity.
+    sel, ev, meta = L.validation_row_split(8, seed=20261020, n_folds=2,
+                                           selection_fold=0, evaluation_fold=1)
+    val8 = rng.integers(0, vocab, size=(8, 15))
+    nested = L.simple_baseline_fit(train, val8, vocab, protocol=proto,
+                                   selection_rows=sel, evaluation_rows=ev,
+                                   row_split=meta)
+    assert L.simple_baseline_audit(nested, protocol=proto)['baseline_verified'] is True
+    wrong_rows = json.loads(json.dumps(nested))
+    wrong_rows['baselines'][_arm]['reported_estimation_rows'] = 'full_validation'
+    rr = L.simple_baseline_audit(wrong_rows, protocol=proto)
+    assert rr['baseline_verified'] is False and any(
+        'not the held-out fold' in p for p in rr['problems']), rr
+    unknown = json.loads(json.dumps(nested))
+    unknown['baselines'][_arm]['reported_estimation_rows'] = 'some_fold'
+    ru = L.simple_baseline_audit(unknown, protocol=proto)
+    assert ru['baseline_verified'] is False and any(
+        'reported_estimation_rows' in p for p in ru['problems']), ru
+
+
 def t_metric_audit_recommended_availability_and_exact_floor_support():
     y = np.array([0] * 1000 + [1])
     score = np.r_[np.linspace(0.0, 0.4, 1000), 0.9]
@@ -12701,6 +12768,7 @@ def main():
     _check('L51 baseline audit binds direction + rejects explicit blank fields', t_baseline_audit_direction_and_explicit_field_fallbacks)
     _check('L51b count floor rejects undeclared arms/blank fields', t_simple_floor_rejects_undeclared_arms_and_blank_fields)
     _check('L51c recommended endpoint availability + exact floor support', t_metric_audit_recommended_availability_and_exact_floor_support)
+    _check('L52 simple-baseline floor identity/rows bind their evidence', t_simple_baseline_bound_floor_identity_and_rows)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

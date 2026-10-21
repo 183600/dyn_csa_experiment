@@ -13409,7 +13409,10 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             problems.append(f'{arm}: no trial records')
             continue
         cfgs = [json.dumps(t.get('config') or {}, sort_keys=True, default=str) for t in trials if isinstance(t, dict)]
-        chosen = entry.get('selected') or entry.get('selected_config')
+        # Only an ABSENT `selected` may fall back to the legacy alias; an
+        # explicit null/blank value is evidence that the selection was lost.
+        chosen = (entry['selected'] if 'selected' in entry
+                  else entry.get('selected_config'))
         if not isinstance(chosen, dict):
             problems.append(f'{arm}: no selected config')
             continue
@@ -13424,9 +13427,9 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         if not vals:
             problems.append(f'{arm}: no finite {metric} in its trials')
             continue
-        chosen_value = entry.get('selected_metric_value')
-        if chosen_value is None:
-            chosen_value = chosen_trial.get(metric)
+        chosen_value = (entry['selected_metric_value']
+                        if 'selected_metric_value' in entry
+                        else chosen_trial.get(metric))
         chosen_f = _finite_scalar(chosen_value)
         if chosen_f is None:
             problems.append(f'{arm}: no finite selected {metric} value')
@@ -13672,6 +13675,13 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
                     problems.append(f'{arm}: reported per-row NLL/token values are not finite exact numbers')
                 else:
                     _marker = entry.get('reported_estimation_rows')
+                    if (_marker is not None
+                            and _marker not in ('nested_validation_holdout',
+                                                'full_validation')):
+                        problems.append(
+                            f'{arm}: reported_estimation_rows={_marker!r} is not '
+                            'one of nested_validation_holdout/full_validation; '
+                            'the reported rows cannot be identified')
                     if _marker == 'nested_validation_holdout':
                         _want_tok = _exact_count(entry.get('holdout_n_tokens'), minimum=1)
                         _want_nll = _finite_scalar(entry.get('holdout_nll'))
@@ -13786,6 +13796,18 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             problems.append('nested simple-baseline artifact lacks selection/evaluation token fingerprints')
         elif _sel_fp == _eval_fp:
             problems.append('nested simple-baseline selection and evaluation token fingerprints are identical')
+        # Per-arm accounting must describe the SAME sample as the floor the
+        # artifact quotes.  A nested artifact whose rows are labelled
+        # full_validation (or vice versa) is comparing different samples.
+        _want_marker = 'nested_validation_holdout'
+        for _arm, _entry in baselines.items():
+            if not isinstance(_entry, dict):
+                continue
+            _marker = _entry.get('reported_estimation_rows')
+            if _marker is not None and _marker != _want_marker:
+                problems.append(
+                    f'{_arm}: nested baseline reports per-row accounting for '
+                    f'{_marker!r}, not the held-out fold')
         _hold_tok = set()
         for arm, entry in baselines.items():
             if not isinstance(entry, dict):
@@ -13826,15 +13848,33 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
                 f'best_ppl_estimation_rows={_reported_rows!r} does not match the '
                 f'artifact\'s nested evidence ({_want_rows!r}); the quoted floor '
                 'describes a different sample than the one that was scored')
+    elif _reported_rows is not None:
+        problems.append(
+            f'best_ppl_estimation_rows={_reported_rows!r} cannot be verified: '
+            'the artifact carries no nested/full-validation row evidence')
     best_name = None
     best_ppl_value = None
     if selected_values:
         best_name = min(selected_values, key=selected_values.get)
-        reported = artifact.get('best_baseline') or artifact.get('best_arm')
+        # An explicitly empty/None `best_baseline` must not silently fall back
+        # to the legacy alias: the floor identity is part of the claim.
+        reported = (artifact['best_baseline'] if 'best_baseline' in artifact
+                    else artifact.get('best_arm'))
         reported_ppl = artifact.get('best_ppl')
+        if 'best_baseline' in artifact and reported is None:
+            problems.append('best_baseline is present but null; the quoted floor '
+                            'has no arm identity')
+        if (reported is not None and isinstance(reported, str)
+                and not reported.strip()):
+            problems.append('best_baseline is present but blank; the quoted floor '
+                            'has no arm identity')
         if reported is not None and reported != best_name:
             problems.append(f'best_baseline={reported!r} is not the minimum selected arm ({best_name!r})')
         _reported_f = _finite_scalar(reported_ppl)
+        if 'best_ppl' in artifact and _reported_f is None:
+            problems.append(
+                f'best_ppl={reported_ppl!r} is present but not a finite number; '
+                'the quoted floor cannot be verified')
         if nested_applied is True:
             _expected = _finite_scalar((baselines.get(best_name) or {}).get('holdout_metric_value'))
             if _expected is None:
