@@ -21055,8 +21055,47 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
     arr = torch.as_tensor(ids)
     if arr.ndim == 1:
         arr = arr[None, :]
+    if arr.ndim != 2 or int(arr.shape[1]) < 1:
+        raise ValueError(
+            f'measure_efficiency_sweep needs a non-empty 1-D/2-D token table, '
+            f'got shape {tuple(arr.shape)}')
+    try:
+        _lens_raw = list(lengths)
+    except TypeError:
+        raise ValueError(f'lengths must be an iterable of positive integers, got {lengths!r}') from None
+    if not _lens_raw:
+        raise ValueError('lengths must contain at least one sequence length')
+    _lens = []
+    for _x in _lens_raw:
+        _n = _exact_count(_x, minimum=1)
+        if _n is None:
+            raise ValueError(f'lengths must contain positive integers, got {_x!r}')
+        _lens.append(int(_n))
+    try:
+        _batches_raw = list(batches)
+    except TypeError:
+        raise ValueError(f'batches must be an iterable of positive integers, got {batches!r}') from None
+    if not _batches_raw:
+        raise ValueError('batches must contain at least one batch size')
+    _batches = []
+    for _x in _batches_raw:
+        _n = _exact_count(_x, minimum=1)
+        if _n is None:
+            raise ValueError(f'batches must contain positive integers, got {_x!r}')
+        _batches.append(int(_n))
+    _warm = _exact_count(warmup, minimum=0)
+    _iters = _exact_count(iters, minimum=1)
+    if _warm is None:
+        raise ValueError(f'warmup must be a non-negative integer, got {warmup!r}')
+    if _iters is None:
+        raise ValueError(f'iters must be a positive integer, got {iters!r}')
+    warmup, iters = int(_warm), int(_iters)
     arr = arr.to(device)
-    max_len = int(min(arr.shape[1], max(int(x) for x in lengths)))
+    max_len = int(min(arr.shape[1], max(_lens)))
+    if not any(0 < int(x) <= max_len for x in _lens):
+        raise ValueError(
+            f'none of lengths={_lens} fits the token table width '
+            f'{int(arr.shape[1])}; refusing to return an empty sweep as success')
     out = {'status': 'ok', 'device': str(device), 'torch': torch.__version__,
            'triton': None, 'tf32': None, 'rows': [],
            'decode_has_kv_cache': False,
@@ -21072,8 +21111,8 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
     except Exception:
         pass
     try:
-        for bs in [int(b) for b in batches if int(b) >= 1]:
-            for L in [int(x) for x in lengths if 0 < int(x) <= max_len]:
+        for bs in _batches:
+            for L in [int(x) for x in _lens if 0 < int(x) <= max_len]:
                 base = arr[:, :L]
                 if base.shape[0] < bs:
                     reps = (bs + base.shape[0] - 1) // base.shape[0]

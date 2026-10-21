@@ -7401,6 +7401,19 @@ def t_efficiency_pairs_audit_and_sweep():
     sw = L.measure_efficiency_sweep(model, ids, torch.device('cpu'), lengths=(8, 16), batches=(1, 2), warmup=0, iters=1)
     assert sw['status'] == 'ok' and len(sw['rows']) == 4, sw
     assert sw['decode_has_kv_cache'] is False and sw['measurement'] == 'cpu perf_counter', sw
+    # A malformed/empty shape grid must not produce an empty row list that
+    # still claims status=ok: that looks like a completed sweep.
+    for _kw in ({'lengths': ()}, {'lengths': (8.5,)}, {'lengths': (True,)},
+                {'lengths': (100,)}, {'batches': ()}, {'batches': (0,)},
+                {'batches': (True,)}, {'warmup': -1}, {'iters': 0}):
+        _args = dict(lengths=(8,), batches=(1,), warmup=0, iters=1)
+        _args.update(_kw)
+        try:
+            L.measure_efficiency_sweep(model, ids, torch.device('cpu'), **_args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'measure_efficiency_sweep accepted {_kw!r}')
 
 
 def t_efficiency_pareto_is_grouped():
