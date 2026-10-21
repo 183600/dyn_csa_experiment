@@ -313,6 +313,16 @@ def _validated_index(values, *, name='index'):
         return _empty_index()
     kind = flat.dtype.kind
     if kind in 'iu':
+        # An unsigned index can hold values above int64's maximum.  Casting
+        # those would wrap to a negative int64, so the overlap/negativity
+        # checks below would reject a valid-looking split with a misleading
+        # "negative index" message (or, for some widths, silently alias).  Fail
+        # on the actual out-of-range value first.
+        if kind == 'u' and flat.size:
+            if int(flat.max()) > int(np.iinfo(np.int64).max):
+                raise ValueError(
+                    f'{name} contains an out-of-range row index '
+                    f'{int(flat.max())}; indices must fit in int64')
         out = flat.astype(np.int64, copy=False)
     elif kind == 'f':
         f = flat.astype(np.float64, copy=False)
@@ -320,6 +330,13 @@ def _validated_index(values, *, name='index'):
             raise ValueError(f'{name} contains NaN/Inf; split indices must be finite')
         if np.any(f != np.floor(f)):
             raise ValueError(f'{name} contains non-integer row indices')
+        # float64 cannot represent int64_max exactly; its nearest float is
+        # 2**63, which is already outside the int64 range.  Check the exact
+        # boundary before the cast instead of relying on the wrapped result.
+        if np.any(f >= 2.0 ** 63):
+            raise ValueError(
+                f'{name} contains an out-of-range row index '
+                f'{float(f.max())!r}; indices must fit in int64')
         out = f.astype(np.int64)
     elif kind == 'O':
         # Reject strings, datetimes and booleans instead of coercing them:
