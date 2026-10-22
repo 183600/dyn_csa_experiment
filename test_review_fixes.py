@@ -16874,6 +16874,51 @@ def t_confirmation_parameter_binding():
     assert d4['param_match_complete'] is True and d4['param_matched'] is False, d4
 
 
+def t_window_geometry_is_built_per_chunk():
+    # The full [n, w] window table is O(n*w) and is only consumed by the
+    # full-width mask hoist.  The row-chunked attention path must build the
+    # rows it reads and produce exactly the values of the full table.
+    torch = __import__('torch')
+    n, w = 64, 6
+    full_i, full_v = L._window_geometry(n, w, 'cpu')
+    for (s, e) in ((0, n), (0, 1), (17, 33), (n - 3, n), (n, n)):
+        for off in (0, 5, 123):
+            gi, gv = L._window_geometry_rows(n, w, 'cpu', s, e, offset=off)
+            ei = ((full_i[s:e] + off).to(torch.int32) if off else full_i[s:e])
+            assert gi.shape == (max(0, e - s), w) and gv.shape == gi.shape
+            if s < e:
+                assert torch.equal(gi, ei)
+                assert torch.equal(gv, full_v[s:e])
+
+    # End-to-end: force the chunked branch and make any full-table build
+    # fail, so a regression that reintroduces the O(n*w) allocation is
+    # caught rather than merely slow.
+    nh, hd, nb, B = 2, 8, 5, 11
+    q = torch.randn(64, nh, hd, dtype=torch.float64)
+    kb = torch.randn(B, nh, hd, dtype=torch.float64)
+    vb = torch.randn(B, nh, hd, dtype=torch.float64)
+    ks = torch.randn(64, nh, hd, dtype=torch.float64)
+    vs = torch.randn(64, nh, hd, dtype=torch.float64)
+    idx = torch.randint(0, B, (64, nb))
+    last = torch.randint(0, 64, (B,))
+    valid = torch.rand(64, nb) < 0.8
+    ref = L.gathered_attention(q, kb, vb, idx, last, ks, vs, w, 1.0,
+                               sel_valid=valid)
+    old_ok, old_geo = L._attn_full_width_ok, L._window_geometry
+
+    def _no_full(*_a, **_k):
+        raise AssertionError('the chunked path built the full window table')
+
+    try:
+        L._attn_full_width_ok = lambda *_a, **_k: False
+        L._window_geometry = _no_full
+        got = L.gathered_attention(q, kb, vb, idx, last, ks, vs, w, 1.0,
+                                   sel_valid=valid)
+    finally:
+        L._attn_full_width_ok, L._window_geometry = old_ok, old_geo
+    assert torch.equal(ref, got), (ref - got).abs().max().item()
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -17274,6 +17319,7 @@ def main():
     _check('L62 seq2k sweep contrasts carry explicit factor declarations', t_seq2k_contrasts_carry_factor_declarations)
     _check('L63 driver method-vs-dense pairs carry a capacity-control verdict', t_driver_pair_capacity_controls)
     _check('L64 indexer chunked partial tile preserves the compact row stride', t_indexer_chunked_partial_tile_preserves_row_stride)
+    _check('L64b window geometry is built per chunk, not as a full O(n*w) table', t_window_geometry_is_built_per_chunk)
     _check('L65 categorical shift keeps equal-length tuple categories intact', t_categorical_shift_preserves_equal_length_tuple_categories)
     _check('L66 preprocessor audit rejects truncated feature stats', t_preprocessor_audit_rejects_truncated_stats)
     _check('L67 single-factor audit fails closed on a non-object manifest', t_single_factor_audit_rejects_nonobject_manifest)

@@ -2760,6 +2760,45 @@ def _window_geometry(n, w, device):
     _cache_put(_IDX_CACHE, key, pair, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return pair
 
+
+def _window_geometry_rows(n, w, device, start, end, offset=0):
+    """Row slice ``[start, end)`` of :func:`_window_geometry`, built on demand.
+
+    The cached full table is O(n*w); at long context that is much larger than
+    the attention chunk that actually reads it (and larger than the mask
+    budget the rest of this module enforces).  Every row of the table is a
+    pure function of that row's own position, so building only the rows a
+    chunk consumes is value-identical to slicing the full table: the same
+    int32 arithmetic, the same pre-clamp validity mask and the same clamp.
+
+    ``offset`` adds the block-table row offset used by the concatenated
+    ``[blocks | window]`` KV table.  Keeping it here lets the chunked path do
+    the addition per chunk instead of materialising an O(n*w) offset table.
+
+    The result is deliberately not cached: keeping every chunk would rebuild
+    the full table in the cache, so the caller pays the small per-chunk
+    integer arithmetic instead of the O(n*w) allocation.
+    """
+    n = int(n)
+    w = int(w)
+    start = max(0, min(int(start), n))
+    end = max(start, min(int(end), n))
+    rows = end - start
+    if rows <= 0 or w <= 0:
+        # Preserve the [rows, 0] shape contract for w == 0 (the block-only
+        # attention path) without touching the arange/range caches.
+        return (torch.empty((rows, max(w, 0)), dtype=torch.int32, device=device),
+                torch.empty((rows, max(w, 0)), dtype=torch.bool, device=device))
+    pos = _arange_cache(n, device)[start:end]
+    rel = _range_cache(0, w, device)
+    with torch.inference_mode(False):
+        win_idx = pos.to(torch.int32)[:, None] - (w - 1) + rel.to(torch.int32)[None, :]
+        valid = win_idx >= 0
+        win_idx.clamp_(min=0)
+        if offset:
+            win_idx = (win_idx + int(offset)).to(torch.int32)
+    return win_idx, valid
+
 def _range_cache(lo, hi, device):
     if lo == 0:
         return _arange_cache(hi, device)
@@ -4897,7 +4936,17 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     q_chunk = max(1, min(int(q_chunk), n))
     out = torch.empty_like(q)
     pos_all = _arange_cache(n, dev)
-    win_idx, win_valid_all = _window_geometry(n, w, dev)
+    # Only the full-width branch needs the O(n*w) geometry table.  At long
+    # context (or a wide top-k sweep) the chunked branch serves every row it
+    # reads from `_window_geometry_rows`, so the cached full table would be a
+    # pure O(n*w) allocation with no consumer.
+    _nb = int(topk_idx.shape[1])
+    _dedup = (not topk_distinct) and _nb > 1
+    _full_width = _attn_full_width_ok(n, _nb, w, _dedup)
+    if _full_width:
+        win_idx, win_valid_all = _window_geometry(n, w, dev)
+    else:
+        win_idx = win_valid_all = None
     _MINL = _finfo_min(k_blk.dtype)
     # The V halves are laid out contiguously once and gathered with one
     # combined row index per chunk: the selected rows of `v_all` are exactly
@@ -4948,9 +4997,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # ids (the read-everything HCA arm passes an arange expansion), in which
     # case first_occurrence_mask is provably all-True — the keep mask is then
     # identical to the computed form.
-    _nb = int(topk_l.shape[1])
-    _dedup = (not topk_distinct) and _nb > 1
-    if _attn_full_width_ok(n, _nb, w, _dedup):
+    if _full_width:
         # Build the [selected | window] table in place: the block half is
         # written straight into its slice, with no separate sel table and cat
         # copy needed; the result is the same boolean table, lane for lane.
@@ -4996,7 +5043,12 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         del valid_all
     else:
         _plan = None
-    _win_off_tab = _window_block_offset(n, w, _nblk_rows, dev) if _win_off else None
+    # The full offset table is also O(n*w) and is only consumed by the
+    # full-width branch.  The chunked branch adds the same block offset to its
+    # own row slice in `_window_geometry_rows`, so it never allocates this
+    # table.
+    _win_off_tab = (_window_block_offset(n, w, _nblk_rows, dev)
+                    if (_win_off and _has_all) else None)
     # Full-width row-table hoist: when the hoisted [n, nb + w] masks are live
     # (`_has_all`) and the int64 rows table fits the same byte ceiling the
     # mask hoist uses, the concatenated [selected | window] row table is
@@ -5017,6 +5069,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         qseg = q[s:e]
         if _plan is not None:
             keep, nvalid, anyrow = _plan[s // q_chunk]
+            _win_local = win_idx[s:e]
+            _win_rows = _win_off_tab[s:e] if _win_off_tab is not None else _win_local
         else:
             # per-chunk form of the full-width table (same integers, same
             # booleans).
@@ -5031,7 +5085,14 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
                 keep = _ddk if keep is None else keep & _ddk
             if keep is not None:
                 sel_blk = sel_blk & keep
-            valid = torch.cat([sel_blk, win_valid_all[s:e]], dim=1)
+            # Build only the [rows, w] window geometry this chunk reads: the
+            # full [n, w] table/offset table is not materialised here.  The
+            # local indices address k_sw/v_sw; the offset rows address the
+            # concatenated [blocks | window] table.
+            _win_local, _win_valid = _window_geometry_rows(n, w, dev, s, e)
+            _win_rows = ((_win_local + _win_off).to(torch.int32)
+                         if _win_off else _win_local)
+            valid = torch.cat([sel_blk, _win_valid], dim=1)
             nvalid = ~valid[:, None, :]
             anyrow = None if _has_sink else valid.any(-1)
             del sel_blk, valid
@@ -5043,8 +5104,6 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # hence every downstream value — are bit-identical to the
         # cat-then-gather form (index re-plumbing only, design notes §6.1).
         _sel_rows = topk_l[s:e]
-        _win_local = win_idx[s:e]
-        _win_rows = _win_off_tab[s:e] if _win_off_tab is not None else _win_local
         # `_has_sw` is the contract for stacking window lanes: the row offset
         # may be 0 when k_blk holds no rows, and that is still a valid
         # stacked-row base.
@@ -5165,7 +5224,6 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
     per_row = 4 * M * nh * hd + 2 * M * nh
     q_chunk = max(1, min(int(q_chunk), max(1, int(mem_budget_bytes) // max(1, per_row * q.element_size()))))
     q_chunk = max(1, min(q_chunk, n))
-    win_idx, win_valid_all = _window_geometry(n, int(w), dev)
     _MINL = _finfo_min(k_blk.dtype)
     out = torch.empty_like(q)
     mass = None
@@ -5204,11 +5262,14 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
             raise ValueError(f'unknown prefix_kind {prefix_kind!r}')
         Kc = torch.where(is_pref[:, :, None, None], pk, kb)
         Vc = torch.where(is_pref[:, :, None, None], pv, vb)
-        kw = k_sw[win_idx[s:e]]
-        vw = v_sw[win_idx[s:e]]
+        # Per-chunk window geometry: this path has no full-width mask hoist,
+        # so there is no reason to materialise the O(n*w) table.
+        _win_local, _win_valid = _window_geometry_rows(n, int(w), dev, s, e)
+        kw = k_sw[_win_local]
+        vw = v_sw[_win_local]
         Kall = torch.cat([Kc, kw], 1)
         Vall = torch.cat([Vc, vw], 1)
-        valid_all = torch.cat([valid, win_valid_all[s:e]], 1)
+        valid_all = torch.cat([valid, _win_valid], 1)
         logits = torch.einsum('qhd,qmhd->qhm', qseg, Kall)
         if scale != 1.0:
             logits.mul_(scale)

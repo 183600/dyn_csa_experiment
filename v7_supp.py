@@ -365,7 +365,6 @@ class HybridAttentionRoPE(L.HybridAttention):
         # RoPE is position-wise, so rotating the gathered rows gives
         # exactly the same values as rotating the table and then gathering.
         out = torch.empty_like(q)
-        _wi_all, _wvalid_all = L._window_geometry(T, w, dev)
         pos_all = L._arange_cache(T, dev)
         q_chunk = max(1, min(int(q_chunk), T))
         _MINL = L._finfo_min(k_blk.dtype)
@@ -387,7 +386,12 @@ class HybridAttentionRoPE(L.HybridAttention):
         # arange expansion) makes first_occurrence_mask provably all-True — the
         # keep mask is then identical to the computed form.
         _dedup = (not topk_distinct) and topk_l.shape[1] > 1
-        if L._attn_full_width_ok(T, topk_l.shape[1], w, _dedup):
+        _full_ok = L._attn_full_width_ok(T, topk_l.shape[1], w, _dedup)
+        if _full_ok:
+            _wi_all, _wvalid_all = L._window_geometry(T, w, dev)
+        else:
+            _wi_all = _wvalid_all = None
+        if _full_ok:
             _sel_all = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
             _keep_all = sel_valid
             if _dedup:
@@ -413,6 +417,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 valid = _valid_all[s:e]
                 _nvalid = _nvalid_all[s:e]
                 _anyrow = None if _anyrow_all is None else _anyrow_all[s:e]
+                _iw = _wi_all[s:e]
             else:
                 # Row-chunked construction when the full-width mask is not
                 # built.
@@ -424,14 +429,16 @@ class HybridAttentionRoPE(L.HybridAttention):
                     _keep = _ddk if _keep is None else _keep & _ddk
                 if _keep is not None:
                     sel = sel & _keep
-                valid = torch.cat([sel, _wvalid_all[s:e]], 1)
+                # Build only this chunk's window rows; the full O(T*w) table
+                # is not materialised when the mask hoist is skipped.
+                _iw, _wvalid = L._window_geometry_rows(T, w, dev, s, e)
+                valid = torch.cat([sel, _wvalid], 1)
                 _nvalid = ~valid[:, None, :]
                 _anyrow = valid.any(-1) if sink is None else None
-            # ib selects rows of k_blk_r / v_blk and _wi_all selects rows of
+            # ib selects rows of k_blk_r / v_blk and _iw selects rows of
             # k_sw_r / v_sw — exactly the rows the cat-then-gather form
             # addressed through the +n_blk offsets, so every gathered value is
             # bit-identical (index re-plumbing only, §6.1).
-            _iw = _wi_all[s:e]
             _Kb = L._take_2d(k_blk_r, ib)
             if _has_sw:
                 _Kw = L._take_2d(k_sw, _iw)
