@@ -380,12 +380,15 @@ def _validated_index(values, *, name='index'):
         if np.any(f != np.floor(f)):
             raise ValueError(f'{name} contains non-integer row indices')
         # float64 cannot represent int64_max exactly; its nearest float is
-        # 2**63, which is already outside the int64 range.  Check the exact
-        # boundary before the cast instead of relying on the wrapped result.
-        if np.any(f >= 2.0 ** 63):
+        # 2**63, which is already outside the int64 range.  Check both exact
+        # boundaries before the cast instead of relying on an
+        # implementation-defined overflow (which also warns) for values far
+        # outside the range.
+        if np.any(f >= 2.0 ** 63) or np.any(f < -(2.0 ** 63)):
             raise ValueError(
                 f'{name} contains an out-of-range row index '
-                f'{float(f.max())!r}; indices must fit in int64')
+                f'{float(f.min() if f.min() < -(2.0 ** 63) else f.max())!r}; '
+                'indices must fit in int64')
         out = f.astype(np.int64)
     elif kind == 'O':
         # Reject strings, datetimes and booleans instead of coercing them:
@@ -4153,8 +4156,19 @@ def _matrix_fingerprint(X):
                 _back_u[_castable] = block_f[_castable].astype(np.uint64)
             _exact = _castable & (_back_u == _raw)
         else:
-            _back = block_f.astype(np.int64)
-            _exact = _back == _raw
+            # Guard the float64 -> int64 cast.  The float64 image of int64_max
+            # is 2**63, which is outside int64; casting it directly is an
+            # implementation-defined overflow that emits a RuntimeWarning (and
+            # raises if warnings are errors).  Such a value is inexact by
+            # definition, so mark it non-castable and let the exact tail below
+            # carry it.
+            _castable = (np.isfinite(block_f)
+                         & (block_f >= -(2.0 ** 63))
+                         & (block_f < (2.0 ** 63)))
+            _back = np.zeros(_raw.shape, dtype=np.int64)
+            if _castable.any():
+                _back[_castable] = block_f[_castable].astype(np.int64)
+            _exact = _castable & (_back == _raw)
         _bad_rows = ~_exact.all(axis=-1) if _exact.ndim > 1 else ~_exact
         if np.any(_bad_rows):
             _bad = _raw[_bad_rows]

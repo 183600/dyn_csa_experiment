@@ -1510,10 +1510,14 @@ def _by_len_shape_reason(rec, n_seq):
                         f'entries, not the frozen n_seq={int(n_seq)}')
         if _c.get('n_seq') is not None:
             _ns = _c.get('n_seq')
-            if (isinstance(_ns, (bool, np.bool_))
-                    or not isinstance(_ns, (int, float, np.integer, np.floating))
-                    or not math.isfinite(float(_ns))
-                    or float(_ns) != int(n_seq)):
+            if isinstance(_ns, (bool, np.bool_)) or not isinstance(
+                    _ns, (int, float, np.integer, np.floating)):
+                return f'by_len[{_ln_i}].n_seq={_ns!r} != the frozen n_seq={int(n_seq)}'
+            try:
+                _nsf = float(_ns)
+            except (TypeError, ValueError, OverflowError):
+                return f'by_len[{_ln_i}].n_seq={_ns!r} != the frozen n_seq={int(n_seq)}'
+            if not math.isfinite(_nsf) or _nsf != int(n_seq):
                 return f'by_len[{_ln_i}].n_seq={_ns!r} != the frozen n_seq={int(n_seq)}'
     return None
 
@@ -1551,6 +1555,16 @@ def _admit_confirmation_records(raw, manifest):
     若清单声明/记录携带 ckpt_sha256，则同一权重摘要不得冒充另一个
     (variant, seed) 的独立测量。
     返回 (admitted[(variant, seed)] -> record, unified data_fp)。"""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise SystemExit(
+            '[p5t stats] REFUSE: the bylen payload must be a JSON object '
+            f'mapping record keys to records, got {type(raw).__name__}')
+    if not isinstance(manifest, dict):
+        raise SystemExit(
+            '[p5t stats] REFUSE: the frozen manifest must be a JSON object, '
+            f'got {type(manifest).__name__}')
     arms = list(manifest['arms'])
     seed_whitelist = {int(s) for s in manifest['seeds']}
     exp_code = L.code_stamp()  # eager-only; kernel mode is refused at load

@@ -3230,6 +3230,23 @@ def _np_range(n):
         _NP_RANGE_CACHE[n] = a
     return a
 
+# Host pooling geometry is uploaded as int32 only while every value AND the
+# intermediate `start + offset` / `ov_start + offset` sums are representable.
+# Values above this bound use int64 instead of silently wrapping (the same
+# exact integers; only the transport width changes).  Keeping the bound at
+# half the int32 range makes `2 * value` safe without a per-element check, and
+# leaves every currently realistic sequence on the historical int32 path.
+_POOL_HOST_I32_SAFE_MAX = (2 ** 31 - 2) // 2
+
+
+def _pool_host_idx_dtype(*values):
+    """int32 while all geometry values (and their pairwise sums) fit, else int64."""
+    try:
+        need = max((int(v) for v in values if v is not None), default=0)
+    except (TypeError, ValueError, OverflowError):
+        return np.int64
+    return np.int32 if need <= _POOL_HOST_I32_SAFE_MAX else np.int64
+
 # Block-chunking of the block-pooling gathers/mixes: the chunk boundaries are
 # a pure function of the shapes, so the forward and the checkpoint recompute
 # split identically.  Each block's pooled vector is computed from its own
@@ -3284,27 +3301,32 @@ def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
     try:
         B = int(B)
         n = int(n)
-        counts_np = np.asarray(counts_l, dtype=np.int32)
-        if counts_np.shape != (B,) or n <= 0:
+        _raw_counts = np.asarray(counts_l)
+        if _raw_counts.shape != (B,) or n <= 0:
             return None
+        _cmax = int(_raw_counts.max()) if _raw_counts.size else 0
+        _dt = _pool_host_idx_dtype(n, _cmax, -1 if ov is None else int(ov))
+        counts_np = _raw_counts.astype(_dt, copy=False)
         # The content cache exists for repeated eval passes over an identical
         # cut table.  A very wide counts row makes each key several KiB while
         # a training panel never repeats it, so above the small-table bound the
         # per-object caches are the only useful layer (the values are the same
         # either way).
-        _ck = ('p', counts_np.tobytes(), B, -1 if ov is None else int(ov), n, int(pad_to)) if B <= 1024 else None
+        _ck = ('p', counts_np.dtype.str, counts_np.tobytes(), B, -1 if ov is None else int(ov), n, int(pad_to)) if B <= 1024 else None
         _hit = _pool_geom_content_get(_ck)
         if _hit is not None:
             return _hit
-        ends_np = np.cumsum(counts_np, dtype=np.int32)
+        ends_np = np.cumsum(counts_np, dtype=_dt)
         nseg = 8 if ov is not None else 4
         total = nseg * B
         pad = (-total) % int(pad_to) if pad_to > 1 else 0
         # Flat layout: [counts | ends | starts | last_idx (| end_prev |
         # starts_prev | ov_start | ov_len)] followed by the zero pad; the
         # integers uploaded are identical to the per-segment form.  Index
-        # transport is int32 (sequence lengths are far inside int32 range).
-        flat = np.empty(total + pad, dtype=np.int32)
+        # transport stays int32 while the geometry (and the additive sums in
+        # the sibling builders) fit; above that it widens to int64 instead of
+        # wrapping.
+        flat = np.empty(total + pad, dtype=_dt)
         flat[0:B] = counts_np
         flat[B:2 * B] = ends_np
         starts_np = flat[2 * B:3 * B]
@@ -3370,21 +3392,24 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         W_b = max(int(ov_hi), 0)
         pa_rows = int(pa_rows)
         pb_rows = int(pb_rows)
-        counts_np = np.asarray(counts_l, dtype=np.int32)
-        if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or pa_rows <= 0 or pb_rows <= 0:
+        _raw_counts = np.asarray(counts_l)
+        if _raw_counts.shape != (B,) or n <= 0 or max_len <= 0 or pa_rows <= 0 or pb_rows <= 0:
             return None
-        _ck = ('v', counts_np.tobytes(), B, ov, n, max_len, W_b, pa_rows, pb_rows, int(pad_to)) if B <= 1024 else None
+        _cmax = int(_raw_counts.max()) if _raw_counts.size else 0
+        _dt = _pool_host_idx_dtype(n, max_len, W_b, _cmax, pa_rows, pb_rows, ov)
+        counts_np = _raw_counts.astype(_dt, copy=False)
+        _ck = ('v', counts_np.dtype.str, counts_np.tobytes(), B, ov, n, max_len, W_b, pa_rows, pb_rows, int(pad_to)) if B <= 1024 else None
         _hit = _pool_geom_content_get(_ck)
         if _hit is not None:
             return _hit
-        ends_np = np.cumsum(counts_np, dtype=np.int32)
+        ends_np = np.cumsum(counts_np, dtype=_dt)
         starts_np = ends_np - counts_np
-        pos = _np_range(max_len).astype(np.int32, copy=False)
-        op = _np_range(W_b).astype(np.int32, copy=False)
-        end_prev = np.empty(B, dtype=np.int32)
+        pos = _np_range(max_len).astype(_dt, copy=False)
+        op = _np_range(W_b).astype(_dt, copy=False)
+        end_prev = np.empty(B, dtype=_dt)
         end_prev[0] = -1
         end_prev[1:] = ends_np[:-1]
-        starts_prev = np.empty(B, dtype=np.int32)
+        starts_prev = np.empty(B, dtype=_dt)
         starts_prev[0] = 0
         starts_prev[1:] = starts_np[:-1]
         ov_start = np.maximum(end_prev - ov, starts_prev)
@@ -3393,7 +3418,7 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         n_b = B * W_b
         _pi = (-(n_a + 2 * n_b + max_len)) % int(pad_to) if int(pad_to) > 1 else 0
         _pb = (-(n_a + n_b)) % int(pad_to) if int(pad_to) > 1 else 0
-        flat_i = np.empty(n_a + 2 * n_b + max_len + _pi, dtype=np.int32)
+        flat_i = np.empty(n_a + 2 * n_b + max_len + _pi, dtype=_dt)
         flat_b = np.empty(n_a + n_b + _pb, dtype=np.bool_)
         gp = flat_i[0:n_a].reshape(B, max_len)
         np.add(starts_np[:, None], pos[None, :], out=gp)
@@ -3424,7 +3449,8 @@ def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, de
         B = int(B)
         flat_i, flat_b, n_a, n_b, W_b, max_len = _built
         # `_pool_geom_flat_var` already bucket-pads both flats.
-        buf = _h2d_async(flat_i, torch.int32, dev)
+        _idt = torch.int64 if flat_i.dtype == np.int64 else torch.int32
+        buf = _h2d_async(flat_i, _idt, dev)
         g_a = buf[0:n_a].view(B, max_len)
         g_b = buf[n_a:n_a + n_b].view(B, W_b)
         b_off = buf[n_a + n_b:n_a + 2 * n_b].view(B, W_b)
@@ -3444,20 +3470,23 @@ def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
         n = int(n)
         max_len = int(max_len)
         p_rows = int(p_rows)
-        counts_np = np.asarray(counts_l, dtype=np.int32)
-        if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or p_rows <= 0:
+        _raw_counts = np.asarray(counts_l)
+        if _raw_counts.shape != (B,) or n <= 0 or max_len <= 0 or p_rows <= 0:
             return None
-        _ck = ('s', counts_np.tobytes(), B, n, max_len, p_rows, int(pad_to)) if B <= 1024 else None
+        _cmax = int(_raw_counts.max()) if _raw_counts.size else 0
+        _dt = _pool_host_idx_dtype(n, max_len, _cmax, p_rows)
+        counts_np = _raw_counts.astype(_dt, copy=False)
+        _ck = ('s', counts_np.dtype.str, counts_np.tobytes(), B, n, max_len, p_rows, int(pad_to)) if B <= 1024 else None
         _hit = _pool_geom_content_get(_ck)
         if _hit is not None:
             return _hit
-        ends_np = np.cumsum(counts_np, dtype=np.int32)
+        ends_np = np.cumsum(counts_np, dtype=_dt)
         starts_np = ends_np - counts_np
-        pos = _np_range(max_len).astype(np.int32, copy=False)
+        pos = _np_range(max_len).astype(_dt, copy=False)
         n_g = B * max_len
         _pi = (-(n_g + max_len)) % int(pad_to) if int(pad_to) > 1 else 0
         _pb = (-n_g) % int(pad_to) if int(pad_to) > 1 else 0
-        flat_i = np.empty(n_g + max_len + _pi, dtype=np.int32)
+        flat_i = np.empty(n_g + max_len + _pi, dtype=_dt)
         mask_np = np.empty(n_g + _pb, dtype=np.bool_)
         gp = flat_i[0:n_g].reshape(B, max_len)
         np.add(starts_np[:, None], pos[None, :], out=gp)
@@ -3484,7 +3513,8 @@ def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
         B = int(B)
         flat_i, mask_np, n_g, max_len = _built
         # Both flats are already bucket-padded.
-        buf = _h2d_async(flat_i, torch.int32, dev)
+        _idt = torch.int64 if flat_i.dtype == np.int64 else torch.int32
+        buf = _h2d_async(flat_i, _idt, dev)
         mask = _h2d_async(mask_np, torch.bool, dev)[:n_g].view(B, max_len)
         return (buf[0:n_g].view(B, max_len), mask, buf[n_g:n_g + max_len])
     except (RuntimeError, TypeError, ValueError, AttributeError):
@@ -3597,7 +3627,12 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
             continue
         _tot_i += len(_r[2][0]) + len(_r[3][0])
         _tot_b += len(_r[3][1].ravel())
-    flat_i = np.empty(_tot_i + (-_tot_i) % _POOL_GEOM_BUCKET, dtype=np.int32)
+    _idt = np.int64 if any(
+        _r is not None and (
+            _r[2][0].dtype == np.dtype(np.int64)
+            or _r[3][0].dtype == np.dtype(np.int64))
+        for _r in rows) else np.int32
+    flat_i = np.empty(_tot_i + (-_tot_i) % _POOL_GEOM_BUCKET, dtype=_idt)
     flat_b = np.empty(_tot_b + (-_tot_b) % _POOL_GEOM_BUCKET, dtype=np.bool_)
     _oi = 0
     _ob = 0
@@ -3616,7 +3651,7 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
         _n = len(_bflat)
         flat_b[_ob:_ob + _n] = _bflat
         _ob += _n
-    buf_i = _h2d_async(flat_i, torch.int32, dev)
+    buf_i = _h2d_async(flat_i, torch.int64 if _idt == np.dtype(np.int64) else torch.int32, dev)
     buf_b = _h2d_async(flat_b, torch.bool, dev)
     off_i = 0
     off_b = 0
@@ -15748,6 +15783,12 @@ def dynamic_design_audit(manifest, *, manifest_path=None):
                 'cannot contain two indistinguishable slots')
         seen_names.add(name)
         a, b = comp.get('a'), comp.get('b')
+        # Arm names are identities, not arbitrary JSON values.  Testing an
+        # unhashable value (a list/dict) against the arm set used to raise
+        # ``TypeError: unhashable type`` from the middle of the audit; name the
+        # malformed entry and keep auditing the rest of the family instead.
+        _a_ok = isinstance(a, str) and bool(a.strip())
+        _b_ok = isinstance(b, str) and bool(b.strip())
         _lvl_raw = comp.get('evidence_level')
         _lvl_explicit = isinstance(_lvl_raw, str) and bool(_lvl_raw.strip())
         _lvl = str(_lvl_raw or level).strip().lower()
@@ -15760,7 +15801,14 @@ def dynamic_design_audit(manifest, *, manifest_path=None):
                'expected_sign': _sign,
                'mechanism_claim_allowed': comp.get('mechanism_claim_allowed'),
                'problems': []}
-        if a not in arm_set or b not in arm_set:
+        if not (_a_ok and _b_ok):
+            if not _a_ok:
+                ent['problems'].append(
+                    f'a={a!r} is not a non-empty arm name')
+            if not _b_ok:
+                ent['problems'].append(
+                    f'b={b!r} is not a non-empty arm name')
+        elif a not in arm_set or b not in arm_set:
             ent['problems'].append('names an arm outside manifest.arms')
         if not _lvl_explicit:
             ent['problems'].append(
@@ -15851,7 +15899,8 @@ def dynamic_design_audit(manifest, *, manifest_path=None):
                     'a design target and clear it after calibration/freeze')
         if ent['problems']:
             out['violations'].extend(f'{name}: {p}' for p in ent['problems'])
-        seen_pairs.add(frozenset((a, b)))
+        if _a_ok and _b_ok:
+            seen_pairs.add(frozenset((a, b)))
         out['comparisons'][name] = ent
     for _hid in required_hyp:
         if not _tested_by_hyp.get(_hid):
@@ -26845,8 +26894,11 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
     addition order (and the last-bit result) can depend on thread scheduling.
     Sorting by (index, original position) fixes the order; segment sums are
     then formed with a cumsum and written through ``index_copy_`` (unique
-    destinations, no atomics).  Mirrors ``csa_kernels._det_scatter_add`` but
-    keeps the caller's dtype (the per-document NLL accumulator is float64).
+    destinations, no atomics).  Mirrors ``csa_kernels._det_scatter_add``: the
+    output keeps the caller's dtype, but floating (and complex) sums accumulate
+    in float64/complex128 before the final cast.  A shared prefix from an early
+    segment otherwise rounds away every later small segment in fp32, and the
+    loss grows with the number of rows/segments.
 
     ``sorted_indices=True`` promises the flattened indices are already
     non-decreasing (the sampled-eval path maps a sorted global-row table, so
@@ -26866,13 +26918,22 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
         vals = vals[valid]
         if idx.numel() == 0:
             return out
+    if out_dtype.is_complex:
+        _acc = torch.complex128
+    elif out_dtype.is_floating_point:
+        _acc = torch.float64
+    else:
+        # Integer destinations (token counts) stay exact; int64 is the widest
+        # representation the destination can require and avoids an unnecessary
+        # float round-trip.
+        _acc = torch.int64
     if sorted_indices:
         idx_s = idx
-        val_s = vals.to(out_dtype)
+        val_s = vals.to(_acc)
     else:
         order = torch.argsort(idx, stable=True)
         idx_s = idx.index_select(0, order)
-        val_s = vals.index_select(0, order).to(out_dtype)
+        val_s = vals.index_select(0, order).to(_acc)
     end = torch.ones_like(idx_s, dtype=torch.bool)
     if idx_s.numel() > 1:
         end[:-1] = idx_s[1:] != idx_s[:-1]
@@ -26884,7 +26945,7 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
         lo[1:] = csum.index_select(0, seg_end[:-1])
     seg_sum = hi - lo
     seg_id = idx_s.index_select(0, seg_end)
-    out.index_copy_(0, seg_id, seg_sum)
+    out.index_copy_(0, seg_id, seg_sum.to(out_dtype))
     return out
 
 @torch.inference_mode()

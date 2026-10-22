@@ -16655,6 +16655,112 @@ def t_evidence_audit_checks_power_floor_and_family_identity():
         'expected_sign' in v for v in r['violations']), r['violations']
 
 
+def t_dynamic_audit_names_unhashable_arm_values():
+    import copy
+    with open(os.path.join(REPO, 'confirmation_frozen_dynamic.json'), encoding='utf-8') as f:
+        dyn = json.load(f)
+    bad = copy.deepcopy(dyn)
+    bad['primary_comparisons'][0]['a'] = ['csa_dynamic_rope']
+    bad['primary_comparisons'][0]['b'] = {'name': 'csa_fixed_rope'}
+    # A malformed arm identity must be named and the rest of the family must
+    # still be audited; it used to raise `TypeError: unhashable type` from the
+    # seen-pairs set.
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail', r
+    assert any('is not a non-empty arm name' in v for v in r['violations']), r['violations']
+    # The well-formed sibling comparison is still represented.
+    assert len(r['comparisons']) == len(bad['primary_comparisons']), r['comparisons']
+
+
+def t_integer_fingerprint_cast_stays_in_range():
+    import warnings
+    import data_guard as DG
+    # The float64 image of int64_max is 2**63 (outside int64), and the same is
+    # true for the largest datetime64[ns].  An unguarded cast warns/overflows
+    # even though the exact tail makes the digest correct.
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        for arr in (np.array([[2 ** 63 - 1]], dtype=np.int64),
+                    np.array([[np.datetime64('2262-04-11T23:47:16.854775807')]])):
+            fp = DG._matrix_fingerprint(arr)
+            assert isinstance(fp, str) and len(fp) == 64, fp
+        # A native int64 and its exact object twin share one digest.
+        assert (DG._matrix_fingerprint(np.array([[2 ** 63 - 1]], dtype=np.int64))
+                == DG._matrix_fingerprint(np.array([[2 ** 63 - 1]], dtype=object)))
+
+
+def t_index_float_boundary_casts_are_guarded():
+    import warnings
+    import data_guard as DG
+    # The signed int64 boundaries, not just the positive one: a far-negative
+    # float used to reach the cast (warning/implementation-defined overflow)
+    # before the negativity check could reject it.
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        for value in (-1e20, 1e20, 2.0 ** 63, -2.0 ** 63):
+            try:
+                DG._validated_index(np.array([value]))
+                raise AssertionError(f'out-of-range/negative float index {value!r} was accepted')
+            except ValueError:
+                pass
+
+
+def t_segment_sum_accumulates_precisely():
+    # Same failure mode the fused scatter helper fixed: a large global prefix
+    # rounds a later small segment to zero in fp32.  The output dtype must stay
+    # fp32, but the accumulation must not be an fp32 global cumsum.
+    idx = torch.cat([torch.zeros(64, dtype=torch.long),
+                     torch.ones(1000, dtype=torch.long)])
+    vals = torch.cat([torch.full((64,), 1e12), torch.ones(1000)])
+    out = L._det_segment_sum(2, idx, vals, dtype=torch.float32)
+    assert out.dtype == torch.float32, out.dtype
+    assert abs(float(out[1]) - 1000.0) < 1.0, out
+    # Integer destinations keep their existing per-element cast semantics.
+    iout = L._det_segment_sum(2, torch.tensor([1, 0, 1, 0]),
+                              torch.tensor([2.5, 3.5, 4.5, 5.5]),
+                              dtype=torch.long)
+    assert iout.tolist() == [8, 6], iout.tolist()
+
+
+def t_confirmation_admission_rejects_nonobject_payload():
+    # A JSON list/string at the bylen path is not a record mapping; it used to
+    # raise AttributeError (`.items()`), bypassing the documented fail-closed
+    # refusal path.
+    for bad in ([], 'records', 3):
+        try:
+            V12._admit_confirmation_records(bad, {})
+            raise AssertionError(f'non-object bylen payload {bad!r} was admitted')
+        except SystemExit:
+            pass
+
+
+def t_pool_geometry_widens_instead_of_wrapping():
+    import csa_kernels as CK
+    n = 2 ** 31 + 9
+    # Host geometry: int32 on the historical path, int64 once a value/its
+    # pairwise sum leaves the int32 range (the same exact integers).
+    p32 = L._pool_parts_flat([5], 1, 3, 1000)
+    assert p32 is not None and p32[0].dtype == np.int32, p32
+    p = L._pool_parts_flat([5], 1, 3, n)
+    assert p is not None and p[0].dtype == np.int64, p
+    assert p[0][:8].tolist() == [5, 5, 0, 4, -1, 0, 0, 0], p[0].tolist()
+    v = L._pool_geom_flat_var([5], 1, 3, n, 5, 2, 8, 8)
+    assert v is not None and v[0].dtype == np.int64, v
+    assert v[0].tolist() == [0, 1, 2, 3, 4, 0, 1, 0, 1, 0, 1, 2, 3, 4], v[0].tolist()
+    s = L._pool_geom_flat_single([5], 1, n, 5, 8)
+    assert s is not None and s[0].dtype == np.int64, s
+    assert s[0].tolist() == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4], s[0].tolist()
+    # PoolGeometry also stores the widened tables (not wrapped negatives).
+    g = CK.PoolGeometry([[2, 3]], 2, n, torch.device('cpu'), None)
+    assert g.starts.dtype == torch.int64, g.starts.dtype
+    assert g.last_tok.tolist() == [[1, 4]], g.last_tok.tolist()
+    ga, av = g.gather_geom()
+    assert ga.tolist() == [[[0, 1, 2], [2, 3, 4]]], ga.tolist()
+    assert av[..., 0].tolist() == [[[True, True, False], [True, True, True]]], av.tolist()
+    g2 = CK.PoolGeometry([[2, 3]], 2, 10, torch.device('cpu'), None)
+    assert g2.starts.dtype == torch.int32, g2.starts.dtype
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -17089,6 +17195,12 @@ def main():
     _check('L95 dynamic power/read calibration are machine-checked', t_dynamic_power_and_read_calibration_are_machine_checked)
     _check('L96 mechanism claim needs confirmation + measured calibration', t_budget_ledger_mechanism_claim_needs_confirmation_and_calibration)
     _check('L97 evidence audit checks power floor + family identity', t_evidence_audit_checks_power_floor_and_family_identity)
+    _check('L98 dynamic audit names unhashable arm values', t_dynamic_audit_names_unhashable_arm_values)
+    _check('L99 integer fingerprint cast stays in range', t_integer_fingerprint_cast_stays_in_range)
+    _check('L100 pool geometry widens instead of wrapping', t_pool_geometry_widens_instead_of_wrapping)
+    _check('L101 float index boundary casts are range-guarded', t_index_float_boundary_casts_are_guarded)
+    _check('L102 confirmation admission rejects non-object payloads', t_confirmation_admission_rejects_nonobject_payload)
+    _check('L103 segment sums accumulate in wide precision', t_segment_sum_accumulates_precisely)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -1390,3 +1390,44 @@ calibration formula, mechanism-claim confirmation, evidence-family identity).
 `python test_review_fixes.py` passes 430/433 with the same 3 DataLoader
 environment skips; `python v12_supp.py dynamic-plan` reports the draft as
 coherent but non-runnable.
+
+## 2026-10-22 — scale cast/geometry hardening + malformed-design fail-closed (no new runs)
+
+**Problem.** Four paths still assumed values that hold at the current scale.
+(1) `data_guard._matrix_fingerprint` cast every signed-integer block through
+float64 to int64 without a range guard.  `int64_max` maps to `2**63` (outside
+int64), so the cast overflowed/warned and the same applied to the largest
+`datetime64[ns]`; `_validated_index` guarded only the positive float boundary,
+so a far-negative float reached the same implementation-defined cast before the
+negativity check.  (2) The host pooling geometry builders (`_pool_parts_flat`,
+`_pool_geom_flat_var`, `_pool_geom_flat_single`, `PoolGeometry`) packed every
+table into int32; a sequence length / count beyond that range wrapped negative
+instead of widening.  (3) `dynamic_design_audit` put comparison arm values into
+a `frozenset` and tested them against the arm set without validating they were
+strings, so a malformed list/dict arm raised `TypeError: unhashable type`
+instead of failing closed.  (4) `_admit_confirmation_records` assumed the bylen
+payload was an object and `_by_len_shape_reason` converted an unbounded
+`n_seq` through float outside a guard, so malformed records could crash
+admission rather than be named/excluded.  (5) `_det_segment_sum` — the eager
+twin of the fused deterministic scatter — still accumulated a global fp32
+prefix in the output dtype, so a large early segment erased later segments.
+
+**Changes.** The fingerprint/index casts now guard both int64 boundaries and
+route inexact values to the existing exact-tail path (identical digests, no
+overflow warning).  Host pooling geometry selects int32 while the geometry and
+its pairwise sums fit (`(2**31-2)//2`) and int64 otherwise; the H2D upload and
+prefetch packer follow the chosen width, and `PoolGeometry` stores int64 when
+needed (the Triton pool kernel, whose lane arithmetic is int32, now refuses
+such a geometry explicitly instead of truncating it).  `dynamic_design_audit`
+names a non-string/empty `a`/`b` and keeps auditing the remaining comparisons.
+Confirmation admission rejects a non-object bylen payload with a clear
+`SystemExit`, and the by-length `n_seq` read catches float overflow.
+`_det_segment_sum` accumulates floating/complex sums in float64/complex128 and
+casts only the final segment sums, so its output dtype is unchanged while the
+later-segment precision matches the fused helper.
+
+Verification: new CPU tests L98-L103 (unhashable arm values, int64/datetime
+fingerprint boundaries, int32→int64 pool geometry, float index boundaries,
+non-object confirmation payload, wide segment-sum accumulation).  `python
+test_review_fixes.py` passes 436/439 with the same 3 DataLoader environment
+skips; `python test_open_block.py` passes 15/15.

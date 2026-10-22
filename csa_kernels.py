@@ -288,15 +288,22 @@ class PoolGeometry:
             starts_prev_np = np.zeros((R, Bm), dtype=np.int64)
             max_ov = 0
         W_b = max_ov if overlap is not None else 0
-        # 8 张 int32 几何表打包进一条宿主缓冲、一次 H2D（同样的 int32 值、
-        # 同样的 int64→int32 窄化，transport only），设备侧按只读视图切分。
-        flat = np.empty(7 * R * Bm + R, dtype=np.int32)
+        # 8 张几何表打包进一条宿主缓冲、一次 H2D。  int32 is the historical
+        # transport width and stays byte-identical while every table value (and
+        # the `starts + offset` sums built later) fits; beyond that the same
+        # exact integers use int64 instead of wrapping to negative indices.
+        # The bound is half the int32 range so a pairwise sum cannot overflow.
+        _safe_i32 = (2 ** 31 - 2) // 2
+        _need_i64 = max(int(T), int(W_b), int(counts_np.max(initial=0))) > _safe_i32
+        _idx_dtype = np.int64 if _need_i64 else np.int32
+        flat = np.empty(7 * R * Bm + R, dtype=_idx_dtype)
         for _i, _a in enumerate((counts_np, ends_np, starts_np, last_np,
                                  ov_start_np, ov_len_np, starts_prev_np)):
             flat[_i * R * Bm:(_i + 1) * R * Bm] = _a.reshape(-1)
         flat[7 * R * Bm:] = nblk_np
         import exp_lib as L
-        staged, commit = L._h2d_stage((int(flat.size),), torch.int32, device)
+        _tdtype = torch.int64 if _need_i64 else torch.int32
+        staged, commit = L._h2d_stage((int(flat.size),), _tdtype, device)
         if staged is not None:
             staged.numpy()[:] = flat
             _buf = commit()
@@ -315,6 +322,7 @@ class PoolGeometry:
         self.max_len = int(max_len)
         self.W_b = int(W_b)
         self.overlap = overlap
+        self.idx_dtype = _idx_dtype
         # `max_block=None` is the no-cap configuration: the counts table already
         # encodes every forced cut, so the geometry is well defined.  Keep the
         # declaration as None instead of crashing on int(None) (the no-cap
@@ -2325,6 +2333,14 @@ def _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     Bm = geom.Bm
     L, W = geom.max_len, geom.W_b
     has_b = Xb is not None and W > 0
+    if geom.starts.dtype != torch.int32:
+        # The Triton kernel addresses lanes with int32 offsets.  A geometry
+        # wider than that cannot be represented by this kernel; fail closed
+        # instead of letting a truncated pointer target another block.  The
+        # torch-reference/eager paths accept the same int64 geometry.
+        raise RuntimeError(
+            'Triton pool kernel requires int32 geometry; this sequence '
+            'exceeds the int32 lane range — use the eager/reference path')
     Xa = Xa.contiguous()
     Za = Za.contiguous()
     if has_b:
