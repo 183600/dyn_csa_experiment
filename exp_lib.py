@@ -2258,7 +2258,12 @@ def segmentation_prefix_invariance(cut_table, n, min_block, max_block,
 
     def _starts_for(m):
         _, _, counts = _segment(m, cuts[:m - 1], min_block, max_block)
-        return np.cumsum(np.asarray([0] + list(counts), dtype=np.int64))[:-1]
+        # Block starts are the exclusive cumulative counts shifted by one.
+        # `np.asarray` keeps a large segmenter row in NumPy: the old
+        # `[0] + list(counts)` materialised every block as a Python int (and a
+        # full extra list) even though only this arithmetic needs it.
+        _counts = np.asarray(counts, dtype=np.int64)
+        return np.cumsum(_counts) - _counts
 
     full = _starts_for(n)
     if prefixes is None:
@@ -2731,10 +2736,18 @@ def blocks_fixed(n, block_size, device):
         out = torch.arange(n, device=device) // int(block_size)
         if n > 0:
             bs = int(block_size)
-            counts = [bs] * (n // bs)
-            _rem = n % bs
+            # The fixed stride is one for the block_size=1 arm, so the old
+            # `[bs] * (n // bs)` built one Python object per block (and one
+            # pointer per block) before any consumer ran.  Build the same
+            # integers in a NumPy row for a long sequence; only the historical
+            # small-table shape stays a Python list.
+            _nfull, _rem = divmod(int(n), bs)
+            _k = _nfull + (1 if _rem else 0)
+            counts = np.full(_k, bs, dtype=np.int64)
             if _rem:
-                counts.append(_rem)
+                counts[-1] = _rem
+            if n <= 64:
+                counts = counts.tolist()
             out._pool_cpu = (counts, min(bs, n), bs if len(counts) > 1 else 0)
     _cache_put(_IDX_CACHE, key, out, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return out
@@ -2800,8 +2813,37 @@ def _cache_bytes(t):
 def _mask_cache_total(cache):
     return sum((_cache_bytes(v) for v in cache.values()))
 
+def _cache_attachment_bytes(t):
+    """Host bytes attached to a cached tensor (currently `_pool_cpu`).
+
+    `blocks_fixed` caches one block-id tensor per sequence length and attaches
+    the segmenter's host counts row to it.  For the block_size=1 arm that row
+    is the same size as the int64 tensor itself, so leaving it out of the
+    budget would let `_IDX_CACHE` retain roughly twice the advertised bytes.
+    """
+    if t is None:
+        return 0
+    if isinstance(t, (tuple, list)):
+        return sum((_cache_attachment_bytes(_v) for _v in t))
+    cpu = getattr(t, '_pool_cpu', None)
+    if cpu is None:
+        return 0
+    try:
+        counts = cpu[0]
+    except (TypeError, IndexError, KeyError):
+        return 0
+    if isinstance(counts, np.ndarray):
+        return int(counts.nbytes)
+    try:
+        # A Python int list stores one machine-word pointer per block; the
+        # integer objects themselves are bounded by the small-table contract.
+        return 8 * len(counts)
+    except TypeError:
+        return 0
+
 def _idx_cache_total(cache):
-    return sum((_cache_bytes(v) + 128 * len(k) for k, v in cache.items()))
+    return sum((_cache_bytes(v) + _cache_attachment_bytes(v)
+                + 128 * len(k) for k, v in cache.items()))
 
 def _is_pinned_key(key):
     return key in _PINNED_KEYS
@@ -2813,7 +2855,7 @@ _CACHE_STATS = {}
 def _cache_item_bytes(key, value, total_of):
     n = _cache_bytes(value)
     if total_of is _idx_cache_total:
-        n += 128 * len(key)
+        n += _cache_attachment_bytes(value) + 128 * len(key)
     return n
 
 
@@ -6173,14 +6215,21 @@ class HybridAttention(nn.Module):
             self._stats.add_segmentation(bid, _seg_cuts, cfg.max_block)
             if self._cuts is not None:
                 _cpu = getattr(bid, '_pool_cpu', None)
-                if _cpu is not None and sum(_cpu[0]) == T:
+                _cpu_counts = (np.asarray(_cpu[0], dtype=np.int64)
+                               if _cpu is not None else None)
+                # `sum(numpy_row)` walks the row element by element in Python
+                # and is O(blocks) per layer per step; the vectorised sum is
+                # the same exact integer total and keeps the long-sequence
+                # block_size=1 arm linear in C rather than Python.
+                if (_cpu_counts is not None
+                        and int(_cpu_counts.sum()) == T):
                     # host-side integer equivalence (design notes §6.2): cut
                     # positions are the prefix sums of the same counts table
                     # that generated bid — the identical integers to the
                     # nonzero(diff)+1 form.  Consumers accept numpy rows
                     # directly (compression_report's _tcut_ix split and
                     # boundary_alignment's np.asarray).
-                    self._cuts.append(np.cumsum(np.asarray(_cpu[0], dtype=np.int64))[:-1])
+                    self._cuts.append(np.cumsum(_cpu_counts)[:-1])
                 else:
                     cuts = (bid[1:] != bid[:-1]).nonzero(as_tuple=True)[0] + 1
                     # Keep the device tensor for compression_report.
@@ -35282,8 +35331,9 @@ def run_order_balance(plan, actual_order=None):
                 continue
             actual_blocks.setdefault(str(b), []).append(lab)
         if planned:
+            planned_set = set(planned)
             missing = [x for x in planned if x not in seen]
-            extra = [x for x in seen if x not in set(planned)]
+            extra = [x for x in seen if x not in planned_set]
             if extra:
                 out['problems'].append(f'actual order contains unplanned cells: {extra[:5]}')
             out['actual'] = {
@@ -35313,21 +35363,28 @@ def run_order_balance(plan, actual_order=None):
                 for i, v in enumerate(seq_variants):
                     if i == 0 or v != seq_variants[i - 1]:
                         runs += 1
+                variant_counts = collections.Counter(seq_variants)
                 out['actual']['variant_runs'] = runs
-                out['actual']['n_arms'] = len(set(seq_variants))
+                out['actual']['n_arms'] = len(variant_counts)
                 actual_arm_major = bool(
                     len(actual_blocks) > 1
-                    and len(set(seq_variants)) > 1
-                    and runs == len(set(seq_variants))
-                    and all(seq_variants.count(v) == len(actual_blocks)
-                            for v in set(seq_variants)))
+                    and len(variant_counts) > 1
+                    and runs == len(variant_counts)
+                    and all(n == len(actual_blocks)
+                            for n in variant_counts.values()))
                 if actual_arm_major:
                     out['arm_major'] = True
                     out['problems'].append(
                         'the completed run is arm-major even though the plan was '
                         'blocked; the driver did not honour the run-order plan')
+        # Group the plan once instead of rescanning every planned cell for
+        # every block: a future panel with many seeds would otherwise make the
+        # audit quadratic in the number of cells.
+        planned_by_block = collections.OrderedDict()
+        for x in planned:
+            planned_by_block.setdefault(str(label_block.get(x)), []).append(x)
         for b, seq in actual_blocks.items():
-            plan_seq = [x for x in planned if label_block.get(x) == str(b)]
+            plan_seq = planned_by_block.get(str(b), [])
             it = iter(plan_seq)
             if not all(any(x == y for y in it) for x in seq):
                 out['warnings'].append(

@@ -4409,7 +4409,10 @@ def _row_keys(X):
         # missing-like key.  Non-numeric objects (strings/categoricals) get a
         # type-qualified representation key; they must not crash the generic
         # float fallback or compare equal to their numeric spelling.
-        _flat = src.reshape(-1).tolist()
+        # Do NOT flatten the entire object table just to reject complex
+        # values: one Python reference per cell is pure peak memory on a
+        # large table, and the hash loop below already visits every row.
+        # The complex check is therefore done per bounded hash block.
 
         def _real_key(v):
             if v is None:
@@ -4477,15 +4480,16 @@ def _row_keys(X):
             n, d = f.as_integer_ratio()
             return b'R' + str(n).encode('ascii') + b'/' + str(d).encode('ascii')
 
-        if any(isinstance(v, (complex, np.complexfloating)) for v in _flat):
-            raise TypeError(
-                'duplicate detection needs real-valued rows; casting complex '
-                'rows to float64 would silently discard the imaginary part')
-
         _step = _hash_row_block(int(src.shape[1]), 1 << 16)
         keys = []
         for start in range(0, src.shape[0], _step):
-            for row in src[start:start + _step].tolist():
+            _block = src[start:start + _step]
+            if any(isinstance(v, (complex, np.complexfloating))
+                   for v in _block.flat):
+                raise TypeError(
+                    'duplicate detection needs real-valued rows; casting complex '
+                    'rows to float64 would silently discard the imaginary part')
+            for row in _block.tolist():
                 # An all-numeric row (None counts as the missing-like NaN)
                 # uses the SAME row bytes as the native int/float branch, so
                 # an object column and a numeric column holding equal values

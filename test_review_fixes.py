@@ -17775,6 +17775,70 @@ def t_scale_uniform_segment_and_oom_fallback():
         assert L._pool_geom_flat_single([17, 4, 9], 3, 30, 4, 5) is None
 
 
+def t_fixed_blocks_and_prefix_starts_stay_numpy_at_scale():
+    # `blocks_fixed` is the fixed-stride twin of `_segment`'s uniform
+    # shortcut.  It used to build one Python list entry per block, so the
+    # block_size=1 arm allocated O(n) Python pointers on a long sequence.
+    # The values stay identical, but a large-host table must be a NumPy row
+    # and the historical list shape must remain for tiny tables.
+    n = 10000
+    bid = L.blocks_fixed(n, 1, 'cpu')
+    counts = getattr(bid, '_pool_cpu', None)
+    assert counts is not None, 'blocks_fixed lost its host count attachment'
+    assert isinstance(counts[0], np.ndarray) and counts[0].dtype == np.int64, type(counts[0])
+    assert counts[0].size == n
+    assert np.array_equal(counts[0], np.ones(n, dtype=np.int64))
+    assert counts[1] == 1 and counts[2] == 1
+    assert L.blocks_fixed(16, 4, 'cpu')._pool_cpu[0] == [4, 4, 4, 4]
+    assert L.blocks_fixed(15, 4, 'cpu')._pool_cpu[0] == [4, 4, 4, 3]
+    # The attached host counts are retained by the cache and must be charged:
+    # at block_size=1 they are the same size as the cached int64 tensor.
+    _tensor_bytes = bid.numel() * bid.element_size()
+    _charged = L._cache_item_bytes(('blk',), bid, L._idx_cache_total)
+    assert _charged >= _tensor_bytes + int(counts[0].nbytes), (_charged, _tensor_bytes)
+    assert L._idx_cache_total({('blk',): bid}) == _charged
+
+    # Prefix-invariance diagnostics must not turn a large segmenter counts row
+    # back into a Python list just to prepend the zero start.
+    cuts = np.zeros(1024, dtype=bool)
+    cuts[::11] = True
+    rep = L.segmentation_prefix_invariance(cuts, 1024, 1, 4, prefixes=8)
+    assert rep['ok'], rep
+
+    # Run-order audits must stay linear in the panel size: many blocks with
+    # many cells still classify a blocked execution and an arm-major one.
+    variants = ['arm%02d' % i for i in range(8)]
+    seeds = list(range(500))
+    cells = [(v, s) for s in seeds for v in variants]
+    plan = L.build_run_order_plan(cells, block_key=lambda c: c[1], seed=7)
+    rep = L.run_order_balance(plan, plan['planned_cells'])
+    assert rep['status'] == 'ok' and rep['actual']['complete'] is True, rep
+    arm_major = [f'{v}::seed{s}' for v in variants for s in seeds]
+    rep = L.run_order_balance(plan, arm_major)
+    assert rep['status'] == 'fail' and rep['arm_major'] is True, rep
+
+
+def t_object_row_keys_reject_complex_per_hash_block():
+    # Object-dtype keys used to flatten the WHOLE table just to find a complex
+    # cell.  Check the rejection on a hash-block boundary, where a per-block
+    # scan must still find a complex value in the first and in a later block.
+    import data_guard as DG
+    saved = DG._hash_row_block
+    DG._hash_row_block = lambda width, cap: 1
+    try:
+        for arr in (np.array([[1 + 2j], [2]], dtype=object),
+                    np.array([[1], [2 + 3j]], dtype=object)):
+            try:
+                DG._row_keys(arr)
+            except TypeError:
+                pass
+            else:
+                raise AssertionError(f'complex object rows accepted: {arr!r}')
+        assert len(DG._row_keys(np.array([[1], [2]], dtype=object))) == 2
+    finally:
+        DG._hash_row_block = saved
+
+
 def t_ladder_tier_discovery_is_numeric_and_complete():
     # The parameter audit used to iterate a literal S1-S4 tuple.  A newly
     # declared SCALE_LADDER tier must be discovered (and numeric order must
@@ -18382,6 +18446,8 @@ def main():
     _check('L119 per-seed matched-initialization audit is tri-state', t_paired_init_core_audit)
     _check('L120 confirmation drops init-mismatched pairs and never vacuous-passes', t_v12_init_core_fp_pairing)
     _check('L121 uniform segmentation stays NumPy at scale and OOM falls back', t_scale_uniform_segment_and_oom_fallback)
+    _check('L121b fixed blocks / prefix starts stay NumPy and audits stay linear', t_fixed_blocks_and_prefix_starts_stay_numpy_at_scale)
+    _check('L121c object row keys reject complex values per hash block', t_object_row_keys_reject_complex_per_hash_block)
     _check('L122 ladder parameter tiers are discovered in numeric order', t_ladder_tier_discovery_is_numeric_and_complete)
     _check('L123 run order is blocked randomized and position balanced', t_run_order_is_blocked_randomized_and_position_balanced)
     _check('L124 run-order audit detects arm-major temporal confounding', t_run_order_audit_detects_temporal_confounding)

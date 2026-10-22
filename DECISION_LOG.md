@@ -1945,3 +1945,46 @@ environment skips; `python audit_gates.py run_order` reports
 `not_verifiable_locally` on this source-only tree (no `results_*/` artifacts);
 `python v12_supp.py plan` still admits 72/72 synthetic frozen records with the
 same six comparisons.
+
+## 2026-10-22 — fixed-stride host tables, cached attachments and object-key scanning at scale
+
+Zero-GPU scale review; no training run, frozen manifest byte, test split,
+`CODE_SEMANTICS`, README or CI configuration was touched.
+
+**Problem.** (1) `blocks_fixed` still built its host counts as
+`[bs] * (n // bs)`, one Python list slot per block.  With the supported
+`block_size=1` arm that is one Python pointer per token, even though
+`_segment`'s uniform shortcut had already moved to a NumPy row.  (2) The same
+tensor is cached in `_IDX_CACHE` with the counts row attached as `_pool_cpu`,
+but `_cache_bytes`/`_idx_cache_total` charged only the tensor, so a length
+sweep could retain roughly twice the advertised cache budget.  (3)
+`segmentation_prefix_invariance` converted a large counts row back to a Python
+list merely to prepend the zero start.  (4) `HybridAttention` used Python
+`sum(numpy_row)` to verify the counts total while collecting cut tables; that
+walk is O(blocks) in Python per layer/step.  (5) `data_guard._row_keys`
+flattened the whole object-dtype table to a Python list only to reject complex
+cells, then re-walked it block by block.
+
+**Changes.** `blocks_fixed` builds the same integers in an `int64` NumPy row
+and keeps the historical list only for `n <= 64`; `_cache_attachment_bytes`
+charges the `_pool_cpu` counts row (NumPy `.nbytes`, or one pointer per list
+entry) through both `_idx_cache_total` and `_cache_item_bytes`.
+`segmentation_prefix_invariance` obtains starts as
+`cumsum(counts) - counts` directly on the NumPy row.  The cut-table total uses
+one vectorised `int64` sum of the same counts.  `_row_keys` rejects complex
+values per bounded hash block instead of flattening the table.
+
+**Boundary.** These are representation/transport/accounting corrections: the
+same block ids, counts, cut positions, row digests and cache contents are
+produced; no frozen arm/seed/endpoint/alpha/Holm family or decision rule
+changes.  The `<=64` Python-list contract and all returned values are
+unchanged.
+
+**Verification.** New CPU tests L121b (NumPy fixed-stride counts with exact
+values/list contract, attached-byte charging, prefix starts, linear run-order
+audit) and L121c (complex object rows rejected across hash-block boundaries).
+`python test_review_fixes.py` passes 460/463 with the same 3 DataLoader
+environment skips; `python test_open_block.py` passes 15/15;
+`python audit_gates.py run_order` still reports `not_verifiable_locally` on
+this source-only tree; `python v12_supp.py plan` still admits 72/72 synthetic
+frozen records with the same six comparisons.
