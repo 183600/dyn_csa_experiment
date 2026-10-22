@@ -1027,6 +1027,26 @@ def t_error_analysis_context_scan_is_bounded():
             raise AssertionError(f'context_scan_max_positions={_bad!r} must be refused')
 
 
+def t_context_scan_budget_holds_below_one_row():
+    vb = np.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]], dtype=np.int64)
+    for _max in (1, 2, 3):
+        _, _, meta = L._context_target_counts(vb, 3, max_positions=_max)
+        assert meta['complete'] is False, meta
+        assert meta['n_positions_scanned'] <= _max, meta
+        assert meta['n_positions_scanned'] == _max, meta
+    _, _, meta = L._context_target_counts(vb, 3, max_positions=100)
+    assert meta['complete'] is True, meta
+    assert meta['n_positions_scanned'] == 8, meta
+
+
+def t_first_occurrence_of_valid_drops_invalid_lanes():
+    idx = torch.tensor([[3, 1, 3, 0, 1]], dtype=torch.int32)
+    valid = torch.tensor([[False, False, True, True, True]])
+    got = L._first_occurrence_of_valid(idx, valid)
+    assert not bool(got[0, 0]) and not bool(got[0, 1]), got
+    assert got[0, 2:].tolist() == [True, True, True], got
+
+
 def t_cost_increase_flags_sub_noise_gain():
     rows = [{'variant': 'best', 'ppl': p, 'prefill_ms_p50': 10.0,
              'params': 100, 'peak_mem_allocated_mb': 10.0, 'tokens_seen': 100}
@@ -15233,6 +15253,8 @@ def main():
     _check('A4m train-only loss-curve health', t_train_only_curve_health)
     _check('A4m1 train_variant records the train-only curve', t_train_variant_records_train_curve_without_validation)
     _check('A4m2 bad-case prefix scan is bounded', t_error_analysis_context_scan_is_bounded)
+    _check('A4m2a bad-case prefix scan stays within a sub-row budget', t_context_scan_budget_holds_below_one_row)
+    _check('A4m2b dedup mask never keeps an invalid lane', t_first_occurrence_of_valid_drops_invalid_lanes)
     _check('A4m3 cost increase without a clear PPL gain is flagged', t_cost_increase_flags_sub_noise_gain)
     _check('A4l v12 health gate refuses a recorded non-finite event', t_v12_health_gate_refuses_unstable_training)
     _check('A4g rope arms never claim the batched eager twin', t_rope_arms_are_not_batched)

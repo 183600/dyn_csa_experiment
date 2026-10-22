@@ -2777,15 +2777,16 @@ def _first_occurrence_of_valid(idx, valid):
     first copy of a block id is invalid and a later copy is valid, the plain
     conjunction removes the later (valid) lane too and the block is never
     read.  Give every invalid lane a unique negative key first: block ids are
-    non-negative, so these keys cannot collide with a readable block, and the
-    final `& valid` drops them anyway.  The valid lanes then compete only
-    with each other, which is the intended dedup contract.
+    non-negative, so these keys cannot collide with a readable block.  The
+    valid lanes then compete only with each other, and the final `& valid`
+    makes the returned mask itself satisfy the contract (invalid lanes are
+    never selected) instead of relying on every caller to apply that mask.
     """
     if valid is None:
         return first_occurrence_mask(idx)
     lanes = torch.arange(idx.shape[1], device=idx.device, dtype=torch.long)
     key = torch.where(valid, idx.to(torch.long), -(lanes + 1))
-    return first_occurrence_mask(key)
+    return first_occurrence_mask(key) & valid
 
 
 def _block_order(block_ids, n):
@@ -26680,10 +26681,12 @@ def _context_target_counts(vb, ctx_len, *, max_positions=None):
     span = seq - 1
     if span < 1:
         return {}, 0, {'n_rows_total': n_rows, 'n_rows_scanned': 0,
+                       'n_positions_per_row': 0,
                        'n_positions_scanned': 0, 'max_positions': max_positions,
                        'complete': True, 'rows': []}
     ctx_len = max(1, min(int(ctx_len), span))
     scan_rows = list(range(n_rows))
+    positions_per_row = span
     complete = True
     if max_positions is not None:
         _max = _exact_count(max_positions, minimum=1)
@@ -26691,15 +26694,27 @@ def _context_target_counts(vb, ctx_len, *, max_positions=None):
             raise ValueError(f'_context_target_counts needs a positive integer max_positions, got {max_positions!r}')
         total = n_rows * span
         if total > int(_max):
-            n_scan = max(1, min(n_rows, int(_max) // max(1, span)))
-            if n_scan < n_rows:
+            complete = False
+            # Scan complete rows when the budget covers at least one; when the
+            # budget is smaller than one row, scan the prefix that fits instead
+            # of silently exceeding `max_positions` (the bound must hold for a
+            # single long sequence too, not only for many short rows).
+            full_rows = int(_max) // max(1, span)
+            if full_rows >= 1:
+                n_scan = min(max(1, n_rows), full_rows)
+                positions_per_row = span
+            else:
+                n_scan = min(max(1, n_rows), 1)
+                positions_per_row = int(_max)
+            if n_rows <= 0:
+                scan_rows = []
+            else:
                 scan_rows = [int(r) for r in
                              np.unique(np.linspace(0, n_rows - 1, num=n_scan, dtype=np.int64))]
-                complete = False
     out = {}
     for r in scan_rows:
         row = vb[r]
-        for pos in range(span):
+        for pos in range(positions_per_row):
             start = max(0, pos + 1 - ctx_len)
             key = row[start:pos + 1].tobytes()
             tgt = int(row[pos + 1])
@@ -26709,7 +26724,8 @@ def _context_target_counts(vb, ctx_len, *, max_positions=None):
             else:
                 d[tgt] = d.get(tgt, 0) + 1
     meta = {'n_rows_total': n_rows, 'n_rows_scanned': len(scan_rows),
-            'n_positions_scanned': len(scan_rows) * span,
+            'n_positions_per_row': positions_per_row,
+            'n_positions_scanned': len(scan_rows) * positions_per_row,
             'max_positions': max_positions, 'complete': complete}
     if not complete:
         meta['rows'] = scan_rows
@@ -27095,7 +27111,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                 'note': ('same prefix in the evaluated validation rows has more than one observed next token; '
                          'this is label inconsistency or genuine ambiguity, not proof of an annotation error'),
                 'scan_note': (None if (_ctx_scan is None or _ctx_scan.get('complete'))
-                              else 'prefix-ambiguity counts are from a bounded, evenly spaced row sample; '
+                              else 'prefix-ambiguity counts are from a bounded row/position sample; '
                                    'they are not whole-split totals (see scan metadata)')},
             'tokenizer_available': tok is not None,
             'rare_target_basis': rare_basis,
