@@ -18763,6 +18763,147 @@ def t_metric_threshold_and_manifest_status_guards():
             assert e['completion']['complete'] is False, e['completion']
 
 
+def t_effect_modification_across_conditions():
+    # One paired effect per seed at each condition: the interaction is the
+    # within-seed CHANGE, not a comparison of two separate p-values.
+    seeds = list(range(12))
+    conds = ['512', '1024', '2048', '4096']
+    axis = {'512': 9.0, '1024': 10.0, '2048': 11.0, '4096': 12.0}
+    grow = {c: [0.05 * (j + 1) + 0.10 * i for j in seeds]
+            for i, c in enumerate(conds)}
+    r = L.effect_modification(grow, reference='512', condition_values=axis,
+                              seeds=seeds)
+    assert r['status'] == 'ok' and r['n_complete'] == 12, r
+    assert r['reference'] == '512' and r['conditions'] == conds, r
+    assert set(r['interactions']) == {'1024', '2048', '4096'}, r['interactions']
+    for i, c in enumerate(conds[1:], start=1):
+        cell = r['interactions'][c]
+        assert abs(cell['mean'] - 0.10 * i) < 1e-12, (c, cell)
+        assert abs(cell['ratio'] - math.exp(0.10 * i)) < 1e-12, (c, cell)
+        assert cell['p_exact_signflip'] == L.signflip_p_floor(12), (c, cell)
+        # Holm over the three non-reference conditions: m*p on the first step.
+        assert cell['p_holm'] is not None and cell['p_holm'] > cell['p_exact_signflip'], (c, cell)
+    assert r['interaction_family']['m'] == 3, r['interaction_family']
+    assert abs(r['trend']['mean'] - 0.10) < 1e-12, r['trend']
+    assert r['trend']['p_exact_signflip'] == L.signflip_p_floor(12), r['trend']
+    assert r['trend']['ci95_low'] > 0, r['trend']
+    assert 'not evidence' in r['note'], r['note']
+    # A constant effect has zero interaction and zero slope: the correct
+    # reading is "no detected effect modification", never "equivalent".
+    const = {c: [0.05 * (j + 1) for j in seeds] for c in conds}
+    rc = L.effect_modification(const, reference='512', condition_values=axis,
+                               seeds=seeds)
+    assert abs(rc['interactions']['4096']['mean']) < 1e-15, rc
+    assert rc['interactions']['4096']['p_exact_signflip'] == 1.0, rc
+    assert rc['interactions']['4096']['significant'] is False, rc
+    assert abs(rc['trend']['mean']) < 1e-15 and rc['trend']['p_exact_signflip'] == 1.0, rc
+    # A seed missing at ONE condition is dropped from the whole panel and
+    # named; the simple effects and the interaction must use the same set.
+    miss = {c: list(v) for c, v in grow.items()}
+    miss['2048'][3] = float('nan')
+    rm = L.effect_modification(miss, reference='512', condition_values=axis,
+                               seeds=seeds)
+    assert rm['n_complete'] == 11 and rm['n_dropped'] == 1, rm
+    assert rm['dropped_seeds'] == [3], rm['dropped_seeds']
+    assert all(c['n'] == 11 for c in rm['simple_effects'].values()), rm['simple_effects']
+    assert all(c['n'] == 11 for c in rm['interactions'].values()), rm['interactions']
+    # Numeric keys work too (the condition label is normalised to str for the
+    # report/tables, but the reference resolution is by value).
+    rnum = L.effect_modification({512: grow['512'], 1024: grow['1024']},
+                                 reference=512, seeds=seeds)
+    assert rnum['reference'] == '512' and rnum['trend'] is None, rnum
+    assert 'no numeric condition axis' in rnum['trend_reason'], rnum['trend_reason']
+    r2ax = L.effect_modification({512: grow['512'], 1024: grow['1024']},
+                                 reference=512, seeds=seeds,
+                                 condition_values={'512': 9, '1024': 10})
+    assert r2ax['trend'] is None and 'at least three' in r2ax['trend_reason'], r2ax
+    # A non-monotone or incomplete axis is refused as a slope, while the
+    # interaction itself (which does not need an axis) still runs.
+    rbad_axis = L.effect_modification(
+        grow, reference='512',
+        condition_values={'512': 10, '1024': 9, '2048': 11, '4096': 12},
+        seeds=seeds)
+    assert rbad_axis['trend'] is None and 'strictly increasing' in rbad_axis['trend_reason'], rbad_axis
+    rmiss_axis = L.effect_modification(
+        grow, reference='512',
+        condition_values={'512': 9, '1024': 10, '2048': 11}, seeds=seeds)
+    assert rmiss_axis['trend'] is None and 'no condition_values' in rmiss_axis['trend_reason'], rmiss_axis
+    # No data: reported, not crashed into a fabricated p.
+    r0 = L.effect_modification({'a': [float('nan')], 'b': [float('nan')]},
+                               reference='a', seeds=[0])
+    assert r0['status'] == 'no_data' and r0['n_complete'] == 0, r0
+    # Malformed inputs fail closed.
+    for bad in (lambda: L.effect_modification({}, reference='a'),
+                lambda: L.effect_modification({'a': '12', 'b': '12'}),
+                lambda: L.effect_modification({'a': [1, 2], 'b': [1]}),
+                lambda: L.effect_modification({'a': [1, 2], 'b': [1, 2]}, reference='c'),
+                lambda: L.effect_modification({'a': [1, 2], 'b': [1, 2]}, seeds=[0]),
+                lambda: L.effect_modification({'a': [1, 2], 'b': [1, 2]}, seeds=[0, 0]),
+                lambda: L.effect_modification({'a': [1, 2], 'b': [1, 2]}, seeds=[0, True]),
+                lambda: L.effect_modification({'a': [1, 2], 'b': [1, 2]}, alpha=0),
+                lambda: L.effect_modification({'a': [1, 2], 'b': [1, 2]}, min_n=-1),
+                lambda: L.effect_modification({'a': [1, 2], 'b': [1, 2]}, min_n=2.5)):
+        try:
+            bad()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('malformed effect_modification input must raise ValueError')
+    # Booleans are not measurements; dropping them must also drop the seed.
+    rb = L.effect_modification({'a': [True, 2.0], 'b': [1.0, 1.0]}, seeds=[0, 1])
+    assert rb['n_complete'] == 1 and rb['dropped_seeds'] == [0], rb
+
+
+def t_length_interaction_analysis_and_markdown():
+    lens = [512, 1024, 2048, 4096]
+    recs_a, recs_b = {}, {}
+    for s in range(12):
+        recs_a[s] = {'by_len': {
+            str(Ln): {'ppl': 10.0 * math.exp(0.05 * (s + 1) + 0.10 * i),
+                      'truncated': False}
+            for i, Ln in enumerate(lens)}}
+        recs_b[s] = {'by_len': {
+            str(Ln): {'ppl': 10.0 * math.exp(0.05 * (s + 1)),
+                      'truncated': False}
+            for i, Ln in enumerate(lens)}}
+    li = V12._length_interaction_analysis(recs_a, recs_b, list(range(12)), lens,
+                                          primary_len=4096)
+    assert li is not None, li
+    assert li['reference_length'] == 512 and li['primary_length'] == 4096, li
+    assert li['n_complete'] == 12 and li['interactions']['4096']['mean'] > 0, li
+    assert 'log(PPL_a)' in li['effect_definition'], li
+    assert 'never changes' in li['role'] and 'post-hoc' in li['role'], li
+    # A seed whose L2048 cell is unusable is dropped from EVERY length, not
+    # only from the 2048 interaction.
+    bad_a = {s: {'by_len': {k: dict(v) for k, v in r['by_len'].items()}}
+             for s, r in recs_a.items()}
+    bad_a[2]['by_len']['2048']['truncated'] = True
+    li2 = V12._length_interaction_analysis(bad_a, recs_b, list(range(12)), lens,
+                                           primary_len=4096)
+    assert li2['n_complete'] == 11 and li2['dropped_seeds'] == [2], li2
+    assert all(c['n'] == 11 for c in li2['interactions'].values()), li2
+    # The reference falls back to the shortest length when training length 512
+    # is not in the panel.
+    li3 = V12._length_interaction_analysis(recs_a, recs_b, list(range(12)),
+                                           [1024, 2048], primary_len=2048)
+    assert li3['reference_length'] == 1024, li3
+    # Fewer than two lengths/seeds -> no panel, never a one-point "trend".
+    assert V12._length_interaction_analysis(recs_a, recs_b, list(range(12)),
+                                            [512], primary_len=512) is None
+    assert V12._length_interaction_analysis(recs_a, recs_b, [0], lens,
+                                            primary_len=4096) is None
+    # Rendering: the interaction table and the "not two significance verdicts"
+    # caveat must both survive, and an absent block must render nothing.
+    md = V12._length_interaction_markdown('cmp', li)
+    assert md and any('L4096' in line for line in md), md
+    assert any('交互' in line and 'Holm' in line for line in md), md
+    assert any('不显著 ≠' in line for line in md), md
+    assert any('不改变' in line for line in md), md
+    assert any('趋势' in line for line in md), md
+    assert V12._length_interaction_markdown('cmp', None) == []
+    assert V12._length_interaction_markdown('cmp', {}) == []
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -19251,6 +19392,8 @@ def main():
     _check('L146 non-monotone pooling uses original block positions', t_nonmonotone_pooling_uses_original_positions)
     _check('L147 topk=1 margin is unmeasured, not zero', t_analyze_errors_topk_one_has_no_margin)
     _check('L148 logit thresholds + terminal manifest status + NaN calibration', t_metric_threshold_and_manifest_status_guards)
+    _check('L149 paired effect modification across conditions', t_effect_modification_across_conditions)
+    _check('L150 length interaction uses within-seed log effects', t_length_interaction_analysis_and_markdown)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

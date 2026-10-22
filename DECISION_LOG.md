@@ -2161,3 +2161,46 @@ environment skips; `python test_open_block.py` passes 15/15;
 same six comparisons; `python audit_gates.py source` reports `ok` against the
 regenerated plan snapshot; `python audit_gates.py dependencies` reports `ok`
 with 48/48 pinned and 0 unpinned installed distributions.
+
+## 2026-10-23 — effect modification across evaluation lengths (no new runs)
+
+Zero-GPU results-analysis hardening; no training run, no test read, no frozen
+manifest byte, seed, recipe, endpoint, alpha, Holm family or decision rule is
+touched.
+
+**Problem.** The frozen P5T table reports a per-length exact sign-flip p for
+512/1024/2048/4096, but the report had no test of whether the arm contrast
+*changes* with length.  Reading "significant at 512, not significant at 4096"
+as length dependence is the classic difference-between-significant-and-
+non-significant error, and reading "significant at both" as a constant effect
+does not test a zero difference either.  Absolute ΔPPL is also not comparable
+across lengths because baseline PPL grows with the evaluation span.
+
+**Changes.** `exp_lib.effect_modification()` takes one already-paired effect
+per seed at each condition, aligns a single complete-case seed set, and
+reports (i) descriptive simple effects, (ii) per-seed
+`effect(condition) − effect(reference)` with exact sign-flip p, t interval,
+paired bootstrap and a declared-family Holm adjustment, and (iii) an optional
+per-seed OLS slope on a supplied numeric axis (never a regression on condition
+means).  Missing/bool/non-finite cells drop the whole seed and are named.
+`v12_supp._length_interaction_analysis()` applies it to PPL as
+`log(PPL_a) − log(PPL_b)` with the training length 512 as reference (shortest
+length if absent) and `log2(length)` as the axis; `finaltest_stats` attaches
+`comparisons[*].length_interaction`, and `_length_interaction_markdown`
+renders the post-hoc table after the per-length curve.
+
+**Boundary.** The interaction and trend are post-hoc diagnostics: they are not
+added to the frozen Holm family, do not change `confirmed`, `p`, `p_holm`,
+α or the decision rule, and are not confirmatory evidence.  A non-significant
+interaction is explicitly rendered as "no detected effect modification", not
+as equivalent/constant effects.  No PPL, checkpoint, seed plan, manifest or
+`CODE_SEMANTICS` is changed.
+
+**Verification.** New CPU tests L149 (constant vs growing effects, Holm family,
+per-seed trend, whole-seed dropping, reference/axis guards, malformed inputs)
+and L150 (log-ratio definition, 512 reference and fallback, truncated-cell
+seed drop, single-length refusal, Markdown caveats).
+`python test_review_fixes.py` passes 486/489 with the same 3 DataLoader
+environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
+frozen records with the same six comparisons; `python audit_gates.py source`
+reports `ok` (23/23 files byte-identical to the regenerated plan snapshot).

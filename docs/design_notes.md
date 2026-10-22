@@ -2778,3 +2778,72 @@ python test_review_fixes.py       # L141 锁绑定/漂移拒绝/披露/重冻结
 python audit_gates.py source      # 有锁时按锁内源码树核验；无摘要则 not_verifiable
 python v12_supp.py plan           # 预检不变：72/72、6 个主比较
 ```
+
+## 52. 结果分析要检验「效应是否随条件改变」，而不是比较两个显著性（本轮方法硬化）
+
+### 52.1 问题：两个 p 值不能相减
+
+P5T 已经报告同一批冻结记录在 512/1024/2048/4096 上的逐长度曲线。
+旧报告把每个长度的 p 值并排打印，读者很自然地会做两种错误推断：
+
+1. 「L512 显著、L4096 不显著 ⇒ 优势只在训练长度成立」；
+2. 「两个长度都显著 ⇒ 效应不随长度变化」。
+
+第一种是经典的 **difference between significant and non-significant is
+not itself significant**：两个简单效应的显著性差异不是它们之差的检验。
+第二种同样没有回答「差值是否为 0」。小样本、不同基线 PPL、以及 PPL 的
+乘性尺度会让这两种读法都不可靠。
+
+### 52.2 改动：逐种子效应修饰（interaction）与趋势
+
+`exp_lib.effect_modification(effects_by_condition, reference=...,
+condition_values=..., seeds=..., min_n=6)` 接收「每个条件一个逐种子配对
+效应」的映射，并做三件事：
+
+- **简单效应**：每个条件的 `paired_effect_stats`（描述性；不把两个简单
+  效应的显著性当成交互）。
+- **交互**：对每个非参考条件计算逐种子
+  `effect(condition) − effect(reference)`，复用精确符号翻转、t 区间、
+  配对 bootstrap，并在**声明**的非参考条件族内做 Holm；缺失/非法成员以
+  p=1 占位，避免缩小族放松校正。
+- **趋势**：若提供严格递增的数值轴，则先对**每个种子**拟合 OLS 斜率，
+  再对逐种子斜率做精确符号翻转；绝不对条件均值回归（那会丢掉配对）。
+
+条件向量的缺失值按**整颗种子**剔除，并在 `dropped_seeds` 点名；同一个
+交互面板里的简单效应、交互与斜率因此使用同一个完整种子集合。布尔值、
+非有限值不是测量。`condition_values` 缺失/不单调/少于三个不同值时不报
+斜率，但交互仍然可算，原因写进 `trend_reason`。
+
+`v12_supp._length_interaction_analysis()` 把每个长度的 PPL 转成
+`log(PPL_a) − log(PPL_b)`（正 = a 更差），以训练长度 512 为参考（不在
+面板时退回最短长度），轴为 `log2(eval length)`。这样跨长度的效应可比，
+且交互不会被基线 PPL 随长度增长所污染。结果作为
+`comparisons[*].length_interaction` 落盘，并在报告的「全长度曲线」之后
+渲染为 post-hoc 表。
+
+### 52.3 解释边界
+
+- 交互与趋势是 **post-hoc 诊断**：不进入冻结 Holm 族、不改变 `confirmed`、
+  不改变任何 p/Holm/决策规则。
+- **不显著的交互 ≠ 效应不变/等价**；报告必须同时给出交互 p、区间和
+  「未检测到效应修饰」的措辞，不能写成「各长度相同」。
+- 简单效应仍是描述性的；「一个长度显著、另一个不显著」不再被当作长度
+  依赖的证据，必须看交互行。
+- `n < min_n` 时交互 p 只作描述，不能称为已确认；这与报告层 n≥6 的措辞
+  规则一致。
+- 逐长度曲线的 Holm 族仍只含冻结主比较；交互是额外的敏感度读数，不能
+  被用来追加确认性主张。
+
+### 52.4 入口与验证
+
+```bash
+python test_review_fixes.py     # L149 effect_modification；L150 长度交互/渲染
+python v12_supp.py analysis     # 在 test_stats.json 增加 length_interaction（不读新数据）
+python v12_supp.py report       # 全长度曲线后追加 post-hoc 交互表
+```
+
+L149 覆盖：恒定效应的零交互、线性增长效应、Holm 族、逐种子趋势、缺失
+种子整列剔除、数值键/参考解析、非单调/缺轴拒绝、空数据与畸形输入。
+L150 覆盖：`log(PPL_a/PPL_b)` 口径、512 参考与回退、截断单元导致整颗
+种子剔除、负/单长度拒绝，以及 Markdown 必须保留「不显著 ≠ 相同」和
+「不改变冻结判定」的边界。

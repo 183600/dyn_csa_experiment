@@ -13840,6 +13840,279 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     return st
 
 
+def effect_modification(effects_by_condition, *, reference=None, condition_values=None,
+                        seeds=None, alpha=0.05, min_n=6):
+    """Paired **effect-modification** (interaction) analysis across conditions.
+
+    The scientific question is not "is the effect significant at condition A
+    and also at condition B?" but "does the paired effect *change* between A
+    and B?".  Comparing two separate significance verdicts is not a test of
+    that difference (the classic "difference between significant and
+    non-significant is not itself significant" error).  This helper takes one
+    already-paired effect per seed at each condition (for PPL the caller should
+    pass ``log(PPL_a) - log(PPL_b)`` so conditions with different baseline
+    PPLs are comparable), aligns the seeds, and tests:
+
+      * each simple effect (descriptive; same exact sign-flip machinery);
+      * ``effect(condition) - effect(reference)`` per seed, with an exact
+        sign-flip p, t interval, paired bootstrap and a within-family Holm
+        adjustment over the declared non-reference conditions;
+      * when a numeric, strictly increasing ``condition_values`` axis is
+        supplied, a **per-seed** OLS slope of the effect on that axis, tested
+        with the same exact sign-flip test (never a regression on condition
+        means, which would discard the seed pairing).
+
+    A seed missing at ANY condition is dropped from the whole analysis and is
+    named in ``dropped_seeds``; silently using a different complete-case set
+    per interaction would make the simple effects and the interactions answer
+    different questions.  Non-finite/boolean values are not measurements.
+
+    ``significant`` on an interaction still requires n >= ``min_n`` and
+    ``p_floor <= alpha`` (via :func:`paired_effect_stats`), but this function
+    is a **post-hoc diagnostic**: its p-values are not part of a frozen
+    confirmatory family and it never rewrites one.  A non-significant
+    interaction is NOT evidence that the effect is constant or equivalent
+    across conditions; the report must say so next to the number.
+    """
+    alpha = _validated_alpha(alpha, context='effect_modification alpha')
+    _min_n = _as_seed_int(min_n)
+    if _min_n is None or _min_n < 0:
+        raise ValueError(f'effect_modification: min_n must be a non-negative integer, got {min_n!r}')
+    min_n = _min_n
+    try:
+        from collections.abc import Mapping
+    except Exception:  # pragma: no cover - Python 3.12 always has it
+        Mapping = dict
+    if not isinstance(effects_by_condition, Mapping) or not effects_by_condition:
+        raise ValueError('effect_modification: effects_by_condition must be a non-empty mapping')
+    keys = list(effects_by_condition.keys())
+    labels = [str(k) for k in keys]
+    if len(set(labels)) != len(labels):
+        raise ValueError(f'effect_modification: condition labels collide after str(): {labels!r}')
+    vectors = []
+    n_input = None
+    for k in keys:
+        raw = effects_by_condition[k]
+        if isinstance(raw, (str, bytes)):
+            raise ValueError(f'effect_modification: condition {k!r} must map to a sequence, not a string')
+        try:
+            seq = list(raw)
+        except TypeError:
+            raise ValueError(f'effect_modification: condition {k!r} must map to a sequence') from None
+        if n_input is None:
+            n_input = len(seq)
+        elif len(seq) != n_input:
+            raise ValueError(
+                'effect_modification: condition vectors differ in length (%d vs %d)'
+                % (n_input, len(seq)))
+        vectors.append(seq)
+    # Seed identity is part of the pairing.  Positional labels are only used
+    # when the caller did not declare identities; they are never invented to
+    # make a dropped seed look complete.
+    if seeds is None:
+        seed_labels = list(range(int(n_input)))
+    else:
+        if isinstance(seeds, (str, bytes)):
+            raise ValueError('effect_modification: seeds must be an iterable of integers, not a string')
+        try:
+            raw_seeds = list(seeds)
+        except TypeError:
+            raise ValueError('effect_modification: seeds must be an iterable') from None
+        if len(raw_seeds) != n_input:
+            raise ValueError(
+                'effect_modification: seeds length %d does not match condition length %d'
+                % (len(raw_seeds), n_input))
+        _norm = [_as_seed_int(s) for s in raw_seeds]
+        if any(s is None for s in _norm):
+            raise ValueError(f'effect_modification: seeds must be integers ({raw_seeds!r})')
+        if len(set(_norm)) != len(_norm):
+            raise ValueError(f'effect_modification: duplicate seeds {_norm!r}')
+        seed_labels = _norm
+    ref_label = labels[0] if reference is None else str(reference)
+    if ref_label not in labels:
+        raise ValueError(
+            'effect_modification: reference %r is not one of the conditions %r'
+            % (ref_label, labels))
+    # Complete-case pass over ALL conditions: one common seed set for every
+    # simple effect, interaction and slope in this panel.
+    data = {lab: [] for lab in labels}
+    kept, dropped = [], []
+    for i in range(int(n_input)):
+        row, ok = [], True
+        for seq in vectors:
+            f = _finite_scalar(seq[i])
+            if f is None:
+                ok = False
+                break
+            row.append(f)
+        if not ok:
+            dropped.append(seed_labels[i])
+            continue
+        for lab, v in zip(labels, row):
+            data[lab].append(v)
+        kept.append(seed_labels[i])
+    n = len(kept)
+
+    def _cell(st):
+        return {
+            'n': int(st.get('n') or 0),
+            'mean': float(st.get('mean', float('nan'))),
+            'std': float(st.get('std', float('nan'))),
+            'std_defined': st.get('std_defined'),
+            'ci95_low': float(st.get('ci95_low', float('nan'))),
+            'ci95_high': float(st.get('ci95_high', float('nan'))),
+            'cohens_dz': float(st.get('cohens_dz', float('nan'))),
+            'p_exact_signflip': float(st.get('p_exact_signflip', float('nan'))),
+            'p_floor': float(st.get('p_floor', float('nan'))),
+            'underpowered': bool(st.get('underpowered')),
+            'resolution_limited': bool(st.get('resolution_limited')),
+            'within_seed_noise': bool(st.get('within_seed_noise')),
+            'significant': bool(st.get('significant')),
+            'effect_vs_noise': st.get('effect_vs_noise'),
+            'ci95_paired_bootstrap': st.get('ci95_paired_bootstrap'),
+        }
+
+    simple = {}
+    for lab in labels:
+        st = paired_effect_stats(data[lab], alpha=alpha, min_n=min_n, seeds=kept)
+        cell = _cell(st)
+        cell['condition'] = lab
+        cell['role'] = 'descriptive simple effect (not an interaction test)'
+        simple[lab] = cell
+    interactions = {}
+    for lab in labels:
+        if lab == ref_label:
+            continue
+        diff = [data[lab][j] - data[ref_label][j] for j in range(n)]
+        st = paired_effect_stats(diff, alpha=alpha, min_n=min_n, seeds=kept)
+        cell = _cell(st)
+        m = cell['mean']
+        if math.isfinite(m) and -700.0 < m < 700.0:
+            cell['ratio'] = float(math.exp(m))
+            cell['percent_change'] = float(100.0 * (math.exp(m) - 1.0))
+        else:
+            # exp() would under/overflow and turn a real effect into 0/inf.
+            cell['ratio'] = None
+            cell['percent_change'] = None
+        cell.update({
+            'condition': lab,
+            'reference': ref_label,
+            'delta_mean': m,
+            'definition': ('effect(condition) - effect(reference); positive = the '
+                           'paired effect is larger at this condition'),
+            'p_holm': None,
+            'role': 'post-hoc effect modification (not in the frozen family)',
+        })
+        interactions[lab] = cell
+    # Holm over the declared non-reference interaction family.  As everywhere
+    # else in this repo an omitted/invalid member stays at p=1.0 so the family
+    # cannot shrink and relax the correction.
+    if interactions:
+        _fam = [(lab, (float(c['p_exact_signflip'])
+                       if math.isfinite(float(c['p_exact_signflip'])) else 1.0))
+                for lab, c in interactions.items()]
+        h = holm_adjust(_fam, alpha=alpha)
+        for lab, c in interactions.items():
+            c['p_holm'] = (h.get(lab) or {}).get('p_holm')
+        family = {
+            'm': len(_fam),
+            'method': 'holm step-down over the non-reference interaction conditions',
+            'alpha': alpha,
+            'min_attainable_p_holm': holm_min_attainable_p_floors(
+                [c.get('p_floor') for c in interactions.values()], alpha=alpha),
+        }
+    else:
+        family = {'m': 0, 'method': 'no non-reference condition', 'alpha': alpha,
+                  'min_attainable_p_holm': None}
+    # Optional numeric axis -> one within-seed slope per seed.  The axis must
+    # be supplied (condition labels need not be numeric) and strictly
+    # increasing in the declared order.
+    axis = None
+    trend = None
+    trend_reason = None
+    if condition_values is None:
+        trend_reason = 'no numeric condition axis supplied; a slope is not defined'
+    elif not isinstance(condition_values, Mapping):
+        trend_reason = 'condition_values must be a mapping from condition label to a numeric value'
+    else:
+        _cv = {str(k): v for k, v in condition_values.items()}
+        _axis, _why = [], None
+        for lab in labels:
+            if lab not in _cv:
+                _why = f'condition {lab!r} has no condition_values entry'
+                break
+            f = _finite_scalar(_cv[lab])
+            if f is None:
+                _why = f'condition {lab!r} has a non-numeric/non-finite axis value'
+                break
+            _axis.append(f)
+        if _why is None:
+            if any(_axis[i] >= _axis[i + 1] for i in range(len(_axis) - 1)):
+                _why = 'condition_values must be strictly increasing in the declared condition order'
+            elif len(set(_axis)) < 3:
+                _why = 'a slope needs at least three distinct condition values'
+        if _why is not None:
+            trend_reason = _why
+        else:
+            axis = _axis
+    if axis is not None and n >= 2:
+        x = np.asarray(axis, dtype=float)
+        xbar = float(x.mean())
+        denom = float(((x - xbar) ** 2).sum())
+        if denom <= 0.0:
+            trend_reason = 'the condition axis has zero variance'
+        else:
+            slopes = []
+            for j in range(n):
+                y = np.asarray([data[lab][j] for lab in labels], dtype=float)
+                slopes.append(float(((x - xbar) * (y - y.mean())).sum() / denom))
+            st = paired_effect_stats(slopes, alpha=alpha, min_n=min_n, seeds=kept)
+            trend = _cell(st)
+            trend.update({
+                'axis': 'condition_values',
+                'axis_values': [float(v) for v in axis],
+                'n_conditions': len(labels),
+                'definition': ('per-seed OLS slope of the paired effect on the supplied '
+                               'numeric condition axis; positive = the effect increases '
+                               'with the axis'),
+                'role': 'post-hoc trend diagnostic (not in the frozen family)',
+            })
+    elif axis is not None:
+        trend_reason = 'fewer than two complete seeds; no within-seed slope'
+    out = {
+        'kind': 'effect_modification',
+        'unit': 'seed',
+        'alpha': alpha,
+        'min_n': min_n,
+        'reference': ref_label,
+        'conditions': labels,
+        'condition_values': ([float(v) for v in axis] if axis is not None else None),
+        'n_input': int(n_input),
+        'n_complete': n,
+        'n_dropped': int(len(dropped)),
+        'seeds': kept,
+        'dropped_seeds': dropped,
+        'simple_effects': simple,
+        'interactions': interactions,
+        'interaction_family': family,
+        'trend': trend,
+        'trend_reason': trend_reason,
+        'claim_level': ('post-hoc effect-modification diagnostic; not part of a frozen '
+                        'confirmatory family and never rewrites its verdict'),
+        'note': ('interactions ask whether the paired effect CHANGES across conditions. '
+                 'A non-significant interaction is not evidence that the effect is constant '
+                 'or equivalent, and a difference in the significance of two separate simple '
+                 'effects is not an interaction test. Simple effects are descriptive.'),
+    }
+    if n == 0:
+        out['status'] = 'no_data'
+        out['note'] = ('no seed had a finite effect at every condition; no interaction or '
+                       'trend was estimated. ' + out['note'])
+    else:
+        out['status'] = 'ok'
+    return out
+
+
 def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=True):
     """尺度阶梯上的效应趋势：相对效应 ~ log(scale) 的加权回归 + 精确配对检验。
 

@@ -2385,6 +2385,62 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     return out
 
 
+def _length_interaction_analysis(recs_a, recs_b, common, lengths, *, primary_len=None,
+                                 alpha=0.05, min_n=6):
+    """Paired effect modification of the arm contrast across evaluation lengths.
+
+    PPL at different context lengths is not on one additive scale: the baseline
+    PPL itself grows with length, so an absolute ΔPPL at L512 and at L4096 are
+    not directly comparable.  The paired effect is therefore the per-seed
+    ``log(PPL_a) - log(PPL_b)`` at each length (positive = arm a is worse),
+    and the interaction is the within-seed change of that effect relative to a
+    reference length (the training length 512 when present, otherwise the
+    shortest evaluated length).
+
+    This is deliberately **not** "compare the p-value at 512 with the p-value
+    at 4096": a difference in significance is not a significant difference.
+    The same seeds must be observed at every length; a seed missing one cell is
+    dropped from the whole panel and named, never paired positionally.  The
+    result is post-hoc/descriptive and never enters the frozen Holm family.
+    """
+    lens = sorted({int(x) for x in (lengths or [])})
+    common = list(common or [])
+    if len(lens) < 2 or len(common) < 2:
+        return None
+    effects = {}
+    for Ln in lens:
+        vals = []
+        for s in common:
+            pa = _ppl_at_len(recs_a.get(s), Ln)
+            pb = _ppl_at_len(recs_b.get(s), Ln)
+            if pa is None or pb is None:
+                vals.append(float('nan'))
+                continue
+            try:
+                vals.append(float(math.log(pa) - math.log(pb)))
+            except (ValueError, OverflowError):
+                vals.append(float('nan'))
+        effects[str(Ln)] = vals
+    reference = 512 if 512 in lens else lens[0]
+    res = L.effect_modification(
+        effects, reference=str(reference),
+        condition_values={str(Ln): float(math.log2(Ln)) for Ln in lens},
+        seeds=[int(s) for s in common], alpha=alpha, min_n=min_n)
+    res.update({
+        'lengths': [int(x) for x in lens],
+        'reference_length': int(reference),
+        'primary_length': (int(primary_len) if primary_len is not None else None),
+        'effect_definition': ('log(PPL_a) - log(PPL_b) at each length; positive = arm a '
+                              'has higher PPL (worse)'),
+        'condition_axis': 'log2(eval length)',
+        'role': ('post-hoc length effect-modification diagnostic; not in the frozen '
+                 'Holm family and never changes `confirmed`'),
+        'simple_effect_note': ('per-length simple effects are descriptive; compare the '
+                               'interaction, not the significance of separate lengths'),
+    })
+    return res
+
+
 def _test_probe_stats(probe_path, manifest, slice_fp):
     """Descriptive summary of the P5T test-split distractor probe.
 
@@ -2729,6 +2785,74 @@ def _robustness_markdown(rob):
     return out
 
 
+def _length_interaction_markdown(name, li):
+    """Render the post-hoc length effect-modification table.
+
+    Pure formatting so the "interaction, not two significance verdicts" caveat
+    and the table can be unit-tested without a GPU panel or a report build.
+    """
+    out = []
+    if not (isinstance(li, dict) and li.get('conditions')):
+        return out
+    A = out.append
+
+    def _fmt_ci(cell):
+        lo, hi = cell.get('ci95_low'), cell.get('ci95_high')
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+            if math.isfinite(float(lo)) and math.isfinite(float(hi)):
+                return f'[{float(lo):+.4f}, {float(hi):+.4f}]'
+        return '—'
+
+    def _fmt_p(v):
+        return f'{float(v):.4g}' if isinstance(v, (int, float)) and math.isfinite(float(v)) else '—'
+
+    ref = str(li.get('reference'))
+    A(f'**`{name}`** — 参考条件 L{li.get("reference_length", ref)}；'
+      f'效应 = log(PPL_a/PPL_b)，正 = a 更差；交互 = 该长度的效应减参考长度的效应。')
+    A('')
+    A('| 条件 | n | 简单效应 mean [95% CI] | 与参考的交互 Δ [95% CI] | 效应比值变化 | 交互 p（原始） | 交互 p（Holm） |')
+    A('|---|---|---|---|---|---|---|')
+    _simples = li.get('simple_effects') or {}
+    _inters = li.get('interactions') or {}
+    for lab in li.get('conditions') or []:
+        cell = _simples.get(lab) or {}
+        mean = cell.get('mean')
+        mtxt = f'{float(mean):+.4f} {_fmt_ci(cell)}' if isinstance(mean, (int, float)) else '—'
+        if lab == ref:
+            itxt, rtxt, praw, pholm = '—（参考）', '—', '—', '—'
+        else:
+            inter = _inters.get(lab) or {}
+            dm = inter.get('delta_mean')
+            itxt = (f'{float(dm):+.4f} {_fmt_ci(inter)}'
+                    if isinstance(dm, (int, float)) else '—')
+            ratio = inter.get('ratio')
+            rtxt = (f'×{float(ratio):.3f}' if isinstance(ratio, (int, float))
+                    and math.isfinite(float(ratio)) else '—')
+            praw = _fmt_p(inter.get('p_exact_signflip'))
+            pholm = _fmt_p(inter.get('p_holm'))
+        A(f'| L{lab} | {cell.get("n", 0)} | {mtxt} | {itxt} | {rtxt} | {praw} | {pholm} |')
+    A('')
+    tr = li.get('trend') or {}
+    if isinstance(tr, dict) and tr.get('n'):
+        A(f"- 趋势（逐种子斜率 / {li.get('condition_axis', 'condition axis')}）："
+          f"{float(tr.get('mean')):+.4f} {_fmt_ci(tr)}，p={_fmt_p(tr.get('p_exact_signflip'))}，"
+          f"n={tr.get('n')}；这是 post-hoc 趋势读数，不进冻结族。")
+    else:
+        A(f"- 趋势：不可估（{li.get('trend_reason') or '—'}）。")
+    _n, _min = li.get('n_complete'), li.get('min_n')
+    if isinstance(_n, int) and isinstance(_min, int) and _n < _min:
+        A(f"- 样本：只有 {_n} 个完整种子（< min_n={_min}），交互 p 仅作描述，不能称为已确认。")
+    _dropped = li.get('dropped_seeds') or []
+    if _dropped:
+        A(f"- 完整种子集合：缺少任一长度可用单元的种子 {_dropped} 已从整个交互面板剔除（不是按长度各自配对）。")
+    A('')
+    A('> 这是 **post-hoc 效应修饰（interaction）诊断**，不属于冻结 Holm 族，也不改变 `confirmed`。'
+      '不显著 ≠ 各长度效应相同；「L512 显著、L4096 不显著」也不能当作长度依赖证据——'
+      '必须看本表的交互检验。简单效应与趋势仅作描述。')
+    A('')
+    return out
+
+
 def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analysis_v12/test_stats.json'):
     """Zero-GPU: paired confirmation statistics under the frozen plan.
 
@@ -2966,6 +3090,19 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                 'note': ('primary frozen endpoint' if _Ln2 == Ln else
                          'same records, different length; not in the frozen Holm family and never confirmatory'),
             }
+        # Does the arm contrast CHANGE with length?  Separate per-length
+        # sign-flip p-values cannot answer that (a difference in significance
+        # is not a significant difference).  The interaction uses the same
+        # seeds at every length, conditions on those seeds, and is post-hoc:
+        # it is never added to the frozen Holm family or the decision rule.
+        _li_lens = sorted(
+            {int(x) for x in ((manifest.get('eval') or {}).get('by_length_ppl') or [])}
+            | {int(Ln)})
+        _li = _length_interaction_analysis(
+            recs_a, recs_b, usable, _li_lens, primary_len=Ln,
+            alpha=_alpha, min_n=6)
+        if _li is not None and _li.get('n_complete', 0) >= 2:
+            res['length_interaction'] = _li
         res['in_distribution_L512'] = res['by_length_curve'].get('512')
         if exp_sign in ('positive', 'negative') and math.isfinite(res.get('mean', float('nan'))):
             res['direction_ok'] = bool((res['mean'] > 0) == (exp_sign == 'positive'))
@@ -3539,6 +3676,15 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             A('')
             A('> L512 是训练长度，其余长度是外推；L512 与冻结终点方向相反时，冻结终点的“优势”只能读作长度外推鲁棒性，不能读作“CSA 更好”。')
             A('')
+            _li_lines = []
+            for _k, _v in comps.items():
+                _one = _length_interaction_markdown(_k, _v.get('length_interaction'))
+                if _one:
+                    _li_lines.extend(_one)
+            if _li_lines:
+                A('### 长度效应修饰（post-hoc；不改变冻结判定）')
+                A('')
+                lines.extend(_li_lines)
         _claim_no = [k for k, v in comps.items() if v.get('mechanism_claim_allowed') is False]
         if _claim_no:
             A('**主张边界（v4）**：以下比较不自动构成机制证据（`mechanism_claim_allowed=false`）：')
