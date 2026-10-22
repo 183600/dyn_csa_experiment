@@ -9383,6 +9383,9 @@ def pair_reason(ra, rb):
         return 'unverifiable run_cfg'
     if ra.get('run_cfg') != rb.get('run_cfg'):
         return 'different run_cfg'
+    _env_reason = execution_environment_reason(ra, rb)
+    if _env_reason is not None:
+        return _env_reason
     # Controlled-variable gate for the settings the run fingerprint does not
     # carry (optimizer identity / betas / eps, LR-schedule shape, grad-clip,
     # augmentation).  BOTH records must carry the descriptor or BOTH must omit
@@ -22056,6 +22059,76 @@ def environment_snapshot():
             env[_key] = None
     return env
 
+def execution_fingerprint(env=None):
+    """Fingerprint of the hardware/software/determinism class of a run.
+
+    Same-seed replication is only guaranteed on the same stack: a different
+    GPU architecture, CUDA/cuDNN build, precision policy or thread count can
+    change every result.  Paired seed contrasts therefore carry this digest,
+    and `pair_reason` refuses two records whose digests disagree.  Hostname and
+    process id are deliberately excluded so two machines of the same class can
+    still be compared; the GPU UUID is excluded for the same reason (hardware
+    model and compute capability are the reproducibility-relevant part).
+    """
+    env = environment_snapshot() if env is None else env
+    gpus = []
+    for g in env.get('gpu_identity') or []:
+        if not isinstance(g, dict):
+            continue
+        gpus.append({k: g.get(k) for k in ('name', 'major', 'minor', 'total_memory_bytes')})
+    deps = env.get('dependencies') or {}
+    fields = {
+        'python': env.get('python'),
+        'platform': env.get('platform'),
+        'machine': env.get('machine'),
+        'processor': env.get('processor'),
+        'cpu_count': env.get('cpu_count'),
+        'torch': env.get('torch'),
+        'torch_git_version': env.get('torch_git_version'),
+        'numpy': env.get('numpy'),
+        'cuda_available': env.get('cuda_available'),
+        'cuda_version': env.get('cuda_version'),
+        'cudnn_version': env.get('cudnn_version'),
+        'cuda_device_count': env.get('cuda_device_count'),
+        'gpus': gpus,
+        'determinism': env.get('determinism'),
+        'cudnn_deterministic': env.get('cudnn_deterministic'),
+        'cudnn_benchmark': env.get('cudnn_benchmark'),
+        'deterministic_algorithms': env.get('deterministic_algorithms'),
+        'tf32_matmul': env.get('tf32_matmul'),
+        'tf32_cudnn': env.get('tf32_cudnn'),
+        'fp16_reduced_precision_reduction': env.get('fp16_reduced_precision_reduction'),
+        'bf16_reduced_precision_reduction': env.get('bf16_reduced_precision_reduction'),
+        'float32_matmul_precision': env.get('float32_matmul_precision'),
+        'cublas_workspace_config': env.get('cublas_workspace_config'),
+        'cpu_threads': env.get('cpu_threads'),
+        'cpu_interop_threads': env.get('cpu_interop_threads'),
+        'packages': deps.get('packages') if isinstance(deps, dict) else None,
+    }
+    blob = json.dumps(fields, sort_keys=True, default=str, ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+def execution_environment_reason(ra, rb):
+    """Why two records cannot attest same-environment replication, or None.
+
+    Both-present is required for a verdict; legacy records without the digest
+    keep the historical permissive path.  This is only about the execution
+    environment, not the seed, data or recipe (those have their own gates).
+    """
+    def _fp(rec):
+        v = rec.get('exec_fp')
+        if v is None and isinstance(rec.get('hyperparams'), dict):
+            v = rec['hyperparams'].get('exec_fp')
+        return v
+    a, b = _fp(ra), _fp(rb)
+    ha = a is not None and str(a) != ''
+    hb = b is not None and str(b) != ''
+    if ha and hb and str(a) != str(b):
+        return (f'different execution environment ({str(a)[:12]}… vs '
+                f'{str(b)[:12]}…): same-seed replication is not controlled '
+                'across hardware/driver/precision classes')
+    return None
+
 def _corpus_prefix_fp(train_ids, cap=None):
     """Fingerprint of the tokenizer-fit prefix, independent of training budget.
 
@@ -22180,6 +22253,7 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
         'vocab_size': int(vocab),
         'mlp_ratio': float(mlp_ratio),
         'dataset': cfg.get('dataset') or 'wikitext',
+        'exec_fp': execution_fingerprint(),
         'train_knobs': training_knobs(amp_dtype=amp_dtype, eager_batch=eager_batch),
         'determinism': {
             'level': determinism_label(),
@@ -22314,6 +22388,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                     'train_time_s': rec.get('train_time_s'),
                     'final_loss_smoothed': rec.get('final_loss_smoothed'),
                     'rng_fp': rec.get('rng_fp'),
+                    'exec_fp': rec.get('exec_fp'),
                     'data_fp': rec.get('data_fp'),
                     'val_fp': rec.get('val_fp'),
                     'data_version': rec.get('data_version') or prov.get('data', {}).get('data_version'),
@@ -22393,6 +22468,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         'with_provenance': sum(1 for c in cells.values() if c.get('data_fp') and c.get('code_stamp')),
         'with_hyperparams': sum(1 for c in cells.values() if c.get('hyperparams')),
         'with_rng_fp': sum(1 for c in cells.values() if c.get('rng_fp')),
+        'with_exec_fp': sum(1 for c in cells.values() if c.get('exec_fp')),
         'with_data_version': sum(1 for c in cells.values() if c.get('data_version')),
         'with_curve': sum(1 for c in cells.values() if (c.get('curve_summary') or {}).get('n_points')),
         'with_sanity_ref': sum(1 for c in cells.values() if c.get('sanity_ref')),
@@ -22447,8 +22523,12 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                                'seed_metadata_mismatch / run_cfg_mismatch / '
                                'data_version_mismatch'),
     }
+    _prod_evidence = None
+    if isinstance(sanity, dict) and isinstance(sanity.get('production_loop'), dict):
+        _prod_evidence = bool((sanity.get('production_loop') or {}).get('passed'))
     _evidence = {
         'small_batch_overfit': (bool(sanity.get('passed')) if isinstance(sanity, dict) else None),
+        'production_loop_overfit': _prod_evidence,
         'same_machine_reproducibility': (bool(reproducibility.get('passed')) if isinstance(reproducibility, dict) else None),
         'rng_seed_contract': (bool(seed_contract.get('passed')) if isinstance(seed_contract, dict) else None),
         'batch_iterator_contract': (bool(data_contract.get('passed')) if isinstance(data_contract, dict) else None),
@@ -23774,6 +23854,32 @@ LR_FLOOR_MULT = 0.1
 BOUNDARY_PG_COEF = 1.0
 LR_COSINE_AMP = 0.45
 
+def optimizer_param_groups(model):
+    """Split trainable parameters exactly as the production trainer does."""
+    decay = [p for n_, p in model.named_parameters()
+             if p.requires_grad and (not is_no_decay(n_)) and (not is_delta_param(n_))]
+    no_decay = [p for n_, p in model.named_parameters()
+                if p.requires_grad and is_no_decay(n_) and (not is_delta_param(n_))]
+    delta = [p for n_, p in model.named_parameters()
+             if p.requires_grad and is_delta_param(n_)]
+    return decay, no_decay, delta
+
+def build_optimizer(model, *, lr, weight_decay, delta_lr_mult=10.0):
+    """Build the production AdamW optimizer (three groups, foreach=True).
+
+    The overfit/reproducibility pre-flights use this function too, so a
+    parameter-grouping change can no longer pass a hand-rolled probe while
+    breaking the real training loop.
+    """
+    decay, no_decay, delta = optimizer_param_groups(model)
+    groups = [
+        {'params': decay, 'weight_decay': float(weight_decay), 'lr_scale': 1.0},
+        {'params': no_decay, 'weight_decay': 0.0, 'lr_scale': 1.0},
+        {'params': delta, 'weight_decay': 0.0, 'lr_scale': float(delta_lr_mult)},
+    ]
+    return torch.optim.AdamW(groups, lr=float(lr), betas=OPT_ADAMW_BETAS,
+                             eps=OPT_ADAMW_EPS, foreach=True)
+
 def training_knobs(*, amp_dtype='auto', eager_batch='auto'):
     """Canonical, JSON-safe descriptor of the optimisation / schedule /
     gradient-clipping / augmentation / precision settings shared by every arm
@@ -24305,6 +24411,23 @@ def _is_finite_number(v):
     return _finite_scalar(v) is not None
 
 
+def data_seed_for_rank(seed, rank):
+    """Domain-safe per-rank data seed for DDP.
+
+    Rank 0 keeps the single-process stream unchanged.  Other ranks get a
+    deterministic SplitMix64 derivation instead of ``seed + rank``, which can
+    overflow the NumPy/PyTorch seed domain and can silently collide with a
+    different declared seed (seed=0/rank=1 vs seed=1/rank=0).
+    """
+    seed = _seed_value(seed)
+    rank = int(rank)
+    if rank < 0:
+        raise ValueError(f'rank must be non-negative, got {rank}')
+    if rank == 0:
+        return seed
+    mixed = _splitmix64_u64((int(seed) << 32) ^ (rank & 0xFFFFFFFF))
+    return int(mixed % (MAX_SEED + 1))
+
 def _fixed_train_eval_batch(train_ids, seq_len, batch_size, device, seed):
     """One deterministic batch used ONLY to measure training CE on a fixed
     distribution.  It has its own RNG stream, so it cannot perturb the training
@@ -24649,8 +24772,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         if not (eval_every and int(eval_every) > 0):
             raise ValueError('early_stop_patience needs eval_every > 0 so the validation curve is measured')
         _es_patience = int(early_stop_patience)
-    set_seed(seed)
+    seed = set_seed(seed)
     _rng_fp = rng_fingerprint()
+    _exec_fp = execution_fingerprint()
     _attb_bump_epoch()
     _amp, _ = _resolve_impl_modes({'amp_dtype': amp_dtype, 'eager_batch': False}, device=device)
     _amp_dtype = torch.bfloat16 if _amp == 'bf16' else (torch.float16 if _amp == 'fp16' else None)
@@ -24695,15 +24819,14 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             gradient_as_bucket_view=True)
     n_param = count_params(model)
     print(f'\n[{variant} seed={seed}] params={n_param / 1000000.0:.2f}M  mlp_ratio={mlp_ratio:.2f}  layers={[c.kind for c in cfgs]}')
-    decay_params = [p for n_, p in _inner_model.named_parameters() if p.requires_grad and (not is_no_decay(n_)) and (not is_delta_param(n_))]
-    ndecay_params = [p for n_, p in _inner_model.named_parameters() if p.requires_grad and is_no_decay(n_) and (not is_delta_param(n_))]
-    delta_params = [p for n_, p in _inner_model.named_parameters() if p.requires_grad and is_delta_param(n_)]
     # foreach=True pins the multi-tensor AdamW implementation.  Foreach applies
     # the same per-element IEEE op chain as the single-tensor form (lerp /
     # addcmul / sqrt are elementwise, so every element sees the identical
     # rounding sequence), so the update is bit-identical to the single-tensor
     # form, and on CUDA it pins the already-default foreach path.
-    opt = torch.optim.AdamW([{'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': 1.0}, {'params': ndecay_params, 'weight_decay': 0.0, 'lr_scale': 1.0}, {'params': delta_params, 'weight_decay': 0.0, 'lr_scale': delta_lr_mult}], lr=lr, betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, foreach=True)
+    opt = build_optimizer(_inner_model, lr=lr, weight_decay=weight_decay,
+                          delta_lr_mult=delta_lr_mult)
+    _, _, delta_params = optimizer_param_groups(_inner_model)
     if delta_params:
         print(f'    delta_logit params: {len(delta_params)} (lr x{delta_lr_mult:g})')
 
@@ -24718,8 +24841,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # In DDP each rank consumes a different data shard; the global batch is
     # batch_size * world_size (recorded below).  Single-process runs keep the
     # same seed exactly.
-    bpe = batch_iter(train_ids, seq_len, batch_size, device,
-                     seed=(seed + _rank if _dist else seed))
+    _data_seed = data_seed_for_rank(seed, _rank) if _dist else seed
+    bpe = batch_iter(train_ids, seq_len, batch_size, device, seed=_data_seed)
     _eval_batch = val_batch[:eval_subset] if val_batch is not None else None
     _eval_subset_fp = _ids_fp(np.ascontiguousarray(np.asarray(_eval_batch)).reshape(-1)) if _eval_batch is not None else None
     _fixed_eval = None
@@ -25233,7 +25356,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if _n_train > 0:
         _p = min(float(seq_len) / float(_n_train), 1.0)
         _uniq_frac = (1.0 if _p >= 1.0 else float(1.0 - math.exp(_draws * math.log1p(-_p))))
-    result = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'steps_completed': int(_steps_completed), 'early_stop': _early_stop, 'tokens_seen': _steps_completed * batch_size * seq_len * _world,
+    result = {'variant': variant, 'seed': seed, 'data_seed': int(_data_seed), 'exec_fp': _exec_fp, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'steps_completed': int(_steps_completed), 'early_stop': _early_stop, 'tokens_seen': _steps_completed * batch_size * seq_len * _world,
               'tokens_seen_unique_estimate': (int(round(_n_train * _uniq_frac)) if _uniq_frac is not None else None),
               'tokens_seen_unique_frac_estimate': _uniq_frac,
               'token_accounting_note': 'tokens_seen counts window draws; unique-token coverage is an estimate under independent uniform window draws, not a measurement',
@@ -25985,7 +26108,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
                                      or not isinstance(ignore_index, numbers.Integral)):
         raise ValueError(f'overfit_sanity_check: ignore_index must be an integer or None, got {ignore_index!r}')
     device = DEVICE if device is None else (device if isinstance(device, torch.device) else torch.device(device))
-    set_seed(seed)
+    seed = set_seed(seed)
     _rng_fp = rng_fingerprint()
     _label_shift_ok = None
     _batch_contract = None
@@ -26046,7 +26169,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     cfgs = make_layer_cfgs(n_layers, variant)
     model = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
     _p_before = _param_change_sample(model).clone()
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, weight_decay=0.0, foreach=True)
+    opt = build_optimizer(model, lr=lr, weight_decay=0.0, delta_lr_mult=1.0)
 
     _loss_path = 'forward' if _ign in (None, -100) else 'ce_loss'
 
@@ -26411,6 +26534,169 @@ def _overfit_ratio_for(mlp_ratio, variant):
         return mlp_ratio.get(variant)
     return mlp_ratio
 
+def _production_loop_sanity_check_impl(variant='full', *, seed=0, steps=150, lr=1e-2,
+                                      d=32, n_layers=1, n_heads=4, d_head=8,
+                                      seq_len=16, batch_size=2, vocab=64,
+                                      train_ids=None, device=None,
+                                      target_loss=0.05, target_acc=0.99,
+                                      mlp_ratio=None):
+    """Overfit ONE fixed window through the REAL `train_variant` loop.
+
+    The hand-rolled small-batch probe proves the model/loss/label plumbing.
+    This companion check proves the production trainer (optimizer groups,
+    scheduler, clipping, loss assembly, PPL/eval path) actually applies the
+    updates: a bug in `train_variant` cannot hide behind a separately written
+    probe loop.
+    """
+    if int(d) != int(n_heads) * int(d_head):
+        raise ValueError(f'production_loop_sanity_check: d={d} must equal n_heads*d_head={n_heads}*{d_head}')
+    _steps = _exact_count(steps, minimum=1)
+    if _steps is None:
+        raise ValueError(f'production_loop_sanity_check: steps must be a positive integer, got {steps!r}')
+    _seq = _exact_count(seq_len, minimum=1)
+    if _seq is None:
+        raise ValueError(f'production_loop_sanity_check: seq_len must be a positive integer, got {seq_len!r}')
+    _bs = _exact_count(batch_size, minimum=1)
+    if _bs is None:
+        raise ValueError(f'production_loop_sanity_check: batch_size must be a positive integer, got {batch_size!r}')
+    _vocab = _exact_count(vocab, minimum=1)
+    if _vocab is None:
+        raise ValueError(f'production_loop_sanity_check: vocab must be a positive integer, got {vocab!r}')
+    steps, seq_len, batch_size, vocab = int(_steps), int(_seq), int(_bs), int(_vocab)
+    device = DEVICE if device is None else (device if isinstance(device, torch.device) else torch.device(device))
+    seed = set_seed(seed)
+    rng = np.random.default_rng((seed + 7919) % (MAX_SEED + 1))
+    if train_ids is None:
+        window = rng.integers(0, vocab, size=seq_len + 1, dtype=np.int64)
+        source = 'synthetic'
+    else:
+        arr = np.asarray(train_ids)
+        if arr.ndim != 1:
+            raise ValueError('production_loop_sanity_check: train_ids must be one-dimensional')
+        if arr.size < seq_len + 1:
+            raise ValueError(f'production_loop_sanity_check: need at least seq_len+1={seq_len + 1} tokens, got {arr.size}')
+        start = int(rng.integers(0, int(arr.size) - int(seq_len)))
+        window = np.ascontiguousarray(arr[start:start + seq_len + 1], dtype=np.int64)
+        source = 'train_ids'
+    if mlp_ratio is None:
+        mlp_ratio = variant_mlp_ratio(variant, vocab, d=d, n_layers=n_layers,
+                                      n_heads=n_heads, d_head=d_head,
+                                      seq_len=seq_len,
+                                      matched=PARAM_MATCHED | PARAM_MATCHED_V7)
+    val = np.tile(window[None, :seq_len], (batch_size, 1)).astype(np.int64, copy=False)
+    rec = train_variant(variant, window, val, vocab, seed=seed, d=d,
+                        n_layers=n_layers, n_heads=n_heads, d_head=d_head,
+                        seq_len=seq_len, batch_size=batch_size, steps=steps,
+                        lr=lr, weight_decay=0.0, warmup=0, comp_lambda=0.0,
+                        delta_lr_mult=1.0, eval_every=0, eval_subset=0,
+                        val_bnd=None, device=device, log_every=0,
+                        diag_every=1, measure_eff=False, amp_dtype='fp32',
+                        eager_batch=False, return_model=True,
+                        save_ckpt='none', ckpt_dir=None,
+                        early_stop_patience=None)
+    model = rec.pop('_model', None)
+    try:
+        if rec.get('cap_truncated'):
+            final_loss = final_acc = float('nan')
+            losses = []
+            opt = {}
+        else:
+            losses = [float(v) for v in (rec.get('losses') or [])]
+            x = torch.from_numpy(np.tile(window[:-1], (batch_size, 1))).to(device)
+            y = torch.from_numpy(np.tile(window[1:], (batch_size, 1))).to(device)
+            try:
+                final_loss, final_acc = _lm_batch_metrics(model, x, y, vocab)
+            finally:
+                del x, y
+            opt = rec.get('opt_diag_summary') if isinstance(rec.get('opt_diag_summary'), dict) else {}
+    finally:
+        del model
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+    finite = all(math.isfinite(v) for v in losses)
+    best_loss = min(losses) if losses else float('nan')
+    initial_loss = losses[0] if losses else float('nan')
+    loss_decreased = bool(math.isfinite(initial_loss) and math.isfinite(final_loss)
+                          and final_loss < initial_loss)
+    skipped = int(opt.get('skipped_updates') or 0)
+    nonfinite_loss = int(opt.get('nonfinite_loss_steps') or 0)
+    nonfinite_grad = int(opt.get('nonfinite_grad_steps') or 0)
+    grad_max = opt.get('grad_norm_max')
+    update_max = opt.get('update_norm_max')
+    grad_ok = (grad_max is not None and math.isfinite(float(grad_max)) and float(grad_max) > 0.0)
+    params_changed = bool(update_max is not None and math.isfinite(float(update_max))
+                          and float(update_max) > 0.0)
+    criteria = {
+        'all_steps_completed': bool(not rec.get('cap_truncated')
+                                    and int(rec.get('steps_completed') or 0) == steps),
+        'no_skipped_updates': bool(skipped == 0),
+        'no_nonfinite_loss_steps': bool(nonfinite_loss == 0),
+        'no_nonfinite_grad_steps': bool(nonfinite_grad == 0),
+        'gradients_finite_and_nonzero': bool(grad_ok),
+        'parameters_changed': bool(params_changed),
+        'loss_curve_all_finite': bool(finite),
+        'loss_decreased': bool(loss_decreased),
+        'final_loss_below_target': bool(math.isfinite(final_loss) and final_loss <= float(target_loss)),
+        'accuracy_above_target': bool(math.isfinite(final_acc) and final_acc >= float(target_acc)),
+    }
+    passed = all(criteria.values())
+    report = {
+        'kind': 'production_loop_overfit_sanity',
+        'variant': variant,
+        'seed': int(seed),
+        'code': code_stamp(),
+        'device': str(device),
+        'steps': steps,
+        'lr': float(lr),
+        'seq_len': seq_len,
+        'batch_size': batch_size,
+        'vocab_size': vocab,
+        'architecture': {'d': int(d), 'n_layers': int(n_layers),
+                         'n_heads': int(n_heads), 'd_head': int(d_head)},
+        'mlp_ratio': float(mlp_ratio),
+        'data_source': source,
+        'data_fp': _ids_fp(window),
+        'optimizer': 'build_optimizer/AdamW',
+        'losses': losses,
+        'initial_loss': float(initial_loss),
+        'final_loss': float(final_loss),
+        'best_loss': float(best_loss),
+        'final_accuracy': float(final_acc),
+        'loss_decreased': bool(loss_decreased),
+        'grad_norm_max': grad_max,
+        'update_norm_max': update_max,
+        'params_changed': bool(params_changed),
+        'skipped_updates': skipped,
+        'nonfinite_loss_steps': nonfinite_loss,
+        'nonfinite_grad_steps': nonfinite_grad,
+        'target_loss': float(target_loss),
+        'target_accuracy': float(target_acc),
+        'pass_criteria': criteria,
+        'passed': passed,
+        'failed_criteria': [k for k, ok in criteria.items() if not ok],
+    }
+    report['diagnosis'] = ('ok' if passed else
+                           'the production training loop did not overfit the fixed window '
+                           '(see failed_criteria)')
+    return report
+
+def production_loop_sanity_check(variant='full', *, seed=0, **kwargs):
+    """RNG-preserving wrapper around the production-loop overfit probe."""
+    _fp_before = rng_fingerprint()
+    with _preserve_rng_state():
+        report = _production_loop_sanity_check_impl(variant, seed=seed, **kwargs)
+    _fp_after = rng_fingerprint()
+    report['rng_fp_before'] = _fp_before
+    report['rng_fp_after'] = _fp_after
+    report['rng_state_preserved'] = bool(_fp_before == _fp_after)
+    report['pass_criteria']['rng_state_preserved'] = bool(report['rng_state_preserved'])
+    if not report['rng_state_preserved']:
+        report['passed'] = False
+        report['failed_criteria'] = list(report.get('failed_criteria') or []) + ['rng_state_preserved']
+        report['diagnosis'] = 'the production-loop probe did not restore the process RNG state'
+    return report
+
 def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, vocab=1024, train_ids=None, batch=None, ignore_index=None, mlp_ratio=None, force=False, target_loss=0.05, target_acc=0.99, arch=None):
     """Run `overfit_sanity_check` once per variant per process and hard-stop
     on failure.  Called automatically by `run()` before the first panel and by
@@ -26435,6 +26721,7 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
         return []
     if batch is not None and train_ids is not None:
         raise ValueError('overfit_guard: pass either train_ids or batch, not both')
+    seed = _seed_value(seed)
     variants = list(variants)
     _arch = _probe_arch(arch)
     _ign = None
@@ -26545,7 +26832,7 @@ def _repro_tiny_losses(variant, seed, *, steps=3, d=32, n_layers=1, n_heads=4, d
     architecture/MLP/data are caller-selectable so a scale panel can repeat
     its REAL geometry instead of a tiny proxy."""
     device = DEVICE if device is None else (device if isinstance(device, torch.device) else torch.device(device))
-    set_seed(seed)
+    seed = set_seed(seed)
     x_np, y_np, _data_fp, _src = _repro_batch(seed, batch_size=batch_size, seq_len=seq_len, vocab=vocab, train_ids=train_ids)
     x = torch.from_numpy(np.ascontiguousarray(x_np)).to(device)
     y = torch.from_numpy(np.ascontiguousarray(y_np)).to(device)
@@ -26553,7 +26840,7 @@ def _repro_tiny_losses(variant, seed, *, steps=3, d=32, n_layers=1, n_heads=4, d
         mlp_ratio = variant_mlp_ratio(variant, int(vocab), d=int(d), n_layers=int(n_layers), n_heads=int(n_heads), d_head=int(d_head), seq_len=int(seq_len), matched=PARAM_MATCHED | PARAM_MATCHED_V7)
     cfgs = make_layer_cfgs(int(n_layers), variant)
     model = SmallGPT(int(vocab), int(d), int(n_layers), int(n_heads), int(d_head), int(seq_len), cfgs, mlp_ratio=mlp_ratio).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=float(lr), betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, weight_decay=0.0, foreach=True)
+    opt = build_optimizer(model, lr=lr, weight_decay=0.0, delta_lr_mult=1.0)
     model.train()
     losses = []
     try:
@@ -28601,7 +28888,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                 _cs = _finite_curve(_losses)
                 _ledger_losses, _losses_n, _losses_down = _ledger_curve(_losses)
                 _ledger_ph, _ph_n, _ph_down = _ledger_curve_points(rec.get('ppl_history'))
-                _ev = {'kind': 'cell', 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': rec.get('finished_at'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': rec.get('_code') or code_stamp(), 'provenance': rec.get('provenance'), 'hyperparams': rec.get('hyperparams'), 'data_fp': rec.get('data_fp'), 'val_fp': rec.get('val_fp'), 'data_version': rec.get('data_version'), 'rng_fp': rec.get('rng_fp'), 'metrics': {'ppl': rec.get('ppl'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'steps_completed': rec.get('steps_completed'), 'early_stop': rec.get('early_stop'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed'), 'best_val_ppl': rec.get('best_val_ppl'), 'final_minus_best': rec.get('final_minus_best')}, 'curve_summary': {'n_points': _cs['n_points'], 'n_nonfinite': _cs['n_nonfinite'], 'first': _losses[0] if _losses else None, 'last': _cs['last'], 'best': _cs['min']}, 'curve_health': rec.get('curve_health'), 'instability_diagnosis': rec.get('instability_diagnosis'), 'opt_diag_summary': rec.get('opt_diag_summary'), 'checkpoints': rec.get('checkpoints'), 'efficiency': rec.get('efficiency'), 'losses': _ledger_losses, 'losses_n_points': _losses_n, 'losses_downsampled': _losses_down, 'ppl_history': _ledger_ph, 'ppl_history_n_points': _ph_n, 'ppl_history_downsampled': _ph_down, 'curve_ref': _curve_ref or rec.get('curve_ref'), 'sanity_ref': rec.get('sanity_ref')}
+                _ev = {'kind': 'cell', 'run_id': _run_id, 'status': 'ok', 'started_at': _started_at, 'finished_at': rec.get('finished_at'), 'elapsed_s': time.time() - _t_start, 'key': key, 'variant': v, 'seed': int(seed), 'run_cfg': fp, 'code': rec.get('_code') or code_stamp(), 'provenance': rec.get('provenance'), 'hyperparams': rec.get('hyperparams'), 'data_fp': rec.get('data_fp'), 'val_fp': rec.get('val_fp'), 'data_version': rec.get('data_version'), 'rng_fp': rec.get('rng_fp'), 'exec_fp': rec.get('exec_fp'), 'metrics': {'ppl': rec.get('ppl'), 'params': rec.get('params'), 'steps': rec.get('steps'), 'steps_completed': rec.get('steps_completed'), 'early_stop': rec.get('early_stop'), 'tokens_seen': rec.get('tokens_seen'), 'train_time_s': rec.get('train_time_s'), 'final_loss_smoothed': rec.get('final_loss_smoothed'), 'best_val_ppl': rec.get('best_val_ppl'), 'final_minus_best': rec.get('final_minus_best')}, 'curve_summary': {'n_points': _cs['n_points'], 'n_nonfinite': _cs['n_nonfinite'], 'first': _losses[0] if _losses else None, 'last': _cs['last'], 'best': _cs['min']}, 'curve_health': rec.get('curve_health'), 'instability_diagnosis': rec.get('instability_diagnosis'), 'opt_diag_summary': rec.get('opt_diag_summary'), 'checkpoints': rec.get('checkpoints'), 'efficiency': rec.get('efficiency'), 'losses': _ledger_losses, 'losses_n_points': _losses_n, 'losses_downsampled': _losses_down, 'ppl_history': _ledger_ph, 'ppl_history_n_points': _ph_n, 'ppl_history_downsampled': _ph_down, 'curve_ref': _curve_ref or rec.get('curve_ref'), 'sanity_ref': rec.get('sanity_ref')}
                 log_experiment_event(outdir, _ev)
         except Exception as e:
             import traceback
@@ -28979,6 +29266,55 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             'reports': _sanity,
         }
         atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), _sanity_doc)
+    # The hand-rolled probe above certifies model/loss/label plumbing.  Re-run
+    # one fixed window through the ACTUAL `train_variant` loop so a broken
+    # optimizer/scheduler/loss assembly cannot pass a separately written loop.
+    _prod_doc = None
+    if _variants and os.environ.get('CSA_SKIP_OVERFIT', '').strip().lower() not in ('1', 'true', 'yes', 'on'):
+        try:
+            # The production trainer is shared by every arm; a dense sentinel
+            # tests optimizer/scheduler/loss-assembly wiring without coupling
+            # the gate to a stochastic task or boundary-policy arm.
+            _prod = production_loop_sanity_check(
+                'full', seed=_first_seed, train_ids=train_ids,
+                vocab=vocab, device=DEVICE)
+            _prod_error = None
+        except Exception as _fe:
+            _prod = {'kind': 'production_loop_overfit_sanity', 'variant': 'full',
+                     'passed': False, 'diagnosis': f'{type(_fe).__name__}: {_fe}'}
+            _prod_error = f'{_fe}'
+        _prod_doc = {
+            'kind': 'production_loop_overfit_sanity_panel',
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'run_cfg': fp, 'label': label or outdir,
+            'passed': bool(_prod.get('passed')),
+            'provenance': prov, 'reports': [dict(_prod)],
+        }
+        if _prod_error is not None:
+            _prod_doc['error'] = _prod_error
+        atomic_write_json(os.path.join(outdir, 'production_sanity.json'), _prod_doc)
+        log_experiment_event(outdir, {
+            'kind': 'preflight', 'tracking_schema': 2,
+            'status': ('ok' if _prod_doc['passed'] else 'failed'),
+            'stage': 'production_loop_overfit', 'run_cfg': fp,
+            'code': code_stamp(), 'provenance': prov,
+            'production_sanity': {'passed': _prod_doc['passed'],
+                                  'ref': 'production_sanity.json',
+                                  'variant': 'full'},
+        })
+        if _sanity_doc is not None:
+            _sanity_doc['production_loop'] = _prod_doc
+            if not _prod_doc['passed']:
+                _sanity_doc['passed'] = False
+            atomic_write_json(os.path.join(outdir, 'overfit_sanity.json'), _sanity_doc)
+        if not _prod_doc['passed']:
+            _record_failed_panel(outdir, cfg, fp, prov, stage='production_loop_overfit',
+                                 error=_prod.get('diagnosis'), planned_cells=_planned_keys)
+            raise RuntimeError(
+                'production training-loop overfit check FAILED '
+                f"({_prod.get('diagnosis')}) — do NOT start a full run; the "
+                'actual train_variant loop is not applying updates to one fixed '
+                'batch. See production_sanity.json.')
     # Same-machine seed check on the REAL architecture/data, first and last
     # panel seed.  Confirmation/scale panels require it to pass; exploratory
     # panels record the failure but stay advisory.

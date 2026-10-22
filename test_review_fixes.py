@@ -3440,6 +3440,68 @@ def t_seed_reproducible():
     assert d != a[:3], 'a different seed must change the RNG stream'
 
 
+def t_train_variant_normalizes_seed():
+    ids = np.arange(8192, dtype=np.int64) % 997
+    val = (np.arange(32, dtype=np.int64) % 997).reshape(2, 16)
+    kw = dict(d=32, n_layers=1, n_heads=4, d_head=8, seq_len=16, batch_size=2,
+              steps=2, lr=1e-3, weight_decay=0.0, warmup=0, comp_lambda=0.0,
+              eval_every=0, mlp_ratio=4.0, device=torch.device('cpu'), log_every=0)
+    a = L.train_variant('full', ids, val, 997, seed=np.int64(3), **kw)
+    b = L.train_variant('full', ids, val, 997, seed='3', **kw)
+    assert a['seed'] == b['seed'] == 3 and isinstance(a['seed'], int), (a['seed'], b['seed'])
+    assert a['data_seed'] == b['data_seed'] == 3, (a.get('data_seed'), b.get('data_seed'))
+    assert a['losses'] == b['losses'], 'a normalisable seed must use the same stream as the integer seed'
+    assert a.get('exec_fp') and a['exec_fp'] == b['exec_fp'], a.get('exec_fp')
+
+
+def t_data_seed_for_rank_is_domain_safe():
+    assert L.data_seed_for_rank(0, 0) == 0
+    assert L.data_seed_for_rank(L.MAX_SEED, 0) == L.MAX_SEED
+    seen = set()
+    for seed in (0, 1, L.MAX_SEED):
+        for rank in range(1, 8):
+            s = L.data_seed_for_rank(seed, rank)
+            assert 0 <= s <= L.MAX_SEED, (seed, rank, s)
+            seen.add((seed, rank, s))
+    assert len({s for _seed, _rank, s in seen}) == len(seen), 'rank-derived seeds must not collide'
+    assert L.data_seed_for_rank(0, 1) != 1, 'rank 1 seed=0 must not alias the rank-0 seed=1 stream'
+    for bad in (-1, L.MAX_SEED + 1, True, 1.5):
+        try:
+            L.data_seed_for_rank(bad, 0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'data_seed_for_rank accepted seed {bad!r}')
+
+
+def t_execution_environment_pair_gate():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    base = dict(variant='a', seed=0, run_cfg=fp, steps=1, tokens_seen=1, ppl=10.0,
+                data_fp='d', val_fp='v', eval_fp='e', exec_fp='env-a')
+    assert L.pair_reason(base, dict(base, variant='b')) is None
+    why = L.pair_reason(base, dict(base, variant='b', exec_fp='env-b'))
+    assert why and 'execution environment' in why, why
+    # Legacy records without the digest keep the historical permissive path.
+    leg = {k: v for k, v in base.items() if k != 'exec_fp'}
+    assert L.pair_reason(leg, dict(leg, variant='b')) is None
+    assert L.execution_environment_reason(base, dict(base, exec_fp='env-a')) is None
+    assert L.execution_environment_reason(base, leg) is None
+
+
+def t_optimizer_groups_match_trainer():
+    L.set_seed(0)
+    cfgs = L.make_layer_cfgs(1, 'csa_dynamic')
+    model = L.SmallGPT(64, 32, 1, 4, 8, 16, cfgs)
+    decay, no_decay, delta = L.optimizer_param_groups(model)
+    grouped = [id(p) for p in decay + no_decay + delta]
+    trainable = [id(p) for p in model.parameters() if p.requires_grad]
+    assert len(grouped) == len(set(grouped)), 'one parameter appears in two optimizer groups'
+    assert set(grouped) == set(trainable), 'the production optimizer leaves a trainable parameter out'
+    opt = L.build_optimizer(model, lr=1e-3, weight_decay=0.1, delta_lr_mult=10.0)
+    assert [g['weight_decay'] for g in opt.param_groups] == [0.1, 0.0, 0.0], opt.param_groups
+    assert [g['lr_scale'] for g in opt.param_groups] == [1.0, 1.0, 10.0], opt.param_groups
+
+
 def t_seed_axis_normalization():
     assert L.normalize_seed_list([0, 1, 1, 2, '3']) == [0, 1, 2, 3]
     assert L.normalize_seed_list([]) == [0]
@@ -3678,6 +3740,32 @@ def t_overfit_sanity():
     assert r2['passed'] is True and r2['data_source'] == 'train_ids', r2
     assert r2['loader_mode'] == 'batch_iter', 'the real-data probe must exercise the production loader'
     assert r2['intermediate_checks']['labels_are_next_token_shift'] is True, r2['intermediate_checks']
+
+
+def t_production_loop_overfit_sanity():
+    r = L.production_loop_sanity_check('full', seed=0, steps=120, d=32,
+                                       n_layers=1, n_heads=4, d_head=8,
+                                       seq_len=8, batch_size=2, vocab=97)
+    assert r['passed'] is True, r
+    assert r['final_loss'] <= r['target_loss'] and r['final_accuracy'] >= r['target_accuracy'], r
+    assert r['loss_decreased'] and r['params_changed'], r
+    assert r['failed_criteria'] == [] and r['rng_state_preserved'] is True, r
+    # A fixed window through the real loop: the production trainer must not
+    # silently skip updates or produce a non-finite curve.
+    ids = np.arange(4096, dtype=np.int64) % 97
+    r2 = L.production_loop_sanity_check('csa_dynamic', seed=1, steps=100, d=32,
+                                        n_layers=1, n_heads=4, d_head=8,
+                                        seq_len=8, batch_size=2, vocab=97,
+                                        train_ids=ids)
+    assert r2['passed'] is True and r2['data_source'] == 'train_ids', r2
+    assert r2['skipped_updates'] == 0 and r2['nonfinite_grad_steps'] == 0, r2
+    # The real trainer with lr=0 must FAIL the same check: this is the
+    # regression that a separately written probe loop could miss.
+    bad = L.production_loop_sanity_check('full', seed=0, steps=5, lr=0.0,
+                                         d=32, n_layers=1, n_heads=4, d_head=8,
+                                         seq_len=8, batch_size=2, vocab=97)
+    assert bad['passed'] is False and bad['params_changed'] is False, bad
+    assert 'parameters_changed' in bad['failed_criteria'], bad['failed_criteria']
 
 
 def t_rng_state_preserved_by_preflight():
@@ -14660,8 +14748,11 @@ def main():
     _check('E1c seed contract inventories every CUDA device', t_seed_contract_cuda_device_inventory)
     _check('E1d CPU strict determinism is labelled', t_determinism_label_cpu_strict)
     _check('E1a seed/variant axis normalisation', t_seed_axis_normalization)
+    _check('E1a1 trainer normalises the seed it actually uses', t_train_variant_normalizes_seed)
     _check('E1a2 seed scalars never truncate silently', t_seed_scalar_rejects_silent_truncation)
     _check('E1a3 seed domain validation', t_seed_domain_guard)
+    _check('E1a4 DDP rank data seeds stay in-domain and collision-free', t_data_seed_for_rank_is_domain_safe)
+    _check('E1a5 paired records must share the execution environment', t_execution_environment_pair_gate)
     _check('E1b explicit RNG seed contract', t_seed_contract_check)
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
     _check('E2b batch_iter uint16 transport', t_batch_iter_uint16)
@@ -14671,6 +14762,8 @@ def main():
     _check('E2e parallel child gets the seed hash', t_parallel_child_env_seed)
     _check('E3 small-batch overfit sanity', t_overfit_sanity)
     _check('E3a overfit loss contract + ignore-index propagation', t_overfit_loss_contract_and_ignore_index)
+    _check('E3a1 preflights share the production optimizer grouping', t_optimizer_groups_match_trainer)
+    _check('E3a2 production train_variant loop overfits one fixed batch', t_production_loop_overfit_sanity)
     _check('E3b training CE default ignore reduction', t_ce_loss_default_ignore_matches_pytorch_reduction)
     _check('E3b preflight RNG-state preservation', t_rng_state_preserved_by_preflight)
     _check('E3c duplicate-run reproducibility check', t_reproducibility_check)

@@ -864,3 +864,49 @@ Later seed top-ups remain resume-safe.
 Verification: new CPU test L63 checks both driver implementations for the
 matched/unmatched/unverifiable capacity verdicts; the extended seed-plan test
 covers v8/v9/v11 phases. `python test_review_fixes.py` passes 363/363.
+
+## 2026-10-22 — reproducibility hardening: seed normalisation, shared optimizer, environment gate (no new runs)
+
+Zero-GPU code/test hardening; no panel result, frozen manifest, test split,
+README or CI configuration was touched.
+
+(1) **The seed the trainer actually uses is normalised.** `train_variant` used
+to call `set_seed(seed)` for validation but kept the caller's original object
+for the data stream and the record (a NumPy scalar or numeric string could
+therefore be recorded differently from the integer it trained with). It now
+binds the validated integer returned by `set_seed`. `overfit_guard` validates
+its seed up front, and the overfit/reproducibility probes use the same
+normalised value.
+
+(2) **DDP rank data seeds are domain-safe.** The old `seed + rank` could
+exceed the NumPy/PyTorch `[0, 2**32-1]` domain and could alias a different
+declared seed (`seed=0, rank=1` vs `seed=1, rank=0`). Rank 0 keeps the
+historical stream; other ranks use a deterministic SplitMix64 derivation
+(`data_seed_for_rank`), recorded as `data_seed` on the training record.
+
+(3) **Pre-flights share the production optimizer construction.**
+`optimizer_param_groups` / `build_optimizer` now define the three AdamW
+groups (decay / no-decay / delta-logit) once. `train_variant`, the small-batch
+overfit probe and the duplicate-run reproducibility probe all use it, so a
+grouping/`foreach` regression can no longer pass a hand-rolled probe while
+breaking real training. `run()` additionally drives ONE fixed window through
+the real `train_variant` loop (`production_sanity.json`) and refuses the panel
+unless that loop applies updates, keeps the loss/gradient finite and reaches
+the same loss/accuracy targets. The hand-rolled probe proves model/loss/label
+plumbing; this companion proves optimizer/scheduler/loss-assembly wiring.
+
+(4) **Execution-environment gate for paired seeds.**
+`execution_fingerprint` hashes the reproducibility-relevant hardware/software
+class (GPU model + compute capability, torch/CUDA/cuDNN builds, dependency
+versions, TF32/reduced-precision policy, determinism flags, thread counts;
+hostname/process id/UUID excluded). It is recorded per cell (`exec_fp`) and in
+`run_hyperparameters`; `pair_reason` now refuses a paired contrast whose two
+records were produced under different classes. Legacy records without the
+digest keep the old permissive path, and the manifest exposes
+`tracking_integrity.with_exec_fp`.
+
+Verification: new CPU tests E1a1 (trainer seed normalisation), E1a4 (DDP rank
+seed domain/collisions), E1a5 (environment pair gate), E3a1 (single optimizer
+grouping shared by trainer and probes) and E3a2 (the real `train_variant`
+loop overfits one fixed batch, and lr=0 fails it). `python
+test_review_fixes.py` passes 372/372.
