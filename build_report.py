@@ -1735,8 +1735,17 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
         # surviving seeds were selected by that failure and cannot support a
         # significance claim (mirror exp_lib.reportable_claim).  Missing
         # fields keep the legacy permissive path.
-        _n_input = _int_or(st.get('n_input'), None)
-        _n_dropped = _int_or(st.get('n_dropped'), None)
+        _raw_n_input = st.get('n_input')
+        _raw_n_dropped = st.get('n_dropped')
+        _n_input = _int_or(_raw_n_input, None)
+        _n_dropped = _int_or(_raw_n_dropped, None)
+        # A present-but-malformed accounting field is corrupt, not missing;
+        # silently falling back would let e.g. n_dropped=0.5 or True pass as
+        # a complete panel.
+        if _raw_n_input is not None and _n_input is None:
+            return False
+        if _raw_n_dropped is not None and _n_dropped is None:
+            return False
         if _n_input is not None and (_n_input < 0 or n > _n_input):
             return False
         if _n_dropped is not None:
@@ -1748,6 +1757,13 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
                 return False
             if _n_dropped > 0:
                 return False
+        # n survivors + dropped inputs must reconstruct n_input; a smaller n
+        # with n_dropped=0 means observations vanished from the accounting.
+        if _n_input is not None and _n_dropped is not None:
+            if n != _n_input - _n_dropped:
+                return False
+        elif _n_input is not None and _n_dropped is None and n != _n_input:
+            return False
         # `complete_pairs=False` says the paired panel is incomplete even when
         # the caller did not also carry n_dropped.
         if st.get('complete_pairs') is False:
@@ -1755,7 +1771,10 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
         # Exact ties lower the sign-flip resolution.  A fabricated n_nonzero
         # (or one bigger than the panel) must not make n seeds look finer than
         # the test can actually resolve.
-        _n_nonzero = _int_or(st.get('n_nonzero'), None)
+        _raw_n_nonzero = st.get('n_nonzero')
+        _n_nonzero = _int_or(_raw_n_nonzero, None)
+        if _raw_n_nonzero is not None and _n_nonzero is None:
+            return False
         if _n_nonzero is not None:
             if _n_nonzero < 0 or _n_nonzero > n:
                 return False

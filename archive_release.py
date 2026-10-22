@@ -229,10 +229,11 @@ def _collect(dirs, include_ckpt=False):
             continue
         for root, _dirs, names in os.walk(base):
             for n in names:
-                p = os.path.join(root, n)
-                if not include_ckpt and n.endswith(_CKPT_SUFFIXES):
-                    continue
-                files.append(p)
+                # Do NOT drop checkpoint-suffixed files before the regular-file
+                # / symlink check below: a link named `model.pt` would then be
+                # skipped here but still hashed by `_ckpt_hash_table`, making
+                # the manifest depend on bytes outside the archive/repository.
+                files.append(os.path.join(root, n))
     for f in ENV_FILES:
         p = os.path.join(REPO, f)
         if os.path.exists(p):
@@ -264,6 +265,9 @@ def _collect(dirs, include_ckpt=False):
         key = os.path.abspath(p)
         if key in seen:
             continue
+        # Validate every candidate BEFORE the checkpoint-body filter: a
+        # symlinked or otherwise non-regular `model.pt` must be refused even
+        # when the caller asked not to embed weight bodies.
         if os.path.islink(p):
             # tarfile stores the link itself, while the manifest hashes its
             # target; verify() then (correctly) refuses the non-regular member.
@@ -283,6 +287,10 @@ def _collect(dirs, include_ckpt=False):
         if not _inside:
             raise ValueError(f'archive file {p!r} resolves outside the repository '
                              f'({_p_real!r}); refusing to pack it')
+        if not include_ckpt and p.endswith(_CKPT_SUFFIXES):
+            # The checkpoint hash table still records the (already validated)
+            # regular file, but its body is intentionally not packed.
+            continue
         seen.add(key)
         unique.append(p)
     return unique
@@ -290,17 +298,41 @@ def _collect(dirs, include_ckpt=False):
 
 def _ckpt_hash_table(dirs):
     """sha256 of every checkpoint file referenced by the release (even when the
-    .pt bodies are not packed) — the weights stay auditable by hash."""
+    .pt bodies are not packed) — the weights stay auditable by hash.
+
+    The table is part of the release manifest, so it must obey the same
+    containment/regular-file contract as the packed files: a symlink (or a
+    directory named `*.pt`) would either hash bytes outside the repository or
+    crash the archiver after the manifest was already built."""
     rows = {}
+    _repo_real = os.path.realpath(REPO)
     for d in dirs:
         base = os.path.join(REPO, d)
         if not os.path.isdir(base):
             continue
         for root, _dirs, names in os.walk(base):
             for n in names:
-                if n.endswith(_CKPT_SUFFIXES):
-                    p = os.path.join(root, n)
-                    rows[os.path.relpath(p, REPO)] = _sha256(p)
+                if not n.endswith(_CKPT_SUFFIXES):
+                    continue
+                p = os.path.join(root, n)
+                if os.path.islink(p):
+                    raise ValueError(
+                        f'checkpoint {p!r} is a symbolic link; pack the target '
+                        'explicitly (a link cannot be hashed as a regular file)')
+                if not os.path.isfile(p):
+                    raise ValueError(
+                        f'checkpoint {p!r} is not a regular file; refusing to '
+                        'hash it')
+                _p_real = os.path.realpath(p)
+                try:
+                    _inside = os.path.commonpath([_repo_real, _p_real]) == _repo_real
+                except ValueError:
+                    _inside = False
+                if not _inside:
+                    raise ValueError(
+                        f'checkpoint {p!r} resolves outside the repository '
+                        f'({_p_real!r}); refusing to hash it')
+                rows[os.path.relpath(p, REPO)] = _sha256(p)
     return rows
 
 

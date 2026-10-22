@@ -11270,10 +11270,18 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         # records its non-zero pair count, the family ceiling is m*2/2**nn,
         # not the theoretical all-nonzero m*2/2**n.
         _n = _as_seed_int(v.get('n'))
-        _nn = _as_seed_int(v.get('n_nonzero'))
-        if _nn is not None and _n is not None and 0 <= _nn <= _n:
-            return _nn if _nn > 0 else 1
-        return _n
+        if _n is None or _n < 0:
+            return None
+        _raw_nn = v.get('n_nonzero')
+        if _raw_nn is None:
+            return _n
+        _nn = _as_seed_int(_raw_nn)
+        if _nn is None or _nn < 0 or _nn > _n:
+            # A malformed tie count cannot buy the family a finer resolution.
+            # Use the coarsest non-zero count (one) so the reported family floor
+            # is conservative rather than silently reverting to all-nonzero n.
+            return 1
+        return _nn if _nn > 0 else 1
 
     for k, v in (comparisons or {}).items():
         if not isinstance(v, dict):
@@ -11408,9 +11416,19 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     # Exact ties do not contribute resolution.  A caller that supplies the
     # non-zero count (paired_effect_stats/exact_signflip_p do) must not be
     # re-scored with the theoretical all-nonzero floor 2/2**n.
-    _nn = _as_seed_int(stats.get('n_nonzero'))
+    _raw_nn = stats.get('n_nonzero')
+    _nn = _as_seed_int(_raw_nn)
     _resolution_n = n
-    if _nn is not None and _nn >= 0:
+    if _raw_nn is not None and _nn is None:
+        # A supplied tie count that is not an exact integer is corrupt.  Treat
+        # it as an unverifiable resolution claim instead of silently reverting
+        # to the (possibly finer) all-nonzero floor.
+        out['n_nonzero'] = None
+        out['p_floor'] = signflip_p_floor(n) if n > 0 else None
+        out['reasons'].append(
+            f'n_nonzero={_raw_nn!r} is not a non-negative integer; the exact-test '
+            'resolution is unverifiable')
+    elif _nn is not None and _nn >= 0:
         out['n_nonzero'] = _nn
         if _nn > n:
             # A non-zero count larger than the paired panel cannot describe
@@ -11422,7 +11440,11 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         out['p_floor'] = (1.0 if _resolution_n == 0
                           else signflip_p_floor(_resolution_n))
     else:
-        out['n_nonzero'] = None
+        out['n_nonzero'] = _nn
+        if _nn is not None:
+            out['reasons'].append(
+                f'n_nonzero={_nn} is negative; the exact-test resolution is '
+                'unverifiable')
         out['p_floor'] = signflip_p_floor(n) if n > 0 else None
     out['n_effective_resolution'] = _resolution_n
     # A p-value is a probability.  p=-0.1 would satisfy every strict "< alpha"
@@ -11436,16 +11458,29 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     # n is the number that SURVIVED filtering; a claim over that subset can be
     # biased by which seeds/arms failed.  Keep the number reportable but refuse
     # the significance wording unless the caller supplies the complete panel.
-    _n_input = _as_seed_int(stats.get('n_input'))
-    _n_dropped = _as_seed_int(stats.get('n_dropped'))
+    _raw_n_input = stats.get('n_input')
+    _raw_n_dropped = stats.get('n_dropped')
+    _n_input = _as_seed_int(_raw_n_input)
+    _n_dropped = _as_seed_int(_raw_n_dropped)
     out['n_input'] = _n_input
     out['n_dropped'] = _n_dropped
-    if _n_input is not None and _n_input < 0:
+    # A supplied accounting field that cannot be read as an exact integer is
+    # corrupt, not absent.  Falling back to "no attrition" would let a
+    # malformed n_dropped=0.5/True/'x' support a complete-panel claim.
+    if _raw_n_input is not None and _n_input is None:
+        out['reasons'].append(
+            f'n_input={_raw_n_input!r} is not a non-negative integer; the paired '
+            'panel size is unverifiable')
+    elif _n_input is not None and _n_input < 0:
         out['reasons'].append(f'n_input={_n_input} is negative; the paired panel size is unverifiable')
     elif _n_input is not None and n > _n_input:
         out['reasons'].append(
             f'n={n} exceeds n_input={_n_input}; the paired panel accounting is inconsistent')
-    if _n_dropped is not None and _n_dropped < 0:
+    if _raw_n_dropped is not None and _n_dropped is None:
+        out['reasons'].append(
+            f'n_dropped={_raw_n_dropped!r} is not a non-negative integer; the '
+            'paired panel accounting is unverifiable')
+    elif _n_dropped is not None and _n_dropped < 0:
         out['reasons'].append(f'n_dropped={_n_dropped} is negative; the paired panel size is unverifiable')
     elif (_n_dropped is not None and _n_input is not None
           and _n_dropped > _n_input):
@@ -11457,6 +11492,19 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             f'{_n_dropped} paired observation(s) were dropped as non-finite '
             f'(n_input={_n_input}); complete-case significance is not a '
             'complete-panel result')
+    # The three fields describe one panel: n survivors + dropped inputs must
+    # reconstruct n_input exactly.  A record that reports a smaller n with
+    # n_dropped=0 has silently lost observations, and complete-case wording
+    # over the survivors would be selection-biased.
+    if _n_input is not None and _n_dropped is not None:
+        if n != _n_input - _n_dropped:
+            out['reasons'].append(
+                f'n={n} != n_input={_n_input} - n_dropped={_n_dropped}; the '
+                'paired panel accounting is inconsistent')
+    elif _n_input is not None and _n_dropped is None and n != _n_input:
+        out['reasons'].append(
+            f'n={n} != n_input={_n_input} and no n_dropped was recorded; the '
+            'paired panel accounting is incomplete')
     # Seeds excluded because the two arms failed the same-recipe controlled
     # comparison are ALSO an incomplete paired panel.  Keeping them out of the
     # test is correct, but the surviving subset was selected by that mismatch

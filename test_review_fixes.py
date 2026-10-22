@@ -1562,9 +1562,14 @@ def t_report_gate_refuses_attrition_and_seed_driven():
                  dict(ok, n_input=-1, n_dropped=0),
                  dict(ok, n_input=3, n_dropped=6),
                  dict(ok, n_input=3, n_dropped=0),
+                 dict(ok, n_input=7, n_dropped=0),
+                 dict(ok, n_input=7),
+                 dict(ok, n_input=6.5),
+                 dict(ok, n_dropped=0.5),
                  dict(ok, complete_pairs=False),
                  dict(ok, n_nonzero=7),
                  dict(ok, n_nonzero=-1),
+                 dict(ok, n_nonzero=1.5),
                  dict(ok, n_nonzero=2)):
         assert BR._sig_gate(_bad) is False, _bad
     assert BR._sig_gate(dict(ok, n_nonzero=6)) is True
@@ -9629,11 +9634,17 @@ def t_reportable_claim_gate():
     for _bad in (dict(base, n_input=-1, n_dropped=0),
                  dict(base, n_input=6, n_dropped=-1),
                  dict(base, n_input=3, n_dropped=6),
-                 dict(base, n_input=3, n_dropped=0)):
+                 dict(base, n_input=3, n_dropped=0),
+                 dict(base, n_input=7, n_dropped=0),
+                 dict(base, n_input=7),
+                 dict(base, n_input=6.5),
+                 dict(base, n_dropped=0.5),
+                 dict(base, n_nonzero=-1),
+                 dict(base, n_nonzero=1.5)):
         _rb = L.reportable_claim(_bad)
         assert _rb['allowed'] is False, (_bad, _rb)
         assert any('n_input' in x or 'n_dropped' in x or 'panel accounting' in x
-                   for x in _rb['reasons']), (_bad, _rb)
+                   or 'n_nonzero' in x for x in _rb['reasons']), (_bad, _rb)
     # A threshold outside (0,1) must be rejected, not used to relabel every
     # p-value as significant (alpha=1.5) or unreachable (alpha=0).
     _alpha_pts = [{'label': f'S{i}', 'scale': i + 1,
@@ -13673,6 +13684,12 @@ def t_zero_aware_family_resolution_floor():
     bad = L.reportable_claim(dict(st, n_nonzero=9), family_size=1)
     assert bad['allowed'] is False and any('n_nonzero=9 exceeds n=8' in r
                                            for r in bad['reasons']), bad
+    # A malformed/negative tie count must not silently revert to the finer
+    # all-nonzero floor; the family resolution is conservatively coarsened.
+    fam_bad = L.attach_holm({'x': {'n': 8, 'n_nonzero': -1,
+                                   'p_exact_signflip': 0.01}})
+    assert fam_bad['family_resolution_limited'] is True, fam_bad
+    assert fam_bad['family_min_attainable_p_holm'] == 1.0, fam_bad
     # Per-contrast floors: the family floor is m * min(floor), so a single
     # tie-heavy contrast blocks the whole tuned family.
     assert abs(L.holm_min_attainable_p_floors([0.03125, 0.5]) - 0.0625) < 1e-15
@@ -14103,6 +14120,25 @@ def t_archive_refuses_links_and_repo_escape():
                 assert 'symbolic link' in str(e), e
             else:
                 raise AssertionError('a symlink member was packed')
+            # The checkpoint-body filter must not run before the symlink
+            # check: a linked `model.pt` is skipped from packing (no bodies)
+            # but still enters `_ckpt_hash_table`, which used to follow the
+            # link and hash bytes outside the repository.
+            os.symlink(os.path.join(_linkdir, 'target.txt'),
+                       os.path.join(_linkdir, 'model.pt'))
+            try:
+                AR._collect([os.path.relpath(_linkdir, AR.REPO)],
+                            include_ckpt=False)
+            except ValueError as e:
+                assert 'symbolic link' in str(e), e
+            else:
+                raise AssertionError('a symlinked checkpoint was packed/skipped')
+            try:
+                AR._ckpt_hash_table([os.path.relpath(_linkdir, AR.REPO)])
+            except ValueError as e:
+                assert 'symbolic link' in str(e), e
+            else:
+                raise AssertionError('a symlinked checkpoint was hashed')
         finally:
             shutil.rmtree(_linkdir, ignore_errors=True)
         # The release output directory is confined just like the tag and the
