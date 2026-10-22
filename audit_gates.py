@@ -3443,16 +3443,31 @@ def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
         print(json.dumps({k: v for k, v in out.items() if k != 'files'},
                          ensure_ascii=False, indent=2)[:4000])
         return out
-    exp_files = expected.get('files') if isinstance(expected.get('files'), dict) else {}
-    cur_files = cur.get('files') or {}
-    out['n_expected_files'] = len(exp_files) if exp_files else None
+    _raw_exp_files = expected.get('files')
+    if _raw_exp_files is not None and not isinstance(_raw_exp_files, dict):
+        out['problems'].append('the recorded source-tree files entry is not an object')
+    exp_files = _raw_exp_files if isinstance(_raw_exp_files, dict) else {}
+    _raw_cur_files = cur.get('files')
+    cur_files = _raw_cur_files if isinstance(_raw_cur_files, dict) else {}
+    out['n_expected_files'] = len(exp_files) if _raw_exp_files is not None else None
+
+    def _entry_sha(entry):
+        # A malformed per-file entry is not evidence of a match.  Returning
+        # None makes it differ from every real digest instead of raising
+        # AttributeError on an untrusted snapshot.
+        if not isinstance(entry, dict):
+            return None
+        value = entry.get('sha256')
+        return value if isinstance(value, str) and value else None
+
+    if any(not isinstance(v, dict) for v in exp_files.values()):
+        out['problems'].append('the recorded source-tree file table has malformed entries')
     if exp_files:
         _added = sorted(set(cur_files) - set(exp_files))
         _removed = sorted(set(exp_files) - set(cur_files))
         _changed = sorted(
             rel for rel in set(cur_files) & set(exp_files)
-            if (cur_files.get(rel) or {}).get('sha256')
-            != (exp_files.get(rel) or {}).get('sha256'))
+            if _entry_sha(cur_files.get(rel)) != _entry_sha(exp_files.get(rel)))
         out['added'], out['removed'], out['changed'] = _added, _removed, _changed
         if _added:
             out['problems'].append(f'{len(_added)} source file(s) added since the snapshot')

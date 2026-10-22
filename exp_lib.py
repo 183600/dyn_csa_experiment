@@ -1825,14 +1825,33 @@ _SEGMENT_CACHE_CAP = 4096
 # every call.
 _SEG_POS_CACHE = {}
 _SEG_POS_CACHE_CAP = 16
+_SEG_POS_CACHE_BYTES = [0]
+try:
+    # A count-only cap retains up to 16 full position tables: at a 10M-token
+    # scale-up that is 1.3 GB of host memory even though each table is a pure
+    # function of n.  Bound the retained bytes as well as the entry count.
+    _SEG_POS_CACHE_BUDGET = max(1, int(os.environ.get('CSA_SEG_POS_CACHE_MB', '64'))) << 20
+except (TypeError, ValueError, OverflowError):
+    _SEG_POS_CACHE_BUDGET = 64 << 20
 
 def _seg_pos(n):
     pos = _SEG_POS_CACHE.get(n)
     if pos is None:
         pos = np.arange(n + 1, dtype=np.int64)
-        if len(_SEG_POS_CACHE) >= _SEG_POS_CACHE_CAP:
-            _SEG_POS_CACHE.pop(next(iter(_SEG_POS_CACHE)))
+        _nb = int(pos.nbytes)
+        if _nb > _SEG_POS_CACHE_BUDGET:
+            # Keep one oversized table (rebuilding it at every layer/step is
+            # worse than retaining it) but make it the only entry.
+            _SEG_POS_CACHE.clear()
+            _SEG_POS_CACHE_BYTES[0] = 0
+        else:
+            while _SEG_POS_CACHE and (
+                    len(_SEG_POS_CACHE) >= _SEG_POS_CACHE_CAP
+                    or _SEG_POS_CACHE_BYTES[0] + _nb > _SEG_POS_CACHE_BUDGET):
+                _old = _SEG_POS_CACHE.pop(next(iter(_SEG_POS_CACHE)))
+                _SEG_POS_CACHE_BYTES[0] -= int(_old.nbytes)
         _SEG_POS_CACHE[n] = pos
+        _SEG_POS_CACHE_BYTES[0] += _nb
     return pos
 
 _SEG_WALK_PROBE = 32
@@ -2728,20 +2747,32 @@ def causal_adaptive_threshold(sim, target_block_tokens):
 
 
 def blocks_fixed(n, block_size, device):
-    key = (_dev_str(device), 'blkfix', int(n), int(block_size))
+    # A zero/negative/fractional stride is not a smaller or coarser block:
+    # `torch.arange // 0` raises after the cache key was already built, a
+    # negative stride produces negative block ids (which look like padding or
+    # sentinels downstream), and int(1.5) silently changes the geometry.
+    _n = _exact_count(n, minimum=0)
+    _bs = _exact_count(block_size, minimum=1)
+    if _n is None:
+        raise ValueError(f'blocks_fixed needs a non-negative integer n, got {n!r}')
+    if _bs is None:
+        raise ValueError(
+            f'blocks_fixed needs a positive integer block_size, got {block_size!r}')
+    n, block_size = int(_n), int(_bs)
+    key = (_dev_str(device), 'blkfix', n, block_size)
     hit = _cache_get(_IDX_CACHE, key)
     if hit is not None:
         return hit
     with torch.inference_mode(False):
-        out = torch.arange(n, device=device) // int(block_size)
+        out = torch.arange(n, device=device) // block_size
         if n > 0:
-            bs = int(block_size)
+            bs = block_size
             # The fixed stride is one for the block_size=1 arm, so the old
             # `[bs] * (n // bs)` built one Python object per block (and one
             # pointer per block) before any consumer ran.  Build the same
             # integers in a NumPy row for a long sequence; only the historical
             # small-table shape stays a Python list.
-            _nfull, _rem = divmod(int(n), bs)
+            _nfull, _rem = divmod(n, bs)
             _k = _nfull + (1 if _rem else 0)
             counts = np.full(_k, bs, dtype=np.int64)
             if _rem:
@@ -3455,6 +3486,14 @@ def _pool_geom_content_put(key, value):
     _POOL_GEOM_CONTENT_USED += _b
     return value
 _NP_RANGE_CACHE = {}
+_NP_RANGE_CACHE_BYTES = [0]
+try:
+    # 64 full int64 ranges can be several GB once sequence lengths reach the
+    # millions (the same scale-up the pooling paths are built for).  Keep the
+    # historical 64-entry count for ordinary panels and add a byte ceiling.
+    _NP_RANGE_CACHE_BUDGET = max(1, int(os.environ.get('CSA_NP_RANGE_CACHE_MB', '64'))) << 20
+except (TypeError, ValueError, OverflowError):
+    _NP_RANGE_CACHE_BUDGET = 64 << 20
 
 def _np_range(n):
     # Read-only arange source for the host pooling flats; callers write into
@@ -3464,9 +3503,18 @@ def _np_range(n):
     if a is None:
         a = np.arange(n, dtype=np.int64)
         a.flags.writeable = False
-        if len(_NP_RANGE_CACHE) >= 64:
-            _NP_RANGE_CACHE.pop(next(iter(_NP_RANGE_CACHE)))
+        _nb = int(a.nbytes)
+        if _nb > _NP_RANGE_CACHE_BUDGET:
+            _NP_RANGE_CACHE.clear()
+            _NP_RANGE_CACHE_BYTES[0] = 0
+        else:
+            while _NP_RANGE_CACHE and (
+                    len(_NP_RANGE_CACHE) >= 64
+                    or _NP_RANGE_CACHE_BYTES[0] + _nb > _NP_RANGE_CACHE_BUDGET):
+                _old = _NP_RANGE_CACHE.pop(next(iter(_NP_RANGE_CACHE)))
+                _NP_RANGE_CACHE_BYTES[0] -= int(_old.nbytes)
         _NP_RANGE_CACHE[n] = a
+        _NP_RANGE_CACHE_BYTES[0] += _nb
     return a
 
 # Host pooling geometry is uploaded as int32 only while every value AND the
@@ -27219,13 +27267,25 @@ def _source_tree_paths(root):
     tree must not turn a provenance call into an I/O sweep.  README files are
     intentionally outside the scope (they document the project but cannot
     change a measurement; the operational tree is what this digest binds).
+
+    Symlinked files are included only when their target stays inside ``root``.
+    A link to an unrelated external file must not make the source digest (and
+    every artifact that records it) depend on bytes outside the repository.
     """
     root = os.path.abspath(root)
+    root_real = os.path.realpath(root)
     out = []
     seen = set()
+
+    def _inside_root(path):
+        try:
+            return os.path.commonpath([root_real, os.path.realpath(path)]) == root_real
+        except (OSError, ValueError):
+            return False
+
     for rel in _SOURCE_TREE_CONFIG_FILES:
         p = os.path.join(root, rel)
-        if os.path.isfile(p):
+        if os.path.isfile(p) and _inside_root(p):
             out.append(p)
             seen.add(os.path.abspath(p))
     for cur, dirs, names in os.walk(root, followlinks=False):
@@ -27244,7 +27304,7 @@ def _source_tree_paths(root):
                 continue
             p = os.path.join(cur, n)
             ap = os.path.abspath(p)
-            if ap in seen or not os.path.isfile(p):
+            if ap in seen or not os.path.isfile(p) or not _inside_root(p):
                 continue
             seen.add(ap)
             out.append(p)
@@ -27259,22 +27319,41 @@ def source_tree_manifest(root=None, include=None):
     per-record provenance uses ``source_tree_summary`` so it stays small.
     """
     root = os.path.abspath(root or os.path.dirname(os.path.abspath(__file__)))
+    root_real = os.path.realpath(root)
     if include is None:
         paths = _source_tree_paths(root)
     else:
+        # A bare string is one path, not an iterable of characters.  Repeating
+        # the same file must not count its bytes twice (the per-file map keeps
+        # one entry), and a symlink may not smuggle in an out-of-tree file.
+        if isinstance(include, (str, bytes)):
+            include = [include]
         paths = []
+        _seen_rel = set()
         for rel in include:
-            rel = str(rel).replace('\\', '/')
+            rel = os.fsdecode(rel) if isinstance(rel, bytes) else str(rel)
+            rel = rel.replace('\\', '/')
             p = os.path.join(root, rel)
             ap = os.path.abspath(p)
             if os.path.commonpath([root, ap]) != root:
                 raise ValueError(f'source_tree_manifest: {rel!r} escapes {root!r}')
-            if os.path.isfile(ap):
-                paths.append(ap)
+            if not os.path.isfile(ap):
+                continue
+            try:
+                _inside = os.path.commonpath([root_real, os.path.realpath(ap)]) == root_real
+            except (OSError, ValueError):
+                _inside = False
+            if not _inside:
+                raise ValueError(
+                    f'source_tree_manifest: {rel!r} resolves outside {root!r}')
+            rel_norm = _source_tree_rel(ap, root)
+            if rel_norm in _seen_rel:
+                continue
+            _seen_rel.add(rel_norm)
+            paths.append(ap)
         paths = sorted(paths, key=lambda p: _source_tree_rel(p, root))
     files = {}
     unreadable = []
-    total = 0
     for p in paths:
         rel = _source_tree_rel(p, root)
         try:
@@ -27284,7 +27363,9 @@ def source_tree_manifest(root=None, include=None):
             unreadable.append({'path': rel, 'error': f'{type(e).__name__}: {e}'})
             continue
         files[rel] = {'sha256': digest, 'bytes': int(st.st_size)}
-        total += int(st.st_size)
+    # Derive the total from the deduplicated per-file map: duplicate include
+    # entries (or two spellings of one path) must not inflate `bytes`.
+    total = sum(int(entry['bytes']) for entry in files.values())
     # Hash paths, sizes and per-file digests in sorted order.  Including the
     # path makes a rename visible even when the bytes are unchanged; including
     # the size makes truncation visible even before a digest is compared.
@@ -27354,8 +27435,14 @@ def parse_requirements_lock(path=None):
             continue
         name = re.sub(r'[-_.]+', '-', m.group(1)).lower()
         ver = m.group(2).strip()
-        if name in out['pins'] and out['pins'][name]['version'] != ver:
-            out['invalid'].append(f'duplicate/conflicting pin: {s}')
+        if name in out['pins']:
+            # Even an identical duplicate makes the lock ambiguous (the two
+            # lines could acquire different markers/hashes later); the
+            # contract is one unambiguous pin per distribution.
+            if out['pins'][name]['version'] != ver:
+                out['invalid'].append(f'duplicate/conflicting pin: {s}')
+            else:
+                out['invalid'].append(f'duplicate pin: {s}')
             continue
         out['pins'][name] = {'name': m.group(1), 'version': ver}
     return out

@@ -1019,14 +1019,18 @@ def _finaltest_admission_problem(stats, manifest, *, smoke=False,
     _raw_admitted = admission.get('n_admitted')
     if isinstance(_raw_admitted, (bool, np.bool_)):
         return f'P5T admission count is malformed: {_raw_admitted!r}'
-    try:
-        n_admitted = int(_raw_admitted)
-    except (TypeError, ValueError, OverflowError):
+    # Reuse the record-contract reader: int(2.5) == 2 would silently turn a
+    # malformed count into a partial-but-plausible panel, and int(True) == 1
+    # would turn a flag into an admitted cell.  `_record_int` rejects both.
+    n_admitted = _record_int(_raw_admitted)
+    if n_admitted is None:
         return f'P5T admission count is malformed: {_raw_admitted!r}'
     if n_admitted < 0:
         return f'P5T admission count is negative: {n_admitted!r}'
     n_expected = (len(manifest.get('arms') or [])
                   * len(manifest.get('seeds') or []))
+    if n_expected <= 0:
+        return 'the frozen manifest declares no (arm, seed) cells'
     if n_admitted <= 0:
         return (f'P5T admitted 0/{n_expected} frozen (arm, seed) cells — the '
                 'one-shot test split produced no confirmatory evidence')
