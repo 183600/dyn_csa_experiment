@@ -2286,7 +2286,11 @@ def audit_single_factor(manifest_path=None):
         fail-closed，加对照不声明键集本身就是错误；
       * open-block 2x2 矩阵：同一 cap 的 mode 对照只差 `open_block_mode`，
         同一 mode 的 cap 对照只差 `max_block`，scope 对照只差
-        `open_block_scope`——交互统计只能读这两根轴；
+        `open_block_scope`——交互统计只能读这两根轴；每个轴单元（含两种
+        scope）都要核验，多一个键=漏进第三因素，少一个键=轴退化；
+      * v9/v10 seq2k 扫描声明（`v9.SEQ2K_CONTRAST_FACTORS`）：把元数据里的
+        `single_factor`/`factors` 与真实臂配置 diff 对账，单因素标签不能只
+        靠手写；
       * 冻结清单（confirmation_frozen.json）：每条 primary comparison 的
         attention-cfg diff 是否单因素（`cfg_keys_single_factor` 的一族判据），
         与 `mechanism_claim_allowed` 标志的一致性。`True` 标志但 cfg 非单因素
@@ -2294,12 +2298,27 @@ def audit_single_factor(manifest_path=None):
         同一口径的 cfg 级读数）。
     """
     L = _import_exp_lib()
-    out = {'status': 'ok', 'design': {}, 'open_block_matrix': {}, 'frozen_manifest': {}}
+    out = {'status': 'ok', 'design': {}, 'open_block_matrix': {},
+           'sweep_contrasts': {}, 'frozen_manifest': {}}
     design_rep = L.single_factor_design_audit(verbose=False)
     out['design'] = design_rep
     ob_rep = L.open_block_matrix_audit(verbose=False)
     out['open_block_matrix'] = ob_rep
     if design_rep.get('status') != 'ok' or ob_rep.get('status') != 'ok':
+        out['status'] = 'fail'
+    # v9/v10 attach a `single_factor`/`factors` label to each seq2k paired
+    # record.  Verify that label against the actual arm construction instead of
+    # trusting the hand-written metadata.
+    try:
+        import v9_supp as V9
+        sw_rep = L.sweep_contrast_factor_audit(V9.SEQ2K_CONTRAST_FACTORS,
+                                               verbose=False)
+    except Exception as _e:
+        sw_rep = {'status': 'not_verifiable_locally',
+                  'note': f'cannot import the v9 sweep declarations '
+                          f'({type(_e).__name__}: {_e})'}
+    out['sweep_contrasts'] = sw_rep
+    if sw_rep.get('status') == 'fail':
         out['status'] = 'fail'
     # The frozen family resolves through the v7 factory (rope arms); the base
     # factory is its delegate for non-rope arms, so one factory covers both.

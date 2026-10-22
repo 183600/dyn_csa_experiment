@@ -2059,3 +2059,45 @@ unpinned installed distributions; `pip install --dry-run --no-deps
 reports no broken requirements; `python v12_supp.py plan` still admits 72/72
 synthetic frozen records with the same six comparisons.
 
+
+## 2026-10-22 — single-factor labels now machine-derived (no new runs)
+
+Zero-GPU audit hardening only; no arm value, recipe, seed, endpoint, frozen
+manifest or test split was touched.
+
+**Problem.** The review-7 gate verified that a contrast's actual cfg diff
+equaled its DECLARED key set, but it still called every non-`kind` diff
+"knob-level single-factor".  Two shipped dynamic-vs-fixed contrasts move the
+segmentation bundle together with the HCA boundary-gate objective multiplier
+(`comp_lambda_mult`) and an inert `block_size` field: enumerated keys were
+accepted, yet the pair was multi-factor and the report counted it as a
+single-factor ablation.  The v9/v10 seq2k `single_factor`/`factors` metadata
+was also never compared with the real arm configs, and the open-block matrix
+only checked one cap mode (and only extra keys).
+
+**Changes.** (1) `exp_lib.single_factor_design_audit` now derives the level
+from the diff: `single_factor` only when the keys sit inside ONE declared
+family, `architecture_level` for `kind` swaps, and `system_level` only for the
+two explicitly declared multi-factor HCA-dynamic pairs
+(`CONTRAST_SYSTEM_LEVEL_DECLARATIONS`).  Any other multi-family bundle is a
+violation; enumerating the keys is not a licence to call it single-factor.
+(2) `exp_lib.sweep_contrast_factor_audit` rebuilds the v9/v10 seq2k arms and
+checks `SEQ2K_CONTRAST_FACTORS` against the actual config diff (arms, factors,
+`single_factor` flag).  `v9.add_paired` attaches the verification and clears an
+unverified `single_factor=True` label instead of propagating metadata.
+(3) `open_block_matrix_audit` checks every mode/cap/scope cell in both scopes
+and fails on a missing axis key as well as a leaked key.
+(4) `dynamic_design_audit` now requires every `mechanism_claim_eligible`
+hypothesis to be tested by a single-factor cfg pair (H1/H2/H4 pass; H3/H5 stay
+system-level), and a mechanism claim on a non-single-factor diff fails.
+(5) `audit_gates.py single_factor` reports the new sweep section.
+
+Verification: shipped design reports 13 knob-level single-factor, 3
+architecture-level and 2 declared system-level pairs; 46 open-block intra-matrix
+axes and all 3 seq2k declarations verify; the dynamic draft still audits `ok`
+with H1/H2/H4 single-factor while the non-eligible H3/H5 family stays
+system-level.  New CPU assertions cover the multi-family refusal, sweep drift,
+omitted-record attachment and the mechanism-eligible/HCA mismatch.
+`python test_review_fixes.py` passes 476/479 with the same 3 DataLoader
+environment skips; `python test_open_block.py` passes 15/15; the
+`audit_gates.py single_factor` subcommand reports `ok`.

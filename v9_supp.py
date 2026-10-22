@@ -91,6 +91,7 @@ PHASES = [('P2T', P2T_CFG, [0, 1, 2]), ('P2S3', P2S3_CFG, [0, 1, 2])]
 # 设计点审计（exp_lib.single_factor_design_audit）同一口径。
 SEQ2K_CONTRAST_FACTORS = {
     'seq2k(bs1): topk8 - m1': {
+        'a': 'csa_fixed_topk8', 'b': 'csa_fix_m1',
         'single_factor': False,
         'factors': ['block_size', 'overlap', 'index_topk'],
         'factors_note': ('multi-factor block-geometry bundle: compressed 4-token blocks vs '
@@ -98,6 +99,7 @@ SEQ2K_CONTRAST_FACTORS = {
                          'comparison, not a topk dose-response'),
     },
     'seq2k(bs1): topk512 - m1': {
+        'a': 'csa_fixed_topk512', 'b': 'csa_fix_m1',
         'single_factor': False,
         'factors': ['block_size', 'overlap', 'index_topk'],
         'factors_note': ('multi-factor block-geometry bundle: compressed 4-token blocks vs '
@@ -105,6 +107,7 @@ SEQ2K_CONTRAST_FACTORS = {
                          'comparison, not a topk dose-response'),
     },
     'seq2k(bs1): topk8 - topk512': {
+        'a': 'csa_fixed_topk8', 'b': 'csa_fixed_topk512',
         'single_factor': True,
         'factors': ['index_topk'],
         'factors_note': 'single-factor topk dose-response (index_topk only)',
@@ -170,11 +173,56 @@ def _arm_param_control(panel, a, b):
 def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None, factors=None,
                require_param_match=False):
 
+    # A factor declaration is metadata only unless it is checked against the
+    # real arm construction.  Recompute the AttnCfg diff here so a record can
+    # never say `single_factor=True` while its two arms move a second knob.
+    _factor_check = None
+    if isinstance(factors, dict) and factors:
+        _declared = {str(k) for k in (factors.get('factors') or [])}
+        _declared_sf = factors.get('single_factor')
+        _keys, _ = L._design_pair_cfg_keys(a, b, L.make_layer_cfgs, 6)
+        if isinstance(_keys, Exception):
+            _factor_check = {'factor_declaration_verified': None,
+                             'factor_declaration_error': (
+                                 f'cannot construct both arms to verify the factor '
+                                 f'declaration ({type(_keys).__name__}: {_keys})')}
+        else:
+            _actual = set(_keys)
+            _extra = sorted(_actual - _declared)
+            _missing = sorted(_declared - _actual)
+            _actual_sf = bool(L.cfg_keys_single_factor(_actual))
+            _ok = not _extra and not _missing
+            if _declared_sf is True:
+                _ok = _ok and _actual_sf
+            _factor_check = {
+                'factor_declaration_verified': bool(_ok),
+                'factor_declaration_actual_keys': sorted(_actual),
+                'factor_declaration_extra_keys': _extra,
+                'factor_declaration_missing_keys': _missing,
+                'factor_declaration_actual_single_factor': _actual_sf,
+            }
+            if not _ok:
+                print(f'[stats] {who}{name}: factor declaration NOT verified — '
+                      f'declared {sorted(_declared)} (single_factor={_declared_sf!r}) '
+                      f'but arms differ in {sorted(_actual)}; the single-factor '
+                      f'label is cleared')
+
+    def _attach_factors(record):
+        if isinstance(factors, dict) and factors:
+            record.update(factors)
+            if _factor_check:
+                record.update(_factor_check)
+                if (_factor_check.get('factor_declaration_verified') is not True
+                        and record.get('single_factor') is True):
+                    # Fail closed: do not let an unverified/mismatched metadata
+                    # label back a single-factor claim.
+                    record['declared_single_factor'] = True
+                    record['single_factor'] = False
+
     def _omit(reason):
         print(f'[stats] {who}{name}: comparison OMITTED — {reason}')
         comparisons[name] = {'omitted': reason, 'n': 0}
-        if factors:
-            comparisons[name].update(factors)
+        _attach_factors(comparisons[name])
         return None
     if not panel and outdir is None:
         return _omit('no measurable record in the panel — every record was unmeasured (error / no ppl) or a `synthesized` reconstruction, so none is an independent observation')
@@ -235,8 +283,7 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None, factors=N
         else:
             res['capacity_confounded'] = False
             res['method_claim_allowed'] = True
-    if factors:
-        res.update(factors)
+    _attach_factors(res)
     res['seeds'] = [s for s in common if s not in set(skipped)]
     res['n_skipped_config_mismatch'] = len(skipped)
     res['n_unstamped'] = unstamped

@@ -15054,6 +15054,24 @@ CONTRAST_OUTSIDE_CFG_FACTORS = {
     ('hybrid_csa_dyn', 'csa_dynamic'): 'attention-kind swap (csa->hca on half the layers); capacity/objective readouts stay with the record-level gates.',
 }
 
+# Contrasts that are explicitly NOT single-factor.  A multi-family key set is
+# only accepted when the design says so here; otherwise it is a second factor
+# that slipped into a contrast declared as a single-factor ablation.  These two
+# dynamic-HCA pairs move the segmentation bundle together with the HCA
+# boundary-gate objective multiplier (and an inert `block_size` field), so they
+# keep the system-level reading from design_notes §22.4 and must never appear
+# in `single_factor_pairs` merely because their key set was enumerated.
+CONTRAST_SYSTEM_LEVEL_DECLARATIONS = {
+    ('hybrid_dynamic', 'hybrid_fixed'):
+        'dynamic segmentation bundle + HCA boundary-gate comp_lambda_mult=4 '
+        '(and the inert block_size field): a system-level dynamic-vs-fixed '
+        'readout, not a knob-level single factor',
+    ('hybrid_hca_dyn', 'hybrid_fixed'):
+        'dynamic segmentation bundle + HCA boundary-gate comp_lambda_mult=4 '
+        '(and the inert block_size field): a system-level dynamic-vs-fixed '
+        'readout, not a knob-level single factor',
+}
+
 # Declared single-factor intervention families over the attention cfg: a diff
 # whose keys all sit inside ONE family isolates that knob (and nothing else).
 # `kind` is deliberately NOT a family — swapping the attention operator is an
@@ -15166,7 +15184,17 @@ def single_factor_design_audit(design=None, *, baseline_design=None, factory=Non
       * `kind` in the diff means the attention operator itself is swapped —
         the contrast is reported as `architecture_level` (multi-factor by
         declaration, together with the mlp-ratio parameter matching in
-        `CONTRAST_OUTSIDE_CFG_FACTORS`), never as a knob-level single factor.
+        `CONTRAST_OUTSIDE_CFG_FACTORS`), never as a knob-level single factor;
+      * a diff whose keys span more than ONE declared family is only accepted
+        as `system_level` when the contrast is listed in
+        `CONTRAST_SYSTEM_LEVEL_DECLARATIONS`.  Enumerating the extra keys in
+        the intervention map is not enough: the contrast is then multi-factor
+        by construction, and silently counting it as a knob-level single
+        factor would let a two-factor ablation back a one-factor claim.
+
+    Every reported level is therefore machine-derived from the actual diff:
+    `single_factor` iff the keys sit inside one family, `architecture_level`
+    for operator swaps, `system_level` for explicitly declared bundles.
 
     Returns the report dict; `status` is 'ok' iff no violation was found.
     Nothing is written to disk and no model is built — this is pure config
@@ -15182,7 +15210,8 @@ def single_factor_design_audit(design=None, *, baseline_design=None, factory=Non
     _factory_name = getattr(factory, '__name__', repr(factory))
     report = {'factory': _factory_name, 'n_layers': int(n_layers),
               'pairs': {}, 'violations': [], 'undeclared': [], 'warnings': [],
-              'checked_pairs': 0, 'single_factor_pairs': [], 'architecture_level_pairs': []}
+              'checked_pairs': 0, 'single_factor_pairs': [],
+              'architecture_level_pairs': [], 'system_level_pairs': []}
 
     def _audit_one(comp, a, b, declared_map, kind):
         label = f'{comp}: {a} vs {b}'
@@ -15202,14 +15231,25 @@ def single_factor_design_audit(design=None, *, baseline_design=None, factory=Non
         actual_set = set(actual)
         extra = sorted(actual_set - declared_set)
         missing = sorted(declared_set - actual_set)
-        level = ('architecture_level' if 'kind' in actual_set else 'single_factor')
+        family_ok = cfg_keys_single_factor(actual_set)
+        if 'kind' in actual_set:
+            level = 'architecture_level'
+        elif (a, b) in CONTRAST_SYSTEM_LEVEL_DECLARATIONS:
+            level = 'system_level'
+        elif family_ok:
+            level = 'single_factor'
+        else:
+            level = 'multi_factor'
         entry = {'component': comp, 'a': a, 'b': b, 'kind': kind,
                  'declared_keys': sorted(declared_set), 'actual_keys': sorted(actual_set),
                  'extra_keys': extra, 'missing_keys': missing, 'level': level,
+                 'single_factor_family': bool(family_ok),
                  'per_layer': {str(i): {k: [v0, v1] for k, (v0, v1) in d.items()}
                                for i, d in per_layer.items()}}
         if CONTRAST_OUTSIDE_CFG_FACTORS.get((a, b)):
             entry['outside_cfg_factors'] = CONTRAST_OUTSIDE_CFG_FACTORS[(a, b)]
+        if CONTRAST_SYSTEM_LEVEL_DECLARATIONS.get((a, b)):
+            entry['system_level_note'] = CONTRAST_SYSTEM_LEVEL_DECLARATIONS[(a, b)]
         if extra:
             report['violations'].append(
                 f'{label}: UNDECLARED factor key(s) {extra} in the config diff — a '
@@ -15218,11 +15258,20 @@ def single_factor_design_audit(design=None, *, baseline_design=None, factory=Non
             report['violations'].append(
                 f'{label}: declared key(s) {missing} no longer differ — the intervention '
                 f'disappeared; either the arm definition drifted or the declaration is stale')
+        if level == 'multi_factor':
+            report['violations'].append(
+                f'{label}: the config diff keys {sorted(actual_set)} span more than one '
+                f'declared single-factor family — this is a multi-factor contrast.  Either '
+                f'remove the second factor from the arm definition or declare the contrast '
+                f'multi-factor/system-level in CONTRAST_SYSTEM_LEVEL_DECLARATIONS before '
+                f'it can be reported as an ablation')
         if not extra and not missing:
             if level == 'single_factor':
                 report['single_factor_pairs'].append(label)
-            else:
+            elif level == 'architecture_level':
                 report['architecture_level_pairs'].append(label)
+            elif level == 'system_level':
+                report['system_level_pairs'].append(label)
         report['pairs'][label] = entry
         report['checked_pairs'] += 1
 
@@ -15258,7 +15307,116 @@ def single_factor_design_audit(design=None, *, baseline_design=None, factory=Non
         else:
             print(f"[single-factor] OK: {report['checked_pairs']} declared contrast(s) verified; "
                   f"{len(report['single_factor_pairs'])} knob-level single-factor, "
-                  f"{len(report['architecture_level_pairs'])} architecture-level (declared)")
+                  f"{len(report['architecture_level_pairs'])} architecture-level, "
+                  f"{len(report['system_level_pairs'])} system-level (declared multi-factor)")
+    return report
+
+def sweep_contrast_factor_audit(declarations, *, factory=None, n_layers=6,
+                                verbose=True):
+    """Verify declared sweep/sensitivity contrasts against the real arm configs.
+
+    ``ABLATION_DESIGN`` has a definition-site gate, but the v9/v10 seq2k sweep
+    declarations (``v9.SEQ2K_CONTRAST_FACTORS``) were prose metadata attached
+    to a paired record: nothing checked that the arm named as a "single-factor
+    topk dose-response" actually differed in ``index_topk`` alone, or that a
+    contrast labeled multi-factor listed all the keys it moves.  A metadata
+    label is not evidence.
+
+    Each declaration must name its two arms (``a``/``b``), the exact AttnCfg
+    keys it expects to move (``factors``) and whether it is a single-factor
+    contrast.  The audit builds both arms through the module factory, diffs
+    the configs and refuses:
+
+      * a declared/actual key mismatch in either direction (an extra moved
+        key is an undeclared second factor; a missing key means the declared
+        intervention disappeared);
+      * ``single_factor=True`` on a diff that is not inside ONE declared
+        family (including any ``kind`` swap or multi-family bundle);
+      * a malformed declaration (missing arms/factors/flag), because an
+        unverifiable label cannot be used in a report.
+
+    Returns ``{status, pairs, violations}`` where every pair records the
+    machine-derived diff, not just the declared label.
+    """
+    factory = make_layer_cfgs if factory is None else factory
+    report = {'pairs': {}, 'violations': [], 'status': 'ok'}
+    if not isinstance(declarations, dict) or not declarations:
+        report['status'] = 'fail'
+        report['violations'].append(
+            'sweep factor declarations must be a non-empty name -> declaration object')
+        if verbose:
+            print('[sweep-factor] REFUSED: no declarations to verify')
+        return report
+    for name, spec in declarations.items():
+        label = str(name)
+        if not isinstance(spec, dict):
+            report['violations'].append(f'{label}: declaration is not an object')
+            continue
+        a, b = spec.get('a'), spec.get('b')
+        if not (isinstance(a, str) and a.strip() and isinstance(b, str) and b.strip()):
+            report['violations'].append(
+                f'{label}: declaration must name both arms (a/b)')
+            continue
+        factors = spec.get('factors')
+        if (not isinstance(factors, (list, tuple, set, frozenset))
+                or not factors
+                or any(not isinstance(k, str) or not k.strip() for k in factors)):
+            report['violations'].append(
+                f'{label}: factors must be a non-empty list of AttnCfg key names')
+            continue
+        declared_sf = spec.get('single_factor')
+        if not isinstance(declared_sf, bool):
+            report['violations'].append(
+                f'{label}: single_factor must be an explicit boolean')
+            continue
+        declared_set = {str(k) for k in factors}
+        actual, per_layer = _design_pair_cfg_keys(a, b, factory, n_layers)
+        if isinstance(actual, Exception):
+            report['violations'].append(
+                f'{label}: arm construction failed ({type(actual).__name__}: {actual})')
+            continue
+        actual_set = set(actual)
+        extra = sorted(actual_set - declared_set)
+        missing = sorted(declared_set - actual_set)
+        actual_sf = bool(cfg_keys_single_factor(actual_set))
+        entry = {'a': a, 'b': b, 'declared_factors': sorted(declared_set),
+                 'actual_keys': sorted(actual_set), 'extra_keys': extra,
+                 'missing_keys': missing,
+                 'declared_single_factor': declared_sf,
+                 'actual_single_factor': actual_sf,
+                 'per_layer': {str(i): {k: [v0, v1] for k, (v0, v1) in d.items()}
+                               for i, d in per_layer.items()}}
+        ok = True
+        if extra:
+            ok = False
+            report['violations'].append(
+                f'{label}: arms also differ in undeclared key(s) {extra} — the '
+                f'declared factors {sorted(declared_set)} do not describe the contrast')
+        if missing:
+            ok = False
+            report['violations'].append(
+                f'{label}: declared factor key(s) {missing} do not differ — the '
+                f'declared intervention is absent from the arm pair')
+        if declared_sf:
+            if actual_set != declared_set:
+                ok = False
+            if not actual_sf:
+                ok = False
+                report['violations'].append(
+                    f'{label}: declared single-factor but the actual diff '
+                    f'{sorted(actual_set)} is not one declared intervention family '
+                    f'(kind swaps and multi-family bundles are not single factors)')
+        entry['verified'] = bool(ok)
+        report['pairs'][label] = entry
+    report['status'] = 'fail' if report['violations'] else 'ok'
+    if verbose:
+        if report['violations']:
+            print('[sweep-factor] REFUSED — declared contrasts do not match the arms:')
+            for _v in report['violations']:
+                print(f'  - {_v}')
+        else:
+            print(f"[sweep-factor] OK: {len(report['pairs'])} declared sweep "
+                  f"contrast(s) verified against the actual arm configs")
     return report
 
 def open_block_matrix_audit(factory=None, *, n_layers=6, verbose=True):
@@ -15272,43 +15430,65 @@ def open_block_matrix_audit(factory=None, *, n_layers=6, verbose=True):
     alone, and scope variants differ in `open_block_scope` alone.  Any other
     key leaking into an intra-matrix diff would make the interaction
     statistics read a third, undeclared factor.
+
+    Every axis cell is checked (not only the closed reading rule), in both
+    scopes.  The diff must EQUAL the axis key: an extra key leaks a second
+    factor, and a missing key means the declared axis no longer varies (the
+    interaction statistic would then be read off a degenerate contrast).
     """
     factory = make_layer_cfgs if factory is None else factory
     report = {'pairs': {}, 'violations': [], 'status': None}
     mbs = list(OPEN_BLOCK_MAX_VALUES)
     modes = list(OPEN_BLOCK_MODES_SHORT)
+    scopes = ('full_prefix', 'outside_window')
     checks = []
-    for mb in mbs:
+    seen = set()
+
+    def _add(a, b, allowed, axis):
+        if a == b or (a, b) in seen:
+            return
+        seen.add((a, b))
+        checks.append((a, b, frozenset(allowed), axis))
+
+    for scope in scopes:
+        # mode axis at every cap
+        for mb in mbs:
+            for mode in modes:
+                if mode != 'closed':
+                    _add(open_block_variant_name(mb, mode, scope),
+                         open_block_variant_name(mb, 'closed', scope),
+                         {'open_block_mode'}, 'mode')
+        # cap axis at every reading rule
         for mode in modes:
-            if mode != 'closed':
-                checks.append((('mode', mb, mode), ('mode', mb, 'closed'),
-                               {'open_block_mode'}))
-    for mb in mbs[1:]:
-        checks.append((('cap', mb, 'closed'), ('cap', mbs[0], 'closed'), {'max_block'}))
-    for mb in mbs:
-        # scope axis: the outside-window auxiliary arm differs from its
-        # full-prefix twin in `open_block_scope` alone
-        checks.append((('scope', mb, 'closed'), ('scope', mb, 'closed'), {'open_block_scope'}))
-    for tag_a, tag_b, allowed in checks:
-        # every axis check compares one cell against its axis twin; scope
-        # checks pair the outside_window variant with the full_prefix one
-        a = open_block_variant_name(tag_a[1], tag_a[2] if tag_a[0] == 'mode' else 'closed',
-                                    'outside_window' if tag_a[0] == 'scope' else 'full_prefix')
-        b = open_block_variant_name(tag_b[1], tag_b[2] if tag_b[0] == 'mode' else 'closed',
-                                    'full_prefix')
-        if a == b:
-            continue
+            for mb in mbs[1:]:
+                _add(open_block_variant_name(mb, mode, scope),
+                     open_block_variant_name(mbs[0], mode, scope),
+                     {'max_block'}, 'cap')
+        # scope axis at every (cap, mode) cell
+        for mb in mbs:
+            for mode in modes:
+                _add(open_block_variant_name(mb, mode, 'outside_window'),
+                     open_block_variant_name(mb, mode, 'full_prefix'),
+                     {'open_block_scope'}, 'scope')
+    for a, b, allowed, axis in checks:
         keys, per_layer = _design_pair_cfg_keys(a, b, factory, n_layers)
         if isinstance(keys, Exception):
             report['violations'].append(f'open-block {a} vs {b}: construction failed ({keys})')
             continue
         extra = sorted(set(keys) - allowed)
+        missing = sorted(allowed - set(keys))
         label = f'{a} vs {b}'
-        report['pairs'][label] = {'actual_keys': keys, 'allowed_keys': sorted(allowed), 'extra_keys': extra}
+        report['pairs'][label] = {'axis': axis, 'actual_keys': keys,
+                                  'allowed_keys': sorted(allowed),
+                                  'extra_keys': extra, 'missing_keys': missing}
         if extra:
             report['violations'].append(
                 f'open-block {label}: intra-matrix diff leaks factor key(s) {extra} '
                 f'outside the declared axis {sorted(allowed)}')
+        if missing:
+            report['violations'].append(
+                f'open-block {label}: declared {axis} axis key(s) {missing} no longer '
+                f'differ — the axis contrast is degenerate')
     report['status'] = 'fail' if report['violations'] else 'ok'
     if verbose:
         if report['violations']:
@@ -16776,6 +16956,22 @@ def dynamic_design_audit(manifest, *, manifest_path=None):
     seen_pairs = set()
     seen_names = set()
     _tested_by_hyp = {}
+    # The hypotheses that declare `mechanism_claim_eligible=true` are the ones
+    # that NEED to be single-factor.  Verify that at the definition site: the
+    # budget ledger checks what the arms share, but only the cfg diff can show
+    # whether a "H1 segmentation-only" or "H2 selection-only" contrast also
+    # moved a second knob.  The v7 factory owns the rope arms used by this
+    # study; a missing factory is reported as unverifiable rather than silently
+    # passing.
+    _cfg_factory = None
+    try:
+        import v7_supp as _v7
+        _cfg_factory = _v7.make_layer_cfgs_v7
+    except Exception as _e:  # pragma: no cover - environment/import defect
+        out['warnings'].append(
+            f'dynamic single-factor check cannot build arms '
+            f'({type(_e).__name__}: {_e}); mechanism-eligible contrasts are '
+            'unverifiable')
     for i, comp in enumerate(comps):
         if not isinstance(comp, dict):
             out['violations'].append(f'primary comparison #{i} is not an object')
@@ -16901,6 +17097,43 @@ def dynamic_design_audit(manifest, *, manifest_path=None):
                 ent['problems'].append(
                     'draft cannot carry an enabled mechanism claim; mark it as '
                     'a design target and clear it after calibration/freeze')
+        # A mechanism-eligible hypothesis must be tested by a contrast that
+        # isolates ONE declared cfg family.  Enumerating a multi-family bundle
+        # somewhere else in the design does not make this pair single-factor.
+        _needs_sf = bool(isinstance(_h, dict)
+                         and _h.get('mechanism_claim_eligible') is True)
+        ent['single_factor_required'] = _needs_sf
+        ent['cfg_diff_keys'] = None
+        ent['single_factor_cfg'] = None
+        if _cfg_factory is not None and _a_ok and _b_ok and a in arm_set and b in arm_set:
+            _keys, _per_layer = _design_pair_cfg_keys(a, b, _cfg_factory, 6)
+            if isinstance(_keys, Exception):
+                ent['cfg_diff_error'] = f'{type(_keys).__name__}: {_keys}'
+                if _needs_sf:
+                    ent['problems'].append(
+                        f'hypothesis {_hid} is mechanism_claim_eligible but the '
+                        f'contrast arms cannot be constructed to verify a '
+                        f'single-factor diff ({ent["cfg_diff_error"]})')
+            else:
+                _keys = set(_keys)
+                ent['cfg_diff_keys'] = sorted(_keys)
+                ent['single_factor_cfg'] = bool(cfg_keys_single_factor(_keys))
+                if _needs_sf and ent['single_factor_cfg'] is not True:
+                    ent['problems'].append(
+                        f'hypothesis {_hid} is mechanism_claim_eligible but this '
+                        f'contrast moves cfg keys {sorted(_keys)}, which are not '
+                        'one declared single-factor family; a mechanism claim '
+                        'needs a single-factor arm pair')
+                if (comp.get('mechanism_claim_allowed') is True
+                        and ent['single_factor_cfg'] is not True):
+                    ent['problems'].append(
+                        'mechanism claim on a non-single-factor cfg diff '
+                        f'{sorted(_keys)}')
+        elif _needs_sf and _cfg_factory is None:
+            ent['problems'].append(
+                f'hypothesis {_hid} is mechanism_claim_eligible but the arm '
+                'factory is unavailable; the single-factor property is '
+                'unverifiable')
         if ent['problems']:
             out['violations'].extend(f'{name}: {p}' for p in ent['problems'])
         if _a_ok and _b_ok:

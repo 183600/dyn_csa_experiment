@@ -15539,6 +15539,25 @@ def t_single_factor_design_gate_passes_and_fails_closed():
     assert rep['architecture_level_pairs'], rep
     for label in rep['architecture_level_pairs']:
         assert 'kind' in rep['pairs'][label]['actual_keys'], label
+    # A multi-family bundle (the dynamic-HCA pairs move segmentation together
+    # with comp_lambda_mult) is system-level, never a knob-level single factor;
+    # every reported single_factor pair must really sit inside one family.
+    assert rep['system_level_pairs'], rep
+    for label in rep['single_factor_pairs']:
+        assert L.cfg_keys_single_factor(rep['pairs'][label]['actual_keys']), label
+    for label in rep['system_level_pairs']:
+        assert not L.cfg_keys_single_factor(rep['pairs'][label]['actual_keys']), label
+        assert rep['pairs'][label]['level'] == 'system_level', label
+    # Removing the explicit system-level declaration must fail closed instead
+    # of silently re-labelling the bundle as a single-factor ablation.
+    _saved_system = dict(L.CONTRAST_SYSTEM_LEVEL_DECLARATIONS)
+    try:
+        L.CONTRAST_SYSTEM_LEVEL_DECLARATIONS.clear()
+        _rep_bad = L.single_factor_design_audit(verbose=False)
+        assert _rep_bad['status'] == 'fail', _rep_bad
+        assert any('multi-factor' in v for v in _rep_bad['violations']), _rep_bad['violations']
+    finally:
+        L.CONTRAST_SYSTEM_LEVEL_DECLARATIONS.update(_saved_system)
     # the seeded-random control family: salt counts INSIDE indexer_mode's family
     assert L.cfg_keys_single_factor({'indexer_mode', 'random_salt'})
     assert L.cfg_keys_single_factor({'index_topk'})
@@ -15641,6 +15660,18 @@ def t_seq2k_contrasts_carry_factor_declarations():
     for name in ('seq2k(bs1): topk8 - m1', 'seq2k(bs1): topk512 - m1',
                  'seq2k(bs1): topk8 - topk512'):
         assert name in decl, name
+    # The declarations are not prose: the audit recomputes each arm diff and
+    # refuses a `single_factor=True` that the actual configs do not back.
+    _sweep = L.sweep_contrast_factor_audit(decl, verbose=False)
+    assert _sweep['status'] == 'ok', _sweep['violations']
+    assert all(e['verified'] for e in _sweep['pairs'].values()), _sweep['pairs']
+    _drift = {k: dict(v) for k, v in decl.items()}
+    _drift['seq2k(bs1): topk8 - topk512'] = dict(
+        _drift['seq2k(bs1): topk8 - topk512'],
+        factors=['index_topk', 'block_size'])
+    _sweep_bad = L.sweep_contrast_factor_audit(_drift, verbose=False)
+    assert _sweep_bad['status'] == 'fail', _sweep_bad
+    assert not _sweep_bad['pairs']['seq2k(bs1): topk8 - topk512']['verified']
     # add_paired attaches the declaration to a real paired record
     knobs = L.training_knobs(amp_dtype=None, eager_batch=False)
     def _rec(ppl):
@@ -15653,6 +15684,7 @@ def t_seq2k_contrasts_carry_factor_declarations():
                         factors=decl['seq2k(bs1): topk8 - m1'])
     assert out is not None and 'omitted' not in out, out
     assert out['single_factor'] is False and 'factors' in out and 'factors_note' in out, out
+    assert out['factor_declaration_verified'] is True, out
     assert out['n'] == 2 and out['seeds'] == [0, 1], out
     # and to an omitted record (missing arm) the declaration still attaches
     comps2 = {}
@@ -15661,6 +15693,14 @@ def t_seq2k_contrasts_carry_factor_declarations():
                   factors=decl['seq2k(bs1): topk8 - topk512'])
     rec = comps2['seq2k(bs1): topk8 - topk512']
     assert 'omitted' in rec and rec.get('single_factor') is True and rec.get('factors') == ['index_topk'], rec
+    assert rec.get('factor_declaration_verified') is True, rec
+    # A wrong metadata label is cleared, never propagated as a single factor.
+    _bad = dict(decl['seq2k(bs1): topk8 - topk512'], factors=['block_size'])
+    _panel = {'csa_fixed_topk8': {0: _rec(40.0)}, 'csa_fixed_topk512': {0: _rec(41.0)}}
+    _out = V9.add_paired({}, 'wrong', _panel, 'csa_fixed_topk8', 'csa_fixed_topk512',
+                         factors=_bad)
+    assert _out['single_factor'] is False, _out
+    assert _out['factor_declaration_verified'] is False, _out
 
 
 def t_driver_pair_capacity_controls():
@@ -16522,6 +16562,18 @@ def t_dynamic_design_requires_explicit_mapping_and_orientation():
     r = L.dynamic_design_audit(bad)
     assert r['status'] == 'fail' and any(
         'not declared mechanism_claim_eligible' in v for v in r['violations']), r['violations']
+    # A mechanism-eligible hypothesis must actually be tested by a
+    # single-factor pair.  Replacing H1's random-vs-random segmentation pair
+    # with a kind swap (HCA vs CSA) makes it a multi-factor contrast even
+    # though the hypothesis is still labeled mechanism-eligible.
+    bad = copy.deepcopy(dyn)
+    h1 = next(c for c in bad['primary_comparisons']
+              if c.get('hypothesis_id') == 'H1_segmentation_quality'
+              and c.get('a') == 'csa_dynamic_rope_randidx_seeded')
+    h1['a'], h1['b'] = 'hybrid_dynamic_rope', 'csa_dynamic_rope'
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail', r
+    assert any('single-factor family' in v for v in r['violations']), r['violations']
 
 
 def t_dynamic_power_and_read_calibration_are_machine_checked():

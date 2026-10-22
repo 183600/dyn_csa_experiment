@@ -1809,18 +1809,36 @@ AttnCfg 键集（`CONTRAST_OUTSIDE_CFG_FACTORS` 另行声明 cfg 之外的带外
   （refuse）；少一个键 = 干预消失（refuse）；两侧漂移都在跑 GPU 之前被抓。
 - **缺声明即 fail-closed**：往设计里加对照而不声明键集，本身就是错误——
   没有默认放行。
-- **分级**：`kind` 出现在差集 = 换注意力算子（另有 mlp 加宽/投影/sink 语
-  义），标记 `architecture_level`，永远不冒充 knob 级单因素；其余为
-  `single_factor`。方法 vs 参数对齐稠密基线因此是 architecture_level 而
-  不是单因素，与 §22.4 的 objective 门结论一致。
+- **分级由实际 diff 推导**：`kind` 出现在差集 = 换注意力算子（另有 mlp
+  加宽/投影/sink 语义），标记 `architecture_level`，永远不冒充 knob 级单
+  因素；差集落在**一个**已声明干预族内才是 `single_factor`。方法 vs 参数
+  对齐稠密基线因此是 architecture_level 而不是单因素，与 §22.4 的
+  objective 门结论一致。
+- **多族键集必须显式声明 system-level**：仅把多个键枚举进
+  `ABLATION_INTERVENTION_KEYS` 不等于单因素。差集跨两个以上家族时，只有
+  在 `CONTRAST_SYSTEM_LEVEL_DECLARATIONS` 中声明的对照才能记为
+  `system_level`；否则 refuse。否则一条两因素消融会继续被报告成单因素。
 
 契约同时把两处此前**未声明**的 HCA 动态臂差异写进明面：动态 HCA 层的
 边界门以 `comp_lambda_mult=4` 训练（comp_lambda_effective 0.05→0.2），以及
 `block_size` 在动态分段下的 inert 差（`blocks_from_cuts` 不读它）。这两条
 差此前只在代码与 `train_objective` 读数里可见、未进对照声明；现在它们是
 声明键集的一部分，且 `ABLATION_DESIGN` 的对照注释与
-`CONTRAST_OUTSIDE_CFG_FACTORS` 都写明其语义。dynamic-vs-fixed 的对照因此
-继续保持 §22.4 的 system-level 读数——契约的职责是不漏报，不是放宽。
+`CONTRAST_OUTSIDE_CFG_FACTORS` 都写明其语义。`hybrid_dynamic` /
+`hybrid_hca_dyn` 两条对照同时移动分段束与 HCA 边界门的
+`comp_lambda_mult`，因此显式列入 `CONTRAST_SYSTEM_LEVEL_DECLARATIONS`，
+继续按 §22.4 的 system-level 读数，不再计入 knob 级单因素；其余
+dynamic-vs-fixed 对照（只差分段束）仍为单因素。契约的职责是不漏报，不是
+放宽。
+
+### 37.2b 扫描对照：元数据要与真实臂 diff 对账
+
+`exp_lib.sweep_contrast_factor_audit` 把 `v9.SEQ2K_CONTRAST_FACTORS` 的
+`a`/`b`/`factors`/`single_factor` 声明逐条重建臂配置并核验：声明的因素键
+必须恰好等于实际 diff；标成 `single_factor=True` 的还必须落在一个声明家
+族内。`v9.add_paired` 在写 comparison 记录时附带
+`factor_declaration_verified`，声明不匹配时清零 `single_factor` 标签，避
+免手写元数据冒充已验证的单因素结论。
 
 ### 37.3 冻结清单：`mechanism_claim_allowed` 从手写断言变成可核验属性
 
@@ -1844,18 +1862,29 @@ allblocks 读严格更多信息、等读预算不成立——保守方向永远�
 与 allblocks 的保守 False 全部一致。`audit_gates.py single_factor` 子命令
 给出同一口径的 cfg 级读数（不建模型，零依赖），并汇入 `report` 汇总审计。
 
+动态研究清单同样在定义点核验“需要是单因素”的假设：
+`dynamic_design_audit` 对每条 `mechanism_claim_eligible=true` 的假设要求
+其 primary comparison 的 cfg diff 落在一个单因素族内。当前 H1（随机选择
+下的固定 vs 动态分段 → `dynamic/chunking/target_block_tokens`）、H2
+（动态臂内的学习 vs 随机选择 → `indexer_mode/random_salt`）与 H4（任务
+边界策略 → `boundary_policy`）通过；H5 的 HCA 互换（`kind` + 多键）与 H3
+的稠密参数代理保持 system-level，不能挂机制主张。若把可挂机制的假设换成
+多因素臂对，audit 直接 refuse。
+
 ### 37.4 扫描对照与开放块矩阵
 
 - v9/v10 的 seq2k 扫描配对检验新增因素列（`v9.SEQ2K_CONTRAST_FACTORS`）：
   `topk8 - topk512` 是单因素剂量响应（只差 `index_topk`）；两条 m1 对照同
   时改 block_size(4→1)/overlap(128→0) 与 topk 语义（逐 token 读取）——等
   token 预算但**多因素块几何束**，只能读作 sweep 点之间的系统级比较，报告
-  明示不得读作 topk 剂量响应。
+  明示不得读作 topk 剂量响应。声明本身由 37.2b 的 audit 与实际臂 diff 对
+  账，漂移时 refuse。
 - `exp_lib.open_block_matrix_audit` 核验开放块 2x2 矩阵（§24 声明的
   max_block × 读取规则）只沿两根声明轴变化：同 cap 的 mode 对照只差
   `open_block_mode`、同 mode 的 cap 对照只差 `max_block`、scope 对照只差
-  `open_block_scope`；任何第三键泄漏进矩阵内 diff 都会让交互统计读到未声
-  明因素而 refuse。
+  `open_block_scope`。审计覆盖每个 mode/cap/scope 单元和两种 scope，不再
+  只查 closed 读取规则；任何第三键泄漏（extra）或声明轴不再差异（missing）
+  都会 refuse。
 
 本节全部改动为零 GPU 的定义点/清单门与标注：不改任何臂的测量语义
 （`CODE_SEMANTICS` 不变）、不改冻结清单字节、不动任何 results_*。
