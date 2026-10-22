@@ -2022,6 +2022,20 @@ def audit_single_factor(manifest_path=None):
                                           'arms_checked': _arms}
                 if _bad:
                     out['status'] = 'fail'
+            else:
+                # A readable but non-object manifest (or an unreadable one,
+                # handled above) cannot be audited.  Leaving frozen_manifest
+                # empty previously let the overall status stay 'ok', so a
+                # malformed gate artifact silently passed.
+                out['frozen_manifest'] = {
+                    'status': 'fail', 'manifest': _mp,
+                    'note': ('manifest must be a JSON object, got '
+                             f'{type(man).__name__}' if man is not None
+                             else 'manifest is not readable JSON')}
+                out['status'] = 'fail'
+            if (isinstance(out.get('frozen_manifest'), dict)
+                    and out['frozen_manifest'].get('status') == 'fail'):
+                out['status'] = 'fail'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 

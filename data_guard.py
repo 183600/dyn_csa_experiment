@@ -3075,9 +3075,15 @@ def audit_preprocessor_fit(preprocessor, X_train, X_holdout=None, *,
                                          len(ref.get('features') or []))))
         if str(ref.get('train_fp')) != str(stats.get('train_fp')):
             return False, list(range(len(stats.get('features') or [])))
+        got_features = stats.get('features') or []
+        ref_features = ref.get('features') or []
+        if len(got_features) != len(ref_features):
+            # zip() would silently truncate to the shorter list, so a stats
+            # artifact with a dropped/extra column could be certified as a
+            # train-only fit without ever comparing that column.
+            return False, list(range(max(len(got_features), len(ref_features))))
         bad = []
-        for j, (got, want) in enumerate(zip(stats.get('features') or [],
-                                            ref.get('features') or [])):
+        for j, (got, want) in enumerate(zip(got_features, ref_features)):
             keys = ('fill', 'clip_lo', 'clip_hi', 'center', 'factor',
                     'mean', 'std', 'median', 'min', 'max')
             if not all(_stats_match_float(got.get(k), want.get(k),
@@ -4209,6 +4215,19 @@ def _row_keys(X):
         # Canonical object keys keep their type-qualified identity (so b'a',
         # 'a' and 1 remain distinct) instead of crashing duplicate detection.
         src = src.astype(object)
+    _canonical_int = (np.issubdtype(src.dtype, np.integer)
+                      or src.dtype == np.bool_)
+    if _canonical_int:
+        # Hashing the native bytes made the same integer row keyed differently
+        # by width (int32 [1, 2] != int64 [1, 2]), so a train/test duplicate
+        # stored at different dtypes was reported as zero overlap.  Canonical
+        # int64 rows are hashed below (per block, so a large uint16 cache is
+        # not duplicated in memory); uint64 values above int64's maximum fall
+        # through to the exact object path.
+        if (src.dtype.kind == 'u' and src.dtype.itemsize >= 8 and src.size
+                and int(src.max()) > int(np.iinfo(np.int64).max)):
+            src = src.astype(object)
+            _canonical_int = False
     if src.dtype == object:
         # Object columns are common after pandas/None handling.  Casting a
         # whole object row through float64 (the generic fallback below) would
@@ -4313,7 +4332,10 @@ def _row_keys(X):
         _step = _hash_row_block(int(src.shape[1]), 1 << 16)
         keys = []
         for start in range(0, src.shape[0], _step):
-            arr = np.ascontiguousarray(src[start:start + _step])
+            block = src[start:start + _step]
+            if _canonical_int:
+                block = block.astype(np.int64, copy=False)
+            arr = np.ascontiguousarray(block)
             for row_view in arr.view(np.uint8).reshape(arr.shape[0], -1):
                 h = hashlib.blake2b(digest_size=8)
                 h.update(memoryview(row_view))
@@ -5091,8 +5113,27 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
     category frequencies; sorting the identity keys on ``(type, repr)`` keeps
     the report computable and deterministic without conflating distinct values.
     """
-    ref = np.asarray(reference, dtype=object).reshape(-1)
-    hold = np.asarray(holdout, dtype=object).reshape(-1)
+    def _category_vector(values):
+        # Keep each supplied item as ONE category.  ``np.asarray(seq,
+        # dtype=object)`` expands a sequence of equal-length tuples/lists into
+        # a 2-D array, so reshape(-1) would split a tuple category into its
+        # components and silently change the distribution.  ndarray inputs
+        # keep their existing flattening contract (a 2-D token table is a
+        # table of categories); a Python sequence is materialised element by
+        # element.
+        if isinstance(values, np.ndarray):
+            return values.reshape(-1)
+        try:
+            seq = list(values)
+        except TypeError:
+            seq = [values]
+        out = np.empty(len(seq), dtype=object)
+        for i, value in enumerate(seq):
+            out[i] = value
+        return out
+
+    ref = _category_vector(reference)
+    hold = _category_vector(holdout)
     if max_categories is not None:
         max_categories = _check_count('max_categories', max_categories, positive=True)
         if max_categories < 2:

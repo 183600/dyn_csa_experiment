@@ -16475,6 +16475,10 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         if score.ndim == 2:
             y_pred = labels[np.argmax(score, axis=1)]
             _threshold_source = 'argmax'
+            # Predictions come from argmax, not from the caller's scalar cut;
+            # recording that cut as the decision threshold would misdescribe
+            # the operating point the metrics were computed at.
+            _threshold_used = None
         elif labels.size == 2:
             if score.size != y_true.size:
                 raise ValueError(f'y_score {score.shape} and y_true {y_true.shape} differ')
@@ -16628,7 +16632,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         # probability.  Logits/scores outside [0, 1] leave it unavailable, so
         # do not advertise Brier/ECE in the metric list as if they had been
         # measured.
-        out['threshold_free_metrics'] = ['roc_auc', 'pr_auc']
+        out['threshold_free_metrics'] = []
     if y_score is not None and labels.size == 2:
         y_bin = (y_true == pos).astype(np.int64)
         # A 2-D score matrix is column-per-label: the binary endpoint uses the
@@ -16645,6 +16649,9 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         out['score_max'] = float(np.max(_bin_score)) if _bin_score.size else None
         out['roc_auc'] = _binary_roc_auc(y_bin, _bin_score)
         out['pr_auc'] = _binary_average_precision(y_bin, _bin_score)
+        # Only advertise the ranking metrics that were actually computed from
+        # a score column; a predictions-only record has neither key.
+        out['threshold_free_metrics'].extend(['roc_auc', 'pr_auc'])
         if out['decision_threshold'] is not None and _bin_score.size:
             _t = float(out['decision_threshold'])
             out['threshold_within_score_range'] = bool(
@@ -25056,11 +25063,22 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
         raise ValueError(
             f'none of lengths={_lens} fits the token table width '
             f'{int(arr.shape[1])}; refusing to return an empty sweep as success')
+    _skipped_lens = sorted({int(x) for x in _lens
+                            if not (0 < int(x) <= max_len)})
     out = {'status': 'ok', 'device': str(device), 'torch': torch.__version__,
            'triton': None, 'tf32': None, 'rows': [],
+           'requested_seq_lens': sorted({int(x) for x in _lens}),
+           'skipped_seq_lens': _skipped_lens,
            'decode_has_kv_cache': False,
            'decode_metric': 'prefix_prefill (no KV cache)',
            'measurement': ('cuda events' if device.type == 'cuda' else 'cpu perf_counter')}
+    if _skipped_lens:
+        # A requested length wider than the token table is not measured.  Keep
+        # it visible instead of returning a shorter grid that still claims
+        # status=ok (the all-lengths-invalid case already raises).
+        out['skipped_seq_lens_reason'] = (
+            f'requested length(s) {_skipped_lens} exceed the token table width '
+            f'{int(arr.shape[1])}; they were not measured')
     try:
         import triton  # noqa: F401
         out['triton'] = getattr(triton, '__version__', None)
@@ -25108,6 +25126,7 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
                 out['rows'].append(row)
     finally:
         model.train(was)
+    out['measured_seq_lens'] = sorted({int(r['seq_len']) for r in out['rows']})
     return out
 
 

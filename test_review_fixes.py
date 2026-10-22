@@ -9426,7 +9426,16 @@ def t_efficiency_pairs_audit_and_sweep():
     ids = torch.randint(0, 64, (1, 20), dtype=torch.long)
     sw = L.measure_efficiency_sweep(model, ids, torch.device('cpu'), lengths=(8, 16), batches=(1, 2), warmup=0, iters=1)
     assert sw['status'] == 'ok' and len(sw['rows']) == 4, sw
+    assert sw['requested_seq_lens'] == [8, 16], sw
+    assert sw['measured_seq_lens'] == [8, 16] and sw['skipped_seq_lens'] == [], sw
     assert sw['decode_has_kv_cache'] is False and sw['measurement'] == 'cpu perf_counter', sw
+    _partial = L.measure_efficiency_sweep(
+        model, ids, torch.device('cpu'), lengths=(8, 100), batches=(1,),
+        warmup=0, iters=1)
+    assert _partial['status'] == 'ok', _partial
+    assert _partial['measured_seq_lens'] == [8], _partial
+    assert _partial['skipped_seq_lens'] == [100], _partial
+    assert 'not measured' in _partial.get('skipped_seq_lens_reason', ''), _partial
     # A malformed/empty shape grid must not produce an empty row list that
     # still claims status=ok: that looks like a completed sweep.
     for _kw in ({'lengths': ()}, {'lengths': (8.5,)}, {'lengths': (True,)},
@@ -14785,6 +14794,110 @@ def t_driver_pair_capacity_controls():
             assert st['method_claim_allowed'] is False, st
 
 
+def t_indexer_chunked_partial_tile_preserves_row_stride():
+    # idx_score writes each tile compactly with row stride tc, not the
+    # allocation's T_c stride.  For R >= 2 the final short chunk must be read
+    # back from that compact prefix; scores[:, :tc] keeps stride T_c and reads
+    # stale rows for every row after the first.
+    import types
+    import csa_kernels as C
+    R, T, nIH, hd, Bm, k = 2, 5, 1, 2, 8193, 2
+
+    class _Launch:
+        def __getitem__(self, _grid):
+            return self
+        def __call__(self, qI, kI, w, scores, t0, TF, tc, Bm_, *args, **kwargs):
+            flat = scores.reshape(-1, int(Bm_))
+            for r in range(R):
+                for t in range(int(tc)):
+                    flat[r * int(tc) + t].fill_(float(1000 * r + int(t0) + t))
+
+    fake = types.SimpleNamespace(
+        triton=types.SimpleNamespace(cdiv=lambda a, b: (a + b - 1) // b),
+        idx_score=_Launch())
+    seen = []
+
+    def _helper(scores, last_tok, t0, T_, Bm_, k_out, need_soft, out_dtype):
+        rr, tt = int(scores.shape[0]), int(scores.shape[1])
+        for r in range(rr):
+            for t in range(tt):
+                seen.append((r, int(t0) + t, float(scores[r, t, 0])))
+        return (torch.zeros((rr, tt, k_out), dtype=torch.int32),
+                torch.zeros((rr, tt, k_out), dtype=torch.bool), None)
+
+    _old = (C._kernels, C._IDX_SCORES_CAP_BYTES, C._indexer_topk_chunked)
+    try:
+        C._kernels = lambda: fake
+        C._IDX_SCORES_CAP_BYTES = 3 * R * Bm * 4  # T_c = 3 for T = 5
+        C._indexer_topk_chunked = _helper
+        C._indexer_fwd_triton(
+            torch.randn(R, T, nIH, hd), torch.randn(R, Bm, nIH, hd),
+            torch.randn(nIH, hd), torch.zeros(R, Bm, dtype=torch.long),
+            k, need_soft=False)
+    finally:
+        C._kernels, C._IDX_SCORES_CAP_BYTES, C._indexer_topk_chunked = _old
+    assert len(seen) == R * T, seen
+    bad = [(r, t, got) for r, t, got in seen
+           if got != float(1000 * r + t)]
+    assert not bad, bad[:6]
+
+
+def t_categorical_shift_preserves_equal_length_tuple_categories():
+    import data_guard as DG
+    # np.asarray(list_of_equal_length_tuples) is 2-D; flattening it splits each
+    # tuple into two categories.  A tuple is one category identity.
+    same = DG.categorical_shift_report([('a', 'b')] * 4, [('a', 'b')] * 4)
+    assert same['n_reference'] == 4 and same['n_holdout'] == 4, same
+    assert same['js_divergence'] < 1e-12, same
+    shifted = DG.categorical_shift_report([('a', 'b')] * 4, [('a', 'c')] * 4)
+    assert shifted['n_reference'] == 4, shifted
+    assert shifted['unseen_rate'] == 1.0, shifted
+
+
+def t_preprocessor_audit_rejects_truncated_stats():
+    import data_guard as DG
+    rng = np.random.default_rng(11)
+    Xtr = rng.normal(size=(30, 2))
+    fit = DG.LeakageSafePreprocessor().fit(Xtr)
+    stats = fit.get_stats()
+    stats['features'] = stats['features'][:-1]
+
+    class _Truncated:
+        fitted_ = True
+        def get_stats(self):
+            return stats
+
+    rep = DG.audit_preprocessor_fit(_Truncated(), Xtr)
+    assert rep['stats_match_train'] is False, rep
+    assert rep['status'] != 'train_only_verified', rep
+
+
+def t_single_factor_audit_rejects_nonobject_manifest():
+    import audit_gates as A
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'manifest.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump([], f)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rep = A.audit_single_factor(manifest_path=path)
+    assert rep['status'] == 'fail', rep
+    assert rep['frozen_manifest']['status'] == 'fail', rep
+
+
+def t_classification_threshold_metadata_matches_predictions():
+    y = np.array([0, 1, 0, 1])
+    score = np.array([[0.9, 0.1], [0.2, 0.8], [0.7, 0.3], [0.4, 0.6]])
+    argmax = L.classification_metrics(y, y_score=score, labels=[0, 1],
+                                      threshold=0.99)
+    assert argmax['decision_threshold_source'] == 'argmax', argmax
+    assert argmax['decision_threshold'] is None, argmax
+    pred_only = L.classification_metrics(y, y_pred=np.array([0, 1, 0, 1]),
+                                         labels=[0, 1])
+    assert pred_only['threshold_free_metrics'] == [], pred_only
+    assert 'roc_auc' not in pred_only and 'pr_auc' not in pred_only, pred_only
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -15160,6 +15273,11 @@ def main():
     _check('L61 frozen-manifest mechanism flags are machine-verified single-factor verdicts', t_frozen_manifest_mechanism_flags_are_verified_single_factor)
     _check('L62 seq2k sweep contrasts carry explicit factor declarations', t_seq2k_contrasts_carry_factor_declarations)
     _check('L63 driver method-vs-dense pairs carry a capacity-control verdict', t_driver_pair_capacity_controls)
+    _check('L64 indexer chunked partial tile preserves the compact row stride', t_indexer_chunked_partial_tile_preserves_row_stride)
+    _check('L65 categorical shift keeps equal-length tuple categories intact', t_categorical_shift_preserves_equal_length_tuple_categories)
+    _check('L66 preprocessor audit rejects truncated feature stats', t_preprocessor_audit_rejects_truncated_stats)
+    _check('L67 single-factor audit fails closed on a non-object manifest', t_single_factor_audit_rejects_nonobject_manifest)
+    _check('L68 classification threshold metadata matches the actual predictions', t_classification_threshold_metadata_matches_predictions)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
