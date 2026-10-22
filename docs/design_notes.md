@@ -2293,3 +2293,44 @@ Holm/6 时返回 None），以及
 python test_review_fixes.py     # L111 逐 token 对齐、L112 跨行/混合文档聚合、L113 粒度拒绝
 python v12_supp.py plan         # 冻结预检不受影响
 ```
+
+## 44. 文档级 Δ 区间必须与主终点同口径（token 池化 cluster）
+
+主终点是 token 池化的 PPL：`exp(Σ NLL / Σ tokens)`。文档长度不同，它
+不等于「每个文档 PPL 的等权平均」。因此「平均文档的 ΔPPL」和「池化
+ΔPPL」是两个不同的估计量，不能把前者的区间印在后者的点估计旁边。
+
+本轮修正：
+
+- `exp_lib._paired_nll_doc_ci(nll_a, nll_b, n_tokens)` 以文档为 cluster，
+  先对每个种子计算 token 池化 CE 差，再对种子取平均。单种子影响函数为
+  `exp(ce_a)·(a_i − ce_a·t_i)/T − exp(ce_b)·(b_i − ce_b·t_i)/T`，
+  种子平均后的方差为 `D/(D−1)·Σ_i ψ_i²`，用 `df=D−1` 的 t 临界值；同时
+  给出种子平均 log-ratio 与 PPL ratio 区间。它不重采样、结果确定，且
+  明确条件在已训练的种子上：种子间训练随机性仍由精确符号翻转检验负责。
+- `v12_supp._doc_nll_matrix` 在使用前校验逐文档 NLL 有限、逐文档 NLL 之和
+  与单元记录的 `nll_sum` 一致、`ppl_per_doc = exp(nll_i/t_i)` 一致。任一
+  不通过就拒绝计算，并写出 `pooled_ci_unavailable_reason`；绝不从错位的
+  向量算出一个看起来正常的区间。
+- `_doc_level_analysis` 新增 `pooled_delta_ppl` / `pooled_delta_ppl_ci95` /
+  `pooled_delta_log_ratio` / `pooled_delta_log_ratio_ci95` /
+  `pooled_ratio_ci95` / `pooled_ci_n_docs` / `pooled_ci_df` /
+  `pooled_ci_method`。旧的 `per_doc_delta_mean` 与等权 bootstrap
+  `per_doc_delta_ppl_ci95` 保留，只作为「平均文档」的描述量。
+- 准入端 `_by_len_shape_reason` 增加：`nll_per_doc` 必须有限，且其和必须
+  与记录的 `nll_sum` 一致（容差 1e-5 相对）；`n_tokens_per_doc` 的每一项
+  必须为正。零目标文档已在聚合端被丢弃，若仍作为评测单元声明，说明该
+  单元的文档向量与计分流不一致，不能准入。
+- 报告端 `_doc_ci_markdown_cell`：有 pooled cluster 区间时优先显示并标明
+  「token 池化」；没有时才显示「等权单元 bootstrap」，并在表头/表注说明
+  两种口径。行级记录仍只能得到行 bootstrap，不会冒充文档区间。
+- 边界：这是描述性的文档抽样区间（且条件在已训练种子上），不进入冻结
+  决策；精确符号翻转、Holm 族、覆盖门和 `confirmed` 均不变。池化点估计
+  和 `CODE_SEMANTICS` 也不因本改动而改变。
+
+入口与验证：
+
+```bash
+python test_review_fixes.py     # L113 准入、L115 cluster CI、L116 集成、L117 报告口径
+python v12_supp.py plan         # 冻结预检不受影响
+```

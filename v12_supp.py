@@ -1548,8 +1548,11 @@ def _by_len_shape_reason(rec, n_seq):
                         or not isinstance(_x, (int, float, np.integer, np.floating))):
                     return f'by_len[{_ln_i}].n_tokens_per_doc contains {_x!r}'
                 _xf = float(_x)
-                if not math.isfinite(_xf) or _xf != math.floor(_xf) or _xf < 0:
-                    return f'by_len[{_ln_i}].n_tokens_per_doc contains {_x!r}'
+                if not math.isfinite(_xf) or _xf != math.floor(_xf) or _xf <= 0:
+                    return (f'by_len[{_ln_i}].n_tokens_per_doc contains {_x!r}; '
+                            'every retained document needs at least one scored '
+                            'target (zero-target documents are dropped, not '
+                            'reported as evaluation units)')
                 _dsum += int(_xf)
             if _dsum != int(_ntok_f):
                 return (f'by_len[{_ln_i}].n_tokens_per_doc sums to {_dsum}, '
@@ -1567,6 +1570,29 @@ def _by_len_shape_reason(rec, n_seq):
                         or int(_ndf) != len(_dnt)):
                     return (f'by_len[{_ln_i}].n_docs={_nd!r} != the '
                             f'{len(_dnt)} per-document entries')
+            # A document-level NLL vector must actually reconstruct the cell's
+            # own totals.  Otherwise a downstream pooled-Δ interval would be
+            # computed from one grouping while the reported PPL came from
+            # another, and the mismatch would be invisible.
+            _dnll = _c.get('nll_per_doc')
+            for _x in _dnll:
+                if (isinstance(_x, (bool, np.bool_))
+                        or not isinstance(_x, (int, float, np.integer, np.floating))):
+                    return f'by_len[{_ln_i}].nll_per_doc contains {_x!r}'
+                if not math.isfinite(float(_x)):
+                    return f'by_len[{_ln_i}].nll_per_doc contains {_x!r}'
+            if _c.get('nll_sum') is not None:
+                _ns = _c.get('nll_sum')
+                if (isinstance(_ns, (bool, np.bool_))
+                        or not isinstance(_ns, (int, float, np.integer, np.floating))):
+                    return f'by_len[{_ln_i}].nll_sum={_ns!r} is not numeric'
+                _nsf = float(_ns)
+                if (not math.isfinite(_nsf)
+                        or abs(math.fsum(float(x) for x in _dnll) - _nsf)
+                        > 1e-5 * max(1.0, abs(_nsf))):
+                    return (f'by_len[{_ln_i}].nll_per_doc sums to '
+                            f'{math.fsum(float(x) for x in _dnll)!r}, not the '
+                            f'recorded nll_sum={_nsf!r}')
         elif _has_doc_cell:
             # A partially-written document cell is not evidence; do not let a
             # row-labelled record smuggle incomplete document fields into the
@@ -1825,13 +1851,85 @@ def _admit_confirmation_records(raw, manifest):
     return admitted, (sorted(fps)[0] if fps else None)
 
 
+def _doc_nll_matrix(rows, n_docs, tokens):
+    """Validate and stack per-document NLL vectors for the pooled-Δ CI.
+
+    Returns ``(matrix, None)`` or ``(None, reason)``.  Admission checks the
+    same totals, but these checks are repeated at the analysis boundary: the
+    CI must be refused when the document vectors do not reconstruct the cell's
+    own totals, because a wrong interval is worse than an explicitly
+    unavailable one.
+    """
+    if not isinstance(tokens, (list, tuple)) or len(tokens) != n_docs:
+        return None, 'n_tokens_per_doc is missing or misaligned'
+    _tok_f = []
+    for t in tokens:
+        if isinstance(t, (bool, np.bool_)):
+            return None, 'n_tokens_per_doc contains a boolean'
+        try:
+            tf = float(t)
+        except (TypeError, ValueError, OverflowError):
+            return None, 'n_tokens_per_doc contains a non-numeric value'
+        if not math.isfinite(tf) or tf <= 0.0:
+            return None, 'n_tokens_per_doc contains a non-positive entry'
+        _tok_f.append(tf)
+    out = []
+    for r in rows:
+        nll = r.get('nll_per_doc')
+        if not isinstance(nll, list) or len(nll) != n_docs:
+            return None, 'nll_per_doc missing or misaligned with the document vector'
+        vals = []
+        for x in nll:
+            if isinstance(x, (bool, np.bool_)):
+                return None, 'nll_per_doc contains a boolean'
+            try:
+                v = float(x)
+            except (TypeError, ValueError, OverflowError):
+                return None, 'nll_per_doc contains a non-numeric value'
+            if not math.isfinite(v):
+                return None, 'nll_per_doc contains a non-finite value'
+            vals.append(v)
+        _nll_sum = r.get('nll_sum')
+        if _nll_sum is not None:
+            if isinstance(_nll_sum, (bool, np.bool_)):
+                return None, 'nll_sum is a boolean'
+            try:
+                _ns = float(_nll_sum)
+            except (TypeError, ValueError, OverflowError):
+                return None, 'nll_sum is not numeric'
+            if not math.isfinite(_ns) or abs(math.fsum(vals) - _ns) > 1e-5 * max(1.0, abs(_ns)):
+                return None, 'nll_per_doc does not partition the recorded nll_sum'
+        _ppl = r.get('ppl_per_doc')
+        if isinstance(_ppl, list) and len(_ppl) == n_docs:
+            for v, t, p in zip(vals, _tok_f, _ppl):
+                if isinstance(p, (bool, np.bool_)):
+                    return None, 'ppl_per_doc contains a boolean'
+                try:
+                    pf = float(p)
+                except (TypeError, ValueError, OverflowError):
+                    return None, 'ppl_per_doc contains a non-numeric value'
+                expected = L._safe_exp_ppl(v / t)
+                if (expected is None or not math.isfinite(expected)
+                        or not math.isfinite(pf) or pf <= 0.0
+                        or abs(pf - expected) > 1e-6 * max(1.0, abs(expected))):
+                    return None, ('ppl_per_doc is inconsistent with '
+                                  'nll_per_doc / n_tokens_per_doc')
+        out.append(vals)
+    return out, None
+
+
 def _doc_level_analysis(recs_a, recs_b, common, Ln):
     """Document-sampling readout for one comparison.
 
     逐文档配对差（对每个文档取「种子内臂差」的均值）与两层方差分解：
     between-doc（文档抽样不确定性）与 within-doc-across-seed（训练随机性）。
     48 条评测行仍不足以充分覆盖文档分布——本读数的目的就是把这个不确定性
-    显式化，而不是宣称已消除。"""
+    显式化，而不是宣称已消除。
+
+    等权逐文档均值回答「平均文档是否更好」，主终点回答「token 池化 PPL
+    是否更低」。文档长度不同时这是两个估计量；因此额外给出与主终点同口径
+    的 token 池化 Δ 的文档 cluster-robust 区间（条件在已训练种子上），等权
+    bootstrap 只保留为描述量。"""
     if not common:
         return None
     rows_a = [recs_a[s]['by_len'].get(Ln, recs_a[s]['by_len'].get(str(Ln))) or {} for s in common]
@@ -1926,6 +2024,53 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
         within.append(float(np.std(cell, ddof=1)) if len(cell) > 1 else 0.0)
     if len(doc_deltas) < 2:
         return None
+    # The equal-weighted per-document mean above answers "is the average
+    # document better?"; the primary endpoint asks "is the token-pooled PPL
+    # lower?".  When document lengths differ these are different estimands, so
+    # the interval shown next to the pooled Δ must resample/weight DOCUMENTS
+    # with their token counts, not give every document equal weight.
+    _pooled_ci = None
+    _pooled_ci_reason = None
+    if _granularity == 'document':
+        _nll_a, _why_a = _doc_nll_matrix(rows_a, n_docs, _ref_tok)
+        _nll_b, _why_b = _doc_nll_matrix(rows_b, n_docs, _ref_tok)
+        if _nll_a is None or _nll_b is None:
+            _pooled_ci_reason = (
+                'token-pooled cluster CI not available: '
+                + (_why_a or _why_b or 'document NLL vectors are unusable'))
+        else:
+            _pc = L._paired_nll_doc_ci(_nll_a, _nll_b, _ref_tok)
+            if _pc is None:
+                _pooled_ci_reason = (
+                    'token-pooled cluster CI not available: the per-seed PPL '
+                    'difference overflowed')
+            else:
+                # The interval is only meaningful if its point estimate is the
+                # SAME per-seed pooled Δ the frozen comparison reports.
+                _cell_a = [r.get('ppl') for r in rows_a]
+                _cell_b = [r.get('ppl') for r in rows_b]
+                _pt = []
+                for _pa, _pb in zip(_cell_a, _cell_b):
+                    try:
+                        _fa, _fb = float(_pa), float(_pb)
+                    except (TypeError, ValueError, OverflowError):
+                        _pt = []
+                        break
+                    if (not math.isfinite(_fa)) or (not math.isfinite(_fb)):
+                        _pt = []
+                        break
+                    _pt.append(_fa - _fb)
+                if _pt:
+                    _want = float(np.mean(_pt))
+                    if abs(_pc['delta_ppl'] - _want) > 1e-5 * max(1.0, abs(_want)):
+                        _pooled_ci_reason = (
+                            'token-pooled cluster CI refused: the document '
+                            'vectors do not reproduce the recorded per-seed '
+                            'pooled PPL difference')
+                    else:
+                        _pooled_ci = _pc
+                else:
+                    _pooled_ci = _pc
     arr = np.asarray(doc_deltas, dtype=float)
     lr = np.asarray(doc_log_ratios, dtype=float)
     # Seed-level sign-flip remains the confirmatory test.  These intervals
@@ -1944,33 +2089,56 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     _zero = int((arr == 0).sum())
     _abs_sum = float(np.abs(arr).sum())
     _top_share = (float(np.abs(arr).max() / _abs_sum) if _abs_sum > 0.0 else None)
-    return {'n_docs': int(len(doc_deltas)), 'n_seeds': len(common),
-            'granularity': _granularity,
-            'per_doc_delta_mean': float(arr.mean()),
-            'per_doc_delta_median': float(np.median(arr)),
-            'per_doc_log_ratio_mean': float(lr.mean()),
-            'doc_delta_negative': _neg, 'doc_delta_positive': _pos,
-            'doc_delta_zero': _zero,
-            'doc_a_better_fraction': (float(_neg / arr.size) if arr.size else None),
-            'top_doc_abs_share': _top_share,
-            'between_doc_sd': float(arr.std(ddof=1)) if len(doc_deltas) > 1 else 0.0,
-            'between_doc_log_ratio_sd': float(lr.std(ddof=1)) if len(doc_log_ratios) > 1 else 0.0,
-            'mean_within_doc_seed_sd': float(np.mean(within)),
-            'per_doc_delta_ppl_ci95': ([_ci_ppl['ci_low'], _ci_ppl['ci_high']] if _ci_ppl else None),
-            'per_doc_log_ratio_ci95': ([_ci_log['ci_low'], _ci_log['ci_high']] if _ci_log else None),
-            'incomplete_doc_seed_cells': int(incomplete),
-            'ci_method': (('percentile bootstrap over DOCUMENTS (chunked, deterministic); '
-                           'conditions on the trained seeds')
-                          if _granularity == 'document' else
-                          ('percentile bootstrap over fixed eval ROWS (chunked, '
-                           'deterministic); rows are not documents, so this is '
-                           'a row-level interval, not a document-sampling one')),
-            'breadth_note': ('doc_a_better_fraction counts units whose seed-mean Δ (a-b) is negative, i.e. lower PPL for arm a; '
-                             'top_doc_abs_share is max|Δ_unit| / sum|Δ_unit| (a single unit carrying a large share means the '
-                             'mean is outlier-sensitive).  Both are descriptive: units are not an arm randomisation.'),
-            'note': (('document-sampling uncertainty only; seed-level exact sign-flip remains the confirmatory test, and n_seqs<64 does not cover the language-population distribution — enlarge the row panel for population-level claims (design_notes section 20)')
-                     if _granularity == 'document' else
-                     ('ROW-level uncertainty only: fixed eval rows can split or merge documents, so this bootstrap is not a document bootstrap; rebuild/copy the test cache with per-token document ids for the document-level readout (design_notes section 43)'))}
+    out = {'n_docs': int(len(doc_deltas)), 'n_seeds': len(common),
+           'granularity': _granularity,
+           'per_doc_delta_mean': float(arr.mean()),
+           'per_doc_delta_median': float(np.median(arr)),
+           'per_doc_log_ratio_mean': float(lr.mean()),
+           'doc_delta_negative': _neg, 'doc_delta_positive': _pos,
+           'doc_delta_zero': _zero,
+           'doc_a_better_fraction': (float(_neg / arr.size) if arr.size else None),
+           'top_doc_abs_share': _top_share,
+           'between_doc_sd': float(arr.std(ddof=1)) if len(doc_deltas) > 1 else 0.0,
+           'between_doc_log_ratio_sd': float(lr.std(ddof=1)) if len(doc_log_ratios) > 1 else 0.0,
+           'mean_within_doc_seed_sd': float(np.mean(within)),
+           'per_doc_delta_ppl_ci95': ([_ci_ppl['ci_low'], _ci_ppl['ci_high']] if _ci_ppl else None),
+           'per_doc_log_ratio_ci95': ([_ci_log['ci_low'], _ci_log['ci_high']] if _ci_log else None),
+           'incomplete_doc_seed_cells': int(incomplete),
+           'ci_method': (('percentile bootstrap over DOCUMENTS (chunked, deterministic); '
+                          'conditions on the trained seeds')
+                         if _granularity == 'document' else
+                         ('percentile bootstrap over fixed eval ROWS (chunked, '
+                          'deterministic); rows are not documents, so this is '
+                          'a row-level interval, not a document-sampling one')),
+           'breadth_note': ('doc_a_better_fraction counts units whose seed-mean Δ (a-b) is negative, i.e. lower PPL for arm a; '
+                            'top_doc_abs_share is max|Δ_unit| / sum|Δ_unit| (a single unit carrying a large share means the '
+                            'mean is outlier-sensitive).  Both are descriptive: units are not an arm randomisation.'),
+           'note': (('document-sampling uncertainty only; seed-level exact sign-flip remains the confirmatory test, and n_seqs<64 does not cover the language-population distribution — enlarge the row panel for population-level claims (design_notes section 20)')
+                    if _granularity == 'document' else
+                    ('ROW-level uncertainty only: fixed eval rows can split or merge documents, so this bootstrap is not a document bootstrap; rebuild/copy the test cache with per-token document ids for the document-level readout (design_notes section 43)'))}
+    if _pooled_ci is not None:
+        out.update({
+            'pooled_delta_ppl': _pooled_ci['delta_ppl'],
+            'pooled_delta_ppl_ci95': _pooled_ci['delta_ppl_ci95'],
+            'pooled_delta_log_ratio': _pooled_ci['delta_log_ratio'],
+            'pooled_delta_log_ratio_ci95': _pooled_ci['delta_log_ratio_ci95'],
+            'pooled_ratio_ci95': _pooled_ci['ratio_ci95'],
+            'pooled_ci_n_docs': _pooled_ci['n_docs'],
+            'pooled_ci_df': _pooled_ci['df'],
+            'pooled_ci_method': _pooled_ci['method'],
+            'pooled_ci_note': ('interval for the token-pooled Δ, the same '
+                               'estimand as the primary comparison; documents '
+                               'are clusters and the trained seeds are '
+                               'conditioned on.  `pooled_delta_log_ratio` is '
+                               'the seed-averaged log PPL ratio, not the log '
+                               'of the ΔPPL.  This is not a seed-level '
+                               'significance test.'),
+        })
+    elif _granularity == 'document':
+        out['pooled_ci_unavailable_reason'] = (
+            _pooled_ci_reason or
+            'token-pooled cluster CI not available for this cell')
+    return out
 
 
 def _test_probe_stats(probe_path, manifest, slice_fp):
@@ -2208,6 +2376,36 @@ def _confirmation_robustness_block(stats, pairs, *, alpha, family_size, param_re
         'additionally requires complete coverage.')
     stats['robustness'] = rob
     return rob
+
+
+def _doc_ci_markdown_cell(dsm):
+    """Render the document/row sampling interval without mixing estimands.
+
+    Prefer the token-pooled cluster-robust interval (same estimand as the
+    primary Δ); fall back to the labelled equal-weighted unit bootstrap only
+    when the pooled interval is unavailable.  Kept pure so the report wording
+    is testable without a panel.
+    """
+    dsm = dsm if isinstance(dsm, dict) else {}
+    unit = '文档' if dsm.get('granularity') == 'document' else '行'
+
+    def _fmt(ci):
+        if isinstance(ci, (list, tuple)) and len(ci) == 2:
+            try:
+                lo, hi = float(ci[0]), float(ci[1])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if math.isfinite(lo) and math.isfinite(hi):
+                return f'[{lo:+.2f}, {hi:+.2f}]'
+        return None
+
+    pooled = _fmt(dsm.get('pooled_delta_ppl_ci95'))
+    if pooled is not None:
+        return f'{pooled}（{unit} cluster，token 池化）'
+    unit_ci = _fmt(dsm.get('per_doc_delta_ppl_ci95'))
+    if unit_ci is not None:
+        return f'{unit_ci}（{unit} bootstrap，等权单元）'
+    return '—'
 
 
 def _robustness_markdown(rob):
@@ -2944,7 +3142,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('')
     comps = ft.get('comparisons') or {}
     if comps:
-        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | Δ mean±std | 单元 Δ 95% CI（文档/行） | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
+        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | Δ mean±std | Δ 95% CI（文档 token 池化 cluster / 行 bootstrap） | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
         A('|---|---|---|---|---|---|---|---|---|---|---|---|')
         holm = ft.get('holm') or {}
         for k, v in comps.items():
@@ -2957,14 +3155,21 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _dir = v.get('direction_ok')
             _ds = '—（非方向性）' if _dir is None else ('✔' if _dir else '✘')
             _dsm = v.get('doc_sampling') or {}
-            _dci = _dsm.get('per_doc_delta_ppl_ci95')
-            _dcitxt = f'[{_dci[0]:+.2f}, {_dci[1]:+.2f}]' if isinstance(_dci, (list, tuple)) and len(_dci) == 2 else '—'
+            _dcitxt = _doc_ci_markdown_cell(_dsm)
             _dwin = _dsm.get('doc_a_better_fraction')
             _dunit = ('文档' if _dsm.get('granularity') == 'document' else '行')
             if isinstance(_dwin, (int, float)) and _dcitxt != '—':
                 _dcitxt += f'；{100.0 * _dwin:.0f}% {_dunit} Δ<0'
             A(f'| {k} | {v["n"]} | {v.get("coverage_ok")} | {v.get("param_matched")} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {_dcitxt} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
         A('')
+        if any(isinstance((_v.get('doc_sampling') or {}).get('pooled_delta_ppl_ci95'),
+                          (list, tuple))
+               for _v in comps.values()):
+            A('（CI 口径：文档级记录使用按文档聚类的 token 池化 Δ 的 cluster-robust 区间，'
+              '点估计与冻结比较的 token 池化 Δ 相同；同表 `Δ mean±std` 的离散度是种子间训练随机性，'
+              '两者不确定性来源不同。等权逐文档 bootstrap 仍保存在 `analysis_v12/test_stats.json` 的 '
+              '`per_doc_delta_ppl_ci95`，只作「平均文档」描述，不再占据主表 CI 列。）')
+            A('')
         _conf = ft.get('confirmed')
         if _conf is None:
             _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') is True) and (comps.get(k, {}).get('param_matched') is not False) and (comps.get(k, {}).get('coverage_ok') is True)]

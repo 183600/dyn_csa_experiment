@@ -1223,6 +1223,121 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
             'ppl_ci95_high': _safe_exp_ppl(ce + _tc * _sem_ce),
             'n_docs': n_docs}
 
+def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
+    """Cluster-robust CI for a PAIRED token-pooled PPL difference.
+
+    ``nll_a`` / ``nll_b`` are ``[n_seeds, n_docs]`` per-document summed NLLs
+    for the two arms; ``n_tokens`` is the shared ``[n_docs]`` token count (the
+    two arms are evaluated on the same documents and the same positions).
+    The point estimate is the frozen-estimand analogue
+
+        mean_s [ exp(sum_i a_si / T) - exp(sum_i b_si / T) ],
+
+    i.e. the mean over seeds of each seed's token-pooled PPL difference.
+
+    The interval treats DOCUMENTS as clusters.  For each seed, the delta-method
+    influence of its pooled CE difference on document ``i`` is
+
+        exp(ce_a) * (a_i - ce_a * t_i) / T
+      - exp(ce_b) * (b_i - ce_b * t_i) / T,
+
+    and the influence of the seed-averaged difference is the average of those
+    per-seed influences.  The variance is the usual cluster-robust
+    ``D/(D-1) * sum_i psi_i^2`` with a t critical value (df=D-1).  This keeps
+    the interval on the SAME token-weighted estimand as the pooled PPL, unlike
+    a bootstrap over equal-weighted per-document PPLs (which answers a
+    different question when document lengths differ).
+
+    The interval conditions on the trained seeds: seed-to-seed training
+    uncertainty is handled separately by the exact sign-flip test.  It is a
+    document-sampling interval for the observed document panel, not a claim
+    that the panel covers the language population.
+    """
+    def _matrix(x, name):
+        try:
+            arr = np.asarray(x, dtype=float)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{name}: values must be numeric') from None
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        if arr.ndim != 2 or arr.shape[0] < 1 or arr.shape[1] < 1:
+            raise ValueError(f'{name}: expected [n_seeds, n_docs], got shape {arr.shape}')
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f'{name}: all per-document NLLs must be finite')
+        return arr
+    A = _matrix(nll_a, '_paired_nll_doc_ci(nll_a)')
+    B = _matrix(nll_b, '_paired_nll_doc_ci(nll_b)')
+    if A.shape != B.shape:
+        raise ValueError(
+            f'_paired_nll_doc_ci: arm shapes differ ({A.shape} vs {B.shape}); '
+            'a paired interval needs the same seeds and documents')
+    try:
+        T = np.asarray(n_tokens, dtype=float).reshape(-1)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('_paired_nll_doc_ci: n_tokens must be numeric') from None
+    if T.size != A.shape[1]:
+        raise ValueError(
+            f'_paired_nll_doc_ci: {T.size} token counts for {A.shape[1]} documents')
+    if not np.all(np.isfinite(T)) or np.any(T <= 0.0):
+        raise ValueError('_paired_nll_doc_ci: every document needs a finite positive token count')
+    if isinstance(conf, (bool, np.bool_)):
+        raise ValueError('_paired_nll_doc_ci: conf must be a probability in (0, 1)')
+    try:
+        conf = float(conf)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('_paired_nll_doc_ci: conf must be a probability in (0, 1)') from None
+    if not (0.0 < conf < 1.0):
+        raise ValueError('_paired_nll_doc_ci: conf must be a probability in (0, 1)')
+
+    S, D = A.shape
+    total_tok = float(T.sum())
+    if not math.isfinite(total_tok) or total_tok <= 0.0:
+        raise ValueError('_paired_nll_doc_ci: the total token count must be positive')
+    ce_a = A.sum(axis=1) / total_tok
+    ce_b = B.sum(axis=1) / total_tok
+    ea = np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
+    eb = np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)
+    if not (np.all(np.isfinite(ea)) and np.all(np.isfinite(eb))):
+        return None
+    delta_ppl = float(np.mean(ea - eb))
+    lr = float(np.mean(ce_a - ce_b))
+    out = {'n_docs': int(D), 'n_seeds': int(S), 'conf': float(conf),
+           'delta_ppl': delta_ppl, 'delta_log_ratio': lr,
+           'delta_ppl_ci95': None, 'delta_log_ratio_ci95': None,
+           'ratio_ci95': None, 'se_ppl': None, 'se_log_ratio': None,
+           'df': (int(D - 1) if D > 1 else None),
+           'method': ('cluster-robust documents (delta method, t df=n_docs-1; '
+                      'token-pooled per seed then averaged over seeds; '
+                      'conditions on the trained seeds)')}
+    if D < 2:
+        out['method'] = ('point estimate only: a cluster-robust interval needs '
+                         'at least two documents')
+        return out
+
+    # Per-seed influence on the pooled CE difference, then average over seeds.
+    psi = (ea[:, None] * (A - ce_a[:, None] * T[None, :]) / total_tok
+           - eb[:, None] * (B - ce_b[:, None] * T[None, :]) / total_tok)
+    bar = psi.mean(axis=0)
+    var = (D / (D - 1.0)) * float(np.sum(bar * bar))
+    se = math.sqrt(max(var, 0.0))
+    psi_lr = ((A - ce_a[:, None] * T[None, :])
+              - (B - ce_b[:, None] * T[None, :])) / total_tok
+    bar_lr = psi_lr.mean(axis=0)
+    var_lr = (D / (D - 1.0)) * float(np.sum(bar_lr * bar_lr))
+    se_lr = math.sqrt(max(var_lr, 0.0))
+    tc = _t_critical(conf, D - 1)
+    if not math.isfinite(tc):
+        return out
+    out.update({
+        'se_ppl': float(se),
+        'se_log_ratio': float(se_lr),
+        'delta_ppl_ci95': [delta_ppl - tc * se, delta_ppl + tc * se],
+        'delta_log_ratio_ci95': [lr - tc * se_lr, lr + tc * se_lr],
+        'ratio_ci95': [_safe_exp_ppl(lr - tc * se_lr),
+                       _safe_exp_ppl(lr + tc * se_lr)],
+    })
+    return out
+
 
 # ---- G0 gate ---------------------------------------------------------------
 # The scale panels are only allowed to start after the kernel/eager

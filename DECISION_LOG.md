@@ -1654,3 +1654,67 @@ cells, refuses mixed granularity and mismatched document units). The unchanged
 L109 still covers the row-level fallback.
 `python test_review_fixes.py` passes 447/450 with the same 3 DataLoader
 environment skips.
+
+## 2026-10-22 — token-pooled Δ interval at the document level (no new runs)
+
+Zero-GPU statistics/measurement hardening; no panel, frozen manifest byte
+(`confirmation_frozen.json`), training path, `CODE_SEMANTICS`, test split,
+README or CI configuration was touched. The pooled point estimate and the
+frozen decision rule are unchanged; this entry fixes the ESTIMAND of the
+document-sampling interval printed next to the primary comparison.
+
+**Problem.** `v12_supp._doc_level_analysis` built `ppl_per_doc`, averaged the
+per-seed arm difference with EQUAL weight per document, and bootstrapped those
+unit means. The primary endpoint is token-pooled PPL
+(`exp(sum NLL / sum tokens)`), so when document lengths differ "the average
+document's ΔPPL" and "the pooled ΔPPL" are different estimands. The report
+printed the equal-weight interval next to the pooled Δ mean and the exact
+sign-flip p, so the interval and the tested effect described two different
+quantities. The single-arm diagnostic `_nll_doc_ci` already used a
+cluster-robust ratio-of-totals interval; the paired comparison did not.
+
+**Changes.** (1) `exp_lib._paired_nll_doc_ci(nll_a, nll_b, n_tokens)` computes
+the mean over seeds of each seed's token-pooled PPL difference and a
+document-cluster delta-method interval: per-seed influence
+`exp(ce_a)*(a_i - ce_a*t_i)/T - exp(ce_b)*(b_i - ce_b*t_i)/T`, averaged over
+seeds, variance `D/(D-1)*sum_i psi_i^2`, t critical value with `df=D-1`, and
+the corresponding seed-averaged log-ratio / PPL-ratio interval. It is
+deterministic (no bootstrap), conditions on the trained seeds, and validates
+shapes, finiteness, positive token counts and `conf`. (2)
+`v12_supp._doc_nll_matrix` checks that every per-document NLL vector is
+finite, reconstructs the cell's recorded `nll_sum`, and is consistent with
+`ppl_per_doc = exp(nll_i/t_i)`. (3) `_doc_level_analysis` attaches
+`pooled_delta_ppl`, `pooled_delta_ppl_ci95`, `pooled_delta_log_ratio`,
+`pooled_delta_log_ratio_ci95`, `pooled_ratio_ci95`, `pooled_ci_n_docs`,
+`pooled_ci_df` and `pooled_ci_method`; if the vectors do not reproduce the
+recorded per-seed pooled Δ, it emits `pooled_ci_unavailable_reason` instead of
+a wrong interval. Existing fields (`per_doc_delta_*`, `per_doc_*_ci95`,
+breadth counts) are unchanged. (4) Admission (`_by_len_shape_reason`) now
+rejects a document cell whose `nll_per_doc` is non-finite or does not
+partition its recorded `nll_sum`, and a cell whose `n_tokens_per_doc`
+contains a zero-target document (the aggregator drops such documents rather
+than reporting them as evaluation units). (5) The report uses the pure helper
+`_doc_ci_markdown_cell`: the pooled cluster interval when available, otherwise
+the explicitly labelled equal-weight unit bootstrap; the table header and a
+note state which estimand each column is. (6) Row-level cells still get only
+the labelled row bootstrap; no document interval is claimed for them.
+
+**Boundary.** This is a descriptive document-sampling interval for the
+observed document panel, not a second confirmatory test: the seed-level exact
+sign-flip, Holm family, coverage gate and decision rule are untouched, and the
+new interval is not used to confirm or reject any claim. The equal-weight
+per-document mean and bootstrap remain available as a "mean document"
+description; they are no longer presented as the interval of the token-pooled
+effect. No `CODE_SEMANTICS` bump is needed because no training or measurement
+value changed.
+
+**Verification.** New CPU tests L115 (paired cluster CI: token weighting,
+multi-seed point identity, degenerate/overflow shapes, input guards), L116
+(document-level integration: pooled point equals the per-seed pooled Δ,
+cluster CI present, equal-weight interval differs, inconsistent NLL/PPL
+vectors are refused rather than silently used, row fallback stays row-level)
+and L117 (report helper prefers the pooled interval and labels the fallback).
+Extended L113 covers the new admission checks.
+`python test_review_fixes.py` passes 451/454 with the same 3 DataLoader
+environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
+frozen records with the same six comparisons.

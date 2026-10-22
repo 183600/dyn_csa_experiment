@@ -17388,6 +17388,158 @@ def t_doc_level_analysis_prefers_document_cells():
     del missing['nll_per_doc']
     assert 'missing' in str(
         V12._by_len_shape_reason({'by_len': {8: missing}}, 4))
+    # A per-document NLL vector is a measurement, not a decorative field: it
+    # must be finite and must reconstruct the cell's recorded nll_sum.
+    summed = dict(good_cell, nll_sum=3.0)
+    assert V12._by_len_shape_reason({'by_len': {8: summed}}, 4) is None
+    bad_nll_sum = dict(good_cell, nll_sum=4.0)
+    assert 'nll_per_doc sums' in str(
+        V12._by_len_shape_reason({'by_len': {8: bad_nll_sum}}, 4))
+    bad_nll = dict(good_cell, nll_per_doc=[1.0, float('nan')])
+    assert 'nll_per_doc contains' in str(
+        V12._by_len_shape_reason({'by_len': {8: bad_nll}}, 4))
+    # A zero-target document is not an evaluation unit: the aggregator drops
+    # it, so a cell that still declares it is internally inconsistent.
+    zero_doc = dict(good_cell, n_tokens_per_doc=[28, 0])
+    assert 'at least one scored' in str(
+        V12._by_len_shape_reason({'by_len': {8: zero_doc}}, 4))
+
+
+def _document_cell(nll, tokens, doc_ids):
+    """Build a self-consistent by_len cell from per-document NLL/tokens."""
+    ppl_doc = [math.exp(n / t) for n, t in zip(nll, tokens)]
+    nll_sum = math.fsum(nll)
+    n_tok = sum(tokens)
+    return {'n_tok': n_tok, 'truncated': False, 'n_seq': 2,
+            'nll_sum': nll_sum, 'ppl': math.exp(nll_sum / n_tok),
+            'doc_granularity': 'document',
+            'nll_per_doc': list(nll), 'n_tokens_per_doc': list(tokens),
+            'ppl_per_doc': ppl_doc, 'doc_ids': list(doc_ids),
+            'n_docs': len(tokens)}
+
+
+def t_paired_token_pooled_document_ci():
+    # One seed, two documents with unequal lengths: the point must be the
+    # token-pooled PPL difference, not the equal-weighted mean document Δ.
+    tokens = [10, 30]
+    a = [[2.0, 6.0]]
+    b = [[1.0, 7.0]]
+    got = L._paired_nll_doc_ci(a, b, tokens)
+    assert got is not None, got
+    want = math.exp(8.0 / 40.0) - math.exp(8.0 / 40.0)
+    assert abs(got['delta_ppl'] - want) < 1e-12, got
+    assert got['n_docs'] == 2 and got['n_seeds'] == 1 and got['df'] == 1, got
+    lo, hi = got['delta_ppl_ci95']
+    assert lo <= got['delta_ppl'] <= hi, got
+    # Two seeds with different pooled effects: the point is the mean of the
+    # per-seed pooled PPL differences (the frozen comparison's estimand).
+    a2 = [[2.0, 6.0, 30.0], [3.0, 6.0, 30.0]]
+    b2 = [[3.0, 5.0, 31.0], [3.0, 5.0, 31.0]]
+    toks2 = [10, 20, 70]
+    got2 = L._paired_nll_doc_ci(a2, b2, toks2)
+    per_seed = [math.exp(sum(x) / 100.0) - math.exp(sum(y) / 100.0)
+                 for x, y in zip(a2, b2)]
+    assert abs(got2['delta_ppl'] - sum(per_seed) / 2.0) < 1e-12, got2
+    assert got2['n_docs'] == 3 and got2['n_seeds'] == 2 and got2['df'] == 2, got2
+    lo2, hi2 = got2['delta_ppl_ci95']
+    assert lo2 <= got2['delta_ppl'] <= hi2, got2
+    assert got2['delta_log_ratio_ci95'] is not None, got2
+    assert got2['ratio_ci95'][0] <= math.exp(got2['delta_log_ratio']) <= got2['ratio_ci95'][1], got2
+    # A single document is a point estimate, not a fabricated interval.
+    one = L._paired_nll_doc_ci([[3.0]], [[2.0]], [10])
+    assert one['delta_ppl_ci95'] is None and one['df'] is None, one
+    # Divergent CE is unavailable rather than an inf-valued interval.
+    assert L._paired_nll_doc_ci([[2000.0, 2000.0]], [[0.0, 0.0]], [1, 1]) is None
+    # Shape/token/probability guards.
+    for _a, _b, _t in (([[1.0, 2.0]], [[1.0]], [1, 1]),
+                       ([[1.0, 2.0]], [[1.0, 2.0]], [1]),
+                       ([[1.0, 2.0]], [[1.0, 2.0]], [1, 0]),
+                       ([[1.0, 2.0]], [[1.0, 2.0]], [1, float('nan')])):
+        try:
+            L._paired_nll_doc_ci(_a, _b, _t)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted malformed paired NLL input {(_a, _b, _t)!r}')
+    for _conf in (True, 0.0, 1.0, float('nan')):
+        try:
+            L._paired_nll_doc_ci([[1.0, 2.0]], [[1.0, 2.0]], [1, 1], conf=_conf)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted invalid conf={_conf!r}')
+
+
+def t_doc_level_analysis_uses_the_pooled_estimand_ci():
+    docs = ['0000000000000001', '0000000000000002', '0000000000000003']
+    toks = [10, 20, 70]
+    nll_a = [2.0, 6.0, 30.0]
+    nll_b = [3.0, 5.0, 31.0]
+    recs_a = {s: {'by_len': {512: _document_cell(nll_a, toks, docs)}}
+              for s in (0, 1)}
+    recs_b = {s: {'by_len': {512: _document_cell(nll_b, toks, docs)}}
+              for s in (0, 1)}
+    got = V12._doc_level_analysis(recs_a, recs_b, [0, 1], 512)
+    assert got is not None and got['granularity'] == 'document', got
+    want = math.exp(38.0 / 100.0) - math.exp(39.0 / 100.0)
+    assert 'pooled_delta_ppl' in got and abs(got['pooled_delta_ppl'] - want) < 1e-12, got
+    assert 'pooled_delta_ppl_ci95' in got, got
+    lo, hi = got['pooled_delta_ppl_ci95']
+    assert lo <= got['pooled_delta_ppl'] <= hi, got
+    assert got['pooled_ci_n_docs'] == 3 and got['pooled_ci_df'] == 2, got
+    assert got['pooled_ci_method'].startswith('cluster-robust'), got
+    # Equal-weight document mean is a different estimand; the old bootstrap is
+    # retained only as a descriptive field, not as the primary CI.
+    assert abs(got['per_doc_delta_mean'] - got['pooled_delta_ppl']) > 1e-6, got
+    assert got['per_doc_delta_ppl_ci95'] is not None, got
+    assert 'cluster' in V12._doc_ci_markdown_cell(got), got
+    # A vector that does not reconstruct the recorded nll_sum is refused, and
+    # the refusal is explicit rather than a silently wrong interval.
+    bad_cell = _document_cell(nll_a, toks, docs)
+    bad_cell['nll_per_doc'] = [nll_a[0] + 1.0, nll_a[1], nll_a[2]]
+    bad = {s: {'by_len': {512: dict(bad_cell)}} for s in (0, 1)}
+    refused = V12._doc_level_analysis(bad, recs_b, [0, 1], 512)
+    assert 'pooled_delta_ppl_ci95' not in refused, refused
+    assert 'partition' in refused.get('pooled_ci_unavailable_reason', ''), refused
+    # A ppl_per_doc that disagrees with nll/tokens is equally unusable.
+    bad_ppl = {s: {'by_len': {512: dict(
+        _document_cell(nll_a, toks, docs),
+        ppl_per_doc=[1.0, 1.0, 1.0])}} for s in (0, 1)}
+    refused2 = V12._doc_level_analysis(bad_ppl, recs_b, [0, 1], 512)
+    assert 'pooled_delta_ppl_ci95' not in refused2, refused2
+    assert 'inconsistent' in refused2.get('pooled_ci_unavailable_reason', ''), refused2
+    # Row-level cells keep the labelled row bootstrap and never claim a
+    # token-pooled document interval.
+    rows_a = {s: {'by_len': {512: {'ppl_per_seq': [1.0, 2.0, 4.0]}}}
+              for s in (0, 1)}
+    rows_b = {s: {'by_len': {512: {'ppl_per_seq': [2.0, 2.0, 2.0]}}}
+              for s in (0, 1)}
+    row = V12._doc_level_analysis(rows_a, rows_b, [0, 1], 512)
+    assert row is not None and row['granularity'] == 'row', row
+    assert 'pooled_delta_ppl_ci95' not in row, row
+    assert 'bootstrap' in V12._doc_ci_markdown_cell(row), row
+
+
+def t_doc_ci_markdown_cell_prefers_pooled_cluster():
+    assert V12._doc_ci_markdown_cell({}) == '—'
+    assert V12._doc_ci_markdown_cell(None) == '—'
+    dsm = {'granularity': 'document',
+           'pooled_delta_ppl_ci95': [-1.25, 0.5],
+           'per_doc_delta_ppl_ci95': [-9.0, 9.0]}
+    cell = V12._doc_ci_markdown_cell(dsm)
+    assert 'cluster' in cell and 'token 池化' in cell and '-1.25' in cell, cell
+    fallback = {'granularity': 'document',
+                'per_doc_delta_ppl_ci95': [-3.0, 2.0]}
+    cell2 = V12._doc_ci_markdown_cell(fallback)
+    assert 'bootstrap' in cell2 and '等权' in cell2, cell2
+    row = {'granularity': 'row', 'per_doc_delta_ppl_ci95': [-1.0, 1.0]}
+    cell3 = V12._doc_ci_markdown_cell(row)
+    assert '行 bootstrap' in cell3, cell3
+    # A non-finite/invalid pooled interval must fall back, not render garbage.
+    bad = {'granularity': 'document', 'pooled_delta_ppl_ci95': [float('nan'), 1.0],
+           'per_doc_delta_ppl_ci95': [-2.0, 2.0]}
+    cell4 = V12._doc_ci_markdown_cell(bad)
+    assert 'bootstrap' in cell4, cell4
 
 
 def main():
@@ -17842,6 +17994,9 @@ def main():
     _check('L112 eval aggregates by real document boundaries', t_document_level_eval_uses_real_boundaries)
     _check('L113 doc-level analysis prefers documents and refuses mixed granularity', t_doc_level_analysis_prefers_document_cells)
     _check('L114 document aggregation omits documents absent from a shorter slice', t_document_aggregation_omits_documents_absent_from_the_slice)
+    _check('L115 paired token-pooled document cluster CI', t_paired_token_pooled_document_ci)
+    _check('L116 doc-level analysis CI targets the pooled estimand', t_doc_level_analysis_uses_the_pooled_estimand_ci)
+    _check('L117 document CI rendering never mixes estimands', t_doc_ci_markdown_cell_prefers_pooled_cluster)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
