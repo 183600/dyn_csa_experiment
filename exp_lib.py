@@ -1419,8 +1419,12 @@ def cosine_similarity_consecutive(H, eps=1e-08):
     # time axis in chunks changes no value; the unchunked form is used when
     # the whole sequence fits in one chunk.
     if H.dim() < 2:
-        h = F.normalize(H, dim=-1, eps=eps)
-        return (h[1:] * h[:-1]).sum(dim=-1)
+        # A 1-D input is a sequence of scalar features.  Treat it as [T, 1]
+        # so the result has the same [T-1] shape as the general path; the old
+        # scalar reduction made T=1 return 0.0 instead of an empty vector and
+        # could not be consumed by the segmenter.
+        h = F.normalize(H.reshape(-1, 1), dim=-1, eps=eps).reshape(-1)
+        return h[1:] * h[:-1]
     T = int(H.shape[-2])
     if T <= 1:
         return H.new_empty(H.shape[:-2] + (0,))
@@ -23377,6 +23381,25 @@ def determinism_label():
         return 'cpu'
     return 'cudnn' if torch.backends.cudnn.deterministic else 'off'
 
+def _hashseed_pinned_value(value):
+    """Whether a PYTHONHASHSEED value actually fixes hash randomisation.
+
+    CPython accepts only a decimal uint32 or the literal ``random``; the latter
+    deliberately re-randomises the process, so it is not a pin even though the
+    environment variable is present.
+    """
+    if value is None:
+        return False
+    text = str(value).strip()
+    if not text or text.lower() == 'random':
+        return False
+    try:
+        seed = int(text, 10)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return 0 <= seed <= 2 ** 32 - 1
+
+
 def hashseed_contract():
     """Report whether the CURRENT interpreter was started hash-seeded.
 
@@ -23386,8 +23409,9 @@ def hashseed_contract():
     order, but a future data path must not silently rely on that promise.
     This report separates:
 
-    * ``pinned_at_startup`` — the environment variable existed before
+    * ``pinned_at_startup`` — a valid numeric seed was present before
       ``exp_lib`` imported (a re-launched/CI/par.py child has this true);
+      ``PYTHONHASHSEED=random`` is not a pin;
     * ``child_seed`` — what every child process we spawn will inherit;
     * ``effective_current_process`` — ``fixed`` only when the startup pin was
       present, else ``randomised``.
@@ -23398,7 +23422,11 @@ def hashseed_contract():
     RNG streams and a confirmation driver can require it explicitly.
     """
     env_at_startup = _PYTHONHASHSEED_AT_STARTUP
-    pinned = env_at_startup is not None and str(env_at_startup).strip() != ''
+    # A valid numeric startup value is the actual pin; `random` is explicitly
+    # not.  `sys.flags.hash_randomization` is recorded separately as evidence
+    # rather than folded into the pin test, so a unit test can exercise this
+    # branch by setting the captured startup value in the current process.
+    pinned = _hashseed_pinned_value(env_at_startup)
     return {
         'pinned_at_startup': bool(pinned),
         'value_at_startup': env_at_startup,
@@ -23557,7 +23585,8 @@ def environment_snapshot():
         'cpu_interop_threads': int(torch.get_num_interop_threads()) if hasattr(torch, 'get_num_interop_threads') else None,
         'pythonhashseed': os.environ.get('PYTHONHASHSEED'),
         'pythonhashseed_at_startup': _PYTHONHASHSEED_AT_STARTUP,
-        'pythonhashseed_pinned_at_startup': bool(_PYTHONHASHSEED_AT_STARTUP not in (None, '')),
+        'pythonhashseed_pinned_at_startup': bool(
+            _hashseed_pinned_value(_PYTHONHASHSEED_AT_STARTUP)),
         'hashseed_contract': hashseed_contract(),
         'tensorflow': getattr(sys.modules.get('tensorflow'), '__version__', None),
         'dependencies': _dependency_fingerprint(),

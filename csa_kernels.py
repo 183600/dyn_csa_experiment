@@ -2477,6 +2477,23 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     if cfg.indexer_mode != 'learned':
         raise RuntimeError('CSA_KERNEL 只支持 learned indexer（indexer_mode != "learned" 的臂请回退 eager）')
     if cfg.chunking == 'cosine_learnable':
+        if pre_blocks is None and int(T) <= 1:
+            # A length-1 sequence has no consecutive-pair similarity, so the
+            # eager forward hoist yields no gate row and leaves the geometry
+            # to the segmenter (the single token is one whole block).  Mirror
+            # that fallback here: the kernel path must not fail on the same
+            # input the eager path accepts.
+            import exp_lib as _L
+            _bid, _nb, _hon = _L.blocks_from_cuts(
+                int(T), [], cfg.min_block, cfg.max_block, dev,
+                return_count=True, return_honoured=True)
+            pre_blocks = [(_bid, _nb, _hon) for _ in range(int(B))]
+            if gate_sigs is None:
+                # The gate vectors are zero-width at T=1; keep the shape the
+                # per-row path would feed to the segmentation statistics.
+                _gate = x.new_empty((int(B), 0))
+                _gate_bool = torch.empty((int(B), 0), dtype=torch.bool, device=dev)
+                gate_sigs = [(_gate[_b], _gate_bool[_b]) for _b in range(int(B))]
         if pre_blocks is None or gate_sigs is None:
             raise RuntimeError('cosine_learnable 层需要 forward 预计算的门控信号与块几何')
         bids = [pb[0] for pb in pre_blocks]

@@ -3227,6 +3227,18 @@ def t_panel_ablation_flag_does_not_overclaim():
     assert r['ablation_completeness']['omitted_components'] == ['B'], r['ablation_completeness']
 
 
+def t_cosine_similarity_scalar_features_keep_sequence_axis():
+    # A 1-D sequence means one scalar feature per position, so the result is
+    # [T-1] (the same contract as [T, 1]), not a reduced scalar.  T<=1 must
+    # yield a zero-width vector rather than 0.0.
+    for T in (0, 1, 2, 5):
+        x = torch.arange(T, dtype=torch.float32)
+        got = L.cosine_similarity_consecutive(x)
+        assert tuple(got.shape) == (max(T - 1, 0),), (T, got.shape, got)
+    x = torch.tensor([1.0, 1.0, -1.0])
+    assert L.cosine_similarity_consecutive(x).tolist() == [1.0, -1.0]
+
+
 def t_adaptive_threshold_guard():
     # Row chunking keeps a large batch feasible; an explicit safety ceiling is
     # still honoured.
@@ -4331,11 +4343,26 @@ def t_dataloader_seeding_helpers():
     assert _w4a != _w5, 'a different DataLoader seed must change the worker draws'
 
 
+def _skip_dataloader_if_unavailable(contract):
+    """Turn a sandbox's missing worker-process support into a SKIP, not a fail.
+
+    `dataloader_contract_check` reports the environment error in its result
+    instead of raising, so the test must inspect it.  A real wiring bug still
+    reaches the assertions below.
+    """
+    error = str((contract or {}).get('error') or '')
+    if 'PermissionError' in error or 'Errno 13' in error:
+        raise _SkipTest(
+            'DataLoader worker processes need POSIX semaphores, which this '
+            f'sandbox forbids ({error})')
+
+
 def t_dataloader_contract_check():
     try:
         r = L.dataloader_contract_check(seed=11, num_workers=2, batch_size=4, batches=2)
     except (PermissionError, OSError) as e:
         raise _SkipTest(f'DataLoader worker processes need POSIX semaphores, which this sandbox forbids ({type(e).__name__}: {e})') from e
+    _skip_dataloader_if_unavailable(r)
     assert r['passed'] is True, r
     for k in ('stream_nonempty', 'same_seed_reproducible',
               'different_seed_changes_stream', 'rng_state_preserved'):
@@ -4354,10 +4381,25 @@ def t_seed_contract_reports_hashseed_and_workers():
     for k in ('pinned_at_startup', 'child_seed', 'effective_current_process', 'note'):
         assert k in r['hashseed'], r['hashseed']
     assert r['hashseed']['child_seed'] is not None
+    # `PYTHONHASHSEED=random` is present but does not pin the process; only a
+    # valid decimal uint32 does.
+    for _good in ('0', '123', '4294967295'):
+        assert L._hashseed_pinned_value(_good) is True, _good
+    for _bad in (None, '', 'random', 'RANDOM', '-1', '4294967296', 'abc'):
+        assert L._hashseed_pinned_value(_bad) is False, _bad
+    _startup = L._PYTHONHASHSEED_AT_STARTUP
+    try:
+        L._PYTHONHASHSEED_AT_STARTUP = '0'
+        assert L.hashseed_contract()['pinned_at_startup'] is True
+        L._PYTHONHASHSEED_AT_STARTUP = 'random'
+        assert L.hashseed_contract()['pinned_at_startup'] is False
+    finally:
+        L._PYTHONHASHSEED_AT_STARTUP = _startup
     try:
         r2 = L.seed_contract_check(seed=3, check_dataloader_workers=True, dataloader_workers=2)
     except (PermissionError, OSError) as e:
         raise _SkipTest(f'DataLoader worker processes need POSIX semaphores ({type(e).__name__}: {e})') from e
+    _skip_dataloader_if_unavailable(r2.get('dataloader_contract'))
     assert r2['passed'] is True, r2
     assert r2['checks']['dataloader_worker_processes'] is True, r2['checks']
     assert r2['dataloader_contract']['passed'] is True, r2['dataloader_contract']
@@ -14008,6 +14050,24 @@ def t_kernel_attention_grad_matches_eager_at_boundaries():
           sink=torch.tensor([float('nan'), 0.3]))
 
 
+def t_kernel_ref_length_one_dynamic_arm_matches_eager():
+    # At T=1 there is no consecutive-pair similarity, so the eager gate hoist
+    # returns no row and the segmenter supplies the single one-token block.
+    # The kernel/ref path must accept the same input instead of demanding a
+    # gate row that cannot exist.
+    import csa_kernels as C
+    for variant in ('csa_dynamic', 'hybrid_dynamic'):
+        cfgs = L.make_layer_cfgs(2, variant)
+        model = L.SmallGPT(97, 32, 2, 4, 8, 1, cfgs, mlp_ratio=2.0)
+        ids = torch.tensor([[3], [5]], dtype=torch.long)
+        with C.kernel_env(None):
+            eager = model(ids)
+        with C.kernel_env('ref'):
+            kernel = model(ids)
+        assert torch.allclose(eager, kernel, atol=1e-5, rtol=1e-5), (
+            variant, eager, kernel)
+
+
 def t_kernel_reinforce_boundary_logp_survives_batching():
     # `csa_dynamic_task` trains its cut policy through REINFORCE.  The batched
     # kernel/ref path used to return None (dropping the only boundary-loss
@@ -15647,6 +15707,7 @@ def main():
     _check('C20a partial pairing keeps controlled seeds', t_partial_skipped_seed_keeps_controlled_contrast)
     _check('C20b incomplete components exported in audit report', t_audit_incomplete_components_alias)
     _check('A7 adaptive-threshold capacity guard', t_adaptive_threshold_guard)
+    _check('A7a scalar-feature cosine keeps the sequence axis', t_cosine_similarity_scalar_features_keep_sequence_axis)
     _check('A7b adaptive-threshold chunked values', t_adaptive_threshold_values)
     _check('A8 empty segmenter', t_segment_empty)
     _check('A8a uniform-stride cut boundary', t_segment_uniform_stride_only_when_all_cuts)
@@ -15920,6 +15981,7 @@ def main():
     _check('L42e kernel attention gradients match eager at clamp/sink boundaries', t_kernel_attention_grad_matches_eager_at_boundaries)
     _check('L42f greedy match batch is subset-order independent', t_greedy_match_batch_is_order_independent)
     _check('L42g kernel/ref REINFORCE boundary logp survives batching', t_kernel_reinforce_boundary_logp_survives_batching)
+    _check('L42g2 kernel/ref accepts the length-one dynamic arm', t_kernel_ref_length_one_dynamic_arm_matches_eager)
     _check('L42h probe contrasts require the same validation slice', t_probe_contrasts_require_same_validation_slice)
     _check('L42c efficiency medians average both middle seeds', t_efficiency_median_uses_both_middle_seeds)
     _check('L43 eager_batch rejects typos/non-finite values', t_eager_batch_rejects_typos_and_nonfinite)
