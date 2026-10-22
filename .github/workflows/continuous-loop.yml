@@ -1,11 +1,20 @@
 name: Continuous Loop
 
-# The automatic loop is disabled on purpose.  This workflow can rewrite and
-# push source code; while the frozen confirmation plan (confirmation_frozen.json)
-# is waiting for its single test-split access, an unattended 15-minute loop must
-# not be able to change CODE_SEMANTICS or the manifest.  Run it manually only.
+# Re-enabled on 2026-10-22 by the operator: P5T (the one-shot test-split
+# confirmation) is deferred, so the agent loop is allowed to edit code again.
+# The loop can rewrite and push source code, and it can change CODE_SEMANTICS.
+#
+# Freeze hazard worth remembering: the frozen manifest binds only the declared
+# CODE_SEMANTICS constant ('v11.128' in exp_lib.py), NOT the file's own hash.
+# An agent edit can therefore change measurement semantics while the stamp
+# still matches, and P5T would admit it silently.  Before running P5T, check
+# exp_lib.py against its sha256 at re-enable time
+# (4a6cc34cfaac2388d2286a6370d0d91da8d932039e8ecb707a7c4f58af813579) and
+# re-freeze consciously if it changed.
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
 
 concurrency:
   group: continuous-loop
@@ -13,10 +22,10 @@ concurrency:
 
 jobs:
   run-opencode:
-    # Opt-in only: the self-dispatching next-run job would otherwise keep the
-    # loop alive forever after a single manual dispatch.  Set the repository
-    # variable CONTINUOUS_LOOP_ENABLED=true only when you deliberately want
-    # the agent loop; it is unset for the frozen-confirmation window.
+    # Kill switch: the loop self-dispatches, so one dispatch keeps it alive
+    # indefinitely.  Clear the CONTINUOUS_LOOP_ENABLED repository variable to
+    # stop it: the next queued run then evaluates this guard as false, skips,
+    # and dispatches no successor.
     if: vars.CONTINUOUS_LOOP_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 200
